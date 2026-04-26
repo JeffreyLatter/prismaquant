@@ -13,6 +13,21 @@ h_trace_raw, h_w2_sum_raw, h_full per-weight, expert_saliency, and
 n_tokens_seen). The activation cache from the LAST chunk is retained
 for the cost stage.
 
+Adaptive sampling (v21 #3) is opt-in via `--adaptive-sampling`. When
+on, the driver tracks per-domain saliency via
+`prismaquant.adaptive_sampling.AdaptiveExpertScheduler` and narrows
+each chunk's `--linear-include` to skip experts whose rank has
+stabilized in every observed domain. This is what lets later chunks
+focus calibration tokens on contested experts instead of paying the
+full per-chunk cost. Domain inference uses the chunk filename:
+`chunk_<domain>_<idx>.jsonl` → domain `<domain>`; `chunk_<idx>.jsonl`
+falls back to `_global` so single-domain runs work unchanged.
+
+Per-domain saliency (v21): the merged probe.pkl gains an
+`expert_saliency_per_domain[domain][router_q][expert_id]` field built
+by token-weighted averaging across chunks tagged with that domain. The
+allocator can consume this for union/intersection prune policies.
+
 Usage:
     python -m prismaquant.multi_chunk_probe \\
         --chunks-dir /path/with/chunk_*.jsonl \\
@@ -22,6 +37,7 @@ Usage:
         --work-dir /path/to/work_root \\
         --h-detail-dir /path/to/h_detail \\
         --layers-per-shard 8 --prefetch-lookahead 4 \\
+        [--adaptive-sampling] [--retain-cross-chunk-cache] \\
         [other incremental_probe args]
 """
 
@@ -40,24 +56,37 @@ from pathlib import Path
 os.environ.setdefault("PRISMAQUANT_PROBE_CTX_CACHE", "1")
 
 from prismaquant import incremental_probe as ip
+from prismaquant.adaptive_sampling import (
+    AdaptiveExpertScheduler,
+    aggregate_global_saliency,
+    aggregate_per_domain_saliency,
+    infer_chunk_domain,
+)
 
 
 def _make_chunk_argv(base_argv: list[str], chunk_jsonl: Path,
                      chunk_work_dir: Path, chunk_output: Path,
-                     drop_keys: tuple[str, ...]) -> list[str]:
+                     drop_keys: tuple[str, ...],
+                     extra_args: list[str] | None = None) -> list[str]:
     """Rebuild sys.argv for one chunk by overriding --dataset, --work-dir,
-    --output and stripping the multi-chunk-only keys."""
+    --output and stripping the multi-chunk-only keys.
+
+    `extra_args` is appended at the end so adaptive-sampling overrides
+    (e.g. a narrowed --linear-include) win over any earlier values.
+    """
     out: list[str] = [base_argv[0]]
-    i = 1
     skip_next = False
+    skip_keys = tuple(drop_keys) + (
+        ("--linear-include",) if extra_args else ()
+    )
     for tok in base_argv[1:]:
         if skip_next:
             skip_next = False
             continue
-        if tok in drop_keys:
+        if tok in skip_keys:
             skip_next = True
             continue
-        if any(tok.startswith(k + "=") for k in drop_keys):
+        if any(tok.startswith(k + "=") for k in skip_keys):
             continue
         out.append(tok)
     # Append chunk-specific overrides (these win over any earlier values).
@@ -66,7 +95,28 @@ def _make_chunk_argv(base_argv: list[str], chunk_jsonl: Path,
         "--work-dir", str(chunk_work_dir),
         "--output", str(chunk_output),
     ]
+    if extra_args:
+        out += extra_args
     return out
+
+
+def _extract_arg_value(argv: list[str], key: str) -> str | None:
+    """Pull a `--key VALUE` or `--key=VALUE` value out of an argv list."""
+    for i, tok in enumerate(argv):
+        if tok == key and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith(key + "="):
+            return tok[len(key) + 1:]
+    return None
+
+
+def _summarize_scheduler(sched: AdaptiveExpertScheduler) -> str:
+    s = sched.summary()
+    return (f"experts: total={s['total']} "
+            f"frozen-keep={s['frozen_keep']} "
+            f"frozen-drop={s['frozen_drop']} "
+            f"contested={s['contested']} "
+            f"chunks_by_domain={s['chunks_by_domain']}")
 
 
 def main() -> int:
@@ -86,6 +136,33 @@ def main() -> int:
                          "Adds ~70 GB of resident bytes at chunk transitions; "
                          "safe on Spark (cache budget already accounts for it) "
                          "but disable on smaller boxes if memory is tight.")
+    ap.add_argument("--adaptive-sampling", action="store_true",
+                    default=False,
+                    help="Enable per-domain expert saliency tracking and "
+                         "narrow each chunk's --linear-include to skip "
+                         "experts whose rank has stabilized across all "
+                         "observed domains. Off by default for byte-for-"
+                         "byte parity with v20 launches.")
+    ap.add_argument("--adaptive-min-chunks", type=int, default=2,
+                    help="Minimum number of observations per domain before "
+                         "an expert can be marked frozen (default: 2).")
+    ap.add_argument("--adaptive-stability", type=float, default=0.10,
+                    help="Relative-range stability threshold across the "
+                         "stability window. Smaller = stricter (default: 0.10).")
+    ap.add_argument("--adaptive-keep-band", type=float, default=0.25,
+                    help="Top fraction of router rank that counts as "
+                         "frozen-keep (default: 0.25 → top 25%).")
+    ap.add_argument("--adaptive-drop-band", type=float, default=0.10,
+                    help="Bottom fraction of router rank that counts as "
+                         "frozen-drop (default: 0.10 → bottom 10%).")
+    ap.add_argument("--adaptive-disagreement-spread", type=float, default=0.5,
+                    help="Per-domain rank-spread threshold above which an "
+                         "expert stays contested even if individually "
+                         "stable in each domain (default: 0.5).")
+    ap.add_argument("--adaptive-prune-ratio", type=float, default=0.375,
+                    help="Approximate prune cutoff used to define the "
+                         "contested band around the prune decision "
+                         "(default: 0.375, matching MiniMax launch).")
     args, passthrough = ap.parse_known_args()
     if args.retain_cross_chunk_cache:
         os.environ["PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK"] = "1"
@@ -107,63 +184,163 @@ def main() -> int:
     print(f"[multi-chunk] {len(chunk_jsonls)} chunks; sharing model+ctx "
           f"across all of them via PRISMAQUANT_PROBE_CTX_CACHE", flush=True)
 
-    chunk_outputs: list[Path] = []
     base_argv = ["prismaquant.incremental_probe"] + passthrough
     drop_keys = ("--chunks-dir", "--dataset", "--output", "--work-dir")
+    base_linear_include = _extract_arg_value(base_argv, "--linear-include")
+
+    sched: AdaptiveExpertScheduler | None = None
+    sched_state_path = work_root / "adaptive_scheduler.json"
+    if args.adaptive_sampling:
+        if sched_state_path.exists():
+            sched = AdaptiveExpertScheduler.load(sched_state_path)
+            print(f"[multi-chunk] adaptive scheduler resumed from "
+                  f"{sched_state_path} ({_summarize_scheduler(sched)})",
+                  flush=True)
+        else:
+            sched = AdaptiveExpertScheduler(
+                prune_ratio=args.adaptive_prune_ratio,
+                stability_threshold=args.adaptive_stability,
+                min_chunks_for_freeze=args.adaptive_min_chunks,
+                keep_band=args.adaptive_keep_band,
+                drop_band=args.adaptive_drop_band,
+                disagreement_spread=args.adaptive_disagreement_spread,
+            )
+            print(f"[multi-chunk] adaptive sampling enabled: "
+                  f"min_chunks={args.adaptive_min_chunks} "
+                  f"stability={args.adaptive_stability} "
+                  f"keep={args.adaptive_keep_band} "
+                  f"drop={args.adaptive_drop_band} "
+                  f"prune={args.adaptive_prune_ratio} "
+                  f"spread={args.adaptive_disagreement_spread}",
+                  flush=True)
+
+    chunk_outputs: list[Path] = []
+    chunk_domains: list[str] = []
 
     for i, chunk_jsonl in enumerate(chunk_jsonls):
         chunk_work_dir = work_root / f"chunk_{i:02d}"
         chunk_output = chunk_work_dir / "probe.pkl"
+        domain = infer_chunk_domain(chunk_jsonl)
+        chunk_domains.append(domain)
+
         if chunk_output.exists():
             print(f"[multi-chunk] chunk {i}: resume — {chunk_output} "
-                  f"already exists, skipping", flush=True)
+                  f"already exists, skipping (domain={domain})", flush=True)
             chunk_outputs.append(chunk_output)
+            # Even on resume, fold this chunk's saliency into the
+            # scheduler so subsequent chunks see consistent state.
+            if sched is not None:
+                with chunk_output.open("rb") as f:
+                    pkl = pickle.load(f)
+                sched.update_from_chunk_pickle(pkl, domain)
             continue
         chunk_work_dir.mkdir(parents=True, exist_ok=True)
-        # Per-chunk streaming-offload subdir: keep ctx warm across chunks
-        # by sharing the offload at the work_root level instead of the
-        # per-chunk subdir. The probe will use this when ctx is built
-        # (chunk 0). Chunks 1..N reuse the cached ctx and never touch
-        # offload setup again.
-        # NOTE: we leave the ctx cache to handle reuse; per-chunk work_dir
-        # only carries shards/, work/precompute, logs/.
+
+        # Adaptive sampling: narrow --linear-include based on what
+        # the scheduler considers contested. Falls back to base
+        # include on the first chunk (no history yet).
+        extra_args: list[str] = []
+        if sched is not None and base_linear_include is not None:
+            # Read expert_info from the previous chunk's pickle so the
+            # narrowing has Linear→(router, eid) mapping. On chunk 0
+            # there isn't one yet — fall through to base include.
+            expert_info: dict[str, tuple[str, str]] = {}
+            for prev in chunk_outputs:
+                with prev.open("rb") as f:
+                    prev_pkl = pickle.load(f)
+                expert_info.update(prev_pkl.get("expert_info") or {})
+            narrowed = sched.linear_include_for_next_chunk(
+                base_include=base_linear_include,
+                expert_info=expert_info,
+            )
+            if narrowed != base_linear_include:
+                extra_args += ["--linear-include", narrowed]
+                n_frozen = sum(
+                    len(v) for v in sched.frozen_experts().values())
+                print(f"[multi-chunk] chunk {i}: adaptive narrow — "
+                      f"{n_frozen} frozen experts excluded; "
+                      f"{_summarize_scheduler(sched)}", flush=True)
+
         chunk_argv = _make_chunk_argv(
-            base_argv, chunk_jsonl, chunk_work_dir, chunk_output, drop_keys)
+            base_argv, chunk_jsonl, chunk_work_dir, chunk_output, drop_keys,
+            extra_args=extra_args,
+        )
+
+        # Tag the chunk with its domain so the per-chunk pickle's meta
+        # carries it. incremental_probe.main() reads this env var and
+        # stashes it into meta["domain"].
+        prior_domain = os.environ.get("PRISMAQUANT_PROBE_DOMAIN")
+        os.environ["PRISMAQUANT_PROBE_DOMAIN"] = domain
+
         print(f"\n[multi-chunk] === chunk {i+1}/{len(chunk_jsonls)} ===",
               flush=True)
         print(f"[multi-chunk] dataset={chunk_jsonl.name} "
+              f"domain={domain} "
               f"work_dir={chunk_work_dir.name}", flush=True)
         t0 = time.time()
-        # Save & restore sys.argv so each main() invocation parses fresh.
         saved_argv = sys.argv
         sys.argv = chunk_argv
         try:
             ip.main()
         finally:
             sys.argv = saved_argv
+            if prior_domain is None:
+                os.environ.pop("PRISMAQUANT_PROBE_DOMAIN", None)
+            else:
+                os.environ["PRISMAQUANT_PROBE_DOMAIN"] = prior_domain
         elapsed = time.time() - t0
         print(f"[multi-chunk] chunk {i+1} done in {elapsed:.0f}s",
               flush=True)
         chunk_outputs.append(chunk_output)
 
+        # Fold this chunk's saliency into the scheduler and persist.
+        if sched is not None:
+            with chunk_output.open("rb") as f:
+                pkl = pickle.load(f)
+            n = sched.update_from_chunk_pickle(pkl, domain)
+            sched.save(sched_state_path)
+            print(f"[multi-chunk] adaptive scheduler updated: +{n} "
+                  f"(router,expert) entries for domain={domain}; "
+                  f"{_summarize_scheduler(sched)}", flush=True)
+
     print(f"\n[multi-chunk] merging {len(chunk_outputs)} per-chunk "
           f"probe.pkls -> {out_path}", flush=True)
     ip.merge_probe_pickles(chunk_outputs, out_path)
-    # Annotate the final pickle with multi-chunk metadata so downstream
-    # consumers can see it was produced by N chunks.
+
+    # Build per-domain + globally-aggregated saliency maps from raw
+    # per-chunk pickles using the token-weighted average so the merged
+    # value is correct regardless of differing chunk sizes.
+    per_chunk_pairs: list[tuple[dict, str]] = []
+    for p, d in zip(chunk_outputs, chunk_domains):
+        with p.open("rb") as f:
+            per_chunk_pairs.append((pickle.load(f), d))
+    expert_saliency_per_domain = aggregate_per_domain_saliency(per_chunk_pairs)
+    expert_saliency_global = aggregate_global_saliency(
+        expert_saliency_per_domain, per_chunk_pairs)
+
     with out_path.open("rb") as f:
         merged = pickle.load(f)
+    merged["expert_saliency"] = expert_saliency_global
+    merged["expert_saliency_per_domain"] = expert_saliency_per_domain
     meta = dict(merged.get("meta", {}))
     meta["multi_chunk_count"] = len(chunk_outputs)
     meta["multi_chunk_total_nsamples"] = sum(
-        pickle.loads(p.read_bytes()).get("meta", {}).get("nsamples", 0)
-        for p in chunk_outputs
+        pkl.get("meta", {}).get("nsamples", 0)
+        for pkl, _ in per_chunk_pairs
     )
+    meta["chunk_domains"] = chunk_domains
+    meta["adaptive_sampling"] = bool(args.adaptive_sampling)
+    if sched is not None:
+        meta["adaptive_summary"] = sched.summary()
     merged["meta"] = meta
     with out_path.open("wb") as f:
         pickle.dump(merged, f)
+    n_domains = len(expert_saliency_per_domain)
+    n_routers = sum(len(v) for v in expert_saliency_per_domain.values())
     print(f"[multi-chunk] DONE — merged probe at {out_path} "
-          f"(total_nsamples={meta['multi_chunk_total_nsamples']})", flush=True)
+          f"(total_nsamples={meta['multi_chunk_total_nsamples']}, "
+          f"per-domain saliency: {n_domains} domains × "
+          f"~{n_routers // max(n_domains, 1)} routers)", flush=True)
     return 0
 
 

@@ -88,6 +88,42 @@ def validate_probe_payload(payload, path: str | None = None):
                 if not isinstance(eid, (str, Integral)) or isinstance(eid, bool):
                     _fail(path, f".expert_saliency[{router!r}]", "expert ids must be strings or ints")
                 _as_number(score, path, f".expert_saliency[{router!r}][{eid!r}]")
+    # v21 #3: per-domain saliency. Same shape as `expert_saliency` but
+    # with a domain key on the outside.
+    saliency_pd = payload.get("expert_saliency_per_domain")
+    if saliency_pd is not None:
+        if not _is_mapping(saliency_pd):
+            _fail(path, ".expert_saliency_per_domain",
+                  "must be a mapping when present")
+        for domain, by_router in saliency_pd.items():
+            if not isinstance(domain, str):
+                _fail(path, ".expert_saliency_per_domain",
+                      "domain keys must be strings")
+            if not _is_mapping(by_router):
+                _fail(path, f".expert_saliency_per_domain[{domain!r}]",
+                      "must be a mapping of router → expert → score")
+            for router, values in by_router.items():
+                if not isinstance(router, str):
+                    _fail(path, f".expert_saliency_per_domain[{domain!r}]",
+                          "router keys must be strings")
+                if not _is_mapping(values):
+                    _fail(
+                        path,
+                        f".expert_saliency_per_domain[{domain!r}][{router!r}]",
+                        "must be a mapping",
+                    )
+                for eid, score in values.items():
+                    if (not isinstance(eid, (str, Integral))
+                            or isinstance(eid, bool)):
+                        _fail(
+                            path,
+                            f".expert_saliency_per_domain[{domain!r}][{router!r}]",
+                            "expert ids must be strings or ints",
+                        )
+                    _as_number(
+                        score, path,
+                        f".expert_saliency_per_domain[{domain!r}][{router!r}][{eid!r}]",
+                    )
     expert_info = payload.get("expert_info", {})
     if expert_info is not None:
         if not _is_mapping(expert_info):

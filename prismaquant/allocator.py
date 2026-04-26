@@ -412,6 +412,23 @@ def main():
                          "loss estimate for the expert. Smaller α makes "
                          "pruning cheaper (the DP prunes more aggressively); "
                          "larger α protects experts.")
+    ap.add_argument("--prune-domain-policy",
+                    choices=["global", "union", "intersection", "mean"],
+                    default="global",
+                    help="How to collapse per-domain expert saliency into "
+                         "the prune candidate score when probe.pkl carries "
+                         "an `expert_saliency_per_domain` map (multi-chunk "
+                         "probe with domain-tagged calibration). "
+                         "`global` (default): use the legacy token-weighted "
+                         "average — preserves v20 behavior. "
+                         "`union`: max across domains — keeps an expert "
+                         "if it's load-bearing in ANY domain (recommended "
+                         "when every cal-mix domain must be served well). "
+                         "`intersection`: min across domains — drops an "
+                         "expert only when it's clearly droppable in EVERY "
+                         "domain (most aggressive). "
+                         "`mean`: equal-weight average per domain. "
+                         "No-op when probe.pkl has no per-domain map.")
     ap.add_argument("--target-profile",
                     choices=["research", "vllm_qwen3_5_packed_moe"],
                     default="research",
@@ -578,6 +595,26 @@ def main():
     # format-only candidates when either is empty.
     probe_expert_saliency = probe.get("expert_saliency", {}) if args.enable_expert_prune else {}
     probe_expert_info = probe.get("expert_info", {}) if args.enable_expert_prune else {}
+    # v21: when the probe carries per-domain saliency (multi-chunk
+    # probe with domain-tagged calibration), apply the user's
+    # cross-domain policy. Default `global` returns the legacy
+    # token-weighted average unchanged so single-domain runs behave
+    # exactly as before.
+    if args.enable_expert_prune:
+        from .adaptive_sampling import saliency_with_policy
+        probe_expert_saliency_per_domain = probe.get(
+            "expert_saliency_per_domain") or {}
+        if probe_expert_saliency_per_domain:
+            probe_expert_saliency = saliency_with_policy(
+                probe_expert_saliency_per_domain,
+                probe_expert_saliency,
+                args.prune_domain_policy,
+            )
+            print(
+                f"[alloc] per-domain saliency: "
+                f"{len(probe_expert_saliency_per_domain)} domains, "
+                f"policy={args.prune_domain_policy}", flush=True,
+            )
     # Parse the user's ratio list as a SWEEP. For packed-3D models we
     # couple every layer to the same ratio (below) to match vLLM's
     # uniform-num_experts constraint — so "multi-ratio" means "try each

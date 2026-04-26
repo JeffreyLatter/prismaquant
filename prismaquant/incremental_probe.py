@@ -787,12 +787,22 @@ def merge_probe_pickles(paths: list[Path], output_path: Path):
     merged["router_totals"] = dict(merged_router_totals)
     merged["expert_info"] = merged_expert_info
     merged["expert_saliency"] = merged_expert_saliency
-    merged["meta"] = {
+    merged_meta = {
         **merged.get("meta", {}),
         "incremental": True,
         "n_shards": len(paths),
         "shards": shard_metas,
     }
+    # v21 #3 + per-domain saliency: propagate the calibration-chunk
+    # domain label into the chunk-level pickle meta. multi_chunk_probe
+    # sets PRISMAQUANT_PROBE_DOMAIN per chunk so the merged chunk
+    # pickle records which calibration slice it represents. Single-
+    # chunk runs without the env var get the synthetic "_global"
+    # domain so downstream consumers always see a value.
+    domain_env = os.environ.get("PRISMAQUANT_PROBE_DOMAIN")
+    if domain_env:
+        merged_meta["domain"] = domain_env
+    merged["meta"] = merged_meta
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
