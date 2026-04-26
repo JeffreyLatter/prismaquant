@@ -1605,6 +1605,21 @@ def _run_body_streaming_shard(
                             activation_rows[name] += flat.size(0)
                 return hook
 
+            # v21 #1: deferred Fisher sync. PRISMAQUANT_DEFERRED_FISHER_SYNC=1
+            # accumulates h_trace_raw / h_w2_sum_raw on the device as 0-D
+            # tensors and batches the host transfer to a single sync per
+            # layer. The default per-Linear `.item()` calls force ~94k
+            # CUDA syncs per phase-3 sweep (47k Linears × 2); deferring
+            # collapses that to ~62 (one per layer) without changing the
+            # math. h_full collection is unaffected (it stays on the CPU
+            # path; only the device→host scalar transfers are batched).
+            deferred_sync = (
+                os.environ.get("PRISMAQUANT_DEFERRED_FISHER_SYNC") == "1"
+            )
+            # Per-Linear device-resident accumulators built lazily inside
+            # the hook so we know the stream / device the kernel ran on.
+            device_accums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
             def make_bwd(name: str, mod_ref: nn.Linear):
                 def hook(module, grad_input, grad_output):
                     gy = grad_output[0]
@@ -1648,7 +1663,21 @@ def _run_body_streaming_shard(
                     # Trace from chunk_h.sum() — same value as
                     # (gy_norm·x_norm).sum() but reuses the fp32 chunk_h
                     # we already have, no extra reductions on the inputs.
-                    acc_stats[name]["h_trace_raw"] += float(chunk_h.sum().item())
+                    h_trace_dev = chunk_h.sum()
+                    if deferred_sync:
+                        slot = device_accums.get(name)
+                        if slot is None:
+                            slot = (
+                                torch.zeros((), device=h_trace_dev.device,
+                                            dtype=torch.float32),
+                                torch.zeros((), device=h_trace_dev.device,
+                                            dtype=torch.float32),
+                            )
+                            device_accums[name] = slot
+                        slot[0].add_(h_trace_dev)
+                    else:
+                        acc_stats[name]["h_trace_raw"] += float(
+                            h_trace_dev.item())
                     # h_w2_sum is a scalar proxy used as a fallback when
                     # full per-weight Fisher isn't available. When
                     # collect_h_full is on (which is whenever the cost
@@ -1660,9 +1689,18 @@ def _run_body_streaming_shard(
                     if not collect_h_full:
                         w = mod_ref.weight
                         if w is not None and not w.is_meta:
-                            acc_stats[name]["h_w2_sum_raw"] += float(
-                                (chunk_h * w.detach().float().pow(2)
-                                 .to(chunk_h.device)).sum().item())
+                            h_w2_dev = (
+                                chunk_h * w.detach().float().pow(2)
+                                .to(chunk_h.device)
+                            ).sum()
+                            if deferred_sync:
+                                # device_accums slot was created above
+                                # when h_trace was computed (h_trace
+                                # accum always runs first).
+                                device_accums[name][1].add_(h_w2_dev)
+                            else:
+                                acc_stats[name]["h_w2_sum_raw"] += float(
+                                    h_w2_dev.item())
                     acc_stats[name]["n_tokens_seen"] += T
                 return hook
 
@@ -1774,6 +1812,28 @@ def _run_body_streaming_shard(
             out.backward(grad_out.to(device))
             bwd_s = time.time() - bwd_t0
             phase_bwd_s += bwd_s
+
+            # v21 #1: batched device→host transfer of the per-Linear
+            # h_trace / h_w2_sum accumulators built up in the bwd hooks.
+            # Single sync per layer instead of two per Linear (47k
+            # Linears in unified-sweep × 2 = ~94k → ~62 syncs).
+            if deferred_sync and device_accums:
+                names = list(device_accums.keys())
+                # Stack into (2, N): row 0 = h_trace, row 1 = h_w2_sum.
+                # One .cpu() call → one CUDA sync.
+                stacked = torch.stack(
+                    [
+                        torch.stack([device_accums[n][0] for n in names]),
+                        torch.stack([device_accums[n][1] for n in names]),
+                    ],
+                    dim=0,
+                )
+                host = stacked.cpu().tolist()
+                tr_vals, w2_vals = host[0], host[1]
+                for n, tr_v, w2_v in zip(names, tr_vals, w2_vals):
+                    acc_stats[n]["h_trace_raw"] += float(tr_v)
+                    acc_stats[n]["h_w2_sum_raw"] += float(w2_v)
+                device_accums.clear()
 
             for local_key, raw in packed_grad_acc.items():
                 full_key = f"{layer_prefix}{local_key}"
