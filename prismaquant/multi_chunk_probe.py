@@ -56,6 +56,7 @@ from pathlib import Path
 os.environ.setdefault("PRISMAQUANT_PROBE_CTX_CACHE", "1")
 
 from prismaquant import incremental_probe as ip
+from prismaquant import incremental_measure_quant_cost as cost_step
 from prismaquant.adaptive_sampling import (
     AdaptiveExpertScheduler,
     aggregate_global_saliency,
@@ -163,6 +164,34 @@ def main() -> int:
                     help="Approximate prune cutoff used to define the "
                          "contested band around the prune decision "
                          "(default: 0.375, matching MiniMax launch).")
+    # v21 #2: in-process cost step. Sequential rather than concurrent
+    # — the multi-chunk probe pickle isn't ready until all chunks
+    # complete, so the cost step still runs after probing is done.
+    # The win is amortizing process / interpreter / streaming-context
+    # build cost vs launching cost as a separate Python invocation.
+    ap.add_argument("--run-cost", action="store_true", default=False,
+                    help="After the merged probe.pkl is written, invoke "
+                         "incremental_measure_quant_cost in-process. "
+                         "Probe StreamingContext is torn down first so "
+                         "the cost step's context build doesn't double "
+                         "the UMA memory footprint.")
+    ap.add_argument("--cost-output", default=None,
+                    help="cost.pkl output path (required if --run-cost).")
+    ap.add_argument("--cost-formats", default="NVFP4,MXFP8_E4M3,FP8_SOURCE,BF16",
+                    help="Comma-separated format list for the cost step.")
+    ap.add_argument("--cost-work-dir", default=None,
+                    help="Cost-step work dir; defaults to "
+                         "<work-dir>/cost_work when --run-cost.")
+    ap.add_argument("--cost-mode", choices=["auto", "batched", "unbatched"],
+                    default="batched")
+    ap.add_argument("--cost-chunk-size", type=int, default=256)
+    ap.add_argument("--cost-layers-per-shard", default=None,
+                    help="Cost layers-per-shard. Defaults to the probe's "
+                         "(picked up from passthrough args).")
+    ap.add_argument("--cost-h-detail-dir", default=None,
+                    help="Cost h-detail dir; off by default — h-detail "
+                         "writes ~940 GB/chunk on MiniMax, defer unless "
+                         "the disk has headroom.")
     args, passthrough = ap.parse_known_args()
     if args.retain_cross_chunk_cache:
         os.environ["PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK"] = "1"
@@ -341,6 +370,89 @@ def main() -> int:
           f"(total_nsamples={meta['multi_chunk_total_nsamples']}, "
           f"per-domain saliency: {n_domains} domains × "
           f"~{n_routers // max(n_domains, 1)} routers)", flush=True)
+
+    # v21 #2: in-process cost step. Sequential after the merged probe
+    # is written. The cost step builds its own StreamingContext, so we
+    # tear down the probe ctx first to keep peak UMA memory bounded.
+    if args.run_cost:
+        if not args.cost_output:
+            print("[multi-chunk] --run-cost requires --cost-output",
+                  file=sys.stderr)
+            return 2
+        # Tear down the probe's persistent ctx so cost can build its own
+        # without doubling UMA pressure. After this point the probe is
+        # done and no further chunk loop runs in this process.
+        try:
+            for key, (ctx, _tok) in list(ip._PROBE_CTX_CACHE.items()):
+                try:
+                    ctx.shutdown()
+                except Exception as e:
+                    print(f"[multi-chunk] ctx shutdown raised: {e!r}",
+                          file=sys.stderr)
+                ip._PROBE_CTX_CACHE.pop(key, None)
+        except Exception as e:
+            print(f"[multi-chunk] probe ctx teardown failed (continuing): "
+                  f"{e!r}", file=sys.stderr)
+        # Force a gc + cuda empty before cost starts so the cost ctx
+        # build sees the freshest MemAvailable.
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
+        cost_work_dir = (
+            Path(args.cost_work_dir) if args.cost_work_dir
+            else (work_root / "cost_work")
+        )
+        cost_argv = [
+            "prismaquant.incremental_measure_quant_cost",
+            "--model", _extract_arg_value(base_argv, "--model") or "",
+            "--probe", str(out_path),
+            "--activation-cache-dir",
+            _extract_arg_value(base_argv, "--activation-cache-dir") or "",
+            "--output", str(args.cost_output),
+            "--work-dir", str(cost_work_dir),
+            "--device", _extract_arg_value(base_argv, "--device") or "cuda",
+            "--dtype", _extract_arg_value(base_argv, "--dtype") or "bf16",
+            "--formats", args.cost_formats,
+            "--mode", args.cost_mode,
+            "--chunk-size", str(args.cost_chunk_size),
+            "--skip-missing-activations",
+        ]
+        cost_lps = (
+            args.cost_layers_per_shard
+            or _extract_arg_value(base_argv, "--layers-per-shard")
+            or "auto"
+        )
+        cost_argv += ["--layers-per-shard", str(cost_lps)]
+        if args.cost_h_detail_dir:
+            cost_argv += ["--h-detail-dir", args.cost_h_detail_dir]
+        # Sanity check the model & activation-cache-dir survived the
+        # passthrough split — a missing value here would silently
+        # produce a useless cost.pkl, so loud-fail instead.
+        if not cost_argv[3] or not cost_argv[7]:
+            print("[multi-chunk] --run-cost requires --model and "
+                  "--activation-cache-dir to be in the probe passthrough "
+                  "args.", file=sys.stderr)
+            return 2
+
+        print(f"\n[multi-chunk] === cost step (in-process) ===", flush=True)
+        print(f"[multi-chunk] cost output: {args.cost_output}", flush=True)
+        print(f"[multi-chunk] cost work-dir: {cost_work_dir}", flush=True)
+        t_cost = time.time()
+        saved_argv = sys.argv
+        sys.argv = cost_argv
+        try:
+            cost_step.main()
+        finally:
+            sys.argv = saved_argv
+        print(f"[multi-chunk] cost step done in "
+              f"{time.time()-t_cost:.0f}s", flush=True)
     return 0
 
 
