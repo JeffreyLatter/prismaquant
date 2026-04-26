@@ -26,6 +26,42 @@ from accelerate.utils.modeling import set_module_tensor_to_device
 from safetensors import safe_open
 
 
+# ---------------------------------------------------------------------------
+# v21 #5: opt-in direct-to-CUDA safetensors load. Default path opens the
+# safetensors file with framework="pt" (CPU mmap) and explicitly moves
+# each tensor to device with `.to(device, non_blocking=True)`. That
+# allocates a host-side torch.Tensor object even though the underlying
+# bytes are mmapped, then issues a host→device cudaMemcpy.
+#
+# When PRISMAQUANT_DIRECT_CUDA_LOAD=1 is set, we instead pass
+# `device=str(device)` to safe_open so safetensors materializes the
+# tensor directly on the CUDA device. On UMA hardware (DGX Spark) the
+# physical memory is shared, so the win is mostly the elision of the
+# extra Python-side host tensor object and one redundant memcpy step;
+# expected savings are 10–30 ms per layer load (modest but additive
+# across 16 chunks × 2 phases × ~62 layers).
+#
+# Falls back to the host-stage path on any TypeError / RuntimeError to
+# stay compatible with older safetensors releases that do not accept
+# the device kwarg.
+# ---------------------------------------------------------------------------
+def _direct_cuda_enabled() -> bool:
+    return os.environ.get("PRISMAQUANT_DIRECT_CUDA_LOAD") == "1"
+
+
+def _safe_open_kwargs(device: torch.device) -> dict:
+    if (_direct_cuda_enabled()
+            and isinstance(device, torch.device)
+            and device.type == "cuda"):
+        # Fully qualified device string is what safetensors expects
+        # (e.g. "cuda:0" — `str(torch.device("cuda"))` gives "cuda" but
+        # we explicitly normalize to "cuda:<index>" so multi-GPU runs
+        # don't accidentally land on the wrong card).
+        idx = device.index if device.index is not None else 0
+        return {"framework": "pt", "device": f"cuda:{idx}"}
+    return {"framework": "pt"}
+
+
 def _build_weight_map(model_path: str, *,
                       multimodal: bool = False
                       ) -> tuple[dict[str, str], dict[str, str]]:
@@ -342,8 +378,15 @@ def _materialize(model: nn.Module, prefixes: list[str],
             by_shard[shard].append((model_name, model_to_ckpt[model_name]))
     # Collect loaded tensors first so we can batch the scale-read pass.
     out: dict[str, torch.Tensor] = {}
+    open_kwargs = _safe_open_kwargs(device)
     for shard, pairs in by_shard.items():
-        with safe_open(shard, framework="pt") as f:
+        try:
+            f_ctx = safe_open(shard, **open_kwargs)
+        except (TypeError, RuntimeError):
+            # Older safetensors / unsupported device combos: drop the
+            # device kwarg and fall back to the host-stage path.
+            f_ctx = safe_open(shard, framework="pt")
+        with f_ctx as f:
             for model_name, ckpt_name in pairs:
                 t = f.get_tensor(ckpt_name)
                 if (t.is_floating_point()
@@ -381,15 +424,24 @@ def _read_layer_to_device(prefix: str,
         if model_name.startswith(prefix):
             by_shard[shard].append((model_name, model_to_ckpt[model_name]))
     out: dict[str, torch.Tensor] = {}
+    open_kwargs = _safe_open_kwargs(device)
+    direct = "device" in open_kwargs
     for shard, pairs in by_shard.items():
-        with safe_open(shard, framework="pt") as f:
+        try:
+            f_ctx = safe_open(shard, **open_kwargs)
+            used_direct = direct
+        except (TypeError, RuntimeError):
+            f_ctx = safe_open(shard, framework="pt")
+            used_direct = False
+        with f_ctx as f:
             for model_name, ckpt_name in pairs:
                 t = f.get_tensor(ckpt_name)
                 if (t.is_floating_point()
                         and not _is_fp8_scaled_tensor(
                             model_name, fp8_scale_inv_map)):
                     t = t.to(dtype)
-                t = t.to(device, non_blocking=True)
+                if not used_direct:
+                    t = t.to(device, non_blocking=True)
                 if not t.is_contiguous():
                     t = t.contiguous()
                 out[model_name] = t
