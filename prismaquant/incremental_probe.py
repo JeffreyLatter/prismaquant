@@ -242,6 +242,43 @@ def _set_minimax_fast_moe(
 
 
 # ---------------------------------------------------------------------------
+# Memory snapshot (v20 hygiene)
+# ---------------------------------------------------------------------------
+def _read_proc_status_kb(*keys: str) -> dict[str, int]:
+    """Read /proc/self/status for the given keys (e.g. 'VmHWM', 'VmRSS').
+    Returns a dict of key -> kilobytes. Missing keys map to 0."""
+    out = {k: 0 for k in keys}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                k = k.strip()
+                if k in out:
+                    out[k] = int(rest.strip().split()[0])
+    except Exception:
+        pass
+    return out
+
+
+def _print_mem_snapshot(label: str, log_prefix: str = "[incremental]"):
+    """One-line memory snapshot at a phase boundary. Reads VmHWM
+    (process high-water mark RSS), VmRSS (current resident), VmSwap
+    (paged out), and MemAvailable (system-wide). All values in GB."""
+    proc = _read_proc_status_kb("VmHWM", "VmRSS", "VmSwap")
+    try:
+        import psutil
+        avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        avail_gb = -1.0
+    print(f"{log_prefix} mem[{label}] "
+          f"vmhwm={proc['VmHWM']/(1024**2):.1f}GB "
+          f"vmrss={proc['VmRSS']/(1024**2):.1f}GB "
+          f"swap={proc['VmSwap']/(1024**2):.1f}GB "
+          f"sys_avail={avail_gb:.1f}GB",
+          flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Shard regex builders (unchanged public API)
 # ---------------------------------------------------------------------------
 def build_layer_shard_regexes(num_hidden_layers: int,
@@ -343,6 +380,186 @@ def _count_mtp_layers_from_safetensors(model_path: str) -> int:
         if m:
             mtp_indices.add(int(m.group(1)))
     return max(mtp_indices) + 1 if mtp_indices else 0
+
+
+# ---------------------------------------------------------------------------
+# Predeclared shard schedule (v20 step 1)
+#
+# A ShardSchedule is the full, statically-known list of shards that phase-3
+# will process for a chunk. Each entry pairs the linear-include regex (the
+# only thing the runners themselves consume) with kind + the layer indices
+# in scope, so policy code (cache mark_done, instrumentation, allocator)
+# can answer "what layers are in shard S?" without re-parsing regexes.
+#
+# This unblocks v20 steps 2-5: mark_done events fall out of
+# `layers_done_after(shard_idx)`, value-aware retention can preload the
+# layers reused across all shards, etc.
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class ShardEntry:
+    shard_idx: int
+    linear_include: str
+    kind: str  # "body", "mtp", "visual", "lm_head"
+    layer_indices: frozenset[int]
+    layer_prefix: str | None  # "model.layers", "mtp.layers", "model.visual.blocks"; None for lm_head
+
+
+@dataclasses.dataclass(frozen=True)
+class ShardSchedule:
+    entries: tuple[ShardEntry, ...]
+
+    def __iter__(self):
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, i: int) -> ShardEntry:
+        return self.entries[i]
+
+    def regexes(self) -> list[str]:
+        return [e.linear_include for e in self.entries]
+
+    def body_layer_indices(self,
+                           layer_prefix: str = "model.layers") -> frozenset[int]:
+        out: set[int] = set()
+        for e in self.entries:
+            if e.layer_prefix == layer_prefix:
+                out |= e.layer_indices
+        return frozenset(out)
+
+    def layers_done_after(self, shard_idx: int,
+                          layer_prefix: str = "model.layers") -> frozenset[int]:
+        """Layer indices in shard_idx's scope that no later shard touches.
+
+        For the canonical body-shard layout (contiguous, disjoint ranges
+        per shard), this is exactly the in-scope layers of shard_idx.
+        For unified-sweep (one body shard) it returns the full body
+        layer set after the only shard. The cache uses this signal to
+        evict layers we've provably stopped tracking stats for."""
+        if shard_idx >= len(self.entries):
+            return frozenset()
+        cur = self.entries[shard_idx]
+        if cur.layer_prefix != layer_prefix:
+            return frozenset()
+        future: set[int] = set()
+        for e in self.entries[shard_idx + 1:]:
+            if e.layer_prefix == layer_prefix:
+                future |= e.layer_indices
+        return cur.layer_indices - future
+
+
+def _build_body_shard_entries(num_layers: int, layers_per_shard: int,
+                              layer_prefix: str,
+                              kind: str,
+                              start_idx: int) -> list[ShardEntry]:
+    """Mirror of build_layer_shard_regexes but emits ShardEntry list."""
+    entries: list[ShardEntry] = []
+    sidx = start_idx
+    for start in range(0, num_layers, layers_per_shard):
+        end = min(start + layers_per_shard, num_layers)
+        if end - start == 1:
+            body = rf"{re.escape(layer_prefix)}\.{start}\."
+        else:
+            idxs = "|".join(str(i) for i in range(start, end))
+            body = rf"{re.escape(layer_prefix)}\.(?:{idxs})\."
+        entries.append(ShardEntry(
+            shard_idx=sidx,
+            linear_include=body,
+            kind=kind,
+            layer_indices=frozenset(range(start, end)),
+            layer_prefix=layer_prefix,
+        ))
+        sidx += 1
+    return entries
+
+
+def build_shard_schedule(
+    *,
+    model_path: str,
+    num_body_layers: int,
+    body_layers_per_shard: int,
+    body_layer_range: tuple[int, int],
+    include_mtp: bool,
+    include_visual: bool,
+    include_lm_head: bool,
+    unified_body_sweep: bool,
+) -> ShardSchedule:
+    """Single source of truth for the shard list.
+
+    body_layer_range = (first_layer, last_layer_exclusive) — slices the
+    body shard list to this range (default (0, num_body_layers))."""
+    sidx = 0
+
+    # Body shards (mirror old slice semantics).
+    body_entries_full = _build_body_shard_entries(
+        num_body_layers, body_layers_per_shard, "model.layers", "body", sidx)
+    first = body_layer_range[0] // body_layers_per_shard
+    last = (body_layer_range[1] + body_layers_per_shard - 1) // body_layers_per_shard
+    body_entries = body_entries_full[first:last]
+    # Renumber after slice so shard_idx is contiguous from 0.
+    body_entries = [
+        dataclasses.replace(e, shard_idx=sidx + i)
+        for i, e in enumerate(body_entries)
+    ]
+    sidx += len(body_entries)
+
+    if unified_body_sweep and body_entries:
+        union = "(?:" + "|".join(
+            f"(?:{e.linear_include})" for e in body_entries) + ")"
+        union_layers = frozenset().union(
+            *(e.layer_indices for e in body_entries))
+        body_entries = [ShardEntry(
+            shard_idx=0,
+            linear_include=union,
+            kind="body",
+            layer_indices=union_layers,
+            layer_prefix="model.layers",
+        )]
+        sidx = 1
+
+    extras: list[ShardEntry] = []
+    src_cfg_path = Path(model_path) / "config.json"
+    with open(src_cfg_path) as f:
+        cfg = json.load(f)
+    text_cfg = cfg.get("text_config", cfg)
+    vis_cfg = cfg.get("vision_config", {})
+
+    if include_mtp:
+        n_mtp = int(
+            text_cfg.get("num_nextn_predict_layers")
+            or cfg.get("num_nextn_predict_layers")
+            or text_cfg.get("num_mtp_layers")
+            or cfg.get("num_mtp_layers")
+            or _count_mtp_layers_from_safetensors(model_path)
+            or 0
+        )
+        if n_mtp > 0:
+            mtp_entries = _build_body_shard_entries(
+                n_mtp, body_layers_per_shard, "mtp.layers", "mtp", sidx)
+            extras.extend(mtp_entries)
+            sidx += len(mtp_entries)
+
+    if include_visual:
+        n_vis = int(vis_cfg.get("depth") or vis_cfg.get("num_hidden_layers") or 0)
+        if n_vis > 0:
+            vis_per_shard = max(body_layers_per_shard, 4)
+            vis_entries = _build_body_shard_entries(
+                n_vis, vis_per_shard, "model.visual.blocks", "visual", sidx)
+            extras.extend(vis_entries)
+            sidx += len(vis_entries)
+
+    if include_lm_head:
+        extras.append(ShardEntry(
+            shard_idx=sidx,
+            linear_include=r"^lm_head$",
+            kind="lm_head",
+            layer_indices=frozenset(),
+            layer_prefix=None,
+        ))
+        sidx += 1
+
+    return ShardSchedule(entries=tuple(body_entries + extras))
 
 
 # ---------------------------------------------------------------------------
@@ -1214,6 +1431,7 @@ def _run_body_streaming_shard(
         del grad_at_tail
     else:
         # ---- Phase 3: reverse sweep, Fisher collection only on tracked Linears ----
+        _print_mem_snapshot("phase-3 start")
         t_phase = time.time()
         phase_load_s = 0.0
         phase_bwd_s = 0.0
@@ -1655,6 +1873,7 @@ def _run_body_streaming_shard(
               f"load_by_src=[{load_parts}]  "
               f"{ctx.layer_cache.summary()}  {ctx.prefetch_summary()}",
               flush=True)
+        _print_mem_snapshot("phase-3 done")
 
         # `activations_cpu` is a shared reference into the global
         # precompute; do not free it here — the caller reuses across
@@ -2006,6 +2225,19 @@ def main():
                          "per-weight delta loss = 0.5 * <H, MSE_W> instead "
                          "of the scalar proxy. Omit to keep the legacy "
                          "scalar path.")
+    ap.add_argument("--unified-sweep", action="store_true", default=False,
+                    help="Phase-3 in ONE reverse sweep through all 62 "
+                         "layers, tracking ALL in-scope Linears at once "
+                         "instead of N=ceil(num_layers/lps) per-shard "
+                         "sweeps. ~16x reduction in disk reads + redundant "
+                         "backward computation. Memory bounded by skipping "
+                         "the per-weight h_full matrix accumulator (47k × "
+                         "17 MB = 800 GB CPU, doesn't fit), keeping only "
+                         "scalar h_trace + h_w2_sum. Cost stage falls "
+                         "back to the scalar predicted_dloss formula "
+                         "which preserves relative Linear ranking — the "
+                         "load-bearing signal for the allocator's "
+                         "format-choice DP. Forces --h-detail-dir off.")
     ap.add_argument("--prefetch-lookahead",
                     default=os.environ.get("PREFETCH_LOOKAHEAD", "auto"),
                     help="Number of layers to queue ahead in the disk "
@@ -2096,23 +2328,36 @@ def main():
           f"activation_rows_limit={args.activation_rows_limit}",
           flush=True)
 
-    body_regexes = build_layer_shard_regexes(
-        n_layers, args.layers_per_shard, layer_prefix="model.layers")
-    first_shard = start // args.layers_per_shard
-    last_shard = (end + args.layers_per_shard - 1) // args.layers_per_shard
-    shard_regexes = body_regexes[first_shard:last_shard]
+    if args.unified_sweep and args.h_detail_dir:
+        # h_detail off-switch must fire BEFORE schedule build so the
+        # reusable-shard meta hash matches; the runners themselves only
+        # see the final args.h_detail_dir.
+        print("[incremental] --unified-sweep forces --h-detail-dir "
+              "off (per-weight Fisher matrix would need ~800 GB CPU "
+              "with all-Linears-at-once tracking)", flush=True)
+        args.h_detail_dir = None
 
-    extra = build_extended_shard_regexes(
-        args.model, args.layers_per_shard,
-        include_body=False,
+    schedule = build_shard_schedule(
+        model_path=args.model,
+        num_body_layers=n_layers,
+        body_layers_per_shard=args.layers_per_shard,
+        body_layer_range=(start, end),
         include_mtp=args.include_mtp,
         include_visual=args.include_visual,
         include_lm_head=args.include_lm_head,
+        unified_body_sweep=args.unified_sweep,
     )
-    shard_regexes = shard_regexes + extra
+    shard_regexes = schedule.regexes()
+    n_body = sum(1 for e in schedule if e.kind == "body")
+    n_extras = len(schedule) - n_body
+    if args.unified_sweep:
+        # Approximate count of pre-collapse shards for the existing log line.
+        pre_union = (end - start + args.layers_per_shard - 1) // args.layers_per_shard
+        print(f"[incremental] --unified-sweep: collapsed {pre_union} "
+              f"body shards into 1 union regex; phase-3 runs as a single "
+              f"reverse sweep", flush=True)
     print(f"[incremental] shard regexes: {len(shard_regexes)} total "
-          f"(body={len(body_regexes[first_shard:last_shard])}, extras={len(extra)})",
-          flush=True)
+          f"(body={n_body}, extras={n_extras})", flush=True)
 
     work_dir = Path(args.work_dir)
     shard_dir = work_dir / "shards"
@@ -2173,6 +2418,7 @@ def main():
                       f"between-chunk reset freed {diag['freed_gb']:.1f} GB "
                       f"(avail {diag['before_avail_gb']:.0f}->{diag['after_avail_gb']:.0f} GB)",
                       flush=True)
+                _print_mem_snapshot("chunk start (post-reset)")
         if ctx is None:
             from transformers import AutoTokenizer
             staged = stage_text_only(args.model)
@@ -2302,11 +2548,44 @@ def main():
         print(f"[incremental] linear cache: {len(linear_cache)} stats pooled "
               f"from prior shards (LPS-invariant reuse enabled)", flush=True)
 
+    # v20 step 2: precompute mark_done trigger. After the last body
+    # shard, all body-layer tensors can be released — only non-body
+    # shards (visual, lm_head) remain and they don't load body layers.
+    last_body_shard_idx = max(
+        (e.shard_idx for e in schedule if e.kind == "body"), default=-1)
+    body_layers_marked_done = False
+
+    def _mark_body_done_once(reason: str):
+        # v20 fix #3: mark_done must fire even when the last body
+        # shard is reused/synthesized (continue-skipped the old
+        # in-loop call). Hoisted to a helper so we can call from
+        # the body→non-body transition AND from end-of-loop.
+        nonlocal body_layers_marked_done
+        if body_layers_marked_done or ctx is None:
+            return
+        if last_body_shard_idx < 0:
+            return
+        transitioned = ctx.layer_cache.mark_layers_done(
+            schedule.body_layer_indices())
+        body_layers_marked_done = True
+        if transitioned:
+            print(f"[incremental] mark_done ({reason}): {transitioned} body "
+                  f"layers transitioned (refuse future puts; "
+                  f"refused_so_far={ctx.layer_cache.refused_puts})",
+                  flush=True)
+
     try:
         if not all_reusable:
             _ensure_ready()
 
         for shard_idx, linear_include in enumerate(shard_regexes):
+            # v20 fix #3: when crossing the body→non-body boundary,
+            # mark body layers done before the next (non-body) shard
+            # runs so its memory pressure benefits from the freed
+            # cache slots. Fires regardless of how the body shards
+            # were processed (computed/reused/synthesized).
+            if shard_idx > last_body_shard_idx and last_body_shard_idx >= 0:
+                _mark_body_done_once("body→non-body transition")
             shard_path = shard_paths[shard_idx]
             expected_meta = expected_metas[shard_idx]
             if shard_path.exists() and probe_shard_is_reusable(shard_path, expected_meta):
@@ -2448,8 +2727,35 @@ def main():
             gc.collect()
             if exec_device.type == "cuda":
                 torch.cuda.empty_cache()
+            # MiniMax-M2's per-shard merged_h_full holds ~52 GB of fp32
+            # CPU tensors (4 layers × 256 experts × 3 weights × 17 MB).
+            # CPython's pymalloc + glibc malloc don't return mapped pages
+            # to the OS after dict deletion, so MemAvailable doesn't
+            # recover and the next shard hits OOM. malloc_trim(0) forces
+            # glibc to release unused arena memory. No-op on platforms
+            # without malloc_trim (the ctypes.CDLL fails gracefully).
+            try:
+                import ctypes
+                _libc = ctypes.CDLL("libc.so.6", use_errno=False)
+                _libc.malloc_trim.argtypes = [ctypes.c_size_t]
+                _libc.malloc_trim.restype = ctypes.c_int
+                _libc.malloc_trim(0)
+            except Exception:
+                pass
+        # v20 fix #3: end-of-loop fallback if no non-body shards
+        # followed (e.g., text-only run with --no-include-{mtp,visual,lm-head}).
+        # The transition check above never fired, so mark body layers
+        # done now to refuse stale prefetches before the chunk ends.
+        _mark_body_done_once("end of shard loop")
     finally:
-        if ctx is not None:
+        # v20 fix #2: under PRISMAQUANT_PROBE_CTX_CACHE=1 the ctx is
+        # cached for chunk 1+ in the in-process driver. Shutting down
+        # its prefetch_pool here would kill the executor and any
+        # subsequent schedule_prefetch() in chunk 1 would raise
+        # RuntimeError("cannot schedule new futures after shutdown").
+        # Keep the ctx alive for the cache; reset_between_chunks()
+        # handles per-chunk cleanup.
+        if ctx is not None and not use_persistent:
             ctx.shutdown()
 
     # ---- Phase 2 multimodal visual probe (non-streaming second pass) ----

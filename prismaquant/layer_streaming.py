@@ -529,6 +529,29 @@ class LayerCache:
         # 0 disables. Set via configure_pressure_threshold().
         self._pressure_threshold_bytes: int = 0
         self.pressure_evictions = 0
+        # Mark-done set (v20 step 2): layers the scheduler has declared
+        # provably won't be requested again this chunk. put() refuses
+        # to repopulate, get()/peek() see them as not-cached. Cleared
+        # at chunk boundaries by clear_done() (called from
+        # StreamingContext.reset_between_chunks).
+        #
+        # Within a single phase-3 sweep, NO body layer can be marked done
+        # — every shard re-traverses all layers for backward gradient
+        # propagation. The valid call sites are:
+        #   1. After phase-1 completes, for layers not in any phase-3 shard.
+        #   2. After phase-3 completes, for ALL body layers (only non-body
+        #      shards remain, e.g. visual/lm_head, which don't load body
+        #      layer tensors).
+        #   3. Implicit at chunk teardown via clear_done().
+        self._done_layers: set[int] = set()
+        self.refused_puts = 0
+        # Dynamic budget reserve (v20 step 3+4): when > 0, put()
+        # recomputes the effective max as
+        #   min(max_bytes, MemAvailable + total_bytes - reserve)
+        # so the cache shrinks under host-memory pressure and grows
+        # back up to max_bytes when other processes free RAM.
+        # 0 = static max_bytes only (default).
+        self._dynamic_reserve_bytes: int = 0
 
     def _sizeof(self, tensors: dict[str, torch.Tensor]) -> int:
         return sum(t.numel() * t.element_size() for t in tensors.values())
@@ -554,19 +577,54 @@ class LayerCache:
         scheduler so checking doesn't reshuffle eviction order."""
         return layer_idx in self._cache
 
-    def put(self, layer_idx: int, tensors: dict[str, torch.Tensor]):
+    def put(self, layer_idx: int, tensors: dict[str, torch.Tensor],
+            force: bool = True) -> bool:
+        """Insert tensors into the cache. Returns True on success.
+
+        force=True (default): always insert, even if the layer is
+            larger than effective_max — required for cold ensure_loaded
+            paths where the consumer needs the layer regardless of
+            budget. After evict-all, the cache may be over budget for
+            this one entry until the next put() naturally evicts it.
+
+        force=False: refuse the insert if size > effective_max after
+            evict-all. Used by the prefetch worker — a layer that
+            won't fit shouldn't displace cache state speculatively.
+            v20 fix #5.
+        """
+        # v20 step 2: refuse to populate a layer the scheduler said is
+        # done. This catches stale in-flight prefetches and any policy
+        # bug where a "won't be reused" claim turned out to be wrong —
+        # the silent no-op + counter makes the bug visible without
+        # crashing the run.
+        if layer_idx in self._done_layers:
+            self.refused_puts += 1
+            return False
         if layer_idx in self._cache:
-            return
+            return False
         size = self._sizeof(tensors)
-        evicted = False
         # Pressure-shrink check (Task #3): if MemAvailable is below the
         # configured threshold, drop entries until we've halved cache
         # bytes (or exhausted candidates). Skips priority layers.
         self._maybe_pressure_shrink()
+        # v20 step 3+4: dynamic budget — recompute effective_max from
+        # current MemAvailable so the cache shrinks under load and
+        # grows back when other processes free RAM. Bounded by static
+        # max_bytes. When _dynamic_reserve_bytes is 0 (default), this
+        # reduces to the static budget.
+        effective_max = self._effective_max()
+        # v20 fix #5: refuse over-budget prefetch BEFORE eviction.
+        # If size > effective_max, no eviction makes room — and we
+        # don't want to evict valuable entries just to refuse the new
+        # one. Cold path (force=True) skips this check.
+        if not force and size > effective_max:
+            self.refused_puts += 1
+            return False
+        evicted = False
         # In-scope priority eviction (Task #4): when full, prefer evicting
         # out-of-scope (non-priority) entries before in-scope ones. Falls
         # back to LRU order if all candidates are in-scope.
-        while (self.total_bytes + size > self.max_bytes
+        while (self.total_bytes + size > effective_max
                and len(self._cache) > 0):
             evict_idx = self._pick_evict_candidate()
             if evict_idx is None:
@@ -582,6 +640,7 @@ class LayerCache:
         # the shared LPDDR5X pool. Force a release after each eviction.
         if evicted and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        return True
 
     def _pick_evict_candidate(self) -> int | None:
         """Return the layer_idx of the LRU non-priority entry, or the
@@ -598,10 +657,12 @@ class LayerCache:
 
     def _maybe_pressure_shrink(self):
         """If system MemAvailable is below the configured threshold,
-        drop entries until cache bytes have halved (or we've evicted
-        all non-priority entries). Used to react to spikes from other
-        processes (prefetcher, backward gradient transients, etc.)
-        before the LRU mechanism would notice."""
+        drop entries until cache bytes have halved or we recover
+        headroom. Two-phase: non-priority first, then priority if
+        still under pressure. v20 fix #4-B: previously returned early
+        when only priority entries remained (e.g., unified-sweep
+        marks every body layer priority), so pressure shrink was a
+        no-op when it mattered most."""
         if self._pressure_threshold_bytes <= 0 or not self._cache:
             return
         try:
@@ -613,14 +674,35 @@ class LayerCache:
             return
         target = self.total_bytes // 2
         evicted_any = False
-        while self.total_bytes > target and self._cache:
-            evict_idx = self._pick_evict_candidate()
-            if evict_idx is None or evict_idx in self._priority_layers:
+
+        # Phase 1: non-priority LRU, no priority fallback.
+        for idx in list(self._cache.keys()):
+            if self.total_bytes <= target:
                 break
-            self._cache.pop(evict_idx, None)
-            self.total_bytes -= self._bytes.pop(evict_idx, 0)
+            if idx in self._priority_layers:
+                continue
+            self._cache.pop(idx, None)
+            self.total_bytes -= self._bytes.pop(idx, 0)
             evicted_any = True
             self.pressure_evictions += 1
+
+        # Phase 2: re-check pressure; if still tight, drop priority
+        # entries in LRU order. Priority is a preference, not a hard
+        # contract — when host memory is genuinely scarce, holding
+        # cached weights is worse than re-loading them.
+        try:
+            avail = psutil.virtual_memory().available
+        except Exception:
+            avail = self._pressure_threshold_bytes
+        if avail < self._pressure_threshold_bytes:
+            for idx in list(self._cache.keys()):
+                if self.total_bytes <= target:
+                    break
+                self._cache.pop(idx, None)
+                self.total_bytes -= self._bytes.pop(idx, 0)
+                evicted_any = True
+                self.pressure_evictions += 1
+
         if evicted_any and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -628,6 +710,61 @@ class LayerCache:
         """Set the MemAvailable byte threshold below which the cache
         triggers proactive eviction. 0 disables (default)."""
         self._pressure_threshold_bytes = int(available_bytes_floor)
+
+    def configure_dynamic_budget(self, reserve_bytes: int):
+        """Enable dynamic cap: effective_max = min(max_bytes,
+        MemAvailable + total_bytes - reserve_bytes). Each put()
+        re-evaluates against current MemAvailable, so the cache
+        breathes with host memory pressure. 0 disables (static max)."""
+        self._dynamic_reserve_bytes = int(reserve_bytes)
+
+    def prepare_for_load(self, size_hint: int) -> int:
+        """Pre-evict entries to make room for an incoming layer load
+        of approximately size_hint bytes. v20 fix #1: the dynamic
+        budget cap in put() runs AFTER the load lands in memory,
+        which on UMA can push the system into OOM during the load
+        itself. Calling this before _read_layer_to_device gives the
+        cache a chance to free bytes first.
+
+        Eviction order: LRU non-priority first, then LRU priority.
+        Returns the number of bytes actually freed (caller can decide
+        whether to skip the load if 0 was freed and we're tight)."""
+        self._maybe_pressure_shrink()
+        effective_max = self._effective_max()
+        target_total = max(0, effective_max - max(0, size_hint))
+        freed = 0
+        while self.total_bytes > target_total and self._cache:
+            evict_idx = self._pick_evict_candidate()
+            if evict_idx is None:
+                break
+            size = self._bytes.get(evict_idx, 0)
+            self._cache.pop(evict_idx, None)
+            self.total_bytes -= self._bytes.pop(evict_idx, 0)
+            freed += size
+        if freed and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return freed
+
+    def _effective_max(self) -> int:
+        """Compute the byte cap that put() should honor for this call.
+
+        With dynamic budget disabled (default), returns static max_bytes.
+        With dynamic budget on, caps such that completing this put will
+        leave the system with at least reserve_bytes of MemAvailable.
+        Falls back to static max if psutil is unavailable."""
+        if self._dynamic_reserve_bytes <= 0:
+            return self.max_bytes
+        try:
+            import psutil
+            avail = psutil.virtual_memory().available
+        except Exception:
+            return self.max_bytes
+        # If we evicted everything, MemAvailable would rise by total_bytes.
+        # We want post-eviction-and-put: avail_after >= reserve.
+        # avail_after = avail + (current_total - new_cache_bytes), so
+        # new_cache_bytes <= avail + current_total - reserve.
+        room = avail + self.total_bytes - self._dynamic_reserve_bytes
+        return max(0, min(self.max_bytes, room))
 
     def set_priority_layers(self, layers: "set[int] | list[int]"):
         """Mark these layer indices as in-scope/priority. They are
@@ -647,6 +784,30 @@ class LayerCache:
         if tensors is None:
             return
         self.total_bytes -= self._bytes.pop(layer_idx, 0)
+
+    def mark_done(self, layer_idx: int):
+        """Declare layer_idx provably won't be requested again. Evicts
+        any cached entry and refuses future put() until clear_done().
+
+        See _done_layers comment for valid call sites."""
+        self.discard(layer_idx)
+        self._done_layers.add(layer_idx)
+
+    def mark_layers_done(self, layer_indices) -> int:
+        """Bulk mark_done. Returns the count actually transitioned (i.e.
+        excluding layers that were already in the done set)."""
+        before = len(self._done_layers)
+        for L in layer_indices:
+            self.discard(L)
+            self._done_layers.add(L)
+        return len(self._done_layers) - before
+
+    def clear_done(self):
+        """Reset the mark-done set. Called at chunk boundaries by
+        StreamingContext.reset_between_chunks() so the next chunk's
+        loads work normally."""
+        self._done_layers.clear()
+        self.refused_puts = 0
 
     def clear(self):
         self._cache.clear()

@@ -273,11 +273,30 @@ class StreamingContext:
         self._inflight_lock = threading.Lock()
 
     def _prefetch_worker(self, L: int):
+        # v20 fix #1: re-check memory + pre-evict before the read.
+        # schedule_prefetch's check may be stale if the queue was deep,
+        # and the cache's dynamic budget only kicks in at put() time —
+        # which is too late on UMA where the read itself can OOM.
+        if self.prefetch_min_available_bytes > 0:
+            try:
+                import psutil
+                if psutil.virtual_memory().available < self.prefetch_min_available_bytes:
+                    self.prefetch_memory_skips += 1
+                    with self._inflight_lock:
+                        self._inflight.pop(L, None)
+                    return None
+            except Exception:
+                pass
+        self.layer_cache.prepare_for_load(self.estimated_layer_bytes)
         prefix = f"{self.layers_prefix}{L}."
         tensors = _read_layer_to_device(
             prefix, self.weight_shard, self.weight_ckpt, self.dtype,
             self.device, fp8_scale_inv_map=self.fp8_scale_inv_map)
-        self.layer_cache.put(L, tensors)
+        # v20 fix #5: prefetch path doesn't force-insert. If the layer
+        # exceeds effective budget, the put returns False and the
+        # tensors fall out of scope here — ensure_loaded will re-load
+        # synchronously when actually needed.
+        self.layer_cache.put(L, tensors, force=False)
         with self._inflight_lock:
             self._inflight.pop(L, None)
         return tensors
@@ -313,6 +332,11 @@ class StreamingContext:
             cached = self.layer_cache.get(L)
             if cached is not None:
                 return cached, "wait"
+        # v20 fix #1: pre-evict to make room for the synchronous read.
+        # Cold path can't skip (the consumer needs this layer now), so
+        # prepare_for_load best-efforts; if effective_max < layer size,
+        # the cache still inserts (correctness > budget for cold).
+        self.layer_cache.prepare_for_load(self.estimated_layer_bytes)
         prefix = f"{self.layers_prefix}{L}."
         tensors = _read_layer_to_device(
             prefix, self.weight_shard, self.weight_ckpt, self.dtype,
@@ -323,11 +347,16 @@ class StreamingContext:
     def install(self, L: int):
         tensors, src = self.ensure_loaded(L)
         _fast_install(self.install_resolvers[L], tensors, self.device, model=self.model)
-        # This run is a one-way layer stream. Once the tensors are
-        # installed, the model owns them until `unload`; keeping a cache
-        # reference would make the current layer MRU and cause prefetch
-        # churn to evict the next layer we are about to need.
-        self.layer_cache.discard(L)
+        # v20 step 3+4: value-aware retention. The historical
+        # one-way-stream assumption (discard immediately after install)
+        # is wrong for multi-shard workloads where every phase-3 shard
+        # re-traverses all layers. _fast_install rebinds tensors by
+        # reference, so the cache entry shares storage with the
+        # model — keeping it costs no extra memory until the model
+        # unload()s, and even then the entry is bounded by the cache's
+        # dynamic budget (eviction follows LRU in put() when full).
+        # Layers the scheduler has provably finished with are filtered
+        # out via mark_done (v20 step 2).
         return src
 
     def unload(self, L: int):
@@ -370,6 +399,19 @@ class StreamingContext:
         self.layer_cache._cache.clear()
         self.layer_cache._bytes.clear()
         self.layer_cache.total_bytes = 0
+        # v20 step 2: drop the mark-done set so the next chunk's loads
+        # aren't refused. Without this, layers marked done at end of
+        # chunk N's phase-3 would silently fail to repopulate in chunk
+        # N+1's phase-1 forward.
+        self.layer_cache.clear_done()
+        # v20 fix #4-A: clear priority + pressure config too.
+        # set_priority_layers is called per-shard from
+        # _run_body_streaming_shard; carrying chunk N's priority into
+        # chunk N+1 means stale layers are protected before the new
+        # shard re-registers them. Pressure threshold likewise is
+        # configured per-shard. Reset both to neutral state.
+        self.layer_cache.set_priority_layers(set())
+        self.layer_cache.configure_pressure_threshold(0)
         self.prefetch_memory_skips = 0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -624,9 +666,15 @@ def _build_streaming_context(model_path: str, *,
     cache_bytes = max(int(free_bytes) - int(resolved_headroom_gb * 1024 ** 3),
                       8 * 1024 ** 3)
     layer_cache = LayerCache(max_bytes=cache_bytes)
+    # v20 step 3+4: enable dynamic budget with the same headroom reserve
+    # used to size the static max. The cache shrinks when host memory
+    # tightens (other processes growing, gradient transients) and grows
+    # back to static_max when slack returns.
+    layer_cache.configure_dynamic_budget(int(resolved_headroom_gb * 1024 ** 3))
     src = "explicit" if autoscale_diag is None else "autoscaled"
     print(f"{log_prefix} layer cache budget={cache_bytes/(1024**3):.1f} GB "
-          f"(free={free_bytes/(1024**3):.1f} GB, headroom={resolved_headroom_gb:.1f} GB, {src})",
+          f"(free={free_bytes/(1024**3):.1f} GB, headroom={resolved_headroom_gb:.1f} GB, "
+          f"dynamic_reserve={resolved_headroom_gb:.1f} GB, {src})",
           flush=True)
     if autoscale_diag is not None:
         print(f"{log_prefix}   autoscale: shard_working={autoscale_diag['shard_working_gb']:.1f} GB "
