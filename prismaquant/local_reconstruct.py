@@ -266,11 +266,45 @@ def _gptq_lite_quantize_row(
     spec: fr.FormatSpec,
     row_clip,
     damping: float,
+    fisher_per_input: torch.Tensor | None = None,
+    g2_per_token: torch.Tensor | None = None,
 ):
     n_in = row_vec.numel()
     if spec.group_size <= 0 or n_in % spec.group_size != 0:
         return _quantize_row_with_clip(row_vec, spec, row_clip)
-    H = (X_hat.float().T @ X_hat.float()) / max(int(X_hat.shape[0]), 1)
+    # Fisher-weighted GPTQ Hessian. Two preference order:
+    #   1) Per-token Fisher (g2_per_token, from probe v2): the literally-
+    #      correct empirical-Fisher Hessian H = X^T diag(g²_t) X. Token-level
+    #      weights — important calibration tokens drive the OBS direction.
+    #   2) Per-input-channel Fisher (fisher_per_input, derived from h_full):
+    #      a row-agnostic approximation that weights input channels by their
+    #      summed-across-output Fisher. Less accurate than per-token but
+    #      uses the probe's per-weight Fisher matrix when per-token isn't
+    #      available.
+    #   3) Plain X^T X otherwise.
+    Xf = X_hat.float()
+    n_tokens = int(X_hat.shape[0])
+    H_built = False
+    if g2_per_token is not None and g2_per_token.numel() == n_tokens:
+        w = g2_per_token.to(Xf.device).float().clamp_min(0.0)
+        m = float(w.mean().item()) if w.numel() else 0.0
+        if m > 1e-12:
+            w = w / m
+            sqrt_w = w.sqrt().unsqueeze(1)   # (n_tokens, 1)
+            Xw = Xf * sqrt_w
+            H = (Xw.T @ Xw) / max(n_tokens, 1)
+            H_built = True
+    if not H_built and fisher_per_input is not None and fisher_per_input.numel() == n_in:
+        w = fisher_per_input.to(Xf.device).float().clamp_min(0.0)
+        m = float(w.mean().item()) if w.numel() else 0.0
+        if m > 1e-12:
+            w = w / m
+            sqrt_w = w.sqrt().unsqueeze(0)   # (1, n_in)
+            Xw = Xf * sqrt_w
+            H = (Xw.T @ Xw) / max(n_tokens, 1)
+            H_built = True
+    if not H_built:
+        H = (Xf.T @ Xf) / max(n_tokens, 1)
     diag_mean = float(torch.diag(H).mean().item()) if H.numel() else 1.0
     H = H + torch.eye(n_in, device=H.device, dtype=H.dtype) * max(damping * diag_mean, 1e-8)
     row_work = row_vec.float().clone()
@@ -302,22 +336,48 @@ def _gptq_lite_refine_rows(
     best: dict,
     gptq_topk: int,
     gptq_damping: float,
+    h_full: torch.Tensor | None = None,
+    g2_per_token: torch.Tensor | None = None,
 ):
     if gptq_topk <= 0 or spec.name == "BF16":
         return best
     per_output = best.get("per_output_mse")
     if per_output is None or per_output.numel() <= 1:
         return best
-    topk = min(int(gptq_topk), int(per_output.numel()))
-    top_rows = torch.topk(per_output, k=topk).indices.tolist()
+    # Fisher-aware row prioritization: if the per-weight Fisher matrix is
+    # available, weight the per-row reconstruction MSE by the per-row Fisher
+    # importance (row-wise sum of grad²) so we refine the rows whose error
+    # contributes most to downstream loss, not the rows whose raw activation-
+    # MSE happens to be largest. This is the same Fisher signal the cost
+    # stage already uses in its predicted_dloss formula.
+    if h_full is not None and h_full.shape[0] == per_output.numel():
+        fisher_per_output = h_full.float().sum(dim=1).cpu()  # (d_out,)
+        m = float(fisher_per_output.mean().item())
+        if m > 1e-12:
+            score = per_output * (fisher_per_output / m)
+        else:
+            score = per_output
+    else:
+        score = per_output
+    topk = min(int(gptq_topk), int(score.numel()))
+    top_rows = torch.topk(score, k=topk).indices.tolist()
     X_in = _sym_clip(X, float(best["act_clip"]))
     X_hat = spec.activation_quantize_dequantize(X_in.clone())
     base_weight_clip = best["weight_clip"]
     W_in = _sym_clip(W, base_weight_clip, group_size=spec.group_size)
     W_hat = spec.quantize_dequantize(W_in.clone())
+    # Per-input-channel Fisher diagonal for the Hessian weighting inside
+    # _gptq_lite_quantize_row. Same h_full data, summed along the output
+    # axis to get a per-input-channel importance (length n_in).
+    fisher_per_input = (h_full.float().sum(dim=0) if h_full is not None
+                        else None)
     for row in top_rows:
         row_clip = _row_clip_for_weight_clip(base_weight_clip, row, W.shape[-1] // spec.group_size if spec.group_size > 0 else 1)
-        W_hat[row] = _gptq_lite_quantize_row(W_in[row], X_hat, spec, row_clip, gptq_damping)
+        W_hat[row] = _gptq_lite_quantize_row(
+            W_in[row], X_hat, spec, row_clip, gptq_damping,
+            fisher_per_input=fisher_per_input,
+            g2_per_token=g2_per_token,
+        )
     entry = _measure_with_quantized_weight(W, X, spec, base_weight_clip, float(best["act_clip"]), W_hat)
     if _entry_score(entry) + 1e-12 < _entry_score(best):
         return entry
@@ -337,6 +397,8 @@ def _refine_measurement(
     groupwise_rounds: int,
     gptq_topk: int,
     gptq_damping: float,
+    h_full: torch.Tensor | None = None,
+    g2_per_token: torch.Tensor | None = None,
 ):
     best = None
     for w_clip in w_grid:
@@ -390,6 +452,8 @@ def _refine_measurement(
         best,
         gptq_topk=gptq_topk,
         gptq_damping=gptq_damping,
+        h_full=h_full,
+        g2_per_token=g2_per_token,
     )
 
 
@@ -424,6 +488,11 @@ def main():
     ap.add_argument("--groupwise-rounds", type=int, default=1)
     ap.add_argument("--gptq-topk", type=int, default=8)
     ap.add_argument("--gptq-damping", type=float, default=1e-4)
+    ap.add_argument("--h-detail-dir", default=None,
+                    help="Directory of per-Linear Fisher detail (.pt) files "
+                         "written by the probe. When provided, GPTQ uses a "
+                         "Fisher-weighted Hessian (X^T diag(w) X) and "
+                         "Fisher-weighted per-row MSE for top-k selection.")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     ap.add_argument("--expert-granularity", choices=["layer", "expert"], default="layer")
@@ -460,6 +529,15 @@ def main():
 
     w_grid = [float(x) for x in args.w_clip_grid.split(",") if x.strip()]
     a_grid = [float(x) for x in args.a_clip_grid.split(",") if x.strip()]
+    # Optional Fisher-detail loader for Fisher-weighted GPTQ. We import the
+    # cost-stage's HDetailIndex lazily so this script doesn't pay the import
+    # cost when --h-detail-dir is not supplied.
+    h_detail = None
+    if args.h_detail_dir:
+        from prismaquant.measure_quant_cost import HDetailIndex  # type: ignore
+        h_detail = HDetailIndex(Path(args.h_detail_dir), set(stats.keys()))
+        print(f"[local-reconstruct] h-detail cache: {len(h_detail)} Linears "
+              f"loaded from {args.h_detail_dir}", flush=True)
     upgraded = {}
     for layer_name in sorted(target_layers):
         if layer_name not in module_map or layer_name not in act_cache:
@@ -467,10 +545,30 @@ def main():
         mod = module_map[layer_name]
         W = mod.weight.detach()
         X = act_cache.load(layer_name).to(W.dtype).to(W.device)
+        h_full = None
+        g2_per_token = None
+        if h_detail is not None and layer_name in h_detail:
+            blob = h_detail.load_blob(layer_name)
+            h_diag = blob.get("h_diag")
+            if h_diag is not None:
+                h_full = h_diag.to(W.device).float()
+                if h_full.shape != W.shape:
+                    h_full = None  # shape mismatch → fall back to scalar Fisher
+            # Per-token g² is only present in h_detail v2 and later.
+            g2 = blob.get("g2_per_token")
+            if g2 is not None and g2.numel() > 0:
+                g2_per_token = g2.to(W.device).float()
         per_fmt = {}
         for spec in specs_sorted:
             if spec.name not in raw_costs.get(layer_name, {}):
                 continue
+            # Slice per-token g² to match the activation cache rows for this
+            # Linear. The probe records g² in the same row order as the
+            # activation cache, so as long as both come from the same probe
+            # run they line up. Truncate or skip if shapes diverge.
+            g2_for_this_layer = None
+            if g2_per_token is not None and g2_per_token.numel() == X.shape[0]:
+                g2_for_this_layer = g2_per_token
             best = _refine_measurement(
                 W,
                 X,
@@ -484,6 +582,8 @@ def main():
                 groupwise_rounds=args.groupwise_rounds,
                 gptq_topk=args.gptq_topk,
                 gptq_damping=args.gptq_damping,
+                h_full=h_full,
+                g2_per_token=g2_for_this_layer,
             )
             if best is not None:
                 best["source"] = "local_reconstruct"
