@@ -132,6 +132,12 @@ class HDetailIndex:
                           weights_only=False)
         return blob["h_diag"]
 
+    def load_blob(self, name: str) -> dict:
+        """Return the full saved dict (for callers that want g2_per_token,
+        kind, version, etc., not just h_diag)."""
+        return torch.load(self._paths[name], map_location="cpu",
+                          weights_only=False)
+
 
 # ---------------------------------------------------------------------------
 # Activation cache — lazy path index

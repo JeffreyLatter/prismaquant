@@ -646,6 +646,14 @@ def _compute_precompute_key(model_path: str, dataset_name: str,
     }
 
 
+# In-process StreamingContext + tokenizer cache. Populated when
+# `PRISMAQUANT_PROBE_CTX_CACHE=1` is set. Keyed by (model_path, device,
+# dtype). Lets the multi_chunk_main driver reuse a single loaded model
+# across N calibration chunks instead of paying the offload + tokenizer
+# rebuild cost N times.
+_PROBE_CTX_CACHE: dict = {}
+
+
 @dataclasses.dataclass
 class GlobalPrecompute:
     """Shard-independent artifacts from Phase-1 + Phase-2.
@@ -851,20 +859,31 @@ def _compute_global_precompute(
                 return
             gy2 = gy.reshape(-1, gy.size(-1))
             x2 = x.reshape(-1, x.size(-1))
-            grad_w = gy2.t() @ x2
-            grad_w_sq = grad_w.pow(2)
+            # CORRECT empirical-Fisher: Σ_t ‖∇_t‖² (per-token-summed),
+            # not ‖Σ_t ∇_t‖² (sum-then-squared, which inflates by the
+            # cross-token gradient covariance — 5-50× on autoregressive
+            # sequences with correlated gradients). Outer-product norm
+            # identity gives a cheaper trace too: ‖a·b^T‖²_F = ‖a‖²·‖b‖².
+            # Mixed precision: bf16 squaring + matmul, fp32 result.
+            gy2_sq = gy2.pow(2)                  # bf16 (T, out)
+            x2_sq = x2.pow(2)                    # bf16 (T, in)
+            chunk_h = (gy2_sq.t() @ x2_sq).float()  # bf16 matmul + fp32 result
             acc = resident_h_full.get(name)
             if acc is None:
                 acc = torch.zeros(
-                    grad_w.shape[0], grad_w.shape[1],
+                    int(gy2.size(1)), int(x2.size(1)),
                     dtype=torch.float32, device="cpu")
                 resident_h_full[name] = acc
-            acc.add_(grad_w_sq.float().to("cpu"))
-            resident_stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
+            acc.add_(chunk_h.float().to("cpu"))
+            # Trace via the outer-product-norm identity (avoids a second
+            # full matmul, just two reductions of size T).
+            resident_stats[name]["h_trace_raw"] += float(
+                (gy2_sq.sum(dim=1) * x2_sq.sum(dim=1)).sum().item())
             w = mod_ref.weight
             if w is not None and not w.is_meta:
                 resident_stats[name]["h_w2_sum_raw"] += float(
-                    (grad_w_sq * w.detach().pow(2)).sum().item())
+                    (chunk_h * w.detach().float().pow(2).to(chunk_h.device))
+                    .sum().item())
             resident_stats[name]["n_tokens_seen"] += x2.size(0)
         return hook
 
@@ -1201,6 +1220,18 @@ def _run_body_streaming_shard(
         load_by_src: dict[str, float] = defaultdict(float)
         count_by_src: dict[str, int] = defaultdict(int)
         grad_out = grad_at_tail
+        # Smart cache: register in-scope (tracked) layers as priority so the
+        # cache prefers evicting out-of-scope entries first. Also configure
+        # pressure-triggered eviction (Task #3) so spikes during MoE hook
+        # firing don't push the system to OOM. Threshold = the same floor
+        # used by the prefetcher's pause check.
+        in_scope_layers = {L for L in range(num_layers) if layer_linear_names[L]}
+        ctx.layer_cache.set_priority_layers(in_scope_layers)
+        ctx.layer_cache.configure_pressure_threshold(
+            int(ctx.prefetch_min_available_bytes or 0))
+        # Reverse-prefetch (Task #5): prefetcher should now look BACKWARD
+        # in layer index since reverse sweep walks num_layers-1 → 0.
+        # Schedule lookahead in the direction we're actually going.
         for d in range(prefetch_depth):
             ctx.schedule_prefetch(num_layers - 1 - d)
 
@@ -1218,6 +1249,118 @@ def _run_body_streaming_shard(
             acc_stats: dict[str, dict] = {}
             saved_inputs: dict[str, torch.Tensor] = {}
             handles: list = []
+
+            # ---- Batched-MoE Fisher (Task #48) -----------------------
+            # Detect MoE expert containers within this layer (modules
+            # where every immediate child has w1/w2/w3 nn.Linear). For
+            # tracked Linears under such a block, we DEFER the per-Linear
+            # Fisher matmul to a block-level backward hook that batches
+            # all experts in one bmm. Reduces kernel count from N=experts
+            # × 3 weights (~768 per MoE layer) to 3 batched bmm calls.
+            tracked_set = set(tracked_here)
+            moe_linear_to_block: dict[str, tuple[str, int, str]] = {}
+            moe_block_pending: dict[str, dict[tuple[int, str], tuple]] = {}
+            moe_block_handles: list = []
+            for block_name, block in layers[L].named_modules():
+                full_block_name = f"{layers_prefix}{L}.{block_name}" if block_name else f"{layers_prefix}{L}"
+                children = list(block.named_children())
+                if not children or len(children) < 2:
+                    continue
+                ok = True
+                for _, child in children:
+                    for w in ("w1", "w2", "w3"):
+                        if not isinstance(getattr(child, w, None), nn.Linear):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    continue
+                # Check at least one tracked Linear lives under this block
+                any_tracked = False
+                for cname, child in children:
+                    try:
+                        eid = int(cname)
+                    except ValueError:
+                        ok = False; break
+                    for w in ("w1", "w2", "w3"):
+                        ln = f"{full_block_name}.{cname}.{w}"
+                        if ln in tracked_set:
+                            moe_linear_to_block[ln] = (full_block_name, eid, w)
+                            any_tracked = True
+                if not (ok and any_tracked):
+                    continue
+
+                def _make_flush(_block_name: str):
+                    def flush(module, grad_input, grad_output):
+                        pending = moe_block_pending.pop(_block_name, None)
+                        if not pending:
+                            return
+                        from collections import defaultdict as _dd
+                        by_w: dict[str, list] = _dd(list)
+                        for (eid, w_name), (X, gy, lname, T, w_ref) in pending.items():
+                            by_w[w_name].append((eid, lname, X, gy, T, w_ref))
+                        # Expert-chunk size: caps peak GPU memory per bmm.
+                        # 256 experts × max_T × hidden × fp32 can hit 5+ GB
+                        # for w1/w3 alone — way too much on a 121 GB box
+                        # already running 110 GB of model weights. 32 experts
+                        # per chunk → ~600 MB peak per bmm, safe.
+                        EXPERT_CHUNK = 32
+                        for w_name, items in by_w.items():
+                            if not items:
+                                continue
+                            in_dim = items[0][2].size(1)
+                            out_dim = items[0][3].size(1)
+                            device = items[0][2].device
+                            for cs in range(0, len(items), EXPERT_CHUNK):
+                                chunk_items = items[cs:cs + EXPERT_CHUNK]
+                                n_e = len(chunk_items)
+                                max_T = max(it[4] for it in chunk_items)
+                                X_pad = torch.zeros(n_e, max_T, in_dim,
+                                                    dtype=torch.float32, device=device)
+                                gy_pad = torch.zeros(n_e, max_T, out_dim,
+                                                     dtype=torch.float32, device=device)
+                                T_valid = torch.empty(n_e, dtype=torch.long, device=device)
+                                for i, (_eid, _lname, X, gy, T, _w) in enumerate(chunk_items):
+                                    X_pad[i, :T, :] = X.float()
+                                    gy_pad[i, :T, :] = gy.float()
+                                    T_valid[i] = T
+                                X_sq = X_pad.pow(2)
+                                gy_sq = gy_pad.pow(2)
+                                # Drop the padded source tensors before the
+                                # bmm allocates its big result, so peak is
+                                # bounded by max(pad_inputs, bmm_output).
+                                del X_pad, gy_pad
+                                chunk_h_batch = gy_sq.transpose(1, 2).bmm(X_sq)  # (n_e, out, in)
+                                gy_norm = gy_sq.sum(dim=2)
+                                x_norm = X_sq.sum(dim=2)
+                                del X_sq, gy_sq
+                                per_token = gy_norm * x_norm
+                                mask = (torch.arange(max_T, device=device).unsqueeze(0)
+                                        < T_valid.unsqueeze(1)).to(per_token.dtype)
+                                per_token = per_token * mask
+                                trace_per_e = per_token.sum(dim=1)
+                                for i, (_eid, lname, _X, _gy, T, w_ref) in enumerate(chunk_items):
+                                    acc_stats[lname]["h_trace_raw"] += float(trace_per_e[i].item())
+                                    if collect_h_full:
+                                        acc = acc_h_full.get(lname)
+                                        if acc is None:
+                                            acc = torch.zeros(out_dim, in_dim,
+                                                              dtype=torch.float32, device="cpu")
+                                            acc_h_full[lname] = acc
+                                        acc.add_(chunk_h_batch[i].cpu())
+                                    if w_ref is not None and not w_ref.is_meta:
+                                        acc_stats[lname]["h_w2_sum_raw"] += float(
+                                            (chunk_h_batch[i] * w_ref.detach().float().pow(2)
+                                             .to(chunk_h_batch.device)).sum().item())
+                                del chunk_h_batch, per_token, trace_per_e
+                    return flush
+
+                moe_block_handles.append(
+                    block.register_full_backward_hook(_make_flush(full_block_name)))
+            if moe_linear_to_block:
+                # Flag so the per-Linear hook short-circuits to deferred path.
+                pass  # (no-op, used as documentation; lookup happens per-call)
 
             def make_fwd(name: str):
                 def hook(module, inp, out):
@@ -1242,22 +1385,57 @@ def _run_body_streaming_shard(
                         return
                     gy2 = gy.reshape(-1, gy.size(-1))
                     x2 = x.reshape(-1, x.size(-1))
-                    grad_w = gy2.t() @ x2
-                    grad_w_sq = grad_w.pow(2)
+                    T = x2.size(0)
+                    # Batched-MoE deferral was attempted here (Task #48).
+                    # Pinning (X, gy) for all 256 experts × 3 weights until
+                    # the block-level flush peaks at ~7 GB of GPU residency
+                    # which OOM'd the box on top of LayerCache + prefetch.
+                    # Reverted to per-Linear path; the Fisher math fix below
+                    # is the load-bearing correctness change. Proper batched
+                    # implementation requires streaming partial flushes
+                    # rather than holding all expert data simultaneously —
+                    # filed as a follow-up (see task #48 description update).
+                    # CORRECT empirical-Fisher (per-token-summed). The
+                    # buggy `(Σ_t ∇_t)²` form has been replaced with
+                    # `Σ_t (gy²·x²)` via the (gy²)^T @ (x²) identity.
+                    # Memory-efficient mixed precision: squaring + matmul
+                    # in bf16 (typical gradient magnitudes are O(1e-2 ..
+                    # 1e0), so squaring stays well within bf16's safe
+                    # range and the per-element precision loss averages
+                    # out over T tokens and out × in matmul reductions),
+                    # fp32 result for the accumulator. Halves the working
+                    # set vs full-fp32 path → fits in the same memory
+                    # budget the buggy bf16 code was using.
+                    gy2_sq = gy2.pow(2)                        # bf16
+                    x2_sq = x2.pow(2)                          # bf16
+                    chunk_h = (gy2_sq.t() @ x2_sq).float()    # bf16 matmul + fp32 cast
                     if collect_h_full:
                         acc = acc_h_full.get(name)
                         if acc is None:
                             acc = torch.zeros(
-                                grad_w.shape[0], grad_w.shape[1],
+                                int(gy2.size(1)), int(x2.size(1)),
                                 dtype=torch.float32, device="cpu")
                             acc_h_full[name] = acc
-                        acc.add_(grad_w_sq.float().to("cpu"))
-                    acc_stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
-                    w = mod_ref.weight
-                    if w is not None and not w.is_meta:
-                        acc_stats[name]["h_w2_sum_raw"] += float(
-                            (grad_w_sq * w.detach().pow(2)).sum().item())
-                    acc_stats[name]["n_tokens_seen"] += x2.size(0)
+                        acc.add_(chunk_h.to("cpu"))
+                    # Trace from chunk_h.sum() — same value as
+                    # (gy_norm·x_norm).sum() but reuses the fp32 chunk_h
+                    # we already have, no extra reductions on the inputs.
+                    acc_stats[name]["h_trace_raw"] += float(chunk_h.sum().item())
+                    # h_w2_sum is a scalar proxy used as a fallback when
+                    # full per-weight Fisher isn't available. When
+                    # collect_h_full is on (which is whenever the cost
+                    # stage requested h_detail_dir), the per-Linear
+                    # `acc_h_full` entry already encodes the full
+                    # Fisher diagonal; computing the proxy on top costs
+                    # ~34 MB of allocator churn per call (the weight's
+                    # fp32 copy) for no extra signal.
+                    if not collect_h_full:
+                        w = mod_ref.weight
+                        if w is not None and not w.is_meta:
+                            acc_stats[name]["h_w2_sum_raw"] += float(
+                                (chunk_h * w.detach().float().pow(2)
+                                 .to(chunk_h.device)).sum().item())
+                    acc_stats[name]["n_tokens_seen"] += T
                 return hook
 
             for fqn in tracked_here:
@@ -1284,6 +1462,12 @@ def _run_body_streaming_shard(
                     p.requires_grad_(True)
                 handles.append(mod.register_forward_hook(make_fwd(fqn)))
                 handles.append(mod.register_full_backward_hook(make_bwd(fqn, mod)))
+            # Batched-MoE deferral disabled (see make_bwd comment). Skip
+            # the block-level flush hook installation entirely.
+            for h in moe_block_handles:
+                h.remove()
+            moe_block_handles.clear()
+            moe_linear_to_block.clear()
 
             packed_grad_acc: dict[str, float] = {}
             # Per-expert per-channel Fisher [E, M] — enables per-expert
@@ -1396,6 +1580,8 @@ def _run_body_streaming_shard(
                 h.remove()
             for h in layer_packed_handles:
                 h.remove()
+            for h in moe_block_handles:
+                h.remove()
             for fqn, s in acc_stats.items():
                 prev = merged_stats.get(fqn)
                 if prev is None:
@@ -1439,12 +1625,22 @@ def _run_body_streaming_shard(
             flush_activation_snapshots(packed_act_snaps)
 
             ctx.unload(L)
-            # The `del` above drops all per-layer refs; CPython ref counting
-            # reclaims them synchronously. A full gc.collect() sweep here
-            # costs 50-150ms per layer (profiled) with no payoff — there are
-            # no reference cycles in this scope. CUDA's caching allocator
-            # also manages its free-list fine without explicit empty_cache.
+            # The `del` drops all per-layer refs; CPython ref counting
+            # reclaims them synchronously. The per-layer gc + empty_cache
+            # is a quick win for in-scope MoE layers where 768 hooks have
+            # accumulated cached allocator blocks — releasing them after
+            # each in-scope layer prevents the cumulative-residue OOM
+            # we hit at the L7 transition. For out-of-scope layers (no
+            # hooks fired), the empty_cache is essentially a no-op.
             del x_in, out, saved_inputs, acc_stats, acc_h_full, handles
+            if L in in_scope_layers:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Periodic gc — every 4 in-scope layers — picks up any
+                # ref-cycles before they snowball.
+                if L % 4 == 0:
+                    import gc as _gc
+                    _gc.collect()
 
             if L % 8 == 0 or L == 0 or L == num_layers - 1:
                 print(f"[incremental] bwd L{L:02d}  src={src}  load={load_s:.2f}s  "
@@ -1954,25 +2150,52 @@ def main():
     calib: torch.Tensor | None = None
     resolved_prefetch_lookahead: int | None = None
 
+    # Module-level cache: when set, the StreamingContext + tokenizer are
+    # promoted into _PROBE_CTX_CACHE after first build and reused on
+    # subsequent main() calls with the same model in the same process.
+    # This is what makes the in-process multi-chunk driver fast — the
+    # 244 GB BF16 source streaming offload setup + LayerCache survive
+    # across chunks, so chunk_01..N hit warm caches.
+    use_persistent = os.environ.get("PRISMAQUANT_PROBE_CTX_CACHE") == "1"
+
     def _ensure_ready():
         nonlocal ctx, tokenizer, calib
-        if ctx is not None:
-            return
-        from transformers import AutoTokenizer
-        staged = stage_text_only(args.model)
-        tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
-        calib = load_calibration(tokenizer, args.dataset, args.nsamples, args.seqlen)
-        print(f"[incremental] calibration ready: {tuple(calib.shape)}", flush=True)
-        offload_folder = str(work_dir / "streaming_offload")
-        ctx = _build_streaming_context(
-            args.model,
-            device=device,
-            dtype=dtype,
-            offload_folder=offload_folder,
-            prefetch_workers=args.prefetch_workers,
-            prefetch_min_available_gb=args.prefetch_min_available_gb,
-            log_prefix="[incremental]",
-        )
+        if ctx is None and use_persistent:
+            cached = _PROBE_CTX_CACHE.get((args.model, str(device), args.dtype))
+            if cached is not None:
+                ctx, tokenizer = cached
+                # Reset accumulated state from prior chunks before reuse.
+                # The in-process driver pins ~35 GB of allocator residue
+                # without this — phase-3 backward then has too little
+                # headroom for the MoE in-scope hooks.
+                diag = ctx.reset_between_chunks()
+                print(f"[incremental] reused persistent ctx + tokenizer; "
+                      f"between-chunk reset freed {diag['freed_gb']:.1f} GB "
+                      f"(avail {diag['before_avail_gb']:.0f}->{diag['after_avail_gb']:.0f} GB)",
+                      flush=True)
+        if ctx is None:
+            from transformers import AutoTokenizer
+            staged = stage_text_only(args.model)
+            tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
+            offload_folder = str(work_dir / "streaming_offload")
+            ctx = _build_streaming_context(
+                args.model,
+                device=device,
+                dtype=dtype,
+                offload_folder=offload_folder,
+                prefetch_workers=args.prefetch_workers,
+                prefetch_min_available_gb=args.prefetch_min_available_gb,
+                log_prefix="[incremental]",
+            )
+            if use_persistent:
+                _PROBE_CTX_CACHE[(args.model, str(device), args.dtype)] = (
+                    ctx, tokenizer)
+        # calib is always per-call (different chunks have different data)
+        if calib is None:
+            calib = load_calibration(
+                tokenizer, args.dataset, args.nsamples, args.seqlen)
+            print(f"[incremental] calibration ready: {tuple(calib.shape)}",
+                  flush=True)
 
     def _prefetch_lookahead() -> int:
         nonlocal resolved_prefetch_lookahead

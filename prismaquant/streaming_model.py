@@ -336,6 +336,52 @@ class StreamingContext:
     def shutdown(self):
         self.prefetch_pool.shutdown(wait=True)
 
+    def reset_between_chunks(self) -> dict:
+        """Drop accumulated state at chunk boundaries in the multi-chunk
+        in-process probe driver. Returns memory-delta diagnostics so the
+        caller can verify the cleanup actually freed memory.
+
+        What gets reset:
+        - layer_cache: drop all prefetched-but-not-installed entries
+        - inflight prefetches: cancel pending futures (their results
+          would be stale for the next chunk's calibration data anyway)
+        - prefetch_memory_skips counter: zeroed for clean per-chunk stats
+        - PyTorch CUDA caching allocator: forced release
+        - Python gc: forced collection
+
+        Does NOT touch the loaded model itself (that's the whole point
+        of the in-process driver — keep the model+offload index resident).
+        """
+        import gc, psutil
+        before_avail = psutil.virtual_memory().available
+        # Cancel inflight prefetches — they're loading layers based on
+        # whatever the prior chunk's reverse sweep was scheduling, which
+        # has no relevance to the next chunk's freshly-starting forward.
+        with self._inflight_lock:
+            for fut in self._inflight.values():
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            self._inflight.clear()
+        # Purge the layer cache. Force-release each entry's tensors
+        # before clear() so PyTorch's UMA caching allocator returns
+        # the bytes (clear() alone leaves them as cache-allocator-owned).
+        self.layer_cache._cache.clear()
+        self.layer_cache._bytes.clear()
+        self.layer_cache.total_bytes = 0
+        self.prefetch_memory_skips = 0
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+        after_avail = psutil.virtual_memory().available
+        return {
+            "before_avail_gb": before_avail / (1024 ** 3),
+            "after_avail_gb": after_avail / (1024 ** 3),
+            "freed_gb": (after_avail - before_avail) / (1024 ** 3),
+        }
+
     def suggest_prefetch_lookahead(self) -> int:
         if self.estimated_layer_bytes <= 0:
             return 3

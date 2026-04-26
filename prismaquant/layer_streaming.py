@@ -517,6 +517,18 @@ class LayerCache:
         self.total_bytes = 0
         self.hits = 0
         self.misses = 0
+        # In-scope priority set (Task #4): layers in this set are protected
+        # from LRU eviction when possible. The body shard runner registers
+        # its tracked layers here so they stay hot through the reverse
+        # sweep — they fire 768 hooks each and should not be evicted by
+        # out-of-scope prefetches.
+        self._priority_layers: set[int] = set()
+        # Pressure-trigger threshold (Task #3): when MemAvailable falls
+        # below this many bytes, an eviction call drops as many entries
+        # as needed to halve total cache bytes regardless of LRU order.
+        # 0 disables. Set via configure_pressure_threshold().
+        self._pressure_threshold_bytes: int = 0
+        self.pressure_evictions = 0
 
     def _sizeof(self, tensors: dict[str, torch.Tensor]) -> int:
         return sum(t.numel() * t.element_size() for t in tensors.values())
@@ -547,9 +559,19 @@ class LayerCache:
             return
         size = self._sizeof(tensors)
         evicted = False
+        # Pressure-shrink check (Task #3): if MemAvailable is below the
+        # configured threshold, drop entries until we've halved cache
+        # bytes (or exhausted candidates). Skips priority layers.
+        self._maybe_pressure_shrink()
+        # In-scope priority eviction (Task #4): when full, prefer evicting
+        # out-of-scope (non-priority) entries before in-scope ones. Falls
+        # back to LRU order if all candidates are in-scope.
         while (self.total_bytes + size > self.max_bytes
                and len(self._cache) > 0):
-            evict_idx, _ = self._cache.popitem(last=False)  # evict LRU
+            evict_idx = self._pick_evict_candidate()
+            if evict_idx is None:
+                break  # only priority entries left, can't evict any
+            self._cache.pop(evict_idx, None)
             self.total_bytes -= self._bytes.pop(evict_idx, 0)
             evicted = True
         self._cache[layer_idx] = tensors
@@ -560,6 +582,58 @@ class LayerCache:
         # the shared LPDDR5X pool. Force a release after each eviction.
         if evicted and torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _pick_evict_candidate(self) -> int | None:
+        """Return the layer_idx of the LRU non-priority entry, or the
+        LRU priority entry if no non-priority ones exist, or None if
+        the cache is empty."""
+        if not self._cache:
+            return None
+        # OrderedDict iteration is in insertion order; LRU is at front.
+        for idx in self._cache:
+            if idx not in self._priority_layers:
+                return idx
+        # All entries are priority — fall back to LRU
+        return next(iter(self._cache))
+
+    def _maybe_pressure_shrink(self):
+        """If system MemAvailable is below the configured threshold,
+        drop entries until cache bytes have halved (or we've evicted
+        all non-priority entries). Used to react to spikes from other
+        processes (prefetcher, backward gradient transients, etc.)
+        before the LRU mechanism would notice."""
+        if self._pressure_threshold_bytes <= 0 or not self._cache:
+            return
+        try:
+            import psutil
+            avail = psutil.virtual_memory().available
+        except Exception:
+            return
+        if avail >= self._pressure_threshold_bytes:
+            return
+        target = self.total_bytes // 2
+        evicted_any = False
+        while self.total_bytes > target and self._cache:
+            evict_idx = self._pick_evict_candidate()
+            if evict_idx is None or evict_idx in self._priority_layers:
+                break
+            self._cache.pop(evict_idx, None)
+            self.total_bytes -= self._bytes.pop(evict_idx, 0)
+            evicted_any = True
+            self.pressure_evictions += 1
+        if evicted_any and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def configure_pressure_threshold(self, available_bytes_floor: int):
+        """Set the MemAvailable byte threshold below which the cache
+        triggers proactive eviction. 0 disables (default)."""
+        self._pressure_threshold_bytes = int(available_bytes_floor)
+
+    def set_priority_layers(self, layers: "set[int] | list[int]"):
+        """Mark these layer indices as in-scope/priority. They are
+        protected from LRU eviction when possible (other entries are
+        evicted first). Pass an empty set to clear."""
+        self._priority_layers = set(layers)
 
     def discard(self, layer_idx: int):
         """Drop cache ownership for a layer that has been installed.

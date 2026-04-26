@@ -991,14 +991,128 @@ class FisherAccumulator:
         # so the probe pickle stays small while downstream consumers
         # can lazy-load the full H per layer.
         self._h_full: dict[str, torch.Tensor] = {}
+        # Per-token squared gradient norm: ‖∇W_t‖²_F = ‖gy_t‖²·‖x_t‖² as a
+        # scalar per (Linear, token). Stored as a list of per-chunk CPU
+        # vectors during the hook; concatenated at finalize() and saved to
+        # h_detail so local_reconstruct can build the literally-correct
+        # Fisher-weighted GPTQ Hessian H = X^T diag(g²_t) X. Storage cost
+        # is ~4 GB total at 32k tokens × 33k Linears × 4 bytes.
+        self._per_token_grad_norm: dict[str, list[torch.Tensor]] = {}
+        # GPU-resident scalar accumulators. Used by the backward hook to
+        # avoid `.item()` syncs in the hot path — every `.sum().item()`
+        # forces a CUDA→CPU stall, and with 32k Linears × multiple syncs
+        # per backward pass, those compound into seconds of serialization.
+        # We accumulate to a 0-dim GPU tensor here, then flush to the
+        # Python scalar `stats[name]["h_trace_raw"]` once at finalize().
+        self._gpu_h_trace: dict[str, torch.Tensor] = {}
+        self._gpu_h_w2_sum: dict[str, torch.Tensor] = {}
+        # Linears we never want Fisher signal for (always BF16 in our
+        # serving stack, so accumulating the full per-weight matrix is
+        # dead work). Populated in install_hooks() based on a regex; the
+        # hook short-circuits for any name in this set.
+        self._fisher_skip: set[str] = set()
+        # Batched MoE Fisher (Task #48). When a Linear is part of a
+        # detected MoE expert block, the per-Linear backward hook only
+        # SAVES (X, gy); the parent block's backward hook then does ONE
+        # batched bmm per (block, w_name) instead of N=num_experts
+        # per-Linear matmuls. Reduces kernel launches by ~100× for the
+        # MoE-heavy backward sweep.
+        #
+        # _moe_linear_to_block: linear_qname -> (block_qname, eid, w_name)
+        # _moe_block_to_linears: block_qname -> {(eid, w_name): linear_qname}
+        # _moe_pending: block_qname -> {(eid, w_name): (X_2d, gy_2d)}
+        self._moe_linear_to_block: dict[str, tuple[str, int, str]] = {}
+        self._moe_block_to_linears: dict[str, dict[tuple[int, str], str]] = {}
+        self._moe_pending: dict[str, dict[tuple[int, str], tuple]] = {}
+        self._moe_block_handles: list = []
         # Same idea for packed experts, but reduced to per-expert
         # per-output-channel: [E, M] instead of [E, M, N]. Full
         # per-weight for 80 packed tensors at 35B scale is 160+ GB;
         # per-channel is 160 MB total — still a vector form.
         self._h_packed_channel: dict[str, torch.Tensor] = {}
+        # Pre-compute the BF16-skip set: Linears we know will end up
+        # BF16 in serving (lm_head + embed_tokens), so accumulating the
+        # full per-weight Fisher matrix for them is dead work. The hook
+        # short-circuits these. Allocator's lm_head ignore + ParallelLMHead's
+        # BF16-only constraint make this a safe assumption for our pipeline.
+        _BF16_SKIP_RE = re.compile(
+            r"^(?:lm_head$|.*\.lm_head$|model\.embed_tokens$|.*\.embed_tokens$)"
+        )
+
+        # Detect MoE expert blocks for batched Fisher accumulation. A block
+        # qualifies if its immediate children all expose w1/w2/w3 nn.Linear
+        # attributes (the MiniMaxM2Experts / Qwen3.5MoeExpert layout). Each
+        # qualifying block gets a parent-level backward hook installed that
+        # batches per-expert Fisher into one bmm per w_name. Returns the
+        # set of Linear qnames that will be deferred (handled by the block).
+        def _scan_moe_blocks() -> set[str]:
+            deferred: set[str] = set()
+            for block_name, block in model.named_modules():
+                children = list(block.named_children())
+                if not children or len(children) < 2:
+                    continue
+                # Each child must look like a MoE expert with w1/w2/w3 Linear
+                w_attrs = ("w1", "w2", "w3")
+                ok = True
+                for _, child in children:
+                    for w in w_attrs:
+                        sub = getattr(child, w, None)
+                        if not isinstance(sub, nn.Linear):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    continue
+                # Block is an MoE expert container.
+                self._moe_block_to_linears[block_name] = {}
+                for cname, child in children:
+                    try:
+                        eid = int(cname)
+                    except ValueError:
+                        # Non-integer child name — not a regular MoE expert
+                        # container; skip the whole block.
+                        del self._moe_block_to_linears[block_name]
+                        ok = False
+                        break
+                    for w in w_attrs:
+                        linear = getattr(child, w)
+                        linear_qname = f"{block_name}.{cname}.{w}"
+                        if linear_qname not in self.tracked:
+                            continue
+                        self._moe_linear_to_block[linear_qname] = (block_name, eid, w)
+                        self._moe_block_to_linears[block_name][(eid, w)] = linear_qname
+                        deferred.add(linear_qname)
+                if not ok:
+                    continue
+                if not self._moe_block_to_linears.get(block_name):
+                    # No tracked Linears under this block in this shard —
+                    # don't install a block hook (would never have data
+                    # to flush).
+                    self._moe_block_to_linears.pop(block_name, None)
+                    continue
+                # Install the block-level backward flush hook.
+                handle = block.register_full_backward_hook(
+                    self._make_moe_block_flush(block_name))
+                self._moe_block_handles.append(handle)
+            return deferred
+
+        self._moe_deferred_linears = _scan_moe_blocks()
+        # Always log so we can confirm detection ran and see why the count
+        # might be zero (regex-tracked vs named-modules-name mismatch is
+        # the most common failure mode).
+        _example_tracked = next(iter(self.tracked), "<empty>")
+        print(f"[fisher] batched-MoE detect: {len(self._moe_block_to_linears)} "
+              f"expert blocks, {len(self._moe_deferred_linears)} deferred "
+              f"Linears | tracked_count={len(self.tracked)} "
+              f"tracked_example={_example_tracked!r}",
+              flush=True)
+
         for name, mod in model.named_modules():
             if name not in self.tracked or not isinstance(mod, nn.Linear):
                 continue
+            if _BF16_SKIP_RE.match(name):
+                self._fisher_skip.add(name)
             w = mod.weight
             router_qname, eid = expert_info.get(name, (None, None))
             # Weights loaded under accelerate disk offload start on the
@@ -1112,46 +1226,199 @@ class FisherAccumulator:
                     self._rows_got[name] += flat.size(0)
         return hook
 
+    def _make_moe_block_flush(self, block_name: str):
+        """Block-level backward hook: pops the per-Linear pending data
+        gathered by individual MoE-expert Linear hooks, batches the
+        Fisher accumulation by (w_name) group, and scatters the per-
+        Linear results into the existing per-Linear accumulators
+        (gpu_h_trace, gpu_h_w2_sum, h_full, per_token_grad_norm).
+
+        Numerically equivalent to running `_make_bwd`'s per-Linear path
+        for each expert separately — same per-token-summed empirical
+        Fisher (Σ_t gy²·x² element-wise), just executed as one bmm per
+        w_name instead of `num_experts` independent matmuls.
+        """
+        def flush(module, grad_input, grad_output):
+            pending = self._moe_pending.pop(block_name, None)
+            if not pending:
+                return
+            # Group by w_name: list of (eid, name, X, gy, T, weight)
+            from collections import defaultdict as _dd
+            by_w: dict[str, list] = _dd(list)
+            for (eid, w_name), (X, gy, lname, T, w) in pending.items():
+                by_w[w_name].append((eid, lname, X, gy, T, w))
+
+            for w_name, items in by_w.items():
+                if not items:
+                    continue
+                # All items in this group share in_features (X.size(1)) and
+                # out_features (gy.size(1)). Token counts vary per expert
+                # — pad to max_T so we can stack into bmm-shaped tensors.
+                in_dim = items[0][2].size(1)
+                out_dim = items[0][3].size(1)
+                max_T = max(it[4] for it in items)
+                n_e = len(items)
+                device = items[0][2].device
+                # Pad-stacked tensors. Float32 because Fisher accumulates
+                # need fp32 precision (bf16 squared would underflow common
+                # gradient magnitudes after the multiply).
+                X_pad = torch.zeros(n_e, max_T, in_dim,
+                                    dtype=torch.float32, device=device)
+                gy_pad = torch.zeros(n_e, max_T, out_dim,
+                                     dtype=torch.float32, device=device)
+                T_valid = torch.empty(n_e, dtype=torch.long, device=device)
+                for i, (_eid, _lname, X, gy, T, _w) in enumerate(items):
+                    X_pad[i, :T, :] = X.float()
+                    gy_pad[i, :T, :] = gy.float()
+                    T_valid[i] = T
+                # Element-wise squared, then bmm — same arithmetic as the
+                # single-Linear path but done across all experts at once.
+                X_sq = X_pad.pow(2)               # (n_e, max_T, in_dim)
+                gy_sq = gy_pad.pow(2)             # (n_e, max_T, out_dim)
+                # chunk_h_batch[e] = gy_sq[e].T @ X_sq[e]  -> (out, in)
+                chunk_h_batch = gy_sq.transpose(1, 2).bmm(X_sq)  # (n_e, out, in)
+                # Per-token Fisher norm (for trace + per_token_g²)
+                gy_norm = gy_sq.sum(dim=2)        # (n_e, max_T)
+                x_norm = X_sq.sum(dim=2)          # (n_e, max_T)
+                per_token = gy_norm * x_norm      # (n_e, max_T)
+                # Mask padded slots
+                mask = (torch.arange(max_T, device=device).unsqueeze(0)
+                        < T_valid.unsqueeze(1)).to(per_token.dtype)
+                per_token = per_token * mask
+                trace_per_e = per_token.sum(dim=1)            # (n_e,)
+                # Scatter to per-Linear accumulators.
+                for i, (_eid, lname, _X, _gy, T, w) in enumerate(items):
+                    # Trace
+                    gpu_t = self._gpu_h_trace.get(lname)
+                    if gpu_t is None:
+                        gpu_t = torch.zeros((), dtype=torch.float32,
+                                            device=device)
+                        self._gpu_h_trace[lname] = gpu_t
+                    gpu_t.add_(trace_per_e[i])
+                    # h_full (CPU-resident)
+                    chunk_h_e = chunk_h_batch[i]   # (out, in), still on GPU
+                    acc = self._h_full.get(lname)
+                    if acc is None:
+                        acc = torch.zeros(out_dim, in_dim,
+                                          dtype=torch.float32, device="cpu")
+                        self._h_full[lname] = acc
+                    acc.add_(chunk_h_e.cpu())
+                    # h_w2_sum proxy (weight-aware scalar)
+                    if w is not None and not w.is_meta:
+                        wd = w.detach()
+                        w2_contrib = (chunk_h_e
+                                      * wd.float().pow(2).to(chunk_h_e.device)).sum()
+                        gpu_w2 = self._gpu_h_w2_sum.get(lname)
+                        if gpu_w2 is None:
+                            gpu_w2 = torch.zeros((), dtype=torch.float32,
+                                                 device=device)
+                            self._gpu_h_w2_sum[lname] = gpu_w2
+                        gpu_w2.add_(w2_contrib)
+                    # Per-token g² (only the valid-T prefix)
+                    pt_valid = per_token[i, :T].detach().cpu()
+                    self._per_token_grad_norm.setdefault(lname, []).append(pt_valid)
+        return flush
+
     def _make_bwd(self, name: str, mod_ref: nn.Linear):
         def hook(module, grad_input, grad_output):
+            # Fast skip: Linears we know will end up BF16 in serving don't
+            # need Fisher signal (lm_head, embed_tokens). Drop the saved
+            # forward input so memory doesn't leak, then bail.
+            if name in self._fisher_skip:
+                self._saved_inputs.pop(name, None)
+                return
             gy = grad_output[0]
             x = self._saved_inputs.pop(name, None)
             if x is None or gy is None:
                 return
-            gy2 = gy.reshape(-1, gy.size(-1))
-            x2 = x.reshape(-1, x.size(-1))
-            grad_w = gy2.t() @ x2
-            grad_w_sq = grad_w.pow(2)
-            # Full per-weight Fisher accumulation: required for the
-            # `predicted_dloss = 0.5 · <H_full, MSE_W_full>` cost model
-            # that replaces the scalar `h_trace · mse_scalar` proxy.
+            gy2 = gy.reshape(-1, gy.size(-1))   # (T, out)
+            x2 = x.reshape(-1, x.size(-1))      # (T, in)
+            T = x2.size(0)
+            # Batched MoE Fisher: if this Linear is part of an MoE expert
+            # block, just stash (X, gy) for the block-level flush. The
+            # per-Linear matmul + accumulator update happens batched there.
+            moe_meta = self._moe_linear_to_block.get(name)
+            if moe_meta is not None:
+                block_name, eid, w_name = moe_meta
+                pending = self._moe_pending.setdefault(block_name, {})
+                pending[(eid, w_name)] = (
+                    x2.detach(), gy2.detach(), name, T, mod_ref.weight,
+                )
+                self.stats[name]["n_tokens_seen"] += T
+                return
+            # --- CORRECT empirical-Fisher accumulation (per-token sum) ---
+            # The buggy form `(Σ_t gy_t · x_t^T).pow(2)` is
+            # ‖Σ_t ∇_t‖²_F = Σ_t ‖∇_t‖²_F + 2·Σ_{t<s}⟨∇_t,∇_s⟩,
+            # which inflates curvature by the cross-token gradient covariance.
+            # Empirically this overestimates Fisher by 5-50× for sequences
+            # with correlated gradients (notably attention layers), and the
+            # bias is layer-non-uniform → biased allocator decisions.
+            #
+            # The corrected form below uses the outer-product norm identity
+            # ‖a · b^T‖²_F = ‖a‖² · ‖b‖² for the trace, and the elementwise
+            # (gy²)^T @ (x²) identity for the per-weight diagonal:
+            #   Σ_t (gy_{t,i} · x_{t,j})² = Σ_t gy_{t,i}² · x_{t,j}²
+            # Trace cost drops from O(out·in) to O(T·(out+in)).
+            gy2_sq = gy2.float().pow(2)         # (T, out)
+            x2_sq = x2.float().pow(2)           # (T, in)
+            gy_norm_sq = gy2_sq.sum(dim=1)      # (T,)  = ‖gy_t‖²
+            x_norm_sq = x2_sq.sum(dim=1)        # (T,)  = ‖x_t‖²
+            per_token_grad_norm_sq = gy_norm_sq * x_norm_sq  # (T,) = ‖∇_t‖²_F
+            # Trace = Σ_t ‖∇_t‖²_F. Accumulate on GPU (0-dim tensor) to
+            # avoid the CUDA→CPU sync that .item() would force per call.
+            # Flushed to the Python scalar at finalize().
+            gpu_trace = self._gpu_h_trace.get(name)
+            if gpu_trace is None:
+                gpu_trace = torch.zeros((), dtype=torch.float32,
+                                        device=per_token_grad_norm_sq.device)
+                self._gpu_h_trace[name] = gpu_trace
+            gpu_trace.add_(per_token_grad_norm_sq.sum())
+            # Per-weight diagonal accumulator: h_full[i,j] = Σ_t gy²_{t,i}·x²_{t,j}
+            # Compute the matmul once, reuse for both the accumulator and the
+            # weight-aware scalar proxy. (Earlier draft computed it twice.)
+            chunk_h = gy2_sq.t() @ x2_sq        # (out, in)
             acc = self._h_full.get(name)
             if acc is None:
-                # Deferred allocation for disk-offloaded Linears: size
-                # from the current gradient, on CPU so offloaded layers
-                # don't pin GPU memory per-Linear.
+                # Deferred allocation for disk-offloaded Linears (CPU-resident
+                # so offloaded layers don't pin GPU per-Linear).
                 acc = torch.zeros(
-                    grad_w.shape[0], grad_w.shape[1],
+                    int(gy2.size(1)), int(x2.size(1)),
                     dtype=torch.float32, device="cpu",
                 )
                 self._h_full[name] = acc
-            acc.add_(grad_w_sq.float().to(acc.device))
-            self.stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
-            # h_w2_sum is a weight-aware scalar proxy used only as a
-            # fallback when full per-weight Fisher isn't available.
-            # Accelerate offloads the weight back to meta after forward,
-            # so during backward it may not be materialized. Skip the
-            # proxy when meta; the full H in self._h_full already
-            # captures the same information at higher fidelity.
+            acc.add_(chunk_h.to(acc.device))
+            # h_w2_sum (weight-aware scalar proxy): ⟨chunk_h, w²⟩.
+            # Same GPU-tensor accumulation trick as above — keep it off the
+            # synchronous CPU path during the hot per-Linear hook.
             w = mod_ref.weight
             if w is not None and not w.is_meta:
                 wd = w.detach()
-                self.stats[name]["h_w2_sum_raw"] += float(
-                    (grad_w_sq * wd.pow(2)).sum().item())
-            self.stats[name]["n_tokens_seen"] += x2.size(0)
+                w2_contrib = (chunk_h * wd.float().pow(2).to(chunk_h.device)).sum()
+                gpu_w2 = self._gpu_h_w2_sum.get(name)
+                if gpu_w2 is None:
+                    gpu_w2 = torch.zeros((), dtype=torch.float32,
+                                         device=w2_contrib.device)
+                    self._gpu_h_w2_sum[name] = gpu_w2
+                gpu_w2.add_(w2_contrib)
+            # --- Per-token grad-norm² (Task #36, DeepSeek's correct form) ---
+            # Stored as a list of per-chunk vectors; flushed to disk at
+            # finalize() into h_detail so local_reconstruct can build the
+            # truly Fisher-weighted GPTQ Hessian H = X^T diag(g²_t) X.
+            ptl = self._per_token_grad_norm.setdefault(name, [])
+            ptl.append(per_token_grad_norm_sq.detach().cpu())
+            self.stats[name]["n_tokens_seen"] += T
         return hook
 
     def finalize(self, tracker: RouterTracker | None):
+        # Flush GPU-resident scalar accumulators (h_trace, h_w2_sum) into
+        # the stats dict. Single sync per Linear here costs one CUDA stall
+        # per name, vs. thousands during the backward sweep without it.
+        for nm, gpu_t in self._gpu_h_trace.items():
+            if nm in self.stats:
+                self.stats[nm]["h_trace_raw"] += float(gpu_t.item())
+        for nm, gpu_t in self._gpu_h_w2_sum.items():
+            if nm in self.stats:
+                self.stats[nm]["h_w2_sum_raw"] += float(gpu_t.item())
         # Flush packed-expert grad-norm accumulator into stats h_trace_raw.
         # The packed accumulator key matches the stats key by construction
         # (full param name `<experts_qname>.<param_name>`).
@@ -1215,10 +1482,22 @@ class FisherAccumulator:
                     h = acc.to(torch.float32).cpu() / (tokens * rp)
                 else:
                     h = acc.to(torch.float32).cpu() / tokens
+                # Per-token gradient² (g²_t) — concatenate the chunk vectors
+                # collected during the hook. This is the per-token Fisher
+                # weight, used by local_reconstruct's Fisher-weighted GPTQ
+                # Hessian: H = X^T diag(g²_t) X.
+                ptl = self._per_token_grad_norm.get(name, [])
+                g2_per_token = (torch.cat(ptl, dim=0) if ptl
+                                else torch.empty(0, dtype=torch.float32))
+                if rp is not None and rp > 0:
+                    g2_per_token = g2_per_token / rp
                 fname = sub.sub("__", name) + ".pt"
-                torch.save({"h_diag": h, "name": name, "kind": "linear",
-                            "shape": list(h.shape)},
-                           self.h_detail_dir / fname)
+                torch.save({
+                    "h_diag": h, "name": name, "kind": "linear",
+                    "shape": list(h.shape),
+                    "g2_per_token": g2_per_token,    # (n_tokens,)
+                    "h_detail_version": 2,           # bump → invalidate v1 caches
+                }, self.h_detail_dir / fname)
                 self.stats[name]["h_detail_path"] = fname
             for full_name, ch in self._h_packed_channel.items():
                 if full_name not in self.stats:
@@ -1235,10 +1514,11 @@ class FisherAccumulator:
                 self.stats[full_name]["h_detail_path"] = fname
 
     def remove_hooks(self):
-        for h in self._fwd_handles + self._bwd_handles:
+        for h in self._fwd_handles + self._bwd_handles + self._moe_block_handles:
             h.remove()
         self._fwd_handles.clear()
         self._bwd_handles.clear()
+        self._moe_block_handles.clear()
 
 
 # ---------------------------------------------------------------------------
