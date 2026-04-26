@@ -365,18 +365,35 @@ class StreamingContext:
     def shutdown(self):
         self.prefetch_pool.shutdown(wait=True)
 
-    def reset_between_chunks(self) -> dict:
+    def reset_between_chunks(self, retain_cache: bool = False) -> dict:
         """Drop accumulated state at chunk boundaries in the multi-chunk
         in-process probe driver. Returns memory-delta diagnostics so the
         caller can verify the cleanup actually freed memory.
 
-        What gets reset:
-        - layer_cache: drop all prefetched-but-not-installed entries
+        What always gets reset:
         - inflight prefetches: cancel pending futures (their results
           would be stale for the next chunk's calibration data anyway)
+        - mark_done / priority / pressure-threshold config (per-shard
+          state from chunk N must not leak into chunk N+1)
         - prefetch_memory_skips counter: zeroed for clean per-chunk stats
         - PyTorch CUDA caching allocator: forced release
         - Python gc: forced collection
+
+        When `retain_cache=False` (default): the layer_cache is also
+        purged. This is the v20 behavior — assumed safe and frees the
+        most memory.
+
+        When `retain_cache=True`: layer_cache contents are preserved.
+        Layer weights are model-invariant across chunks (the calibration
+        data changes, the model doesn't), so an entry that survived the
+        end of chunk N's phase-3 reverse sweep is still byte-identical
+        to what chunk N+1's phase-1 forward needs. Cuts cold-load wall
+        time on the next chunk's phase-1 by the cache hit rate.
+
+        The retention is bounded by the cache's existing dynamic budget;
+        chunk N+1's first put() will evict via LRU as needed. Marker
+        sets (priority / done) are still cleared so they don't poison
+        chunk N+1's per-shard logic.
 
         Does NOT touch the loaded model itself (that's the whole point
         of the in-process driver — keep the model+offload index resident).
@@ -393,12 +410,18 @@ class StreamingContext:
                 except Exception:
                     pass
             self._inflight.clear()
-        # Purge the layer cache. Force-release each entry's tensors
-        # before clear() so PyTorch's UMA caching allocator returns
-        # the bytes (clear() alone leaves them as cache-allocator-owned).
-        self.layer_cache._cache.clear()
-        self.layer_cache._bytes.clear()
-        self.layer_cache.total_bytes = 0
+        retained_layers = 0
+        retained_bytes = 0
+        if retain_cache:
+            retained_layers = len(self.layer_cache._cache)
+            retained_bytes = self.layer_cache.total_bytes
+        else:
+            # Purge the layer cache. Force-release each entry's tensors
+            # before clear() so PyTorch's UMA caching allocator returns
+            # the bytes (clear() alone leaves them as cache-allocator-owned).
+            self.layer_cache._cache.clear()
+            self.layer_cache._bytes.clear()
+            self.layer_cache.total_bytes = 0
         # v20 step 2: drop the mark-done set so the next chunk's loads
         # aren't refused. Without this, layers marked done at end of
         # chunk N's phase-3 would silently fail to repopulate in chunk
@@ -422,6 +445,8 @@ class StreamingContext:
             "before_avail_gb": before_avail / (1024 ** 3),
             "after_avail_gb": after_avail / (1024 ** 3),
             "freed_gb": (after_avail - before_avail) / (1024 ** 3),
+            "retained_cache_layers": retained_layers,
+            "retained_cache_gb": retained_bytes / (1024 ** 3),
         }
 
     def suggest_prefetch_lookahead(self) -> int:

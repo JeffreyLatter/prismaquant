@@ -77,7 +77,20 @@ def main() -> int:
                     help="Final merged probe.pkl path")
     ap.add_argument("--work-dir", required=True,
                     help="Work root; per-chunk subdirs will be created here")
+    ap.add_argument("--retain-cross-chunk-cache", action="store_true",
+                    default=False,
+                    help="Keep LayerCache contents across chunk boundaries. "
+                         "Layer weights are model-invariant, so retaining "
+                         "the cache makes chunk N+1's phase-1 forward warm "
+                         "on the layers that survived end of chunk N. "
+                         "Adds ~70 GB of resident bytes at chunk transitions; "
+                         "safe on Spark (cache budget already accounts for it) "
+                         "but disable on smaller boxes if memory is tight.")
     args, passthrough = ap.parse_known_args()
+    if args.retain_cross_chunk_cache:
+        os.environ["PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK"] = "1"
+        print("[multi-chunk] cross-chunk LayerCache retention: ENABLED",
+              flush=True)
 
     chunks_dir = Path(args.chunks_dir)
     chunk_jsonls = sorted(chunks_dir.glob("chunk_*.jsonl"))

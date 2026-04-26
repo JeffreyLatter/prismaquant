@@ -2413,11 +2413,26 @@ def main():
                 # The in-process driver pins ~35 GB of allocator residue
                 # without this — phase-3 backward then has too little
                 # headroom for the MoE in-scope hooks.
-                diag = ctx.reset_between_chunks()
-                print(f"[incremental] reused persistent ctx + tokenizer; "
-                      f"between-chunk reset freed {diag['freed_gb']:.1f} GB "
-                      f"(avail {diag['before_avail_gb']:.0f}->{diag['after_avail_gb']:.0f} GB)",
-                      flush=True)
+                # v21 #4: PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK=1 keeps
+                # layer-cache contents across chunks. Layer weights are
+                # model-invariant; an entry that fit the budget at end
+                # of chunk N is still valid for chunk N+1.
+                retain = os.environ.get(
+                    "PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK") == "1"
+                diag = ctx.reset_between_chunks(retain_cache=retain)
+                if retain and diag.get("retained_cache_layers", 0):
+                    print(f"[incremental] reused persistent ctx + tokenizer; "
+                          f"between-chunk reset retained "
+                          f"{diag['retained_cache_layers']} layers "
+                          f"({diag['retained_cache_gb']:.1f} GB cache); "
+                          f"freed {diag['freed_gb']:.1f} GB "
+                          f"(avail {diag['before_avail_gb']:.0f}->{diag['after_avail_gb']:.0f} GB)",
+                          flush=True)
+                else:
+                    print(f"[incremental] reused persistent ctx + tokenizer; "
+                          f"between-chunk reset freed {diag['freed_gb']:.1f} GB "
+                          f"(avail {diag['before_avail_gb']:.0f}->{diag['after_avail_gb']:.0f} GB)",
+                          flush=True)
                 _print_mem_snapshot("chunk start (post-reset)")
         if ctx is None:
             from transformers import AutoTokenizer
