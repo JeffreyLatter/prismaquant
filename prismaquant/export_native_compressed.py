@@ -1361,14 +1361,17 @@ def _build_target_list(vllm_names: list[str]) -> list[str]:
         bucketed[(prefix, L, inner, proj)].add(E)
 
     collapsed: list[str] = []
-    for (prefix, L, inner, proj), experts in sorted(bucketed.items()):
-        n = max(experts) + 1
+    for (prefix, L, inner, proj), _experts in sorted(bucketed.items()):
         prefix_r = prefix.replace(".", "[.]")
         inner_r = inner.replace(".", "[.]")
-        if experts == set(range(n)):
-            expr = "[0-9]+"
-        else:
-            expr = "(" + "|".join(str(e) for e in sorted(experts)) + ")"
+        # Always emit the [0-9]+ wildcard for the expert position. vLLM's
+        # FusedMoE.get_moe_method probes the synthetic name `experts.0.X_proj`
+        # against this regex, and the saved checkpoint uses dense renumbered
+        # eids (0..K-1) — so any literal alternation built from the source
+        # checkpoint's *original* eids would miss expert 0 whenever expert 0
+        # was pruned out. Per FusedMoE semantics every kept expert in a layer
+        # shares the same scheme, so wildcarding is also semantically correct.
+        expr = "[0-9]+"
         collapsed.append(
             f"re:^{prefix_r}layers[.]{L}[.]{inner_r}[.]experts[.]{expr}"
             f"[.]{proj}_proj$"
@@ -2810,6 +2813,27 @@ def materialize_tensors_streaming(
                 full = f"{full_modpath}.{buf_name}"
                 if full in out or buf.is_meta:
                     continue
+                # Buffer-shrink for pruned MoE: per-expert bias-like buffers
+                # (e.g. MiniMax's `e_score_correction_bias` on the MoE block,
+                # or any other shape-num_experts_orig persistent buffer that
+                # lives on the same parent as the router) must be index-
+                # selected down to kept_expert_ids so their first dim matches
+                # what the native vLLM module allocates (num_local_experts =
+                # kept count). Without this, vLLM's bias loader asserts on
+                # the size mismatch (256 vs 176) and engine init dies.
+                if prune_by_parent:
+                    entry_b = prune_by_parent.get(full_modpath)
+                    if (entry_b is not None
+                            and buf.dim() >= 1
+                            and int(buf.shape[0]) == int(entry_b["num_experts_orig"])):
+                        b_idx = torch.as_tensor(
+                            entry_b["kept_expert_ids"], dtype=torch.long,
+                            device=buf.device,
+                        )
+                        shrunk = buf.detach().index_select(0, b_idx).contiguous()
+                        out[full] = shrunk.to(torch.bfloat16).cpu()
+                        hist[("layer_buffer_shrunk", "BF16")] += 1
+                        continue
                 out[full] = buf.detach().to(torch.bfloat16).cpu()
                 hist[("layer_buffer", "BF16")] += 1
 
@@ -3511,8 +3535,8 @@ def _per_expert_parent(base: str) -> str | None:
     return f"{m.group('prefix')}.{parent}"
 
 
-def compute_extra_ignore(source_shape_iter, assignment: dict[str, str]
-                         ) -> list[str]:
+def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
+                         prune_manifest: dict | None = None) -> list[str]:
     """Return the list of 2D `.weight` basenames that must be added to
     the compressed-tensors `ignore` set because the recipe doesn't cover
     them.
@@ -3526,9 +3550,28 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str]
     assignment — the parent's emitted compressed-tensors scheme already
     covers them at vLLM load time, and adding the per-expert name to
     `ignore` would mark the FusedMoE layer as un-quantized.
+
+    `prune_manifest` (when supplied) is the allocator's expert-prune
+    sidecar keyed by router qname. Pruned experts are dropped from the
+    output checkpoint and their slots renumbered to dense 0..K-1, so
+    referring to them in `ignore` by their *original* eid produces
+    stale entries that don't match any module vLLM ever constructs.
+    Filter them out — the kept experts are already covered by the
+    parent FusedMoE scheme, and pruned ones simply don't exist anymore.
     """
     extra_ignore: list[str] = []
     seen_recipe = set(assignment)
+    # Build set of pruned (full source eid path prefixes) we should drop.
+    # Each manifest entry's router_qname is the parent of `.experts.N.X_proj`,
+    # so pruned eids live at f"{parent}.experts.{eid}" where parent is the
+    # router_qname's parent. e.g. router=model.layers.0.mlp.gate ->
+    # parent=model.layers.0.mlp, pruned base=model.layers.0.mlp.experts.102
+    pruned_bases: set[str] = set()
+    if prune_manifest:
+        for _router_qname, entry in prune_manifest.items():
+            parent_path = _router_qname.rsplit(".", 1)[0]
+            for orig_eid in entry.get("pruned_expert_ids", []):
+                pruned_bases.add(f"{parent_path}.experts.{orig_eid}")
     for ckpt_key, shape in source_shape_iter:
         if not ckpt_key.endswith(".weight"):
             continue
@@ -3537,6 +3580,14 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str]
                        if base.startswith("model.language_model.")
                        else base)
         if recipe_name in seen_recipe:
+            continue
+        # Skip pruned experts — they're absent from the renumbered output
+        # checkpoint, so emitting an ignore for their original-eid path
+        # produces stale config entries that match nothing in the served
+        # model.
+        if pruned_bases and any(
+                recipe_name.startswith(p + ".") or recipe_name == p
+                for p in pruned_bases):
             continue
         parent = _per_expert_parent(recipe_name)
         if parent is not None and parent in seen_recipe:
@@ -3908,7 +3959,8 @@ def main():
                         shape = None
                     yield k, shape
 
-    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment)
+    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment,
+                                        prune_manifest=prune_manifest)
     print(f"[export-stream] extra ignore (unmapped Linears): "
           f"{len(extra_ignore)}", flush=True)
 

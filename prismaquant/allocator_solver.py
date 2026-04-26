@@ -253,6 +253,7 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
     """Return ``(avg_bits, total_predicted_dloss)`` for an assignment."""
     total_params = sum(stats[n]["n_params"] for n in assignment)
     total_bits = 0.0
+    total_predicted_dloss = 0.0
     pm = pruned_map or {}
     cs = candidates or {}
     for n in assignment:
@@ -260,6 +261,8 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
         chosen_cand = _candidate_for_assignment(n, fmt, cs, pm)
         if chosen_cand is not None:
             total_bits += 8.0 * chosen_cand.memory_bytes
+            total_predicted_dloss += float(
+                getattr(chosen_cand, "predicted_dloss", 0.0))
             continue
         memory_map = stats[n].get("_memory_bytes_by_format")
         if memory_map is not None and fmt in memory_map:
@@ -270,7 +273,7 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
                 format_specs[fmt].effective_bits_for_shape(shape)
                 * stats[n]["n_params"]
             )
-    return total_bits / max(total_params, 1), 0.0
+    return total_bits / max(total_params, 1), total_predicted_dloss
 
 
 def compute_assignment_predicted_dloss(
