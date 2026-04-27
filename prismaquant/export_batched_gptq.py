@@ -73,7 +73,16 @@ def _build_H_stack(
                 in_features, dtype=torch.float32, device=device)
             dead_mask[e] = True
             continue
-        X = a.detach().to(torch.float32).reshape(-1, in_features)
+        # v23 fix: explicitly move activations to the target device
+        # before the matmul. _LazyActivationCache.get() returns CPU
+        # tensors; the per-Linear path inherits this and runs the
+        # H = X^T X matmul on CPU (slow). Batching across E experts
+        # on CPU doesn't help — the algorithm is bandwidth-bound on
+        # the host. Moving X to the GPU lets the bmm/matmul run as
+        # a real CUDA kernel and is what delivers the projected
+        # speedup at production scale.
+        X = a.detach().to(device, dtype=torch.float32).reshape(
+            -1, in_features)
         H = X.t() @ X
         diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
         H.diagonal().add_(damp * diag_mean)
@@ -289,7 +298,11 @@ def scale_sweep_nvfp4_batched(
             if a is None or a.numel() == 0:
                 col_imp[j] = 1.0  # no activation signal → uniform
                 continue
-            a32 = a.detach().to(torch.float32).reshape(-1, in_features)
+            # Same v23 device-fix as in the GPTQ path: move X to the
+            # target device so the per-column statistics run as CUDA
+            # ops rather than on the host.
+            a32 = a.detach().to(device, dtype=torch.float32).reshape(
+                -1, in_features)
             col_imp[j] = a32.pow(2).mean(dim=0).clamp_min(1e-12)
         col_imp_g = col_imp.reshape(Ec, 1, n_g, group_size)  # [Ec, 1, n_g, gs]
 
