@@ -2369,6 +2369,7 @@ def materialize_tensors_streaming(
     offload_folder: str | None = None,
     prune_manifest: dict[str, dict] | None = None,
     tensor_sink: Callable[[dict[str, torch.Tensor]], None] | None = None,
+    export_cache_dir: str | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict]:
     """Stream decoder layers through quantize → emit → unload. Never
     holds the full model in memory. Small models still exercise this
@@ -2555,7 +2556,21 @@ def materialize_tensors_streaming(
         out = {}
 
     # ----- 3. Per-layer streaming quantize loop -----
+    # v25: per-layer cache. When --export-cache-dir is set, each
+    # layer's emitted tensor dict is torch.save'd to a per-layer file
+    # AFTER quantization succeeds. On a restart the loop checks each
+    # layer's cache file and SKIPS the quantization work for any layer
+    # already cached — instead loads the saved dict and replays it
+    # into tensor_sink. Recovers full progress from a mid-flight kill.
+    cache_path = Path(export_cache_dir) if export_cache_dir else None
+    if cache_path is not None:
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+    def _layer_cache_file(L: int) -> Path | None:
+        return None if cache_path is None else cache_path / f"layer_{L:03d}.pt"
+
     t_layers = time.time()
+    cache_hits = 0
     for L in range(num_layers):
         if tensor_sink is not None:
             out = {}
@@ -2563,6 +2578,21 @@ def materialize_tensors_streaming(
         layer_qname = f"{layers_prefix}{L}".rstrip(".")
         if layer_qname.endswith("."):
             layer_qname = layer_qname[:-1]
+
+        # v25: cache hit — skip quantization, replay cached tensor dict.
+        cf = _layer_cache_file(L)
+        if cf is not None and cf.exists():
+            cached = torch.load(str(cf), weights_only=False, map_location="cpu")
+            if tensor_sink is not None:
+                tensor_sink(cached)
+            else:
+                out.update(cached)
+            cache_hits += 1
+            if L % 4 == 0 or L == num_layers - 1:
+                print(f"[export-stream] layer {L:02d}  CACHED "
+                      f"keys={len(cached)}", flush=True)
+            del cached
+            continue
 
         # 3a. Load layer from safetensors (direct to device). When
         # `fp8_scale_inv_map` is non-empty, the loader applies the
@@ -3051,11 +3081,21 @@ def materialize_tensors_streaming(
             print(f"[export-stream] layer {L:02d}  linears={linear_count} "
                   f"packed={packed_count}  load={load_s:.2f}s  "
                   f"total={elapsed:.2f}s  out_keys={len(out)}", flush=True)
+        # v25: save layer cache BEFORE tensor_sink consumes the dict.
+        # Use a tmp + rename to keep the cache file atomic — a kill in
+        # the middle of torch.save leaves a .tmp behind which we'll
+        # ignore on the next run (skip and recompute the layer).
+        cf = _layer_cache_file(L)
+        if cf is not None and out:
+            tmp = cf.with_suffix(".pt.tmp")
+            torch.save(out, str(tmp))
+            tmp.rename(cf)
         if tensor_sink is not None:
             tensor_sink(out)
             out = {}
 
-    print(f"[export-stream] layer sweep: {time.time()-t_layers:.1f}s",
+    print(f"[export-stream] layer sweep: {time.time()-t_layers:.1f}s "
+          f"(cache_hits={cache_hits}/{num_layers})",
           flush=True)
 
     if unmapped_keys:
@@ -3899,6 +3939,25 @@ def main():
                          "GPTQ: geomean out_mse ratio = 0.33 vs GPTQ-only "
                          "0.41 vs RTN 1.0, on Qwen3.6-35B visual+MTP "
                          "Linears.")
+    ap.add_argument("--export-cache-dir", default=None,
+                    help="Per-layer cache dir for resumable export. When "
+                         "set, each layer's emitted tensor dict is "
+                         "torch.save'd to <cache_dir>/layer_NNN.pt right "
+                         "after quantization. On a restart, layers whose "
+                         "cache file exists are SKIPPED — their tensors "
+                         "are loaded from cache and replayed into the "
+                         "shard writer without redoing the AWQ + GPTQ + "
+                         "scale_sweep work. Recovers full progress on a "
+                         "mid-flight kill (which today restarts from "
+                         "layer 0 every time). Cache is removed at end of "
+                         "successful export. Disk overhead: ~2 GB per "
+                         "MoE layer = ~120 GB transient on a 62-layer "
+                         "MiniMax-class model, freed on completion.")
+    ap.add_argument("--keep-export-cache", action="store_true",
+                    default=False,
+                    help="Don't remove --export-cache-dir on success. "
+                         "Useful for debugging or comparing two exports "
+                         "against the same cache.")
     args = ap.parse_args()
 
     from .model_profiles import detect_profile
@@ -4061,6 +4120,7 @@ def main():
         offload_folder=args.offload_folder,
         prune_manifest=prune_manifest,
         tensor_sink=lambda batch: writer.add_tensors(_rename_body_batch(batch)),
+        export_cache_dir=args.export_cache_dir,
     )
     print(f"[export-stream] streamed materialization complete "
           f"resident_tensors={len(tensors)}  hist={hist}",
@@ -4193,6 +4253,21 @@ def main():
             "ignore": sorted(bf16_passthrough),
             "prune": prune_summary,
         }, f, indent=2)
+
+    # v25: clear the per-layer cache on successful export. --keep-export-cache
+    # leaves it intact (debugging / comparison). On a failed run the cache
+    # stays anyway since this code wouldn't be reached.
+    if (args.export_cache_dir
+            and not args.keep_export_cache
+            and Path(args.export_cache_dir).exists()):
+        import shutil
+        try:
+            shutil.rmtree(args.export_cache_dir)
+            print(f"[export-stream] removed export cache "
+                  f"{args.export_cache_dir}", flush=True)
+        except Exception as e:
+            print(f"[export-stream] WARN cache cleanup failed: {e!r}",
+                  flush=True)
 
     print(f"[export-stream] done. Serve with:\n"
           f"  vllm serve {out_dir.resolve()} --quantization compressed-tensors",
