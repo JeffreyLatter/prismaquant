@@ -2174,6 +2174,16 @@ def _export_vector_chunk_len(
 _FUSED_SIBLINGS = {
     "q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv",
     "gate_proj": "gate_up", "up_proj": "gate_up",
+    # MiniMax M2 MoE expert MLP uses `w1` (gate-equivalent) +
+    # `w3` (up-equivalent) + `w2` (down-equivalent). vLLM's
+    # NVFP4 MoE kernel fuses w1+w3 into a single packed weight at
+    # load time and expects ONE shared `weight_global_scale`. The
+    # original Qwen-style `gate_proj`/`up_proj` entries above don't
+    # match MiniMax's naming; without these `w1`/`w3` entries every
+    # expert ends up with mismatched per-Linear globals and vLLM
+    # warns about reduced accuracy. `w2` has no sibling (it's the
+    # down-projection, not part of a gate/up pair) and is excluded.
+    "w1": "gate_up", "w3": "gate_up",
     # Qwen3.5/3.6 DeltaNet linear-attention pairs. vLLM fuses
     # `in_proj_qkv + in_proj_z → in_proj_qkvz` and
     # `in_proj_b + in_proj_a → in_proj_ba` at load time; the fused
