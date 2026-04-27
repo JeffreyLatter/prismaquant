@@ -1984,6 +1984,141 @@ def _quantize_2d_group_same_shape(
     raise ValueError(f"unsupported grouped 2D export format: {fmt}")
 
 
+def _quantize_2d_nvfp4_group_batched(
+    items: list,
+    joint_globals: dict,
+    device: torch.device,
+    expert_chunk: int = 32,
+) -> list[dict]:
+    """Batched NVFP4 quantization for a same-shape group of Linears
+    when activation-aware passes (GPTQ / scale_sweep) are enabled.
+
+    Replaces the per-Linear `_quantize_2d` flow's slow steps (GPTQ +
+    scale_sweep) with the batched analogs in
+    `prismaquant.export_batched_gptq`. The fast steps (final NVFP4
+    pack, input-global-scale lookup) stay per-Linear since they are
+    already cheap.
+
+    Items: list of `(full, emit_full, recipe_key, mod)` tuples. All
+    `mod.weight` must share `(out, in)` shape. The function returns a
+    list of compressed dicts in the same order, ready to be merged
+    into the export's `out` dict by the caller.
+
+    AWQ rescale is assumed to have been applied IN PLACE on
+    `mod.weight` by `_awq_fold_layer_predecessors` before this is
+    called; we therefore use `mod.weight` directly as the post-AWQ
+    starting point for GPTQ. The reference weight passed to scale_sweep
+    is the same post-AWQ weight (matching the per-Linear path's
+    `weight.to(float32)` argument).
+    """
+    from .export_batched_gptq import (
+        gptq_obs_rounding_nvfp4_batched,
+        scale_sweep_nvfp4_batched,
+    )
+
+    n = len(items)
+    if n == 0:
+        return []
+
+    # Stack post-AWQ weights into [E, out, in]. All shapes must match.
+    weights = torch.stack(
+        [it[3].weight.detach().to(torch.float32) for it in items], dim=0,
+    ).to(device)
+    reference_weights = weights.clone()  # pre-pass reference for scale_sweep
+
+    # Per-Linear activation tensors (None where missing). When AWQ
+    # has produced a per-Linear scale `awq_s`, divide the cached
+    # activations by it — same semantics as `_acts_for_error_passes`
+    # in the per-Linear path.
+    acts_list: list = []
+    for full, emit_full, recipe_key, mod in items:
+        a = None
+        if _CACHED_ACTIVATIONS is not None:
+            raw = _CACHED_ACTIVATIONS.get(recipe_key)
+            if raw is not None and raw.shape[-1] == mod.weight.shape[1]:
+                a = raw.to(torch.float32).reshape(-1, raw.shape[-1])
+                awq_s = _AWQ_PROPER_SCALES.get(recipe_key)
+                if awq_s is not None:
+                    a = a / awq_s.to(a.device).clamp_min(1e-12).unsqueeze(0)
+        acts_list.append(a if a is not None else torch.zeros(
+            0, weights.shape[2], dtype=torch.float32, device=device))
+
+    # Per-Linear NVFP4 global_real overrides (from joint fused-sibling).
+    # When recipe_key isn't in joint_globals, the batched path computes
+    # per-Linear from the weights — pass `None` for that Linear. We
+    # represent the override array as a [E] tensor with NaN for "no
+    # override"; the batched function expects a single tensor of shape
+    # [E], so we must split into "all overridden" or "none overridden"
+    # groups within this function or fall back to per-Linear when mixed.
+    overrides_list = [joint_globals.get(it[2]) for it in items]
+    if all(v is not None for v in overrides_list):
+        global_real_overrides = torch.stack(
+            [v.to(device, dtype=torch.float32) for v in overrides_list]
+        ).reshape(n)
+    elif all(v is None for v in overrides_list):
+        global_real_overrides = None
+    else:
+        # Mixed — split into homogeneous sub-groups and recurse.
+        with_idx = [i for i, v in enumerate(overrides_list) if v is not None]
+        without_idx = [i for i, v in enumerate(overrides_list) if v is None]
+        results: list[dict] = [None] * n  # type: ignore[list-item]
+        if with_idx:
+            sub = [items[i] for i in with_idx]
+            sub_results = _quantize_2d_nvfp4_group_batched(
+                sub, joint_globals, device, expert_chunk=expert_chunk,
+            )
+            for i, r in zip(with_idx, sub_results):
+                results[i] = r
+        if without_idx:
+            sub = [items[i] for i in without_idx]
+            sub_results = _quantize_2d_nvfp4_group_batched(
+                sub, joint_globals, device, expert_chunk=expert_chunk,
+            )
+            for i, r in zip(without_idx, sub_results):
+                results[i] = r
+        return results
+
+    # Run the batched activation-aware passes. Match the per-Linear
+    # `_quantize_2d` ordering: GPTQ → scale_sweep.
+    if _ACT_AWARE_FLAGS["gptq"]:
+        weights = gptq_obs_rounding_nvfp4_batched(
+            weights, acts_list,
+            global_real_overrides=global_real_overrides,
+            expert_chunk=expert_chunk,
+        )
+    if _ACT_AWARE_FLAGS["scale_sweep"]:
+        weights = scale_sweep_nvfp4_batched(
+            weights, acts_list,
+            reference_weights=reference_weights,
+            global_real_overrides=global_real_overrides,
+            expert_chunk=expert_chunk,
+        )
+
+    # Per-Linear final NVFP4 pack (cheap; reuses the existing function).
+    out: list[dict] = []
+    for i, (full, emit_full, recipe_key, mod) in enumerate(items):
+        override = overrides_list[i]
+        wp, ws, wg = quantize_dequantize_nvfp4(
+            weights[i], group_size=16,
+            global_real_override=override,
+        )
+        input_scale = (
+            _INPUT_GLOBAL_SCALES.get(recipe_key) if _INPUT_GLOBAL_SCALES
+            else None
+        )
+        if input_scale is None:
+            input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+        out.append({
+            "weight_packed": wp,
+            "weight_scale": ws,
+            "weight_global_scale": wg.reshape(1)
+            if wg.dim() == 0 else wg,
+            "input_global_scale": torch.tensor(
+                [float(input_scale)], dtype=torch.float32),
+        })
+    return out
+
+
 def _host_mem_available_bytes() -> int:
     try:
         with open("/proc/meminfo") as f:
@@ -2470,6 +2605,21 @@ def materialize_tensors_streaming(
             tuple[str, tuple[int, int]],
             list[tuple[str, str, str, nn.Linear]]  # (full, emit_full, recipe_key, mod)
         ] = defaultdict(list)
+        # v23 (opt-in): batch NVFP4 same-shape Linears when act-aware
+        # passes (GPTQ / scale_sweep) are on. Activated by env var
+        # PRISMAQUANT_BATCHED_NVFP4_EXPORT=1 — disabled by default while
+        # the path is being validated against the per-Linear baseline.
+        # When inactive, NVFP4 Linears go through the per-Linear
+        # `_quantize_2d` exactly as before.
+        grouped_nvfp4_batched: dict[
+            tuple[int, int],
+            list[tuple[str, str, str, nn.Linear]]
+        ] = defaultdict(list)
+        _batched_nvfp4_enabled = (
+            os.environ.get("PRISMAQUANT_BATCHED_NVFP4_EXPORT") == "1"
+            and (_ACT_AWARE_FLAGS["gptq"] or _ACT_AWARE_FLAGS["scale_sweep"])
+            and _CACHED_ACTIVATIONS is not None
+        )
         for sub_name, mod in layer_mod.named_modules():
             if not isinstance(mod, nn.Linear):
                 continue
@@ -2589,6 +2739,16 @@ def materialize_tensors_streaming(
                 grouped_linears[(fmt, shape)].append((full, emit_full, recipe_key, mod))
                 continue
 
+            # v23: route NVFP4 same-shape Linears through the batched
+            # GPTQ + scale_sweep path when env-gated and act-aware.
+            if (_batched_nvfp4_enabled
+                    and fmt == "NVFP4"
+                    and mod.weight.dim() == 2):
+                shape = (int(mod.weight.shape[0]), int(mod.weight.shape[1]))
+                grouped_nvfp4_batched[shape].append(
+                    (full, emit_full, recipe_key, mod))
+                continue
+
             override = joint_globals.get(recipe_key) if fmt == "NVFP4" else None
             compressed = _quantize_2d(
                 mod.weight.detach().float(), fmt,
@@ -2629,6 +2789,33 @@ def materialize_tensors_streaming(
                     hist[("linear", fmt)] += 1
                     covered.add(full)
                 del compressed_batch
+
+        # v23: batched NVFP4 emission for same-shape groups when
+        # _batched_nvfp4_enabled. Mirrors the INT/MXFP8 grouped path
+        # above but routes through the activation-aware batched path.
+        if grouped_nvfp4_batched:
+            export_dev = torch.device(device)
+            for shape, items in grouped_nvfp4_batched.items():
+                # Re-use the same E-chunk sizing as the INT/MXFP8 path
+                # so memory peaks stay bounded.
+                chunk_len = _export_vector_chunk_len(
+                    shape, len(items), export_dev)
+                for start in range(0, len(items), chunk_len):
+                    chunk = items[start:start + chunk_len]
+                    compressed_per_linear = _quantize_2d_nvfp4_group_batched(
+                        chunk, joint_globals, export_dev,
+                        expert_chunk=chunk_len,
+                    )
+                    for (full, emit_full, _recipe_key, mod), compressed in zip(
+                        chunk, compressed_per_linear,
+                    ):
+                        for suffix, t in compressed.items():
+                            out[f"{emit_full}.{suffix}"] = t.cpu()
+                        if mod.bias is not None:
+                            out[f"{emit_full}.bias"] = mod.bias.detach().to(
+                                torch.bfloat16).cpu()
+                        hist[("linear", "NVFP4")] += 1
+                        covered.add(full)
 
         # 3d. Emit packed MoE experts, scoped to this layer.
         packed_count = 0
