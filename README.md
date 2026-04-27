@@ -237,4 +237,4 @@ prismaquant builds on a decade of mixed-precision quantization research. The clo
 - **Pareto-knee detection** — Kneedle (Satopaa et al. 2011)
 - **Foundation** — *Elements of Information Theory* (Cover & Thomas, 2006), Chapter 13 on rate-distortion bit allocation
 
-A full bibliography lives in the project notes; the closed-form allocator math + `_GradNormCapture` MoE Fisher estimator + MTP quantization path will be in a forthcoming preprint.
+For the full bibliography and the derivations underlying the closed-form allocator math, the `_GradNormCapture` MoE Fisher estimator, and the MTP quantization path: see source comments in `prismaquant/{sensitivity_probe,allocator,allocator_prune,mtp_module}.py` and the design notes under `docs/`.
