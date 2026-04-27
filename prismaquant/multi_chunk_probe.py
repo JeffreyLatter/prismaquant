@@ -334,24 +334,79 @@ def main() -> int:
 
     print(f"\n[multi-chunk] merging {len(chunk_outputs)} per-chunk "
           f"probe.pkls -> {out_path}", flush=True)
-    ip.merge_probe_pickles(chunk_outputs, out_path)
-
-    # Build per-domain + globally-aggregated saliency maps from raw
-    # per-chunk pickles using the token-weighted average so the merged
-    # value is correct regardless of differing chunk sizes.
+    # NOTE: cannot use ip.merge_probe_pickles here — that function
+    # expects per-shard pickles WITHIN a single chunk (non-overlapping
+    # Linear sets) and raises on overlap. Across chunks every chunk
+    # tracks the same Linears, so we sum the additive Fisher fields
+    # (h_trace_raw, h_w2_sum_raw, n_tokens_seen) and let the rest of
+    # the merged structure inherit from chunk 0.
+    SUMMABLE = ("h_trace_raw", "h_w2_sum_raw", "n_tokens_seen")
     per_chunk_pairs: list[tuple[dict, str]] = []
     for p, d in zip(chunk_outputs, chunk_domains):
         with p.open("rb") as f:
             per_chunk_pairs.append((pickle.load(f), d))
+
+    merged_stats: dict[str, dict] = {}
+    merged_router_counts: dict = {}
+    merged_router_totals: dict = {}
+    merged_expert_info: dict = {}
+    merged_h_full: dict = {}  # only present if h_detail_dir was on
+    chunk_metas: list = []
+    for pkl, _domain in per_chunk_pairs:
+        for name, s in (pkl.get("stats") or {}).items():
+            prev = merged_stats.get(name)
+            if prev is None:
+                merged_stats[name] = dict(s)
+            else:
+                for fld in SUMMABLE:
+                    prev[fld] = prev.get(fld, 0) + s.get(fld, 0)
+                # h_trace_per_expert_raw (packed-3D path): elementwise sum
+                src_per = s.get("h_trace_per_expert_raw")
+                dst_per = prev.get("h_trace_per_expert_raw")
+                if src_per is not None:
+                    if dst_per is None:
+                        prev["h_trace_per_expert_raw"] = list(src_per)
+                    else:
+                        prev["h_trace_per_expert_raw"] = [
+                            a + b for a, b in zip(dst_per, src_per)]
+        # router counts/totals: sum
+        for rk, rv in (pkl.get("router_counts") or {}).items():
+            merged_router_counts.setdefault(rk, {})
+            for sub_k, sub_v in (rv or {}).items():
+                merged_router_counts[rk][sub_k] = (
+                    merged_router_counts[rk].get(sub_k, 0) + int(sub_v))
+        for rk, rv in (pkl.get("router_totals") or {}).items():
+            merged_router_totals[rk] = (
+                merged_router_totals.get(rk, 0) + int(rv))
+        merged_expert_info.update(pkl.get("expert_info") or {})
+        chunk_metas.append(pkl.get("meta") or {})
+
+    # Finalize derived fields per Linear (h_trace, h_w2_sum) using
+    # accumulated raw + total tokens seen.
+    for s in merged_stats.values():
+        tokens = max(int(s.get("n_tokens_seen", 1)), 1)
+        s["h_trace"] = float(s.get("h_trace_raw", 0.0)) / tokens
+        s["h_w2_sum"] = float(s.get("h_w2_sum_raw", 0.0)) / tokens
+        per = s.get("h_trace_per_expert_raw")
+        if per is not None:
+            s["h_trace_per_expert"] = [float(v) / tokens for v in per]
+
     expert_saliency_per_domain = aggregate_per_domain_saliency(per_chunk_pairs)
     expert_saliency_global = aggregate_global_saliency(
         expert_saliency_per_domain, per_chunk_pairs)
 
-    with out_path.open("rb") as f:
-        merged = pickle.load(f)
-    merged["expert_saliency"] = expert_saliency_global
-    merged["expert_saliency_per_domain"] = expert_saliency_per_domain
-    meta = dict(merged.get("meta", {}))
+    merged: dict = {
+        "stats": merged_stats,
+        "router_counts": merged_router_counts,
+        "router_totals": merged_router_totals,
+        "expert_info": merged_expert_info,
+        "expert_saliency": expert_saliency_global,
+        "expert_saliency_per_domain": expert_saliency_per_domain,
+    }
+    meta = dict(per_chunk_pairs[0][0].get("meta", {})) if per_chunk_pairs else {}
+    meta["incremental"] = True
+    meta["multi_chunk"] = True
+    meta["multi_chunk_chunks"] = chunk_metas
     meta["multi_chunk_count"] = len(chunk_outputs)
     meta["multi_chunk_total_nsamples"] = sum(
         pkl.get("meta", {}).get("nsamples", 0)
