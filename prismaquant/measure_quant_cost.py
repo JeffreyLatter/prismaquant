@@ -585,18 +585,56 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     processed = 0
     tstart = time.time()
 
+    # v24: async activation prefetch. The previous synchronous path
+    # spent ~30-40% of the cost step's wall in the per-Linear file
+    # reads at chunk-start (e.g. chunk_size=256 × ~5 ms/file = ~1.3 s
+    # of disk I/O blocking the GPU after every chunk). Overlap by
+    # loading chunk N+1's activations on a small thread pool while
+    # chunk N's measurements run on the GPU. Default off — opt-in via
+    # PRISMAQUANT_COST_PREFETCH_ACT=1 — until we've validated the win
+    # at production scale.
+    import os as _os
+    from concurrent.futures import ThreadPoolExecutor as _Pool
+    _prefetch_enabled = _os.environ.get("PRISMAQUANT_COST_PREFETCH_ACT") == "1"
+    _prefetch_pool = _Pool(max_workers=2) if _prefetch_enabled else None
+
+    def _load_chunk_acts(_names):
+        return [act_cache.load(n) for n in _names]
+
     for (in_f, out_f), entries in groups.items():
         entries_with_acts = [(n, m) for n, m in entries if n in act_cache]
         if not entries_with_acts:
             continue
 
-        for chunk in _chunked(entries_with_acts, chunk_size):
+        chunks_list = list(_chunked(entries_with_acts, chunk_size))
+        # Kick off the first chunk's load so the loop can pull from the
+        # future immediately on entry. Subsequent iterations submit the
+        # next chunk's load before processing the current one.
+        next_acts_fut = (
+            _prefetch_pool.submit(
+                _load_chunk_acts, [n for n, _ in chunks_list[0]])
+            if _prefetch_enabled and chunks_list
+            else None
+        )
+
+        for chunk_i, chunk in enumerate(chunks_list):
             names = [n for n, _ in chunk]
             N = len(chunk)
-            # Lazy load activations for this chunk only. Keep the list on
-            # CPU briefly so we can pick the uniform row count (min across
-            # the chunk), then stack and ship to GPU.
-            acts_cpu = [act_cache.load(n) for n in names]
+            # Lazy load activations for this chunk only. With prefetch
+            # enabled, the future is already in flight from the prior
+            # iteration (or kicked off above for the first chunk).
+            if _prefetch_enabled:
+                acts_cpu = next_acts_fut.result()
+                # Submit the NEXT chunk's load before we touch the GPU
+                # so the disk reads overlap with the upcoming bmm.
+                if chunk_i + 1 < len(chunks_list):
+                    nxt_names = [n for n, _ in chunks_list[chunk_i + 1]]
+                    next_acts_fut = _prefetch_pool.submit(
+                        _load_chunk_acts, nxt_names)
+                else:
+                    next_acts_fut = None
+            else:
+                acts_cpu = [act_cache.load(n) for n in names]
             chunk_min_rows = min(a.size(0) for a in acts_cpu)
             # Stack weights
             W = torch.stack([m.weight.detach().to(device=dev, dtype=dtype)
@@ -688,6 +726,8 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 print(f"[cost] {processed}/{total_linears} "
                       f"eta={eta:.0f}s  ({N} per chunk × {len(specs)} formats)",
                       flush=True)
+    if _prefetch_pool is not None:
+        _prefetch_pool.shutdown(wait=False)
     return _finalize_results(accum)
 
 
