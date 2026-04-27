@@ -192,6 +192,20 @@ def main() -> int:
                     help="Cost h-detail dir; off by default — h-detail "
                          "writes ~940 GB/chunk on MiniMax, defer unless "
                          "the disk has headroom.")
+    ap.add_argument("--cost-swap-grow-limit-mb", type=int, default=2048,
+                    help="Cost-step memory watchdog: abort if swap "
+                         "grows by more than this many MB. Default 2048 "
+                         "(matches the v20 multipass launcher); the "
+                         "incremental_measure_quant_cost default of 256 "
+                         "is too tight for the batched-GPU path on "
+                         "MoE-heavy models, where transient stacking "
+                         "of expert weights and activations regularly "
+                         "spikes ~500-1000 MB into swap on UMA.")
+    ap.add_argument("--cost-no-watchdog", action="store_true",
+                    default=False,
+                    help="Disable the cost-step memory watchdog "
+                         "entirely. Useful when the swap-grow limit "
+                         "still trips on legitimate workloads.")
     args, passthrough = ap.parse_known_args()
     if args.retain_cross_chunk_cache:
         os.environ["PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK"] = "1"
@@ -487,6 +501,11 @@ def main() -> int:
         cost_argv += ["--layers-per-shard", str(cost_lps)]
         if args.cost_h_detail_dir:
             cost_argv += ["--h-detail-dir", args.cost_h_detail_dir]
+        cost_argv += [
+            "--swap-grow-limit-mb", str(args.cost_swap_grow_limit_mb),
+        ]
+        if args.cost_no_watchdog:
+            cost_argv += ["--no-watchdog"]
         # Sanity check the model & activation-cache-dir survived the
         # passthrough split — a missing value here would silently
         # produce a useless cost.pkl, so loud-fail instead.
