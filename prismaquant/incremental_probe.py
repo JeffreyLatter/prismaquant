@@ -140,15 +140,57 @@ def _minimax_fast_experts_forward(
     final_hidden_states = torch.zeros_like(hidden_states)
     act_fn = self[0].act_fn
 
-    for experts in active.split(chunk_size):
-        expert_list = [int(e) for e in experts.tolist()]
-        chunk_counts = counts.index_select(0, experts)
-        max_count = int(chunk_counts.max().item())
+    # v22 Fix E2: hoist all per-chunk syncs into ONE batched device→host
+    # transfer at the start of the function. The original code did 4-5
+    # `.item()` / `.tolist()` calls inside the loop body, each of which
+    # blocks the GPU until the prior kernel finishes. With ~8 chunks per
+    # layer × ~50 MoE layers per phase-1, that's ~2000 host syncs
+    # serializing GPU work. Now we precompute per-chunk metadata in
+    # device tensors, do one .cpu() at the top, then loop using host
+    # data only — no in-loop syncs.
+    chunk_list = list(active.split(chunk_size))
+    n_chunks = len(chunk_list)
+    if n_chunks == 0:
+        return final_hidden_states
+
+    # Per-chunk metadata: (start, end, max_count) packed into a single
+    # (n_chunks, 3) device tensor.
+    # start_dev[i] = offsets[chunk_list[i][0]]
+    # end_dev[i]   = offsets[chunk_list[i][-1] + 1]
+    # max_count_dev[i] = max(counts[expert] for expert in chunk_list[i])
+    chunk_first = torch.stack([c[0] for c in chunk_list])
+    chunk_last_p1 = torch.stack([c[-1] + 1 for c in chunk_list])
+    starts_dev = offsets.index_select(0, chunk_first)
+    ends_dev = offsets.index_select(0, chunk_last_p1)
+    # Per-chunk max via bincount + max — vectorized on device.
+    # Build a chunk-id-per-active-expert tensor, then segment max.
+    chunk_lengths = torch.tensor(
+        [c.numel() for c in chunk_list], device=device, dtype=torch.long)
+    chunk_id_per_active = torch.repeat_interleave(
+        torch.arange(n_chunks, device=device), chunk_lengths)
+    counts_active = counts.index_select(0, active)
+    max_counts_dev = torch.full((n_chunks,), 0, device=device, dtype=torch.long)
+    max_counts_dev.scatter_reduce_(
+        0, chunk_id_per_active, counts_active, reduce="amax")
+    metadata_dev = torch.stack(
+        [starts_dev, ends_dev, max_counts_dev], dim=1)
+    metadata_host = metadata_dev.cpu()  # SYNC #1 (per layer, not per chunk)
+
+    # Flat list of all active expert ids, host-side, used by the
+    # ModuleList indexing below. ONE sync for all chunks.
+    all_active_host = active.tolist()  # SYNC #2
+
+    expert_offset = 0
+    for chunk_i, experts in enumerate(chunk_list):
+        chunk_n = experts.numel()
+        expert_list = all_active_host[expert_offset:expert_offset + chunk_n]
+        expert_offset += chunk_n
+        start = int(metadata_host[chunk_i, 0])
+        end = int(metadata_host[chunk_i, 1])
+        max_count = int(metadata_host[chunk_i, 2])
         if max_count == 0:
             continue
 
-        start = int(offsets[int(experts[0])].item())
-        end = int(offsets[int(experts[-1]) + 1].item())
         sl = slice(start, end)
         experts_sl = experts_sorted[sl]
         tokens_sl = tokens_sorted[sl]
@@ -1029,7 +1071,12 @@ def _compute_global_precompute(
 
     for d in range(prefetch_depth):
         ctx.schedule_prefetch(d)
-    activations_cpu: list[torch.Tensor] = [hidden.detach().cpu()]
+    # v22 Fix E1: keep activations on device through phase-1 to avoid
+    # the per-layer .cpu() sync that stalls the forward pipeline. We
+    # batch the device→host transfer at the END of phase-1 in a single
+    # call. The pickled precompute cache (and downstream phase-3) want
+    # CPU tensors, which we produce after the loop.
+    device_acts: list[torch.Tensor] = [hidden.detach()]
     for L in range(num_layers):
         load_t0 = time.time()
         src = ctx.install(L)
@@ -1048,12 +1095,25 @@ def _compute_global_precompute(
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
-        activations_cpu.append(hidden.detach().cpu())
+        device_acts.append(hidden.detach())
         ctx.unload(L)
         if L % 8 == 0 or L == num_layers - 1:
             print(f"[incremental/global] fwd L{L:02d}  src={src}  "
                   f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+    # v22 Fix E1: batched device→host transfer for the activations
+    # captured during phase-1. All have the same (B, T, H) shape so we
+    # stack into one (L+1, B, T, H) tensor and do a single .cpu() —
+    # 62 individual transfers collapsed into one. After the copy lands,
+    # we split back into a list of CPU tensors so the rest of the code
+    # (precompute cache pickle, phase-3 reads) sees the original layout.
+    t_h2h = time.time()
+    stacked = torch.stack(device_acts, dim=0).cpu()
+    activations_cpu: list[torch.Tensor] = [
+        stacked[i].clone() for i in range(stacked.size(0))
+    ]
+    del device_acts, stacked
     print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
+          f"(host transfer {time.time()-t_h2h:.1f}s)  "
           f"{ctx.layer_cache.summary()}", flush=True)
 
     # Collect saliency and drop hooks before Phase-2 begins (Phase-2 replays
