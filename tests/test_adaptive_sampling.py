@@ -113,6 +113,62 @@ def test_status_unstable_stays_contested():
     assert sched.expert_status("R", 0) == "contested"
 
 
+def test_status_sticky_freeze_survives_minor_oscillation():
+    """v22 Fix D: once an expert has earned a freeze, a single mildly
+    out-of-window chunk shouldn't unfreeze it. The chunk-3 unfreeze
+    regression we saw on the live MiniMax run came from this exact
+    oscillation. With sticky_unfreeze_factor > 1, only dramatic
+    instability releases the freeze."""
+    sched = AdaptiveExpertScheduler(
+        min_chunks_for_freeze=2,
+        stability_threshold=0.10,
+        stability_window=3,
+        keep_band=0.25, drop_band=0.10,
+        contested_band=0.0,  # disable so global rank check is decisive
+        sticky_unfreeze_factor=2.5,
+    )
+    # 4 experts; expert 9 dominates router, stable across first 3 chunks
+    sal_stable = {"R": {0: 1.0, 1: 2.0, 2: 3.0, 9: 100.0}}
+    for _ in range(3):
+        sched.update_from_chunk_pickle(_make_chunk(sal_stable), "_global")
+    assert sched.expert_status("R", 9) == "frozen-keep"
+
+    # Mild oscillation: chunk 4 has expert-9 saliency at 90 (10% drop).
+    # Range across last 3 = (100 - 90) / 95 = 0.105 — JUST above the
+    # 0.10 stability threshold but below 0.25 sticky threshold.
+    sched.update_from_chunk_pickle(
+        _make_chunk({"R": {0: 1.0, 1: 2.0, 2: 3.0, 9: 90.0}}), "_global")
+    # Sticky semantics: stays frozen.
+    assert sched.expert_status("R", 9) == "frozen-keep"
+
+
+def test_status_sticky_freeze_releases_on_dramatic_change():
+    """v22 Fix D: sticky freeze is not absolute — when an expert's
+    behavior changes dramatically (range > sticky_unfreeze_factor ×
+    threshold), we release the freeze and let the next chunks decide."""
+    sched = AdaptiveExpertScheduler(
+        min_chunks_for_freeze=2,
+        stability_threshold=0.10,
+        stability_window=3,
+        keep_band=0.25, drop_band=0.10,
+        contested_band=0.0,
+        sticky_unfreeze_factor=2.0,
+    )
+    # Expert 9 at 100 across 3 chunks → frozen-keep.
+    for _ in range(3):
+        sched.update_from_chunk_pickle(
+            _make_chunk({"R": {0: 1.0, 1: 2.0, 2: 3.0, 9: 100.0}}),
+            "_global")
+    assert sched.expert_status("R", 9) == "frozen-keep"
+
+    # Chunk 4: expert 9 collapses to 50. Range across last 3 chunks
+    # = (100 - 50) / mean(100,100,50) ≈ 0.6 → way over sticky threshold.
+    sched.update_from_chunk_pickle(
+        _make_chunk({"R": {0: 1.0, 1: 2.0, 2: 3.0, 9: 50.0}}), "_global")
+    # Released.
+    assert sched.expert_status("R", 9) == "contested"
+
+
 def test_per_domain_disagreement_keeps_contested():
     """If an expert ranks in the keep band of one domain and the drop
     band of another, it must stay contested — domain-specific load-

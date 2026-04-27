@@ -881,6 +881,46 @@ def _compute_precompute_key(model_path: str, dataset_name: str,
 _PROBE_CTX_CACHE: dict = {}
 
 
+# v22 Fix A: lazy weight-stats cache.
+#
+# w_max_abs and w_norm_sq are invariants of each Linear's weight. The
+# original probe code recomputed them at every shard's hook setup —
+# that fires `.abs().max().item()` and `.pow(2).sum().item()` per
+# tracked Linear, totaling ~94k device syncs per phase-3 sweep. Each
+# sync is a ~50 us host stall AND blocks subsequent kernel issue, so
+# the cumulative GPU pipeline gap was several seconds per chunk.
+#
+# This cache is keyed by (fqn, weight.data_ptr) so a model swap or
+# in-place weight modification (export pass, AWQ fold, etc.) invalidates
+# automatically — different storage, different key. Within a single
+# probe run the weights are immutable, so the cache holds for the whole
+# multi-chunk driver lifetime.
+_W_STATS_CACHE: dict[tuple[str, int, tuple[int, ...]], tuple[float, float]] = {}
+
+
+def _get_or_compute_w_stats(fqn: str, weight) -> tuple[float, float]:
+    """Return (w_max_abs, w_norm_sq) for `weight`, caching by FQN +
+    storage pointer + shape so repeated calls within a probe run are
+    free. Uses one batched .cpu() call instead of two `.item()` syncs.
+    """
+    try:
+        ptr = int(weight.data_ptr())
+    except Exception:
+        ptr = 0
+    key = (fqn, ptr, tuple(weight.shape))
+    cached = _W_STATS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    w_det = weight.detach()
+    # Stack the two reductions and pull them off the device in one sync.
+    stats = torch.stack(
+        [w_det.abs().max(), w_det.pow(2).sum()]
+    ).float().cpu().tolist()
+    out = (float(stats[0]), float(stats[1]))
+    _W_STATS_CACHE[key] = out
+    return out
+
+
 @dataclasses.dataclass
 class GlobalPrecompute:
     """Shard-independent artifacts from Phase-1 + Phase-2.
@@ -1411,6 +1451,29 @@ def _run_body_streaming_shard(
         cache_dir.mkdir(parents=True, exist_ok=True)
     act_fname_sub = re.compile(r"[^A-Za-z0-9_-]")
 
+    # v22 Fix C: async + batched activation cache writes.
+    #
+    # PRISMAQUANT_ACT_CACHE_ASYNC=1 (default off) defers per-Linear
+    # torch.save calls to a small thread pool so the main probe thread
+    # doesn't pay the file-write latency between layers. Each write is
+    # short (~1-5 ms) but ~770 writes per layer × 62 layers per phase-3
+    # = 47k synchronous file ops, roughly 50-200 s of wall time we
+    # don't need to spend in the foreground. Pool size defaults to 4
+    # workers — enough to keep up with the layer flush rate without
+    # piling on the IO subsystem.
+    _act_async = os.environ.get("PRISMAQUANT_ACT_CACHE_ASYNC") == "1"
+    _act_pool = None
+    _act_pending: list = []
+    if _act_async and cache_dir is not None:
+        from concurrent.futures import ThreadPoolExecutor
+        _act_pool = ThreadPoolExecutor(
+            max_workers=int(os.environ.get("PRISMAQUANT_ACT_CACHE_WORKERS", "4")),
+            thread_name_prefix="act-save",
+        )
+
+    def _act_save_one(path, payload):
+        torch.save(payload, path)
+
     def flush_activation_snapshots(snaps_by_name: dict[str, list[torch.Tensor]]):
         if cache_dir is None:
             return
@@ -1418,9 +1481,32 @@ def _run_body_streaming_shard(
             snaps = snaps_by_name.pop(name)
             if not snaps:
                 continue
-            X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
+            # If the snapshots are still on device (Fix C path), bring
+            # them to host once per Linear via a non-blocking copy
+            # before pickling. The fwd hook keeps them on device when
+            # _act_async is on so the main thread doesn't stall on
+            # device→host transfers between Linears in the same forward.
+            X = torch.cat(snaps, dim=0).to(
+                "cpu", dtype=torch.bfloat16
+            ).contiguous()
             fname = act_fname_sub.sub("__", name) + ".pt"
-            torch.save({"inputs": X, "name": name}, cache_dir / fname)
+            target = cache_dir / fname
+            if _act_pool is not None:
+                fut = _act_pool.submit(
+                    _act_save_one, target, {"inputs": X, "name": name})
+                _act_pending.append(fut)
+            else:
+                torch.save({"inputs": X, "name": name}, target)
+
+    def drain_activation_writes():
+        """Block until all background activation-cache writes have
+        completed. Called at the end of the shard so the cost step sees
+        a fully-flushed activation directory."""
+        if _act_pool is None:
+            return
+        for fut in _act_pending:
+            fut.result()
+        _act_pending.clear()
 
     collect_h_full = h_detail_dir is not None
     packed_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -1601,7 +1687,18 @@ def _run_body_streaming_shard(
                             if flat.size(0) > need:
                                 idx = torch.randperm(flat.size(0), device=flat.device)[:need]
                                 flat = flat.index_select(0, idx)
-                            activation_snaps[name].append(flat.to("cpu"))
+                            # v22 Fix C: keep on device when async writes
+                            # are enabled. Each per-Linear .to("cpu") in
+                            # the inline path forces a device→host
+                            # synchronization, stalling the forward
+                            # pipeline. Deferring lets the layer's whole
+                            # forward run uninterrupted; the device→host
+                            # copy happens once per Linear at end-of-layer
+                            # in flush_activation_snapshots.
+                            if _act_async:
+                                activation_snaps[name].append(flat.detach())
+                            else:
+                                activation_snaps[name].append(flat.to("cpu"))
                             activation_rows[name] += flat.size(0)
                 return hook
 
@@ -1616,11 +1713,56 @@ def _run_body_streaming_shard(
             deferred_sync = (
                 os.environ.get("PRISMAQUANT_DEFERRED_FISHER_SYNC") == "1"
             )
+            # v22 Fix B: deferred Fisher COMPUTE. Beyond just deferring the
+            # device→host syncs (above), this defers the per-Linear matmul
+            # itself out of the autograd engine's per-Linear callback path.
+            #
+            # Why: even with #1 (no .item() syncs), every Linear's bwd
+            # hook still does ~6 GPU kernel launches (gy², x², matmul,
+            # sum, h_w2 multiply, sum) DURING autograd's traversal. Each
+            # launch is bounced through Python and the autograd engine
+            # serializes against it, leaving the GPU idle waiting for
+            # Python to dispatch the next kernel. nvidia-smi dmon shows
+            # 13% SM utilization during phase-3 because of this.
+            #
+            # With deferred_compute=on, the bwd hook just appends
+            # (name, x_ref, gy_ref, mod_ref) to a per-layer queue and
+            # returns immediately. The autograd graph traversal flies
+            # through; the GPU stream stays busy with the layer's actual
+            # bwd kernels (Q/K/V/O, attn, FFN). After `out.backward()`
+            # returns, a tight Python loop drains the queue, issuing
+            # the per-Linear Fisher matmuls back-to-back. The CUDA
+            # driver's command queue stays full — SM utilization should
+            # rise from ~13% to ~50-80%.
+            #
+            # Math is byte-identical to the immediate path. Memory cost:
+            # the queue pins (x, gy) refs for one layer's tracked Linears
+            # — typical MiniMax MoE layer ≈ 770 entries × ~2 MB = ~1.5 GB
+            # peak, well within the cache budget that already accounts
+            # for it.
+            deferred_compute = (
+                os.environ.get("PRISMAQUANT_DEFERRED_FISHER_COMPUTE") == "1"
+            )
             # Per-Linear device-resident accumulators built lazily inside
             # the hook so we know the stream / device the kernel ran on.
             device_accums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            # Per-layer deferred-compute queue: (name, x, gy, mod_ref).
+            # Drained immediately after `out.backward(grad_out)` returns.
+            deferred_queue: list[tuple[str, torch.Tensor, torch.Tensor, "nn.Linear"]] = []
 
             def make_bwd(name: str, mod_ref: nn.Linear):
+                if deferred_compute:
+                    # v22 Fix B path: queue refs, return fast. The Fisher
+                    # math runs after out.backward() in a tight loop.
+                    def hook(module, grad_input, grad_output):
+                        gy = grad_output[0]
+                        x = saved_inputs.pop(name, None)
+                        if x is None or gy is None:
+                            return
+                        deferred_queue.append(
+                            (name, x.detach(), gy.detach(), mod_ref))
+                    return hook
+
                 def hook(module, grad_input, grad_output):
                     gy = grad_output[0]
                     x = saved_inputs.pop(name, None)
@@ -1711,11 +1853,15 @@ def _run_body_streaming_shard(
                 w = mod.weight
                 if w.is_meta:
                     continue
+                # v22 Fix A: cached lookup. First call computes the
+                # batched .stack().cpu() and memoizes; subsequent shards
+                # / chunks return instantly with no device sync.
+                w_max_abs, w_norm_sq = _get_or_compute_w_stats(fqn, w)
                 acc_stats[fqn] = {
                     "h_trace_raw": 0.0,
                     "h_w2_sum_raw": 0.0,
-                    "w_max_abs": float(w.detach().abs().max().item()),
-                    "w_norm_sq": float(w.detach().pow(2).sum().item()),
+                    "w_max_abs": w_max_abs,
+                    "w_norm_sq": w_norm_sq,
                     "n_params": int(w.numel()),
                     "in_features": mod.in_features,
                     "out_features": mod.out_features,
@@ -1812,6 +1958,62 @@ def _run_body_streaming_shard(
             out.backward(grad_out.to(device))
             bwd_s = time.time() - bwd_t0
             phase_bwd_s += bwd_s
+
+            # v22 Fix B: drain the deferred-compute queue. The bwd hook
+            # only queued (x, gy) refs; now we run the per-Linear Fisher
+            # matmul in a tight Python loop, back-to-back, so the CUDA
+            # driver's command queue stays full and SM utilization rises.
+            #
+            # The math is identical to the inline path — same sequence
+            # of ops per Linear, same result. Just decoupled from the
+            # autograd engine's serial Python callback dispatch. When
+            # deferred_sync is also on (typical), the per-Linear
+            # h_trace / h_w2_sum stay device-resident here too.
+            if deferred_compute and deferred_queue:
+                for name, x, gy, mod_ref in deferred_queue:
+                    gy2 = gy.reshape(-1, gy.size(-1))
+                    x2 = x.reshape(-1, x.size(-1))
+                    T = x2.size(0)
+                    gy2_sq = gy2.pow(2)
+                    x2_sq = x2.pow(2)
+                    chunk_h = (gy2_sq.t() @ x2_sq).float()
+                    if collect_h_full:
+                        acc = acc_h_full.get(name)
+                        if acc is None:
+                            acc = torch.zeros(
+                                int(gy2.size(1)), int(x2.size(1)),
+                                dtype=torch.float32, device="cpu")
+                            acc_h_full[name] = acc
+                        acc.add_(chunk_h.to("cpu"))
+                    h_trace_dev = chunk_h.sum()
+                    if deferred_sync:
+                        slot = device_accums.get(name)
+                        if slot is None:
+                            slot = (
+                                torch.zeros((), device=h_trace_dev.device,
+                                            dtype=torch.float32),
+                                torch.zeros((), device=h_trace_dev.device,
+                                            dtype=torch.float32),
+                            )
+                            device_accums[name] = slot
+                        slot[0].add_(h_trace_dev)
+                    else:
+                        acc_stats[name]["h_trace_raw"] += float(
+                            h_trace_dev.item())
+                    if not collect_h_full:
+                        w = mod_ref.weight
+                        if w is not None and not w.is_meta:
+                            h_w2_dev = (
+                                chunk_h * w.detach().float().pow(2)
+                                .to(chunk_h.device)
+                            ).sum()
+                            if deferred_sync:
+                                device_accums[name][1].add_(h_w2_dev)
+                            else:
+                                acc_stats[name]["h_w2_sum_raw"] += float(
+                                    h_w2_dev.item())
+                    acc_stats[name]["n_tokens_seen"] += T
+                deferred_queue.clear()
 
             # v21 #1: batched device→host transfer of the per-Linear
             # h_trace / h_w2_sum accumulators built up in the bwd hooks.
@@ -1979,6 +2181,9 @@ def _run_body_streaming_shard(
             X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
             fname = act_fname_sub.sub("__", name) + ".pt"
             torch.save({"inputs": X, "name": name}, cache_dir / fname)
+        # v22 Fix C: block until any async writes have completed so the
+        # cost step sees a fully-flushed activation cache directory.
+        drain_activation_writes()
 
     # Filter precomputed expert_info / expert_saliency to the subset of
     # routers whose experts are within this shard's include-regex scope.

@@ -85,10 +85,20 @@ class ExpertHistory:
     chunk processed in domain `d`). Used to compute rank stability:
     if successive chunks yield consistent saliency, the expert has
     stabilized for that domain.
+
+    v22 Fix D: `frozen_state` is the sticky freeze marker. Once set
+    (after passing the strict freeze gate at least once), it is only
+    cleared when a follow-up chunk reveals dramatic instability
+    (range > sticky_unfreeze_factor × stability_threshold). This stops
+    the chunk-3 unfreeze regression: with a 3-chunk rolling window,
+    naturally-stable experts could see one outlier chunk push range
+    above threshold and lose their freeze, only to refreeze on the
+    next chunk and oscillate forever. Sticky freezes don't oscillate.
     """
     numerator_by_domain: dict[str, float] = field(default_factory=dict)
     tokens_by_domain: dict[str, int] = field(default_factory=dict)
     chunk_values: dict[str, list[float]] = field(default_factory=dict)
+    frozen_state: str | None = None  # "frozen-keep" / "frozen-drop" / None
 
     def update(self, domain: str, chunk_value: float, chunk_tokens: int):
         """Fold a chunk's per-token-averaged saliency into the history.
@@ -160,6 +170,7 @@ class AdaptiveExpertScheduler:
     drop_band: float = 0.10  # bottom 10% of router → frozen-drop
     contested_band: float = 0.10  # ±10pp around prune cutoff stays contested
     disagreement_spread: float = 0.5  # if per-domain ranks span > this → contested
+    sticky_unfreeze_factor: float = 2.5  # frozen experts unfreeze only on > this × stability_threshold
 
     # Mutable state (not configurable at init time)
     history: dict[str, dict[int, ExpertHistory]] = field(default_factory=dict)
@@ -199,7 +210,96 @@ class AdaptiveExpertScheduler:
         self.chunks_processed_by_domain[domain] = (
             self.chunks_processed_by_domain.get(domain, 0) + 1
         )
+        # v22 Fix D: refresh frozen state across all (router, expert)
+        # pairs after every update. Stickiness lives in the per-expert
+        # ExpertHistory; new data either confirms an existing freeze
+        # (cheap), promotes a contested expert to frozen, or — only on
+        # dramatic disagreement — clears a stale freeze.
+        self._refresh_frozen_states()
         return n_updated
+
+    # ---- sticky freeze refresh ----
+    def _refresh_frozen_states(self) -> None:
+        for router_q, per_expert in self.history.items():
+            for eid, hist in per_expert.items():
+                hist.frozen_state = self._compute_frozen_state(
+                    router_q, eid, hist)
+
+    def _compute_frozen_state(
+        self,
+        router_q: str,
+        eid: int,
+        hist: ExpertHistory,
+    ) -> str | None:
+        """Decide whether `(router_q, eid)` should be marked frozen-keep,
+        frozen-drop, or contested (None). v22 Fix D adds stickiness:
+        once frozen, only un-freeze on a dramatic instability event.
+
+        Returns the new frozen_state for the expert (`"frozen-keep"`,
+        `"frozen-drop"`, or `None`).
+        """
+        domains = hist.domains_seen()
+        if not domains:
+            return None
+
+        prior = hist.frozen_state
+        if prior is not None:
+            # Sticky path: keep the freeze unless a domain shows
+            # range > sticky_unfreeze_factor × stability_threshold.
+            sticky_threshold = (
+                self.stability_threshold * self.sticky_unfreeze_factor
+            )
+            for d in domains:
+                vals = hist.chunk_values.get(d) or []
+                window = vals[-self.stability_window:]
+                if len(window) < 2:
+                    continue
+                v_mean = sum(window) / len(window)
+                eps = 1e-12
+                v_rel_range = (max(window) - min(window)) / (
+                    abs(v_mean) + eps)
+                if v_rel_range > sticky_threshold:
+                    # Dramatic shift — release the freeze; expert
+                    # returns to contested for re-evaluation.
+                    return None
+            return prior
+
+        # Cold path: not currently frozen. Apply the strict
+        # all-domains-stable + clearly-banded gates.
+        for d in domains:
+            if not self._is_stable_in_domain(hist, d):
+                return None
+
+        keep_in_all = True
+        drop_in_all = True
+        per_domain_ranks: list[float] = []
+        for d in domains:
+            r = self._router_rank(router_q, eid, d)
+            if r is None:
+                return None
+            per_domain_ranks.append(r)
+            if r < (1.0 - self.keep_band):
+                keep_in_all = False
+            if r > self.drop_band:
+                drop_in_all = False
+        if keep_in_all:
+            return "frozen-keep"
+        if drop_in_all:
+            return "frozen-drop"
+
+        # Cross-domain disagreement check
+        if (len(per_domain_ranks) > 1
+                and (max(per_domain_ranks) - min(per_domain_ranks))
+                    > self.disagreement_spread):
+            return None
+
+        # Stable + clearly outside contested band → freeze using global rank.
+        global_r = self._router_rank(router_q, eid, None)
+        if global_r is None:
+            return None
+        if abs(global_r - self.prune_ratio) < self.contested_band:
+            return None
+        return "frozen-keep" if global_r > self.prune_ratio else "frozen-drop"
 
     # ---- decision path ----
     def _is_stable_in_domain(self, hist: ExpertHistory, domain: str) -> bool:
@@ -247,69 +347,22 @@ class AdaptiveExpertScheduler:
         router_q: str,
         eid: int,
     ) -> str:
-        """Returns one of `frozen-keep`, `frozen-drop`, or `contested`."""
+        """Returns one of `frozen-keep`, `frozen-drop`, or `contested`.
+
+        v22 Fix D: this is now a pure read of the cached `frozen_state`
+        on the per-(router, expert) history. The freeze decision logic
+        runs in `_compute_frozen_state` (called from
+        `_refresh_frozen_states` at the end of every chunk update) and
+        carries sticky semantics — once frozen, only undone on dramatic
+        instability.
+        """
         per_expert = self.history.get(router_q)
         if per_expert is None:
             return "contested"
         hist = per_expert.get(eid)
         if hist is None:
             return "contested"
-
-        domains = hist.domains_seen()
-        if not domains:
-            return "contested"
-
-        # Need stability in every domain we've observed for this expert,
-        # else we still consider the rank ambiguous.
-        for d in domains:
-            if not self._is_stable_in_domain(hist, d):
-                return "contested"
-
-        # Per-domain rank gate: an expert is frozen-keep only if it
-        # ranks in the keep band of EVERY observed domain (union: any
-        # domain says load-bearing → keep). It is frozen-drop only if
-        # it ranks in the drop band of EVERY observed domain.
-        keep_in_all = True
-        drop_in_all = True
-        per_domain_ranks: list[float] = []
-        for d in domains:
-            r = self._router_rank(router_q, eid, d)
-            if r is None:
-                return "contested"
-            per_domain_ranks.append(r)
-            if r < (1.0 - self.keep_band):
-                keep_in_all = False
-            if r > self.drop_band:
-                drop_in_all = False
-        if keep_in_all:
-            return "frozen-keep"
-        if drop_in_all:
-            return "frozen-drop"
-
-        # Cross-domain disagreement: if an expert's per-domain ranks span
-        # more than `disagreement_spread`, that is a strong signal of
-        # domain-specific load-bearing — additional chunks (especially
-        # in the contested domains) can resolve which side the union /
-        # intersection prune policy will land on. Without this gate the
-        # global-rank fallback below would forcibly assign frozen-keep
-        # or frozen-drop based on token-weighted averaging, hiding the
-        # underlying disagreement.
-        if (len(per_domain_ranks) > 1
-                and (max(per_domain_ranks) - min(per_domain_ranks))
-                    > self.disagreement_spread):
-            return "contested"
-
-        # Near-cutoff experts stay contested even if individually stable —
-        # a small drift could flip the prune decision.
-        global_r = self._router_rank(router_q, eid, None)
-        if global_r is None:
-            return "contested"
-        if abs(global_r - self.prune_ratio) < self.contested_band:
-            return "contested"
-
-        # Stable + clearly outside contested band but not at the extreme
-        # ends: still freeze, the prune decision won't move.
-        return "frozen-keep" if global_r > self.prune_ratio else "frozen-drop"
+        return hist.frozen_state or "contested"
 
     def frozen_experts(self) -> dict[str, set[int]]:
         """Map router_qname -> set of expert_ids that have frozen
@@ -410,6 +463,7 @@ class AdaptiveExpertScheduler:
                 "drop_band": self.drop_band,
                 "contested_band": self.contested_band,
                 "disagreement_spread": self.disagreement_spread,
+                "sticky_unfreeze_factor": self.sticky_unfreeze_factor,
             },
             "chunks_processed_by_domain": dict(
                 self.chunks_processed_by_domain),
@@ -419,6 +473,7 @@ class AdaptiveExpertScheduler:
                         "numerator_by_domain": h.numerator_by_domain,
                         "tokens_by_domain": h.tokens_by_domain,
                         "chunk_values": h.chunk_values,
+                        "frozen_state": h.frozen_state,
                     } for eid, h in per_expert.items()
                 } for rq, per_expert in self.history.items()
             },
@@ -444,6 +499,7 @@ class AdaptiveExpertScheduler:
                         k: [float(x) for x in v]
                         for k, v in (h.get("chunk_values") or {}).items()
                     },
+                    frozen_state=h.get("frozen_state"),
                 )
                 sched.history.setdefault(rq, {})[int(eid_str)] = hist
         return sched
