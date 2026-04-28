@@ -39,6 +39,18 @@ from typing import Any
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
+
+
+# v26: central runtime-flag helper. Each named env var defaults to the
+# given value (typically True for performance flags whose math is
+# equivalent to the legacy path). Set the env var to "0" to disable.
+# This replaces the proliferating `os.environ.get(NAME) == "1"`
+# pattern that left every perf flag opt-in indefinitely.
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw not in ("0", "", "false", "False", "FALSE", "no", "NO")
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -1521,7 +1533,7 @@ def _run_body_streaming_shard(
     # don't need to spend in the foreground. Pool size defaults to 4
     # workers — enough to keep up with the layer flush rate without
     # piling on the IO subsystem.
-    _act_async = os.environ.get("PRISMAQUANT_ACT_CACHE_ASYNC") == "1"
+    _act_async = _env_flag("PRISMAQUANT_ACT_CACHE_ASYNC", default=True)
     _act_pool = None
     _act_pending: list = []
     if _act_async and cache_dir is not None:
@@ -1770,9 +1782,8 @@ def _run_body_streaming_shard(
             # collapses that to ~62 (one per layer) without changing the
             # math. h_full collection is unaffected (it stays on the CPU
             # path; only the device→host scalar transfers are batched).
-            deferred_sync = (
-                os.environ.get("PRISMAQUANT_DEFERRED_FISHER_SYNC") == "1"
-            )
+            deferred_sync = _env_flag(
+                "PRISMAQUANT_DEFERRED_FISHER_SYNC", default=True)
             # v22 Fix B: deferred Fisher COMPUTE. Beyond just deferring the
             # device→host syncs (above), this defers the per-Linear matmul
             # itself out of the autograd engine's per-Linear callback path.
@@ -1800,9 +1811,8 @@ def _run_body_streaming_shard(
             # — typical MiniMax MoE layer ≈ 770 entries × ~2 MB = ~1.5 GB
             # peak, well within the cache budget that already accounts
             # for it.
-            deferred_compute = (
-                os.environ.get("PRISMAQUANT_DEFERRED_FISHER_COMPUTE") == "1"
-            )
+            deferred_compute = _env_flag(
+                "PRISMAQUANT_DEFERRED_FISHER_COMPUTE", default=True)
             # Per-Linear device-resident accumulators built lazily inside
             # the hook so we know the stream / device the kernel ran on.
             device_accums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -2524,7 +2534,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--dataset", default="ultrachat_200k")
-    ap.add_argument("--nsamples", type=int, default=4)
+    ap.add_argument("--nsamples", type=int, default=0,
+                    help="Calibration sample count. 0 (default since v26) "
+                         "uses every line in the --dataset jsonl — useful "
+                         "when the multi-chunk driver pre-shards the cal "
+                         "data into per-chunk files and you want all of "
+                         "each chunk consumed. Pass a positive integer to "
+                         "truncate to the first N samples (smoke tests).")
     ap.add_argument("--seqlen", type=int, default=256)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--device-map", default=None)
@@ -2752,8 +2768,8 @@ def main():
                 # layer-cache contents across chunks. Layer weights are
                 # model-invariant; an entry that fit the budget at end
                 # of chunk N is still valid for chunk N+1.
-                retain = os.environ.get(
-                    "PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK") == "1"
+                retain = _env_flag(
+                    "PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK", default=True)
                 diag = ctx.reset_between_chunks(retain_cache=retain)
                 if retain and diag.get("retained_cache_layers", 0):
                     print(f"[incremental] reused persistent ctx + tokenizer; "
@@ -2788,8 +2804,22 @@ def main():
                     ctx, tokenizer)
         # calib is always per-call (different chunks have different data)
         if calib is None:
+            # v26: nsamples=0 means "use all lines in the dataset". The
+            # prior default of 4 silently truncated multi-chunk runs that
+            # pre-shard 12+ samples per chunk file. Compute the line
+            # count up front when the user passed 0 so load_calibration
+            # gets a positive count.
+            ns = args.nsamples
+            if ns == 0:
+                ns_path = Path(args.dataset)
+                if ns_path.exists() and ns_path.is_file():
+                    with ns_path.open() as f:
+                        ns = sum(1 for _ in f)
+                if ns == 0:
+                    ns = 4  # legacy fallback for non-jsonl datasets
+            args.nsamples = ns  # write back so meta records the actual count
             calib = load_calibration(
-                tokenizer, args.dataset, args.nsamples, args.seqlen)
+                tokenizer, args.dataset, ns, args.seqlen)
             print(f"[incremental] calibration ready: {tuple(calib.shape)}",
                   flush=True)
 

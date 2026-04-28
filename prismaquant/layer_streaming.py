@@ -46,7 +46,10 @@ from safetensors import safe_open
 # the device kwarg.
 # ---------------------------------------------------------------------------
 def _direct_cuda_enabled() -> bool:
-    return os.environ.get("PRISMAQUANT_DIRECT_CUDA_LOAD") == "1"
+    raw = os.environ.get("PRISMAQUANT_DIRECT_CUDA_LOAD")
+    if raw is None:
+        return True  # default on as of v26
+    return raw not in ("0", "", "false", "False", "FALSE", "no", "NO")
 
 
 def _safe_open_kwargs(device: torch.device) -> dict:

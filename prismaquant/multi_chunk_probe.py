@@ -128,15 +128,16 @@ def main() -> int:
                     help="Final merged probe.pkl path")
     ap.add_argument("--work-dir", required=True,
                     help="Work root; per-chunk subdirs will be created here")
-    ap.add_argument("--retain-cross-chunk-cache", action="store_true",
-                    default=False,
+    ap.add_argument("--retain-cross-chunk-cache",
+                    action=argparse.BooleanOptionalAction,
+                    default=True,
                     help="Keep LayerCache contents across chunk boundaries. "
                          "Layer weights are model-invariant, so retaining "
                          "the cache makes chunk N+1's phase-1 forward warm "
                          "on the layers that survived end of chunk N. "
                          "Adds ~70 GB of resident bytes at chunk transitions; "
-                         "safe on Spark (cache budget already accounts for it) "
-                         "but disable on smaller boxes if memory is tight.")
+                         "safe on Spark (cache budget already accounts for it). "
+                         "Disable with --no-retain-cross-chunk-cache on small boxes.")
     ap.add_argument("--adaptive-sampling", action="store_true",
                     default=False,
                     help="Enable per-domain expert saliency tracking and "

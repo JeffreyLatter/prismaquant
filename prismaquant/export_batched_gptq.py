@@ -171,16 +171,43 @@ def gptq_obs_rounding_nvfp4_batched(
         )
 
         # 2. Batched Cholesky + cholesky_inverse + upper Cholesky.
+        # Failure handling: any single Linear with a degenerate H aborts
+        # the batched call. v26 retries per-Linear so only the actually-
+        # bad ones lose GPTQ — the rest still get the activation-aware
+        # update. The previous behavior reverted the ENTIRE chunk to
+        # unchanged weights, which on a 32-expert chunk is a 32× quality
+        # loss for a single bad Linear.
         try:
             L = torch.linalg.cholesky(H_stack)            # [Ec, in, in]
             Hinv = torch.cholesky_inverse(L)              # [Ec, in, in]
             U = torch.linalg.cholesky(Hinv, upper=True)   # [Ec, in, in]
+            failed_mask = torch.zeros(Ec, dtype=torch.bool, device=device)
         except Exception:
-            # Fall back to RTN for this chunk if any Linear's Cholesky
-            # numerically fails. Caller proceeds with vanilla per-Linear
-            # quantization using the input weights as-is.
-            out_buf[e_start:e_end] = weights[e_start:e_end]
-            continue
+            # Per-Linear retry. Build U one-Linear-at-a-time and mark
+            # any failures; the column-update loop below will preserve
+            # the input weight for failed Linears.
+            U = torch.zeros_like(H_stack)
+            Hinv = torch.zeros_like(H_stack)
+            failed_mask = torch.zeros(Ec, dtype=torch.bool, device=device)
+            for j in range(Ec):
+                try:
+                    Lj = torch.linalg.cholesky(H_stack[j])
+                    Hinv[j] = torch.cholesky_inverse(Lj)
+                    U[j] = torch.linalg.cholesky(Hinv[j], upper=True)
+                except Exception:
+                    failed_mask[j] = True
+            n_failed = int(failed_mask.sum().item())
+            if n_failed:
+                # Identity-ish U for failed Linears so the bmm in the
+                # propagation step doesn't NaN; combined with the
+                # per-Linear preserve-input we apply at the end of each
+                # block, the failed Linear's weight passes through as
+                # the un-error-propagated original (NVFP4 RTN at pack
+                # time).
+                eye = torch.eye(in_features, device=device, dtype=torch.float32)
+                for j in range(Ec):
+                    if failed_mask[j]:
+                        U[j] = eye
 
         # 3. Per-Linear global_real (or override).
         if global_real_overrides is not None:
@@ -233,6 +260,17 @@ def gptq_obs_rounding_nvfp4_batched(
                 W[:, :, block_end:] = W[:, :, block_end:] - prop
 
             W[:, :, block_start:block_end] = block_dq
+
+        # v26 per-Linear failure handling: any Linear whose Cholesky
+        # failed gets the un-error-propagated input weight back. The
+        # column-update loop above touched W[failed_idx] with identity-
+        # like U, so the propagation was a no-op there — but block_dq
+        # still ran. To avoid even that pass for failed Linears, restore
+        # them to weights[e_start:e_end][failed_idx]. Downstream NVFP4
+        # pack will RTN-quantize as if no GPTQ ran.
+        if failed_mask.any():
+            failed_idx = failed_mask.nonzero(as_tuple=True)[0]
+            W[failed_idx] = weights[e_start:e_end][failed_idx]
 
         out_buf[e_start:e_end] = W
 

@@ -2655,8 +2655,15 @@ def materialize_tensors_streaming(
             tuple[int, int],
             list[tuple[str, str, str, nn.Linear]]
         ] = defaultdict(list)
+        # v26: default ON. Set PRISMAQUANT_BATCHED_NVFP4_EXPORT=0 to revert
+        # to per-Linear NVFP4 quantization (slower but provably correct).
+        _raw_batched = os.environ.get("PRISMAQUANT_BATCHED_NVFP4_EXPORT")
+        _batched_env_on = (
+            True if _raw_batched is None
+            else _raw_batched not in ("0", "", "false", "False", "FALSE", "no", "NO")
+        )
         _batched_nvfp4_enabled = (
-            os.environ.get("PRISMAQUANT_BATCHED_NVFP4_EXPORT") == "1"
+            _batched_env_on
             and (_ACT_AWARE_FLAGS["gptq"] or _ACT_AWARE_FLAGS["scale_sweep"])
             and _CACHED_ACTIVATIONS is not None
         )

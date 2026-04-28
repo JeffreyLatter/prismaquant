@@ -595,7 +595,13 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     # at production scale.
     import os as _os
     from concurrent.futures import ThreadPoolExecutor as _Pool
-    _prefetch_enabled = _os.environ.get("PRISMAQUANT_COST_PREFETCH_ACT") == "1"
+    # v26: default ON. PRISMAQUANT_COST_PREFETCH_ACT=0 reverts to the
+    # synchronous per-chunk activation read path.
+    _raw_prefetch = _os.environ.get("PRISMAQUANT_COST_PREFETCH_ACT")
+    _prefetch_enabled = (
+        True if _raw_prefetch is None
+        else _raw_prefetch not in ("0", "", "false", "False", "FALSE", "no", "NO")
+    )
     _prefetch_pool = _Pool(max_workers=2) if _prefetch_enabled else None
 
     def _load_chunk_acts(_names):
