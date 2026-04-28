@@ -82,7 +82,16 @@ def _minimax_native_fp8_checkpoint(model_path: str) -> bool:
 
 def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
                          dtype: torch.dtype) -> None:
-    """Populate deterministic rotary buffers on a meta-built skeleton."""
+    """Populate deterministic rotary buffers on a meta-built skeleton.
+
+    Most architectures expose one set of rotary parameters keyed by
+    `inv_freq` / `original_inv_freq`. DeepSeek-V4 uses TWO sets — one
+    for self-attention (`main_inv_freq`) and one for the compressor /
+    indexer (`compress_inv_freq`) — and `RotaryEmbedding.layer_types`
+    enumerates them. Detect the multi-layer-type pattern via
+    `rotary.layer_types` and register each set's buffers individually
+    (Gemma3 / DSv4 share this pattern).
+    """
     rotary = _get_rotary(base_model)
     if rotary is None:
         return
@@ -93,6 +102,38 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
         rope_init_fn = rotary.compute_default_rope_parameters
     except AttributeError:
         return
+
+    # Multi-layer-type rotary (DSv4, Gemma3): rotary.layer_types is a
+    # tuple of names like ("main", "compress"); each one carries its
+    # own rope_parameters entry and produces a separate `<name>_inv_freq`
+    # buffer + `<name>_attention_scaling` attribute. The forward picks
+    # one based on the caller's `layer_type` kwarg.
+    layer_types = getattr(rotary, "layer_types", None)
+    if layer_types and getattr(cfg, "rope_parameters", None) is not None:
+        for layer_type in layer_types:
+            params = cfg.rope_parameters.get(layer_type)
+            if params is None:
+                continue
+            try:
+                inv_freq_lt, scaling_lt = rope_init_fn(
+                    cfg, device, layer_type=layer_type)
+            except TypeError:
+                # Older signature without layer_type kwarg.
+                inv_freq_lt, scaling_lt = rope_init_fn(cfg, device)
+            rotary.register_buffer(
+                f"{layer_type}_inv_freq",
+                inv_freq_lt.to(dtype=torch.float32, device=device),
+                persistent=False,
+            )
+            rotary.register_buffer(
+                f"{layer_type}_original_inv_freq",
+                inv_freq_lt.to(dtype=torch.float32, device=device).clone(),
+                persistent=False,
+            )
+            setattr(rotary, f"{layer_type}_attention_scaling", scaling_lt)
+        return
+
+    # Single-rope path (the common case for Qwen / MiniMax / DSv3).
     inv_freq, attention_scaling = rope_init_fn(cfg, device)
     rotary.register_buffer("inv_freq", inv_freq.to(
         dtype=torch.float32, device=device), persistent=False)

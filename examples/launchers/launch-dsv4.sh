@@ -52,9 +52,16 @@ CAL_MIX=/home/rob/dq-runs/cal-mix-v1/cal_mix_shuf.jsonl
 HOST_WORK=/home/rob/dq-runs/dsv4-flash-base
 mkdir -p "$HOST_WORK"/{chunks,artifacts,act,logs,work,cost_work,export-cache}
 
-# Split cal_mix into 32 chunks of 12 samples each (mirrors v22 MiniMax).
+# Split cal_mix into chunks. DSv4-Flash-Base needs smaller per-chunk
+# samples than MiniMax M2.7 because the model propagates hidden state
+# in multi-stream form `[B, T, hc_mult, H]` (hc_mult=4) — phase-1
+# activation tensors are ~3x bigger than the standard
+# single-stream form. With 12 samples × 2048 × 4 × 4096 ≈ 35 GB just
+# for the activation cache, the 121 GB Spark UMA OOMs at the
+# device→host stack step. 6 samples halves to ~17 GB and leaves
+# comfortable headroom alongside the 76 GB layer cache budget.
 N_CHUNKS=32
-SAMPLES_PER_CHUNK=12
+SAMPLES_PER_CHUNK=6
 SEQLEN=2048
 
 NEED_SPLIT=1

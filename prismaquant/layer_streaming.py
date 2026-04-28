@@ -70,8 +70,18 @@ def _rename_dsv4_text_only(k: str) -> str | None:
         return None
     if k.startswith("mtp."):
         return None
-    if k.startswith("hc_head_"):
-        return None
+    # Top-level HyperHead params: ckpt stores them flat as
+    # `hc_head_{base,fn,scale}`; live module places them under
+    # `model.hc_head.{hc_base, hc_fn, hc_scale}` (the DeepseekV4HyperHead
+    # module's own attribute names). prismaquant calls `model.hc_head`
+    # at the end of phase-1 to collapse multi-stream → single-stream
+    # before the final norm + lm_head, so these MUST load.
+    if k == "hc_head_base":
+        return "model.hc_head.hc_base"
+    if k == "hc_head_fn":
+        return "model.hc_head.hc_fn"
+    if k == "hc_head_scale":
+        return "model.hc_head.hc_scale"
     # Drop any `.scale` siblings of top-level weights that have no live
     # counterpart — DSv4 has tiny F8_E8M0 scales paired with `.weight`
     # in some places. Those need separate handling alongside the FP8
@@ -106,6 +116,19 @@ def _rename_dsv4_text_only(k: str) -> str | None:
             exp_idx, leaf_w, suffix = m_exp.group(1), m_exp.group(2), m_exp.group(3)
             leaf_proj = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}[leaf_w]
             return f"model.layers.{layer_idx}.mlp.experts.{exp_idx}.{leaf_proj}{suffix}"
+
+        # PRISMAQUANT probe mode: drop compressor + indexer keys.
+        # Reason: PR #45643's HCACompressor builds wkv as
+        # `nn.Linear(hidden, head_dim)` while the checkpoint's
+        # `attn.compressor.wkv.weight` has shape `[2*head_dim, hidden]`
+        # (K and V separately concatenated). Loading the source weights
+        # would fail the shape check, and even if forced, the forward
+        # would compute wrong attention outputs. The vendored modeling
+        # patch above (`self.compressor = None` always) bypasses the
+        # long-range branch in attention. Compressor + indexer weights
+        # are passed through at FP8_SOURCE / BF16 at export.
+        if leaf.startswith("attn.compressor.") or leaf.startswith("attn.indexer."):
+            return None
 
         # `attn.X` → `self_attn.X`, `ffn.X` → `mlp.X`.
         # Special: `attn.attn_sink` → `self_attn.sinks` (per-head bias
@@ -278,6 +301,24 @@ def _build_weight_map(model_path: str, *,
             continue
         model_to_shard[mk] = os.path.join(model_path, shard)
         model_to_ckpt[mk] = ck
+
+    # DSv4: drop FP8 block-scale entries from the body weight map. Their
+    # ckpt key ends in `.scale` and pairs with a `.weight` sibling that
+    # lives in the live module. The dequant pass in `_apply_fp8_dequant_inplace`
+    # consumes these scales separately via `_build_fp8_scale_inv_map`.
+    # Standalone `.scale` Parameters (e.g. `attn_hc.scale` — DSv4
+    # HyperConnection mix scale) keep their entry because they have no
+    # `.weight` sibling. The rename has already produced the live qname,
+    # so the pairing test runs in live-name space.
+    if _read_model_type(model_path) == "deepseek_v4":
+        live_keys_set = set(model_to_shard.keys())
+        for mk in list(model_to_shard.keys()):
+            if not mk.endswith(".scale"):
+                continue
+            weight_sibling = mk[: -len(".scale")] + ".weight"
+            if weight_sibling in live_keys_set:
+                del model_to_shard[mk]
+                del model_to_ckpt[mk]
     return model_to_shard, model_to_ckpt
 
 
@@ -1102,9 +1143,16 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
 
 def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
                 position_embeddings, attention_mask, position_ids,
-                past_key_values=None) -> torch.Tensor:
+                past_key_values=None,
+                input_ids: torch.Tensor | None = None) -> torch.Tensor:
     """Call a decoder layer with the common transformers v5 signature.
-    Returns hidden output tensor."""
+    Returns hidden output tensor.
+
+    `input_ids` is passed through for architectures whose router needs
+    the raw token id (e.g. DSv4-Flash hash-routing layers, which look
+    up expert indices via a frozen `tid2eid` table). Layers that don't
+    consume `input_ids` ignore the kwarg via `**kwargs` absorption.
+    """
     out = layer(
         hidden_states=hidden,
         attention_mask=attention_mask,
@@ -1112,6 +1160,7 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
         past_key_values=past_key_values,
         use_cache=False,
         position_embeddings=position_embeddings,
+        input_ids=input_ids,
     )
     if isinstance(out, tuple):
         return out[0]
@@ -1157,6 +1206,14 @@ def _head_prefixes(root: nn.Module, base_prefix: str) -> list[str]:
         "lm_head.",
         f"{p}rotary_emb.",
     ]
+    # DeepSeek-V4 has a HyperHead module at `model.hc_head.{hc_fn, hc_base,
+    # hc_scale}` that collapses multi-stream → single-stream before the
+    # final norm. prismaquant calls it at the end of phase-1, so its
+    # parameters must be loaded with the head-resident batch.
+    if hasattr(root, "model") and hasattr(root.model, "hc_head"):
+        prefixes.append(f"{p}hc_head.")
+    elif hasattr(root, "hc_head"):
+        prefixes.append("hc_head.")
     # Some models put per-layer embeddings inputs (layer_scalar on Gemma 4,
     # per_layer_embeddings on multimodal umbrellas) at top level too —
     # not relevant to causal LM text-only path; skip.

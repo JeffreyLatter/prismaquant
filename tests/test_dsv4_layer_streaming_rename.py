@@ -17,13 +17,15 @@ def test_top_level_rename():
     assert _rename("embed.weight") == "model.embed_tokens.weight"
     assert _rename("head.weight") == "lm_head.weight"
     assert _rename("norm.weight") == "model.norm.weight"
+    assert _rename("hc_head_fn") == "model.hc_head.hc_fn"
+    assert _rename("hc_head_base") == "model.hc_head.hc_base"
+    assert _rename("hc_head_scale") == "model.hc_head.hc_scale"
 
 
 def test_top_level_drops():
-    """Hash heads, MTP, scale-only siblings, and weight_scale_inv all drop."""
-    assert _rename("hc_head_base") is None
-    assert _rename("hc_head_fn") is None
-    assert _rename("hc_head_scale") is None
+    """MTP, scale-only siblings, and weight_scale_inv all drop. (hc_head_*
+    are now mapped, not dropped — they live under model.hc_head and are
+    needed for the multi-stream → single-stream collapse at end-of-body.)"""
     assert _rename("mtp.0.norm.weight") is None
     assert _rename("mtp.0.hc_attn_base") is None
     assert _rename("head.scale") is None
@@ -45,12 +47,13 @@ def test_attn_rename():
         # buffer as `self.sinks`; checkpoint stores it as `attn.attn_sink`.
         ("layers.0.attn.attn_sink",
          "model.layers.0.self_attn.sinks"),
-        ("layers.0.attn.compressor.wkv.weight",
-         "model.layers.0.self_attn.compressor.wkv.weight"),
-        ("layers.0.attn.compressor.indexer.weights_proj.weight",
-         "model.layers.0.self_attn.compressor.indexer.weights_proj.weight"),
-        ("layers.5.attn.compressor.ape",
-         "model.layers.5.self_attn.compressor.ape"),
+        # PRISMAQUANT probe mode drops compressor + indexer keys
+        # entirely (see comment in `_rename_dsv4_text_only`). PR
+        # #45643's compressor wkv shape doesn't match the checkpoint
+        # (K and V are concatenated in the source), and the modeling
+        # patch makes attention skip the compressor branch always.
+        # Test that the drop is consistent for every variant we know
+        # about.
     ]
     for ck, live in cases:
         assert _rename(ck) == live, f"{ck} ↦ {_rename(ck)}, expected {live}"
@@ -73,6 +76,24 @@ def test_ffn_rename():
     ]
     for ck, live in cases:
         assert _rename(ck) == live, f"{ck} ↦ {_rename(ck)}, expected {live}"
+
+
+def test_compressor_and_indexer_drop():
+    """Probe-mode drops compressor + indexer keys (modeling patch
+    skips the long-range branch; weights pass through at export)."""
+    drops = [
+        "layers.0.attn.compressor.wkv.weight",
+        "layers.5.attn.compressor.ape",
+        "layers.5.attn.compressor.norm.weight",
+        "layers.5.attn.compressor.wgate.weight",
+        "layers.2.attn.indexer.compressor.wkv.weight",
+        "layers.2.attn.indexer.compressor.norm.weight",
+        "layers.2.attn.indexer.compressor.ape",
+        "layers.2.attn.indexer.wq_b.weight",
+        "layers.2.attn.indexer.weights_proj.weight",
+    ]
+    for k in drops:
+        assert _rename(k) is None, f"{k} should drop, got {_rename(k)}"
 
 
 def test_routed_experts_per_expert_rename():

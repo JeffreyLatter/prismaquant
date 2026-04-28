@@ -1545,7 +1545,18 @@ def load_calibration(tokenizer, source: str, n_samples: int,
                         texts.append(tokenizer.apply_chat_template(
                             obj["messages"], tokenize=False))
                     except Exception:
-                        continue
+                        # Tokenizer has no chat template (base / pt models
+                        # like DSv4-Flash-Base). Fall back to concatenating
+                        # the message contents — good enough as calibration
+                        # text, mirrors the ultrachat fallback below.
+                        parts = []
+                        for m in obj["messages"]:
+                            if isinstance(m, dict):
+                                c = m.get("content")
+                                if isinstance(c, str) and c:
+                                    parts.append(c)
+                        if parts:
+                            texts.append("\n\n".join(parts))
                 elif "text" in obj:
                     texts.append(obj["text"])
     elif source.endswith(".txt") and os.path.exists(source):

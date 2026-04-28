@@ -605,24 +605,24 @@ class DeepseekV4Attention(nn.Module):
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks = nn.Parameter(torch.empty(self.num_heads))
 
-        # PRISMAQUANT: sliding_attention layers (compress_ratio=0 in
-        # DSv4-Flash-Base config; layers 0 and 1) have no compressor or
-        # indexer in the checkpoint. Build no compressor module for them
-        # so weight loading + Fisher hooks don't see uninitialized state,
-        # and the forward branches around the long-range path entirely.
-        if self.layer_type == "sliding_attention":
-            self.compressor = None
-            self._cache_layer_cls = None
-            self.compress_rate = 0
-        else:
-            compress_rate = (
-                config.compress_rate_csa if self.layer_type == "compressed_sparse_attention" else config.compress_rate_hca
-            )
-            self.compressor = COMPRESSOR_CLASSES[self.layer_type](config, compress_rate)
-            self._cache_layer_cls = (
-                DeepseekV4CSALayer if self.layer_type == "compressed_sparse_attention" else DeepseekV4HCALayer
-            )
-            self.compress_rate = compress_rate
+        # PRISMAQUANT: skip compressor for ALL layers in probe mode.
+        #
+        # (1) Sliding_attention layers (compress_ratio=0; layers 0/1) have no
+        #     compressor in the checkpoint at all.
+        # (2) CSA/HCA layers DO have compressor weights, but the checkpoint's
+        #     `attn.compressor.wkv.weight` is shape [2*head_dim, hidden] —
+        #     the source stores K and V separately concatenated — while PR
+        #     #45643's HCACompressor.__init__ builds wkv as [head_dim, hidden]
+        #     (PR treats wkv as producing a single shared K=V tensor). This
+        #     is an unresolved PR/checkpoint mismatch.
+        #
+        # For probe, the body Linears (wkv/wq_a/wq_b/wo_a/wo_b) still calibrate
+        # correctly because the forward path skips the long-range branch
+        # (full_kv = kv, sliding-window-only attention). Compressor + indexer
+        # weights pass through at FP8_SOURCE / BF16 at export time.
+        self.compressor = None
+        self._cache_layer_cls = None
+        self.compress_rate = 0
 
     def forward(
         self,
@@ -656,25 +656,11 @@ class DeepseekV4Attention(nn.Module):
         # across decode steps. K/V already accumulated on the prior layer is carried
         # over. Without ``past_key_values`` (gradient-checkpointing recompute), use a
         # forward-scoped scratch layer.
-        # PRISMAQUANT: sliding_attention layers (compress_ratio=0) skip
-        # the long-range branch entirely — they're plain sliding-window
-        # attention. self.compressor is None on those layers.
-        if self.layer_type == "sliding_attention":
-            full_kv = kv
-        else:
-            if past_key_values is None:
-                cache_layer = self._cache_layer_cls(self.sliding_window, self.compress_rate)
-            else:
-                cache_layer = past_key_values.layers[self.layer_idx]
-                if not isinstance(cache_layer, self._cache_layer_cls):
-                    new_layer = self._cache_layer_cls(self.sliding_window, self.compress_rate)
-                    if getattr(cache_layer, "is_initialized", False):
-                        new_layer.lazy_initialization(cache_layer.keys, cache_layer.values)
-                        new_layer.cumulative_length = getattr(cache_layer, "cumulative_length", cache_layer.keys.shape[-2])
-                    past_key_values.layers[self.layer_idx] = new_layer
-                    cache_layer = new_layer
-            compressed_kv = self.compressor(hidden_states, q_residual, position_ids, cache_layer)
-            full_kv = torch.cat([kv, compressed_kv], dim=2)
+        # PRISMAQUANT: skip the long-range compressed branch for ALL
+        # layers in probe mode (see the matching __init__ comment). This
+        # keeps the body-Linear Fisher signal correct while sidestepping
+        # the PR/checkpoint shape mismatch in the compressor's wkv.
+        full_kv = kv
 
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
