@@ -243,6 +243,236 @@ class DeepseekV4Profile(ModelProfile):
     # ------------------------------------------------------------
     # Source-passthrough hints
     # ------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Streaming-probe adapters (refactor #32)
+    #
+    # Centralizes all DSv4-specific streaming logic that was previously
+    # scattered across layer_streaming / streaming_model / incremental_probe.
+    # ------------------------------------------------------------
+
+    def checkpoint_to_live_name(self, k: str, *,
+                                multimodal: bool = False) -> str | None:
+        """DSv4-Flash checkpoint → transformers live qname.
+
+        DSv4's checkpoint uses a flat, abbreviated naming convention
+        (`embed.weight`, `layers.5.attn.wkv.weight`) that doesn't match
+        the transformers `DeepseekV4ForCausalLM` live module names.
+        This is the inverse of `source_tensor_name`.
+
+        Drops:
+          - MTP block (`mtp.0.*`) — handled by separate MTP synthesis
+          - `.weight_scale_inv` (legacy MiniMax-style FP8 sibling; DSv4
+             uses `.scale` siblings handled via fp8_scale_pairs)
+          - FP8 block-scale `.scale` siblings of `.weight` keys
+            (consumed by the FP8 dequant pass)
+          - Compressor + indexer keys (skipped at probe time per the
+            modeling patch in vendored/transformers_deepseek_v4)
+          - Standalone `.scale` top-level entries with no paired weight
+        """
+        if k.endswith(".weight_scale_inv"):
+            return None
+        # DSv4 stores FP8 block-scale siblings as `.scale` (paired with
+        # `.weight`). The dequant pass reads these directly via
+        # `fp8_scale_pairs`; they must NOT also flow through the body
+        # weight map (the live Linear has no `.scale` parameter).
+        if k.endswith(".scale"):
+            return None
+        if k.startswith("mtp."):
+            return None
+        if k.startswith("hc_head_"):
+            # Top-level HyperHead params. Map to model.hc_head.{hc_X}
+            # so the multi-stream collapse fires with real weights.
+            if k == "hc_head_base":
+                return "model.hc_head.hc_base"
+            if k == "hc_head_fn":
+                return "model.hc_head.hc_fn"
+            if k == "hc_head_scale":
+                return "model.hc_head.hc_scale"
+            return None
+        if k in ("head.scale", "embed.scale"):
+            return None
+        if k == "embed.weight":
+            return "model.embed_tokens.weight"
+        if k == "head.weight":
+            return "lm_head.weight"
+        if k == "norm.weight":
+            return "model.norm.weight"
+
+        m = re.match(r"^layers\.(\d+)\.(.+)$", k)
+        if m:
+            layer_idx, leaf = m.group(1), m.group(2)
+
+            # Routed experts → per-expert ModuleList (set up by
+            # `enable_per_expert_experts()` in vendored/dsv4_probe_experts).
+            m_exp = re.match(r"^ffn\.experts\.(\d+)\.(w1|w2|w3)(.*)$", leaf)
+            if m_exp:
+                exp_idx, leaf_w, suffix = m_exp.group(1), m_exp.group(2), m_exp.group(3)
+                leaf_proj = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}[leaf_w]
+                return f"model.layers.{layer_idx}.mlp.experts.{exp_idx}.{leaf_proj}{suffix}"
+
+            # Compressor + indexer: drop entirely (modeling patch sets
+            # self.compressor = None for all layers in probe mode).
+            if leaf.startswith("attn.compressor.") or leaf.startswith("attn.indexer."):
+                return None
+
+            # `attn.attn_sink` → `self_attn.sinks` (PR #45643's per-head
+            # bias buffer attribute name).
+            if leaf == "attn.attn_sink":
+                new_leaf = "self_attn.sinks"
+            elif leaf.startswith("attn."):
+                new_leaf = "self_attn." + leaf[len("attn."):]
+            elif leaf.startswith("ffn."):
+                new_leaf = "mlp." + leaf[len("ffn."):]
+            elif leaf.startswith("attn_norm"):
+                # Layer-level pre-attention RMSNorm.
+                new_leaf = "input_layernorm" + leaf[len("attn_norm"):]
+            elif leaf.startswith("ffn_norm"):
+                # Layer-level pre-MLP RMSNorm.
+                new_leaf = "post_attention_layernorm" + leaf[len("ffn_norm"):]
+            elif leaf.startswith("hc_attn_"):
+                new_leaf = "attn_hc." + leaf[len("hc_attn_"):]
+            elif leaf.startswith("hc_ffn_"):
+                new_leaf = "ffn_hc." + leaf[len("hc_ffn_"):]
+            else:
+                new_leaf = leaf
+
+            # Shared experts: gate_proj/up_proj/down_proj → w1/w3/w2 in
+            # the source. Mirror is done via the regex below; we apply
+            # the inverse here (source w1/w3/w2 → live gate/up/down_proj).
+            new_leaf = re.sub(
+                r"(mlp\.shared_experts)\.w1(\.)", r"\1.gate_proj\2", new_leaf)
+            new_leaf = re.sub(
+                r"(mlp\.shared_experts)\.w2(\.)", r"\1.down_proj\2", new_leaf)
+            new_leaf = re.sub(
+                r"(mlp\.shared_experts)\.w3(\.)", r"\1.up_proj\2", new_leaf)
+
+            return f"model.layers.{layer_idx}.{new_leaf}"
+
+        return None
+
+    def fp8_scale_pairs(self, model_path: str
+                        ) -> dict[str, tuple[str, str]] | None:
+        """DSv4 stores F8_E8M0 `.scale` siblings (not `.weight_scale_inv`).
+        Build the `{live_weight_qname: (shard_path, scale_ckpt_key)}`
+        map by pairing every `.scale` ckpt key with its `.weight`
+        sibling, then routing the weight key through `checkpoint_to_live_name`."""
+        import json as _json
+        import os as _os
+        from safetensors import safe_open as _safe_open
+
+        index_file = _os.path.join(model_path, "model.safetensors.index.json")
+        if _os.path.exists(index_file):
+            with open(index_file) as f:
+                raw = _json.load(f)["weight_map"]
+        else:
+            single = _os.path.join(model_path, "model.safetensors")
+            if not _os.path.exists(single):
+                return {}
+            with _safe_open(single, framework="pt") as f:
+                raw = {k: single for k in f.keys()}
+
+        weight_keys = {k for k in raw if k.endswith(".weight")}
+        out: dict[str, tuple[str, str]] = {}
+        for ck_key, shard in raw.items():
+            if not ck_key.endswith(".scale"):
+                continue
+            base = ck_key[: -len(".scale")]
+            weight_ck = base + ".weight"
+            if weight_ck not in weight_keys:
+                continue
+            weight_live = self.checkpoint_to_live_name(weight_ck)
+            if weight_live is None:
+                continue
+            out[weight_live] = (_os.path.join(model_path, shard), ck_key)
+        return out
+
+    def head_resident_extra_prefixes(self, root) -> list[str]:
+        """DSv4 has a HyperHead module at `model.hc_head` that collapses
+        multi-stream → single-stream before the final norm. Its parameters
+        must load with the head-resident batch."""
+        if hasattr(root, "model") and hasattr(root.model, "hc_head"):
+            return ["model.hc_head."]
+        if hasattr(root, "hc_head"):
+            return ["hc_head."]
+        return []
+
+    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
+        """DSv4 uses Gemma3's multi-layer-type rotary pattern: separate
+        `main_inv_freq` and `compress_inv_freq` buffers + matching
+        `<name>_attention_scaling` attributes."""
+        import torch as _torch
+        layer_types = getattr(rotary, "layer_types", None)
+        if not (layer_types and getattr(cfg, "rope_parameters", None) is not None):
+            return False
+        try:
+            rope_init_fn = rotary.compute_default_rope_parameters
+        except AttributeError:
+            return False
+        for layer_type in layer_types:
+            params = cfg.rope_parameters.get(layer_type)
+            if params is None:
+                continue
+            try:
+                inv_freq_lt, scaling_lt = rope_init_fn(
+                    cfg, device, layer_type=layer_type)
+            except TypeError:
+                inv_freq_lt, scaling_lt = rope_init_fn(cfg, device)
+            rotary.register_buffer(
+                f"{layer_type}_inv_freq",
+                inv_freq_lt.to(dtype=_torch.float32, device=device),
+                persistent=False,
+            )
+            rotary.register_buffer(
+                f"{layer_type}_original_inv_freq",
+                inv_freq_lt.to(dtype=_torch.float32, device=device).clone(),
+                persistent=False,
+            )
+            setattr(rotary, f"{layer_type}_attention_scaling", scaling_lt)
+        return True
+
+    def expand_hidden_for_layers(self, hidden, base_model):
+        """Expand single-stream `[B, T, H]` to multi-stream
+        `[B, T, hc_mult, H]` (mirrors `DeepseekV4Model.forward`)."""
+        hc_mult = getattr(base_model.config, "hc_mult", None)
+        if hc_mult is None or hc_mult <= 1:
+            return hidden
+        return hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
+
+    def collapse_hidden_after_layers(self, hidden, base_model):
+        """Collapse multi-stream `[B, T, hc_mult, H]` back to `[B, T, H]`
+        via `base_model.hc_head(hidden)` before the final norm."""
+        if hidden.dim() == 4 and hasattr(base_model, "hc_head"):
+            return base_model.hc_head(hidden)
+        return hidden
+
+    def extra_layer_kwargs(self, *, input_ids=None) -> dict:
+        """DSv4 hash-routed layers (first `num_hash_layers`) consume
+        `input_ids` for the `tid2eid` lookup. Other layers ignore the
+        kwarg via **kwargs absorption."""
+        return {"input_ids": input_ids} if input_ids is not None else {}
+
+    def should_probe_linear(self, name: str, mod) -> bool:
+        """Skip `DeepseekV4GroupedLinear` (the wo_a sub-projection):
+        its weight `[out_features, in_features_per_group]` doesn't
+        match the per-token Hessian-trace effective output dim of
+        `out_features // n_groups`, so the chunk_h * w.pow(2)
+        accumulator can't broadcast. Pass through at export-time
+        fixed precision instead."""
+        import torch.nn as _nn
+        if not isinstance(mod, _nn.Linear):
+            return False
+        return type(mod).__name__ != "DeepseekV4GroupedLinear"
+
+    def register_vendored_modeling(self) -> None:
+        """Install the vendored DSv4 modeling code with transformers
+        + apply the three monkey-patches (ALLOWED_LAYER_TYPES,
+        sqrtsoftplus ACT2FN, per-expert experts swap)."""
+        from ..vendored import register_deepseek_v4
+        register_deepseek_v4()
+
+    # ------------------------------------------------------------
+    # Source-passthrough hints
+    # ------------------------------------------------------------
     def source_passthrough_prefixes(self) -> tuple[str, ...]:
         # Tiny F32 / BF16 params that should never go through quantization:
         # attn_sink, hc_*, ape (compressor abs-pos-embed), tid2eid (hash

@@ -28,159 +28,6 @@ from safetensors import safe_open
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek-V4 rename: the V4 checkpoint uses a flat, abbreviated naming
-# convention (e.g. `embed.weight`, `layers.5.attn.wkv.weight`,
-# `mtp.0.*`) instead of the standard transformers `model.layers.X.*`
-# tree. PR #45643's modeling code uses the standard names, so the
-# streaming loader must bridge both directions. See
-# `prismaquant/model_profiles/deepseek_v4.py` for the forward
-# (live → ckpt) mapping; this function is its inverse.
-# ---------------------------------------------------------------------------
-def _read_model_type(model_path: str) -> str:
-    """Best-effort read of `model_type` from config.json. Returns "" on
-    any failure so callers default to the standard rename path."""
-    cfg_file = os.path.join(model_path, "config.json")
-    if not os.path.exists(cfg_file):
-        return ""
-    try:
-        with open(cfg_file) as f:
-            return str(json.load(f).get("model_type") or "")
-    except (json.JSONDecodeError, OSError):
-        return ""
-
-
-def _rename_dsv4_text_only(k: str) -> str | None:
-    """Map a DSv4-Flash safetensors key to the live transformers
-    DeepseekV4ForCausalLM module qname.
-
-    Returns None for keys that should be excluded from the text-only
-    body weight map:
-      - MTP block (`mtp.0.*`) — handled by separate MTP synthesis path
-      - Top-level hash-cluster heads (`hc_head_*`) — passthrough by other
-        path; their corresponding live module isn't part of the body
-      - `.weight_scale_inv` (drop here, picked up by FP8 scale map)
-      - Routed expert per-leaf tensors (`layers.N.ffn.experts.E.{w1,w2,w3}.*`)
-        — these MUST be assembled into the packed `mlp.experts.{gate_up,
-        down}_proj` Parameters, which is many-to-one and not expressible
-        in `_build_weight_map`'s 1:1 dict. Caller (probe-side) needs to
-        load them via a separate per-expert assembly path. Dropping
-        them here keeps the body load running on everything else.
-    """
-    if k.endswith(".weight_scale_inv"):
-        return None
-    if k.startswith("mtp."):
-        return None
-    # Top-level HyperHead params: ckpt stores them flat as
-    # `hc_head_{base,fn,scale}`; live module places them under
-    # `model.hc_head.{hc_base, hc_fn, hc_scale}` (the DeepseekV4HyperHead
-    # module's own attribute names). prismaquant calls `model.hc_head`
-    # at the end of phase-1 to collapse multi-stream → single-stream
-    # before the final norm + lm_head, so these MUST load.
-    if k == "hc_head_base":
-        return "model.hc_head.hc_base"
-    if k == "hc_head_fn":
-        return "model.hc_head.hc_fn"
-    if k == "hc_head_scale":
-        return "model.hc_head.hc_scale"
-    # Drop any `.scale` siblings of top-level weights that have no live
-    # counterpart — DSv4 has tiny F8_E8M0 scales paired with `.weight`
-    # in some places. Those need separate handling alongside the FP8
-    # block-scale map.
-    if k in ("head.scale", "embed.scale"):
-        return None
-
-    # Top-level rename (`embed/head/norm` → standard transformers names).
-    if k == "embed.weight":
-        return "model.embed_tokens.weight"
-    if k == "head.weight":
-        return "lm_head.weight"
-    if k == "norm.weight":
-        return "model.norm.weight"
-
-    # Per-layer body rename.
-    m = re.match(r"^layers\.(\d+)\.(.+)$", k)
-    if m:
-        layer_idx, leaf = m.group(1), m.group(2)
-
-        # Routed expert per-leaf tensors → per-expert ModuleList live
-        # names. Maps `ffn.experts.E.{w1,w2,w3}.X` → `mlp.experts.E.{gate,
-        # down,up}_proj.X`. The per-expert ModuleList is set up by
-        # `prismaquant.vendored.dsv4_probe_experts.enable_per_expert_experts()`,
-        # which is called from `register_deepseek_v4()`. If that swap
-        # hasn't run, the live model has packed Parameters and these
-        # names won't resolve — but `_materialize` will surface that
-        # cleanly via `set_module_tensor_to_device` failure, not a
-        # silent miss.
-        m_exp = re.match(r"^ffn\.experts\.(\d+)\.(w1|w2|w3)(.*)$", leaf)
-        if m_exp:
-            exp_idx, leaf_w, suffix = m_exp.group(1), m_exp.group(2), m_exp.group(3)
-            leaf_proj = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}[leaf_w]
-            return f"model.layers.{layer_idx}.mlp.experts.{exp_idx}.{leaf_proj}{suffix}"
-
-        # PRISMAQUANT probe mode: drop compressor + indexer keys.
-        # Reason: PR #45643's HCACompressor builds wkv as
-        # `nn.Linear(hidden, head_dim)` while the checkpoint's
-        # `attn.compressor.wkv.weight` has shape `[2*head_dim, hidden]`
-        # (K and V separately concatenated). Loading the source weights
-        # would fail the shape check, and even if forced, the forward
-        # would compute wrong attention outputs. The vendored modeling
-        # patch above (`self.compressor = None` always) bypasses the
-        # long-range branch in attention. Compressor + indexer weights
-        # are passed through at FP8_SOURCE / BF16 at export.
-        if leaf.startswith("attn.compressor.") or leaf.startswith("attn.indexer."):
-            return None
-
-        # `attn.X` → `self_attn.X`, `ffn.X` → `mlp.X`.
-        # Special: `attn.attn_sink` → `self_attn.sinks` (per-head bias
-        # buffer; the checkpoint name has `attn_sink` but the live
-        # module attribute is `sinks`).
-        if leaf == "attn.attn_sink":
-            new_leaf = "self_attn.sinks"
-        elif leaf.startswith("attn."):
-            new_leaf = "self_attn." + leaf[len("attn."):]
-        elif leaf.startswith("ffn."):
-            new_leaf = "mlp." + leaf[len("ffn."):]
-        # Layer-level pre-norms: checkpoint stores `attn_norm` (the
-        # pre-attention RMSNorm) and `ffn_norm` (the pre-MLP RMSNorm)
-        # at the layer scope, but the transformers DecoderLayer
-        # exposes them as `input_layernorm` / `post_attention_layernorm`.
-        elif leaf.startswith("attn_norm"):
-            new_leaf = "input_layernorm" + leaf[len("attn_norm"):]
-        elif leaf.startswith("ffn_norm"):
-            new_leaf = "post_attention_layernorm" + leaf[len("ffn_norm"):]
-        # Hyper-connection compaction: `hc_attn_X` → `attn_hc.X`,
-        # `hc_ffn_X` → `ffn_hc.X`.
-        elif leaf.startswith("hc_attn_"):
-            new_leaf = "attn_hc." + leaf[len("hc_attn_"):]
-        elif leaf.startswith("hc_ffn_"):
-            new_leaf = "ffn_hc." + leaf[len("hc_ffn_"):]
-        else:
-            new_leaf = leaf
-
-        # Shared expert leaf rename: w1/w2/w3 → gate/down/up_proj.
-        new_leaf = re.sub(
-            r"(mlp\.shared_experts)\.w1(\.)",
-            r"\1.gate_proj\2",
-            new_leaf,
-        )
-        new_leaf = re.sub(
-            r"(mlp\.shared_experts)\.w2(\.)",
-            r"\1.down_proj\2",
-            new_leaf,
-        )
-        new_leaf = re.sub(
-            r"(mlp\.shared_experts)\.w3(\.)",
-            r"\1.up_proj\2",
-            new_leaf,
-        )
-
-        return f"model.layers.{layer_idx}.{new_leaf}"
-
-    # Unrecognized top-level keys — drop rather than risk shadowing.
-    return None
-
-
-# ---------------------------------------------------------------------------
 # v21 #5: opt-in direct-to-CUDA safetensors load. Default path opens the
 # safetensors file with framework="pt" (CPU mmap) and explicitly moves
 # each tensor to device with `.to(device, non_blocking=True)`. That
@@ -241,47 +88,13 @@ def _build_weight_map(model_path: str, *,
     visual at `model.visual.*`); no rename is applied and visual/audio
     keys are preserved so `_materialize` can load them onto the visual
     tower. MTP stays dropped — MTP has its own synthesis path."""
-    def _rename_text_only(k: str) -> str | None:
-        # Prefix renames mirroring vLLM's `hf_to_vllm_mapper` for the
-        # multimodal → text-only body remap. Order matters: more
-        # specific rules first.
-        # `.weight_scale_inv` is the native-FP8 per-128x128-block scale
-        # that pairs with a `.weight` fp8_e4m3fn tensor (MiniMax-M2/M2.7,
-        # DeepSeek-V3, any natively-FP8 checkpoint). Drop it from the
-        # primary weight map so callers that install by model-qname
-        # don't try to install it onto the redeclared Linear; fp8-aware
-        # loaders pick it up from `_build_fp8_scale_inv_map` instead
-        # and apply the scale during load.
-        if k.endswith(".weight_scale_inv"):
-            return None
-        if k.startswith("model.visual.") or k.startswith("model.audio_tower.") \
-                or k.startswith("model.vision_tower.") \
-                or k.startswith("model.embed_vision.") \
-                or k.startswith("model.embed_audio.") \
-                or k.startswith("mtp."):
-            return None
-        if k.startswith("model.language_model."):
-            return "model." + k[len("model.language_model."):]
-        return k
-
-    def _rename_multimodal(k: str) -> str | None:
-        # Multimodal umbrella keeps `model.language_model.layers.*` and
-        # `model.visual.*` verbatim — they already match the declared
-        # multimodal model's named modules. MTP weights follow a
-        # separate synthesis path; drop them so they don't shadow
-        # anything.
-        if k.endswith(".weight_scale_inv"):
-            return None
-        if k.startswith("mtp."):
-            return None
-        return k
-
-    if multimodal:
-        _rename = _rename_multimodal
-    elif _read_model_type(model_path) == "deepseek_v4":
-        _rename = _rename_dsv4_text_only
-    else:
-        _rename = _rename_text_only
+    # Rename strategy is owned by the model_profile (refactor #32).
+    # The default ModelProfile.checkpoint_to_live_name preserves the
+    # legacy `_rename_text_only` / `_rename_multimodal` behavior;
+    # architecture-specific profiles (e.g. DeepseekV4Profile) override
+    # to handle their own naming conventions.
+    from .model_profiles import detect_profile
+    profile = detect_profile(model_path)
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_file):
@@ -296,29 +109,11 @@ def _build_weight_map(model_path: str, *,
     model_to_shard: dict[str, str] = {}
     model_to_ckpt: dict[str, str] = {}
     for ck, shard in raw.items():
-        mk = _rename(ck)
+        mk = profile.checkpoint_to_live_name(ck, multimodal=multimodal)
         if mk is None:
             continue
         model_to_shard[mk] = os.path.join(model_path, shard)
         model_to_ckpt[mk] = ck
-
-    # DSv4: drop FP8 block-scale entries from the body weight map. Their
-    # ckpt key ends in `.scale` and pairs with a `.weight` sibling that
-    # lives in the live module. The dequant pass in `_apply_fp8_dequant_inplace`
-    # consumes these scales separately via `_build_fp8_scale_inv_map`.
-    # Standalone `.scale` Parameters (e.g. `attn_hc.scale` — DSv4
-    # HyperConnection mix scale) keep their entry because they have no
-    # `.weight` sibling. The rename has already produced the live qname,
-    # so the pairing test runs in live-name space.
-    if _read_model_type(model_path) == "deepseek_v4":
-        live_keys_set = set(model_to_shard.keys())
-        for mk in list(model_to_shard.keys()):
-            if not mk.endswith(".scale"):
-                continue
-            weight_sibling = mk[: -len(".scale")] + ".weight"
-            if weight_sibling in live_keys_set:
-                del model_to_shard[mk]
-                del model_to_ckpt[mk]
     return model_to_shard, model_to_ckpt
 
 
@@ -338,42 +133,16 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     tensors — load-time dequant is then a no-op and callers behave
     exactly as they did before this function existed.
     """
-    # Same rename table as `_build_weight_map`, but we KEEP
-    # `.weight_scale_inv` and rewrite the same body-vs-multimodal
-    # remap so lookup keys line up with the weight map.
-    def _rename_text_only(k: str) -> str | None:
-        if (k.startswith("model.visual.")
-                or k.startswith("model.audio_tower.")
-                or k.startswith("model.vision_tower.")
-                or k.startswith("model.embed_vision.")
-                or k.startswith("model.embed_audio.")
-                or k.startswith("mtp.")):
-            return None
-        if k.startswith("model.language_model."):
-            return "model." + k[len("model.language_model."):]
-        return k
-
-    def _rename_multimodal(k: str) -> str | None:
-        if k.startswith("mtp."):
-            return None
-        return k
-
-    is_dsv4 = _read_model_type(model_path) == "deepseek_v4"
-    if multimodal:
-        _rename = _rename_multimodal
-    elif is_dsv4:
-        _rename = _rename_dsv4_text_only
-    else:
-        _rename = _rename_text_only
-
-    # DSv4-Flash-Base uses F8_E8M0 `.scale` siblings (not F32
-    # `.weight_scale_inv`). Dequant math is the same multiplicative
-    # form once both are cast to bf16: F8_E8M0 represents 2^(E-127),
-    # which torch's `.to(bf16)` materializes as the multiplier directly.
-    # So the existing `_apply_fp8_dequant_inplace` block-tile multiply
-    # works as-is — we just need to locate `.scale` siblings of `.weight`
-    # tensors and key them by the live model qname for the weight.
-    scale_suffix = ".scale" if is_dsv4 else ".weight_scale_inv"
+    # Profile-driven dispatch (refactor #32). Profiles that store FP8
+    # scales under a non-standard path (DSv4 uses `.scale` siblings)
+    # return a fully populated map from `fp8_scale_pairs`. Profiles
+    # without overrides return None and we fall through to the legacy
+    # `.weight_scale_inv`-suffix scan.
+    from .model_profiles import detect_profile
+    profile = detect_profile(model_path)
+    explicit = profile.fp8_scale_pairs(model_path)
+    if explicit is not None:
+        return explicit
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_file):
@@ -387,40 +156,20 @@ def _build_fp8_scale_inv_map(model_path: str, *,
             raw = {k: single for k in f.keys()}
 
     out: dict[str, tuple[str, str]] = {}
-    if is_dsv4:
-        # DSv4: pair each `*.scale` ckpt key with its `*.weight`
-        # counterpart, then run the weight name through the rename
-        # to get the live qname. Only retain pairs whose `.weight`
-        # sibling actually exists (some `.scale` entries — top-level
-        # `head.scale`, `embed.scale` — don't have a paired weight in
-        # the live model and we drop them via _rename returning None).
-        weight_keys = {k for k in raw if k.endswith(".weight")}
-        for ck_key, shard in raw.items():
-            if not ck_key.endswith(scale_suffix):
-                continue
-            base = ck_key[: -len(scale_suffix)]  # e.g. "layers.0.attn.wkv"
-            weight_ck = base + ".weight"
-            if weight_ck not in weight_keys:
-                # Standalone scale (no paired weight) — drop.
-                continue
-            weight_live = _rename(weight_ck)
-            if weight_live is None:
-                continue
-            out[weight_live] = (os.path.join(model_path, shard), ck_key)
-        return out
-
     for ck_key, shard in raw.items():
-        if not ck_key.endswith(scale_suffix):
+        if not ck_key.endswith(".weight_scale_inv"):
             continue
-        renamed = _rename(ck_key)
-        if renamed is None:
+        # The legacy MiniMax / DSv3 path: `.weight_scale_inv` siblings
+        # paired with `.weight`. Profile.checkpoint_to_live_name
+        # always drops `.weight_scale_inv` from the body map; here we
+        # rebuild the equivalent live qname by stripping the suffix
+        # off the rewritten `.weight` name.
+        weight_ck = ck_key[: -len("_scale_inv")]
+        weight_live = profile.checkpoint_to_live_name(
+            weight_ck, multimodal=multimodal)
+        if weight_live is None:
             continue
-        # Key the map by the WEIGHT name (drop `_scale_inv`, leaving
-        # `...something.weight`) so callers can look up by the same
-        # model_key they use in `_build_weight_map`.
-        assert renamed.endswith(scale_suffix), renamed
-        weight_key = renamed[: -len("_scale_inv")]
-        out[weight_key] = (os.path.join(model_path, shard), ck_key)
+        out[weight_live] = (os.path.join(model_path, shard), ck_key)
     return out
 
 
@@ -1143,15 +892,14 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
 
 def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
                 position_embeddings, attention_mask, position_ids,
-                past_key_values=None,
-                input_ids: torch.Tensor | None = None) -> torch.Tensor:
+                past_key_values=None, **extra) -> torch.Tensor:
     """Call a decoder layer with the common transformers v5 signature.
     Returns hidden output tensor.
 
-    `input_ids` is passed through for architectures whose router needs
-    the raw token id (e.g. DSv4-Flash hash-routing layers, which look
-    up expert indices via a frozen `tid2eid` table). Layers that don't
-    consume `input_ids` ignore the kwarg via `**kwargs` absorption.
+    `extra` carries architecture-specific kwargs supplied by the
+    profile's `extra_layer_kwargs(...)` (e.g. DSv4-Flash hash-routing
+    layers consume `input_ids` for the `tid2eid` lookup). Layers that
+    don't consume those kwargs ignore them via `**kwargs` absorption.
     """
     out = layer(
         hidden_states=hidden,
@@ -1160,7 +908,7 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
         past_key_values=past_key_values,
         use_cache=False,
         position_embeddings=position_embeddings,
-        input_ids=input_ids,
+        **extra,
     )
     if isinstance(out, tuple):
         return out[0]
@@ -1198,7 +946,11 @@ def _resolve_base_prefix(root: nn.Module, base: nn.Module) -> str:
 
 def _head_prefixes(root: nn.Module, base_prefix: str) -> list[str]:
     """Prefixes for the always-resident pieces: embed + norm + lm_head +
-    any rotary/position buffers under the base model."""
+    any rotary/position buffers under the base model.
+
+    Profiles can extend the list via `head_resident_extra_prefixes`
+    (DSv4 adds `model.hc_head.` for the multi-stream→single-stream
+    collapse module)."""
     p = f"{base_prefix}." if base_prefix else ""
     prefixes = [
         f"{p}embed_tokens.",
@@ -1206,14 +958,22 @@ def _head_prefixes(root: nn.Module, base_prefix: str) -> list[str]:
         "lm_head.",
         f"{p}rotary_emb.",
     ]
-    # DeepSeek-V4 has a HyperHead module at `model.hc_head.{hc_fn, hc_base,
-    # hc_scale}` that collapses multi-stream → single-stream before the
-    # final norm. prismaquant calls it at the end of phase-1, so its
-    # parameters must be loaded with the head-resident batch.
-    if hasattr(root, "model") and hasattr(root.model, "hc_head"):
-        prefixes.append(f"{p}hc_head.")
-    elif hasattr(root, "hc_head"):
-        prefixes.append("hc_head.")
+    # Profile-driven extension (refactor #32). Default profile returns
+    # an empty list; architecture-specific profiles append their own
+    # head-resident prefixes here.
+    try:
+        from .model_profiles import profile_from_model
+        extra = profile_from_model(root).head_resident_extra_prefixes(root)
+        for pref in extra:
+            if pref not in prefixes:
+                prefixes.append(pref)
+    except Exception:
+        # Defensive: fall back to the legacy hardcoded check if the
+        # profile import path is unavailable for any reason.
+        if hasattr(root, "model") and hasattr(root.model, "hc_head"):
+            prefixes.append(f"{p}hc_head.")
+        elif hasattr(root, "hc_head"):
+            prefixes.append("hc_head.")
     # Some models put per-layer embeddings inputs (layer_scalar on Gemma 4,
     # per_layer_embeddings on multimodal umbrellas) at top level too —
     # not relevant to causal LM text-only path; skip.

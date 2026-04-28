@@ -1079,15 +1079,12 @@ def _compute_global_precompute(
     position_embeddings = _compute_position_embeddings(
         base_model, hidden, position_ids)
 
-    # DeepSeek-V4 propagates hidden state in multi-stream form
-    # `[B, S, hc_mult, H]` between layers (the hyper-connection inputs
-    # / outputs are explicit). Mirror the model's forward (line 1164)
-    # by expanding here. Other architectures keep the standard
-    # `[B, S, H]` form. Detection via `hc_mult` attribute on the config
-    # is the same probe the modeling code uses internally.
-    hc_mult = getattr(base_model.config, "hc_mult", None)
-    if hc_mult is not None and hc_mult > 1:
-        hidden = hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
+    # Profile-driven hidden-state shape adapter (refactor #32). Default
+    # profile passes through; DSv4 expands single-stream `[B, S, H]` to
+    # multi-stream `[B, S, hc_mult, H]` (mirrors `DeepseekV4Model.forward`).
+    from .model_profiles import profile_from_model as _profile_from_model
+    _profile = _profile_from_model(base_model)
+    hidden = _profile.expand_hidden_for_layers(hidden, base_model)
 
     print(f"[incremental/global] phase-1 N={batch_size} T={tokens_in_sample} "
           f"hidden={tuple(hidden.shape)}", flush=True)
@@ -1115,7 +1112,7 @@ def _compute_global_precompute(
                 position_embeddings=position_embeddings,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                input_ids=ids,
+                **_profile.extra_layer_kwargs(input_ids=ids),
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
@@ -1266,15 +1263,11 @@ def _compute_global_precompute(
 
     t_phase = time.time()
     final_hidden = activations_cpu[-1].to(device).to(dtype).requires_grad_(True)
-    # DSv4 keeps the final hidden state in multi-stream form
-    # `[B, T, hc_mult, H]`; the model's forward collapses it via
-    # `self.hc_head(...)` before the final norm. Mirror that here so
-    # `norm_out` has the standard `[B, T, H]` shape downstream
-    # consumers expect.
-    if final_hidden.dim() == 4 and hasattr(base_model, "hc_head"):
-        final_hidden_for_norm = base_model.hc_head(final_hidden)
-    else:
-        final_hidden_for_norm = final_hidden
+    # Profile-driven hidden-state collapse (refactor #32). Default
+    # profile passes through; DSv4 calls `base_model.hc_head(...)` to
+    # fold multi-stream `[B, T, hc_mult, H]` back to `[B, T, H]`.
+    final_hidden_for_norm = _profile.collapse_hidden_after_layers(
+        final_hidden, base_model)
     norm_out = base_model.norm(final_hidden_for_norm)
     norm_out_d = norm_out.detach().requires_grad_(True)
     grad_buf = torch.zeros_like(norm_out_d)
@@ -1434,20 +1427,16 @@ def _run_body_streaming_shard(
 
     inc = re.compile(linear_include)
     exc = re.compile(linear_exclude)
-    # Skip Linear subclasses that don't follow the standard 2-D
-    # `[out_features, in_features]` weight contract. DSv4's
-    # `DeepseekV4GroupedLinear` inherits nn.Linear so the export-side
-    # quantizer can still find it, but its weight stores
-    # `[out_features, in_features_per_group]` and the effective output
-    # dimension at probe time is `out_features // n_groups`. The
-    # h_trace * w.pow(2) accumulator can't broadcast across that
-    # mismatch. Pass it through at export-time fixed precision (BF16
-    # / FP8_SOURCE) instead of giving it junk Fisher data.
-    _SKIP_LINEAR_CLASSES = ("DeepseekV4GroupedLinear",)
+    # Profile-driven Linear gathering (refactor #32). Profile decides
+    # whether each Linear gets Fisher hooks. Default profile accepts
+    # any `nn.Linear`; DSv4 skips `DeepseekV4GroupedLinear` (its weight
+    # `[out_features, in_features_per_group]` doesn't match the per-token
+    # Hessian-trace effective output dim).
+    from .model_profiles import profile_from_model as _pfm
+    _shard_profile = _pfm(model)
     all_linears = [
         n for n, m in model.named_modules()
-        if isinstance(m, nn.Linear)
-        and type(m).__name__ not in _SKIP_LINEAR_CLASSES
+        if _shard_profile.should_probe_linear(n, m)
     ]
     all_tracked = [n for n in all_linears
                    if inc.search(n) and not exc.search(n)]
@@ -2059,7 +2048,8 @@ def _run_body_streaming_shard(
                 position_embeddings=position_embeddings,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                input_ids=calib.to(device) if calib is not None else None,
+                **_shard_profile.extra_layer_kwargs(
+                    input_ids=calib.to(device) if calib is not None else None),
             )
             out.backward(grad_out.to(device))
             bwd_s = time.time() - bwd_t0

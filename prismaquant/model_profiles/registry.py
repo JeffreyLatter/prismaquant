@@ -75,16 +75,48 @@ def detect_profile(model_path: str) -> ModelProfile:
             archs = list(cfg.get("architectures") or [])
         except (json.JSONDecodeError, OSError):
             pass
+    return _resolve(model_type, archs)
+
+
+def profile_from_config(cfg) -> ModelProfile:
+    """Pick a ModelProfile from a (possibly already-loaded) HF config
+    object or dict. Useful for consumers that already hold the model
+    (e.g. `_init_rotary_inplace`) and don't have `model_path`."""
+    if cfg is None:
+        return DefaultProfile(architectures=[])
+    if isinstance(cfg, dict):
+        model_type = cfg.get("model_type") or ""
+        archs = list(cfg.get("architectures") or [])
+    else:
+        model_type = getattr(cfg, "model_type", "") or ""
+        archs = list(getattr(cfg, "architectures", []) or [])
+    return _resolve(model_type, archs)
+
+
+def profile_from_model(model) -> ModelProfile:
+    """Pick a ModelProfile from a live transformers model. Reads
+    `model.config` and dispatches via `profile_from_config`."""
+    return profile_from_config(getattr(model, "config", None))
+
+
+def _resolve(model_type: str, archs: list[str]) -> ModelProfile:
+    """Walk registered profile classes, instantiate the first match."""
     for cls in _REGISTERED:
         try:
             if cls.matches(model_type, archs):
+                inst = cls()
                 # Some profiles need to register vendored modeling code
-                # with transformers before the model loads — handle that
-                # opportunistically here so callers don't need to know.
-                if cls is DeepseekV4Profile:
-                    from ..vendored import register_deepseek_v4
-                    register_deepseek_v4()
-                return cls()
+                # with transformers before the model loads. Defer to
+                # the profile method (refactor #32) so callers don't
+                # need to know the architecture-specific bootstrap.
+                try:
+                    inst.register_vendored_modeling()
+                except Exception:
+                    # Don't let a vendoring failure block profile
+                    # detection — surface via the eventual model load
+                    # error instead.
+                    pass
+                return inst
         except Exception:
             continue
     return DefaultProfile(architectures=archs)

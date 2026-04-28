@@ -1,16 +1,19 @@
-"""Unit tests for the DSv4 ckpt→live rename in layer_streaming.
+"""Unit tests for the DSv4 ckpt→live rename.
 
 Forward-pair to test_deepseek_v4_profile.py: the profile owns
 `source_tensor_name` (live → ckpt); this file pins the inverse
-direction (`_rename_dsv4_text_only(ckpt_key) → live_qname`) used by
-`_build_weight_map` to populate the streaming loader's
+direction (`DeepseekV4Profile.checkpoint_to_live_name(ckpt_key)`)
+used by `_build_weight_map` to populate the streaming loader's
 {model_key: ckpt_key} dict.
 """
 from __future__ import annotations
 
 import pytest
 
-from prismaquant.layer_streaming import _rename_dsv4_text_only as _rename
+from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+_profile = DeepseekV4Profile()
+_rename = _profile.checkpoint_to_live_name
 
 
 def test_top_level_rename():
@@ -71,8 +74,8 @@ def test_ffn_rename():
          "model.layers.0.mlp.shared_experts.down_proj.weight"),
         ("layers.0.ffn.shared_experts.w3.weight",
          "model.layers.0.mlp.shared_experts.up_proj.weight"),
-        ("layers.0.ffn.shared_experts.w1.scale",
-         "model.layers.0.mlp.shared_experts.gate_proj.scale"),
+        # Note: .scale siblings of FP8 weights are dropped from the body
+        # map; they're consumed by `fp8_scale_pairs` in the dequant pass.
     ]
     for ck, live in cases:
         assert _rename(ck) == live, f"{ck} ↦ {_rename(ck)}, expected {live}"
@@ -111,9 +114,8 @@ def test_routed_experts_per_expert_rename():
          "model.layers.0.mlp.experts.255.up_proj.weight"),
         ("layers.42.ffn.experts.128.w2.weight",
          "model.layers.42.mlp.experts.128.down_proj.weight"),
-        # FP8 block scale siblings preserve suffix
-        ("layers.0.ffn.experts.0.w1.scale",
-         "model.layers.0.mlp.experts.0.gate_proj.scale"),
+        # Note: FP8 block-scale siblings of routed experts drop from
+        # the body map; they're consumed by `fp8_scale_pairs`.
     ]
     for ck, live in cases:
         assert _rename(ck) == live, f"{ck} ↦ {_rename(ck)}, expected {live}"

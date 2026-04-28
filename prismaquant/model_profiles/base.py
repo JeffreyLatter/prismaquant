@@ -397,6 +397,123 @@ class ModelProfile(ABC):
             or 0
         )
 
+    # ------------------------------------------------------------
+    # Streaming probe adapters (DSv4 generalization, refactor #32)
+    #
+    # Profiles override these to teach prismaquant about an architecture's
+    # idiosyncrasies WITHOUT touching layer_streaming / streaming_model /
+    # incremental_probe core paths. Default implementations preserve the
+    # behavior the existing codebase had before the refactor — MiniMax,
+    # Qwen3.5/3.6, Gemma4 and similar architectures all use the defaults.
+    # ------------------------------------------------------------
+
+    def checkpoint_to_live_name(self, ckpt_key: str, *,
+                                multimodal: bool = False) -> str | None:
+        """Map a checkpoint key (as found in the safetensors index) to
+        the live transformers module qname (as found by
+        `model.named_parameters()`). Return None to drop the key from
+        the body weight map (it is then either ignored, or consumed
+        via a sibling path like the FP8 dequant scale map).
+
+        Default: drop visual/audio/MTP keys, drop `.weight_scale_inv`
+        (those go through the FP8 scale map), pass everything else
+        through unchanged. The multimodal-umbrella branch strips the
+        `model.language_model.` infix so probe-side text-only staging
+        and the source checkpoint line up.
+
+        DSv4 overrides this to handle its flat naming convention
+        (`embed.weight`, `layers.5.attn.wkv.weight` → standard
+        transformers names)."""
+        if ckpt_key.endswith(".weight_scale_inv"):
+            return None
+        if (ckpt_key.startswith("model.visual.")
+                or ckpt_key.startswith("model.audio_tower.")
+                or ckpt_key.startswith("model.vision_tower.")
+                or ckpt_key.startswith("model.embed_vision.")
+                or ckpt_key.startswith("model.embed_audio.")
+                or ckpt_key.startswith("mtp.")):
+            return None if not multimodal else (
+                # Multimodal staging keeps visual/audio prefixes verbatim
+                # but still drops MTP (handled by the MTP synthesis path).
+                None if ckpt_key.startswith("mtp.") else ckpt_key)
+        if not multimodal and ckpt_key.startswith("model.language_model."):
+            return "model." + ckpt_key[len("model.language_model."):]
+        return ckpt_key
+
+    def fp8_scale_pairs(self, model_path: str
+                        ) -> dict[str, tuple[str, str]] | None:
+        """Return `{model_weight_key: (scale_shard_path, scale_ckpt_key)}`
+        for every native-FP8 weight tensor in this checkpoint. Returns
+        None to fall through to the default `.weight_scale_inv`
+        sibling discovery path. Returns `{}` to indicate "no FP8 dequant
+        applies to this model". Returns a populated dict to fully
+        override the discovery (e.g. DSv4 uses `.scale` siblings).
+
+        Default: None (use the legacy `.weight_scale_inv` discovery)."""
+        return None
+
+    def head_resident_extra_prefixes(self, root) -> list[str]:
+        """Extra prefixes (rooted under the base model where possible)
+        to load with the head-resident batch (embed/norm/lm_head/rotary).
+        DSv4 returns `["hc_head."]` so its multi-stream collapse can
+        run with real weights at end-of-phase-1.
+
+        Default: empty."""
+        return []
+
+    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
+        """Optionally populate rotary buffers on a meta-built skeleton.
+        Return True if the profile fully handled init (the caller skips
+        its default path), or False to fall through to the standard
+        single-rope flow.
+
+        DSv4 / Gemma3 return True after registering per-layer-type
+        `<name>_inv_freq` buffers (the rotary has a `layer_types` tuple
+        like `("main", "compress")`).
+
+        Default: False (single-rope path)."""
+        return False
+
+    def expand_hidden_for_layers(self, hidden, base_model):
+        """Optionally reshape the post-embedding hidden state before
+        the per-layer forward loop. DSv4 expands single-stream
+        `[B, T, H]` to multi-stream `[B, T, hc_mult, H]` (mirrors
+        `DeepseekV4Model.forward`). Default: passthrough."""
+        return hidden
+
+    def collapse_hidden_after_layers(self, hidden, base_model):
+        """Inverse of `expand_hidden_for_layers`: collapse the post-loop
+        hidden state back to standard `[B, T, H]` before the final
+        norm + lm_head. DSv4 calls `base_model.hc_head(hidden)`.
+        Default: passthrough."""
+        return hidden
+
+    def extra_layer_kwargs(self, *, input_ids=None) -> dict:
+        """Extra kwargs to pass to `layer(...)` during phase-1/3.
+        DSv4 hash-routed layers consume `input_ids` for the `tid2eid`
+        lookup; other architectures ignore it. Default: empty dict
+        (which the layer's `**kwargs` absorbs)."""
+        return {}
+
+    def should_probe_linear(self, name: str, mod) -> bool:
+        """Whether to register Fisher hooks on this Linear module.
+        DSv4 returns False for `DeepseekV4GroupedLinear` (its weight
+        shape doesn't match the per-token Hessian-trace effective
+        output dim, so the chunk_h * w.pow(2) accumulator can't
+        broadcast). Default: True for any nn.Linear instance.
+
+        Profiles may also use this to skip e.g. router gates that
+        shouldn't carry Fisher info."""
+        import torch.nn as _nn
+        return isinstance(mod, _nn.Linear)
+
+    def register_vendored_modeling(self) -> None:
+        """Called once when this profile is instantiated by
+        `detect_profile()`. Profiles that vendor transformers modeling
+        code (DSv4) use this to install monkey-patches and register
+        with AutoConfig / AutoModelForCausalLM. Default: no-op."""
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Shared helper
