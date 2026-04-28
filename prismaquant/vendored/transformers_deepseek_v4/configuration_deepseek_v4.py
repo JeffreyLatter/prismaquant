@@ -21,6 +21,9 @@ from ...utils import auto_docstring
 DEEPSEEK_V4_LAYER_TYPES = (
     "compressed_sparse_attention",
     "heavily_compressed_attention",
+    # PRISMAQUANT: DSv4-Flash-Base layers with compress_ratio=0 are
+    # plain sliding-window attention with no compressor / indexer.
+    "sliding_attention",
 )
 
 
@@ -148,7 +151,26 @@ class DeepseekV4Config(PreTrainedConfig):
     def __post_init__(self, **kwargs):
         super().__post_init__(**kwargs)
         n = self.num_hidden_layers
-        if self.layer_types is None:
+        # PRISMAQUANT: when compress_ratios is provided in config.json
+        # (DSv4-Flash-Base ships with it), use it as the source of truth
+        # for layer_types. The PR's hardcoded default ([HCA, HCA, ...
+        # CSA/HCA interleaved]) does not match Flash-Base, which has
+        # the first two layers as full sliding attention (ratio=0).
+        cr = getattr(self, "compress_ratios", None)
+        if cr is not None and len(cr) >= n:
+            ratio_to_type = {
+                0: "sliding_attention",
+                4: "compressed_sparse_attention",
+                128: "heavily_compressed_attention",
+            }
+            try:
+                self.layer_types = [ratio_to_type[int(r)] for r in cr[:n]]
+            except KeyError as e:
+                raise ValueError(
+                    f"unknown compress_ratio {e.args[0]} in config; "
+                    "expected 0 (sliding), 4 (CSA), or 128 (HCA)"
+                ) from e
+        elif self.layer_types is None:
             # V4-Pro default: two HCA bootstrap layers, then CSA / HCA interleaved.
             interleave = [
                 "compressed_sparse_attention" if i % 2 else "heavily_compressed_attention"

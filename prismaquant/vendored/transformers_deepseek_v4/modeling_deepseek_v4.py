@@ -226,10 +226,11 @@ class DeepseekV4CSALayer(DeepseekV4HCALayer):
 
 
 class DeepseekV4Cache(DynamicCache):
-    """One cache layer per ``config.layer_types[i]``: HCA (Compressor only) or CSA
-    (Compressor + Indexer). All V4 layers carry compressor state — there is no
-    sliding-only layer type. The compressor / indexer state lives on the per-layer
-    cache layer, not on the parent cache.
+    """One cache layer per ``config.layer_types[i]``: HCA (Compressor only), CSA
+    (Compressor + Indexer), or plain sliding-window for ``sliding_attention``
+    layers (PRISMAQUANT addition: DSv4-Flash-Base layers 0/1 have
+    ``compress_ratio=0`` and carry no compressor state). The compressor /
+    indexer state lives on the per-layer cache layer, not on the parent cache.
     """
 
     def __init__(self, config: DeepseekV4Config | None = None):
@@ -240,6 +241,8 @@ class DeepseekV4Cache(DynamicCache):
         for layer_type in config.layer_types:
             if layer_type == "compressed_sparse_attention":
                 self.layers.append(DeepseekV4CSALayer(config.sliding_window, config.compress_rate_csa))
+            elif layer_type == "sliding_attention":
+                self.layers.append(DynamicSlidingWindowLayer(config.sliding_window))
             else:
                 self.layers.append(DeepseekV4HCALayer(config.sliding_window, config.compress_rate_hca))
 
@@ -602,14 +605,24 @@ class DeepseekV4Attention(nn.Module):
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks = nn.Parameter(torch.empty(self.num_heads))
 
-        compress_rate = (
-            config.compress_rate_csa if self.layer_type == "compressed_sparse_attention" else config.compress_rate_hca
-        )
-        self.compressor = COMPRESSOR_CLASSES[self.layer_type](config, compress_rate)
-        self._cache_layer_cls = (
-            DeepseekV4CSALayer if self.layer_type == "compressed_sparse_attention" else DeepseekV4HCALayer
-        )
-        self.compress_rate = compress_rate
+        # PRISMAQUANT: sliding_attention layers (compress_ratio=0 in
+        # DSv4-Flash-Base config; layers 0 and 1) have no compressor or
+        # indexer in the checkpoint. Build no compressor module for them
+        # so weight loading + Fisher hooks don't see uninitialized state,
+        # and the forward branches around the long-range path entirely.
+        if self.layer_type == "sliding_attention":
+            self.compressor = None
+            self._cache_layer_cls = None
+            self.compress_rate = 0
+        else:
+            compress_rate = (
+                config.compress_rate_csa if self.layer_type == "compressed_sparse_attention" else config.compress_rate_hca
+            )
+            self.compressor = COMPRESSOR_CLASSES[self.layer_type](config, compress_rate)
+            self._cache_layer_cls = (
+                DeepseekV4CSALayer if self.layer_type == "compressed_sparse_attention" else DeepseekV4HCALayer
+            )
+            self.compress_rate = compress_rate
 
     def forward(
         self,
@@ -643,19 +656,25 @@ class DeepseekV4Attention(nn.Module):
         # across decode steps. K/V already accumulated on the prior layer is carried
         # over. Without ``past_key_values`` (gradient-checkpointing recompute), use a
         # forward-scoped scratch layer.
-        if past_key_values is None:
-            cache_layer = self._cache_layer_cls(self.sliding_window, self.compress_rate)
+        # PRISMAQUANT: sliding_attention layers (compress_ratio=0) skip
+        # the long-range branch entirely — they're plain sliding-window
+        # attention. self.compressor is None on those layers.
+        if self.layer_type == "sliding_attention":
+            full_kv = kv
         else:
-            cache_layer = past_key_values.layers[self.layer_idx]
-            if not isinstance(cache_layer, self._cache_layer_cls):
-                new_layer = self._cache_layer_cls(self.sliding_window, self.compress_rate)
-                if getattr(cache_layer, "is_initialized", False):
-                    new_layer.lazy_initialization(cache_layer.keys, cache_layer.values)
-                    new_layer.cumulative_length = getattr(cache_layer, "cumulative_length", cache_layer.keys.shape[-2])
-                past_key_values.layers[self.layer_idx] = new_layer
-                cache_layer = new_layer
-        compressed_kv = self.compressor(hidden_states, q_residual, position_ids, cache_layer)
-        full_kv = torch.cat([kv, compressed_kv], dim=2)
+            if past_key_values is None:
+                cache_layer = self._cache_layer_cls(self.sliding_window, self.compress_rate)
+            else:
+                cache_layer = past_key_values.layers[self.layer_idx]
+                if not isinstance(cache_layer, self._cache_layer_cls):
+                    new_layer = self._cache_layer_cls(self.sliding_window, self.compress_rate)
+                    if getattr(cache_layer, "is_initialized", False):
+                        new_layer.lazy_initialization(cache_layer.keys, cache_layer.values)
+                        new_layer.cumulative_length = getattr(cache_layer, "cumulative_length", cache_layer.keys.shape[-2])
+                    past_key_values.layers[self.layer_idx] = new_layer
+                    cache_layer = new_layer
+            compressed_kv = self.compressor(hidden_states, q_residual, position_ids, cache_layer)
+            full_kv = torch.cat([kv, compressed_kv], dim=2)
 
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
