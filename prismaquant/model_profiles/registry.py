@@ -36,6 +36,7 @@ from .qwen3_5_dense import Qwen3_5DenseProfile
 # archive/minimax_m2p7/ as its canonical home; this live import enables
 # allocator Pareto runs without uprooting the archive commit.
 from .minimax_m2 import MiniMaxM2Profile
+from .deepseek_v4 import DeepseekV4Profile
 
 
 _REGISTERED: list[type[ModelProfile]] = [
@@ -44,6 +45,7 @@ _REGISTERED: list[type[ModelProfile]] = [
     Qwen3Profile,  # original Qwen3 (dense, no MoE, no MTP) — after the 3.5 siblings
     Gemma4Profile,
     MiniMaxM2Profile,
+    DeepseekV4Profile,
 ]
 
 
@@ -76,6 +78,12 @@ def detect_profile(model_path: str) -> ModelProfile:
     for cls in _REGISTERED:
         try:
             if cls.matches(model_type, archs):
+                # Some profiles need to register vendored modeling code
+                # with transformers before the model loads — handle that
+                # opportunistically here so callers don't need to know.
+                if cls is DeepseekV4Profile:
+                    from ..vendored import register_deepseek_v4
+                    register_deepseek_v4()
                 return cls()
         except Exception:
             continue
