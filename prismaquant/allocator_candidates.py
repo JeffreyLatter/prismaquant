@@ -46,8 +46,6 @@ def _format_kernel_supports_shape(fmt_name: str, in_features: int,
         if out_features % 128 != 0:
             return False
         return True
-    if fmt_name in ("INT2", "INT3", "NVINT2", "NVINT3"):
-        return in_features % 16 == 0
     if fmt_name.startswith("NVFP4"):
         return in_features % 16 == 0
     return True

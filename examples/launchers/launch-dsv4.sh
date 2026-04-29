@@ -6,9 +6,9 @@
 # projections; BF16 for norms / embed / head / compressor / hyper-conn;
 # F32 for hash-cluster heads + attn_sink + compressor.ape).
 #
-# Targets: ~90 GB on-disk artifact. Per memory dsv4_flash_base_scope.md
-# the floor at all-NVFP4 routed experts is ~151 GB, so 90 GB requires
-# NVINT2 in the format menu.
+# Targets: best-effort compact Spark artifact using only formats that
+# have native runtime support. Sub-4-bit custom formats are omitted
+# because they require custom kernels.
 #
 # Vendoring + patches: detect_profile() automatically calls
 # prismaquant.vendored.register_deepseek_v4() before any DSv4 weights
@@ -144,23 +144,23 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
       --adaptive-prune-ratio 0.375 \\
       --run-cost \\
       --cost-output \"\$COST\" \\
-      --cost-formats NVFP4,NVINT2,MXFP8_E4M3,FP8_SOURCE,BF16 \\
+      --cost-formats NVFP4,MXFP8_E4M3,FP8_SOURCE,BF16 \\
       --cost-work-dir /work/cost_work \\
       --cost-mode batched --cost-chunk-size 256 \\
       --cost-layers-per-shard 4 \\
       --cost-swap-grow-limit-mb 4096 \\
       2>&1 | tee /work/logs/probe_cost.log
 
-    echo '[2/2] allocator (target 90 GB band, NVINT2-enabled) ...'
+    echo '[2/2] allocator (native-kernel format menu) ...'
     python3 -m prismaquant.allocator \\
       --model \"\$MODEL\" \\
       --probe \"\$MERGED_PROBE\" \\
       --costs \"\$COST\" \\
-      --formats NVFP4,NVINT2,MXFP8_E4M3,FP8_SOURCE,BF16 \\
-      --target-bits 2.50 \\
-      --pareto-targets 2.30,2.40,2.50,2.60,2.70,2.80,3.00 \\
+      --formats NVFP4,MXFP8_E4M3,FP8_SOURCE,BF16 \\
+      --target-bits 4.00 \\
+      --pareto-targets 3.00,3.25,3.50,3.75,4.00,4.25,4.50,5.00 \\
       --enable-expert-prune \\
-      --prune-ratios 0.0,0.125,0.1875,0.25,0.3125,0.375 \\
+      --prune-ratios 0.0,0.125,0.1875,0.25,0.3125,0.375,0.4375,0.5 \\
       --prune-alpha 0.15 \\
       --prune-domain-policy union \\
       --layer-config /work/artifacts/layer_config.json \\

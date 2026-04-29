@@ -157,3 +157,26 @@ def test_export_cache_disabled_when_cache_dir_none(tmp_path):
 
     assert _layer_cache_file(0) is None
     assert _layer_cache_file(61) is None
+
+
+def test_activation_cache_fingerprint_tracks_cache_identity(tmp_path):
+    from prismaquant.export_native_compressed import (
+        _activation_index_fingerprint,
+    )
+
+    cache_dir = tmp_path / "act"
+    cache_dir.mkdir()
+    fp = cache_dir / "layer__q_proj.pt"
+    torch.save({"inputs": torch.zeros(2, 3)}, str(fp))
+
+    class _Index:
+        _paths = {"layer.q_proj": fp}
+
+    first = _activation_index_fingerprint(_Index(), cache_dir)
+    torch.save({"inputs": torch.zeros(5, 3)}, str(fp))
+    second = _activation_index_fingerprint(_Index(), cache_dir)
+
+    assert first["path"] == second["path"]
+    assert first["n_files"] == 1
+    assert second["n_files"] == 1
+    assert first["hash"] != second["hash"]

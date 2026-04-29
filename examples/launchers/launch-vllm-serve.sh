@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Serve the v22/v23 MiniMax M2.7 artifact via vLLM.
 # Mirrors the proven launch-minimax-prune-serve.sh param set used for
-# the NVINT2/3 run that hit 3.78 tok/s (per
+# the prior low-bit custom-kernel run that hit 3.78 tok/s (per
 # session_2026_04_24_3stream_win memory).
 #
 # Per memory `feedback_vllm_serve_binding`: bind 0.0.0.0:8000 with

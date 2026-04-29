@@ -3,8 +3,8 @@
 
 Drives a few representative prompt sizes through vLLM's
 /v1/completions endpoint and reports decode tok/s + prefill latency.
-Compare against the 3.78 tok/s NVINT3 baseline noted in memory
-(session_2026_04_24_3stream_win.md).
+Compare against the prior low-bit custom-kernel baseline noted in
+session_2026_04_24_3stream_win.md.
 
 Run after `launch-minimax-v21-vllm-serve.sh`.
 """
@@ -78,9 +78,9 @@ def main() -> int:
             f"decode={m['decode_tok_s']:5.2f} tok/s"
         )
 
-    print("\n[bench] reference: NVINT3 baseline = 3.78 tok/s "
+    print("\n[bench] reference: old custom low-bit baseline = 3.78 tok/s "
           "(session_2026_04_24_3stream_win memory)")
-    print("[bench] expectation: NVFP4 + FP8_SOURCE without NVINT3 should "
+    print("[bench] expectation: native NVFP4 + FP8_SOURCE should "
           "be in similar ballpark or better")
     return 0
 

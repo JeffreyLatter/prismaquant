@@ -148,7 +148,7 @@ Active:
 
 - **MiniMax M2.7 at 90–95 GB on Spark** — currently in probe; v22 branch.
 - **DeepSeek-V4-Flash** — blocked on transformers `DeepseekV4ForCausalLM`; mirror flow ready.
-- **3-bit format support** — NVINT3 + W3A16 dispatch in vLLM (NVINT3 kernels already exist in our fork; vLLM-native serving pending).
+- **Additional native vLLM formats** — add formats only when the runtime has native kernels and compressed-tensors loader support.
 - **Size-targeting allocator mode** — `--target-bytes 24G --kv-budget 8192` instead of `--target-bits 4.75`. The allocator already computes the full Pareto curve; this is a thin wrapper to pick the knee matching a hardware constraint.
 
 Research:

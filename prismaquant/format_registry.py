@@ -15,8 +15,8 @@ uniformly:
   - min_capability_sm       minimum SM arch (useful for hardware filter)
 
 Users register new formats with @register_format. New hardware formats
-(e.g. a future MXFP6 variant, Ada W4A8, INT3) can be added without
-touching core code.
+(e.g. a future MXFP6 variant or Ada W4A8) can be added without touching
+core code.
 """
 from __future__ import annotations
 
@@ -118,8 +118,6 @@ class FormatSpec:
 
 REGISTRY: dict[str, FormatSpec] = {}
 FORMAT_ALIASES: dict[str, str] = {
-    "NVINT2": "INT2",
-    "NVINT3": "INT3",
 }
 
 
@@ -261,17 +259,6 @@ def _e2m3_codebook() -> torch.Tensor:
     return torch.tensor(sorted(codes), dtype=torch.float32)
 
 
-def _e2m0_codebook() -> torch.Tensor:
-    # 3-bit FP e2m0: 1s + 2 exp + 0 mantissa. 7 unique codes (+0/-0 collapse):
-    # {0, ±0.5, ±1, ±2} — log-spaced, matches log-normal weight tails.
-    # Fits 3 bits (8 slots); one slot replicates 0 which is harmless.
-    codes = set([0.0])
-    for exp in range(4):
-        val = 2.0 ** (exp - 2)
-        codes.add(+val); codes.add(-val)
-    return torch.tensor(sorted(codes), dtype=torch.float32)
-
-
 def _e4m3_codebook() -> torch.Tensor:
     # 8-bit FP e4m3 (no inf). 256 codes, covering ±448.
     # We compute it analytically from the OCP FP8 spec (nan reserved).
@@ -302,7 +289,6 @@ def _e5m2_codebook() -> torch.Tensor:
 
 
 _CODEBOOKS = {
-    "fp3_e2m0": _e2m0_codebook(),
     "fp4_e2m1": _e2m1_codebook(),
     "fp6_e3m2": _e3m2_codebook(),
     "fp6_e2m3": _e2m3_codebook(),
@@ -471,45 +457,6 @@ register_format(FormatSpec(
     autoround_config=lambda: _plain_fp8_autoround("fp8_e5m2", 8),
     quantize_dequantize=_make_rtn("fp8_e5m2", 0),
     activation_quantize_dequantize=_make_rtn("fp8_e5m2", 0),
-))
-
-# Low-bit symmetric int quantization (block=16, FP8 scale — matches
-# NVFP4's envelope for easy dequant-to-NVFP4 at serve time). These are
-# our own formats; no hardware tensor-core op exists for them, so the
-# serving path dequantizes to NVFP4 on load and runs unchanged NVFP4
-# GEMMs. Historical configs may still spell these as NVINT2/NVINT3;
-# get_format() accepts those as aliases.
-# Storage savings: INT3 saves 25% vs NVFP4, INT2 saves 50%.
-register_format(FormatSpec(
-    name="INT3",
-    weight_bits=3, group_size=16, scale_bits=8, scale_dtype_name="fp8_e4m3",
-    weight_element_dtype="int3", act_bits=None,
-    family="nv", min_capability_sm=100,
-    autoround_config=lambda: _int_autoround(3, 16, 16),
-    quantize_dequantize=lambda w: _rtn_uniform_int(w, 3, 16),
-    activation_quantize_dequantize=lambda x: x,
-))
-register_format(FormatSpec(
-    name="INT2",
-    weight_bits=2, group_size=16, scale_bits=8, scale_dtype_name="fp8_e4m3",
-    weight_element_dtype="int2", act_bits=None,
-    family="nv", min_capability_sm=100,
-    autoround_config=lambda: _int_autoround(2, 16, 16),
-    quantize_dequantize=lambda w: _rtn_uniform_int(w, 2, 16),
-    activation_quantize_dequantize=lambda x: x,
-))
-
-# FP3 (E2M0, log-spaced codes) — theoretical edge over INT3 on
-# log-normal weight distributions (typical for pretrained models).
-# Same block envelope as NVFP4, decodes to NVFP4 at load time.
-register_format(FormatSpec(
-    name="NVFP3",
-    weight_bits=3, group_size=16, scale_bits=8, scale_dtype_name="fp8_e4m3",
-    weight_element_dtype="fp3_e2m0", act_bits=None,
-    family="nv", min_capability_sm=100,
-    autoround_config=lambda: _int_autoround(3, 16, 16),
-    quantize_dequantize=_make_rtn("fp3_e2m0", 16),
-    activation_quantize_dequantize=lambda x: x,
 ))
 
 # INT8 per-channel / INT4 per-group

@@ -133,7 +133,7 @@ class TestGroupedExportQuantization(unittest.TestCase):
 
         torch.manual_seed(0)
         weights = torch.randn(3, 4, 32)
-        for fmt in ("INT2", "INT3", "MXFP8"):
+        for fmt in ("MXFP8",):
             grouped = _quantize_2d_group_same_shape(weights, fmt)
             for i in range(weights.shape[0]):
                 scalar = _quantize_2d(weights[i], fmt)
@@ -160,7 +160,7 @@ class TestGroupedExportQuantization(unittest.TestCase):
                             msg=f"{fmt} {key}[{i}]",
                         )
 
-    def test_legacy_nvint_aliases_match_int_names(self):
+    def test_low_bit_custom_kernel_formats_are_rejected(self):
         from prismaquant.export_native_compressed import (
             _quantize_2d,
             _quantize_2d_group_same_shape,
@@ -168,15 +168,14 @@ class TestGroupedExportQuantization(unittest.TestCase):
         )
 
         weights = torch.randn(2, 4, 16)
-        self.assertEqual(canonicalize_format("nvint2"), "INT2")
-        self.assertEqual(canonicalize_format({"data_type": "int", "bits": 3}), "INT3")
-        for legacy, canonical in (("NVINT2", "INT2"), ("NVINT3", "INT3")):
-            old = _quantize_2d(weights[0], legacy)
-            new = _quantize_2d(weights[0], canonical)
-            self.assertTrue(torch.equal(old["weight_packed"], new["weight_packed"]))
-            grouped = _quantize_2d_group_same_shape(weights, legacy)
-            scalar = _quantize_2d(weights[1], canonical)
-            self.assertTrue(torch.equal(grouped["weight_packed"][1], scalar["weight_packed"]))
+        with self.assertRaises(ValueError):
+            canonicalize_format("nvint2")
+        with self.assertRaises(ValueError):
+            canonicalize_format({"data_type": "int", "bits": 3})
+        with self.assertRaises(ValueError):
+            _quantize_2d(weights[0], "NVINT2")
+        with self.assertRaises(ValueError):
+            _quantize_2d_group_same_shape(weights, "INT3")
 
 
 def _nvfp4_dequantize(weight_packed, weight_scale_fp8, weight_global_scale_divisor):

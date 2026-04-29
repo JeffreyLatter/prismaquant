@@ -13,18 +13,15 @@ class TestPrismaQuantFormatRegistry(unittest.TestCase):
     def test_block_formats_have_expected_shape_aware_bits(self):
         shape = (128, 128)
         self.assertAlmostEqual(fr.get_format("NVFP4").effective_bits_for_shape(shape), 4.5)
-        self.assertAlmostEqual(fr.get_format("INT2").effective_bits_for_shape(shape), 2.5)
-        self.assertAlmostEqual(fr.get_format("INT3").effective_bits_for_shape(shape), 3.5)
         self.assertAlmostEqual(fr.get_format("MXFP4").effective_bits_for_shape(shape), 4.25)
         self.assertAlmostEqual(fr.get_format("MXFP8").effective_bits_for_shape(shape), 8.25)
         self.assertAlmostEqual(fr.get_format("FP8_SOURCE").effective_bits_for_shape(shape), 8.001953125)
         self.assertAlmostEqual(fr.get_format("BF16").effective_bits_for_shape(shape), 16.0)
 
-    def test_legacy_nvint_names_are_aliases(self):
-        self.assertIs(fr.get_format("NVINT2"), fr.get_format("INT2"))
-        self.assertIs(fr.get_format("NVINT3"), fr.get_format("INT3"))
-        self.assertEqual(fr.canonical_format_name("NVINT2"), "INT2")
-        self.assertEqual(fr.aliases_for("INT3"), ("INT3", "NVINT3"))
+    def test_low_bit_custom_kernel_formats_are_not_registered(self):
+        for name in ("INT2", "INT3", "NVINT2", "NVINT3", "NVFP3"):
+            with self.assertRaises(KeyError):
+                fr.get_format(name)
 
     def test_source_fp8_uses_2d_scale_blocks(self):
         spec = fr.get_format("FP8_SOURCE")

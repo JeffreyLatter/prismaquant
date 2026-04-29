@@ -11,11 +11,15 @@ the resulting weights would silently corrupt the model.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
 from prismaquant.halo import (
+    apply_halo_to_head,
+    apply_halo_to_layer,
     apply_halo_rotation,
     default_block_specs,
     fold_gamma_into_linears,
@@ -36,6 +40,11 @@ def test_hadamard_matrix_orthogonal_pow2():
             f"Hadamard d={d} not orthogonal"
         assert torch.allclose(H.t() @ H, I, atol=1e-9), \
             f"Hadamard d={d} not orthogonal (transpose)"
+
+
+def test_hadamard_matrix_rejects_non_power_of_two():
+    with pytest.raises(ValueError, match="power-of-2"):
+        hadamard_matrix(12)
 
 
 def test_random_hadamard_orthogonal():
@@ -225,3 +234,42 @@ def test_halo_actually_changes_weights():
         "q_proj weight unchanged — rotation didn't apply"
     assert not torch.allclose(o_before, o_after), \
         "o_proj weight unchanged — rotation didn't apply"
+
+
+def test_streaming_layer_halo_strict_rejects_unsupported_topology():
+    model = nn.Module()
+    model.layer = nn.Module()
+    with pytest.raises(RuntimeError, match="no supported standard"):
+        apply_halo_to_layer(model, model.layer, "layer", torch.eye(8))
+
+
+def test_head_halo_strict_rejects_tied_embeddings():
+    class _HeadOnly(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.embed_tokens = nn.Embedding(16, 8)
+            self.lm_head = nn.Linear(8, 16, bias=False)
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+    with pytest.raises(RuntimeError, match="tied"):
+        apply_halo_to_head(
+            _HeadOnly(), torch.eye(8), final_norm_qname=None)
+
+
+def test_export_halo_validator_rejects_unsupported_configs():
+    from prismaquant.export_native_compressed import (
+        _validate_halo_export_support,
+    )
+
+    default_profile = SimpleNamespace(name="default", has_mtp=lambda: False)
+    qwen35_profile = SimpleNamespace(name="qwen3_5", has_mtp=lambda: False)
+    tied_cfg = SimpleNamespace(hidden_size=64, tie_word_embeddings=True)
+    untied_cfg = SimpleNamespace(hidden_size=64, tie_word_embeddings=False)
+
+    with pytest.raises(RuntimeError, match="tied embeddings"):
+        _validate_halo_export_support(default_profile, tied_cfg, 64)
+    with pytest.raises(RuntimeError, match="profile 'qwen3_5'"):
+        _validate_halo_export_support(qwen35_profile, untied_cfg, 64)
+    with pytest.raises(RuntimeError, match="power-of-2"):
+        _validate_halo_export_support(default_profile, untied_cfg, 96)

@@ -47,13 +47,14 @@ import torch.nn as nn
 
 def hadamard_matrix(d: int, device: torch.device | str = "cpu",
                     dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Sylvester-construction Hadamard matrix when `d` is a power of 2;
-    falls back to randomized orthogonal matrix otherwise.
+    """Sylvester-construction Hadamard matrix for power-of-2 dimensions.
 
     Sylvester construction is deterministic and gives exactly ±1/sqrt(d)
     entries — preserves the Hadamard property `H @ H.T = I` exactly in
     floating point.
     """
+    if d <= 0:
+        raise ValueError(f"Hadamard dimension must be positive; got {d}")
     if d & (d - 1) == 0:  # d is a power of 2
         h = torch.tensor([[1.0]], device=device, dtype=dtype)
         size = 1
@@ -64,12 +65,10 @@ def hadamard_matrix(d: int, device: torch.device | str = "cpu",
             ], dim=0)
             size *= 2
         return h / math.sqrt(d)
-    # Non-power-of-2: random orthogonal via QR.
-    g = torch.Generator(device=device)
-    g.manual_seed(0)
-    A = torch.randn(d, d, generator=g, device=device, dtype=dtype)
-    Q, _ = torch.linalg.qr(A)
-    return Q
+    raise ValueError(
+        f"HALO random Hadamard requires a power-of-2 dimension; got {d}. "
+        "Non-power-of-2 dense QR fallback is intentionally disabled for "
+        "streaming export.")
 
 
 def random_hadamard(d: int, seed: int = 0,
@@ -387,7 +386,8 @@ def block_specs_for_layer(layer_mod: nn.Module, layer_qname: str,
 
 
 def apply_halo_to_layer(model: nn.Module, layer_mod: nn.Module,
-                        layer_qname: str, R: torch.Tensor) -> int:
+                        layer_qname: str, R: torch.Tensor, *,
+                        strict: bool = True) -> int:
     """Apply HALO rotation to a single layer's modules in-place.
 
     Folds input_layernorm and post_attention_layernorm gammas into
@@ -400,24 +400,37 @@ def apply_halo_to_layer(model: nn.Module, layer_mod: nn.Module,
     """
     dim = R.shape[0]
     specs = block_specs_for_layer(layer_mod, layer_qname, dim)
+    if not specs:
+        if strict:
+            raise RuntimeError(
+                f"[halo] {layer_qname}: no supported standard "
+                "attention/MLP rotation sites. HALO currently supports "
+                "standard dense transformer layers only.")
+        return 0
     n = 0
     for bspec in specs:
-        # 1. Fold gamma first.
-        fold_gamma_into_linears(model, bspec.norm_qname, bspec.input_linears)
-        # 2. Right-rotate input linears, left-rotate output linears.
-        for q in bspec.input_linears:
-            _right_rotate_linear(model, q, R)
-            n += 1
-        for q in bspec.output_linears:
-            _left_rotate_linear(model, q, R)
-            n += 1
+        try:
+            # 1. Fold gamma first.
+            fold_gamma_into_linears(model, bspec.norm_qname, bspec.input_linears)
+            # 2. Right-rotate input linears, left-rotate output linears.
+            for q in bspec.input_linears:
+                _right_rotate_linear(model, q, R)
+                n += 1
+            for q in bspec.output_linears:
+                _left_rotate_linear(model, q, R)
+                n += 1
+        except (AttributeError, IndexError, KeyError, ValueError) as exc:
+            if strict:
+                raise RuntimeError(
+                    f"[halo] failed rotating {bspec.name}: {exc}") from exc
     return n
 
 
 def apply_halo_to_head(model: nn.Module, R: torch.Tensor, *,
                        embed_qname: str = "model.embed_tokens",
                        lm_head_qname: str = "lm_head",
-                       final_norm_qname: str | None = "model.norm"
+                       final_norm_qname: str | None = "model.norm",
+                       strict: bool = True,
                        ) -> int:
     """Apply HALO rotation to embedding + final_norm + lm_head.
 
@@ -428,21 +441,49 @@ def apply_halo_to_head(model: nn.Module, R: torch.Tensor, *,
     Returns the count of head tensors rotated.
     """
     n = 0
+    try:
+        embed = _get_module_by_qname(model, embed_qname)
+        head = _get_module_by_qname(model, lm_head_qname)
+        tied = (
+            hasattr(embed, "weight")
+            and hasattr(head, "weight")
+            and (
+                embed.weight is head.weight
+                or embed.weight.data_ptr() == head.weight.data_ptr()
+            )
+        )
+        if tied:
+            raise ValueError(
+                f"{embed_qname}.weight and {lm_head_qname}.weight are tied")
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        if strict:
+            raise RuntimeError(
+                f"[halo] unsupported head topology for embed={embed_qname} "
+                f"lm_head={lm_head_qname}: {exc}") from exc
+        return n
+
     if final_norm_qname:
         try:
             fold_gamma_into_linears(model, final_norm_qname, [lm_head_qname])
-        except (AttributeError, ValueError):
-            pass
+        except (AttributeError, IndexError, KeyError, ValueError) as exc:
+            if strict:
+                raise RuntimeError(
+                    f"[halo] failed folding final norm {final_norm_qname} "
+                    f"into {lm_head_qname}: {exc}") from exc
     try:
         _right_rotate_embedding(model, embed_qname, R)
         n += 1
-    except (AttributeError, ValueError):
-        pass
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        if strict:
+            raise RuntimeError(
+                f"[halo] failed rotating embedding {embed_qname}: {exc}") from exc
     try:
         _right_rotate_linear(model, lm_head_qname, R)
         n += 1
-    except (AttributeError, ValueError):
-        pass
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        if strict:
+            raise RuntimeError(
+                f"[halo] failed rotating lm_head {lm_head_qname}: {exc}") from exc
     return n
 
 

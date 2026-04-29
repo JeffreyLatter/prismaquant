@@ -136,91 +136,56 @@ def _round_to_codebook(values_in_grid: torch.Tensor) -> torch.Tensor:
     return abs_idx + sign_bit                # [..., shape]; values 0-15
 
 
-INT2_MAX = 1   # symmetric: codes in {-2, -1, 0, 1} from (1<<(2-1))-1
-INT3_MAX = 3   # symmetric: codes in {-4, ..., 3}
-
-
 def _canonical_export_format(fmt: str) -> str:
-    return {"NVINT2": "INT2", "NVINT3": "INT3"}.get(fmt, fmt)
+    return fmt
 
 
-def pack_int2(signed: torch.Tensor, last_dim: int) -> torch.Tensor:
-    """Pack signed 2-bit ints ({-2,-1,0,1}) into uint8, 4 values per byte.
+def _resolve_act_clip_quantile(default: str = "0.999") -> float | None:
+    """Return the effective activation-clip quantile for GPTQ scoring."""
+    raw = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE", default)
+    if not raw:
+        return None
+    try:
+        q = float(raw)
+    except ValueError:
+        return None
+    return q if 0.0 < q < 1.0 else None
 
-    Storage layout: LSB-first within each byte. Value i occupies bits
-    [2i, 2i+1] of its byte. Value is stored as two's-complement-2bit
-    (the sign bit is bit 1).
+
+def _activation_matrix_for_gptq(
+    activations: torch.Tensor,
+    cols: int,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Flatten activations and apply the same optional clipping used by GPTQ.
+
+    This is intentionally shared by the Hessian build, damping sweep
+    evaluator, and do-no-harm gate. Mixing clipped optimization with
+    unclipped local gates caused the full quality-win stack to undo part
+    of the activation-clipping gain.
     """
-    if last_dim % 4 != 0:
-        raise ValueError(f"INT2 pack requires last dim divisible by 4; got {last_dim}")
-    # Map signed -> unsigned 2-bit (two's complement: -2->0b10, -1->0b11, 0->0b00, 1->0b01).
-    u = (signed.to(torch.int32) & 0b11).to(torch.uint8)
-    q = u.reshape(*signed.shape[:-1], last_dim // 4, 4)
-    return (q[..., 0] | (q[..., 1] << 2) | (q[..., 2] << 4) | (q[..., 3] << 6)).to(torch.uint8)
+    X = activations.detach().to(torch.float32)
+    if device is not None:
+        X = X.to(device)
+    X = X.reshape(-1, cols)
+    q = _resolve_act_clip_quantile()
+    if q is not None and X.numel() > 0:
+        thresh = X.abs().quantile(q, dim=1, keepdim=True)
+        X = X.clamp(min=-thresh, max=thresh)
+    return X
 
 
-def pack_int3(signed: torch.Tensor, last_dim: int) -> torch.Tensor:
-    """Pack signed 3-bit ints ({-4..3}) into uint8, 8 values per 3 bytes.
-
-    Bitstream LSB-first: value i occupies bits [3i, 3i+2] of the
-    flattened bitstream. Last dim must be divisible by 8 for clean
-    byte-aligned packing (3 * 8 = 24 bits = 3 bytes per group of 8).
-    """
-    if last_dim % 8 != 0:
-        raise ValueError(f"INT3 pack requires last dim divisible by 8; got {last_dim}")
-    # 3-bit two's-complement (int range [-4, 3]; we store 0b000..0b111).
-    u = (signed.to(torch.int32) & 0b111).to(torch.int32)
-    leading = signed.shape[:-1]
-    groups = u.reshape(*leading, last_dim // 8, 8).to(torch.int32)
-    b0 = (groups[..., 0] | (groups[..., 1] << 3) | ((groups[..., 2] & 0b011) << 6)).to(torch.uint8)
-    b1 = (((groups[..., 2] >> 2) & 0b001) | (groups[..., 3] << 1) | (groups[..., 4] << 4)
-          | ((groups[..., 5] & 0b001) << 7)).to(torch.uint8)
-    b2 = (((groups[..., 5] >> 1) & 0b011) | (groups[..., 6] << 2) | (groups[..., 7] << 5)).to(torch.uint8)
-    # Stack the three bytes per group into the packed byte stream, last-dim first.
-    packed = torch.stack([b0, b1, b2], dim=-1).reshape(*leading, last_dim * 3 // 8)
-    return packed.to(torch.uint8)
-
-
-def quantize_dequantize_int(
-    weight: torch.Tensor, bits: int, group_size: int = 16,
-    global_real_override: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Symmetric-int quantizer with the NVFP4-style scale envelope.
-
-    Returns `(weight_packed, weight_scale_fp8, weight_global_scale)`:
-      - weight_packed: uint8, bit-packed signed ints (2 or 3 bits each)
-      - weight_scale_fp8: fp8_e4m3fn per-group, shape [rows, n_groups]
-      - weight_global_scale: fp32 scalar (divisor convention, 1/global_real)
-
-    vLLM loader reconstructs: w_fp32[g,i] ≈ code[g,i] * scale_fp8[g] * global_real.
-    The decode-to-NVFP4 path then re-rounds those fp32 values to the
-    NVFP4 E2M1 grid and runs the existing NVFP4 GEMM kernel.
-    """
-    if bits not in (2, 3):
-        raise ValueError(f"INT quantization only supports bits=2 or 3; got {bits}")
-    rows, cols = weight.shape
-    if cols % group_size != 0:
-        raise ValueError(f"INT{bits} group_size={group_size} ∤ {cols}")
-    int_max = INT2_MAX if bits == 2 else INT3_MAX
-    int_min = -(int_max + 1)
-    n_groups = cols // group_size
-    grouped = weight.float().reshape(rows, n_groups, group_size)
-    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
-    s_g_real = max_abs / int_max
-    if global_real_override is not None:
-        global_real = global_real_override.to(weight.device).clamp_min(1e-12)
-    else:
-        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
-    fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
-    q = torch.round(grouped / s_g_real.unsqueeze(-1).clamp_min(1e-12)).clamp(int_min, int_max)
-    q = q.to(torch.int8)
-    packer = pack_int2 if bits == 2 else pack_int3
-    weight_packed = packer(q.reshape(rows, cols), cols)
-    return (
-        weight_packed,
-        fp8_scale_real.to(torch.float8_e4m3fn),
-        (1.0 / global_real).to(torch.float32).reshape(1),
-    )
+def _activation_col_importance_for_gptq(
+    activations: torch.Tensor,
+    cols: int,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    X = _activation_matrix_for_gptq(activations, cols, device=device)
+    if X.numel() == 0:
+        return torch.ones(cols, device=device, dtype=torch.float32)
+    return X.pow(2).mean(dim=0).clamp_min(1e-12)
 
 
 def pack_fp4_indices(fp4_indices: torch.Tensor, last_dim: int) -> torch.Tensor:
@@ -271,6 +236,7 @@ _INPUT_GLOBAL_SCALES: dict[str, float] | None = None
 # (lazily upcast from the on-disk bfloat16 for numerical stability
 # during Hessian + per-channel stats). None means "not loaded".
 _CACHED_ACTIVATIONS: object | None = None
+_ACTIVATION_CACHE_FINGERPRINT: dict[str, object] | None = None
 
 
 class _LazyActivationCache:
@@ -297,6 +263,32 @@ class _LazyActivationCache:
             return None
         self.loads += 1
         return self.index.load(name).to(torch.float32)
+
+
+def _activation_index_fingerprint(index, cache_dir: Path) -> dict[str, object]:
+    """Cheap cache identity for export-cache invalidation.
+
+    The layer export cache stores quantized tensors whose values depend
+    on activation-cache contents. Hash names plus file size/mtime so
+    changing the activation cache or pointing at a different cache dir
+    invalidates stale layer_NNN.pt files without reading tensor bytes.
+    """
+    import hashlib
+    import json as _json
+
+    paths = getattr(index, "_paths", {})
+    rows = []
+    for name, path in sorted(paths.items()):
+        st = path.stat()
+        rows.append([name, path.name, st.st_size, st.st_mtime_ns])
+    digest = hashlib.sha256(
+        _json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    return {
+        "path": str(cache_dir.resolve()),
+        "n_files": len(rows),
+        "hash": digest,
+    }
 
 # Module-level flag bundle that controls which activation-aware
 # passes run when `_quantize_2d` is invoked from main()'s streaming
@@ -768,25 +760,14 @@ def _gptq_obs_rounding_nvfp4(
     if cols % group_size != 0:
         raise ValueError(f"GPTQ requires group_size={group_size} ∤ {cols}")
 
-    X = activations.detach().to(torch.float32).reshape(-1, cols)
     # #42: per-token activation clipping to reduce Hessian condition
     # number. PRISMAQUANT_ACT_CLIP_QUANTILE in (0,1) clamps each token's
     # activations to ±|q-th percentile| of |x|. 0.999 removes ~4 extreme
     # outliers per 4k-dim row; condition number drops materially with
-    # near-zero impact on bulk distribution. Only affects the H used
-    # for the OBS solve — error measurement in the swept wrapper uses
-    # unclipped X for fair candidate comparison.
-    # Default 0.999 (validated on Qwen3-0.6B audit: −0.91 PPL alone
-    # vs no-clip baseline). Set "0" or out-of-range to disable.
-    _clip_q_str = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999")
-    if _clip_q_str:
-        try:
-            _clip_q = float(_clip_q_str)
-        except ValueError:
-            _clip_q = 1.0
-        if 0.0 < _clip_q < 1.0:
-            thresh = X.abs().quantile(_clip_q, dim=1, keepdim=True)
-            X = X.clamp(min=-thresh, max=thresh)
+    # near-zero impact on bulk distribution. Set "0" or out-of-range to
+    # disable. The same clipped matrix is used by local gates/sweeps so
+    # those gates score the objective the candidate was optimized under.
+    X = _activation_matrix_for_gptq(activations, cols, device=W.device)
     # H = X^T X; guard against near-zero diagonal (dead channels).
     H = X.t() @ X                                         # [in, in]
     diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
@@ -904,7 +885,8 @@ def _gptq_obs_rounding_nvfp4_swept(
     successful pass; if all fail, we return the unswept fallback.
     """
     W_orig = weight.to(torch.float32)
-    X = activations.detach().to(torch.float32).reshape(-1, weight.shape[1])
+    X = _activation_matrix_for_gptq(
+        activations, weight.shape[1], device=weight.device)
     H_full = X.t() @ X  # [in, in], shared evaluator
 
     best_w = None
@@ -1361,15 +1343,6 @@ def canonicalize_format(scheme_dict: dict | str | int) -> str:
             if int(scheme_dict.get("group_size", 0)) == 128:
                 return "FP8_SOURCE"
             return "MXFP8"
-        # Low-bit INT / NVFP3 (load-time dequant to NVFP4 at serve time).
-        # Emit the low-bit name here so downstream packer writes the
-        # narrow payload; the vLLM loader expands to NVFP4 on load.
-        if dt == "int" and bits == 2:
-            return "INT2"
-        if dt == "int" and bits == 3:
-            return "INT3"
-        if dt == "fp3_e2m0" and bits == 3:
-            return "NVFP3"
         # MXFP6 variants (load-time dequant to MXFP8).
         if dt in ("mx_fp", "fp6_e3m2") and bits == 6:
             return "MXFP6_E3M2"
@@ -1382,10 +1355,6 @@ def canonicalize_format(scheme_dict: dict | str | int) -> str:
             return "NVFP4"
         if s in ("mxfp8", "fp8", "8"):
             return "MXFP8"
-        if s in ("int2", "nvint2", "2"):
-            return "INT2"
-        if s in ("int3", "nvint3", "3"):
-            return "INT3"
         if s in ("bf16", "bfloat16", "16"):
             return "BF16"
     if isinstance(scheme_dict, int):
@@ -1970,9 +1939,8 @@ def _quantize_2d(
                     w_orig_f, group_size=16,
                     global_real_override=nvfp4_global_real_override,
                 )
-                a2 = (acts.detach().to(torch.float32)
-                      .reshape(-1, w_orig_f.shape[1])
-                      .pow(2).mean(dim=0).clamp_min(1e-12))
+                a2 = _activation_col_importance_for_gptq(
+                    acts, w_orig_f.shape[1], device=w_orig_f.device)
                 mse_rtn = float((a2 * (w_orig_f - w_rtn).pow(2)
                                  .sum(dim=0)).sum())
                 mse_work = float((a2 * (w_orig_f - w_work).pow(2)
@@ -2040,55 +2008,7 @@ def _quantize_2d(
         return {"weight": w, "weight_scale": ws}
     if fmt == "BF16":
         return {"weight": weight.to(torch.bfloat16)}
-    if fmt in ("INT2", "INT3"):
-        # Low-bit symmetric-int with NVFP4-style scale envelope.
-        # Stored as bit-packed uint8 + fp8 per-group scale + fp32 global.
-        # vLLM loader decodes to NVFP4 at process_weights_after_loading
-        # and runs the NVFP4 GEMM kernel unchanged.
-        w_work = weight.to(torch.float32)
-        # Act-aware passes are noisy at 2/3-bit — keep RTN only.
-        bits = 2 if fmt == "INT2" else 3
-        wp, ws, wg = quantize_dequantize_int(
-            w_work, bits=bits, group_size=16,
-            global_real_override=nvfp4_global_real_override,
-        )
-        return {
-            "weight_packed": wp,
-            "weight_scale": ws,
-            "weight_global_scale": wg,
-        }
     raise ValueError(f"unsupported format: {fmt}")
-
-
-def _quantize_int_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tensor]:
-    """Per-expert INT2/INT3 packing for a 3D `[E, M, N]` tensor.
-
-    Each expert gets its own global scale (so weight_global_scale has
-    shape [E]). Mirrors `quantize_dequantize_nvfp4_packed` structure.
-    """
-    fmt = _canonical_export_format(fmt)
-    bits = 2 if fmt == "INT2" else 3
-    int_max = INT2_MAX if bits == 2 else INT3_MAX
-    int_min = -(int_max + 1)
-    group_size = 16
-    E, M, N = packed.shape
-    if N % group_size != 0:
-        raise ValueError(f"{fmt} group_size={group_size} ∤ {N}")
-    n_groups = N // group_size
-    grouped = packed.float().reshape(E, M, n_groups, group_size)
-    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
-    s_g_real = max_abs / int_max
-    global_real = (s_g_real.amax(dim=(-2, -1)) / FP8_E4M3_MAX).clamp_min(1e-12)  # [E]
-    fp8_scale_real = (s_g_real / global_real.view(E, 1, 1)).clamp(0, FP8_E4M3_MAX)
-    q = torch.round(grouped / s_g_real.unsqueeze(-1).clamp_min(1e-12)).clamp(int_min, int_max)
-    q = q.to(torch.int8).reshape(E, M, N)
-    packer = pack_int2 if bits == 2 else pack_int3
-    weight_packed = packer(q, N)  # [E, M, packed_cols]
-    return {
-        "weight_packed": weight_packed,
-        "weight_scale": fp8_scale_real.to(torch.float8_e4m3fn),
-        "weight_global_scale": (1.0 / global_real).to(torch.float32),
-    }
 
 
 def _quantize_3d_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tensor]:
@@ -2113,8 +2033,6 @@ def _quantize_3d_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tenso
     if fmt == "MXFP8":
         w, ws = quantize_dequantize_mxfp8_packed(packed, group_size=32)
         return {"weight": w, "weight_scale": ws}
-    if fmt in ("INT2", "INT3"):
-        return _quantize_int_packed(packed, fmt)
     raise ValueError(f"unsupported format for packed-MoE: {fmt}")
 
 
@@ -2171,8 +2089,6 @@ def _quantize_2d_group_same_shape(
             "same-shape export grouping expects [B, out, in] weights; "
             f"got shape={tuple(stacked_weights.shape)}"
         )
-    if fmt in ("INT2", "INT3"):
-        return _quantize_int_packed(stacked_weights.to(torch.float32), fmt)
     if fmt == "MXFP8":
         w, ws = quantize_dequantize_mxfp8_packed(
             stacked_weights.to(torch.float32), group_size=32,
@@ -2297,9 +2213,8 @@ def _quantize_2d_nvfp4_group_batched(
                 if a is None or a.numel() == 0:
                     col_imp[j] = 1.0
                 else:
-                    col_imp[j] = a.detach().to(
-                        device, dtype=torch.float32
-                    ).reshape(-1, weights.shape[2]).pow(2).mean(dim=0).clamp_min(1e-12)
+                    col_imp[j] = _activation_col_importance_for_gptq(
+                        a, weights.shape[2], device=device)
             for damp in damp_candidates:
                 cand_w = gptq_obs_rounding_nvfp4_batched(
                     weights, acts_list,
@@ -2350,9 +2265,8 @@ def _quantize_2d_nvfp4_group_batched(
                 if a is None or a.numel() == 0:
                     col_imp[j] = 1.0
                 else:
-                    col_imp[j] = a.detach().to(
-                        device, dtype=torch.float32
-                    ).reshape(-1, weights.shape[2]).pow(2).mean(dim=0).clamp_min(1e-12)
+                    col_imp[j] = _activation_col_importance_for_gptq(
+                        a, weights.shape[2], device=device)
                     n_acts_avail += 1
             n_reverted = 0
             for i in range(n):
@@ -2807,6 +2721,7 @@ def materialize_tensors_streaming(
             embed_qname=_embed_qname,
             lm_head_qname=profile.lm_head_name(),
             final_norm_qname=_final_norm_qname,
+            strict=True,
         )
         print(f"[halo] head rotation: {n_head} tensors "
               f"(embed={_embed_qname}, norm={_final_norm_qname})",
@@ -2916,13 +2831,15 @@ def materialize_tensors_streaming(
             "PRISMAQUANT_DO_NO_HARM": os.environ.get(
                 "PRISMAQUANT_DO_NO_HARM", "1"),
             "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
-                "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
+                "PRISMAQUANT_GPTQ_DAMP_SWEEP", "1"),
             "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
-                "PRISMAQUANT_ACT_CLIP_QUANTILE", ""),
+                "PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999"),
             "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(
                 "PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1"),
             "PRISMAQUANT_BATCHED_NVFP4_EXPORT": os.environ.get(
-                "PRISMAQUANT_BATCHED_NVFP4_EXPORT", ""),
+                "PRISMAQUANT_BATCHED_NVFP4_EXPORT", "1"),
+            "ACT_AWARE_FLAGS": dict(sorted(_ACT_AWARE_FLAGS.items())),
+            "activation_cache_fingerprint": _ACTIVATION_CACHE_FINGERPRINT,
         }
         # Hash the assignment dict (layer_config recipe) too — recipe
         # changes invalidate per-Linear quantization output.
@@ -3021,7 +2938,7 @@ def materialize_tensors_streaming(
         if halo_R is not None:
             from .halo import apply_halo_to_layer
             n_rotated = apply_halo_to_layer(model, layer_mod, layer_qname,
-                                            halo_R)
+                                            halo_R, strict=True)
             if n_rotated:
                 print(f"[halo] layer {L:02d}: rotated {n_rotated} linears",
                       flush=True)
@@ -3218,7 +3135,7 @@ def materialize_tensors_streaming(
                 covered.add(full)
                 continue
 
-            if fmt in ("INT2", "INT3", "MXFP8") and mod.weight.dim() == 2:
+            if fmt == "MXFP8" and mod.weight.dim() == 2:
                 shape = (int(mod.weight.shape[0]), int(mod.weight.shape[1]))
                 grouped_linears[(fmt, shape)].append((full, emit_full, recipe_key, mod))
                 continue
@@ -3260,7 +3177,7 @@ def materialize_tensors_streaming(
                 )
                 _BLOCK_COMPUTE_PENDING.append({
                     "full": full, "emit_full": emit_full,
-                    "sub_leaf": sub_leaf, "mod": mod,
+                    "sub_name": sub_name, "sub_leaf": sub_leaf, "mod": mod,
                     "compute_dict": compute_dict, "fmt": fmt,
                 })
                 continue  # skip immediate emit; finalized post-loop
@@ -3341,6 +3258,7 @@ def materialize_tensors_streaming(
         if _BLOCK_COMPUTE_PENDING:
             try:
                 from .block_output_match import (
+                    block_output_mse,
                     make_attention_block_spec, make_mlp_block_spec,
                     refine_block_scales,
                 )
@@ -3377,11 +3295,15 @@ def materialize_tensors_streaming(
                 # picks the per-Linear scale that minimizes block MSE.
                 cands = [torch.tensor(s) for s in (0.95, 1.0, 1.05)]
 
-                def _apply_refined_scales(spec_factory, cal_input):
+                block_logs: list[str] = []
+
+                def _apply_refined_scales(label: str, spec_factory, cal_input):
                     if cal_input is None:
+                        block_logs.append(f"{label}=no_cal")
                         return
-                    spec = spec_factory(layer_mod, layer_qname)
-                    if spec is None:
+                    ref_spec = spec_factory(layer_mod, layer_qname)
+                    if ref_spec is None:
+                        block_logs.append(f"{label}=no_spec")
                         return
                     # Cap the cal_input to a small batch to keep refinement fast.
                     ci = cal_input.to(layer_mod.input_layernorm.weight.device
@@ -3391,25 +3313,81 @@ def materialize_tensors_streaming(
                         ci = ci[:32]
                     elif ci.dim() == 3:
                         ci = ci[:8]
+                    run_dtype = next(
+                        (p["mod"].weight.dtype for p in _BLOCK_COMPUTE_PENDING
+                         if p["mod"].weight.dtype.is_floating_point),
+                        torch.float32,
+                    )
+                    ci_run = ci.to(dtype=run_dtype)
+                    # Full-precision reference first, while the live layer
+                    # still holds original weights. Earlier code built the
+                    # reference and candidates from the same live weights,
+                    # making scale=1.0 perfect and the pass a silent no-op.
                     with torch.no_grad():
-                        ref = spec.forward_fn(ci.float()).float().clone()
-                    candidates = {ln: cands for ln in spec.linears}
-                    refine_block_scales(spec, ci.float(), ref, candidates,
-                                        max_passes=2)
-                    # Read back refined per-Linear scales and apply to
-                    # the corresponding compute_dict's _w_dq.
-                    for ln in spec.linears:
-                        s = float(spec.scale_getter(ln))
-                        if abs(s - 1.0) < 1e-8:
-                            continue  # no change
+                        ref = ref_spec.forward_fn(ci_run).float().clone()
+
+                    touched: list[dict] = []
+                    for ln in ref_spec.linears:
                         p = pending_by_sub.get(ln)
                         if p is None:
                             continue
-                        p["compute_dict"]["_w_dq"] = (
-                            p["compute_dict"]["_w_dq"] * s)
+                        mod = p["mod"]
+                        touched.append(p)
+                        q_weight = p["compute_dict"]["_w_dq"].to(
+                            device=mod.weight.device, dtype=mod.weight.dtype)
+                        mod.weight.data.copy_(q_weight)
 
-                _apply_refined_scales(make_attention_block_spec, cal_input_attn)
-                _apply_refined_scales(make_mlp_block_spec, cal_input_mlp)
+                    if not touched:
+                        block_logs.append(f"{label}=no_pending")
+                        return
+
+                    try:
+                        spec = spec_factory(layer_mod, layer_qname)
+                        if spec is None:
+                            block_logs.append(f"{label}=lost_spec")
+                            return
+                        candidates = {
+                            ln: cands for ln in spec.linears
+                            if ln in pending_by_sub
+                        }
+                        before = block_output_mse(spec, ci_run, ref)
+                        final = refine_block_scales(
+                            spec, ci_run, ref, candidates, max_passes=2)
+                        n_changed = 0
+                        n_eval = 0
+                        for ln in spec.linears:
+                            p = pending_by_sub.get(ln)
+                            if p is None:
+                                continue
+                            n_eval += len(cands) * 2
+                            s = float(spec.scale_getter(ln))
+                            if abs(s - 1.0) < 1e-8:
+                                continue
+                            p["compute_dict"]["_w_dq"] = (
+                                p["compute_dict"]["_w_dq"] * s)
+                            n_changed += 1
+                        block_logs.append(
+                            f"{label}=spec evals={n_eval} "
+                            f"changed={n_changed} "
+                            f"mse={before:.3e}->{final:.3e}")
+                    finally:
+                        for p in touched:
+                            snap = _FP16_BLOCK_SNAPSHOTS.get(p["sub_name"])
+                            if snap is not None:
+                                p["mod"].weight.data.copy_(
+                                    snap.to(device=p["mod"].weight.device,
+                                            dtype=p["mod"].weight.dtype))
+
+                _apply_refined_scales(
+                    "attn", make_attention_block_spec, cal_input_attn)
+                _apply_refined_scales(
+                    "mlp", make_mlp_block_spec, cal_input_mlp)
+                print(
+                    f"[block-output-match] {layer_qname}: "
+                    f"pending={len(_BLOCK_COMPUTE_PENDING)} "
+                    + " ".join(block_logs),
+                    flush=True,
+                )
 
             except Exception as e:
                 print(f"[block-output-match] WARN refinement failed for "
@@ -3859,35 +3837,6 @@ MXFP8_SCHEME = {
         "zp_dtype": "torch.uint8",
     },
 }
-# INT2 / INT3: symmetric-int weights with the NVFP4 scale envelope
-# (group=16, FP8 per-group scale, FP32 per-tensor global). vLLM's
-# loader scheme decodes to NVFP4 at
-# load time and serves through the existing NVFP4 GEMM kernel. No
-# activation quantization (W{2,3}A16) — activations stay BF16.
-# Use the generic "pack-quantized" format string so compressed-tensors'
-# format whitelist accepts the group. The actual INT decode is picked
-# by vLLM's dispatcher based on weight args (type=int, num_bits=2/3,
-# strategy=tensor_group, scale_dtype=fp8_e4m3fn).
-INT2_SCHEME = {
-    "format": "pack-quantized",
-    "weights": {
-        "num_bits": 2, "type": "int", "strategy": "tensor_group",
-        "group_size": 16, "symmetric": True, "dynamic": False,
-        "scale_dtype": "torch.float8_e4m3fn",
-        "zp_dtype": "torch.float8_e4m3fn",
-        "observer": "memoryless_minmax",
-    },
-}
-INT3_SCHEME = {
-    "format": "pack-quantized",
-    "weights": {
-        "num_bits": 3, "type": "int", "strategy": "tensor_group",
-        "group_size": 16, "symmetric": True, "dynamic": False,
-        "scale_dtype": "torch.float8_e4m3fn",
-        "zp_dtype": "torch.float8_e4m3fn",
-        "observer": "memoryless_minmax",
-    },
-}
 # Source-FP8 passthrough. Emitted for Linears whose source checkpoint
 # already stores `.weight` as fp8_e4m3fn + `.weight_scale_inv` fp32 at
 # 128×128 block granularity (MiniMax-M2/M2.7, DeepSeek V3, several
@@ -4033,10 +3982,6 @@ def _bf16_packed_expert_ignore_regex(
 FORMAT_SCHEME = {
     "NVFP4": NVFP4_SCHEME,
     "MXFP8": MXFP8_SCHEME,
-    "INT2": INT2_SCHEME,
-    "INT3": INT3_SCHEME,
-    "NVINT2": INT2_SCHEME,
-    "NVINT3": INT3_SCHEME,
     "FP8_SOURCE": FP8_SOURCE_SCHEME,
 }
 
@@ -4318,7 +4263,7 @@ def build_quantization_config(
 def _canonicalize_assignment(raw: dict) -> dict[str, str]:
     """Accept either AutoRound-style dicts (`{key: {bits: 4, data_type: nv_fp,
     ...}}`) or shorthand (`{key: "NVFP4"}`). Return `{key: fmt_str}` with
-    fmt in {"NVFP4", "MXFP8", "INT2", "INT3", "FP8_SOURCE", "BF16"}."""
+    fmt in {"NVFP4", "MXFP8", "FP8_SOURCE", "BF16"}."""
     out: dict[str, str] = {}
     for k, v in raw.items():
         name = _strip_weight(k)
@@ -4412,7 +4357,86 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
     return extra_ignore
 
 
+def _cfg_value(obj, key: str):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _cfg_path_value(cfg, path: str):
+    cur = cfg
+    for part in path.split("."):
+        cur = _cfg_value(cur, part)
+        if cur is None:
+            return None
+    return cur
+
+
+def _halo_hidden_from_config(cfg) -> tuple[int | None, str | None]:
+    for path in (
+        "hidden_size",
+        "text_config.hidden_size",
+        "language_model_config.hidden_size",
+        "llm_config.hidden_size",
+    ):
+        val = _cfg_path_value(cfg, path)
+        if isinstance(val, int) and val > 0:
+            return val, path
+    return None, None
+
+
+def _halo_config_bool(cfg, key: str) -> bool:
+    for path in (
+        key,
+        f"text_config.{key}",
+        f"language_model_config.{key}",
+        f"llm_config.{key}",
+    ):
+        val = _cfg_path_value(cfg, path)
+        if val is not None:
+            return bool(val)
+    return False
+
+
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _validate_halo_export_support(profile, cfg, hidden: int) -> None:
+    """Fail fast for HALO topologies this exporter cannot rotate safely."""
+    if not _is_power_of_two(hidden):
+        raise RuntimeError(
+            f"[halo] random mode requires power-of-2 hidden_size; got "
+            f"{hidden}. Dense QR fallback is disabled because it is slow "
+            "and changes the intended Hadamard structure. Disable HALO "
+            "or add a structured padded/block Hadamard path.")
+    if _halo_config_bool(cfg, "tie_word_embeddings"):
+        raise RuntimeError(
+            "[halo] tied embeddings/lm_head are unsupported. HALO needs "
+            "separate embedding and lm_head rotations after final-norm "
+            "gamma folding; materialize an untied lm_head first or "
+            "disable HALO.")
+    if getattr(profile, "has_mtp", lambda: False)():
+        raise RuntimeError(
+            f"[halo] profile {profile.name!r} has MTP heads; HALO is "
+            "not wired for MTP residual/head rotations yet.")
+    supported = {"default", "qwen3"}
+    if getattr(profile, "name", None) not in supported:
+        raise RuntimeError(
+            f"[halo] profile {getattr(profile, 'name', '<unknown>')!r} "
+            "is not supported by generic HALO. Current support is limited "
+            "to standard dense transformer profiles with embed/layers/"
+            "final_norm/lm_head topology.")
+
+
 def main():
+    global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
+    _INPUT_GLOBAL_SCALES = None
+    _CACHED_ACTIVATIONS = None
+    _ACTIVATION_CACHE_FINGERPRINT = None
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
                     help="HF model dir (source safetensors + config.json)")
@@ -4548,8 +4572,10 @@ def main():
                          "Llama-class models. Critical: assumes standard "
                          "transformer block topology (input_layernorm + "
                          "q/k/v/o_proj, post_attention_layernorm + "
-                         "gate/up/down_proj). Profile-specific overrides "
-                         "needed for non-standard architectures.")
+                         "gate/up/down_proj), untied embeddings, and "
+                         "power-of-2 hidden_size. Profile-specific "
+                         "overrides needed for multimodal, MTP, MoE, or "
+                         "non-standard architectures.")
     ap.add_argument("--halo-seed", type=int, default=0,
                     help="RNG seed for HALO sign-diagonal in random "
                          "Hadamard. Saved alongside the artifact at "
@@ -4600,12 +4626,15 @@ def main():
     # act-aware pass is enabled.
     if args.activation_cache_dir:
         from .measure_quant_cost import ActivationIndex
-        global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS
         cache_dir = Path(args.activation_cache_dir)
         if not cache_dir.exists():
             print(f"[export-stream] WARN activation cache dir {cache_dir} "
                   f"missing; input_global_scale falls back to "
                   f"{DEFAULT_INPUT_GLOBAL_SCALE}", flush=True)
+            _ACTIVATION_CACHE_FINGERPRINT = {
+                "path": str(cache_dir.resolve()),
+                "missing": True,
+            }
         else:
             # Pull candidate names from the recipe — ActivationIndex
             # only loads for names that actually have a cached file.
@@ -4614,6 +4643,8 @@ def main():
             validate_layer_config_payload(_recipe_payload, args.layer_config)
             _recipe_names = list(_recipe_payload.keys())
             idx = ActivationIndex(cache_dir, _recipe_names)
+            _ACTIVATION_CACHE_FINGERPRINT = _activation_index_fingerprint(
+                idx, cache_dir)
             scales: dict[str, float] = {}
             for name in idx.names():
                 try:
@@ -4714,25 +4745,14 @@ def main():
     halo_R = None
     if args.halo_mode == "random":
         from .halo import random_hadamard
-        # Discover residual-stream dim from config. Multimodal configs
-        # (Qwen 3.5 4B, Gemma 4, etc.) nest hidden_size under text_config
-        # or language_model_config. Probe a few common locations.
         from transformers import AutoConfig as _AC
+
+        # Discover residual-stream dim from config. Multimodal configs
+        # nest hidden_size under text_config/language_model_config. The
+        # validator below rejects unsupported topologies before we spend
+        # time materializing heads or accidentally reusing a stale cache.
         _cfg = _AC.from_pretrained(args.model, trust_remote_code=True)
-        _hidden = None
-        for _path in ("hidden_size",
-                      "text_config.hidden_size",
-                      "language_model_config.hidden_size",
-                      "llm_config.hidden_size"):
-            _obj = _cfg
-            try:
-                for _part in _path.split("."):
-                    _obj = getattr(_obj, _part)
-                if isinstance(_obj, int) and _obj > 0:
-                    _hidden = _obj
-                    break
-            except AttributeError:
-                continue
+        _hidden, _hidden_path = _halo_hidden_from_config(_cfg)
         if _hidden is None:
             raise RuntimeError(
                 "[halo] cannot determine hidden_size from config — "
@@ -4740,9 +4760,10 @@ def main():
                 "hidden_size, text_config.hidden_size, "
                 "language_model_config.hidden_size, "
                 "llm_config.hidden_size.")
+        _validate_halo_export_support(profile, _cfg, _hidden)
         halo_R = random_hadamard(_hidden, seed=args.halo_seed)
         print(f"[halo] mode=random seed={args.halo_seed} "
-              f"dim={_hidden}", flush=True)
+              f"dim={_hidden} hidden_path={_hidden_path}", flush=True)
         # Persist R alongside the artifact for forensic reproducibility.
         os.makedirs(out_dir, exist_ok=True)
         torch.save({"R": halo_R.cpu(), "seed": args.halo_seed,
