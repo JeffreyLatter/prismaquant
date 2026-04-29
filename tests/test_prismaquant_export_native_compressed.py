@@ -1111,7 +1111,10 @@ class TestActivationAwarePasses(unittest.TestCase):
         )
         err_rtn = (ref - (W_rtn @ X.t())).pow(2).mean().item()
         err_aa = (ref - (W_aa @ X.t())).pow(2).mean().item()
-        self.assertLess(
+        # The do-no-harm gate (PRISMAQUANT_DO_NO_HARM=1, default on)
+        # reverts to RTN when act-aware passes don't improve, so the
+        # invariant is `err_aa <= err_rtn`, not strictly less.
+        self.assertLessEqual(
             err_aa, err_rtn,
             f"act-aware passes increased output error: "
             f"rtn={err_rtn:.4e} aa={err_aa:.4e}",
@@ -1145,6 +1148,13 @@ class TestActivationAwarePasses(unittest.TestCase):
         X[:, :16] *= 10.0
         saved_flags = dict(m._ACT_AWARE_FLAGS)
         saved_cache = m._CACHED_ACTIVATIONS
+        # Disable do-no-harm gate for this test: we're verifying the
+        # ACT-AWARE PASS dispatch, not the gate. The gate can revert
+        # to RTN when the random fixture happens not to benefit from
+        # GPTQ — masking the dispatch test.
+        import os
+        saved_dnh = os.environ.get("PRISMAQUANT_DO_NO_HARM")
+        os.environ["PRISMAQUANT_DO_NO_HARM"] = "0"
         try:
             m._ACT_AWARE_FLAGS.update({
                 "awq": False, "gptq": True, "awq_round": False,
@@ -1163,6 +1173,10 @@ class TestActivationAwarePasses(unittest.TestCase):
             m._ACT_AWARE_FLAGS.clear()
             m._ACT_AWARE_FLAGS.update(saved_flags)
             m._CACHED_ACTIVATIONS = saved_cache
+            if saved_dnh is None:
+                os.environ.pop("PRISMAQUANT_DO_NO_HARM", None)
+            else:
+                os.environ["PRISMAQUANT_DO_NO_HARM"] = saved_dnh
         # The weight_packed should differ because GPTQ reshapes the
         # weight via block-wise error propagation.
         self.assertFalse(

@@ -1170,6 +1170,37 @@ def quantize_dequantize_nvfp4(
     )
 
 
+def _rtn_dequant_nvfp4(
+    weight: torch.Tensor, group_size: int = 16,
+    global_real_override: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RTN to NVFP4 grid, returning FP32 dequantized weights (no GPTQ
+    error propagation, no scale sweep). Used by the do-no-harm gate
+    (#do-no-harm) to compare against post-GPTQ/sweep state and revert
+    if a Linear locally regressed."""
+    rows, cols = weight.shape
+    if cols % group_size != 0:
+        raise ValueError(f"NVFP4 group_size={group_size} ∤ {cols}")
+    n_groups = cols // group_size
+    W = weight.float()
+    grouped = W.reshape(rows, n_groups, group_size)
+    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
+    s_g_real = max_abs / NVFP4_MAX
+    if global_real_override is not None:
+        global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
+    else:
+        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+    fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
+    eff_scale = (fp8_scale_real * global_real).unsqueeze(-1).clamp_min(1e-12)
+    in_grid = (grouped / eff_scale).clamp(-NVFP4_MAX, NVFP4_MAX)
+    fp4_idx = _round_to_codebook(in_grid)
+    cb = _nvfp4_codebook(weight.device, dtype=torch.float32)
+    abs_idx = fp4_idx & 0x7
+    sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
+    q_vals = sign * cb[abs_idx]
+    return (q_vals * eff_scale).reshape(rows, cols)
+
+
 def quantize_dequantize_nvfp4_packed(
     packed: torch.Tensor, group_size: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1920,6 +1951,39 @@ def _quantize_2d(
                     reference_weight=weight.to(torch.float32),
                 )
 
+        # Do-no-harm gate (codex review #3): if GPTQ ran and we have
+        # cached activations, compute the activation-weighted
+        # reconstruction MSE for both the post-pass weight (`w_work`)
+        # and a pure-RTN baseline against the original. If RTN is
+        # better, revert. Catches per-Linear cases where GPTQ + sweep
+        # locally degraded reconstruction. Env-gated; default on
+        # because the cost is one RTN dequant + two MSE sums (cheap).
+        if (gptq_enabled and not skip_awq and acts is not None
+                and os.environ.get("PRISMAQUANT_DO_NO_HARM", "1") != "0"):
+            try:
+                w_orig_f = weight.to(torch.float32)
+                w_rtn = _rtn_dequant_nvfp4(
+                    w_orig_f, group_size=16,
+                    global_real_override=nvfp4_global_real_override,
+                )
+                a2 = (acts.detach().to(torch.float32)
+                      .reshape(-1, w_orig_f.shape[1])
+                      .pow(2).mean(dim=0).clamp_min(1e-12))
+                mse_rtn = float((a2 * (w_orig_f - w_rtn).pow(2)
+                                 .sum(dim=0)).sum())
+                mse_work = float((a2 * (w_orig_f - w_work).pow(2)
+                                  .sum(dim=0)).sum())
+                if mse_rtn < mse_work:
+                    if os.environ.get(
+                        "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
+                        print(f"[do-no-harm] {linear_name}: "
+                              f"reverted to RTN "
+                              f"(mse {mse_work:.3e} → {mse_rtn:.3e})",
+                              flush=True)
+                    w_work = w_rtn
+            except Exception as _e:
+                pass  # never fail the export over the gate
+
         # Step 4: final NVFP4 pack. `w_work` is the post-AWQ,
         # post-GPTQ, post-act-round, post-scale-sweep weight. Store it
         # as-is — the fold pass preserved the matmul identity
@@ -2639,15 +2703,22 @@ def materialize_tensors_streaming(
     # in the streaming loop below. See prismaquant/halo.py.
     if halo_R is not None:
         from .halo import apply_halo_to_head
+        # Resolve embed/norm qnames from the resolved base_prefix —
+        # multimodal Qwen has body at model.language_model.*, dense
+        # transformer-style models have body at model.*.
+        _embed_qname = (f"{base_prefix}.embed_tokens"
+                        if base_prefix else "model.embed_tokens")
+        _final_norm_qname = (f"{base_prefix}.norm"
+                             if base_prefix else "model.norm")
         n_head = apply_halo_to_head(
             model, halo_R,
-            embed_qname=getattr(profile, "embed_tokens_qname",
-                                "model.embed_tokens"),
+            embed_qname=_embed_qname,
             lm_head_qname=profile.lm_head_name(),
-            final_norm_qname=getattr(profile, "final_norm_qname",
-                                     "model.norm"),
+            final_norm_qname=_final_norm_qname,
         )
-        print(f"[halo] head rotation: {n_head} tensors", flush=True)
+        print(f"[halo] head rotation: {n_head} tensors "
+              f"(embed={_embed_qname}, norm={_final_norm_qname})",
+              flush=True)
 
     def _emit_head_param(full_qname: str, param: nn.Parameter):
         recipe_key = profile.live_to_recipe_name(full_qname)
@@ -4479,14 +4550,32 @@ def main():
     halo_R = None
     if args.halo_mode == "random":
         from .halo import random_hadamard
-        # Discover residual-stream dim from config.
+        # Discover residual-stream dim from config. Multimodal configs
+        # (Qwen 3.5 4B, Gemma 4, etc.) nest hidden_size under text_config
+        # or language_model_config. Probe a few common locations.
         from transformers import AutoConfig as _AC
         _cfg = _AC.from_pretrained(args.model, trust_remote_code=True)
-        _hidden = getattr(_cfg, "hidden_size", None)
+        _hidden = None
+        for _path in ("hidden_size",
+                      "text_config.hidden_size",
+                      "language_model_config.hidden_size",
+                      "llm_config.hidden_size"):
+            _obj = _cfg
+            try:
+                for _part in _path.split("."):
+                    _obj = getattr(_obj, _part)
+                if isinstance(_obj, int) and _obj > 0:
+                    _hidden = _obj
+                    break
+            except AttributeError:
+                continue
         if _hidden is None:
             raise RuntimeError(
                 "[halo] cannot determine hidden_size from config — "
-                "needed for HALO rotation dimension.")
+                "needed for HALO rotation dimension. Probed: "
+                "hidden_size, text_config.hidden_size, "
+                "language_model_config.hidden_size, "
+                "llm_config.hidden_size.")
         halo_R = random_hadamard(_hidden, seed=args.halo_seed)
         print(f"[halo] mode=random seed={args.halo_seed} "
               f"dim={_hidden}", flush=True)

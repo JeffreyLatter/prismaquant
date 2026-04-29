@@ -2916,6 +2916,37 @@ def main():
             precomputed = cached
             return precomputed
         _ensure_ready()
+        # Tied-embedding repair: when `tie_word_embeddings=True` (Qwen
+        # 3.5/3.6 small variants, Llama-3.2-1B/3B, etc.), the streaming
+        # pipeline materializes embed_tokens but leaves lm_head on meta
+        # because the source has no separate lm_head shard. Manually
+        # alias lm_head.weight to the materialized embedding before
+        # the precompute, otherwise model.lm_head(...) returns a meta
+        # tensor and `.item()` fails.
+        try:
+            _model = ctx.model
+            _cfg = getattr(_model, "config", None)
+            if _cfg is not None and getattr(_cfg, "tie_word_embeddings", False):
+                _embed = None
+                for _path in ("model.embed_tokens",
+                              "model.language_model.embed_tokens",
+                              "transformer.wte"):
+                    try:
+                        _m = _model.get_submodule(_path)
+                        if hasattr(_m, "weight") and not _m.weight.is_meta:
+                            _embed = _m
+                            break
+                    except (AttributeError, KeyError):
+                        continue
+                if _embed is not None and hasattr(_model, "lm_head"):
+                    if _model.lm_head.weight.is_meta:
+                        _model.lm_head.weight = _embed.weight
+                        print(f"[incremental] tied lm_head.weight ← "
+                              f"embed_tokens.weight (meta repair)", flush=True)
+        except Exception as _e:
+            print(f"[incremental] WARN tied-embedding repair: {_e}",
+                  flush=True)
+
         precomputed = _compute_global_precompute(
             ctx,
             calib=calib,
