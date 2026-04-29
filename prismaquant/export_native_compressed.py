@@ -2850,6 +2850,25 @@ def materialize_tensors_streaming(
             and (_ACT_AWARE_FLAGS["gptq"] or _ACT_AWARE_FLAGS["scale_sweep"])
             and _CACHED_ACTIVATIONS is not None
         )
+
+        # #12 Block-output match deferred-pack list. Per-layer scope.
+        _BLOCK_COMPUTE_PENDING: list[dict] = []
+        # Capture FP16 snapshots of the layer's standard block Linears
+        # so we can run a reference (pre-quantization) forward pass for
+        # block-output match. Cheap: a layer's q/k/v/o + gate/up/down at
+        # FP32 ≈ 64-128 MB.
+        _FP16_BLOCK_SNAPSHOTS: dict[str, torch.Tensor] = {}
+        if os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH") == "1":
+            for _sn, _m in layer_mod.named_modules():
+                if not isinstance(_m, nn.Linear):
+                    continue
+                _leaf = _sn.rsplit(".", 1)[-1] if _sn else ""
+                if _leaf in (
+                    "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                ):
+                    _FP16_BLOCK_SNAPSHOTS[_sn] = _m.weight.detach().clone()
+
         for sub_name, mod in layer_mod.named_modules():
             if not isinstance(mod, nn.Linear):
                 continue
@@ -2980,6 +2999,37 @@ def materialize_tensors_streaming(
                 continue
 
             override = joint_globals.get(recipe_key) if fmt == "NVFP4" else None
+
+            # #12 Block-output match: when enabled AND this is a
+            # standard "block" Linear (q/k/v/o or gate/up/down) on
+            # NVFP4, defer the final pack so we can refine its
+            # dequantized weight using block-level output MSE before
+            # freezing it into FP4 codes. The compute_dict + post-pack
+            # state is saved into _BLOCK_COMPUTE_PENDING; the post-loop
+            # phase invokes refine_block_scales then _finalize_compute_only.
+            sub_leaf = sub_name.rsplit(".", 1)[-1] if sub_name else ""
+            is_block_linear = (
+                fmt == "NVFP4"
+                and os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH") == "1"
+                and sub_leaf in (
+                    "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                )
+            )
+            if is_block_linear:
+                compute_dict = _quantize_2d(
+                    mod.weight.detach().float(), fmt,
+                    nvfp4_global_real_override=override,
+                    linear_name=recipe_key,
+                    compute_only=True,
+                )
+                _BLOCK_COMPUTE_PENDING.append({
+                    "full": full, "emit_full": emit_full,
+                    "sub_leaf": sub_leaf, "mod": mod,
+                    "compute_dict": compute_dict, "fmt": fmt,
+                })
+                continue  # skip immediate emit; finalized post-loop
+
             compressed = _quantize_2d(
                 mod.weight.detach().float(), fmt,
                 nvfp4_global_real_override=override,
@@ -3046,6 +3096,103 @@ def materialize_tensors_streaming(
                                 torch.bfloat16).cpu()
                         hist[("linear", "NVFP4")] += 1
                         covered.add(full)
+
+        # 3c'. Block-output match (#12). When PRISMAQUANT_BLOCK_OUTPUT_MATCH=1
+        # the per-Linear loop above deferred packing for standard block
+        # Linears (q/k/v/o, gate/up/down). Now run greedy refinement of
+        # per-Linear scale perturbations against an FP16 reference forward,
+        # then finalize the pack. Skipped if no compute-only entries
+        # accumulated (env flag off, or no eligible Linears in this layer).
+        if _BLOCK_COMPUTE_PENDING:
+            try:
+                from .block_output_match import (
+                    make_attention_block_spec, make_mlp_block_spec,
+                    refine_block_scales,
+                )
+                # Group pending entries by sub_leaf so we can index
+                # them when applying refined scales. Also recover
+                # the FP16 reference weights from _FP16_BLOCK_SNAPSHOTS.
+                pending_by_sub = {p["sub_leaf"]: p
+                                  for p in _BLOCK_COMPUTE_PENDING}
+
+                # Use a small calibration input drawn from the cached
+                # activation of q_proj (its input == post-norm of the
+                # residual stream, which is the natural attn-block
+                # input). For MLP block, gate_proj input is the same
+                # post-norm residual after attention. If activations
+                # aren't cached for this layer, skip refinement —
+                # there's no reference signal.
+                cal_input_attn = None
+                cal_input_mlp = None
+                if _CACHED_ACTIVATIONS is not None:
+                    # cached keys are recipe_keys; pull from any
+                    # block-Linear that's pending so naming variation
+                    # across profiles still works.
+                    for p in _BLOCK_COMPUTE_PENDING:
+                        if p["sub_leaf"] in ("q_proj",) and cal_input_attn is None:
+                            cal_input_attn = _CACHED_ACTIVATIONS.get(
+                                profile.live_to_recipe_name(p["full"]))
+                        if p["sub_leaf"] in ("gate_proj",) and cal_input_mlp is None:
+                            cal_input_mlp = _CACHED_ACTIVATIONS.get(
+                                profile.live_to_recipe_name(p["full"]))
+
+                # Run refinement for each block we have a cal input for.
+                # Candidates are simple multiplicative perturbations of
+                # the current dequantized weight; refine_block_scales
+                # picks the per-Linear scale that minimizes block MSE.
+                cands = [torch.tensor(s) for s in (0.95, 1.0, 1.05)]
+
+                def _apply_refined_scales(spec_factory, cal_input):
+                    if cal_input is None:
+                        return
+                    spec = spec_factory(layer_mod, layer_qname)
+                    if spec is None:
+                        return
+                    # Cap the cal_input to a small batch to keep refinement fast.
+                    ci = cal_input.to(layer_mod.input_layernorm.weight.device
+                                      if hasattr(layer_mod, "input_layernorm")
+                                      else next(iter(layer_mod.parameters())).device)
+                    if ci.dim() == 2:
+                        ci = ci[:32]
+                    elif ci.dim() == 3:
+                        ci = ci[:8]
+                    with torch.no_grad():
+                        ref = spec.forward_fn(ci.float()).float().clone()
+                    candidates = {ln: cands for ln in spec.linears}
+                    refine_block_scales(spec, ci.float(), ref, candidates,
+                                        max_passes=2)
+                    # Read back refined per-Linear scales and apply to
+                    # the corresponding compute_dict's _w_dq.
+                    for ln in spec.linears:
+                        s = float(spec.scale_getter(ln))
+                        if abs(s - 1.0) < 1e-8:
+                            continue  # no change
+                        p = pending_by_sub.get(ln)
+                        if p is None:
+                            continue
+                        p["compute_dict"]["_w_dq"] = (
+                            p["compute_dict"]["_w_dq"] * s)
+
+                _apply_refined_scales(make_attention_block_spec, cal_input_attn)
+                _apply_refined_scales(make_mlp_block_spec, cal_input_mlp)
+
+            except Exception as e:
+                print(f"[block-output-match] WARN refinement failed for "
+                      f"{layer_qname}: {e}", flush=True)
+
+            # Finalize the pack for every pending Linear (refined or not).
+            for p in _BLOCK_COMPUTE_PENDING:
+                compressed = _finalize_compute_only(p["compute_dict"])
+                emit_full = p["emit_full"]
+                for suffix, t in compressed.items():
+                    out[f"{emit_full}.{suffix}"] = t.cpu()
+                if p["mod"].bias is not None:
+                    out[f"{emit_full}.bias"] = p["mod"].bias.detach().to(
+                        torch.bfloat16).cpu()
+                hist[("linear", "NVFP4_block_match")] += 1
+                covered.add(p["full"])
+
+            del _BLOCK_COMPUTE_PENDING, _FP16_BLOCK_SNAPSHOTS
 
         # 3d. Emit packed MoE experts, scoped to this layer.
         packed_count = 0
