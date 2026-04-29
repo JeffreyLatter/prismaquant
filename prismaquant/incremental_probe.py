@@ -1586,7 +1586,7 @@ def _run_body_streaming_shard(
             # for better Hessian numerical stability in the cost step.
             # 2× storage cost; recommended when disk is plentiful.
             cache_dtype = (torch.float32
-                           if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32") == "1"
+                           if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32", "1") != "0"
                            else torch.bfloat16)
             X = torch.cat(snaps, dim=0).to(
                 "cpu", dtype=cache_dtype
@@ -2278,7 +2278,7 @@ def _run_body_streaming_shard(
         flush_activation_snapshots(activation_snaps)
         flush_activation_snapshots(packed_act_snaps)
         cache_dtype = (torch.float32
-                       if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32") == "1"
+                       if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32", "1") != "0"
                        else torch.bfloat16)
         for name, snaps in resident_act_snaps.items():
             if not snaps:
