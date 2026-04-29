@@ -1582,8 +1582,14 @@ def _run_body_streaming_shard(
             # before pickling. The fwd hook keeps them on device when
             # _act_async is on so the main thread doesn't stall on
             # device→host transfers between Linears in the same forward.
+            # #43: PRISMAQUANT_ACT_CACHE_FP32 keeps activations at FP32
+            # for better Hessian numerical stability in the cost step.
+            # 2× storage cost; recommended when disk is plentiful.
+            cache_dtype = (torch.float32
+                           if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32") == "1"
+                           else torch.bfloat16)
             X = torch.cat(snaps, dim=0).to(
-                "cpu", dtype=torch.bfloat16
+                "cpu", dtype=cache_dtype
             ).contiguous()
             fname = act_fname_sub.sub("__", name) + ".pt"
             target = cache_dir / fname
@@ -2271,10 +2277,13 @@ def _run_body_streaming_shard(
     if cache_dir is not None:
         flush_activation_snapshots(activation_snaps)
         flush_activation_snapshots(packed_act_snaps)
+        cache_dtype = (torch.float32
+                       if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32") == "1"
+                       else torch.bfloat16)
         for name, snaps in resident_act_snaps.items():
             if not snaps:
                 continue
-            X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
+            X = torch.cat(snaps, dim=0).to(cache_dtype).contiguous()
             fname = act_fname_sub.sub("__", name) + ".pt"
             torch.save({"inputs": X, "name": name}, cache_dir / fname)
         # v22 Fix C: block until any async writes have completed so the

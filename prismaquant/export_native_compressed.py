@@ -769,6 +769,22 @@ def _gptq_obs_rounding_nvfp4(
         raise ValueError(f"GPTQ requires group_size={group_size} ∤ {cols}")
 
     X = activations.detach().to(torch.float32).reshape(-1, cols)
+    # #42: per-token activation clipping to reduce Hessian condition
+    # number. PRISMAQUANT_ACT_CLIP_QUANTILE in (0,1) clamps each token's
+    # activations to ±|q-th percentile| of |x|. 0.999 removes ~4 extreme
+    # outliers per 4k-dim row; condition number drops materially with
+    # near-zero impact on bulk distribution. Only affects the H used
+    # for the OBS solve — error measurement in the swept wrapper uses
+    # unclipped X for fair candidate comparison.
+    _clip_q_str = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE")
+    if _clip_q_str:
+        try:
+            _clip_q = float(_clip_q_str)
+        except ValueError:
+            _clip_q = 1.0
+        if 0.0 < _clip_q < 1.0:
+            thresh = X.abs().quantile(_clip_q, dim=1, keepdim=True)
+            X = X.clamp(min=-thresh, max=thresh)
     # H = X^T X; guard against near-zero diagonal (dead channels).
     H = X.t() @ X                                         # [in, in]
     diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
