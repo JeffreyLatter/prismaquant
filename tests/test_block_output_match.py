@@ -96,6 +96,56 @@ def test_refine_picks_better_scale():
         f"initial={initial_mse}, final={final_mse}")
 
 
+def test_make_attention_block_spec():
+    """make_attention_block_spec produces a working BlockSpec for a
+    standard transformer-style attention module."""
+    torch.manual_seed(0)
+    d = 16
+
+    class _SelfAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(d, d, bias=False)
+            self.k_proj = nn.Linear(d, d, bias=False)
+            self.v_proj = nn.Linear(d, d, bias=False)
+            self.o_proj = nn.Linear(d, d, bias=False)
+
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _SelfAttn()
+
+    from prismaquant.block_output_match import (
+        make_attention_block_spec, block_output_mse, refine_block_scales)
+
+    layer = _Layer().eval()
+    x = torch.randn(4, 8, d)
+    with torch.no_grad():
+        ref = layer.self_attn.o_proj(
+            torch.softmax(layer.self_attn.q_proj(x)
+                          @ layer.self_attn.k_proj(x).transpose(-2, -1)
+                          / (d ** 0.5), dim=-1)
+            @ layer.self_attn.v_proj(x))
+
+    spec = make_attention_block_spec(layer, "model.layers.0")
+    assert spec is not None
+    assert set(spec.linears) == {"q_proj", "k_proj", "v_proj", "o_proj"}
+
+    # At identity scales, MSE should be ~0.
+    mse_id = block_output_mse(spec, x, ref)
+    assert mse_id < 1e-6
+
+    # Perturb q_proj, verify refiner restores it.
+    spec.scale_setter("q_proj", torch.tensor(1.5))
+    mse_perturbed = block_output_mse(spec, x, ref)
+    assert mse_perturbed > mse_id
+
+    candidates = {qn: [torch.tensor(0.85), torch.tensor(1.0),
+                       torch.tensor(1.15)] for qn in spec.linears}
+    final = refine_block_scales(spec, x, ref, candidates, max_passes=2)
+    assert final < mse_perturbed
+
+
 def test_refine_handles_no_improvement():
     """If no candidate improves over the current state, refine_block_scales
     should converge in <= max_passes and not regress."""

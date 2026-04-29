@@ -68,6 +68,128 @@ class BlockSpec:
     scale_getter: callable
 
 
+def make_attention_block_spec(layer_mod: nn.Module, layer_qname: str,
+                              candidate_perturbations: tuple[float, ...]
+                              = (0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15)
+                              ) -> BlockSpec | None:
+    """Build a BlockSpec for the attention block of a standard transformer
+    layer.
+
+    Linears: q_proj, k_proj, v_proj (input-side) and o_proj (output-side).
+    Returns None if the layer doesn't have the expected attention
+    structure (e.g., Mamba layer, or DSv4 compressor — those need
+    architecture-specific spec builders).
+
+    The BlockSpec uses LIVE module references via attribute lookup, so
+    the refiner can install candidate weights in-place. Candidate scales
+    are multiplicative perturbations of the current weight (the
+    refinement objective is to find which perturbation scale gives the
+    smallest block-output MSE; this is a discrete proxy for the proper
+    NVFP4 per-group scale search but cheap enough to run greedily).
+    """
+    if not hasattr(layer_mod, "self_attn"):
+        return None
+    sa = layer_mod.self_attn
+    o_attr = "o_proj" if hasattr(sa, "o_proj") else (
+        "out_proj" if hasattr(sa, "out_proj") else None)
+    if o_attr is None:
+        return None
+    required = ["q_proj", "k_proj", "v_proj"]
+    for r in required:
+        if not hasattr(sa, r):
+            return None
+
+    saved: dict[str, torch.Tensor] = {}
+    for name in (*required, o_attr):
+        saved[name] = getattr(sa, name).weight.data.clone()
+
+    def setter(qname: str, scale_tensor: torch.Tensor):
+        # qname is "q_proj" / "o_proj" / etc. — short name.
+        lin = getattr(sa, qname)
+        s = float(scale_tensor)
+        lin.weight.data = saved[qname] * s
+
+    def getter(qname: str) -> torch.Tensor:
+        lin = getattr(sa, qname)
+        # Recover scale by inverse — robust to fp dtype shenanigans.
+        ref = saved[qname]
+        # Use a non-zero element to estimate scale.
+        idx = ref.abs().argmax()
+        flat_ref = ref.reshape(-1)
+        flat_cur = lin.weight.data.reshape(-1)
+        s = float(flat_cur[idx] / flat_ref[idx].clamp_min(1e-12))
+        return torch.tensor(s)
+
+    def fwd(x: torch.Tensor) -> torch.Tensor:
+        # Single-head-style forward: just exercise q/k/v/o through
+        # softmax(QK^T)V → o_proj. This isn't faithful to the model's
+        # multi-head attention, but it's sufficient for measuring
+        # reconstruction sensitivity of the four Linears as a coupled
+        # system (the qk-product is the inter-Linear coupling we want
+        # to capture). Faithful reproduction would call the model's
+        # actual attention forward — that's an integration upgrade.
+        Q = sa.q_proj(x)
+        K = sa.k_proj(x)
+        V = sa.v_proj(x)
+        d = Q.shape[-1]
+        scores = Q @ K.transpose(-2, -1) / (d ** 0.5)
+        attn = torch.softmax(scores, dim=-1)
+        return getattr(sa, o_attr)(attn @ V)
+
+    return BlockSpec(
+        linears=[*required, o_attr],
+        forward_fn=fwd,
+        scale_setter=setter,
+        scale_getter=getter,
+    )
+
+
+def make_mlp_block_spec(layer_mod: nn.Module, layer_qname: str
+                        ) -> BlockSpec | None:
+    """Build a BlockSpec for a dense MLP block (gate_proj + up_proj +
+    down_proj with SiLU activation, the Llama/Qwen pattern).
+
+    Returns None for MoE layers — those need expert-aware spec builders
+    that can refine the experts as a fused tensor or per-expert.
+    """
+    if not hasattr(layer_mod, "mlp"):
+        return None
+    mlp = layer_mod.mlp
+    required = ["gate_proj", "up_proj", "down_proj"]
+    for r in required:
+        if not hasattr(mlp, r):
+            return None
+
+    saved: dict[str, torch.Tensor] = {}
+    for name in required:
+        saved[name] = getattr(mlp, name).weight.data.clone()
+
+    def setter(qname: str, scale_tensor: torch.Tensor):
+        lin = getattr(mlp, qname)
+        s = float(scale_tensor)
+        lin.weight.data = saved[qname] * s
+
+    def getter(qname: str) -> torch.Tensor:
+        lin = getattr(mlp, qname)
+        ref = saved[qname]
+        idx = ref.abs().argmax()
+        flat_ref = ref.reshape(-1)
+        flat_cur = lin.weight.data.reshape(-1)
+        s = float(flat_cur[idx] / flat_ref[idx].clamp_min(1e-12))
+        return torch.tensor(s)
+
+    def fwd(x: torch.Tensor) -> torch.Tensor:
+        return mlp.down_proj(
+            torch.nn.functional.silu(mlp.gate_proj(x)) * mlp.up_proj(x))
+
+    return BlockSpec(
+        linears=required,
+        forward_fn=fwd,
+        scale_setter=setter,
+        scale_getter=getter,
+    )
+
+
 def block_output_mse(spec: BlockSpec, calib_input: torch.Tensor,
                      reference_output: torch.Tensor) -> float:
     """Forward the block with current weights and compute MSE against
