@@ -39,9 +39,10 @@ from .export_native_compressed import (
 
 
 def _resolve_clip_quantile() -> float | None:
-    """Read PRISMAQUANT_ACT_CLIP_QUANTILE once. Returns None when unset
-    or out of (0,1)."""
-    raw = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE")
+    """Read PRISMAQUANT_ACT_CLIP_QUANTILE. Default 0.999 (validated on
+    Qwen3-0.6B audit: −0.91 PPL alone vs no-clip baseline). Set to "0"
+    or any value outside (0,1) to disable."""
+    raw = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999")
     if not raw:
         return None
     try:

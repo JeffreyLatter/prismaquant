@@ -776,7 +776,9 @@ def _gptq_obs_rounding_nvfp4(
     # near-zero impact on bulk distribution. Only affects the H used
     # for the OBS solve — error measurement in the swept wrapper uses
     # unclipped X for fair candidate comparison.
-    _clip_q_str = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE")
+    # Default 0.999 (validated on Qwen3-0.6B audit: −0.91 PPL alone
+    # vs no-clip baseline). Set "0" or out-of-range to disable.
+    _clip_q_str = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999")
     if _clip_q_str:
         try:
             _clip_q = float(_clip_q_str)
@@ -1914,7 +1916,9 @@ def _quantize_2d(
                 # try multiple λ values for the Hessian regularizer and
                 # pick the one with smallest output-space error. ~5×
                 # GPTQ wallclock; ~0.02–0.05 PPL gain on Llama-class.
-                if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP") == "1":
+                # Default ON (validated on Qwen3-0.6B audit: −0.19 PPL
+                # vs single-damp). PRISMAQUANT_GPTQ_DAMP_SWEEP=0 disables.
+                if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
                     w_work = _gptq_obs_rounding_nvfp4_swept(
                         w_work, acts_work, group_size=16,
                         global_real_override=nvfp4_global_real_override,
@@ -2279,8 +2283,9 @@ def _quantize_2d_nvfp4_group_batched(
     # n_candidates × the unswept GPTQ pass; gated by env so prod
     # default keeps the existing single-damp speed.
     if _ACT_AWARE_FLAGS["gptq"]:
+        # Default ON (validated on Qwen3-0.6B audit). =0 to disable.
         damp_sweep_on = (
-            os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP") == "1")
+            os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0")
         if damp_sweep_on:
             damp_candidates = (0.001, 0.005, 0.01, 0.05, 0.1)
             best_w = None
@@ -2915,7 +2920,7 @@ def materialize_tensors_streaming(
             "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
                 "PRISMAQUANT_ACT_CLIP_QUANTILE", ""),
             "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(
-                "PRISMAQUANT_BLOCK_OUTPUT_MATCH", "0"),
+                "PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1"),
             "PRISMAQUANT_BATCHED_NVFP4_EXPORT": os.environ.get(
                 "PRISMAQUANT_BATCHED_NVFP4_EXPORT", ""),
         }
@@ -3088,7 +3093,7 @@ def materialize_tensors_streaming(
         # block-output match. Cheap: a layer's q/k/v/o + gate/up/down at
         # FP32 ≈ 64-128 MB.
         _FP16_BLOCK_SNAPSHOTS: dict[str, torch.Tensor] = {}
-        if os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH") == "1":
+        if os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1") != "0":
             for _sn, _m in layer_mod.named_modules():
                 if not isinstance(_m, nn.Linear):
                     continue
@@ -3240,7 +3245,7 @@ def materialize_tensors_streaming(
             sub_leaf = sub_name.rsplit(".", 1)[-1] if sub_name else ""
             is_block_linear = (
                 fmt == "NVFP4"
-                and os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH") == "1"
+                and os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1") != "0"
                 and sub_leaf in (
                     "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
                     "gate_proj", "up_proj", "down_proj",
