@@ -2273,12 +2273,54 @@ def _quantize_2d_nvfp4_group_batched(
 
     # Run the batched activation-aware passes. Match the per-Linear
     # `_quantize_2d` ordering: GPTQ → scale_sweep.
+    # Codex review #46 batched extension: per-Linear damping sweep.
+    # Run GPTQ at each candidate damp, measure activation-weighted
+    # output MSE per Linear, keep the best per Linear. Cost is
+    # n_candidates × the unswept GPTQ pass; gated by env so prod
+    # default keeps the existing single-damp speed.
     if _ACT_AWARE_FLAGS["gptq"]:
-        weights = gptq_obs_rounding_nvfp4_batched(
-            weights, acts_list,
-            global_real_overrides=global_real_overrides,
-            expert_chunk=expert_chunk,
-        )
+        damp_sweep_on = (
+            os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP") == "1")
+        if damp_sweep_on:
+            damp_candidates = (0.001, 0.005, 0.01, 0.05, 0.1)
+            best_w = None
+            best_err = None  # [E] of activation-weighted MSE
+            # Pre-compute per-Linear column importance for the gate.
+            col_imp = torch.empty(
+                (n, weights.shape[2]), device=device, dtype=torch.float32)
+            for j, a in enumerate(acts_list):
+                if a is None or a.numel() == 0:
+                    col_imp[j] = 1.0
+                else:
+                    col_imp[j] = a.detach().to(
+                        device, dtype=torch.float32
+                    ).reshape(-1, weights.shape[2]).pow(2).mean(dim=0).clamp_min(1e-12)
+            for damp in damp_candidates:
+                cand_w = gptq_obs_rounding_nvfp4_batched(
+                    weights, acts_list,
+                    damp=damp,
+                    global_real_overrides=global_real_overrides,
+                    expert_chunk=expert_chunk,
+                )
+                # Per-Linear activation-weighted MSE vs reference.
+                diff = reference_weights - cand_w
+                err = (col_imp.unsqueeze(1) * diff.pow(2)).sum(dim=(1, 2))
+                if best_w is None:
+                    best_w = cand_w
+                    best_err = err
+                else:
+                    take = err < best_err
+                    if take.any():
+                        idx = take.nonzero(as_tuple=True)[0]
+                        best_w[idx] = cand_w[idx]
+                        best_err[idx] = err[idx]
+            weights = best_w
+        else:
+            weights = gptq_obs_rounding_nvfp4_batched(
+                weights, acts_list,
+                global_real_overrides=global_real_overrides,
+                expert_chunk=expert_chunk,
+            )
     if _ACT_AWARE_FLAGS["scale_sweep"]:
         weights = scale_sweep_nvfp4_batched(
             weights, acts_list,
@@ -2286,6 +2328,51 @@ def _quantize_2d_nvfp4_group_batched(
             global_real_overrides=global_real_overrides,
             expert_chunk=expert_chunk,
         )
+
+    # Codex review #47 batched extension: per-Linear do-no-harm gate.
+    # If the post-pass weight is worse on activation-weighted MSE than
+    # a pure RTN of the original, swap that single Linear back to RTN.
+    # Same default-on as the per-Linear path; PRISMAQUANT_DO_NO_HARM=0
+    # disables. Cost: one RTN dequant + two MSE sums per Linear.
+    if (_ACT_AWARE_FLAGS["gptq"]
+            and os.environ.get("PRISMAQUANT_DO_NO_HARM", "1") != "0"):
+        try:
+            # Per-Linear activation column importance.
+            col_imp = torch.empty(
+                (n, weights.shape[2]), device=device, dtype=torch.float32)
+            n_acts_avail = 0
+            for j, a in enumerate(acts_list):
+                if a is None or a.numel() == 0:
+                    col_imp[j] = 1.0
+                else:
+                    col_imp[j] = a.detach().to(
+                        device, dtype=torch.float32
+                    ).reshape(-1, weights.shape[2]).pow(2).mean(dim=0).clamp_min(1e-12)
+                    n_acts_avail += 1
+            n_reverted = 0
+            for i in range(n):
+                if acts_list[i] is None or acts_list[i].numel() == 0:
+                    continue  # no activations → can't gate; trust the pass
+                override = overrides_list[i]
+                w_rtn = _rtn_dequant_nvfp4(
+                    reference_weights[i], group_size=16,
+                    global_real_override=override,
+                )
+                ref_i = reference_weights[i]
+                imp = col_imp[i]
+                mse_pass = float(
+                    (imp * (ref_i - weights[i]).pow(2).sum(dim=0)).sum())
+                mse_rtn = float(
+                    (imp * (ref_i - w_rtn).pow(2).sum(dim=0)).sum())
+                if mse_rtn < mse_pass:
+                    weights[i] = w_rtn
+                    n_reverted += 1
+            if n_reverted and os.environ.get(
+                    "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
+                print(f"[do-no-harm batched] reverted {n_reverted}/{n} "
+                      f"Linears to RTN", flush=True)
+        except Exception as _e:
+            print(f"[do-no-harm batched] WARN failed: {_e}", flush=True)
 
     # Per-Linear final NVFP4 pack (cheap; reuses the existing function).
     out: list[dict] = []

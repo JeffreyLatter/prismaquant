@@ -24,6 +24,8 @@ The math is bitwise-equivalent to the per-Linear functions in
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 # Re-import codebook helpers from the main export module to avoid
@@ -34,6 +36,21 @@ from .export_native_compressed import (
     NVFP4_MAX,
     FP8_E4M3_MAX,
 )
+
+
+def _resolve_clip_quantile() -> float | None:
+    """Read PRISMAQUANT_ACT_CLIP_QUANTILE once. Returns None when unset
+    or out of (0,1)."""
+    raw = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE")
+    if not raw:
+        return None
+    try:
+        q = float(raw)
+    except ValueError:
+        return None
+    if not (0.0 < q < 1.0):
+        return None
+    return q
 
 
 def _build_H_stack(
@@ -63,6 +80,10 @@ def _build_H_stack(
         (E, in_features, in_features), dtype=torch.float32, device=device,
     )
     dead_mask = torch.zeros((E, in_features), dtype=torch.bool, device=device)
+    # Codex review #42 batched extension: per-token activation clipping.
+    # Same semantics as the per-Linear path's clip in
+    # `_gptq_obs_rounding_nvfp4`: ±|q-th quantile| of |x| per row.
+    clip_q = _resolve_clip_quantile()
     for e in range(E):
         a = activations_list[e]
         if a is None or a.numel() == 0:
@@ -83,6 +104,9 @@ def _build_H_stack(
         # speedup at production scale.
         X = a.detach().to(device, dtype=torch.float32).reshape(
             -1, in_features)
+        if clip_q is not None:
+            thresh = X.abs().quantile(clip_q, dim=1, keepdim=True)
+            X = X.clamp(min=-thresh, max=thresh)
         H = X.t() @ X
         diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
         H.diagonal().add_(damp * diag_mean)
