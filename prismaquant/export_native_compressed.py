@@ -2469,6 +2469,7 @@ def materialize_tensors_streaming(
     prune_manifest: dict[str, dict] | None = None,
     tensor_sink: Callable[[dict[str, torch.Tensor]], None] | None = None,
     export_cache_dir: str | None = None,
+    halo_R: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict]:
     """Stream decoder layers through quantize → emit → unload. Never
     holds the full model in memory. Small models still exercise this
@@ -2580,6 +2581,22 @@ def materialize_tensors_streaming(
     # These are resident on `device` already. Emit as BF16 passthrough
     # UNLESS `lm_head` (or similar) is explicitly in the assignment.
     t_head = time.time()
+
+    # HALO rotation on the head section (#4). Folds final_norm gamma into
+    # lm_head and right-rotates embedding + lm_head so the residual
+    # stream starts in the rotated frame. Per-layer rotation continues
+    # in the streaming loop below. See prismaquant/halo.py.
+    if halo_R is not None:
+        from .halo import apply_halo_to_head
+        n_head = apply_halo_to_head(
+            model, halo_R,
+            embed_qname=getattr(profile, "embed_tokens_qname",
+                                "model.embed_tokens"),
+            lm_head_qname=profile.lm_head_name(),
+            final_norm_qname=getattr(profile, "final_norm_qname",
+                                     "model.norm"),
+        )
+        print(f"[halo] head rotation: {n_head} tensors", flush=True)
 
     def _emit_head_param(full_qname: str, param: nn.Parameter):
         recipe_key = profile.live_to_recipe_name(full_qname)
@@ -2708,6 +2725,20 @@ def materialize_tensors_streaming(
         load_s = time.time() - load_t0
 
         layer_mod = model.get_submodule(layer_qname)
+
+        # HALO per-layer rotation (#4). Applied AFTER weights are
+        # on-device but BEFORE quantization passes so the rotated
+        # weights are what GPTQ/scale_sweep target. Folds the layer's
+        # input_layernorm + post_attention_layernorm gammas into
+        # downstream Linears, then right-rotates q/k/v/gate/up and
+        # left-rotates o_proj/down_proj. No effect when halo_R is None.
+        if halo_R is not None:
+            from .halo import apply_halo_to_layer
+            n_rotated = apply_halo_to_layer(model, layer_mod, layer_qname,
+                                            halo_R)
+            if n_rotated:
+                print(f"[halo] layer {L:02d}: rotated {n_rotated} linears",
+                      flush=True)
 
         # 3b. Proper-AWQ fold pass — modifies predecessor RMSNorm γ
         # AND every reader's weight (nn.Linear + packed experts)
@@ -4071,6 +4102,25 @@ def main():
                     help="Don't remove --export-cache-dir on success. "
                          "Useful for debugging or comparing two exports "
                          "against the same cache.")
+    ap.add_argument("--halo-mode", default="off",
+                    choices=("off", "random"),
+                    help="HALO rotation preprocessor (#4). When 'random', "
+                         "applies a random Hadamard rotation R to the "
+                         "residual stream and absorbs R into adjacent "
+                         "Linear weights. Diffuses outliers across "
+                         "channels — downstream NVFP4/MXFP8 quantization "
+                         "has lower reconstruction error. No new vLLM "
+                         "kernel required (R is absorbed into weights "
+                         "and norms). Expected gain: ~0.20-0.30 PPL on "
+                         "Llama-class models. Critical: assumes standard "
+                         "transformer block topology (input_layernorm + "
+                         "q/k/v/o_proj, post_attention_layernorm + "
+                         "gate/up/down_proj). Profile-specific overrides "
+                         "needed for non-standard architectures.")
+    ap.add_argument("--halo-seed", type=int, default=0,
+                    help="RNG seed for HALO sign-diagonal in random "
+                         "Hadamard. Saved alongside the artifact at "
+                         "halo_rotation.pt for forensic reproducibility.")
     args = ap.parse_args()
 
     from .model_profiles import detect_profile
@@ -4226,6 +4276,28 @@ def main():
         print(f"[export-stream] streaming body rename → model.{infix}...",
               flush=True)
 
+    # HALO rotation matrix (#4). Generated once; applied in
+    # materialize_tensors_streaming to head + each layer.
+    halo_R = None
+    if args.halo_mode == "random":
+        from .halo import random_hadamard
+        # Discover residual-stream dim from config.
+        from transformers import AutoConfig as _AC
+        _cfg = _AC.from_pretrained(args.model, trust_remote_code=True)
+        _hidden = getattr(_cfg, "hidden_size", None)
+        if _hidden is None:
+            raise RuntimeError(
+                "[halo] cannot determine hidden_size from config — "
+                "needed for HALO rotation dimension.")
+        halo_R = random_hadamard(_hidden, seed=args.halo_seed)
+        print(f"[halo] mode=random seed={args.halo_seed} "
+              f"dim={_hidden}", flush=True)
+        # Persist R alongside the artifact for forensic reproducibility.
+        os.makedirs(out_dir, exist_ok=True)
+        torch.save({"R": halo_R.cpu(), "seed": args.halo_seed,
+                    "mode": "random", "dim": _hidden},
+                   os.path.join(out_dir, "halo_rotation.pt"))
+
     tensors, hist = materialize_tensors_streaming(
         args.model, assignment,
         profile=profile, bf16_passthrough=bf16_passthrough,
@@ -4234,6 +4306,7 @@ def main():
         prune_manifest=prune_manifest,
         tensor_sink=lambda batch: writer.add_tensors(_rename_body_batch(batch)),
         export_cache_dir=args.export_cache_dir,
+        halo_R=halo_R,
     )
     print(f"[export-stream] streamed materialization complete "
           f"resident_tensors={len(tensors)}  hist={hist}",

@@ -326,6 +326,126 @@ def apply_halo_rotation(model: nn.Module, spec: HaloModelSpec, *,
 # Default block-spec builder for standard transformer architectures
 # ---------------------------------------------------------------------------
 
+def block_specs_for_layer(layer_mod: nn.Module, layer_qname: str,
+                          dim: int) -> list[HaloBlockSpec]:
+    """Layer-scoped variant of `default_block_specs`. Used by the
+    streaming export integration which materializes one layer at a
+    time. Returns 0–2 HaloBlockSpec entries for this layer (one for
+    attention, optionally one for MLP/MoE) using qnames RELATIVE to
+    `layer_qname` (e.g., `f"{layer_qname}.self_attn.q_proj"`).
+
+    Each spec's qnames are resolvable via _get_module_by_qname against
+    the FULL model, but the rotation applier can also operate against
+    a single layer module by stripping the layer prefix.
+    """
+    blocks: list[HaloBlockSpec] = []
+
+    def _has(qname: str) -> bool:
+        try:
+            _get_module_by_qname(layer_mod, qname)
+            return True
+        except (AttributeError, IndexError, KeyError):
+            return False
+
+    # Attention block.
+    attn_in: list[str] = []
+    for proj in ("self_attn.q_proj", "self_attn.k_proj",
+                 "self_attn.v_proj"):
+        if _has(proj):
+            attn_in.append(f"{layer_qname}.{proj}")
+    attn_out: list[str] = []
+    for proj in ("self_attn.o_proj", "self_attn.out_proj"):
+        if _has(proj):
+            attn_out.append(f"{layer_qname}.{proj}")
+            break
+    if attn_in and attn_out and _has("input_layernorm"):
+        blocks.append(HaloBlockSpec(
+            name=f"{layer_qname}.attn",
+            dim=dim,
+            norm_qname=f"{layer_qname}.input_layernorm",
+            input_linears=attn_in,
+            output_linears=attn_out,
+        ))
+
+    # MLP / MoE block. Standard MLP has gate/up/down. MoE has experts
+    # under various names — here we only handle dense MLPs; per-expert
+    # rotation (uniform across experts in a layer) is a separate path.
+    mlp_in: list[str] = []
+    for proj in ("mlp.gate_proj", "mlp.up_proj"):
+        if _has(proj):
+            mlp_in.append(f"{layer_qname}.{proj}")
+    if _has("mlp.down_proj") and mlp_in and _has("post_attention_layernorm"):
+        blocks.append(HaloBlockSpec(
+            name=f"{layer_qname}.mlp",
+            dim=dim,
+            norm_qname=f"{layer_qname}.post_attention_layernorm",
+            input_linears=mlp_in,
+            output_linears=[f"{layer_qname}.mlp.down_proj"],
+        ))
+
+    return blocks
+
+
+def apply_halo_to_layer(model: nn.Module, layer_mod: nn.Module,
+                        layer_qname: str, R: torch.Tensor) -> int:
+    """Apply HALO rotation to a single layer's modules in-place.
+
+    Folds input_layernorm and post_attention_layernorm gammas into
+    their downstream Linears, then applies right/left rotations to
+    the q/k/v/o (attention) and gate/up/down (MLP) projections.
+
+    `model` is the full model (so qnames resolve); `layer_mod` is just
+    the body for module resolution; `layer_qname` is the dotted prefix
+    (e.g. "model.layers.5"). Returns the count of Linears rotated.
+    """
+    dim = R.shape[0]
+    specs = block_specs_for_layer(layer_mod, layer_qname, dim)
+    n = 0
+    for bspec in specs:
+        # 1. Fold gamma first.
+        fold_gamma_into_linears(model, bspec.norm_qname, bspec.input_linears)
+        # 2. Right-rotate input linears, left-rotate output linears.
+        for q in bspec.input_linears:
+            _right_rotate_linear(model, q, R)
+            n += 1
+        for q in bspec.output_linears:
+            _left_rotate_linear(model, q, R)
+            n += 1
+    return n
+
+
+def apply_halo_to_head(model: nn.Module, R: torch.Tensor, *,
+                       embed_qname: str = "model.embed_tokens",
+                       lm_head_qname: str = "lm_head",
+                       final_norm_qname: str | None = "model.norm"
+                       ) -> int:
+    """Apply HALO rotation to embedding + final_norm + lm_head.
+
+    Run ONCE at the start of streaming materialization for the head
+    tensors. Folds final_norm gamma into lm_head, right-rotates
+    embedding output direction, right-rotates lm_head input direction.
+
+    Returns the count of head tensors rotated.
+    """
+    n = 0
+    if final_norm_qname:
+        try:
+            fold_gamma_into_linears(model, final_norm_qname, [lm_head_qname])
+        except (AttributeError, ValueError):
+            pass
+    try:
+        _right_rotate_embedding(model, embed_qname, R)
+        n += 1
+    except (AttributeError, ValueError):
+        pass
+    try:
+        _right_rotate_linear(model, lm_head_qname, R)
+        n += 1
+    except (AttributeError, ValueError):
+        pass
+    return n
+
+
 def default_block_specs(model: nn.Module, *,
                         body_layer_prefix: str = "model.layers",
                         embed_qname: str = "model.embed_tokens",
