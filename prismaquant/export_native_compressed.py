@@ -2806,6 +2806,78 @@ def materialize_tensors_streaming(
     if cache_path is not None:
         cache_path.mkdir(parents=True, exist_ok=True)
 
+        # Cache fingerprint (codex review #2): bind the cache to the
+        # quality-affecting state. If any of these change between runs,
+        # the cache is silently wrong because the saved layer tensors
+        # were quantized under a different recipe. Write/check a
+        # manifest.json; mismatch invalidates the cache wholesale.
+        import hashlib
+        import json as _json
+        fp_state = {
+            "halo_R_present": halo_R is not None,
+            "halo_R_shape": (
+                list(halo_R.shape) if halo_R is not None else None),
+            "halo_R_hash": (
+                hashlib.sha256(
+                    halo_R.detach().cpu().contiguous().numpy().tobytes()
+                ).hexdigest()[:16] if halo_R is not None else None),
+            "PRISMAQUANT_DO_NO_HARM": os.environ.get(
+                "PRISMAQUANT_DO_NO_HARM", "1"),
+            "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
+                "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
+            "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
+                "PRISMAQUANT_ACT_CLIP_QUANTILE", ""),
+            "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(
+                "PRISMAQUANT_BLOCK_OUTPUT_MATCH", "0"),
+            "PRISMAQUANT_BATCHED_NVFP4_EXPORT": os.environ.get(
+                "PRISMAQUANT_BATCHED_NVFP4_EXPORT", ""),
+        }
+        # Hash the assignment dict (layer_config recipe) too — recipe
+        # changes invalidate per-Linear quantization output.
+        try:
+            fp_state["assignment_hash"] = hashlib.sha256(
+                _json.dumps(assignment, sort_keys=True).encode()
+            ).hexdigest()[:16]
+        except Exception:
+            fp_state["assignment_hash"] = None
+
+        manifest_path = cache_path / "manifest.json"
+        if manifest_path.exists():
+            try:
+                with manifest_path.open() as _f:
+                    prev = _json.load(_f)
+                if prev != fp_state:
+                    diff_keys = sorted(
+                        set(prev.keys()) | set(fp_state.keys())
+                    )
+                    diffs = [
+                        k for k in diff_keys
+                        if prev.get(k) != fp_state.get(k)
+                    ]
+                    print(f"[export-stream] cache fingerprint MISMATCH "
+                          f"(differs in: {diffs}); invalidating cache",
+                          flush=True)
+                    for _f in cache_path.glob("layer_*.pt"):
+                        _f.unlink()
+                    with manifest_path.open("w") as _f:
+                        _json.dump(fp_state, _f, indent=2)
+                else:
+                    print(f"[export-stream] cache fingerprint match — "
+                          f"resumable from {len(list(cache_path.glob('layer_*.pt')))} "
+                          f"layers", flush=True)
+            except Exception as _e:
+                print(f"[export-stream] cache manifest unreadable "
+                      f"({_e}); invalidating cache", flush=True)
+                for _f in cache_path.glob("layer_*.pt"):
+                    _f.unlink()
+                with manifest_path.open("w") as _f:
+                    _json.dump(fp_state, _f, indent=2)
+        else:
+            with manifest_path.open("w") as _f:
+                _json.dump(fp_state, _f, indent=2)
+            print(f"[export-stream] wrote cache fingerprint to {manifest_path}",
+                  flush=True)
+
     def _layer_cache_file(L: int) -> Path | None:
         return None if cache_path is None else cache_path / f"layer_{L:03d}.pt"
 
