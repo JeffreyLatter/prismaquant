@@ -1769,6 +1769,7 @@ def _quantize_2d(
     awq_round_enabled: bool = False,
     scale_sweep_enabled: bool = False,
     cached_activations: torch.Tensor | None = None,
+    compute_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Compress a 2D Linear weight under format `fmt`.
 
@@ -1923,15 +1924,29 @@ def _quantize_2d(
         # post-GPTQ, post-act-round, post-scale-sweep weight. Store it
         # as-is — the fold pass preserved the matmul identity
         # externally.
-        wp, ws, wg = quantize_dequantize_nvfp4(
-            w_work, group_size=16,
-            global_real_override=nvfp4_global_real_override,
-        )
         input_scale = input_global_scale_override
         if input_scale is None and linear_name is not None and _INPUT_GLOBAL_SCALES:
             input_scale = _INPUT_GLOBAL_SCALES.get(linear_name)
         if input_scale is None:
             input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+
+        # compute_only path (#12): defer final pack so block-output
+        # match can refine the dequantized weight before it's frozen
+        # into FP4 codes. Caller invokes _finalize_compute_only() to
+        # produce the final packed dict.
+        if compute_only:
+            return {
+                "_compute_only": True,
+                "_fmt": "NVFP4",
+                "_w_dq": w_work,
+                "_nvfp4_global_real": nvfp4_global_real_override,
+                "_input_scale": float(input_scale),
+            }
+
+        wp, ws, wg = quantize_dequantize_nvfp4(
+            w_work, group_size=16,
+            global_real_override=nvfp4_global_real_override,
+        )
         return {
             "weight_packed": wp,
             "weight_scale": ws,
@@ -2033,6 +2048,42 @@ def _quantize_3d_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tenso
     if fmt in ("INT2", "INT3"):
         return _quantize_int_packed(packed, fmt)
     raise ValueError(f"unsupported format for packed-MoE: {fmt}")
+
+
+def _finalize_compute_only(compute_dict: dict, *,
+                           weight_override: torch.Tensor | None = None
+                           ) -> dict[str, torch.Tensor]:
+    """Pack a compute_only result from `_quantize_2d` into the final
+    on-disk tensor dict. When `weight_override` is supplied (e.g. after
+    block-output match modified the dequantized weight), pack that
+    instead of the original `_w_dq`.
+
+    Currently only NVFP4 is supported in compute_only mode. Other
+    formats fall through to a clear error so a misuse fails loudly
+    rather than silently silently corrupting the artifact.
+    """
+    fmt = compute_dict.get("_fmt")
+    if fmt != "NVFP4":
+        raise ValueError(
+            f"_finalize_compute_only: only NVFP4 is supported "
+            f"(got fmt={fmt}). Other formats should not be in "
+            f"compute_only mode.")
+    w = compute_dict["_w_dq"] if weight_override is None else weight_override
+    nvfp4_global_real = compute_dict["_nvfp4_global_real"]
+    input_scale = compute_dict["_input_scale"]
+
+    wp, ws, wg = quantize_dequantize_nvfp4(
+        w, group_size=16,
+        global_real_override=nvfp4_global_real,
+    )
+    return {
+        "weight_packed": wp,
+        "weight_scale": ws,
+        "weight_global_scale": wg,
+        "input_global_scale": torch.tensor(
+            [float(input_scale)], dtype=torch.float32,
+        ),
+    }
 
 
 def _quantize_2d_group_same_shape(
