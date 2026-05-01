@@ -129,6 +129,7 @@ def test_l3_polish_summary_reports_flips_and_regression():
         kl_before=1.0,
         kl_after=1.2,
         elapsed_seconds=2.5,
+        frozen_dp_precision_used=0.05,
     )
 
     assert summary["l3_enabled"] is True
@@ -137,6 +138,7 @@ def test_l3_polish_summary_reports_flips_and_regression():
     assert isinstance(summary["kl_before"], float)
     assert isinstance(summary["kl_after"], float)
     assert summary["elapsed_seconds"] == pytest.approx(2.5)
+    assert summary["frozen_dp_precision_used"] == pytest.approx(0.05)
     assert summary["flip_count"] == 1
     assert summary["flips"] == [
         {

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
+from prismaquant import propagated_cost as pc
 from prismaquant.allocator_solver import Candidate
 from prismaquant.propagated_cost import (
     FrozenBudgetError,
@@ -220,7 +221,7 @@ def test_solve_frozen_l3_neighborhood_respects_remaining_budget():
         candidates,
         _specs(),
         target_bits=8.0,
-        bit_precision=0.5,
+        bit_precision=0.001,
     )
 
     assert solved["frozen"] == "MXFP8"
@@ -229,7 +230,37 @@ def test_solve_frozen_l3_neighborhood_respects_remaining_budget():
     assert chosen["b"].fmt == "NVFP4"
 
 
-def test_solve_frozen_l3_neighborhood_rejects_over_budget_frozen_choices():
+def test_solve_frozen_l3_neighborhood_falls_back_when_precision_too_tight(monkeypatch):
+    stats = {f"layer{i}": _stat(n_params=100) for i in range(15)}
+    assignment = {name: "NVFP4" for name in stats}
+    candidates = {
+        name: [
+            Candidate("NVFP4", 4.0, 50, 1.0),
+            Candidate("MXFP8", 8.0, 100, 0.0),
+            Candidate("BF16", 16.0, 200, 2.0),
+        ]
+        for name in stats
+    }
+    monkeypatch.setattr(pc, "solve_allocation", lambda *_args, **_kwargs: None)
+
+    solved, chosen, meta = solve_frozen_l3_neighborhood(
+        stats,
+        assignment,
+        candidates,
+        _specs(),
+        target_bits=4.4091,
+        bit_precision=0.001,
+        return_metadata=True,
+    )
+
+    used_bits = sum(8.0 * chosen[name].memory_bytes for name in chosen)
+    total_params = sum(entry["n_params"] for entry in stats.values())
+    assert used_bits <= 4.4091 * total_params + 1e-6
+    assert list(solved.values()).count("MXFP8") == 1
+    assert meta["frozen_dp_precision_used"] == "greedy"
+
+
+def test_solve_frozen_l3_neighborhood_still_raises_when_frozen_exceeds_budget():
     stats = {name: _stat(n_params=100) for name in ("open", "frozen")}
     assignment = {"open": "MXFP8", "frozen": "BF16"}
     candidates = {"open": [Candidate("NVFP4", 4.0, 50, 0.0)]}

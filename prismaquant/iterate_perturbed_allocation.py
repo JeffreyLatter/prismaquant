@@ -523,6 +523,7 @@ def build_l3_polish_summary(
     kl_before: float,
     kl_after: float,
     elapsed_seconds: float = 0.0,
+    frozen_dp_precision_used=None,
     accepted: bool = True,
 ) -> dict:
     flips = []
@@ -558,6 +559,7 @@ def build_l3_polish_summary(
         "kl_after": float(kl_after),
         "regression": regression,
         "elapsed_seconds": float(elapsed_seconds),
+        "frozen_dp_precision_used": frozen_dp_precision_used,
         "flip_count": len(flips),
         "flips": flips,
         "selected": [
@@ -1159,16 +1161,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         frozen_solve_start = _phase_start("[l3] frozen DP solve")
         if l3_candidates:
-            polished_assignment, _chosen = solve_frozen_l3_neighborhood(
+            polished_assignment, _chosen, frozen_dp_meta = solve_frozen_l3_neighborhood(
                 stats,
                 l2_assignment,
                 l3_candidates,
                 specs,
                 target_bits=args.target_bits,
                 bit_precision=args.bit_precision,
+                return_metadata=True,
             )
         else:
             polished_assignment = dict(l2_assignment)
+            frozen_dp_meta = {"frozen_dp_precision_used": "none"}
         frozen_solve_timing = _phase_end(
             "[l3] frozen DP solve",
             frozen_solve_start,
@@ -1251,6 +1255,7 @@ def main(argv: list[str] | None = None) -> int:
             kl_before=kl_before,
             kl_after=kl_after,
             elapsed_seconds=l3_elapsed_seconds,
+            frozen_dp_precision_used=frozen_dp_meta["frozen_dp_precision_used"],
         )
         l3_summary["cost_path"] = str(l3_cost_path)
         l3_summary["timing"] = {

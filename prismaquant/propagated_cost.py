@@ -311,6 +311,53 @@ def build_l3_candidates(
     return out
 
 
+def _candidate_total_bits(candidate: Candidate) -> float:
+    return 8.0 * float(candidate.memory_bytes)
+
+
+def _greedy_l3_under_budget(
+    open_stats: Mapping[str, Mapping],
+    open_cands: Mapping[str, list[Candidate]],
+    remaining_bits: float,
+) -> tuple[dict[str, str], dict[str, Candidate]]:
+    names = sorted(open_cands)
+    min_by_name = {
+        name: min(open_cands[name], key=lambda c: (_candidate_total_bits(c), c.fmt))
+        for name in names
+    }
+    min_suffix = [0.0 for _ in range(len(names) + 1)]
+    for idx in range(len(names) - 1, -1, -1):
+        min_suffix[idx] = (
+            min_suffix[idx + 1]
+            + _candidate_total_bits(min_by_name[names[idx]])
+        )
+
+    used_bits = 0.0
+    assignment: dict[str, str] = {}
+    chosen: dict[str, Candidate] = {}
+    for idx, name in enumerate(names):
+        options = sorted(
+            open_cands[name],
+            key=lambda c: (c.predicted_dloss, _candidate_total_bits(c), c.fmt),
+        )
+        picked = None
+        for cand in options:
+            total_if_picked = (
+                used_bits
+                + _candidate_total_bits(cand)
+                + min_suffix[idx + 1]
+            )
+            if total_if_picked <= remaining_bits + 1e-6:
+                picked = cand
+                break
+        if picked is None:
+            picked = min_by_name[name]
+        assignment[name] = picked.fmt
+        chosen[name] = picked
+        used_bits += _candidate_total_bits(picked)
+    return assignment, chosen
+
+
 def solve_frozen_l3_neighborhood(
     stats: Mapping[str, Mapping],
     assignment: Mapping[str, str],
@@ -319,6 +366,7 @@ def solve_frozen_l3_neighborhood(
     *,
     target_bits: float,
     bit_precision: float,
+    return_metadata: bool = False,
 ) -> tuple[dict[str, str], dict[str, Candidate]]:
     """Solve L3 candidates while freezing all non-neighborhood L2 choices."""
     specs_by_name = {s.name: s for s in specs}
@@ -331,7 +379,10 @@ def solve_frozen_l3_neighborhood(
     total_params = sum(int(stats[n].get("n_params", 0) or 0) for n in all_names)
     open_params = sum(int(stats[n].get("n_params", 0) or 0) for n in open_names)
     if total_params <= 0:
-        return dict(assignment), {}
+        result = (dict(assignment), {})
+        if return_metadata:
+            return (*result, {"frozen_dp_precision_used": "none"})
+        return result
 
     target_total_bits = float(target_bits) * float(total_params)
     frozen_bits = assignment_bit_total(stats, frozen_assignment, specs_by_name)
@@ -343,20 +394,35 @@ def solve_frozen_l3_neighborhood(
             f"{target_bits:.6f} bpp target)."
         )
     if open_params <= 0:
-        return dict(assignment), {}
+        result = (dict(assignment), {})
+        if return_metadata:
+            return (*result, {"frozen_dp_precision_used": "none"})
+        return result
 
     open_target_bits = remaining_bits / float(open_params)
     open_stats = {name: dict(stats[name]) for name in sorted(open_names)}
     open_cands = {name: list(l3_candidates[name]) for name in sorted(open_names)}
     result = solve_allocation(open_stats, open_cands, open_target_bits, bit_precision)
+    precision_used: float | str = float(bit_precision)
     if result is None:
-        raise FrozenBudgetError(
-            "L3 polish infeasible: measured neighborhood cannot satisfy "
-            f"remaining budget {open_target_bits:.6f} bpp after frozen choices."
-        )
+        for fallback_precision in (0.01, 0.05, 0.25, 0.5, 1.0):
+            result = solve_allocation(
+                open_stats,
+                open_cands,
+                open_target_bits,
+                fallback_precision,
+            )
+            if result is not None:
+                precision_used = fallback_precision
+                break
+    if result is None:
+        result = _greedy_l3_under_budget(open_stats, open_cands, remaining_bits)
+        precision_used = "greedy"
     open_assignment, chosen = result
     merged = dict(assignment)
     merged.update(open_assignment)
+    if return_metadata:
+        return merged, chosen, {"frozen_dp_precision_used": precision_used}
     return merged, chosen
 
 
