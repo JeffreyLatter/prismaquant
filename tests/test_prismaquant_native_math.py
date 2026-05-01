@@ -5,7 +5,11 @@ import torch.nn as nn
 
 from prismaquant import format_registry as fr
 from prismaquant.allocator import build_candidates
-from prismaquant.calibrate_allocator import install_activation_hooks, select_targets
+from prismaquant.calibrate_allocator import (
+    install_activation_hooks,
+    per_format_predicted_breakdown,
+    select_targets,
+)
 from prismaquant.sensitivity_probe import discover_moe_structure
 
 
@@ -188,6 +192,45 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         self.assertAlmostEqual(by_fmt["NVFP4"].predicted_dloss, 7.0)
         self.assertAlmostEqual(by_fmt["MXFP4"].predicted_dloss, 2.0)
         self.assertAlmostEqual(by_fmt["BF16"].predicted_dloss, 0.5 * 3.0 * 0.25)
+
+    def test_calibration_breakdown_uses_allocator_candidate_basis(self):
+        assignment = {
+            "layer.output_measured": "NVFP4",
+            "layer.packed_expert": "MXFP4",
+        }
+        stats = {
+            "layer.output_measured": {
+                "h_trace": 2.0,
+                "out_features": 8,
+                "in_features": 16,
+                "n_params": 128,
+            },
+            "layer.packed_expert": {
+                "h_trace": 3.0,
+                "out_features": 8,
+                "in_features": 16,
+                "n_params": 256,
+                "num_experts": 2,
+            },
+        }
+        costs = {
+            "layer.output_measured": {
+                "NVFP4": {"weight_mse": 10.0, "output_mse": 0.25},
+            },
+            "layer.packed_expert": {
+                "MXFP4": {
+                    "weight_mse": 0.20,
+                    "output_mse": 0.0,
+                    "output_mse_measured": False,
+                    "predicted_dloss": 5.0,
+                },
+            },
+        }
+
+        breakdown = per_format_predicted_breakdown(assignment, stats, costs)
+
+        self.assertAlmostEqual(breakdown["NVFP4"], 0.5 * 2.0 * 0.25)
+        self.assertAlmostEqual(breakdown["MXFP4"], 5.0)
 
     def test_select_targets_returns_baseline_knee_high(self):
         curve = [

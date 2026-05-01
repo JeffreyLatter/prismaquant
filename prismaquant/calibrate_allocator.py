@@ -13,8 +13,8 @@ This script:
      calibration corpus
   4. Fits per-format scalar gains α_f by non-negative least squares so
      that  Σ_f α_f · S_f(pt)  ≈  ΔKL_pt  across the bake-off frontier,
-     where  S_f(pt) = Σ_{layer assigned to f at pt} 0.5 · h · weight_mse
-     is the per-format predicted contribution at frontier point pt.
+     where  S_f(pt) is the allocator's own per-candidate predicted Δloss
+     contribution grouped by format at frontier point pt.
 
 The fitted gains land in the output JSON under `calibrated_gains` and
 are consumed by `allocator.py --calibration <this output>`. With a
@@ -46,10 +46,10 @@ from prismaquant.allocator import (
     compute_achieved,
     expand_moe_assignment,
     kneedle,
-    predicted_dloss,
     promote_fused,
     solve_allocation,
 )
+from prismaquant.allocator_candidates import cost_entry_predicted_dloss
 from prismaquant.schemas import validate_cost_payload, validate_probe_payload
 
 
@@ -79,11 +79,12 @@ def per_format_predicted_breakdown(
     by the assigned format. Returned dict maps fmt → S_f(pt)."""
     out: dict[str, float] = {}
     for name, fmt in assignment.items():
-        entry = costs_alloc[name].get(fmt, {})
-        contrib = predicted_dloss(
-            stats_alloc[name]["h_trace"],
-            entry.get("weight_mse", 0.0),
-        )
+        entry = {}
+        for alias in fr.aliases_for(fmt):
+            entry = costs_alloc.get(name, {}).get(alias, {})
+            if entry:
+                break
+        contrib = cost_entry_predicted_dloss(stats_alloc[name], entry)
         out[fmt] = out.get(fmt, 0.0) + contrib
     return out
 
