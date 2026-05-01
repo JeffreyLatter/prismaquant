@@ -8,6 +8,7 @@ from prismaquant import format_registry as fr
 from prismaquant.allocator_solver import Candidate
 from prismaquant.propagated_cost import (
     FrozenBudgetError,
+    L3UnsupportedTargetError,
     L3NeighborhoodEntry,
     build_l3_candidates,
     measure_propagated_costs,
@@ -32,6 +33,14 @@ def _stat(n_params=128 * 128):
             "MXFP8": int(n_params * 8 / 8),
             "BF16": int(n_params * 16 / 8),
         },
+    }
+
+
+def _cost_table(current=1.0, cheaper=1.04):
+    return {
+        "NVFP4": {"predicted_dloss": cheaper},
+        "MXFP8": {"predicted_dloss": current},
+        "BF16": {"predicted_dloss": 0.0},
     }
 
 
@@ -121,6 +130,56 @@ def test_select_l3_neighborhood_caps_and_keeps_safety_layers():
     assert len(selected) == 2
     assert "layer19" in {entry.name for entry in selected}
     assert any("high_l2_cost" in entry.reasons for entry in selected)
+
+
+def test_select_l3_neighborhood_errors_on_packed_experts():
+    packed = dict(_stat())
+    packed.update({
+        "num_experts": 4,
+        "_packed_experts_module": "model.layers.0.mlp.experts",
+        "_packed_param": "gate_up_proj",
+    })
+    stats = {
+        "model.layers.0.mlp.experts.gate_up_proj": packed,
+        "model.layers.0.self_attn.q_proj": _stat(),
+    }
+    assignment = {name: "MXFP8" for name in stats}
+    costs = {name: _cost_table() for name in stats}
+
+    with pytest.raises(L3UnsupportedTargetError) as exc:
+        select_l3_neighborhood(
+            stats,
+            costs,
+            assignment,
+            _specs(),
+            min_fraction=1.0,
+            max_fraction=1.0,
+            safety_fraction=0.0,
+        )
+
+    assert "model.layers.0.mlp.experts.gate_up_proj" in str(exc.value)
+    assert "L3 polish does not yet support packed expert tensors" in str(exc.value)
+
+
+def test_select_l3_neighborhood_passes_dense_only():
+    stats = {
+        "model.layers.0.self_attn.q_proj": _stat(),
+        "model.layers.0.self_attn.k_proj": _stat(),
+    }
+    assignment = {name: "MXFP8" for name in stats}
+    costs = {name: _cost_table() for name in stats}
+
+    selected = select_l3_neighborhood(
+        stats,
+        costs,
+        assignment,
+        _specs(),
+        min_fraction=1.0,
+        max_fraction=1.0,
+        safety_fraction=0.0,
+    )
+
+    assert {entry.name for entry in selected} == set(stats)
 
 
 def test_build_l3_candidates_uses_propagated_end_kl_only():

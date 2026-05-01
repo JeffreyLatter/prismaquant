@@ -20,7 +20,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
-from prismaquant.allocator_candidates import cost_entry_predicted_dloss
+from prismaquant.allocator_candidates import (
+    _stats_indicates_packed_expert,
+    cost_entry_predicted_dloss,
+)
 from prismaquant.allocator_solver import Candidate, _shape_from_stats, solve_allocation
 from prismaquant.build_rtn_cache import kl_divergence
 from prismaquant.perturbed_x_cache import (
@@ -43,6 +46,10 @@ class L3NeighborhoodEntry:
 
 class FrozenBudgetError(RuntimeError):
     """Raised when frozen L2 choices make the L3 neighborhood infeasible."""
+
+
+class L3UnsupportedTargetError(RuntimeError):
+    """Raised when L3 selection reaches targets the hook path cannot measure."""
 
 
 @dataclass(frozen=True)
@@ -167,6 +174,11 @@ def _relative_margin(values: list[float], current_cost: float) -> float:
     return float(min(margins))
 
 
+def _is_l3_unsupported_target(stats_entry: Mapping) -> bool:
+    """Return True for probe entries whose live module is not L3-hookable."""
+    return _stats_indicates_packed_expert(dict(stats_entry))
+
+
 def select_l3_neighborhood(
     stats: Mapping,
     costs: Mapping,
@@ -241,6 +253,19 @@ def select_l3_neighborhood(
             _add(entry, "fill_min_fraction")
             if len(by_name) >= min_count:
                 break
+
+    unsupported = sorted(
+        name
+        for name in by_name
+        if _is_l3_unsupported_target(stats[name])
+    )
+    if unsupported:
+        raise L3UnsupportedTargetError(
+            "L3 polish does not yet support packed expert tensors. "
+            f"Unsupported targets: {unsupported}. "
+            "Re-run without --l3-polish for L2-only allocation, or wait "
+            "for packed-expert L3 support."
+        )
 
     selected = list(by_name.values())
     if len(selected) > max_count:
