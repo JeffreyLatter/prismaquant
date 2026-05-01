@@ -576,6 +576,7 @@ class BudgetResult:
     anchor_stale: bool
     achieved_bpp: float
     predicted_dloss: float
+    l2_kl: float
     validation_kl: float
     accepted: bool
     regression: bool
@@ -592,6 +593,7 @@ class BudgetResult:
             "anchor_stale": self.anchor_stale,
             "achieved_bpp": self.achieved_bpp,
             "predicted_dloss": self.predicted_dloss,
+            "l2_kl": self.l2_kl,
             "validation_kl": self.validation_kl,
             "accepted": self.accepted,
             "regression": self.regression,
@@ -840,6 +842,7 @@ def _write_pareto_outputs(
         "anchor_stale",
         "achieved_bpp",
         "predicted_dloss",
+        "l2_kl",
         "validation_kl",
         "accepted",
         "regression",
@@ -1167,6 +1170,7 @@ def solve_target_from_anchor(
         anchor_stale=bool(abs(float(target_bpp) - float(anchor.anchor_bpp)) > 1e-12),
         achieved_bpp=float(histogram["achieved_bpp"]),
         predicted_dloss=float(predicted),
+        l2_kl=float(anchor.l2_kl),
         validation_kl=float(validation_kl),
         accepted=accepted,
         regression=regression,
@@ -1215,12 +1219,21 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
         for target in cluster["targets"]:
             result = run_single_budget(args, float(target), reusable_anchor=anchor)
             results.append(result)
+            l2_kl = float(result.l2_kl)
+            l3_kl = float(result.validation_kl)
             _emit(
                 f"[multi] target {result.target_bpp:.2f}: "
                 f"anchor={result.anchor_bpp:.2f} "
-                f"KL={result.validation_kl:.6g} "
+                f"L2_KL={l2_kl:.4g} "
+                f"L3_KL={l3_kl:.4g} "
+                f"delta={l3_kl - l2_kl:+.4g} "
                 f"accepted={str(result.accepted).lower()}"
             )
+            if not result.accepted and l3_kl > l2_kl * 1.05:
+                _emit(
+                    "[multi] WARNING: L3 polish regressed L2 by >5% — "
+                    "likely non-additive cost interaction; consider --l3-mode selective"
+                )
     csv_path, json_path = _write_pareto_outputs(
         runtime.output_root,
         results,
@@ -1338,6 +1351,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
         "knee": {
             **knee_meta,
             "chosen_bpp": float(chosen.target_bpp),
+            "l2_kl": float(chosen.l2_kl),
             "validation_kl": float(chosen.validation_kl),
             "assignment": str(knee_assignment_path),
             "layer_config": str(knee_config_path),

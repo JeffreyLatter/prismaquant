@@ -688,7 +688,17 @@ def test_multi_budget_clusters_by_tolerance():
     assert [cluster["targets"] for cluster in clusters] == [[t] for t in targets]
 
 
-def _dummy_budget_result(target_bpp, anchor_bpp, tmp_path):
+def _dummy_budget_result(
+    target_bpp,
+    anchor_bpp,
+    tmp_path,
+    *,
+    l2_kl=0.25,
+    validation_kl=None,
+    accepted=True,
+):
+    if validation_kl is None:
+        validation_kl = 1.0 / float(target_bpp)
     return ipa.BudgetResult(
         target_bpp=float(target_bpp),
         anchor_bpp=float(anchor_bpp),
@@ -696,9 +706,10 @@ def _dummy_budget_result(target_bpp, anchor_bpp, tmp_path):
         anchor_stale=target_bpp != anchor_bpp,
         achieved_bpp=float(target_bpp),
         predicted_dloss=0.1,
-        validation_kl=1.0 / float(target_bpp),
-        accepted=True,
-        regression=False,
+        l2_kl=float(l2_kl),
+        validation_kl=float(validation_kl),
+        accepted=bool(accepted),
+        regression=bool(float(validation_kl) > float(l2_kl)),
         flips_accepted=1,
         format_histogram={"counts": {"BF16": 1}, "total": 1},
         assignment={"layer": "BF16"},
@@ -728,6 +739,55 @@ def test_multi_budget_reanchor_runs_full_l2_l3(tmp_path, monkeypatch):
 
     assert ipa.run_multi_budget(args, runtime) == 0
     assert calls == {"l2": 3, "l3": 3}
+
+
+def test_multi_budget_emit_and_json_include_l2_kl_on_regression(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    result = _dummy_budget_result(
+        4.0,
+        4.0,
+        tmp_path,
+        l2_kl=1.0,
+        validation_kl=1.2,
+        accepted=False,
+    )
+
+    def _anchor(_args, _runtime, anchor_bpp, *, measure_all_formats=False):
+        return SimpleNamespace(anchor_bpp=float(anchor_bpp))
+
+    def _single(_args, _target_bits, reusable_anchor=None):
+        return result
+
+    monkeypatch.setattr(ipa, "run_anchor_budget", _anchor)
+    monkeypatch.setattr(ipa, "run_single_budget", _single)
+    args = SimpleNamespace(
+        target_bits_list="4.0",
+        target_bits_share_tolerance=0.25,
+        target_bits_anchor=None,
+    )
+
+    assert result.l2_kl == pytest.approx(1.0)
+    assert ipa.run_multi_budget(args, SimpleNamespace(output_root=tmp_path)) == 0
+
+    out = capsys.readouterr().out
+    assert "L2_KL=1" in out
+    assert "L3_KL=1.2" in out
+    assert "delta=+0.2" in out
+    assert (
+        "[multi] WARNING: L3 polish regressed L2 by >5% — "
+        "likely non-additive cost interaction; consider --l3-mode selective"
+    ) in out
+
+    with open(tmp_path / "pareto_curve.json") as f:
+        pareto = json.load(f)
+    with open(tmp_path / "summary.json") as f:
+        summary = json.load(f)
+
+    assert pareto["points"][0]["l2_kl"] == pytest.approx(1.0)
+    assert summary["pareto"]["points"][0]["l2_kl"] == pytest.approx(1.0)
 
 
 def test_multi_budget_anchor_l3_passes_progress_callback(
