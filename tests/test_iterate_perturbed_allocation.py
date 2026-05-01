@@ -623,3 +623,236 @@ def test_global_l3_respects_regression_rollback(tmp_path, monkeypatch):
     assert summary["regression"] is True
     assert summary["accepted"] is False
     assert summary["accepted_assignment"] == "l2"
+
+
+def test_multi_budget_clusters_by_tolerance():
+    targets = [4.0, 4.5, 5.0, 5.5, 6.0, 6.5]
+
+    clusters = ipa.plan_target_bit_clusters(targets, 0.25)
+
+    assert len(clusters) == 6
+    assert [cluster["targets"] for cluster in clusters] == [[t] for t in targets]
+
+
+def _dummy_budget_result(target_bpp, anchor_bpp, tmp_path):
+    return ipa.BudgetResult(
+        target_bpp=float(target_bpp),
+        anchor_bpp=float(anchor_bpp),
+        distance_from_anchor=abs(float(target_bpp) - float(anchor_bpp)),
+        anchor_stale=target_bpp != anchor_bpp,
+        achieved_bpp=float(target_bpp),
+        predicted_dloss=0.1,
+        validation_kl=1.0 / float(target_bpp),
+        accepted=True,
+        regression=False,
+        flips_accepted=1,
+        format_histogram={"counts": {"BF16": 1}, "total": 1},
+        assignment={"layer": "BF16"},
+        layer_config_path=str(tmp_path / f"final_layer_config_bpp_{target_bpp}.json"),
+    )
+
+
+def test_multi_budget_reanchor_runs_full_l2_l3(tmp_path, monkeypatch):
+    calls = {"l2": 0, "l3": 0}
+
+    def _anchor(_args, _runtime, anchor_bpp, *, measure_all_formats=False):
+        calls["l2"] += 1
+        calls["l3"] += 1
+        return SimpleNamespace(anchor_bpp=float(anchor_bpp))
+
+    def _single(_args, target_bits, reusable_anchor=None):
+        return _dummy_budget_result(target_bits, reusable_anchor.anchor_bpp, tmp_path)
+
+    monkeypatch.setattr(ipa, "run_anchor_budget", _anchor)
+    monkeypatch.setattr(ipa, "run_single_budget", _single)
+    args = SimpleNamespace(
+        target_bits_list="4.0,4.5,5.0",
+        target_bits_share_tolerance=0.25,
+        target_bits_anchor=None,
+    )
+    runtime = SimpleNamespace(output_root=tmp_path)
+
+    assert ipa.run_multi_budget(args, runtime) == 0
+    assert calls == {"l2": 3, "l3": 3}
+
+
+def test_multi_budget_widens_format_filter(tmp_path, monkeypatch):
+    specs = [
+        ipa.fr.get_format(name)
+        for name in [
+            "NVFP4",
+            "MXFP4",
+            "MXFP6_E3M2",
+            "MXFP6_E2M3",
+            "MXFP8",
+            "MXFP8_E5M2",
+            "BF16",
+        ]
+    ]
+    entry = L3NeighborhoodEntry(
+        name="layer",
+        current_format="MXFP6_E3M2",
+        formats=("NVFP4", "MXFP6_E3M2", "BF16"),
+        margin=0.1,
+        l2_current_cost=1.0,
+        reasons=("global",),
+    )
+
+    widened = ipa.widen_l3_neighborhood_formats([entry], specs)
+
+    assert widened[0].formats == tuple(spec.name for spec in specs)
+    assert "all_formats" in widened[0].reasons
+
+    flags = []
+
+    def _anchor(_args, _runtime, anchor_bpp, *, measure_all_formats=False):
+        flags.append(bool(measure_all_formats))
+        return SimpleNamespace(anchor_bpp=float(anchor_bpp))
+
+    def _single(_args, target_bits, reusable_anchor=None):
+        return _dummy_budget_result(target_bits, reusable_anchor.anchor_bpp, tmp_path)
+
+    monkeypatch.setattr(ipa, "run_anchor_budget", _anchor)
+    monkeypatch.setattr(ipa, "run_single_budget", _single)
+    args = SimpleNamespace(
+        target_bits_list="4.0,5.5",
+        target_bits_share_tolerance=0.25,
+        target_bits_anchor=None,
+    )
+
+    assert ipa.run_multi_budget(args, SimpleNamespace(output_root=tmp_path)) == 0
+    assert flags and all(flags)
+
+
+def test_knee_search_segmented_kneedle():
+    values = {
+        4.0: 1.0,
+        5.0: 0.5,
+        5.5: 0.5,
+        5.75: 0.45,
+        6.0: 0.2,
+        6.5: 0.3,
+        7.0: 0.18,
+        8.0: 0.17,
+    }
+
+    def _evaluate(bpp):
+        return values.get(round(float(bpp), 2), 1.0 / float(bpp))
+
+    knee, points, meta = ipa.adaptive_segmented_kneedle(
+        _evaluate,
+        4.0,
+        8.0,
+        tolerance=0.25,
+        max_evaluations=8,
+    )
+
+    assert knee == pytest.approx(6.0)
+    assert len(points) <= 8
+    assert meta["mode"] == "kneedle"
+
+
+def test_knee_threshold_mode_finds_lowest_bpp():
+    knee, points, meta = ipa.threshold_knee_search(
+        lambda bpp: 10.0 - float(bpp),
+        4.0,
+        8.0,
+        threshold_kl=4.0,
+        tolerance=0.1,
+        max_evaluations=20,
+    )
+
+    assert knee == pytest.approx(6.0, abs=0.1)
+    assert len(points) <= 20
+    assert meta["mode"] == "threshold"
+
+
+def test_knee_search_max_evaluations_stop():
+    calls = {"n": 0}
+
+    def _evaluate(bpp):
+        calls["n"] += 1
+        return 1.0 / float(bpp)
+
+    _knee, points, _meta = ipa.adaptive_segmented_kneedle(
+        _evaluate,
+        4.0,
+        8.0,
+        tolerance=0.001,
+        max_evaluations=4,
+    )
+
+    assert calls["n"] == 4
+    assert len(points) == 4
+
+
+def test_main_dispatches_target_bits_list_with_one_model_load(tmp_path, monkeypatch):
+    probe_path = tmp_path / "probe.pkl"
+    costs_path = tmp_path / "costs.pkl"
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "out"
+    stats = {"layer": _tiny_stat()}
+    costs = {
+        "layer": {
+            "INT8_W8A16": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    }
+    with open(probe_path, "wb") as f:
+        pickle.dump({"stats": stats}, f)
+    with open(costs_path, "wb") as f:
+        pickle.dump({"costs": costs}, f)
+
+    class _Tokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    load_calls = {"n": 0}
+    captured = {}
+
+    def _load_model(*_args, **_kwargs):
+        load_calls["n"] += 1
+        return _TinyLogitsModel()
+
+    def _run_multi(args, runtime):
+        captured["l3_mode"] = args.l3_mode
+        captured["model"] = runtime.model
+        captured["targets"] = ipa.parse_target_bits_list(args.target_bits_list)
+        return 0
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=_Tokenizer),
+    )
+    monkeypatch.setattr(ipa, "validate_probe_payload", lambda *_args: None)
+    monkeypatch.setattr(ipa, "validate_cost_payload", lambda *_args: None)
+    monkeypatch.setattr(ipa, "load_text_model_under_work_root", _load_model)
+    monkeypatch.setattr(
+        ipa,
+        "load_wikitext_calibration",
+        lambda _tokenizer, n_samples, seqlen: torch.zeros(
+            (n_samples, seqlen),
+            dtype=torch.long,
+        ),
+    )
+    monkeypatch.setattr(ipa, "cache_reference_log_probs", lambda *_args: [])
+    monkeypatch.setattr(ipa, "run_multi_budget", _run_multi)
+
+    rc = ipa.main([
+        "--model", "tiny",
+        "--probe", str(probe_path),
+        "--initial-costs", str(costs_path),
+        "--formats", "INT8_W8A16,BF16",
+        "--target-bits-list", "4.5,5.0",
+        "--work-dir", str(work_dir),
+        "--output-dir", str(output_dir),
+        "--l3-polish",
+    ])
+
+    assert rc == 0
+    assert load_calls["n"] == 1
+    assert captured["l3_mode"] == "global"
+    assert captured["targets"] == [4.5, 5.0]
+    assert isinstance(captured["model"], _TinyLogitsModel)

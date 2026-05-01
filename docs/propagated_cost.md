@@ -82,6 +82,19 @@ When enabled, `iterate_perturbed_allocation.py` writes:
 The summary reports L3 mode, selected or total Linears, measured count, KL
 before/after, flip count, per-Linear flips, and whether `kl_after > kl_before`.
 
+Multi-budget runs add:
+
+- `pareto_curve.csv`;
+- `pareto_curve.json`;
+- `final_layer_config_bpp_X.XX.json` for each requested target;
+- a `pareto` field in `summary.json`.
+
+Knee-search runs also write:
+
+- `knee_assignment.json`;
+- `final_layer_config_knee.json`;
+- a `knee` field in `summary.json` describing the selected point.
+
 ## Flags
 
 ```bash
@@ -108,6 +121,42 @@ Useful tuning flags:
   fallback to use up to 5% of total target bits as hard budget slack.
 
 L3 is one final pass by design; per-iteration L3 is not exposed yet.
+
+## Multi-Budget And Knee Search
+
+`--target-bits-list` evaluates several budgets in one process:
+
+```bash
+python3 -m prismaquant.iterate_perturbed_allocation \
+  ... \
+  --l3-polish \
+  --target-bits-list 4.5,5.0,5.5,6.0,6.5
+```
+
+The list mode clusters targets by `--target-bits-share-tolerance` (default
+`0.25` bpp). Each cluster anchor runs a full L2 convergence and global L3
+measurement; targets inside the cluster reuse that anchor's L3 costs for DP and
+then run their own validation KL. When the requested span is larger than 1 bpp,
+L3 measures every format in the menu for each candidate so lower and higher
+budgets are not constrained by the anchor's local format filter.
+
+`--knee-search` adaptively samples the Pareto curve:
+
+```bash
+python3 -m prismaquant.iterate_perturbed_allocation \
+  ... \
+  --l3-polish \
+  --knee-search \
+  --knee-bpp-min 4.0 \
+  --knee-bpp-max 8.0
+```
+
+The default `--knee-mode kneedle` starts with endpoints plus midpoint, scores
+the normalized validation-KL curve by distance to the endpoint chord, and
+refines the largest interval adjacent to the current best knee until
+`--knee-tolerance` or `--knee-max-evaluations` stops it. Threshold mode instead
+uses bisection to find the lowest bpp satisfying
+`--knee-threshold-kl`.
 
 The Qwen 4B smoke launcher exposes the final-pass path through:
 
