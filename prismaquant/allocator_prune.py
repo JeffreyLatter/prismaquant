@@ -180,7 +180,12 @@ def aggregate_moe_candidates(
                 if c is None:
                     c = {"weight_mse": mean_weight_mse,
                          "output_mse": mean_output_mse}
-                if "predicted_dloss" in c:
+                # Mirrors build_candidates: prefer joint output_mse-based
+                # Δloss; legacy fields kept for old cost pickles.
+                if "output_mse" in c:
+                    h_i = stats[m_]["h_trace"]
+                    sum_pred += 0.5 * h_i * float(c["output_mse"])
+                elif "predicted_dloss" in c:
                     sum_pred += float(c["predicted_dloss"])
                 else:
                     h_i = stats[m_]["h_trace"]
@@ -193,7 +198,7 @@ def aggregate_moe_candidates(
 
             super_cost[spec.name] = {
                 "weight_mse": effective_mse,
-                "output_mse": mean_output_mse,
+                "output_mse": effective_mse,
                 "rel_output_mse": mean_output_mse,
                 "predicted_dloss": sum_pred,
             }
@@ -260,12 +265,18 @@ def aggregate_moe_candidates(
             for m_ in members:
                 c = _member_cost(m_, spec.name)
                 if c is None:
-                    fb_weight_mse = entry["weight_mse"]
+                    # Fall back to super-cost effective_mse (joint).
+                    fb_mse = entry["output_mse"]
                     per_member_dloss[m_] = (
-                        0.5 * float(stats[m_]["h_trace"]) * fb_weight_mse * gain
+                        0.5 * float(stats[m_]["h_trace"]) * fb_mse * gain
                     )
                 else:
-                    if "predicted_dloss" in c:
+                    if "output_mse" in c:
+                        per_member_dloss[m_] = (
+                            0.5 * float(stats[m_]["h_trace"])
+                            * float(c["output_mse"]) * gain
+                        )
+                    elif "predicted_dloss" in c:
                         per_member_dloss[m_] = float(c["predicted_dloss"]) * gain
                     else:
                         per_member_dloss[m_] = (
@@ -281,7 +292,9 @@ def aggregate_moe_candidates(
 
             for ratio in effective_prune_ratios:
                 if ratio <= 0.0 or num_experts_total == 0:
-                    predicted = predicted_dloss(sum_h, entry["weight_mse"], gain=gain)
+                    # super_cost stores effective_mse in both fields; use
+                    # the joint value to stay consistent with members.
+                    predicted = predicted_dloss(sum_h, entry["output_mse"], gain=gain)
                     cands.append(Candidate(
                         fmt=spec.name,
                         bits_per_param=base_bits_per_param,

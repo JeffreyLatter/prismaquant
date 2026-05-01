@@ -59,8 +59,9 @@ class TestPrismaQuantFormatRegistry(unittest.TestCase):
 
 class TestPrismaQuantAllocatorMath(unittest.TestCase):
     def test_build_candidates_uses_shape_aware_bits(self):
-        # Predicted Δloss = 0.5 · h_trace · weight_mse  (closed-form
-        # diagonal-Fisher term; see allocator.py module docstring eq. 3).
+        # Predicted Δloss = 0.5 · h_trace · output_mse  (joint W·X
+        # perturbation under diagonal-Fisher curvature; output_mse is
+        # the cost step's W*A*-aware error metric).
         stats = {
             "layer.weight": {
                 "h_trace": 2.0,
@@ -85,7 +86,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             by_fmt["FP8_E4M3"].memory_bytes,
             fr.get_format("FP8_E4M3").memory_bytes_for_shape((5, 7)),
         )
-        self.assertAlmostEqual(by_fmt["FP8_E4M3"].predicted_dloss, 0.5 * 2.0 * 0.10)
+        self.assertAlmostEqual(by_fmt["FP8_E4M3"].predicted_dloss, 0.5 * 2.0 * 0.25)
         self.assertAlmostEqual(by_fmt["BF16"].predicted_dloss, 0.0)
 
     def test_build_candidates_prices_source_fp8_below_mxfp8(self):

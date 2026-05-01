@@ -117,7 +117,19 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 masked_by_shape.setdefault(spec.name, []).append(name)
                 continue
             gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
-            if "predicted_dloss" in entry:
+            # Always use joint output perturbation (output_mse), not just
+            # weight error. For W*A* formats (NVFP4/W4A4, MXFP8/W8A8) the
+            # runtime error is dominated by activation quantization, not
+            # weight quantization. Using weight_mse alone undercounts MXFP8
+            # against NVFP4 because MXFP8 wins on weight precision but
+            # loses on group_size=32 (vs NVFP4's group_size=16) activation
+            # scaling — invisible to a weight-only Δloss model. Falls back
+            # to the legacy weight_mse formula when output_mse isn't in
+            # the cost pickle (older runs).
+            if "output_mse" in entry:
+                output_mse = float(entry["output_mse"])
+                predicted = predicted_dloss(h_trace, output_mse, gain=gain)
+            elif "predicted_dloss" in entry:
                 predicted = float(entry["predicted_dloss"]) * gain
             else:
                 weight_mse = float(entry.get("weight_mse", 0.0))
@@ -219,7 +231,12 @@ def aggregate_fused_siblings(
             sum_pred = 0.0
             for m in members:
                 c = costs[m][spec.name]
-                if "predicted_dloss" in c:
+                # Mirrors build_candidates: prefer joint output_mse-based
+                # Δloss; fall back to legacy fields for older cost pickles.
+                if "output_mse" in c:
+                    h_i = stats[m]["h_trace"]
+                    sum_pred += 0.5 * h_i * float(c["output_mse"])
+                elif "predicted_dloss" in c:
                     sum_pred += float(c["predicted_dloss"])
                 else:
                     h_i = stats[m]["h_trace"]

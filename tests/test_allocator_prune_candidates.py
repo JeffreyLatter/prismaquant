@@ -200,7 +200,12 @@ def test_prune_cost_matches_formula():
     )
     kept_member = "model.layers.0.mlp.experts.0.gate_proj"
     dropped_member = "model.layers.0.mlp.experts.1.gate_proj"
-    kept_dloss = costs[kept_member]["NVFP4"]["predicted_dloss"]
+    # Allocator now derives Δloss from joint output_mse, not the cost
+    # entry's predicted_dloss field (see allocator_candidates.py).
+    kept_dloss = (
+        0.5 * stats[kept_member]["h_trace"]
+        * costs[kept_member]["NVFP4"]["output_mse"]
+    )
     prune_dloss = _prune_cost_per_expert(
         saliency=0.1,
         h_trace=stats[dropped_member]["h_trace"],
@@ -226,7 +231,12 @@ def test_dead_expert_pruned_nearly_free():
         c for c in c_out[SUPER_NAME]
         if c.fmt == "NVFP4" and c.pruned_expert_ids == (1,)
     )
-    kept_dloss = costs["model.layers.0.mlp.experts.0.gate_proj"]["NVFP4"]["predicted_dloss"]
+    kept_member = "model.layers.0.mlp.experts.0.gate_proj"
+    # Allocator now derives Δloss from joint output_mse.
+    kept_dloss = (
+        0.5 * stats[kept_member]["h_trace"]
+        * costs[kept_member]["NVFP4"]["output_mse"]
+    )
     # Prune cost of dead expert = α · 0 = 0; total Δloss = kept_dloss only.
     assert cand.predicted_dloss == pytest.approx(kept_dloss, rel=1e-12)
 
