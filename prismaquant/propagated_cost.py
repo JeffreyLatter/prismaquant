@@ -386,31 +386,6 @@ def _greedy_l3_under_budget(
     return assignment, chosen, stats
 
 
-def _minimum_bpp_result_if_within_precision(
-    open_stats: Mapping[str, Mapping],
-    open_cands: Mapping[str, list[Candidate]],
-    open_target_bits: float,
-    bit_precision: float,
-) -> tuple[dict[str, str], dict[str, Candidate]] | None:
-    total_params = sum(int(open_stats[name]["n_params"]) for name in open_cands)
-    if total_params <= 0:
-        return {}, {}
-    chosen = {
-        name: min(open_cands[name], key=lambda c: (c.bits_per_param, c.fmt))
-        for name in open_cands
-    }
-    min_bpp = sum(
-        chosen[name].bits_per_param * int(open_stats[name]["n_params"])
-        for name in open_cands
-    ) / float(total_params)
-    if open_target_bits < min_bpp and min_bpp - open_target_bits <= bit_precision + 1e-12:
-        return (
-            {name: cand.fmt for name, cand in chosen.items()},
-            dict(chosen),
-        )
-    return None
-
-
 def solve_frozen_l3_neighborhood(
     stats: Mapping[str, Mapping],
     assignment: Mapping[str, str],
@@ -478,23 +453,6 @@ def solve_frozen_l3_neighborhood(
                 precision_used = fallback_precision
                 print(
                     f"[l3] frozen DP precision {fallback_precision:g}: ok",
-                    flush=True,
-                )
-                break
-            min_result = _minimum_bpp_result_if_within_precision(
-                open_stats,
-                open_cands,
-                open_target_bits,
-                fallback_precision,
-            )
-            if min_result is not None:
-                result = min_result
-                precision_used = fallback_precision
-                dp_attempts[-1]["result"] = "minimum_bpp_within_precision"
-                print(
-                    "[l3] frozen DP precision "
-                    f"{fallback_precision:g}: minimum-bpp assignment within "
-                    "precision",
                     flush=True,
                 )
                 break

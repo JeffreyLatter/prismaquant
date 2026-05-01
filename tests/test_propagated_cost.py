@@ -273,12 +273,14 @@ def test_solve_frozen_l3_neighborhood_greedy_swaps_dominated_current(monkeypatch
     }
     monkeypatch.setattr(pc, "solve_allocation", lambda *_args, **_kwargs: None)
 
+    # The target is just below the minimum-bpp candidate, so the removed
+    # min-bpp shortcut would have engaged at precision=0.01 before greedy.
     solved, _chosen, meta = solve_frozen_l3_neighborhood(
         stats,
         assignment,
         candidates,
         _specs(),
-        target_bits=6.0,
+        target_bits=3.995,
         bit_precision=0.001,
         return_metadata=True,
     )
