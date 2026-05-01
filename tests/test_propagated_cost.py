@@ -258,6 +258,34 @@ def test_solve_frozen_l3_neighborhood_falls_back_when_precision_too_tight(monkey
     assert used_bits <= 4.4091 * total_params + 1e-6
     assert list(solved.values()).count("MXFP8") == 1
     assert meta["frozen_dp_precision_used"] == "greedy"
+    assert meta["frozen_dp_greedy"]["accepted"] == 1
+
+
+def test_solve_frozen_l3_neighborhood_greedy_swaps_dominated_current(monkeypatch):
+    stats = {"layer": _stat(n_params=100)}
+    assignment = {"layer": "MXFP6_E3M2"}
+    candidates = {
+        "layer": [
+            Candidate("NVFP4", 4.0, 50, 0.1),
+            Candidate("MXFP6_E3M2", 6.0, 75, 1.0),
+            Candidate("BF16", 16.0, 200, 2.0),
+        ]
+    }
+    monkeypatch.setattr(pc, "solve_allocation", lambda *_args, **_kwargs: None)
+
+    solved, _chosen, meta = solve_frozen_l3_neighborhood(
+        stats,
+        assignment,
+        candidates,
+        _specs(),
+        target_bits=6.0,
+        bit_precision=0.001,
+        return_metadata=True,
+    )
+
+    assert solved["layer"] == "NVFP4"
+    assert meta["frozen_dp_precision_used"] == "greedy"
+    assert meta["frozen_dp_greedy"]["accepted"] == 1
 
 
 def test_solve_frozen_l3_neighborhood_still_raises_when_frozen_exceeds_budget():

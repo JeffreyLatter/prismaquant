@@ -1258,6 +1258,8 @@ def main(argv: list[str] | None = None) -> int:
             frozen_dp_precision_used=frozen_dp_meta["frozen_dp_precision_used"],
         )
         l3_summary["cost_path"] = str(l3_cost_path)
+        l3_summary["frozen_dp_attempts"] = frozen_dp_meta.get("frozen_dp_attempts")
+        l3_summary["frozen_dp_greedy"] = frozen_dp_meta.get("frozen_dp_greedy")
         l3_summary["timing"] = {
             "kl_before": kl_before_timing,
             "selection": selection_timing,

@@ -316,46 +316,99 @@ def _candidate_total_bits(candidate: Candidate) -> float:
 
 
 def _greedy_l3_under_budget(
-    open_stats: Mapping[str, Mapping],
     open_cands: Mapping[str, list[Candidate]],
+    current_assignment: Mapping[str, str],
     remaining_bits: float,
-) -> tuple[dict[str, str], dict[str, Candidate]]:
+) -> tuple[dict[str, str], dict[str, Candidate], dict]:
     names = sorted(open_cands)
-    min_by_name = {
-        name: min(open_cands[name], key=lambda c: (_candidate_total_bits(c), c.fmt))
-        for name in names
-    }
-    min_suffix = [0.0 for _ in range(len(names) + 1)]
-    for idx in range(len(names) - 1, -1, -1):
-        min_suffix[idx] = (
-            min_suffix[idx + 1]
-            + _candidate_total_bits(min_by_name[names[idx]])
-        )
-
-    used_bits = 0.0
-    assignment: dict[str, str] = {}
     chosen: dict[str, Candidate] = {}
-    for idx, name in enumerate(names):
-        options = sorted(
+    for name in names:
+        by_fmt = {c.fmt: c for c in open_cands[name]}
+        current_fmt = fr.canonical_format_name(current_assignment.get(name, "BF16"))
+        chosen[name] = by_fmt.get(current_fmt) or min(
             open_cands[name],
             key=lambda c: (c.predicted_dloss, _candidate_total_bits(c), c.fmt),
         )
-        picked = None
-        for cand in options:
-            total_if_picked = (
-                used_bits
-                + _candidate_total_bits(cand)
-                + min_suffix[idx + 1]
-            )
-            if total_if_picked <= remaining_bits + 1e-6:
-                picked = cand
-                break
-        if picked is None:
-            picked = min_by_name[name]
-        assignment[name] = picked.fmt
-        chosen[name] = picked
-        used_bits += _candidate_total_bits(picked)
-    return assignment, chosen
+
+    used_bits = sum(_candidate_total_bits(c) for c in chosen.values())
+    attempts = []
+    for name in names:
+        current = chosen[name]
+        for cand in open_cands[name]:
+            if cand.fmt == current.fmt:
+                continue
+            improvement = current.predicted_dloss - cand.predicted_dloss
+            attempts.append((improvement, name, cand))
+    attempts.sort(
+        key=lambda item: (
+            -item[0],
+            _candidate_total_bits(item[2]),
+            item[1],
+            item[2].fmt,
+        )
+    )
+
+    stats = {
+        "attempts": 0,
+        "accepted": 0,
+        "rejected_not_better": 0,
+        "rejected_budget": 0,
+        "start_bits": used_bits,
+        "end_bits": None,
+        "remaining_bits": float(remaining_bits),
+    }
+    swapped_names: set[str] = set()
+    for improvement, name, cand in attempts:
+        if name in swapped_names:
+            continue
+        stats["attempts"] += 1
+        if improvement <= 1e-12:
+            stats["rejected_not_better"] += 1
+            continue
+        current = chosen[name]
+        current_bits = _candidate_total_bits(current)
+        cand_bits = _candidate_total_bits(cand)
+        next_bits = used_bits - current_bits + cand_bits
+        if used_bits > remaining_bits + 1e-6:
+            if cand_bits >= current_bits - 1e-6:
+                stats["rejected_budget"] += 1
+                continue
+        elif next_bits > remaining_bits + 1e-6:
+            stats["rejected_budget"] += 1
+            continue
+        chosen[name] = cand
+        used_bits = next_bits
+        swapped_names.add(name)
+        stats["accepted"] += 1
+
+    stats["end_bits"] = used_bits
+    assignment = {name: chosen[name].fmt for name in names}
+    return assignment, chosen, stats
+
+
+def _minimum_bpp_result_if_within_precision(
+    open_stats: Mapping[str, Mapping],
+    open_cands: Mapping[str, list[Candidate]],
+    open_target_bits: float,
+    bit_precision: float,
+) -> tuple[dict[str, str], dict[str, Candidate]] | None:
+    total_params = sum(int(open_stats[name]["n_params"]) for name in open_cands)
+    if total_params <= 0:
+        return {}, {}
+    chosen = {
+        name: min(open_cands[name], key=lambda c: (c.bits_per_param, c.fmt))
+        for name in open_cands
+    }
+    min_bpp = sum(
+        chosen[name].bits_per_param * int(open_stats[name]["n_params"])
+        for name in open_cands
+    ) / float(total_params)
+    if open_target_bits < min_bpp and min_bpp - open_target_bits <= bit_precision + 1e-12:
+        return (
+            {name: cand.fmt for name, cand in chosen.items()},
+            dict(chosen),
+        )
+    return None
 
 
 def solve_frozen_l3_neighborhood(
@@ -404,7 +457,12 @@ def solve_frozen_l3_neighborhood(
     open_cands = {name: list(l3_candidates[name]) for name in sorted(open_names)}
     result = solve_allocation(open_stats, open_cands, open_target_bits, bit_precision)
     precision_used: float | str = float(bit_precision)
+    dp_attempts = [{"precision": float(bit_precision), "result": "ok" if result is not None else "failed"}]
     if result is None:
+        print(
+            f"[l3] frozen DP precision {float(bit_precision):g}: failed",
+            flush=True,
+        )
         for fallback_precision in (0.01, 0.05, 0.25, 0.5, 1.0):
             result = solve_allocation(
                 open_stats,
@@ -412,17 +470,70 @@ def solve_frozen_l3_neighborhood(
                 open_target_bits,
                 fallback_precision,
             )
+            dp_attempts.append({
+                "precision": fallback_precision,
+                "result": "ok" if result is not None else "failed",
+            })
             if result is not None:
                 precision_used = fallback_precision
+                print(
+                    f"[l3] frozen DP precision {fallback_precision:g}: ok",
+                    flush=True,
+                )
                 break
+            min_result = _minimum_bpp_result_if_within_precision(
+                open_stats,
+                open_cands,
+                open_target_bits,
+                fallback_precision,
+            )
+            if min_result is not None:
+                result = min_result
+                precision_used = fallback_precision
+                dp_attempts[-1]["result"] = "minimum_bpp_within_precision"
+                print(
+                    "[l3] frozen DP precision "
+                    f"{fallback_precision:g}: minimum-bpp assignment within "
+                    "precision",
+                    flush=True,
+                )
+                break
+            print(
+                f"[l3] frozen DP precision {fallback_precision:g}: failed",
+                flush=True,
+            )
     if result is None:
-        result = _greedy_l3_under_budget(open_stats, open_cands, remaining_bits)
+        open_current_assignment = {
+            name: assignment[name]
+            for name in open_cands
+            if name in assignment
+        }
+        open_assignment, chosen, greedy_stats = _greedy_l3_under_budget(
+            open_cands,
+            open_current_assignment,
+            remaining_bits,
+        )
+        result = (open_assignment, chosen)
         precision_used = "greedy"
+        print(
+            "[l3] frozen DP greedy: "
+            f"attempts={greedy_stats['attempts']} "
+            f"accepted={greedy_stats['accepted']} "
+            f"rejected_not_better={greedy_stats['rejected_not_better']} "
+            f"rejected_budget={greedy_stats['rejected_budget']}",
+            flush=True,
+        )
+    else:
+        greedy_stats = None
     open_assignment, chosen = result
     merged = dict(assignment)
     merged.update(open_assignment)
     if return_metadata:
-        return merged, chosen, {"frozen_dp_precision_used": precision_used}
+        return merged, chosen, {
+            "frozen_dp_precision_used": precision_used,
+            "frozen_dp_attempts": dp_attempts,
+            "frozen_dp_greedy": greedy_stats,
+        }
     return merged, chosen
 
 
