@@ -1072,47 +1072,6 @@ def main():
                 "investigate fused-sibling / MoE-unity promotion."
             )
 
-    # Streak-limit post-pass. The per-layer Δloss model is additive,
-    # so it can't see that 5+ consecutive same-module MXFP8 picks
-    # compound into runtime NaN at W8A8 — even when each individual
-    # layer's output_mse looks fine. Empirically 3-streaks work, 5
-    # break (Qwen 3.6 27B 4/30: 5-streak at 24-28 mlp.gate/up → uniform
-    # garbage). When export's block-output-match supports MXFP8 (it
-    # currently skips when all block linears are MXFP8 — `mlp=no_cal`),
-    # this constraint can be relaxed or removed.
-    MAX_STREAK = 3
-    by_pattern: dict[str, list[tuple[int, str]]] = defaultdict(list)
-    for name, fmt in assignment_expanded.items():
-        if fmt != "MXFP8" and fmt != "MXFP8_E4M3":
-            continue
-        # Pattern = module suffix after layer index, e.g. "mlp.gate_proj".
-        parts = name.split(".")
-        try:
-            li = parts.index("layers")
-            layer_idx = int(parts[li + 1])
-            suffix = ".".join(parts[li + 2:])
-        except (ValueError, IndexError):
-            continue
-        by_pattern[suffix].append((layer_idx, name))
-    demoted: list[str] = []
-    for suffix, picks in by_pattern.items():
-        picks.sort()
-        streak = 1
-        prev = None
-        for layer_idx, name in picks:
-            if prev is not None and layer_idx == prev + 1:
-                streak += 1
-            else:
-                streak = 1
-            if streak > MAX_STREAK:
-                assignment_expanded[name] = "NVFP4"
-                demoted.append(name)
-            prev = layer_idx
-    if demoted:
-        print(f"[alloc] streak-limit: demoted {len(demoted)} MXFP8 → NVFP4 "
-              f"to break consecutive same-module streaks > {MAX_STREAK} "
-              f"(sample: {demoted[:3]})", flush=True)
-
     layer_cfg = {}
     for name, fmt in assignment_expanded.items():
         if fmt in format_specs:
