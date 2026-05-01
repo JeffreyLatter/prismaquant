@@ -84,8 +84,7 @@ Useful tuning flags:
 - `--l3-safety-fraction` default `0.02`;
 - `--l3-max-lanes-per-batch` default `8`.
 
-`--l3-per-iter` is reserved and currently exits with a clear error. L3 is one
-final pass by design.
+L3 is one final pass by design; per-iteration L3 is not exposed yet.
 
 The Qwen 4B smoke launcher exposes the final-pass path through:
 

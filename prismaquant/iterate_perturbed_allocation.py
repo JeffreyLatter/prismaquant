@@ -388,17 +388,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--h-detail-dir")
     ap.add_argument("--l3-polish", action="store_true",
                     help="Run one propagated-cost polish pass after L2 convergence.")
-    ap.add_argument("--l3-per-iter", action="store_true",
-                    help="Reserved for future thorough runs; currently unsupported.")
     ap.add_argument("--l3-uncertainty-rel-tol", type=float, default=0.10)
     ap.add_argument("--l3-min-fraction", type=float, default=0.05)
     ap.add_argument("--l3-max-fraction", type=float, default=0.10)
     ap.add_argument("--l3-safety-fraction", type=float, default=0.02)
     ap.add_argument("--l3-max-lanes-per-batch", type=int, default=8)
     args = ap.parse_args(argv)
-
-    if args.l3_per_iter:
-        raise SystemExit("--l3-per-iter is reserved; use --l3-polish final pass")
 
     work_root = Path(args.work_dir)
     output_root = Path(args.output_dir)
@@ -538,6 +533,8 @@ def main(argv: list[str] | None = None) -> int:
 
     l3_summary_path = None
     if args.l3_polish:
+        # Per-iteration L3 can reuse this path later; only final polish is
+        # exposed because each propagated measurement is a full forward pass.
         l2_assignment = dict(assignment)
         kl_before = measure_assignment_kl(
             model,
