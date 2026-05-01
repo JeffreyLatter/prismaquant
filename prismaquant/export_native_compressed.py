@@ -273,6 +273,42 @@ class _LazyActivationCache:
         return self.index.load(name).to(torch.float32)
 
 
+def _resolve_perturbed_x_export_inputs(root: str | Path) -> tuple[Path, Path]:
+    """Return (layer_config, activation_cache_dir) from an iteration output."""
+    root = Path(root)
+    layer_config = root / "final_layer_config.json"
+    summary_path = root / "summary.json"
+    cache_dir: Path | None = None
+    if summary_path.is_file():
+        with open(summary_path) as f:
+            summary = json.load(f)
+        if summary.get("final_layer_config"):
+            layer_config = Path(summary["final_layer_config"])
+            if not layer_config.is_absolute():
+                layer_config = root / layer_config
+        iterations = summary.get("iterations") or []
+        if iterations:
+            cache_info = iterations[-1].get("cache", {})
+            cache_raw = cache_info.get("cache_dir")
+            if cache_raw:
+                cache_dir = Path(cache_raw)
+                if not cache_dir.is_absolute():
+                    cache_dir = root / cache_dir
+    if cache_dir is None:
+        caches = sorted(root.glob("activation_cache_iter_*"))
+        if caches:
+            cache_dir = caches[-1]
+    if not layer_config.is_file():
+        raise FileNotFoundError(
+            f"perturbed-X layer config not found at {layer_config}"
+        )
+    if cache_dir is None or not cache_dir.is_dir():
+        raise FileNotFoundError(
+            f"perturbed-X activation cache not found under {root}"
+        )
+    return layer_config, cache_dir
+
+
 class _LazyFisherDiagCache:
     """HDetailIndex-backed lazy cache for per-Linear Fisher diagonal.
 
@@ -4603,8 +4639,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
                     help="HF model dir (source safetensors + config.json)")
-    ap.add_argument("--layer-config", required=True,
-                    help="layer_config.json from allocator.py")
+    ap.add_argument("--layer-config", default=None,
+                    help="layer_config.json from allocator.py. Optional when "
+                         "--perturbed-x-dir is supplied.")
     ap.add_argument("--prune-manifest", default=None,
                     help="Optional path to an expert-prune sidecar JSON "
                          "emitted by the allocator at "
@@ -4655,6 +4692,13 @@ def main():
                          "computed from cached activations "
                          "(max_abs/6.0) instead of the 1.0 default. "
                          "Typically ~1-3% PPL improvement on NVFP4.")
+    ap.add_argument("--perturbed-x-dir", default=None,
+                    help="Directory produced by iterate_perturbed_allocation.py. "
+                         "When supplied, defaults --layer-config to "
+                         "final_layer_config.json and --activation-cache-dir "
+                         "to the final perturbed activation cache so GPTQ, "
+                         "scale-sweep, and block-output-match use the "
+                         "converged activation distribution.")
     # Activation-aware passes.
     #
     # AWQ defaults to OFF — per-channel input scaling fights NVFP4's
@@ -4748,6 +4792,21 @@ def main():
     from .model_profiles import detect_profile
     profile = detect_profile(args.model)
     print(f"[export-stream] model profile: {profile.name}", flush=True)
+
+    if args.perturbed_x_dir:
+        px_layer_config, px_cache_dir = _resolve_perturbed_x_export_inputs(
+            args.perturbed_x_dir
+        )
+        if args.layer_config is None:
+            args.layer_config = str(px_layer_config)
+        if args.activation_cache_dir is None:
+            args.activation_cache_dir = str(px_cache_dir)
+        print("[export-stream] perturbed-X inputs: "
+              f"layer_config={args.layer_config} "
+              f"activation_cache_dir={args.activation_cache_dir}",
+              flush=True)
+    if args.layer_config is None:
+        ap.error("--layer-config is required unless --perturbed-x-dir is supplied")
 
     # Resolve flag defaults.
     cache_supplied = bool(args.activation_cache_dir)

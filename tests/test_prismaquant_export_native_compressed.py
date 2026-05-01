@@ -23,6 +23,7 @@ from prismaquant.export_native_compressed import (
     _compute_layer_joint_nvfp4,
     _quantize_2d,
     _quantize_3d_packed,
+    _resolve_perturbed_x_export_inputs,
     _round_to_codebook,
     _to_vllm_internal_name,
     compute_extra_ignore,
@@ -77,6 +78,46 @@ class TestLazyActivationCache(unittest.TestCase):
         self.assertEqual(cache.loads, 1)
         self.assertEqual(value.dtype, torch.float32)
         self.assertTrue(torch.equal(value, torch.ones(2, 3, dtype=torch.float32)))
+
+
+class TestPerturbedXExportInputs(unittest.TestCase):
+    def test_resolves_summary_layer_config_and_final_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            layer_config = root / "final_layer_config.json"
+            layer_config.write_text("{}")
+            cache = root / "activation_cache_iter_02"
+            cache.mkdir()
+            with open(root / "summary.json", "w") as f:
+                json.dump(
+                    {
+                        "final_layer_config": str(layer_config),
+                        "iterations": [
+                            {"cache": {"cache_dir": str(root / "activation_cache_iter_01")}},
+                            {"cache": {"cache_dir": str(cache)}},
+                        ],
+                    },
+                    f,
+                )
+
+            got_layer_config, got_cache = _resolve_perturbed_x_export_inputs(root)
+
+            self.assertEqual(got_layer_config, layer_config)
+            self.assertEqual(got_cache, cache)
+
+    def test_resolves_latest_cache_without_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            layer_config = root / "final_layer_config.json"
+            layer_config.write_text("{}")
+            (root / "activation_cache_iter_01").mkdir()
+            latest = root / "activation_cache_iter_03"
+            latest.mkdir()
+
+            got_layer_config, got_cache = _resolve_perturbed_x_export_inputs(root)
+
+            self.assertEqual(got_layer_config, layer_config)
+            self.assertEqual(got_cache, latest)
 
 
 class TestIncrementalSafetensorsWriter(unittest.TestCase):
