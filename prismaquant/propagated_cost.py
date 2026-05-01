@@ -7,6 +7,7 @@ rest of the L2 assignment.
 """
 from __future__ import annotations
 
+import inspect
 import math
 import re
 import shutil
@@ -844,6 +845,59 @@ class _TailLayerCaptureDone(Exception):
     pass
 
 
+def _clone_layer_value_for_cache(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu").clone()
+    if isinstance(value, Mapping):
+        return {
+            key: _clone_layer_value_for_cache(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_clone_layer_value_for_cache(child) for child in value)
+    if isinstance(value, list):
+        return [_clone_layer_value_for_cache(child) for child in value]
+    return value
+
+
+def _move_cached_layer_value(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, Mapping):
+        return {
+            key: _move_cached_layer_value(child, device)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_move_cached_layer_value(child, device) for child in value)
+    if isinstance(value, list):
+        return [_move_cached_layer_value(child, device) for child in value]
+    return value
+
+
+def _move_cached_layer_call(cached_call, device):
+    args, kwargs, base_batch = cached_call
+    return (
+        tuple(_move_cached_layer_value(value, device) for value in args),
+        {
+            key: _move_cached_layer_value(value, device)
+            for key, value in kwargs.items()
+        },
+        base_batch,
+    )
+
+
+def _model_accepts_kwarg(model: nn.Module, name: str) -> bool:
+    try:
+        signature = inspect.signature(model.forward)
+    except (TypeError, ValueError):
+        return False
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return name in signature.parameters
+
+
 def _capture_layer_call(model: nn.Module, layer: nn.Module, args, kwargs):
     captured = {}
 
@@ -868,6 +922,57 @@ def _capture_layer_call(model: nn.Module, layer: nn.Module, args, kwargs):
     if "args" not in captured:
         raise RuntimeError("tail-only L3 could not capture decoder layer inputs")
     return captured["args"], captured["kwargs"]
+
+
+def _capture_all_layer_calls(
+    model: nn.Module,
+    layers,
+    layer_indices: set[int],
+    calibration_data,
+    device,
+) -> dict[int, list[tuple[tuple, dict, int]]]:
+    captured: dict[int, list[tuple[tuple, dict, int]]] = {
+        idx: [] for idx in sorted(layer_indices)
+    }
+    handles = []
+
+    def _make_hook(layer_idx: int):
+        def _hook(_module, hook_args, hook_kwargs):
+            layer_kwargs = dict(hook_kwargs or {})
+            if "use_cache" in layer_kwargs:
+                layer_kwargs["use_cache"] = False
+            if "past_key_value" in layer_kwargs:
+                layer_kwargs["past_key_value"] = None
+            base_batch = _first_tensor_batch_size(hook_args, layer_kwargs)
+            captured[layer_idx].append(
+                (
+                    tuple(_clone_layer_value_for_cache(value) for value in hook_args),
+                    {
+                        key: _clone_layer_value_for_cache(value)
+                        for key, value in layer_kwargs.items()
+                    },
+                    int(base_batch),
+                )
+            )
+
+        return _hook
+
+    for layer_idx in sorted(layer_indices):
+        layer = layers[layer_idx]
+        handles.append(layer.register_forward_pre_hook(
+            _make_hook(layer_idx),
+            with_kwargs=True,
+        ))
+    try:
+        for args, kwargs in iter_calibration_forwards(calibration_data, device):
+            call_kwargs = dict(kwargs or {})
+            if _model_accepts_kwarg(model, "use_cache"):
+                call_kwargs["use_cache"] = False
+            model(*args, **call_kwargs)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return captured
 
 
 def tail_forward_from_layer(
@@ -1176,6 +1281,7 @@ def measure_propagated_costs(
     profile=None,
     max_lanes_per_batch: int = 16,
     tail_only: bool = True,
+    cache_tail_layer_inputs: bool = True,
     output_mse_names: list[str] | None = None,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> dict[str, dict[str, dict]]:
@@ -1210,6 +1316,51 @@ def measure_propagated_costs(
 
     depth_groups = _group_neighborhood_by_depth(neighborhood)
     _decoder_base, decoder_layers = _decoder_stack(model)
+    tail_call_cache: dict[int, list[tuple[tuple, dict, int]]] = {}
+    if (
+        bool(tail_only)
+        and bool(cache_tail_layer_inputs)
+        and decoder_layers is not None
+    ):
+        needed_depths = {
+            layer_depth(group_entries[0].name)
+            for _group_key, group_entries in depth_groups
+            if group_entries
+        }
+        needed_depths = {
+            depth
+            for depth in needed_depths
+            if depth is not None and 0 <= depth < len(decoder_layers)
+        }
+        if needed_depths:
+            cache_dir = Path(tempfile.mkdtemp(
+                prefix="prismaquant_l3_baseline_context_",
+                dir=tmp_parent,
+            ))
+            context_hooks = PerturbedActivationCache(
+                model,
+                assignment_c,
+                cache_dir,
+                input_rows=0,
+                cal_hash=cal_hash,
+                profile=profile,
+            )
+            context_hooks.install()
+            try:
+                all_layer_calls = _capture_all_layer_calls(
+                    model,
+                    decoder_layers,
+                    needed_depths,
+                    calibration_data,
+                    device,
+                )
+                tail_call_cache = {
+                    depth: all_layer_calls.get(depth, [])
+                    for depth in needed_depths
+                }
+            finally:
+                context_hooks.remove()
+                shutil.rmtree(cache_dir, ignore_errors=True)
     for group_index, (group_key, group_entries) in enumerate(depth_groups, start=1):
         group_depth = layer_depth(group_entries[0].name) if group_entries else None
         use_tail_group = (
@@ -1268,12 +1419,28 @@ def measure_propagated_costs(
                 first_batch = True
                 kl_totals = [0.0 for _ in lanes]
                 batch_count = 0
+                cached_calls = (
+                    tail_call_cache.get(group_depth, [])
+                    if use_tail_group and cache_tail_layer_inputs
+                    else None
+                )
+                if not cached_calls:
+                    cached_calls = None
+                call_iter = (
+                    cached_calls
+                    if cached_calls is not None
+                    else iter_calibration_forwards(calibration_data, device)
+                )
                 try:
-                    for args, kwargs in iter_calibration_forwards(
-                        calibration_data,
-                        device,
-                    ):
-                        base_batch = _first_tensor_batch_size(args, kwargs)
+                    for call_item in call_iter:
+                        if cached_calls is not None:
+                            args, kwargs, base_batch = _move_cached_layer_call(
+                                call_item,
+                                device,
+                            )
+                        else:
+                            args, kwargs = call_item
+                            base_batch = _first_tensor_batch_size(args, kwargs)
                         if first_batch:
                             target_hooks = _DepthGroupTargetHooks(
                                 model,
@@ -1294,12 +1461,15 @@ def measure_propagated_costs(
 
                         if use_tail_group:
                             layer = decoder_layers[group_depth]
-                            layer_args, layer_kwargs = _capture_layer_call(
-                                model,
-                                layer,
-                                args,
-                                kwargs,
-                            )
+                            if cached_calls is not None:
+                                layer_args, layer_kwargs = args, kwargs
+                            else:
+                                layer_args, layer_kwargs = _capture_layer_call(
+                                    model,
+                                    layer,
+                                    args,
+                                    kwargs,
+                                )
                             rep_args, rep_kwargs = _repeat_layer_call_for_lanes(
                                 layer_args,
                                 layer_kwargs,

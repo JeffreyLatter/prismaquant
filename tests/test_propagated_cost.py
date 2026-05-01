@@ -90,6 +90,39 @@ class _TailToy(nn.Module):
         return SimpleNamespace(logits=self.lm_head(self.norm(x)))
 
 
+class _TwoProjTailLayer(nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.a = nn.Linear(2, 2, bias=False)
+        self.b = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            self.a.weight.copy_(scale * torch.tensor([[1.0, 0.25], [-0.5, 1.0]]))
+            self.b.weight.copy_(scale * torch.tensor([[0.5, -0.75], [1.25, 0.5]]))
+
+    def forward(self, hidden_states, **_kwargs):
+        return self.b(torch.tanh(self.a(hidden_states)))
+
+
+class _TwoProjTailToy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+        self.layers = nn.ModuleList([
+            _TwoProjTailLayer(1.0),
+            _TwoProjTailLayer(0.5),
+        ])
+        self.norm = nn.Identity()
+        self.lm_head = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            self.lm_head.weight.copy_(torch.tensor([[1.0, -0.5], [0.25, 1.5]]))
+
+    def forward(self, x):
+        self.forward_calls += 1
+        for layer in self.layers:
+            x = layer(x)
+        return SimpleNamespace(logits=self.lm_head(self.norm(x)))
+
+
 def _zero_spec():
     return fr.FormatSpec(
         name="ZERO4",
@@ -520,6 +553,80 @@ def test_measure_propagated_costs_pairs_candidate_with_target_bf16_baseline(tmp_
     assert zero["propagated_end_kl"] > 0.1
     assert zero["downstream_output_mse"] > 0.0
     assert costs["l1"]["BF16"]["propagated_end_kl"] == 0.0
+
+
+def _assert_l3_costs_close(actual, expected):
+    assert set(actual) == set(expected)
+    for name, per_name in expected.items():
+        assert set(actual[name]) == set(per_name)
+        for fmt, expected_entry in per_name.items():
+            actual_entry = actual[name][fmt]
+            assert set(actual_entry) == set(expected_entry)
+            for key, expected_value in expected_entry.items():
+                actual_value = actual_entry[key]
+                if isinstance(expected_value, float):
+                    assert actual_value == pytest.approx(
+                        expected_value,
+                        abs=1e-6,
+                        rel=1e-6,
+                    )
+                else:
+                    assert actual_value == expected_value
+
+
+def test_measure_propagated_costs_cached_tail_inputs_are_equivalent(tmp_path):
+    assignment = {
+        "layers.0.a": "MXFP8",
+        "layers.0.b": "MXFP8",
+        "layers.1.a": "MXFP8",
+        "layers.1.b": "MXFP8",
+    }
+    neighborhood = [
+        L3NeighborhoodEntry(
+            name="layers.0.a",
+            current_format="MXFP8",
+            formats=("NVFP4", "MXFP8", "BF16"),
+            margin=0.0,
+            l2_current_cost=0.0,
+        ),
+        L3NeighborhoodEntry(
+            name="layers.0.b",
+            current_format="MXFP8",
+            formats=("NVFP4", "MXFP8", "BF16"),
+            margin=0.0,
+            l2_current_cost=0.0,
+        ),
+    ]
+    calib = torch.tensor(
+        [[1.0, -1.0], [0.5, -0.25], [-0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    specs = [fr.get_format(name) for name in ("NVFP4", "MXFP8", "BF16")]
+
+    def _measure(*, cache_tail_layer_inputs: bool):
+        model = _TwoProjTailToy().eval()
+        costs = measure_propagated_costs(
+            model,
+            assignment,
+            neighborhood,
+            calib,
+            specs,
+            work_root=tmp_path,
+            max_lanes_per_batch=3,
+            tail_only=True,
+            cache_tail_layer_inputs=cache_tail_layer_inputs,
+        )
+        return costs, model.forward_calls
+
+    baseline, baseline_forward_calls = _measure(
+        cache_tail_layer_inputs=False,
+    )
+    cached, cached_forward_calls = _measure(cache_tail_layer_inputs=True)
+    _assert_l3_costs_close(
+        cached,
+        baseline,
+    )
+    assert cached_forward_calls < baseline_forward_calls
 
 
 def test_toy_l3_propagation_differs_from_local_cost_and_flips_pick(tmp_path):
