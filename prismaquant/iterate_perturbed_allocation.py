@@ -854,6 +854,7 @@ def _write_budget_artifacts(
     label: str,
     assignment: Mapping[str, str],
 ) -> tuple[Path, Path]:
+    output_root.mkdir(parents=True, exist_ok=True)
     assignment_path = output_root / f"final_assignment_bpp_{label}.json"
     layer_config_path = output_root / f"final_layer_config_bpp_{label}.json"
     with open(assignment_path, "w") as f:
@@ -1096,9 +1097,17 @@ def solve_target_from_anchor(
         + max(float(args.l3_regression_tolerance), 0.0) * abs(anchor.l2_kl)
     )
     accepted = bool(float(validation_kl) <= float(allowed))
-    final_assignment = (
-        dict(proposed_assignment) if accepted else dict(anchor.l2_assignment)
-    )
+    if accepted:
+        final_assignment = dict(proposed_assignment)
+    else:
+        final_assignment = solve_from_costs(
+            runtime.stats,
+            anchor.latest_smoothed_costs,
+            runtime.specs,
+            target_bits=target_bpp,
+            bit_precision=args.bit_precision,
+            profile=runtime.profile,
+        )
     predicted = (
         proposed_predicted
         if accepted else _predicted_dloss_for_assignment(

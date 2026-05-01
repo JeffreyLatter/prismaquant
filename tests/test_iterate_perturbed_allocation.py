@@ -280,6 +280,60 @@ def test_l3_polish_rejects_assignment_on_regression(tmp_path, monkeypatch):
     assert l3_summary["accepted_flip_count"] == 0
 
 
+def test_solve_target_from_anchor_rejects_to_l2_at_target(tmp_path, monkeypatch):
+    stats = {
+        "layer": {
+            "n_params": 16,
+            "in_features": 4,
+            "out_features": 4,
+            "h_trace": 1.0,
+        }
+    }
+    costs = {
+        "layer": {
+            "INT8_W8A16": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    }
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    anchor = ipa.AnchorResult(
+        anchor_bpp=16.0,
+        output_dir=tmp_path / "anchor_bpp_16.00",
+        l2_assignment={"layer": "BF16"},
+        l2_kl=1.0,
+        l3_candidates={},
+        l3_costs={},
+        latest_smoothed_costs=costs,
+    )
+    runtime = ipa.BudgetRuntime(
+        work_root=tmp_path / "work",
+        output_root=tmp_path / "out",
+        stats=stats,
+        current_costs=costs,
+        specs=specs,
+        profile=None,
+        model=_TinyLogitsModel(),
+        calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        l3_calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        ref_log_probs=[],
+        dtype=torch.bfloat16,
+        probe_load_timing={},
+    )
+    args = SimpleNamespace(
+        bit_precision=0.001,
+        l3_regression_tolerance=0.0,
+    )
+    monkeypatch.setattr(ipa, "measure_assignment_kl", lambda *_args, **_kwargs: 2.0)
+
+    result = ipa.solve_target_from_anchor(args, runtime, anchor, 12.0)
+
+    assert result.accepted is False
+    assert result.assignment == {"layer": "INT8_W8A16"}
+    assert result.achieved_bpp == pytest.approx(12.0)
+    assert result.anchor_bpp == pytest.approx(16.0)
+    assert result.target_bpp == pytest.approx(12.0)
+
+
 def test_l3_polish_accepts_within_tolerance(tmp_path, monkeypatch):
     rc, final_assignment, l3_summary = _run_tiny_l3_regression_case(
         tmp_path,
