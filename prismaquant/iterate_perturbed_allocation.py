@@ -37,6 +37,12 @@ from prismaquant.perturbed_x_cache import (
     capture_perturbed_activation_cache,
     load_text_model_under_work_root,
 )
+from prismaquant.propagated_cost import (
+    build_l3_candidates,
+    measure_propagated_costs,
+    select_l3_neighborhood,
+    solve_frozen_l3_neighborhood,
+)
 from prismaquant.schemas import validate_cost_payload, validate_probe_payload
 
 
@@ -256,6 +262,63 @@ def write_layer_config(assignment: Mapping[str, str], output_path: str | Path) -
         json.dump(payload, f, indent=2)
 
 
+def build_l3_polish_summary(
+    *,
+    selected,
+    l3_costs: dict,
+    before_assignment: Mapping[str, str],
+    after_assignment: Mapping[str, str],
+    kl_before: float,
+    kl_after: float,
+    accepted: bool = True,
+) -> dict:
+    flips = []
+    for name in sorted(set(before_assignment) | set(after_assignment)):
+        old = before_assignment.get(name)
+        new = after_assignment.get(name)
+        if old == new:
+            continue
+        per_name = l3_costs.get(name, {})
+        flips.append(
+            {
+                "name": name,
+                "from": old,
+                "to": new,
+                "from_l3_cost": (
+                    per_name.get(old, {}).get("propagated_end_kl")
+                    if old is not None else None
+                ),
+                "to_l3_cost": (
+                    per_name.get(new, {}).get("propagated_end_kl")
+                    if new is not None else None
+                ),
+            }
+        )
+    regression = bool(float(kl_after) > float(kl_before))
+    return {
+        "enabled": True,
+        "accepted": bool(accepted),
+        "selected_count": len(selected),
+        "measured_count": len(l3_costs),
+        "kl_before": float(kl_before),
+        "kl_after": float(kl_after),
+        "regression": regression,
+        "flip_count": len(flips),
+        "flips": flips,
+        "selected": [
+            {
+                "name": entry.name,
+                "current_format": entry.current_format,
+                "formats": list(entry.formats),
+                "margin": entry.margin,
+                "l2_current_cost": entry.l2_current_cost,
+                "reasons": list(entry.reasons),
+            }
+            for entry in selected
+        ],
+    }
+
+
 @torch.no_grad()
 def measure_assignment_kl(
     model,
@@ -323,7 +386,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cost-mode", default="auto", choices=["auto", "unbatched", "batched"])
     ap.add_argument("--chunk-size", type=int, default=128)
     ap.add_argument("--h-detail-dir")
+    ap.add_argument("--l3-polish", action="store_true",
+                    help="Run one propagated-cost polish pass after L2 convergence.")
+    ap.add_argument("--l3-per-iter", action="store_true",
+                    help="Reserved for future thorough runs; currently unsupported.")
+    ap.add_argument("--l3-uncertainty-rel-tol", type=float, default=0.10)
+    ap.add_argument("--l3-min-fraction", type=float, default=0.05)
+    ap.add_argument("--l3-max-fraction", type=float, default=0.10)
+    ap.add_argument("--l3-safety-fraction", type=float, default=0.02)
+    ap.add_argument("--l3-max-lanes-per-batch", type=int, default=8)
     args = ap.parse_args(argv)
+
+    if args.l3_per_iter:
+        raise SystemExit("--l3-per-iter is reserved; use --l3-polish final pass")
 
     work_root = Path(args.work_dir)
     output_root = Path(args.output_dir)
@@ -372,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
         assignment = default_initial_assignment(stats, current_costs, specs)
 
     cost_history: list[dict] = []
+    latest_smoothed_costs = current_costs
     assignment_history: list[dict[str, str]] = [dict(assignment)]
     iteration_log: list[dict] = []
 
@@ -406,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         cost_history.append(measured_costs)
         smoothed_costs = smooth_cost_history(cost_history, decay=args.ema_decay)
+        latest_smoothed_costs = smoothed_costs
 
         def _solve(cost_table: dict) -> dict[str, str]:
             return solve_from_costs(
@@ -459,6 +536,96 @@ def main(argv: list[str] | None = None) -> int:
         if flip_frac <= args.convergence_frac:
             break
 
+    l3_summary_path = None
+    if args.l3_polish:
+        l2_assignment = dict(assignment)
+        kl_before = measure_assignment_kl(
+            model,
+            l2_assignment,
+            calib_ids,
+            ref_log_probs,
+            work_root=work_root,
+            profile=profile,
+        )
+        selected = select_l3_neighborhood(
+            stats,
+            latest_smoothed_costs,
+            l2_assignment,
+            specs,
+            uncertainty_rel_tol=args.l3_uncertainty_rel_tol,
+            min_fraction=args.l3_min_fraction,
+            max_fraction=args.l3_max_fraction,
+            safety_fraction=args.l3_safety_fraction,
+        )
+        l3_costs = measure_propagated_costs(
+            model,
+            l2_assignment,
+            selected,
+            calib_ids,
+            specs,
+            work_root=work_root,
+            profile=profile,
+            max_lanes_per_batch=args.l3_max_lanes_per_batch,
+        )
+        l3_cost_path = output_root / "l3_propagated_costs.pkl"
+        with open(l3_cost_path, "wb") as f:
+            pickle.dump(
+                {
+                    "costs": l3_costs,
+                    "formats": [s.name for s in specs],
+                    "meta": {
+                        "model": args.model,
+                        "probe": args.probe,
+                        "paired_baseline": "target_bf16_under_l2_assignment",
+                        "selected_count": len(selected),
+                    },
+                },
+                f,
+            )
+        l3_candidates = build_l3_candidates(stats, l3_costs, specs)
+        current_fmt_by_name = {
+            name: l2_assignment[name]
+            for name in l3_candidates
+            if name in l2_assignment
+        }
+        l3_candidates = {
+            name: cands
+            for name, cands in l3_candidates.items()
+            if any(c.fmt == current_fmt_by_name.get(name) for c in cands)
+        }
+        if l3_candidates:
+            polished_assignment, _chosen = solve_frozen_l3_neighborhood(
+                stats,
+                l2_assignment,
+                l3_candidates,
+                specs,
+                target_bits=args.target_bits,
+                bit_precision=args.bit_precision,
+            )
+        else:
+            polished_assignment = dict(l2_assignment)
+        kl_after = measure_assignment_kl(
+            model,
+            polished_assignment,
+            calib_ids,
+            ref_log_probs,
+            work_root=work_root,
+            profile=profile,
+        )
+        l3_summary = build_l3_polish_summary(
+            selected=selected,
+            l3_costs=l3_costs,
+            before_assignment=l2_assignment,
+            after_assignment=polished_assignment,
+            kl_before=kl_before,
+            kl_after=kl_after,
+        )
+        l3_summary["cost_path"] = str(l3_cost_path)
+        l3_summary_path = output_root / "l3_polish_summary.json"
+        with open(l3_summary_path, "w") as f:
+            json.dump(l3_summary, f, indent=2)
+        assignment = dict(polished_assignment)
+
     final_assignment_path = output_root / "final_assignment.json"
     with open(final_assignment_path, "w") as f:
         json.dump(dict(sorted(assignment.items())), f, indent=2)
@@ -470,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
         "final_layer_config": str(final_layer_config),
         "target_bits": args.target_bits,
     }
+    if l3_summary_path is not None:
+        summary["l3_polish_summary"] = str(l3_summary_path)
     with open(output_root / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     return 0

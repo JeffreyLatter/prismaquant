@@ -19,12 +19,18 @@ INPUT_ROWS="${INPUT_ROWS:-256}"
 DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bf16}"
 SHARD_BYTES="${SHARD_BYTES:-5368709120}"
+L3_POLISH="${L3_POLISH:-0}"
 
 mkdir -p "$OUT_DIR" "$WORK_DIR"
 
 initial_config_args=()
 if [[ -n "${INITIAL_CONFIG:-}" ]]; then
   initial_config_args=(--initial-config "$INITIAL_CONFIG")
+fi
+
+l3_args=()
+if [[ "$L3_POLISH" == "1" || "$L3_POLISH" == "true" || "$L3_POLISH" == "TRUE" ]]; then
+  l3_args=(--l3-polish)
 fi
 
 python3 -m prismaquant.iterate_perturbed_allocation \
@@ -40,7 +46,8 @@ python3 -m prismaquant.iterate_perturbed_allocation \
   --input-rows "$INPUT_ROWS" \
   --device "$DEVICE" \
   --dtype "$DTYPE" \
-  "${initial_config_args[@]}"
+  "${initial_config_args[@]}" \
+  "${l3_args[@]}"
 
 python3 -m prismaquant.export_native_compressed \
   --model "$MODEL" \

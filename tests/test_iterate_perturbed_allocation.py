@@ -2,10 +2,12 @@ import pytest
 
 from prismaquant.iterate_perturbed_allocation import (
     assignment_hash,
+    build_l3_polish_summary,
     resolve_two_cycle,
     smooth_cost_history,
     weighted_hamming_fraction,
 )
+from prismaquant.propagated_cost import L3NeighborhoodEntry
 
 
 def test_cost_ema_uses_geometric_decay_and_skips_errors():
@@ -92,3 +94,42 @@ def test_cycle_detection_kl_tie_breaks_if_average_stays_endpoint():
 
     assert resolved == b
     assert mode == "kl-prev"
+
+
+def test_l3_polish_summary_reports_flips_and_regression():
+    selected = [
+        L3NeighborhoodEntry(
+            name="layer",
+            current_format="MXFP8",
+            formats=("NVFP4", "MXFP8", "BF16"),
+            margin=0.03,
+            l2_current_cost=2.0,
+            reasons=("uncertain",),
+        )
+    ]
+    summary = build_l3_polish_summary(
+        selected=selected,
+        l3_costs={
+            "layer": {
+                "MXFP8": {"propagated_end_kl": 3.0},
+                "BF16": {"propagated_end_kl": 0.0},
+            }
+        },
+        before_assignment={"layer": "MXFP8"},
+        after_assignment={"layer": "BF16"},
+        kl_before=1.0,
+        kl_after=1.2,
+    )
+
+    assert summary["regression"] is True
+    assert summary["flip_count"] == 1
+    assert summary["flips"] == [
+        {
+            "name": "layer",
+            "from": "MXFP8",
+            "to": "BF16",
+            "from_l3_cost": 3.0,
+            "to_l3_cost": 0.0,
+        }
+    ]
+    assert summary["selected"][0]["reasons"] == ["uncertain"]
