@@ -65,6 +65,18 @@ def _zero_spec():
     )
 
 
+def _identity8_spec():
+    return fr.FormatSpec(
+        name="IDENT8",
+        weight_bits=8,
+        group_size=0,
+        scale_bits=0,
+        scale_dtype_name="none",
+        weight_element_dtype="test_identity",
+        quantize_dequantize=lambda w: w.clone(),
+    )
+
+
 def test_select_formats_uses_current_neighbors_and_bf16():
     stats = {"layer": _stat()}
     costs = {
@@ -202,3 +214,65 @@ def test_measure_propagated_costs_pairs_candidate_with_target_bf16_baseline(tmp_
     assert zero["propagated_end_kl"] > 0.1
     assert zero["downstream_output_mse"] > 0.0
     assert costs["l1"]["BF16"]["propagated_end_kl"] == 0.0
+
+
+def test_toy_l3_propagation_differs_from_local_cost_and_flips_pick(tmp_path):
+    model = _AmplifyingToy().eval()
+    stats = {
+        "l1": {
+            "n_params": 4,
+            "in_features": 2,
+            "out_features": 2,
+            "h_trace": 1.0,
+            "_memory_bytes_by_format": {
+                "ZERO4": 2,
+                "IDENT8": 4,
+                "BF16": 8,
+            },
+        }
+    }
+    l2_costs = {
+        "l1": {
+            "ZERO4": {"predicted_dloss": 0.01},
+            "IDENT8": {"predicted_dloss": 0.02},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    }
+    assignment = {"l1": "ZERO4", "l2": "BF16", "l3": "BF16"}
+    specs = [_zero_spec(), _identity8_spec(), fr.get_format("BF16")]
+    selected = select_l3_neighborhood(
+        stats,
+        l2_costs,
+        {"l1": "ZERO4"},
+        specs,
+        min_fraction=1.0,
+        max_fraction=1.0,
+    )
+    calib = torch.tensor([[1.0, -1.0], [0.5, -0.5]], dtype=torch.float32)
+
+    l3_costs = measure_propagated_costs(
+        model,
+        assignment,
+        selected,
+        calib,
+        specs,
+        work_root=tmp_path,
+        max_lanes_per_batch=8,
+    )
+    l3_candidates = build_l3_candidates(stats, l3_costs, specs)
+    solved, _chosen = solve_frozen_l3_neighborhood(
+        stats,
+        {"l1": "ZERO4"},
+        l3_candidates,
+        specs,
+        target_bits=8.0,
+        bit_precision=0.5,
+    )
+
+    assert l3_costs["l1"]["ZERO4"]["propagated_end_kl"] != pytest.approx(
+        l2_costs["l1"]["ZERO4"]["predicted_dloss"]
+    )
+    assert l3_costs["l1"]["ZERO4"]["propagated_end_kl"] > (
+        l3_costs["l1"]["IDENT8"]["propagated_end_kl"]
+    )
+    assert solved["l1"] == "IDENT8"
