@@ -213,7 +213,7 @@ These caveats apply equally to most published mixed-precision allocators (HAQ, H
 
 </details>
 
-For full derivations, the `_GradNormCapture` MoE Fisher estimator, the MTP quantization path, and the joint expert-prune solver: see source comments in `prismaquant/{sensitivity_probe,allocator,allocator_prune}.py` and the design notes in `docs/`.
+For full derivations, the `_GradNormCapture` MoE Fisher estimator, the MTP quantization path, the propagated-cost L3 polish, and the joint expert-prune solver: see source comments in `prismaquant/{sensitivity_probe,allocator,allocator_prune}.py` and the design notes in `docs/`.
 
 ## Citation
 
