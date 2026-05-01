@@ -78,6 +78,55 @@ def _flashinfer_kernel_accepts(fmt_name: str, in_features: int,
         return None
 
 
+def _stats_indicates_packed_expert(stats_entry: dict) -> bool:
+    """True for probe entries representing a 3D packed-expert tensor."""
+    return bool(
+        stats_entry.get("_packed_experts_module")
+        or stats_entry.get("_packed_param")
+        or int(stats_entry.get("num_experts", 0) or 0) > 0
+    )
+
+
+def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
+    """Whether ``output_mse`` is a real joint-output measurement.
+
+    Packed experts historically stored ``output_mse=0.0`` as a placeholder
+    because the routed expert forward was not reconstructed offline. That
+    placeholder must not outrank the scalar predicted_dloss / weight_mse path.
+    """
+    if "output_mse" not in cost_entry:
+        return False
+    if cost_entry.get("output_mse_measured") is False:
+        return False
+    if (_stats_indicates_packed_expert(stats_entry)
+            and float(cost_entry.get("output_mse", 0.0)) == 0.0
+            and ("predicted_dloss" in cost_entry or "weight_mse" in cost_entry)):
+        return False
+    return True
+
+
+def cost_entry_predicted_dloss(
+    stats_entry: dict,
+    cost_entry: dict,
+    *,
+    gain: float = 1.0,
+) -> float:
+    """Return the allocator's authoritative Δloss for one cost entry."""
+    if _has_measured_output_mse(stats_entry, cost_entry):
+        return predicted_dloss(
+            stats_entry["h_trace"],
+            float(cost_entry["output_mse"]),
+            gain=gain,
+        )
+    if "predicted_dloss" in cost_entry:
+        return float(cost_entry["predicted_dloss"]) * float(gain)
+    return predicted_dloss(
+        stats_entry["h_trace"],
+        float(cost_entry.get("weight_mse", 0.0)),
+        gain=gain,
+    )
+
+
 def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                      calibrated_gains: dict[str, float] | None = None,
                      source_manifest: dict[str, str] | None = None,
@@ -90,7 +139,6 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
     for name, s in stats.items():
         if name not in costs:
             continue
-        h_trace = s["h_trace"]
         shape = _shape_from_stats(s)
         in_features = int(s.get("in_features", 0) or 0)
         out_features = int(s.get("out_features", 0) or 0)
@@ -117,23 +165,11 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 masked_by_shape.setdefault(spec.name, []).append(name)
                 continue
             gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
-            # Always use joint output perturbation (output_mse), not just
-            # weight error. For W*A* formats (NVFP4/W4A4, MXFP8/W8A8) the
-            # runtime error is dominated by activation quantization, not
-            # weight quantization. Using weight_mse alone undercounts MXFP8
-            # against NVFP4 because MXFP8 wins on weight precision but
-            # loses on group_size=32 (vs NVFP4's group_size=16) activation
-            # scaling — invisible to a weight-only Δloss model. Falls back
-            # to the legacy weight_mse formula when output_mse isn't in
-            # the cost pickle (older runs).
-            if "output_mse" in entry:
-                output_mse = float(entry["output_mse"])
-                predicted = predicted_dloss(h_trace, output_mse, gain=gain)
-            elif "predicted_dloss" in entry:
-                predicted = float(entry["predicted_dloss"]) * gain
-            else:
-                weight_mse = float(entry.get("weight_mse", 0.0))
-                predicted = predicted_dloss(h_trace, weight_mse, gain=gain)
+            # Always use measured joint output perturbation when available.
+            # Packed experts can carry an unmeasured output_mse placeholder;
+            # cost_entry_predicted_dloss falls back to predicted_dloss or
+            # weight_mse for those entries.
+            predicted = cost_entry_predicted_dloss(s, entry, gain=gain)
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=spec.effective_bits_for_shape(shape),
@@ -231,16 +267,9 @@ def aggregate_fused_siblings(
             sum_pred = 0.0
             for m in members:
                 c = costs[m][spec.name]
-                # Mirrors build_candidates: prefer joint output_mse-based
-                # Δloss; fall back to legacy fields for older cost pickles.
-                if "output_mse" in c:
-                    h_i = stats[m]["h_trace"]
-                    sum_pred += 0.5 * h_i * float(c["output_mse"])
-                elif "predicted_dloss" in c:
-                    sum_pred += float(c["predicted_dloss"])
-                else:
-                    h_i = stats[m]["h_trace"]
-                    sum_pred += 0.5 * h_i * float(c.get("weight_mse", 0.0))
+                # Mirrors build_candidates, including unmeasured packed
+                # output_mse fallback.
+                sum_pred += cost_entry_predicted_dloss(stats[m], c)
             effective_mse = sum_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
             super_cost[spec.name] = {
                 "weight_mse": effective_mse,

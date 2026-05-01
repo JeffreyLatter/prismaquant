@@ -5,8 +5,12 @@ import math
 import re
 
 from . import format_registry as fr
-from .allocator_candidates import _passthrough_source_ok
-from .allocator_solver import Candidate, _shape_from_stats, predicted_dloss
+from .allocator_candidates import (
+    _has_measured_output_mse,
+    _passthrough_source_ok,
+    cost_entry_predicted_dloss,
+)
+from .allocator_solver import Candidate, _shape_from_stats
 
 
 def _moe_group_and_projection(name: str) -> tuple[str, str] | None:
@@ -169,27 +173,30 @@ def aggregate_moe_candidates(
                 sum_weight_mse_x_params += _member_cost(m_, spec.name)["weight_mse"] * p_i
                 sum_params_avail += p_i
             mean_weight_mse = sum_weight_mse_x_params / max(sum_params_avail, 1)
-            mean_output_mse = sum(
-                _member_cost(m_, spec.name)["output_mse"]
-                for m_ in available_members
-            ) / len(available_members)
+            measured_output_members = [
+                m_ for m_ in available_members
+                if _has_measured_output_mse(
+                    stats[m_], _member_cost(m_, spec.name)
+                )
+            ]
+            mean_output_mse = (
+                sum(
+                    _member_cost(m_, spec.name)["output_mse"]
+                    for m_ in measured_output_members
+                ) / len(measured_output_members)
+                if measured_output_members else 0.0
+            )
 
             sum_pred = 0.0
             for m_ in members:
                 c = _member_cost(m_, spec.name)
                 if c is None:
-                    c = {"weight_mse": mean_weight_mse,
-                         "output_mse": mean_output_mse}
-                # Mirrors build_candidates: prefer joint output_mse-based
-                # Δloss; legacy fields kept for old cost pickles.
-                if "output_mse" in c:
-                    h_i = stats[m_]["h_trace"]
-                    sum_pred += 0.5 * h_i * float(c["output_mse"])
-                elif "predicted_dloss" in c:
-                    sum_pred += float(c["predicted_dloss"])
-                else:
-                    h_i = stats[m_]["h_trace"]
-                    sum_pred += 0.5 * h_i * float(c["weight_mse"])
+                    c = {"weight_mse": mean_weight_mse}
+                    if measured_output_members:
+                        c["output_mse"] = mean_output_mse
+                # Mirrors build_candidates, including unmeasured packed
+                # output_mse fallback.
+                sum_pred += cost_entry_predicted_dloss(stats[m_], c)
 
             if sum_h > 0:
                 effective_mse = sum_pred / (0.5 * sum_h)
@@ -271,18 +278,9 @@ def aggregate_moe_candidates(
                         0.5 * float(stats[m_]["h_trace"]) * fb_mse * gain
                     )
                 else:
-                    if "output_mse" in c:
-                        per_member_dloss[m_] = (
-                            0.5 * float(stats[m_]["h_trace"])
-                            * float(c["output_mse"]) * gain
-                        )
-                    elif "predicted_dloss" in c:
-                        per_member_dloss[m_] = float(c["predicted_dloss"]) * gain
-                    else:
-                        per_member_dloss[m_] = (
-                            0.5 * float(stats[m_]["h_trace"])
-                            * float(c["weight_mse"]) * gain
-                        )
+                    per_member_dloss[m_] = cost_entry_predicted_dloss(
+                        stats[m_], c, gain=gain
+                    )
 
             base_memory_bytes, base_bits_per_param = _aggregate_candidate_memory_bits(
                 members, spec, stats
@@ -292,9 +290,7 @@ def aggregate_moe_candidates(
 
             for ratio in effective_prune_ratios:
                 if ratio <= 0.0 or num_experts_total == 0:
-                    # super_cost stores effective_mse in both fields; use
-                    # the joint value to stay consistent with members.
-                    predicted = predicted_dloss(sum_h, entry["output_mse"], gain=gain)
+                    predicted = float(entry["predicted_dloss"]) * gain
                     cands.append(Candidate(
                         fmt=spec.name,
                         bits_per_param=base_bits_per_param,

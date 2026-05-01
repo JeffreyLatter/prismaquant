@@ -142,6 +142,53 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         self.assertAlmostEqual(by_fmt["NVFP4"].predicted_dloss, 0.5 * 2.0 * 0.10 * 2.0)
         self.assertAlmostEqual(by_fmt["MXFP8"].predicted_dloss, 0.5 * 2.0 * 0.02 * 1.0)
 
+    def test_build_candidates_ignores_unmeasured_packed_output_mse(self):
+        stats = {
+            "model.layers.0.mlp.experts.gate_up_proj": {
+                "h_trace": 3.0,
+                "out_features": 8,
+                "in_features": 16,
+                "n_params": 2 * 8 * 16,
+                "num_experts": 2,
+                "_packed_experts_module": "model.layers.0.mlp.experts",
+                "_packed_param": "gate_up_proj",
+            }
+        }
+        costs = {
+            "model.layers.0.mlp.experts.gate_up_proj": {
+                "NVFP4": {
+                    "weight_mse": 0.20,
+                    "output_mse": 0.0,
+                    "output_mse_measured": False,
+                    "predicted_dloss": 7.0,
+                },
+                # Defensive path for old packed artifacts that wrote the
+                # placeholder zero but did not carry the explicit measured flag.
+                "MXFP4": {
+                    "weight_mse": 0.10,
+                    "output_mse": 0.0,
+                    "predicted_dloss": 2.0,
+                },
+                "BF16": {
+                    "weight_mse": 0.25,
+                    "output_mse": 0.0,
+                    "output_mse_measured": False,
+                },
+            }
+        }
+        cands = build_candidates(
+            stats,
+            costs,
+            [fr.get_format("NVFP4"), fr.get_format("MXFP4"), fr.get_format("BF16")],
+        )
+        by_fmt = {
+            c.fmt: c
+            for c in cands["model.layers.0.mlp.experts.gate_up_proj"]
+        }
+        self.assertAlmostEqual(by_fmt["NVFP4"].predicted_dloss, 7.0)
+        self.assertAlmostEqual(by_fmt["MXFP4"].predicted_dloss, 2.0)
+        self.assertAlmostEqual(by_fmt["BF16"].predicted_dloss, 0.5 * 3.0 * 0.25)
+
     def test_select_targets_returns_baseline_knee_high(self):
         curve = [
             {"feasible": True, "achieved_bits": 4.5, "predicted_dloss": 10.0},

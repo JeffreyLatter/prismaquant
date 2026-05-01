@@ -101,6 +101,62 @@ def test_no_prune_when_disabled_preserves_legacy_behavior():
         assert cand.pruned_expert_ids == ()
 
 
+def test_packed_expert_aggregation_ignores_unmeasured_output_mse():
+    members = [
+        "model.layers.0.mlp.experts.gate_up_proj.0",
+        "model.layers.0.mlp.experts.gate_up_proj.1",
+    ]
+    stats = {
+        m: {
+            "h_trace": 1.0,
+            "w_max_abs": 1.0,
+            "w_norm_sq": 4.0,
+            "n_params": 160,
+            "in_features": 16,
+            "out_features": 10,
+            "h_trace_raw": 1.0,
+            "h_w2_sum": 0.4,
+            "num_experts": 2,
+            "_packed_experts_module": "model.layers.0.mlp.experts",
+            "_packed_param": "gate_up_proj",
+        }
+        for m in members
+    }
+    costs = {
+        members[0]: {
+            "NVFP4": {
+                "weight_mse": 0.10,
+                "output_mse": 0.0,
+                "output_mse_measured": False,
+                "predicted_dloss": 7.0,
+            }
+        },
+        members[1]: {
+            "NVFP4": {
+                "weight_mse": 0.20,
+                "output_mse": 0.0,
+                "predicted_dloss": 2.0,
+            }
+        },
+    }
+    candidates = {
+        m: [Candidate("NVFP4", 4.5, 90, 1.0)]
+        for m in members
+    }
+
+    _, costs_ext, c_out = aggregate_moe_candidates(
+        stats,
+        costs,
+        [fr.get_format("NVFP4")],
+        candidates,
+        granularity="projection",
+    )
+
+    super_name = "model.layers.0.mlp.experts.__fused__.gate_up_proj"
+    assert costs_ext[super_name]["NVFP4"]["predicted_dloss"] == pytest.approx(9.0)
+    assert c_out[super_name][0].predicted_dloss == pytest.approx(9.0)
+
+
 def test_prune_drops_lowest_saliency_first():
     stats, costs, c_in, e_info, sal, specs = _make_two_expert_fixture({0: 1.0, 1: 0.1})
     _, _, c_out = aggregate_moe_candidates(

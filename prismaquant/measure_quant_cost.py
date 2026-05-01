@@ -57,7 +57,8 @@ def canonical_linear_name(name: str) -> str:
 def _accumulate_result(bucket: dict, name: str, fmt: str,
                        weight_mse: float, output_mse: float,
                        rel_output_mse: float,
-                       predicted_dloss: float | None = None):
+                       predicted_dloss: float | None = None,
+                       output_mse_measured: bool = True):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
@@ -66,6 +67,7 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_rel_output_mse_sum": 0.0,
         "_predicted_dloss_sum": 0.0,
         "_predicted_dloss_count": 0,
+        "_output_mse_measured": True,
     })
     acc["_count"] += 1
     acc["_weight_mse_sum"] += weight_mse
@@ -74,6 +76,9 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
     if predicted_dloss is not None:
         acc["_predicted_dloss_sum"] += predicted_dloss
         acc["_predicted_dloss_count"] += 1
+    acc["_output_mse_measured"] = bool(
+        acc["_output_mse_measured"] and output_mse_measured
+    )
 
 
 def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
@@ -87,11 +92,14 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             n = max(int(acc.pop("_count", 1)), 1)
             dloss_n = int(acc.pop("_predicted_dloss_count", 0) or 0)
             dloss_sum = acc.pop("_predicted_dloss_sum", 0.0)
+            output_mse_measured = bool(acc.pop("_output_mse_measured", True))
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
                 "rel_output_mse": acc.pop("_rel_output_mse_sum") / n,
             }
+            if not output_mse_measured:
+                entry["output_mse_measured"] = False
             if dloss_n > 0:
                 # Full per-weight Δloss from the H-detail path. The
                 # allocator prefers this scalar over the scalar-proxy
@@ -400,10 +408,9 @@ def _measure_packed_experts(
     output_mse for packed experts: the experts module's forward involves
     token routing, so a clean per-tensor output MSE would require
     per-expert masked input slices that are awkward to reconstruct
-    offline. The allocator's predicted_dloss formula only consumes
-    weight_mse, so this is a deliberate skip rather than a missing
-    measurement; a zero is recorded for output_mse so downstream code
-    that still inspects the field gets a valid scalar.
+    offline. A zero is recorded for output_mse so downstream schema
+    validation still sees a scalar, but the entry is marked unmeasured so
+    the allocator falls back to predicted_dloss or weight_mse.
 
     When `h_detail` is provided, we also emit a per-weight Δloss based
     on the packed H diagonal stored with per-expert per-output-channel
@@ -444,7 +451,8 @@ def _measure_packed_experts(
                     del per_ch_mse
                 _accumulate_result(accum, full_name, spec.name,
                                    weight_mse, 0.0, 0.0,
-                                   predicted_dloss=dloss_val)
+                                   predicted_dloss=dloss_val,
+                                   output_mse_measured=False)
                 del w_hat, err
             except Exception as e:
                 accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
