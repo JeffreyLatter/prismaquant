@@ -180,6 +180,26 @@ def _is_l3_unsupported_target(stats_entry: Mapping) -> bool:
     return _stats_indicates_packed_expert(dict(stats_entry))
 
 
+def _current_has_cheaper_available_format(
+    stats: Mapping,
+    costs: Mapping,
+    assignment: Mapping[str, str],
+    name: str,
+    specs: list[fr.FormatSpec],
+) -> bool:
+    current = fr.canonical_format_name(assignment[name])
+    specs_by_name = {s.name: s for s in specs}
+    if current not in specs_by_name:
+        return False
+    current_bits = _bits_for_name(stats, name, specs_by_name[current])
+    for fmt in _available_formats_for_name(stats, costs, name, specs):
+        if fmt == current or fmt not in specs_by_name:
+            continue
+        if _bits_for_name(stats, name, specs_by_name[fmt]) < current_bits - 1e-12:
+            return True
+    return False
+
+
 def select_l3_neighborhood(
     stats: Mapping,
     costs: Mapping,
@@ -242,15 +262,40 @@ def select_l3_neighborhood(
             reasons=tuple(sorted(reasons)),
         )
 
-    for entry in eligible:
-        if entry.margin <= uncertainty_rel_tol:
-            _add(entry, "uncertain")
+    def _add_until_full(entries: list[L3NeighborhoodEntry], reason: str) -> None:
+        for entry in entries:
+            if len(by_name) >= max_count:
+                break
+            _add(entry, reason)
 
-    for entry in sorted(eligible, key=lambda e: (-e.l2_current_cost, e.name))[:safety_count]:
-        _add(entry, "high_l2_cost")
+    uncertain = [
+        entry
+        for entry in eligible
+        if entry.margin <= uncertainty_rel_tol
+    ]
+    uncertain.sort(key=lambda e: (e.margin, -e.l2_current_cost, e.name))
+    _add_until_full(uncertain, "uncertain")
+
+    confident_non_cheapest = [
+        entry
+        for entry in eligible
+        if _current_has_cheaper_available_format(
+            stats, costs, assignment, entry.name, specs
+        )
+    ]
+    confident_non_cheapest.sort(key=lambda e: (-e.l2_current_cost, e.margin, e.name))
+    # This backstop is mandatory: otherwise a full uncertain set can starve
+    # confident non-cheapest picks, which are the exact misranking cases L3
+    # is meant to verify.
+    for entry in confident_non_cheapest:
+        _add(entry, "confident_non_cheapest")
+
+    safety = sorted(eligible, key=lambda e: (-e.l2_current_cost, e.name))[:safety_count]
+    _add_until_full(safety, "high_l2_cost")
 
     if len(by_name) < min_count:
-        for entry in sorted(eligible, key=lambda e: (e.margin, -e.l2_current_cost, e.name)):
+        fill = sorted(eligible, key=lambda e: (e.margin, -e.l2_current_cost, e.name))
+        for entry in fill:
             _add(entry, "fill_min_fraction")
             if len(by_name) >= min_count:
                 break

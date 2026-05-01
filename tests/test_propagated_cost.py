@@ -109,14 +109,29 @@ def test_select_l3_neighborhood_caps_and_keeps_safety_layers():
     assignment = {}
     for i in range(20):
         name = f"layer{i}"
-        assignment[name] = "MXFP8"
-        current = 100.0 if i == 19 else 1.0
-        cheaper = current * (1.04 if i < 12 else 2.0)
+        assignment[name] = "NVFP4"
         costs[name] = {
-            "NVFP4": {"predicted_dloss": cheaper},
-            "MXFP8": {"predicted_dloss": current},
+            "NVFP4": {"predicted_dloss": 1.0},
+            "MXFP8": {"predicted_dloss": 2.0},
             "BF16": {"predicted_dloss": 0.0},
         }
+    assignment["layer0"] = "MXFP8"
+    costs["layer0"] = {
+        "NVFP4": {"predicted_dloss": 1.04},
+        "MXFP8": {"predicted_dloss": 1.0},
+        "BF16": {"predicted_dloss": 0.0},
+    }
+    assignment["layer5"] = "MXFP8"
+    costs["layer5"] = {
+        "NVFP4": {"predicted_dloss": 2.0},
+        "MXFP8": {"predicted_dloss": 1.0},
+        "BF16": {"predicted_dloss": 0.0},
+    }
+    costs["layer19"] = {
+        "NVFP4": {"predicted_dloss": 100.0},
+        "MXFP8": {"predicted_dloss": 200.0},
+        "BF16": {"predicted_dloss": 0.0},
+    }
 
     selected = select_l3_neighborhood(
         stats,
@@ -124,13 +139,43 @@ def test_select_l3_neighborhood_caps_and_keeps_safety_layers():
         assignment,
         _specs(),
         min_fraction=0.05,
-        max_fraction=0.10,
+        max_fraction=0.15,
         safety_fraction=0.05,
     )
 
-    assert len(selected) == 2
-    assert "layer19" in {entry.name for entry in selected}
-    assert any("high_l2_cost" in entry.reasons for entry in selected)
+    selected_by_name = {entry.name: entry for entry in selected}
+    assert len(selected) == 3
+    assert "uncertain" in selected_by_name["layer0"].reasons
+    assert "confident_non_cheapest" in selected_by_name["layer5"].reasons
+    assert "high_l2_cost" in selected_by_name["layer19"].reasons
+
+
+def test_select_l3_neighborhood_includes_confident_non_cheapest():
+    stats = {"layer": _stat()}
+    costs = {
+        "layer": {
+            "NVFP4": {"predicted_dloss": 10.0},
+            "MXFP6_E3M2": {"predicted_dloss": 1.0},
+            "MXFP8": {"predicted_dloss": 2.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    }
+    assignment = {"layer": "MXFP6_E3M2"}
+    specs = [fr.get_format(n) for n in ("NVFP4", "MXFP6_E3M2", "MXFP8", "BF16")]
+
+    selected = select_l3_neighborhood(
+        stats,
+        costs,
+        assignment,
+        specs,
+        min_fraction=1.0,
+        max_fraction=1.0,
+        safety_fraction=0.0,
+    )
+
+    assert len(selected) == 1
+    assert selected[0].name == "layer"
+    assert selected[0].reasons == ("confident_non_cheapest",)
 
 
 def test_select_l3_neighborhood_errors_on_packed_experts():
