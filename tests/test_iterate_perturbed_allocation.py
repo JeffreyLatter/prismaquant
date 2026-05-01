@@ -450,3 +450,176 @@ def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
     assert l3_payload["meta"]["tail_only"] is False
     assert l3_payload["meta"]["l3_n_calib_samples"] == 1
     assert l3_payload["meta"]["l3_calib_seqlen"] == 2
+
+
+def _run_global_l3_case(tmp_path, monkeypatch, *, l3_costs, kl_after):
+    probe_path = tmp_path / "probe.pkl"
+    costs_path = tmp_path / "costs.pkl"
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "out"
+    stats = {f"layer{i}": _tiny_stat() for i in range(4)}
+    l2_costs = {
+        name: {
+            "INT8_W8A16": {"predicted_dloss": 0.0},
+            "BF16": {"predicted_dloss": 10.0},
+        }
+        for name in stats
+    }
+    with open(probe_path, "wb") as f:
+        pickle.dump({"stats": stats}, f)
+    with open(costs_path, "wb") as f:
+        pickle.dump({"costs": l2_costs}, f)
+
+    class _Tokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=_Tokenizer),
+    )
+    monkeypatch.setattr(ipa, "validate_probe_payload", lambda *_args: None)
+    monkeypatch.setattr(ipa, "validate_cost_payload", lambda *_args: None)
+    monkeypatch.setattr(
+        ipa,
+        "load_text_model_under_work_root",
+        lambda *_args, **_kwargs: _TinyLogitsModel(),
+    )
+    monkeypatch.setattr(
+        ipa,
+        "load_wikitext_calibration",
+        lambda _tokenizer, n_samples, seqlen: torch.zeros(
+            (n_samples, seqlen),
+            dtype=torch.long,
+        ),
+    )
+    monkeypatch.setattr(ipa, "cache_reference_log_probs", lambda *_args: [])
+
+    l2_assignment = {name: "INT8_W8A16" for name in stats}
+
+    def _kl(_model, assignment, *_args, **_kwargs):
+        return float(kl_after) if dict(assignment) != l2_assignment else 1.0
+
+    def _capture(_model, _assignment, _calib_ids, cache_dir, **_kwargs):
+        cache_dir = tmp_path / Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "cache.bin").write_bytes(b"x")
+        return {"cache_dir": str(cache_dir)}
+
+    class _ActivationIndex:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __contains__(self, _name):
+            return True
+
+    measured_names = []
+
+    def _measure(_model, _assignment, selected, *_args, **_kwargs):
+        measured_names.extend(entry.name for entry in selected)
+        return l3_costs
+
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _kl)
+    monkeypatch.setattr(ipa, "capture_perturbed_activation_cache", _capture)
+    monkeypatch.setattr(ipa, "ActivationIndex", _ActivationIndex)
+    monkeypatch.setattr(ipa, "run_cost_pass", lambda *_args, **_kwargs: l2_costs)
+    monkeypatch.setattr(ipa, "measure_propagated_costs", _measure)
+
+    rc = ipa.main([
+        "--model", "tiny",
+        "--probe", str(probe_path),
+        "--initial-costs", str(costs_path),
+        "--formats", "INT8_W8A16,BF16",
+        "--target-bits", "16",
+        "--work-dir", str(work_dir),
+        "--output-dir", str(output_dir),
+        "--max-iters", "1",
+        "--convergence-frac", "1",
+        "--l3-polish",
+        "--l3-mode", "global",
+        "--no-l3-tail-only",
+    ])
+    with open(output_dir / "final_assignment.json") as f:
+        final_assignment = json.load(f)
+    with open(output_dir / "l3_polish_summary.json") as f:
+        l3_summary = json.load(f)
+    with open(output_dir / "l3_propagated_costs.pkl", "rb") as f:
+        l3_payload = pickle.load(f)
+    return rc, final_assignment, l3_summary, l3_payload, measured_names
+
+
+def _global_l3_costs_for_joint_choice():
+    return {
+        "layer0": {
+            "INT8_W8A16": {"propagated_end_kl": 1.0, "downstream_output_mse": 0.0},
+            "BF16": {"propagated_end_kl": 0.0, "downstream_output_mse": 0.0},
+        },
+        "layer1": {
+            "INT8_W8A16": {"propagated_end_kl": 0.0, "downstream_output_mse": 0.0},
+            "BF16": {"propagated_end_kl": 1.0, "downstream_output_mse": 0.0},
+        },
+        "layer2": {
+            "INT8_W8A16": {"propagated_end_kl": 1.0, "downstream_output_mse": 0.0},
+            "BF16": {"propagated_end_kl": 0.0, "downstream_output_mse": 0.0},
+        },
+        "layer3": {
+            "INT8_W8A16": {"propagated_end_kl": 0.0, "downstream_output_mse": 0.0},
+            "BF16": {"propagated_end_kl": 1.0, "downstream_output_mse": 0.0},
+        },
+    }
+
+
+def test_global_l3_measures_all_linears(tmp_path, monkeypatch):
+    rc, _final, summary, payload, measured_names = _run_global_l3_case(
+        tmp_path,
+        monkeypatch,
+        l3_costs=_global_l3_costs_for_joint_choice(),
+        kl_after=0.5,
+    )
+
+    assert rc == 0
+    assert sorted(measured_names) == [f"layer{i}" for i in range(4)]
+    assert sorted(payload["costs"]) == [f"layer{i}" for i in range(4)]
+    assert payload["meta"]["l3_mode"] == "global"
+    assert payload["meta"]["total_count"] == 4
+    assert payload["meta"]["model_linear_count"] == 4
+    assert summary["l3_mode"] == "global"
+    assert summary["total_count"] == 4
+    assert summary["model_linear_count"] == 4
+
+
+def test_global_l3_dp_optimizes_jointly(tmp_path, monkeypatch):
+    rc, final_assignment, summary, _payload, _measured = _run_global_l3_case(
+        tmp_path,
+        monkeypatch,
+        l3_costs=_global_l3_costs_for_joint_choice(),
+        kl_after=0.5,
+    )
+
+    assert rc == 0
+    assert final_assignment == {
+        "layer0": "BF16",
+        "layer1": "INT8_W8A16",
+        "layer2": "BF16",
+        "layer3": "INT8_W8A16",
+    }
+    assert summary["accepted"] is True
+    assert summary["accepted_flip_count"] == 2
+
+
+def test_global_l3_respects_regression_rollback(tmp_path, monkeypatch):
+    rc, final_assignment, summary, _payload, _measured = _run_global_l3_case(
+        tmp_path,
+        monkeypatch,
+        l3_costs=_global_l3_costs_for_joint_choice(),
+        kl_after=1.2,
+    )
+
+    assert rc == 0
+    assert final_assignment == {f"layer{i}": "INT8_W8A16" for i in range(4)}
+    assert summary["l3_mode"] == "global"
+    assert summary["regression"] is True
+    assert summary["accepted"] is False
+    assert summary["accepted_assignment"] == "l2"

@@ -42,6 +42,7 @@ from prismaquant.perturbed_x_cache import (
 from prismaquant.propagated_cost import (
     L3UnsupportedTargetError,
     assignment_bit_total,
+    build_global_l3_neighborhood,
     build_l3_candidates,
     measure_propagated_costs,
     select_l3_neighborhood,
@@ -647,6 +648,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--h-detail-dir")
     ap.add_argument("--l3-polish", action="store_true",
                     help="Run one propagated-cost polish pass after L2 convergence.")
+    ap.add_argument(
+        "--l3-mode",
+        default="selective",
+        choices=["selective", "global"],
+        help="L3 polish mode: bounded neighborhood or all eligible Linears.",
+    )
     ap.add_argument("--l3-uncertainty-rel-tol", type=float, default=0.10)
     ap.add_argument("--l3-min-fraction", type=float, default=0.05)
     ap.add_argument("--l3-max-fraction", type=float, default=0.30)
@@ -1007,30 +1014,44 @@ def main(argv: list[str] | None = None) -> int:
             kl_before_start,
         )
         selection_start = _phase_start("[l3] selection")
+        n_total = len(set(stats) & set(l2_assignment))
         try:
-            selected = select_l3_neighborhood(
-                stats,
-                latest_smoothed_costs,
-                l2_assignment,
-                specs,
-                uncertainty_rel_tol=args.l3_uncertainty_rel_tol,
-                min_fraction=args.l3_min_fraction,
-                max_fraction=args.l3_max_fraction,
-                safety_fraction=args.l3_safety_fraction,
-            )
+            if args.l3_mode == "global":
+                selected = build_global_l3_neighborhood(
+                    stats,
+                    latest_smoothed_costs,
+                    l2_assignment,
+                    specs,
+                )
+            else:
+                selected = select_l3_neighborhood(
+                    stats,
+                    latest_smoothed_costs,
+                    l2_assignment,
+                    specs,
+                    uncertainty_rel_tol=args.l3_uncertainty_rel_tol,
+                    min_fraction=args.l3_min_fraction,
+                    max_fraction=args.l3_max_fraction,
+                    safety_fraction=args.l3_safety_fraction,
+                )
         except L3UnsupportedTargetError as exc:
             _emit(f"[l3] ERROR: packed experts present in L3 selection: {exc}")
             raise
         selection_timing = _phase_end("[l3] selection", selection_start)
         n_uncertain = sum(1 for entry in selected if "uncertain" in entry.reasons)
         n_safety = sum(1 for entry in selected if "high_l2_cost" in entry.reasons)
-        n_total = len(set(stats) & set(l2_assignment))
-        _emit(
-            f"[l3] selection details: uncertain {n_uncertain} "
-            f"(margin threshold {args.l3_uncertainty_rel_tol:.2f}), "
-            f"safety includes {n_safety}, total selected {len(selected)} "
-            f"from {n_total} Linears"
-        )
+        if args.l3_mode == "global":
+            _emit(
+                f"[l3] global mode: measuring {len(selected)} eligible "
+                f"Linears from {n_total} total Linears"
+            )
+        else:
+            _emit(
+                f"[l3] selection details: uncertain {n_uncertain} "
+                f"(margin threshold {args.l3_uncertainty_rel_tol:.2f}), "
+                f"safety includes {n_safety}, total selected {len(selected)} "
+                f"from {n_total} Linears"
+            )
         _emit(f"[l3] selecting neighborhood: {len(selected)} candidates")
         for entry in selected:
             if "uncertain" not in entry.reasons:
@@ -1100,7 +1121,10 @@ def main(argv: list[str] | None = None) -> int:
                         "model": args.model,
                         "probe": args.probe,
                         "paired_baseline": "target_bf16_under_l2_assignment",
+                        "l3_mode": args.l3_mode,
                         "selected_count": len(selected),
+                        "total_count": len(selected),
+                        "model_linear_count": n_total,
                         "tail_only": bool(args.l3_tail_only),
                         "l3_max_lanes_per_batch": int(args.l3_max_lanes_per_batch),
                         "l3_n_calib_samples": int(args.l3_n_calib_samples),
@@ -1161,56 +1185,97 @@ def main(argv: list[str] | None = None) -> int:
             for name in set(stats) & set(l2_assignment)
         )
         open_names = set(l3_candidates)
-        frozen_assignment = {
-            name: l2_assignment[name]
-            for name in sorted((set(stats) & set(l2_assignment)) - open_names)
-        }
-        frozen_bits = assignment_bit_total(
-            stats,
-            frozen_assignment,
-            {s.name: s for s in specs},
-        )
-        target_total_bits = float(args.target_bits) * float(total_params)
-        open_params = sum(
-            int(stats[name].get("n_params", 0) or 0)
-            for name in open_names
-        )
-        remaining_bpp = (
-            (target_total_bits - frozen_bits) / float(open_params)
-            if open_params > 0 else 0.0
-        )
-        frozen_bpp_total = (
-            frozen_bits / float(total_params)
-            if total_params > 0 else 0.0
-        )
-        _emit(
-            f"[l3] solving frozen DP: open={len(open_names)}, "
-            f"frozen={len(frozen_assignment)}, remaining_bpp={remaining_bpp:.4f}"
-        )
-        _emit(
-            f"[l3] frozen DP detail: frozen {len(frozen_assignment)} "
-            f"({frozen_bpp_total:.4f} bpp total), open {len(open_names)}, "
-            f"remaining_bpp {remaining_bpp:.4f}"
-        )
-        frozen_solve_start = _phase_start("[l3] frozen DP solve")
-        if l3_candidates:
-            polished_assignment, _chosen, frozen_dp_meta = solve_frozen_l3_neighborhood(
-                stats,
-                l2_assignment,
-                l3_candidates,
-                specs,
-                target_bits=args.target_bits,
-                bit_precision=args.bit_precision,
-                budget_tolerance=args.frozen_dp_budget_tolerance,
-                return_metadata=True,
+        if args.l3_mode == "global":
+            _emit(
+                f"[l3] solving global DP: open={len(open_names)}, "
+                f"target_bpp={args.target_bits:.4f}"
+            )
+            frozen_solve_start = _phase_start("[l3] global DP solve")
+            if l3_candidates:
+                global_stats = {
+                    name: stats[name]
+                    for name in l3_candidates
+                    if name in stats
+                }
+                result = solve_allocation(
+                    global_stats,
+                    l3_candidates,
+                    args.target_bits,
+                    args.bit_precision,
+                )
+                if result is None:
+                    raise RuntimeError(
+                        "L3 global DP could not find a feasible allocation "
+                        f"within bit_precision={args.bit_precision}."
+                    )
+                open_assignment, _chosen = result
+                polished_assignment = dict(l2_assignment)
+                polished_assignment.update(open_assignment)
+                frozen_dp_meta = {
+                    "frozen_dp_precision_used": args.bit_precision,
+                    "global_dp": True,
+                }
+            else:
+                polished_assignment = dict(l2_assignment)
+                frozen_dp_meta = {
+                    "frozen_dp_precision_used": "none",
+                    "global_dp": True,
+                }
+            frozen_solve_timing = _phase_end(
+                "[l3] global DP solve",
+                frozen_solve_start,
             )
         else:
-            polished_assignment = dict(l2_assignment)
-            frozen_dp_meta = {"frozen_dp_precision_used": "none"}
-        frozen_solve_timing = _phase_end(
-            "[l3] frozen DP solve",
-            frozen_solve_start,
-        )
+            frozen_assignment = {
+                name: l2_assignment[name]
+                for name in sorted((set(stats) & set(l2_assignment)) - open_names)
+            }
+            frozen_bits = assignment_bit_total(
+                stats,
+                frozen_assignment,
+                {s.name: s for s in specs},
+            )
+            target_total_bits = float(args.target_bits) * float(total_params)
+            open_params = sum(
+                int(stats[name].get("n_params", 0) or 0)
+                for name in open_names
+            )
+            remaining_bpp = (
+                (target_total_bits - frozen_bits) / float(open_params)
+                if open_params > 0 else 0.0
+            )
+            frozen_bpp_total = (
+                frozen_bits / float(total_params)
+                if total_params > 0 else 0.0
+            )
+            _emit(
+                f"[l3] solving frozen DP: open={len(open_names)}, "
+                f"frozen={len(frozen_assignment)}, remaining_bpp={remaining_bpp:.4f}"
+            )
+            _emit(
+                f"[l3] frozen DP detail: frozen {len(frozen_assignment)} "
+                f"({frozen_bpp_total:.4f} bpp total), open {len(open_names)}, "
+                f"remaining_bpp {remaining_bpp:.4f}"
+            )
+            frozen_solve_start = _phase_start("[l3] frozen DP solve")
+            if l3_candidates:
+                polished_assignment, _chosen, frozen_dp_meta = solve_frozen_l3_neighborhood(
+                    stats,
+                    l2_assignment,
+                    l3_candidates,
+                    specs,
+                    target_bits=args.target_bits,
+                    bit_precision=args.bit_precision,
+                    budget_tolerance=args.frozen_dp_budget_tolerance,
+                    return_metadata=True,
+                )
+            else:
+                polished_assignment = dict(l2_assignment)
+                frozen_dp_meta = {"frozen_dp_precision_used": "none"}
+            frozen_solve_timing = _phase_end(
+                "[l3] frozen DP solve",
+                frozen_solve_start,
+            )
         l3_all_flips = []
         for name in sorted(set(l2_assignment) | set(polished_assignment)):
             old_fmt = l2_assignment.get(name)
@@ -1315,6 +1380,9 @@ def main(argv: list[str] | None = None) -> int:
             frozen_dp_precision_used=frozen_dp_meta["frozen_dp_precision_used"],
             accepted=polish_accepted,
         )
+        l3_summary["l3_mode"] = args.l3_mode
+        l3_summary["total_count"] = len(selected)
+        l3_summary["model_linear_count"] = n_total
         l3_summary["accepted_assignment"] = (
             "polished" if polish_accepted else "l2"
         )
@@ -1358,6 +1426,7 @@ def main(argv: list[str] | None = None) -> int:
                 l3_trace_path,
                 {
                     "name": entry.name,
+                    "l3_mode": args.l3_mode,
                     "format_candidates": list(entry.formats),
                     "propagated_end_kl": propagated,
                     "downstream_output_mse": downstream,

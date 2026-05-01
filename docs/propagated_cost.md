@@ -1,9 +1,11 @@
 # L3 Propagated Cost Polish
 
 L3 is an opt-in final pass on top of the converged perturbed-X/L2 allocation.
-It does not replace the L2 fixed-point loop. It measures a small neighborhood
-around the final L2 assignment, then re-solves only that measured neighborhood
-while freezing every other Linear at its L2 pick.
+It does not replace the L2 fixed-point loop. In the default selective mode it
+measures a small neighborhood around the final L2 assignment, then re-solves
+only that measured neighborhood while freezing every other Linear at its L2
+pick. In global mode it measures every eligible Linear candidate and runs one
+joint DP over the full measured set.
 
 ## Cost Semantics
 
@@ -29,7 +31,7 @@ DP pass.
 
 ## Candidate Scope
 
-`--l3-polish` selects a bounded Linear neighborhood:
+`--l3-polish --l3-mode selective` selects a bounded Linear neighborhood:
 
 - uncertain allocator-neighborhood choices, using `--l3-uncertainty-rel-tol`;
 - current L2 picks that are not the cheapest available measured format,
@@ -43,6 +45,14 @@ DP pass.
 For each selected Linear, L3 measures the current L2 pick, one cheaper format,
 one more accurate format, and BF16 when available. The final DP is run only
 over candidates with measured L3 costs and a measured current-format candidate.
+
+`--l3-mode global` uses the same per-Linear format filter but skips selection
+entirely: every eligible Linear is measured under the converged L2 baseline, and
+a single global DP optimizes all measured Linears using propagated end-KL. This
+is the cleaner algorithmic path because it removes selection coverage gaps and
+multi-flip interaction from the selective frozen-DP polish. It is also more
+expensive, so selective remains the default until larger smoke data justifies a
+default switch.
 
 ## Hook Ordering
 
@@ -66,11 +76,11 @@ When enabled, `iterate_perturbed_allocation.py` writes:
 
 - `l3_propagated_costs.pkl`;
 - `l3_polish_summary.json`;
-- the usual final assignment and final layer config, using the polished
-  assignment.
+- the usual final assignment and final layer config, using the accepted
+  assignment after validation rollback.
 
-The summary reports selected Linears, measured count, KL before/after, flip
-count, per-Linear flips, and whether `kl_after > kl_before`.
+The summary reports L3 mode, selected or total Linears, measured count, KL
+before/after, flip count, per-Linear flips, and whether `kl_after > kl_before`.
 
 ## Flags
 
@@ -82,6 +92,7 @@ python3 -m prismaquant.iterate_perturbed_allocation \
 
 Useful tuning flags:
 
+- `--l3-mode {selective,global}` default `selective`;
 - `--l3-uncertainty-rel-tol` default `0.10`;
 - `--l3-min-fraction` default `0.05`;
 - `--l3-max-fraction` default `0.30`;

@@ -368,6 +368,53 @@ def select_l3_neighborhood(
     return sorted(by_name.values(), key=lambda e: e.name)
 
 
+def build_global_l3_neighborhood(
+    stats: Mapping,
+    costs: Mapping,
+    assignment: Mapping[str, str],
+    specs: list[fr.FormatSpec],
+) -> list[L3NeighborhoodEntry]:
+    """Build an L3 measurement neighborhood covering every eligible Linear."""
+    selected: list[L3NeighborhoodEntry] = []
+    unsupported: list[str] = []
+    for name in sorted(set(stats) & set(assignment)):
+        current = fr.canonical_format_name(assignment[name])
+        current_cost = l2_cost_value(stats, costs, name, current)
+        if current_cost is None:
+            continue
+        fmts = select_formats_for_l3(stats, costs, assignment, name, specs)
+        if not fmts:
+            continue
+        if _is_l3_unsupported_target(stats[name]):
+            unsupported.append(name)
+            continue
+        alt_costs = [
+            value
+            for fmt in fmts
+            if fmt != current
+            for value in [l2_cost_value(stats, costs, name, fmt)]
+            if value is not None
+        ]
+        selected.append(
+            L3NeighborhoodEntry(
+                name=name,
+                current_format=current,
+                formats=fmts,
+                margin=_relative_margin(alt_costs, current_cost),
+                l2_current_cost=current_cost,
+                reasons=("global",),
+            )
+        )
+    if unsupported:
+        raise L3UnsupportedTargetError(
+            "L3 polish does not yet support packed expert tensors. "
+            f"Unsupported targets: {sorted(unsupported)}. "
+            "Re-run without --l3-polish for L2-only allocation, or wait "
+            "for packed-expert L3 support."
+        )
+    return selected
+
+
 def build_l3_candidates(
     stats: Mapping,
     propagated_costs: Mapping[str, Mapping[str, Mapping]],
