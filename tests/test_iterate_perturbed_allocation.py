@@ -133,6 +133,7 @@ def test_l3_polish_summary_reports_flips_and_regression():
     )
 
     assert summary["l3_enabled"] is True
+    assert summary["accepted"] is False
     assert isinstance(summary["selected_count"], int)
     assert summary["regression"] is True
     assert isinstance(summary["kl_before"], float)
@@ -150,6 +151,149 @@ def test_l3_polish_summary_reports_flips_and_regression():
         }
     ]
     assert summary["selected"][0]["reasons"] == ["uncertain"]
+
+
+def _run_tiny_l3_regression_case(tmp_path, monkeypatch, *, tolerance, kl_after):
+    probe_path = tmp_path / "probe.pkl"
+    costs_path = tmp_path / "costs.pkl"
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "out"
+    stats = {"layer": _tiny_stat()}
+    costs = {
+        "layer": {
+            "INT8_W8A16": {"predicted_dloss": 0.0},
+            "BF16": {"predicted_dloss": 10.0},
+        }
+    }
+    with open(probe_path, "wb") as f:
+        pickle.dump({"stats": stats}, f)
+    with open(costs_path, "wb") as f:
+        pickle.dump({"costs": costs}, f)
+
+    class _Tokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=_Tokenizer),
+    )
+    monkeypatch.setattr(ipa, "validate_probe_payload", lambda *_args: None)
+    monkeypatch.setattr(ipa, "validate_cost_payload", lambda *_args: None)
+    monkeypatch.setattr(
+        ipa,
+        "load_text_model_under_work_root",
+        lambda *_args, **_kwargs: _TinyLogitsModel(),
+    )
+    monkeypatch.setattr(
+        ipa,
+        "load_wikitext_calibration",
+        lambda _tokenizer, n_samples, seqlen: torch.zeros(
+            (n_samples, seqlen),
+            dtype=torch.long,
+        ),
+    )
+    monkeypatch.setattr(ipa, "cache_reference_log_probs", lambda *_args: [])
+    monkeypatch.setattr(
+        ipa,
+        "measure_assignment_kl",
+        lambda _model, assignment, *_args, **_kwargs: (
+            float(kl_after) if assignment.get("layer") == "BF16" else 1.0
+        ),
+    )
+
+    def _capture(_model, _assignment, _calib_ids, cache_dir, **_kwargs):
+        cache_dir = tmp_path / Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "cache.bin").write_bytes(b"x")
+        return {"cache_dir": str(cache_dir)}
+
+    class _ActivationIndex:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __contains__(self, _name):
+            return True
+
+    monkeypatch.setattr(ipa, "capture_perturbed_activation_cache", _capture)
+    monkeypatch.setattr(ipa, "ActivationIndex", _ActivationIndex)
+    monkeypatch.setattr(ipa, "run_cost_pass", lambda *_args, **_kwargs: costs)
+    monkeypatch.setattr(
+        ipa,
+        "measure_propagated_costs",
+        lambda *_args, **_kwargs: {
+            "layer": {
+                "INT8_W8A16": {"propagated_end_kl": 1.0, "downstream_output_mse": 0.0},
+                "BF16": {"propagated_end_kl": 0.0, "downstream_output_mse": 0.0},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        ipa,
+        "solve_frozen_l3_neighborhood",
+        lambda *_args, **_kwargs: (
+            {"layer": "BF16"},
+            {},
+            {"frozen_dp_precision_used": 0.001},
+        ),
+    )
+
+    argv = [
+        "--model", "tiny",
+        "--probe", str(probe_path),
+        "--initial-costs", str(costs_path),
+        "--formats", "INT8_W8A16,BF16",
+        "--target-bits", "16",
+        "--work-dir", str(work_dir),
+        "--output-dir", str(output_dir),
+        "--max-iters", "1",
+        "--convergence-frac", "1",
+        "--l3-polish",
+        "--no-l3-tail-only",
+    ]
+    if tolerance is not None:
+        argv.extend(["--l3-regression-tolerance", str(tolerance)])
+
+    rc = ipa.main(argv)
+    with open(output_dir / "final_assignment.json") as f:
+        final_assignment = json.load(f)
+    with open(output_dir / "l3_polish_summary.json") as f:
+        l3_summary = json.load(f)
+    return rc, final_assignment, l3_summary
+
+
+def test_l3_polish_rejects_assignment_on_regression(tmp_path, monkeypatch):
+    rc, final_assignment, l3_summary = _run_tiny_l3_regression_case(
+        tmp_path,
+        monkeypatch,
+        tolerance=None,
+        kl_after=1.2,
+    )
+
+    assert rc == 0
+    assert final_assignment == {"layer": "INT8_W8A16"}
+    assert l3_summary["regression"] is True
+    assert l3_summary["accepted"] is False
+    assert l3_summary["accepted_assignment"] == "l2"
+    assert l3_summary["accepted_flip_count"] == 0
+
+
+def test_l3_polish_accepts_within_tolerance(tmp_path, monkeypatch):
+    rc, final_assignment, l3_summary = _run_tiny_l3_regression_case(
+        tmp_path,
+        monkeypatch,
+        tolerance=0.10,
+        kl_after=1.05,
+    )
+
+    assert rc == 0
+    assert final_assignment == {"layer": "BF16"}
+    assert l3_summary["regression"] is True
+    assert l3_summary["accepted"] is True
+    assert l3_summary["accepted_assignment"] == "polished"
+    assert l3_summary["accepted_flip_count"] == 1
 
 
 class _TinyLogitsModel(nn.Module):

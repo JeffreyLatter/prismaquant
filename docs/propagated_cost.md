@@ -91,6 +91,8 @@ Useful tuning flags:
   fallback;
 - `--l3-n-calib-samples` default `4`;
 - `--l3-calib-seqlen` default `256`;
+- `--l3-regression-tolerance` default `0.0`, rejecting polish output when
+  validation KL regresses beyond the configured fraction of `kl_before`;
 - `--frozen-dp-budget-tolerance` default `0.05`, allowing the L3 greedy
   fallback to use up to 5% of total target bits as hard budget slack.
 

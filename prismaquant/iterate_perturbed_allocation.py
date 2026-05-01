@@ -524,7 +524,7 @@ def build_l3_polish_summary(
     kl_after: float,
     elapsed_seconds: float = 0.0,
     frozen_dp_precision_used=None,
-    accepted: bool = True,
+    accepted: bool | None = None,
 ) -> dict:
     flips = []
     for name in sorted(set(before_assignment) | set(after_assignment)):
@@ -549,10 +549,11 @@ def build_l3_polish_summary(
             }
         )
     regression = bool(float(kl_after) > float(kl_before))
+    accepted_value = (not regression) if accepted is None else bool(accepted)
     return {
         "l3_enabled": True,
         "enabled": True,
-        "accepted": bool(accepted),
+        "accepted": accepted_value,
         "selected_count": len(selected),
         "measured_count": len(l3_costs),
         "kl_before": float(kl_before),
@@ -659,6 +660,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--l3-n-calib-samples", type=int, default=4)
     ap.add_argument("--l3-calib-seqlen", type=int, default=256)
+    ap.add_argument("--l3-regression-tolerance", type=float, default=0.0)
     ap.add_argument(
         "--frozen-dp-budget-tolerance",
         type=float,
@@ -1252,6 +1254,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         kl_after_timing = _phase_end("[l3] validation KL after", kl_after_start)
         regression = bool(float(kl_after) > float(kl_before))
+        allowed_kl_after = (
+            float(kl_before)
+            + max(float(args.l3_regression_tolerance), 0.0) * abs(float(kl_before))
+        )
+        polish_accepted = bool(float(kl_after) <= allowed_kl_after)
         l3_kl_improvement_pct = (
             (float(kl_before) - float(kl_after)) / abs(float(kl_before)) * 100.0
             if abs(float(kl_before)) > 1e-12 else 0.0
@@ -1260,6 +1267,24 @@ def main(argv: list[str] | None = None) -> int:
             f"[l3] validating: KL_before={kl_before:.4e}, "
             f"KL_after={kl_after:.4e}, regression={str(regression).lower()}, "
             f"improvement={l3_kl_improvement_pct:.2f}%"
+        )
+        if not polish_accepted:
+            delta_pct = (
+                (float(kl_after) - float(kl_before)) / abs(float(kl_before)) * 100.0
+                if abs(float(kl_before)) > 1e-12 else 0.0
+            )
+            _emit(
+                f"[l3] regression detected (kl_before={kl_before:.4e}, "
+                f"kl_after={kl_after:.4e}, delta=+{delta_pct:.2f}%); "
+                "REJECTING polish, falling back to L2 assignment."
+            )
+        accepted_assignment = (
+            dict(polished_assignment) if polish_accepted else dict(l2_assignment)
+        )
+        l3_flip_count = sum(
+            1
+            for name in set(l2_assignment) | set(accepted_assignment)
+            if l2_assignment.get(name) != accepted_assignment.get(name)
         )
         validation_wall = (
             _phase_elapsed(kl_before_timing)
@@ -1288,7 +1313,13 @@ def main(argv: list[str] | None = None) -> int:
             kl_after=kl_after,
             elapsed_seconds=l3_elapsed_seconds,
             frozen_dp_precision_used=frozen_dp_meta["frozen_dp_precision_used"],
+            accepted=polish_accepted,
         )
+        l3_summary["accepted_assignment"] = (
+            "polished" if polish_accepted else "l2"
+        )
+        l3_summary["accepted_flip_count"] = int(l3_flip_count)
+        l3_summary["regression_tolerance"] = float(args.l3_regression_tolerance)
         l3_summary["cost_path"] = str(l3_cost_path)
         l3_summary["frozen_dp_attempts"] = frozen_dp_meta.get("frozen_dp_attempts")
         l3_summary["frozen_dp_greedy"] = frozen_dp_meta.get("frozen_dp_greedy")
@@ -1333,14 +1364,15 @@ def main(argv: list[str] | None = None) -> int:
                     "l2_disagreement": disagreements,
                     "accepted_flip": (
                         l2_assignment.get(entry.name)
-                        != polished_assignment.get(entry.name)
+                        != accepted_assignment.get(entry.name)
                     ),
                     "from": l2_assignment.get(entry.name),
-                    "to": polished_assignment.get(entry.name),
+                    "to": accepted_assignment.get(entry.name),
+                    "proposed_to": polished_assignment.get(entry.name),
                     "timing": l3_summary["timing"],
                 },
             )
-        assignment = dict(polished_assignment)
+        assignment = dict(accepted_assignment)
 
     final_assignment_path = output_root / "final_assignment.json"
     with open(final_assignment_path, "w") as f:
@@ -1391,7 +1423,11 @@ def main(argv: list[str] | None = None) -> int:
             f"{l3_kl_improvement_pct:.2f}%"
             if l3_kl_improvement_pct is not None else "n/a"
         )
-        _emit(f"L3 flips: {l3_flip_count}")
+        proposed_flips = l3_summary.get("flip_count") if l3_summary_path else None
+        if proposed_flips is not None:
+            _emit(f"L3 flips: {l3_flip_count} accepted / {proposed_flips} proposed")
+        else:
+            _emit(f"L3 flips: {l3_flip_count}")
         _emit(f"KL improvement: {improvement}")
     _emit(f"Total wall time: {total_wall:.1f}s")
     _emit("== marginal cost ==")
