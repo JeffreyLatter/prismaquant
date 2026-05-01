@@ -648,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="Run one propagated-cost polish pass after L2 convergence.")
     ap.add_argument("--l3-uncertainty-rel-tol", type=float, default=0.10)
     ap.add_argument("--l3-min-fraction", type=float, default=0.05)
-    ap.add_argument("--l3-max-fraction", type=float, default=0.10)
+    ap.add_argument("--l3-max-fraction", type=float, default=0.30)
     ap.add_argument("--l3-safety-fraction", type=float, default=0.02)
     ap.add_argument("--l3-max-lanes-per-batch", type=int, default=8)
     ap.add_argument(

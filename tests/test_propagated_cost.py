@@ -103,6 +103,32 @@ def test_select_formats_uses_current_neighbors_and_bf16():
     assert got == ("NVFP4", "MXFP8", "BF16")
 
 
+def test_select_formats_limits_rich_menu_to_current_neighbors_and_bf16():
+    stats = {"layer": _stat()}
+    formats = (
+        "NVFP4",
+        "MXFP6_E3M2",
+        "MXFP6_E2M3",
+        "FP8_E4M3",
+        "FP8_E5M2",
+        "MXFP8",
+        "BF16",
+    )
+    costs = {
+        "layer": {
+            fmt: {"predicted_dloss": float(i)}
+            for i, fmt in enumerate(formats)
+        }
+    }
+    assignment = {"layer": "FP8_E4M3"}
+    specs = [fr.get_format(name) for name in formats]
+
+    got = select_formats_for_l3(stats, costs, assignment, "layer", specs)
+
+    assert len(got) == 4
+    assert got == ("MXFP6_E3M2", "FP8_E4M3", "FP8_E5M2", "BF16")
+
+
 def test_select_l3_neighborhood_caps_and_keeps_safety_layers():
     stats = {f"layer{i}": _stat() for i in range(20)}
     costs = {}
@@ -149,6 +175,40 @@ def test_select_l3_neighborhood_caps_and_keeps_safety_layers():
     assert "confident_non_cheapest" in selected_by_name["layer5"].reasons
     assert "high_l2_cost" in selected_by_name["layer19"].reasons
 
+    ranked_stats = {f"ranked{i}": _stat() for i in range(10)}
+    ranked_costs = {}
+    ranked_assignment = {}
+    for i in range(10):
+        name = f"ranked{i}"
+        ranked_assignment[name] = "NVFP4"
+        ranked_costs[name] = {
+            "NVFP4": {"predicted_dloss": 1.0},
+            "MXFP8": {"predicted_dloss": 2.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    for i, benefit in enumerate([0.0, 1.0, 2.0, 3.0, 4.0, 5.0]):
+        name = f"ranked{i}"
+        ranked_assignment[name] = "MXFP8"
+        ranked_costs[name] = {
+            "NVFP4": {"predicted_dloss": 10.0 - benefit},
+            "MXFP8": {"predicted_dloss": 10.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+
+    ranked = select_l3_neighborhood(
+        ranked_stats,
+        ranked_costs,
+        ranked_assignment,
+        _specs(),
+        uncertainty_rel_tol=0.0,
+        min_fraction=0.0,
+        max_fraction=0.30,
+        safety_fraction=0.0,
+    )
+
+    assert [entry.name for entry in ranked] == ["ranked3", "ranked4", "ranked5"]
+    assert all("confident_non_cheapest" in entry.reasons for entry in ranked)
+
 
 def test_select_l3_neighborhood_includes_confident_non_cheapest():
     stats = {f"layer{i}": _stat() for i in range(6)}
@@ -170,7 +230,7 @@ def test_select_l3_neighborhood_includes_confident_non_cheapest():
         assignment,
         specs,
         min_fraction=0.0,
-        max_fraction=0.10,
+        max_fraction=1.0,
         safety_fraction=0.0,
     )
 

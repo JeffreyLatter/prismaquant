@@ -214,7 +214,7 @@ def select_l3_neighborhood(
     *,
     uncertainty_rel_tol: float = 0.10,
     min_fraction: float = 0.05,
-    max_fraction: float = 0.10,
+    max_fraction: float = 0.30,
     safety_fraction: float = 0.02,
 ) -> list[L3NeighborhoodEntry]:
     """Select the small L2 neighborhood that L3 is allowed to re-optimize."""
@@ -249,9 +249,8 @@ def select_l3_neighborhood(
         return []
 
     total = len([name for name in assignment if name in stats])
-    min_count = max(1, int(math.ceil(total * min_fraction)))
-    max_count = max(min_count, int(math.ceil(total * max_fraction)))
-    upper_count = max(max_count, int(math.ceil(total * 0.25)))
+    max_count = max(1, int(math.ceil(total * max_fraction)))
+    min_count = min(max_count, max(1, int(math.ceil(total * min_fraction))))
     safety_count = int(math.ceil(total * safety_fraction))
 
     by_name: dict[str, L3NeighborhoodEntry] = {}
@@ -271,9 +270,27 @@ def select_l3_neighborhood(
 
     def _add_until_full(entries: list[L3NeighborhoodEntry], reason: str) -> None:
         for entry in entries:
-            if len(by_name) >= max_count:
-                break
+            if entry.name not in by_name and len(by_name) >= max_count:
+                continue
             _add(entry, reason)
+
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
+
+    def _expected_flip_benefit(entry: L3NeighborhoodEntry) -> float:
+        current = entry.current_format
+        if current not in specs_by_name:
+            return float("-inf")
+        current_bits = _bits_for_name(stats, entry.name, specs_by_name[current])
+        best = float("-inf")
+        for fmt in entry.formats:
+            if fmt == current or fmt not in specs_by_name:
+                continue
+            if _bits_for_name(stats, entry.name, specs_by_name[fmt]) >= current_bits:
+                continue
+            alt_cost = l2_cost_value(stats, costs, entry.name, fmt)
+            if alt_cost is not None:
+                best = max(best, entry.l2_current_cost - alt_cost)
+        return best
 
     uncertain = [
         entry
@@ -281,7 +298,6 @@ def select_l3_neighborhood(
         if entry.margin <= uncertainty_rel_tol
     ]
     uncertain.sort(key=lambda e: (e.margin, -e.l2_current_cost, e.name))
-    _add_until_full(uncertain, "uncertain")
 
     confident_non_cheapest = [
         entry
@@ -290,20 +306,48 @@ def select_l3_neighborhood(
             stats, costs, assignment, entry.name, specs
         )
     ]
-    confident_non_cheapest.sort(key=lambda e: (-e.l2_current_cost, e.margin, e.name))
-    # This backstop is mandatory: otherwise a full uncertain set can starve
-    # confident non-cheapest picks, which are the exact misranking cases L3
-    # is meant to verify.
-    for entry in confident_non_cheapest:
-        _add(entry, "confident_non_cheapest")
+    benefit_by_name = {
+        entry.name: _expected_flip_benefit(entry)
+        for entry in confident_non_cheapest
+    }
+    confident_non_cheapest.sort(
+        key=lambda e: (
+            -benefit_by_name[e.name],
+            -e.l2_current_cost,
+            e.margin,
+            e.name,
+        )
+    )
 
     safety = sorted(eligible, key=lambda e: (-e.l2_current_cost, e.name))[:safety_count]
+
+    unsupported = sorted(
+        {
+            entry.name
+            for entry in (*confident_non_cheapest, *uncertain, *safety)
+            if _is_l3_unsupported_target(stats[entry.name])
+        }
+    )
+    if unsupported:
+        raise L3UnsupportedTargetError(
+            "L3 polish does not yet support packed expert tensors. "
+            f"Unsupported targets: {unsupported}. "
+            "Re-run without --l3-polish for L2-only allocation, or wait "
+            "for packed-expert L3 support."
+        )
+
+    _add_until_full(confident_non_cheapest, "confident_non_cheapest")
+    _add_until_full(uncertain, "uncertain")
     for entry in safety:
+        if entry.name not in by_name and len(by_name) >= max_count:
+            continue
         _add(entry, "high_l2_cost")
 
     if len(by_name) < min_count:
         fill = sorted(eligible, key=lambda e: (e.margin, -e.l2_current_cost, e.name))
         for entry in fill:
+            if entry.name not in by_name and len(by_name) >= max_count:
+                break
             _add(entry, "fill_min_fraction")
             if len(by_name) >= min_count:
                 break
@@ -321,41 +365,7 @@ def select_l3_neighborhood(
             "for packed-expert L3 support."
         )
 
-    selected = list(by_name.values())
-    if len(selected) > upper_count:
-        confident = [
-            e for e in selected
-            if "confident_non_cheapest" in e.reasons
-        ]
-        uncertain_only = [
-            e for e in selected
-            if "confident_non_cheapest" not in e.reasons
-            and "uncertain" in e.reasons
-        ]
-        safety_only = [
-            e for e in selected
-            if "confident_non_cheapest" not in e.reasons
-            and "uncertain" not in e.reasons
-            and "high_l2_cost" in e.reasons
-        ]
-        rest = [
-            e for e in selected
-            if "confident_non_cheapest" not in e.reasons
-            and "uncertain" not in e.reasons
-            and "high_l2_cost" not in e.reasons
-        ]
-        confident.sort(key=lambda e: (-e.l2_current_cost, e.margin, e.name))
-        uncertain_only.sort(key=lambda e: (e.margin, -e.l2_current_cost, e.name))
-        safety_only.sort(key=lambda e: (-e.l2_current_cost, e.name))
-        rest.sort(key=lambda e: (e.margin, -e.l2_current_cost, e.name))
-        selected = list(confident)
-        for group in (uncertain_only, safety_only, rest):
-            for entry in group:
-                if len(selected) >= upper_count:
-                    break
-                selected.append(entry)
-
-    return sorted(selected, key=lambda e: e.name)
+    return sorted(by_name.values(), key=lambda e: e.name)
 
 
 def build_l3_candidates(
