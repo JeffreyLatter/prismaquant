@@ -238,6 +238,14 @@ _INPUT_GLOBAL_SCALES: dict[str, float] | None = None
 _CACHED_ACTIVATIONS: object | None = None
 _ACTIVATION_CACHE_FINGERPRINT: dict[str, object] | None = None
 
+# #38: per-Linear empirical Fisher diagonal cache for Fisher-weighted
+# GPTQ. Mirrors the activation cache shape but holds `[out, in]` Fisher
+# tensors from the probe. Lazy-loaded on the same lifecycle as
+# `_CACHED_ACTIVATIONS`. None means "not loaded" — GPTQ falls back to
+# unweighted Hessian when this is unavailable. Gated by the
+# `PRISMAQUANT_GPTQ_FISHER_WEIGHT` env flag.
+_CACHED_FISHER_DIAG: object | None = None
+
 
 class _LazyActivationCache:
     """ActivationIndex-backed mapping with a dict-like `.get()`.
@@ -263,6 +271,29 @@ class _LazyActivationCache:
             return None
         self.loads += 1
         return self.index.load(name).to(torch.float32)
+
+
+class _LazyFisherDiagCache:
+    """HDetailIndex-backed lazy cache for per-Linear Fisher diagonal.
+
+    Mirrors `_LazyActivationCache` but loads `h_diag` tensors of shape
+    `[out, in]` from the probe's per-Linear `.pt` blobs. Returns None
+    when the requested name isn't in the index — caller (GPTQ wrapper)
+    falls back to unweighted Hessian. Loads are demand-driven so the
+    full Fisher cache (typically a few GB) doesn't sit resident."""
+
+    def __init__(self, index):
+        self.index = index
+        self.loads = 0
+
+    def get(self, name: str):
+        if name not in self.index:
+            return None
+        self.loads += 1
+        try:
+            return self.index.load(name).to(torch.float32)
+        except Exception:
+            return None
 
 
 def _activation_index_fingerprint(index, cache_dir: Path) -> dict[str, object]:
@@ -736,6 +767,7 @@ def _gptq_obs_rounding_nvfp4(
     weight: torch.Tensor, activations: torch.Tensor,
     group_size: int = 16, damp: float = 0.01,
     global_real_override: torch.Tensor | None = None,
+    fisher_per_input: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """GPTQ one-shot OBS rounding for NVFP4 weights.
 
@@ -754,7 +786,19 @@ def _gptq_obs_rounding_nvfp4(
     `damp = 0.01` adds `0.01·mean(diag(H))` to `diag(H)` for Cholesky
     stability. `global_real_override` threads through for fused-sibling
     consistency (same semantics as `quantize_dequantize_nvfp4`).
-    """
+
+    `fisher_per_input` (#38, optional): per-input-channel empirical
+    Fisher diagonal (length = `cols`), derived from the probe's
+    per-weight Fisher matrix `h_full` summed along the output axis.
+    When provided, the GPTQ Hessian becomes
+        `H = (X · sqrt(F_in))^T (X · sqrt(F_in))`
+    which weights input channels by their downstream-loss importance.
+    Channels carrying high Fisher get more aggressive error
+    propagation; low-Fisher channels are de-prioritized. This is the
+    same Fisher signal the cost-stage's local-reconstruction already
+    uses (see `local_reconstruct._gptq_lite_quantize_row`); bringing
+    it into the export-time GPTQ keeps cost-prediction and shipped
+    quality consistent."""
     W = weight.to(torch.float32).clone()
     rows, cols = W.shape
     if cols % group_size != 0:
@@ -768,7 +812,18 @@ def _gptq_obs_rounding_nvfp4(
     # disable. The same clipped matrix is used by local gates/sweeps so
     # those gates score the objective the candidate was optimized under.
     X = _activation_matrix_for_gptq(activations, cols, device=W.device)
-    # H = X^T X; guard against near-zero diagonal (dead channels).
+    # H = (X · sqrt(F_in))^T (X · sqrt(F_in)) when Fisher is available,
+    # else plain X^T X. The mean-normalized weighting keeps the trace
+    # of H roughly unchanged so the damping factor stays meaningful.
+    if (fisher_per_input is not None
+            and fisher_per_input.numel() == cols):
+        f = fisher_per_input.to(device=W.device, dtype=torch.float32)
+        f = f.clamp_min(0.0)
+        m = float(f.mean().item())
+        if m > 1e-12:
+            f_norm = f / m
+            sqrt_f = f_norm.sqrt().unsqueeze(0)              # [1, in]
+            X = X * sqrt_f
     H = X.t() @ X                                         # [in, in]
     diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
     H.diagonal().add_(damp * diag_mean)
@@ -863,6 +918,7 @@ def _gptq_obs_rounding_nvfp4_swept(
     group_size: int = 16,
     global_real_override: torch.Tensor | None = None,
     damp_candidates: tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.1),
+    fisher_per_input: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-Linear GPTQ damping sweep.
 
@@ -887,7 +943,23 @@ def _gptq_obs_rounding_nvfp4_swept(
     W_orig = weight.to(torch.float32)
     X = _activation_matrix_for_gptq(
         activations, weight.shape[1], device=weight.device)
-    H_full = X.t() @ X  # [in, in], shared evaluator
+    # Score candidates against the SAME Fisher-weighted objective the
+    # inner GPTQ optimizes, so the sweep picks the candidate that's
+    # actually best under the chosen weighting (not the candidate that
+    # happens to be best under unweighted X^T X).
+    if (fisher_per_input is not None
+            and fisher_per_input.numel() == weight.shape[1]):
+        f = fisher_per_input.to(device=X.device,
+                                dtype=torch.float32).clamp_min(0.0)
+        m = float(f.mean().item())
+        if m > 1e-12:
+            sqrt_f = (f / m).sqrt().unsqueeze(0)
+            X_eval = X * sqrt_f
+        else:
+            X_eval = X
+    else:
+        X_eval = X
+    H_full = X_eval.t() @ X_eval  # [in, in], shared evaluator
 
     best_w = None
     best_err = float("inf")
@@ -896,6 +968,7 @@ def _gptq_obs_rounding_nvfp4_swept(
             w_q = _gptq_obs_rounding_nvfp4(
                 weight, activations, group_size=group_size,
                 damp=damp, global_real_override=global_real_override,
+                fisher_per_input=fisher_per_input,
             )
         except Exception:
             continue
@@ -1881,6 +1954,26 @@ def _quantize_2d(
         if gptq_enabled and not skip_awq:
             acts_work = _acts_for_error_passes()
             if acts_work is not None:
+                # #38: Fisher-weighted Hessian. When the probe's
+                # per-Linear Fisher matrix is available, weight the
+                # GPTQ Hessian by per-input-channel Fisher
+                # importance. Default ON (validated on Qwen3-0.6B
+                # smoke at 4.50 bpp: −0.93 PPL, −0.061 mean NLL,
+                # p99 also improves). Set
+                # PRISMAQUANT_GPTQ_FISHER_WEIGHT=0 to disable;
+                # automatically inert when the probe didn't write
+                # `h_detail` (default falls through to unweighted).
+                fisher_in: torch.Tensor | None = None
+                if (os.environ.get("PRISMAQUANT_GPTQ_FISHER_WEIGHT", "1") != "0"
+                        and linear_name is not None
+                        and _CACHED_FISHER_DIAG is not None):
+                    h_full = _CACHED_FISHER_DIAG.get(linear_name)
+                    if h_full is not None and h_full.dim() == 2:
+                        if h_full.shape == w_work.shape:
+                            fisher_in = h_full.float().sum(dim=0)
+                        elif h_full.shape == (w_work.shape[1], w_work.shape[0]):
+                            # transposed convention safety net
+                            fisher_in = h_full.float().sum(dim=1)
                 # Env-gated per-Linear damping sweep (#46). When set,
                 # try multiple λ values for the Hessian regularizer and
                 # pick the one with smallest output-space error. ~5×
@@ -1891,11 +1984,13 @@ def _quantize_2d(
                     w_work = _gptq_obs_rounding_nvfp4_swept(
                         w_work, acts_work, group_size=16,
                         global_real_override=nvfp4_global_real_override,
+                        fisher_per_input=fisher_in,
                     )
                 else:
                     w_work = _gptq_obs_rounding_nvfp4(
                         w_work, acts_work, group_size=16,
                         global_real_override=nvfp4_global_real_override,
+                        fisher_per_input=fisher_in,
                     )
 
         # Step 3: activation-weighted rounding polish. Measured to be
@@ -2473,7 +2568,13 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
     `inv_freq` buffers are on meta. Re-run the module's own rope init
     (which is deterministic from config) so `inv_freq` lives on the
     exec device with correct values — matching what `from_pretrained`
-    would have produced."""
+    would have produced.
+
+    Multi-layer-type rope (Gemma 4 / DSv4 / Gemma 3) must defer to the
+    profile, which knows the per-layer-type rope_type dispatch and any
+    head_dim_key overrides — otherwise the default
+    `rope_init_fn(cfg, device)` raises `KeyError: None` (it indexes
+    `cfg.rope_parameters[layer_type]`)."""
     from .layer_streaming import _get_rotary
     rotary = _get_rotary(base_model)
     if rotary is None:
@@ -2485,6 +2586,12 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
         rope_init_fn = rotary.compute_default_rope_parameters
     except AttributeError:
         return
+    try:
+        from .model_profiles import profile_from_model
+        if profile_from_model(base_model).init_rotaries(rotary, cfg, device, dtype):
+            return
+    except Exception:
+        pass
     inv_freq, attention_scaling = rope_init_fn(cfg, device)
     rotary.register_buffer("inv_freq", inv_freq.to(dtype=torch.float32,
                                                    device=device),
@@ -3288,6 +3395,29 @@ def materialize_tensors_streaming(
                         if p["sub_leaf"] in ("gate_proj",) and cal_input_mlp is None:
                             cal_input_mlp = _CACHED_ACTIVATIONS.get(
                                 profile.live_to_recipe_name(p["full"]))
+                    # Fallback: when the block-input Linear (q_proj for
+                    # attn, gate_proj for MLP) is at a format that doesn't
+                    # need scale refinement (MXFP8/W8A8, BF16) it isn't in
+                    # `_BLOCK_COMPUTE_PENDING`, but its activation IS
+                    # cached. Look it up directly so the OTHER linears in
+                    # the block (e.g., NVFP4 down_proj) can still be
+                    # refined. Without this fallback, having gate+up at
+                    # MXFP8 across consecutive layers leaves cumulative
+                    # MLP-output drift unbounded — observed as NaN logits
+                    # on Qwen 3.6 27B with 5+ consecutive MXFP8 mlp picks.
+                    if cal_input_attn is None or cal_input_mlp is None:
+                        for sub_name, sub_mod in layer_mod.named_modules():
+                            if not isinstance(sub_mod, torch.nn.Linear):
+                                continue
+                            leaf = sub_name.rsplit(".", 1)[-1]
+                            if leaf == "q_proj" and cal_input_attn is None:
+                                cal_input_attn = _CACHED_ACTIVATIONS.get(
+                                    profile.live_to_recipe_name(
+                                        f"{layer_qname}.{sub_name}"))
+                            elif leaf == "gate_proj" and cal_input_mlp is None:
+                                cal_input_mlp = _CACHED_ACTIVATIONS.get(
+                                    profile.live_to_recipe_name(
+                                        f"{layer_qname}.{sub_name}"))
 
                 # Run refinement for each block we have a cal input for.
                 # Candidates are simple multiplicative perturbations of
@@ -3406,6 +3536,26 @@ def materialize_tensors_streaming(
                 covered.add(p["full"])
 
             del _BLOCK_COMPUTE_PENDING, _FP16_BLOCK_SNAPSHOTS
+
+        # 3c'. Aliased-sibling emit pass.
+        # Some architectures (Gemma 4 with `attention_k_eq_v=True` on
+        # full_attention layers) have no v_proj Linear in the live
+        # model because k doubles as v at runtime, but vLLM's
+        # `QKVParallelLinear` builds a fused qkv from concatenated
+        # q+k+v weight tensors regardless. Profile.aliased_for_export
+        # tells us which Linears need their tensors mirrored under an
+        # alias qname (typically v_proj ← k_proj). We do this once per
+        # layer right before tensor_sink drains the dict.
+        for source_full in list(covered):
+            alias_full = profile.aliased_for_export(source_full, base_model)
+            if alias_full is None or alias_full == source_full:
+                continue
+            prefix = source_full + "."
+            for k in list(out.keys()):
+                if k.startswith(prefix):
+                    suffix = k[len(prefix):]
+                    out[f"{alias_full}.{suffix}"] = out[k]
+            hist[("linear", "ALIAS")] += 1
 
         # 3d. Emit packed MoE experts, scoped to this layer.
         packed_count = 0
@@ -4188,8 +4338,18 @@ def build_quantization_config(
                 continue
             leaf_state.setdefault((parent, leaf), "IGNORE")
 
-        # For each (parent, fused) pair where all siblings are present
-        # and share a state, emit the fused-name target.
+        # For each (parent, fused) pair where the present siblings share
+        # a state, emit the fused-name target. We allow a sibling to be
+        # absent in the assignment as long as ≥2 siblings are present
+        # and they agree — this handles Gemma 4's `attention_k_eq_v=True`
+        # full_attention layers where `v_proj` doesn't exist on disk
+        # (k doubles as v) but vLLM still instantiates a fused
+        # `QKVParallelLinear` at load time. Without this fallback, the
+        # fused qkv_proj target never gets written and vLLM raises
+        # "Unable to find matching target for ...qkv_proj" on layers
+        # 29/35/41/47/53/59 of gemma-4-31b-it. Requiring ≥2 present
+        # siblings keeps the rule conservative: a single isolated
+        # sibling (ambiguous case) is still skipped.
         fused_emitted: set[str] = set()
         parents = {p for (p, _) in leaf_state}
         for parent in parents:
@@ -4198,11 +4358,12 @@ def build_quantization_config(
                 if len(sibs) < 2:
                     continue
                 states = [leaf_state.get((parent, s)) for s in sibs]
-                if any(s is None for s in states):
-                    continue  # not all siblings present → skip
-                if len(set(states)) != 1:
-                    continue  # mixed formats → caller's bug; don't emit
-                state = states[0]
+                present = [s for s in states if s is not None]
+                if len(present) < 2:
+                    continue  # not enough siblings present → skip
+                if len(set(present)) != 1:
+                    continue  # mixed formats among present → don't emit
+                state = present[0]
                 fused_vllm_name = f"{parent}.{fused_name}"
                 if fused_vllm_name in fused_emitted:
                     continue
@@ -4433,9 +4594,11 @@ def _validate_halo_export_support(profile, cfg, hidden: int) -> None:
 
 def main():
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
+    global _CACHED_FISHER_DIAG
     _INPUT_GLOBAL_SCALES = None
     _CACHED_ACTIVATIONS = None
     _ACTIVATION_CACHE_FINGERPRINT = None
+    _CACHED_FISHER_DIAG = None
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
@@ -4677,6 +4840,45 @@ def main():
             print(f"[export-stream] input_global_scale calibrated for "
                   f"{len(scales)}/{len(_recipe_names)} Linears from "
                   f"{cache_dir}", flush=True)
+            # #38: Fisher-weighted GPTQ. The probe writes per-Linear
+            # `[out, in]` Fisher diagonal (`h_diag`) to a sibling
+            # `h_detail` directory next to the activation cache. When
+            # the env flag is on (default), lazy-load these for GPTQ
+            # to use as per-input-channel reconstruction weights. The
+            # cost step uses the same data via `HDetailIndex` for
+            # predicted Δloss; bringing it into the export-side GPTQ
+            # keeps cost-prediction and shipped-quality consistent.
+            # Validated on Qwen3-0.6B at 4.50 bpp: −0.93 PPL,
+            # −0.061 mean NLL, p99 NLL also improves. Inert (with a
+            # log line) when the probe didn't write h_detail.
+            if (os.environ.get("PRISMAQUANT_GPTQ_FISHER_WEIGHT", "1") != "0"
+                    and gptq_enabled):
+                from .measure_quant_cost import HDetailIndex
+                # Probe convention: h_detail dir lives alongside the
+                # activation cache, named `h_detail` (or override via
+                # PRISMAQUANT_FISHER_DETAIL_DIR for unusual layouts).
+                detail_dir = Path(os.environ.get(
+                    "PRISMAQUANT_FISHER_DETAIL_DIR",
+                    str(cache_dir.parent / "h_detail")))
+                if detail_dir.is_dir():
+                    h_idx = HDetailIndex(detail_dir, _recipe_names)
+                    if len(h_idx) > 0:
+                        _CACHED_FISHER_DIAG = _LazyFisherDiagCache(h_idx)
+                        print(f"[export-stream] Fisher-weighted GPTQ "
+                              f"enabled: {len(h_idx)}/{len(_recipe_names)} "
+                              f"Linears have h_diag in {detail_dir}",
+                              flush=True)
+                    else:
+                        print(f"[export-stream] PRISMAQUANT_GPTQ_FISHER_WEIGHT "
+                              f"set but no h_diag files in {detail_dir} — "
+                              f"Fisher-weighted GPTQ inert (using unweighted)",
+                              flush=True)
+                else:
+                    print(f"[export-stream] PRISMAQUANT_GPTQ_FISHER_WEIGHT "
+                          f"set but {detail_dir} missing — Fisher-weighted "
+                          f"GPTQ inert (using unweighted). Set "
+                          f"PRISMAQUANT_FISHER_DETAIL_DIR if your probe "
+                          f"writes h_detail elsewhere.", flush=True)
 
     with open(args.layer_config) as f:
         raw_recipe = json.load(f)
