@@ -16,6 +16,7 @@ from prismaquant.propagated_cost import (
     select_formats_for_l3,
     select_l3_neighborhood,
     solve_frozen_l3_neighborhood,
+    tail_forward_from_layer,
 )
 
 
@@ -63,6 +64,32 @@ class _AmplifyingToy(nn.Module):
         return SimpleNamespace(logits=x)
 
 
+class _TailLayer(nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.proj = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            self.proj.weight.copy_(scale * torch.eye(2))
+
+    def forward(self, hidden_states, **_kwargs):
+        return hidden_states + self.proj(hidden_states)
+
+
+class _TailToy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_TailLayer(float(i + 1)) for i in range(4)])
+        self.norm = nn.Identity()
+        self.lm_head = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            self.lm_head.weight.copy_(torch.tensor([[1.0, 0.5], [-0.25, 1.5]]))
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return SimpleNamespace(logits=self.lm_head(self.norm(x)))
+
+
 def _zero_spec():
     return fr.FormatSpec(
         name="ZERO4",
@@ -101,6 +128,28 @@ def test_select_formats_uses_current_neighbors_and_bf16():
     got = select_formats_for_l3(stats, costs, assignment, "layer", _specs())
 
     assert got == ("NVFP4", "MXFP8", "BF16")
+
+
+def test_tail_forward_from_layer_matches_full_forward_from_layer_output():
+    model = _TailToy().eval()
+    x = torch.tensor([[1.0, -2.0], [0.5, 0.25]])
+    with torch.no_grad():
+        hidden = x
+        for idx in range(3):
+            hidden = model.layers[idx](hidden)
+        perturbed = hidden + torch.tensor([[0.1, -0.2], [0.05, 0.1]])
+
+        tail_logits = tail_forward_from_layer(model, 2, (x,), {}, perturbed)
+
+        handle = model.layers[2].register_forward_hook(
+            lambda _module, _args, _output: perturbed
+        )
+        try:
+            full_logits = model(x).logits
+        finally:
+            handle.remove()
+
+    assert torch.allclose(tail_logits, full_logits, atol=1e-6, rtol=1e-6)
 
 
 def test_select_formats_limits_rich_menu_to_current_neighbors_and_bf16():

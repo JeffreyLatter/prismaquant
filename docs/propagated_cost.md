@@ -86,7 +86,11 @@ Useful tuning flags:
 - `--l3-min-fraction` default `0.05`;
 - `--l3-max-fraction` default `0.30`;
 - `--l3-safety-fraction` default `0.02`;
-- `--l3-max-lanes-per-batch` default `8`;
+- `--l3-max-lanes-per-batch` default `16`;
+- `--l3-tail-only` default on, with `--no-l3-tail-only` for full-forward
+  fallback;
+- `--l3-n-calib-samples` default `4`;
+- `--l3-calib-seqlen` default `256`;
 - `--frozen-dp-budget-tolerance` default `0.05`, allowing the L3 greedy
   fallback to use up to 5% of total target bits as hard budget slack.
 

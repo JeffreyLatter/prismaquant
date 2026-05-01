@@ -650,7 +650,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--l3-min-fraction", type=float, default=0.05)
     ap.add_argument("--l3-max-fraction", type=float, default=0.30)
     ap.add_argument("--l3-safety-fraction", type=float, default=0.02)
-    ap.add_argument("--l3-max-lanes-per-batch", type=int, default=8)
+    ap.add_argument("--l3-max-lanes-per-batch", type=int, default=16)
+    ap.add_argument(
+        "--l3-tail-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use decoder tail-only L3 propagation when the model supports it.",
+    )
+    ap.add_argument("--l3-n-calib-samples", type=int, default=4)
+    ap.add_argument("--l3-calib-seqlen", type=int, default=256)
     ap.add_argument(
         "--frozen-dp-budget-tolerance",
         type=float,
@@ -706,6 +714,16 @@ def main(argv: list[str] | None = None) -> int:
         args.n_calib_samples,
         args.calib_seqlen,
     )
+    l3_calib_ids = calib_ids
+    if args.l3_polish and (
+        args.l3_n_calib_samples != args.n_calib_samples
+        or args.l3_calib_seqlen != args.calib_seqlen
+    ):
+        l3_calib_ids = load_wikitext_calibration(
+            tokenizer,
+            args.l3_n_calib_samples,
+            args.l3_calib_seqlen,
+        )
     ref_log_probs = cache_reference_log_probs(model, calib_ids, next(model.parameters()).device)
 
     if args.initial_config:
@@ -970,7 +988,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.l3_polish:
         _emit("[l3] === polish ===")
         # Per-iteration L3 can reuse this path later; only final polish is
-        # exposed because each propagated measurement is a full forward pass.
+        # exposed because each propagated measurement is still expensive even
+        # when tail-only propagation is available.
         l2_assignment = dict(assignment)
         kl_before_start = _phase_start("[l3] validation KL before")
         kl_before = measure_assignment_kl(
@@ -1038,7 +1057,8 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(
                     f"[l3] depth group {event['group_index']}/"
                     f"{event['group_count']} {event['group']}: start "
-                    f"entries={event['entry_count']} lanes={event['lane_count']}"
+                    f"entries={event['entry_count']} lanes={event['lane_count']} "
+                    f"mode={event.get('mode', 'unknown')}"
                 )
             elif event.get("event") == "depth_group_end":
                 _emit(
@@ -1052,11 +1072,12 @@ def main(argv: list[str] | None = None) -> int:
             model,
             l2_assignment,
             selected,
-            calib_ids,
+            l3_calib_ids,
             specs,
             work_root=work_root,
             profile=profile,
             max_lanes_per_batch=args.l3_max_lanes_per_batch,
+            tail_only=args.l3_tail_only,
             progress_callback=_l3_progress,
         )
         l3_elapsed_seconds = time.monotonic() - l3_measure_start
@@ -1078,6 +1099,10 @@ def main(argv: list[str] | None = None) -> int:
                         "probe": args.probe,
                         "paired_baseline": "target_bf16_under_l2_assignment",
                         "selected_count": len(selected),
+                        "tail_only": bool(args.l3_tail_only),
+                        "l3_max_lanes_per_batch": int(args.l3_max_lanes_per_batch),
+                        "l3_n_calib_samples": int(args.l3_n_calib_samples),
+                        "l3_calib_seqlen": int(args.l3_calib_seqlen),
                     },
                 },
                 f,

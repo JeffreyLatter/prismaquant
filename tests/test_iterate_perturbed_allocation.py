@@ -214,11 +214,13 @@ def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
         "load_text_model_under_work_root",
         lambda *_args, **_kwargs: _TinyLogitsModel(),
     )
-    monkeypatch.setattr(
-        ipa,
-        "load_wikitext_calibration",
-        lambda *_args, **_kwargs: torch.tensor([[0, 1], [1, 0]]),
-    )
+    calib_calls = []
+
+    def _load_calib(_tokenizer, n_samples, seqlen):
+        calib_calls.append((n_samples, seqlen))
+        return torch.zeros((n_samples, seqlen), dtype=torch.long)
+
+    monkeypatch.setattr(ipa, "load_wikitext_calibration", _load_calib)
     monkeypatch.setattr(ipa, "cache_reference_log_probs", lambda *_args: [])
     monkeypatch.setattr(
         ipa,
@@ -268,6 +270,10 @@ def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
         "--max-iters", "2",
         "--convergence-frac", "-1",
         "--l3-polish",
+        "--l3-max-lanes-per-batch", "3",
+        "--no-l3-tail-only",
+        "--l3-n-calib-samples", "1",
+        "--l3-calib-seqlen", "2",
     ])
 
     out = capsys.readouterr().out
@@ -292,3 +298,11 @@ def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
     l3_lines = [json.loads(line) for line in l3_trace.read_text().splitlines()]
     assert len(iter_lines) == 2
     assert len(l3_lines) == 1
+    assert (8, 512) in calib_calls
+    assert (1, 2) in calib_calls
+    with open(output_dir / "l3_propagated_costs.pkl", "rb") as f:
+        l3_payload = pickle.load(f)
+    assert l3_payload["meta"]["l3_max_lanes_per_batch"] == 3
+    assert l3_payload["meta"]["tail_only"] is False
+    assert l3_payload["meta"]["l3_n_calib_samples"] == 1
+    assert l3_payload["meta"]["l3_calib_seqlen"] == 2

@@ -724,6 +724,137 @@ def _replace_first_tensor_output(output, replacement: torch.Tensor):
     return output
 
 
+def _decoder_stack(model: nn.Module):
+    candidates = [
+        model,
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+    ]
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None:
+        candidates.append(getattr(language_model, "model", None))
+    for base in candidates:
+        if base is None:
+            continue
+        layers = getattr(base, "layers", None)
+        if layers is not None and hasattr(layers, "__len__"):
+            return base, layers
+    return None, None
+
+
+def _replace_first_tensor_call(args, kwargs, replacement: torch.Tensor):
+    args = list(args)
+    for idx, value in enumerate(args):
+        if isinstance(value, torch.Tensor):
+            args[idx] = replacement
+            return tuple(args), dict(kwargs or {})
+    kwargs = dict(kwargs or {})
+    for key, value in kwargs.items():
+        if isinstance(value, torch.Tensor):
+            kwargs[key] = replacement
+            return tuple(args), kwargs
+    return (replacement, *tuple(args)), kwargs
+
+
+def _repeat_layer_value_for_lanes(value, lane_count: int, base_batch: int):
+    if isinstance(value, torch.Tensor):
+        if value.dim() > 0 and int(value.size(0)) == int(base_batch):
+            repeats = (int(lane_count),) + (1,) * (value.dim() - 1)
+            return value.repeat(repeats)
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key: _repeat_layer_value_for_lanes(child, lane_count, base_batch)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(
+            _repeat_layer_value_for_lanes(child, lane_count, base_batch)
+            for child in value
+        )
+    if isinstance(value, list):
+        return [
+            _repeat_layer_value_for_lanes(child, lane_count, base_batch)
+            for child in value
+        ]
+    return value
+
+
+def _repeat_layer_call_for_lanes(args, kwargs, lane_count: int, base_batch: int):
+    return (
+        tuple(
+            _repeat_layer_value_for_lanes(value, lane_count, base_batch)
+            for value in args
+        ),
+        {
+            key: _repeat_layer_value_for_lanes(value, lane_count, base_batch)
+            for key, value in (kwargs or {}).items()
+        },
+    )
+
+
+class _TailLayerCaptureDone(Exception):
+    pass
+
+
+def _capture_layer_call(model: nn.Module, layer: nn.Module, args, kwargs):
+    captured = {}
+
+    def _hook(_module, hook_args, hook_kwargs):
+        layer_kwargs = dict(hook_kwargs or {})
+        if "use_cache" in layer_kwargs:
+            layer_kwargs["use_cache"] = False
+        if "past_key_value" in layer_kwargs:
+            layer_kwargs["past_key_value"] = None
+        captured["args"] = tuple(hook_args)
+        captured["kwargs"] = layer_kwargs
+        raise _TailLayerCaptureDone
+
+    handle = layer.register_forward_pre_hook(_hook, with_kwargs=True)
+    try:
+        try:
+            model(*args, **(kwargs or {}))
+        except _TailLayerCaptureDone:
+            pass
+    finally:
+        handle.remove()
+    if "args" not in captured:
+        raise RuntimeError("tail-only L3 could not capture decoder layer inputs")
+    return captured["args"], captured["kwargs"]
+
+
+def tail_forward_from_layer(
+    model: nn.Module,
+    layer_idx: int,
+    layer_args,
+    layer_kwargs,
+    hidden_state: torch.Tensor,
+) -> torch.Tensor:
+    """Run decoder layers after ``layer_idx`` plus final norm and LM head."""
+    base, layers = _decoder_stack(model)
+    if layers is None:
+        raise RuntimeError("tail-only L3 requires a decoder layer stack")
+    hidden = hidden_state
+    for next_idx in range(int(layer_idx) + 1, len(layers)):
+        call_args, call_kwargs = _replace_first_tensor_call(
+            layer_args,
+            layer_kwargs,
+            hidden,
+        )
+        output = layers[next_idx](*call_args, **call_kwargs)
+        next_hidden = _first_tensor_output(output)
+        if next_hidden is None:
+            raise RuntimeError("tail-only L3 decoder layer returned no tensor")
+        hidden = next_hidden
+    norm = getattr(base, "norm", None)
+    if norm is not None:
+        hidden = norm(hidden)
+    lm_head = getattr(model, "lm_head", None) or getattr(base, "lm_head", None)
+    if lm_head is not None:
+        return lm_head(hidden)
+    return hidden
+
+
 def _split_lanes(tensor: torch.Tensor, base_batch: int, lane_count: int):
     if tensor.dim() == 0 or tensor.size(0) != base_batch * lane_count:
         return None
@@ -996,7 +1127,8 @@ def measure_propagated_costs(
     *,
     work_root: str | Path | None = None,
     profile=None,
-    max_lanes_per_batch: int = 8,
+    max_lanes_per_batch: int = 16,
+    tail_only: bool = True,
     output_mse_names: list[str] | None = None,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> dict[str, dict[str, dict]]:
@@ -1030,7 +1162,15 @@ def measure_propagated_costs(
     tmp_parent = str(work_root) if work_root is not None else None
 
     depth_groups = _group_neighborhood_by_depth(neighborhood)
+    _decoder_base, decoder_layers = _decoder_stack(model)
     for group_index, (group_key, group_entries) in enumerate(depth_groups, start=1):
+        group_depth = layer_depth(group_entries[0].name) if group_entries else None
+        use_tail_group = (
+            bool(tail_only)
+            and group_depth is not None
+            and decoder_layers is not None
+            and 0 <= group_depth < len(decoder_layers)
+        )
         group_start = time.monotonic()
         group_lane_count = sum(
             len(_lane_specs_for_entries([entry]))
@@ -1044,6 +1184,7 @@ def measure_propagated_costs(
                 "group_count": len(depth_groups),
                 "entry_count": len(group_entries),
                 "lane_count": group_lane_count,
+                "mode": "tail-only" if use_tail_group else "full-forward",
             })
         for lanes in _lane_microbatches_for_entries(
             group_entries,
@@ -1081,7 +1222,10 @@ def measure_propagated_costs(
                 kl_totals = [0.0 for _ in lanes]
                 batch_count = 0
                 try:
-                    for args, kwargs in iter_calibration_forwards(calibration_data, device):
+                    for args, kwargs in iter_calibration_forwards(
+                        calibration_data,
+                        device,
+                    ):
                         base_batch = _first_tensor_batch_size(args, kwargs)
                         if first_batch:
                             target_hooks = _DepthGroupTargetHooks(
@@ -1100,12 +1244,42 @@ def measure_propagated_costs(
                             )
                             output_mse.install()
                             first_batch = False
-                        rep_args, rep_kwargs = _repeat_inputs_for_lanes(
-                            args,
-                            kwargs,
-                            len(lanes),
-                        )
-                        logits = _extract_logits(model(*rep_args, **rep_kwargs))
+
+                        if use_tail_group:
+                            layer = decoder_layers[group_depth]
+                            layer_args, layer_kwargs = _capture_layer_call(
+                                model,
+                                layer,
+                                args,
+                                kwargs,
+                            )
+                            rep_args, rep_kwargs = _repeat_layer_call_for_lanes(
+                                layer_args,
+                                layer_kwargs,
+                                len(lanes),
+                                base_batch,
+                            )
+                            layer_output = layer(*rep_args, **rep_kwargs)
+                            hidden = _first_tensor_output(layer_output)
+                            if hidden is None:
+                                raise RuntimeError(
+                                    "tail-only L3 decoder layer returned no tensor"
+                                )
+                            logits = tail_forward_from_layer(
+                                model,
+                                group_depth,
+                                rep_args,
+                                rep_kwargs,
+                                hidden,
+                            )
+                        else:
+                            rep_args, rep_kwargs = _repeat_inputs_for_lanes(
+                                args,
+                                kwargs,
+                                len(lanes),
+                            )
+                            logits = _extract_logits(model(*rep_args, **rep_kwargs))
+
                         chunks = _split_lanes(logits.detach(), base_batch, len(lanes))
                         if chunks is None:
                             raise RuntimeError(
