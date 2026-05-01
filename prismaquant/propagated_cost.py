@@ -8,12 +8,27 @@ rest of the L2 assignment.
 from __future__ import annotations
 
 import math
+import re
+import shutil
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
 from prismaquant.allocator_candidates import cost_entry_predicted_dloss
 from prismaquant.allocator_solver import Candidate, _shape_from_stats, solve_allocation
+from prismaquant.build_rtn_cache import kl_divergence
+from prismaquant.perturbed_x_cache import (
+    PerturbedActivationCache,
+    build_quantizable_map,
+    calibration_data_hash,
+    iter_calibration_forwards,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +43,14 @@ class L3NeighborhoodEntry:
 
 class FrozenBudgetError(RuntimeError):
     """Raised when frozen L2 choices make the L3 neighborhood infeasible."""
+
+
+@dataclass(frozen=True)
+class _LaneSpec:
+    name: str
+    fmt: str
+    baseline_index: int | None
+    is_baseline: bool
 
 
 def _cost_entry(costs: Mapping, name: str, fmt: str) -> dict | None:
@@ -309,3 +332,525 @@ def solve_frozen_l3_neighborhood(
     merged = dict(assignment)
     merged.update(open_assignment)
     return merged, chosen
+
+
+_LAYER_DEPTH_RE = re.compile(r"(?:^|[.])layers[.](\d+)(?:[.]|$)")
+
+
+def layer_depth(name: str) -> int | None:
+    """Best-effort decoder-layer depth parser for depth-grouped L3 batches."""
+    m = _LAYER_DEPTH_RE.search(name)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _group_neighborhood_by_depth(
+    entries: list[L3NeighborhoodEntry],
+) -> list[tuple[str, list[L3NeighborhoodEntry]]]:
+    grouped: dict[str, list[L3NeighborhoodEntry]] = {}
+    for entry in entries:
+        depth = layer_depth(entry.name)
+        key = f"layer:{depth:05d}" if depth is not None else f"name:{entry.name}"
+        grouped.setdefault(key, []).append(entry)
+    return [(key, grouped[key]) for key in sorted(grouped)]
+
+
+def _canonical_assignment(
+    assignment: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        str(name): fr.canonical_format_name(fmt)
+        for name, fmt in assignment.items()
+    }
+
+
+def _first_tensor_batch_size(args, kwargs) -> int:
+    for value in list(args) + list((kwargs or {}).values()):
+        if isinstance(value, torch.Tensor) and value.dim() > 0:
+            return int(value.size(0))
+    raise ValueError("could not infer calibration batch size from model inputs")
+
+
+def _repeat_value_for_lanes(value, lane_count: int):
+    if isinstance(value, torch.Tensor) and value.dim() > 0:
+        repeats = (int(lane_count),) + (1,) * (value.dim() - 1)
+        return value.repeat(repeats)
+    if isinstance(value, Mapping):
+        return {
+            key: _repeat_value_for_lanes(child, lane_count)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_repeat_value_for_lanes(child, lane_count) for child in value)
+    if isinstance(value, list):
+        return [_repeat_value_for_lanes(child, lane_count) for child in value]
+    return value
+
+
+def _repeat_inputs_for_lanes(args, kwargs, lane_count: int):
+    return (
+        tuple(_repeat_value_for_lanes(value, lane_count) for value in args),
+        {
+            key: _repeat_value_for_lanes(value, lane_count)
+            for key, value in (kwargs or {}).items()
+        },
+    )
+
+
+def _extract_logits(output):
+    if hasattr(output, "logits"):
+        return output.logits
+    if isinstance(output, tuple):
+        return output[0]
+    return output
+
+
+def _first_tensor_output(output) -> torch.Tensor | None:
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, tuple):
+        for value in output:
+            if isinstance(value, torch.Tensor):
+                return value
+    if isinstance(output, Mapping):
+        for value in output.values():
+            if isinstance(value, torch.Tensor):
+                return value
+    return None
+
+
+def _replace_first_tensor_output(output, replacement: torch.Tensor):
+    if isinstance(output, torch.Tensor):
+        return replacement
+    if isinstance(output, tuple):
+        values = list(output)
+        for idx, value in enumerate(values):
+            if isinstance(value, torch.Tensor):
+                values[idx] = replacement
+                return tuple(values)
+    if isinstance(output, dict):
+        values = dict(output)
+        for key, value in values.items():
+            if isinstance(value, torch.Tensor):
+                values[key] = replacement
+                return values
+    return output
+
+
+def _split_lanes(tensor: torch.Tensor, base_batch: int, lane_count: int):
+    if tensor.dim() == 0 or tensor.size(0) != base_batch * lane_count:
+        return None
+    return tensor.split(base_batch, dim=0)
+
+
+def _l3_quantizable_map(model: nn.Module) -> dict[str, tuple[nn.Module, str]]:
+    """Map L3 names to modules, including tiny nn.Linear modules in tests."""
+    out = dict(build_quantizable_map(model))
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        names = {name, f"{name}.weight"}
+        if name.startswith("model."):
+            suffix = name[len("model."):]
+            names.add(f"model.language_model.{suffix}")
+            names.add(f"model.language_model.{suffix}.weight")
+        for candidate in names:
+            out.setdefault(candidate, (module, "weight"))
+    return out
+
+
+class _DepthGroupTargetHooks:
+    """Apply lane-specific target formats for one depth-group microbatch.
+
+    The normal L2 context hooks are installed for every non-target module.
+    Group targets are excluded from that context, then these hooks apply either
+    the lane's candidate format, that target's paired BF16 baseline, or the
+    target's original L2 format for lanes belonging to other targets in the
+    same depth group. This avoids double-quantizing a target module while
+    preserving "all other modules at the L2 assignment" semantics.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        assignment: Mapping[str, str],
+        specs_by_name: Mapping[str, fr.FormatSpec],
+        lanes: list[_LaneSpec],
+        *,
+        base_batch: int,
+    ):
+        self.model = model
+        self.assignment = _canonical_assignment(assignment)
+        self.specs_by_name = specs_by_name
+        self.lanes = lanes
+        self.base_batch = int(base_batch)
+        self.handles = []
+        self.missing: list[str] = []
+
+    def install(self) -> None:
+        quant_map = _l3_quantizable_map(self.model)
+        target_names = sorted({lane.name for lane in self.lanes})
+        for name in target_names:
+            target = quant_map.get(name)
+            if target is None:
+                self.missing.append(name)
+                continue
+            module, _attr = target
+            if not isinstance(module, nn.Linear):
+                self.missing.append(name)
+                continue
+            self.handles.append(
+                module.register_forward_hook(
+                    self._make_hook(name),
+                    with_kwargs=True,
+                )
+            )
+
+    def remove(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def _format_for_lane(self, module_name: str, lane: _LaneSpec) -> str:
+        if lane.name == module_name:
+            return "BF16" if lane.is_baseline else lane.fmt
+        return self.assignment.get(module_name, "BF16")
+
+    def _make_hook(self, module_name: str):
+        def _hook(module, args, kwargs, output):
+            y = _first_tensor_output(output)
+            if y is None:
+                return output
+            chunks = _split_lanes(y, self.base_batch, len(self.lanes))
+            if chunks is None:
+                return output
+            x = None
+            for value in list(args) + list((kwargs or {}).values()):
+                if isinstance(value, torch.Tensor):
+                    x = value
+                    break
+            if x is None:
+                return output
+            x_chunks = _split_lanes(x, self.base_batch, len(self.lanes))
+            if x_chunks is None:
+                return output
+
+            out_chunks = []
+            weight = module.weight.detach()
+            bias = module.bias.detach() if module.bias is not None else None
+            for lane, y_lane, x_lane in zip(self.lanes, chunks, x_chunks):
+                fmt = self._format_for_lane(module_name, lane)
+                if fmt == "BF16":
+                    out_chunks.append(y_lane)
+                    continue
+                spec = self.specs_by_name.get(fmt)
+                if spec is None:
+                    out_chunks.append(y_lane)
+                    continue
+                w_hat = spec.quantize_dequantize(weight.clone())
+                x_hat = spec.activation_quantize_dequantize(x_lane)
+                out_chunks.append(F.linear(x_hat, w_hat.to(weight.dtype), bias))
+            replacement = torch.cat(out_chunks, dim=0)
+            return _replace_first_tensor_output(output, replacement)
+
+        return _hook
+
+
+class _LaneOutputMSE:
+    def __init__(
+        self,
+        model: nn.Module,
+        names: list[str],
+        lanes: list[_LaneSpec],
+        *,
+        base_batch: int,
+    ):
+        self.model = model
+        self.names = names
+        self.lanes = lanes
+        self.base_batch = int(base_batch)
+        self.handles = []
+        self.total_by_lane = [0.0 for _ in lanes]
+        self.batch_count = 0
+
+    def install(self) -> None:
+        quant_map = _l3_quantizable_map(self.model)
+        seen_modules: set[int] = set()
+        for name in self.names:
+            target = quant_map.get(name)
+            if target is None:
+                continue
+            module, _attr = target
+            if id(module) in seen_modules:
+                continue
+            seen_modules.add(id(module))
+            self.handles.append(
+                module.register_forward_hook(self._hook, with_kwargs=True)
+            )
+
+    def remove(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def mark_batch(self) -> None:
+        self.batch_count += 1
+
+    def _hook(self, _module, _args, _kwargs, output):
+        y = _first_tensor_output(output)
+        if y is None:
+            return output
+        chunks = _split_lanes(y.detach(), self.base_batch, len(self.lanes))
+        if chunks is None:
+            return output
+        for idx, lane in enumerate(self.lanes):
+            if lane.is_baseline or lane.baseline_index is None:
+                continue
+            base = chunks[lane.baseline_index].float()
+            cand = chunks[idx].float()
+            self.total_by_lane[idx] += float((cand - base).pow(2).mean().item())
+        return output
+
+    def value_for_lane(self, lane_index: int) -> float:
+        return self.total_by_lane[lane_index] / max(self.batch_count, 1)
+
+
+def _ordered_quantizable_names(model: nn.Module, assignment_names: set[str]) -> list[str]:
+    quant_map = _l3_quantizable_map(model)
+    module_to_names: dict[int, list[str]] = {}
+    for name in assignment_names:
+        target = quant_map.get(name)
+        if target is None:
+            continue
+        module_to_names.setdefault(id(target[0]), []).append(name)
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _qname, module in model.named_modules():
+        for name in sorted(module_to_names.get(id(module), [])):
+            if name not in seen:
+                ordered.append(name)
+                seen.add(name)
+    return ordered
+
+
+def _downstream_names_for_group(
+    ordered_names: list[str],
+    group_names: set[str],
+) -> list[str]:
+    positions = [
+        idx for idx, name in enumerate(ordered_names)
+        if name in group_names
+    ]
+    if not positions:
+        return []
+    return ordered_names[min(positions):]
+
+
+def _lane_specs_for_entries(
+    entries: list[L3NeighborhoodEntry],
+) -> list[_LaneSpec]:
+    lanes: list[_LaneSpec] = []
+    for entry in entries:
+        candidate_fmts = [fmt for fmt in entry.formats if fmt != "BF16"]
+        if not candidate_fmts:
+            continue
+        baseline_idx = len(lanes)
+        lanes.append(
+            _LaneSpec(
+                name=entry.name,
+                fmt="BF16",
+                baseline_index=None,
+                is_baseline=True,
+            )
+        )
+        for fmt in candidate_fmts:
+            lanes.append(
+                _LaneSpec(
+                    name=entry.name,
+                    fmt=fmt,
+                    baseline_index=baseline_idx,
+                    is_baseline=False,
+                )
+            )
+    return lanes
+
+
+def _lane_microbatches_for_entries(
+    entries: list[L3NeighborhoodEntry],
+    max_lanes_per_batch: int,
+) -> list[list[_LaneSpec]]:
+    batches: list[list[_LaneSpec]] = []
+    current: list[_LaneSpec] = []
+    max_lanes = max(int(max_lanes_per_batch), 1)
+    for entry in entries:
+        entry_lanes = _lane_specs_for_entries([entry])
+        if not entry_lanes:
+            continue
+        if current and len(current) + len(entry_lanes) > max_lanes:
+            batches.append(current)
+            current = []
+        if len(entry_lanes) > max_lanes:
+            batches.append(entry_lanes)
+        else:
+            current.extend(entry_lanes)
+    if current:
+        batches.append(current)
+    return batches
+
+
+@torch.no_grad()
+def measure_propagated_costs(
+    model: nn.Module,
+    assignment: Mapping[str, str],
+    neighborhood: list[L3NeighborhoodEntry],
+    calibration_data,
+    specs: list[fr.FormatSpec],
+    *,
+    work_root: str | Path | None = None,
+    profile=None,
+    max_lanes_per_batch: int = 8,
+    output_mse_names: list[str] | None = None,
+) -> dict[str, dict[str, dict]]:
+    """Measure paired end-KL and downstream output-MSE for L3 candidates.
+
+    Each non-BF16 candidate lane is paired with a target-specific BF16 lane in
+    the same model call, while all non-target modules run under the converged
+    L2 assignment. Depth groups are microbatched by lane count so memory stays
+    bounded.
+    """
+    if not neighborhood:
+        return {}
+
+    specs_by_name = {s.name: s for s in specs}
+    assignment_c = _canonical_assignment(assignment)
+    results: dict[str, dict[str, dict]] = {
+        entry.name: {
+            "BF16": {
+                "propagated_end_kl": 0.0,
+                "downstream_output_mse": 0.0,
+                "paired_baseline": "target_bf16_under_l2_assignment",
+            }
+        }
+        for entry in neighborhood
+        if "BF16" in entry.formats
+    }
+    ordered_names = _ordered_quantizable_names(model, set(assignment_c))
+    all_output_names = output_mse_names or ordered_names
+    device = next(model.parameters()).device
+    cal_hash = calibration_data_hash(calibration_data)
+    tmp_parent = str(work_root) if work_root is not None else None
+
+    for _group_key, group_entries in _group_neighborhood_by_depth(neighborhood):
+        for lanes in _lane_microbatches_for_entries(
+            group_entries,
+            max_lanes_per_batch,
+        ):
+            if not lanes:
+                continue
+            target_names = {lane.name for lane in lanes}
+            context_assignment = {
+                name: fmt
+                for name, fmt in assignment_c.items()
+                if name not in target_names
+            }
+            downstream_names = [
+                name for name in _downstream_names_for_group(ordered_names, target_names)
+                if name in set(all_output_names)
+            ]
+            cache_dir = Path(tempfile.mkdtemp(
+                prefix="prismaquant_l3_context_",
+                dir=tmp_parent,
+            ))
+            context_hooks = PerturbedActivationCache(
+                model,
+                context_assignment,
+                cache_dir,
+                input_rows=0,
+                cal_hash=cal_hash,
+                profile=profile,
+            )
+            context_hooks.install()
+            target_hooks = None
+            output_mse = None
+            try:
+                first_batch = True
+                kl_totals = [0.0 for _ in lanes]
+                batch_count = 0
+                try:
+                    for args, kwargs in iter_calibration_forwards(calibration_data, device):
+                        base_batch = _first_tensor_batch_size(args, kwargs)
+                        if first_batch:
+                            target_hooks = _DepthGroupTargetHooks(
+                                model,
+                                assignment_c,
+                                specs_by_name,
+                                lanes,
+                                base_batch=base_batch,
+                            )
+                            target_hooks.install()
+                            output_mse = _LaneOutputMSE(
+                                model,
+                                downstream_names,
+                                lanes,
+                                base_batch=base_batch,
+                            )
+                            output_mse.install()
+                            first_batch = False
+                        rep_args, rep_kwargs = _repeat_inputs_for_lanes(
+                            args,
+                            kwargs,
+                            len(lanes),
+                        )
+                        logits = _extract_logits(model(*rep_args, **rep_kwargs))
+                        chunks = _split_lanes(logits.detach(), base_batch, len(lanes))
+                        if chunks is None:
+                            raise RuntimeError(
+                                "L3 propagated-cost logits did not preserve lane "
+                                f"batching: shape={tuple(logits.shape)} "
+                                f"base_batch={base_batch} lanes={len(lanes)}"
+                            )
+                        for idx, lane in enumerate(lanes):
+                            if lane.is_baseline or lane.baseline_index is None:
+                                continue
+                            teacher = F.log_softmax(
+                                chunks[lane.baseline_index].float(),
+                                dim=-1,
+                            )
+                            kl_totals[idx] += float(
+                                kl_divergence(chunks[idx], teacher).item()
+                            )
+                        batch_count += 1
+                        if output_mse is not None:
+                            output_mse.mark_batch()
+                finally:
+                    if target_hooks is not None:
+                        target_hooks.remove()
+                    if output_mse is not None:
+                        output_mse.remove()
+
+                missing_targets = set(target_hooks.missing if target_hooks else [])
+                for idx, lane in enumerate(lanes):
+                    if lane.is_baseline:
+                        continue
+                    per_name = results.setdefault(lane.name, {})
+                    if lane.name in missing_targets:
+                        per_name[lane.fmt] = {
+                            "error": "target module missing or unsupported for L3"
+                        }
+                        continue
+                    per_name[lane.fmt] = {
+                        "propagated_end_kl": kl_totals[idx] / max(batch_count, 1),
+                        "downstream_output_mse": (
+                            output_mse.value_for_lane(idx)
+                            if output_mse is not None
+                            else 0.0
+                        ),
+                        "paired_baseline": "target_bf16_under_l2_assignment",
+                    }
+            finally:
+                context_hooks.remove()
+                shutil.rmtree(cache_dir, ignore_errors=True)
+
+    return results
