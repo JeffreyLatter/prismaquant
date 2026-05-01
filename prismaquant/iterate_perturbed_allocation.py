@@ -12,6 +12,7 @@ import argparse
 import json
 import pickle
 import tempfile
+import time
 from collections.abc import Callable, Mapping
 from numbers import Real
 from pathlib import Path
@@ -270,6 +271,7 @@ def build_l3_polish_summary(
     after_assignment: Mapping[str, str],
     kl_before: float,
     kl_after: float,
+    elapsed_seconds: float = 0.0,
     accepted: bool = True,
 ) -> dict:
     flips = []
@@ -296,6 +298,7 @@ def build_l3_polish_summary(
         )
     regression = bool(float(kl_after) > float(kl_before))
     return {
+        "l3_enabled": True,
         "enabled": True,
         "accepted": bool(accepted),
         "selected_count": len(selected),
@@ -303,6 +306,7 @@ def build_l3_polish_summary(
         "kl_before": float(kl_before),
         "kl_after": float(kl_after),
         "regression": regression,
+        "elapsed_seconds": float(elapsed_seconds),
         "flip_count": len(flips),
         "flips": flips,
         "selected": [
@@ -554,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
             max_fraction=args.l3_max_fraction,
             safety_fraction=args.l3_safety_fraction,
         )
+        l3_measure_start = time.monotonic()
         l3_costs = measure_propagated_costs(
             model,
             l2_assignment,
@@ -564,6 +569,7 @@ def main(argv: list[str] | None = None) -> int:
             profile=profile,
             max_lanes_per_batch=args.l3_max_lanes_per_batch,
         )
+        l3_elapsed_seconds = time.monotonic() - l3_measure_start
         l3_cost_path = output_root / "l3_propagated_costs.pkl"
         with open(l3_cost_path, "wb") as f:
             pickle.dump(
@@ -616,6 +622,7 @@ def main(argv: list[str] | None = None) -> int:
             after_assignment=polished_assignment,
             kl_before=kl_before,
             kl_after=kl_after,
+            elapsed_seconds=l3_elapsed_seconds,
         )
         l3_summary["cost_path"] = str(l3_cost_path)
         l3_summary_path = output_root / "l3_polish_summary.json"

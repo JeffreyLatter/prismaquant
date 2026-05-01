@@ -119,9 +119,15 @@ def test_l3_polish_summary_reports_flips_and_regression():
         after_assignment={"layer": "BF16"},
         kl_before=1.0,
         kl_after=1.2,
+        elapsed_seconds=2.5,
     )
 
+    assert summary["l3_enabled"] is True
+    assert isinstance(summary["selected_count"], int)
     assert summary["regression"] is True
+    assert isinstance(summary["kl_before"], float)
+    assert isinstance(summary["kl_after"], float)
+    assert summary["elapsed_seconds"] == pytest.approx(2.5)
     assert summary["flip_count"] == 1
     assert summary["flips"] == [
         {
