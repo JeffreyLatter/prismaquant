@@ -29,12 +29,15 @@ DP pass.
 
 ## Candidate Scope
 
-`--l3-polish` selects roughly 5-10% of Linears by default:
+`--l3-polish` selects a bounded Linear neighborhood:
 
 - uncertain allocator-neighborhood choices, using `--l3-uncertainty-rel-tol`;
+- every current L2 pick that is not the cheapest available measured format;
 - a small safety set of high L2 predicted-cost Linears;
 - fill to `--l3-min-fraction` when too few Linears qualify;
-- cap at `--l3-max-fraction`.
+- `--l3-max-fraction` bounds the uncertain seed set; if the combined set
+  exceeds the internal upper guard, L3 keeps non-cheapest current picks first,
+  then uncertain choices, then safety picks.
 
 For each selected Linear, L3 measures the current L2 pick, one cheaper format,
 one more accurate format, and BF16 when available. The final DP is run only
@@ -82,7 +85,9 @@ Useful tuning flags:
 - `--l3-min-fraction` default `0.05`;
 - `--l3-max-fraction` default `0.10`;
 - `--l3-safety-fraction` default `0.02`;
-- `--l3-max-lanes-per-batch` default `8`.
+- `--l3-max-lanes-per-batch` default `8`;
+- `--frozen-dp-budget-tolerance` default `0.05`, allowing the L3 greedy
+  fallback to use up to 5% of total target bits as hard budget slack.
 
 L3 is one final pass by design; per-iteration L3 is not exposed yet.
 

@@ -151,16 +151,17 @@ def test_select_l3_neighborhood_caps_and_keeps_safety_layers():
 
 
 def test_select_l3_neighborhood_includes_confident_non_cheapest():
-    stats = {"layer": _stat()}
+    stats = {f"layer{i}": _stat() for i in range(6)}
     costs = {
-        "layer": {
+        name: {
             "NVFP4": {"predicted_dloss": 10.0},
             "MXFP6_E3M2": {"predicted_dloss": 1.0},
             "MXFP8": {"predicted_dloss": 2.0},
             "BF16": {"predicted_dloss": 0.0},
         }
+        for name in stats
     }
-    assignment = {"layer": "MXFP6_E3M2"}
+    assignment = {name: "MXFP6_E3M2" for name in stats}
     specs = [fr.get_format(n) for n in ("NVFP4", "MXFP6_E3M2", "MXFP8", "BF16")]
 
     selected = select_l3_neighborhood(
@@ -168,14 +169,14 @@ def test_select_l3_neighborhood_includes_confident_non_cheapest():
         costs,
         assignment,
         specs,
-        min_fraction=1.0,
-        max_fraction=1.0,
+        min_fraction=0.0,
+        max_fraction=0.10,
         safety_fraction=0.0,
     )
 
-    assert len(selected) == 1
-    assert selected[0].name == "layer"
-    assert selected[0].reasons == ("confident_non_cheapest",)
+    assert {entry.name for entry in selected} == set(stats)
+    assert len(selected) > 1
+    assert all(entry.reasons == ("confident_non_cheapest",) for entry in selected)
 
 
 def test_select_l3_neighborhood_errors_on_packed_experts():
@@ -305,6 +306,36 @@ def test_solve_frozen_l3_neighborhood_falls_back_when_precision_too_tight(monkey
     assert meta["frozen_dp_precision_used"] == "greedy"
     assert meta["frozen_dp_greedy"]["accepted"] == 1
 
+    over_stats = {f"over{i}": _stat(n_params=100) for i in range(3)}
+    over_assignment = {name: "MXFP8" for name in over_stats}
+    over_candidates = {
+        name: [
+            Candidate("NVFP4", 4.0, 50, 1.0),
+            Candidate("MXFP8", 8.0, 100, 1.0),
+            Candidate("BF16", 16.0, 200, 2.0),
+        ]
+        for name in over_stats
+    }
+
+    solved, chosen, meta = solve_frozen_l3_neighborhood(
+        over_stats,
+        over_assignment,
+        over_candidates,
+        _specs(),
+        target_bits=7.8,
+        bit_precision=0.001,
+        budget_tolerance=0.05,
+        return_metadata=True,
+    )
+
+    used_bits = sum(8.0 * chosen[name].memory_bytes for name in chosen)
+    total_params = sum(entry["n_params"] for entry in over_stats.values())
+    ceiling_bits = 7.8 * total_params * 1.05
+    assert used_bits <= ceiling_bits + 1e-6
+    assert list(solved.values()).count("NVFP4") == 1
+    assert meta["frozen_dp_precision_used"] == "greedy"
+    assert meta["frozen_dp_greedy"]["accepted_budget_reducing_nonworse"] == 1
+
 
 def test_solve_frozen_l3_neighborhood_greedy_swaps_dominated_current(monkeypatch):
     stats = {"layer": _stat(n_params=100)}
@@ -327,6 +358,7 @@ def test_solve_frozen_l3_neighborhood_greedy_swaps_dominated_current(monkeypatch
         _specs(),
         target_bits=3.995,
         bit_precision=0.001,
+        budget_tolerance=0.01,
         return_metadata=True,
     )
 

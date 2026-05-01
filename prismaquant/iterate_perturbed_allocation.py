@@ -651,6 +651,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--l3-max-fraction", type=float, default=0.10)
     ap.add_argument("--l3-safety-fraction", type=float, default=0.02)
     ap.add_argument("--l3-max-lanes-per-batch", type=int, default=8)
+    ap.add_argument(
+        "--frozen-dp-budget-tolerance",
+        type=float,
+        default=0.05,
+        help="Fraction of total target bits allowed as L3 frozen-DP slack.",
+    )
     ap.add_argument("--verbose", action="store_true",
                     help="Print per-Linear per-format costs each iteration.")
     args = ap.parse_args(argv)
@@ -1168,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
                 specs,
                 target_bits=args.target_bits,
                 bit_precision=args.bit_precision,
+                budget_tolerance=args.frozen_dp_budget_tolerance,
                 return_metadata=True,
             )
         else:
@@ -1260,6 +1267,13 @@ def main(argv: list[str] | None = None) -> int:
         l3_summary["cost_path"] = str(l3_cost_path)
         l3_summary["frozen_dp_attempts"] = frozen_dp_meta.get("frozen_dp_attempts")
         l3_summary["frozen_dp_greedy"] = frozen_dp_meta.get("frozen_dp_greedy")
+        l3_summary["frozen_dp_budget_tolerance"] = frozen_dp_meta.get(
+            "frozen_dp_budget_tolerance",
+            args.frozen_dp_budget_tolerance,
+        )
+        l3_summary["frozen_dp_budget_tolerance_bits"] = frozen_dp_meta.get(
+            "frozen_dp_budget_tolerance_bits",
+        )
         l3_summary["timing"] = {
             "kl_before": kl_before_timing,
             "selection": selection_timing,

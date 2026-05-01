@@ -112,9 +112,15 @@ def _available_formats_for_name(
     specs: list[fr.FormatSpec],
 ) -> list[str]:
     available: list[str] = []
+    seen: set[str] = set()
     for spec in specs:
-        if l2_cost_value(stats, costs, name, spec.name) is not None:
-            available.append(spec.name)
+        canonical = fr.canonical_format_name(spec.name)
+        if (
+            canonical not in seen
+            and l2_cost_value(stats, costs, name, canonical) is not None
+        ):
+            available.append(canonical)
+            seen.add(canonical)
     return available
 
 
@@ -133,7 +139,7 @@ def select_formats_for_l3(
     """Choose current + one cheaper + one more accurate + BF16 when present."""
     if name not in stats or name not in assignment:
         return ()
-    specs_by_name = {s.name: s for s in specs}
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
     current = fr.canonical_format_name(assignment[name])
     available = _available_formats_for_name(stats, costs, name, specs)
     if current not in available:
@@ -188,7 +194,7 @@ def _current_has_cheaper_available_format(
     specs: list[fr.FormatSpec],
 ) -> bool:
     current = fr.canonical_format_name(assignment[name])
-    specs_by_name = {s.name: s for s in specs}
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
     if current not in specs_by_name:
         return False
     current_bits = _bits_for_name(stats, name, specs_by_name[current])
@@ -245,6 +251,7 @@ def select_l3_neighborhood(
     total = len([name for name in assignment if name in stats])
     min_count = max(1, int(math.ceil(total * min_fraction)))
     max_count = max(min_count, int(math.ceil(total * max_fraction)))
+    upper_count = max(max_count, int(math.ceil(total * 0.25)))
     safety_count = int(math.ceil(total * safety_fraction))
 
     by_name: dict[str, L3NeighborhoodEntry] = {}
@@ -291,7 +298,8 @@ def select_l3_neighborhood(
         _add(entry, "confident_non_cheapest")
 
     safety = sorted(eligible, key=lambda e: (-e.l2_current_cost, e.name))[:safety_count]
-    _add_until_full(safety, "high_l2_cost")
+    for entry in safety:
+        _add(entry, "high_l2_cost")
 
     if len(by_name) < min_count:
         fill = sorted(eligible, key=lambda e: (e.margin, -e.l2_current_cost, e.name))
@@ -314,11 +322,38 @@ def select_l3_neighborhood(
         )
 
     selected = list(by_name.values())
-    if len(selected) > max_count:
-        safety = [e for e in selected if "high_l2_cost" in e.reasons]
-        rest = [e for e in selected if "high_l2_cost" not in e.reasons]
+    if len(selected) > upper_count:
+        confident = [
+            e for e in selected
+            if "confident_non_cheapest" in e.reasons
+        ]
+        uncertain_only = [
+            e for e in selected
+            if "confident_non_cheapest" not in e.reasons
+            and "uncertain" in e.reasons
+        ]
+        safety_only = [
+            e for e in selected
+            if "confident_non_cheapest" not in e.reasons
+            and "uncertain" not in e.reasons
+            and "high_l2_cost" in e.reasons
+        ]
+        rest = [
+            e for e in selected
+            if "confident_non_cheapest" not in e.reasons
+            and "uncertain" not in e.reasons
+            and "high_l2_cost" not in e.reasons
+        ]
+        confident.sort(key=lambda e: (-e.l2_current_cost, e.margin, e.name))
+        uncertain_only.sort(key=lambda e: (e.margin, -e.l2_current_cost, e.name))
+        safety_only.sort(key=lambda e: (-e.l2_current_cost, e.name))
         rest.sort(key=lambda e: (e.margin, -e.l2_current_cost, e.name))
-        selected = (safety + rest)[:max_count]
+        selected = list(confident)
+        for group in (uncertain_only, safety_only, rest):
+            for entry in group:
+                if len(selected) >= upper_count:
+                    break
+                selected.append(entry)
 
     return sorted(selected, key=lambda e: e.name)
 
@@ -329,7 +364,7 @@ def build_l3_candidates(
     specs: list[fr.FormatSpec],
 ) -> dict[str, list[Candidate]]:
     """Build DP candidates from propagated end-KL costs only."""
-    specs_by_name = {s.name: s for s in specs}
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
     out: dict[str, list[Candidate]] = {}
     for name, per_name in propagated_costs.items():
         if name not in stats or not isinstance(per_name, Mapping):
@@ -364,6 +399,7 @@ def _greedy_l3_under_budget(
     open_cands: Mapping[str, list[Candidate]],
     current_assignment: Mapping[str, str],
     remaining_bits: float,
+    budget_ceiling_bits: float | None = None,
 ) -> tuple[dict[str, str], dict[str, Candidate], dict]:
     names = sorted(open_cands)
     chosen: dict[str, Candidate] = {}
@@ -376,6 +412,12 @@ def _greedy_l3_under_budget(
         )
 
     used_bits = sum(_candidate_total_bits(c) for c in chosen.values())
+    budget_ceiling_bits = (
+        float(remaining_bits)
+        if budget_ceiling_bits is None
+        else float(budget_ceiling_bits)
+    )
+    eps = 1e-12
     attempts = []
     for name in names:
         current = chosen[name]
@@ -383,13 +425,23 @@ def _greedy_l3_under_budget(
             if cand.fmt == current.fmt:
                 continue
             improvement = current.predicted_dloss - cand.predicted_dloss
-            attempts.append((improvement, name, cand))
+            bit_delta = _candidate_total_bits(cand) - _candidate_total_bits(current)
+            if bit_delta < -eps and improvement >= -eps:
+                priority = 0
+            elif bit_delta < -eps:
+                priority = 1
+            elif improvement > eps:
+                priority = 2
+            else:
+                priority = 3
+            attempts.append((priority, improvement, name, cand))
     attempts.sort(
         key=lambda item: (
-            -item[0],
-            _candidate_total_bits(item[2]),
-            item[1],
-            item[2].fmt,
+            item[0],
+            -item[1],
+            _candidate_total_bits(item[3]),
+            item[2],
+            item[3].fmt,
         )
     )
 
@@ -398,28 +450,40 @@ def _greedy_l3_under_budget(
         "accepted": 0,
         "rejected_not_better": 0,
         "rejected_budget": 0,
+        "accepted_budget_reducing_nonworse": 0,
+        "accepted_budget_reducing_worse": 0,
+        "accepted_cost_improving": 0,
         "start_bits": used_bits,
         "end_bits": None,
         "remaining_bits": float(remaining_bits),
+        "budget_ceiling_bits": float(budget_ceiling_bits),
     }
     swapped_names: set[str] = set()
-    for improvement, name, cand in attempts:
+    for _priority, improvement, name, cand in attempts:
         if name in swapped_names:
             continue
         stats["attempts"] += 1
-        if improvement <= 1e-12:
-            stats["rejected_not_better"] += 1
-            continue
         current = chosen[name]
         current_bits = _candidate_total_bits(current)
         cand_bits = _candidate_total_bits(cand)
         next_bits = used_bits - current_bits + cand_bits
-        if used_bits > remaining_bits + 1e-6:
-            if cand_bits >= current_bits - 1e-6:
-                stats["rejected_budget"] += 1
-                continue
-        elif next_bits > remaining_bits + 1e-6:
+        if next_bits > budget_ceiling_bits + 1e-6:
             stats["rejected_budget"] += 1
+            continue
+        overshoot_before = max(float(used_bits) - float(remaining_bits), 0.0)
+        overshoot_after = max(float(next_bits) - float(remaining_bits), 0.0)
+        reduces_overshoot = overshoot_after < overshoot_before - 1e-6
+        cost_worsens = improvement < -eps
+        cost_improves = improvement > eps
+        if reduces_overshoot:
+            if cost_worsens:
+                stats["accepted_budget_reducing_worse"] += 1
+            else:
+                stats["accepted_budget_reducing_nonworse"] += 1
+        elif cost_improves:
+            stats["accepted_cost_improving"] += 1
+        else:
+            stats["rejected_not_better"] += 1
             continue
         chosen[name] = cand
         used_bits = next_bits
@@ -439,10 +503,11 @@ def solve_frozen_l3_neighborhood(
     *,
     target_bits: float,
     bit_precision: float,
+    budget_tolerance: float = 0.0,
     return_metadata: bool = False,
 ) -> tuple[dict[str, str], dict[str, Candidate]]:
     """Solve L3 candidates while freezing all non-neighborhood L2 choices."""
-    specs_by_name = {s.name: s for s in specs}
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
     all_names = set(stats) & set(assignment)
     open_names = set(l3_candidates)
     frozen_assignment = {
@@ -458,6 +523,7 @@ def solve_frozen_l3_neighborhood(
         return result
 
     target_total_bits = float(target_bits) * float(total_params)
+    budget_tolerance_bits = max(0.0, float(budget_tolerance)) * target_total_bits
     frozen_bits = assignment_bit_total(stats, frozen_assignment, specs_by_name)
     remaining_bits = target_total_bits - frozen_bits
     if remaining_bits < -1e-6:
@@ -515,6 +581,7 @@ def solve_frozen_l3_neighborhood(
             open_cands,
             open_current_assignment,
             remaining_bits,
+            remaining_bits + budget_tolerance_bits,
         )
         result = (open_assignment, chosen)
         precision_used = "greedy"
@@ -523,7 +590,8 @@ def solve_frozen_l3_neighborhood(
             f"attempts={greedy_stats['attempts']} "
             f"accepted={greedy_stats['accepted']} "
             f"rejected_not_better={greedy_stats['rejected_not_better']} "
-            f"rejected_budget={greedy_stats['rejected_budget']}",
+            f"rejected_budget={greedy_stats['rejected_budget']} "
+            f"budget_ceiling_bits={greedy_stats['budget_ceiling_bits']:.1f}",
             flush=True,
         )
     else:
@@ -536,6 +604,8 @@ def solve_frozen_l3_neighborhood(
             "frozen_dp_precision_used": precision_used,
             "frozen_dp_attempts": dp_attempts,
             "frozen_dp_greedy": greedy_stats,
+            "frozen_dp_budget_tolerance": float(budget_tolerance),
+            "frozen_dp_budget_tolerance_bits": float(budget_tolerance_bits),
         }
     return merged, chosen
 
