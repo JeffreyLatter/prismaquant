@@ -362,6 +362,16 @@ def _format_histogram(
     }
 
 
+def _format_histogram_delta(previous: Mapping[str, int], current: Mapping[str, int]) -> str:
+    parts = []
+    for fmt in sorted(set(previous) | set(current)):
+        delta = int(current.get(fmt, 0)) - int(previous.get(fmt, 0))
+        if delta == 0:
+            continue
+        parts.append(f"{fmt} {delta:+d}")
+    return ", ".join(parts) if parts else "no count changes"
+
+
 def _ema_weights(history_len: int, decay: float) -> list[float]:
     return [float(decay) ** age for age in range(history_len)]
 
@@ -475,6 +485,33 @@ def _top_l2_formats(
 def _normalised_disagreement(l2_cost: float, l3_cost: float) -> float:
     denom = max(abs(l2_cost), abs(l3_cost), 1e-12)
     return abs(l3_cost - l2_cost) / denom
+
+
+def _phase_elapsed(timing: Mapping | None) -> float:
+    if not isinstance(timing, Mapping):
+        return 0.0
+    return float(timing.get("elapsed_seconds", 0.0) or 0.0)
+
+
+def _max_peak_gb(*timings: Mapping | None) -> float | None:
+    values = [
+        float(timing["cuda_peak_gb"])
+        for timing in timings
+        if isinstance(timing, Mapping) and timing.get("cuda_peak_gb") is not None
+    ]
+    return max(values) if values else None
+
+
+def _pct(part: float, total: float) -> float:
+    return (float(part) / float(total) * 100.0) if total > 1e-12 else 0.0
+
+
+def _gb(num_bytes: int) -> float:
+    return float(num_bytes) / float(1024 ** 3)
+
+
+def _fmt_gb(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}GB"
 
 
 def build_l3_polish_summary(
@@ -673,6 +710,12 @@ def main(argv: list[str] | None = None) -> int:
     assignment_history: list[dict[str, str]] = [dict(assignment)]
     iteration_log: list[dict] = []
     convergence_reached = False
+    previous_histogram_counts: dict[str, int] | None = None
+    previous_measured_linears: int | None = None
+    previous_assignment_hash: str | None = None
+    l2_iteration_walls: list[float] = []
+    cache_size_total_bytes = 0
+    l2_peak_gb: float | None = None
 
     for iteration in range(1, int(args.max_iters) + 1):
         _emit(f"[l2] === iteration {iteration}/{int(args.max_iters)} ===")
@@ -694,6 +737,7 @@ def main(argv: list[str] | None = None) -> int:
             cache_start,
         )
         cache_bytes = _directory_size_bytes(cache_dir)
+        cache_size_total_bytes += cache_bytes
         _emit(
             f"[l2] iteration {iteration}: activation cache size "
             f"{_human_bytes(cache_bytes)}"
@@ -724,11 +768,16 @@ def main(argv: list[str] | None = None) -> int:
             cost_start,
         )
         measured_linears = len(measured_costs)
-        _emit(
-            f"[l2] iteration {iteration}: cost step done in "
-            f"{cost_timing['elapsed_seconds']:.1f}s, measured "
-            f"{measured_linears} Linears"
-        )
+        if (
+            previous_measured_linears is None
+            or measured_linears != previous_measured_linears
+        ):
+            _emit(
+                f"[l2] iteration {iteration}: cost step done in "
+                f"{cost_timing['elapsed_seconds']:.1f}s, measured "
+                f"{measured_linears} Linears"
+            )
+        previous_measured_linears = measured_linears
         if args.verbose:
             for name in sorted(measured_costs):
                 for fmt in sorted(measured_costs.get(name, {})):
@@ -785,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         flip_frac = hamming["ratio"]
         histogram = _format_histogram(stats, next_assignment, specs, args.target_bits)
+        histogram_counts = histogram["counts"]
         top_changes = _top_cost_changes(
             previous_costs,
             measured_costs,
@@ -800,12 +850,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         ema_weights = _ema_weights(len(cost_history), args.ema_decay)
         assignment_hash_short = _assignment_digest(next_assignment)
-        _emit(
-            f"[l2] iteration {iteration}: format histogram "
-            f"{histogram['counts']} total={histogram['total']} "
-            f"achieved_bpp={histogram['achieved_bpp']:.4f} "
-            f"target_bpp={histogram['target_bpp']:.4f}"
-        )
+        if previous_histogram_counts is None:
+            _emit(
+                f"[l2] iteration {iteration}: format histogram "
+                f"{histogram_counts} total={histogram['total']} "
+                f"achieved_bpp={histogram['achieved_bpp']:.4f} "
+                f"target_bpp={histogram['target_bpp']:.4f}"
+            )
+        elif histogram_counts == previous_histogram_counts:
+            _emit(f"[l2] iteration {iteration}: format histogram: unchanged")
+        else:
+            _emit(
+                f"[l2] iteration {iteration}: format histogram delta: "
+                f"{_format_histogram_delta(previous_histogram_counts, histogram_counts)}"
+            )
+        previous_histogram_counts = dict(histogram_counts)
         if top_changes:
             rendered = [
                 f"({item['name']}, {item['format']}) old={item['old']:.4g} "
@@ -827,22 +886,32 @@ def main(argv: list[str] | None = None) -> int:
             f"[l2] iteration {iteration}: EMA weights newest-first "
             f"{[round(w, 6) for w in ema_weights]}"
         )
-        _emit(
-            f"[l2] iteration {iteration}: cycle assignment_hash="
-            f"{assignment_hash_short}, cycle_mode={cycle_mode}"
-        )
-        _emit(
-            f"[l2] iteration {iteration}: weighted_hamming "
-            f"numerator={hamming['numerator']:.6g}, "
-            f"denominator={hamming['denominator']:.6g}, "
-            f"ratio={flip_frac:.4f}, threshold={args.convergence_frac:.4f}"
-        )
+        if assignment_hash_short != previous_assignment_hash:
+            _emit(
+                f"[l2] iteration {iteration}: assignment_hash="
+                f"{assignment_hash_short}"
+            )
+        previous_assignment_hash = assignment_hash_short
+        if cycle_mode != "none":
+            _emit(f"[l2] iteration {iteration}: cycle_mode={cycle_mode}")
+        if flip_frac > 1e-6:
+            _emit(
+                f"[l2] iteration {iteration}: weighted_hamming "
+                f"numerator={hamming['numerator']:.6g}, "
+                f"denominator={hamming['denominator']:.6g}, "
+                f"ratio={flip_frac:.4f}, threshold={args.convergence_frac:.4f}"
+            )
         verdict = "converged" if flip_frac <= args.convergence_frac else "continuing"
-        _emit(
-            f"[l2] iteration {iteration}: weighted_hamming={flip_frac:.4f}, "
-            f"cycle_mode={cycle_mode}"
-        )
         _emit(f"[l2] iteration {iteration}: {verdict}")
+        iteration_wall = (
+            _phase_elapsed(cache_timing)
+            + _phase_elapsed(cost_timing)
+            + _phase_elapsed(solve_timing)
+        )
+        l2_iteration_walls.append(iteration_wall)
+        iter_peak = _max_peak_gb(cache_timing, cost_timing, solve_timing)
+        if iter_peak is not None:
+            l2_peak_gb = iter_peak if l2_peak_gb is None else max(l2_peak_gb, iter_peak)
         iteration_log.append(
             {
                 "iteration": iteration,
@@ -851,6 +920,7 @@ def main(argv: list[str] | None = None) -> int:
                 "flip_fraction": flip_frac,
                 "cycle_mode": cycle_mode,
                 "assignment_hash": list(assignment_hash(next_assignment)),
+                "iteration_wall_seconds": iteration_wall,
             }
         )
         _append_jsonl(
@@ -871,6 +941,8 @@ def main(argv: list[str] | None = None) -> int:
                     "cache": cache_timing,
                     "cost": cost_timing,
                     "solve": solve_timing,
+                    "iteration_wall_seconds": iteration_wall,
+                    "memory_peak_gb": iter_peak,
                 },
             },
         )
@@ -884,6 +956,9 @@ def main(argv: list[str] | None = None) -> int:
     l3_cost_path = None
     l3_flip_count = 0
     l3_kl_improvement_pct = None
+    l3_timing_breakdown: dict[str, float] = {}
+    l3_wall = 0.0
+    l3_peak_gb: float | None = None
     if args.l3_polish:
         _emit("[l3] === polish ===")
         # Per-iteration L3 can reuse this path later; only final polish is
@@ -1150,6 +1225,24 @@ def main(argv: list[str] | None = None) -> int:
             f"KL_after={kl_after:.4e}, regression={str(regression).lower()}, "
             f"improvement={l3_kl_improvement_pct:.2f}%"
         )
+        validation_wall = (
+            _phase_elapsed(kl_before_timing)
+            + _phase_elapsed(kl_after_timing)
+        )
+        l3_timing_breakdown = {
+            "selection": _phase_elapsed(selection_timing),
+            "measurement": _phase_elapsed(l3_measure_timing),
+            "dp": _phase_elapsed(frozen_solve_timing),
+            "validation": validation_wall,
+        }
+        l3_wall = sum(l3_timing_breakdown.values())
+        l3_peak_gb = _max_peak_gb(
+            kl_before_timing,
+            selection_timing,
+            l3_measure_timing,
+            frozen_solve_timing,
+            kl_after_timing,
+        )
         l3_summary = build_l3_polish_summary(
             selected=selected,
             l3_costs=l3_costs,
@@ -1166,6 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
             "measurement": l3_measure_timing,
             "frozen_solve": frozen_solve_timing,
             "kl_after": kl_after_timing,
+            "l3_wall_seconds": l3_wall,
         }
         l3_summary_path = output_root / "l3_polish_summary.json"
         with open(l3_summary_path, "w") as f:
@@ -1197,6 +1291,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     "from": l2_assignment.get(entry.name),
                     "to": polished_assignment.get(entry.name),
+                    "timing": l3_summary["timing"],
                 },
             )
         assignment = dict(polished_assignment)
@@ -1206,6 +1301,27 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(dict(sorted(assignment.items())), f, indent=2)
     final_layer_config = output_root / "final_layer_config.json"
     write_layer_config(assignment, final_layer_config)
+    total_wall = time.monotonic() - total_wall_start
+    l2_wall = sum(l2_iteration_walls)
+    baseline_wall = max(total_wall - l2_wall - l3_wall, 0.0)
+    additional_iter_wall = sum(l2_iteration_walls[1:])
+    single_iter_wall = l2_iteration_walls[0] if l2_iteration_walls else 0.0
+    marginal_cost = {
+        "total_wall_seconds": total_wall,
+        "l2_wall_seconds": l2_wall,
+        "l2_wall_pct": _pct(l2_wall, total_wall),
+        "l2_iteration_wall_seconds": list(l2_iteration_walls),
+        "additional_iter_wall_seconds": additional_iter_wall,
+        "additional_iter_extra_pct": _pct(additional_iter_wall, single_iter_wall),
+        "l3_wall_seconds": l3_wall,
+        "l3_wall_pct": _pct(l3_wall, total_wall),
+        "l3_timing_breakdown": dict(l3_timing_breakdown),
+        "baseline_wall_seconds": baseline_wall,
+        "l2_cuda_peak_gb": l2_peak_gb,
+        "l3_cuda_peak_gb": l3_peak_gb,
+        "perturbed_cache_disk_gb": _gb(cache_size_total_bytes),
+        "perturbed_cache_count": len(iteration_log),
+    }
     summary = {
         "iterations": iteration_log,
         "final_assignment": str(final_assignment_path),
@@ -1214,13 +1330,13 @@ def main(argv: list[str] | None = None) -> int:
         "converged": convergence_reached,
         "probe_load_timing": probe_load_timing,
         "iteration_trace": str(iteration_trace_path),
+        "marginal_cost": marginal_cost,
     }
     if l3_summary_path is not None:
         summary["l3_polish_summary"] = str(l3_summary_path)
         summary["l3_polish_trace"] = str(l3_trace_path)
     with open(output_root / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
-    total_wall = time.monotonic() - total_wall_start
     _emit("===== summary =====")
     _emit(f"L2 iterations: {len(iteration_log)}")
     _emit(f"Converged: {str(convergence_reached).lower()}")
@@ -1232,6 +1348,35 @@ def main(argv: list[str] | None = None) -> int:
         _emit(f"L3 flips: {l3_flip_count}")
         _emit(f"KL improvement: {improvement}")
     _emit(f"Total wall time: {total_wall:.1f}s")
+    _emit("== marginal cost ==")
+    _emit(f"total wall: {total_wall:.1f}s")
+    _emit(
+        f"  L2 (perturbed-X iteration): {l2_wall:.1f}s "
+        f"({_pct(l2_wall, total_wall):.1f}% of wall)"
+    )
+    iter_parts = [
+        f"iter{idx}={seconds:.1f}s"
+        for idx, seconds in enumerate(l2_iteration_walls, start=1)
+    ]
+    _emit(f"    iteration breakdown: [{', '.join(iter_parts)}]")
+    _emit(
+        f"    marginal cost of additional iters (vs single-pass): "
+        f"+{additional_iter_wall:.1f}s "
+        f"({_pct(additional_iter_wall, single_iter_wall):.1f}% extra)"
+    )
+    _emit(
+        f"  L3 polish: {l3_wall:.1f}s ({_pct(l3_wall, total_wall):.1f}% "
+        f"of wall) - selection={l3_timing_breakdown.get('selection', 0.0):.1f}s, "
+        f"measurement={l3_timing_breakdown.get('measurement', 0.0):.1f}s, "
+        f"DP={l3_timing_breakdown.get('dp', 0.0):.1f}s, "
+        f"validation={l3_timing_breakdown.get('validation', 0.0):.1f}s"
+    )
+    _emit(f"  baseline (probe/cost loading, model setup): {baseline_wall:.1f}s")
+    _emit(f"memory peak: L2={_fmt_gb(l2_peak_gb)}, L3={_fmt_gb(l3_peak_gb)}")
+    _emit(
+        f"disk: perturbed-X caches total {_gb(cache_size_total_bytes):.3f}GB "
+        f"across {len(iteration_log)} iters"
+    )
     _emit(f"Summary manifest: {output_root / 'summary.json'}")
     _emit(f"Iteration trace: {iteration_trace_path}")
     if l3_summary_path is not None:

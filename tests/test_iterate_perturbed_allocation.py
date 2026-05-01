@@ -273,6 +273,14 @@ def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
     assert out.count("[l2] === iteration") == 2
     assert "[l3] === polish ===" in out
     assert "format histogram" in out
+    assert (
+        "[l2] iteration 2: format histogram delta:" in out
+        or "[l2] iteration 2: format histogram: unchanged" in out
+    )
+    assert "[l2] iteration 1: weighted_hamming " in out
+    assert "[l2] iteration 2: weighted_hamming " not in out
+    assert "== marginal cost ==" in out
+    assert "total wall:" in out
 
     iteration_trace = output_dir / "iteration_trace.jsonl"
     l3_trace = output_dir / "l3_polish_trace.jsonl"
