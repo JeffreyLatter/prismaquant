@@ -37,6 +37,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from prismaquant.sensitivity_probe import (
+    _is_packed_experts_module,
+    _packed_experts_param_names,
+)
+
 
 def _fp8_round(weight: torch.Tensor) -> torch.Tensor:
     """FP8 E4M3 round-trip with per-output-channel scale."""
@@ -220,16 +225,19 @@ def is_fused_moe_experts(module) -> bool:
 def iter_quantizable_tensors(model):
     """Yield (full_name, module, param_attr) for each quantizable weight.
     Caller uses module.{param_attr}.data to read, and can REPLACE the data
-    attribute to free storage. Handles nn.Linear and Qwen3.5 MoE fused experts."""
+    attribute to free storage. Handles nn.Linear and 3D packed MoE experts."""
     for name, mod in model.named_modules():
         # Regular nn.Linear
         if isinstance(mod, nn.Linear) and mod.weight.numel() >= 1000:
             if should_always_skip(name):
                 continue
             yield (f"{name}.weight", mod, "weight")
-        # Fused MoE experts (two parameters: gate_up_proj and down_proj)
-        elif is_fused_moe_experts(mod):
-            for param_name in ("gate_up_proj", "down_proj"):
+        # Packed MoE experts (for example gate_up_proj/down_proj, w1/w2/w3).
+        elif _is_packed_experts_module(mod) or is_fused_moe_experts(mod):
+            param_names = _packed_experts_param_names(mod)
+            if not param_names and is_fused_moe_experts(mod):
+                param_names = ["gate_up_proj", "down_proj"]
+            for param_name in param_names:
                 if not hasattr(mod, param_name):
                     continue
                 param = getattr(mod, param_name)
