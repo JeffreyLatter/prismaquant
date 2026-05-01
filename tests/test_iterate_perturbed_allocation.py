@@ -1,5 +1,14 @@
-import pytest
+import json
+import pickle
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+import torch
+import torch.nn as nn
+
+from prismaquant import iterate_perturbed_allocation as ipa
 from prismaquant.iterate_perturbed_allocation import (
     assignment_hash,
     build_l3_polish_summary,
@@ -139,3 +148,137 @@ def test_l3_polish_summary_reports_flips_and_regression():
         }
     ]
     assert summary["selected"][0]["reasons"] == ["uncertain"]
+
+
+class _TinyLogitsModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            self.layer.weight.copy_(torch.eye(2))
+
+    def forward(self, input_ids):
+        if input_ids.dtype in (torch.int32, torch.int64, torch.long):
+            x = torch.nn.functional.one_hot(input_ids % 2, num_classes=2).float()
+        else:
+            x = input_ids.float()
+        return SimpleNamespace(logits=self.layer(x))
+
+
+def _tiny_stat():
+    return {
+        "n_params": 4,
+        "in_features": 2,
+        "out_features": 2,
+        "h_trace": 1.0,
+        "_memory_bytes_by_format": {
+            "INT8_W8A16": 8,
+            "BF16": 8,
+        },
+    }
+
+
+def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
+    probe_path = tmp_path / "probe.pkl"
+    costs_path = tmp_path / "costs.pkl"
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "out"
+    stats = {"layer": _tiny_stat()}
+    initial_costs = {
+        "layer": {
+            "INT8_W8A16": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    }
+    with open(probe_path, "wb") as f:
+        pickle.dump({"stats": stats}, f)
+    with open(costs_path, "wb") as f:
+        pickle.dump({"costs": initial_costs}, f)
+
+    class _Tokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=_Tokenizer),
+    )
+    monkeypatch.setattr(ipa, "validate_probe_payload", lambda *_args: None)
+    monkeypatch.setattr(ipa, "validate_cost_payload", lambda *_args: None)
+    monkeypatch.setattr(
+        ipa,
+        "load_text_model_under_work_root",
+        lambda *_args, **_kwargs: _TinyLogitsModel(),
+    )
+    monkeypatch.setattr(
+        ipa,
+        "load_wikitext_calibration",
+        lambda *_args, **_kwargs: torch.tensor([[0, 1], [1, 0]]),
+    )
+    monkeypatch.setattr(ipa, "cache_reference_log_probs", lambda *_args: [])
+    monkeypatch.setattr(
+        ipa,
+        "measure_assignment_kl",
+        lambda _model, assignment, *_args, **_kwargs: (
+            0.9 if assignment.get("layer") == "BF16" else 1.0
+        ),
+    )
+
+    def _capture(_model, _assignment, _calib_ids, cache_dir, **_kwargs):
+        cache_dir = tmp_path / Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "cache.bin").write_bytes(b"x")
+        return {"cache_dir": str(cache_dir)}
+
+    class _ActivationIndex:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __contains__(self, _name):
+            return True
+
+    calls = {"n": 0}
+
+    def _run_cost_pass(*_args, **_kwargs):
+        calls["n"] += 1
+        value = 1.0 + 0.1 * calls["n"]
+        return {
+            "layer": {
+                "INT8_W8A16": {"predicted_dloss": value},
+                "BF16": {"predicted_dloss": 0.0},
+            }
+        }
+
+    monkeypatch.setattr(ipa, "capture_perturbed_activation_cache", _capture)
+    monkeypatch.setattr(ipa, "ActivationIndex", _ActivationIndex)
+    monkeypatch.setattr(ipa, "run_cost_pass", _run_cost_pass)
+
+    rc = ipa.main([
+        "--model", "tiny",
+        "--probe", str(probe_path),
+        "--initial-costs", str(costs_path),
+        "--formats", "INT8_W8A16,BF16",
+        "--target-bits", "16",
+        "--work-dir", str(work_dir),
+        "--output-dir", str(output_dir),
+        "--max-iters", "2",
+        "--convergence-frac", "-1",
+        "--l3-polish",
+    ])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.count("[l2] === iteration") == 2
+    assert "[l3] === polish ===" in out
+    assert "format histogram" in out
+
+    iteration_trace = output_dir / "iteration_trace.jsonl"
+    l3_trace = output_dir / "l3_polish_trace.jsonl"
+    assert iteration_trace.exists()
+    assert l3_trace.exists()
+    iter_lines = [json.loads(line) for line in iteration_trace.read_text().splitlines()]
+    l3_lines = [json.loads(line) for line in l3_trace.read_text().splitlines()]
+    assert len(iter_lines) == 2
+    assert len(l3_lines) == 1

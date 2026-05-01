@@ -9,6 +9,7 @@ weighted assignment change is small or when max_iters is reached.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pickle
 import tempfile
@@ -39,6 +40,8 @@ from prismaquant.perturbed_x_cache import (
     load_text_model_under_work_root,
 )
 from prismaquant.propagated_cost import (
+    L3UnsupportedTargetError,
+    assignment_bit_total,
     build_l3_candidates,
     measure_propagated_costs,
     select_l3_neighborhood,
@@ -263,6 +266,217 @@ def write_layer_config(assignment: Mapping[str, str], output_path: str | Path) -
         json.dump(payload, f, indent=2)
 
 
+def _emit(message: str) -> None:
+    print(message, flush=True)
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+
+
+def _assignment_digest(assignment: Mapping[str, str]) -> str:
+    payload = json.dumps(dict(sorted(assignment.items())), sort_keys=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _cuda_reset_peak() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _cuda_peak_gb() -> float | None:
+    if not torch.cuda.is_available():
+        return None
+    torch.cuda.synchronize()
+    peak = float(torch.cuda.max_memory_allocated()) / float(1024 ** 3)
+    torch.cuda.reset_peak_memory_stats()
+    return peak
+
+
+def _phase_start(label: str) -> float:
+    _cuda_reset_peak()
+    _emit(f"{label}: start")
+    return time.monotonic()
+
+
+def _phase_end(label: str, start: float) -> dict:
+    elapsed = time.monotonic() - start
+    peak_gb = _cuda_peak_gb()
+    suffix = f", cuda_peak={peak_gb:.2f}GB" if peak_gb is not None else ""
+    _emit(f"{label}: done in {elapsed:.1f}s{suffix}")
+    return {"elapsed_seconds": elapsed, "cuda_peak_gb": peak_gb}
+
+
+def _directory_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += child.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _human_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+    return f"{value:.1f}TB"
+
+
+def _format_histogram(
+    stats: Mapping[str, Mapping],
+    assignment: Mapping[str, str],
+    specs: list[fr.FormatSpec],
+    target_bits: float,
+) -> dict:
+    counts: dict[str, int] = {}
+    for fmt in assignment.values():
+        canonical = fr.canonical_format_name(fmt)
+        counts[canonical] = counts.get(canonical, 0) + 1
+    specs_by_name = {s.name: s for s in specs}
+    total_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in assignment
+        if name in stats
+    )
+    known_assignment = {
+        name: fmt
+        for name, fmt in assignment.items()
+        if fr.canonical_format_name(fmt) in specs_by_name
+    }
+    total_bits = assignment_bit_total(stats, known_assignment, specs_by_name)
+    achieved = total_bits / float(total_params) if total_params > 0 else 0.0
+    return {
+        "counts": dict(sorted(counts.items())),
+        "total": len(assignment),
+        "achieved_bpp": achieved,
+        "target_bpp": float(target_bits),
+    }
+
+
+def _ema_weights(history_len: int, decay: float) -> list[float]:
+    return [float(decay) ** age for age in range(history_len)]
+
+
+def _top_cost_changes(
+    previous: dict | None,
+    current: dict,
+    stats: dict,
+    *,
+    top_k: int = 5,
+) -> list[dict]:
+    if previous is None:
+        return []
+    changes = []
+    names = sorted(set(previous) | set(current))
+    for name in names:
+        fmts = sorted(set(previous.get(name, {})) | set(current.get(name, {})))
+        for fmt in fmts:
+            if fmt not in previous.get(name, {}) or fmt not in current.get(name, {}):
+                continue
+            old = cost_value(name, fmt, previous, stats)
+            new = cost_value(name, fmt, current, stats)
+            changes.append({
+                "name": name,
+                "format": fmt,
+                "old": old,
+                "new": new,
+                "delta": new - old,
+            })
+    changes.sort(key=lambda item: abs(item["delta"]), reverse=True)
+    return changes[:top_k]
+
+
+def _flip_details(
+    old: Mapping[str, str],
+    new: Mapping[str, str],
+    costs: dict,
+    stats: dict,
+    *,
+    top_k: int | None = 5,
+) -> list[dict]:
+    flips = []
+    for name in sorted(set(old) | set(new)):
+        old_fmt = old.get(name)
+        new_fmt = new.get(name)
+        if old_fmt is None or new_fmt is None or old_fmt == new_fmt:
+            continue
+        old_cost = cost_value(name, old_fmt, costs, stats)
+        new_cost = cost_value(name, new_fmt, costs, stats)
+        flips.append({
+            "name": name,
+            "from": old_fmt,
+            "to": new_fmt,
+            "old_cost": old_cost,
+            "new_cost": new_cost,
+            "delta": new_cost - old_cost,
+        })
+    flips.sort(key=lambda item: abs(item["delta"]), reverse=True)
+    return flips if top_k is None else flips[:top_k]
+
+
+def _weighted_hamming_detail(
+    old: Mapping[str, str],
+    new: Mapping[str, str],
+    costs: dict,
+    stats: dict,
+    *,
+    eps: float = 1e-12,
+) -> dict:
+    numerator = 0.0
+    for name in sorted(set(old) | set(new)):
+        old_fmt = old.get(name)
+        new_fmt = new.get(name)
+        if old_fmt is None or new_fmt is None or old_fmt == new_fmt:
+            continue
+        numerator += abs(
+            cost_value(name, old_fmt, costs, stats)
+            - cost_value(name, new_fmt, costs, stats)
+        )
+    denominator = sum(
+        cost_value(name, fmt, costs, stats)
+        for name, fmt in new.items()
+    )
+    return {
+        "numerator": numerator,
+        "denominator": denominator,
+        "ratio": numerator / max(denominator, eps),
+    }
+
+
+def _top_l2_formats(
+    name: str,
+    costs: dict,
+    stats: dict,
+    *,
+    top_k: int = 2,
+) -> list[dict]:
+    values = []
+    for fmt in sorted(costs.get(name, {})):
+        entry = costs.get(name, {}).get(fmt)
+        if not isinstance(entry, dict) or "error" in entry:
+            continue
+        values.append({
+            "format": fmt,
+            "cost": cost_value(name, fmt, costs, stats),
+        })
+    values.sort(key=lambda item: item["cost"])
+    return values[:top_k]
+
+
+def _normalised_disagreement(l2_cost: float, l3_cost: float) -> float:
+    denom = max(abs(l2_cost), abs(l3_cost), 1e-12)
+    return abs(l3_cost - l2_cost) / denom
+
+
 def build_l3_polish_summary(
     *,
     selected,
@@ -368,6 +582,7 @@ def _dtype_from_name(name: str) -> torch.dtype:
 
 
 def main(argv: list[str] | None = None) -> int:
+    total_wall_start = time.monotonic()
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--probe", required=True)
@@ -397,13 +612,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--l3-max-fraction", type=float, default=0.10)
     ap.add_argument("--l3-safety-fraction", type=float, default=0.02)
     ap.add_argument("--l3-max-lanes-per-batch", type=int, default=8)
+    ap.add_argument("--verbose", action="store_true",
+                    help="Print per-Linear per-format costs each iteration.")
     args = ap.parse_args(argv)
 
     work_root = Path(args.work_dir)
     output_root = Path(args.output_dir)
     work_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
+    iteration_trace_path = output_root / "iteration_trace.jsonl"
+    l3_trace_path = output_root / "l3_polish_trace.jsonl"
+    iteration_trace_path.write_text("")
+    l3_trace_path.write_text("")
 
+    probe_load_start = _phase_start("[init] probe load")
     with open(args.probe, "rb") as f:
         probe = pickle.load(f)
     with open(args.initial_costs, "rb") as f:
@@ -414,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
     current_costs = cost_payload["costs"]
     specs = [fr.get_format(s.strip()) for s in args.formats.split(",") if s.strip()]
     specs = sorted(specs, key=lambda s: s.effective_bits)
+    probe_load_timing = _phase_end("[init] probe load", probe_load_start)
 
     from transformers import AutoTokenizer
     from prismaquant.model_profiles import detect_profile, DefaultProfile
@@ -449,9 +672,15 @@ def main(argv: list[str] | None = None) -> int:
     latest_smoothed_costs = current_costs
     assignment_history: list[dict[str, str]] = [dict(assignment)]
     iteration_log: list[dict] = []
+    convergence_reached = False
 
     for iteration in range(1, int(args.max_iters) + 1):
+        _emit(f"[l2] === iteration {iteration}/{int(args.max_iters)} ===")
         cache_dir = output_root / f"activation_cache_iter_{iteration:02d}"
+        _emit(f"[l2] iteration {iteration}: building perturbed cache at {cache_dir}")
+        cache_start = _phase_start(
+            f"[l2] iteration {iteration}: perturbed-cache build at {cache_dir}"
+        )
         capture_manifest = capture_perturbed_activation_cache(
             model,
             assignment,
@@ -460,10 +689,21 @@ def main(argv: list[str] | None = None) -> int:
             input_rows=args.input_rows,
             profile=profile,
         )
+        cache_timing = _phase_end(
+            f"[l2] iteration {iteration}: perturbed-cache build",
+            cache_start,
+        )
+        cache_bytes = _directory_size_bytes(cache_dir)
+        _emit(
+            f"[l2] iteration {iteration}: activation cache size "
+            f"{_human_bytes(cache_bytes)}"
+        )
         act_cache = ActivationIndex(cache_dir, stats.keys())
         target_names = set(stats.keys())
         missing_act = [n for n in target_names if n not in act_cache]
         cost_path = output_root / f"costs_iter_{iteration:02d}.pkl"
+        previous_costs = cost_history[-1] if cost_history else None
+        cost_start = _phase_start(f"[l2] iteration {iteration}: cost step")
         measured_costs = run_cost_pass(
             model,
             act_cache,
@@ -479,6 +719,24 @@ def main(argv: list[str] | None = None) -> int:
             str(cost_path),
             h_detail_dir=args.h_detail_dir,
         )
+        cost_timing = _phase_end(
+            f"[l2] iteration {iteration}: cost step",
+            cost_start,
+        )
+        measured_linears = len(measured_costs)
+        _emit(
+            f"[l2] iteration {iteration}: cost step done in "
+            f"{cost_timing['elapsed_seconds']:.1f}s, measured "
+            f"{measured_linears} Linears"
+        )
+        if args.verbose:
+            for name in sorted(measured_costs):
+                for fmt in sorted(measured_costs.get(name, {})):
+                    value = cost_value(name, fmt, measured_costs, stats)
+                    _emit(
+                        f"[l2] iteration {iteration}: cost "
+                        f"{name} {fmt}={value:.6g}"
+                    )
         cost_history.append(measured_costs)
         smoothed_costs = smooth_cost_history(cost_history, decay=args.ema_decay)
         latest_smoothed_costs = smoothed_costs
@@ -493,6 +751,7 @@ def main(argv: list[str] | None = None) -> int:
                 profile=profile,
             )
 
+        solve_start = _phase_start(f"[l2] iteration {iteration}: allocator solve")
         next_assignment = _solve(smoothed_costs)
         cycle_mode = "none"
         if len(assignment_history) >= 2:
@@ -513,13 +772,77 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
             next_assignment = maybe
+        solve_timing = _phase_end(
+            f"[l2] iteration {iteration}: allocator solve",
+            solve_start,
+        )
 
-        flip_frac = weighted_hamming_fraction(
+        hamming = _weighted_hamming_detail(
             assignment,
             next_assignment,
             smoothed_costs,
-            stats=stats,
+            stats,
         )
+        flip_frac = hamming["ratio"]
+        histogram = _format_histogram(stats, next_assignment, specs, args.target_bits)
+        top_changes = _top_cost_changes(
+            previous_costs,
+            measured_costs,
+            stats,
+            top_k=5,
+        )
+        flips = _flip_details(
+            assignment,
+            next_assignment,
+            smoothed_costs,
+            stats,
+            top_k=5,
+        )
+        ema_weights = _ema_weights(len(cost_history), args.ema_decay)
+        assignment_hash_short = _assignment_digest(next_assignment)
+        _emit(
+            f"[l2] iteration {iteration}: format histogram "
+            f"{histogram['counts']} total={histogram['total']} "
+            f"achieved_bpp={histogram['achieved_bpp']:.4f} "
+            f"target_bpp={histogram['target_bpp']:.4f}"
+        )
+        if top_changes:
+            rendered = [
+                f"({item['name']}, {item['format']}) old={item['old']:.4g} "
+                f"new={item['new']:.4g} delta={item['delta']:.4g}"
+                for item in top_changes
+            ]
+            _emit(f"[l2] iteration {iteration}: top cost changes {rendered}")
+        else:
+            _emit(f"[l2] iteration {iteration}: top cost changes []")
+        if flips:
+            rendered_flips = [
+                f"({item['name']}, {item['from']}->{item['to']})"
+                for item in flips
+            ]
+            _emit(f"[l2] iteration {iteration}: top flips {rendered_flips}")
+        else:
+            _emit(f"[l2] iteration {iteration}: top flips []")
+        _emit(
+            f"[l2] iteration {iteration}: EMA weights newest-first "
+            f"{[round(w, 6) for w in ema_weights]}"
+        )
+        _emit(
+            f"[l2] iteration {iteration}: cycle assignment_hash="
+            f"{assignment_hash_short}, cycle_mode={cycle_mode}"
+        )
+        _emit(
+            f"[l2] iteration {iteration}: weighted_hamming "
+            f"numerator={hamming['numerator']:.6g}, "
+            f"denominator={hamming['denominator']:.6g}, "
+            f"ratio={flip_frac:.4f}, threshold={args.convergence_frac:.4f}"
+        )
+        verdict = "converged" if flip_frac <= args.convergence_frac else "continuing"
+        _emit(
+            f"[l2] iteration {iteration}: weighted_hamming={flip_frac:.4f}, "
+            f"cycle_mode={cycle_mode}"
+        )
+        _emit(f"[l2] iteration {iteration}: {verdict}")
         iteration_log.append(
             {
                 "iteration": iteration,
@@ -530,16 +853,43 @@ def main(argv: list[str] | None = None) -> int:
                 "assignment_hash": list(assignment_hash(next_assignment)),
             }
         )
+        _append_jsonl(
+            iteration_trace_path,
+            {
+                "iteration": iteration,
+                "cache_dir": str(cache_dir),
+                "cache_size_bytes": cache_bytes,
+                "cost_path": str(cost_path),
+                "format_histogram": histogram,
+                "top_cost_changes": top_changes,
+                "top_flips": flips,
+                "ema_weights_newest_first": ema_weights,
+                "hamming": hamming,
+                "cycle_mode": cycle_mode,
+                "assignment_hash": assignment_hash_short,
+                "timing": {
+                    "cache": cache_timing,
+                    "cost": cost_timing,
+                    "solve": solve_timing,
+                },
+            },
+        )
         assignment = dict(next_assignment)
         assignment_history.append(dict(assignment))
-        if flip_frac <= args.convergence_frac:
+        if verdict == "converged":
+            convergence_reached = True
             break
 
     l3_summary_path = None
+    l3_cost_path = None
+    l3_flip_count = 0
+    l3_kl_improvement_pct = None
     if args.l3_polish:
+        _emit("[l3] === polish ===")
         # Per-iteration L3 can reuse this path later; only final polish is
         # exposed because each propagated measurement is a full forward pass.
         l2_assignment = dict(assignment)
+        kl_before_start = _phase_start("[l3] validation KL before")
         kl_before = measure_assignment_kl(
             model,
             l2_assignment,
@@ -548,17 +898,73 @@ def main(argv: list[str] | None = None) -> int:
             work_root=work_root,
             profile=profile,
         )
-        selected = select_l3_neighborhood(
-            stats,
-            latest_smoothed_costs,
-            l2_assignment,
-            specs,
-            uncertainty_rel_tol=args.l3_uncertainty_rel_tol,
-            min_fraction=args.l3_min_fraction,
-            max_fraction=args.l3_max_fraction,
-            safety_fraction=args.l3_safety_fraction,
+        kl_before_timing = _phase_end(
+            "[l3] validation KL before",
+            kl_before_start,
         )
+        selection_start = _phase_start("[l3] selection")
+        try:
+            selected = select_l3_neighborhood(
+                stats,
+                latest_smoothed_costs,
+                l2_assignment,
+                specs,
+                uncertainty_rel_tol=args.l3_uncertainty_rel_tol,
+                min_fraction=args.l3_min_fraction,
+                max_fraction=args.l3_max_fraction,
+                safety_fraction=args.l3_safety_fraction,
+            )
+        except L3UnsupportedTargetError as exc:
+            _emit(f"[l3] ERROR: packed experts present in L3 selection: {exc}")
+            raise
+        selection_timing = _phase_end("[l3] selection", selection_start)
+        n_uncertain = sum(1 for entry in selected if "uncertain" in entry.reasons)
+        n_safety = sum(1 for entry in selected if "high_l2_cost" in entry.reasons)
+        n_total = len(set(stats) & set(l2_assignment))
+        _emit(
+            f"[l3] selection details: uncertain {n_uncertain} "
+            f"(margin threshold {args.l3_uncertainty_rel_tol:.2f}), "
+            f"safety includes {n_safety}, total selected {len(selected)} "
+            f"from {n_total} Linears"
+        )
+        _emit(f"[l3] selecting neighborhood: {len(selected)} candidates")
+        for entry in selected:
+            if "uncertain" not in entry.reasons:
+                continue
+            top2 = _top_l2_formats(entry.name, latest_smoothed_costs, stats)
+            _emit(
+                f"[l3] uncertain {entry.name}: top2={top2} "
+                f"margin={entry.margin:.6g} reasons={list(entry.reasons)}"
+            )
         l3_measure_start = time.monotonic()
+        l3_lane_count = sum(
+            len([fmt for fmt in entry.formats if fmt != "BF16"]) + 1
+            for entry in selected
+        )
+        avg_formats = (
+            sum(len(entry.formats) for entry in selected) / float(len(selected))
+            if selected else 0.0
+        )
+        _emit(
+            f"[l3] measuring propagated costs: {len(selected)} candidates x "
+            f"{avg_formats:.2f} formats = {l3_lane_count} total lanes"
+        )
+
+        def _l3_progress(event: dict) -> None:
+            if event.get("event") == "depth_group_start":
+                _emit(
+                    f"[l3] depth group {event['group_index']}/"
+                    f"{event['group_count']} {event['group']}: start "
+                    f"entries={event['entry_count']} lanes={event['lane_count']}"
+                )
+            elif event.get("event") == "depth_group_end":
+                _emit(
+                    f"[l3] depth group {event['group_index']}/"
+                    f"{event['group_count']} {event['group']}: done in "
+                    f"{event['elapsed_seconds']:.1f}s"
+                )
+
+        _cuda_reset_peak()
         l3_costs = measure_propagated_costs(
             model,
             l2_assignment,
@@ -568,8 +974,16 @@ def main(argv: list[str] | None = None) -> int:
             work_root=work_root,
             profile=profile,
             max_lanes_per_batch=args.l3_max_lanes_per_batch,
+            progress_callback=_l3_progress,
         )
         l3_elapsed_seconds = time.monotonic() - l3_measure_start
+        l3_peak_gb = _cuda_peak_gb()
+        suffix = f", cuda_peak={l3_peak_gb:.2f}GB" if l3_peak_gb is not None else ""
+        _emit(f"[l3] measurement done in {l3_elapsed_seconds:.1f}s{suffix}")
+        l3_measure_timing = {
+            "elapsed_seconds": l3_elapsed_seconds,
+            "cuda_peak_gb": l3_peak_gb,
+        }
         l3_cost_path = output_root / "l3_propagated_costs.pkl"
         with open(l3_cost_path, "wb") as f:
             pickle.dump(
@@ -585,6 +999,42 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 f,
             )
+        amplifications = []
+        for name in sorted(l3_costs):
+            for fmt in sorted(l3_costs.get(name, {})):
+                entry = l3_costs[name][fmt]
+                if not isinstance(entry, dict):
+                    continue
+                if "error" in entry:
+                    _emit(f"[l3] metric {name} {fmt}: error={entry['error']}")
+                    continue
+                l3_value = float(entry.get("propagated_end_kl", 0.0))
+                output_mse = float(entry.get("downstream_output_mse", 0.0))
+                l2_value = cost_value(name, fmt, latest_smoothed_costs, stats)
+                disagreement = _normalised_disagreement(l2_value, l3_value)
+                _emit(
+                    f"[l3] metric {name} {fmt}: propagated_end_kl="
+                    f"{l3_value:.6g}, downstream_output_mse={output_mse:.6g}, "
+                    f"l3_l2_disagreement={disagreement:.6g}"
+                )
+                if abs(l2_value) > 1e-12 and fmt != "BF16":
+                    amplifications.append({
+                        "name": name,
+                        "format": fmt,
+                        "l2_cost": l2_value,
+                        "l3_cost": l3_value,
+                        "amplification": l3_value / l2_value,
+                    })
+        amplifications.sort(
+            key=lambda item: item["amplification"],
+            reverse=True,
+        )
+        for item in amplifications[:10]:
+            _emit(
+                f"[l3] amplification ({item['name']}, {item['format']}) "
+                f"L2_cost={item['l2_cost']:.6g} L3_cost={item['l3_cost']:.6g} "
+                f"amplification={item['amplification']:.6g}"
+            )
         l3_candidates = build_l3_candidates(stats, l3_costs, specs)
         current_fmt_by_name = {
             name: l2_assignment[name]
@@ -596,6 +1046,43 @@ def main(argv: list[str] | None = None) -> int:
             for name, cands in l3_candidates.items()
             if any(c.fmt == current_fmt_by_name.get(name) for c in cands)
         }
+        total_params = sum(
+            int(stats[name].get("n_params", 0) or 0)
+            for name in set(stats) & set(l2_assignment)
+        )
+        open_names = set(l3_candidates)
+        frozen_assignment = {
+            name: l2_assignment[name]
+            for name in sorted((set(stats) & set(l2_assignment)) - open_names)
+        }
+        frozen_bits = assignment_bit_total(
+            stats,
+            frozen_assignment,
+            {s.name: s for s in specs},
+        )
+        target_total_bits = float(args.target_bits) * float(total_params)
+        open_params = sum(
+            int(stats[name].get("n_params", 0) or 0)
+            for name in open_names
+        )
+        remaining_bpp = (
+            (target_total_bits - frozen_bits) / float(open_params)
+            if open_params > 0 else 0.0
+        )
+        frozen_bpp_total = (
+            frozen_bits / float(total_params)
+            if total_params > 0 else 0.0
+        )
+        _emit(
+            f"[l3] solving frozen DP: open={len(open_names)}, "
+            f"frozen={len(frozen_assignment)}, remaining_bpp={remaining_bpp:.4f}"
+        )
+        _emit(
+            f"[l3] frozen DP detail: frozen {len(frozen_assignment)} "
+            f"({frozen_bpp_total:.4f} bpp total), open {len(open_names)}, "
+            f"remaining_bpp {remaining_bpp:.4f}"
+        )
+        frozen_solve_start = _phase_start("[l3] frozen DP solve")
         if l3_candidates:
             polished_assignment, _chosen = solve_frozen_l3_neighborhood(
                 stats,
@@ -607,6 +1094,43 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             polished_assignment = dict(l2_assignment)
+        frozen_solve_timing = _phase_end(
+            "[l3] frozen DP solve",
+            frozen_solve_start,
+        )
+        l3_all_flips = []
+        for name in sorted(set(l2_assignment) | set(polished_assignment)):
+            old_fmt = l2_assignment.get(name)
+            new_fmt = polished_assignment.get(name)
+            if old_fmt is None or new_fmt is None or old_fmt == new_fmt:
+                continue
+            per_name = l3_costs.get(name, {})
+            old_cost = per_name.get(old_fmt, {}).get("propagated_end_kl")
+            new_cost = per_name.get(new_fmt, {}).get("propagated_end_kl")
+            if old_cost is None or new_cost is None:
+                delta = 0.0
+            else:
+                delta = float(new_cost) - float(old_cost)
+            l3_all_flips.append({
+                "name": name,
+                "from": old_fmt,
+                "to": new_fmt,
+                "old_cost": old_cost,
+                "new_cost": new_cost,
+                "delta": delta,
+            })
+        l3_flip_count = len(l3_all_flips)
+        _emit(f"[l3] polish: {l3_flip_count} flips out of {len(selected)}")
+        for item in sorted(
+            l3_all_flips,
+            key=lambda row: abs(row["delta"]),
+            reverse=True,
+        )[:20]:
+            _emit(
+                f"[l3] flip {item['name']} {item['from']}->{item['to']} "
+                f"L3_delta={item['delta']:.6g}"
+            )
+        kl_after_start = _phase_start("[l3] validation KL after")
         kl_after = measure_assignment_kl(
             model,
             polished_assignment,
@@ -614,6 +1138,17 @@ def main(argv: list[str] | None = None) -> int:
             ref_log_probs,
             work_root=work_root,
             profile=profile,
+        )
+        kl_after_timing = _phase_end("[l3] validation KL after", kl_after_start)
+        regression = bool(float(kl_after) > float(kl_before))
+        l3_kl_improvement_pct = (
+            (float(kl_before) - float(kl_after)) / abs(float(kl_before)) * 100.0
+            if abs(float(kl_before)) > 1e-12 else 0.0
+        )
+        _emit(
+            f"[l3] validating: KL_before={kl_before:.4e}, "
+            f"KL_after={kl_after:.4e}, regression={str(regression).lower()}, "
+            f"improvement={l3_kl_improvement_pct:.2f}%"
         )
         l3_summary = build_l3_polish_summary(
             selected=selected,
@@ -625,9 +1160,45 @@ def main(argv: list[str] | None = None) -> int:
             elapsed_seconds=l3_elapsed_seconds,
         )
         l3_summary["cost_path"] = str(l3_cost_path)
+        l3_summary["timing"] = {
+            "kl_before": kl_before_timing,
+            "selection": selection_timing,
+            "measurement": l3_measure_timing,
+            "frozen_solve": frozen_solve_timing,
+            "kl_after": kl_after_timing,
+        }
         l3_summary_path = output_root / "l3_polish_summary.json"
         with open(l3_summary_path, "w") as f:
             json.dump(l3_summary, f, indent=2)
+        for entry in selected:
+            per_name = l3_costs.get(entry.name, {})
+            propagated = {}
+            downstream = {}
+            disagreements = {}
+            for fmt, cost_entry in per_name.items():
+                if not isinstance(cost_entry, dict) or "error" in cost_entry:
+                    continue
+                l3_value = float(cost_entry.get("propagated_end_kl", 0.0))
+                propagated[fmt] = l3_value
+                downstream[fmt] = float(cost_entry.get("downstream_output_mse", 0.0))
+                l2_value = cost_value(entry.name, fmt, latest_smoothed_costs, stats)
+                disagreements[fmt] = _normalised_disagreement(l2_value, l3_value)
+            _append_jsonl(
+                l3_trace_path,
+                {
+                    "name": entry.name,
+                    "format_candidates": list(entry.formats),
+                    "propagated_end_kl": propagated,
+                    "downstream_output_mse": downstream,
+                    "l2_disagreement": disagreements,
+                    "accepted_flip": (
+                        l2_assignment.get(entry.name)
+                        != polished_assignment.get(entry.name)
+                    ),
+                    "from": l2_assignment.get(entry.name),
+                    "to": polished_assignment.get(entry.name),
+                },
+            )
         assignment = dict(polished_assignment)
 
     final_assignment_path = output_root / "final_assignment.json"
@@ -640,11 +1211,34 @@ def main(argv: list[str] | None = None) -> int:
         "final_assignment": str(final_assignment_path),
         "final_layer_config": str(final_layer_config),
         "target_bits": args.target_bits,
+        "converged": convergence_reached,
+        "probe_load_timing": probe_load_timing,
+        "iteration_trace": str(iteration_trace_path),
     }
     if l3_summary_path is not None:
         summary["l3_polish_summary"] = str(l3_summary_path)
+        summary["l3_polish_trace"] = str(l3_trace_path)
     with open(output_root / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+    total_wall = time.monotonic() - total_wall_start
+    _emit("===== summary =====")
+    _emit(f"L2 iterations: {len(iteration_log)}")
+    _emit(f"Converged: {str(convergence_reached).lower()}")
+    if args.l3_polish:
+        improvement = (
+            f"{l3_kl_improvement_pct:.2f}%"
+            if l3_kl_improvement_pct is not None else "n/a"
+        )
+        _emit(f"L3 flips: {l3_flip_count}")
+        _emit(f"KL improvement: {improvement}")
+    _emit(f"Total wall time: {total_wall:.1f}s")
+    _emit(f"Summary manifest: {output_root / 'summary.json'}")
+    _emit(f"Iteration trace: {iteration_trace_path}")
+    if l3_summary_path is not None:
+        _emit(f"L3 summary: {l3_summary_path}")
+        _emit(f"L3 trace: {l3_trace_path}")
+        _emit(f"L3 costs: {l3_cost_path}")
+    _emit("===================")
     return 0
 
 

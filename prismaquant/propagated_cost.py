@@ -11,9 +11,10 @@ import math
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 import torch
 import torch.nn as nn
@@ -737,6 +738,7 @@ def measure_propagated_costs(
     profile=None,
     max_lanes_per_batch: int = 8,
     output_mse_names: list[str] | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> dict[str, dict[str, dict]]:
     """Measure paired end-KL and downstream output-MSE for L3 candidates.
 
@@ -767,7 +769,22 @@ def measure_propagated_costs(
     cal_hash = calibration_data_hash(calibration_data)
     tmp_parent = str(work_root) if work_root is not None else None
 
-    for _group_key, group_entries in _group_neighborhood_by_depth(neighborhood):
+    depth_groups = _group_neighborhood_by_depth(neighborhood)
+    for group_index, (group_key, group_entries) in enumerate(depth_groups, start=1):
+        group_start = time.monotonic()
+        group_lane_count = sum(
+            len(_lane_specs_for_entries([entry]))
+            for entry in group_entries
+        )
+        if progress_callback is not None:
+            progress_callback({
+                "event": "depth_group_start",
+                "group": group_key,
+                "group_index": group_index,
+                "group_count": len(depth_groups),
+                "entry_count": len(group_entries),
+                "lane_count": group_lane_count,
+            })
         for lanes in _lane_microbatches_for_entries(
             group_entries,
             max_lanes_per_batch,
@@ -877,5 +894,15 @@ def measure_propagated_costs(
             finally:
                 context_hooks.remove()
                 shutil.rmtree(cache_dir, ignore_errors=True)
+        if progress_callback is not None:
+            progress_callback({
+                "event": "depth_group_end",
+                "group": group_key,
+                "group_index": group_index,
+                "group_count": len(depth_groups),
+                "entry_count": len(group_entries),
+                "lane_count": group_lane_count,
+                "elapsed_seconds": time.monotonic() - group_start,
+            })
 
     return results
