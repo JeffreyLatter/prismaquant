@@ -730,6 +730,118 @@ def test_multi_budget_reanchor_runs_full_l2_l3(tmp_path, monkeypatch):
     assert calls == {"l2": 3, "l3": 3}
 
 
+def test_multi_budget_anchor_l3_passes_progress_callback(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    stats = {"layer": _tiny_stat()}
+    costs = {
+        "layer": {
+            "INT8_W8A16": {"predicted_dloss": 0.0},
+            "BF16": {"predicted_dloss": 1.0},
+        }
+    }
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    runtime = ipa.BudgetRuntime(
+        work_root=tmp_path / "work",
+        output_root=tmp_path / "out",
+        stats=stats,
+        current_costs=costs,
+        specs=specs,
+        profile=None,
+        model=_TinyLogitsModel(),
+        calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        l3_calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        ref_log_probs=[],
+        dtype=torch.bfloat16,
+        probe_load_timing={},
+    )
+    args = SimpleNamespace(
+        initial_config=None,
+        max_iters=1,
+        input_rows=None,
+        model="tiny",
+        probe="probe",
+        device="cpu",
+        cost_mode="mse",
+        chunk_size=1,
+        h_detail_dir=None,
+        ema_decay=0.5,
+        convergence_frac=1.0,
+        bit_precision=0.001,
+        l3_max_lanes_per_batch=14,
+        l3_tail_only=False,
+    )
+    entry = L3NeighborhoodEntry(
+        name="layer",
+        current_format="INT8_W8A16",
+        formats=("INT8_W8A16", "BF16"),
+        margin=0.0,
+        l2_current_cost=0.0,
+        reasons=("global",),
+    )
+    captured = {"callback_present": False}
+
+    def _capture(_model, _assignment, _calib_ids, cache_dir, **_kwargs):
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        return {"cache_dir": str(cache_dir)}
+
+    class _ActivationIndex:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __contains__(self, _name):
+            return True
+
+    def _measure(_model, _assignment, _selected, *_args, **kwargs):
+        progress_callback = kwargs.get("progress_callback")
+        captured["callback_present"] = progress_callback is not None
+        progress_callback({
+            "event": "depth_group_start",
+            "group": "layers.20.self_attn.q_proj",
+            "group_index": 5,
+            "group_count": 36,
+            "entry_count": 7,
+            "lane_count": 14,
+            "mode": "batched",
+        })
+        progress_callback({
+            "event": "depth_group_end",
+            "group": "layers.20.self_attn.q_proj",
+            "group_index": 5,
+            "group_count": 36,
+            "entry_count": 7,
+            "lane_count": 14,
+            "elapsed_seconds": 12.34,
+        })
+        return {"layer": {"INT8_W8A16": {"propagated_end_kl": 0.0}}}
+
+    monkeypatch.setattr(ipa, "capture_perturbed_activation_cache", _capture)
+    monkeypatch.setattr(ipa, "ActivationIndex", _ActivationIndex)
+    monkeypatch.setattr(ipa, "run_cost_pass", lambda *_args, **_kwargs: costs)
+    monkeypatch.setattr(ipa, "solve_from_costs", lambda *_args, **_kwargs: {
+        "layer": "INT8_W8A16",
+    })
+    monkeypatch.setattr(ipa, "measure_assignment_kl", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(ipa, "build_global_l3_neighborhood", lambda *_args: [entry])
+    monkeypatch.setattr(ipa, "build_l3_candidates", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ipa, "measure_propagated_costs", _measure)
+
+    ipa.run_anchor_budget(args, runtime, 4.5)
+
+    out = capsys.readouterr().out
+    assert captured["callback_present"] is True
+    assert (
+        "[multi][l3] anchor 4.50: depth group 5/36 "
+        "layers.20.self_attn.q_proj: start entries=7 lanes=14 mode=batched"
+    ) in out
+    assert (
+        "[multi][l3] anchor 4.50: depth group 5/36 "
+        "layers.20.self_attn.q_proj: done in 12.3s"
+    ) in out
+
+
 def test_multi_budget_widens_format_filter(tmp_path, monkeypatch):
     specs = [
         ipa.fr.get_format(name)

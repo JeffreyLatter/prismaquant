@@ -274,6 +274,29 @@ def _emit(message: str) -> None:
     print(message, flush=True)
 
 
+def _make_l3_progress(
+    emit: Callable[[str], None],
+    *,
+    prefix: str = "[l3]",
+) -> Callable[[dict], None]:
+    def _l3_progress(event: dict) -> None:
+        if event.get("event") == "depth_group_start":
+            emit(
+                f"{prefix} depth group {event['group_index']}/"
+                f"{event['group_count']} {event['group']}: start "
+                f"entries={event['entry_count']} lanes={event['lane_count']} "
+                f"mode={event.get('mode', 'unknown')}"
+            )
+        elif event.get("event") == "depth_group_end":
+            emit(
+                f"{prefix} depth group {event['group_index']}/"
+                f"{event['group_count']} {event['group']}: done in "
+                f"{event['elapsed_seconds']:.1f}s"
+            )
+
+    return _l3_progress
+
+
 def _append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
@@ -1022,6 +1045,10 @@ def run_anchor_budget(
         profile=runtime.profile,
         max_lanes_per_batch=args.l3_max_lanes_per_batch,
         tail_only=args.l3_tail_only,
+        progress_callback=_make_l3_progress(
+            _emit,
+            prefix=f"[multi][l3] anchor {anchor_label}:",
+        ),
     )
     l3_cost_path = anchor_dir / "l3_propagated_costs.pkl"
     with open(l3_cost_path, "wb") as f:
@@ -1949,21 +1976,6 @@ def main(argv: list[str] | None = None) -> int:
             f"{avg_formats:.2f} formats = {l3_lane_count} total lanes"
         )
 
-        def _l3_progress(event: dict) -> None:
-            if event.get("event") == "depth_group_start":
-                _emit(
-                    f"[l3] depth group {event['group_index']}/"
-                    f"{event['group_count']} {event['group']}: start "
-                    f"entries={event['entry_count']} lanes={event['lane_count']} "
-                    f"mode={event.get('mode', 'unknown')}"
-                )
-            elif event.get("event") == "depth_group_end":
-                _emit(
-                    f"[l3] depth group {event['group_index']}/"
-                    f"{event['group_count']} {event['group']}: done in "
-                    f"{event['elapsed_seconds']:.1f}s"
-                )
-
         _cuda_reset_peak()
         l3_costs = measure_propagated_costs(
             model,
@@ -1975,7 +1987,7 @@ def main(argv: list[str] | None = None) -> int:
             profile=profile,
             max_lanes_per_batch=args.l3_max_lanes_per_batch,
             tail_only=args.l3_tail_only,
-            progress_callback=_l3_progress,
+            progress_callback=_make_l3_progress(_emit),
         )
         l3_elapsed_seconds = time.monotonic() - l3_measure_start
         l3_peak_gb = _cuda_peak_gb()
