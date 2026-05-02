@@ -300,6 +300,6 @@ def nvfp4_fused_aw_matmul(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         num_warps=4,
-        num_stages=3,
+        num_stages=2,
     )
     return out
