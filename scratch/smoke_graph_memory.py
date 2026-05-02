@@ -8,6 +8,14 @@ local_files_only=True.
 from __future__ import annotations
 
 import os
+
+# CUBLAS_WORKSPACE_CONFIG must be set BEFORE the first CUDA init for
+# torch.use_deterministic_algorithms(True) to avoid NaN in cuBLAS matmuls
+# (e.g. Qwen3RotaryEmbedding's freqs = inv_freq @ position_ids). Setting
+# it later (in _pin_rng) is a no-op because importing prismaquant.kernels
+# already initialized CUDA via the Triton warmup.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import random
 import shutil
 import sys
@@ -66,15 +74,20 @@ def _set_smoke_env() -> None:
 
 
 def _pin_rng(seed: int) -> None:
-    # Note: torch.use_deterministic_algorithms(True) was tried here but
-    # produces NaN with the fused NVFP4 Triton kernel. Seeding alone is
-    # enough to give bit-identical coord descent decisions across
-    # shared-vs-private graph pool runs.
+    # CUBLAS_WORKSPACE_CONFIG is also set at module top so it precedes CUDA
+    # init when the smoke is run as a script. Re-set here so callers using
+    # _pin_rng standalone also get the workspace config — the setdefault is
+    # a no-op when the value is already in env.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if os.environ.get("PRISMAQUANT_SMOKE_DETERMINISM", "0") not in {"0", "false", "no"}:
+        # Opt-in: torch.use_deterministic_algorithms can produce NaN with
+        # PrismaClade's perturbation pipeline; root cause not yet isolated.
+        # Default OFF so the smoke runs cleanly.
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _load_local_model():
