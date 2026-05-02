@@ -1545,11 +1545,28 @@ def _downstream_names_for_group(
 
 def _lane_specs_for_entries(
     entries: list[L3NeighborhoodEntry],
+    *,
+    include_baseline: bool = True,
 ) -> list[_LaneSpec]:
     lanes: list[_LaneSpec] = []
     for entry in entries:
-        candidate_fmts = [fmt for fmt in entry.formats if fmt != "BF16"]
+        candidate_fmts = [
+            fr.canonical_format_name(fmt)
+            for fmt in entry.formats
+            if not include_baseline or fr.canonical_format_name(fmt) != "BF16"
+        ]
         if not candidate_fmts:
+            continue
+        if not include_baseline:
+            for fmt in candidate_fmts:
+                lanes.append(
+                    _LaneSpec(
+                        name=entry.name,
+                        fmt=fmt,
+                        baseline_index=None,
+                        is_baseline=False,
+                    )
+                )
             continue
         baseline_idx = len(lanes)
         lanes.append(
@@ -1575,12 +1592,17 @@ def _lane_specs_for_entries(
 def _lane_microbatches_for_entries(
     entries: list[L3NeighborhoodEntry],
     max_lanes_per_batch: int,
+    *,
+    include_baseline: bool = True,
 ) -> list[list[_LaneSpec]]:
     batches: list[list[_LaneSpec]] = []
     current: list[_LaneSpec] = []
     max_lanes = max(int(max_lanes_per_batch), 1)
     for entry in entries:
-        entry_lanes = _lane_specs_for_entries([entry])
+        entry_lanes = _lane_specs_for_entries(
+            [entry],
+            include_baseline=include_baseline,
+        )
         if not entry_lanes:
             continue
         if current and len(current) + len(entry_lanes) > max_lanes:
@@ -1593,6 +1615,36 @@ def _lane_microbatches_for_entries(
     if current:
         batches.append(current)
     return batches
+
+
+def _specs_by_canonical_name(format_names: set[str]) -> dict[str, fr.FormatSpec]:
+    specs_by_name: dict[str, fr.FormatSpec] = {}
+    for fmt in sorted(format_names):
+        canonical = fr.canonical_format_name(fmt)
+        if canonical == "BF16":
+            continue
+        spec = fr.get_format(canonical)
+        specs_by_name[spec.name] = spec
+        specs_by_name[canonical] = spec
+        for alias in fr.aliases_for(spec.name):
+            specs_by_name[alias] = spec
+    return specs_by_name
+
+
+def _entries_for_candidate_flips(
+    candidate_flips: list[tuple[str, str]],
+    assignment: Mapping[str, str],
+) -> list[L3NeighborhoodEntry]:
+    return [
+        L3NeighborhoodEntry(
+            name=str(name),
+            current_format=assignment.get(str(name), "BF16"),
+            formats=(fr.canonical_format_name(fmt),),
+            margin=0.0,
+            l2_current_cost=0.0,
+        )
+        for name, fmt in candidate_flips
+    ]
 
 
 def _cuda_graph_lane_count(lane_count: int) -> int:
@@ -1683,6 +1735,196 @@ def _output_mse_names_reach_tail(
         if depth is None or depth > group_depth:
             return True
     return False
+
+
+@torch.no_grad()
+def measure_lane_batched_kl_deltas(
+    model: nn.Module,
+    baseline_assignment: Mapping[str, str],
+    candidate_flips: list[tuple[str, str]],
+    calib_ids: torch.Tensor,
+    ref_log_probs: list[torch.Tensor],
+    *,
+    work_root: Path,
+    max_lanes_per_batch: int = 64,
+    profile=None,
+) -> list[float]:
+    """Measure end-KL for each candidate flip applied to baseline_assignment.
+
+    Each lane is one ``(Linear, format)`` override. Lanes may target different
+    Linear modules; target hooks apply the candidate format for the matching
+    lane and the baseline assignment for all other target modules in that lane.
+    """
+    if not candidate_flips:
+        return []
+
+    assignment_c = _canonical_assignment(baseline_assignment)
+    flips = [
+        (str(name), fr.canonical_format_name(fmt))
+        for name, fmt in candidate_flips
+    ]
+    format_names = set(assignment_c.values()) | {fmt for _name, fmt in flips}
+    specs_by_name = _specs_by_canonical_name(format_names)
+
+    device = next(model.parameters()).device
+    requested_max_lanes_per_batch = max(int(max_lanes_per_batch), 1)
+    max_lanes_per_batch = _adjust_l3_max_lanes_for_memory(
+        requested_max_lanes_per_batch,
+        calib_ids,
+        device,
+    )
+    entries = _entries_for_candidate_flips(flips, assignment_c)
+    batches = _lane_microbatches_for_entries(
+        entries,
+        max_lanes_per_batch,
+        include_baseline=False,
+    )
+    cal_hash = calibration_data_hash(calib_ids)
+    tmp_parent = str(work_root) if work_root is not None else None
+    use_prequant_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_PREQUANT_CACHE",
+        default=True,
+    )
+    use_frozen_perturbed_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
+        default=True,
+    )
+    rng_devices = []
+    if device.type == "cuda" and torch.cuda.is_available():
+        rng_devices = [
+            device.index if device.index is not None else torch.cuda.current_device()
+        ]
+
+    measured: list[float] = []
+    for lanes in batches:
+        if not lanes:
+            continue
+        target_names = {lane.name for lane in lanes}
+        context_assignment = {
+            name: fmt
+            for name, fmt in assignment_c.items()
+            if name not in target_names
+        }
+        cache_entries = [
+            L3NeighborhoodEntry(
+                name=name,
+                current_format=assignment_c.get(name, "BF16"),
+                formats=tuple(
+                    sorted({
+                        assignment_c.get(name, "BF16"),
+                        *[
+                            lane.fmt
+                            for lane in lanes
+                            if lane.name == name
+                        ],
+                    })
+                ),
+                margin=0.0,
+                l2_current_cost=0.0,
+            )
+            for name in sorted(target_names)
+        ]
+        group_quant_cache = (
+            build_quant_weight_cache(
+                model,
+                cache_entries,
+                list({id(spec): spec for spec in specs_by_name.values()}.values()),
+            )
+            if use_prequant_cache
+            else None
+        )
+        cache_dir = Path(tempfile.mkdtemp(
+            prefix="prismaquant_coord_lanes_",
+            dir=tmp_parent,
+        ))
+        context_hooks = PerturbedActivationCache(
+            model,
+            context_assignment,
+            cache_dir,
+            input_rows=0,
+            cal_hash=cal_hash,
+            profile=profile,
+        )
+        frozen_context = (
+            context_hooks.frozen_weight_cache()
+            if use_frozen_perturbed_cache
+            else nullcontext(context_hooks)
+        )
+        target_hooks = None
+        kl_totals = [0.0 for _lane in lanes]
+        batch_count = 0
+        frozen_context_entered = False
+        rng_cm = torch.random.fork_rng(devices=rng_devices)
+        try:
+            frozen_context.__enter__()
+            frozen_context_entered = True
+            context_hooks.install()
+            with rng_cm:
+                torch.manual_seed(0)
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(0)
+                for batch_index, (args, kwargs) in enumerate(
+                    iter_calibration_forwards(calib_ids, device)
+                ):
+                    base_batch = _first_tensor_batch_size(args, kwargs)
+                    if target_hooks is None:
+                        target_hooks = _DepthGroupTargetHooks(
+                            model,
+                            assignment_c,
+                            specs_by_name,
+                            lanes,
+                            base_batch=base_batch,
+                            quant_weight_cache=group_quant_cache,
+                        )
+                        target_hooks.install()
+                    rep_args, rep_kwargs = _repeat_inputs_for_lanes(
+                        args,
+                        kwargs,
+                        len(lanes),
+                    )
+                    logits = _extract_logits(model(*rep_args, **rep_kwargs))
+                    if logits.dim() >= 3:
+                        logits = logits[:, -1:, :]
+                    chunks = _split_lanes(logits.detach(), base_batch, len(lanes))
+                    if chunks is None:
+                        raise RuntimeError(
+                            "lane-batched coord KL logits did not preserve lane "
+                            f"batching: shape={tuple(logits.shape)} "
+                            f"base_batch={base_batch} lanes={len(lanes)}"
+                        )
+                    teacher = ref_log_probs[batch_index]
+                    if teacher.dim() >= 3:
+                        teacher = teacher[:, -1:, :]
+                    for idx, chunk in enumerate(chunks):
+                        kl_totals[idx] += float(
+                            kl_divergence(chunk, teacher).item()
+                        )
+                    batch_count += 1
+            missing_targets = set(target_hooks.missing if target_hooks else [])
+            if missing_targets:
+                raise RuntimeError(
+                    "target module missing or unsupported for lane-batched KL: "
+                    + ", ".join(sorted(missing_targets))
+                )
+            measured.extend(
+                total / max(batch_count, 1)
+                for total in kl_totals
+            )
+        finally:
+            if target_hooks is not None:
+                target_hooks.remove()
+            if context_hooks.installed:
+                context_hooks.remove()
+            if frozen_context_entered:
+                frozen_context.__exit__(None, None, None)
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    if len(measured) != len(candidate_flips):
+        raise RuntimeError(
+            "lane-batched coord KL produced "
+            f"{len(measured)} results for {len(candidate_flips)} candidates"
+        )
+    return measured
 
 
 @torch.no_grad()

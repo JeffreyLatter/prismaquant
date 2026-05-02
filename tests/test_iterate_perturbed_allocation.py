@@ -424,7 +424,31 @@ def _counted_fp_spec(name: str):
     )
 
 
+def _scaled_weight_spec(name: str, scale: float):
+    return ipa.fr.FormatSpec(
+        name=name,
+        weight_bits=8,
+        group_size=0,
+        scale_bits=0,
+        scale_dtype_name="none",
+        weight_element_dtype="test_scaled",
+        quantize_dequantize=lambda w: w.detach().clone() * float(scale),
+        activation_quantize_dequantize=lambda x: x.clone(),
+    )
+
+
+class _CountingWideStackLogitsModel(_WideStackLogitsModel):
+    def __init__(self, width=33, layers=3):
+        super().__init__(width=width, layers=layers)
+        self.forward_calls = 0
+
+    def forward(self, input_ids):
+        self.forward_calls += 1
+        return super().forward(input_ids)
+
+
 def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
     probe_path = tmp_path / "probe.pkl"
     costs_path = tmp_path / "costs.pkl"
     work_dir = tmp_path / "work"
@@ -844,6 +868,7 @@ def test_l3_hamming_cap_respected():
 
 
 def test_coord_descent_non_regressive(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
     stats = {"layer": _tiny_stat()}
     specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
     l3_costs = {
@@ -878,6 +903,7 @@ def test_coord_descent_non_regressive(tmp_path, monkeypatch):
 
 
 def test_coord_descent_uses_frozen_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
     spec_a = _counted_fp_spec("COUNTED_FP4_A")
     spec_b = _counted_fp_spec("COUNTED_FP4_B")
     monkeypatch.setitem(ipa.fr.REGISTRY, spec_a.name, spec_a)
@@ -935,6 +961,7 @@ def test_coord_descent_uses_frozen_cache(tmp_path, monkeypatch):
 
 
 def test_coord_descent_frozen_cache_spans_passes(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
     spec_a = _counted_fp_spec("COUNTED_COORD_PASS_FP4_A")
     spec_b = _counted_fp_spec("COUNTED_COORD_PASS_FP4_B")
     monkeypatch.setitem(ipa.fr.REGISTRY, spec_a.name, spec_a)
@@ -1002,6 +1029,7 @@ def test_coord_descent_frozen_cache_spans_passes(tmp_path, monkeypatch):
 
 
 def test_coord_descent_l3_ranked_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
     stats = {f"layer{i}": _tiny_stat() for i in range(2)}
     specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
     assignment = {name: "INT8_W8A16" for name in stats}
@@ -1042,6 +1070,7 @@ def test_coord_descent_l3_ranked_order(tmp_path, monkeypatch):
 
 
 def test_coord_descent_early_stop_streak(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
     stats = {f"layer{i}": _tiny_stat() for i in range(5)}
     specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
     assignment = {name: "INT8_W8A16" for name in stats}
@@ -1078,6 +1107,213 @@ def test_coord_descent_early_stop_streak(tmp_path, monkeypatch):
     assert len(tried) == 3
     assert meta["measurements"] == 3
     assert meta["halted"] == "streak"
+
+
+def test_coord_descent_lane_batched_matches_sequential(tmp_path, monkeypatch):
+    scale_spec = _scaled_weight_spec("COORD_SCALE90_MATCH", 0.9)
+    monkeypatch.setitem(ipa.fr.REGISTRY, scale_spec.name, scale_spec)
+    specs = [scale_spec, ipa.fr.get_format("BF16")]
+    layers = 3
+    stats = {
+        f"layer{i}": _wide_stat(width=4, formats=(scale_spec.name, "BF16"))
+        for i in range(layers)
+    }
+    assignment = {name: scale_spec.name for name in stats}
+    l3_costs = {
+        name: {
+            scale_spec.name: {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 0.0},
+        }
+        for name in stats
+    }
+    calib_ids = torch.tensor(
+        [[[1.0, -1.0, 0.5, 0.25], [0.25, 0.5, -0.75, 1.0]]],
+        dtype=torch.float32,
+    )
+
+    seq_model = _WideStackLogitsModel(width=4, layers=layers).eval()
+    ref_log_probs = ipa.cache_reference_log_probs(
+        seq_model,
+        calib_ids,
+        next(seq_model.parameters()).device,
+    )
+    current_kl = ipa.measure_assignment_kl(
+        seq_model,
+        assignment,
+        calib_ids,
+        ref_log_probs,
+        work_root=tmp_path,
+    )
+
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
+    sequential_assignment, sequential_kl, sequential_meta = ipa.coordinate_descent_polish(
+        seq_model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=current_kl,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=2,
+    )
+
+    lane_model = _WideStackLogitsModel(width=4, layers=layers).eval()
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "1")
+    lane_assignment, lane_kl, lane_meta = ipa.coordinate_descent_polish(
+        lane_model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=current_kl,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=2,
+    )
+
+    assert lane_meta["lane_batched"] is True
+    assert sequential_meta["lane_batched"] is False
+    assert lane_assignment == sequential_assignment
+    assert lane_kl == pytest.approx(sequential_kl, abs=1e-9, rel=0.0)
+
+
+def test_coord_descent_lane_batched_emits_fewer_forwards(tmp_path, monkeypatch):
+    scale_spec = _scaled_weight_spec("COORD_SCALE90_FORWARD_COUNT", 0.9)
+    monkeypatch.setitem(ipa.fr.REGISTRY, scale_spec.name, scale_spec)
+    specs = [scale_spec, ipa.fr.get_format("BF16")]
+    layers = 5
+    lane_batch_size = 2
+    stats = {
+        f"layer{i}": _wide_stat(width=4, formats=(scale_spec.name, "BF16"))
+        for i in range(layers)
+    }
+    assignment = {name: "BF16" for name in stats}
+    l3_costs = {
+        name: {
+            "BF16": {"propagated_end_kl": 0.0},
+            scale_spec.name: {"propagated_end_kl": 1.0},
+        }
+        for name in stats
+    }
+    calib_ids = torch.tensor(
+        [[[1.0, -1.0, 0.5, 0.25], [0.25, 0.5, -0.75, 1.0]]],
+        dtype=torch.float32,
+    )
+
+    seq_model = _CountingWideStackLogitsModel(width=4, layers=layers).eval()
+    ref_log_probs = ipa.cache_reference_log_probs(
+        seq_model,
+        calib_ids,
+        next(seq_model.parameters()).device,
+    )
+    seq_model.forward_calls = 0
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
+    _seq_assignment, _seq_kl, seq_meta = ipa.coordinate_descent_polish(
+        seq_model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=0.0,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=lane_batch_size,
+    )
+    sequential_forwards = seq_model.forward_calls
+
+    lane_model = _CountingWideStackLogitsModel(width=4, layers=layers).eval()
+    lane_model.forward_calls = 0
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "1")
+    _lane_assignment, _lane_kl, lane_meta = ipa.coordinate_descent_polish(
+        lane_model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=0.0,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=lane_batch_size,
+    )
+    lane_forwards = lane_model.forward_calls
+
+    assert seq_meta["measurements"] == layers
+    assert lane_meta["measurements"] == layers
+    assert sequential_forwards == layers
+    assert lane_forwards <= (layers + lane_batch_size - 1) // lane_batch_size
+
+
+def test_coord_descent_lane_batched_handles_commit_correctly(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "1")
+    stats = {f"layer{i}": _tiny_stat() for i in range(2)}
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    assignment = {name: "INT8_W8A16" for name in stats}
+    l3_costs = {
+        "layer0": {
+            "INT8_W8A16": {"propagated_end_kl": 0.0},
+            "BF16": {"propagated_end_kl": -2.0},
+        },
+        "layer1": {
+            "INT8_W8A16": {"propagated_end_kl": 0.0},
+            "BF16": {"propagated_end_kl": -1.0},
+        },
+    }
+    calls = []
+
+    def _measure(_model, baseline, candidate_flips, *_args, **_kwargs):
+        calls.append((dict(baseline), list(candidate_flips)))
+        if baseline["layer0"] == "INT8_W8A16":
+            return [0.5, 0.4]
+        return [0.8]
+
+    monkeypatch.setattr(ipa, "measure_lane_batched_kl_deltas", _measure)
+
+    polished, final_kl, meta = ipa.coordinate_descent_polish(
+        _TinyLogitsModel(),
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=1.0,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=2,
+    )
+
+    assert calls == [
+        (
+            {"layer0": "INT8_W8A16", "layer1": "INT8_W8A16"},
+            [("layer0", "BF16"), ("layer1", "BF16")],
+        ),
+        (
+            {"layer0": "BF16", "layer1": "INT8_W8A16"},
+            [("layer1", "BF16")],
+        ),
+    ]
+    assert polished == {"layer0": "BF16", "layer1": "INT8_W8A16"}
+    assert final_kl == pytest.approx(0.5)
+    assert meta["flips_committed"] == 1
 
 
 def test_measure_assignment_kl_deterministic_same_inputs(tmp_path):

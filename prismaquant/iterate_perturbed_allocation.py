@@ -12,6 +12,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import pickle
 import tempfile
 import time
@@ -48,6 +49,7 @@ from prismaquant.propagated_cost import (
     assignment_bit_total,
     build_global_l3_neighborhood,
     build_l3_candidates,
+    measure_lane_batched_kl_deltas,
     measure_propagated_costs,
     select_l3_neighborhood,
     solve_frozen_l3_neighborhood,
@@ -1165,6 +1167,13 @@ def _coord_descent_ranked_candidates(
     return ranked
 
 
+def _coord_lane_batch_enabled() -> bool:
+    value = os.environ.get("PRISMAQUANT_COORD_LANE_BATCH")
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def coordinate_descent_polish(
     model,
     current_assignment: Mapping[str, str],
@@ -1184,6 +1193,7 @@ def coordinate_descent_polish(
     return_metadata: bool = False,
     emit: Callable[[str], None] | None = None,
     anchor_label: str | None = None,
+    max_lanes_per_batch: int = 64,
 ) -> tuple[dict[str, str], float] | tuple[dict[str, str], float, dict]:
     assignment = dict(current_assignment)
     if current_kl is None:
@@ -1202,11 +1212,12 @@ def coordinate_descent_polish(
     failed_streak = 0
     halted = "max_passes" if int(max_passes) > 0 else "max_passes"
     anchor_text = f"anchor {anchor_label}" if anchor_label is not None else "anchor n/a"
+    lane_batch_enabled = _coord_lane_batch_enabled()
 
     hooks: PerturbedActivationCache | None = None
     cached_names: set[str] = set()
     cache_cm = nullcontext()
-    if int(max_passes) > 0:
+    if int(max_passes) > 0 and not lane_batch_enabled:
         Path(work_root).mkdir(parents=True, exist_ok=True)
         cache_dir = Path(
             tempfile.mkdtemp(
@@ -1256,21 +1267,102 @@ def coordinate_descent_polish(
                     halted = "no_improvement"
                     break
 
-                for _predicted_delta, name, candidate_fmt in ranked_candidates:
-                    if candidate_fmt == fr.canonical_format_name(assignment.get(name, "")):
-                        continue
-                    trial = dict(assignment)
-                    trial[name] = candidate_fmt
-                    if not _within_assignment_budget(
-                        stats,
-                        trial,
-                        specs,
-                        target_bpp,
-                        bit_precision,
-                    ):
-                        continue
-                    if hooks is not None and name in cached_names:
-                        with hooks.override({name: candidate_fmt}):
+                if lane_batch_enabled:
+                    cursor = 0
+                    while cursor < len(ranked_candidates):
+                        batch: list[tuple[str, str]] = []
+                        next_positions: list[int] = []
+                        scan = cursor
+                        while (
+                            scan < len(ranked_candidates)
+                            and len(batch) < max(int(max_lanes_per_batch), 1)
+                        ):
+                            _predicted_delta, name, candidate_fmt = ranked_candidates[scan]
+                            scan += 1
+                            if candidate_fmt == fr.canonical_format_name(
+                                assignment.get(name, "")
+                            ):
+                                continue
+                            trial = dict(assignment)
+                            trial[name] = candidate_fmt
+                            if not _within_assignment_budget(
+                                stats,
+                                trial,
+                                specs,
+                                target_bpp,
+                                bit_precision,
+                            ):
+                                continue
+                            batch.append((name, candidate_fmt))
+                            next_positions.append(scan)
+
+                        if not batch:
+                            cursor = scan
+                            continue
+
+                        batch_kls = measure_lane_batched_kl_deltas(
+                            model,
+                            assignment,
+                            batch,
+                            calib_ids,
+                            ref_log_probs,
+                            work_root=work_root,
+                            max_lanes_per_batch=max_lanes_per_batch,
+                            profile=profile,
+                        )
+                        committed_in_batch = False
+                        for idx, ((name, candidate_fmt), trial_kl) in enumerate(
+                            zip(batch, batch_kls)
+                        ):
+                            measurements += 1
+                            if float(trial_kl) < current_kl - 1e-12:
+                                assignment[name] = candidate_fmt
+                                current_kl = float(trial_kl)
+                                flips_committed += 1
+                                failed_streak = 0
+                                pass_improved = True
+                                committed_in_batch = True
+                                cursor = next_positions[idx]
+                                break
+                            failed_streak += 1
+                            if (
+                                int(early_stop_streak) > 0
+                                and failed_streak >= int(early_stop_streak)
+                            ):
+                                halted = "streak"
+                                break
+                        if halted == "streak":
+                            break
+                        if not committed_in_batch:
+                            cursor = scan
+                    if halted == "streak":
+                        break
+                else:
+                    for _predicted_delta, name, candidate_fmt in ranked_candidates:
+                        if candidate_fmt == fr.canonical_format_name(assignment.get(name, "")):
+                            continue
+                        trial = dict(assignment)
+                        trial[name] = candidate_fmt
+                        if not _within_assignment_budget(
+                            stats,
+                            trial,
+                            specs,
+                            target_bpp,
+                            bit_precision,
+                        ):
+                            continue
+                        if hooks is not None and name in cached_names:
+                            with hooks.override({name: candidate_fmt}):
+                                trial_kl = measure_assignment_kl(
+                                    model,
+                                    trial,
+                                    calib_ids,
+                                    ref_log_probs,
+                                    work_root=work_root,
+                                    profile=profile,
+                                    perturbed_cache=hooks,
+                                )
+                        else:
                             trial_kl = measure_assignment_kl(
                                 model,
                                 trial,
@@ -1278,34 +1370,24 @@ def coordinate_descent_polish(
                                 ref_log_probs,
                                 work_root=work_root,
                                 profile=profile,
-                                perturbed_cache=hooks,
                             )
-                    else:
-                        trial_kl = measure_assignment_kl(
-                            model,
-                            trial,
-                            calib_ids,
-                            ref_log_probs,
-                            work_root=work_root,
-                            profile=profile,
-                        )
-                    measurements += 1
-                    if float(trial_kl) < current_kl - 1e-12:
-                        assignment[name] = candidate_fmt
-                        current_kl = float(trial_kl)
-                        if hooks is not None and name in cached_names:
-                            hooks.set_frozen_weight_format(name, candidate_fmt)
-                        flips_committed += 1
-                        failed_streak = 0
-                        pass_improved = True
-                    else:
-                        failed_streak += 1
-                        if (
-                            int(early_stop_streak) > 0
-                            and failed_streak >= int(early_stop_streak)
-                        ):
-                            halted = "streak"
-                            break
+                        measurements += 1
+                        if float(trial_kl) < current_kl - 1e-12:
+                            assignment[name] = candidate_fmt
+                            current_kl = float(trial_kl)
+                            if hooks is not None and name in cached_names:
+                                hooks.set_frozen_weight_format(name, candidate_fmt)
+                            flips_committed += 1
+                            failed_streak = 0
+                            pass_improved = True
+                        else:
+                            failed_streak += 1
+                            if (
+                                int(early_stop_streak) > 0
+                                and failed_streak >= int(early_stop_streak)
+                            ):
+                                halted = "streak"
+                                break
 
                 if halted == "streak":
                     break
@@ -1327,6 +1409,8 @@ def coordinate_descent_polish(
         "halted": halted,
         "early_stop_streak": int(early_stop_streak),
         "failed_streak": int(failed_streak),
+        "lane_batched": bool(lane_batch_enabled),
+        "max_lanes_per_batch": int(max_lanes_per_batch),
     }
     if emit is not None:
         emit(
@@ -1552,6 +1636,8 @@ def run_iterated_l3_polish(
         "halted": "disabled",
         "early_stop_streak": int(getattr(args, "coord_descent_early_stop_streak", 50)),
         "failed_streak": 0,
+        "lane_batched": _coord_lane_batch_enabled(),
+        "max_lanes_per_batch": int(getattr(args, "l3_max_lanes_per_batch", 64)),
     }
     if bool(getattr(args, "l3_coord_descent_fallback", True)):
         coord_passes = max(0, int(getattr(args, "l3_coord_descent_max_passes", 1)))
@@ -1574,6 +1660,7 @@ def run_iterated_l3_polish(
             return_metadata=True,
             emit=emit,
             anchor_label=coord_anchor_label,
+            max_lanes_per_batch=getattr(args, "l3_max_lanes_per_batch", 64),
         )
         coord_elapsed = time.monotonic() - coord_start
         validation_seconds += float(coord_elapsed)
