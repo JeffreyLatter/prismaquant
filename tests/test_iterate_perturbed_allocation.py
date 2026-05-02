@@ -1508,6 +1508,7 @@ def test_coord_descent_lane_batched_emits_fewer_forwards(tmp_path, monkeypatch):
     lane_model = _CountingWideStackLogitsModel(width=4, layers=layers).eval()
     lane_model.forward_calls = 0
     monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "1")
+    emitted = []
     _lane_assignment, _lane_kl, lane_meta = ipa.coordinate_descent_polish(
         lane_model,
         assignment,
@@ -1522,13 +1523,37 @@ def test_coord_descent_lane_batched_emits_fewer_forwards(tmp_path, monkeypatch):
         return_metadata=True,
         early_stop_streak=100,
         max_lanes_per_batch=lane_batch_size,
+        emit=emitted.append,
+        anchor_label="4.00",
     )
     lane_forwards = lane_model.forward_calls
+
+    expected_batches = (layers + lane_batch_size - 1) // lane_batch_size
+    expected_lane_counts = [
+        min(lane_batch_size, layers - idx * lane_batch_size)
+        for idx in range(expected_batches)
+    ]
+    batch_lines = [
+        line for line in emitted
+        if line.startswith("[coord] anchor 4.00 pass 1 batch ")
+    ]
 
     assert seq_meta["measurements"] == layers
     assert lane_meta["measurements"] == layers
     assert sequential_forwards == layers
     assert lane_forwards <= (layers + lane_batch_size - 1) // lane_batch_size
+    assert len(batch_lines) == expected_batches
+    assert [
+        f"batch {idx}/{expected_batches}" in line
+        for idx, line in enumerate(batch_lines, 1)
+    ] == [True] * expected_batches
+    assert [
+        f"n_lanes={expected_lanes}" in line
+        for expected_lanes, line in zip(expected_lane_counts, batch_lines)
+    ] == [True] * expected_batches
+    assert all("best_in_batch=layer" in line for line in batch_lines)
+    assert all("cumul_accepted=0" in line for line in batch_lines)
+    assert all("cumul_best_kl=0.0000e+00" in line for line in batch_lines)
 
 
 def test_coord_descent_lane_batched_handles_commit_correctly(tmp_path, monkeypatch):
@@ -1555,6 +1580,7 @@ def test_coord_descent_lane_batched_handles_commit_correctly(tmp_path, monkeypat
         return [0.8]
 
     monkeypatch.setattr(ipa, "measure_lane_batched_kl_deltas", _measure)
+    emitted = []
 
     polished, final_kl, meta = ipa.coordinate_descent_polish(
         _TinyLogitsModel(),
@@ -1570,6 +1596,8 @@ def test_coord_descent_lane_batched_handles_commit_correctly(tmp_path, monkeypat
         return_metadata=True,
         early_stop_streak=100,
         max_lanes_per_batch=2,
+        emit=emitted.append,
+        anchor_label="4.00",
     )
 
     assert calls == [
@@ -1585,6 +1613,13 @@ def test_coord_descent_lane_batched_handles_commit_correctly(tmp_path, monkeypat
     assert polished == {"layer0": "BF16", "layer1": "INT8_W8A16"}
     assert final_kl == pytest.approx(0.5)
     assert meta["flips_committed"] == 1
+    commit_lines = [line for line in emitted if " COMMIT: " in line]
+    assert len(commit_lines) == 1
+    assert commit_lines[0].startswith(
+        "[coord] anchor 4.00 COMMIT: layer0.INT8_W8A16 -> BF16"
+    )
+    assert "delta=-5.0000e-01" in commit_lines[0]
+    assert "pass 1 batch 1/2" in commit_lines[0]
 
 
 def test_measure_assignment_kl_deterministic_same_inputs(tmp_path):

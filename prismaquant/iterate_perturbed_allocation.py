@@ -1169,6 +1169,43 @@ def _coord_descent_ranked_candidates(
     return ranked
 
 
+def _coord_descent_lane_batch_count(
+    ranked_candidates: list[tuple[float, str, str]],
+    assignment: Mapping[str, str],
+    stats: Mapping[str, Mapping],
+    specs: list[fr.FormatSpec],
+    target_bpp: float,
+    bit_precision: float,
+    max_lanes_per_batch: int,
+    *,
+    start_index: int = 0,
+) -> int:
+    lanes_per_batch = max(int(max_lanes_per_batch), 1)
+    batch_count = 0
+    lanes_in_batch = 0
+    start_index = max(int(start_index), 0)
+    for _predicted_delta, name, candidate_fmt in ranked_candidates[start_index:]:
+        if candidate_fmt == fr.canonical_format_name(assignment.get(name, "")):
+            continue
+        trial = dict(assignment)
+        trial[name] = candidate_fmt
+        if not _within_assignment_budget(
+            stats,
+            trial,
+            specs,
+            target_bpp,
+            bit_precision,
+        ):
+            continue
+        lanes_in_batch += 1
+        if lanes_in_batch >= lanes_per_batch:
+            batch_count += 1
+            lanes_in_batch = 0
+    if lanes_in_batch:
+        batch_count += 1
+    return batch_count
+
+
 def _coord_lane_batch_enabled() -> bool:
     value = os.environ.get("PRISMAQUANT_COORD_LANE_BATCH")
     if value is None:
@@ -1294,14 +1331,33 @@ def coordinate_descent_polish(
         if hooks is not None and cached_names:
             hooks.install()
         try:
-            for _pass_idx in range(max(0, int(max_passes))):
+            pass_limit = max(0, int(max_passes))
+            for _pass_idx in range(pass_limit):
                 passes_completed += 1
+                pass_index = passes_completed
+                pass_start = time.monotonic()
+                pass_measurements_start = measurements
+                pass_flips_start = flips_committed
                 pass_improved = False
                 ranked_candidates = _coord_descent_ranked_candidates(
                     assignment,
                     l3_costs,
                     specs,
                 )
+
+                def _emit_pass_done(reason: str | None = None) -> None:
+                    if emit is None:
+                        return
+                    pass_measurements = measurements - pass_measurements_start
+                    pass_flips = flips_committed - pass_flips_start
+                    pass_halt_reason = halted if reason is None else reason
+                    emit(
+                        f"[coord] {anchor_text} pass {pass_index} done: "
+                        f"tried_{pass_measurements}_flips accepted_{pass_flips} "
+                        f"halted={pass_halt_reason} "
+                        f"elapsed={time.monotonic() - pass_start:.0f}s"
+                    )
+
                 if emit is not None:
                     if ranked_candidates:
                         best_pred, best_name, best_fmt = ranked_candidates[0]
@@ -1314,9 +1370,11 @@ def coordinate_descent_polish(
                         emit(f"[coord] {anchor_text}: L3-ranked 0 candidates")
                 if not ranked_candidates:
                     halted = "no_improvement"
+                    _emit_pass_done()
                     break
 
                 if lane_batch_enabled:
+                    pass_batch_index = 0
                     replay_cache = None
                     if (
                         replay_cache_enabled
@@ -1365,6 +1423,9 @@ def coordinate_descent_polish(
                             cursor = scan
                             continue
 
+                        pass_batch_index += 1
+                        display_batch_total = pass_batch_index
+                        batch_start_kl = float(current_kl)
                         batch_kls = measure_lane_batched_kl_deltas(
                             model,
                             assignment,
@@ -1376,18 +1437,52 @@ def coordinate_descent_polish(
                             profile=profile,
                             replay_cache=replay_cache,
                         )
+                        batch_results = [
+                            (name, candidate_fmt, float(trial_kl))
+                            for (name, candidate_fmt), trial_kl in zip(batch, batch_kls)
+                        ]
+                        best_batch_name, best_batch_fmt, best_batch_kl = min(
+                            batch_results,
+                            key=lambda item: item[2],
+                        )
+                        best_batch_delta = best_batch_kl - batch_start_kl
                         committed_in_batch = False
-                        for idx, ((name, candidate_fmt), trial_kl) in enumerate(
-                            zip(batch, batch_kls)
+                        for idx, (name, candidate_fmt, trial_kl) in enumerate(
+                            batch_results
                         ):
                             measurements += 1
-                            if float(trial_kl) < current_kl - 1e-12:
+                            if trial_kl < current_kl - 1e-12:
+                                old_fmt = assignment.get(name, "")
+                                old_kl = float(current_kl)
                                 assignment[name] = candidate_fmt
-                                current_kl = float(trial_kl)
+                                current_kl = trial_kl
                                 flips_committed += 1
                                 failed_streak = 0
                                 pass_improved = True
                                 committed_in_batch = True
+                                cursor = next_positions[idx]
+                                if emit is not None:
+                                    display_batch_total = (
+                                        pass_batch_index
+                                        + _coord_descent_lane_batch_count(
+                                            ranked_candidates,
+                                            assignment,
+                                            stats,
+                                            specs,
+                                            target_bpp,
+                                            bit_precision,
+                                            max_lanes_per_batch,
+                                            start_index=cursor,
+                                        )
+                                    )
+                                    emit(
+                                        f"[coord] {anchor_text} COMMIT: "
+                                        f"{name}.{old_fmt} -> {candidate_fmt}, "
+                                        f"kl {old_kl:.4e} -> {current_kl:.4e} "
+                                        f"(delta={current_kl - old_kl:+.4e}), "
+                                        f"pass {pass_index} batch {pass_batch_index}/"
+                                        f"{display_batch_total}"
+                                    )
                                 if replay_cache is not None:
                                     replay_cache.invalidate()
                                     if any(
@@ -1405,7 +1500,6 @@ def coordinate_descent_polish(
                                         if replay_cache is not None:
                                             replay_cache_populates += 1
                                             replay_cache_active = True
-                                cursor = next_positions[idx]
                                 break
                             failed_streak += 1
                             if (
@@ -1414,11 +1508,39 @@ def coordinate_descent_polish(
                             ):
                                 halted = "streak"
                                 break
+                        if emit is not None:
+                            if halted == "streak":
+                                display_batch_total = pass_batch_index
+                            elif not committed_in_batch:
+                                display_batch_total = (
+                                    pass_batch_index
+                                    + _coord_descent_lane_batch_count(
+                                        ranked_candidates,
+                                        assignment,
+                                        stats,
+                                        specs,
+                                        target_bpp,
+                                        bit_precision,
+                                        max_lanes_per_batch,
+                                        start_index=scan,
+                                    )
+                                )
+                            emit(
+                                f"[coord] {anchor_text} pass {pass_index} "
+                                f"batch {pass_batch_index}/{display_batch_total}: "
+                                f"elapsed={time.monotonic() - pass_start:.0f}s "
+                                f"n_lanes={len(batch)} "
+                                f"best_in_batch={best_batch_name}->{best_batch_fmt} "
+                                f"delta={best_batch_delta:+.3e} "
+                                f"cumul_accepted={flips_committed - pass_flips_start} "
+                                f"cumul_best_kl={current_kl:.4e}"
+                            )
                         if halted == "streak":
                             break
                         if not committed_in_batch:
                             cursor = scan
                     if halted == "streak":
+                        _emit_pass_done()
                         break
                 else:
                     for _predicted_delta, name, candidate_fmt in ranked_candidates:
@@ -1473,10 +1595,14 @@ def coordinate_descent_polish(
                                 break
 
                 if halted == "streak":
+                    _emit_pass_done()
                     break
                 if not pass_improved:
                     halted = "no_improvement"
+                    _emit_pass_done()
                     break
+                pass_done_reason = "max_passes" if pass_index >= pass_limit else "continue"
+                _emit_pass_done(pass_done_reason)
             else:
                 if int(max_passes) <= 0:
                     halted = "max_passes"
