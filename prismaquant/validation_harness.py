@@ -350,6 +350,8 @@ def _wikitext_ppl(
         def _loss_forward(input_ids, target_labels):
             return model(input_ids, labels=target_labels).loss
 
+        # When output cloning is disabled this scalar is read immediately and
+        # never held across another validation graph replay.
         loss = _validation_cuda_graph_run(
             "wikitext-ppl-loss",
             model,
@@ -547,6 +549,8 @@ def _choice_letter_nll(model, tokenizer, prompt: str, choice_idx: int, device) -
     def _loss_forward(choice_input_ids, choice_labels):
         return model(choice_input_ids, labels=choice_labels).loss
 
+    # When output cloning is disabled this scalar is consumed immediately for
+    # the NLL value and is not retained across graph replays.
     loss = _validation_cuda_graph_run(
         "mmlu-choice-loss",
         model,
@@ -595,8 +599,10 @@ def _end_kl(
         batch = calib_ids[i:i + 1].to(device)
 
         def _logits_forward(batch_ids):
-            return model(batch_ids).logits[:, -1:, :]
+            return model(batch_ids).logits[:, -1:, :].clone()
 
+        # The logits are immediately transformed into a detached log-softmax
+        # tensor before the next replay can overwrite the static graph output.
         logits = _validation_cuda_graph_run(
             "end-kl-ref-logits",
             model,
