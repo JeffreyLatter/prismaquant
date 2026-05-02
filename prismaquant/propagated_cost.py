@@ -118,6 +118,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 _PRISMAQUANT_GRAPH_POOL = None
+_NOCLONE_OVERRIDE_WARNED = False
 
 
 def get_prismaquant_graph_pool():
@@ -1182,7 +1183,26 @@ def _first_cuda_tensor(value) -> torch.Tensor | None:
 
 
 def _clone_cuda_graph_output(value):
-    if not _env_flag_enabled("PRISMAQUANT_GRAPH_OUTPUT_CLONE", default=True):
+    clone_disabled = not _env_flag_enabled(
+        "PRISMAQUANT_GRAPH_OUTPUT_CLONE",
+        default=True,
+    )
+    if clone_disabled and _env_flag_enabled(
+        "PRISMAQUANT_GRAPH_SHARED_POOL",
+        default=True,
+    ):
+        global _NOCLONE_OVERRIDE_WARNED
+        if not _NOCLONE_OVERRIDE_WARNED:
+            _NOCLONE_OVERRIDE_WARNED = True
+            print(
+                "[cuda-graphs] warning: "
+                "PRISMAQUANT_GRAPH_OUTPUT_CLONE=0 is unsafe with "
+                "PRISMAQUANT_GRAPH_SHARED_POOL=1; cloning CUDA graph outputs instead",
+                file=sys.stderr,
+                flush=True,
+            )
+        clone_disabled = False
+    if clone_disabled:
         return value
     if isinstance(value, torch.Tensor):
         return value.clone()
@@ -1243,10 +1263,9 @@ class CUDAGraphRegistry:
     The default cap is intentionally small and can be overridden per path with
     the registry's ``max_entries_env`` variable.
 
-    Replays return a clone of the static output by default. Setting
-    ``PRISMAQUANT_GRAPH_OUTPUT_CLONE=0`` returns the static output directly to
-    avoid a per-replay allocation; callers must consume it before the next replay
-    for the same entry because that replay overwrites the tensor in-place.
+    With ``PRISMAQUANT_GRAPH_SHARED_POOL`` enabled,
+    ``PRISMAQUANT_GRAPH_OUTPUT_CLONE=0`` is ignored and outputs are cloned.
+    Shared-pool captures can alias pool-mate static outputs still held by callers.
     """
 
     def __init__(
@@ -1600,9 +1619,9 @@ class _TailCudaGraphEntry:
 class _TailCudaGraphCache:
     """Bounded tail-forward CUDA graph cache.
 
-    When ``PRISMAQUANT_GRAPH_OUTPUT_CLONE=0`` replay returns the static output
-    directly. The L3 callers consume it in the current batch before another tail
-    replay can overwrite the same graph output.
+    With ``PRISMAQUANT_GRAPH_SHARED_POOL`` enabled,
+    ``PRISMAQUANT_GRAPH_OUTPUT_CLONE=0`` is ignored and outputs are cloned.
+    Another registry's capture can alias this cache's static output.
     """
 
     def __init__(self, *, enabled: bool):
@@ -1809,8 +1828,8 @@ def tail_forward_from_layer(
     lane_count: int | None = None,
 ) -> torch.Tensor:
     if cuda_graph_cache is not None:
-        # L3 consumes these logits in the current calibration batch before any
-        # next tail replay, which is required when output cloning is disabled.
+        # Private-pool no-clone mode requires L3 to consume these logits before
+        # another tail replay can overwrite the same static output.
         return cuda_graph_cache.run(
             model,
             layer_idx,
@@ -2550,9 +2569,8 @@ def measure_lane_batched_kl_deltas(
                             return logits[:, -1:, :].clone()
                         return logits
 
-                    # With PRISMAQUANT_GRAPH_OUTPUT_CLONE=0 this returns the
-                    # static graph tensor; the KL loop below consumes it before
-                    # any next replay can overwrite the same graph output.
+                    # In private-pool no-clone mode this returns the static graph
+                    # tensor; the KL loop consumes it before the next replay.
                     logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
                         "coord-lane-replay",
                         (
@@ -2672,8 +2690,8 @@ def measure_lane_batched_kl_deltas(
                             return logits[:, -1:, :].clone()
                         return logits
 
-                    # With PRISMAQUANT_GRAPH_OUTPUT_CLONE=0 this static output
-                    # is split and reduced to scalar KLs before another replay.
+                    # In private-pool no-clone mode this static output is split
+                    # and reduced to scalar KLs before another replay.
                     logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
                         "coord-lane-full",
                         (

@@ -13,6 +13,12 @@ from prismaquant.propagated_cost import CUDAGraphRegistry, _CUDAGraphEntry
 from prismaquant.memory_management import enforce_gpu_memory_budget, report_graph_memory
 
 
+_NOCLONE_OVERRIDE_FRAGMENT = (
+    "PRISMAQUANT_GRAPH_OUTPUT_CLONE=0 is unsafe with "
+    "PRISMAQUANT_GRAPH_SHARED_POOL=1"
+)
+
+
 class _ManyLinear(nn.Module):
     def __init__(self, count: int):
         super().__init__()
@@ -125,7 +131,49 @@ def test_cuda_graph_shared_pool_env_can_disable(monkeypatch):
     assert registry.graph_pool_id() == "private"
 
 
+def test_output_clone_overridden_when_shared_pool_enabled(monkeypatch, capsys):
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "1")
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_OUTPUT_CLONE", "0")
+    monkeypatch.setattr(pc, "_NOCLONE_OVERRIDE_WARNED", False)
+    value = torch.tensor([1.0, 2.0])
+
+    cloned = pc._clone_cuda_graph_output(value)
+
+    captured = capsys.readouterr()
+    assert cloned is not value
+    assert torch.equal(cloned, value)
+    assert _NOCLONE_OVERRIDE_FRAGMENT in captured.err
+
+
+def test_output_clone_override_warning_emitted_once(monkeypatch, capsys):
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "1")
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_OUTPUT_CLONE", "0")
+    monkeypatch.setattr(pc, "_NOCLONE_OVERRIDE_WARNED", False)
+    value = torch.tensor([1.0, 2.0])
+
+    for _ in range(5):
+        cloned = pc._clone_cuda_graph_output(value)
+        assert cloned is not value
+
+    captured = capsys.readouterr()
+    assert captured.err.count(_NOCLONE_OVERRIDE_FRAGMENT) == 1
+
+
+def test_output_clone_skipped_when_only_clone_disabled(monkeypatch, capsys):
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "0")
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_OUTPUT_CLONE", "0")
+    monkeypatch.setattr(pc, "_NOCLONE_OVERRIDE_WARNED", False)
+    value = torch.tensor([1.0, 2.0])
+
+    output = pc._clone_cuda_graph_output(value)
+
+    captured = capsys.readouterr()
+    assert output is value
+    assert _NOCLONE_OVERRIDE_FRAGMENT not in captured.err
+
+
 def test_cuda_graph_output_clone_can_return_static_replay_tensor(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "0")
     monkeypatch.setenv("PRISMAQUANT_GRAPH_OUTPUT_CLONE", "0")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     registry = CUDAGraphRegistry(label="output-alias", max_entries=4)

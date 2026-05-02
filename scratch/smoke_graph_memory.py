@@ -41,11 +41,12 @@ MODEL_CANDIDATES = (
 
 
 def _set_smoke_env() -> None:
+    # Shared graph pools are incompatible with no-clone; see clone warning.
     defaults = {
         "PRISMAQUANT_FUSED_KERNEL_NVFP4": "1",
         "PRISMAQUANT_GRAPH_AUDIT": "1",
         "PRISMAQUANT_GRAPH_SHARED_POOL": "1",
-        "PRISMAQUANT_GRAPH_OUTPUT_CLONE": "0",
+        "PRISMAQUANT_GRAPH_OUTPUT_CLONE": "1",
         "PRISMAQUANT_KL_CUDA_GRAPHS": "1",
         "PRISMAQUANT_L3_CUDA_GRAPHS": "1",
         "PRISMAQUANT_COORD_LANE_BATCH": "1",
