@@ -210,7 +210,11 @@ def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
     else:
         w2 = w2.unsqueeze(1)
 
-    cb = codebook.to(device=w2.device, dtype=torch.float32).contiguous()
+    cb = _codebook_on_device(
+        codebook,
+        device=w2.device,
+        dtype=torch.float32,
+    )
     cmax = float(cb.abs().max().item())
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
@@ -295,6 +299,40 @@ _CODEBOOKS = {
     "fp8_e4m3": _e4m3_codebook(),
     "fp8_e5m2": _e5m2_codebook(),
 }
+
+_CODEBOOK_DEVICE_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
+
+
+def _codebook_on_device(
+    codebook: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if codebook.device == device and codebook.dtype == dtype:
+        return codebook.contiguous()
+    key = (id(codebook), str(device), dtype)
+    cached = _CODEBOOK_DEVICE_CACHE.get(key)
+    if cached is not None and cached.device == device and cached.dtype == dtype:
+        return cached
+    source = codebook
+    if (
+        torch.device(device).type == "cuda"
+        and codebook.device.type == "cpu"
+        and torch.cuda.is_available()
+        and not codebook.is_pinned()
+    ):
+        try:
+            source = codebook.pin_memory()
+        except RuntimeError:
+            source = codebook
+    cached = source.to(
+        device=device,
+        dtype=dtype,
+        non_blocking=bool(source.device.type == "cpu" and source.is_pinned()),
+    ).contiguous()
+    _CODEBOOK_DEVICE_CACHE[key] = cached
+    return cached
 
 
 def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):

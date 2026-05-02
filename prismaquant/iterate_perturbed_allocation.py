@@ -773,6 +773,8 @@ class AnchorResult:
     l3_candidates: dict
     l3_costs: dict
     latest_smoothed_costs: dict
+    l3_cost_history: list[dict] | None = None
+    l3_resumed: bool = False
 
 
 @dataclass
@@ -840,6 +842,261 @@ class L3PolishRun:
     coord_descent_flips: int
     coord_descent_passes: int
     cycle_detected: bool
+
+
+@dataclass(frozen=True)
+class L3ResumeCosts:
+    path: Path
+    costs: dict
+    cost_history: list[dict]
+    payload: dict
+    mismatches: tuple[str, ...] = ()
+
+
+class L3ResumeMetadataError(RuntimeError):
+    pass
+
+
+def _move_tensor_tree_to_device(value, device: torch.device):
+    if isinstance(value, torch.Tensor):
+        non_blocking = bool(value.device.type == "cpu" and value.is_pinned())
+        return value.to(device, non_blocking=non_blocking)
+    if isinstance(value, Mapping):
+        return {
+            key: _move_tensor_tree_to_device(child, device)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_move_tensor_tree_to_device(child, device) for child in value)
+    if isinstance(value, list):
+        return [_move_tensor_tree_to_device(child, device) for child in value]
+    return value
+
+
+def _prepare_kl_tensor_inputs(calib_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if not isinstance(calib_ids, torch.Tensor):
+        return calib_ids
+    if torch.device(device).type == "cuda" and calib_ids.device != device:
+        if (
+            calib_ids.device.type == "cpu"
+            and torch.cuda.is_available()
+            and not calib_ids.is_pinned()
+        ):
+            try:
+                calib_ids = calib_ids.pin_memory()
+            except RuntimeError:
+                pass
+        non_blocking = bool(calib_ids.device.type == "cpu" and calib_ids.is_pinned())
+        return calib_ids.to(device, non_blocking=non_blocking)
+    return calib_ids
+
+
+def _prepare_ref_log_probs_for_kl(ref_log_probs, device: torch.device):
+    if torch.device(device).type != "cuda":
+        return ref_log_probs
+    return _move_tensor_tree_to_device(ref_log_probs, device)
+
+
+def _l3_resume_cli_force(args) -> bool:
+    return bool(
+        getattr(args, "resume_l3_ignore_mismatch", False)
+        or getattr(args, "force_resume_l3_costs", False)
+    )
+
+
+def _normalise_resume_anchor_key(value: str | float) -> str:
+    text = str(value).strip()
+    for prefix in ("anchor_bpp_", "anchor_", "bpp_", "target_"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return _bpp_label(float(text))
+
+
+def _parse_resume_l3_costs(value: str | None) -> tuple[Path | None, dict[str, Path]]:
+    if not value:
+        return None, {}
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if len(parts) == 1 and "=" not in parts[0]:
+        return Path(parts[0]), {}
+    by_anchor: dict[str, Path] = {}
+    for part in parts:
+        if "=" not in part:
+            raise ValueError(
+                "--resume-l3-costs entries must be either one path or "
+                "anchor_bpp_X.XX=/path pairs"
+            )
+        key, path_text = part.split("=", 1)
+        by_anchor[_normalise_resume_anchor_key(key)] = Path(path_text)
+    return None, by_anchor
+
+
+def _resume_l3_cost_path_for_anchor(
+    args,
+    anchor_bpp: float,
+    *,
+    single_output: bool = False,
+) -> Path | None:
+    label = _bpp_label(anchor_bpp)
+    by_anchor = getattr(args, "_resume_l3_costs_by_anchor", {}) or {}
+    if label in by_anchor:
+        return Path(by_anchor[label])
+    resume_dir = getattr(args, "resume_l3_costs_dir", None)
+    if resume_dir:
+        root = Path(resume_dir)
+        candidates = [
+            root / f"anchor_bpp_{label}" / "l3_propagated_costs.pkl",
+            root / f"anchor_{label}" / "l3_propagated_costs.pkl",
+        ]
+        if single_output:
+            candidates.insert(0, root / "l3_propagated_costs.pkl")
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+    single = getattr(args, "_resume_l3_costs_single", None)
+    if single is not None:
+        return Path(single)
+    return None
+
+
+def _format_set_from_payload(payload: Mapping) -> set[str]:
+    meta = payload.get("meta", {}) if isinstance(payload, Mapping) else {}
+    formats = None
+    if isinstance(meta, Mapping):
+        formats = meta.get("formats") or meta.get("format_set")
+    if formats is None and isinstance(payload, Mapping):
+        formats = payload.get("formats")
+    return {
+        fr.canonical_format_name(str(fmt))
+        for fmt in (formats or [])
+    }
+
+
+def _expected_l3_resume_meta(
+    args,
+    runtime: BudgetRuntime,
+    anchor_bpp: float,
+) -> dict:
+    return {
+        "model": str(getattr(args, "model", "")),
+        "anchor_bpp": float(anchor_bpp),
+        "formats": [s.name for s in runtime.specs],
+        "format_set": {
+            fr.canonical_format_name(s.name)
+            for s in runtime.specs
+        },
+        "calib_hash": calibration_data_hash(runtime.l3_calib_ids),
+    }
+
+
+def _l3_resume_metadata_mismatches(
+    payload: Mapping,
+    *,
+    expected: Mapping,
+) -> list[str]:
+    meta = payload.get("meta", {}) if isinstance(payload, Mapping) else {}
+    if not isinstance(meta, Mapping):
+        meta = {}
+    mismatches: list[str] = []
+    actual_model = meta.get("model") or meta.get("model_path")
+    if actual_model != expected["model"]:
+        mismatches.append(
+            f"model expected {expected['model']!r} got {actual_model!r}"
+        )
+    actual_anchor = meta.get("anchor_bpp")
+    try:
+        anchor_matches = abs(float(actual_anchor) - float(expected["anchor_bpp"])) <= 1e-9
+    except (TypeError, ValueError):
+        anchor_matches = False
+    if not anchor_matches:
+        mismatches.append(
+            f"anchor_bpp expected {expected['anchor_bpp']:.2f} got {actual_anchor!r}"
+        )
+    actual_formats = _format_set_from_payload(payload)
+    if actual_formats != set(expected["format_set"]):
+        mismatches.append(
+            "formats expected "
+            f"{sorted(expected['format_set'])!r} got {sorted(actual_formats)!r}"
+        )
+    actual_hash = (
+        meta.get("l3_calib_hash")
+        or meta.get("calib_hash")
+        or meta.get("calibration_hash")
+    )
+    if actual_hash != expected["calib_hash"]:
+        mismatches.append(
+            f"calib_hash expected {expected['calib_hash']!r} got {actual_hash!r}"
+        )
+    return mismatches
+
+
+def _load_l3_resume_costs(
+    path: Path,
+    *,
+    args,
+    runtime: BudgetRuntime,
+    anchor_bpp: float,
+    prefix: str,
+) -> L3ResumeCosts:
+    path = Path(path)
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, Mapping) or "costs" not in payload:
+        raise L3ResumeMetadataError(
+            f"L3 resume file {path} does not contain a 'costs' payload"
+        )
+    expected = _expected_l3_resume_meta(args, runtime, anchor_bpp)
+    mismatches = _l3_resume_metadata_mismatches(payload, expected=expected)
+    if mismatches and not _l3_resume_cli_force(args):
+        raise L3ResumeMetadataError(
+            f"L3 resume metadata mismatch for {path}: "
+            + "; ".join(mismatches)
+            + ". Refusing to resume; pass --no-resume-on-mismatch to force."
+        )
+    if mismatches:
+        _emit(
+            f"{prefix} WARNING: forcing L3 resume from {path} despite "
+            f"metadata mismatch: {'; '.join(mismatches)}"
+        )
+    cost_history = payload.get("cost_history")
+    if not isinstance(cost_history, list) or not all(
+        isinstance(item, dict) for item in cost_history
+    ):
+        cost_history = [payload["costs"]]
+    return L3ResumeCosts(
+        path=path,
+        costs=dict(payload["costs"]),
+        cost_history=list(cost_history),
+        payload=dict(payload),
+        mismatches=tuple(mismatches),
+    )
+
+
+def _l3_cost_payload_meta(
+    args,
+    runtime: BudgetRuntime,
+    *,
+    anchor_bpp: float,
+    selected_count: int,
+    extra: Mapping | None = None,
+) -> dict:
+    meta = {
+        "model": str(getattr(args, "model", "")),
+        "probe": str(getattr(args, "probe", "")),
+        "anchor_bpp": float(anchor_bpp),
+        "formats": [s.name for s in runtime.specs],
+        "format_set": sorted(
+            fr.canonical_format_name(s.name)
+            for s in runtime.specs
+        ),
+        "calib_hash": calibration_data_hash(runtime.l3_calib_ids),
+        "l3_calib_hash": calibration_data_hash(runtime.l3_calib_ids),
+        "kl_calib_hash": calibration_data_hash(runtime.calib_ids),
+        "selected_count": int(selected_count),
+    }
+    if extra:
+        meta.update(dict(extra))
+    return meta
 
 
 def parse_target_bits_list(raw: str) -> list[float]:
@@ -1663,6 +1920,7 @@ def run_iterated_l3_polish(
     measure_all_formats: bool = False,
     initial_selected: list[L3NeighborhoodEntry] | None = None,
     initial_l3_costs: dict | None = None,
+    resume_l3_cost_history: list[dict] | None = None,
     coord_anchor_label: str | None = None,
 ) -> L3PolishRun:
     l3_assignment = dict(initial_assignment)
@@ -1707,7 +1965,18 @@ def run_iterated_l3_polish(
             termination = "empty_neighborhood"
             break
 
-        if iteration == 1 and initial_l3_costs is not None:
+        if resume_l3_cost_history is not None:
+            if iteration > len(resume_l3_cost_history):
+                termination = "resume_costs_exhausted"
+                break
+            l3_costs_iter = resume_l3_cost_history[iteration - 1]
+            measure_elapsed = 0.0
+            measure_peak = None
+            emit(
+                f"{prefix} iteration {iteration}: using resumed L3 costs; "
+                f"skipping measurement"
+            )
+        elif iteration == 1 and initial_l3_costs is not None:
             l3_costs_iter = initial_l3_costs
             measure_elapsed = 0.0
             measure_peak = None
@@ -2274,37 +2543,64 @@ def run_anchor_budget(
     )
     if measure_all_formats:
         selected = widen_l3_neighborhood_formats(selected, runtime.specs)
-    _emit(
-        f"[multi][l3] anchor {anchor_label}: measuring {len(selected)} "
-        f"Linears ({'all formats' if measure_all_formats else 'filtered formats'})"
-    )
-    l3_costs = measure_propagated_costs(
-        runtime.model,
-        assignment,
-        selected,
-        runtime.l3_calib_ids,
-        runtime.specs,
-        work_root=runtime.work_root,
-        profile=runtime.profile,
-        max_lanes_per_batch=args.l3_max_lanes_per_batch,
-        tail_only=args.l3_tail_only,
-        progress_callback=_make_l3_progress(
-            _emit,
+    resume_path = _resume_l3_cost_path_for_anchor(args, anchor_bpp)
+    resumed_l3: L3ResumeCosts | None = None
+    if resume_path is not None:
+        resumed_l3 = _load_l3_resume_costs(
+            resume_path,
+            args=args,
+            runtime=runtime,
+            anchor_bpp=anchor_bpp,
             prefix=f"[multi][l3] anchor {anchor_label}:",
-        ),
-    )
+        )
+        _emit(
+            f"[multi][l3] anchor {anchor_label}: loaded L3 costs from "
+            f"{resumed_l3.path}; skipping measurement"
+        )
+        l3_costs = resumed_l3.costs
+    else:
+        _emit(
+            f"[multi][l3] anchor {anchor_label}: measuring {len(selected)} "
+            f"Linears ({'all formats' if measure_all_formats else 'filtered formats'})"
+        )
+        l3_costs = measure_propagated_costs(
+            runtime.model,
+            assignment,
+            selected,
+            runtime.l3_calib_ids,
+            runtime.specs,
+            work_root=runtime.work_root,
+            profile=runtime.profile,
+            max_lanes_per_batch=args.l3_max_lanes_per_batch,
+            tail_only=args.l3_tail_only,
+            progress_callback=_make_l3_progress(
+                _emit,
+                prefix=f"[multi][l3] anchor {anchor_label}:",
+            ),
+        )
     l3_cost_path = anchor_dir / "l3_propagated_costs.pkl"
+    meta_extra = {
+        "l3_mode": "global",
+        "measure_all_formats": bool(measure_all_formats),
+        "resumed_from": str(resumed_l3.path) if resumed_l3 is not None else None,
+    }
     with open(l3_cost_path, "wb") as f:
         pickle.dump(
             {
                 "costs": l3_costs,
+                "cost_history": (
+                    resumed_l3.cost_history
+                    if resumed_l3 is not None
+                    else [l3_costs]
+                ),
                 "formats": [s.name for s in runtime.specs],
-                "meta": {
-                    "l3_mode": "global",
-                    "anchor_bpp": float(anchor_bpp),
-                    "selected_count": len(selected),
-                    "measure_all_formats": bool(measure_all_formats),
-                },
+                "meta": _l3_cost_payload_meta(
+                    args,
+                    runtime,
+                    anchor_bpp=anchor_bpp,
+                    selected_count=len(selected),
+                    extra=meta_extra,
+                ),
             },
             f,
         )
@@ -2322,6 +2618,12 @@ def run_anchor_budget(
         l3_candidates=l3_candidates,
         l3_costs=l3_costs,
         latest_smoothed_costs=latest_smoothed_costs,
+        l3_cost_history=(
+            resumed_l3.cost_history
+            if resumed_l3 is not None
+            else [l3_costs]
+        ),
+        l3_resumed=bool(resumed_l3 is not None),
     )
 
 
@@ -2350,6 +2652,9 @@ def solve_target_from_anchor(
         measure_all_formats=bool(getattr(args, "_l3_measure_all_formats", False)),
         initial_selected=anchor.l3_selected,
         initial_l3_costs=anchor.l3_costs,
+        resume_l3_cost_history=(
+            anchor.l3_cost_history if anchor.l3_resumed else None
+        ),
         coord_anchor_label=_bpp_label(anchor.anchor_bpp),
     )
     accepted = bool(polish.accepted)
@@ -2675,6 +2980,9 @@ def measure_assignment_kl(
     use_frozen_weight_cache: bool = True,
     rng_seed: int | None = 0,
 ) -> float:
+    device = next(model.parameters()).device
+    calib_ids = _prepare_kl_tensor_inputs(calib_ids, device)
+    ref_log_probs = _prepare_ref_log_probs_for_kl(ref_log_probs, device)
     hooks = perturbed_cache
     if hooks is None:
         cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_kl_hooks_", dir=str(work_root)))
@@ -2687,7 +2995,6 @@ def measure_assignment_kl(
             cal_hash=cal_hash,
             profile=profile,
         )
-    device = next(model.parameters()).device
     values = []
     use_cuda_graphs = _env_flag_enabled(
         "PRISMAQUANT_KL_CUDA_GRAPHS",
@@ -2804,6 +3111,32 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="Use decoder tail-only L3 propagation when the model supports it.",
     )
+    ap.add_argument(
+        "--resume-l3-costs",
+        help=(
+            "Load cached L3 costs from one pickle, or comma-separated "
+            "anchor_bpp_X.XX=/path/l3_propagated_costs.pkl pairs."
+        ),
+    )
+    ap.add_argument(
+        "--resume-l3-costs-dir",
+        help=(
+            "Directory containing l3_propagated_costs.pkl or "
+            "anchor_bpp_X.XX/l3_propagated_costs.pkl files."
+        ),
+    )
+    ap.add_argument(
+        "--no-resume-on-mismatch",
+        dest="resume_l3_ignore_mismatch",
+        action="store_true",
+        help="Force L3 resume despite metadata mismatch, with a warning.",
+    )
+    ap.add_argument(
+        "--force-resume-l3-costs",
+        dest="force_resume_l3_costs",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     ap.add_argument("--l3-n-calib-samples", type=int, default=4)
     ap.add_argument("--l3-calib-seqlen", type=int, default=256)
     ap.add_argument("--l3-regression-tolerance", type=float, default=0.0)
@@ -2884,6 +3217,16 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("--knee-max-evaluations must be at least 3.")
     if (args.target_bits_list is not None or args.knee_search) and not args.l3_polish:
         ap.error("--target-bits-list and --knee-search require --l3-polish.")
+    if (args.resume_l3_costs or args.resume_l3_costs_dir) and not args.l3_polish:
+        ap.error("--resume-l3-costs requires --l3-polish.")
+    try:
+        resume_single, resume_by_anchor = _parse_resume_l3_costs(
+            args.resume_l3_costs
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
+    args._resume_l3_costs_single = resume_single
+    args._resume_l3_costs_by_anchor = resume_by_anchor
     if args.target_bits_list is not None or args.knee_search:
         args.l3_mode = "global"
 
@@ -2926,12 +3269,14 @@ def main(argv: list[str] | None = None) -> int:
         work_root=work_root,
         device_map=args.device_map,
     )
+    model_device = next(model.parameters()).device
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     calib_ids = load_wikitext_calibration(
         tokenizer,
         args.n_calib_samples,
         args.calib_seqlen,
     )
+    calib_ids = _prepare_kl_tensor_inputs(calib_ids, model_device)
     l3_calib_ids = calib_ids
     if args.l3_polish and (
         args.l3_n_calib_samples != args.n_calib_samples
@@ -2942,7 +3287,9 @@ def main(argv: list[str] | None = None) -> int:
             args.l3_n_calib_samples,
             args.l3_calib_seqlen,
         )
-    ref_log_probs = cache_reference_log_probs(model, calib_ids, next(model.parameters()).device)
+        l3_calib_ids = _prepare_kl_tensor_inputs(l3_calib_ids, model_device)
+    ref_log_probs = cache_reference_log_probs(model, calib_ids, model_device)
+    ref_log_probs = _prepare_ref_log_probs_for_kl(ref_log_probs, model_device)
     runtime = BudgetRuntime(
         work_root=work_root,
         output_root=output_root,
@@ -3301,10 +3648,29 @@ def main(argv: list[str] | None = None) -> int:
             sum(len(entry.formats) for entry in selected) / float(len(selected))
             if selected else 0.0
         )
-        _emit(
-            f"[l3] measuring propagated costs: {len(selected)} candidates x "
-            f"{avg_formats:.2f} formats = {l3_lane_count} total lanes"
+        resume_path = _resume_l3_cost_path_for_anchor(
+            args,
+            float(args.target_bits),
+            single_output=True,
         )
+        resumed_l3: L3ResumeCosts | None = None
+        if resume_path is not None:
+            resumed_l3 = _load_l3_resume_costs(
+                resume_path,
+                args=args,
+                runtime=runtime,
+                anchor_bpp=float(args.target_bits),
+                prefix="[l3]",
+            )
+            _emit(
+                f"[l3] loaded L3 costs from {resumed_l3.path}; "
+                "skipping measurement"
+            )
+        else:
+            _emit(
+                f"[l3] measuring propagated costs: {len(selected)} candidates x "
+                f"{avg_formats:.2f} formats = {l3_lane_count} total lanes"
+            )
 
         polish_run = run_iterated_l3_polish(
             args,
@@ -3321,6 +3687,10 @@ def main(argv: list[str] | None = None) -> int:
             work_root=work_root,
             profile=profile,
             initial_selected=selected,
+            initial_l3_costs=(resumed_l3.costs if resumed_l3 is not None else None),
+            resume_l3_cost_history=(
+                resumed_l3.cost_history if resumed_l3 is not None else None
+            ),
             coord_anchor_label=_bpp_label(args.target_bits),
         )
         l3_costs = polish_run.smoothed_l3_costs
@@ -3334,25 +3704,32 @@ def main(argv: list[str] | None = None) -> int:
                     "costs": l3_costs,
                     "cost_history": polish_run.l3_cost_history,
                     "formats": [s.name for s in specs],
-                    "meta": {
-                        "model": args.model,
-                        "probe": args.probe,
-                        "paired_baseline": "target_bf16_under_l2_assignment",
-                        "l3_mode": args.l3_mode,
-                        "selected_count": len(selected),
-                        "total_count": len(selected),
-                        "model_linear_count": n_total,
-                        "tail_only": bool(args.l3_tail_only),
-                        "l3_max_lanes_per_batch": int(args.l3_max_lanes_per_batch),
-                        "l3_n_calib_samples": int(args.l3_n_calib_samples),
-                        "l3_calib_seqlen": int(args.l3_calib_seqlen),
-                        "l3_iter_max": int(args.l3_iter_max),
-                        "l3_iterations": len(polish_run.iterations),
-                        "l3_hamming_cap_init": int(args.l3_hamming_cap_init),
-                        "l3_hamming_cap_max": int(args.l3_hamming_cap_max),
-                        "coord_descent_fired": bool(polish_run.coord_descent_fired),
-                        "coord_descent_flips": int(polish_run.coord_descent_flips),
-                    },
+                    "meta": _l3_cost_payload_meta(
+                        args,
+                        runtime,
+                        anchor_bpp=float(args.target_bits),
+                        selected_count=len(selected),
+                        extra={
+                            "paired_baseline": "target_bf16_under_l2_assignment",
+                            "l3_mode": args.l3_mode,
+                            "total_count": len(selected),
+                            "model_linear_count": n_total,
+                            "tail_only": bool(args.l3_tail_only),
+                            "l3_max_lanes_per_batch": int(args.l3_max_lanes_per_batch),
+                            "l3_n_calib_samples": int(args.l3_n_calib_samples),
+                            "l3_calib_seqlen": int(args.l3_calib_seqlen),
+                            "l3_iter_max": int(args.l3_iter_max),
+                            "l3_iterations": len(polish_run.iterations),
+                            "l3_hamming_cap_init": int(args.l3_hamming_cap_init),
+                            "l3_hamming_cap_max": int(args.l3_hamming_cap_max),
+                            "coord_descent_fired": bool(polish_run.coord_descent_fired),
+                            "coord_descent_flips": int(polish_run.coord_descent_flips),
+                            "resumed_from": (
+                                str(resumed_l3.path)
+                                if resumed_l3 is not None else None
+                            ),
+                        },
+                    ),
                 },
                 f,
             )

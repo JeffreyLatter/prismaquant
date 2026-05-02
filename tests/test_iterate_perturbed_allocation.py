@@ -1728,6 +1728,50 @@ def test_cuda_graph_safety_fallback_on_capture_failure(tmp_path, monkeypatch):
     assert fallback == pytest.approx(eager, abs=1e-9, rel=0.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_kl_cuda_graphs_no_pinned_memory_warning(tmp_path, monkeypatch):
+    ipa._KL_CUDA_GRAPH_REGISTRY.clear()
+    pc._CUDA_GRAPH_WARNED_LABELS.clear()
+    monkeypatch.setenv("PRISMAQUANT_KL_CUDA_GRAPHS", "1")
+    model = _WideStackLogitsModel(layers=2).eval().cuda()
+    calib_ids = torch.linspace(-1.0, 1.0, steps=2 * 2 * 33).reshape(2, 2, 33)
+    ref_log_probs = ipa.cache_reference_log_probs(
+        model,
+        calib_ids,
+        next(model.parameters()).device,
+    )
+    warnings = []
+    captures = []
+    original_capture = ipa._KL_CUDA_GRAPH_REGISTRY._capture
+
+    def _record_warning(label, exc):
+        warnings.append((label, exc))
+
+    def _count_capture(*args, **kwargs):
+        captures.append(True)
+        return original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(pc, "_warn_cuda_graph_fallback_once", _record_warning)
+    monkeypatch.setattr(ipa._KL_CUDA_GRAPH_REGISTRY, "_capture", _count_capture)
+
+    value = ipa.measure_assignment_kl(
+        model,
+        {"layer0": "FP8_E4M3", "layer1": "BF16"},
+        calib_ids,
+        ref_log_probs,
+        work_root=tmp_path,
+    )
+
+    assert value >= 0.0
+    assert captures
+    assert not ipa._KL_CUDA_GRAPH_REGISTRY.disabled_keys
+    assert not [
+        str(exc)
+        for _label, exc in warnings
+        if "pinned" in str(exc).lower()
+    ]
+
+
 def test_l3_iteration_terminates_on_cycle(tmp_path, monkeypatch):
     stats = {"layer": _tiny_stat()}
     specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
