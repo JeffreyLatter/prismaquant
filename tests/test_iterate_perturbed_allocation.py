@@ -367,6 +367,23 @@ class _TinyLogitsModel(nn.Module):
         return SimpleNamespace(logits=self.layer(x))
 
 
+class _WideStackLogitsModel(nn.Module):
+    def __init__(self, width=33, layers=3):
+        super().__init__()
+        self.layer_names = [f"layer{i}" for i in range(layers)]
+        for idx, name in enumerate(self.layer_names):
+            layer = nn.Linear(width, width, bias=False)
+            with torch.no_grad():
+                layer.weight.copy_(torch.eye(width) * (1.0 + idx * 0.01))
+            setattr(self, name, layer)
+
+    def forward(self, input_ids):
+        x = input_ids.float()
+        for name in self.layer_names:
+            x = getattr(self, name)(x)
+        return SimpleNamespace(logits=x)
+
+
 def _tiny_stat():
     return {
         "n_params": 4,
@@ -378,6 +395,33 @@ def _tiny_stat():
             "BF16": 8,
         },
     }
+
+
+def _wide_stat(width=33, formats=("COUNTED_FP4_A", "COUNTED_FP4_B", "BF16")):
+    n_params = width * width
+    return {
+        "n_params": n_params,
+        "in_features": width,
+        "out_features": width,
+        "h_trace": 1.0,
+        "_memory_bytes_by_format": {
+            fmt: 2 * n_params for fmt in formats
+        },
+    }
+
+
+def _counted_fp_spec(name: str):
+    codebook = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+    return ipa.fr.FormatSpec(
+        name=name,
+        weight_bits=4,
+        group_size=0,
+        scale_bits=0,
+        scale_dtype_name="none",
+        weight_element_dtype="test_counted_fp",
+        quantize_dequantize=lambda w: ipa.fr._rtn_fp_codebook(w, codebook, 0),
+        activation_quantize_dequantize=lambda x: x.clone(),
+    )
 
 
 def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
@@ -831,6 +875,170 @@ def test_coord_descent_non_regressive(tmp_path, monkeypatch):
     assert final_kl <= 1.0
     assert polished == {"layer": "BF16"}
     assert meta["flips_committed"] == 1
+
+
+def test_coord_descent_uses_frozen_cache(tmp_path, monkeypatch):
+    spec_a = _counted_fp_spec("COUNTED_FP4_A")
+    spec_b = _counted_fp_spec("COUNTED_FP4_B")
+    monkeypatch.setitem(ipa.fr.REGISTRY, spec_a.name, spec_a)
+    monkeypatch.setitem(ipa.fr.REGISTRY, spec_b.name, spec_b)
+
+    n_layers = 3
+    model = _WideStackLogitsModel(layers=n_layers).eval()
+    stats = {
+        name: _wide_stat(formats=(spec_a.name, spec_b.name, "BF16"))
+        for name in model.layer_names
+    }
+    specs = [spec_a, spec_b, ipa.fr.get_format("BF16")]
+    assignment = {name: spec_a.name for name in model.layer_names}
+    l3_costs = {
+        name: {
+            spec_a.name: {"propagated_end_kl": 0.0},
+            spec_b.name: {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 2.0},
+        }
+        for name in model.layer_names
+    }
+    calib_ids = torch.randn(2, 4, 33)
+    ref_log_probs = ipa.cache_reference_log_probs(
+        model,
+        calib_ids,
+        next(model.parameters()).device,
+    )
+
+    calls = {"count": 0}
+    original = ipa.fr._rtn_fp_codebook
+
+    def _counted(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ipa.fr, "_rtn_fp_codebook", _counted)
+
+    _polished, _final_kl, meta = ipa.coordinate_descent_polish(
+        model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=0.0,
+        return_metadata=True,
+        early_stop_streak=100,
+    )
+
+    assert meta["measurements"] == n_layers * 2
+    assert calls["count"] == n_layers * 2
+
+
+def test_coord_descent_l3_ranked_order(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(2)}
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    assignment = {name: "INT8_W8A16" for name in stats}
+    l3_costs = {
+        "layer0": {
+            "INT8_W8A16": {"propagated_end_kl": 10.0},
+            "BF16": {"propagated_end_kl": -5.0},
+        },
+        "layer1": {
+            "INT8_W8A16": {"propagated_end_kl": 10.0},
+            "BF16": {"propagated_end_kl": 9.0},
+        },
+    }
+    tried = []
+
+    def _kl(_model, trial_assignment, *_args, **_kwargs):
+        tried.append(dict(trial_assignment))
+        return 1.0
+
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _kl)
+
+    ipa.coordinate_descent_polish(
+        _TinyLogitsModel(),
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=0.0,
+        early_stop_streak=10,
+    )
+
+    assert tried[0]["layer0"] == "BF16"
+    assert tried[0]["layer1"] == "INT8_W8A16"
+
+
+def test_coord_descent_early_stop_streak(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(5)}
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    assignment = {name: "INT8_W8A16" for name in stats}
+    l3_costs = {
+        name: {
+            "INT8_W8A16": {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": float(idx)},
+        }
+        for idx, name in enumerate(stats)
+    }
+    tried = []
+
+    def _kl(_model, trial_assignment, *_args, **_kwargs):
+        tried.append(dict(trial_assignment))
+        return 1.0
+
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _kl)
+
+    _polished, _final_kl, meta = ipa.coordinate_descent_polish(
+        _TinyLogitsModel(),
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=0.0,
+        return_metadata=True,
+        early_stop_streak=3,
+    )
+
+    assert len(tried) == 3
+    assert meta["measurements"] == 3
+    assert meta["halted"] == "streak"
+
+
+def test_measure_assignment_kl_deterministic_same_inputs(tmp_path):
+    model = _WideStackLogitsModel(layers=2).eval()
+    assignment = {name: "BF16" for name in model.layer_names}
+    calib_ids = torch.randn(2, 4, 33)
+    ref_log_probs = ipa.cache_reference_log_probs(
+        model,
+        calib_ids,
+        next(model.parameters()).device,
+    )
+
+    first = ipa.measure_assignment_kl(
+        model,
+        assignment,
+        calib_ids,
+        ref_log_probs,
+        work_root=tmp_path,
+    )
+    second = ipa.measure_assignment_kl(
+        model,
+        assignment,
+        calib_ids,
+        ref_log_probs,
+        work_root=tmp_path,
+    )
+
+    assert first == second
 
 
 def test_l3_iteration_terminates_on_cycle(tmp_path, monkeypatch):

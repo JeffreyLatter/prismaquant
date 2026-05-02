@@ -248,6 +248,13 @@ class PerturbedActivationCache:
         self._rows_got: dict[str, int] = defaultdict(int)
         self._handles = []
         self._frozen_weight_cache: dict[tuple[int, str], torch.Tensor] | None = None
+        self._frozen_weight_format_cache: dict[
+            tuple[str, str], torch.Tensor
+        ] = {}
+
+    @property
+    def installed(self) -> bool:
+        return bool(self._handles)
 
     def install(self) -> None:
         for plan in self.plans:
@@ -271,6 +278,34 @@ class PerturbedActivationCache:
         for plan in self.plans:
             self._restore_plan(plan)
 
+    def _find_param_plan(self, name: str) -> tuple[_ModulePlan, _ParamPlan]:
+        for plan in self.plans:
+            for param_plan in plan.params:
+                if param_plan.name == name:
+                    return plan, param_plan
+        raise KeyError(f"no quantized parameter named {name!r}")
+
+    def _quantized_weight_for(
+        self,
+        plan: _ModulePlan,
+        param_plan: _ParamPlan,
+        spec: fr.FormatSpec,
+    ) -> torch.Tensor | None:
+        param = getattr(plan.module, param_plan.attr)
+        if not isinstance(param, torch.nn.Parameter) or param.is_meta:
+            return None
+        fmt = fr.canonical_format_name(spec.name)
+        cache_key = (param_plan.name, fmt)
+        q = self._frozen_weight_format_cache.get(cache_key)
+        if q is None:
+            original = param.data.detach().clone()
+            q = spec.quantize_dequantize(original).to(
+                device=param.device,
+                dtype=param.dtype,
+            ).contiguous()
+            self._frozen_weight_format_cache[cache_key] = q
+        return q
+
     def build_frozen_weight_cache(self) -> dict[tuple[int, str], torch.Tensor]:
         cache: dict[tuple[int, str], torch.Tensor] = {}
         for plan in self.plans:
@@ -279,15 +314,10 @@ class PerturbedActivationCache:
                 if param_plan.attr in seen_attrs:
                     continue
                 seen_attrs.add(param_plan.attr)
-                param = getattr(plan.module, param_plan.attr)
-                if not isinstance(param, torch.nn.Parameter) or param.is_meta:
+                q = self._quantized_weight_for(plan, param_plan, param_plan.spec)
+                if q is None:
                     continue
-                original = param.data.detach().clone()
-                q = param_plan.spec.quantize_dequantize(original)
-                cache[(id(plan.module), param_plan.attr)] = q.to(
-                    device=param.device,
-                    dtype=param.dtype,
-                ).contiguous()
+                cache[(id(plan.module), param_plan.attr)] = q
         self._frozen_weight_cache = cache
         return cache
 
@@ -299,6 +329,39 @@ class PerturbedActivationCache:
             yield self
         finally:
             self._frozen_weight_cache = previous
+
+    def set_frozen_weight_format(self, name: str, fmt: str) -> None:
+        if self._frozen_weight_cache is None:
+            raise RuntimeError("frozen weight cache is not active")
+        plan, param_plan = self._find_param_plan(name)
+        spec = fr.get_format(fmt)
+        q = self._quantized_weight_for(plan, param_plan, spec)
+        if q is None:
+            return
+        self._frozen_weight_cache[(id(plan.module), param_plan.attr)] = q
+        param_plan.spec = spec
+
+    @contextmanager
+    def temporary_frozen_weight_format(
+        self,
+        name: str,
+        fmt: str,
+    ) -> Iterator["PerturbedActivationCache"]:
+        if self._frozen_weight_cache is None:
+            raise RuntimeError("frozen weight cache is not active")
+        plan, param_plan = self._find_param_plan(name)
+        cache_key = (id(plan.module), param_plan.attr)
+        previous_q = self._frozen_weight_cache.get(cache_key)
+        previous_spec = param_plan.spec
+        self.set_frozen_weight_format(name, fmt)
+        try:
+            yield self
+        finally:
+            if previous_q is None:
+                self._frozen_weight_cache.pop(cache_key, None)
+            else:
+                self._frozen_weight_cache[cache_key] = previous_q
+            param_plan.spec = previous_spec
 
     def _capture(self, plan: _ModulePlan, x: torch.Tensor) -> None:
         flat = x.detach().reshape(-1, x.size(-1))
@@ -329,6 +392,16 @@ class PerturbedActivationCache:
             param.data.copy_(q.to(device=param.device, dtype=param.dtype))
             plan.active_originals.append((param, original))
 
+    def _active_activation_spec(self, plan: _ModulePlan) -> fr.FormatSpec | None:
+        low_act = {
+            p.spec.name: p.spec
+            for p in plan.params
+            if p.spec.act_bits is not None and p.spec.act_bits < 16
+        }
+        if len(low_act) == 1:
+            return next(iter(low_act.values()))
+        return None
+
     def _restore_plan(self, plan: _ModulePlan) -> None:
         for param, original in reversed(plan.active_originals):
             param.data.copy_(original.to(device=param.device, dtype=param.dtype))
@@ -339,8 +412,9 @@ class PerturbedActivationCache:
             where, key, x = _first_tensor_location(args, kwargs)
             if isinstance(x, torch.Tensor):
                 self._capture(plan, x)
-                if plan.act_spec is not None:
-                    qx = plan.act_spec.activation_quantize_dequantize(x)
+                act_spec = self._active_activation_spec(plan)
+                if act_spec is not None:
+                    qx = act_spec.activation_quantize_dequantize(x)
                     args, kwargs = _replace_tensor_input(args, kwargs, where, key, qx)
             self._apply_weight_quant(plan)
             return args, kwargs

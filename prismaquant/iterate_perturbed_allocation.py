@@ -15,6 +15,7 @@ import json
 import pickle
 import tempfile
 import time
+from contextlib import nullcontext
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Real
@@ -1112,6 +1113,58 @@ def _solve_l3_candidates_with_hamming_cap(
     return merged, chosen, meta
 
 
+def _l3_entry_by_canonical_format(
+    per_name: Mapping,
+) -> dict[str, Mapping]:
+    out: dict[str, Mapping] = {}
+    for raw_fmt, entry in per_name.items():
+        if not isinstance(entry, Mapping) or "error" in entry:
+            continue
+        out[fr.canonical_format_name(str(raw_fmt))] = entry
+    return out
+
+
+def _l3_propagated_end_kl(entry: Mapping | None) -> float | None:
+    if not isinstance(entry, Mapping):
+        return None
+    value = entry.get("propagated_end_kl")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coord_descent_ranked_candidates(
+    assignment: Mapping[str, str],
+    l3_costs: Mapping,
+    specs: list[fr.FormatSpec],
+) -> list[tuple[float, str, str]]:
+    spec_names = [fr.canonical_format_name(spec.name) for spec in specs]
+    ranked: list[tuple[float, str, str]] = []
+    if not isinstance(l3_costs, Mapping):
+        return ranked
+    for name in sorted(assignment):
+        current_fmt = fr.canonical_format_name(assignment[name])
+        per_name = l3_costs.get(name, {})
+        if not isinstance(per_name, Mapping):
+            continue
+        by_fmt = _l3_entry_by_canonical_format(per_name)
+        current_cost = _l3_propagated_end_kl(by_fmt.get(current_fmt))
+        if current_cost is None:
+            continue
+        for candidate_fmt in spec_names:
+            if candidate_fmt == current_fmt:
+                continue
+            candidate_cost = _l3_propagated_end_kl(by_fmt.get(candidate_fmt))
+            if candidate_cost is None:
+                continue
+            ranked.append((candidate_cost - current_cost, name, candidate_fmt))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    return ranked
+
+
 def coordinate_descent_polish(
     model,
     current_assignment: Mapping[str, str],
@@ -1126,8 +1179,11 @@ def coordinate_descent_polish(
     profile=None,
     bit_precision: float = 0.001,
     max_passes: int = 1,
+    early_stop_streak: int = 50,
     current_kl: float | None = None,
     return_metadata: bool = False,
+    emit: Callable[[str], None] | None = None,
+    anchor_label: str | None = None,
 ) -> tuple[dict[str, str], float] | tuple[dict[str, str], float, dict]:
     assignment = dict(current_assignment)
     if current_kl is None:
@@ -1140,31 +1196,60 @@ def coordinate_descent_polish(
             profile=profile,
         )
     current_kl = float(current_kl)
-    spec_names = [fr.canonical_format_name(spec.name) for spec in specs]
     passes_completed = 0
     flips_committed = 0
     measurements = 0
+    failed_streak = 0
+    halted = "max_passes" if int(max_passes) > 0 else "max_passes"
+    anchor_text = f"anchor {anchor_label}" if anchor_label is not None else "anchor n/a"
 
     for _pass_idx in range(max(0, int(max_passes))):
         passes_completed += 1
-        best_flip: tuple[str, str] | None = None
-        best_kl = current_kl
-        for name in sorted(assignment):
-            current_fmt = fr.canonical_format_name(assignment[name])
-            per_name = l3_costs.get(name, {}) if isinstance(l3_costs, Mapping) else {}
-            if per_name:
-                trial_formats = [
-                    fmt for fmt in spec_names
-                    if fmt in {
-                        fr.canonical_format_name(raw_fmt)
-                        for raw_fmt, entry in per_name.items()
-                        if isinstance(entry, Mapping) and "error" not in entry
-                    }
-                ]
+        pass_improved = False
+        ranked_candidates = _coord_descent_ranked_candidates(
+            assignment,
+            l3_costs,
+            specs,
+        )
+        if emit is not None:
+            if ranked_candidates:
+                best_pred, best_name, best_fmt = ranked_candidates[0]
+                emit(
+                    f"[coord] {anchor_text}: L3-ranked "
+                    f"{len(ranked_candidates)} candidates; best="
+                    f"{best_name}->{best_fmt} predicted_delta={best_pred:.6g}"
+                )
             else:
-                continue
-            for candidate_fmt in trial_formats:
-                if candidate_fmt == current_fmt:
+                emit(f"[coord] {anchor_text}: L3-ranked 0 candidates")
+        if not ranked_candidates:
+            halted = "no_improvement"
+            break
+
+        cache_dir = Path(
+            tempfile.mkdtemp(
+                prefix="prismaquant_coord_kl_hooks_",
+                dir=str(work_root),
+            )
+        )
+        hooks = PerturbedActivationCache(
+            model,
+            assignment,
+            cache_dir,
+            input_rows=0,
+            cal_hash=calibration_data_hash(calib_ids),
+            profile=profile,
+        )
+        cached_names = {
+            param_plan.name
+            for plan in hooks.plans
+            for param_plan in plan.params
+        }
+        if cached_names:
+            hooks.build_frozen_weight_cache()
+            hooks.install()
+        try:
+            for _predicted_delta, name, candidate_fmt in ranked_candidates:
+                if candidate_fmt == fr.canonical_format_name(assignment.get(name, "")):
                     continue
                 trial = dict(assignment)
                 trial[name] = candidate_fmt
@@ -1176,30 +1261,67 @@ def coordinate_descent_polish(
                     bit_precision,
                 ):
                     continue
-                trial_kl = measure_assignment_kl(
-                    model,
-                    trial,
-                    calib_ids,
-                    ref_log_probs,
-                    work_root=work_root,
-                    profile=profile,
-                )
+                if name in cached_names:
+                    with hooks.temporary_frozen_weight_format(name, candidate_fmt):
+                        trial_kl = measure_assignment_kl(
+                            model,
+                            trial,
+                            calib_ids,
+                            ref_log_probs,
+                            work_root=work_root,
+                            profile=profile,
+                            perturbed_cache=hooks,
+                        )
+                else:
+                    trial_kl = measure_assignment_kl(
+                        model,
+                        trial,
+                        calib_ids,
+                        ref_log_probs,
+                        work_root=work_root,
+                        profile=profile,
+                    )
                 measurements += 1
-                if float(trial_kl) < best_kl - 1e-12:
-                    best_flip = (name, candidate_fmt)
-                    best_kl = float(trial_kl)
-        if best_flip is None:
+                if float(trial_kl) < current_kl - 1e-12:
+                    assignment[name] = candidate_fmt
+                    current_kl = float(trial_kl)
+                    if name in cached_names:
+                        hooks.set_frozen_weight_format(name, candidate_fmt)
+                    flips_committed += 1
+                    failed_streak = 0
+                    pass_improved = True
+                else:
+                    failed_streak += 1
+                    if int(early_stop_streak) > 0 and failed_streak >= int(early_stop_streak):
+                        halted = "streak"
+                        break
+        finally:
+            if hooks.installed:
+                hooks.remove()
+
+        if halted == "streak":
             break
-        assignment[best_flip[0]] = best_flip[1]
-        current_kl = best_kl
-        flips_committed += 1
+        if not pass_improved:
+            halted = "no_improvement"
+            break
+    else:
+        if int(max_passes) <= 0:
+            halted = "max_passes"
 
     meta = {
         "passes_completed": passes_completed,
         "flips_committed": flips_committed,
         "measurements": measurements,
         "fired": bool(max_passes > 0),
+        "halted": halted,
+        "early_stop_streak": int(early_stop_streak),
+        "failed_streak": int(failed_streak),
     }
+    if emit is not None:
+        emit(
+            f"[coord] {anchor_text}: tried {measurements} flips, "
+            f"accepted {flips_committed}, halted ({halted})"
+        )
     if return_metadata:
         return assignment, current_kl, meta
     return assignment, current_kl
@@ -1225,6 +1347,7 @@ def run_iterated_l3_polish(
     measure_all_formats: bool = False,
     initial_selected: list[L3NeighborhoodEntry] | None = None,
     initial_l3_costs: dict | None = None,
+    coord_anchor_label: str | None = None,
 ) -> L3PolishRun:
     l3_assignment = dict(initial_assignment)
     current_kl = float(initial_kl)
@@ -1415,6 +1538,9 @@ def run_iterated_l3_polish(
         "flips_committed": 0,
         "passes_completed": 0,
         "measurements": 0,
+        "halted": "disabled",
+        "early_stop_streak": int(getattr(args, "coord_descent_early_stop_streak", 50)),
+        "failed_streak": 0,
     }
     if bool(getattr(args, "l3_coord_descent_fallback", True)):
         coord_passes = max(0, int(getattr(args, "l3_coord_descent_max_passes", 1)))
@@ -1432,8 +1558,11 @@ def run_iterated_l3_polish(
             profile=profile,
             bit_precision=getattr(args, "bit_precision", 0.001),
             max_passes=coord_passes,
+            early_stop_streak=getattr(args, "coord_descent_early_stop_streak", 50),
             current_kl=current_kl,
             return_metadata=True,
+            emit=emit,
+            anchor_label=coord_anchor_label,
         )
         coord_elapsed = time.monotonic() - coord_start
         validation_seconds += float(coord_elapsed)
@@ -1443,7 +1572,9 @@ def run_iterated_l3_polish(
         emit(
             f"{prefix} coordinate descent: passes="
             f"{coord_meta['passes_completed']} flips="
-            f"{coord_meta['flips_committed']} KL={current_kl:.4e}"
+            f"{coord_meta['flips_committed']} tried="
+            f"{coord_meta['measurements']} halted={coord_meta.get('halted')} "
+            f"KL={current_kl:.4e}"
         )
 
     final_changed = assignment_hash(l3_assignment) != assignment_hash(initial_assignment)
@@ -1898,6 +2029,7 @@ def solve_target_from_anchor(
         measure_all_formats=bool(getattr(args, "_l3_measure_all_formats", False)),
         initial_selected=anchor.l3_selected,
         initial_l3_costs=anchor.l3_costs,
+        coord_anchor_label=_bpp_label(anchor.anchor_bpp),
     )
     accepted = bool(polish.accepted)
     if accepted:
@@ -2218,28 +2350,52 @@ def measure_assignment_kl(
     *,
     work_root: str | Path,
     profile=None,
+    perturbed_cache: PerturbedActivationCache | None = None,
+    use_frozen_weight_cache: bool = True,
+    rng_seed: int | None = 0,
 ) -> float:
-    cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_kl_hooks_", dir=str(work_root)))
-    cal_hash = calibration_data_hash(calib_ids)
-    hooks = PerturbedActivationCache(
-        model,
-        assignment,
-        cache_dir,
-        input_rows=0,
-        cal_hash=cal_hash,
-        profile=profile,
-    )
+    hooks = perturbed_cache
+    if hooks is None:
+        cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_kl_hooks_", dir=str(work_root)))
+        cal_hash = calibration_data_hash(calib_ids)
+        hooks = PerturbedActivationCache(
+            model,
+            assignment,
+            cache_dir,
+            input_rows=0,
+            cal_hash=cal_hash,
+            profile=profile,
+        )
     device = next(model.parameters()).device
     values = []
-    hooks.install()
-    try:
-        for i in range(calib_ids.size(0)):
-            batch = calib_ids[i:i + 1].to(device)
-            logits = model(batch).logits[:, -1:, :]
-            teacher = ref_log_probs[i][:, -1:, :]
-            values.append(float(kl_divergence(logits, teacher).item()))
-    finally:
-        hooks.remove()
+    cache_cm = nullcontext()
+    if use_frozen_weight_cache and hooks._frozen_weight_cache is None:
+        cache_cm = hooks.frozen_weight_cache()
+    rng_devices = []
+    if rng_seed is not None and device.type == "cuda" and torch.cuda.is_available():
+        rng_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+    rng_cm = (
+        torch.random.fork_rng(devices=rng_devices)
+        if rng_seed is not None else nullcontext()
+    )
+    installed_here = not hooks.installed
+    with cache_cm:
+        if installed_here:
+            hooks.install()
+        try:
+            with rng_cm:
+                if rng_seed is not None:
+                    torch.manual_seed(int(rng_seed))
+                    if device.type == "cuda" and torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(int(rng_seed))
+                for i in range(calib_ids.size(0)):
+                    batch = calib_ids[i:i + 1].to(device)
+                    logits = model(batch).logits[:, -1:, :]
+                    teacher = ref_log_probs[i][:, -1:, :]
+                    values.append(float(kl_divergence(logits, teacher).item()))
+        finally:
+            if installed_here:
+                hooks.remove()
     return sum(values) / max(len(values), 1)
 
 
@@ -2338,6 +2494,12 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=1,
         help="Max coordinate-descent passes after iterated L3.",
+    )
+    ap.add_argument(
+        "--coord-descent-early-stop-streak",
+        type=int,
+        default=50,
+        help="Halt coord descent after this many consecutive non-improving flips",
     )
     ap.add_argument(
         "--frozen-dp-budget-tolerance",
@@ -2813,6 +2975,7 @@ def main(argv: list[str] | None = None) -> int:
             work_root=work_root,
             profile=profile,
             initial_selected=selected,
+            coord_anchor_label=_bpp_label(args.target_bits),
         )
         l3_costs = polish_run.smoothed_l3_costs
         l3_elapsed_seconds = float(polish_run.measurement_timing["elapsed_seconds"])

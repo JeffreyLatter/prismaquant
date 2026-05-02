@@ -5,6 +5,8 @@ MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 DEVICE="${DEVICE:-cuda}"
 MAX_LANES="${MAX_LANES:-64}"
 MAX_LENGTH="${MAX_LENGTH:-128}"
+COORD_LINEAR_LIMIT="${COORD_LINEAR_LIMIT:-8}"
+COORD_EARLY_STOP="${COORD_EARLY_STOP:-8}"
 
 python3 - <<'PY'
 import json
@@ -15,6 +17,11 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
+from prismaquant.build_rtn_cache import cache_reference_log_probs
+from prismaquant.iterate_perturbed_allocation import (
+    coordinate_descent_polish,
+    measure_assignment_kl,
+)
 from prismaquant.propagated_cost import L3NeighborhoodEntry, measure_propagated_costs
 
 try:
@@ -29,6 +36,10 @@ device = "cuda" if device_pref != "cpu" and torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if device == "cuda" else torch.float32
 max_lanes = int(os.environ.get("MAX_LANES", "64"))
 max_length = int(os.environ.get("MAX_LENGTH", "128"))
+coord_linear_limit = int(os.environ.get("COORD_LINEAR_LIMIT", "8"))
+coord_early_stop = int(os.environ.get("COORD_EARLY_STOP", "8"))
+work_dir = os.environ.get("WORK_DIR", "/tmp")
+os.makedirs(work_dir, exist_ok=True)
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 if tokenizer.pad_token is None:
@@ -123,4 +134,72 @@ summary = {
     },
 }
 print(json.dumps(summary, indent=2))
+
+coord_names = linear_names[:coord_linear_limit]
+modules = dict(model.named_modules())
+coord_assignment = {name: "MXFP8" for name in coord_names}
+coord_stats = {}
+for name in coord_names:
+    weight = modules[name].weight
+    coord_stats[name] = {
+        "n_params": int(weight.numel()),
+        "in_features": int(weight.shape[-1]),
+        "out_features": int(weight.shape[-2]),
+        "_memory_bytes_by_format": {
+            "MXFP8": fr.get_format("MXFP8").memory_bytes_for_shape(tuple(weight.shape)),
+            "BF16": fr.get_format("BF16").memory_bytes_for_shape(tuple(weight.shape)),
+        },
+    }
+coord_l3_costs = {
+    name: {
+        "MXFP8": {"propagated_end_kl": float(idx + 1)},
+        "BF16": {"propagated_end_kl": 0.0},
+    }
+    for idx, name in enumerate(coord_names)
+}
+coord_specs = [fr.get_format("MXFP8"), fr.get_format("BF16")]
+calib_ids = encoded["input_ids"].to(device)
+ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
+coord_start_kl = measure_assignment_kl(
+    model,
+    coord_assignment,
+    calib_ids,
+    ref_log_probs,
+    work_root=work_dir,
+)
+if device == "cuda":
+    torch.cuda.synchronize()
+coord_start = time.monotonic()
+polished, coord_final_kl, coord_meta = coordinate_descent_polish(
+    model,
+    coord_assignment,
+    coord_l3_costs,
+    coord_specs,
+    16.0,
+    calib_ids,
+    ref_log_probs,
+    stats=coord_stats,
+    work_root=work_dir,
+    current_kl=coord_start_kl,
+    return_metadata=True,
+    early_stop_streak=coord_early_stop,
+    emit=print,
+    anchor_label="bench",
+)
+if device == "cuda":
+    torch.cuda.synchronize()
+coord_elapsed = time.monotonic() - coord_start
+coord_summary = {
+    "label": "coord_descent",
+    "linear_count": len(coord_names),
+    "wall": coord_elapsed,
+    "start_kl": float(coord_start_kl),
+    "final_kl": float(coord_final_kl),
+    "meta": coord_meta,
+    "accepted_formats": {
+        fmt: sum(1 for value in polished.values() if value == fmt)
+        for fmt in sorted(set(polished.values()))
+    },
+}
+print(json.dumps(coord_summary, indent=2))
 PY
