@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import tempfile
 from collections import defaultdict
@@ -21,12 +22,17 @@ from typing import Iterator, Mapping
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 
 
 _FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def activation_cache_filename(name: str) -> str:
@@ -251,6 +257,11 @@ class PerturbedActivationCache:
         self._frozen_weight_format_cache: dict[
             tuple[str, str], torch.Tensor
         ] = {}
+        self._fused_forward_originals: list[tuple[nn.Module, object]] = []
+        self._fused_nvfp4_weight_cache: dict[
+            tuple[str, str, str, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
 
     @property
     def installed(self) -> bool:
@@ -258,6 +269,8 @@ class PerturbedActivationCache:
 
     def install(self) -> None:
         for plan in self.plans:
+            if self._try_install_nvfp4_fused_forward(plan):
+                continue
             self._handles.append(
                 plan.module.register_forward_pre_hook(
                     self._make_pre_hook(plan),
@@ -275,6 +288,9 @@ class PerturbedActivationCache:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+        for module, original_forward in reversed(self._fused_forward_originals):
+            module.forward = original_forward
+        self._fused_forward_originals.clear()
         for plan in self.plans:
             self._restore_plan(plan)
 
@@ -420,6 +436,123 @@ class PerturbedActivationCache:
         if len(low_act) == 1:
             return next(iter(low_act.values()))
         return None
+
+    def _nvfp4_fused_param_plan(self, plan: _ModulePlan) -> _ParamPlan | None:
+        if not _env_truthy("PRISMAQUANT_FUSED_KERNEL_NVFP4"):
+            return None
+        if not isinstance(plan.module, nn.Linear) or len(plan.params) != 1:
+            return None
+        param_plan = plan.params[0]
+        if param_plan.attr != "weight":
+            return None
+        if fr.canonical_format_name(param_plan.spec.name) != "NVFP4":
+            return None
+        act_spec = self._active_activation_spec(plan)
+        if act_spec is None or fr.canonical_format_name(act_spec.name) != "NVFP4":
+            return None
+        return param_plan
+
+    def _try_install_nvfp4_fused_forward(self, plan: _ModulePlan) -> bool:
+        param_plan = self._nvfp4_fused_param_plan(plan)
+        if param_plan is None:
+            return False
+        try:
+            from prismaquant.kernels.nvfp4_fused import nvfp4_fused_aw_matmul  # noqa: F401
+        except Exception:
+            return False
+
+        module = plan.module
+        original_forward = module.forward
+
+        def _forward(x, *args, **kwargs):
+            if args or kwargs or not isinstance(x, torch.Tensor):
+                return original_forward(x, *args, **kwargs)
+            return self._nvfp4_fused_linear_forward(plan, param_plan, x)
+
+        module.forward = _forward
+        self._fused_forward_originals.append((module, original_forward))
+        return True
+
+    def _weight_for_reference_forward(
+        self,
+        plan: _ModulePlan,
+        param_plan: _ParamPlan,
+    ) -> torch.Tensor:
+        param = getattr(plan.module, param_plan.attr)
+        if not isinstance(param, torch.nn.Parameter) or param.is_meta:
+            return param
+        q = None
+        if self._frozen_weight_cache is not None:
+            q = self._frozen_weight_cache.get((id(plan.module), param_plan.attr))
+        if q is None:
+            q = self._quantized_weight_for(plan, param_plan, param_plan.spec)
+        if q is None:
+            return param
+        return q.to(device=param.device, dtype=param.dtype)
+
+    def _reference_linear_forward(
+        self,
+        plan: _ModulePlan,
+        param_plan: _ParamPlan,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        act_spec = self._active_activation_spec(plan)
+        if act_spec is not None:
+            x = act_spec.activation_quantize_dequantize(x)
+        weight = self._weight_for_reference_forward(plan, param_plan)
+        return F.linear(x, weight, plan.module.bias)
+
+    def _packed_nvfp4_weight_for(
+        self,
+        plan: _ModulePlan,
+        param_plan: _ParamPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        param = getattr(plan.module, param_plan.attr)
+        if not isinstance(param, torch.nn.Parameter) or param.is_meta:
+            raise RuntimeError("cannot pack a missing or meta Linear weight")
+        cache_key = (
+            param_plan.name,
+            str(param.device),
+            str(param.dtype),
+            int(param.data_ptr()),
+        )
+        packed = self._fused_nvfp4_weight_cache.get(cache_key)
+        if packed is None:
+            from prismaquant.kernels.nvfp4_fused import nvfp4_pack_weight
+
+            packed = nvfp4_pack_weight(param.detach())
+            self._fused_nvfp4_weight_cache[cache_key] = packed
+        return packed
+
+    def _nvfp4_fused_linear_forward(
+        self,
+        plan: _ModulePlan,
+        param_plan: _ParamPlan,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        self._capture(plan, x)
+        act_spec = self._active_activation_spec(plan)
+        fused_active = (
+            fr.canonical_format_name(param_plan.spec.name) == "NVFP4"
+            and act_spec is not None
+            and fr.canonical_format_name(act_spec.name) == "NVFP4"
+            and x.is_cuda
+            and x.shape[-1] % 16 == 0
+        )
+        if not fused_active:
+            return self._reference_linear_forward(plan, param_plan, x)
+
+        from prismaquant.kernels.nvfp4_fused import nvfp4_fused_aw_matmul
+
+        w_packed, w_scales, w_global_scale = self._packed_nvfp4_weight_for(
+            plan, param_plan
+        )
+        flat_x = x.reshape(-1, x.shape[-1])
+        out = nvfp4_fused_aw_matmul(flat_x, w_packed, w_scales, w_global_scale)
+        out = out.reshape(*x.shape[:-1], plan.module.out_features)
+        if plan.module.bias is not None:
+            out = out + plan.module.bias.to(device=out.device, dtype=out.dtype)
+        return out
 
     def _restore_plan(self, plan: _ModulePlan) -> None:
         for param, original in reversed(plan.active_originals):
