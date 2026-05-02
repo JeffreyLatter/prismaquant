@@ -8,12 +8,14 @@ local_files_only=True.
 from __future__ import annotations
 
 import os
+import random
 import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -43,6 +45,7 @@ MODEL_CANDIDATES = (
 def _set_smoke_env() -> None:
     # Shared graph pools are incompatible with no-clone; see clone warning.
     defaults = {
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "PRISMAQUANT_FUSED_KERNEL_NVFP4": "1",
         "PRISMAQUANT_GRAPH_AUDIT": "1",
         "PRISMAQUANT_GRAPH_SHARED_POOL": "1",
@@ -56,9 +59,19 @@ def _set_smoke_env() -> None:
         "PRISMAQUANT_COORD_LANE_CUDA_GRAPH_CACHE_SIZE": "2",
         "PRISMAQUANT_VALIDATION_CUDA_GRAPH_CACHE_SIZE": "2",
         "PRISMAQUANT_CUDA_GRAPH_MAX_ENTRIES_PER_PATH": "2",
+        "PRISMAQUANT_SMOKE_SEED": "12345",
     }
     for name, value in defaults.items():
         os.environ.setdefault(name, value)
+
+
+def _pin_rng(seed: int) -> None:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _load_local_model():
@@ -170,10 +183,16 @@ def _phase(records: list[dict], label: str, fn):
 
 
 def main() -> int:
+    _set_smoke_env()
     if not torch.cuda.is_available():
         print("SKIP: CUDA unavailable")
         return 0
-    _set_smoke_env()
+
+    # Pinned for shared-vs-private graph pool determinism check.
+    # Keep calibration data and coord descent RNG-aligned across modes.
+    # Do not relax without re-verifying both graph pool configurations.
+    _pin_rng(int(os.environ["PRISMAQUANT_SMOKE_SEED"]))
+
     model_id, tokenizer, model = _load_local_model()
     if model is None:
         return 0
