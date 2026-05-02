@@ -14,6 +14,7 @@ import re
 import shutil
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
@@ -66,6 +67,17 @@ class _LaneSpec:
 @dataclass
 class QuantWeightCache:
     cache: dict[tuple[str, str], torch.Tensor]
+
+    def get(self, module_name: str, fmt: str) -> torch.Tensor | None:
+        seen: set[str] = set()
+        for candidate in (fmt, fr.canonical_format_name(fmt), *fr.aliases_for(fmt)):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            cached = self.cache.get((module_name, candidate))
+            if cached is not None:
+                return cached
+        return None
 
 
 def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
@@ -1314,6 +1326,12 @@ def build_quant_weight_cache(
         linear, attr = target
         if not isinstance(linear, nn.Linear) or attr != "weight":
             continue
+        name_keys = {
+            name
+            for name, (candidate_module, candidate_attr) in quant_map.items()
+            if candidate_module is linear and candidate_attr == attr
+        }
+        name_keys.add(entry.name)
         original_weight = linear.weight.data
         for spec in specs:
             canonical = fr.canonical_format_name(spec.name)
@@ -1324,9 +1342,10 @@ def build_quant_weight_cache(
                 dtype=original_weight.dtype,
             )
             quantized = quantized.contiguous()
-            cache[(entry.name, canonical)] = quantized
-            if spec.name != canonical:
-                cache[(entry.name, spec.name)] = quantized
+            fmt_keys = {canonical, spec.name, *fr.aliases_for(spec.name)}
+            for name_key in name_keys:
+                for fmt_key in fmt_keys:
+                    cache[(name_key, fmt_key)] = quantized
     return QuantWeightCache(cache)
 
 
@@ -1422,7 +1441,7 @@ class _DepthGroupTargetHooks:
                     continue
                 w_hat = None
                 if self.quant_weight_cache is not None:
-                    w_hat = self.quant_weight_cache.cache.get((module_name, fmt))
+                    w_hat = self.quant_weight_cache.get(module_name, fmt)
                 if w_hat is None:
                     w_hat = apply_format_quantization(weight, spec)
                 x_hat = spec.activation_quantize_dequantize(x_lane)
@@ -1736,6 +1755,10 @@ def measure_propagated_costs(
         "PRISMAQUANT_L3_PREQUANT_CACHE",
         default=True,
     )
+    use_frozen_perturbed_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
+        default=True,
+    )
     use_cuda_graphs = _env_flag_enabled(
         "PRISMAQUANT_L3_CUDA_GRAPHS",
         default=True,
@@ -1769,22 +1792,28 @@ def measure_propagated_costs(
                 cal_hash=cal_hash,
                 profile=profile,
             )
-            context_hooks.install()
-            try:
-                all_layer_calls = _capture_all_layer_calls(
-                    model,
-                    decoder_layers,
-                    needed_depths,
-                    calibration_data,
-                    device,
-                )
-                tail_call_cache = {
-                    depth: all_layer_calls.get(depth, [])
-                    for depth in needed_depths
-                }
-            finally:
-                context_hooks.remove()
-                shutil.rmtree(cache_dir, ignore_errors=True)
+            frozen_context = (
+                context_hooks.frozen_weight_cache()
+                if use_frozen_perturbed_cache
+                else nullcontext(context_hooks)
+            )
+            with frozen_context:
+                context_hooks.install()
+                try:
+                    all_layer_calls = _capture_all_layer_calls(
+                        model,
+                        decoder_layers,
+                        needed_depths,
+                        calibration_data,
+                        device,
+                    )
+                    tail_call_cache = {
+                        depth: all_layer_calls.get(depth, [])
+                        for depth in needed_depths
+                    }
+                finally:
+                    context_hooks.remove()
+                    shutil.rmtree(cache_dir, ignore_errors=True)
     for group_index, (group_key, group_entries) in enumerate(depth_groups, start=1):
         group_depth = layer_depth(group_entries[0].name) if group_entries else None
         use_tail_group = (
@@ -1851,10 +1880,18 @@ def measure_propagated_costs(
                 cal_hash=cal_hash,
                 profile=profile,
             )
-            context_hooks.install()
+            frozen_context = (
+                context_hooks.frozen_weight_cache()
+                if use_frozen_perturbed_cache
+                else nullcontext(context_hooks)
+            )
+            frozen_context_entered = False
             target_hooks = None
             output_mse = None
             try:
+                frozen_context.__enter__()
+                frozen_context_entered = True
+                context_hooks.install()
                 first_batch = True
                 kl_totals = [0.0 for _ in lanes]
                 batch_count = 0
@@ -1993,6 +2030,8 @@ def measure_propagated_costs(
                     }
             finally:
                 context_hooks.remove()
+                if frozen_context_entered:
+                    frozen_context.__exit__(None, None, None)
                 shutil.rmtree(cache_dir, ignore_errors=True)
         if progress_callback is not None:
             progress_callback({

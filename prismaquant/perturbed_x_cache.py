@@ -14,9 +14,10 @@ import json
 import re
 import tempfile
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Iterator, Mapping
 
 import torch
 import torch.nn as nn
@@ -246,6 +247,7 @@ class PerturbedActivationCache:
         self._snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._rows_got: dict[str, int] = defaultdict(int)
         self._handles = []
+        self._frozen_weight_cache: dict[tuple[int, str], torch.Tensor] | None = None
 
     def install(self) -> None:
         for plan in self.plans:
@@ -269,6 +271,35 @@ class PerturbedActivationCache:
         for plan in self.plans:
             self._restore_plan(plan)
 
+    def build_frozen_weight_cache(self) -> dict[tuple[int, str], torch.Tensor]:
+        cache: dict[tuple[int, str], torch.Tensor] = {}
+        for plan in self.plans:
+            seen_attrs: set[str] = set()
+            for param_plan in plan.params:
+                if param_plan.attr in seen_attrs:
+                    continue
+                seen_attrs.add(param_plan.attr)
+                param = getattr(plan.module, param_plan.attr)
+                if not isinstance(param, torch.nn.Parameter) or param.is_meta:
+                    continue
+                original = param.data.detach().clone()
+                q = param_plan.spec.quantize_dequantize(original)
+                cache[(id(plan.module), param_plan.attr)] = q.to(
+                    device=param.device,
+                    dtype=param.dtype,
+                ).contiguous()
+        self._frozen_weight_cache = cache
+        return cache
+
+    @contextmanager
+    def frozen_weight_cache(self) -> Iterator["PerturbedActivationCache"]:
+        previous = self._frozen_weight_cache
+        self.build_frozen_weight_cache()
+        try:
+            yield self
+        finally:
+            self._frozen_weight_cache = previous
+
     def _capture(self, plan: _ModulePlan, x: torch.Tensor) -> None:
         flat = x.detach().reshape(-1, x.size(-1))
         for name in plan.cache_names:
@@ -290,7 +321,11 @@ class PerturbedActivationCache:
             if not isinstance(param, torch.nn.Parameter) or param.is_meta:
                 continue
             original = param.data.detach().clone()
-            q = param_plan.spec.quantize_dequantize(original)
+            q = None
+            if self._frozen_weight_cache is not None:
+                q = self._frozen_weight_cache.get((id(plan.module), param_plan.attr))
+            if q is None:
+                q = param_plan.spec.quantize_dequantize(original)
             param.data.copy_(q.to(device=param.device, dtype=param.dtype))
             plan.active_originals.append((param, original))
 

@@ -8,6 +8,7 @@ import torch.nn as nn
 from prismaquant import format_registry as fr
 from prismaquant import propagated_cost as pc
 from prismaquant.allocator_solver import Candidate
+from prismaquant.perturbed_x_cache import PerturbedActivationCache
 from prismaquant.propagated_cost import (
     FrozenBudgetError,
     L3UnsupportedTargetError,
@@ -145,6 +146,20 @@ def _identity8_spec():
         scale_dtype_name="none",
         weight_element_dtype="test_identity",
         quantize_dequantize=lambda w: w.clone(),
+    )
+
+
+def _counted_fp_spec(name: str):
+    codebook = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+    return fr.FormatSpec(
+        name=name,
+        weight_bits=4,
+        group_size=0,
+        scale_bits=0,
+        scale_dtype_name="none",
+        weight_element_dtype="test_counted_fp",
+        quantize_dequantize=lambda w: fr._rtn_fp_codebook(w, codebook, 0),
+        activation_quantize_dequantize=lambda x: x.clone(),
     )
 
 
@@ -661,6 +676,7 @@ def test_prequant_cache_bit_exact_with_inline(tmp_path, monkeypatch):
             dtype=cache_model.l1.weight.dtype,
             device=cache_model.l1.weight.device,
         ).contiguous()
+        assert torch.equal(cached, inline)
         assert _tensor_digest(cached) == _tensor_digest(inline)
 
     monkeypatch.setenv("PRISMAQUANT_L3_CUDA_GRAPHS", "0")
@@ -686,6 +702,149 @@ def test_prequant_cache_bit_exact_with_inline(tmp_path, monkeypatch):
     )
 
     _assert_l3_costs_close(cached_costs, inline_costs)
+
+
+def test_l3_lane_prequant_cache_avoids_per_forward_weight_rtn(tmp_path, monkeypatch):
+    specs = [
+        _counted_fp_spec("COUNTED_FP4_A"),
+        _counted_fp_spec("COUNTED_FP4_B"),
+        fr.get_format("BF16"),
+    ]
+    assignment = {"l1": "BF16", "l2": "BF16", "l3": "BF16"}
+    neighborhood = [
+        L3NeighborhoodEntry(
+            name=name,
+            current_format="BF16",
+            formats=("COUNTED_FP4_A", "COUNTED_FP4_B", "BF16"),
+            margin=0.0,
+            l2_current_cost=0.0,
+        )
+        for name in ("l1", "l2")
+    ]
+    calls = {"count": 0}
+    original = fr._rtn_fp_codebook
+
+    def _counted(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setenv("PRISMAQUANT_L3_CUDA_GRAPHS", "0")
+    monkeypatch.setenv("PRISMAQUANT_L3_PREQUANT_CACHE", "1")
+    monkeypatch.setattr(fr, "_rtn_fp_codebook", _counted)
+
+    measure_propagated_costs(
+        _AmplifyingToy().eval(),
+        assignment,
+        neighborhood,
+        torch.randn(5, 2),
+        specs,
+        work_root=tmp_path,
+        max_lanes_per_batch=8,
+        tail_only=False,
+    )
+
+    assert calls["count"] == 4
+
+
+def test_l3_frozen_perturbed_cache_avoids_per_forward_context_rtn(
+    tmp_path,
+    monkeypatch,
+):
+    spec = _counted_fp_spec("COUNTED_CONTEXT_FP4")
+    monkeypatch.setitem(fr.REGISTRY, spec.name, spec)
+
+    class _WideToy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l1 = nn.Linear(33, 33, bias=False)
+            self.l2 = nn.Linear(33, 33, bias=False)
+            self.l3 = nn.Linear(33, 33, bias=False)
+
+        def forward(self, x):
+            return SimpleNamespace(logits=self.l3(self.l2(self.l1(x))))
+
+    calls = {"count": 0}
+    original = fr._rtn_fp_codebook
+
+    def _counted(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fr, "_rtn_fp_codebook", _counted)
+
+    def _run(cache_enabled: bool) -> int:
+        calls["count"] = 0
+        monkeypatch.setenv("PRISMAQUANT_L3_CUDA_GRAPHS", "0")
+        monkeypatch.setenv(
+            "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
+            "1" if cache_enabled else "0",
+        )
+        measure_propagated_costs(
+            _WideToy().eval(),
+            {"l1": "BF16", "l2": spec.name, "l3": spec.name},
+            [
+                L3NeighborhoodEntry(
+                    name="l1",
+                    current_format="BF16",
+                    formats=("ZERO4", "BF16"),
+                    margin=0.0,
+                    l2_current_cost=0.0,
+                )
+            ],
+            torch.randn(4, 33),
+            [_zero_spec(), fr.get_format("BF16")],
+            work_root=tmp_path,
+            max_lanes_per_batch=2,
+            tail_only=False,
+        )
+        return calls["count"]
+
+    assert _run(cache_enabled=True) == 2
+    assert _run(cache_enabled=False) == 8
+
+
+def test_perturbed_frozen_weight_cache_bit_exact_and_reused(tmp_path, monkeypatch):
+    spec = _counted_fp_spec("COUNTED_PERTURBED_FP4")
+    monkeypatch.setitem(fr.REGISTRY, spec.name, spec)
+    model = nn.Sequential(
+        nn.Linear(33, 33, bias=False),
+        nn.Linear(33, 33, bias=False),
+    ).eval()
+    assignment = {"0": spec.name, "1": spec.name}
+    builder = PerturbedActivationCache(
+        model,
+        assignment,
+        tmp_path,
+        input_rows=0,
+        cal_hash="test",
+    )
+    calls = {"count": 0}
+    original = fr._rtn_fp_codebook
+
+    def _counted(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fr, "_rtn_fp_codebook", _counted)
+    with builder.frozen_weight_cache():
+        assert calls["count"] == 2
+        for idx, layer in enumerate(model):
+            cached = builder._frozen_weight_cache[(id(layer), "weight")]
+            inline = spec.quantize_dequantize(layer.weight.data.detach().clone()).to(
+                device=layer.weight.device,
+                dtype=layer.weight.dtype,
+            ).contiguous()
+            assert torch.equal(cached, inline), idx
+        assert calls["count"] == 4
+        builder.install()
+        try:
+            x = torch.randn(1, 33)
+            for _ in range(5):
+                model(x)
+        finally:
+            builder.remove()
+
+    assert calls["count"] == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
