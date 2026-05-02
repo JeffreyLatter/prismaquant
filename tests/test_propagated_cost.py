@@ -1,3 +1,4 @@
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -145,6 +146,15 @@ def _identity8_spec():
         weight_element_dtype="test_identity",
         quantize_dequantize=lambda w: w.clone(),
     )
+
+
+def _tensor_digest(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().to("cpu").contiguous()
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(tuple(cpu.shape)).encode())
+    h.update(str(cpu.dtype).encode())
+    h.update(cpu.view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()
 
 
 def test_select_formats_uses_current_neighbors_and_bf16():
@@ -627,6 +637,113 @@ def test_measure_propagated_costs_cached_tail_inputs_are_equivalent(tmp_path):
         baseline,
     )
     assert cached_forward_calls < baseline_forward_calls
+
+
+def test_prequant_cache_bit_exact_with_inline(tmp_path, monkeypatch):
+    assignment = {"l1": "BF16", "l2": "BF16", "l3": "BF16"}
+    neighborhood = [
+        L3NeighborhoodEntry(
+            name="l1",
+            current_format="BF16",
+            formats=("ZERO4", "IDENT8", "BF16"),
+            margin=0.0,
+            l2_current_cost=0.0,
+        )
+    ]
+    specs = [_zero_spec(), _identity8_spec(), fr.get_format("BF16")]
+    calib = torch.tensor([[1.0, -1.0], [0.5, -0.5]], dtype=torch.float32)
+
+    cache_model = _AmplifyingToy().eval()
+    cache = pc.build_quant_weight_cache(cache_model, neighborhood, specs)
+    for spec in specs[:-1]:
+        cached = cache.cache[("l1", spec.name)]
+        inline = pc.apply_format_quantization(cache_model.l1.weight.data, spec).to(
+            dtype=cache_model.l1.weight.dtype,
+            device=cache_model.l1.weight.device,
+        ).contiguous()
+        assert _tensor_digest(cached) == _tensor_digest(inline)
+
+    monkeypatch.setenv("PRISMAQUANT_L3_CUDA_GRAPHS", "0")
+    monkeypatch.setenv("PRISMAQUANT_L3_PREQUANT_CACHE", "0")
+    inline_costs = measure_propagated_costs(
+        _AmplifyingToy().eval(),
+        assignment,
+        neighborhood,
+        calib,
+        specs,
+        work_root=tmp_path,
+        max_lanes_per_batch=4,
+    )
+    monkeypatch.setenv("PRISMAQUANT_L3_PREQUANT_CACHE", "1")
+    cached_costs = measure_propagated_costs(
+        _AmplifyingToy().eval(),
+        assignment,
+        neighborhood,
+        calib,
+        specs,
+        work_root=tmp_path,
+        max_lanes_per_batch=4,
+    )
+
+    _assert_l3_costs_close(cached_costs, inline_costs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_graphs_bit_exact_with_eager(tmp_path, monkeypatch):
+    assignment = {"layers.0.proj": "BF16"}
+    neighborhood = [
+        L3NeighborhoodEntry(
+            name="layers.0.proj",
+            current_format="BF16",
+            formats=("ZERO4", "BF16"),
+            margin=0.0,
+            l2_current_cost=0.0,
+        )
+    ]
+    specs = [_zero_spec(), fr.get_format("BF16")]
+    calib = torch.tensor(
+        [[1.0, -1.0], [0.5, -0.25], [-0.75, 0.25]],
+        dtype=torch.float32,
+    )
+
+    def _measure(graphs_enabled: bool):
+        monkeypatch.setenv(
+            "PRISMAQUANT_L3_CUDA_GRAPHS",
+            "1" if graphs_enabled else "0",
+        )
+        return measure_propagated_costs(
+            _TailToy().eval().cuda(),
+            assignment,
+            neighborhood,
+            calib,
+            specs,
+            work_root=tmp_path,
+            max_lanes_per_batch=4,
+            tail_only=True,
+            output_mse_names=[],
+        )
+
+    eager = _measure(False)
+    graphed = _measure(True)
+    _assert_l3_costs_close(graphed, eager)
+
+
+def test_lane_batch_memory_check_falls_back(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_GB", "8")
+    monkeypatch.setattr(pc.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        pc.torch.cuda,
+        "mem_get_info",
+        lambda _device=None: (1, 16 * 1024 ** 3),
+    )
+
+    adjusted = pc._adjust_l3_max_lanes_for_memory(
+        8,
+        torch.ones(2, 4),
+        torch.device("cuda"),
+    )
+
+    assert adjusted == 4
 
 
 def test_toy_l3_propagation_differs_from_local_cost_and_flips_pick(tmp_path):

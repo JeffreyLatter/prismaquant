@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -60,6 +61,28 @@ class _LaneSpec:
     fmt: str
     baseline_index: int | None
     is_baseline: bool
+
+
+@dataclass
+class QuantWeightCache:
+    cache: dict[tuple[str, str], torch.Tensor]
+
+
+def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return float(default)
+    try:
+        return float(value)
+    except ValueError:
+        return float(default)
 
 
 def _cost_entry(costs: Mapping, name: str, fmt: str) -> dict | None:
@@ -975,7 +998,7 @@ def _capture_all_layer_calls(
     return captured
 
 
-def tail_forward_from_layer(
+def _tail_forward_eager(
     model: nn.Module,
     layer_idx: int,
     layer_args,
@@ -1007,6 +1030,245 @@ def tail_forward_from_layer(
     return hidden
 
 
+def _tensor_tree_signature(value):
+    if isinstance(value, torch.Tensor):
+        return (
+            "tensor",
+            tuple(value.shape),
+            str(value.dtype),
+            str(value.device),
+        )
+    if isinstance(value, Mapping):
+        return (
+            "mapping",
+            type(value).__name__,
+            tuple(
+                sorted(
+                    (str(key), _tensor_tree_signature(child))
+                    for key, child in value.items()
+                )
+            ),
+        )
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_tensor_tree_signature(child) for child in value))
+    if isinstance(value, list):
+        return ("list", tuple(_tensor_tree_signature(child) for child in value))
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return ("value", type(value).__name__, value)
+    return ("object", type(value).__name__, id(value))
+
+
+def _clone_static_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, Mapping):
+        return {
+            key: _clone_static_tree(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_clone_static_tree(child) for child in value)
+    if isinstance(value, list):
+        return [_clone_static_tree(child) for child in value]
+    return value
+
+
+def _copy_static_tree(src, dst) -> bool:
+    if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
+        if (
+            tuple(src.shape) != tuple(dst.shape)
+            or src.dtype != dst.dtype
+            or src.device != dst.device
+        ):
+            return False
+        dst.copy_(src)
+        return True
+    if isinstance(src, Mapping) and isinstance(dst, Mapping):
+        if set(src.keys()) != set(dst.keys()):
+            return False
+        return all(_copy_static_tree(src[key], dst[key]) for key in src)
+    if isinstance(src, tuple) and isinstance(dst, tuple):
+        if len(src) != len(dst):
+            return False
+        return all(_copy_static_tree(a, b) for a, b in zip(src, dst))
+    if isinstance(src, list) and isinstance(dst, list):
+        if len(src) != len(dst):
+            return False
+        return all(_copy_static_tree(a, b) for a, b in zip(src, dst))
+    if src is dst:
+        return True
+    if src is None or isinstance(src, (bool, int, float, str)):
+        return src == dst
+    return False
+
+
+@dataclass
+class _TailCudaGraphEntry:
+    graph: object
+    static_hidden: torch.Tensor
+    static_args: tuple
+    static_kwargs: dict
+    static_output: torch.Tensor
+
+
+class _TailCudaGraphCache:
+    def __init__(self, *, enabled: bool):
+        self.enabled = bool(enabled) and torch.cuda.is_available()
+        self.entries: dict[tuple, _TailCudaGraphEntry] = {}
+        self.disabled_keys: set[tuple] = set()
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.disabled_keys.clear()
+
+    def run(
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        layer_args,
+        layer_kwargs,
+        hidden_state: torch.Tensor,
+        *,
+        lane_count: int,
+    ) -> torch.Tensor:
+        if (
+            not self.enabled
+            or not isinstance(hidden_state, torch.Tensor)
+            or not hidden_state.is_cuda
+        ):
+            return _tail_forward_eager(
+                model,
+                layer_idx,
+                layer_args,
+                layer_kwargs,
+                hidden_state,
+            )
+        key = (
+            id(model),
+            int(layer_idx),
+            int(lane_count),
+            _tensor_tree_signature(hidden_state),
+            _tensor_tree_signature(layer_args),
+            _tensor_tree_signature(layer_kwargs or {}),
+        )
+        entry = self.entries.get(key)
+        if entry is not None:
+            if not (
+                _copy_static_tree(hidden_state, entry.static_hidden)
+                and _copy_static_tree(tuple(layer_args), entry.static_args)
+                and _copy_static_tree(dict(layer_kwargs or {}), entry.static_kwargs)
+            ):
+                return _tail_forward_eager(
+                    model,
+                    layer_idx,
+                    layer_args,
+                    layer_kwargs,
+                    hidden_state,
+                )
+            entry.graph.replay()
+            return entry.static_output.clone()
+        if key in self.disabled_keys:
+            return _tail_forward_eager(
+                model,
+                layer_idx,
+                layer_args,
+                layer_kwargs,
+                hidden_state,
+            )
+        try:
+            entry = self._capture(
+                model,
+                layer_idx,
+                layer_args,
+                layer_kwargs,
+                hidden_state,
+            )
+        except Exception:
+            self.disabled_keys.add(key)
+            return _tail_forward_eager(
+                model,
+                layer_idx,
+                layer_args,
+                layer_kwargs,
+                hidden_state,
+            )
+        self.entries[key] = entry
+        return entry.static_output.clone()
+
+    def _capture(
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        layer_args,
+        layer_kwargs,
+        hidden_state: torch.Tensor,
+    ) -> _TailCudaGraphEntry:
+        static_hidden = hidden_state.detach().clone()
+        static_args = tuple(_clone_static_tree(value) for value in layer_args)
+        static_kwargs = {
+            key: _clone_static_tree(value)
+            for key, value in (layer_kwargs or {}).items()
+        }
+        device = hidden_state.device
+        current_stream = torch.cuda.current_stream(device)
+        side_stream = torch.cuda.Stream(device=device)
+        side_stream.wait_stream(current_stream)
+        with torch.cuda.stream(side_stream):
+            for _ in range(2):
+                _tail_forward_eager(
+                    model,
+                    layer_idx,
+                    static_args,
+                    static_kwargs,
+                    static_hidden,
+                )
+        current_stream.wait_stream(side_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = _tail_forward_eager(
+                model,
+                layer_idx,
+                static_args,
+                static_kwargs,
+                static_hidden,
+            )
+        return _TailCudaGraphEntry(
+            graph=graph,
+            static_hidden=static_hidden,
+            static_args=static_args,
+            static_kwargs=static_kwargs,
+            static_output=static_output,
+        )
+
+
+def tail_forward_from_layer(
+    model: nn.Module,
+    layer_idx: int,
+    layer_args,
+    layer_kwargs,
+    hidden_state: torch.Tensor,
+    *,
+    cuda_graph_cache: _TailCudaGraphCache | None = None,
+    lane_count: int | None = None,
+) -> torch.Tensor:
+    if cuda_graph_cache is not None:
+        return cuda_graph_cache.run(
+            model,
+            layer_idx,
+            layer_args,
+            layer_kwargs,
+            hidden_state,
+            lane_count=lane_count or 1,
+        )
+    return _tail_forward_eager(
+        model,
+        layer_idx,
+        layer_args,
+        layer_kwargs,
+        hidden_state,
+    )
+
+
 def _split_lanes(tensor: torch.Tensor, base_batch: int, lane_count: int):
     if tensor.dim() == 0 or tensor.size(0) != base_batch * lane_count:
         return None
@@ -1029,6 +1291,45 @@ def _l3_quantizable_map(model: nn.Module) -> dict[str, tuple[nn.Module, str]]:
     return out
 
 
+def apply_format_quantization(
+    weight: torch.Tensor,
+    spec: fr.FormatSpec,
+) -> torch.Tensor:
+    return spec.quantize_dequantize(weight.detach().clone())
+
+
+def build_quant_weight_cache(
+    model: nn.Module,
+    neighborhood: list[L3NeighborhoodEntry],
+    specs: list[fr.FormatSpec],
+    *,
+    skip_bf16: bool = True,
+) -> QuantWeightCache:
+    quant_map = _l3_quantizable_map(model)
+    cache: dict[tuple[str, str], torch.Tensor] = {}
+    for entry in neighborhood:
+        target = quant_map.get(entry.name)
+        if target is None:
+            continue
+        linear, attr = target
+        if not isinstance(linear, nn.Linear) or attr != "weight":
+            continue
+        original_weight = linear.weight.data
+        for spec in specs:
+            canonical = fr.canonical_format_name(spec.name)
+            if skip_bf16 and canonical == "BF16":
+                continue
+            quantized = apply_format_quantization(original_weight, spec).to(
+                device=original_weight.device,
+                dtype=original_weight.dtype,
+            )
+            quantized = quantized.contiguous()
+            cache[(entry.name, canonical)] = quantized
+            if spec.name != canonical:
+                cache[(entry.name, spec.name)] = quantized
+    return QuantWeightCache(cache)
+
+
 class _DepthGroupTargetHooks:
     """Apply lane-specific target formats for one depth-group microbatch.
 
@@ -1048,12 +1349,14 @@ class _DepthGroupTargetHooks:
         lanes: list[_LaneSpec],
         *,
         base_batch: int,
+        quant_weight_cache: QuantWeightCache | None = None,
     ):
         self.model = model
         self.assignment = _canonical_assignment(assignment)
         self.specs_by_name = specs_by_name
         self.lanes = lanes
         self.base_batch = int(base_batch)
+        self.quant_weight_cache = quant_weight_cache
         self.handles = []
         self.missing: list[str] = []
 
@@ -1117,7 +1420,11 @@ class _DepthGroupTargetHooks:
                 if spec is None:
                     out_chunks.append(y_lane)
                     continue
-                w_hat = spec.quantize_dequantize(weight.clone())
+                w_hat = None
+                if self.quant_weight_cache is not None:
+                    w_hat = self.quant_weight_cache.cache.get((module_name, fmt))
+                if w_hat is None:
+                    w_hat = apply_format_quantization(weight, spec)
                 x_hat = spec.activation_quantize_dequantize(x_lane)
                 out_chunks.append(F.linear(x_hat, w_hat.to(weight.dtype), bias))
             replacement = torch.cat(out_chunks, dim=0)
@@ -1269,6 +1576,96 @@ def _lane_microbatches_for_entries(
     return batches
 
 
+def _cuda_graph_lane_count(lane_count: int) -> int:
+    for candidate in (1, 2, 4, 8, 16, 32, 64):
+        if int(lane_count) <= candidate:
+            return candidate
+    return int(lane_count)
+
+
+def _pad_lanes_for_cuda_graph(lanes: list[_LaneSpec]) -> list[_LaneSpec]:
+    padded_count = _cuda_graph_lane_count(len(lanes))
+    if padded_count <= len(lanes) or not lanes:
+        return lanes
+    dummy_source = lanes[-1]
+    padded = list(lanes)
+    padded.extend(
+        _LaneSpec(
+            name=dummy_source.name,
+            fmt="BF16",
+            baseline_index=None,
+            is_baseline=True,
+        )
+        for _ in range(padded_count - len(lanes))
+    )
+    return padded
+
+
+def _calibration_sample_tensor_bytes(value) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, Mapping):
+        return sum(_calibration_sample_tensor_bytes(child) for child in value.values())
+    if isinstance(value, tuple | list):
+        return sum(_calibration_sample_tensor_bytes(child) for child in value)
+    return 0
+
+
+def _estimate_l3_microbatch_memory_bytes(calibration_data, lane_count: int) -> int:
+    if isinstance(calibration_data, torch.Tensor):
+        if calibration_data.dim() == 0 or calibration_data.size(0) == 0:
+            sample = calibration_data
+        else:
+            sample = calibration_data[:1]
+        base_bytes = _calibration_sample_tensor_bytes(sample)
+    elif isinstance(calibration_data, Mapping):
+        base_bytes = _calibration_sample_tensor_bytes(calibration_data)
+    elif isinstance(calibration_data, (tuple, list)) and calibration_data:
+        base_bytes = _calibration_sample_tensor_bytes(calibration_data[0])
+    else:
+        base_bytes = 0
+    return int(base_bytes * max(int(lane_count), 1) * 4)
+
+
+def _adjust_l3_max_lanes_for_memory(
+    max_lanes_per_batch: int,
+    calibration_data,
+    device: torch.device,
+) -> int:
+    requested = max(int(max_lanes_per_batch), 1)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return requested
+    headroom_gb = max(
+        _env_float("PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_GB", 8.0),
+        0.0,
+    )
+    headroom_bytes = int(headroom_gb * 1024 ** 3)
+    estimated_bytes = _estimate_l3_microbatch_memory_bytes(
+        calibration_data,
+        requested,
+    )
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    except TypeError:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+    if int(free_bytes) < headroom_bytes + estimated_bytes and requested > 1:
+        return max(requested // 2, 1)
+    return requested
+
+
+def _output_mse_names_reach_tail(
+    names: list[str],
+    group_depth: int | None,
+) -> bool:
+    if group_depth is None:
+        return bool(names)
+    for name in names:
+        depth = layer_depth(name)
+        if depth is None or depth > group_depth:
+            return True
+    return False
+
+
 @torch.no_grad()
 def measure_propagated_costs(
     model: nn.Module,
@@ -1295,7 +1692,10 @@ def measure_propagated_costs(
     if not neighborhood:
         return {}
 
-    specs_by_name = {s.name: s for s in specs}
+    specs_by_name: dict[str, fr.FormatSpec] = {}
+    for spec in specs:
+        specs_by_name[spec.name] = spec
+        specs_by_name[fr.canonical_format_name(spec.name)] = spec
     assignment_c = _canonical_assignment(assignment)
     results: dict[str, dict[str, dict]] = {
         entry.name: {
@@ -1309,14 +1709,38 @@ def measure_propagated_costs(
         if "BF16" in entry.formats
     }
     ordered_names = _ordered_quantizable_names(model, set(assignment_c))
-    all_output_names = output_mse_names or ordered_names
+    all_output_names = ordered_names if output_mse_names is None else output_mse_names
     device = next(model.parameters()).device
+    requested_max_lanes_per_batch = max(int(max_lanes_per_batch), 1)
+    max_lanes_per_batch = _adjust_l3_max_lanes_for_memory(
+        requested_max_lanes_per_batch,
+        calibration_data,
+        device,
+    )
+    if (
+        progress_callback is not None
+        and max_lanes_per_batch != requested_max_lanes_per_batch
+    ):
+        progress_callback({
+            "event": "lane_batch_memory_adjusted",
+            "requested_max_lanes_per_batch": requested_max_lanes_per_batch,
+            "max_lanes_per_batch": max_lanes_per_batch,
+        })
     cal_hash = calibration_data_hash(calibration_data)
     tmp_parent = str(work_root) if work_root is not None else None
 
     depth_groups = _group_neighborhood_by_depth(neighborhood)
     _decoder_base, decoder_layers = _decoder_stack(model)
     tail_call_cache: dict[int, list[tuple[tuple, dict, int]]] = {}
+    use_prequant_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_PREQUANT_CACHE",
+        default=True,
+    )
+    use_cuda_graphs = _env_flag_enabled(
+        "PRISMAQUANT_L3_CUDA_GRAPHS",
+        default=True,
+    )
+    tail_graph_cache = _TailCudaGraphCache(enabled=use_cuda_graphs)
     if (
         bool(tail_only)
         and bool(cache_tail_layer_inputs)
@@ -1384,6 +1808,11 @@ def measure_propagated_costs(
                 "lane_count": group_lane_count,
                 "mode": "tail-only" if use_tail_group else "full-forward",
             })
+        group_quant_cache = (
+            build_quant_weight_cache(model, group_entries, specs)
+            if use_prequant_cache
+            else None
+        )
         for lanes in _lane_microbatches_for_entries(
             group_entries,
             max_lanes_per_batch,
@@ -1400,6 +1829,16 @@ def measure_propagated_costs(
                 name for name in _downstream_names_for_group(ordered_names, target_names)
                 if name in set(all_output_names)
             ]
+            tail_graph_safe = (
+                use_tail_group
+                and use_cuda_graphs
+                and not _output_mse_names_reach_tail(downstream_names, group_depth)
+            )
+            execution_lanes = (
+                _pad_lanes_for_cuda_graph(lanes)
+                if tail_graph_safe
+                else lanes
+            )
             cache_dir = Path(tempfile.mkdtemp(
                 prefix="prismaquant_l3_context_",
                 dir=tmp_parent,
@@ -1446,14 +1885,15 @@ def measure_propagated_costs(
                                 model,
                                 assignment_c,
                                 specs_by_name,
-                                lanes,
+                                execution_lanes,
                                 base_batch=base_batch,
+                                quant_weight_cache=group_quant_cache,
                             )
                             target_hooks.install()
                             output_mse = _LaneOutputMSE(
                                 model,
                                 downstream_names,
-                                lanes,
+                                execution_lanes,
                                 base_batch=base_batch,
                             )
                             output_mse.install()
@@ -1473,7 +1913,7 @@ def measure_propagated_costs(
                             rep_args, rep_kwargs = _repeat_layer_call_for_lanes(
                                 layer_args,
                                 layer_kwargs,
-                                len(lanes),
+                                len(execution_lanes),
                                 base_batch,
                             )
                             layer_output = layer(*rep_args, **rep_kwargs)
@@ -1488,21 +1928,30 @@ def measure_propagated_costs(
                                 rep_args,
                                 rep_kwargs,
                                 hidden,
+                                cuda_graph_cache=(
+                                    tail_graph_cache if tail_graph_safe else None
+                                ),
+                                lane_count=len(execution_lanes),
                             )
                         else:
                             rep_args, rep_kwargs = _repeat_inputs_for_lanes(
                                 args,
                                 kwargs,
-                                len(lanes),
+                                len(execution_lanes),
                             )
                             logits = _extract_logits(model(*rep_args, **rep_kwargs))
 
-                        chunks = _split_lanes(logits.detach(), base_batch, len(lanes))
+                        chunks = _split_lanes(
+                            logits.detach(),
+                            base_batch,
+                            len(execution_lanes),
+                        )
                         if chunks is None:
                             raise RuntimeError(
                                 "L3 propagated-cost logits did not preserve lane "
                                 f"batching: shape={tuple(logits.shape)} "
-                                f"base_batch={base_batch} lanes={len(lanes)}"
+                                f"base_batch={base_batch} "
+                                f"lanes={len(execution_lanes)}"
                             )
                         for idx, lane in enumerate(lanes):
                             if lane.is_baseline or lane.baseline_index is None:
@@ -1556,4 +2005,5 @@ def measure_propagated_costs(
                 "elapsed_seconds": time.monotonic() - group_start,
             })
 
+    tail_graph_cache.clear()
     return results
