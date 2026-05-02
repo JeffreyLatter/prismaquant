@@ -28,7 +28,7 @@ from prismaquant.allocator_candidates import (
     build_candidates,
     expand_fused_sibling_assignment,
 )
-from prismaquant.allocator_solver import solve_allocation
+from prismaquant.allocator_solver import Candidate, solve_allocation
 from prismaquant.build_rtn_cache import (
     cache_reference_log_probs,
     kl_divergence,
@@ -255,6 +255,198 @@ def solve_from_costs(
     result = solve_allocation(stats_alloc, candidates, target_bits, bit_precision)
     if result is None:
         raise RuntimeError(f"infeasible target_bits={target_bits}")
+    assignment, _chosen = result
+    return expand_fused_sibling_assignment(assignment, stats_alloc)
+
+
+def _hamming_count(
+    left: Mapping[str, str],
+    right: Mapping[str, str],
+) -> int:
+    return sum(
+        1
+        for name in set(left) | set(right)
+        if left.get(name) != right.get(name)
+    )
+
+
+def _baseline_for_allocated_stats(
+    baseline_assignment: Mapping[str, str],
+    stats_alloc: Mapping[str, Mapping],
+) -> dict[str, str]:
+    baseline: dict[str, str] = {}
+    for name, entry in stats_alloc.items():
+        members = entry.get("_fused_siblings") if isinstance(entry, Mapping) else None
+        if members:
+            fmts = [
+                fr.canonical_format_name(baseline_assignment[member])
+                for member in members
+                if member in baseline_assignment
+            ]
+            if fmts:
+                baseline[name] = fmts[0]
+            continue
+        if name in baseline_assignment:
+            baseline[name] = fr.canonical_format_name(baseline_assignment[name])
+    return baseline
+
+
+def solve_allocation_with_hamming_cap(
+    stats: dict,
+    candidates: dict[str, list[Candidate]],
+    target_bits: float,
+    bit_precision: float = 0.001,
+    *,
+    baseline_assignment: Mapping[str, str],
+    max_flips: int,
+) -> tuple[dict[str, str], dict[str, Candidate]] | None:
+    """Solve allocation with a cap on Hamming distance from a baseline."""
+    import numpy as np
+
+    names = list(candidates.keys())
+    total_params = sum(stats[n]["n_params"] for n in names)
+    if total_params == 0:
+        return {}, {}
+
+    max_flips = max(0, int(max_flips))
+    baseline_fmt = {
+        name: fr.canonical_format_name(fmt)
+        for name, fmt in baseline_assignment.items()
+    }
+    baselines = {
+        name: min(cs, key=lambda c: c.bits_per_param)
+        for name, cs in candidates.items()
+    }
+    min_bits = sum(
+        baselines[n].bits_per_param * stats[n]["n_params"]
+        for n in names
+    ) / total_params
+    if target_bits < min_bits - 1e-6:
+        return None
+
+    excess = target_bits - min_bits
+    n_bins = int(round(excess / bit_precision)) + 2
+    flip_bins = max_flips + 1
+    INF_NEG = -1e30
+    dp = np.full((n_bins, flip_bins), INF_NEG, dtype=np.float64)
+    dp[0, 0] = 0.0
+    choice: list[np.ndarray] = []
+
+    for name in names:
+        baseline = baselines[name]
+        cs = candidates[name]
+        params = stats[name]["n_params"]
+        fraction = params / total_params
+        baseline_loss = baseline.predicted_dloss
+        options = []
+        for idx, cand in enumerate(cs):
+            d_avg_bits = (cand.bits_per_param - baseline.bits_per_param) * fraction
+            dbins = int(round(d_avg_bits / bit_precision))
+            if dbins < 0 or dbins >= n_bins:
+                continue
+            flip = int(
+                name in baseline_fmt
+                and fr.canonical_format_name(cand.fmt) != baseline_fmt[name]
+            )
+            if flip > max_flips:
+                continue
+            dgain = baseline_loss - cand.predicted_dloss
+            options.append((dbins, flip, dgain, idx))
+        if not options:
+            idx = cs.index(baseline)
+            flip = int(
+                name in baseline_fmt
+                and fr.canonical_format_name(baseline.fmt) != baseline_fmt[name]
+            )
+            if flip <= max_flips:
+                options = [(0, flip, 0.0, idx)]
+
+        new_dp = np.full((n_bins, flip_bins), INF_NEG, dtype=np.float64)
+        new_choice = np.full((n_bins, flip_bins), -1, dtype=np.int32)
+        for dbins, flip, dgain, idx in options:
+            src_b = slice(0, n_bins - dbins) if dbins else slice(None)
+            dst_b = slice(dbins, None)
+            src_f = slice(0, flip_bins - flip) if flip else slice(None)
+            dst_f = slice(flip, None)
+            candidate_vals = dp[src_b, src_f] + dgain
+            if candidate_vals.size == 0:
+                continue
+            target_slice = new_dp[dst_b, dst_f]
+            mask = candidate_vals > target_slice
+            target_slice[:] = np.where(mask, candidate_vals, target_slice)
+            choice_slice = new_choice[dst_b, dst_f]
+            choice_slice[:] = np.where(mask, idx, choice_slice)
+        dp = new_dp
+        choice.append(new_choice)
+
+    if dp.max() <= INF_NEG / 2:
+        return None
+    best_b, best_f = np.unravel_index(int(np.argmax(dp)), dp.shape)
+    assignment: dict[str, str] = {}
+    chosen_cands: dict[str, Candidate] = {}
+    cur_b = int(best_b)
+    cur_f = int(best_f)
+    for layer_idx in range(len(names) - 1, -1, -1):
+        name = names[layer_idx]
+        idx_chosen = int(choice[layer_idx][cur_b, cur_f])
+        cs = candidates[name]
+        if idx_chosen < 0:
+            idx_chosen = 0
+        chosen = cs[idx_chosen]
+        assignment[name] = chosen.fmt
+        chosen_cands[name] = chosen
+        baseline = baselines[name]
+        params = stats[name]["n_params"]
+        fraction = params / total_params
+        d_avg_bits = (chosen.bits_per_param - baseline.bits_per_param) * fraction
+        cur_b -= int(round(d_avg_bits / bit_precision))
+        flip = int(
+            name in baseline_fmt
+            and fr.canonical_format_name(chosen.fmt) != baseline_fmt[name]
+        )
+        cur_f -= flip
+        if cur_b < 0:
+            cur_b = 0
+        if cur_f < 0:
+            cur_f = 0
+    return assignment, chosen_cands
+
+
+def solve_from_costs_with_cap(
+    stats: dict,
+    costs: dict,
+    specs: list[fr.FormatSpec],
+    *,
+    target_bits: float,
+    bit_precision: float,
+    baseline_assignment: Mapping[str, str],
+    max_flips: int,
+    profile=None,
+) -> dict[str, str]:
+    candidates = build_candidates(stats, costs, specs)
+    stats_alloc, _costs_alloc, candidates = aggregate_fused_siblings(
+        stats,
+        costs,
+        specs,
+        candidates,
+        profile=profile,
+    )
+    baseline_alloc = _baseline_for_allocated_stats(
+        baseline_assignment,
+        stats_alloc,
+    )
+    result = solve_allocation_with_hamming_cap(
+        stats_alloc,
+        candidates,
+        target_bits,
+        bit_precision,
+        baseline_assignment=baseline_alloc,
+        max_flips=max_flips,
+    )
+    if result is None:
+        raise RuntimeError(
+            f"infeasible target_bits={target_bits} with max_flips={max_flips}"
+        )
     assignment, _chosen = result
     return expand_fused_sibling_assignment(assignment, stats_alloc)
 
@@ -563,6 +755,7 @@ class AnchorResult:
     output_dir: Path
     l2_assignment: dict[str, str]
     l2_kl: float
+    l3_selected: list[L3NeighborhoodEntry]
     l3_candidates: dict
     l3_costs: dict
     latest_smoothed_costs: dict
@@ -584,6 +777,9 @@ class BudgetResult:
     format_histogram: dict
     assignment: dict[str, str]
     layer_config_path: str
+    l3_iterations: int = 0
+    coord_descent_fired: bool = False
+    coord_descent_flips: int = 0
 
     def as_record(self) -> dict:
         return {
@@ -600,7 +796,36 @@ class BudgetResult:
             "flips_accepted": self.flips_accepted,
             "format_histogram": self.format_histogram,
             "layer_config_path": self.layer_config_path,
+            "l3_iterations": self.l3_iterations,
+            "coord_descent_fired": self.coord_descent_fired,
+            "coord_descent_flips": self.coord_descent_flips,
         }
+
+
+@dataclass
+class L3PolishRun:
+    initial_assignment: dict[str, str]
+    assignment: dict[str, str]
+    proposed_assignment: dict[str, str]
+    initial_kl: float
+    final_kl: float
+    proposed_kl: float
+    accepted: bool
+    regression: bool
+    iterations: list[dict]
+    selected: list[L3NeighborhoodEntry]
+    selected_history: list[list[L3NeighborhoodEntry]]
+    l3_cost_history: list[dict]
+    l3_costs: dict
+    smoothed_l3_costs: dict
+    frozen_dp_meta: dict
+    measurement_timing: dict
+    dp_timing: dict
+    validation_timing: dict
+    coord_descent_fired: bool
+    coord_descent_flips: int
+    coord_descent_passes: int
+    cycle_detected: bool
 
 
 def parse_target_bits_list(raw: str) -> list[float]:
@@ -703,6 +928,569 @@ def _solve_global_l3_assignment(
     if result is None:
         raise RuntimeError(f"infeasible target_bits={target_bpp}")
     return result
+
+
+def _assignment_average_bpp(
+    stats: Mapping[str, Mapping],
+    assignment: Mapping[str, str],
+    specs: list[fr.FormatSpec],
+) -> float:
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
+    known_assignment = {
+        name: fr.canonical_format_name(fmt)
+        for name, fmt in assignment.items()
+        if name in stats and fr.canonical_format_name(fmt) in specs_by_name
+    }
+    total_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in known_assignment
+    )
+    if total_params <= 0:
+        return 0.0
+    total_bits = assignment_bit_total(stats, known_assignment, specs_by_name)
+    return total_bits / float(total_params)
+
+
+def _within_assignment_budget(
+    stats: Mapping[str, Mapping],
+    assignment: Mapping[str, str],
+    specs: list[fr.FormatSpec],
+    target_bpp: float,
+    tolerance_bpp: float,
+) -> bool:
+    achieved = _assignment_average_bpp(stats, assignment, specs)
+    return achieved <= float(target_bpp) + max(float(tolerance_bpp), 0.0) + 1e-12
+
+
+def _filter_l3_candidates_for_assignment(
+    l3_candidates: Mapping[str, list[Candidate]],
+    assignment: Mapping[str, str],
+) -> dict[str, list[Candidate]]:
+    current_fmt_by_name = {
+        name: fr.canonical_format_name(assignment[name])
+        for name in l3_candidates
+        if name in assignment
+    }
+    return {
+        name: list(cands)
+        for name, cands in l3_candidates.items()
+        if any(
+            fr.canonical_format_name(c.fmt) == current_fmt_by_name.get(name)
+            for c in cands
+        )
+    }
+
+
+def _select_l3_neighborhood_for_assignment(
+    args,
+    stats: dict,
+    costs: dict,
+    assignment: Mapping[str, str],
+    specs: list[fr.FormatSpec],
+    *,
+    measure_all_formats: bool = False,
+) -> list[L3NeighborhoodEntry]:
+    if getattr(args, "l3_mode", "selective") == "global":
+        selected = build_global_l3_neighborhood(stats, costs, assignment, specs)
+    else:
+        selected = select_l3_neighborhood(
+            stats,
+            costs,
+            assignment,
+            specs,
+            uncertainty_rel_tol=getattr(args, "l3_uncertainty_rel_tol", 0.10),
+            min_fraction=getattr(args, "l3_min_fraction", 0.05),
+            max_fraction=getattr(args, "l3_max_fraction", 0.30),
+            safety_fraction=getattr(args, "l3_safety_fraction", 0.02),
+        )
+    if measure_all_formats:
+        selected = widen_l3_neighborhood_formats(selected, specs)
+    return selected
+
+
+def _choose_current_l3_candidates(
+    assignment: Mapping[str, str],
+    l3_candidates: Mapping[str, list[Candidate]],
+) -> dict[str, Candidate]:
+    chosen: dict[str, Candidate] = {}
+    for name, cands in l3_candidates.items():
+        current = fr.canonical_format_name(assignment.get(name, "BF16"))
+        by_fmt = {fr.canonical_format_name(c.fmt): c for c in cands}
+        if current in by_fmt:
+            chosen[name] = by_fmt[current]
+    return chosen
+
+
+def _solve_l3_candidates_with_hamming_cap(
+    stats: Mapping[str, Mapping],
+    assignment: Mapping[str, str],
+    l3_candidates: Mapping[str, list[Candidate]],
+    specs: list[fr.FormatSpec],
+    *,
+    target_bits: float,
+    bit_precision: float,
+    max_flips: int,
+    budget_tolerance: float = 0.0,
+) -> tuple[dict[str, str], dict[str, Candidate], dict]:
+    if not l3_candidates:
+        return dict(assignment), {}, {
+            "frozen_dp_precision_used": "none",
+            "hamming_cap": int(max_flips),
+            "hamming_cap_infeasible": False,
+        }
+
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
+    all_names = set(stats) & set(assignment)
+    open_names = set(l3_candidates) & all_names
+    frozen_assignment = {
+        name: assignment[name]
+        for name in sorted(all_names - open_names)
+    }
+    total_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in all_names
+    )
+    open_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in open_names
+    )
+    if total_params <= 0 or open_params <= 0:
+        return dict(assignment), {}, {
+            "frozen_dp_precision_used": "none",
+            "hamming_cap": int(max_flips),
+            "hamming_cap_infeasible": False,
+        }
+
+    target_total_bits = float(target_bits) * float(total_params)
+    frozen_bits = assignment_bit_total(stats, frozen_assignment, specs_by_name)
+    remaining_bits = target_total_bits - frozen_bits
+    if remaining_bits < -1e-6:
+        return dict(assignment), _choose_current_l3_candidates(
+            assignment,
+            l3_candidates,
+        ), {
+            "frozen_dp_precision_used": "none",
+            "hamming_cap": int(max_flips),
+            "hamming_cap_infeasible": True,
+            "remaining_bits": float(remaining_bits),
+        }
+
+    open_target_bits = remaining_bits / float(open_params)
+    open_stats = {name: dict(stats[name]) for name in sorted(open_names)}
+    open_cands = {name: list(l3_candidates[name]) for name in sorted(open_names)}
+    open_baseline = {
+        name: assignment[name]
+        for name in open_cands
+        if name in assignment
+    }
+    result = solve_allocation_with_hamming_cap(
+        open_stats,
+        open_cands,
+        open_target_bits,
+        bit_precision,
+        baseline_assignment=open_baseline,
+        max_flips=max_flips,
+    )
+    meta = {
+        "frozen_dp_precision_used": float(bit_precision),
+        "global_dp": len(open_names) == len(all_names),
+        "hamming_cap": int(max_flips),
+        "hamming_cap_infeasible": result is None,
+        "frozen_dp_budget_tolerance": float(budget_tolerance),
+        "frozen_dp_budget_tolerance_bits": (
+            max(0.0, float(budget_tolerance)) * target_total_bits
+        ),
+    }
+    if result is None:
+        return dict(assignment), _choose_current_l3_candidates(
+            assignment,
+            l3_candidates,
+        ), meta
+    open_assignment, chosen = result
+    merged = dict(assignment)
+    merged.update(open_assignment)
+    return merged, chosen, meta
+
+
+def coordinate_descent_polish(
+    model,
+    current_assignment: Mapping[str, str],
+    l3_costs: Mapping,
+    specs: list[fr.FormatSpec],
+    target_bpp: float,
+    calib_ids: torch.Tensor,
+    ref_log_probs,
+    *,
+    stats: Mapping[str, Mapping],
+    work_root: Path,
+    profile=None,
+    bit_precision: float = 0.001,
+    max_passes: int = 1,
+    current_kl: float | None = None,
+    return_metadata: bool = False,
+) -> tuple[dict[str, str], float] | tuple[dict[str, str], float, dict]:
+    assignment = dict(current_assignment)
+    if current_kl is None:
+        current_kl = measure_assignment_kl(
+            model,
+            assignment,
+            calib_ids,
+            ref_log_probs,
+            work_root=work_root,
+            profile=profile,
+        )
+    current_kl = float(current_kl)
+    spec_names = [fr.canonical_format_name(spec.name) for spec in specs]
+    passes_completed = 0
+    flips_committed = 0
+    measurements = 0
+
+    for _pass_idx in range(max(0, int(max_passes))):
+        passes_completed += 1
+        best_flip: tuple[str, str] | None = None
+        best_kl = current_kl
+        for name in sorted(assignment):
+            current_fmt = fr.canonical_format_name(assignment[name])
+            per_name = l3_costs.get(name, {}) if isinstance(l3_costs, Mapping) else {}
+            if per_name:
+                trial_formats = [
+                    fmt for fmt in spec_names
+                    if fmt in {
+                        fr.canonical_format_name(raw_fmt)
+                        for raw_fmt, entry in per_name.items()
+                        if isinstance(entry, Mapping) and "error" not in entry
+                    }
+                ]
+            else:
+                continue
+            for candidate_fmt in trial_formats:
+                if candidate_fmt == current_fmt:
+                    continue
+                trial = dict(assignment)
+                trial[name] = candidate_fmt
+                if not _within_assignment_budget(
+                    stats,
+                    trial,
+                    specs,
+                    target_bpp,
+                    bit_precision,
+                ):
+                    continue
+                trial_kl = measure_assignment_kl(
+                    model,
+                    trial,
+                    calib_ids,
+                    ref_log_probs,
+                    work_root=work_root,
+                    profile=profile,
+                )
+                measurements += 1
+                if float(trial_kl) < best_kl - 1e-12:
+                    best_flip = (name, candidate_fmt)
+                    best_kl = float(trial_kl)
+        if best_flip is None:
+            break
+        assignment[best_flip[0]] = best_flip[1]
+        current_kl = best_kl
+        flips_committed += 1
+
+    meta = {
+        "passes_completed": passes_completed,
+        "flips_committed": flips_committed,
+        "measurements": measurements,
+        "fired": bool(max_passes > 0),
+    }
+    if return_metadata:
+        return assignment, current_kl, meta
+    return assignment, current_kl
+
+
+def run_iterated_l3_polish(
+    args,
+    model,
+    initial_assignment: Mapping[str, str],
+    initial_kl: float,
+    stats: dict,
+    l2_costs: dict,
+    specs: list[fr.FormatSpec],
+    target_bpp: float,
+    calib_ids: torch.Tensor,
+    l3_calib_ids: torch.Tensor,
+    ref_log_probs,
+    *,
+    work_root: Path,
+    profile=None,
+    emit: Callable[[str], None] = _emit,
+    prefix: str = "[l3]",
+    measure_all_formats: bool = False,
+    initial_selected: list[L3NeighborhoodEntry] | None = None,
+    initial_l3_costs: dict | None = None,
+) -> L3PolishRun:
+    l3_assignment = dict(initial_assignment)
+    current_kl = float(initial_kl)
+    proposed_assignment = dict(l3_assignment)
+    proposed_kl = float(current_kl)
+    l3_cost_history: list[dict] = []
+    selected_history: list[list[L3NeighborhoodEntry]] = []
+    iteration_records: list[dict] = []
+    seen_hashes = {assignment_hash(l3_assignment)}
+    hamming_cap = max(0, int(getattr(args, "l3_hamming_cap_init", 8)))
+    hamming_cap_max = max(hamming_cap, int(getattr(args, "l3_hamming_cap_max", 64)))
+    max_iters = max(1, int(getattr(args, "l3_iter_max", 3)))
+    latest_smoothed_l3: dict = {}
+    latest_l3_costs: dict = {}
+    latest_selected: list[L3NeighborhoodEntry] = []
+    frozen_dp_meta: dict = {"frozen_dp_precision_used": "none"}
+    measurement_seconds = 0.0
+    dp_seconds = 0.0
+    validation_seconds = 0.0
+    measurement_peak: float | None = None
+    dp_peak: float | None = None
+    validation_peak: float | None = None
+    cycle_detected = False
+    termination = "max_iters"
+
+    for iteration in range(1, max_iters + 1):
+        if iteration == 1 and initial_selected is not None:
+            selected = list(initial_selected)
+        else:
+            selected = _select_l3_neighborhood_for_assignment(
+                args,
+                stats,
+                l2_costs,
+                l3_assignment,
+                specs,
+                measure_all_formats=measure_all_formats,
+            )
+        latest_selected = list(selected)
+        selected_history.append(list(selected))
+        if not selected:
+            termination = "empty_neighborhood"
+            break
+
+        if iteration == 1 and initial_l3_costs is not None:
+            l3_costs_iter = initial_l3_costs
+            measure_elapsed = 0.0
+            measure_peak = None
+        else:
+            lane_count = sum(
+                len([fmt for fmt in entry.formats if fmt != "BF16"]) + 1
+                for entry in selected
+            )
+            emit(
+                f"{prefix} iteration {iteration}: measuring "
+                f"{len(selected)} Linears x {lane_count} lanes "
+                f"cap={hamming_cap}"
+            )
+            _cuda_reset_peak()
+            measure_start = time.monotonic()
+            l3_costs_iter = measure_propagated_costs(
+                model,
+                l3_assignment,
+                selected,
+                l3_calib_ids,
+                specs,
+                work_root=work_root,
+                profile=profile,
+                max_lanes_per_batch=getattr(args, "l3_max_lanes_per_batch", 16),
+                tail_only=getattr(args, "l3_tail_only", True),
+                progress_callback=_make_l3_progress(emit, prefix=prefix),
+            )
+            measure_elapsed = time.monotonic() - measure_start
+            measure_peak = _cuda_peak_gb()
+            suffix = (
+                f", cuda_peak={measure_peak:.2f}GB"
+                if measure_peak is not None else ""
+            )
+            emit(
+                f"{prefix} iteration {iteration}: measurement done in "
+                f"{measure_elapsed:.1f}s{suffix}"
+            )
+        latest_l3_costs = l3_costs_iter
+        l3_cost_history.append(l3_costs_iter)
+        latest_smoothed_l3 = smooth_cost_history(
+            l3_cost_history,
+            decay=getattr(args, "ema_decay", 0.5),
+        )
+        measurement_seconds += float(measure_elapsed)
+        if measure_peak is not None:
+            measurement_peak = (
+                measure_peak
+                if measurement_peak is None else max(measurement_peak, measure_peak)
+            )
+
+        l3_candidates = _filter_l3_candidates_for_assignment(
+            build_l3_candidates(stats, latest_smoothed_l3, specs),
+            l3_assignment,
+        )
+        _cuda_reset_peak()
+        dp_start = time.monotonic()
+        candidate_assignment, _chosen, frozen_dp_meta = (
+            _solve_l3_candidates_with_hamming_cap(
+                stats,
+                l3_assignment,
+                l3_candidates,
+                specs,
+                target_bits=target_bpp,
+                bit_precision=getattr(args, "bit_precision", 0.001),
+                max_flips=hamming_cap,
+                budget_tolerance=getattr(args, "frozen_dp_budget_tolerance", 0.0),
+            )
+        )
+        dp_elapsed = time.monotonic() - dp_start
+        dp_peak_iter = _cuda_peak_gb()
+        dp_seconds += float(dp_elapsed)
+        if dp_peak_iter is not None:
+            dp_peak = dp_peak_iter if dp_peak is None else max(dp_peak, dp_peak_iter)
+
+        candidate_hamming = _hamming_count(l3_assignment, candidate_assignment)
+        validation_start = time.monotonic()
+        candidate_kl = measure_assignment_kl(
+            model,
+            candidate_assignment,
+            calib_ids,
+            ref_log_probs,
+            work_root=work_root,
+            profile=profile,
+        )
+        validation_elapsed = time.monotonic() - validation_start
+        validation_peak_iter = _cuda_peak_gb()
+        validation_seconds += float(validation_elapsed)
+        if validation_peak_iter is not None:
+            validation_peak = (
+                validation_peak_iter
+                if validation_peak is None else max(validation_peak, validation_peak_iter)
+            )
+        candidate_kl = float(candidate_kl)
+        proposed_assignment = dict(candidate_assignment)
+        proposed_kl = candidate_kl
+        allowed_regression = (
+            max(float(getattr(args, "l3_regression_tolerance", 0.0)), 0.0)
+            * abs(current_kl)
+        )
+        accepted_step = bool(candidate_kl <= current_kl + allowed_regression + 1e-12)
+        candidate_hash = assignment_hash(candidate_assignment)
+        record = {
+            "iteration": iteration,
+            "hamming_cap": int(hamming_cap),
+            "hamming": int(candidate_hamming),
+            "kl_before": float(current_kl),
+            "candidate_kl": float(candidate_kl),
+            "accepted": accepted_step,
+            "assignment_hash": list(candidate_hash),
+            "cycle": False,
+            "selected_count": len(selected),
+        }
+        iteration_records.append(record)
+        emit(
+            f"{prefix} iteration {iteration}: candidate_hamming="
+            f"{candidate_hamming} KL_before={current_kl:.4e} "
+            f"KL_candidate={candidate_kl:.4e} "
+            f"accepted={str(accepted_step).lower()}"
+        )
+        if not accepted_step:
+            termination = "rollback"
+            break
+        if candidate_hamming == 0:
+            termination = "fixed_point"
+            break
+        if candidate_hash in seen_hashes:
+            record["cycle"] = True
+            cycle_detected = True
+            termination = "cycle"
+            break
+        l3_assignment = dict(candidate_assignment)
+        current_kl = float(candidate_kl)
+        seen_hashes.add(candidate_hash)
+        hamming_cap = min(
+            max(hamming_cap * 2, hamming_cap + 1),
+            hamming_cap_max,
+            max(len(selected), 1),
+        )
+    else:
+        termination = "max_iters"
+
+    coord_meta = {
+        "fired": False,
+        "flips_committed": 0,
+        "passes_completed": 0,
+        "measurements": 0,
+    }
+    if bool(getattr(args, "l3_coord_descent_fallback", True)):
+        coord_passes = max(0, int(getattr(args, "l3_coord_descent_max_passes", 1)))
+        coord_start = time.monotonic()
+        l3_assignment, current_kl, coord_meta = coordinate_descent_polish(
+            model,
+            l3_assignment,
+            latest_smoothed_l3 or latest_l3_costs,
+            specs,
+            target_bpp,
+            calib_ids,
+            ref_log_probs,
+            stats=stats,
+            work_root=work_root,
+            profile=profile,
+            bit_precision=getattr(args, "bit_precision", 0.001),
+            max_passes=coord_passes,
+            current_kl=current_kl,
+            return_metadata=True,
+        )
+        coord_elapsed = time.monotonic() - coord_start
+        validation_seconds += float(coord_elapsed)
+        if coord_meta["flips_committed"]:
+            proposed_assignment = dict(l3_assignment)
+            proposed_kl = float(current_kl)
+        emit(
+            f"{prefix} coordinate descent: passes="
+            f"{coord_meta['passes_completed']} flips="
+            f"{coord_meta['flips_committed']} KL={current_kl:.4e}"
+        )
+
+    final_changed = assignment_hash(l3_assignment) != assignment_hash(initial_assignment)
+    allowed_final_regression = (
+        max(float(getattr(args, "l3_regression_tolerance", 0.0)), 0.0)
+        * abs(float(initial_kl))
+    )
+    accepted = bool(
+        final_changed
+        and float(current_kl) <= float(initial_kl) + allowed_final_regression + 1e-12
+    )
+    regression = bool(float(proposed_kl) > float(initial_kl))
+    measurement_timing = {
+        "elapsed_seconds": measurement_seconds,
+        "cuda_peak_gb": measurement_peak,
+    }
+    dp_timing = {"elapsed_seconds": dp_seconds, "cuda_peak_gb": dp_peak}
+    validation_timing = {
+        "elapsed_seconds": validation_seconds,
+        "cuda_peak_gb": validation_peak,
+    }
+    if iteration_records:
+        iteration_records[-1]["termination"] = termination
+    return L3PolishRun(
+        initial_assignment=dict(initial_assignment),
+        assignment=dict(l3_assignment),
+        proposed_assignment=dict(proposed_assignment),
+        initial_kl=float(initial_kl),
+        final_kl=float(current_kl),
+        proposed_kl=float(proposed_kl),
+        accepted=accepted,
+        regression=regression,
+        iterations=iteration_records,
+        selected=list(latest_selected),
+        selected_history=selected_history,
+        l3_cost_history=l3_cost_history,
+        l3_costs=latest_l3_costs,
+        smoothed_l3_costs=latest_smoothed_l3 or latest_l3_costs,
+        frozen_dp_meta=frozen_dp_meta,
+        measurement_timing=measurement_timing,
+        dp_timing=dp_timing,
+        validation_timing=validation_timing,
+        coord_descent_fired=bool(coord_meta["fired"]),
+        coord_descent_flips=int(coord_meta["flips_committed"]),
+        coord_descent_passes=int(coord_meta["passes_completed"]),
+        cycle_detected=cycle_detected,
+    )
 
 
 def _normalise(values: list[float]) -> list[float]:
@@ -1069,21 +1857,16 @@ def run_anchor_budget(
             f,
         )
     l3_candidates = build_l3_candidates(runtime.stats, l3_costs, runtime.specs)
-    current_fmt_by_name = {
-        name: assignment[name]
-        for name in l3_candidates
-        if name in assignment
-    }
-    l3_candidates = {
-        name: cands
-        for name, cands in l3_candidates.items()
-        if any(c.fmt == current_fmt_by_name.get(name) for c in cands)
-    }
+    l3_candidates = _filter_l3_candidates_for_assignment(
+        l3_candidates,
+        assignment,
+    )
     return AnchorResult(
         anchor_bpp=float(anchor_bpp),
         output_dir=anchor_dir,
         l2_assignment=dict(assignment),
         l2_kl=float(kl_before),
+        l3_selected=list(selected),
         l3_candidates=l3_candidates,
         l3_costs=l3_costs,
         latest_smoothed_costs=latest_smoothed_costs,
@@ -1097,38 +1880,28 @@ def solve_target_from_anchor(
     target_bpp: float,
 ) -> BudgetResult:
     target_label = _bpp_label(target_bpp)
-    if anchor.l3_candidates:
-        open_assignment, chosen = _solve_global_l3_assignment(
-            runtime.stats,
-            anchor.l3_candidates,
-            target_bpp,
-            args.bit_precision,
-        )
-        proposed_assignment = dict(anchor.l2_assignment)
-        proposed_assignment.update(open_assignment)
-        proposed_predicted = _predicted_dloss_for_chosen(chosen, runtime.stats)
-    else:
-        proposed_assignment = dict(anchor.l2_assignment)
-        proposed_predicted = _predicted_dloss_for_assignment(
-            proposed_assignment,
-            anchor.latest_smoothed_costs,
-            runtime.stats,
-        )
-    validation_kl = measure_assignment_kl(
+    polish = run_iterated_l3_polish(
+        args,
         runtime.model,
-        proposed_assignment,
+        anchor.l2_assignment,
+        anchor.l2_kl,
+        runtime.stats,
+        anchor.latest_smoothed_costs,
+        runtime.specs,
+        target_bpp,
         runtime.calib_ids,
+        runtime.l3_calib_ids,
         runtime.ref_log_probs,
         work_root=runtime.work_root,
         profile=runtime.profile,
+        prefix=f"[multi][l3] target {target_label}:",
+        measure_all_formats=bool(getattr(args, "_l3_measure_all_formats", False)),
+        initial_selected=anchor.l3_selected,
+        initial_l3_costs=anchor.l3_costs,
     )
-    allowed = (
-        anchor.l2_kl
-        + max(float(args.l3_regression_tolerance), 0.0) * abs(anchor.l2_kl)
-    )
-    accepted = bool(float(validation_kl) <= float(allowed))
+    accepted = bool(polish.accepted)
     if accepted:
-        final_assignment = dict(proposed_assignment)
+        final_assignment = dict(polish.assignment)
     else:
         final_assignment = solve_from_costs(
             runtime.stats,
@@ -1138,13 +1911,14 @@ def solve_target_from_anchor(
             bit_precision=args.bit_precision,
             profile=runtime.profile,
         )
-    predicted = (
-        proposed_predicted
-        if accepted else _predicted_dloss_for_assignment(
-            final_assignment,
-            anchor.latest_smoothed_costs,
-            runtime.stats,
-        )
+    validation_kl = (
+        float(polish.final_kl)
+        if accepted else float(polish.proposed_kl)
+    )
+    predicted = _predicted_dloss_for_assignment(
+        final_assignment,
+        anchor.latest_smoothed_costs,
+        runtime.stats,
     )
     histogram = _format_histogram(
         runtime.stats,
@@ -1162,7 +1936,7 @@ def solve_target_from_anchor(
         target_label,
         final_assignment,
     )
-    regression = bool(float(validation_kl) > float(anchor.l2_kl))
+    regression = bool(polish.regression)
     return BudgetResult(
         target_bpp=float(target_bpp),
         anchor_bpp=float(anchor.anchor_bpp),
@@ -1178,6 +1952,9 @@ def solve_target_from_anchor(
         format_histogram=histogram,
         assignment=dict(final_assignment),
         layer_config_path=str(layer_config_path),
+        l3_iterations=len(polish.iterations),
+        coord_descent_fired=bool(polish.coord_descent_fired),
+        coord_descent_flips=int(polish.coord_descent_flips),
     )
 
 
@@ -1227,6 +2004,8 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
                 f"L2_KL={l2_kl:.4g} "
                 f"L3_KL={l3_kl:.4g} "
                 f"delta={l3_kl - l2_kl:+.4g} "
+                f"iters={result.l3_iterations} "
+                f"coord={result.coord_descent_flips} "
                 f"accepted={str(result.accepted).lower()}"
             )
             if not result.accepted and l3_kl > l2_kl * 1.05:
@@ -1509,7 +2288,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--chunk-size", type=int, default=128)
     ap.add_argument("--h-detail-dir")
     ap.add_argument("--l3-polish", action="store_true",
-                    help="Run one propagated-cost polish pass after L2 convergence.")
+                    help="Run propagated-cost L3 polish after L2 convergence.")
     ap.add_argument(
         "--l3-mode",
         default="selective",
@@ -1530,6 +2309,36 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--l3-n-calib-samples", type=int, default=4)
     ap.add_argument("--l3-calib-seqlen", type=int, default=256)
     ap.add_argument("--l3-regression-tolerance", type=float, default=0.0)
+    ap.add_argument(
+        "--l3-iter-max",
+        type=int,
+        default=3,
+        help="Max iterations of L3 trust-region polish loop.",
+    )
+    ap.add_argument(
+        "--l3-hamming-cap-init",
+        type=int,
+        default=8,
+        help="Initial Hamming-distance cap on L3 DP per iteration.",
+    )
+    ap.add_argument(
+        "--l3-hamming-cap-max",
+        type=int,
+        default=64,
+        help="Maximum Hamming cap after expansion on successful L3 steps.",
+    )
+    ap.add_argument(
+        "--l3-coord-descent-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run coordinate-descent greedy after iterated L3.",
+    )
+    ap.add_argument(
+        "--l3-coord-descent-max-passes",
+        type=int,
+        default=1,
+        help="Max coordinate-descent passes after iterated L3.",
+    )
     ap.add_argument(
         "--frozen-dp-budget-tolerance",
         type=float,
@@ -1976,7 +2785,6 @@ def main(argv: list[str] | None = None) -> int:
                 f"[l3] uncertain {entry.name}: top2={top2} "
                 f"margin={entry.margin:.6g} reasons={list(entry.reasons)}"
             )
-        l3_measure_start = time.monotonic()
         l3_lane_count = sum(
             len([fmt for fmt in entry.formats if fmt != "BF16"]) + 1
             for entry in selected
@@ -1990,32 +2798,32 @@ def main(argv: list[str] | None = None) -> int:
             f"{avg_formats:.2f} formats = {l3_lane_count} total lanes"
         )
 
-        _cuda_reset_peak()
-        l3_costs = measure_propagated_costs(
+        polish_run = run_iterated_l3_polish(
+            args,
             model,
             l2_assignment,
-            selected,
-            l3_calib_ids,
+            kl_before,
+            stats,
+            latest_smoothed_costs,
             specs,
+            args.target_bits,
+            calib_ids,
+            l3_calib_ids,
+            ref_log_probs,
             work_root=work_root,
             profile=profile,
-            max_lanes_per_batch=args.l3_max_lanes_per_batch,
-            tail_only=args.l3_tail_only,
-            progress_callback=_make_l3_progress(_emit),
+            initial_selected=selected,
         )
-        l3_elapsed_seconds = time.monotonic() - l3_measure_start
-        l3_peak_gb = _cuda_peak_gb()
-        suffix = f", cuda_peak={l3_peak_gb:.2f}GB" if l3_peak_gb is not None else ""
-        _emit(f"[l3] measurement done in {l3_elapsed_seconds:.1f}s{suffix}")
-        l3_measure_timing = {
-            "elapsed_seconds": l3_elapsed_seconds,
-            "cuda_peak_gb": l3_peak_gb,
-        }
+        l3_costs = polish_run.smoothed_l3_costs
+        l3_elapsed_seconds = float(polish_run.measurement_timing["elapsed_seconds"])
+        l3_peak_gb = polish_run.measurement_timing.get("cuda_peak_gb")
+        l3_measure_timing = dict(polish_run.measurement_timing)
         l3_cost_path = output_root / "l3_propagated_costs.pkl"
         with open(l3_cost_path, "wb") as f:
             pickle.dump(
                 {
                     "costs": l3_costs,
+                    "cost_history": polish_run.l3_cost_history,
                     "formats": [s.name for s in specs],
                     "meta": {
                         "model": args.model,
@@ -2029,6 +2837,12 @@ def main(argv: list[str] | None = None) -> int:
                         "l3_max_lanes_per_batch": int(args.l3_max_lanes_per_batch),
                         "l3_n_calib_samples": int(args.l3_n_calib_samples),
                         "l3_calib_seqlen": int(args.l3_calib_seqlen),
+                        "l3_iter_max": int(args.l3_iter_max),
+                        "l3_iterations": len(polish_run.iterations),
+                        "l3_hamming_cap_init": int(args.l3_hamming_cap_init),
+                        "l3_hamming_cap_max": int(args.l3_hamming_cap_max),
+                        "coord_descent_fired": bool(polish_run.coord_descent_fired),
+                        "coord_descent_flips": int(polish_run.coord_descent_flips),
                     },
                 },
                 f,
@@ -2069,113 +2883,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"L2_cost={item['l2_cost']:.6g} L3_cost={item['l3_cost']:.6g} "
                 f"amplification={item['amplification']:.6g}"
             )
-        l3_candidates = build_l3_candidates(stats, l3_costs, specs)
-        current_fmt_by_name = {
-            name: l2_assignment[name]
-            for name in l3_candidates
-            if name in l2_assignment
-        }
-        l3_candidates = {
-            name: cands
-            for name, cands in l3_candidates.items()
-            if any(c.fmt == current_fmt_by_name.get(name) for c in cands)
-        }
-        total_params = sum(
-            int(stats[name].get("n_params", 0) or 0)
-            for name in set(stats) & set(l2_assignment)
-        )
-        open_names = set(l3_candidates)
-        if args.l3_mode == "global":
-            _emit(
-                f"[l3] solving global DP: open={len(open_names)}, "
-                f"target_bpp={args.target_bits:.4f}"
-            )
-            frozen_solve_start = _phase_start("[l3] global DP solve")
-            if l3_candidates:
-                global_stats = {
-                    name: stats[name]
-                    for name in l3_candidates
-                    if name in stats
-                }
-                result = solve_allocation(
-                    global_stats,
-                    l3_candidates,
-                    args.target_bits,
-                    args.bit_precision,
-                )
-                if result is None:
-                    raise RuntimeError(
-                        "L3 global DP could not find a feasible allocation "
-                        f"within bit_precision={args.bit_precision}."
-                    )
-                open_assignment, _chosen = result
-                polished_assignment = dict(l2_assignment)
-                polished_assignment.update(open_assignment)
-                frozen_dp_meta = {
-                    "frozen_dp_precision_used": args.bit_precision,
-                    "global_dp": True,
-                }
-            else:
-                polished_assignment = dict(l2_assignment)
-                frozen_dp_meta = {
-                    "frozen_dp_precision_used": "none",
-                    "global_dp": True,
-                }
-            frozen_solve_timing = _phase_end(
-                "[l3] global DP solve",
-                frozen_solve_start,
-            )
-        else:
-            frozen_assignment = {
-                name: l2_assignment[name]
-                for name in sorted((set(stats) & set(l2_assignment)) - open_names)
-            }
-            frozen_bits = assignment_bit_total(
-                stats,
-                frozen_assignment,
-                {s.name: s for s in specs},
-            )
-            target_total_bits = float(args.target_bits) * float(total_params)
-            open_params = sum(
-                int(stats[name].get("n_params", 0) or 0)
-                for name in open_names
-            )
-            remaining_bpp = (
-                (target_total_bits - frozen_bits) / float(open_params)
-                if open_params > 0 else 0.0
-            )
-            frozen_bpp_total = (
-                frozen_bits / float(total_params)
-                if total_params > 0 else 0.0
-            )
-            _emit(
-                f"[l3] solving frozen DP: open={len(open_names)}, "
-                f"frozen={len(frozen_assignment)}, remaining_bpp={remaining_bpp:.4f}"
-            )
-            _emit(
-                f"[l3] frozen DP detail: frozen {len(frozen_assignment)} "
-                f"({frozen_bpp_total:.4f} bpp total), open {len(open_names)}, "
-                f"remaining_bpp {remaining_bpp:.4f}"
-            )
-            frozen_solve_start = _phase_start("[l3] frozen DP solve")
-            if l3_candidates:
-                polished_assignment, _chosen, frozen_dp_meta = solve_frozen_l3_neighborhood(
-                    stats,
-                    l2_assignment,
-                    l3_candidates,
-                    specs,
-                    target_bits=args.target_bits,
-                    bit_precision=args.bit_precision,
-                    budget_tolerance=args.frozen_dp_budget_tolerance,
-                    return_metadata=True,
-                )
-            else:
-                polished_assignment = dict(l2_assignment)
-                frozen_dp_meta = {"frozen_dp_precision_used": "none"}
-            frozen_solve_timing = _phase_end(
-                "[l3] frozen DP solve",
-                frozen_solve_start,
-            )
+        polished_assignment = dict(polish_run.proposed_assignment)
+        accepted_assignment = dict(polish_run.assignment)
+        kl_after = float(polish_run.proposed_kl)
+        final_kl = float(polish_run.final_kl)
+        frozen_dp_meta = dict(polish_run.frozen_dp_meta)
+        frozen_solve_timing = dict(polish_run.dp_timing)
+        kl_after_timing = dict(polish_run.validation_timing)
+        polish_accepted = bool(polish_run.accepted)
+        regression = bool(polish_run.regression)
         l3_all_flips = []
         for name in sorted(set(l2_assignment) | set(polished_assignment)):
             old_fmt = l2_assignment.get(name)
@@ -2208,29 +2924,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"[l3] flip {item['name']} {item['from']}->{item['to']} "
                 f"L3_delta={item['delta']:.6g}"
             )
-        kl_after_start = _phase_start("[l3] validation KL after")
-        kl_after = measure_assignment_kl(
-            model,
-            polished_assignment,
-            calib_ids,
-            ref_log_probs,
-            work_root=work_root,
-            profile=profile,
-        )
-        kl_after_timing = _phase_end("[l3] validation KL after", kl_after_start)
-        regression = bool(float(kl_after) > float(kl_before))
-        allowed_kl_after = (
-            float(kl_before)
-            + max(float(args.l3_regression_tolerance), 0.0) * abs(float(kl_before))
-        )
-        polish_accepted = bool(float(kl_after) <= allowed_kl_after)
         l3_kl_improvement_pct = (
-            (float(kl_before) - float(kl_after)) / abs(float(kl_before)) * 100.0
+            (float(kl_before) - float(final_kl)) / abs(float(kl_before)) * 100.0
             if abs(float(kl_before)) > 1e-12 else 0.0
         )
         _emit(
             f"[l3] validating: KL_before={kl_before:.4e}, "
-            f"KL_after={kl_after:.4e}, regression={str(regression).lower()}, "
+            f"KL_after={final_kl:.4e}, regression={str(regression).lower()}, "
             f"improvement={l3_kl_improvement_pct:.2f}%"
         )
         if not polish_accepted:
@@ -2243,9 +2943,6 @@ def main(argv: list[str] | None = None) -> int:
                 f"kl_after={kl_after:.4e}, delta=+{delta_pct:.2f}%); "
                 "REJECTING polish, falling back to L2 assignment."
             )
-        accepted_assignment = (
-            dict(polished_assignment) if polish_accepted else dict(l2_assignment)
-        )
         l3_flip_count = sum(
             1
             for name in set(l2_assignment) | set(accepted_assignment)
@@ -2289,6 +2986,15 @@ def main(argv: list[str] | None = None) -> int:
         l3_summary["accepted_flip_count"] = int(l3_flip_count)
         l3_summary["regression_tolerance"] = float(args.l3_regression_tolerance)
         l3_summary["cost_path"] = str(l3_cost_path)
+        l3_summary["final_kl"] = float(final_kl)
+        l3_summary["l3_iterations"] = len(polish_run.iterations)
+        l3_summary["l3_iteration_trace"] = polish_run.iterations
+        l3_summary["l3_hamming_cap_init"] = int(args.l3_hamming_cap_init)
+        l3_summary["l3_hamming_cap_max"] = int(args.l3_hamming_cap_max)
+        l3_summary["l3_cycle_detected"] = bool(polish_run.cycle_detected)
+        l3_summary["coord_descent_fired"] = bool(polish_run.coord_descent_fired)
+        l3_summary["coord_descent_flips"] = int(polish_run.coord_descent_flips)
+        l3_summary["coord_descent_passes"] = int(polish_run.coord_descent_passes)
         l3_summary["frozen_dp_attempts"] = frozen_dp_meta.get("frozen_dp_attempts")
         l3_summary["frozen_dp_greedy"] = frozen_dp_meta.get("frozen_dp_greedy")
         l3_summary["frozen_dp_budget_tolerance"] = frozen_dp_meta.get(
@@ -2338,6 +3044,8 @@ def main(argv: list[str] | None = None) -> int:
                     "from": l2_assignment.get(entry.name),
                     "to": accepted_assignment.get(entry.name),
                     "proposed_to": polished_assignment.get(entry.name),
+                    "l3_iterations": len(polish_run.iterations),
+                    "coord_descent_flips": int(polish_run.coord_descent_flips),
                     "timing": l3_summary["timing"],
                 },
             )
@@ -2397,6 +3105,11 @@ def main(argv: list[str] | None = None) -> int:
             _emit(f"L3 flips: {l3_flip_count} accepted / {proposed_flips} proposed")
         else:
             _emit(f"L3 flips: {l3_flip_count}")
+        if l3_summary_path:
+            _emit(
+                f"L3 iterations: {l3_summary.get('l3_iterations', 0)} "
+                f"coord_flips={l3_summary.get('coord_descent_flips', 0)}"
+            )
         _emit(f"KL improvement: {improvement}")
     _emit(f"Total wall time: {total_wall:.1f}s")
     _emit("== marginal cost ==")

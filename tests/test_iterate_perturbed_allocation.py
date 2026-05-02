@@ -251,6 +251,7 @@ def _run_tiny_l3_regression_case(tmp_path, monkeypatch, *, tolerance, kl_after):
         "--max-iters", "1",
         "--convergence-frac", "1",
         "--l3-polish",
+        "--no-l3-coord-descent-fallback",
         "--no-l3-tail-only",
     ]
     if tolerance is not None:
@@ -301,6 +302,7 @@ def test_solve_target_from_anchor_rejects_to_l2_at_target(tmp_path, monkeypatch)
         output_dir=tmp_path / "anchor_bpp_16.00",
         l2_assignment={"layer": "BF16"},
         l2_kl=1.0,
+        l3_selected=[],
         l3_candidates={},
         l3_costs={},
         latest_smoothed_costs=costs,
@@ -593,6 +595,8 @@ def _run_global_l3_case(tmp_path, monkeypatch, *, l3_costs, kl_after):
         "--convergence-frac", "1",
         "--l3-polish",
         "--l3-mode", "global",
+        "--l3-iter-max", "1",
+        "--no-l3-coord-descent-fallback",
         "--no-l3-tail-only",
     ])
     with open(output_dir / "final_assignment.json") as f:
@@ -677,6 +681,204 @@ def test_global_l3_respects_regression_rollback(tmp_path, monkeypatch):
     assert summary["regression"] is True
     assert summary["accepted"] is False
     assert summary["accepted_assignment"] == "l2"
+
+
+def _iterated_l3_args(**overrides):
+    values = dict(
+        l3_mode="global",
+        l3_iter_max=3,
+        l3_hamming_cap_init=1,
+        l3_hamming_cap_max=4,
+        l3_coord_descent_fallback=False,
+        l3_coord_descent_max_passes=1,
+        l3_max_lanes_per_batch=4,
+        l3_tail_only=False,
+        l3_regression_tolerance=0.0,
+        ema_decay=0.5,
+        bit_precision=0.001,
+        frozen_dp_budget_tolerance=0.0,
+        l3_uncertainty_rel_tol=0.10,
+        l3_min_fraction=0.05,
+        l3_max_fraction=1.0,
+        l3_safety_fraction=0.0,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_l3_iteration_monotone(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(2)}
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    assignment = {name: "INT8_W8A16" for name in stats}
+    l2_costs = {
+        name: {
+            "INT8_W8A16": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+        for name in stats
+    }
+
+    def _measure(_model, current_assignment, selected, *_args, **_kwargs):
+        del selected
+        if current_assignment["layer0"] == "INT8_W8A16":
+            return {
+                "layer0": {
+                    "INT8_W8A16": {"propagated_end_kl": 2.0},
+                    "BF16": {"propagated_end_kl": 0.0},
+                },
+                "layer1": {
+                    "INT8_W8A16": {"propagated_end_kl": 2.0},
+                    "BF16": {"propagated_end_kl": 3.0},
+                },
+            }
+        return {
+            name: {
+                "INT8_W8A16": {"propagated_end_kl": 2.0},
+                "BF16": {"propagated_end_kl": 0.0},
+            }
+            for name in stats
+        }
+
+    def _kl(_model, trial_assignment, *_args, **_kwargs):
+        bf16_count = sum(fmt == "BF16" for fmt in trial_assignment.values())
+        return 3.0 - float(bf16_count)
+
+    monkeypatch.setattr(ipa, "measure_propagated_costs", _measure)
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _kl)
+
+    result = ipa.run_iterated_l3_polish(
+        _iterated_l3_args(l3_hamming_cap_init=1, l3_hamming_cap_max=2),
+        _TinyLogitsModel(),
+        assignment,
+        3.0,
+        stats,
+        l2_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        work_root=tmp_path,
+    )
+
+    accepted = [
+        row for row in result.iterations
+        if row["accepted"] and row["hamming"] > 0
+    ]
+    assert len(accepted) >= 2
+    kl_sequence = [3.0] + [row["candidate_kl"] for row in accepted]
+    assert all(
+        after <= before
+        for before, after in zip(kl_sequence, kl_sequence[1:])
+    )
+    assert result.final_kl <= 3.0
+
+
+def test_l3_hamming_cap_respected():
+    stats = {f"layer{i}": _tiny_stat() for i in range(4)}
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    costs = {
+        name: {
+            "INT8_W8A16": {"predicted_dloss": 10.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+        for name in stats
+    }
+    baseline = {name: "INT8_W8A16" for name in stats}
+
+    solved = ipa.solve_from_costs_with_cap(
+        stats,
+        costs,
+        specs,
+        target_bits=16.0,
+        bit_precision=0.001,
+        baseline_assignment=baseline,
+        max_flips=2,
+    )
+
+    assert ipa._hamming_count(baseline, solved) <= 2
+
+
+def test_coord_descent_non_regressive(tmp_path, monkeypatch):
+    stats = {"layer": _tiny_stat()}
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    l3_costs = {
+        "layer": {
+            "INT8_W8A16": {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 0.0},
+        }
+    }
+
+    def _kl(_model, assignment, *_args, **_kwargs):
+        return 0.5 if assignment["layer"] == "BF16" else 1.0
+
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _kl)
+
+    polished, final_kl, meta = ipa.coordinate_descent_polish(
+        _TinyLogitsModel(),
+        {"layer": "INT8_W8A16"},
+        l3_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=1.0,
+        return_metadata=True,
+    )
+
+    assert final_kl <= 1.0
+    assert polished == {"layer": "BF16"}
+    assert meta["flips_committed"] == 1
+
+
+def test_l3_iteration_terminates_on_cycle(tmp_path, monkeypatch):
+    stats = {"layer": _tiny_stat()}
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    l2_costs = {
+        "layer": {
+            "INT8_W8A16": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    }
+    initial = {"layer": "INT8_W8A16"}
+
+    monkeypatch.setattr(
+        ipa,
+        "measure_propagated_costs",
+        lambda *_args, **_kwargs: {
+            "layer": {
+                "INT8_W8A16": {"propagated_end_kl": 0.0},
+                "BF16": {"propagated_end_kl": 0.0},
+            }
+        },
+    )
+    monkeypatch.setattr(ipa, "measure_assignment_kl", lambda *_args, **_kwargs: 1.0)
+
+    def _solve_cycle(_stats, assignment, *_args, **_kwargs):
+        next_fmt = "BF16" if assignment["layer"] == "INT8_W8A16" else "INT8_W8A16"
+        return {"layer": next_fmt}, {}, {"frozen_dp_precision_used": 0.001}
+
+    monkeypatch.setattr(ipa, "_solve_l3_candidates_with_hamming_cap", _solve_cycle)
+
+    result = ipa.run_iterated_l3_polish(
+        _iterated_l3_args(l3_iter_max=4),
+        _TinyLogitsModel(),
+        initial,
+        1.0,
+        stats,
+        l2_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        work_root=tmp_path,
+    )
+
+    assert result.cycle_detected is True
+    assert len(result.iterations) == 2
 
 
 def test_multi_budget_clusters_by_tolerance():
