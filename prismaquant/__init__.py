@@ -95,6 +95,15 @@ def _polyfill_transformers() -> None:
             ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
     except Exception:
         pass
+    try:
+        # Qwen3 upstream recomputes rotary cos/sin with a per-forward
+        # FP32 BMM. Under deterministic cuBLAS plus PrismaQuant imports,
+        # that BMM can produce NaNs after model.cuda(). Route Qwen3
+        # AutoModel loads to the vendored cached-RoPE copy.
+        from .vendored import register_qwen3 as _register_qwen3
+        _register_qwen3()
+    except Exception:
+        pass
 
 
 _polyfill_transformers()

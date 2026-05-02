@@ -57,3 +57,8 @@ class Qwen3Profile(ModelProfile):
 
     def per_expert_mtp_regex(self) -> str | None:
         return None
+
+    def register_vendored_modeling(self) -> None:
+        """Install the vendored Qwen3 causal-LM class with cached RoPE."""
+        from ..vendored import register_qwen3
+        register_qwen3()

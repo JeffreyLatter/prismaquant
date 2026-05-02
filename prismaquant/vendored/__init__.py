@@ -1,9 +1,11 @@
-"""Vendored modeling code for architectures not yet on transformers main.
+"""Vendored modeling code for architecture gaps and local compatibility fixes.
 
 Currently:
 - transformers_deepseek_v4/ — from transformers PR #45643 (Arthur Zucker's
   add-deepseek-v4 branch, vendored 2026-04-27). Required because DSv4 is
   the test target for the prismaquant DSv4-Flash-Base run.
+- transformers_qwen3/ — local Qwen3 copy with RoPE cos/sin precomputed at
+  init time to avoid deterministic cuBLAS NaNs in per-forward RoPE matmul.
 """
 from __future__ import annotations
 
@@ -13,6 +15,28 @@ import sys
 from pathlib import Path
 
 _VENDOR_DIR = Path(__file__).parent
+
+
+_QWEN3_REGISTERED = False
+
+
+def register_qwen3() -> None:
+    """Route Qwen3 causal-LM loads to PrismaQuant's vendored model.
+
+    Idempotent — safe to call on any PrismaQuant import or profile detect.
+    Uses the upstream Qwen3Config and only replaces the causal-LM model class.
+    """
+    global _QWEN3_REGISTERED
+    if _QWEN3_REGISTERED:
+        return
+
+    from transformers import AutoModelForCausalLM
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+
+    from .transformers_qwen3.modeling_qwen3 import Qwen3ForCausalLM
+
+    AutoModelForCausalLM.register(Qwen3Config, Qwen3ForCausalLM, exist_ok=True)
+    _QWEN3_REGISTERED = True
 
 
 def register_deepseek_v4() -> None:
