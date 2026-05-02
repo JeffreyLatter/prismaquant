@@ -117,6 +117,37 @@ def _env_int(name: str, default: int) -> int:
     return max(parsed, 0)
 
 
+_PRISMAQUANT_GRAPH_POOL = None
+
+
+def get_prismaquant_graph_pool():
+    """Return the process-wide CUDA graph memory pool, or None when disabled."""
+    if not _env_flag_enabled("PRISMAQUANT_GRAPH_SHARED_POOL", default=True):
+        return None
+    if not torch.cuda.is_available():
+        return None
+    global _PRISMAQUANT_GRAPH_POOL
+    if _PRISMAQUANT_GRAPH_POOL is None:
+        _PRISMAQUANT_GRAPH_POOL = torch.cuda.graph_pool_handle()
+    return _PRISMAQUANT_GRAPH_POOL
+
+
+def _cuda_graph_pool_id(pool) -> str:
+    if pool is None:
+        return "private"
+    return f"shared:{id(pool):x}"
+
+
+def get_prismaquant_graph_pool_id() -> str:
+    if not _env_flag_enabled("PRISMAQUANT_GRAPH_SHARED_POOL", default=True):
+        return "private"
+    if not torch.cuda.is_available():
+        return "unavailable"
+    if _PRISMAQUANT_GRAPH_POOL is None:
+        return "shared:uninitialized"
+    return _cuda_graph_pool_id(_PRISMAQUANT_GRAPH_POOL)
+
+
 def _cost_entry(costs: Mapping, name: str, fmt: str) -> dict | None:
     per_name = costs.get(name, {})
     if not isinstance(per_name, Mapping):
@@ -1151,6 +1182,8 @@ def _first_cuda_tensor(value) -> torch.Tensor | None:
 
 
 def _clone_cuda_graph_output(value):
+    if not _env_flag_enabled("PRISMAQUANT_GRAPH_OUTPUT_CLONE", default=True):
+        return value
     if isinstance(value, torch.Tensor):
         return value.clone()
     if isinstance(value, Mapping):
@@ -1209,6 +1242,11 @@ class CUDAGraphRegistry:
     Each entry owns graph activation memory plus static input/output tensors.
     The default cap is intentionally small and can be overridden per path with
     the registry's ``max_entries_env`` variable.
+
+    Replays return a clone of the static output by default. Setting
+    ``PRISMAQUANT_GRAPH_OUTPUT_CLONE=0`` returns the static output directly to
+    avoid a per-replay allocation; callers must consume it before the next replay
+    for the same entry because that replay overwrites the tensor in-place.
     """
 
     def __init__(
@@ -1229,6 +1267,12 @@ class CUDAGraphRegistry:
         self.disabled_keys: set[tuple] = set()
         self.eviction_count = 0
         register_budget_evictor(self)
+
+    def graph_pool(self):
+        return get_prismaquant_graph_pool()
+
+    def graph_pool_id(self) -> str:
+        return get_prismaquant_graph_pool_id()
 
     def clear(self) -> None:
         self.entries.clear()
@@ -1492,7 +1536,13 @@ class CUDAGraphRegistry:
                 except Exception as exc:
                     self._verbose_exception(label, "enable debug mode failed", exc)
         try:
-            with torch.cuda.graph(graph), torch.no_grad():
+            graph_pool = self.graph_pool()
+            graph_cm = (
+                torch.cuda.graph(graph, pool=graph_pool)
+                if graph_pool is not None
+                else torch.cuda.graph(graph)
+            )
+            with graph_cm, torch.no_grad():
                 static_output = fn(*static_args, **static_kwargs)
         except Exception as exc:
             self._verbose_exception(label, "capture body/end failed", exc)
@@ -1548,12 +1598,26 @@ class _TailCudaGraphEntry:
 
 
 class _TailCudaGraphCache:
+    """Bounded tail-forward CUDA graph cache.
+
+    When ``PRISMAQUANT_GRAPH_OUTPUT_CLONE=0`` replay returns the static output
+    directly. The L3 callers consume it in the current batch before another tail
+    replay can overwrite the same graph output.
+    """
+
     def __init__(self, *, enabled: bool):
+        self.label = "l3-tail"
         self.enabled = bool(enabled) and torch.cuda.is_available()
         self.entries: OrderedDict[tuple, _TailCudaGraphEntry] = OrderedDict()
         self.disabled_keys: set[tuple] = set()
         self.eviction_count = 0
         register_budget_evictor(self)
+
+    def graph_pool(self):
+        return get_prismaquant_graph_pool()
+
+    def graph_pool_id(self) -> str:
+        return get_prismaquant_graph_pool_id()
 
     def clear(self) -> None:
         self.entries.clear()
@@ -1640,7 +1704,7 @@ class _TailCudaGraphCache:
                     hidden_state,
                 )
             entry.graph.replay()
-            return entry.static_output.clone()
+            return _clone_cuda_graph_output(entry.static_output)
         if key in self.disabled_keys:
             return _tail_forward_eager(
                 model,
@@ -1680,7 +1744,7 @@ class _TailCudaGraphCache:
             device=hidden_state.device,
             reason="l3-tail CUDA graph capture",
         )
-        return entry.static_output.clone()
+        return _clone_cuda_graph_output(entry.static_output)
 
     def _capture(
         self,
@@ -1711,7 +1775,13 @@ class _TailCudaGraphCache:
                 )
         current_stream.wait_stream(side_stream)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        graph_pool = self.graph_pool()
+        graph_cm = (
+            torch.cuda.graph(graph, pool=graph_pool)
+            if graph_pool is not None
+            else torch.cuda.graph(graph)
+        )
+        with graph_cm:
             static_output = _tail_forward_eager(
                 model,
                 layer_idx,
@@ -1739,6 +1809,8 @@ def tail_forward_from_layer(
     lane_count: int | None = None,
 ) -> torch.Tensor:
     if cuda_graph_cache is not None:
+        # L3 consumes these logits in the current calibration batch before any
+        # next tail replay, which is required when output cloning is disabled.
         return cuda_graph_cache.run(
             model,
             layer_idx,
@@ -2465,14 +2537,22 @@ def measure_lane_batched_kl_deltas(
                     )
 
                     def _replay_forward():
-                        return _lane_replay_cache_logits(
-                            replay_cache,
-                            int(replay_layer_idx),
-                            lane_count=len(lanes),
-                            base_batch=base_batch,
-                            target_names=target_names,
+                        logits = _extract_logits(
+                            _lane_replay_cache_logits(
+                                replay_cache,
+                                int(replay_layer_idx),
+                                lane_count=len(lanes),
+                                base_batch=base_batch,
+                                target_names=target_names,
+                            )
                         )
+                        if logits.dim() >= 3:
+                            return logits[:, -1:, :].clone()
+                        return logits
 
+                    # With PRISMAQUANT_GRAPH_OUTPUT_CLONE=0 this returns the
+                    # static graph tensor; the KL loop below consumes it before
+                    # any next replay can overwrite the same graph output.
                     logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
                         "coord-lane-replay",
                         (
@@ -2587,8 +2667,13 @@ def measure_lane_batched_kl_deltas(
                     )
 
                     def _full_forward(*call_args, **call_kwargs):
-                        return _extract_logits(model(*call_args, **call_kwargs))
+                        logits = _extract_logits(model(*call_args, **call_kwargs))
+                        if logits.dim() >= 3:
+                            return logits[:, -1:, :].clone()
+                        return logits
 
+                    # With PRISMAQUANT_GRAPH_OUTPUT_CLONE=0 this static output
+                    # is split and reduced to scalar KLs before another replay.
                     logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
                         "coord-lane-full",
                         (

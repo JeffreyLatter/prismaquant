@@ -37,7 +37,10 @@ from prismaquant.build_rtn_cache import (
     load_wikitext_calibration,
 )
 from prismaquant.measure_quant_cost import ActivationIndex, run_cost_pass
-from prismaquant.memory_management import phase_boundary_memory_cleanup
+from prismaquant.memory_management import (
+    phase_boundary_memory_cleanup,
+    report_graph_memory,
+)
 from prismaquant.perturbed_x_cache import (
     PerturbedActivationCache,
     calibration_data_hash,
@@ -546,6 +549,10 @@ def _phase_end(label: str, start: float) -> dict:
 
 def _phase_boundary_cleanup(label: str) -> None:
     phase_boundary_memory_cleanup(label)
+
+
+def _report_graph_memory(label: str) -> None:
+    report_graph_memory(label)
 
 
 def _directory_size_bytes(path: Path) -> int:
@@ -2020,6 +2027,7 @@ def run_iterated_l3_polish(
                 f"{prefix} iteration {iteration}: measurement done in "
                 f"{measure_elapsed:.1f}s{suffix}"
             )
+        _report_graph_memory(f"{prefix} iteration {iteration} after_l3_measurement")
         latest_l3_costs = l3_costs_iter
         l3_cost_history.append(l3_costs_iter)
         latest_smoothed_l3 = smooth_cost_history(
@@ -2058,6 +2066,7 @@ def run_iterated_l3_polish(
             dp_peak = dp_peak_iter if dp_peak is None else max(dp_peak, dp_peak_iter)
 
         candidate_hamming = _hamming_count(l3_assignment, candidate_assignment)
+        _report_graph_memory(f"{prefix} iteration {iteration} before_validation")
         validation_start = time.monotonic()
         candidate_kl = measure_assignment_kl(
             model,
@@ -2069,6 +2078,7 @@ def run_iterated_l3_polish(
         )
         validation_elapsed = time.monotonic() - validation_start
         validation_peak_iter = _cuda_peak_gb()
+        _report_graph_memory(f"{prefix} iteration {iteration} after_validation")
         validation_seconds += float(validation_elapsed)
         if validation_peak_iter is not None:
             validation_peak = (
@@ -2160,6 +2170,7 @@ def run_iterated_l3_polish(
             max_lanes_per_batch=getattr(args, "l3_max_lanes_per_batch", 64),
         )
         coord_elapsed = time.monotonic() - coord_start
+        _report_graph_memory(f"{prefix} after_coord_descent")
         validation_seconds += float(coord_elapsed)
         if coord_meta["flips_committed"]:
             proposed_assignment = dict(l3_assignment)
@@ -2526,6 +2537,7 @@ def run_anchor_budget(
         )
         assignment = dict(next_assignment)
         assignment_history.append(dict(assignment))
+        _report_graph_memory(f"[multi][l2] anchor {anchor_label} iter {iteration} after")
         if hamming["ratio"] <= float(args.convergence_frac):
             convergence_reached = True
             break
@@ -2535,6 +2547,8 @@ def run_anchor_budget(
         f"{'converged' if convergence_reached else 'max-iters'}"
     )
     _phase_boundary_cleanup(f"anchor_{anchor_label}_l2_to_l3")
+    _report_graph_memory(f"anchor_{anchor_label}_l2_to_l3")
+    _report_graph_memory(f"[multi][l3] anchor {anchor_label} before_validation")
     kl_before = measure_assignment_kl(
         runtime.model,
         assignment,
@@ -2543,6 +2557,7 @@ def run_anchor_budget(
         work_root=runtime.work_root,
         profile=runtime.profile,
     )
+    _report_graph_memory(f"[multi][l3] anchor {anchor_label} after_validation")
     selected = build_global_l3_neighborhood(
         runtime.stats,
         latest_smoothed_costs,
@@ -2586,6 +2601,7 @@ def run_anchor_budget(
                 prefix=f"[multi][l3] anchor {anchor_label}:",
             ),
         )
+        _report_graph_memory(f"[multi][l3] anchor {anchor_label} after_l3_measurement")
     l3_cost_path = anchor_dir / "l3_propagated_costs.pkl"
     meta_extra = {
         "l3_mode": "global",
@@ -3055,8 +3071,11 @@ def measure_assignment_kl(
                     for i in range(calib_ids.size(0)):
                         batch = calib_ids[i:i + 1].to(device)
                         def _forward(batch_ids):
-                            return model(batch_ids).logits[:, -1:, :]
+                            return model(batch_ids).logits[:, -1:, :].clone()
 
+                        # With PRISMAQUANT_GRAPH_OUTPUT_CLONE=0 this returns
+                        # the graph's static logits tensor. It is consumed by
+                        # KL immediately and not retained across replays.
                         logits = _KL_CUDA_GRAPH_REGISTRY.run(
                             "assignment-kl-forward",
                             graph_key,
@@ -3588,11 +3607,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         assignment = dict(next_assignment)
         assignment_history.append(dict(assignment))
+        _report_graph_memory(f"[l2] iteration {iteration} after")
         if verdict == "converged":
             convergence_reached = True
             break
 
     _phase_boundary_cleanup("single_budget_l2_to_l3")
+    _report_graph_memory("single_budget_l2_to_l3")
     l3_summary_path = None
     l3_cost_path = None
     l3_flip_count = 0
@@ -3606,6 +3627,7 @@ def main(argv: list[str] | None = None) -> int:
         # exposed because each propagated measurement is still expensive even
         # when tail-only propagation is available.
         l2_assignment = dict(assignment)
+        _report_graph_memory("[l3] validation KL before start")
         kl_before_start = _phase_start("[l3] validation KL before")
         kl_before = measure_assignment_kl(
             model,
@@ -3619,6 +3641,7 @@ def main(argv: list[str] | None = None) -> int:
             "[l3] validation KL before",
             kl_before_start,
         )
+        _report_graph_memory("[l3] validation KL before done")
         selection_start = _phase_start("[l3] selection")
         n_total = len(set(stats) & set(l2_assignment))
         try:

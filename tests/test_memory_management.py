@@ -7,9 +7,10 @@ import torch
 import torch.nn as nn
 
 from prismaquant import iterate_perturbed_allocation as ipa
+from prismaquant import propagated_cost as pc
 from prismaquant.perturbed_x_cache import PerturbedActivationCache
 from prismaquant.propagated_cost import CUDAGraphRegistry, _CUDAGraphEntry
-from prismaquant.memory_management import enforce_gpu_memory_budget
+from prismaquant.memory_management import enforce_gpu_memory_budget, report_graph_memory
 
 
 class _ManyLinear(nn.Module):
@@ -83,6 +84,109 @@ def test_cuda_graph_capture_failure_cleanup_resets_graph(monkeypatch):
     )
 
     assert calls == ["reset", ("sync", "cuda:0"), "empty"]
+
+
+def test_cuda_graph_registries_share_lazy_pool(monkeypatch):
+    sentinel = object()
+    calls = []
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "1")
+    monkeypatch.setattr(pc, "_PRISMAQUANT_GRAPH_POOL", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "graph_pool_handle",
+        lambda: calls.append("pool") or sentinel,
+        raising=False,
+    )
+
+    first = CUDAGraphRegistry(label="pool-a")
+    second = CUDAGraphRegistry(label="pool-b")
+
+    assert first.graph_pool() is sentinel
+    assert second.graph_pool() is sentinel
+    assert pc.get_prismaquant_graph_pool() is sentinel
+    assert calls == ["pool"]
+    assert first.graph_pool_id() == second.graph_pool_id()
+
+
+def test_cuda_graph_shared_pool_env_can_disable(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "graph_pool_handle",
+        lambda: pytest.fail("disabled shared pool should not initialize"),
+        raising=False,
+    )
+
+    registry = CUDAGraphRegistry(label="private-pool")
+
+    assert registry.graph_pool() is None
+    assert registry.graph_pool_id() == "private"
+
+
+def test_cuda_graph_output_clone_can_return_static_replay_tensor(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_OUTPUT_CLONE", "0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    registry = CUDAGraphRegistry(label="output-alias", max_entries=4)
+    arg = torch.ones(2)
+    static_arg = torch.empty_like(arg)
+    static_output = torch.zeros(2)
+    full_key = (
+        registry.label,
+        "alias",
+        ("key",),
+        pc._tensor_tree_signature((arg,)),
+        pc._tensor_tree_signature({}),
+    )
+
+    registry.entries[full_key] = _CUDAGraphEntry(
+        graph=SimpleNamespace(replay=lambda: static_output.add_(1.0)),
+        static_args=(static_arg,),
+        static_kwargs={},
+        static_output=static_output,
+    )
+
+    first = registry.run(
+        "alias",
+        ("key",),
+        lambda x: x + 1,
+        arg,
+        enabled=True,
+        device=torch.device("cuda"),
+    )
+    second = registry.run(
+        "alias",
+        ("key",),
+        lambda x: x + 1,
+        arg,
+        enabled=True,
+        device=torch.device("cuda"),
+    )
+
+    assert first is static_output
+    assert second is static_output
+    assert first is second
+    assert static_output.tolist() == [2.0, 2.0]
+
+
+def test_graph_memory_audit_reports_registered_graphs(monkeypatch, capsys):
+    monkeypatch.setenv("PRISMAQUANT_GRAPH_AUDIT", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    registry = CUDAGraphRegistry(label="audit-registry", max_entries=4)
+    registry.entries[("entry",)] = _CUDAGraphEntry(
+        graph=SimpleNamespace(replay=lambda: None),
+        static_args=(torch.ones(2, dtype=torch.float32),),
+        static_kwargs={},
+        static_output=torch.ones(3, dtype=torch.float32),
+    )
+
+    report_graph_memory("unit")
+
+    captured = capsys.readouterr()
+    assert "label=unit registry=audit-registry" in captured.err
+    assert "entries=1" in captured.err
+    assert "static_bytes=20" in captured.err
 
 
 def test_phase_boundary_cleanup_called(monkeypatch):

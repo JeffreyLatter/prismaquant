@@ -80,6 +80,110 @@ def _gb(num_bytes: int | float) -> float:
     return float(num_bytes) / float(1024 ** 3)
 
 
+def _tensor_tree_nbytes(value, seen: set[int] | None = None) -> int:
+    if seen is None:
+        seen = set()
+    if isinstance(value, torch.Tensor):
+        key = id(value)
+        if key in seen:
+            return 0
+        seen.add(key)
+        return int(value.numel()) * int(value.element_size())
+    if isinstance(value, dict):
+        return sum(_tensor_tree_nbytes(child, seen) for child in value.values())
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_tree_nbytes(child, seen) for child in value)
+    return 0
+
+
+def _graph_entry_static_nbytes(entry) -> int:
+    seen: set[int] = set()
+    total = 0
+    for attr in ("static_hidden", "static_args", "static_kwargs", "static_output"):
+        if hasattr(entry, attr):
+            total += _tensor_tree_nbytes(getattr(entry, attr), seen)
+    return total
+
+
+def _evictor_pool_id(evictor: object) -> str:
+    getter = getattr(evictor, "graph_pool_id", None)
+    if callable(getter):
+        try:
+            return str(getter())
+        except Exception as exc:
+            return f"unavailable:{type(exc).__name__}"
+    pool = getattr(evictor, "graph_pool", None)
+    if callable(pool):
+        try:
+            handle = pool()
+        except Exception as exc:
+            return f"unavailable:{type(exc).__name__}"
+        if handle is None:
+            return "private"
+        return f"shared:{id(handle):x}"
+    return "unknown"
+
+
+def report_graph_memory(label: str = "") -> None:
+    """Print per-registry occupancy + pool footprint. Used at phase boundaries."""
+    if not env_flag_enabled("PRISMAQUANT_GRAPH_AUDIT", default=False):
+        return
+    label_text = str(label or "-")
+    evictors = list(_BUDGET_EVICTORS)
+    registry_count = 0
+    total_entries = 0
+    total_static_bytes = 0
+    for evictor in evictors:
+        entries = getattr(evictor, "entries", None)
+        if entries is None:
+            continue
+        try:
+            entry_items = list(entries.values())
+        except AttributeError:
+            continue
+        registry_count += 1
+        entry_count = len(entry_items)
+        static_bytes = sum(_graph_entry_static_nbytes(entry) for entry in entry_items)
+        total_entries += entry_count
+        total_static_bytes += static_bytes
+        registry_label = getattr(evictor, "label", type(evictor).__name__)
+        print(
+            "[graph-audit] "
+            f"label={label_text} registry={registry_label} "
+            f"class={type(evictor).__name__} entries={entry_count} "
+            f"static_bytes={static_bytes} static_gb={_gb(static_bytes):.6f} "
+            f"pool={_evictor_pool_id(evictor)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    allocated_current = None
+    mem_info = None
+    if torch.cuda.is_available():
+        try:
+            allocated_current = int(
+                torch.cuda.memory_stats().get("allocated_bytes.all.current", 0)
+            )
+        except Exception:
+            allocated_current = None
+        mem_info = cuda_memory_info()
+    free_text = total_text = "n/a"
+    if mem_info is not None:
+        free_text = str(mem_info[0])
+        total_text = str(mem_info[1])
+    allocated_text = "n/a" if allocated_current is None else str(allocated_current)
+    print(
+        "[graph-audit] "
+        f"label={label_text} summary registries={registry_count} "
+        f"entries={total_entries} static_bytes={total_static_bytes} "
+        f"static_gb={_gb(total_static_bytes):.6f} "
+        f"allocated_bytes_current={allocated_text} "
+        f"mem_free_bytes={free_text} mem_total_bytes={total_text}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _unique_evictors(evictors: Iterable[object]) -> list[object]:
     out: list[object] = []
     seen: set[int] = set()
