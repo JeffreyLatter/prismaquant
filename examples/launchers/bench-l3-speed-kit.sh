@@ -7,11 +7,15 @@ MAX_LANES="${MAX_LANES:-64}"
 MAX_LENGTH="${MAX_LENGTH:-128}"
 COORD_LINEAR_LIMIT="${COORD_LINEAR_LIMIT:-8}"
 COORD_EARLY_STOP="${COORD_EARLY_STOP:-8}"
+SYNTHETIC_LAYERS="${SYNTHETIC_LAYERS:-8}"
+SYNTHETIC_HIDDEN="${SYNTHETIC_HIDDEN:-64}"
+SYNTHETIC_SEQ_LEN="${SYNTHETIC_SEQ_LEN:-32}"
 
 python3 - <<'PY'
 import json
 import os
 import time
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -23,11 +27,6 @@ from prismaquant.iterate_perturbed_allocation import (
     measure_assignment_kl,
 )
 from prismaquant.propagated_cost import L3NeighborhoodEntry, measure_propagated_costs
-
-try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-except Exception as exc:
-    raise SystemExit(f"transformers is required for this benchmark: {exc}") from exc
 
 
 model_name = os.environ.get("MODEL", "Qwen/Qwen3-0.6B")
@@ -41,14 +40,84 @@ coord_early_stop = int(os.environ.get("COORD_EARLY_STOP", "8"))
 work_dir = os.environ.get("WORK_DIR", "/tmp")
 os.makedirs(work_dir, exist_ok=True)
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=dtype,
-    trust_remote_code=True,
-).to(device).eval()
+
+class _SyntheticBlock(nn.Module):
+    def __init__(self, hidden: int, idx: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden, hidden, bias=False)
+        with torch.no_grad():
+            self.proj.weight.copy_(torch.eye(hidden) * (1.0 + 0.01 * idx))
+
+    def forward(self, hidden_states):
+        return self.proj(hidden_states)
+
+
+class _SyntheticDecoder(nn.Module):
+    def __init__(self, vocab: int, hidden: int, layers: int):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden)
+        self.layers = nn.ModuleList(
+            [_SyntheticBlock(hidden, idx) for idx in range(layers)]
+        )
+        self.norm = nn.Identity()
+
+
+class _SyntheticCausalLM(nn.Module):
+    def __init__(self, *, vocab: int = 257, hidden: int = 64, layers: int = 8):
+        super().__init__()
+        self.model = _SyntheticDecoder(vocab, hidden, layers)
+        self.lm_head = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, input_ids, attention_mask=None):
+        hidden = self.model.embed_tokens(input_ids)
+        for layer in self.model.layers:
+            hidden = layer(hidden)
+        hidden = self.model.norm(hidden)
+        return SimpleNamespace(logits=self.lm_head(hidden))
+
+
+if model_name.lower() in {"synthetic", "synthetic-decoder"}:
+    synthetic_layers = int(os.environ.get("SYNTHETIC_LAYERS", "8"))
+    synthetic_hidden = int(os.environ.get("SYNTHETIC_HIDDEN", "64"))
+    synthetic_seq_len = int(os.environ.get("SYNTHETIC_SEQ_LEN", "32"))
+    model = _SyntheticCausalLM(
+        hidden=synthetic_hidden,
+        layers=synthetic_layers,
+    ).to(device=device, dtype=dtype).eval()
+    calib_ids = (
+        torch.arange(2 * synthetic_seq_len, dtype=torch.long)
+        .reshape(2, synthetic_seq_len)
+        % 257
+    ).to(device)
+    encoded = {
+        "input_ids": calib_ids,
+        "attention_mask": torch.ones_like(calib_ids),
+    }
+else:
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except Exception as exc:
+        raise SystemExit(f"transformers is required for this benchmark: {exc}") from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+    ).to(device).eval()
+    encoded = tokenizer(
+        [
+            "PrismaQuant measures propagated quantization costs.",
+            "A tiny L3 benchmark checks cache and graph equivalence.",
+        ],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+    calib_ids = encoded["input_ids"].to(device)
 
 linear_names = [
     name
@@ -59,16 +128,6 @@ if not linear_names:
     raise SystemExit("could not find a decoder Linear to benchmark")
 target = linear_names[0]
 
-encoded = tokenizer(
-    [
-        "PrismaQuant measures propagated quantization costs.",
-        "A tiny L3 benchmark checks cache and graph equivalence.",
-    ],
-    return_tensors="pt",
-    padding=True,
-    truncation=True,
-    max_length=max_length,
-)
 calibration = {
     key: value.to(device)
     for key, value in encoded.items()
@@ -135,9 +194,13 @@ summary = {
 }
 print(json.dumps(summary, indent=2))
 
-coord_names = linear_names[:coord_linear_limit]
+coord_names = (
+    linear_names[-coord_linear_limit:]
+    if len(linear_names) > coord_linear_limit
+    else linear_names[:coord_linear_limit]
+)
 modules = dict(model.named_modules())
-coord_assignment = {name: "MXFP8" for name in coord_names}
+coord_assignment = {name: "BF16" for name in coord_names}
 coord_stats = {}
 for name in coord_names:
     weight = modules[name].weight
@@ -152,13 +215,12 @@ for name in coord_names:
     }
 coord_l3_costs = {
     name: {
-        "MXFP8": {"propagated_end_kl": float(idx + 1)},
         "BF16": {"propagated_end_kl": 0.0},
+        "MXFP8": {"propagated_end_kl": float(idx + 1)},
     }
     for idx, name in enumerate(coord_names)
 }
 coord_specs = [fr.get_format("MXFP8"), fr.get_format("BF16")]
-calib_ids = encoded["input_ids"].to(device)
 ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
 coord_start_kl = measure_assignment_kl(
     model,
@@ -167,39 +229,64 @@ coord_start_kl = measure_assignment_kl(
     ref_log_probs,
     work_root=work_dir,
 )
-if device == "cuda":
-    torch.cuda.synchronize()
-coord_start = time.monotonic()
-polished, coord_final_kl, coord_meta = coordinate_descent_polish(
-    model,
-    coord_assignment,
-    coord_l3_costs,
-    coord_specs,
-    16.0,
-    calib_ids,
-    ref_log_probs,
-    stats=coord_stats,
-    work_root=work_dir,
-    current_kl=coord_start_kl,
-    return_metadata=True,
-    early_stop_streak=coord_early_stop,
-    emit=print,
-    anchor_label="bench",
-)
-if device == "cuda":
-    torch.cuda.synchronize()
-coord_elapsed = time.monotonic() - coord_start
-coord_summary = {
-    "label": "coord_descent",
-    "linear_count": len(coord_names),
-    "wall": coord_elapsed,
-    "start_kl": float(coord_start_kl),
-    "final_kl": float(coord_final_kl),
-    "meta": coord_meta,
-    "accepted_formats": {
-        fmt: sum(1 for value in polished.values() if value == fmt)
-        for fmt in sorted(set(polished.values()))
-    },
+
+
+def run_coord(label: str, *, lane_batch: bool, replay_cache: bool) -> dict:
+    os.environ["PRISMAQUANT_COORD_LANE_BATCH"] = "1" if lane_batch else "0"
+    os.environ["PRISMAQUANT_COORD_REPLAY_CACHE"] = "1" if replay_cache else "0"
+    if device == "cuda":
+        torch.cuda.synchronize()
+    coord_start = time.monotonic()
+    polished, coord_final_kl, coord_meta = coordinate_descent_polish(
+        model,
+        coord_assignment,
+        coord_l3_costs,
+        coord_specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=coord_stats,
+        work_root=work_dir,
+        current_kl=coord_start_kl,
+        return_metadata=True,
+        early_stop_streak=coord_early_stop,
+        max_lanes_per_batch=max_lanes,
+        emit=print,
+        anchor_label=label,
+    )
+    if device == "cuda":
+        torch.cuda.synchronize()
+    coord_elapsed = time.monotonic() - coord_start
+    coord_summary = {
+        "label": label,
+        "linear_count": len(coord_names),
+        "wall": coord_elapsed,
+        "start_kl": float(coord_start_kl),
+        "final_kl": float(coord_final_kl),
+        "meta": coord_meta,
+        "accepted_formats": {
+            fmt: sum(1 for value in polished.values() if value == fmt)
+            for fmt in sorted(set(polished.values()))
+        },
+    }
+    print(
+        f"{label}: wall={coord_elapsed:.3f}s "
+        f"final_kl={float(coord_final_kl):.12g} "
+        f"flips={coord_meta['flips_committed']}"
+    )
+    return coord_summary
+
+
+coord_results = [
+    run_coord("coord_sequential", lane_batch=False, replay_cache=False),
+    run_coord("coord_lane_batched_no_cache", lane_batch=True, replay_cache=False),
+    run_coord("coord_lane_batched_replay_cache", lane_batch=True, replay_cache=True),
+]
+coord_baseline = coord_results[0]
+coord_speedups = {
+    item["label"]: coord_baseline["wall"] / item["wall"]
+    for item in coord_results[1:]
+    if item["wall"] > 0
 }
-print(json.dumps(coord_summary, indent=2))
+print(json.dumps({"coord_results": coord_results, "coord_speedups": coord_speedups}, indent=2))
 PY

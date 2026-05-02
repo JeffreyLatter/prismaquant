@@ -447,6 +447,53 @@ class _CountingWideStackLogitsModel(_WideStackLogitsModel):
         return super().forward(input_ids)
 
 
+class _ReplayDecoderBlock(nn.Module):
+    def __init__(self, width: int, idx: int):
+        super().__init__()
+        self.proj = nn.Linear(width, width, bias=False)
+        self.forward_calls = 0
+        with torch.no_grad():
+            self.proj.weight.copy_(torch.eye(width) * (1.0 + idx * 0.01))
+
+    def forward(self, hidden_states):
+        self.forward_calls += 1
+        return self.proj(hidden_states)
+
+
+class _ReplayDecoder(nn.Module):
+    def __init__(self, width: int, layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_ReplayDecoderBlock(width, idx) for idx in range(layers)]
+        )
+        self.norm = nn.Identity()
+
+
+class _ReplayStackLogitsModel(nn.Module):
+    def __init__(self, width=33, layers=4):
+        super().__init__()
+        self.model = _ReplayDecoder(width, layers)
+        self.lm_head = nn.Identity()
+        self.layer_names = [
+            f"model.layers.{idx}.proj"
+            for idx in range(layers)
+        ]
+
+    def forward(self, input_ids):
+        hidden = input_ids.float()
+        for layer in self.model.layers:
+            hidden = layer(hidden)
+        hidden = self.model.norm(hidden)
+        return SimpleNamespace(logits=self.lm_head(hidden))
+
+    def reset_layer_forward_calls(self):
+        for layer in self.model.layers:
+            layer.forward_calls = 0
+
+    def layer_forward_calls(self) -> int:
+        return sum(layer.forward_calls for layer in self.model.layers)
+
+
 def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "0")
     probe_path = tmp_path / "probe.pkl"
@@ -1184,6 +1231,230 @@ def test_coord_descent_lane_batched_matches_sequential(tmp_path, monkeypatch):
     assert sequential_meta["lane_batched"] is False
     assert lane_assignment == sequential_assignment
     assert lane_kl == pytest.approx(sequential_kl, abs=1e-9, rel=0.0)
+
+
+def test_coord_descent_replay_cache_matches_full_forward(tmp_path, monkeypatch):
+    scale_spec = _scaled_weight_spec("COORD_REPLAY_SCALE90_MATCH", 0.9)
+    monkeypatch.setitem(ipa.fr.REGISTRY, scale_spec.name, scale_spec)
+    specs = [scale_spec, ipa.fr.get_format("BF16")]
+    layers = 4
+    width = 33
+    stats = {
+        f"model.layers.{idx}.proj": _wide_stat(
+            width=width,
+            formats=(scale_spec.name, "BF16"),
+        )
+        for idx in range(layers)
+    }
+    assignment = {name: scale_spec.name for name in stats}
+    l3_costs = {
+        name: {
+            scale_spec.name: {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 0.0},
+        }
+        for name in stats
+    }
+    calib_ids = torch.linspace(-1.0, 1.0, steps=2 * 3 * width).reshape(2, 3, width)
+
+    full_model = _ReplayStackLogitsModel(width=width, layers=layers).eval()
+    ref_log_probs = ipa.cache_reference_log_probs(
+        full_model,
+        calib_ids,
+        next(full_model.parameters()).device,
+    )
+    current_kl = ipa.measure_assignment_kl(
+        full_model,
+        assignment,
+        calib_ids,
+        ref_log_probs,
+        work_root=tmp_path,
+    )
+
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "1")
+    monkeypatch.setenv("PRISMAQUANT_COORD_REPLAY_CACHE", "0")
+    full_assignment, full_kl, full_meta = ipa.coordinate_descent_polish(
+        full_model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=current_kl,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=2,
+    )
+
+    replay_model = _ReplayStackLogitsModel(width=width, layers=layers).eval()
+    monkeypatch.setenv("PRISMAQUANT_COORD_REPLAY_CACHE", "1")
+    replay_assignment, replay_kl, replay_meta = ipa.coordinate_descent_polish(
+        replay_model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=current_kl,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=2,
+    )
+
+    assert full_meta["replay_cache_active"] is False
+    assert replay_meta["replay_cache_active"] is True
+    assert replay_assignment == full_assignment
+    assert replay_kl == pytest.approx(full_kl, abs=1e-9, rel=0.0)
+
+
+def test_coord_descent_replay_cache_invalidated_on_commit(tmp_path, monkeypatch):
+    scale_spec = _scaled_weight_spec("COORD_REPLAY_SCALE90_INVALIDATE", 0.9)
+    monkeypatch.setitem(ipa.fr.REGISTRY, scale_spec.name, scale_spec)
+    specs = [scale_spec, ipa.fr.get_format("BF16")]
+    layers = 3
+    width = 33
+    stats = {
+        f"model.layers.{idx}.proj": _wide_stat(
+            width=width,
+            formats=(scale_spec.name, "BF16"),
+        )
+        for idx in range(layers)
+    }
+    assignment = {name: scale_spec.name for name in stats}
+    l3_costs = {
+        name: {
+            scale_spec.name: {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 0.0},
+        }
+        for name in stats
+    }
+    calib_ids = torch.linspace(-0.5, 0.5, steps=2 * 2 * width).reshape(2, 2, width)
+    model = _ReplayStackLogitsModel(width=width, layers=layers).eval()
+    ref_log_probs = ipa.cache_reference_log_probs(
+        model,
+        calib_ids,
+        next(model.parameters()).device,
+    )
+    current_kl = ipa.measure_assignment_kl(
+        model,
+        assignment,
+        calib_ids,
+        ref_log_probs,
+        work_root=tmp_path,
+    )
+
+    populate_calls = []
+    real_cache_cls = ipa.LayerHiddenStateCache
+
+    class _CountingLayerHiddenStateCache(real_cache_cls):
+        def populate(self, baseline_assignment, *args, **kwargs):
+            populate_calls.append(dict(baseline_assignment))
+            return super().populate(baseline_assignment, *args, **kwargs)
+
+    monkeypatch.setattr(ipa, "LayerHiddenStateCache", _CountingLayerHiddenStateCache)
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "1")
+    monkeypatch.setenv("PRISMAQUANT_COORD_REPLAY_CACHE", "1")
+
+    _assignment, _kl, meta = ipa.coordinate_descent_polish(
+        model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=current_kl,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=1,
+    )
+
+    assert meta["flips_committed"] >= 1
+    assert meta["replay_cache_populates"] == len(populate_calls)
+    assert len(populate_calls) >= 2
+
+
+def test_coord_descent_replay_cache_emits_fewer_layer_forwards(tmp_path, monkeypatch):
+    scale_spec = _scaled_weight_spec("COORD_REPLAY_SCALE90_FORWARD_COUNT", 0.9)
+    monkeypatch.setitem(ipa.fr.REGISTRY, scale_spec.name, scale_spec)
+    specs = [scale_spec, ipa.fr.get_format("BF16")]
+    layers = 14
+    width = 33
+    candidate_depths = list(range(7, layers))
+    stats = {
+        f"model.layers.{idx}.proj": _wide_stat(
+            width=width,
+            formats=("BF16", scale_spec.name),
+        )
+        for idx in candidate_depths
+    }
+    assignment = {name: "BF16" for name in stats}
+    l3_costs = {
+        f"model.layers.{idx}.proj": {
+            "BF16": {"propagated_end_kl": 0.0},
+            scale_spec.name: {"propagated_end_kl": float(idx)},
+        }
+        for idx in candidate_depths
+    }
+    calib_ids = torch.linspace(-1.0, 1.0, steps=1 * 3 * width).reshape(1, 3, width)
+
+    full_model = _ReplayStackLogitsModel(width=width, layers=layers).eval()
+    ref_log_probs = ipa.cache_reference_log_probs(
+        full_model,
+        calib_ids,
+        next(full_model.parameters()).device,
+    )
+    full_model.reset_layer_forward_calls()
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_BATCH", "1")
+    monkeypatch.setenv("PRISMAQUANT_COORD_REPLAY_CACHE", "0")
+    _full_assignment, _full_kl, full_meta = ipa.coordinate_descent_polish(
+        full_model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=0.0,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=2,
+    )
+    full_layer_forwards = full_model.layer_forward_calls()
+
+    replay_model = _ReplayStackLogitsModel(width=width, layers=layers).eval()
+    replay_model.reset_layer_forward_calls()
+    monkeypatch.setenv("PRISMAQUANT_COORD_REPLAY_CACHE", "1")
+    _replay_assignment, _replay_kl, replay_meta = ipa.coordinate_descent_polish(
+        replay_model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=0.0,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_lanes_per_batch=2,
+    )
+    replay_layer_forwards = replay_model.layer_forward_calls()
+
+    assert full_meta["measurements"] == len(candidate_depths)
+    assert replay_meta["measurements"] == len(candidate_depths)
+    assert replay_meta["replay_cache_active"] is True
+    assert full_layer_forwards / replay_layer_forwards >= 1.5
 
 
 def test_coord_descent_lane_batched_emits_fewer_forwards(tmp_path, monkeypatch):

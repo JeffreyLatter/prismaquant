@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -36,6 +36,7 @@ from prismaquant.perturbed_x_cache import (
     calibration_data_hash,
     iter_calibration_forwards,
 )
+from prismaquant.layer_state_cache import LayerHiddenStateCache
 
 
 @dataclass(frozen=True)
@@ -1287,6 +1288,103 @@ def _split_lanes(tensor: torch.Tensor, base_batch: int, lane_count: int):
     return tensor.split(base_batch, dim=0)
 
 
+def _coord_replay_target_keys(
+    replay_cache: LayerHiddenStateCache,
+    target_names: set[str],
+) -> tuple[set[object], set[int]]:
+    by_name = getattr(replay_cache, "_linear_targets_by_name", {})
+    target_keys: set[object] = set()
+    module_ids: set[int] = set()
+    for raw_name in target_names:
+        candidates = [raw_name]
+        if raw_name.endswith(".weight"):
+            candidates.append(raw_name[:-7])
+        else:
+            candidates.append(f"{raw_name}.weight")
+        for name in candidates:
+            target = by_name.get(name)
+            if target is None:
+                continue
+            target_keys.add(target.key)
+            module_ids.add(id(target.module))
+            break
+    return target_keys, module_ids
+
+
+def _repeat_replay_template_for_lanes(template, lane_count: int, base_batch: int):
+    return replace(
+        template,
+        args=tuple(
+            _repeat_layer_value_for_lanes(value, lane_count, base_batch)
+            for value in template.args
+        ),
+        kwargs={
+            key: _repeat_layer_value_for_lanes(value, lane_count, base_batch)
+            for key, value in template.kwargs.items()
+        },
+    )
+
+
+def _lane_replay_cache_logits(
+    replay_cache: LayerHiddenStateCache,
+    layer_idx: int,
+    *,
+    lane_count: int,
+    base_batch: int,
+    target_names: set[str],
+) -> torch.Tensor:
+    """Replay a populated LayerHiddenStateCache with lane-repeated state.
+
+    LayerHiddenStateCache intentionally exposes scalar replay. Coord descent
+    keeps lane semantics here by temporarily repeating the cached layer input
+    and non-hidden layer-call tensors, while leaving target modules at live
+    BF16 weights so _DepthGroupTargetHooks can choose the per-lane format.
+    """
+    original_inputs = list(replay_cache.layer_inputs)
+    original_templates = list(getattr(replay_cache, "_layer_call_templates"))
+    original_baseline_weights = dict(
+        getattr(replay_cache, "_baseline_weight_values")
+    )
+    original_activation_quantizers = dict(
+        getattr(replay_cache, "_activation_quantizers")
+    )
+    target_keys, target_module_ids = _coord_replay_target_keys(
+        replay_cache,
+        target_names,
+    )
+    try:
+        replay_cache.layer_inputs = list(original_inputs)
+        replay_cache.layer_inputs[layer_idx] = _repeat_layer_value_for_lanes(
+            original_inputs[layer_idx],
+            lane_count,
+            base_batch,
+        )
+        repeated_templates = list(original_templates)
+        for idx in range(layer_idx, len(repeated_templates)):
+            repeated_templates[idx] = _repeat_replay_template_for_lanes(
+                repeated_templates[idx],
+                lane_count,
+                base_batch,
+            )
+        replay_cache._layer_call_templates = repeated_templates
+        replay_cache._baseline_weight_values = {
+            key: value
+            for key, value in original_baseline_weights.items()
+            if key not in target_keys
+        }
+        replay_cache._activation_quantizers = {
+            module_id: value
+            for module_id, value in original_activation_quantizers.items()
+            if module_id not in target_module_ids
+        }
+        return replay_cache.replay_from(layer_idx)
+    finally:
+        replay_cache.layer_inputs = original_inputs
+        replay_cache._layer_call_templates = original_templates
+        replay_cache._baseline_weight_values = original_baseline_weights
+        replay_cache._activation_quantizers = original_activation_quantizers
+
+
 def _l3_quantizable_map(model: nn.Module) -> dict[str, tuple[nn.Module, str]]:
     """Map L3 names to modules, including tiny nn.Linear modules in tests."""
     out = dict(build_quantizable_map(model))
@@ -1748,6 +1846,7 @@ def measure_lane_batched_kl_deltas(
     work_root: Path,
     max_lanes_per_batch: int = 64,
     profile=None,
+    replay_cache: LayerHiddenStateCache | None = None,
 ) -> list[float]:
     """Measure end-KL for each candidate flip applied to baseline_assignment.
 
@@ -1833,6 +1932,92 @@ def measure_lane_batched_kl_deltas(
             if use_prequant_cache
             else None
         )
+        lane_depths = [layer_depth(lane.name) for lane in lanes]
+        replay_layer_idx = (
+            min(depth for depth in lane_depths if depth is not None)
+            if (
+                replay_cache is not None
+                and lane_depths
+                and all(depth is not None for depth in lane_depths)
+            )
+            else None
+        )
+        use_replay_cache = (
+            replay_cache is not None
+            and replay_layer_idx is not None
+            and 0 <= replay_layer_idx < len(replay_cache.layers)
+            and _env_flag_enabled(
+                "PRISMAQUANT_COORD_REPLAY_CACHE",
+                default=True,
+            )
+        )
+        if use_replay_cache:
+            target_hooks = None
+            kl_totals = [0.0 for _lane in lanes]
+            batch_count = (
+                int(calib_ids.size(0))
+                if isinstance(calib_ids, torch.Tensor)
+                else 0
+            )
+            base_batch = batch_count
+            rng_cm = torch.random.fork_rng(devices=rng_devices)
+            try:
+                with rng_cm:
+                    torch.manual_seed(0)
+                    if device.type == "cuda" and torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(0)
+                    target_hooks = _DepthGroupTargetHooks(
+                        model,
+                        assignment_c,
+                        specs_by_name,
+                        lanes,
+                        base_batch=base_batch,
+                        quant_weight_cache=group_quant_cache,
+                    )
+                    target_hooks.install()
+                    logits = _lane_replay_cache_logits(
+                        replay_cache,
+                        int(replay_layer_idx),
+                        lane_count=len(lanes),
+                        base_batch=base_batch,
+                        target_names=target_names,
+                    )
+                    logits = _extract_logits(logits)
+                    if logits.dim() >= 3:
+                        logits = logits[:, -1:, :]
+                    chunks = _split_lanes(logits.detach(), base_batch, len(lanes))
+                    if chunks is None:
+                        raise RuntimeError(
+                            "lane-batched coord replay logits did not preserve lane "
+                            f"batching: shape={tuple(logits.shape)} "
+                            f"base_batch={base_batch} lanes={len(lanes)}"
+                        )
+                    for idx, chunk in enumerate(chunks):
+                        for batch_index, teacher in enumerate(ref_log_probs):
+                            teacher = teacher.to(chunk.device)
+                            if teacher.dim() >= 3:
+                                teacher = teacher[:, -1:, :]
+                            kl_totals[idx] += float(
+                                kl_divergence(
+                                    chunk[batch_index:batch_index + 1],
+                                    teacher,
+                                ).item()
+                            )
+                missing_targets = set(target_hooks.missing if target_hooks else [])
+                if missing_targets:
+                    raise RuntimeError(
+                        "target module missing or unsupported for lane-batched KL: "
+                        + ", ".join(sorted(missing_targets))
+                    )
+                measured.extend(
+                    total / max(batch_count, 1)
+                    for total in kl_totals
+                )
+            finally:
+                if target_hooks is not None:
+                    target_hooks.remove()
+            continue
+
         cache_dir = Path(tempfile.mkdtemp(
             prefix="prismaquant_coord_lanes_",
             dir=tmp_parent,

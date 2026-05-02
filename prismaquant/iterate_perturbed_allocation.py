@@ -43,12 +43,14 @@ from prismaquant.perturbed_x_cache import (
     capture_perturbed_activation_cache,
     load_text_model_under_work_root,
 )
+from prismaquant.layer_state_cache import LayerHiddenStateCache
 from prismaquant.propagated_cost import (
     L3NeighborhoodEntry,
     L3UnsupportedTargetError,
     assignment_bit_total,
     build_global_l3_neighborhood,
     build_l3_candidates,
+    layer_depth,
     measure_lane_batched_kl_deltas,
     measure_propagated_costs,
     select_l3_neighborhood,
@@ -1174,6 +1176,49 @@ def _coord_lane_batch_enabled() -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _coord_replay_cache_enabled() -> bool:
+    value = os.environ.get("PRISMAQUANT_COORD_REPLAY_CACHE")
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _coord_replay_cache_dtype(model) -> torch.dtype:
+    for parameter in model.parameters():
+        if parameter.is_floating_point():
+            return parameter.dtype
+    return torch.float32
+
+
+def _populate_coord_replay_cache(
+    model,
+    assignment: Mapping[str, str],
+    calib_ids: torch.Tensor,
+) -> LayerHiddenStateCache | None:
+    try:
+        cache = LayerHiddenStateCache(model)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    device = next(model.parameters()).device
+    dtype = _coord_replay_cache_dtype(model)
+    rng_devices = []
+    if device.type == "cuda" and torch.cuda.is_available():
+        rng_devices = [
+            device.index if device.index is not None else torch.cuda.current_device()
+        ]
+    with torch.random.fork_rng(devices=rng_devices):
+        torch.manual_seed(0)
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.manual_seed_all(0)
+        cache.populate(
+            assignment,
+            calib_ids,
+            device=str(device),
+            dtype=dtype,
+        )
+    return cache
+
+
 def coordinate_descent_polish(
     model,
     current_assignment: Mapping[str, str],
@@ -1213,6 +1258,10 @@ def coordinate_descent_polish(
     halted = "max_passes" if int(max_passes) > 0 else "max_passes"
     anchor_text = f"anchor {anchor_label}" if anchor_label is not None else "anchor n/a"
     lane_batch_enabled = _coord_lane_batch_enabled()
+    replay_cache_enabled = lane_batch_enabled and _coord_replay_cache_enabled()
+    replay_cache: LayerHiddenStateCache | None = None
+    replay_cache_populates = 0
+    replay_cache_active = False
 
     hooks: PerturbedActivationCache | None = None
     cached_names: set[str] = set()
@@ -1268,6 +1317,22 @@ def coordinate_descent_polish(
                     break
 
                 if lane_batch_enabled:
+                    replay_cache = None
+                    if (
+                        replay_cache_enabled
+                        and any(
+                            layer_depth(name) is not None
+                            for _delta, name, _fmt in ranked_candidates
+                        )
+                    ):
+                        replay_cache = _populate_coord_replay_cache(
+                            model,
+                            assignment,
+                            calib_ids,
+                        )
+                        if replay_cache is not None:
+                            replay_cache_populates += 1
+                            replay_cache_active = True
                     cursor = 0
                     while cursor < len(ranked_candidates):
                         batch: list[tuple[str, str]] = []
@@ -1309,6 +1374,7 @@ def coordinate_descent_polish(
                             work_root=work_root,
                             max_lanes_per_batch=max_lanes_per_batch,
                             profile=profile,
+                            replay_cache=replay_cache,
                         )
                         committed_in_batch = False
                         for idx, ((name, candidate_fmt), trial_kl) in enumerate(
@@ -1322,6 +1388,23 @@ def coordinate_descent_polish(
                                 failed_streak = 0
                                 pass_improved = True
                                 committed_in_batch = True
+                                if replay_cache is not None:
+                                    replay_cache.invalidate()
+                                    if any(
+                                        layer_depth(candidate_name) is not None
+                                        for _delta, candidate_name, _fmt in ranked_candidates[
+                                            next_positions[idx]:
+                                        ]
+                                    ):
+                                        rebuilt = _populate_coord_replay_cache(
+                                            model,
+                                            assignment,
+                                            calib_ids,
+                                        )
+                                        replay_cache = rebuilt
+                                        if replay_cache is not None:
+                                            replay_cache_populates += 1
+                                            replay_cache_active = True
                                 cursor = next_positions[idx]
                                 break
                             failed_streak += 1
@@ -1410,6 +1493,9 @@ def coordinate_descent_polish(
         "early_stop_streak": int(early_stop_streak),
         "failed_streak": int(failed_streak),
         "lane_batched": bool(lane_batch_enabled),
+        "replay_cache_enabled": bool(replay_cache_enabled),
+        "replay_cache_active": bool(replay_cache_active),
+        "replay_cache_populates": int(replay_cache_populates),
         "max_lanes_per_batch": int(max_lanes_per_batch),
     }
     if emit is not None:
