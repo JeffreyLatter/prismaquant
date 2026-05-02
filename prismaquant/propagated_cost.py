@@ -1340,6 +1340,28 @@ class CUDAGraphRegistry:
     def evict_oldest_for_memory_budget(self) -> bool:
         return self._evict_oldest_graph_entry()
 
+    def _cleanup_failed_capture(
+        self,
+        graph,
+        device: torch.device,
+        label: str,
+    ) -> None:
+        if graph is not None:
+            reset = getattr(graph, "reset", None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception as exc:
+                    self._verbose_exception(label, "failed graph reset failed", exc)
+        try:
+            torch.cuda.synchronize(device)
+        except Exception as exc:
+            self._verbose_exception(label, "post-failure synchronize failed", exc)
+        try:
+            torch.cuda.empty_cache()
+        except Exception as exc:
+            self._verbose_exception(label, "post-failure empty_cache failed", exc)
+
     def run(
         self,
         label: str,
@@ -1457,6 +1479,7 @@ class CUDAGraphRegistry:
                 self._verbose_exception(label, "warmup synchronize failed", exc)
                 raise
 
+        graph = None
         try:
             graph = torch.cuda.CUDAGraph(keep_graph=self._verbose_enabled())
         except TypeError:
@@ -1473,14 +1496,7 @@ class CUDAGraphRegistry:
                 static_output = fn(*static_args, **static_kwargs)
         except Exception as exc:
             self._verbose_exception(label, "capture body/end failed", exc)
-            try:
-                torch.cuda.synchronize(device)
-            except Exception as sync_exc:
-                self._verbose_exception(
-                    label,
-                    "post-failure synchronize failed",
-                    sync_exc,
-                )
+            self._cleanup_failed_capture(graph, device, label)
             raise
         try:
             instantiate = getattr(graph, "instantiate", None)
@@ -1489,6 +1505,7 @@ class CUDAGraphRegistry:
             graph.replay()
         except Exception as exc:
             self._verbose_exception(label, "initial replay failed", exc)
+            self._cleanup_failed_capture(graph, device, label)
             raise
         if self._verbose_enabled():
             try:

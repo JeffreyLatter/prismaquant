@@ -65,6 +65,26 @@ def test_cuda_graph_cache_lru_eviction(monkeypatch):
     assert registry.eviction_count == 5
 
 
+def test_cuda_graph_capture_failure_cleanup_resets_graph(monkeypatch):
+    calls = []
+    registry = CUDAGraphRegistry(label="test-graph-cleanup", max_entries=10)
+    graph = SimpleNamespace(reset=lambda: calls.append("reset"))
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda device=None: calls.append(("sync", str(device))),
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+
+    registry._cleanup_failed_capture(
+        graph,
+        torch.device("cuda:0"),
+        "test-capture",
+    )
+
+    assert calls == ["reset", ("sync", "cuda:0"), "empty"]
+
+
 def test_phase_boundary_cleanup_called(monkeypatch):
     calls = {"empty_cache": 0}
 

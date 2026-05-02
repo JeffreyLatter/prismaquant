@@ -9,6 +9,7 @@ from prismaquant import format_registry as fr
 from prismaquant import propagated_cost as pc
 from prismaquant.allocator_solver import Candidate
 from prismaquant.build_rtn_cache import cache_reference_log_probs
+from prismaquant.layer_state_cache import LayerHiddenStateCache
 from prismaquant.perturbed_x_cache import PerturbedActivationCache
 from prismaquant.propagated_cost import (
     FrozenBudgetError,
@@ -65,6 +66,66 @@ class _AmplifyingToy(nn.Module):
         x = self.l2(x)
         x = self.l3(x)
         return SimpleNamespace(logits=x)
+
+
+class _ReplayPastCache:
+    def __init__(self):
+        self.keys = {}
+
+    def update(self, layer_idx: int, hidden_states: torch.Tensor) -> None:
+        key_states = hidden_states.transpose(1, 2).contiguous()
+        previous = self.keys.get(layer_idx)
+        if previous is not None:
+            key_states = torch.cat([previous, key_states], dim=2)
+        self.keys[layer_idx] = key_states
+
+
+class _CacheReplayLayer(nn.Module):
+    def __init__(self, width: int, layer_idx: int):
+        super().__init__()
+        self.layer_idx = int(layer_idx)
+        self.proj = nn.Linear(width, width, bias=False)
+        with torch.no_grad():
+            self.proj.weight.copy_(torch.eye(width) * (1.0 + 0.05 * layer_idx))
+
+    def forward(
+        self,
+        hidden_states,
+        *,
+        past_key_value=None,
+        use_cache: bool = True,
+    ):
+        if use_cache and past_key_value is not None:
+            past_key_value.update(self.layer_idx, hidden_states)
+        return self.proj(torch.tanh(hidden_states))
+
+
+class _CacheReplayDecoder(nn.Module):
+    def __init__(self, width: int, layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_CacheReplayLayer(width, idx) for idx in range(layers)]
+        )
+        self.norm = nn.Identity()
+
+
+class _CacheReplayCausalLM(nn.Module):
+    def __init__(self, *, width: int = 8, layers: int = 4):
+        super().__init__()
+        self.model = _CacheReplayDecoder(width, layers)
+        self.lm_head = nn.Identity()
+
+    def forward(self, input_ids, *, use_cache: bool = True):
+        hidden = input_ids.float()
+        past_key_value = _ReplayPastCache() if use_cache else None
+        for layer in self.model.layers:
+            hidden = layer(
+                hidden,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+            )
+        hidden = self.model.norm(hidden)
+        return SimpleNamespace(logits=self.lm_head(hidden))
 
 
 class _TailLayer(nn.Module):
@@ -923,6 +984,69 @@ def test_coord_lane_batched_with_cuda_graphs_matches_eager(tmp_path, monkeypatch
     eager = _measure(False)
     graphed = _measure(True)
     assert graphed == pytest.approx(eager, abs=1e-9, rel=0.0)
+
+
+def test_coord_lane_replay_graph_capture_no_shape_mismatch(tmp_path, monkeypatch):
+    pc._COORD_LANE_CUDA_GRAPH_REGISTRY.clear()
+    pc._CUDA_GRAPH_WARNED_LABELS.clear()
+    zero = _zero_spec()
+    monkeypatch.setitem(fr.REGISTRY, zero.name, zero)
+    monkeypatch.setenv("PRISMAQUANT_COORD_REPLAY_CACHE", "1")
+    assignment = {
+        f"model.layers.{idx}.proj": "BF16"
+        for idx in range(4)
+    }
+    candidate_flips = [
+        ("model.layers.1.proj", zero.name),
+        ("model.layers.2.proj", zero.name),
+    ]
+    calib = torch.linspace(-1.0, 1.0, steps=3 * 5 * 8).reshape(3, 5, 8)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _prepare():
+        torch.manual_seed(1234)
+        model = _CacheReplayCausalLM(width=8, layers=4).eval().to(device)
+        ref_log_probs = cache_reference_log_probs(model, calib, device)
+        replay_cache = LayerHiddenStateCache(model)
+        replay_cache.populate(
+            assignment,
+            calib,
+            device=str(device),
+            dtype=torch.float32,
+        )
+        return model, ref_log_probs, replay_cache
+
+    def _measure(graphs_enabled: bool):
+        monkeypatch.setenv(
+            "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+            "1" if graphs_enabled else "0",
+        )
+        model, ref_log_probs, replay_cache = _prepare()
+        return pc.measure_lane_batched_kl_deltas(
+            model,
+            assignment,
+            candidate_flips,
+            calib,
+            ref_log_probs,
+            work_root=tmp_path,
+            max_lanes_per_batch=2,
+            replay_cache=replay_cache,
+        )
+
+    eager = _measure(False)
+    warnings = []
+    monkeypatch.setattr(
+        pc,
+        "_warn_cuda_graph_fallback_once",
+        lambda label, exc: warnings.append((label, exc)),
+    )
+    graphed = _measure(True)
+
+    assert graphed == pytest.approx(eager, abs=1e-9, rel=0.0)
+    assert not warnings
+    if torch.cuda.is_available():
+        assert pc._COORD_LANE_CUDA_GRAPH_REGISTRY.entries
+        assert not pc._COORD_LANE_CUDA_GRAPH_REGISTRY.disabled_keys
 
 
 def test_lane_batch_memory_check_falls_back(monkeypatch):

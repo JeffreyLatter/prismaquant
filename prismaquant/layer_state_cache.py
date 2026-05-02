@@ -31,6 +31,7 @@ Design summary:
 """
 from __future__ import annotations
 
+import inspect
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
@@ -236,6 +237,28 @@ def _fill_template(template: _LayerCallTemplate, hidden: torch.Tensor) -> tuple[
     return tuple(args), kwargs
 
 
+def _call_accepts_kwarg(fn: Any, name: str) -> bool:
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return name in signature.parameters
+
+
+def _disable_decoder_cache_kwargs(kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
+    out = dict(kwargs or {})
+    if "use_cache" in out:
+        out["use_cache"] = False
+    if "past_key_value" in out:
+        out["past_key_value"] = None
+    if "past_key_values" in out:
+        out["past_key_values"] = None
+    return out
+
+
 def _hidden_from_layer_output(output: Any) -> torch.Tensor:
     if isinstance(output, torch.Tensor):
         return output
@@ -302,14 +325,15 @@ class LayerHiddenStateCache:
 
         def make_hook(layer_idx: int):
             def _hook(_module, args, kwargs):
-                where, key, hidden = _first_tensor_location(tuple(args), kwargs)
+                layer_kwargs = _disable_decoder_cache_kwargs(kwargs)
+                where, key, hidden = _first_tensor_location(tuple(args), layer_kwargs)
                 if not isinstance(hidden, torch.Tensor):
                     capture_errors.append(f"layer {layer_idx} did not receive a tensor hidden state")
                     return None
                 captured_inputs[layer_idx] = hidden.detach().clone().contiguous()
                 captured_templates[layer_idx] = _make_layer_template(
                     tuple(args),
-                    kwargs,
+                    layer_kwargs,
                     str(where),
                     key,
                 )
@@ -323,7 +347,10 @@ class LayerHiddenStateCache:
         ]
         try:
             with torch.no_grad(), self._temporary_execution():
-                self.model(calib_ids.to(torch_device))
+                call_kwargs = {}
+                if _call_accepts_kwarg(self.model.forward, "use_cache"):
+                    call_kwargs["use_cache"] = False
+                self.model(calib_ids.to(torch_device), **call_kwargs)
         finally:
             for handle in handles:
                 handle.remove()
@@ -362,6 +389,7 @@ class LayerHiddenStateCache:
         with torch.no_grad(), self._temporary_execution(weight_override):
             for idx in range(layer_idx, len(self.layers)):
                 args, kwargs = _fill_template(self._layer_call_templates[idx], hidden)
+                kwargs = _disable_decoder_cache_kwargs(kwargs)
                 output = self.layers[idx](*args, **kwargs)
                 hidden = _hidden_from_layer_output(output)
             hidden = self._apply_final_norm(hidden)
