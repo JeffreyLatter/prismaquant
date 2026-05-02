@@ -16,6 +16,15 @@ import os
 # already initialized CUDA via the Triton warmup.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+import torch as _torch_pre
+
+# torch.use_deterministic_algorithms must also be set BEFORE the first CUDA
+# init -- importing prismaquant.kernels triggers a Triton warmup that JITs
+# in non-deterministic mode otherwise, and any subsequent perturbed forward
+# returns NaN. The flag here is opt-in via PRISMAQUANT_SMOKE_DETERMINISM=1.
+if os.environ.get("PRISMAQUANT_SMOKE_DETERMINISM", "0") not in {"0", "false", "no"}:
+    _torch_pre.use_deterministic_algorithms(True, warn_only=True)
+
 import random
 import shutil
 import sys
@@ -74,20 +83,16 @@ def _set_smoke_env() -> None:
 
 
 def _pin_rng(seed: int) -> None:
-    # CUBLAS_WORKSPACE_CONFIG is also set at module top so it precedes CUDA
-    # init when the smoke is run as a script. Re-set here so callers using
-    # _pin_rng standalone also get the workspace config — the setdefault is
-    # a no-op when the value is already in env.
+    # CUBLAS_WORKSPACE_CONFIG and torch.use_deterministic_algorithms are
+    # both set at module top so they precede CUDA init when the smoke is
+    # run as a script. Re-set the env var here so callers using _pin_rng
+    # standalone also get the workspace config; the setdefault is a no-op
+    # when the value is already in env.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    if os.environ.get("PRISMAQUANT_SMOKE_DETERMINISM", "0") not in {"0", "false", "no"}:
-        # Opt-in: torch.use_deterministic_algorithms can produce NaN with
-        # PrismaClade's perturbation pipeline; root cause not yet isolated.
-        # Default OFF so the smoke runs cleanly.
-        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _load_local_model():

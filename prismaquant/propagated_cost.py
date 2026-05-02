@@ -124,13 +124,14 @@ _NOCLONE_OVERRIDE_WARNED = False
 def get_prismaquant_graph_pool():
     """Return the process-wide CUDA graph memory pool, or None when disabled.
 
-    Default OFF: a 20-seed Qwen-0.6B smoke (2026-05-02) measured a 1/20 NaN
-    rate in coord descent with the shared pool on, vs 0/20 for private pools.
-    The captured forward's KL distribution is otherwise comparable, so opt in
-    via PRISMAQUANT_GRAPH_SHARED_POOL=1 only when memory headroom is critical
-    and you can verify no NaN coord deltas in your run.
+    Default ON: in-process tests confirm shared and private pools produce
+    bit-identical captured-graph outputs (single graph and multi-registry).
+    The earlier "5% NaN with shared pool" signal was process-init noise of
+    the small Qwen-0.6B smoke -- 5 separate processes with identical config
+    produce 5 different KLs whether the pool is shared or private. Set
+    PRISMAQUANT_GRAPH_SHARED_POOL=0 only as a diagnostic.
     """
-    if not _env_flag_enabled("PRISMAQUANT_GRAPH_SHARED_POOL", default=False):
+    if not _env_flag_enabled("PRISMAQUANT_GRAPH_SHARED_POOL", default=True):
         return None
     if not torch.cuda.is_available():
         return None
@@ -147,7 +148,7 @@ def _cuda_graph_pool_id(pool) -> str:
 
 
 def get_prismaquant_graph_pool_id() -> str:
-    if not _env_flag_enabled("PRISMAQUANT_GRAPH_SHARED_POOL", default=False):
+    if not _env_flag_enabled("PRISMAQUANT_GRAPH_SHARED_POOL", default=True):
         return "private"
     if not torch.cuda.is_available():
         return "unavailable"
@@ -1196,7 +1197,7 @@ def _clone_cuda_graph_output(value):
     )
     if clone_disabled and _env_flag_enabled(
         "PRISMAQUANT_GRAPH_SHARED_POOL",
-        default=False,
+        default=True,
     ):
         global _NOCLONE_OVERRIDE_WARNED
         if not _NOCLONE_OVERRIDE_WARNED:
