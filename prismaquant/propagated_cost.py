@@ -33,6 +33,11 @@ from prismaquant.allocator_candidates import (
 )
 from prismaquant.allocator_solver import Candidate, _shape_from_stats, solve_allocation
 from prismaquant.build_rtn_cache import kl_divergence
+from prismaquant.memory_management import (
+    GPUMemoryBudgetExceeded,
+    enforce_gpu_memory_budget,
+    register_budget_evictor,
+)
 from prismaquant.perturbed_x_cache import (
     PerturbedActivationCache,
     build_quantizable_map,
@@ -1222,15 +1227,23 @@ class CUDAGraphRegistry:
         self.verbose_env = verbose_env
         self.entries: OrderedDict[tuple, _CUDAGraphEntry] = OrderedDict()
         self.disabled_keys: set[tuple] = set()
+        self.eviction_count = 0
+        register_budget_evictor(self)
 
     def clear(self) -> None:
         self.entries.clear()
         self.disabled_keys.clear()
 
     def _max_entries(self) -> int:
-        if self.max_entries_env is None:
-            return self.default_max_entries
-        return _env_int(self.max_entries_env, self.default_max_entries)
+        if (
+            self.max_entries_env is not None
+            and os.environ.get(self.max_entries_env) is not None
+        ):
+            return _env_int(self.max_entries_env, self.default_max_entries)
+        return _env_int(
+            "PRISMAQUANT_CUDA_GRAPH_MAX_ENTRIES_PER_PATH",
+            self.default_max_entries,
+        )
 
     def _verbose_enabled(self) -> bool:
         return (
@@ -1295,10 +1308,37 @@ class CUDAGraphRegistry:
     def _evict_if_needed(self) -> None:
         max_entries = self._max_entries()
         if max_entries <= 0:
+            evicted = len(self.entries)
             self.entries.clear()
+            self.eviction_count += evicted
+            if evicted:
+                self._log_graph_eviction(evicted, max_entries)
             return
         while len(self.entries) > max_entries:
-            self.entries.popitem(last=False)
+            self._evict_oldest_graph_entry(max_entries=max_entries)
+
+    def _log_graph_eviction(self, count: int, *, max_entries: int) -> None:
+        print(
+            "[cuda-graphs] "
+            f"{self.label}: evicted {count} graph(s) "
+            f"(max_entries={max_entries})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _evict_oldest_graph_entry(self, *, max_entries: int | None = None) -> bool:
+        if not self.entries:
+            return False
+        self.entries.popitem(last=False)
+        self.eviction_count += 1
+        self._log_graph_eviction(
+            1,
+            max_entries=self._max_entries() if max_entries is None else max_entries,
+        )
+        return True
+
+    def evict_oldest_for_memory_budget(self) -> bool:
+        return self._evict_oldest_graph_entry()
 
     def run(
         self,
@@ -1352,6 +1392,11 @@ class CUDAGraphRegistry:
             return fn(*args, **kwargs)
 
         try:
+            enforce_gpu_memory_budget(
+                [self],
+                device=torch.device(graph_device),
+                reason=f"{self.label}:{label} CUDA graph capture",
+            )
             entry = self._capture(
                 fn,
                 args,
@@ -1361,12 +1406,19 @@ class CUDAGraphRegistry:
                 capture_label=str(label),
             )
         except Exception as exc:
+            if isinstance(exc, GPUMemoryBudgetExceeded):
+                raise
             self.disabled_keys.add(full_key)
             self._verbose_exception(str(label), "capture failed", exc)
             _warn_cuda_graph_fallback_once(str(label), exc)
             return fn(*args, **kwargs)
         self.entries[full_key] = entry
         self._evict_if_needed()
+        enforce_gpu_memory_budget(
+            [self],
+            device=torch.device(graph_device),
+            reason=f"{self.label}:{label} CUDA graph capture",
+        )
         return _clone_cuda_graph_output(entry.static_output)
 
     def _capture(
@@ -1481,12 +1533,49 @@ class _TailCudaGraphEntry:
 class _TailCudaGraphCache:
     def __init__(self, *, enabled: bool):
         self.enabled = bool(enabled) and torch.cuda.is_available()
-        self.entries: dict[tuple, _TailCudaGraphEntry] = {}
+        self.entries: OrderedDict[tuple, _TailCudaGraphEntry] = OrderedDict()
         self.disabled_keys: set[tuple] = set()
+        self.eviction_count = 0
+        register_budget_evictor(self)
 
     def clear(self) -> None:
         self.entries.clear()
         self.disabled_keys.clear()
+
+    def _max_entries(self) -> int:
+        return _env_int("PRISMAQUANT_CUDA_GRAPH_MAX_ENTRIES_PER_PATH", 4)
+
+    def _log_graph_eviction(self, count: int) -> None:
+        print(
+            "[cuda-graphs] "
+            f"l3-tail: evicted {count} graph(s) "
+            f"(max_entries={self._max_entries()})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _evict_oldest_graph_entry(self) -> bool:
+        if not self.entries:
+            return False
+        self.entries.popitem(last=False)
+        self.eviction_count += 1
+        self._log_graph_eviction(1)
+        return True
+
+    def evict_oldest_for_memory_budget(self) -> bool:
+        return self._evict_oldest_graph_entry()
+
+    def _evict_if_needed(self) -> None:
+        max_entries = self._max_entries()
+        if max_entries <= 0:
+            evicted = len(self.entries)
+            self.entries.clear()
+            self.eviction_count += evicted
+            if evicted:
+                self._log_graph_eviction(evicted)
+            return
+        while len(self.entries) > max_entries:
+            self._evict_oldest_graph_entry()
 
     def run(
         self,
@@ -1520,6 +1609,7 @@ class _TailCudaGraphCache:
         )
         entry = self.entries.get(key)
         if entry is not None:
+            self.entries.move_to_end(key)
             if not (
                 _copy_static_tree(hidden_state, entry.static_hidden)
                 and _copy_static_tree(tuple(layer_args), entry.static_args)
@@ -1543,6 +1633,11 @@ class _TailCudaGraphCache:
                 hidden_state,
             )
         try:
+            enforce_gpu_memory_budget(
+                [self],
+                device=hidden_state.device,
+                reason="l3-tail CUDA graph capture",
+            )
             entry = self._capture(
                 model,
                 layer_idx,
@@ -1550,6 +1645,8 @@ class _TailCudaGraphCache:
                 layer_kwargs,
                 hidden_state,
             )
+        except GPUMemoryBudgetExceeded:
+            raise
         except Exception:
             self.disabled_keys.add(key)
             return _tail_forward_eager(
@@ -1560,6 +1657,12 @@ class _TailCudaGraphCache:
                 hidden_state,
             )
         self.entries[key] = entry
+        self._evict_if_needed()
+        enforce_gpu_memory_budget(
+            [self],
+            device=hidden_state.device,
+            reason="l3-tail CUDA graph capture",
+        )
         return entry.static_output.clone()
 
     def _capture(
@@ -1789,6 +1892,11 @@ def build_quant_weight_cache(
             canonical = fr.canonical_format_name(spec.name)
             if skip_bf16 and canonical == "BF16":
                 continue
+            enforce_gpu_memory_budget(
+                device=original_weight.device
+                if original_weight.device.type == "cuda" else None,
+                reason="L3 quant weight cache fill",
+            )
             quantized = apply_format_quantization(original_weight, spec).to(
                 device=original_weight.device,
                 dtype=original_weight.dtype,

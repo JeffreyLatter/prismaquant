@@ -13,8 +13,9 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,11 @@ import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
+from prismaquant.memory_management import (
+    enforce_gpu_memory_budget,
+    env_int,
+    register_budget_evictor,
+)
 
 
 _FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
@@ -253,16 +259,21 @@ class PerturbedActivationCache:
         self._snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._rows_got: dict[str, int] = defaultdict(int)
         self._handles = []
-        self._frozen_weight_cache: dict[tuple[int, str], torch.Tensor] | None = None
-        self._frozen_weight_format_cache: dict[
+        self._frozen_weight_cache: OrderedDict[
+            tuple[int, str], torch.Tensor
+        ] | None = None
+        self._frozen_weight_format_cache: OrderedDict[
             tuple[str, str], torch.Tensor
-        ] = {}
+        ] = OrderedDict()
         self._fused_forward_originals: list[tuple[nn.Module, object]] = []
-        self._fused_nvfp4_weight_cache: dict[
+        self._fused_nvfp4_weight_cache: OrderedDict[
             tuple[str, str, str, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        ] = {}
+        ] = OrderedDict()
         self._materialized_frozen_weight_depth = 0
+        self._frozen_weight_cache_evictions = 0
+        self._frozen_weight_cache_eviction_reported = False
+        register_budget_evictor(self)
 
     @property
     def installed(self) -> bool:
@@ -315,16 +326,30 @@ class PerturbedActivationCache:
         cache_key = (param_plan.name, fmt)
         q = self._frozen_weight_format_cache.get(cache_key)
         if q is None:
+            enforce_gpu_memory_budget(
+                [self],
+                device=param.device if param.device.type == "cuda" else None,
+                reason="frozen weight cache fill",
+            )
             original = param.data.detach().clone()
             q = spec.quantize_dequantize(original).to(
                 device=param.device,
                 dtype=param.dtype,
             ).contiguous()
-            self._frozen_weight_format_cache[cache_key] = q
+            if self._frozen_weight_cache_max_entries() > 0:
+                self._frozen_weight_format_cache[cache_key] = q
+                self._evict_frozen_weight_format_cache_to_limit()
+            enforce_gpu_memory_budget(
+                [self],
+                device=param.device if param.device.type == "cuda" else None,
+                reason="frozen weight cache fill",
+            )
+        else:
+            self._frozen_weight_format_cache.move_to_end(cache_key)
         return q
 
     def build_frozen_weight_cache(self) -> dict[tuple[int, str], torch.Tensor]:
-        cache: dict[tuple[int, str], torch.Tensor] = {}
+        cache: OrderedDict[tuple[int, str], torch.Tensor] = OrderedDict()
         for plan in self.plans:
             seen_attrs: set[str] = set()
             for param_plan in plan.params:
@@ -346,6 +371,7 @@ class PerturbedActivationCache:
             yield self
         finally:
             self._frozen_weight_cache = previous
+            self._emit_frozen_weight_cache_evictions()
 
     @contextmanager
     def materialized_frozen_weights(self) -> Iterator["PerturbedActivationCache"]:
@@ -376,6 +402,7 @@ class PerturbedActivationCache:
                     q = self._frozen_weight_cache.get(cache_key)
                     if q is None:
                         continue
+                    self._frozen_weight_cache.move_to_end(cache_key)
                     originals.append((param, param.data.detach().clone()))
                     param.data.copy_(q.to(device=param.device, dtype=param.dtype))
             yield self
@@ -393,6 +420,7 @@ class PerturbedActivationCache:
         if q is None:
             return
         self._frozen_weight_cache[(id(plan.module), param_plan.attr)] = q
+        self._frozen_weight_cache.move_to_end((id(plan.module), param_plan.attr))
         param_plan.spec = spec
 
     @contextmanager
@@ -434,6 +462,7 @@ class PerturbedActivationCache:
                     self._frozen_weight_cache.pop(cache_key, None)
                 else:
                     self._frozen_weight_cache[cache_key] = previous_q
+                    self._frozen_weight_cache.move_to_end(cache_key)
                 param_plan.spec = previous_spec
 
     def _capture(self, plan: _ModulePlan, x: torch.Tensor) -> None:
@@ -461,7 +490,10 @@ class PerturbedActivationCache:
             original = param.data.detach().clone()
             q = None
             if self._frozen_weight_cache is not None:
-                q = self._frozen_weight_cache.get((id(plan.module), param_plan.attr))
+                cache_key = (id(plan.module), param_plan.attr)
+                q = self._frozen_weight_cache.get(cache_key)
+                if q is not None:
+                    self._frozen_weight_cache.move_to_end(cache_key)
             if q is None:
                 q = param_plan.spec.quantize_dequantize(original)
             param.data.copy_(q.to(device=param.device, dtype=param.dtype))
@@ -523,7 +555,10 @@ class PerturbedActivationCache:
             return param
         q = None
         if self._frozen_weight_cache is not None:
-            q = self._frozen_weight_cache.get((id(plan.module), param_plan.attr))
+            cache_key = (id(plan.module), param_plan.attr)
+            q = self._frozen_weight_cache.get(cache_key)
+            if q is not None:
+                self._frozen_weight_cache.move_to_end(cache_key)
         if q is None:
             q = self._quantized_weight_for(plan, param_plan, param_plan.spec)
         if q is None:
@@ -560,9 +595,65 @@ class PerturbedActivationCache:
         if packed is None:
             from prismaquant.kernels.nvfp4_fused import nvfp4_pack_weight
 
+            enforce_gpu_memory_budget(
+                [self],
+                device=param.device if param.device.type == "cuda" else None,
+                reason="NVFP4 packed weight cache fill",
+            )
             packed = nvfp4_pack_weight(param.detach())
             self._fused_nvfp4_weight_cache[cache_key] = packed
+            self._fused_nvfp4_weight_cache.move_to_end(cache_key)
+            enforce_gpu_memory_budget(
+                [self],
+                device=param.device if param.device.type == "cuda" else None,
+                reason="NVFP4 packed weight cache fill",
+            )
+        else:
+            self._fused_nvfp4_weight_cache.move_to_end(cache_key)
         return packed
+
+    def _frozen_weight_cache_max_entries(self) -> int:
+        return env_int("PRISMAQUANT_FROZEN_WEIGHT_CACHE_MAX_ENTRIES", 400)
+
+    def _evict_frozen_weight_format_cache_to_limit(self) -> None:
+        max_entries = self._frozen_weight_cache_max_entries()
+        if max_entries <= 0:
+            evicted = len(self._frozen_weight_format_cache)
+            self._frozen_weight_format_cache.clear()
+            self._frozen_weight_cache_evictions += evicted
+            return
+        while len(self._frozen_weight_format_cache) > max_entries:
+            self._frozen_weight_format_cache.popitem(last=False)
+            self._frozen_weight_cache_evictions += 1
+
+    def evict_oldest_for_memory_budget(self) -> bool:
+        if self._frozen_weight_format_cache:
+            self._frozen_weight_format_cache.popitem(last=False)
+            self._frozen_weight_cache_evictions += 1
+            return True
+        if self._fused_nvfp4_weight_cache:
+            self._fused_nvfp4_weight_cache.popitem(last=False)
+            return True
+        if self._frozen_weight_cache:
+            self._frozen_weight_cache.popitem(last=False)
+            self._frozen_weight_cache_evictions += 1
+            return True
+        return False
+
+    def _emit_frozen_weight_cache_evictions(self) -> None:
+        if (
+            self._frozen_weight_cache_evictions <= 0
+            or self._frozen_weight_cache_eviction_reported
+        ):
+            return
+        self._frozen_weight_cache_eviction_reported = True
+        print(
+            "[frozen-weight-cache] evicted "
+            f"{self._frozen_weight_cache_evictions} entries "
+            f"(max_entries={self._frozen_weight_cache_max_entries()})",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _nvfp4_fused_linear_forward(
         self,

@@ -11,11 +11,22 @@ import triton
 import triton.language as tl
 
 from prismaquant import format_registry as fr
+from prismaquant.memory_management import (
+    enforce_gpu_memory_budget,
+    env_flag_enabled,
+)
 
 
 _FP4_E2M1_MAX = 6.0
 _NVFP4_GROUP_SIZE = 16
 _FP4_E2M1_POS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_NVFP4_FUSED_WARMUP_STATE = {
+    "attempted": False,
+    "compiled": False,
+    "skipped_reason": None,
+}
+_NVFP4_FUSED_WARMUP_ACTIVE = False
+_NVFP4_FUSED_COMPILED_SIGNATURES: set[tuple[int, int, int, int, int, int]] = set()
 
 
 def _pack_fp4_indices(fp4_indices: torch.Tensor, last_dim: int) -> torch.Tensor:
@@ -261,6 +272,11 @@ def nvfp4_fused_aw_matmul(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return ``x @ dequantize(w_packed).T`` with inline NVFP4 activation RTN."""
+    if (
+        not _NVFP4_FUSED_WARMUP_ACTIVE
+        and not _NVFP4_FUSED_WARMUP_STATE["attempted"]
+    ):
+        ensure_nvfp4_fused_warmup()
     M, N, K = _validate_inputs(x, w_packed, w_scales, w_global_scale)
     if not x.is_cuda:
         raise RuntimeError("nvfp4_fused_aw_matmul requires CUDA")
@@ -278,6 +294,7 @@ def nvfp4_fused_aw_matmul(
     block_m = 16 if M <= 16 else 32
     block_n = 32 if N <= 512 else 64
     block_k = 64 if K <= 64 else 128
+    enforce_gpu_memory_budget(device=x.device, reason="NVFP4 fused matmul")
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
     nvfp4_fused_aw_matmul_kernel[grid](
         x,
@@ -302,4 +319,48 @@ def nvfp4_fused_aw_matmul(
         num_warps=4,
         num_stages=2,
     )
+    _NVFP4_FUSED_COMPILED_SIGNATURES.add((M, N, K, block_m, block_n, block_k))
     return out
+
+
+def nvfp4_fused_warmup_state() -> dict:
+    return {
+        **_NVFP4_FUSED_WARMUP_STATE,
+        "compiled_signatures": sorted(_NVFP4_FUSED_COMPILED_SIGNATURES),
+    }
+
+
+def ensure_nvfp4_fused_warmup() -> bool:
+    global _NVFP4_FUSED_WARMUP_ACTIVE
+    if _NVFP4_FUSED_WARMUP_STATE["attempted"]:
+        return bool(_NVFP4_FUSED_WARMUP_STATE["compiled"])
+    _NVFP4_FUSED_WARMUP_STATE["attempted"] = True
+    if not env_flag_enabled("PRISMAQUANT_NVFP4_FUSED_JIT_WARMUP", default=True):
+        _NVFP4_FUSED_WARMUP_STATE["skipped_reason"] = "disabled"
+        return False
+    if not torch.cuda.is_available():
+        _NVFP4_FUSED_WARMUP_STATE["skipped_reason"] = "cuda_unavailable"
+        return False
+    device = torch.device("cuda")
+    _NVFP4_FUSED_WARMUP_ACTIVE = True
+    try:
+        with torch.no_grad():
+            x = torch.zeros((8, 64), device=device, dtype=torch.bfloat16)
+            weight = torch.zeros((8, 64), device=device, dtype=torch.bfloat16)
+            w_packed, w_scales, w_global_scale = nvfp4_pack_weight(weight)
+            out = torch.empty((8, 8), device=device, dtype=torch.bfloat16)
+            nvfp4_fused_aw_matmul(x, w_packed, w_scales, w_global_scale, out=out)
+            torch.cuda.synchronize(device)
+        _NVFP4_FUSED_WARMUP_STATE["compiled"] = True
+        _NVFP4_FUSED_WARMUP_STATE["skipped_reason"] = None
+        return True
+    except Exception as exc:
+        _NVFP4_FUSED_WARMUP_STATE["skipped_reason"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False
+    finally:
+        _NVFP4_FUSED_WARMUP_ACTIVE = False
+
+
+ensure_nvfp4_fused_warmup()

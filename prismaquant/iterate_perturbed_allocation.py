@@ -37,6 +37,7 @@ from prismaquant.build_rtn_cache import (
     load_wikitext_calibration,
 )
 from prismaquant.measure_quant_cost import ActivationIndex, run_cost_pass
+from prismaquant.memory_management import phase_boundary_memory_cleanup
 from prismaquant.perturbed_x_cache import (
     PerturbedActivationCache,
     calibration_data_hash,
@@ -541,6 +542,10 @@ def _phase_end(label: str, start: float) -> dict:
     suffix = f", cuda_peak={peak_gb:.2f}GB" if peak_gb is not None else ""
     _emit(f"{label}: done in {elapsed:.1f}s{suffix}")
     return {"elapsed_seconds": elapsed, "cuda_peak_gb": peak_gb}
+
+
+def _phase_boundary_cleanup(label: str) -> None:
+    phase_boundary_memory_cleanup(label)
 
 
 def _directory_size_bytes(path: Path) -> int:
@@ -2119,6 +2124,7 @@ def run_iterated_l3_polish(
     else:
         termination = "max_iters"
 
+    _phase_boundary_cleanup(f"{prefix} l3_to_coord")
     coord_meta = {
         "fired": False,
         "flips_committed": 0,
@@ -2528,6 +2534,7 @@ def run_anchor_budget(
         f"[multi][l2] anchor {anchor_label}: "
         f"{'converged' if convergence_reached else 'max-iters'}"
     )
+    _phase_boundary_cleanup(f"anchor_{anchor_label}_l2_to_l3")
     kl_before = measure_assignment_kl(
         runtime.model,
         assignment,
@@ -2610,6 +2617,7 @@ def run_anchor_budget(
         l3_candidates,
         assignment,
     )
+    _phase_boundary_cleanup(f"anchor_{anchor_label}_complete")
     return AnchorResult(
         anchor_bpp=float(anchor_bpp),
         output_dir=anchor_dir,
@@ -2755,6 +2763,9 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
         for target in cluster["targets"]:
             result = run_single_budget(args, float(target), reusable_anchor=anchor)
             results.append(result)
+            _phase_boundary_cleanup(
+                f"target_{_bpp_label(float(target))}_complete"
+            )
             l2_kl = float(result.l2_kl)
             l3_kl = float(result.validation_kl)
             _emit(
@@ -2772,6 +2783,9 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
                     "[multi] WARNING: L3 polish regressed L2 by >5% — "
                     "likely non-additive cost interaction; consider --l3-mode selective"
                 )
+        _phase_boundary_cleanup(
+            f"anchor_{_bpp_label(float(cluster['anchor']))}_to_next_anchor"
+        )
     csv_path, json_path = _write_pareto_outputs(
         runtime.output_root,
         results,
@@ -2837,6 +2851,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             anchors.append(anchor)
         result = run_single_budget(args, float(bpp), reusable_anchor=anchor)
         results_by_bpp[key] = result
+        _phase_boundary_cleanup(f"knee_eval_{_bpp_label(float(bpp))}_complete")
         return result.validation_kl
 
     if args.knee_mode == "threshold":
@@ -3577,6 +3592,7 @@ def main(argv: list[str] | None = None) -> int:
             convergence_reached = True
             break
 
+    _phase_boundary_cleanup("single_budget_l2_to_l3")
     l3_summary_path = None
     l3_cost_path = None
     l3_flip_count = 0
