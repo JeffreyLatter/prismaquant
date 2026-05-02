@@ -347,21 +347,40 @@ class PerturbedActivationCache:
         name: str,
         fmt: str,
     ) -> Iterator["PerturbedActivationCache"]:
+        with self.override({name: fmt}):
+            yield self
+
+    @contextmanager
+    def override(
+        self,
+        assignment_delta: Mapping[str, str],
+    ) -> Iterator["PerturbedActivationCache"]:
         if self._frozen_weight_cache is None:
             raise RuntimeError("frozen weight cache is not active")
-        plan, param_plan = self._find_param_plan(name)
-        cache_key = (id(plan.module), param_plan.attr)
-        previous_q = self._frozen_weight_cache.get(cache_key)
-        previous_spec = param_plan.spec
-        self.set_frozen_weight_format(name, fmt)
+        previous: list[
+            tuple[tuple[int, str], torch.Tensor | None, _ParamPlan, fr.FormatSpec]
+        ] = []
+        for name, fmt in assignment_delta.items():
+            plan, param_plan = self._find_param_plan(name)
+            cache_key = (id(plan.module), param_plan.attr)
+            previous.append(
+                (
+                    cache_key,
+                    self._frozen_weight_cache.get(cache_key),
+                    param_plan,
+                    param_plan.spec,
+                )
+            )
+            self.set_frozen_weight_format(name, fmt)
         try:
             yield self
         finally:
-            if previous_q is None:
-                self._frozen_weight_cache.pop(cache_key, None)
-            else:
-                self._frozen_weight_cache[cache_key] = previous_q
-            param_plan.spec = previous_spec
+            for cache_key, previous_q, param_plan, previous_spec in reversed(previous):
+                if previous_q is None:
+                    self._frozen_weight_cache.pop(cache_key, None)
+                else:
+                    self._frozen_weight_cache[cache_key] = previous_q
+                param_plan.spec = previous_spec
 
     def _capture(self, plan: _ModulePlan, x: torch.Tensor) -> None:
         flat = x.detach().reshape(-1, x.size(-1))

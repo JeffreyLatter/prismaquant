@@ -1203,28 +1203,11 @@ def coordinate_descent_polish(
     halted = "max_passes" if int(max_passes) > 0 else "max_passes"
     anchor_text = f"anchor {anchor_label}" if anchor_label is not None else "anchor n/a"
 
-    for _pass_idx in range(max(0, int(max_passes))):
-        passes_completed += 1
-        pass_improved = False
-        ranked_candidates = _coord_descent_ranked_candidates(
-            assignment,
-            l3_costs,
-            specs,
-        )
-        if emit is not None:
-            if ranked_candidates:
-                best_pred, best_name, best_fmt = ranked_candidates[0]
-                emit(
-                    f"[coord] {anchor_text}: L3-ranked "
-                    f"{len(ranked_candidates)} candidates; best="
-                    f"{best_name}->{best_fmt} predicted_delta={best_pred:.6g}"
-                )
-            else:
-                emit(f"[coord] {anchor_text}: L3-ranked 0 candidates")
-        if not ranked_candidates:
-            halted = "no_improvement"
-            break
-
+    hooks: PerturbedActivationCache | None = None
+    cached_names: set[str] = set()
+    cache_cm = nullcontext()
+    if int(max_passes) > 0:
+        Path(work_root).mkdir(parents=True, exist_ok=True)
         cache_dir = Path(
             tempfile.mkdtemp(
                 prefix="prismaquant_coord_kl_hooks_",
@@ -1245,24 +1228,59 @@ def coordinate_descent_polish(
             for param_plan in plan.params
         }
         if cached_names:
-            hooks.build_frozen_weight_cache()
+            cache_cm = hooks.frozen_weight_cache()
+
+    with cache_cm:
+        if hooks is not None and cached_names:
             hooks.install()
         try:
-            for _predicted_delta, name, candidate_fmt in ranked_candidates:
-                if candidate_fmt == fr.canonical_format_name(assignment.get(name, "")):
-                    continue
-                trial = dict(assignment)
-                trial[name] = candidate_fmt
-                if not _within_assignment_budget(
-                    stats,
-                    trial,
+            for _pass_idx in range(max(0, int(max_passes))):
+                passes_completed += 1
+                pass_improved = False
+                ranked_candidates = _coord_descent_ranked_candidates(
+                    assignment,
+                    l3_costs,
                     specs,
-                    target_bpp,
-                    bit_precision,
-                ):
-                    continue
-                if name in cached_names:
-                    with hooks.temporary_frozen_weight_format(name, candidate_fmt):
+                )
+                if emit is not None:
+                    if ranked_candidates:
+                        best_pred, best_name, best_fmt = ranked_candidates[0]
+                        emit(
+                            f"[coord] {anchor_text}: L3-ranked "
+                            f"{len(ranked_candidates)} candidates; best="
+                            f"{best_name}->{best_fmt} predicted_delta={best_pred:.6g}"
+                        )
+                    else:
+                        emit(f"[coord] {anchor_text}: L3-ranked 0 candidates")
+                if not ranked_candidates:
+                    halted = "no_improvement"
+                    break
+
+                for _predicted_delta, name, candidate_fmt in ranked_candidates:
+                    if candidate_fmt == fr.canonical_format_name(assignment.get(name, "")):
+                        continue
+                    trial = dict(assignment)
+                    trial[name] = candidate_fmt
+                    if not _within_assignment_budget(
+                        stats,
+                        trial,
+                        specs,
+                        target_bpp,
+                        bit_precision,
+                    ):
+                        continue
+                    if hooks is not None and name in cached_names:
+                        with hooks.override({name: candidate_fmt}):
+                            trial_kl = measure_assignment_kl(
+                                model,
+                                trial,
+                                calib_ids,
+                                ref_log_probs,
+                                work_root=work_root,
+                                profile=profile,
+                                perturbed_cache=hooks,
+                            )
+                    else:
                         trial_kl = measure_assignment_kl(
                             model,
                             trial,
@@ -1270,43 +1288,36 @@ def coordinate_descent_polish(
                             ref_log_probs,
                             work_root=work_root,
                             profile=profile,
-                            perturbed_cache=hooks,
                         )
-                else:
-                    trial_kl = measure_assignment_kl(
-                        model,
-                        trial,
-                        calib_ids,
-                        ref_log_probs,
-                        work_root=work_root,
-                        profile=profile,
-                    )
-                measurements += 1
-                if float(trial_kl) < current_kl - 1e-12:
-                    assignment[name] = candidate_fmt
-                    current_kl = float(trial_kl)
-                    if name in cached_names:
-                        hooks.set_frozen_weight_format(name, candidate_fmt)
-                    flips_committed += 1
-                    failed_streak = 0
-                    pass_improved = True
-                else:
-                    failed_streak += 1
-                    if int(early_stop_streak) > 0 and failed_streak >= int(early_stop_streak):
-                        halted = "streak"
-                        break
-        finally:
-            if hooks.installed:
-                hooks.remove()
+                    measurements += 1
+                    if float(trial_kl) < current_kl - 1e-12:
+                        assignment[name] = candidate_fmt
+                        current_kl = float(trial_kl)
+                        if hooks is not None and name in cached_names:
+                            hooks.set_frozen_weight_format(name, candidate_fmt)
+                        flips_committed += 1
+                        failed_streak = 0
+                        pass_improved = True
+                    else:
+                        failed_streak += 1
+                        if (
+                            int(early_stop_streak) > 0
+                            and failed_streak >= int(early_stop_streak)
+                        ):
+                            halted = "streak"
+                            break
 
-        if halted == "streak":
-            break
-        if not pass_improved:
-            halted = "no_improvement"
-            break
-    else:
-        if int(max_passes) <= 0:
-            halted = "max_passes"
+                if halted == "streak":
+                    break
+                if not pass_improved:
+                    halted = "no_improvement"
+                    break
+            else:
+                if int(max_passes) <= 0:
+                    halted = "max_passes"
+        finally:
+            if hooks is not None and hooks.installed:
+                hooks.remove()
 
     meta = {
         "passes_completed": passes_completed,

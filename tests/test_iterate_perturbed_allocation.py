@@ -934,6 +934,73 @@ def test_coord_descent_uses_frozen_cache(tmp_path, monkeypatch):
     assert calls["count"] == n_layers * 2
 
 
+def test_coord_descent_frozen_cache_spans_passes(tmp_path, monkeypatch):
+    spec_a = _counted_fp_spec("COUNTED_COORD_PASS_FP4_A")
+    spec_b = _counted_fp_spec("COUNTED_COORD_PASS_FP4_B")
+    monkeypatch.setitem(ipa.fr.REGISTRY, spec_a.name, spec_a)
+    monkeypatch.setitem(ipa.fr.REGISTRY, spec_b.name, spec_b)
+
+    n_layers = 5
+    model = _WideStackLogitsModel(layers=n_layers).eval()
+    stats = {
+        name: _wide_stat(formats=(spec_a.name, spec_b.name))
+        for name in model.layer_names
+    }
+    specs = [spec_a, spec_b]
+    assignment = {name: spec_a.name for name in model.layer_names}
+    l3_costs = {
+        name: {
+            spec_a.name: {"propagated_end_kl": 1.0},
+            spec_b.name: {"propagated_end_kl": 0.0},
+        }
+        for name in model.layer_names
+    }
+    calib_ids = torch.randn(1, 4, 33)
+    ref_log_probs = ipa.cache_reference_log_probs(
+        model,
+        calib_ids,
+        next(model.parameters()).device,
+    )
+
+    calls = {"count": 0}
+    original = ipa.fr._rtn_fp_codebook
+
+    def _counted(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    kl_sequence = {"next": 1000.0}
+
+    def _decreasing_kl(*_args, **_kwargs):
+        kl_sequence["next"] -= 1.0
+        return torch.tensor(kl_sequence["next"], dtype=torch.float32)
+
+    monkeypatch.setattr(ipa.fr, "_rtn_fp_codebook", _counted)
+    monkeypatch.setattr(ipa, "kl_divergence", _decreasing_kl)
+
+    _polished, _final_kl, meta = ipa.coordinate_descent_polish(
+        model,
+        assignment,
+        l3_costs,
+        specs,
+        16.0,
+        calib_ids,
+        ref_log_probs,
+        stats=stats,
+        work_root=tmp_path,
+        current_kl=1000.0,
+        return_metadata=True,
+        early_stop_streak=100,
+        max_passes=2,
+    )
+
+    expected_trials = 10
+    max_unique_weight_rounds = n_layers * len(specs)
+    assert meta["measurements"] == expected_trials
+    assert calls["count"] <= max_unique_weight_rounds
+    assert calls["count"] <= max_unique_weight_rounds + expected_trials
+
+
 def test_coord_descent_l3_ranked_order(tmp_path, monkeypatch):
     stats = {f"layer{i}": _tiny_stat() for i in range(2)}
     specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
