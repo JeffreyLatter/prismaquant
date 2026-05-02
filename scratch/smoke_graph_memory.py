@@ -66,12 +66,15 @@ def _set_smoke_env() -> None:
 
 
 def _pin_rng(seed: int) -> None:
+    # Note: torch.use_deterministic_algorithms(True) was tried here but
+    # produces NaN with the fused NVFP4 Triton kernel. Seeding alone is
+    # enough to give bit-identical coord descent decisions across
+    # shared-vs-private graph pool runs.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _load_local_model():
