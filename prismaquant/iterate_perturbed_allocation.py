@@ -45,8 +45,10 @@ from prismaquant.perturbed_x_cache import (
 )
 from prismaquant.layer_state_cache import LayerHiddenStateCache
 from prismaquant.propagated_cost import (
+    CUDAGraphRegistry,
     L3NeighborhoodEntry,
     L3UnsupportedTargetError,
+    _env_flag_enabled,
     assignment_bit_total,
     build_global_l3_neighborhood,
     build_l3_candidates,
@@ -57,6 +59,13 @@ from prismaquant.propagated_cost import (
     solve_frozen_l3_neighborhood,
 )
 from prismaquant.schemas import validate_cost_payload, validate_probe_payload
+
+
+_KL_CUDA_GRAPH_REGISTRY = CUDAGraphRegistry(
+    label="assignment-kl",
+    max_entries=4,
+    max_entries_env="PRISMAQUANT_KL_CUDA_GRAPH_CACHE_SIZE",
+)
 
 
 def assignment_hash(assignment: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
@@ -2161,6 +2170,8 @@ def run_anchor_budget(
         target_names = set(runtime.stats.keys())
         missing_act = [n for n in target_names if n not in act_cache]
         cost_path = anchor_dir / f"costs_iter_{iteration:02d}.pkl"
+        # PRISMAQUANT_L2_CUDA_GRAPHS is skipped for the mixed-shape L2 cost
+        # table loop; see the single-budget path comment for the same boundary.
         measured_costs = run_cost_pass(
             runtime.model,
             act_cache,
@@ -2678,6 +2689,16 @@ def measure_assignment_kl(
         )
     device = next(model.parameters()).device
     values = []
+    use_cuda_graphs = _env_flag_enabled(
+        "PRISMAQUANT_KL_CUDA_GRAPHS",
+        default=True,
+    )
+    graph_key = (
+        id(model),
+        assignment_hash(assignment),
+        bool(use_frozen_weight_cache),
+        rng_seed,
+    )
     cache_cm = nullcontext()
     if use_frozen_weight_cache and hooks._frozen_weight_cache is None:
         cache_cm = hooks.frozen_weight_cache()
@@ -2700,7 +2721,18 @@ def measure_assignment_kl(
                         torch.cuda.manual_seed_all(int(rng_seed))
                 for i in range(calib_ids.size(0)):
                     batch = calib_ids[i:i + 1].to(device)
-                    logits = model(batch).logits[:, -1:, :]
+                    def _forward(batch_ids):
+                        return model(batch_ids).logits[:, -1:, :]
+
+                    logits = _KL_CUDA_GRAPH_REGISTRY.run(
+                        "assignment-kl-forward",
+                        graph_key,
+                        _forward,
+                        batch,
+                        enabled=use_cuda_graphs,
+                        device=device,
+                        keepalive=(hooks,),
+                    )
                     teacher = ref_log_probs[i][:, -1:, :]
                     values.append(float(kl_divergence(logits, teacher).item()))
         finally:
@@ -2979,6 +3011,10 @@ def main(argv: list[str] | None = None) -> int:
         cost_path = output_root / f"costs_iter_{iteration:02d}.pkl"
         previous_costs = cost_history[-1] if cost_history else None
         cost_start = _phase_start(f"[l2] iteration {iteration}: cost step")
+        # PRISMAQUANT_L2_CUDA_GRAPHS is not wired into the L2 cost kernel path
+        # here: run_cost_pass measures many per-Linear/per-chunk shapes and
+        # returns host scalar tables, so safe graphing needs a separate
+        # per-shape output-buffer API rather than wrapping this mixed loop.
         measured_costs = run_cost_pass(
             model,
             act_cache,

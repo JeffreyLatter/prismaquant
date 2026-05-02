@@ -146,9 +146,30 @@ neighborhood = [
 specs = [fr.get_format("MXFP8"), fr.get_format("BF16")]
 
 
-def run(label: str, *, prequant_cache: bool, cuda_graphs: bool) -> dict:
+GRAPH_ENV_FLAGS = (
+    "PRISMAQUANT_L3_CUDA_GRAPHS",
+    "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+    "PRISMAQUANT_KL_CUDA_GRAPHS",
+    "PRISMAQUANT_L2_CUDA_GRAPHS",
+    "PRISMAQUANT_VALIDATION_CUDA_GRAPHS",
+)
+
+
+def set_graph_mode(mode: str) -> None:
+    for name in GRAPH_ENV_FLAGS:
+        os.environ[name] = "0"
+    if mode == "l3_tail":
+        os.environ["PRISMAQUANT_L3_CUDA_GRAPHS"] = "1"
+    elif mode == "all":
+        for name in GRAPH_ENV_FLAGS:
+            os.environ[name] = "1"
+    elif mode != "off":
+        raise ValueError(f"unknown graph mode {mode!r}")
+
+
+def run(label: str, *, prequant_cache: bool, graph_mode: str) -> dict:
     os.environ["PRISMAQUANT_L3_PREQUANT_CACHE"] = "1" if prequant_cache else "0"
-    os.environ["PRISMAQUANT_L3_CUDA_GRAPHS"] = "1" if cuda_graphs else "0"
+    set_graph_mode(graph_mode)
     if device == "cuda":
         torch.cuda.synchronize()
     start = time.monotonic()
@@ -171,9 +192,9 @@ def run(label: str, *, prequant_cache: bool, cuda_graphs: bool) -> dict:
 
 
 results = [
-    run("no_cache_no_graphs", prequant_cache=False, cuda_graphs=False),
-    run("cache_only", prequant_cache=True, cuda_graphs=False),
-    run("cache_plus_graphs", prequant_cache=True, cuda_graphs=True),
+    run("graphs_off", prequant_cache=True, graph_mode="off"),
+    run("l3_tail_graphs_only", prequant_cache=True, graph_mode="l3_tail"),
+    run("all_graphs_on", prequant_cache=True, graph_mode="all"),
 ]
 baseline = results[0]
 for item in results[1:]:
@@ -222,16 +243,43 @@ coord_l3_costs = {
 }
 coord_specs = [fr.get_format("MXFP8"), fr.get_format("BF16")]
 ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
-coord_start_kl = measure_assignment_kl(
-    model,
-    coord_assignment,
-    calib_ids,
-    ref_log_probs,
-    work_root=work_dir,
-)
 
 
-def run_coord(label: str, *, lane_batch: bool, replay_cache: bool) -> dict:
+def run_kl(label: str, *, graph_mode: str) -> dict:
+    set_graph_mode(graph_mode)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    kl_start = time.monotonic()
+    value = measure_assignment_kl(
+        model,
+        coord_assignment,
+        calib_ids,
+        ref_log_probs,
+        work_root=work_dir,
+    )
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.monotonic() - kl_start
+    print(f"assignment_kl_{label}: wall={elapsed:.3f}s kl={float(value):.12g}")
+    return {"label": label, "wall": elapsed, "kl": float(value)}
+
+
+kl_results = [
+    run_kl("graphs_off", graph_mode="off"),
+    run_kl("l3_tail_graphs_only", graph_mode="l3_tail"),
+    run_kl("all_graphs_on", graph_mode="all"),
+]
+coord_start_kl = kl_results[0]["kl"]
+
+
+def run_coord(
+    label: str,
+    *,
+    lane_batch: bool,
+    replay_cache: bool,
+    graph_mode: str,
+) -> dict:
+    set_graph_mode(graph_mode)
     os.environ["PRISMAQUANT_COORD_LANE_BATCH"] = "1" if lane_batch else "0"
     os.environ["PRISMAQUANT_COORD_REPLAY_CACHE"] = "1" if replay_cache else "0"
     if device == "cuda":
@@ -278,9 +326,24 @@ def run_coord(label: str, *, lane_batch: bool, replay_cache: bool) -> dict:
 
 
 coord_results = [
-    run_coord("coord_sequential", lane_batch=False, replay_cache=False),
-    run_coord("coord_lane_batched_no_cache", lane_batch=True, replay_cache=False),
-    run_coord("coord_lane_batched_replay_cache", lane_batch=True, replay_cache=True),
+    run_coord(
+        "coord_graphs_off",
+        lane_batch=True,
+        replay_cache=True,
+        graph_mode="off",
+    ),
+    run_coord(
+        "coord_l3_tail_graphs_only",
+        lane_batch=True,
+        replay_cache=True,
+        graph_mode="l3_tail",
+    ),
+    run_coord(
+        "coord_all_graphs_on",
+        lane_batch=True,
+        replay_cache=True,
+        graph_mode="all",
+    ),
 ]
 coord_baseline = coord_results[0]
 coord_speedups = {
@@ -288,5 +351,9 @@ coord_speedups = {
     for item in coord_results[1:]
     if item["wall"] > 0
 }
-print(json.dumps({"coord_results": coord_results, "coord_speedups": coord_speedups}, indent=2))
+print(json.dumps({
+    "kl_results": kl_results,
+    "coord_results": coord_results,
+    "coord_speedups": coord_speedups,
+}, indent=2))
 PY

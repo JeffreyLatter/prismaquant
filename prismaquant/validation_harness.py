@@ -28,6 +28,50 @@ from .artifact_registry import (
 
 DEFAULT_CACHE_DIR = Path("/home/rob/dq-runs/prismaquant-validation-cache")
 MMLU_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_VALIDATION_GRAPH_CONTEXT_ATTR = "_prismaquant_validation_graph_context"
+_VALIDATION_GRAPH_CONTEXT_MISSING = object()
+_VALIDATION_CUDA_GRAPH_REGISTRY = None
+
+
+def _validation_cuda_graph_registry():
+    global _VALIDATION_CUDA_GRAPH_REGISTRY
+    if _VALIDATION_CUDA_GRAPH_REGISTRY is None:
+        from .propagated_cost import CUDAGraphRegistry
+
+        _VALIDATION_CUDA_GRAPH_REGISTRY = CUDAGraphRegistry(
+            label="validation",
+            max_entries=4,
+            max_entries_env="PRISMAQUANT_VALIDATION_CUDA_GRAPH_CACHE_SIZE",
+        )
+    return _VALIDATION_CUDA_GRAPH_REGISTRY
+
+
+def _validation_cuda_graph_enabled() -> bool:
+    from .propagated_cost import _env_flag_enabled
+
+    return _env_flag_enabled("PRISMAQUANT_VALIDATION_CUDA_GRAPHS", default=True)
+
+
+def _validation_graph_context(model):
+    return getattr(model, _VALIDATION_GRAPH_CONTEXT_ATTR, ("unperturbed",))
+
+
+def _validation_cuda_graph_run(label: str, model, fn, *args, **kwargs):
+    device = None
+    try:
+        device = next(model.parameters()).device
+    except Exception:
+        pass
+    return _validation_cuda_graph_registry().run(
+        label,
+        (id(model), _validation_graph_context(model)),
+        fn,
+        *args,
+        enabled=_validation_cuda_graph_enabled(),
+        device=device,
+        keepalive=(model,),
+        **kwargs,
+    )
 
 
 def validate_artifact(
@@ -232,11 +276,30 @@ def _perturbed_model(
             "layer_config entries did not match model parameters: "
             f"{preview}{suffix}"
         )
-    hooks.install()
+    previous_context = getattr(
+        model,
+        _VALIDATION_GRAPH_CONTEXT_ATTR,
+        _VALIDATION_GRAPH_CONTEXT_MISSING,
+    )
+    setattr(
+        model,
+        _VALIDATION_GRAPH_CONTEXT_ATTR,
+        ("perturbed", tuple(sorted((str(k), str(v)) for k, v in active.items()))),
+    )
     try:
-        yield
+        hooks.install()
+        try:
+            yield
+        finally:
+            hooks.remove()
     finally:
-        hooks.remove()
+        if previous_context is _VALIDATION_GRAPH_CONTEXT_MISSING:
+            try:
+                delattr(model, _VALIDATION_GRAPH_CONTEXT_ATTR)
+            except AttributeError:
+                pass
+        else:
+            setattr(model, _VALIDATION_GRAPH_CONTEXT_ATTR, previous_context)
 
 
 def _active_assignment(assignment: Mapping[str, str]) -> dict[str, str]:
@@ -283,8 +346,18 @@ def _wikitext_ppl(
             break
         labels = window.clone()
         labels[:, :-trg_len] = -100
-        out = model(window, labels=labels)
-        nll_sum += float(out.loss.detach().float().item()) * float(trg_len)
+
+        def _loss_forward(input_ids, target_labels):
+            return model(input_ids, labels=target_labels).loss
+
+        loss = _validation_cuda_graph_run(
+            "wikitext-ppl-loss",
+            model,
+            _loss_forward,
+            window,
+            labels,
+        )
+        nll_sum += float(loss.detach().float().item()) * float(trg_len)
         token_count += int(trg_len)
         prev_end = end
         if end >= seq_len:
@@ -470,8 +543,18 @@ def _choice_letter_nll(model, tokenizer, prompt: str, choice_idx: int, device) -
     input_ids = _cat_token_ids(prompt_ids, answer_ids).unsqueeze(0).to(device)
     labels = input_ids.clone()
     labels[:, : int(prompt_ids.numel())] = -100
-    out = model(input_ids, labels=labels)
-    return float(out.loss.detach().float().item()) * float(answer_ids.numel())
+
+    def _loss_forward(choice_input_ids, choice_labels):
+        return model(choice_input_ids, labels=choice_labels).loss
+
+    loss = _validation_cuda_graph_run(
+        "mmlu-choice-loss",
+        model,
+        _loss_forward,
+        input_ids,
+        labels,
+    )
+    return float(loss.detach().float().item()) * float(answer_ids.numel())
 
 
 def _cat_token_ids(left, right):
@@ -510,7 +593,16 @@ def _end_kl(
     ref_log_probs = []
     for i in _progress_iter(range(calib_ids.size(0)), progress, "end-kl-ref"):
         batch = calib_ids[i:i + 1].to(device)
-        logits = model(batch).logits[:, -1:, :]
+
+        def _logits_forward(batch_ids):
+            return model(batch_ids).logits[:, -1:, :]
+
+        logits = _validation_cuda_graph_run(
+            "end-kl-ref-logits",
+            model,
+            _logits_forward,
+            batch,
+        )
         ref_log_probs.append(torch.log_softmax(logits.float(), dim=-1).detach())
     work_root = cache_dir / "end_kl"
     work_root.mkdir(parents=True, exist_ok=True)

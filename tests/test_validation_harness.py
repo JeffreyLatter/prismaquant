@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+from prismaquant import validation_harness as vh
 from prismaquant.validation_harness import validate_artifact
 
 
@@ -78,6 +83,57 @@ def test_validate_artifact_accepts_layer_config_path_with_stub_backend(tmp_path)
     assert result["ppl_wikitext"] == 9.0
     assert result["ppl_mmlu_acc"] == 0.30
     assert result["end_kl"] == 0.0
+
+
+class _ValidationToyModel(nn.Module):
+    def __init__(self, vocab: int = 64, hidden: int = 16):
+        super().__init__()
+        self.config = SimpleNamespace(max_position_embeddings=128)
+        self.embed = nn.Embedding(vocab, hidden)
+        self.proj = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, input_ids, labels=None):
+        hidden = self.embed(input_ids)
+        logits = self.proj(hidden)
+        loss = logits.float().sum() * 0.0
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.float().reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
+        return SimpleNamespace(logits=logits, loss=loss)
+
+
+class _ValidationTokenizer:
+    def __call__(self, text, *, add_special_tokens=False, return_tensors="pt"):
+        del add_special_tokens
+        ids = [(ord(ch) % 63) + 1 for ch in text]
+        if not ids:
+            ids = [1]
+        return SimpleNamespace(input_ids=torch.tensor([ids], dtype=torch.long))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_validation_with_cuda_graphs_matches_eager(monkeypatch):
+    torch.manual_seed(0)
+    model = _ValidationToyModel().eval().cuda()
+    tokenizer = _ValidationTokenizer()
+    prompt = "Question: 1 + 1?\nA. 1\nB. 2\nAnswer:"
+
+    def _measure(graphs_enabled: bool) -> list[float]:
+        monkeypatch.setenv(
+            "PRISMAQUANT_VALIDATION_CUDA_GRAPHS",
+            "1" if graphs_enabled else "0",
+        )
+        return [
+            vh._choice_letter_nll(model, tokenizer, prompt, idx, torch.device("cuda"))
+            for idx in range(2)
+        ]
+
+    eager = _measure(False)
+    graphed = _measure(True)
+    assert graphed == pytest.approx(eager, abs=1e-8, rel=0.0)
 
 
 @pytest.mark.slow

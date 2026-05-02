@@ -524,6 +524,10 @@ def capture_perturbed_activation_cache(
     device = _model_device(model)
     builder.install()
     try:
+        # PRISMAQUANT_L2_CUDA_GRAPHS is intentionally not applied here.
+        # These forwards must execute Python hooks on every batch to snapshot
+        # perturbed-X activations; CUDA graph replay would skip those hooks and
+        # silently under-fill the activation cache.
         for args, kwargs in iter_calibration_forwards(calibration_data, device):
             model(*args, **kwargs)
     finally:

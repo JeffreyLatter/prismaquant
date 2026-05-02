@@ -12,8 +12,10 @@ import math
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -96,6 +98,17 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError:
         return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return int(default)
+    try:
+        parsed = int(value)
+    except ValueError:
+        return int(default)
+    return max(parsed, 0)
 
 
 def _cost_entry(costs: Mapping, name: str, fmt: str) -> dict | None:
@@ -1115,6 +1128,209 @@ def _copy_static_tree(src, dst) -> bool:
     return False
 
 
+def _first_cuda_tensor(value) -> torch.Tensor | None:
+    if isinstance(value, torch.Tensor):
+        return value if value.is_cuda else None
+    if isinstance(value, Mapping):
+        for child in value.values():
+            found = _first_cuda_tensor(child)
+            if found is not None:
+                return found
+    if isinstance(value, (tuple, list)):
+        for child in value:
+            found = _first_cuda_tensor(child)
+            if found is not None:
+                return found
+    return None
+
+
+def _clone_cuda_graph_output(value):
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, Mapping):
+        return {
+            key: _clone_cuda_graph_output(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_clone_cuda_graph_output(child) for child in value)
+    if isinstance(value, list):
+        return [_clone_cuda_graph_output(child) for child in value]
+    return value
+
+
+_CUDA_GRAPH_WARNED_LABELS: set[str] = set()
+
+
+def _warn_cuda_graph_fallback_once(label: str, exc: BaseException) -> None:
+    if label in _CUDA_GRAPH_WARNED_LABELS:
+        return
+    _CUDA_GRAPH_WARNED_LABELS.add(label)
+    print(
+        "[cuda-graphs] warning: "
+        f"{label} capture/replay failed once; using eager for that shape "
+        f"({type(exc).__name__}: {exc})",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+@dataclass
+class _CUDAGraphEntry:
+    graph: object
+    static_args: tuple
+    static_kwargs: dict
+    static_output: object
+    keepalive: tuple[object, ...] = field(default_factory=tuple)
+
+
+class CUDAGraphRegistry:
+    """Bounded LRU CUDA graph cache for fixed-shape tensor forwards.
+
+    Each entry owns graph activation memory plus static input/output tensors.
+    The default cap is intentionally small and can be overridden per path with
+    the registry's ``max_entries_env`` variable.
+    """
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        max_entries: int = 4,
+        max_entries_env: str | None = None,
+        warmup_iters: int = 2,
+    ):
+        self.label = str(label)
+        self.default_max_entries = max(int(max_entries), 0)
+        self.max_entries_env = max_entries_env
+        self.warmup_iters = max(int(warmup_iters), 0)
+        self.entries: OrderedDict[tuple, _CUDAGraphEntry] = OrderedDict()
+        self.disabled_keys: set[tuple] = set()
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.disabled_keys.clear()
+
+    def _max_entries(self) -> int:
+        if self.max_entries_env is None:
+            return self.default_max_entries
+        return _env_int(self.max_entries_env, self.default_max_entries)
+
+    def _evict_if_needed(self) -> None:
+        max_entries = self._max_entries()
+        if max_entries <= 0:
+            self.entries.clear()
+            return
+        while len(self.entries) > max_entries:
+            self.entries.popitem(last=False)
+
+    def run(
+        self,
+        label: str,
+        key: tuple,
+        fn: Callable,
+        *args,
+        enabled: bool = True,
+        device: torch.device | None = None,
+        keepalive: tuple[object, ...] = (),
+        **kwargs,
+    ):
+        cuda_tensor = _first_cuda_tensor((args, kwargs))
+        graph_device = device
+        if graph_device is None and cuda_tensor is not None:
+            graph_device = cuda_tensor.device
+        if (
+            not enabled
+            or not torch.cuda.is_available()
+            or graph_device is None
+            or torch.device(graph_device).type != "cuda"
+            or self._max_entries() <= 0
+        ):
+            return fn(*args, **kwargs)
+
+        full_key = (
+            self.label,
+            str(label),
+            tuple(key),
+            _tensor_tree_signature(args),
+            _tensor_tree_signature(kwargs),
+        )
+        entry = self.entries.get(full_key)
+        if entry is not None:
+            self.entries.move_to_end(full_key)
+            if not (
+                _copy_static_tree(tuple(args), entry.static_args)
+                and _copy_static_tree(dict(kwargs), entry.static_kwargs)
+            ):
+                return fn(*args, **kwargs)
+            try:
+                entry.graph.replay()
+                return _clone_cuda_graph_output(entry.static_output)
+            except Exception as exc:
+                self.entries.pop(full_key, None)
+                self.disabled_keys.add(full_key)
+                _warn_cuda_graph_fallback_once(str(label), exc)
+                return fn(*args, **kwargs)
+        if full_key in self.disabled_keys:
+            return fn(*args, **kwargs)
+
+        try:
+            entry = self._capture(
+                fn,
+                args,
+                kwargs,
+                torch.device(graph_device),
+                keepalive=keepalive,
+            )
+        except Exception as exc:
+            self.disabled_keys.add(full_key)
+            _warn_cuda_graph_fallback_once(str(label), exc)
+            return fn(*args, **kwargs)
+        self.entries[full_key] = entry
+        self._evict_if_needed()
+        return _clone_cuda_graph_output(entry.static_output)
+
+    def _capture(
+        self,
+        fn: Callable,
+        args: tuple,
+        kwargs: Mapping,
+        device: torch.device,
+        *,
+        keepalive: tuple[object, ...],
+    ) -> _CUDAGraphEntry:
+        static_args = tuple(_clone_static_tree(value) for value in args)
+        static_kwargs = {
+            key: _clone_static_tree(value)
+            for key, value in dict(kwargs).items()
+        }
+        current_stream = torch.cuda.current_stream(device)
+        side_stream = torch.cuda.Stream(device=device)
+        side_stream.wait_stream(current_stream)
+        with torch.cuda.stream(side_stream), torch.no_grad():
+            for _ in range(self.warmup_iters):
+                fn(*static_args, **static_kwargs)
+        current_stream.wait_stream(side_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph), torch.no_grad():
+            static_output = fn(*static_args, **static_kwargs)
+        return _CUDAGraphEntry(
+            graph=graph,
+            static_args=static_args,
+            static_kwargs=static_kwargs,
+            static_output=static_output,
+            keepalive=tuple(keepalive),
+        )
+
+
+_COORD_LANE_CUDA_GRAPH_REGISTRY = CUDAGraphRegistry(
+    label="coord-lane",
+    max_entries=4,
+    max_entries_env="PRISMAQUANT_COORD_LANE_CUDA_GRAPH_CACHE_SIZE",
+)
+
+
 @dataclass
 class _TailCudaGraphEntry:
     graph: object
@@ -1888,6 +2104,11 @@ def measure_lane_batched_kl_deltas(
         "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
         default=True,
     )
+    use_coord_lane_cuda_graphs = _env_flag_enabled(
+        "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+        default=True,
+    )
+    assignment_key = tuple(sorted(assignment_c.items()))
     rng_devices = []
     if device.type == "cuda" and torch.cuda.is_available():
         rng_devices = [
@@ -1975,12 +2196,42 @@ def measure_lane_batched_kl_deltas(
                         quant_weight_cache=group_quant_cache,
                     )
                     target_hooks.install()
-                    logits = _lane_replay_cache_logits(
-                        replay_cache,
-                        int(replay_layer_idx),
-                        lane_count=len(lanes),
-                        base_batch=base_batch,
-                        target_names=target_names,
+                    lane_key = tuple(
+                        (lane.name, lane.fmt, lane.baseline_index, lane.is_baseline)
+                        for lane in lanes
+                    )
+
+                    def _replay_forward():
+                        return _lane_replay_cache_logits(
+                            replay_cache,
+                            int(replay_layer_idx),
+                            lane_count=len(lanes),
+                            base_batch=base_batch,
+                            target_names=target_names,
+                        )
+
+                    logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
+                        "coord-lane-replay",
+                        (
+                            "replay",
+                            id(model),
+                            id(replay_cache),
+                            assignment_key,
+                            cal_hash,
+                            int(replay_layer_idx),
+                            int(len(lanes)),
+                            int(base_batch),
+                            lane_key,
+                            tuple(sorted(target_names)),
+                        ),
+                        _replay_forward,
+                        enabled=use_coord_lane_cuda_graphs,
+                        device=device,
+                        keepalive=(
+                            replay_cache,
+                            target_hooks,
+                            group_quant_cache,
+                        ),
                     )
                     logits = _extract_logits(logits)
                     if logits.dim() >= 3:
@@ -2067,7 +2318,37 @@ def measure_lane_batched_kl_deltas(
                         kwargs,
                         len(lanes),
                     )
-                    logits = _extract_logits(model(*rep_args, **rep_kwargs))
+                    lane_key = tuple(
+                        (lane.name, lane.fmt, lane.baseline_index, lane.is_baseline)
+                        for lane in lanes
+                    )
+
+                    def _full_forward(*call_args, **call_kwargs):
+                        return _extract_logits(model(*call_args, **call_kwargs))
+
+                    logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
+                        "coord-lane-full",
+                        (
+                            "full",
+                            id(model),
+                            assignment_key,
+                            cal_hash,
+                            int(len(lanes)),
+                            int(base_batch),
+                            lane_key,
+                            tuple(sorted(target_names)),
+                        ),
+                        _full_forward,
+                        *rep_args,
+                        enabled=use_coord_lane_cuda_graphs,
+                        device=device,
+                        keepalive=(
+                            context_hooks,
+                            target_hooks,
+                            group_quant_cache,
+                        ),
+                        **rep_kwargs,
+                    )
                     if logits.dim() >= 3:
                         logits = logits[:, -1:, :]
                     chunks = _split_lanes(logits.detach(), base_batch, len(lanes))

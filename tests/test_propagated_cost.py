@@ -8,6 +8,7 @@ import torch.nn as nn
 from prismaquant import format_registry as fr
 from prismaquant import propagated_cost as pc
 from prismaquant.allocator_solver import Candidate
+from prismaquant.build_rtn_cache import cache_reference_log_probs
 from prismaquant.perturbed_x_cache import PerturbedActivationCache
 from prismaquant.propagated_cost import (
     FrozenBudgetError,
@@ -885,6 +886,43 @@ def test_cuda_graphs_bit_exact_with_eager(tmp_path, monkeypatch):
     eager = _measure(False)
     graphed = _measure(True)
     _assert_l3_costs_close(graphed, eager)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_coord_lane_batched_with_cuda_graphs_matches_eager(tmp_path, monkeypatch):
+    zero = _zero_spec()
+    monkeypatch.setitem(fr.REGISTRY, zero.name, zero)
+    assignment = {"l1": "BF16", "l2": "BF16", "l3": "BF16"}
+    candidate_flips = [("l1", zero.name), ("l2", zero.name)]
+    calib = torch.tensor(
+        [[1.0, -1.0], [0.5, -0.25], [-0.75, 0.25]],
+        dtype=torch.float32,
+    )
+
+    def _measure(graphs_enabled: bool):
+        monkeypatch.setenv(
+            "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+            "1" if graphs_enabled else "0",
+        )
+        model = _AmplifyingToy().eval().cuda()
+        ref_log_probs = cache_reference_log_probs(
+            model,
+            calib,
+            next(model.parameters()).device,
+        )
+        return pc.measure_lane_batched_kl_deltas(
+            model,
+            assignment,
+            candidate_flips,
+            calib,
+            ref_log_probs,
+            work_root=tmp_path,
+            max_lanes_per_batch=2,
+        )
+
+    eager = _measure(False)
+    graphed = _measure(True)
+    assert graphed == pytest.approx(eager, abs=1e-9, rel=0.0)
 
 
 def test_lane_batch_memory_check_falls_back(monkeypatch):

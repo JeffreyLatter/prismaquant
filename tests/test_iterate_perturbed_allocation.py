@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from prismaquant import iterate_perturbed_allocation as ipa
+from prismaquant import propagated_cost as pc
 from prismaquant.iterate_perturbed_allocation import (
     assignment_hash,
     build_l3_polish_summary,
@@ -1648,6 +1649,83 @@ def test_measure_assignment_kl_deterministic_same_inputs(tmp_path):
     )
 
     assert first == second
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_measure_assignment_kl_with_cuda_graphs_matches_eager(tmp_path, monkeypatch):
+    scale50 = _scaled_weight_spec("KL_GRAPH_SCALE50", 0.5)
+    scale90 = _scaled_weight_spec("KL_GRAPH_SCALE90", 0.9)
+    monkeypatch.setitem(ipa.fr.REGISTRY, scale50.name, scale50)
+    monkeypatch.setitem(ipa.fr.REGISTRY, scale90.name, scale90)
+    calib_ids = torch.linspace(-1.0, 1.0, steps=3 * 2 * 33).reshape(3, 2, 33)
+    assignments = [
+        {"layer0": scale50.name, "layer1": "BF16"},
+        {"layer0": scale90.name, "layer1": "BF16"},
+    ]
+
+    def _measure(graphs_enabled: bool) -> list[float]:
+        monkeypatch.setenv(
+            "PRISMAQUANT_KL_CUDA_GRAPHS",
+            "1" if graphs_enabled else "0",
+        )
+        model = _WideStackLogitsModel(layers=2).eval().cuda()
+        ref_log_probs = ipa.cache_reference_log_probs(
+            model,
+            calib_ids,
+            next(model.parameters()).device,
+        )
+        return [
+            ipa.measure_assignment_kl(
+                model,
+                assignment,
+                calib_ids,
+                ref_log_probs,
+                work_root=tmp_path,
+            )
+            for assignment in assignments
+        ]
+
+    eager = _measure(False)
+    graphed = _measure(True)
+    assert graphed == pytest.approx(eager, abs=1e-9, rel=0.0)
+    assert abs(graphed[0] - graphed[1]) > 1e-8
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_graph_safety_fallback_on_capture_failure(tmp_path, monkeypatch):
+    scale75 = _scaled_weight_spec("KL_GRAPH_FALLBACK_SCALE75", 0.75)
+    monkeypatch.setitem(ipa.fr.REGISTRY, scale75.name, scale75)
+    assignment = {"layer0": scale75.name, "layer1": "BF16"}
+    calib_ids = torch.linspace(-1.0, 1.0, steps=2 * 2 * 33).reshape(2, 2, 33)
+    model = _WideStackLogitsModel(layers=2).eval().cuda()
+    ref_log_probs = ipa.cache_reference_log_probs(
+        model,
+        calib_ids,
+        next(model.parameters()).device,
+    )
+    monkeypatch.setenv("PRISMAQUANT_KL_CUDA_GRAPHS", "0")
+    eager = ipa.measure_assignment_kl(
+        model,
+        assignment,
+        calib_ids,
+        ref_log_probs,
+        work_root=tmp_path,
+    )
+
+    def _raise_capture(self, *args, **kwargs):
+        raise RuntimeError("forced graph capture failure")
+
+    monkeypatch.setattr(pc.CUDAGraphRegistry, "_capture", _raise_capture)
+    monkeypatch.setenv("PRISMAQUANT_KL_CUDA_GRAPHS", "1")
+    fallback = ipa.measure_assignment_kl(
+        model,
+        assignment,
+        calib_ids,
+        ref_log_probs,
+        work_root=tmp_path,
+    )
+
+    assert fallback == pytest.approx(eager, abs=1e-9, rel=0.0)
 
 
 def test_l3_iteration_terminates_on_cycle(tmp_path, monkeypatch):
