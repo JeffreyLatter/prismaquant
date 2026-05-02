@@ -262,6 +262,7 @@ class PerturbedActivationCache:
             tuple[str, str, str, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        self._materialized_frozen_weight_depth = 0
 
     @property
     def installed(self) -> bool:
@@ -346,6 +347,43 @@ class PerturbedActivationCache:
         finally:
             self._frozen_weight_cache = previous
 
+    @contextmanager
+    def materialized_frozen_weights(self) -> Iterator["PerturbedActivationCache"]:
+        """Apply the active frozen weights to modules for whole-forward reuse."""
+        if self._frozen_weight_cache is None:
+            raise RuntimeError("frozen weight cache is not active")
+        if self._materialized_frozen_weight_depth > 0:
+            self._materialized_frozen_weight_depth += 1
+            try:
+                yield self
+            finally:
+                self._materialized_frozen_weight_depth -= 1
+            return
+
+        originals: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+        seen_keys: set[tuple[int, str]] = set()
+        self._materialized_frozen_weight_depth = 1
+        try:
+            for plan in self.plans:
+                for param_plan in plan.params:
+                    cache_key = (id(plan.module), param_plan.attr)
+                    if cache_key in seen_keys:
+                        continue
+                    seen_keys.add(cache_key)
+                    param = getattr(plan.module, param_plan.attr)
+                    if not isinstance(param, torch.nn.Parameter) or param.is_meta:
+                        continue
+                    q = self._frozen_weight_cache.get(cache_key)
+                    if q is None:
+                        continue
+                    originals.append((param, param.data.detach().clone()))
+                    param.data.copy_(q.to(device=param.device, dtype=param.dtype))
+            yield self
+        finally:
+            for param, original in reversed(originals):
+                param.data.copy_(original.to(device=param.device, dtype=param.dtype))
+            self._materialized_frozen_weight_depth = 0
+
     def set_frozen_weight_format(self, name: str, fmt: str) -> None:
         if self._frozen_weight_cache is None:
             raise RuntimeError("frozen weight cache is not active")
@@ -410,6 +448,8 @@ class PerturbedActivationCache:
 
     def _apply_weight_quant(self, plan: _ModulePlan) -> None:
         plan.active_originals.clear()
+        if self._materialized_frozen_weight_depth > 0:
+            return
         seen_attrs: set[str] = set()
         for param_plan in plan.params:
             if param_plan.attr in seen_attrs:

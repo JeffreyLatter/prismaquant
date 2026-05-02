@@ -15,6 +15,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -1175,6 +1176,19 @@ def _warn_cuda_graph_fallback_once(label: str, exc: BaseException) -> None:
     )
 
 
+def _cuda_graph_debug_node_count(path: Path) -> int | None:
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return None
+    count = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "label=" in stripped and "->" not in stripped:
+            count += 1
+    return count if count > 0 else None
+
+
 @dataclass
 class _CUDAGraphEntry:
     graph: object
@@ -1199,11 +1213,13 @@ class CUDAGraphRegistry:
         max_entries: int = 4,
         max_entries_env: str | None = None,
         warmup_iters: int = 2,
+        verbose_env: str | None = None,
     ):
         self.label = str(label)
         self.default_max_entries = max(int(max_entries), 0)
         self.max_entries_env = max_entries_env
         self.warmup_iters = max(int(warmup_iters), 0)
+        self.verbose_env = verbose_env
         self.entries: OrderedDict[tuple, _CUDAGraphEntry] = OrderedDict()
         self.disabled_keys: set[tuple] = set()
 
@@ -1215,6 +1231,66 @@ class CUDAGraphRegistry:
         if self.max_entries_env is None:
             return self.default_max_entries
         return _env_int(self.max_entries_env, self.default_max_entries)
+
+    def _verbose_enabled(self) -> bool:
+        return (
+            self.verbose_env is not None
+            and _env_flag_enabled(self.verbose_env, default=False)
+        )
+
+    def _verbose_log(self, label: str, message: str) -> None:
+        if not self._verbose_enabled():
+            return
+        print(
+            f"[cuda-graphs][{self.label}:{label}] "
+            f"{time.time():.6f} {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _verbose_exception(
+        self,
+        label: str,
+        message: str,
+        exc: BaseException,
+    ) -> None:
+        if not self._verbose_enabled():
+            return
+        self._verbose_log(label, f"{message}: {type(exc).__name__}: {exc}")
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+
+    def _debug_graph_summary(
+        self,
+        graph,
+        label: str,
+    ) -> tuple[int | str, str | None]:
+        node_count: int | str = "unavailable"
+        dump_path: str | None = None
+        for attr in ("num_nodes", "_num_nodes"):
+            fn = getattr(graph, attr, None)
+            if callable(fn):
+                try:
+                    node_count = int(fn())
+                    break
+                except Exception:
+                    pass
+        debug_dump = getattr(graph, "debug_dump", None)
+        if callable(debug_dump):
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{self.label}_{label}")
+            path = (
+                Path(tempfile.gettempdir())
+                / f"prismaquant_cuda_graph_{safe}_{os.getpid()}.dot"
+            )
+            try:
+                debug_dump(str(path))
+                dump_path = str(path)
+                if node_count == "unavailable":
+                    parsed_count = _cuda_graph_debug_node_count(path)
+                    if parsed_count is not None:
+                        node_count = parsed_count
+            except Exception as exc:
+                self._verbose_exception(label, "debug dump failed", exc)
+        return node_count, dump_path
 
     def _evict_if_needed(self) -> None:
         max_entries = self._max_entries()
@@ -1269,6 +1345,7 @@ class CUDAGraphRegistry:
             except Exception as exc:
                 self.entries.pop(full_key, None)
                 self.disabled_keys.add(full_key)
+                self._verbose_exception(str(label), "replay failed", exc)
                 _warn_cuda_graph_fallback_once(str(label), exc)
                 return fn(*args, **kwargs)
         if full_key in self.disabled_keys:
@@ -1281,9 +1358,11 @@ class CUDAGraphRegistry:
                 kwargs,
                 torch.device(graph_device),
                 keepalive=keepalive,
+                capture_label=str(label),
             )
         except Exception as exc:
             self.disabled_keys.add(full_key)
+            self._verbose_exception(str(label), "capture failed", exc)
             _warn_cuda_graph_fallback_once(str(label), exc)
             return fn(*args, **kwargs)
         self.entries[full_key] = entry
@@ -1298,7 +1377,15 @@ class CUDAGraphRegistry:
         device: torch.device,
         *,
         keepalive: tuple[object, ...],
+        capture_label: str | None = None,
     ) -> _CUDAGraphEntry:
+        label = capture_label or self.label
+        capture_start_wall = time.time()
+        capture_start = time.perf_counter()
+        self._verbose_log(
+            label,
+            f"capture start device={device} warmup_iters={self.warmup_iters}",
+        )
         static_args = tuple(_clone_static_tree(value) for value in args)
         static_kwargs = {
             key: _clone_static_tree(value)
@@ -1311,10 +1398,61 @@ class CUDAGraphRegistry:
             for _ in range(self.warmup_iters):
                 fn(*static_args, **static_kwargs)
         current_stream.wait_stream(side_stream)
+        if self._verbose_enabled():
+            try:
+                torch.cuda.synchronize(device)
+            except Exception as exc:
+                self._verbose_exception(label, "warmup synchronize failed", exc)
+                raise
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph), torch.no_grad():
-            static_output = fn(*static_args, **static_kwargs)
+        try:
+            graph = torch.cuda.CUDAGraph(keep_graph=self._verbose_enabled())
+        except TypeError:
+            graph = torch.cuda.CUDAGraph()
+        if self._verbose_enabled():
+            enable_debug = getattr(graph, "enable_debug_mode", None)
+            if callable(enable_debug):
+                try:
+                    enable_debug()
+                except Exception as exc:
+                    self._verbose_exception(label, "enable debug mode failed", exc)
+        try:
+            with torch.cuda.graph(graph), torch.no_grad():
+                static_output = fn(*static_args, **static_kwargs)
+        except Exception as exc:
+            self._verbose_exception(label, "capture body/end failed", exc)
+            try:
+                torch.cuda.synchronize(device)
+            except Exception as sync_exc:
+                self._verbose_exception(
+                    label,
+                    "post-failure synchronize failed",
+                    sync_exc,
+                )
+            raise
+        try:
+            instantiate = getattr(graph, "instantiate", None)
+            if self._verbose_enabled() and callable(instantiate):
+                instantiate()
+            graph.replay()
+        except Exception as exc:
+            self._verbose_exception(label, "initial replay failed", exc)
+            raise
+        if self._verbose_enabled():
+            try:
+                torch.cuda.synchronize(device)
+            except Exception as exc:
+                self._verbose_exception(label, "post-capture synchronize failed", exc)
+                raise
+            node_count, dump_path = self._debug_graph_summary(graph, label)
+            elapsed = time.perf_counter() - capture_start
+            suffix = f" debug_dump={dump_path}" if dump_path is not None else ""
+            self._verbose_log(
+                label,
+                "capture end "
+                f"started_at={capture_start_wall:.6f} "
+                f"elapsed={elapsed:.6f}s graph_nodes={node_count}{suffix}",
+            )
         return _CUDAGraphEntry(
             graph=graph,
             static_args=static_args,

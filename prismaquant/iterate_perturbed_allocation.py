@@ -65,6 +65,7 @@ _KL_CUDA_GRAPH_REGISTRY = CUDAGraphRegistry(
     label="assignment-kl",
     max_entries=4,
     max_entries_env="PRISMAQUANT_KL_CUDA_GRAPH_CACHE_SIZE",
+    verbose_env="PRISMAQUANT_KL_CUDA_GRAPHS_VERBOSE",
 )
 
 
@@ -3018,33 +3019,43 @@ def measure_assignment_kl(
     )
     installed_here = not hooks.installed
     with cache_cm:
-        if installed_here:
-            hooks.install()
-        try:
-            with rng_cm:
-                if rng_seed is not None:
-                    torch.manual_seed(int(rng_seed))
-                    if device.type == "cuda" and torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(int(rng_seed))
-                for i in range(calib_ids.size(0)):
-                    batch = calib_ids[i:i + 1].to(device)
-                    def _forward(batch_ids):
-                        return model(batch_ids).logits[:, -1:, :]
-
-                    logits = _KL_CUDA_GRAPH_REGISTRY.run(
-                        "assignment-kl-forward",
-                        graph_key,
-                        _forward,
-                        batch,
-                        enabled=use_cuda_graphs,
-                        device=device,
-                        keepalive=(hooks,),
-                    )
-                    teacher = ref_log_probs[i][:, -1:, :]
-                    values.append(float(kl_divergence(logits, teacher).item()))
-        finally:
+        materialized_cm = nullcontext()
+        if (
+            use_cuda_graphs
+            and use_frozen_weight_cache
+            and device.type == "cuda"
+            and torch.cuda.is_available()
+            and hooks._frozen_weight_cache is not None
+        ):
+            materialized_cm = hooks.materialized_frozen_weights()
+        with materialized_cm:
             if installed_here:
-                hooks.remove()
+                hooks.install()
+            try:
+                with rng_cm:
+                    if rng_seed is not None:
+                        torch.manual_seed(int(rng_seed))
+                        if device.type == "cuda" and torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(int(rng_seed))
+                    for i in range(calib_ids.size(0)):
+                        batch = calib_ids[i:i + 1].to(device)
+                        def _forward(batch_ids):
+                            return model(batch_ids).logits[:, -1:, :]
+
+                        logits = _KL_CUDA_GRAPH_REGISTRY.run(
+                            "assignment-kl-forward",
+                            graph_key,
+                            _forward,
+                            batch,
+                            enabled=use_cuda_graphs,
+                            device=device,
+                            keepalive=(hooks,),
+                        )
+                        teacher = ref_log_probs[i][:, -1:, :]
+                        values.append(float(kl_divergence(logits, teacher).item()))
+            finally:
+                if installed_here:
+                    hooks.remove()
     return sum(values) / max(len(values), 1)
 
 

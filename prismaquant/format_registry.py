@@ -215,7 +215,7 @@ def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
         device=w2.device,
         dtype=torch.float32,
     )
-    cmax = float(cb.abs().max().item())
+    cmax = cb.abs().max()
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
     if mx_scale:

@@ -1652,7 +1652,9 @@ def test_measure_assignment_kl_deterministic_same_inputs(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_measure_assignment_kl_with_cuda_graphs_matches_eager(tmp_path, monkeypatch):
+def test_kl_cuda_graphs_replay_matches_eager(tmp_path, monkeypatch):
+    ipa._KL_CUDA_GRAPH_REGISTRY.clear()
+    pc._CUDA_GRAPH_WARNED_LABELS.clear()
     scale50 = _scaled_weight_spec("KL_GRAPH_SCALE50", 0.5)
     scale90 = _scaled_weight_spec("KL_GRAPH_SCALE90", 0.9)
     monkeypatch.setitem(ipa.fr.REGISTRY, scale50.name, scale50)
@@ -1686,9 +1688,18 @@ def test_measure_assignment_kl_with_cuda_graphs_matches_eager(tmp_path, monkeypa
         ]
 
     eager = _measure(False)
+    warnings = []
+    monkeypatch.setattr(
+        pc,
+        "_warn_cuda_graph_fallback_once",
+        lambda label, exc: warnings.append((label, exc)),
+    )
     graphed = _measure(True)
     assert graphed == pytest.approx(eager, abs=1e-9, rel=0.0)
     assert abs(graphed[0] - graphed[1]) > 1e-8
+    assert ipa._KL_CUDA_GRAPH_REGISTRY.entries
+    assert not ipa._KL_CUDA_GRAPH_REGISTRY.disabled_keys
+    assert not warnings
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1729,7 +1740,7 @@ def test_cuda_graph_safety_fallback_on_capture_failure(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_kl_cuda_graphs_no_pinned_memory_warning(tmp_path, monkeypatch):
+def test_kl_cuda_graphs_capture_succeeds(tmp_path, monkeypatch):
     ipa._KL_CUDA_GRAPH_REGISTRY.clear()
     pc._CUDA_GRAPH_WARNED_LABELS.clear()
     monkeypatch.setenv("PRISMAQUANT_KL_CUDA_GRAPHS", "1")
@@ -1764,12 +1775,9 @@ def test_kl_cuda_graphs_no_pinned_memory_warning(tmp_path, monkeypatch):
 
     assert value >= 0.0
     assert captures
+    assert ipa._KL_CUDA_GRAPH_REGISTRY.entries
     assert not ipa._KL_CUDA_GRAPH_REGISTRY.disabled_keys
-    assert not [
-        str(exc)
-        for _label, exc in warnings
-        if "pinned" in str(exc).lower()
-    ]
+    assert not warnings
 
 
 def test_l3_iteration_terminates_on_cycle(tmp_path, monkeypatch):
