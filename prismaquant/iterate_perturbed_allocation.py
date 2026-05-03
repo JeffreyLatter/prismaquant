@@ -5049,6 +5049,13 @@ def _budget_result_from_seed_row(
     assignment = _load_seed_assignment(row, source_json)
     if not assignment:
         return None
+    coherent_assignment = _enforce_fused_assignment_coherence(
+        assignment,
+        runtime.specs,
+        profile=getattr(runtime, "profile", None),
+    )
+    if assignment_hash(coherent_assignment) != assignment_hash(assignment):
+        return None
     assignment_path = _resolve_seed_artifact_path(
         row.get("assignment_path") or row.get("assignment"),
         source_json,

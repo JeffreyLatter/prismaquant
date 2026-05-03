@@ -3363,6 +3363,66 @@ def test_knee_checkpoint_frontier_can_seed_search(tmp_path):
     assert seeds[0].assignment == assignment
 
 
+def test_knee_seed_frontier_rejects_incoherent_fused_assignment(tmp_path):
+    stats = {
+        "model.layers.0.self_attn.q_proj": _tiny_stat(),
+        "model.layers.0.self_attn.k_proj": _tiny_stat(),
+        "model.layers.0.self_attn.v_proj": _tiny_stat(),
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    incoherent_assignment = {
+        "model.layers.0.self_attn.q_proj": "NVFP4",
+        "model.layers.0.self_attn.k_proj": "BF16",
+        "model.layers.0.self_attn.v_proj": "BF16",
+    }
+    coherent_assignment = {
+        "model.layers.0.self_attn.q_proj": "BF16",
+        "model.layers.0.self_attn.k_proj": "BF16",
+        "model.layers.0.self_attn.v_proj": "BF16",
+    }
+    incoherent_path = tmp_path / "incoherent_assignment.json"
+    coherent_path = tmp_path / "coherent_assignment.json"
+    incoherent_path.write_text(json.dumps(incoherent_assignment))
+    coherent_path.write_text(json.dumps(coherent_assignment))
+    seed_path = tmp_path / "validated_frontier.json"
+    seed_path.write_text(
+        json.dumps(
+            {
+                "validated_candidates": [
+                    {
+                        "target_bpp": 5.3,
+                        "achieved_bpp": 5.3,
+                        "validation_kl": 0.01,
+                        "assignment_path": str(incoherent_path),
+                    },
+                    {
+                        "target_bpp": 5.5,
+                        "achieved_bpp": 5.5,
+                        "validation_kl": 0.02,
+                        "assignment_path": str(coherent_path),
+                    },
+                ]
+            }
+        )
+    )
+
+    seeds, meta = ipa._load_knee_seed_results(
+        SimpleNamespace(knee_seed_frontier=[str(seed_path)]),
+        SimpleNamespace(
+            output_root=tmp_path / "fresh",
+            stats=stats,
+            specs=specs,
+            profile=_FakeQkvProfile(),
+        ),
+    )
+
+    assert meta["loaded"] == 1
+    assert meta["files"][0]["loaded"] == 1
+    assert meta["files"][0]["skipped_rows"] == 1
+    assert len(seeds) == 1
+    assert seeds[0].assignment == coherent_assignment
+
+
 def test_quality_equivalent_search_finds_lowest_matching_bpp(tmp_path, monkeypatch):
     anchor_calls = []
 
