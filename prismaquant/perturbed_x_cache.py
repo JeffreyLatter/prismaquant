@@ -183,8 +183,6 @@ def _build_module_plans(
     by_module: dict[int, _ModulePlan] = {}
     missing: list[str] = []
     for name, fmt in assignment.items():
-        if fr.canonical_format_name(fmt) == "BF16":
-            continue
         target = quant_map.get(name)
         if target is None:
             missing.append(name)

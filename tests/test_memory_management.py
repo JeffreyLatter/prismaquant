@@ -48,10 +48,11 @@ def test_frozen_weight_cache_lru_eviction(tmp_path, monkeypatch):
     with builder.frozen_weight_cache():
         pass
 
-    assert list(builder._frozen_weight_format_cache.keys()) == [
-        (f"layers.{idx}", "BF16")
-        for idx in range(5, 8)
+    logical_keys = [
+        (name, fmt)
+        for name, fmt, *_ in builder._frozen_weight_format_cache.keys()
     ]
+    assert logical_keys == [(f"layers.{idx}", "BF16") for idx in range(5, 8)]
     assert builder._frozen_weight_cache_evictions == 5
 
 

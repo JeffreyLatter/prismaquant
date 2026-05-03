@@ -52,12 +52,6 @@ from prismaquant.perturbed_x_cache import (
     load_text_model_under_work_root,
 )
 from prismaquant.layer_state_cache import LayerHiddenStateCache
-from prismaquant.discovery_rate import (
-    DiscoveryObservation,
-    decide_continue,
-    rank_buckets_by_upper_bound,
-    summarize_observations,
-)
 from prismaquant.interaction_refine import (
     RefinementUnit,
     UnitOption,
@@ -2155,10 +2149,6 @@ def _candidate_bucket(
     )
 
 
-def _scout_rate_bucket(candidate_bucket: str) -> str:
-    return str(candidate_bucket).split("|", 1)[0]
-
-
 def _search_telemetry_path(args) -> Path | None:
     raw = getattr(args, "_search_telemetry_path", None)
     if raw is None:
@@ -2298,100 +2288,6 @@ def _select_validation_scout_candidates(args, rows: list[dict]) -> list[dict]:
     return selected
 
 
-def _scout_remaining_by_rate_bucket(rows: list[dict]) -> dict[str, int]:
-    remaining: dict[str, int] = {}
-    for row in rows:
-        bucket = _scout_rate_bucket(str(row["bucket"]))
-        remaining[bucket] = remaining.get(bucket, 0) + 1
-    return remaining
-
-
-def _scout_stop_config(args) -> dict:
-    raw_price = getattr(
-        args,
-        "l3_validation_scout_marginal_price_kl_per_second",
-        None,
-    )
-    enabled = raw_price is not None
-    marginal_price = float(raw_price) if enabled else None
-    if enabled and (
-        marginal_price is None
-        or not math.isfinite(marginal_price)
-        or marginal_price < 0.0
-    ):
-        raise ValueError(
-            "l3_validation_scout_marginal_price_kl_per_second must be "
-            "a finite non-negative value"
-        )
-    confidence = float(getattr(args, "l3_validation_scout_stop_confidence", 0.95))
-    gain_prior = float(getattr(args, "l3_validation_scout_gain_prior_kl", 0.0))
-    min_rounds = max(
-        int(getattr(args, "l3_validation_scout_min_stop_rounds", 1)),
-        1,
-    )
-    return {
-        "enabled": enabled,
-        "marginal_price_kl_per_second": marginal_price,
-        "confidence": confidence,
-        "gain_prior_kl": gain_prior,
-        "min_rounds": min_rounds,
-    }
-
-
-def _scout_economic_stop_decision(
-    observations: list[DiscoveryObservation],
-    *,
-    remaining_rows: list[dict],
-    config: Mapping,
-) -> dict | None:
-    if not config.get("enabled") or not observations:
-        return None
-    observed_buckets = sorted({obs.bucket for obs in observations})
-    remaining_by_bucket = _scout_remaining_by_rate_bucket(remaining_rows)
-    summaries = summarize_observations(
-        observations,
-        buckets=observed_buckets,
-        remaining_by_bucket={
-            bucket: remaining_by_bucket.get(bucket, 0)
-            for bucket in observed_buckets
-        },
-        gain_prior_kl=float(config.get("gain_prior_kl", 0.0)),
-        confidence=float(config.get("confidence", 0.95)),
-    )
-    decision = decide_continue(
-        summaries,
-        marginal_price_kl_per_second=float(
-            config["marginal_price_kl_per_second"]
-        ),
-    )
-    ranked = rank_buckets_by_upper_bound(summaries)
-    return {
-        "continue_search": bool(decision.continue_search),
-        "best_bucket": decision.best_bucket,
-        "best_upper_gain_per_second": float(decision.best_upper_gain_per_second),
-        "marginal_price_kl_per_second": float(
-            decision.marginal_price_kl_per_second
-        ),
-        "bucket_summaries": [
-            {
-                "bucket": summary.bucket,
-                "observations": int(summary.observations),
-                "hits": int(summary.hits),
-                "hit_rate": float(summary.hit_rate),
-                "hit_rate_upper": float(summary.hit_rate_upper),
-                "mean_gain_per_hit_kl": float(summary.mean_gain_per_hit_kl),
-                "gain_upper_kl": float(summary.gain_upper_kl),
-                "remaining_count": summary.remaining_count,
-                "empirical_gain_per_second": float(
-                    summary.empirical_gain_per_second
-                ),
-                "upper_gain_per_second": float(summary.upper_gain_per_second),
-            }
-            for summary in ranked[:8]
-        ],
-    }
-
-
 def run_l3_validation_scout(
     args,
     model,
@@ -2422,18 +2318,6 @@ def run_l3_validation_scout(
     if not meta["enabled"]:
         return dict(current_assignment), float(current_kl), meta
 
-    stop_config = _scout_stop_config(args)
-    meta["economic_stop"] = {
-        "enabled": bool(stop_config["enabled"]),
-        "marginal_price_kl_per_second": stop_config[
-            "marginal_price_kl_per_second"
-        ],
-        "confidence": float(stop_config["confidence"]),
-        "gain_prior_kl": float(stop_config["gain_prior_kl"]),
-        "min_rounds": int(stop_config["min_rounds"]),
-        "checks": [],
-    }
-    observations: list[DiscoveryObservation] = []
     attempted_by_assignment: dict[str, set[tuple[str, str]]] = {}
     assignment = dict(current_assignment)
     kl = float(current_kl)
@@ -2588,14 +2472,6 @@ def run_l3_validation_scout(
                     },
                 )
                 attempted_for_assignment.add((row["name"], row["to_format"]))
-                observations.append(
-                    DiscoveryObservation(
-                        _scout_rate_bucket(str(row["bucket"])),
-                        hit=hit,
-                        gain_kl=gain,
-                        seconds=seconds_per_candidate,
-                    )
-                )
                 if round_best is None or trial_kl < round_best[0]:
                     round_best = (trial_kl, row)
             if emit is not None:
@@ -2621,49 +2497,6 @@ def run_l3_validation_scout(
             break
         if best_gain <= min_improvement + 1e-12:
             meta["stopped_reason"] = "no_validated_improvement"
-            if (
-                stop_config.get("enabled")
-                and round_idx >= int(stop_config["min_rounds"])
-                and round_idx < max_rounds
-            ):
-                remaining_rows = [
-                    row for row in all_candidate_rows
-                    if (row["name"], row["to_format"])
-                    not in attempted_for_assignment
-                ]
-                stop_check = _scout_economic_stop_decision(
-                    observations,
-                    remaining_rows=remaining_rows,
-                    config=stop_config,
-                )
-                if stop_check is not None:
-                    stop_check["round"] = round_idx
-                    stop_check["remaining_candidates"] = len(remaining_rows)
-                    meta["economic_stop"]["checks"].append(stop_check)
-                    _append_search_telemetry(
-                        args,
-                        {
-                            "event": "validation_scout_stop_check",
-                            "candidate_source": "l3_ranked_unary",
-                            "prefix": prefix,
-                            "round": round_idx,
-                            "target_bpp": float(target_bpp),
-                            "assignment_hash": assignment_digest,
-                            "remaining_candidates": len(remaining_rows),
-                            **stop_check,
-                        },
-                    )
-                    if stop_check["continue_search"]:
-                        meta["stopped_reason"] = "max_rounds"
-                        if emit is not None:
-                            emit(
-                                f"{prefix} validation scout: no commit in "
-                                f"round {round_idx}, continuing; "
-                                f"best_upper_gain_per_second="
-                                f"{stop_check['best_upper_gain_per_second']:.4e}"
-                            )
-                        continue
-                    meta["stopped_reason"] = "marginal_gain_below_price"
             break
         old_fmt = assignment.get(best_row["name"], "")
         assignment[best_row["name"]] = best_row["to_format"]
@@ -2697,53 +2530,6 @@ def run_l3_validation_scout(
                 f"kl {old_kl:.4e} -> {kl:.4e} "
                 f"(gain={best_gain:.4e})"
             )
-
-        if (
-            stop_config.get("enabled")
-            and round_idx >= int(stop_config["min_rounds"])
-            and round_idx < max_rounds
-        ):
-            next_rows = _l3_validation_scout_candidates(
-                args,
-                assignment,
-                l3_costs,
-                specs,
-                stats,
-                target_bpp,
-            )
-            stop_check = _scout_economic_stop_decision(
-                observations,
-                remaining_rows=next_rows,
-                config=stop_config,
-            )
-            if stop_check is not None:
-                stop_check["round"] = round_idx
-                stop_check["remaining_candidates"] = len(next_rows)
-                meta["economic_stop"]["checks"].append(stop_check)
-                _append_search_telemetry(
-                    args,
-                    {
-                        "event": "validation_scout_stop_check",
-                        "candidate_source": "l3_ranked_unary",
-                        "prefix": prefix,
-                        "round": round_idx,
-                        "target_bpp": float(target_bpp),
-                        "assignment_hash": _assignment_digest(assignment),
-                        "remaining_candidates": len(next_rows),
-                        **stop_check,
-                    },
-                )
-                if not stop_check["continue_search"]:
-                    meta["stopped_reason"] = "marginal_gain_below_price"
-                    if emit is not None:
-                        emit(
-                            f"{prefix} validation scout: economic stop "
-                            f"best_upper_gain_per_second="
-                            f"{stop_check['best_upper_gain_per_second']:.4e} "
-                            f"price="
-                            f"{stop_check['marginal_price_kl_per_second']:.4e}"
-                        )
-                    break
 
     meta["elapsed_seconds"] = time.monotonic() - overall_start
     if emit is not None:
@@ -4887,37 +4673,6 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         help="Minimum KL gain required for a validation-scout hit/commit.",
-    )
-    ap.add_argument(
-        "--l3-validation-scout-marginal-price-kl-per-second",
-        type=float,
-        default=None,
-        help=(
-            "Enable empirical discovery-rate stopping. After the minimum "
-            "stop rounds, continue only while the best bucket's one-sided "
-            "upper-bound gain/sec exceeds this price."
-        ),
-    )
-    ap.add_argument(
-        "--l3-validation-scout-min-stop-rounds",
-        type=int,
-        default=1,
-        help="Minimum validation-scout rounds before economic stopping can fire.",
-    )
-    ap.add_argument(
-        "--l3-validation-scout-stop-confidence",
-        type=float,
-        default=0.95,
-        help="One-sided confidence for validation-scout discovery-rate upper bounds.",
-    )
-    ap.add_argument(
-        "--l3-validation-scout-gain-prior-kl",
-        type=float,
-        default=0.0,
-        help=(
-            "Optional non-negative gain prior used by validation-scout "
-            "discovery-rate bounds for sparse/all-miss buckets."
-        ),
     )
     ap.add_argument(
         "--l3-validation-scout-commit-best",

@@ -911,10 +911,6 @@ def _iterated_l3_args(**overrides):
         l3_validation_scout_bpp_slack=0.25,
         l3_validation_scout_max_predicted_delta=0.0,
         l3_validation_scout_min_improvement=0.0,
-        l3_validation_scout_marginal_price_kl_per_second=None,
-        l3_validation_scout_min_stop_rounds=1,
-        l3_validation_scout_stop_confidence=0.95,
-        l3_validation_scout_gain_prior_kl=0.0,
         l3_validation_scout_commit_best=True,
         search_telemetry_jsonl=None,
         _search_telemetry_path=None,
@@ -1339,57 +1335,6 @@ def test_l3_validation_scout_samples_unrepresented_rank_buckets():
         "rank_512_plus",
     }
     assert [row["rank"] for row in selected[:3]] == [0, 1, 2]
-
-
-def test_l3_validation_scout_economic_stop_advances_after_no_hit(tmp_path, monkeypatch):
-    stats = {f"layer{i}": _tiny_stat() for i in range(3)}
-    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
-    assignment = {name: "NVFP4" for name in stats}
-    l3_costs = {
-        name: {
-            "NVFP4": {"propagated_end_kl": 1.0},
-            "BF16": {"propagated_end_kl": float(idx) * 0.1},
-        }
-        for idx, name in enumerate(stats)
-    }
-    measured = []
-
-    def _measure(_model, _assignment, flips, *_args, **_kwargs):
-        measured.extend(flips)
-        values = []
-        for name, fmt in flips:
-            assert fmt == "BF16"
-            values.append(0.5 if name == "layer1" else 1.1)
-        return values
-
-    monkeypatch.setattr(ipa, "measure_lane_batched_kl_deltas", _measure)
-
-    refined, final_kl, meta = ipa.run_l3_validation_scout(
-        _iterated_l3_args(
-            l3_validation_scout=True,
-            l3_validation_scout_max_candidates=1,
-            l3_validation_scout_rounds=2,
-            l3_validation_scout_marginal_price_kl_per_second=0.0,
-            l3_validation_scout_gain_prior_kl=0.1,
-        ),
-        _TinyLogitsModel(),
-        assignment,
-        1.0,
-        l3_costs,
-        specs,
-        16.0,
-        torch.zeros((1, 2), dtype=torch.long),
-        [],
-        stats=stats,
-        work_root=tmp_path,
-    )
-
-    assert measured == [("layer0", "BF16"), ("layer1", "BF16")]
-    assert refined["layer1"] == "BF16"
-    assert final_kl == pytest.approx(0.5)
-    assert meta["candidates_evaluated"] == 2
-    assert meta["flips_committed"] == 1
-    assert meta["economic_stop"]["checks"][0]["continue_search"] is True
 
 
 def test_coord_descent_non_regressive(tmp_path, monkeypatch):
