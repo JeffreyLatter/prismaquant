@@ -20,6 +20,51 @@ from prismaquant.iterate_perturbed_allocation import (
 from prismaquant.propagated_cost import L3NeighborhoodEntry
 
 
+class _FakeQkvProfile:
+    def fused_sibling_group(self, name: str) -> str | None:
+        if name.endswith((".q_proj", ".k_proj", ".v_proj")):
+            return name.rsplit(".", 1)[0] + ".qkv_proj"
+        return None
+
+
+def test_candidate_trial_changes_fused_siblings_atomically():
+    assignment = {
+        "model.layers.0.self_attn.q_proj": "BF16",
+        "model.layers.0.self_attn.k_proj": "BF16",
+        "model.layers.0.self_attn.v_proj": "BF16",
+        "model.layers.0.self_attn.o_proj": "BF16",
+    }
+
+    trial = ipa._candidate_trial_assignment(
+        assignment,
+        "model.layers.0.self_attn.q_proj",
+        "NVFP4",
+        profile=_FakeQkvProfile(),
+    )
+
+    assert trial["model.layers.0.self_attn.q_proj"] == "NVFP4"
+    assert trial["model.layers.0.self_attn.k_proj"] == "NVFP4"
+    assert trial["model.layers.0.self_attn.v_proj"] == "NVFP4"
+    assert trial["model.layers.0.self_attn.o_proj"] == "BF16"
+
+
+def test_fused_assignment_coherence_promotes_mixed_group():
+    assignment = {
+        "model.layers.0.self_attn.q_proj": "NVFP4",
+        "model.layers.0.self_attn.k_proj": "BF16",
+        "model.layers.0.self_attn.v_proj": "BF16",
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+
+    coherent = ipa._enforce_fused_assignment_coherence(
+        assignment,
+        specs,
+        profile=_FakeQkvProfile(),
+    )
+
+    assert set(coherent.values()) == {"BF16"}
+
+
 def test_coord_replay_cache_default_is_opt_in(monkeypatch):
     monkeypatch.delenv("PRISMAQUANT_COORD_REPLAY_CACHE", raising=False)
     assert ipa._coord_replay_cache_enabled() is False

@@ -33,7 +33,7 @@ from prismaquant.allocator_candidates import (
     build_candidates,
     expand_fused_sibling_assignment,
 )
-from prismaquant.allocator_solver import Candidate, solve_allocation
+from prismaquant.allocator_solver import Candidate, promote_fused, solve_allocation
 from prismaquant.build_rtn_cache import (
     cache_reference_log_probs,
     kl_divergence,
@@ -491,6 +491,47 @@ def write_layer_config(assignment: Mapping[str, str], output_path: str | Path) -
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
         json.dump(payload, f, indent=2)
+
+
+def _format_rank(specs: list[fr.FormatSpec]) -> dict[str, int]:
+    return {
+        spec.name: idx
+        for idx, spec in enumerate(sorted(specs, key=lambda s: s.effective_bits))
+    }
+
+
+def _fused_sibling_members(
+    assignment: Mapping[str, str],
+    name: str,
+    profile=None,
+) -> tuple[str, ...]:
+    if profile is None or name not in assignment:
+        return (name,)
+    try:
+        group_key = profile.fused_sibling_group(name)
+    except Exception:
+        group_key = None
+    if group_key is None:
+        return (name,)
+    members = []
+    for candidate in assignment:
+        try:
+            if profile.fused_sibling_group(candidate) == group_key:
+                members.append(candidate)
+        except Exception:
+            continue
+    members = sorted(set(members))
+    return tuple(members) if members else (name,)
+
+
+def _enforce_fused_assignment_coherence(
+    assignment: Mapping[str, str],
+    specs: list[fr.FormatSpec],
+    profile=None,
+) -> dict[str, str]:
+    if profile is None:
+        return dict(assignment)
+    return promote_fused(dict(assignment), _format_rank(specs), profile=profile)
 
 
 def _emit(message: str) -> None:
@@ -1398,6 +1439,7 @@ def _solve_l3_candidates_with_hamming_cap(
     bit_precision: float,
     max_flips: int,
     budget_tolerance: float = 0.0,
+    profile=None,
 ) -> tuple[dict[str, str], dict[str, Candidate], dict]:
     if not l3_candidates:
         return dict(assignment), {}, {
@@ -1476,6 +1518,20 @@ def _solve_l3_candidates_with_hamming_cap(
     open_assignment, chosen = result
     merged = dict(assignment)
     merged.update(open_assignment)
+    merged = _enforce_fused_assignment_coherence(merged, specs, profile=profile)
+    if not _within_assignment_budget(
+        stats,
+        merged,
+        specs,
+        target_bits,
+        budget_tolerance,
+    ):
+        meta["fused_coherence_budget_rejected"] = True
+        return dict(assignment), _choose_current_l3_candidates(
+            assignment,
+            l3_candidates,
+        ), meta
+    meta["fused_coherence_budget_rejected"] = False
     return merged, chosen, meta
 
 
@@ -2093,6 +2149,28 @@ def run_l3_interaction_refine(
     for unit in selected_units:
         fmt = refined["choices"].get(unit.key, unit.base_fmt)
         refined_assignment[unit.key] = fmt
+    pre_coherence_assignment = dict(refined_assignment)
+    refined_assignment = _enforce_fused_assignment_coherence(
+        refined_assignment,
+        specs,
+        profile=profile,
+    )
+    if (
+        assignment_hash(refined_assignment) != assignment_hash(pre_coherence_assignment)
+        and not _within_assignment_budget(
+            stats,
+            refined_assignment,
+            specs,
+            target_bpp,
+            max(float(getattr(args, "bit_precision", 0.001)), 0.0),
+        )
+    ):
+        meta["skipped_reason"] = "fused_coherence_budget_rejected"
+        emit(
+            f"{prefix} interaction refine: skipped because fused-sibling "
+            "coherence would exceed the target budget"
+        )
+        return dict(candidate_assignment), meta
     meta.update(
         {
             "objective_delta": float(refined["objective_delta"]),
@@ -2216,10 +2294,34 @@ def _candidate_trial_assignment(
     assignment: Mapping[str, str],
     name: str,
     candidate_fmt: str,
+    *,
+    profile=None,
 ) -> dict[str, str]:
     trial = dict(assignment)
-    trial[name] = fr.canonical_format_name(candidate_fmt)
+    fmt = fr.canonical_format_name(candidate_fmt)
+    for member in _fused_sibling_members(trial, name, profile):
+        trial[member] = fmt
     return trial
+
+
+def _candidate_override(
+    assignment: Mapping[str, str],
+    name: str,
+    candidate_fmt: str,
+    *,
+    profile=None,
+) -> dict[str, str]:
+    trial = _candidate_trial_assignment(
+        assignment,
+        name,
+        candidate_fmt,
+        profile=profile,
+    )
+    return {
+        key: fmt
+        for key, fmt in trial.items()
+        if fr.canonical_format_name(assignment.get(key, "")) != fmt
+    }
 
 
 def _assignment_bits_bpp(
@@ -2247,6 +2349,8 @@ def _l3_validation_scout_candidates(
     specs: list[fr.FormatSpec],
     stats: Mapping[str, Mapping],
     target_bpp: float,
+    *,
+    profile=None,
 ) -> list[dict]:
     ranked = _coord_descent_ranked_candidates(assignment, l3_costs, specs)
     max_predicted_delta = float(
@@ -2261,7 +2365,12 @@ def _l3_validation_scout_candidates(
             continue
         if float(predicted_delta) > max_predicted_delta:
             continue
-        trial = _candidate_trial_assignment(assignment, name, candidate_fmt)
+        trial = _candidate_trial_assignment(
+            assignment,
+            name,
+            candidate_fmt,
+            profile=profile,
+        )
         if not _within_assignment_budget(
             stats,
             trial,
@@ -2414,6 +2523,7 @@ def run_l3_validation_scout(
             specs,
             stats,
             target_bpp,
+            profile=profile,
         )
         candidate_rows = [
             row for row in all_candidate_rows
@@ -2471,16 +2581,43 @@ def run_l3_validation_scout(
             if not bool(getattr(args, "l3_validation_scout_cuda_graphs", False)):
                 os.environ[graph_env_name] = "0"
             try:
-                measured_kls = measure_lane_batched_kl_deltas(
-                    model,
-                    assignment,
-                    flips,
-                    calib_ids,
-                    ref_log_probs,
-                    work_root=work_root,
-                    max_lanes_per_batch=lanes_per_batch,
-                    profile=profile,
+                needs_group_serial = any(
+                    len(_candidate_override(
+                        assignment,
+                        row["name"],
+                        row["to_format"],
+                        profile=profile,
+                    )) > 1
+                    for row in chunk
                 )
+                if needs_group_serial:
+                    measured_kls = [
+                        measure_assignment_kl(
+                            model,
+                            _candidate_trial_assignment(
+                                assignment,
+                                row["name"],
+                                row["to_format"],
+                                profile=profile,
+                            ),
+                            calib_ids,
+                            ref_log_probs,
+                            work_root=work_root,
+                            profile=profile,
+                        )
+                        for row in chunk
+                    ]
+                else:
+                    measured_kls = measure_lane_batched_kl_deltas(
+                        model,
+                        assignment,
+                        flips,
+                        calib_ids,
+                        ref_log_probs,
+                        work_root=work_root,
+                        max_lanes_per_batch=lanes_per_batch,
+                        profile=profile,
+                    )
             finally:
                 if old_graph_env is None:
                     os.environ.pop(graph_env_name, None)
@@ -2503,6 +2640,7 @@ def run_l3_validation_scout(
                     assignment,
                     row["name"],
                     row["to_format"],
+                    profile=profile,
                 )
                 trial_bits, trial_bpp = _assignment_bits_bpp(stats, trial, specs)
                 _append_search_telemetry(
@@ -2565,7 +2703,12 @@ def run_l3_validation_scout(
             meta["stopped_reason"] = "no_validated_improvement"
             break
         old_fmt = assignment.get(best_row["name"], "")
-        assignment[best_row["name"]] = best_row["to_format"]
+        assignment = _candidate_trial_assignment(
+            assignment,
+            best_row["name"],
+            best_row["to_format"],
+            profile=profile,
+        )
         old_kl = kl
         kl = float(best_kl)
         bits_before, bpp_before = _assignment_bits_bpp(stats, assignment, specs)
@@ -2625,6 +2768,7 @@ def _coord_descent_lane_batch_count(
     max_lanes_per_batch: int,
     *,
     start_index: int = 0,
+    profile=None,
 ) -> int:
     lanes_per_batch = max(int(max_lanes_per_batch), 1)
     batch_count = 0
@@ -2633,8 +2777,12 @@ def _coord_descent_lane_batch_count(
     for _predicted_delta, name, candidate_fmt in ranked_candidates[start_index:]:
         if candidate_fmt == fr.canonical_format_name(assignment.get(name, "")):
             continue
-        trial = dict(assignment)
-        trial[name] = candidate_fmt
+        trial = _candidate_trial_assignment(
+            assignment,
+            name,
+            candidate_fmt,
+            profile=profile,
+        )
         if not _within_assignment_budget(
             stats,
             trial,
@@ -2850,6 +2998,7 @@ def coordinate_descent_polish(
                     cursor = 0
                     while cursor < len(ranked_candidates):
                         batch: list[tuple[str, str]] = []
+                        batch_trials: list[dict[str, str]] = []
                         next_positions: list[int] = []
                         scan = cursor
                         while (
@@ -2862,8 +3011,12 @@ def coordinate_descent_polish(
                                 assignment.get(name, "")
                             ):
                                 continue
-                            trial = dict(assignment)
-                            trial[name] = candidate_fmt
+                            trial = _candidate_trial_assignment(
+                                assignment,
+                                name,
+                                candidate_fmt,
+                                profile=profile,
+                            )
                             if not _within_assignment_budget(
                                 stats,
                                 trial,
@@ -2873,6 +3026,7 @@ def coordinate_descent_polish(
                             ):
                                 continue
                             batch.append((name, candidate_fmt))
+                            batch_trials.append(trial)
                             next_positions.append(scan)
 
                         if not batch:
@@ -2882,35 +3036,62 @@ def coordinate_descent_polish(
                         pass_batch_index += 1
                         display_batch_total = pass_batch_index
                         batch_start_kl = float(current_kl)
-                        batch_kls = measure_lane_batched_kl_deltas(
-                            model,
-                            assignment,
-                            batch,
-                            calib_ids,
-                            ref_log_probs,
-                            work_root=work_root,
-                            max_lanes_per_batch=max_lanes_per_batch,
-                            profile=profile,
-                            replay_cache=replay_cache,
+                        needs_group_serial = any(
+                            len(_candidate_override(
+                                assignment,
+                                name,
+                                candidate_fmt,
+                                profile=profile,
+                            )) > 1
+                            for name, candidate_fmt in batch
                         )
+                        if needs_group_serial:
+                            batch_kls = [
+                                measure_assignment_kl(
+                                    model,
+                                    trial,
+                                    calib_ids,
+                                    ref_log_probs,
+                                    work_root=work_root,
+                                    profile=profile,
+                                )
+                                for trial in batch_trials
+                            ]
+                        else:
+                            batch_kls = measure_lane_batched_kl_deltas(
+                                model,
+                                assignment,
+                                batch,
+                                calib_ids,
+                                ref_log_probs,
+                                work_root=work_root,
+                                max_lanes_per_batch=max_lanes_per_batch,
+                                profile=profile,
+                                replay_cache=replay_cache,
+                            )
                         batch_results = [
-                            (name, candidate_fmt, float(trial_kl))
-                            for (name, candidate_fmt), trial_kl in zip(batch, batch_kls)
+                            (name, candidate_fmt, trial, float(trial_kl))
+                            for (name, candidate_fmt), trial, trial_kl
+                            in zip(batch, batch_trials, batch_kls)
                         ]
                         best_batch_name, best_batch_fmt, best_batch_kl = min(
-                            batch_results,
+                            (
+                                (name, candidate_fmt, trial_kl)
+                                for name, candidate_fmt, _trial, trial_kl
+                                in batch_results
+                            ),
                             key=lambda item: item[2],
                         )
                         best_batch_delta = best_batch_kl - batch_start_kl
                         committed_in_batch = False
-                        for idx, (name, candidate_fmt, trial_kl) in enumerate(
+                        for idx, (name, candidate_fmt, trial, trial_kl) in enumerate(
                             batch_results
                         ):
                             measurements += 1
                             if trial_kl < current_kl - 1e-12:
                                 old_fmt = assignment.get(name, "")
                                 old_kl = float(current_kl)
-                                assignment[name] = candidate_fmt
+                                assignment = dict(trial)
                                 current_kl = trial_kl
                                 flips_committed += 1
                                 failed_streak = 0
@@ -2929,6 +3110,7 @@ def coordinate_descent_polish(
                                             bit_precision,
                                             max_lanes_per_batch,
                                             start_index=cursor,
+                                            profile=profile,
                                         )
                                     )
                                     emit(
@@ -2979,6 +3161,7 @@ def coordinate_descent_polish(
                                         bit_precision,
                                         max_lanes_per_batch,
                                         start_index=scan,
+                                        profile=profile,
                                     )
                                 )
                             emit(
@@ -3002,8 +3185,12 @@ def coordinate_descent_polish(
                     for _predicted_delta, name, candidate_fmt in ranked_candidates:
                         if candidate_fmt == fr.canonical_format_name(assignment.get(name, "")):
                             continue
-                        trial = dict(assignment)
-                        trial[name] = candidate_fmt
+                        trial = _candidate_trial_assignment(
+                            assignment,
+                            name,
+                            candidate_fmt,
+                            profile=profile,
+                        )
                         if not _within_assignment_budget(
                             stats,
                             trial,
@@ -3012,7 +3199,17 @@ def coordinate_descent_polish(
                             bit_precision,
                         ):
                             continue
-                        if hooks is not None and name in cached_names:
+                        override = _candidate_override(
+                            assignment,
+                            name,
+                            candidate_fmt,
+                            profile=profile,
+                        )
+                        if (
+                            hooks is not None
+                            and len(override) == 1
+                            and name in cached_names
+                        ):
                             with hooks.override({name: candidate_fmt}):
                                 trial_kl = measure_assignment_kl(
                                     model,
@@ -3034,9 +3231,13 @@ def coordinate_descent_polish(
                             )
                         measurements += 1
                         if float(trial_kl) < current_kl - 1e-12:
-                            assignment[name] = candidate_fmt
+                            assignment = dict(trial)
                             current_kl = float(trial_kl)
-                            if hooks is not None and name in cached_names:
+                            if (
+                                hooks is not None
+                                and len(override) == 1
+                                and name in cached_names
+                            ):
                                 hooks.set_frozen_weight_format(name, candidate_fmt)
                             flips_committed += 1
                             failed_streak = 0
@@ -3066,6 +3267,25 @@ def coordinate_descent_polish(
             if hooks is not None and hooks.installed:
                 hooks.remove()
 
+    coherent_assignment = _enforce_fused_assignment_coherence(
+        assignment,
+        specs,
+        profile=profile,
+    )
+    if assignment_hash(coherent_assignment) != assignment_hash(assignment):
+        assignment = coherent_assignment
+        current_kl = float(
+            measure_assignment_kl(
+                model,
+                assignment,
+                calib_ids,
+                ref_log_probs,
+                work_root=work_root,
+                profile=profile,
+            )
+        )
+    else:
+        assignment = coherent_assignment
     meta = {
         "passes_completed": passes_completed,
         "flips_committed": flips_committed,
@@ -3245,6 +3465,7 @@ def run_iterated_l3_polish(
                 bit_precision=getattr(args, "bit_precision", 0.001),
                 max_flips=hamming_cap,
                 budget_tolerance=getattr(args, "frozen_dp_budget_tolerance", 0.0),
+                profile=profile,
             )
         )
         additive_candidate_assignment = dict(candidate_assignment)
@@ -3447,6 +3668,26 @@ def run_iterated_l3_polish(
             f"{coord_meta['measurements']} halted={coord_meta.get('halted')} "
             f"KL={current_kl:.4e}"
         )
+
+    coherent_l3_assignment = _enforce_fused_assignment_coherence(
+        l3_assignment,
+        specs,
+        profile=profile,
+    )
+    if assignment_hash(coherent_l3_assignment) != assignment_hash(l3_assignment):
+        l3_assignment = coherent_l3_assignment
+        current_kl = float(
+            measure_assignment_kl(
+                model,
+                l3_assignment,
+                calib_ids,
+                ref_log_probs,
+                work_root=work_root,
+                profile=profile,
+            )
+        )
+        proposed_assignment = dict(l3_assignment)
+        proposed_kl = float(current_kl)
 
     final_changed = assignment_hash(l3_assignment) != assignment_hash(initial_assignment)
     allowed_final_regression = (
