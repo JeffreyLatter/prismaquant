@@ -4627,7 +4627,7 @@ def main():
                          "supplied, per-Linear input_global_scale is "
                          "computed from cached activations "
                          "(max_abs/6.0) instead of the 1.0 default. "
-                         "Typically ~1-3% PPL improvement on NVFP4.")
+                         "Typically ~1-3%% PPL improvement on NVFP4.")
     ap.add_argument("--perturbed-x-dir", default=None,
                     help="Directory produced by iterate_perturbed_allocation.py. "
                          "When supplied, defaults --layer-config to "
@@ -4664,7 +4664,7 @@ def main():
                     help="GPTQ one-shot OBS rounding with block-wise "
                          "error propagation (NVFP4 only; skipped on "
                          "MXFP8). Auto-on when --activation-cache-dir "
-                         "is supplied. Measured -2.7% PPL on Qwen3.6-35B.")
+                         "is supplied. Measured -2.7%% PPL on Qwen3.6-35B.")
     ap.add_argument("--act-weighted-round", dest="awq_round", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="Activation-weighted rounding polish on NVFP4 "
