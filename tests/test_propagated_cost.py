@@ -858,6 +858,74 @@ def test_measure_override_paired_kl_cached_tail_inputs_are_equivalent(tmp_path):
     assert cached_forward_calls < baseline_forward_calls
 
 
+def test_paired_tail_cuda_graph_key_tracks_override_state(tmp_path, monkeypatch):
+    assignment = {
+        "layers.0.a": "MXFP8",
+        "layers.0.b": "MXFP8",
+        "layers.1.a": "MXFP8",
+        "layers.1.b": "MXFP8",
+    }
+    overrides = [
+        {"layers.1.a": "NVFP4", "layers.1.b": "NVFP4"},
+        {"layers.1.a": "BF16", "layers.1.b": "NVFP4"},
+        {"layers.1.a": "NVFP4", "layers.1.b": "BF16"},
+    ]
+    calib = torch.tensor(
+        [[1.0, -1.0], [0.5, -0.25], [-0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    seen_state_keys = []
+
+    class _FakeTailGraphCache:
+        enabled = True
+
+        def run(
+            self,
+            model,
+            layer_idx,
+            layer_args,
+            layer_kwargs,
+            hidden_state,
+            *,
+            lane_count,
+            state_key=None,
+        ):
+            seen_state_keys.append(state_key)
+            return pc._tail_forward_eager(
+                model,
+                layer_idx,
+                layer_args,
+                layer_kwargs,
+                hidden_state,
+            )
+
+        def clear(self):
+            pass
+
+    monkeypatch.setenv("PRISMAQUANT_L3_CUDA_GRAPHS", "1")
+    monkeypatch.setattr(
+        pc,
+        "_TailCudaGraphCache",
+        lambda *, enabled: _FakeTailGraphCache(),
+    )
+
+    values = measure_override_paired_kl_deltas(
+        _TwoProjTailToy().eval(),
+        assignment,
+        overrides,
+        calib,
+        work_root=tmp_path,
+        max_lanes_per_batch=2,
+        tail_only=True,
+        cache_tail_layer_inputs=True,
+    )
+
+    assert len(values) == len(overrides)
+    assert len(seen_state_keys) >= len(overrides)
+    assert all(key is not None for key in seen_state_keys)
+    assert len(set(seen_state_keys)) == len(overrides)
+
+
 def test_prequant_cache_bit_exact_with_inline(tmp_path, monkeypatch):
     assignment = {"l1": "BF16", "l2": "BF16", "l3": "BF16"}
     neighborhood = [

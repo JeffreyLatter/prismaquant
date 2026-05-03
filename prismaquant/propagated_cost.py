@@ -21,7 +21,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -1789,6 +1789,7 @@ class _TailCudaGraphCache:
         hidden_state: torch.Tensor,
         *,
         lane_count: int,
+        state_key: object | None = None,
     ) -> torch.Tensor:
         if (
             not self.enabled
@@ -1806,6 +1807,7 @@ class _TailCudaGraphCache:
             id(model),
             int(layer_idx),
             int(lane_count),
+            state_key,
             _tensor_tree_signature(hidden_state),
             _tensor_tree_signature(layer_args),
             _tensor_tree_signature(layer_kwargs or {}),
@@ -1929,6 +1931,7 @@ def tail_forward_from_layer(
     *,
     cuda_graph_cache: _TailCudaGraphCache | None = None,
     lane_count: int | None = None,
+    graph_state_key: object | None = None,
 ) -> torch.Tensor:
     if cuda_graph_cache is not None:
         # Private-pool no-clone mode requires L3 to consume these logits before
@@ -1940,6 +1943,7 @@ def tail_forward_from_layer(
             layer_kwargs,
             hidden_state,
             lane_count=lane_count or 1,
+            state_key=graph_state_key,
         )
     return _tail_forward_eager(
         model,
@@ -1948,6 +1952,33 @@ def tail_forward_from_layer(
         layer_kwargs,
         hidden_state,
     )
+
+
+def _assignment_graph_key(assignment: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (str(name), fr.canonical_format_name(str(fmt)))
+            for name, fmt in assignment.items()
+        )
+    )
+
+
+def _lane_specs_graph_key(lanes: Sequence[_LaneSpec]) -> tuple[tuple, ...]:
+    return tuple(
+        (
+            str(lane.name),
+            fr.canonical_format_name(str(lane.fmt)),
+            None if lane.baseline_index is None else int(lane.baseline_index),
+            bool(lane.is_baseline),
+        )
+        for lane in lanes
+    )
+
+
+def _override_sets_graph_key(
+    overrides: Sequence[Mapping[str, str]],
+) -> tuple[tuple[tuple[str, str], ...], ...]:
+    return tuple(_assignment_graph_key(override) for override in overrides)
 
 
 def _split_lanes(tensor: torch.Tensor, base_batch: int, lane_count: int):
@@ -3223,6 +3254,10 @@ def measure_override_paired_kl_deltas(
             for name, fmt in assignment_c.items()
             if name not in target_names
         }
+        graph_state_key = (
+            _assignment_graph_key(context_assignment),
+            _override_sets_graph_key(execution_lane_overrides),
+        )
         cache_entries = [
             L3NeighborhoodEntry(
                 name=name,
@@ -3335,6 +3370,7 @@ def measure_override_paired_kl_deltas(
                             tail_graph_cache if tail_graph_safe else None
                         ),
                         lane_count=len(execution_lane_overrides),
+                        graph_state_key=graph_state_key,
                     )
                 else:
                     rep_args, rep_kwargs = _repeat_inputs_for_lanes(
@@ -3619,6 +3655,10 @@ def measure_propagated_costs(
                 if tail_graph_safe
                 else lanes
             )
+            graph_state_key = (
+                _assignment_graph_key(context_assignment),
+                _lane_specs_graph_key(execution_lanes),
+            )
             cache_dir = Path(tempfile.mkdtemp(
                 prefix="prismaquant_l3_context_",
                 dir=tmp_parent,
@@ -3714,6 +3754,7 @@ def measure_propagated_costs(
                                     tail_graph_cache if tail_graph_safe else None
                                 ),
                                 lane_count=len(execution_lanes),
+                                graph_state_key=graph_state_key,
                             )
                         else:
                             rep_args, rep_kwargs = _repeat_inputs_for_lanes(
