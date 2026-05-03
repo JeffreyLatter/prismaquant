@@ -84,6 +84,24 @@ def test_l3_host_memory_floor_raises_before_oom(monkeypatch):
         )
 
 
+def test_l3_host_memory_floor_reduces_pair_lanes(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_L3_MIN_HOST_MEM_GB", "24")
+    monkeypatch.setattr(pc, "_host_available_memory_gb", lambda: 46.0)
+
+    assert pc._adjust_l3_max_lanes_for_host_floor(
+        8,
+        phase="paired_override_kl",
+        chunk_index=3,
+    ) == 4
+
+    monkeypatch.setattr(pc, "_host_available_memory_gb", lambda: 68.0)
+    assert pc._adjust_l3_max_lanes_for_host_floor(
+        8,
+        phase="paired_override_kl",
+        chunk_index=4,
+    ) == 6
+
+
 def _stat(n_params=128 * 128):
     return {
         "n_params": n_params,

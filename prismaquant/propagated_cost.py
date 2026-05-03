@@ -176,6 +176,37 @@ def _enforce_l3_host_memory_floor(*, phase: str, chunk_index: int | None = None)
     )
 
 
+def _adjust_l3_max_lanes_for_host_floor(
+    max_lanes_per_batch: int,
+    *,
+    phase: str,
+    chunk_index: int | None = None,
+) -> int:
+    max_lanes = max(int(max_lanes_per_batch), 2)
+    if max_lanes % 2:
+        max_lanes -= 1
+    floor_gb = _env_float("PRISMAQUANT_L3_MIN_HOST_MEM_GB", 0.0)
+    if floor_gb <= 0.0:
+        return max(max_lanes, 2)
+
+    available_gb = _host_available_memory_gb()
+    if available_gb is None:
+        return max(max_lanes, 2)
+    margin_gb = available_gb - floor_gb
+    if margin_gb < 4.0:
+        _enforce_l3_host_memory_floor(
+            phase=phase,
+            chunk_index=chunk_index,
+        )
+    if margin_gb < 16.0:
+        max_lanes = min(max_lanes, 2)
+    elif margin_gb < 32.0:
+        max_lanes = min(max_lanes, 4)
+    elif margin_gb < 48.0:
+        max_lanes = min(max_lanes, 6)
+    return max(max_lanes, 2)
+
+
 _PRISMAQUANT_GRAPH_POOL = None
 _NOCLONE_OVERRIDE_WARNED = False
 
@@ -3023,15 +3054,27 @@ def measure_override_paired_kl_deltas(
 
     measured: list[float] = []
     chunk_count = int(math.ceil(len(overrides) / float(max_pairs_per_batch)))
-    for chunk_index, start in enumerate(
-        range(0, len(overrides), max_pairs_per_batch),
-        start=1,
-    ):
+    chunk_index = 0
+    start = 0
+    while start < len(overrides):
+        chunk_index += 1
         _enforce_l3_host_memory_floor(
             phase="paired_override_kl",
             chunk_index=chunk_index,
         )
-        chunk = overrides[start:start + max_pairs_per_batch]
+        chunk_lanes_per_batch = _adjust_l3_max_lanes_for_host_floor(
+            max_lanes_per_batch,
+            phase="paired_override_kl",
+            chunk_index=chunk_index,
+        )
+        chunk_pairs_per_batch = max(int(chunk_lanes_per_batch) // 2, 1)
+        remaining_count = len(overrides) - start
+        chunk_count = max(
+            chunk_count,
+            chunk_index - 1
+            + int(math.ceil(remaining_count / float(chunk_pairs_per_batch))),
+        )
+        chunk = overrides[start:start + chunk_pairs_per_batch]
         chunk_start = time.monotonic()
         if progress_callback is not None:
             progress_callback(
@@ -3204,6 +3247,7 @@ def measure_override_paired_kl_deltas(
                 phase="paired_override_kl_cleanup",
                 chunk_index=chunk_index,
             )
+        start += len(chunk)
 
     if len(measured) != len(candidate_overrides):
         raise RuntimeError(

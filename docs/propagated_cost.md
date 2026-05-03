@@ -185,9 +185,10 @@ GPU memory that is not reflected in container RSS. Set
 `PRISMAQUANT_L3_MIN_HOST_MEM_GB` to make L3 check `/proc/meminfo`
 `MemAvailable` between paired-override chunks and raise
 `GPUMemoryBudgetExceeded` before the host reaches OOM pressure. The
-memory-aware 4B-class cap currently uses up to 6 interaction lanes after
-empirical tests showed 4 lanes safe, 8 lanes unsafe, and 6 lanes viable on the
-GB10 diagnostic machine.
+paired-override loop also reduces the next chunk's lane count as it approaches
+that floor. The memory-aware 4B-class cap currently uses up to 6 interaction
+lanes after empirical tests showed 4 lanes safe, 8 lanes unsafe, and 6 lanes
+viable on the GB10 diagnostic machine.
 
 L3 is one final pass by design; per-iteration L3 is not exposed yet.
 
