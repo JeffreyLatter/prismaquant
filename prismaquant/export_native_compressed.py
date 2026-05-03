@@ -1275,6 +1275,61 @@ def quantize_dequantize_nvfp4_packed(
 # MXFP8 packing (E4M3 element format, E8M0 per-group scale).
 # ---------------------------------------------------------------------------
 MXFP8_E4M3_MAX = 448.0   # max representable in fp8_e4m3fn
+MXFP4_E2M1_MAX = NVFP4_MAX
+
+
+def _mxfp4_quantize_grouped(grouped: torch.Tensor
+                            ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute MXFP4 packed E2M1 values + E8M0 scale for grouped weights.
+
+    `grouped` must have the per-group axis in the final dimension
+    (size 32 for the OCP MXFP4 layout). The returned packed tensor has
+    two FP4 codes per byte along that final axis, and the scale tensor is
+    uint8 E8M0 with the final group axis removed.
+    """
+    group_size = grouped.shape[-1]
+    if group_size % 2 != 0:
+        raise ValueError("MXFP4 packing requires an even group size")
+    s_g_real = grouped.abs().amax(dim=-1).clamp_min(2.0 ** -127) / MXFP4_E2M1_MAX
+    # Use ceil so the scaled values never exceed the representable E2M1
+    # range. This mirrors the MXFP8 export path and avoids saturation at
+    # group maxima after the scale is quantized to E8M0.
+    e8m0 = torch.ceil(torch.log2(s_g_real)).clamp(-127, 127)
+    s_g = torch.pow(2.0, e8m0)
+    quant_grid = (grouped / s_g.unsqueeze(-1).clamp_min(2.0 ** -127)).clamp(
+        -MXFP4_E2M1_MAX, MXFP4_E2M1_MAX,
+    )
+    fp4_idx = _round_to_codebook(quant_grid)
+    packed = pack_fp4_indices(fp4_idx, group_size)
+    e8m0_uint8 = (e8m0 + 127).to(torch.int32).clamp(0, 255).to(torch.uint8)
+    return packed, e8m0_uint8
+
+
+def quantize_dequantize_mxfp4(weight: torch.Tensor, group_size: int = 32
+                              ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply MXFP4 RTN with E8M0 per-group scale to a 2D weight.
+
+    On-disk schema (compressed-tensors `mxfp4-pack-quantized` format):
+      - weight_packed: uint8, shape (rows, cols // 2)
+      - weight_scale:  uint8 E8M0, shape (rows, cols // group_size)
+    """
+    rows, cols = weight.shape
+    if cols % group_size != 0:
+        raise ValueError(f"MXFP4 group_size={group_size} ∤ {cols}")
+    grouped = weight.float().reshape(rows, cols // group_size, group_size)
+    packed, e8m0_uint8 = _mxfp4_quantize_grouped(grouped)
+    return packed.reshape(rows, cols // 2), e8m0_uint8
+
+
+def quantize_dequantize_mxfp4_packed(packed: torch.Tensor, group_size: int = 32
+                                     ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply MXFP4 RTN to a 3D packed-experts tensor `[E, M, N]`."""
+    E, M, N = packed.shape
+    if N % group_size != 0:
+        raise ValueError(f"MXFP4 group_size={group_size} ∤ {N}")
+    grouped = packed.float().reshape(E, M, N // group_size, group_size)
+    qpacked, e8m0_uint8 = _mxfp4_quantize_grouped(grouped)
+    return qpacked.reshape(E, M, N // 2), e8m0_uint8
 
 
 def _mxfp8_quantize_grouped(grouped: torch.Tensor
@@ -1373,7 +1428,7 @@ def quantize_dequantize_fp8_dynamic_packed(packed: torch.Tensor
 # accepts the allocator's exact AutoRound-shaped output.
 # ---------------------------------------------------------------------------
 def canonicalize_format(scheme_dict: dict | str | int) -> str:
-    """Map a layer_config entry to one of {NVFP4, MXFP8, BF16}.
+    """Map a layer_config entry to one of {NVFP4, MXFP4, MXFP8, BF16}.
 
     Accepts the dicts emitted by allocator.py via FormatSpec.autoround_config()
     (data_type=nv_fp/mx_fp/float, bits=4/8/16) plus a few tolerant
@@ -1385,7 +1440,7 @@ def canonicalize_format(scheme_dict: dict | str | int) -> str:
         if dt == "nv_fp" and bits == 4:
             return "NVFP4"
         if dt == "mx_fp" and bits == 4:
-            return "NVFP4"  # 4-bit floor — only NVFP4 has vLLM serving today
+            return "MXFP4"
         if dt == "mx_fp" and bits == 8:
             return "MXFP8"
         if dt in ("float", "bfloat16") and bits in (16, 0):
@@ -1412,7 +1467,9 @@ def canonicalize_format(scheme_dict: dict | str | int) -> str:
         s = scheme_dict.lower()
         if s in ("nvfp4", "fp4", "4"):
             return "NVFP4"
-        if s in ("mxfp8", "fp8", "8"):
+        if s in ("mxfp4", "mx_fp4"):
+            return "MXFP4"
+        if s in ("mxfp8", "mxfp8_e4m3", "fp8", "8"):
             return "MXFP8"
         if s in ("bf16", "bfloat16", "16"):
             return "BF16"
@@ -2065,6 +2122,10 @@ def _quantize_2d(
         w_work = weight.to(torch.float32)
         w, ws = quantize_dequantize_mxfp8(w_work, group_size=32)
         return {"weight": w, "weight_scale": ws}
+    if fmt == "MXFP4":
+        w_work = weight.to(torch.float32)
+        wp, ws = quantize_dequantize_mxfp4(w_work, group_size=32)
+        return {"weight_packed": wp, "weight_scale": ws}
     if fmt == "BF16":
         return {"weight": weight.to(torch.bfloat16)}
     raise ValueError(f"unsupported format: {fmt}")
@@ -2092,6 +2153,9 @@ def _quantize_3d_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tenso
     if fmt == "MXFP8":
         w, ws = quantize_dequantize_mxfp8_packed(packed, group_size=32)
         return {"weight": w, "weight_scale": ws}
+    if fmt == "MXFP4":
+        wp, ws = quantize_dequantize_mxfp4_packed(packed, group_size=32)
+        return {"weight_packed": wp, "weight_scale": ws}
     raise ValueError(f"unsupported format for packed-MoE: {fmt}")
 
 
@@ -3896,6 +3960,17 @@ MXFP8_SCHEME = {
         "zp_dtype": "torch.uint8",
     },
 }
+MXFP4_SCHEME = {
+    "format": "mxfp4-pack-quantized",
+    "weights": {
+        "num_bits": 4, "type": "float", "strategy": "group",
+        "group_size": 32,
+        "symmetric": True, "dynamic": False,
+        "scale_dtype": "torch.uint8",
+        "zp_dtype": "torch.uint8",
+        "observer": "memoryless_minmax",
+    },
+}
 # Source-FP8 passthrough. Emitted for Linears whose source checkpoint
 # already stores `.weight` as fp8_e4m3fn + `.weight_scale_inv` fp32 at
 # 128×128 block granularity (MiniMax-M2/M2.7, DeepSeek V3, several
@@ -4040,6 +4115,7 @@ def _bf16_packed_expert_ignore_regex(
 
 FORMAT_SCHEME = {
     "NVFP4": NVFP4_SCHEME,
+    "MXFP4": MXFP4_SCHEME,
     "MXFP8": MXFP8_SCHEME,
     "FP8_SOURCE": FP8_SOURCE_SCHEME,
 }

@@ -162,9 +162,12 @@ def _allowed_format(target_profile: str, name: str, fmt: str) -> bool:
             # Packed Qwen3.5/3.6 experts are emitted by
             # export_native_compressed as compressed-tensors MoE units.
             # Keep this allow-list aligned with FORMAT_SCHEME plus BF16
-            # passthrough; MXFP4/FP8_E* are measurable research formats
-            # but not currently exportable in the packed-MoE path.
-            return fmt in {"NVFP4", "MXFP8", "MXFP8_E4M3", "BF16"}
+            # passthrough. MXFP4 is exportable only for MoE experts in
+            # local vLLM; dense MXFP4 is weight-only and not part of the
+            # Qwen3.6 MoE shipping profile.
+            return fmt in {"NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"}
+        if fmt == "MXFP4":
+            return False
         return True
     raise ValueError(f"Unknown target profile: {target_profile}")
 

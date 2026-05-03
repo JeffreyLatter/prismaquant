@@ -33,6 +33,8 @@ from prismaquant.export_native_compressed import (
     pack_fp4_indices,
     quantize_dequantize_fp8_dynamic,
     quantize_dequantize_fp8_dynamic_packed,
+    quantize_dequantize_mxfp4,
+    quantize_dequantize_mxfp4_packed,
     quantize_dequantize_mxfp8,
     quantize_dequantize_mxfp8_packed,
     quantize_dequantize_nvfp4,
@@ -348,8 +350,7 @@ class TestRecipeParsing(unittest.TestCase):
         self.assertEqual(canonicalize_format(nv), "NVFP4")
         self.assertEqual(canonicalize_format(mx8), "MXFP8")
         self.assertEqual(canonicalize_format(bf), "BF16")
-        # mx_fp/4 collapses to NVFP4 (only 4-bit format vLLM-served).
-        self.assertEqual(canonicalize_format({"bits": 4, "data_type": "mx_fp"}), "NVFP4")
+        self.assertEqual(canonicalize_format({"bits": 4, "data_type": "mx_fp"}), "MXFP4")
 
 
 class TestVLLMInternalNaming(unittest.TestCase):
@@ -580,6 +581,23 @@ class TestQuantize2DDispatch(unittest.TestCase):
         self.assertEqual(out["weight"].dtype, torch.float8_e4m3fn)
         self.assertEqual(out["weight_scale"].dtype, torch.uint8)
         self.assertEqual(tuple(out["weight_scale"].shape), (8, 1))
+
+    def test_mxfp4_emits_packed_grouped_dense(self):
+        W = torch.randn(8, 32) * 0.1
+        out = _quantize_2d(W, "MXFP4")
+        self.assertIn("weight_packed", out)
+        self.assertEqual(out["weight_packed"].dtype, torch.uint8)
+        self.assertEqual(tuple(out["weight_packed"].shape), (8, 16))
+        self.assertEqual(out["weight_scale"].dtype, torch.uint8)
+        self.assertEqual(tuple(out["weight_scale"].shape), (8, 1))
+
+    def test_mxfp4_packed_expert_shapes(self):
+        W = torch.randn(2, 6, 32) * 0.1
+        wp, ws = quantize_dequantize_mxfp4_packed(W)
+        self.assertEqual(wp.dtype, torch.uint8)
+        self.assertEqual(tuple(wp.shape), (2, 6, 16))
+        self.assertEqual(ws.dtype, torch.uint8)
+        self.assertEqual(tuple(ws.shape), (2, 6, 1))
 
 
 class TestFusedSiblingJointGlobalScale(unittest.TestCase):

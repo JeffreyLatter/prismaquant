@@ -292,12 +292,9 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
 
         self.assertEqual(
             [c.fmt for c in filtered[name]],
-            ["NVFP4", "MXFP8", "MXFP8_E4M3", "BF16"],
+            ["NVFP4", "MXFP8", "MXFP8_E4M3", "MXFP4", "BF16"],
         )
-        self.assertEqual(
-            [c.fmt for c in filtered["model.layers.0.self_attn.q_proj"]],
-            ["MXFP4"],
-        )
+        self.assertNotIn("model.layers.0.self_attn.q_proj", filtered)
 
     def test_select_targets_returns_baseline_knee_high(self):
         curve = [
