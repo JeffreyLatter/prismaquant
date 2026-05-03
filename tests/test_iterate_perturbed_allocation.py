@@ -411,6 +411,7 @@ def test_solve_target_from_anchor_rejects_to_l2_at_target(tmp_path, monkeypatch)
 
     assert result.accepted is False
     assert result.assignment == {"layer": "INT8_W8A16"}
+    assert result.validation_kl == pytest.approx(2.0)
     assert result.achieved_bpp == pytest.approx(12.0)
     assert result.anchor_bpp == pytest.approx(16.0)
     assert result.target_bpp == pytest.approx(12.0)

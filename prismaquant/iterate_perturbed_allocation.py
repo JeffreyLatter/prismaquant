@@ -3904,6 +3904,7 @@ def solve_target_from_anchor(
     accepted = bool(polish.accepted)
     if accepted:
         final_assignment = dict(polish.assignment)
+        validation_kl = float(polish.final_kl)
     else:
         final_assignment = solve_from_costs(
             runtime.stats,
@@ -3913,10 +3914,23 @@ def solve_target_from_anchor(
             bit_precision=args.bit_precision,
             profile=runtime.profile,
         )
-    validation_kl = (
-        float(polish.final_kl)
-        if accepted else float(polish.proposed_kl)
-    )
+        if dict(final_assignment) == dict(polish.assignment):
+            validation_kl = float(polish.proposed_kl)
+        else:
+            _emit(
+                f"[multi][l3] target {target_label}: validating fallback "
+                "target assignment"
+            )
+            validation_kl = float(
+                measure_assignment_kl(
+                    runtime.model,
+                    final_assignment,
+                    runtime.calib_ids,
+                    runtime.ref_log_probs,
+                    work_root=runtime.work_root,
+                    profile=runtime.profile,
+                )
+            )
     predicted = _predicted_dloss_for_assignment(
         final_assignment,
         anchor.latest_smoothed_costs,
