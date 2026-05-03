@@ -2260,6 +2260,244 @@ def test_multi_budget_clusters_by_tolerance():
     assert [cluster["targets"] for cluster in clusters] == [[t] for t in targets]
 
 
+def test_surrogate_grid_points_fixed_step():
+    args = SimpleNamespace(
+        knee_bpp_min=4.5,
+        knee_bpp_max=5.0,
+        knee_surrogate_bpp_step=0.25,
+        knee_surrogate_points=99,
+    )
+
+    assert ipa._surrogate_grid_points(args) == [4.5, 4.75, 5.0]
+
+
+def test_surrogate_knee_search_writes_knee_without_model(tmp_path):
+    stats = {
+        f"layer{i}": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for i in range(4)
+    }
+    current_costs = {
+        name: {
+            "NVFP4": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+        for name in stats
+    }
+    l3_costs = {
+        "layer0": {
+            "NVFP4": {"propagated_end_kl": 0.8},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer1": {
+            "NVFP4": {"propagated_end_kl": 0.5},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer2": {
+            "NVFP4": {"propagated_end_kl": 0.2},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer3": {
+            "NVFP4": {"propagated_end_kl": 0.1},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+    }
+    resume_path = tmp_path / "l3_propagated_costs.pkl"
+    with open(resume_path, "wb") as f:
+        pickle.dump(
+            {
+                "costs": l3_costs,
+                "formats": ["NVFP4", "BF16"],
+                "meta": {"anchor_bpp": 5.5},
+            },
+            f,
+        )
+    initial_config = tmp_path / "initial_assignment.json"
+    initial_config.write_text(
+        json.dumps({name: "NVFP4" for name in stats})
+    )
+    args = SimpleNamespace(
+        target_bits_anchor=5.5,
+        knee_bpp_min=4.5,
+        knee_bpp_max=16.0,
+        knee_surrogate_bpp_step=2.5,
+        knee_surrogate_points=9,
+        knee_surrogate_neighbors=1,
+        _resume_l3_costs_single=resume_path,
+        _resume_l3_costs_by_anchor={},
+        resume_l3_costs_dir=None,
+        initial_config=str(initial_config),
+        bit_precision=0.25,
+        frozen_dp_budget_tolerance=0.0,
+    )
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+
+    assert ipa.run_surrogate_knee_search(
+        args,
+        stats=stats,
+        current_costs=current_costs,
+        specs=specs,
+        output_root=tmp_path / "out",
+    ) == 0
+
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert summary["pareto"]["mode"] == "surrogate_knee_search"
+    assert Path(summary["knee"]["layer_config"]).exists()
+    assert Path(summary["knee"]["assignment"]).exists()
+
+
+def test_validated_surrogate_knee_uses_real_kl(tmp_path, monkeypatch):
+    stats = {
+        f"layer{i}": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for i in range(3)
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    assignments = [
+        {"layer0": "NVFP4", "layer1": "NVFP4", "layer2": "NVFP4"},
+        {"layer0": "BF16", "layer1": "NVFP4", "layer2": "NVFP4"},
+        {"layer0": "BF16", "layer1": "BF16", "layer2": "NVFP4"},
+    ]
+    frontier = []
+    for idx, assignment in enumerate(assignments):
+        assignment_path = tmp_path / f"a{idx}.json"
+        layer_config_path = tmp_path / f"c{idx}.json"
+        assignment_path.write_text(json.dumps(assignment))
+        ipa.write_layer_config(assignment, layer_config_path)
+        histogram = ipa._format_histogram(stats, assignment, specs, 0.0)
+        frontier.append({
+            "target_bpp": float(idx),
+            "achieved_bpp": histogram["achieved_bpp"],
+            "surrogate_loss": float(idx),
+            "assignment_path": str(assignment_path),
+            "layer_config_path": str(layer_config_path),
+            "format_histogram": histogram,
+        })
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "surrogate_frontier.json").write_text(json.dumps({
+        "knee": {"assignment": frontier[1]["assignment_path"]},
+        "frontier": frontier,
+    }))
+    kl_by_hash = {
+        ipa._assignment_digest(assignments[0]): 0.05,
+        ipa._assignment_digest(assignments[1]): 0.01,
+        ipa._assignment_digest(assignments[2]): 0.02,
+    }
+
+    def _fake_kl(_model, assignment, *_args, **_kwargs):
+        return kl_by_hash[ipa._assignment_digest(assignment)]
+
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _fake_kl)
+    runtime = SimpleNamespace(
+        output_root=out,
+        work_root=tmp_path / "work",
+        stats=stats,
+        specs=specs,
+        model=object(),
+        calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        ref_log_probs=[],
+        profile=None,
+    )
+    args = SimpleNamespace(
+        knee_include_assignment=[],
+        knee_surrogate_validation_candidates=9,
+        n_calib_samples=1,
+        calib_seqlen=2,
+    )
+
+    assert ipa.run_validated_surrogate_knee_search(args, runtime) == 0
+    summary = json.loads((out / "validated_summary.json").read_text())
+    assert summary["knee"]["validation_kl"] == pytest.approx(0.01)
+    assert Path(summary["knee"]["layer_config"]).exists()
+
+
+def test_validated_surrogate_knee_caps_generated_candidates_but_keeps_includes(
+    tmp_path, monkeypatch
+):
+    stats = {
+        f"layer{i}": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for i in range(3)
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    frontier_assignments = [
+        {"layer0": "NVFP4", "layer1": "NVFP4", "layer2": "NVFP4"},
+        {"layer0": "BF16", "layer1": "NVFP4", "layer2": "NVFP4"},
+        {"layer0": "BF16", "layer1": "BF16", "layer2": "NVFP4"},
+        {"layer0": "BF16", "layer1": "BF16", "layer2": "BF16"},
+    ]
+    frontier = []
+    for idx, assignment in enumerate(frontier_assignments):
+        assignment_path = tmp_path / f"frontier_{idx}.json"
+        layer_config_path = tmp_path / f"frontier_{idx}_config.json"
+        assignment_path.write_text(json.dumps(assignment))
+        ipa.write_layer_config(assignment, layer_config_path)
+        frontier.append({
+            "target_bpp": float(idx),
+            "achieved_bpp": ipa._format_histogram(
+                stats, assignment, specs, 0.0
+            )["achieved_bpp"],
+            "surrogate_loss": float(idx),
+            "assignment_path": str(assignment_path),
+            "layer_config_path": str(layer_config_path),
+            "format_histogram": ipa._format_histogram(stats, assignment, specs, 0.0),
+        })
+    included_assignment = {
+        "layer0": "NVFP4",
+        "layer1": "BF16",
+        "layer2": "NVFP4",
+    }
+    included_path = tmp_path / "included.json"
+    included_path.write_text(json.dumps(included_assignment))
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "surrogate_frontier.json").write_text(json.dumps({
+        "knee": {"assignment": frontier[1]["assignment_path"]},
+        "frontier": frontier,
+    }))
+    calls = []
+
+    def _fake_kl(_model, assignment, *_args, **_kwargs):
+        calls.append(ipa._assignment_digest(assignment))
+        return float(len(calls)) / 100.0
+
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _fake_kl)
+    runtime = SimpleNamespace(
+        output_root=out,
+        work_root=tmp_path / "work",
+        stats=stats,
+        specs=specs,
+        model=object(),
+        calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        ref_log_probs=[],
+        profile=None,
+    )
+    args = SimpleNamespace(
+        knee_include_assignment=[str(included_path)],
+        knee_surrogate_validation_candidates=2,
+        n_calib_samples=1,
+        calib_seqlen=2,
+    )
+
+    assert ipa.run_validated_surrogate_knee_search(args, runtime) == 0
+    assert len(calls) == 3
+    assert ipa._assignment_digest(frontier_assignments[2]) not in calls
+    assert ipa._assignment_digest(included_assignment) in calls
+
+
 def _dummy_budget_result(
     target_bpp,
     anchor_bpp,

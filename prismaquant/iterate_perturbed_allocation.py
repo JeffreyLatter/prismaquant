@@ -60,6 +60,7 @@ from prismaquant.interaction_refine import (
 )
 from prismaquant.propagated_cost import (
     CUDAGraphRegistry,
+    FrozenBudgetError,
     L3NeighborhoodEntry,
     L3UnsupportedTargetError,
     _env_cuda_graphs_enabled_for_call_count,
@@ -3544,6 +3545,386 @@ def knee_candidate_from_points(points: list[tuple[float, float]]) -> dict | None
     }
 
 
+def _surrogate_grid_points(args) -> list[float]:
+    lo = float(args.knee_bpp_min)
+    hi = float(args.knee_bpp_max)
+    step = getattr(args, "knee_surrogate_bpp_step", None)
+    if step is not None and float(step) > 0:
+        values = []
+        x = lo
+        while x <= hi + 1e-12:
+            values.append(round(float(x), 8))
+            x += float(step)
+        if abs(values[-1] - hi) > 1e-8:
+            values.append(round(hi, 8))
+        return sorted(set(values))
+    count = max(int(getattr(args, "knee_surrogate_points", 41)), 3)
+    if count == 1:
+        return [round((lo + hi) / 2.0, 8)]
+    return [
+        round(lo + (hi - lo) * idx / float(count - 1), 8)
+        for idx in range(count)
+    ]
+
+
+def _load_l3_cost_payload_unchecked(path: Path) -> dict:
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, Mapping) or "costs" not in payload:
+        raise L3ResumeMetadataError(
+            f"L3 resume file {path} does not contain a 'costs' payload"
+        )
+    cost_history = payload.get("cost_history")
+    if not isinstance(cost_history, list) or not all(
+        isinstance(item, dict) for item in cost_history
+    ):
+        cost_history = [payload["costs"]]
+    return {
+        "path": str(path),
+        "costs": dict(payload["costs"]),
+        "cost_history": list(cost_history),
+        "formats": list(payload.get("formats") or []),
+        "meta": dict(payload.get("meta") or {}),
+    }
+
+
+def _assignment_from_anchor_or_default(
+    args,
+    *,
+    resume_path: Path,
+    anchor_bpp: float,
+    stats: dict,
+    costs: dict,
+    specs: list[fr.FormatSpec],
+) -> tuple[dict[str, str], Path | None, str]:
+    if args.initial_config:
+        path = Path(args.initial_config)
+        return load_assignment_config(path), path, "initial_config"
+    label = _bpp_label(anchor_bpp)
+    candidate = resume_path.parent / f"l2_assignment_bpp_{label}.json"
+    if candidate.exists():
+        return load_assignment_config(candidate), candidate, "anchor_l2_assignment"
+    return default_initial_assignment(stats, costs, specs), None, "default_initial"
+
+
+def _candidate_loss_sum(chosen: Mapping[str, Candidate]) -> float:
+    return sum(float(c.predicted_dloss) for c in chosen.values())
+
+
+def _nondominated_surrogate_points(points: list[dict]) -> list[dict]:
+    ordered = sorted(
+        points,
+        key=lambda row: (
+            float(row["achieved_bpp"]),
+            float(row["surrogate_loss"]),
+            float(row["target_bpp"]),
+        ),
+    )
+    frontier = []
+    best_loss = float("inf")
+    for row in ordered:
+        loss = float(row["surrogate_loss"])
+        if loss < best_loss - 1e-12:
+            frontier.append(row)
+            best_loss = loss
+    return frontier
+
+
+def _write_surrogate_frontier_outputs(
+    output_root: Path,
+    *,
+    points: list[dict],
+    frontier: list[dict],
+    knee: dict,
+    selected_indices: list[int],
+    metadata: Mapping,
+) -> tuple[Path, Path]:
+    csv_path = output_root / "surrogate_frontier.csv"
+    json_path = output_root / "surrogate_frontier.json"
+    fields = [
+        "target_bpp",
+        "achieved_bpp",
+        "surrogate_loss",
+        "assignment_hash",
+        "hamming_from_anchor",
+        "solver",
+        "format_histogram",
+        "assignment_path",
+        "layer_config_path",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in frontier:
+            record = dict(row)
+            record["format_histogram"] = json.dumps(
+                record.get("format_histogram", {}),
+                sort_keys=True,
+            )
+            writer.writerow({field: record.get(field) for field in fields})
+    with open(json_path, "w") as f:
+        json.dump(
+            {
+                "metadata": dict(metadata),
+                "knee": dict(knee),
+                "selected_indices": list(selected_indices),
+                "frontier": frontier,
+                "all_unique_points": points,
+            },
+            f,
+            indent=2,
+        )
+    return csv_path, json_path
+
+
+def _spread_indices(count: int, selected_count: int) -> set[int]:
+    count = int(count)
+    selected_count = max(int(selected_count), 0)
+    if count <= 0 or selected_count <= 0:
+        return set()
+    if selected_count == 1:
+        return {0}
+    if selected_count >= count:
+        return set(range(count))
+    return {
+        int(round(idx * (count - 1) / float(selected_count - 1)))
+        for idx in range(selected_count)
+    }
+
+
+def _cap_spread_candidates(
+    candidates: list[dict],
+    limit: int,
+    *,
+    required_key: str | None = None,
+) -> list[dict]:
+    if limit <= 0 or len(candidates) <= limit:
+        return list(candidates)
+    required_indices = {
+        idx
+        for idx, row in enumerate(candidates)
+        if required_key is not None and row.get(required_key)
+    }
+    keep = set(required_indices)
+    for idx in sorted(_spread_indices(len(candidates), limit)):
+        if len(keep) >= limit:
+            break
+        keep.add(idx)
+    if len(keep) < limit:
+        for idx in range(len(candidates)):
+            if len(keep) >= limit:
+                break
+            keep.add(idx)
+    return [candidates[idx] for idx in sorted(keep)]
+
+
+def run_surrogate_knee_search(
+    args,
+    *,
+    stats: dict,
+    current_costs: dict,
+    specs: list[fr.FormatSpec],
+    output_root: Path,
+) -> int:
+    anchor_hint = (
+        args.target_bits_anchor
+        if args.target_bits_anchor is not None
+        else (float(args.knee_bpp_min) + float(args.knee_bpp_max)) / 2.0
+    )
+    resume_path = _resume_l3_cost_path_for_anchor(
+        args,
+        float(anchor_hint),
+        single_output=True,
+    )
+    if resume_path is None:
+        raise RuntimeError(
+            "--knee-surrogate requires --resume-l3-costs or "
+            "--resume-l3-costs-dir containing an anchor L3 cost table"
+        )
+    payload = _load_l3_cost_payload_unchecked(Path(resume_path))
+    meta = payload.get("meta", {})
+    anchor_bpp = float(meta.get("anchor_bpp", anchor_hint))
+    anchor_assignment, anchor_assignment_path, anchor_source = (
+        _assignment_from_anchor_or_default(
+            args,
+            resume_path=Path(resume_path),
+            anchor_bpp=anchor_bpp,
+            stats=stats,
+            costs=current_costs,
+            specs=specs,
+        )
+    )
+    l3_candidates = _filter_l3_candidates_for_assignment(
+        build_l3_candidates(stats, payload["costs"], specs),
+        anchor_assignment,
+    )
+    if not l3_candidates:
+        raise RuntimeError("surrogate knee search found no L3 candidates")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    grid = _surrogate_grid_points(args)
+    points_by_hash: dict[tuple, dict] = {}
+    failures: list[dict] = []
+    for target_bpp in grid:
+        try:
+            assignment, chosen, solver_meta = solve_frozen_l3_neighborhood(
+                stats,
+                anchor_assignment,
+                l3_candidates,
+                specs,
+                target_bits=float(target_bpp),
+                bit_precision=float(args.bit_precision),
+                budget_tolerance=float(args.frozen_dp_budget_tolerance),
+                return_metadata=True,
+            )
+        except FrozenBudgetError as exc:
+            failures.append({
+                "target_bpp": float(target_bpp),
+                "error": str(exc),
+            })
+            continue
+        histogram = _format_histogram(stats, assignment, specs, float(target_bpp))
+        digest = assignment_hash(assignment)
+        row = {
+            "target_bpp": float(target_bpp),
+            "achieved_bpp": float(histogram["achieved_bpp"]),
+            "surrogate_loss": float(_candidate_loss_sum(chosen)),
+            "assignment_hash": _assignment_digest(assignment),
+            "hamming_from_anchor": _hamming_count(anchor_assignment, assignment),
+            "solver": str(solver_meta.get("frozen_dp_precision_used", "unknown")),
+            "format_histogram": histogram,
+            "solver_meta": dict(solver_meta),
+        }
+        previous = points_by_hash.get(digest)
+        if previous is None or (
+            float(row["surrogate_loss"]),
+            abs(float(row["target_bpp"]) - float(row["achieved_bpp"])),
+        ) < (
+            float(previous["surrogate_loss"]),
+            abs(float(previous["target_bpp"]) - float(previous["achieved_bpp"])),
+        ):
+            row["_assignment"] = assignment
+            points_by_hash[digest] = row
+
+    unique_points = list(points_by_hash.values())
+    frontier = _nondominated_surrogate_points(unique_points)
+    if len(frontier) < 3:
+        raise RuntimeError(
+            f"surrogate frontier has only {len(frontier)} point(s); "
+            "widen --knee-bpp-min/--knee-bpp-max or reduce bit precision"
+        )
+    knee_bpp, knee_loss, knee_score, endpoint = segmented_kneedle_point(
+        [
+            (float(row["achieved_bpp"]), float(row["surrogate_loss"]))
+            for row in frontier
+        ]
+    )
+    knee_index = min(
+        range(len(frontier)),
+        key=lambda idx: abs(float(frontier[idx]["achieved_bpp"]) - knee_bpp),
+    )
+    neighbor_count = max(int(getattr(args, "knee_surrogate_neighbors", 1)), 0)
+    selected_indices = sorted(
+        {
+            idx
+            for idx in range(
+                max(0, knee_index - neighbor_count),
+                min(len(frontier), knee_index + neighbor_count + 1),
+            )
+        }
+    )
+    validation_candidate_count = int(
+        getattr(args, "knee_surrogate_validation_candidates", 0) or 0
+    )
+    selected_indices = sorted(
+        set(selected_indices)
+        | _spread_indices(len(frontier), validation_candidate_count)
+    )
+    selected_dir = output_root / "surrogate_selected"
+    for idx in selected_indices:
+        row = frontier[idx]
+        label = f"{idx:03d}_bpp_{float(row['achieved_bpp']):.4f}"
+        assignment = dict(row.pop("_assignment"))
+        assignment_path, layer_config_path = _write_named_assignment_artifacts(
+            assignment,
+            assignment_path=selected_dir / f"assignment_{label}.json",
+            layer_config_path=selected_dir / f"layer_config_{label}.json",
+        )
+        row["assignment_path"] = str(assignment_path)
+        row["layer_config_path"] = str(layer_config_path)
+        row["_assignment"] = assignment
+    knee_assignment = dict(frontier[knee_index]["_assignment"])
+    knee_assignment_path, knee_layer_config_path = _write_named_assignment_artifacts(
+        knee_assignment,
+        assignment_path=output_root / "knee_surrogate_assignment.json",
+        layer_config_path=output_root / "final_layer_config_knee_surrogate.json",
+    )
+    for row in unique_points:
+        row.pop("_assignment", None)
+    knee = {
+        "mode": "surrogate_kneedle",
+        "frontier_index": int(knee_index),
+        "achieved_bpp": float(frontier[knee_index]["achieved_bpp"]),
+        "target_bpp": float(frontier[knee_index]["target_bpp"]),
+        "surrogate_loss": float(knee_loss),
+        "kneedle_score": float(knee_score),
+        "endpoint_fallback": bool(endpoint),
+        "assignment": str(knee_assignment_path),
+        "layer_config": str(knee_layer_config_path),
+        "format_histogram": frontier[knee_index]["format_histogram"],
+    }
+    for row in frontier:
+        row.pop("_assignment", None)
+    csv_path, json_path = _write_surrogate_frontier_outputs(
+        output_root,
+        points=sorted(unique_points, key=lambda r: float(r["achieved_bpp"])),
+        frontier=frontier,
+        knee=knee,
+        selected_indices=selected_indices,
+        metadata={
+            "mode": "surrogate_knee_search",
+            "resume_l3_costs": str(resume_path),
+            "anchor_bpp": float(anchor_bpp),
+            "anchor_assignment": (
+                str(anchor_assignment_path) if anchor_assignment_path else None
+            ),
+            "anchor_assignment_source": anchor_source,
+            "grid": grid,
+            "failures": failures,
+            "l3_candidate_count": len(l3_candidates),
+            "formats": [s.name for s in specs],
+            "bit_precision": float(args.bit_precision),
+            "frozen_dp_budget_tolerance": float(args.frozen_dp_budget_tolerance),
+            "quality_note": (
+                "Surrogate losses are computed from one cached L3 cost table. "
+                "They rank candidate assignments but are not held-out KL."
+            ),
+        },
+    )
+    summary = {
+        "pareto": {
+            "mode": "surrogate_knee_search",
+            "csv": str(csv_path),
+            "json": str(json_path),
+            "frontier_points": len(frontier),
+            "unique_points": len(unique_points),
+        },
+        "knee": knee,
+    }
+    with open(output_root / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    _emit("===== summary =====")
+    _emit(
+        f"Surrogate knee: achieved_bpp={knee['achieved_bpp']:.4f} "
+        f"target_bpp={knee['target_bpp']:.4f} "
+        f"surrogate_loss={knee['surrogate_loss']:.6g}"
+    )
+    _emit(f"Knee assignment: {knee_assignment_path}")
+    _emit(f"Surrogate frontier: {json_path}")
+    _emit("===================")
+    return 0
+
+
 def _bpp_label(value: float) -> str:
     return f"{float(value):.2f}"
 
@@ -4175,6 +4556,329 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
     return 0
 
 
+def _load_assignment_json(path: str | Path) -> dict[str, str]:
+    with open(path) as f:
+        payload = json.load(f)
+    return {
+        str(name): fr.canonical_format_name(str(fmt))
+        for name, fmt in payload.items()
+    }
+
+
+def _candidate_from_assignment(
+    *,
+    assignment: Mapping[str, str],
+    stats: Mapping[str, Mapping],
+    specs: list[fr.FormatSpec],
+    source: str,
+    source_path: str | None = None,
+    target_bpp: float | None = None,
+    surrogate_loss: float | None = None,
+) -> dict:
+    histogram = _format_histogram(
+        stats,
+        assignment,
+        specs,
+        float(target_bpp) if target_bpp is not None else 0.0,
+    )
+    return {
+        "source": source,
+        "source_path": source_path,
+        "target_bpp": (float(target_bpp) if target_bpp is not None else None),
+        "achieved_bpp": float(histogram["achieved_bpp"]),
+        "surrogate_loss": (
+            float(surrogate_loss) if surrogate_loss is not None else None
+        ),
+        "assignment_hash": _assignment_digest(assignment),
+        "format_histogram": histogram,
+        "_assignment": dict(assignment),
+    }
+
+
+def _nondominated_validated_points(points: list[dict]) -> list[dict]:
+    ordered = sorted(
+        points,
+        key=lambda row: (
+            float(row["achieved_bpp"]),
+            float(row["validation_kl"]),
+            str(row["assignment_hash"]),
+        ),
+    )
+    frontier = []
+    best_kl = float("inf")
+    for row in ordered:
+        kl = float(row["validation_kl"])
+        if kl < best_kl - 1e-12:
+            frontier.append(row)
+            best_kl = kl
+    return frontier
+
+
+def _write_validated_frontier_outputs(
+    output_root: Path,
+    *,
+    candidates: list[dict],
+    frontier: list[dict],
+    knee: dict,
+    metadata: Mapping,
+) -> tuple[Path, Path]:
+    csv_path = output_root / "validated_frontier.csv"
+    json_path = output_root / "validated_frontier.json"
+    fields = [
+        "source",
+        "target_bpp",
+        "achieved_bpp",
+        "validation_kl",
+        "surrogate_loss",
+        "assignment_hash",
+        "format_histogram",
+        "assignment_path",
+        "layer_config_path",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in frontier:
+            record = dict(row)
+            record["format_histogram"] = json.dumps(
+                record.get("format_histogram", {}),
+                sort_keys=True,
+            )
+            writer.writerow({field: record.get(field) for field in fields})
+    with open(json_path, "w") as f:
+        json.dump(
+            {
+                "metadata": dict(metadata),
+                "knee": dict(knee),
+                "frontier": frontier,
+                "validated_candidates": candidates,
+            },
+            f,
+            indent=2,
+        )
+    return csv_path, json_path
+
+
+def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
+    frontier_path = runtime.output_root / "surrogate_frontier.json"
+    if not frontier_path.exists():
+        raise RuntimeError(
+            "validated surrogate knee search requires surrogate_frontier.json; "
+            "run_surrogate_knee_search first"
+        )
+    with open(frontier_path) as f:
+        surrogate = json.load(f)
+    candidates_by_hash: dict[str, dict] = {}
+    for row in surrogate.get("frontier", []):
+        assignment_path = row.get("assignment_path")
+        if not assignment_path:
+            continue
+        assignment = _load_assignment_json(assignment_path)
+        candidate = _candidate_from_assignment(
+            assignment=assignment,
+            stats=runtime.stats,
+            specs=runtime.specs,
+            source="surrogate_frontier",
+            source_path=str(assignment_path),
+            target_bpp=row.get("target_bpp"),
+            surrogate_loss=row.get("surrogate_loss"),
+        )
+        candidate["assignment_path"] = str(assignment_path)
+        candidate["layer_config_path"] = row.get("layer_config_path")
+        candidates_by_hash.setdefault(candidate["assignment_hash"], candidate)
+
+    knee_assignment_path = surrogate.get("knee", {}).get("assignment")
+    if knee_assignment_path:
+        assignment = _load_assignment_json(knee_assignment_path)
+        candidate = _candidate_from_assignment(
+            assignment=assignment,
+            stats=runtime.stats,
+            specs=runtime.specs,
+            source="surrogate_knee",
+            source_path=str(knee_assignment_path),
+            target_bpp=surrogate.get("knee", {}).get("target_bpp"),
+            surrogate_loss=surrogate.get("knee", {}).get("surrogate_loss"),
+        )
+        candidate["is_surrogate_knee"] = True
+        candidate["assignment_path"] = str(knee_assignment_path)
+        candidate["layer_config_path"] = surrogate.get("knee", {}).get("layer_config")
+        existing = candidates_by_hash.get(candidate["assignment_hash"])
+        if existing is None:
+            candidates_by_hash[candidate["assignment_hash"]] = candidate
+        else:
+            existing["is_surrogate_knee"] = True
+            if existing.get("source") == "surrogate_frontier":
+                existing["source"] = "surrogate_knee"
+                existing["source_path"] = str(knee_assignment_path)
+                existing["target_bpp"] = candidate.get("target_bpp")
+                existing["surrogate_loss"] = candidate.get("surrogate_loss")
+                existing["assignment_path"] = str(knee_assignment_path)
+                existing["layer_config_path"] = candidate.get("layer_config_path")
+
+    for path in getattr(args, "knee_include_assignment", None) or []:
+        assignment = _load_assignment_json(path)
+        candidate = _candidate_from_assignment(
+            assignment=assignment,
+            stats=runtime.stats,
+            specs=runtime.specs,
+            source="included_assignment",
+            source_path=str(path),
+        )
+        candidates_by_hash.setdefault(candidate["assignment_hash"], candidate)
+
+    sort_key = lambda row: (
+        float(row["achieved_bpp"]),
+        (
+            row.get("surrogate_loss")
+            if row.get("surrogate_loss") is not None
+            else float("inf")
+        ),
+        str(row["assignment_hash"]),
+    )
+    generated_candidates = sorted(
+        [
+            row
+            for row in candidates_by_hash.values()
+            if row.get("source") != "included_assignment"
+        ],
+        key=sort_key,
+    )
+    included_candidates = sorted(
+        [
+            row
+            for row in candidates_by_hash.values()
+            if row.get("source") == "included_assignment"
+        ],
+        key=sort_key,
+    )
+    validate_limit = int(
+        getattr(args, "knee_surrogate_validation_candidates", 0) or 0
+    )
+    if validate_limit > 0:
+        generated_candidates = _cap_spread_candidates(
+            generated_candidates,
+            validate_limit,
+            required_key="is_surrogate_knee",
+        )
+    candidates = sorted(
+        generated_candidates + included_candidates,
+        key=sort_key,
+    )
+    if len(candidates) < 3:
+        raise RuntimeError(
+            f"validated surrogate knee search has only {len(candidates)} "
+            "candidate(s); increase --knee-surrogate-validation-candidates"
+        )
+    validated_dir = runtime.output_root / "validated_selected"
+    for index, row in enumerate(candidates):
+        assignment = dict(row["_assignment"])
+        _emit(
+            f"[knee][validate] {index + 1}/{len(candidates)} "
+            f"source={row['source']} bpp={row['achieved_bpp']:.4f}"
+        )
+        validation_kl = measure_assignment_kl(
+            runtime.model,
+            assignment,
+            runtime.calib_ids,
+            runtime.ref_log_probs,
+            work_root=runtime.work_root,
+            profile=runtime.profile,
+            use_frozen_weight_cache=False,
+        )
+        row["validation_kl"] = float(validation_kl)
+        label = f"{index:03d}_bpp_{float(row['achieved_bpp']):.4f}"
+        if not row.get("assignment_path"):
+            assignment_path, layer_config_path = _write_named_assignment_artifacts(
+                assignment,
+                assignment_path=validated_dir / f"assignment_{label}.json",
+                layer_config_path=validated_dir / f"layer_config_{label}.json",
+            )
+            row["assignment_path"] = str(assignment_path)
+            row["layer_config_path"] = str(layer_config_path)
+        row.pop("_assignment", None)
+
+    validated_frontier = _nondominated_validated_points(candidates)
+    if len(validated_frontier) < 3:
+        # Still write all data; choose the best KL if monotone dominance leaves
+        # too few points for a geometric knee.
+        chosen = min(candidates, key=lambda row: float(row["validation_kl"]))
+        knee_score = 0.0
+        endpoint = True
+    else:
+        knee_bpp, knee_kl, knee_score, endpoint = segmented_kneedle_point(
+            [
+                (float(row["achieved_bpp"]), float(row["validation_kl"]))
+                for row in validated_frontier
+            ]
+        )
+        chosen = min(
+            validated_frontier,
+            key=lambda row: (
+                abs(float(row["achieved_bpp"]) - float(knee_bpp)),
+                abs(float(row["validation_kl"]) - float(knee_kl)),
+            ),
+        )
+    assignment = _load_assignment_json(chosen["assignment_path"])
+    knee_assignment_path, knee_layer_config_path = _write_named_assignment_artifacts(
+        assignment,
+        assignment_path=runtime.output_root / "validated_knee_assignment.json",
+        layer_config_path=runtime.output_root / "final_layer_config_validated_knee.json",
+    )
+    knee = {
+        "mode": "validated_surrogate_kneedle",
+        "source": chosen["source"],
+        "achieved_bpp": float(chosen["achieved_bpp"]),
+        "target_bpp": chosen.get("target_bpp"),
+        "validation_kl": float(chosen["validation_kl"]),
+        "surrogate_loss": chosen.get("surrogate_loss"),
+        "kneedle_score": float(knee_score),
+        "endpoint_fallback": bool(endpoint),
+        "assignment": str(knee_assignment_path),
+        "layer_config": str(knee_layer_config_path),
+        "format_histogram": chosen["format_histogram"],
+    }
+    csv_path, json_path = _write_validated_frontier_outputs(
+        runtime.output_root,
+        candidates=candidates,
+        frontier=validated_frontier,
+        knee=knee,
+        metadata={
+            "mode": "validated_surrogate_knee_search",
+            "surrogate_frontier": str(frontier_path),
+            "validation_candidate_count": len(candidates),
+            "validation_calib_samples": int(args.n_calib_samples),
+            "validation_calib_seqlen": int(args.calib_seqlen),
+            "included_assignments": list(
+                getattr(args, "knee_include_assignment", None) or []
+            ),
+            "quality_note": (
+                "Kneedle is selected from real assignment KL measured on this "
+                "validation calibration set; surrogate losses are retained "
+                "only as candidate-generation diagnostics."
+            ),
+        },
+    )
+    with open(runtime.output_root / "validated_summary.json", "w") as f:
+        json.dump(
+            {
+                "knee": knee,
+                "validated_frontier": str(json_path),
+                "validated_frontier_csv": str(csv_path),
+            },
+            f,
+            indent=2,
+        )
+    _emit("===== validated summary =====")
+    _emit(
+        f"Validated knee: bpp={knee['achieved_bpp']:.4f} "
+        f"KL={knee['validation_kl']:.6g} source={knee['source']}"
+    )
+    _emit(f"Validated knee config: {knee_layer_config_path}")
+    _emit(f"Validated frontier: {json_path}")
+    _emit("=============================")
+    return 0
+
+
 def run_quality_equivalent_search(args, runtime: BudgetRuntime) -> int:
     """Find the smallest bpp matching a higher-bit reference KL."""
     args._runtime = runtime
@@ -4499,6 +5203,58 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--knee-mode", choices=["kneedle", "threshold"], default="kneedle")
     ap.add_argument("--knee-threshold-kl", type=float)
     ap.add_argument("--knee-max-evaluations", type=int, default=12)
+    ap.add_argument(
+        "--knee-surrogate",
+        action="store_true",
+        help=(
+            "For --knee-search, choose the kneedle from one cached L3 cost "
+            "table by solving many CPU-only target budgets. This writes "
+            "candidate configs but does not perform held-out KL validation."
+        ),
+    )
+    ap.add_argument(
+        "--knee-surrogate-points",
+        type=int,
+        default=41,
+        help="Number of evenly spaced CPU surrogate frontier points to solve.",
+    )
+    ap.add_argument(
+        "--knee-surrogate-bpp-step",
+        type=float,
+        help="Optional fixed bpp grid step for --knee-surrogate.",
+    )
+    ap.add_argument(
+        "--knee-surrogate-neighbors",
+        type=int,
+        default=1,
+        help="Write layer configs for this many frontier neighbors around the knee.",
+    )
+    ap.add_argument(
+        "--knee-surrogate-validate",
+        action="store_true",
+        help=(
+            "After generating the surrogate frontier, load the model and "
+            "validate selected candidates with real KL before choosing the knee."
+        ),
+    )
+    ap.add_argument(
+        "--knee-surrogate-validation-candidates",
+        type=int,
+        default=9,
+        help=(
+            "Number of evenly spread surrogate frontier candidates to write "
+            "and validate when --knee-surrogate-validate is set."
+        ),
+    )
+    ap.add_argument(
+        "--knee-include-assignment",
+        action="append",
+        default=[],
+        help=(
+            "Additional assignment JSON to validate during "
+            "--knee-surrogate-validate. May be repeated."
+        ),
+    )
     ap.add_argument(
         "--quality-equivalent-bits",
         "--quality-equivalent-to-bits",
@@ -4830,6 +5586,16 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("--knee-bpp-min must be less than --knee-bpp-max.")
         if args.knee_max_evaluations < 3:
             ap.error("--knee-max-evaluations must be at least 3.")
+        if args.knee_surrogate and args.knee_surrogate_points < 3:
+            ap.error("--knee-surrogate-points must be at least 3.")
+        if (
+            args.knee_surrogate
+            and args.knee_surrogate_bpp_step is not None
+            and args.knee_surrogate_bpp_step <= 0
+        ):
+            ap.error("--knee-surrogate-bpp-step must be positive.")
+        if args.knee_surrogate_validation_candidates < 0:
+            ap.error("--knee-surrogate-validation-candidates must be non-negative.")
     if args.quality_equivalent_bits is not None:
         if args.quality_equivalent_bpp_min >= args.quality_equivalent_bits:
             ap.error(
@@ -4889,6 +5655,16 @@ def main(argv: list[str] | None = None) -> int:
     specs = [fr.get_format(s.strip()) for s in args.formats.split(",") if s.strip()]
     specs = sorted(specs, key=lambda s: s.effective_bits)
     probe_load_timing = _phase_end("[init] probe load", probe_load_start)
+    if args.knee_search and args.knee_surrogate:
+        run_surrogate_knee_search(
+            args,
+            stats=stats,
+            current_costs=current_costs,
+            specs=specs,
+            output_root=output_root,
+        )
+        if not args.knee_surrogate_validate:
+            return 0
 
     from transformers import AutoTokenizer
     from prismaquant.model_profiles import detect_profile, DefaultProfile
@@ -4946,6 +5722,8 @@ def main(argv: list[str] | None = None) -> int:
     args._runtime = runtime
     if args.target_bits_list is not None:
         return run_multi_budget(args, runtime)
+    if args.knee_search and args.knee_surrogate_validate:
+        return run_validated_surrogate_knee_search(args, runtime)
     if args.knee_search:
         return run_knee_search(args, runtime)
     if args.quality_equivalent_bits is not None:
