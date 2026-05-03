@@ -37,7 +37,7 @@ def test_l3_output_mse_default_is_opt_in():
     assert ipa._l3_output_mse_names(SimpleNamespace(l3_output_mse=True)) is None
 
 
-def test_memory_aware_policy_keeps_resume_calibration(monkeypatch):
+def test_memory_aware_policy_keeps_resume_l3_calibration(monkeypatch):
     args = SimpleNamespace(
         memory_aware_l3=True,
         resume_l3_costs="anchor_bpp_4.50=/tmp/l3.pkl",
@@ -59,8 +59,8 @@ def test_memory_aware_policy_keeps_resume_calibration(monkeypatch):
 
     ipa._apply_memory_aware_runtime_policy(args, stats, model=None)
 
-    assert args.n_calib_samples == 8
-    assert args.calib_seqlen == 512
+    assert args.n_calib_samples == 2
+    assert args.calib_seqlen == 128
     assert args.l3_n_calib_samples == 8
     assert args.l3_calib_seqlen == 512
     assert args.input_rows == 64
@@ -270,7 +270,7 @@ def _run_tiny_l3_regression_case(tmp_path, monkeypatch, *, tolerance, kl_after):
     monkeypatch.setattr(
         ipa,
         "load_wikitext_calibration",
-        lambda _tokenizer, n_samples, seqlen: torch.zeros(
+        lambda _tokenizer, n_samples, seqlen, **_kwargs: torch.zeros(
             (n_samples, seqlen),
             dtype=torch.long,
         ),
@@ -612,8 +612,8 @@ def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
     )
     calib_calls = []
 
-    def _load_calib(_tokenizer, n_samples, seqlen):
-        calib_calls.append((n_samples, seqlen))
+    def _load_calib(_tokenizer, n_samples, seqlen, **kwargs):
+        calib_calls.append((n_samples, seqlen, kwargs))
         return torch.zeros((n_samples, seqlen), dtype=torch.long)
 
     monkeypatch.setattr(ipa, "load_wikitext_calibration", _load_calib)
@@ -694,12 +694,28 @@ def test_iterate_main_emits_observability_traces(tmp_path, monkeypatch, capsys):
     l3_lines = [json.loads(line) for line in l3_trace.read_text().splitlines()]
     assert len(iter_lines) == 2
     assert len(l3_lines) == 1
-    assert (8, 512) in calib_calls
-    assert (1, 2) in calib_calls
+    assert any(
+        n_samples == 8
+        and seqlen == 512
+        and kwargs["split"] == "validation"
+        and kwargs["seed"] == 4242
+        for n_samples, seqlen, kwargs in calib_calls
+    )
+    assert any(
+        n_samples == 1
+        and seqlen == 2
+        and kwargs["split"] == "train"
+        and kwargs["seed"] == 42
+        for n_samples, seqlen, kwargs in calib_calls
+    )
     with open(output_dir / "l3_propagated_costs.pkl", "rb") as f:
         l3_payload = pickle.load(f)
     assert l3_payload["meta"]["l3_max_lanes_per_batch"] == 3
     assert l3_payload["meta"]["tail_only"] is False
+    assert l3_payload["meta"]["kl_calib_split"] == "validation"
+    assert l3_payload["meta"]["kl_calib_seed"] == 4242
+    assert l3_payload["meta"]["l3_calib_split"] == "train"
+    assert l3_payload["meta"]["l3_calib_seed"] == 42
     assert l3_payload["meta"]["l3_n_calib_samples"] == 1
     assert l3_payload["meta"]["l3_calib_seqlen"] == 2
 
@@ -742,7 +758,7 @@ def _run_global_l3_case(tmp_path, monkeypatch, *, l3_costs, kl_after):
     monkeypatch.setattr(
         ipa,
         "load_wikitext_calibration",
-        lambda _tokenizer, n_samples, seqlen: torch.zeros(
+        lambda _tokenizer, n_samples, seqlen, **_kwargs: torch.zeros(
             (n_samples, seqlen),
             dtype=torch.long,
         ),
@@ -902,6 +918,7 @@ def _iterated_l3_args(**overrides):
         l3_interaction_neighbor_radius=1,
         l3_interaction_max_pairs=0,
         l3_interaction_max_passes=4,
+        l3_interaction_max_seconds=600.0,
         l3_interaction_exact=True,
         l3_interaction_exact_max_states=2_000_000,
         l3_validation_scout=False,
@@ -1186,6 +1203,63 @@ def test_l3_interaction_refine_starts_from_feasible_candidate(tmp_path, monkeypa
     assert meta["attempted"] is True
     assert meta["skipped_reason"] is None
     assert refined["layer0"] == "NVFP4"
+
+
+def test_l3_interaction_refine_honors_time_budget(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(2)}
+    specs = [
+        ipa.fr.get_format("NVFP4"),
+        ipa.fr.get_format("MXFP8"),
+        ipa.fr.get_format("BF16"),
+    ]
+    base_assignment = {name: "MXFP8" for name in stats}
+    additive_candidate = {name: "NVFP4" for name in stats}
+    l3_candidates = {
+        name: [
+            ipa.Candidate("NVFP4", bits_per_param=4.0, memory_bytes=2, predicted_dloss=0.0),
+            ipa.Candidate("MXFP8", bits_per_param=8.0, memory_bytes=4, predicted_dloss=0.3),
+        ]
+        for name in stats
+    }
+
+    def _measure(_model, _assignment, overrides, *_args, **kwargs):
+        progress_callback = kwargs["progress_callback"]
+        progress_callback({
+            "event": "paired_override_chunk_start",
+            "chunk_index": 1,
+            "chunk_count": 1,
+            "override_count": len(overrides),
+            "lane_count": 1,
+        })
+        return [0.0 for _override in overrides]
+
+    times = iter([0.0, 1.0, 1.0])
+    monkeypatch.setattr(ipa.time, "monotonic", lambda: next(times, 1.0))
+    monkeypatch.setattr(ipa, "measure_override_paired_kl_deltas", _measure)
+
+    refined, meta = ipa.run_l3_interaction_refine(
+        _iterated_l3_args(
+            l3_interaction_refine=True,
+            l3_interaction_top_units=2,
+            l3_interaction_neighbor_radius=2,
+            l3_interaction_max_seconds=0.5,
+        ),
+        _TinyLogitsModel(),
+        base_assignment,
+        additive_candidate,
+        l3_candidates,
+        stats,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        work_root=tmp_path,
+    )
+
+    assert refined == additive_candidate
+    assert meta["attempted"] is True
+    assert meta["stopped_reason"] == "time_budget_exceeded"
+    assert meta["skipped_reason"] == "time_budget_exceeded"
+    assert meta["pair_measurement_seconds"] == pytest.approx(1.0)
 
 
 def test_l3_interaction_validation_keeps_better_additive_candidate(tmp_path, monkeypatch):
@@ -2350,6 +2424,45 @@ def test_surrogate_knee_search_writes_knee_without_model(tmp_path):
     assert Path(summary["knee"]["assignment"]).exists()
 
 
+def test_surrogate_knee_cli_requires_validation_or_unsafe_flag(tmp_path, monkeypatch):
+    probe_path = tmp_path / "probe.pkl"
+    costs_path = tmp_path / "costs.pkl"
+    stats = {"layer": _tiny_stat()}
+    costs = {
+        "layer": {
+            "NVFP4": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    }
+    with open(probe_path, "wb") as f:
+        pickle.dump({"stats": stats}, f)
+    with open(costs_path, "wb") as f:
+        pickle.dump({"costs": costs}, f)
+    monkeypatch.setattr(ipa, "validate_probe_payload", lambda *_args: None)
+    monkeypatch.setattr(ipa, "validate_cost_payload", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="--knee-surrogate writes"):
+        ipa.main([
+            "--model", "tiny",
+            "--probe", str(probe_path),
+            "--initial-costs", str(costs_path),
+            "--formats", "NVFP4,BF16",
+            "--knee-search",
+            "--knee-surrogate",
+            "--l3-polish",
+            "--work-dir", str(tmp_path / "work"),
+            "--output-dir", str(tmp_path / "out"),
+        ])
+
+
+def test_endpoint_fallback_warning_emits(capsys):
+    ipa._warn_endpoint_fallback("knee", {"endpoint_fallback": True})
+
+    out = capsys.readouterr().out
+    assert "[knee] warning:" in out
+    assert "endpoint fallback" in out
+
+
 def test_validated_surrogate_knee_uses_real_kl(tmp_path, monkeypatch):
     stats = {
         f"layer{i}": {
@@ -3137,7 +3250,7 @@ def test_main_dispatches_target_bits_list_with_one_model_load(tmp_path, monkeypa
     monkeypatch.setattr(
         ipa,
         "load_wikitext_calibration",
-        lambda _tokenizer, n_samples, seqlen: torch.zeros(
+        lambda _tokenizer, n_samples, seqlen, **_kwargs: torch.zeros(
             (n_samples, seqlen),
             dtype=torch.long,
         ),
@@ -3201,7 +3314,7 @@ def test_main_preserves_explicit_global_l3_for_target_bits_list(
     monkeypatch.setattr(
         ipa,
         "load_wikitext_calibration",
-        lambda _tokenizer, n_samples, seqlen: torch.zeros(
+        lambda _tokenizer, n_samples, seqlen, **_kwargs: torch.zeros(
             (n_samples, seqlen),
             dtype=torch.long,
         ),

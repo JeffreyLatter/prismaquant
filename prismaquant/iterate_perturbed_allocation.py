@@ -935,6 +935,27 @@ def _prepare_ref_log_probs_for_kl(ref_log_probs, device: torch.device):
     return _move_tensor_tree_to_device(ref_log_probs, device)
 
 
+def _calibration_metadata(args) -> dict:
+    return {
+        "kl_calib_split": str(getattr(args, "calib_split", "validation")),
+        "kl_calib_seed": int(getattr(args, "calib_seed", 4242)),
+        "n_calib_samples": int(getattr(args, "n_calib_samples", 0)),
+        "calib_seqlen": int(getattr(args, "calib_seqlen", 0)),
+        "l3_calib_split": str(getattr(args, "l3_calib_split", "train")),
+        "l3_calib_seed": int(getattr(args, "l3_calib_seed", 42)),
+        "l3_n_calib_samples": int(getattr(args, "l3_n_calib_samples", 0)),
+        "l3_calib_seqlen": int(getattr(args, "l3_calib_seqlen", 0)),
+    }
+
+
+def _warn_endpoint_fallback(context: str, metadata: Mapping | None) -> None:
+    if isinstance(metadata, Mapping) and metadata.get("endpoint_fallback"):
+        _emit(
+            f"[{context}] warning: no interior validated knee found; "
+            "using endpoint fallback"
+        )
+
+
 def _l3_resume_cli_force(args) -> bool:
     return bool(
         getattr(args, "resume_l3_ignore_mismatch", False)
@@ -1130,6 +1151,7 @@ def _l3_cost_payload_meta(
         "calib_hash": calibration_data_hash(runtime.l3_calib_ids),
         "l3_calib_hash": calibration_data_hash(runtime.l3_calib_ids),
         "kl_calib_hash": calibration_data_hash(runtime.calib_ids),
+        **_calibration_metadata(args),
         "selected_count": int(selected_count),
     }
     if extra:
@@ -1718,8 +1740,6 @@ def _apply_memory_aware_runtime_policy(args, stats: Mapping[str, Mapping], model
         or getattr(args, "resume_l3_costs_dir", None)
     )
     resume_locked_calibration = {
-        "n_calib_samples",
-        "calib_seqlen",
         "l3_n_calib_samples",
         "l3_calib_seqlen",
     }
@@ -1818,6 +1838,7 @@ def run_l3_interaction_refine(
         "lagrangian_bpp_penalty": float(
             getattr(args, "l3_interaction_lagrangian_bpp_penalty", 0.0)
         ),
+        "max_seconds": float(getattr(args, "l3_interaction_max_seconds", 600.0)),
     }
     if not meta["enabled"]:
         meta["skipped_reason"] = "disabled"
@@ -1934,7 +1955,22 @@ def run_l3_interaction_refine(
         f"measuring {len(overrides)} paired overrides"
     )
     pair_measure_start = time.monotonic()
+
+    class _InteractionTimeBudgetExceeded(RuntimeError):
+        pass
+
     def _interaction_progress(event: dict) -> None:
+        elapsed = time.monotonic() - pair_measure_start
+        max_seconds = float(getattr(args, "l3_interaction_max_seconds", 600.0))
+        if (
+            max_seconds > 0.0
+            and event.get("event") == "paired_override_chunk_start"
+            and elapsed >= max_seconds
+        ):
+            raise _InteractionTimeBudgetExceeded(
+                f"interaction refine exceeded {max_seconds:.1f}s before "
+                f"chunk {event.get('chunk_index')}"
+            )
         kind = event.get("event")
         if kind == "paired_override_chunk_start":
             emit(
@@ -1967,16 +2003,24 @@ def run_l3_interaction_refine(
             f"{prefix} interaction refine: memory-aware lane cap "
             f"{requested_pair_lanes}->{pair_lanes}"
         )
-    pair_kls = measure_override_paired_kl_deltas(
-        model,
-        base_assignment,
-        overrides,
-        calib_ids,
-        work_root=work_root,
-        max_lanes_per_batch=pair_lanes,
-        profile=profile,
-        progress_callback=_interaction_progress,
-    )
+    try:
+        pair_kls = measure_override_paired_kl_deltas(
+            model,
+            base_assignment,
+            overrides,
+            calib_ids,
+            work_root=work_root,
+            max_lanes_per_batch=pair_lanes,
+            profile=profile,
+            progress_callback=_interaction_progress,
+        )
+    except _InteractionTimeBudgetExceeded as exc:
+        pair_measure_seconds = time.monotonic() - pair_measure_start
+        meta["pair_measurement_seconds"] = float(pair_measure_seconds)
+        meta["stopped_reason"] = "time_budget_exceeded"
+        meta["skipped_reason"] = "time_budget_exceeded"
+        emit(f"{prefix} interaction refine: {exc}; returning additive candidate")
+        return dict(candidate_assignment), meta
     pair_measure_seconds = time.monotonic() - pair_measure_start
     meta["pair_measurement_seconds"] = float(pair_measure_seconds)
     emit(
@@ -4304,6 +4348,7 @@ def run_surrogate_knee_search(
         "layer_config": str(knee_layer_config_path),
         "format_histogram": frontier[knee_index]["format_histogram"],
     }
+    _warn_endpoint_fallback("knee-surrogate", knee)
     for row in frontier:
         row.pop("_assignment", None)
     csv_path, json_path = _write_surrogate_frontier_outputs(
@@ -4326,6 +4371,7 @@ def run_surrogate_knee_search(
             "formats": [s.name for s in specs],
             "bit_precision": float(args.bit_precision),
             "frozen_dp_budget_tolerance": float(args.frozen_dp_budget_tolerance),
+            **_calibration_metadata(args),
             "quality_note": (
                 "Surrogate losses are computed from one cached L3 cost table. "
                 "They rank candidate assignments but are not held-out KL."
@@ -5282,6 +5328,7 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
             "share_tolerance": float(args.target_bits_share_tolerance),
             "clusters": clusters,
             **_l3_scope_metadata(args),
+            **_calibration_metadata(args),
             "search_telemetry": str(_search_telemetry_path(args)),
         },
     )
@@ -5295,6 +5342,7 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
             "json": str(json_path),
             "search_telemetry": str(_search_telemetry_path(args)),
             **_l3_scope_metadata(args),
+            **_calibration_metadata(args),
             "points": [result.as_record() for result in results],
         }
     }
@@ -5416,6 +5464,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
                 "knee_tolerance": float(args.knee_tolerance),
                 "knee_seed_frontier": seed_meta,
                 **_l3_scope_metadata(args),
+                **_calibration_metadata(args),
             },
         )
         _phase_boundary_cleanup(f"knee_eval_{_bpp_label(float(bpp))}_complete")
@@ -5451,8 +5500,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             initial_points=int(args.knee_initial_points),
             initial_results=list(results_by_bpp.values()),
         )
-        if knee_meta.get("endpoint_fallback"):
-            _emit("[knee] warning: no interior validated knee found; using fallback")
+        _warn_endpoint_fallback("knee", knee_meta)
     csv_path, json_path = _write_pareto_outputs(
         runtime.output_root,
         results,
@@ -5463,6 +5511,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             "knee_tolerance": float(args.knee_tolerance),
             "knee_seed_frontier": seed_meta,
             **_l3_scope_metadata(args),
+            **_calibration_metadata(args),
         },
     )
     knee_assignment_path = runtime.output_root / "knee_assignment.json"
@@ -5479,6 +5528,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             "knee_tolerance": float(args.knee_tolerance),
             "knee_seed_frontier": seed_meta,
             **_l3_scope_metadata(args),
+            **_calibration_metadata(args),
             "points": [result.as_record() for result in results],
         },
         "knee": {
@@ -5784,6 +5834,7 @@ def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
         "layer_config": str(knee_layer_config_path),
         "format_histogram": chosen["format_histogram"],
     }
+    _warn_endpoint_fallback("validated-knee", knee)
     csv_path, json_path = _write_validated_frontier_outputs(
         runtime.output_root,
         candidates=candidates,
@@ -5798,6 +5849,7 @@ def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
             "included_assignments": list(
                 getattr(args, "knee_include_assignment", None) or []
             ),
+            **_calibration_metadata(args),
             "quality_note": (
                 "Kneedle is selected from real assignment KL measured on this "
                 "validation calibration set; surrogate losses are retained "
@@ -5901,6 +5953,7 @@ def run_quality_equivalent_search(args, runtime: BudgetRuntime) -> int:
             "evaluated_points": points,
             "knee_candidate": knee_meta,
             **_l3_scope_metadata(args),
+            **_calibration_metadata(args),
             "search_telemetry": str(_search_telemetry_path(args)),
         },
     )
@@ -5916,6 +5969,7 @@ def run_quality_equivalent_search(args, runtime: BudgetRuntime) -> int:
             "json": str(json_path),
             "search_telemetry": str(_search_telemetry_path(args)),
             **_l3_scope_metadata(args),
+            **_calibration_metadata(args),
             "points": [result.as_record() for result in results],
         },
         "quality_equivalent": {
@@ -6204,6 +6258,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     ap.add_argument(
+        "--allow-unsafe-surrogate-knee",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
         "--knee-surrogate-validation-candidates",
         type=int,
         default=9,
@@ -6244,6 +6303,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--input-rows", type=int, default=256)
     ap.add_argument("--n-calib-samples", type=int, default=8)
     ap.add_argument("--calib-seqlen", type=int, default=512)
+    ap.add_argument(
+        "--calib-split",
+        default="validation",
+        help=(
+            "Wikitext split used for measured KL scoring. Defaults to "
+            "validation so validation_kl is disjoint from L3 cost calibration."
+        ),
+    )
+    ap.add_argument(
+        "--calib-seed",
+        type=int,
+        default=4242,
+        help="Stable random seed for measured KL calibration windows.",
+    )
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--device-map", default=None)
     ap.add_argument("--dtype", default="bf16")
@@ -6325,6 +6398,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--l3-n-calib-samples", type=int, default=4)
     ap.add_argument("--l3-calib-seqlen", type=int, default=256)
+    ap.add_argument(
+        "--l3-calib-split",
+        default="train",
+        help="Wikitext split used for L3 propagated-cost candidate generation.",
+    )
+    ap.add_argument(
+        "--l3-calib-seed",
+        type=int,
+        default=42,
+        help="Stable random seed for L3 calibration windows.",
+    )
     ap.add_argument("--l3-regression-tolerance", type=float, default=0.0)
     ap.add_argument(
         "--l3-iter-max",
@@ -6469,6 +6553,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Cap paired override measurements for interaction refinement; "
             "0 means no explicit cap."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-max-seconds",
+        type=float,
+        default=600.0,
+        help=(
+            "Wall-time budget for sparse interaction-refine pair measurement. "
+            "Checked between chunks; <=0 disables the time cap."
         ),
     )
     ap.add_argument(
@@ -6642,6 +6735,12 @@ def main(argv: list[str] | None = None) -> int:
     specs = sorted(specs, key=lambda s: s.effective_bits)
     probe_load_timing = _phase_end("[init] probe load", probe_load_start)
     if args.knee_search and args.knee_surrogate:
+        if not args.knee_surrogate_validate and not args.allow_unsafe_surrogate_knee:
+            raise RuntimeError(
+                "--knee-surrogate writes a surrogate-only knee candidate. "
+                "Pass --knee-surrogate-validate to select the knee by real KL "
+                "or --allow-unsafe-surrogate-knee for diagnostic/internal use."
+            )
         run_surrogate_knee_search(
             args,
             stats=stats,
@@ -6676,17 +6775,23 @@ def main(argv: list[str] | None = None) -> int:
         tokenizer,
         args.n_calib_samples,
         args.calib_seqlen,
+        split=args.calib_split,
+        seed=args.calib_seed,
     )
     calib_ids = _prepare_kl_tensor_inputs(calib_ids, model_device)
     l3_calib_ids = calib_ids
     if args.l3_polish and (
         args.l3_n_calib_samples != args.n_calib_samples
         or args.l3_calib_seqlen != args.calib_seqlen
+        or args.l3_calib_split != args.calib_split
+        or int(args.l3_calib_seed) != int(args.calib_seed)
     ):
         l3_calib_ids = load_wikitext_calibration(
             tokenizer,
             args.l3_n_calib_samples,
             args.l3_calib_seqlen,
+            split=args.l3_calib_split,
+            seed=args.l3_calib_seed,
         )
         l3_calib_ids = _prepare_kl_tensor_inputs(l3_calib_ids, model_device)
     ref_log_probs = cache_reference_log_probs(model, calib_ids, model_device)

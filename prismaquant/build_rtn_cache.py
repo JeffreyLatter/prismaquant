@@ -279,16 +279,23 @@ def rtn_fp8_any_shape(tensor: torch.Tensor) -> torch.Tensor:
 # Calibration + KL measurement
 # ---------------------------------------------------------------------------
 
-def load_wikitext_calibration(tokenizer, n_samples: int, seqlen: int) -> torch.Tensor:
+def load_wikitext_calibration(
+    tokenizer,
+    n_samples: int,
+    seqlen: int,
+    *,
+    split: str = "train",
+    seed: int = 42,
+) -> torch.Tensor:
     from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
     text = "\n\n".join(row["text"] for row in ds if row["text"].strip())
     enc = tokenizer(text, return_tensors="pt", truncation=False).input_ids
     total = enc.size(1)
     max_start = total - seqlen
     import random
-    random.seed(42)
-    starts = random.sample(range(max_start), n_samples) if max_start >= n_samples else \
+    rng = random.Random(int(seed))
+    starts = rng.sample(range(max_start), n_samples) if max_start >= n_samples else \
              [i * (max_start // n_samples) for i in range(n_samples)]
     batches = torch.stack([enc[0, s:s + seqlen] for s in starts], dim=0)
     return batches
@@ -394,6 +401,8 @@ def main():
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--n-calib-samples", type=int, default=8)
     parser.add_argument("--calib-seqlen", type=int, default=512)
+    parser.add_argument("--calib-split", default="train")
+    parser.add_argument("--calib-seed", type=int, default=42)
     parser.add_argument("--chunk-size-gb", type=float, default=8.0,
                         help="Max size per safetensors shard (GB)")
     args = parser.parse_args()
@@ -413,7 +422,13 @@ def main():
         print(f"[rtn-cache]   {sum(p.numel() for p in model.parameters()):,} params", flush=True)
 
         # Stage 1: reference log probs
-        calib_ids = load_wikitext_calibration(tokenizer, args.n_calib_samples, args.calib_seqlen)
+        calib_ids = load_wikitext_calibration(
+            tokenizer,
+            args.n_calib_samples,
+            args.calib_seqlen,
+            split=args.calib_split,
+            seed=args.calib_seed,
+        )
         print(f"[rtn-cache] computing BF16 reference log_probs", flush=True)
         ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
 
