@@ -482,7 +482,7 @@ def test_select_l3_neighborhood_includes_confident_non_cheapest():
     assert all(entry.reasons == ("confident_non_cheapest",) for entry in selected)
 
 
-def test_select_l3_neighborhood_errors_on_packed_experts():
+def test_select_l3_neighborhood_excludes_packed_experts(capsys):
     packed = dict(_stat())
     packed.update({
         "num_experts": 4,
@@ -496,19 +496,42 @@ def test_select_l3_neighborhood_errors_on_packed_experts():
     assignment = {name: "MXFP8" for name in stats}
     costs = {name: _cost_table() for name in stats}
 
-    with pytest.raises(L3UnsupportedTargetError) as exc:
-        select_l3_neighborhood(
-            stats,
-            costs,
-            assignment,
-            _specs(),
-            min_fraction=1.0,
-            max_fraction=1.0,
-            safety_fraction=0.0,
-        )
+    selected = select_l3_neighborhood(
+        stats,
+        costs,
+        assignment,
+        _specs(),
+        min_fraction=1.0,
+        max_fraction=1.0,
+        safety_fraction=0.0,
+    )
+    out = capsys.readouterr().out
 
-    assert "model.layers.0.mlp.experts.gate_up_proj" in str(exc.value)
-    assert "L3 polish does not yet support packed expert tensors" in str(exc.value)
+    assert [entry.name for entry in selected] == ["model.layers.0.self_attn.q_proj"]
+    assert "model.layers.0.mlp.experts.gate_up_proj" in out
+    assert "packed MoE expert tensor" in out
+
+
+def test_global_l3_neighborhood_excludes_packed_experts(capsys):
+    packed = dict(_stat())
+    packed.update({
+        "num_experts": 4,
+        "_packed_experts_module": "model.layers.0.mlp.experts",
+        "_packed_param": "down_proj",
+    })
+    stats = {
+        "model.layers.0.mlp.experts.down_proj": packed,
+        "model.layers.0.self_attn.q_proj": _stat(),
+    }
+    assignment = {name: "MXFP8" for name in stats}
+    costs = {name: _cost_table() for name in stats}
+
+    selected = pc.build_global_l3_neighborhood(stats, costs, assignment, _specs())
+    out = capsys.readouterr().out
+
+    assert [entry.name for entry in selected] == ["model.layers.0.self_attn.q_proj"]
+    assert "model.layers.0.mlp.experts.down_proj" in out
+    assert "packed MoE expert tensor" in out
 
 
 def test_select_l3_neighborhood_passes_dense_only():

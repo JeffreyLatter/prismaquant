@@ -367,9 +367,41 @@ def _relative_margin(values: list[float], current_cost: float) -> float:
     return float(min(margins))
 
 
+def _l3_unsupported_reason(stats_entry: Mapping) -> str | None:
+    """Return why this probe entry is not currently L3-hookable."""
+    if _stats_indicates_packed_expert(dict(stats_entry)):
+        return (
+            "packed MoE expert tensor: L3 target hooks currently measure "
+            "nn.Linear modules only; packed experts remain L2-priced and "
+            "exportable"
+        )
+    return None
+
+
 def _is_l3_unsupported_target(stats_entry: Mapping) -> bool:
     """Return True for probe entries whose live module is not L3-hookable."""
-    return _stats_indicates_packed_expert(dict(stats_entry))
+    return _l3_unsupported_reason(stats_entry) is not None
+
+
+def _log_l3_exclusions(
+    excluded: Mapping[str, str],
+    *,
+    scope: str,
+) -> None:
+    if not excluded:
+        return
+    reason_counts: dict[str, int] = {}
+    for reason in excluded.values():
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    reason_text = "; ".join(
+        f"{count} x {reason}" for reason, count in sorted(reason_counts.items())
+    )
+    sample = sorted(excluded)[:5]
+    print(
+        f"[l3] excluded {len(excluded)} unsupported target(s) from {scope}: "
+        f"{reason_text}; sample={sample}",
+        flush=True,
+    )
 
 
 def _current_has_cheaper_available_format(
@@ -405,7 +437,12 @@ def select_l3_neighborhood(
 ) -> list[L3NeighborhoodEntry]:
     """Select the small L2 neighborhood that L3 is allowed to re-optimize."""
     eligible: list[L3NeighborhoodEntry] = []
+    excluded: dict[str, str] = {}
     for name in sorted(set(stats) & set(assignment)):
+        reason = _l3_unsupported_reason(stats[name])
+        if reason is not None:
+            excluded[name] = reason
+            continue
         current = fr.canonical_format_name(assignment[name])
         current_cost = l2_cost_value(stats, costs, name, current)
         if current_cost is None:
@@ -430,11 +467,12 @@ def select_l3_neighborhood(
                 l2_current_cost=current_cost,
             )
         )
+    _log_l3_exclusions(excluded, scope="bounded neighborhood selection")
 
     if not eligible:
         return []
 
-    total = len([name for name in assignment if name in stats])
+    total = len(eligible)
     max_count = max(1, int(math.ceil(total * max_fraction)))
     min_count = min(max_count, max(1, int(math.ceil(total * min_fraction))))
     safety_count = int(math.ceil(total * safety_fraction))
@@ -507,21 +545,6 @@ def select_l3_neighborhood(
 
     safety = sorted(eligible, key=lambda e: (-e.l2_current_cost, e.name))[:safety_count]
 
-    unsupported = sorted(
-        {
-            entry.name
-            for entry in (*confident_non_cheapest, *uncertain, *safety)
-            if _is_l3_unsupported_target(stats[entry.name])
-        }
-    )
-    if unsupported:
-        raise L3UnsupportedTargetError(
-            "L3 polish does not yet support packed expert tensors. "
-            f"Unsupported targets: {unsupported}. "
-            "Re-run without --l3-polish for L2-only allocation, or wait "
-            "for packed-expert L3 support."
-        )
-
     _add_until_full(confident_non_cheapest, "confident_non_cheapest")
     _add_until_full(uncertain, "uncertain")
     for entry in safety:
@@ -538,19 +561,6 @@ def select_l3_neighborhood(
             if len(by_name) >= min_count:
                 break
 
-    unsupported = sorted(
-        name
-        for name in by_name
-        if _is_l3_unsupported_target(stats[name])
-    )
-    if unsupported:
-        raise L3UnsupportedTargetError(
-            "L3 polish does not yet support packed expert tensors. "
-            f"Unsupported targets: {unsupported}. "
-            "Re-run without --l3-polish for L2-only allocation, or wait "
-            "for packed-expert L3 support."
-        )
-
     return sorted(by_name.values(), key=lambda e: e.name)
 
 
@@ -562,17 +572,18 @@ def build_global_l3_neighborhood(
 ) -> list[L3NeighborhoodEntry]:
     """Build an L3 measurement neighborhood covering every eligible Linear."""
     selected: list[L3NeighborhoodEntry] = []
-    unsupported: list[str] = []
+    excluded: dict[str, str] = {}
     for name in sorted(set(stats) & set(assignment)):
+        reason = _l3_unsupported_reason(stats[name])
+        if reason is not None:
+            excluded[name] = reason
+            continue
         current = fr.canonical_format_name(assignment[name])
         current_cost = l2_cost_value(stats, costs, name, current)
         if current_cost is None:
             continue
         fmts = select_formats_for_l3(stats, costs, assignment, name, specs)
         if not fmts:
-            continue
-        if _is_l3_unsupported_target(stats[name]):
-            unsupported.append(name)
             continue
         alt_costs = [
             value
@@ -591,13 +602,7 @@ def build_global_l3_neighborhood(
                 reasons=("global",),
             )
         )
-    if unsupported:
-        raise L3UnsupportedTargetError(
-            "L3 polish does not yet support packed expert tensors. "
-            f"Unsupported targets: {sorted(unsupported)}. "
-            "Re-run without --l3-polish for L2-only allocation, or wait "
-            "for packed-expert L3 support."
-        )
+    _log_l3_exclusions(excluded, scope="global selection")
     return selected
 
 

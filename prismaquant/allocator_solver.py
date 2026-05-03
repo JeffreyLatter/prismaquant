@@ -24,6 +24,9 @@ class Candidate:
 def _shape_from_stats(entry: dict) -> tuple[int, ...]:
     out_features = int(entry.get("out_features", 0) or 0)
     in_features = int(entry.get("in_features", 0) or 0)
+    num_experts = int(entry.get("num_experts", 0) or 0)
+    if num_experts > 0 and out_features > 0 and in_features > 0:
+        return (num_experts, out_features, in_features)
     if out_features > 0 and in_features > 0:
         return (out_features, in_features)
     n_params = int(entry.get("n_params", 0) or 0)

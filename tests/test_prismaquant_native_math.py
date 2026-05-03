@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
-from prismaquant.allocator import build_candidates
+from prismaquant.allocator import Candidate, build_candidates, filter_candidates_for_profile
 from prismaquant.calibrate_allocator import (
     install_activation_hooks,
     per_format_predicted_breakdown,
@@ -192,6 +192,44 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         self.assertAlmostEqual(by_fmt["NVFP4"].predicted_dloss, 7.0)
         self.assertAlmostEqual(by_fmt["MXFP4"].predicted_dloss, 2.0)
         self.assertAlmostEqual(by_fmt["BF16"].predicted_dloss, 0.5 * 3.0 * 0.25)
+        expected_nvfp4_bytes = fr.get_format("NVFP4").memory_bytes_for_shape(
+            (2, 8, 16)
+        )
+        self.assertEqual(by_fmt["NVFP4"].memory_bytes, expected_nvfp4_bytes)
+
+    def test_build_candidates_prices_packed_expert_memory_with_expert_dim(self):
+        name = "model.layers.0.mlp.experts.down_proj"
+        stats = {
+            name: {
+                "h_trace": 1.0,
+                "out_features": 8,
+                "in_features": 16,
+                "num_experts": 4,
+                "n_params": 4 * 8 * 16,
+                "_packed_experts_module": "model.layers.0.mlp.experts",
+                "_packed_param": "down_proj",
+            }
+        }
+        costs = {
+            name: {
+                "NVFP4": {"weight_mse": 0.1, "predicted_dloss": 0.1},
+                "BF16": {"weight_mse": 0.0, "predicted_dloss": 0.0},
+            }
+        }
+
+        cands = build_candidates(
+            stats, costs, [fr.get_format("NVFP4"), fr.get_format("BF16")]
+        )
+        by_fmt = {c.fmt: c for c in cands[name]}
+
+        self.assertEqual(
+            by_fmt["NVFP4"].memory_bytes,
+            fr.get_format("NVFP4").memory_bytes_for_shape((4, 8, 16)),
+        )
+        self.assertEqual(
+            by_fmt["BF16"].memory_bytes,
+            fr.get_format("BF16").memory_bytes_for_shape((4, 8, 16)),
+        )
 
     def test_calibration_breakdown_uses_allocator_candidate_basis(self):
         assignment = {
@@ -231,6 +269,35 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
 
         self.assertAlmostEqual(breakdown["NVFP4"], 0.5 * 2.0 * 0.25)
         self.assertAlmostEqual(breakdown["MXFP4"], 5.0)
+
+    def test_qwen_packed_moe_profile_allows_only_exportable_expert_formats(self):
+        name = "model.layers.0.mlp.experts.gate_up_proj"
+        candidates = {
+            name: [
+                Candidate("NVFP4", 4.5, 100, 1.0),
+                Candidate("MXFP8", 8.25, 180, 0.2),
+                Candidate("MXFP8_E4M3", 8.25, 180, 0.2),
+                Candidate("MXFP4", 4.25, 96, 0.9),
+                Candidate("FP8_E4M3", 8.5, 190, 0.1),
+                Candidate("BF16", 16.0, 512, 0.0),
+            ],
+            "model.layers.0.self_attn.q_proj": [
+                Candidate("MXFP4", 4.25, 96, 0.9),
+            ],
+        }
+
+        filtered = filter_candidates_for_profile(
+            candidates, "vllm_qwen3_5_packed_moe"
+        )
+
+        self.assertEqual(
+            [c.fmt for c in filtered[name]],
+            ["NVFP4", "MXFP8", "MXFP8_E4M3", "BF16"],
+        )
+        self.assertEqual(
+            [c.fmt for c in filtered["model.layers.0.self_attn.q_proj"]],
+            ["MXFP4"],
+        )
 
     def test_select_targets_returns_baseline_knee_high(self):
         curve = [
