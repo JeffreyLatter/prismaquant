@@ -3713,6 +3713,14 @@ def _warn_kneedle_instability(context: str, metadata: Mapping | None) -> None:
             f"(max_bpp_shift={float(diagnostic.get('max_bpp_shift', 0.0)):.4g}, "
             f"max_kl_shift={float(diagnostic.get('max_kl_shift', 0.0)):.4g})"
         )
+        guard = metadata.get("selection_guard")
+        if isinstance(guard, Mapping) and guard.get("applied"):
+            _emit(
+                f"[{context}] warning: selected best measured-KL frontier point "
+                f"target={float(guard.get('guarded_chosen_target_bpp', 0.0)):.4g} "
+                f"KL={float(guard.get('guarded_chosen_validation_kl', 0.0)):.4g} "
+                "because the geometric knee was unstable"
+            )
 
 
 def _linspace_bpp(lo: float, hi: float, count: int) -> list[float]:
@@ -3904,6 +3912,7 @@ def adaptive_validated_frontier_kneedle(
     initial_points: int = 9,
     initial_results: list[BudgetResult] | None = None,
     kl_noise_floor: float = DEFAULT_KNEE_KL_NOISE_FLOOR,
+    unstable_policy: str = "best-kl",
 ) -> tuple[BudgetResult, list[BudgetResult], dict]:
     """Search the kneedle on the real-KL Pareto envelope.
 
@@ -3918,6 +3927,7 @@ def adaptive_validated_frontier_kneedle(
     bpp_max = float(bpp_max)
     tolerance = max(float(tolerance), 0.0)
     kl_noise_floor = max(float(kl_noise_floor), 0.0)
+    unstable_policy = str(unstable_policy or "best-kl")
     seeded = 0
     for result in initial_results or []:
         key = round(float(result.target_bpp), 8)
@@ -4101,16 +4111,49 @@ def adaptive_validated_frontier_kneedle(
         bracket_width = _result_pair_width(bracket_pair, attr="achieved_bpp")
         target_bracket_width = _result_pair_width(bracket_pair, attr="target_bpp")
 
+    geometric_chosen = chosen
     loo_diagnostic = kneedle_leave_one_out_diagnostic(
         [
             (float(result.achieved_bpp), float(result.validation_kl))
             for result in frontier
         ],
-        float(chosen.achieved_bpp),
-        float(chosen.validation_kl),
+        float(geometric_chosen.achieved_bpp),
+        float(geometric_chosen.validation_kl),
         tolerance_bpp=float(tolerance),
         kl_noise_floor=float(kl_noise_floor),
     )
+    selection_guard = {
+        "policy": unstable_policy,
+        "applied": False,
+        "reason": "stable_or_disabled",
+    }
+    if (
+        unstable_policy == "best-kl"
+        and loo_diagnostic.get("enabled")
+        and not loo_diagnostic.get("stable", True)
+        and frontier
+    ):
+        best_kl = min(
+            frontier,
+            key=lambda result: (
+                float(result.validation_kl),
+                float(result.achieved_bpp),
+                float(result.target_bpp),
+            ),
+        )
+        if best_kl is not geometric_chosen:
+            chosen = best_kl
+            selection_guard = {
+                "policy": unstable_policy,
+                "applied": True,
+                "reason": "leave_one_out_unstable",
+                "geometric_chosen_target_bpp": float(geometric_chosen.target_bpp),
+                "geometric_chosen_achieved_bpp": float(geometric_chosen.achieved_bpp),
+                "geometric_chosen_validation_kl": float(geometric_chosen.validation_kl),
+                "guarded_chosen_target_bpp": float(chosen.target_bpp),
+                "guarded_chosen_achieved_bpp": float(chosen.achieved_bpp),
+                "guarded_chosen_validation_kl": float(chosen.validation_kl),
+            }
 
     return chosen, results, {
         "mode": "validated_frontier_kneedle",
@@ -4130,6 +4173,7 @@ def adaptive_validated_frontier_kneedle(
         "knee_tolerance_bpp": float(tolerance),
         "knee_kl_noise_floor": float(kl_noise_floor),
         "leave_one_out": loo_diagnostic,
+        "selection_guard": selection_guard,
         "initial_points": int(initial_points),
         "seeded_evaluations": int(seeded),
         "evaluations": len(results),
@@ -5624,6 +5668,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             initial_points=int(args.knee_initial_points),
             initial_results=list(results_by_bpp.values()),
             kl_noise_floor=float(kl_noise_floor),
+            unstable_policy=str(getattr(args, "knee_unstable_policy", "best-kl")),
         )
         _warn_endpoint_fallback("knee", knee_meta)
         _warn_kneedle_instability("knee", knee_meta)
@@ -5790,6 +5835,7 @@ def _write_validated_frontier_outputs(
 
 def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
     kl_noise_floor = _knee_kl_noise_floor(args)
+    unstable_policy = str(getattr(args, "knee_unstable_policy", "best-kl"))
     frontier_path = runtime.output_root / "surrogate_frontier.json"
     if not frontier_path.exists():
         raise RuntimeError(
@@ -5951,16 +5997,49 @@ def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
                 abs(float(row["validation_kl"]) - float(knee_kl)),
             ),
         )
+    geometric_chosen = chosen
     loo_diagnostic = kneedle_leave_one_out_diagnostic(
         [
             (float(row["achieved_bpp"]), float(row["validation_kl"]))
             for row in validated_frontier
         ],
-        float(chosen["achieved_bpp"]),
-        float(chosen["validation_kl"]),
+        float(geometric_chosen["achieved_bpp"]),
+        float(geometric_chosen["validation_kl"]),
         tolerance_bpp=float(getattr(args, "knee_tolerance", 0.1)),
         kl_noise_floor=float(kl_noise_floor),
     )
+    selection_guard = {
+        "policy": unstable_policy,
+        "applied": False,
+        "reason": "stable_or_disabled",
+    }
+    if (
+        unstable_policy == "best-kl"
+        and loo_diagnostic.get("enabled")
+        and not loo_diagnostic.get("stable", True)
+        and validated_frontier
+    ):
+        best_kl = min(
+            validated_frontier,
+            key=lambda row: (
+                float(row["validation_kl"]),
+                float(row["achieved_bpp"]),
+                float(row.get("target_bpp") or row["achieved_bpp"]),
+            ),
+        )
+        if best_kl is not geometric_chosen:
+            chosen = best_kl
+            selection_guard = {
+                "policy": unstable_policy,
+                "applied": True,
+                "reason": "leave_one_out_unstable",
+                "geometric_chosen_target_bpp": geometric_chosen.get("target_bpp"),
+                "geometric_chosen_achieved_bpp": float(geometric_chosen["achieved_bpp"]),
+                "geometric_chosen_validation_kl": float(geometric_chosen["validation_kl"]),
+                "guarded_chosen_target_bpp": chosen.get("target_bpp"),
+                "guarded_chosen_achieved_bpp": float(chosen["achieved_bpp"]),
+                "guarded_chosen_validation_kl": float(chosen["validation_kl"]),
+            }
     assignment = _load_assignment_json(chosen["assignment_path"])
     knee_assignment_path, knee_layer_config_path = _write_named_assignment_artifacts(
         assignment,
@@ -5978,6 +6057,7 @@ def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
         "endpoint_fallback": bool(endpoint),
         "knee_kl_noise_floor": float(kl_noise_floor),
         "leave_one_out": loo_diagnostic,
+        "selection_guard": selection_guard,
         "assignment": str(knee_assignment_path),
         "layer_config": str(knee_layer_config_path),
         "format_histogram": chosen["format_histogram"],
@@ -6360,6 +6440,16 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Measured-KL improvement required before a higher-bpp point "
             "extends the nondominated knee frontier."
+        ),
+    )
+    ap.add_argument(
+        "--knee-unstable-policy",
+        choices=["best-kl", "warn"],
+        default="best-kl",
+        help=(
+            "Policy when leave-one-out diagnostics show an unstable geometric "
+            "knee. best-kl selects the lowest measured-KL frontier point; "
+            "warn keeps the geometric knee and only records the warning."
         ),
     )
     ap.add_argument("--knee-max-evaluations", type=int, default=12)

@@ -3006,6 +3006,122 @@ def test_kneedle_leave_one_out_diagnostic_flags_unstable():
     assert diagnostic["max_kl_shift"] == pytest.approx(0.05)
 
 
+def test_validated_frontier_kneedle_quality_guard_selects_best_kl(tmp_path):
+    initial_results = [
+        _dummy_budget_result(
+            5.0625,
+            5.31,
+            tmp_path,
+            validation_kl=0.020272708032280207,
+            achieved_bpp=5.076189995966115,
+            accepted=False,
+        ),
+        _dummy_budget_result(
+            5.1,
+            5.31,
+            tmp_path,
+            validation_kl=0.020065429194801254,
+            achieved_bpp=5.116327148043566,
+            accepted=False,
+        ),
+        _dummy_budget_result(
+            5.175,
+            5.17,
+            tmp_path,
+            validation_kl=0.01953181641874835,
+            achieved_bpp=5.277027027027027,
+        ),
+        _dummy_budget_result(
+            5.3117184348527635,
+            5.3117184348527635,
+            tmp_path,
+            validation_kl=0.015127555539947934,
+            achieved_bpp=5.3117184348527635,
+        ),
+        _dummy_budget_result(
+            5.3,
+            5.3117184348527635,
+            tmp_path,
+            validation_kl=0.013117771479301155,
+            achieved_bpp=5.323416700282372,
+        ),
+    ]
+
+    def _unexpected(_bpp):
+        raise AssertionError("seeded frontier should be sufficient")
+
+    chosen, _results, meta = ipa.adaptive_validated_frontier_kneedle(
+        _unexpected,
+        5.05,
+        5.55,
+        tolerance=0.02,
+        max_evaluations=len(initial_results),
+        initial_points=len(initial_results),
+        initial_results=initial_results,
+    )
+
+    assert chosen.target_bpp == pytest.approx(5.3)
+    assert chosen.validation_kl == pytest.approx(0.013117771479301155)
+    assert meta["selection_guard"]["applied"] is True
+    assert meta["selection_guard"]["geometric_chosen_target_bpp"] == pytest.approx(
+        5.175
+    )
+
+
+def test_validated_frontier_kneedle_warn_policy_keeps_geometric_knee(tmp_path):
+    initial_results = [
+        _dummy_budget_result(
+            5.0625,
+            5.31,
+            tmp_path,
+            validation_kl=0.020272708032280207,
+            achieved_bpp=5.076189995966115,
+        ),
+        _dummy_budget_result(
+            5.1,
+            5.31,
+            tmp_path,
+            validation_kl=0.020065429194801254,
+            achieved_bpp=5.116327148043566,
+        ),
+        _dummy_budget_result(
+            5.175,
+            5.17,
+            tmp_path,
+            validation_kl=0.01953181641874835,
+            achieved_bpp=5.277027027027027,
+        ),
+        _dummy_budget_result(
+            5.3117184348527635,
+            5.3117184348527635,
+            tmp_path,
+            validation_kl=0.015127555539947934,
+            achieved_bpp=5.3117184348527635,
+        ),
+        _dummy_budget_result(
+            5.3,
+            5.3117184348527635,
+            tmp_path,
+            validation_kl=0.013117771479301155,
+            achieved_bpp=5.323416700282372,
+        ),
+    ]
+
+    chosen, _results, meta = ipa.adaptive_validated_frontier_kneedle(
+        lambda _bpp: (_ for _ in ()).throw(AssertionError("unexpected eval")),
+        5.05,
+        5.55,
+        tolerance=0.02,
+        max_evaluations=len(initial_results),
+        initial_points=len(initial_results),
+        initial_results=initial_results,
+        unstable_policy="warn",
+    )
+
+    assert chosen.target_bpp == pytest.approx(5.175)
+    assert meta["selection_guard"]["applied"] is False
+
+
 def test_validated_frontier_kneedle_discards_empirically_dominated_points(tmp_path):
     # Higher-bpp probes can be worse when the allocator lands in a bad local
     # solution. The validated frontier search must not let those points define
