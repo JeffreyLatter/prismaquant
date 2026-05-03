@@ -1428,6 +1428,63 @@ def test_l3_validation_scout_commits_best_validated_flip(tmp_path, monkeypatch):
     assert all(record["target_bpp"] == pytest.approx(16.0) for record in records)
 
 
+def test_l3_fixed_point_remeasurement_gates_validation_scout(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(2)}
+    specs = [ipa.fr.get_format("INT8_W8A16"), ipa.fr.get_format("BF16")]
+    assignment = {"layer0": "INT8_W8A16", "layer1": "INT8_W8A16"}
+    l3_costs = {
+        "layer0": {
+            "INT8_W8A16": {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer1": {
+            "INT8_W8A16": {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 0.5},
+        },
+    }
+
+    def _same_assignment(*_args, **_kwargs):
+        return dict(assignment), [], {"frozen_dp_precision_used": 0.001}
+
+    def _remeasured_kl(_model, measured_assignment, *_args, **_kwargs):
+        assert measured_assignment == assignment
+        return 0.5
+
+    def _scout_measure(_model, _assignment, flips, *_args, **_kwargs):
+        assert flips == [("layer0", "BF16")]
+        return [0.75]
+
+    monkeypatch.setattr(ipa, "_solve_l3_candidates_with_hamming_cap", _same_assignment)
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _remeasured_kl)
+    monkeypatch.setattr(ipa, "measure_lane_batched_kl_deltas", _scout_measure)
+
+    result = ipa.run_iterated_l3_polish(
+        _iterated_l3_args(
+            l3_iter_max=1,
+            l3_validation_scout=True,
+            l3_validation_scout_max_candidates=1,
+        ),
+        _TinyLogitsModel(),
+        assignment,
+        1.0,
+        stats,
+        l3_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        work_root=tmp_path,
+        initial_l3_costs=l3_costs,
+    )
+
+    assert result.final_kl == pytest.approx(0.5)
+    assert result.assignment == assignment
+    assert result.validation_scout["flips_committed"] == 0
+    assert result.validation_scout["stopped_reason"] == "no_validated_improvement"
+    assert result.iterations[0]["termination"] == "fixed_point"
+
+
 def test_l3_validation_scout_samples_unrepresented_rank_buckets():
     rows = [
         {

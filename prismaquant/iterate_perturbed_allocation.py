@@ -3569,6 +3569,8 @@ def run_iterated_l3_polish(
             termination = "rollback"
             break
         if candidate_hamming == 0:
+            current_kl = float(candidate_kl)
+            l3_assignment = dict(candidate_assignment)
             termination = "fixed_point"
             break
         if candidate_hash in seen_hashes:
