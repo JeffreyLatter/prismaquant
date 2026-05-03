@@ -2505,16 +2505,19 @@ def _dummy_budget_result(
     *,
     l2_kl=0.25,
     validation_kl=None,
+    achieved_bpp=None,
     accepted=True,
 ):
     if validation_kl is None:
         validation_kl = 1.0 / float(target_bpp)
+    if achieved_bpp is None:
+        achieved_bpp = target_bpp
     return ipa.BudgetResult(
         target_bpp=float(target_bpp),
         anchor_bpp=float(anchor_bpp),
         distance_from_anchor=abs(float(target_bpp) - float(anchor_bpp)),
         anchor_stale=target_bpp != anchor_bpp,
-        achieved_bpp=float(target_bpp),
+        achieved_bpp=float(achieved_bpp),
         predicted_dloss=0.1,
         l2_kl=float(l2_kl),
         validation_kl=float(validation_kl),
@@ -2849,6 +2852,198 @@ def test_knee_search_max_evaluations_stop():
 
     assert calls["n"] == 4
     assert len(points) == 4
+
+
+def test_validated_frontier_kneedle_discards_empirically_dominated_points(tmp_path):
+    # Higher-bpp probes can be worse when the allocator lands in a bad local
+    # solution. The validated frontier search must not let those points define
+    # the knee.
+    kl_by_target = {
+        4.0: 0.20,
+        4.5: 0.15,
+        5.0: 0.08,
+        5.5: 0.015,
+        6.0: 0.060,
+        6.5: 0.050,
+        7.0: 0.040,
+        7.5: 0.035,
+        8.0: 0.030,
+    }
+
+    def _evaluate(bpp):
+        target = round(float(bpp), 1)
+        achieved = 5.31 if target == 5.5 else target
+        return _dummy_budget_result(
+            target,
+            target,
+            tmp_path,
+            validation_kl=kl_by_target[target],
+            achieved_bpp=achieved,
+        )
+
+    chosen, _results, meta = ipa.adaptive_validated_frontier_kneedle(
+        _evaluate,
+        4.0,
+        8.0,
+        tolerance=0.25,
+        max_evaluations=9,
+        initial_points=9,
+    )
+
+    assert meta["mode"] == "validated_frontier_kneedle"
+    assert chosen.achieved_bpp <= 5.31
+    assert all(
+        point["achieved_bpp"] <= 5.31
+        for point in meta["frontier_points"]
+    )
+
+
+def test_knee_search_uses_validated_frontier_metadata(tmp_path, monkeypatch):
+    def _anchor(_args, _runtime, anchor_bpp, *, measure_all_formats=False):
+        return SimpleNamespace(anchor_bpp=float(anchor_bpp))
+
+    def _single(_args, target_bits, reusable_anchor=None):
+        kl_by_target = {
+            4.0: 0.20,
+            5.0: 0.08,
+            6.0: 0.06,
+            7.0: 0.04,
+            8.0: 0.03,
+        }
+        target = round(float(target_bits), 1)
+        return _dummy_budget_result(
+            target,
+            reusable_anchor.anchor_bpp,
+            tmp_path,
+            validation_kl=kl_by_target[target],
+        )
+
+    monkeypatch.setattr(ipa, "run_anchor_budget", _anchor)
+    monkeypatch.setattr(ipa, "run_single_budget", _single)
+    args = SimpleNamespace(
+        knee_mode="kneedle",
+        knee_bpp_min=4.0,
+        knee_bpp_max=8.0,
+        knee_tolerance=0.25,
+        knee_max_evaluations=5,
+        knee_initial_points=5,
+        target_bits_share_tolerance=0.25,
+        l3_measure_all_formats=False,
+    )
+
+    assert ipa.run_knee_search(args, SimpleNamespace(output_root=tmp_path)) == 0
+
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["knee"]["mode"] == "validated_frontier_kneedle"
+    assert summary["knee"]["chosen_achieved_bpp"] == pytest.approx(
+        summary["knee"]["chosen_bpp"]
+    )
+    assert summary["knee"]["frontier_points"]
+
+
+def test_knee_search_reuses_seed_frontier_without_remeasurement(tmp_path, monkeypatch):
+    stats = {
+        f"layer{i}": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for i in range(3)
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    assignments = [
+        {"layer0": "NVFP4", "layer1": "NVFP4", "layer2": "NVFP4"},
+        {"layer0": "BF16", "layer1": "NVFP4", "layer2": "NVFP4"},
+        {"layer0": "BF16", "layer1": "BF16", "layer2": "NVFP4"},
+    ]
+    rows = []
+    for idx, (target, kl, assignment) in enumerate(
+        zip((4.0, 6.0, 8.0), (0.20, 0.05, 0.03), assignments)
+    ):
+        assignment_path = tmp_path / f"seed_assignment_{idx}.json"
+        assignment_path.write_text(json.dumps(assignment))
+        rows.append(
+            {
+                "target_bpp": target,
+                "achieved_bpp": target,
+                "validation_kl": kl,
+                "assignment_path": str(assignment_path),
+            }
+        )
+    seed_path = tmp_path / "validated_frontier.json"
+    seed_path.write_text(json.dumps({"validated_candidates": rows}))
+
+    def _unexpected_anchor(*_args, **_kwargs):
+        raise AssertionError("seeded knee search should not measure new points")
+
+    monkeypatch.setattr(ipa, "run_anchor_budget", _unexpected_anchor)
+    args = SimpleNamespace(
+        knee_mode="kneedle",
+        knee_bpp_min=4.0,
+        knee_bpp_max=8.0,
+        knee_tolerance=0.25,
+        knee_max_evaluations=3,
+        knee_initial_points=3,
+        knee_seed_frontier=[str(seed_path)],
+        target_bits_share_tolerance=0.25,
+        l3_measure_all_formats=False,
+    )
+
+    assert ipa.run_knee_search(
+        args,
+        SimpleNamespace(output_root=tmp_path / "out", stats=stats, specs=specs),
+    ) == 0
+
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert summary["knee"]["seeded_evaluations"] == 3
+    assert summary["knee"]["evaluations"] == 3
+    assert summary["pareto"]["knee_seed_frontier"]["loaded"] == 3
+
+
+def test_knee_checkpoint_frontier_can_seed_search(tmp_path):
+    stats = {"layer": _tiny_stat()}
+    specs = [ipa.fr.get_format("BF16")]
+    assignment = {"layer": "BF16"}
+    assignment_path, layer_config_path = ipa._write_budget_artifacts(
+        tmp_path,
+        "5.00",
+        assignment,
+    )
+    histogram = ipa._format_histogram(stats, assignment, specs, 5.0)
+    result = ipa.BudgetResult(
+        target_bpp=5.0,
+        anchor_bpp=5.0,
+        distance_from_anchor=0.0,
+        anchor_stale=False,
+        achieved_bpp=float(histogram["achieved_bpp"]),
+        predicted_dloss=0.0,
+        l2_kl=0.02,
+        validation_kl=0.01,
+        accepted=True,
+        regression=False,
+        flips_accepted=1,
+        format_histogram=histogram,
+        assignment=assignment,
+        assignment_path=str(assignment_path),
+        layer_config_path=str(layer_config_path),
+    )
+    checkpoint_path = ipa._write_knee_checkpoint_point(
+        tmp_path / "out",
+        result,
+        source="unit_test",
+        metadata={"round": 1},
+    )
+
+    seeds, meta = ipa._load_knee_seed_results(
+        SimpleNamespace(knee_seed_frontier=[str(checkpoint_path)]),
+        SimpleNamespace(output_root=tmp_path / "fresh", stats=stats, specs=specs),
+    )
+
+    assert meta["loaded"] == 1
+    assert len(seeds) == 1
+    assert seeds[0].validation_kl == pytest.approx(0.01)
+    assert seeds[0].assignment == assignment
 
 
 def test_quality_equivalent_search_finds_lowest_matching_bpp(tmp_path, monkeypatch):

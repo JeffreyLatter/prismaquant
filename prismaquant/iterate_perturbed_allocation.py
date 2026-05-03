@@ -828,6 +828,7 @@ class BudgetResult:
     format_histogram: dict
     assignment: dict[str, str]
     layer_config_path: str
+    assignment_path: str = ""
     l3_iterations: int = 0
     coord_descent_fired: bool = False
     coord_descent_flips: int = 0
@@ -846,6 +847,7 @@ class BudgetResult:
             "regression": self.regression,
             "flips_accepted": self.flips_accepted,
             "format_histogram": self.format_histogram,
+            "assignment_path": self.assignment_path,
             "layer_config_path": self.layer_config_path,
             "l3_iterations": self.l3_iterations,
             "coord_descent_fired": self.coord_descent_fired,
@@ -2305,6 +2307,7 @@ def run_l3_validation_scout(
     profile=None,
     emit: Callable[[str], None] | None = _emit,
     prefix: str = "[l3]",
+    checkpoint_callback: Callable[[Mapping[str, str], float, dict], None] | None = None,
 ) -> tuple[dict[str, str], float, dict]:
     meta = {
         "enabled": _l3_validation_scout_enabled(args),
@@ -2334,6 +2337,11 @@ def run_l3_validation_scout(
         requested_lanes_per_batch,
         phase="scout",
     )
+    scout_lane_cap = max(
+        int(getattr(args, "l3_validation_scout_max_lanes_per_batch", 1)),
+        1,
+    )
+    lanes_per_batch = min(lanes_per_batch, scout_lane_cap)
     min_improvement = max(
         float(getattr(args, "l3_validation_scout_min_improvement", 0.0)),
         0.0,
@@ -2414,16 +2422,29 @@ def run_l3_validation_scout(
                     f"{prefix} validation scout: round {round_idx} "
                     f"chunk {chunk_index} start lanes={len(chunk)}"
                 )
-            measured_kls = measure_lane_batched_kl_deltas(
-                model,
-                assignment,
-                flips,
-                calib_ids,
-                ref_log_probs,
-                work_root=work_root,
-                max_lanes_per_batch=lanes_per_batch,
-                profile=profile,
-            )
+            graph_env_name = "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS"
+            old_graph_env = os.environ.get(graph_env_name)
+            if not bool(getattr(args, "l3_validation_scout_cuda_graphs", False)):
+                os.environ[graph_env_name] = "0"
+            try:
+                measured_kls = measure_lane_batched_kl_deltas(
+                    model,
+                    assignment,
+                    flips,
+                    calib_ids,
+                    ref_log_probs,
+                    work_root=work_root,
+                    max_lanes_per_batch=lanes_per_batch,
+                    profile=profile,
+                )
+            finally:
+                if old_graph_env is None:
+                    os.environ.pop(graph_env_name, None)
+                else:
+                    os.environ[graph_env_name] = old_graph_env
+                _phase_boundary_cleanup(
+                    f"{prefix} validation_scout_round_{round_idx}_chunk_{chunk_index}"
+                )
             elapsed = time.monotonic() - chunk_start
             seconds_per_candidate = elapsed / max(len(chunk), 1)
             for row, trial_kl_raw in zip(chunk, measured_kls):
@@ -2506,24 +2527,31 @@ def run_l3_validation_scout(
         bits_before, bpp_before = _assignment_bits_bpp(stats, assignment, specs)
         meta["flips_committed"] += 1
         meta["stopped_reason"] = "max_rounds"
-        _append_search_telemetry(
-            args,
-            {
-                "event": "validation_scout_commit",
-                "candidate_source": "l3_ranked_unary",
-                "prefix": prefix,
-                "round": round_idx,
-                "target_bpp": float(target_bpp),
-                "name": best_row["name"],
-                "from_format": old_fmt,
-                "to_format": best_row["to_format"],
-                "kl_before": float(old_kl),
-                "kl_after": float(kl),
-                "gain_kl": float(best_gain),
-                "assignment_hash_after": _assignment_digest(assignment),
-                "bpp_after": float(bpp_before),
-            },
-        )
+        commit_record = {
+            "event": "validation_scout_commit",
+            "candidate_source": "l3_ranked_unary",
+            "prefix": prefix,
+            "round": round_idx,
+            "target_bpp": float(target_bpp),
+            "name": best_row["name"],
+            "from_format": old_fmt,
+            "to_format": best_row["to_format"],
+            "kl_before": float(old_kl),
+            "kl_after": float(kl),
+            "gain_kl": float(best_gain),
+            "assignment_hash_after": _assignment_digest(assignment),
+            "bpp_after": float(bpp_before),
+        }
+        _append_search_telemetry(args, commit_record)
+        if checkpoint_callback is not None:
+            try:
+                checkpoint_callback(dict(assignment), float(kl), dict(commit_record))
+            except Exception as exc:
+                if emit is not None:
+                    emit(
+                        f"{prefix} validation scout: checkpoint failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
         if emit is not None:
             emit(
                 f"{prefix} validation scout COMMIT: {best_row['name']}."
@@ -3040,6 +3068,7 @@ def run_iterated_l3_polish(
     initial_l3_costs: dict | None = None,
     resume_l3_cost_history: list[dict] | None = None,
     coord_anchor_label: str | None = None,
+    scout_checkpoint_callback: Callable[[Mapping[str, str], float, dict], None] | None = None,
 ) -> L3PolishRun:
     l3_assignment = dict(initial_assignment)
     current_kl = float(initial_kl)
@@ -3323,6 +3352,7 @@ def run_iterated_l3_polish(
             profile=profile,
             emit=emit,
             prefix=prefix,
+            checkpoint_callback=scout_checkpoint_callback,
         )
         validation_seconds += time.monotonic() - scout_start
         if scout_meta.get("flips_committed"):
@@ -3542,6 +3572,407 @@ def knee_candidate_from_points(points: list[tuple[float, float]]) -> dict | None
         "validation_kl": float(knee_kl),
         "kneedle_score": float(score),
         "endpoint_fallback": bool(endpoint),
+    }
+
+
+def _linspace_bpp(lo: float, hi: float, count: int) -> list[float]:
+    count = max(int(count), 1)
+    if count == 1:
+        return [round((float(lo) + float(hi)) / 2.0, 8)]
+    return [
+        round(float(lo) + (float(hi) - float(lo)) * idx / float(count - 1), 8)
+        for idx in range(count)
+    ]
+
+
+def _nondominated_budget_results(results: list[BudgetResult]) -> list[BudgetResult]:
+    ordered = sorted(
+        results,
+        key=lambda result: (
+            float(result.achieved_bpp),
+            float(result.validation_kl),
+            float(result.target_bpp),
+        ),
+    )
+    frontier: list[BudgetResult] = []
+    best_kl = float("inf")
+    for result in ordered:
+        kl = float(result.validation_kl)
+        if kl < best_kl - 1e-12:
+            frontier.append(result)
+            best_kl = kl
+    return frontier
+
+
+def _result_attr(result: BudgetResult, attr: str) -> float:
+    return float(getattr(result, attr))
+
+
+def _bracketing_result_pair(
+    results: list[BudgetResult],
+    value: float,
+    *,
+    attr: str,
+) -> tuple[BudgetResult, BudgetResult] | None:
+    ordered = sorted(results, key=lambda result: (_result_attr(result, attr), result.target_bpp))
+    if len(ordered) < 2:
+        return None
+    value = float(value)
+    for left, right in zip(ordered, ordered[1:]):
+        if (
+            _result_attr(left, attr) <= value + 1e-12
+            and value <= _result_attr(right, attr) + 1e-12
+        ):
+            return left, right
+    if value < _result_attr(ordered[0], attr):
+        return ordered[0], ordered[1]
+    return ordered[-2], ordered[-1]
+
+
+def _neighbor_result_pairs(
+    results: list[BudgetResult],
+    center: BudgetResult,
+    *,
+    attr: str = "target_bpp",
+) -> list[tuple[BudgetResult, BudgetResult]]:
+    ordered = sorted(results, key=lambda result: (_result_attr(result, attr), result.achieved_bpp))
+    center_digest = _assignment_digest(center.assignment)
+    center_index = None
+    for idx, result in enumerate(ordered):
+        if result is center or (
+            round(result.target_bpp, 8) == round(center.target_bpp, 8)
+            and _assignment_digest(result.assignment) == center_digest
+        ):
+            center_index = idx
+            break
+    if center_index is None:
+        return []
+    pairs: list[tuple[BudgetResult, BudgetResult]] = []
+    if center_index > 0:
+        pairs.append((ordered[center_index - 1], ordered[center_index]))
+    if center_index + 1 < len(ordered):
+        pairs.append((ordered[center_index], ordered[center_index + 1]))
+    return pairs
+
+
+def _result_pair_width(
+    pair: tuple[BudgetResult, BudgetResult] | None,
+    *,
+    attr: str,
+) -> float | None:
+    if pair is None:
+        return None
+    return abs(_result_attr(pair[1], attr) - _result_attr(pair[0], attr))
+
+
+def _next_target_between_results(
+    pair: tuple[BudgetResult, BudgetResult] | None,
+    evaluated_targets: set[float],
+    *,
+    bpp_min: float,
+    bpp_max: float,
+) -> float | None:
+    if pair is None:
+        return None
+    target_interval = (
+        float(pair[0].target_bpp),
+        float(pair[1].target_bpp),
+    )
+    candidate = _next_midpoint_target(
+        target_interval,
+        evaluated_targets,
+        bpp_min=bpp_min,
+        bpp_max=bpp_max,
+    )
+    if candidate is not None:
+        return candidate
+    achieved_interval = (
+        float(pair[0].achieved_bpp),
+        float(pair[1].achieved_bpp),
+    )
+    return _next_midpoint_target(
+        achieved_interval,
+        evaluated_targets,
+        bpp_min=bpp_min,
+        bpp_max=bpp_max,
+    )
+
+
+def _widest_pair(
+    pairs: list[tuple[BudgetResult, BudgetResult]],
+) -> tuple[BudgetResult, BudgetResult] | None:
+    if not pairs:
+        return None
+    return max(
+        pairs,
+        key=lambda pair: (
+            _result_pair_width(pair, attr="achieved_bpp") or 0.0,
+            _result_pair_width(pair, attr="target_bpp") or 0.0,
+        ),
+    )
+
+
+def _largest_adjacent_gap(values: list[float]) -> tuple[float, float] | None:
+    ordered = sorted({round(float(value), 8) for value in values})
+    if len(ordered) < 2:
+        return None
+    left, right = max(
+        zip(ordered, ordered[1:]),
+        key=lambda pair: (pair[1] - pair[0], -pair[0]),
+    )
+    return float(left), float(right)
+
+
+def _next_midpoint_target(
+    interval: tuple[float, float] | None,
+    evaluated_targets: set[float],
+    *,
+    bpp_min: float,
+    bpp_max: float,
+) -> float | None:
+    if interval is None:
+        return None
+    left, right = sorted((float(interval[0]), float(interval[1])))
+    left = max(float(bpp_min), left)
+    right = min(float(bpp_max), right)
+    if right - left <= 1e-12:
+        return None
+    fractions = (0.5, 1.0 / 3.0, 2.0 / 3.0, 0.25, 0.75)
+    for frac in fractions:
+        candidate = round(left + (right - left) * frac, 8)
+        if candidate <= float(bpp_min) - 1e-12:
+            continue
+        if candidate >= float(bpp_max) + 1e-12:
+            continue
+        if candidate not in evaluated_targets:
+            return candidate
+    return None
+
+
+def adaptive_validated_frontier_kneedle(
+    evaluator: Callable[[float], BudgetResult],
+    bpp_min: float,
+    bpp_max: float,
+    *,
+    tolerance: float,
+    max_evaluations: int,
+    initial_points: int = 9,
+    initial_results: list[BudgetResult] | None = None,
+) -> tuple[BudgetResult, list[BudgetResult], dict]:
+    """Search the kneedle on the real-KL Pareto envelope.
+
+    Target bpps are only probes. Selection and refinement use achieved bpp and
+    validation KL, then discard empirically dominated points before applying
+    kneedle geometry.
+    """
+    evaluated: dict[float, BudgetResult] = {}
+    max_evaluations = max(int(max_evaluations), 3)
+    initial_points = min(max(int(initial_points), 3), max_evaluations)
+    bpp_min = float(bpp_min)
+    bpp_max = float(bpp_max)
+    tolerance = max(float(tolerance), 0.0)
+    seeded = 0
+    for result in initial_results or []:
+        key = round(float(result.target_bpp), 8)
+        previous = evaluated.get(key)
+        if previous is None or (
+            float(result.validation_kl),
+            float(result.achieved_bpp),
+        ) < (
+            float(previous.validation_kl),
+            float(previous.achieved_bpp),
+        ):
+            evaluated[key] = result
+        seeded += 1
+
+    def eval_once(x: float) -> BudgetResult:
+        target = min(max(float(x), bpp_min), bpp_max)
+        key = round(target, 8)
+        if key not in evaluated:
+            evaluated[key] = evaluator(target)
+        return evaluated[key]
+
+    for point in _linspace_bpp(bpp_min, bpp_max, initial_points):
+        if len(evaluated) >= max_evaluations:
+            break
+        eval_once(point)
+
+    termination = "max_evaluations"
+    knee_score = 0.0
+    endpoint = True
+    bracket_width: float | None = None
+    target_bracket_width: float | None = None
+    knee_bpp: float | None = None
+    knee_kl: float | None = None
+    chosen: BudgetResult | None = None
+
+    while len(evaluated) < max_evaluations:
+        results = sorted(evaluated.values(), key=lambda result: result.target_bpp)
+        frontier = _nondominated_budget_results(results)
+        evaluated_targets = set(evaluated)
+        next_target: float | None = None
+
+        if len(frontier) >= 3:
+            knee_bpp, knee_kl, knee_score, endpoint = segmented_kneedle_point(
+                [
+                    (float(result.achieved_bpp), float(result.validation_kl))
+                    for result in frontier
+                ]
+            )
+            chosen = min(
+                frontier,
+                key=lambda result: (
+                    abs(float(result.achieved_bpp) - float(knee_bpp)),
+                    abs(float(result.validation_kl) - float(knee_kl)),
+                ),
+            )
+            bracket_pair = _bracketing_result_pair(
+                frontier,
+                float(knee_bpp),
+                attr="achieved_bpp",
+            )
+            if endpoint:
+                bracket_pair = _widest_pair(
+                    _neighbor_result_pairs(frontier, chosen, attr="achieved_bpp")
+                    or _neighbor_result_pairs(results, chosen, attr="target_bpp")
+                ) or bracket_pair
+            bracket_width = _result_pair_width(bracket_pair, attr="achieved_bpp")
+            target_bracket_width = _result_pair_width(bracket_pair, attr="target_bpp")
+            if (
+                bracket_pair is None
+                or (
+                    bracket_width is not None
+                    and bracket_width <= tolerance + 1e-12
+                    and (
+                        target_bracket_width is None
+                        or target_bracket_width <= tolerance + 1e-12
+                        or len(evaluated) >= max_evaluations
+                    )
+                )
+            ):
+                termination = "tolerance"
+                break
+            next_target = _next_target_between_results(
+                bracket_pair,
+                evaluated_targets,
+                bpp_min=bpp_min,
+                bpp_max=bpp_max,
+            )
+        else:
+            best = min(
+                results,
+                key=lambda result: (
+                    float(result.validation_kl),
+                    float(result.achieved_bpp),
+                ),
+            )
+            interval = _largest_adjacent_interval(
+                [float(result.target_bpp) for result in results],
+                float(best.target_bpp),
+            )
+            if interval is None:
+                interval = _largest_adjacent_gap(
+                    [float(result.target_bpp) for result in results]
+                )
+            bracket_width = (
+                None if interval is None else float(interval[1]) - float(interval[0])
+            )
+            if interval is None or bracket_width <= tolerance + 1e-12:
+                termination = "too_few_frontier_points"
+                break
+            next_target = _next_midpoint_target(
+                interval,
+                evaluated_targets,
+                bpp_min=bpp_min,
+                bpp_max=bpp_max,
+            )
+
+        if next_target is None:
+            interval = _largest_adjacent_gap(
+                [float(result.target_bpp) for result in evaluated.values()]
+            )
+            next_target = _next_midpoint_target(
+                interval,
+                evaluated_targets,
+                bpp_min=bpp_min,
+                bpp_max=bpp_max,
+            )
+        if next_target is None:
+            termination = "no_unevaluated_midpoint"
+            break
+        eval_once(next_target)
+
+    results = sorted(evaluated.values(), key=lambda result: result.target_bpp)
+    frontier = _nondominated_budget_results(results)
+    if len(frontier) >= 3:
+        knee_bpp, knee_kl, knee_score, endpoint = segmented_kneedle_point(
+            [
+                (float(result.achieved_bpp), float(result.validation_kl))
+                for result in frontier
+            ]
+        )
+        chosen = min(
+            frontier,
+            key=lambda result: (
+                abs(float(result.achieved_bpp) - float(knee_bpp)),
+                abs(float(result.validation_kl) - float(knee_kl)),
+            ),
+        )
+        bracket_pair = _bracketing_result_pair(
+            frontier,
+            float(knee_bpp),
+            attr="achieved_bpp",
+        )
+        if endpoint:
+            bracket_pair = _widest_pair(
+                _neighbor_result_pairs(frontier, chosen, attr="achieved_bpp")
+                or _neighbor_result_pairs(results, chosen, attr="target_bpp")
+            ) or bracket_pair
+        bracket_width = _result_pair_width(bracket_pair, attr="achieved_bpp")
+        target_bracket_width = _result_pair_width(bracket_pair, attr="target_bpp")
+    else:
+        chosen = min(
+            frontier or results,
+            key=lambda result: (
+                float(result.validation_kl),
+                float(result.achieved_bpp),
+            ),
+        )
+        knee_bpp = float(chosen.achieved_bpp)
+        knee_kl = float(chosen.validation_kl)
+        knee_score = 0.0
+        endpoint = True
+        bracket_pair = _widest_pair(
+            _neighbor_result_pairs(results, chosen, attr="target_bpp")
+        )
+        bracket_width = _result_pair_width(bracket_pair, attr="achieved_bpp")
+        target_bracket_width = _result_pair_width(bracket_pair, attr="target_bpp")
+
+    return chosen, results, {
+        "mode": "validated_frontier_kneedle",
+        "chosen_target_bpp": float(chosen.target_bpp),
+        "chosen_achieved_bpp": float(chosen.achieved_bpp),
+        "validation_kl": float(chosen.validation_kl),
+        "kneedle_score": float(knee_score),
+        "endpoint_fallback": bool(endpoint),
+        "termination": termination,
+        "bracket_width_bpp": (
+            float(bracket_width) if bracket_width is not None else None
+        ),
+        "target_bracket_width_bpp": (
+            float(target_bracket_width)
+            if target_bracket_width is not None else None
+        ),
+        "knee_tolerance_bpp": float(tolerance),
+        "initial_points": int(initial_points),
+        "seeded_evaluations": int(seeded),
+        "evaluations": len(results),
+        "frontier_points": [result.as_record() for result in frontier],
+        "evaluated_points": [result.as_record() for result in results],
+        "quality_note": (
+            "Kneedle is computed after filtering empirically dominated points "
+            "by achieved bpp and measured validation KL."
+        ),
     }
 
 
@@ -3935,6 +4366,7 @@ def _write_pareto_outputs(
     *,
     metadata: Mapping | None = None,
 ) -> tuple[Path, Path]:
+    output_root.mkdir(parents=True, exist_ok=True)
     csv_path = output_root / "pareto_curve.csv"
     json_path = output_root / "pareto_curve.json"
     fields = [
@@ -3950,6 +4382,7 @@ def _write_pareto_outputs(
         "regression",
         "flips_accepted",
         "format_histogram",
+        "assignment_path",
         "layer_config_path",
     ]
     with open(csv_path, "w", newline="") as f:
@@ -3991,6 +4424,80 @@ def _write_budget_artifacts(
     return assignment_path, layer_config_path
 
 
+def _write_knee_checkpoint_point(
+    output_root: Path,
+    result: BudgetResult,
+    *,
+    source: str,
+    metadata: Mapping | None = None,
+) -> Path:
+    output_root.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_root / "knee_checkpoint_frontier.json"
+    existing_points: list[dict] = []
+    if checkpoint_path.exists():
+        try:
+            with open(checkpoint_path) as f:
+                payload = json.load(f)
+            if isinstance(payload, Mapping):
+                existing = payload.get("points")
+                if isinstance(existing, list):
+                    existing_points = [
+                        row for row in existing if isinstance(row, dict)
+                    ]
+        except (OSError, json.JSONDecodeError, TypeError):
+            existing_points = []
+
+    row = result.as_record()
+    row.update(
+        {
+            "source": source,
+            "assignment_hash": _assignment_digest(result.assignment),
+            "checkpoint_metadata": dict(metadata or {}),
+        }
+    )
+    by_hash: dict[str, dict] = {}
+    for candidate in [*existing_points, row]:
+        digest = str(
+            candidate.get("assignment_hash")
+            or candidate.get("layer_config_path")
+            or candidate.get("assignment_path")
+            or len(by_hash)
+        )
+        previous = by_hash.get(digest)
+        if previous is None or (
+            float(candidate.get("validation_kl", float("inf"))),
+            float(candidate.get("achieved_bpp", float("inf"))),
+        ) < (
+            float(previous.get("validation_kl", float("inf"))),
+            float(previous.get("achieved_bpp", float("inf"))),
+        ):
+            by_hash[digest] = candidate
+
+    points = sorted(
+        by_hash.values(),
+        key=lambda candidate: (
+            float(candidate.get("target_bpp", 0.0)),
+            float(candidate.get("validation_kl", float("inf"))),
+        ),
+    )
+    with open(checkpoint_path, "w") as f:
+        json.dump(
+            {
+                "metadata": {
+                    "mode": "knee_checkpoint_frontier",
+                    "quality_note": (
+                        "Each point is a real validation-KL assignment checkpoint "
+                        "written as soon as it is available."
+                    ),
+                },
+                "points": points,
+            },
+            f,
+            indent=2,
+        )
+    return checkpoint_path
+
+
 def _write_named_assignment_artifacts(
     assignment: Mapping[str, str],
     *,
@@ -4002,6 +4509,297 @@ def _write_named_assignment_artifacts(
         json.dump(dict(sorted(assignment.items())), f, indent=2)
     write_layer_config(assignment, layer_config_path)
     return assignment_path, layer_config_path
+
+
+def _resolve_seed_artifact_path(raw_path, source_json: Path) -> Path | None:
+    if raw_path is None:
+        return None
+    text = str(raw_path)
+    if not text:
+        return None
+    path = Path(text)
+    if path.exists():
+        return path
+    candidates: list[Path] = []
+    source_dir = source_json.parent
+    if not path.is_absolute():
+        candidates.append(source_dir / path)
+    parts = path.parts
+    for marker in (("work", "out"), ("run", "out")):
+        for idx in range(max(len(parts) - 1, 0)):
+            if tuple(parts[idx:idx + 2]) == marker:
+                rel = Path(*parts[idx + 2:])
+                candidates.append(source_dir / rel)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _inferred_assignment_paths(path: Path) -> list[Path]:
+    names = []
+    for old, new in (
+        ("final_layer_config", "final_assignment"),
+        ("layer_config", "assignment"),
+    ):
+        if old in path.name:
+            names.append(path.with_name(path.name.replace(old, new, 1)))
+    return names
+
+
+def _load_seed_assignment(row: Mapping, source_json: Path) -> dict[str, str] | None:
+    raw_paths = [
+        row.get("assignment_path"),
+        row.get("assignment"),
+        row.get("source_path"),
+        row.get("layer_config_path"),
+        row.get("layer_config"),
+    ]
+    candidate_paths: list[Path] = []
+    for raw_path in raw_paths:
+        path = _resolve_seed_artifact_path(raw_path, source_json)
+        if path is None:
+            continue
+        candidate_paths.extend(_inferred_assignment_paths(path))
+        candidate_paths.append(path)
+    seen: set[Path] = set()
+    for path in candidate_paths:
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        try:
+            return load_assignment_config(path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def _seed_rows_from_payload(payload: Mapping) -> list[Mapping]:
+    rows: list[Mapping] = []
+    for key in ("validated_candidates", "frontier", "points"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            rows.extend(row for row in value if isinstance(row, Mapping))
+    knee = payload.get("knee")
+    if isinstance(knee, Mapping):
+        rows.append(knee)
+    return rows
+
+
+def _budget_result_from_seed_row(
+    row: Mapping,
+    source_json: Path,
+    runtime: BudgetRuntime,
+) -> BudgetResult | None:
+    if row.get("validation_kl") is None:
+        return None
+    assignment = _load_seed_assignment(row, source_json)
+    if not assignment:
+        return None
+    assignment_path = _resolve_seed_artifact_path(
+        row.get("assignment_path") or row.get("assignment"),
+        source_json,
+    )
+    target_bpp = row.get("target_bpp")
+    if target_bpp is None:
+        target_bpp = row.get("achieved_bpp")
+    if target_bpp is None:
+        target_bpp = row.get("chosen_bpp")
+    target_bpp = float(target_bpp if target_bpp is not None else 0.0)
+    histogram = _format_histogram(
+        runtime.stats,
+        assignment,
+        runtime.specs,
+        target_bpp,
+    )
+    achieved_bpp = float(row.get("achieved_bpp", histogram["achieved_bpp"]))
+    if achieved_bpp <= 0.0:
+        achieved_bpp = float(histogram["achieved_bpp"])
+    if target_bpp <= 0.0:
+        target_bpp = achieved_bpp
+    histogram["achieved_bpp"] = achieved_bpp
+    histogram["target_bpp"] = target_bpp
+    validation_kl = float(row["validation_kl"])
+    l2_kl = float(row.get("l2_kl", validation_kl))
+    return BudgetResult(
+        target_bpp=target_bpp,
+        anchor_bpp=float(row.get("anchor_bpp", target_bpp)),
+        distance_from_anchor=float(row.get("distance_from_anchor", 0.0)),
+        anchor_stale=bool(row.get("anchor_stale", False)),
+        achieved_bpp=achieved_bpp,
+        predicted_dloss=float(row.get("predicted_dloss", 0.0)),
+        l2_kl=l2_kl,
+        validation_kl=validation_kl,
+        accepted=bool(row.get("accepted", True)),
+        regression=bool(row.get("regression", validation_kl > l2_kl)),
+        flips_accepted=int(row.get("flips_accepted", 0) or 0),
+        format_histogram=histogram,
+        assignment=assignment,
+        assignment_path=str(assignment_path or ""),
+        layer_config_path=str(
+            _resolve_seed_artifact_path(
+                row.get("layer_config_path") or row.get("layer_config"),
+                source_json,
+            )
+            or ""
+        ),
+        l3_iterations=int(row.get("l3_iterations", 0) or 0),
+        coord_descent_fired=bool(row.get("coord_descent_fired", False)),
+        coord_descent_flips=int(row.get("coord_descent_flips", 0) or 0),
+    )
+
+
+def _load_knee_seed_results_from_file(
+    path: Path,
+    runtime: BudgetRuntime,
+    *,
+    seen_files: set[Path],
+) -> tuple[list[BudgetResult], dict]:
+    path = path.expanduser()
+    if not path.exists():
+        raise RuntimeError(f"knee seed frontier does not exist: {path}")
+    path = path.resolve()
+    if path in seen_files:
+        return [], {"path": str(path), "skipped": "already_loaded"}
+    seen_files.add(path)
+    with open(path) as f:
+        payload = json.load(f)
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(f"knee seed frontier is not a JSON object: {path}")
+
+    results: list[BudgetResult] = []
+    referenced = payload.get("validated_frontier")
+    referenced_meta = None
+    if isinstance(referenced, str) and referenced:
+        ref_path = _resolve_seed_artifact_path(referenced, path)
+        if ref_path is not None and ref_path.exists():
+            ref_results, referenced_meta = _load_knee_seed_results_from_file(
+                ref_path,
+                runtime,
+                seen_files=seen_files,
+            )
+            results.extend(ref_results)
+
+    rows = _seed_rows_from_payload(payload)
+    skipped = 0
+    for row in rows:
+        result = _budget_result_from_seed_row(row, path, runtime)
+        if result is None:
+            skipped += 1
+            continue
+        results.append(result)
+    return results, {
+        "path": str(path),
+        "rows": len(rows),
+        "loaded": len(results),
+        "skipped_rows": skipped,
+        "referenced": referenced_meta,
+    }
+
+
+def _load_knee_seed_results(args, runtime: BudgetRuntime) -> tuple[list[BudgetResult], dict]:
+    paths = [Path(p) for p in (getattr(args, "knee_seed_frontier", None) or [])]
+    auto_resume_paths = [
+        runtime.output_root / "pareto_curve.json",
+        runtime.output_root / "knee_checkpoint_frontier.json",
+    ]
+    seen_path_text = {str(path.expanduser()) for path in paths}
+    for path in auto_resume_paths:
+        if path.exists() and str(path.expanduser()) not in seen_path_text:
+            paths.append(path)
+            seen_path_text.add(str(path.expanduser()))
+    if not paths:
+        return [], {"files": [], "loaded": 0}
+    by_assignment: dict[str, BudgetResult] = {}
+    files = []
+    seen_files: set[Path] = set()
+    for path in paths:
+        results, meta = _load_knee_seed_results_from_file(
+            path,
+            runtime,
+            seen_files=seen_files,
+        )
+        files.append(meta)
+        for result in results:
+            digest = _assignment_digest(result.assignment)
+            previous = by_assignment.get(digest)
+            if previous is None or (
+                float(result.validation_kl),
+                float(result.achieved_bpp),
+            ) < (
+                float(previous.validation_kl),
+                float(previous.achieved_bpp),
+            ):
+                by_assignment[digest] = result
+    seeds = sorted(
+        by_assignment.values(),
+        key=lambda result: (
+            float(result.achieved_bpp),
+            float(result.validation_kl),
+            float(result.target_bpp),
+        ),
+    )
+    return seeds, {"files": files, "loaded": len(seeds)}
+
+
+def _build_anchor_from_seed_result(
+    args,
+    runtime: BudgetRuntime,
+    seed: BudgetResult,
+    *,
+    measure_all_formats: bool,
+) -> AnchorResult | None:
+    resume_path = _resume_l3_cost_path_for_anchor(
+        args,
+        float(seed.target_bpp),
+    )
+    if resume_path is None:
+        return None
+    label = _bpp_label(seed.achieved_bpp)
+    output_dir = runtime.output_root / f"seed_anchor_bpp_{label}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resumed_l3 = _load_l3_resume_costs(
+        Path(resume_path),
+        args=args,
+        runtime=runtime,
+        anchor_bpp=float(seed.target_bpp),
+        prefix=f"[knee][seed-anchor] {label}:",
+    )
+    selected = _select_l3_neighborhood_for_assignment(
+        args,
+        runtime.stats,
+        runtime.current_costs,
+        seed.assignment,
+        runtime.specs,
+        measure_all_formats=measure_all_formats,
+    )
+    l3_candidates = build_l3_candidates(
+        runtime.stats,
+        resumed_l3.costs,
+        runtime.specs,
+    )
+    l3_candidates = _filter_l3_candidates_for_assignment(
+        l3_candidates,
+        seed.assignment,
+    )
+    if not l3_candidates:
+        return None
+    _emit(
+        f"[knee] seed anchor {label}: using prevalidated "
+        f"KL={seed.validation_kl:.6g} from achieved_bpp={seed.achieved_bpp:.4f}"
+    )
+    return AnchorResult(
+        anchor_bpp=float(seed.achieved_bpp),
+        output_dir=output_dir,
+        l2_assignment=dict(seed.assignment),
+        l2_kl=float(seed.validation_kl),
+        l3_selected=list(selected),
+        l3_candidates=l3_candidates,
+        l3_costs=resumed_l3.costs,
+        latest_smoothed_costs=runtime.current_costs,
+        l3_cost_history=resumed_l3.cost_history,
+        l3_resumed=True,
+    )
 
 
 def run_anchor_budget(
@@ -4259,6 +5057,64 @@ def solve_target_from_anchor(
     target_bpp: float,
 ) -> BudgetResult:
     target_label = _bpp_label(target_bpp)
+
+    def _checkpoint_scout_assignment(
+        assignment: Mapping[str, str],
+        validation_kl: float,
+        commit_record: Mapping,
+    ) -> None:
+        checkpoint_label = (
+            f"{target_label}_scout_"
+            f"{int(commit_record.get('round', 0)):02d}_"
+            f"{_assignment_digest(assignment)[:8]}"
+        )
+        assignment_path, layer_config_path = _write_budget_artifacts(
+            runtime.output_root,
+            checkpoint_label,
+            assignment,
+        )
+        histogram = _format_histogram(
+            runtime.stats,
+            assignment,
+            runtime.specs,
+            target_bpp,
+        )
+        predicted = _predicted_dloss_for_assignment(
+            assignment,
+            anchor.latest_smoothed_costs,
+            runtime.stats,
+        )
+        checkpoint_result = BudgetResult(
+            target_bpp=float(target_bpp),
+            anchor_bpp=float(anchor.anchor_bpp),
+            distance_from_anchor=abs(float(target_bpp) - float(anchor.anchor_bpp)),
+            anchor_stale=bool(
+                abs(float(target_bpp) - float(anchor.anchor_bpp)) > 1e-12
+            ),
+            achieved_bpp=float(histogram["achieved_bpp"]),
+            predicted_dloss=float(predicted),
+            l2_kl=float(anchor.l2_kl),
+            validation_kl=float(validation_kl),
+            accepted=True,
+            regression=bool(float(validation_kl) > float(anchor.l2_kl)),
+            flips_accepted=_hamming_count(anchor.l2_assignment, assignment),
+            format_histogram=histogram,
+            assignment=dict(assignment),
+            assignment_path=str(assignment_path),
+            layer_config_path=str(layer_config_path),
+        )
+        checkpoint_path = _write_knee_checkpoint_point(
+            runtime.output_root,
+            checkpoint_result,
+            source="validation_scout_commit",
+            metadata=commit_record,
+        )
+        _emit(
+            f"[knee] checkpoint target={target_label} "
+            f"achieved={checkpoint_result.achieved_bpp:.4f} "
+            f"KL={checkpoint_result.validation_kl:.6g} -> {checkpoint_path}"
+        )
+
     polish = run_iterated_l3_polish(
         args,
         runtime.model,
@@ -4281,6 +5137,7 @@ def solve_target_from_anchor(
             anchor.l3_cost_history if anchor.l3_resumed else None
         ),
         coord_anchor_label=_bpp_label(anchor.anchor_bpp),
+        scout_checkpoint_callback=_checkpoint_scout_assignment,
     )
     accepted = bool(polish.accepted)
     if accepted:
@@ -4328,7 +5185,7 @@ def solve_target_from_anchor(
         for name in set(anchor.l2_assignment) | set(final_assignment)
         if anchor.l2_assignment.get(name) != final_assignment.get(name)
     )
-    _assignment_path, layer_config_path = _write_budget_artifacts(
+    assignment_path, layer_config_path = _write_budget_artifacts(
         runtime.output_root,
         target_label,
         final_assignment,
@@ -4348,6 +5205,7 @@ def solve_target_from_anchor(
         flips_accepted=int(flips),
         format_histogram=histogram,
         assignment=dict(final_assignment),
+        assignment_path=str(assignment_path),
         layer_config_path=str(layer_config_path),
         l3_iterations=len(polish.iterations),
         coord_descent_fired=bool(polish.coord_descent_fired),
@@ -4453,7 +5311,31 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
     args._runtime = runtime
     args._l3_measure_all_formats = _resolve_l3_measure_all_formats(args)
     anchors: list[AnchorResult] = []
+    seed_anchors_by_digest: dict[str, AnchorResult] = {}
     results_by_bpp: dict[float, BudgetResult] = {}
+    seed_results, seed_meta = _load_knee_seed_results(args, runtime)
+    seed_results = [
+        result for result in seed_results
+        if float(args.knee_bpp_min) - 1e-12
+        <= float(result.achieved_bpp)
+        <= float(args.knee_bpp_max) + 1e-12
+    ]
+    for result in seed_results:
+        key = round(float(result.target_bpp), 8)
+        previous = results_by_bpp.get(key)
+        if previous is None or (
+            float(result.validation_kl),
+            float(result.achieved_bpp),
+        ) < (
+            float(previous.validation_kl),
+            float(previous.achieved_bpp),
+        ):
+            results_by_bpp[key] = result
+    if seed_results:
+        _emit(
+            f"[knee] loaded {len(seed_results)} prevalidated seed point(s) "
+            "for real-KL frontier search"
+        )
 
     def _nearest_anchor(bpp: float) -> AnchorResult | None:
         eligible = [
@@ -4466,11 +5348,49 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             return None
         return min(eligible, key=lambda a: abs(a.anchor_bpp - float(bpp)))
 
-    def _evaluate(bpp: float) -> float:
+    def _nearest_seed_result(bpp: float) -> BudgetResult | None:
+        eligible = [
+            result for result in seed_results
+            if abs(float(result.achieved_bpp) - float(bpp))
+            <= float(args.target_bits_share_tolerance) + 1e-12
+        ]
+        if not eligible:
+            return None
+        return min(
+            eligible,
+            key=lambda result: (
+                abs(float(result.achieved_bpp) - float(bpp)),
+                float(result.validation_kl),
+            ),
+        )
+
+    def _seed_anchor_for_target(bpp: float) -> AnchorResult | None:
+        seed = _nearest_seed_result(float(bpp))
+        if seed is None:
+            return None
+        digest = _assignment_digest(seed.assignment)
+        anchor = seed_anchors_by_digest.get(digest)
+        if anchor is not None:
+            return anchor
+        anchor = _build_anchor_from_seed_result(
+            args,
+            runtime,
+            seed,
+            measure_all_formats=bool(args._l3_measure_all_formats),
+        )
+        if anchor is None:
+            return None
+        seed_anchors_by_digest[digest] = anchor
+        anchors.append(anchor)
+        return anchor
+
+    def _evaluate_result(bpp: float) -> BudgetResult:
         key = round(float(bpp), 8)
         if key in results_by_bpp:
-            return results_by_bpp[key].validation_kl
+            return results_by_bpp[key]
         anchor = _nearest_anchor(float(bpp))
+        if anchor is None:
+            anchor = _seed_anchor_for_target(float(bpp))
         if anchor is None:
             anchor = run_anchor_budget(
                 args,
@@ -4481,44 +5401,67 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             anchors.append(anchor)
         result = run_single_budget(args, float(bpp), reusable_anchor=anchor)
         results_by_bpp[key] = result
+        _write_knee_checkpoint_point(
+            runtime.output_root,
+            result,
+            source="completed_budget_eval",
+            metadata={"target_bpp": float(bpp)},
+        )
+        _write_pareto_outputs(
+            runtime.output_root,
+            list(results_by_bpp.values()),
+            metadata={
+                "mode": "knee_search_checkpoint",
+                "knee_max_evaluations": int(args.knee_max_evaluations),
+                "knee_tolerance": float(args.knee_tolerance),
+                "knee_seed_frontier": seed_meta,
+                **_l3_scope_metadata(args),
+            },
+        )
         _phase_boundary_cleanup(f"knee_eval_{_bpp_label(float(bpp))}_complete")
-        return result.validation_kl
+        return result
+
+    def _evaluate_kl(bpp: float) -> float:
+        return float(_evaluate_result(float(bpp)).validation_kl)
 
     if args.knee_mode == "threshold":
         if args.knee_threshold_kl is None:
             raise RuntimeError("--knee-threshold-kl is required for threshold mode")
         chosen_bpp, points, knee_meta = threshold_knee_search(
-            _evaluate,
+            _evaluate_kl,
             float(args.knee_bpp_min),
             float(args.knee_bpp_max),
             threshold_kl=float(args.knee_threshold_kl),
             tolerance=float(args.knee_tolerance),
             max_evaluations=int(args.knee_max_evaluations),
         )
+        knee_meta["evaluated_points"] = points
+        chosen_key = round(float(chosen_bpp), 8)
+        if chosen_key not in results_by_bpp:
+            _evaluate_result(float(chosen_bpp))
+        chosen = results_by_bpp[chosen_key]
+        results = list(results_by_bpp.values())
     else:
-        chosen_bpp, points, knee_meta = adaptive_segmented_kneedle(
-            _evaluate,
+        chosen, results, knee_meta = adaptive_validated_frontier_kneedle(
+            _evaluate_result,
             float(args.knee_bpp_min),
             float(args.knee_bpp_max),
             tolerance=float(args.knee_tolerance),
             max_evaluations=int(args.knee_max_evaluations),
+            initial_points=int(args.knee_initial_points),
+            initial_results=list(results_by_bpp.values()),
         )
         if knee_meta.get("endpoint_fallback"):
-            _emit("[knee] warning: no interior knee found; using midpoint fallback")
-    chosen_key = round(float(chosen_bpp), 8)
-    if chosen_key not in results_by_bpp:
-        _evaluate(float(chosen_bpp))
-    chosen = results_by_bpp[chosen_key]
-    results = list(results_by_bpp.values())
+            _emit("[knee] warning: no interior validated knee found; using fallback")
     csv_path, json_path = _write_pareto_outputs(
         runtime.output_root,
         results,
         metadata={
             "mode": "knee_search",
             "knee": knee_meta,
-            "evaluated_points": points,
             "knee_max_evaluations": int(args.knee_max_evaluations),
             "knee_tolerance": float(args.knee_tolerance),
+            "knee_seed_frontier": seed_meta,
             **_l3_scope_metadata(args),
         },
     )
@@ -4534,6 +5477,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             "json": str(json_path),
             "knee_max_evaluations": int(args.knee_max_evaluations),
             "knee_tolerance": float(args.knee_tolerance),
+            "knee_seed_frontier": seed_meta,
             **_l3_scope_metadata(args),
             "points": [result.as_record() for result in results],
         },
@@ -4549,7 +5493,10 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
     with open(runtime.output_root / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     _emit("===== summary =====")
-    _emit(f"Knee bpp: {chosen.target_bpp:.2f}")
+    _emit(
+        f"Knee bpp: target={chosen.target_bpp:.2f} "
+        f"achieved={chosen.achieved_bpp:.4f} KL={chosen.validation_kl:.6g}"
+    )
     _emit(f"Knee assignment: {knee_assignment_path}")
     _emit(f"Pareto CSV: {csv_path}")
     _emit("===================")
@@ -5204,12 +6151,31 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--knee-threshold-kl", type=float)
     ap.add_argument("--knee-max-evaluations", type=int, default=12)
     ap.add_argument(
+        "--knee-initial-points",
+        type=int,
+        default=9,
+        help=(
+            "Initial evenly spaced real-KL probes for --knee-mode kneedle. "
+            "The search then refines the nondominated achieved-bpp frontier."
+        ),
+    )
+    ap.add_argument(
+        "--knee-seed-frontier",
+        "--knee-resume-frontier",
+        action="append",
+        default=[],
+        help=(
+            "JSON file with already validated knee/pareto points to seed "
+            "normal --knee-search. Supports validated_frontier.json, "
+            "validated_summary.json, and pareto_curve.json."
+        ),
+    )
+    ap.add_argument(
         "--knee-surrogate",
         action="store_true",
         help=(
-            "For --knee-search, choose the kneedle from one cached L3 cost "
-            "table by solving many CPU-only target budgets. This writes "
-            "candidate configs but does not perform held-out KL validation."
+            "Legacy side path: generate candidate configs from one cached L3 "
+            "cost table. The normal kneedle path uses measured validation KL."
         ),
     )
     ap.add_argument(
@@ -5412,6 +6378,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum validation-scout candidates per round.",
     )
     ap.add_argument(
+        "--l3-validation-scout-max-lanes-per-batch",
+        type=int,
+        default=1,
+        help=(
+            "Maximum simultaneous KL lanes for validation scout. The default "
+            "keeps scout probes restartable and memory-stable during knee search."
+        ),
+    )
+    ap.add_argument(
+        "--l3-validation-scout-cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow CUDA graph capture inside validation scout. Disabled by "
+            "default because scout shapes vary across candidates."
+        ),
+    )
+    ap.add_argument(
         "--l3-validation-scout-sample-per-bucket",
         type=int,
         default=0,
@@ -5586,6 +6570,8 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("--knee-bpp-min must be less than --knee-bpp-max.")
         if args.knee_max_evaluations < 3:
             ap.error("--knee-max-evaluations must be at least 3.")
+        if args.knee_initial_points < 3:
+            ap.error("--knee-initial-points must be at least 3.")
         if args.knee_surrogate and args.knee_surrogate_points < 3:
             ap.error("--knee-surrogate-points must be at least 3.")
         if (
