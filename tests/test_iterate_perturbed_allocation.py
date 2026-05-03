@@ -3360,6 +3360,7 @@ def test_knee_search_reuses_seed_frontier_without_remeasurement(tmp_path, monkey
         knee_max_evaluations=3,
         knee_initial_points=3,
         knee_seed_frontier=[str(seed_path)],
+        knee_seed_remeasure=False,
         target_bits_share_tolerance=0.25,
         l3_measure_all_formats=False,
     )
@@ -3373,6 +3374,60 @@ def test_knee_search_reuses_seed_frontier_without_remeasurement(tmp_path, monkey
     assert summary["knee"]["seeded_evaluations"] == 3
     assert summary["knee"]["evaluations"] == 3
     assert summary["pareto"]["knee_seed_frontier"]["loaded"] == 3
+
+
+def test_knee_seed_remeasurement_updates_seed_checkpoint(tmp_path, monkeypatch):
+    stats = {"layer": _tiny_stat()}
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    assignment = {"layer": "NVFP4"}
+    histogram = ipa._format_histogram(stats, assignment, specs, 5.0)
+    result = ipa.BudgetResult(
+        target_bpp=5.0,
+        anchor_bpp=5.0,
+        distance_from_anchor=0.0,
+        anchor_stale=False,
+        achieved_bpp=float(histogram["achieved_bpp"]),
+        predicted_dloss=0.0,
+        l2_kl=0.05,
+        validation_kl=0.05,
+        accepted=True,
+        regression=False,
+        flips_accepted=0,
+        format_histogram=histogram,
+        assignment=assignment,
+        assignment_path="",
+        layer_config_path="",
+    )
+
+    monkeypatch.setattr(ipa, "measure_assignment_kl", lambda *_args, **_kwargs: 0.0125)
+
+    runtime = SimpleNamespace(
+        output_root=tmp_path / "out",
+        work_root=tmp_path / "work",
+        model=object(),
+        calib_ids=torch.zeros((1, 1), dtype=torch.long),
+        ref_log_probs=None,
+        stats=stats,
+        specs=specs,
+        profile=None,
+    )
+    meta = ipa._remeasure_knee_seed_results(
+        SimpleNamespace(knee_seed_remeasure=True),
+        runtime,
+        [result],
+    )
+
+    assert meta["enabled"] is True
+    assert meta["updated"] == 1
+    assert result.validation_kl == pytest.approx(0.0125)
+    assert result.l2_kl == pytest.approx(0.0125)
+    assert Path(result.assignment_path).exists()
+
+    checkpoint = json.loads(
+        (tmp_path / "out" / "knee_checkpoint_frontier.json").read_text()
+    )
+    assert checkpoint["points"][0]["source"] == "seed_remeasurement"
+    assert checkpoint["points"][0]["validation_kl"] == pytest.approx(0.0125)
 
 
 def test_knee_checkpoint_frontier_can_seed_search(tmp_path):

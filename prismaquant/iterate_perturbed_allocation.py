@@ -5204,6 +5204,85 @@ def _load_knee_seed_results(args, runtime: BudgetRuntime) -> tuple[list[BudgetRe
     return seeds, {"files": files, "loaded": len(seeds)}
 
 
+def _remeasure_knee_seed_results(
+    args,
+    runtime: BudgetRuntime,
+    seed_results: list[BudgetResult],
+) -> dict:
+    enabled = bool(getattr(args, "knee_seed_remeasure", True))
+    meta = {
+        "enabled": enabled,
+        "points": 0,
+        "unique_assignments": 0,
+        "updated": 0,
+        "max_abs_delta": 0.0,
+        "rows": [],
+    }
+    if not enabled or not seed_results:
+        return meta
+
+    measured_by_digest: dict[str, float] = {}
+    for result in seed_results:
+        digest = _assignment_digest(result.assignment)
+        old_kl = float(result.validation_kl)
+        if digest not in measured_by_digest:
+            measured_by_digest[digest] = float(
+                measure_assignment_kl(
+                    runtime.model,
+                    result.assignment,
+                    runtime.calib_ids,
+                    runtime.ref_log_probs,
+                    work_root=runtime.work_root,
+                    profile=runtime.profile,
+                )
+            )
+        measured_kl = float(measured_by_digest[digest])
+        result.validation_kl = measured_kl
+        result.l2_kl = measured_kl
+        result.regression = False
+        label = f"seed_{_bpp_label(result.achieved_bpp)}_{digest[:8]}"
+        assignment_path, layer_config_path = _write_budget_artifacts(
+            runtime.output_root,
+            label,
+            result.assignment,
+        )
+        result.assignment_path = str(assignment_path)
+        result.layer_config_path = str(layer_config_path)
+        _write_knee_checkpoint_point(
+            runtime.output_root,
+            result,
+            source="seed_remeasurement",
+            metadata={
+                "old_validation_kl": old_kl,
+                "new_validation_kl": measured_kl,
+                "assignment_hash": digest,
+            },
+        )
+        delta = measured_kl - old_kl
+        meta["points"] += 1
+        if abs(delta) > 1e-12:
+            meta["updated"] += 1
+        meta["max_abs_delta"] = max(float(meta["max_abs_delta"]), abs(delta))
+        meta["rows"].append(
+            {
+                "target_bpp": float(result.target_bpp),
+                "achieved_bpp": float(result.achieved_bpp),
+                "assignment_hash": digest,
+                "old_validation_kl": old_kl,
+                "new_validation_kl": measured_kl,
+                "delta_validation_kl": delta,
+            }
+        )
+
+    meta["unique_assignments"] = len(measured_by_digest)
+    _emit(
+        "[knee] remeasured seed frontier: "
+        f"{meta['points']} point(s), {meta['unique_assignments']} unique assignment(s), "
+        f"{meta['updated']} changed, max_abs_delta={meta['max_abs_delta']:.6g}"
+    )
+    return meta
+
+
 def _build_anchor_from_seed_result(
     args,
     runtime: BudgetRuntime,
@@ -5785,6 +5864,11 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
         <= float(result.achieved_bpp)
         <= float(args.knee_bpp_max) + 1e-12
     ]
+    seed_meta["remeasure"] = _remeasure_knee_seed_results(
+        args,
+        runtime,
+        seed_results,
+    )
     for result in seed_results:
         key = round(float(result.target_bpp), 8)
         previous = results_by_bpp.get(key)
@@ -6721,6 +6805,15 @@ def main(argv: list[str] | None = None) -> int:
             "JSON file with already validated knee/pareto points to seed "
             "normal --knee-search. Supports validated_frontier.json, "
             "validated_summary.json, and pareto_curve.json."
+        ),
+    )
+    ap.add_argument(
+        "--knee-seed-remeasure",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Remeasure seeded frontier assignments on the current calibration "
+            "before using them in kneedle selection."
         ),
     )
     ap.add_argument(
