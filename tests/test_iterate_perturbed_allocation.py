@@ -2967,6 +2967,45 @@ def test_knee_search_max_evaluations_stop():
     assert len(points) == 4
 
 
+def test_nondominated_budget_results_respects_kl_noise_floor(tmp_path):
+    results = [
+        _dummy_budget_result(4.0, 4.0, tmp_path, validation_kl=0.100000),
+        _dummy_budget_result(4.5, 4.5, tmp_path, validation_kl=0.099995),
+        _dummy_budget_result(5.0, 5.0, tmp_path, validation_kl=0.099000),
+    ]
+
+    frontier = ipa._nondominated_budget_results(
+        results,
+        kl_noise_floor=0.000010,
+    )
+
+    assert [row.target_bpp for row in frontier] == [4.0, 5.0]
+
+
+def test_kneedle_leave_one_out_diagnostic_flags_unstable():
+    points = [
+        (4.0, 0.20),
+        (5.0, 0.10),
+        (6.0, 0.05),
+        (7.0, 0.049),
+        (8.0, 0.048),
+    ]
+    knee_bpp, knee_kl, _score, _endpoint = ipa.segmented_kneedle_point(points)
+
+    diagnostic = ipa.kneedle_leave_one_out_diagnostic(
+        points,
+        knee_bpp,
+        knee_kl,
+        tolerance_bpp=0.1,
+        kl_noise_floor=0.000010,
+    )
+
+    assert diagnostic["enabled"] is True
+    assert diagnostic["stable"] is False
+    assert diagnostic["max_bpp_shift"] == pytest.approx(1.0)
+    assert diagnostic["max_kl_shift"] == pytest.approx(0.05)
+
+
 def test_validated_frontier_kneedle_discards_empirically_dominated_points(tmp_path):
     # Higher-bpp probes can be worse when the allocator lands in a bad local
     # solution. The validated frontier search must not let those points define
@@ -3004,6 +3043,10 @@ def test_validated_frontier_kneedle_discards_empirically_dominated_points(tmp_pa
     )
 
     assert meta["mode"] == "validated_frontier_kneedle"
+    assert meta["knee_kl_noise_floor"] == pytest.approx(
+        ipa.DEFAULT_KNEE_KL_NOISE_FLOOR
+    )
+    assert meta["leave_one_out"]["enabled"] is True
     assert chosen.achieved_bpp <= 5.31
     assert all(
         point["achieved_bpp"] <= 5.31

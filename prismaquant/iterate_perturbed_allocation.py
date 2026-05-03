@@ -3114,6 +3114,14 @@ def run_iterated_l3_polish(
     coord_anchor_label: str | None = None,
     scout_checkpoint_callback: Callable[[Mapping[str, str], float, dict], None] | None = None,
 ) -> L3PolishRun:
+    """Generate L3 candidates with additive costs, then gate by measured KL.
+
+    Propagated L3 costs are a surrogate for fast discrete search; they do not
+    claim joint optimality. Every proposed assignment is measured on the KL
+    calibration slice and accepted only when it is non-regressive under that
+    empirical objective. Validation scout and coordinate descent use the same
+    measured-KL gate for local corrections around the surrogate proposal.
+    """
     l3_assignment = dict(initial_assignment)
     current_kl = float(initial_kl)
     proposed_assignment = dict(l3_assignment)
@@ -3488,6 +3496,22 @@ def run_iterated_l3_polish(
     )
 
 
+DEFAULT_KNEE_KL_NOISE_FLOOR = 1e-5
+
+
+def _knee_kl_noise_floor(args=None) -> float:
+    return max(
+        float(
+            getattr(
+                args,
+                "knee_kl_noise_floor",
+                DEFAULT_KNEE_KL_NOISE_FLOOR,
+            )
+        ),
+        0.0,
+    )
+
+
 def _normalise(values: list[float]) -> list[float]:
     lo = min(values)
     hi = max(values)
@@ -3619,6 +3643,78 @@ def knee_candidate_from_points(points: list[tuple[float, float]]) -> dict | None
     }
 
 
+def kneedle_leave_one_out_diagnostic(
+    points: list[tuple[float, float]],
+    chosen_bpp: float,
+    chosen_kl: float,
+    *,
+    tolerance_bpp: float,
+    kl_noise_floor: float = DEFAULT_KNEE_KL_NOISE_FLOOR,
+) -> dict:
+    pts = sorted((float(bpp), float(kl)) for bpp, kl in points)
+    tolerance_bpp = max(float(tolerance_bpp), 0.0)
+    kl_noise_floor = max(float(kl_noise_floor), 0.0)
+    if len(pts) < 4:
+        return {
+            "enabled": False,
+            "stable": True,
+            "reason": "requires_at_least_4_points",
+            "points": len(pts),
+            "max_bpp_shift": 0.0,
+            "max_kl_shift": 0.0,
+            "tolerance_bpp": float(tolerance_bpp),
+            "kl_noise_floor": float(kl_noise_floor),
+            "trials": [],
+        }
+
+    trials = []
+    for idx, removed in enumerate(pts):
+        subset = pts[:idx] + pts[idx + 1:]
+        loo_bpp, loo_kl, loo_score, loo_endpoint = segmented_kneedle_point(subset)
+        trials.append(
+            {
+                "removed_bpp": float(removed[0]),
+                "removed_kl": float(removed[1]),
+                "chosen_bpp": float(loo_bpp),
+                "chosen_kl": float(loo_kl),
+                "bpp_shift": abs(float(loo_bpp) - float(chosen_bpp)),
+                "kl_shift": abs(float(loo_kl) - float(chosen_kl)),
+                "kneedle_score": float(loo_score),
+                "endpoint_fallback": bool(loo_endpoint),
+            }
+        )
+    max_bpp_shift = max(float(row["bpp_shift"]) for row in trials)
+    max_kl_shift = max(float(row["kl_shift"]) for row in trials)
+    stable = bool(
+        max_bpp_shift <= tolerance_bpp + 1e-12
+        and max_kl_shift <= kl_noise_floor + 1e-12
+    )
+    return {
+        "enabled": True,
+        "stable": stable,
+        "points": len(pts),
+        "max_bpp_shift": float(max_bpp_shift),
+        "max_kl_shift": float(max_kl_shift),
+        "tolerance_bpp": float(tolerance_bpp),
+        "kl_noise_floor": float(kl_noise_floor),
+        "trials": trials,
+    }
+
+
+def _warn_kneedle_instability(context: str, metadata: Mapping | None) -> None:
+    if not isinstance(metadata, Mapping):
+        return
+    diagnostic = metadata.get("leave_one_out")
+    if not isinstance(diagnostic, Mapping):
+        return
+    if diagnostic.get("enabled") and not diagnostic.get("stable", True):
+        _emit(
+            f"[{context}] warning: leave-one-out kneedle unstable "
+            f"(max_bpp_shift={float(diagnostic.get('max_bpp_shift', 0.0)):.4g}, "
+            f"max_kl_shift={float(diagnostic.get('max_kl_shift', 0.0)):.4g})"
+        )
+
+
 def _linspace_bpp(lo: float, hi: float, count: int) -> list[float]:
     count = max(int(count), 1)
     if count == 1:
@@ -3629,7 +3725,11 @@ def _linspace_bpp(lo: float, hi: float, count: int) -> list[float]:
     ]
 
 
-def _nondominated_budget_results(results: list[BudgetResult]) -> list[BudgetResult]:
+def _nondominated_budget_results(
+    results: list[BudgetResult],
+    *,
+    kl_noise_floor: float = DEFAULT_KNEE_KL_NOISE_FLOOR,
+) -> list[BudgetResult]:
     ordered = sorted(
         results,
         key=lambda result: (
@@ -3640,9 +3740,10 @@ def _nondominated_budget_results(results: list[BudgetResult]) -> list[BudgetResu
     )
     frontier: list[BudgetResult] = []
     best_kl = float("inf")
+    kl_noise_floor = max(float(kl_noise_floor), 0.0)
     for result in ordered:
         kl = float(result.validation_kl)
-        if kl < best_kl - 1e-12:
+        if kl < best_kl - kl_noise_floor - 1e-12:
             frontier.append(result)
             best_kl = kl
     return frontier
@@ -3802,6 +3903,7 @@ def adaptive_validated_frontier_kneedle(
     max_evaluations: int,
     initial_points: int = 9,
     initial_results: list[BudgetResult] | None = None,
+    kl_noise_floor: float = DEFAULT_KNEE_KL_NOISE_FLOOR,
 ) -> tuple[BudgetResult, list[BudgetResult], dict]:
     """Search the kneedle on the real-KL Pareto envelope.
 
@@ -3815,6 +3917,7 @@ def adaptive_validated_frontier_kneedle(
     bpp_min = float(bpp_min)
     bpp_max = float(bpp_max)
     tolerance = max(float(tolerance), 0.0)
+    kl_noise_floor = max(float(kl_noise_floor), 0.0)
     seeded = 0
     for result in initial_results or []:
         key = round(float(result.target_bpp), 8)
@@ -3852,7 +3955,10 @@ def adaptive_validated_frontier_kneedle(
 
     while len(evaluated) < max_evaluations:
         results = sorted(evaluated.values(), key=lambda result: result.target_bpp)
-        frontier = _nondominated_budget_results(results)
+        frontier = _nondominated_budget_results(
+            results,
+            kl_noise_floor=kl_noise_floor,
+        )
         evaluated_targets = set(evaluated)
         next_target: float | None = None
 
@@ -3947,7 +4053,10 @@ def adaptive_validated_frontier_kneedle(
         eval_once(next_target)
 
     results = sorted(evaluated.values(), key=lambda result: result.target_bpp)
-    frontier = _nondominated_budget_results(results)
+    frontier = _nondominated_budget_results(
+        results,
+        kl_noise_floor=kl_noise_floor,
+    )
     if len(frontier) >= 3:
         knee_bpp, knee_kl, knee_score, endpoint = segmented_kneedle_point(
             [
@@ -3992,6 +4101,17 @@ def adaptive_validated_frontier_kneedle(
         bracket_width = _result_pair_width(bracket_pair, attr="achieved_bpp")
         target_bracket_width = _result_pair_width(bracket_pair, attr="target_bpp")
 
+    loo_diagnostic = kneedle_leave_one_out_diagnostic(
+        [
+            (float(result.achieved_bpp), float(result.validation_kl))
+            for result in frontier
+        ],
+        float(chosen.achieved_bpp),
+        float(chosen.validation_kl),
+        tolerance_bpp=float(tolerance),
+        kl_noise_floor=float(kl_noise_floor),
+    )
+
     return chosen, results, {
         "mode": "validated_frontier_kneedle",
         "chosen_target_bpp": float(chosen.target_bpp),
@@ -4008,6 +4128,8 @@ def adaptive_validated_frontier_kneedle(
             if target_bracket_width is not None else None
         ),
         "knee_tolerance_bpp": float(tolerance),
+        "knee_kl_noise_floor": float(kl_noise_floor),
+        "leave_one_out": loo_diagnostic,
         "initial_points": int(initial_points),
         "seeded_evaluations": int(seeded),
         "evaluations": len(results),
@@ -5358,6 +5480,7 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
 def run_knee_search(args, runtime: BudgetRuntime) -> int:
     args._runtime = runtime
     args._l3_measure_all_formats = _resolve_l3_measure_all_formats(args)
+    kl_noise_floor = _knee_kl_noise_floor(args)
     anchors: list[AnchorResult] = []
     seed_anchors_by_digest: dict[str, AnchorResult] = {}
     results_by_bpp: dict[float, BudgetResult] = {}
@@ -5462,6 +5585,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
                 "mode": "knee_search_checkpoint",
                 "knee_max_evaluations": int(args.knee_max_evaluations),
                 "knee_tolerance": float(args.knee_tolerance),
+                "knee_kl_noise_floor": float(kl_noise_floor),
                 "knee_seed_frontier": seed_meta,
                 **_l3_scope_metadata(args),
                 **_calibration_metadata(args),
@@ -5499,8 +5623,10 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             max_evaluations=int(args.knee_max_evaluations),
             initial_points=int(args.knee_initial_points),
             initial_results=list(results_by_bpp.values()),
+            kl_noise_floor=float(kl_noise_floor),
         )
         _warn_endpoint_fallback("knee", knee_meta)
+        _warn_kneedle_instability("knee", knee_meta)
     csv_path, json_path = _write_pareto_outputs(
         runtime.output_root,
         results,
@@ -5509,6 +5635,7 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             "knee": knee_meta,
             "knee_max_evaluations": int(args.knee_max_evaluations),
             "knee_tolerance": float(args.knee_tolerance),
+            "knee_kl_noise_floor": float(kl_noise_floor),
             "knee_seed_frontier": seed_meta,
             **_l3_scope_metadata(args),
             **_calibration_metadata(args),
@@ -5592,7 +5719,11 @@ def _candidate_from_assignment(
     }
 
 
-def _nondominated_validated_points(points: list[dict]) -> list[dict]:
+def _nondominated_validated_points(
+    points: list[dict],
+    *,
+    kl_noise_floor: float = DEFAULT_KNEE_KL_NOISE_FLOOR,
+) -> list[dict]:
     ordered = sorted(
         points,
         key=lambda row: (
@@ -5603,9 +5734,10 @@ def _nondominated_validated_points(points: list[dict]) -> list[dict]:
     )
     frontier = []
     best_kl = float("inf")
+    kl_noise_floor = max(float(kl_noise_floor), 0.0)
     for row in ordered:
         kl = float(row["validation_kl"])
-        if kl < best_kl - 1e-12:
+        if kl < best_kl - kl_noise_floor - 1e-12:
             frontier.append(row)
             best_kl = kl
     return frontier
@@ -5657,6 +5789,7 @@ def _write_validated_frontier_outputs(
 
 
 def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
+    kl_noise_floor = _knee_kl_noise_floor(args)
     frontier_path = runtime.output_root / "surrogate_frontier.json"
     if not frontier_path.exists():
         raise RuntimeError(
@@ -5794,7 +5927,10 @@ def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
             row["layer_config_path"] = str(layer_config_path)
         row.pop("_assignment", None)
 
-    validated_frontier = _nondominated_validated_points(candidates)
+    validated_frontier = _nondominated_validated_points(
+        candidates,
+        kl_noise_floor=kl_noise_floor,
+    )
     if len(validated_frontier) < 3:
         # Still write all data; choose the best KL if monotone dominance leaves
         # too few points for a geometric knee.
@@ -5815,6 +5951,16 @@ def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
                 abs(float(row["validation_kl"]) - float(knee_kl)),
             ),
         )
+    loo_diagnostic = kneedle_leave_one_out_diagnostic(
+        [
+            (float(row["achieved_bpp"]), float(row["validation_kl"]))
+            for row in validated_frontier
+        ],
+        float(chosen["achieved_bpp"]),
+        float(chosen["validation_kl"]),
+        tolerance_bpp=float(getattr(args, "knee_tolerance", 0.1)),
+        kl_noise_floor=float(kl_noise_floor),
+    )
     assignment = _load_assignment_json(chosen["assignment_path"])
     knee_assignment_path, knee_layer_config_path = _write_named_assignment_artifacts(
         assignment,
@@ -5830,11 +5976,14 @@ def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
         "surrogate_loss": chosen.get("surrogate_loss"),
         "kneedle_score": float(knee_score),
         "endpoint_fallback": bool(endpoint),
+        "knee_kl_noise_floor": float(kl_noise_floor),
+        "leave_one_out": loo_diagnostic,
         "assignment": str(knee_assignment_path),
         "layer_config": str(knee_layer_config_path),
         "format_histogram": chosen["format_histogram"],
     }
     _warn_endpoint_fallback("validated-knee", knee)
+    _warn_kneedle_instability("validated-knee", knee)
     csv_path, json_path = _write_validated_frontier_outputs(
         runtime.output_root,
         candidates=candidates,
@@ -5846,6 +5995,7 @@ def run_validated_surrogate_knee_search(args, runtime: BudgetRuntime) -> int:
             "validation_candidate_count": len(candidates),
             "validation_calib_samples": int(args.n_calib_samples),
             "validation_calib_seqlen": int(args.calib_seqlen),
+            "knee_kl_noise_floor": float(kl_noise_floor),
             "included_assignments": list(
                 getattr(args, "knee_include_assignment", None) or []
             ),
@@ -6203,6 +6353,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--knee-tolerance", type=float, default=0.1)
     ap.add_argument("--knee-mode", choices=["kneedle", "threshold"], default="kneedle")
     ap.add_argument("--knee-threshold-kl", type=float)
+    ap.add_argument(
+        "--knee-kl-noise-floor",
+        type=float,
+        default=DEFAULT_KNEE_KL_NOISE_FLOOR,
+        help=(
+            "Measured-KL improvement required before a higher-bpp point "
+            "extends the nondominated knee frontier."
+        ),
+    )
     ap.add_argument("--knee-max-evaluations", type=int, default=12)
     ap.add_argument(
         "--knee-initial-points",
@@ -6409,7 +6568,15 @@ def main(argv: list[str] | None = None) -> int:
         default=42,
         help="Stable random seed for L3 calibration windows.",
     )
-    ap.add_argument("--l3-regression-tolerance", type=float, default=0.0)
+    ap.add_argument(
+        "--l3-regression-tolerance",
+        type=float,
+        default=0.0,
+        help=(
+            "Relative KL regression allowed during L3 acceptance. The default "
+            "0.0 keeps the polish loop strictly monotonic under measured KL."
+        ),
+    )
     ap.add_argument(
         "--l3-iter-max",
         type=int,
