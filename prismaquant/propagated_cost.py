@@ -2549,6 +2549,22 @@ def _pad_lanes_for_cuda_graph(lanes: list[_LaneSpec]) -> list[_LaneSpec]:
     return padded
 
 
+def _pad_override_lanes_for_cuda_graph(
+    lane_overrides: list[dict[str, str]],
+    target_names: set[str],
+) -> list[dict[str, str]]:
+    padded_count = _cuda_graph_lane_count(len(lane_overrides))
+    if padded_count <= len(lane_overrides) or not lane_overrides:
+        return lane_overrides
+    padded = [dict(override) for override in lane_overrides]
+    baseline_override = {name: "BF16" for name in sorted(target_names)}
+    padded.extend(
+        dict(baseline_override)
+        for _ in range(padded_count - len(lane_overrides))
+    )
+    return padded
+
+
 def _calibration_sample_tensor_bytes(value) -> int:
     if isinstance(value, torch.Tensor):
         return int(value.numel() * value.element_size())
@@ -3016,6 +3032,8 @@ def measure_override_paired_kl_deltas(
     max_lanes_per_batch: int = 64,
     profile=None,
     progress_callback: Callable[[dict], None] | None = None,
+    tail_only: bool = True,
+    cache_tail_layer_inputs: bool = True,
 ) -> list[float]:
     """Measure paired propagated KL for multi-target override sets.
 
@@ -3056,6 +3074,56 @@ def measure_override_paired_kl_deltas(
         "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
         default=True,
     )
+    _decoder_base, decoder_layers = _decoder_stack(model)
+    tail_call_cache: dict[int, list[tuple[tuple, dict, int]]] = {}
+    tail_graph_cache = _TailCudaGraphCache(enabled=torch.cuda.is_available())
+    if (
+        bool(tail_only)
+        and bool(cache_tail_layer_inputs)
+        and decoder_layers is not None
+    ):
+        needed_depths = set()
+        for override in overrides:
+            depths = [layer_depth(name) for name in override]
+            if depths and all(depth is not None for depth in depths):
+                depth = min(int(depth) for depth in depths if depth is not None)
+                if 0 <= depth < len(decoder_layers):
+                    needed_depths.add(depth)
+        if needed_depths:
+            cache_dir = Path(tempfile.mkdtemp(
+                prefix="prismaquant_pairwise_baseline_context_",
+                dir=tmp_parent,
+            ))
+            context_hooks = PerturbedActivationCache(
+                model,
+                assignment_c,
+                cache_dir,
+                input_rows=0,
+                cal_hash=cal_hash,
+                profile=profile,
+            )
+            frozen_context = (
+                context_hooks.frozen_weight_cache()
+                if use_frozen_perturbed_cache
+                else nullcontext(context_hooks)
+            )
+            with frozen_context:
+                context_hooks.install()
+                try:
+                    captured = _capture_all_layer_calls(
+                        model,
+                        decoder_layers,
+                        needed_depths,
+                        calib_ids,
+                        device,
+                    )
+                    tail_call_cache = {
+                        depth: captured.get(depth, [])
+                        for depth in needed_depths
+                    }
+                finally:
+                    context_hooks.remove()
+                    shutil.rmtree(cache_dir, ignore_errors=True)
 
     measured: list[float] = []
     chunk_count = int(math.ceil(len(overrides) / float(max_pairs_per_batch)))
@@ -3107,6 +3175,49 @@ def measure_override_paired_kl_deltas(
             for override in lane_overrides
             for name in override
         }
+        target_depths = [layer_depth(name) for name in target_names]
+        replay_layer_idx = (
+            min(int(depth) for depth in target_depths if depth is not None)
+            if (
+                bool(tail_only)
+                and decoder_layers is not None
+                and target_depths
+                and all(depth is not None for depth in target_depths)
+            )
+            else None
+        )
+        use_tail_chunk = (
+            replay_layer_idx is not None
+            and 0 <= int(replay_layer_idx) < len(decoder_layers)
+        )
+        cached_calls_for_graph = (
+            tail_call_cache.get(int(replay_layer_idx), [])
+            if use_tail_chunk and cache_tail_layer_inputs
+            else None
+        )
+        if not cached_calls_for_graph:
+            cached_calls_for_graph = None
+        l3_tail_graph_call_count = (
+            len(cached_calls_for_graph)
+            if cached_calls_for_graph is not None
+            else _calibration_call_count(calib_ids)
+        )
+        use_l3_tail_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+            "PRISMAQUANT_L3_CUDA_GRAPHS",
+            default="auto",
+            call_count=l3_tail_graph_call_count,
+            min_calls=8,
+        )
+        tail_graph_safe = (
+            use_tail_chunk
+            and tail_graph_cache.enabled
+            and use_l3_tail_cuda_graphs
+        )
+        execution_lane_overrides = (
+            _pad_override_lanes_for_cuda_graph(lane_overrides, target_names)
+            if tail_graph_safe
+            else lane_overrides
+        )
         context_assignment = {
             name: fmt
             for name, fmt in assignment_c.items()
@@ -3167,37 +3278,84 @@ def measure_override_paired_kl_deltas(
             frozen_context.__enter__()
             frozen_context_entered = True
             context_hooks.install()
-            for args, kwargs in iter_calibration_forwards(calib_ids, device):
-                base_batch = _first_tensor_batch_size(args, kwargs)
+            call_iter = (
+                cached_calls_for_graph
+                if cached_calls_for_graph is not None
+                else iter_calibration_forwards(calib_ids, device)
+            )
+            for call_item in call_iter:
+                if cached_calls_for_graph is not None:
+                    args, kwargs, base_batch = _move_cached_layer_call(
+                        call_item,
+                        device,
+                    )
+                else:
+                    args, kwargs = call_item
+                    base_batch = _first_tensor_batch_size(args, kwargs)
                 if target_hooks is None:
                     target_hooks = _OverrideSetTargetHooks(
                         model,
                         assignment_c,
                         specs_by_name,
-                        lane_overrides,
+                        execution_lane_overrides,
                         base_batch=base_batch,
                         quant_weight_cache=group_quant_cache,
                     )
                     target_hooks.install()
-                rep_args, rep_kwargs = _repeat_inputs_for_lanes(
-                    args,
-                    kwargs,
-                    len(lane_overrides),
-                )
-                logits = _extract_logits(model(*rep_args, **rep_kwargs))
+                if use_tail_chunk:
+                    layer = decoder_layers[int(replay_layer_idx)]
+                    if cached_calls_for_graph is not None:
+                        layer_args, layer_kwargs = args, kwargs
+                    else:
+                        layer_args, layer_kwargs = _capture_layer_call(
+                            model,
+                            layer,
+                            args,
+                            kwargs,
+                        )
+                    rep_args, rep_kwargs = _repeat_layer_call_for_lanes(
+                        layer_args,
+                        layer_kwargs,
+                        len(execution_lane_overrides),
+                        base_batch,
+                    )
+                    layer_output = layer(*rep_args, **rep_kwargs)
+                    hidden = _first_tensor_output(layer_output)
+                    if hidden is None:
+                        raise RuntimeError(
+                            "tail-only paired override decoder layer returned no tensor"
+                        )
+                    logits = tail_forward_from_layer(
+                        model,
+                        int(replay_layer_idx),
+                        rep_args,
+                        rep_kwargs,
+                        hidden,
+                        cuda_graph_cache=(
+                            tail_graph_cache if tail_graph_safe else None
+                        ),
+                        lane_count=len(execution_lane_overrides),
+                    )
+                else:
+                    rep_args, rep_kwargs = _repeat_inputs_for_lanes(
+                        args,
+                        kwargs,
+                        len(execution_lane_overrides),
+                    )
+                    logits = _extract_logits(model(*rep_args, **rep_kwargs))
                 if logits.dim() >= 3:
                     logits = logits[:, -1:, :]
                 chunks = _split_lanes(
                     logits.detach(),
                     base_batch,
-                    len(lane_overrides),
+                    len(execution_lane_overrides),
                 )
                 if chunks is None:
                     raise RuntimeError(
                         "paired override KL logits did not preserve lane "
                         f"batching: shape={tuple(logits.shape)} "
                         f"base_batch={base_batch} "
-                        f"lanes={len(lane_overrides)}"
+                        f"lanes={len(execution_lane_overrides)}"
                     )
                 for idx, (baseline_idx, candidate_idx) in enumerate(paired_indices):
                     teacher = F.log_softmax(
@@ -3223,7 +3381,7 @@ def measure_override_paired_kl_deltas(
                         "chunk_index": chunk_index,
                         "chunk_count": chunk_count,
                         "override_count": len(chunk),
-                        "lane_count": len(lane_overrides),
+                        "lane_count": len(execution_lane_overrides),
                         "batch_count": batch_count,
                         "elapsed_seconds": time.monotonic() - chunk_start,
                     }
@@ -3254,6 +3412,7 @@ def measure_override_paired_kl_deltas(
             )
         start += len(chunk)
 
+    tail_graph_cache.clear()
     if len(measured) != len(candidate_overrides):
         raise RuntimeError(
             "paired override KL produced "

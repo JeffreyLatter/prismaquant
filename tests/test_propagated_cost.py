@@ -17,6 +17,7 @@ from prismaquant.propagated_cost import (
     L3UnsupportedTargetError,
     L3NeighborhoodEntry,
     build_l3_candidates,
+    measure_override_paired_kl_deltas,
     measure_propagated_costs,
     select_formats_for_l3,
     select_l3_neighborhood,
@@ -810,6 +811,50 @@ def test_measure_propagated_costs_cached_tail_inputs_are_equivalent(tmp_path):
         cached,
         baseline,
     )
+    assert cached_forward_calls < baseline_forward_calls
+
+
+def test_measure_override_paired_kl_cached_tail_inputs_are_equivalent(tmp_path):
+    assignment = {
+        "layers.0.a": "MXFP8",
+        "layers.0.b": "MXFP8",
+        "layers.1.a": "MXFP8",
+        "layers.1.b": "MXFP8",
+    }
+    overrides = [
+        {"layers.1.a": "NVFP4", "layers.1.b": "NVFP4"},
+        {"layers.1.a": "BF16", "layers.1.b": "NVFP4"},
+        {"layers.1.a": "NVFP4", "layers.1.b": "BF16"},
+    ]
+    calib = torch.tensor(
+        [[1.0, -1.0], [0.5, -0.25], [-0.75, 0.25]],
+        dtype=torch.float32,
+    )
+
+    def _measure(*, tail_only: bool, cache_tail_layer_inputs: bool):
+        model = _TwoProjTailToy().eval()
+        values = measure_override_paired_kl_deltas(
+            model,
+            assignment,
+            overrides,
+            calib,
+            work_root=tmp_path,
+            max_lanes_per_batch=2,
+            tail_only=tail_only,
+            cache_tail_layer_inputs=cache_tail_layer_inputs,
+        )
+        return values, model.forward_calls
+
+    baseline, baseline_forward_calls = _measure(
+        tail_only=False,
+        cache_tail_layer_inputs=False,
+    )
+    cached, cached_forward_calls = _measure(
+        tail_only=True,
+        cache_tail_layer_inputs=True,
+    )
+
+    assert cached == pytest.approx(baseline, abs=1e-6, rel=1e-6)
     assert cached_forward_calls < baseline_forward_calls
 
 
