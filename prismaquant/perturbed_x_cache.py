@@ -33,8 +33,11 @@ from prismaquant.memory_management import (
     register_budget_evictor,
 )
 
-
 _FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
+_SHARED_FROZEN_WEIGHT_FORMAT_CACHE: OrderedDict[
+    tuple[str, str, int, str, str],
+    torch.Tensor,
+] = OrderedDict()
 
 
 def _env_truthy(name: str) -> bool:
@@ -180,6 +183,8 @@ def _build_module_plans(
     by_module: dict[int, _ModulePlan] = {}
     missing: list[str] = []
     for name, fmt in assignment.items():
+        if fr.canonical_format_name(fmt) == "BF16":
+            continue
         target = quant_map.get(name)
         if target is None:
             missing.append(name)
@@ -263,8 +268,12 @@ class PerturbedActivationCache:
             tuple[int, str], torch.Tensor
         ] | None = None
         self._frozen_weight_format_cache: OrderedDict[
-            tuple[str, str], torch.Tensor
-        ] = OrderedDict()
+            tuple[str, str, int, str, str], torch.Tensor
+        ] = (
+            _SHARED_FROZEN_WEIGHT_FORMAT_CACHE
+            if _env_truthy("PRISMAQUANT_SHARED_WEIGHT_FORMAT_CACHE")
+            else OrderedDict()
+        )
         self._fused_forward_originals: list[tuple[nn.Module, object]] = []
         self._fused_nvfp4_weight_cache: OrderedDict[
             tuple[str, str, str, int],
@@ -323,7 +332,13 @@ class PerturbedActivationCache:
         if not isinstance(param, torch.nn.Parameter) or param.is_meta:
             return None
         fmt = fr.canonical_format_name(spec.name)
-        cache_key = (param_plan.name, fmt)
+        cache_key = (
+            param_plan.name,
+            fmt,
+            int(param.data_ptr()),
+            str(param.device),
+            str(param.dtype),
+        )
         q = self._frozen_weight_format_cache.get(cache_key)
         if q is None:
             enforce_gpu_memory_budget(
@@ -494,8 +509,12 @@ class PerturbedActivationCache:
                 q = self._frozen_weight_cache.get(cache_key)
                 if q is not None:
                     self._frozen_weight_cache.move_to_end(cache_key)
+            if q is None and _env_truthy("PRISMAQUANT_SHARED_WEIGHT_FORMAT_CACHE"):
+                q = self._quantized_weight_for(plan, param_plan, param_plan.spec)
             if q is None:
                 q = param_plan.spec.quantize_dequantize(original)
+            if q is None:
+                continue
             param.data.copy_(q.to(device=param.device, dtype=param.dtype))
             plan.active_originals.append((param, original))
 

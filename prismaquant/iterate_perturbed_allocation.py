@@ -12,13 +12,16 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import pickle
+import random
 import tempfile
 import time
 from contextlib import nullcontext
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from itertools import combinations
 from numbers import Real
 from pathlib import Path
 
@@ -38,6 +41,7 @@ from prismaquant.build_rtn_cache import (
 )
 from prismaquant.measure_quant_cost import ActivationIndex, run_cost_pass
 from prismaquant.memory_management import (
+    cuda_memory_info,
     phase_boundary_memory_cleanup,
     report_graph_memory,
 )
@@ -48,16 +52,29 @@ from prismaquant.perturbed_x_cache import (
     load_text_model_under_work_root,
 )
 from prismaquant.layer_state_cache import LayerHiddenStateCache
+from prismaquant.discovery_rate import (
+    DiscoveryObservation,
+    decide_continue,
+    rank_buckets_by_upper_bound,
+    summarize_observations,
+)
+from prismaquant.interaction_refine import (
+    RefinementUnit,
+    UnitOption,
+    make_pair_key,
+    sparse_local_refine,
+)
 from prismaquant.propagated_cost import (
     CUDAGraphRegistry,
     L3NeighborhoodEntry,
     L3UnsupportedTargetError,
-    _env_flag_enabled,
+    _env_cuda_graphs_enabled_for_call_count,
     assignment_bit_total,
     build_global_l3_neighborhood,
     build_l3_candidates,
     layer_depth,
     measure_lane_batched_kl_deltas,
+    measure_override_paired_kl_deltas,
     measure_propagated_costs,
     select_l3_neighborhood,
     solve_frozen_l3_neighborhood,
@@ -508,6 +525,16 @@ def _make_l3_progress(
     return _l3_progress
 
 
+def _l3_output_mse_names(args) -> list[str] | None:
+    """Return downstream-MSE targets for PrismaClade L3 measurement.
+
+    Downstream output-MSE is useful diagnostics, but current L3 allocation and
+    coordinate descent consume propagated end-KL. Keep the metric opt-in on the
+    PrismaClade path so default runtime measures the actual decision signal.
+    """
+    return None if bool(getattr(args, "l3_output_mse", False)) else []
+
+
 def _append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
@@ -855,6 +882,7 @@ class L3PolishRun:
     coord_descent_flips: int
     coord_descent_passes: int
     cycle_detected: bool
+    validation_scout: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -1258,11 +1286,22 @@ def _filter_l3_candidates_for_assignment(
     return {
         name: list(cands)
         for name, cands in l3_candidates.items()
+        if _is_l3_mutable_target(name)
         if any(
             fr.canonical_format_name(c.fmt) == current_fmt_by_name.get(name)
             for c in cands
         )
     }
+
+
+def _is_l3_mutable_target(name: str) -> bool:
+    return not (name == "lm_head" or name.endswith(".lm_head"))
+
+
+def _filter_l3_neighborhood_entries(
+    selected: list[L3NeighborhoodEntry],
+) -> list[L3NeighborhoodEntry]:
+    return [entry for entry in selected if _is_l3_mutable_target(entry.name)]
 
 
 def _select_l3_neighborhood_for_assignment(
@@ -1289,7 +1328,32 @@ def _select_l3_neighborhood_for_assignment(
         )
     if measure_all_formats:
         selected = widen_l3_neighborhood_formats(selected, specs)
-    return selected
+    return _filter_l3_neighborhood_entries(selected)
+
+
+def _resolve_l3_measure_all_formats(args) -> bool:
+    requested = getattr(args, "l3_measure_all_formats", None)
+    return bool(requested) if requested is not None else False
+
+
+def _l3_scope_metadata(args) -> dict:
+    return {
+        "l3_mode": getattr(args, "l3_mode", "selective"),
+        "measure_all_formats": bool(
+            getattr(args, "_l3_measure_all_formats", False)
+        ),
+        "l3_uncertainty_rel_tol": float(
+            getattr(args, "l3_uncertainty_rel_tol", 0.10)
+        ),
+        "l3_min_fraction": float(getattr(args, "l3_min_fraction", 0.05)),
+        "l3_max_fraction": float(getattr(args, "l3_max_fraction", 0.30)),
+        "l3_safety_fraction": float(getattr(args, "l3_safety_fraction", 0.02)),
+        "l3_iter_max": int(getattr(args, "l3_iter_max", 3)),
+        "l3_hamming_cap_init": int(getattr(args, "l3_hamming_cap_init", 8)),
+        "l3_hamming_cap_max": int(getattr(args, "l3_hamming_cap_max", 64)),
+        "l3_validation_scout": bool(getattr(args, "l3_validation_scout", False)),
+        "l3_interaction_refine": bool(getattr(args, "l3_interaction_refine", False)),
+    }
 
 
 def _choose_current_l3_candidates(
@@ -1419,6 +1483,601 @@ def _l3_propagated_end_kl(entry: Mapping | None) -> float | None:
         return None
 
 
+def _candidate_bits_total(candidate: Candidate) -> float:
+    return 8.0 * float(candidate.memory_bytes)
+
+
+def _l3_candidate_units(
+    assignment: Mapping[str, str],
+    l3_candidates: Mapping[str, list[Candidate]],
+) -> list[RefinementUnit]:
+    units: list[RefinementUnit] = []
+    for name in sorted(l3_candidates):
+        base_fmt = fr.canonical_format_name(assignment.get(name, "BF16"))
+        options_by_fmt: dict[str, UnitOption] = {}
+        for cand in l3_candidates.get(name, []):
+            fmt = fr.canonical_format_name(cand.fmt)
+            options_by_fmt[fmt] = UnitOption(
+                fmt=fmt,
+                bits_total=_candidate_bits_total(cand),
+                predicted_dloss=float(cand.predicted_dloss),
+            )
+        if base_fmt not in options_by_fmt or len(options_by_fmt) < 2:
+            continue
+        options = tuple(
+            sorted(
+                options_by_fmt.values(),
+                key=lambda opt: (opt.bits_total, opt.predicted_dloss, opt.fmt),
+            )
+        )
+        units.append(
+            RefinementUnit(
+                key=name,
+                members=(name,),
+                base_fmt=base_fmt,
+                base_member_fmts=((name, base_fmt),),
+                options=options,
+            )
+        )
+    return units
+
+
+def _l3_option_cost(unit: RefinementUnit, fmt: str) -> float:
+    return float(unit.option_map[fr.canonical_format_name(fmt)].predicted_dloss)
+
+
+def _l3_interaction_unary(
+    units: list[RefinementUnit],
+) -> dict[str, dict[str, float]]:
+    unary: dict[str, dict[str, float]] = {}
+    for unit in units:
+        base_cost = _l3_option_cost(unit, unit.base_fmt)
+        unary[unit.key] = {
+            opt.fmt: float(opt.predicted_dloss) - base_cost
+            for opt in unit.options
+        }
+    return unary
+
+
+def _l3_interaction_allowed_options(
+    unit: RefinementUnit,
+    *,
+    radius: int,
+    preferred_fmt: str | None,
+) -> tuple[UnitOption, ...]:
+    opts = list(unit.options)
+    base_idx = next((i for i, opt in enumerate(opts) if opt.fmt == unit.base_fmt), 0)
+    radius = max(int(radius), 0)
+    selected = {
+        opt.fmt: opt
+        for opt in opts[max(0, base_idx - radius):base_idx + radius + 1]
+    }
+    selected[unit.base_fmt] = unit.option_map[unit.base_fmt]
+    if preferred_fmt is not None:
+        preferred = fr.canonical_format_name(preferred_fmt)
+        if preferred in unit.option_map:
+            selected[preferred] = unit.option_map[preferred]
+    return tuple(
+        sorted(
+            selected.values(),
+            key=lambda opt: (opt.bits_total, opt.predicted_dloss, opt.fmt),
+        )
+    )
+
+
+def _l3_select_interaction_units(
+    units: list[RefinementUnit],
+    candidate_assignment: Mapping[str, str],
+    *,
+    top_units: int,
+) -> list[RefinementUnit]:
+    scored = []
+    for unit in units:
+        candidate_fmt = fr.canonical_format_name(
+            candidate_assignment.get(unit.key, unit.base_fmt)
+        )
+        base_cost = _l3_option_cost(unit, unit.base_fmt)
+        if candidate_fmt in unit.option_map:
+            candidate_cost = _l3_option_cost(unit, candidate_fmt)
+        else:
+            candidate_cost = base_cost
+        span = max(
+            abs(float(opt.predicted_dloss) - base_cost)
+            for opt in unit.options
+        )
+        changed = candidate_fmt != unit.base_fmt
+        score = max(abs(candidate_cost - base_cost), span)
+        scored.append((0 if changed else 1, -score, unit.key, unit))
+    scored.sort()
+    return [row[-1] for row in scored[:max(int(top_units), 0)]]
+
+
+def _assignment_bits_total_from_specs(
+    stats: Mapping[str, Mapping],
+    assignment: Mapping[str, str],
+    specs: list[fr.FormatSpec],
+) -> float:
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
+    return assignment_bit_total(
+        stats,
+        {
+            name: fmt
+            for name, fmt in assignment.items()
+            if name in stats
+        },
+        specs_by_name,
+    )
+
+
+def _tracked_param_count(stats: Mapping[str, Mapping]) -> int:
+    return sum(int(entry.get("n_params", 0) or 0) for entry in stats.values())
+
+
+def _gpu_memory_gb_for_model(model) -> tuple[float | None, float | None]:
+    if model is None or not torch.cuda.is_available():
+        return None, None
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cuda")
+    if device.type != "cuda":
+        return None, None
+    info = cuda_memory_info(device)
+    if info is None:
+        return None, None
+    free_bytes, total_bytes = info
+    scale = float(1024 ** 3)
+    return float(free_bytes) / scale, float(total_bytes) / scale
+
+
+def _host_available_memory_gb() -> float | None:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return float(parts[1]) / (1024.0 * 1024.0)
+    except OSError:
+        return None
+    return None
+
+
+def _memory_aware_enabled(args) -> bool:
+    return bool(getattr(args, "memory_aware_l3", True))
+
+
+def _memory_class(stats: Mapping[str, Mapping]) -> str:
+    params_b = _tracked_param_count(stats) / 1.0e9
+    if params_b >= 20.0:
+        return "xxlarge"
+    if params_b >= 6.0:
+        return "xlarge"
+    if params_b >= 3.0:
+        return "large"
+    if params_b >= 1.0:
+        return "medium"
+    return "small"
+
+
+def _memory_aware_caps(stats: Mapping[str, Mapping]) -> dict[str, int]:
+    klass = _memory_class(stats)
+    if klass == "xxlarge":
+        return {
+            "n_calib_samples": 2,
+            "calib_seqlen": 128,
+            "l3_n_calib_samples": 2,
+            "l3_calib_seqlen": 128,
+            "input_rows": 64,
+            "chunk_size": 64,
+            "l3_max_lanes_per_batch": 8,
+            "l3_interaction_max_lanes_per_batch": 4,
+            "l3_validation_scout_max_candidates": 8,
+        }
+    if klass == "xlarge":
+        return {
+            "n_calib_samples": 3,
+            "calib_seqlen": 192,
+            "l3_n_calib_samples": 3,
+            "l3_calib_seqlen": 192,
+            "input_rows": 96,
+            "chunk_size": 96,
+            "l3_max_lanes_per_batch": 12,
+            "l3_interaction_max_lanes_per_batch": 8,
+            "l3_validation_scout_max_candidates": 12,
+        }
+    if klass == "large":
+        return {
+            "n_calib_samples": 2,
+            "calib_seqlen": 128,
+            "l3_n_calib_samples": 2,
+            "l3_calib_seqlen": 128,
+            "input_rows": 64,
+            "chunk_size": 64,
+            "l3_max_lanes_per_batch": 8,
+            "l3_interaction_max_lanes_per_batch": 6,
+            "l3_validation_scout_max_candidates": 16,
+        }
+    if klass == "medium":
+        return {
+            "l3_max_lanes_per_batch": 32,
+            "l3_interaction_max_lanes_per_batch": 16,
+            "l3_validation_scout_max_candidates": 32,
+        }
+    return {
+        "l3_max_lanes_per_batch": 64,
+        "l3_interaction_max_lanes_per_batch": 32,
+        "l3_validation_scout_max_candidates": 64,
+    }
+
+
+def _apply_memory_aware_runtime_policy(args, stats: Mapping[str, Mapping], model) -> None:
+    if not _memory_aware_enabled(args):
+        return
+    caps = _memory_aware_caps(stats)
+    changes: list[str] = []
+    resume_l3_costs = bool(
+        getattr(args, "resume_l3_costs", None)
+        or getattr(args, "resume_l3_costs_dir", None)
+    )
+    resume_locked_calibration = {
+        "n_calib_samples",
+        "calib_seqlen",
+        "l3_n_calib_samples",
+        "l3_calib_seqlen",
+    }
+    for attr, cap in caps.items():
+        if resume_l3_costs and attr in resume_locked_calibration:
+            continue
+        current = int(getattr(args, attr, cap))
+        if cap > 0 and current > cap:
+            setattr(args, attr, cap)
+            changes.append(f"{attr} {current}->{cap}")
+    if changes:
+        free_gb, total_gb = _gpu_memory_gb_for_model(model)
+        host_free_gb = _host_available_memory_gb()
+        params_b = _tracked_param_count(stats) / 1.0e9
+        mem_text = "unknown"
+        if free_gb is not None and total_gb is not None:
+            mem_text = f"free={free_gb:.1f}GB total={total_gb:.1f}GB"
+        if host_free_gb is not None:
+            mem_text = f"{mem_text} host_available={host_free_gb:.1f}GB"
+        _emit(
+            "[memory-aware] applying L3 safety caps "
+            f"class={_memory_class(stats)} tracked_params={params_b:.2f}B "
+            f"{mem_text}: {', '.join(changes)}"
+        )
+
+
+def _memory_aware_lane_cap(
+    args,
+    stats: Mapping[str, Mapping],
+    model,
+    requested: int,
+    *,
+    phase: str,
+) -> int:
+    requested = max(int(requested), 1)
+    if not _memory_aware_enabled(args):
+        return requested
+    caps = _memory_aware_caps(stats)
+    if phase == "interaction":
+        cap = caps.get("l3_interaction_max_lanes_per_batch", requested)
+    elif phase == "scout":
+        cap = caps.get("l3_max_lanes_per_batch", requested)
+    else:
+        cap = caps.get("l3_max_lanes_per_batch", requested)
+    free_gb, _total_gb = _gpu_memory_gb_for_model(model)
+    host_free_gb = _host_available_memory_gb()
+    if free_gb is not None:
+        if free_gb < 12.0:
+            cap = min(cap, 2)
+        elif free_gb < 24.0:
+            cap = min(cap, 4)
+        elif free_gb < 40.0:
+            cap = min(cap, 8)
+        elif free_gb < 70.0:
+            cap = min(cap, 16)
+    if host_free_gb is not None:
+        if host_free_gb < 8.0:
+            cap = min(cap, 1)
+        elif host_free_gb < 16.0:
+            cap = min(cap, 2)
+        elif host_free_gb < 32.0:
+            cap = min(cap, 4)
+        elif host_free_gb < 64.0:
+            cap = min(cap, 8)
+    return max(min(requested, int(cap)), 1)
+
+
+def _l3_interaction_enabled(args) -> bool:
+    return bool(getattr(args, "l3_interaction_refine", False))
+
+
+def run_l3_interaction_refine(
+    args,
+    model,
+    base_assignment: Mapping[str, str],
+    candidate_assignment: Mapping[str, str],
+    l3_candidates: Mapping[str, list[Candidate]],
+    stats: Mapping[str, Mapping],
+    specs: list[fr.FormatSpec],
+    target_bpp: float,
+    calib_ids: torch.Tensor,
+    *,
+    work_root: Path,
+    profile=None,
+    emit: Callable[[str], None] = _emit,
+    prefix: str = "[l3]",
+) -> tuple[dict[str, str], dict]:
+    meta = {
+        "enabled": _l3_interaction_enabled(args),
+        "attempted": False,
+        "selected_units": 0,
+        "pair_measurements": 0,
+        "changed": False,
+        "skipped_reason": None,
+        "solver_mode": str(getattr(args, "l3_interaction_solver", "budget")),
+        "lagrangian_bpp_penalty": float(
+            getattr(args, "l3_interaction_lagrangian_bpp_penalty", 0.0)
+        ),
+    }
+    if not meta["enabled"]:
+        meta["skipped_reason"] = "disabled"
+        return dict(candidate_assignment), meta
+
+    units = _l3_candidate_units(base_assignment, l3_candidates)
+    if len(units) < 2:
+        meta["skipped_reason"] = "too_few_units"
+        return dict(candidate_assignment), meta
+
+    total_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in set(stats) & set(base_assignment)
+    )
+    if total_params <= 0:
+        meta["skipped_reason"] = "empty_stats"
+        return dict(candidate_assignment), meta
+    target_total_bits = float(target_bpp) * float(total_params)
+    budget_tolerance_bits = (
+        max(float(getattr(args, "bit_precision", 0.001)), 0.0)
+        * float(total_params)
+    )
+    base_total_bits = _assignment_bits_total_from_specs(
+        stats,
+        base_assignment,
+        specs,
+    )
+    candidate_total_bits = _assignment_bits_total_from_specs(
+        stats,
+        candidate_assignment,
+        specs,
+    )
+    effective_target_total_bits = max(
+        target_total_bits + budget_tolerance_bits,
+        candidate_total_bits,
+    )
+    meta["base_total_bits"] = float(base_total_bits)
+    meta["candidate_total_bits"] = float(candidate_total_bits)
+    meta["target_total_bits"] = float(target_total_bits)
+    meta["budget_tolerance_bits"] = float(budget_tolerance_bits)
+
+    selected_units = _l3_select_interaction_units(
+        units,
+        candidate_assignment,
+        top_units=int(getattr(args, "l3_interaction_top_units", 8)),
+    )
+    if len(selected_units) < 2:
+        meta["skipped_reason"] = "too_few_selected_units"
+        return dict(candidate_assignment), meta
+
+    radius = int(getattr(args, "l3_interaction_neighbor_radius", 1))
+    allowed = {
+        unit.key: _l3_interaction_allowed_options(
+            unit,
+            radius=radius,
+            preferred_fmt=candidate_assignment.get(unit.key),
+        )
+        for unit in selected_units
+    }
+    selected_keys = {unit.key for unit in selected_units}
+    fixed_bits_total = _assignment_bits_total_from_specs(
+        stats,
+        {
+            name: fmt
+            for name, fmt in candidate_assignment.items()
+            if name not in selected_keys
+        },
+        specs,
+    )
+    unary = _l3_interaction_unary(selected_units)
+    unit_map = {unit.key: unit for unit in selected_units}
+
+    overrides: list[dict[str, str]] = []
+    override_meta: list[tuple[str, str, str, str, bool]] = []
+    measured_seen: set[tuple[tuple[str, str], ...]] = set()
+    max_pairs = max(int(getattr(args, "l3_interaction_max_pairs", 0)), 0)
+    for left, right in combinations(selected_units, 2):
+        combos: list[tuple[str, str, bool]] = []
+        combos.append((left.base_fmt, right.base_fmt, True))
+        for left_opt in allowed[left.key]:
+            for right_opt in allowed[right.key]:
+                if left_opt.fmt == left.base_fmt and right_opt.fmt == right.base_fmt:
+                    continue
+                combos.append((left_opt.fmt, right_opt.fmt, False))
+        for left_fmt, right_fmt, is_base in combos:
+            override = {
+                left.key: fr.canonical_format_name(left_fmt),
+                right.key: fr.canonical_format_name(right_fmt),
+            }
+            key = tuple(sorted(override.items()))
+            if key in measured_seen:
+                continue
+            measured_seen.add(key)
+            overrides.append(override)
+            override_meta.append((left.key, left_fmt, right.key, right_fmt, is_base))
+            if max_pairs > 0 and len(overrides) >= max_pairs:
+                break
+        if max_pairs > 0 and len(overrides) >= max_pairs:
+            break
+
+    if not overrides:
+        meta["skipped_reason"] = "empty_pair_frontier"
+        return dict(candidate_assignment), meta
+
+    meta.update(
+        {
+            "attempted": True,
+            "selected_units": len(selected_units),
+            "pair_measurements": len(overrides),
+        }
+    )
+    emit(
+        f"{prefix} interaction refine: selected {len(selected_units)} units; "
+        f"measuring {len(overrides)} paired overrides"
+    )
+    pair_measure_start = time.monotonic()
+    def _interaction_progress(event: dict) -> None:
+        kind = event.get("event")
+        if kind == "paired_override_chunk_start":
+            emit(
+                f"{prefix} interaction refine: pair chunk "
+                f"{event['chunk_index']}/{event['chunk_count']} start "
+                f"overrides={event['override_count']} lanes={event['lane_count']}"
+            )
+        elif kind == "paired_override_chunk_end":
+            emit(
+                f"{prefix} interaction refine: pair chunk "
+                f"{event['chunk_index']}/{event['chunk_count']} done "
+                f"overrides={event['override_count']} "
+                f"batches={event['batch_count']} "
+                f"elapsed={float(event['elapsed_seconds']):.1f}s"
+            )
+
+    requested_pair_lanes = min(
+        int(getattr(args, "l3_max_lanes_per_batch", 64)),
+        int(getattr(args, "l3_interaction_max_lanes_per_batch", 16)),
+    )
+    pair_lanes = _memory_aware_lane_cap(
+        args,
+        stats,
+        model,
+        requested_pair_lanes,
+        phase="interaction",
+    )
+    if pair_lanes < requested_pair_lanes:
+        emit(
+            f"{prefix} interaction refine: memory-aware lane cap "
+            f"{requested_pair_lanes}->{pair_lanes}"
+        )
+    pair_kls = measure_override_paired_kl_deltas(
+        model,
+        base_assignment,
+        overrides,
+        calib_ids,
+        work_root=work_root,
+        max_lanes_per_batch=pair_lanes,
+        profile=profile,
+        progress_callback=_interaction_progress,
+    )
+    pair_measure_seconds = time.monotonic() - pair_measure_start
+    meta["pair_measurement_seconds"] = float(pair_measure_seconds)
+    emit(
+        f"{prefix} interaction refine: measured {len(overrides)} paired "
+        f"overrides in {pair_measure_seconds:.1f}s"
+    )
+
+    base_residual_by_pair: dict[tuple[str, str], float] = {}
+    residual_rows = []
+    for (left_key, left_fmt, right_key, right_fmt, is_base), pair_kl in zip(
+        override_meta,
+        pair_kls,
+    ):
+        left_unit = unit_map[left_key]
+        right_unit = unit_map[right_key]
+        residual = (
+            float(pair_kl)
+            - _l3_option_cost(left_unit, left_fmt)
+            - _l3_option_cost(right_unit, right_fmt)
+        )
+        pair_id = tuple(sorted((left_key, right_key)))
+        if is_base:
+            base_residual_by_pair[pair_id] = residual
+        residual_rows.append(
+            (left_key, left_fmt, right_key, right_fmt, residual, is_base)
+        )
+
+    pairwise: dict[tuple[str, str, str, str], float] = {}
+    for left_key, left_fmt, right_key, right_fmt, residual, is_base in residual_rows:
+        if is_base:
+            continue
+        pair_id = tuple(sorted((left_key, right_key)))
+        base_residual = base_residual_by_pair.get(pair_id, 0.0)
+        pairwise[make_pair_key(left_key, left_fmt, right_key, right_fmt)] = (
+            residual - base_residual
+        )
+
+    try:
+        refined = sparse_local_refine(
+            selected_units,
+            unary,
+            pairwise,
+            target_total_bits=effective_target_total_bits,
+            fixed_bits_total=fixed_bits_total,
+            allowed=allowed,
+            max_passes=int(getattr(args, "l3_interaction_max_passes", 4)),
+            initial_choices={
+                unit.key: fr.canonical_format_name(
+                    candidate_assignment.get(unit.key, unit.base_fmt)
+                )
+                for unit in selected_units
+            },
+            exact_max_states=(
+                int(getattr(args, "l3_interaction_exact_max_states", 2_000_000))
+                if bool(getattr(args, "l3_interaction_exact", True))
+                else 0
+            ),
+            solver_mode=str(getattr(args, "l3_interaction_solver", "budget")),
+            lagrangian_bpp_penalty=float(
+                getattr(args, "l3_interaction_lagrangian_bpp_penalty", 0.0)
+            ),
+            total_params=float(total_params),
+        )
+    except ValueError as exc:
+        meta["skipped_reason"] = str(exc)
+        emit(f"{prefix} interaction refine: skipped {exc}")
+        return dict(candidate_assignment), meta
+
+    refined_assignment = dict(candidate_assignment)
+    for unit in selected_units:
+        fmt = refined["choices"].get(unit.key, unit.base_fmt)
+        refined_assignment[unit.key] = fmt
+    meta.update(
+        {
+            "objective_delta": float(refined["objective_delta"]),
+            "bits_total": float(refined["bits_total"]),
+            "bits_per_param": refined.get("bits_per_param"),
+            "solver": refined.get("solver"),
+            "lagrangian_objective": refined.get("lagrangian_objective"),
+            "lagrangian_bpp_penalty": refined.get("lagrangian_bpp_penalty"),
+            "states_evaluated": refined.get("states_evaluated"),
+            "state_count": refined.get("state_count"),
+            "nodes_visited": refined.get("nodes_visited"),
+            "states_pruned": refined.get("states_pruned"),
+            "changed": assignment_hash(refined_assignment)
+            != assignment_hash(candidate_assignment),
+        }
+    )
+    emit(
+        f"{prefix} interaction refine: objective_delta="
+        f"{float(refined['objective_delta']):.4e} "
+        f"solver={refined.get('solver', 'unknown')} "
+        f"bits_per_param={refined.get('bits_per_param')} "
+        f"changed={str(meta['changed']).lower()}"
+    )
+    return refined_assignment, meta
+
+
 def _coord_descent_ranked_candidates(
     assignment: Mapping[str, str],
     l3_costs: Mapping,
@@ -1446,6 +2105,655 @@ def _coord_descent_ranked_candidates(
             ranked.append((candidate_cost - current_cost, name, candidate_fmt))
     ranked.sort(key=lambda item: (item[0], item[1], item[2]))
     return ranked
+
+
+def _rank_bucket(rank: int) -> str:
+    if rank < 32:
+        return "rank_000_031"
+    if rank < 128:
+        return "rank_032_127"
+    if rank < 512:
+        return "rank_128_511"
+    return "rank_512_plus"
+
+
+def _module_leaf(name: str) -> str:
+    return str(name).split(".")[-1]
+
+
+def _module_family(name: str) -> str:
+    if ".self_attn." in name:
+        return "self_attn"
+    if ".mlp." in name:
+        return "mlp"
+    return "other"
+
+
+def _depth_bucket(name: str) -> str:
+    depth = layer_depth(name)
+    if depth is None:
+        return "depth_other"
+    start = (int(depth) // 4) * 4
+    return f"depth_{start:02d}_{start + 3:02d}"
+
+
+def _candidate_bucket(
+    *,
+    rank: int,
+    name: str,
+    current_fmt: str,
+    candidate_fmt: str,
+) -> str:
+    return "|".join(
+        (
+            _rank_bucket(rank),
+            _depth_bucket(name),
+            _module_family(name),
+            _module_leaf(name),
+            f"{current_fmt}->{candidate_fmt}",
+        )
+    )
+
+
+def _scout_rate_bucket(candidate_bucket: str) -> str:
+    return str(candidate_bucket).split("|", 1)[0]
+
+
+def _search_telemetry_path(args) -> Path | None:
+    raw = getattr(args, "_search_telemetry_path", None)
+    if raw is None:
+        raw = getattr(args, "search_telemetry_jsonl", None)
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _append_search_telemetry(args, payload: Mapping) -> None:
+    path = _search_telemetry_path(args)
+    if path is None:
+        return
+    _append_jsonl(path, dict(payload))
+
+
+def _candidate_trial_assignment(
+    assignment: Mapping[str, str],
+    name: str,
+    candidate_fmt: str,
+) -> dict[str, str]:
+    trial = dict(assignment)
+    trial[name] = fr.canonical_format_name(candidate_fmt)
+    return trial
+
+
+def _assignment_bits_bpp(
+    stats: Mapping[str, Mapping],
+    assignment: Mapping[str, str],
+    specs: list[fr.FormatSpec],
+) -> tuple[float, float]:
+    bits = _assignment_bits_total_from_specs(stats, assignment, specs)
+    total_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in set(stats) & set(assignment)
+    )
+    bpp = bits / float(total_params) if total_params > 0 else 0.0
+    return bits, bpp
+
+
+def _l3_validation_scout_enabled(args) -> bool:
+    return bool(getattr(args, "l3_validation_scout", False))
+
+
+def _l3_validation_scout_candidates(
+    args,
+    assignment: Mapping[str, str],
+    l3_costs: Mapping,
+    specs: list[fr.FormatSpec],
+    stats: Mapping[str, Mapping],
+    target_bpp: float,
+) -> list[dict]:
+    ranked = _coord_descent_ranked_candidates(assignment, l3_costs, specs)
+    max_predicted_delta = float(
+        getattr(args, "l3_validation_scout_max_predicted_delta", 0.0)
+    )
+    bpp_slack = max(float(getattr(args, "l3_validation_scout_bpp_slack", 0.25)), 0.0)
+    rows: list[dict] = []
+    for rank, (predicted_delta, name, candidate_fmt) in enumerate(ranked):
+        current_fmt = fr.canonical_format_name(assignment.get(name, ""))
+        candidate_fmt = fr.canonical_format_name(candidate_fmt)
+        if candidate_fmt == current_fmt:
+            continue
+        if float(predicted_delta) > max_predicted_delta:
+            continue
+        trial = _candidate_trial_assignment(assignment, name, candidate_fmt)
+        if not _within_assignment_budget(
+            stats,
+            trial,
+            specs,
+            target_bpp,
+            bpp_slack,
+        ):
+            continue
+        bits, bpp = _assignment_bits_bpp(stats, trial, specs)
+        rows.append(
+            {
+                "rank": rank,
+                "predicted_delta": float(predicted_delta),
+                "name": name,
+                "from_format": current_fmt,
+                "to_format": candidate_fmt,
+                "bucket": _candidate_bucket(
+                    rank=rank,
+                    name=name,
+                    current_fmt=current_fmt,
+                    candidate_fmt=candidate_fmt,
+                ),
+                "trial_bits": float(bits),
+                "trial_bpp": float(bpp),
+            }
+        )
+    return rows
+
+
+def _select_validation_scout_candidates(args, rows: list[dict]) -> list[dict]:
+    max_candidates = max(int(getattr(args, "l3_validation_scout_max_candidates", 64)), 0)
+    if max_candidates <= 0 or not rows:
+        return []
+    sample_per_bucket = max(
+        int(getattr(args, "l3_validation_scout_sample_per_bucket", 0)),
+        0,
+    )
+    rank_buckets = sorted({_rank_bucket(int(row["rank"])) for row in rows})
+    reserve = (
+        min(max_candidates, sample_per_bucket * max(len(rank_buckets) - 1, 0))
+        if sample_per_bucket > 0 else 0
+    )
+    top_k = min(max(max_candidates - reserve, 0), len(rows))
+    selected = list(rows[:top_k])
+    if sample_per_bucket <= 0 or len(selected) >= max_candidates:
+        return selected[:max_candidates]
+
+    selected_keys = {(row["name"], row["to_format"]) for row in selected}
+    dominant_bucket = _rank_bucket(int(rows[0]["rank"]))
+    by_bucket: dict[str, list[dict]] = {}
+    for row in rows[top_k:]:
+        bucket = _rank_bucket(int(row["rank"]))
+        if bucket == dominant_bucket:
+            continue
+        by_bucket.setdefault(bucket, []).append(row)
+    rng = random.Random(int(getattr(args, "l3_validation_scout_seed", 0)))
+    for bucket in sorted(by_bucket):
+        if len(selected) >= max_candidates:
+            break
+        candidates = [
+            row for row in by_bucket[bucket]
+            if (row["name"], row["to_format"]) not in selected_keys
+        ]
+        if not candidates:
+            continue
+        take = min(sample_per_bucket, len(candidates), max_candidates - len(selected))
+        for row in rng.sample(candidates, take):
+            selected.append(row)
+            selected_keys.add((row["name"], row["to_format"]))
+    selected.sort(key=lambda row: (int(row["rank"]), row["name"], row["to_format"]))
+    return selected
+
+
+def _scout_remaining_by_rate_bucket(rows: list[dict]) -> dict[str, int]:
+    remaining: dict[str, int] = {}
+    for row in rows:
+        bucket = _scout_rate_bucket(str(row["bucket"]))
+        remaining[bucket] = remaining.get(bucket, 0) + 1
+    return remaining
+
+
+def _scout_stop_config(args) -> dict:
+    raw_price = getattr(
+        args,
+        "l3_validation_scout_marginal_price_kl_per_second",
+        None,
+    )
+    enabled = raw_price is not None
+    marginal_price = float(raw_price) if enabled else None
+    if enabled and (
+        marginal_price is None
+        or not math.isfinite(marginal_price)
+        or marginal_price < 0.0
+    ):
+        raise ValueError(
+            "l3_validation_scout_marginal_price_kl_per_second must be "
+            "a finite non-negative value"
+        )
+    confidence = float(getattr(args, "l3_validation_scout_stop_confidence", 0.95))
+    gain_prior = float(getattr(args, "l3_validation_scout_gain_prior_kl", 0.0))
+    min_rounds = max(
+        int(getattr(args, "l3_validation_scout_min_stop_rounds", 1)),
+        1,
+    )
+    return {
+        "enabled": enabled,
+        "marginal_price_kl_per_second": marginal_price,
+        "confidence": confidence,
+        "gain_prior_kl": gain_prior,
+        "min_rounds": min_rounds,
+    }
+
+
+def _scout_economic_stop_decision(
+    observations: list[DiscoveryObservation],
+    *,
+    remaining_rows: list[dict],
+    config: Mapping,
+) -> dict | None:
+    if not config.get("enabled") or not observations:
+        return None
+    observed_buckets = sorted({obs.bucket for obs in observations})
+    remaining_by_bucket = _scout_remaining_by_rate_bucket(remaining_rows)
+    summaries = summarize_observations(
+        observations,
+        buckets=observed_buckets,
+        remaining_by_bucket={
+            bucket: remaining_by_bucket.get(bucket, 0)
+            for bucket in observed_buckets
+        },
+        gain_prior_kl=float(config.get("gain_prior_kl", 0.0)),
+        confidence=float(config.get("confidence", 0.95)),
+    )
+    decision = decide_continue(
+        summaries,
+        marginal_price_kl_per_second=float(
+            config["marginal_price_kl_per_second"]
+        ),
+    )
+    ranked = rank_buckets_by_upper_bound(summaries)
+    return {
+        "continue_search": bool(decision.continue_search),
+        "best_bucket": decision.best_bucket,
+        "best_upper_gain_per_second": float(decision.best_upper_gain_per_second),
+        "marginal_price_kl_per_second": float(
+            decision.marginal_price_kl_per_second
+        ),
+        "bucket_summaries": [
+            {
+                "bucket": summary.bucket,
+                "observations": int(summary.observations),
+                "hits": int(summary.hits),
+                "hit_rate": float(summary.hit_rate),
+                "hit_rate_upper": float(summary.hit_rate_upper),
+                "mean_gain_per_hit_kl": float(summary.mean_gain_per_hit_kl),
+                "gain_upper_kl": float(summary.gain_upper_kl),
+                "remaining_count": summary.remaining_count,
+                "empirical_gain_per_second": float(
+                    summary.empirical_gain_per_second
+                ),
+                "upper_gain_per_second": float(summary.upper_gain_per_second),
+            }
+            for summary in ranked[:8]
+        ],
+    }
+
+
+def run_l3_validation_scout(
+    args,
+    model,
+    current_assignment: Mapping[str, str],
+    current_kl: float,
+    l3_costs: Mapping,
+    specs: list[fr.FormatSpec],
+    target_bpp: float,
+    calib_ids: torch.Tensor,
+    ref_log_probs,
+    *,
+    stats: Mapping[str, Mapping],
+    work_root: Path,
+    profile=None,
+    emit: Callable[[str], None] | None = _emit,
+    prefix: str = "[l3]",
+) -> tuple[dict[str, str], float, dict]:
+    meta = {
+        "enabled": _l3_validation_scout_enabled(args),
+        "rounds_completed": 0,
+        "candidates_evaluated": 0,
+        "hits": 0,
+        "flips_committed": 0,
+        "elapsed_seconds": 0.0,
+        "best_gain_kl": 0.0,
+        "stopped_reason": "disabled",
+    }
+    if not meta["enabled"]:
+        return dict(current_assignment), float(current_kl), meta
+
+    stop_config = _scout_stop_config(args)
+    meta["economic_stop"] = {
+        "enabled": bool(stop_config["enabled"]),
+        "marginal_price_kl_per_second": stop_config[
+            "marginal_price_kl_per_second"
+        ],
+        "confidence": float(stop_config["confidence"]),
+        "gain_prior_kl": float(stop_config["gain_prior_kl"]),
+        "min_rounds": int(stop_config["min_rounds"]),
+        "checks": [],
+    }
+    observations: list[DiscoveryObservation] = []
+    attempted_by_assignment: dict[str, set[tuple[str, str]]] = {}
+    assignment = dict(current_assignment)
+    kl = float(current_kl)
+    max_rounds = max(int(getattr(args, "l3_validation_scout_rounds", 1)), 0)
+    requested_lanes_per_batch = max(
+        int(getattr(args, "l3_max_lanes_per_batch", 64)),
+        1,
+    )
+    lanes_per_batch = _memory_aware_lane_cap(
+        args,
+        stats,
+        model,
+        requested_lanes_per_batch,
+        phase="scout",
+    )
+    min_improvement = max(
+        float(getattr(args, "l3_validation_scout_min_improvement", 0.0)),
+        0.0,
+    )
+    commit_best = bool(getattr(args, "l3_validation_scout_commit_best", True))
+    overall_start = time.monotonic()
+    bits_before, bpp_before = _assignment_bits_bpp(stats, assignment, specs)
+
+    if emit is not None:
+        emit(
+            f"{prefix} validation scout: start rounds={max_rounds} "
+            f"max_candidates={getattr(args, 'l3_validation_scout_max_candidates', 64)} "
+            f"sample_per_bucket={getattr(args, 'l3_validation_scout_sample_per_bucket', 0)}"
+        )
+
+    for round_idx in range(1, max_rounds + 1):
+        assignment_digest = _assignment_digest(assignment)
+        attempted_for_assignment = attempted_by_assignment.setdefault(
+            assignment_digest,
+            set(),
+        )
+        all_candidate_rows = _l3_validation_scout_candidates(
+            args,
+            assignment,
+            l3_costs,
+            specs,
+            stats,
+            target_bpp,
+        )
+        candidate_rows = [
+            row for row in all_candidate_rows
+            if (row["name"], row["to_format"]) not in attempted_for_assignment
+        ]
+        selected = _select_validation_scout_candidates(args, candidate_rows)
+        if _memory_aware_enabled(args):
+            scout_cap = _memory_aware_caps(stats).get(
+                "l3_validation_scout_max_candidates",
+                len(selected),
+            )
+            if len(selected) > scout_cap:
+                selected = selected[:scout_cap]
+        if not selected:
+            meta["stopped_reason"] = (
+                "no_untried_candidates" if all_candidate_rows else "no_candidates"
+            )
+            break
+        meta["rounds_completed"] = round_idx
+        _append_search_telemetry(
+            args,
+            {
+                "event": "validation_scout_round_start",
+                "candidate_source": "l3_ranked_unary",
+                "prefix": prefix,
+                "round": round_idx,
+                "target_bpp": float(target_bpp),
+                "eligible_candidates": len(candidate_rows),
+                "eligible_candidates_total": len(all_candidate_rows),
+                "selected_candidates": len(selected),
+                "assignment_hash_before": assignment_digest,
+                "bpp_before": float(bpp_before),
+            },
+        )
+        if emit is not None:
+            emit(
+                f"{prefix} validation scout: round {round_idx} "
+                f"evaluating {len(selected)} / {len(candidate_rows)} candidates"
+            )
+
+        round_best: tuple[float, dict] | None = None
+        chunk_index = 0
+        for start in range(0, len(selected), lanes_per_batch):
+            chunk_index += 1
+            chunk = selected[start:start + lanes_per_batch]
+            flips = [(row["name"], row["to_format"]) for row in chunk]
+            chunk_start = time.monotonic()
+            if emit is not None:
+                emit(
+                    f"{prefix} validation scout: round {round_idx} "
+                    f"chunk {chunk_index} start lanes={len(chunk)}"
+                )
+            measured_kls = measure_lane_batched_kl_deltas(
+                model,
+                assignment,
+                flips,
+                calib_ids,
+                ref_log_probs,
+                work_root=work_root,
+                max_lanes_per_batch=lanes_per_batch,
+                profile=profile,
+            )
+            elapsed = time.monotonic() - chunk_start
+            seconds_per_candidate = elapsed / max(len(chunk), 1)
+            for row, trial_kl_raw in zip(chunk, measured_kls):
+                trial_kl = float(trial_kl_raw)
+                gain = max(0.0, kl - trial_kl)
+                hit = bool(gain > min_improvement + 1e-12)
+                meta["candidates_evaluated"] += 1
+                if hit:
+                    meta["hits"] += 1
+                    meta["best_gain_kl"] = max(float(meta["best_gain_kl"]), gain)
+                trial = _candidate_trial_assignment(
+                    assignment,
+                    row["name"],
+                    row["to_format"],
+                )
+                trial_bits, trial_bpp = _assignment_bits_bpp(stats, trial, specs)
+                _append_search_telemetry(
+                    args,
+                    {
+                        "event": "validation_scout_candidate",
+                        "candidate_source": "l3_ranked_unary",
+                        "prefix": prefix,
+                        "round": round_idx,
+                        "chunk_index": chunk_index,
+                        "target_bpp": float(target_bpp),
+                        "eligible_candidates": len(candidate_rows),
+                        "eligible_candidates_total": len(all_candidate_rows),
+                        "selected_candidates": len(selected),
+                        "rank": int(row["rank"]),
+                        "bucket": row["bucket"],
+                        "name": row["name"],
+                        "from_format": row["from_format"],
+                        "to_format": row["to_format"],
+                        "predicted_delta_kl": float(row["predicted_delta"]),
+                        "kl_before": float(kl),
+                        "kl_after": trial_kl,
+                        "actual_delta_kl": trial_kl - kl,
+                        "gain_kl": gain,
+                        "hit": hit,
+                        "seconds": seconds_per_candidate,
+                        "assignment_hash_before": _assignment_digest(assignment),
+                        "assignment_hash_after": _assignment_digest(trial),
+                        "bits_before": float(bits_before),
+                        "bits_after": float(trial_bits),
+                        "bpp_before": float(bpp_before),
+                        "bpp_after": float(trial_bpp),
+                    },
+                )
+                attempted_for_assignment.add((row["name"], row["to_format"]))
+                observations.append(
+                    DiscoveryObservation(
+                        _scout_rate_bucket(str(row["bucket"])),
+                        hit=hit,
+                        gain_kl=gain,
+                        seconds=seconds_per_candidate,
+                    )
+                )
+                if round_best is None or trial_kl < round_best[0]:
+                    round_best = (trial_kl, row)
+            if emit is not None:
+                best_text = ""
+                if round_best is not None:
+                    best_text = (
+                        f" best={round_best[1]['name']}->"
+                        f"{round_best[1]['to_format']} "
+                        f"kl={round_best[0]:.4e}"
+                    )
+                emit(
+                    f"{prefix} validation scout: round {round_idx} "
+                    f"chunk {chunk_index} done elapsed={elapsed:.1f}s{best_text}"
+                )
+
+        if round_best is None:
+            meta["stopped_reason"] = "empty_measurement"
+            break
+        best_kl, best_row = round_best
+        best_gain = kl - float(best_kl)
+        if not commit_best:
+            meta["stopped_reason"] = "measured_only"
+            break
+        if best_gain <= min_improvement + 1e-12:
+            meta["stopped_reason"] = "no_validated_improvement"
+            if (
+                stop_config.get("enabled")
+                and round_idx >= int(stop_config["min_rounds"])
+                and round_idx < max_rounds
+            ):
+                remaining_rows = [
+                    row for row in all_candidate_rows
+                    if (row["name"], row["to_format"])
+                    not in attempted_for_assignment
+                ]
+                stop_check = _scout_economic_stop_decision(
+                    observations,
+                    remaining_rows=remaining_rows,
+                    config=stop_config,
+                )
+                if stop_check is not None:
+                    stop_check["round"] = round_idx
+                    stop_check["remaining_candidates"] = len(remaining_rows)
+                    meta["economic_stop"]["checks"].append(stop_check)
+                    _append_search_telemetry(
+                        args,
+                        {
+                            "event": "validation_scout_stop_check",
+                            "candidate_source": "l3_ranked_unary",
+                            "prefix": prefix,
+                            "round": round_idx,
+                            "target_bpp": float(target_bpp),
+                            "assignment_hash": assignment_digest,
+                            "remaining_candidates": len(remaining_rows),
+                            **stop_check,
+                        },
+                    )
+                    if stop_check["continue_search"]:
+                        meta["stopped_reason"] = "max_rounds"
+                        if emit is not None:
+                            emit(
+                                f"{prefix} validation scout: no commit in "
+                                f"round {round_idx}, continuing; "
+                                f"best_upper_gain_per_second="
+                                f"{stop_check['best_upper_gain_per_second']:.4e}"
+                            )
+                        continue
+                    meta["stopped_reason"] = "marginal_gain_below_price"
+            break
+        old_fmt = assignment.get(best_row["name"], "")
+        assignment[best_row["name"]] = best_row["to_format"]
+        old_kl = kl
+        kl = float(best_kl)
+        bits_before, bpp_before = _assignment_bits_bpp(stats, assignment, specs)
+        meta["flips_committed"] += 1
+        meta["stopped_reason"] = "max_rounds"
+        _append_search_telemetry(
+            args,
+            {
+                "event": "validation_scout_commit",
+                "candidate_source": "l3_ranked_unary",
+                "prefix": prefix,
+                "round": round_idx,
+                "target_bpp": float(target_bpp),
+                "name": best_row["name"],
+                "from_format": old_fmt,
+                "to_format": best_row["to_format"],
+                "kl_before": float(old_kl),
+                "kl_after": float(kl),
+                "gain_kl": float(best_gain),
+                "assignment_hash_after": _assignment_digest(assignment),
+                "bpp_after": float(bpp_before),
+            },
+        )
+        if emit is not None:
+            emit(
+                f"{prefix} validation scout COMMIT: {best_row['name']}."
+                f"{old_fmt} -> {best_row['to_format']} "
+                f"kl {old_kl:.4e} -> {kl:.4e} "
+                f"(gain={best_gain:.4e})"
+            )
+
+        if (
+            stop_config.get("enabled")
+            and round_idx >= int(stop_config["min_rounds"])
+            and round_idx < max_rounds
+        ):
+            next_rows = _l3_validation_scout_candidates(
+                args,
+                assignment,
+                l3_costs,
+                specs,
+                stats,
+                target_bpp,
+            )
+            stop_check = _scout_economic_stop_decision(
+                observations,
+                remaining_rows=next_rows,
+                config=stop_config,
+            )
+            if stop_check is not None:
+                stop_check["round"] = round_idx
+                stop_check["remaining_candidates"] = len(next_rows)
+                meta["economic_stop"]["checks"].append(stop_check)
+                _append_search_telemetry(
+                    args,
+                    {
+                        "event": "validation_scout_stop_check",
+                        "candidate_source": "l3_ranked_unary",
+                        "prefix": prefix,
+                        "round": round_idx,
+                        "target_bpp": float(target_bpp),
+                        "assignment_hash": _assignment_digest(assignment),
+                        "remaining_candidates": len(next_rows),
+                        **stop_check,
+                    },
+                )
+                if not stop_check["continue_search"]:
+                    meta["stopped_reason"] = "marginal_gain_below_price"
+                    if emit is not None:
+                        emit(
+                            f"{prefix} validation scout: economic stop "
+                            f"best_upper_gain_per_second="
+                            f"{stop_check['best_upper_gain_per_second']:.4e} "
+                            f"price="
+                            f"{stop_check['marginal_price_kl_per_second']:.4e}"
+                        )
+                    break
+
+    meta["elapsed_seconds"] = time.monotonic() - overall_start
+    if emit is not None:
+        emit(
+            f"{prefix} validation scout: done rounds={meta['rounds_completed']} "
+            f"evaluated={meta['candidates_evaluated']} hits={meta['hits']} "
+            f"commits={meta['flips_committed']} "
+            f"halted={meta['stopped_reason']} KL={kl:.4e}"
+        )
+    return assignment, kl, meta
 
 
 def _coord_descent_lane_batch_count(
@@ -1492,10 +2800,17 @@ def _coord_lane_batch_enabled() -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _coord_replay_cache_enabled() -> bool:
     value = os.environ.get("PRISMAQUANT_COORD_REPLAY_CACHE")
     if value is None:
-        return True
+        return False
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
@@ -1603,7 +2918,10 @@ def coordinate_descent_polish(
             for plan in hooks.plans
             for param_plan in plan.params
         }
-        if cached_names:
+        if cached_names and _env_flag_enabled(
+            "PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE",
+            default=True,
+        ):
             cache_cm = hooks.frozen_weight_cache()
 
     with cache_cm:
@@ -1951,6 +3269,7 @@ def run_iterated_l3_polish(
     latest_l3_costs: dict = {}
     latest_selected: list[L3NeighborhoodEntry] = []
     frozen_dp_meta: dict = {"frozen_dp_precision_used": "none"}
+    latest_interaction_meta: dict = {"enabled": False, "attempted": False}
     measurement_seconds = 0.0
     dp_seconds = 0.0
     validation_seconds = 0.0
@@ -2015,6 +3334,7 @@ def run_iterated_l3_polish(
                 profile=profile,
                 max_lanes_per_batch=getattr(args, "l3_max_lanes_per_batch", 16),
                 tail_only=getattr(args, "l3_tail_only", True),
+                output_mse_names=_l3_output_mse_names(args),
                 progress_callback=_make_l3_progress(emit, prefix=prefix),
             )
             measure_elapsed = time.monotonic() - measure_start
@@ -2059,13 +3379,33 @@ def run_iterated_l3_polish(
                 budget_tolerance=getattr(args, "frozen_dp_budget_tolerance", 0.0),
             )
         )
+        additive_candidate_assignment = dict(candidate_assignment)
+        candidate_assignment, interaction_meta = run_l3_interaction_refine(
+            args,
+            model,
+            l3_assignment,
+            candidate_assignment,
+            l3_candidates,
+            stats,
+            specs,
+            target_bpp,
+            l3_calib_ids,
+            work_root=work_root,
+            profile=profile,
+            emit=emit,
+            prefix=prefix,
+        )
+        latest_interaction_meta = dict(interaction_meta)
+        interaction_changed = (
+            assignment_hash(candidate_assignment)
+            != assignment_hash(additive_candidate_assignment)
+        )
         dp_elapsed = time.monotonic() - dp_start
         dp_peak_iter = _cuda_peak_gb()
         dp_seconds += float(dp_elapsed)
         if dp_peak_iter is not None:
             dp_peak = dp_peak_iter if dp_peak is None else max(dp_peak, dp_peak_iter)
 
-        candidate_hamming = _hamming_count(l3_assignment, candidate_assignment)
         _report_graph_memory(f"{prefix} iteration {iteration} before_validation")
         validation_start = time.monotonic()
         candidate_kl = measure_assignment_kl(
@@ -2076,6 +3416,28 @@ def run_iterated_l3_polish(
             work_root=work_root,
             profile=profile,
         )
+        if interaction_changed:
+            additive_kl = measure_assignment_kl(
+                model,
+                additive_candidate_assignment,
+                calib_ids,
+                ref_log_probs,
+                work_root=work_root,
+                profile=profile,
+            )
+            latest_interaction_meta["additive_candidate_kl"] = float(additive_kl)
+            latest_interaction_meta["interaction_candidate_kl"] = float(candidate_kl)
+            if float(additive_kl) + 1e-12 < float(candidate_kl):
+                emit(
+                    f"{prefix} interaction refine: validation rollback to "
+                    f"additive KL={float(additive_kl):.4e} "
+                    f"interaction_KL={float(candidate_kl):.4e}"
+                )
+                candidate_assignment = dict(additive_candidate_assignment)
+                candidate_kl = float(additive_kl)
+                latest_interaction_meta["validation_rollback_to_additive"] = True
+            else:
+                latest_interaction_meta["validation_rollback_to_additive"] = False
         validation_elapsed = time.monotonic() - validation_start
         validation_peak_iter = _cuda_peak_gb()
         _report_graph_memory(f"{prefix} iteration {iteration} after_validation")
@@ -2086,6 +3448,7 @@ def run_iterated_l3_polish(
                 if validation_peak is None else max(validation_peak, validation_peak_iter)
             )
         candidate_kl = float(candidate_kl)
+        candidate_hamming = _hamming_count(l3_assignment, candidate_assignment)
         proposed_assignment = dict(candidate_assignment)
         proposed_kl = candidate_kl
         allowed_regression = (
@@ -2104,6 +3467,7 @@ def run_iterated_l3_polish(
             "assignment_hash": list(candidate_hash),
             "cycle": False,
             "selected_count": len(selected),
+            "interaction_refine": latest_interaction_meta,
         }
         iteration_records.append(record)
         emit(
@@ -2146,6 +3510,38 @@ def run_iterated_l3_polish(
         "lane_batched": _coord_lane_batch_enabled(),
         "max_lanes_per_batch": int(getattr(args, "l3_max_lanes_per_batch", 64)),
     }
+    scout_meta = {
+        "enabled": False,
+        "rounds_completed": 0,
+        "candidates_evaluated": 0,
+        "hits": 0,
+        "flips_committed": 0,
+        "elapsed_seconds": 0.0,
+        "stopped_reason": "disabled",
+    }
+    if _l3_validation_scout_enabled(args):
+        scout_start = time.monotonic()
+        l3_assignment, current_kl, scout_meta = run_l3_validation_scout(
+            args,
+            model,
+            l3_assignment,
+            current_kl,
+            latest_smoothed_l3 or latest_l3_costs,
+            specs,
+            target_bpp,
+            calib_ids,
+            ref_log_probs,
+            stats=stats,
+            work_root=work_root,
+            profile=profile,
+            emit=emit,
+            prefix=prefix,
+        )
+        validation_seconds += time.monotonic() - scout_start
+        if scout_meta.get("flips_committed"):
+            proposed_assignment = dict(l3_assignment)
+            proposed_kl = float(current_kl)
+
     if bool(getattr(args, "l3_coord_descent_fallback", True)):
         coord_passes = max(0, int(getattr(args, "l3_coord_descent_max_passes", 1)))
         coord_start = time.monotonic()
@@ -2227,6 +3623,7 @@ def run_iterated_l3_polish(
         coord_descent_flips=int(coord_meta["flips_committed"]),
         coord_descent_passes=int(coord_meta["passes_completed"]),
         cycle_detected=cycle_detected,
+        validation_scout=scout_meta,
     )
 
 
@@ -2348,6 +3745,19 @@ def threshold_knee_search(
     }
 
 
+def knee_candidate_from_points(points: list[tuple[float, float]]) -> dict | None:
+    if not points:
+        return None
+    knee_bpp, knee_kl, score, endpoint = segmented_kneedle_point(points)
+    return {
+        "mode": "kneedle_on_evaluated_points",
+        "chosen_bpp": float(knee_bpp),
+        "validation_kl": float(knee_kl),
+        "kneedle_score": float(score),
+        "endpoint_fallback": bool(endpoint),
+    }
+
+
 def _bpp_label(value: float) -> str:
     return f"{float(value):.2f}"
 
@@ -2408,6 +3818,19 @@ def _write_budget_artifacts(
     output_root.mkdir(parents=True, exist_ok=True)
     assignment_path = output_root / f"final_assignment_bpp_{label}.json"
     layer_config_path = output_root / f"final_layer_config_bpp_{label}.json"
+    with open(assignment_path, "w") as f:
+        json.dump(dict(sorted(assignment.items())), f, indent=2)
+    write_layer_config(assignment, layer_config_path)
+    return assignment_path, layer_config_path
+
+
+def _write_named_assignment_artifacts(
+    assignment: Mapping[str, str],
+    *,
+    assignment_path: Path,
+    layer_config_path: Path,
+) -> tuple[Path, Path]:
+    assignment_path.parent.mkdir(parents=True, exist_ok=True)
     with open(assignment_path, "w") as f:
         json.dump(dict(sorted(assignment.items())), f, indent=2)
     write_layer_config(assignment, layer_config_path)
@@ -2546,6 +3969,15 @@ def run_anchor_budget(
         f"[multi][l2] anchor {anchor_label}: "
         f"{'converged' if convergence_reached else 'max-iters'}"
     )
+    l2_assignment_path, l2_layer_config_path = _write_named_assignment_artifacts(
+        assignment,
+        assignment_path=anchor_dir / f"l2_assignment_bpp_{anchor_label}.json",
+        layer_config_path=anchor_dir / f"l2_layer_config_bpp_{anchor_label}.json",
+    )
+    _emit(
+        f"[multi][l2] anchor {anchor_label}: wrote L2 seed "
+        f"{l2_assignment_path} and {l2_layer_config_path}"
+    )
     _phase_boundary_cleanup(f"anchor_{anchor_label}_l2_to_l3")
     _report_graph_memory(f"anchor_{anchor_label}_l2_to_l3")
     _report_graph_memory(f"[multi][l3] anchor {anchor_label} before_validation")
@@ -2558,14 +3990,14 @@ def run_anchor_budget(
         profile=runtime.profile,
     )
     _report_graph_memory(f"[multi][l3] anchor {anchor_label} after_validation")
-    selected = build_global_l3_neighborhood(
+    selected = _select_l3_neighborhood_for_assignment(
+        args,
         runtime.stats,
         latest_smoothed_costs,
         assignment,
         runtime.specs,
+        measure_all_formats=measure_all_formats,
     )
-    if measure_all_formats:
-        selected = widen_l3_neighborhood_formats(selected, runtime.specs)
     resume_path = _resume_l3_cost_path_for_anchor(args, anchor_bpp)
     resumed_l3: L3ResumeCosts | None = None
     if resume_path is not None:
@@ -2596,6 +4028,7 @@ def run_anchor_budget(
             profile=runtime.profile,
             max_lanes_per_batch=args.l3_max_lanes_per_batch,
             tail_only=args.l3_tail_only,
+            output_mse_names=_l3_output_mse_names(args),
             progress_callback=_make_l3_progress(
                 _emit,
                 prefix=f"[multi][l3] anchor {anchor_label}:",
@@ -2604,7 +4037,7 @@ def run_anchor_budget(
         _report_graph_memory(f"[multi][l3] anchor {anchor_label} after_l3_measurement")
     l3_cost_path = anchor_dir / "l3_propagated_costs.pkl"
     meta_extra = {
-        "l3_mode": "global",
+        "l3_mode": getattr(args, "l3_mode", "selective"),
         "measure_all_formats": bool(measure_all_formats),
         "resumed_from": str(resumed_l3.path) if resumed_l3 is not None else None,
     }
@@ -2759,8 +4192,7 @@ def run_single_budget(
 
 def run_multi_budget(args, runtime: BudgetRuntime) -> int:
     targets = parse_target_bits_list(args.target_bits_list)
-    span = max(targets) - min(targets)
-    measure_all_formats = bool(span > 1.0)
+    measure_all_formats = _resolve_l3_measure_all_formats(args)
     args._runtime = runtime
     args._l3_measure_all_formats = measure_all_formats
     clusters = plan_target_bit_clusters(
@@ -2797,7 +4229,7 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
             if not result.accepted and l3_kl > l2_kl * 1.05:
                 _emit(
                     "[multi] WARNING: L3 polish regressed L2 by >5% — "
-                    "likely non-additive cost interaction; consider --l3-mode selective"
+                    "likely non-additive cost interaction; consider tighter L3 scope"
                 )
         _phase_boundary_cleanup(
             f"anchor_{_bpp_label(float(cluster['anchor']))}_to_next_anchor"
@@ -2810,7 +4242,8 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
             "targets": targets,
             "share_tolerance": float(args.target_bits_share_tolerance),
             "clusters": clusters,
-            "measure_all_formats": measure_all_formats,
+            **_l3_scope_metadata(args),
+            "search_telemetry": str(_search_telemetry_path(args)),
         },
     )
     summary = {
@@ -2821,6 +4254,8 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
             "clusters": clusters,
             "csv": str(csv_path),
             "json": str(json_path),
+            "search_telemetry": str(_search_telemetry_path(args)),
+            **_l3_scope_metadata(args),
             "points": [result.as_record() for result in results],
         }
     }
@@ -2835,9 +4270,7 @@ def run_multi_budget(args, runtime: BudgetRuntime) -> int:
 
 def run_knee_search(args, runtime: BudgetRuntime) -> int:
     args._runtime = runtime
-    args._l3_measure_all_formats = bool(
-        float(args.knee_bpp_max) - float(args.knee_bpp_min) > 1.0
-    )
+    args._l3_measure_all_formats = _resolve_l3_measure_all_formats(args)
     anchors: list[AnchorResult] = []
     results_by_bpp: dict[float, BudgetResult] = {}
 
@@ -2903,6 +4336,9 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             "mode": "knee_search",
             "knee": knee_meta,
             "evaluated_points": points,
+            "knee_max_evaluations": int(args.knee_max_evaluations),
+            "knee_tolerance": float(args.knee_tolerance),
+            **_l3_scope_metadata(args),
         },
     )
     knee_assignment_path = runtime.output_root / "knee_assignment.json"
@@ -2915,6 +4351,9 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
             "mode": "knee_search",
             "csv": str(csv_path),
             "json": str(json_path),
+            "knee_max_evaluations": int(args.knee_max_evaluations),
+            "knee_tolerance": float(args.knee_tolerance),
+            **_l3_scope_metadata(args),
             "points": [result.as_record() for result in results],
         },
         "knee": {
@@ -2931,6 +4370,138 @@ def run_knee_search(args, runtime: BudgetRuntime) -> int:
     _emit("===== summary =====")
     _emit(f"Knee bpp: {chosen.target_bpp:.2f}")
     _emit(f"Knee assignment: {knee_assignment_path}")
+    _emit(f"Pareto CSV: {csv_path}")
+    _emit("===================")
+    return 0
+
+
+def run_quality_equivalent_search(args, runtime: BudgetRuntime) -> int:
+    """Find the smallest bpp matching a higher-bit reference KL."""
+    args._runtime = runtime
+    reference_bpp = float(args.quality_equivalent_bits)
+    bpp_min = float(args.quality_equivalent_bpp_min)
+    args._l3_measure_all_formats = _resolve_l3_measure_all_formats(args)
+    anchors: list[AnchorResult] = []
+    results_by_bpp: dict[float, BudgetResult] = {}
+
+    def _nearest_anchor(bpp: float) -> AnchorResult | None:
+        eligible = [
+            anchor
+            for anchor in anchors
+            if abs(anchor.anchor_bpp - float(bpp))
+            <= float(args.target_bits_share_tolerance) + 1e-12
+        ]
+        if not eligible:
+            return None
+        return min(eligible, key=lambda a: abs(a.anchor_bpp - float(bpp)))
+
+    def _evaluate_result(bpp: float) -> BudgetResult:
+        key = round(float(bpp), 8)
+        if key in results_by_bpp:
+            return results_by_bpp[key]
+        anchor = _nearest_anchor(float(bpp))
+        if anchor is None:
+            anchor = run_anchor_budget(
+                args,
+                runtime,
+                float(bpp),
+                measure_all_formats=bool(args._l3_measure_all_formats),
+            )
+            anchors.append(anchor)
+        result = run_single_budget(args, float(bpp), reusable_anchor=anchor)
+        results_by_bpp[key] = result
+        _phase_boundary_cleanup(
+            f"quality_equiv_eval_{_bpp_label(float(bpp))}_complete"
+        )
+        return result
+
+    def _evaluate_kl(bpp: float) -> float:
+        return float(_evaluate_result(float(bpp)).validation_kl)
+
+    reference = _evaluate_result(reference_bpp)
+    threshold_kl = (
+        float(reference.validation_kl)
+        + float(args.quality_equivalent_kl_slack)
+    )
+    chosen_bpp, points, threshold_meta = threshold_knee_search(
+        _evaluate_kl,
+        bpp_min,
+        reference_bpp,
+        threshold_kl=threshold_kl,
+        tolerance=float(args.quality_equivalent_bpp_tolerance),
+        max_evaluations=int(args.quality_equivalent_max_evaluations),
+    )
+    chosen_key = round(float(chosen_bpp), 8)
+    if chosen_key not in results_by_bpp:
+        _evaluate_result(float(chosen_bpp))
+    chosen = results_by_bpp[chosen_key]
+    results = list(results_by_bpp.values())
+    knee_meta = knee_candidate_from_points(points)
+    csv_path, json_path = _write_pareto_outputs(
+        runtime.output_root,
+        results,
+        metadata={
+            "mode": "quality_equivalent",
+            "reference_bpp": reference_bpp,
+            "reference_validation_kl": float(reference.validation_kl),
+            "kl_slack": float(args.quality_equivalent_kl_slack),
+            "threshold_kl": threshold_kl,
+            "threshold": threshold_meta,
+            "evaluated_points": points,
+            "knee_candidate": knee_meta,
+            **_l3_scope_metadata(args),
+            "search_telemetry": str(_search_telemetry_path(args)),
+        },
+    )
+    assignment_path = runtime.output_root / "quality_equivalent_assignment.json"
+    with open(assignment_path, "w") as f:
+        json.dump(dict(sorted(chosen.assignment.items())), f, indent=2)
+    config_path = runtime.output_root / "final_layer_config_quality_equivalent.json"
+    write_layer_config(chosen.assignment, config_path)
+    summary = {
+        "pareto": {
+            "mode": "quality_equivalent",
+            "csv": str(csv_path),
+            "json": str(json_path),
+            "search_telemetry": str(_search_telemetry_path(args)),
+            **_l3_scope_metadata(args),
+            "points": [result.as_record() for result in results],
+        },
+        "quality_equivalent": {
+            "reference_bpp": reference_bpp,
+            "reference_validation_kl": float(reference.validation_kl),
+            "kl_slack": float(args.quality_equivalent_kl_slack),
+            "threshold_kl": threshold_kl,
+            "chosen_bpp": float(chosen.target_bpp),
+            "chosen_achieved_bpp": float(chosen.achieved_bpp),
+            "validation_kl": float(chosen.validation_kl),
+            "threshold": threshold_meta,
+            "evaluated_points": points,
+            "knee_candidate": knee_meta,
+            "assignment": str(assignment_path),
+            "layer_config": str(config_path),
+        },
+    }
+    with open(runtime.output_root / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    _emit("===== summary =====")
+    _emit(
+        "Quality-equivalent target: "
+        f"{reference_bpp:.2f} bpp KL={reference.validation_kl:.4g} "
+        f"+ slack={float(args.quality_equivalent_kl_slack):.4g} "
+        f"=> threshold={threshold_kl:.4g}"
+    )
+    _emit(
+        f"Quality-equivalent bpp: {chosen.target_bpp:.2f} "
+        f"(achieved={chosen.achieved_bpp:.4f}, KL={chosen.validation_kl:.4g})"
+    )
+    if knee_meta is not None:
+        _emit(
+            "Evaluated-point knee candidate: "
+            f"{knee_meta['chosen_bpp']:.2f} bpp "
+            f"(KL={knee_meta['validation_kl']:.4g})"
+        )
+    _emit(f"Quality-equivalent assignment: {assignment_path}")
     _emit(f"Pareto CSV: {csv_path}")
     _emit("===================")
     return 0
@@ -3015,6 +4586,11 @@ def measure_assignment_kl(
     device = next(model.parameters()).device
     calib_ids = _prepare_kl_tensor_inputs(calib_ids, device)
     ref_log_probs = _prepare_ref_log_probs_for_kl(ref_log_probs, device)
+    if use_frozen_weight_cache and not _env_flag_enabled(
+        "PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE",
+        default=True,
+    ):
+        use_frozen_weight_cache = False
     hooks = perturbed_cache
     if hooks is None:
         cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_kl_hooks_", dir=str(work_root)))
@@ -3028,9 +4604,11 @@ def measure_assignment_kl(
             profile=profile,
         )
     values = []
-    use_cuda_graphs = _env_flag_enabled(
+    use_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
         "PRISMAQUANT_KL_CUDA_GRAPHS",
-        default=True,
+        default="auto",
+        call_count=int(calib_ids.size(0)),
+        min_calls=16,
     )
     graph_key = (
         id(model),
@@ -3121,6 +4699,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--knee-mode", choices=["kneedle", "threshold"], default="kneedle")
     ap.add_argument("--knee-threshold-kl", type=float)
     ap.add_argument("--knee-max-evaluations", type=int, default=12)
+    ap.add_argument(
+        "--quality-equivalent-bits",
+        "--quality-equivalent-to-bits",
+        dest="quality_equivalent_bits",
+        type=float,
+        help=(
+            "Find the smallest bpp whose validated KL is no worse than the "
+            "validated KL of this reference bpp plus --quality-equivalent-kl-slack."
+        ),
+    )
+    ap.add_argument("--quality-equivalent-bpp-min", type=float, default=4.0)
+    ap.add_argument("--quality-equivalent-bpp-tolerance", type=float, default=0.1)
+    ap.add_argument("--quality-equivalent-max-evaluations", type=int, default=12)
+    ap.add_argument("--quality-equivalent-kl-slack", type=float, default=0.0)
     ap.add_argument("--work-dir", required=True)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--initial-config")
@@ -3133,6 +4725,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--device-map", default=None)
     ap.add_argument("--dtype", default="bf16")
+    ap.add_argument(
+        "--memory-aware-l3",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Clamp calibration, lane batching, and validation-scout breadth "
+            "based on tracked model size and current CUDA memory."
+        ),
+    )
     ap.add_argument("--bit-precision", type=float, default=0.001)
     ap.add_argument("--cost-mode", default="auto", choices=["auto", "unbatched", "batched"])
     ap.add_argument("--chunk-size", type=int, default=128)
@@ -3155,6 +4756,24 @@ def main(argv: list[str] | None = None) -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use decoder tail-only L3 propagation when the model supports it.",
+    )
+    ap.add_argument(
+        "--l3-output-mse",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also collect downstream output-MSE diagnostics during L3. "
+            "Disabled by default because allocation uses propagated end-KL."
+        ),
+    )
+    ap.add_argument(
+        "--l3-measure-all-formats",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Measure every available L3 format instead of the L2-neighbor "
+            "filter. Defaults to auto: enabled for wide multi-target spans."
+        ),
     )
     ap.add_argument(
         "--resume-l3-costs",
@@ -3216,6 +4835,187 @@ def main(argv: list[str] | None = None) -> int:
         help="Max coordinate-descent passes after iterated L3.",
     )
     ap.add_argument(
+        "--l3-validation-scout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run a bounded validation-backed one-flip scout after L3. "
+            "This logs per-candidate outcomes for marginal-value stopping."
+        ),
+    )
+    ap.add_argument(
+        "--l3-validation-scout-rounds",
+        type=int,
+        default=1,
+        help="Maximum validation-scout rounds; each round can commit one best flip.",
+    )
+    ap.add_argument(
+        "--l3-validation-scout-max-candidates",
+        type=int,
+        default=64,
+        help="Maximum validation-scout candidates per round.",
+    )
+    ap.add_argument(
+        "--l3-validation-scout-sample-per-bucket",
+        type=int,
+        default=0,
+        help="Additional stable-random validation-scout samples per rank bucket.",
+    )
+    ap.add_argument(
+        "--l3-validation-scout-seed",
+        type=int,
+        default=0,
+        help="Stable random seed for validation-scout exploration samples.",
+    )
+    ap.add_argument(
+        "--l3-validation-scout-bpp-slack",
+        type=float,
+        default=0.25,
+        help="Allowed bpp above target for validation-scout trial flips.",
+    )
+    ap.add_argument(
+        "--l3-validation-scout-max-predicted-delta",
+        type=float,
+        default=0.0,
+        help=(
+            "Largest L3-predicted KL delta eligible for validation scout; "
+            "0 means only predicted non-worsening flips."
+        ),
+    )
+    ap.add_argument(
+        "--l3-validation-scout-min-improvement",
+        type=float,
+        default=0.0,
+        help="Minimum KL gain required for a validation-scout hit/commit.",
+    )
+    ap.add_argument(
+        "--l3-validation-scout-marginal-price-kl-per-second",
+        type=float,
+        default=None,
+        help=(
+            "Enable empirical discovery-rate stopping. After the minimum "
+            "stop rounds, continue only while the best bucket's one-sided "
+            "upper-bound gain/sec exceeds this price."
+        ),
+    )
+    ap.add_argument(
+        "--l3-validation-scout-min-stop-rounds",
+        type=int,
+        default=1,
+        help="Minimum validation-scout rounds before economic stopping can fire.",
+    )
+    ap.add_argument(
+        "--l3-validation-scout-stop-confidence",
+        type=float,
+        default=0.95,
+        help="One-sided confidence for validation-scout discovery-rate upper bounds.",
+    )
+    ap.add_argument(
+        "--l3-validation-scout-gain-prior-kl",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional non-negative gain prior used by validation-scout "
+            "discovery-rate bounds for sparse/all-miss buckets."
+        ),
+    )
+    ap.add_argument(
+        "--l3-validation-scout-commit-best",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Commit the best validated validation-scout flip in each round.",
+    )
+    ap.add_argument(
+        "--search-telemetry-jsonl",
+        help=(
+            "Path for candidate-search telemetry JSONL. Defaults to "
+            "<output-dir>/search_telemetry.jsonl."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-refine",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Measure sparse pairwise L3 interaction residuals near the DP "
+            "proposal and run a bounded local quadratic refiner."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-top-units",
+        type=int,
+        default=8,
+        help="Maximum Linear units included in sparse L3 interaction refinement.",
+    )
+    ap.add_argument(
+        "--l3-interaction-neighbor-radius",
+        type=int,
+        default=1,
+        help="Format-neighborhood radius around each selected unit's current format.",
+    )
+    ap.add_argument(
+        "--l3-interaction-max-pairs",
+        type=int,
+        default=0,
+        help=(
+            "Cap paired override measurements for interaction refinement; "
+            "0 means no explicit cap."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-max-lanes-per-batch",
+        type=int,
+        default=16,
+        help=(
+            "Maximum live lanes for paired interaction measurement. Pairwise "
+            "overrides have a higher transient memory footprint than unary L3, "
+            "so this defaults lower than --l3-max-lanes-per-batch."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-max-passes",
+        type=int,
+        default=4,
+        help="Max local-search passes for the sparse quadratic L3 refiner.",
+    )
+    ap.add_argument(
+        "--l3-interaction-solver",
+        choices=("budget", "lagrangian", "qubo"),
+        default="budget",
+        help=(
+            "Objective for sparse interaction refinement. 'budget' minimizes "
+            "KL under the target bit budget. 'lagrangian'/'qubo' minimize "
+            "KL + lambda*bpp and can move along the Pareto frontier."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-lagrangian-bpp-penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "Lambda for --l3-interaction-solver=lagrangian/qubo, in KL units "
+            "per additional bpp."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-exact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Exactly solve measured sparse interaction subproblems when the "
+            "option-state count is below --l3-interaction-exact-max-states."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-exact-max-states",
+        type=int,
+        default=2_000_000,
+        help=(
+            "Maximum option combinations to enumerate exactly in the sparse "
+            "interaction refiner; larger subproblems fall back to greedy local search."
+        ),
+    )
+    ap.add_argument(
         "--coord-descent-early-stop-streak",
         type=int,
         default=50,
@@ -3235,12 +5035,13 @@ def main(argv: list[str] | None = None) -> int:
             args.target_bits is not None,
             args.target_bits_list is not None,
             bool(args.knee_search),
+            args.quality_equivalent_bits is not None,
         ]
     )
     if budget_mode_count != 1:
         ap.error(
             "Specify exactly one of --target-bits, --target-bits-list, "
-            "or --knee-search."
+            "--knee-search, or --quality-equivalent-bits."
         )
     if (
         args.knee_search
@@ -3260,8 +5061,27 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("--knee-bpp-min must be less than --knee-bpp-max.")
         if args.knee_max_evaluations < 3:
             ap.error("--knee-max-evaluations must be at least 3.")
-    if (args.target_bits_list is not None or args.knee_search) and not args.l3_polish:
-        ap.error("--target-bits-list and --knee-search require --l3-polish.")
+    if args.quality_equivalent_bits is not None:
+        if args.quality_equivalent_bpp_min >= args.quality_equivalent_bits:
+            ap.error(
+                "--quality-equivalent-bpp-min must be less than "
+                "--quality-equivalent-bits."
+            )
+        if args.quality_equivalent_bpp_tolerance <= 0:
+            ap.error("--quality-equivalent-bpp-tolerance must be positive.")
+        if args.quality_equivalent_max_evaluations < 3:
+            ap.error("--quality-equivalent-max-evaluations must be at least 3.")
+        if args.quality_equivalent_kl_slack < 0:
+            ap.error("--quality-equivalent-kl-slack must be non-negative.")
+    if (
+        args.target_bits_list is not None
+        or args.knee_search
+        or args.quality_equivalent_bits is not None
+    ) and not args.l3_polish:
+        ap.error(
+            "--target-bits-list, --knee-search, and "
+            "--quality-equivalent-bits require --l3-polish."
+        )
     if (args.resume_l3_costs or args.resume_l3_costs_dir) and not args.l3_polish:
         ap.error("--resume-l3-costs requires --l3-polish.")
     try:
@@ -3272,17 +5092,21 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(str(exc))
     args._resume_l3_costs_single = resume_single
     args._resume_l3_costs_by_anchor = resume_by_anchor
-    if args.target_bits_list is not None or args.knee_search:
-        args.l3_mode = "global"
-
     work_root = Path(args.work_dir)
     output_root = Path(args.output_dir)
     work_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
     iteration_trace_path = output_root / "iteration_trace.jsonl"
     l3_trace_path = output_root / "l3_polish_trace.jsonl"
+    search_telemetry_path = (
+        Path(args.search_telemetry_jsonl)
+        if args.search_telemetry_jsonl
+        else output_root / "search_telemetry.jsonl"
+    )
+    args._search_telemetry_path = search_telemetry_path
     iteration_trace_path.write_text("")
     l3_trace_path.write_text("")
+    search_telemetry_path.write_text("")
 
     probe_load_start = _phase_start("[init] probe load")
     with open(args.probe, "rb") as f:
@@ -3315,6 +5139,7 @@ def main(argv: list[str] | None = None) -> int:
         device_map=args.device_map,
     )
     model_device = next(model.parameters()).device
+    _apply_memory_aware_runtime_policy(args, stats, model)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     calib_ids = load_wikitext_calibration(
         tokenizer,
@@ -3354,6 +5179,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_multi_budget(args, runtime)
     if args.knee_search:
         return run_knee_search(args, runtime)
+    if args.quality_equivalent_bits is not None:
+        return run_quality_equivalent_search(args, runtime)
 
     if args.initial_config:
         assignment = load_assignment_config(args.initial_config)
@@ -3666,6 +5493,7 @@ def main(argv: list[str] | None = None) -> int:
         except L3UnsupportedTargetError as exc:
             _emit(f"[l3] ERROR: packed experts present in L3 selection: {exc}")
             raise
+        selected = _filter_l3_neighborhood_entries(selected)
         selection_timing = _phase_end("[l3] selection", selection_start)
         n_uncertain = sum(1 for entry in selected if "uncertain" in entry.reasons)
         n_safety = sum(1 for entry in selected if "high_l2_cost" in entry.reasons)
@@ -3931,6 +5759,7 @@ def main(argv: list[str] | None = None) -> int:
         l3_summary["coord_descent_fired"] = bool(polish_run.coord_descent_fired)
         l3_summary["coord_descent_flips"] = int(polish_run.coord_descent_flips)
         l3_summary["coord_descent_passes"] = int(polish_run.coord_descent_passes)
+        l3_summary["validation_scout"] = polish_run.validation_scout
         l3_summary["frozen_dp_attempts"] = frozen_dp_meta.get("frozen_dp_attempts")
         l3_summary["frozen_dp_greedy"] = frozen_dp_meta.get("frozen_dp_greedy")
         l3_summary["frozen_dp_budget_tolerance"] = frozen_dp_meta.get(
@@ -4021,6 +5850,7 @@ def main(argv: list[str] | None = None) -> int:
         "converged": convergence_reached,
         "probe_load_timing": probe_load_timing,
         "iteration_trace": str(iteration_trace_path),
+        "search_telemetry": str(search_telemetry_path),
         "marginal_cost": marginal_cost,
     }
     if l3_summary_path is not None:

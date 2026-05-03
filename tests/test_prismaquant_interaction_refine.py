@@ -83,6 +83,125 @@ class TestInteractionRefine(unittest.TestCase):
         self.assertEqual(refined["choices"]["a"], "MXFP8")
         self.assertEqual(refined["choices"]["b"], "MXFP8")
         self.assertLess(refined["objective_delta"], 0.0)
+        self.assertEqual(refined["solver"], "exact")
+        self.assertLess(refined["states_evaluated"], refined["state_count"])
+
+    def test_sparse_local_refine_can_disable_exact_solver(self):
+        units = build_refinement_units(
+            {
+                "a": {"n_params": 8, "out_features": 4, "in_features": 2},
+                "b": {"n_params": 8, "out_features": 4, "in_features": 2},
+            },
+            {
+                "a": [Candidate("NVFP4", 4.5, 0, 2.0), Candidate("MXFP8", 8.25, 0, 0.8)],
+                "b": [Candidate("NVFP4", 4.5, 0, 2.0), Candidate("MXFP8", 8.25, 0, 0.8)],
+            },
+            {"a": "NVFP4", "b": "NVFP4"},
+        )
+        allowed = {u.key: neighborhood_options(u, 1) for u in units}
+        unary = {
+            "a": {"NVFP4": 0.0, "MXFP8": 0.1},
+            "b": {"NVFP4": 0.0, "MXFP8": 0.1},
+        }
+        pairwise = {("a", "MXFP8", "b", "MXFP8"): -0.4}
+        base_bits = sum(u.option_map[u.base_fmt].bits_total for u in units)
+
+        refined = sparse_local_refine(
+            units=units,
+            unary=unary,
+            pairwise=pairwise,
+            target_total_bits=base_bits + 100.0,
+            fixed_bits_total=0.0,
+            allowed=allowed,
+            exact_max_states=0,
+        )
+
+        self.assertEqual(refined["solver"], "greedy_local")
+
+    def test_sparse_local_refine_lagrangian_trades_kl_against_bits(self):
+        units = build_refinement_units(
+            {
+                "a": {"n_params": 100, "out_features": 10, "in_features": 10},
+                "b": {"n_params": 100, "out_features": 10, "in_features": 10},
+            },
+            {
+                "a": [Candidate("NVFP4", 4.5, 0, 2.0), Candidate("MXFP8", 8.0, 0, 0.5)],
+                "b": [Candidate("NVFP4", 4.5, 0, 2.0), Candidate("MXFP8", 8.0, 0, 0.5)],
+            },
+            {"a": "NVFP4", "b": "NVFP4"},
+        )
+        allowed = {u.key: neighborhood_options(u, 1) for u in units}
+        unary = {
+            "a": {"NVFP4": 0.0, "MXFP8": -0.05},
+            "b": {"NVFP4": 0.0, "MXFP8": -0.04},
+        }
+        base_bits = sum(u.option_map[u.base_fmt].bits_total for u in units)
+
+        low_penalty = sparse_local_refine(
+            units=units,
+            unary=unary,
+            pairwise={},
+            target_total_bits=base_bits,
+            fixed_bits_total=0.0,
+            allowed=allowed,
+            solver_mode="lagrangian",
+            lagrangian_bpp_penalty=0.0,
+            total_params=200.0,
+        )
+        high_penalty = sparse_local_refine(
+            units=units,
+            unary=unary,
+            pairwise={},
+            target_total_bits=base_bits,
+            fixed_bits_total=0.0,
+            allowed=allowed,
+            solver_mode="lagrangian",
+            lagrangian_bpp_penalty=0.1,
+            total_params=200.0,
+        )
+
+        self.assertEqual(low_penalty["solver"], "lagrangian_exact")
+        self.assertEqual(low_penalty["choices"]["a"], "MXFP8")
+        self.assertEqual(low_penalty["choices"]["b"], "MXFP8")
+        self.assertEqual(high_penalty["choices"]["a"], "NVFP4")
+        self.assertEqual(high_penalty["choices"]["b"], "NVFP4")
+
+    def test_exact_sparse_local_refine_prunes_by_objective_bound(self):
+        units = build_refinement_units(
+            {
+                name: {"n_params": 8, "out_features": 4, "in_features": 2}
+                for name in ("a", "b", "c")
+            },
+            {
+                name: [
+                    Candidate("NVFP4", 4.5, 0, 0.0),
+                    Candidate("MXFP8", 8.25, 0, 10.0),
+                ]
+                for name in ("a", "b", "c")
+            },
+            {"a": "NVFP4", "b": "NVFP4", "c": "NVFP4"},
+        )
+        allowed = {u.key: neighborhood_options(u, 1) for u in units}
+        unary = {
+            name: {"NVFP4": 0.0, "MXFP8": 10.0}
+            for name in ("a", "b", "c")
+        }
+        base_bits = sum(u.option_map[u.base_fmt].bits_total for u in units)
+
+        refined = sparse_local_refine(
+            units=units,
+            unary=unary,
+            pairwise={},
+            target_total_bits=base_bits + 100.0,
+            fixed_bits_total=0.0,
+            allowed=allowed,
+            max_passes=4,
+        )
+
+        self.assertEqual(refined["solver"], "exact")
+        self.assertEqual(refined["state_count"], 8)
+        self.assertLess(refined["states_evaluated"], refined["state_count"])
+        self.assertGreater(refined["states_pruned"], 0)
 
     def test_expand_unit_assignment_projects_to_members(self):
         units = build_refinement_units(

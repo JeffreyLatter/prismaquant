@@ -13,6 +13,7 @@ from prismaquant.layer_state_cache import LayerHiddenStateCache
 from prismaquant.perturbed_x_cache import PerturbedActivationCache
 from prismaquant.propagated_cost import (
     FrozenBudgetError,
+    GPUMemoryBudgetExceeded,
     L3UnsupportedTargetError,
     L3NeighborhoodEntry,
     build_l3_candidates,
@@ -26,6 +27,61 @@ from prismaquant.propagated_cost import (
 
 def _specs():
     return [fr.get_format(n) for n in ("NVFP4", "MXFP8", "BF16")]
+
+
+def test_cuda_graph_auto_mode_requires_enough_repeated_calls(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_L3_CUDA_GRAPHS", raising=False)
+    assert pc._env_cuda_graphs_enabled_for_call_count(
+        "PRISMAQUANT_L3_CUDA_GRAPHS",
+        call_count=4,
+        min_calls=8,
+    ) is False
+    assert pc._env_cuda_graphs_enabled_for_call_count(
+        "PRISMAQUANT_L3_CUDA_GRAPHS",
+        call_count=8,
+        min_calls=8,
+    ) is True
+
+    monkeypatch.setenv("PRISMAQUANT_L3_CUDA_GRAPHS", "1")
+    assert pc._env_cuda_graphs_enabled_for_call_count(
+        "PRISMAQUANT_L3_CUDA_GRAPHS",
+        call_count=1,
+        min_calls=8,
+    ) is True
+
+    monkeypatch.setenv("PRISMAQUANT_L3_CUDA_GRAPHS", "0")
+    assert pc._env_cuda_graphs_enabled_for_call_count(
+        "PRISMAQUANT_L3_CUDA_GRAPHS",
+        call_count=64,
+        min_calls=8,
+    ) is False
+
+
+def test_cuda_graph_auto_mode_honors_min_calls_override(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_COORD_LANE_CUDA_GRAPHS", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_CUDA_GRAPHS_MIN_CALLS", "3")
+
+    assert pc._env_cuda_graphs_enabled_for_call_count(
+        "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+        call_count=2,
+        min_calls=16,
+    ) is False
+    assert pc._env_cuda_graphs_enabled_for_call_count(
+        "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+        call_count=3,
+        min_calls=16,
+    ) is True
+
+
+def test_l3_host_memory_floor_raises_before_oom(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_L3_MIN_HOST_MEM_GB", "24")
+    monkeypatch.setattr(pc, "_host_available_memory_gb", lambda: 3.0)
+
+    with pytest.raises(GPUMemoryBudgetExceeded, match="host MemAvailable"):
+        pc._enforce_l3_host_memory_floor(
+            phase="paired_override_kl",
+            chunk_index=3,
+        )
 
 
 def _stat(n_params=128 * 128):

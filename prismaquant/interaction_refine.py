@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
+from math import prod
 
 from .allocator import Candidate, _shape_from_stats, _group_by_profile
 
@@ -252,8 +253,24 @@ def objective_delta(
     for left, right in combinations(sorted(choices), 2):
         lfmt = choices[left]
         rfmt = choices[right]
-        total += pairwise.get((left, lfmt, right, rfmt), 0.0)
+        total += _pairwise_value(pairwise, left, lfmt, right, rfmt)
     return total
+
+
+def make_pair_key(left_unit: str, left_fmt: str, right_unit: str, right_fmt: str):
+    if left_unit <= right_unit:
+        return (left_unit, left_fmt, right_unit, right_fmt)
+    return (right_unit, right_fmt, left_unit, left_fmt)
+
+
+def _pairwise_value(
+    pairwise: dict[tuple[str, str, str, str], float],
+    left_unit: str,
+    left_fmt: str,
+    right_unit: str,
+    right_fmt: str,
+) -> float:
+    return float(pairwise.get(make_pair_key(left_unit, left_fmt, right_unit, right_fmt), 0.0))
 
 
 def _bits_total_for_choices(
@@ -275,6 +292,324 @@ def _candidate_choice_maps(units: list[RefinementUnit], allowed: dict[str, tuple
     return out
 
 
+def _initial_choice_map(
+    units: list[RefinementUnit],
+    option_maps: dict[str, dict[str, UnitOption]],
+    initial_choices: dict[str, str] | None,
+) -> dict[str, str]:
+    current = {unit.key: unit.base_fmt for unit in units}
+    if initial_choices:
+        for unit in units:
+            fmt = initial_choices.get(unit.key)
+            if fmt in option_maps[unit.key]:
+                current[unit.key] = fmt
+    return current
+
+
+def _exact_local_refine(
+    units: list[RefinementUnit],
+    unary: dict[str, dict[str, float]],
+    pairwise: dict[tuple[str, str, str, str], float],
+    target_total_bits: float,
+    fixed_bits_total: float,
+    option_maps: dict[str, dict[str, UnitOption]],
+    initial_choices: dict[str, str] | None,
+) -> dict:
+    unit_map = {unit.key: unit for unit in units}
+    initial = _initial_choice_map(units, option_maps, initial_choices)
+    initial_bits = _bits_total_for_choices(initial, unit_map, fixed_bits_total)
+    if initial_bits > target_total_bits + 1e-6:
+        raise ValueError("initial refinement state exceeds target budget")
+
+    ordered_units = sorted(
+        units,
+        key=lambda unit: (len(option_maps[unit.key]), unit.key),
+        reverse=True,
+    )
+    option_lists = [
+        tuple(option_maps[unit.key].values())
+        for unit in ordered_units
+    ]
+    state_count = prod(max(len(options), 1) for options in option_lists)
+    suffix_min_bits = [0.0 for _unit in range(len(ordered_units) + 1)]
+    for idx in range(len(ordered_units) - 1, -1, -1):
+        suffix_min_bits[idx] = suffix_min_bits[idx + 1] + min(
+            opt.bits_total for opt in option_lists[idx]
+        )
+    suffix_min_unary = [0.0 for _unit in range(len(ordered_units) + 1)]
+    for idx in range(len(ordered_units) - 1, -1, -1):
+        unit = ordered_units[idx]
+        suffix_min_unary[idx] = suffix_min_unary[idx + 1] + min(
+            float(unary.get(unit.key, {}).get(opt.fmt, 0.0))
+            for opt in option_lists[idx]
+        )
+    pair_min_by_index: dict[tuple[int, int], float] = {}
+    for left_idx, right_idx in combinations(range(len(ordered_units)), 2):
+        left = ordered_units[left_idx]
+        right = ordered_units[right_idx]
+        pair_min_by_index[(left_idx, right_idx)] = min(
+            _pairwise_value(pairwise, left.key, left_opt.fmt, right.key, right_opt.fmt)
+            for left_opt in option_lists[left_idx]
+            for right_opt in option_lists[right_idx]
+        )
+    suffix_min_unassigned_pairwise = [
+        0.0 for _unit in range(len(ordered_units) + 1)
+    ]
+    for idx in range(len(ordered_units) - 1, -1, -1):
+        suffix_min_unassigned_pairwise[idx] = (
+            suffix_min_unassigned_pairwise[idx + 1]
+            + sum(
+                pair_min_by_index[(idx, right_idx)]
+                for right_idx in range(idx + 1, len(ordered_units))
+            )
+        )
+
+    best_choices = dict(initial)
+    best_obj = objective_delta(initial, units, unary, pairwise)
+    best_bits = initial_bits
+    states_evaluated = 0
+    nodes_visited = 0
+    states_pruned = 0
+
+    assigned: dict[str, str] = {}
+    assigned_by_index: dict[int, str] = {}
+
+    def _objective_lower_bound(index: int, obj_total: float) -> float:
+        lower = (
+            float(obj_total)
+            + suffix_min_unary[index]
+            + suffix_min_unassigned_pairwise[index]
+        )
+        for prev_idx, prev_fmt in assigned_by_index.items():
+            prev_unit = ordered_units[prev_idx]
+            for next_idx in range(index, len(ordered_units)):
+                next_unit = ordered_units[next_idx]
+                lower += min(
+                    _pairwise_value(
+                        pairwise,
+                        prev_unit.key,
+                        prev_fmt,
+                        next_unit.key,
+                        option.fmt,
+                    )
+                    for option in option_lists[next_idx]
+                )
+        return lower
+
+    def _search(index: int, bits_total: float, obj_total: float) -> None:
+        nonlocal best_choices, best_obj, best_bits, states_evaluated
+        nonlocal nodes_visited, states_pruned
+        nodes_visited += 1
+        if bits_total + suffix_min_bits[index] > target_total_bits + 1e-6:
+            states_pruned += 1
+            return
+        if _objective_lower_bound(index, obj_total) >= best_obj - 1e-12:
+            states_pruned += 1
+            return
+        if index == len(ordered_units):
+            states_evaluated += 1
+            if obj_total + 1e-12 < best_obj:
+                best_obj = obj_total
+                best_bits = bits_total
+                best_choices = dict(assigned)
+            return
+
+        unit = ordered_units[index]
+        for option in option_lists[index]:
+            next_bits = bits_total + option.bits_total
+            if next_bits + suffix_min_bits[index + 1] > target_total_bits + 1e-6:
+                continue
+            delta = float(unary.get(unit.key, {}).get(option.fmt, 0.0))
+            for prev_key, prev_fmt in assigned.items():
+                delta += _pairwise_value(
+                    pairwise,
+                    prev_key,
+                    prev_fmt,
+                    unit.key,
+                    option.fmt,
+                )
+            assigned[unit.key] = option.fmt
+            assigned_by_index[index] = option.fmt
+            _search(index + 1, next_bits, obj_total + delta)
+            assigned_by_index.pop(index, None)
+            assigned.pop(unit.key, None)
+
+    _search(0, fixed_bits_total, 0.0)
+    return {
+        "choices": best_choices,
+        "objective_delta": best_obj,
+        "bits_total": best_bits,
+        "bits_per_param": None,
+        "solver": "exact",
+        "states_evaluated": states_evaluated,
+        "state_count": state_count,
+        "nodes_visited": nodes_visited,
+        "states_pruned": states_pruned,
+    }
+
+
+def _lagrangian_score(
+    obj_total: float,
+    bits_total: float,
+    *,
+    total_params: float,
+    bpp_penalty: float,
+) -> float:
+    if total_params <= 0:
+        raise ValueError("total_params must be positive for lagrangian refinement")
+    return float(obj_total) + float(bpp_penalty) * (float(bits_total) / float(total_params))
+
+
+def _exact_lagrangian_refine(
+    units: list[RefinementUnit],
+    unary: dict[str, dict[str, float]],
+    pairwise: dict[tuple[str, str, str, str], float],
+    fixed_bits_total: float,
+    option_maps: dict[str, dict[str, UnitOption]],
+    initial_choices: dict[str, str] | None,
+    *,
+    total_params: float,
+    bpp_penalty: float,
+) -> dict:
+    unit_map = {unit.key: unit for unit in units}
+    initial = _initial_choice_map(units, option_maps, initial_choices)
+    ordered_units = sorted(
+        units,
+        key=lambda unit: (len(option_maps[unit.key]), unit.key),
+        reverse=True,
+    )
+    option_lists = [
+        tuple(option_maps[unit.key].values())
+        for unit in ordered_units
+    ]
+    state_count = prod(max(len(options), 1) for options in option_lists)
+
+    bit_penalty_per_bit = float(bpp_penalty) / float(total_params)
+    suffix_min_adjusted_unary = [0.0 for _unit in range(len(ordered_units) + 1)]
+    for idx in range(len(ordered_units) - 1, -1, -1):
+        unit = ordered_units[idx]
+        suffix_min_adjusted_unary[idx] = suffix_min_adjusted_unary[idx + 1] + min(
+            float(unary.get(unit.key, {}).get(opt.fmt, 0.0))
+            + bit_penalty_per_bit * float(opt.bits_total)
+            for opt in option_lists[idx]
+        )
+    pair_min_by_index: dict[tuple[int, int], float] = {}
+    for left_idx, right_idx in combinations(range(len(ordered_units)), 2):
+        left = ordered_units[left_idx]
+        right = ordered_units[right_idx]
+        pair_min_by_index[(left_idx, right_idx)] = min(
+            _pairwise_value(pairwise, left.key, left_opt.fmt, right.key, right_opt.fmt)
+            for left_opt in option_lists[left_idx]
+            for right_opt in option_lists[right_idx]
+        )
+    suffix_min_unassigned_pairwise = [
+        0.0 for _unit in range(len(ordered_units) + 1)
+    ]
+    for idx in range(len(ordered_units) - 1, -1, -1):
+        suffix_min_unassigned_pairwise[idx] = (
+            suffix_min_unassigned_pairwise[idx + 1]
+            + sum(
+                pair_min_by_index[(idx, right_idx)]
+                for right_idx in range(idx + 1, len(ordered_units))
+            )
+        )
+
+    initial_bits = _bits_total_for_choices(initial, unit_map, fixed_bits_total)
+    initial_obj = objective_delta(initial, units, unary, pairwise)
+    best_choices = dict(initial)
+    best_obj = initial_obj
+    best_bits = initial_bits
+    best_score = _lagrangian_score(
+        initial_obj,
+        initial_bits,
+        total_params=total_params,
+        bpp_penalty=bpp_penalty,
+    )
+    states_evaluated = 0
+    nodes_visited = 0
+    states_pruned = 0
+
+    assigned: dict[str, str] = {}
+    assigned_by_index: dict[int, str] = {}
+
+    def _score_lower_bound(index: int, obj_total: float, bits_total: float) -> float:
+        lower = (
+            float(obj_total)
+            + bit_penalty_per_bit * float(bits_total)
+            + suffix_min_adjusted_unary[index]
+            + suffix_min_unassigned_pairwise[index]
+        )
+        for prev_idx, prev_fmt in assigned_by_index.items():
+            prev_unit = ordered_units[prev_idx]
+            for next_idx in range(index, len(ordered_units)):
+                next_unit = ordered_units[next_idx]
+                lower += min(
+                    _pairwise_value(
+                        pairwise,
+                        prev_unit.key,
+                        prev_fmt,
+                        next_unit.key,
+                        option.fmt,
+                    )
+                    for option in option_lists[next_idx]
+                )
+        return lower
+
+    def _search(index: int, bits_total: float, obj_total: float) -> None:
+        nonlocal best_choices, best_obj, best_bits, best_score
+        nonlocal states_evaluated, nodes_visited, states_pruned
+        nodes_visited += 1
+        if _score_lower_bound(index, obj_total, bits_total) >= best_score - 1e-12:
+            states_pruned += 1
+            return
+        if index == len(ordered_units):
+            states_evaluated += 1
+            score = _lagrangian_score(
+                obj_total,
+                bits_total,
+                total_params=total_params,
+                bpp_penalty=bpp_penalty,
+            )
+            if score + 1e-12 < best_score:
+                best_score = score
+                best_obj = obj_total
+                best_bits = bits_total
+                best_choices = dict(assigned)
+            return
+
+        unit = ordered_units[index]
+        for option in option_lists[index]:
+            delta = float(unary.get(unit.key, {}).get(option.fmt, 0.0))
+            for prev_key, prev_fmt in assigned.items():
+                delta += _pairwise_value(
+                    pairwise,
+                    prev_key,
+                    prev_fmt,
+                    unit.key,
+                    option.fmt,
+                )
+            assigned[unit.key] = option.fmt
+            assigned_by_index[index] = option.fmt
+            _search(index + 1, bits_total + option.bits_total, obj_total + delta)
+            assigned_by_index.pop(index, None)
+            assigned.pop(unit.key, None)
+
+    _search(0, fixed_bits_total, 0.0)
+    return {
+        "choices": best_choices,
+        "objective_delta": best_obj,
+        "bits_total": best_bits,
+        "bits_per_param": best_bits / float(total_params),
+        "solver": "lagrangian_exact",
+        "lagrangian_objective": best_score,
+        "lagrangian_bpp_penalty": float(bpp_penalty),
+        "states_evaluated": states_evaluated,
+        "state_count": state_count,
+        "nodes_visited": nodes_visited,
+        "states_pruned": states_pruned,
+    }
+
+
 def sparse_local_refine(
     units: list[RefinementUnit],
     unary: dict[str, dict[str, float]],
@@ -283,13 +618,105 @@ def sparse_local_refine(
     fixed_bits_total: float,
     allowed: dict[str, tuple[UnitOption, ...]] | None = None,
     max_passes: int = 8,
+    initial_choices: dict[str, str] | None = None,
+    exact_max_states: int = 2_000_000,
+    solver_mode: str = "budget",
+    lagrangian_bpp_penalty: float = 0.0,
+    total_params: float | None = None,
 ) -> dict:
     unit_map = {unit.key: unit for unit in units}
     option_maps = _candidate_choice_maps(units, allowed)
-    current = {unit.key: unit.base_fmt for unit in units}
+    state_count = prod(max(len(options), 1) for options in option_maps.values())
+    mode = str(solver_mode or "budget").lower()
+    if mode in {"lagrangian", "qubo"}:
+        if total_params is None or float(total_params) <= 0:
+            raise ValueError("total_params must be positive for lagrangian refinement")
+        if exact_max_states > 0 and state_count <= int(exact_max_states):
+            return _exact_lagrangian_refine(
+                units,
+                unary,
+                pairwise,
+                fixed_bits_total,
+                option_maps,
+                initial_choices,
+                total_params=float(total_params),
+                bpp_penalty=float(lagrangian_bpp_penalty),
+            )
+        current = _initial_choice_map(units, option_maps, initial_choices)
+        current_bits = _bits_total_for_choices(current, unit_map, fixed_bits_total)
+        current_obj = objective_delta(current, units, unary, pairwise)
+        current_score = _lagrangian_score(
+            current_obj,
+            current_bits,
+            total_params=float(total_params),
+            bpp_penalty=float(lagrangian_bpp_penalty),
+        )
+        for _pass in range(max_passes):
+            best = None
+            for unit in units:
+                for fmt in option_maps[unit.key]:
+                    if fmt == current[unit.key]:
+                        continue
+                    trial = dict(current)
+                    trial[unit.key] = fmt
+                    bits = _bits_total_for_choices(trial, unit_map, fixed_bits_total)
+                    obj = objective_delta(trial, units, unary, pairwise)
+                    score = _lagrangian_score(
+                        obj,
+                        bits,
+                        total_params=float(total_params),
+                        bpp_penalty=float(lagrangian_bpp_penalty),
+                    )
+                    if score + 1e-12 < current_score and (best is None or score < best[0]):
+                        best = (score, obj, bits, trial)
+            for left, right in combinations(units, 2):
+                for lfmt in option_maps[left.key]:
+                    for rfmt in option_maps[right.key]:
+                        if lfmt == current[left.key] and rfmt == current[right.key]:
+                            continue
+                        trial = dict(current)
+                        trial[left.key] = lfmt
+                        trial[right.key] = rfmt
+                        bits = _bits_total_for_choices(trial, unit_map, fixed_bits_total)
+                        obj = objective_delta(trial, units, unary, pairwise)
+                        score = _lagrangian_score(
+                            obj,
+                            bits,
+                            total_params=float(total_params),
+                            bpp_penalty=float(lagrangian_bpp_penalty),
+                        )
+                        if score + 1e-12 < current_score and (best is None or score < best[0]):
+                            best = (score, obj, bits, trial)
+            if best is None:
+                break
+            current_score, current_obj, current_bits, current = best
+        return {
+            "choices": current,
+            "objective_delta": current_obj,
+            "bits_total": current_bits,
+            "bits_per_param": current_bits / float(total_params),
+            "solver": "lagrangian_greedy_local",
+            "lagrangian_objective": current_score,
+            "lagrangian_bpp_penalty": float(lagrangian_bpp_penalty),
+            "states_evaluated": None,
+            "state_count": state_count,
+        }
+    if mode != "budget":
+        raise ValueError(f"unknown sparse local refine solver_mode={solver_mode!r}")
+    if exact_max_states > 0 and state_count <= int(exact_max_states):
+        return _exact_local_refine(
+            units,
+            unary,
+            pairwise,
+            target_total_bits,
+            fixed_bits_total,
+            option_maps,
+            initial_choices,
+        )
+    current = _initial_choice_map(units, option_maps, initial_choices)
     current_bits = _bits_total_for_choices(current, unit_map, fixed_bits_total)
     if current_bits > target_total_bits + 1e-6:
-        raise ValueError("base refinement state exceeds target budget")
+        raise ValueError("initial refinement state exceeds target budget")
     current_obj = objective_delta(current, units, unary, pairwise)
 
     for _pass in range(max_passes):
@@ -335,10 +762,7 @@ def sparse_local_refine(
         "objective_delta": current_obj,
         "bits_total": current_bits,
         "bits_per_param": None,
+        "solver": "greedy_local",
+        "states_evaluated": None,
+        "state_count": state_count,
     }
-
-
-def make_pair_key(left_unit: str, left_fmt: str, right_unit: str, right_fmt: str):
-    if left_unit <= right_unit:
-        return (left_unit, left_fmt, right_unit, right_fmt)
-    return (right_unit, right_fmt, left_unit, left_fmt)
