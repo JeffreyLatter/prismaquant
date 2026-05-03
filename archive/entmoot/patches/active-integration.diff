@@ -1,0 +1,1638 @@
+diff --git a/examples/launchers/launch-dsv4.sh b/examples/launchers/launch-dsv4.sh
+index a92a089..2f72883 100755
+--- a/examples/launchers/launch-dsv4.sh
++++ b/examples/launchers/launch-dsv4.sh
+@@ -140,27 +140,25 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
+       --activation-rows-limit 256 \\
+       --calibration-modality text-only \\
+       --retain-cross-chunk-cache \\
+-      --adaptive-sampling \\
+-      --adaptive-prune-ratio 0.375 \\
+       --run-cost \\
+       --cost-output \"\$COST\" \\
+-      --cost-formats NVFP4,NVINT2,MXFP8_E4M3,FP8_SOURCE,BF16 \\
++      --cost-formats NVFP4,MXFP8_E4M3,FP8_SOURCE,BF16 \\
+       --cost-work-dir /work/cost_work \\
+       --cost-mode batched --cost-chunk-size 256 \\
+       --cost-layers-per-shard 4 \\
+       --cost-swap-grow-limit-mb 4096 \\
+       2>&1 | tee /work/logs/probe_cost.log
+ 
+-    echo '[2/2] allocator (target 90 GB band, NVINT2-enabled) ...'
++    echo '[2/2] allocator (3-5 bpp pareto, NVFP4 floor + aggressive expert prune) ...'
+     python3 -m prismaquant.allocator \\
+       --model \"\$MODEL\" \\
+       --probe \"\$MERGED_PROBE\" \\
+       --costs \"\$COST\" \\
+-      --formats NVFP4,NVINT2,MXFP8_E4M3,FP8_SOURCE,BF16 \\
+-      --target-bits 2.50 \\
+-      --pareto-targets 2.30,2.40,2.50,2.60,2.70,2.80,3.00 \\
++      --formats NVFP4,MXFP8_E4M3,FP8_SOURCE,BF16 \\
++      --target-bits 4.00 \\
++      --pareto-targets 3.00,3.25,3.50,3.75,4.00,4.25,4.50,4.75,5.00 \\
+       --enable-expert-prune \\
+-      --prune-ratios 0.0,0.125,0.1875,0.25,0.3125,0.375 \\
++      --prune-ratios 0.0,0.125,0.1875,0.25,0.3125,0.375,0.4375,0.5 \\
+       --prune-alpha 0.15 \\
+       --prune-domain-policy union \\
+       --layer-config /work/artifacts/layer_config.json \\
+diff --git a/prismaquant/allocator.py b/prismaquant/allocator.py
+index 854bc48..d3ca8e8 100644
+--- a/prismaquant/allocator.py
++++ b/prismaquant/allocator.py
+@@ -687,11 +687,14 @@ def main():
+     # field in config.json. They therefore need the same global-ratio
+     # discipline as packed-3D MoE: the DP may choose quant formats per
+     # group, but not independently choose each layer's prune ratio.
++    # DeepSeek-V4 has the same constraint (`n_routed_experts` is a
++    # single scalar in config.json), so it joins MiniMax in the
++    # nested-global-prune set.
+     nested_global_prune = (
+         args.enable_expert_prune
+         and args.expert_granularity == "layer"
+         and args.target_profile == "research"
+-        and getattr(model_profile, "name", "") in {"minimax_m2"}
++        and getattr(model_profile, "name", "") in {"minimax_m2", "deepseek_v4"}
+     )
+     if nested_global_prune:
+         print("[alloc] nested-MoE global prune sweep enabled "
+diff --git a/prismaquant/export_native_compressed.py b/prismaquant/export_native_compressed.py
+index ee94d5c..a4f6a8c 100644
+--- a/prismaquant/export_native_compressed.py
++++ b/prismaquant/export_native_compressed.py
+@@ -62,7 +62,7 @@ import time
+ from collections import Counter, defaultdict
+ from copy import deepcopy
+ from pathlib import Path
+-from typing import Callable, Iterable
++from typing import Callable, Iterable, Mapping
+ 
+ import torch
+ import torch.nn as nn
+@@ -70,7 +70,11 @@ from accelerate import init_empty_weights
+ from safetensors.torch import save_file
+ 
+ from .model_profiles.qwen3_5 import Qwen3_5Profile
+-from .schemas import validate_layer_config_payload, validate_prune_manifest_payload
++from .schemas import (
++    validate_layer_config_payload,
++    validate_merge_manifest_payload,
++    validate_prune_manifest_payload,
++)
+ 
+ # ---------------------------------------------------------------------------
+ # NVFP4 packing (inlined from compressed-tensors fp4_quantized.py to avoid
+@@ -1451,6 +1455,19 @@ def _load_prune_manifest(path: Path | str | None) -> dict[str, dict]:
+     return data
+ 
+ 
++def _load_merge_manifest(path: Path | str | None) -> dict[str, dict]:
++    """Load an Entmoot merge-sidecar JSON. Returns empty for no sidecar."""
++    if path is None:
++        return {}
++    p = Path(path)
++    if not p.exists():
++        return {}
++    with open(p) as f:
++        data = json.load(f)
++    validate_merge_manifest_payload(data, str(p))
++    return data
++
++
+ def _index_prune_by_parent(manifest: dict[str, dict]) -> dict[str, dict]:
+     """Re-index the router-keyed manifest by the parent qname common to
+     both the router and the experts module (e.g. `model.layers.0.mlp`
+@@ -1467,6 +1484,15 @@ def _index_prune_by_parent(manifest: dict[str, dict]) -> dict[str, dict]:
+     return by_parent
+ 
+ 
++def _index_merge_by_parent(manifest: dict[str, dict]) -> dict[str, dict]:
++    """Re-index an Entmoot manifest by MoE parent qname."""
++    by_parent: dict[str, dict] = {}
++    for router_qname, entry in manifest.items():
++        parent = router_qname.rsplit(".", 1)[0]
++        by_parent[parent] = {"router_qname": router_qname, **entry}
++    return by_parent
++
++
+ def _resolve_linear_prune_action(
+     full_qname: str,
+     prune_by_parent: dict[str, dict],
+@@ -1519,6 +1545,90 @@ def _resolve_linear_prune_action(
+     return "reindex", out_entry
+ 
+ 
++def _cluster_weight_by_orig(
++    entry: dict,
++    new_eid: int,
++    *,
++    prefer_router: bool = False,
++    tensor_name: str | None = None,
++) -> dict[int, float]:
++    for cluster in entry.get("clusters", []):
++        if int(cluster.get("new_expert_id", -1)) != int(new_eid):
++            continue
++        weights = cluster.get("router_weights") if prefer_router else None
++        if weights is None and tensor_name:
++            tensor_weights = cluster.get("tensor_weights") or {}
++            weights = tensor_weights.get(tensor_name)
++        if weights is None:
++            weights = cluster.get("weights")
++        if weights:
++            return {int(k): float(v) for k, v in weights.items()}
++        orig = [int(e) for e in cluster["original_expert_ids"]]
++        return {e: 1.0 / max(len(orig), 1) for e in orig}
++    raise KeyError(f"merge manifest missing cluster new_expert_id={new_eid}")
++
++
++def _resolve_linear_merge_action(
++    full_qname: str,
++    merge_by_parent: dict[str, dict],
++) -> tuple[str, dict] | None:
++    """Map a live qname to an Entmoot merge action.
++
++    Returns:
++      ("router", entry) — shrink/merge router rows to K rows.
++      ("merge", entry) — this original expert tensor contributes to a
++                         new dense expert slot; `new_full` is the output
++                         qname and `cluster_weight` is its coefficient.
++    """
++    if not merge_by_parent:
++        return None
++    parent = full_qname.rsplit(".", 1)[0]
++    entry = merge_by_parent.get(parent)
++    if entry is not None and entry["router_qname"] == full_qname:
++        return "router", entry
++
++    m = _EXPERT_IDX_IN_QNAME_RE.match(full_qname)
++    if m is None:
++        return None
++    parent = m.group("parent")
++    entry = merge_by_parent.get(parent)
++    if entry is None:
++        return None
++    try:
++        eid = int(m.group("eid"))
++    except (TypeError, ValueError):
++        return None
++    mapping = entry["orig_to_new_eid"]
++    new_eid = mapping.get(str(eid), mapping.get(eid))
++    if new_eid is None:
++        return None
++    new_eid = int(new_eid)
++    rest = m.group("rest")
++    new_full = (
++        f"{parent}.experts.{new_eid}.{rest}" if rest
++        else f"{parent}.experts.{new_eid}"
++    )
++    anchor_eid = None
++    for cluster in entry.get("clusters", []):
++        if int(cluster.get("new_expert_id", -1)) == new_eid:
++            anchor_eid = int(cluster["anchor_expert_id"])
++            break
++    if anchor_eid is None:
++        anchor_eid = int(entry["kept_expert_ids"][new_eid])
++    anchor_full = (
++        f"{parent}.experts.{anchor_eid}.{rest}" if rest
++        else f"{parent}.experts.{anchor_eid}"
++    )
++    weights = _cluster_weight_by_orig(entry, new_eid)
++    out_entry = dict(entry)
++    out_entry["new_full"] = new_full
++    out_entry["anchor_full"] = anchor_full
++    out_entry["orig_eid"] = eid
++    out_entry["new_eid"] = new_eid
++    out_entry["cluster_weight"] = float(weights[eid])
++    return "merge", out_entry
++
++
+ def _resolve_packed_experts_prune(
+     experts_qname: str,
+     prune_by_parent: dict[str, dict],
+@@ -1534,6 +1644,16 @@ def _resolve_packed_experts_prune(
+     return prune_by_parent.get(parent)
+ 
+ 
++def _resolve_packed_experts_merge(
++    experts_qname: str,
++    merge_by_parent: dict[str, dict],
++) -> dict | None:
++    if not merge_by_parent:
++        return None
++    parent = experts_qname.rsplit(".", 1)[0]
++    return merge_by_parent.get(parent)
++
++
+ def _shrink_router_weight(
+     mod: nn.Linear,
+     entry: dict,
+@@ -1557,6 +1677,232 @@ def _shrink_router_weight(
+     return w.index_select(0, idx).contiguous()
+ 
+ 
++def _merge_router_tensor_first_dim(
++    tensor: torch.Tensor,
++    entry: dict,
++) -> torch.Tensor:
++    """Shrink a router-shaped tensor to K rows for an Entmoot plan.
++
++    Default strategy is anchor-row routing. A manifest may opt into
++    `router_strategy="weighted_average"` for experimental row averaging,
++    but exact cluster-probability routing would need model-code changes.
++    """
++    n_orig = int(entry["num_experts_orig"])
++    if tensor.shape[0] != n_orig:
++        raise RuntimeError(
++            f"[export-stream] entmoot: router first dim ({tensor.shape[0]}) "
++            f"!= manifest num_experts_orig ({n_orig}). Manifest was built "
++            f"against a different model — refusing to shrink."
++        )
++    strategy = entry.get("router_strategy", "anchor")
++    if strategy in ("anchor", "anchor_rows"):
++        idx = torch.as_tensor(
++            entry["kept_expert_ids"], dtype=torch.long, device=tensor.device,
++        )
++        return tensor.index_select(0, idx).contiguous()
++    if strategy == "weighted_average":
++        rows = []
++        for new_eid in range(int(entry["num_experts_kept"])):
++            weights = _cluster_weight_by_orig(entry, new_eid, prefer_router=True)
++            acc = None
++            for orig_eid, coeff in sorted(weights.items()):
++                part = tensor[int(orig_eid)].detach().float() * float(coeff)
++                acc = part if acc is None else acc + part
++            rows.append(acc.to(dtype=tensor.dtype))
++        return torch.stack(rows, dim=0).contiguous()
++    raise ValueError(f"unknown Entmoot router_strategy={strategy!r}")
++
++
++def _merge_router_weight(
++    mod: nn.Linear,
++    entry: dict,
++) -> torch.Tensor:
++    return _merge_router_tensor_first_dim(mod.weight.detach(), entry)
++
++
++def _merge_packed_experts_tensor(
++    packed_param: torch.Tensor,
++    entry: dict,
++    *,
++    tensor_name: str | None = None,
++) -> torch.Tensor:
++    """Merge a packed `[E, ...]` expert tensor to `[K, ...]`."""
++    E = int(packed_param.shape[0])
++    n_orig = int(entry["num_experts_orig"])
++    if E != n_orig:
++        raise RuntimeError(
++            f"[export-stream] entmoot: packed experts have E={E} but "
++            f"manifest has num_experts_orig={n_orig}. Manifest was built "
++            f"against a different model — refusing to emit."
++        )
++    merged = []
++    for new_eid in range(int(entry["num_experts_kept"])):
++        weights = _cluster_weight_by_orig(entry, new_eid, tensor_name=tensor_name)
++        acc = None
++        for orig_eid, coeff in sorted(weights.items()):
++            part = packed_param[int(orig_eid)].detach().float() * float(coeff)
++            acc = part if acc is None else acc + part
++        merged.append(acc)
++    return torch.stack(merged, dim=0).contiguous()
++
++
++def _first_dim_weighted_merge_buffer() -> dict[str, dict]:
++    if not hasattr(_first_dim_weighted_merge_buffer, "_buf"):
++        _first_dim_weighted_merge_buffer._buf = {}
++    return _first_dim_weighted_merge_buffer._buf
++
++
++def _queue_or_emit_weighted_tensor_merge(
++    out: dict[str, torch.Tensor],
++    *,
++    source_full: str,
++    target_full: str,
++    source_tensor: torch.Tensor,
++    coeff: float,
++    expected_sources: Mapping[int, float],
++    source_eid: int,
++    dtype: torch.dtype = torch.bfloat16,
++    to_cpu: bool = True,
++) -> bool:
++    """Accumulate per-expert tensors until a complete merged tensor exists.
++
++    Returns True once ``out[target_full]`` has been emitted.
++    """
++    buf = _first_dim_weighted_merge_buffer()
++    entry = buf.setdefault(target_full, {
++        "expected": {int(k): float(v) for k, v in expected_sources.items()},
++        "seen": set(),
++        "acc": None,
++        "sources": [],
++    })
++    expected = entry["expected"]
++    if expected != {int(k): float(v) for k, v in expected_sources.items()}:
++        raise RuntimeError(
++            f"[export-stream] entmoot: inconsistent merge weights for "
++            f"{target_full}"
++        )
++    if int(source_eid) in entry["seen"]:
++        raise RuntimeError(
++            f"[export-stream] entmoot: duplicate source eid {source_eid} "
++            f"for {target_full}"
++        )
++    part = source_tensor.detach().float() * float(coeff)
++    entry["acc"] = part if entry["acc"] is None else entry["acc"] + part
++    entry["seen"].add(int(source_eid))
++    entry["sources"].append(source_full)
++    if entry["seen"] == set(expected):
++        merged = entry["acc"].to(dtype)
++        out[target_full] = merged.cpu() if to_cpu else merged
++        del buf[target_full]
++        return True
++    return False
++
++
++def _assert_no_pending_weighted_merges(layer_qname: str) -> None:
++    buf = _first_dim_weighted_merge_buffer()
++    pending = [
++        (target, sorted(entry["expected"]), sorted(entry["seen"]))
++        for target, entry in buf.items()
++        if target.startswith(layer_qname + ".") or target == layer_qname
++    ]
++    if pending:
++        target, expected, seen = pending[0]
++        raise RuntimeError(
++            f"[export-stream] entmoot: incomplete weighted merge for "
++            f"{target}: expected source eids {expected}, saw {seen}"
++        )
++
++
++def _entmoot_nvfp4_pair_buffer() -> dict[str, dict]:
++    if not hasattr(_entmoot_nvfp4_pair_buffer, "_buf"):
++        _entmoot_nvfp4_pair_buffer._buf = {}
++    return _entmoot_nvfp4_pair_buffer._buf
++
++
++def _gate_up_pair_parent(qname: str) -> tuple[str, str] | None:
++    for leaf in ("gate_proj", "up_proj"):
++        suffix = "." + leaf
++        if qname.endswith(suffix):
++            return qname[: -len(suffix)], leaf
++    return None
++
++
++def _emit_quantized_2d(
++    out: dict[str, torch.Tensor],
++    emit_full: str,
++    weight: torch.Tensor,
++    fmt: str,
++    *,
++    recipe_key: str | None,
++    nvfp4_global_real_override: torch.Tensor | None = None,
++) -> None:
++    compressed = _quantize_2d(
++        weight.float(), fmt,
++        nvfp4_global_real_override=nvfp4_global_real_override,
++        linear_name=recipe_key,
++    )
++    for suffix, t in compressed.items():
++        out[f"{emit_full}.{suffix}"] = t.cpu()
++
++
++def _queue_or_emit_entmoot_nvfp4(
++    out: dict[str, torch.Tensor],
++    *,
++    emit_full: str,
++    recipe_key: str,
++    merged_weight: torch.Tensor,
++    hist: Counter,
++) -> None:
++    """Quantize Entmoot NVFP4 output, sharing gate/up global scale."""
++    pair = _gate_up_pair_parent(emit_full)
++    if pair is None:
++        _emit_quantized_2d(out, emit_full, merged_weight, "NVFP4",
++                           recipe_key=recipe_key)
++        hist[("linear", "NVFP4_entmoot")] += 1
++        return
++
++    parent, leaf = pair
++    buf = _entmoot_nvfp4_pair_buffer()
++    entry = buf.setdefault(parent, {})
++    if leaf in entry:
++        raise RuntimeError(
++            f"[export-stream] entmoot: duplicate NVFP4 {leaf} for {parent}"
++        )
++    entry[leaf] = (emit_full, recipe_key, merged_weight.detach().float())
++    if set(entry) != {"gate_proj", "up_proj"}:
++        return
++
++    gate = entry["gate_proj"]
++    up = entry["up_proj"]
++    joint = torch.stack([
++        compute_nvfp4_global_real(gate[2], group_size=16),
++        compute_nvfp4_global_real(up[2], group_size=16),
++    ]).max()
++    for emit, recipe, weight in (gate, up):
++        _emit_quantized_2d(
++            out, emit, weight, "NVFP4",
++            recipe_key=recipe,
++            nvfp4_global_real_override=joint,
++        )
++        hist[("linear", "NVFP4_entmoot")] += 1
++    del buf[parent]
++
++
++def _assert_no_pending_entmoot_nvfp4_pairs(layer_qname: str) -> None:
++    buf = _entmoot_nvfp4_pair_buffer()
++    pending = [
++        (parent, sorted(entry))
++        for parent, entry in buf.items()
++        if parent.startswith(layer_qname + ".") or parent == layer_qname
++    ]
++    if pending:
++        parent, leaves = pending[0]
++        raise RuntimeError(
++            f"[export-stream] entmoot: incomplete NVFP4 gate/up pair for "
++            f"{parent}: saw {leaves}"
++        )
++
++
+ # HF config field names that hold the MoE expert count. Different
+ # archs use different ones; we update whichever exist.
+ _MOE_EXPERT_COUNT_FIELDS = (
+@@ -2253,7 +2599,16 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
+     `inv_freq` buffers are on meta. Re-run the module's own rope init
+     (which is deterministic from config) so `inv_freq` lives on the
+     exec device with correct values — matching what `from_pretrained`
+-    would have produced."""
++    would have produced.
++
++    Two flavours:
++    * Single-layer-type rope (transformers default): one `inv_freq` +
++      `attention_scaling` pair.
++    * Multi-layer-type rope (DeepSeek-V4 / hybrid attention): per-
++      layer-type buffers `<lt>_inv_freq` + scalar `<lt>_attention_scaling`,
++      iterated from `rotary.layer_types`. The rope init fn requires
++      `layer_type=` and indexes `config.rope_parameters[layer_type]`.
++    """
+     from .layer_streaming import _get_rotary
+     rotary = _get_rotary(base_model)
+     if rotary is None:
+@@ -2261,6 +2616,29 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
+     cfg = getattr(rotary, "config", None)
+     if cfg is None:
+         return
++
++    layer_types = getattr(rotary, "layer_types", None)
++    if layer_types:
++        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
++        rope_type_map = getattr(rotary, "rope_type", {}) or {}
++        rope_params = getattr(cfg, "rope_parameters", {}) or {}
++        for lt in layer_types:
++            if rope_params.get(lt) is None:
++                continue
++            rope_type = rope_type_map.get(lt, "default")
++            if rope_type == "default":
++                rope_init_fn = rotary.compute_default_rope_parameters
++            else:
++                rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
++            inv_freq, scaling = rope_init_fn(cfg, device, layer_type=lt)
++            inv_freq = inv_freq.to(dtype=torch.float32, device=device)
++            rotary.register_buffer(f"{lt}_inv_freq", inv_freq,
++                                   persistent=False)
++            rotary.register_buffer(f"{lt}_original_inv_freq",
++                                   inv_freq.clone(), persistent=False)
++            setattr(rotary, f"{lt}_attention_scaling", scaling)
++        return
++
+     try:
+         rope_init_fn = rotary.compute_default_rope_parameters
+     except AttributeError:
+@@ -2301,6 +2679,21 @@ def _build_fp8_source_map(
+     case the FP8_SOURCE format is inert (allocator's passthrough-
+     integrity filter drops it from every Linear's candidate set).
+     """
++    # Profile-driven dispatch (refactor #32 mirror — same pattern as
++    # `layer_streaming._build_fp8_scale_inv_map`). Profiles that store
++    # FP8 scales under a non-standard path (DSv4 uses `.scale` siblings,
++    # not `.weight_scale_inv`) return a fully populated map. Without this
++    # the export hits the passthrough-integrity check at the first
++    # FP8_SOURCE-assigned attention Linear with `scale=None`.
++    from .model_profiles import detect_profile
++    profile = detect_profile(model_path)
++    explicit = profile.fp8_scale_pairs(model_path)
++    if explicit is not None:
++        return {
++            live[: -len(".weight")] if live.endswith(".weight") else live: pair
++            for live, pair in explicit.items()
++        }
++
+     idx_path = os.path.join(model_path, "model.safetensors.index.json")
+     if not os.path.exists(idx_path):
+         single = os.path.join(model_path, "model.safetensors")
+@@ -2368,6 +2761,7 @@ def materialize_tensors_streaming(
+     device: torch.device = torch.device("cuda"),
+     offload_folder: str | None = None,
+     prune_manifest: dict[str, dict] | None = None,
++    merge_manifest: dict[str, dict] | None = None,
+     tensor_sink: Callable[[dict[str, torch.Tensor]], None] | None = None,
+     export_cache_dir: str | None = None,
+ ) -> tuple[dict[str, torch.Tensor], dict]:
+@@ -2444,6 +2838,14 @@ def materialize_tensors_streaming(
+     # Distinct key format from the loader-side dequant map above.
+     fp8_source_map = _build_fp8_source_map(model_path)
+     prune_by_parent = _index_prune_by_parent(prune_manifest or {})
++    merge_by_parent = _index_merge_by_parent(merge_manifest or {})
++    overlap = set(prune_by_parent) & set(merge_by_parent)
++    if overlap:
++        raise RuntimeError(
++            f"[export-stream] Entmoot merge and prune manifests both "
++            f"target MoE parents {sorted(overlap)[:5]}. Use one structural "
++            f"compression mode per MoE layer."
++        )
+     if prune_by_parent:
+         n_pruned_total = sum(
+             e["num_experts_orig"] - e["num_experts_kept"]
+@@ -2454,6 +2856,16 @@ def materialize_tensors_streaming(
+             f"MoE layers, {n_pruned_total} experts dropped total",
+             flush=True,
+         )
++    if merge_by_parent:
++        n_merged_total = sum(
++            e["num_experts_orig"] - e["num_experts_kept"]
++            for e in merge_by_parent.values()
++        )
++        print(
++            f"[export-stream] Entmoot merge manifest: {len(merge_by_parent)} "
++            f"MoE layers, {n_merged_total} expert slots consolidated total",
++            flush=True,
++        )
+     if fp8_source_map:
+         print(f"[export-stream] fp8 source-emit map: {len(fp8_source_map)} "
+               f"Linears available for FP8_SOURCE passthrough", flush=True)
+@@ -2679,6 +3091,10 @@ def materialize_tensors_streaming(
+             #   "reindex" → kept expert; rewrite qname eid and continue
+             #               through the normal emit path
+             prune_action = _resolve_linear_prune_action(full, prune_by_parent)
++            merge_action = (
++                None if prune_action is not None
++                else _resolve_linear_merge_action(full, merge_by_parent)
++            )
+             if prune_action is not None:
+                 kind, p_entry = prune_action
+                 if kind == "router":
+@@ -2706,6 +3122,115 @@ def materialize_tensors_streaming(
+                     continue
+                 # kind == "reindex": emit under the reindexed qname.
+                 emit_full = p_entry["new_full"]
++            elif merge_action is not None:
++                kind, m_entry = merge_action
++                if kind == "router":
++                    if not mod.weight.is_meta:
++                        w_merged = _merge_router_weight(mod, m_entry)
++                        out[f"{full}.weight"] = w_merged.to(torch.bfloat16).cpu()
++                        if mod.bias is not None and not mod.bias.is_meta:
++                            b_merged = _merge_router_tensor_first_dim(
++                                mod.bias.detach(), m_entry,
++                            )
++                            out[f"{full}.bias"] = b_merged.to(torch.bfloat16).cpu()
++                        hist[("linear", "BF16_router_entmoot")] += 1
++                        covered.add(full)
++                    continue
++                # kind == "merge": accumulate all original experts into a
++                # new dense expert slot and quantize once the merged BF16
++                # tensor exists. The merged target uses the anchor expert's
++                # recipe key so mixed-format assignments remain stable.
++                emit_full = m_entry["new_full"]
++                recipe_key = profile.live_to_recipe_name(m_entry["anchor_full"])
++                fmt = assignment.get(recipe_key)
++                if fmt is not None:
++                    fmt = _canonical_export_format(fmt)
++                if fmt is None or fmt == "BF16" or recipe_key in bf16_passthrough:
++                    emitted = _queue_or_emit_weighted_tensor_merge(
++                        out,
++                        source_full=full,
++                        target_full=f"{emit_full}.weight",
++                        source_tensor=mod.weight,
++                        coeff=m_entry["cluster_weight"],
++                        expected_sources=_cluster_weight_by_orig(
++                            m_entry, m_entry["new_eid"],
++                        ),
++                        source_eid=m_entry["orig_eid"],
++                        dtype=torch.bfloat16,
++                    )
++                    if mod.bias is not None:
++                        # Biases are rare on routed expert Linears; if
++                        # present, merge them with the same coefficients.
++                        _queue_or_emit_weighted_tensor_merge(
++                            out,
++                            source_full=full,
++                            target_full=f"{emit_full}.bias",
++                            source_tensor=mod.bias,
++                            coeff=m_entry["cluster_weight"],
++                            expected_sources=_cluster_weight_by_orig(
++                                m_entry, m_entry["new_eid"],
++                            ),
++                            source_eid=m_entry["orig_eid"],
++                            dtype=torch.bfloat16,
++                        )
++                    if emitted:
++                        hist[("linear", "BF16_entmoot")] += 1
++                    covered.add(full)
++                    continue
++                if fmt == "FP8_SOURCE":
++                    raise NotImplementedError(
++                        f"[export-stream] Entmoot cannot synthesize "
++                        f"FP8_SOURCE passthrough experts at {full}; "
++                        f"merged experts must be emitted as BF16 or "
++                        f"requantized formats."
++                    )
++                target_weight = f"{emit_full}.__entmoot_weight"
++                emitted = _queue_or_emit_weighted_tensor_merge(
++                    out,
++                    source_full=full,
++                    target_full=target_weight,
++                    source_tensor=mod.weight,
++                    coeff=m_entry["cluster_weight"],
++                    expected_sources=_cluster_weight_by_orig(
++                        m_entry, m_entry["new_eid"],
++                    ),
++                    source_eid=m_entry["orig_eid"],
++                    dtype=torch.float32,
++                    to_cpu=False,
++                )
++                if emitted:
++                    merged_weight = out.pop(target_weight)
++                    if fmt == "NVFP4":
++                        _queue_or_emit_entmoot_nvfp4(
++                            out,
++                            emit_full=emit_full,
++                            recipe_key=recipe_key,
++                            merged_weight=merged_weight,
++                            hist=hist,
++                        )
++                    else:
++                        _emit_quantized_2d(
++                            out, emit_full, merged_weight, fmt,
++                            recipe_key=recipe_key,
++                        )
++                        hist[("linear", f"{fmt}_entmoot")] += 1
++                if mod.bias is not None:
++                    emitted_bias = _queue_or_emit_weighted_tensor_merge(
++                        out,
++                        source_full=full,
++                        target_full=f"{emit_full}.bias",
++                        source_tensor=mod.bias,
++                        coeff=m_entry["cluster_weight"],
++                        expected_sources=_cluster_weight_by_orig(
++                            m_entry, m_entry["new_eid"],
++                        ),
++                        source_eid=m_entry["orig_eid"],
++                        dtype=torch.bfloat16,
++                    )
++                    if not emitted_bias:
++                        pass
++                covered.add(full)
++                continue
+             else:
+                 emit_full = full
+ 
+@@ -2894,6 +3419,25 @@ def materialize_tensors_streaming(
+                         f"`.weight_scale_inv` from source and emit the "
+                         f"per-expert compressed-tensors pairs.")
+                 packed_param = getattr(mod, pn).detach().float()
++                merge_entry = _resolve_packed_experts_merge(
++                    experts_qname, merge_by_parent,
++                )
++                prune_entry = _resolve_packed_experts_prune(
++                    experts_qname, prune_by_parent,
++                )
++                if merge_entry is not None and prune_entry is not None:
++                    raise RuntimeError(
++                        f"[export-stream] {experts_qname} is present in "
++                        f"both prune and Entmoot merge manifests"
++                    )
++                if merge_entry is not None:
++                    packed_param = _merge_packed_experts_tensor(
++                        packed_param, merge_entry, tensor_name=pn,
++                    )
++                    hist[("packed_moe_entmoot", "experts")] += (
++                        merge_entry["num_experts_orig"]
++                        - merge_entry["num_experts_kept"]
++                    )
+                 E, M, N = packed_param.shape
+                 if pn == "gate_up_proj":
+                     half = M // 2
+@@ -2913,9 +3457,6 @@ def materialize_tensors_streaming(
+                 # pairs — only kept experts appear. On the non-pruned
+                 # path it's `((e, e) for e in range(E))`, preserving
+                 # exact legacy behavior.
+-                prune_entry = _resolve_packed_experts_prune(
+-                    experts_qname, prune_by_parent,
+-                )
+                 if prune_entry is not None:
+                     if E != int(prune_entry["num_experts_orig"]):
+                         raise RuntimeError(
+@@ -3035,6 +3576,18 @@ def materialize_tensors_streaming(
+                     out[full] = shrunk.to(torch.bfloat16).cpu()
+                     hist[("router_weight_shrunk", "BF16")] += 1
+                     continue
++            if merge_by_parent and full.endswith(".weight"):
++                trimmed = full[: -len(".weight")]
++                parent_r = trimmed.rsplit(".", 1)[0]
++                entry_r = merge_by_parent.get(parent_r)
++                if (entry_r is not None
++                        and entry_r["router_qname"] == trimmed
++                        and param.dim() >= 1
++                        and int(param.shape[0]) == int(entry_r["num_experts_orig"])):
++                    merged = _merge_router_tensor_first_dim(param.detach(), entry_r)
++                    out[full] = merged.to(torch.bfloat16).cpu()
++                    hist[("router_weight_entmoot", "BF16")] += 1
++                    continue
+             out[full] = param.detach().to(torch.bfloat16).cpu()
+             hist[("layer_passthrough", "BF16")] += 1
+         for mod_name, mod in layer_mod.named_modules():
+@@ -3068,9 +3621,21 @@ def materialize_tensors_streaming(
+                         out[full] = shrunk.to(torch.bfloat16).cpu()
+                         hist[("layer_buffer_shrunk", "BF16")] += 1
+                         continue
++                if merge_by_parent:
++                    entry_b = merge_by_parent.get(full_modpath)
++                    if (entry_b is not None
++                            and buf.dim() >= 1
++                            and int(buf.shape[0]) == int(entry_b["num_experts_orig"])):
++                        merged = _merge_router_tensor_first_dim(buf.detach(), entry_b)
++                        out[full] = merged.to(torch.bfloat16).cpu()
++                        hist[("layer_buffer_entmoot", "BF16")] += 1
++                        continue
+                 out[full] = buf.detach().to(torch.bfloat16).cpu()
+                 hist[("layer_buffer", "BF16")] += 1
+ 
++        _assert_no_pending_weighted_merges(layer_qname)
++        _assert_no_pending_entmoot_nvfp4_pairs(layer_qname)
++
+         # 3f. Unload.
+         _unload(model, [f"{layers_prefix}{L}."])
+         del tensors, resolver, joint_globals
+@@ -3780,7 +4345,8 @@ def _per_expert_parent(base: str) -> str | None:
+ 
+ 
+ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
+-                         prune_manifest: dict | None = None) -> list[str]:
++                         prune_manifest: dict | None = None,
++                         merge_manifest: dict | None = None) -> list[str]:
+     """Return the list of 2D `.weight` basenames that must be added to
+     the compressed-tensors `ignore` set because the recipe doesn't cover
+     them.
+@@ -3802,6 +4368,10 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
+     stale entries that don't match any module vLLM ever constructs.
+     Filter them out — the kept experts are already covered by the
+     parent FusedMoE scheme, and pruned ones simply don't exist anymore.
++
++    `merge_manifest` follows the same rule for non-anchor original
++    experts: their weights are folded into dense new expert slots, so
++    original-id ignore entries would be stale.
+     """
+     extra_ignore: list[str] = []
+     seen_recipe = set(assignment)
+@@ -3816,6 +4386,14 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
+             parent_path = _router_qname.rsplit(".", 1)[0]
+             for orig_eid in entry.get("pruned_expert_ids", []):
+                 pruned_bases.add(f"{parent_path}.experts.{orig_eid}")
++    merged_nonanchor_bases: set[str] = set()
++    if merge_manifest:
++        for _router_qname, entry in merge_manifest.items():
++            parent_path = _router_qname.rsplit(".", 1)[0]
++            anchors = {int(e) for e in entry.get("kept_expert_ids", [])}
++            for orig_eid in range(int(entry.get("num_experts_orig", 0) or 0)):
++                if orig_eid not in anchors:
++                    merged_nonanchor_bases.add(f"{parent_path}.experts.{orig_eid}")
+     for ckpt_key, shape in source_shape_iter:
+         if not ckpt_key.endswith(".weight"):
+             continue
+@@ -3833,6 +4411,10 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
+                 recipe_name.startswith(p + ".") or recipe_name == p
+                 for p in pruned_bases):
+             continue
++        if merged_nonanchor_bases and any(
++                recipe_name.startswith(p + ".") or recipe_name == p
++                for p in merged_nonanchor_bases):
++            continue
+         parent = _per_expert_parent(recipe_name)
+         if parent is not None and parent in seen_recipe:
+             continue
+@@ -3860,6 +4442,17 @@ def main():
+                          "dense 0..K-1, shrinks the router weight's "
+                          "out-dim, and updates config.json's expert "
+                          "count fields.")
++    ap.add_argument("--merge-manifest", default=None,
++                    help="Optional path to an Entmoot expert-merge "
++                         "sidecar JSON. When omitted, the exporter "
++                         "auto-detects `<layer_config>.merge.json` and "
++                         "uses it if present; pass an empty string to "
++                         "force a non-merge export. Entmoot merges "
++                         "expert weights into standard dense expert "
++                         "slots, shrinks router rows to K anchors, and "
++                         "updates config.json expert-count fields. It "
++                         "cannot be combined with prune on the same "
++                         "MoE layer.")
+     ap.add_argument("--output", required=True,
+                     help="Output directory for the compressed checkpoint")
+     ap.add_argument("--shard-bytes", type=int, default=5 * 1024**3,
+@@ -3965,6 +4558,14 @@ def main():
+                     help="Don't remove --export-cache-dir on success. "
+                          "Useful for debugging or comparing two exports "
+                          "against the same cache.")
++    ap.add_argument("--drop-mtp", action="store_true", default=False,
++                    help="Drop mtp.* weights from the exported artifact. "
++                         "Bypasses validate_mtp_assignment_coverage. The "
++                         "streaming pipeline already filters mtp.* keys "
++                         "(see _rename in materialize_tensors_streaming) "
++                         "— this flag only documents intent and silences "
++                         "the validator. Use when probe/cost/allocator "
++                         "were run with --no-include-mtp.")
+     args = ap.parse_args()
+ 
+     from .model_profiles import detect_profile
+@@ -4062,7 +4663,12 @@ def main():
+         raw_recipe = json.load(f)
+     validate_layer_config_payload(raw_recipe, args.layer_config)
+     assignment = _canonicalize_assignment(raw_recipe)
+-    validate_mtp_assignment_coverage(args.model, assignment, profile)
++    if not args.drop_mtp:
++        validate_mtp_assignment_coverage(args.model, assignment, profile)
++    else:
++        print("[export-stream] --drop-mtp: skipping MTP coverage check; "
++              "mtp.* weights will be dropped from the artifact",
++              flush=True)
+     fmts = Counter(assignment.values())
+     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
+           flush=True)
+@@ -4079,6 +4685,26 @@ def main():
+     else:
+         prune_manifest = _load_prune_manifest(args.prune_manifest)
+ 
++    # Entmoot merge manifest: explicit path (empty string = opt-out),
++    # else auto-discover sidecar next to layer_config.json.
++    if args.merge_manifest is None:
++        default_sidecar = Path(args.layer_config + ".merge.json")
++        merge_manifest = _load_merge_manifest(
++            default_sidecar if default_sidecar.exists() else None
++        )
++    elif args.merge_manifest == "":
++        merge_manifest = {}
++    else:
++        merge_manifest = _load_merge_manifest(args.merge_manifest)
++
++    overlap = set(prune_manifest) & set(merge_manifest)
++    if overlap:
++        raise RuntimeError(
++            f"[export-stream] prune and Entmoot merge manifests both "
++            f"target routers {sorted(overlap)[:5]}; use one structural "
++            f"compression mode per MoE layer."
++        )
++
+     dtype = torch.bfloat16
+     device = torch.device(args.device)
+     out_dir = Path(args.output)
+@@ -4126,6 +4752,7 @@ def main():
+         dtype=dtype, device=device,
+         offload_folder=args.offload_folder,
+         prune_manifest=prune_manifest,
++        merge_manifest=merge_manifest,
+         tensor_sink=lambda batch: writer.add_tensors(_rename_body_batch(batch)),
+         export_cache_dir=args.export_cache_dir,
+     )
+@@ -4137,7 +4764,10 @@ def main():
+     # helper — MTP heads are small enough that full-model residency
+     # isn't a concern.
+     mtp_tensors: dict[str, torch.Tensor] = {}
+-    if profile.has_mtp():
++    if args.drop_mtp:
++        print("[export-stream] --drop-mtp: skipping MTP materialization",
++              flush=True)
++    elif profile.has_mtp():
+         print("[export-stream] materializing MTP tensors ...", flush=True)
+         mtp_tensors = _materialize_mtp_tensors(
+             args.model, assignment,
+@@ -4224,14 +4854,16 @@ def main():
+                     yield k, shape
+ 
+     extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment,
+-                                        prune_manifest=prune_manifest)
++                                        prune_manifest=prune_manifest,
++                                        merge_manifest=merge_manifest)
+     print(f"[export-stream] extra ignore (unmapped Linears): "
+           f"{len(extra_ignore)}", flush=True)
+ 
+     write_config_with_quantization(
+         args.model, out_dir, assignment, bf16_passthrough,
+         extra_ignore=extra_ignore,
+-        prune_manifest=prune_manifest)
++        prune_manifest=prune_manifest,
++        merge_manifest=merge_manifest)
+     _copy_tokenizer(args.model, out_dir)
+ 
+     prune_summary: dict | None = None
+@@ -4251,6 +4883,21 @@ def main():
+         with open(out_dir / "prune_manifest.json", "w") as f:
+             json.dump(prune_manifest, f, indent=2, sort_keys=True)
+ 
++    merge_summary: dict | None = None
++    if merge_manifest:
++        merge_summary = {
++            "n_layers_merged": len(merge_manifest),
++            "n_experts_orig_total": sum(
++                int(e["num_experts_orig"]) for e in merge_manifest.values()
++            ),
++            "n_experts_kept_total": sum(
++                int(e["num_experts_kept"]) for e in merge_manifest.values()
++            ),
++            "manifest_file": "entmoot_merge_manifest.json",
++        }
++        with open(out_dir / "entmoot_merge_manifest.json", "w") as f:
++            json.dump(merge_manifest, f, indent=2, sort_keys=True)
++
+     with open(out_dir / "mixed_native_manifest.json", "w") as f:
+         json.dump({
+             "source_model": args.model,
+@@ -4259,6 +4906,7 @@ def main():
+             "n_assignment_entries": len(assignment),
+             "ignore": sorted(bf16_passthrough),
+             "prune": prune_summary,
++            "entmoot": merge_summary,
+         }, f, indent=2)
+ 
+     # v25: clear the per-layer cache on successful export. --keep-export-cache
+@@ -4468,6 +5116,7 @@ def write_config_with_quantization(
+     bf16_passthrough: set[str],
+     extra_ignore: Iterable[str] = (),
+     prune_manifest: dict[str, dict] | None = None,
++    merge_manifest: dict[str, dict] | None = None,
+ ) -> None:
+     from .model_profiles import detect_profile
+     profile = detect_profile(src_model)
+@@ -4478,18 +5127,20 @@ def write_config_with_quantization(
+     if qc:
+         cfg["quantization_config"] = qc
+ 
+-    # Prune: shrink MoE expert counts in the config so vLLM / HF
++    structural_manifest = merge_manifest or prune_manifest
++
++    # Prune/Entmoot: shrink MoE expert counts in the config so vLLM / HF
+     # instantiate a ModuleList of the right size. We update every
+     # common HF field name that exists in the source config, so the
+     # loader finds the expected field regardless of arch convention.
+     # All manifest entries must agree on num_experts_kept (same arch)
+     # — mixing kept counts across layers isn't supported by the
+     # shared-config convention.
+-    if prune_manifest:
+-        kept_counts = {int(e["num_experts_kept"]) for e in prune_manifest.values()}
++    if structural_manifest:
++        kept_counts = {int(e["num_experts_kept"]) for e in structural_manifest.values()}
+         if len(kept_counts) != 1:
+             raise RuntimeError(
+-                f"[export-stream] prune: manifest has inconsistent "
++                f"[export-stream] structural compression: manifest has inconsistent "
+                 f"num_experts_kept across layers ({sorted(kept_counts)}). "
+                 f"HF config carries a single scalar field — mixed "
+                 f"per-layer counts need a schema change."
+diff --git a/prismaquant/measure_quant_cost.py b/prismaquant/measure_quant_cost.py
+index c67337e..98d972b 100644
+--- a/prismaquant/measure_quant_cost.py
++++ b/prismaquant/measure_quant_cost.py
+@@ -287,11 +287,26 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
+     n_total = len(target_list)
+ 
+     for name, mod in model.named_modules():
++        if not isinstance(mod, nn.Linear):
++            continue
++        # `canonical_linear_name` rewrites per-expert names to the
++        # Qwen3.5/3.6-packed form (`experts.0.gate_proj` →
++        # `experts.gate_up_proj.0`). That's correct when the probe
++        # keyed stats by the packed form; for architectures that
++        # probed per-expert directly (DSv4 routed experts via the
++        # per-expert ModuleList), the raw name matches probe_stats
++        # already. Try the canonical form first (preserves Qwen
++        # behavior), then fall back to the raw name.
+         canonical_name = canonical_linear_name(name)
+-        if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
++        if canonical_name in target_names:
++            match_name = canonical_name
++        elif name in target_names:
++            match_name = name
++        else:
+             continue
+-        if canonical_name not in act_cache:
++        if match_name not in act_cache:
+             continue
++        canonical_name = match_name
+         W = mod.weight.detach()
+         X = act_cache.load(canonical_name).to(W.dtype).to(W.device)
+         y_ref = X @ W.T
+@@ -346,11 +361,20 @@ def _group_by_shape(model: nn.Module, target_names: set[str]
+     """
+     groups: dict[tuple[int, int], list[tuple[str, nn.Linear]]] = {}
+     for name, mod in model.named_modules():
++        if not isinstance(mod, nn.Linear):
++            continue
++        # Same canonical-name fallback as the unbatched path: try the
++        # Qwen3.5/3.6-packed form first, fall back to the raw name for
++        # architectures (DSv4) that probed per-expert directly.
+         canonical_name = canonical_linear_name(name)
+-        if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
++        if canonical_name in target_names:
++            match_name = canonical_name
++        elif name in target_names:
++            match_name = name
++        else:
+             continue
+         key = (mod.in_features, mod.out_features)
+-        groups.setdefault(key, []).append((canonical_name, mod))
++        groups.setdefault(key, []).append((match_name, mod))
+     return groups
+ 
+ 
+diff --git a/prismaquant/schemas.py b/prismaquant/schemas.py
+index e085515..3619dea 100644
+--- a/prismaquant/schemas.py
++++ b/prismaquant/schemas.py
+@@ -266,6 +266,157 @@ def validate_prune_manifest_payload(payload, path: str | None = None):
+     return payload
+ 
+ 
++def validate_merge_manifest_payload(payload, path: str | None = None):
++    """Validate the router-keyed expert merge manifest.
++
++    Merge manifests map every original expert id to a dense new expert id.
++    Unlike prune manifests, many original ids may map to the same new id.
++    """
++    if not _is_mapping(payload):
++        _fail(path, "", "merge manifest is not a JSON object")
++    for router, entry in payload.items():
++        if not isinstance(router, str):
++            _fail(path, "", "router keys must be strings")
++        if not _is_mapping(entry):
++            _fail(path, f"[{router!r}]", "entry is not a mapping")
++        for field in (
++            "num_experts_orig",
++            "num_experts_kept",
++            "kept_expert_ids",
++            "orig_to_new_eid",
++            "clusters",
++        ):
++            if field not in entry:
++                _fail(path, f"[{router!r}].{field}", "required field missing")
++        num_orig = _as_non_negative_int(
++            entry["num_experts_orig"], path, f"[{router!r}].num_experts_orig"
++        )
++        num_kept = _as_non_negative_int(
++            entry["num_experts_kept"], path, f"[{router!r}].num_experts_kept"
++        )
++        if num_orig <= 0:
++            _fail(path, f"[{router!r}].num_experts_orig", "must be positive")
++        if num_kept <= 0 or num_kept > num_orig:
++            _fail(path, f"[{router!r}].num_experts_kept", "must be in 1..num_experts_orig")
++
++        kept = _int_list(entry["kept_expert_ids"], path, f"[{router!r}].kept_expert_ids")
++        if len(set(kept)) != len(kept):
++            _fail(path, f"[{router!r}].kept_expert_ids", "contains duplicates")
++        if len(kept) != num_kept:
++            _fail(path, f"[{router!r}].kept_expert_ids", "length does not match num_experts_kept")
++        for eid in kept:
++            if eid < 0 or eid >= num_orig:
++                _fail(path, f"[{router!r}]", f"expert id {eid} is outside [0, {num_orig})")
++
++        mapping = entry["orig_to_new_eid"]
++        if not _is_mapping(mapping):
++            _fail(path, f"[{router!r}].orig_to_new_eid", "must be a mapping")
++        seen_orig: set[int] = set()
++        dense_values: list[int] = []
++        for orig, new in mapping.items():
++            orig_int = _parse_eid(orig, path, f"[{router!r}].orig_to_new_eid key")
++            new_int = _as_non_negative_int(
++                new, path, f"[{router!r}].orig_to_new_eid[{orig!r}]"
++            )
++            if orig_int >= num_orig:
++                _fail(path, f"[{router!r}].orig_to_new_eid", f"expert id {orig_int} is outside [0, {num_orig})")
++            if new_int >= num_kept:
++                _fail(path, f"[{router!r}].orig_to_new_eid", f"new expert id {new_int} is outside [0, {num_kept})")
++            seen_orig.add(orig_int)
++            dense_values.append(new_int)
++        if seen_orig != set(range(num_orig)):
++            _fail(path, f"[{router!r}].orig_to_new_eid", "keys must cover every original expert id")
++        if sorted(set(dense_values)) != list(range(num_kept)):
++            _fail(path, f"[{router!r}].orig_to_new_eid", "values must use dense 0..num_experts_kept-1")
++
++        clusters = entry["clusters"]
++        if not isinstance(clusters, Sequence) or isinstance(clusters, (str, bytes)):
++            _fail(path, f"[{router!r}].clusters", "expected a list of cluster mappings")
++        if len(clusters) != num_kept:
++            _fail(path, f"[{router!r}].clusters", "length does not match num_experts_kept")
++        cluster_new_ids: list[int] = []
++        cluster_orig_ids: list[int] = []
++        for idx, cluster in enumerate(clusters):
++            where = f"[{router!r}].clusters[{idx}]"
++            if not _is_mapping(cluster):
++                _fail(path, where, "cluster is not a mapping")
++            for field in ("new_expert_id", "anchor_expert_id", "original_expert_ids"):
++                if field not in cluster:
++                    _fail(path, f"{where}.{field}", "required field missing")
++            new_eid = _as_non_negative_int(cluster["new_expert_id"], path, f"{where}.new_expert_id")
++            if new_eid >= num_kept:
++                _fail(path, f"{where}.new_expert_id", f"is outside [0, {num_kept})")
++            anchor = _as_non_negative_int(cluster["anchor_expert_id"], path, f"{where}.anchor_expert_id")
++            orig_ids = _int_list(cluster["original_expert_ids"], path, f"{where}.original_expert_ids")
++            if not orig_ids:
++                _fail(path, f"{where}.original_expert_ids", "cluster must contain at least one expert")
++            if len(set(orig_ids)) != len(orig_ids):
++                _fail(path, f"{where}.original_expert_ids", "contains duplicates")
++            for eid in orig_ids:
++                if eid < 0 or eid >= num_orig:
++                    _fail(path, where, f"expert id {eid} is outside [0, {num_orig})")
++                mapped = mapping.get(str(eid), mapping.get(eid))
++                if mapped != new_eid:
++                    _fail(path, f"{where}.original_expert_ids", "does not match orig_to_new_eid")
++            if anchor not in orig_ids:
++                _fail(path, f"{where}.anchor_expert_id", "must be a member of original_expert_ids")
++            if anchor not in kept:
++                _fail(path, f"{where}.anchor_expert_id", "must be listed in kept_expert_ids")
++            cluster_new_ids.append(new_eid)
++            cluster_orig_ids.extend(orig_ids)
++            if "weights" in cluster:
++                _validate_cluster_weights(
++                    cluster["weights"], set(orig_ids), path, f"{where}.weights"
++                )
++            if "router_weights" in cluster:
++                _validate_cluster_weights(
++                    cluster["router_weights"], set(orig_ids), path, f"{where}.router_weights"
++                )
++            if "tensor_weights" in cluster:
++                if not _is_mapping(cluster["tensor_weights"]):
++                    _fail(path, f"{where}.tensor_weights", "must be a mapping")
++                for tensor_name, weights in cluster["tensor_weights"].items():
++                    if not isinstance(tensor_name, str) or not tensor_name:
++                        _fail(path, f"{where}.tensor_weights", "tensor names must be non-empty strings")
++                    _validate_cluster_weights(
++                        weights,
++                        set(orig_ids),
++                        path,
++                        f"{where}.tensor_weights[{tensor_name!r}]",
++                    )
++            if "merge_action" in cluster and cluster["merge_action"] not in (
++                "anchor",
++                "merge",
++                "identity",
++            ):
++                _fail(path, f"{where}.merge_action", "unknown merge action")
++            if "decision" in cluster and not isinstance(cluster["decision"], str):
++                _fail(path, f"{where}.decision", "must be a string")
++            for numeric in (
++                "centroid_residual_energy",
++                "predicted_merge_loss",
++                "marginal_value_sum",
++            ):
++                if numeric in cluster:
++                    val = _as_number(cluster[numeric], path, f"{where}.{numeric}")
++                    if val < 0:
++                        _fail(path, f"{where}.{numeric}", "must be non-negative")
++        if sorted(cluster_new_ids) != list(range(num_kept)):
++            _fail(path, f"[{router!r}].clusters", "new_expert_id values must be dense 0..num_experts_kept-1")
++        if sorted(cluster_orig_ids) != list(range(num_orig)):
++            _fail(path, f"[{router!r}].clusters", "original_expert_ids must cover every original expert id exactly once")
++
++        if "total_predicted_merge_loss" in entry:
++            val = _as_number(
++                entry["total_predicted_merge_loss"],
++                path,
++                f"[{router!r}].total_predicted_merge_loss",
++            )
++            if val < 0:
++                _fail(path, f"[{router!r}].total_predicted_merge_loss", "must be non-negative")
++    return payload
++
++
+ def _int_list(value, path: str | None, where: str) -> list[int]:
+     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+         _fail(path, where, "expected a list of integers")
+@@ -283,3 +434,21 @@ def _parse_eid(value, path: str | None, where: str) -> int:
+     if out < 0:
+         _fail(path, where, "expected a non-negative expert id")
+     return out
++
++
++def _validate_cluster_weights(value, expected_ids: set[int], path: str | None, where: str) -> None:
++    if not _is_mapping(value):
++        _fail(path, where, "must be a mapping")
++    seen: set[int] = set()
++    total = 0.0
++    for eid, weight in value.items():
++        eid_int = _parse_eid(eid, path, f"{where} key")
++        w = _as_number(weight, path, f"{where}[{eid!r}]")
++        if w < 0:
++            _fail(path, f"{where}[{eid!r}]", "must be non-negative")
++        seen.add(eid_int)
++        total += w
++    if seen != expected_ids:
++        _fail(path, where, "keys must exactly match original_expert_ids")
++    if expected_ids and abs(total - 1.0) > 1e-4:
++        _fail(path, where, "weights must sum to 1")
+diff --git a/tests/test_exporter_prune.py b/tests/test_exporter_prune.py
+index b8ab6a1..8942010 100644
+--- a/tests/test_exporter_prune.py
++++ b/tests/test_exporter_prune.py
+@@ -16,6 +16,7 @@ run, not by unit tests (would require a full MoE skeleton on disk).
+ from __future__ import annotations
+ 
+ import json
++from collections import Counter
+ from pathlib import Path
+ 
+ import pytest
+@@ -24,7 +25,14 @@ import torch.nn as nn
+ 
+ from prismaquant.export_native_compressed import (
+     _index_prune_by_parent,
++    _index_merge_by_parent,
++    _load_merge_manifest,
+     _load_prune_manifest,
++    _merge_packed_experts_tensor,
++    _merge_router_tensor_first_dim,
++    _queue_or_emit_entmoot_nvfp4,
++    _queue_or_emit_weighted_tensor_merge,
++    _resolve_linear_merge_action,
+     _resolve_linear_prune_action,
+     _resolve_packed_experts_prune,
+     _shrink_router_weight,
+@@ -45,6 +53,33 @@ def _manifest_fixture():
+     }
+ 
+ 
++def _merge_manifest_fixture():
++    """4-expert Entmoot merge to two dense expert slots."""
++    return {
++        "model.layers.0.mlp.gate": {
++            "method": "entmoot_svd_gram_v1",
++            "num_experts_orig": 4,
++            "num_experts_kept": 2,
++            "kept_expert_ids": [0, 2],
++            "orig_to_new_eid": {"0": 0, "1": 0, "2": 1, "3": 1},
++            "clusters": [
++                {
++                    "new_expert_id": 0,
++                    "anchor_expert_id": 0,
++                    "original_expert_ids": [0, 1],
++                    "weights": {"0": 0.75, "1": 0.25},
++                },
++                {
++                    "new_expert_id": 1,
++                    "anchor_expert_id": 2,
++                    "original_expert_ids": [2, 3],
++                    "weights": {"2": 0.6, "3": 0.4},
++                },
++            ],
++        }
++    }
++
++
+ def test_load_prune_manifest_missing_file(tmp_path):
+     assert _load_prune_manifest(None) == {}
+     assert _load_prune_manifest(tmp_path / "does_not_exist.json") == {}
+@@ -59,6 +94,15 @@ def test_load_prune_manifest_valid_json(tmp_path):
+     assert got == m
+ 
+ 
++def test_load_merge_manifest_valid_json(tmp_path):
++    m = _merge_manifest_fixture()
++    p = tmp_path / "m.json"
++    with open(p, "w") as f:
++        json.dump(m, f)
++    got = _load_merge_manifest(p)
++    assert got == m
++
++
+ def test_load_prune_manifest_rejects_non_object(tmp_path):
+     p = tmp_path / "bad.json"
+     with open(p, "w") as f:
+@@ -133,6 +177,137 @@ def test_resolve_action_empty_manifest_is_noop():
+     ) is None
+ 
+ 
++def test_resolve_linear_merge_action():
++    by_parent = _index_merge_by_parent(_merge_manifest_fixture())
++    got = _resolve_linear_merge_action(
++        "model.layers.0.mlp.experts.1.gate_proj", by_parent,
++    )
++    assert got is not None
++    kind, entry = got
++    assert kind == "merge"
++    assert entry["orig_eid"] == 1
++    assert entry["new_eid"] == 0
++    assert entry["cluster_weight"] == 0.25
++    assert entry["new_full"] == "model.layers.0.mlp.experts.0.gate_proj"
++    assert entry["anchor_full"] == "model.layers.0.mlp.experts.0.gate_proj"
++
++
++def test_merge_router_tensor_uses_anchor_rows_by_default():
++    w = torch.arange(32, dtype=torch.float32).reshape(4, 8)
++    entry = _merge_manifest_fixture()["model.layers.0.mlp.gate"]
++    merged = _merge_router_tensor_first_dim(w, entry)
++    assert torch.equal(merged[0], w[0])
++    assert torch.equal(merged[1], w[2])
++
++
++def test_merge_router_tensor_can_weight_average_rows():
++    w = torch.arange(16, dtype=torch.float32).reshape(4, 4)
++    entry = _merge_manifest_fixture()["model.layers.0.mlp.gate"].copy()
++    entry["router_strategy"] = "weighted_average"
++    merged = _merge_router_tensor_first_dim(w, entry)
++    assert torch.allclose(merged[0], 0.75 * w[0] + 0.25 * w[1])
++    assert torch.allclose(merged[1], 0.6 * w[2] + 0.4 * w[3])
++
++
++def test_merge_router_tensor_prefers_router_weights_for_row_average():
++    w = torch.arange(16, dtype=torch.float32).reshape(4, 4)
++    entry = _merge_manifest_fixture()["model.layers.0.mlp.gate"].copy()
++    entry["router_strategy"] = "weighted_average"
++    entry["clusters"] = [dict(c) for c in entry["clusters"]]
++    entry["clusters"][0]["router_weights"] = {"0": 0.2, "1": 0.8}
++    entry["clusters"][1]["router_weights"] = {"2": 1.0, "3": 0.0}
++    merged = _merge_router_tensor_first_dim(w, entry)
++    assert torch.allclose(merged[0], 0.2 * w[0] + 0.8 * w[1])
++    assert torch.allclose(merged[1], w[2])
++
++
++def test_merge_packed_experts_tensor_weight_average_dim0():
++    packed = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
++    entry = _merge_manifest_fixture()["model.layers.0.mlp.gate"]
++    merged = _merge_packed_experts_tensor(packed, entry)
++    assert merged.shape == (2, 2, 3)
++    assert torch.allclose(merged[0], 0.75 * packed[0] + 0.25 * packed[1])
++    assert torch.allclose(merged[1], 0.6 * packed[2] + 0.4 * packed[3])
++
++
++def test_merge_packed_experts_tensor_uses_tensor_specific_weights():
++    packed = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
++    entry = _merge_manifest_fixture()["model.layers.0.mlp.gate"].copy()
++    entry["clusters"] = [dict(c) for c in entry["clusters"]]
++    entry["clusters"][0]["tensor_weights"] = {
++        "gate_up_proj": {"0": 0.1, "1": 0.9},
++        "down_proj": {"0": 0.8, "1": 0.2},
++    }
++
++    gate_up = _merge_packed_experts_tensor(
++        packed, entry, tensor_name="gate_up_proj",
++    )
++    down = _merge_packed_experts_tensor(
++        packed, entry, tensor_name="down_proj",
++    )
++
++    assert torch.allclose(gate_up[0], 0.1 * packed[0] + 0.9 * packed[1])
++    assert torch.allclose(down[0], 0.8 * packed[0] + 0.2 * packed[1])
++
++
++def test_weighted_merge_queue_emits_only_after_cluster_complete():
++    out = {}
++    weights = {0: 0.25, 1: 0.75}
++    emitted = _queue_or_emit_weighted_tensor_merge(
++        out,
++        source_full="expert.0",
++        target_full="expert.new.weight",
++        source_tensor=torch.tensor([4.0, 8.0]),
++        coeff=weights[0],
++        expected_sources=weights,
++        source_eid=0,
++        dtype=torch.float32,
++        to_cpu=False,
++    )
++    assert emitted is False
++    assert out == {}
++    emitted = _queue_or_emit_weighted_tensor_merge(
++        out,
++        source_full="expert.1",
++        target_full="expert.new.weight",
++        source_tensor=torch.tensor([8.0, 16.0]),
++        coeff=weights[1],
++        expected_sources=weights,
++        source_eid=1,
++        dtype=torch.float32,
++        to_cpu=False,
++    )
++    assert emitted is True
++    assert torch.allclose(out["expert.new.weight"], torch.tensor([7.0, 14.0]))
++
++
++def test_entmoot_nvfp4_gate_up_queue_shares_global_scale():
++    out = {}
++    hist = Counter()
++    _queue_or_emit_entmoot_nvfp4(
++        out,
++        emit_full="model.layers.0.mlp.experts.0.gate_proj",
++        recipe_key="model.layers.0.mlp.experts.0.gate_proj",
++        merged_weight=torch.ones(16, 16),
++        hist=hist,
++    )
++    assert out == {}
++    _queue_or_emit_entmoot_nvfp4(
++        out,
++        emit_full="model.layers.0.mlp.experts.0.up_proj",
++        recipe_key="model.layers.0.mlp.experts.0.up_proj",
++        merged_weight=torch.ones(16, 16) * 2,
++        hist=hist,
++    )
++    gate_scale = out[
++        "model.layers.0.mlp.experts.0.gate_proj.weight_global_scale"
++    ]
++    up_scale = out[
++        "model.layers.0.mlp.experts.0.up_proj.weight_global_scale"
++    ]
++    assert torch.equal(gate_scale, up_scale)
++
++
+ def test_resolve_packed_experts_prune():
+     by_parent = _index_prune_by_parent(_manifest_fixture())
+     got = _resolve_packed_experts_prune("model.layers.0.mlp.experts", by_parent)
+@@ -224,6 +399,29 @@ def test_write_config_patches_num_experts_fields(tmp_path):
+     assert patched["text_config"]["num_local_experts"] == 2
+ 
+ 
++def test_write_config_patches_num_experts_fields_for_entmoot(tmp_path):
++    src = tmp_path / "src"
++    src.mkdir()
++    with open(src / "config.json", "w") as f:
++        json.dump({"num_experts": 4, "num_routed_experts": 4}, f)
++    out_dir = tmp_path / "out"
++    out_dir.mkdir()
++
++    import prismaquant.model_profiles as mp
++    from prismaquant.model_profiles import DefaultProfile
++    mp.detect_profile = lambda _p: DefaultProfile()
++    write_config_with_quantization(
++        str(src), out_dir,
++        assignment={}, bf16_passthrough=set(),
++        merge_manifest=_merge_manifest_fixture(),
++    )
++
++    with open(out_dir / "config.json") as f:
++        patched = json.load(f)
++    assert patched["num_experts"] == 2
++    assert patched["num_routed_experts"] == 2
++
++
+ def test_write_config_rejects_mixed_kept_counts(tmp_path):
+     """All MoE layers must share a kept count — the HF config holds
+     a single scalar per field."""
+diff --git a/tests/test_prismaquant_export_native_compressed.py b/tests/test_prismaquant_export_native_compressed.py
+index d3254cc..b13f7e8 100644
+--- a/tests/test_prismaquant_export_native_compressed.py
++++ b/tests/test_prismaquant_export_native_compressed.py
+@@ -886,6 +886,42 @@ class TestComputeExtraIgnorePerExpertSiblings(unittest.TestCase):
+         self.assertIn(
+             "model.language_model.layers.0.mlp.shared_expert_gate", extra)
+ 
++    def test_entmoot_nonanchor_original_experts_excluded(self):
++        assignment: dict[str, str] = {}
++        merge_manifest = {
++            "model.layers.0.mlp.gate": {
++                "num_experts_orig": 4,
++                "num_experts_kept": 2,
++                "kept_expert_ids": [0, 2],
++                "orig_to_new_eid": {"0": 0, "1": 0, "2": 1, "3": 1},
++                "clusters": [
++                    {
++                        "new_expert_id": 0,
++                        "anchor_expert_id": 0,
++                        "original_expert_ids": [0, 1],
++                    },
++                    {
++                        "new_expert_id": 1,
++                        "anchor_expert_id": 2,
++                        "original_expert_ids": [2, 3],
++                    },
++                ],
++            }
++        }
++        source_iter = [
++            ("model.layers.0.mlp.experts.0.gate_proj.weight", [512, 1024]),
++            ("model.layers.0.mlp.experts.1.gate_proj.weight", [512, 1024]),
++            ("model.layers.0.mlp.experts.2.down_proj.weight", [1024, 512]),
++            ("model.layers.0.mlp.experts.3.down_proj.weight", [1024, 512]),
++        ]
++        extra = compute_extra_ignore(
++            source_iter, assignment, merge_manifest=merge_manifest)
++
++        self.assertIn("model.layers.0.mlp.experts.0.gate_proj", extra)
++        self.assertNotIn("model.layers.0.mlp.experts.1.gate_proj", extra)
++        self.assertIn("model.layers.0.mlp.experts.2.down_proj", extra)
++        self.assertNotIn("model.layers.0.mlp.experts.3.down_proj", extra)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_schema_validation.py b/tests/test_schema_validation.py
+index 0fb2ab4..4195205 100644
+--- a/tests/test_schema_validation.py
++++ b/tests/test_schema_validation.py
+@@ -9,6 +9,7 @@ from prismaquant.schemas import (
+     SchemaValidationError,
+     validate_cost_payload,
+     validate_layer_config_payload,
++    validate_merge_manifest_payload,
+     validate_probe_payload,
+     validate_prune_manifest_payload,
+ )
+@@ -74,11 +75,45 @@ def _prune_manifest_payload():
+     }
+ 
+ 
++def _merge_manifest_payload():
++    return {
++        "model.layers.0.mlp.gate": {
++            "method": "entmoot_svd_gram_v1",
++            "num_experts_orig": 4,
++            "num_experts_kept": 2,
++            "kept_expert_ids": [0, 2],
++            "orig_to_new_eid": {"0": 0, "1": 0, "2": 1, "3": 1},
++            "clusters": [
++                {
++                    "new_expert_id": 0,
++                    "anchor_expert_id": 0,
++                    "original_expert_ids": [0, 1],
++                    "weights": {"0": 0.75, "1": 0.25},
++                    "centroid_residual_energy": 0.1,
++                    "predicted_merge_loss": 0.1,
++                    "marginal_value_sum": 4.0,
++                },
++                {
++                    "new_expert_id": 1,
++                    "anchor_expert_id": 2,
++                    "original_expert_ids": [2, 3],
++                    "weights": {"2": 0.6, "3": 0.4},
++                    "centroid_residual_energy": 0.2,
++                    "predicted_merge_loss": 0.2,
++                    "marginal_value_sum": 3.0,
++                },
++            ],
++            "total_predicted_merge_loss": 0.3,
++        }
++    }
++
++
+ def test_valid_handoff_payloads_pass():
+     assert validate_probe_payload(_probe_payload(), "probe.pkl") is not None
+     assert validate_cost_payload(_cost_payload(), "cost.pkl") is not None
+     assert validate_layer_config_payload(_layer_config_payload(), "layer.json") is not None
+     assert validate_prune_manifest_payload(_prune_manifest_payload(), "prune.json") is not None
++    assert validate_merge_manifest_payload(_merge_manifest_payload(), "merge.json") is not None
+ 
+ 
+ def test_probe_payload_rejects_missing_required_stat_field():
+@@ -109,6 +144,49 @@ def test_prune_manifest_rejects_inconsistent_reindex_map():
+         validate_prune_manifest_payload(payload, "prune.json")
+ 
+ 
++def test_merge_manifest_rejects_incomplete_original_mapping():
++    payload = _merge_manifest_payload()
++    del payload["model.layers.0.mlp.gate"]["orig_to_new_eid"]["3"]
++    with pytest.raises(SchemaValidationError, match="cover every original"):
++        validate_merge_manifest_payload(payload, "merge.json")
++
++
++def test_merge_manifest_rejects_cluster_mapping_mismatch():
++    payload = _merge_manifest_payload()
++    payload["model.layers.0.mlp.gate"]["clusters"][1]["original_expert_ids"] = [2]
++    with pytest.raises(SchemaValidationError, match="original_expert_ids"):
++        validate_merge_manifest_payload(payload, "merge.json")
++
++
++def test_merge_manifest_rejects_bad_cluster_weights():
++    payload = _merge_manifest_payload()
++    payload["model.layers.0.mlp.gate"]["clusters"][0]["weights"] = {"0": 0.9, "1": 0.2}
++    with pytest.raises(SchemaValidationError, match="sum to 1"):
++        validate_merge_manifest_payload(payload, "merge.json")
++
++
++def test_merge_manifest_rejects_bad_router_weights():
++    payload = _merge_manifest_payload()
++    payload["model.layers.0.mlp.gate"]["clusters"][0]["router_weights"] = {"0": 1.0}
++    with pytest.raises(SchemaValidationError, match="router_weights"):
++        validate_merge_manifest_payload(payload, "merge.json")
++
++
++def test_merge_manifest_validates_tensor_weights():
++    payload = _merge_manifest_payload()
++    payload["model.layers.0.mlp.gate"]["clusters"][0]["tensor_weights"] = {
++        "gate_up_proj": {"0": 0.7, "1": 0.3},
++        "down_proj": {"0": 0.2, "1": 0.8},
++    }
++    validate_merge_manifest_payload(payload, "merge.json")
++
++    payload["model.layers.0.mlp.gate"]["clusters"][0]["tensor_weights"]["down_proj"] = {
++        "0": 1.0,
++    }
++    with pytest.raises(SchemaValidationError, match="tensor_weights"):
++        validate_merge_manifest_payload(payload, "merge.json")
++
++
+ def test_exporter_prune_loader_validates_manifest_schema(tmp_path):
+     path = tmp_path / "bad.prune.json"
+     payload = _prune_manifest_payload()

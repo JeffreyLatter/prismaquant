@@ -1,0 +1,32 @@
+{
+  "collector": "scratch/entmoot/qwen36-layer20/qwen36_layer20.collector.pt",
+  "format": "entmoot_choose_router_strategies_v1",
+  "manifest": "scratch/entmoot/qwen36-layer20/qwen36_layer20.merge.activation_fit.json",
+  "model": "/home/rob/.cache/huggingface/qwen36_src",
+  "output": "scratch/entmoot/qwen36-layer20/qwen36_layer20.merge.activation_fit.routed.json",
+  "routers": {
+    "model.layers.20.mlp.gate": {
+      "kl_cap": 0.05,
+      "metrics": [
+        {
+          "kl_mean": 0.0,
+          "num_tokens": 4096,
+          "strategy": "anchor",
+          "top1_agreement": 1.0,
+          "topk_set_agreement": 1.0
+        },
+        {
+          "kl_mean": 0.0,
+          "num_tokens": 4096,
+          "strategy": "weighted_average",
+          "top1_agreement": 1.0,
+          "topk_set_agreement": 1.0
+        }
+      ],
+      "selected_strategy": "anchor",
+      "top1_floor": 0.95,
+      "topk_floor": 0.9
+    }
+  },
+  "top_k": 8
+}

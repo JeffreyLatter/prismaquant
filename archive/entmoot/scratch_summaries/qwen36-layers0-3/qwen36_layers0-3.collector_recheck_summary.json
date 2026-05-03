@@ -1,0 +1,51 @@
+{
+  "format": "entmoot_collector_summary_v1",
+  "layers": {
+    "model.layers.0.mlp.gate": {
+      "experts_with_samples": 256,
+      "max_samples": 256,
+      "max_seen": 1700,
+      "median_samples": 256.0,
+      "median_seen": 477.0,
+      "min_samples": 38,
+      "min_seen": 38,
+      "num_experts": 256,
+      "total_tokens": 16961
+    },
+    "model.layers.1.mlp.gate": {
+      "experts_with_samples": 256,
+      "max_samples": 256,
+      "max_seen": 1771,
+      "median_samples": 256.0,
+      "median_seen": 470.0,
+      "min_samples": 21,
+      "min_seen": 21,
+      "num_experts": 256,
+      "total_tokens": 16961
+    },
+    "model.layers.2.mlp.gate": {
+      "experts_with_samples": 256,
+      "max_samples": 256,
+      "max_seen": 1345,
+      "median_samples": 256.0,
+      "median_seen": 470.0,
+      "min_samples": 153,
+      "min_seen": 153,
+      "num_experts": 256,
+      "total_tokens": 16961
+    },
+    "model.layers.3.mlp.gate": {
+      "experts_with_samples": 256,
+      "max_samples": 256,
+      "max_seen": 2274,
+      "median_samples": 256.0,
+      "median_seen": 414.5,
+      "min_samples": 15,
+      "min_seen": 15,
+      "num_experts": 256,
+      "total_tokens": 16961
+    }
+  },
+  "n_layers": 4,
+  "path": "scratch/entmoot/qwen36-layers0-3/qwen36_layers0-3.collector.pt"
+}

@@ -1,0 +1,13 @@
+{
+  "activation_fit_mode": "synthesis_pair_decoupled",
+  "activation_fit_model": "/home/rob/.cache/huggingface/qwen36_src",
+  "collector": "scratch/entmoot/qwen36-layer20/qwen36_layer20.collector.pt",
+  "format": "entmoot_plan_from_collector_v1",
+  "n_experts_kept": 256,
+  "n_experts_orig": 256,
+  "n_layers": 1,
+  "output": "scratch/entmoot/qwen36-layer20/qwen36_layer20.merge.synthesis_pair_decoupled.json",
+  "routers": [
+    "model.layers.20.mlp.gate"
+  ]
+}

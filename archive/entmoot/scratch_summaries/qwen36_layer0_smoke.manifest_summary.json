@@ -1,0 +1,15 @@
+{
+  "format": "entmoot_manifest_summary_v1",
+  "layers": {
+    "model.layers.0.mlp.gate": {
+      "accepted_merges": 0,
+      "method": "entmoot_router_id_v1",
+      "num_experts_kept": 256,
+      "num_experts_orig": 256,
+      "rejected_identity": 128,
+      "router_strategy": "anchor"
+    }
+  },
+  "n_layers": 1,
+  "path": "scratch/entmoot/qwen36_layer0_smoke.merge.json"
+}

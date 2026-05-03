@@ -1,0 +1,1560 @@
+{
+  "dataset": "/home/rob/dq-runs/minimax-m2p7-v21/chunks/chunk_04.jsonl",
+  "format": "entmoot_collect_jsonl_v1",
+  "forward_mode": "backbone",
+  "layers": {
+    "model.layers.20.mlp.gate": {
+      "experts": [
+        {
+          "expert_id": 0,
+          "routed_mass": 65.33007365837693,
+          "samples": 256,
+          "seen": 492
+        },
+        {
+          "expert_id": 1,
+          "routed_mass": 11.23636706918478,
+          "samples": 123,
+          "seen": 123
+        },
+        {
+          "expert_id": 2,
+          "routed_mass": 0.0,
+          "samples": 0,
+          "seen": 0
+        },
+        {
+          "expert_id": 3,
+          "routed_mass": 57.88183297216892,
+          "samples": 256,
+          "seen": 488
+        },
+        {
+          "expert_id": 4,
+          "routed_mass": 62.91464210674167,
+          "samples": 256,
+          "seen": 614
+        },
+        {
+          "expert_id": 5,
+          "routed_mass": 4.667319737374783,
+          "samples": 63,
+          "seen": 63
+        },
+        {
+          "expert_id": 6,
+          "routed_mass": 10.287065787240863,
+          "samples": 117,
+          "seen": 117
+        },
+        {
+          "expert_id": 7,
+          "routed_mass": 72.02474375069141,
+          "samples": 256,
+          "seen": 643
+        },
+        {
+          "expert_id": 8,
+          "routed_mass": 14.436085375025868,
+          "samples": 161,
+          "seen": 161
+        },
+        {
+          "expert_id": 9,
+          "routed_mass": 11.938802503049374,
+          "samples": 136,
+          "seen": 136
+        },
+        {
+          "expert_id": 10,
+          "routed_mass": 97.75124135613441,
+          "samples": 256,
+          "seen": 772
+        },
+        {
+          "expert_id": 11,
+          "routed_mass": 31.977123025804758,
+          "samples": 237,
+          "seen": 237
+        },
+        {
+          "expert_id": 12,
+          "routed_mass": 8.160344678908587,
+          "samples": 90,
+          "seen": 90
+        },
+        {
+          "expert_id": 13,
+          "routed_mass": 201.238129645586,
+          "samples": 256,
+          "seen": 1662
+        },
+        {
+          "expert_id": 14,
+          "routed_mass": 2.4922992177307606,
+          "samples": 31,
+          "seen": 31
+        },
+        {
+          "expert_id": 15,
+          "routed_mass": 0.07561778277158737,
+          "samples": 1,
+          "seen": 1
+        },
+        {
+          "expert_id": 16,
+          "routed_mass": 20.72025590389967,
+          "samples": 168,
+          "seen": 168
+        },
+        {
+          "expert_id": 17,
+          "routed_mass": 22.149199955165386,
+          "samples": 141,
+          "seen": 141
+        },
+        {
+          "expert_id": 18,
+          "routed_mass": 20.785891147330403,
+          "samples": 228,
+          "seen": 228
+        },
+        {
+          "expert_id": 19,
+          "routed_mass": 119.49121766537428,
+          "samples": 256,
+          "seen": 982
+        },
+        {
+          "expert_id": 20,
+          "routed_mass": 127.84410010837018,
+          "samples": 256,
+          "seen": 1253
+        },
+        {
+          "expert_id": 21,
+          "routed_mass": 15.66636162251234,
+          "samples": 183,
+          "seen": 183
+        },
+        {
+          "expert_id": 22,
+          "routed_mass": 429.9822059292346,
+          "samples": 256,
+          "seen": 3474
+        },
+        {
+          "expert_id": 23,
+          "routed_mass": 7.982391562312841,
+          "samples": 86,
+          "seen": 86
+        },
+        {
+          "expert_id": 24,
+          "routed_mass": 8.268593057990074,
+          "samples": 99,
+          "seen": 99
+        },
+        {
+          "expert_id": 25,
+          "routed_mass": 50.307058326900005,
+          "samples": 256,
+          "seen": 518
+        },
+        {
+          "expert_id": 26,
+          "routed_mass": 15.637965381145477,
+          "samples": 125,
+          "seen": 125
+        },
+        {
+          "expert_id": 27,
+          "routed_mass": 93.57677124813199,
+          "samples": 256,
+          "seen": 721
+        },
+        {
+          "expert_id": 28,
+          "routed_mass": 274.42642403393984,
+          "samples": 256,
+          "seen": 1637
+        },
+        {
+          "expert_id": 29,
+          "routed_mass": 0.5444345325231552,
+          "samples": 6,
+          "seen": 6
+        },
+        {
+          "expert_id": 30,
+          "routed_mass": 0.7967454604804516,
+          "samples": 11,
+          "seen": 11
+        },
+        {
+          "expert_id": 31,
+          "routed_mass": 6.7048769891262054,
+          "samples": 100,
+          "seen": 100
+        },
+        {
+          "expert_id": 32,
+          "routed_mass": 0.8418180830776691,
+          "samples": 10,
+          "seen": 10
+        },
+        {
+          "expert_id": 33,
+          "routed_mass": 107.105353243649,
+          "samples": 256,
+          "seen": 682
+        },
+        {
+          "expert_id": 34,
+          "routed_mass": 26.549090955406427,
+          "samples": 256,
+          "seen": 279
+        },
+        {
+          "expert_id": 35,
+          "routed_mass": 93.0616467371583,
+          "samples": 256,
+          "seen": 834
+        },
+        {
+          "expert_id": 36,
+          "routed_mass": 54.09481383487582,
+          "samples": 256,
+          "seen": 624
+        },
+        {
+          "expert_id": 37,
+          "routed_mass": 4.680221538990736,
+          "samples": 53,
+          "seen": 53
+        },
+        {
+          "expert_id": 38,
+          "routed_mass": 77.11650693044066,
+          "samples": 256,
+          "seen": 568
+        },
+        {
+          "expert_id": 39,
+          "routed_mass": 0.17231478542089462,
+          "samples": 2,
+          "seen": 2
+        },
+        {
+          "expert_id": 40,
+          "routed_mass": 41.65317602828145,
+          "samples": 256,
+          "seen": 373
+        },
+        {
+          "expert_id": 41,
+          "routed_mass": 12.40702704526484,
+          "samples": 176,
+          "seen": 176
+        },
+        {
+          "expert_id": 42,
+          "routed_mass": 54.16586697846651,
+          "samples": 256,
+          "seen": 508
+        },
+        {
+          "expert_id": 43,
+          "routed_mass": 168.68509454280138,
+          "samples": 256,
+          "seen": 1030
+        },
+        {
+          "expert_id": 44,
+          "routed_mass": 72.23926790058613,
+          "samples": 256,
+          "seen": 851
+        },
+        {
+          "expert_id": 45,
+          "routed_mass": 22.516405809670687,
+          "samples": 215,
+          "seen": 215
+        },
+        {
+          "expert_id": 46,
+          "routed_mass": 1.5243775099515915,
+          "samples": 15,
+          "seen": 15
+        },
+        {
+          "expert_id": 47,
+          "routed_mass": 38.5052954480052,
+          "samples": 256,
+          "seen": 285
+        },
+        {
+          "expert_id": 48,
+          "routed_mass": 8.069840107113123,
+          "samples": 97,
+          "seen": 97
+        },
+        {
+          "expert_id": 49,
+          "routed_mass": 64.98296995460987,
+          "samples": 256,
+          "seen": 558
+        },
+        {
+          "expert_id": 50,
+          "routed_mass": 35.54400926083326,
+          "samples": 256,
+          "seen": 311
+        },
+        {
+          "expert_id": 51,
+          "routed_mass": 0.0,
+          "samples": 0,
+          "seen": 0
+        },
+        {
+          "expert_id": 52,
+          "routed_mass": 1.4405849426984787,
+          "samples": 18,
+          "seen": 18
+        },
+        {
+          "expert_id": 53,
+          "routed_mass": 23.853500120341778,
+          "samples": 243,
+          "seen": 243
+        },
+        {
+          "expert_id": 54,
+          "routed_mass": 2.5193722993135452,
+          "samples": 28,
+          "seen": 28
+        },
+        {
+          "expert_id": 55,
+          "routed_mass": 0.4694316238164902,
+          "samples": 5,
+          "seen": 5
+        },
+        {
+          "expert_id": 56,
+          "routed_mass": 83.20894651859999,
+          "samples": 256,
+          "seen": 598
+        },
+        {
+          "expert_id": 57,
+          "routed_mass": 22.329253502190113,
+          "samples": 256,
+          "seen": 259
+        },
+        {
+          "expert_id": 58,
+          "routed_mass": 19.20871021784842,
+          "samples": 198,
+          "seen": 198
+        },
+        {
+          "expert_id": 59,
+          "routed_mass": 2.666681043803692,
+          "samples": 32,
+          "seen": 32
+        },
+        {
+          "expert_id": 60,
+          "routed_mass": 8.09529735147953,
+          "samples": 86,
+          "seen": 86
+        },
+        {
+          "expert_id": 61,
+          "routed_mass": 8.848165020346642,
+          "samples": 97,
+          "seen": 97
+        },
+        {
+          "expert_id": 62,
+          "routed_mass": 12.461784116923809,
+          "samples": 177,
+          "seen": 177
+        },
+        {
+          "expert_id": 63,
+          "routed_mass": 3.2523170821368694,
+          "samples": 36,
+          "seen": 36
+        },
+        {
+          "expert_id": 64,
+          "routed_mass": 153.41849359683692,
+          "samples": 256,
+          "seen": 937
+        },
+        {
+          "expert_id": 65,
+          "routed_mass": 129.1761888973415,
+          "samples": 256,
+          "seen": 943
+        },
+        {
+          "expert_id": 66,
+          "routed_mass": 62.865458596497774,
+          "samples": 256,
+          "seen": 614
+        },
+        {
+          "expert_id": 67,
+          "routed_mass": 7.5930818580091,
+          "samples": 82,
+          "seen": 82
+        },
+        {
+          "expert_id": 68,
+          "routed_mass": 74.6782316789031,
+          "samples": 256,
+          "seen": 606
+        },
+        {
+          "expert_id": 69,
+          "routed_mass": 119.80182107537985,
+          "samples": 256,
+          "seen": 863
+        },
+        {
+          "expert_id": 70,
+          "routed_mass": 2.3232434950768948,
+          "samples": 27,
+          "seen": 27
+        },
+        {
+          "expert_id": 71,
+          "routed_mass": 25.312883120030165,
+          "samples": 256,
+          "seen": 287
+        },
+        {
+          "expert_id": 72,
+          "routed_mass": 240.52702456712723,
+          "samples": 256,
+          "seen": 1887
+        },
+        {
+          "expert_id": 73,
+          "routed_mass": 17.336496833711863,
+          "samples": 227,
+          "seen": 227
+        },
+        {
+          "expert_id": 74,
+          "routed_mass": 25.50820714980364,
+          "samples": 226,
+          "seen": 226
+        },
+        {
+          "expert_id": 75,
+          "routed_mass": 10.841927936300635,
+          "samples": 150,
+          "seen": 150
+        },
+        {
+          "expert_id": 76,
+          "routed_mass": 0.6348633840680122,
+          "samples": 4,
+          "seen": 4
+        },
+        {
+          "expert_id": 77,
+          "routed_mass": 140.9468286409974,
+          "samples": 256,
+          "seen": 1182
+        },
+        {
+          "expert_id": 78,
+          "routed_mass": 44.27534580603242,
+          "samples": 231,
+          "seen": 231
+        },
+        {
+          "expert_id": 79,
+          "routed_mass": 13.24475272744894,
+          "samples": 154,
+          "seen": 154
+        },
+        {
+          "expert_id": 80,
+          "routed_mass": 21.23750191926956,
+          "samples": 250,
+          "seen": 250
+        },
+        {
+          "expert_id": 81,
+          "routed_mass": 22.303108781576157,
+          "samples": 256,
+          "seen": 257
+        },
+        {
+          "expert_id": 82,
+          "routed_mass": 5.544195577502251,
+          "samples": 62,
+          "seen": 62
+        },
+        {
+          "expert_id": 83,
+          "routed_mass": 26.621657069772482,
+          "samples": 245,
+          "seen": 245
+        },
+        {
+          "expert_id": 84,
+          "routed_mass": 17.531928319483995,
+          "samples": 212,
+          "seen": 212
+        },
+        {
+          "expert_id": 85,
+          "routed_mass": 37.34103811532259,
+          "samples": 256,
+          "seen": 371
+        },
+        {
+          "expert_id": 86,
+          "routed_mass": 1.3514601215720177,
+          "samples": 14,
+          "seen": 14
+        },
+        {
+          "expert_id": 87,
+          "routed_mass": 0.07062026113271713,
+          "samples": 1,
+          "seen": 1
+        },
+        {
+          "expert_id": 88,
+          "routed_mass": 53.713562440127134,
+          "samples": 256,
+          "seen": 457
+        },
+        {
+          "expert_id": 89,
+          "routed_mass": 159.36063737794757,
+          "samples": 256,
+          "seen": 1087
+        },
+        {
+          "expert_id": 90,
+          "routed_mass": 0.5083621218800545,
+          "samples": 5,
+          "seen": 5
+        },
+        {
+          "expert_id": 91,
+          "routed_mass": 20.17287276312709,
+          "samples": 174,
+          "seen": 174
+        },
+        {
+          "expert_id": 92,
+          "routed_mass": 30.797415625303984,
+          "samples": 215,
+          "seen": 215
+        },
+        {
+          "expert_id": 93,
+          "routed_mass": 3.816215142607689,
+          "samples": 52,
+          "seen": 52
+        },
+        {
+          "expert_id": 94,
+          "routed_mass": 8.897686142474413,
+          "samples": 91,
+          "seen": 91
+        },
+        {
+          "expert_id": 95,
+          "routed_mass": 5.712939187884331,
+          "samples": 66,
+          "seen": 66
+        },
+        {
+          "expert_id": 96,
+          "routed_mass": 9.22031394764781,
+          "samples": 111,
+          "seen": 111
+        },
+        {
+          "expert_id": 97,
+          "routed_mass": 0.7937207594513893,
+          "samples": 10,
+          "seen": 10
+        },
+        {
+          "expert_id": 98,
+          "routed_mass": 6.30140046775341,
+          "samples": 73,
+          "seen": 73
+        },
+        {
+          "expert_id": 99,
+          "routed_mass": 17.97192707657814,
+          "samples": 159,
+          "seen": 159
+        },
+        {
+          "expert_id": 100,
+          "routed_mass": 279.9716520346701,
+          "samples": 256,
+          "seen": 1505
+        },
+        {
+          "expert_id": 101,
+          "routed_mass": 1.1876646131277084,
+          "samples": 13,
+          "seen": 13
+        },
+        {
+          "expert_id": 102,
+          "routed_mass": 2.6155657283961773,
+          "samples": 30,
+          "seen": 30
+        },
+        {
+          "expert_id": 103,
+          "routed_mass": 67.52330892905593,
+          "samples": 256,
+          "seen": 625
+        },
+        {
+          "expert_id": 104,
+          "routed_mass": 25.98530705086887,
+          "samples": 220,
+          "seen": 220
+        },
+        {
+          "expert_id": 105,
+          "routed_mass": 5.00343944132328,
+          "samples": 63,
+          "seen": 63
+        },
+        {
+          "expert_id": 106,
+          "routed_mass": 55.152534522116184,
+          "samples": 256,
+          "seen": 538
+        },
+        {
+          "expert_id": 107,
+          "routed_mass": 64.62345982342958,
+          "samples": 256,
+          "seen": 518
+        },
+        {
+          "expert_id": 108,
+          "routed_mass": 14.542202707380056,
+          "samples": 206,
+          "seen": 206
+        },
+        {
+          "expert_id": 109,
+          "routed_mass": 8.368891630321741,
+          "samples": 87,
+          "seen": 87
+        },
+        {
+          "expert_id": 110,
+          "routed_mass": 48.29438000544906,
+          "samples": 256,
+          "seen": 472
+        },
+        {
+          "expert_id": 111,
+          "routed_mass": 1.8196459859609604,
+          "samples": 24,
+          "seen": 24
+        },
+        {
+          "expert_id": 112,
+          "routed_mass": 87.0943560525775,
+          "samples": 256,
+          "seen": 595
+        },
+        {
+          "expert_id": 113,
+          "routed_mass": 14.381569661200047,
+          "samples": 88,
+          "seen": 88
+        },
+        {
+          "expert_id": 114,
+          "routed_mass": 20.742264218628407,
+          "samples": 256,
+          "seen": 285
+        },
+        {
+          "expert_id": 115,
+          "routed_mass": 30.495631366968155,
+          "samples": 256,
+          "seen": 287
+        },
+        {
+          "expert_id": 116,
+          "routed_mass": 16.999747943133116,
+          "samples": 135,
+          "seen": 135
+        },
+        {
+          "expert_id": 117,
+          "routed_mass": 36.18424006178975,
+          "samples": 256,
+          "seen": 365
+        },
+        {
+          "expert_id": 118,
+          "routed_mass": 42.66858456283808,
+          "samples": 256,
+          "seen": 497
+        },
+        {
+          "expert_id": 119,
+          "routed_mass": 110.35975471511483,
+          "samples": 256,
+          "seen": 714
+        },
+        {
+          "expert_id": 120,
+          "routed_mass": 125.9746245406568,
+          "samples": 256,
+          "seen": 783
+        },
+        {
+          "expert_id": 121,
+          "routed_mass": 64.71408089995384,
+          "samples": 256,
+          "seen": 524
+        },
+        {
+          "expert_id": 122,
+          "routed_mass": 177.65111051872373,
+          "samples": 256,
+          "seen": 1314
+        },
+        {
+          "expert_id": 123,
+          "routed_mass": 13.082473780959845,
+          "samples": 103,
+          "seen": 103
+        },
+        {
+          "expert_id": 124,
+          "routed_mass": 107.64946066960692,
+          "samples": 256,
+          "seen": 1009
+        },
+        {
+          "expert_id": 125,
+          "routed_mass": 11.763050980865955,
+          "samples": 129,
+          "seen": 129
+        },
+        {
+          "expert_id": 126,
+          "routed_mass": 0.0,
+          "samples": 0,
+          "seen": 0
+        },
+        {
+          "expert_id": 127,
+          "routed_mass": 51.55580425262451,
+          "samples": 256,
+          "seen": 353
+        },
+        {
+          "expert_id": 128,
+          "routed_mass": 52.15748502872884,
+          "samples": 256,
+          "seen": 513
+        },
+        {
+          "expert_id": 129,
+          "routed_mass": 7.970236327499151,
+          "samples": 90,
+          "seen": 90
+        },
+        {
+          "expert_id": 130,
+          "routed_mass": 90.04283262044191,
+          "samples": 256,
+          "seen": 687
+        },
+        {
+          "expert_id": 131,
+          "routed_mass": 0.9292520694434643,
+          "samples": 15,
+          "seen": 15
+        },
+        {
+          "expert_id": 132,
+          "routed_mass": 10.214559201151133,
+          "samples": 110,
+          "seen": 110
+        },
+        {
+          "expert_id": 133,
+          "routed_mass": 119.04938913881779,
+          "samples": 256,
+          "seen": 785
+        },
+        {
+          "expert_id": 134,
+          "routed_mass": 17.983671747148037,
+          "samples": 214,
+          "seen": 214
+        },
+        {
+          "expert_id": 135,
+          "routed_mass": 224.28260410390794,
+          "samples": 256,
+          "seen": 1561
+        },
+        {
+          "expert_id": 136,
+          "routed_mass": 0.0,
+          "samples": 0,
+          "seen": 0
+        },
+        {
+          "expert_id": 137,
+          "routed_mass": 2.030484363436699,
+          "samples": 23,
+          "seen": 23
+        },
+        {
+          "expert_id": 138,
+          "routed_mass": 97.89920061640441,
+          "samples": 256,
+          "seen": 1093
+        },
+        {
+          "expert_id": 139,
+          "routed_mass": 16.998639760538936,
+          "samples": 180,
+          "seen": 180
+        },
+        {
+          "expert_id": 140,
+          "routed_mass": 8.31290365755558,
+          "samples": 108,
+          "seen": 108
+        },
+        {
+          "expert_id": 141,
+          "routed_mass": 5.88522594794631,
+          "samples": 62,
+          "seen": 62
+        },
+        {
+          "expert_id": 142,
+          "routed_mass": 20.628943875432014,
+          "samples": 256,
+          "seen": 270
+        },
+        {
+          "expert_id": 143,
+          "routed_mass": 0.42331796139478683,
+          "samples": 7,
+          "seen": 7
+        },
+        {
+          "expert_id": 144,
+          "routed_mass": 262.9025089032948,
+          "samples": 256,
+          "seen": 1991
+        },
+        {
+          "expert_id": 145,
+          "routed_mass": 156.5878915246576,
+          "samples": 256,
+          "seen": 1228
+        },
+        {
+          "expert_id": 146,
+          "routed_mass": 39.40928975492716,
+          "samples": 256,
+          "seen": 330
+        },
+        {
+          "expert_id": 147,
+          "routed_mass": 11.90081675723195,
+          "samples": 121,
+          "seen": 121
+        },
+        {
+          "expert_id": 148,
+          "routed_mass": 32.972564335912466,
+          "samples": 256,
+          "seen": 343
+        },
+        {
+          "expert_id": 149,
+          "routed_mass": 51.83359743654728,
+          "samples": 256,
+          "seen": 322
+        },
+        {
+          "expert_id": 150,
+          "routed_mass": 16.32043982669711,
+          "samples": 197,
+          "seen": 197
+        },
+        {
+          "expert_id": 151,
+          "routed_mass": 2.6653547324240208,
+          "samples": 32,
+          "seen": 32
+        },
+        {
+          "expert_id": 152,
+          "routed_mass": 52.756064768880606,
+          "samples": 256,
+          "seen": 437
+        },
+        {
+          "expert_id": 153,
+          "routed_mass": 10.924922432750463,
+          "samples": 126,
+          "seen": 126
+        },
+        {
+          "expert_id": 154,
+          "routed_mass": 7.419556651264429,
+          "samples": 85,
+          "seen": 85
+        },
+        {
+          "expert_id": 155,
+          "routed_mass": 0.585051953792572,
+          "samples": 9,
+          "seen": 9
+        },
+        {
+          "expert_id": 156,
+          "routed_mass": 57.76578702032566,
+          "samples": 256,
+          "seen": 675
+        },
+        {
+          "expert_id": 157,
+          "routed_mass": 162.04110606014729,
+          "samples": 256,
+          "seen": 993
+        },
+        {
+          "expert_id": 158,
+          "routed_mass": 29.572624899446964,
+          "samples": 256,
+          "seen": 350
+        },
+        {
+          "expert_id": 159,
+          "routed_mass": 55.95782982185483,
+          "samples": 256,
+          "seen": 423
+        },
+        {
+          "expert_id": 160,
+          "routed_mass": 22.99083837866783,
+          "samples": 236,
+          "seen": 236
+        },
+        {
+          "expert_id": 161,
+          "routed_mass": 103.4649696201086,
+          "samples": 256,
+          "seen": 1058
+        },
+        {
+          "expert_id": 162,
+          "routed_mass": 3.0353889651596546,
+          "samples": 46,
+          "seen": 46
+        },
+        {
+          "expert_id": 163,
+          "routed_mass": 1.8281725645065308,
+          "samples": 23,
+          "seen": 23
+        },
+        {
+          "expert_id": 164,
+          "routed_mass": 32.32850988954306,
+          "samples": 252,
+          "seen": 252
+        },
+        {
+          "expert_id": 165,
+          "routed_mass": 10.72415479272604,
+          "samples": 128,
+          "seen": 128
+        },
+        {
+          "expert_id": 166,
+          "routed_mass": 9.992881275713444,
+          "samples": 116,
+          "seen": 116
+        },
+        {
+          "expert_id": 167,
+          "routed_mass": 11.643498407676816,
+          "samples": 138,
+          "seen": 138
+        },
+        {
+          "expert_id": 168,
+          "routed_mass": 51.264865620061755,
+          "samples": 256,
+          "seen": 364
+        },
+        {
+          "expert_id": 169,
+          "routed_mass": 3.344878416508436,
+          "samples": 48,
+          "seen": 48
+        },
+        {
+          "expert_id": 170,
+          "routed_mass": 2.5986339524388313,
+          "samples": 28,
+          "seen": 28
+        },
+        {
+          "expert_id": 171,
+          "routed_mass": 1.0781336054205894,
+          "samples": 13,
+          "seen": 13
+        },
+        {
+          "expert_id": 172,
+          "routed_mass": 43.93557486310601,
+          "samples": 256,
+          "seen": 356
+        },
+        {
+          "expert_id": 173,
+          "routed_mass": 9.922763496637344,
+          "samples": 106,
+          "seen": 106
+        },
+        {
+          "expert_id": 174,
+          "routed_mass": 74.45554235205054,
+          "samples": 256,
+          "seen": 452
+        },
+        {
+          "expert_id": 175,
+          "routed_mass": 56.811577927321196,
+          "samples": 256,
+          "seen": 511
+        },
+        {
+          "expert_id": 176,
+          "routed_mass": 15.644859701395035,
+          "samples": 155,
+          "seen": 155
+        },
+        {
+          "expert_id": 177,
+          "routed_mass": 0.2890720069408417,
+          "samples": 4,
+          "seen": 4
+        },
+        {
+          "expert_id": 178,
+          "routed_mass": 14.867099832743406,
+          "samples": 158,
+          "seen": 158
+        },
+        {
+          "expert_id": 179,
+          "routed_mass": 11.370133329182863,
+          "samples": 101,
+          "seen": 101
+        },
+        {
+          "expert_id": 180,
+          "routed_mass": 358.50594770908356,
+          "samples": 256,
+          "seen": 2180
+        },
+        {
+          "expert_id": 181,
+          "routed_mass": 2.5157507061958313,
+          "samples": 29,
+          "seen": 29
+        },
+        {
+          "expert_id": 182,
+          "routed_mass": 1.8347165621817112,
+          "samples": 25,
+          "seen": 25
+        },
+        {
+          "expert_id": 183,
+          "routed_mass": 51.38235414773226,
+          "samples": 256,
+          "seen": 501
+        },
+        {
+          "expert_id": 184,
+          "routed_mass": 105.53417717292905,
+          "samples": 256,
+          "seen": 911
+        },
+        {
+          "expert_id": 185,
+          "routed_mass": 24.232225988060236,
+          "samples": 194,
+          "seen": 194
+        },
+        {
+          "expert_id": 186,
+          "routed_mass": 65.84350457787514,
+          "samples": 256,
+          "seen": 573
+        },
+        {
+          "expert_id": 187,
+          "routed_mass": 15.921231009066105,
+          "samples": 184,
+          "seen": 184
+        },
+        {
+          "expert_id": 188,
+          "routed_mass": 0.25639326125383377,
+          "samples": 4,
+          "seen": 4
+        },
+        {
+          "expert_id": 189,
+          "routed_mass": 0.4712633863091469,
+          "samples": 5,
+          "seen": 5
+        },
+        {
+          "expert_id": 190,
+          "routed_mass": 10.359203431755304,
+          "samples": 116,
+          "seen": 116
+        },
+        {
+          "expert_id": 191,
+          "routed_mass": 84.19507195055485,
+          "samples": 256,
+          "seen": 729
+        },
+        {
+          "expert_id": 192,
+          "routed_mass": 1.1332424320280552,
+          "samples": 15,
+          "seen": 15
+        },
+        {
+          "expert_id": 193,
+          "routed_mass": 109.43868458271027,
+          "samples": 256,
+          "seen": 682
+        },
+        {
+          "expert_id": 194,
+          "routed_mass": 61.670420959591866,
+          "samples": 256,
+          "seen": 614
+        },
+        {
+          "expert_id": 195,
+          "routed_mass": 0.3098359629511833,
+          "samples": 4,
+          "seen": 4
+        },
+        {
+          "expert_id": 196,
+          "routed_mass": 7.157555043697357,
+          "samples": 87,
+          "seen": 87
+        },
+        {
+          "expert_id": 197,
+          "routed_mass": 53.495557859539986,
+          "samples": 256,
+          "seen": 410
+        },
+        {
+          "expert_id": 198,
+          "routed_mass": 100.017567737028,
+          "samples": 256,
+          "seen": 777
+        },
+        {
+          "expert_id": 199,
+          "routed_mass": 17.27646415308118,
+          "samples": 196,
+          "seen": 196
+        },
+        {
+          "expert_id": 200,
+          "routed_mass": 23.68593304604292,
+          "samples": 221,
+          "seen": 221
+        },
+        {
+          "expert_id": 201,
+          "routed_mass": 122.98250189051032,
+          "samples": 256,
+          "seen": 931
+        },
+        {
+          "expert_id": 202,
+          "routed_mass": 75.68506171368062,
+          "samples": 256,
+          "seen": 645
+        },
+        {
+          "expert_id": 203,
+          "routed_mass": 2.891830824315548,
+          "samples": 35,
+          "seen": 35
+        },
+        {
+          "expert_id": 204,
+          "routed_mass": 740.8269099593163,
+          "samples": 256,
+          "seen": 3610
+        },
+        {
+          "expert_id": 205,
+          "routed_mass": 98.4521660413593,
+          "samples": 256,
+          "seen": 1028
+        },
+        {
+          "expert_id": 206,
+          "routed_mass": 0.4317142330110073,
+          "samples": 5,
+          "seen": 5
+        },
+        {
+          "expert_id": 207,
+          "routed_mass": 106.38559060543776,
+          "samples": 256,
+          "seen": 986
+        },
+        {
+          "expert_id": 208,
+          "routed_mass": 2.590144095942378,
+          "samples": 35,
+          "seen": 35
+        },
+        {
+          "expert_id": 209,
+          "routed_mass": 13.814906384795904,
+          "samples": 156,
+          "seen": 156
+        },
+        {
+          "expert_id": 210,
+          "routed_mass": 2.1445094756782055,
+          "samples": 31,
+          "seen": 31
+        },
+        {
+          "expert_id": 211,
+          "routed_mass": 2.113562412559986,
+          "samples": 24,
+          "seen": 24
+        },
+        {
+          "expert_id": 212,
+          "routed_mass": 8.168512918055058,
+          "samples": 91,
+          "seen": 91
+        },
+        {
+          "expert_id": 213,
+          "routed_mass": 225.07897379994392,
+          "samples": 256,
+          "seen": 1531
+        },
+        {
+          "expert_id": 214,
+          "routed_mass": 14.114982325583696,
+          "samples": 171,
+          "seen": 171
+        },
+        {
+          "expert_id": 215,
+          "routed_mass": 13.18561577424407,
+          "samples": 120,
+          "seen": 120
+        },
+        {
+          "expert_id": 216,
+          "routed_mass": 97.70561384037137,
+          "samples": 256,
+          "seen": 609
+        },
+        {
+          "expert_id": 217,
+          "routed_mass": 54.97195721231401,
+          "samples": 256,
+          "seen": 447
+        },
+        {
+          "expert_id": 218,
+          "routed_mass": 17.124803245067596,
+          "samples": 188,
+          "seen": 188
+        },
+        {
+          "expert_id": 219,
+          "routed_mass": 3.801801037043333,
+          "samples": 48,
+          "seen": 48
+        },
+        {
+          "expert_id": 220,
+          "routed_mass": 15.015697283670306,
+          "samples": 151,
+          "seen": 151
+        },
+        {
+          "expert_id": 221,
+          "routed_mass": 2.7432427033782005,
+          "samples": 29,
+          "seen": 29
+        },
+        {
+          "expert_id": 222,
+          "routed_mass": 86.55368334800005,
+          "samples": 256,
+          "seen": 656
+        },
+        {
+          "expert_id": 223,
+          "routed_mass": 33.8026463445276,
+          "samples": 256,
+          "seen": 335
+        },
+        {
+          "expert_id": 224,
+          "routed_mass": 15.434418480843306,
+          "samples": 134,
+          "seen": 134
+        },
+        {
+          "expert_id": 225,
+          "routed_mass": 48.5584077462554,
+          "samples": 256,
+          "seen": 381
+        },
+        {
+          "expert_id": 226,
+          "routed_mass": 72.07894649729133,
+          "samples": 256,
+          "seen": 736
+        },
+        {
+          "expert_id": 227,
+          "routed_mass": 5.379774197936058,
+          "samples": 66,
+          "seen": 66
+        },
+        {
+          "expert_id": 228,
+          "routed_mass": 18.689167654141784,
+          "samples": 221,
+          "seen": 221
+        },
+        {
+          "expert_id": 229,
+          "routed_mass": 3.266331098973751,
+          "samples": 37,
+          "seen": 37
+        },
+        {
+          "expert_id": 230,
+          "routed_mass": 16.011140380054712,
+          "samples": 225,
+          "seen": 225
+        },
+        {
+          "expert_id": 231,
+          "routed_mass": 1.3238703906536102,
+          "samples": 13,
+          "seen": 13
+        },
+        {
+          "expert_id": 232,
+          "routed_mass": 94.6689150929451,
+          "samples": 256,
+          "seen": 842
+        },
+        {
+          "expert_id": 233,
+          "routed_mass": 7.7395704090595245,
+          "samples": 115,
+          "seen": 115
+        },
+        {
+          "expert_id": 234,
+          "routed_mass": 132.68979642167687,
+          "samples": 256,
+          "seen": 865
+        },
+        {
+          "expert_id": 235,
+          "routed_mass": 7.737321827560663,
+          "samples": 82,
+          "seen": 82
+        },
+        {
+          "expert_id": 236,
+          "routed_mass": 10.347385972738266,
+          "samples": 107,
+          "seen": 107
+        },
+        {
+          "expert_id": 237,
+          "routed_mass": 29.890409223735332,
+          "samples": 256,
+          "seen": 297
+        },
+        {
+          "expert_id": 238,
+          "routed_mass": 4.156712606549263,
+          "samples": 45,
+          "seen": 45
+        },
+        {
+          "expert_id": 239,
+          "routed_mass": 34.427219949662685,
+          "samples": 256,
+          "seen": 300
+        },
+        {
+          "expert_id": 240,
+          "routed_mass": 57.94465505331755,
+          "samples": 256,
+          "seen": 440
+        },
+        {
+          "expert_id": 241,
+          "routed_mass": 0.0,
+          "samples": 0,
+          "seen": 0
+        },
+        {
+          "expert_id": 242,
+          "routed_mass": 63.736670572310686,
+          "samples": 256,
+          "seen": 495
+        },
+        {
+          "expert_id": 243,
+          "routed_mass": 9.008962273597717,
+          "samples": 85,
+          "seen": 85
+        },
+        {
+          "expert_id": 244,
+          "routed_mass": 7.545868011191487,
+          "samples": 92,
+          "seen": 92
+        },
+        {
+          "expert_id": 245,
+          "routed_mass": 38.42625493183732,
+          "samples": 256,
+          "seen": 372
+        },
+        {
+          "expert_id": 246,
+          "routed_mass": 5.67163648083806,
+          "samples": 66,
+          "seen": 66
+        },
+        {
+          "expert_id": 247,
+          "routed_mass": 101.02781153470278,
+          "samples": 256,
+          "seen": 872
+        },
+        {
+          "expert_id": 248,
+          "routed_mass": 23.940665658563375,
+          "samples": 169,
+          "seen": 169
+        },
+        {
+          "expert_id": 249,
+          "routed_mass": 2.756939724087715,
+          "samples": 31,
+          "seen": 31
+        },
+        {
+          "expert_id": 250,
+          "routed_mass": 6.034482698887587,
+          "samples": 54,
+          "seen": 54
+        },
+        {
+          "expert_id": 251,
+          "routed_mass": 36.82049494981766,
+          "samples": 256,
+          "seen": 364
+        },
+        {
+          "expert_id": 252,
+          "routed_mass": 74.17000941745937,
+          "samples": 256,
+          "seen": 533
+        },
+        {
+          "expert_id": 253,
+          "routed_mass": 10.284578518941998,
+          "samples": 125,
+          "seen": 125
+        },
+        {
+          "expert_id": 254,
+          "routed_mass": 12.279501106590033,
+          "samples": 132,
+          "seen": 132
+        },
+        {
+          "expert_id": 255,
+          "routed_mass": 1.3893075846135616,
+          "samples": 16,
+          "seen": 16
+        }
+      ],
+      "max_samples_per_expert": 256,
+      "num_experts": 256,
+      "router_qname": "model.layers.20.mlp.gate",
+      "total_tokens": 11841
+    }
+  },
+  "max_length": 1024,
+  "max_samples_per_expert": 256,
+  "output": "scratch/entmoot/qwen36-layer20/qwen36_layer20.collector.pt",
+  "routers": [
+    "model.layers.20.mlp.gate"
+  ],
+  "rows_seen": 12,
+  "rows_used": 12,
+  "stop_after_layer": 20
+}

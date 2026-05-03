@@ -1,0 +1,11 @@
+{
+  "collector": "scratch/entmoot/qwen36_layer0_smoke.collector.pt",
+  "format": "entmoot_plan_from_collector_v1",
+  "n_experts_kept": 256,
+  "n_experts_orig": 256,
+  "n_layers": 1,
+  "output": "scratch/entmoot/qwen36_layer0_smoke.merge.json",
+  "routers": [
+    "model.layers.0.mlp.gate"
+  ]
+}

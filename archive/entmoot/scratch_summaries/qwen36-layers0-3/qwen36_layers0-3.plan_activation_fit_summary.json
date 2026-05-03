@@ -1,0 +1,15 @@
+{
+  "activation_fit_model": "/home/rob/.cache/huggingface/qwen36_src",
+  "collector": "scratch/entmoot/qwen36-layers0-3/qwen36_layers0-3.collector.pt",
+  "format": "entmoot_plan_from_collector_v1",
+  "n_experts_kept": 1024,
+  "n_experts_orig": 1024,
+  "n_layers": 4,
+  "output": "scratch/entmoot/qwen36-layers0-3/qwen36_layers0-3.merge.activation_fit.json",
+  "routers": [
+    "model.layers.0.mlp.gate",
+    "model.layers.1.mlp.gate",
+    "model.layers.2.mlp.gate",
+    "model.layers.3.mlp.gate"
+  ]
+}

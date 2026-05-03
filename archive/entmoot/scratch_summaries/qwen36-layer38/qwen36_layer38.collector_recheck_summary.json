@@ -1,0 +1,18 @@
+{
+  "format": "entmoot_collector_summary_v1",
+  "layers": {
+    "model.layers.38.mlp.gate": {
+      "experts_with_samples": 251,
+      "max_samples": 256,
+      "max_seen": 4741,
+      "median_samples": 154.5,
+      "median_seen": 154.5,
+      "min_samples": 0,
+      "min_seen": 0,
+      "num_experts": 256,
+      "total_tokens": 9071
+    }
+  },
+  "n_layers": 1,
+  "path": "scratch/entmoot/qwen36-layer38/qwen36_layer38.collector.pt"
+}
