@@ -8,6 +8,7 @@ rest of the L2 assignment.
 from __future__ import annotations
 
 import inspect
+import gc
 import math
 import os
 import re
@@ -96,6 +97,37 @@ def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_cuda_graphs_enabled_for_call_count(
+    name: str,
+    *,
+    default: str | bool = "auto",
+    call_count: int,
+    min_calls: int,
+) -> bool:
+    """Return whether a CUDA graph path should run for this call pattern.
+
+    L3 and coord-descent candidates are often one-shot graph keys. Capturing
+    those graphs costs warmup + capture work without enough replays to pay it
+    back, so the default is ``auto``: graph only when the same key is expected
+    to run at least ``min_calls`` times. Explicit env values keep their force
+    semantics: ``1``/``true`` force on, ``0``/``false`` force off.
+    """
+
+    value = os.environ.get(name)
+    mode = default if value is None else value.strip().lower()
+    if isinstance(mode, bool):
+        return mode
+    if mode in {"1", "true", "yes", "on", "force"}:
+        return True
+    if mode in {"0", "false", "no", "off"}:
+        return False
+    if mode != "auto":
+        return bool(default) if isinstance(default, bool) else False
+
+    threshold = _env_int(f"{name}_MIN_CALLS", int(min_calls))
+    return int(call_count) >= max(int(threshold), 1)
+
+
 def _env_float(name: str, default: float) -> float:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -115,6 +147,64 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return int(default)
     return max(parsed, 0)
+
+
+def _host_available_memory_gb() -> float | None:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return float(parts[1]) / (1024.0 * 1024.0)
+    except OSError:
+        return None
+    return None
+
+
+def _enforce_l3_host_memory_floor(*, phase: str, chunk_index: int | None = None) -> None:
+    floor_gb = _env_float("PRISMAQUANT_L3_MIN_HOST_MEM_GB", 0.0)
+    if floor_gb <= 0.0:
+        return
+    available_gb = _host_available_memory_gb()
+    if available_gb is None or available_gb >= floor_gb:
+        return
+    chunk_text = "" if chunk_index is None else f" chunk={chunk_index}"
+    raise GPUMemoryBudgetExceeded(
+        f"{phase}{chunk_text}: host MemAvailable {available_gb:.1f}GB "
+        f"is below PRISMAQUANT_L3_MIN_HOST_MEM_GB={floor_gb:.1f}GB"
+    )
+
+
+def _adjust_l3_max_lanes_for_host_floor(
+    max_lanes_per_batch: int,
+    *,
+    phase: str,
+    chunk_index: int | None = None,
+) -> int:
+    max_lanes = max(int(max_lanes_per_batch), 2)
+    if max_lanes % 2:
+        max_lanes -= 1
+    floor_gb = _env_float("PRISMAQUANT_L3_MIN_HOST_MEM_GB", 0.0)
+    if floor_gb <= 0.0:
+        return max(max_lanes, 2)
+
+    available_gb = _host_available_memory_gb()
+    if available_gb is None:
+        return max(max_lanes, 2)
+    margin_gb = available_gb - floor_gb
+    if margin_gb < 4.0:
+        _enforce_l3_host_memory_floor(
+            phase=phase,
+            chunk_index=chunk_index,
+        )
+    if margin_gb < 16.0:
+        max_lanes = min(max_lanes, 2)
+    elif margin_gb < 32.0:
+        max_lanes = min(max_lanes, 4)
+    elif margin_gb < 48.0:
+        max_lanes = min(max_lanes, 6)
+    return max(max_lanes, 2)
 
 
 _PRISMAQUANT_GRAPH_POOL = None
@@ -2128,6 +2218,112 @@ class _DepthGroupTargetHooks:
         return _hook
 
 
+class _OverrideSetTargetHooks:
+    """Apply one override mapping per lane for interaction probes."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        assignment: Mapping[str, str],
+        specs_by_name: Mapping[str, fr.FormatSpec],
+        lane_overrides: list[Mapping[str, str]],
+        *,
+        base_batch: int,
+        quant_weight_cache: QuantWeightCache | None = None,
+    ):
+        self.model = model
+        self.assignment = _canonical_assignment(assignment)
+        self.specs_by_name = specs_by_name
+        self.lane_overrides = [
+            {
+                str(name): fr.canonical_format_name(fmt)
+                for name, fmt in override.items()
+            }
+            for override in lane_overrides
+        ]
+        self.base_batch = int(base_batch)
+        self.quant_weight_cache = quant_weight_cache
+        self.handles = []
+        self.missing: list[str] = []
+
+    def install(self) -> None:
+        quant_map = _l3_quantizable_map(self.model)
+        target_names = sorted(
+            {
+                name
+                for override in self.lane_overrides
+                for name in override
+            }
+        )
+        for name in target_names:
+            target = quant_map.get(name)
+            if target is None:
+                self.missing.append(name)
+                continue
+            module, _attr = target
+            if not isinstance(module, nn.Linear):
+                self.missing.append(name)
+                continue
+            self.handles.append(
+                module.register_forward_hook(
+                    self._make_hook(name),
+                    with_kwargs=True,
+                )
+            )
+
+    def remove(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def _format_for_lane(self, module_name: str, lane_idx: int) -> str:
+        override = self.lane_overrides[lane_idx]
+        return override.get(module_name, self.assignment.get(module_name, "BF16"))
+
+    def _make_hook(self, module_name: str):
+        def _hook(module, args, kwargs, output):
+            y = _first_tensor_output(output)
+            if y is None:
+                return output
+            chunks = _split_lanes(y, self.base_batch, len(self.lane_overrides))
+            if chunks is None:
+                return output
+            x = None
+            for value in list(args) + list((kwargs or {}).values()):
+                if isinstance(value, torch.Tensor):
+                    x = value
+                    break
+            if x is None:
+                return output
+            x_chunks = _split_lanes(x, self.base_batch, len(self.lane_overrides))
+            if x_chunks is None:
+                return output
+
+            out_chunks = []
+            weight = module.weight.detach()
+            bias = module.bias.detach() if module.bias is not None else None
+            for lane_idx, (y_lane, x_lane) in enumerate(zip(chunks, x_chunks)):
+                fmt = self._format_for_lane(module_name, lane_idx)
+                if fmt == "BF16":
+                    out_chunks.append(y_lane)
+                    continue
+                spec = self.specs_by_name.get(fmt)
+                if spec is None:
+                    out_chunks.append(y_lane)
+                    continue
+                w_hat = None
+                if self.quant_weight_cache is not None:
+                    w_hat = self.quant_weight_cache.get(module_name, fmt)
+                if w_hat is None:
+                    w_hat = apply_format_quantization(weight, spec)
+                x_hat = spec.activation_quantize_dequantize(x_lane)
+                out_chunks.append(F.linear(x_hat, w_hat.to(weight.dtype), bias))
+            replacement = torch.cat(out_chunks, dim=0)
+            return _replace_first_tensor_output(output, replacement)
+
+        return _hook
+
+
 class _LaneOutputMSE:
     def __init__(
         self,
@@ -2374,6 +2570,22 @@ def _estimate_l3_microbatch_memory_bytes(calibration_data, lane_count: int) -> i
     return int(base_bytes * max(int(lane_count), 1) * 4)
 
 
+def _calibration_call_count(calibration_data) -> int:
+    if isinstance(calibration_data, torch.Tensor):
+        if calibration_data.dim() == 0:
+            return 1
+        return max(int(calibration_data.size(0)), 1)
+    if isinstance(calibration_data, Mapping):
+        first_tensor = _first_cuda_tensor(calibration_data)
+        if first_tensor is not None and first_tensor.dim() > 0:
+            return max(int(first_tensor.size(0)), 1)
+        return 1
+    try:
+        return max(len(calibration_data), 1)
+    except TypeError:
+        return 1
+
+
 def _adjust_l3_max_lanes_for_memory(
     max_lanes_per_batch: int,
     calibration_data,
@@ -2466,9 +2678,9 @@ def measure_lane_batched_kl_deltas(
         "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
         default=True,
     )
-    use_coord_lane_cuda_graphs = _env_flag_enabled(
-        "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
-        default=True,
+    calibration_call_count = max(
+        len(ref_log_probs),
+        _calibration_call_count(calib_ids),
     )
     assignment_key = tuple(sorted(assignment_c.items()))
     rng_devices = []
@@ -2531,10 +2743,16 @@ def measure_lane_batched_kl_deltas(
             and 0 <= replay_layer_idx < len(replay_cache.layers)
             and _env_flag_enabled(
                 "PRISMAQUANT_COORD_REPLAY_CACHE",
-                default=True,
+                default=False,
             )
         )
         if use_replay_cache:
+            use_coord_lane_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+                "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+                default="auto",
+                call_count=1,
+                min_calls=8,
+            )
             target_hooks = None
             kl_totals = [0.0 for _lane in lanes]
             batch_count = (
@@ -2659,6 +2877,12 @@ def measure_lane_batched_kl_deltas(
         kl_totals = [0.0 for _lane in lanes]
         batch_count = 0
         frozen_context_entered = False
+        use_coord_lane_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+            "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+            default="auto",
+            call_count=calibration_call_count,
+            min_calls=16,
+        )
         rng_cm = torch.random.fork_rng(devices=rng_devices)
         try:
             frozen_context.__enter__()
@@ -2767,6 +2991,272 @@ def measure_lane_batched_kl_deltas(
     return measured
 
 
+def _normalise_override_set(
+    override: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        str(name): fr.canonical_format_name(fmt)
+        for name, fmt in sorted(override.items())
+    }
+
+
+@torch.no_grad()
+def measure_override_paired_kl_deltas(
+    model: nn.Module,
+    baseline_assignment: Mapping[str, str],
+    candidate_overrides: list[Mapping[str, str]],
+    calib_ids: torch.Tensor,
+    *,
+    work_root: Path,
+    max_lanes_per_batch: int = 64,
+    profile=None,
+    progress_callback: Callable[[dict], None] | None = None,
+) -> list[float]:
+    """Measure paired propagated KL for multi-target override sets.
+
+    Each candidate override is paired with a lane where the same target modules
+    are forced to BF16 while all other modules stay at ``baseline_assignment``.
+    This gives pair/block interaction probes the same baseline semantics as
+    ``measure_propagated_costs`` uses for unary L3 costs.
+    """
+
+    if not candidate_overrides:
+        return []
+
+    assignment_c = _canonical_assignment(baseline_assignment)
+    overrides = [
+        _normalise_override_set(override)
+        for override in candidate_overrides
+    ]
+    format_names = set(assignment_c.values())
+    for override in overrides:
+        format_names.update(override.values())
+    specs_by_name = _specs_by_canonical_name(format_names)
+
+    device = next(model.parameters()).device
+    requested_max_lanes_per_batch = max(int(max_lanes_per_batch), 2)
+    max_lanes_per_batch = _adjust_l3_max_lanes_for_memory(
+        requested_max_lanes_per_batch,
+        calib_ids,
+        device,
+    )
+    max_pairs_per_batch = max(int(max_lanes_per_batch) // 2, 1)
+    cal_hash = calibration_data_hash(calib_ids)
+    tmp_parent = str(work_root) if work_root is not None else None
+    use_prequant_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_PREQUANT_CACHE",
+        default=True,
+    )
+    use_frozen_perturbed_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
+        default=True,
+    )
+
+    measured: list[float] = []
+    chunk_count = int(math.ceil(len(overrides) / float(max_pairs_per_batch)))
+    chunk_index = 0
+    start = 0
+    while start < len(overrides):
+        chunk_index += 1
+        _enforce_l3_host_memory_floor(
+            phase="paired_override_kl",
+            chunk_index=chunk_index,
+        )
+        chunk_lanes_per_batch = _adjust_l3_max_lanes_for_host_floor(
+            max_lanes_per_batch,
+            phase="paired_override_kl",
+            chunk_index=chunk_index,
+        )
+        chunk_pairs_per_batch = max(int(chunk_lanes_per_batch) // 2, 1)
+        remaining_count = len(overrides) - start
+        chunk_count = max(
+            chunk_count,
+            chunk_index - 1
+            + int(math.ceil(remaining_count / float(chunk_pairs_per_batch))),
+        )
+        chunk = overrides[start:start + chunk_pairs_per_batch]
+        chunk_start = time.monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "event": "paired_override_chunk_start",
+                    "chunk_index": chunk_index,
+                    "chunk_count": chunk_count,
+                    "override_count": len(chunk),
+                    "lane_count": len(chunk) * 2,
+                }
+            )
+        lane_overrides: list[dict[str, str]] = []
+        paired_indices: list[tuple[int, int]] = []
+        for override in chunk:
+            target_names = sorted(override)
+            baseline_override = {name: "BF16" for name in target_names}
+            baseline_idx = len(lane_overrides)
+            lane_overrides.append(baseline_override)
+            candidate_idx = len(lane_overrides)
+            lane_overrides.append(dict(override))
+            paired_indices.append((baseline_idx, candidate_idx))
+
+        target_names = {
+            name
+            for override in lane_overrides
+            for name in override
+        }
+        context_assignment = {
+            name: fmt
+            for name, fmt in assignment_c.items()
+            if name not in target_names
+        }
+        cache_entries = [
+            L3NeighborhoodEntry(
+                name=name,
+                current_format=assignment_c.get(name, "BF16"),
+                formats=tuple(
+                    sorted(
+                        {
+                            assignment_c.get(name, "BF16"),
+                            *[
+                                override[name]
+                                for override in lane_overrides
+                                if name in override
+                            ],
+                        }
+                    )
+                ),
+                margin=0.0,
+                l2_current_cost=0.0,
+            )
+            for name in sorted(target_names)
+        ]
+        group_quant_cache = (
+            build_quant_weight_cache(
+                model,
+                cache_entries,
+                list({id(spec): spec for spec in specs_by_name.values()}.values()),
+            )
+            if use_prequant_cache
+            else None
+        )
+        cache_dir = Path(tempfile.mkdtemp(
+            prefix="prismaquant_pairwise_lanes_",
+            dir=tmp_parent,
+        ))
+        context_hooks = PerturbedActivationCache(
+            model,
+            context_assignment,
+            cache_dir,
+            input_rows=0,
+            cal_hash=cal_hash,
+            profile=profile,
+        )
+        frozen_context = (
+            context_hooks.frozen_weight_cache()
+            if use_frozen_perturbed_cache
+            else nullcontext(context_hooks)
+        )
+        target_hooks = None
+        kl_totals = [0.0 for _override in chunk]
+        batch_count = 0
+        frozen_context_entered = False
+        try:
+            frozen_context.__enter__()
+            frozen_context_entered = True
+            context_hooks.install()
+            for args, kwargs in iter_calibration_forwards(calib_ids, device):
+                base_batch = _first_tensor_batch_size(args, kwargs)
+                if target_hooks is None:
+                    target_hooks = _OverrideSetTargetHooks(
+                        model,
+                        assignment_c,
+                        specs_by_name,
+                        lane_overrides,
+                        base_batch=base_batch,
+                        quant_weight_cache=group_quant_cache,
+                    )
+                    target_hooks.install()
+                rep_args, rep_kwargs = _repeat_inputs_for_lanes(
+                    args,
+                    kwargs,
+                    len(lane_overrides),
+                )
+                logits = _extract_logits(model(*rep_args, **rep_kwargs))
+                if logits.dim() >= 3:
+                    logits = logits[:, -1:, :]
+                chunks = _split_lanes(
+                    logits.detach(),
+                    base_batch,
+                    len(lane_overrides),
+                )
+                if chunks is None:
+                    raise RuntimeError(
+                        "paired override KL logits did not preserve lane "
+                        f"batching: shape={tuple(logits.shape)} "
+                        f"base_batch={base_batch} "
+                        f"lanes={len(lane_overrides)}"
+                    )
+                for idx, (baseline_idx, candidate_idx) in enumerate(paired_indices):
+                    teacher = F.log_softmax(
+                        chunks[baseline_idx].float(),
+                        dim=-1,
+                    )
+                    kl_totals[idx] += float(
+                        kl_divergence(chunks[candidate_idx], teacher).item()
+                    )
+                batch_count += 1
+
+            missing_targets = set(target_hooks.missing if target_hooks else [])
+            if missing_targets:
+                raise RuntimeError(
+                    "target module missing or unsupported for paired override KL: "
+                    + ", ".join(sorted(missing_targets))
+                )
+            measured.extend(total / max(batch_count, 1) for total in kl_totals)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "paired_override_chunk_end",
+                        "chunk_index": chunk_index,
+                        "chunk_count": chunk_count,
+                        "override_count": len(chunk),
+                        "lane_count": len(lane_overrides),
+                        "batch_count": batch_count,
+                        "elapsed_seconds": time.monotonic() - chunk_start,
+                    }
+                )
+        finally:
+            if target_hooks is not None:
+                target_hooks.remove()
+            if context_hooks.installed:
+                context_hooks.remove()
+            if frozen_context_entered:
+                frozen_context.__exit__(None, None, None)
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            target_hooks = None
+            context_hooks = None
+            frozen_context = None
+            group_quant_cache = None
+            lane_overrides = []
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                torch.cuda.empty_cache()
+            gc.collect()
+            _enforce_l3_host_memory_floor(
+                phase="paired_override_kl_cleanup",
+                chunk_index=chunk_index,
+            )
+        start += len(chunk)
+
+    if len(measured) != len(candidate_overrides):
+        raise RuntimeError(
+            "paired override KL produced "
+            f"{len(measured)} results for {len(candidate_overrides)} candidates"
+        )
+    return measured
+
+
 @torch.no_grad()
 def measure_propagated_costs(
     model: nn.Module,
@@ -2841,11 +3331,7 @@ def measure_propagated_costs(
         "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
         default=True,
     )
-    use_cuda_graphs = _env_flag_enabled(
-        "PRISMAQUANT_L3_CUDA_GRAPHS",
-        default=True,
-    )
-    tail_graph_cache = _TailCudaGraphCache(enabled=use_cuda_graphs)
+    tail_graph_cache = _TailCudaGraphCache(enabled=torch.cuda.is_available())
     if (
         bool(tail_only)
         and bool(cache_tail_layer_inputs)
@@ -2940,9 +3426,28 @@ def measure_propagated_costs(
                 name for name in _downstream_names_for_group(ordered_names, target_names)
                 if name in set(all_output_names)
             ]
+            cached_calls_for_graph = (
+                tail_call_cache.get(group_depth, [])
+                if use_tail_group and cache_tail_layer_inputs
+                else None
+            )
+            if not cached_calls_for_graph:
+                cached_calls_for_graph = None
+            l3_tail_graph_call_count = (
+                len(cached_calls_for_graph)
+                if cached_calls_for_graph is not None
+                else _calibration_call_count(calibration_data)
+            )
+            use_l3_tail_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+                "PRISMAQUANT_L3_CUDA_GRAPHS",
+                default="auto",
+                call_count=l3_tail_graph_call_count,
+                min_calls=8,
+            )
             tail_graph_safe = (
                 use_tail_group
-                and use_cuda_graphs
+                and tail_graph_cache.enabled
+                and use_l3_tail_cuda_graphs
                 and not _output_mse_names_reach_tail(downstream_names, group_depth)
             )
             execution_lanes = (
@@ -2977,13 +3482,7 @@ def measure_propagated_costs(
                 first_batch = True
                 kl_totals = [0.0 for _ in lanes]
                 batch_count = 0
-                cached_calls = (
-                    tail_call_cache.get(group_depth, [])
-                    if use_tail_group and cache_tail_layer_inputs
-                    else None
-                )
-                if not cached_calls:
-                    cached_calls = None
+                cached_calls = cached_calls_for_graph
                 call_iter = (
                     cached_calls
                     if cached_calls is not None
@@ -3072,13 +3571,18 @@ def measure_propagated_costs(
                                 f"base_batch={base_batch} "
                                 f"lanes={len(execution_lanes)}"
                             )
+                        teacher_by_baseline: dict[int, torch.Tensor] = {}
                         for idx, lane in enumerate(lanes):
                             if lane.is_baseline or lane.baseline_index is None:
                                 continue
-                            teacher = F.log_softmax(
-                                chunks[lane.baseline_index].float(),
-                                dim=-1,
-                            )
+                            baseline_index = int(lane.baseline_index)
+                            teacher = teacher_by_baseline.get(baseline_index)
+                            if teacher is None:
+                                teacher = F.log_softmax(
+                                    chunks[baseline_index].float(),
+                                    dim=-1,
+                                )
+                                teacher_by_baseline[baseline_index] = teacher
                             kl_totals[idx] += float(
                                 kl_divergence(chunks[idx], teacher).item()
                             )

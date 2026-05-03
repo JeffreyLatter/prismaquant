@@ -20,6 +20,85 @@ from prismaquant.iterate_perturbed_allocation import (
 from prismaquant.propagated_cost import L3NeighborhoodEntry
 
 
+def test_coord_replay_cache_default_is_opt_in(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_COORD_REPLAY_CACHE", raising=False)
+    assert ipa._coord_replay_cache_enabled() is False
+
+    monkeypatch.setenv("PRISMAQUANT_COORD_REPLAY_CACHE", "1")
+    assert ipa._coord_replay_cache_enabled() is True
+
+    monkeypatch.setenv("PRISMAQUANT_COORD_REPLAY_CACHE", "0")
+    assert ipa._coord_replay_cache_enabled() is False
+
+
+def test_l3_output_mse_default_is_opt_in():
+    assert ipa._l3_output_mse_names(SimpleNamespace()) == []
+    assert ipa._l3_output_mse_names(SimpleNamespace(l3_output_mse=False)) == []
+    assert ipa._l3_output_mse_names(SimpleNamespace(l3_output_mse=True)) is None
+
+
+def test_memory_aware_policy_keeps_resume_calibration(monkeypatch):
+    args = SimpleNamespace(
+        memory_aware_l3=True,
+        resume_l3_costs="anchor_bpp_4.50=/tmp/l3.pkl",
+        resume_l3_costs_dir=None,
+        n_calib_samples=8,
+        calib_seqlen=512,
+        l3_n_calib_samples=8,
+        l3_calib_seqlen=512,
+        input_rows=256,
+        chunk_size=256,
+        l3_max_lanes_per_batch=32,
+        l3_interaction_max_lanes_per_batch=32,
+        l3_validation_scout_max_candidates=64,
+    )
+    stats = {"layer": {"n_params": 4_000_000_000}}
+    monkeypatch.setattr(ipa, "_gpu_memory_gb_for_model", lambda _model: (100.0, 128.0))
+    monkeypatch.setattr(ipa, "_host_available_memory_gb", lambda: 120.0)
+    monkeypatch.setattr(ipa, "_emit", lambda _msg: None)
+
+    ipa._apply_memory_aware_runtime_policy(args, stats, model=None)
+
+    assert args.n_calib_samples == 8
+    assert args.calib_seqlen == 512
+    assert args.l3_n_calib_samples == 8
+    assert args.l3_calib_seqlen == 512
+    assert args.input_rows == 64
+    assert args.chunk_size == 64
+    assert args.l3_max_lanes_per_batch == 8
+    assert args.l3_interaction_max_lanes_per_batch == 6
+    assert args.l3_validation_scout_max_candidates == 16
+
+
+def test_memory_aware_policy_clamps_fresh_large_calibration(monkeypatch):
+    args = SimpleNamespace(
+        memory_aware_l3=True,
+        resume_l3_costs=None,
+        resume_l3_costs_dir=None,
+        n_calib_samples=8,
+        calib_seqlen=512,
+        l3_n_calib_samples=8,
+        l3_calib_seqlen=512,
+        input_rows=256,
+        chunk_size=256,
+        l3_max_lanes_per_batch=32,
+        l3_interaction_max_lanes_per_batch=32,
+        l3_validation_scout_max_candidates=64,
+    )
+    stats = {"layer": {"n_params": 4_000_000_000}}
+    monkeypatch.setattr(ipa, "_gpu_memory_gb_for_model", lambda _model: (100.0, 128.0))
+    monkeypatch.setattr(ipa, "_host_available_memory_gb", lambda: 120.0)
+    monkeypatch.setattr(ipa, "_emit", lambda _msg: None)
+
+    ipa._apply_memory_aware_runtime_policy(args, stats, model=None)
+
+    assert args.n_calib_samples == 2
+    assert args.calib_seqlen == 128
+    assert args.l3_n_calib_samples == 2
+    assert args.l3_calib_seqlen == 128
+    assert args.l3_interaction_max_lanes_per_batch == 6
+
+
 def test_cost_ema_uses_geometric_decay_and_skips_errors():
     history = [
         {
@@ -817,6 +896,28 @@ def _iterated_l3_args(**overrides):
         l3_min_fraction=0.05,
         l3_max_fraction=1.0,
         l3_safety_fraction=0.0,
+        l3_interaction_refine=False,
+        l3_interaction_top_units=8,
+        l3_interaction_neighbor_radius=1,
+        l3_interaction_max_pairs=0,
+        l3_interaction_max_passes=4,
+        l3_interaction_exact=True,
+        l3_interaction_exact_max_states=2_000_000,
+        l3_validation_scout=False,
+        l3_validation_scout_rounds=1,
+        l3_validation_scout_max_candidates=64,
+        l3_validation_scout_sample_per_bucket=0,
+        l3_validation_scout_seed=0,
+        l3_validation_scout_bpp_slack=0.25,
+        l3_validation_scout_max_predicted_delta=0.0,
+        l3_validation_scout_min_improvement=0.0,
+        l3_validation_scout_marginal_price_kl_per_second=None,
+        l3_validation_scout_min_stop_rounds=1,
+        l3_validation_scout_stop_confidence=0.95,
+        l3_validation_scout_gain_prior_kl=0.0,
+        l3_validation_scout_commit_best=True,
+        search_telemetry_jsonl=None,
+        _search_telemetry_path=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -913,6 +1014,382 @@ def test_l3_hamming_cap_respected():
     )
 
     assert ipa._hamming_count(baseline, solved) <= 2
+
+
+def test_l3_interaction_refine_repairs_bad_pairwise_choice(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(2)}
+    specs = [
+        ipa.fr.get_format("NVFP4"),
+        ipa.fr.get_format("MXFP8"),
+        ipa.fr.get_format("BF16"),
+    ]
+    base_assignment = {name: "MXFP8" for name in stats}
+    additive_candidate = {name: "NVFP4" for name in stats}
+    l3_candidates = {
+        name: [
+            ipa.Candidate("NVFP4", bits_per_param=4.0, memory_bytes=2, predicted_dloss=0.0),
+            ipa.Candidate("MXFP8", bits_per_param=8.0, memory_bytes=4, predicted_dloss=0.3),
+        ]
+        for name in stats
+    }
+
+    measured_overrides = []
+
+    def _measure(_model, _assignment, overrides, *_args, **_kwargs):
+        values = []
+        for override in overrides:
+            measured_overrides.append(dict(override))
+            fmts = (override["layer0"], override["layer1"])
+            if fmts == ("MXFP8", "MXFP8"):
+                values.append(0.6)
+            elif fmts == ("NVFP4", "NVFP4"):
+                values.append(2.0)
+            elif set(fmts) == {"MXFP8", "NVFP4"}:
+                values.append(0.3)
+            else:
+                values.append(0.0)
+        return values
+
+    monkeypatch.setattr(ipa, "measure_override_paired_kl_deltas", _measure)
+
+    refined, meta = ipa.run_l3_interaction_refine(
+        _iterated_l3_args(
+            l3_interaction_refine=True,
+            l3_interaction_top_units=2,
+            l3_interaction_neighbor_radius=2,
+        ),
+        _TinyLogitsModel(),
+        base_assignment,
+        additive_candidate,
+        l3_candidates,
+        stats,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        work_root=tmp_path,
+    )
+
+    assert meta["attempted"] is True
+    assert meta["pair_measurements"] == len(measured_overrides)
+    assert refined != additive_candidate
+    assert sum(fmt == "NVFP4" for fmt in refined.values()) == 1
+
+
+def test_l3_interaction_refine_preserves_non_selected_l3_flips(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(3)}
+    specs = [
+        ipa.fr.get_format("NVFP4"),
+        ipa.fr.get_format("MXFP8"),
+        ipa.fr.get_format("BF16"),
+    ]
+    base_assignment = {name: "MXFP8" for name in stats}
+    additive_candidate = {name: "NVFP4" for name in stats}
+    l3_candidates = {
+        "layer0": [
+            ipa.Candidate("NVFP4", bits_per_param=4.0, memory_bytes=2, predicted_dloss=0.0),
+            ipa.Candidate("MXFP8", bits_per_param=8.0, memory_bytes=4, predicted_dloss=0.3),
+        ],
+        "layer1": [
+            ipa.Candidate("NVFP4", bits_per_param=4.0, memory_bytes=2, predicted_dloss=0.0),
+            ipa.Candidate("MXFP8", bits_per_param=8.0, memory_bytes=4, predicted_dloss=0.3),
+        ],
+        "layer2": [
+            ipa.Candidate("NVFP4", bits_per_param=4.0, memory_bytes=2, predicted_dloss=0.1),
+            ipa.Candidate("MXFP8", bits_per_param=8.0, memory_bytes=4, predicted_dloss=0.15),
+        ],
+    }
+
+    def _measure(_model, _assignment, overrides, *_args, **_kwargs):
+        values = []
+        for override in overrides:
+            assert set(override) == {"layer0", "layer1"}
+            fmts = (override["layer0"], override["layer1"])
+            if fmts == ("MXFP8", "MXFP8"):
+                values.append(0.6)
+            elif fmts == ("NVFP4", "NVFP4"):
+                values.append(2.0)
+            elif set(fmts) == {"MXFP8", "NVFP4"}:
+                values.append(0.3)
+            else:
+                values.append(0.0)
+        return values
+
+    monkeypatch.setattr(ipa, "measure_override_paired_kl_deltas", _measure)
+
+    refined, meta = ipa.run_l3_interaction_refine(
+        _iterated_l3_args(
+            l3_interaction_refine=True,
+            l3_interaction_top_units=2,
+            l3_interaction_neighbor_radius=2,
+        ),
+        _TinyLogitsModel(),
+        base_assignment,
+        additive_candidate,
+        l3_candidates,
+        stats,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        work_root=tmp_path,
+    )
+
+    assert meta["attempted"] is True
+    assert refined["layer2"] == "NVFP4"
+    assert sum(refined[name] == "NVFP4" for name in ("layer0", "layer1")) == 1
+
+
+def test_l3_interaction_refine_starts_from_feasible_candidate(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(3)}
+    specs = [
+        ipa.fr.get_format("NVFP4"),
+        ipa.fr.get_format("MXFP8"),
+        ipa.fr.get_format("BF16"),
+    ]
+    base_assignment = {
+        "layer0": "BF16",
+        "layer1": "MXFP8",
+        "layer2": "MXFP8",
+    }
+    additive_candidate = {
+        "layer0": "NVFP4",
+        "layer1": "BF16",
+        "layer2": "MXFP8",
+    }
+    l3_candidates = {
+        name: [
+            ipa.Candidate("NVFP4", bits_per_param=4.0, memory_bytes=2, predicted_dloss=0.2),
+            ipa.Candidate("MXFP8", bits_per_param=8.0, memory_bytes=4, predicted_dloss=0.1),
+            ipa.Candidate("BF16", bits_per_param=16.0, memory_bytes=8, predicted_dloss=0.0),
+        ]
+        for name in stats
+    }
+
+    def _measure(_model, _assignment, overrides, *_args, **_kwargs):
+        return [0.0 for _override in overrides]
+
+    monkeypatch.setattr(ipa, "measure_override_paired_kl_deltas", _measure)
+
+    refined, meta = ipa.run_l3_interaction_refine(
+        _iterated_l3_args(
+            l3_interaction_refine=True,
+            l3_interaction_top_units=2,
+            l3_interaction_neighbor_radius=2,
+        ),
+        _TinyLogitsModel(),
+        base_assignment,
+        additive_candidate,
+        l3_candidates,
+        stats,
+        specs,
+        8.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        work_root=tmp_path,
+    )
+
+    assert meta["attempted"] is True
+    assert meta["skipped_reason"] is None
+    assert refined["layer0"] == "NVFP4"
+
+
+def test_l3_interaction_validation_keeps_better_additive_candidate(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(2)}
+    specs = [ipa.fr.get_format("MXFP8"), ipa.fr.get_format("BF16")]
+    initial = {name: "MXFP8" for name in stats}
+    additive = {"layer0": "BF16", "layer1": "MXFP8"}
+    interaction = {"layer0": "BF16", "layer1": "BF16"}
+    l3_costs = {
+        name: {
+            "MXFP8": {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 0.0},
+        }
+        for name in stats
+    }
+
+    def _solve_l3(*_args, **_kwargs):
+        return dict(additive), {}, {"frozen_dp_precision_used": 0.001}
+
+    def _interaction_refine(*_args, **_kwargs):
+        return dict(interaction), {
+            "enabled": True,
+            "attempted": True,
+            "changed": True,
+        }
+
+    def _kl(_model, assignment, *_args, **_kwargs):
+        if assignment == additive:
+            return 1.0
+        if assignment == interaction:
+            return 2.0
+        return 3.0
+
+    monkeypatch.setattr(ipa, "_solve_l3_candidates_with_hamming_cap", _solve_l3)
+    monkeypatch.setattr(ipa, "run_l3_interaction_refine", _interaction_refine)
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _kl)
+
+    result = ipa.run_iterated_l3_polish(
+        _iterated_l3_args(l3_iter_max=1),
+        _TinyLogitsModel(),
+        initial,
+        3.0,
+        stats,
+        l3_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        work_root=tmp_path,
+        initial_l3_costs=l3_costs,
+    )
+
+    assert result.assignment == additive
+    assert result.final_kl == pytest.approx(1.0)
+    meta = result.iterations[0]["interaction_refine"]
+    assert meta["validation_rollback_to_additive"] is True
+    assert meta["additive_candidate_kl"] == pytest.approx(1.0)
+    assert meta["interaction_candidate_kl"] == pytest.approx(2.0)
+
+
+def test_l3_validation_scout_commits_best_validated_flip(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(2)}
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("MXFP8"), ipa.fr.get_format("BF16")]
+    assignment = {"layer0": "NVFP4", "layer1": "NVFP4"}
+    l3_costs = {
+        "layer0": {
+            "NVFP4": {"propagated_end_kl": 1.0},
+            "MXFP8": {"propagated_end_kl": 0.5},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer1": {
+            "NVFP4": {"propagated_end_kl": 1.0},
+            "MXFP8": {"propagated_end_kl": 0.8},
+            "BF16": {"propagated_end_kl": 0.7},
+        },
+    }
+    measured_batches = []
+
+    def _measure(_model, _assignment, flips, *_args, **_kwargs):
+        measured_batches.append(list(flips))
+        values = []
+        for name, fmt in flips:
+            values.append(0.4 if (name, fmt) == ("layer0", "BF16") else 0.9)
+        return values
+
+    monkeypatch.setattr(ipa, "measure_lane_batched_kl_deltas", _measure)
+    telemetry_path = tmp_path / "search_telemetry.jsonl"
+
+    refined, final_kl, meta = ipa.run_l3_validation_scout(
+        _iterated_l3_args(
+            l3_validation_scout=True,
+            l3_validation_scout_max_candidates=2,
+            _search_telemetry_path=telemetry_path,
+        ),
+        _TinyLogitsModel(),
+        assignment,
+        1.0,
+        l3_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        stats=stats,
+        work_root=tmp_path,
+    )
+
+    assert measured_batches
+    assert refined["layer0"] == "BF16"
+    assert final_kl == pytest.approx(0.4)
+    assert meta["candidates_evaluated"] == 2
+    assert meta["hits"] == 2
+    assert meta["flips_committed"] == 1
+    records = [json.loads(line) for line in telemetry_path.read_text().splitlines()]
+    assert {record["event"] for record in records} == {
+        "validation_scout_candidate",
+        "validation_scout_commit",
+        "validation_scout_round_start",
+    }
+    assert all(record["candidate_source"] == "l3_ranked_unary" for record in records)
+    assert all(record["target_bpp"] == pytest.approx(16.0) for record in records)
+
+
+def test_l3_validation_scout_samples_unrepresented_rank_buckets():
+    rows = [
+        {
+            "rank": rank,
+            "name": f"layer{rank}",
+            "to_format": "BF16",
+        }
+        for rank in [0, 1, 2, 3, 4, 5, 40, 41, 140, 141, 600, 601]
+    ]
+
+    selected = ipa._select_validation_scout_candidates(
+        _iterated_l3_args(
+            l3_validation_scout_max_candidates=6,
+            l3_validation_scout_sample_per_bucket=1,
+            l3_validation_scout_seed=0,
+        ),
+        rows,
+    )
+
+    selected_buckets = {ipa._rank_bucket(row["rank"]) for row in selected}
+    assert selected_buckets == {
+        "rank_000_031",
+        "rank_032_127",
+        "rank_128_511",
+        "rank_512_plus",
+    }
+    assert [row["rank"] for row in selected[:3]] == [0, 1, 2]
+
+
+def test_l3_validation_scout_economic_stop_advances_after_no_hit(tmp_path, monkeypatch):
+    stats = {f"layer{i}": _tiny_stat() for i in range(3)}
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    assignment = {name: "NVFP4" for name in stats}
+    l3_costs = {
+        name: {
+            "NVFP4": {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": float(idx) * 0.1},
+        }
+        for idx, name in enumerate(stats)
+    }
+    measured = []
+
+    def _measure(_model, _assignment, flips, *_args, **_kwargs):
+        measured.extend(flips)
+        values = []
+        for name, fmt in flips:
+            assert fmt == "BF16"
+            values.append(0.5 if name == "layer1" else 1.1)
+        return values
+
+    monkeypatch.setattr(ipa, "measure_lane_batched_kl_deltas", _measure)
+
+    refined, final_kl, meta = ipa.run_l3_validation_scout(
+        _iterated_l3_args(
+            l3_validation_scout=True,
+            l3_validation_scout_max_candidates=1,
+            l3_validation_scout_rounds=2,
+            l3_validation_scout_marginal_price_kl_per_second=0.0,
+            l3_validation_scout_gain_prior_kl=0.1,
+        ),
+        _TinyLogitsModel(),
+        assignment,
+        1.0,
+        l3_costs,
+        specs,
+        16.0,
+        torch.zeros((1, 2), dtype=torch.long),
+        [],
+        stats=stats,
+        work_root=tmp_path,
+    )
+
+    assert measured == [("layer0", "BF16"), ("layer1", "BF16")]
+    assert refined["layer1"] == "BF16"
+    assert final_kl == pytest.approx(0.5)
+    assert meta["candidates_evaluated"] == 2
+    assert meta["flips_committed"] == 1
+    assert meta["economic_stop"]["checks"][0]["continue_search"] is True
 
 
 def test_coord_descent_non_regressive(tmp_path, monkeypatch):
@@ -1927,7 +2404,7 @@ def test_multi_budget_emit_and_json_include_l2_kl_on_regression(
     assert "delta=+0.2" in out
     assert (
         "[multi] WARNING: L3 polish regressed L2 by >5% — "
-        "likely non-additive cost interaction; consider --l3-mode selective"
+        "likely non-additive cost interaction; consider tighter L3 scope"
     ) in out
 
     with open(tmp_path / "pareto_curve.json") as f:
@@ -2051,7 +2528,7 @@ def test_multi_budget_anchor_l3_passes_progress_callback(
     ) in out
 
 
-def test_multi_budget_widens_format_filter(tmp_path, monkeypatch):
+def test_multi_budget_does_not_widen_format_filter_by_default(tmp_path, monkeypatch):
     specs = [
         ipa.fr.get_format(name)
         for name in [
@@ -2096,7 +2573,36 @@ def test_multi_budget_widens_format_filter(tmp_path, monkeypatch):
     )
 
     assert ipa.run_multi_budget(args, SimpleNamespace(output_root=tmp_path)) == 0
-    assert flags and all(flags)
+    assert flags == [False, False]
+
+
+def test_multi_budget_l3_measure_all_formats_override(tmp_path, monkeypatch):
+    flags = []
+
+    def _anchor(_args, _runtime, anchor_bpp, *, measure_all_formats=False):
+        flags.append(bool(measure_all_formats))
+        return SimpleNamespace(anchor_bpp=float(anchor_bpp))
+
+    def _single(_args, target_bits, reusable_anchor=None):
+        return _dummy_budget_result(target_bits, reusable_anchor.anchor_bpp, tmp_path)
+
+    monkeypatch.setattr(ipa, "run_anchor_budget", _anchor)
+    monkeypatch.setattr(ipa, "run_single_budget", _single)
+
+    args = SimpleNamespace(
+        target_bits_list="4.0,5.5",
+        target_bits_share_tolerance=0.25,
+        target_bits_anchor=None,
+        l3_measure_all_formats=False,
+    )
+    assert ipa.run_multi_budget(args, SimpleNamespace(output_root=tmp_path)) == 0
+    assert flags == [False, False]
+
+    flags.clear()
+    args.target_bits_list = "4.5"
+    args.l3_measure_all_formats = True
+    assert ipa.run_multi_budget(args, SimpleNamespace(output_root=tmp_path)) == 0
+    assert flags == [True]
 
 
 def test_knee_search_segmented_kneedle():
@@ -2159,6 +2665,51 @@ def test_knee_search_max_evaluations_stop():
 
     assert calls["n"] == 4
     assert len(points) == 4
+
+
+def test_quality_equivalent_search_finds_lowest_matching_bpp(tmp_path, monkeypatch):
+    anchor_calls = []
+
+    def _anchor(_args, _runtime, anchor_bpp, *, measure_all_formats=False):
+        anchor_calls.append((float(anchor_bpp), bool(measure_all_formats)))
+        return SimpleNamespace(anchor_bpp=float(anchor_bpp))
+
+    def _single(_args, target_bits, reusable_anchor=None):
+        validation_kl = max(0.0, 8.0 - float(target_bits))
+        return _dummy_budget_result(
+            target_bits,
+            reusable_anchor.anchor_bpp,
+            tmp_path,
+            validation_kl=validation_kl,
+        )
+
+    monkeypatch.setattr(ipa, "run_anchor_budget", _anchor)
+    monkeypatch.setattr(ipa, "run_single_budget", _single)
+    args = SimpleNamespace(
+        quality_equivalent_bits=8.0,
+        quality_equivalent_bpp_min=4.0,
+        quality_equivalent_bpp_tolerance=0.1,
+        quality_equivalent_max_evaluations=20,
+        quality_equivalent_kl_slack=2.0,
+        target_bits_share_tolerance=0.25,
+        l3_measure_all_formats=False,
+    )
+
+    assert ipa.run_quality_equivalent_search(
+        args,
+        SimpleNamespace(output_root=tmp_path),
+    ) == 0
+
+    with open(tmp_path / "summary.json") as f:
+        summary = json.load(f)
+    qeq = summary["quality_equivalent"]
+    assert qeq["reference_bpp"] == pytest.approx(8.0)
+    assert qeq["reference_validation_kl"] == pytest.approx(0.0)
+    assert qeq["threshold_kl"] == pytest.approx(2.0)
+    assert qeq["chosen_bpp"] == pytest.approx(6.0, abs=0.1)
+    assert qeq["validation_kl"] <= qeq["threshold_kl"]
+    assert qeq["knee_candidate"]["mode"] == "kneedle_on_evaluated_points"
+    assert anchor_calls
 
 
 def test_main_dispatches_target_bits_list_with_one_model_load(tmp_path, monkeypatch):
@@ -2228,6 +2779,72 @@ def test_main_dispatches_target_bits_list_with_one_model_load(tmp_path, monkeypa
 
     assert rc == 0
     assert load_calls["n"] == 1
-    assert captured["l3_mode"] == "global"
+    assert captured["l3_mode"] == "selective"
     assert captured["targets"] == [4.5, 5.0]
     assert isinstance(captured["model"], _TinyLogitsModel)
+
+
+def test_main_preserves_explicit_global_l3_for_target_bits_list(
+    tmp_path,
+    monkeypatch,
+):
+    probe_path = tmp_path / "probe.pkl"
+    costs_path = tmp_path / "costs.pkl"
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "out"
+    stats = {"layer": _tiny_stat()}
+    costs = {
+        "layer": {
+            "INT8_W8A16": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+    }
+    with open(probe_path, "wb") as f:
+        pickle.dump({"stats": stats}, f)
+    with open(costs_path, "wb") as f:
+        pickle.dump({"costs": costs}, f)
+
+    class _Tokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    captured = {}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=_Tokenizer),
+    )
+    monkeypatch.setattr(ipa, "validate_probe_payload", lambda *_args: None)
+    monkeypatch.setattr(ipa, "validate_cost_payload", lambda *_args: None)
+    monkeypatch.setattr(ipa, "load_text_model_under_work_root", lambda *_args, **_kwargs: _TinyLogitsModel())
+    monkeypatch.setattr(
+        ipa,
+        "load_wikitext_calibration",
+        lambda _tokenizer, n_samples, seqlen: torch.zeros(
+            (n_samples, seqlen),
+            dtype=torch.long,
+        ),
+    )
+    monkeypatch.setattr(ipa, "cache_reference_log_probs", lambda *_args: [])
+    def _run_multi(args, _runtime):
+        captured["l3_mode"] = args.l3_mode
+        return 0
+
+    monkeypatch.setattr(ipa, "run_multi_budget", _run_multi)
+
+    rc = ipa.main([
+        "--model", "tiny",
+        "--probe", str(probe_path),
+        "--initial-costs", str(costs_path),
+        "--formats", "INT8_W8A16,BF16",
+        "--target-bits-list", "4.5,5.0",
+        "--work-dir", str(work_dir),
+        "--output-dir", str(output_dir),
+        "--l3-polish",
+        "--l3-mode", "global",
+    ])
+
+    assert rc == 0
+    assert captured["l3_mode"] == "global"

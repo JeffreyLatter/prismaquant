@@ -1,9 +1,11 @@
 # prismaquant runtime flags
 
 All performance-critical paths can be tuned at runtime via env vars.
-**As of v26 the proven flags default ON** — these flags exist mostly
-for opt-out / debugging. Set the env var to `"0"` (or `"false"`,
-`"no"`, etc.) to disable.
+Most proven probe/cost/export flags default ON and exist mostly for opt-out /
+debugging. CUDA graph flags are different: L3 and coord-descent graph capture
+defaults to `auto` because one-shot candidate batches do not amortize capture
+cost. Set the env var to `"1"` to force a graph path for benchmarking, or
+`"0"` (also `"false"`, `"no"`, etc.) to disable it.
 
 ## Probe + cost flags
 
@@ -30,6 +32,11 @@ for opt-out / debugging. Set the env var to `"0"` (or `"false"`,
 | env var | recommended | what it does |
 |---|---|---|
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | Required on UMA hardware (DGX Spark) to keep the CUDA caching allocator from hoarding freed blocks. Set automatically by `incremental_probe.py` at module load. |
+| `PRISMAQUANT_L3_CUDA_GRAPHS` | `auto` | Graphs decoder-tail L3 propagation only when the same graph key has enough repeated calibration calls. Default threshold: `8`, override with `PRISMAQUANT_L3_CUDA_GRAPHS_MIN_CALLS`. |
+| `PRISMAQUANT_COORD_LANE_CUDA_GRAPHS` | `auto` | Graphs lane-batched coord flip evaluation only when repeated calls can amortize capture. Replay-cache coord batches are one-shot, so auto leaves them eager. Default thresholds: `8` for replay mode, `16` for full-forward mode; override with `PRISMAQUANT_COORD_LANE_CUDA_GRAPHS_MIN_CALLS`. |
+| `PRISMAQUANT_KL_CUDA_GRAPHS` | `auto` | Graphs assignment-KL validation only for larger calibration batches. Default threshold: `16`, override with `PRISMAQUANT_KL_CUDA_GRAPHS_MIN_CALLS`. |
+| `PRISMAQUANT_COORD_REPLAY_CACHE` | `off` | Opt-in LayerHiddenStateCache for coord descent. It reduces tail layer forwards but currently copies too much baseline model state on large Qwen runs, so the fast default is lane-batched eager evaluation. |
+| `PRISMAQUANT_L3_MIN_HOST_MEM_GB` | unset | Optional host-memory floor for L3 pair/scout diagnostics. When set, L3 raises `GPUMemoryBudgetExceeded` between paired-override chunks if `/proc/meminfo` `MemAvailable` drops below this many GiB, giving long runs a chance to stop before system OOM. |
 
 ## Disabling for debugging
 

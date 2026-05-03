@@ -18,10 +18,11 @@ propagation measurement:
    target weights using the same RTN and activation-quantization semantics as
    the L2 perturbed-X hooks.
 4. Compare candidate logits against that target-specific BF16 lane with end-KL.
-5. Record downstream output MSE as a diagnostic.
+5. Optionally record downstream output MSE as a diagnostic.
 
 The allocator uses only `propagated_end_kl` inside the L3 neighborhood. It does
-not mix L3 end-KL with L2 `predicted_dloss` values. Unmeasured Linears are
+not mix L3 end-KL with L2 `predicted_dloss` values, and downstream output-MSE
+is opt-in because the allocator does not consume it. Unmeasured Linears are
 frozen at their L2 choices.
 
 The paired baseline is deliberately not a global BF16 model run. For target
@@ -53,6 +54,53 @@ is the cleaner algorithmic path because it removes selection coverage gaps and
 multi-flip interaction from the selective frozen-DP polish. It is also more
 expensive, so selective remains the default until larger smoke data justifies a
 default switch.
+
+`--l3-measure-all-formats` widens every selected Linear to the full format menu
+instead of trusting the L2-neighbor filter. This costs more lanes, but is the
+right mode when L2 may have chosen a poor starting format and L3 needs to search
+the full marginal bit frontier.
+
+## Sparse Interaction Refinement
+
+`--l3-interaction-refine` adds a bounded interaction-aware stage after the
+additive L3 DP proposal and before the normal validation/rollback gate. It keeps
+the measured propagated end-KL values as unary costs, selects a small set of
+high-impact Linear units near the DP proposal, measures paired override KL for
+format combinations among those units, and feeds the residuals into the sparse
+quadratic local refiner.
+
+The residual for a pair is:
+
+```text
+paired_KL(i=a, j=b) - unary_KL(i=a) - unary_KL(j=b)
+```
+
+where `paired_KL` uses the same target-BF16 paired baseline as L3 unary
+measurement: both targets are BF16 in the paired baseline lane, while all other
+modules remain at the current assignment. This makes the stage a local
+CLADO/CoopQ-style correction to additive DP rather than a separate global KL
+objective.
+
+Useful bounds:
+
+- `--l3-interaction-top-units` default `8`;
+- `--l3-interaction-neighbor-radius` default `1`;
+- `--l3-interaction-max-pairs` default `0`, meaning uncapped within the selected
+  frontier;
+- `--l3-interaction-max-passes` default `4`;
+- `--l3-interaction-exact` default enabled, with
+  `--l3-interaction-exact-max-states` default `2000000`.
+
+When the selected option product is below the exact-state cap, the refiner
+enumerates the measured local quadratic problem exactly under the bit budget.
+Larger frontiers fall back to bounded greedy single/pair moves. This gives
+medium-size diagnostic runs a clear interpretation: they are locally optimal for
+the measured unary and pairwise residual model, even though they are not a
+global proof over every layer or higher-order interaction.
+
+The final assignment still goes through full validation. If the interaction
+refiner proposes a worse assignment, the existing L3 regression handling rolls
+it back.
 
 ## Hook Ordering
 
@@ -110,15 +158,37 @@ Useful tuning flags:
 - `--l3-min-fraction` default `0.05`;
 - `--l3-max-fraction` default `0.30`;
 - `--l3-safety-fraction` default `0.02`;
-- `--l3-max-lanes-per-batch` default `16`;
+- `--l3-max-lanes-per-batch` default `64`;
 - `--l3-tail-only` default on, with `--no-l3-tail-only` for full-forward
   fallback;
+- `--l3-measure-all-formats` default auto for wide multi-budget spans and off
+  for single-budget runs;
+- `--l3-output-mse` default off; enables downstream output-MSE diagnostics that
+  are not used by the allocator;
 - `--l3-n-calib-samples` default `4`;
 - `--l3-calib-seqlen` default `256`;
 - `--l3-regression-tolerance` default `0.0`, rejecting polish output when
   validation KL regresses beyond the configured fraction of `kl_before`;
 - `--frozen-dp-budget-tolerance` default `0.05`, allowing the L3 greedy
   fallback to use up to 5% of total target bits as hard budget slack.
+
+CUDA graph capture is opportunistic by default. `PRISMAQUANT_L3_CUDA_GRAPHS`,
+`PRISMAQUANT_COORD_LANE_CUDA_GRAPHS`, and `PRISMAQUANT_KL_CUDA_GRAPHS` accept
+`auto`/unset, `1`, or `0`. Auto mode avoids graphing one-shot flip batches
+because capture warmup dominates on the Qwen 4B PrismaClade L3 workload.
+`PRISMAQUANT_COORD_REPLAY_CACHE` is opt-in for the same reason: it can reduce
+tail forwards, but the current cache path copies too much baseline model state
+for large dense checkpoints.
+
+On UMA systems, paired L3 interaction measurement can consume host-visible
+GPU memory that is not reflected in container RSS. Set
+`PRISMAQUANT_L3_MIN_HOST_MEM_GB` to make L3 check `/proc/meminfo`
+`MemAvailable` between paired-override chunks and raise
+`GPUMemoryBudgetExceeded` before the host reaches OOM pressure. The
+paired-override loop also reduces the next chunk's lane count as it approaches
+that floor. The memory-aware 4B-class cap currently uses up to 6 interaction
+lanes after empirical tests showed 4 lanes safe, 8 lanes unsafe, and 6 lanes
+viable on the GB10 diagnostic machine.
 
 L3 is one final pass by design; per-iteration L3 is not exposed yet.
 
@@ -134,11 +204,13 @@ python3 -m prismaquant.iterate_perturbed_allocation \
 ```
 
 The list mode clusters targets by `--target-bits-share-tolerance` (default
-`0.25` bpp). Each cluster anchor runs a full L2 convergence and global L3
+`0.25` bpp). Each cluster anchor runs a full L2 convergence and one L3
 measurement; targets inside the cluster reuse that anchor's L3 costs for DP and
-then run their own validation KL. When the requested span is larger than 1 bpp,
-L3 measures every format in the menu for each candidate so lower and higher
-budgets are not constrained by the anchor's local format filter.
+then run their own validation KL. By default, the anchor uses the bounded
+`--l3-mode selective` neighborhood and the local format filter, so multi-budget
+and knee runs remain time-bounded. Pass `--l3-mode global` and/or
+`--l3-measure-all-formats` explicitly when you want the older exhaustive
+behavior.
 
 `--knee-search` adaptively samples the Pareto curve:
 
@@ -157,6 +229,36 @@ refines the largest interval adjacent to the current best knee until
 `--knee-tolerance` or `--knee-max-evaluations` stops it. Threshold mode instead
 uses bisection to find the lowest bpp satisfying
 `--knee-threshold-kl`.
+
+The hard runtime bound is the product of evaluated Pareto points, L3 selected
+linears, selected formats per linear, L3 iterations, validation-scout limits,
+and any explicit interaction-refine caps. The output metadata records these
+scope controls alongside the Pareto curve so a knee result is auditable.
+
+`--quality-equivalent-bits` makes the threshold explicit in "bit-equivalent"
+terms. It first evaluates the requested reference bpp, then sets:
+
+```text
+threshold_kl = KL(reference_bpp) + quality_equivalent_kl_slack
+```
+
+It then searches for the lowest bpp in
+`[--quality-equivalent-bpp-min, --quality-equivalent-bits]` whose validated KL
+meets that threshold:
+
+```bash
+python3 -m prismaquant.iterate_perturbed_allocation \
+  ... \
+  --l3-polish \
+  --quality-equivalent-bits 8.0 \
+  --quality-equivalent-bpp-min 4.0 \
+  --quality-equivalent-kl-slack 0.01
+```
+
+The output still writes `pareto_curve.csv`, `pareto_curve.json`, and
+`summary.json`. The summary includes the reference KL, threshold KL, chosen
+quality-equivalent bpp, and a best-effort knee candidate computed from the
+evaluated points.
 
 The Qwen 4B smoke launcher exposes the final-pass path through:
 
