@@ -350,56 +350,31 @@ $60{,}000$ downloads on Hugging Face in their first weeks of release,
 across a heterogeneous set of source architectures (dense, MoE, and
 native-FP8). v1 is a competitive shipping default in absolute terms.
 
-\paragraph{The stacking-interference failure mode.} The conventional
-intuition for per-tensor techniques is that they are \emph{additive} in
-single-format quantization: HALO reduces outliers, GPTQ minimizes the
-local quadratic, scale-sweep tunes the post-rotation per-tensor scale,
-block-output-match closes the residual block-level gap, and stacking
-them composes the gains. In a fixed-format setting (e.g.\ all
-NVFP4) this composition is empirically robust on the per-Linear
-metrics each pass optimizes against. In a mixed-precision setting it is
-not. Each pass operates on the activation distribution as modified by
-the previous pass, and the per-Linear cost models the passes consume
-are decoupled from the format choices that the allocator will eventually
-make for upstream Linears. The result is that pairs of individually
-validated wins can interfere catastrophically when stacked.
-
-The canonical empirical incident is recorded in the quality-wins audit
-on Qwen3-0.6B
-(handover \texttt{.claude/codex-handover-2026-04-29-pm.md}). Each of
-four wins (\texttt{PRISMAQUANT\_ACT\_CLIP\_QUANTILE}=$0.999$,
-\texttt{PRISMAQUANT\_GPTQ\_DAMP\_SWEEP}, \texttt{PRISMAQUANT\_BLOCK\_OUTPUT\_MATCH},
-\texttt{PRISMAQUANT\_DO\_NO\_HARM}) was validated individually on the
-\textsc{PrismaQuant} validator EVAL\_PROMPTS suite. \texttt{solo\_clip}
-alone moved PPL from $15.453$ (baseline) to $14.546$ ($-0.907$); the
-other three were neutral or near-neutral on Qwen3. The cumulative
-\texttt{full\_v2} configuration with all four wins enabled landed at PPL
-$14.987$, $-0.466$ from baseline --- materially \emph{worse} than
-\texttt{solo\_clip} alone. Roughly half the activation-clip benefit was
-lost. The mechanism, root-caused after the audit: the do-no-harm gate
-compares per-Linear MSE on \emph{unclipped} cached activations while
-GPTQ optimized that Linear's weight under \emph{clipped} activations.
-The post-pass weight is a better fit on the clipped activation
-distribution but appears worse on the unclipped one; the gate reverts
-clip-improved Linears back to RTN, undoing the upstream gain. This is
-exactly the AWQ-style interference pattern, and it is structural.
-Mixed-precision quantization sits on a directed acyclic graph of
-optimizations whose intermediate states are not propagated forward
-through the rest of the pipeline.
-
-A second instance of the same mechanism is the AWQ result: \textsc{AWQ}
-\cite{awq2024} was defaulted off in v1 after empirical bakeoffs showed
-it \emph{worsened} NVFP4 group quantization on most Linears, despite
-being a strict win on uniform-format $4$-bit settings. The
-per-Linear ``do no harm'' gate (commit \texttt{ed9c60c}) was added as
-a direct band-aid for the same family: after GPTQ + scale-sweep,
-compare against pure RTN on the cached activations and revert that
-Linear if RTN beats the post-pass weight. Both observations are
-artifacts of the same structural property --- per-tensor wins that
-modify the activation distribution do not propagate that modification
-forward into the cost models the downstream wins consume, so
-cumulative recipes are not, in general, the composition of their
-individually-validated parts.
+\paragraph{The stacking-interference failure mode.} Per-tensor
+techniques are conventionally treated as additive in single-format
+quantization, and on the per-Linear metrics each pass optimizes against
+this composition is empirically robust. In a mixed-precision setting it
+is not. Each pass operates on the activation distribution as modified
+by the previous pass, and the per-Linear cost models the passes consume
+are decoupled from the format choices the allocator eventually makes
+for upstream Linears. Pairs of individually validated wins can therefore
+interfere when stacked: an internal audit confirmed a recipe with all
+four wins enabled lost roughly half the gain of activation-clipping
+applied alone, with the do-no-harm gate reverting clip-improved Linears
+because its cached MSE comparison ran on the unclipped activation
+distribution while the upstream pass had optimized under the clipped
+one. \textsc{AWQ} \cite{awq2024} surfaces the same family from a
+different angle: it was defaulted off in v1 after empirical bakeoffs
+showed it \emph{worsened} NVFP4 group quantization on most Linears,
+despite being a strict win on uniform-format $4$-bit settings. The
+per-Linear ``do no harm'' gate (commit \texttt{ed9c60c}) is the
+direct band-aid: after GPTQ + scale-sweep, compare against pure RTN
+on the cached activations and revert that Linear if RTN beats the
+post-pass weight. Both observations are artifacts of the same
+structural property --- per-tensor wins that modify the activation
+distribution do not propagate that modification forward into the cost
+models the downstream wins consume, so cumulative recipes are not, in
+general, the composition of their individually-validated parts.
 
 \paragraph{What v1 leaves on the table.} The systematic gap v1 cannot
 close from the per-layer view is the joint-allocation question:
