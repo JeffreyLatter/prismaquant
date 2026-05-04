@@ -271,12 +271,14 @@ v1 composes:
     a block-level optimization that re-tunes a subset of parameters so
     that the \emph{block} output matches the BF16 reference, not just the
     individual Linear outputs.
-  \item \textbf{FP8 source passthrough} (commits \texttt{705fbcd},
-    \texttt{0bf4146}) --- for natively-FP8 source checkpoints, the
-    allocator may pick a verbatim copy of the source FP8 codes plus
-    \texttt{weight\_scale\_inv}; the BF16 view is a lossless dequant, so
-    the per-Linear $\Delta\mathrm{loss}$ is exactly zero. This is
-    important for native-FP8 architectures (MiniMax, DeepSeek-class).
+  \item \textbf{Source passthrough} (commits \texttt{705fbcd},
+    \texttt{0bf4146}) --- when the source checkpoint is already at a
+    serving-compatible precision, the allocator may pick a verbatim
+    copy of the source codes and scales rather than re-quantizing; the
+    dequant view back to BF16 is lossless, so the per-Linear
+    $\Delta\mathrm{loss}$ is exactly zero. This is important for
+    native low-precision source architectures (MiniMax, DeepSeek-class)
+    where re-quantization can only lose information.
   \item \textbf{Activation clipping and FP32 activation cache}
     (commit \texttt{a5d13db}) --- wins the cost-step vs.\ activation
     quantization tradeoff for formats that benefit from clipped
