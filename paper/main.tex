@@ -109,18 +109,20 @@ methods --- GPTQ \cite{gptq2022}, AWQ \cite{awq2024}, AutoRound
 \cite{autoround2023}, HALO/HQQ-style rotation preprocessors, and most
 recently ParoQuant \cite{paroquant} --- improve the per-Linear quantization
 error of a fixed format. Allocation methods --- HAWQ-V3 \cite{hawqv3}, the
-integer quadratic programming approach of \cite{deng2023iqp}, the
-cooperative-game CoopQ allocator \cite{coopq}, and the AutoML-style AMQ
-\cite{amq} --- choose how many bits to spend where. The two axes are
-largely orthogonal: an allocator can sit on top of any per-tensor toolkit
-and decide which Linears get 16, 8, 4, 3, or 2 bits.
+cross-layer-dependency-aware integer-quadratic-programming approach of
+CLADO \cite{clado2023}, the cooperative-game CoopQ allocator \cite{coopq},
+and the AutoML-style AMQ \cite{amq} --- choose how many bits to spend
+where. The two axes are largely orthogonal: an allocator can sit on top
+of any per-tensor toolkit and decide which Linears get 16, 8, 4, 3, or 2
+bits.
 
 The allocation literature is unified by a recurring observation: per-layer
 sensitivity surrogates (diagonal Hessian traces, Fisher MSEs, output-MSEs)
 are biased estimators of joint quantization error. The standard remedy is
-to model the bias --- structured pairwise integer programming
-\cite{deng2023iqp}, second-order ILP in HAWQ-V3 \cite{hawqv3}, Shapley-based
-cooperative-game allocation in CoopQ \cite{coopq}. We take a different tack.
+to model the bias --- pairwise integer-quadratic programming over an
+explicit cross-layer dependency model in CLADO \cite{clado2023}, second-order
+ILP in HAWQ-V3 \cite{hawqv3}, Shapley-based cooperative-game allocation
+in CoopQ \cite{coopq}. We take a different tack.
 \emph{Surrogates generate, real measurement selects.} An allocator does not need
 a perfect cost model if every candidate it proposes can be cheaply re-scored
 end-to-end on a held-out calibration split. Cross-layer interactions and
@@ -188,9 +190,11 @@ matrix; they do not decide \emph{which} matrix gets which format.
 \paragraph{Mixed-precision allocation.} HAWQ-V3 \cite{hawqv3} formulates
 mixed-precision quantization as an integer linear program over per-layer
 sensitivity (second-order Hessian information) and dyadic arithmetic
-constraints. The integer-quadratic-programming approach of Deng et al.\
-\cite{deng2023iqp} extends to a structured pairwise cost across layers
-within a single optimization. Recent allocation work for LLMs includes
+constraints. CLADO \cite{clado2023} extends this with an explicit
+cross-layer dependency: pairwise quantization-error coupling is measured
+on a small data subset and the bit-allocation problem is solved as an
+integer quadratic program in seconds, rather than approximated additively
+across layers. Recent allocation work for LLMs includes
 CoopQ \cite{coopq}, which models layers as a cooperative game and uses a
 Shapley-based progressive allocator to capture inter-layer interaction, and
 AMQ \cite{amq}, which applies AutoML-style search over per-layer
@@ -230,6 +234,105 @@ fused-sibling constraints in attention ($q,k,v$) and MoE
 \cite{vllm} via the \texttt{compressed-tensors} schema, with format coverage
 extending to NVFP4, MXFP8, BF16 passthrough, and (in MoE settings) MXFP4
 experts. End-to-end inference uses Blackwell-native kernels.
+
+\subsection{The \textsc{PrismaQuant}~v1 baseline and why it sets a hard bar}\label{subsec:v1}
+
+The artifact \textsc{PrismaSCOUT} replaces was not a weak baseline. The
+production \textsc{PrismaQuant}~v1 stack is a tuned per-tensor pipeline
+that combines several state-of-the-art techniques per Linear, with a
+per-layer sensitivity allocator on top. It is worth describing in its own
+right, both because PrismaSCOUT inherits it wholesale (only the selection
+routine changed in the head-to-head comparison of
+Table~\ref{tab:27b_headline}), and because understanding what v1 already
+captures clarifies which residual is left for joint-allocation methods to
+attack.
+
+\paragraph{The per-tensor toolkit.} For every quantizable Linear,
+v1 composes:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{HALO rotation preprocessing} \cite{prismaquant} ---
+    a Hadamard-style orthogonal rotation applied to the weight matrix
+    before integer quantization, which spreads outlier-channel mass
+    over the rotated basis and reduces the per-element representation
+    range. Particularly effective for $4$-bit weight-only formats whose
+    error is dominated by tail outliers.
+  \item \textbf{Per-layer GPTQ} \cite{gptq2022}, the workhorse
+    Hessian-weighted least-squares rounding. v1 ships an adaptive
+    \emph{damp probe} (commit \texttt{0cbaddb}) that tries multiple
+    Hessian damping coefficients per Linear and picks the lowest measured
+    output MSE; a \emph{batched-NVFP4} fast path (commit
+    \texttt{f57d960}) processes Linear groups together.
+  \item \textbf{Scale sweep} (commit \texttt{7884536}) --- a per-tensor
+    scale-factor search that minimizes the post-quantization output MSE
+    of each Linear, executed inside the export hot path.
+  \item \textbf{Block-output matching} (commits \texttt{9ef0a05},
+    \texttt{a6c0cf6}, \texttt{b12f96b}) --- after per-Linear quantization,
+    a block-level optimization that re-tunes a subset of parameters so
+    that the \emph{block} output matches the BF16 reference, not just the
+    individual Linear outputs.
+  \item \textbf{FP8 source passthrough} (commits \texttt{705fbcd},
+    \texttt{0bf4146}) --- for natively-FP8 source checkpoints, the
+    allocator may pick a verbatim copy of the source FP8 codes plus
+    \texttt{weight\_scale\_inv}; the BF16 view is a lossless dequant, so
+    the per-Linear $\Delta\mathrm{loss}$ is exactly zero. This is
+    important for native-FP8 architectures (MiniMax, DeepSeek-class).
+  \item \textbf{Activation clipping and FP32 activation cache}
+    (commit \texttt{a5d13db}) --- wins the cost-step vs.\ activation
+    quantization tradeoff for formats that benefit from clipped
+    activations.
+\end{itemize}
+
+The allocator on top is HAWQ-style per-layer sensitivity \cite{hawqv3}
+fed by a multi-chunk empirical-Fisher probe, with a multi-choice knapsack
+DP under the bit budget. Activation residency, fused-sibling coherence,
+shape constraints (e.g.\ MXFP8 tile alignment, FlashInfer kernel masks),
+and joint-input-global-scale handling for fused attention are all
+enforced inside the DP. The whole pipeline runs end-to-end on a UMA
+host with bounded memory.
+
+\paragraph{Why this works as well as it does.} Per-layer quantization
+error is, on most Linears in a modern transformer, well-modeled by a
+local quadratic $\tfrac12 \langle H_i, (W_i - \hat W_i)^2 \rangle$. Each
+component above attacks one term of this quadratic: HALO reduces
+$\|W_i - \hat W_i\|$ by spreading outliers; GPTQ minimizes
+$\langle H_i, (W_i - \hat W_i)^2 \rangle$ exactly under a fixed format;
+scale sweep tunes the post-rotation per-tensor scale to minimize the
+remaining error; block-output match closes the gap to the
+\emph{block-level} reference, absorbing some of the inter-Linear
+coupling without an explicit cross-layer cost model. The allocator's
+HAWQ-style sensitivity then spends bits on the Linears whose local
+quadratic has the largest top-eigenvalue. Each per-layer technique is
+narrow, principled, and composable; together they extract most of the
+per-Linear quantization headroom.
+
+The empirical evidence that this pipeline is strong is the community
+adoption: the public Qwen-3.6 27B, Qwen-3.5 122B-A10B, Qwen-3.6 35B-A3B,
+Mistral-Medium-3.5, MiniMax-M2.7, Gemma-4-31B, and DSv4-Flash
+\textsc{PrismaQuant}~v1 artifacts have together accumulated over
+$60{,}000$ downloads on Hugging Face in their first weeks of release,
+across a heterogeneous set of source architectures (dense, MoE, and
+native-FP8). v1 is a competitive shipping default in absolute terms.
+
+\paragraph{What v1 leaves on the table.} The systematic gap v1 cannot
+close from the per-layer view is the joint-allocation question:
+``which Linear should pay an extra bit?'' Per-layer sensitivity
+correlates with end-KL impact but does not predict it perfectly,
+because end-KL depends on how a Linear's quantization error
+\emph{propagates} downstream, and propagation is sensitive to the
+formats chosen for upstream Linears. v1's HAWQ-style allocator
+overspends on Linears with high local sensitivity but modest
+downstream impact, and underspends on Linears with low local
+sensitivity but errors that compound through later attention.
+PrismaSCOUT does not change a single per-Linear technique; it changes
+the allocator from \emph{additive surrogate cost} to \emph{validated
+end-KL on real assignments}, and it gates every shipping decision on a
+held-out KL measurement. The Qwen3.6-27B head-to-head in
+Table~\ref{tab:27b_headline} is the empirical statement of this
+relationship: the per-Linear toolkit is held fixed, only the selection
+routine changes, and the resulting artifact is $11\%$ smaller and
+$68\%$ lower in held-out KL. The remaining headroom is at the joint
+level, which is where the rest of this paper goes.
 
 \section{Theoretical Framework}\label{sec:theory}
 
@@ -592,7 +695,7 @@ around.
 bug: $u^{(2)}_i$ is measured holding $\Assignment_{-i}$ at $\Assignment^{(\mathrm{ref})}$,
 the DP then proposes a multi-flip $\Assignment^{(\mathrm{prop})}$ far outside
 that radius. The remedy proposed in the design deliberation
-\cite[\texttt{scratch/powwow/02\_gemini.md}]{prismaquant} is a
+\cite[\texttt{scratch/deliberation/02\_gemini.md}]{prismaquant} is a
 \emph{sandwich}: propose $\Assignment^{(\mathrm{prop})}$ from the additive
 DP, re-measure $u^{(2)}_i$ holding $\Assignment_{-i}$ at
 $\Assignment^{(\mathrm{prop})}$, re-solve the DP. Under a Mirror-Descent
@@ -905,47 +1008,61 @@ specific tool-eval-bench regression we identified.
   (20 points/trial). Both tool-eval invocations used \texttt{--no-think}
   and \texttt{--temperature 0}.}
 \label{tab:27b_evals}
-\begin{tabular}{lrr}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrr}
 \toprule
-Metric & PrismaSCOUT (5.31) & PrismaQuant v1 (5.50) \\
+Metric & PrismaSCOUT (5.31) & PrismaQuant v1 (5.50) & $\Delta$ \\
 \midrule
-Held-out KL ($\downarrow$, $8\times 512$ tokens)  & 0.0151    & 0.0475    \\
-Validator perplexity ($\downarrow$)               & 4.128     & 4.178     \\
-Validator mean NLL ($\downarrow$)                 & 1.4178    & 1.4297    \\
-Validator max prompt-avg NLL ($\downarrow$)       & 1.8946    & 1.8350    \\
-GSM8K strict ($\uparrow$)                          & 96.66\%   & --        \\
-IFEval prompt strict ($\uparrow$)                 & 85.40\%   & --        \\
-MMLU 5-shot ($\uparrow$)                          & 86.23\%   & --        \\
+Held-out KL ($\downarrow$, $8\times 512$ tokens)  & \textbf{0.0151}   & 0.0475   & $-0.0324$ ($-68\%$) \\
+GSM8K strict ($\uparrow$)                          & 96.66\%           & \textbf{96.74\%} & $-0.08$ pp \\
+GSM8K flexible ($\uparrow$)                        & 96.59\%           & \textbf{96.66\%} & $-0.08$ pp \\
+IFEval prompt strict ($\uparrow$)                  & \textbf{85.40\%}  & 84.66\%  & $+0.74$ pp \\
+IFEval prompt loose ($\uparrow$)                   & \textbf{88.72\%}  & 87.80\%  & $+0.92$ pp \\
+IFEval instruction strict ($\uparrow$)             & \textbf{89.93\%}  & 89.81\%  & $+0.12$ pp \\
+IFEval instruction loose ($\uparrow$)              & \textbf{92.45\%}  & 92.09\%  & $+0.36$ pp \\
+MMLU 5-shot (limit $20$ / subj.) ($\uparrow$)      & 86.23\%           & \textbf{87.19\%} & $-0.96$ pp \\
+Validator perplexity ($\downarrow$)                & \textbf{4.128}    & 4.178    & $-0.050$ \\
+Validator mean NLL ($\downarrow$)                  & \textbf{1.4178}   & 1.4297   & $-0.012$ \\
+Validator max prompt-avg NLL ($\downarrow$)        & 1.8946            & \textbf{1.8350} & $+0.060$ \\
 \midrule
-\multicolumn{3}{l}{\emph{tool-eval-bench, full hardmode suite (single trial, 148 pts)}} \\
-\quad final score ($\uparrow$)                     & 88/100    & 85/100    \\
-\quad total points ($\uparrow$)                    & 130/148   & 126/148   \\
-\quad safety-critical failures ($\downarrow$)      & 4         & 3         \\
+\multicolumn{4}{l}{\emph{tool-eval-bench, full hardmode sequential suite (single trial, 148 pts)}} \\
+\quad final score ($\uparrow$)                     & \textbf{88/100}   & 85/100   & $+3$ \\
+\quad total points ($\uparrow$)                    & \textbf{130/148}  & 126/148  & $+4$ \\
+\quad safety-critical failures ($\downarrow$)      & 4                 & \textbf{3} & $+1$ \\
 \midrule
-\multicolumn{3}{l}{\emph{tool-eval-bench, targeted adversarial subset (10 scenarios $\times$ 3 trials, 20 pts)}} \\
-\quad mean final score ($\uparrow$)                & 30/100    & 25/100    \\
-\quad mean points ($\uparrow$)                     & 6.0/20    & 5.0/20    \\
-\quad pass@3 ($\uparrow$)                          & 10\%      & 20\%      \\
-\quad safety warnings/trial ($\downarrow$)         & 4         & 3         \\
+\multicolumn{4}{l}{\emph{tool-eval-bench, targeted adversarial subset (10 scenarios $\times$ 3 trials, 20 pts)}} \\
+\quad mean final score ($\uparrow$)                & \textbf{30/100}   & 25/100   & $+5$ \\
+\quad mean points ($\uparrow$)                     & \textbf{6.0/20}   & 5.0/20   & $+1.0$ \\
+\quad pass@3 ($\uparrow$)                          & 10\%              & \textbf{20\%} & $-10$ pp \\
+\quad safety warnings/trial ($\downarrow$)         & 4                 & \textbf{3} & $+1$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The 5.31~bpp artifact wins on perplexity, mean NLL, GSM8K, and aggregate
-tool-eval scores, but the targeted adversarial 3-trial subset surfaces
-regressions that the full single-trial run does not isolate cleanly.
-Specifically, scenario \texttt{TC-42} (extra parameter injection in tool
-calls) is a stable regression on 5.31 (FAIL across all three trials)
-where 5.5 stably PASSES, and \texttt{TC-50} similarly degrades from PASS
-to PARTIAL. The shipped 5.5 artifact and the new 5.31 artifact share a
-vulnerability to \texttt{TC-60} (cross-turn sleeper injection); both
-follow an attacker BCC inserted via a tool result. The validator
-\emph{max prompt-avg NLL} is also worse on 5.31 ($1.8946$ vs.\ $1.8350$),
-indicating that the lower mean KL is accompanied by a heavier tail.
-We do not claim KL improvement implies uniform task improvement. Mean KL
-hides tail regressions and underweights low-frequency schema and
-tool-call tokens. Future work includes p95/p99 KL diagnostics and a
-schema-focused KL gate (Section~\ref{sec:discussion}).
+The headline KL improvement is large and clean: $-68\%$ on the held-out
+text split, with strong improvements on perplexity, mean NLL, all four
+IFEval splits, and aggregate tool-eval-bench score. But the comparison is
+not uniformly favorable. PrismaSCOUT regresses by $0.96$ pp on MMLU
+$5$-shot and is statistically tied on GSM8K ($\pm 0.08$ pp). The
+validator \emph{max prompt-avg NLL} is also worse on 5.31 ($1.8946$
+vs.\ $1.8350$), indicating that the lower \emph{mean} KL is accompanied
+by a heavier tail. The targeted adversarial 3-trial subset surfaces
+finer-grained regressions that the full single-trial run does not isolate
+cleanly. Scenario \texttt{TC-42} (extra-parameter injection in tool
+calls) is a stable regression on $5.31$ (FAIL across all three trials)
+where $5.5$ stably PASSES, and \texttt{TC-50} similarly degrades from
+PASS to PARTIAL. Both artifacts share a vulnerability to \texttt{TC-60}
+(cross-turn sleeper injection); both follow an attacker BCC inserted
+via a tool result. We do not claim KL improvement implies uniform task
+improvement: the MMLU regression specifically suggests that the
+validation-split KL we optimized against does not perfectly cover
+multi-shot reasoning, and mean KL hides tail behavior that the
+prompt-avg-NLL diagnostic exposes. Future work includes p95/p99 KL
+diagnostics, a schema-focused KL gate, and an MMLU-style multi-shot
+calibration slice (Section~\ref{sec:discussion}). The benchmark numbers
+above are reproduced verbatim from the model card at
+DOI~\texttt{10.57967/hf/8656} \cite{Tand2026hf}.
 
 \section{Discussion and Limitations}\label{sec:discussion}
 
@@ -1033,7 +1150,7 @@ proximal-descent argument, block-DP clique structure, probe error bounds)
 that produced the rejected-methods catalog of Section~\ref{sec:rejected}.
 Where their contributions are load-bearing for the paper's narrative, the
 relevant deliberation transcripts are preserved in
-\texttt{scratch/powwow/} of the source repository for future audit.
+\texttt{scratch/deliberation/} of the source repository for future audit.
 
 \renewcommand{\refname}{References}
 
@@ -1072,9 +1189,11 @@ relevant deliberation transcripts are preserved in
   HAWQ-V3: Dyadic Neural Network Quantization. \emph{ICML}, 2021.
   arXiv:2011.10680.
 
-\bibitem{deng2023iqp} Z.~Deng, S.~Sharify, X.~Wang, and M.~Orshansky.
+\bibitem{clado2023} Z.~Deng, S.~Sharify, X.~Wang, and M.~Orshansky.
   Mixed-Precision Quantization for Deep Vision Models with Integer
-  Quadratic Programming. \emph{arXiv:2307.05657}, 2023.
+  Quadratic Programming (CLADO: Cross-LAyer-Dependency-aware
+  Optimization). \emph{Proceedings of the 62nd Annual Design
+  Automation Conference (DAC)}, 2025. arXiv:2307.05657.
 
 \bibitem{coopq} J.~Zhao, A.~Derakhshan, J.~Kana~Hyman, J.~Dong,
   S.~Abdu~Jyothi, and I.~Harris. CoopQ: Cooperative Game Inspired Layerwise

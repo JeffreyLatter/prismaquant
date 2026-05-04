@@ -50,7 +50,7 @@ Sources you should consult (in priority order)
    - /home/rob/prismaquant/docs/runtime_flags.md
 
 4. Multi-agent deliberation record (Claude/Codex/Gemini)
-   - /home/rob/prismaquant/scratch/powwow/*.md
+   - /home/rob/prismaquant/scratch/deliberation/*.md
    - Especially:
      00_brief.md (the original problem statement)
      02_gemini.md and 05_gemini.md (the Lagrangian / sandwich math)
