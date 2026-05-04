@@ -2774,6 +2774,54 @@ def test_l3_lagrangian_assignment_sweeps_size_quality_tradeoff():
     assert set(small.values()) == {"NVFP4"}
 
 
+def test_l3_pareto_archive_dp_recovers_frontier_in_one_pass():
+    stats = {
+        f"layer{i}": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for i in range(3)
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    l3_costs = {
+        "layer0": {
+            "NVFP4": {"propagated_end_kl": 0.01},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer1": {
+            "NVFP4": {"propagated_end_kl": 0.20},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer2": {
+            "NVFP4": {"propagated_end_kl": 0.80},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+    }
+    l3_candidates = ipa.build_l3_candidates(
+        stats,
+        ipa._l3_costs_as_predicted_dloss(l3_costs),
+        specs,
+    )
+
+    rows, meta = ipa.solve_l3_pareto_archive_assignments(
+        stats,
+        {name: "NVFP4" for name in stats},
+        l3_candidates,
+        specs,
+        bpp_min=0.0,
+        bpp_max=16.0,
+        bit_precision=0.01,
+    )
+
+    assert meta["frontier_bins"] >= 3
+    assert len(rows) >= 3
+    assert rows == sorted(rows, key=ipa._archive_sort_key)
+    assert rows[0]["surrogate_loss"] > rows[-1]["surrogate_loss"]
+    assert rows[0]["achieved_bpp"] < rows[-1]["achieved_bpp"]
+
+
 def test_l3_lagrangian_assignment_keeps_fused_siblings_coherent():
     names = [
         "model.layers.0.self_attn.q_proj",

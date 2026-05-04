@@ -4790,6 +4790,217 @@ def solve_l3_lagrangian_assignment(
     }
 
 
+def solve_l3_pareto_archive_assignments(
+    stats: Mapping[str, Mapping],
+    baseline_assignment: Mapping[str, str],
+    l3_candidates: Mapping[str, list[Candidate]],
+    specs: list[fr.FormatSpec],
+    *,
+    bpp_min: float,
+    bpp_max: float,
+    bit_precision: float,
+    profile=None,
+) -> tuple[list[dict], dict]:
+    """Return one-pass epsilon-frontier candidates from cached L3 costs.
+
+    This is a single multi-objective DP over average-bit bins. It is not an
+    iterative target-budget sweep; every retained row is later judged by real KL.
+    """
+    import numpy as np
+
+    if not l3_candidates:
+        return [], {"enabled": True, "reason": "no_l3_candidates"}
+    precision = max(float(bit_precision), 1e-6)
+    stats_alloc, candidates_alloc = _aggregate_l3_candidates_for_lagrangian(
+        stats,
+        l3_candidates,
+        specs,
+        profile=profile,
+    )
+    specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
+    full_total_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in baseline_assignment
+        if name in stats
+    )
+    if full_total_params <= 0:
+        return [], {"enabled": True, "reason": "zero_total_params"}
+
+    open_original_names: set[str] = set()
+    for name, entry in stats_alloc.items():
+        members = entry.get("_fused_siblings") if isinstance(entry, Mapping) else None
+        if members:
+            open_original_names.update(str(member) for member in members)
+        else:
+            open_original_names.add(str(name))
+    frozen_assignment = {
+        name: fmt
+        for name, fmt in baseline_assignment.items()
+        if name in stats and name not in open_original_names
+    }
+    frozen_bpp = assignment_bit_total(
+        stats,
+        frozen_assignment,
+        specs_by_name,
+    ) / float(full_total_params)
+
+    names = sorted(candidates_alloc)
+    if not names:
+        return [], {"enabled": True, "reason": "no_alloc_candidates"}
+    base_open_bpp = 0.0
+    options_by_name: list[tuple[str, list[tuple[int, Candidate, float]]]] = []
+    for name in names:
+        params = int(stats_alloc[name].get("n_params", 0) or 0)
+        if params <= 0:
+            continue
+        cands = list(candidates_alloc[name])
+        if not cands:
+            continue
+        bit_contrib = {
+            idx: float(cand.bits_per_param) * float(params) / float(full_total_params)
+            for idx, cand in enumerate(cands)
+        }
+        min_bpp = min(bit_contrib.values())
+        base_open_bpp += min_bpp
+        by_bin: dict[int, tuple[Candidate, float]] = {}
+        for idx, cand in enumerate(cands):
+            dbin = int(round((bit_contrib[idx] - min_bpp) / precision))
+            loss = float(cand.predicted_dloss)
+            previous = by_bin.get(dbin)
+            if previous is None or (loss, cand.bits_per_param, cand.fmt) < (
+                previous[1],
+                previous[0].bits_per_param,
+                previous[0].fmt,
+            ):
+                by_bin[dbin] = (cand, loss)
+        options_by_name.append(
+            (
+                name,
+                [
+                    (dbin, cand, loss)
+                    for dbin, (cand, loss) in sorted(by_bin.items())
+                ],
+            )
+        )
+    if not options_by_name:
+        return [], {"enabled": True, "reason": "no_dp_options"}
+
+    min_total_bpp = frozen_bpp + base_open_bpp
+    max_extra_bpp = max(float(bpp_max) - min_total_bpp, 0.0)
+    n_bins = int(math.ceil(max_extra_bpp / precision)) + 1
+    if n_bins <= 0:
+        return [], {
+            "enabled": True,
+            "reason": "range_below_min_bpp",
+            "min_total_bpp": float(min_total_bpp),
+        }
+    inf = np.float64(1e100)
+    dp = np.full(n_bins, inf, dtype=np.float64)
+    dp[0] = 0.0
+    choices: list[np.ndarray] = []
+    for _name, options in options_by_name:
+        next_dp = np.full(n_bins, inf, dtype=np.float64)
+        choice = np.full(n_bins, -1, dtype=np.int16)
+        for opt_idx, (dbin, _cand, loss) in enumerate(options):
+            if dbin >= n_bins:
+                continue
+            src = dp[: n_bins - dbin]
+            candidate = src + float(loss)
+            dst = next_dp[dbin:]
+            mask = candidate < dst - 1e-15
+            if mask.any():
+                dst[mask] = candidate[mask]
+                choice_view = choice[dbin:]
+                choice_view[mask] = int(opt_idx)
+        dp = next_dp
+        choices.append(choice)
+
+    frontier_bins: list[int] = []
+    best_loss = float("inf")
+    start_bin = max(int(math.floor((float(bpp_min) - min_total_bpp) / precision)), 0)
+    for bin_idx in range(start_bin, n_bins):
+        loss = float(dp[bin_idx])
+        if not math.isfinite(loss) or loss >= 1e99:
+            continue
+        estimated_bpp = min_total_bpp + float(bin_idx) * precision
+        if estimated_bpp < float(bpp_min) - precision:
+            continue
+        if estimated_bpp > float(bpp_max) + precision:
+            break
+        if loss < best_loss - 1e-12:
+            frontier_bins.append(bin_idx)
+            best_loss = loss
+
+    rows_by_hash: dict[str, dict] = {}
+    baseline_alloc = _baseline_for_allocated_stats(
+        baseline_assignment,
+        stats_alloc,
+    )
+    for bin_idx in frontier_bins:
+        cur = int(bin_idx)
+        assignment_alloc = dict(baseline_alloc)
+        chosen_alloc: dict[str, Candidate] = {}
+        valid = True
+        for layer_idx in range(len(options_by_name) - 1, -1, -1):
+            name, options = options_by_name[layer_idx]
+            opt_idx = int(choices[layer_idx][cur]) if cur >= 0 else -1
+            if opt_idx < 0 or opt_idx >= len(options):
+                valid = False
+                break
+            dbin, cand, _loss = options[opt_idx]
+            assignment_alloc[name] = fr.canonical_format_name(cand.fmt)
+            chosen_alloc[name] = cand
+            cur -= int(dbin)
+        if not valid:
+            continue
+        expanded = expand_fused_sibling_assignment(assignment_alloc, stats_alloc)
+        merged = dict(baseline_assignment)
+        merged.update(expanded)
+        merged = _enforce_fused_assignment_coherence(
+            merged,
+            specs,
+            profile=profile,
+        )
+        histogram = _format_histogram(
+            stats,
+            merged,
+            specs,
+            target_bits=min_total_bpp + float(bin_idx) * precision,
+        )
+        row = _candidate_from_assignment(
+            assignment=merged,
+            stats=stats,
+            specs=specs,
+            source="pareto_archive_dp",
+            source_path=None,
+            target_bpp=min_total_bpp + float(bin_idx) * precision,
+            surrogate_loss=float(dp[bin_idx]),
+        )
+        row["archive_bin"] = int(bin_idx)
+        row["estimated_bpp"] = float(min_total_bpp + float(bin_idx) * precision)
+        row["format_histogram"] = histogram
+        previous = rows_by_hash.get(row["assignment_hash"])
+        if previous is None or (
+            float(row["surrogate_loss"]),
+            float(row["achieved_bpp"]),
+        ) < (
+            float(previous["surrogate_loss"]),
+            float(previous["achieved_bpp"]),
+        ):
+            rows_by_hash[row["assignment_hash"]] = row
+
+    rows = sorted(rows_by_hash.values(), key=_archive_sort_key)
+    return rows, {
+        "enabled": True,
+        "open_items": len(options_by_name),
+        "bins": int(n_bins),
+        "bit_precision": float(precision),
+        "min_total_bpp": float(min_total_bpp),
+        "frontier_bins": len(frontier_bins),
+        "unique_assignments": len(rows),
+    }
+
+
 def _candidate_bpp_in_range(args, row: Mapping) -> bool:
     achieved_bpp = float(row["achieved_bpp"])
     return (
@@ -5146,6 +5357,31 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
         ):
             generated_by_hash[row["assignment_hash"]] = row
 
+    pareto_dp_meta = {"enabled": False}
+    if bool(getattr(args, "knee_archive_dp", True)):
+        pareto_rows, pareto_dp_meta = solve_l3_pareto_archive_assignments(
+            runtime.stats,
+            anchor_assignment,
+            l3_candidates,
+            runtime.specs,
+            bpp_min=float(args.knee_bpp_min),
+            bpp_max=float(args.knee_bpp_max),
+            bit_precision=float(getattr(args, "bit_precision", 0.001)),
+            profile=runtime.profile,
+        )
+        for row in pareto_rows:
+            if not _candidate_bpp_in_range(args, row):
+                continue
+            previous = generated_by_hash.get(row["assignment_hash"])
+            if previous is None or (
+                float(row.get("surrogate_loss", float("inf"))),
+                float(row["achieved_bpp"]),
+            ) < (
+                float(previous.get("surrogate_loss", float("inf"))),
+                float(previous["achieved_bpp"]),
+            ):
+                generated_by_hash[row["assignment_hash"]] = row
+
     generated_candidates, surrogate_meta = _select_lambda_archive_candidates(
         list(generated_by_hash.values()),
         limit=int(getattr(args, "knee_archive_validation_candidates", 9)),
@@ -5259,6 +5495,7 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
             "l3_cost_history_entries": len(l3_cost_history),
             "lambda_grid": [float(value) for value in lambda_grid],
             "lambda_generated_unique": len(generated_by_hash),
+            "pareto_archive_dp": pareto_dp_meta,
             "lambda_validated_selected": len(generated_candidates),
             "validation_candidate_count": len(candidates),
             "new_validation_measurements": int(measured_count),
@@ -7582,6 +7819,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Number of generated lambda-archive candidates to validate. "
             "Validated seed/included assignments are added separately."
+        ),
+    )
+    ap.add_argument(
+        "--knee-archive-dp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Add a one-pass cached-L3 Pareto DP archive to recover non-convex "
+            "frontier pockets missed by scalar lambda values."
         ),
     )
     ap.add_argument(
