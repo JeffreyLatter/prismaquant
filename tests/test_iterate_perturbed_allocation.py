@@ -2713,6 +2713,216 @@ def test_validated_surrogate_knee_caps_generated_candidates_but_keeps_includes(
     assert ipa._assignment_digest(included_assignment) in calls
 
 
+def test_l3_lagrangian_assignment_sweeps_size_quality_tradeoff():
+    stats = {
+        f"layer{i}": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for i in range(3)
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    l3_costs = {
+        "layer0": {
+            "NVFP4": {"propagated_end_kl": 0.01},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer1": {
+            "NVFP4": {"propagated_end_kl": 0.25},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer2": {
+            "NVFP4": {"propagated_end_kl": 0.75},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+    }
+    l3_candidates = ipa.build_l3_candidates(
+        stats,
+        ipa._l3_costs_as_predicted_dloss(l3_costs),
+        specs,
+    )
+    baseline = {name: "NVFP4" for name in stats}
+
+    high_quality, _chosen, high_meta = ipa.solve_l3_lagrangian_assignment(
+        stats,
+        baseline,
+        l3_candidates,
+        specs,
+        lambda_penalty=0.0,
+    )
+    small, _chosen, small_meta = ipa.solve_l3_lagrangian_assignment(
+        stats,
+        baseline,
+        l3_candidates,
+        specs,
+        lambda_penalty=10.0,
+    )
+    grid = ipa._lambda_grid_from_l3_candidates(
+        stats,
+        l3_candidates,
+        count=7,
+        specs=specs,
+    )
+
+    assert grid[0] == 0.0
+    assert len(grid) >= 3
+    assert high_meta["surrogate_loss"] < small_meta["surrogate_loss"]
+    assert high_meta["achieved_bpp"] > small_meta["achieved_bpp"]
+    assert set(high_quality.values()) == {"BF16"}
+    assert set(small.values()) == {"NVFP4"}
+
+
+def test_l3_lagrangian_assignment_keeps_fused_siblings_coherent():
+    names = [
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj",
+    ]
+    stats = {
+        name: {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for name in names
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    l3_costs = {
+        name: {
+            "NVFP4": {"propagated_end_kl": 1.0},
+            "BF16": {"propagated_end_kl": 0.0},
+        }
+        for name in names
+    }
+    l3_candidates = ipa.build_l3_candidates(
+        stats,
+        ipa._l3_costs_as_predicted_dloss(l3_costs),
+        specs,
+    )
+
+    assignment, _chosen, meta = ipa.solve_l3_lagrangian_assignment(
+        stats,
+        {name: "NVFP4" for name in names},
+        l3_candidates,
+        specs,
+        lambda_penalty=0.0,
+        profile=_FakeQkvProfile(),
+    )
+
+    assert meta["open_items"] == 1
+    assert {assignment[name] for name in names} == {"BF16"}
+
+
+def test_knee_archive_search_validates_lambda_archive(tmp_path, monkeypatch):
+    stats = {
+        f"layer{i}": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for i in range(4)
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    current_costs = {
+        name: {
+            "NVFP4": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+        for name in stats
+    }
+    l3_costs = {
+        "layer0": {
+            "NVFP4": {"propagated_end_kl": 0.01},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer1": {
+            "NVFP4": {"propagated_end_kl": 0.10},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer2": {
+            "NVFP4": {"propagated_end_kl": 0.30},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer3": {
+            "NVFP4": {"propagated_end_kl": 0.80},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+    }
+    resume_path = tmp_path / "l3_propagated_costs.pkl"
+    with open(resume_path, "wb") as f:
+        pickle.dump(
+            {
+                "costs": l3_costs,
+                "cost_history": [l3_costs],
+                "formats": ["NVFP4", "BF16"],
+                "meta": {"anchor_bpp": 5.5},
+            },
+            f,
+        )
+    initial_config = tmp_path / "initial_assignment.json"
+    initial_config.write_text(json.dumps({name: "NVFP4" for name in stats}))
+
+    def _fake_kl(_model, assignment, *_args, **_kwargs):
+        bpp = ipa._format_histogram(stats, assignment, specs, 0.0)["achieved_bpp"]
+        return ((float(bpp) - 10.0) ** 2) / 100.0
+
+    monkeypatch.setattr(ipa, "measure_assignment_kl", _fake_kl)
+    monkeypatch.setattr(ipa, "_emit", lambda _msg: None)
+    out = tmp_path / "out"
+    args = SimpleNamespace(
+        target_bits_anchor=5.5,
+        knee_bpp_min=4.0,
+        knee_bpp_max=16.1,
+        knee_tolerance=0.1,
+        knee_kl_noise_floor=0.0,
+        knee_unstable_policy="best-kl",
+        knee_lambda_evaluations=9,
+        knee_archive_validation_candidates=9,
+        knee_include_assignment=[],
+        knee_seed_frontier=[],
+        knee_seed_remeasure=False,
+        _resume_l3_costs_single=resume_path,
+        _resume_l3_costs_by_anchor={},
+        resume_l3_costs_dir=None,
+        resume_l3_ignore_mismatch=True,
+        force_resume_l3_costs=False,
+        initial_config=str(initial_config),
+        model="tiny",
+        probe="probe",
+        n_calib_samples=1,
+        calib_seqlen=2,
+        l3_n_calib_samples=1,
+        l3_calib_seqlen=2,
+    )
+    runtime = ipa.BudgetRuntime(
+        work_root=tmp_path / "work",
+        output_root=out,
+        stats=stats,
+        current_costs=current_costs,
+        specs=specs,
+        profile=None,
+        model=object(),
+        calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        l3_calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        ref_log_probs=[],
+        dtype=torch.bfloat16,
+        probe_load_timing={},
+    )
+
+    assert ipa.run_knee_archive_search(args, runtime) == 0
+    summary = json.loads((out / "summary.json").read_text())
+    frontier = json.loads((out / "validated_frontier.json").read_text())
+
+    assert summary["knee"]["mode"] == "lambda_sandwich_archive_kneedle"
+    assert Path(summary["knee"]["layer_config"]).exists()
+    assert frontier["metadata"]["new_validation_measurements"] >= 3
+    assert frontier["metadata"]["lambda_generated_unique"] >= 3
+
+
 def _dummy_budget_result(
     target_bpp,
     anchor_bpp,

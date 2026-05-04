@@ -4602,6 +4602,703 @@ def _cap_spread_candidates(
     return [candidates[idx] for idx in sorted(keep)]
 
 
+def _l3_costs_as_predicted_dloss(
+    l3_costs: Mapping[str, Mapping[str, Mapping]],
+) -> dict[str, dict[str, dict]]:
+    out: dict[str, dict[str, dict]] = {}
+    for name, per_name in l3_costs.items():
+        if not isinstance(per_name, Mapping):
+            continue
+        per_out: dict[str, dict] = {}
+        for fmt, entry in per_name.items():
+            if not isinstance(entry, Mapping) or "error" in entry:
+                continue
+            value = entry.get("propagated_end_kl")
+            if value is None:
+                value = entry.get("predicted_dloss")
+            if value is None:
+                continue
+            per_out[fr.canonical_format_name(str(fmt))] = {
+                "predicted_dloss": max(float(value), 0.0),
+                "propagated_end_kl": max(float(value), 0.0),
+            }
+        if per_out:
+            out[str(name)] = per_out
+    return out
+
+
+def _aggregate_l3_candidates_for_lagrangian(
+    stats: Mapping[str, Mapping],
+    l3_candidates: Mapping[str, list[Candidate]],
+    specs: list[fr.FormatSpec],
+    *,
+    profile=None,
+) -> tuple[dict, dict]:
+    candidate_stats = {
+        name: dict(stats[name])
+        for name in l3_candidates
+        if name in stats
+    }
+    candidate_costs = {
+        name: {
+            fr.canonical_format_name(cand.fmt): {
+                "predicted_dloss": float(cand.predicted_dloss),
+            }
+            for cand in cands
+        }
+        for name, cands in l3_candidates.items()
+        if name in candidate_stats
+    }
+    stats_alloc, _costs_alloc, candidates_alloc = aggregate_fused_siblings(
+        candidate_stats,
+        candidate_costs,
+        specs,
+        {
+            name: list(cands)
+            for name, cands in l3_candidates.items()
+            if name in candidate_stats
+        },
+        profile=profile,
+    )
+    return stats_alloc, candidates_alloc
+
+
+def _lambda_grid_from_l3_candidates(
+    stats: Mapping[str, Mapping],
+    l3_candidates: Mapping[str, list[Candidate]],
+    *,
+    count: int,
+    profile=None,
+    specs: list[fr.FormatSpec] | None = None,
+) -> list[float]:
+    count = max(int(count), 2)
+    if specs is None:
+        specs = sorted(fr.list_formats(), key=lambda spec: spec.effective_bits)
+    stats_alloc, candidates_alloc = _aggregate_l3_candidates_for_lagrangian(
+        stats,
+        l3_candidates,
+        specs,
+        profile=profile,
+    )
+    total_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in stats
+    )
+    slopes: list[float] = []
+    if total_params > 0:
+        for name, cands in candidates_alloc.items():
+            params = int(stats_alloc.get(name, {}).get("n_params", 0) or 0)
+            if params <= 0:
+                continue
+            for left, right in combinations(cands, 2):
+                loss_delta = abs(
+                    float(left.predicted_dloss) - float(right.predicted_dloss)
+                )
+                bpp_delta = abs(
+                    float(left.bits_per_param) - float(right.bits_per_param)
+                ) * float(params) / float(total_params)
+                if loss_delta > 1e-18 and bpp_delta > 1e-18:
+                    slopes.append(loss_delta / bpp_delta)
+    if not slopes:
+        return [0.0, 1.0]
+    lo = max(min(slopes) * 0.1, 1e-18)
+    hi = max(max(slopes) * 10.0, lo * 10.0)
+    if count == 2:
+        return [0.0, hi]
+    values = {0.0, lo, hi}
+    interior = max(count - len(values), 0)
+    if interior > 0:
+        log_lo = math.log10(lo)
+        log_hi = math.log10(hi)
+        for idx in range(interior):
+            frac = idx / float(max(interior - 1, 1))
+            values.add(10.0 ** (log_lo + (log_hi - log_lo) * frac))
+    return sorted(values)
+
+
+def solve_l3_lagrangian_assignment(
+    stats: Mapping[str, Mapping],
+    baseline_assignment: Mapping[str, str],
+    l3_candidates: Mapping[str, list[Candidate]],
+    specs: list[fr.FormatSpec],
+    *,
+    lambda_penalty: float,
+    profile=None,
+) -> tuple[dict[str, str], dict[str, Candidate], dict]:
+    """Minimize cached L3 loss + lambda * achieved bpp over mutable L3 items."""
+    if not l3_candidates:
+        return dict(baseline_assignment), {}, {
+            "solver": "lagrangian",
+            "lambda_penalty": float(lambda_penalty),
+            "open_items": 0,
+        }
+
+    stats_alloc, candidates_alloc = _aggregate_l3_candidates_for_lagrangian(
+        stats,
+        l3_candidates,
+        specs,
+        profile=profile,
+    )
+    total_params = sum(
+        int(stats[name].get("n_params", 0) or 0)
+        for name in baseline_assignment
+        if name in stats
+    )
+    total_params = max(int(total_params), 1)
+    baseline_alloc = _baseline_for_allocated_stats(
+        baseline_assignment,
+        stats_alloc,
+    )
+    chosen_alloc: dict[str, Candidate] = {}
+    assignment_alloc = dict(baseline_alloc)
+    for name in sorted(candidates_alloc):
+        params = int(stats_alloc[name].get("n_params", 0) or 0)
+        fraction = float(params) / float(total_params)
+        chosen = min(
+            candidates_alloc[name],
+            key=lambda cand: (
+                float(cand.predicted_dloss)
+                + float(lambda_penalty) * float(cand.bits_per_param) * fraction,
+                float(cand.predicted_dloss),
+                float(cand.bits_per_param),
+                fr.canonical_format_name(cand.fmt),
+            ),
+        )
+        chosen_alloc[name] = chosen
+        assignment_alloc[name] = fr.canonical_format_name(chosen.fmt)
+
+    expanded = expand_fused_sibling_assignment(assignment_alloc, stats_alloc)
+    merged = dict(baseline_assignment)
+    merged.update(expanded)
+    merged = _enforce_fused_assignment_coherence(
+        merged,
+        specs,
+        profile=profile,
+    )
+    histogram = _format_histogram(
+        stats,
+        merged,
+        specs,
+        target_bits=0.0,
+    )
+    return merged, chosen_alloc, {
+        "solver": "lagrangian",
+        "lambda_penalty": float(lambda_penalty),
+        "open_items": len(candidates_alloc),
+        "achieved_bpp": float(histogram["achieved_bpp"]),
+        "surrogate_loss": float(_candidate_loss_sum(chosen_alloc)),
+    }
+
+
+def _candidate_bpp_in_range(args, row: Mapping) -> bool:
+    achieved_bpp = float(row["achieved_bpp"])
+    return (
+        achieved_bpp >= float(args.knee_bpp_min) - 1e-12
+        and achieved_bpp <= float(args.knee_bpp_max) + 1e-12
+    )
+
+
+def _upsert_archive_candidate(
+    candidates_by_hash: dict[str, dict],
+    row: dict,
+) -> None:
+    digest = str(row["assignment_hash"])
+    previous = candidates_by_hash.get(digest)
+    if previous is None:
+        candidates_by_hash[digest] = row
+        return
+    previous_validated = previous.get("validation_kl") is not None
+    row_validated = row.get("validation_kl") is not None
+    if row_validated and not previous_validated:
+        if "generated_sources" in previous:
+            row.setdefault("generated_sources", []).extend(previous["generated_sources"])
+        candidates_by_hash[digest] = row
+        return
+    if row_validated and previous_validated:
+        if float(row["validation_kl"]) < float(previous["validation_kl"]):
+            candidates_by_hash[digest] = row
+        return
+    if previous_validated:
+        previous.setdefault("generated_sources", []).append({
+            "source": row.get("source"),
+            "lambda_penalty": row.get("lambda_penalty"),
+            "surrogate_loss": row.get("surrogate_loss"),
+        })
+        return
+    row_key = (
+        row.get("surrogate_loss")
+        if row.get("surrogate_loss") is not None
+        else float("inf"),
+        float(row.get("achieved_bpp", float("inf"))),
+    )
+    previous_key = (
+        previous.get("surrogate_loss")
+        if previous.get("surrogate_loss") is not None
+        else float("inf"),
+        float(previous.get("achieved_bpp", float("inf"))),
+    )
+    if row_key < previous_key:
+        candidates_by_hash[digest] = row
+
+
+def _archive_sort_key(row: Mapping) -> tuple:
+    return (
+        float(row["achieved_bpp"]),
+        (
+            float(row["surrogate_loss"])
+            if row.get("surrogate_loss") is not None
+            else float("inf")
+        ),
+        str(row["assignment_hash"]),
+    )
+
+
+def _select_lambda_archive_candidates(
+    generated: list[dict],
+    *,
+    limit: int,
+) -> tuple[list[dict], dict]:
+    generated = sorted(generated, key=_archive_sort_key)
+    if not generated:
+        return [], {
+            "surrogate_frontier_points": 0,
+            "surrogate_knee": None,
+        }
+    surrogate_frontier = _nondominated_surrogate_points(generated)
+    surrogate_knee = None
+    if len(surrogate_frontier) >= 3:
+        knee_bpp, knee_loss, knee_score, endpoint = segmented_kneedle_point(
+            [
+                (float(row["achieved_bpp"]), float(row["surrogate_loss"]))
+                for row in surrogate_frontier
+            ]
+        )
+        knee_index = min(
+            range(len(surrogate_frontier)),
+            key=lambda idx: (
+                abs(float(surrogate_frontier[idx]["achieved_bpp"]) - knee_bpp),
+                abs(float(surrogate_frontier[idx]["surrogate_loss"]) - knee_loss),
+            ),
+        )
+        surrogate_frontier[knee_index]["is_surrogate_knee"] = True
+        surrogate_knee = {
+            "achieved_bpp": float(surrogate_frontier[knee_index]["achieved_bpp"]),
+            "surrogate_loss": float(surrogate_frontier[knee_index]["surrogate_loss"]),
+            "kneedle_score": float(knee_score),
+            "endpoint_fallback": bool(endpoint),
+        }
+    selected = _cap_spread_candidates(
+        surrogate_frontier,
+        int(limit),
+        required_key="is_surrogate_knee",
+    )
+    if int(limit) <= 0:
+        selected = surrogate_frontier
+    return selected, {
+        "surrogate_frontier_points": len(surrogate_frontier),
+        "surrogate_knee": surrogate_knee,
+    }
+
+
+def _choose_validated_archive_knee(
+    args,
+    validated_frontier: list[dict],
+    candidates: list[dict],
+) -> tuple[dict, dict]:
+    kl_noise_floor = _knee_kl_noise_floor(args)
+    unstable_policy = str(getattr(args, "knee_unstable_policy", "best-kl"))
+    if len(validated_frontier) < 3:
+        chosen = min(candidates, key=lambda row: float(row["validation_kl"]))
+        knee_score = 0.0
+        endpoint = True
+    else:
+        knee_bpp, knee_kl, knee_score, endpoint = segmented_kneedle_point(
+            [
+                (float(row["achieved_bpp"]), float(row["validation_kl"]))
+                for row in validated_frontier
+            ]
+        )
+        chosen = min(
+            validated_frontier,
+            key=lambda row: (
+                abs(float(row["achieved_bpp"]) - float(knee_bpp)),
+                abs(float(row["validation_kl"]) - float(knee_kl)),
+            ),
+        )
+
+    geometric_chosen = chosen
+    loo_diagnostic = kneedle_leave_one_out_diagnostic(
+        [
+            (float(row["achieved_bpp"]), float(row["validation_kl"]))
+            for row in validated_frontier
+        ],
+        float(geometric_chosen["achieved_bpp"]),
+        float(geometric_chosen["validation_kl"]),
+        tolerance_bpp=float(getattr(args, "knee_tolerance", 0.1)),
+        kl_noise_floor=float(kl_noise_floor),
+    )
+    selection_guard = {
+        "policy": unstable_policy,
+        "applied": False,
+        "reason": "stable_or_disabled",
+    }
+    if (
+        unstable_policy == "best-kl"
+        and loo_diagnostic.get("enabled")
+        and not loo_diagnostic.get("stable", True)
+        and validated_frontier
+    ):
+        best_kl = min(
+            validated_frontier,
+            key=lambda row: (
+                float(row["validation_kl"]),
+                float(row["achieved_bpp"]),
+                float(row.get("target_bpp") or row["achieved_bpp"]),
+            ),
+        )
+        if best_kl is not geometric_chosen:
+            chosen = best_kl
+            selection_guard = {
+                "policy": unstable_policy,
+                "applied": True,
+                "reason": "leave_one_out_unstable",
+                "geometric_chosen_target_bpp": geometric_chosen.get("target_bpp"),
+                "geometric_chosen_achieved_bpp": float(geometric_chosen["achieved_bpp"]),
+                "geometric_chosen_validation_kl": float(geometric_chosen["validation_kl"]),
+                "guarded_chosen_target_bpp": chosen.get("target_bpp"),
+                "guarded_chosen_achieved_bpp": float(chosen["achieved_bpp"]),
+                "guarded_chosen_validation_kl": float(chosen["validation_kl"]),
+            }
+    return chosen, {
+        "kneedle_score": float(knee_score),
+        "endpoint_fallback": bool(endpoint),
+        "leave_one_out": loo_diagnostic,
+        "selection_guard": selection_guard,
+    }
+
+
+def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
+    kl_noise_floor = _knee_kl_noise_floor(args)
+    runtime.output_root.mkdir(parents=True, exist_ok=True)
+
+    seed_results, seed_meta = _load_knee_seed_results(args, runtime)
+    seed_remeasure_meta = _remeasure_knee_seed_results(
+        args,
+        runtime,
+        seed_results,
+    )
+    candidates_by_hash: dict[str, dict] = {}
+    for result in seed_results:
+        row = _candidate_from_assignment(
+            assignment=result.assignment,
+            stats=runtime.stats,
+            specs=runtime.specs,
+            source="seed_frontier",
+            source_path=result.assignment_path or None,
+            target_bpp=result.target_bpp,
+            surrogate_loss=result.predicted_dloss,
+        )
+        row["validation_kl"] = float(result.validation_kl)
+        row["assignment_path"] = result.assignment_path
+        row["layer_config_path"] = result.layer_config_path
+        row["_validated"] = True
+        if _candidate_bpp_in_range(args, row):
+            _upsert_archive_candidate(candidates_by_hash, row)
+
+    anchor_hint = getattr(args, "target_bits_anchor", None)
+    if anchor_hint is None and seed_results:
+        anchor_hint = min(
+            seed_results,
+            key=lambda result: (
+                float(result.validation_kl),
+                abs(
+                    float(result.achieved_bpp)
+                    - (float(args.knee_bpp_min) + float(args.knee_bpp_max)) / 2.0
+                ),
+            ),
+        ).achieved_bpp
+    if anchor_hint is None:
+        anchor_hint = (float(args.knee_bpp_min) + float(args.knee_bpp_max)) / 2.0
+
+    resume_path = _resume_l3_cost_path_for_anchor(
+        args,
+        float(anchor_hint),
+        single_output=True,
+    )
+    anchor_assignment: dict[str, str]
+    anchor_assignment_path: Path | None = None
+    anchor_source = "unknown"
+    l3_costs: dict
+    l3_cost_history: list[dict]
+    l3_resumed = False
+    l3_resume_meta: dict = {}
+    if resume_path is not None:
+        unchecked = _load_l3_cost_payload_unchecked(Path(resume_path))
+        anchor_bpp = float(
+            unchecked.get("meta", {}).get("anchor_bpp", float(anchor_hint))
+        )
+        resumed_l3 = _load_l3_resume_costs(
+            Path(resume_path),
+            args=args,
+            runtime=runtime,
+            anchor_bpp=anchor_bpp,
+            prefix="[knee][archive]:",
+        )
+        l3_costs = resumed_l3.costs
+        l3_cost_history = resumed_l3.cost_history
+        l3_resumed = True
+        l3_resume_meta = {
+            "path": str(resumed_l3.path),
+            "mismatches": list(resumed_l3.mismatches),
+        }
+        anchor_assignment, anchor_assignment_path, anchor_source = (
+            _assignment_from_anchor_or_default(
+                args,
+                resume_path=Path(resume_path),
+                anchor_bpp=anchor_bpp,
+                stats=runtime.stats,
+                costs=runtime.current_costs,
+                specs=runtime.specs,
+            )
+        )
+        if anchor_source == "default" and seed_results:
+            best_seed = min(
+                seed_results,
+                key=lambda result: (
+                    float(result.validation_kl),
+                    abs(float(result.achieved_bpp) - float(anchor_bpp)),
+                ),
+            )
+            anchor_assignment = dict(best_seed.assignment)
+            anchor_assignment_path = (
+                Path(best_seed.assignment_path)
+                if best_seed.assignment_path
+                else None
+            )
+            anchor_source = "best_seed_frontier"
+    else:
+        anchor_bpp = float(anchor_hint)
+        anchor = run_anchor_budget(
+            args,
+            runtime,
+            anchor_bpp,
+            measure_all_formats=bool(getattr(args, "_l3_measure_all_formats", False)),
+        )
+        anchor_assignment = dict(anchor.l2_assignment)
+        anchor_assignment_path = Path(anchor.output_dir) / (
+            f"l2_assignment_bpp_{_bpp_label(anchor_bpp)}.json"
+        )
+        anchor_source = "fresh_anchor"
+        l3_costs = anchor.l3_costs
+        l3_cost_history = anchor.l3_cost_history
+
+    l3_costs_for_candidates = _l3_costs_as_predicted_dloss(l3_costs)
+    l3_candidates = build_l3_candidates(
+        runtime.stats,
+        l3_costs_for_candidates,
+        runtime.specs,
+    )
+    l3_candidates = _filter_l3_candidates_for_assignment(
+        l3_candidates,
+        anchor_assignment,
+    )
+    if not l3_candidates:
+        raise RuntimeError("knee archive search found no mutable L3 candidates")
+
+    lambda_grid = _lambda_grid_from_l3_candidates(
+        runtime.stats,
+        l3_candidates,
+        count=int(getattr(args, "knee_lambda_evaluations", 21)),
+        profile=runtime.profile,
+        specs=runtime.specs,
+    )
+    generated_by_hash: dict[str, dict] = {}
+    for lambda_penalty in lambda_grid:
+        assignment, chosen, solver_meta = solve_l3_lagrangian_assignment(
+            runtime.stats,
+            anchor_assignment,
+            l3_candidates,
+            runtime.specs,
+            lambda_penalty=float(lambda_penalty),
+            profile=runtime.profile,
+        )
+        row = _candidate_from_assignment(
+            assignment=assignment,
+            stats=runtime.stats,
+            specs=runtime.specs,
+            source="lambda_sandwich",
+            source_path=None,
+            target_bpp=solver_meta.get("achieved_bpp"),
+            surrogate_loss=solver_meta.get("surrogate_loss"),
+        )
+        row["lambda_penalty"] = float(lambda_penalty)
+        row["solver_meta"] = dict(solver_meta)
+        row["hamming_from_anchor"] = _hamming_count(anchor_assignment, assignment)
+        if not _candidate_bpp_in_range(args, row):
+            continue
+        previous = generated_by_hash.get(row["assignment_hash"])
+        if previous is None or (
+            float(row.get("surrogate_loss", float("inf"))),
+            float(row["achieved_bpp"]),
+        ) < (
+            float(previous.get("surrogate_loss", float("inf"))),
+            float(previous["achieved_bpp"]),
+        ):
+            generated_by_hash[row["assignment_hash"]] = row
+
+    generated_candidates, surrogate_meta = _select_lambda_archive_candidates(
+        list(generated_by_hash.values()),
+        limit=int(getattr(args, "knee_archive_validation_candidates", 9)),
+    )
+    for row in generated_candidates:
+        _upsert_archive_candidate(candidates_by_hash, row)
+    for path in getattr(args, "knee_include_assignment", None) or []:
+        assignment = _load_assignment_json(path)
+        assignment = _enforce_fused_assignment_coherence(
+            assignment,
+            runtime.specs,
+            profile=runtime.profile,
+        )
+        row = _candidate_from_assignment(
+            assignment=assignment,
+            stats=runtime.stats,
+            specs=runtime.specs,
+            source="included_assignment",
+            source_path=str(path),
+        )
+        if _candidate_bpp_in_range(args, row):
+            _upsert_archive_candidate(candidates_by_hash, row)
+
+    candidates = sorted(candidates_by_hash.values(), key=_archive_sort_key)
+    if len(candidates) < 3:
+        raise RuntimeError(
+            f"knee archive search has only {len(candidates)} candidate(s); "
+            "increase --knee-lambda-evaluations, widen --knee-bpp-min/max, "
+            "or include more seed assignments"
+        )
+
+    validated_dir = runtime.output_root / "archive_validated"
+    measured_count = 0
+    for index, row in enumerate(candidates):
+        assignment = dict(row["_assignment"])
+        if row.get("validation_kl") is None:
+            _emit(
+                f"[knee][archive][validate] {index + 1}/{len(candidates)} "
+                f"source={row['source']} bpp={row['achieved_bpp']:.4f} "
+                f"lambda={row.get('lambda_penalty')}"
+            )
+            row["validation_kl"] = float(
+                measure_assignment_kl(
+                    runtime.model,
+                    assignment,
+                    runtime.calib_ids,
+                    runtime.ref_log_probs,
+                    work_root=runtime.work_root,
+                    profile=runtime.profile,
+                    use_frozen_weight_cache=False,
+                )
+            )
+            measured_count += 1
+        if not row.get("assignment_path"):
+            label = f"{index:03d}_bpp_{float(row['achieved_bpp']):.4f}"
+            assignment_path, layer_config_path = _write_named_assignment_artifacts(
+                assignment,
+                assignment_path=validated_dir / f"assignment_{label}.json",
+                layer_config_path=validated_dir / f"layer_config_{label}.json",
+            )
+            row["assignment_path"] = str(assignment_path)
+            row["layer_config_path"] = str(layer_config_path)
+        row.pop("_assignment", None)
+        row.pop("_validated", None)
+
+    validated_frontier = _nondominated_validated_points(
+        candidates,
+        kl_noise_floor=kl_noise_floor,
+    )
+    chosen, selection_meta = _choose_validated_archive_knee(
+        args,
+        validated_frontier,
+        candidates,
+    )
+    chosen_assignment = _load_assignment_json(chosen["assignment_path"])
+    knee_assignment_path, knee_layer_config_path = _write_named_assignment_artifacts(
+        chosen_assignment,
+        assignment_path=runtime.output_root / "knee_assignment.json",
+        layer_config_path=runtime.output_root / "final_layer_config_knee.json",
+    )
+    knee = {
+        "mode": "lambda_sandwich_archive_kneedle",
+        "source": chosen["source"],
+        "achieved_bpp": float(chosen["achieved_bpp"]),
+        "target_bpp": chosen.get("target_bpp"),
+        "validation_kl": float(chosen["validation_kl"]),
+        "surrogate_loss": chosen.get("surrogate_loss"),
+        "lambda_penalty": chosen.get("lambda_penalty"),
+        "knee_kl_noise_floor": float(kl_noise_floor),
+        "assignment": str(knee_assignment_path),
+        "layer_config": str(knee_layer_config_path),
+        "format_histogram": chosen["format_histogram"],
+        **selection_meta,
+    }
+    _warn_endpoint_fallback("archive-knee", knee)
+    _warn_kneedle_instability("archive-knee", knee)
+    csv_path, json_path = _write_validated_frontier_outputs(
+        runtime.output_root,
+        candidates=candidates,
+        frontier=validated_frontier,
+        knee=knee,
+        metadata={
+            "mode": "lambda_sandwich_archive_kneedle",
+            "anchor_bpp": float(anchor_bpp),
+            "anchor_assignment": (
+                str(anchor_assignment_path) if anchor_assignment_path else None
+            ),
+            "anchor_assignment_source": anchor_source,
+            "l3_resumed": bool(l3_resumed),
+            "l3_resume": l3_resume_meta,
+            "l3_cost_history_entries": len(l3_cost_history),
+            "lambda_grid": [float(value) for value in lambda_grid],
+            "lambda_generated_unique": len(generated_by_hash),
+            "lambda_validated_selected": len(generated_candidates),
+            "validation_candidate_count": len(candidates),
+            "new_validation_measurements": int(measured_count),
+            "seed_frontier": seed_meta,
+            "seed_remeasurement": seed_remeasure_meta,
+            "surrogate_selection": surrogate_meta,
+            "knee_kl_noise_floor": float(kl_noise_floor),
+            "included_assignments": list(
+                getattr(args, "knee_include_assignment", None) or []
+            ),
+            **_l3_scope_metadata(args),
+            **_calibration_metadata(args),
+            "quality_note": (
+                "Candidates are generated by a Lagrangian sweep over one "
+                "cached L3 sandwich table, deduplicated by assignment hash, "
+                "then selected only from measured validation-KL Pareto points."
+            ),
+        },
+    )
+    with open(runtime.output_root / "summary.json", "w") as f:
+        json.dump(
+            {
+                "knee": knee,
+                "validated_frontier": str(json_path),
+                "validated_frontier_csv": str(csv_path),
+            },
+            f,
+            indent=2,
+        )
+    _emit("===== archive knee summary =====")
+    _emit(
+        f"Archive knee: bpp={knee['achieved_bpp']:.6f} "
+        f"KL={knee['validation_kl']:.12f} source={knee['source']}"
+    )
+    _emit(f"Knee config: {knee_layer_config_path}")
+    _emit(f"Validated frontier: {json_path}")
+    _emit("================================")
+    return 0
+
+
 def run_surrogate_knee_search(
     args,
     *,
@@ -6864,12 +7561,36 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     ap.add_argument(
+        "--knee-archive-search",
+        action="store_true",
+        help=(
+            "Generate a lambda-sandwich candidate archive from one cached L3 "
+            "table, validate candidates with real KL, and choose the measured "
+            "Pareto kneedle. This avoids target-budget probing."
+        ),
+    )
+    ap.add_argument(
+        "--knee-lambda-evaluations",
+        type=int,
+        default=21,
+        help="Number of Lagrangian lambda values to sweep for --knee-archive-search.",
+    )
+    ap.add_argument(
+        "--knee-archive-validation-candidates",
+        type=int,
+        default=9,
+        help=(
+            "Number of generated lambda-archive candidates to validate. "
+            "Validated seed/included assignments are added separately."
+        ),
+    )
+    ap.add_argument(
         "--knee-include-assignment",
         action="append",
         default=[],
         help=(
-            "Additional assignment JSON to validate during "
-            "--knee-surrogate-validate. May be repeated."
+            "Additional assignment JSON to validate during archive or "
+            "surrogate validation. May be repeated."
         ),
     )
     ap.add_argument(
@@ -7275,6 +7996,10 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("--knee-surrogate-bpp-step must be positive.")
         if args.knee_surrogate_validation_candidates < 0:
             ap.error("--knee-surrogate-validation-candidates must be non-negative.")
+        if args.knee_lambda_evaluations < 2:
+            ap.error("--knee-lambda-evaluations must be at least 2.")
+        if args.knee_archive_validation_candidates < 0:
+            ap.error("--knee-archive-validation-candidates must be non-negative.")
     if args.quality_equivalent_bits is not None:
         if args.quality_equivalent_bpp_min >= args.quality_equivalent_bits:
             ap.error(
@@ -7415,6 +8140,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_multi_budget(args, runtime)
     if args.knee_search and args.knee_surrogate_validate:
         return run_validated_surrogate_knee_search(args, runtime)
+    if args.knee_search and args.knee_archive_search:
+        return run_knee_archive_search(args, runtime)
     if args.knee_search:
         return run_knee_search(args, runtime)
     if args.quality_equivalent_bits is not None:
