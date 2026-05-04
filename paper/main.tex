@@ -351,49 +351,19 @@ Mixed-precision quantization sits on a directed acyclic graph of
 optimizations whose intermediate states are not propagated forward
 through the rest of the pipeline.
 
-Several related incidents shaped the same lesson, all of them
-quantization-pipeline issues rather than orthogonal bugs. \textsc{AWQ}
+A second instance of the same mechanism is the AWQ result: \textsc{AWQ}
 \cite{awq2024} was defaulted off in v1 after empirical bakeoffs showed
 it \emph{worsened} NVFP4 group quantization on most Linears, despite
-being a strict win on uniform-format $4$-bit settings (handover
-\texttt{.claude/prismaquant-handover-2026-04-29.md}, line 38). The
-HALO integration in \texttt{materialize\_tensors\_streaming} hung on
-Qwen-3.5/3.6 multimodal models at \texttt{apply\_halo\_to\_head} when
-tied embeddings collided with the \texttt{model.language\_model.*}
-body prefix; HALO was force-disabled in the launcher for those
-architectures (same handover, ``HALO Risks To Handle First''). HALO's
-topology coverage is also fragile: it handles standard
-\texttt{self\_attn.\{q,k,v,o\}\_proj} and dense
-\texttt{mlp.\{gate,up,down\}\_proj}, but Qwen-3.5's
-\texttt{linear\_attn.*} layers and DSv4's
-\texttt{wq\_a/wq\_b/wkv/wo\_a/wo\_b} plus hyper-connections plus
-packed routed experts produce silently incorrect rotations on the
-unsupported sites unless the profile declares per-architecture block
-specs. Onboarding Gemma~4 26B-A4B as a second base architecture
-(commit \texttt{7cd0d39}, ``framework: harden onboarding via Gemma 4
-smoke-out'') surfaced seven distinct framework issues that were
-Qwen-biased assumptions in \texttt{sensitivity\_probe},
-\texttt{export\_native\_compressed}, and the profile base class:
-\texttt{text\_config} key promotion for AutoConfig resolution, a
-plain-content calibration fallback for tokenizers without a chat
-template, an \texttt{on\_disk\_expert\_qname} indirection,
-profile-driven source-passthrough prefixes for vision/audio towers,
-profile-gated MTP materialization, fused-sibling auto-fill from vLLM's
-\texttt{packed\_modules\_mapping}, and a per-format toggle for whether
-the exporter emits 3D packed-MoE tensors or per-expert 2D splits.
-Even after those fixes, Gemma~4 served at $27$ tok/s but generated
-\emph{empty text}: a Gemma-specific expert-shard routing bug had BF16
-3D packed tensors landing in the wrong \texttt{w13\_weight} /
-\texttt{w2\_weight} slots, an export-side packing fault that no
-per-Linear cost model would have flagged because each individual
-Linear's quantization was correct. The per-Linear ``do no harm'' gate
-(commit \texttt{ed9c60c}) was added as a band-aid for the
-stacking-interference family: after GPTQ + scale-sweep, compare
-against pure RTN on the cached activations and revert if RTN beats the
-post-pass weight. The export-cache fingerprint fix (commit
-\texttt{7a3628e}) closes a related hazard: a per-layer export cache
-hit would otherwise bypass HALO rotation \emph{and} quantization,
-producing artifacts that disagreed with the recipe.
+being a strict win on uniform-format $4$-bit settings. The
+per-Linear ``do no harm'' gate (commit \texttt{ed9c60c}) was added as
+a direct band-aid for the same family: after GPTQ + scale-sweep,
+compare against pure RTN on the cached activations and revert that
+Linear if RTN beats the post-pass weight. Both observations are
+artifacts of the same structural property --- per-tensor wins that
+modify the activation distribution do not propagate that modification
+forward into the cost models the downstream wins consume, so
+cumulative recipes are not, in general, the composition of their
+individually-validated parts.
 
 \paragraph{What v1 leaves on the table.} The systematic gap v1 cannot
 close from the per-layer view is the joint-allocation question:
