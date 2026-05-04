@@ -314,6 +314,87 @@ $60{,}000$ downloads on Hugging Face in their first weeks of release,
 across a heterogeneous set of source architectures (dense, MoE, and
 native-FP8). v1 is a competitive shipping default in absolute terms.
 
+\paragraph{The stacking-interference failure mode.} The conventional
+intuition for per-tensor techniques is that they are \emph{additive} in
+single-format quantization: HALO reduces outliers, GPTQ minimizes the
+local quadratic, scale-sweep tunes the post-rotation per-tensor scale,
+block-output-match closes the residual block-level gap, and stacking
+them composes the gains. In a fixed-format setting (e.g.\ all
+NVFP4) this composition is empirically robust on the per-Linear
+metrics each pass optimizes against. In a mixed-precision setting it is
+not. Each pass operates on the activation distribution as modified by
+the previous pass, and the per-Linear cost models the passes consume
+are decoupled from the format choices that the allocator will eventually
+make for upstream Linears. The result is that pairs of individually
+validated wins can interfere catastrophically when stacked.
+
+The canonical empirical incident is recorded in the quality-wins audit
+on Qwen3-0.6B
+(handover \texttt{.claude/codex-handover-2026-04-29-pm.md}). Each of
+four wins (\texttt{PRISMAQUANT\_ACT\_CLIP\_QUANTILE}=$0.999$,
+\texttt{PRISMAQUANT\_GPTQ\_DAMP\_SWEEP}, \texttt{PRISMAQUANT\_BLOCK\_OUTPUT\_MATCH},
+\texttt{PRISMAQUANT\_DO\_NO\_HARM}) was validated individually on the
+\textsc{PrismaQuant} validator EVAL\_PROMPTS suite. \texttt{solo\_clip}
+alone moved PPL from $15.453$ (baseline) to $14.546$ ($-0.907$); the
+other three were neutral or near-neutral on Qwen3. The cumulative
+\texttt{full\_v2} configuration with all four wins enabled landed at PPL
+$14.987$, $-0.466$ from baseline --- materially \emph{worse} than
+\texttt{solo\_clip} alone. Roughly half the activation-clip benefit was
+lost. The mechanism, root-caused after the audit: the do-no-harm gate
+compares per-Linear MSE on \emph{unclipped} cached activations while
+GPTQ optimized that Linear's weight under \emph{clipped} activations.
+The post-pass weight is a better fit on the clipped activation
+distribution but appears worse on the unclipped one; the gate reverts
+clip-improved Linears back to RTN, undoing the upstream gain. This is
+exactly the AWQ-style interference pattern, and it is structural.
+Mixed-precision quantization sits on a directed acyclic graph of
+optimizations whose intermediate states are not propagated forward
+through the rest of the pipeline.
+
+Several related incidents shaped the same lesson, all of them
+quantization-pipeline issues rather than orthogonal bugs. \textsc{AWQ}
+\cite{awq2024} was defaulted off in v1 after empirical bakeoffs showed
+it \emph{worsened} NVFP4 group quantization on most Linears, despite
+being a strict win on uniform-format $4$-bit settings (handover
+\texttt{.claude/prismaquant-handover-2026-04-29.md}, line 38). The
+HALO integration in \texttt{materialize\_tensors\_streaming} hung on
+Qwen-3.5/3.6 multimodal models at \texttt{apply\_halo\_to\_head} when
+tied embeddings collided with the \texttt{model.language\_model.*}
+body prefix; HALO was force-disabled in the launcher for those
+architectures (same handover, ``HALO Risks To Handle First''). HALO's
+topology coverage is also fragile: it handles standard
+\texttt{self\_attn.\{q,k,v,o\}\_proj} and dense
+\texttt{mlp.\{gate,up,down\}\_proj}, but Qwen-3.5's
+\texttt{linear\_attn.*} layers and DSv4's
+\texttt{wq\_a/wq\_b/wkv/wo\_a/wo\_b} plus hyper-connections plus
+packed routed experts produce silently incorrect rotations on the
+unsupported sites unless the profile declares per-architecture block
+specs. Onboarding Gemma~4 26B-A4B as a second base architecture
+(commit \texttt{7cd0d39}, ``framework: harden onboarding via Gemma 4
+smoke-out'') surfaced seven distinct framework issues that were
+Qwen-biased assumptions in \texttt{sensitivity\_probe},
+\texttt{export\_native\_compressed}, and the profile base class:
+\texttt{text\_config} key promotion for AutoConfig resolution, a
+plain-content calibration fallback for tokenizers without a chat
+template, an \texttt{on\_disk\_expert\_qname} indirection,
+profile-driven source-passthrough prefixes for vision/audio towers,
+profile-gated MTP materialization, fused-sibling auto-fill from vLLM's
+\texttt{packed\_modules\_mapping}, and a per-format toggle for whether
+the exporter emits 3D packed-MoE tensors or per-expert 2D splits.
+Even after those fixes, Gemma~4 served at $27$ tok/s but generated
+\emph{empty text}: a Gemma-specific expert-shard routing bug had BF16
+3D packed tensors landing in the wrong \texttt{w13\_weight} /
+\texttt{w2\_weight} slots, an export-side packing fault that no
+per-Linear cost model would have flagged because each individual
+Linear's quantization was correct. The per-Linear ``do no harm'' gate
+(commit \texttt{ed9c60c}) was added as a band-aid for the
+stacking-interference family: after GPTQ + scale-sweep, compare
+against pure RTN on the cached activations and revert if RTN beats the
+post-pass weight. The export-cache fingerprint fix (commit
+\texttt{7a3628e}) closes a related hazard: a per-layer export cache
+hit would otherwise bypass HALO rotation \emph{and} quantization,
+producing artifacts that disagreed with the recipe.
+
 \paragraph{What v1 leaves on the table.} The systematic gap v1 cannot
 close from the per-layer view is the joint-allocation question:
 ``which Linear should pay an extra bit?'' Per-layer sensitivity
@@ -323,11 +404,19 @@ because end-KL depends on how a Linear's quantization error
 formats chosen for upstream Linears. v1's HAWQ-style allocator
 overspends on Linears with high local sensitivity but modest
 downstream impact, and underspends on Linears with low local
-sensitivity but errors that compound through later attention.
-PrismaSCOUT does not change a single per-Linear technique; it changes
-the allocator from \emph{additive surrogate cost} to \emph{validated
-end-KL on real assignments}, and it gates every shipping decision on a
-held-out KL measurement. The Qwen3.6-27B head-to-head in
+sensitivity but errors that compound through later attention. The
+stacking-interference failure mode of the previous paragraph is the
+mirror image of this gap on the per-tensor side: when upstream
+optimization decisions are not propagated into the cost model that
+downstream optimizations consume, the resulting cumulative recipe is
+not the composition of its individually-validated parts. PrismaSCOUT
+does not change a single per-Linear technique; it changes the
+allocator from \emph{additive surrogate cost} to \emph{validated end-KL
+on real assignments}, and it gates every shipping decision on a held-out
+KL measurement. The real-KL gate is also what catches the
+stacking-interference failure mode end-to-end --- if a recipe stack
+quietly regresses on real KL, no DP rearrangement of the per-Linear
+costs hides that fact. The Qwen3.6-27B head-to-head in
 Table~\ref{tab:27b_headline} is the empirical statement of this
 relationship: the per-Linear toolkit is held fixed, only the selection
 routine changes, and the resulting artifact is $11\%$ smaller and
