@@ -238,17 +238,51 @@ experts. End-to-end inference uses Blackwell-native kernels.
 \subsection{The \textsc{PrismaQuant}~v1 baseline and why it sets a hard bar}\label{subsec:v1}
 
 The artifact \textsc{PrismaSCOUT} replaces was not a weak baseline. The
-production \textsc{PrismaQuant}~v1 stack is a tuned per-tensor pipeline
-that combines several state-of-the-art techniques per Linear, with a
-per-layer sensitivity allocator on top. It is worth describing in its own
-right, both because PrismaSCOUT inherits it wholesale (only the selection
-routine changed in the head-to-head comparison of
-Table~\ref{tab:27b_headline}), and because understanding what v1 already
+defining feature of \textsc{PrismaQuant}~v1 is the \emph{mixed-precision
+allocator itself}: each Linear in the model independently picks its
+serving format from $\{$BF16, MXFP8, NVFP4, MXFP4, source-passthrough$\}$
+under a global bits-per-parameter budget, rather than every Linear
+sharing one quantization scheme as in single-format methods like GPTQ
+\cite{gptq2022} or AWQ \cite{awq2024}. A tuned per-tensor toolkit runs
+\emph{under} whatever format the allocator picks for a given Linear; the
+allocator decides where bits should be spent. v1 is worth describing in
+its own right both because PrismaSCOUT inherits it wholesale (only the
+selection routine changed in the head-to-head comparison of
+Table~\ref{tab:27b_headline}) and because understanding what v1 already
 captures clarifies which residual is left for joint-allocation methods to
 attack.
 
-\paragraph{The per-tensor toolkit.} For every quantizable Linear,
-v1 composes:
+\paragraph{The mixed-precision allocator.} For each Linear $i$ in the
+model, v1 enumerates a candidate menu
+$\Formats_i \subseteq \{$BF16, MXFP8, NVFP4, MXFP4, source-passthrough$\}$
+filtered by serving-time constraints (MXFP8 tile alignment for the
+target kernel, FlashInfer masks, source-dtype eligibility for
+passthrough), and assigns each candidate a per-Linear cost
+$u_i^{(1)}(f)$ from a HAWQ-style \cite{hawqv3} sensitivity probe fed by
+a multi-chunk empirical-Fisher accumulator. A multi-choice knapsack DP
+\[
+  \min_{\Assignment}\;\sum_i u_i^{(1)}(\Assignment_i) \quad
+  \text{s.t.}\quad \sum_i b_i(\Assignment_i)\,n_i \le B \cdot \sum_i n_i
+\]
+selects one format per Linear under the bits-per-parameter budget $B$,
+where $b_i(f)$ is the bit count for Linear $i$ at format $f$ and $n_i$
+is its parameter count. Fused-sibling coherence (q/k/v in attention,
+$\mathrm{gate\_up}$/$\mathrm{down}$ in MoE) is enforced natively by
+grouping siblings into refinement units that enumerate only joint
+sibling-coherent format combinations; joint-input-global-scale handling
+for fused attention is folded into the DP's transition costs. The
+output is a heterogeneous per-Linear assignment that may, for example,
+keep the highest-sensitivity attention output projection in BF16, the
+medium-sensitivity gate/up projections in MXFP8, the bulk dense MLPs
+in NVFP4, and (for native-FP8 source architectures) the down-projection
+verbatim from the source. This per-Linear heterogeneity is the
+operative quality lever; on the production Qwen-3.6 27B artifact, the
+allocator selects 117 BF16 Linears, 379 NVFP4 Linears, and 0 MXFP8
+Linears under the chosen budget --- a distribution no single-format
+method can produce.
+
+\paragraph{The per-tensor toolkit.} For each Linear, after the
+allocator has picked its format, v1 composes:
 
 \begin{itemize}[leftmargin=*,itemsep=2pt]
   \item \textbf{HALO rotation preprocessing} \cite{prismaquant} ---
@@ -285,28 +319,28 @@ v1 composes:
     activations.
 \end{itemize}
 
-The allocator on top is HAWQ-style per-layer sensitivity \cite{hawqv3}
-fed by a multi-chunk empirical-Fisher probe, with a multi-choice knapsack
-DP under the bit budget. Activation residency, fused-sibling coherence,
-shape constraints (e.g.\ MXFP8 tile alignment, FlashInfer kernel masks),
-and joint-input-global-scale handling for fused attention are all
-enforced inside the DP. The whole pipeline runs end-to-end on a UMA
-host with bounded memory.
+The whole pipeline (probe $\to$ allocator $\to$ per-tensor refinement
+$\to$ export) runs end-to-end on a UMA host with bounded memory.
 
-\paragraph{Why this works as well as it does.} Per-layer quantization
-error is, on most Linears in a modern transformer, well-modeled by a
-local quadratic $\tfrac12 \langle H_i, (W_i - \hat W_i)^2 \rangle$. Each
-component above attacks one term of this quadratic: HALO reduces
+\paragraph{Why this works as well as it does.} The combination divides
+the quantization problem cleanly into two layers. The mixed-precision
+allocator solves the \emph{global} question --- which Linears tolerate
+$4$-bit storage and which need $8$ or $16$ --- and the per-tensor
+toolkit solves the \emph{local} question --- given a chosen format,
+what is the lowest-error rounding for this specific weight matrix. Each
+per-tensor component attacks one term of the per-Linear quadratic
+$\tfrac12 \langle H_i, (W_i - \hat W_i)^2 \rangle$: HALO reduces
 $\|W_i - \hat W_i\|$ by spreading outliers; GPTQ minimizes
-$\langle H_i, (W_i - \hat W_i)^2 \rangle$ exactly under a fixed format;
+$\langle H_i, (W_i - \hat W_i)^2 \rangle$ under the chosen format;
 scale sweep tunes the post-rotation per-tensor scale to minimize the
 remaining error; block-output match closes the gap to the
 \emph{block-level} reference, absorbing some of the inter-Linear
-coupling without an explicit cross-layer cost model. The allocator's
-HAWQ-style sensitivity then spends bits on the Linears whose local
-quadratic has the largest top-eigenvalue. Each per-layer technique is
-narrow, principled, and composable; together they extract most of the
-per-Linear quantization headroom.
+coupling without an explicit cross-layer cost model. The HAWQ-style
+allocator then spends bits on the Linears whose local quadratic has
+the largest top eigenvalue. Each technique is narrow, principled, and
+composable inside its own layer; together they extract most of the
+per-Linear quantization headroom \emph{conditional on} a fixed
+allocation.
 
 The empirical evidence that this pipeline is strong is the community
 adoption: the public Qwen-3.6 27B, Qwen-3.5 122B-A10B, Qwen-3.6 35B-A3B,
