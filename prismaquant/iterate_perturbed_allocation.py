@@ -6168,6 +6168,7 @@ def _remeasure_knee_seed_results(
                     runtime.ref_log_probs,
                     work_root=runtime.work_root,
                     profile=runtime.profile,
+                    use_frozen_weight_cache=False,
                 )
             )
         measured_kl = float(measured_by_digest[digest])
