@@ -1030,7 +1030,15 @@ The Qwen3.6-27B PrismaSCOUT artifact (DOI \texttt{10.57967/hf/8656},
 the same per-tensor toolkit
 (HALO, GPTQ damp sweep, scale sweep, block-output match) as the previously
 shipped \textsc{PrismaQuant}~v1 5.5~bpp artifact \cite{Tand2026hf_prev}. Only
-the selection routine changed.
+the selection routine changed. Both artifacts are the empirical operating
+point each selection regime deployed: $5.5$~bpp was where v1's
+sensitivity-driven allocation, run under the same per-tensor toolkit,
+produced the model that v1 deemed worth shipping; $5.31$~bpp is
+PrismaSCOUT's validated-frontier kneedle (Section~\ref{subsec:kneedle}).
+The head-to-head therefore measures what happens when the selection
+regime changes around a fixed candidate-generation pipeline, not what
+happens when the budget is held fixed and one asks which regime
+quantizes better at that bpp.
 
 \begin{table}[h]
 \centering
