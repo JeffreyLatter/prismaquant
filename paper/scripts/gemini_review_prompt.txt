@@ -1,0 +1,157 @@
+You are a fresh peer reviewer for the academic paper at
+/home/rob/prismaquant/paper/main.tex (rendered PDF at
+/home/rob/prismaquant/paper/main.pdf).
+
+You have not seen this paper before. The codebase, handover notes, and
+prior multi-agent deliberation transcripts are all available to read,
+but you are reviewing the paper as it now stands, not the deliberation
+that produced it. Read-only review pass. Do not modify any files.
+
+================================================================
+Your charge
+================================================================
+
+Three orthogonal questions:
+
+1. CORRECTNESS. Are the load-bearing technical claims true? Specifically:
+   - The math definitions and notation (KL, multi-level cost hierarchy,
+     kneedle formula, monotone-non-regression proposition).
+   - The descriptions of the L1 / L2 / L3 cost hierarchy as actually
+     implemented in /home/rob/prismaquant/prismaquant/.
+   - The validated-frontier kneedle algorithm vs the code at
+     iterate_perturbed_allocation.py:segmented_kneedle_point and
+     adaptive_validated_frontier_kneedle.
+   - The historical attribution of commits / numerical incidents
+     (the stacking-interference paragraph in section 2.5, the AWQ
+     defaulted-off claim, the do-no-harm gate, the propagated-cost L3
+     paired-baseline semantics).
+   - The relationship between v1 (the per-Linear sensitivity allocator
+     plus per-tensor toolkit) and PrismaSCOUT (the validated-frontier
+     replacement of the selection routine, generating candidates from
+     the same v1 toolkit).
+   - The empirical numbers in section 7 against the model card at
+     huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm
+     (DOI 10.57967/hf/8656).
+   - The framing in section 7.2 that "5.5 bpp was where v1's
+     sensitivity-driven allocation produced the model that v1 deemed
+     worth shipping" and "5.31 is PrismaSCOUT's validated-frontier
+     kneedle" --- is the comparison framed honestly or does it overstate?
+
+2. PROFESSIONALISM. The paper is intended for the open ML/quantization
+   community, ultimately publishable on arXiv with a DOI. Specifically:
+   - Tone: is it consistent with a method/engineering paper, or does it
+     drift into blog-post register or insider language?
+   - Self-citation discipline: are claims supported by published work
+     where appropriate, and are unverified claims appropriately hedged?
+   - Honest accounting: section 7.3 reports a stable TC-42 regression
+     and an MMLU regression; is the framing fair, or does the paper
+     underplay or overplay the negatives?
+   - Acknowledgment integrity: the paper acknowledges Claude / Codex /
+     Gemini collaboration. Is this acknowledgment professional, or does
+     it raise red flags for an academic audience?
+   - Bibliography: are the entries specific, with full author lists,
+     real venues / arXiv IDs?
+   - Anything else that would embarrass the author at a workshop?
+
+3. NON-DATA GAPS. What's missing that an experienced reviewer would
+   want to see, and that DOES NOT require running new experiments?
+   For example:
+   - Missing definitions, missing figure references, missing notation
+     introductions.
+   - A theorem or proposition the paper makes a claim about but does
+     not formally state.
+   - A subsection the paper alludes to but never expands (e.g., what
+     does "leave-one-out diagnostic" do exactly --- does the description
+     match the figure?).
+   - An obvious related-work entry the paper should engage with but
+     does not.
+   - A control-flow diagram, sequence of operations, or algorithm box
+     that would clarify the pipeline if present.
+   - A limitations / honesty point that the paper hints at but does not
+     name explicitly.
+
+DO NOT raise items that would require new experiments to fill. We are
+not running new experiments; assume the empirical surface is fixed.
+DO raise items that are filled by re-stating, restructuring, defining,
+diagramming, or citing existing work.
+
+================================================================
+Source material to consult
+================================================================
+
+1. Paper source: /home/rob/prismaquant/paper/main.tex
+2. Paper PDF: /home/rob/prismaquant/paper/main.pdf  (use pdftotext if
+   you cannot view PDF directly)
+3. Figures: /home/rob/prismaquant/paper/figures/*.tex
+4. Codebase the paper describes: /home/rob/prismaquant/prismaquant/
+   (especially iterate_perturbed_allocation.py, propagated_cost.py,
+   perturbed_x_cache.py, allocator_solver.py, halo.py,
+   measure_quant_cost.py, kernels/nvfp4_fused.py)
+5. Documentation: /home/rob/prismaquant/docs/prismascout_overview.md,
+   /home/rob/prismaquant/docs/propagated_cost.md,
+   /home/rob/prismaquant/docs/halo/design.md
+6. Handover record:
+   /home/rob/prismaquant/.claude/prismaquant-handover-2026-04-29.md,
+   /home/rob/prismaquant/.claude/codex-handover-2026-04-29-pm.md,
+   /home/rob/prismaquant/.claude/prismaquant-handover-2026-05-01.md,
+   /home/rob/prismaquant/.claude/prismaquant-handover-2026-05-02.md,
+   /home/rob/prismaquant/docs/prismascout_handover_2026-05-03.md
+7. Prior deliberation (use as background, not as load-bearing source):
+   /home/rob/prismaquant/scratch/deliberation/*.md
+8. Git history:
+   `git -C /home/rob/prismaquant log --oneline -200`
+   `git -C /home/rob/prismaquant show <sha>` for any commit referenced
+   in the paper (e.g. 2e670b3, 444bc28, 7a3628e, ed9c60c, fcf2bf9,
+   d48575c, 7cd0d39, 705fbcd, 0bf4146, 0cbaddb, 7884536, 9ef0a05,
+   a5d13db).
+9. Published HF artifact:
+   https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm
+
+================================================================
+Output format (write to stdout)
+================================================================
+
+Open with: "Gemini fresh-session review of PrismaQuant/PrismaSCOUT paper, dated <today>"
+
+Then in this order:
+
+## 1. Headline assessment
+3-5 bullets. The most important takeaways. State plainly: is this paper
+in publishable shape, in shape with major revisions, or not yet
+publishable? Be direct.
+
+## 2. Correctness issues
+Numbered list. For each: location (section / equation / figure / line),
+the problem, and a concrete fix. Skip items already known to have been
+addressed in commits 2e670b3, 444bc28, e00851f, 8f050df, 049e348,
+39f9c9c, 93b12ed, ab12d67, a889a94, 682736d, 304939f, 06f02b3 ---
+these were the response to a prior Codex review pass and you are not
+asked to re-litigate them.
+
+## 3. Professionalism issues
+Numbered list. Same format. Tone, hedging, attribution, bibliography
+discipline, self-citation, honest accounting.
+
+## 4. Non-data gaps
+Numbered list. Things missing that should be added without running
+new experiments. Each item: what is missing, why it matters, where it
+should land in the paper, and what the inserted content should look
+like.
+
+## 5. What's done well
+Brief --- keep the review balanced, but do not be sycophantic. If
+nothing is done well, say so.
+
+## 6. Recommendation
+One of: ready-for-arxiv, accept-with-minor-revisions,
+accept-with-major-revisions, not-yet-publishable. Followed by 2-3
+sentences of justification.
+
+================================================================
+Length and tone
+================================================================
+
+Keep the review under ~2000 words. Bias toward concrete, actionable
+critiques over abstract observations. The author wants pushback ---
+state disagreements with the paper's framing plainly. Do not be polite
+at the expense of accuracy.

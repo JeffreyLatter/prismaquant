@@ -1,0 +1,43 @@
+Gemini fresh-session review of PrismaQuant/PrismaSCOUT paper, dated May 4, 2026
+
+## 1. Headline assessment
+*   **Highly Technical and Grounded:** The paper is a rigorous engineering report on a production system. Its core claim—that end-to-end KL divergence is non-monotone with respect to surrogate costs—is empirically validated and provides a strong foundation for the "SCOUT" methodology.
+*   **Empirically Significant:** The Qwen3.6-27B results (11% size reduction, 68% lower KL) are exceptional and represent a major improvement over an already strong v1 baseline.
+*   **Status: Accept with Minor Revisions.** The paper is technically sound and professionally written, but it suffers from several "presentation gaps" (missing figure references, informal algorithm description) and an unconventional (though transparent) approach to AI collaboration disclosure that might need tuning for a traditional academic venue.
+*   **Honest Accounting:** The inclusion of downstream benchmark regressions (MMLU, TC-42) is a mark of high integrity, distinguishing this from typical "SOTA-chasing" papers.
+
+## 2. Correctness issues
+1.  **Figure 13 (Qwen 27B Frontier) Data Non-Monotonicity:** The paper claims (Line 1056) that "the surrogate kneedle on the same candidate set picks 5.857 bpp / KL 0.056... the validated kneedle picks 5.31 bpp / KL 0.015." Looking at Figure 13, the point at 5.50 bpp (v1 ship) sits at KL 0.0475, which is *lower* than the surrogate knee at 5.86 bpp. While this supports the non-additivity claim, the text should explicitly clarify how v1 reached 5.50 bpp if the surrogate kneedle was at 5.86. **Concrete fix:** Add a sentence in Section 7.2 explaining whether the v1 5.50 bpp operating point was a manual choice or a kneedle from an earlier, less-saturated cost hierarchy (L1/L2 only).
+2.  **Equation 1 (KL definition):** The notation $\kl(\Assignment)$ is standard, but in the context of sequence models, it is technically the *mean token-level KL* over a calibration set. The paper should define the aggregation over sequence length $T$ and calibration samples $N$. **Concrete fix:** Update Equation 1 to explicitly show the sum/mean over tokens and samples: $\frac{1}{N \cdot T} \sum_{n, t} \kl[\dots]$.
+3.  **L2 Convergence Criterion:** Section 3.4 (Line 514) mentions convergence but does not define it. The Appendix (Line 1152) defines it as "weighted-Hamming flip ratio < 0.01." **Concrete fix:** Move the definition of the convergence threshold and the "weighted-Hamming" metric into Section 3.4.
+4.  **Proposition 1 (Monotone non-regression):** The proposition is technically a tautology given the algorithm's acceptance criterion ($K(\Assignment^{(t+1)}) < K(\Assignment^{(t)})$). It is "correct," but its value is in defining the *contract* between the developer and the evaluator, not in a mathematical discovery. **Concrete fix:** Reframe Proposition 1 as a "Design Guarantee" rather than a formal mathematical proof, and explicitly mention the $\epsilon = 1 \times 10^{-12}$ stability floor used in the code (`iterate_perturbed_allocation.py:3203`).
+
+## 3. Professionalism issues
+1.  **AI Collaboration Acknowledgment:** The acknowledgment section (Line 1195) is exceptionally thorough but may be perceived as "insider language" in some academic venues. Stating that Gemini 3.1 Pro provided the "mathematical formalism" for rejected methods is honest, but potentially provocative for reviewers. **Recommendation:** Keep the transparency but perhaps streamline the phrasing to: "The author acknowledges technical consultation with several large language models during the design and review phases."
+2.  **Self-Citation Discipline:** The paper refers to "PrismaQuant v1" as a "competitive shipping default" (Line 314). While backed by download stats, the comparison in Table 1 is essentially "Self (v2) vs Self (v1)." **Concrete fix:** Add a baseline from a standard single-format method (e.g., GPTQ 4-bit or 6-bit) to Table 1 to anchor the results for readers unfamiliar with the PrismaQuant ecosystem.
+3.  **Bibliography Integrity:** Citation `Tand2026hf` (Line 1245) is a Hugging Face model card. While appropriate for this community, ensure the "DOI 10.57967/hf/8656" is properly formatted and clickable in the PDF.
+4.  **Tone:** The paper is professional throughout, but Section 6.1 ("The math is correct") is a bit informal. **Concrete fix:** Change "The math is correct" to "Theoretical Optimality."
+
+## 4. Non-data gaps
+1.  **Missing Figure References:** Multiple figures are input but never explicitly referenced by number in the text, leaving the reader to "stumble" upon them.
+    *   **Figure 2 (Cost Hierarchy):** Not referenced in 3.4.
+    *   **Figure 3 (Kneedle Geometry):** Not referenced in 3.5.
+    *   **Figure 6 (Coord Descent):** Not referenced in 3.7.
+    *   **Figure 7 (Pipeline):** Not referenced in 4.1.
+    *   **Figure 8 (Calibration Split):** Not referenced in 4.3.
+    *   **Figure 10 (Method Decision Tree):** Not referenced in 6.0.
+    **Concrete fix:** Add `(Figure~\ref{fig:...})` to the first paragraph of each corresponding section.
+2.  **Algorithm Box:** The SCOUT algorithm is described in text but missing a formal pseudocode block. An experienced reviewer will want to see the nested loops (Budgets -> L1/L2/L3 -> Kneedle -> Polish) in one place. **Concrete fix:** Insert a `float` environment with an `algorithmic` block in Section 4 summarizing the `PrismaSCOUT` procedure.
+3.  **L3 Neighborhood Selection Details:** Section 4.1 says "select a bounded neighborhood." The text never explains *how* the 5-30% of Linears are chosen (e.g., top-K by L2 margin). **Concrete fix:** Add a paragraph in 3.4 explaining the selection criteria (Linears near a format flip-point in the DP, high-uncertainty layers, etc.).
+4.  **Control-Flow vs. Data-Flow:** Figure 7 is a control-flow diagram. A diagram showing the *data-flow* (Calibration Tokens -> Hooks -> Activation Cache -> DP) would clarify the $L_2/L_3$ implementation.
+5.  **Related Work - Single-Format Baselines:** The paper focuses on other allocators (HAWQ, CLADO). It should more explicitly mention how single-format methods (like Quark or OmniQuant) compare to the "v1 toolkit" described in Section 2.1.
+
+## 5. What's done well
+*   **Engineering Depth:** The discussion of CUDA graphs, UMA memory constraints, and lane-batching (Section 6) is excellent. It moves the paper from "idealized math" to "practical implementation."
+*   **The "Rejected Methods" Catalog:** Section 6 is a highlight. Explaining *why* attractive ideas (like $\lambda$-bisection) fail in practice is highly valuable for the community.
+*   **Empirical Visuals:** Figure 13 is a "smoking gun" for the whole paper. The fact that the frontier is non-monotone in measured KL while being monotone in surrogate cost is the strongest possible justification for the work.
+
+## 6. Recommendation
+**Accept with minor revisions.**
+
+The paper represents a significant contribution to the operational side of LLM quantization. It identifies a structural flaw in existing allocation surrogates and provides a robust, engineered solution that fits on a single Blackwell workstation. Once the missing figure references are fixed and the algorithm is formally boxed, it will be in excellent shape for arXiv or a workshop.

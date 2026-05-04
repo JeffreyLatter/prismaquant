@@ -18,6 +18,8 @@
 \usepackage{tabularx}
 \usepackage{verbatim}
 \usepackage{url}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
 
 \definecolor{accent}{HTML}{1f3a93}
 \definecolor{accent2}{HTML}{c0392b}
@@ -415,9 +417,15 @@ $\mathcal{D}$ over input prefixes $x_{1:t}$, the operational quality of
 $\Assignment$ is
 
 \begin{equation}\label{eq:kl}
-  \kl(\Assignment) \;=\; \E_{x \sim \mathcal{D}}\,
-   \kl\!\left[\,p_\theta(\,\cdot \mid x)\,\big\|\,p_{\hat\theta}(\,\cdot \mid x)\,\right].
+  \kl(\Assignment) \;=\;
+   \frac{1}{N\,T}\sum_{n=1}^{N}\sum_{t=1}^{T_n}
+   \kl\!\left[\,p_\theta(\,\cdot \mid x^{(n)}_{1:t})\,\big\|\,
+                p_{\hat\theta}(\,\cdot \mid x^{(n)}_{1:t})\,\right],
 \end{equation}
+
+\noindent that is, the per-token KL between teacher and quantized
+model averaged over $T = \sum_n T_n$ non-padding positions in $N$
+calibration prefixes.
 
 KL is the natural objective for ``does the quantized model behave like the
 teacher?'' because it captures the entire output distribution and not merely
@@ -477,7 +485,8 @@ where the cost hierarchy enters.
 
 \subsection{The cost hierarchy}\label{subsec:hierarchy}
 
-\textsc{PrismaSCOUT} runs three escalating cost models on the same problem.
+\textsc{PrismaSCOUT} runs three escalating cost models on the same problem
+(Figure~\ref{fig:cost_hierarchy}).
 
 \begin{description}[leftmargin=2em,style=nextline]
   \item[$L_1$ probe ($\sim$\,seconds per Linear).] A coarse per-matrix
@@ -510,10 +519,15 @@ where the cost hierarchy enters.
     $\Delta\mathrm{loss}$/Fisher-trace cost machinery as $L_1$. The DP solves
     under $u^{(2)}$, producing $\Assignment^{(k+1)}$. The fixed-point
     iteration $\Assignment \to X \to u^{(2)} \to \Assignment$ typically
-    converges in $2$--$3$ iterations on the models we have measured;
-    convergence is declared when the weighted-Hamming flip ratio between
-    successive assignments falls below \texttt{convergence-frac} (default
-    $0.01$). Inter-layer coupling enters through the activation cache:
+    converges in $2$--$3$ iterations on the models we have measured.
+    Convergence is declared when the weighted-Hamming flip ratio
+    \[
+      h^{(k)} \;=\;
+      \frac{\sum_{i:\,\Assignment^{(k+1)}_i \neq \Assignment^{(k)}_i} n_i}{\sum_i n_i}
+    \]
+    (parameter-count weighted, with $n_i$ the parameter count of Linear
+    $i$) falls below \texttt{convergence-frac} (default $0.01$).
+    Inter-layer coupling enters through the activation cache:
     late-layer activations under a low-bit early-layer assignment differ
     from BF16 activations, and the per-Linear cost adapts.
   \item[$L_3$ propagated cost ($\sim$\,tens of minutes).] An end-KL
@@ -542,7 +556,9 @@ unary cost for a final DP.
 
 \subsection{The validated-frontier kneedle}\label{subsec:kneedle}
 
-After the cost hierarchy generates a set of candidate assignments
+The validated-frontier construction is sketched in
+Figure~\ref{fig:kneedle}. After the cost hierarchy generates a set of
+candidate assignments
 $\{\Assignment^{(j)}\}$ at multiple budgets, each candidate is materialized,
 forwarded against the held-out calibration split, and assigned a measured pair
 $(\bpp(\Assignment^{(j)}),\,\kl(\Assignment^{(j)}))$. The Pareto frontier of
@@ -596,41 +612,59 @@ wide or the frontier is under-sampled near the knee.
 
 \subsection{Coordinate descent as monotone polish}\label{subsec:coord}
 
-\begin{proposition}[Monotone non-regression of coord-descent polish]\label{prop:monotone}
-Fix a calibration prefix set $C$, a deterministic logits evaluator $\mathcal{E}$
-(model class, kernel selection, RNG state, and quantization rounding mode all
-held constant), and a fused-sibling-coherent move set $\mathcal{M}$. Write
-$K(\Assignment) \;\equiv\; \kl(\Assignment;\,C,\,\mathcal{E})$ for the KL
-measured against this fixed pair. Let $\Assignment^{(0)}$ be the chosen knee
-assignment with $\kappa_0 = K(\Assignment^{(0)})$. The coord-descent polish
-iterates single-refinement-unit flips
-$\Assignment^{(t+1)} = \Assignment^{(t)}\!\big[i \to f^\star\big]$ drawn from
-$\mathcal{M}$ and accepts only flips that strictly satisfy
-$K(\Assignment^{(t+1)}) < K(\Assignment^{(t)})$. The output assignment
-$\Assignment^{(\infty)}$ satisfies $K(\Assignment^{(\infty)}) \le \kappa_0$.
+The polish trace is illustrated in Figure~\ref{fig:coord_descent}.
+
+The polish does not produce a mathematical discovery; it provides a
+contractual guarantee that the shipped assignment cannot be worse than
+the chosen frontier point under the polish-time evaluator. We state the
+contract formally so that what it covers, and what it does not, is
+explicit.
+
+\begin{proposition}[Design guarantee, monotone non-regression of coord-descent polish]\label{prop:monotone}
+Fix a calibration prefix set $C$, a deterministic logits evaluator
+$\mathcal{E}$ (model class, kernel selection, RNG state, and
+quantization rounding mode all held constant), a fused-sibling-coherent
+move set $\mathcal{M}$, and a numerical-stability tolerance
+$\varepsilon \ge 0$. Write $K(\Assignment) \equiv \kl(\Assignment;\,C,\,\mathcal{E})$
+for the KL measured against this fixed pair. Let $\Assignment^{(0)}$ be
+the chosen knee assignment with $\kappa_0 = K(\Assignment^{(0)})$. The
+coord-descent polish iterates single-refinement-unit flips
+$\Assignment^{(t+1)} = \Assignment^{(t)}\!\big[i \to f^\star\big]$
+drawn from $\mathcal{M}$ and accepts only flips that satisfy
+$K(\Assignment^{(t+1)}) < K(\Assignment^{(t)}) - \varepsilon$. Then the
+output assignment $\Assignment^{(\infty)}$ satisfies
+$K(\Assignment^{(\infty)}) \le \kappa_0$.
 \end{proposition}
 
 \begin{proof}
 Each accepted flip strictly decreases $K$ on the fixed $(C, \mathcal{E})$
-pair; rejected flips leave the assignment and $K$ unchanged. The sequence
-$\{K(\Assignment^{(t)})\}$ is monotone non-increasing.
+pair by more than $\varepsilon$; rejected flips leave the assignment
+and $K$ unchanged. The sequence $\{K(\Assignment^{(t)})\}$ is monotone
+non-increasing.
 \end{proof}
 
-\begin{remark}
+The implementation uses $\varepsilon = 10^{-12}$ as a numerical-stability
+floor (strict less-than under floating-point roundoff;
+\texttt{coordinate\_descent\_polish} in
+\texttt{iterate\_perturbed\_allocation.py}). The proof is one line; the
+load-bearing content is the proposition's scope.
+
+\begin{remark}\label{rem:monotone_scope}
 Proposition~\ref{prop:monotone} guarantees non-regression on the
 calibration prefix set, the evaluator, and the move set fixed at polish
 time. It does not extend to (i) a different held-out calibration set,
-(ii) a different evaluator (e.g.\ post-export inference engine, alternate
-kernel choice), or (iii) post-polish assignment mutation outside
-$\mathcal{M}$ (e.g.\ exporter-side fused-sibling rewrites, format coercions
-imposed by serving constraints). The shipped artifact is therefore
-re-validated end-to-end after export to bound the residual divergence
-between the polish-time evaluator and the production inference engine.
+(ii) a different evaluator (e.g.\ post-export inference engine,
+alternate kernel choice), or (iii) post-polish assignment mutation
+outside $\mathcal{M}$ (e.g.\ exporter-side fused-sibling rewrites,
+format coercions imposed by serving constraints). The shipped artifact
+is therefore re-validated end-to-end after export to bound the residual
+divergence between the polish-time evaluator and the production
+inference engine.
 \end{remark}
 
-The proposition is trivial; the operationally important point is that the
-polish does not need a cost model. It does not need to predict the change in
-KL; it measures it. The flip ranking comes from $L_3$ unary costs (cheap), the
+The operationally important point is that the polish does not need a
+cost model. It does not need to predict the change in KL; it measures
+it. The flip ranking comes from $L_3$ unary costs (cheap), the
 acceptance criterion is real KL on held-out (slow but rare). On Qwen3.6-4B at
 the 4.5~bpp anchor, coord descent committed 6 flips out of 101 attempts and
 moved KL from $0.371$ (post-$L_2$) to $0.245$, a $34\%$ improvement. None of
@@ -643,7 +677,8 @@ rejected by the surrogate's predicted-cost ranking but accepted by real KL.
 
 \subsection{Pipeline}
 
-For each anchor budget $B$:
+The full pipeline is summarized in Figure~\ref{fig:pipeline} and
+Algorithm~\ref{alg:scout}. For each anchor budget $B$:
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
   \item \textbf{Probe ($L_1$).} Fisher-weighted MSE per (Linear, format).
     Solve additive DP at $B$ to get $\Assignment^{(0)}$.
@@ -670,6 +705,70 @@ coordinate-descent polish (Section~\ref{subsec:coord}). Record audit trail.
 
 \input{figures/fig_pipeline.tex}
 
+\subsection{$L_3$ neighborhood selection}\label{subsec:l3_selection}
+
+The $L_3$ measurement budget is bounded; we cannot afford to measure
+every (Linear, format) pair on a large model. The pipeline therefore
+selects a bounded \emph{neighborhood} of candidate Linears around the
+converged $L_2$ assignment, prioritized as follows:
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+  \item \textbf{Uncertain DP choices.} Linears whose $L_2$
+    second-best format is within \texttt{l3-uncertainty-rel-tol}
+    (default $0.10$) of the chosen format under $u^{(2)}$. These are
+    the Linears the additive DP could plausibly have flipped under a
+    small perturbation of the cost.
+  \item \textbf{Non-cheapest current picks.} Linears whose current
+    $L_2$ choice is more expensive (in bits) than the cheapest measured
+    format that does not break the bit budget elsewhere; these are the
+    candidates for trading bits down with end-KL gating.
+  \item \textbf{High-cost safety set.} A small fraction
+    (\texttt{l3-safety-fraction}, default $0.02$) of the
+    highest-predicted-cost Linears, regardless of uncertainty, to
+    catch high-impact picks that were not flagged by the uncertainty
+    filter.
+  \item \textbf{Fill to minimum coverage.} If the above sets jointly
+    cover fewer than \texttt{l3-min-fraction} (default $0.05$) of
+    Linears, additional non-cheapest picks are added to reach that
+    floor; the union is hard-capped at \texttt{l3-max-fraction}
+    (default $0.30$).
+\end{enumerate}
+For each selected Linear, $L_3$ measures the current $L_2$ pick, one
+cheaper format, one more accurate format, and BF16 when available; the
+final DP runs only over candidates with measured $L_3$ costs and a
+measured current-format candidate.
+
+\begin{algorithm}[h]
+\caption{\textsc{PrismaSCOUT} (validated-frontier knee mode)}\label{alg:scout}
+\begin{algorithmic}[1]
+\Require source weights $\theta$, calibration splits $C_{\mathrm{train}}$,
+  $C_{\mathrm{val}}$, format menu $\Formats_i$ per Linear, anchor
+  budget set $\{B_j\}$, KL noise floor $\eta$, bisection tolerance
+  $\tau$
+\State $u^{(1)} \gets \textsc{Probe}(\theta, C_{\mathrm{train}})$ \Comment{$L_1$ Fisher-trace probe}
+\For{each anchor budget $B_j$}
+  \State $\Assignment^{(0)} \gets \textsc{DP}(u^{(1)}, B_j)$
+  \For{$k = 0, 1, \dots$}\Comment{$L_2$ perturbed-X fixed point}
+    \State $X^{(k)} \gets \textsc{ActCache}(\theta, \Assignment^{(k)}, C_{\mathrm{train}})$
+    \State $u^{(2)} \gets \textsc{MeasureLocalMSE}(\theta, X^{(k)}, \Formats)$
+    \State $\Assignment^{(k+1)} \gets \textsc{DP}_{\mathrm{Hamming-cap}}(u^{(2)}, B_j, \Assignment^{(k)})$
+    \If{$h^{(k)} < \texttt{convergence-frac}$} \textbf{break} \EndIf
+  \EndFor
+  \State $\mathcal{N} \gets \textsc{L3Neighborhood}(\Assignment^{(k)}, u^{(2)})$
+  \State $u^{(3)} \gets \textsc{MeasurePropagatedKL}(\theta, \Assignment^{(k)}, \mathcal{N}, C_{\mathrm{train}})$
+  \State $\Assignment_j \gets \textsc{DP}_{\mathrm{frozen}}(u^{(3)}, B_j, \mathcal{N}, \Assignment^{(k)})$
+  \State $\kappa_j \gets \kl(\Assignment_j;\,C_{\mathrm{val}})$ \Comment{real-KL gate}
+  \If{$\kappa_j > \kl(\Assignment^{(k)}) + \rho\,\kl(\Assignment^{(k)})$}
+    $\Assignment_j \gets \Assignment^{(k)}$ \Comment{rollback}
+  \EndIf
+\EndFor
+\State $\mathcal{F} \gets \textsc{Pareto}_{\eta}\{(\bpp(\Assignment_j),\,\kappa_j)\}$ \Comment{$\eta$-non-dominated}
+\State $\Assignment^\star \gets \textsc{Kneedle}(\mathcal{F};\,\tau)$ \Comment{Equation~\eqref{eq:kneedle}}
+\State $\Assignment^\star \gets \textsc{LeaveOneOutGuard}(\mathcal{F},\Assignment^\star)$
+\State $\Assignment^\star \gets \textsc{CoordDescent}(\Assignment^\star,\,C_{\mathrm{val}})$ \Comment{Proposition~\ref{prop:monotone}}
+\State \Return $\Assignment^\star$
+\end{algorithmic}
+\end{algorithm}
+
 \subsection{The DP and fused-sibling constraints}
 
 The allocator solves an additive multi-choice knapsack DP whose
@@ -685,6 +784,7 @@ comparison in Appendix~\ref{app:fused}.
 
 \subsection{Calibration disjointness}\label{subsec:disjoint}
 
+The split discipline is summarized in Figure~\ref{fig:calib_split}.
 \textsc{PrismaSCOUT} maintains two disjoint calibration splits:
 
 \begin{itemize}[leftmargin=*,itemsep=2pt]
@@ -713,6 +813,8 @@ between several principled alternatives. We describe each, the math behind
 it, and the empirical or structural reason it was not adopted as the default.
 The intent is not exhaustiveness for its own sake --- it is to make explicit
 that simpler, mathematically attractive answers were considered first.
+Figure~\ref{fig:methods_tree} catalogs the full set, classified as
+shipped, experimental, or rejected.
 
 \subsection{Lagrangian \texorpdfstring{$\lambda$}{lambda}-bisection on the dual gradient}\label{subsec:lambda}
 
@@ -728,9 +830,9 @@ $B^\star(\lambda)$ is the subgradient of the dual function. The kneedle is
 the region of maximum $|dB^\star/d\lambda|$ on log-$\lambda$. A few-step
 bisection on $\lambda$ produces the kneedle without sweeping the full grid.
 
-\paragraph{The math is correct.} For a strictly convex frontier, the proposal
-is optimal: $5$--$7$ $\lambda$ evaluations isolate the kneedle to within
-$0.04$ bpp.
+\paragraph{Theoretical optimality.} For a strictly convex frontier, the
+proposal is optimal: $5$--$7$ $\lambda$ evaluations isolate the kneedle
+to within $0.04$ bpp.
 
 \paragraph{Why we did not adopt it as the default.} Two reasons.
 
@@ -1221,14 +1323,13 @@ visible there.
 
 \section*{Acknowledgments}
 
-The author thanks two LLM collaborators (\textsc{Claude} and \textsc{Codex})
-for sustained design and implementation help, and \textsc{Gemini~3.1~Pro}
-for the mathematical formalism (Lagrangian dual analysis, sandwich
-proximal-descent argument, block-DP clique structure, probe error bounds)
-that produced the rejected-methods catalog of Section~\ref{sec:rejected}.
-Where their contributions are load-bearing for the paper's narrative, the
-relevant deliberation transcripts are preserved in
-\texttt{scratch/deliberation/} of the source repository for future audit.
+The author acknowledges substantive technical consultation with several
+large language model assistants during the design, implementation, and
+review phases of this work, including the mathematical analysis of the
+alternatives surveyed in Section~\ref{sec:rejected}. Deliberation
+transcripts where the consultation was load-bearing for the paper's
+narrative are preserved in \texttt{scratch/deliberation/} of the source
+repository for audit.
 
 \renewcommand{\refname}{References}
 
