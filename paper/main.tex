@@ -226,7 +226,7 @@ MXFP4 weight-only Linears cost $4 + 8/32 = 4.25$\,bpp. Modern
 Blackwell/Hopper GPUs offer first-class kernels for both. Mixed precision in
 this paper means an assignment
 $\Assignment : \Linears \to \Formats$ where each Linear independently
-selects from $\{$BF16, MXFP8, NVFP4, MXFP4, NVINT3, $\dots\}$, subject to
+selects from $\{$BF16, MXFP8, NVFP4, MXFP4, $\dots\}$, subject to
 fused-sibling constraints in attention ($q,k,v$) and MoE
 ($\mathrm{gate\_up},\mathrm{down}$).
 
