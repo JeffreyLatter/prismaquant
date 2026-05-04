@@ -276,10 +276,10 @@ keep the highest-sensitivity attention output projection in BF16, the
 medium-sensitivity gate/up projections in MXFP8, the bulk dense MLPs
 in NVFP4, and (for native-FP8 source architectures) the down-projection
 verbatim from the source. This per-Linear heterogeneity is the
-operative quality lever; on the production Qwen-3.6 27B artifact, the
-allocator selects 117 BF16 Linears, 379 NVFP4 Linears, and 0 MXFP8
-Linears under the chosen budget --- a distribution no single-format
-method can produce.
+operative quality lever: the shipped v1 Qwen-3.6 27B 5.5 bpp artifact,
+for example, mixes BF16, MXFP8, and NVFP4 Linears within a single
+model (the vLLM serve dispatches all three kernels at load time) ---
+a distribution no single-format method can produce.
 
 \paragraph{The per-tensor toolkit.} For each Linear, after the
 allocator has picked its format, v1 composes:
