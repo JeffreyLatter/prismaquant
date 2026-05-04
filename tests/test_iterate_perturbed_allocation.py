@@ -2971,6 +2971,118 @@ def test_knee_archive_search_validates_lambda_archive(tmp_path, monkeypatch):
     assert frontier["metadata"]["lambda_generated_unique"] >= 3
 
 
+def test_knee_archive_fresh_anchor_honors_measure_all_formats(
+    tmp_path, monkeypatch
+):
+    stats = {
+        "layer0": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        },
+        "layer1": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        },
+        "layer2": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        },
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    current_costs = {
+        name: {
+            "NVFP4": {"predicted_dloss": 1.0},
+            "BF16": {"predicted_dloss": 0.0},
+        }
+        for name in stats
+    }
+    l3_costs = {
+        "layer0": {
+            "NVFP4": {"propagated_end_kl": 0.01},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer1": {
+            "NVFP4": {"propagated_end_kl": 0.20},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer2": {
+            "NVFP4": {"propagated_end_kl": 0.80},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+    }
+    captured = {}
+    anchor_assignment = {name: "NVFP4" for name in stats}
+
+    def _fake_anchor(_args, _runtime, anchor_bpp, *, measure_all_formats=False):
+        captured["measure_all_formats"] = measure_all_formats
+        return SimpleNamespace(
+            anchor_bpp=float(anchor_bpp),
+            output_dir=tmp_path / "anchor",
+            l2_assignment=anchor_assignment,
+            l3_costs=l3_costs,
+            l3_cost_history=[l3_costs],
+        )
+
+    monkeypatch.setattr(ipa, "run_anchor_budget", _fake_anchor)
+    monkeypatch.setattr(
+        ipa,
+        "measure_assignment_kl",
+        lambda _model, assignment, *_args, **_kwargs: (
+            ipa._format_histogram(stats, assignment, specs, 0.0)["achieved_bpp"]
+            / 100.0
+        ),
+    )
+    monkeypatch.setattr(ipa, "_emit", lambda _msg: None)
+    args = SimpleNamespace(
+        target_bits_anchor=5.5,
+        knee_bpp_min=4.0,
+        knee_bpp_max=16.1,
+        knee_tolerance=0.1,
+        knee_kl_noise_floor=0.0,
+        knee_unstable_policy="best-kl",
+        knee_lambda_evaluations=7,
+        knee_archive_validation_candidates=7,
+        knee_include_assignment=[],
+        knee_seed_frontier=[],
+        knee_seed_remeasure=False,
+        _resume_l3_costs_single=None,
+        _resume_l3_costs_by_anchor={},
+        resume_l3_costs_dir=None,
+        initial_config=None,
+        l3_measure_all_formats=True,
+        bit_precision=0.01,
+        model="tiny",
+        probe="probe",
+        n_calib_samples=1,
+        calib_seqlen=2,
+        l3_n_calib_samples=1,
+        l3_calib_seqlen=2,
+    )
+    runtime = ipa.BudgetRuntime(
+        work_root=tmp_path / "work",
+        output_root=tmp_path / "out",
+        stats=stats,
+        current_costs=current_costs,
+        specs=specs,
+        profile=None,
+        model=object(),
+        calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        l3_calib_ids=torch.zeros((1, 2), dtype=torch.long),
+        ref_log_probs=[],
+        dtype=torch.bfloat16,
+        probe_load_timing={},
+    )
+
+    assert ipa.run_knee_archive_search(args, runtime) == 0
+    assert captured["measure_all_formats"] is True
+
+
 def _dummy_budget_result(
     target_bpp,
     anchor_bpp,

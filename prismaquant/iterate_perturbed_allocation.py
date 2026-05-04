@@ -5189,6 +5189,8 @@ def _choose_validated_archive_knee(
 
 
 def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
+    args._runtime = runtime
+    args._l3_measure_all_formats = _resolve_l3_measure_all_formats(args)
     kl_noise_floor = _knee_kl_noise_floor(args)
     runtime.output_root.mkdir(parents=True, exist_ok=True)
 
