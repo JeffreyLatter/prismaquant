@@ -1,0 +1,58 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small},
+  axis/.style={->, thick, draw=rule}
+]
+  % Frame
+  \def\xa{0}\def\xb{9.5}\def\ya{0}\def\yb{4.4}
+  \draw[axis] (\xa,\ya) -- (\xb,\ya) node[below right, font=\scriptsize]{flips committed};
+  \draw[axis] (\xa,\ya) -- (\xa,\yb) node[above left, font=\scriptsize]{KL (held-out)};
+
+  % Predicted (additive surrogate) trace — monotone decrease with flips
+  \draw[draw=accent, very thick]
+    (0.5, 3.5) .. controls (1.5,2.6) and (2.8,2.2) ..
+    (4.5, 1.95) .. controls (6.2,1.85) and (7.8,1.78) ..
+    (9.0, 1.7);
+  \node[font=\scriptsize, text=accent, anchor=west] at (8.3, 1.45) {$\sum u_i$ (predicted)};
+
+  % Measured KL trace — initially follows, then explodes upward at many-flip step
+  \draw[draw=accent2, very thick]
+    (0.5, 3.5) .. controls (1.5,2.7) and (2.8,2.3) ..
+    (4.5, 2.1)
+    -- (4.5, 3.95)
+    -- (9.0, 3.95);
+  \node[font=\scriptsize, text=accent2, anchor=west] at (8.0, 3.6)
+    {KL (measured) on additive DP proposal};
+
+  % Coord descent (monotone) trace from rollback point
+  \draw[draw=accent3, very thick, dashed]
+    (4.5, 2.1) -- (5.2, 1.95) -- (5.9, 1.85) --
+    (6.6, 1.55) -- (7.3, 1.25) -- (8.0, 1.10) -- (9.0, 1.05);
+  \node[font=\scriptsize, text=accent3, anchor=west] at (7.0, 0.85)
+    {coord descent (real-KL gated)};
+
+  % Rollback marker
+  \node[circle, draw=accent2, fill=white, inner sep=1.2pt] at (4.5, 2.1) {};
+  \draw[draw=accent2, dotted, thick] (4.5, 2.1) -- (4.5, 3.95);
+  \node[anchor=south, font=\scriptsize, text=accent2] at (4.7, 3.95) {rollback};
+
+  % Trust-region annotation
+  \draw[draw=rule!50, dotted] (3.0, 0) -- (3.0, 4.0);
+  \node[anchor=south, font=\scriptsize\itshape, text=rule] at (3.0, 4.05)
+    {trust-region of $\sum u_i$};
+
+  % Caption-internal labels
+  \node[font=\scriptsize, anchor=west] at (0.5, 4.2)
+    {\itshape additive DP commits many flips at once};
+\end{tikzpicture}
+\caption{The non-additivity overshoot. The additive surrogate
+$U_{\mathrm{add}} = \sum u_i$ predicts a monotone KL decrease as flips
+accumulate (blue). The real, measured held-out KL agrees with the surrogate
+inside the trust region of the local Taylor expansion, but diverges
+sharply when many flips are committed at once (red). The validated-frontier
+gate detects the regression and rolls back to the prior assignment;
+coord-descent then makes single-Linear flips, each gated on real KL
+(green dashed), and is monotone non-increasing by construction.}
+\label{fig:nonadditivity}
+\end{figure}

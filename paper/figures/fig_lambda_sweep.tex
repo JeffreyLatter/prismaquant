@@ -1,0 +1,61 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small},
+  axis/.style={->, thick, draw=rule}
+]
+  \def\xa{0}\def\xb{8.5}\def\ya{0}\def\yb{4.4}
+  \draw[axis] (\xa,\ya) -- (\xb,\ya) node[below right, font=\scriptsize]{$\bpp$};
+  \draw[axis] (\xa,\ya) -- (\xa,\yb) node[above left, font=\scriptsize]{KL};
+
+  % "True" measured frontier with concave segment
+  \draw[draw=accent2, very thick]
+    (1.0, 4.0) .. controls (1.7, 3.0) and (2.4, 2.4) ..
+    (3.2, 1.95)
+    .. controls (4.2, 1.6) and (4.7, 1.5) ..
+    (4.95, 1.45)               % concave segment up
+    .. controls (5.05, 1.55) and (5.2, 1.7) ..
+    (5.5, 1.65)                % bump up
+    .. controls (5.9, 1.45) and (6.5, 1.05) ..
+    (7.5, 0.6);
+
+  % Convex hull (skips the bump)
+  \draw[draw=accent, very thick, dashed]
+    (1.0, 4.0) -- (3.2, 1.95) -- (4.95, 1.45) -- (7.5, 0.6);
+
+  % Frontier points
+  \foreach \x/\y in {1.0/4.0, 3.2/1.95, 4.95/1.45, 5.5/1.65, 7.5/0.6} {
+    \node[circle, draw=accent2, fill=accent2!30, inner sep=1.2pt] at (\x, \y) {};
+  }
+
+  % Concave-skip annotation
+  \node[font=\scriptsize, anchor=west, text=accent2] at (5.6, 2.05)
+    {\itshape concave pocket};
+  \draw[draw=accent2, dotted] (5.5, 2.0) -- (5.5, 1.7);
+
+  % Knee labels
+  \node[circle, draw=accent3, fill=accent3, inner sep=1.6pt] (truek) at (4.95, 1.45) {};
+  \node[font=\scriptsize, text=accent3, anchor=south] at (4.95, 1.5) {true measured knee};
+
+  \node[circle, draw=accent, fill=accent, inner sep=1.6pt] (lamk) at (5.5, 1.65) {};
+  \node[font=\scriptsize, text=accent, anchor=south west] at (5.55, 1.7) {$\lambda$-sweep would skip past};
+
+  % Legend
+  \node[font=\scriptsize, anchor=west, draw=rule!30, fill=white, rounded corners=2pt, inner sep=2pt]
+    at (5.0, 4.05)
+    {\begin{tabular}{@{}l@{}}
+      {\color{accent2}\textbf{---}} measured frontier\\
+      {\color{accent}\textbf{- -}} convex hull ($\lambda$-sweep)
+    \end{tabular}};
+\end{tikzpicture}
+\caption{Why a Lagrangian $\lambda$-sweep is not the shipping selector.
+The achievable mixed-precision frontier (red) admits non-convex
+``pockets'' --- combinatorially-suboptimal assignments that lie
+\emph{above} the lower convex hull. A $\lambda$-sweep traces the dashed
+hull and never selects pocket points; for the macroscopic kneedle this is
+harmless, but on the Qwen3.6-27B production data the gap between the
+hull-knee at $5.857$\,bpp and the measured-frontier knee at $5.31$\,bpp
+is operationally meaningful. We retain the $\lambda$-archive search as a
+candidate generator and gate selection on real KL.}
+\label{fig:lambda_skip}
+\end{figure}

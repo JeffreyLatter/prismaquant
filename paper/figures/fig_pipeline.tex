@@ -1,0 +1,50 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=4mm and 7mm,
+  every node/.style={font=\small},
+  stage/.style={
+    draw=accent, fill=accent!5, rounded corners=2pt,
+    minimum height=8mm, minimum width=22mm, align=center,
+    inner sep=2pt
+  },
+  measure/.style={
+    draw=accent2, fill=accent2!8, rounded corners=2pt,
+    minimum height=8mm, minimum width=22mm, align=center,
+    inner sep=2pt
+  },
+  pick/.style={
+    draw=accent3, fill=accent3!8, rounded corners=2pt,
+    minimum height=8mm, minimum width=22mm, align=center,
+    inner sep=2pt
+  },
+  arr/.style={-{Latex[length=2mm]}, thick, draw=rule}
+]
+  \node[stage] (probe) {$L_1$ probe\\\scriptsize Fisher MSE};
+  \node[stage, right=of probe] (l2) {$L_2$ fixed point\\\scriptsize perturbed-X};
+  \node[stage, right=of l2]   (dp) {DP\\\scriptsize +Hamming cap};
+  \node[measure, right=of dp] (l3) {$L_3$ propagated\\\scriptsize lane-batched};
+  \node[measure, below=8mm of l3, xshift=-1mm] (gate) {real-KL gate\\\scriptsize disjoint split};
+  \node[pick, left=of gate]   (kneedle) {kneedle\\\scriptsize $\eta$-non-dom + LOO};
+  \node[pick, left=of kneedle] (coord)   {coord descent\\\scriptsize monotone};
+  \node[stage, left=of coord, fill=accent!10, draw=accent] (ship) {ship\\\scriptsize artifact};
+
+  \draw[arr] (probe) -- (l2);
+  \draw[arr] (l2)    -- (dp);
+  \draw[arr] (dp)    -- (l3);
+  \draw[arr] (l3.south) |- (gate.east);
+  \draw[arr] (gate)  -- (kneedle);
+  \draw[arr] (kneedle) -- (coord);
+  \draw[arr] (coord) -- (ship);
+
+  \draw[arr, dashed, draw=rule!70]
+    (gate.north) .. controls +(0,7mm) and +(0,7mm) .. node[above, midway, font=\scriptsize, text=rule]{rollback if regression} (dp.north);
+\end{tikzpicture}
+\caption{The \textsc{PrismaSCOUT} pipeline. Blue stages are surrogate
+candidate generation ($L_1, L_2$, additive DP). Red stages are real
+measurement ($L_3$ propagated end-KL, real-KL gate on disjoint validation
+split). Green stages are selection: validated-frontier kneedle and monotone
+coord-descent polish. Surrogate proposals are rolled back if the real-KL gate
+detects a regression.}
+\label{fig:pipeline}
+\end{figure}

@@ -1,0 +1,1082 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric,shapes.misc,fit,backgrounds,decorations.pathreplacing,patterns}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{tabularx}
+\usepackage{verbatim}
+
+\definecolor{accent}{HTML}{1f3a93}
+\definecolor{accent2}{HTML}{c0392b}
+\definecolor{accent3}{HTML}{27ae60}
+\definecolor{rule}{HTML}{888888}
+\definecolor{lightgray}{HTML}{dcdcdc}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=accent,
+  citecolor=accent,
+  urlcolor=accent,
+}
+
+% Allow extra inter-word stretch in paragraphs containing long unbreakable
+% \texttt{} tokens (commit hashes, env-var names, parameter names) so they
+% do not produce overfull hboxes.
+\emergencystretch=3em
+\sloppy
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\bpp}{\mathrm{bpp}}
+\newcommand{\kl}{D_{\mathrm{KL}}}
+\newcommand{\Linears}{\mathcal{L}}
+\newcommand{\Formats}{\mathcal{F}}
+\newcommand{\Assignment}{\mathcal{A}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+
+\title{\bfseries PrismaQuant and PrismaSCOUT:\\
+       Operational Rate--Distortion for\\
+       Mixed-Precision Large Language Model Quantization}
+
+\author{Robert Tand\\
+        \textit{Independent Researcher}\\
+        \texttt{tenari@gmail.com}}
+
+\date{May 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe \textsc{PrismaQuant}, a mixed-precision quantization pipeline for
+large language models, and \textsc{PrismaSCOUT}, the search-and-select algorithm
+at its core. Mixed-precision allocation is conventionally posed as a
+constrained discrete optimization in which a per-Linear surrogate cost
+$\sum_i u_i(f_i)$ is minimized over format assignments under a total-bit budget.
+We argue that this formulation is structurally biased on modern transformers:
+the true joint quantization error is non-additive across layers, and surrogate
+ranks reliably overshoot when many flips are committed at once. We therefore
+decouple \emph{candidate generation} from \emph{candidate selection}. Surrogate
+costs propose discrete allocations cheaply via a multi-level hierarchy
+($L_1$ probe, $L_2$ perturbed-activation fixed point, $L_3$ propagated end-KL);
+every assignment that may ship is then gated by a real, end-to-end
+Kullback--Leibler divergence measured on a held-out calibration split. Selection
+is performed by a validated-frontier kneedle: the bisection samples
+$(\bpp,\,\mathrm{KL})$ pairs adaptively, the dominance filter is widened by an
+explicit KL noise floor, and the chosen knee is verified by a
+leave-one-out stability diagnostic. A monotone coordinate-descent polish
+guarantees the shipped assignment is no worse than the chosen frontier point.
+On Qwen3.6\nobreakdash-27B, the pipeline produces a 5.31 bits-per-parameter
+artifact with held-out KL $0.0151$, replacing a previously shipped 5.50 bpp
+artifact at KL $0.0475$ from the same source weights and the same
+export-time quantization tricks --- 11\% smaller and 68\% lower KL on the same
+calibration. The artifact is published with DOI \texttt{10.57967/hf/8656}
+\cite{Tand2026hf}. We also document, in a separate methodology section, several
+numerical methods that were proposed and either implemented-but-deprecated or
+rejected outright during the design process: Lagrangian
+$\lambda$-bisection on the dual gradient, sandwich proximal recalibration,
+block-DP over architectural cliques, sparse pairwise QUBO refinement, top-$K$
+Hessian-eigenvalue covering, surrogate-only knee selection, and a
+single-anchor probe-only knee predictor. We give the principled argument for
+each, and the empirical or structural reason it did not become the shipping
+path.
+\end{abstract}
+
+\section{Introduction}
+
+Post-training quantization has converged on two dominant axes. Per-tensor
+methods --- GPTQ \cite{gptq2022}, AWQ \cite{awq2024}, AutoRound
+\cite{autoround2023}, HALO/HQQ-style rotation preprocessors --- improve the
+per-Linear quantization error of a fixed format. Allocation methods --- HAWQ-V3
+\cite{hawqv3}, CLADO \cite{clado2023}, and the more recent ParoQuant
+\cite{paroquant}, IMPQ \cite{impq}, and AMQ \cite{amq} --- choose how many bits
+to spend where. The two axes are largely orthogonal: an allocator can sit on top
+of any per-tensor toolkit and decide which Linears get 16, 8, 4, 3, or 2 bits.
+
+The allocation literature is unified by a recurring observation: per-layer
+sensitivity surrogates (diagonal Hessian traces, Fisher MSEs, output-MSEs) are
+biased estimators of joint quantization error. The standard remedy is to model
+the bias --- pairwise ADMM in CLADO, sensitivity-matrix integer programming in
+HAWQ, structured Pareto solvers in ParoQuant. We take a different tack.
+\emph{Surrogates generate, real measurement selects.} An allocator does not need
+a perfect cost model if every candidate it proposes can be cheaply re-scored
+end-to-end on a held-out calibration split. Cross-layer interactions and
+propagated effects then cease to be quantities one must \emph{model}; they are
+quantities one \emph{observes}, automatically, every time a candidate is gated.
+
+This paper reports the design and engineering of a system, named
+\textsc{PrismaQuant}, that operationalizes that principle, and the search
+algorithm at its core, \textsc{PrismaSCOUT} (\textbf{S}urrogate-\textbf{C}ascaded
+\textbf{O}ptimization \textbf{U}nder \textbf{T}radeoff). Three contributions are
+new:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item A \textbf{multi-level cost hierarchy} ($L_1, L_2, L_3$) that separates
+    cheap proposal from increasingly faithful measurement. $L_2$ is a
+    perturbed-activation fixed point that folds inter-layer coupling into the
+    activation cache rather than into a closed-form interaction term. $L_3$ is
+    a propagated end-KL measurement performed against a target-specific BF16
+    paired baseline, lane-batched and tail-amortized so that one $L_3$ pass at
+    Qwen-27B scale takes a tractable wall time.
+  \item A \textbf{validated-frontier kneedle}: the elbow of the operational
+    rate--distortion curve is found on \emph{measured} $(\bpp,\,\mathrm{KL})$
+    pairs, not on a surrogate hull. We add a KL noise floor to the dominance
+    filter, an adaptive bisection that refines around the current best knee, a
+    leave-one-out stability diagnostic, and a strict monotone polish.
+  \item A documented \textbf{methodology of rejected detours}. Several
+    numerically attractive ideas (sandwich recalibration, $\lambda$-bisection,
+    block-DP, sparse pairwise QUBO, top-$K$ Hessian covering, surrogate-only
+    knee, probe-only prediction) were proposed during design, some implemented;
+    we report the conditions under which each is principled and the empirical
+    reasons each was not adopted as the shipping path.
+\end{enumerate}
+
+\noindent\textbf{Headline empirical result.} On Qwen3.6\nobreakdash-27B, with
+identical source weights and identical export-time per-tensor tricks (HALO,
+GPTQ damp sweep, scale sweep, block-output match), \textsc{PrismaSCOUT} produces
+a 5.31~bpp artifact with held-out KL $0.0151$. The previously published
+\textsc{PrismaQuant}~v1 artifact at the same source was 5.50~bpp with held-out
+KL $0.0475$ from the same calibration. The new artifact is 11\% smaller and the
+held-out KL is 68\% lower. Only the selection routine changed.
+
+The paper is organized as follows. Section~\ref{sec:related} gives background
+and related work. Section~\ref{sec:theory} sets up the theoretical framework:
+the rate--distortion view, the additive surrogate failure mode, the cost
+hierarchy, the kneedle. Section~\ref{sec:algorithm} states the algorithm.
+Section~\ref{sec:rejected} is a deliberate methodology section on the numerical
+detours we considered and rejected. Section~\ref{sec:engineering} reports the
+engineering work that made the measurement loop tractable.
+Section~\ref{sec:results} reports empirical results on Qwen3.6-4B and
+Qwen3.6-27B, including an honest accounting of the tool-eval-bench delta.
+Section~\ref{sec:discussion} discusses limitations.
+
+\section{Background and Related Work}\label{sec:related}
+
+\paragraph{Per-tensor quantization.} GPTQ \cite{gptq2022} is the workhorse
+weight-only quantizer for transformers, posed as Hessian-weighted least squares
+over reconstruction error. AWQ \cite{awq2024} reweights salient channels.
+SmoothQuant \cite{smoothquant} pushes activation quantization tractable by
+migrating activation magnitude into weights. AutoRound \cite{autoround2023}
+sign-rounds via signSGD. HALO/HQQ-style rotations preprocess weight matrices to
+reduce outlier counts before integer quantization. These methods take a single
+matrix and a fixed format and produce a high-quality quantized version of that
+matrix; they do not decide \emph{which} matrix gets which format.
+
+\paragraph{Mixed-precision allocation.} HAWQ-V3 \cite{hawqv3} popularized
+Hessian-eigenvalue-driven sensitivity allocation: layers with larger top
+eigenvalues receive more bits. CLADO \cite{clado2023} extends to cross-layer
+error coupling via ADMM on a structured pairwise cost. Recent work
+(IMPQ \cite{impq}, ParoQuant \cite{paroquant}, AMQ \cite{amq}) frames the
+problem in increasingly explicit Pareto terms, generally over surrogate cost
+models. Surveys of the broader space have appeared as the field has matured
+\cite{mpq_survey,iterquant2026}. The geometry-aware quantization line
+\cite{geometry_aware} views per-layer quantization error through Riemannian
+manifold structure of weight space.
+
+\paragraph{Knee detection and operational rate--distortion.} The kneedle
+algorithm of \cite{kneedle2011} provides a non-parametric estimator of the
+elbow of a tradeoff curve. The closely related operational
+rate--distortion (ORD) framing of \cite{ortega1998} establishes that any
+discrete-choice rate--distortion problem admits a Lagrangian relaxation whose
+solutions trace the lower convex hull of the achievable points. Knees on the
+ORD frontier correspond to phase transitions where additional rate buys
+disproportionate fidelity. Our work imports the ORD vocabulary --- and avoids
+the convex hull, since for mixed-precision LLM quantization the discrete
+frontier admits non-convex segments and a $\lambda$-sweep on the dual would
+skip them (Section~\ref{subsec:lambda}).
+
+\paragraph{Microscaling formats.} NVFP4 and MXFP4 \cite{microscaling} package
+4-bit weights with FP8 group scales (NVFP4 group size 16; MXFP4 group size 32).
+NVFP4 weight-only Linears are 4.5 bpp ($4 + 8/16 = 4.5$); MXFP4 is 4.25 bpp.
+Modern Blackwell/Hopper GPUs offer first-class kernels for both. Mixed
+precision in this paper means an assignment $\Assignment : \Linears \to
+\Formats$ where each Linear independently selects from
+$\{$BF16, MXFP8, NVFP4, MXFP4, NVINT3, $\dots\}$, subject to fused-sibling
+constraints in attention ($q,k,v$) and MoE ($\mathrm{gate\_up},\mathrm{down}$).
+
+\paragraph{Serving.} The artifacts described here are exported to vLLM
+\cite{vllm} via the \texttt{compressed-tensors} schema, with format coverage
+extending to NVFP4, MXFP8, BF16 passthrough, and (in MoE settings) MXFP4
+experts. End-to-end inference uses Blackwell-native kernels.
+
+\section{Theoretical Framework}\label{sec:theory}
+
+\subsection{The shipping criterion}
+
+Let $p_\theta$ denote the full-precision teacher model with parameters $\theta$
+and $p_{\hat\theta}$ a quantized variant with weights $\hat\theta = Q_\Assignment(\theta)$
+under format assignment $\Assignment$. Given a calibration distribution
+$\mathcal{D}$ over input prefixes $x_{1:t}$, the operational quality of
+$\Assignment$ is
+
+\begin{equation}\label{eq:kl}
+  \kl(\Assignment) \;=\; \E_{x \sim \mathcal{D}}\,
+   \kl\!\left[\,p_\theta(\,\cdot \mid x)\,\big\|\,p_{\hat\theta}(\,\cdot \mid x)\,\right].
+\end{equation}
+
+KL is the natural objective for ``does the quantized model behave like the
+teacher?'' because it captures the entire output distribution and not merely
+the top-1 token. Two assignments with identical greedy decoding can differ
+substantially in KL --- and that difference dominates sampling, instruction
+following, and tool use, all of which depend on probability mass at non-modal
+tokens. Throughout this paper KL is measured token-by-token, masked to
+non-padding positions, averaged across calibration, and computed on a
+held-out calibration split that is not seen by the surrogate cost stages.
+
+\subsection{The additive-surrogate failure mode}
+
+A natural objective for allocation is the additive sum of per-Linear costs
+
+\begin{equation}\label{eq:additive}
+  U_{\mathrm{add}}(\Assignment) \;=\; \sum_{i \in \Linears} u_i(\Assignment_i)
+\end{equation}
+
+where $u_i(f)$ is the local cost of using format $f$ at Linear $i$, holding
+all other Linears at some reference assignment $\Assignment^{(\mathrm{ref})}$.
+The diagonal Hessian formulation
+$u_i(f) = \mathrm{Tr}(H_i)\cdot \mathrm{MSE}_i(f)$ used by HAWQ
+\cite{hawqv3} is one example; output-MSE under fixed activation context is
+another. \emph{For any choice of $u_i$ that holds $\Assignment_{-i}$ fixed,
+$U_{\mathrm{add}}$ is a first-order Taylor expansion of $\kl(\Assignment)$
+centered at $\Assignment^{(\mathrm{ref})}$.} A constrained minimization of
+$U_{\mathrm{add}}$ subject to a bit budget $B$ via additive multi-choice
+knapsack DP greedily flips many Linears at once and routinely steps outside
+the trust region of the linear approximation. Empirically, the proposed
+allocation overshoots true KL by a factor of $1.3$--$1.5$ on the
+configurations we measured; a 0.10 unit predicted decrease can produce a 0.08
+unit measured \emph{increase}.
+
+This is the structural hazard the rest of the paper is built around.
+Figure~\ref{fig:nonadditivity} sketches the geometry.
+
+\input{figures/fig_nonadditivity.tex}
+
+\subsection{Surrogates generate, real measurement selects}
+
+The remedy adopted in \textsc{PrismaSCOUT} is to use $U_{\mathrm{add}}$ purely
+as a \emph{candidate generator} and to select from generated candidates by
+real, end-to-end measurement of $\kl(\Assignment)$ on a held-out calibration
+split. The objective inequality
+\[
+  U_{\mathrm{add}}(\Assignment) \le U_{\mathrm{add}}(\Assignment') \quad
+  \not\Longrightarrow \quad \kl(\Assignment) \le \kl(\Assignment')
+\]
+fails on average for many-flip moves. The substitute property
+\[
+  \kl(\Assignment) \le \kl(\Assignment')\quad\text{(measured on held-out)}
+\]
+is observable for any pair we are willing to materialize and forward through
+the model. The cost of \emph{making} that observation is what determines
+whether the surrogates-generate paradigm is practical at LLM scale, which is
+where the cost hierarchy enters.
+
+\subsection{The cost hierarchy}\label{subsec:hierarchy}
+
+\textsc{PrismaSCOUT} runs three escalating cost models on the same problem.
+
+\begin{description}[leftmargin=2em,style=nextline]
+  \item[$L_1$ probe ($\sim$\,seconds per Linear).] A coarse per-matrix
+    surrogate. We use a Fisher-weighted MSE
+    $u_i^{(1)}(f) = \mathrm{Tr}(\hat H_i)\cdot \mathrm{MSE}_i(f)$ where
+    $\hat H_i$ is an empirical Fisher accumulated by a multi-chunk probe pass
+    \cite{prismaquant}. The output is a budget-feasible assignment computed
+    by additive multi-choice knapsack DP; this is the role of HAWQ-style
+    sensitivity, used here only as a starting point.
+  \item[$L_2$ perturbed-X fixed point ($\sim$\,minutes).] A more careful
+    per-Linear measurement that captures the activation distribution
+    \emph{under the current assignment} rather than under BF16. We install
+    pre-quantization activation hooks on the model under $\Assignment^{(k)}$,
+    forward calibration tokens, and cache the resulting activations
+    $X^{(k)}$. We then measure $u_i^{(2)}(f) = \mathrm{MSE}\!\left(W_i X^{(k)}, Q_f(W_i) X^{(k)}\right)$
+    for each (Linear, format) pair. The DP solves under $u^{(2)}$, producing
+    $\Assignment^{(k+1)}$. The fixed-point iteration $\Assignment \to X \to
+    u^{(2)} \to \Assignment$ converges in $2$--$3$ iterations on every model
+    we have measured. Inter-layer coupling enters through the activation
+    cache: late-layer activations under a low-bit early-layer assignment
+    differ from BF16 activations, and the per-Linear cost adapts.
+  \item[$L_3$ propagated cost ($\sim$\,tens of minutes).] An end-KL
+    measurement against a \emph{target-specific BF16 paired baseline}. For
+    each candidate $(\mathrm{Linear}\;\ell,\,\mathrm{format}\;f)$, we run two
+    forwards: a baseline lane in which Linear $\ell$ is BF16 and every other
+    Linear is at its $L_2$ assignment, and a candidate lane in which Linear
+    $\ell$ uses format $f$. The cost is the end-KL between the candidate
+    lane logits and the baseline lane logits. Lane batching across all
+    candidates within a depth group amortizes the forward; tail-only
+    measurement avoids re-running the head/embedding for each lane. The
+    output is a per-(Linear, format) end-KL table $u^{(3)}_i(f)$ that the
+    final DP consumes.
+\end{description}
+
+\input{figures/fig_cost_hierarchy.tex}
+
+The three levels are wired in cascade: $L_1$ proposes, $L_2$ refines under the
+proposed activation distribution, $L_3$ measures the end-effect locally
+around the converged $L_2$ assignment.
+$L_3$ semantics differ from $L_1$ and $L_2$ in a load-bearing way: $L_3$
+\emph{is} an end-KL measurement, just one whose paired baseline freezes the
+context outside the target Linear at the converged $L_2$ assignment rather
+than at BF16. This subtraction makes $L_3$ a local end-KL, defensible as a
+unary cost for a final DP.
+
+\subsection{The validated-frontier kneedle}\label{subsec:kneedle}
+
+After the cost hierarchy generates a set of candidate assignments
+$\{\Assignment^{(j)}\}$ at multiple budgets, each candidate is materialized,
+forwarded against the held-out calibration split, and assigned a measured pair
+$(\bpp(\Assignment^{(j)}),\,\kl(\Assignment^{(j)}))$. The Pareto frontier of
+these points is the set of measured candidates not dominated by any other
+measured candidate. The dominance filter is widened by an explicit KL noise
+floor $\eta$:
+
+\begin{definition}[$\eta$-dominance]
+$\Assignment$ $\eta$-dominates $\Assignment'$ if
+$\bpp(\Assignment) \le \bpp(\Assignment')$ and
+$\kl(\Assignment) + \eta < \kl(\Assignment')$.
+\end{definition}
+
+This avoids spurious points on the frontier created by KL measurement noise
+within $\eta$ of a competing point. The kneedle is then computed on the
+$\eta$-non-dominated frontier as the point of maximum perpendicular distance
+to the secant joining the frontier endpoints, after standard min-max
+normalization of both axes. Concretely, with normalized
+$(\tilde x_i, \tilde y_i)$ on the frontier in increasing-$\bpp$ order, and
+$\tilde y$ replaced by $1 - \tilde y$ so the curve is increasing,
+
+\begin{equation}\label{eq:kneedle}
+  i^\star \;=\; \arg\max_i\;
+  \frac{\big| (\tilde y_n - \tilde y_1)\tilde x_i - (\tilde x_n - \tilde x_1)\tilde y_i + \tilde x_n \tilde y_1 - \tilde y_n \tilde x_1 \big|}{\sqrt{(\tilde y_n - \tilde y_1)^2 + (\tilde x_n - \tilde x_1)^2}}.
+\end{equation}
+
+The kneedle is endpoint-fallback: if the maximum-perpendicular point is one of
+the two endpoints (a near-linear frontier), the central point is used instead
+and a warning is emitted. Adaptive bisection refines the frontier by
+evaluating the midpoint of the largest gap adjacent to the current best knee
+until either $|\bpp_R - \bpp_L| < \tau$ or the evaluation budget is reached.
+
+\input{figures/fig_kneedle.tex}
+
+\subsection{Leave-one-out stability}\label{subsec:loo}
+
+A frontier with $5$--$7$ points is small enough that the chosen knee can be
+brittle. We add a leave-one-out diagnostic: for each frontier point $i$,
+remove it and re-run the kneedle (Figure~\ref{fig:loo_stability}). If the
+maximum bpp shift across removals exceeds tolerance, or the maximum KL
+shift exceeds $\eta$, the search emits an instability warning, and the
+artifact metadata records both the chosen knee and a guarded fallback
+(a geometric-median point on the frontier). We do not hard-fail on
+instability; we record it. The diagnostic catches configurations in which
+one or two frontier points dominate the elbow geometry --- usually a sign
+that the bracket is too wide or the frontier is under-sampled near the
+knee.
+
+\input{figures/fig_loo_stability.tex}
+
+\subsection{Coordinate descent as monotone polish}\label{subsec:coord}
+
+\begin{proposition}[Monotone non-regression]
+Let $\Assignment^{(0)}$ be the chosen knee assignment with measured KL
+$\kappa_0 = \kl(\Assignment^{(0)})$. The coordinate-descent polish iterates
+single-Linear flips $\Assignment^{(t+1)} = \Assignment^{(t)}\!\big[i \to
+f^\star\big]$ and accepts only flips that strictly satisfy
+$\kl(\Assignment^{(t+1)}) < \kl(\Assignment^{(t)})$ measured on the held-out
+calibration split. The output assignment $\Assignment^{(\infty)}$ satisfies
+$\kl(\Assignment^{(\infty)}) \le \kappa_0$.
+\end{proposition}
+
+\begin{proof}
+Each accepted flip strictly decreases the held-out KL on the same
+calibration split; rejected flips leave it unchanged. The sequence
+$\{\kl(\Assignment^{(t)})\}$ is monotone non-increasing.
+\end{proof}
+
+The proposition is trivial; the operationally important point is that the
+polish does not need a cost model. It does not need to predict the change in
+KL; it measures it. The flip ranking comes from $L_3$ unary costs (cheap), the
+acceptance criterion is real KL on held-out (slow but rare). On Qwen3.6-4B at
+the 4.5~bpp anchor, coord descent committed 6 flips out of 101 attempts and
+moved KL from $0.371$ (post-$L_2$) to $0.245$, a $34\%$ improvement. None of
+those flips would have been picked by the additive surrogate; many were
+rejected by the surrogate's predicted-cost ranking but accepted by real KL.
+
+\input{figures/fig_coord_descent.tex}
+
+\section{The Algorithm: \textsc{PrismaSCOUT}}\label{sec:algorithm}
+
+\subsection{Pipeline}
+
+For each anchor budget $B$:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Probe ($L_1$).} Fisher-weighted MSE per (Linear, format).
+    Solve additive DP at $B$ to get $\Assignment^{(0)}$.
+  \item \textbf{Perturbed-X fixed point ($L_2$).} Iterate $k = 0,\dots,K$:
+    install activation hooks under $\Assignment^{(k)}$, cache calibration
+    activations, measure $u^{(2)}_i(f)$ for all (Linear, format), solve
+    weighted-Hamming-capped DP at $B$ for $\Assignment^{(k+1)}$. Stop on
+    weighted-Hamming convergence ($K \le 3$ in practice).
+  \item \textbf{Propagated cost ($L_3$).} Select a bounded neighborhood of
+    Linears (uncertain choices, non-cheapest current picks, safety set);
+    for each, measure $u^{(3)}_i(f)$ via paired BF16/candidate lanes,
+    lane-batched, tail-only. Solve frozen DP over the neighborhood at $B$.
+  \item \textbf{Real-KL gate.} Materialize the proposed assignment, forward
+    against the held-out calibration split, record measured KL. If KL
+    regresses beyond $\rho \cdot \kappa_{\mathrm{before}}$ (default $\rho =
+    0$), roll back to the prior assignment.
+\end{enumerate}
+
+For the validated-frontier kneedle: repeat the above for a small set of
+anchor budgets, validate the resulting candidates on the held-out split,
+filter by $\eta$-dominance, and select via Equation~\eqref{eq:kneedle} with
+adaptive bisection. Run leave-one-out (Section~\ref{subsec:loo}). Run
+coordinate-descent polish (Section~\ref{subsec:coord}). Record audit trail.
+
+\input{figures/fig_pipeline.tex}
+
+\subsection{The DP and fused-sibling constraints}
+
+The allocator solves an additive multi-choice knapsack DP whose
+\emph{units} are not individual Linears but \emph{refinement units} that group
+fused siblings. Attention $q,k,v$ projections share a per-tensor global scale
+in vLLM's fused kernel \cite{vllm}; in MoE, $\mathrm{gate\_up}$ and
+$\mathrm{down}$ packed Linears must share schemes within an expert column.
+The DP enforces these constraints natively by enumerating only joint
+sibling-coherent format choices per unit. Fused-sibling aggregation uses
+sum (joint-cost) for activation-coupled siblings and max for
+isolated-sensitivity siblings; we report the rationale and an empirical
+comparison in Appendix~\ref{app:fused}.
+
+\subsection{Calibration disjointness}\label{subsec:disjoint}
+
+\textsc{PrismaSCOUT} maintains two disjoint calibration splits:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Train split} (\texttt{l3\_calib\_split=train}, default).
+    Used for $L_2$ activation caching and $L_3$ paired-baseline measurement.
+  \item \textbf{Validation split} (\texttt{kl\_calib\_split=validation},
+    default). Used for the real-KL gate, the validated-frontier kneedle, the
+    coordinate-descent polish, and the artifact metadata. Never seen by any
+    cost-generation stage.
+\end{itemize}
+
+The renaming and split discipline was added in commit \texttt{2e670b3}
+(``Implement PR-Polish-1: Rename validation\_kl and secure surrogate
+knee'') after an audit identified that the original
+\texttt{validation\_kl} field was, in fact, an in-sample number on the same
+calibration split that drove $L_2$/$L_3$ cost generation. Until that fix
+landed, \texttt{validation\_kl} could be reasonably misread as a held-out
+metric; it was not.
+
+\input{figures/fig_calib_split.tex}
+
+\section{Methods Considered and Rejected}\label{sec:rejected}
+
+The shipping algorithm above is the result of a deliberate triangulation
+between several principled alternatives. We describe each, the math behind
+it, and the empirical or structural reason it was not adopted as the default.
+The intent is not exhaustiveness for its own sake --- it is to make explicit
+that simpler, mathematically attractive answers were considered first.
+
+\subsection{Lagrangian \texorpdfstring{$\lambda$}{lambda}-bisection on the dual gradient}\label{subsec:lambda}
+
+\paragraph{The proposal.} The constrained problem
+$\min_\Assignment U(\Assignment)\;\text{s.t.}\;B(\Assignment) \le B$ admits the
+Lagrangian relaxation $L(\Assignment, \lambda) = U(\Assignment) + \lambda(B(\Assignment) - B)$.
+Sweeping $\lambda$ traces the lower convex envelope of the achievable
+$(\bpp,\,U)$ frontier. For each $\lambda$, the per-Linear minimizer
+decouples: $\Assignment_i^\star(\lambda) = \arg\min_f\,u_i(f) + \lambda\,
+b_i(f)$ where $b_i(f)$ is the bit count for Linear $i$ at format $f$. This
+costs CPU seconds. By Danskin's theorem, the achieved budget
+$B^\star(\lambda)$ is the subgradient of the dual function. The kneedle is
+the region of maximum $|dB^\star/d\lambda|$ on log-$\lambda$. A few-step
+bisection on $\lambda$ produces the kneedle without sweeping the full grid.
+
+\paragraph{The math is correct.} For a strictly convex frontier, the proposal
+is optimal: $5$--$7$ $\lambda$ evaluations isolate the kneedle to within
+$0.04$ bpp.
+
+\paragraph{Why we did not adopt it as the default.} Two reasons.
+
+First, the discrete frontier is not strictly convex. Sub-bit combinatorial
+packing produces concave pockets where a slightly suboptimal assignment lies
+\emph{above} the convex hull. No strictly positive $\lambda$ selects those
+points as global minimizers of $L$; sweeping $\lambda$ leaps over them. For
+the macroscopic kneedle this is harmless --- the macroscopic curve is
+overwhelmingly convex --- but our production data on Qwen3.6-27B exhibits a
+non-trivial gap between the convex-hull knee at 5.857~bpp / KL~0.056 and the
+true measured knee at 5.31~bpp / KL~0.015 (Figure~\ref{fig:lambda_skip}).
+The discrete archive search and the validated-frontier kneedle both find the
+5.31 point; a pure $\lambda$-sweep on the surrogate does not.
+
+Second, the surrogate $U_{\mathrm{add}}$ used inside the Lagrangian is the
+same additive quantity whose joint behavior overshoots true KL by 30--50\%.
+Even if the dual perfectly traced the surrogate hull, the surrogate hull is
+not the true KL hull. We therefore retained a \emph{$\lambda$-archive search}
+as an experimental candidate generator (commit \texttt{86f2c14}, ``Add
+lambda archive knee search''; commit \texttt{444bc28}, ``Add one-pass Pareto
+archive DP''), with a beam variant retaining alternate states per bit bin.
+But the final selector is real-KL on the validated frontier; the
+$\lambda$-archive feeds candidates into that selector, not the other way
+around.
+
+\input{figures/fig_lambda_sweep.tex}
+
+\subsection{Sandwich proximal recalibration}
+
+\paragraph{The proposal.} The non-additivity bug is a Taylor-trust-region
+bug: $u^{(2)}_i$ is measured holding $\Assignment_{-i}$ at $\Assignment^{(\mathrm{ref})}$,
+the DP then proposes a multi-flip $\Assignment^{(\mathrm{prop})}$ far outside
+that radius. The remedy is a \emph{sandwich}: propose
+$\Assignment^{(\mathrm{prop})}$ from the additive DP, re-measure
+$u^{(2)}_i$ holding $\Assignment_{-i}$ at $\Assignment^{(\mathrm{prop})}$,
+re-solve the DP. By Mirror-Descent convergence, the contraction factor
+$\rho$ is the ratio of off-diagonal Hessian energy to block-diagonal
+energy (empirically $\rho \in [0.3, 0.5]$). $2$--$3$ sandwich passes reach
+within $5\%$ of the true KL minimum.
+
+\paragraph{Why not adopted as default.} Two practical reasons.
+
+First, each sandwich pass costs another full $L_2$ activation cache plus a
+full DP solve. On Qwen3.6-27B, each pass is $\sim$22 minutes wall, so 3
+passes is over an hour per anchor. A coordinate-descent polish of the same
+anchor finds the same KL improvement at a fraction of the cost, because it
+spends measurement on flips that are already small (single-Linear) and in a
+region where the linear approximation does hold. Coord descent is also
+trivially monotone on real KL by construction, while sandwich is
+\emph{empirically} contractive.
+
+Second, the operational re-centering target is the \emph{actual} chosen
+assignment, not a sequence of $L_2$ DP outputs. The validated-frontier
+kneedle and the coord-descent polish do this re-centering directly: the
+gate is real KL on the assignment we are about to ship, with no Taylor
+hand-waving in between. Sandwich would still be valuable as a refinement of
+$L_2$ specifically; we list it under future work.
+
+\subsection{Block-DP over architectural cliques}
+
+\paragraph{The proposal.} The transformer Hessian is not dense; it is
+block-diagonal with strong sequential off-diagonals confined to within a
+single attention or MLP block. The structurally non-zero pairwise
+interactions are essentially:
+
+\[
+  \mathrm{V}_{\mathrm{proj}} \to \mathrm{O}_{\mathrm{proj}}, \qquad
+  \mathrm{Gate}_{\mathrm{proj}}/\mathrm{Up}_{\mathrm{proj}} \to \mathrm{Down}_{\mathrm{proj}}.
+\]
+
+A block-DP over these cliques (size $2$--$3$, disjoint after LayerNorm
+resets, illustrated in Figure~\ref{fig:smrf_clique}) captures the dominant
+interaction energy without an NP-hard QUBO, in
+$K = 2 \cdot \mathrm{num\_layers}$ measurements per pass.
+
+\input{figures/fig_smrf_clique.tex}
+
+\paragraph{Why not adopted as default.} The shipping path already ships
+fused-sibling aggregation in the additive DP, which bakes the dominant
+intra-block coupling into joint sibling-coherent format choices. The
+$\mathrm{Gate}/\mathrm{Up}\to\mathrm{Down}$ correlation is already
+treated jointly inside the refinement unit. Block-DP would extend this to
+$\mathrm{V}\to\mathrm{O}$, which is real, but not large enough on the
+configurations we measured to justify a measurement pass beyond the existing
+sibling aggregation. We retain it as a candidate for stronger interaction
+regimes (sub-3-bit, MXFP4-only experts, reduced-rotation pre-processing).
+
+\subsection{Sparse pairwise QUBO / SMRF}
+
+\paragraph{The proposal.} For a sparse set of high-impact unit pairs $(i,j)$,
+measure the residual
+$\mathrm{res}_{ij}(a,b) = \mathrm{KL}_{\mathrm{paired}}(i=a,j=b) -
+u_i(a) - u_j(b)$
+and solve the resulting sparse QUBO in addition to the additive DP. This is
+implemented in \texttt{interaction\_refine.py}.
+
+\paragraph{Why default-off.} On the production Qwen3.6-27B run, the pairwise
+stage covered 8 high-impact units at the cost of $\sim$250 paired forwards
+($\sim$45 minutes) and rolled back when validation regressed. Coverage of
+8 units out of $\sim$500 Linears is what one of our reviewers (Gemini~3.1)
+called \emph{homeopathic}: too local to fix global non-additivity and
+expensive enough to dominate the budget when activated. The audit consensus
+hid the QUBO alias from the user-facing CLI, time-capped each pass, and
+required a real-KL validation gate around any proposal it produces. The
+code stays available for experimentation; the shipping path does not enable
+it.
+
+\subsection{Top-\texorpdfstring{$K$}{K} Hessian-eigenvalue covering}
+
+\paragraph{The proposal.} Allocate measurement budget to the $K$ Linears
+with largest top Hessian eigenvalue.
+
+\paragraph{Why rejected.} The eigenvalue ranks individual matrices by local
+sensitivity. It is structurally blind to the propagation graph: a Linear with
+small top eigenvalue but a long downstream path through unnormalized
+attention can dominate end-KL. The sandwich and validated-frontier results
+both repeatedly select Linears that the eigenvalue ranking would have
+missed.
+
+\subsection{Surrogate-only knee selection}\label{subsec:surrogate}
+
+\paragraph{The proposal.} Sweep target $\bpp$ on a single cached $L_3$ cost
+table; let $U_{\mathrm{add}} = \sum_i u^{(3)}_i(\Assignment_i)$ stand in for
+KL; pick the kneedle on the surrogate frontier.
+
+\paragraph{Why rejected.} On the Qwen3.6-27B production data
+(Figure~\ref{fig:surrogate_vs_validated}), the surrogate kneedle picks
+5.857~bpp / KL~0.056. The validated kneedle on the same candidate set picks
+5.31~bpp / KL~0.015. The surrogate is monotone within the additive trust
+region; outside it, the ordering on $\bpp$ is no longer informative about
+the ordering on KL. We retain the surrogate sweep as an
+extremely cheap candidate generator (CPU seconds for hundreds of points)
+and pair it with an obligatory \texttt{--knee-surrogate-validate} gate that
+re-measures the picked points on real KL. After PR-Polish-1, the
+surrogate-only path is hidden from the user-facing CLI; outputs are
+relabeled \texttt{candidate\_surrogate\_*} so a reader cannot mistake the
+surrogate kneedle for the shipping artifact.
+
+\subsection{Probe-only knee prediction}
+
+\paragraph{The proposal.} The kneedle is an artifact of intra-tensor
+representation thresholds (the bpp at which a Linear's representation
+capacity collapses). The $L_1$ probe captures those thresholds well. The
+curvature of the probe sum and the curvature of the true frontier match up
+to a multiplicative constant. Predict the knee bpp from $L_1$ alone.
+
+\paragraph{Why used as a prior, not a selector.} On Qwen-4B-class scales the
+expected error in the probe-predicted knee is empirically $\pm 0.12$--$0.18$
+bpp \cite{prismaquant}. The density of mixed-precision states near the true
+knee is often $\le 0.05$ bpp. A $\pm 0.15$ bpp error therefore guarantees we
+miss the exact discrete kneedle. The probe is the optimal prior for
+\emph{bracket} establishment (e.g., search in $[3.8, 4.1]$ bpp), but the
+final discrete selection requires a real-KL evaluation of $3$--$5$
+$\lambda$- or DP-generated candidates within that bracket.
+
+\subsection{Pareto archive DP and beam variants}
+
+\paragraph{The proposal.} A one-pass DP that retains, at each bit bin, the
+Pareto-optimal set of $(\bpp,\,U)$ states. The archive's frontier becomes a
+ready-made surrogate Pareto curve; the validated-frontier kneedle picks from
+it. The beam variant
+(\texttt{-{}-knee-archive-beam-per-bin}) retains $k$ alternate states per
+bin. The refinement stage adds neighbors of the current best measured KL.
+
+\paragraph{Status.} Implemented (commit \texttt{444bc28}; beam in commit
+\texttt{53fe0db}). Used as a candidate generator in the production
+Qwen3.6-27B archive run (\texttt{27b-knee-archive-beam4-refine-noseed}); the
+exact 5.27~bpp/KL~0.013 supplied-best assignment was not reproduced by the
+no-seed archive --- the no-seed selected $5.31$~bpp / KL~$0.0147$, about
+9.9\% relative KL worse. We treat archive DP as a high-coverage candidate
+generator that requires real-KL validation to ship, and not as a stand-alone
+selector.
+
+\input{figures/fig_method_decision_tree.tex}
+
+\section{Engineering Considerations}\label{sec:engineering}
+
+The theoretical framework requires real-KL measurement to dominate
+selection. At LLM scale, this is only practical with attention to memory,
+launch overhead, and determinism. We report the parts of the engineering
+work that materially shape the algorithm.
+
+\subsection{The 121~GB UMA constraint}
+
+The development host is an NVIDIA GB10 (Blackwell) with 121~GB unified
+memory shared between GPU and host. Quantization workloads at Qwen-27B scale
+have a non-trivial peak memory schedule
+(Figure~\ref{fig:memory_landscape}):
+model weights $\sim$54~GB BF16, $L_2$ activation cache up to 24~GB across
+iterations, frozen-weight cache $\sim$4~GB, lane-batched activations
+$\sim$3$-$5~GB, CUDA graph pools $\sim$10$-$20~GB if naively stacked,
+Triton kernel JIT transients $\sim$1$-$2~GB, and Python plus framework
+baseline $\sim$3~GB. Single-component runs fit cleanly. All-on stacks reach
+99--121~GB and OOM-kill, sometimes silently before the in-process budget
+enforcer can intervene.
+
+The empirical lesson, reflected throughout the codebase, is that the
+shipping algorithm runs on the eager, default-pool path with the activation
+cache and frozen-weight cache as the only large-state components, and that
+all advanced kernels and graph optimizations are env-gated and disabled by
+default. A run that takes longer but completes with a real-KL gate is
+preferred over a run that benchmarks faster on a single pass and OOMs out at
+coord descent.
+
+\input{figures/fig_memory_landscape.tex}
+
+\subsection{Lane-batched $L_3$ measurement}
+
+The $L_3$ measurement of one (Linear, format) candidate forwards a calibration
+batch through the model with one Linear in BF16 and one Linear at the
+candidate format. Naively, each candidate is a separate forward. Lane
+batching groups all candidates within a depth group into a single forward
+with one extra batch dimension; per-lane Linear behavior is dispatched in
+the swap hooks (the target's paired baseline lane stays BF16, the candidate
+lane applies the candidate format, lanes belonging to other targets in the
+same depth group apply that module's $L_2$ format). This reduced launch
+overhead by 30$-$60$\times$ versus the sequential implementation, at the
+cost of activation memory linear in the number of lanes; the
+\texttt{-{}-l3-max-lanes-per-batch} flag bounds memory.
+
+The tail-only mode caches the inputs to the tail of the network and replays
+only the tail under each candidate, saving the head/embedding cost.
+\texttt{PRISMAQUANT\_L3\_MIN\_HOST\_MEM\_GB} adds memory backpressure for
+UMA hosts: the loop checks \texttt{/proc/meminfo} \texttt{MemAvailable}
+between paired-override chunks and reduces the next chunk's lane count
+before the host reaches OOM pressure.
+
+\subsection{CUDA graphs and the shared-pool retreat}
+
+CUDA graph capture eliminates per-launch overhead for the fixed-shape forward
+paths used in $L_2$, $L_3$, KL evaluation, and coordinate-descent flip
+evaluation. Naive capture allocates a separate graph memory pool per path, so
+$4$--$5$ pools stack to $\sim$10$-$20~GB. We attempted a shared-pool
+implementation (commit \texttt{3f320c7}) that captures all paths into a
+single workspace with a tracked allocator. The shared-pool implementation
+exposed a smoke-test NaN under one configuration (commit \texttt{d830a01},
+``graphs: default shared pool OFF after smoke NaN risk''); a second pass
+re-enabled shared-pool by default after a determinism flag and a
+safety-override no-clone path were added (commits \texttt{2ba832f} and
+\texttt{d9d67a9}). Through this, every path remains env-gated:
+\texttt{PRISMAQUANT\_L3\_CUDA\_GRAPHS},
+\texttt{PRISMAQUANT\_COORD\_LANE\_CUDA\_GRAPHS},
+\texttt{PRISMAQUANT\_KL\_CUDA\_GRAPHS} accept \texttt{auto}/unset, \texttt{1}, or
+\texttt{0}, and auto avoids graphing one-shot flip batches because capture
+warmup dominates on small workloads.
+
+The take-home is that CUDA graphs are real wall-time wins for stable-shape
+loops (KL eval, $L_2$ activation cache, repeated lane forwards) and a real
+hazard for exploratory loops (coord descent flip swaps). The shipping
+default is auto: graph the stable paths, eager the rest.
+
+\subsection{Determinism and reproducibility}
+
+The audit trail recorded with each artifact includes: every measured
+$(\bpp,\,\mathrm{KL})$ point on the validated frontier, the dominance filter
+parameters ($\eta$ and the bisection tolerance), the chosen knee, the
+leave-one-out shadow knees, the coord-descent flip log, the $L_2$ iteration
+trace, the $L_3$ neighborhood selection rationale, and the final assignment
+hash. The run is reproducible up to floating-point determinism on the
+hardware that produced it (Blackwell GB10), which we have verified across
+restarts on the same host. Artifacts are gated by an artifact registry
+(\texttt{prismaquant.artifact\_registry}, commit \texttt{b3d8445}) that
+refuses to publish without a passed validation entry.
+
+\section{Empirical Results}\label{sec:results}
+
+\subsection{Qwen3.6-4B at the 4.5~bpp anchor}
+
+The 4.5~bpp anchor on Qwen3.6-4B is the canonical microbenchmark for the
+non-additivity story. Figure~\ref{fig:4b_progression} reports KL at three
+stages of the pipeline.
+
+\input{figures/fig_4b_progression.tex}
+
+The $L_3$ polish stage \emph{regresses} relative to $L_2$ ($0.371 \to 0.461$,
+$+24\%$), consistent with the additive overshoot mechanism described in
+Section~\ref{sec:theory}; the regression is detected by the real-KL gate
+and the polish output is rolled back. The coordinate-descent stage
+recovers and surpasses both: $0.461 \to 0.245$, with 6 flips committed out
+of 101 attempts. The shipped 4B artifact at this anchor is the
+coord-descent output. The same pattern reproduces at every Qwen-4B anchor we
+have measured.
+
+\subsection{Qwen3.6-27B production}\label{subsec:27b_results}
+
+The Qwen3.6-27B PrismaSCOUT artifact (DOI \texttt{10.57967/hf/8656},
+\cite{Tand2026hf}) is produced from the same source weights and
+the same per-tensor toolkit
+(HALO, GPTQ damp sweep, scale sweep, block-output match) as the previously
+shipped \textsc{PrismaQuant}~v1 5.5~bpp artifact \cite{Tand2026hf_prev}. Only
+the selection routine changed.
+
+\begin{table}[h]
+\centering
+\caption{Qwen3.6-27B: previously shipped \textsc{PrismaQuant}~v1 vs.\ current
+  \textsc{PrismaSCOUT} artifact, same source weights and same per-tensor
+  toolkit. Held-out KL on disjoint validation split, 8 samples
+  $\times$ 512 tokens.}
+\label{tab:27b_headline}
+\begin{tabular}{lrrr}
+\toprule
+Artifact & Size & bpp & Held-out KL \\
+\midrule
+\textsc{PrismaQuant}~v1 (5.50 bpp) & 22.67 GB & 5.50 & 0.0475 \\
+\textsc{PrismaSCOUT} (5.31 bpp)    & 20.17 GB & 5.31 & 0.0151 \\
+\midrule
+Change                              & $-2.5$ GB ($-11\%$) & $-0.19$ & $-0.0324$ ($-68\%$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The artifact is 11\% smaller and the held-out KL is $\sim 3.2\times$ lower.
+The validated-frontier picture (Figure~\ref{fig:validated_27b}) is the
+algorithmic explanation: the surrogate-only kneedle on the same candidate
+set picks 5.857~bpp / KL~0.056; the validated kneedle picks 5.31~bpp /
+KL~0.015. The surrogate ranking on bpp does not preserve the ranking on
+real KL inside the additive trust region's overshoot zone.
+
+\input{figures/fig_validated_27b.tex}
+
+\subsection{Downstream evaluation}
+
+We report the downstream evaluation on the 27B PrismaSCOUT artifact in
+Table~\ref{tab:27b_evals}. KL is a token-distribution statistic; it is not
+a guarantee of task accuracy. We report results honestly, including a
+specific tool-eval-bench regression we identified.
+
+\begin{table}[h]
+\centering
+\caption{Qwen3.6-27B downstream evaluation under matched vLLM serve flags.
+  Both artifacts served identically (\texttt{compressed-tensors},
+  \texttt{kv-cache-dtype=fp8}, \texttt{enable-prefix-caching}). Validator and
+  tool-eval-bench used \texttt{--no-think}.}
+\label{tab:27b_evals}
+\begin{tabular}{lrr}
+\toprule
+Metric & PrismaSCOUT (5.31) & PrismaQuant v1 (5.50) \\
+\midrule
+Held-out KL ($\downarrow$)               & 0.0151    & 0.0475    \\
+Validator perplexity ($\downarrow$)       & 4.128     & 4.178     \\
+Validator mean NLL ($\downarrow$)         & 1.4178    & 1.4297    \\
+GSM8K strict ($\uparrow$)                  & 96.66\%   & --        \\
+IFEval prompt strict ($\uparrow$)         & 85.40\%   & --        \\
+MMLU 5-shot ($\uparrow$)                  & 86.23\%   & --        \\
+tool-eval-bench hardmode ($\uparrow$)     & 88/100    & 85/100    \\
+tool-eval safety-critical failures ($\downarrow$) & 4 & 3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 5.31~bpp artifact wins on perplexity, mean NLL, and tool-eval-bench
+hardmode score, but it has a stable regression on
+tool-eval-bench scenario \texttt{TC-42} (extra parameter injection in tool
+calls), and four versus three safety-critical failures. The shipped 5.5
+artifact and the new 5.31 artifact share a vulnerability to scenario
+\texttt{TC-60} (cross-turn sleeper injection); both follow an attacker BCC
+inserted via a tool result. We do not claim KL improvement implies uniform
+task improvement. Mean KL hides tail regressions and underweights
+low-frequency schema and tool-call tokens. Future work includes p95/p99 KL
+diagnostics and a schema-focused KL gate.
+
+\section{Discussion and Limitations}\label{sec:discussion}
+
+\paragraph{Non-additivity is structural, not pathological.} The 30--50\%
+overshoot of the additive surrogate's predicted decrease versus measured KL
+is not noise. It is the systematic bias of a first-order Taylor expansion
+applied outside its trust region. The remedy is either a smaller step (which
+$L_2$'s perturbed-X iteration approximates by re-centering the activation
+cache) or a real-KL gate (which the validated-frontier kneedle and coord
+descent enforce). The shipping path uses both.
+
+\paragraph{The kneedle is a model-selection criterion.} The kneedle is not a
+universal optimum. It selects the bpp where additional rate buys
+disproportionately less fidelity --- i.e., where the marginal cost of further
+size reduction is high. It is the right shipping criterion under the implicit
+loss
+$\mathcal{L}(\bpp,\,\mathrm{KL}) = \alpha\cdot\mathrm{KL} + \beta\cdot\bpp$
+with $\alpha,\beta$ proportional to the perpendicular axis weights, and a
+reasonable default in the absence of an explicit task-cost-of-bits curve.
+Users with task-specific cost functions can substitute their own selector
+on the validated frontier.
+
+\paragraph{The held-out KL is a calibration-set statistic.} The downstream
+evaluation in Section~\ref{subsec:27b_results} confirms that lower held-out
+KL does not entail uniform task improvement. A schema-focused KL or a
+top-token flip-rate diagnostic on chat-formatted prompts would tighten the
+correspondence to tool-use accuracy. We report the KL we measured and flag
+the gaps.
+
+\paragraph{Hardware-bounded measurement.} The cost hierarchy is calibrated
+to fit in a 121~GB UMA host; on larger hosts, $L_3$ candidate budgets and
+coord-descent pass counts can be substantially larger, and the Pareto
+sweep can target denser frontiers. The fundamental bound is that
+real-KL measurement scales linearly with the number of validated assignments;
+the validated-frontier kneedle keeps that count to $5$--$15$ per artifact.
+
+\paragraph{Limitations.}
+(i) The surrogate hierarchy is calibrated for transformer architectures;
+its $L_2$ perturbed-X step assumes that activation caching is feasible, which
+breaks for sparse-routing MoE without a careful expert-aware cache.
+(ii) The sandwich, block-DP, and full QUBO are deliberately not adopted but
+remain principled candidates for stronger interaction regimes.
+(iii) Calibration is wikitext-derived and chat-formatted via a fixed system
+prompt; domain-shifted deployments may benefit from in-domain calibration.
+(iv) No claim of optimality is made beyond ``provably no worse than the
+chosen frontier point under monotone real-KL flips.'' The frontier itself is
+sampled, not exhaustive.
+
+\section{Conclusion}
+
+We described \textsc{PrismaQuant} and its core search algorithm
+\textsc{PrismaSCOUT}: a mixed-precision LLM quantization pipeline whose
+defining choice is to use surrogate cost models for candidate generation
+only and to make every shipping decision on a real, end-to-end
+Kullback--Leibler divergence measurement against a held-out calibration
+split. The key engineering challenge was making that measurement loop
+tractable on a 121~GB UMA host through a multi-level cost hierarchy with
+lane-batched, tail-amortized $L_3$, validated-frontier kneedle selection
+with a noise-floor dominance filter and leave-one-out stability, and a
+monotone coord-descent polish that is provably non-regressive on real KL.
+
+The shipping artifact on Qwen3.6-27B is 11\% smaller and 68\% lower in
+held-out KL than the previously shipped \textsc{PrismaQuant}~v1 artifact at
+the same source. We also documented several principled numerical methods
+(Lagrangian $\lambda$-bisection, sandwich proximal recalibration, block-DP
+over architectural cliques, sparse pairwise QUBO, top-$K$ Hessian covering,
+surrogate-only knee, probe-only knee predictor) that were considered during
+design and either deprecated, made experimental-only, or rejected outright.
+Each is principled in its regime; none is the right shipping default for
+mixed-precision LLM quantization under our measurement constraints.
+
+\paragraph{Reproduction.} The Qwen3.6-27B PrismaSCOUT artifact is available at
+\url{https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm}
+(DOI \texttt{10.57967/hf/8656}, \cite{Tand2026hf}). The pipeline is open
+source at \url{https://github.com/RobTand/prismaquant}; commits referenced
+throughout (\texttt{8e503a5}, \texttt{2e670b3}, \texttt{444bc28}, \dots) are
+visible there.
+
+\section*{Acknowledgments}
+
+The author thanks two LLM collaborators (\textsc{Claude} and \textsc{Codex})
+for sustained design and implementation help, and \textsc{Gemini~3.1~Pro}
+for the mathematical formalism (Lagrangian dual analysis, sandwich
+proximal-descent argument, block-DP clique structure, probe error bounds)
+that produced the rejected-methods catalog of Section~\ref{sec:rejected}.
+Where their contributions are load-bearing for the paper's narrative, the
+relevant deliberation transcripts are preserved in
+\texttt{scratch/powwow/} of the source repository for future audit.
+
+\renewcommand{\refname}{References}
+
+\begin{thebibliography}{99}
+
+\bibitem{Tand2026hf} R.~Tand. \emph{Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm.}
+  Hugging Face model artifact, 2026. DOI: \texttt{10.57967/hf/8656}.
+  \url{https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm}.
+
+\bibitem{Tand2026hf_prev} R.~Tand. \emph{Qwen3.6-27B-PrismaQuant-5.5bit-vllm.}
+  Hugging Face model artifact, 2026.
+  \url{https://huggingface.co/rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm}.
+
+\bibitem{prismaquant} R.~Tand. \emph{PrismaQuant: per-Linear sensitivity-driven
+  mixed-precision quantization for LLMs.}
+  \url{https://github.com/RobTand/prismaquant}, 2026.
+
+\bibitem{gptq2022} E.~Frantar, S.~Ashkboos, T.~Hoefler, and D.~Alistarh. GPTQ:
+  Accurate post-training quantization for generative pre-trained transformers.
+  \emph{ICLR}, 2023. \url{https://arxiv.org/abs/2210.17323}.
+
+\bibitem{awq2024} J.~Lin, J.~Tang, H.~Tang, S.~Yang, X.~Dang, C.~Gan, and S.~Han.
+  AWQ: Activation-aware weight quantization for LLM compression and
+  acceleration. \emph{MLSys}, 2024. \url{https://arxiv.org/abs/2306.00978}.
+
+\bibitem{autoround2023} W.~Cheng, Y.~Lv, W.~Zhang, and H.~Shen. Optimize weight
+  rounding via signed gradient descent for the quantization of LLMs.
+  \emph{arXiv:2309.05516}, 2023.
+
+\bibitem{smoothquant} G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, and S.~Han.
+  SmoothQuant: Accurate and efficient post-training quantization for large
+  language models. \emph{ICML}, 2023.
+
+\bibitem{hawqv3} Z.~Yao, Z.~Dong, Z.~Zheng, A.~Gholami, J.~Yu, E.~Tan, L.~Wang,
+  Q.~Huang, Y.~Wang, M.~W.~Mahoney, and K.~Keutzer. HAWQ-V3: Dyadic neural
+  network quantization. \emph{ICML}, 2021. arXiv:2011.10680.
+
+\bibitem{clado2023} D.~Lee, M.~Kim, and S.~Han. CLADO: Cross-layer ADMM
+  optimization for joint mixed-precision quantization.
+  \emph{arXiv:2307.05657}, 2023.
+
+\bibitem{paroquant} (ParoQuant authors). Pareto-optimal mixed-precision
+  quantization. \emph{arXiv:2511.10645}, 2025.
+
+\bibitem{impq} (IMPQ authors). Integer-mixed-precision quantization for LLMs.
+  \emph{arXiv:2509.15455}, 2025.
+
+\bibitem{amq} (AMQ authors). Adaptive mixed-precision quantization.
+  \emph{arXiv:2509.12019}, 2025.
+
+\bibitem{mpq_survey} (Survey authors). Mixed-precision quantization for large
+  language models: a survey. \emph{arXiv:2510.16805}, 2025.
+
+\bibitem{iterquant2026} (IterQuant authors). Iterative mixed-precision
+  quantization for LLMs. \emph{DATE}, 2026.
+
+\bibitem{geometry_aware} (Authors). Geometry-aware quantization of large
+  language models. \emph{arXiv:2507.18553}, 2025.
+
+\bibitem{kneedle2011} V.~Satopaa, J.~Albrecht, D.~Irwin, and B.~Raghavan. Finding
+  a ``kneedle'' in a haystack: Detecting knee points in system behavior.
+  \emph{ICDCSW}, 2011.
+
+\bibitem{ortega1998} A.~Ortega and K.~Ramchandran. Rate-distortion methods for
+  image and video compression. \emph{IEEE Signal Processing Magazine},
+  15(6):23--50, 1998.
+
+\bibitem{microscaling} (OCP). Microscaling formats: MXFP4, MXFP6, MXFP8 and
+  NVFP4. \emph{Open Compute Project Microscaling Spec.}, 2023--2024.
+
+\bibitem{vllm} W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~H.~Yu,
+  J.~Gonzalez, H.~Zhang, and I.~Stoica. Efficient memory management for large
+  language model serving with PagedAttention. \emph{SOSP}, 2023.
+
+\bibitem{turboboa} (Authors). TurboBOA: Throughput-optimal mixed-precision
+  inference. \emph{arXiv:2602.04929}, 2026.
+
+\bibitem{shapley_potential_games} D.~Monderer and L.~Shapley. Potential games.
+  \emph{Games and Economic Behavior}, 14:124--143, 1996.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Fused-sibling aggregation}\label{app:fused}
+
+Fused siblings in attention ($q,k,v$) and MoE ($\mathrm{gate\_up}$,
+$\mathrm{down}$) must share one format choice in vLLM's fused kernel. The
+allocator's refinement unit groups them and enumerates only joint
+sibling-coherent format combinations. The aggregation rule for the unit's
+unary cost has two natural candidates: $\sum$ over siblings (sum-aggregation)
+and $\max$ over siblings (max-aggregation). Sum is correct when the siblings'
+output errors propagate independently; max is correct when one sibling
+dominates the unit's downstream activation noise. Empirically on
+Qwen3.6-27B, sum-aggregation matches the measured $L_3$ end-KL more closely
+on both attention and MoE units (commit \texttt{d370c3e}, ``allocator: revert
+to sum-aggregation for fused siblings (right thing on principle)''). We use
+sum.
+
+\section{Allocator runtime parameters}
+
+\begin{itemize}[leftmargin=*]
+  \item $L_2$: \texttt{bit\_precision}~$=0.001$, weighted-Hamming convergence
+    threshold $0.05$, max iterations $5$ (typically converges in $2$--$3$).
+  \item $L_3$:
+    \texttt{l3-uncertainty-rel-tol}~$=0.10$,
+    \texttt{l3-min-fraction}~$=0.05$,
+    \texttt{l3-max-fraction}~$=0.30$,
+    \texttt{l3-safety-fraction}~$=0.02$,
+    \texttt{l3-max-lanes-per-batch}~$=64$ (UMA-cap aware),
+    \texttt{l3-tail-only}~$=$~on,
+    \texttt{l3-regression-tolerance}~$=0.0$.
+  \item Validated-frontier kneedle: KL noise floor
+    $\eta$ default $5\times 10^{-4}$, bisection tolerance $0.05$ bpp,
+    leave-one-out at $\ge 4$ frontier points.
+  \item Coord descent: \texttt{max-passes}~$=1$,
+    \texttt{early-stop-streak}~$=50$,
+    \texttt{max-lanes-per-batch}~$=64$.
+\end{itemize}
+
+\end{document}

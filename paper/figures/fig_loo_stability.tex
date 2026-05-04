@@ -1,0 +1,92 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\scriptsize},
+  pt/.style={circle, draw=accent2, fill=accent2!30, inner sep=1.0pt},
+  pt_removed/.style={circle, draw=accent2!50, fill=white, inner sep=1.0pt},
+  knee_orig/.style={circle, draw=accent3, fill=accent3, inner sep=1.4pt},
+  knee_loo/.style={circle, draw=accent3!70, fill=accent3!10, inner sep=1.0pt},
+  axis/.style={->, thick, draw=rule}
+]
+
+% Three panels side by side: full, leave-one-out (i=2), leave-one-out (i=3)
+\foreach \panel/\title/\removed in {0/full frontier/-1, 5/leave-out point 2/2, 10/leave-out point 3/3} {
+  \begin{scope}[xshift=\panel cm]
+    \draw[axis] (0,0) -- (4.2,0) node[below right]{$\bpp$};
+    \draw[axis] (0,0) -- (0,3.0) node[above left]{KL};
+
+    % 5 frontier points
+    \pgfmathsetmacro{\xa}{0.4}\pgfmathsetmacro{\ya}{2.5}
+    \pgfmathsetmacro{\xb}{1.2}\pgfmathsetmacro{\yb}{1.5}
+    \pgfmathsetmacro{\xc}{2.0}\pgfmathsetmacro{\yc}{0.8}  % near-knee
+    \pgfmathsetmacro{\xd}{2.8}\pgfmathsetmacro{\yd}{0.45}
+    \pgfmathsetmacro{\xe}{3.6}\pgfmathsetmacro{\ye}{0.25}
+
+    % Render points (filled or empty depending on removed)
+    \ifnum\removed=2
+      \node[pt_removed] at (\xb,\yb) {};
+      \node[pt] at (\xa,\ya) {};
+      \node[pt] at (\xc,\yc) {};
+      \node[pt] at (\xd,\yd) {};
+      \node[pt] at (\xe,\ye) {};
+    \else
+      \ifnum\removed=3
+        \node[pt_removed] at (\xc,\yc) {};
+        \node[pt] at (\xa,\ya) {};
+        \node[pt] at (\xb,\yb) {};
+        \node[pt] at (\xd,\yd) {};
+        \node[pt] at (\xe,\ye) {};
+      \else
+        \node[pt] at (\xa,\ya) {};
+        \node[pt] at (\xb,\yb) {};
+        \node[pt] at (\xc,\yc) {};
+        \node[pt] at (\xd,\yd) {};
+        \node[pt] at (\xe,\ye) {};
+      \fi
+    \fi
+
+    % Secant on remaining points
+    \ifnum\removed=2
+      \draw[draw=accent, dashed] (\xa,\ya) -- (\xe,\ye);
+    \else
+      \ifnum\removed=3
+        \draw[draw=accent, dashed] (\xa,\ya) -- (\xe,\ye);
+      \else
+        \draw[draw=accent, dashed] (\xa,\ya) -- (\xe,\ye);
+      \fi
+    \fi
+
+    % Knee marker (different position depending on which is removed)
+    \ifnum\removed=2
+      % LOO knee shifts slightly
+      \node[knee_loo] at (\xd,\yd) {};
+      \node[anchor=north, font=\tiny, text=accent3!70] at (\xd,\yd-0.15) {LOO};
+    \else
+      \ifnum\removed=3
+        % Removing the actual knee shifts further
+        \node[knee_loo] at (\xb,\yb) {};
+        \node[anchor=north, font=\tiny, text=accent3!70] at (\xb,\yb-0.15) {LOO};
+      \else
+        \node[knee_orig] at (\xc,\yc) {};
+        \node[anchor=north, font=\tiny, text=accent3] at (\xc,\yc-0.15) {knee};
+      \fi
+    \fi
+
+    \node[font=\scriptsize\itshape, anchor=south] at (2.1, 3.05) {\title};
+  \end{scope}
+}
+
+\end{tikzpicture}
+\caption{Leave-one-out kneedle stability. The diagnostic re-runs the
+kneedle algorithm on each subset of size $|F|-1$ obtained by removing one
+frontier point. If the maximum bpp shift across removals exceeds tolerance,
+or the maximum KL shift exceeds the noise floor $\eta$, the search emits
+an instability warning and records both the original knee and a guarded
+fallback. In the synthetic example shown: removing a non-knee point
+(middle) leaves the knee location nearly unchanged; removing the knee point
+itself (right) shifts the LOO knee to a neighboring frontier point. A
+configuration that produces shifts of the latter type at every removal is
+an indication that the bracket is too wide or the frontier is
+under-sampled.}
+\label{fig:loo_stability}
+\end{figure}

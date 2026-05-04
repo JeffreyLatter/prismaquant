@@ -1,0 +1,58 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\scriptsize},
+  rejected/.style={draw=accent2!70, fill=accent2!7, rounded corners=2pt,
+                   align=left, inner sep=3pt, minimum width=39mm},
+  experimental/.style={draw=rule!60, fill=rule!7, rounded corners=2pt,
+                       align=left, inner sep=3pt, minimum width=39mm},
+  shipped/.style={draw=accent3, fill=accent3!10, rounded corners=2pt,
+                  align=left, inner sep=3pt, minimum width=39mm},
+  arr/.style={-{Latex[length=1.6mm]}, draw=rule}
+]
+  \node[font=\small\bfseries] (root) at (0, 0) {Selection method};
+
+  % Three columns: rejected, experimental, shipped
+  \node[font=\bfseries, text=accent2,  anchor=west] at (-7.4, -0.9) {Rejected};
+  \node[font=\bfseries, text=rule,     anchor=west] at (-2.3, -0.9) {Experimental};
+  \node[font=\bfseries, text=accent3,  anchor=west] at ( 2.7, -0.9) {Shipped};
+
+  % Rejected
+  \node[rejected, anchor=west] (r1) at (-7.4, -1.7)
+    {Surrogate-only knee\\\itshape on Qwen 27B picks $5.857/0.056$};
+  \node[rejected, anchor=west] (r2) at (-7.4, -3.3)
+    {Top-$K$ Hessian covering\\\itshape blind to propagation graph};
+  \node[rejected, anchor=west] (r3) at (-7.4, -4.9)
+    {Probe-only prediction (final selector)\\\itshape $\pm 0.15$ bpp $\gg$ state density};
+
+  % Experimental
+  \node[experimental, anchor=west] (e1) at (-2.3, -1.7)
+    {Lagrangian $\lambda$-bisection\\\itshape skips concave pockets};
+  \node[experimental, anchor=west] (e2) at (-2.3, -3.3)
+    {Sandwich proximal recalibration\\\itshape coord-descent cheaper, monotone};
+  \node[experimental, anchor=west] (e3) at (-2.3, -4.9)
+    {Sparse pairwise QUBO (SMRF)\\\itshape default off; 8/500 = homeopathic};
+  \node[experimental, anchor=west] (e4) at (-2.3, -6.5)
+    {Block-DP over V$\to$O / Gate$\to$Down\\\itshape sibling aggregation already absorbs};
+
+  % Shipped
+  \node[shipped, anchor=west] (s1) at (2.7, -1.7)
+    {$L_1$/$L_2$/$L_3$ cost hierarchy};
+  \node[shipped, anchor=west] (s2) at (2.7, -3.3)
+    {Pareto archive DP (candidate gen)};
+  \node[shipped, anchor=west] (s3) at (2.7, -4.9)
+    {Validated-frontier kneedle\\\itshape $\eta$-non-dom + LOO + bisection};
+  \node[shipped, anchor=west] (s4) at (2.7, -6.5)
+    {Coord descent (monotone)};
+
+\end{tikzpicture}
+\caption{Methods considered during design, classified by status. \emph{Shipped}
+(green) is the production path. \emph{Experimental} (gray) is implemented
+in the codebase but disabled or hidden from the user-facing CLI; remains
+available for stronger interaction regimes. \emph{Rejected} (red) was
+proposed and analyzed but did not survive empirical or structural
+analysis. Each method is principled in its regime; the column it lands in
+reflects whether that regime matches modern transformer
+mixed-precision allocation under a real-KL gate.}
+\label{fig:methods_tree}
+\end{figure}

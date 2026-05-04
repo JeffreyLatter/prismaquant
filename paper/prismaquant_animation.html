@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>PrismaSCOUT — Validated-Frontier Kneedle Animation</title>
+<style>
+  :root {
+    --accent: #1f3a93;
+    --accent2: #c0392b;
+    --accent3: #27ae60;
+    --rule: #888;
+    --bg: #fafafa;
+    --fg: #222;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+                 Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+  }
+  .container {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 32px 24px 64px 24px;
+  }
+  h1 {
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: var(--accent);
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 6px;
+    margin-bottom: 4px;
+  }
+  h1 small { color: var(--rule); font-weight: 400; font-size: 0.85rem; display: block; }
+  .subtitle { color: var(--rule); font-size: 0.95rem; margin-bottom: 24px; }
+  .stage-card {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 16px 20px;
+    margin: 18px 0;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  }
+  .stage-title { font-weight: 600; color: var(--accent); margin: 0 0 6px 0; font-size: 1.05rem; }
+  .stage-desc  { font-size: 0.92rem; color: #444; margin: 0 0 12px 0; }
+  .controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin: 16px 0 8px 0;
+    flex-wrap: wrap;
+  }
+  .controls button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 7px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .controls button:hover { background: #16306f; }
+  .controls button:disabled { background: #999; cursor: not-allowed; }
+  .controls input[type="range"] { flex: 1; min-width: 200px; }
+  .controls .step-label {
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-size: 0.85rem;
+    color: var(--rule);
+    min-width: 90px;
+  }
+  svg { display: block; margin: 0 auto; background: white; border: 1px solid #eee; border-radius: 4px; }
+  .footnote {
+    color: var(--rule);
+    font-size: 0.85rem;
+    margin-top: 20px;
+    border-top: 1px solid #eee;
+    padding-top: 12px;
+  }
+  .footnote code { background: #f4f4f4; padding: 1px 4px; border-radius: 2px; }
+  .legend {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    font-size: 0.82rem;
+    color: #444;
+    margin-top: 8px;
+  }
+  .legend-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .narration {
+    background: #f5f8ff;
+    border-left: 3px solid var(--accent);
+    padding: 10px 14px;
+    margin: 12px 0;
+    font-size: 0.93rem;
+    min-height: 44px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>PrismaSCOUT
+    <small>validated-frontier kneedle: the non-additivity gating story, animated</small>
+  </h1>
+  <div class="subtitle">
+    Companion to <em>PrismaQuant and PrismaSCOUT: Operational Rate–Distortion for
+    Mixed-Precision LLM Quantization</em> (Tand 2026). This page steps through the
+    additive-DP proposal, the real-KL gate, the rollback, and the
+    coordinate-descent polish &mdash; the operational core of the algorithm.
+  </div>
+
+  <div class="stage-card">
+    <div class="stage-title" id="stage-title">Stage 0 &mdash; initial L₂ assignment</div>
+    <div class="stage-desc" id="stage-desc">
+      The L₂ perturbed-X fixed point has converged. Each Linear has a per-format
+      cost <em>uᵢ(f)</em> measured under the activation cache of the current
+      assignment. The held-out KL is the baseline.
+    </div>
+    <div class="narration" id="narration">
+      Press <strong>Play</strong> or scrub the slider to walk through the gating
+      story. The y-axis tracks measured KL on the held-out validation split.
+    </div>
+
+    <svg id="canvas" width="900" height="380" viewBox="0 0 900 380"></svg>
+
+    <div class="legend">
+      <span><span class="legend-swatch" style="background:var(--accent)"></span>predicted KL (additive surrogate)</span>
+      <span><span class="legend-swatch" style="background:var(--accent2)"></span>measured KL (held-out)</span>
+      <span><span class="legend-swatch" style="background:var(--accent3)"></span>coord-descent (real-KL gated)</span>
+      <span><span class="legend-swatch" style="background:#bbb"></span>trust region of ∑ uᵢ</span>
+    </div>
+
+    <div class="controls">
+      <button id="play-btn">▶ Play</button>
+      <button id="reset-btn">⟲ Reset</button>
+      <input id="scrub" type="range" min="0" max="9" value="0" step="0.01" />
+      <span class="step-label" id="step-label">0 / 9</span>
+    </div>
+  </div>
+
+  <div class="footnote">
+    The trace above is illustrative. The numerical anchor is Qwen3.6-4B at the
+    4.5 bpp anchor: KL <code>0.371</code> after L₂, <code>0.461</code> after the
+    additive L₃ polish DP (rolled back by the real-KL gate), and
+    <code>0.245</code> after coord descent (6 of 101 attempted flips committed).
+    The 27B production result extends the same pattern at production scale:
+    <code>5.31 bpp / KL 0.0151</code> against a previously shipped <code>5.50 bpp /
+    KL 0.0475</code>.
+  </div>
+</div>
+
+<script>
+(() => {
+  const svg = document.getElementById("canvas");
+  const W = 900, H = 380;
+  const padL = 60, padR = 30, padT = 30, padB = 40;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  // Coordinate space: x = "step number" 0..9, y = KL 0..0.55
+  const xMin = 0, xMax = 9;
+  const yMin = 0, yMax = 0.55;
+
+  function xToPx(x) { return padL + ((x - xMin) / (xMax - xMin)) * plotW; }
+  function yToPx(y) { return padT + (1 - (y - yMin) / (yMax - yMin)) * plotH; }
+
+  // Define the trace data
+  // Stage 0 (L2 converged):  KL = 0.371
+  // Stage 1 (additive proposal grows): KL_pred drops linearly toward 0.30, KL_meas tracks
+  // Stage 2 (overshoots trust region): KL_meas explodes upward to 0.461 (regression)
+  // Stage 3 (real-KL gate detects, rolls back): KL returns to 0.371
+  // Stages 4-9 (coord descent): single flips, monotone decrease to 0.245
+
+  // We animate by drawing predicted/measured curves up to a parameter t in [0..9].
+
+  // Build polylines
+  const trustRegionEnd = 4.0; // surrogate trust region edge
+  const stages = {
+    L2_KL: 0.371,
+    pred_at_overshoot: 0.30,
+    meas_at_overshoot: 0.461,
+    rolled_back_KL: 0.371,
+    final_KL: 0.245,
+  };
+
+  function predictedAt(t) {
+    // additive surrogate: monotonically decreases from 0.371 toward 0.30 over [0..3]
+    // then continues flat after rollback
+    if (t <= 0) return stages.L2_KL;
+    if (t <= 3) {
+      const frac = t / 3;
+      return stages.L2_KL - (stages.L2_KL - stages.pred_at_overshoot) * frac;
+    }
+    return stages.pred_at_overshoot;
+  }
+
+  function measuredAt(t) {
+    // measured tracks predicted in trust region [0..2], then explodes [2..3] to 0.461,
+    // rolls back at 3 (vertical drop), then coord descent monotone decrease 4..9 to 0.245
+    if (t <= 0) return stages.L2_KL;
+    if (t <= 2) {
+      const frac = t / 2;
+      return stages.L2_KL - (stages.L2_KL - 0.32) * frac;
+    }
+    if (t <= 3) {
+      const frac = (t - 2) / 1;
+      return 0.32 + (stages.meas_at_overshoot - 0.32) * frac;
+    }
+    if (t <= 4) {
+      // rollback step
+      return stages.rolled_back_KL;
+    }
+    // coord descent stairsteps from 0.371 -> 0.245 over [4..9]
+    const cdStages = [
+      [4.0, 0.371],
+      [4.8, 0.345],
+      [5.6, 0.315],
+      [6.4, 0.290],
+      [7.2, 0.270],
+      [8.0, 0.255],
+      [9.0, 0.245],
+    ];
+    for (let i = 0; i < cdStages.length - 1; i++) {
+      const [tA, kA] = cdStages[i];
+      const [tB, kB] = cdStages[i + 1];
+      if (t >= tA && t <= tB) {
+        const frac = (t - tA) / (tB - tA);
+        return kA - (kA - kB) * frac;
+      }
+    }
+    return 0.245;
+  }
+
+  function setupAxes() {
+    // Border + axes
+    const xs = [0,1,2,3,4,5,6,7,8,9];
+    const ys = [0, 0.1, 0.2, 0.3, 0.4, 0.5];
+    let html = "";
+    // grid + ticks
+    ys.forEach(y => {
+      html += `<line x1="${xToPx(xMin)}" y1="${yToPx(y)}" x2="${xToPx(xMax)}" y2="${yToPx(y)}"
+                stroke="#eee" />`;
+      html += `<text x="${padL - 6}" y="${yToPx(y) + 4}" font-size="11"
+                text-anchor="end" fill="#666">${y.toFixed(1)}</text>`;
+    });
+    xs.forEach(x => {
+      html += `<line x1="${xToPx(x)}" y1="${yToPx(yMin)}" x2="${xToPx(x)}" y2="${yToPx(yMin) + 4}"
+                stroke="#888" />`;
+      html += `<text x="${xToPx(x)}" y="${yToPx(yMin) + 18}" font-size="11"
+                text-anchor="middle" fill="#666">${x}</text>`;
+    });
+    // axis labels
+    html += `<text x="${padL + plotW/2}" y="${H - 6}" font-size="12" text-anchor="middle"
+              fill="#444">step</text>`;
+    html += `<text x="14" y="${padT + plotH/2}" font-size="12" text-anchor="middle"
+              fill="#444" transform="rotate(-90, 14, ${padT + plotH/2})">held-out KL</text>`;
+    // axes
+    html += `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${yToPx(yMin)}"
+              stroke="#444" stroke-width="1.2"/>`;
+    html += `<line x1="${padL}" y1="${yToPx(yMin)}" x2="${xToPx(xMax)}" y2="${yToPx(yMin)}"
+              stroke="#444" stroke-width="1.2"/>`;
+    return html;
+  }
+
+  function trustRegionShade() {
+    // Shaded region [0..2] indicating linear-approximation trust region
+    return `<rect x="${xToPx(0)}" y="${padT}"
+                  width="${xToPx(2.0) - xToPx(0)}" height="${plotH}"
+                  fill="#bbb" fill-opacity="0.10"/>
+            <text x="${xToPx(1.0)}" y="${padT + 16}"
+                  font-size="11" font-style="italic" fill="#888"
+                  text-anchor="middle">trust region of ∑ uᵢ</text>`;
+  }
+
+  function predictedPath(tMax) {
+    const samples = 100;
+    const tEnd = Math.min(tMax, 4.0);
+    if (tEnd <= 0) return "";
+    let d = `M ${xToPx(0)} ${yToPx(predictedAt(0))}`;
+    for (let i = 1; i <= samples; i++) {
+      const t = (i / samples) * tEnd;
+      d += ` L ${xToPx(t)} ${yToPx(predictedAt(t))}`;
+    }
+    return `<path d="${d}" stroke="#1f3a93" stroke-width="2.5" fill="none" />`;
+  }
+
+  function measuredPath(tMax) {
+    const samples = 200;
+    const tEnd = Math.min(tMax, 9.0);
+    if (tEnd <= 0) return "";
+    let d = `M ${xToPx(0)} ${yToPx(measuredAt(0))}`;
+    let lastWasRollback = false;
+    for (let i = 1; i <= samples; i++) {
+      const t = (i / samples) * tEnd;
+      const k = measuredAt(t);
+      if (t > 3 && t < 4 && !lastWasRollback) {
+        // rollback drop
+        d += ` L ${xToPx(3)} ${yToPx(stages.meas_at_overshoot)}`;
+        d += ` L ${xToPx(3.001)} ${yToPx(stages.rolled_back_KL)}`;
+        lastWasRollback = true;
+      }
+      d += ` L ${xToPx(t)} ${yToPx(k)}`;
+    }
+    // pre-rollback measured (red) up to 3
+    let dRed = `M ${xToPx(0)} ${yToPx(measuredAt(0))}`;
+    const tRedEnd = Math.min(tEnd, 3);
+    for (let i = 1; i <= samples; i++) {
+      const t = (i / samples) * tRedEnd;
+      dRed += ` L ${xToPx(t)} ${yToPx(measuredAt(t))}`;
+    }
+    let out = `<path d="${dRed}" stroke="#c0392b" stroke-width="2.5" fill="none" />`;
+    // rollback marker
+    if (tEnd >= 3) {
+      out += `<line x1="${xToPx(3)}" y1="${yToPx(stages.meas_at_overshoot)}"
+                    x2="${xToPx(3)}" y2="${yToPx(stages.rolled_back_KL)}"
+                    stroke="#c0392b" stroke-width="2" stroke-dasharray="4 3"/>`;
+      out += `<circle cx="${xToPx(3)}" cy="${yToPx(stages.meas_at_overshoot)}" r="4"
+                fill="white" stroke="#c0392b" stroke-width="2"/>`;
+      out += `<text x="${xToPx(3) + 8}" y="${yToPx(stages.meas_at_overshoot) - 6}"
+                fill="#c0392b" font-size="11" font-style="italic">regression detected; rollback</text>`;
+    }
+    // green coord descent staircase 4..tMax
+    if (tEnd >= 4) {
+      const cdStages = [
+        [4.0, 0.371],[4.8, 0.345],[5.6, 0.315],[6.4, 0.290],
+        [7.2, 0.270],[8.0, 0.255],[9.0, 0.245],
+      ];
+      let dGreen = `M ${xToPx(4)} ${yToPx(0.371)}`;
+      for (let i = 1; i < cdStages.length; i++) {
+        const [tA, kA] = cdStages[i - 1];
+        const [tB, kB] = cdStages[i];
+        if (tEnd >= tA) {
+          const tStep = Math.min(tEnd, tB);
+          // horizontal then drop
+          dGreen += ` L ${xToPx(tStep)} ${yToPx(kA)}`;
+          if (tEnd >= tB) {
+            dGreen += ` L ${xToPx(tB)} ${yToPx(kB)}`;
+          }
+        }
+      }
+      out += `<path d="${dGreen}" stroke="#27ae60" stroke-width="2.5" fill="none"
+                stroke-linejoin="miter"/>`;
+      // markers for each accepted flip
+      cdStages.forEach(([t, k], idx) => {
+        if (tEnd >= t && idx > 0) {
+          out += `<circle cx="${xToPx(t)}" cy="${yToPx(k)}" r="3.4"
+                  fill="#27ae60" stroke="#1d8049" stroke-width="0.8"/>`;
+        }
+      });
+    }
+    return out;
+  }
+
+  function annotations(tMax) {
+    let out = "";
+    // baseline marker (KL = 0.371)
+    out += `<line x1="${padL}" y1="${yToPx(stages.L2_KL)}"
+                  x2="${xToPx(xMax)}" y2="${yToPx(stages.L2_KL)}"
+                  stroke="#888" stroke-width="0.8" stroke-dasharray="3 4"/>`;
+    out += `<text x="${xToPx(xMax)}" y="${yToPx(stages.L2_KL) - 4}"
+              font-size="11" fill="#666" text-anchor="end" font-style="italic">L₂ baseline 0.371</text>`;
+    // final KL (when reached)
+    if (tMax >= 9) {
+      out += `<line x1="${padL}" y1="${yToPx(stages.final_KL)}"
+                    x2="${xToPx(xMax)}" y2="${yToPx(stages.final_KL)}"
+                    stroke="#27ae60" stroke-width="0.8" stroke-dasharray="3 4"/>`;
+      out += `<text x="${xToPx(xMax)}" y="${yToPx(stages.final_KL) - 4}"
+                font-size="11" fill="#27ae60" text-anchor="end"
+                font-style="italic">coord descent 0.245 (−34%)</text>`;
+    }
+    return out;
+  }
+
+  function render(t) {
+    let html = "";
+    html += setupAxes();
+    html += trustRegionShade();
+    html += predictedPath(t);
+    html += measuredPath(t);
+    html += annotations(t);
+    svg.innerHTML = html;
+  }
+
+  // Stage descriptions
+  const stagesText = [
+    {
+      title: "Stage 0 — initial L₂ assignment",
+      desc: "L₂ perturbed-X fixed point has converged. KL is the baseline at 0.371.",
+      narr: "We start at the converged L₂ assignment. Every Linear has a per-format cost measured under the activation cache of the current assignment.",
+    },
+    {
+      title: "Stage 1 — additive DP proposal (in trust region)",
+      desc: "DP greedily flips formats to chase the surrogate gradient ∑ uᵢ.",
+      narr: "Inside the trust region of the linear approximation, the surrogate prediction (blue) and the real measured KL (red) track each other.",
+    },
+    {
+      title: "Stage 2 — DP commits many flips at once",
+      desc: "The proposal continues outside the trust region of the surrogate.",
+      narr: "The DP keeps committing flips. The predicted KL keeps dropping; the measured KL stops following.",
+    },
+    {
+      title: "Stage 3 — non-additivity overshoot",
+      desc: "Measured KL diverges from predicted: the surrogate underestimates joint cost.",
+      narr: "Outside the trust region, the additive surrogate is no longer a faithful local model of the true KL. The measured KL has overshot to 0.461 (+24% over baseline).",
+    },
+    {
+      title: "Stage 4 — real-KL gate detects regression; rollback",
+      desc: "The held-out validation KL is checked against the prior assignment.",
+      narr: "The real-KL gate catches the regression and rolls the proposal back to the prior assignment. We are back at KL 0.371 — no worse than where we started.",
+    },
+    {
+      title: "Stage 5 — coord-descent flip 1",
+      desc: "Single-Linear flip ranked by L₃ unary cost; accept iff measured KL strictly decreases.",
+      narr: "Coord descent now starts. Each attempt tries one Linear at a time, ranked by L₃ unary cost, and only accepts the flip if the held-out KL strictly decreases.",
+    },
+    { title: "Stage 6 — coord-descent flip 2", desc: "Monotone non-increasing by construction.", narr: "Another flip lands. The trace is monotone non-increasing — that's the structural guarantee of the polish." },
+    { title: "Stage 7 — coord-descent flip 3", desc: "Many proposals are rejected; only strict improvers are kept.", narr: "Most attempted flips don't pass the gate. They're rejected silently; only strict improvers move the trace down." },
+    { title: "Stage 8 — coord-descent flip 4–5", desc: "Diminishing returns near the elbow.", narr: "We're approaching diminishing returns: each accepted flip buys less KL than the previous one." },
+    {
+      title: "Stage 9 — final assignment, KL 0.245 (−34% vs L₂)",
+      desc: "6 of 101 attempted flips committed; final KL provably ≤ chosen knee KL.",
+      narr: "Final assignment: KL 0.245. 34% improvement over the L₂ baseline. By construction, the shipped assignment is no worse than the chosen frontier point.",
+    },
+  ];
+
+  function update(t) {
+    render(t);
+    const stageIdx = Math.min(9, Math.floor(t));
+    document.getElementById("stage-title").innerText = stagesText[stageIdx].title;
+    document.getElementById("stage-desc").innerText = stagesText[stageIdx].desc;
+    document.getElementById("narration").innerText = stagesText[stageIdx].narr;
+    document.getElementById("step-label").innerText = `${t.toFixed(1)} / 9.0`;
+    document.getElementById("scrub").value = t;
+  }
+
+  // Animation
+  let playing = false;
+  let rafId = null;
+  let startTime = null;
+  let startT = 0;
+  const duration = 12000; // 12s for full trace
+
+  function tick(now) {
+    if (!playing) return;
+    if (startTime === null) startTime = now;
+    const elapsed = now - startTime;
+    const t = startT + (elapsed / duration) * (9 - startT);
+    if (t >= 9) {
+      update(9);
+      playing = false;
+      document.getElementById("play-btn").innerText = "▶ Play";
+      return;
+    }
+    update(t);
+    rafId = requestAnimationFrame(tick);
+  }
+
+  document.getElementById("play-btn").addEventListener("click", () => {
+    playing = !playing;
+    if (playing) {
+      const cur = parseFloat(document.getElementById("scrub").value);
+      startT = (cur >= 9) ? 0 : cur;
+      startTime = null;
+      document.getElementById("play-btn").innerText = "⏸ Pause";
+      rafId = requestAnimationFrame(tick);
+    } else {
+      document.getElementById("play-btn").innerText = "▶ Play";
+      cancelAnimationFrame(rafId);
+    }
+  });
+
+  document.getElementById("reset-btn").addEventListener("click", () => {
+    playing = false;
+    cancelAnimationFrame(rafId);
+    document.getElementById("play-btn").innerText = "▶ Play";
+    update(0);
+  });
+
+  document.getElementById("scrub").addEventListener("input", (e) => {
+    if (playing) {
+      playing = false;
+      cancelAnimationFrame(rafId);
+      document.getElementById("play-btn").innerText = "▶ Play";
+    }
+    update(parseFloat(e.target.value));
+  });
+
+  update(0);
+})();
+</script>
+</body>
+</html>

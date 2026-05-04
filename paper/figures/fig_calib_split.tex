@@ -1,0 +1,46 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small},
+  block/.style={draw=accent, fill=accent!7, rounded corners=2pt,
+                minimum width=24mm, minimum height=11mm, align=center, inner sep=2pt},
+  block2/.style={draw=accent3, fill=accent3!8, rounded corners=2pt,
+                minimum width=24mm, minimum height=11mm, align=center, inner sep=2pt},
+  arr/.style={-{Latex[length=2mm]}, thick, draw=rule}
+]
+  \node[draw=rule!40, fill=rule!4, rounded corners=2pt,
+        minimum width=46mm, minimum height=10mm, align=center, inner sep=2pt] (corpus)
+    {wikitext / chat-formatted calibration};
+
+  \node[block, below=7mm of corpus, xshift=-15mm] (train) {\textbf{train split}\\\scriptsize\texttt{l3\_calib\_split=train}};
+  \node[block2, below=7mm of corpus, xshift=15mm] (val)   {\textbf{validation split}\\\scriptsize\texttt{kl\_calib\_split=validation}};
+
+  \draw[arr] (corpus.south west) ++(8mm,0) -- (train.north);
+  \draw[arr] (corpus.south east) ++(-8mm,0) -- (val.north);
+
+  \node[draw=accent!30, fill=accent!4, rounded corners=2pt, align=left,
+        below=4mm of train, inner sep=3pt, font=\scriptsize, minimum width=42mm]
+    (trainuse) {\textbullet{} $L_2$ activation cache\\\textbullet{} $L_3$ paired baseline\\\textbullet{} additive surrogate generation};
+
+  \node[draw=accent3!30, fill=accent3!4, rounded corners=2pt, align=left,
+        below=4mm of val, inner sep=3pt, font=\scriptsize, minimum width=42mm]
+    (valuse) {\textbullet{} real-KL gate\\\textbullet{} validated-frontier kneedle\\\textbullet{} coord-descent acceptance\\\textbullet{} artifact metadata};
+
+  \draw[arr] (train) -- (trainuse);
+  \draw[arr] (val)   -- (valuse);
+
+  \draw[draw=accent2, very thick, decorate, decoration={brace, amplitude=2mm}]
+    (-3.4, -3.95) -- (-3.4, -1.0)
+    node[midway, left=2mm, font=\scriptsize, text=accent2, align=right]{never seen by\\cost stages};
+
+\end{tikzpicture}
+\caption{Calibration split discipline. The train split feeds all surrogate
+cost-generation stages ($L_2$ activation cache, $L_3$ paired baseline,
+additive DP). The validation split feeds every selection decision
+(real-KL gate, kneedle, coord descent, artifact metadata) and is never
+seen by any cost stage. Until commit \texttt{2e670b3} (PR-Polish-1), the
+field labelled \texttt{validation\_kl} could be reasonably misread as
+held-out; that field has been renamed throughout to require disjoint splits
+in the shipping path.}
+\label{fig:calib_split}
+\end{figure}

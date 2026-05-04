@@ -1,0 +1,80 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\linewidth,
+  height=6.0cm,
+  xlabel={Achieved $\bpp$},
+  ylabel={Held-out KL},
+  xmin=5.10, xmax=6.65,
+  ymin=0.0, ymax=0.085,
+  grid=both,
+  major grid style={draw=rule!20},
+  minor grid style={draw=rule!10},
+  axis line style={draw=rule},
+  tick label style={font=\scriptsize},
+  label style={font=\scriptsize},
+  title style={font=\scriptsize\itshape},
+  title={Qwen3.6-27B validated frontier (held-out, 8$\times$512 tokens)},
+  legend style={font=\scriptsize, draw=rule!30, fill=white, at={(0.97,0.97)}, anchor=north east},
+  legend cell align={left}
+]
+% Validated points (achieved_bpp, validation_kl) from the 27B run
+\addplot[
+  only marks, mark=*, mark size=1.6pt,
+  color=accent2, fill=accent2!30
+]
+table[row sep=\\] {
+x  y  \\
+5.1656 0.053241 \\
+5.3117 0.015128 \\
+5.3371 0.018352 \\
+5.5090 0.046646 \\
+5.6853 0.031769 \\
+5.8336 0.033356 \\
+5.8569 0.055692 \\
+5.8801 0.071730 \\
+6.0564 0.051443 \\
+6.2280 0.075630 \\
+6.4043 0.052859 \\
+6.5759 0.025567 \\
+};
+\addlegendentry{measured candidate}
+
+% Validated knee (5.31)
+\addplot[
+  only marks, mark=*, mark size=2.7pt,
+  color=accent3
+] coordinates {(5.3117, 0.015128)};
+\addlegendentry{validated knee (5.31, 0.015)}
+
+% Surrogate-only knee pick (5.857)
+\addplot[
+  only marks, mark=square*, mark size=2.4pt,
+  color=accent
+] coordinates {(5.8569, 0.055692)};
+\addlegendentry{surrogate-only kneedle pick}
+
+% Annotation for shipped 5.5
+\addplot[
+  only marks, mark=triangle*, mark size=2.5pt,
+  color=rule
+] coordinates {(5.5, 0.0475)};
+\addlegendentry{prior PrismaQuant\,v1 5.5}
+
+\node[font=\scriptsize, text=accent3, anchor=west] at (axis cs:5.32,0.005) {chosen};
+\node[font=\scriptsize, text=accent, anchor=west] at (axis cs:5.86,0.061) {surrogate};
+\node[font=\scriptsize, text=rule, anchor=south] at (axis cs:5.5,0.049) {v1 ship};
+
+\end{axis}
+\end{tikzpicture}
+\caption{Validated-frontier candidates measured on the held-out validation
+split for Qwen3.6-27B. The surrogate-only kneedle on the same set picks
+$5.857$\,bpp at KL $0.056$ (blue square). The validated kneedle picks
+$5.3117$\,bpp at KL $0.0151$ (green dot, shipped artifact). The previously
+shipped \textsc{PrismaQuant}~v1 artifact at $5.50$\,bpp / KL $0.0475$ (gray
+triangle) sits clearly inside the validated frontier --- the new selector
+finds a strictly better point at lower bpp.}
+\label{fig:surrogate_vs_validated}
+\label{fig:validated_27b}
+\end{figure}

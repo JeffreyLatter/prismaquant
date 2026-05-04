@@ -1,0 +1,65 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small},
+  pt/.style={circle, draw=accent2, fill=accent2!30, inner sep=1.2pt},
+  filtered/.style={circle, draw=rule!50, fill=rule!10, inner sep=1.2pt},
+  knee/.style={circle, draw=accent3, fill=accent3, inner sep=1.6pt},
+  loo/.style={circle, draw=accent3!70, fill=accent3!10, inner sep=1.2pt},
+  axis/.style={->, thick, draw=rule}
+]
+  \def\xa{0}\def\xb{8.0}\def\ya{0}\def\yb{4.5}
+  \draw[axis] (\xa,\ya) -- (\xb,\ya) node[below right, font=\scriptsize]{$\bpp$ (achieved)};
+  \draw[axis] (\xa,\ya) -- (\xa,\yb) node[above left, font=\scriptsize]{KL (held-out)};
+
+  % Pareto-frontier-shaped points
+  \node[pt] (P1) at (0.6, 4.0) {};
+  \node[pt] (P2) at (1.5, 2.5) {};
+  \node[pt] (P3) at (2.6, 1.5) {};
+  \node[pt] (P4) at (3.7, 0.95) {}; % near-knee
+  \node[pt] (P5) at (5.0, 0.55) {};
+  \node[pt] (P6) at (6.4, 0.30) {};
+  \node[pt] (P7) at (7.6, 0.20) {};
+
+  % Filtered (eta-dominated) point — same bpp neighborhood, slightly worse KL
+  \node[filtered] (F1) at (3.6, 1.10) {};
+  \node[filtered] (F2) at (5.1, 0.62) {};
+
+  % Secant
+  \draw[draw=accent, dashed] (P1) -- (P7);
+
+  % Knee (highlight P4)
+  \node[knee, label={[font=\scriptsize, text=accent3]below right:knee $i^\star$ (chosen)}] at (P4) {};
+
+  % Perpendicular drop from knee to secant
+  \coordinate (Pfoot) at ($ (P1)!(P4)!(P7) $);
+  \draw[draw=accent3, very thick, -{Latex[length=1.5mm]}] (P4) -- (Pfoot)
+    node[midway, sloped, above, font=\scriptsize, text=accent3]{$d^\perp_i$};
+
+  % LOO shadow knees
+  \node[loo, label={[font=\scriptsize, text=accent3!70]above:LOO}] at ($(P4)+(0.55,-0.05)$) {};
+  \node[loo] at ($(P4)+(-0.40,0.08)$) {};
+
+  % Annotations
+  \node[font=\scriptsize, text=rule, anchor=east] at (3.4, 1.10) {filtered};
+  \node[font=\scriptsize, text=rule, anchor=west] at (5.2, 0.62) {by $\eta$};
+
+  \node[font=\scriptsize, anchor=west] at (5.6, 3.6)
+   {\begin{tabular}{@{}l@{}}
+     {\color{accent2}$\bullet$} measured frontier point\\
+     {\color{accent3}$\bullet$} chosen kneedle\\
+     {\color{accent3!70}$\circ$} leave-one-out shadow\\
+     {\color{rule}$\circ$} $\eta$-dominated, filtered
+    \end{tabular}};
+\end{tikzpicture}
+\caption{Validated-frontier kneedle. Each point on the frontier is a
+real, end-to-end held-out KL measurement of a materialized candidate
+assignment. The dominance filter widens by an explicit KL noise floor
+$\eta$. The chosen knee maximizes perpendicular distance to the
+endpoint-secant after min-max normalization
+(Equation~\ref{eq:kneedle}). The leave-one-out diagnostic re-runs the
+kneedle on each subset of size $|F|-1$; if the maximum bpp shift exceeds
+tolerance, the search emits an instability warning and records a guarded
+fallback knee.}
+\label{fig:kneedle}
+\end{figure}

@@ -1,0 +1,48 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small},
+  axis/.style={->, thick, draw=rule}
+]
+  \def\xa{0}\def\xb{9.5}\def\ya{0}\def\yb{4.0}
+  \draw[axis] (\xa,\ya) -- (\xb,\ya) node[below right, font=\scriptsize]{flip attempt};
+  \draw[axis] (\xa,\ya) -- (\xa,\yb) node[above left, font=\scriptsize]{KL (held-out)};
+
+  % Stairstep monotone non-increasing — accepted flips only step down
+  \def\step#1#2#3#4{ % (x_old, y_old, x_new, y_new)
+    \draw[draw=accent3, very thick] (#1,#2) -- (#3,#2) -- (#3,#4);
+  }
+  \draw[draw=accent3, very thick] (0.0,3.5) -- (1.0,3.5);
+  \draw[draw=accent3, very thick, dotted] (1.0,3.5) -- (1.4,3.5);
+  \draw[draw=accent3, very thick] (1.4,3.5) -- (1.4,3.05) -- (3.0,3.05);
+  \draw[draw=accent3, very thick, dotted] (3.0,3.05) -- (3.7,3.05);
+  \draw[draw=accent3, very thick] (3.7,3.05) -- (3.7,2.5) -- (5.0,2.5);
+  \draw[draw=accent3, very thick, dotted] (5.0,2.5) -- (5.6,2.5);
+  \draw[draw=accent3, very thick] (5.6,2.5) -- (5.6,1.95) -- (6.5,1.95);
+  \draw[draw=accent3, very thick, dotted] (6.5,1.95) -- (7.3,1.95);
+  \draw[draw=accent3, very thick] (7.3,1.95) -- (7.3,1.5) -- (8.5,1.5);
+
+  % Mark accepted vs rejected
+  \foreach \x/\y in {1.4/3.5, 3.7/3.05, 5.6/2.5, 7.3/1.95} {
+    \node[circle, draw=accent3, fill=accent3, inner sep=1.0pt] at (\x,\y) {};
+  }
+  \foreach \x/\y in {1.0/3.5, 3.0/3.05, 5.0/2.5, 6.5/1.95} {
+    \node[font=\scriptsize, text=rule, above] at (\x,\y) {$\times$};
+  }
+  \node[font=\scriptsize, text=accent3, anchor=west] at (8.7, 1.5) {6 of 101 accepted};
+
+  % Annotation
+  \draw[draw=rule, dashed] (\xa, 3.5) -- (8.5, 3.5);
+  \node[anchor=west, font=\scriptsize, text=rule] at (1.6, 3.65) {chosen knee KL $\kappa_0$};
+
+  \node[font=\scriptsize, anchor=west] at (0.2, 4.15)
+    {\itshape Qwen 4B 4.5\,bpp anchor: $0.461 \to 0.245$ over 6 accepted flips ($-47\%$)};
+\end{tikzpicture}
+\caption{Coord-descent polish on the Qwen 4B 4.5~bpp anchor. Each attempt
+ranks the next single-Linear flip by $L_3$ unary cost; the flip is accepted
+only if real, held-out KL strictly decreases. Crossed marks are
+rejected attempts; filled circles are accepted flips. The KL trace is
+monotone non-increasing by construction. Six flips of 101 attempted moved
+KL from $0.461$ (post-rolled-back $L_3$ polish) to $0.245$.}
+\label{fig:coord_descent}
+\end{figure}

@@ -1,0 +1,96 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small},
+  axis/.style={->, thick, draw=rule}
+]
+  % Horizontal axis = phase, vertical axis = GB
+  \def\xa{0}\def\xb{12.0}\def\ya{0}\def\yb{4.6}
+  \draw[axis] (\xa,\ya) -- (\xa,\yb) node[above left, font=\scriptsize]{GB};
+  \draw[axis] (\xa,\ya) -- (\xb,\ya) node[below right, font=\scriptsize]{phase};
+
+  % UMA cap line
+  \draw[draw=accent2, dashed, thick] (\xa, 4.2) -- (\xb-0.05, 4.2);
+  \node[anchor=east, font=\scriptsize, text=accent2] at (\xb-0.1, 4.35) {GB10 121\,GB UMA};
+
+  % Stacked bars: each bar is one phase, components stack
+  % phase widths
+  \def\bw{0.85}
+  % Reusable colors
+  \definecolor{cWeights}{HTML}{1f3a93}
+  \definecolor{cAct}{HTML}{8e44ad}
+  \definecolor{cFroz}{HTML}{16a085}
+  \definecolor{cLane}{HTML}{f39c12}
+  \definecolor{cGraphs}{HTML}{c0392b}
+  \definecolor{cTriton}{HTML}{e67e22}
+  \definecolor{cBase}{HTML}{555555}
+
+  % Stack helper: just type out each bar
+  % bar = (xc, [components])
+  % L2 fixed point phase
+  \draw[fill=cWeights] (1.0, 0)        rectangle (1.0+\bw, 1.7);  % weights 54GB scaled
+  \draw[fill=cAct]     (1.0, 1.7)      rectangle (1.0+\bw, 2.5);  % L2 act cache
+  \draw[fill=cFroz]    (1.0, 2.5)      rectangle (1.0+\bw, 2.65); % frozen wt cache
+  \draw[fill=cBase]    (1.0, 2.65)     rectangle (1.0+\bw, 2.75); % base
+  \node[anchor=north, font=\scriptsize] at (1.0+\bw/2, 0) {$L_2$ act cache};
+
+  % L3 lane batched phase
+  \draw[fill=cWeights] (2.5, 0)        rectangle (2.5+\bw, 1.7);
+  \draw[fill=cAct]     (2.5, 1.7)      rectangle (2.5+\bw, 2.0);
+  \draw[fill=cLane]    (2.5, 2.0)      rectangle (2.5+\bw, 2.3);
+  \draw[fill=cFroz]    (2.5, 2.3)      rectangle (2.5+\bw, 2.4);
+  \draw[fill=cBase]    (2.5, 2.4)      rectangle (2.5+\bw, 2.55);
+  \node[anchor=north, font=\scriptsize] at (2.5+\bw/2, 0) {$L_3$ lane batched};
+
+  % All-on (kernel + graphs + replay) — OOM
+  \draw[fill=cWeights] (4.0, 0)        rectangle (4.0+\bw, 1.7);
+  \draw[fill=cAct]     (4.0, 1.7)      rectangle (4.0+\bw, 2.0);
+  \draw[fill=cLane]    (4.0, 2.0)      rectangle (4.0+\bw, 2.3);
+  \draw[fill=cFroz]    (4.0, 2.3)      rectangle (4.0+\bw, 2.45);
+  \draw[fill=cGraphs]  (4.0, 2.45)     rectangle (4.0+\bw, 3.6);  % CUDA graphs naive
+  \draw[fill=cTriton]  (4.0, 3.6)      rectangle (4.0+\bw, 3.9);
+  \draw[fill=cBase]    (4.0, 3.9)      rectangle (4.0+\bw, 4.1);
+  \draw[draw=accent2, very thick] (4.0, 4.1) -- (4.0+\bw, 4.1)
+    node[midway, above=1mm, font=\scriptsize, text=accent2]{OOM};
+  \node[anchor=north, font=\scriptsize] at (4.0+\bw/2, 0) {all-on (kernel+graphs+replay)};
+
+  % Shared pool config
+  \draw[fill=cWeights] (6.5, 0)        rectangle (6.5+\bw, 1.7);
+  \draw[fill=cAct]     (6.5, 1.7)      rectangle (6.5+\bw, 2.0);
+  \draw[fill=cLane]    (6.5, 2.0)      rectangle (6.5+\bw, 2.3);
+  \draw[fill=cFroz]    (6.5, 2.3)      rectangle (6.5+\bw, 2.45);
+  \draw[fill=cGraphs]  (6.5, 2.45)     rectangle (6.5+\bw, 2.95);  % shared pool 1 instead of 4
+  \draw[fill=cBase]    (6.5, 2.95)     rectangle (6.5+\bw, 3.15);
+  \node[anchor=north, font=\scriptsize] at (6.5+\bw/2, 0) {shared pool};
+
+  % Shipping default (eager)
+  \draw[fill=cWeights] (8.0, 0)        rectangle (8.0+\bw, 1.7);
+  \draw[fill=cAct]     (8.0, 1.7)      rectangle (8.0+\bw, 2.0);
+  \draw[fill=cLane]    (8.0, 2.0)      rectangle (8.0+\bw, 2.25);
+  \draw[fill=cFroz]    (8.0, 2.25)     rectangle (8.0+\bw, 2.4);
+  \draw[fill=cBase]    (8.0, 2.4)      rectangle (8.0+\bw, 2.55);
+  \node[anchor=north, font=\scriptsize] at (8.0+\bw/2, 0) {shipping default};
+
+  % Legend
+  \node[anchor=west, font=\scriptsize, draw=rule!30, fill=white, rounded corners=2pt, inner sep=3pt]
+    at (9.6, 3.5)
+    {\begin{tabular}{@{}cl@{}}
+      \tikz \filldraw[fill=cWeights] (0,0) rectangle (3pt,3pt); & weights (BF16) \\
+      \tikz \filldraw[fill=cAct] (0,0) rectangle (3pt,3pt); & activation cache \\
+      \tikz \filldraw[fill=cLane] (0,0) rectangle (3pt,3pt); & lane forwards \\
+      \tikz \filldraw[fill=cFroz] (0,0) rectangle (3pt,3pt); & frozen-wt cache \\
+      \tikz \filldraw[fill=cGraphs] (0,0) rectangle (3pt,3pt); & CUDA graph pools \\
+      \tikz \filldraw[fill=cTriton] (0,0) rectangle (3pt,3pt); & Triton JIT \\
+      \tikz \filldraw[fill=cBase] (0,0) rectangle (3pt,3pt); & Python + framework
+    \end{tabular}};
+\end{tikzpicture}
+\caption{Memory landscape on the GB10 development host (Qwen3.6-27B
+configuration; bar heights illustrative, drawn to relative scale).
+Single-component runs fit cleanly. The naive ``all-on'' configuration
+(per-path CUDA graph pools + Triton-fused NVFP4 kernel + replay cache)
+stacks past the 121\,GB UMA cap and OOM-kills. The shared-pool
+configuration consolidates four graph pools into one workspace and recovers
+$\sim$10\,GB. The shipping default eager-pool path with bounded LRU caches
+is the rightmost bar; it is what produces the published artifacts.}
+\label{fig:memory_landscape}
+\end{figure}

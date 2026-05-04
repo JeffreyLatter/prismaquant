@@ -1,0 +1,53 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small},
+  level/.style={draw=accent, fill=accent!7, rounded corners=2pt,
+                minimum width=46mm, minimum height=12mm,
+                align=left, inner sep=4pt},
+  cost/.style={font=\scriptsize, text=accent},
+  arr/.style={-{Latex[length=2.2mm]}, thick, draw=accent!70}
+]
+  \node[level] (l1)
+    {{\bfseries $L_1$ probe} \hfill {\scriptsize $\sim$ seconds/Linear} \\[1pt]
+     \scriptsize $u_i^{(1)}(f) = \mathrm{Tr}(\hat H_i)\cdot \mathrm{MSE}_i(f)$ \\
+     \scriptsize Fisher accumulator + multi-chunk probe};
+
+  \node[level, below=7mm of l1] (l2)
+    {{\bfseries $L_2$ perturbed-X fixed point} \hfill {\scriptsize $\sim$ minutes} \\[1pt]
+     \scriptsize $u_i^{(2)}(f) = \mathrm{MSE}\!\big(W_i X^{(k)},\, Q_f(W_i)\,X^{(k)}\big)$ \\
+     \scriptsize $X^{(k)}$ = activations cached under $\Assignment^{(k)}$};
+
+  \node[level, below=7mm of l2] (l3)
+    {{\bfseries $L_3$ propagated cost} \hfill {\scriptsize $\sim$ tens of minutes} \\[1pt]
+     \scriptsize $u_i^{(3)}(f) = \kl\!\big(\mathrm{logits}_{cand}\,\big\|\,\mathrm{logits}_{paired-BF16}\big)$ \\
+     \scriptsize lane-batched; tail-only; per-target paired baseline};
+
+  \node[right=12mm of l1, font=\footnotesize, align=left, text=rule] (l1n)
+    {\emph{Generates}\\ baseline assignment};
+  \node[right=12mm of l2, font=\footnotesize, align=left, text=rule] (l2n)
+    {\emph{Refines} under\\ realized activation\\ distribution};
+  \node[right=12mm of l3, font=\footnotesize, align=left, text=rule] (l3n)
+    {\emph{Measures} local\\ end-KL around\\ converged $L_2$};
+
+  \draw[arr] (l1) -- node[right, midway, font=\scriptsize]{seed} (l2);
+  \draw[arr] (l2) -- node[right, midway, font=\scriptsize]{$2$--$3$ iters; converged $\Assignment$} (l3);
+
+  \draw[draw=rule!50, dashed] (l1.east) -- (l1n.west);
+  \draw[draw=rule!50, dashed] (l2.east) -- (l2n.west);
+  \draw[draw=rule!50, dashed] (l3.east) -- (l3n.west);
+
+  \begin{scope}[on background layer]
+    \node[draw=rule!30, fill=rule!5, rounded corners=2pt,
+          fit=(l1)(l2)(l3)(l3n)(l1n),
+          inner sep=4mm,
+          label={[font=\footnotesize\itshape, text=rule]above:cost hierarchy --- generate, then measure}] {};
+  \end{scope}
+\end{tikzpicture}
+\caption{The three-level cost hierarchy. $L_1$ and $L_2$ are surrogate cost
+models used for candidate generation; $L_3$ is a real, end-to-end
+KL-divergence measurement against a target-specific paired baseline. The
+$L_2$ fixed point folds inter-layer coupling into the activation cache so
+that the per-Linear surrogate adapts to the realized assignment.}
+\label{fig:cost_hierarchy}
+\end{figure}

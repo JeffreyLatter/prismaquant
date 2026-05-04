@@ -1,0 +1,64 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\scriptsize},
+  proj/.style={
+    draw=accent, fill=accent!10, rounded corners=1.5pt,
+    minimum height=6mm, minimum width=10mm, inner sep=1pt
+  },
+  norm/.style={
+    draw=rule, fill=rule!10, rounded corners=1.5pt,
+    minimum height=4mm, minimum width=18mm, inner sep=1pt
+  },
+  edge/.style={-{Latex[length=1.5mm]}, draw=accent, thick},
+  longedge/.style={-{Latex[length=1.5mm]}, dashed, draw=accent2}
+]
+  % Block 1: attention
+  \node[norm] (ln1) at (0,0) {LayerNorm};
+  \node[proj, right=4mm of ln1] (q) {Q};
+  \node[proj, right=2mm of q]   (k) {K};
+  \node[proj, right=2mm of k]   (v) {V};
+  \node[proj, right=8mm of v]   (o) {O};
+
+  \draw[edge] (ln1) -- (q.west);
+  \draw[edge] (ln1) -- (k.west);
+  \draw[edge] (ln1) -- (v.west);
+  \draw[edge, very thick] (v) -- (o)
+    node[midway, above, font=\scriptsize, text=accent]{strong};
+
+  % MLP block
+  \node[norm, below=8mm of ln1] (ln2) {LayerNorm};
+  \node[proj, right=4mm of ln2] (gate) {Gate};
+  \node[proj, right=2mm of gate] (up)  {Up};
+  \node[proj, right=8mm of up]   (down) {Down};
+
+  \draw[edge] (ln2) -- (gate.west);
+  \draw[edge] (ln2) -- (up.west);
+  \draw[edge, very thick] (gate) -- (down)
+    node[midway, above, font=\scriptsize, text=accent]{strong};
+  \draw[edge, very thick] (up) -- (down);
+
+  % Cross-block edges (rejected by LN reset)
+  \draw[longedge] (o) to[bend left=20] (ln2.east);
+  \node[font=\scriptsize, text=accent2, anchor=west] at (4.2, -1.0)
+    {LN reset $\Rightarrow$ off-diagonal energy collapses};
+
+  % Annotation: cliques
+  \node[draw=accent3, dashed, rounded corners=2pt, fit=(v)(o), inner sep=1.5mm] (att_clique) {};
+  \node[draw=accent3, dashed, rounded corners=2pt, fit=(gate)(up)(down), inner sep=1.5mm] (mlp_clique) {};
+  \node[font=\scriptsize, text=accent3, anchor=west] at ($(att_clique.east)+(0.6,0)$) {V$\to$O clique};
+  \node[font=\scriptsize, text=accent3, anchor=west] at ($(mlp_clique.east)+(0.6,0)$) {Gate/Up$\to$Down clique};
+
+\end{tikzpicture}
+\caption{Architectural cliques in transformer blocks. The dominant
+non-additive interactions in mixed-precision quantization are confined to
+the V$\to$O attention output projection and the Gate/Up$\to$Down MLP
+output projection. LayerNorms reset error magnitude between blocks, so
+cross-block off-diagonal Hessian energy is small. A block-DP over these
+disjoint cliques (Section~\ref{sec:rejected}) would in principle capture
+the structural interaction without an NP-hard QUBO. We do not adopt it as
+a default because the additive DP's fused-sibling refinement units already
+absorb the within-clique constraint via joint sibling-coherent format
+choices.}
+\label{fig:smrf_clique}
+\end{figure}

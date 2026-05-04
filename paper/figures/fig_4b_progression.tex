@@ -1,0 +1,41 @@
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\linewidth,
+  height=5.5cm,
+  ybar,
+  bar width=14mm,
+  ylabel={Held-out KL at 4.5\,bpp},
+  symbolic x coords={$L_2$ converged, $L_3$ polish (rolled back), coord descent},
+  xtick=data,
+  ymin=0.0, ymax=0.55,
+  ymajorgrids,
+  major grid style={draw=rule!20},
+  axis line style={draw=rule},
+  tick label style={font=\scriptsize},
+  label style={font=\scriptsize},
+  title style={font=\scriptsize\itshape},
+  title={Qwen3.6-4B 4.5\,bpp anchor: KL across pipeline stages},
+  nodes near coords,
+  nodes near coords style={font=\scriptsize},
+  enlarge x limits=0.25
+]
+\addplot[draw=accent, fill=accent!40] coordinates {
+  ($L_2$ converged, 0.371)
+  ($L_3$ polish (rolled back), 0.461)
+  (coord descent, 0.245)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Pipeline progression at the Qwen3.6-4B 4.5\,bpp anchor.
+$L_2$ converges to KL $0.371$. The $L_3$ polish DP applies the additive-DP
+non-additivity bug at scale and \emph{regresses} to KL $0.461$ ($+24\%$);
+the real-KL gate detects the regression and rolls the polish output
+back to the prior assignment. Coord descent then commits 6 single-Linear
+flips of 101 attempted, each gated on real held-out KL, ending at KL
+$0.245$ ($-34\%$ versus $L_2$). The pattern is reproducible across every
+4B anchor we have measured and is the empirical motivation for separating
+candidate generation from candidate selection.}
+\label{fig:4b_progression}
+\end{figure}
