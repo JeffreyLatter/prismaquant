@@ -215,6 +215,40 @@ These caveats apply equally to most published mixed-precision allocators (HAQ, H
 
 For full derivations, the `_GradNormCapture` MoE Fisher estimator, the MTP quantization path, the propagated-cost L3 polish, and the joint expert-prune solver: see source comments in `prismaquant/{sensitivity_probe,allocator,allocator_prune}.py` and the design notes in `docs/`.
 
+## PrismaSCOUT — measurement-driven allocator (May 2026)
+
+PrismaSCOUT (**S**urrogate-**C**ascaded **O**ptimization **U**nder **T**radeoff) is the next-generation bit allocator inside prismaquant. The v1 stack documented above selects per-Linear formats with the additive cost model (Fisher-weighted MSE, multi-choice knapsack). PrismaSCOUT replaces that final selection step with **end-to-end measurement on the rebuilt model**.
+
+PrismaSCOUT was always the goal. We released the v1 artifacts on the standard per-layer toolkit to get the ball rolling and to see whether mixed-format quantization really had juice in it before pouring engineering effort into the harder pipeline. The community reaction made the answer clear — **tens of thousands of downloads across the family in the first few weeks** — so we committed to delivering on the original promise.
+
+### Smaller and better than v1 on Qwen3.6-27B
+
+| Artifact | Size | bpp | Held-out KL |
+|---|---|---|---|
+| PrismaQuant v1 (5.5 bpp) | 22.67 GB | 5.50 | 0.0475 |
+| **PrismaSCOUT** | **20.17 GB** | **5.31** | **0.0151** |
+| **Change** | **−2.5 GB (−11%)** | −0.19 | **−0.0324 (−68%)** |
+
+Same source weights, same export-time tricks (HALO, GPTQ, block-output match, scale sweeps). Only the allocator changed. The 68% KL reduction comes entirely from selecting on real end-to-end behavior instead of summed per-layer surrogates — which means the cross-layer interactions and propagated effects called out as a caveat in the v1 method notes above are now *observed* during selection, not *modeled away*.
+
+Public artifact: https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm
+
+### Algorithm
+
+PrismaSCOUT runs a three-stage cost cascade: **L1** cheap per-matrix rank → **L2** sparse pairwise interaction model solved as a Lagrangian-relaxed QUBO (a game-theoretic decomposition that, to our knowledge, has not been applied at LLM scale before) → **L3** rebuilt-model end-to-end KL on a small allocator neighborhood around L2's converged point.
+
+Sitting above the cascade, a **λ-sweep with one-pass Pareto archive DP** traces the achievable size-vs-quality frontier directly from the L3 measurements. We deliberately abandon the traditional "fix a target bpp, pack to fit" formulation: instead of constraining the search to one bit budget, we trace the entire frontier and let the kneedle pick the best point on it (selected on a held-out calibration split). A non-regressive coordinate-descent polish step then perturbs the chosen assignment locally and accepts only moves that strictly improve real held-out KL.
+
+The L3 measurement loop went through roughly half a dozen design rounds — fused NVFP4 Triton kernels, multi-lane CUDA graphs, a replay cache, aggressive memory management — before we landed on something with both respectable accuracy and tractable wall-clock at 27B+ scale.
+
+### Relation to v1 and to prior work
+
+The v1 `0.5·H·MSE_W` additive cost model now lives at the L1/L2 layer as a candidate-generation surrogate — PrismaSCOUT keeps it for proposing assignments cheaply, but no longer trusts it for the final pick. This realizes the follow-up path explicitly called out in the v1 method notes above ("What about inter-layer interactions?").
+
+PrismaSCOUT draws on the mixed-precision quantization literature — Hessian-aware allocation (HAWQ), cross-layer error coupling (CLADO), Pareto-optimal bit budgeting (ParoQuant, IMPQ, AMQ), and the geometry-aware quantization line — much of which had not been run end-to-end at LLM scale before. We adapted those ideas, added a few new techniques to make the measurement loop tractable on real models, and built the pipeline around directly measuring how each candidate assignment behaves end-to-end.
+
+For the full overview, see [`docs/prismascout_overview.md`](docs/prismascout_overview.md).
+
 ## Citation
 
 ```bibtex
