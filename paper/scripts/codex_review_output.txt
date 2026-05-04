@@ -1,0 +1,91 @@
+Codex peer review of PrismaQuant/PrismaSCOUT paper, dated 2026-05-04
+
+## 1. Summary
+
+- The headline 5.31 bpp / KL 0.0151 claim checks out against the HF card and local eval artifacts, but some downstream reporting mixes full-suite and hard-subset tool-eval numbers.
+- Several method equations are cleaner than the implementation: L1/L2 omit activation quantization, the 0.5 loss factor, full-H/detail paths, and fallback ordering.
+- The kneedle equation matches code, but the paper misstates at least one default and under-describes the `best-kl` instability fallback.
+- Related work and bibliography need serious cleanup: placeholder authors, likely wrong ParoQuant citation, and an OCP/NVFP4 citation mismatch.
+- Section 5 is mostly honest about the deliberation record, but the sandwich-recalibration discussion treats analytic estimates as if they were empirical findings.
+
+## 2. Content issues
+
+1. Location: Related Work and bibliography  
+   Problem: Several citations are placeholders or mischaracterized. The ParoQuant entry appears to cite arXiv:2511.10645 as “Pareto-optimal mixed-precision quantization,” but that arXiv entry is “Pairwise Rotation Quantization”; HAWQ-V3 is compressed to “top eigenvalues,” while HAWQ-V3 is more specifically second-order/ILP/dyadic quantization; OCP microscaling covers MX formats, not NVIDIA NVFP4 as such. See HAWQ-V3: https://arxiv.org/abs/2011.10680, Kneedle: https://raghavan.usc.edu/papers/kneedle-simplex11.pdf, OCP MX spec: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf.  
+   Suggested fix: Replace placeholder bibitems with full metadata, correct ParoQuant/IMPQ/AMQ entries, cite NVIDIA/CUTLASS/Blackwell material for NVFP4, and soften prior-work comparisons until each claim is source-checked.
+
+2. Location: Section 3.1, L1 probe formula  
+   Problem: The formula `Tr(H_i) * MSE_i(f)` does not match the allocator path closely enough. The code uses an empirical Fisher-style trace, applies a `0.5` loss factor, prefers measured local output MSE or full-H `predicted_dloss` when available, and falls back to weight MSE.  
+   Suggested fix: Define L1 as an implementation-level cost pipeline: empirical Fisher trace/full-H detail plus measured local output perturbation, with explicit fallback order and the `1/2` second-order factor.
+
+3. Location: Section 3.1 / Algorithm, L2 perturbed-X  
+   Problem: The L2 equation omits activation quantization. The implementation measures `W X` against `Q_f(W) Q_f^act(X)` where applicable, then feeds output MSE through the same loss-cost machinery.  
+   Suggested fix: Rewrite the L2 equation to include activation quantize-dequantize and clarify that L2 is a local output-loss proxy, not plain weight-output MSE.
+
+4. Location: Equation 3, Appendix runtime parameters  
+   Problem: The kneedle formula itself matches `segmented_kneedle_point()`, but the paper says the default KL noise floor is `5e-4`; current code default is `1e-5`. The paper also underplays that leave-one-out instability can replace the geometric knee with the best-KL frontier point under the default `best-kl` policy.  
+   Suggested fix: State the actual default, or document the exact production override. Add one sentence: “When leave-one-out is unstable, the default guard selects the best measured-KL frontier point rather than forcing the geometric knee.”
+
+5. Location: Section 4 / Appendix convergence parameters  
+   Problem: The paper says L2 stops at weighted-Hamming threshold `0.05`; code default `--convergence-frac` is `0.01`. The “2–3 iterations on every model measured” claim also needs a table or log reference.  
+   Suggested fix: Correct the default and either cite the measured iteration counts or weaken to “typically 2–3 iterations in our runs.”
+
+6. Location: Proposition 1, monotone non-regression  
+   Problem: The proposition is true only for the measured coordinate-polish loop on a fixed calibration slice and deterministic evaluation path. It should not read as an artifact-level guarantee after exporter changes, fused coherence enforcement, or distribution shift.  
+   Suggested fix: Scope the proposition explicitly: “with fixed calibration inputs, fixed evaluator, and no post-polish assignment mutation except already-modeled fused sibling moves.”
+
+7. Location: Section 7, Table 2 / tool-eval text  
+   Problem: The row labeled “tool-eval-bench hardmode” reports 88/100 vs 85/100 from the full sequential suite. The actual targeted 10-scenario hard subset is 30/100 vs 25/100, and the safety-critical failure counts come from that targeted subset. This mixes contexts and understates the TC-42 regression.  
+   Suggested fix: Rename the 88/85 row to “full tool-eval-bench suite” and add a separate “targeted hard subset, 3 trials” row with 30/25 and safety failures 4/3. Explicitly say TC-42 regressed stably while aggregate score improved.
+
+8. Location: Section 5.2, sandwich recalibration  
+   Problem: The “2–3 passes reach within 5%” statement is not an empirical result in the deliberation record; it is Gemini’s analytic/heuristic estimate.  
+   Suggested fix: Rephrase as “the deliberation estimated” or “we expected,” and do not present it as measured unless you add experiment logs.
+
+9. Location: Section 5.3 / Figure 10  
+   Problem: Archive DP is described in places as “shipped,” but in code it is flag-gated candidate generation, not the default selector.  
+   Suggested fix: Use “implemented and used in the production search path when enabled” or “candidate generator,” and distinguish it from the final validated-frontier selector.
+
+10. Location: Appendix A / reproducibility  
+   Problem: The appendix is useful but not enough for an outsider to reproduce the 27B result. It lacks exact run commands, seeds, calibration sample IDs or hashes, hardware/driver versions, git SHA, and artifact/eval report paths.  
+   Suggested fix: Add a reproduction manifest table and point to the exact run directory reports. The HF headline card matches the paper: https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm.
+
+## 3. Formatting / Typesetting Issues
+
+1. Location: Bibliography  
+   Problem: Placeholder author names and inconsistent venue/arXiv formatting are not publication-ready.  
+   Suggested fix: Convert to BibTeX or complete every `\bibitem` with real authors, title, venue, year, arXiv/DOI.
+
+2. Location: PDF build warnings  
+   Problem: The build emits bold small-caps font warnings and hyperref PDF-string warnings.  
+   Suggested fix: Use T1/lmodern or avoid bold `\textsc`; wrap math/small-caps section titles with `\texorpdfstring`.
+
+3. Location: Figures overall  
+   Problem: Thirteen figures in 20 pages is heavy; several are schematic and partly redundant.  
+   Suggested fix: Move some pipeline/history diagrams to appendix and keep only the most explanatory figures in the main paper.
+
+4. Location: Figure 11  
+   Problem: The memory plot y-axis says “GB” but the bars appear normalized/illustrative rather than plotted on true GB ticks.  
+   Suggested fix: Either plot real GB values with ticks or label the axis “relative memory” and remove unit ambiguity.
+
+5. Location: Figure 13  
+   Problem: The figure has duplicate labels in source, a possibly mismatched “blue square” caption, and does not visually explain why the selected point is the knee despite later lower-KL high-bpp points.  
+   Suggested fix: Use one label, align caption colors with plotted marks, and annotate dominated/frontier/knee status.
+
+6. Location: Tables 1–2  
+   Problem: Units and evaluation contexts are not always explicit enough; “hardmode” is especially misleading.  
+   Suggested fix: Add sample counts, exact suite names, and split full-suite from targeted hard-subset metrics.
+
+7. Location: Math typography  
+   Problem: KL notation, bpp units, and long equations are visually inconsistent in places.  
+   Suggested fix: Use `D_{\mathrm{KL}}` consistently, romanize units, and break the kneedle equation with `aligned`.
+
+## 4. What's Done Well
+
+The paper is unusually transparent about rejected methods and historical engineering turns. The calibration-disjointness fix is correctly described and matches current defaults. The headline metric improvement is supported by the local reports and HF card. The monotone-polish idea is practical and, once properly scoped, is a clear contribution.
+
+## 5. Recommendation
+
+major-revisions-needed.
+
+The core result appears real, and the paper has enough substance to become a strong method/engineering paper. But the current draft needs revisions for code-paper drift, tool-eval reporting clarity, reproducibility detail, and prior-work/bibliography accuracy before it is safe to treat as publication-ready.

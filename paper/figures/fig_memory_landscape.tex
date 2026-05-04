@@ -11,7 +11,7 @@
 
   % UMA cap line
   \draw[draw=accent2, dashed, thick] (\xa, 4.2) -- (\xb-0.05, 4.2);
-  \node[anchor=east, font=\scriptsize, text=accent2] at (\xb-0.1, 4.35) {GB10 121\,GB UMA};
+  \node[anchor=east, font=\scriptsize, text=accent2] at (\xb-0.1, 4.35) {GB10 128\,GB UMA};
 
   % Stacked bars: each bar is one phase, components stack
   % phase widths
@@ -88,7 +88,7 @@
 configuration; bar heights illustrative, drawn to relative scale).
 Single-component runs fit cleanly. The naive ``all-on'' configuration
 (per-path CUDA graph pools + Triton-fused NVFP4 kernel + replay cache)
-stacks past the 121\,GB UMA cap and OOM-kills. The shared-pool
+stacks past the 128\,GB UMA cap and OOM-kills. The shared-pool
 configuration consolidates four graph pools into one workspace and recovers
 $\sim$10\,GB. The shipping default eager-pool path with bounded LRU caches
 is the rightmost bar; it is what produces the published artifacts.}

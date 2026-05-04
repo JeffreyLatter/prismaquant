@@ -69,12 +69,14 @@ x  y  \\
 \end{axis}
 \end{tikzpicture}
 \caption{Validated-frontier candidates measured on the held-out validation
-split for Qwen3.6-27B. The surrogate-only kneedle on the same set picks
-$5.857$\,bpp at KL $0.056$ (blue square). The validated kneedle picks
-$5.3117$\,bpp at KL $0.0151$ (green dot, shipped artifact). The previously
-shipped \textsc{PrismaQuant}~v1 artifact at $5.50$\,bpp / KL $0.0475$ (gray
-triangle) sits clearly inside the validated frontier --- the new selector
-finds a strictly better point at lower bpp.}
-\label{fig:surrogate_vs_validated}
+split for Qwen3.6-27B. Red filled circles are measured candidate
+assignments. The surrogate-only kneedle on the same candidate set picks
+$5.857$\,bpp at KL $0.056$ (dark-blue square). The validated kneedle
+picks the dominating point at $5.3117$\,bpp / KL $0.0151$ (green disk,
+shipped artifact); note the lower-bpp point at $5.166$ has higher
+KL and is therefore $\eta$-dominated. The previously shipped
+\textsc{PrismaQuant}~v1 artifact at $5.50$\,bpp / KL $0.0475$ (gray
+triangle) sits inside the validated frontier --- the new selector finds a
+strictly better point at lower bpp.}
 \label{fig:validated_27b}
 \end{figure}

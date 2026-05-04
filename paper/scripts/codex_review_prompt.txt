@@ -1,0 +1,164 @@
+You are an experienced peer reviewer for the academic paper at
+/home/rob/prismaquant/paper/main.tex (rendered PDF at
+/home/rob/prismaquant/paper/main.pdf).
+
+Your job: deliver a thorough peer review covering BOTH content and
+formatting/typesetting. The author wants critique, not validation; surface real
+problems, even small ones. Do not modify any files. Read-only review pass.
+
+================================================================
+Sources you should consult (in priority order)
+================================================================
+1. The paper itself
+   - Source:  /home/rob/prismaquant/paper/main.tex
+   - Rendered: /home/rob/prismaquant/paper/main.pdf  (open or describe via pdftotext)
+   - Figures: /home/rob/prismaquant/paper/figures/*.tex
+   - HTML companion: /home/rob/prismaquant/paper/prismaquant_animation.html
+
+2. The codebase the paper describes
+   - Repo root: /home/rob/prismaquant
+   - Key modules to cross-check claims against:
+     prismaquant/iterate_perturbed_allocation.py
+     prismaquant/propagated_cost.py
+     prismaquant/perturbed_x_cache.py
+     prismaquant/allocator_solver.py
+     prismaquant/interaction_refine.py
+     prismaquant/kernels/nvfp4_fused.py
+   - Specifically verify:
+     a) The kneedle formula in Equation 6 of the paper vs.
+        `segmented_kneedle_point()` in iterate_perturbed_allocation.py.
+     b) The L1 probe formula description vs. the actual probe code
+        (incremental_probe.py / multi_chunk_probe.py /
+        observers/expert_saliency.py).
+     c) The L2 perturbed-X iteration description vs. perturbed_x_cache.py.
+     d) The L3 propagated-cost paired-baseline description vs.
+        measure_propagated_costs() in propagated_cost.py.
+     e) The calibration disjointness claim (kl_calib_split=validation,
+        l3_calib_split=train) vs. the actual defaults in
+        iterate_perturbed_allocation.py.
+     f) The coord-descent monotone gating claim vs.
+        coordinate_descent_polish() in iterate_perturbed_allocation.py.
+
+3. Handover notes (the historical record of what happened)
+   - /home/rob/prismaquant/.claude/prismaquant-handover-*.md  (multiple dates)
+   - /home/rob/prismaquant/docs/prismascout_overview.md
+   - /home/rob/prismaquant/docs/prismascout_handover_2026-05-03.md
+   - /home/rob/prismaquant/docs/propagated_cost.md
+   - /home/rob/prismaquant/docs/joint_optimizer.md
+   - /home/rob/prismaquant/docs/validation_harness.md
+   - /home/rob/prismaquant/docs/v20_memory_and_scheduling.md
+   - /home/rob/prismaquant/docs/runtime_flags.md
+
+4. Multi-agent deliberation record (Claude/Codex/Gemini)
+   - /home/rob/prismaquant/scratch/powwow/*.md
+   - Especially:
+     00_brief.md (the original problem statement)
+     02_gemini.md and 05_gemini.md (the Lagrangian / sandwich math)
+     03_claude_synthesis.md (the round-1 synthesis)
+     final_audit_consensus.md (the polish-direction sign-off)
+     13_codex_handover_20260504_kneedle_eval.md (the latest export+eval results)
+   - Cross-check that Section 5 ("Methods Considered and Rejected") faithfully
+     represents what each method actually was, what its principled motivation
+     was, and why it was not adopted. The acknowledgments thank Gemini and
+     Codex for these contributions; verify the attributions are honest.
+
+5. GitHub history
+   - `git -C /home/rob/prismaquant log --oneline -200`
+   - `git -C /home/rob/prismaquant show <sha>` for any commit named in the paper
+   - Specifically verify these commits exist and that their commit messages
+     support the claims made in the paper (the paper references them by hash):
+     2e670b3, 444bc28, 3f320c7, d830a01, 86f2c14, 53fe0db, d370c3e,
+     b3d8445, 7f7521a, 8b502ec, 71f771f, 3bda16c
+   - The paper attributes specific behaviors to specific commits; verify each
+     attribution.
+
+6. Published HF artifact (for headline metric verification)
+   - The paper claims Qwen3.6-27B PrismaSCOUT achieves 5.31 bpp / KL 0.0151
+     vs. the prior 5.50 bpp / KL 0.0475. The artifact card at
+     huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm
+     reports the same numbers. The local run dir referenced in the
+     2026-05-04 handover is
+     /home/rob/dq-runs/qwen3p6-27b-smrf-overnight/27b-export-5p3095-kneedle-20260504T025719Z
+     ; if you can read that directory, verify the validator/eval numbers
+     in Table 2 of the paper against the actual evaluation reports
+     (validate_5p3095.md, validate_5p5.md, tool-eval-bench summaries).
+
+================================================================
+What to evaluate
+================================================================
+
+CONTENT
+- Overclaims and underclaims, especially around novelty (this is a method
+  paper that should not oversell against HAWQ/CLADO/ParoQuant/IMPQ/AMQ).
+- Mathematical rigor: section 3 (theory) and the "monotone non-regression"
+  proposition. Are the definitions tight? Are the dependencies between
+  L1/L2/L3 stated correctly?
+- Accuracy of cited prior work: do the descriptions of HAWQ-V3, CLADO,
+  AWQ, GPTQ, kneedle (Satopaa 2011), ORD (Ortega/Ramchandran 1998), and
+  the microscaling spec match the actual content of those references?
+  Flag anything that mischaracterizes a prior work.
+- Empirical numbers: cross-check every numeric claim against handovers,
+  run dirs, and the HF model card. Flag any number that doesn't have a
+  ground-truth source.
+- Tool-eval-bench reporting: the paper goes out of its way to be honest
+  about TC-42 / TC-60. Is the framing fair, or does it under-report a
+  meaningful regression?
+- Code-paper drift: does anything the paper claims correspond to a code
+  path that's actually default-ON, default-OFF, or removed?
+- Reproducibility: is the appendix detailed enough that an outsider could
+  re-run the pipeline?
+- Section 5 ("Methods Considered and Rejected"): does each entry cite the
+  specific claim faithfully? Did the paper get the empirical justification
+  right for each rejection?
+
+FORMATTING / TYPESETTING
+- LaTeX style: awkward typesetting, broken refs, ugly hyphenation,
+  inconsistent capitalization in section headers, table layout.
+- Mathematical typography: \operatorname vs \mathrm usage, theorem
+  environments, equation numbering, vector/matrix conventions.
+- Figures: open figures in the rendered PDF (use pdftotext or describe
+  via the PDF). For each figure, is it: legible, well-captioned, properly
+  referenced in text, structurally informative? Are any figures redundant
+  or aesthetically weak?
+- Tables: column alignment, units, missing entries, captions.
+- Bibliography: entries that should have first-author full names, missing
+  volume/page numbers, inconsistent venue formatting (some use just arXiv,
+  some have proper venue), missing DOIs where they should appear.
+- Title and abstract: is the title accurate? Does the abstract front-load
+  the contribution clearly?
+- Length: 20 pages with 13 figures; right-sized for a method paper, or
+  bloated/under-developed somewhere?
+
+================================================================
+Output format (write to stdout)
+================================================================
+Open with: "Codex peer review of PrismaQuant/PrismaSCOUT paper, dated <today>"
+
+Then in this order:
+
+## 1. Summary
+3-7 bullets, the most load-bearing critiques. Keep this section tight.
+
+## 2. Content issues
+Numbered list. For each:
+- Location: `section X.Y` or `Equation N` or `Figure N caption` or
+  `bibitem foo`
+- Problem: what is wrong, in one or two sentences
+- Suggested fix: a concrete edit (a sentence or a short paragraph)
+
+## 3. Formatting / typesetting issues
+Same numbered format.
+
+## 4. What's done well
+Brief — keep the review balanced. Don't be sycophantic.
+
+## 5. Recommendation
+One of: accept-as-is, accept-with-minor-revisions, major-revisions-needed.
+Followed by a 2-3 sentence justification.
+
+================================================================
+Keep the review under ~1500 words. Bias toward concrete, actionable
+critiques over abstract observations. If you disagree with a design
+decision (e.g. the choice to ship the surrogate-archive path, the choice
+not to adopt sandwich recalibration), say so plainly --- the author
+specifically wants pushback.
