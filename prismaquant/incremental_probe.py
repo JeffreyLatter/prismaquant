@@ -380,14 +380,25 @@ def build_extended_shard_regexes(
             n_body, layers_per_shard, layer_prefix="model.layers"))
 
     if include_mtp:
-        n_mtp = int(
+        n_mtp_config = int(
             text_cfg.get("num_nextn_predict_layers")
             or cfg.get("num_nextn_predict_layers")
             or text_cfg.get("num_mtp_layers")
             or cfg.get("num_mtp_layers")
-            or _count_mtp_layers_from_safetensors(model_path)
             or 0
         )
+        n_mtp_actual = _count_mtp_layers_from_safetensors(model_path)
+        # Empirical safetensors count is ground truth: a config may
+        # declare MTP layers (inherited from a base) when the finetune
+        # actually stripped the weights. Take the min so we never
+        # schedule MTP shards the runner can't fulfill.
+        n_mtp = min(n_mtp_config, n_mtp_actual) if n_mtp_actual > 0 else 0
+        if n_mtp_config > 0 and n_mtp_actual == 0:
+            print(f"[shard-schedule] config declares "
+                  f"{n_mtp_config} MTP layer(s) but safetensors index "
+                  f"has no `mtp.*` keys; skipping MTP shards "
+                  f"(common on Qwen3.5/3.6 finetunes that strip MTP)",
+                  flush=True)
         if n_mtp > 0:
             mtp_regexes = build_layer_shard_regexes(
                 n_mtp, layers_per_shard, layer_prefix="mtp.layers")
@@ -2511,6 +2522,32 @@ def _run_mtp_streaming_shard(
     mtp_wrapper.eval()
 
     raw = _load_mtp_state_dict(model_path)
+    if not raw:
+        # No MTP weights in source — write empty pickle to satisfy the
+        # schedule and return. Mirrors the text-only visual fallback.
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            pickle.dump({
+                "stats": {},
+                "router_counts": {},
+                "router_totals": {},
+                "expert_info": {},
+                "expert_saliency": {},
+                "meta": {
+                    "model": model_path,
+                    "dataset": dataset_name,
+                    "nsamples": int(calib.size(0)),
+                    "seqlen": seqlen,
+                    "dtype": dtype_name,
+                    "execution_device": str(device),
+                    "linear_include": linear_include,
+                    "linear_exclude": linear_exclude,
+                    "skipped_reason": "no MTP weights in source",
+                },
+            }, f)
+        print(f"[incremental/mtp] no MTP weights; wrote empty shard "
+              f"pickle to {output_path}", flush=True)
+        return
     missing, extra = _load_into_mtp(inner_mtp, raw)
     loaded = len(raw) - len(missing)
     print(f"[incremental/mtp] loaded {loaded}/{len(raw)} mtp weights "
