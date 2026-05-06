@@ -18,6 +18,7 @@ MAX_ITERATIONS="${MAX_ITERATIONS:-3}"
 N_NEIGHBORS_VALIDATE="${N_NEIGHBORS_VALIDATE:-4}"
 POLISH_MAX_PASSES="${POLISH_MAX_PASSES:-6}"
 POLISH_NOISE_FLOOR="${POLISH_NOISE_FLOOR:-1e-5}"
+USE_FROZEN_WEIGHT_CACHE="${USE_FROZEN_WEIGHT_CACHE:-1}"
 LOG_NAME="${LOG_NAME:-iterate.log}"
 
 mkdir -p "${RUN_ROOT}"/{logs,home,hf_modules,hf_datasets,tf_cache}
@@ -44,6 +45,7 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
   -e N_NEIGHBORS_VALIDATE="${N_NEIGHBORS_VALIDATE}" \
   -e POLISH_MAX_PASSES="${POLISH_MAX_PASSES}" \
   -e POLISH_NOISE_FLOOR="${POLISH_NOISE_FLOOR}" \
+  -e USE_FROZEN_WEIGHT_CACHE="${USE_FROZEN_WEIGHT_CACHE}" \
   -e LOG_NAME="${LOG_NAME}" \
   -w /prismaquant \
   --entrypoint bash "${IMAGE}" \
@@ -52,6 +54,10 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
     python3 -m pip install --user --quiet accelerate datasets 2>&1 \
       | tee "/work/logs/iter_pip.log"
 
+    EXTRA=()
+    if [[ "${USE_FROZEN_WEIGHT_CACHE:-0}" == "1" ]]; then
+      EXTRA+=(--use-frozen-weight-cache)
+    fi
     python3 -m prismaquant.iterate_block_clado \
       --model "${MODEL_PATH}" \
       --output-root /work \
@@ -66,6 +72,7 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
       --n-neighbors-validate "${N_NEIGHBORS_VALIDATE}" \
       --polish-max-passes "${POLISH_MAX_PASSES}" \
       --polish-noise-floor "${POLISH_NOISE_FLOOR}" \
+      "${EXTRA[@]}" \
       2>&1 | tee "/work/logs/${LOG_NAME}"
   '
 

@@ -104,6 +104,7 @@ def run_iteration(
     polish_noise_floor: float = 1e-5,
     polish_budget_creep: float = 0.05,
     polish_steepest_first: bool = False,
+    use_frozen_weight_cache: bool = False,
     log_callback=None,
 ) -> IterationResult:
     """One iteration: measure → sweep → kneedle → validate → polish."""
@@ -121,6 +122,7 @@ def run_iteration(
         profile=profile, work_root=work_root,
         skip_pairs=False,
         center_assignment=center_assignment,
+        use_frozen_weight_cache=use_frozen_weight_cache,
     )
     payload_path = iter_dir / "block_clado.json"
     payload_path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -315,6 +317,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "surrogate ranks moves accurately around the current point."
         ),
     )
+    parser.add_argument(
+        "--use-frozen-weight-cache",
+        action="store_true",
+        help=(
+            "Pre-quantize centered base assignment once and reuse cached "
+            "weights across measurements.  Big speedup on sandwich runs "
+            "for small/medium models; OOM-prone at LLM scale."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -382,6 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 polish_noise_floor=args.polish_noise_floor,
                 polish_budget_creep=args.polish_budget_creep,
                 polish_steepest_first=bool(args.polish_steepest_first),
+                use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
                 log_callback=log,
             )
             summary_rows.append(result)

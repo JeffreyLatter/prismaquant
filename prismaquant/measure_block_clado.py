@@ -281,6 +281,7 @@ def collect_block_clado(
     progress_callback: Callable[[dict], None] | None = None,
     skip_pairs: bool = False,
     center_assignment: Mapping[str, str] | None = None,
+    use_frozen_weight_cache: bool = False,
 ) -> dict:
     """Run the Block-CLADO measurement.
 
@@ -342,7 +343,8 @@ def collect_block_clado(
             center_kl = float(measure_assignment_kl(
                 model, base, calib_ids, ref_log_probs,
                 work_root=work_root, profile=profile,
-                use_frozen_weight_cache=False, rng_seed=0,
+                use_frozen_weight_cache=use_frozen_weight_cache,
+                rng_seed=0,
             ))
             if progress_callback is not None:
                 progress_callback({
@@ -379,7 +381,7 @@ def collect_block_clado(
                     ref_log_probs,
                     work_root=work_root,
                     profile=profile,
-                    use_frozen_weight_cache=False,
+                    use_frozen_weight_cache=use_frozen_weight_cache,
                     rng_seed=0,
                 )
                 omega_ii[(unit.name, opt.fmt)] = float(kl) - center_kl
@@ -486,7 +488,7 @@ def collect_block_clado(
                                 ref_log_probs,
                                 work_root=work_root,
                                 profile=profile,
-                                use_frozen_weight_cache=False,
+                                use_frozen_weight_cache=use_frozen_weight_cache,
                                 rng_seed=0,
                             )
                             omega_a = float(omega_ii[(unit_a.name, opt_a.fmt)])
@@ -617,6 +619,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "BF16 (standard CLADO)."
         ),
     )
+    parser.add_argument(
+        "--use-frozen-weight-cache",
+        action="store_true",
+        help=(
+            "Pre-quantize the centered base assignment once and reuse cached "
+            "weights across measurements.  Massively faster on sandwich runs "
+            "(non-BF16 centers) but uses memory; safe at small/medium scale."
+        ),
+    )
     args = parser.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -686,6 +697,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             progress_callback=_progress_printer,
             skip_pairs=args.skip_pairs,
             center_assignment=center_assignment,
+            use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
         )
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
