@@ -37,7 +37,7 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
   -e PYTHONPATH=/prismaquant \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e MODEL_PATH="${MODEL_PATH}" \
-  -e KNEEDLE_DIR="/work/$(basename "${KNEEDLE_DIR}")" \
+  -e KNEEDLE_DIR="${KNEEDLE_DIR/${RUN_ROOT}/\/work}" \
   -e N_CALIB_SAMPLES="${N_CALIB_SAMPLES}" \
   -e CALIB_SEQLEN="${CALIB_SEQLEN}" \
   -e CALIB_SPLIT="${CALIB_SPLIT}" \

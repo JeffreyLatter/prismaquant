@@ -56,6 +56,7 @@ from prismaquant.measure_block_clado import (
     collect_block_clado,
     discover_blocks,
 )
+from prismaquant.measure_output_fisher import collect_output_fisher
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 
 
@@ -106,6 +107,7 @@ def run_iteration(
     polish_steepest_first: bool = False,
     skip_polish: bool = False,
     use_frozen_weight_cache: bool = False,
+    measure_method: str = "four_term",
     log_callback=None,
 ) -> IterationResult:
     """One iteration: measure → sweep → kneedle → validate → polish."""
@@ -117,16 +119,62 @@ def run_iteration(
     log(event="iter_start", iter=iter_idx, centered_at=center_label)
 
     # ---- measure
-    log(event="measure_start", iter=iter_idx)
-    payload = collect_block_clado(
-        model, calib_ids, formats,
-        profile=profile, work_root=work_root,
-        skip_pairs=False,
-        center_assignment=center_assignment,
-        use_frozen_weight_cache=use_frozen_weight_cache,
-    )
-    payload_path = iter_dir / "block_clado.json"
-    payload_path.write_text(json.dumps(payload, indent=2) + "\n")
+    # When method=='output_fisher' and we're at the BF16 center (iter 0
+    # or any time center_assignment is unset/all-BF16), use the analytic
+    # Fisher form which is much faster.  At non-trivial centers fall back
+    # to four-term since OF doesn't support sandwich centering yet.
+    method_used = measure_method
+    if measure_method == "output_fisher":
+        if center_assignment is None or all(
+            fmt == "BF16" for fmt in center_assignment.values()
+        ):
+            log(event="measure_start", iter=iter_idx, method="output_fisher")
+            payload = collect_output_fisher(
+                model, calib_ids, formats,
+                profile=profile,
+                cache_dir=str(iter_dir / "of_cache"),
+                keep_disk_cache=False,
+                skip_pairs=False,
+            )
+            payload_path = iter_dir / "block_clado.json"
+            payload_path.write_text(json.dumps(payload, indent=2) + "\n")
+            log(event="measure_done", iter=iter_idx,
+                method="output_fisher",
+                elapsed=payload["meta"]["elapsed_seconds"],
+                center_kl=0.0)
+        else:
+            method_used = "four_term"
+            log(event="measure_start", iter=iter_idx,
+                method="four_term",
+                reason="OF does not support sandwich centering")
+            payload = collect_block_clado(
+                model, calib_ids, formats,
+                profile=profile, work_root=work_root,
+                skip_pairs=False,
+                center_assignment=center_assignment,
+                use_frozen_weight_cache=use_frozen_weight_cache,
+            )
+            payload_path = iter_dir / "block_clado.json"
+            payload_path.write_text(json.dumps(payload, indent=2) + "\n")
+            log(event="measure_done", iter=iter_idx,
+                method="four_term",
+                elapsed=payload["meta"]["elapsed_seconds"],
+                center_kl=payload["meta"].get("center_kl", 0.0))
+    else:
+        log(event="measure_start", iter=iter_idx, method="four_term")
+        payload = collect_block_clado(
+            model, calib_ids, formats,
+            profile=profile, work_root=work_root,
+            skip_pairs=False,
+            center_assignment=center_assignment,
+            use_frozen_weight_cache=use_frozen_weight_cache,
+        )
+        payload_path = iter_dir / "block_clado.json"
+        payload_path.write_text(json.dumps(payload, indent=2) + "\n")
+        log(event="measure_done", iter=iter_idx,
+            method="four_term",
+            elapsed=payload["meta"]["elapsed_seconds"],
+            center_kl=payload["meta"].get("center_kl", 0.0))
     log(event="measure_done", iter=iter_idx,
         elapsed=payload["meta"]["elapsed_seconds"],
         center_kl=payload["meta"].get("center_kl", 0.0))
@@ -354,6 +402,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "dominant cost; the iterate output then equals best-validated."
         ),
     )
+    parser.add_argument(
+        "--measure-method",
+        choices=["four_term", "output_fisher"],
+        default="four_term",
+        help=(
+            "Surrogate measurement method.  'output_fisher' uses the "
+            "analytic per-token Fisher and is much cheaper on the BF16-"
+            "centered iter 0; sandwich iter 1+ falls back to four_term "
+            "automatically (Fisher form doesn't support non-zero centers)."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -423,6 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 polish_steepest_first=bool(args.polish_steepest_first),
                 skip_polish=bool(args.skip_polish),
                 use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
+                measure_method=str(args.measure_method),
                 log_callback=log,
             )
             summary_rows.append(result)
