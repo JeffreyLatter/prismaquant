@@ -88,6 +88,7 @@ import torch
 from prismaquant import block_clado as bc
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import iter_quantizable_tensors, stage_multimodal
+from prismaquant.iterate_perturbed_allocation import calibration_data_hash
 from prismaquant.measure_adjoint_l3 import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
@@ -95,8 +96,10 @@ from prismaquant.measure_adjoint_l3 import (
 from prismaquant.measure_block_clado import (
     discover_blocks,
     enumerate_block_pairs,
+    _bf16_assignment,
 )
 from prismaquant.model_profiles import DefaultProfile, detect_profile
+from prismaquant.perturbed_x_cache import PerturbedActivationCache
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +173,51 @@ def _forward_logits(
     return out
 
 
+@torch.no_grad()
+def _forward_logits_with_assignment(
+    model,
+    assignment: Mapping[str, str],
+    calib_ids: torch.Tensor,
+    *,
+    work_root: Path,
+    profile=None,
+    use_frozen_weight_cache: bool = False,
+) -> list[torch.Tensor]:
+    """Run forward with the given quantization assignment applied via
+    PerturbedActivationCache, returning per-sample fp32 ``[T, V]`` logits.
+
+    Unlike ``_quantize_unit_in_place`` + ``_forward_logits``, this path
+    matches ``measure_assignment_kl``'s deployment-faithful measurement
+    that includes activation quantization at any unit assigned to a
+    non-BF16 format.
+    """
+    device = next(model.parameters()).device
+    cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_of_pcache_", dir=str(work_root)))
+    cal_hash = calibration_data_hash(calib_ids)
+    hooks = PerturbedActivationCache(
+        model, assignment, cache_dir,
+        input_rows=0, cal_hash=cal_hash, profile=profile,
+    )
+    out: list[torch.Tensor] = []
+    try:
+        from contextlib import nullcontext
+        cache_cm = nullcontext()
+        if use_frozen_weight_cache and hooks._frozen_weight_cache is None:
+            cache_cm = hooks.frozen_weight_cache()
+        with cache_cm:
+            hooks.install()
+            try:
+                for i in range(calib_ids.size(0)):
+                    batch = calib_ids[i:i + 1].to(device)
+                    logits = model(batch).logits[0].detach().float()
+                    out.append(logits.cpu())
+            finally:
+                hooks.remove()
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Fisher quadratic forms (variance / covariance under teacher)
 # ---------------------------------------------------------------------------
@@ -240,6 +288,8 @@ def collect_output_fisher(
     delta_z_dtype: torch.dtype = torch.float16,
     progress_callback: Callable[[dict], None] | None = None,
     skip_pairs: bool = False,
+    include_activation_quant: bool = True,
+    use_frozen_weight_cache: bool = False,
 ) -> dict:
     """Build the Output-Fisher Block-CLADO payload.
 
@@ -279,7 +329,10 @@ def collect_output_fisher(
         # Phase 1: clean teacher logits + teacher probs
         # ---------------------------------------------------------------
         if progress_callback is not None:
-            progress_callback({"event": "teacher_forward_start"})
+            progress_callback({
+                "event": "teacher_forward_start",
+                "include_activation_quant": include_activation_quant,
+            })
         z_teacher = _forward_logits(model, calib_ids)  # list of [T, V] fp32 (CPU)
         teacher_probs: list[torch.Tensor] = [
             torch.softmax(z, dim=-1) for z in z_teacher
@@ -289,6 +342,14 @@ def collect_output_fisher(
                 "event": "teacher_forward_done",
                 "n_samples": len(z_teacher),
             })
+
+        # Build BF16-everywhere assignment for the activation-quant path
+        units_by_name_for_base = {u.name: u for u in all_units}
+        # Empty mapping is fine for _bf16_assignment — it iterates the units
+        bf16_base = {}
+        for unit in all_units:
+            for member in unit.member_qnames:
+                bf16_base[member] = "BF16"
 
         # ---------------------------------------------------------------
         # Phase 2: compute and cache δz_{U,f} for each (unit, format != BF16);
@@ -306,14 +367,41 @@ def collect_output_fisher(
                 if opt.fmt == "BF16":
                     omega_ii[(unit.name, "BF16")] = 0.0
                     continue
-                saved = _quantize_unit_in_place(model, unit, opt.fmt)
-                if not saved:
-                    omega_ii[(unit.name, opt.fmt)] = 0.0
-                    continue
-                try:
-                    z_pert = _forward_logits(model, calib_ids)
-                finally:
-                    _restore_unit(model, saved)
+
+                if include_activation_quant:
+                    # Use PerturbedActivationCache so activation quantization is
+                    # applied at this unit, matching deployment / four-term.
+                    assignment = dict(bf16_base)
+                    canonical_fmt = fr.canonical_format_name(opt.fmt)
+                    for member in unit.member_qnames:
+                        assignment[member] = canonical_fmt
+                    try:
+                        z_pert = _forward_logits_with_assignment(
+                            model, assignment, calib_ids,
+                            work_root=cache_dir,
+                            profile=profile,
+                            use_frozen_weight_cache=use_frozen_weight_cache,
+                        )
+                    except Exception as exc:
+                        if progress_callback is not None:
+                            progress_callback({
+                                "event": "perturbation_error",
+                                "unit": unit.name,
+                                "format": opt.fmt,
+                                "error": str(exc),
+                            })
+                        omega_ii[(unit.name, opt.fmt)] = 0.0
+                        continue
+                else:
+                    # Weight-only fast path (legacy)
+                    saved = _quantize_unit_in_place(model, unit, opt.fmt)
+                    if not saved:
+                        omega_ii[(unit.name, opt.fmt)] = 0.0
+                        continue
+                    try:
+                        z_pert = _forward_logits(model, calib_ids)
+                    finally:
+                        _restore_unit(model, saved)
 
                 delta_z = [(zp - zt).contiguous() for zp, zt in zip(z_pert, z_teacher)]
                 omega_ii[(unit.name, opt.fmt)] = fisher_omega_ii(teacher_probs, delta_z)
@@ -450,10 +538,13 @@ def collect_output_fisher(
             "loss": "teacher_student_kl",
             "method": "output_fisher",
             "method_notes": (
-                "weight-only perturbation, BF16-centered; activation quantization "
-                "is NOT included in this MVP — for sandwich centering or "
-                "deployment-faithful surrogates use measure_block_clado."
+                "BF16-centered Output-Fisher; "
+                + ("activation quantization included via PerturbedActivationCache. "
+                   if include_activation_quant else
+                   "weight-only perturbation (no activation quantization). ")
+                + "Sandwich centering not yet supported; falls back to four-term."
             ),
+            "include_activation_quant": bool(include_activation_quant),
             "block_count": len(blocks),
             "singleton_count": len(singletons),
             "n_perturbation_forwards": int(n_pert_done) + 1,  # +1 for teacher
@@ -546,6 +637,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="fp16",
         help="Disk storage dtype for δz tensors",
     )
+    parser.add_argument(
+        "--no-activation-quant",
+        action="store_true",
+        help=(
+            "Use weight-only perturbation (manual swap, no PerturbedActivationCache). "
+            "Faster but doesn't match deployment-faithful surrogates."
+        ),
+    )
+    parser.add_argument(
+        "--use-frozen-weight-cache",
+        action="store_true",
+        help=(
+            "Reuse pre-quantized weights across measurements (only relevant when "
+            "activation-quant is enabled)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -602,6 +709,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             keep_disk_cache=bool(args.keep_disk_cache),
             delta_z_dtype=delta_z_dtype,
             skip_pairs=bool(args.skip_pairs),
+            include_activation_quant=not bool(args.no_activation_quant),
+            use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
             progress_callback=_progress_printer,
         )
         out_path = Path(args.output)
