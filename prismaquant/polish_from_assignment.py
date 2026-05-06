@@ -130,12 +130,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--prefetch-cache",
-        action="store_true",
+        dest="prefetch_cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="At polish startup, eagerly torch.load every disk-streamed "
-        "cache entry via a thread pool.  Trades ~6 sec of startup time "
-        "for elimination of per-trial torch.load latency (~50ms × 305 "
-        "units × 8 passes ≈ 2 minutes saved).  Only useful when "
-        "--lru-gb is large enough to keep all entries resident.",
+        "cache entry via a thread pool.  Trades ~5 sec of startup time "
+        "for elimination of per-trial torch.load latency (which would "
+        "otherwise dominate wall time on disk-streamed caches with the "
+        "default --lru-gb=0 — every miss reloads from disk).  Default "
+        "ON.  Disable with --no-prefetch-cache only on systems where "
+        "the in-memory cache footprint plus model weights would exceed "
+        "the host's UMA budget.",
     )
     args = p.parse_args(argv)
 
