@@ -397,13 +397,15 @@ def collect_output_fisher(
             centered_probs: list[torch.Tensor] = [
                 torch.softmax(z, dim=-1) for z in z_centered
             ]
-            # Compute KL(p_t || p_centered) for telemetry
-            log_p_c = [torch.log(p.clamp(min=1e-30)) for p in centered_probs]
-            log_p_t = [torch.log(p.clamp(min=1e-30)) for p in teacher_probs]
+            # Compute KL(p_t || p_centered) for telemetry; use log_softmax
+            # directly to match measure_assignment_kl's numerics rather
+            # than log-of-clamp(p) which over-estimates for tiny probs.
             total_kl = 0.0
             total_tokens = 0
-            for p_t_i, lp_t_i, lp_c_i in zip(teacher_probs, log_p_t, log_p_c):
-                kl_per_token = (p_t_i * (lp_t_i - lp_c_i)).sum(dim=-1)
+            for z_t, z_c, p_t_i in zip(z_teacher, z_centered, teacher_probs):
+                lp_t = torch.log_softmax(z_t.float(), dim=-1)
+                lp_c = torch.log_softmax(z_c.float(), dim=-1)
+                kl_per_token = (p_t_i.float() * (lp_t - lp_c)).sum(dim=-1)
                 total_kl += float(kl_per_token.sum())
                 total_tokens += kl_per_token.numel()
             center_kl = total_kl / max(total_tokens, 1)
