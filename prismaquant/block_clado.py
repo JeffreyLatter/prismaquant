@@ -740,6 +740,69 @@ def fill_bpp(result: GlobalSolveResult, total_params: int) -> GlobalSolveResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# Kneedle extraction + per-Linear assignment expansion
+# ---------------------------------------------------------------------------
+
+
+def _normalise(values: Sequence[float]) -> list[float]:
+    lo = min(values)
+    hi = max(values)
+    if abs(hi - lo) <= 1e-12:
+        return [0.0 for _ in values]
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def kneedle_pick(
+    points: Sequence[tuple[float, float]],
+) -> tuple[int, float, bool]:
+    """Pick the kneedle (max-perpendicular-distance) point from ``(x, y)``.
+
+    Inputs are interpreted as ``(bpp, cost)``; the function picks the index
+    on the (bpp ascending, cost descending) frontier that maximises the
+    perpendicular distance to the secant line connecting the endpoints.
+
+    Returns ``(index, score, endpoint_fallback)``.
+    """
+    if len(points) < 3:
+        # Degenerate: fall through to the middle point.
+        return len(points) // 2, 0.0, True
+    pts = sorted(points, key=lambda xy: xy[0])
+    xs = _normalise([p[0] for p in pts])
+    ys_raw = _normalise([p[1] for p in pts])
+    # Cost is the y axis we want LOW, so flip for kneedle scoring.
+    ys = [1.0 - v for v in ys_raw]
+    x1, y1 = xs[0], ys[0]
+    x2, y2 = xs[-1], ys[-1]
+    denom = max(((y2 - y1) ** 2 + (x2 - x1) ** 2) ** 0.5, 1e-12)
+    best_score = -math.inf
+    best_idx = 0
+    for idx, (x, y) in enumerate(zip(xs, ys)):
+        score = abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1) / denom
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    endpoint = best_idx in {0, len(pts) - 1}
+    if endpoint:
+        best_idx = len(pts) // 2
+    # Map back to original index ordering.
+    sorted_to_orig = [points.index(pt) for pt in pts]
+    return sorted_to_orig[best_idx], float(best_score), bool(endpoint)
+
+
+def expand_sweep_row_to_linear_assignment(
+    payload: Mapping,
+    unit_assignment: Mapping[str, str],
+) -> dict[str, str]:
+    """Convert a sweep row's per-unit assignment into per-Linear members."""
+    blocks, singletons, _pairs = parse_payload(payload)
+    units: list[DecisionUnit] = []
+    for unit_list in blocks.values():
+        units.extend(unit_list)
+    units.extend(singletons)
+    return expand_unit_assignment(unit_assignment, units)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Block-CLADO solver")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -756,6 +819,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     budget.add_argument("--target-bpp", type=float, required=True)
     budget.add_argument("--bit-precision-bits", type=float, default=1.0)
     budget.add_argument("--output", required=True)
+
+    knee = sub.add_parser(
+        "kneedle",
+        help="extract kneedle from a sweep, write per-Linear assignment JSONs",
+    )
+    knee.add_argument("--payload", required=True)
+    knee.add_argument("--sweep", required=True)
+    knee.add_argument("--output-dir", required=True)
+    knee.add_argument(
+        "--n-neighbors",
+        type=int,
+        default=2,
+        help="Also write N nearest-neighbor frontier points either side",
+    )
 
     args = parser.parse_args(argv)
     payload = load_payload(args.payload)
@@ -806,6 +883,88 @@ def main(argv: Sequence[str] | None = None) -> int:
             "assignment": result.assignment,
         }, indent=2))
         print(f"[block-clado] budget solve achieved bpp={result.bpp:.4f}, cost={result.cost_total:.6g}")
+        return 0
+
+    if args.command == "kneedle":
+        with Path(args.sweep).open("r", encoding="utf-8") as fh:
+            sweep = json.load(fh)
+        rows = sweep.get("rows") or []
+        if not rows:
+            raise RuntimeError("sweep file has no rows")
+
+        # Restrict kneedle picking to the meaningful (positive-cost) region.
+        # Negative surrogate cost lives above the trust region of the second-
+        # order Taylor approximation; ignore it for the elbow.
+        positive_rows = [r for r in rows if r["cost_total"] > 0.0]
+        if len(positive_rows) < 3:
+            positive_rows = rows
+        points = [(float(r["bpp"]), float(r["cost_total"])) for r in positive_rows]
+        idx, score, endpoint = kneedle_pick(points)
+        chosen = positive_rows[idx]
+
+        out_root = Path(args.output_dir)
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        # Sort full sweep by bpp for neighbour lookup.
+        sweep_sorted = sorted(rows, key=lambda r: r["bpp"])
+        # Find chosen in sorted order.
+        chosen_bpp = float(chosen["bpp"])
+        chosen_sorted_idx = min(
+            range(len(sweep_sorted)),
+            key=lambda i: abs(sweep_sorted[i]["bpp"] - chosen_bpp),
+        )
+        n_neighbors = max(int(args.n_neighbors), 0)
+        neighbour_indices = list(range(
+            max(chosen_sorted_idx - n_neighbors, 0),
+            min(chosen_sorted_idx + n_neighbors + 1, len(sweep_sorted)),
+        ))
+        wrote = []
+        for sort_idx in neighbour_indices:
+            row = sweep_sorted[sort_idx]
+            label = (
+                "kneedle"
+                if sort_idx == chosen_sorted_idx
+                else f"neighbor_bpp_{row['bpp']:.4f}".replace(".", "p")
+            )
+            assignment = expand_sweep_row_to_linear_assignment(payload, row["assignment"])
+            row_payload = {
+                "schema": "prismaquant.block_clado.kneedle.v1",
+                "label": label,
+                "bpp": float(row["bpp"]),
+                "bits_total": float(row["bits_total"]),
+                "surrogate_cost": float(row["cost_total"]),
+                "lambda": float(row["lambda"]),
+                "assignment": assignment,
+            }
+            out_path = out_root / f"{label}.json"
+            out_path.write_text(json.dumps(row_payload, indent=2) + "\n")
+            wrote.append({
+                "label": label,
+                "bpp": float(row["bpp"]),
+                "surrogate_cost": float(row["cost_total"]),
+                "path": str(out_path),
+            })
+
+        summary = {
+            "schema": "prismaquant.block_clado.kneedle_summary.v1",
+            "kneedle_score": float(score),
+            "endpoint_fallback": bool(endpoint),
+            "chosen": {
+                "bpp": float(chosen["bpp"]),
+                "surrogate_cost": float(chosen["cost_total"]),
+                "lambda": float(chosen["lambda"]),
+            },
+            "candidates": wrote,
+            "frontier_size_used": len(positive_rows),
+            "frontier_size_total": len(rows),
+        }
+        (out_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        print(
+            f"[block-clado] kneedle bpp={chosen['bpp']:.4f} "
+            f"cost={chosen['cost_total']:.6g} score={score:.4f} "
+            f"endpoint_fallback={endpoint}"
+        )
+        print(f"[block-clado] wrote {len(wrote)} candidate(s) to {out_root}")
         return 0
 
     raise AssertionError(args.command)
