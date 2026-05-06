@@ -485,7 +485,11 @@ def parse_payload(payload: Mapping) -> tuple[
             units.append(DecisionUnit(
                 name=str(unit_name),
                 block_id=str(block_id),
-                member_qnames=tuple(unit_payload.get("members") or [unit_name]),
+                member_qnames=tuple(
+                    unit_payload.get("members")
+                    or unit_payload.get("member_qnames")
+                    or [unit_name]
+                ),
                 options=tuple(options),
             ))
         units.sort(key=lambda unit: unit.name)
@@ -517,7 +521,11 @@ def parse_payload(payload: Mapping) -> tuple[
         singletons.append(DecisionUnit(
             name=str(unit_name),
             block_id=str(unit_payload.get("block_id") or unit_name),
-            member_qnames=tuple(unit_payload.get("members") or [unit_name]),
+            member_qnames=tuple(
+                unit_payload.get("members")
+                or unit_payload.get("member_qnames")
+                or [unit_name]
+            ),
             options=tuple(options),
         ))
     singletons.sort(key=lambda unit: unit.name)

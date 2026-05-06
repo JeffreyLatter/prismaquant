@@ -254,6 +254,28 @@ def coord_descent_polish(
         raise ValueError(
             f"direction must be 'bottom_up' or 'top_down', got {direction!r}"
         )
+    # Defensive: if any DecisionUnit's members aren't in the starting
+    # assignment, polish will silently miss it and bits accounting will
+    # undercount.  Detect early so we don't ship wrong numbers.  This
+    # guarded a real, hard-to-find bug where a payload file used the
+    # wrong key for ``members`` and parse_payload fell back to using
+    # the unit name as a sole pseudo-member; the entire fused-sibling
+    # decision space disappeared from polish.
+    _missing_units = []
+    for _u in units:
+        _members = list(getattr(_u, "member_qnames", []) or [])
+        if not _members:
+            continue
+        if not any(m in starting_assignment for m in _members):
+            _missing_units.append(_u.name)
+    if _missing_units:
+        raise ValueError(
+            f"{len(_missing_units)} DecisionUnits have NO member_qnames "
+            f"present in starting_assignment — polish would silently skip "
+            f"them and undercount bits.  Likely cause: the payload's "
+            f"unit entries are missing the 'members' field (parse_payload "
+            f"falls back to [unit_name]).  Sample: {_missing_units[:5]}"
+        )
     if work_root is None:
         work_root = Path(tempfile.mkdtemp(prefix="prismaquant_polish_"))
         cleanup_work_root = True
@@ -261,6 +283,26 @@ def coord_descent_polish(
         work_root = Path(work_root)
         work_root.mkdir(parents=True, exist_ok=True)
         cleanup_work_root = False
+
+    # When PRISMAQUANT_DELTA_QUANTIZE_POLISH=1 is set, polish opens a
+    # WeightSession at the start, materializes the assignment ONCE on
+    # model.params, and per trial only swaps the diffed unit's weight
+    # in place (with revert-on-reject).  The hooks installed by
+    # PerturbedActivationCache skip their clone+restore because the
+    # PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT flag is set.  Net effect:
+    # ~50 GB of GPU/UMA pressure removed on 27B-class polish.
+    import os as _os
+    use_delta_quant = (
+        production_weight_cache is not None
+        and _os.environ.get("PRISMAQUANT_DELTA_QUANTIZE_POLISH", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+    )
+    weight_session = None
+    if use_delta_quant:
+        from prismaquant.weight_session import WeightSession
+        # Tell the activation hooks to skip weight management; we'll
+        # manage weights externally via WeightSession.
+        _os.environ["PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT"] = "1"
 
     start = time.time()
     n_measurements = 0
@@ -286,6 +328,16 @@ def coord_descent_polish(
                     f"DecisionUnit {unit.name!r}: members {members} carry "
                     f"formats {sorted(fmts)}"
                 )
+        if use_delta_quant:
+            weight_session = WeightSession(
+                model, production_weight_cache=production_weight_cache,
+            )
+            weight_session.initialize(current, units)
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "weight_session_initialized",
+                    "n_bf16_snapshots": weight_session.n_bf16_snapshots,
+                })
         current_kl = measure_assignment_kl(
             model, current, calib_ids, ref_log_probs,
             work_root=work_root, profile=profile,
@@ -393,12 +445,25 @@ def coord_descent_polish(
                     if trial_bits >= current_bits - 1e-9:
                         continue
                 trial = _override_unit(current, unit, option.fmt)
-                trial_kl = measure_assignment_kl(
-                    model, trial, calib_ids, ref_log_probs,
-                    work_root=work_root, profile=profile,
-                    use_frozen_weight_cache=use_frozen_weight_cache,
-                    production_weight_cache=production_weight_cache, rng_seed=0,
-                )
+                # DELTA: stage the unit's format change directly on
+                # model.params via WeightSession.  PerturbedActivation
+                # Cache's hooks see the new weights already in place
+                # (PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT=1) so they
+                # skip the per-module clone+restore.  We always revert
+                # after the trial — only the accept path persists.
+                n_staged = 0
+                if weight_session is not None:
+                    n_staged = weight_session.stage_unit(unit, option.fmt)
+                try:
+                    trial_kl = measure_assignment_kl(
+                        model, trial, calib_ids, ref_log_probs,
+                        work_root=work_root, profile=profile,
+                        use_frozen_weight_cache=use_frozen_weight_cache,
+                        production_weight_cache=production_weight_cache, rng_seed=0,
+                    )
+                finally:
+                    if weight_session is not None and n_staged:
+                        weight_session.revert_unit_last(n_staged)
                 n_measurements += 1
                 candidates_this_pass += 1
                 if progress_callback is not None:
@@ -459,6 +524,13 @@ def coord_descent_polish(
             cur_fmt = _current_unit_format(current, unit) or "BF16"
             current = _override_unit(current, unit, fmt)
             current_bits = best_bits_after
+            # DELTA: re-apply the accepted move on the live model and
+            # commit so the staged change persists across subsequent
+            # trials (no revert).  The next pass's trials see the
+            # updated current_assignment in model.params.
+            if weight_session is not None:
+                n_committed = weight_session.stage_unit(unit, fmt)
+                weight_session.commit_unit_last(n_committed)
             step = PolishStep(
                 pass_index=pass_idx,
                 accepted=True,

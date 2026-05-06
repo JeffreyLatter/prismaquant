@@ -93,6 +93,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "lazy-loads each weight on first access at hook time.  Required "
         "for arbitrarily-large models (e.g. 27B+ on a 121 GB UMA box).",
     )
+    p.add_argument(
+        "--skip-qnames",
+        nargs="*",
+        default=["lm_head"],
+        help="Substrings on qname components that should be EXCLUDED from "
+        "the cache fill.  Default: lm_head — we always pin it to BF16 in "
+        "polish (vLLM ParallelLMHead constraint), so a NVFP4 cache entry "
+        "is unused.  Excluding lm_head also avoids the OOM-prone last "
+        "render on big models with linear-attention forward fallbacks.",
+    )
     args = p.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -133,17 +143,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             model.to(device)
         model.eval()
 
+        skip_tokens = list(args.skip_qnames or [])
         qnames: list[str] = []
+        skipped: list[str] = []
         for full_name, mod, attr in iter_quantizable_tensors(model):
             if attr != "weight" or not isinstance(mod, nn.Linear):
                 continue
             qname = full_name[:-7] if full_name.endswith(".weight") else full_name
+            # Exact dotted-token match against --skip-qnames substrings.
+            tokens = qname.split(".")
+            if any(s in tokens for s in skip_tokens):
+                skipped.append(qname)
+                continue
             qnames.append(qname)
         print(
             f"[build-prod-cache] {len(qnames)} quantizable Linears, "
             f"formats={formats}, levers={sorted(levers)}",
             flush=True,
         )
+        if skipped:
+            print(
+                f"[build-prod-cache] skipped {len(skipped)} qnames matching "
+                f"{skip_tokens} (typically pinned-BF16 in polish): "
+                f"{skipped if len(skipped) <= 5 else skipped[:5] + ['...']}",
+                flush=True,
+            )
 
         t0 = time.monotonic()
         cache = fill_production_weight_cache(

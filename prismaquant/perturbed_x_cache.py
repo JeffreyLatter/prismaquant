@@ -403,25 +403,24 @@ class PerturbedActivationCache:
         if not isinstance(param, torch.nn.Parameter) or param.is_meta:
             return None
         fmt = fr.canonical_format_name(spec.name)
+        # Include production-cache identity in the key so a SHARED
+        # frozen_weight_format_cache that's seen multiple instances
+        # (with/without production cache, or different production
+        # caches) doesn't return stale entries.  Same-instance reuse
+        # across polish trials still hits because id() is stable.
+        prod_id = (
+            id(self._production_weight_cache)
+            if self._production_weight_cache is not None else 0
+        )
         cache_key = (
             param_plan.name,
             fmt,
             int(param.data_ptr()),
             str(param.device),
             str(param.dtype),
+            prod_id,
         )
-        # When a production cache is active, ignore the shared frozen-
-        # weight-format cache.  A prior caller may have populated it with
-        # RTN-rendered tensors (no production cache); without bypassing,
-        # those stale entries would be returned in preference to W_tilde.
-        # codex round-5 reproduced this by populating the shared cache
-        # first, then instantiating with a ProductionWeightCache —
-        # second lookup returned RTN.
-        bypass_shared = (
-            self._production_weight_cache is not None
-            and not _env_truthy("PRISMAQUANT_FUSED_KERNEL_OVER_PROD_CACHE")
-        )
-        q = None if bypass_shared else self._frozen_weight_format_cache.get(cache_key)
+        q = self._frozen_weight_format_cache.get(cache_key)
         if q is None:
             enforce_gpu_memory_budget(
                 [self],
@@ -455,10 +454,11 @@ class PerturbedActivationCache:
                     device=param.device,
                     dtype=param.dtype,
                 ).contiguous()
-            # Don't pollute the shared cache with W_tilde tensors when
-            # production cache is active — a non-production caller using
-            # the shared cache would otherwise receive production weights.
-            if self._frozen_weight_cache_max_entries() > 0 and not bypass_shared:
+            # cache_key now includes production-cache identity, so we
+            # can safely populate the shared cache regardless of
+            # production-active state.  Different production caches
+            # (or no cache) get distinct keys; no cross-contamination.
+            if self._frozen_weight_cache_max_entries() > 0:
                 self._frozen_weight_format_cache[cache_key] = q
                 self._evict_frozen_weight_format_cache_to_limit()
             enforce_gpu_memory_budget(
@@ -600,6 +600,13 @@ class PerturbedActivationCache:
     def _apply_weight_quant(self, plan: _ModulePlan) -> None:
         plan.active_originals.clear()
         if self._materialized_frozen_weight_depth > 0:
+            return
+        if _env_truthy("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT", default=False):
+            # Caller (e.g. WeightSession) has installed the desired weights
+            # directly on model.params; we just observe + activation-
+            # quantize, no clone/restore.  Saves ~50 MB clone per module
+            # on the hot path and lets polish on big models avoid the
+            # cumulative-clone OOM.
             return
         seen_attrs: set[str] = set()
         for param_plan in plan.params:
@@ -886,6 +893,10 @@ class PerturbedActivationCache:
         return out
 
     def _restore_plan(self, plan: _ModulePlan) -> None:
+        if _env_truthy("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT", default=False):
+            # Mirror of _apply_weight_quant's bypass — WeightSession
+            # owns weight transitions, so there's nothing to restore.
+            return
         for param, original in reversed(plan.active_originals):
             param.data.copy_(original.to(device=param.device, dtype=param.dtype))
         plan.active_originals.clear()
