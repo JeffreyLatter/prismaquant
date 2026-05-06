@@ -95,6 +95,15 @@ class ProductionWeightCache:
     cache_dir: str | None = None  # set when disk-streaming was used at fill time
     # Backward-compat alias for code that still reads ``activation_scales``.
     activation_scales: dict[str, float] | None = None
+    # LRU eviction state for memoized tensor loads.  When non-None, the
+    # in-memory cache holds at most ``mem_lru_max_bytes`` of tensor data;
+    # least-recently-used entries are evicted back to their on-disk
+    # filename when the budget is exceeded.  Default OFF for backward
+    # compat; opt-in via ``enable_lru(...)``.
+    _lru_order: list[tuple[str, str]] | None = None
+    _lru_paths: dict[tuple[str, str], str] | None = None
+    _lru_bytes: int = 0
+    _lru_max_bytes: int = 0
 
     def __post_init__(self) -> None:
         # Normalize to ``activation_max_abs`` if a caller used the legacy
@@ -104,14 +113,75 @@ class ProductionWeightCache:
         elif self.activation_scales is None and self.activation_max_abs is not None:
             self.activation_scales = self.activation_max_abs
 
+    def enable_lru(self, max_bytes: int) -> None:
+        """Bound the in-memory tensor footprint to ``max_bytes`` via LRU
+        eviction.  Required for very large disk-streamed caches (e.g.
+        Qwen3.6-27B's ~46 GB of bf16 weights wouldn't fit in a 121 GB
+        UMA box alongside the model + working set)."""
+        self._lru_max_bytes = int(max_bytes)
+        self._lru_order = []
+        self._lru_paths = {}
+        self._lru_bytes = 0
+
+    def _evict_to_budget(self) -> None:
+        if self._lru_order is None or self._lru_max_bytes <= 0:
+            return
+        while self._lru_bytes > self._lru_max_bytes and self._lru_order:
+            evict_key = self._lru_order.pop(0)
+            t = self.weights.get(evict_key)
+            if isinstance(t, torch.Tensor):
+                self._lru_bytes -= t.element_size() * t.numel()
+                # Restore the filename so subsequent lookups still resolve.
+                if self._lru_paths is not None and evict_key in self._lru_paths:
+                    self.weights[evict_key] = self._lru_paths[evict_key]
+
+    def prefetch(self, keys: Sequence[tuple[str, str]] | None = None,
+                 max_workers: int = 4) -> int:
+        """Eagerly load (a subset of) cache entries via a thread pool.
+
+        ``keys=None`` prefetches every entry that's still on disk (the
+        common case at polish startup).  Returns the number of newly-
+        materialized tensors.
+
+        Disk-streamed caches typically have torch.load latency ~50 ms
+        per file (deserialization-bound, not I/O-bound).  Loading
+        serially through 496 entries = ~25 sec; with 4 threads this
+        drops to ~6 sec.  Subsequent ``.get()`` calls hit the in-memory
+        copy (no torch.load), so per-trial materialization in polish
+        becomes essentially free.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        if keys is None:
+            keys = [k for k, v in self.weights.items()
+                    if not isinstance(v, torch.Tensor)]
+        else:
+            keys = [k for k in keys
+                    if not isinstance(self.weights.get(k), torch.Tensor)]
+        if not keys:
+            return 0
+
+        def _load_one(key):
+            self._resolve_to_tensor(key)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_load_one, keys))
+        return len(keys)
+
     def _resolve_to_tensor(self, key: tuple[str, str]) -> torch.Tensor | None:
-        """Return the tensor at ``key`` (lazy-load from disk if needed)
-        and store it back in ``self.weights`` so subsequent calls hit
-        the in-memory copy.  Returns None if the key isn't present."""
+        """Return the tensor at ``key`` (lazy-load from disk if needed).
+        With LRU enabled, the freshly-loaded tensor is bookkept and the
+        oldest entries get evicted back to filenames when the byte budget
+        is exceeded.  Returns None if the key isn't present."""
         v = self.weights.get(key)
         if v is None:
             return None
         if isinstance(v, torch.Tensor):
+            # Refresh LRU position.
+            if self._lru_order is not None:
+                if key in self._lru_order:
+                    self._lru_order.remove(key)
+                self._lru_order.append(key)
             return v
         # Treat anything non-tensor as a filename / path.
         path = str(v)
@@ -119,6 +189,14 @@ class ProductionWeightCache:
             path = str(Path(self.cache_dir) / path)
         loaded = torch.load(path, map_location="cpu", weights_only=True)
         self.weights[key] = loaded
+        if self._lru_order is not None:
+            # Remember the filename so we can evict back to it later.
+            if self._lru_paths is None:
+                self._lru_paths = {}
+            self._lru_paths[key] = str(v)
+            self._lru_bytes += loaded.element_size() * loaded.numel()
+            self._lru_order.append(key)
+            self._evict_to_budget()
         return loaded
 
     def get(self, name: str, fmt: str) -> torch.Tensor | None:
@@ -152,14 +230,27 @@ class ProductionWeightCache:
         formats: Sequence[str],
     ) -> dict:
         """Return a dict with ``hits``, ``misses``, ``failed`` lists keyed
-        by (qname, fmt).  Use ``validate_coverage`` to raise on any miss."""
+        by (qname, fmt).  Use ``validate_coverage`` to raise on any miss.
+
+        Crucially, this checks key membership only — does NOT lazy-load
+        tensors — so it stays cheap on disk-streaming caches with
+        thousands of entries totalling tens of GB.
+        """
+        def _has_key(name: str, fmt: str) -> bool:
+            cands = [name]
+            if name.endswith(".weight"):
+                cands.append(name[:-len(".weight")])
+            if name.startswith("model.language_model."):
+                cands.append("model." + name[len("model.language_model."):])
+            return any((c, fmt) in self.weights for c in cands)
+
         hits: list[tuple[str, str]] = []
         misses: list[tuple[str, str]] = []
         for q in expected_qnames:
             for f in formats:
                 if f.upper() in {"BF16", "MXFP8", "MXFP8_E4M3"}:
                     continue
-                if self.get(q, f.upper()) is not None:
+                if _has_key(q, f.upper()):
                     hits.append((q, f.upper()))
                 else:
                     misses.append((q, f.upper()))
@@ -431,23 +522,49 @@ def fill_production_weight_cache(
             )
 
     device = next(model.parameters()).device
-    # Hook EVERY relevant Linear so we always get max_abs (cheap), but
-    # only STORE full activations for Linears we still need to render.
-    collector = _LinearActivationCollector(
-        model,
-        qnames=qname_set,
-        max_rows=max_act_rows,
-        store_qnames=qnames_to_render,
+    # RESUME: if all qnames are already rendered AND we have either a
+    # sidecar OR no need for max_abs (no NVFP4 in formats), skip the
+    # forward pass entirely.  Avoids OOM from the model's forward pass
+    # itself on big models (e.g. linear-attention torch fallback can
+    # spike memory mid-pass on Qwen3.5/3.6 27B+).
+    sidecar_path: Path | None = (
+        cache_dir_path / "activation_max_abs.json"
+        if cache_dir_path is not None else None
     )
-    collector.install()
-    try:
-        with torch.no_grad():
-            for i in range(calib_ids.size(0)):
-                batch = calib_ids[i:i + 1].to(device)
-                model(batch)
-    finally:
-        collector.remove()
-    activations = collector.collected()
+    skip_forward = (
+        cache_dir_path is not None
+        and not qnames_to_render
+        and (
+            (sidecar_path is not None and sidecar_path.is_file())
+            or "NVFP4" not in {f.upper() for f in formats}
+        )
+    )
+    if skip_forward:
+        if progress:
+            print(
+                "[prod-cache] resume: all qnames pre-rendered + max_abs "
+                "available, skipping activation forward pass",
+                flush=True,
+            )
+        activations: dict[str, torch.Tensor] = {}
+    else:
+        # Hook every relevant Linear so we always get max_abs (cheap), but
+        # only STORE full activations for Linears we still need to render.
+        collector = _LinearActivationCollector(
+            model,
+            qnames=qname_set,
+            max_rows=max_act_rows,
+            store_qnames=qnames_to_render,
+        )
+        collector.install()
+        try:
+            with torch.no_grad():
+                for i in range(calib_ids.size(0)):
+                    batch = calib_ids[i:i + 1].to(device)
+                    model(batch)
+        finally:
+            collector.remove()
+        activations = collector.collected()
 
     if progress:
         print(
@@ -503,11 +620,8 @@ def fill_production_weight_cache(
     # RESUME: load previously-computed max_abs values from the sidecar
     # JSON if disk-streaming + sidecar exists.  Lets a resume run skip
     # both activation collection and max_abs recomputation for already-
-    # rendered qnames.
-    sidecar_path: Path | None = (
-        cache_dir_path / "activation_max_abs.json"
-        if cache_dir_path is not None else None
-    )
+    # rendered qnames.  ``sidecar_path`` was defined earlier (before the
+    # forward-skip decision); re-using it here.
     if sidecar_path is not None and sidecar_path.is_file():
         import json as _json
         try:

@@ -83,6 +83,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Top-down only: maximum allowed KL.  Polish accepts a flip "
         "iff trial_kl ≤ kl_budget.  Required for top_down.",
     )
+    p.add_argument(
+        "--lru-gb",
+        type=float,
+        default=0.0,
+        help="When >0 and the production cache was built in disk-streaming "
+        "mode, bound the in-memory tensor footprint to this many GiB via "
+        "LRU eviction.  Required on big models that don't fit alongside "
+        "the model weights (e.g. 27B+ on 121 GB UMA).  Disk churn cost "
+        "is roughly (n_units_flipped × weight_size) per polish trial.",
+    )
+    p.add_argument(
+        "--prefetch-cache",
+        action="store_true",
+        help="At polish startup, eagerly torch.load every disk-streamed "
+        "cache entry via a thread pool.  Trades ~6 sec of startup time "
+        "for elimination of per-trial torch.load latency (~50ms × 305 "
+        "units × 8 passes ≈ 2 minutes saved).  Only useful when "
+        "--lru-gb is large enough to keep all entries resident.",
+    )
     args = p.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -140,6 +159,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             production_weight_cache = pickle.load(fh)
         print(f"[polish] loaded prod cache with "
               f"{len(production_weight_cache)} entries", flush=True)
+        if args.lru_gb and args.lru_gb > 0:
+            n_bytes = int(args.lru_gb * (1024 ** 3))
+            production_weight_cache.enable_lru(n_bytes)
+            print(
+                f"[polish] LRU eviction enabled at {args.lru_gb:.1f} GiB",
+                flush=True,
+            )
+        if args.prefetch_cache:
+            t_pre = time.monotonic()
+            n_loaded = production_weight_cache.prefetch()
+            elapsed = time.monotonic() - t_pre
+            print(
+                f"[polish] prefetched {n_loaded} cache entries in "
+                f"{elapsed:.1f}s",
+                flush=True,
+            )
 
     dtype = _dtype_from_name(args.dtype)
     staged, cleanup = stage_multimodal(args.model)
