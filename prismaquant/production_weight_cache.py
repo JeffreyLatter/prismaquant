@@ -195,13 +195,22 @@ class _LinearActivationCollector:
     across calibration samples) as float32 CPU tensors.  Only handles
     ``nn.Linear`` for now — packed MoE experts route through different
     APIs in the export pipeline and would need a separate collector.
+
+    ``store_qnames`` controls which Linears get full activation tensors
+    stored (memory-bounded by ``max_rows``).  All Linears in
+    ``qnames`` get a per-Linear scalar ``max_abs`` recorded — that's
+    cheap (one float per Linear) and needed by the cache's act-clip
+    metadata even for Linears whose render is skipped via resume.
     """
 
-    def __init__(self, model: nn.Module, qnames: set[str], max_rows: int):
+    def __init__(self, model: nn.Module, qnames: set[str], max_rows: int,
+                 store_qnames: set[str] | None = None):
         self.model = model
         self.qnames = qnames
+        self.store_qnames = set(store_qnames) if store_qnames is not None else set(qnames)
         self.max_rows = int(max_rows)
         self.activations: dict[str, list[torch.Tensor]] = {}
+        self.max_abs: dict[str, float] = {}
         self._handles: list = []
         self._name_by_id: dict[int, str] = {}
         for full_name, mod, attr in iter_quantizable_tensors(model):
@@ -212,7 +221,8 @@ class _LinearActivationCollector:
                 continue
             key = qname
             self._name_by_id[id(mod)] = key
-            self.activations[key] = []
+            if key in self.store_qnames:
+                self.activations[key] = []
 
     def install(self) -> None:
         for mod_id, key in self._name_by_id.items():
@@ -230,6 +240,17 @@ class _LinearActivationCollector:
                 return
             x = args[0]
             if not isinstance(x, torch.Tensor):
+                return
+            # Always update the cheap per-Linear max_abs scalar — needed
+            # even for Linears we won't store activations for (so cache
+            # has act-clip values for every assigned Linear).
+            x_abs_max = float(x.detach().abs().max().item())
+            prev = self.max_abs.get(key, 0.0)
+            if x_abs_max > prev:
+                self.max_abs[key] = x_abs_max
+            # Only store the full activation tensor if this Linear is in
+            # the store set.  Memory bound: store_qnames × max_rows × in.
+            if key not in self.store_qnames:
                 return
             flat = x.detach().reshape(-1, x.shape[-1]).to(torch.float32).cpu()
             existing = sum(t.shape[0] for t in self.activations[key])
@@ -378,9 +399,45 @@ def fill_production_weight_cache(
     if not qname_set:
         return ProductionWeightCache(weights={}, levers=dict(levers))
 
+    # RESUME: when disk-streaming is on and prior shards exist, only
+    # collect activations for Linears whose shards we still need to
+    # render.  On a job that's 99%+ complete this drops activation
+    # collection memory + compute by 99% — and lets a borderline-OOM
+    # job finish on the same hardware.
+    cache_dir_path: Path | None = None
+    if cache_dir is not None:
+        cache_dir_path = Path(cache_dir)
+        cache_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def _safe_path_early(qname: str, fmt: str) -> str:
+        safe = qname.replace("/", "__").replace(".", "_")
+        return f"{safe}__{fmt}.pt"
+
+    qnames_to_render: set[str] = set(qname_set)
+    if cache_dir_path is not None:
+        # A qname is FULLY done if every requested format has a shard.
+        fmts_upper = [f.upper() for f in formats]
+        prerendered = 0
+        for q in list(qname_set):
+            if all((cache_dir_path / _safe_path_early(q, f)).is_file()
+                   for f in fmts_upper):
+                qnames_to_render.discard(q)
+                prerendered += 1
+        if progress and prerendered:
+            print(
+                f"[prod-cache] resume: {prerendered} qnames already on disk "
+                f"({len(qnames_to_render)} still need rendering)",
+                flush=True,
+            )
+
     device = next(model.parameters()).device
+    # Hook EVERY relevant Linear so we always get max_abs (cheap), but
+    # only STORE full activations for Linears we still need to render.
     collector = _LinearActivationCollector(
-        model, qnames=qname_set, max_rows=max_act_rows,
+        model,
+        qnames=qname_set,
+        max_rows=max_act_rows,
+        store_qnames=qnames_to_render,
     )
     collector.install()
     try:
@@ -403,12 +460,8 @@ def fill_production_weight_cache(
     failed: dict[tuple[str, str], str] = {}
     qname_to_module: dict[str, nn.Module] = {}
 
-    cache_dir_path: Path | None = None
-    if cache_dir is not None:
-        cache_dir_path = Path(cache_dir)
-        cache_dir_path.mkdir(parents=True, exist_ok=True)
-        if progress:
-            print(f"[prod-cache] streaming cache to {cache_dir_path}/", flush=True)
+    if cache_dir_path is not None and progress:
+        print(f"[prod-cache] streaming cache to {cache_dir_path}/", flush=True)
 
     def _safe_path(qname: str, fmt: str) -> str:
         # Replace path-unsafe chars in qnames with __ for filename use.
@@ -446,6 +499,32 @@ def fill_production_weight_cache(
     # We store max_abs directly (not 6/max_abs) — see ProductionWeightCache
     # docstring on the convention difference.
     activation_max_abs: dict[str, float] = {}
+
+    # RESUME: load previously-computed max_abs values from the sidecar
+    # JSON if disk-streaming + sidecar exists.  Lets a resume run skip
+    # both activation collection and max_abs recomputation for already-
+    # rendered qnames.
+    sidecar_path: Path | None = (
+        cache_dir_path / "activation_max_abs.json"
+        if cache_dir_path is not None else None
+    )
+    if sidecar_path is not None and sidecar_path.is_file():
+        import json as _json
+        try:
+            activation_max_abs.update(_json.loads(sidecar_path.read_text()))
+            if progress:
+                print(
+                    f"[prod-cache] resume: loaded {len(activation_max_abs)} "
+                    f"max_abs entries from sidecar",
+                    flush=True,
+                )
+        except Exception as e:
+            if progress:
+                print(
+                    f"[prod-cache] sidecar load failed ({e}); recomputing",
+                    flush=True,
+                )
+
     fmt_set = {f.upper() for f in formats}
     if "NVFP4" in fmt_set:
         # Group by fused sibling key for max-across-siblings unification.
@@ -459,10 +538,20 @@ def fill_production_weight_cache(
 
         per_qname_max_abs: dict[str, float] = {}
         for qname, _ in qname_to_module.items():
-            a = activations.get(qname)
-            if a is None:
+            # 1. Sidecar (resume) wins — these are the pre-computed values
+            #    from a prior run.
+            if qname in activation_max_abs:
+                per_qname_max_abs[qname] = activation_max_abs[qname]
                 continue
-            mx = float(a.abs().max().item())
+            # 2. Collector's per-Linear scalar (always populated for
+            #    Linears that were hooked, even if no full activation
+            #    tensor was stored).
+            mx = collector.max_abs.get(qname, 0.0)
+            if mx <= 0:
+                a = activations.get(qname)
+                if a is None:
+                    continue
+                mx = float(a.abs().max().item())
             if mx <= 0:
                 continue
             per_qname_max_abs[qname] = mx
@@ -486,9 +575,15 @@ def fill_production_weight_cache(
                 f"({len(groups)} fused groups)",
                 flush=True,
             )
+        # Persist max_abs to sidecar so future resume runs can skip
+        # activation collection entirely for completed qnames.
+        if sidecar_path is not None and activation_max_abs:
+            import json as _json
+            sidecar_path.write_text(_json.dumps(activation_max_abs, indent=2))
 
     n = len(qname_to_module) * len(formats)
     done = 0
+    skipped_resumed = 0
     # MEM: free per-Linear activation tensors after each render so peak
     # memory stays bounded.  On 27B, 497 Linears × ~10K in_features × 512
     # rows × fp32 = ~10 GB just for activations.  Freeing in-loop drops
@@ -506,6 +601,18 @@ def fill_production_weight_cache(
         # case future code consumes it.
         export_scale = (6.0 / max_abs) if (max_abs is not None and max_abs > 0) else None
         for fmt in formats:
+            # RESUME: in disk-streaming mode, if a shard already exists
+            # for (qname, fmt) on disk, treat it as previously rendered
+            # and skip re-rendering.  This lets a job that OOM'd at 95%
+            # resume without re-doing the work — just rebuild the manifest
+            # from the surviving .pt files.
+            if cache_dir_path is not None:
+                fname = _safe_path(qname, fmt.upper())
+                if (cache_dir_path / fname).is_file():
+                    weights[(qname, fmt.upper())] = fname
+                    skipped_resumed += 1
+                    activations_local.pop(qname, None)
+                    continue
             try:
                 w_dq = render_production_weight(
                     weight, fmt,
@@ -556,8 +663,11 @@ def fill_production_weight_cache(
             except Exception:
                 pass
     if progress:
-        print(f"[prod-cache] rendered {len(weights)} (qname, fmt) entries; "
-              f"{len(failed)} failures", flush=True)
+        print(
+            f"[prod-cache] rendered {len(weights)} (qname, fmt) entries "
+            f"({skipped_resumed} resumed from disk); {len(failed)} failures",
+            flush=True,
+        )
     return ProductionWeightCache(
         weights=weights,
         levers=dict(levers),
