@@ -13,9 +13,8 @@ dist/
 references/
 scratch/
 
-# Personal / local-only state
-.claude/settings.local.json
-.claude/scheduled_tasks.lock
+# Personal / local-only state — entire .claude dir kept out of the repo
+.claude/
 
 # Local sqlite + worktrees + scratch artifacts
 data/
