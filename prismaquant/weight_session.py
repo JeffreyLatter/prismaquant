@@ -61,7 +61,17 @@ class WeightSession:
         self,
         model: nn.Module,
         production_weight_cache=None,
+        snapshot_dir: str | None = None,
     ):
+        """If ``snapshot_dir`` is provided, BF16 source snapshots are
+        spilled to disk after capture instead of held in memory.  This
+        bounds the in-memory snapshot footprint to a single tensor at a
+        time, at the cost of one ``torch.save`` per first-touch and one
+        ``torch.load`` per revert.  Required for very-large models
+        (e.g. 70B+ on a 121 GB UMA host) where the cumulative BF16
+        snapshot footprint of every quantizable Linear would exceed
+        the budget.
+        """
         self._model = model
         self._cache = production_weight_cache
         self._linear_by_qname: dict[str, tuple[nn.Module, str]] = {}
@@ -71,6 +81,14 @@ class WeightSession:
             qname = full_name[:-7] if full_name.endswith(".weight") else full_name
             self._linear_by_qname[qname] = (mod, attr)
         self._bf16_originals: dict[str, torch.Tensor] = {}
+        self._snapshot_dir = None
+        if snapshot_dir is not None:
+            from pathlib import Path as _P
+            self._snapshot_dir = _P(snapshot_dir)
+            self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+        # Maps qname -> spilled-to-disk filename (relative to snapshot_dir).
+        # Mutually exclusive with _bf16_originals[qname].
+        self._spilled: dict[str, str] = {}
         self._current: dict[str, str] = {}
         self._undo_stack: list[_UndoEntry] = []
 
@@ -95,9 +113,21 @@ class WeightSession:
         called BEFORE the live weight is overwritten by a quantized
         version.  Callers handle that ordering in ``initialize`` and
         ``stage_format``.
+
+        Spill behavior: when ``snapshot_dir`` was passed to
+        ``__init__``, the snapshot is written to disk after capture
+        and dropped from memory; subsequent calls re-load from disk
+        (one-shot, then dropped again).  This bounds the in-memory
+        snapshot footprint at the cost of ``torch.save`` per
+        first-touch and ``torch.load`` per revert.
         """
         if qname in self._bf16_originals:
             return self._bf16_originals[qname]
+        if qname in self._spilled and self._snapshot_dir is not None:
+            return torch.load(
+                self._snapshot_dir / self._spilled[qname],
+                map_location="cpu",
+            )
         live = self._live_weight(qname)
         if live is None:
             return None
@@ -105,6 +135,18 @@ class WeightSession:
         # not part of the model's param graph).  This is a one-time cost
         # per qname.
         snap = live.detach().clone()
+        if self._snapshot_dir is not None:
+            # Spill to disk; do not hold in memory.  Atomic via tmp +
+            # rename so a kill mid-write leaves no half-written file.
+            safe = qname.replace("/", "__").replace(".", "_")
+            fname = f"{safe}__bf16src.pt"
+            tmp = self._snapshot_dir / (fname + ".tmp")
+            torch.save(snap, tmp)
+            import os as _os
+            _os.replace(tmp, self._snapshot_dir / fname)
+            self._spilled[qname] = fname
+            return snap  # caller still uses the in-flight tensor; we'll
+                         # re-load from disk on subsequent calls.
         self._bf16_originals[qname] = snap
         return snap
 
@@ -259,7 +301,7 @@ class WeightSession:
     # ------------------------------------------------------------------
     @property
     def n_bf16_snapshots(self) -> int:
-        return len(self._bf16_originals)
+        return len(self._bf16_originals) + len(self._spilled)
 
     @property
     def n_pending_undo(self) -> int:

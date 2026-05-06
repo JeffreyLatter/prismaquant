@@ -1,0 +1,60 @@
+Gemini review of PrismaQuant production-faithful polish, dated Wednesday, May 6, 2026
+
+## 1. Headline assessment
+* The "production-faithful polish" implementation correctly bridges the functional gap between polish-time KL measurement and export-time weights, and the metrics achieved (5.39 bpp / 0.0054 KL) are impressive and verifiable.
+* However, the headline "2.8x lower KL" claim is compromised. The 0.0151 baseline it compares against was measured on a tiny (2x128) calibration set, creating an apples-to-oranges comparison when stacked against the rigorously validated 8x512 polish result.
+* Critical new infrastructure bugs—specifically disk-streaming atomicity failures and memory leaks—make the pipeline unsafe to run on memory-constrained UMA machines without risking data corruption or Out-of-Memory (OOM) errors. 
+* Several high-severity carryover items, notably a process-poisoning environment variable leak, remain completely open despite being flagged in the last review.
+
+## 2. Carryover from previous review
+1. **Env-var leak (`PRISMAQUANT_DELTA_QUANTIZE_POLISH` / `PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT`):** STILL-OPEN. 
+   - **Location:** `prismaquant/coord_descent_polish.py:305`
+   - **Fix:** The path is still gated by `PRISMAQUANT_DELTA_QUANTIZE_POLISH`. Worse, it sets `_os.environ["PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT"] = "1"` globally and never restores it. Subsequent in-process evaluators (like $L_3$ or validation) will silently skip normal weight installation. You must expose this as a CLI flag and wrap the `EXTERNAL_WEIGHT_MANAGEMENT` mutation in a `try/finally` block.
+2. **README/overview overclaim relative to handover:** STILL-OPEN.
+   - **Location:** `paper/main.tex` (Table 1), `README.md`
+   - **Fix:** The paper touts the shipped 0.0151 KL result as a "held-out" baseline (implying the 8x512 split). The handover doc specifically states this was a sanity run on "tiny calibration (2 x 128)" and should not be used to claim final model quality. Re-measure the 0.0151 artifact on the true 8x512 split before claiming a 2.8x reduction, or add an explicit footnote clarifying the differing calibration sizes.
+3. **"Production-faithful" claim is close but not literally exact:** PARTIALLY-CLOSED.
+   - **Location:** `README.md:238`
+   - **Fix:** While the paper's text was softened, `README.md` still claims "the exact per-Linear weight the exporter would render". As listed in `production_weight_cache.py`, gaps like block-output match and AWQ predecessor folding remain. Change "exact" to "functionally identical" or "structurally representative".
+4. **KL metric defaults to last-token KL:** STILL-OPEN.
+   - **Location:** `prismaquant/iterate_perturbed_allocation.py:8550`
+   - **Fix:** The code still defaults to `PRISMAQUANT_FULL_SEQUENCE_KL=False`. If the paper's "held-out KL" claims depend on full-sequence perplexity-style metrics, the default should be explicitly synchronized, or the paper must specify that it is reporting last-token KL. 
+5. **Production cache resume edge cases:** STILL-OPEN.
+   - **Location:** `prismaquant/production_weight_cache.py:723` and `663`.
+   - **Fix:** `activations_local.pop(qname, None)` is still called *inside* the `for fmt in formats:` loop. If a Linear has multiple formats, the first format drops the activation, starving subsequent formats. Move the pop outside the `formats` loop. Additionally, if `skip_forward` is true (line 663), `collector` is never instantiated. If a Linear is missing from the sidecar, line 640 attempts to access `collector.max_abs` and raises an `UnboundLocalError`. Handle `collector` being undefined safely.
+
+## 3. Correctness of the new material
+1. **§6.3 Incident Disagreements:**
+   - **Problem:** The paper claims 148/497 disagreements with PrismaSCOUT. Analyzing `forward_polish.json` against `validated_knee_assignment.json` reveals exactly 144 disagreements out of the 497 Linears. The 12 BF16 and 5 MXFP8 counts, along with the 12 accepted moves and ~28 minute wall time, reproduce correctly. 
+   - **Fix:** Update the text in §6.3 to "144/497 disagreements".
+2. **§5.10 Top-down polish convergence description:**
+   - **Problem:** The paper states top-down polish "converges toward a budget-feasible all-NVFP4 floor that the bottom-up sweep already produces directly." This is inaccurate. Top-down converges from the BF16 ceiling downwards until it hits the KL budget constraint, not the all-NVFP4 floor. 
+   - **Fix:** Correct the theoretical explanation of top-down convergence. (The claim that the plumbing was left in place but defaulted off matches the code in `polish_from_assignment.py`).
+3. **§5.11 UMA-clone misadventure explanation:**
+   - **Problem:** The paper claims the fix was "not to clone at all per trial, which is the WeightSession delta-quantize path". However, `WeightSession.stage_format` *does* still clone the individual Linear's weight per trial (`prev_weight = live.detach().clone()`). It just avoids cloning the *entire model*. 
+   - **Fix:** Clarify that the slot's weight is still cloned per-trial on the GPU, but the 54GB full-model clone was eliminated.
+
+## 4. New failure modes
+1. **ProductionWeightCache partial write corruption:**
+   - **Location:** `prismaquant/production_weight_cache.py:755`
+   - **Problem:** Disk-streaming writes directly to the final filename via `torch.save(tensor, cache_dir_path / fname)`. This write is not atomic. If the script is OOM killed or interrupted mid-write, a corrupted `.pt` file is left behind. On resume, `.is_file()` (line 716) will see the corrupted shard, skip rendering, and cause a deserialization crash later.
+   - **Fix:** Write to a temporary file (e.g., `fname + ".tmp"`) and use `os.rename()` to atomically move it into place.
+2. **WeightSession unbounded BF16 snapshot growth:**
+   - **Location:** `prismaquant/weight_session.py:80` (`_ensure_bf16_snapshot`)
+   - **Problem:** The method clones the live BF16 weight into memory on first access. During a heavy bidirectional or top-down sweep that touches every unit, this will eventually snapshot the entire model's parameters into `_bf16_originals` (~46 GB for Qwen3.6-27B). On a 121 GB UMA machine sharing memory with the live model, this will eventually trigger a delayed OOM.
+   - **Fix:** Implement an LRU eviction strategy for `_bf16_originals` or load from the original disk weights on demand. 
+3. **Defensive member_qnames assertion bypass:**
+   - **Location:** `prismaquant/coord_descent_polish.py:269`
+   - **Problem:** The guard checks `if not any(m in starting_assignment for m in _members)`. If a payload bug causes a fused-sibling unit (e.g., `gate_up_proj`) to include one member but incorrectly drop the other, `any()` evaluates to True. The assertion passes, and the polish silently undercounts bits for the missing member.
+   - **Fix:** Change the check to `not all(m in starting_assignment for m in _members)`.
+
+## 5. Professionalism / framing
+1. **Abstract Headline:** "$\sim$2.8x lower KL... at comparable bpp". While mathematically accurate (0.0151 vs 0.0054), comparing a heavily polished outcome against an unpolished, tiny-calibration sanity check borders on marketing spin. Re-run the baseline properly or frame the comparison honestly. 
+2. **§6.3 "Incident" Tone:** Dedicating a formally titled subsection to the `member_qnames` payload dictionary bug feels overly dramatic and self-flagellating. While honesty is appreciated, treating a standard serialization bug like a post-mortem incident undermines the paper's academic tone. Fold the finding into a standard "Limitations" or "Implementation Details" paragraph.
+
+## 6. What's done well
+* The `WeightSession` logic for in-place delta updates is an elegant and highly effective piece of engineering that correctly targets the bottleneck.
+* The disk-streaming implementation (coupled with LRU parallel prefetching) in the production cache shows a deep, practical understanding of memory limitations on UMA architectures. 
+
+## 7. Recommendation
+`claim-after-major-revisions`. The 5.39 / 0.0054 metrics are strong and the codebase improvements are highly effective, but the paper cannot legitimately claim a 2.8x reduction until the baseline provenance mismatch is corrected. Furthermore, the disk streaming atomicity flaws and the `EXTERNAL_WEIGHT_MANAGEMENT` env-var leak are critical bugs that actively jeopardize the integrity of downstream measurements and must be fixed prior to merging.

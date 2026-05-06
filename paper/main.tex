@@ -95,13 +95,17 @@ export-time quantization tricks --- 11\% smaller and 68\% lower KL on the same
 calibration. The artifact is published with DOI \texttt{10.57967/hf/8656}
 \cite{Tand2026hf}. A subsequent \emph{production-faithful} polish
 (Section~\ref{subsec:prodpolish}), in which the polish-time evaluator is
-upgraded to use the same per-Linear quantized weights the exporter ultimately
-ships --- joint-NVFP4 sibling-coherent input global scales, GPTQ
-reconstruction, scale-sweep, and calibrated activation clip --- and the
-move set is restructured to start from a low-bpp floor with a small
-bits-budget creep, drives the held-out KL further down to $0.0054$ at
-$5.39$~bpp, roughly $2.8\times$ lower KL than the shipped PrismaSCOUT
-artifact at comparable bpp. We also document, in a separate methodology section, several
+upgraded to use a closer approximation of the per-Linear quantized weight
+the exporter ultimately ships --- joint-NVFP4 sibling-coherent input
+global scales, GPTQ reconstruction, scale-sweep, and calibrated activation
+clip; block-output match, HALO, and AWQ predecessor folding remain on the
+export-only side --- and the move set is restructured to start from a
+low-bpp floor with a small bits-budget creep, drives the polish-time KL
+on Qwen3.6\nobreakdash-27B from $0.0151$ at $5.31$~bpp to $0.0054$ at
+$5.39$~bpp on a matched 2$\times$128 token calibration. A re-measurement
+on the 8$\times$512 token validation split that backs the v1 5.5~bpp
+baseline is in flight at the time of writing; the calibration-matched
+polish-time signal is the conservative claim until that completes. We also document, in a separate methodology section, several
 numerical methods that were proposed and either implemented-but-deprecated or
 rejected outright during the design process: Lagrangian
 $\lambda$-bisection on the dual gradient, sandwich proximal recalibration,
@@ -174,11 +178,16 @@ a 5.31~bpp artifact with held-out KL $0.0151$. The previously published
 KL $0.0475$ from the same calibration. The new artifact is 11\% smaller and the
 held-out KL is 68\% lower. Only the selection routine changed. A second
 selection-only upgrade --- the \emph{production-faithful} polish of
-Section~\ref{subsec:prodpolish}, which evaluates candidate flips on the same
-quantized weights the exporter will ship rather than on RTN proxies and
-sweeps from a low-bpp floor under a small bits-budget creep --- drives the
-same model further to $5.39$~bpp / KL $0.0054$, $\sim\!2.8\times$ lower KL
-than the shipped 5.31 artifact at $+0.08$~bpp.
+Section~\ref{subsec:prodpolish}, which evaluates candidate flips on a
+closer approximation of the per-Linear weight the exporter will ship
+rather than on RTN proxies and sweeps from a low-bpp floor under a small
+bits-budget creep --- drops the polish-time KL on the same model from
+$0.0151$ at $5.31$~bpp to $0.0054$ at $5.39$~bpp on a matched
+$2\!\times\!128$ token calibration. Both numbers come from the
+polish-time evaluator on the same calibration split and are
+apples-to-apples; a re-measurement on the larger
+$8\!\times\!512$ split that backs the v1 5.5~bpp baseline is in flight
+and will be the load-bearing claim once it completes.
 
 The paper is organized as follows. Section~\ref{sec:related} gives background
 and related work. Section~\ref{sec:theory} sets up the theoretical framework:
@@ -1141,12 +1150,18 @@ greedy chooses the unit with the smallest KL increase among those, finds
 many nearly-identical such picks at the start, and uses the entire
 \texttt{max\_passes} budget on cheap flips with no incentive to
 extend toward the bpp range where the forward sweep operates. Increasing
-\texttt{max\_passes} to $100$+ would in principle close the gap, but the
-top-down direction also has no convergence guarantee \emph{toward a knee};
-it converges toward a budget-feasible all-NVFP4 floor that the bottom-up
-sweep already produces directly. We retired the top-down direction; the
-shipping production-faithful polish runs only the bottom-up sweep from the
-floor.
+\texttt{max\_passes} to $100$+ would in principle close the gap by
+exhausting the KL budget --- the contractual stopping condition for the
+top-down direction is that no further bits-decreasing flip stays under
+$\kappa_{\mathrm{budget}}$, which on Qwen3.6-27B at
+$\kappa_{\mathrm{budget}} = 0.05$ means many more accepted flips than
+\texttt{max\_passes}=12 allowed. But the top-down direction also has no
+convergence guarantee \emph{toward a knee}: it descends until the KL
+budget is the binding constraint, which is operationally equivalent to
+``find the highest-bpp assignment with KL just under the budget'', not
+``find the right Pareto-optimal point''. We retired the top-down
+direction; the shipping production-faithful polish runs only the
+bottom-up sweep from the floor.
 
 \paragraph{What we kept from the experiment.} The plumbing
 (\texttt{--direction top\_down}, \texttt{--kl-budget}) stays in
@@ -1169,8 +1184,12 @@ memory are different pools, so the trial-time peak should drop.
 the CPU and GPU share the same physical pool. ``Move to CPU'' relabels a
 tensor as host-resident in the PyTorch view but does not change which
 DRAM page backs it; the trial-time peak is identical. The right fix is
-not to clone at all per trial, which is the \texttt{WeightSession}
-delta-quantize path (Section~\ref{subsec:prodpolish}). We mention the
+not to clone the \emph{whole materialized model} per trial: the
+\texttt{WeightSession} delta-quantize path
+(Section~\ref{subsec:prodpolish}) still clones the staged unit's slot
+on each trial (so a revert is a $\sim$50--500~MB \texttt{copy\_} per
+unit, not free), but it eliminates the $\sim$54~GB-per-trial full-model
+clone that the per-module hook path used to make. We mention the
 non-fix because it is a recurring class of mistake on UMA architectures:
 a memory-management heuristic that is correct on a discrete-GPU host can
 be a no-op on a UMA host, and the eviction path of the
@@ -1413,27 +1432,35 @@ DOI~\texttt{10.57967/hf/8656} \cite{Tand2026hf}.
 
 Section~\ref{subsec:prodpolish} described the production-faithful polish:
 delta-quantize \texttt{WeightSession} swaps one decision unit's weight in
-place per trial, weights are rendered through the full export pipeline
-(GPTQ, scale-sweep, joint sibling-coherent NVFP4 input global scales,
-calibrated activation clip), and the move set is a single bottom-up sweep
-from a low-bpp floor under a $5\%$ bits-budget creep. Table~\ref{tab:27b_prodpolish}
-reports the held-out KL outcome on Qwen3.6-27B against the same calibration
-that drove the upstream PrismaSCOUT selection.
+place per trial, weights are rendered through a closer approximation of
+the export pipeline (GPTQ, scale-sweep, joint sibling-coherent NVFP4
+input global scales, calibrated activation clip; block-output match,
+HALO, and AWQ predecessor folding remain on the export-only side and are
+not yet replicated in the polish-time evaluator), and the move set is a
+single bottom-up sweep from a low-bpp floor under a $5\%$ bits-budget
+creep. Table~\ref{tab:27b_prodpolish} reports the polish-time KL outcome
+on Qwen3.6-27B; both rows are evaluated on the same matched
+$2\!\times\!128$ token calibration that the upstream PrismaSCOUT
+selection used during its kneedle search. This is a polish-time signal,
+not a held-out claim --- a re-measurement on the larger
+$8\!\times\!512$ split that backs the v1 5.5~bpp baseline is in flight.
 
 \begin{table}[h]
 \centering
 \caption{Qwen3.6-27B: production-faithful polish vs.\ shipped
-  PrismaSCOUT. Both runs use identical source weights and identical
-  per-tensor toolkit; the polish operates on the same Block-CLADO decision
-  units that PrismaSCOUT's surrogate hierarchy used. Held-out KL on
-  disjoint validation split, identical $8\!\times\!512$ token budget.}
+  PrismaSCOUT, polish-time KL on a matched $2\!\times\!128$ token
+  calibration set. Both rows use identical source weights and identical
+  per-tensor toolkit; the polish operates on the same Block-CLADO
+  decision units that PrismaSCOUT's surrogate hierarchy used.
+  Calibration-matched but small; treat as polish-time signal pending
+  $8\!\times\!512$ re-measurement.}
 \label{tab:27b_prodpolish}
 \begin{tabular}{lrrr}
 \toprule
-Artifact & bpp & Held-out KL & Improvement \\
+Artifact & bpp & Polish-time KL ($2{\times}128$) & Relative \\
 \midrule
 \textsc{PrismaSCOUT} (5.31)             & 5.31           & 0.0151          & --- \\
-Production-faithful polish (5.39)       & \textbf{5.39}  & \textbf{0.0054} & $-2.8\times$ at $+0.08$ bpp \\
+Production-faithful polish (5.39)       & \textbf{5.39}  & \textbf{0.0054} & $-2.8\times$ at $+0.08$ bpp (provisional) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1442,7 +1469,7 @@ The polish committed $12$ accepted moves in $28$ minutes wall on a single
 GB10 (delta-quantize \texttt{WeightSession} with disk-streaming
 \texttt{ProductionWeightCache} and a 5~GiB LRU bound). Per-Linear, the
 disagreement with PrismaSCOUT's assignment is large
-(Table~\ref{tab:27b_prodpolish_diff}): $148$ of $497$ language-domain
+(Table~\ref{tab:27b_prodpolish_diff}): $144$ of $497$ language-domain
 Linears change format, with the new assignment concentrating its
 high-precision budget on a tight set of bottleneck Linears.
 
@@ -1450,7 +1477,7 @@ high-precision budget on a tight set of bottleneck Linears.
 \centering
 \caption{Per-Linear format disagreement on the $497$-entry language-domain
   assignment between PrismaSCOUT (5.31~bpp) and the production-faithful
-  polish (5.39~bpp). Disagreement total: $148/497 = 29.8\%$.}
+  polish (5.39~bpp). Disagreement total: $144/497 = 29.0\%$.}
 \label{tab:27b_prodpolish_diff}
 \begin{tabular}{lr}
 \toprule
@@ -1494,31 +1521,16 @@ $\to$ validated-frontier upgrade, or surfaces fresh tail regressions of
 its own, remains an open question we will report when the eval suite
 completes.
 
-\paragraph{An incident: undercounted decision units.} A near-miss is
-worth recording. The first production-faithful polish run on 27B reported
-\texttt{final\_bpp} of $2.15$, which is well below the all-NVFP4 floor of
-$5.07$. The cause was a key mismatch in an ad-hoc payload writer: the
-serialized decision units carried their member Linears under a
-\texttt{member\_qnames} key, but
-\texttt{prismaquant.block\_clado.parse\_payload} only recognized
-\texttt{members} and silently fell back to using the unit name as a sole
-pseudo-member. Half the fused-sibling decision space (every \texttt{q/k/v}
-group, every \texttt{gate\_up/down} pair) became invisible to polish, so
-flips on those units were silently no-ops, and bits accounting computed
-from \texttt{member\_qnames} undercounted by $\sim 2.4\times$. The fix has
-two parts: \texttt{parse\_payload} now accepts both keys, and
-\texttt{coord\_descent\_polish} raises a hard error if any decision unit
-has zero \texttt{member\_qnames} present in the starting assignment. The
-defensive assertion would have caught the bug at the first KL measurement
-of the first pass; the canonical writer
-\texttt{units\_and\_pairs\_to\_payload} has emitted both keys all along.
-We mention the incident because it is a useful illustration of a more
-general pipeline-discipline principle: cost-model and weight-rendering
-fidelity is necessary but not sufficient. Move-set fidelity --- the polish
-must actually be able to flip every quantizable Linear it claims it can
---- is independently load-bearing. A silent fallback that turns expensive
-flips into no-ops looks indistinguishable from a polish that converged
-fast.
+A first run of the production-faithful polish reported a final
+\texttt{bpp} below the all-NVFP4 floor due to a key mismatch in an
+ad-hoc payload writer: it serialized decision-unit members under
+\texttt{member\_qnames} but \texttt{block\_clado.parse\_payload}
+only recognized \texttt{members} and silently fell back to a singleton
+pseudo-member. Move-set fidelity is independently load-bearing of
+cost-model fidelity: a silent fallback that turns expensive flips into
+no-ops looks indistinguishable from a polish that converged fast. The
+fix accepts both keys and \texttt{coord\_descent\_polish} now raises if
+any decision unit has any member missing from the starting assignment.
 
 \section{Discussion and Limitations}\label{sec:discussion}
 
@@ -1583,12 +1595,15 @@ monotone coord-descent polish that is provably non-regressive on real KL.
 The shipping artifact on Qwen3.6-27B is 11\% smaller and 68\% lower in
 held-out KL than the previously shipped \textsc{PrismaQuant}~v1 artifact at
 the same source. A subsequent production-faithful polish, in which the
-polish-time evaluator is upgraded to render exactly the per-Linear
-quantized weights the exporter ships and the move set is restructured
-around a low-bpp floor, drops held-out KL another $2.8\times$ at $+0.08$
-bpp ($5.39$~bpp / KL $0.0054$), reclaiming the rank-projection bit budget
-that distributed-saliency surrogates over-protect and concentrating it on
-a handful of \texttt{mlp.down\_proj} bottleneck Linears.
+polish-time evaluator is upgraded to render a closer approximation of
+the per-Linear quantized weights the exporter ships and the move set is
+restructured around a low-bpp floor, drops the polish-time KL on the
+same calibration from $0.0151$ to $0.0054$ at $+0.08$ bpp ($5.39$~bpp),
+reclaiming the rank-projection bit budget that distributed-saliency
+surrogates over-protect and concentrating it on a handful of
+\texttt{mlp.down\_proj} bottleneck Linears. The polish-time signal still
+needs to be re-measured on the larger validation calibration that backs
+the v1 shipping baseline before becoming a load-bearing claim.
 We also documented several principled numerical methods
 (Lagrangian $\lambda$-bisection, sandwich proximal recalibration, block-DP
 over architectural cliques, sparse pairwise QUBO, top-$K$ Hessian covering,

@@ -235,14 +235,16 @@ Public artifact: https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell
 
 ### Production-faithful polish: another 2.8× KL drop at +0.08 bpp
 
-The PrismaSCOUT polish step measures KL on RTN-quantized proxy weights — fast, but not what the exporter actually ships. We close that gap with a **production-faithful polish**: every candidate flip is evaluated against the exact per-Linear weight the exporter would render (joint NVFP4 sibling-coherent input global scales, GPTQ reconstruction, scale sweep, calibrated activation clip), with a delta-quantize `WeightSession` that swaps one decision unit's weight in place per trial instead of cloning the model. The move set sweeps from a low-bpp floor under a 5% bits-budget creep.
+The PrismaSCOUT polish step measures KL on RTN-quantized proxy weights — fast, but not what the exporter actually ships. We close that gap with a **production-faithful polish**: every candidate flip is evaluated against the per-Linear weight the exporter would render (joint NVFP4 sibling-coherent input global scales, GPTQ reconstruction, scale sweep, calibrated activation clip — block-output match, HALO, and AWQ predecessor folding are not yet replicated in the polish-time evaluator and remain on the export-only side; see `prismaquant/production_weight_cache.py` for the current gap list), with a delta-quantize `WeightSession` that swaps one decision unit's weight in place per trial instead of cloning the model. The move set sweeps from a low-bpp floor under a 5% bits-budget creep.
 
-| Artifact | bpp | Held-out KL |
+| Artifact | bpp | KL (last-token, on a polish-time calibration set) |
 |---|---|---|
-| PrismaSCOUT (5.31) | 5.31 | 0.0151 |
-| **Production-faithful polish (5.39)** | **5.39** | **0.0054** |
+| PrismaSCOUT (5.31)              | 5.31 | 0.0151 |
+| Production-faithful polish (5.39) | **5.39** | **0.0054** |
 
-29.8% of language-domain Linears (148/497) flip format. The polish reclaims the ~130 small `linear_attn.in_proj_{a,b}` rank-projection matrices PrismaSCOUT held at BF16 (real KL says they're cheap to quantize) and concentrates the budget on a small set of bottleneck Linears: `mlp.down_proj` at layers {0, 10, 16, 62}, `mlp.{gate,up}_proj` at {16, 19}, the embedding-adjacent layer-0 attention block, plus a few mid-network linear-attention picks. Distributed saliency surrogates over-protect rank-projection matrices; real KL on production weights does not.
+**Calibration provenance — important.** Both numbers above come from a polish-time KL evaluator using a 2 × 128 token calibration set (the legacy default of `polish_from_assignment.py`); this matches what the kneedle used to select the 5.31 ship but is too small to back a final-quality claim. A re-measurement on the 8 × 512 token validation split that backs the v1 5.5 bpp baseline is in flight. Until that re-measurement is reported, treat this row as a polish-time signal, not a held-out claim.
+
+144/497 language-domain Linears flip format between the two assignments. The polish reclaims the ~130 small `linear_attn.in_proj_{a,b}` rank-projection matrices PrismaSCOUT held at BF16 (real KL says they're cheap to quantize) and concentrates the budget on a small set of bottleneck Linears: `mlp.down_proj` at layers {0, 10, 16, 62}, `mlp.{gate,up}_proj` at {16, 19}, the embedding-adjacent layer-0 attention block, plus a few mid-network linear-attention picks. Distributed saliency surrogates over-protect rank-projection matrices; real KL on production weights does not.
 
 Polished assignment runs in 28 minutes on a single GB10 (delta-quantize WeightSession + disk-streaming `ProductionWeightCache` + 5 GiB LRU). Downstream task evals (validator perplexity, GSM8K, IFEval, MMLU, tool-eval-bench) are in flight at time of writing.
 

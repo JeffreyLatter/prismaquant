@@ -48,8 +48,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="JSON file with `assignment: {qname: fmt}`")
     p.add_argument("--output", required=True)
     p.add_argument("--production-weight-cache", default=None)
-    p.add_argument("--n-calib-samples", type=int, default=2)
-    p.add_argument("--calib-seqlen", type=int, default=128)
+    # Defaults match the shipping artifact's validation calibration
+    # (8 samples × 512 tokens = 4 096 tokens).  An older default of
+    # 2 × 128 was a sanity-run config that should not back any
+    # publishable KL claim — see the 2026-05-03 PrismaSCOUT handover.
+    p.add_argument("--n-calib-samples", type=int, default=8)
+    p.add_argument("--calib-seqlen", type=int, default=512)
     p.add_argument("--calib-split", default="train")
     p.add_argument("--calib-seed", type=int, default=42)
     p.add_argument("--dtype", default="bf16")
@@ -82,6 +86,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Top-down only: maximum allowed KL.  Polish accepts a flip "
         "iff trial_kl ≤ kl_budget.  Required for top_down.",
+    )
+    p.add_argument(
+        "--delta-quantize",
+        dest="delta_quantize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use delta-quantize WeightSession (single-unit in-place swap "
+        "per trial) when a production_weight_cache is provided.  When "
+        "None (default), falls back to the PRISMAQUANT_DELTA_QUANTIZE_POLISH "
+        "env var.  --no-delta-quantize forces the legacy clone-and-restore "
+        "path.  Required for big-model polish (27B+) on a 121 GB UMA host.",
+    )
+    p.add_argument(
+        "--weight-session-spill-to-disk",
+        action="store_true",
+        help="Spill WeightSession's BF16 source snapshots to disk (in "
+        "work_root) instead of holding all of them in memory.  Bounds "
+        "the polish-time snapshot footprint at the cost of one "
+        "torch.save per first-touch and one torch.load per revert.  "
+        "Required for very-large models (e.g. 70B+ on a 121 GB UMA host) "
+        "where the cumulative BF16-source footprint of every quantizable "
+        "Linear would exceed the budget.",
     )
     p.add_argument(
         "--lru-gb",
@@ -243,6 +269,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             pinned_units=pinned_qnames,
             direction=args.direction,
             kl_budget=args.kl_budget,
+            delta_quantize=args.delta_quantize,
+            weight_session_spill_to_disk=bool(
+                args.weight_session_spill_to_disk
+            ),
             progress_callback=progress,
         )
         elapsed = time.monotonic() - t0

@@ -539,6 +539,7 @@ def fill_production_weight_cache(
             or "NVFP4" not in {f.upper() for f in formats}
         )
     )
+    collector = None  # may stay None on the skip_forward path
     if skip_forward:
         if progress:
             print(
@@ -659,8 +660,14 @@ def fill_production_weight_cache(
                 continue
             # 2. Collector's per-Linear scalar (always populated for
             #    Linears that were hooked, even if no full activation
-            #    tensor was stored).
-            mx = collector.max_abs.get(qname, 0.0)
+            #    tensor was stored).  ``collector`` is None on the
+            #    skip_forward path, in which case we can only fall
+            #    through to the activations-tensor path (which is
+            #    empty on skip_forward, so we just continue).
+            mx = (
+                collector.max_abs.get(qname, 0.0)
+                if collector is not None else 0.0
+            )
             if mx <= 0:
                 a = activations.get(qname)
                 if a is None:
@@ -725,7 +732,12 @@ def fill_production_weight_cache(
                 if (cache_dir_path / fname).is_file():
                     weights[(qname, fmt.upper())] = fname
                     skipped_resumed += 1
-                    activations_local.pop(qname, None)
+                    # Do NOT pop activations_local[qname] here: this
+                    # loop iterates through every format for this
+                    # Linear, and a later format in the same outer
+                    # iteration may still need the activation tensor
+                    # to render.  The outer pop after the format loop
+                    # drops it once all formats are done.
                     continue
             try:
                 w_dq = render_production_weight(
@@ -755,8 +767,16 @@ def fill_production_weight_cache(
                 # Disk-streaming mode: save to per-Linear .pt and store
                 # only the relative filename in the cache.  Peak memory
                 # during fill is bounded by the largest single render.
+                # Atomic via tmp + rename: if the process is killed
+                # mid-write, resume sees no .pt at all (and re-renders)
+                # rather than a corrupt one (which would deserialize-
+                # crash later).
                 fname = _safe_path(qname, fmt.upper())
-                torch.save(tensor, cache_dir_path / fname)
+                final_path = cache_dir_path / fname
+                tmp_path = cache_dir_path / (fname + ".tmp")
+                torch.save(tensor, tmp_path)
+                import os as _os
+                _os.replace(tmp_path, final_path)
                 weights[(qname, fmt.upper())] = fname
                 del tensor
             else:

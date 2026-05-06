@@ -208,6 +208,8 @@ def coord_descent_polish(
     pinned_units: set[str] | None = None,
     direction: str = "bottom_up",
     kl_budget: float | None = None,
+    delta_quantize: bool | None = None,
+    weight_session_spill_to_disk: bool = False,
     progress_callback=None,
 ) -> PolishResult:
     """Polish a starting assignment via real-KL-gated single-flip moves.
@@ -261,20 +263,26 @@ def coord_descent_polish(
     # wrong key for ``members`` and parse_payload fell back to using
     # the unit name as a sole pseudo-member; the entire fused-sibling
     # decision space disappeared from polish.
+    # Use ALL not ANY: a fused-sibling unit with one member present and
+    # another missing would silently undercount bits for the missing
+    # member, which is the same class of bug the original assertion was
+    # added to catch (Gemini 2026-05-06 review).
     _missing_units = []
     for _u in units:
         _members = list(getattr(_u, "member_qnames", []) or [])
         if not _members:
             continue
-        if not any(m in starting_assignment for m in _members):
+        if not all(m in starting_assignment for m in _members):
             _missing_units.append(_u.name)
     if _missing_units:
         raise ValueError(
-            f"{len(_missing_units)} DecisionUnits have NO member_qnames "
-            f"present in starting_assignment — polish would silently skip "
-            f"them and undercount bits.  Likely cause: the payload's "
-            f"unit entries are missing the 'members' field (parse_payload "
-            f"falls back to [unit_name]).  Sample: {_missing_units[:5]}"
+            f"{len(_missing_units)} DecisionUnits have ≥1 member_qname "
+            f"missing from starting_assignment — polish would silently "
+            f"undercount bits for the missing member(s).  Likely causes: "
+            f"the payload's unit entries are missing the 'members' field "
+            f"(parse_payload falls back to [unit_name]); or fused-sibling "
+            f"members were dropped during assignment construction.  "
+            f"Sample: {_missing_units[:5]}"
         )
     if work_root is None:
         work_root = Path(tempfile.mkdtemp(prefix="prismaquant_polish_"))
@@ -284,24 +292,36 @@ def coord_descent_polish(
         work_root.mkdir(parents=True, exist_ok=True)
         cleanup_work_root = False
 
-    # When PRISMAQUANT_DELTA_QUANTIZE_POLISH=1 is set, polish opens a
+    # When delta_quantize_polish is requested, polish opens a
     # WeightSession at the start, materializes the assignment ONCE on
     # model.params, and per trial only swaps the diffed unit's weight
     # in place (with revert-on-reject).  The hooks installed by
     # PerturbedActivationCache skip their clone+restore because the
     # PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT flag is set.  Net effect:
     # ~50 GB of GPU/UMA pressure removed on 27B-class polish.
+    #
+    # Selection precedence: explicit kwarg > env var > default(False).
+    # The env var is preserved for back-compat; new callers should pass
+    # delta_quantize=True.  We restore the prior value of
+    # PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT in the finally block so
+    # subsequent in-process evaluators (L3 measurement, validation,
+    # etc.) see the same environment they would absent this call.
     import os as _os
-    use_delta_quant = (
-        production_weight_cache is not None
-        and _os.environ.get("PRISMAQUANT_DELTA_QUANTIZE_POLISH", "").strip().lower()
-            in {"1", "true", "yes", "on"}
-    )
+    if delta_quantize is None:
+        use_delta_quant = (
+            production_weight_cache is not None
+            and _os.environ.get(
+                "PRISMAQUANT_DELTA_QUANTIZE_POLISH", "",
+            ).strip().lower() in {"1", "true", "yes", "on"}
+        )
+    else:
+        use_delta_quant = bool(delta_quantize) and (
+            production_weight_cache is not None
+        )
     weight_session = None
+    _ext_wm_prev = _os.environ.get("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT")
     if use_delta_quant:
         from prismaquant.weight_session import WeightSession
-        # Tell the activation hooks to skip weight management; we'll
-        # manage weights externally via WeightSession.
         _os.environ["PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT"] = "1"
 
     start = time.time()
@@ -330,7 +350,12 @@ def coord_descent_polish(
                 )
         if use_delta_quant:
             weight_session = WeightSession(
-                model, production_weight_cache=production_weight_cache,
+                model,
+                production_weight_cache=production_weight_cache,
+                snapshot_dir=(
+                    str(work_root / "weight_session_snapshots")
+                    if weight_session_spill_to_disk else None
+                ),
             )
             weight_session.initialize(current, units)
             if progress_callback is not None:
@@ -564,6 +589,17 @@ def coord_descent_polish(
             n_kl_measurements=int(n_measurements),
         )
     finally:
+        # Restore PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT to its prior
+        # value so we do not poison subsequent in-process callers
+        # (L3 measurement, validation, model.eval loops) that expect
+        # PerturbedActivationCache to install weights normally.
+        if use_delta_quant:
+            if _ext_wm_prev is None:
+                _os.environ.pop("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT", None)
+            else:
+                _os.environ["PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT"] = (
+                    _ext_wm_prev
+                )
         if cleanup_work_root:
             shutil.rmtree(work_root, ignore_errors=True)
 

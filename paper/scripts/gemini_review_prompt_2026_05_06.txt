@@ -1,0 +1,207 @@
+You are a fresh peer reviewer for the PrismaQuant / PrismaSCOUT paper at
+/home/rob/prismaquant/paper/main.tex (rendered PDF at
+/home/rob/prismaquant/paper/main.pdf, ~30 pages).
+
+You may have reviewed an earlier draft of this paper. The author has added
+substantial new material in the last 12 hours: a "production-faithful
+polish" path and supporting infrastructure. Your charge is to review the
+*current* state of the project (paper + code) and tell the author what
+still needs to be fixed.
+
+================================================================
+Context: previous review items (from your last pass)
+================================================================
+
+You raised the following concerns last time. Some have been addressed,
+some have not. Your job is to assess each in the current code:
+
+1. HIGH: delta-quantize polish path is gated by env var
+   (PRISMAQUANT_DELTA_QUANTIZE_POLISH), not a CLI flag, and no launcher
+   sets it. When enabled it sets PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT
+   and never restores it, so later same-process KL measurements can
+   silently skip normal weight installation.
+   Files: prismaquant/coord_descent_polish.py:295, 305, 566.
+
+2. HIGH: README/overview overclaim relative to handover. Handover
+   (docs/prismascout_handover_2026-05-03.md:130) said the 0.0151 27B
+   result was on tiny calibration and "do not claim final model quality";
+   README.md:226 and docs/prismascout_overview.md:34 call it held-out
+   shipping-grade. Provenance needs to match.
+
+3. MEDIUM: "production-faithful" claim is close but not literally exact.
+   prismaquant/production_weight_cache.py:21 lists gaps: block-output
+   match, HALO, AWQ predecessor folding, future export-only refinements
+   not implemented. README.md:238 says "exact per-Linear weight the
+   exporter would render" — soften unless those levers were definitely
+   off for the claimed artifact.
+
+4. MEDIUM: KL metric defaults to last-token KL, not full-sequence KL,
+   unless PRISMAQUANT_FULL_SEQUENCE_KL is set
+   (prismaquant/iterate_perturbed_allocation.py:8545). Public
+   "held-out KL across tokens" language should be precise.
+
+5. MEDIUM: production cache resume edge cases — partial multi-format
+   resume can drop activations early inside the format loop
+   (prismaquant/production_weight_cache.py:723); skip-forward resume
+   can reference collector with incomplete sidecar
+   (prismaquant/production_weight_cache.py:663).
+
+================================================================
+What changed since your last review
+================================================================
+
+Recent commits on `main` (last 24h, see `git log --oneline`):
+
+* 241e685 paper + readme: production-faithful polish (5.39 / 0.0054 on 27B)
+* 47eccad remove .claude/ from repo; gitignore the entire dir
+* cfdd300 block-clado polish: delta-quantize WeightSession + member_qnames bug fix
+* e2f7441 production cache: LRU + parallel prefetch for big-model polish
+* acf7b70 production cache: resume support — pre-render skip + max_abs sidecar
+* e1d7429 production cache: disk-streaming mode for arbitrarily-large models
+* 10f0323 production cache: smart memory — free activations as you go + bf16 storage
+* e219cb6 block-clado: bidirectional polish (Buchbinder et al. double greedy) [later disabled]
+
+Concretely, the new material the paper now claims:
+
+a) A "production-faithful polish" producing 5.39 bpp / KL 0.0054 on
+   Qwen3.6-27B (vs the shipped PrismaSCOUT 5.31 / KL 0.0151,
+   ~2.8x lower KL at +0.08 bpp). Header in §1, body in §4.5
+   (subsec:prodpolish), results in §6.3 (subsec:prodpolish_results).
+
+b) Two new entries under "Methods Considered and Rejected": §5.10
+   top-down (ceiling-start) polish, retired because the bottom-up sweep
+   already produces the floor it would converge to and the two
+   directions did not overlap in bpp; §5.11 the UMA-clone misadventure
+   ("move to CPU" being a no-op on UMA hardware).
+
+c) An "incident" record in §6.3 of a member_qnames vs members
+   payload-key bug that silently undercounted bits by ~2.4x on 27B,
+   with the fix landed in cfdd300 (parse_payload accepts both keys,
+   defensive assertion in coord_descent_polish that raises if any
+   DecisionUnit has zero member_qnames in the starting assignment).
+
+d) Implementation: prismaquant/weight_session.py (new),
+   prismaquant/production_weight_cache.py (now with LRU + parallel
+   prefetch + disk streaming + resume), prismaquant/coord_descent_polish.py
+   (with delta-quantize wiring + bidirectional plumbing left in place
+   but not on the shipping path), prismaquant/perturbed_x_cache.py
+   (with PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT bypass), and
+   prismaquant/build_production_cache.py.
+
+e) Downstream task evals (perplexity, GSM8K, IFEval, MMLU,
+   tool-eval-bench) on the 5.39 artifact are *in flight* at the time
+   the paper is being written. The held-out KL is the conservative
+   claim; the paper explicitly says the downstream numbers are not
+   yet known.
+
+================================================================
+Your charge
+================================================================
+
+A targeted review pass focused on:
+
+1. CORRECTNESS of the new material in the paper:
+   - §1 (abstract + headline) and §4.5 (production-faithful polish):
+     are the algorithmic descriptions accurate against the code at
+     prismaquant/{weight_session,coord_descent_polish,production_weight_cache,
+     perturbed_x_cache,block_clado,polish_from_assignment,build_production_cache}.py?
+   - §6.3 numbers: 5.39 / 0.0054, 12 accepted moves, 28 minutes wall,
+     148/497 disagreements with PrismaSCOUT, the 12 BF16 + 5 MXFP8
+     concentrations. Are these reproducible from the assignment files
+     at /home/rob/dq-runs/qwen36-27b-bidir-20260506T201033Z/forward_polish.json
+     and /home/rob/dq-runs/qwen3p6-27b-smrf-overnight/validated-knee-ship3-20260503T105059/out/validated_knee_assignment.json?
+   - §5.10 and §5.11 retirement claims: do they match the code that
+     was actually retired (top-down direction left in place but
+     default-off; UMA-clone fix never landed)?
+
+2. CARRYOVER of your previous review items: which of the five concerns
+   above (env-var leak, doc overclaim, "production-faithful" gap,
+   last-token-vs-full-sequence KL, production-cache resume edges) are
+   still open in the current code/paper? Check the actual files; do
+   not assume anything was fixed without verifying.
+
+3. NEW failure modes introduced by the production-faithful work:
+   - The defensive member_qnames assertion in coord_descent_polish:
+     does it cover the failure mode it claims to, or are there bypass
+     paths?
+   - Delta-quantize WeightSession lifecycle: is the BF16 snapshot
+     genuinely lazy, or does it grow unboundedly under heavy
+     bidirectional polish? What happens on revert when the production
+     cache evicted the entry that was staged?
+   - ProductionWeightCache disk-streaming: are partial writes
+     atomic? Does the manifest get written before its referenced
+     .pt files are flushed?
+   - The PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT env var is set in
+     coord_descent_polish but never unset in any path I can see — is
+     this still a leak, and what blast radius does it have on a
+     long-running process that runs polish then anything else?
+
+4. PROFESSIONALISM in the paper updates:
+   - §6.3's "incident" subsection on the member_qnames bug:
+     appropriately honest, or self-flagellating to the point of
+     undermining trust?
+   - The §5.10 retirement of top-down polish: is the explanation
+     actually correct (that the symmetric trajectories did not
+     overlap in bpp), and is "we tried it and retired it" stronger
+     than "we considered it and rejected it on theoretical grounds"?
+   - Does the abstract's headline ("$\sim$2.8x lower KL than the shipped
+     PrismaSCOUT artifact at comparable bpp") read as a meaningful
+     claim or as marketing language?
+
+================================================================
+Source material to consult
+================================================================
+
+1. Paper: /home/rob/prismaquant/paper/main.tex (and main.pdf)
+2. Code: /home/rob/prismaquant/prismaquant/
+   especially weight_session.py, coord_descent_polish.py,
+   production_weight_cache.py, perturbed_x_cache.py, block_clado.py,
+   polish_from_assignment.py, build_production_cache.py
+3. README: /home/rob/prismaquant/README.md
+4. Polished assignment + cache artifacts:
+   /home/rob/dq-runs/qwen36-27b-bidir-20260506T201033Z/{forward_polish.json,reverse_polish.json,production_cache.pkl,logs/}
+5. Shipped PrismaSCOUT comparison artifact:
+   /home/rob/dq-runs/qwen3p6-27b-smrf-overnight/validated-knee-ship3-20260503T105059/out/validated_knee_assignment.json
+6. Git: `git -C /home/rob/prismaquant log --oneline -50`,
+   `git -C /home/rob/prismaquant show 241e685 cfdd300 e2f7441 ...`
+
+================================================================
+Output format (write to stdout)
+================================================================
+
+Open with:
+"Gemini review of PrismaQuant production-faithful polish, dated <today>"
+
+Then:
+
+## 1. Headline assessment
+3-5 bullets. Plainly: is the production-faithful polish work in shape
+to back the abstract's "2.8x lower KL" claim? Are the open items from
+the previous review actually closed?
+
+## 2. Carryover from previous review
+For each of the 5 items above, state: CLOSED, PARTIALLY-CLOSED, or
+STILL-OPEN. For partially or still-open, give the file:line and the
+concrete fix.
+
+## 3. Correctness of the new material
+Numbered list. For each: location (paper section / code file:line),
+the problem, concrete fix.
+
+## 4. New failure modes
+Numbered list. Same format. Focus on edges introduced by the
+production-faithful path.
+
+## 5. Professionalism / framing
+Numbered. Tone, hedging, attribution discipline, honesty calibration.
+
+## 6. What's done well
+Brief. Keep balanced; do not be sycophantic.
+
+## 7. Recommendation
+One of: ready-to-claim-2.8x, claim-after-minor-revisions,
+claim-after-major-revisions, do-not-claim-yet. 2-3 sentence
+justification.
+
+Length: under 2500 words. Bias toward concrete actionable critiques.
+The author wants pushback. State disagreements plainly.
