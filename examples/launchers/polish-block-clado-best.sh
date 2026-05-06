@@ -19,6 +19,10 @@ CALIB_SPLIT="${CALIB_SPLIT:-train}"
 CALIB_SEED="${CALIB_SEED:-42}"
 MAX_PASSES="${MAX_PASSES:-8}"
 NOISE_FLOOR="${NOISE_FLOOR:-1e-5}"
+BITS_BUDGET_MODE="${BITS_BUDGET_MODE:-starting}"
+BITS_TOLERANCE="${BITS_TOLERANCE:-0}"
+USE_FROZEN_WEIGHT_CACHE="${USE_FROZEN_WEIGHT_CACHE:-1}"
+STEEPEST_FIRST="${STEEPEST_FIRST:-0}"
 
 mkdir -p "${RUN_ROOT}"/{polish,logs}
 
@@ -44,6 +48,10 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
   -e CALIB_SEED="${CALIB_SEED}" \
   -e MAX_PASSES="${MAX_PASSES}" \
   -e NOISE_FLOOR="${NOISE_FLOOR}" \
+  -e BITS_BUDGET_MODE="${BITS_BUDGET_MODE}" \
+  -e BITS_TOLERANCE="${BITS_TOLERANCE}" \
+  -e USE_FROZEN_WEIGHT_CACHE="${USE_FROZEN_WEIGHT_CACHE}" \
+  -e STEEPEST_FIRST="${STEEPEST_FIRST}" \
   -e LOG_NAME="${LOG_NAME}" \
   -w /prismaquant \
   --entrypoint bash "${IMAGE}" \
@@ -51,6 +59,13 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
     set -euo pipefail
     python3 -m pip install --user --quiet accelerate datasets 2>&1 \
       | tee "/work/logs/polish_pip.log"
+    EXTRA=()
+    if [[ "${USE_FROZEN_WEIGHT_CACHE:-0}" == "1" ]]; then
+      EXTRA+=(--use-frozen-weight-cache)
+    fi
+    if [[ "${STEEPEST_FIRST:-0}" == "1" ]]; then
+      EXTRA+=(--steepest-first)
+    fi
     python3 -m prismaquant.coord_descent_polish \
       --model "${MODEL_PATH}" \
       --payload "${PAYLOAD}" \
@@ -64,6 +79,9 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
       --device cuda \
       --max-passes "${MAX_PASSES}" \
       --noise-floor "${NOISE_FLOOR}" \
+      --bits-budget-mode "${BITS_BUDGET_MODE}" \
+      --bits-tolerance "${BITS_TOLERANCE}" \
+      "${EXTRA[@]}" \
       2>&1 | tee "/work/logs/${LOG_NAME}"
   '
 
