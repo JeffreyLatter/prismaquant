@@ -234,6 +234,7 @@ def run_iteration(
         bits_budget=polish_budget,
         pairs_by_block=dict(pairs_back),
         steepest_first=polish_steepest_first,
+        use_frozen_weight_cache=use_frozen_weight_cache,
         progress_callback=_polish_progress,
     )
     log(event="polish_done", iter=iter_idx,

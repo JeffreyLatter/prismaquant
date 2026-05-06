@@ -203,6 +203,7 @@ def coord_descent_polish(
     bits_tolerance: float = 0.0,
     pairs_by_block: Mapping[str, Sequence[bc.BlockPair]] | None = None,
     steepest_first: bool = False,
+    use_frozen_weight_cache: bool = False,
     progress_callback=None,
 ) -> PolishResult:
     """Polish a starting assignment via real-KL-gated single-flip moves.
@@ -243,7 +244,7 @@ def coord_descent_polish(
         current_kl = measure_assignment_kl(
             model, current, calib_ids, ref_log_probs,
             work_root=work_root, profile=profile,
-            use_frozen_weight_cache=False, rng_seed=0,
+            use_frozen_weight_cache=use_frozen_weight_cache, rng_seed=0,
         )
         n_measurements += 1
         initial_kl = float(current_kl)
@@ -323,7 +324,7 @@ def coord_descent_polish(
                 trial_kl = measure_assignment_kl(
                     model, trial, calib_ids, ref_log_probs,
                     work_root=work_root, profile=profile,
-                    use_frozen_weight_cache=False, rng_seed=0,
+                    use_frozen_weight_cache=use_frozen_weight_cache, rng_seed=0,
                 )
                 n_measurements += 1
                 candidates_this_pass += 1
@@ -500,6 +501,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "current assignment."
         ),
     )
+    parser.add_argument(
+        "--use-frozen-weight-cache",
+        action="store_true",
+        help=(
+            "Pre-quantize the centered base assignment once and reuse "
+            "cached weights across polish trials.  Big speedup for non-"
+            "BF16 starting points; OOM-prone at LLM scale."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -580,6 +590,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bits_tolerance=args.bits_tolerance,
             pairs_by_block=pairs_by_block,
             steepest_first=bool(args.steepest_first),
+            use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
             progress_callback=_progress_printer,
         )
         out_payload = {
