@@ -102,6 +102,7 @@ def run_iteration(
     n_neighbors_validate: int = 4,
     polish_max_passes: int = 8,
     polish_noise_floor: float = 1e-5,
+    polish_budget_creep: float = 0.05,
     log_callback=None,
 ) -> IterationResult:
     """One iteration: measure → sweep → kneedle → validate → polish."""
@@ -200,13 +201,18 @@ def run_iteration(
     log(event="best_validated", iter=iter_idx,
         bpp=best_validated["bpp"], real_kl=best_validated["real_kl"])
 
-    # ---- polish the best validated assignment
+    # ---- polish the best validated assignment.  Allow modest budget
+    # creep (default 5%) so polish can take Pareto-beneficial precision
+    # upgrades on a small number of high-impact layers, but not all the
+    # way to BF16-everywhere.
     log(event="polish_start", iter=iter_idx)
     units = []
     blocks_back, singletons_back, _pairs = bc.parse_payload(payload)
     for unit_list in blocks_back.values():
         units.extend(unit_list)
     units.extend(singletons_back)
+    starting_bits = cdp._assignment_bits(units, best_validated["assignment"])
+    polish_budget = starting_bits * (1.0 + polish_budget_creep)
     polish_result = cdp.coord_descent_polish(
         model, calib_ids, ref_log_probs,
         units=units,
@@ -215,6 +221,7 @@ def run_iteration(
         work_root=work_root,
         noise_floor=polish_noise_floor,
         max_passes=polish_max_passes,
+        bits_budget=polish_budget,
     )
     log(event="polish_done", iter=iter_idx,
         initial_kl=polish_result.initial_kl,
@@ -278,6 +285,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--n-neighbors-validate", type=int, default=4)
     parser.add_argument("--polish-max-passes", type=int, default=8)
     parser.add_argument("--polish-noise-floor", type=float, default=1e-5)
+    parser.add_argument(
+        "--polish-budget-creep",
+        type=float,
+        default=0.05,
+        help=(
+            "Polish bits-budget tolerance as a fraction of the starting "
+            "bits.  0.0 = strict (no precision creep); default 0.05 lets "
+            "polish make ~5%% Pareto-beneficial precision upgrades."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -342,6 +359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 n_neighbors_validate=args.n_neighbors_validate,
                 polish_max_passes=args.polish_max_passes,
                 polish_noise_floor=args.polish_noise_floor,
+                polish_budget_creep=args.polish_budget_creep,
                 log_callback=log,
             )
             summary_rows.append(result)

@@ -173,6 +173,69 @@ def test_polish_fused_sibling_flips_all_members():
     }
 
 
+def test_polish_respects_bits_budget():
+    """A KL-improving move that busts the budget must be rejected."""
+    # 16-bit upgrade is the only KL-improver but exceeds the 4-bit budget.
+    unit = _mk_unit("a", ("a.weight",),
+                    [("BF16", 0.0, 16, 1024), ("LO", 0.1, 4, 256)])
+    units = [unit]
+    kl_table = {
+        (("a", "BF16"),): 0.0,   # zero KL but 16 bits
+        (("a", "LO"),):   0.1,   # higher KL but 4 bits
+    }
+    starting = {"a.weight": "LO"}
+
+    def fake_measure(model, assignment, calib_ids, ref_log_probs, **kwargs):
+        for member in unit.member_qnames:
+            if member in assignment:
+                return float(kl_table[(("a", assignment[member]),)])
+        raise KeyError(unit.member_qnames)
+
+    with patch("prismaquant.coord_descent_polish.measure_assignment_kl",
+               side_effect=fake_measure):
+        result = cdp.coord_descent_polish(
+            model=object(), calib_ids=object(), ref_log_probs=object(),
+            units=units, starting_assignment=starting,
+            work_root="/tmp",
+            noise_floor=0.0, max_passes=4,
+            bits_budget=2048.0,  # = 4 bits × 512 = LO budget; BF16 (16384) busts it
+        )
+    # BF16 would lower KL (0.1 → 0.0) but exceeds budget — rejected.
+    assert result.steps == []
+    assert result.final_assignment == {"a.weight": "LO"}
+
+
+def test_polish_unconstrained_when_no_budget():
+    """When no budget, polish accepts even precision-upgrading moves."""
+    unit = _mk_unit("a", ("a.weight",),
+                    [("BF16", 0.0, 16, 1024), ("LO", 0.1, 4, 256)])
+    units = [unit]
+    kl_table = {
+        (("a", "BF16"),): 0.0,
+        (("a", "LO"),):   0.1,
+    }
+    starting = {"a.weight": "LO"}
+
+    def fake_measure(model, assignment, calib_ids, ref_log_probs, **kwargs):
+        for member in unit.member_qnames:
+            if member in assignment:
+                return float(kl_table[(("a", assignment[member]),)])
+        raise KeyError(unit.member_qnames)
+
+    with patch("prismaquant.coord_descent_polish.measure_assignment_kl",
+               side_effect=fake_measure):
+        result = cdp.coord_descent_polish(
+            model=object(), calib_ids=object(), ref_log_probs=object(),
+            units=units, starting_assignment=starting,
+            work_root="/tmp",
+            noise_floor=0.0, max_passes=4,
+            bits_budget=None,  # explicitly unconstrained
+        )
+    # Without a budget, polish accepts the LO → BF16 upgrade.
+    assert len(result.steps) == 1
+    assert result.steps[0].to_fmt == "BF16"
+
+
 def test_polish_records_full_trace():
     unit_a = _mk_unit("a", ("a.weight",),
                       [("BF16", 0.0, 16, 1024), ("LO", 0.1, 4, 256)])

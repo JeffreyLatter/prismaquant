@@ -95,6 +95,23 @@ def _current_unit_format(
     return None
 
 
+def _assignment_bits(
+    units: Sequence[bc.DecisionUnit],
+    assignment: Mapping[str, str],
+) -> float:
+    """Return the total bits implied by ``assignment`` across ``units``."""
+    total = 0.0
+    for unit in units:
+        fmt = _current_unit_format(assignment, unit)
+        if fmt is None:
+            continue
+        for opt in unit.options:
+            if opt.fmt == fmt:
+                total += float(opt.bits_total)
+                break
+    return total
+
+
 def coord_descent_polish(
     model,
     calib_ids: torch.Tensor,
@@ -106,6 +123,8 @@ def coord_descent_polish(
     work_root: str | Path | None = None,
     noise_floor: float = 1e-5,
     max_passes: int = 8,
+    bits_budget: float | None = None,
+    bits_tolerance: float = 0.0,
     progress_callback=None,
 ) -> PolishResult:
     """Polish a starting assignment via real-KL-gated single-flip moves.
@@ -115,12 +134,18 @@ def coord_descent_polish(
       2. For each unit, for each format option != current, build the trial
          assignment and measure KL.
       3. Accept the move with the largest improvement, provided
-         ``current_kl - trial_kl > noise_floor``.
+         ``current_kl - trial_kl > noise_floor`` and (if ``bits_budget`` is
+         supplied) the trial does not exceed ``bits_budget + bits_tolerance``.
       4. Stop when no improving move exists or ``max_passes`` is reached.
 
+    ``bits_budget=None`` (default) lets polish creep toward higher precision
+    monotonically — useful as a *Pareto-improvement* search but undesirable
+    for shipping artifacts.  Pass ``bits_budget`` (in absolute total bits)
+    to constrain polish to budget-respecting moves only.
+
     Cost: O(passes × units × (formats - 1)) KL measurements.  For Qwen 0.6B
-    with 197 fused units × 3 formats × 4 passes ≈ 1,500 measurements at
-    ~50 ms each = ~80 s.
+    with 113 fused units × 2 non-current formats × 4 passes ≈ 900
+    measurements; per-call latency dominates.
     """
     if work_root is None:
         work_root = Path(tempfile.mkdtemp(prefix="prismaquant_polish_"))
@@ -150,17 +175,45 @@ def coord_descent_polish(
                 "event": "starting", "kl": float(initial_kl),
             })
 
+        # Per-unit format → bits lookup, so we can quickly compute the bits
+        # delta of a candidate flip without rebuilding the whole sum.
+        unit_by_name = {unit.name: unit for unit in units}
+        option_bits: dict[tuple[str, str], float] = {}
+        for unit in units:
+            for opt in unit.options:
+                option_bits[(unit.name, opt.fmt)] = float(opt.bits_total)
+
+        current_bits = _assignment_bits(units, current)
+        if bits_budget is None:
+            budget_bits = float("inf")
+        else:
+            budget_bits = float(bits_budget) + float(bits_tolerance)
+        if progress_callback is not None and bits_budget is not None:
+            progress_callback({
+                "event": "budget_set",
+                "starting_bits": float(current_bits),
+                "budget_bits": float(budget_bits),
+            })
+
         for pass_idx in range(max_passes):
             best_move: tuple[bc.DecisionUnit, str] | None = None
             best_kl_after = current_kl
+            best_bits_after = current_bits
             candidates_this_pass = 0
             # Order units lexicographically for reproducibility.
             for unit in sorted(units, key=lambda u: u.name):
                 cur_fmt = _current_unit_format(current, unit)
                 if cur_fmt is None:
                     continue
+                cur_bits = option_bits.get((unit.name, cur_fmt), 0.0)
                 for option in unit.options:
                     if option.fmt == cur_fmt:
+                        continue
+                    trial_bits = current_bits - cur_bits + option_bits.get(
+                        (unit.name, option.fmt), 0.0,
+                    )
+                    if trial_bits > budget_bits + 1e-9:
+                        # Skip moves that bust the budget.
                         continue
                     trial = _override_unit(current, unit, option.fmt)
                     trial_kl = measure_assignment_kl(
@@ -179,11 +232,13 @@ def coord_descent_polish(
                             "to": option.fmt,
                             "current_kl": float(current_kl),
                             "trial_kl": float(trial_kl),
+                            "trial_bits": float(trial_bits),
                             "best_so_far": float(best_kl_after),
                             "n_measurements": n_measurements,
                         })
                     if trial_kl < best_kl_after - float(noise_floor):
                         best_kl_after = float(trial_kl)
+                        best_bits_after = float(trial_bits)
                         best_move = (unit, option.fmt)
             if best_move is None:
                 if progress_callback is not None:
@@ -196,6 +251,7 @@ def coord_descent_polish(
             unit, fmt = best_move
             cur_fmt = _current_unit_format(current, unit) or "BF16"
             current = _override_unit(current, unit, fmt)
+            current_bits = best_bits_after
             step = PolishStep(
                 pass_index=pass_idx,
                 accepted=True,
@@ -287,6 +343,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-passes", type=int, default=8)
     parser.add_argument("--noise-floor", type=float, default=1e-5)
+    parser.add_argument(
+        "--bits-budget",
+        type=float,
+        default=None,
+        help=(
+            "Total-bits budget for polish moves.  Without this flag polish "
+            "may creep toward higher precision monotonically.  Defaults to "
+            "the bits of the starting assignment when --bits-budget-mode "
+            "is 'starting'."
+        ),
+    )
+    parser.add_argument(
+        "--bits-budget-mode",
+        choices=["explicit", "starting", "unconstrained"],
+        default="starting",
+        help=(
+            "How to set the polish bits budget when --bits-budget is not "
+            "given.  'starting' uses the starting assignment's bits "
+            "(default).  'unconstrained' lets polish creep upward freely."
+        ),
+    )
+    parser.add_argument("--bits-tolerance", type=float, default=0.0)
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -336,6 +414,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         device = next(model.parameters()).device
         ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
 
+        # Resolve bits budget
+        if args.bits_budget is not None:
+            bits_budget = float(args.bits_budget)
+        elif args.bits_budget_mode == "starting":
+            bits_budget = _assignment_bits(units, starting_assignment)
+        elif args.bits_budget_mode == "unconstrained":
+            bits_budget = None
+        else:
+            raise ValueError(f"unsupported bits_budget_mode: {args.bits_budget_mode}")
+        if bits_budget is not None:
+            print(
+                f"[polish] budget = {bits_budget:.0f} bits "
+                f"(tolerance ±{args.bits_tolerance:.0f})",
+                flush=True,
+            )
+
         result = coord_descent_polish(
             model, calib_ids, ref_log_probs,
             units=units,
@@ -344,6 +438,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             work_root=work_root,
             noise_floor=args.noise_floor,
             max_passes=args.max_passes,
+            bits_budget=bits_budget,
+            bits_tolerance=args.bits_tolerance,
             progress_callback=_progress_printer,
         )
         out_payload = {
