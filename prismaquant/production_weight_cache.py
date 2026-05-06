@@ -211,6 +211,57 @@ class ProductionWeightCache:
                 return self._resolve_to_tensor((cand, fmt))
         return None
 
+    def relocate(self, new_cache_dir: str | Path) -> None:
+        """Point the cache at a new on-disk directory of .pt shards.
+
+        Used when a pickled cache is moved to a new host or when a
+        cache_dir set inside one container is re-mounted at a different
+        path on a second container.  No tensor reload happens here; the
+        next ``get()`` will resolve against the new path.
+        """
+        self.cache_dir = str(new_cache_dir) if new_cache_dir is not None else None
+
+    def verify_files(
+        self,
+        expected: Sequence[tuple[str, str]] | None = None,
+    ) -> dict[str, list[tuple[str, str]]]:
+        """Verify every disk-resident cache entry's .pt file exists.
+
+        Returns ``{"present": [...], "missing": [...], "in_memory": [...]}``
+        keyed by (qname, fmt).  In-memory entries (already-loaded tensors)
+        are reported separately and never count as missing.
+
+        On a disk-streaming cache that has been moved or whose backing
+        directory was deleted, this is the canonical way to detect the
+        problem at startup rather than at first ``get()`` (which raises
+        FileNotFoundError mid-polish).  Callers should treat any
+        ``missing`` entry as fatal: the cache must be rebuilt or its
+        directory restored before use.
+
+        ``expected``, when given, restricts the check to that subset of
+        keys.  Default checks every entry in ``self.weights``.
+        """
+        present: list[tuple[str, str]] = []
+        missing: list[tuple[str, str]] = []
+        in_memory: list[tuple[str, str]] = []
+        keys = list(self.weights) if expected is None else list(expected)
+        for key in keys:
+            v = self.weights.get(key)
+            if v is None:
+                missing.append(key)
+                continue
+            if isinstance(v, torch.Tensor):
+                in_memory.append(key)
+                continue
+            path = str(v)
+            if self.cache_dir and not Path(path).is_absolute():
+                path = str(Path(self.cache_dir) / path)
+            if Path(path).is_file():
+                present.append(key)
+            else:
+                missing.append(key)
+        return {"present": present, "missing": missing, "in_memory": in_memory}
+
     def __contains__(self, key: tuple[str, str]) -> bool:
         # Mirror the alias-resolution that ``get`` performs.
         name, fmt = key

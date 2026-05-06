@@ -99,6 +99,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "path.  Required for big-model polish (27B+) on a 121 GB UMA host.",
     )
     p.add_argument(
+        "--cache-dir-override",
+        default=None,
+        help="When the production_weight_cache pkl was built in disk-"
+        "streaming mode in another container/environment, its stored "
+        "cache_dir may be unreachable from this run.  Pass the host-"
+        "resolvable path to the cache_shards directory here and the "
+        "cache will be relocated before any .pt resolution.",
+    )
+    p.add_argument(
         "--weight-session-spill-to-disk",
         action="store_true",
         help="Spill WeightSession's BF16 source snapshots to disk (in "
@@ -185,6 +194,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             production_weight_cache = pickle.load(fh)
         print(f"[polish] loaded prod cache with "
               f"{len(production_weight_cache)} entries", flush=True)
+        if args.cache_dir_override:
+            production_weight_cache.relocate(args.cache_dir_override)
+            print(
+                f"[polish] cache_dir relocated to "
+                f"{args.cache_dir_override}",
+                flush=True,
+            )
+        # Verify backing .pt files exist BEFORE we sink a model load +
+        # an activation forward pass.  A pickled disk-streaming cache
+        # whose backing directory was deleted would otherwise raise
+        # FileNotFoundError mid-polish — a costly failure mode.
+        if getattr(production_weight_cache, "cache_dir", None) is not None:
+            verify = production_weight_cache.verify_files()
+            n_present = len(verify["present"])
+            n_missing = len(verify["missing"])
+            n_in_mem = len(verify["in_memory"])
+            print(
+                f"[polish] cache verify: {n_present} on disk, "
+                f"{n_in_mem} in memory, {n_missing} missing",
+                flush=True,
+            )
+            if n_missing > 0:
+                missing_sample = verify["missing"][:5]
+                raise FileNotFoundError(
+                    f"production_weight_cache references {n_missing} "
+                    f".pt files that are not on disk under "
+                    f"{production_weight_cache.cache_dir!r}. "
+                    f"Either restore the directory or pass "
+                    f"--cache-dir-override <path-to-cache_shards>. "
+                    f"Sample: {missing_sample}"
+                )
         if args.lru_gb and args.lru_gb > 0:
             n_bytes = int(args.lru_gb * (1024 ** 3))
             production_weight_cache.enable_lru(n_bytes)
