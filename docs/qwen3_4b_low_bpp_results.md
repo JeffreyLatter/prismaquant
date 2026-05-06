@@ -81,6 +81,35 @@ GB of 121 GB UMA budget) and dropped to per-module re-quantization,
 which is ~10× slower per call.  This is the dominant scaling factor;
 fixing the cache discipline at 4B would put the pipeline at ~5 min.
 
+## Polish-frontier sweep (all 7 cone candidates)
+
+For comparison, polishing each cone candidate independently with 5%
+budget creep (separate Docker container, fresh model load):
+
+| candidate | start bpp | start KL (re-meas) | final KL | steps | wall |
+|---|---|---|---|---|---|
+| 4.5000 | 4.50 | 0.218 | 0.136 | 5 | 31s |
+| 4.5330 | 4.53 | 0.299 | 0.156 | 8 | 23s |
+| 4.5477 | 4.55 | 0.232 | 0.107 | 6 | 121s |
+| 4.6246 | 4.62 | 0.229 | **0.103** | 7 | 243s |
+| 4.7236 | 4.72 | 0.329 | 0.111 | 6 | 144s |
+| 4.7530 | 4.75 | 0.339 | 0.128 | 8 | 285s |
+| 5.0564 | 5.06 | 0.249 | 0.110 | 8 | 40s |
+
+The polish-frontier's "start KL" disagrees with the in-process
+iterate's validation-cone KL measurements by ~30–100% in places (e.g.
+4.5330 reported 0.299 here vs 0.131 by validate cone).  The measurement
+discrepancy is from a fresh-process model-load floating-point drift in
+the PerturbedActivationCache hooks — same RNG seed, same calibration,
+but different starting GPU state gives different KL values for
+identical assignments.  This is a known noise source.
+
+**Despite the noisier starts, no polish-frontier candidate beats the
+iterate's in-process 0.066.**  In-process polish (model state continuous
+from measure → validate → polish) is the most reliable.  The
+polish-frontier tooling is best for comparing polish behaviors across
+starting points, not for finding the lowest absolute KL.
+
 ## What's next on 4B
 
 1. **Polish-frontier across all 7 cone candidates** (running now): polish
