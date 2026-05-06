@@ -307,6 +307,61 @@ def test_payload_roundtrip_preserves_units_and_pairs():
 # ---------------------------------------------------------------------------
 
 
+def test_centered_measurement_recovers_center_kl_in_meta():
+    """When ``meta.center_kl`` is non-zero, ``score_block_assignment`` should
+    still recover sensible costs at the centered formats (zero unary, zero
+    pairs)."""
+    block_id = "model.layers.0"
+    # Centered at NVFP4 for unit a, NVFP4 for unit b → omega_ii at NVFP4 is
+    # 0 by convention.  At BF16 it's a delta from the centered KL, so it can
+    # be negative.
+    unit_a = _mk_unit("a", block_id, [
+        ("BF16", -0.05, 16, 1024),  # delta from center
+        ("NVFP4", 0.0, 4.5, 256),    # the centered format
+        ("MXFP8_E4M3", 0.02, 8, 512),
+    ])
+    unit_b = _mk_unit("b", block_id, [
+        ("BF16", -0.04, 16, 1024),
+        ("NVFP4", 0.0, 4.5, 256),
+        ("MXFP8_E4M3", 0.03, 8, 512),
+    ])
+    pair = bc.BlockPair(
+        unit_a="a", unit_b="b", block_id=block_id,
+        omega_ij={
+            ("BF16", "BF16"): -0.01,  # interaction once both upgrade
+            ("BF16", "NVFP4"): 0.0,
+            ("NVFP4", "BF16"): 0.0,
+            ("NVFP4", "NVFP4"): 0.0,
+            ("BF16", "MXFP8_E4M3"): 0.005,
+            ("MXFP8_E4M3", "BF16"): 0.005,
+            ("MXFP8_E4M3", "MXFP8_E4M3"): 0.01,
+            ("NVFP4", "MXFP8_E4M3"): 0.0,
+            ("MXFP8_E4M3", "NVFP4"): 0.0,
+        },
+    )
+    payload = bc.units_and_pairs_to_payload(
+        blocks={block_id: [unit_a, unit_b]},
+        singletons=[],
+        pairs_by_block={block_id: [pair]},
+        meta={"center_kl": 0.087, "centered": True},
+    )
+    # center_kl roundtrips
+    assert bc.center_kl_from_payload(payload) == pytest.approx(0.087)
+
+    # Score at the centered formats should be zero.
+    units = [unit_a, unit_b]
+    cost, bits = bc.score_block_assignment(
+        units, {"a": "NVFP4", "b": "NVFP4"}, [pair],
+    )
+    assert cost == pytest.approx(0.0)
+
+    # Score at all-BF16: −0.05 −0.04 + (−0.01) = −0.10.
+    cost_bf16, _ = bc.score_block_assignment(
+        units, {"a": "BF16", "b": "BF16"}, [pair],
+    )
+    assert cost_bf16 == pytest.approx(-0.10)
+
+
 def test_total_param_count_recovers_member_count():
     # 1024 params × 16 bpp = 16384 bits → 2048 bytes.  Memory bytes / bpp
     # back-derives the param count.
