@@ -59,8 +59,6 @@ from prismaquant import incremental_probe as ip
 from prismaquant import incremental_measure_quant_cost as cost_step
 from prismaquant.adaptive_sampling import (
     AdaptiveExpertScheduler,
-    aggregate_global_saliency,
-    aggregate_per_domain_saliency,
     infer_chunk_domain,
 )
 
@@ -364,6 +362,7 @@ def main() -> int:
     merged_stats: dict[str, dict] = {}
     merged_router_counts: dict = {}
     merged_router_totals: dict = {}
+    merged_router_active_counts: dict = {}
     merged_expert_info: dict = {}
     merged_h_full: dict = {}  # only present if h_detail_dir was on
     chunk_metas: list = []
@@ -389,7 +388,14 @@ def main() -> int:
             merged_router_counts.setdefault(rk, {})
             for sub_k, sub_v in (rv or {}).items():
                 merged_router_counts[rk][sub_k] = (
-                    merged_router_counts[rk].get(sub_k, 0) + int(sub_v))
+                    merged_router_counts[rk].get(sub_k, 0.0) + float(sub_v))
+        for rk, rv in (pkl.get("router_active_counts") or {}).items():
+            merged_router_active_counts.setdefault(rk, {})
+            for sub_k, sub_v in (rv or {}).items():
+                merged_router_active_counts[rk][sub_k] = (
+                    int(merged_router_active_counts[rk].get(sub_k, 0))
+                    + int(sub_v)
+                )
         for rk, rv in (pkl.get("router_totals") or {}).items():
             merged_router_totals[rk] = (
                 merged_router_totals.get(rk, 0) + int(rv))
@@ -406,14 +412,19 @@ def main() -> int:
         if per is not None:
             s["h_trace_per_expert"] = [float(v) / tokens for v in per]
 
-    expert_saliency_per_domain = aggregate_per_domain_saliency(per_chunk_pairs)
-    expert_saliency_global = aggregate_global_saliency(
-        expert_saliency_per_domain, per_chunk_pairs)
+    # REAP expert pruning is archived. Preserve compatibility fields but
+    # do not propagate old per-chunk saliency into new merged probes.
+    expert_saliency_per_domain = {}
+    expert_saliency_global = {}
 
     merged: dict = {
         "stats": merged_stats,
         "router_counts": merged_router_counts,
         "router_totals": merged_router_totals,
+        "router_active_counts": merged_router_active_counts,
+        "expert_route_stats": ip._route_stats_from_counts(
+            merged_router_counts, merged_router_totals, merged_router_active_counts,
+        ),
         "expert_info": merged_expert_info,
         "expert_saliency": expert_saliency_global,
         "expert_saliency_per_domain": expert_saliency_per_domain,

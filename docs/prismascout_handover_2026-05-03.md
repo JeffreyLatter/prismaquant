@@ -1,6 +1,6 @@
-# PrismaClade Handover - 2026-05-03
+# PrismaSCOUT Handover - 2026-05-03
 
-This note is for the next Codex instance picking up PrismaClade/SMRF work.
+This note is for the next Codex instance picking up PrismaSCOUT/SMRF work.
 
 ## Repository State
 
@@ -13,7 +13,7 @@ This note is for the next Codex instance picking up PrismaClade/SMRF work.
 
 ## User Goal
 
-The user wants PrismaClade to find the best bang-for-the-buck quantization point, not just satisfy a fixed bit budget. They are comfortable with the actual bpp landing above or below a nominal target if the Pareto/knee point is better. The core thesis is that bits should be spent where they preserve downstream distribution fidelity, including inter-layer and intra-layer interactions.
+The user wants PrismaSCOUT to find the best bang-for-the-buck quantization point, not just satisfy a fixed bit budget. They are comfortable with the actual bpp landing above or below a nominal target if the Pareto/knee point is better. The core thesis is that bits should be spent where they preserve downstream distribution fidelity, including inter-layer and intra-layer interactions.
 
 Practical near-term goal:
 

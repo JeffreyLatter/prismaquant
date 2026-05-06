@@ -39,6 +39,11 @@ from prismaquant.allocator import (
 import prismaquant.format_registry as fr
 
 
+pytestmark = pytest.mark.skip(
+    reason="REAP expert pruning is archived; old prune-candidate mechanics retained only as reference."
+)
+
+
 def _make_two_expert_fixture(saliencies: dict[int, float]):
     """Two-expert MoE group for a single projection. Returns (stats,
     costs, candidates_in, expert_info, saliency_map, specs)."""
@@ -178,6 +183,73 @@ def test_prune_drops_lowest_saliency_first():
         assert prune.pruned_expert_ids == (1,)
         # Pruning must halve memory (2 experts total, drop 1).
         assert prune.memory_bytes == no_prune.memory_bytes // 2, (fmt, prune, no_prune)
+
+
+def test_route_floor_protects_rare_high_impact_expert():
+    """Route mass floors preserve conditional impact for rare experts.
+
+    Expert 1 has lower raw token-normalized REAP saliency, but only one
+    weighted routed-token of evidence. With a 10-token floor its implied
+    conditional impact is high enough that expert 0 should be dropped.
+    """
+    stats, costs, c_in, e_info, sal, specs = _make_two_expert_fixture({
+        0: 0.05,  # route_prob=.10, conditional=.5
+        1: 0.01,  # route_prob=.001, conditional=10
+    })
+    route_counts = {"model.layers.0.mlp.gate": {"0": 100.0, "1": 1.0}}
+    route_totals = {"model.layers.0.mlp.gate": 1000}
+    _, _, c_out = aggregate_moe_candidates(
+        stats, costs, specs, c_in, granularity="projection",
+        expert_saliency=sal,
+        expert_info=e_info,
+        router_counts=route_counts,
+        router_totals=route_totals,
+        route_floor_mass=10.0,
+        prune_ratios=(0.5,),
+        prune_alpha=1.0,
+    )
+    pruned = {
+        c.pruned_expert_ids for c in c_out[SUPER_NAME]
+        if c.pruned_expert_ids
+    }
+    assert pruned == {(0,)}
+
+
+def test_route_floor_assigns_unseen_expert_prior_cost():
+    stats, costs, c_in, e_info, sal, specs = _make_two_expert_fixture({
+        0: 0.001,
+        1: 0.0,
+    })
+    route_counts = {"model.layers.0.mlp.gate": {"0": 100.0}}
+    route_totals = {"model.layers.0.mlp.gate": 1000}
+    _, _, c_out = aggregate_moe_candidates(
+        stats, costs, specs, c_in, granularity="projection",
+        expert_saliency=sal,
+        expert_info=e_info,
+        router_counts=route_counts,
+        router_totals=route_totals,
+        route_floor_mass=10.0,
+        prune_ratios=(0.5,),
+        prune_alpha=1.0,
+    )
+    pruned = {
+        c.pruned_expert_ids for c in c_out[SUPER_NAME]
+        if c.pruned_expert_ids
+    }
+    # Median conditional prior from expert 0 is 0.001 / .10 = .01.
+    # Expert 1's unseen floor cost is .01 * .01 = .0001, so it is no
+    # longer free, but still cheaper than dropping expert 0.
+    assert pruned == {(1,)}
+    cand = next(
+        c for c in c_out[SUPER_NAME]
+        if c.fmt == "NVFP4" and c.pruned_expert_ids == (1,)
+    )
+    kept_member = "model.layers.0.mlp.experts.0.gate_proj"
+    kept_dloss = (
+        0.5 * stats[kept_member]["h_trace"]
+        * costs[kept_member]["NVFP4"]["output_mse"]
+    )
+    assert cand.predicted_dloss == pytest.approx(kept_dloss + 0.0001)
 
 
 def test_nested_global_prune_ratio_filters_superlinear_candidates():
@@ -553,6 +625,25 @@ def test_apply_global_prune_ratio_replaces_candidates():
     assert nv.bits_per_param == pytest.approx(2.125)
     assert mx.memory_bytes == 206, mx
     assert mx.bits_per_param == pytest.approx(4.125)
+
+
+def test_apply_global_prune_ratio_uses_route_floor():
+    name, stats, router, _sal = _packed_stat_fixture()
+    sal = {router: {0: 0.05, 1: 0.01, 2: 0.2, 3: 0.3}}
+    route_counts = {router: {"0": 100.0, "1": 1.0, "2": 100.0, "3": 100.0}}
+    route_totals = {router: 1000}
+    candidates = {
+        name: [Candidate("NVFP4", 4.25, 1000, 0.010)]
+    }
+    n = apply_global_prune_ratio(
+        candidates, stats, sal, global_ratio=0.25, prune_alpha=1.0,
+        router_counts=route_counts, router_totals=route_totals,
+        route_floor_mass=10.0,
+    )
+    assert n == 1
+    # Raw saliency would drop expert 1. The route floor preserves its
+    # high conditional impact, so expert 0 is cheaper to drop.
+    assert candidates[name][0].pruned_expert_ids == (0,)
 
 
 def test_apply_global_prune_ratio_uses_floor_not_round():

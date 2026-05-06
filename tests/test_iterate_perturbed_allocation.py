@@ -2822,6 +2822,68 @@ def test_l3_pareto_archive_dp_recovers_frontier_in_one_pass():
     assert rows[0]["achieved_bpp"] < rows[-1]["achieved_bpp"]
 
 
+def test_l3_pareto_archive_dp_beam_retains_same_bin_variants():
+    stats = {
+        f"layer{i}": {
+            "n_params": 4096,
+            "in_features": 64,
+            "out_features": 64,
+            "h_trace": 1.0,
+        }
+        for i in range(4)
+    }
+    specs = [ipa.fr.get_format("NVFP4"), ipa.fr.get_format("BF16")]
+    l3_costs = {
+        "layer0": {
+            "NVFP4": {"propagated_end_kl": 0.01},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer1": {
+            "NVFP4": {"propagated_end_kl": 0.10},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer2": {
+            "NVFP4": {"propagated_end_kl": 0.30},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+        "layer3": {
+            "NVFP4": {"propagated_end_kl": 0.80},
+            "BF16": {"propagated_end_kl": 0.0},
+        },
+    }
+    l3_candidates = ipa.build_l3_candidates(
+        stats,
+        ipa._l3_costs_as_predicted_dloss(l3_costs),
+        specs,
+    )
+
+    single_rows, single_meta = ipa.solve_l3_pareto_archive_assignments(
+        stats,
+        {name: "NVFP4" for name in stats},
+        l3_candidates,
+        specs,
+        bpp_min=0.0,
+        bpp_max=16.0,
+        bit_precision=0.01,
+        beam_per_bin=1,
+    )
+    beam_rows, beam_meta = ipa.solve_l3_pareto_archive_assignments(
+        stats,
+        {name: "NVFP4" for name in stats},
+        l3_candidates,
+        specs,
+        bpp_min=0.0,
+        bpp_max=16.0,
+        bit_precision=0.01,
+        beam_per_bin=2,
+    )
+
+    assert beam_meta["beam_per_bin"] == 2
+    assert beam_meta["retained_frontier_states"] >= beam_meta["frontier_bins"]
+    assert len(beam_rows) > len(single_rows)
+    assert any(row["archive_beam_rank"] == 1 for row in beam_rows)
+
+
 def test_l3_lagrangian_assignment_keeps_fused_siblings_coherent():
     names = [
         "model.layers.0.self_attn.q_proj",
@@ -2967,8 +3029,76 @@ def test_knee_archive_search_validates_lambda_archive(tmp_path, monkeypatch):
 
     assert summary["knee"]["mode"] == "lambda_sandwich_archive_kneedle"
     assert Path(summary["knee"]["layer_config"]).exists()
+    assert summary["practical_knee"]["enabled"]
+    assert "archive_refinement" in frontier["metadata"]
     assert frontier["metadata"]["new_validation_measurements"] >= 3
     assert frontier["metadata"]["lambda_generated_unique"] >= 3
+    generated_archive = json.loads(Path(summary["generated_archive"]).read_text())
+    generated_assignments = json.loads(
+        Path(summary["generated_archive_assignments"]).read_text()
+    )
+    assert Path(summary["generated_archive_csv"]).exists()
+    assert len(generated_archive["generated_candidates"]) >= len(
+        frontier["validated_candidates"]
+    )
+    assert generated_assignments
+    assert any(
+        row["selected_for_validation"]
+        for row in generated_archive["generated_candidates"]
+    )
+    assert frontier["metadata"]["generated_archive"] == summary["generated_archive"]
+
+
+def test_archive_noise_aware_selection_uses_upper_confidence():
+    args = SimpleNamespace(
+        knee_unstable_policy="best-kl",
+        knee_tolerance=0.1,
+        knee_kl_noise_floor=0.0,
+    )
+    candidates = [
+        {
+            "source": "test",
+            "achieved_bpp": 4.75,
+            "validation_kl": 0.90,
+            "validation_kl_ucb": 1.20,
+            "assignment_hash": "noisy-low-raw",
+        },
+        {
+            "source": "test",
+            "achieved_bpp": 4.90,
+            "validation_kl": 0.95,
+            "validation_kl_ucb": 0.98,
+            "assignment_hash": "stable-low-ucb",
+        },
+    ]
+
+    frontier = ipa._nondominated_validated_points(
+        candidates,
+        kl_noise_floor=0.0,
+        kl_key="validation_kl_ucb",
+    )
+    chosen, meta = ipa._choose_validated_archive_knee(
+        args,
+        frontier,
+        candidates,
+        selection_kl_key="validation_kl_ucb",
+    )
+
+    assert frontier == [candidates[0], candidates[1]]
+    assert chosen["assignment_hash"] == "stable-low-ucb"
+    assert meta["selection_kl_key"] == "validation_kl_ucb"
+
+
+def test_validation_kl_statistics_records_ucb():
+    row = {}
+
+    ipa._apply_validation_kl_statistics(row, [1.0, 1.2, 0.8], confidence_z=1.0)
+
+    assert row["validation_kl"] == pytest.approx(1.0)
+    assert row["validation_kl_repeats"] == 3
+    assert row["validation_kl_std"] == pytest.approx(0.2)
+    assert row["validation_kl_stderr"] == pytest.approx(0.2 / (3 ** 0.5))
+    assert row["validation_kl_ucb"] == pytest.approx(1.0 + 0.2 / (3 ** 0.5))
 
 
 def test_knee_archive_fresh_anchor_honors_measure_all_formats(

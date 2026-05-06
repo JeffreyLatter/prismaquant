@@ -36,7 +36,9 @@ from prismaquant.allocator_solver import Candidate, _shape_from_stats, solve_all
 from prismaquant.build_rtn_cache import kl_divergence
 from prismaquant.memory_management import (
     GPUMemoryBudgetExceeded,
+    cuda_memory_info,
     enforce_gpu_memory_budget,
+    max_gpu_memory_bytes,
     register_budget_evictor,
 )
 from prismaquant.perturbed_x_cache import (
@@ -147,6 +149,186 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return int(default)
     return max(parsed, 0)
+
+
+def _bytes_to_gb(num_bytes: int | float) -> float:
+    return float(num_bytes) / float(1024 ** 3)
+
+
+_L3_FROZEN_CACHE_MEMORY_NOTICE_EMITTED = False
+_L3_PREQUANT_CACHE_MEMORY_NOTICE_EMITTED = False
+_L3_PREQUANT_GROUP_SKIP_NOTICE_EMITTED = False
+
+
+def _memory_status_disables_weight_cache(
+    device: torch.device,
+) -> tuple[bool, int, int, int, int, int]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False, 0, 0, 0, 0, 0
+    budget = max_gpu_memory_bytes(device)
+    info = cuda_memory_info(device)
+    if budget is None or info is None:
+        return False, 0, 0, 0, 0, 0
+    free_bytes, total_bytes = info
+    used_bytes = total_bytes - free_bytes
+    reserve_frac = _env_float(
+        "PRISMAQUANT_FROZEN_WEIGHT_CACHE_MIN_FREE_FRACTION", 0.05)
+    reserve_floor_gb = _env_float(
+        "PRISMAQUANT_FROZEN_WEIGHT_CACHE_MIN_FREE_GB", 2.0)
+    reserve_bytes = max(
+        int(total_bytes * max(reserve_frac, 0.0)),
+        int(max(reserve_floor_gb, 0.0) * 1024 ** 3),
+    )
+    budget_slack = budget - used_bytes
+    disabled = not (
+        used_bytes < budget
+        and free_bytes >= reserve_bytes
+        and budget_slack >= reserve_bytes
+    )
+    return disabled, used_bytes, budget, free_bytes, total_bytes, reserve_bytes
+
+
+def _maybe_disable_l3_frozen_cache_for_memory(
+    device: torch.device,
+    enabled: bool,
+) -> bool:
+    global _L3_FROZEN_CACHE_MEMORY_NOTICE_EMITTED
+    if not enabled:
+        return enabled
+    disabled, used_bytes, budget, free_bytes, total_bytes, reserve_bytes = (
+        _memory_status_disables_weight_cache(device)
+    )
+    if not disabled:
+        return enabled
+    if not _L3_FROZEN_CACHE_MEMORY_NOTICE_EMITTED:
+        _L3_FROZEN_CACHE_MEMORY_NOTICE_EMITTED = True
+        print(
+            "[memory-aware] disabling L3 frozen weight cache: "
+            f"used={_bytes_to_gb(used_bytes):.2f}GB "
+            f"budget={_bytes_to_gb(budget):.2f}GB "
+            f"free={_bytes_to_gb(free_bytes):.2f}GB "
+            f"total={_bytes_to_gb(total_bytes):.2f}GB "
+            f"reserve={_bytes_to_gb(reserve_bytes):.2f}GB; "
+            "falling back to per-module quantize/restore",
+            flush=True,
+        )
+    return False
+
+
+def _maybe_disable_l3_prequant_cache_for_memory(
+    device: torch.device,
+    enabled: bool,
+) -> bool:
+    global _L3_PREQUANT_CACHE_MEMORY_NOTICE_EMITTED
+    if not enabled:
+        return enabled
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return enabled
+    budget = max_gpu_memory_bytes(device)
+    info = cuda_memory_info(device)
+    if budget is None or info is None:
+        return enabled
+    free_bytes, total_bytes = info
+    used_bytes = total_bytes - free_bytes
+    reserve_frac = _env_float(
+        "PRISMAQUANT_FROZEN_WEIGHT_CACHE_MIN_FREE_FRACTION", 0.05)
+    reserve_floor_gb = _env_float(
+        "PRISMAQUANT_FROZEN_WEIGHT_CACHE_MIN_FREE_GB", 2.0)
+    reserve_bytes = max(
+        int(total_bytes * max(reserve_frac, 0.0)),
+        int(max(reserve_floor_gb, 0.0) * 1024 ** 3),
+    )
+    disabled = used_bytes >= budget or free_bytes < reserve_bytes
+    if not disabled:
+        return enabled
+    if not _L3_PREQUANT_CACHE_MEMORY_NOTICE_EMITTED:
+        _L3_PREQUANT_CACHE_MEMORY_NOTICE_EMITTED = True
+        print(
+            "[memory-aware] disabling L3 prequant weight cache: "
+            f"used={_bytes_to_gb(used_bytes):.2f}GB "
+            f"budget={_bytes_to_gb(budget):.2f}GB "
+            f"free={_bytes_to_gb(free_bytes):.2f}GB "
+            f"total={_bytes_to_gb(total_bytes):.2f}GB "
+            f"reserve={_bytes_to_gb(reserve_bytes):.2f}GB; "
+            "quantizing target weights on demand",
+            flush=True,
+        )
+    return False
+
+
+def _estimate_l3_quant_cache_bytes(
+    model: nn.Module,
+    neighborhood: list[L3NeighborhoodEntry],
+    specs: list[fr.FormatSpec],
+    *,
+    skip_bf16: bool = True,
+) -> int:
+    quant_map = _l3_quantizable_map(model)
+    seen: set[tuple[int, str, str]] = set()
+    total = 0
+    for entry in neighborhood:
+        target = quant_map.get(entry.name)
+        if target is None:
+            continue
+        linear, attr = target
+        if not isinstance(linear, nn.Linear) or attr != "weight":
+            continue
+        weight = linear.weight
+        weight_bytes = int(weight.numel()) * int(weight.element_size())
+        for spec in specs:
+            canonical = fr.canonical_format_name(spec.name)
+            if skip_bf16 and canonical == "BF16":
+                continue
+            key = (id(linear), attr, canonical)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += weight_bytes
+    return int(total)
+
+
+def _l3_prequant_group_cache_fits(
+    model: nn.Module,
+    group_entries: list[L3NeighborhoodEntry],
+    specs: list[fr.FormatSpec],
+    device: torch.device,
+) -> bool:
+    global _L3_PREQUANT_GROUP_SKIP_NOTICE_EMITTED
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return True
+    info = cuda_memory_info(device)
+    if info is None:
+        return True
+    free_bytes, total_bytes = info
+    reserve_bytes = max(
+        int(total_bytes * max(
+            _env_float("PRISMAQUANT_L3_PREQUANT_CACHE_RESERVE_FRACTION", 0.05),
+            0.0,
+        )),
+        int(
+            max(_env_float("PRISMAQUANT_L3_PREQUANT_CACHE_RESERVE_GB", 2.0), 0.0)
+            * 1024 ** 3
+        ),
+    )
+    cache_bytes = _estimate_l3_quant_cache_bytes(model, group_entries, specs)
+    peak_multiplier = max(
+        _env_float("PRISMAQUANT_L3_PREQUANT_CACHE_PEAK_MULTIPLIER", 3.0),
+        1.0,
+    )
+    needed_bytes = int(cache_bytes * peak_multiplier)
+    fits = int(free_bytes) >= reserve_bytes + needed_bytes
+    if not fits and not _L3_PREQUANT_GROUP_SKIP_NOTICE_EMITTED:
+        _L3_PREQUANT_GROUP_SKIP_NOTICE_EMITTED = True
+        print(
+            "[memory-aware] disabling L3 prequant weight cache for a depth group: "
+            f"free={_bytes_to_gb(free_bytes):.2f}GB "
+            f"reserve={_bytes_to_gb(reserve_bytes):.2f}GB "
+            f"estimated_cache={_bytes_to_gb(cache_bytes):.2f}GB "
+            f"peak_multiplier={peak_multiplier:.2f}; "
+            "quantizing group weights on demand",
+            flush=True,
+        )
+    return fits
 
 
 def _host_available_memory_gb() -> float | None:
@@ -271,8 +453,14 @@ def _memory_bytes_for_format(
     spec: fr.FormatSpec,
 ) -> int:
     memory_map = stats_entry.get("_memory_bytes_by_format")
-    if isinstance(memory_map, Mapping) and spec.name in memory_map:
-        return int(memory_map[spec.name])
+    if isinstance(memory_map, Mapping):
+        # Legacy stats may be keyed by the pre-canonical name (e.g.
+        # ``"MXFP8"`` before the alias to ``"MXFP8_E4M3"`` was added).
+        # Try the canonical name first, then any registered aliases for
+        # the same spec.
+        for key in (spec.name, *fr.aliases_for(spec.name)):
+            if key in memory_map:
+                return int(memory_map[key])
     return int(spec.memory_bytes_for_shape(_shape_from_stats(dict(stats_entry))))
 
 
@@ -652,7 +840,10 @@ def _greedy_l3_under_budget(
     names = sorted(open_cands)
     chosen: dict[str, Candidate] = {}
     for name in names:
-        by_fmt = {c.fmt: c for c in open_cands[name]}
+        # Index candidates by canonical format so a candidate with raw
+        # legacy ``c.fmt == "MXFP8"`` matches the canonical
+        # ``"MXFP8_E4M3"`` after `current_assignment` is canonicalized.
+        by_fmt = {fr.canonical_format_name(c.fmt): c for c in open_cands[name]}
         current_fmt = fr.canonical_format_name(current_assignment.get(name, "BF16"))
         chosen[name] = by_fmt.get(current_fmt) or min(
             open_cands[name],
@@ -2646,22 +2837,30 @@ def _adjust_l3_max_lanes_for_memory(
     requested = max(int(max_lanes_per_batch), 1)
     if device.type != "cuda" or not torch.cuda.is_available():
         return requested
-    headroom_gb = max(
-        _env_float("PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_GB", 8.0),
-        0.0,
+    info = cuda_memory_info(device)
+    if info is None:
+        return requested
+    free_bytes, total_bytes = info
+    headroom_bytes = max(
+        int(total_bytes * max(
+            _env_float("PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_FRACTION", 0.05),
+            0.0,
+        )),
+        int(
+            max(_env_float("PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_GB", 2.0), 0.0)
+            * 1024 ** 3
+        ),
     )
-    headroom_bytes = int(headroom_gb * 1024 ** 3)
-    estimated_bytes = _estimate_l3_microbatch_memory_bytes(
-        calibration_data,
-        requested,
-    )
-    try:
-        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
-    except TypeError:
-        free_bytes, _total_bytes = torch.cuda.mem_get_info()
-    if int(free_bytes) < headroom_bytes + estimated_bytes and requested > 1:
-        return max(requested // 2, 1)
-    return requested
+    lanes = requested
+    while lanes > 1:
+        estimated_bytes = _estimate_l3_microbatch_memory_bytes(
+            calibration_data,
+            lanes,
+        )
+        if int(free_bytes) >= headroom_bytes + estimated_bytes:
+            break
+        lanes = max(lanes // 2, 1)
+    return max(lanes, 1)
 
 
 def _output_mse_names_reach_tail(
@@ -2726,10 +2925,14 @@ def measure_lane_batched_kl_deltas(
         "PRISMAQUANT_L3_PREQUANT_CACHE",
         default=True,
     )
+    use_prequant_cache = _maybe_disable_l3_prequant_cache_for_memory(
+        device, use_prequant_cache)
     use_frozen_perturbed_cache = _env_flag_enabled(
         "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
         default=True,
     )
+    use_frozen_perturbed_cache = _maybe_disable_l3_frozen_cache_for_memory(
+        device, use_frozen_perturbed_cache)
     calibration_call_count = max(
         len(ref_log_probs),
         _calibration_call_count(calib_ids),
@@ -3101,10 +3304,14 @@ def measure_override_paired_kl_deltas(
         "PRISMAQUANT_L3_PREQUANT_CACHE",
         default=True,
     )
+    use_prequant_cache = _maybe_disable_l3_prequant_cache_for_memory(
+        device, use_prequant_cache)
     use_frozen_perturbed_cache = _env_flag_enabled(
         "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
         default=True,
     )
+    use_frozen_perturbed_cache = _maybe_disable_l3_frozen_cache_for_memory(
+        device, use_frozen_perturbed_cache)
     _decoder_base, decoder_layers = _decoder_stack(model)
     tail_call_cache: dict[int, list[tuple[tuple, dict, int]]] = {}
     tail_graph_cache = _TailCudaGraphCache(enabled=torch.cuda.is_available())
@@ -3527,10 +3734,14 @@ def measure_propagated_costs(
         "PRISMAQUANT_L3_PREQUANT_CACHE",
         default=True,
     )
+    use_prequant_cache = _maybe_disable_l3_prequant_cache_for_memory(
+        device, use_prequant_cache)
     use_frozen_perturbed_cache = _env_flag_enabled(
         "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
         default=True,
     )
+    use_frozen_perturbed_cache = _maybe_disable_l3_frozen_cache_for_memory(
+        device, use_frozen_perturbed_cache)
     tail_graph_cache = _TailCudaGraphCache(enabled=torch.cuda.is_available())
     if (
         bool(tail_only)
@@ -3605,15 +3816,25 @@ def measure_propagated_costs(
                 "lane_count": group_lane_count,
                 "mode": "tail-only" if use_tail_group else "full-forward",
             })
+        group_use_prequant_cache = (
+            use_prequant_cache
+            and _l3_prequant_group_cache_fits(
+                model,
+                group_entries,
+                specs,
+                device,
+            )
+        )
         group_quant_cache = (
             build_quant_weight_cache(model, group_entries, specs)
-            if use_prequant_cache
+            if group_use_prequant_cache
             else None
         )
-        for lanes in _lane_microbatches_for_entries(
+        lane_batches = list(_lane_microbatches_for_entries(
             group_entries,
             max_lanes_per_batch,
-        ):
+        ))
+        for lane_batch_index, lanes in enumerate(lane_batches, start=1):
             if not lanes:
                 continue
             target_names = {lane.name for lane in lanes}
@@ -3655,6 +3876,17 @@ def measure_propagated_costs(
                 if tail_graph_safe
                 else lanes
             )
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "depth_group_microbatch_start",
+                    "group": group_key,
+                    "group_index": group_index,
+                    "group_count": len(depth_groups),
+                    "microbatch_index": lane_batch_index,
+                    "microbatch_count": len(lane_batches),
+                    "lane_count": len(lanes),
+                    "execution_lane_count": len(execution_lanes),
+                })
             graph_state_key = (
                 _assignment_graph_key(context_assignment),
                 _lane_specs_graph_key(execution_lanes),
@@ -3794,6 +4026,18 @@ def measure_propagated_costs(
                         batch_count += 1
                         if output_mse is not None:
                             output_mse.mark_batch()
+                    if progress_callback is not None:
+                        progress_callback({
+                            "event": "depth_group_microbatch_end",
+                            "group": group_key,
+                            "group_index": group_index,
+                            "group_count": len(depth_groups),
+                            "microbatch_index": lane_batch_index,
+                            "microbatch_count": len(lane_batches),
+                            "lane_count": len(lanes),
+                            "execution_lane_count": len(execution_lanes),
+                            "batch_count": batch_count,
+                        })
                 finally:
                     if target_hooks is not None:
                         target_hooks.remove()

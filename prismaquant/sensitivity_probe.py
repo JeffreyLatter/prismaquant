@@ -889,6 +889,7 @@ class RouterTracker:
     def __init__(self, model: nn.Module, routers: list[str], top_k: int):
         self.top_k = top_k
         self.counts_t: dict[str, torch.Tensor] = {}
+        self.active_counts_t: dict[str, torch.Tensor] = {}
         self.total_tokens: dict[str, int] = defaultdict(int)
         self._handles = []
         for rq in routers:
@@ -906,6 +907,7 @@ class RouterTracker:
             if not isinstance(n_experts, int) or n_experts <= 0:
                 continue
             self.counts_t[rq] = torch.zeros(n_experts, dtype=torch.float64)
+            self.active_counts_t[rq] = torch.zeros(n_experts, dtype=torch.int64)
             self._handles.append(mod.register_forward_hook(self._make_hook(rq)))
 
     def _make_hook(self, router_qname: str):
@@ -920,8 +922,13 @@ class RouterTracker:
                 weights=probs.reshape(-1).to(torch.float64),
                 minlength=int(scores.size(-1)),
             )
+            active = torch.bincount(
+                topk_i.reshape(-1),
+                minlength=int(scores.size(-1)),
+            )
             self.total_tokens[router_qname] += flat.size(0)
             self.counts_t[router_qname].add_(weighted.cpu())
+            self.active_counts_t[router_qname].add_(active.cpu().to(torch.int64))
         return hook
 
     def remove_hooks(self):
@@ -949,6 +956,35 @@ class RouterTracker:
             out[router] = {
                 str(int(i)): float(counts[int(i)].item())
                 for i in nz.tolist()
+            }
+        return out
+
+    @property
+    def active_counts(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for router, counts in self.active_counts_t.items():
+            nz = torch.nonzero(counts > 0, as_tuple=False).reshape(-1)
+            out[router] = {
+                str(int(i)): int(counts[int(i)].item())
+                for i in nz.tolist()
+            }
+        return out
+
+    @property
+    def route_stats(self) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        active = self.active_counts
+        for router, counts in self.counts.items():
+            total = int(self.total_tokens.get(router, 0))
+            denom = max(total, 1)
+            out[router] = {
+                "total_tokens": total,
+                "mass": counts,
+                "active_count": active.get(router, {}),
+                "prob": {
+                    eid: float(mass) / denom
+                    for eid, mass in counts.items()
+                },
             }
         return out
 
@@ -1862,6 +1898,8 @@ def run_probe_pass(model: nn.Module,
             "stats": acc.stats,
             "router_counts": dict(tracker.counts) if tracker else {},
             "router_totals": dict(tracker.total_tokens) if tracker else {},
+            "router_active_counts": dict(tracker.active_counts) if tracker else {},
+            "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
                 "model": model_name,
@@ -2071,6 +2109,8 @@ def run_multimodal_visual_probe_pass(
             "stats": acc.stats,
             "router_counts": dict(tracker.counts) if tracker else {},
             "router_totals": dict(tracker.total_tokens) if tracker else {},
+            "router_active_counts": dict(tracker.active_counts) if tracker else {},
+            "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
                 "model": model_path,
@@ -2460,6 +2500,8 @@ def run_streaming_multimodal_visual_probe_pass(
             "stats": acc.stats,
             "router_counts": dict(tracker.counts) if tracker else {},
             "router_totals": dict(tracker.total_tokens) if tracker else {},
+            "router_active_counts": dict(tracker.active_counts) if tracker else {},
+            "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
                 "model": model_path,

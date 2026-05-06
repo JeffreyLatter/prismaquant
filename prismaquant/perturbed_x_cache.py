@@ -40,8 +40,62 @@ _SHARED_FROZEN_WEIGHT_FORMAT_CACHE: OrderedDict[
 ] = OrderedDict()
 
 
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Clamping inputs to the calibrated max(|activations|) before per-group
+# RTN matches the export's act-clip behavior.  Without this, dynamic
+# per-group RTN sets scales from the raw input's local max, so outliers
+# dominate and any pre-scaling is mathematically a no-op
+# (Q(x/s)*s == Q(x) under purely dynamic Q — codex round-3 caught this).
+
+
+def _activation_max_abs_lookup(
+    activation_max_abs: dict,
+    param_name: str | None,
+) -> float | None:
+    """Resolve ``param_name`` against ``activation_max_abs`` with the same
+    alias-fallbacks as ``ProductionWeightCache.get`` so cache hits and
+    activation-clip lookups stay consistent."""
+    if param_name is None or not activation_max_abs:
+        return None
+    candidates = [param_name]
+    if param_name.endswith(".weight"):
+        candidates.append(param_name[:-len(".weight")])
+    if param_name.startswith("model.language_model."):
+        candidates.append("model." + param_name[len("model.language_model."):])
+    for cand in candidates:
+        v = activation_max_abs.get(cand)
+        if v is not None:
+            return v
+    return None
+
+
+def _maybe_clip_activations(
+    x: "torch.Tensor",
+    activation_max_abs: dict,
+    param_name: str | None,
+) -> "torch.Tensor":
+    """Clamp activations to ±max_abs when a calibrated value is known.
+
+    ``activation_max_abs`` is the dict from
+    ``ProductionWeightCache.activation_max_abs`` (calibrated max(|x|)
+    per fused-sibling group).  Returns ``x`` unchanged when:
+
+      * no entry is registered for ``param_name`` (or its aliases),
+      * the registered value is non-positive, or
+      * ``PRISMAQUANT_PROD_ACT_SCALES`` is explicitly disabled.
+    """
+    max_abs = _activation_max_abs_lookup(activation_max_abs, param_name)
+    if max_abs is None or max_abs <= 0:
+        return x
+    if not _env_truthy("PRISMAQUANT_PROD_ACT_SCALES", default=True):
+        return x
+    return x.clamp(-float(max_abs), float(max_abs))
 
 
 def activation_cache_filename(name: str) -> str:
@@ -251,6 +305,7 @@ class PerturbedActivationCache:
         input_rows: int = 256,
         cal_hash: str,
         profile=None,
+        production_weight_cache=None,
     ):
         self.model = model
         self.cache_dir = Path(cache_dir)
@@ -259,6 +314,24 @@ class PerturbedActivationCache:
         self.plans, self.missing, self.skipped = _build_module_plans(
             model, assignment
         )
+        self._production_weight_cache = production_weight_cache
+        # MED-3: per-Linear calibrated max(|activations|), unified across
+        # fused-sibling groups.  Used by the activation-quant hook to
+        # clamp activations to ±max_abs before per-group RTN, matching
+        # the export's act-clip behavior.  See production_weight_cache.py
+        # for the convention note (we store max_abs directly; the export's
+        # vLLM-facing metadata convention is 6.0 / max_abs).
+        if production_weight_cache is not None and (
+            production_weight_cache.activation_max_abs
+            or production_weight_cache.activation_scales
+        ):
+            src = (
+                production_weight_cache.activation_max_abs
+                or production_weight_cache.activation_scales
+            )
+            self._activation_scales: dict[str, float] = dict(src)
+        else:
+            self._activation_scales = {}
         self._snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._rows_got: dict[str, int] = defaultdict(int)
         self._handles = []
@@ -337,19 +410,55 @@ class PerturbedActivationCache:
             str(param.device),
             str(param.dtype),
         )
-        q = self._frozen_weight_format_cache.get(cache_key)
+        # When a production cache is active, ignore the shared frozen-
+        # weight-format cache.  A prior caller may have populated it with
+        # RTN-rendered tensors (no production cache); without bypassing,
+        # those stale entries would be returned in preference to W_tilde.
+        # codex round-5 reproduced this by populating the shared cache
+        # first, then instantiating with a ProductionWeightCache —
+        # second lookup returned RTN.
+        bypass_shared = (
+            self._production_weight_cache is not None
+            and not _env_truthy("PRISMAQUANT_FUSED_KERNEL_OVER_PROD_CACHE")
+        )
+        q = None if bypass_shared else self._frozen_weight_format_cache.get(cache_key)
         if q is None:
             enforce_gpu_memory_budget(
                 [self],
                 device=param.device if param.device.type == "cuda" else None,
                 reason="frozen weight cache fill",
             )
-            original = param.data.detach().clone()
-            q = spec.quantize_dequantize(original).to(
-                device=param.device,
-                dtype=param.dtype,
-            ).contiguous()
-            if self._frozen_weight_cache_max_entries() > 0:
+            production = (
+                self._production_weight_cache.get(param_plan.name, fmt)
+                if self._production_weight_cache is not None
+                else None
+            )
+            if production is not None:
+                q = production.to(
+                    device=param.device,
+                    dtype=param.dtype,
+                ).contiguous()
+            else:
+                if (
+                    self._production_weight_cache is not None
+                    and fmt not in {"BF16", "MXFP8", "MXFP8_E4M3"}
+                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                ):
+                    raise RuntimeError(
+                        f"production_weight_cache miss for "
+                        f"({param_plan.name!r}, {fmt!r}); set "
+                        f"PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 to fall back "
+                        f"to RTN, or rebuild the cache to cover this Linear."
+                    )
+                original = param.data.detach().clone()
+                q = spec.quantize_dequantize(original).to(
+                    device=param.device,
+                    dtype=param.dtype,
+                ).contiguous()
+            # Don't pollute the shared cache with W_tilde tensors when
+            # production cache is active — a non-production caller using
+            # the shared cache would otherwise receive production weights.
+            if self._frozen_weight_cache_max_entries() > 0 and not bypass_shared:
                 self._frozen_weight_format_cache[cache_key] = q
                 self._evict_frozen_weight_format_cache_to_limit()
             enforce_gpu_memory_budget(
@@ -509,6 +618,25 @@ class PerturbedActivationCache:
                     self._frozen_weight_cache.move_to_end(cache_key)
             if q is None and _env_truthy("PRISMAQUANT_SHARED_WEIGHT_FORMAT_CACHE"):
                 q = self._quantized_weight_for(plan, param_plan, param_plan.spec)
+            if q is None and self._production_weight_cache is not None:
+                fmt_canon = fr.canonical_format_name(param_plan.spec.name)
+                production = self._production_weight_cache.get(
+                    param_plan.name, fmt_canon,
+                )
+                if production is not None:
+                    q = production.to(
+                        device=param.device, dtype=param.dtype,
+                    ).contiguous()
+                elif (
+                    fmt_canon not in {"BF16", "MXFP8", "MXFP8_E4M3"}
+                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                ):
+                    raise RuntimeError(
+                        f"production_weight_cache miss for "
+                        f"({param_plan.name!r}, {fmt_canon!r}); set "
+                        f"PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 to allow "
+                        f"RTN fallback."
+                    )
             if q is None:
                 q = param_plan.spec.quantize_dequantize(original)
             if q is None:
@@ -528,6 +656,17 @@ class PerturbedActivationCache:
 
     def _nvfp4_fused_param_plan(self, plan: _ModulePlan) -> _ParamPlan | None:
         if not _env_truthy("PRISMAQUANT_FUSED_KERNEL_NVFP4"):
+            return None
+        # When a production cache is active, the fused fast path's
+        # `nvfp4_pack_weight` re-computes per-group scales locally and
+        # ignores the cache's joint NVFP4 sibling globals — so the
+        # packed FP4 codes diverge from what the export would produce.
+        # Refuse to use the fast path in that mode unless the user
+        # explicitly opts in via PRISMAQUANT_FUSED_KERNEL_OVER_PROD_CACHE.
+        if (
+            self._production_weight_cache is not None
+            and not _env_truthy("PRISMAQUANT_FUSED_KERNEL_OVER_PROD_CACHE")
+        ):
             return None
         if not isinstance(plan.module, nn.Linear) or len(plan.params) != 1:
             return None
@@ -590,6 +729,18 @@ class PerturbedActivationCache:
     ) -> torch.Tensor:
         act_spec = self._active_activation_spec(plan)
         if act_spec is not None:
+            # MED-3: act-clip the input to the calibrated max_abs before
+            # per-group RTN.  The dynamic per-group quantizer in
+            # `act_spec.activation_quantize_dequantize` would otherwise
+            # set its scales from the input's per-group max — outliers
+            # then dominate.  Production export does the same clipping
+            # as `_resolve_act_clip_quantile`, so this matches what the
+            # shipped artifact sees at runtime.  `Q(x/s)*s == Q(x)` for
+            # purely dynamic Q, so the previous "pre-scale + post-multiply"
+            # formulation was a no-op (codex round-3).
+            x = _maybe_clip_activations(
+                x, self._activation_scales, param_plan.name,
+            )
             x = act_spec.activation_quantize_dequantize(x)
         weight = self._weight_for_reference_forward(plan, param_plan)
         return F.linear(x, weight, plan.module.bias)
@@ -617,7 +768,30 @@ class PerturbedActivationCache:
                 device=param.device if param.device.type == "cuda" else None,
                 reason="NVFP4 packed weight cache fill",
             )
-            packed = nvfp4_pack_weight(param.detach())
+            # HIGH: prefer the production cache's GPTQ + scale_sweep
+            # weight when present.  Without this, the fused NVFP4 fast
+            # path packs the raw BF16 param and bypasses the entire
+            # production cache (silently runs RTN-equivalent weights
+            # through the kernel).  Strict mode raises on miss so the
+            # fast path matches the slow-path miss semantics.
+            source = param.detach()
+            if self._production_weight_cache is not None:
+                w_dq = self._production_weight_cache.get(
+                    param_plan.name, "NVFP4",
+                )
+                if w_dq is not None:
+                    source = w_dq.to(
+                        device=param.device, dtype=param.dtype,
+                    ).contiguous()
+                elif _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE"):
+                    raise RuntimeError(
+                        f"production_weight_cache miss for "
+                        f"({param_plan.name!r}, 'NVFP4') on the fused "
+                        f"NVFP4 fast path; set "
+                        f"PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 to allow "
+                        f"raw-weight fallback or rebuild the cache."
+                    )
+            packed = nvfp4_pack_weight(source)
             self._fused_nvfp4_weight_cache[cache_key] = packed
             self._fused_nvfp4_weight_cache.move_to_end(cache_key)
             enforce_gpu_memory_budget(
@@ -696,6 +870,15 @@ class PerturbedActivationCache:
             plan, param_plan
         )
         flat_x = x.reshape(-1, x.shape[-1])
+        # MED-3: act-clip the activation to the calibrated max_abs before
+        # the fused kernel's internal per-group RTN.  Same rationale as
+        # ``_reference_linear_forward``: pre-scale + post-multiply
+        # cancels under dynamic per-group RTN, but clipping forces
+        # outliers to the calibrated range so per-group scales are
+        # bounded — matching production's act-clip semantics.
+        flat_x = _maybe_clip_activations(
+            flat_x, self._activation_scales, param_plan.name,
+        )
         out = nvfp4_fused_aw_matmul(flat_x, w_packed, w_scales, w_global_scale)
         out = out.reshape(*x.shape[:-1], plan.module.out_features)
         if plan.module.bias is not None:
@@ -714,7 +897,19 @@ class PerturbedActivationCache:
                 self._capture(plan, x)
                 act_spec = self._active_activation_spec(plan)
                 if act_spec is not None:
-                    qx = act_spec.activation_quantize_dequantize(x)
+                    # MED-3: act-clip to the calibrated max_abs before the
+                    # quantizer, so outliers don't dominate per-group
+                    # scales.  See ``_maybe_clip_activations`` for the
+                    # math; pre-scale + post-multiply was a no-op (codex
+                    # round-3 caught Q(x/s)*s == Q(x)).
+                    member_name = next(
+                        (p.name for p in plan.params if p.attr == "weight"),
+                        None,
+                    )
+                    x_in = _maybe_clip_activations(
+                        x, self._activation_scales, member_name,
+                    )
+                    qx = act_spec.activation_quantize_dequantize(x_in)
                     args, kwargs = _replace_tensor_input(args, kwargs, where, key, qx)
             self._apply_weight_quant(plan)
             return args, kwargs

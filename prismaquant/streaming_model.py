@@ -34,6 +34,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -78,6 +79,41 @@ def _minimax_native_fp8_checkpoint(model_path: str) -> bool:
         model_type.startswith("minimax_m2")
         or any(a.startswith("MiniMaxM2") for a in archs)
     ) and qc.get("quant_method") == "fp8" and "weight_block_size" in qc
+
+
+@contextmanager
+def _mask_cuda_queries_during_meta_init(log_prefix: str):
+    """Keep HF meta-skeleton construction from probing CUDA.
+
+    `init_empty_weights()` should be a pure Python/meta-tensor path. Some model
+    constructors or optional attention backends still ask `torch.cuda` whether
+    a device exists while choosing implementation details. On systems with a
+    wedged or slow UVM/NVML path that can burn CPU or hang before PrismaQuant
+    reaches its own streaming loader. The skeleton does not need CUDA, so make
+    those availability checks return "no CUDA" for this short block without
+    initializing CUDA or changing the requested runtime device.
+    """
+    enabled = os.environ.get(
+        "PRISMAQUANT_MASK_CUDA_DURING_META_INIT", "1"
+    ).lower() not in {"0", "false", "no"}
+    if not enabled or torch.cuda.is_initialized():
+        yield
+        return
+
+    old_is_available = torch.cuda.is_available
+    old_device_count = torch.cuda.device_count
+    old_current_device = torch.cuda.current_device
+    torch.cuda.is_available = lambda: False  # type: ignore[assignment]
+    torch.cuda.device_count = lambda: 0  # type: ignore[assignment]
+    torch.cuda.current_device = lambda: 0  # type: ignore[assignment]
+    try:
+        print(f"{log_prefix} masking torch.cuda queries during meta init",
+              flush=True)
+        yield
+    finally:
+        torch.cuda.is_available = old_is_available  # type: ignore[assignment]
+        torch.cuda.device_count = old_device_count  # type: ignore[assignment]
+        torch.cuda.current_device = old_current_device  # type: ignore[assignment]
 
 
 def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
@@ -219,7 +255,7 @@ def _auto_prefetch_min_available_bytes(layer_bytes: int,
 # but skipped in the text-only streaming pipeline.
 # ---------------------------------------------------------------------------
 _BODY_SHARD_RE = re.compile(r"^model\\\.layers\\\.")
-_MTP_SHARD_RE = re.compile(r"^mtp\\\.layers\\\.")
+_MTP_SHARD_RE = re.compile(r"mtp\\\.(?:fc|layers\\\.)")
 _VISUAL_SHARD_RE = re.compile(r"^model\\\.visual\\\.")
 _LM_HEAD_SHARD_RE = re.compile(r"^\^lm_head\$?$")
 
@@ -227,7 +263,7 @@ _LM_HEAD_SHARD_RE = re.compile(r"^\^lm_head\$?$")
 def _classify_shard(regex: str) -> str:
     if _BODY_SHARD_RE.match(regex):
         return "body"
-    if _MTP_SHARD_RE.match(regex):
+    if _MTP_SHARD_RE.search(regex):
         return "mtp"
     if _VISUAL_SHARD_RE.match(regex):
         return "visual"
@@ -290,16 +326,30 @@ class StreamingContext:
         self.fp8_scale_inv_map = fp8_scale_inv_map or {}
         self._inflight: dict[int, Any] = {}
         self._inflight_lock = threading.Lock()
+        self.configure_runtime_pressure_floor()
+
+    def memory_pressure_floor_bytes(self) -> int:
+        """Available-memory floor used for speculative loads and pressure trims."""
+        return max(
+            int(self.prefetch_min_available_bytes or 0),
+            int(self.layer_cache.dynamic_reserve_bytes or 0),
+        )
+
+    def configure_runtime_pressure_floor(self) -> int:
+        floor = self.memory_pressure_floor_bytes()
+        self.layer_cache.configure_pressure_threshold(floor)
+        return floor
 
     def _prefetch_worker(self, L: int):
         # v20 fix #1: re-check memory + pre-evict before the read.
         # schedule_prefetch's check may be stale if the queue was deep,
         # and the cache's dynamic budget only kicks in at put() time —
         # which is too late on UMA where the read itself can OOM.
-        if self.prefetch_min_available_bytes > 0:
+        pressure_floor = self.memory_pressure_floor_bytes()
+        if pressure_floor > 0:
             try:
                 import psutil
-                if psutil.virtual_memory().available < self.prefetch_min_available_bytes:
+                if psutil.virtual_memory().available < pressure_floor:
                     self.prefetch_memory_skips += 1
                     with self._inflight_lock:
                         self._inflight.pop(L, None)
@@ -325,10 +375,11 @@ class StreamingContext:
             return None
         if self.layer_cache.peek(L):
             return None
-        if self.prefetch_min_available_bytes > 0:
+        pressure_floor = self.memory_pressure_floor_bytes()
+        if pressure_floor > 0:
             try:
                 import psutil
-                if psutil.virtual_memory().available < self.prefetch_min_available_bytes:
+                if psutil.virtual_memory().available < pressure_floor:
                     self.prefetch_memory_skips += 1
                     return None
             except Exception:
@@ -380,6 +431,7 @@ class StreamingContext:
 
     def unload(self, L: int):
         _unload(self.model, [f"{self.layers_prefix}{L}."])
+        return self.layer_cache.trim_for_memory_pressure()
 
     def shutdown(self):
         self.prefetch_pool.shutdown(wait=True)
@@ -446,14 +498,14 @@ class StreamingContext:
         # chunk N's phase-3 would silently fail to repopulate in chunk
         # N+1's phase-1 forward.
         self.layer_cache.clear_done()
-        # v20 fix #4-A: clear priority + pressure config too.
+        # v20 fix #4-A: clear priority too.
         # set_priority_layers is called per-shard from
         # _run_body_streaming_shard; carrying chunk N's priority into
         # chunk N+1 means stale layers are protected before the new
-        # shard re-registers them. Pressure threshold likewise is
-        # configured per-shard. Reset both to neutral state.
+        # shard re-registers them. Reapply the pressure floor after
+        # cleanup so retained caches keep responding to current memory.
         self.layer_cache.set_priority_layers(set())
-        self.layer_cache.configure_pressure_threshold(0)
+        self.configure_runtime_pressure_floor()
         self.prefetch_memory_skips = 0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -486,9 +538,11 @@ class StreamingContext:
             inflight = len(self._inflight)
         est_gb = self.estimated_layer_bytes / (1024 ** 3)
         min_gb = self.prefetch_min_available_bytes / (1024 ** 3)
+        floor_gb = self.memory_pressure_floor_bytes() / (1024 ** 3)
         return (f"Prefetch: workers={self.prefetch_workers} "
                 f"inflight={inflight} est_layer={est_gb:.1f}GB "
                 f"min_avail={min_gb:.1f}GB "
+                f"pressure_floor={floor_gb:.1f}GB "
                 f"mem_skips={self.prefetch_memory_skips}")
 
 
@@ -577,12 +631,13 @@ def _build_streaming_context(model_path: str, *,
     else:
         model_cls = AutoModelForCausalLM
 
-    with init_empty_weights():
-        if model_cls is AutoModelForCausalLM:
-            skeleton = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=True)
-        else:
-            skeleton = model_cls._from_config(config)
+    with _mask_cuda_queries_during_meta_init(log_prefix):
+        with init_empty_weights():
+            if model_cls is AutoModelForCausalLM:
+                skeleton = AutoModelForCausalLM.from_config(
+                    config, trust_remote_code=True)
+            else:
+                skeleton = model_cls._from_config(config)
     skel_base, skel_layers = _get_layer_list(skeleton)
     base_prefix = _resolve_base_prefix(skeleton, skel_base)
     num_layers = len(skel_layers)

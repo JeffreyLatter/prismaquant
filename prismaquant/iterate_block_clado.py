@@ -108,6 +108,7 @@ def run_iteration(
     skip_polish: bool = False,
     use_frozen_weight_cache: bool = False,
     measure_method: str = "four_term",
+    production_weight_cache=None,
     log_callback=None,
 ) -> IterationResult:
     """One iteration: measure → sweep → kneedle → validate → polish."""
@@ -137,6 +138,7 @@ def run_iteration(
             center_assignment=center_assignment,
             use_frozen_weight_cache=use_frozen_weight_cache,
             include_activation_quant=True,
+            production_weight_cache=production_weight_cache,
         )
         payload_path = iter_dir / "block_clado.json"
         payload_path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -152,6 +154,7 @@ def run_iteration(
             skip_pairs=False,
             center_assignment=center_assignment,
             use_frozen_weight_cache=use_frozen_weight_cache,
+            production_weight_cache=production_weight_cache,
         )
         payload_path = iter_dir / "block_clado.json"
         payload_path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -221,7 +224,8 @@ def run_iteration(
         kl = measure_assignment_kl(
             model, assignment, calib_ids, ref_log_probs,
             work_root=work_root, profile=profile,
-            use_frozen_weight_cache=use_frozen_weight_cache, rng_seed=0,
+            use_frozen_weight_cache=use_frozen_weight_cache,
+            production_weight_cache=production_weight_cache, rng_seed=0,
         )
         validation.append({
             "bpp": r["bpp"],
@@ -285,6 +289,7 @@ def run_iteration(
             pairs_by_block=dict(pairs_back),
             steepest_first=polish_steepest_first,
             use_frozen_weight_cache=use_frozen_weight_cache,
+            production_weight_cache=production_weight_cache,
             progress_callback=_polish_progress,
         )
     log(event="polish_done", iter=iter_idx,
@@ -398,6 +403,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument(
+        "--production-weight-cache",
+        default=None,
+        help=(
+            "Path to a pickled ProductionWeightCache (e.g. from "
+            "prismaquant.build_production_cache).  When supplied, four-term "
+            "/ output-Fisher measurements, cone validation, and polish all "
+            "use production-faithful δw (GPTQ + scale_sweep on NVFP4) "
+            "instead of bare RTN."
+        ),
+    )
     args = parser.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -439,6 +455,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         ref_log_probs = cache_reference_log_probs(model, calib_ids, model_device)
         formats = [fr.get_format(name.strip()) for name in args.formats.split(",") if name.strip()]
 
+        production_weight_cache = None
+        if args.production_weight_cache:
+            import pickle
+            with open(args.production_weight_cache, "rb") as fh:
+                production_weight_cache = pickle.load(fh)
+            print(
+                f"[iter] loaded production cache with "
+                f"{len(production_weight_cache)} entries",
+                flush=True,
+            )
+
         def log(**kw):
             payload = dict(kw)
             print(f"[iter] {json.dumps(payload, default=str)}", flush=True)
@@ -467,6 +494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 skip_polish=bool(args.skip_polish),
                 use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
                 measure_method=str(args.measure_method),
+                production_weight_cache=production_weight_cache,
                 log_callback=log,
             )
             summary_rows.append(result)

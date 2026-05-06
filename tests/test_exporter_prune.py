@@ -1,7 +1,7 @@
-"""Unit tests for the exporter's prune-manifest plumbing.
+"""Unit tests for the exporter's archived prune-manifest plumbing.
 
 Covers the pure helpers in `export_native_compressed`:
-  - manifest load (missing file → empty; valid JSON round-trip)
+  - manifest load (missing file → empty; non-empty JSON rejected)
   - parent-index build from router-keyed manifest
   - resolve-action for per-expert Linears (router / drop / reindex /
     passthrough)
@@ -50,13 +50,13 @@ def test_load_prune_manifest_missing_file(tmp_path):
     assert _load_prune_manifest(tmp_path / "does_not_exist.json") == {}
 
 
-def test_load_prune_manifest_valid_json(tmp_path):
+def test_load_prune_manifest_rejects_nonempty_json(tmp_path):
     m = _manifest_fixture()
     p = tmp_path / "m.json"
     with open(p, "w") as f:
         json.dump(m, f)
-    got = _load_prune_manifest(p)
-    assert got == m
+    with pytest.raises(RuntimeError, match="Expert pruning is disabled"):
+        _load_prune_manifest(p)
 
 
 def test_load_prune_manifest_rejects_non_object(tmp_path):
@@ -168,7 +168,7 @@ def test_shrink_router_weight_rejects_size_mismatch():
         _shrink_router_weight(mod, entry)
 
 
-def test_write_config_patches_num_experts_fields(tmp_path):
+def test_write_config_rejects_prune_manifest(tmp_path):
     # Fake source model dir with a minimal config.json carrying both
     # flat and text_config nested expert counts.
     src = tmp_path / "src"
@@ -205,23 +205,17 @@ def test_write_config_patches_num_experts_fields(tmp_path):
     import prismaquant.model_profiles as mp
     mp.detect_profile = _fake_detect_profile
     try:
-        write_config_with_quantization(
-            str(src), out_dir,
-            assignment={},  # empty → no quantization_config injected
-            bf16_passthrough=set(),
-            prune_manifest=_manifest_fixture(),
-        )
+        with pytest.raises(RuntimeError, match="Expert pruning is disabled"):
+            write_config_with_quantization(
+                str(src), out_dir,
+                assignment={},  # empty → no quantization_config injected
+                bf16_passthrough=set(),
+                prune_manifest=_manifest_fixture(),
+            )
     finally:
         # Restore (best-effort — tests run in-process, don't leak).
         if orig is not None:
             mp.detect_profile = orig
-
-    with open(out_dir / "config.json") as f:
-        patched = json.load(f)
-    # 4 → 2 in all three fields
-    assert patched["num_experts"] == 2
-    assert patched["num_routed_experts"] == 2
-    assert patched["text_config"]["num_local_experts"] == 2
 
 
 def test_write_config_rejects_mixed_kept_counts(tmp_path):
@@ -249,7 +243,7 @@ def test_write_config_rejects_mixed_kept_counts(tmp_path):
     import prismaquant.model_profiles as mp
     from prismaquant.model_profiles import DefaultProfile
     mp.detect_profile = lambda _p: DefaultProfile()
-    with pytest.raises(RuntimeError, match="inconsistent"):
+    with pytest.raises(RuntimeError, match="Expert pruning is disabled"):
         write_config_with_quantization(
             str(src), out_dir,
             assignment={}, bf16_passthrough=set(),

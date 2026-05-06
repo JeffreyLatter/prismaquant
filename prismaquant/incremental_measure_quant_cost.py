@@ -294,6 +294,9 @@ def _run_body_cost_shard(
     # shard — resolver has nothing to install at layer granularity;
     # lm_head is already resident from the context setup).
     installed = []
+    pressure_trim_bytes = 0
+    ctx.layer_cache.set_priority_layers(body_layers_needed)
+    ctx.configure_runtime_pressure_floor()
     try:
         t_install = time.time()
         for L in sorted(body_layers_needed):
@@ -318,9 +321,14 @@ def _run_body_cost_shard(
         )
     finally:
         for L in installed:
-            ctx.unload(L)
+            pressure_trim_bytes += int(ctx.unload(L) or 0)
+        ctx.layer_cache.set_priority_layers(set())
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
+    if pressure_trim_bytes:
+        print(f"[incremental-cost] pressure-trimmed "
+              f"{pressure_trim_bytes/(1024**3):.1f} GB from layer cache",
+              flush=True)
 
     missing_from_results = [n for n in target_names if n not in results]
     if missing_from_results:

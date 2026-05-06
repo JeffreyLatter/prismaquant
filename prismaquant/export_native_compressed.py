@@ -19,7 +19,8 @@ Reads the per-tensor format assignment produced by `allocator.py`
         <name>.weight_scale          (fp8_e4m3fn for NVFP4 / e8m0 for MXFP8)
         <name>.weight_global_scale   (fp32, NVFP4 only)
         <name>.input_global_scale    (fp32, A4/A8 formats only)
-    OR `<name>.weight` (passthrough bf16) for layers in the BF16 bucket.
+    OR `<name>.weight` (passthrough in the source storage dtype) for
+    layers in the uncompressed bucket.
 
   - `model.safetensors.index.json` matching the safetensors layout
 
@@ -69,6 +70,7 @@ import torch.nn as nn
 from accelerate import init_empty_weights
 from safetensors.torch import save_file
 
+from .expert_prune import raise_expert_prune_disabled
 from .model_profiles.qwen3_5 import Qwen3_5Profile
 from .schemas import validate_layer_config_payload, validate_prune_manifest_payload
 
@@ -1634,6 +1636,8 @@ def _load_prune_manifest(path: Path | str | None) -> dict[str, dict]:
     with open(p) as f:
         data = json.load(f)
     validate_prune_manifest_payload(data, str(p))
+    if data:
+        raise_expert_prune_disabled("export prune manifest")
     return data
 
 
@@ -1799,13 +1803,14 @@ def _unify_input_global_scales_across_fused_siblings(
     pass. If the siblings' scales don't match, vLLM warns and reduces
     accuracy.
 
-    Siblings receive the same upstream activation, so their max/6
-    values are theoretically identical — but capture + subsampling
-    order introduces float-precision drift in practice. Taking the
-    max over the group picks the conservative value (every sibling's
-    quantization range is at-or-above the computed max, so the fused
-    Linear never truncates any sibling's activations). Siblings that
-    weren't NVFP4-assigned pass through unchanged.
+    Siblings receive the same upstream activation, so their
+    `compute_nvfp4_input_global_scale` outputs are theoretically
+    identical — but capture + subsampling order introduces float-
+    precision drift in practice.  The stored values are reciprocals
+    (s = 6 / max_abs); the conservative join is therefore ``min(vals)``
+    (smallest reciprocal == largest max_abs == loosest clipping), so
+    the fused Linear never truncates any sibling's activations.
+    Siblings that weren't NVFP4-assigned pass through unchanged.
     """
     # Bucket siblings by fused group.
     groups: dict[tuple[str, tuple[str, ...]], list[str]] = {}
@@ -1823,7 +1828,16 @@ def _unify_input_global_scales_across_fused_siblings(
         if len(members) < 2:
             continue
         vals = [scales[m] for m in members]
-        joint = max(vals)
+        # input_global_scale stores 6 / max_abs (reciprocal convention,
+        # see compute_nvfp4_input_global_scale).  To pick a JOINT scale
+        # that doesn't over-clip ANY sibling's activations we want the
+        # smallest reciprocal == largest max_abs == loosest clipping.
+        # Previously this used max(vals), which under the reciprocal
+        # convention yields the TIGHTEST clipping — over-clipping the
+        # sibling with the largest activation range.  In practice fused
+        # siblings have similar activation distributions, so the drift
+        # is small, but min() is the correct conservative join.
+        joint = min(vals)
         drift = max(abs(joint - v) for v in vals)
         max_drift = max(max_drift, drift)
         for m in members:
@@ -2569,25 +2583,87 @@ def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
     return out
 
 
-def _passthrough_dtype(qname: str) -> torch.dtype:
+_SAFETENSORS_DTYPE_TO_TORCH = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+}
+
+
+def _build_source_dtype_map(
+    model_to_shard: dict[str, str],
+    model_to_ckpt: dict[str, str],
+) -> dict[str, torch.dtype]:
+    """Return live tensor qname -> dtype from source safetensors metadata."""
+    from safetensors import safe_open
+
+    by_shard: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for model_name, shard in model_to_shard.items():
+        by_shard[shard].append((model_name, model_to_ckpt[model_name]))
+
+    out: dict[str, torch.dtype] = {}
+    for shard, pairs in by_shard.items():
+        with safe_open(shard, framework="pt") as f:
+            keys = set(f.keys())
+            for model_name, ckpt_name in pairs:
+                if ckpt_name not in keys:
+                    continue
+                label = f.get_slice(ckpt_name).get_dtype()
+                dtype = _SAFETENSORS_DTYPE_TO_TORCH.get(label)
+                if dtype is not None:
+                    out[model_name] = dtype
+    return out
+
+
+def _dtype_hist_label(dtype: torch.dtype) -> str:
+    if dtype == torch.bfloat16:
+        return "BF16"
+    if dtype == torch.float16:
+        return "FP16"
+    if dtype == torch.float32:
+        return "FP32"
+    if dtype == torch.float64:
+        return "FP64"
+    if dtype == torch.float8_e4m3fn:
+        return "FP8_E4M3"
+    if dtype == torch.float8_e5m2:
+        return "FP8_E5M2"
+    return str(dtype).replace("torch.", "").upper()
+
+
+def _passthrough_dtype(
+    qname: str,
+    source_dtype: torch.dtype | None = None,
+    *,
+    fallback_dtype: torch.dtype | None = None,
+) -> torch.dtype:
     """Pick the storage dtype for a passthrough (non-quantized) param.
 
-    Norm (LayerNorm / RMSNorm / *_norm) parameters keep FP32 for
-    numerical stability — their scale is multiplied into every token's
-    hidden state at every block, so BF16 rounding error compounds.
-    Per-param size cost is trivial (~16 KB per norm × hundreds of norms
-    ≈ a few MB total) and quality gain is real (~0.02–0.05 PPL on
-    Llama-class models).
-
-    Detection: any path component containing "norm" (case-insensitive).
-    Catches `model.norm.weight`, `*.input_layernorm.weight`,
-    `*.kv_norm.weight`, `*.q_norm.weight`, `*.compressor.norm.weight`,
-    etc. Does NOT match `lm_head.weight` or `model.embed_tokens.weight`.
+    Passthrough means source-preserving. Do not silently upcast norms or
+    other parameters here; if a future recipe wants FP32 norms, it should
+    request that as an explicit transform and record it in the manifest.
     """
-    for part in qname.split("."):
-        if "norm" in part.lower():
-            return torch.float32
-    return torch.bfloat16
+    if source_dtype is not None:
+        return source_dtype
+    if fallback_dtype is not None:
+        return fallback_dtype
+    raise ValueError(f"missing source dtype for passthrough tensor {qname}")
+
+
+def _passthrough_tensor(
+    qname: str,
+    tensor: torch.Tensor,
+    source_dtype_by_name: dict[str, torch.dtype] | None = None,
+) -> tuple[torch.Tensor, str]:
+    dtype = _passthrough_dtype(
+        qname,
+        None if source_dtype_by_name is None else source_dtype_by_name.get(qname),
+        fallback_dtype=tensor.dtype,
+    )
+    return tensor.detach().to(dtype).cpu(), _dtype_hist_label(dtype)
 
 
 def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
@@ -2725,6 +2801,8 @@ def materialize_tensors_streaming(
     When `tensor_sink` is supplied, each emitted head/layer batch is
     passed to the sink and cleared immediately; the returned tensor dict
     is then intentionally empty."""
+    if prune_manifest:
+        raise_expert_prune_disabled("streaming export prune manifest")
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from .layer_streaming import (
@@ -2769,6 +2847,7 @@ def materialize_tensors_streaming(
     layers_prefix = f"{base_prefix}.layers." if base_prefix else "layers."
 
     weight_shard, weight_ckpt = _build_weight_map(model_path)
+    source_dtype_by_name = _build_source_dtype_map(weight_shard, weight_ckpt)
     # Native-FP8 dequant map, keyed by live weight-qname. Passed to
     # every `_read_layer_to_device` / `_materialize` call so fp8 source
     # weights land on the module as TRUE dequanted bf16 — not raw fp8
@@ -2822,8 +2901,9 @@ def materialize_tensors_streaming(
     unmapped_keys: list[str] = []
 
     # ----- 2. Head / embed / norm / lm_head / rotary passthrough -----
-    # These are resident on `device` already. Emit as BF16 passthrough
-    # UNLESS `lm_head` (or similar) is explicitly in the assignment.
+    # These are resident on `device` already. Emit as source-dtype
+    # passthrough UNLESS `lm_head` (or similar) is explicitly in the
+    # assignment.
     t_head = time.time()
 
     # HALO rotation on the head section (#4). Folds final_norm gamma into
@@ -2855,8 +2935,8 @@ def materialize_tensors_streaming(
         # Recipe keys are module qnames (e.g. "lm_head"), not parameter
         # qnames ("lm_head.weight"). Strip the trailing `.weight` so the
         # assignment lookup hits — otherwise head params always fall
-        # through to BF16 passthrough regardless of what the allocator
-        # chose for them.
+        # through to source-dtype passthrough regardless of what the
+        # allocator chose for them.
         if recipe_key.endswith(".weight"):
             recipe_key = recipe_key[:-len(".weight")]
         fmt = assignment.get(recipe_key)
@@ -2893,9 +2973,9 @@ def materialize_tensors_streaming(
                 out[out_key] = t.cpu()
             hist[("head", fmt)] += 1
         else:
-            dt = _passthrough_dtype(full_qname)
-            out[full_qname] = param.detach().to(dt).cpu()
-            hist[("head_passthrough", "FP32" if dt == torch.float32 else "BF16")] += 1
+            out[full_qname], label = _passthrough_tensor(
+                full_qname, param, source_dtype_by_name)
+            hist[("head_passthrough", label)] += 1
 
     for name, p in model.named_parameters():
         if p.is_meta:
@@ -2916,9 +2996,9 @@ def materialize_tensors_streaming(
                 continue
             if full in out:
                 continue
-            dt = _passthrough_dtype(full)
-            out[full] = buf.detach().to(dt).cpu()
-            hist[("head_buffer", "FP32" if dt == torch.float32 else "BF16")] += 1
+            out[full], label = _passthrough_tensor(
+                full, buf, source_dtype_by_name)
+            hist[("head_buffer", label)] += 1
     print(f"[export-stream] head+embed+norm+lm_head passthrough: "
           f"{time.time()-t_head:.1f}s  keys={len(out)}", flush=True)
     if tensor_sink is not None:
@@ -3161,17 +3241,19 @@ def materialize_tensors_streaming(
                 if kind == "router":
                     if not mod.weight.is_meta:
                         w_shrunk = _shrink_router_weight(mod, p_entry)
-                        out[f"{full}.weight"] = w_shrunk.to(torch.bfloat16).cpu()
+                        out[f"{full}.weight"], label = _passthrough_tensor(
+                            f"{full}.weight", w_shrunk, source_dtype_by_name)
                         if mod.bias is not None and not mod.bias.is_meta:
                             b_idx = torch.as_tensor(
                                 p_entry["kept_expert_ids"], dtype=torch.long,
                                 device=mod.bias.device,
                             )
-                            out[f"{full}.bias"] = (
-                                mod.bias.detach().index_select(0, b_idx)
-                                .to(torch.bfloat16).cpu()
+                            out[f"{full}.bias"], _ = _passthrough_tensor(
+                                f"{full}.bias",
+                                mod.bias.detach().index_select(0, b_idx),
+                                source_dtype_by_name,
                             )
-                        hist[("linear", "BF16_router_shrunk")] += 1
+                        hist[("linear", f"{label}_router_shrunk")] += 1
                         covered.add(full)
                     continue
                 if kind == "drop":
@@ -3190,21 +3272,36 @@ def materialize_tensors_streaming(
             fmt = assignment.get(recipe_key)
             if fmt is not None:
                 fmt = _canonical_export_format(fmt)
+            source_weight_key = f"{full}.weight"
+            source_weight_dtype = source_dtype_by_name.get(source_weight_key)
+            source_is_fp8_scaled = (
+                source_weight_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and source_weight_key in fp8_scale_inv_map
+            )
+            if (source_is_fp8_scaled
+                    and (fmt is None
+                         or fmt == "BF16"
+                         or recipe_key in bf16_passthrough)):
+                fmt = "FP8_SOURCE"
             if fmt is None:
-                # No assignment → BF16 passthrough.
+                # No assignment -> source-dtype passthrough.
                 if not mod.weight.is_meta:
-                    out[f"{emit_full}.weight"] = mod.weight.detach().to(torch.bfloat16).cpu()
+                    out[f"{emit_full}.weight"], label = _passthrough_tensor(
+                        source_weight_key, mod.weight, source_dtype_by_name)
                     if mod.bias is not None and not mod.bias.is_meta:
-                        out[f"{emit_full}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
-                    hist[("linear", "BF16")] += 1
+                        out[f"{emit_full}.bias"], _ = _passthrough_tensor(
+                            f"{full}.bias", mod.bias, source_dtype_by_name)
+                    hist[("linear", label)] += 1
                     covered.add(full)
                 continue
 
             if fmt == "BF16" or recipe_key in bf16_passthrough:
-                out[f"{emit_full}.weight"] = mod.weight.detach().to(torch.bfloat16).cpu()
+                out[f"{emit_full}.weight"], label = _passthrough_tensor(
+                    source_weight_key, mod.weight, source_dtype_by_name)
                 if mod.bias is not None:
-                    out[f"{emit_full}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
-                hist[("linear", "BF16")] += 1
+                    out[f"{emit_full}.bias"], _ = _passthrough_tensor(
+                        f"{full}.bias", mod.bias, source_dtype_by_name)
+                hist[("linear", label)] += 1
                 covered.add(full)
                 continue
 
@@ -3252,8 +3349,8 @@ def materialize_tensors_streaming(
                 out[f"{emit_full}.weight_scale"] = w_scale.to(
                     torch.float32).cpu().contiguous()
                 if mod.bias is not None and not mod.bias.is_meta:
-                    out[f"{emit_full}.bias"] = mod.bias.detach().to(
-                        torch.bfloat16).cpu()
+                    out[f"{emit_full}.bias"], _ = _passthrough_tensor(
+                        f"{full}.bias", mod.bias, source_dtype_by_name)
                 hist[("linear", "FP8_SOURCE")] += 1
                 covered.add(full)
                 continue
@@ -3313,7 +3410,8 @@ def materialize_tensors_streaming(
             for suffix, t in compressed.items():
                 out[f"{emit_full}.{suffix}"] = t.cpu()
             if mod.bias is not None:
-                out[f"{emit_full}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
+                out[f"{emit_full}.bias"], _ = _passthrough_tensor(
+                    f"{full}.bias", mod.bias, source_dtype_by_name)
             hist[("linear", fmt)] += 1
             covered.add(full)
 
@@ -3339,8 +3437,8 @@ def materialize_tensors_streaming(
                             piece = piece.reshape(1)
                         out[f"{emit_full}.{suffix}"] = piece.cpu()
                     if mod.bias is not None:
-                        out[f"{emit_full}.bias"] = mod.bias.detach().to(
-                            torch.bfloat16).cpu()
+                        out[f"{emit_full}.bias"], _ = _passthrough_tensor(
+                            f"{full}.bias", mod.bias, source_dtype_by_name)
                     hist[("linear", fmt)] += 1
                     covered.add(full)
                 del compressed_batch
@@ -3367,8 +3465,8 @@ def materialize_tensors_streaming(
                         for suffix, t in compressed.items():
                             out[f"{emit_full}.{suffix}"] = t.cpu()
                         if mod.bias is not None:
-                            out[f"{emit_full}.bias"] = mod.bias.detach().to(
-                                torch.bfloat16).cpu()
+                            out[f"{emit_full}.bias"], _ = _passthrough_tensor(
+                                f"{full}.bias", mod.bias, source_dtype_by_name)
                         hist[("linear", "NVFP4")] += 1
                         covered.add(full)
 
@@ -3523,8 +3621,9 @@ def materialize_tensors_streaming(
                 for suffix, t in compressed.items():
                     out[f"{emit_full}.{suffix}"] = t.cpu()
                 if p["mod"].bias is not None:
-                    out[f"{emit_full}.bias"] = p["mod"].bias.detach().to(
-                        torch.bfloat16).cpu()
+                    out[f"{emit_full}.bias"], _ = _passthrough_tensor(
+                        f"{p['full']}.bias", p["mod"].bias,
+                        source_dtype_by_name)
                 hist[("linear", "NVFP4_block_match")] += 1
                 covered.add(p["full"])
 
@@ -3559,7 +3658,8 @@ def materialize_tensors_streaming(
                         f"to read per-expert `.weight` + "
                         f"`.weight_scale_inv` from source and emit the "
                         f"per-expert compressed-tensors pairs.")
-                packed_param = getattr(mod, pn).detach().float()
+                packed_param_src = getattr(mod, pn).detach()
+                packed_param = packed_param_src.float()
                 E, M, N = packed_param.shape
                 if pn == "gate_up_proj":
                     half = M // 2
@@ -3611,13 +3711,15 @@ def materialize_tensors_streaming(
                             [o for o, _ in iter_experts],
                             dtype=torch.long, device=packed_param.device,
                         )
-                        shrunk = packed_param.index_select(0, kept_idx)
-                        out[f"{disk_qname}.{pn}"] = shrunk.to(torch.bfloat16).cpu()
+                        shrunk = packed_param_src.index_select(0, kept_idx)
+                        out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
+                            full, shrunk, source_dtype_by_name)
                     else:
-                        out[f"{disk_qname}.{pn}"] = packed_param.to(torch.bfloat16).cpu()
+                        out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
+                            full, packed_param_src, source_dtype_by_name)
                     covered.add(full)
-                    hist[("packed_moe", "BF16" if is_bf16 else fmt)] += 1
-                    del packed_param
+                    hist[("packed_moe", label if is_bf16 else fmt)] += 1
+                    del packed_param, packed_param_src
                     continue
 
                 # Per-expert joint global scale when NVFP4 splits gate+up.
@@ -3636,7 +3738,8 @@ def materialize_tensors_streaming(
                         expert_2d = sub_packed[orig_e]
                         base = f"{disk_qname}.{new_e}.{proj_name}"
                         if is_bf16:
-                            out[f"{base}.weight"] = expert_2d.to(torch.bfloat16).cpu()
+                            out[f"{base}.weight"], label = _passthrough_tensor(
+                                full, expert_2d, source_dtype_by_name)
                         else:
                             compressed = _quantize_2d(
                                 expert_2d, fmt,
@@ -3648,12 +3751,12 @@ def materialize_tensors_streaming(
                                        else f"{base}.{suffix}")
                                 out[key] = t.cpu()
                 covered.add(full)
-                hist[("packed_moe_per_expert", "BF16" if is_bf16 else fmt)] += 1
+                hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
                 if prune_entry is not None:
                     hist[("packed_moe_pruned", "experts")] += (
                         E - prune_entry["num_experts_kept"]
                     )
-                del packed_param, proj_split
+                del packed_param, packed_param_src, proj_split
 
         # 3e. Remaining layer-scoped params (norms, conv1d, biases on
         # passthrough-only modules) and persistent buffers.
@@ -3677,9 +3780,9 @@ def materialize_tensors_streaming(
                 if kind == "drop":
                     continue
                 if kind == "reindex":
-                    dt = _passthrough_dtype(p_entry["new_full"])
-                    out[p_entry["new_full"]] = param.detach().to(dt).cpu()
-                    hist[("layer_passthrough", "FP32" if dt == torch.float32 else "BF16")] += 1
+                    out[p_entry["new_full"]], label = _passthrough_tensor(
+                        full, param, source_dtype_by_name)
+                    hist[("layer_passthrough", label)] += 1
                     continue
             # Router-weight shrink for non-Linear routers. Qwen3.5's
             # `Qwen3_5MoeTopKRouter` is a bare nn.Module with a `.weight`
@@ -3699,12 +3802,13 @@ def materialize_tensors_streaming(
                         device=param.device,
                     )
                     shrunk = param.detach().index_select(0, idx).contiguous()
-                    out[full] = shrunk.to(torch.bfloat16).cpu()
-                    hist[("router_weight_shrunk", "BF16")] += 1
+                    out[full], label = _passthrough_tensor(
+                        full, shrunk, source_dtype_by_name)
+                    hist[("router_weight_shrunk", label)] += 1
                     continue
-            dt = _passthrough_dtype(full)
-            out[full] = param.detach().to(dt).cpu()
-            hist[("layer_passthrough", "FP32" if dt == torch.float32 else "BF16")] += 1
+            out[full], label = _passthrough_tensor(
+                full, param, source_dtype_by_name)
+            hist[("layer_passthrough", label)] += 1
         for mod_name, mod in layer_mod.named_modules():
             non_persistent = getattr(mod, "_non_persistent_buffers_set", set())
             for buf_name, buf in mod.named_buffers(recurse=False):
@@ -3733,12 +3837,13 @@ def materialize_tensors_streaming(
                             device=buf.device,
                         )
                         shrunk = buf.detach().index_select(0, b_idx).contiguous()
-                        out[full] = shrunk.to(torch.bfloat16).cpu()
-                        hist[("layer_buffer_shrunk", "BF16")] += 1
+                        out[full], label = _passthrough_tensor(
+                            full, shrunk, source_dtype_by_name)
+                        hist[("layer_buffer_shrunk", label)] += 1
                         continue
-                dt = _passthrough_dtype(full)
-                out[full] = buf.detach().to(dt).cpu()
-                hist[("layer_buffer", "BF16")] += 1
+                out[full], label = _passthrough_tensor(
+                    full, buf, source_dtype_by_name)
+                hist[("layer_buffer", label)] += 1
 
         # 3f. Unload.
         _unload(model, [f"{layers_prefix}{L}."])
@@ -3815,11 +3920,13 @@ def _materialize_tensors_inmemory(
         if fmt is None:
             continue
         if fmt == "BF16" or fmt_key in bf16_passthrough:
-            out[f"{qname}.weight"] = mod.weight.detach().to(torch.bfloat16).cpu()
+            out[f"{qname}.weight"], label = _passthrough_tensor(
+                f"{qname}.weight", mod.weight)
             if mod.bias is not None:
-                out[f"{qname}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
+                out[f"{qname}.bias"], _ = _passthrough_tensor(
+                    f"{qname}.bias", mod.bias)
             covered.add(qname)
-            hist[("linear", "BF16")] += 1
+            hist[("linear", label)] += 1
             continue
         joint = nvfp4_joint_global.get(fmt_key) if fmt == "NVFP4" else None
         compressed = _quantize_2d(
@@ -3830,7 +3937,8 @@ def _materialize_tensors_inmemory(
         for suffix, tensor in compressed.items():
             out[f"{qname}.{suffix}"] = tensor.cpu()
         if mod.bias is not None:
-            out[f"{qname}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
+            out[f"{qname}.bias"], _ = _passthrough_tensor(
+                f"{qname}.bias", mod.bias)
         covered.add(qname)
         hist[("linear", fmt)] += 1
 
@@ -3845,7 +3953,8 @@ def _materialize_tensors_inmemory(
                 fmt = _canonical_export_format(fmt)
             if fmt is None:
                 continue
-            packed_param = getattr(mod, pn).detach().float()
+            packed_param_src = getattr(mod, pn).detach()
+            packed_param = packed_param_src.float()
             E, M, N = packed_param.shape
             if pn == "gate_up_proj":
                 half = M // 2
@@ -3863,9 +3972,10 @@ def _materialize_tensors_inmemory(
             should_split = profile.split_packed_experts_for_format(fmt)
 
             if not should_split:
-                out[f"{disk_qname}.{pn}"] = packed_param.to(torch.bfloat16).cpu()
+                out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
+                    full_name, packed_param_src)
                 covered.add(full_name)
-                hist[("packed_moe", "BF16" if is_bf16 else fmt)] += 1
+                hist[("packed_moe", label if is_bf16 else fmt)] += 1
                 continue
 
             per_expert_joint: list[torch.Tensor | None] = [None] * E
@@ -3884,7 +3994,8 @@ def _materialize_tensors_inmemory(
                     expert_2d = sub_packed[e]
                     base = f"{disk_qname}.{e}.{proj_name}"
                     if is_bf16:
-                        out[f"{base}.weight"] = expert_2d.to(torch.bfloat16).cpu()
+                        out[f"{base}.weight"], label = _passthrough_tensor(
+                            full_name, expert_2d)
                     else:
                         compressed = _quantize_2d(
                             expert_2d, fmt,
@@ -3894,16 +4005,15 @@ def _materialize_tensors_inmemory(
                             key = base if suffix == "weight" else f"{base}.{suffix}"
                             out[key] = tensor.cpu()
             covered.add(full_name)
-            hist[("packed_moe_per_expert", "BF16" if is_bf16 else fmt)] += 1
+            hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
 
     for name, p in model.named_parameters():
         if any(name.startswith(c + ".") or name == c for c in covered):
             continue
         if name in out:
             continue
-        dt = _passthrough_dtype(name)
-        out[name] = p.detach().to(dt).cpu()
-        hist[("passthrough", "FP32" if dt == torch.float32 else "BF16")] += 1
+        out[name], label = _passthrough_tensor(name, p)
+        hist[("passthrough", label)] += 1
 
     for mod_name, mod in model.named_modules():
         non_persistent = getattr(mod, "_non_persistent_buffers_set", set())
@@ -3915,9 +4025,8 @@ def _materialize_tensors_inmemory(
                 continue
             if full in out:
                 continue
-            dt = _passthrough_dtype(full)
-            out[full] = buf.detach().to(dt).cpu()
-            hist[("passthrough_buffer", "FP32" if dt == torch.float32 else "BF16")] += 1
+            out[full], label = _passthrough_tensor(full, buf)
+            hist[("passthrough_buffer", label)] += 1
 
     return out, dict(hist)
 
@@ -5278,6 +5387,8 @@ def write_config_with_quantization(
     extra_ignore: Iterable[str] = (),
     prune_manifest: dict[str, dict] | None = None,
 ) -> None:
+    if prune_manifest:
+        raise_expert_prune_disabled("write config prune manifest")
     from .model_profiles import detect_profile
     profile = detect_profile(src_model)
     src_cfg_path = Path(src_model) / "config.json"

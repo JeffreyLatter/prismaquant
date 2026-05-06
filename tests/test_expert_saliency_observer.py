@@ -81,6 +81,12 @@ class _DummyMoeLayer(nn.Module):
         return out
 
 
+def _dummy_expert_forward_no_hooks(expert: _DummyExpert, x: torch.Tensor) -> torch.Tensor:
+    gate = F.linear(x, expert.gate_proj.weight, expert.gate_proj.bias)
+    up = F.linear(x, expert.up_proj.weight, expert.up_proj.bias)
+    return F.linear(F.silu(gate) * up, expert.down_proj.weight, expert.down_proj.bias)
+
+
 def _compute_reference_saliency(
     layer: _DummyMoeLayer,
     x: torch.Tensor,
@@ -89,7 +95,9 @@ def _compute_reference_saliency(
 
     Returns (mean_saliency, max_saliency, active_count).
     """
-    logits = layer.gate(x)
+    # Avoid calling the hooked router again while computing the
+    # reference route stats.
+    logits = F.linear(x, layer.gate.weight, layer.gate.bias)
     topk_v, topk_i = logits.topk(layer.top_k, dim=-1)
     probs = F.softmax(topk_v, dim=-1)
     means: dict[int, float] = {}
@@ -105,7 +113,7 @@ def _compute_reference_saliency(
             maxes[e] = 0.0
             counts[e] = 0
             continue
-        f_e = layer.experts[e](x[active])
+        f_e = _dummy_expert_forward_no_hooks(layer.experts[e], x[active])
         norms = f_e.to(torch.float64).norm(dim=-1)
         g_active = gate_e[active].to(torch.float64)
         contrib = g_active * norms
@@ -193,19 +201,25 @@ def test_saliency_reap_dropout_matches_reference():
     with torch.no_grad():
         _ = layer(x)
 
-    logits = layer.gate(x)
+    # Avoid calling the hooked router again while computing the
+    # reference route stats.
+    logits = F.linear(x, layer.gate.weight, layer.gate.bias)
     topk_v, topk_i = logits.topk(layer.top_k, dim=-1)
     probs = F.softmax(topk_v, dim=-1)
     expected = {}
+    expected_mass = {}
+    expected_active_count = {}
     for e in range(layer.num_experts):
         gate_e = torch.zeros(x.size(0), dtype=probs.dtype)
         for k in range(layer.top_k):
             gate_e = torch.where(topk_i[:, k] == e, probs[:, k], gate_e)
         active = gate_e > 0
+        expected_mass[e] = float(gate_e.to(torch.float64).sum().item())
+        expected_active_count[e] = int(active.sum().item())
         if not active.any():
             expected[e] = 0.0
             continue
-        f_e = layer.experts[e](x[active])
+        f_e = _dummy_expert_forward_no_hooks(layer.experts[e], x[active])
         norms = f_e.to(torch.float64).norm(dim=-1)
         expected[e] = float(
             (gate_e[active].to(torch.float64) * norms.pow(2)).sum().item()
@@ -216,6 +230,20 @@ def test_saliency_reap_dropout_matches_reference():
     for e in range(n_experts):
         assert got[e] == pytest.approx(expected[e], abs=1e-10, rel=1e-8), (
             e, got[e], expected[e]
+        )
+    route_counts = tracker.router_counts()["mlp.gate"]
+    route_active = tracker.router_active_counts()["mlp.gate"]
+    route_totals = tracker.router_totals()
+    route_stats = tracker.route_stats()["mlp.gate"]
+    assert route_totals["mlp.gate"] == x.shape[0]
+    assert route_stats["total_tokens"] == x.shape[0]
+    for e in range(n_experts):
+        assert route_counts[str(e)] == pytest.approx(
+            expected_mass[e], abs=1e-10, rel=1e-8
+        )
+        assert route_active[str(e)] == expected_active_count[e]
+        assert route_stats["prob"][str(e)] == pytest.approx(
+            expected_mass[e] / x.shape[0], abs=1e-10, rel=1e-8,
         )
     tracker.remove_hooks()
 
@@ -452,6 +480,11 @@ def test_packed_saliency_patched_forward_matches_reference():
     # precision (we accumulate in fp64 in both).
     got_mean = tracker.saliency(reduction="mean")["mlp.gate"]
     got_max = tracker.saliency(reduction="max")["mlp.gate"]
+    route_counts = tracker.router_counts()["mlp.gate"]
+    route_active = tracker.router_active_counts()["mlp.gate"]
+    assert tracker.router_totals()["mlp.gate"] == x.shape[0]
+    assert sum(route_counts.values()) == pytest.approx(x.shape[0], rel=1e-8)
+    assert sum(route_active.values()) == x.shape[0] * top_k
     for e in range(n_experts):
         assert got_mean[e] == pytest.approx(ref_mean[e], abs=1e-10, rel=1e-8), (
             e, got_mean[e], ref_mean[e]

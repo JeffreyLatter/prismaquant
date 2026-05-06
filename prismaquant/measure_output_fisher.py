@@ -182,6 +182,7 @@ def _forward_logits_with_assignment(
     work_root: Path,
     profile=None,
     use_frozen_weight_cache: bool = False,
+    production_weight_cache=None,
 ) -> list[torch.Tensor]:
     """Run forward with the given quantization assignment applied via
     PerturbedActivationCache, returning per-sample fp32 ``[T, V]`` logits.
@@ -197,6 +198,7 @@ def _forward_logits_with_assignment(
     hooks = PerturbedActivationCache(
         model, assignment, cache_dir,
         input_rows=0, cal_hash=cal_hash, profile=profile,
+        production_weight_cache=production_weight_cache,
     )
     out: list[torch.Tensor] = []
     try:
@@ -308,6 +310,7 @@ def collect_output_fisher(
     include_activation_quant: bool = True,
     use_frozen_weight_cache: bool = False,
     center_assignment: Mapping[str, str] | None = None,
+    production_weight_cache=None,
 ) -> dict:
     """Build the Output-Fisher Block-CLADO payload.
 
@@ -393,6 +396,7 @@ def collect_output_fisher(
                 work_root=cache_dir,
                 profile=profile,
                 use_frozen_weight_cache=use_frozen_weight_cache,
+                production_weight_cache=production_weight_cache,
             )
             centered_probs: list[torch.Tensor] = [
                 torch.softmax(z, dim=-1) for z in z_centered
@@ -474,6 +478,7 @@ def collect_output_fisher(
                             work_root=cache_dir,
                             profile=profile,
                             use_frozen_weight_cache=use_frozen_weight_cache,
+                            production_weight_cache=production_weight_cache,
                         )
                     except Exception as exc:
                         if progress_callback is not None:

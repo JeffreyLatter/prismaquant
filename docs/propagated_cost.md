@@ -175,7 +175,7 @@ Useful tuning flags:
 CUDA graph capture is opportunistic by default. `PRISMAQUANT_L3_CUDA_GRAPHS`,
 `PRISMAQUANT_COORD_LANE_CUDA_GRAPHS`, and `PRISMAQUANT_KL_CUDA_GRAPHS` accept
 `auto`/unset, `1`, or `0`. Auto mode avoids graphing one-shot flip batches
-because capture warmup dominates on the Qwen 4B PrismaClade L3 workload.
+because capture warmup dominates on the Qwen 4B PrismaSCOUT L3 workload.
 `PRISMAQUANT_COORD_REPLAY_CACHE` is opt-in for the same reason: it can reduce
 tail forwards, but the current cache path copies too much baseline model state
 for large dense checkpoints.

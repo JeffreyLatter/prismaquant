@@ -126,6 +126,7 @@ from .allocator_prune import (
     compute_max_prune_ratio,
     expand_moe_assignment,
 )
+from .expert_prune import EXPERT_PRUNE_DISABLED_MESSAGE
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
@@ -399,15 +400,8 @@ def main():
                          "forces slower sequential serving and is noise-floor "
                          "limited at typical calibration budgets.")
     ap.add_argument("--enable-expert-prune", action="store_true",
-                    help="Joint REAP prune + quant optimization. When set, "
-                         "the allocator generates DROP-variant candidates per "
-                         "MoE super-Linear at each ratio in --prune-ratios, "
-                         "and the DP picks the best (format, prune_ratio) "
-                         "combination per layer under the bpp budget. Requires "
-                         "expert saliency in the probe pickle (emitted "
-                         "automatically since 2026-04-24; older probes have "
-                         "no-op empty saliency). The exporter drops the "
-                         "selected expert ids + shrinks the router output dim.")
+                    help="Archived. Any use now exits with an error; expert "
+                         "pruning via REAP is disabled for shipping artifacts.")
     ap.add_argument("--prune-ratios",
                     default="0.0,0.125,0.25,0.375,0.5",
                     help="Comma-separated candidate prune ratios per MoE "
@@ -420,6 +414,14 @@ def main():
                          "loss estimate for the expert. Smaller α makes "
                          "pruning cheaper (the DP prunes more aggressively); "
                          "larger α protects experts.")
+    ap.add_argument("--expert-route-floor-mass", type=float, default=4.0,
+                    help="Minimum weighted routed-token mass used when "
+                         "pricing expert DROP candidates. New probes emit "
+                         "router_counts/router_totals; when available, a "
+                         "low-mass expert's REAP score is evaluated at "
+                         "least this many routed-token equivalents so rare "
+                         "or unseen experts are not treated as free drops "
+                         "from tiny calibration samples. Set 0 to disable.")
     ap.add_argument("--prune-domain-policy",
                     choices=["global", "union", "intersection", "mean"],
                     default="global",
@@ -479,6 +481,8 @@ def main():
                          "the Phase 1 path: every visual Linear gets "
                          "--visual-format regardless of what's in the probe.")
     args = ap.parse_args()
+    if args.enable_expert_prune:
+        raise SystemExit(f"[alloc] {EXPERT_PRUNE_DISABLED_MESSAGE}")
 
     if args.threads > 0:
         import os
@@ -603,6 +607,8 @@ def main():
     # format-only candidates when either is empty.
     probe_expert_saliency = probe.get("expert_saliency", {}) if args.enable_expert_prune else {}
     probe_expert_info = probe.get("expert_info", {}) if args.enable_expert_prune else {}
+    probe_router_counts = probe.get("router_counts", {}) if args.enable_expert_prune else {}
+    probe_router_totals = probe.get("router_totals", {}) if args.enable_expert_prune else {}
     # v21: when the probe carries per-domain saliency (multi-chunk
     # probe with domain-tagged calibration), apply the user's
     # cross-domain policy. Default `global` returns the legacy
@@ -662,8 +668,15 @@ def main():
         print(
             f"[alloc] expert-prune ENABLED: saliency routers="
             f"{n_routers_with_saliency}, sweep ratios={global_ratio_sweep}, "
-            f"top_k={top_k}, alpha={args.prune_alpha}", flush=True,
+            f"top_k={top_k}, alpha={args.prune_alpha}, "
+            f"route_floor_mass={args.expert_route_floor_mass}", flush=True,
         )
+        if args.expert_route_floor_mass > 0 and not probe_router_counts:
+            print(
+                "[alloc] expert-prune route floor requested, but probe has "
+                "no router_counts; falling back to raw REAP saliency.",
+                flush=True,
+            )
 
     # Nested-MoE aggregation with per-layer prune variants (research
     # path). For packed-3D models `aggregate_moe_candidates` is a
@@ -674,6 +687,9 @@ def main():
             calibrated_gains=calibrated_gains,
             expert_saliency=probe_expert_saliency,
             expert_info=probe_expert_info,
+            router_counts=probe_router_counts,
+            router_totals=probe_router_totals,
+            route_floor_mass=args.expert_route_floor_mass,
             prune_ratios=(),  # packed-3D path handles prune below
             prune_alpha=args.prune_alpha,
             source_manifest=source_manifest)
@@ -685,6 +701,9 @@ def main():
             calibrated_gains=calibrated_gains,
             expert_saliency=probe_expert_saliency,
             expert_info=probe_expert_info,
+            router_counts=probe_router_counts,
+            router_totals=probe_router_totals,
+            route_floor_mass=args.expert_route_floor_mass,
             prune_ratios=user_prune_ratios,
             prune_alpha=args.prune_alpha,
             source_manifest=source_manifest)
@@ -746,6 +765,9 @@ def main():
             apply_global_prune_ratio(
                 c, stats, probe_expert_saliency,
                 global_ratio=R, prune_alpha=args.prune_alpha,
+                router_counts=probe_router_counts,
+                router_totals=probe_router_totals,
+                route_floor_mass=args.expert_route_floor_mass,
             )
         else:
             c = candidates
@@ -897,6 +919,9 @@ def main():
         prune_manifest, prune_warnings = build_prune_manifest(
             pruned_map, stats, probe_expert_info,
             expert_saliency=probe_expert_saliency,
+            router_counts=probe_router_counts,
+            router_totals=probe_router_totals,
+            route_floor_mass=args.expert_route_floor_mass,
             uniform_kept=uniform_kept,
         )
         if uniform_kept:

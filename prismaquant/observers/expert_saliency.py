@@ -184,6 +184,12 @@ class ExpertSaliencyTracker:
         # per-expert; every token contributes to the router's total
         # regardless of which top-k set included a given expert.
         self.total_tokens_by_router: dict[str, torch.Tensor] = {}
+        # Route-mass traces used by the allocator as a confidence prior
+        # when deciding whether a low observed REAP score is reliable.
+        # `route_mass[j] = Σ_t g_j(t)` over selected top-k entries;
+        # `route_count[j]` is the unweighted number of top-k selections.
+        self.route_mass: dict[str, torch.Tensor] = {}
+        self.route_count: dict[str, torch.Tensor] = {}
         # Transient per-forward cache. Populated by the router hook,
         # consumed by each expert's hook that fires afterward in the
         # same layer's forward.
@@ -347,6 +353,12 @@ class ExpertSaliencyTracker:
         self.total_tokens_by_router[router_qname] = torch.zeros(
             (), dtype=torch.int64, device=device,
         )
+        self.route_mass[router_qname] = torch.zeros(
+            num, dtype=torch.float64, device=device,
+        )
+        self.route_count[router_qname] = torch.zeros(
+            num, dtype=torch.int64, device=device,
+        )
 
     def _make_router_hook(self, router_qname: str) -> Callable:
         softmax_dtype = self.softmax_dtype
@@ -373,6 +385,18 @@ class ExpertSaliencyTracker:
             acc_total = self.total_tokens_by_router.get(router_qname)
             if acc_total is not None:
                 acc_total += flat.size(0)
+            acc_route_mass = self.route_mass.get(router_qname)
+            acc_route_count = self.route_count.get(router_qname)
+            if acc_route_mass is not None and acc_route_count is not None:
+                acc_route_mass.add_(torch.bincount(
+                    topk_i.reshape(-1),
+                    weights=probs.reshape(-1).to(torch.float64),
+                    minlength=acc_route_mass.numel(),
+                ))
+                acc_route_count.add_(torch.bincount(
+                    topk_i.reshape(-1),
+                    minlength=acc_route_count.numel(),
+                ).to(torch.int64))
 
         return hook
 
@@ -599,9 +623,85 @@ class ExpertSaliencyTracker:
                 "sum_g_norm": self.sum_g_norm[qname].clone(),
                 "count": self.count[qname].clone(),
                 "max_g_norm": self.max_g_norm[qname].clone(),
+                "sum_g_norm_sq": self.sum_g_norm_sq[qname].clone(),
+                "route_mass": self.route_mass[qname].clone(),
+                "route_count": self.route_count[qname].clone(),
+                "total_tokens": self.total_tokens_by_router[qname].clone(),
             }
             for qname in self.sum_g_norm
         }
+
+    def router_counts(self) -> dict[str, dict[str, float]]:
+        """Return weighted routed-token mass per router/expert.
+
+        Shape matches the legacy probe field `router_counts`:
+        `{router_qname: {expert_id_str: Σ topk_prob}}`.
+        """
+        out: dict[str, dict[str, float]] = {}
+        qnames = set(self._num_experts_by_router) | set(self.route_mass)
+        for qname in qnames:
+            mass = self.route_mass.get(qname)
+            num_experts = self._num_experts_by_router.get(
+                qname, mass.numel() if mass is not None else 0,
+            )
+            if mass is None:
+                mass_cpu = torch.zeros(num_experts, dtype=torch.float64)
+            else:
+                mass_cpu = mass.detach().to("cpu")
+            out[qname] = {
+                str(e): float(mass_cpu[e].item())
+                for e in range(num_experts)
+            }
+        return out
+
+    def router_active_counts(self) -> dict[str, dict[str, int]]:
+        """Return unweighted top-k selection counts per router/expert."""
+        out: dict[str, dict[str, int]] = {}
+        qnames = set(self._num_experts_by_router) | set(self.route_count)
+        for qname in qnames:
+            counts = self.route_count.get(qname)
+            num_experts = self._num_experts_by_router.get(
+                qname, counts.numel() if counts is not None else 0,
+            )
+            if counts is None:
+                counts_cpu = torch.zeros(num_experts, dtype=torch.int64)
+            else:
+                counts_cpu = counts.detach().to("cpu")
+            out[qname] = {
+                str(e): int(counts_cpu[e].item())
+                for e in range(num_experts)
+            }
+        return out
+
+    def router_totals(self) -> dict[str, int]:
+        """Return total calibration tokens seen per router."""
+        out: dict[str, int] = {}
+        qnames = set(self._num_experts_by_router) | set(self.total_tokens_by_router)
+        for qname in qnames:
+            total = self.total_tokens_by_router.get(qname)
+            out[qname] = int(total.detach().to("cpu").item()) if total is not None else 0
+        return out
+
+    def route_stats(self) -> dict[str, dict]:
+        """Return a compact router trace for diagnostics and downstream
+        allocator priors."""
+        totals = self.router_totals()
+        masses = self.router_counts()
+        active_counts = self.router_active_counts()
+        out: dict[str, dict] = {}
+        for qname, by_eid in masses.items():
+            total = int(totals.get(qname, 0))
+            denom = max(total, 1)
+            out[qname] = {
+                "total_tokens": total,
+                "mass": by_eid,
+                "active_count": active_counts.get(qname, {}),
+                "prob": {
+                    eid: float(mass) / denom
+                    for eid, mass in by_eid.items()
+                },
+            }
+        return out
 
     def registered_experts(self) -> dict[str, list[int]]:
         """Return the (router_qname -> sorted expert_ids) map that was
@@ -637,11 +737,23 @@ def _qwen3_5_moe_experts_saliency_forward(
         acc_max = tracker.max_g_norm.get(router_qname)
         acc_sum_sq = tracker.sum_g_norm_sq.get(router_qname)
         acc_total = tracker.total_tokens_by_router.get(router_qname)
+        acc_route_mass = tracker.route_mass.get(router_qname)
+        acc_route_count = tracker.route_count.get(router_qname)
         # For the packed path we hook the experts module directly — no
         # router hook fires for us. Increment the token total here,
         # once per forward.
         if acc_total is not None:
             acc_total += hidden_states.shape[0]
+        if acc_route_mass is not None and acc_route_count is not None:
+            acc_route_mass.add_(torch.bincount(
+                top_k_index.reshape(-1),
+                weights=top_k_weights.reshape(-1).to(torch.float64),
+                minlength=acc_route_mass.numel(),
+            ))
+            acc_route_count.add_(torch.bincount(
+                top_k_index.reshape(-1),
+                minlength=acc_route_count.numel(),
+            ).to(torch.int64))
     else:
         acc_sum = acc_count = acc_max = acc_sum_sq = None
 

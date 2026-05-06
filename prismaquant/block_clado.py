@@ -183,6 +183,158 @@ def fused_group_key(profile, qname: str) -> str:
     return qname
 
 
+def _recipe_name(full_name: str) -> str:
+    return full_name[:-7] if full_name.endswith(".weight") else full_name
+
+
+def _enumerate_quantizable_linears(model) -> list[str]:
+    from .build_rtn_cache import iter_quantizable_tensors
+    names: list[str] = []
+    for full_name, _module, _attr in iter_quantizable_tensors(model):
+        names.append(_recipe_name(full_name))
+    return sorted(set(names))
+
+
+def _shape_of_param(model, qname: str) -> tuple[int, ...] | None:
+    from .build_rtn_cache import iter_quantizable_tensors
+    target = qname
+    for full_name, module, attr in iter_quantizable_tensors(model):
+        if _recipe_name(full_name) == target:
+            param = getattr(module, attr, None)
+            if param is None:
+                return None
+            return tuple(int(v) for v in param.shape)
+    return None
+
+
+def _prod(seq: Iterable[int]) -> int:
+    out = 1
+    for v in seq:
+        out *= int(v)
+    return out
+
+
+def discover_units(
+    model,
+    profile,
+    formats: Sequence["fr.FormatSpec"],
+) -> tuple[
+    dict[str, list["DecisionUnit"]],
+    list["DecisionUnit"],
+    dict[str, int],
+]:
+    """Build the {block_id → [DecisionUnit]} dict directly from the model.
+
+    No measurement — just sibling-fusion + format-menu enumeration.  Each
+    unit's ``options`` carry ``omega_ii=0.0`` because the polish pipeline
+    gates on real-KL and doesn't need the surrogate.
+
+    Returns:
+      blocks:     transformer-block decision units
+      singletons: lm_head/embed/MTP/etc. (one option set per unit)
+      n_params_by_unit: param counts for telemetry / total-bpp computation
+    """
+    qnames = _enumerate_quantizable_linears(model)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for qname in qnames:
+        key = fused_group_key(profile, qname)
+        groups[key].append(qname)
+
+    blocks: dict[str, list[DecisionUnit]] = defaultdict(list)
+    singletons: list[DecisionUnit] = []
+    n_params_by_unit: dict[str, int] = {}
+
+    for group_name, members in sorted(groups.items()):
+        members = sorted(set(members))
+        block_ids = [block_id_from_qname(m) for m in members]
+        block_id = max(set(block_ids), key=block_ids.count) if block_ids else group_name
+        member_shapes: list[tuple[int, ...]] = []
+        for member in members:
+            shape = _shape_of_param(model, member)
+            if shape is None:
+                continue
+            member_shapes.append(shape)
+        if not member_shapes:
+            continue
+        n_params_unit = sum(int(_prod(s)) for s in member_shapes)
+        n_params_by_unit[group_name] = n_params_unit
+
+        options = []
+        for spec in formats:
+            spec_canon = fr.canonical_format_name(spec.name)
+            mem_bytes = sum(spec.memory_bytes_for_shape(s) for s in member_shapes)
+            bits_per_param = 8.0 * mem_bytes / max(n_params_unit, 1)
+            options.append(FormatCost(
+                fmt=spec_canon,
+                omega_ii=0.0,
+                bits_per_param=float(bits_per_param),
+                memory_bytes=int(mem_bytes),
+            ))
+        options.sort(key=lambda opt: (opt.bits_per_param, opt.fmt))
+        unit = DecisionUnit(
+            name=group_name,
+            block_id=block_id,
+            member_qnames=tuple(members),
+            options=tuple(options),
+        )
+        if block_id == group_name and ".layers." not in block_id:
+            singletons.append(unit)
+        else:
+            blocks[block_id].append(unit)
+
+    pruned_blocks: dict[str, list[DecisionUnit]] = {}
+    for block_id, units in blocks.items():
+        if len(units) == 1 and ".layers." not in block_id:
+            singletons.append(units[0])
+        else:
+            pruned_blocks[block_id] = units
+    return pruned_blocks, singletons, n_params_by_unit
+
+
+def floor_assignment(
+    model,
+    profile,
+    formats: Sequence["fr.FormatSpec"],
+    *,
+    pin_to_bf16: Sequence[str] = ("lm_head",),
+) -> tuple[dict[str, str], list["DecisionUnit"]]:
+    """Build the all-min-bpp assignment, pinning specified qnames to BF16.
+
+    Returns ``(per_linear_assignment, units)`` where ``units`` is the flat
+    list usable by ``coord_descent_polish``.  The min-bpp format is chosen
+    per-unit (typically NVFP4 if available); pinned units use BF16
+    regardless of menu.
+    """
+    blocks, singletons, _np = discover_units(model, profile, formats)
+    units: list[DecisionUnit] = []
+    for unit_list in blocks.values():
+        units.extend(unit_list)
+    units.extend(singletons)
+
+    pin_tokens = list(pin_to_bf16 or [])
+    assignment: dict[str, str] = {}
+
+    def _is_pinned(unit: DecisionUnit) -> bool:
+        # MED-5: exact-token match on dotted-path components, not substring.
+        # Substring matching catches false positives like "lm_head_norm".
+        for tok in pin_tokens:
+            if tok in unit.name.split("."):
+                return True
+            for m in unit.member_qnames:
+                if tok in m.split("."):
+                    return True
+        return False
+
+    for unit in units:
+        if _is_pinned(unit):
+            chosen_fmt = "BF16"
+        else:
+            chosen_fmt = min(unit.options, key=lambda opt: opt.bits_per_param).fmt
+        for member in unit.member_qnames:
+            assignment[member] = chosen_fmt
+    return assignment, units
+
+
 def collapse_assignment_to_units(
     base_assignment: Mapping[str, str],
     units: Sequence[DecisionUnit],

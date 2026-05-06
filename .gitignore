@@ -8,3 +8,16 @@ dist/
 .env
 *.pkl
 *.log
+
+# Local reference materials (third-party papers / code; copyrighted, not to publish)
+references/
+scratch/
+
+# Personal / local-only state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Local sqlite + worktrees + scratch artifacts
+data/
+propagated-cost
+paper/scripts/gemini_review_stderr.txt

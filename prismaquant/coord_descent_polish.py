@@ -204,6 +204,8 @@ def coord_descent_polish(
     pairs_by_block: Mapping[str, Sequence[bc.BlockPair]] | None = None,
     steepest_first: bool = False,
     use_frozen_weight_cache: bool = False,
+    production_weight_cache=None,
+    pinned_units: set[str] | None = None,
     progress_callback=None,
 ) -> PolishResult:
     """Polish a starting assignment via real-KL-gated single-flip moves.
@@ -241,10 +243,28 @@ def coord_descent_polish(
             str(k): fr.canonical_format_name(str(v))
             for k, v in starting_assignment.items()
         }
+        # MED-4: validate that fused-sibling members share a format in the
+        # starting assignment.  Polish itself only flips whole units (so it
+        # *maintains* coherence after the first move), but if the caller
+        # passes in an already-incoherent assignment we'd silently start
+        # measuring a state that violates the vLLM fused-Linear contract.
+        for unit in units:
+            members = list(getattr(unit, "member_qnames", []) or [])
+            if len(members) <= 1:
+                continue
+            fmts = {current.get(m) for m in members if m in current}
+            fmts.discard(None)
+            if len(fmts) > 1:
+                raise ValueError(
+                    f"starting_assignment violates sibling consistency for "
+                    f"DecisionUnit {unit.name!r}: members {members} carry "
+                    f"formats {sorted(fmts)}"
+                )
         current_kl = measure_assignment_kl(
             model, current, calib_ids, ref_log_probs,
             work_root=work_root, profile=profile,
-            use_frozen_weight_cache=use_frozen_weight_cache, rng_seed=0,
+            use_frozen_weight_cache=use_frozen_weight_cache,
+            production_weight_cache=production_weight_cache, rng_seed=0,
         )
         n_measurements += 1
         initial_kl = float(current_kl)
@@ -283,6 +303,16 @@ def coord_descent_polish(
             # Order candidates by surrogate priority when steepest_first is
             # enabled and a pairs_by_block payload was supplied.  Otherwise
             # sweep lexicographically (greedy-best).
+            pinned = set(pinned_units or set())
+
+            def _is_pinned(unit: bc.DecisionUnit) -> bool:
+                if unit.name in pinned:
+                    return True
+                for member in getattr(unit, "member_qnames", []) or []:
+                    if member in pinned:
+                        return True
+                return False
+
             order: list[tuple[bc.DecisionUnit, "bc.FormatCost"]]
             if steepest_first and pairs_by_block is not None:
                 priority = _surrogate_candidate_priority(
@@ -290,6 +320,8 @@ def coord_descent_polish(
                 )
                 order = []
                 for unit in units:
+                    if _is_pinned(unit):
+                        continue
                     cur_fmt = _current_unit_format(current, unit)
                     if cur_fmt is None:
                         continue
@@ -301,6 +333,8 @@ def coord_descent_polish(
             else:
                 order = []
                 for unit in sorted(units, key=lambda u: u.name):
+                    if _is_pinned(unit):
+                        continue
                     cur_fmt = _current_unit_format(current, unit)
                     if cur_fmt is None:
                         continue
@@ -324,7 +358,8 @@ def coord_descent_polish(
                 trial_kl = measure_assignment_kl(
                     model, trial, calib_ids, ref_log_probs,
                     work_root=work_root, profile=profile,
-                    use_frozen_weight_cache=use_frozen_weight_cache, rng_seed=0,
+                    use_frozen_weight_cache=use_frozen_weight_cache,
+                    production_weight_cache=production_weight_cache, rng_seed=0,
                 )
                 n_measurements += 1
                 candidates_this_pass += 1

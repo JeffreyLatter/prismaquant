@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from itertools import combinations
 from math import prod
 
+import numpy as np
+
 from .allocator import Candidate, _shape_from_stats, _group_by_profile
 
 
@@ -271,6 +273,120 @@ def _pairwise_value(
     right_fmt: str,
 ) -> float:
     return float(pairwise.get(make_pair_key(left_unit, left_fmt, right_unit, right_fmt), 0.0))
+
+
+def psd_project_quadratic(
+    units: list[RefinementUnit],
+    unary: dict[str, dict[str, float]],
+    pairwise: dict[tuple[str, str, str, str], float],
+    *,
+    allowed: dict[str, tuple[UnitOption, ...]] | None = None,
+    min_eigenvalue: float = 0.0,
+    shrink_to_diagonal: float = 0.0,
+) -> tuple[dict[str, dict[str, float]], dict[tuple[str, str, str, str], float], dict]:
+    """Project sparse pair residuals to a PSD quadratic over option variables.
+
+    The local refiner represents a one-hot choice per unit and scores pair
+    residuals as ``sum_{i<j} pairwise(choice_i, choice_j)``.  For projection we
+    lift that to ``x.T @ Q @ x`` where off-diagonal entries are half the stored
+    pairwise residual, clamp negative eigenvalues, then fold diagonal terms back
+    into unary option costs.  The projection is used as a stabilizing surrogate;
+    final candidates are still validated by measured KL.
+    """
+    option_maps = _candidate_choice_maps(units, allowed)
+    option_keys: list[tuple[str, str]] = []
+    option_index: dict[tuple[str, str], int] = {}
+    for unit in sorted(units, key=lambda item: item.key):
+        for fmt in sorted(option_maps[unit.key]):
+            key = (unit.key, fmt)
+            option_index[key] = len(option_keys)
+            option_keys.append(key)
+
+    dim = len(option_keys)
+    if dim == 0:
+        return dict(unary), dict(pairwise), {
+            "enabled": True,
+            "dimension": 0,
+            "reason": "empty_option_space",
+        }
+
+    q = np.zeros((dim, dim), dtype=np.float64)
+    loaded_entries = 0
+    skipped_entries = 0
+    for key, value in pairwise.items():
+        if len(key) != 4:
+            skipped_entries += 1
+            continue
+        left_unit, left_fmt, right_unit, right_fmt = key
+        left_idx = option_index.get((left_unit, left_fmt))
+        right_idx = option_index.get((right_unit, right_fmt))
+        if left_idx is None or right_idx is None or left_idx == right_idx:
+            skipped_entries += 1
+            continue
+        q[left_idx, right_idx] += float(value) / 2.0
+        q[right_idx, left_idx] += float(value) / 2.0
+        loaded_entries += 1
+
+    q = (q + q.T) / 2.0
+    eigvals, eigvecs = np.linalg.eigh(q)
+    min_eigenvalue = max(float(min_eigenvalue), 0.0)
+    clipped = np.maximum(eigvals, min_eigenvalue)
+    projected = (eigvecs * clipped) @ eigvecs.T
+    projected = (projected + projected.T) / 2.0
+
+    shrink = min(max(float(shrink_to_diagonal), 0.0), 1.0)
+    if shrink > 0.0:
+        projected = (1.0 - shrink) * projected + shrink * np.diag(np.diag(projected))
+        projected = (projected + projected.T) / 2.0
+
+    projected_unary = {
+        unit_key: {fmt: float(value) for fmt, value in fmt_costs.items()}
+        for unit_key, fmt_costs in unary.items()
+    }
+    for idx, (unit_key, fmt) in enumerate(option_keys):
+        projected_unary.setdefault(unit_key, {})
+        projected_unary[unit_key][fmt] = (
+            float(projected_unary[unit_key].get(fmt, 0.0))
+            + float(projected[idx, idx])
+        )
+
+    projected_pairwise: dict[tuple[str, str, str, str], float] = {}
+    for left_idx, (left_unit, left_fmt) in enumerate(option_keys):
+        for right_idx in range(left_idx + 1, dim):
+            right_unit, right_fmt = option_keys[right_idx]
+            if left_unit == right_unit:
+                continue
+            value = float(2.0 * projected[left_idx, right_idx])
+            if abs(value) <= 1e-15:
+                continue
+            projected_pairwise[make_pair_key(left_unit, left_fmt, right_unit, right_fmt)] = value
+
+    original_min = float(eigvals[0]) if eigvals.size else 0.0
+    projected_eigvals = np.linalg.eigvalsh(projected)
+    meta = {
+        "enabled": True,
+        "dimension": int(dim),
+        "input_pairwise_entries": int(len(pairwise)),
+        "loaded_pairwise_entries": int(loaded_entries),
+        "skipped_pairwise_entries": int(skipped_entries),
+        "output_pairwise_entries": int(len(projected_pairwise)),
+        "negative_eigenvalues_clipped": int(np.sum(eigvals < min_eigenvalue - 1e-12)),
+        "min_eigenvalue_before": original_min,
+        "min_eigenvalue_after": (
+            float(projected_eigvals[0]) if projected_eigvals.size else 0.0
+        ),
+        "max_eigenvalue_before": (
+            float(eigvals[-1]) if eigvals.size else 0.0
+        ),
+        "max_eigenvalue_after": (
+            float(projected_eigvals[-1]) if projected_eigvals.size else 0.0
+        ),
+        "min_eigenvalue_floor": float(min_eigenvalue),
+        "shrink_to_diagonal": float(shrink),
+        "input_frobenius_norm": float(np.linalg.norm(q, ord="fro")),
+        "output_frobenius_norm": float(np.linalg.norm(projected, ord="fro")),
+    }
+    return projected_unary, projected_pairwise, meta
 
 
 def _bits_total_for_choices(

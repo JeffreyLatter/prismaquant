@@ -60,7 +60,6 @@ from .layer_streaming import (
     _make_causal_mask,
 )
 from .observers import (
-    ExpertSaliencyTracker,
     saliency_from_moe_structure,
     saliency_from_packed_moe,
 )
@@ -363,7 +362,7 @@ def build_extended_shard_regexes(
     multimodal Qwen3.5/3.6 checkpoint:
 
       - body transformer    (`model.layers.X.*`)         — N shards
-      - MTP block(s)        (`mtp.layers.X.*`)           — 1 shard typically
+      - MTP block(s)        (`mtp.fc`, `mtp.layers.X.*`) — 1 shard typically
       - visual ViT blocks   (`model.visual.blocks.X.*`)  — depth/N shards
       - lm_head             (`^lm_head$`)                — 1 shard
     """
@@ -390,8 +389,14 @@ def build_extended_shard_regexes(
             or 0
         )
         if n_mtp > 0:
-            regexes.extend(build_layer_shard_regexes(
-                n_mtp, layers_per_shard, layer_prefix="mtp.layers"))
+            mtp_regexes = build_layer_shard_regexes(
+                n_mtp, layers_per_shard, layer_prefix="mtp.layers")
+            # `mtp.fc` is a top-level MTP Linear, not under
+            # `mtp.layers.0.*`; include it in the first MTP shard so
+            # probe/cost/allocation coverage stays aligned.
+            if mtp_regexes:
+                mtp_regexes[0] = rf"(?:mtp\.fc|{mtp_regexes[0]})"
+            regexes.extend(mtp_regexes)
 
     if include_visual:
         n_vis = int(vis_cfg.get("depth") or vis_cfg.get("num_hidden_layers") or 0)
@@ -591,6 +596,11 @@ def build_shard_schedule(
         if n_mtp > 0:
             mtp_entries = _build_body_shard_entries(
                 n_mtp, body_layers_per_shard, "mtp.layers", "mtp", sidx)
+            if mtp_entries:
+                mtp_entries[0] = dataclasses.replace(
+                    mtp_entries[0],
+                    linear_include=rf"(?:mtp\.fc|{mtp_entries[0].linear_include})",
+                )
             extras.extend(mtp_entries)
             sidx += len(mtp_entries)
 
@@ -624,6 +634,35 @@ def _merge_nested_counts(dst: dict, src: dict):
         tgt = dst.setdefault(key, {})
         for sk, sv in sub.items():
             tgt[sk] = tgt.get(sk, 0.0) + float(sv)
+
+
+def _merge_nested_int_counts(dst: dict, src: dict):
+    for key, sub in src.items():
+        tgt = dst.setdefault(key, {})
+        for sk, sv in sub.items():
+            tgt[sk] = int(tgt.get(sk, 0)) + int(sv)
+
+
+def _route_stats_from_counts(
+    router_counts: dict,
+    router_totals: dict,
+    router_active_counts: dict | None = None,
+) -> dict[str, dict]:
+    active_counts = router_active_counts or {}
+    out: dict[str, dict] = {}
+    for router, counts in router_counts.items():
+        total = int(router_totals.get(router, 0) or 0)
+        denom = max(total, 1)
+        out[router] = {
+            "total_tokens": total,
+            "mass": dict(counts or {}),
+            "active_count": dict(active_counts.get(router, {}) or {}),
+            "prob": {
+                str(eid): float(mass) / denom
+                for eid, mass in (counts or {}).items()
+            },
+        }
+    return out
 
 
 def _read_pickle(path: Path) -> Any:
@@ -791,6 +830,8 @@ def synthesize_shard_from_linear_cache(
         "stats": selected,
         "router_counts": {},
         "router_totals": {},
+        "router_active_counts": {},
+        "expert_route_stats": {},
         "expert_info": {},
         "meta": {
             **dict(expected_meta),
@@ -809,11 +850,10 @@ def merge_probe_pickles(paths: list[Path], output_path: Path):
     merged_stats = {}
     merged_router_counts = {}
     merged_router_totals = defaultdict(int)
+    merged_router_active_counts = {}
     merged_expert_info = {}
-    # Each shard holds saliency for routers whose expert Linears fall
-    # within that shard's scope. Shards are disjoint (the body-shard
-    # filter by `linear_include` regex ensures this), so the merge is
-    # just a dict-union on the router_qname key — no overlap handling.
+    # REAP expert pruning is archived. Keep the compatibility field
+    # present but empty even when older shards carry saliency.
     merged_expert_saliency: dict[str, dict[int, float]] = {}
     shard_metas = []
 
@@ -827,10 +867,12 @@ def merge_probe_pickles(paths: list[Path], output_path: Path):
             raise ValueError(f"probe shards overlap on {len(overlap)} stats entries")
         merged_stats.update(data["stats"])
         _merge_nested_counts(merged_router_counts, data.get("router_counts", {}))
+        _merge_nested_int_counts(
+            merged_router_active_counts, data.get("router_active_counts", {})
+        )
         for rk, rv in data.get("router_totals", {}).items():
             merged_router_totals[rk] += int(rv)
         merged_expert_info.update(data.get("expert_info", {}))
-        merged_expert_saliency.update(data.get("expert_saliency", {}))
         shard_metas.append(data.get("meta", {}))
 
     if merged is None:
@@ -839,6 +881,10 @@ def merge_probe_pickles(paths: list[Path], output_path: Path):
     merged["stats"] = merged_stats
     merged["router_counts"] = dict(merged_router_counts)
     merged["router_totals"] = dict(merged_router_totals)
+    merged["router_active_counts"] = dict(merged_router_active_counts)
+    merged["expert_route_stats"] = _route_stats_from_counts(
+        merged_router_counts, merged_router_totals, merged_router_active_counts,
+    )
     merged["expert_info"] = merged_expert_info
     merged["expert_saliency"] = merged_expert_saliency
     merged_meta = {
@@ -989,12 +1035,9 @@ class GlobalPrecompute:
       runner filters these dicts to its own include regex.
     - `resident_act_snaps` holds (per-fqn) CPU activation snapshots for
       resident linears, used by the cost stage's ActivationIndex.
-    - `expert_saliency` is the REAP dropout-loss estimate per
-      (router_qname, expert_id), harvested via
-      `ExpertSaliencyTracker.saliency(reduction="reap_dropout")`.
-      It is populated during Phase-1 forward and empty for dense
-      models. See `prismaquant.observers.expert_saliency` for both
-      the ranking reductions and the dropout-loss formula.
+    - `expert_saliency` is retained as an empty compatibility field.
+      REAP expert pruning is archived and new probes do not emit
+      saliency suitable for expert DROP decisions.
     - `expert_info` mirrors `sensitivity_probe.discover_moe_structure`'s
       output (Linear qname -> (router_qname, expert_id_str)); the
       allocator uses it to map per-Linear quantization decisions back to
@@ -1008,6 +1051,10 @@ class GlobalPrecompute:
     resident_act_snaps: dict[str, list[torch.Tensor]]
     expert_saliency: dict[str, dict[int, float]]
     expert_info: dict[str, tuple[str, str]]
+    router_counts: dict[str, dict[str, float]]
+    router_totals: dict[str, int]
+    router_active_counts: dict[str, dict[str, int]]
+    expert_route_stats: dict[str, dict]
     # Reusable forward-state derivable from ids + model; recomputed on demand.
 
 
@@ -1047,31 +1094,19 @@ def _compute_global_precompute(
 
     # ---- Phase 1: streaming forward, cache activations on CPU ----
     #
-    # Alongside the forward we install an ExpertSaliencyTracker whose hooks
-    # fire whenever any MoE router/expert module is called. The tracker
-    # accumulates REAP dropout-loss saliency per expert — consumed later
-    # by the allocator's DROP-candidate logic. Hooks remain registered
-    # across the streaming install/unload cycle because they're bound to
-    # Python module objects, not to weight tensors. Dense models get an
-    # empty saliency dict at no cost.
+    # REAP expert pruning is archived. We still discover MoE structure
+    # for compatibility metadata, but no saliency hooks are installed
+    # and new probes emit empty expert_saliency fields.
     phase1_expert_info = discover_moe_structure(model)
-    _saliency_top_k = read_top_k(model, default=2)
     _saliency_triples = saliency_from_moe_structure(phase1_expert_info)
     _packed_moe_blocks = saliency_from_packed_moe(model)
-    saliency_tracker = (
-        ExpertSaliencyTracker(
-            model, _saliency_triples, top_k=_saliency_top_k,
-            packed_moe_blocks=_packed_moe_blocks,
+    saliency_tracker = None
+    if _saliency_triples or _packed_moe_blocks:
+        print(
+            "[incremental/global] expert-saliency tracker disabled "
+            "(REAP expert pruning archived)",
+            flush=True,
         )
-        if (_saliency_triples or _packed_moe_blocks) else None
-    )
-    if saliency_tracker is not None:
-        n_hooked = sum(len(v) for v in saliency_tracker.registered_experts().values())
-        print(f"[incremental/global] expert-saliency tracker hooked "
-              f"{n_hooked} experts across "
-              f"{len(_saliency_triples)} nested routers + "
-              f"{len(_packed_moe_blocks)} packed-3D routers "
-              f"(top_k={_saliency_top_k})", flush=True)
 
     t_phase = time.time()
     with torch.no_grad():
@@ -1147,6 +1182,10 @@ def _compute_global_precompute(
         # so the packed-prune path can use this directly as per-expert
         # prune cost with no α/h/n scaling.
         phase1_expert_saliency = saliency_tracker.saliency(reduction="reap_dropout")
+        phase1_router_counts = saliency_tracker.router_counts()
+        phase1_router_totals = saliency_tracker.router_totals()
+        phase1_router_active_counts = saliency_tracker.router_active_counts()
+        phase1_expert_route_stats = saliency_tracker.route_stats()
         saliency_tracker.remove_hooks()
         nonzero_counts = sum(
             1 for rq_saliencies in phase1_expert_saliency.values()
@@ -1155,9 +1194,13 @@ def _compute_global_precompute(
         total_slots = sum(len(v) for v in phase1_expert_saliency.values())
         print(f"[incremental/global] expert-saliency: "
               f"{nonzero_counts}/{total_slots} experts activated "
-              f"(inactive experts get S=0, allocator may DROP free)", flush=True)
+              f"(route mass emitted for allocator drop priors)", flush=True)
     else:
         phase1_expert_saliency = {}
+        phase1_router_counts = {}
+        phase1_router_totals = {}
+        phase1_router_active_counts = {}
+        phase1_expert_route_stats = {}
 
     # ---- Phase 2: final norm + lm_head + CE loss; grad at final hidden ----
     ctx.layer_cache.clear()
@@ -1333,6 +1376,10 @@ def _compute_global_precompute(
         resident_act_snaps=dict(resident_act_snaps),
         expert_saliency=phase1_expert_saliency,
         expert_info=phase1_expert_info,
+        router_counts=phase1_router_counts,
+        router_totals=phase1_router_totals,
+        router_active_counts=phase1_router_active_counts,
+        expert_route_stats=phase1_expert_route_stats,
     )
 
 
@@ -1352,6 +1399,10 @@ def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
         "resident_act_snaps": pre.resident_act_snaps,
         "expert_saliency": pre.expert_saliency,
         "expert_info": pre.expert_info,
+        "router_counts": pre.router_counts,
+        "router_totals": pre.router_totals,
+        "router_active_counts": pre.router_active_counts,
+        "expert_route_stats": pre.expert_route_stats,
         "meta": meta,
     }, str(path))
 
@@ -1381,9 +1432,14 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
         resident_stats=data["resident_stats"],
         resident_h_full=data["resident_h_full"],
         resident_act_snaps=data["resident_act_snaps"],
-        # Older caches predate expert saliency; fall back to empty dicts.
-        expert_saliency=data.get("expert_saliency", {}),
+        # REAP expert pruning is archived. Ignore any saliency persisted
+        # by older precompute caches so resumed probes do not re-emit it.
+        expert_saliency={},
         expert_info=data.get("expert_info", {}),
+        router_counts={},
+        router_totals={},
+        router_active_counts={},
+        expert_route_stats={},
     )
 
 
@@ -1466,6 +1522,8 @@ def _run_body_streaming_shard(
                 "stats": {},
                 "router_counts": {},
                 "router_totals": {},
+                "router_active_counts": {},
+                "expert_route_stats": {},
                 "expert_info": {},
                 "meta": {
                     "model": model_path,
@@ -1633,18 +1691,18 @@ def _run_body_streaming_shard(
         t_phase = time.time()
         phase_load_s = 0.0
         phase_bwd_s = 0.0
+        phase_pressure_trim_bytes = 0
         load_by_src: dict[str, float] = defaultdict(float)
         count_by_src: dict[str, int] = defaultdict(int)
         grad_out = grad_at_tail
         # Smart cache: register in-scope (tracked) layers as priority so the
         # cache prefers evicting out-of-scope entries first. Also configure
         # pressure-triggered eviction (Task #3) so spikes during MoE hook
-        # firing don't push the system to OOM. Threshold = the same floor
-        # used by the prefetcher's pause check.
+        # firing don't push the system to OOM. Threshold = max(prefetch
+        # pause floor, dynamic cache reserve).
         in_scope_layers = {L for L in range(num_layers) if layer_linear_names[L]}
         ctx.layer_cache.set_priority_layers(in_scope_layers)
-        ctx.layer_cache.configure_pressure_threshold(
-            int(ctx.prefetch_min_available_bytes or 0))
+        ctx.configure_runtime_pressure_floor()
         # Reverse-prefetch (Task #5): prefetcher should now look BACKWARD
         # in layer index since reverse sweep walks num_layers-1 → 0.
         # Schedule lookahead in the direction we're actually going.
@@ -2216,7 +2274,7 @@ def _run_body_streaming_shard(
             flush_activation_snapshots(activation_snaps)
             flush_activation_snapshots(packed_act_snaps)
 
-            ctx.unload(L)
+            phase_pressure_trim_bytes += int(ctx.unload(L) or 0)
             # The `del` drops all per-layer refs; CPython ref counting
             # reclaims them synchronously. The per-layer gc + empty_cache
             # is a quick win for in-scope MoE layers where 768 hooks have
@@ -2244,6 +2302,7 @@ def _run_body_streaming_shard(
         )
         print(f"[incremental] phase-3 reverse sweep: {time.time()-t_phase:.1f}s  "
               f"load={phase_load_s:.1f}s bwd={phase_bwd_s:.1f}s "
+              f"pressure_trim={phase_pressure_trim_bytes/(1024**3):.1f}GB "
               f"load_by_src=[{load_parts}]  "
               f"{ctx.layer_cache.summary()}  {ctx.prefetch_summary()}",
               flush=True)
@@ -2335,14 +2394,36 @@ def _run_body_streaming_shard(
         for rq, per_expert_map in precomputed.expert_saliency.items()
         if rq in shard_routers_in_scope
     }
+    shard_router_counts = {
+        rq: per_expert_map
+        for rq, per_expert_map in precomputed.router_counts.items()
+        if rq in shard_routers_in_scope
+    }
+    shard_router_totals = {
+        rq: total
+        for rq, total in precomputed.router_totals.items()
+        if rq in shard_routers_in_scope
+    }
+    shard_router_active_counts = {
+        rq: per_expert_map
+        for rq, per_expert_map in precomputed.router_active_counts.items()
+        if rq in shard_routers_in_scope
+    }
+    shard_expert_route_stats = {
+        rq: stats
+        for rq, stats in precomputed.expert_route_stats.items()
+        if rq in shard_routers_in_scope
+    }
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
         pickle.dump({
             "stats": merged_stats,
-            "router_counts": {},
-            "router_totals": {},
+            "router_counts": shard_router_counts,
+            "router_totals": shard_router_totals,
+            "router_active_counts": shard_router_active_counts,
+            "expert_route_stats": shard_expert_route_stats,
             "expert_info": shard_expert_info,
             "expert_saliency": shard_expert_saliency,
             "meta": {
@@ -2535,6 +2616,8 @@ def _run_mtp_streaming_shard(
             "stats": renamed,
             "router_counts": {},
             "router_totals": {},
+            "router_active_counts": {},
+            "expert_route_stats": {},
             "expert_info": expert_info_renamed,
             "meta": {
                 "model": model_path,
@@ -3143,6 +3226,8 @@ def main():
                         "stats": {},
                         "router_counts": {},
                         "router_totals": {},
+                        "router_active_counts": {},
+                        "expert_route_stats": {},
                         "expert_info": {},
                         "meta": {
                             "model": args.model,

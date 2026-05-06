@@ -282,6 +282,7 @@ def collect_block_clado(
     skip_pairs: bool = False,
     center_assignment: Mapping[str, str] | None = None,
     use_frozen_weight_cache: bool = False,
+    production_weight_cache=None,
 ) -> dict:
     """Run the Block-CLADO measurement.
 
@@ -344,6 +345,7 @@ def collect_block_clado(
                 model, base, calib_ids, ref_log_probs,
                 work_root=work_root, profile=profile,
                 use_frozen_weight_cache=use_frozen_weight_cache,
+                production_weight_cache=production_weight_cache,
                 rng_seed=0,
             ))
             if progress_callback is not None:
@@ -382,6 +384,7 @@ def collect_block_clado(
                     work_root=work_root,
                     profile=profile,
                     use_frozen_weight_cache=use_frozen_weight_cache,
+                    production_weight_cache=production_weight_cache,
                     rng_seed=0,
                 )
                 omega_ii[(unit.name, opt.fmt)] = float(kl) - center_kl
@@ -489,6 +492,7 @@ def collect_block_clado(
                                 work_root=work_root,
                                 profile=profile,
                                 use_frozen_weight_cache=use_frozen_weight_cache,
+                                production_weight_cache=production_weight_cache,
                                 rng_seed=0,
                             )
                             omega_a = float(omega_ii[(unit_a.name, opt_a.fmt)])

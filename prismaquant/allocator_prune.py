@@ -11,6 +11,7 @@ from .allocator_candidates import (
     cost_entry_predicted_dloss,
 )
 from .allocator_solver import Candidate, _shape_from_stats
+from .expert_prune import raise_expert_prune_disabled
 
 
 def _moe_group_and_projection(name: str) -> tuple[str, str] | None:
@@ -90,6 +91,99 @@ def _saliency_lookup(
     return float(default)
 
 
+def _route_mass_lookup(route_mass_map: dict | None, eid: int) -> float | None:
+    if not route_mass_map:
+        return None
+    if eid in route_mass_map:
+        return float(route_mass_map[eid])
+    s_eid = str(eid)
+    if s_eid in route_mass_map:
+        return float(route_mass_map[s_eid])
+    return None
+
+
+def _router_total_lookup(router_totals: dict | None, router_qname: str | None) -> int:
+    if not router_totals or router_qname is None:
+        return 0
+    return int(router_totals.get(router_qname, 0) or 0)
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    vals = sorted(values)
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return vals[mid]
+    return 0.5 * (vals[mid - 1] + vals[mid])
+
+
+def _router_conditional_saliency_prior(
+    saliency_map: dict,
+    route_mass_map: dict | None,
+    total_tokens: int,
+) -> float | None:
+    """Median conditional saliency among observed experts on a router.
+
+    REAP dropout saliency is token-normalized:
+        S_j = route_prob_j * E[g_norm_sq | routed to j]
+
+    For experts with too little route mass, the allocator uses this
+    median conditional term as a small empirical prior rather than
+    treating an unobserved expert as evidence of zero utility.
+    """
+    if total_tokens <= 0 or not route_mass_map:
+        return None
+    vals: list[float] = []
+    for eid_raw, s_j_raw in saliency_map.items():
+        try:
+            eid = int(eid_raw)
+        except (TypeError, ValueError):
+            continue
+        mass = _route_mass_lookup(route_mass_map, eid)
+        if mass is None or mass <= 0:
+            continue
+        route_prob = mass / float(total_tokens)
+        if route_prob <= 0:
+            continue
+        vals.append(max(float(s_j_raw), 0.0) / route_prob)
+    return _median(vals)
+
+
+def _route_floor_adjusted_saliency(
+    saliency: float,
+    route_mass: float | None,
+    total_tokens: int,
+    route_floor_mass: float,
+    conditional_prior: float | None,
+) -> float:
+    """Apply a routed-token-mass floor to a REAP dropout score.
+
+    With enough route evidence this returns `saliency` unchanged. With
+    too little evidence, it preserves the expert's observed conditional
+    impact and prices the drop as though the expert had at least
+    `route_floor_mass` weighted routed tokens. If the expert was unseen,
+    a router-level median conditional prior is used when available.
+    """
+    s_j = max(float(saliency), 0.0)
+    if route_floor_mass <= 0 or total_tokens <= 0:
+        return s_j
+    floor_prob = min(1.0, max(float(route_floor_mass), 0.0) / float(total_tokens))
+    if floor_prob <= 0:
+        return s_j
+    mass = 0.0 if route_mass is None else max(float(route_mass), 0.0)
+    route_prob = mass / float(total_tokens)
+    if route_prob >= floor_prob:
+        return s_j
+    if route_prob > 0:
+        conditional = s_j / route_prob
+    elif conditional_prior is not None:
+        conditional = max(float(conditional_prior), 0.0)
+    else:
+        return s_j
+    return max(s_j, conditional * floor_prob)
+
+
 def _saliency_complete_for_eids(saliency_map: dict, eids) -> bool:
     expected = [int(e) for e in eids]
     return bool(expected) and all(_saliency_has_eid(saliency_map, e) for e in expected)
@@ -102,11 +196,16 @@ def aggregate_moe_candidates(
     calibrated_gains: dict[str, float] | None = None,
     expert_saliency: dict[str, dict[int, float]] | None = None,
     expert_info: dict[str, tuple[str, str]] | None = None,
+    router_counts: dict[str, dict[str, float]] | None = None,
+    router_totals: dict[str, int] | None = None,
+    route_floor_mass: float = 0.0,
     prune_ratios: tuple[float, ...] = (),
     prune_alpha: float = 0.5,
     source_manifest: dict[str, str] | None = None,
 ) -> tuple[dict, dict, dict]:
     """Aggregate per-expert Linears into per-layer MoE super-candidates."""
+    if any(float(r) > 0.0 for r in prune_ratios):
+        raise_expert_prune_disabled("allocator MoE prune candidates")
     gains = calibrated_gains or {}
     expert_leaves: dict[tuple[str, str], list[str]] = {}
     non_expert_names: list[str] = []
@@ -219,6 +318,15 @@ def aggregate_moe_candidates(
             if router_qname_for_grp is not None
             else {}
         )
+        route_mass_map = (
+            (router_counts or {}).get(router_qname_for_grp, {})
+            if router_qname_for_grp is not None
+            else {}
+        )
+        route_total = _router_total_lookup(router_totals, router_qname_for_grp)
+        conditional_prior = _router_conditional_saliency_prior(
+            saliency_map, route_mass_map, route_total,
+        )
         saliency_complete = _saliency_complete_for_eids(
             saliency_map, eid_to_member.keys(),
         )
@@ -232,6 +340,13 @@ def aggregate_moe_candidates(
         prune_dloss_by_eid: dict[int, float] = {}
         for eid, member in eid_to_member.items():
             s_j = _saliency_lookup(saliency_map, eid, 0.0)
+            s_j = _route_floor_adjusted_saliency(
+                s_j,
+                _route_mass_lookup(route_mass_map, eid),
+                route_total,
+                route_floor_mass,
+                conditional_prior,
+            )
             h_j = float(stats[member].get("h_trace", 0.0))
             np_j = int(stats[member].get("n_params", 0) or 0)
             prune_dloss_by_eid[eid] = _prune_cost_per_expert(
@@ -358,6 +473,8 @@ def apply_nested_global_prune_ratio(
     requested ratio, making that global ratio infeasible.
     """
     R = float(global_ratio)
+    if R > 0.0:
+        raise_expert_prune_disabled("nested MoE global prune ratio")
     out: dict[str, list[Candidate]] = {}
     warnings: list[str] = []
     for name, cs in candidates.items():
@@ -405,9 +522,14 @@ def apply_global_prune_ratio(
     expert_saliency: dict[str, dict[int, float]],
     global_ratio: float,
     prune_alpha: float = 1.0,
+    router_counts: dict[str, dict[str, float]] | None = None,
+    router_totals: dict[str, int] | None = None,
+    route_floor_mass: float = 0.0,
 ) -> int:
     """Rewrite packed-entry candidates at one global prune ratio."""
     R = float(global_ratio)
+    if R > 0.0:
+        raise_expert_prune_disabled("packed MoE global prune ratio")
     if R <= 0.0 or not expert_saliency:
         return 0
 
@@ -428,8 +550,19 @@ def apply_global_prune_ratio(
         n_drop = int(math.floor(E * R))
         if n_drop <= 0:
             continue
+        route_mass_map = (router_counts or {}).get(router_qname, {})
+        route_total = _router_total_lookup(router_totals, router_qname)
+        conditional_prior = _router_conditional_saliency_prior(
+            saliency_map, route_mass_map, route_total,
+        )
         prune_dloss_by_eid = {
-            eid: prune_alpha * _saliency_lookup(saliency_map, eid, 0.0)
+            eid: prune_alpha * _route_floor_adjusted_saliency(
+                _saliency_lookup(saliency_map, eid, 0.0),
+                _route_mass_lookup(route_mass_map, eid),
+                route_total,
+                route_floor_mass,
+                conditional_prior,
+            )
             for eid in range(E)
         }
         drop_order = sorted(
@@ -493,6 +626,8 @@ def expand_moe_assignment(
     expert_info: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, str]:
     """Expand MoE super-Linear assignments back to individual experts."""
+    if pruned_map:
+        raise_expert_prune_disabled("expand MoE assignment with pruned experts")
     out = {}
     pm = pruned_map or {}
     einfo = expert_info or {}
@@ -521,9 +656,14 @@ def build_prune_manifest(
     stats_ext: dict,
     expert_info: dict[str, tuple[str, str]],
     expert_saliency: dict[str, dict[int, float]] | None = None,
+    router_counts: dict[str, dict[str, float]] | None = None,
+    router_totals: dict[str, int] | None = None,
+    route_floor_mass: float = 0.0,
     uniform_kept: bool = False,
 ) -> tuple[dict[str, dict], list[str]]:
     """Build a router-keyed prune manifest for the exporter."""
+    if pruned_map:
+        raise_expert_prune_disabled("build expert-prune manifest")
     if not pruned_map:
         return {}, []
 
@@ -592,9 +732,23 @@ def build_prune_manifest(
             kept_now = list(entry["kept_expert_ids"])
             already_dropped = set(entry["pruned_expert_ids"])
             router_sal = sal.get(router, {})
+            route_mass_map = (router_counts or {}).get(router, {})
+            route_total = _router_total_lookup(router_totals, router)
+            conditional_prior = _router_conditional_saliency_prior(
+                router_sal, route_mass_map, route_total,
+            )
             kept_ranked = sorted(
                 kept_now,
-                key=lambda eid: (_saliency_lookup(router_sal, eid, float("inf")), eid),
+                key=lambda eid: (
+                    _route_floor_adjusted_saliency(
+                        _saliency_lookup(router_sal, eid, float("inf")),
+                        _route_mass_lookup(route_mass_map, eid),
+                        route_total,
+                        route_floor_mass,
+                        conditional_prior,
+                    ),
+                    eid,
+                ),
             )
             extra = set(kept_ranked[:need_extra_drops])
             new_dropped = sorted(already_dropped | extra)
@@ -626,13 +780,27 @@ def build_prune_manifest(
             if num_orig is None:
                 continue
             router_sal = sal[router]
+            route_mass_map = (router_counts or {}).get(router, {})
+            route_total = _router_total_lookup(router_totals, router)
+            conditional_prior = _router_conditional_saliency_prior(
+                router_sal, route_mass_map, route_total,
+            )
             need_drops = num_orig - min_kept
             if need_drops <= 0:
                 continue
             all_eids = list(range(num_orig))
             ranked = sorted(
                 all_eids,
-                key=lambda eid: (_saliency_lookup(router_sal, eid, float("inf")), eid),
+                key=lambda eid: (
+                    _route_floor_adjusted_saliency(
+                        _saliency_lookup(router_sal, eid, float("inf")),
+                        _route_mass_lookup(route_mass_map, eid),
+                        route_total,
+                        route_floor_mass,
+                        conditional_prior,
+                    ),
+                    eid,
+                ),
             )
             dropped = sorted(ranked[:need_drops])
             kept = [e for e in all_eids if e not in set(dropped)]
@@ -659,6 +827,8 @@ def apply_consensus_prune(
     expert_info: dict[str, tuple[str, str]],
 ) -> dict[str, tuple[int, ...]]:
     """Coerce super-Linears to the router consensus drop set."""
+    if pruned_map:
+        raise_expert_prune_disabled("apply expert-prune consensus")
     if not manifest:
         return pruned_map
     out: dict[str, tuple[int, ...]] = {}

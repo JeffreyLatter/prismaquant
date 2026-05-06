@@ -5,6 +5,7 @@ from prismaquant.interaction_refine import (
     build_refinement_units,
     expand_unit_assignment,
     neighborhood_options,
+    psd_project_quadratic,
     select_critical_units,
     sparse_local_refine,
 )
@@ -85,6 +86,38 @@ class TestInteractionRefine(unittest.TestCase):
         self.assertLess(refined["objective_delta"], 0.0)
         self.assertEqual(refined["solver"], "exact")
         self.assertLess(refined["states_evaluated"], refined["state_count"])
+
+    def test_psd_projection_clamps_negative_interaction_curvature(self):
+        units = build_refinement_units(
+            {
+                "a": {"n_params": 8, "out_features": 4, "in_features": 2},
+                "b": {"n_params": 8, "out_features": 4, "in_features": 2},
+            },
+            {
+                "a": [Candidate("NVFP4", 4.5, 0, 2.0), Candidate("MXFP8", 8.25, 0, 0.8)],
+                "b": [Candidate("NVFP4", 4.5, 0, 2.0), Candidate("MXFP8", 8.25, 0, 0.8)],
+            },
+            {"a": "NVFP4", "b": "NVFP4"},
+        )
+        allowed = {u.key: neighborhood_options(u, 1) for u in units}
+        unary = {
+            "a": {"NVFP4": 0.0, "MXFP8": 0.1},
+            "b": {"NVFP4": 0.0, "MXFP8": 0.1},
+        }
+        pairwise = {("a", "MXFP8", "b", "MXFP8"): -2.0}
+
+        projected_unary, projected_pairwise, meta = psd_project_quadratic(
+            units,
+            unary,
+            pairwise,
+            allowed=allowed,
+        )
+
+        self.assertLess(meta["min_eigenvalue_before"], 0.0)
+        self.assertGreaterEqual(meta["min_eigenvalue_after"], -1e-12)
+        self.assertGreater(meta["negative_eigenvalues_clipped"], 0)
+        self.assertIn("MXFP8", projected_unary["a"])
+        self.assertGreaterEqual(len(projected_pairwise), 1)
 
     def test_sparse_local_refine_can_disable_exact_solver(self):
         units = build_refinement_units(

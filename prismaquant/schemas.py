@@ -49,6 +49,32 @@ def _as_number(value, path: str | None, where: str) -> float:
     return float(value)
 
 
+def _validate_router_number_map(
+    payload,
+    field: str,
+    path: str | None,
+    *,
+    integral_values: bool = False,
+) -> None:
+    value = payload.get(field)
+    if value is None:
+        return
+    if not _is_mapping(value):
+        _fail(path, f".{field}", "must be a mapping when present")
+    for router, values in value.items():
+        if not isinstance(router, str):
+            _fail(path, f".{field}", "router keys must be strings")
+        if not _is_mapping(values):
+            _fail(path, f".{field}[{router!r}]", "must be a mapping")
+        for eid, count in values.items():
+            if not isinstance(eid, (str, Integral)) or isinstance(eid, bool):
+                _fail(path, f".{field}[{router!r}]", "expert ids must be strings or ints")
+            if integral_values:
+                _as_non_negative_int(count, path, f".{field}[{router!r}][{eid!r}]")
+            else:
+                _as_number(count, path, f".{field}[{router!r}][{eid!r}]")
+
+
 def validate_probe_payload(payload, path: str | None = None):
     """Validate the merged sensitivity-probe pickle contract."""
     if not _is_mapping(payload):
@@ -75,6 +101,16 @@ def validate_probe_payload(payload, path: str | None = None):
     meta = payload.get("meta", {})
     if meta is not None and not _is_mapping(meta):
         _fail(path, ".meta", "must be a mapping when present")
+    _validate_router_number_map(payload, "router_counts", path)
+    _validate_router_number_map(payload, "router_active_counts", path, integral_values=True)
+    router_totals = payload.get("router_totals")
+    if router_totals is not None:
+        if not _is_mapping(router_totals):
+            _fail(path, ".router_totals", "must be a mapping when present")
+        for router, total in router_totals.items():
+            if not isinstance(router, str):
+                _fail(path, ".router_totals", "router keys must be strings")
+            _as_non_negative_int(total, path, f".router_totals[{router!r}]")
     saliency = payload.get("expert_saliency", {})
     if saliency is not None:
         if not _is_mapping(saliency):

@@ -21,6 +21,8 @@ from prismaquant.export_native_compressed import (
     NVFP4_MAX,
     PER_EXPERT_MOE_REGEX,
     _compute_layer_joint_nvfp4,
+    _passthrough_dtype,
+    _passthrough_tensor,
     _quantize_2d,
     _quantize_3d_packed,
     _resolve_perturbed_x_export_inputs,
@@ -50,6 +52,43 @@ class _IdentityProfile:
 
     def live_to_recipe_name(self, live_qname: str) -> str:
         return live_qname
+
+
+class TestPassthroughDtype(unittest.TestCase):
+    def test_passthrough_preserves_source_precision_policy(self):
+        self.assertEqual(
+            _passthrough_dtype(
+                "model.layers.0.input_layernorm.weight",
+                torch.bfloat16,
+            ),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            _passthrough_dtype(
+                "mtp.layers.0.self_attn.q_norm.weight",
+                torch.float16,
+            ),
+            torch.float16,
+        )
+        self.assertEqual(
+            _passthrough_dtype(
+                "model.layers.0.self_attn.q_proj.weight",
+                torch.float8_e4m3fn,
+            ),
+            torch.float8_e4m3fn,
+        )
+
+    def test_passthrough_uses_current_dtype_only_as_fallback(self):
+        value, label = _passthrough_tensor(
+            "model.norm.weight",
+            torch.ones(4, dtype=torch.float32),
+        )
+        self.assertEqual(value.dtype, torch.float32)
+        self.assertEqual(label, "FP32")
+
+    def test_passthrough_rejects_missing_dtype_without_fallback(self):
+        with self.assertRaises(ValueError):
+            _passthrough_dtype("model.norm.weight")
 
 
 class TestLazyActivationCache(unittest.TestCase):

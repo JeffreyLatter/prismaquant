@@ -542,9 +542,8 @@ class LayerCache:
         # out-of-scope prefetches.
         self._priority_layers: set[int] = set()
         # Pressure-trigger threshold (Task #3): when MemAvailable falls
-        # below this many bytes, an eviction call drops as many entries
-        # as needed to halve total cache bytes regardless of LRU order.
-        # 0 disables. Set via configure_pressure_threshold().
+        # below this many bytes, an eviction call drops enough entries to
+        # recover that floor. 0 disables. Set via configure_pressure_threshold().
         self._pressure_threshold_bytes: int = 0
         self.pressure_evictions = 0
         # Mark-done set (v20 step 2): layers the scheduler has declared
@@ -622,8 +621,8 @@ class LayerCache:
             return False
         size = self._sizeof(tensors)
         # Pressure-shrink check (Task #3): if MemAvailable is below the
-        # configured threshold, drop entries until we've halved cache
-        # bytes (or exhausted candidates). Skips priority layers.
+        # configured floor, drop entries until the projected available
+        # memory recovers that floor (or candidates are exhausted).
         self._maybe_pressure_shrink()
         # v20 step 3+4: dynamic budget — recompute effective_max from
         # current MemAvailable so the cache shrinks under load and
@@ -673,56 +672,85 @@ class LayerCache:
         # All entries are priority — fall back to LRU
         return next(iter(self._cache))
 
-    def _maybe_pressure_shrink(self):
+    def _maybe_pressure_shrink(self) -> int:
         """If system MemAvailable is below the configured threshold,
-        drop entries until cache bytes have halved or we recover
+        drop entries until projected MemAvailable recovers that
         headroom. Two-phase: non-priority first, then priority if
         still under pressure. v20 fix #4-B: previously returned early
         when only priority entries remained (e.g., unified-sweep
         marks every body layer priority), so pressure shrink was a
         no-op when it mattered most."""
         if self._pressure_threshold_bytes <= 0 or not self._cache:
-            return
+            return 0
         try:
             import psutil
             avail = psutil.virtual_memory().available
         except Exception:
-            return
+            return 0
         if avail >= self._pressure_threshold_bytes:
-            return
-        target = self.total_bytes // 2
-        evicted_any = False
+            return 0
+        needed = max(0, self._pressure_threshold_bytes - avail)
+        freed = 0
 
         # Phase 1: non-priority LRU, no priority fallback.
         for idx in list(self._cache.keys()):
-            if self.total_bytes <= target:
+            if freed >= needed:
                 break
             if idx in self._priority_layers:
                 continue
+            size = self._bytes.get(idx, 0)
             self._cache.pop(idx, None)
             self.total_bytes -= self._bytes.pop(idx, 0)
-            evicted_any = True
+            freed += size
             self.pressure_evictions += 1
 
         # Phase 2: re-check pressure; if still tight, drop priority
         # entries in LRU order. Priority is a preference, not a hard
         # contract — when host memory is genuinely scarce, holding
         # cached weights is worse than re-loading them.
-        try:
-            avail = psutil.virtual_memory().available
-        except Exception:
-            avail = self._pressure_threshold_bytes
-        if avail < self._pressure_threshold_bytes:
+        if freed < needed:
             for idx in list(self._cache.keys()):
-                if self.total_bytes <= target:
+                if freed >= needed:
                     break
+                size = self._bytes.get(idx, 0)
                 self._cache.pop(idx, None)
                 self.total_bytes -= self._bytes.pop(idx, 0)
-                evicted_any = True
+                freed += size
                 self.pressure_evictions += 1
 
-        if evicted_any and torch.cuda.is_available():
+        if freed and torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # Unified-memory systems can keep an evicted cache tensor alive
+        # through another owner (for example, an installed model layer).
+        # Re-check real MemAvailable after empty_cache and keep trimming
+        # if the projected release did not materialize.
+        if freed and self._cache:
+            try:
+                avail = psutil.virtual_memory().available
+            except Exception:
+                avail = self._pressure_threshold_bytes
+            if avail < self._pressure_threshold_bytes:
+                needed = self._pressure_threshold_bytes - avail
+                extra_freed = 0
+                while extra_freed < needed and self._cache:
+                    evict_idx = self._pick_evict_candidate()
+                    if evict_idx is None:
+                        break
+                    size = self._bytes.get(evict_idx, 0)
+                    self._cache.pop(evict_idx, None)
+                    self.total_bytes -= self._bytes.pop(evict_idx, 0)
+                    extra_freed += size
+                    self.pressure_evictions += 1
+                if extra_freed and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                freed += extra_freed
+        return freed
+
+    def trim_for_memory_pressure(self) -> int:
+        """Public pressure-trim hook for callers that just released large
+        transient tensors. Returns the projected cache bytes evicted."""
+        return self._maybe_pressure_shrink()
 
     def configure_pressure_threshold(self, available_bytes_floor: int):
         """Set the MemAvailable byte threshold below which the cache
@@ -735,6 +763,10 @@ class LayerCache:
         re-evaluates against current MemAvailable, so the cache
         breathes with host memory pressure. 0 disables (static max)."""
         self._dynamic_reserve_bytes = int(reserve_bytes)
+
+    @property
+    def dynamic_reserve_bytes(self) -> int:
+        return int(self._dynamic_reserve_bytes)
 
     def prepare_for_load(self, size_hint: int) -> int:
         """Pre-evict entries to make room for an incoming layer load

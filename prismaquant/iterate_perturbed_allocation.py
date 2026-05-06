@@ -42,6 +42,7 @@ from prismaquant.build_rtn_cache import (
 from prismaquant.measure_quant_cost import ActivationIndex, run_cost_pass
 from prismaquant.memory_management import (
     cuda_memory_info,
+    max_gpu_memory_bytes,
     phase_boundary_memory_cleanup,
     report_graph_memory,
 )
@@ -56,6 +57,7 @@ from prismaquant.interaction_refine import (
     RefinementUnit,
     UnitOption,
     make_pair_key,
+    psd_project_quadratic,
     sparse_local_refine,
 )
 from prismaquant.propagated_cost import (
@@ -557,16 +559,37 @@ def _make_l3_progress(
                 f"{event['group_count']} {event['group']}: done in "
                 f"{event['elapsed_seconds']:.1f}s"
             )
+        elif event.get("event") == "lane_batch_memory_adjusted":
+            emit(
+                f"{prefix} lane batch memory cap "
+                f"{event['requested_max_lanes_per_batch']}->"
+                f"{event['max_lanes_per_batch']}"
+            )
+        elif event.get("event") == "depth_group_microbatch_start":
+            emit(
+                f"{prefix} depth group {event['group_index']}/"
+                f"{event['group_count']} {event['group']}: microbatch "
+                f"{event['microbatch_index']}/{event['microbatch_count']} "
+                f"start lanes={event['lane_count']} "
+                f"exec_lanes={event['execution_lane_count']}"
+            )
+        elif event.get("event") == "depth_group_microbatch_end":
+            emit(
+                f"{prefix} depth group {event['group_index']}/"
+                f"{event['group_count']} {event['group']}: microbatch "
+                f"{event['microbatch_index']}/{event['microbatch_count']} "
+                f"done batches={event.get('batch_count', 0)}"
+            )
 
     return _l3_progress
 
 
 def _l3_output_mse_names(args) -> list[str] | None:
-    """Return downstream-MSE targets for PrismaClade L3 measurement.
+    """Return downstream-MSE targets for PrismaSCOUT L3 measurement.
 
     Downstream output-MSE is useful diagnostics, but current L3 allocation and
     coordinate descent consume propagated end-KL. Keep the metric opt-in on the
-    PrismaClade path so default runtime measures the actual decision signal.
+    PrismaSCOUT path so default runtime measures the actual decision signal.
     """
     return None if bool(getattr(args, "l3_output_mse", False)) else []
 
@@ -821,6 +844,53 @@ def _gb(num_bytes: int) -> float:
 
 def _fmt_gb(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.2f}GB"
+
+
+_FROZEN_WEIGHT_CACHE_MEMORY_NOTICE_EMITTED = False
+
+
+def _maybe_disable_frozen_weight_cache_for_memory(
+    device: torch.device,
+    enabled: bool,
+) -> bool:
+    """Disable whole-assignment frozen weight caching when the live model
+    already consumes the usable CUDA/UMA budget.
+
+    The non-cache path still quantizes weights on demand around each module
+    forward. It is slower, but its peak is bounded by a module instead of a
+    whole-model quantized-weight copy.
+    """
+    global _FROZEN_WEIGHT_CACHE_MEMORY_NOTICE_EMITTED
+    if not enabled or device.type != "cuda" or not torch.cuda.is_available():
+        return enabled
+    budget = max_gpu_memory_bytes(device)
+    info = cuda_memory_info(device)
+    if budget is None or info is None:
+        return enabled
+    free_bytes, total_bytes = info
+    used_bytes = total_bytes - free_bytes
+    reserve_frac = float(os.environ.get(
+        "PRISMAQUANT_FROZEN_WEIGHT_CACHE_MIN_FREE_FRACTION", "0.05"))
+    reserve_floor_gb = float(os.environ.get(
+        "PRISMAQUANT_FROZEN_WEIGHT_CACHE_MIN_FREE_GB", "2.0"))
+    reserve_bytes = max(
+        int(total_bytes * max(reserve_frac, 0.0)),
+        int(max(reserve_floor_gb, 0.0) * 1024 ** 3),
+    )
+    budget_slack = budget - used_bytes
+    if used_bytes < budget and free_bytes >= reserve_bytes and budget_slack >= reserve_bytes:
+        return enabled
+    if not _FROZEN_WEIGHT_CACHE_MEMORY_NOTICE_EMITTED:
+        _FROZEN_WEIGHT_CACHE_MEMORY_NOTICE_EMITTED = True
+        print(
+            "[memory-aware] disabling frozen weight cache: "
+            f"used={_gb(used_bytes):.2f}GB budget={_gb(budget):.2f}GB "
+            f"free={_gb(free_bytes):.2f}GB total={_gb(total_bytes):.2f}GB "
+            f"reserve={_gb(reserve_bytes):.2f}GB; falling back to "
+            "per-module quantize/restore",
+            flush=True,
+        )
+    return False
 
 
 @dataclass
@@ -1413,6 +1483,9 @@ def _l3_scope_metadata(args) -> dict:
         "l3_hamming_cap_max": int(getattr(args, "l3_hamming_cap_max", 64)),
         "l3_validation_scout": bool(getattr(args, "l3_validation_scout", False)),
         "l3_interaction_refine": bool(getattr(args, "l3_interaction_refine", False)),
+        "l3_interaction_psd_project": bool(
+            getattr(args, "l3_interaction_psd_project", False)
+        ),
     }
 
 
@@ -1895,6 +1968,9 @@ def run_l3_interaction_refine(
             getattr(args, "l3_interaction_lagrangian_bpp_penalty", 0.0)
         ),
         "max_seconds": float(getattr(args, "l3_interaction_max_seconds", 600.0)),
+        "psd_projection": {
+            "enabled": bool(getattr(args, "l3_interaction_psd_project", False)),
+        },
     }
     if not meta["enabled"]:
         meta["skipped_reason"] = "disabled"
@@ -2112,6 +2188,28 @@ def run_l3_interaction_refine(
         base_residual = base_residual_by_pair.get(pair_id, 0.0)
         pairwise[make_pair_key(left_key, left_fmt, right_key, right_fmt)] = (
             residual - base_residual
+        )
+
+    if bool(getattr(args, "l3_interaction_psd_project", False)):
+        unary, pairwise, psd_meta = psd_project_quadratic(
+            selected_units,
+            unary,
+            pairwise,
+            allowed=allowed,
+            min_eigenvalue=float(
+                getattr(args, "l3_interaction_psd_min_eigenvalue", 0.0)
+            ),
+            shrink_to_diagonal=float(
+                getattr(args, "l3_interaction_psd_shrink", 0.0)
+            ),
+        )
+        meta["psd_projection"] = psd_meta
+        emit(
+            f"{prefix} interaction refine: PSD projection "
+            f"dim={psd_meta['dimension']} "
+            f"clipped={psd_meta['negative_eigenvalues_clipped']} "
+            f"min_eig={psd_meta['min_eigenvalue_before']:.4e}->"
+            f"{psd_meta['min_eigenvalue_after']:.4e}"
         )
 
     try:
@@ -4799,6 +4897,7 @@ def solve_l3_pareto_archive_assignments(
     bpp_min: float,
     bpp_max: float,
     bit_precision: float,
+    beam_per_bin: int = 1,
     profile=None,
 ) -> tuple[list[dict], dict]:
     """Return one-pass epsilon-frontier candidates from cached L3 costs.
@@ -4894,65 +4993,24 @@ def solve_l3_pareto_archive_assignments(
             "reason": "range_below_min_bpp",
             "min_total_bpp": float(min_total_bpp),
         }
-    inf = np.float64(1e100)
-    dp = np.full(n_bins, inf, dtype=np.float64)
-    dp[0] = 0.0
-    choices: list[np.ndarray] = []
-    for _name, options in options_by_name:
-        next_dp = np.full(n_bins, inf, dtype=np.float64)
-        choice = np.full(n_bins, -1, dtype=np.int16)
-        for opt_idx, (dbin, _cand, loss) in enumerate(options):
-            if dbin >= n_bins:
-                continue
-            src = dp[: n_bins - dbin]
-            candidate = src + float(loss)
-            dst = next_dp[dbin:]
-            mask = candidate < dst - 1e-15
-            if mask.any():
-                dst[mask] = candidate[mask]
-                choice_view = choice[dbin:]
-                choice_view[mask] = int(opt_idx)
-        dp = next_dp
-        choices.append(choice)
-
-    frontier_bins: list[int] = []
-    best_loss = float("inf")
     start_bin = max(int(math.floor((float(bpp_min) - min_total_bpp) / precision)), 0)
-    for bin_idx in range(start_bin, n_bins):
-        loss = float(dp[bin_idx])
-        if not math.isfinite(loss) or loss >= 1e99:
-            continue
-        estimated_bpp = min_total_bpp + float(bin_idx) * precision
-        if estimated_bpp < float(bpp_min) - precision:
-            continue
-        if estimated_bpp > float(bpp_max) + precision:
-            break
-        if loss < best_loss - 1e-12:
-            frontier_bins.append(bin_idx)
-            best_loss = loss
-
     rows_by_hash: dict[str, dict] = {}
     baseline_alloc = _baseline_for_allocated_stats(
         baseline_assignment,
         stats_alloc,
     )
-    for bin_idx in frontier_bins:
-        cur = int(bin_idx)
+
+    def add_dp_row(
+        *,
+        bin_idx: int,
+        surrogate_loss: float,
+        chosen_alloc: Mapping[str, Candidate],
+        archive_beam_rank: int = 0,
+        archive_frontier: bool = True,
+    ) -> None:
         assignment_alloc = dict(baseline_alloc)
-        chosen_alloc: dict[str, Candidate] = {}
-        valid = True
-        for layer_idx in range(len(options_by_name) - 1, -1, -1):
-            name, options = options_by_name[layer_idx]
-            opt_idx = int(choices[layer_idx][cur]) if cur >= 0 else -1
-            if opt_idx < 0 or opt_idx >= len(options):
-                valid = False
-                break
-            dbin, cand, _loss = options[opt_idx]
+        for name, cand in chosen_alloc.items():
             assignment_alloc[name] = fr.canonical_format_name(cand.fmt)
-            chosen_alloc[name] = cand
-            cur -= int(dbin)
-        if not valid:
-            continue
         expanded = expand_fused_sibling_assignment(assignment_alloc, stats_alloc)
         merged = dict(baseline_assignment)
         merged.update(expanded)
@@ -4974,20 +5032,175 @@ def solve_l3_pareto_archive_assignments(
             source="pareto_archive_dp",
             source_path=None,
             target_bpp=min_total_bpp + float(bin_idx) * precision,
-            surrogate_loss=float(dp[bin_idx]),
+            surrogate_loss=float(surrogate_loss),
         )
         row["archive_bin"] = int(bin_idx)
+        row["archive_beam_rank"] = int(archive_beam_rank)
+        row["archive_surrogate_frontier"] = bool(archive_frontier)
         row["estimated_bpp"] = float(min_total_bpp + float(bin_idx) * precision)
         row["format_histogram"] = histogram
         previous = rows_by_hash.get(row["assignment_hash"])
         if previous is None or (
             float(row["surrogate_loss"]),
+            int(row.get("archive_beam_rank", 0)),
             float(row["achieved_bpp"]),
         ) < (
             float(previous["surrogate_loss"]),
+            int(previous.get("archive_beam_rank", 0)),
             float(previous["achieved_bpp"]),
         ):
             rows_by_hash[row["assignment_hash"]] = row
+
+    beam_per_bin = max(int(beam_per_bin), 1)
+    frontier_bins: list[int] = []
+    reachable_bins = 0
+    retained_states = 0
+    if beam_per_bin <= 1:
+        inf = np.float64(1e100)
+        dp = np.full(n_bins, inf, dtype=np.float64)
+        dp[0] = 0.0
+        choices: list[np.ndarray] = []
+        for _name, options in options_by_name:
+            next_dp = np.full(n_bins, inf, dtype=np.float64)
+            choice = np.full(n_bins, -1, dtype=np.int16)
+            for opt_idx, (dbin, _cand, loss) in enumerate(options):
+                if dbin >= n_bins:
+                    continue
+                src = dp[: n_bins - dbin]
+                candidate = src + float(loss)
+                dst = next_dp[dbin:]
+                mask = candidate < dst - 1e-15
+                if mask.any():
+                    dst[mask] = candidate[mask]
+                    choice_view = choice[dbin:]
+                    choice_view[mask] = int(opt_idx)
+            dp = next_dp
+            choices.append(choice)
+
+        best_loss = float("inf")
+        for bin_idx in range(start_bin, n_bins):
+            loss = float(dp[bin_idx])
+            if not math.isfinite(loss) or loss >= 1e99:
+                continue
+            reachable_bins += 1
+            estimated_bpp = min_total_bpp + float(bin_idx) * precision
+            if estimated_bpp < float(bpp_min) - precision:
+                continue
+            if estimated_bpp > float(bpp_max) + precision:
+                break
+            if loss < best_loss - 1e-12:
+                frontier_bins.append(bin_idx)
+                best_loss = loss
+
+        for bin_idx in frontier_bins:
+            cur = int(bin_idx)
+            chosen_alloc: dict[str, Candidate] = {}
+            valid = True
+            for layer_idx in range(len(options_by_name) - 1, -1, -1):
+                name, options = options_by_name[layer_idx]
+                opt_idx = int(choices[layer_idx][cur]) if cur >= 0 else -1
+                if opt_idx < 0 or opt_idx >= len(options):
+                    valid = False
+                    break
+                dbin, cand, _loss = options[opt_idx]
+                chosen_alloc[name] = cand
+                cur -= int(dbin)
+            if not valid:
+                continue
+            add_dp_row(
+                bin_idx=bin_idx,
+                surrogate_loss=float(dp[bin_idx]),
+                chosen_alloc=chosen_alloc,
+            )
+        retained_states = len(frontier_bins)
+    else:
+        # State: cumulative loss, previous bin, previous state index, option index.
+        current: list[list[tuple[float, int, int, int]]] = [
+            [] for _ in range(n_bins)
+        ]
+        current[0] = [(0.0, -1, -1, -1)]
+        layers: list[list[list[tuple[float, int, int, int]]]] = []
+        for _name, options in options_by_name:
+            next_states: list[list[tuple[float, int, int, int]]] = [
+                [] for _ in range(n_bins)
+            ]
+            for src_bin, states in enumerate(current):
+                if not states:
+                    continue
+                for state_idx, state in enumerate(states):
+                    prefix_loss = float(state[0])
+                    for opt_idx, (dbin, _cand, loss) in enumerate(options):
+                        dst_bin = src_bin + int(dbin)
+                        if dst_bin >= n_bins:
+                            continue
+                        next_states[dst_bin].append(
+                            (
+                                prefix_loss + float(loss),
+                                int(src_bin),
+                                int(state_idx),
+                                int(opt_idx),
+                            )
+                        )
+            for bin_idx, states in enumerate(next_states):
+                if len(states) > beam_per_bin:
+                    states.sort(key=lambda item: (item[0], item[3], item[1], item[2]))
+                    next_states[bin_idx] = states[:beam_per_bin]
+            layers.append(next_states)
+            current = next_states
+
+        best_loss = float("inf")
+        frontier_state_refs: list[tuple[int, int, float, int]] = []
+        for bin_idx in range(start_bin, n_bins):
+            states = current[bin_idx]
+            if not states:
+                continue
+            reachable_bins += 1
+            states.sort(key=lambda item: (item[0], item[3], item[1], item[2]))
+            estimated_bpp = min_total_bpp + float(bin_idx) * precision
+            if estimated_bpp < float(bpp_min) - precision:
+                continue
+            if estimated_bpp > float(bpp_max) + precision:
+                break
+            bin_best_loss = float(states[0][0])
+            if bin_best_loss < best_loss - 1e-12:
+                frontier_bins.append(bin_idx)
+                for rank, state in enumerate(states):
+                    frontier_state_refs.append(
+                        (bin_idx, rank, float(state[0]), int(rank))
+                    )
+                best_loss = bin_best_loss
+
+        retained_states = sum(len(current[bin_idx]) for bin_idx in frontier_bins)
+        for bin_idx, state_idx, loss, beam_rank in frontier_state_refs:
+            cur_bin = int(bin_idx)
+            cur_state_idx = int(state_idx)
+            chosen_alloc: dict[str, Candidate] = {}
+            valid = True
+            for layer_idx in range(len(options_by_name) - 1, -1, -1):
+                if cur_bin < 0 or cur_state_idx < 0:
+                    valid = False
+                    break
+                states = layers[layer_idx][cur_bin]
+                if cur_state_idx >= len(states):
+                    valid = False
+                    break
+                _state_loss, prev_bin, prev_state_idx, opt_idx = states[cur_state_idx]
+                name, options = options_by_name[layer_idx]
+                if opt_idx < 0 or opt_idx >= len(options):
+                    valid = False
+                    break
+                _dbin, cand, _option_loss = options[opt_idx]
+                chosen_alloc[name] = cand
+                cur_bin = int(prev_bin)
+                cur_state_idx = int(prev_state_idx)
+            if not valid:
+                continue
+            add_dp_row(
+                bin_idx=bin_idx,
+                surrogate_loss=loss,
+                chosen_alloc=chosen_alloc,
+                archive_beam_rank=beam_rank,
+            )
 
     rows = sorted(rows_by_hash.values(), key=_archive_sort_key)
     return rows, {
@@ -4995,8 +5208,11 @@ def solve_l3_pareto_archive_assignments(
         "open_items": len(options_by_name),
         "bins": int(n_bins),
         "bit_precision": float(precision),
+        "beam_per_bin": int(beam_per_bin),
         "min_total_bpp": float(min_total_bpp),
         "frontier_bins": len(frontier_bins),
+        "reachable_bins": int(reachable_bins),
+        "retained_frontier_states": int(retained_states),
         "unique_assignments": len(rows),
     }
 
@@ -5111,21 +5327,523 @@ def _select_lambda_archive_candidates(
     }
 
 
+def _archive_candidate_public_record(
+    row: Mapping,
+    *,
+    selected_for_validation: bool = False,
+    validation_order: int | None = None,
+) -> dict:
+    return {
+        "source": row.get("source"),
+        "source_path": row.get("source_path"),
+        "target_bpp": row.get("target_bpp"),
+        "achieved_bpp": float(row["achieved_bpp"]),
+        "surrogate_loss": row.get("surrogate_loss"),
+        "assignment_hash": row.get("assignment_hash"),
+        "format_histogram": row.get("format_histogram"),
+        "hamming_from_anchor": row.get("hamming_from_anchor"),
+        "lambda_penalty": row.get("lambda_penalty"),
+        "archive_bin": row.get("archive_bin"),
+        "archive_beam_rank": row.get("archive_beam_rank"),
+        "archive_surrogate_frontier": row.get("archive_surrogate_frontier"),
+        "estimated_bpp": row.get("estimated_bpp"),
+        "solver_meta": row.get("solver_meta"),
+        "is_surrogate_knee": bool(row.get("is_surrogate_knee", False)),
+        "archive_refinement_selected": bool(
+            row.get("archive_refinement_selected", False)
+        ),
+        "selected_for_validation": bool(selected_for_validation),
+        "validation_order": validation_order,
+    }
+
+
+def _write_generated_archive_outputs(
+    output_root: Path,
+    *,
+    generated: list[dict],
+    selected: list[dict],
+    metadata: Mapping,
+) -> tuple[Path, Path, Path]:
+    archive_dir = output_root / "archive_generated"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = archive_dir / "generated_archive.csv"
+    json_path = archive_dir / "generated_archive.json"
+    assignments_path = archive_dir / "generated_archive_assignments.json"
+    selected_order = {
+        str(row["assignment_hash"]): idx
+        for idx, row in enumerate(selected)
+    }
+    rows = []
+    assignments = {}
+    for row in sorted(generated, key=_archive_sort_key):
+        digest = str(row["assignment_hash"])
+        order = selected_order.get(digest)
+        rows.append(
+            _archive_candidate_public_record(
+                row,
+                selected_for_validation=order is not None,
+                validation_order=order,
+            )
+        )
+        assignment = row.get("_assignment")
+        if assignment is not None:
+            assignments[digest] = dict(sorted(dict(assignment).items()))
+
+    fields = [
+        "source",
+        "target_bpp",
+        "achieved_bpp",
+        "surrogate_loss",
+        "assignment_hash",
+        "selected_for_validation",
+        "validation_order",
+        "hamming_from_anchor",
+        "lambda_penalty",
+        "archive_bin",
+        "archive_beam_rank",
+        "archive_surrogate_frontier",
+        "estimated_bpp",
+        "is_surrogate_knee",
+        "archive_refinement_selected",
+        "format_histogram",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            record = dict(row)
+            record["format_histogram"] = json.dumps(
+                record.get("format_histogram", {}),
+                sort_keys=True,
+            )
+            writer.writerow({field: record.get(field) for field in fields})
+    with open(json_path, "w") as f:
+        json.dump(
+            {
+                "metadata": dict(metadata),
+                "generated_candidates": rows,
+                "assignments": str(assignments_path),
+            },
+            f,
+            indent=2,
+        )
+    with open(assignments_path, "w") as f:
+        json.dump(assignments, f, indent=2)
+    return csv_path, json_path, assignments_path
+
+
+def _sample_mean_std(values: list[float]) -> tuple[float, float, float]:
+    if not values:
+        return 0.0, 0.0, 0.0
+    mean = sum(float(value) for value in values) / float(len(values))
+    if len(values) < 2:
+        return mean, 0.0, 0.0
+    variance = sum((float(value) - mean) ** 2 for value in values) / float(
+        len(values) - 1
+    )
+    std = math.sqrt(max(variance, 0.0))
+    stderr = std / math.sqrt(float(len(values)))
+    return mean, std, stderr
+
+
+def _validation_kl_key(args) -> str:
+    return (
+        "validation_kl_ucb"
+        if bool(getattr(args, "knee_noise_aware_selection", False))
+        else "validation_kl"
+    )
+
+
+def _row_validation_kl(row: Mapping, key: str = "validation_kl") -> float:
+    value = row.get(key)
+    if value is None:
+        value = row.get("validation_kl")
+    return float(value)
+
+
+def _apply_validation_kl_statistics(
+    row: dict,
+    values: list[float],
+    *,
+    confidence_z: float,
+) -> None:
+    mean, std, stderr = _sample_mean_std([float(value) for value in values])
+    ucb = mean + max(float(confidence_z), 0.0) * stderr
+    row["validation_kl"] = float(mean)
+    row["validation_kl_repeats"] = int(len(values))
+    row["validation_kl_std"] = float(std)
+    row["validation_kl_stderr"] = float(stderr)
+    row["validation_kl_ucb"] = float(ucb)
+    if len(values) > 1:
+        row["validation_kl_values"] = [float(value) for value in values]
+
+
+def _ensure_validation_kl_statistics(row: dict, args) -> None:
+    if row.get("validation_kl") is None:
+        return
+    if row.get("validation_kl_ucb") is not None:
+        return
+    values_obj = row.get("validation_kl_values")
+    if isinstance(values_obj, list) and values_obj:
+        values = [float(value) for value in values_obj]
+    else:
+        values = [float(row["validation_kl"])]
+    _apply_validation_kl_statistics(
+        row,
+        values,
+        confidence_z=float(getattr(args, "knee_validation_confidence_z", 1.0)),
+    )
+
+
+def _archive_validated_summary(row: Mapping) -> dict:
+    return {
+        "source": row.get("source"),
+        "source_path": row.get("source_path"),
+        "target_bpp": row.get("target_bpp"),
+        "achieved_bpp": float(row["achieved_bpp"]),
+        "validation_kl": (
+            float(row["validation_kl"])
+            if row.get("validation_kl") is not None
+            else None
+        ),
+        "validation_kl_repeats": row.get("validation_kl_repeats"),
+        "validation_kl_std": row.get("validation_kl_std"),
+        "validation_kl_stderr": row.get("validation_kl_stderr"),
+        "validation_kl_ucb": row.get("validation_kl_ucb"),
+        "surrogate_loss": row.get("surrogate_loss"),
+        "assignment_hash": row.get("assignment_hash"),
+        "assignment_path": row.get("assignment_path"),
+        "layer_config_path": row.get("layer_config_path"),
+    }
+
+
+def _validate_archive_candidate_rows(
+    args,
+    runtime: BudgetRuntime,
+    rows: list[dict],
+    *,
+    validated_dir: Path,
+    start_index: int = 0,
+    emit_prefix: str = "[knee][archive][validate]",
+) -> int:
+    measured_count = 0
+    total = len(rows)
+    repeats = max(int(getattr(args, "knee_validation_repeats", 1)), 1)
+    confidence_z = float(getattr(args, "knee_validation_confidence_z", 1.0))
+    for offset, row in enumerate(rows):
+        assignment_obj = row.get("_assignment")
+        if assignment_obj is None and row.get("assignment_path"):
+            assignment = _load_assignment_json(row["assignment_path"])
+        elif assignment_obj is not None:
+            assignment = dict(assignment_obj)
+        else:
+            raise RuntimeError(
+                "archive candidate is missing both inline assignment and "
+                "assignment_path"
+            )
+        if row.get("validation_kl") is None:
+            _emit(
+                f"{emit_prefix} {offset + 1}/{total} "
+                f"source={row['source']} bpp={row['achieved_bpp']:.4f} "
+                f"lambda={row.get('lambda_penalty')}"
+            )
+            values = []
+            for repeat_idx in range(repeats):
+                repeat_inputs = getattr(args, "_knee_validation_repeat_inputs", None)
+                if repeat_inputs:
+                    calib_ids_i, ref_log_probs_i = repeat_inputs[
+                        min(repeat_idx, len(repeat_inputs) - 1)
+                    ]
+                else:
+                    calib_ids_i, ref_log_probs_i = (
+                        runtime.calib_ids,
+                        runtime.ref_log_probs,
+                    )
+                if repeats > 1:
+                    _emit(
+                        f"{emit_prefix} repeat {repeat_idx + 1}/{repeats} "
+                        f"bpp={row['achieved_bpp']:.4f}"
+                    )
+                values.append(
+                    float(
+                        measure_assignment_kl(
+                            runtime.model,
+                            assignment,
+                            calib_ids_i,
+                            ref_log_probs_i,
+                            work_root=runtime.work_root,
+                            profile=runtime.profile,
+                            use_frozen_weight_cache=False,
+                        )
+                    )
+                )
+            _apply_validation_kl_statistics(
+                row,
+                values,
+                confidence_z=confidence_z,
+            )
+            measured_count += 1
+        else:
+            _ensure_validation_kl_statistics(row, args)
+        if not row.get("assignment_path"):
+            label = (
+                f"{start_index + offset:03d}_bpp_"
+                f"{float(row['achieved_bpp']):.4f}"
+            )
+            assignment_path, layer_config_path = _write_named_assignment_artifacts(
+                assignment,
+                assignment_path=validated_dir / f"assignment_{label}.json",
+                layer_config_path=validated_dir / f"layer_config_{label}.json",
+            )
+            row["assignment_path"] = str(assignment_path)
+            row["layer_config_path"] = str(layer_config_path)
+        row["_validated"] = True
+    return measured_count
+
+
+def _select_archive_refinement_candidates(
+    generated: list[dict],
+    *,
+    already_selected_hashes: set[str],
+    validated_frontier: list[dict],
+    candidates: list[dict],
+    chosen: Mapping | None,
+    selection_meta: Mapping,
+    limit: int,
+    selection_kl_key: str = "validation_kl",
+) -> tuple[list[dict], dict]:
+    limit = max(int(limit), 0)
+    if limit <= 0:
+        return [], {"enabled": False, "reason": "disabled", "selected": 0}
+    pool = [
+        row
+        for row in generated
+        if str(row["assignment_hash"]) not in already_selected_hashes
+    ]
+    if not pool:
+        return [], {"enabled": True, "reason": "no_unvalidated_generated", "selected": 0}
+
+    anchors: list[dict] = []
+
+    def add_anchor(reason: str, row_or_bpp) -> None:
+        if row_or_bpp is None:
+            return
+        try:
+            bpp = (
+                float(row_or_bpp["achieved_bpp"])
+                if isinstance(row_or_bpp, Mapping)
+                else float(row_or_bpp)
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+        if not math.isfinite(bpp):
+            return
+        key = round(bpp, 8)
+        if any(anchor["key"] == key and anchor["reason"] == reason for anchor in anchors):
+            return
+        anchors.append({"reason": reason, "bpp": float(bpp), "key": key})
+
+    if candidates:
+        best_kl = min(
+            candidates,
+            key=lambda row: (
+                _row_validation_kl(row, selection_kl_key),
+                float(row["achieved_bpp"]),
+                str(row["assignment_hash"]),
+            ),
+        )
+        add_anchor("best_validation_kl", best_kl)
+    add_anchor("current_knee", chosen)
+    guard = selection_meta.get("selection_guard", {})
+    if isinstance(guard, Mapping):
+        add_anchor("geometric_knee", guard.get("geometric_chosen_achieved_bpp"))
+        add_anchor("guarded_knee", guard.get("guarded_chosen_achieved_bpp"))
+    loo = selection_meta.get("leave_one_out", {})
+    if isinstance(loo, Mapping) and not loo.get("stable", True):
+        trials = sorted(
+            loo.get("trials", []),
+            key=lambda row: float(row.get("bpp_shift", 0.0)),
+            reverse=True,
+        )
+        for trial in trials[: max(limit, 1)]:
+            add_anchor("leave_one_out_knee", trial.get("chosen_bpp"))
+    if validated_frontier:
+        add_anchor("frontier_low_bpp", validated_frontier[0])
+        add_anchor("frontier_high_bpp", validated_frontier[-1])
+
+    if not anchors:
+        anchors.append(
+            {
+                "reason": "archive_midpoint",
+                "bpp": (
+                    min(float(row["achieved_bpp"]) for row in pool)
+                    + max(float(row["achieved_bpp"]) for row in pool)
+                )
+                / 2.0,
+                "key": None,
+            }
+        )
+
+    selected: list[dict] = []
+    selected_hashes: set[str] = set()
+    ranked_by_anchor = []
+    for anchor in anchors:
+        bpp = float(anchor["bpp"])
+        ranked_by_anchor.append(
+            {
+                "anchor": anchor,
+                "rows": sorted(
+                    pool,
+                    key=lambda row: (
+                        abs(float(row["achieved_bpp"]) - bpp),
+                        (
+                            float(row["surrogate_loss"])
+                            if row.get("surrogate_loss") is not None
+                            else float("inf")
+                        ),
+                        str(row["assignment_hash"]),
+                    ),
+                ),
+                "index": 0,
+            }
+        )
+
+    while len(selected) < limit:
+        progressed = False
+        for ranked in ranked_by_anchor:
+            rows = ranked["rows"]
+            idx = int(ranked["index"])
+            while idx < len(rows) and str(rows[idx]["assignment_hash"]) in selected_hashes:
+                idx += 1
+            ranked["index"] = idx + 1
+            if idx >= len(rows):
+                continue
+            row = rows[idx]
+            digest = str(row["assignment_hash"])
+            if digest in selected_hashes:
+                continue
+            selected.append(row)
+            selected_hashes.add(digest)
+            progressed = True
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+
+    return selected, {
+        "enabled": True,
+        "reason": "selected_nearest_generated_neighbors",
+        "limit": int(limit),
+        "selected": len(selected),
+        "anchors": [
+            {
+                "reason": anchor["reason"],
+                "bpp": float(anchor["bpp"]),
+            }
+            for anchor in anchors
+        ],
+        "selected_candidates": [
+            {
+                "assignment_hash": row.get("assignment_hash"),
+                "source": row.get("source"),
+                "achieved_bpp": float(row["achieved_bpp"]),
+                "surrogate_loss": row.get("surrogate_loss"),
+            }
+            for row in selected
+        ],
+        "selection_kl_key": selection_kl_key,
+    }
+
+
+def _archive_practical_knee_summary(
+    args,
+    *,
+    chosen: Mapping,
+    validated_frontier: list[dict],
+    candidates: list[dict],
+    selection_kl_key: str = "validation_kl",
+) -> dict:
+    if not candidates:
+        return {"enabled": False, "reason": "no_candidates"}
+    kl_noise_floor = _knee_kl_noise_floor(args)
+    rel_epsilon = max(
+        float(getattr(args, "knee_practical_kl_rel_epsilon", 0.10)),
+        0.0,
+    )
+    configured_abs_epsilon = max(
+        float(getattr(args, "knee_practical_kl_abs_epsilon", 0.0)),
+        0.0,
+    )
+    best_kl_row = min(
+        candidates,
+        key=lambda row: (
+            _row_validation_kl(row, selection_kl_key),
+            float(row["achieved_bpp"]),
+            str(row["assignment_hash"]),
+        ),
+    )
+    best_kl = _row_validation_kl(best_kl_row, selection_kl_key)
+    effective_abs_epsilon = max(
+        configured_abs_epsilon,
+        float(kl_noise_floor),
+        best_kl * rel_epsilon,
+    )
+    pool = validated_frontier or candidates
+    eligible = [
+        row
+        for row in pool
+        if _row_validation_kl(row, selection_kl_key)
+        <= best_kl + effective_abs_epsilon + 1e-12
+    ]
+    lowest_bpp_row = min(
+        eligible or [best_kl_row],
+        key=lambda row: (
+            float(row["achieved_bpp"]),
+            float(row["validation_kl"]),
+            str(row["assignment_hash"]),
+        ),
+    )
+    chosen_kl = _row_validation_kl(chosen, selection_kl_key)
+    chosen_delta = chosen_kl - best_kl
+    return {
+        "enabled": True,
+        "selection_kl_key": selection_kl_key,
+        "relative_kl_epsilon": float(rel_epsilon),
+        "configured_abs_kl_epsilon": float(configured_abs_epsilon),
+        "effective_abs_kl_epsilon": float(effective_abs_epsilon),
+        "best_kl": _archive_validated_summary(best_kl_row),
+        "lowest_bpp_within_best_kl_epsilon": _archive_validated_summary(
+            lowest_bpp_row
+        ),
+        "chosen": _archive_validated_summary(chosen),
+        "chosen_vs_best_abs_kl_delta": float(chosen_delta),
+        "chosen_vs_best_relative_kl_delta": (
+            float(chosen_delta / best_kl) if best_kl > 0.0 else 0.0
+        ),
+        "chosen_within_best_kl_epsilon": bool(
+            chosen_kl <= best_kl + effective_abs_epsilon + 1e-12
+        ),
+        "eligible_frontier_points": len(eligible),
+    }
+
+
 def _choose_validated_archive_knee(
     args,
     validated_frontier: list[dict],
     candidates: list[dict],
+    *,
+    selection_kl_key: str = "validation_kl",
 ) -> tuple[dict, dict]:
     kl_noise_floor = _knee_kl_noise_floor(args)
     unstable_policy = str(getattr(args, "knee_unstable_policy", "best-kl"))
     if len(validated_frontier) < 3:
-        chosen = min(candidates, key=lambda row: float(row["validation_kl"]))
+        chosen = min(candidates, key=lambda row: _row_validation_kl(row, selection_kl_key))
         knee_score = 0.0
         endpoint = True
     else:
         knee_bpp, knee_kl, knee_score, endpoint = segmented_kneedle_point(
             [
-                (float(row["achieved_bpp"]), float(row["validation_kl"]))
+                (float(row["achieved_bpp"]), _row_validation_kl(row, selection_kl_key))
                 for row in validated_frontier
             ]
         )
@@ -5133,18 +5851,18 @@ def _choose_validated_archive_knee(
             validated_frontier,
             key=lambda row: (
                 abs(float(row["achieved_bpp"]) - float(knee_bpp)),
-                abs(float(row["validation_kl"]) - float(knee_kl)),
+                abs(_row_validation_kl(row, selection_kl_key) - float(knee_kl)),
             ),
         )
 
     geometric_chosen = chosen
     loo_diagnostic = kneedle_leave_one_out_diagnostic(
         [
-            (float(row["achieved_bpp"]), float(row["validation_kl"]))
+            (float(row["achieved_bpp"]), _row_validation_kl(row, selection_kl_key))
             for row in validated_frontier
         ],
         float(geometric_chosen["achieved_bpp"]),
-        float(geometric_chosen["validation_kl"]),
+        _row_validation_kl(geometric_chosen, selection_kl_key),
         tolerance_bpp=float(getattr(args, "knee_tolerance", 0.1)),
         kl_noise_floor=float(kl_noise_floor),
     )
@@ -5162,7 +5880,7 @@ def _choose_validated_archive_knee(
         best_kl = min(
             validated_frontier,
             key=lambda row: (
-                float(row["validation_kl"]),
+                _row_validation_kl(row, selection_kl_key),
                 float(row["achieved_bpp"]),
                 float(row.get("target_bpp") or row["achieved_bpp"]),
             ),
@@ -5176,11 +5894,20 @@ def _choose_validated_archive_knee(
                 "geometric_chosen_target_bpp": geometric_chosen.get("target_bpp"),
                 "geometric_chosen_achieved_bpp": float(geometric_chosen["achieved_bpp"]),
                 "geometric_chosen_validation_kl": float(geometric_chosen["validation_kl"]),
+                "geometric_chosen_selection_kl": _row_validation_kl(
+                    geometric_chosen,
+                    selection_kl_key,
+                ),
                 "guarded_chosen_target_bpp": chosen.get("target_bpp"),
                 "guarded_chosen_achieved_bpp": float(chosen["achieved_bpp"]),
                 "guarded_chosen_validation_kl": float(chosen["validation_kl"]),
+                "guarded_chosen_selection_kl": _row_validation_kl(
+                    chosen,
+                    selection_kl_key,
+                ),
             }
     return chosen, {
+        "selection_kl_key": selection_kl_key,
         "kneedle_score": float(knee_score),
         "endpoint_fallback": bool(endpoint),
         "leave_one_out": loo_diagnostic,
@@ -5192,6 +5919,7 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
     args._runtime = runtime
     args._l3_measure_all_formats = _resolve_l3_measure_all_formats(args)
     kl_noise_floor = _knee_kl_noise_floor(args)
+    selection_kl_key = _validation_kl_key(args)
     runtime.output_root.mkdir(parents=True, exist_ok=True)
 
     seed_results, seed_meta = _load_knee_seed_results(args, runtime)
@@ -5369,6 +6097,7 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
             bpp_min=float(args.knee_bpp_min),
             bpp_max=float(args.knee_bpp_max),
             bit_precision=float(getattr(args, "bit_precision", 0.001)),
+            beam_per_bin=int(getattr(args, "knee_archive_beam_per_bin", 1)),
             profile=runtime.profile,
         )
         for row in pareto_rows:
@@ -5387,6 +6116,53 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
     generated_candidates, surrogate_meta = _select_lambda_archive_candidates(
         list(generated_by_hash.values()),
         limit=int(getattr(args, "knee_archive_validation_candidates", 9)),
+    )
+    generated_archive_metadata = {
+        "mode": "lambda_sandwich_archive_generated",
+        "anchor_bpp": float(anchor_bpp),
+        "anchor_assignment": (
+            str(anchor_assignment_path) if anchor_assignment_path else None
+        ),
+        "anchor_assignment_source": anchor_source,
+        "l3_resumed": bool(l3_resumed),
+        "l3_resume": l3_resume_meta,
+        "l3_cost_history_entries": len(l3_cost_history),
+        "knee_bpp_min": float(args.knee_bpp_min),
+        "knee_bpp_max": float(args.knee_bpp_max),
+        "bit_precision": float(getattr(args, "bit_precision", 0.001)),
+        "lambda_grid": [float(value) for value in lambda_grid],
+        "lambda_generated_unique": len(generated_by_hash),
+        "lambda_validation_limit": int(
+            getattr(args, "knee_archive_validation_candidates", 9)
+        ),
+        "refinement_validation_limit": int(
+            getattr(args, "knee_archive_refine_candidates", 8)
+        ),
+        "validation_repeats": int(getattr(args, "knee_validation_repeats", 1)),
+        "noise_aware_selection": bool(
+            getattr(args, "knee_noise_aware_selection", False)
+        ),
+        "selection_kl_key": selection_kl_key,
+        "validation_confidence_z": float(
+            getattr(args, "knee_validation_confidence_z", 1.0)
+        ),
+        "validation_repeat_seed_stride": int(
+            getattr(args, "knee_validation_repeat_seed_stride", 9973)
+        ),
+        "pareto_archive_dp": pareto_dp_meta,
+        "surrogate_selection": surrogate_meta,
+        "seed_frontier": seed_meta,
+        "seed_remeasurement": seed_remeasure_meta,
+        **_l3_scope_metadata(args),
+        **_calibration_metadata(args),
+    }
+    generated_archive_csv_path, generated_archive_json_path, generated_assignments_path = (
+        _write_generated_archive_outputs(
+            runtime.output_root,
+            generated=list(generated_by_hash.values()),
+            selected=generated_candidates,
+            metadata=generated_archive_metadata,
+        )
     )
     for row in generated_candidates:
         _upsert_archive_candidate(candidates_by_hash, row)
@@ -5416,47 +6192,124 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
         )
 
     validated_dir = runtime.output_root / "archive_validated"
-    measured_count = 0
-    for index, row in enumerate(candidates):
-        assignment = dict(row["_assignment"])
-        if row.get("validation_kl") is None:
-            _emit(
-                f"[knee][archive][validate] {index + 1}/{len(candidates)} "
-                f"source={row['source']} bpp={row['achieved_bpp']:.4f} "
-                f"lambda={row.get('lambda_penalty')}"
-            )
-            row["validation_kl"] = float(
-                measure_assignment_kl(
-                    runtime.model,
-                    assignment,
-                    runtime.calib_ids,
-                    runtime.ref_log_probs,
-                    work_root=runtime.work_root,
-                    profile=runtime.profile,
-                    use_frozen_weight_cache=False,
-                )
-            )
-            measured_count += 1
-        if not row.get("assignment_path"):
-            label = f"{index:03d}_bpp_{float(row['achieved_bpp']):.4f}"
-            assignment_path, layer_config_path = _write_named_assignment_artifacts(
-                assignment,
-                assignment_path=validated_dir / f"assignment_{label}.json",
-                layer_config_path=validated_dir / f"layer_config_{label}.json",
-            )
-            row["assignment_path"] = str(assignment_path)
-            row["layer_config_path"] = str(layer_config_path)
-        row.pop("_assignment", None)
-        row.pop("_validated", None)
+    measured_count = _validate_archive_candidate_rows(
+        args,
+        runtime,
+        candidates,
+        validated_dir=validated_dir,
+        start_index=0,
+    )
 
     validated_frontier = _nondominated_validated_points(
         candidates,
         kl_noise_floor=kl_noise_floor,
+        kl_key=selection_kl_key,
     )
     chosen, selection_meta = _choose_validated_archive_knee(
         args,
         validated_frontier,
         candidates,
+        selection_kl_key=selection_kl_key,
+    )
+    interaction_refinement_candidates: list[dict] = []
+    archive_interaction_meta = {
+        "enabled": _l3_interaction_enabled(args),
+        "attempted": False,
+        "selected_candidate": None,
+    }
+    if _l3_interaction_enabled(args):
+        chosen_assignment = _load_assignment_json(chosen["assignment_path"])
+        refined_assignment, archive_interaction_meta = run_l3_interaction_refine(
+            args,
+            runtime.model,
+            anchor_assignment,
+            chosen_assignment,
+            l3_candidates,
+            runtime.stats,
+            runtime.specs,
+            float(chosen["achieved_bpp"]),
+            runtime.l3_calib_ids,
+            work_root=runtime.work_root,
+            profile=runtime.profile,
+            prefix="[knee][archive]",
+        )
+        if assignment_hash(refined_assignment) != assignment_hash(chosen_assignment):
+            row = _candidate_from_assignment(
+                assignment=refined_assignment,
+                stats=runtime.stats,
+                specs=runtime.specs,
+                source="archive_interaction_refine",
+                source_path=None,
+                target_bpp=float(chosen["achieved_bpp"]),
+                surrogate_loss=chosen.get("surrogate_loss"),
+            )
+            row["solver_meta"] = {"interaction_refine": dict(archive_interaction_meta)}
+            if _candidate_bpp_in_range(args, row):
+                row["archive_refinement_selected"] = True
+                interaction_refinement_candidates.append(row)
+                archive_interaction_meta["selected_candidate"] = {
+                    "assignment_hash": row["assignment_hash"],
+                    "achieved_bpp": float(row["achieved_bpp"]),
+                    "source": row["source"],
+                }
+            else:
+                archive_interaction_meta["skipped_reason"] = (
+                    "interaction_candidate_out_of_range"
+                )
+    refinement_candidates, refinement_meta = _select_archive_refinement_candidates(
+        list(generated_by_hash.values()),
+        already_selected_hashes=set(candidates_by_hash),
+        validated_frontier=validated_frontier,
+        candidates=candidates,
+        chosen=chosen,
+        selection_meta=selection_meta,
+        selection_kl_key=selection_kl_key,
+        limit=int(getattr(args, "knee_archive_refine_candidates", 8)),
+    )
+    all_refinement_candidates = interaction_refinement_candidates + refinement_candidates
+    if all_refinement_candidates:
+        for row in all_refinement_candidates:
+            row["archive_refinement_selected"] = True
+            _upsert_archive_candidate(candidates_by_hash, row)
+        measured_count += _validate_archive_candidate_rows(
+            args,
+            runtime,
+            all_refinement_candidates,
+            validated_dir=validated_dir,
+            start_index=len(candidates),
+            emit_prefix="[knee][archive][refine]",
+        )
+        candidates = sorted(candidates_by_hash.values(), key=_archive_sort_key)
+        validated_frontier = _nondominated_validated_points(
+            candidates,
+            kl_noise_floor=kl_noise_floor,
+            kl_key=selection_kl_key,
+        )
+        chosen, selection_meta = _choose_validated_archive_knee(
+            args,
+            validated_frontier,
+            candidates,
+            selection_kl_key=selection_kl_key,
+        )
+    generated_archive_metadata["archive_refinement"] = refinement_meta
+    generated_archive_metadata["archive_interaction_refine"] = archive_interaction_meta
+    generated_archive_metadata["interaction_refinement_selected"] = len(
+        interaction_refinement_candidates
+    )
+    generated_archive_csv_path, generated_archive_json_path, generated_assignments_path = (
+        _write_generated_archive_outputs(
+            runtime.output_root,
+            generated=list(generated_by_hash.values()),
+            selected=generated_candidates + refinement_candidates,
+            metadata=generated_archive_metadata,
+        )
+    )
+    practical_knee = _archive_practical_knee_summary(
+        args,
+        chosen=chosen,
+        validated_frontier=validated_frontier,
+        candidates=candidates,
+        selection_kl_key=selection_kl_key,
     )
     chosen_assignment = _load_assignment_json(chosen["assignment_path"])
     knee_assignment_path, knee_layer_config_path = _write_named_assignment_artifacts(
@@ -5470,14 +6323,20 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
         "achieved_bpp": float(chosen["achieved_bpp"]),
         "target_bpp": chosen.get("target_bpp"),
         "validation_kl": float(chosen["validation_kl"]),
+        "selection_kl_key": selection_kl_key,
+        "selection_kl": _row_validation_kl(chosen, selection_kl_key),
         "surrogate_loss": chosen.get("surrogate_loss"),
         "lambda_penalty": chosen.get("lambda_penalty"),
         "knee_kl_noise_floor": float(kl_noise_floor),
         "assignment": str(knee_assignment_path),
         "layer_config": str(knee_layer_config_path),
         "format_histogram": chosen["format_histogram"],
+        "practical_knee": practical_knee,
         **selection_meta,
     }
+    for row in candidates:
+        row.pop("_assignment", None)
+        row.pop("_validated", None)
     _warn_endpoint_fallback("archive-knee", knee)
     _warn_kneedle_instability("archive-knee", knee)
     csv_path, json_path = _write_validated_frontier_outputs(
@@ -5499,12 +6358,35 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
             "lambda_generated_unique": len(generated_by_hash),
             "pareto_archive_dp": pareto_dp_meta,
             "lambda_validated_selected": len(generated_candidates),
+            "refinement_validated_selected": len(refinement_candidates),
+            "interaction_refinement_validated_selected": len(
+                interaction_refinement_candidates
+            ),
+            "archive_refinement": refinement_meta,
+            "archive_interaction_refine": archive_interaction_meta,
             "validation_candidate_count": len(candidates),
             "new_validation_measurements": int(measured_count),
+            "validation_repeats": int(
+                getattr(args, "knee_validation_repeats", 1)
+            ),
+            "noise_aware_selection": bool(
+                getattr(args, "knee_noise_aware_selection", False)
+            ),
+            "selection_kl_key": selection_kl_key,
+            "validation_confidence_z": float(
+                getattr(args, "knee_validation_confidence_z", 1.0)
+            ),
+            "validation_repeat_seed_stride": int(
+                getattr(args, "knee_validation_repeat_seed_stride", 9973)
+            ),
             "seed_frontier": seed_meta,
             "seed_remeasurement": seed_remeasure_meta,
             "surrogate_selection": surrogate_meta,
+            "generated_archive": str(generated_archive_json_path),
+            "generated_archive_csv": str(generated_archive_csv_path),
+            "generated_archive_assignments": str(generated_assignments_path),
             "knee_kl_noise_floor": float(kl_noise_floor),
+            "practical_knee": practical_knee,
             "included_assignments": list(
                 getattr(args, "knee_include_assignment", None) or []
             ),
@@ -5521,8 +6403,12 @@ def run_knee_archive_search(args, runtime: BudgetRuntime) -> int:
         json.dump(
             {
                 "knee": knee,
+                "practical_knee": practical_knee,
                 "validated_frontier": str(json_path),
                 "validated_frontier_csv": str(csv_path),
+                "generated_archive": str(generated_archive_json_path),
+                "generated_archive_csv": str(generated_archive_csv_path),
+                "generated_archive_assignments": str(generated_assignments_path),
             },
             f,
             indent=2,
@@ -7039,12 +7925,13 @@ def _nondominated_validated_points(
     points: list[dict],
     *,
     kl_noise_floor: float = DEFAULT_KNEE_KL_NOISE_FLOOR,
+    kl_key: str = "validation_kl",
 ) -> list[dict]:
     ordered = sorted(
         points,
         key=lambda row: (
             float(row["achieved_bpp"]),
-            float(row["validation_kl"]),
+            _row_validation_kl(row, kl_key),
             str(row["assignment_hash"]),
         ),
     )
@@ -7052,7 +7939,7 @@ def _nondominated_validated_points(
     best_kl = float("inf")
     kl_noise_floor = max(float(kl_noise_floor), 0.0)
     for row in ordered:
-        kl = float(row["validation_kl"])
+        kl = _row_validation_kl(row, kl_key)
         if kl < best_kl - kl_noise_floor - 1e-12:
             frontier.append(row)
             best_kl = kl
@@ -7074,6 +7961,10 @@ def _write_validated_frontier_outputs(
         "target_bpp",
         "achieved_bpp",
         "validation_kl",
+        "validation_kl_repeats",
+        "validation_kl_std",
+        "validation_kl_stderr",
+        "validation_kl_ucb",
         "surrogate_loss",
         "assignment_hash",
         "format_histogram",
@@ -7587,6 +8478,7 @@ def measure_assignment_kl(
     profile=None,
     perturbed_cache: PerturbedActivationCache | None = None,
     use_frozen_weight_cache: bool = True,
+    production_weight_cache=None,
     rng_seed: int | None = 0,
 ) -> float:
     device = next(model.parameters()).device
@@ -7597,6 +8489,8 @@ def measure_assignment_kl(
         default=True,
     ):
         use_frozen_weight_cache = False
+    use_frozen_weight_cache = _maybe_disable_frozen_weight_cache_for_memory(
+        device, use_frozen_weight_cache)
     hooks = perturbed_cache
     if hooks is None:
         cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_kl_hooks_", dir=str(work_root)))
@@ -7608,6 +8502,7 @@ def measure_assignment_kl(
             input_rows=0,
             cal_hash=cal_hash,
             profile=profile,
+            production_weight_cache=production_weight_cache,
         )
     values = []
     use_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
@@ -7647,6 +8542,13 @@ def measure_assignment_kl(
             if installed_here:
                 hooks.install()
             try:
+                # MED-6: env flag for full-sequence vs last-token KL.  Last-
+                # token is the historical default (cheaper, lower variance);
+                # full-sequence is closer to perplexity-style metrics and is
+                # what most downstream eval cares about.  Polish can choose.
+                full_seq = _env_flag_enabled(
+                    "PRISMAQUANT_FULL_SEQUENCE_KL", default=False,
+                )
                 with rng_cm:
                     if rng_seed is not None:
                         torch.manual_seed(int(rng_seed))
@@ -7654,8 +8556,12 @@ def measure_assignment_kl(
                             torch.cuda.manual_seed_all(int(rng_seed))
                     for i in range(calib_ids.size(0)):
                         batch = calib_ids[i:i + 1].to(device)
-                        def _forward(batch_ids):
-                            return model(batch_ids).logits[:, -1:, :].clone()
+                        if full_seq:
+                            def _forward(batch_ids):
+                                return model(batch_ids).logits.clone()
+                        else:
+                            def _forward(batch_ids):
+                                return model(batch_ids).logits[:, -1:, :].clone()
 
                         # With PRISMAQUANT_GRAPH_OUTPUT_CLONE=0 this returns
                         # the graph's static logits tensor. It is consumed by
@@ -7669,7 +8575,7 @@ def measure_assignment_kl(
                             device=device,
                             keepalive=(hooks,),
                         )
-                        teacher = ref_log_probs[i][:, -1:, :]
+                        teacher = ref_log_probs[i] if full_seq else ref_log_probs[i][:, -1:, :]
                         values.append(float(kl_divergence(logits, teacher).item()))
             finally:
                 if installed_here:
@@ -7831,6 +8737,80 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Add a one-pass cached-L3 Pareto DP archive to recover non-convex "
             "frontier pockets missed by scalar lambda values."
+        ),
+    )
+    ap.add_argument(
+        "--knee-archive-beam-per-bin",
+        type=int,
+        default=4,
+        help=(
+            "Retain this many cached-L3 DP states per average-bit bin before "
+            "reconstructing archive frontier assignments. Values above 1 keep "
+            "nearby variants that a one-winner DP would discard."
+        ),
+    )
+    ap.add_argument(
+        "--knee-archive-refine-candidates",
+        type=int,
+        default=8,
+        help=(
+            "After the first measured archive pass, validate this many extra "
+            "generated neighbors around the measured best/knee/unstable "
+            "regions."
+        ),
+    )
+    ap.add_argument(
+        "--knee-practical-kl-rel-epsilon",
+        type=float,
+        default=0.10,
+        help=(
+            "Relative KL slack used when reporting the lowest-bpp practical "
+            "alternative to the best measured archive candidate."
+        ),
+    )
+    ap.add_argument(
+        "--knee-practical-kl-abs-epsilon",
+        type=float,
+        default=0.0,
+        help=(
+            "Absolute KL slack floor used for practical archive-knee reporting."
+        ),
+    )
+    ap.add_argument(
+        "--knee-validation-repeats",
+        type=int,
+        default=1,
+        help=(
+            "Measure each archive/surrogate validation candidate this many "
+            "times and store mean/std/upper-confidence KL diagnostics."
+        ),
+    )
+    ap.add_argument(
+        "--knee-noise-aware-selection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use validation_kl_ucb rather than raw validation_kl for measured "
+            "frontier dominance and knee selection when repeated measurements "
+            "are available."
+        ),
+    )
+    ap.add_argument(
+        "--knee-validation-confidence-z",
+        type=float,
+        default=1.0,
+        help=(
+            "Z multiplier for validation_kl_ucb = mean + z*stderr when "
+            "--knee-validation-repeats is greater than 1."
+        ),
+    )
+    ap.add_argument(
+        "--knee-validation-repeat-seed-stride",
+        type=int,
+        default=9973,
+        help=(
+            "Seed stride between independent calibration shards used by "
+            "--knee-validation-repeats."
         ),
     )
     ap.add_argument(
@@ -8170,6 +9150,30 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     ap.add_argument(
+        "--l3-interaction-psd-project",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Project measured sparse pairwise residuals to a PSD quadratic "
+            "surrogate before local interaction solving."
+        ),
+    )
+    ap.add_argument(
+        "--l3-interaction-psd-min-eigenvalue",
+        type=float,
+        default=0.0,
+        help="Eigenvalue floor used by --l3-interaction-psd-project.",
+    )
+    ap.add_argument(
+        "--l3-interaction-psd-shrink",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional [0,1] shrinkage of the projected interaction matrix "
+            "toward its diagonal after PSD projection."
+        ),
+    )
+    ap.add_argument(
         "--l3-interaction-exact",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -8249,6 +9253,18 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("--knee-lambda-evaluations must be at least 2.")
         if args.knee_archive_validation_candidates < 0:
             ap.error("--knee-archive-validation-candidates must be non-negative.")
+        if args.knee_archive_beam_per_bin < 1:
+            ap.error("--knee-archive-beam-per-bin must be at least 1.")
+        if args.knee_archive_refine_candidates < 0:
+            ap.error("--knee-archive-refine-candidates must be non-negative.")
+        if args.knee_practical_kl_rel_epsilon < 0:
+            ap.error("--knee-practical-kl-rel-epsilon must be non-negative.")
+        if args.knee_practical_kl_abs_epsilon < 0:
+            ap.error("--knee-practical-kl-abs-epsilon must be non-negative.")
+        if args.knee_validation_repeats < 1:
+            ap.error("--knee-validation-repeats must be at least 1.")
+        if args.knee_validation_confidence_z < 0:
+            ap.error("--knee-validation-confidence-z must be non-negative.")
     if args.quality_equivalent_bits is not None:
         if args.quality_equivalent_bpp_min >= args.quality_equivalent_bits:
             ap.error(
@@ -8280,6 +9296,10 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(str(exc))
     args._resume_l3_costs_single = resume_single
     args._resume_l3_costs_by_anchor = resume_by_anchor
+    if args.l3_interaction_psd_min_eigenvalue < 0:
+        ap.error("--l3-interaction-psd-min-eigenvalue must be non-negative.")
+    if not (0.0 <= args.l3_interaction_psd_shrink <= 1.0):
+        ap.error("--l3-interaction-psd-shrink must be between 0 and 1.")
     work_root = Path(args.work_dir)
     output_root = Path(args.output_dir)
     work_root.mkdir(parents=True, exist_ok=True)
@@ -8370,6 +9390,35 @@ def main(argv: list[str] | None = None) -> int:
         l3_calib_ids = _prepare_kl_tensor_inputs(l3_calib_ids, model_device)
     ref_log_probs = cache_reference_log_probs(model, calib_ids, model_device)
     ref_log_probs = _prepare_ref_log_probs_for_kl(ref_log_probs, model_device)
+    args._knee_validation_repeat_inputs = None
+    if int(getattr(args, "knee_validation_repeats", 1)) > 1:
+        repeat_inputs = [(calib_ids, ref_log_probs)]
+        repeat_count = int(getattr(args, "knee_validation_repeats", 1))
+        seed_stride = int(getattr(args, "knee_validation_repeat_seed_stride", 9973))
+        for repeat_idx in range(1, repeat_count):
+            repeat_seed = int(args.calib_seed) + repeat_idx * seed_stride
+            repeat_calib_ids = load_wikitext_calibration(
+                tokenizer,
+                args.n_calib_samples,
+                args.calib_seqlen,
+                split=args.calib_split,
+                seed=repeat_seed,
+            )
+            repeat_calib_ids = _prepare_kl_tensor_inputs(
+                repeat_calib_ids,
+                model_device,
+            )
+            repeat_ref_log_probs = cache_reference_log_probs(
+                model,
+                repeat_calib_ids,
+                model_device,
+            )
+            repeat_ref_log_probs = _prepare_ref_log_probs_for_kl(
+                repeat_ref_log_probs,
+                model_device,
+            )
+            repeat_inputs.append((repeat_calib_ids, repeat_ref_log_probs))
+        args._knee_validation_repeat_inputs = repeat_inputs
     runtime = BudgetRuntime(
         work_root=work_root,
         output_root=output_root,

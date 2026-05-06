@@ -41,6 +41,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calib-split", default="train")
     parser.add_argument("--calib-seed", type=int, default=42)
     parser.add_argument("--dtype", default="bf16")
+    parser.add_argument(
+        "--production-weight-cache",
+        default=None,
+        help="Path to a pickled ProductionWeightCache (use the production-"
+        "faithful δw for cone KL instead of bare RTN).",
+    )
     args = parser.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -86,6 +92,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception:
             profile = DefaultProfile()
         ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
+
+        production_weight_cache = None
+        if args.production_weight_cache:
+            import pickle
+            with open(args.production_weight_cache, "rb") as fh:
+                production_weight_cache = pickle.load(fh)
+            print(
+                f"[validate] loaded production cache with "
+                f"{len(production_weight_cache)} entries from "
+                f"{args.production_weight_cache}",
+                flush=True,
+            )
+
         for path in candidates:
             payload = json.loads(path.read_text())
             assignment = payload["assignment"]
@@ -97,6 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 work_root=work_root,
                 profile=profile,
                 use_frozen_weight_cache=False,
+                production_weight_cache=production_weight_cache,
                 rng_seed=0,
             )
             counts = dict(Counter(assignment.values()))
