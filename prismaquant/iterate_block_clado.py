@@ -104,6 +104,7 @@ def run_iteration(
     polish_noise_floor: float = 1e-5,
     polish_budget_creep: float = 0.05,
     polish_steepest_first: bool = False,
+    skip_polish: bool = False,
     use_frozen_weight_cache: bool = False,
     log_callback=None,
 ) -> IterationResult:
@@ -214,29 +215,37 @@ def run_iteration(
     for unit_list in blocks_back.values():
         units.extend(unit_list)
     units.extend(singletons_back)
-    starting_bits = cdp._assignment_bits(units, best_validated["assignment"])
-    polish_budget = starting_bits * (1.0 + polish_budget_creep)
-    def _polish_progress(event):
-        kind = event.get("event")
-        if kind in {"accept_move", "pass_no_improvement", "budget_set", "starting"}:
-            log(event=f"polish_{kind}", iter=iter_idx, **{
-                k: v for k, v in event.items() if k != "event"
-            })
+    if skip_polish:
+        log(event="polish_skipped", iter=iter_idx)
+        polish_result = cdp.PolishResult(
+            initial_kl=float(best_validated["real_kl"]),
+            final_kl=float(best_validated["real_kl"]),
+            final_assignment=dict(best_validated["assignment"]),
+        )
+    else:
+        starting_bits = cdp._assignment_bits(units, best_validated["assignment"])
+        polish_budget = starting_bits * (1.0 + polish_budget_creep)
+        def _polish_progress(event):
+            kind = event.get("event")
+            if kind in {"accept_move", "pass_no_improvement", "budget_set", "starting"}:
+                log(event=f"polish_{kind}", iter=iter_idx, **{
+                    k: v for k, v in event.items() if k != "event"
+                })
 
-    polish_result = cdp.coord_descent_polish(
-        model, calib_ids, ref_log_probs,
-        units=units,
-        starting_assignment=best_validated["assignment"],
-        profile=profile,
-        work_root=work_root,
-        noise_floor=polish_noise_floor,
-        max_passes=polish_max_passes,
-        bits_budget=polish_budget,
-        pairs_by_block=dict(pairs_back),
-        steepest_first=polish_steepest_first,
-        use_frozen_weight_cache=use_frozen_weight_cache,
-        progress_callback=_polish_progress,
-    )
+        polish_result = cdp.coord_descent_polish(
+            model, calib_ids, ref_log_probs,
+            units=units,
+            starting_assignment=best_validated["assignment"],
+            profile=profile,
+            work_root=work_root,
+            noise_floor=polish_noise_floor,
+            max_passes=polish_max_passes,
+            bits_budget=polish_budget,
+            pairs_by_block=dict(pairs_back),
+            steepest_first=polish_steepest_first,
+            use_frozen_weight_cache=use_frozen_weight_cache,
+            progress_callback=_polish_progress,
+        )
     log(event="polish_done", iter=iter_idx,
         initial_kl=polish_result.initial_kl,
         final_kl=polish_result.final_kl,
@@ -327,6 +336,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "for small/medium models; OOM-prone at LLM scale."
         ),
     )
+    parser.add_argument(
+        "--skip-polish",
+        action="store_true",
+        help=(
+            "Skip the coord-descent polish stage at every iteration.  "
+            "Useful for fast surrogate-only sweeps where polish is the "
+            "dominant cost; the iterate output then equals best-validated."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -394,6 +412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 polish_noise_floor=args.polish_noise_floor,
                 polish_budget_creep=args.polish_budget_creep,
                 polish_steepest_first=bool(args.polish_steepest_first),
+                skip_polish=bool(args.skip_polish),
                 use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
                 log_callback=log,
             )
