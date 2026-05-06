@@ -214,6 +214,13 @@ def run_iteration(
     units.extend(singletons_back)
     starting_bits = cdp._assignment_bits(units, best_validated["assignment"])
     polish_budget = starting_bits * (1.0 + polish_budget_creep)
+    def _polish_progress(event):
+        kind = event.get("event")
+        if kind in {"accept_move", "pass_no_improvement", "budget_set", "starting"}:
+            log(event=f"polish_{kind}", iter=iter_idx, **{
+                k: v for k, v in event.items() if k != "event"
+            })
+
     polish_result = cdp.coord_descent_polish(
         model, calib_ids, ref_log_probs,
         units=units,
@@ -225,6 +232,7 @@ def run_iteration(
         bits_budget=polish_budget,
         pairs_by_block=dict(pairs_back),
         steepest_first=polish_steepest_first,
+        progress_callback=_polish_progress,
     )
     log(event="polish_done", iter=iter_idx,
         initial_kl=polish_result.initial_kl,
