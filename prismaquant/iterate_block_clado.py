@@ -125,41 +125,25 @@ def run_iteration(
     # to four-term since OF doesn't support sandwich centering yet.
     method_used = measure_method
     if measure_method == "output_fisher":
-        if center_assignment is None or all(
-            fmt == "BF16" for fmt in center_assignment.values()
-        ):
-            log(event="measure_start", iter=iter_idx, method="output_fisher")
-            payload = collect_output_fisher(
-                model, calib_ids, formats,
-                profile=profile,
-                cache_dir=str(iter_dir / "of_cache"),
-                keep_disk_cache=False,
-                skip_pairs=False,
-            )
-            payload_path = iter_dir / "block_clado.json"
-            payload_path.write_text(json.dumps(payload, indent=2) + "\n")
-            log(event="measure_done", iter=iter_idx,
-                method="output_fisher",
-                elapsed=payload["meta"]["elapsed_seconds"],
-                center_kl=0.0)
-        else:
-            method_used = "four_term"
-            log(event="measure_start", iter=iter_idx,
-                method="four_term",
-                reason="OF does not support sandwich centering")
-            payload = collect_block_clado(
-                model, calib_ids, formats,
-                profile=profile, work_root=work_root,
-                skip_pairs=False,
-                center_assignment=center_assignment,
-                use_frozen_weight_cache=use_frozen_weight_cache,
-            )
-            payload_path = iter_dir / "block_clado.json"
-            payload_path.write_text(json.dumps(payload, indent=2) + "\n")
-            log(event="measure_done", iter=iter_idx,
-                method="four_term",
-                elapsed=payload["meta"]["elapsed_seconds"],
-                center_kl=payload["meta"].get("center_kl", 0.0))
+        # OF now supports sandwich centering as well — pass through.
+        log(event="measure_start", iter=iter_idx, method="output_fisher",
+            centered=(center_assignment is not None))
+        payload = collect_output_fisher(
+            model, calib_ids, formats,
+            profile=profile,
+            cache_dir=str(iter_dir / "of_cache"),
+            keep_disk_cache=False,
+            skip_pairs=False,
+            center_assignment=center_assignment,
+            use_frozen_weight_cache=use_frozen_weight_cache,
+            include_activation_quant=True,
+        )
+        payload_path = iter_dir / "block_clado.json"
+        payload_path.write_text(json.dumps(payload, indent=2) + "\n")
+        log(event="measure_done", iter=iter_idx,
+            method="output_fisher",
+            elapsed=payload["meta"]["elapsed_seconds"],
+            center_kl=payload["meta"].get("center_kl", 0.0))
     else:
         log(event="measure_start", iter=iter_idx, method="four_term")
         payload = collect_block_clado(

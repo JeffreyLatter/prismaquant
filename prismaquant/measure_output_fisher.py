@@ -227,25 +227,42 @@ def _forward_logits_with_assignment(
 def fisher_omega_ii(
     teacher_probs: Sequence[torch.Tensor],
     delta_z: Sequence[torch.Tensor],
+    *,
+    linear_offset: Sequence[torch.Tensor] | None = None,
 ) -> float:
-    """Return ``(1/2) · mean_t Var_{p_t}(δz)`` averaged over all tokens.
+    """Return ``Ω_ii`` = (1/2) · mean_t Var_p(δz) [+ linear correction].
 
-    ``teacher_probs[i]`` and ``delta_z[i]`` should be aligned ``[T, V]``
-    fp32 tensors for calibration sample ``i``.
+    For BF16-centered measurement (``linear_offset=None``), this returns
+    the standard ``(1/2) Var_{p_t}(δz)`` second-order Fisher term.
+
+    For sandwich-centered measurement, the Taylor expansion of
+    ``KL(p_t ‖ student)`` at the centered student state ``z_c`` has a
+    non-zero linear term ``⟨p_c − p_t, δz⟩``.  Pass ``linear_offset =
+    (p_c − p_t)`` per sample to include it; the function then returns
+
+        E_t[⟨linear_offset, δz⟩] + (1/2) E_t[Var_{p_c}(δz)]
+
+    which equals ``KL(p_t ‖ student_perturbed) − KL(p_t ‖ student_c)``
+    at second order — exactly what the four-term identity measures.
     """
-    total_var = 0.0
+    total_quad = 0.0
+    total_lin = 0.0
     total_tokens = 0
-    for p, dz in zip(teacher_probs, delta_z):
+    for idx, (p, dz) in enumerate(zip(teacher_probs, delta_z)):
         p32 = p.float()
         dz32 = dz.float()
         e_dz = (p32 * dz32).sum(dim=-1)
         e_dz2 = (p32 * dz32 * dz32).sum(dim=-1)
         var = e_dz2 - e_dz * e_dz
-        total_var += float(var.sum())
+        total_quad += float(var.sum())
         total_tokens += var.numel()
+        if linear_offset is not None:
+            offset = linear_offset[idx].float()
+            lin = (offset * dz32).sum(dim=-1)
+            total_lin += float(lin.sum())
     if total_tokens == 0:
         return 0.0
-    return 0.5 * total_var / total_tokens
+    return (total_lin + 0.5 * total_quad) / total_tokens
 
 
 @torch.no_grad()
@@ -290,6 +307,7 @@ def collect_output_fisher(
     skip_pairs: bool = False,
     include_activation_quant: bool = True,
     use_frozen_weight_cache: bool = False,
+    center_assignment: Mapping[str, str] | None = None,
 ) -> dict:
     """Build the Output-Fisher Block-CLADO payload.
 
@@ -324,14 +342,20 @@ def collect_output_fisher(
         cleanup_cache_dir = False
 
     start = time.time()
+    is_sandwich = center_assignment is not None and any(
+        fr.canonical_format_name(str(fmt)) != "BF16"
+        for fmt in center_assignment.values()
+    )
     try:
         # ---------------------------------------------------------------
-        # Phase 1: clean teacher logits + teacher probs
+        # Phase 1: teacher logits + teacher probs (always needed for the
+        # linear correction term in sandwich mode).
         # ---------------------------------------------------------------
         if progress_callback is not None:
             progress_callback({
                 "event": "teacher_forward_start",
                 "include_activation_quant": include_activation_quant,
+                "centered": bool(is_sandwich),
             })
         z_teacher = _forward_logits(model, calib_ids)  # list of [T, V] fp32 (CPU)
         teacher_probs: list[torch.Tensor] = [
@@ -343,13 +367,67 @@ def collect_output_fisher(
                 "n_samples": len(z_teacher),
             })
 
-        # Build BF16-everywhere assignment for the activation-quant path
-        units_by_name_for_base = {u.name: u for u in all_units}
-        # Empty mapping is fine for _bf16_assignment — it iterates the units
-        bf16_base = {}
+        # Build BF16-everywhere base for the perturbed-cache path (used
+        # when centering at BF16 or when we need a clean baseline).
+        bf16_base: dict[str, str] = {}
         for unit in all_units:
             for member in unit.member_qnames:
                 bf16_base[member] = "BF16"
+
+        # ---------------------------------------------------------------
+        # Phase 1b: sandwich state (z_c, p_c, KL(p_t ‖ p_c), linear offset)
+        # ---------------------------------------------------------------
+        if is_sandwich:
+            # Use the user-supplied centered assignment as the base.
+            sandwich_base: dict[str, str] = {}
+            for member, fmt in center_assignment.items():
+                sandwich_base[str(member)] = fr.canonical_format_name(str(fmt))
+            # Fill any missing members with BF16
+            for unit in all_units:
+                for member in unit.member_qnames:
+                    sandwich_base.setdefault(member, "BF16")
+            if progress_callback is not None:
+                progress_callback({"event": "centered_forward_start"})
+            z_centered = _forward_logits_with_assignment(
+                model, sandwich_base, calib_ids,
+                work_root=cache_dir,
+                profile=profile,
+                use_frozen_weight_cache=use_frozen_weight_cache,
+            )
+            centered_probs: list[torch.Tensor] = [
+                torch.softmax(z, dim=-1) for z in z_centered
+            ]
+            # Compute KL(p_t || p_centered) for telemetry
+            log_p_c = [torch.log(p.clamp(min=1e-30)) for p in centered_probs]
+            log_p_t = [torch.log(p.clamp(min=1e-30)) for p in teacher_probs]
+            total_kl = 0.0
+            total_tokens = 0
+            for p_t_i, lp_t_i, lp_c_i in zip(teacher_probs, log_p_t, log_p_c):
+                kl_per_token = (p_t_i * (lp_t_i - lp_c_i)).sum(dim=-1)
+                total_kl += float(kl_per_token.sum())
+                total_tokens += kl_per_token.numel()
+            center_kl = total_kl / max(total_tokens, 1)
+            # Linear offset for Ω_ii correction: (p_c - p_t) per sample
+            linear_offset = [pc - pt for pc, pt in zip(centered_probs, teacher_probs)]
+            # Pair Ω_ij math uses centered_probs as the quadratic measure
+            quad_probs = centered_probs
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "centered_forward_done",
+                    "center_kl": float(center_kl),
+                })
+            # The base from which we apply per-unit overrides
+            base_assignment = sandwich_base
+            # Keep z_centered for δz computation
+            z_baseline = z_centered
+        else:
+            sandwich_base = None
+            centered_probs = None
+            linear_offset = None
+            quad_probs = teacher_probs
+            center_kl = 0.0
+            base_assignment = bf16_base
+            z_baseline = z_teacher
 
         # ---------------------------------------------------------------
         # Phase 2: compute and cache δz_{U,f} for each (unit, format != BF16);
@@ -357,21 +435,34 @@ def collect_output_fisher(
         # ---------------------------------------------------------------
         omega_ii: dict[tuple[str, str], float] = {}
         delta_z_paths: dict[tuple[str, str], Path] = {}
+        # In sandwich mode we override starting from the centered base; the
+        # "no-op" format for each unit is whatever it has in the center.
+        per_unit_center: dict[str, str] = {}
+        for unit in all_units:
+            cur_fmt = "BF16"
+            for member in unit.member_qnames:
+                if base_assignment.get(member, "BF16") != "BF16":
+                    cur_fmt = base_assignment[member]
+                    break
+            per_unit_center[unit.name] = cur_fmt
         n_pert_total = sum(
-            sum(1 for opt in u.options if opt.fmt != "BF16")
+            sum(1 for opt in u.options if opt.fmt != per_unit_center[u.name])
             for u in all_units
         )
         n_pert_done = 0
         for unit in all_units:
+            center_fmt = per_unit_center[unit.name]
             for opt in unit.options:
-                if opt.fmt == "BF16":
-                    omega_ii[(unit.name, "BF16")] = 0.0
+                if opt.fmt == center_fmt:
+                    omega_ii[(unit.name, opt.fmt)] = 0.0
                     continue
 
-                if include_activation_quant:
+                if include_activation_quant or is_sandwich:
                     # Use PerturbedActivationCache so activation quantization is
                     # applied at this unit, matching deployment / four-term.
-                    assignment = dict(bf16_base)
+                    # Required for sandwich (need consistent quant on all
+                    # already-non-BF16 units).
+                    assignment = dict(base_assignment)
                     canonical_fmt = fr.canonical_format_name(opt.fmt)
                     for member in unit.member_qnames:
                         assignment[member] = canonical_fmt
@@ -393,7 +484,7 @@ def collect_output_fisher(
                         omega_ii[(unit.name, opt.fmt)] = 0.0
                         continue
                 else:
-                    # Weight-only fast path (legacy)
+                    # Weight-only fast path (legacy, BF16 base only)
                     saved = _quantize_unit_in_place(model, unit, opt.fmt)
                     if not saved:
                         omega_ii[(unit.name, opt.fmt)] = 0.0
@@ -403,8 +494,13 @@ def collect_output_fisher(
                     finally:
                         _restore_unit(model, saved)
 
-                delta_z = [(zp - zt).contiguous() for zp, zt in zip(z_pert, z_teacher)]
-                omega_ii[(unit.name, opt.fmt)] = fisher_omega_ii(teacher_probs, delta_z)
+                # δz is measured FROM the baseline (BF16 in normal mode,
+                # centered state in sandwich mode).
+                delta_z = [(zp - zb).contiguous() for zp, zb in zip(z_pert, z_baseline)]
+                omega_ii[(unit.name, opt.fmt)] = fisher_omega_ii(
+                    quad_probs, delta_z,
+                    linear_offset=linear_offset,
+                )
 
                 # Save for pair compute later
                 delta_z_path = cache_dir / f"{_slug(unit.name)}__{_slug(opt.fmt)}.pt"
@@ -439,8 +535,9 @@ def collect_output_fisher(
                 # Load this block's δz tensors (stay on CPU, fp32 for compute)
                 block_cache: dict[tuple[str, str], list[torch.Tensor]] = {}
                 for unit in units_in_block:
+                    center_fmt = per_unit_center[unit.name]
                     for opt in unit.options:
-                        if opt.fmt == "BF16":
+                        if opt.fmt == center_fmt:
                             continue
                         path = delta_z_paths.get((unit.name, opt.fmt))
                         if path is None:
@@ -452,10 +549,14 @@ def collect_output_fisher(
                 for unit_a_name, unit_b_name in enumerate_block_pairs(units_in_block):
                     unit_a = units_by_name[unit_a_name]
                     unit_b = units_by_name[unit_b_name]
+                    center_a = per_unit_center[unit_a.name]
+                    center_b = per_unit_center[unit_b.name]
                     omega_ij_dict: dict[tuple[str, str], float] = {}
                     for opt_a in unit_a.options:
                         for opt_b in unit_b.options:
-                            if opt_a.fmt == "BF16" or opt_b.fmt == "BF16":
+                            if opt_a.fmt == center_a or opt_b.fmt == center_b:
+                                # Either format == centered format → δz = 0,
+                                # so Ω_ij = 0 by the four-term identity.
                                 omega_ij_dict[(opt_a.fmt, opt_b.fmt)] = 0.0
                                 continue
                             dz_a = block_cache.get((unit_a.name, opt_a.fmt))
@@ -464,7 +565,7 @@ def collect_output_fisher(
                                 omega_ij_dict[(opt_a.fmt, opt_b.fmt)] = 0.0
                                 continue
                             omega_ij_dict[(opt_a.fmt, opt_b.fmt)] = fisher_omega_ij(
-                                teacher_probs, dz_a, dz_b,
+                                quad_probs, dz_a, dz_b,
                             )
                     pair_list.append(bc.BlockPair(
                         unit_a=unit_a.name,
@@ -538,19 +639,19 @@ def collect_output_fisher(
             "loss": "teacher_student_kl",
             "method": "output_fisher",
             "method_notes": (
-                "BF16-centered Output-Fisher; "
-                + ("activation quantization included via PerturbedActivationCache. "
-                   if include_activation_quant else
-                   "weight-only perturbation (no activation quantization). ")
-                + "Sandwich centering not yet supported; falls back to four-term."
+                ("Sandwich-centered " if is_sandwich else "BF16-centered ") +
+                "Output-Fisher; " +
+                ("activation quantization included via PerturbedActivationCache. "
+                 if (include_activation_quant or is_sandwich) else
+                 "weight-only perturbation (no activation quantization). ")
             ),
-            "include_activation_quant": bool(include_activation_quant),
+            "include_activation_quant": bool(include_activation_quant or is_sandwich),
+            "centered": bool(is_sandwich),
+            "center_kl": float(center_kl),
             "block_count": len(blocks),
             "singleton_count": len(singletons),
-            "n_perturbation_forwards": int(n_pert_done) + 1,  # +1 for teacher
+            "n_perturbation_forwards": int(n_pert_done) + (2 if is_sandwich else 1),
             "skip_pairs": bool(skip_pairs),
-            "centered": False,
-            "center_kl": 0.0,
             "delta_z_dtype": str(delta_z_dtype),
         }
         return bc.units_and_pairs_to_payload(
