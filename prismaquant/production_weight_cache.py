@@ -451,6 +451,12 @@ def fill_production_weight_cache(
 
     n = len(qname_to_module) * len(formats)
     done = 0
+    # MEM: free per-Linear activation tensors after each render so peak
+    # memory stays bounded.  On 27B, 497 Linears × ~10K in_features × 512
+    # rows × fp32 = ~10 GB just for activations.  Freeing in-loop drops
+    # this to ~20 MB resident.
+    import gc as _gc
+    activations_local = dict(activations)  # shallow copy; we'll pop entries
     for qname, mod in qname_to_module.items():
         weight = mod.weight.data
         joint = joint_globals.get(qname)
@@ -466,7 +472,7 @@ def fill_production_weight_cache(
                 w_dq = render_production_weight(
                     weight, fmt,
                     qname=qname,
-                    activations=activations,
+                    activations=activations_local,
                     levers=levers,
                     joint_global_real=joint,
                     input_global_scale=export_scale,
@@ -479,10 +485,28 @@ def fill_production_weight_cache(
                         flush=True,
                     )
                 continue
-            weights[(qname, fmt.upper())] = w_dq.cpu()
+            # MEM: store as the model's native dtype (bf16 by default)
+            # rather than fp32 — _quantize_2d's compute_only path returns
+            # fp32 but we always re-cast at install time, so storing fp32
+            # is wasteful (2× memory).  On 27B this drops the cache from
+            # ~25 GB to ~12 GB.
+            target_dtype = weight.dtype if weight.dtype != torch.float32 else torch.bfloat16
+            weights[(qname, fmt.upper())] = w_dq.to(target_dtype).cpu()
             done += 1
+            del w_dq
             if progress and done % 25 == 0:
                 print(f"[prod-cache] {done}/{n}", flush=True)
+        # Free this Linear's activation tensor — won't render this qname
+        # again, and the activation can be tens of MB on big models.
+        activations_local.pop(qname, None)
+        if done % 50 == 0:
+            _gc.collect()
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
     if progress:
         print(f"[prod-cache] rendered {len(weights)} (qname, fmt) entries; "
               f"{len(failed)} failures", flush=True)
