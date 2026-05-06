@@ -103,6 +103,7 @@ def run_iteration(
     polish_max_passes: int = 8,
     polish_noise_floor: float = 1e-5,
     polish_budget_creep: float = 0.05,
+    polish_steepest_first: bool = False,
     log_callback=None,
 ) -> IterationResult:
     """One iteration: measure → sweep → kneedle → validate → polish."""
@@ -207,7 +208,7 @@ def run_iteration(
     # way to BF16-everywhere.
     log(event="polish_start", iter=iter_idx)
     units = []
-    blocks_back, singletons_back, _pairs = bc.parse_payload(payload)
+    blocks_back, singletons_back, pairs_back = bc.parse_payload(payload)
     for unit_list in blocks_back.values():
         units.extend(unit_list)
     units.extend(singletons_back)
@@ -222,6 +223,8 @@ def run_iteration(
         noise_floor=polish_noise_floor,
         max_passes=polish_max_passes,
         bits_budget=polish_budget,
+        pairs_by_block=dict(pairs_back),
+        steepest_first=polish_steepest_first,
     )
     log(event="polish_done", iter=iter_idx,
         initial_kl=polish_result.initial_kl,
@@ -295,6 +298,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "polish make ~5%% Pareto-beneficial precision upgrades."
         ),
     )
+    parser.add_argument(
+        "--polish-steepest-first",
+        action="store_true",
+        help=(
+            "Order polish candidates by surrogate ΔΩ; accept the first "
+            "real-KL improvement.  Faster than greedy-best when the "
+            "surrogate ranks moves accurately around the current point."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -360,6 +372,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 polish_max_passes=args.polish_max_passes,
                 polish_noise_floor=args.polish_noise_floor,
                 polish_budget_creep=args.polish_budget_creep,
+                polish_steepest_first=bool(args.polish_steepest_first),
                 log_callback=log,
             )
             summary_rows.append(result)

@@ -112,6 +112,82 @@ def _assignment_bits(
     return total
 
 
+def _surrogate_candidate_priority(
+    units: Sequence[bc.DecisionUnit],
+    pairs_by_block: Mapping[str, Sequence[bc.BlockPair]],
+    current_assignment: Mapping[str, str],
+) -> dict[tuple[str, str], float]:
+    """Return surrogate-predicted ΔCost for every (unit, target_fmt) flip.
+
+    For unit i with current format c_i and trial format f, the predicted
+    delta in surrogate cost is::
+
+        ΔΩ_i = Ω_ii(i, f) − Ω_ii(i, c_i)
+             + Σ_{j ≠ i, in block_i} [Ω_ij(i, j; f, c_j) − Ω_ij(i, j; c_i, c_j)]
+
+    More-negative ΔΩ_i predicts larger improvement.  We only compute pair
+    deltas for *intra-block* edges since that's the only Ω_ij we measured.
+    """
+    by_unit_format = {
+        unit.name: {opt.fmt: opt for opt in unit.options}
+        for unit in units
+    }
+    current_fmts: dict[str, str] = {}
+    for unit in units:
+        for member in unit.member_qnames:
+            if member in current_assignment:
+                current_fmts[unit.name] = fr.canonical_format_name(
+                    str(current_assignment[member])
+                )
+                break
+    # Build a quick lookup of the block each unit is in.
+    units_by_block: dict[str, list[bc.DecisionUnit]] = {}
+    for unit in units:
+        units_by_block.setdefault(unit.block_id, []).append(unit)
+
+    priority: dict[tuple[str, str], float] = {}
+    for unit in units:
+        cur_fmt = current_fmts.get(unit.name)
+        if cur_fmt is None:
+            continue
+        cur_opt = by_unit_format[unit.name].get(cur_fmt)
+        if cur_opt is None:
+            continue
+        block_pairs = pairs_by_block.get(unit.block_id, ())
+        for opt in unit.options:
+            if opt.fmt == cur_fmt:
+                continue
+            delta = float(opt.omega_ii) - float(cur_opt.omega_ii)
+            for pair in block_pairs:
+                if unit.name not in (pair.unit_a, pair.unit_b):
+                    continue
+                other_name = pair.unit_b if pair.unit_a == unit.name else pair.unit_a
+                other_fmt = current_fmts.get(other_name)
+                if other_fmt is None:
+                    continue
+                if pair.unit_a == unit.name:
+                    new_omega = pair.omega_ij.get((opt.fmt, other_fmt))
+                    if new_omega is None:
+                        new_omega = pair.omega_ij.get((other_fmt, opt.fmt))
+                    cur_omega = pair.omega_ij.get((cur_fmt, other_fmt))
+                    if cur_omega is None:
+                        cur_omega = pair.omega_ij.get((other_fmt, cur_fmt))
+                else:
+                    new_omega = pair.omega_ij.get((other_fmt, opt.fmt))
+                    if new_omega is None:
+                        new_omega = pair.omega_ij.get((opt.fmt, other_fmt))
+                    cur_omega = pair.omega_ij.get((other_fmt, cur_fmt))
+                    if cur_omega is None:
+                        cur_omega = pair.omega_ij.get((cur_fmt, other_fmt))
+                if new_omega is None:
+                    new_omega = 0.0
+                if cur_omega is None:
+                    cur_omega = 0.0
+                delta += float(new_omega) - float(cur_omega)
+            priority[(unit.name, opt.fmt)] = float(delta)
+    return priority
+
+
 def coord_descent_polish(
     model,
     calib_ids: torch.Tensor,
@@ -125,6 +201,8 @@ def coord_descent_polish(
     max_passes: int = 8,
     bits_budget: float | None = None,
     bits_tolerance: float = 0.0,
+    pairs_by_block: Mapping[str, Sequence[bc.BlockPair]] | None = None,
+    steepest_first: bool = False,
     progress_callback=None,
 ) -> PolishResult:
     """Polish a starting assignment via real-KL-gated single-flip moves.
@@ -200,46 +278,76 @@ def coord_descent_polish(
             best_kl_after = current_kl
             best_bits_after = current_bits
             candidates_this_pass = 0
-            # Order units lexicographically for reproducibility.
-            for unit in sorted(units, key=lambda u: u.name):
+
+            # Order candidates by surrogate priority when steepest_first is
+            # enabled and a pairs_by_block payload was supplied.  Otherwise
+            # sweep lexicographically (greedy-best).
+            order: list[tuple[bc.DecisionUnit, "bc.FormatCost"]]
+            if steepest_first and pairs_by_block is not None:
+                priority = _surrogate_candidate_priority(
+                    units, pairs_by_block, current,
+                )
+                order = []
+                for unit in units:
+                    cur_fmt = _current_unit_format(current, unit)
+                    if cur_fmt is None:
+                        continue
+                    for option in unit.options:
+                        if option.fmt == cur_fmt:
+                            continue
+                        order.append((unit, option))
+                order.sort(key=lambda pair: priority.get((pair[0].name, pair[1].fmt), 0.0))
+            else:
+                order = []
+                for unit in sorted(units, key=lambda u: u.name):
+                    cur_fmt = _current_unit_format(current, unit)
+                    if cur_fmt is None:
+                        continue
+                    for option in unit.options:
+                        if option.fmt == cur_fmt:
+                            continue
+                        order.append((unit, option))
+
+            for unit, option in order:
                 cur_fmt = _current_unit_format(current, unit)
                 if cur_fmt is None:
                     continue
                 cur_bits = option_bits.get((unit.name, cur_fmt), 0.0)
-                for option in unit.options:
-                    if option.fmt == cur_fmt:
-                        continue
-                    trial_bits = current_bits - cur_bits + option_bits.get(
-                        (unit.name, option.fmt), 0.0,
-                    )
-                    if trial_bits > budget_bits + 1e-9:
-                        # Skip moves that bust the budget.
-                        continue
-                    trial = _override_unit(current, unit, option.fmt)
-                    trial_kl = measure_assignment_kl(
-                        model, trial, calib_ids, ref_log_probs,
-                        work_root=work_root, profile=profile,
-                        use_frozen_weight_cache=False, rng_seed=0,
-                    )
-                    n_measurements += 1
-                    candidates_this_pass += 1
-                    if progress_callback is not None:
-                        progress_callback({
-                            "event": "trial",
-                            "pass": pass_idx,
-                            "unit": unit.name,
-                            "from": cur_fmt,
-                            "to": option.fmt,
-                            "current_kl": float(current_kl),
-                            "trial_kl": float(trial_kl),
-                            "trial_bits": float(trial_bits),
-                            "best_so_far": float(best_kl_after),
-                            "n_measurements": n_measurements,
-                        })
-                    if trial_kl < best_kl_after - float(noise_floor):
-                        best_kl_after = float(trial_kl)
-                        best_bits_after = float(trial_bits)
-                        best_move = (unit, option.fmt)
+                trial_bits = current_bits - cur_bits + option_bits.get(
+                    (unit.name, option.fmt), 0.0,
+                )
+                if trial_bits > budget_bits + 1e-9:
+                    # Skip moves that bust the budget.
+                    continue
+                trial = _override_unit(current, unit, option.fmt)
+                trial_kl = measure_assignment_kl(
+                    model, trial, calib_ids, ref_log_probs,
+                    work_root=work_root, profile=profile,
+                    use_frozen_weight_cache=False, rng_seed=0,
+                )
+                n_measurements += 1
+                candidates_this_pass += 1
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "trial",
+                        "pass": pass_idx,
+                        "unit": unit.name,
+                        "from": cur_fmt,
+                        "to": option.fmt,
+                        "current_kl": float(current_kl),
+                        "trial_kl": float(trial_kl),
+                        "trial_bits": float(trial_bits),
+                        "best_so_far": float(best_kl_after),
+                        "n_measurements": n_measurements,
+                    })
+                if trial_kl < best_kl_after - float(noise_floor):
+                    best_kl_after = float(trial_kl)
+                    best_bits_after = float(trial_bits)
+                    best_move = (unit, option.fmt)
+                    # Steepest-first: accept the first improving move
+                    # without exhausting the rest of the pass.
+                    if steepest_first:
+                        break
             if best_move is None:
                 if progress_callback is not None:
                     progress_callback({
@@ -299,6 +407,23 @@ def units_from_payload(payload_path: str | Path) -> list[bc.DecisionUnit]:
         units.extend(unit_list)
     units.extend(singletons)
     return units
+
+
+def units_and_pairs_from_payload(
+    payload_path: str | Path,
+) -> tuple[list[bc.DecisionUnit], dict[str, list[bc.BlockPair]]]:
+    """Load DecisionUnits AND intra-block pairs from a Block-CLADO payload.
+
+    Returns ``(units, pairs_by_block)`` for use with ``steepest_first``.
+    """
+    with Path(payload_path).open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    blocks, singletons, pairs = bc.parse_payload(payload)
+    units: list[bc.DecisionUnit] = []
+    for unit_list in blocks.values():
+        units.extend(unit_list)
+    units.extend(singletons)
+    return units, dict(pairs)
 
 
 def _device_from_arg(value: str) -> str:
@@ -365,16 +490,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--bits-tolerance", type=float, default=0.0)
+    parser.add_argument(
+        "--steepest-first",
+        action="store_true",
+        help=(
+            "Order candidate flips by the surrogate's predicted ΔΩ and "
+            "accept the first measured improvement.  Faster than greedy-"
+            "best when the surrogate ranks moves accurately around the "
+            "current assignment."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    units = units_from_payload(args.payload)
+    units, pairs_by_block = units_and_pairs_from_payload(args.payload)
     if not units:
         raise RuntimeError(f"no decision units in {args.payload}")
-    print(f"[polish] loaded {len(units)} decision units from {args.payload}",
-          flush=True)
+    print(
+        f"[polish] loaded {len(units)} decision units, "
+        f"{sum(len(p) for p in pairs_by_block.values())} pairs from {args.payload}",
+        flush=True,
+    )
 
     starting_payload = json.loads(Path(args.starting_assignment).read_text())
     if isinstance(starting_payload, dict) and "assignment" in starting_payload:
@@ -440,6 +578,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_passes=args.max_passes,
             bits_budget=bits_budget,
             bits_tolerance=args.bits_tolerance,
+            pairs_by_block=pairs_by_block,
+            steepest_first=bool(args.steepest_first),
             progress_callback=_progress_printer,
         )
         out_payload = {
