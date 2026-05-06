@@ -151,6 +151,56 @@ def test_fisher_omega_ii_consistent_across_token_aggregation():
     assert omega_full == pytest.approx(omega_chunks, rel=1e-7)
 
 
+def test_fisher_omega_ii_with_linear_offset_zero_offset_matches_no_offset():
+    """When linear_offset is all zeros, sandwich Ω_ii reduces to BF16-centered."""
+    torch.manual_seed(123)
+    p = torch.softmax(torch.randn(2, 5), dim=-1)
+    dz = torch.randn(2, 5) * 0.5
+    zero_offset = [torch.zeros_like(p)]
+    omega_no_offset = of.fisher_omega_ii([p], [dz])
+    omega_zero_offset = of.fisher_omega_ii([p], [dz], linear_offset=zero_offset)
+    assert omega_no_offset == pytest.approx(omega_zero_offset, rel=1e-7)
+
+
+def test_fisher_omega_ii_sandwich_formula_matches_kl_difference():
+    """For sandwich centered at z_c with student state p_c:
+    Ω_ii ≈ KL(p_t || student_perturbed) − KL(p_t || p_c) at second order.
+
+    Verify this matches the analytic decomposition
+    ⟨p_c − p_t, δz⟩ + (1/2) Var_{p_c}(δz).
+    """
+    torch.manual_seed(7)
+    V = 8
+    z_t = torch.randn(1, V) * 1.0  # teacher logits
+    p_t = torch.softmax(z_t, dim=-1)
+    log_p_t = torch.log_softmax(z_t, dim=-1)
+
+    # Centered student state at z_c = z_t + ε_c (small offset)
+    eps_c = torch.randn(1, V) * 0.05
+    z_c = z_t + eps_c
+    p_c = torch.softmax(z_c, dim=-1)
+    log_p_c = torch.log_softmax(z_c, dim=-1)
+
+    # KL(p_t || p_c) per token, summed over vocab
+    kl_c = float((p_t * (log_p_t - log_p_c)).sum().item())
+
+    # Perturbation δz (from centered)
+    dz = torch.randn(1, V) * 0.03  # small enough for second-order to dominate
+    z_pert = z_c + dz
+    log_p_pert = torch.log_softmax(z_pert, dim=-1)
+    kl_pert = float((p_t * (log_p_t - log_p_pert)).sum().item())
+
+    # Exact KL difference (the four-term Ω_ii at sandwich)
+    omega_exact = kl_pert - kl_c
+
+    # Output-Fisher analytic prediction: ⟨p_c − p_t, δz⟩ + (1/2) Var_{p_c}(δz)
+    linear_offset = [(p_c - p_t)]
+    omega_predicted = of.fisher_omega_ii([p_c], [dz], linear_offset=linear_offset)
+
+    # Should agree to second order; remaining error is O(δz^3) ≈ O(1e-5)
+    assert omega_predicted == pytest.approx(omega_exact, rel=5e-2, abs=1e-7)
+
+
 def test_omega_ij_correct_when_aggregated_across_samples():
     """E_t Cov should aggregate correctly across multiple samples."""
     torch.manual_seed(5)
