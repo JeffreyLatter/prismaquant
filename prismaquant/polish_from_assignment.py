@@ -65,6 +65,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "moved during polish.  Default: lm_head (vLLM ParallelLMHead "
         "rejects compressed-tensors layout).",
     )
+    p.add_argument(
+        "--direction",
+        choices=["bottom_up", "top_down"],
+        default="bottom_up",
+        help="Polish direction.  'bottom_up' starts at low-bpp/high-KL "
+        "and accepts flips that decrease KL within the bits budget. "
+        "'top_down' starts at high-bpp/low-KL and accepts flips that "
+        "decrease bits while keeping KL ≤ kl_budget — Buchbinder et "
+        "al. (2012) double-greedy formulation.  Run both and combine "
+        "trajectories for full Pareto coverage.",
+    )
+    p.add_argument(
+        "--kl-budget",
+        type=float,
+        default=None,
+        help="Top-down only: maximum allowed KL.  Polish accepts a flip "
+        "iff trial_kl ≤ kl_budget.  Required for top_down.",
+    )
     args = p.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -155,10 +173,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         starting_bits = _assignment_bits(units, starting_assignment)
         budget = starting_bits * (1.0 + float(args.polish_budget_creep))
+        if args.direction == "top_down" and args.kl_budget is None:
+            raise ValueError(
+                "--direction=top_down requires --kl-budget (max real KL); "
+                "see Buchbinder et al. 2012 for the constrained formulation."
+            )
         print(
-            f"[polish] starting from {starting_label}: "
-            f"bits={starting_bits:.0f}  budget={budget:.0f} "
-            f"({100*args.polish_budget_creep:.1f}% creep)",
+            f"[polish] starting from {starting_label} (direction={args.direction}): "
+            f"bits={starting_bits:.0f}  bits_budget={budget:.0f} "
+            f"({100*args.polish_budget_creep:.1f}% creep)  "
+            f"kl_budget={args.kl_budget}",
             flush=True,
         )
 
@@ -182,6 +206,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             use_frozen_weight_cache=False,
             production_weight_cache=production_weight_cache,
             pinned_units=pinned_qnames,
+            direction=args.direction,
+            kl_budget=args.kl_budget,
             progress_callback=progress,
         )
         elapsed = time.monotonic() - t0

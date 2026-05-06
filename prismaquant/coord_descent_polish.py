@@ -206,28 +206,54 @@ def coord_descent_polish(
     use_frozen_weight_cache: bool = False,
     production_weight_cache=None,
     pinned_units: set[str] | None = None,
+    direction: str = "bottom_up",
+    kl_budget: float | None = None,
     progress_callback=None,
 ) -> PolishResult:
     """Polish a starting assignment via real-KL-gated single-flip moves.
 
-    Each pass:
-      1. Measure KL of the current assignment (cached from previous accept).
-      2. For each unit, for each format option != current, build the trial
-         assignment and measure KL.
-      3. Accept the move with the largest improvement, provided
-         ``current_kl - trial_kl > noise_floor`` and (if ``bits_budget`` is
-         supplied) the trial does not exceed ``bits_budget + bits_tolerance``.
-      4. Stop when no improving move exists or ``max_passes`` is reached.
+    Two directions are supported (Buchbinder et al. 2012 "double greedy"
+    formulation, adapted for constrained submodular maximization):
 
-    ``bits_budget=None`` (default) lets polish creep toward higher precision
-    monotonically — useful as a *Pareto-improvement* search but undesirable
-    for shipping artifacts.  Pass ``bits_budget`` (in absolute total bits)
-    to constrain polish to budget-respecting moves only.
+    bottom_up (default):
+      Minimize KL subject to ``bits ≤ bits_budget``.  Start at a low-bpp
+      feasible state (typically all-NVFP4 + lm_head=BF16).  Accept a flip
+      iff ``current_kl - trial_kl > noise_floor`` and the trial does not
+      bust ``bits_budget + bits_tolerance``.  Each move has KL going
+      DOWN; bpp generally increases (with occasional decreasing
+      "rebalance" moves).
 
-    Cost: O(passes × units × (formats - 1)) KL measurements.  For Qwen 0.6B
-    with 113 fused units × 2 non-current formats × 4 passes ≈ 900
-    measurements; per-call latency dominates.
+    top_down:
+      Minimize bits subject to ``KL ≤ kl_budget``.  Start at a high-bpp
+      lossy-but-low-KL state (typically all-BF16).  Accept a flip iff
+      ``current_bits - trial_bits > 0`` (bits go DOWN by at least one
+      candidate's worth) and ``trial_kl <= kl_budget``.  Among the
+      bits-decreasing budget-respecting moves, pick the one with the
+      largest ``bits_decrease`` for the smallest ``kl_increase`` —
+      specifically the one with the lowest ``trial_kl``.
+
+    Running both directions traces the Pareto frontier from opposite
+    ends.  Where the two assignments agree on a unit's format at
+    similar (bpp, KL) operating points, you have high confidence;
+    disagreement localizes Linears with non-trivial interactions
+    (1-flip greedy stops at a local optimum on either side).
+
+    Cost: O(passes × units × (formats - 1)) KL measurements per
+    direction.  For Qwen 0.6B with 113 fused units × 2 non-current
+    formats × 4 passes ≈ 900 measurements; per-call latency dominates.
+
+    References:
+      - Buchbinder, Feldman, Naor, Schwartz, "A tight linear time
+        (1/2)-approximation for unconstrained submodular maximization,"
+        FOCS 2012.
+      - Sviridenko, "A note on maximizing a submodular set function
+        subject to a knapsack constraint," ORL 2004.
     """
+    direction = direction.lower().strip()
+    if direction not in ("bottom_up", "top_down"):
+        raise ValueError(
+            f"direction must be 'bottom_up' or 'top_down', got {direction!r}"
+        )
     if work_root is None:
         work_root = Path(tempfile.mkdtemp(prefix="prismaquant_polish_"))
         cleanup_work_root = True
@@ -296,8 +322,15 @@ def coord_descent_polish(
 
         for pass_idx in range(max_passes):
             best_move: tuple[bc.DecisionUnit, str] | None = None
-            best_kl_after = current_kl
-            best_bits_after = current_bits
+            if direction == "bottom_up":
+                # Sentinel: any move with KL strictly below current beats this.
+                best_kl_after = float(current_kl)
+                best_bits_after = float(current_bits)
+            else:
+                # Top-down: any feasible bits-decreasing move with KL ≤ budget
+                # beats `inf`; ties broken by larger bit decrease.
+                best_kl_after = float("inf")
+                best_bits_after = float(current_bits)
             candidates_this_pass = 0
 
             # Order candidates by surrogate priority when steepest_first is
@@ -351,9 +384,14 @@ def coord_descent_polish(
                 trial_bits = current_bits - cur_bits + option_bits.get(
                     (unit.name, option.fmt), 0.0,
                 )
-                if trial_bits > budget_bits + 1e-9:
-                    # Skip moves that bust the budget.
-                    continue
+                if direction == "bottom_up":
+                    # Bottom-up: KL decreases, bits ≤ budget_bits.
+                    if trial_bits > budget_bits + 1e-9:
+                        continue
+                else:
+                    # Top-down: bits decrease, KL ≤ kl_budget.
+                    if trial_bits >= current_bits - 1e-9:
+                        continue
                 trial = _override_unit(current, unit, option.fmt)
                 trial_kl = measure_assignment_kl(
                     model, trial, calib_ids, ref_log_probs,
@@ -376,14 +414,39 @@ def coord_descent_polish(
                         "best_so_far": float(best_kl_after),
                         "n_measurements": n_measurements,
                     })
-                if trial_kl < best_kl_after - float(noise_floor):
-                    best_kl_after = float(trial_kl)
-                    best_bits_after = float(trial_bits)
-                    best_move = (unit, option.fmt)
-                    # Steepest-first: accept the first improving move
-                    # without exhausting the rest of the pass.
-                    if steepest_first:
-                        break
+                if direction == "bottom_up":
+                    if trial_kl < best_kl_after - float(noise_floor):
+                        best_kl_after = float(trial_kl)
+                        best_bits_after = float(trial_bits)
+                        best_move = (unit, option.fmt)
+                        if steepest_first:
+                            break
+                else:
+                    # Top-down: must respect kl_budget; among feasible
+                    # bits-decreasing moves, prefer the one with smallest
+                    # KL (smallest quality cost for an equivalent bit
+                    # save) — the textbook "min KL increase per bit
+                    # saved" greedy rule.  Ties broken by larger bit
+                    # decrease.
+                    if kl_budget is not None and trial_kl > kl_budget + float(
+                        noise_floor
+                    ):
+                        continue
+                    bits_dec = current_bits - trial_bits
+                    best_bits_dec = current_bits - best_bits_after
+                    is_better = (
+                        trial_kl < best_kl_after - float(noise_floor)
+                        or (
+                            abs(trial_kl - best_kl_after) <= float(noise_floor)
+                            and bits_dec > best_bits_dec + 1e-9
+                        )
+                    )
+                    if is_better:
+                        best_kl_after = float(trial_kl)
+                        best_bits_after = float(trial_bits)
+                        best_move = (unit, option.fmt)
+                        if steepest_first:
+                            break
             if best_move is None:
                 if progress_callback is not None:
                     progress_callback({

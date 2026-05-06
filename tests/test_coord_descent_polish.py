@@ -32,9 +32,9 @@ def _mk_unit(name: str, members: tuple[str, ...], options):
     )
 
 
-def _stub_run(units, starting, kl_table):
+def _stub_run(units, starting, kl_table, **kwargs):
     """Run coord descent against a stubbed measure_assignment_kl."""
-    def fake_measure(model, assignment, calib_ids, ref_log_probs, **kwargs):
+    def fake_measure(model, assignment, calib_ids, ref_log_probs, **_):
         # Build a frozen tuple over fused-group choices for lookup.
         key_parts = []
         for unit in units:
@@ -57,6 +57,7 @@ def _stub_run(units, starting, kl_table):
             work_root="/tmp",
             noise_floor=0.0,
             max_passes=8,
+            **kwargs,
         )
 
 
@@ -314,3 +315,104 @@ def test_polish_records_full_trace():
     assert step.kl_before == pytest.approx(1.0)
     assert step.kl_after == pytest.approx(0.5)
     assert step.candidates_evaluated == 1
+
+
+def test_top_down_decreases_bits_subject_to_kl_budget():
+    """Top-down: starts at high-bpp/low-KL, drops bits while KL ≤ kl_budget."""
+    unit_a = _mk_unit("a", ("a.weight",),
+                      [("BF16", 0.0, 16, 1024), ("LO", 0.1, 4, 256)])
+    unit_b = _mk_unit("b", ("b.weight",),
+                      [("BF16", 0.0, 16, 1024), ("LO", 0.2, 4, 256)])
+    units = [unit_a, unit_b]
+
+    # KL surface: starting at all-BF16 = 0.0 (lossless).  Each downgrade
+    # raises KL.  With kl_budget=0.5 polish accepts both downgrades; with
+    # kl_budget=0.4 it accepts only one.
+    kl_table = {
+        (("a", "BF16"), ("b", "BF16")): 0.0,
+        (("a", "LO"),   ("b", "BF16")): 0.3,
+        (("a", "BF16"), ("b", "LO")):   0.4,
+        (("a", "LO"),   ("b", "LO")):   0.5,
+    }
+    starting = {"a.weight": "BF16", "b.weight": "BF16"}
+
+    # kl_budget=0.5 → accept both: ends at all-LO with KL=0.5.
+    result = _stub_run(
+        units, starting, kl_table,
+        direction="top_down", kl_budget=0.5,
+    )
+    assert result.final_kl == pytest.approx(0.5)
+    assert result.final_assignment == {"a.weight": "LO", "b.weight": "LO"}
+    assert len(result.steps) == 2
+
+    # kl_budget=0.35 → only the cheaper downgrade is accepted.
+    # Of {a→LO (KL 0.3), b→LO (KL 0.4)}, only a→LO is feasible.
+    result = _stub_run(
+        units, starting, kl_table,
+        direction="top_down", kl_budget=0.35,
+    )
+    assert result.final_assignment["a.weight"] == "LO"
+    assert result.final_assignment["b.weight"] == "BF16"
+    assert result.final_kl == pytest.approx(0.3)
+
+
+def test_top_down_picks_minimum_kl_among_bits_decreasing_moves():
+    """Top-down should prefer the move with smallest trial_kl (= smallest
+    quality cost) among bits-decreasing budget-respecting moves."""
+    unit_a = _mk_unit("a", ("a.weight",),
+                      [("BF16", 0.0, 16, 1024), ("LO", 0.1, 4, 256)])
+    unit_b = _mk_unit("b", ("b.weight",),
+                      [("BF16", 0.0, 16, 1024), ("LO", 0.2, 4, 256)])
+    units = [unit_a, unit_b]
+
+    # Both downgrades save the SAME bits (1024 - 256 = 768 each).  But
+    # a→LO costs 0.1 KL and b→LO costs 0.4 KL.  Top-down should accept
+    # a first (smaller KL increase).
+    kl_table = {
+        (("a", "BF16"), ("b", "BF16")): 0.0,
+        (("a", "LO"),   ("b", "BF16")): 0.1,
+        (("a", "BF16"), ("b", "LO")):   0.4,
+        (("a", "LO"),   ("b", "LO")):   0.5,
+    }
+    starting = {"a.weight": "BF16", "b.weight": "BF16"}
+    # _stub_run sets max_passes=8 by default; override in kwargs.
+    def fake_measure(model, assignment, calib_ids, ref_log_probs, **_):
+        key_parts = []
+        for u in units:
+            fmt = None
+            for member in u.member_qnames:
+                if member in assignment:
+                    fmt = assignment[member]
+                    break
+            key_parts.append((u.name, fmt))
+        return float(kl_table[tuple(key_parts)])
+    with patch("prismaquant.coord_descent_polish.measure_assignment_kl",
+               side_effect=fake_measure):
+        result = cdp.coord_descent_polish(
+            model=object(), calib_ids=object(), ref_log_probs=object(),
+            units=units, starting_assignment=starting,
+            work_root="/tmp", noise_floor=0.0, max_passes=1,
+            direction="top_down", kl_budget=1.0,
+        )
+    assert result.steps[0].unit == "a"
+    assert result.steps[0].to_fmt == "LO"
+
+
+def test_top_down_requires_kl_budget_ish():
+    """Without a kl_budget, top-down has no termination condition on KL — it
+    accepts any bits-decreasing move regardless of quality.  We don't enforce
+    'kl_budget required' inside coord_descent_polish itself (the CLI does)
+    so this just verifies it runs."""
+    unit = _mk_unit("a", ("a.weight",),
+                    [("BF16", 0.0, 16, 1024), ("LO", 0.1, 4, 256)])
+    kl_table = {
+        (("a", "BF16"),): 0.0,
+        (("a", "LO"),):   100.0,  # huge KL increase
+    }
+    starting = {"a.weight": "BF16"}
+    result = _stub_run(
+        [unit], starting, kl_table,
+        direction="top_down", kl_budget=None,
+    )
+    # With no kl_budget, the move is accepted because it decreases bits.
+    assert result.final_assignment == {"a.weight": "LO"}
