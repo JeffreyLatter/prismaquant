@@ -364,6 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         center_assignment: dict[str, str] | None = None
         center_label = "BF16"
         prev_polish_hash: str | None = None
+        best_overall: IterationResult | None = None
         for iter_idx in range(int(args.max_iterations)):
             result = run_iteration(
                 model=model,
@@ -384,6 +385,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log_callback=log,
             )
             summary_rows.append(result)
+            if best_overall is None or result.polished_kl < best_overall.polished_kl - 1e-9:
+                best_overall = result
+                log(event="best_overall_updated",
+                    iter=iter_idx,
+                    polished_kl=result.polished_kl,
+                    bpp=result.best_validated_bpp)
             log(event="iter_summary",
                 iter=iter_idx,
                 kneedle_bpp=result.kneedle_bpp,
@@ -416,8 +423,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 for r in summary_rows
             ],
+            "best_overall": (
+                {
+                    "iteration": best_overall.iteration,
+                    "polished_kl": best_overall.polished_kl,
+                    "best_validated_bpp": best_overall.best_validated_bpp,
+                    "polish_steps": best_overall.polish_steps,
+                }
+                if best_overall is not None else None
+            ),
         }
         (output_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        if best_overall is not None:
+            (output_root / "best_assignment.json").write_text(json.dumps({
+                "schema": "prismaquant.block_clado.best.v1",
+                "iteration": best_overall.iteration,
+                "polished_kl": best_overall.polished_kl,
+                "best_validated_bpp": best_overall.best_validated_bpp,
+                "assignment": best_overall.polished_assignment,
+            }, indent=2) + "\n")
         print(f"[iter] wrote {output_root / 'summary.json'}", flush=True)
     finally:
         if cleanup is not None:
