@@ -206,6 +206,42 @@ def _bf16_assignment(
     return out
 
 
+def _center_histogram(per_unit_center: Mapping[str, str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for fmt in per_unit_center.values():
+        counts[str(fmt)] = counts.get(str(fmt), 0) + 1
+    return counts
+
+
+def _center_assignment_for_units(
+    units_by_name: Mapping[str, bc.DecisionUnit],
+    singletons_by_name: Mapping[str, bc.DecisionUnit],
+    center_assignment: Mapping[str, str] | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Build the per-Linear base assignment for sandwich recalibration.
+
+    Returns ``(per_linear_base, per_unit_center)``.  Each unit's per-Linear
+    members are coerced to a single canonical format taken from
+    ``center_assignment``; if no entry is present, BF16 is used.
+    """
+    base: dict[str, str] = {}
+    per_unit: dict[str, str] = {}
+    all_units = list(units_by_name.values()) + list(singletons_by_name.values())
+    for unit in all_units:
+        chosen = None
+        if center_assignment:
+            for member in unit.member_qnames:
+                if member in center_assignment:
+                    chosen = fr.canonical_format_name(str(center_assignment[member]))
+                    break
+        if chosen is None:
+            chosen = "BF16"
+        per_unit[unit.name] = chosen
+        for member in unit.member_qnames:
+            base[member] = chosen
+    return base, per_unit
+
+
 def _override_assignment(
     base: Mapping[str, str],
     unit: bc.DecisionUnit,
@@ -244,11 +280,25 @@ def collect_block_clado(
     work_root: str | Path | None = None,
     progress_callback: Callable[[dict], None] | None = None,
     skip_pairs: bool = False,
+    center_assignment: Mapping[str, str] | None = None,
 ) -> dict:
     """Run the Block-CLADO measurement.
 
     Returns the portable JSON payload (dict).  Does not write to disk; the
     caller is responsible for serialising.
+
+    ``center_assignment`` selects the centering point for the Taylor
+    expansion.  When ``None`` (default), all Linears are pinned to BF16 —
+    i.e. the standard CLADO four-term identity at the teacher state.  When
+    provided as a per-Linear ``{qname: format}`` mapping, every Ω_ii is
+    measured as the *delta* KL from that centered state, and the four-term
+    identity becomes::
+
+        Ω_ij(f_a, f_b) = KL(x_c ⊕ a→f_a, b→f_b)
+                         − KL(x_c ⊕ a→f_a) − KL(x_c ⊕ b→f_b) + KL(x_c)
+
+    where ``KL(x_c)`` is no longer 0 in general.  This is the sandwich
+    recalibration sketched in deliberation round 02.
     """
     if not isinstance(calib_ids, torch.Tensor) or calib_ids.dim() != 2:
         raise ValueError("calib_ids must be a 2D tensor [samples, seqlen]")
@@ -282,22 +332,44 @@ def collect_block_clado(
     try:
         ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
 
-        base = _bf16_assignment(units_by_name, singletons_by_name)
+        base, per_unit_center = _center_assignment_for_units(
+            units_by_name, singletons_by_name, center_assignment,
+        )
+        center_kl = 0.0
+        if center_assignment is not None and any(
+            fmt != "BF16" for fmt in per_unit_center.values()
+        ):
+            center_kl = float(measure_assignment_kl(
+                model, base, calib_ids, ref_log_probs,
+                work_root=work_root, profile=profile,
+                use_frozen_weight_cache=False, rng_seed=0,
+            ))
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "center_kl",
+                    "kl": float(center_kl),
+                })
 
         # ------------------------------------------------------------------
-        # Pass 1 — unary measurements.  ω_ii(unit, f) = KL(teacher‖f-only)
+        # Pass 1 — unary measurements.
+        # ω_ii(unit, f) = KL(teacher ‖ x_c ⊕ unit→f) − KL(x_c)
+        # When x_c is BF16 everywhere, KL(x_c) = 0 and this collapses to the
+        # standard form.
         # ------------------------------------------------------------------
         omega_ii: dict[tuple[str, str], float] = {}
         all_units = list(units_by_name.values()) + list(singletons_by_name.values())
+        # Skip measurements where the override matches the centered format —
+        # ω_ii of the centering format is 0 by definition.
         n_unary = sum(
-            sum(1 for opt in unit.options if opt.fmt != "BF16")
+            sum(1 for opt in unit.options if opt.fmt != per_unit_center.get(unit.name, "BF16"))
             for unit in all_units
         )
         unary_done = 0
         for unit in all_units:
+            center_fmt = per_unit_center.get(unit.name, "BF16")
             for opt in unit.options:
-                if opt.fmt == "BF16":
-                    omega_ii[(unit.name, "BF16")] = 0.0
+                if opt.fmt == center_fmt:
+                    omega_ii[(unit.name, opt.fmt)] = 0.0
                     continue
                 assignment = _override_assignment(base, unit, opt.fmt)
                 kl = measure_assignment_kl(
@@ -310,14 +382,14 @@ def collect_block_clado(
                     use_frozen_weight_cache=False,
                     rng_seed=0,
                 )
-                omega_ii[(unit.name, opt.fmt)] = float(kl)
+                omega_ii[(unit.name, opt.fmt)] = float(kl) - center_kl
                 unary_done += 1
                 if progress_callback is not None:
                     progress_callback({
                         "event": "unary_done",
                         "unit": unit.name,
                         "format": opt.fmt,
-                        "kl": float(kl),
+                        "kl": float(kl) - center_kl,
                         "completed": unary_done,
                         "total": n_unary,
                     })
@@ -365,12 +437,12 @@ def collect_block_clado(
         )}
 
         # ------------------------------------------------------------------
-        # Pass 2 — intra-block pair measurements.
-        #   Ω_ij(f_a, f_b) = KL(teacher ‖ {a:f_a, b:f_b, rest:BF16})
-        #                  − Ω_ii(a, f_a)  − Ω_ii(b, f_b)
-        # We skip the trivial cases where either format is BF16 (Ω_ii is 0
-        # there, so Ω_ij = KL of the OTHER unit's perturbation alone, which
-        # is exactly Ω_ii of that unit — pair contribution is identically 0).
+        # Pass 2 — intra-block pair measurements (four-term identity).
+        #   Ω_ij(f_a, f_b) = KL(x_c ⊕ a→f_a, b→f_b)
+        #                    − Ω_ii(a, f_a) − Ω_ii(b, f_b) − KL(x_c)
+        # When either format == centered format for that unit, the pair
+        # interaction reduces to Ω_ii of the other unit alone, so the pair
+        # contribution is identically 0 — no measurement needed.
         # ------------------------------------------------------------------
         pairs_by_block: dict[str, list[bc.BlockPair]] = {}
         if not skip_pairs:
@@ -379,11 +451,13 @@ def collect_block_clado(
                 for unit_a_name, unit_b_name in enumerate_block_pairs(units):
                     unit_a = units_by_name[unit_a_name]
                     unit_b = units_by_name[unit_b_name]
+                    center_a = per_unit_center.get(unit_a.name, "BF16")
+                    center_b = per_unit_center.get(unit_b.name, "BF16")
                     for opt_a in unit_a.options:
-                        if opt_a.fmt == "BF16":
+                        if opt_a.fmt == center_a:
                             continue
                         for opt_b in unit_b.options:
-                            if opt_b.fmt == "BF16":
+                            if opt_b.fmt == center_b:
                                 continue
                             n_pairs_total += 1
             pair_done = 0
@@ -392,12 +466,14 @@ def collect_block_clado(
                 for unit_a_name, unit_b_name in enumerate_block_pairs(units):
                     unit_a = units_by_name[unit_a_name]
                     unit_b = units_by_name[unit_b_name]
+                    center_a = per_unit_center.get(unit_a.name, "BF16")
+                    center_b = per_unit_center.get(unit_b.name, "BF16")
                     omega_ij: dict[tuple[str, str], float] = {}
                     for opt_a in unit_a.options:
                         for opt_b in unit_b.options:
-                            if opt_a.fmt == "BF16" or opt_b.fmt == "BF16":
-                                # No measurable interaction with the
-                                # un-quantised reference — Ω_ij is 0 here.
+                            if opt_a.fmt == center_a or opt_b.fmt == center_b:
+                                # No measurable interaction when either unit
+                                # is at the centered format — Ω_ij ≡ 0.
                                 omega_ij[(opt_a.fmt, opt_b.fmt)] = 0.0
                                 continue
                             assignment = _override_pair(
@@ -416,7 +492,7 @@ def collect_block_clado(
                             omega_a = float(omega_ii[(unit_a.name, opt_a.fmt)])
                             omega_b = float(omega_ii[(unit_b.name, opt_b.fmt)])
                             omega_ij[(opt_a.fmt, opt_b.fmt)] = (
-                                float(kl_ab) - omega_a - omega_b
+                                float(kl_ab) - omega_a - omega_b - center_kl
                             )
                             pair_done += 1
                             if progress_callback is not None:
@@ -444,6 +520,9 @@ def collect_block_clado(
                 pairs_by_block[block_id] = []
 
         elapsed = time.time() - start
+        is_centered = center_assignment is not None and any(
+            fmt != "BF16" for fmt in per_unit_center.values()
+        )
         meta = {
             "elapsed_seconds": float(elapsed),
             "n_calib_samples": int(calib_ids.size(0)),
@@ -459,6 +538,9 @@ def collect_block_clado(
                 if not skip_pairs else 0
             ),
             "skip_pairs": bool(skip_pairs),
+            "centered": bool(is_centered),
+            "center_kl": float(center_kl),
+            "center_format_histogram": _center_histogram(per_unit_center),
         }
         return bc.units_and_pairs_to_payload(
             blocks=blocks,
@@ -526,6 +608,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "baseline against full Block-CLADO."
         ),
     )
+    parser.add_argument(
+        "--center-assignment",
+        default=None,
+        help=(
+            "Per-Linear assignment JSON used as the centering point for the "
+            "Taylor expansion (sandwich recalibration).  Default centers at "
+            "BF16 (standard CLADO)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -567,6 +658,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile = DefaultProfile()
 
         specs = [fr.get_format(part.strip()) for part in args.formats.split(",") if part.strip()]
+        center_assignment: Mapping[str, str] | None = None
+        if args.center_assignment:
+            raw = json.loads(Path(args.center_assignment).read_text())
+            if isinstance(raw, Mapping) and "assignment" in raw and isinstance(raw["assignment"], Mapping):
+                center_assignment = {
+                    str(k): str(v) for k, v in raw["assignment"].items()
+                }
+            elif isinstance(raw, Mapping):
+                center_assignment = {str(k): str(v) for k, v in raw.items()}
+            else:
+                raise ValueError(
+                    f"unsupported --center-assignment shape: {args.center_assignment}"
+                )
+            print(
+                f"[block-clado] sandwich recalibration: centering at "
+                f"{args.center_assignment} ({len(center_assignment)} entries)",
+                flush=True,
+            )
+
         payload = collect_block_clado(
             model,
             calib_ids,
@@ -575,6 +685,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             work_root=args.work_dir,
             progress_callback=_progress_printer,
             skip_pairs=args.skip_pairs,
+            center_assignment=center_assignment,
         )
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)

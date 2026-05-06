@@ -242,6 +242,11 @@ def _parse_pair_key(key: str) -> tuple[str, str]:
     return fr.canonical_format_name(a), fr.canonical_format_name(b)
 
 
+def center_kl_from_payload(payload: Mapping) -> float:
+    """Return ``KL(x_c)`` for the payload, or 0.0 if uncentered."""
+    return float((payload.get("meta") or {}).get("center_kl", 0.0))
+
+
 def units_and_pairs_to_payload(
     *,
     blocks: Mapping[str, Sequence[DecisionUnit]],
