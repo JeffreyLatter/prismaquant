@@ -156,13 +156,22 @@ def run_iteration(
     log(event="sweep_done", iter=iter_idx, points=len(sweep_rows))
 
     # ---- kneedle + neighbours expansion (validate cone around the elbow)
-    positive_rows = [r for r in sweep_rows if r["cost_total"] > 0.0]
-    if len(positive_rows) < 3:
-        positive_rows = sweep_rows
-    points = [(float(r["bpp"]), float(r["cost_total"])) for r in positive_rows]
+    # Filter to physically meaningful frontier: predicted_kl = center_kl
+    # + cost_total > 0.  For BF16-centered (center_kl=0) this collapses
+    # to cost_total > 0 (the original behavior); for sandwich-centered
+    # (center_kl>0) it correctly admits negative-cost rows representing
+    # predicted improvements over the centered state.
+    center_kl = bc.center_kl_from_payload(payload)
+    feasible_rows = [
+        r for r in sweep_rows
+        if (center_kl + r["cost_total"]) > 1e-9
+    ]
+    if len(feasible_rows) < 3:
+        feasible_rows = sweep_rows
+    points = [(float(r["bpp"]), float(r["cost_total"])) for r in feasible_rows]
     knee_idx, knee_score, knee_endpoint = bc.kneedle_pick(points)
-    sorted_rows = sorted(positive_rows, key=lambda r: r["bpp"])
-    knee_bpp_target = positive_rows[knee_idx]["bpp"]
+    sorted_rows = sorted(feasible_rows, key=lambda r: r["bpp"])
+    knee_bpp_target = feasible_rows[knee_idx]["bpp"]
     knee_in_sorted = min(
         range(len(sorted_rows)),
         key=lambda i: abs(sorted_rows[i]["bpp"] - knee_bpp_target),
@@ -180,7 +189,7 @@ def run_iteration(
         kl = measure_assignment_kl(
             model, assignment, calib_ids, ref_log_probs,
             work_root=work_root, profile=profile,
-            use_frozen_weight_cache=False, rng_seed=0,
+            use_frozen_weight_cache=use_frozen_weight_cache, rng_seed=0,
         )
         validation.append({
             "bpp": r["bpp"],
@@ -280,9 +289,9 @@ def run_iteration(
         centered_at=center_label,
         payload_path=payload_path,
         sweep_path=sweep_path,
-        kneedle_label=f"frontier_bpp_{positive_rows[knee_idx]['bpp']:.4f}",
-        kneedle_bpp=float(positive_rows[knee_idx]["bpp"]),
-        kneedle_surrogate_cost=float(positive_rows[knee_idx]["cost_total"]),
+        kneedle_label=f"frontier_bpp_{feasible_rows[knee_idx]['bpp']:.4f}",
+        kneedle_bpp=float(feasible_rows[knee_idx]["bpp"]),
+        kneedle_surrogate_cost=float(feasible_rows[knee_idx]["cost_total"]),
         best_validated_kl=float(best_validated["real_kl"]),
         best_validated_bpp=float(best_validated["bpp"]),
         best_validated_assignment=dict(best_validated["assignment"]),
