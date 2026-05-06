@@ -54,6 +54,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -65,10 +66,16 @@ from prismaquant.build_rtn_cache import iter_quantizable_tensors
 class ProductionWeightCache:
     """Dict-like cache of production-faithful dequantized weights.
 
-    Keys: ``(qname, fmt_canonical)``.  Values: ``[out, in]`` float32 or
-    bf16 tensors that match the live module weight shape after applying
-    the production pipeline (GPTQ + scale_sweep + joint sibling NVFP4
-    globals at minimum; HALO, etc. when those layers are extended).
+    Keys: ``(qname, fmt_canonical)``.  Values are EITHER:
+      * ``torch.Tensor`` ([out, in] float32 or bf16) — in-memory cache
+      * ``str`` (a path) — points to a per-Linear .pt file on disk;
+        ``get()`` lazy-loads on first access and memoizes the tensor
+
+    Disk-streaming mode (when ``cache_dir`` is set during fill) keeps
+    fill-time peak memory bounded — only one weight is in RAM at a time
+    instead of the full ~25 GB stack of all rendered Linears.  At
+    polish time the lazy-load caches each weight in memory after first
+    access, so steady-state behavior matches the in-memory mode.
 
     ``activation_max_abs[qname]`` is the calibrated max(|activations|)
     used by the act-clip step in the export pipeline.  PerturbedActivation
@@ -81,10 +88,11 @@ class ProductionWeightCache:
     that's the value the act-clip path needs; consumers can convert if
     they need the metadata convention.
     """
-    weights: dict[tuple[str, str], torch.Tensor]
+    weights: dict[tuple[str, str], object]  # tensor OR str(path)
     levers: dict[str, bool]
     activation_max_abs: dict[str, float] | None = None
     failed: dict[tuple[str, str], str] | None = None
+    cache_dir: str | None = None  # set when disk-streaming was used at fill time
     # Backward-compat alias for code that still reads ``activation_scales``.
     activation_scales: dict[str, float] | None = None
 
@@ -96,6 +104,23 @@ class ProductionWeightCache:
         elif self.activation_scales is None and self.activation_max_abs is not None:
             self.activation_scales = self.activation_max_abs
 
+    def _resolve_to_tensor(self, key: tuple[str, str]) -> torch.Tensor | None:
+        """Return the tensor at ``key`` (lazy-load from disk if needed)
+        and store it back in ``self.weights`` so subsequent calls hit
+        the in-memory copy.  Returns None if the key isn't present."""
+        v = self.weights.get(key)
+        if v is None:
+            return None
+        if isinstance(v, torch.Tensor):
+            return v
+        # Treat anything non-tensor as a filename / path.
+        path = str(v)
+        if self.cache_dir and not Path(path).is_absolute():
+            path = str(Path(self.cache_dir) / path)
+        loaded = torch.load(path, map_location="cpu", weights_only=True)
+        self.weights[key] = loaded
+        return loaded
+
     def get(self, name: str, fmt: str) -> torch.Tensor | None:
         # Try canonical alias variants the perturbed map exposes.
         candidates = [name]
@@ -105,7 +130,7 @@ class ProductionWeightCache:
             candidates.append("model." + name[len("model.language_model."):])
         for cand in candidates:
             if (cand, fmt) in self.weights:
-                return self.weights[(cand, fmt)]
+                return self._resolve_to_tensor((cand, fmt))
         return None
 
     def __contains__(self, key: tuple[str, str]) -> bool:
@@ -329,6 +354,7 @@ def fill_production_weight_cache(
     levers: Mapping[str, bool] | None = None,
     max_act_rows: int = 256,
     progress: bool = True,
+    cache_dir: str | Path | None = None,
 ) -> ProductionWeightCache:
     """End-to-end fill: collect activations, render production δw per
     (qname, fmt), return a `ProductionWeightCache`.
@@ -373,9 +399,21 @@ def fill_production_weight_cache(
             flush=True,
         )
 
-    weights: dict[tuple[str, str], torch.Tensor] = {}
+    weights: dict[tuple[str, str], object] = {}
     failed: dict[tuple[str, str], str] = {}
     qname_to_module: dict[str, nn.Module] = {}
+
+    cache_dir_path: Path | None = None
+    if cache_dir is not None:
+        cache_dir_path = Path(cache_dir)
+        cache_dir_path.mkdir(parents=True, exist_ok=True)
+        if progress:
+            print(f"[prod-cache] streaming cache to {cache_dir_path}/", flush=True)
+
+    def _safe_path(qname: str, fmt: str) -> str:
+        # Replace path-unsafe chars in qnames with __ for filename use.
+        safe = qname.replace("/", "__").replace(".", "_")
+        return f"{safe}__{fmt}.pt"
     for full_name, mod, attr in iter_quantizable_tensors(model):
         if attr != "weight" or not isinstance(mod, nn.Linear):
             continue
@@ -491,7 +529,17 @@ def fill_production_weight_cache(
             # is wasteful (2× memory).  On 27B this drops the cache from
             # ~25 GB to ~12 GB.
             target_dtype = weight.dtype if weight.dtype != torch.float32 else torch.bfloat16
-            weights[(qname, fmt.upper())] = w_dq.to(target_dtype).cpu()
+            tensor = w_dq.to(target_dtype).cpu()
+            if cache_dir_path is not None:
+                # Disk-streaming mode: save to per-Linear .pt and store
+                # only the relative filename in the cache.  Peak memory
+                # during fill is bounded by the largest single render.
+                fname = _safe_path(qname, fmt.upper())
+                torch.save(tensor, cache_dir_path / fname)
+                weights[(qname, fmt.upper())] = fname
+                del tensor
+            else:
+                weights[(qname, fmt.upper())] = tensor
             done += 1
             del w_dq
             if progress and done % 25 == 0:
@@ -515,4 +563,5 @@ def fill_production_weight_cache(
         levers=dict(levers),
         activation_max_abs=activation_max_abs or None,
         failed=failed,
+        cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
     )

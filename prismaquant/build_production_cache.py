@@ -83,6 +83,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "consumers running with PRISMAQUANT_STRICT_PRODUCTION_CACHE=1 "
         "will refuse to use an incomplete cache anyway.",
     )
+    p.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Directory to stream per-Linear weight tensors to (one .pt "
+        "per (qname, fmt)).  When set, fill peak memory is bounded by "
+        "the largest single render rather than the full cache size.  "
+        "The pickle becomes a small manifest; PerturbedActivationCache "
+        "lazy-loads each weight on first access at hook time.  Required "
+        "for arbitrarily-large models (e.g. 27B+ on a 121 GB UMA box).",
+    )
     args = p.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -141,6 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             formats=formats,
             levers=levers,
             max_act_rows=args.max_act_rows,
+            cache_dir=args.cache_dir,
         )
         elapsed = time.monotonic() - t0
 
