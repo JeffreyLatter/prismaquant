@@ -233,6 +233,19 @@ Same source weights, same export-time tricks (HALO, GPTQ, block-output match, sc
 
 Public artifact: https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm
 
+### Production-faithful polish: another 2.8× KL drop at +0.08 bpp
+
+The PrismaSCOUT polish step measures KL on RTN-quantized proxy weights — fast, but not what the exporter actually ships. We close that gap with a **production-faithful polish**: every candidate flip is evaluated against the exact per-Linear weight the exporter would render (joint NVFP4 sibling-coherent input global scales, GPTQ reconstruction, scale sweep, calibrated activation clip), with a delta-quantize `WeightSession` that swaps one decision unit's weight in place per trial instead of cloning the model. The move set sweeps from a low-bpp floor under a 5% bits-budget creep.
+
+| Artifact | bpp | Held-out KL |
+|---|---|---|
+| PrismaSCOUT (5.31) | 5.31 | 0.0151 |
+| **Production-faithful polish (5.39)** | **5.39** | **0.0054** |
+
+29.8% of language-domain Linears (148/497) flip format. The polish reclaims the ~130 small `linear_attn.in_proj_{a,b}` rank-projection matrices PrismaSCOUT held at BF16 (real KL says they're cheap to quantize) and concentrates the budget on a small set of bottleneck Linears: `mlp.down_proj` at layers {0, 10, 16, 62}, `mlp.{gate,up}_proj` at {16, 19}, the embedding-adjacent layer-0 attention block, plus a few mid-network linear-attention picks. Distributed saliency surrogates over-protect rank-projection matrices; real KL on production weights does not.
+
+Polished assignment runs in 28 minutes on a single GB10 (delta-quantize WeightSession + disk-streaming `ProductionWeightCache` + 5 GiB LRU). Downstream task evals (validator perplexity, GSM8K, IFEval, MMLU, tool-eval-bench) are in flight at time of writing.
+
 ### Algorithm
 
 PrismaSCOUT runs a three-stage cost cascade: **L1** cheap per-matrix rank → **L2** sparse pairwise interaction model solved as a Lagrangian-relaxed QUBO (a game-theoretic decomposition that, to our knowledge, has not been applied at LLM scale before) → **L3** rebuilt-model end-to-end KL on a small allocator neighborhood around L2's converged point.
