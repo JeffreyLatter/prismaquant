@@ -146,6 +146,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    # Fail fast if the optimized linear-attention kernels are missing
+    # on a Qwen3.5/3.6 hybrid model — the Python torch fallback is
+    # ~5-10x slower and silently destroys polish wall-time measurability.
+    # Bypass with PRISMAQUANT_ALLOW_PYTORCH_FALLBACK=1 for debug only.
+    from prismaquant._fast_kernel_guard import require_fast_kernels
+    require_fast_kernels(args.model)
+
     payload = bc.load_payload(args.payload)
     blocks_back, singletons_back, pairs_back = bc.parse_payload(payload)
     units: list[bc.DecisionUnit] = []
