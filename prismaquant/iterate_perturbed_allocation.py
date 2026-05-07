@@ -63,6 +63,7 @@ from prismaquant.interaction_refine import (
 from prismaquant.propagated_cost import (
     CUDAGraphRegistry,
     FrozenBudgetError,
+    KLScope,
     L3NeighborhoodEntry,
     L3UnsupportedTargetError,
     _env_cuda_graphs_enabled_for_call_count,
@@ -73,6 +74,7 @@ from prismaquant.propagated_cost import (
     measure_lane_batched_kl_deltas,
     measure_override_paired_kl_deltas,
     measure_propagated_costs,
+    resolve_kl_scope,
     select_l3_neighborhood,
     solve_frozen_l3_neighborhood,
 )
@@ -8480,10 +8482,12 @@ def measure_assignment_kl(
     use_frozen_weight_cache: bool = True,
     production_weight_cache=None,
     rng_seed: int | None = 0,
+    kl_scope: KLScope | None = None,
 ) -> float:
     device = next(model.parameters()).device
     calib_ids = _prepare_kl_tensor_inputs(calib_ids, device)
     ref_log_probs = _prepare_ref_log_probs_for_kl(ref_log_probs, device)
+    effective_kl_scope = resolve_kl_scope(kl_scope)
     if use_frozen_weight_cache and not _env_flag_enabled(
         "PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE",
         default=True,
@@ -8545,6 +8549,7 @@ def measure_assignment_kl(
         id(model),
         assignment_hash(assignment),
         bool(use_frozen_weight_cache),
+        effective_kl_scope,
         rng_seed,
     )
     cache_cm = nullcontext()
@@ -8572,13 +8577,9 @@ def measure_assignment_kl(
             if installed_here:
                 hooks.install()
             try:
-                # MED-6: env flag for full-sequence vs last-token KL.  Last-
-                # token is the historical default (cheaper, lower variance);
-                # full-sequence is closer to perplexity-style metrics and is
-                # what most downstream eval cares about.  Polish can choose.
-                full_seq = _env_flag_enabled(
-                    "PRISMAQUANT_FULL_SEQUENCE_KL", default=False,
-                )
+                # Last-token KL is the historical default.  Passing kl_scope
+                # explicitly wins; omitting it keeps the legacy env override.
+                full_seq = effective_kl_scope == "full_sequence"
                 with rng_cm:
                     if rng_seed is not None:
                         torch.manual_seed(int(rng_seed))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import format_registry as fr
@@ -30,6 +31,46 @@ def _passthrough_source_ok(
     return source_kind == required
 
 
+@dataclass(frozen=True)
+class FormatApplicability:
+    legal: bool
+    reason: str | None = None
+    detail: str = ""
+
+
+def _profile_allows_format(
+    target_profile: str | None,
+    name: str | None,
+    fmt: str,
+) -> FormatApplicability:
+    if target_profile in (None, "", "research"):
+        return FormatApplicability(True)
+    if target_profile == "vllm_qwen3_5_packed_moe":
+        qname = name or ""
+        if ".mlp.experts" in qname:
+            if fmt in {"NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"}:
+                return FormatApplicability(True)
+            return FormatApplicability(
+                False,
+                "profile_mismatch",
+                "Qwen3.5/3.6 packed MoE serving path only supports "
+                "NVFP4, MXFP4, MXFP8_E4M3, or BF16 for expert tensors",
+            )
+        if fmt == "MXFP4":
+            return FormatApplicability(
+                False,
+                "profile_mismatch",
+                "MXFP4 is only enabled for packed MoE experts in this "
+                "serving profile",
+            )
+        return FormatApplicability(True)
+    return FormatApplicability(
+        False,
+        "profile_mismatch",
+        f"unknown target profile {target_profile!r}",
+    )
+
+
 def _format_kernel_supports_shape(fmt_name: str, in_features: int,
                                   out_features: int) -> bool:
     """Return True if the runtime kernel can handle this Linear shape."""
@@ -49,6 +90,87 @@ def _format_kernel_supports_shape(fmt_name: str, in_features: int,
     if fmt_name.startswith("NVFP4"):
         return in_features % 16 == 0
     return True
+
+
+def check_format_applicability(
+    linear_shape: tuple[int, ...],
+    format_spec_or_name: fr.FormatSpec | str,
+    *,
+    qname: str | None = None,
+    source_kind: str | None = None,
+    target_profile: str | None = None,
+) -> FormatApplicability:
+    """Return whether a Linear shape can legally use a format.
+
+    The verdict captures all cheap preflight constraints that otherwise show
+    up later as allocator-invalid choices or RTN/kernel crashes: source
+    passthrough integrity, serving profile restrictions, group divisibility,
+    and known runtime kernel shape rules.
+    """
+    try:
+        spec = (
+            format_spec_or_name
+            if isinstance(format_spec_or_name, fr.FormatSpec)
+            else fr.get_format(str(format_spec_or_name))
+        )
+    except KeyError as exc:
+        return FormatApplicability(False, "unknown_format", str(exc))
+    fmt = fr.canonical_format_name(spec.name)
+    shape = tuple(int(dim) for dim in linear_shape)
+    if len(shape) < 2:
+        return FormatApplicability(
+            False,
+            "shape_rank",
+            f"expected a Linear weight shape with rank >= 2, got {shape}",
+        )
+    out_features = int(shape[-2])
+    in_features = int(shape[-1])
+
+    if (
+        source_kind is not None
+        and _is_passthrough_format(fmt)
+        and not _passthrough_source_ok(fmt, source_kind)
+    ):
+        required = PASSTHROUGH_SOURCE_REQUIREMENTS.get(fmt)
+        return FormatApplicability(
+            False,
+            "source_dtype_mismatch",
+            f"{fmt} requires source_kind={required!r}, got {source_kind!r}",
+        )
+
+    profile_verdict = _profile_allows_format(target_profile, qname, fmt)
+    if not profile_verdict.legal:
+        return profile_verdict
+
+    if (
+        spec.group_size > 0
+        and int(spec.group_size) < in_features
+        and in_features % int(spec.group_size) != 0
+    ):
+        return FormatApplicability(
+            False,
+            "group_divisibility",
+            f"group_size={spec.group_size} does not divide in_features="
+            f"{in_features}",
+        )
+    if spec.scale_block_shape is not None:
+        block_rows, block_cols = spec.scale_block_shape
+        if out_features % int(block_rows) != 0 or in_features % int(block_cols) != 0:
+            return FormatApplicability(
+                False,
+                "scale_block_divisibility",
+                f"scale_block_shape={spec.scale_block_shape} does not divide "
+                f"(out_features={out_features}, in_features={in_features})",
+            )
+
+    if not _format_kernel_supports_shape(fmt, in_features, out_features):
+        return FormatApplicability(
+            False,
+            "kernel_shape",
+            f"{fmt} kernel does not support (out_features={out_features}, "
+            f"in_features={in_features})",
+        )
+    return FormatApplicability(True)
 
 
 def _flashinfer_kernel_accepts(fmt_name: str, in_features: int,
@@ -134,8 +256,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
     """Build legal format candidates for every measured Linear."""
     gains = calibrated_gains or {}
     out: dict[str, list[Candidate]] = {}
-    masked_by_shape: dict[str, list[str]] = {}
-    masked_by_passthrough: dict[str, list[str]] = {}
+    masked: dict[tuple[str, str], list[str]] = {}
     for name, s in stats.items():
         if name not in costs:
             continue
@@ -154,15 +275,21 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                     break
             if entry is None or "error" in entry:
                 continue
-            if (source_kind is not None
-                    and _is_passthrough_format(spec.name)
-                    and not _passthrough_source_ok(spec.name, source_kind)):
-                masked_by_passthrough.setdefault(spec.name, []).append(name)
-                continue
-            if in_features and out_features and not _format_kernel_supports_shape(
-                spec.name, in_features, out_features
-            ):
-                masked_by_shape.setdefault(spec.name, []).append(name)
+            verdict = (
+                check_format_applicability(
+                    shape,
+                    spec,
+                    qname=name,
+                    source_kind=source_kind,
+                )
+                if len(shape) >= 2
+                else FormatApplicability(True)
+            )
+            if not verdict.legal:
+                masked.setdefault(
+                    (spec.name, verdict.reason or "not_applicable"),
+                    [],
+                ).append(name)
                 continue
             gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
             # Always use measured joint output perturbation when available.
@@ -178,15 +305,13 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             ))
         if cands:
             out[name] = cands
-    if masked_by_shape:
-        for fmt, names in masked_by_shape.items():
-            print(f"[alloc] kernel shape-mask: {len(names)} Linear(s) "
-                  f"dropped {fmt} (sample: {names[:3]})", flush=True)
-    if masked_by_passthrough:
-        for fmt, names in masked_by_passthrough.items():
-            print(f"[alloc] passthrough-integrity: {len(names)} Linear(s) "
-                  f"dropped {fmt} (source dtype mismatch; "
-                  f"sample: {names[:3]})", flush=True)
+    if masked:
+        for (fmt, reason), names in sorted(masked.items()):
+            print(
+                f"[alloc] format-applicability: {len(names)} Linear(s) "
+                f"dropped {fmt} reason={reason} (sample: {names[:3]})",
+                flush=True,
+            )
     return out
 
 

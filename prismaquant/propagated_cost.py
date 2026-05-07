@@ -21,7 +21,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Literal, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -48,6 +48,8 @@ from prismaquant.perturbed_x_cache import (
     iter_calibration_forwards,
 )
 from prismaquant.layer_state_cache import LayerHiddenStateCache
+
+KLScope = Literal["last_token", "full_sequence"]
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,27 @@ def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
     if value is None:
         return bool(default)
     return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def resolve_kl_scope(kl_scope: KLScope | None = None) -> KLScope:
+    """Resolve KL reduction scope, preserving the legacy env override.
+
+    Passing an explicit ``kl_scope`` wins.  ``None`` means use
+    ``PRISMAQUANT_FULL_SEQUENCE_KL`` for backward compatibility, with
+    last-token KL as the default when the env var is unset.
+    """
+    if kl_scope is not None:
+        if kl_scope not in {"last_token", "full_sequence"}:
+            raise ValueError(
+                "kl_scope must be 'last_token' or 'full_sequence', "
+                f"got {kl_scope!r}"
+            )
+        return kl_scope
+    return (
+        "full_sequence"
+        if _env_flag_enabled("PRISMAQUANT_FULL_SEQUENCE_KL", default=False)
+        else "last_token"
+    )
 
 
 def _env_cuda_graphs_enabled_for_call_count(
@@ -2888,6 +2911,7 @@ def measure_lane_batched_kl_deltas(
     max_lanes_per_batch: int = 64,
     profile=None,
     replay_cache: LayerHiddenStateCache | None = None,
+    kl_scope: KLScope | None = None,
 ) -> list[float]:
     """Measure end-KL for each candidate flip applied to baseline_assignment.
 
@@ -2897,6 +2921,8 @@ def measure_lane_batched_kl_deltas(
     """
     if not candidate_flips:
         return []
+    effective_kl_scope = resolve_kl_scope(kl_scope)
+    full_sequence_kl = effective_kl_scope == "full_sequence"
 
     assignment_c = _canonical_assignment(baseline_assignment)
     flips = [
@@ -3047,6 +3073,8 @@ def measure_lane_batched_kl_deltas(
                             )
                         )
                         if logits.dim() >= 3:
+                            if full_sequence_kl:
+                                return logits.clone()
                             return logits[:, -1:, :].clone()
                         return logits
 
@@ -3063,6 +3091,7 @@ def measure_lane_batched_kl_deltas(
                             int(replay_layer_idx),
                             int(len(lanes)),
                             int(base_batch),
+                            effective_kl_scope,
                             lane_key,
                             tuple(sorted(target_names)),
                         ),
@@ -3076,7 +3105,7 @@ def measure_lane_batched_kl_deltas(
                         ),
                     )
                     logits = _extract_logits(logits)
-                    if logits.dim() >= 3:
+                    if logits.dim() >= 3 and not full_sequence_kl:
                         logits = logits[:, -1:, :]
                     chunks = _split_lanes(logits.detach(), base_batch, len(lanes))
                     if chunks is None:
@@ -3088,7 +3117,7 @@ def measure_lane_batched_kl_deltas(
                     for idx, chunk in enumerate(chunks):
                         for batch_index, teacher in enumerate(ref_log_probs):
                             teacher = teacher.to(chunk.device)
-                            if teacher.dim() >= 3:
+                            if teacher.dim() >= 3 and not full_sequence_kl:
                                 teacher = teacher[:, -1:, :]
                             kl_totals[idx] += float(
                                 kl_divergence(
@@ -3174,6 +3203,8 @@ def measure_lane_batched_kl_deltas(
                     def _full_forward(*call_args, **call_kwargs):
                         logits = _extract_logits(model(*call_args, **call_kwargs))
                         if logits.dim() >= 3:
+                            if full_sequence_kl:
+                                return logits.clone()
                             return logits[:, -1:, :].clone()
                         return logits
 
@@ -3188,6 +3219,7 @@ def measure_lane_batched_kl_deltas(
                             cal_hash,
                             int(len(lanes)),
                             int(base_batch),
+                            effective_kl_scope,
                             lane_key,
                             tuple(sorted(target_names)),
                         ),
@@ -3202,7 +3234,7 @@ def measure_lane_batched_kl_deltas(
                         ),
                         **rep_kwargs,
                     )
-                    if logits.dim() >= 3:
+                    if logits.dim() >= 3 and not full_sequence_kl:
                         logits = logits[:, -1:, :]
                     chunks = _split_lanes(logits.detach(), base_batch, len(lanes))
                     if chunks is None:
@@ -3212,7 +3244,7 @@ def measure_lane_batched_kl_deltas(
                             f"base_batch={base_batch} lanes={len(lanes)}"
                         )
                     teacher = ref_log_probs[batch_index]
-                    if teacher.dim() >= 3:
+                    if teacher.dim() >= 3 and not full_sequence_kl:
                         teacher = teacher[:, -1:, :]
                     for idx, chunk in enumerate(chunks):
                         kl_totals[idx] += float(
