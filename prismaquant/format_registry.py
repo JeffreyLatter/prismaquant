@@ -400,9 +400,24 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
     ).strip().lower() in {"1", "true", "yes", "on"}:
         _inner = _inner_eager
     else:
-        _inner = torch.compile(
-            _inner_eager, mode="reduce-overhead", dynamic=False,
-        )
+        # ``dynamic=True`` produces one compiled kernel that handles
+        # every (batch, hidden) shape via symbolic shape specialization.
+        # ``dynamic=False`` would per-shape-recompile and quickly hit
+        # dynamo's default recompile_limit=8, after which every new
+        # shape silently falls back to eager.  At polish time we see
+        # 30+ unique Linear input shapes on a single 27B model, so the
+        # symbolic-shape kernel is the right trade-off (slightly less
+        # aggressive optimization in exchange for no recompile thrash).
+        # Raise the recompile limit defensively in case dynamic
+        # specialization still triggers a recompile path.
+        try:
+            torch._dynamo.config.recompile_limit = max(
+                int(getattr(torch._dynamo.config, "recompile_limit", 8)),
+                256,
+            )
+        except Exception:
+            pass
+        _inner = torch.compile(_inner_eager, dynamic=True)
 
     def f(w: torch.Tensor) -> torch.Tensor:
         cb = _codebook_on_device(
