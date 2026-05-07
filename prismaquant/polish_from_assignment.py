@@ -11,9 +11,12 @@ trace to ``--output`` JSON.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import pickle
 import shutil
+import subprocess
 import tempfile
 import time
 from collections.abc import Sequence
@@ -36,7 +39,24 @@ from prismaquant.measure_adjoint_l3 import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
+from prismaquant.perturbed_x_cache import calibration_data_hash
 from prismaquant.model_profiles import DefaultProfile, detect_profile
+
+
+def _assignment_digest(assignment: dict[str, str]) -> str:
+    payload = json.dumps(dict(sorted(assignment.items())), sort_keys=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return ""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -201,13 +221,28 @@ def main(argv: Sequence[str] | None = None) -> int:
               flush=True)
 
     production_weight_cache = None
+    prod_cache_diag: dict = {
+        "path": str(args.production_weight_cache or ""),
+        "entries": 0,
+    }
     if args.production_weight_cache:
         with open(args.production_weight_cache, "rb") as fh:
             production_weight_cache = pickle.load(fh)
+        prod_cache_diag.update({
+            "entries": len(production_weight_cache),
+            "cache_dir": str(
+                getattr(production_weight_cache, "cache_dir", "") or ""
+            ),
+            "activation_max_abs_entries": len(
+                getattr(production_weight_cache, "activation_max_abs", {})
+                or {}
+            ),
+        })
         print(f"[polish] loaded prod cache with "
               f"{len(production_weight_cache)} entries", flush=True)
         if args.cache_dir_override:
             production_weight_cache.relocate(args.cache_dir_override)
+            prod_cache_diag["cache_dir"] = str(args.cache_dir_override)
             print(
                 f"[polish] cache_dir relocated to "
                 f"{args.cache_dir_override}",
@@ -222,6 +257,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             n_present = len(verify["present"])
             n_missing = len(verify["missing"])
             n_in_mem = len(verify["in_memory"])
+            prod_cache_diag["verify"] = {
+                "present": n_present,
+                "missing": n_missing,
+                "in_memory": n_in_mem,
+                "missing_sample": verify["missing"][:5],
+            }
             print(
                 f"[polish] cache verify: {n_present} on disk, "
                 f"{n_in_mem} in memory, {n_missing} missing",
@@ -240,6 +281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.lru_gb and args.lru_gb > 0:
             n_bytes = int(args.lru_gb * (1024 ** 3))
             production_weight_cache.enable_lru(n_bytes)
+            prod_cache_diag["lru_gb"] = float(args.lru_gb)
             print(
                 f"[polish] LRU eviction enabled at {args.lru_gb:.1f} GiB",
                 flush=True,
@@ -248,11 +290,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             t_pre = time.monotonic()
             n_loaded = production_weight_cache.prefetch()
             elapsed = time.monotonic() - t_pre
+            prod_cache_diag["prefetch"] = {
+                "enabled": True,
+                "loaded": int(n_loaded),
+                "elapsed_seconds": float(elapsed),
+            }
             print(
                 f"[polish] prefetched {n_loaded} cache entries in "
                 f"{elapsed:.1f}s",
                 flush=True,
             )
+        else:
+            prod_cache_diag["prefetch"] = {"enabled": False}
 
     dtype = _dtype_from_name(args.dtype)
     staged, cleanup = stage_multimodal(args.model)
@@ -268,6 +317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.n_calib_samples, args.calib_seqlen,
             split=args.calib_split, seed=args.calib_seed,
         )
+        calib_hash = calibration_data_hash(calib_ids)
         load_kwargs = {
             "torch_dtype": dtype, "trust_remote_code": True,
             "local_files_only": local_only,
@@ -345,6 +395,66 @@ def main(argv: Sequence[str] | None = None) -> int:
             "n_kl_measurements": int(polish_result.n_kl_measurements),
             "elapsed_seconds": float(elapsed),
             "production_weight_cache": str(args.production_weight_cache or ""),
+            "diagnostics": {
+                "git_commit": _git_commit(),
+                "model": str(args.model),
+                "payload": str(args.payload),
+                "assignment": str(args.assignment),
+                "starting_assignment_hash": _assignment_digest(
+                    starting_assignment
+                ),
+                "final_assignment_hash": _assignment_digest(
+                    polish_result.final_assignment
+                ),
+                "calibration": {
+                    "dataset": "wikitext/wikitext-2-raw-v1",
+                    "split": str(args.calib_split),
+                    "seed": int(args.calib_seed),
+                    "n_samples": int(args.n_calib_samples),
+                    "seqlen": int(args.calib_seqlen),
+                    "hash": str(calib_hash),
+                },
+                "runtime": {
+                    "torch_version": str(torch.__version__),
+                    "torch_cuda": str(getattr(torch.version, "cuda", "") or ""),
+                    "cuda_available": bool(torch.cuda.is_available()),
+                    "cuda_device": (
+                        torch.cuda.get_device_name(0)
+                        if torch.cuda.is_available() else ""
+                    ),
+                    "torchinductor_cache_dir": os.environ.get(
+                        "TORCHINDUCTOR_CACHE_DIR", ""
+                    ),
+                    "rtn_compile_disabled": os.environ.get(
+                        "PRISMAQUANT_DISABLE_RTN_COMPILE", ""
+                    ),
+                    "full_sequence_kl": os.environ.get(
+                        "PRISMAQUANT_FULL_SEQUENCE_KL", ""
+                    ),
+                    "strict_assignment_coverage": os.environ.get(
+                        "PRISMAQUANT_STRICT_ASSIGNMENT_COVERAGE", "auto"
+                    ),
+                    "strict_production_cache": os.environ.get(
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE", "1"
+                    ),
+                },
+                "polish_args": {
+                    "direction": str(args.direction),
+                    "kl_budget": args.kl_budget,
+                    "polish_budget_creep": float(args.polish_budget_creep),
+                    "polish_max_passes": int(args.polish_max_passes),
+                    "polish_noise_floor": float(args.polish_noise_floor),
+                    "delta_quantize": args.delta_quantize,
+                    "weight_session_spill_to_disk": bool(
+                        args.weight_session_spill_to_disk
+                    ),
+                    "lru_gb": float(args.lru_gb),
+                    "prefetch_cache": bool(args.prefetch_cache),
+                    "pin": list(args.pin or []),
+                },
+                "production_weight_cache": prod_cache_diag,
+                "coord_descent": polish_result.diagnostics,
+            },
             "steps": [
                 {
                     "pass_index": s.pass_index,

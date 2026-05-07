@@ -68,6 +68,7 @@ class PolishResult:
     steps: list[PolishStep] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     n_kl_measurements: int = 0
+    diagnostics: dict = field(default_factory=dict)
 
 
 def _override_unit(
@@ -362,6 +363,7 @@ def coord_descent_polish(
                 progress_callback({
                     "event": "weight_session_initialized",
                     "n_bf16_snapshots": weight_session.n_bf16_snapshots,
+                    "diagnostics": weight_session.diagnostics(),
                 })
         current_kl = measure_assignment_kl(
             model, current, calib_ids, ref_log_probs,
@@ -587,6 +589,12 @@ def coord_descent_polish(
             steps=steps,
             elapsed_seconds=float(time.time() - start),
             n_kl_measurements=int(n_measurements),
+            diagnostics={
+                "weight_session": (
+                    weight_session.diagnostics()
+                    if weight_session is not None else None
+                ),
+            },
         )
     finally:
         # Restore PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT to its prior

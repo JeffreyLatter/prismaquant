@@ -2250,6 +2250,31 @@ def test_measure_assignment_kl_deterministic_same_inputs(tmp_path):
     assert first == second
 
 
+def test_measure_assignment_kl_rejects_missing_non_bf16_qname(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("PRISMAQUANT_STRICT_ASSIGNMENT_COVERAGE", "1")
+    model = _WideStackLogitsModel(layers=2).eval()
+    assignment = {name: "BF16" for name in model.layer_names}
+    assignment["missing_linear"] = "NVFP4"
+    calib_ids = torch.randn(2, 4, 33)
+    ref_log_probs = ipa.cache_reference_log_probs(
+        model,
+        calib_ids,
+        next(model.parameters()).device,
+    )
+
+    with pytest.raises(RuntimeError, match="non-BF16 qnames"):
+        ipa.measure_assignment_kl(
+            model,
+            assignment,
+            calib_ids,
+            ref_log_probs,
+            work_root=tmp_path,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_kl_cuda_graphs_replay_matches_eager(tmp_path, monkeypatch):
     ipa._KL_CUDA_GRAPH_REGISTRY.clear()

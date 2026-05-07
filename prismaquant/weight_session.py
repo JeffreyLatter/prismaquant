@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import os
 import torch
 import torch.nn as nn
 
@@ -62,6 +63,7 @@ class WeightSession:
         model: nn.Module,
         production_weight_cache=None,
         snapshot_dir: str | None = None,
+        strict_production_cache: bool | None = None,
     ):
         """If ``snapshot_dir`` is provided, BF16 source snapshots are
         spilled to disk after capture instead of held in memory.  This
@@ -74,12 +76,19 @@ class WeightSession:
         """
         self._model = model
         self._cache = production_weight_cache
+        if strict_production_cache is None:
+            strict_production_cache = _env_truthy(
+                "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                default=True,
+            )
+        self._strict_production_cache = bool(strict_production_cache)
         self._linear_by_qname: dict[str, tuple[nn.Module, str]] = {}
         for full_name, mod, attr in iter_quantizable_tensors(model):
             if attr != "weight" or not isinstance(mod, nn.Linear):
                 continue
             qname = full_name[:-7] if full_name.endswith(".weight") else full_name
-            self._linear_by_qname[qname] = (mod, attr)
+            for alias in _qname_aliases(qname):
+                self._linear_by_qname[alias] = (mod, attr)
         self._bf16_originals: dict[str, torch.Tensor] = {}
         self._snapshot_dir = None
         if snapshot_dir is not None:
@@ -91,6 +100,13 @@ class WeightSession:
         self._spilled: dict[str, str] = {}
         self._current: dict[str, str] = {}
         self._undo_stack: list[_UndoEntry] = []
+        self._initialize_missing: list[str] = []
+        self._stage_missing: list[str] = []
+        self._cache_hits = 0
+        self._cache_misses: list[tuple[str, str]] = []
+        self._rtn_fallbacks: list[tuple[str, str]] = []
+        self._applied = 0
+        self._bf16_kept = 0
 
     # ------------------------------------------------------------------
     # qname → live weight resolution
@@ -166,11 +182,23 @@ class WeightSession:
         if self._cache is not None:
             cached = self._cache.get(qname, fmt_canon)
             if cached is not None:
+                self._cache_hits += 1
                 return cached
+            if fmt_canon not in {"BF16", "MXFP8", "MXFP8_E4M3"}:
+                self._cache_misses.append((qname, fmt_canon))
+                if self._strict_production_cache:
+                    raise RuntimeError(
+                        f"production_weight_cache miss for "
+                        f"({qname!r}, {fmt_canon!r}) in WeightSession; "
+                        f"rebuild the cache or set "
+                        f"PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 to allow "
+                        f"RTN fallback."
+                    )
         # Fall back to RTN-quantize from BF16 source (matches what the
         # OLD per-module hook path does when production cache misses).
         # MXFP8 commonly takes this path because the production cache
         # only fills NVFP4 by default.
+        self._rtn_fallbacks.append((qname, fmt_canon))
         bf16 = self._ensure_bf16_snapshot(qname)
         if bf16 is None:
             return None
@@ -202,11 +230,14 @@ class WeightSession:
 
         for qname, fmt in assignment.items():
             if qname not in self._linear_by_qname:
+                if fr.canonical_format_name(fmt) != "BF16":
+                    self._initialize_missing.append(qname)
                 continue
             # Snapshot BEFORE any overwrite.
             self._ensure_bf16_snapshot(qname)
             self._current[qname] = fr.canonical_format_name(fmt)
             if self._current[qname] == "BF16":
+                self._bf16_kept += 1
                 continue  # live weight already holds BF16 source
             replacement = self._format_weight(qname, self._current[qname])
             if replacement is None:
@@ -215,6 +246,15 @@ class WeightSession:
             if live is None:
                 continue
             live.copy_(replacement.to(device=live.device, dtype=live.dtype))
+            self._applied += 1
+        if self._initialize_missing:
+            sample = self._initialize_missing[:5]
+            raise RuntimeError(
+                f"WeightSession could not resolve "
+                f"{len(self._initialize_missing)} non-BF16 assignment qnames "
+                f"on the live model; sample={sample}.  Refusing to measure "
+                f"a partially materialized assignment."
+            )
 
     # ------------------------------------------------------------------
     # Staged format swaps
@@ -230,6 +270,7 @@ class WeightSession:
         ``revert_last`` restores from this entry; ``commit_last`` drops it.
         """
         if qname not in self._linear_by_qname:
+            self._stage_missing.append(qname)
             return None
         new_canon = fr.canonical_format_name(new_fmt)
         prev_fmt = self._current.get(qname, "BF16")
@@ -309,3 +350,38 @@ class WeightSession:
 
     def current_assignment(self) -> dict[str, str]:
         return dict(self._current)
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "n_live_qname_aliases": len(self._linear_by_qname),
+            "n_bf16_snapshots": self.n_bf16_snapshots,
+            "n_pending_undo": self.n_pending_undo,
+            "n_applied": self._applied,
+            "n_bf16_kept": self._bf16_kept,
+            "n_cache_hits": self._cache_hits,
+            "n_cache_misses": len(self._cache_misses),
+            "cache_miss_sample": list(self._cache_misses[:5]),
+            "n_rtn_fallbacks": len(self._rtn_fallbacks),
+            "rtn_fallback_sample": list(self._rtn_fallbacks[:5]),
+            "n_initialize_missing": len(self._initialize_missing),
+            "initialize_missing_sample": list(self._initialize_missing[:5]),
+            "n_stage_missing": len(self._stage_missing),
+            "stage_missing_sample": list(self._stage_missing[:5]),
+            "strict_production_cache": self._strict_production_cache,
+        }
+
+
+def _env_truthy(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _qname_aliases(qname: str) -> set[str]:
+    aliases = {qname}
+    if qname.startswith("model.language_model."):
+        aliases.add("model." + qname[len("model.language_model."):])
+    elif qname.startswith("model."):
+        aliases.add("model.language_model." + qname[len("model."):])
+    return aliases

@@ -8504,6 +8504,36 @@ def measure_assignment_kl(
             profile=profile,
             production_weight_cache=production_weight_cache,
         )
+        strict_coverage_default = (
+            production_weight_cache is not None
+            or _env_flag_enabled(
+                "PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT",
+                default=False,
+            )
+        )
+        if _env_flag_enabled(
+            "PRISMAQUANT_STRICT_ASSIGNMENT_COVERAGE",
+            default=strict_coverage_default,
+        ):
+            missing = [
+                name for name in hooks.missing
+                if fr.canonical_format_name(assignment.get(name, "BF16"))
+                != "BF16"
+            ]
+            if missing:
+                raise RuntimeError(
+                    "assignment contains non-BF16 qnames that do not "
+                    "resolve on the live model; refusing to measure a "
+                    f"partial assignment.  missing={len(missing)} "
+                    f"sample={missing[:5]}"
+                )
+            if hooks.skipped:
+                raise RuntimeError(
+                    "assignment has conflicting activation-quant formats "
+                    "within at least one module; refusing to measure with "
+                    f"activation quant silently skipped.  sample="
+                    f"{hooks.skipped[:3]}"
+                )
     values = []
     use_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
         "PRISMAQUANT_KL_CUDA_GRAPHS",
