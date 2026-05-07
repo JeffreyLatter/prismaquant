@@ -118,6 +118,10 @@ class FormatSpec:
 
 REGISTRY: dict[str, FormatSpec] = {}
 FORMAT_ALIASES: dict[str, str] = {
+    # Historical artifacts and launchers used the short OCP-MX default name.
+    # Keep it accepted at every input boundary, but normalize persisted solver
+    # and measurement output to the explicit FP8 variant.
+    "MXFP8": "MXFP8_E4M3",
 }
 
 
@@ -336,9 +340,76 @@ def _codebook_on_device(
 
 
 def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
-    cb = _CODEBOOKS[codebook_name]
+    """Return a closure that runs RTN through ``codebook`` at ``group_size``.
+
+    The hot path is wrapped in ``torch.compile`` (mode='reduce-overhead',
+    dynamic=False) by default — micro-benchmark on Blackwell + cu130 +
+    torch 2.11 shows ~10x speedup on per-Linear activation RTN
+    (12 ms eager → 1.2 ms compiled, max numerical diff 5e-7).  This
+    matters most on the polish hot path where the closure is called
+    once per Linear per forward, ~497 calls per measurement on 27B,
+    several hundred measurements per polish pass.
+
+    Set ``PRISMAQUANT_DISABLE_RTN_COMPILE=1`` to fall back to eager —
+    only useful if torch.compile fails on a particular tensor shape
+    or kernel mismatch, which has not been observed but might surface
+    on older torch / non-Blackwell hardware.
+
+    The codebook device-resolution is kept *outside* the compiled
+    function: dynamo cannot trace ``codebook.pin_memory()`` (NYI in
+    the Inductor backend), and compiling around it would force a
+    graph break on every call.  Instead the closure resolves the
+    device-resident codebook eagerly, then passes it as a positional
+    argument to the compiled inner.
+    """
+    cb_cpu = _CODEBOOKS[codebook_name]
+
+    # Inner function takes a pre-resolved on-device codebook so the
+    # compile can trace cleanly.  Functionally equivalent to
+    # _rtn_fp_codebook except we skip the device-resolution call
+    # (caller already did it).
+    def _inner_eager(
+        w: torch.Tensor, cb: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_shape = w.shape
+        in_f = w.shape[-1]
+        w2 = w.reshape(-1, in_f).float()
+        if group_size > 0 and group_size < in_f:
+            w2 = w2.reshape(-1, in_f // group_size, group_size)
+        else:
+            w2 = w2.unsqueeze(1)
+        cmax = cb.abs().max()
+        max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        scale = max_abs / cmax
+        if mx_scale:
+            scale = _snap_scale_e8m0(scale)
+        x = w2 / scale
+        idx = torch.bucketize(x.contiguous(), cb)
+        idx_lo = (idx - 1).clamp_min(0)
+        idx_hi = idx.clamp_max(cb.numel() - 1)
+        lo = cb[idx_lo]
+        hi = cb[idx_hi]
+        choose_hi = (hi - x).abs() < (x - lo).abs()
+        q = torch.where(choose_hi, hi, lo)
+        w_rec = q * scale
+        return w_rec.reshape(orig_shape).to(w.dtype)
+
+    import os as _os
+    if _os.environ.get(
+        "PRISMAQUANT_DISABLE_RTN_COMPILE", "",
+    ).strip().lower() in {"1", "true", "yes", "on"}:
+        _inner = _inner_eager
+    else:
+        _inner = torch.compile(
+            _inner_eager, mode="reduce-overhead", dynamic=False,
+        )
+
     def f(w: torch.Tensor) -> torch.Tensor:
-        return _rtn_fp_codebook(w, cb, group_size, mx_scale=mx_scale)
+        cb = _codebook_on_device(
+            cb_cpu, device=w.device, dtype=torch.float32,
+        )
+        return _inner(w, cb)
+
     return f
 
 
