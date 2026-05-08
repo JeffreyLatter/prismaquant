@@ -121,10 +121,12 @@ class FrontierPoint:
     promotion_count: int
     measured_kl: float | None = None
     measured_gain: float | None = None
+    source: str = "frontier"
+    label: str | None = None
 
     def to_json(self) -> dict:
         predicted = float(self.predicted_kl)
-        return {
+        payload = {
             "budget_bits": float(self.budget_bits),
             "bits_total": float(self.bits_total),
             "bits_delta": float(self.bits_delta),
@@ -143,7 +145,11 @@ class FrontierPoint:
             "assignment": dict(sorted(self.assignment.items())),
             "assignment_hash": _assignment_digest(self.assignment),
             "promotion_count": int(self.promotion_count),
+            "source": self.source,
         }
+        if self.label is not None:
+            payload["label"] = self.label
+        return payload
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -787,6 +793,319 @@ def _promotion_count(
         if fmt_bits >= base_bits - 1e-12:
             count += 1
     return count
+
+
+_SEED_ASSIGNMENT_KEYS = (
+    "assignment",
+    "chosen_assignment",
+    "final_assignment",
+)
+
+
+def _extract_seed_assignment(
+    payload: object,
+    *,
+    path: Path,
+) -> tuple[Mapping[str, object], str, str]:
+    """Return (assignment, label, source_key) from common assignment JSON shapes."""
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{path} does not contain a JSON object")
+
+    label = str(payload.get("label") or path.stem)
+    if payload and all(isinstance(key, str) and isinstance(value, str)
+                       for key, value in payload.items()):
+        return payload, label, "root"
+
+    for key in _SEED_ASSIGNMENT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            return value, label, key
+
+    selection = payload.get("selection")
+    if isinstance(selection, Mapping):
+        chosen = selection.get("chosen")
+        if isinstance(chosen, Mapping):
+            value = chosen.get("assignment")
+            if isinstance(value, Mapping):
+                return value, label, "selection.chosen.assignment"
+
+    raise ValueError(
+        f"{path} does not contain an assignment, chosen_assignment, "
+        "final_assignment, or selection.chosen.assignment object"
+    )
+
+
+def _seed_assignment_point(
+    *,
+    path: Path,
+    raw_assignment: Mapping[str, object],
+    label: str,
+    source_key: str,
+    floor_assignment: Mapping[str, str],
+    floor_kl: float,
+    targets: Sequence[LinearTarget],
+    profile,
+    requested_formats: Sequence[str],
+    source_manifest: Mapping[str, str | None],
+    target_profile: str,
+) -> tuple[FrontierPoint, dict[str, object]]:
+    target_by_qname = {target.qname: target for target in targets}
+    allowed_formats = {
+        fr.canonical_format_name(fmt)
+        for fmt in requested_formats
+    }
+    allowed_formats.add("BF16")
+    specs_by_name = {
+        fr.canonical_format_name(spec.name): spec
+        for spec in fr.list_formats()
+    }
+    assignment = {
+        qname: fr.canonical_format_name(fmt)
+        for qname, fmt in floor_assignment.items()
+    }
+    diagnostics: dict[str, object] = {
+        "path": str(path),
+        "label": label,
+        "source_key": source_key,
+        "raw_entries": int(len(raw_assignment)),
+        "matched_entries": 0,
+        "filled_from_floor": int(len(
+            set(floor_assignment) - {str(qname) for qname in raw_assignment}
+        )),
+        "unknown_entries": 0,
+        "unknown_sample": [],
+        "invalid_formats": [],
+        "disallowed_formats": [],
+        "pinned_conflicts": [],
+        "illegal_formats": [],
+    }
+    unknown_sample: list[str] = []
+    unknown_count = 0
+    invalid_formats: list[dict[str, str]] = []
+    disallowed_formats: list[dict[str, str]] = []
+    pinned_conflicts: list[dict[str, str]] = []
+    illegal_formats: list[dict[str, str]] = []
+
+    for raw_qname, raw_fmt in raw_assignment.items():
+        qname = str(raw_qname)
+        if qname not in target_by_qname:
+            unknown_count += 1
+            if len(unknown_sample) < 10:
+                unknown_sample.append(qname)
+            continue
+        if not isinstance(raw_fmt, str):
+            invalid_formats.append({"qname": qname, "format": repr(raw_fmt)})
+            continue
+        fmt = fr.canonical_format_name(raw_fmt)
+        if fmt not in specs_by_name:
+            invalid_formats.append({"qname": qname, "format": raw_fmt})
+            continue
+        if fmt not in allowed_formats:
+            disallowed_formats.append({"qname": qname, "format": fmt})
+            continue
+        target = target_by_qname[qname]
+        if target.pinned and fmt != fr.canonical_format_name(floor_assignment[qname]):
+            pinned_conflicts.append({"qname": qname, "format": fmt})
+            continue
+        assignment[qname] = fmt
+        diagnostics["matched_entries"] = int(diagnostics["matched_entries"]) + 1
+
+    assignment = _coerce_assignment_to_fused_units(
+        assignment,
+        targets,
+        profile,
+    )
+
+    members_by_unit_all = _members_by_decision_unit(
+        targets,
+        profile,
+        include_pinned=True,
+    )
+    for unit, members in members_by_unit_all.items():
+        unit_fmts = {
+            fr.canonical_format_name(assignment.get(member, floor_assignment[member]))
+            for member in members
+        }
+        if len(unit_fmts) != 1:
+            assignment = _coerce_assignment_to_fused_units(
+                assignment,
+                targets,
+                profile,
+            )
+            unit_fmts = {
+                fr.canonical_format_name(
+                    assignment.get(member, floor_assignment[member])
+                )
+                for member in members
+            }
+        fmt = next(iter(unit_fmts))
+        reset_unit = fmt not in allowed_formats or fmt not in specs_by_name
+        if not reset_unit:
+            spec = specs_by_name[fmt]
+            for member in members:
+                target = target_by_qname[member]
+                verdict = check_format_applicability(
+                    target.shape,
+                    spec,
+                    qname=member,
+                    source_kind=source_manifest.get(member),
+                    target_profile=target_profile,
+                )
+                if not verdict.legal:
+                    illegal_formats.append({
+                        "qname": member,
+                        "format": fmt,
+                        "reason": str(verdict.reason or "not_applicable"),
+                        "detail": str(verdict.detail or ""),
+                    })
+                    reset_unit = True
+                    break
+        if reset_unit:
+            for member in members:
+                assignment[member] = fr.canonical_format_name(
+                    floor_assignment[member]
+                )
+
+    for target in targets:
+        if not target.pinned:
+            continue
+        floor_fmt = fr.canonical_format_name(floor_assignment[target.qname])
+        if assignment.get(target.qname) != floor_fmt:
+            pinned_conflicts.append({
+                "qname": target.qname,
+                "format": str(assignment.get(target.qname)),
+            })
+            assignment[target.qname] = floor_fmt
+
+    assignment = _coerce_assignment_to_fused_units(
+        assignment,
+        targets,
+        profile,
+    )
+    _assert_fused_assignment_coherent(
+        assignment,
+        targets,
+        profile,
+        label=f"seed_assignment:{path}",
+    )
+
+    members_by_unit = _members_by_decision_unit(targets, profile)
+    unit_assignment = {
+        unit: fr.canonical_format_name(assignment[members[0]])
+        for unit, members in members_by_unit.items()
+    }
+    floor_bits_total = sum(
+        _format_bits(fr.get_format(floor_assignment[target.qname]), target.shape)
+        for target in targets
+    )
+    bits_total = sum(
+        _format_bits(fr.get_format(assignment[target.qname]), target.shape)
+        for target in targets
+    )
+    point = FrontierPoint(
+        budget_bits=float(bits_total),
+        bits_total=float(bits_total),
+        bits_delta=float(bits_total - floor_bits_total),
+        gain=0.0,
+        predicted_kl=float(floor_kl),
+        unit_assignment=unit_assignment,
+        assignment=dict(sorted(assignment.items())),
+        promotion_count=_promotion_count(assignment, floor_assignment, specs_by_name),
+        source="seed_assignment",
+        label=label,
+    )
+    diagnostics.update({
+        "unknown_entries": int(unknown_count),
+        "unknown_sample": unknown_sample,
+        "invalid_formats": invalid_formats[:20],
+        "disallowed_formats": disallowed_formats[:20],
+        "pinned_conflicts": pinned_conflicts[:20],
+        "illegal_formats": illegal_formats[:20],
+        "bits_total": float(bits_total),
+        "bits_delta": float(bits_total - floor_bits_total),
+        "promotion_count": int(point.promotion_count),
+        "assignment_hash": _assignment_digest(point.assignment),
+        "included": True,
+    })
+    return point, diagnostics
+
+
+def _load_seed_assignment_points(
+    paths: Sequence[str],
+    *,
+    floor_assignment: Mapping[str, str],
+    floor_kl: float,
+    targets: Sequence[LinearTarget],
+    profile,
+    requested_formats: Sequence[str],
+    source_manifest: Mapping[str, str | None],
+    target_profile: str,
+) -> tuple[list[FrontierPoint], list[dict[str, object]]]:
+    points: list[FrontierPoint] = []
+    diagnostics: list[dict[str, object]] = []
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        try:
+            payload = json.loads(path.read_text())
+            raw_assignment, label, source_key = _extract_seed_assignment(
+                payload,
+                path=path,
+            )
+            point, diag = _seed_assignment_point(
+                path=path,
+                raw_assignment=raw_assignment,
+                label=label,
+                source_key=source_key,
+                floor_assignment=floor_assignment,
+                floor_kl=floor_kl,
+                targets=targets,
+                profile=profile,
+                requested_formats=requested_formats,
+                source_manifest=source_manifest,
+                target_profile=target_profile,
+            )
+            points.append(point)
+            diagnostics.append(diag)
+        except Exception as exc:
+            diagnostics.append({
+                "path": str(path),
+                "included": False,
+                "error": str(exc),
+            })
+            raise
+    return points, diagnostics
+
+
+def _append_unique_frontier_points(
+    frontier: Sequence[FrontierPoint],
+    extra_points: Sequence[FrontierPoint],
+    diagnostics: Sequence[dict[str, object]],
+) -> tuple[list[FrontierPoint], list[dict[str, object]]]:
+    combined = list(frontier)
+    updated_diagnostics = [dict(diag) for diag in diagnostics]
+    seen: dict[str, int] = {
+        _assignment_digest(point.assignment): idx
+        for idx, point in enumerate(combined)
+    }
+    for point, diag in zip(extra_points, updated_diagnostics, strict=True):
+        digest = _assignment_digest(point.assignment)
+        if digest in seen:
+            diag["included"] = False
+            diag["duplicate_of_frontier_index"] = int(seen[digest])
+            continue
+        seen[digest] = len(combined)
+        combined.append(point)
+        diag["included"] = True
+        diag["frontier_index_before_sort"] = int(len(combined) - 1)
+    combined.sort(
+        key=lambda point: (
+            point.bits_total,
+            -point.gain,
+            point.source,
+            point.label or "",
+        )
+    )
+    return combined, updated_diagnostics
 
 
 def solve_multi_choice_frontier(
@@ -2538,6 +2857,34 @@ def run_probe(args: argparse.Namespace) -> dict:
         budget_points=args.selection_budget_points,
         bit_precision_bits=args.selection_bit_precision,
     )
+    seed_assignment_diagnostics: list[dict[str, object]] = []
+    seed_assignment_points: list[FrontierPoint] = []
+    if getattr(args, "seed_assignment", None):
+        seed_assignment_points, seed_assignment_diagnostics = (
+            _load_seed_assignment_points(
+                args.seed_assignment,
+                floor_assignment=floor_assignment,
+                floor_kl=float(floor_kl),
+                targets=targets,
+                profile=profile,
+                requested_formats=requested_formats,
+                source_manifest=source_manifest,
+                target_profile=args.target_profile,
+            )
+        )
+        frontier, seed_assignment_diagnostics = _append_unique_frontier_points(
+            frontier,
+            seed_assignment_points,
+            seed_assignment_diagnostics,
+        )
+        included = sum(
+            1 for item in seed_assignment_diagnostics if item.get("included")
+        )
+        print(
+            f"[kl-probe] loaded seed assignments "
+            f"included={included}/{len(seed_assignment_diagnostics)}",
+            flush=True,
+        )
     measured_frontier = False
     if args.measure_frontier_kl and frontier:
         frontier = measure_frontier_points(
@@ -2556,6 +2903,23 @@ def run_probe(args: argparse.Namespace) -> dict:
             weight_session=weight_session,
         )
         measured_frontier = True
+    if seed_assignment_diagnostics:
+        point_by_digest = {
+            _assignment_digest(point.assignment): point
+            for point in frontier
+        }
+        for diag in seed_assignment_diagnostics:
+            digest = diag.get("assignment_hash")
+            point = point_by_digest.get(str(digest)) if digest is not None else None
+            if point is None:
+                continue
+            diag["frontier_index"] = int(frontier.index(point))
+            diag["measured_kl"] = (
+                None if point.measured_kl is None else float(point.measured_kl)
+            )
+            diag["measured_gain"] = (
+                None if point.measured_gain is None else float(point.measured_gain)
+            )
     knee_idx = choose_kneedle_point(frontier, use_measured=measured_frontier)
     chosen = frontier[knee_idx] if knee_idx >= 0 else None
     if chosen is None:
@@ -2628,6 +2992,7 @@ def run_probe(args: argparse.Namespace) -> dict:
                 "measured_gain" if measured_frontier else "predicted_gain_first_order"
             ),
             "frontier": [point.to_json() for point in frontier],
+            "seed_assignments": seed_assignment_diagnostics,
             "knee_index": int(knee_idx),
             "chosen": (
                 frontier[knee_idx].to_json()
@@ -2968,6 +3333,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.set_defaults(measure_frontier_kl=True)
+    parser.add_argument(
+        "--seed-assignment",
+        action="append",
+        default=[],
+        help=(
+            "Assignment JSON to remeasure as an extra frontier candidate. "
+            "May be repeated. Supports raw qname->format maps and payloads "
+            "with assignment, chosen_assignment, final_assignment, or "
+            "selection.chosen.assignment. Entries are normalized to the "
+            "current model, pinned/fused modules are coerced, illegal formats "
+            "fall back to the floor, and the resulting assignment is measured "
+            "with the same production-faithful KL path as generated frontier "
+            "points."
+        ),
+    )
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="auto")
     parser.add_argument(

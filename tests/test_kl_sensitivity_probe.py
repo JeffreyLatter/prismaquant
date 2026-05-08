@@ -296,6 +296,95 @@ def test_measure_frontier_points_reuses_floor_kl(monkeypatch, tmp_path):
     assert measured[1].measured_gain == pytest.approx(0.35)
 
 
+def test_seed_assignment_loader_normalizes_current_oracle_candidate(tmp_path):
+    class _Profile:
+        def fused_sibling_group(self, qname):
+            if qname.endswith(("gate_proj", "up_proj")):
+                return "model.layers.0.mlp.gate_up_proj"
+            return None
+
+    targets = [
+        LinearTarget("model.layers.0.mlp.gate_proj", (128, 128), 16384),
+        LinearTarget("model.layers.0.mlp.up_proj", (128, 128), 16384),
+        LinearTarget("model.layers.0.mlp.down_proj", (128, 128), 16384),
+        LinearTarget("model.layers.0.self_attn.o_proj", (128, 128), 16384),
+        LinearTarget("lm_head", (128, 128), 16384, pinned=True),
+    ]
+    floor_assignment = {
+        target.qname: ("BF16" if target.pinned else "NVFP4")
+        for target in targets
+    }
+    seed_path = tmp_path / "historical_assignment.json"
+    seed_path.write_text(json.dumps({
+        "label": "old_ship_candidate",
+        "assignment": {
+            "model.layers.0.mlp.gate_proj": "BF16",
+            "model.layers.0.mlp.down_proj": "MXFP8",
+            "model.layers.0.self_attn.o_proj": "NOPE",
+            "lm_head": "NVFP4",
+            "not.in.this.model": "BF16",
+        },
+    }))
+
+    points, diagnostics = ksp._load_seed_assignment_points(
+        [str(seed_path)],
+        floor_assignment=floor_assignment,
+        floor_kl=0.25,
+        targets=targets,
+        profile=_Profile(),
+        requested_formats=["NVFP4", "MXFP8_E4M3", "BF16"],
+        source_manifest={target.qname: "bf16" for target in targets},
+        target_profile="research",
+    )
+
+    assert len(points) == 1
+    point = points[0]
+    diag = diagnostics[0]
+    assert point.source == "seed_assignment"
+    assert point.label == "old_ship_candidate"
+    assert point.predicted_kl == pytest.approx(0.25)
+    assert point.assignment["model.layers.0.mlp.gate_proj"] == "BF16"
+    assert point.assignment["model.layers.0.mlp.up_proj"] == "BF16"
+    assert point.assignment["model.layers.0.mlp.down_proj"] == "MXFP8_E4M3"
+    assert point.assignment["model.layers.0.self_attn.o_proj"] == "NVFP4"
+    assert point.assignment["lm_head"] == "BF16"
+    assert diag["unknown_entries"] == 1
+    assert diag["unknown_sample"] == ["not.in.this.model"]
+    assert diag["invalid_formats"][0]["format"] == "NOPE"
+    assert diag["pinned_conflicts"][0]["qname"] == "lm_head"
+    assert diag["included"] is True
+
+
+def test_seed_assignment_points_dedupe_against_frontier(tmp_path):
+    floor_assignment = {"a": "NVFP4", "b": "NVFP4"}
+    frontier = [
+        FrontierPoint(
+            budget_bits=10.0,
+            bits_total=10.0,
+            bits_delta=0.0,
+            gain=0.0,
+            predicted_kl=1.0,
+            unit_assignment=dict(floor_assignment),
+            assignment=dict(floor_assignment),
+            promotion_count=0,
+        )
+    ]
+    seed = replace(
+        frontier[0],
+        source="seed_assignment",
+        label="duplicate_floor",
+    )
+    combined, diagnostics = ksp._append_unique_frontier_points(
+        frontier,
+        [seed],
+        [{"assignment_hash": ksp._assignment_digest(seed.assignment)}],
+    )
+
+    assert combined == frontier
+    assert diagnostics[0]["included"] is False
+    assert diagnostics[0]["duplicate_of_frontier_index"] == 0
+
+
 def test_qwen3_profile_has_vllm_packed_module_fallback_without_vllm():
     profile = Qwen3Profile()
     profile._vllm_cls = None
