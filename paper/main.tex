@@ -713,8 +713,8 @@ the production engine. We close that gap with a second polish whose
 weight-materialization path is the exporter's.
 
 \paragraph{Production weight cache.} For each (Linear, format) pair we
-need to evaluate, \texttt{ProductionWeightCache} pre-renders the
-\emph{exact} weight the exporter would ship: GPTQ, scale-sweep, joint
+need to evaluate, \texttt{ProductionWeightCache} pre-renders an
+export-aligned weight path: GPTQ, scale-sweep, joint
 sibling-coherent input global scales chosen across all members of a fused
 unit simultaneously, and a calibrated activation clip from the
 $L_2$ activation cache. Cache fill streams one Linear at a time and writes

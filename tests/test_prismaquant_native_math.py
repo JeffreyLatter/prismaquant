@@ -22,6 +22,11 @@ class TestPrismaQuantFormatRegistry(unittest.TestCase):
         self.assertAlmostEqual(fr.get_format("FP8_SOURCE").effective_bits_for_shape(shape), 8.001953125)
         self.assertAlmostEqual(fr.get_format("BF16").effective_bits_for_shape(shape), 16.0)
 
+    def test_mxfp8_short_name_is_input_alias_only(self):
+        self.assertEqual(fr.canonical_format_name("MXFP8"), "MXFP8_E4M3")
+        self.assertEqual(fr.get_format("MXFP8").name, "MXFP8_E4M3")
+        self.assertIn("MXFP8", fr.aliases_for("MXFP8_E4M3"))
+
     def test_low_bit_custom_kernel_formats_are_not_registered(self):
         for name in ("INT2", "INT3", "NVINT2", "NVINT3", "NVFP3"):
             with self.assertRaises(KeyError):
@@ -112,13 +117,17 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             stats,
             costs,
             [fr.get_format("FP8_SOURCE"), fr.get_format("MXFP8")],
+            source_manifest={"layer.weight": "fp8"},
         )
         by_fmt = {cand.fmt: cand for cand in cands["layer.weight"]}
 
-        self.assertLess(by_fmt["FP8_SOURCE"].bits_per_param, by_fmt["MXFP8"].bits_per_param)
+        self.assertLess(
+            by_fmt["FP8_SOURCE"].bits_per_param,
+            by_fmt["MXFP8_E4M3"].bits_per_param,
+        )
         self.assertEqual(by_fmt["FP8_SOURCE"].memory_bytes, 128 * 128 + 4)
         self.assertAlmostEqual(by_fmt["FP8_SOURCE"].bits_per_param, 8.001953125)
-        self.assertAlmostEqual(by_fmt["MXFP8"].bits_per_param, 8.25)
+        self.assertAlmostEqual(by_fmt["MXFP8_E4M3"].bits_per_param, 8.25)
 
     def test_build_candidates_applies_calibrated_gains(self):
         stats = {
@@ -144,7 +153,10 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         )
         by_fmt = {c.fmt: c for c in cands["layer.weight"]}
         self.assertAlmostEqual(by_fmt["NVFP4"].predicted_dloss, 0.5 * 2.0 * 0.10 * 2.0)
-        self.assertAlmostEqual(by_fmt["MXFP8"].predicted_dloss, 0.5 * 2.0 * 0.02 * 1.0)
+        self.assertAlmostEqual(
+            by_fmt["MXFP8_E4M3"].predicted_dloss,
+            0.5 * 2.0 * 0.02 * 1.0,
+        )
 
     def test_build_candidates_ignores_unmeasured_packed_output_mse(self):
         stats = {
@@ -323,7 +335,7 @@ class TestCalibrationHooks(unittest.TestCase):
         try:
             self.assertEqual(active, [])
             self.assertEqual(len(skipped), 1)
-            self.assertEqual(set(skipped[0]["formats"]), {"MXFP8", "NVFP4"})
+            self.assertEqual(set(skipped[0]["formats"]), {"MXFP8_E4M3", "NVFP4"})
         finally:
             for handle in handles:
                 handle.remove()

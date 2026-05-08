@@ -21,12 +21,14 @@ These tests pin the reuse machinery:
 """
 from __future__ import annotations
 
+import json
 import pickle
 from pathlib import Path
 
 import pytest
 
 from prismaquant.incremental_probe import (
+    build_extended_shard_regexes,
     merge_probe_pickles,
     scan_cached_linear_stats,
     synthesize_shard_from_linear_cache,
@@ -97,6 +99,30 @@ def _stats_for(layer_ids: list[int]) -> dict:
             name = f"model.layers.{L}.{proj}"
             out[name] = {"h_trace": float(L) + 0.1, "n_tokens_seen": 100}
     return out
+
+
+def test_extended_shards_skip_declared_mtp_when_index_has_no_mtp(tmp_path, capsys):
+    (tmp_path / "config.json").write_text(json.dumps({
+        "num_hidden_layers": 2,
+        "num_nextn_predict_layers": 1,
+    }))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "model.layers.0.self_attn.q_proj.weight": "model-00001.safetensors",
+            "model.layers.1.self_attn.q_proj.weight": "model-00001.safetensors",
+        }
+    }))
+
+    regexes = build_extended_shard_regexes(
+        str(tmp_path),
+        1,
+        include_visual=False,
+        include_lm_head=False,
+    )
+
+    assert regexes == [r"model\.layers\.0\.", r"model\.layers\.1\."]
+    assert not any("mtp" in regex for regex in regexes)
+    assert "skipping MTP shards" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

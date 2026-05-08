@@ -5,13 +5,18 @@ so we test it with a stub-KL function that doesn't need a real model.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from unittest.mock import patch
 
 import pytest
+import torch
+import torch.nn as nn
 
 from prismaquant import block_clado as bc
 from prismaquant import coord_descent_polish as cdp
+from prismaquant.production_weight_cache import ProductionWeightCache
+from prismaquant.weight_session import WeightSession
 
 
 def _mk_unit(name: str, members: tuple[str, ...], options):
@@ -59,6 +64,92 @@ def _stub_run(units, starting, kl_table, **kwargs):
             max_passes=8,
             **kwargs,
         )
+
+
+class _ToyLinearModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(32, 32, bias=False)
+
+
+def test_weight_session_stages_reverts_and_commits(tmp_path):
+    model = _ToyLinearModel()
+    original = model.linear.weight.detach().clone()
+    rendered = torch.full_like(original, 0.125)
+    cache = ProductionWeightCache(
+        weights={("linear", "NVFP4"): rendered.clone()},
+        levers={},
+    )
+    unit = _mk_unit(
+        "linear",
+        ("linear",),
+        [("BF16", 0.0, 16, original.numel() * 2),
+         ("NVFP4", 0.1, 4.5, original.numel() // 2)],
+    )
+
+    session = WeightSession(
+        model,
+        production_weight_cache=cache,
+        snapshot_dir=str(tmp_path),
+    )
+    session.initialize({"linear": "BF16"}, [unit])
+
+    assert session.n_bf16_snapshots == 0
+    assert not list(tmp_path.glob("*__bf16src.pt"))
+
+    assert session.stage_format("linear", "NVFP4") is not None
+    torch.testing.assert_close(model.linear.weight, rendered)
+    assert session.n_bf16_snapshots == 0
+    session.revert_last()
+    torch.testing.assert_close(model.linear.weight, original)
+
+    assert session.stage_format("linear", "NVFP4") is not None
+    session.commit_last()
+    torch.testing.assert_close(model.linear.weight, rendered)
+    assert session.current_assignment()["linear"] == "NVFP4"
+
+
+def test_delta_quantize_polish_restores_external_weight_env(monkeypatch, tmp_path):
+    model = _ToyLinearModel()
+    rendered = torch.full_like(model.linear.weight.detach(), 0.125)
+    cache = ProductionWeightCache(
+        weights={("linear", "NVFP4"): rendered},
+        levers={},
+    )
+    unit = _mk_unit(
+        "linear",
+        ("linear",),
+        [("BF16", 0.0, 16, 2048), ("NVFP4", 0.1, 4.5, 512)],
+    )
+    kl_table = {
+        (("linear", "BF16"),): 1.0,
+        (("linear", "NVFP4"),): 0.5,
+    }
+    monkeypatch.setenv("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT", "sentinel")
+
+    def fake_measure(model, assignment, calib_ids, ref_log_probs, **_):
+        return float(kl_table[(("linear", assignment["linear"]),)])
+
+    with patch(
+        "prismaquant.coord_descent_polish.measure_assignment_kl",
+        side_effect=fake_measure,
+    ):
+        result = cdp.coord_descent_polish(
+            model=model,
+            calib_ids=object(),
+            ref_log_probs=object(),
+            units=[unit],
+            starting_assignment={"linear": "BF16"},
+            work_root=str(tmp_path),
+            noise_floor=0.0,
+            max_passes=2,
+            production_weight_cache=cache,
+            delta_quantize=True,
+        )
+
+    assert result.final_assignment == {"linear": "NVFP4"}
+    torch.testing.assert_close(model.linear.weight, rendered)
+    assert os.environ.get("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT") == "sentinel"
 
 
 def test_polish_accepts_strict_improvement():

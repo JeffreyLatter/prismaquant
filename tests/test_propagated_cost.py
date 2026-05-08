@@ -430,7 +430,7 @@ def test_select_formats_uses_current_neighbors_and_bf16():
 
     got = select_formats_for_l3(stats, costs, assignment, "layer", _specs())
 
-    assert got == ("NVFP4", "MXFP8", "BF16")
+    assert got == ("NVFP4", "MXFP8_E4M3", "BF16")
 
 
 def test_tail_forward_from_layer_matches_full_forward_from_layer_output():
@@ -1627,7 +1627,7 @@ def test_lane_batch_memory_check_falls_back(monkeypatch):
         torch.device("cuda"),
     )
 
-    assert adjusted == 4
+    assert adjusted == 1
 
 
 def test_toy_l3_propagation_differs_from_local_cost_and_flips_pick(tmp_path):
