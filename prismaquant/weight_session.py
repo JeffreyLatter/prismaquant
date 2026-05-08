@@ -233,12 +233,13 @@ class WeightSession:
                 if fr.canonical_format_name(fmt) != "BF16":
                     self._initialize_missing.append(qname)
                 continue
-            # Snapshot BEFORE any overwrite.
-            self._ensure_bf16_snapshot(qname)
             self._current[qname] = fr.canonical_format_name(fmt)
             if self._current[qname] == "BF16":
                 self._bf16_kept += 1
                 continue  # live weight already holds BF16 source
+            # Snapshot BEFORE any overwrite. BF16-kept weights can be
+            # snapshotted lazily if a later stage actually changes them.
+            self._ensure_bf16_snapshot(qname)
             replacement = self._format_weight(qname, self._current[qname])
             if replacement is None:
                 continue  # cache miss; leave at BF16
@@ -292,6 +293,44 @@ class WeightSession:
         # rolls it back.
         self._current[qname] = new_canon
         return entry
+
+    def format_weight(self, qname: str, fmt: str) -> torch.Tensor | None:
+        """Return the tensor for ``qname`` at ``fmt`` using this session's
+        BF16 source snapshots and production cache.
+
+        This is intentionally a resolver, not a mutator: callers such as
+        lane-batched KL hooks use it to recompute only a target Linear while
+        the live model parameters stay materialized at the floor assignment.
+        """
+        return self._format_weight(str(qname), str(fmt))
+
+    def apply_assignment(self, assignment: Mapping[str, str]) -> int:
+        """Materialize ``assignment`` in-place without retaining undo clones.
+
+        This is for whole-assignment KL validation where the caller will move
+        monotonically from one assignment to the next and does not need a
+        per-step revert stack. It avoids staging hundreds of large tensors at
+        once on 27B-class models.
+        """
+        changed = 0
+        for qname, fmt in assignment.items():
+            if qname not in self._linear_by_qname:
+                if fr.canonical_format_name(fmt) != "BF16":
+                    self._stage_missing.append(qname)
+                continue
+            new_canon = fr.canonical_format_name(fmt)
+            if self._current.get(qname, "BF16") == new_canon:
+                continue
+            replacement = self._format_weight(qname, new_canon)
+            if replacement is None:
+                continue
+            live = self._live_weight(qname)
+            if live is None:
+                continue
+            live.copy_(replacement.to(device=live.device, dtype=live.dtype))
+            self._current[qname] = new_canon
+            changed += 1
+        return changed
 
     def revert_last(self) -> None:
         if not self._undo_stack:

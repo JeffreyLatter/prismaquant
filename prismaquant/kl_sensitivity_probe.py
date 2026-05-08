@@ -5,12 +5,14 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import platform
 import pickle
 import subprocess
 import time
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -30,6 +32,7 @@ from prismaquant.iterate_perturbed_allocation import (
     measure_assignment_kl,
 )
 from prismaquant.layer_state_cache import LayerHiddenStateCache
+from prismaquant.memory_management import phase_boundary_memory_cleanup
 from prismaquant.measure_adjoint_l3 import load_wikitext_calibration_windowed
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 from prismaquant.perturbed_x_cache import (
@@ -1046,6 +1049,33 @@ def _override_measurement_order(
     return sorted(range(len(candidate_overrides)), key=_key)
 
 
+def _weight_session_mode_enabled(
+    args: argparse.Namespace,
+    production_weight_cache,
+) -> bool:
+    mode = str(getattr(args, "weight_session", "auto")).strip().lower()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return production_weight_cache is not None
+
+
+@contextmanager
+def _external_weight_management(enabled: bool):
+    previous = os.environ.get("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT")
+    if enabled:
+        os.environ["PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT"] = "1"
+    try:
+        yield
+    finally:
+        if enabled:
+            if previous is None:
+                os.environ.pop("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT", None)
+            else:
+                os.environ["PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT"] = previous
+
+
 def _populate_replay_cache(
     model: nn.Module,
     assignment: Mapping[str, str],
@@ -1100,6 +1130,7 @@ def measure_candidate_overrides(
     replay_cache_max_effective_batch: int,
     dtype: torch.dtype,
     production_weight_cache=None,
+    source_weight_resolver=None,
 ) -> list[float]:
     if not candidate_overrides:
         return []
@@ -1126,6 +1157,7 @@ def measure_candidate_overrides(
             include_activation_quant=include_activation_quant,
             use_cuda_graphs=use_cuda_graphs,
             production_weight_cache=production_weight_cache,
+            source_weight_resolver=source_weight_resolver,
         )
         return [ordered_values[inverse[idx]] for idx in range(len(inverse))]
 
@@ -1164,6 +1196,7 @@ def measure_candidate_overrides(
             replay_cache_max_effective_batch=replay_cache_max_effective_batch,
             dtype=dtype,
             production_weight_cache=production_weight_cache,
+            source_weight_resolver=source_weight_resolver,
         )
 
     print(
@@ -1217,6 +1250,7 @@ def measure_candidate_overrides(
                 replay_cache_max_effective_batch=replay_cache_max_effective_batch,
                 dtype=dtype,
                 production_weight_cache=production_weight_cache,
+                source_weight_resolver=source_weight_resolver,
             )
         try:
             values = measure_override_set_kl(
@@ -1235,6 +1269,7 @@ def measure_candidate_overrides(
                 use_cuda_graphs=use_cuda_graphs,
                 use_replay_cache=True,
                 production_weight_cache=production_weight_cache,
+                source_weight_resolver=source_weight_resolver,
             )
         finally:
             replay_cache.invalidate()
@@ -1269,6 +1304,7 @@ def measure_candidate_flips(
     replay_cache_max_effective_batch: int,
     dtype: torch.dtype,
     production_weight_cache=None,
+    source_weight_resolver=None,
 ) -> list[float]:
     if not candidate_flips:
         return []
@@ -1295,6 +1331,7 @@ def measure_candidate_flips(
             include_activation_quant=include_activation_quant,
             use_cuda_graphs=use_cuda_graphs,
             production_weight_cache=production_weight_cache,
+            source_weight_resolver=source_weight_resolver,
         )
         return [ordered_values[inverse[idx]] for idx in range(len(inverse))]
 
@@ -1333,6 +1370,7 @@ def measure_candidate_flips(
             replay_cache_max_effective_batch=replay_cache_max_effective_batch,
             dtype=dtype,
             production_weight_cache=production_weight_cache,
+            source_weight_resolver=source_weight_resolver,
         )
 
     print(
@@ -1386,6 +1424,7 @@ def measure_candidate_flips(
                 replay_cache_max_effective_batch=replay_cache_max_effective_batch,
                 dtype=dtype,
                 production_weight_cache=production_weight_cache,
+                source_weight_resolver=source_weight_resolver,
             )
         try:
             values = measure_lane_batched_kl_deltas(
@@ -1404,6 +1443,7 @@ def measure_candidate_flips(
                 use_cuda_graphs=use_cuda_graphs,
                 use_replay_cache=True,
                 production_weight_cache=production_weight_cache,
+                source_weight_resolver=source_weight_resolver,
             )
         finally:
             replay_cache.invalidate()
@@ -1432,47 +1472,62 @@ def measure_frontier_points(
     include_activation_quant: bool = True,
     use_cuda_graphs: bool = False,
     production_weight_cache=None,
+    weight_session=None,
 ) -> list[FrontierPoint]:
     measured: list[FrontierPoint] = []
     total = len(frontier)
     floor_digest = _assignment_digest(floor_assignment)
-    for idx, point in enumerate(frontier, start=1):
-        print(
-            f"[kl-probe] measuring frontier point {idx}/{total} "
-            f"promotions={point.promotion_count}",
-            flush=True,
-        )
-        if _assignment_digest(point.assignment) == floor_digest:
+    try:
+        for idx, point in enumerate(frontier, start=1):
+            print(
+                f"[kl-probe] measuring frontier point {idx}/{total} "
+                f"promotions={point.promotion_count}",
+                flush=True,
+            )
+            if _assignment_digest(point.assignment) == floor_digest:
+                if weight_session is not None:
+                    weight_session.apply_assignment(floor_assignment)
+                measured.append(
+                    replace(
+                        point,
+                        measured_kl=float(floor_kl),
+                        measured_gain=0.0,
+                    )
+                )
+                continue
+            if weight_session is not None:
+                changed = weight_session.apply_assignment(point.assignment)
+                print(
+                    f"[kl-probe] frontier point {idx}/{total} "
+                    f"materialized_changes={changed}",
+                    flush=True,
+                )
+            with _external_weight_management(weight_session is not None):
+                kl = measure_assignment_kl(
+                    model,
+                    point.assignment,
+                    calib_ids,
+                    ref_log_probs,
+                    work_root=work_root,
+                    profile=profile,
+                    use_frozen_weight_cache=weight_session is None,
+                    rng_seed=0,
+                    kl_scope=kl_scope,
+                    include_activation_quant=include_activation_quant,
+                    stream_ref_log_probs=kl_scope == "full_sequence",
+                    use_cuda_graphs=use_cuda_graphs,
+                    production_weight_cache=production_weight_cache,
+                )
             measured.append(
                 replace(
                     point,
-                    measured_kl=float(floor_kl),
-                    measured_gain=0.0,
+                    measured_kl=float(kl),
+                    measured_gain=float(floor_kl - kl),
                 )
             )
-            continue
-        kl = measure_assignment_kl(
-            model,
-            point.assignment,
-            calib_ids,
-            ref_log_probs,
-            work_root=work_root,
-            profile=profile,
-            use_frozen_weight_cache=True,
-            rng_seed=0,
-            kl_scope=kl_scope,
-            include_activation_quant=include_activation_quant,
-            stream_ref_log_probs=kl_scope == "full_sequence",
-            use_cuda_graphs=use_cuda_graphs,
-            production_weight_cache=production_weight_cache,
-        )
-        measured.append(
-            replace(
-                point,
-                measured_kl=float(kl),
-                measured_gain=float(floor_kl - kl),
-            )
-        )
+    finally:
+        if weight_session is not None:
+            weight_session.apply_assignment(floor_assignment)
     return measured
 
 
@@ -1635,22 +1690,61 @@ def run_probe(args: argparse.Namespace) -> dict:
                 "cache or streamed recompute lands.",
                 flush=True,
             )
-    floor_kl = measure_assignment_kl(
-        model,
-        floor_assignment,
-        calib_ids,
-        ref_log_probs,
-        work_root=work_root,
-        profile=profile,
-        use_frozen_weight_cache=True,
-        rng_seed=0,
-        kl_scope=args.kl_scope,
-        include_activation_quant=not args.no_activation_quant,
-        stream_ref_log_probs=args.kl_scope == "full_sequence",
-        use_cuda_graphs=bool(args.enable_cuda_graphs),
-        production_weight_cache=production_weight_cache,
+
+    weight_session = None
+    weight_session_diag: dict[str, object] = {
+        "enabled": False,
+        "mode": str(getattr(args, "weight_session", "auto")),
+    }
+    if _weight_session_mode_enabled(args, production_weight_cache):
+        from prismaquant.weight_session import WeightSession
+
+        snapshot_dir = work_root / "weight_session_snapshots"
+        print(
+            "[kl-probe] initializing WeightSession for floor materialization "
+            f"(snapshots={snapshot_dir})",
+            flush=True,
+        )
+        weight_session = WeightSession(
+            model,
+            production_weight_cache=production_weight_cache,
+            snapshot_dir=str(snapshot_dir),
+        )
+        weight_session.initialize(floor_assignment, [])
+        weight_session_diag = {
+            "enabled": True,
+            "mode": str(getattr(args, "weight_session", "auto")),
+            "snapshot_dir": str(snapshot_dir),
+            "diagnostics": weight_session.diagnostics(),
+        }
+        print(
+            "[kl-probe] WeightSession initialized "
+            f"{weight_session.diagnostics()}",
+            flush=True,
+        )
+        phase_boundary_memory_cleanup("after_weight_session_initialize")
+
+    source_weight_resolver = (
+        weight_session.format_weight if weight_session is not None else None
     )
+    with _external_weight_management(weight_session is not None):
+        floor_kl = measure_assignment_kl(
+            model,
+            floor_assignment,
+            calib_ids,
+            ref_log_probs,
+            work_root=work_root,
+            profile=profile,
+            use_frozen_weight_cache=weight_session is None,
+            rng_seed=0,
+            kl_scope=args.kl_scope,
+            include_activation_quant=not args.no_activation_quant,
+            stream_ref_log_probs=args.kl_scope == "full_sequence",
+            use_cuda_graphs=bool(args.enable_cuda_graphs),
+            production_weight_cache=production_weight_cache,
+        )
     print(f"[kl-probe] floor_kl={floor_kl:.8g}", flush=True)
+    phase_boundary_memory_cleanup("after_floor_kl")
 
     rows: list[ProbeRow] = []
     candidate_overrides: list[dict[str, str]] = []
@@ -1778,26 +1872,30 @@ def run_probe(args: argparse.Namespace) -> dict:
     # assignment KL, where each assignment replays the same graph across many
     # calibration rows.
     candidate_cuda_graphs = bool(args.enable_cuda_graphs and args.no_tail_replay)
-    candidate_kls = measure_candidate_overrides(
-        model,
-        floor_assignment,
-        candidate_overrides,
-        calib_ids,
-        ref_log_probs,
-        work_root=work_root,
-        profile=profile,
-        kl_scope=args.kl_scope,
-        max_lanes_per_batch=args.max_lanes_per_batch,
-        calib_microbatch_size=chosen_calib_micro,
-        include_activation_quant=not args.no_activation_quant,
-        use_cuda_graphs=candidate_cuda_graphs,
-        use_tail_replay=not args.no_tail_replay,
-        replay_cache_window=args.replay_cache_window,
-        replay_cache_max_gb=float(args.replay_cache_max_gb),
-        replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
-        dtype=dtype,
-        production_weight_cache=production_weight_cache,
-    )
+    if weight_session is not None:
+        weight_session.apply_assignment(floor_assignment)
+    with _external_weight_management(weight_session is not None):
+        candidate_kls = measure_candidate_overrides(
+            model,
+            floor_assignment,
+            candidate_overrides,
+            calib_ids,
+            ref_log_probs,
+            work_root=work_root,
+            profile=profile,
+            kl_scope=args.kl_scope,
+            max_lanes_per_batch=args.max_lanes_per_batch,
+            calib_microbatch_size=chosen_calib_micro,
+            include_activation_quant=not args.no_activation_quant,
+            use_cuda_graphs=candidate_cuda_graphs,
+            use_tail_replay=not args.no_tail_replay,
+            replay_cache_window=args.replay_cache_window,
+            replay_cache_max_gb=float(args.replay_cache_max_gb),
+            replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
+            dtype=dtype,
+            production_weight_cache=production_weight_cache,
+            source_weight_resolver=source_weight_resolver,
+        )
     for (
         unit,
         members,
@@ -1877,6 +1975,7 @@ def run_probe(args: argparse.Namespace) -> dict:
             include_activation_quant=not args.no_activation_quant,
             use_cuda_graphs=bool(args.enable_cuda_graphs),
             production_weight_cache=production_weight_cache,
+            weight_session=weight_session,
         )
         measured_frontier = True
     knee_idx = choose_kneedle_point(frontier, use_measured=measured_frontier)
@@ -1984,6 +2083,7 @@ def run_probe(args: argparse.Namespace) -> dict:
             "source_manifest_entries": int(len(source_manifest)),
             "production_cache_used": bool(production_weight_cache is not None),
             "production_weight_cache": production_cache_diag,
+            "weight_session": weight_session_diag,
             "include_activation_quant": bool(not args.no_activation_quant),
             "calib_microbatch_size": int(chosen_calib_micro),
             "cuda_graphs_enabled": bool(args.enable_cuda_graphs),
@@ -2183,6 +2283,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Production-cache prefetch policy. 'batch' prefetches each lane "
             "batch just before use; 'all' materializes every shard within "
             "the LRU budget; 'none' only lazy-loads on demand."
+        ),
+    )
+    parser.add_argument(
+        "--weight-session",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "Materialize the floor assignment once with WeightSession and "
+            "spill BF16 source snapshots to disk. Auto enables this whenever "
+            "a production weight cache is active."
         ),
     )
     parser.add_argument(

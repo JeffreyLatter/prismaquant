@@ -24,6 +24,8 @@ def test_weight_session_accepts_language_model_alias_for_staged_body():
     assert session.current_assignment() == {
         "model.language_model.proj": "BF16"
     }
+    assert session.diagnostics()["n_bf16_snapshots"] == 0
+    assert session.format_weight("model.language_model.proj", "BF16") is not None
     assert session.diagnostics()["n_bf16_snapshots"] == 1
 
 
