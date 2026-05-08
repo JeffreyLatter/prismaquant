@@ -616,6 +616,86 @@ def test_adaptive_group_candidate_search_can_split_before_pruning(
     assert result.diagnostics["rounds"][0]["split_groups"] == 2
 
 
+def test_adaptive_group_candidate_search_fails_open_when_all_groups_prune(
+    monkeypatch,
+    tmp_path,
+):
+    qnames = [
+        f"model.layers.{idx}.mlp.down_proj"
+        for idx in range(4)
+    ]
+    qname_to_idx = {qname: idx for idx, qname in enumerate(qnames)}
+    targets = [
+        LinearTarget(qname, (4, 4), 16)
+        for qname in qnames
+    ]
+    overrides = [
+        {target.qname: "BF16"}
+        for target in targets
+    ]
+    candidate_meta = [
+        (target.qname, (target.qname,), (target,), "BF16", 10.0, 20.0)
+        for target in targets
+    ]
+    calls: list[list[tuple[int, ...]]] = []
+
+    def _fake_measure(_model, _floor_assignment, candidate_overrides, *_args, **_kwargs):
+        call_groups: list[tuple[int, ...]] = []
+        values: list[float] = []
+        for override in candidate_overrides:
+            indices = tuple(sorted(qname_to_idx[qname] for qname in override))
+            call_groups.append(indices)
+            gain = {
+                (0, 1, 2, 3): -0.30,
+                (0, 1): -0.01,
+                (2, 3): -0.20,
+                (0,): -0.03,
+                (1,): -0.04,
+            }.get(indices, -0.10)
+            values.append(1.0 - gain)
+        calls.append(call_groups)
+        return values
+
+    monkeypatch.setattr(ksp, "measure_candidate_overrides", _fake_measure)
+
+    result = ksp._adaptive_group_candidate_kls(
+        torch.nn.Linear(1, 1),
+        {target.qname: "NVFP4" for target in targets},
+        overrides,
+        candidate_meta,
+        torch.ones(1, 1, dtype=torch.long),
+        [torch.zeros(1, 1, 1)],
+        floor_kl=1.0,
+        work_root=tmp_path,
+        profile=None,
+        kl_scope="last_token",
+        max_lanes_per_batch=4,
+        calib_microbatch_size=1,
+        include_activation_quant=False,
+        use_cuda_graphs=False,
+        use_tail_replay=False,
+        replay_cache_window="auto",
+        replay_cache_max_gb=1.0,
+        replay_cache_max_effective_batch=4,
+        dtype=torch.float32,
+        group_size=4,
+        min_group_gain=0.0,
+        max_exact_candidates=2,
+        prune_after_round=2,
+        fail_open_pruning=True,
+    )
+
+    assert calls == [
+        [(0, 1, 2, 3)],
+        [(0, 1), (2, 3)],
+        [(0,), (1,)],
+    ]
+    assert set(result.candidate_kls) == {0, 1}
+    assert result.pruned_indices == (2, 3)
+    assert result.diagnostics["rounds"][1]["fail_open_groups"] == 1
+    assert result.diagnostics["rounds"][1]["fail_open_candidates"] == 2
+
+
 def test_production_cache_metadata_validates_identity_and_entries():
     args = SimpleNamespace(
         model="/tmp/qwen",

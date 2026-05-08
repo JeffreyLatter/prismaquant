@@ -1561,6 +1561,7 @@ def _adaptive_group_candidate_kls(
     min_group_gain: float = 0.0,
     max_exact_candidates: int = 0,
     prune_after_round: int = 1,
+    fail_open_pruning: bool = True,
 ) -> AdaptiveCandidateSearchResult:
     if not candidate_overrides:
         return AdaptiveCandidateSearchResult(
@@ -1660,9 +1661,9 @@ def _adaptive_group_candidate_kls(
         measured_candidate_slots += covered_candidates
 
         next_pending: list[tuple[tuple[int, ...], float]] = []
+        prune_pending: list[tuple[tuple[int, ...], float]] = []
         singleton_count = 0
         split_count = 0
-        pruned_this_round = 0
         gains: list[float] = []
         for indices, group_kl in zip(valid_groups, group_kls, strict=True):
             gain = float(floor_kl - float(group_kl))
@@ -1677,12 +1678,69 @@ def _adaptive_group_candidate_kls(
                 split_count += len(splits)
                 continue
             if gain <= float(min_group_gain):
-                pruned_indices.update(indices)
-                pruned_this_round += len(indices)
+                prune_pending.append((indices, gain))
                 continue
             splits = _split_candidate_group(indices)
             next_pending.extend((split, gain) for split in splits)
             split_count += len(splits)
+
+        fail_open_groups = 0
+        fail_open_candidates = 0
+        fail_open_budget_pruned: tuple[int, ...] = ()
+        if (
+            bool(fail_open_pruning)
+            and not next_pending
+            and not candidate_kls
+            and prune_pending
+        ):
+            if int(max_exact_candidates) > 0:
+                prune_budget = max(int(max_exact_candidates) - len(candidate_kls), 0)
+                if prune_budget <= 0:
+                    fail_open_keep: list[tuple[tuple[int, ...], float]] = []
+                    fail_open_budget_pruned = tuple(
+                        sorted(idx for indices, _score in prune_pending for idx in indices)
+                    )
+                else:
+                    fail_open_keep, fail_open_budget_pruned = (
+                        _limit_adaptive_candidate_coverage(
+                            prune_pending,
+                            max_candidates=prune_budget,
+                        )
+                    )
+            else:
+                fail_open_keep = list(prune_pending)
+            fail_open_kept_indices = {
+                kept_indices for kept_indices, _score in fail_open_keep
+            }
+            prune_pending = [
+                (indices, score)
+                for indices, score in prune_pending
+                if indices not in fail_open_kept_indices
+            ]
+            pruned_indices.update(fail_open_budget_pruned)
+            for indices, score in fail_open_keep:
+                splits = _split_candidate_group(indices)
+                if splits:
+                    next_pending.extend((split, score) for split in splits)
+                    split_count += len(splits)
+                    fail_open_groups += 1
+                    fail_open_candidates += len(indices)
+                else:
+                    candidate_kls[int(indices[0])] = float(floor_kl - score)
+                    singleton_count += 1
+                    fail_open_groups += 1
+                    fail_open_candidates += 1
+            if fail_open_groups:
+                print(
+                    f"[kl-probe] adaptive candidate search round {round_idx} "
+                    f"fail-open: rescued_groups={fail_open_groups} "
+                    f"rescued_candidates={fail_open_candidates}",
+                    flush=True,
+                )
+
+        pruned_this_round = sum(len(indices) for indices, _score in prune_pending)
+        for indices, _score in prune_pending:
+            pruned_indices.update(indices)
 
         dropped_by_budget: tuple[int, ...] = ()
         if (
@@ -1711,6 +1769,9 @@ def _adaptive_group_candidate_kls(
             "split_groups": int(split_count),
             "pruned_candidates": int(pruned_this_round),
             "budget_pruned_candidates": int(len(dropped_by_budget)),
+            "fail_open_groups": int(fail_open_groups),
+            "fail_open_candidates": int(fail_open_candidates),
+            "fail_open_budget_pruned_candidates": int(len(fail_open_budget_pruned)),
             "gain_min": float(min(gains)) if gains else None,
             "gain_max": float(max(gains)) if gains else None,
             "gain_mean": float(sum(gains) / len(gains)) if gains else None,
@@ -1738,6 +1799,7 @@ def _adaptive_group_candidate_kls(
             "min_group_gain": float(min_group_gain),
             "max_exact_candidates": int(max_exact_candidates),
             "prune_after_round": int(max(int(prune_after_round), 1)),
+            "fail_open_pruning": bool(fail_open_pruning),
             "rounds": round_diagnostics,
         },
     )
@@ -2397,6 +2459,7 @@ def run_probe(args: argparse.Namespace) -> dict:
                 min_group_gain=float(args.adaptive_min_group_gain),
                 max_exact_candidates=int(args.adaptive_max_exact_candidates),
                 prune_after_round=int(args.adaptive_prune_after_round),
+                fail_open_pruning=bool(args.adaptive_fail_open_pruning),
             )
             candidate_kls_by_idx = adaptive.candidate_kls
             candidate_search_diag = adaptive.diagnostics
@@ -2785,6 +2848,19 @@ def build_parser() -> argparse.ArgumentParser:
             "extra cost."
         ),
     )
+    parser.add_argument(
+        "--no-adaptive-fail-open-pruning",
+        dest="adaptive_fail_open_pruning",
+        action="store_false",
+        help=(
+            "Disable fail-open adaptive pruning. By default, if a pruning "
+            "round would discard every remaining group before any singleton "
+            "candidate has been measured, the probe keeps splitting the "
+            "least-bad groups within --adaptive-max-exact-candidates instead "
+            "of returning a floor-only frontier."
+        ),
+    )
+    parser.set_defaults(adaptive_fail_open_pruning=True)
     parser.add_argument(
         "--production-weight-cache",
         default=None,
