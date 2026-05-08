@@ -1838,7 +1838,11 @@ def run_probe(args: argparse.Namespace) -> dict:
     if _weight_session_mode_enabled(args, production_weight_cache):
         from prismaquant.weight_session import WeightSession
 
-        snapshot_dir = work_root / "weight_session_snapshots"
+        snapshot_dir = (
+            Path(args.weight_session_snapshot_dir)
+            if getattr(args, "weight_session_snapshot_dir", None)
+            else work_root / "weight_session_snapshots"
+        )
         print(
             "[kl-probe] initializing WeightSession for floor materialization "
             f"(snapshots={snapshot_dir})",
@@ -2432,6 +2436,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Materialize the floor assignment once with WeightSession and "
             "spill BF16 source snapshots to disk. Auto enables this whenever "
             "a production weight cache is active."
+        ),
+    )
+    parser.add_argument(
+        "--weight-session-snapshot-dir",
+        default=None,
+        help=(
+            "Optional shared directory for WeightSession BF16 source "
+            "snapshots. Reusing this across retries avoids re-spilling "
+            "large models into each run directory."
         ),
     )
     parser.add_argument(

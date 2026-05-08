@@ -143,19 +143,35 @@ class WeightSession:
             return torch.load(
                 self._snapshot_dir / self._spilled[qname],
                 map_location="cpu",
+                weights_only=True,
             )
+        safe = qname.replace("/", "__").replace(".", "_")
+        fname = f"{safe}__bf16src.pt"
+        if self._snapshot_dir is not None:
+            existing = self._snapshot_dir / fname
+            if existing.is_file():
+                try:
+                    snap = torch.load(
+                        existing,
+                        map_location="cpu",
+                        weights_only=True,
+                    )
+                    live = self._live_weight(qname)
+                    if live is None or tuple(snap.shape) == tuple(live.shape):
+                        self._spilled[qname] = fname
+                        return snap
+                except Exception:
+                    pass
         live = self._live_weight(qname)
         if live is None:
             return None
         # Detach + clone to UMA (same physical memory; 'cpu' just means
         # not part of the model's param graph).  This is a one-time cost
         # per qname.
-        snap = live.detach().clone()
+        snap = live.detach().cpu().clone()
         if self._snapshot_dir is not None:
             # Spill to disk; do not hold in memory.  Atomic via tmp +
             # rename so a kill mid-write leaves no half-written file.
-            safe = qname.replace("/", "__").replace(".", "_")
-            fname = f"{safe}__bf16src.pt"
             tmp = self._snapshot_dir / (fname + ".tmp")
             torch.save(snap, tmp)
             import os as _os

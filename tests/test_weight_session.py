@@ -1,4 +1,5 @@
 import pytest
+import torch
 import torch.nn as nn
 
 from prismaquant.production_weight_cache import ProductionWeightCache
@@ -48,3 +49,19 @@ def test_weight_session_allows_mxfp8_rtn_fallback_with_nvfp4_only_cache():
     diag = session.diagnostics()
     assert diag["n_rtn_fallbacks"] == 1
     assert diag["n_cache_misses"] == 0
+
+
+def test_weight_session_reuses_existing_spilled_snapshot(tmp_path):
+    model = _ModelWithBody().eval()
+    model.model.proj.weight.data.fill_(1.0)
+    first = WeightSession(model, snapshot_dir=str(tmp_path))
+    saved = first.format_weight("model.proj", "BF16")
+
+    model.model.proj.weight.data.zero_()
+    second = WeightSession(model, snapshot_dir=str(tmp_path))
+    reused = second.format_weight("model.proj", "BF16")
+
+    assert saved is not None
+    assert reused is not None
+    torch.testing.assert_close(reused, torch.ones_like(reused))
+    assert second.diagnostics()["n_bf16_snapshots"] == 1
