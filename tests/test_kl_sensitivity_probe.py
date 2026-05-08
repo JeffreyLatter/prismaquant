@@ -406,6 +406,57 @@ def test_replay_cache_auto_window_caps_effective_lane_batch():
     assert window == 4
 
 
+def test_candidate_replay_checkpoint_round_trips_and_rejects_mismatch(tmp_path):
+    path = tmp_path / "candidate_overrides_tail_replay_checkpoint.json"
+    calib_ids = torch.arange(8, dtype=torch.long).reshape(2, 4)
+    overrides = [
+        {"model.layers.0.mlp.down_proj": "BF16"},
+        {"model.layers.1.mlp.down_proj": "MXFP8_E4M3"},
+    ]
+    signature = ksp._candidate_replay_checkpoint_signature(
+        floor_assignment={
+            "model.layers.0.mlp.down_proj": "NVFP4",
+            "model.layers.1.mlp.down_proj": "NVFP4",
+        },
+        ordered_overrides=overrides,
+        calib_ids=calib_ids,
+        kl_scope="last_token",
+        include_activation_quant=False,
+        max_lanes_per_batch=4,
+        replay_cache_window="auto",
+        replay_cache_max_gb=8.0,
+        replay_cache_max_effective_batch=16,
+    )
+    windows = {
+        0: {"start": 0, "end": 1, "rows": 1, "values": [0.1, 0.2]},
+        1: {"start": 1, "end": 2, "rows": 1, "values": [0.3, 0.4]},
+    }
+
+    ksp._write_candidate_replay_checkpoint(
+        path,
+        signature=signature,
+        total_windows=2,
+        windows=windows,
+    )
+
+    loaded = ksp._load_candidate_replay_checkpoint(
+        path,
+        signature=signature,
+        expected_candidates=2,
+    )
+    assert loaded == windows
+    assert ksp._load_candidate_replay_checkpoint(
+        path,
+        signature="different",
+        expected_candidates=2,
+    ) == {}
+    assert ksp._load_candidate_replay_checkpoint(
+        path,
+        signature=signature,
+        expected_candidates=3,
+    ) == {}
+
+
 def test_production_cache_metadata_validates_identity_and_entries():
     args = SimpleNamespace(
         model="/tmp/qwen",

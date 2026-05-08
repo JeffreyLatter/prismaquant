@@ -1076,6 +1076,97 @@ def _external_weight_management(enabled: bool):
                 os.environ["PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT"] = previous
 
 
+CANDIDATE_REPLAY_CHECKPOINT_SCHEMA = (
+    "prismaquant.kl_sensitivity_probe.candidate_replay_checkpoint.v1"
+)
+
+
+def _candidate_replay_checkpoint_signature(
+    *,
+    floor_assignment: Mapping[str, str],
+    ordered_overrides: Sequence[Mapping[str, str]],
+    calib_ids: torch.Tensor,
+    kl_scope: KLScope,
+    include_activation_quant: bool,
+    max_lanes_per_batch: int,
+    replay_cache_window: str,
+    replay_cache_max_gb: float,
+    replay_cache_max_effective_batch: int,
+) -> str:
+    payload = {
+        "floor_assignment_digest": _assignment_digest(floor_assignment),
+        "overrides": [
+            {str(k): fr.canonical_format_name(v) for k, v in sorted(override.items())}
+            for override in ordered_overrides
+        ],
+        "calibration_data_hash": calibration_data_hash(calib_ids),
+        "kl_scope": str(kl_scope),
+        "include_activation_quant": bool(include_activation_quant),
+        "max_lanes_per_batch": int(max_lanes_per_batch),
+        "replay_cache_window": str(replay_cache_window),
+        "replay_cache_max_gb": float(replay_cache_max_gb),
+        "replay_cache_max_effective_batch": int(replay_cache_max_effective_batch),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _load_candidate_replay_checkpoint(
+    path: Path,
+    *,
+    signature: str,
+    expected_candidates: int,
+) -> dict[int, dict]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return {}
+    if payload.get("schema") != CANDIDATE_REPLAY_CHECKPOINT_SCHEMA:
+        return {}
+    if payload.get("signature") != signature:
+        return {}
+    windows = payload.get("windows")
+    if not isinstance(windows, dict):
+        return {}
+    out: dict[int, dict] = {}
+    for raw_start, entry in windows.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            start = int(raw_start)
+            values = [float(v) for v in entry["values"]]
+            rows = int(entry["rows"])
+            end = int(entry["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if rows <= 0 or end <= start or len(values) != expected_candidates:
+            continue
+        out[start] = {"start": start, "end": end, "rows": rows, "values": values}
+    return out
+
+
+def _write_candidate_replay_checkpoint(
+    path: Path,
+    *,
+    signature: str,
+    total_windows: int,
+    windows: Mapping[int, Mapping[str, object]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": CANDIDATE_REPLAY_CHECKPOINT_SCHEMA,
+        "signature": signature,
+        "total_windows": int(total_windows),
+        "completed_windows": int(len(windows)),
+        "windows": {str(k): dict(v) for k, v in sorted(windows.items())},
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True))
+    os.replace(tmp, path)
+
+
 def _populate_replay_cache(
     model: nn.Module,
     assignment: Mapping[str, str],
@@ -1207,8 +1298,44 @@ def measure_candidate_overrides(
     totals = [0.0 for _ in ordered_overrides]
     count = 0
     total_windows = int(math.ceil(int(calib_ids.size(0)) / float(window)))
+    checkpoint_path = work_root / "candidate_overrides_tail_replay_checkpoint.json"
+    checkpoint_signature = _candidate_replay_checkpoint_signature(
+        floor_assignment=floor_assignment,
+        ordered_overrides=ordered_overrides,
+        calib_ids=calib_ids,
+        kl_scope=kl_scope,
+        include_activation_quant=include_activation_quant,
+        max_lanes_per_batch=max_lanes_per_batch,
+        replay_cache_window=replay_cache_window,
+        replay_cache_max_gb=replay_cache_max_gb,
+        replay_cache_max_effective_batch=replay_cache_max_effective_batch,
+    )
+    completed_windows = _load_candidate_replay_checkpoint(
+        checkpoint_path,
+        signature=checkpoint_signature,
+        expected_candidates=len(ordered_overrides),
+    )
+    if completed_windows:
+        print(
+            f"[kl-probe] resuming tail replay checkpoint "
+            f"{len(completed_windows)}/{total_windows} windows from "
+            f"{checkpoint_path}",
+            flush=True,
+        )
+        for entry in completed_windows.values():
+            rows = int(entry["rows"])
+            count += rows
+            for idx, value in enumerate(entry["values"]):
+                totals[idx] += float(value) * rows
     for window_idx, start in enumerate(range(0, int(calib_ids.size(0)), window), start=1):
         end = min(start + window, int(calib_ids.size(0)))
+        if start in completed_windows:
+            print(
+                f"[kl-probe] skipping completed tail replay cache "
+                f"{window_idx}/{total_windows} rows={end - start}",
+                flush=True,
+            )
+            continue
         calib_window = calib_ids[start:end]
         ref_window = list(ref_log_probs[start:end])
         print(
@@ -1280,6 +1407,18 @@ def measure_candidate_overrides(
         count += rows
         for idx, value in enumerate(values):
             totals[idx] += float(value) * rows
+        completed_windows[start] = {
+            "start": int(start),
+            "end": int(end),
+            "rows": rows,
+            "values": [float(v) for v in values],
+        }
+        _write_candidate_replay_checkpoint(
+            checkpoint_path,
+            signature=checkpoint_signature,
+            total_windows=total_windows,
+            windows=completed_windows,
+        )
     ordered_values = [total / max(count, 1) for total in totals]
     return [ordered_values[inverse[idx]] for idx in range(len(inverse))]
 
