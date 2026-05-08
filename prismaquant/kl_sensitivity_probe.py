@@ -1560,6 +1560,7 @@ def _adaptive_group_candidate_kls(
     group_size: int = 32,
     min_group_gain: float = 0.0,
     max_exact_candidates: int = 0,
+    prune_after_round: int = 1,
 ) -> AdaptiveCandidateSearchResult:
     if not candidate_overrides:
         return AdaptiveCandidateSearchResult(
@@ -1670,6 +1671,11 @@ def _adaptive_group_candidate_kls(
                 candidate_kls[int(indices[0])] = float(group_kl)
                 singleton_count += 1
                 continue
+            if int(round_idx) < max(int(prune_after_round), 1):
+                splits = _split_candidate_group(indices)
+                next_pending.extend((split, gain) for split in splits)
+                split_count += len(splits)
+                continue
             if gain <= float(min_group_gain):
                 pruned_indices.update(indices)
                 pruned_this_round += len(indices)
@@ -1679,7 +1685,11 @@ def _adaptive_group_candidate_kls(
             split_count += len(splits)
 
         dropped_by_budget: tuple[int, ...] = ()
-        if next_pending and int(max_exact_candidates) > 0:
+        if (
+            next_pending
+            and int(max_exact_candidates) > 0
+            and int(round_idx) >= max(int(prune_after_round), 1)
+        ):
             remaining = max(int(max_exact_candidates) - len(candidate_kls), 0)
             if remaining <= 0:
                 dropped_by_budget = tuple(
@@ -1727,6 +1737,7 @@ def _adaptive_group_candidate_kls(
             "group_size": int(group_size),
             "min_group_gain": float(min_group_gain),
             "max_exact_candidates": int(max_exact_candidates),
+            "prune_after_round": int(max(int(prune_after_round), 1)),
             "rounds": round_diagnostics,
         },
     )
@@ -2385,6 +2396,7 @@ def run_probe(args: argparse.Namespace) -> dict:
                 group_size=int(args.adaptive_group_size),
                 min_group_gain=float(args.adaptive_min_group_gain),
                 max_exact_candidates=int(args.adaptive_max_exact_candidates),
+                prune_after_round=int(args.adaptive_prune_after_round),
             )
             candidate_kls_by_idx = adaptive.candidate_kls
             candidate_search_diag = adaptive.diagnostics
@@ -2760,6 +2772,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Optional cap on surviving single-unit candidates under "
             "--candidate-search=adaptive_group. 0 keeps all improving "
             "branches."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-prune-after-round",
+        type=int,
+        default=1,
+        help=(
+            "Do not prune adaptive groups before this measurement round. "
+            "Setting 2 forces one bisection pass before aggregate losers can "
+            "be discarded, reducing cancellation false negatives at modest "
+            "extra cost."
         ),
     )
     parser.add_argument(
