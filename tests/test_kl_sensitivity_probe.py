@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,12 +14,21 @@ import torch.nn.functional as F
 from prismaquant import format_registry as fr
 from prismaquant.allocator_candidates import check_format_applicability
 from prismaquant.build_rtn_cache import kl_divergence
+import prismaquant.kl_sensitivity_probe as ksp
 from prismaquant.kl_sensitivity_probe import (
+    FrontierPoint,
+    LinearTarget,
+    ProbeRow,
     UnitOption,
     choose_kneedle_point,
+    _build_unit_options,
+    _fused_assignment_violations,
+    measure_frontier_points,
+    _replay_cache_window_size,
     solve_multi_choice_frontier,
 )
 from prismaquant.iterate_perturbed_allocation import measure_assignment_kl
+from prismaquant.model_profiles import Qwen3Profile
 from prismaquant.propagated_cost import resolve_kl_scope
 
 
@@ -155,6 +165,16 @@ def test_format_applicability_positive_and_negative_cases():
     assert not source_bad.legal
     assert source_bad.reason == "source_dtype_mismatch"
 
+    source_unknown = check_format_applicability(
+        (256, 256),
+        fr.get_format("FP8_SOURCE"),
+        qname="model.layers.0.mlp.down_proj",
+        source_kind=None,
+        target_profile="research",
+    )
+    assert not source_unknown.legal
+    assert source_unknown.reason == "source_dtype_mismatch"
+
 
 def test_multi_choice_frontier_finds_non_greedy_knapsack_optimum():
     floor_assignment = {"a": "NVFP4", "b": "NVFP4", "c": "NVFP4"}
@@ -192,6 +212,196 @@ def test_multi_choice_frontier_finds_non_greedy_knapsack_optimum():
         "c": "FP8_E4M3",
     }
     assert choose_kneedle_point(frontier) >= 0
+
+
+def test_kneedle_can_select_from_measured_frontier_gain():
+    points = solve_multi_choice_frontier(
+        {
+            "a": [
+                UnitOption("a", "NVFP4", ("a",), 100.0, 0.0, 0.0),
+                UnitOption("a", "FP8_E4M3", ("a",), 120.0, 20.0, 8.0),
+            ],
+            "b": [
+                UnitOption("b", "NVFP4", ("b",), 100.0, 0.0, 0.0),
+                UnitOption("b", "FP8_E4M3", ("b",), 140.0, 40.0, 100.0),
+            ],
+        },
+        floor_assignment={"a": "NVFP4", "b": "NVFP4"},
+        floor_kl=1.0,
+        budget_points=4,
+        bit_precision_bits=1.0,
+    )
+    assert len(points) > 1
+    measured = [
+        replace(point, measured_kl=1.0 - float(idx), measured_gain=float(idx))
+        for idx, point in enumerate(points)
+    ]
+
+    assert choose_kneedle_point(measured, use_measured=True) >= 0
+    with pytest.raises(ValueError):
+        choose_kneedle_point(points, use_measured=True)
+
+
+def test_measure_frontier_points_reuses_floor_kl(monkeypatch, tmp_path):
+    floor_assignment = {"a": "NVFP4", "b": "NVFP4"}
+    promoted_assignment = {"a": "BF16", "b": "NVFP4"}
+    frontier = [
+        FrontierPoint(
+            budget_bits=100.0,
+            bits_total=100.0,
+            bits_delta=0.0,
+            gain=0.0,
+            predicted_kl=0.75,
+            unit_assignment=dict(floor_assignment),
+            assignment=dict(floor_assignment),
+            promotion_count=0,
+        ),
+        FrontierPoint(
+            budget_bits=120.0,
+            bits_total=120.0,
+            bits_delta=20.0,
+            gain=0.25,
+            predicted_kl=0.5,
+            unit_assignment=dict(promoted_assignment),
+            assignment=dict(promoted_assignment),
+            promotion_count=1,
+        ),
+    ]
+    calls = []
+
+    def _measure(_model, assignment, *_args, **_kwargs):
+        calls.append(dict(assignment))
+        return 0.4
+
+    monkeypatch.setattr(ksp, "measure_assignment_kl", _measure)
+
+    measured = measure_frontier_points(
+        torch.nn.Linear(1, 1),
+        frontier,
+        torch.ones(1, 1, dtype=torch.long),
+        [torch.zeros(1, 1, 1)],
+        floor_kl=0.75,
+        floor_assignment=floor_assignment,
+        work_root=tmp_path,
+        profile=None,
+        kl_scope="last_token",
+    )
+
+    assert calls == [promoted_assignment]
+    assert measured[0].measured_kl == pytest.approx(0.75)
+    assert measured[0].measured_gain == pytest.approx(0.0)
+    assert measured[1].measured_kl == pytest.approx(0.4)
+    assert measured[1].measured_gain == pytest.approx(0.35)
+
+
+def test_qwen3_profile_has_vllm_packed_module_fallback_without_vllm():
+    profile = Qwen3Profile()
+    profile._vllm_cls = None
+    profile._vllm_cls_loaded = True
+    profile._fused_matcher = None
+
+    assert (
+        profile.fused_sibling_group("model.layers.0.self_attn.q_proj")
+        == "model.layers.0.self_attn.qkv_proj"
+    )
+    assert (
+        profile.fused_sibling_group("model.layers.0.self_attn.k_proj")
+        == "model.layers.0.self_attn.qkv_proj"
+    )
+    assert (
+        profile.fused_sibling_group("model.layers.0.mlp.gate_proj")
+        == "model.layers.0.mlp.gate_up_proj"
+    )
+    assert profile.fused_sibling_group("model.layers.0.mlp.down_proj") is None
+
+
+def test_probe_frontier_groups_vllm_packed_modules_into_coherent_assignment():
+    class _Profile:
+        def fused_sibling_group(self, qname):
+            if qname.endswith(("gate_proj", "up_proj")):
+                return "model.layers.0.mlp.gate_up_proj"
+            return None
+
+    targets = [
+        LinearTarget("model.layers.0.mlp.gate_proj", (4, 4), 16),
+        LinearTarget("model.layers.0.mlp.up_proj", (4, 4), 16),
+        LinearTarget("model.layers.0.mlp.down_proj", (4, 4), 16),
+    ]
+    floor_assignment = {target.qname: "NVFP4" for target in targets}
+    rows = [
+        ProbeRow(
+            qname=target.qname,
+            format=fmt,
+            shape=target.shape,
+            bits_baseline=100.0,
+            bits_format=bits,
+            bits_delta=bits - 100.0,
+            candidate_kl=1.0 - gain,
+            sensitivity=gain,
+        )
+        for target in targets
+        for fmt, bits, gain in [
+            ("NVFP4", 100.0, 0.0),
+            ("MXFP8_E4M3", 140.0, 1.0),
+            ("BF16", 200.0, 2.0),
+        ]
+    ]
+
+    options, unit_for_qname, missing = _build_unit_options(
+        rows,
+        targets,
+        floor_format="NVFP4",
+        floor_assignment=floor_assignment,
+        profile=_Profile(),
+    )
+
+    assert missing == {}
+    assert unit_for_qname["model.layers.0.mlp.gate_proj"] == (
+        "model.layers.0.mlp.gate_up_proj"
+    )
+    assert options["model.layers.0.mlp.gate_up_proj"][1].members == (
+        "model.layers.0.mlp.gate_proj",
+        "model.layers.0.mlp.up_proj",
+    )
+
+    frontier = solve_multi_choice_frontier(
+        options,
+        floor_assignment=floor_assignment,
+        floor_kl=10.0,
+        budget_points=4,
+        bit_precision_bits=1.0,
+    )
+    assert frontier
+    for point in frontier:
+        assert _fused_assignment_violations(
+            point.assignment, targets, _Profile()
+        ) == {}
+
+
+def test_replay_cache_auto_window_caps_effective_lane_batch():
+    class _Config:
+        hidden_size = 16
+
+    class _Toy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _Config()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList(
+                [torch.nn.Identity() for _ in range(4)]
+            )
+
+    window = _replay_cache_window_size(
+        _Toy(),
+        torch.ones(64, 32, dtype=torch.long),
+        dtype=torch.float32,
+        window_arg="auto",
+        max_cache_gb=128.0,
+        max_lanes_per_batch=4,
+        max_effective_batch=16,
+    )
+
+    assert window == 4
 
 
 def test_kl_sensitivity_probe_help_parses():

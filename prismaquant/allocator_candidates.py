@@ -27,7 +27,7 @@ def _passthrough_source_ok(
     if required is None:
         return True
     if source_kind is None:
-        return True
+        return format_name == "BF16"
     return source_kind == required
 
 
@@ -127,8 +127,7 @@ def check_format_applicability(
     in_features = int(shape[-1])
 
     if (
-        source_kind is not None
-        and _is_passthrough_format(fmt)
+        _is_passthrough_format(fmt)
         and not _passthrough_source_ok(fmt, source_kind)
     ):
         required = PASSTHROUGH_SOURCE_REQUIREMENTS.get(fmt)

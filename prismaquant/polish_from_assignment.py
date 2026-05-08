@@ -77,6 +77,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--calib-split", default="train")
     p.add_argument("--calib-seed", type=int, default=42)
     p.add_argument("--dtype", default="bf16")
+    p.add_argument(
+        "--kl-scope",
+        choices=["last_token", "full_sequence"],
+        default="last_token",
+        help="KL reduction scope.  last_token caches only the final-token "
+        "teacher distribution per calibration row.",
+    )
+    p.add_argument(
+        "--no-activation-quant",
+        action="store_true",
+        help="Disable production activation quantization during polish KL.",
+    )
     p.add_argument("--polish-budget-creep", type=float, default=0.05)
     p.add_argument("--polish-max-passes", type=int, default=12)
     p.add_argument("--polish-noise-floor", type=float, default=1e-5)
@@ -332,7 +344,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile = detect_profile(args.model)
         except Exception:
             profile = DefaultProfile()
-        ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
+        print(
+            f"[polish] caching reference logprobs "
+            f"(kl_scope={args.kl_scope})",
+            flush=True,
+        )
+        ref_log_probs = cache_reference_log_probs(
+            model, calib_ids, device, kl_scope=args.kl_scope,
+        )
 
         starting_bits = _assignment_bits(units, starting_assignment)
         budget = starting_bits * (1.0 + float(args.polish_budget_creep))
@@ -372,6 +391,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             direction=args.direction,
             kl_budget=args.kl_budget,
             delta_quantize=args.delta_quantize,
+            kl_scope=args.kl_scope,
+            include_activation_quant=not bool(args.no_activation_quant),
             weight_session_spill_to_disk=bool(
                 args.weight_session_spill_to_disk
             ),
@@ -413,6 +434,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "n_samples": int(args.n_calib_samples),
                     "seqlen": int(args.calib_seqlen),
                     "hash": str(calib_hash),
+                    "kl_scope": str(args.kl_scope),
+                    "include_activation_quant": bool(
+                        not args.no_activation_quant
+                    ),
                 },
                 "runtime": {
                     "torch_version": str(torch.__version__),
@@ -444,6 +469,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "polish_budget_creep": float(args.polish_budget_creep),
                     "polish_max_passes": int(args.polish_max_passes),
                     "polish_noise_floor": float(args.polish_noise_floor),
+                    "kl_scope": str(args.kl_scope),
+                    "include_activation_quant": bool(
+                        not args.no_activation_quant
+                    ),
                     "delta_quantize": args.delta_quantize,
                     "weight_session_spill_to_disk": bool(
                         args.weight_session_spill_to_disk

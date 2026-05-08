@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
 from prismaquant.perturbed_x_cache import (
+    PerturbedActivationCache,
     activation_cache_filename,
     capture_perturbed_activation_cache,
     stage_text_only_under_work_root,
@@ -90,6 +91,53 @@ def test_perturbed_cache_shares_row_subsample_for_fused_siblings(tmp_path):
     k_rows = _load_cache(tmp_path, "self_attn.k_proj")
     assert q_rows.shape == (2, 64)
     torch.testing.assert_close(q_rows, k_rows)
+
+
+def test_perturbed_cache_can_skip_activation_quant_for_probe(tmp_path, monkeypatch):
+    spec = fr.FormatSpec(
+        name="ZERO_ACT_TEST",
+        weight_bits=8,
+        group_size=0,
+        scale_bits=0,
+        scale_dtype_name="none",
+        weight_element_dtype="test",
+        act_bits=4,
+        quantize_dequantize=lambda w: w.clone(),
+        activation_quantize_dequantize=lambda x: torch.zeros_like(x),
+    )
+    monkeypatch.setitem(fr.REGISTRY, spec.name, spec)
+    model = nn.Sequential(nn.Linear(64, 64, bias=False)).eval()
+    with torch.no_grad():
+        model[0].weight.copy_(torch.eye(64))
+    x = torch.randn(2, 64)
+
+    with_act = PerturbedActivationCache(
+        model,
+        {"0": spec.name},
+        tmp_path / "with_act",
+        input_rows=0,
+        cal_hash="test",
+        include_activation_quant=True,
+    )
+    with_act.install()
+    try:
+        torch.testing.assert_close(model(x), torch.zeros_like(x))
+    finally:
+        with_act.remove()
+
+    without_act = PerturbedActivationCache(
+        model,
+        {"0": spec.name},
+        tmp_path / "without_act",
+        input_rows=0,
+        cal_hash="test",
+        include_activation_quant=False,
+    )
+    without_act.install()
+    try:
+        torch.testing.assert_close(model(x), x)
+    finally:
+        without_act.remove()
 
 
 def test_stage_text_only_uses_work_root_for_tempdir(tmp_path):

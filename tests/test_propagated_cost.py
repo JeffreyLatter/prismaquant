@@ -286,6 +286,21 @@ def _identity8_spec():
     )
 
 
+def _act_zero_identity_weight_spec():
+    return fr.FormatSpec(
+        name="ACTZERO8",
+        weight_bits=8,
+        group_size=0,
+        scale_bits=0,
+        scale_dtype_name="none",
+        weight_element_dtype="test_identity",
+        act_bits=8,
+        act_dtype_name="test_zero",
+        quantize_dequantize=lambda w: w.clone(),
+        activation_quantize_dequantize=lambda x: torch.zeros_like(x),
+    )
+
+
 def _counted_fp_spec(name: str):
     codebook = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
     return fr.FormatSpec(
@@ -1196,6 +1211,193 @@ def test_coord_lane_batched_with_cuda_graphs_matches_eager(tmp_path, monkeypatch
     assert graphed == pytest.approx(eager, abs=1e-9, rel=0.0)
 
 
+def test_coord_lane_batched_mixed_depth_matches_sequential(tmp_path, monkeypatch):
+    zero = _zero_spec()
+    monkeypatch.setitem(fr.REGISTRY, zero.name, zero)
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_CUDA_GRAPHS", "0")
+    assignment = {"l1": "BF16", "l2": "BF16", "l3": "BF16"}
+    candidate_flips = [("l1", zero.name), ("l2", zero.name)]
+    calib = torch.tensor(
+        [[1.0, -1.0], [0.5, -0.25], [-0.75, 0.25]],
+        dtype=torch.float32,
+    )
+
+    def _measure(max_lanes: int):
+        torch.manual_seed(123)
+        model = _AmplifyingToy().eval()
+        ref_log_probs = cache_reference_log_probs(
+            model,
+            calib,
+            next(model.parameters()).device,
+        )
+        return pc.measure_lane_batched_kl_deltas(
+            model,
+            assignment,
+            candidate_flips,
+            calib,
+            ref_log_probs,
+            work_root=tmp_path,
+            max_lanes_per_batch=max_lanes,
+            use_cuda_graphs=False,
+        )
+
+    sequential = _measure(1)
+    batched = _measure(2)
+    assert batched == pytest.approx(sequential, abs=1e-9, rel=0.0)
+
+
+def test_override_set_kl_batches_multi_target_lanes(tmp_path, monkeypatch):
+    zero = _zero_spec()
+    monkeypatch.setitem(fr.REGISTRY, zero.name, zero)
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_CUDA_GRAPHS", "0")
+    assignment = {"l1": "BF16", "l2": "BF16", "l3": "BF16"}
+    overrides = [
+        {"l1": zero.name, "l2": zero.name},
+        {"l2": zero.name, "l3": zero.name},
+    ]
+    calib = torch.tensor(
+        [[1.0, -1.0], [0.5, -0.25], [-0.75, 0.25]],
+        dtype=torch.float32,
+    )
+
+    def _measure(max_lanes: int):
+        torch.manual_seed(321)
+        model = _AmplifyingToy().eval()
+        ref_log_probs = cache_reference_log_probs(
+            model,
+            calib,
+            next(model.parameters()).device,
+        )
+        return pc.measure_override_set_kl(
+            model,
+            assignment,
+            overrides,
+            calib,
+            ref_log_probs,
+            work_root=tmp_path,
+            max_lanes_per_batch=max_lanes,
+            use_cuda_graphs=False,
+        )
+
+    sequential = _measure(1)
+    batched = _measure(2)
+    assert batched == pytest.approx(sequential, abs=1e-9, rel=0.0)
+
+
+def test_override_set_kl_uses_production_weight_cache_for_targets(tmp_path, monkeypatch):
+    zero = _zero_spec()
+    monkeypatch.setitem(fr.REGISTRY, zero.name, zero)
+    monkeypatch.setenv("PRISMAQUANT_COORD_LANE_CUDA_GRAPHS", "0")
+    assignment = {"l1": "BF16", "l2": "BF16", "l3": "BF16"}
+    overrides = [{"l1": zero.name}]
+    calib = torch.tensor(
+        [[1.0, -1.0], [0.5, -0.25], [-0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    model = _AmplifyingToy().eval()
+    ref_log_probs = cache_reference_log_probs(
+        model,
+        calib,
+        next(model.parameters()).device,
+    )
+
+    class _ProductionCache:
+        activation_max_abs = {}
+        activation_scales = {}
+
+        def get(self, name, fmt):
+            if name == "l1" and fmt == zero.name:
+                return model.l1.weight.detach().clone()
+            return None
+
+    raw = pc.measure_override_set_kl(
+        model,
+        assignment,
+        overrides,
+        calib,
+        ref_log_probs,
+        work_root=tmp_path,
+        max_lanes_per_batch=1,
+        use_cuda_graphs=False,
+    )
+    cleaned = pc.measure_override_set_kl(
+        model,
+        assignment,
+        overrides,
+        calib,
+        ref_log_probs,
+        work_root=tmp_path,
+        max_lanes_per_batch=1,
+        use_cuda_graphs=False,
+        production_weight_cache=_ProductionCache(),
+    )
+
+    assert raw[0] > 1e-6
+    assert cleaned == pytest.approx([0.0], abs=1e-9, rel=0.0)
+
+
+def test_override_set_replay_matches_eager(tmp_path, monkeypatch):
+    zero = _zero_spec()
+    monkeypatch.setitem(fr.REGISTRY, zero.name, zero)
+    assignment = {
+        f"model.layers.{idx}.proj": "BF16"
+        for idx in range(4)
+    }
+    overrides = [
+        {
+            "model.layers.1.proj": zero.name,
+            "model.layers.2.proj": zero.name,
+        },
+        {"model.layers.2.proj": zero.name},
+    ]
+    calib = torch.linspace(-1.0, 1.0, steps=3 * 5 * 8).reshape(3, 5, 8)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _prepare():
+        torch.manual_seed(9876)
+        model = _CacheReplayCausalLM(width=8, layers=4).eval().to(device)
+        ref_log_probs = cache_reference_log_probs(model, calib, device)
+        return model, ref_log_probs
+
+    model, ref_log_probs = _prepare()
+    eager = pc.measure_override_set_kl(
+        model,
+        assignment,
+        overrides,
+        calib,
+        ref_log_probs,
+        work_root=tmp_path,
+        max_lanes_per_batch=2,
+        include_activation_quant=False,
+        use_cuda_graphs=False,
+    )
+
+    model, ref_log_probs = _prepare()
+    replay_cache = LayerHiddenStateCache(model)
+    replay_cache.populate(
+        assignment,
+        calib,
+        device=str(device),
+        dtype=torch.float32,
+        include_activation_quant=False,
+    )
+    replay = pc.measure_override_set_kl(
+        model,
+        assignment,
+        overrides,
+        calib,
+        ref_log_probs,
+        work_root=tmp_path,
+        max_lanes_per_batch=2,
+        replay_cache=replay_cache,
+        include_activation_quant=False,
+        use_cuda_graphs=False,
+        use_replay_cache=True,
+    )
+
+    assert replay == pytest.approx(eager, abs=1e-9, rel=0.0)
+
+
 def test_coord_lane_replay_graph_capture_no_shape_mismatch(tmp_path, monkeypatch):
     pc._COORD_LANE_CUDA_GRAPH_REGISTRY.clear()
     pc._CUDA_GRAPH_WARNED_LABELS.clear()
@@ -1257,6 +1459,64 @@ def test_coord_lane_replay_graph_capture_no_shape_mismatch(tmp_path, monkeypatch
     if torch.cuda.is_available():
         assert pc._COORD_LANE_CUDA_GRAPH_REGISTRY.entries
         assert not pc._COORD_LANE_CUDA_GRAPH_REGISTRY.disabled_keys
+
+
+def test_coord_lane_replay_respects_disabled_activation_quant(tmp_path, monkeypatch):
+    zero = _zero_spec()
+    act_zero = _act_zero_identity_weight_spec()
+    monkeypatch.setitem(fr.REGISTRY, zero.name, zero)
+    monkeypatch.setitem(fr.REGISTRY, act_zero.name, act_zero)
+    assignment = {
+        f"model.layers.{idx}.proj": act_zero.name
+        for idx in range(3)
+    }
+    candidate_flips = [("model.layers.1.proj", zero.name)]
+    calib = torch.linspace(-1.0, 1.0, steps=2 * 4 * 8).reshape(2, 4, 8)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _prepare():
+        torch.manual_seed(4321)
+        model = _CacheReplayCausalLM(width=8, layers=3).eval().to(device)
+        ref_log_probs = cache_reference_log_probs(model, calib, device)
+        return model, ref_log_probs
+
+    model, ref_log_probs = _prepare()
+    eager = pc.measure_lane_batched_kl_deltas(
+        model,
+        assignment,
+        candidate_flips,
+        calib,
+        ref_log_probs,
+        work_root=tmp_path,
+        max_lanes_per_batch=1,
+        include_activation_quant=False,
+        use_cuda_graphs=False,
+    )
+
+    model, ref_log_probs = _prepare()
+    replay_cache = LayerHiddenStateCache(model)
+    replay_cache.populate(
+        assignment,
+        calib,
+        device=str(device),
+        dtype=torch.float32,
+        include_activation_quant=False,
+    )
+    replay = pc.measure_lane_batched_kl_deltas(
+        model,
+        assignment,
+        candidate_flips,
+        calib,
+        ref_log_probs,
+        work_root=tmp_path,
+        max_lanes_per_batch=1,
+        replay_cache=replay_cache,
+        include_activation_quant=False,
+        use_cuda_graphs=False,
+        use_replay_cache=True,
+    )
+
+    assert replay == pytest.approx(eager, abs=1e-9, rel=0.0)
 
 
 def test_lane_batch_memory_check_falls_back(monkeypatch):

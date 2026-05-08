@@ -306,10 +306,12 @@ class PerturbedActivationCache:
         cal_hash: str,
         profile=None,
         production_weight_cache=None,
+        include_activation_quant: bool = True,
     ):
         self.model = model
         self.cache_dir = Path(cache_dir)
         self.input_rows = int(input_rows)
+        self.include_activation_quant = bool(include_activation_quant)
         self.subsampler = SharedRowSubsampler(input_rows, cal_hash, profile)
         self.plans, self.missing, self.skipped = _build_module_plans(
             model, assignment
@@ -652,6 +654,8 @@ class PerturbedActivationCache:
             plan.active_originals.append((param, original))
 
     def _active_activation_spec(self, plan: _ModulePlan) -> fr.FormatSpec | None:
+        if not self.include_activation_quant:
+            return None
         low_act = {
             p.spec.name: p.spec
             for p in plan.params
@@ -968,10 +972,25 @@ def _to_device(value, device: torch.device):
     return value
 
 
-def iter_calibration_forwards(calibration_data, device: torch.device):
+def iter_calibration_forwards(
+    calibration_data,
+    device: torch.device,
+    *,
+    microbatch_size: int = 1,
+):
+    """Yield (args, kwargs) for one forward pass per calibration microbatch.
+
+    ``microbatch_size`` controls how many calibration rows are stacked into
+    each forward — default 1 preserves the historical one-sample-at-a-time
+    behaviour every existing caller relies on.  Callers that want to amortize
+    Python and kernel launch overhead can request a larger microbatch; the
+    yielded batch dim becomes ``min(microbatch_size, remaining_rows)``.
+    """
     if isinstance(calibration_data, torch.Tensor):
-        for i in range(calibration_data.size(0)):
-            yield (calibration_data[i:i + 1].to(device),), {}
+        n = int(calibration_data.size(0))
+        m = max(1, int(microbatch_size))
+        for i in range(0, n, m):
+            yield (calibration_data[i:i + m].to(device),), {}
         return
     if isinstance(calibration_data, Mapping):
         yield (), {k: _to_device(v, device) for k, v in calibration_data.items()}

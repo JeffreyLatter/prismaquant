@@ -210,6 +210,8 @@ def coord_descent_polish(
     direction: str = "bottom_up",
     kl_budget: float | None = None,
     delta_quantize: bool | None = None,
+    kl_scope: str | None = "last_token",
+    include_activation_quant: bool = True,
     weight_session_spill_to_disk: bool = False,
     progress_callback=None,
 ) -> PolishResult:
@@ -370,6 +372,9 @@ def coord_descent_polish(
             work_root=work_root, profile=profile,
             use_frozen_weight_cache=use_frozen_weight_cache,
             production_weight_cache=production_weight_cache, rng_seed=0,
+            kl_scope=kl_scope,
+            include_activation_quant=include_activation_quant,
+            stream_ref_log_probs=kl_scope == "full_sequence",
         )
         n_measurements += 1
         initial_kl = float(current_kl)
@@ -487,6 +492,9 @@ def coord_descent_polish(
                         work_root=work_root, profile=profile,
                         use_frozen_weight_cache=use_frozen_weight_cache,
                         production_weight_cache=production_weight_cache, rng_seed=0,
+                        kl_scope=kl_scope,
+                        include_activation_quant=include_activation_quant,
+                        stream_ref_log_probs=kl_scope == "full_sequence",
                     )
                 finally:
                     if weight_session is not None and n_staged:
@@ -590,6 +598,8 @@ def coord_descent_polish(
             elapsed_seconds=float(time.time() - start),
             n_kl_measurements=int(n_measurements),
             diagnostics={
+                "kl_scope": kl_scope,
+                "include_activation_quant": bool(include_activation_quant),
                 "weight_session": (
                     weight_session.diagnostics()
                     if weight_session is not None else None
@@ -680,6 +690,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calib-split", default="train")
     parser.add_argument("--calib-seed", type=int, default=42)
     parser.add_argument("--dtype", default="bf16")
+    parser.add_argument(
+        "--kl-scope",
+        choices=["last_token", "full_sequence"],
+        default="last_token",
+        help="KL reduction scope.  last_token is the scalable default.",
+    )
+    parser.add_argument(
+        "--no-activation-quant",
+        action="store_true",
+        help="Disable production activation quantization during polish KL.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-passes", type=int, default=8)
     parser.add_argument("--noise-floor", type=float, default=1e-5)
@@ -774,7 +795,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception:
             profile = DefaultProfile()
         device = next(model.parameters()).device
-        ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
+        ref_log_probs = cache_reference_log_probs(
+            model, calib_ids, device, kl_scope=args.kl_scope,
+        )
 
         # Resolve bits budget
         if args.bits_budget is not None:
@@ -805,6 +828,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             pairs_by_block=pairs_by_block,
             steepest_first=bool(args.steepest_first),
             use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
+            kl_scope=args.kl_scope,
+            include_activation_quant=not bool(args.no_activation_quant),
             progress_callback=_progress_printer,
         )
         out_payload = {

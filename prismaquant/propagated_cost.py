@@ -46,6 +46,7 @@ from prismaquant.perturbed_x_cache import (
     build_quantizable_map,
     calibration_data_hash,
     iter_calibration_forwards,
+    _maybe_clip_activations,
 )
 from prismaquant.layer_state_cache import LayerHiddenStateCache
 
@@ -1611,8 +1612,16 @@ class CUDAGraphRegistry:
         return get_prismaquant_graph_pool_id()
 
     def clear(self) -> None:
+        had_entries = bool(self.entries)
         self.entries.clear()
         self.disabled_keys.clear()
+        if had_entries and torch.cuda.is_available():
+            gc.collect()
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def _max_entries(self) -> int:
         if (
@@ -1859,18 +1868,28 @@ class CUDAGraphRegistry:
                 self._verbose_exception(label, "warmup synchronize failed", exc)
                 raise
 
-        graph = None
-        try:
-            graph = torch.cuda.CUDAGraph(keep_graph=self._verbose_enabled())
-        except TypeError:
-            graph = torch.cuda.CUDAGraph()
-        if self._verbose_enabled():
-            enable_debug = getattr(graph, "enable_debug_mode", None)
-            if callable(enable_debug):
-                try:
-                    enable_debug()
-                except Exception as exc:
-                    self._verbose_exception(label, "enable debug mode failed", exc)
+        def _new_graph():
+            try:
+                graph_obj = torch.cuda.CUDAGraph(
+                    keep_graph=self._verbose_enabled()
+                )
+            except TypeError:
+                graph_obj = torch.cuda.CUDAGraph()
+            if self._verbose_enabled():
+                enable_debug = getattr(graph_obj, "enable_debug_mode", None)
+                if callable(enable_debug):
+                    try:
+                        enable_debug()
+                    except Exception as exc:
+                        self._verbose_exception(
+                            label,
+                            "enable debug mode failed",
+                            exc,
+                        )
+            return graph_obj
+
+        graph = _new_graph()
+        graph_pool = None
         try:
             graph_pool = self.graph_pool()
             graph_cm = (
@@ -1881,9 +1900,32 @@ class CUDAGraphRegistry:
             with graph_cm, torch.no_grad():
                 static_output = fn(*static_args, **static_kwargs)
         except Exception as exc:
-            self._verbose_exception(label, "capture body/end failed", exc)
+            retry_private = (
+                graph_pool is not None
+                and "use_count > 0" in str(exc)
+            )
+            if not retry_private:
+                self._verbose_exception(label, "capture body/end failed", exc)
+                self._cleanup_failed_capture(graph, device, label)
+                raise
+            self._verbose_exception(
+                label,
+                "shared-pool capture failed; retrying private pool",
+                exc,
+            )
             self._cleanup_failed_capture(graph, device, label)
-            raise
+            graph = _new_graph()
+            try:
+                with torch.cuda.graph(graph), torch.no_grad():
+                    static_output = fn(*static_args, **static_kwargs)
+            except Exception as retry_exc:
+                self._verbose_exception(
+                    label,
+                    "private-pool retry failed",
+                    retry_exc,
+                )
+                self._cleanup_failed_capture(graph, device, label)
+                raise retry_exc from exc
         try:
             instantiate = getattr(graph, "instantiate", None)
             if self._verbose_enabled() and callable(instantiate):
@@ -1956,8 +1998,16 @@ class _TailCudaGraphCache:
         return get_prismaquant_graph_pool_id()
 
     def clear(self) -> None:
+        had_entries = bool(self.entries)
         self.entries.clear()
         self.disabled_keys.clear()
+        if had_entries and torch.cuda.is_available():
+            gc.collect()
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def _max_entries(self) -> int:
         return _env_int("PRISMAQUANT_CUDA_GRAPH_MAX_ENTRIES_PER_PATH", 4)
@@ -2298,6 +2348,24 @@ def _lane_replay_cache_logits(
         replay_cache._activation_quantizers = original_activation_quantizers
 
 
+def _override_replay_cache_logits(
+    replay_cache: LayerHiddenStateCache,
+    layer_idx: int,
+    *,
+    lane_count: int,
+    base_batch: int,
+    target_names: set[str],
+) -> torch.Tensor:
+    """Replay a populated cache with one full override-set per lane."""
+    return _lane_replay_cache_logits(
+        replay_cache,
+        layer_idx,
+        lane_count=lane_count,
+        base_batch=base_batch,
+        target_names=target_names,
+    )
+
+
 def _l3_quantizable_map(model: nn.Module) -> dict[str, tuple[nn.Module, str]]:
     """Map L3 names to modules, including tiny nn.Linear modules in tests."""
     out = dict(build_quantizable_map(model))
@@ -2327,6 +2395,7 @@ def build_quant_weight_cache(
     specs: list[fr.FormatSpec],
     *,
     skip_bf16: bool = True,
+    production_weight_cache=None,
 ) -> QuantWeightCache:
     quant_map = _l3_quantizable_map(model)
     cache: dict[tuple[str, str], torch.Tensor] = {}
@@ -2353,16 +2422,67 @@ def build_quant_weight_cache(
                 if original_weight.device.type == "cuda" else None,
                 reason="L3 quant weight cache fill",
             )
-            quantized = apply_format_quantization(original_weight, spec).to(
-                device=original_weight.device,
-                dtype=original_weight.dtype,
+            production = (
+                production_weight_cache.get(entry.name, canonical)
+                if production_weight_cache is not None
+                else None
             )
+            if production is not None:
+                quantized = production.to(
+                    device=original_weight.device,
+                    dtype=original_weight.dtype,
+                )
+            else:
+                if (
+                    production_weight_cache is not None
+                    and canonical not in {"BF16", "MXFP8", "MXFP8_E4M3"}
+                    and _env_flag_enabled("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                ):
+                    raise RuntimeError(
+                        f"production_weight_cache miss for "
+                        f"({entry.name!r}, {canonical!r}); set "
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 to fall back "
+                        "to RTN, or rebuild the production cache."
+                    )
+                quantized = apply_format_quantization(original_weight, spec).to(
+                    device=original_weight.device,
+                    dtype=original_weight.dtype,
+                )
             quantized = quantized.contiguous()
             fmt_keys = {canonical, spec.name, *fr.aliases_for(spec.name)}
             for name_key in name_keys:
                 for fmt_key in fmt_keys:
                     cache[(name_key, fmt_key)] = quantized
     return QuantWeightCache(cache)
+
+
+def _production_activation_max_abs(production_weight_cache) -> dict[str, float]:
+    if production_weight_cache is None:
+        return {}
+    return dict(
+        getattr(production_weight_cache, "activation_max_abs", None)
+        or getattr(production_weight_cache, "activation_scales", None)
+        or {}
+    )
+
+
+def _prefetch_production_weight_cache(
+    production_weight_cache,
+    entries: Sequence[L3NeighborhoodEntry],
+) -> None:
+    if production_weight_cache is None or not hasattr(production_weight_cache, "prefetch"):
+        return
+    if getattr(production_weight_cache, "_prismaquant_prefetch_policy", "batch") == "none":
+        return
+    keys: list[tuple[str, str]] = []
+    for entry in entries:
+        for fmt in entry.formats:
+            canonical = fr.canonical_format_name(fmt)
+            if canonical == "BF16":
+                continue
+            keys.append((entry.name, canonical))
+    if keys:
+        production_weight_cache.prefetch(keys)
 
 
 class _DepthGroupTargetHooks:
@@ -2385,6 +2505,8 @@ class _DepthGroupTargetHooks:
         *,
         base_batch: int,
         quant_weight_cache: QuantWeightCache | None = None,
+        include_activation_quant: bool = True,
+        activation_max_abs: Mapping[str, float] | None = None,
     ):
         self.model = model
         self.assignment = _canonical_assignment(assignment)
@@ -2392,6 +2514,8 @@ class _DepthGroupTargetHooks:
         self.lanes = lanes
         self.base_batch = int(base_batch)
         self.quant_weight_cache = quant_weight_cache
+        self.include_activation_quant = bool(include_activation_quant)
+        self.activation_max_abs = dict(activation_max_abs or {})
         self.handles = []
         self.missing: list[str] = []
 
@@ -2443,9 +2567,10 @@ class _DepthGroupTargetHooks:
             if x_chunks is None:
                 return output
 
-            out_chunks = []
             weight = module.weight.detach()
             bias = module.bias.detach() if module.bias is not None else None
+
+            out_chunks = []
             for lane, y_lane, x_lane in zip(self.lanes, chunks, x_chunks):
                 fmt = self._format_for_lane(module_name, lane)
                 if fmt == "BF16":
@@ -2460,8 +2585,21 @@ class _DepthGroupTargetHooks:
                     w_hat = self.quant_weight_cache.get(module_name, fmt)
                 if w_hat is None:
                     w_hat = apply_format_quantization(weight, spec)
-                x_hat = spec.activation_quantize_dequantize(x_lane)
-                out_chunks.append(F.linear(x_hat, w_hat.to(weight.dtype), bias))
+                x_hat = (
+                    spec.activation_quantize_dequantize(
+                        _maybe_clip_activations(
+                            x_lane,
+                            self.activation_max_abs,
+                            module_name,
+                        )
+                    )
+                    if self.include_activation_quant
+                    else x_lane
+                )
+                out_chunks.append(
+                    F.linear(x_hat, w_hat.to(weight.dtype), bias)
+                )
+
             replacement = torch.cat(out_chunks, dim=0)
             return _replace_first_tensor_output(output, replacement)
 
@@ -2480,6 +2618,8 @@ class _OverrideSetTargetHooks:
         *,
         base_batch: int,
         quant_weight_cache: QuantWeightCache | None = None,
+        include_activation_quant: bool = True,
+        activation_max_abs: Mapping[str, float] | None = None,
     ):
         self.model = model
         self.assignment = _canonical_assignment(assignment)
@@ -2493,6 +2633,8 @@ class _OverrideSetTargetHooks:
         ]
         self.base_batch = int(base_batch)
         self.quant_weight_cache = quant_weight_cache
+        self.include_activation_quant = bool(include_activation_quant)
+        self.activation_max_abs = dict(activation_max_abs or {})
         self.handles = []
         self.missing: list[str] = []
 
@@ -2566,7 +2708,17 @@ class _OverrideSetTargetHooks:
                     w_hat = self.quant_weight_cache.get(module_name, fmt)
                 if w_hat is None:
                     w_hat = apply_format_quantization(weight, spec)
-                x_hat = spec.activation_quantize_dequantize(x_lane)
+                x_hat = (
+                    spec.activation_quantize_dequantize(
+                        _maybe_clip_activations(
+                            x_lane,
+                            self.activation_max_abs,
+                            module_name,
+                        )
+                    )
+                    if self.include_activation_quant
+                    else x_lane
+                )
                 out_chunks.append(F.linear(x_hat, w_hat.to(weight.dtype), bias))
             replacement = torch.cat(out_chunks, dim=0)
             return _replace_first_tensor_output(output, replacement)
@@ -2810,6 +2962,18 @@ def _pad_override_lanes_for_cuda_graph(
     return padded
 
 
+def _override_sets_microbatches(
+    overrides: Sequence[Mapping[str, str]],
+    max_lanes_per_batch: int,
+) -> list[list[dict[str, str]]]:
+    batch_size = max(int(max_lanes_per_batch), 1)
+    normalised = [_normalise_override_set(override) for override in overrides]
+    return [
+        normalised[start:start + batch_size]
+        for start in range(0, len(normalised), batch_size)
+    ]
+
+
 def _calibration_sample_tensor_bytes(value) -> int:
     if isinstance(value, torch.Tensor):
         return int(value.numel() * value.element_size())
@@ -2820,7 +2984,12 @@ def _calibration_sample_tensor_bytes(value) -> int:
     return 0
 
 
-def _estimate_l3_microbatch_memory_bytes(calibration_data, lane_count: int) -> int:
+def _estimate_l3_microbatch_memory_bytes(
+    calibration_data,
+    lane_count: int,
+    *,
+    calib_microbatch_size: int = 1,
+) -> int:
     if isinstance(calibration_data, torch.Tensor):
         if calibration_data.dim() == 0 or calibration_data.size(0) == 0:
             sample = calibration_data
@@ -2833,7 +3002,8 @@ def _estimate_l3_microbatch_memory_bytes(calibration_data, lane_count: int) -> i
         base_bytes = _calibration_sample_tensor_bytes(calibration_data[0])
     else:
         base_bytes = 0
-    return int(base_bytes * max(int(lane_count), 1) * 4)
+    microbatch = max(int(calib_microbatch_size), 1)
+    return int(base_bytes * microbatch * max(int(lane_count), 1) * 4)
 
 
 def _calibration_call_count(calibration_data) -> int:
@@ -2856,6 +3026,8 @@ def _adjust_l3_max_lanes_for_memory(
     max_lanes_per_batch: int,
     calibration_data,
     device: torch.device,
+    *,
+    calib_microbatch_size: int = 1,
 ) -> int:
     requested = max(int(max_lanes_per_batch), 1)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -2879,11 +3051,56 @@ def _adjust_l3_max_lanes_for_memory(
         estimated_bytes = _estimate_l3_microbatch_memory_bytes(
             calibration_data,
             lanes,
+            calib_microbatch_size=calib_microbatch_size,
         )
         if int(free_bytes) >= headroom_bytes + estimated_bytes:
             break
         lanes = max(lanes // 2, 1)
     return max(lanes, 1)
+
+
+def _pick_l3_calib_microbatch_for_memory(
+    requested: int,
+    calibration_data,
+    lane_count: int,
+    device: torch.device,
+) -> int:
+    """Step a requested calibration-microbatch ceiling down until it fits.
+
+    Mirrors :func:`_adjust_l3_max_lanes_for_memory`: assumes lane batching
+    has already settled on ``lane_count`` and finds the largest power-of-two-
+    style microbatch that, combined with the lane count, fits within the
+    free GPU memory minus the configured headroom.  Returns 1 if memory is
+    unavailable or the device is CPU, preserving historical behaviour.
+    """
+    requested = max(int(requested), 1)
+    if requested == 1 or device.type != "cuda" or not torch.cuda.is_available():
+        return 1
+    info = cuda_memory_info(device)
+    if info is None:
+        return 1
+    free_bytes, total_bytes = info
+    headroom_bytes = max(
+        int(total_bytes * max(
+            _env_float("PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_FRACTION", 0.05),
+            0.0,
+        )),
+        int(
+            max(_env_float("PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_GB", 2.0), 0.0)
+            * 1024 ** 3
+        ),
+    )
+    micro = requested
+    while micro > 1:
+        estimated_bytes = _estimate_l3_microbatch_memory_bytes(
+            calibration_data,
+            lane_count,
+            calib_microbatch_size=micro,
+        )
+        if int(free_bytes) >= headroom_bytes + estimated_bytes:
+            break
+        micro = max(micro // 2, 1)
+    return max(micro, 1)
 
 
 def _output_mse_names_reach_tail(
@@ -2912,12 +3129,23 @@ def measure_lane_batched_kl_deltas(
     profile=None,
     replay_cache: LayerHiddenStateCache | None = None,
     kl_scope: KLScope | None = None,
+    calib_microbatch_size: int = 1,
+    include_activation_quant: bool = True,
+    use_cuda_graphs: bool | None = None,
+    use_replay_cache: bool | None = None,
+    production_weight_cache=None,
 ) -> list[float]:
     """Measure end-KL for each candidate flip applied to baseline_assignment.
 
     Each lane is one ``(Linear, format)`` override. Lanes may target different
     Linear modules; target hooks apply the candidate format for the matching
     lane and the baseline assignment for all other target modules in that lane.
+
+    ``calib_microbatch_size`` (default 1) stacks that many calibration rows
+    into each forward to amortize Python and kernel-launch overhead.  When >1,
+    ``ref_log_probs`` is reorganized into matching microbatches before the
+    inner KL loop; the function still expects one entry per calibration row
+    on input.
     """
     if not candidate_flips:
         return []
@@ -2931,14 +3159,31 @@ def measure_lane_batched_kl_deltas(
     ]
     format_names = set(assignment_c.values()) | {fmt for _name, fmt in flips}
     specs_by_name = _specs_by_canonical_name(format_names)
+    activation_max_abs = _production_activation_max_abs(production_weight_cache)
 
     device = next(model.parameters()).device
     requested_max_lanes_per_batch = max(int(max_lanes_per_batch), 1)
+    calib_microbatch_size = max(int(calib_microbatch_size), 1)
     max_lanes_per_batch = _adjust_l3_max_lanes_for_memory(
         requested_max_lanes_per_batch,
         calib_ids,
         device,
+        calib_microbatch_size=calib_microbatch_size,
     )
+
+    # Reorganize ref_log_probs into microbatches matching calib_microbatch_size
+    # so the per-microbatch teacher tensor has a (B, L, V) shape that matches
+    # the chunk shape the lane-split code emits.  When microbatch_size==1 this
+    # is a no-op (each entry stays its original (1, L, V) shape).
+    if calib_microbatch_size > 1 and isinstance(ref_log_probs, list) and ref_log_probs:
+        regrouped: list[torch.Tensor] = []
+        for start in range(0, len(ref_log_probs), calib_microbatch_size):
+            window = ref_log_probs[start:start + calib_microbatch_size]
+            if all(isinstance(t, torch.Tensor) for t in window):
+                regrouped.append(torch.cat(list(window), dim=0))
+            else:
+                regrouped.extend(window)
+        ref_log_probs = regrouped
     entries = _entries_for_candidate_flips(flips, assignment_c)
     batches = _lane_microbatches_for_entries(
         entries,
@@ -2971,9 +3216,14 @@ def measure_lane_batched_kl_deltas(
         ]
 
     measured: list[float] = []
+    _lb_t0 = time.monotonic()
+    _lb_total = sum(1 for b in batches if b)
+    _lb_idx = 0
     for lanes in batches:
         if not lanes:
             continue
+        _lb_idx += 1
+        _lb_t_batch = time.monotonic()
         target_names = {lane.name for lane in lanes}
         context_assignment = {
             name: fmt
@@ -3000,42 +3250,61 @@ def measure_lane_batched_kl_deltas(
             for name in sorted(target_names)
         ]
         group_quant_cache = (
-            build_quant_weight_cache(
-                model,
-                cache_entries,
-                list({id(spec): spec for spec in specs_by_name.values()}.values()),
+            (
+                _prefetch_production_weight_cache(
+                    production_weight_cache,
+                    cache_entries,
+                )
+                or build_quant_weight_cache(
+                    model,
+                    cache_entries,
+                    list({id(spec): spec for spec in specs_by_name.values()}.values()),
+                    production_weight_cache=production_weight_cache,
+                )
             )
             if use_prequant_cache
             else None
         )
-        lane_depths = [layer_depth(lane.name) for lane in lanes]
+        target_depths = [layer_depth(lane.name) for lane in lanes]
         replay_layer_idx = (
-            min(depth for depth in lane_depths if depth is not None)
+            min(depth for depth in target_depths if depth is not None)
             if (
                 replay_cache is not None
-                and lane_depths
-                and all(depth is not None for depth in lane_depths)
+                and target_depths
+                and all(depth is not None for depth in target_depths)
             )
             else None
         )
-        use_replay_cache = (
-            replay_cache is not None
-            and replay_layer_idx is not None
-            and 0 <= replay_layer_idx < len(replay_cache.layers)
-            and _env_flag_enabled(
+        replay_cache_enabled = (
+            _env_flag_enabled(
                 "PRISMAQUANT_COORD_REPLAY_CACHE",
                 default=False,
             )
+            if use_replay_cache is None
+            else bool(use_replay_cache)
         )
-        if use_replay_cache:
-            use_coord_lane_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
-                "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
-                default="auto",
-                call_count=1,
-                min_calls=8,
-            )
+        use_replay_cache_now = (
+            replay_cache is not None
+            and replay_layer_idx is not None
+            and 0 <= replay_layer_idx < len(replay_cache.layers)
+            and replay_cache_enabled
+        )
+        if use_replay_cache_now:
+            if use_cuda_graphs is None:
+                use_coord_lane_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+                    "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+                    default="auto",
+                    call_count=1,
+                    min_calls=8,
+                )
+            else:
+                use_coord_lane_cuda_graphs = bool(use_cuda_graphs)
             target_hooks = None
-            kl_totals = [0.0 for _lane in lanes]
+            # GPU-resident accumulator: defer the GPU→CPU sync until the
+            # whole lane-batch finishes, instead of once per (lane × sample).
+            kl_totals = torch.zeros(
+                len(lanes), device=device, dtype=torch.float32,
+            )
             batch_count = (
                 int(calib_ids.size(0))
                 if isinstance(calib_ids, torch.Tensor)
@@ -3055,6 +3324,8 @@ def measure_lane_batched_kl_deltas(
                         lanes,
                         base_batch=base_batch,
                         quant_weight_cache=group_quant_cache,
+                        include_activation_quant=include_activation_quant,
+                        activation_max_abs=activation_max_abs,
                     )
                     target_hooks.install()
                     lane_key = tuple(
@@ -3092,8 +3363,11 @@ def measure_lane_batched_kl_deltas(
                             int(len(lanes)),
                             int(base_batch),
                             effective_kl_scope,
+                            bool(include_activation_quant),
                             lane_key,
                             tuple(sorted(target_names)),
+                            id(production_weight_cache)
+                            if production_weight_cache is not None else 0,
                         ),
                         _replay_forward,
                         enabled=use_coord_lane_cuda_graphs,
@@ -3114,30 +3388,55 @@ def measure_lane_batched_kl_deltas(
                             f"batching: shape={tuple(logits.shape)} "
                             f"base_batch={base_batch} lanes={len(lanes)}"
                         )
-                    for idx, chunk in enumerate(chunks):
-                        for batch_index, teacher in enumerate(ref_log_probs):
-                            teacher = teacher.to(chunk.device)
-                            if teacher.dim() >= 3 and not full_sequence_kl:
-                                teacher = teacher[:, -1:, :]
-                            kl_totals[idx] += float(
-                                kl_divergence(
-                                    chunk[batch_index:batch_index + 1],
-                                    teacher,
-                                ).item()
-                            )
+                    # Vectorize the per-lane KL across all lanes in one batched
+                    # GPU op AND keep ``kl_totals`` on the GPU so the entire
+                    # lane-batch incurs a single GPU→CPU sync at the end (in
+                    # measured.extend), instead of ``lanes × cal_samples``
+                    # times via .item().  Profiling on Qwen3-0.6B showed this
+                    # Python-side sync was the dominant cost.
+                    stacked = torch.stack(chunks, dim=0)
+                    for batch_index, teacher in enumerate(ref_log_probs):
+                        teacher = teacher.to(stacked.device).float()
+                        if teacher.dim() >= 3 and not full_sequence_kl:
+                            teacher = teacher[:, -1:, :]
+                        student_log_probs = torch.nn.functional.log_softmax(
+                            stacked[:, batch_index:batch_index + 1].float(),
+                            dim=-1,
+                        )
+                        teacher_probs = teacher.exp()
+                        kl_per_pos = (
+                            teacher_probs * (teacher - student_log_probs)
+                        ).sum(dim=-1)
+                        kl_totals += kl_per_pos.mean(
+                            dim=tuple(range(1, kl_per_pos.dim()))
+                        )
                 missing_targets = set(target_hooks.missing if target_hooks else [])
                 if missing_targets:
                     raise RuntimeError(
                         "target module missing or unsupported for lane-batched KL: "
                         + ", ".join(sorted(missing_targets))
                     )
+                # Single sync per lane-batch.
+                kl_totals_local = kl_totals.detach().cpu().tolist()
                 measured.extend(
                     total / max(batch_count, 1)
-                    for total in kl_totals
+                    for total in kl_totals_local
                 )
             finally:
                 if target_hooks is not None:
                     target_hooks.remove()
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            _lb_dt = time.monotonic() - _lb_t_batch
+            _lb_elapsed = time.monotonic() - _lb_t0
+            _lb_eta = (_lb_elapsed / max(_lb_idx, 1)) * (_lb_total - _lb_idx)
+            print(
+                f"[lane-kl][replay] batch {_lb_idx}/{_lb_total} "
+                f"lanes={len(lanes)} replay_layer={int(replay_layer_idx)} "
+                f"dt={_lb_dt:.1f}s elapsed={_lb_elapsed:.0f}s "
+                f"ETA={_lb_eta:.0f}s",
+                flush=True,
+            )
             continue
 
         cache_dir = Path(tempfile.mkdtemp(
@@ -3151,6 +3450,8 @@ def measure_lane_batched_kl_deltas(
             input_rows=0,
             cal_hash=cal_hash,
             profile=profile,
+            production_weight_cache=production_weight_cache,
+            include_activation_quant=include_activation_quant,
         )
         frozen_context = (
             context_hooks.frozen_weight_cache()
@@ -3158,26 +3459,61 @@ def measure_lane_batched_kl_deltas(
             else nullcontext(context_hooks)
         )
         target_hooks = None
-        kl_totals = [0.0 for _lane in lanes]
+        # GPU-resident accumulator: defer the GPU→CPU sync until the whole
+        # lane-batch finishes, instead of once per (lane × cal sample).
+        kl_totals = torch.zeros(
+            len(lanes), device=device, dtype=torch.float32,
+        )
         batch_count = 0
         frozen_context_entered = False
-        use_coord_lane_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
-            "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
-            default="auto",
-            call_count=calibration_call_count,
-            min_calls=16,
-        )
+        materialized_cm = nullcontext()
+        materialized_entered = False
+        if use_cuda_graphs is None:
+            use_coord_lane_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+                "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+                default="auto",
+                call_count=calibration_call_count,
+                min_calls=16,
+            )
+        else:
+            use_coord_lane_cuda_graphs = bool(use_cuda_graphs)
         rng_cm = torch.random.fork_rng(devices=rng_devices)
         try:
             frozen_context.__enter__()
             frozen_context_entered = True
             context_hooks.install()
+            # Materialize the floor-format frozen weights into the model
+            # parameters for the entire calibration loop.  Without this,
+            # _apply_weight_quant clones every context-Linear's weight
+            # PER FORWARD and the post_hook restores it — for a 0.6B
+            # model with ~190 context Linears that's ~750 MB of GPU
+            # clone/restore per forward × 128 cal samples × 19 batches
+            # = the dominant wall-time cost on small models.
+            # measure_assignment_kl already uses this; lane-batched KL
+            # was missing it.
+            materialized_cm = nullcontext()
+            if (
+                device.type == "cuda"
+                and torch.cuda.is_available()
+                and use_frozen_perturbed_cache
+                and context_hooks._frozen_weight_cache is not None
+            ):
+                materialized_cm = context_hooks.materialized_frozen_weights()
+            materialized_cm.__enter__()
+            materialized_entered = True
             with rng_cm:
                 torch.manual_seed(0)
                 if device.type == "cuda" and torch.cuda.is_available():
                     torch.cuda.manual_seed_all(0)
+                _fwd_t0 = None
+                _fwd_count = 0
+                _fwd_log = []
                 for batch_index, (args, kwargs) in enumerate(
-                    iter_calibration_forwards(calib_ids, device)
+                    iter_calibration_forwards(
+                        calib_ids,
+                        device,
+                        microbatch_size=calib_microbatch_size,
+                    )
                 ):
                     base_batch = _first_tensor_batch_size(args, kwargs)
                     if target_hooks is None:
@@ -3188,6 +3524,8 @@ def measure_lane_batched_kl_deltas(
                             lanes,
                             base_batch=base_batch,
                             quant_weight_cache=group_quant_cache,
+                            include_activation_quant=include_activation_quant,
+                            activation_max_abs=activation_max_abs,
                         )
                         target_hooks.install()
                     rep_args, rep_kwargs = _repeat_inputs_for_lanes(
@@ -3210,6 +3548,9 @@ def measure_lane_batched_kl_deltas(
 
                     # In private-pool no-clone mode this static output is split
                     # and reduced to scalar KLs before another replay.
+                    if device.type == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _fwd_start = time.monotonic()
                     logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
                         "coord-lane-full",
                         (
@@ -3220,8 +3561,11 @@ def measure_lane_batched_kl_deltas(
                             int(len(lanes)),
                             int(base_batch),
                             effective_kl_scope,
+                            bool(include_activation_quant),
                             lane_key,
                             tuple(sorted(target_names)),
+                            id(production_weight_cache)
+                            if production_weight_cache is not None else 0,
                         ),
                         _full_forward,
                         *rep_args,
@@ -3243,32 +3587,70 @@ def measure_lane_batched_kl_deltas(
                             f"batching: shape={tuple(logits.shape)} "
                             f"base_batch={base_batch} lanes={len(lanes)}"
                         )
-                    teacher = ref_log_probs[batch_index]
+                    teacher = ref_log_probs[batch_index].to(logits.device)
                     if teacher.dim() >= 3 and not full_sequence_kl:
                         teacher = teacher[:, -1:, :]
-                    for idx, chunk in enumerate(chunks):
-                        kl_totals[idx] += float(
-                            kl_divergence(chunk, teacher).item()
+                    # Vectorize the per-lane KL across all lanes in one batched
+                    # GPU op AND keep ``kl_totals`` on the GPU so the entire
+                    # lane-batch incurs a single GPU→CPU sync at the end (in
+                    # measured.extend), instead of ``lanes × cal_samples``
+                    # times via .item().
+                    stacked = torch.stack(chunks, dim=0)
+                    student_log_probs = torch.nn.functional.log_softmax(
+                        stacked.float(), dim=-1,
+                    )
+                    teacher_fp32 = teacher.float()
+                    teacher_probs = teacher_fp32.exp()
+                    kl_per_pos = (
+                        teacher_probs * (teacher_fp32 - student_log_probs)
+                    ).sum(dim=-1)
+                    kl_totals += (
+                        kl_per_pos.mean(dim=tuple(range(1, kl_per_pos.dim())))
+                        * float(base_batch)
+                    )
+                    if device.type == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _fwd_dt = time.monotonic() - _fwd_start
+                    _fwd_count += 1
+                    if _fwd_count <= 5 or _fwd_count % 32 == 0:
+                        print(
+                            f"[fwd-time] cal {_fwd_count}/{int(calibration_call_count)} "
+                            f"dt={_fwd_dt*1000:.0f}ms",
+                            flush=True,
                         )
-                    batch_count += 1
+                    batch_count += int(base_batch)
             missing_targets = set(target_hooks.missing if target_hooks else [])
             if missing_targets:
                 raise RuntimeError(
                     "target module missing or unsupported for lane-batched KL: "
                     + ", ".join(sorted(missing_targets))
                 )
+            # Single sync per lane-batch.
+            kl_totals_local = kl_totals.detach().cpu().tolist()
             measured.extend(
                 total / max(batch_count, 1)
-                for total in kl_totals
+                for total in kl_totals_local
             )
         finally:
             if target_hooks is not None:
                 target_hooks.remove()
             if context_hooks.installed:
                 context_hooks.remove()
+            if materialized_entered:
+                materialized_cm.__exit__(None, None, None)
             if frozen_context_entered:
                 frozen_context.__exit__(None, None, None)
             shutil.rmtree(cache_dir, ignore_errors=True)
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        _lb_dt = time.monotonic() - _lb_t_batch
+        _lb_elapsed = time.monotonic() - _lb_t0
+        _lb_eta = (_lb_elapsed / max(_lb_idx, 1)) * (_lb_total - _lb_idx)
+        print(
+            f"[lane-kl] batch {_lb_idx}/{_lb_total} lanes={len(lanes)} "
+            f"dt={_lb_dt:.1f}s elapsed={_lb_elapsed:.0f}s ETA={_lb_eta:.0f}s",
+            flush=True,
+        )
 
     if len(measured) != len(candidate_flips):
         raise RuntimeError(
@@ -3285,6 +3667,476 @@ def _normalise_override_set(
         str(name): fr.canonical_format_name(fmt)
         for name, fmt in sorted(override.items())
     }
+
+
+@torch.no_grad()
+def measure_override_set_kl(
+    model: nn.Module,
+    baseline_assignment: Mapping[str, str],
+    candidate_overrides: list[Mapping[str, str]],
+    calib_ids: torch.Tensor,
+    ref_log_probs: list[torch.Tensor],
+    *,
+    work_root: Path,
+    max_lanes_per_batch: int = 16,
+    profile=None,
+    replay_cache: LayerHiddenStateCache | None = None,
+    kl_scope: KLScope | None = None,
+    calib_microbatch_size: int = 1,
+    include_activation_quant: bool = True,
+    use_cuda_graphs: bool | None = None,
+    use_replay_cache: bool | None = None,
+    production_weight_cache=None,
+) -> list[float]:
+    """Measure end-KL for simultaneous multi-Linear override candidates.
+
+    Each lane is a complete override mapping, e.g. q/k/v all set to MXFP8 for
+    the vLLM-packed qkv decision unit.  The teacher remains the original BF16
+    reference model; all non-target modules stay at ``baseline_assignment``.
+    """
+    if not candidate_overrides:
+        return []
+
+    effective_kl_scope = resolve_kl_scope(kl_scope)
+    full_sequence_kl = effective_kl_scope == "full_sequence"
+    assignment_c = _canonical_assignment(baseline_assignment)
+    overrides = [_normalise_override_set(override) for override in candidate_overrides]
+
+    format_names = set(assignment_c.values())
+    for override in overrides:
+        format_names.update(override.values())
+    specs_by_name = _specs_by_canonical_name(format_names)
+    activation_max_abs = _production_activation_max_abs(production_weight_cache)
+
+    device = next(model.parameters()).device
+    requested_max_lanes_per_batch = max(int(max_lanes_per_batch), 1)
+    calib_microbatch_size = max(int(calib_microbatch_size), 1)
+    max_lanes_per_batch = _adjust_l3_max_lanes_for_memory(
+        requested_max_lanes_per_batch,
+        calib_ids,
+        device,
+        calib_microbatch_size=calib_microbatch_size,
+    )
+    if calib_microbatch_size > 1 and isinstance(ref_log_probs, list) and ref_log_probs:
+        regrouped: list[torch.Tensor] = []
+        for start in range(0, len(ref_log_probs), calib_microbatch_size):
+            window = ref_log_probs[start:start + calib_microbatch_size]
+            if all(isinstance(t, torch.Tensor) for t in window):
+                regrouped.append(torch.cat(list(window), dim=0))
+            else:
+                regrouped.extend(window)
+        ref_log_probs = regrouped
+
+    batches = _override_sets_microbatches(overrides, max_lanes_per_batch)
+    cal_hash = calibration_data_hash(calib_ids)
+    tmp_parent = str(work_root) if work_root is not None else None
+    use_prequant_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_PREQUANT_CACHE",
+        default=True,
+    )
+    use_prequant_cache = _maybe_disable_l3_prequant_cache_for_memory(
+        device, use_prequant_cache)
+    use_frozen_perturbed_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
+        default=True,
+    )
+    use_frozen_perturbed_cache = _maybe_disable_l3_frozen_cache_for_memory(
+        device, use_frozen_perturbed_cache)
+    calibration_call_count = max(
+        len(ref_log_probs),
+        _calibration_call_count(calib_ids),
+    )
+    assignment_key = tuple(sorted(assignment_c.items()))
+    rng_devices = []
+    if device.type == "cuda" and torch.cuda.is_available():
+        rng_devices = [
+            device.index if device.index is not None else torch.cuda.current_device()
+        ]
+
+    measured: list[float] = []
+    _t0 = time.monotonic()
+    _total = sum(1 for batch in batches if batch)
+    for batch_idx, lane_overrides in enumerate(batches, start=1):
+        if not lane_overrides:
+            continue
+        _batch_t0 = time.monotonic()
+        target_names = {
+            name
+            for override in lane_overrides
+            for name in override
+        }
+        context_assignment = {
+            name: fmt
+            for name, fmt in assignment_c.items()
+            if name not in target_names
+        }
+        cache_entries = [
+            L3NeighborhoodEntry(
+                name=name,
+                current_format=assignment_c.get(name, "BF16"),
+                formats=tuple(
+                    sorted({
+                        assignment_c.get(name, "BF16"),
+                        *[
+                            override[name]
+                            for override in lane_overrides
+                            if name in override
+                        ],
+                    })
+                ),
+                margin=0.0,
+                l2_current_cost=0.0,
+            )
+            for name in sorted(target_names)
+        ]
+        group_quant_cache = (
+            (
+                _prefetch_production_weight_cache(
+                    production_weight_cache,
+                    cache_entries,
+                )
+                or build_quant_weight_cache(
+                    model,
+                    cache_entries,
+                    list({id(spec): spec for spec in specs_by_name.values()}.values()),
+                    production_weight_cache=production_weight_cache,
+                )
+            )
+            if use_prequant_cache
+            else None
+        )
+        target_depths = [layer_depth(name) for name in target_names]
+        replay_layer_idx = (
+            min(depth for depth in target_depths if depth is not None)
+            if (
+                replay_cache is not None
+                and target_depths
+                and all(depth is not None for depth in target_depths)
+            )
+            else None
+        )
+        replay_cache_enabled = (
+            _env_flag_enabled(
+                "PRISMAQUANT_COORD_REPLAY_CACHE",
+                default=False,
+            )
+            if use_replay_cache is None
+            else bool(use_replay_cache)
+        )
+        use_replay_cache_now = (
+            replay_cache is not None
+            and replay_layer_idx is not None
+            and 0 <= replay_layer_idx < len(replay_cache.layers)
+            and replay_cache_enabled
+        )
+
+        if use_replay_cache_now:
+            if use_cuda_graphs is None:
+                use_coord_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+                    "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+                    default="auto",
+                    call_count=1,
+                    min_calls=8,
+                )
+            else:
+                use_coord_cuda_graphs = bool(use_cuda_graphs)
+            base_batch = (
+                int(calib_ids.size(0))
+                if isinstance(calib_ids, torch.Tensor)
+                else len(ref_log_probs)
+            )
+            target_hooks = None
+            rng_cm = torch.random.fork_rng(devices=rng_devices)
+            try:
+                with rng_cm:
+                    torch.manual_seed(0)
+                    if device.type == "cuda" and torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(0)
+                    target_hooks = _OverrideSetTargetHooks(
+                        model,
+                        assignment_c,
+                        specs_by_name,
+                        lane_overrides,
+                        base_batch=base_batch,
+                        quant_weight_cache=group_quant_cache,
+                        include_activation_quant=include_activation_quant,
+                        activation_max_abs=activation_max_abs,
+                    )
+                    target_hooks.install()
+
+                    def _replay_forward():
+                        logits = _extract_logits(
+                            _override_replay_cache_logits(
+                                replay_cache,
+                                int(replay_layer_idx),
+                                lane_count=len(lane_overrides),
+                                base_batch=base_batch,
+                                target_names=target_names,
+                            )
+                        )
+                        if logits.dim() >= 3:
+                            if full_sequence_kl:
+                                return logits.clone()
+                            return logits[:, -1:, :].clone()
+                        return logits
+
+                    logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
+                        "coord-override-replay",
+                        (
+                            "override-replay",
+                            id(model),
+                            id(replay_cache),
+                            assignment_key,
+                            cal_hash,
+                            int(replay_layer_idx),
+                            int(len(lane_overrides)),
+                            int(base_batch),
+                            effective_kl_scope,
+                            bool(include_activation_quant),
+                            _override_sets_graph_key(lane_overrides),
+                            tuple(sorted(target_names)),
+                            id(production_weight_cache)
+                            if production_weight_cache is not None else 0,
+                        ),
+                        _replay_forward,
+                        enabled=use_coord_cuda_graphs,
+                        device=device,
+                        keepalive=(
+                            replay_cache,
+                            target_hooks,
+                            group_quant_cache,
+                        ),
+                    )
+                    logits = _extract_logits(logits)
+                    if logits.dim() >= 3 and not full_sequence_kl:
+                        logits = logits[:, -1:, :]
+                    chunks = _split_lanes(
+                        logits.detach(), base_batch, len(lane_overrides),
+                    )
+                    if chunks is None:
+                        raise RuntimeError(
+                            "override-set replay logits did not preserve lane "
+                            f"batching: shape={tuple(logits.shape)} "
+                            f"base_batch={base_batch} lanes={len(lane_overrides)}"
+                        )
+                    teacher = torch.cat(
+                        [t.to(device).float() for t in ref_log_probs],
+                        dim=0,
+                    )
+                    if teacher.dim() >= 3 and not full_sequence_kl:
+                        teacher = teacher[:, -1:, :]
+                    stacked = torch.stack(chunks, dim=0).float()
+                    student_log_probs = F.log_softmax(stacked, dim=-1)
+                    teacher_probs = teacher.exp().unsqueeze(0)
+                    teacher_log_probs = teacher.unsqueeze(0)
+                    kl_per_pos = (
+                        teacher_probs * (teacher_log_probs - student_log_probs)
+                    ).sum(dim=-1)
+                    kl_values = kl_per_pos.mean(
+                        dim=tuple(range(1, kl_per_pos.dim()))
+                    )
+                    measured.extend(float(v) for v in kl_values.detach().cpu())
+                missing_targets = set(target_hooks.missing if target_hooks else [])
+                if missing_targets:
+                    raise RuntimeError(
+                        "target module missing or unsupported for override-set KL: "
+                        + ", ".join(sorted(missing_targets))
+                    )
+            finally:
+                if target_hooks is not None:
+                    target_hooks.remove()
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            dt = time.monotonic() - _batch_t0
+            elapsed = time.monotonic() - _t0
+            eta = (elapsed / max(batch_idx, 1)) * (_total - batch_idx)
+            print(
+                f"[override-kl][replay] batch {batch_idx}/{_total} "
+                f"lanes={len(lane_overrides)} targets={len(target_names)} "
+                f"replay_layer={int(replay_layer_idx)} dt={dt:.1f}s "
+                f"elapsed={elapsed:.0f}s ETA={eta:.0f}s",
+                flush=True,
+            )
+            continue
+
+        cache_dir = Path(tempfile.mkdtemp(
+            prefix="prismaquant_override_lanes_",
+            dir=tmp_parent,
+        ))
+        context_hooks = PerturbedActivationCache(
+            model,
+            context_assignment,
+            cache_dir,
+            input_rows=0,
+            cal_hash=cal_hash,
+            profile=profile,
+            production_weight_cache=production_weight_cache,
+            include_activation_quant=include_activation_quant,
+        )
+        frozen_context = (
+            context_hooks.frozen_weight_cache()
+            if use_frozen_perturbed_cache
+            else nullcontext(context_hooks)
+        )
+        target_hooks = None
+        kl_totals = torch.zeros(
+            len(lane_overrides), device=device, dtype=torch.float32,
+        )
+        batch_count = 0
+        frozen_context_entered = False
+        materialized_cm = nullcontext()
+        materialized_entered = False
+        if use_cuda_graphs is None:
+            use_coord_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+                "PRISMAQUANT_COORD_LANE_CUDA_GRAPHS",
+                default="auto",
+                call_count=calibration_call_count,
+                min_calls=16,
+            )
+        else:
+            use_coord_cuda_graphs = bool(use_cuda_graphs)
+        rng_cm = torch.random.fork_rng(devices=rng_devices)
+        try:
+            frozen_context.__enter__()
+            frozen_context_entered = True
+            context_hooks.install()
+            if (
+                device.type == "cuda"
+                and torch.cuda.is_available()
+                and use_frozen_perturbed_cache
+                and context_hooks._frozen_weight_cache is not None
+            ):
+                materialized_cm = context_hooks.materialized_frozen_weights()
+            materialized_cm.__enter__()
+            materialized_entered = True
+            with rng_cm:
+                torch.manual_seed(0)
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(0)
+                for batch_index, (args, kwargs) in enumerate(
+                    iter_calibration_forwards(
+                        calib_ids,
+                        device,
+                        microbatch_size=calib_microbatch_size,
+                    )
+                ):
+                    base_batch = _first_tensor_batch_size(args, kwargs)
+                    if target_hooks is None:
+                        target_hooks = _OverrideSetTargetHooks(
+                            model,
+                            assignment_c,
+                            specs_by_name,
+                            lane_overrides,
+                            base_batch=base_batch,
+                            quant_weight_cache=group_quant_cache,
+                            include_activation_quant=include_activation_quant,
+                            activation_max_abs=activation_max_abs,
+                        )
+                        target_hooks.install()
+                    rep_args, rep_kwargs = _repeat_inputs_for_lanes(
+                        args,
+                        kwargs,
+                        len(lane_overrides),
+                    )
+
+                    def _full_forward(*call_args, **call_kwargs):
+                        logits = _extract_logits(model(*call_args, **call_kwargs))
+                        if logits.dim() >= 3:
+                            if full_sequence_kl:
+                                return logits.clone()
+                            return logits[:, -1:, :].clone()
+                        return logits
+
+                    logits = _COORD_LANE_CUDA_GRAPH_REGISTRY.run(
+                        "coord-override-full",
+                        (
+                            "override-full",
+                            id(model),
+                            assignment_key,
+                            cal_hash,
+                            int(len(lane_overrides)),
+                            int(base_batch),
+                            effective_kl_scope,
+                            bool(include_activation_quant),
+                            _override_sets_graph_key(lane_overrides),
+                            tuple(sorted(target_names)),
+                            id(production_weight_cache)
+                            if production_weight_cache is not None else 0,
+                        ),
+                        _full_forward,
+                        *rep_args,
+                        enabled=use_coord_cuda_graphs,
+                        device=device,
+                        keepalive=(
+                            context_hooks,
+                            target_hooks,
+                            group_quant_cache,
+                        ),
+                        **rep_kwargs,
+                    )
+                    if logits.dim() >= 3 and not full_sequence_kl:
+                        logits = logits[:, -1:, :]
+                    chunks = _split_lanes(
+                        logits.detach(), base_batch, len(lane_overrides),
+                    )
+                    if chunks is None:
+                        raise RuntimeError(
+                            "override-set KL logits did not preserve lane "
+                            f"batching: shape={tuple(logits.shape)} "
+                            f"base_batch={base_batch} lanes={len(lane_overrides)}"
+                        )
+                    teacher = ref_log_probs[batch_index].to(logits.device).float()
+                    if teacher.dim() >= 3 and not full_sequence_kl:
+                        teacher = teacher[:, -1:, :]
+                    stacked = torch.stack(chunks, dim=0).float()
+                    student_log_probs = F.log_softmax(stacked, dim=-1)
+                    teacher_probs = teacher.exp().unsqueeze(0)
+                    teacher_log_probs = teacher.unsqueeze(0)
+                    kl_per_pos = (
+                        teacher_probs * (teacher_log_probs - student_log_probs)
+                    ).sum(dim=-1)
+                    kl_totals += kl_per_pos.mean(
+                        dim=tuple(range(1, kl_per_pos.dim()))
+                    ) * float(base_batch)
+                    batch_count += int(base_batch)
+            missing_targets = set(target_hooks.missing if target_hooks else [])
+            if missing_targets:
+                raise RuntimeError(
+                    "target module missing or unsupported for override-set KL: "
+                    + ", ".join(sorted(missing_targets))
+                )
+            measured.extend(
+                total / max(batch_count, 1)
+                for total in kl_totals.detach().cpu().tolist()
+            )
+        finally:
+            if target_hooks is not None:
+                target_hooks.remove()
+            if context_hooks.installed:
+                context_hooks.remove()
+            if materialized_entered:
+                materialized_cm.__exit__(None, None, None)
+            if frozen_context_entered:
+                frozen_context.__exit__(None, None, None)
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        dt = time.monotonic() - _batch_t0
+        elapsed = time.monotonic() - _t0
+        eta = (elapsed / max(batch_idx, 1)) * (_total - batch_idx)
+        print(
+            f"[override-kl] batch {batch_idx}/{_total} "
+            f"lanes={len(lane_overrides)} targets={len(target_names)} "
+            f"dt={dt:.1f}s elapsed={elapsed:.0f}s ETA={eta:.0f}s",
+            flush=True,
+        )
+
+    if len(measured) != len(candidate_overrides):
+        raise RuntimeError(
+            "override-set KL produced "
+            f"{len(measured)} results for {len(candidate_overrides)} candidates"
+        )
+    return measured
 
 
 @torch.no_grad()

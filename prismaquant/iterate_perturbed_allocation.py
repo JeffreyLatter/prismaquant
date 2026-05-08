@@ -8483,10 +8483,14 @@ def measure_assignment_kl(
     production_weight_cache=None,
     rng_seed: int | None = 0,
     kl_scope: KLScope | None = None,
+    include_activation_quant: bool = True,
+    stream_ref_log_probs: bool = False,
+    use_cuda_graphs: bool | None = None,
 ) -> float:
     device = next(model.parameters()).device
     calib_ids = _prepare_kl_tensor_inputs(calib_ids, device)
-    ref_log_probs = _prepare_ref_log_probs_for_kl(ref_log_probs, device)
+    if not stream_ref_log_probs:
+        ref_log_probs = _prepare_ref_log_probs_for_kl(ref_log_probs, device)
     effective_kl_scope = resolve_kl_scope(kl_scope)
     if use_frozen_weight_cache and not _env_flag_enabled(
         "PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE",
@@ -8496,9 +8500,9 @@ def measure_assignment_kl(
     use_frozen_weight_cache = _maybe_disable_frozen_weight_cache_for_memory(
         device, use_frozen_weight_cache)
     hooks = perturbed_cache
+    cal_hash = calibration_data_hash(calib_ids)
     if hooks is None:
         cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_kl_hooks_", dir=str(work_root)))
-        cal_hash = calibration_data_hash(calib_ids)
         hooks = PerturbedActivationCache(
             model,
             assignment,
@@ -8507,6 +8511,7 @@ def measure_assignment_kl(
             cal_hash=cal_hash,
             profile=profile,
             production_weight_cache=production_weight_cache,
+            include_activation_quant=include_activation_quant,
         )
         strict_coverage_default = (
             production_weight_cache is not None
@@ -8539,18 +8544,24 @@ def measure_assignment_kl(
                     f"{hooks.skipped[:3]}"
                 )
     values = []
-    use_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
-        "PRISMAQUANT_KL_CUDA_GRAPHS",
-        default="auto",
-        call_count=int(calib_ids.size(0)),
-        min_calls=16,
-    )
+    if use_cuda_graphs is None:
+        use_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
+            "PRISMAQUANT_KL_CUDA_GRAPHS",
+            default="auto",
+            call_count=int(calib_ids.size(0)),
+            min_calls=16,
+        )
+    else:
+        use_cuda_graphs = bool(use_cuda_graphs)
     graph_key = (
         id(model),
         assignment_hash(assignment),
         bool(use_frozen_weight_cache),
         effective_kl_scope,
+        bool(include_activation_quant),
         rng_seed,
+        cal_hash,
+        id(production_weight_cache) if production_weight_cache is not None else 0,
     )
     cache_cm = nullcontext()
     if use_frozen_weight_cache and hooks._frozen_weight_cache is None:
@@ -8607,6 +8618,7 @@ def measure_assignment_kl(
                             keepalive=(hooks,),
                         )
                         teacher = ref_log_probs[i] if full_seq else ref_log_probs[i][:, -1:, :]
+                        teacher = _move_tensor_tree_to_device(teacher, device)
                         values.append(float(kl_divergence(logits, teacher).item()))
             finally:
                 if installed_here:

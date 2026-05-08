@@ -32,6 +32,7 @@ Design summary:
 from __future__ import annotations
 
 import inspect
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
@@ -40,9 +41,17 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
+from prismaquant.perturbed_x_cache import _maybe_clip_activations
 
 
 _HIDDEN_SENTINEL = object()
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -293,7 +302,12 @@ class LayerHiddenStateCache:
         self._layer_call_templates: list[_LayerCallTemplate] = []
         self._linear_targets_by_name, self._linear_targets_by_key = _build_linear_weight_targets(model)
         self._baseline_weight_values: dict[_TargetKey, tuple[_WeightTarget, torch.Tensor]] = {}
-        self._activation_quantizers: dict[int, tuple[nn.Module, fr.FormatSpec]] = {}
+        self._activation_quantizers: dict[
+            int, tuple[nn.Module, fr.FormatSpec, str]
+        ] = {}
+        self._activation_max_abs: dict[str, float] = {}
+        self._production_weight_cache = None
+        self.include_activation_quant = True
         self._device: torch.device | None = None
         self._dtype: torch.dtype | None = None
 
@@ -304,6 +318,8 @@ class LayerHiddenStateCache:
         *,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        include_activation_quant: bool = True,
+        production_weight_cache=None,
     ) -> None:
         """Run a baseline forward and cache the input of each decoder layer."""
         torch_device = torch.device(device)
@@ -313,6 +329,13 @@ class LayerHiddenStateCache:
         self.invalidate()
         self._device = torch_device
         self._dtype = dtype
+        self.include_activation_quant = bool(include_activation_quant)
+        self._production_weight_cache = production_weight_cache
+        self._activation_max_abs = dict(
+            getattr(production_weight_cache, "activation_max_abs", None)
+            or getattr(production_weight_cache, "activation_scales", None)
+            or {}
+        )
         self.baseline_assignment = {str(k): str(v) for k, v in baseline_assignment.items()}
         self.model.to(device=torch_device, dtype=dtype)
         self.model.eval()
@@ -416,7 +439,7 @@ class LayerHiddenStateCache:
             )
 
     def _prepare_baseline_execution(self) -> None:
-        specs_by_target: dict[_TargetKey, tuple[_WeightTarget, fr.FormatSpec]] = {}
+        specs_by_target: dict[_TargetKey, tuple[_WeightTarget, fr.FormatSpec, str]] = {}
         self.missing_baseline_names = []
         self.skipped_activation_quant = []
         for name, fmt in self.baseline_assignment.items():
@@ -429,41 +452,72 @@ class LayerHiddenStateCache:
             if existing is not None and existing[1].name != spec.name:
                 names = ", ".join(target.names)
                 raise ValueError(f"conflicting baseline formats for shared Linear {names}")
-            specs_by_target[target.key] = (target, spec)
+            specs_by_target[target.key] = (target, spec, name)
 
         self._baseline_weight_values = {}
         activation_specs: dict[int, tuple[nn.Module, fr.FormatSpec, list[str]]] = {}
         activation_conflicts: set[int] = set()
-        for key, (target, spec) in specs_by_target.items():
+        for key, (target, spec, assignment_name) in specs_by_target.items():
             param = getattr(target.module, target.attr)
             if not isinstance(param, torch.nn.Parameter):
                 continue
-            quantized = spec.quantize_dequantize(param.data.detach().clone()).to(
-                device=param.device,
-                dtype=param.dtype,
-            ).contiguous()
+            canonical = fr.canonical_format_name(spec.name)
+            production = (
+                self._production_weight_cache.get(assignment_name, canonical)
+                if self._production_weight_cache is not None
+                else None
+            )
+            if production is not None:
+                quantized = production.to(
+                    device=param.device,
+                    dtype=param.dtype,
+                ).contiguous()
+            else:
+                if (
+                    self._production_weight_cache is not None
+                    and canonical not in {"BF16", "MXFP8", "MXFP8_E4M3"}
+                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                ):
+                    raise RuntimeError(
+                        f"production_weight_cache miss for "
+                        f"({assignment_name!r}, {canonical!r}); set "
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 to fall back "
+                        "to RTN, or rebuild the production cache."
+                    )
+                quantized = spec.quantize_dequantize(
+                    param.data.detach().clone()
+                ).to(
+                    device=param.device,
+                    dtype=param.dtype,
+                ).contiguous()
             self._baseline_weight_values[key] = (target, quantized)
-            if spec.act_bits is not None and spec.act_bits < 16:
+            if (
+                self.include_activation_quant
+                and spec.act_bits is not None
+                and spec.act_bits < 16
+            ):
                 if id(target.module) in activation_conflicts:
                     continue
                 entry = activation_specs.get(id(target.module))
                 if entry is None:
-                    activation_specs[id(target.module)] = (target.module, spec, [target.names[0]])
+                    activation_specs[id(target.module)] = (
+                        target.module, spec, [assignment_name]
+                    )
                 elif entry[1].name == spec.name:
-                    entry[2].append(target.names[0])
+                    entry[2].append(assignment_name)
                 else:
                     self.skipped_activation_quant.append(
                         {
                             "module": type(target.module).__name__,
-                            "weights": sorted([*entry[2], target.names[0]]),
+                            "weights": sorted([*entry[2], assignment_name]),
                             "formats": sorted({entry[1].name, spec.name}),
                         }
                     )
                     activation_specs.pop(id(target.module), None)
                     activation_conflicts.add(id(target.module))
         self._activation_quantizers = {
-            module_id: (module, spec)
-            for module_id, (module, spec, _names) in activation_specs.items()
+            module_id: (module, spec, names[0])
+            for module_id, (module, spec, names) in activation_specs.items()
         }
 
     @contextmanager
@@ -473,10 +527,14 @@ class LayerHiddenStateCache:
     ) -> Iterator[None]:
         handles = [
             module.register_forward_pre_hook(
-                self._make_activation_quant_hook(spec),
+                self._make_activation_quant_hook(
+                    spec,
+                    name,
+                    self._activation_max_abs,
+                ),
                 with_kwargs=True,
             )
-            for module, spec in self._activation_quantizers.values()
+            for module, spec, name in self._activation_quantizers.values()
         ]
         originals: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
         try:
@@ -507,11 +565,16 @@ class LayerHiddenStateCache:
                 handle.remove()
 
     @staticmethod
-    def _make_activation_quant_hook(spec: fr.FormatSpec):
+    def _make_activation_quant_hook(
+        spec: fr.FormatSpec,
+        name: str,
+        activation_max_abs: Mapping[str, float],
+    ):
         def _hook(_module, args, kwargs):
             where, key, hidden = _first_tensor_location(tuple(args), kwargs)
             if not isinstance(hidden, torch.Tensor):
                 return None
+            hidden = _maybe_clip_activations(hidden, activation_max_abs, name)
             quantized = spec.activation_quantize_dequantize(hidden)
             return _replace_tensor_input(tuple(args), kwargs, where, key, quantized)
 

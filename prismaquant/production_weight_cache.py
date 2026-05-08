@@ -135,6 +135,30 @@ class ProductionWeightCache:
                 if self._lru_paths is not None and evict_key in self._lru_paths:
                     self.weights[evict_key] = self._lru_paths[evict_key]
 
+    def _path_for_value(self, value: object) -> str:
+        path = str(value)
+        if self.cache_dir and not Path(path).is_absolute():
+            path = str(Path(self.cache_dir) / path)
+        return path
+
+    def _record_lru_load(
+        self,
+        key: tuple[str, str],
+        original_value: object,
+        tensor: torch.Tensor,
+    ) -> None:
+        if self._lru_order is None:
+            return
+        if self._lru_paths is None:
+            self._lru_paths = {}
+        if key not in self._lru_paths:
+            self._lru_paths[key] = str(original_value)
+        if key in self._lru_order:
+            self._lru_order.remove(key)
+        self._lru_bytes += tensor.element_size() * tensor.numel()
+        self._lru_order.append(key)
+        self._evict_to_budget()
+
     def prefetch(self, keys: Sequence[tuple[str, str]] | None = None,
                  max_workers: int = 4) -> int:
         """Eagerly load (a subset of) cache entries via a thread pool.
@@ -162,11 +186,27 @@ class ProductionWeightCache:
             return 0
 
         def _load_one(key):
-            self._resolve_to_tensor(key)
+            value = self.weights.get(key)
+            if value is None or isinstance(value, torch.Tensor):
+                return None
+            return (
+                key,
+                value,
+                torch.load(
+                    self._path_for_value(value),
+                    map_location="cpu",
+                    weights_only=True,
+                ),
+            )
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            list(pool.map(_load_one, keys))
-        return len(keys)
+            loaded = [item for item in pool.map(_load_one, keys) if item is not None]
+        for key, original_value, tensor in loaded:
+            if isinstance(self.weights.get(key), torch.Tensor):
+                continue
+            self.weights[key] = tensor
+            self._record_lru_load(key, original_value, tensor)
+        return len(loaded)
 
     def _resolve_to_tensor(self, key: tuple[str, str]) -> torch.Tensor | None:
         """Return the tensor at ``key`` (lazy-load from disk if needed).
@@ -184,19 +224,10 @@ class ProductionWeightCache:
                 self._lru_order.append(key)
             return v
         # Treat anything non-tensor as a filename / path.
-        path = str(v)
-        if self.cache_dir and not Path(path).is_absolute():
-            path = str(Path(self.cache_dir) / path)
+        path = self._path_for_value(v)
         loaded = torch.load(path, map_location="cpu", weights_only=True)
         self.weights[key] = loaded
-        if self._lru_order is not None:
-            # Remember the filename so we can evict back to it later.
-            if self._lru_paths is None:
-                self._lru_paths = {}
-            self._lru_paths[key] = str(v)
-            self._lru_bytes += loaded.element_size() * loaded.numel()
-            self._lru_order.append(key)
-            self._evict_to_budget()
+        self._record_lru_load(key, v, loaded)
         return loaded
 
     def get(self, name: str, fmt: str) -> torch.Tensor | None:

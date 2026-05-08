@@ -305,11 +305,24 @@ def load_wikitext_calibration(
 # precision loss in log_softmax (small probs round to 0, log(0) = -inf,
 # KL blows up to ~50).
 @torch.no_grad()
-def cache_reference_log_probs(model, calib_ids, device):
+def cache_reference_log_probs(
+    model,
+    calib_ids,
+    device,
+    *,
+    kl_scope: str = "full_sequence",
+):
+    if kl_scope not in {"last_token", "full_sequence"}:
+        raise ValueError(
+            "kl_scope must be 'last_token' or 'full_sequence', "
+            f"got {kl_scope!r}"
+        )
     log_probs = []
     for i in range(calib_ids.size(0)):
         batch = calib_ids[i:i + 1].to(device)
         logits = model(batch).logits
+        if kl_scope == "last_token":
+            logits = logits[:, -1:, :]
         log_probs.append(F.log_softmax(logits.float(), dim=-1))  # fp32!
     return log_probs
 
