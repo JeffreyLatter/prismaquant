@@ -99,6 +99,16 @@ class UnitOption:
     gain: float
 
 
+CandidateMeta = tuple[str, tuple[str, ...], tuple[LinearTarget, ...], str, float, float]
+
+
+@dataclass(frozen=True)
+class AdaptiveCandidateSearchResult:
+    candidate_kls: dict[int, float]
+    pruned_indices: tuple[int, ...]
+    diagnostics: dict[str, object]
+
+
 @dataclass(frozen=True)
 class FrontierPoint:
     budget_bits: float
@@ -1423,6 +1433,305 @@ def measure_candidate_overrides(
     return [ordered_values[inverse[idx]] for idx in range(len(inverse))]
 
 
+def _candidate_group_sort_key(candidate_meta: Sequence[CandidateMeta], idx: int) -> tuple:
+    unit, members, _member_targets, fmt, _baseline_bits, bits_total = candidate_meta[idx]
+    depths = [layer_depth(member) for member in members]
+    known_depths = [depth for depth in depths if depth is not None]
+    depth = min(known_depths) if known_depths else None
+    return (
+        fr.canonical_format_name(fmt),
+        depth is None,
+        depth if depth is not None else 1_000_000,
+        str(unit),
+        float(bits_total),
+        tuple(str(member) for member in members),
+    )
+
+
+def _merge_candidate_override_group(
+    candidate_overrides: Sequence[Mapping[str, str]],
+    indices: Sequence[int],
+) -> dict[str, str] | None:
+    merged: dict[str, str] = {}
+    for idx in indices:
+        for qname, fmt in candidate_overrides[idx].items():
+            canonical = fr.canonical_format_name(fmt)
+            existing = merged.get(str(qname))
+            if existing is not None and existing != canonical:
+                return None
+            merged[str(qname)] = canonical
+    return merged
+
+
+def _initial_candidate_groups(
+    candidate_overrides: Sequence[Mapping[str, str]],
+    candidate_meta: Sequence[CandidateMeta],
+    *,
+    group_size: int,
+) -> list[tuple[int, ...]]:
+    if not candidate_overrides:
+        return []
+    if group_size <= 1:
+        return [(idx,) for idx in range(len(candidate_overrides))]
+
+    by_fmt: dict[str, list[int]] = defaultdict(list)
+    for idx, meta in enumerate(candidate_meta):
+        by_fmt[fr.canonical_format_name(meta[3])].append(idx)
+
+    groups: list[tuple[int, ...]] = []
+    for fmt in sorted(by_fmt):
+        current: list[int] = []
+        current_qnames: set[str] = set()
+        for idx in sorted(by_fmt[fmt], key=lambda item: _candidate_group_sort_key(candidate_meta, item)):
+            qnames = {str(qname) for qname in candidate_overrides[idx]}
+            if current and (
+                len(current) >= group_size or bool(current_qnames & qnames)
+            ):
+                groups.append(tuple(current))
+                current = []
+                current_qnames = set()
+            current.append(idx)
+            current_qnames.update(qnames)
+        if current:
+            groups.append(tuple(current))
+    return groups
+
+
+def _split_candidate_group(indices: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+    if len(indices) <= 1:
+        return ()
+    midpoint = len(indices) // 2
+    return (indices[:midpoint], indices[midpoint:])
+
+
+def _limit_adaptive_candidate_coverage(
+    groups: Sequence[tuple[tuple[int, ...], float]],
+    *,
+    max_candidates: int,
+) -> tuple[list[tuple[tuple[int, ...], float]], tuple[int, ...]]:
+    if max_candidates <= 0 or not groups:
+        return list(groups), ()
+
+    ordered = sorted(
+        groups,
+        key=lambda item: (
+            float(item[1]) / max(len(item[0]), 1),
+            float(item[1]),
+            -len(item[0]),
+            tuple(-idx for idx in item[0]),
+        ),
+        reverse=True,
+    )
+    kept: list[tuple[tuple[int, ...], float]] = []
+    pruned: list[int] = []
+    covered = 0
+    for indices, score in ordered:
+        if covered < max_candidates:
+            kept.append((indices, score))
+            covered += len(indices)
+        else:
+            pruned.extend(indices)
+    return kept, tuple(sorted(pruned))
+
+
+def _adaptive_group_candidate_kls(
+    model: nn.Module,
+    floor_assignment: Mapping[str, str],
+    candidate_overrides: list[Mapping[str, str]],
+    candidate_meta: Sequence[CandidateMeta],
+    calib_ids: torch.Tensor,
+    ref_log_probs: Sequence[torch.Tensor],
+    *,
+    floor_kl: float,
+    work_root: Path,
+    profile,
+    kl_scope: KLScope,
+    max_lanes_per_batch: int,
+    calib_microbatch_size: int,
+    include_activation_quant: bool,
+    use_cuda_graphs: bool,
+    use_tail_replay: bool,
+    replay_cache_window: str,
+    replay_cache_max_gb: float,
+    replay_cache_max_effective_batch: int,
+    dtype: torch.dtype,
+    production_weight_cache=None,
+    source_weight_resolver=None,
+    group_size: int = 32,
+    min_group_gain: float = 0.0,
+    max_exact_candidates: int = 0,
+) -> AdaptiveCandidateSearchResult:
+    if not candidate_overrides:
+        return AdaptiveCandidateSearchResult(
+            candidate_kls={},
+            pruned_indices=(),
+            diagnostics={
+                "mode": "adaptive_group",
+                "initial_candidates": 0,
+                "initial_groups": 0,
+                "measured_groups": 0,
+                "measured_candidates": 0,
+                "pruned_candidates": 0,
+                "rounds": [],
+            },
+        )
+
+    pending: list[tuple[tuple[int, ...], float]] = [
+        (group, float("inf"))
+        for group in _initial_candidate_groups(
+            candidate_overrides,
+            candidate_meta,
+            group_size=max(int(group_size), 1),
+        )
+    ]
+    initial_groups = len(pending)
+    candidate_kls: dict[int, float] = {}
+    pruned_indices: set[int] = set()
+    measured_groups = 0
+    measured_candidate_slots = 0
+    round_diagnostics: list[dict[str, object]] = []
+    round_idx = 0
+
+    while pending:
+        round_idx += 1
+        overrides: list[Mapping[str, str]] = []
+        valid_groups: list[tuple[int, ...]] = []
+        split_again: list[tuple[tuple[int, ...], float]] = []
+        for indices, score in pending:
+            merged = _merge_candidate_override_group(candidate_overrides, indices)
+            if merged is None and len(indices) > 1:
+                split_again.extend((split, score) for split in _split_candidate_group(indices))
+                continue
+            if merged is None:
+                raise RuntimeError(
+                    f"conflicting adaptive candidate override for singleton {indices}"
+                )
+            valid_groups.append(indices)
+            overrides.append(merged)
+
+        if split_again:
+            if int(max_exact_candidates) > 0:
+                remaining = max(int(max_exact_candidates) - len(candidate_kls), 0)
+                if remaining <= 0:
+                    pending = []
+                    dropped = tuple(
+                        sorted(idx for indices, _score in split_again for idx in indices)
+                    )
+                else:
+                    pending, dropped = _limit_adaptive_candidate_coverage(
+                        split_again,
+                        max_candidates=remaining,
+                    )
+            else:
+                pending = split_again
+                dropped = ()
+            pruned_indices.update(dropped)
+            continue
+
+        covered_candidates = sum(len(indices) for indices in valid_groups)
+        print(
+            f"[kl-probe] adaptive candidate search round {round_idx}: "
+            f"groups={len(valid_groups)} covered_candidates={covered_candidates}",
+            flush=True,
+        )
+        group_kls = measure_candidate_overrides(
+            model,
+            floor_assignment,
+            list(overrides),
+            calib_ids,
+            ref_log_probs,
+            work_root=work_root,
+            profile=profile,
+            kl_scope=kl_scope,
+            max_lanes_per_batch=max_lanes_per_batch,
+            calib_microbatch_size=calib_microbatch_size,
+            include_activation_quant=include_activation_quant,
+            use_cuda_graphs=use_cuda_graphs,
+            use_tail_replay=use_tail_replay,
+            replay_cache_window=replay_cache_window,
+            replay_cache_max_gb=replay_cache_max_gb,
+            replay_cache_max_effective_batch=replay_cache_max_effective_batch,
+            dtype=dtype,
+            production_weight_cache=production_weight_cache,
+            source_weight_resolver=source_weight_resolver,
+        )
+        measured_groups += len(valid_groups)
+        measured_candidate_slots += covered_candidates
+
+        next_pending: list[tuple[tuple[int, ...], float]] = []
+        singleton_count = 0
+        split_count = 0
+        pruned_this_round = 0
+        gains: list[float] = []
+        for indices, group_kl in zip(valid_groups, group_kls, strict=True):
+            gain = float(floor_kl - float(group_kl))
+            gains.append(gain)
+            if len(indices) == 1:
+                candidate_kls[int(indices[0])] = float(group_kl)
+                singleton_count += 1
+                continue
+            if gain <= float(min_group_gain):
+                pruned_indices.update(indices)
+                pruned_this_round += len(indices)
+                continue
+            splits = _split_candidate_group(indices)
+            next_pending.extend((split, gain) for split in splits)
+            split_count += len(splits)
+
+        dropped_by_budget: tuple[int, ...] = ()
+        if next_pending and int(max_exact_candidates) > 0:
+            remaining = max(int(max_exact_candidates) - len(candidate_kls), 0)
+            if remaining <= 0:
+                dropped_by_budget = tuple(
+                    sorted(idx for indices, _score in next_pending for idx in indices)
+                )
+                next_pending = []
+            else:
+                next_pending, dropped_by_budget = _limit_adaptive_candidate_coverage(
+                    next_pending,
+                    max_candidates=remaining,
+                )
+            pruned_indices.update(dropped_by_budget)
+
+        round_diagnostics.append({
+            "round": int(round_idx),
+            "groups_measured": int(len(valid_groups)),
+            "covered_candidates": int(covered_candidates),
+            "singleton_candidates": int(singleton_count),
+            "split_groups": int(split_count),
+            "pruned_candidates": int(pruned_this_round),
+            "budget_pruned_candidates": int(len(dropped_by_budget)),
+            "gain_min": float(min(gains)) if gains else None,
+            "gain_max": float(max(gains)) if gains else None,
+            "gain_mean": float(sum(gains) / len(gains)) if gains else None,
+        })
+        print(
+            f"[kl-probe] adaptive candidate search round {round_idx} result: "
+            f"singletons={singleton_count} next_groups={len(next_pending)} "
+            f"pruned={pruned_this_round + len(dropped_by_budget)}",
+            flush=True,
+        )
+        pending = next_pending
+
+    return AdaptiveCandidateSearchResult(
+        candidate_kls=dict(sorted(candidate_kls.items())),
+        pruned_indices=tuple(sorted(pruned_indices)),
+        diagnostics={
+            "mode": "adaptive_group",
+            "initial_candidates": int(len(candidate_overrides)),
+            "initial_groups": int(initial_groups),
+            "measured_groups": int(measured_groups),
+            "measured_candidate_slots": int(measured_candidate_slots),
+            "measured_candidates": int(len(candidate_kls)),
+            "pruned_candidates": int(len(pruned_indices)),
+            "group_size": int(group_size),
+            "min_group_gain": float(min_group_gain),
+            "max_exact_candidates": int(max_exact_candidates),
+            "rounds": round_diagnostics,
+        },
+    )
+
+
 def measure_candidate_flips(
     model: nn.Module,
     floor_assignment: Mapping[str, str],
@@ -1891,9 +2200,7 @@ def run_probe(args: argparse.Namespace) -> dict:
 
     rows: list[ProbeRow] = []
     candidate_overrides: list[dict[str, str]] = []
-    candidate_meta: list[
-        tuple[str, tuple[str, ...], tuple[LinearTarget, ...], str, float, float]
-    ] = []
+    candidate_meta: list[CandidateMeta] = []
     measured_counter: Counter[str] = Counter()
     skipped_counter: Counter[str] = Counter()
     target_by_qname = {target.qname: target for target in targets}
@@ -2017,40 +2324,93 @@ def run_probe(args: argparse.Namespace) -> dict:
     candidate_cuda_graphs = bool(args.enable_cuda_graphs and args.no_tail_replay)
     if weight_session is not None:
         weight_session.apply_assignment(floor_assignment)
+    candidate_search_diag: dict[str, object]
     with _external_weight_management(weight_session is not None):
-        candidate_kls = measure_candidate_overrides(
-            model,
-            floor_assignment,
-            candidate_overrides,
-            calib_ids,
-            ref_log_probs,
-            work_root=work_root,
-            profile=profile,
-            kl_scope=args.kl_scope,
-            max_lanes_per_batch=args.max_lanes_per_batch,
-            calib_microbatch_size=chosen_calib_micro,
-            include_activation_quant=not args.no_activation_quant,
-            use_cuda_graphs=candidate_cuda_graphs,
-            use_tail_replay=not args.no_tail_replay,
-            replay_cache_window=args.replay_cache_window,
-            replay_cache_max_gb=float(args.replay_cache_max_gb),
-            replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
-            dtype=dtype,
-            production_weight_cache=production_weight_cache,
-            source_weight_resolver=source_weight_resolver,
-        )
-    for (
-        unit,
-        members,
-        member_targets,
-        fmt,
-        baseline_bits,
-        bits_total,
-    ), candidate_kl in zip(
-        candidate_meta,
-        candidate_kls,
-        strict=True,
-    ):
+        if args.candidate_search == "exhaustive":
+            candidate_kls = measure_candidate_overrides(
+                model,
+                floor_assignment,
+                candidate_overrides,
+                calib_ids,
+                ref_log_probs,
+                work_root=work_root,
+                profile=profile,
+                kl_scope=args.kl_scope,
+                max_lanes_per_batch=args.max_lanes_per_batch,
+                calib_microbatch_size=chosen_calib_micro,
+                include_activation_quant=not args.no_activation_quant,
+                use_cuda_graphs=candidate_cuda_graphs,
+                use_tail_replay=not args.no_tail_replay,
+                replay_cache_window=args.replay_cache_window,
+                replay_cache_max_gb=float(args.replay_cache_max_gb),
+                replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
+                dtype=dtype,
+                production_weight_cache=production_weight_cache,
+                source_weight_resolver=source_weight_resolver,
+            )
+            candidate_kls_by_idx = {
+                idx: float(candidate_kl)
+                for idx, candidate_kl in enumerate(candidate_kls)
+            }
+            candidate_search_diag = {
+                "mode": "exhaustive",
+                "initial_candidates": int(len(candidate_overrides)),
+                "measured_candidates": int(len(candidate_kls_by_idx)),
+                "pruned_candidates": 0,
+            }
+            pruned_candidate_indices: tuple[int, ...] = ()
+        else:
+            adaptive = _adaptive_group_candidate_kls(
+                model,
+                floor_assignment,
+                candidate_overrides,
+                candidate_meta,
+                calib_ids,
+                ref_log_probs,
+                floor_kl=float(floor_kl),
+                work_root=work_root,
+                profile=profile,
+                kl_scope=args.kl_scope,
+                max_lanes_per_batch=args.max_lanes_per_batch,
+                calib_microbatch_size=chosen_calib_micro,
+                include_activation_quant=not args.no_activation_quant,
+                use_cuda_graphs=candidate_cuda_graphs,
+                use_tail_replay=not args.no_tail_replay,
+                replay_cache_window=args.replay_cache_window,
+                replay_cache_max_gb=float(args.replay_cache_max_gb),
+                replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
+                dtype=dtype,
+                production_weight_cache=production_weight_cache,
+                source_weight_resolver=source_weight_resolver,
+                group_size=int(args.adaptive_group_size),
+                min_group_gain=float(args.adaptive_min_group_gain),
+                max_exact_candidates=int(args.adaptive_max_exact_candidates),
+            )
+            candidate_kls_by_idx = adaptive.candidate_kls
+            candidate_search_diag = adaptive.diagnostics
+            pruned_candidate_indices = adaptive.pruned_indices
+
+    for idx in pruned_candidate_indices:
+        unit, members, member_targets, fmt, _baseline_bits, _bits_total = candidate_meta[idx]
+        skipped_counter[fmt] += len(member_targets)
+        for target in member_targets:
+            skipped.append({
+                "qname": target.qname,
+                "format": fmt,
+                "shape": list(target.shape),
+                "reason": "adaptive_group_pruned",
+                "detail": f"{unit} was not selected by adaptive candidate search",
+            })
+
+    for idx, candidate_kl in sorted(candidate_kls_by_idx.items()):
+        (
+            unit,
+            members,
+            member_targets,
+            fmt,
+            baseline_bits,
+            bits_total,
+        ) = candidate_meta[idx]
         if not math.isfinite(float(candidate_kl)):
             raise RuntimeError(f"non-finite KL for {unit} {fmt}: {candidate_kl}")
         gain = float(floor_kl - candidate_kl)
@@ -2222,7 +2582,9 @@ def run_probe(args: argparse.Namespace) -> dict:
             "target_count": int(len(targets)),
             "candidate_flip_count": int(len(candidate_overrides)),
             "candidate_unit_count": int(len(candidate_overrides)),
+            "candidate_unit_measured_count": int(len(candidate_kls_by_idx)),
             "row_count": int(len(rows)),
+            "candidate_search": candidate_search_diag,
             "source_manifest_entries": int(len(source_manifest)),
             "production_cache_used": bool(production_weight_cache is not None),
             "production_weight_cache": production_cache_diag,
@@ -2357,6 +2719,47 @@ def build_parser() -> argparse.ArgumentParser:
             "'production' renders each unit/format with the same GPTQ/"
             "scale-sweep cache used by export; 'raw' is the older RTN/QDQ "
             "diagnostic path."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-search",
+        choices=["exhaustive", "adaptive_group"],
+        default="exhaustive",
+        help=(
+            "Candidate sensitivity search strategy. 'exhaustive' measures "
+            "every legal unit promotion. 'adaptive_group' first promotes "
+            "format-homogeneous groups, recursively splits improving groups, "
+            "then measures surviving single-unit promotions for a faster "
+            "interaction-aware screen on large models."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-group-size",
+        type=int,
+        default=32,
+        help=(
+            "Initial candidate group size for --candidate-search=adaptive_group. "
+            "Groups are format-homogeneous and depth-contiguous."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-min-group-gain",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum floor-KL improvement required to split an adaptive "
+            "candidate group. Use a small negative guard band to avoid "
+            "pruning groups with noisy near-zero aggregate gains."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-max-exact-candidates",
+        type=int,
+        default=0,
+        help=(
+            "Optional cap on surviving single-unit candidates under "
+            "--candidate-search=adaptive_group. 0 keeps all improving "
+            "branches."
         ),
     )
     parser.add_argument(
