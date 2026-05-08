@@ -1102,10 +1102,10 @@ def _candidate_replay_checkpoint_signature(
         "calibration_data_hash": calibration_data_hash(calib_ids),
         "kl_scope": str(kl_scope),
         "include_activation_quant": bool(include_activation_quant),
-        "max_lanes_per_batch": int(max_lanes_per_batch),
-        "replay_cache_window": str(replay_cache_window),
-        "replay_cache_max_gb": float(replay_cache_max_gb),
-        "replay_cache_max_effective_batch": int(replay_cache_max_effective_batch),
+        # Deliberately exclude scheduling-only knobs such as lane count and
+        # replay window. Per-window candidate KLs are invariant to how lanes
+        # were packed, so completed windows can survive a restart with more
+        # aggressive batching.
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()

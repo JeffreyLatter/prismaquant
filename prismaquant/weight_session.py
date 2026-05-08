@@ -182,6 +182,25 @@ class WeightSession:
         self._bf16_originals[qname] = snap
         return snap
 
+    def _ensure_bf16_snapshot_recorded(self, qname: str) -> bool:
+        """Ensure a BF16 source snapshot exists for future restores.
+
+        Initialization for a non-BF16 floor only needs to guarantee that the
+        source can be loaded later; it does not need the tensor immediately.
+        When a shared spill file already exists, record it without reading the
+        full weight back from disk. This keeps 27B retry startup from pulling
+        another full model worth of snapshots through the page cache.
+        """
+        if qname in self._bf16_originals or qname in self._spilled:
+            return True
+        if self._snapshot_dir is not None:
+            safe = qname.replace("/", "__").replace(".", "_")
+            fname = f"{safe}__bf16src.pt"
+            if (self._snapshot_dir / fname).is_file():
+                self._spilled[qname] = fname
+                return True
+        return self._ensure_bf16_snapshot(qname) is not None
+
     def _format_weight(self, qname: str, fmt: str) -> torch.Tensor | None:
         """Return the weight tensor that should be installed when
         ``qname`` is at ``fmt``.
@@ -255,7 +274,7 @@ class WeightSession:
                 continue  # live weight already holds BF16 source
             # Snapshot BEFORE any overwrite. BF16-kept weights can be
             # snapshotted lazily if a later stage actually changes them.
-            self._ensure_bf16_snapshot(qname)
+            self._ensure_bf16_snapshot_recorded(qname)
             replacement = self._format_weight(qname, self._current[qname])
             if replacement is None:
                 continue  # cache miss; leave at BF16
