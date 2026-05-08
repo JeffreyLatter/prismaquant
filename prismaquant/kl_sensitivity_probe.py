@@ -2736,12 +2736,20 @@ def run_probe(args: argparse.Namespace) -> dict:
         chosen_calib_micro = 1
     else:
         chosen_calib_micro = max(int(args.calib_microbatch), 1)
-    print(
-        f"[kl-probe] measuring {len(candidate_overrides)} unit candidates "
-        f"(max_lanes_per_batch={args.max_lanes_per_batch}, "
-        f"calib_microbatch_size={chosen_calib_micro})",
-        flush=True,
-    )
+    if args.candidate_search == "seed_only":
+        print(
+            f"[kl-probe] seed_only candidate search: skipping "
+            f"{len(candidate_overrides)} unit candidates; measuring floor and "
+            "seed assignments only",
+            flush=True,
+        )
+    else:
+        print(
+            f"[kl-probe] measuring {len(candidate_overrides)} unit candidates "
+            f"(max_lanes_per_batch={args.max_lanes_per_batch}, "
+            f"calib_microbatch_size={chosen_calib_micro})",
+            flush=True,
+        )
     # Tail replay creates a fresh hidden-state cache per calibration window.
     # Graph keys include that cache identity, so candidate replay graphs are
     # effectively single-use captures.  Keep CUDA graphs for measured frontier
@@ -2751,72 +2759,84 @@ def run_probe(args: argparse.Namespace) -> dict:
     if weight_session is not None:
         weight_session.apply_assignment(floor_assignment)
     candidate_search_diag: dict[str, object]
-    with _external_weight_management(weight_session is not None):
-        if args.candidate_search == "exhaustive":
-            candidate_kls = measure_candidate_overrides(
-                model,
-                floor_assignment,
-                candidate_overrides,
-                calib_ids,
-                ref_log_probs,
-                work_root=work_root,
-                profile=profile,
-                kl_scope=args.kl_scope,
-                max_lanes_per_batch=args.max_lanes_per_batch,
-                calib_microbatch_size=chosen_calib_micro,
-                include_activation_quant=not args.no_activation_quant,
-                use_cuda_graphs=candidate_cuda_graphs,
-                use_tail_replay=not args.no_tail_replay,
-                replay_cache_window=args.replay_cache_window,
-                replay_cache_max_gb=float(args.replay_cache_max_gb),
-                replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
-                dtype=dtype,
-                production_weight_cache=production_weight_cache,
-                source_weight_resolver=source_weight_resolver,
-            )
-            candidate_kls_by_idx = {
-                idx: float(candidate_kl)
-                for idx, candidate_kl in enumerate(candidate_kls)
-            }
-            candidate_search_diag = {
-                "mode": "exhaustive",
-                "initial_candidates": int(len(candidate_overrides)),
-                "measured_candidates": int(len(candidate_kls_by_idx)),
-                "pruned_candidates": 0,
-            }
-            pruned_candidate_indices: tuple[int, ...] = ()
-        else:
-            adaptive = _adaptive_group_candidate_kls(
-                model,
-                floor_assignment,
-                candidate_overrides,
-                candidate_meta,
-                calib_ids,
-                ref_log_probs,
-                floor_kl=float(floor_kl),
-                work_root=work_root,
-                profile=profile,
-                kl_scope=args.kl_scope,
-                max_lanes_per_batch=args.max_lanes_per_batch,
-                calib_microbatch_size=chosen_calib_micro,
-                include_activation_quant=not args.no_activation_quant,
-                use_cuda_graphs=candidate_cuda_graphs,
-                use_tail_replay=not args.no_tail_replay,
-                replay_cache_window=args.replay_cache_window,
-                replay_cache_max_gb=float(args.replay_cache_max_gb),
-                replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
-                dtype=dtype,
-                production_weight_cache=production_weight_cache,
-                source_weight_resolver=source_weight_resolver,
-                group_size=int(args.adaptive_group_size),
-                min_group_gain=float(args.adaptive_min_group_gain),
-                max_exact_candidates=int(args.adaptive_max_exact_candidates),
-                prune_after_round=int(args.adaptive_prune_after_round),
-                fail_open_pruning=bool(args.adaptive_fail_open_pruning),
-            )
-            candidate_kls_by_idx = adaptive.candidate_kls
-            candidate_search_diag = adaptive.diagnostics
-            pruned_candidate_indices = adaptive.pruned_indices
+    if args.candidate_search == "seed_only":
+        candidate_kls_by_idx: dict[int, float] = {}
+        candidate_search_diag = {
+            "mode": "seed_only",
+            "initial_candidates": int(len(candidate_overrides)),
+            "measured_candidates": 0,
+            "pruned_candidates": 0,
+            "skipped_candidates": int(len(candidate_overrides)),
+            "seed_assignments_requested": int(len(getattr(args, "seed_assignment", []) or [])),
+        }
+        pruned_candidate_indices: tuple[int, ...] = ()
+    else:
+        with _external_weight_management(weight_session is not None):
+            if args.candidate_search == "exhaustive":
+                candidate_kls = measure_candidate_overrides(
+                    model,
+                    floor_assignment,
+                    candidate_overrides,
+                    calib_ids,
+                    ref_log_probs,
+                    work_root=work_root,
+                    profile=profile,
+                    kl_scope=args.kl_scope,
+                    max_lanes_per_batch=args.max_lanes_per_batch,
+                    calib_microbatch_size=chosen_calib_micro,
+                    include_activation_quant=not args.no_activation_quant,
+                    use_cuda_graphs=candidate_cuda_graphs,
+                    use_tail_replay=not args.no_tail_replay,
+                    replay_cache_window=args.replay_cache_window,
+                    replay_cache_max_gb=float(args.replay_cache_max_gb),
+                    replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
+                    dtype=dtype,
+                    production_weight_cache=production_weight_cache,
+                    source_weight_resolver=source_weight_resolver,
+                )
+                candidate_kls_by_idx = {
+                    idx: float(candidate_kl)
+                    for idx, candidate_kl in enumerate(candidate_kls)
+                }
+                candidate_search_diag = {
+                    "mode": "exhaustive",
+                    "initial_candidates": int(len(candidate_overrides)),
+                    "measured_candidates": int(len(candidate_kls_by_idx)),
+                    "pruned_candidates": 0,
+                }
+                pruned_candidate_indices = ()
+            else:
+                adaptive = _adaptive_group_candidate_kls(
+                    model,
+                    floor_assignment,
+                    candidate_overrides,
+                    candidate_meta,
+                    calib_ids,
+                    ref_log_probs,
+                    floor_kl=float(floor_kl),
+                    work_root=work_root,
+                    profile=profile,
+                    kl_scope=args.kl_scope,
+                    max_lanes_per_batch=args.max_lanes_per_batch,
+                    calib_microbatch_size=chosen_calib_micro,
+                    include_activation_quant=not args.no_activation_quant,
+                    use_cuda_graphs=candidate_cuda_graphs,
+                    use_tail_replay=not args.no_tail_replay,
+                    replay_cache_window=args.replay_cache_window,
+                    replay_cache_max_gb=float(args.replay_cache_max_gb),
+                    replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
+                    dtype=dtype,
+                    production_weight_cache=production_weight_cache,
+                    source_weight_resolver=source_weight_resolver,
+                    group_size=int(args.adaptive_group_size),
+                    min_group_gain=float(args.adaptive_min_group_gain),
+                    max_exact_candidates=int(args.adaptive_max_exact_candidates),
+                    prune_after_round=int(args.adaptive_prune_after_round),
+                    fail_open_pruning=bool(args.adaptive_fail_open_pruning),
+                )
+                candidate_kls_by_idx = adaptive.candidate_kls
+                candidate_search_diag = adaptive.diagnostics
+                pruned_candidate_indices = adaptive.pruned_indices
 
     for idx in pruned_candidate_indices:
         unit, members, member_targets, fmt, _baseline_bits, _bits_total = candidate_meta[idx]
@@ -3207,14 +3227,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--candidate-search",
-        choices=["exhaustive", "adaptive_group"],
+        choices=["exhaustive", "adaptive_group", "seed_only"],
         default="exhaustive",
         help=(
             "Candidate sensitivity search strategy. 'exhaustive' measures "
             "every legal unit promotion. 'adaptive_group' first promotes "
             "format-homogeneous groups, recursively splits improving groups, "
             "then measures surviving single-unit promotions for a faster "
-            "interaction-aware screen on large models."
+            "interaction-aware screen on large models. 'seed_only' skips unit "
+            "candidate measurement and only measures the floor plus "
+            "--seed-assignment candidates."
         ),
     )
     parser.add_argument(

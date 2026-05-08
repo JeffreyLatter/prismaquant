@@ -902,6 +902,7 @@ def test_kl_sensitivity_probe_help_parses():
 
     assert result.returncode == 0
     assert "--kl-scope" in result.stdout
+    assert "seed_only" in result.stdout
 
 
 @pytest.mark.skipif(
