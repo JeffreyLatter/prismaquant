@@ -77,6 +77,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -100,6 +101,13 @@ from prismaquant.measure_block_clado import (
 )
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 from prismaquant.perturbed_x_cache import PerturbedActivationCache
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -162,14 +170,24 @@ def _restore_unit(model, saved: Mapping[str, torch.Tensor]) -> None:
 def _forward_logits(
     model,
     calib_ids: torch.Tensor,
+    *,
+    microbatch: int = 1,
+    output_device: torch.device | str | None = "cpu",
+    logit_scope: str = "full_sequence",
 ) -> list[torch.Tensor]:
-    """Forward each calibration sample; return a list of fp32 ``[T, V]`` tensors on CPU."""
+    """Forward each calibration sample; return fp32 ``[T, V]`` tensors."""
     device = next(model.parameters()).device
+    out_device = torch.device(output_device) if output_device is not None else device
     out: list[torch.Tensor] = []
-    for i in range(calib_ids.size(0)):
-        batch = calib_ids[i:i + 1].to(device)
-        logits = model(batch).logits[0].detach().float()
-        out.append(logits.cpu())
+    step = max(int(microbatch), 1)
+    scope = str(logit_scope)
+    for i in range(0, calib_ids.size(0), step):
+        batch = calib_ids[i:i + step].to(device)
+        logits = model(batch).logits.detach()
+        if scope == "last_token":
+            logits = logits[:, -1:, :]
+        logits = logits.float().to(out_device)
+        out.extend(logits[j].contiguous() for j in range(logits.size(0)))
     return out
 
 
@@ -183,6 +201,10 @@ def _forward_logits_with_assignment(
     profile=None,
     use_frozen_weight_cache: bool = False,
     production_weight_cache=None,
+    microbatch: int = 1,
+    include_activation_quant: bool = True,
+    output_device: torch.device | str | None = "cpu",
+    logit_scope: str = "full_sequence",
 ) -> list[torch.Tensor]:
     """Run forward with the given quantization assignment applied via
     PerturbedActivationCache, returning per-sample fp32 ``[T, V]`` logits.
@@ -193,12 +215,15 @@ def _forward_logits_with_assignment(
     non-BF16 format.
     """
     device = next(model.parameters()).device
+    out_device = torch.device(output_device) if output_device is not None else device
+    scope = str(logit_scope)
     cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_of_pcache_", dir=str(work_root)))
     cal_hash = calibration_data_hash(calib_ids)
     hooks = PerturbedActivationCache(
         model, assignment, cache_dir,
         input_rows=0, cal_hash=cal_hash, profile=profile,
         production_weight_cache=production_weight_cache,
+        include_activation_quant=include_activation_quant,
     )
     out: list[torch.Tensor] = []
     try:
@@ -209,15 +234,55 @@ def _forward_logits_with_assignment(
         with cache_cm:
             hooks.install()
             try:
-                for i in range(calib_ids.size(0)):
-                    batch = calib_ids[i:i + 1].to(device)
-                    logits = model(batch).logits[0].detach().float()
-                    out.append(logits.cpu())
+                step = max(int(microbatch), 1)
+                for i in range(0, calib_ids.size(0), step):
+                    batch = calib_ids[i:i + step].to(device)
+                    logits = model(batch).logits.detach()
+                    if scope == "last_token":
+                        logits = logits[:, -1:, :]
+                    logits = logits.float().to(out_device)
+                    out.extend(logits[j].contiguous() for j in range(logits.size(0)))
             finally:
                 hooks.remove()
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
     return out
+
+
+def _resolve_reduction_device(
+    model,
+    requested: str | torch.device | None,
+    *,
+    calib_ids: torch.Tensor | None = None,
+    is_sandwich: bool = False,
+    logit_scope: str = "full_sequence",
+) -> torch.device:
+    if isinstance(requested, torch.device):
+        return requested
+    value = str(requested or "cpu").strip().lower()
+    model_device = next(model.parameters()).device
+    if value in {"cuda", "gpu"}:
+        return model_device if model_device.type == "cuda" else torch.device("cpu")
+    if value == "auto":
+        if model_device.type != "cuda" or calib_ids is None:
+            return torch.device("cpu")
+        vocab_size = int(getattr(getattr(model, "config", None), "vocab_size", 0) or 0)
+        if vocab_size <= 0:
+            return torch.device("cpu")
+        effective_seqlen = 1 if str(logit_scope) == "last_token" else int(calib_ids.size(1))
+        # Resident full-vocab tensors: teacher logits + teacher probs, plus
+        # centered logits/probs and linear offset in sandwich mode. Block-local
+        # deltas add temporary pressure, so require a conservative headroom.
+        fp32_bytes = int(calib_ids.size(0)) * effective_seqlen * vocab_size * 4
+        resident_bytes = fp32_bytes * (5 if is_sandwich else 2)
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(model_device)
+        except Exception:
+            return torch.device("cpu")
+        cuda_cap = 48 * (1024 ** 3)
+        budget = min(int(free_bytes * 0.45), cuda_cap)
+        return model_device if resident_bytes <= budget else torch.device("cpu")
+    return torch.device("cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +312,8 @@ def fisher_omega_ii(
     which equals ``KL(p_t ‖ student_perturbed) − KL(p_t ‖ student_c)``
     at second order — exactly what the four-term identity measures.
     """
-    total_quad = 0.0
-    total_lin = 0.0
+    total_quad = None
+    total_lin = None
     total_tokens = 0
     for idx, (p, dz) in enumerate(zip(teacher_probs, delta_z)):
         p32 = p.float()
@@ -256,15 +321,21 @@ def fisher_omega_ii(
         e_dz = (p32 * dz32).sum(dim=-1)
         e_dz2 = (p32 * dz32 * dz32).sum(dim=-1)
         var = e_dz2 - e_dz * e_dz
-        total_quad += float(var.sum())
+        var_sum = var.sum()
+        total_quad = var_sum if total_quad is None else total_quad + var_sum
         total_tokens += var.numel()
         if linear_offset is not None:
             offset = linear_offset[idx].float()
             lin = (offset * dz32).sum(dim=-1)
-            total_lin += float(lin.sum())
+            lin_sum = lin.sum()
+            total_lin = lin_sum if total_lin is None else total_lin + lin_sum
     if total_tokens == 0:
         return 0.0
-    return (total_lin + 0.5 * total_quad) / total_tokens
+    if total_quad is None:
+        return 0.0
+    if total_lin is None:
+        total_lin = torch.zeros((), device=total_quad.device, dtype=total_quad.dtype)
+    return float((total_lin + 0.5 * total_quad) / total_tokens)
 
 
 @torch.no_grad()
@@ -274,7 +345,7 @@ def fisher_omega_ij(
     delta_z_b: Sequence[torch.Tensor],
 ) -> float:
     """Return ``mean_t Cov_{p_t}(δz_a, δz_b)`` averaged over tokens."""
-    total_cov = 0.0
+    total_cov = None
     total_tokens = 0
     for p, dz_a, dz_b in zip(teacher_probs, delta_z_a, delta_z_b):
         p32 = p.float()
@@ -284,11 +355,12 @@ def fisher_omega_ij(
         e_a = (p32 * a32).sum(dim=-1)
         e_b = (p32 * b32).sum(dim=-1)
         cov = e_ab - e_a * e_b
-        total_cov += float(cov.sum())
+        cov_sum = cov.sum()
+        total_cov = cov_sum if total_cov is None else total_cov + cov_sum
         total_tokens += cov.numel()
-    if total_tokens == 0:
+    if total_tokens == 0 or total_cov is None:
         return 0.0
-    return total_cov / total_tokens
+    return float(total_cov / total_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +383,10 @@ def collect_output_fisher(
     use_frozen_weight_cache: bool = False,
     center_assignment: Mapping[str, str] | None = None,
     production_weight_cache=None,
+    calib_microbatch: int = 1,
+    reduction_device: str | torch.device | None = "auto",
+    pin_to_bf16: Sequence[str] = ("lm_head",),
+    logit_scope: str = "full_sequence",
 ) -> dict:
     """Build the Output-Fisher Block-CLADO payload.
 
@@ -320,6 +396,8 @@ def collect_output_fisher(
     """
     if not isinstance(calib_ids, torch.Tensor) or calib_ids.dim() != 2:
         raise ValueError("calib_ids must be a 2D tensor [samples, seqlen]")
+    if logit_scope not in {"full_sequence", "last_token"}:
+        raise ValueError("logit_scope must be 'full_sequence' or 'last_token'")
 
     spec_by_name = {fr.canonical_format_name(s.name): s for s in formats}
     if "BF16" not in spec_by_name:
@@ -327,6 +405,9 @@ def collect_output_fisher(
     specs_sorted = [spec_by_name[name] for name in sorted(spec_by_name)]
 
     blocks, singletons, _n_params = discover_blocks(model, profile, specs_sorted)
+    blocks, singletons = bc.apply_bf16_pins_to_units(
+        blocks, singletons, pin_to_bf16=pin_to_bf16,
+    )
     units_by_name: dict[str, bc.DecisionUnit] = {
         u.name: u for ulist in blocks.values() for u in ulist
     }
@@ -335,6 +416,12 @@ def collect_output_fisher(
         raise RuntimeError("no quantizable units discovered in model")
 
     all_units = list(units_by_name.values()) + list(singletons_by_name.values())
+    def _force_pinned_bf16(assignment: dict[str, str]) -> None:
+        for unit in all_units:
+            if not bc.unit_is_bf16_pinned(unit, pin_to_bf16):
+                continue
+            for member in unit.member_qnames:
+                assignment[member] = "BF16"
 
     if cache_dir is None:
         cache_dir = Path(tempfile.mkdtemp(prefix="prismaquant_of_cache_"))
@@ -349,6 +436,15 @@ def collect_output_fisher(
         fr.canonical_format_name(str(fmt)) != "BF16"
         for fmt in center_assignment.values()
     )
+    reduction_dev = _resolve_reduction_device(
+        model,
+        reduction_device,
+        calib_ids=calib_ids,
+        is_sandwich=is_sandwich,
+        logit_scope=logit_scope,
+    )
+    weight_session = None
+    restore_assignment: dict[str, str] | None = None
     try:
         # ---------------------------------------------------------------
         # Phase 1: teacher logits + teacher probs (always needed for the
@@ -360,7 +456,13 @@ def collect_output_fisher(
                 "include_activation_quant": include_activation_quant,
                 "centered": bool(is_sandwich),
             })
-        z_teacher = _forward_logits(model, calib_ids)  # list of [T, V] fp32 (CPU)
+        z_teacher = _forward_logits(
+            model,
+            calib_ids,
+            microbatch=calib_microbatch,
+            output_device=reduction_dev,
+            logit_scope=logit_scope,
+        )  # list of [T, V] fp32 tensors on the selected reduction device
         teacher_probs: list[torch.Tensor] = [
             torch.softmax(z, dim=-1) for z in z_teacher
         ]
@@ -389,30 +491,60 @@ def collect_output_fisher(
             for unit in all_units:
                 for member in unit.member_qnames:
                     sandwich_base.setdefault(member, "BF16")
+            _force_pinned_bf16(sandwich_base)
             if progress_callback is not None:
                 progress_callback({"event": "centered_forward_start"})
-            z_centered = _forward_logits_with_assignment(
-                model, sandwich_base, calib_ids,
-                work_root=cache_dir,
-                profile=profile,
-                use_frozen_weight_cache=use_frozen_weight_cache,
-                production_weight_cache=production_weight_cache,
-            )
+            if include_activation_quant:
+                z_centered = _forward_logits_with_assignment(
+                    model, sandwich_base, calib_ids,
+                    work_root=cache_dir,
+                    profile=profile,
+                    use_frozen_weight_cache=use_frozen_weight_cache,
+                    production_weight_cache=production_weight_cache,
+                    microbatch=calib_microbatch,
+                    include_activation_quant=True,
+                    output_device=reduction_dev,
+                    logit_scope=logit_scope,
+                )
+            else:
+                from prismaquant.weight_session import WeightSession
+
+                weight_session = WeightSession(
+                    model,
+                    production_weight_cache=production_weight_cache,
+                    snapshot_dir=(
+                        str(cache_dir / "weight_session_snapshots")
+                        if _env_truthy("PRISMAQUANT_OF_SPILL_WEIGHT_SESSION")
+                        else None
+                    ),
+                )
+                weight_session.initialize(sandwich_base, all_units)
+                z_centered = _forward_logits(
+                    model,
+                    calib_ids,
+                    microbatch=calib_microbatch,
+                    output_device=reduction_dev,
+                    logit_scope=logit_scope,
+                )
             centered_probs: list[torch.Tensor] = [
                 torch.softmax(z, dim=-1) for z in z_centered
             ]
             # Compute KL(p_t || p_centered) for telemetry; use log_softmax
             # directly to match measure_assignment_kl's numerics rather
             # than log-of-clamp(p) which over-estimates for tiny probs.
-            total_kl = 0.0
+            total_kl = None
             total_tokens = 0
             for z_t, z_c, p_t_i in zip(z_teacher, z_centered, teacher_probs):
                 lp_t = torch.log_softmax(z_t.float(), dim=-1)
                 lp_c = torch.log_softmax(z_c.float(), dim=-1)
                 kl_per_token = (p_t_i.float() * (lp_t - lp_c)).sum(dim=-1)
-                total_kl += float(kl_per_token.sum())
+                kl_sum = kl_per_token.sum()
+                total_kl = kl_sum if total_kl is None else total_kl + kl_sum
                 total_tokens += kl_per_token.numel()
-            center_kl = total_kl / max(total_tokens, 1)
+            center_kl = (
+                float(total_kl / max(total_tokens, 1))
+                if total_kl is not None else 0.0
+            )
             # Linear offset for Ω_ii correction: (p_c - p_t) per sample
             linear_offset = [pc - pt for pc, pt in zip(centered_probs, teacher_probs)]
             # Pair Ω_ij math uses centered_probs as the quadratic measure
@@ -434,13 +566,31 @@ def collect_output_fisher(
             center_kl = 0.0
             base_assignment = bf16_base
             z_baseline = z_teacher
+        restore_assignment = bf16_base
+        if not include_activation_quant and weight_session is None:
+            from prismaquant.weight_session import WeightSession
+
+            weight_session = WeightSession(
+                model,
+                production_weight_cache=production_weight_cache,
+                snapshot_dir=(
+                    str(cache_dir / "weight_session_snapshots")
+                    if _env_truthy("PRISMAQUANT_OF_SPILL_WEIGHT_SESSION")
+                    else None
+                ),
+            )
+            weight_session.initialize(base_assignment, all_units)
+        dirty_weight_members: set[str] = set()
 
         # ---------------------------------------------------------------
-        # Phase 2: compute and cache δz_{U,f} for each (unit, format != BF16);
-        # compute Ω_ii immediately while δz is in memory.
+        # Phase 2/3: compute δz_{U,f}, Ω_ii, and per-block Ω_ij.
+        #
+        # Keep only one transformer's block worth of δz tensors live at a
+        # time. The previous disk-backed implementation wrote every δz to
+        # .pt first, which can consume hundreds of GB on 4B+ full-vocab
+        # output-Fisher runs.
         # ---------------------------------------------------------------
         omega_ii: dict[tuple[str, str], float] = {}
-        delta_z_paths: dict[tuple[str, str], Path] = {}
         # In sandwich mode we override starting from the centered base; the
         # "no-op" format for each unit is whatever it has in the center.
         per_unit_center: dict[str, str] = {}
@@ -456,102 +606,120 @@ def collect_output_fisher(
             for u in all_units
         )
         n_pert_done = 0
-        for unit in all_units:
+
+        def _measure_delta_for_option(
+            unit: bc.DecisionUnit,
+            opt: bc.FormatCost,
+        ) -> list[torch.Tensor] | None:
+            nonlocal n_pert_done
             center_fmt = per_unit_center[unit.name]
-            for opt in unit.options:
-                if opt.fmt == center_fmt:
+            if opt.fmt == center_fmt:
+                omega_ii[(unit.name, opt.fmt)] = 0.0
+                return None
+
+            if include_activation_quant:
+                # Use PerturbedActivationCache so activation quantization is
+                # applied at this unit, matching deployment / four-term.
+                assignment = dict(base_assignment)
+                canonical_fmt = fr.canonical_format_name(opt.fmt)
+                for member in unit.member_qnames:
+                    assignment[member] = canonical_fmt
+                try:
+                    z_pert = _forward_logits_with_assignment(
+                        model, assignment, calib_ids,
+                        work_root=cache_dir,
+                        profile=profile,
+                        use_frozen_weight_cache=use_frozen_weight_cache,
+                        production_weight_cache=production_weight_cache,
+                        microbatch=calib_microbatch,
+                        include_activation_quant=True,
+                        output_device=reduction_dev,
+                        logit_scope=logit_scope,
+                    )
+                except Exception as exc:
+                    if progress_callback is not None:
+                        progress_callback({
+                            "event": "perturbation_error",
+                            "unit": unit.name,
+                            "format": opt.fmt,
+                            "error": str(exc),
+                        })
                     omega_ii[(unit.name, opt.fmt)] = 0.0
-                    continue
-
-                if include_activation_quant or is_sandwich:
-                    # Use PerturbedActivationCache so activation quantization is
-                    # applied at this unit, matching deployment / four-term.
-                    # Required for sandwich (need consistent quant on all
-                    # already-non-BF16 units).
-                    assignment = dict(base_assignment)
-                    canonical_fmt = fr.canonical_format_name(opt.fmt)
-                    for member in unit.member_qnames:
-                        assignment[member] = canonical_fmt
-                    try:
-                        z_pert = _forward_logits_with_assignment(
-                            model, assignment, calib_ids,
-                            work_root=cache_dir,
-                            profile=profile,
-                            use_frozen_weight_cache=use_frozen_weight_cache,
-                            production_weight_cache=production_weight_cache,
-                        )
-                    except Exception as exc:
-                        if progress_callback is not None:
-                            progress_callback({
-                                "event": "perturbation_error",
-                                "unit": unit.name,
-                                "format": opt.fmt,
-                                "error": str(exc),
-                            })
-                        omega_ii[(unit.name, opt.fmt)] = 0.0
-                        continue
-                else:
-                    # Weight-only fast path (legacy, BF16 base only)
-                    saved = _quantize_unit_in_place(model, unit, opt.fmt)
-                    if not saved:
-                        omega_ii[(unit.name, opt.fmt)] = 0.0
-                        continue
-                    try:
-                        z_pert = _forward_logits(model, calib_ids)
-                    finally:
-                        _restore_unit(model, saved)
-
-                # δz is measured FROM the baseline (BF16 in normal mode,
-                # centered state in sandwich mode).
-                delta_z = [(zp - zb).contiguous() for zp, zb in zip(z_pert, z_baseline)]
-                omega_ii[(unit.name, opt.fmt)] = fisher_omega_ii(
-                    quad_probs, delta_z,
-                    linear_offset=linear_offset,
+                    return None
+            elif weight_session is not None:
+                canonical_fmt = fr.canonical_format_name(opt.fmt)
+                changes: dict[str, str] = {}
+                for member in dirty_weight_members:
+                    changes[member] = base_assignment.get(member, "BF16")
+                dirty_weight_members.clear()
+                for member in unit.member_qnames:
+                    changes[member] = canonical_fmt
+                    if canonical_fmt != base_assignment.get(member, "BF16"):
+                        dirty_weight_members.add(member)
+                weight_session.apply_assignment(changes)
+                z_pert = _forward_logits(
+                    model,
+                    calib_ids,
+                    microbatch=calib_microbatch,
+                    output_device=reduction_dev,
+                    logit_scope=logit_scope,
                 )
+            else:
+                # Weight-only fast path (legacy, BF16 base only)
+                saved = _quantize_unit_in_place(model, unit, opt.fmt)
+                if not saved:
+                    omega_ii[(unit.name, opt.fmt)] = 0.0
+                    return None
+                try:
+                    z_pert = _forward_logits(
+                        model,
+                        calib_ids,
+                        microbatch=calib_microbatch,
+                        output_device=reduction_dev,
+                        logit_scope=logit_scope,
+                    )
+                finally:
+                    _restore_unit(model, saved)
 
-                # Save for pair compute later
-                delta_z_path = cache_dir / f"{_slug(unit.name)}__{_slug(opt.fmt)}.pt"
-                torch.save(
-                    [t.to(delta_z_dtype) for t in delta_z],
-                    delta_z_path,
-                )
-                delta_z_paths[(unit.name, opt.fmt)] = delta_z_path
+            # δz is measured FROM the baseline (BF16 in normal mode,
+            # centered state in sandwich mode).
+            delta_z = [(zp - zb).contiguous() for zp, zb in zip(z_pert, z_baseline)]
+            omega_ii[(unit.name, opt.fmt)] = fisher_omega_ii(
+                quad_probs, delta_z,
+                linear_offset=linear_offset,
+            )
 
-                n_pert_done += 1
-                if progress_callback is not None:
-                    progress_callback({
-                        "event": "perturbation_done",
-                        "unit": unit.name,
-                        "format": opt.fmt,
-                        "omega_ii": float(omega_ii[(unit.name, opt.fmt)]),
-                        "completed": n_pert_done,
-                        "total": n_pert_total,
-                    })
+            n_pert_done += 1
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "perturbation_done",
+                    "unit": unit.name,
+                    "format": opt.fmt,
+                    "omega_ii": float(omega_ii[(unit.name, opt.fmt)]),
+                    "completed": n_pert_done,
+                    "total": n_pert_total,
+                })
 
-                del z_pert, delta_z
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            del z_pert
+            return [t.to(delta_z_dtype).contiguous() for t in delta_z]
 
-        # ---------------------------------------------------------------
-        # Phase 3: per-block intra-block Ω_ij (analytic via covariance)
-        # ---------------------------------------------------------------
         pairs_by_block: dict[str, list[bc.BlockPair]] = {}
-        if not skip_pairs:
-            for block_id, units_in_block in blocks.items():
-                # Load this block's δz tensors (stay on CPU, fp32 for compute)
-                block_cache: dict[tuple[str, str], list[torch.Tensor]] = {}
-                for unit in units_in_block:
-                    center_fmt = per_unit_center[unit.name]
-                    for opt in unit.options:
-                        if opt.fmt == center_fmt:
-                            continue
-                        path = delta_z_paths.get((unit.name, opt.fmt))
-                        if path is None:
-                            continue
-                        loaded = torch.load(path, weights_only=False)
-                        block_cache[(unit.name, opt.fmt)] = [t.float() for t in loaded]
+        for block_id, units_in_block in blocks.items():
+            block_cache: dict[tuple[str, str], list[torch.Tensor]] = {}
+            for unit in units_in_block:
+                center_fmt = per_unit_center[unit.name]
+                for opt in unit.options:
+                    if opt.fmt == center_fmt:
+                        omega_ii[(unit.name, opt.fmt)] = 0.0
+                        continue
+                    delta_z = _measure_delta_for_option(unit, opt)
+                    if delta_z is not None and not skip_pairs:
+                        block_cache[(unit.name, opt.fmt)] = delta_z
+                    del delta_z
 
+            if skip_pairs:
+                pairs_by_block[block_id] = []
+            else:
                 pair_list: list[bc.BlockPair] = []
                 for unit_a_name, unit_b_name in enumerate_block_pairs(units_in_block):
                     unit_a = units_by_name[unit_a_name]
@@ -572,7 +740,9 @@ def collect_output_fisher(
                                 omega_ij_dict[(opt_a.fmt, opt_b.fmt)] = 0.0
                                 continue
                             omega_ij_dict[(opt_a.fmt, opt_b.fmt)] = fisher_omega_ij(
-                                quad_probs, dz_a, dz_b,
+                                quad_probs,
+                                [t.float() for t in dz_a],
+                                [t.float() for t in dz_b],
                             )
                     pair_list.append(bc.BlockPair(
                         unit_a=unit_a.name,
@@ -589,11 +759,17 @@ def collect_output_fisher(
                         "n_pairs": len(pair_list),
                     })
 
-                del block_cache
-                gc.collect()
-        else:
-            for block_id in blocks:
-                pairs_by_block[block_id] = []
+            del block_cache
+            gc.collect()
+
+        for unit in singletons:
+            center_fmt = per_unit_center[unit.name]
+            for opt in unit.options:
+                if opt.fmt == center_fmt:
+                    omega_ii[(unit.name, opt.fmt)] = 0.0
+                    continue
+                delta_z = _measure_delta_for_option(unit, opt)
+                del delta_z
 
         # ---------------------------------------------------------------
         # Phase 4: assemble payload
@@ -641,6 +817,9 @@ def collect_output_fisher(
             "elapsed_seconds": float(elapsed),
             "n_calib_samples": int(calib_ids.size(0)),
             "calib_seqlen": int(calib_ids.size(1)),
+            "logit_scope": str(logit_scope),
+            "calib_microbatch": int(max(int(calib_microbatch), 1)),
+            "reduction_device": str(reduction_dev),
             "formats": [s.name for s in specs_sorted],
             "objective_metric": "teacher_forward_kl_output_fisher",
             "loss": "teacher_student_kl",
@@ -649,10 +828,10 @@ def collect_output_fisher(
                 ("Sandwich-centered " if is_sandwich else "BF16-centered ") +
                 "Output-Fisher; " +
                 ("activation quantization included via PerturbedActivationCache. "
-                 if (include_activation_quant or is_sandwich) else
+                 if include_activation_quant else
                  "weight-only perturbation (no activation quantization). ")
             ),
-            "include_activation_quant": bool(include_activation_quant or is_sandwich),
+            "include_activation_quant": bool(include_activation_quant),
             "centered": bool(is_sandwich),
             "center_kl": float(center_kl),
             "block_count": len(blocks),
@@ -668,6 +847,11 @@ def collect_output_fisher(
             meta=meta,
         )
     finally:
+        if weight_session is not None and restore_assignment is not None:
+            try:
+                weight_session.apply_assignment(restore_assignment)
+            except Exception:
+                pass
         if cleanup_cache_dir:
             shutil.rmtree(cache_dir, ignore_errors=True)
 
@@ -691,6 +875,14 @@ def _progress_printer(event: dict) -> None:
         print(
             f"[output-fisher] teacher forward done "
             f"({int(event['n_samples'])} samples)",
+            flush=True,
+        )
+    elif kind == "centered_forward_start":
+        print("[output-fisher] computing centered logits", flush=True)
+    elif kind == "centered_forward_done":
+        print(
+            f"[output-fisher] centered forward done "
+            f"center_kl={float(event['center_kl']):.6g}",
             flush=True,
         )
     elif kind == "perturbation_done":
@@ -726,11 +918,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--formats", default="NVFP4,MXFP8_E4M3,BF16")
     parser.add_argument("--n-calib-samples", type=int, default=2)
     parser.add_argument("--calib-seqlen", type=int, default=128)
+    parser.add_argument("--calib-microbatch", type=int, default=1)
+    parser.add_argument(
+        "--logit-scope",
+        choices=["full_sequence", "last_token"],
+        default="full_sequence",
+        help=(
+            "Which logits participate in the output-Fisher KL surrogate. "
+            "last_token keeps the teacher/center tensor stack bounded for "
+            "long calibration windows."
+        ),
+    )
     parser.add_argument("--calib-split", default="train")
     parser.add_argument("--calib-seed", type=int, default=42)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--device-map", default=None)
+    parser.add_argument(
+        "--attn-implementation",
+        default="sdpa",
+        help=(
+            "Transformers attention backend for model load. Accepts built-ins "
+            "such as sdpa/flash_attention_2 and Kernel Hub backends such as "
+            "kernels-community/flash-attn2."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--cache-dir", default=None,
                         help="Optional persistent dir for cached δz tensors")
@@ -744,6 +956,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=["fp16", "bf16", "fp32"],
         default="fp16",
         help="Disk storage dtype for δz tensors",
+    )
+    parser.add_argument(
+        "--reduction-device",
+        choices=["cpu", "cuda", "auto"],
+        default="auto",
+        help=(
+            "Device for output-Fisher probability/delta reductions. 'cuda' "
+            "keeps full-vocab logits and block-local deltas on GPU and only "
+            "returns scalar Ω values; 'auto' uses CUDA only when the full-vocab "
+            "resident tensor stack fits a conservative memory budget."
+        ),
     )
     parser.add_argument(
         "--no-activation-quant",
@@ -785,6 +1008,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "trust_remote_code": True,
             "local_files_only": local_only,
         }
+        load_kwargs["attn_implementation"] = getattr(
+            args,
+            "attn_implementation",
+            "sdpa",
+        )
         if args.device_map:
             load_kwargs["device_map"] = args.device_map
         elif device_str == "cuda":
@@ -819,6 +1047,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             skip_pairs=bool(args.skip_pairs),
             include_activation_quant=not bool(args.no_activation_quant),
             use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
+            calib_microbatch=int(args.calib_microbatch),
+            reduction_device=args.reduction_device,
+            logit_scope=args.logit_scope,
             progress_callback=_progress_printer,
         )
         out_path = Path(args.output)

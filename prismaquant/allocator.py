@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import pickle
 import re
@@ -368,6 +369,15 @@ def main():
     ap.add_argument("--layer-config", required=True,
                     help="Output AutoRound layer_config JSON")
     ap.add_argument("--pareto-csv", required=True, help="Output Pareto CSV")
+    ap.add_argument(
+        "--pareto-output-dir",
+        default=None,
+        help=(
+            "Optional directory where each feasible Pareto point is written "
+            "as a per-Linear assignment JSON suitable for "
+            "kl_sensitivity_probe --seed-assignment."
+        ),
+    )
     ap.add_argument("--no-fused-promote", action="store_true",
                     help="Skip fused-projection sibling promotion")
     ap.add_argument("--no-fused-aggregation", action="store_true",
@@ -794,6 +804,43 @@ def main():
         total = compute_assignment_predicted_dloss(assign, c, pruned_map_r)
         return assign, pruned_map_r, achieved_r, total
 
+    def _expand_assignment_for_seed_json(
+        assignment: dict[str, str],
+        pruned_map: dict[str, tuple[int, ...]] | dict[str, list[int]] | None,
+    ) -> dict[str, str]:
+        """Expand DP super-items into the per-Linear seed-assignment shape.
+
+        The allocator often solves over fused-sibling and MoE super-items.
+        The KL probe's seed path wants ordinary module qnames; it already
+        handles legality, pinning, and fused coherence, but giving it expanded
+        names preserves the intended frontier point instead of making the
+        super-item markers look like unknown entries.
+        """
+        if args.expert_granularity == "layer":
+            expanded = expand_moe_assignment(
+                assignment,
+                stats,
+                pruned_map=pruned_map or {},
+                expert_info=probe_expert_info,
+            )
+        else:
+            expanded = dict(assignment)
+        if not args.no_fused_aggregation:
+            expanded = expand_fused_sibling_assignment(expanded, stats)
+        return promote_moe_pair(expanded, format_rank)
+
+    def _assignment_bits_total(assignment: dict[str, str]) -> float:
+        total = 0.0
+        for name, fmt in assignment.items():
+            entry = stats.get(name)
+            if not isinstance(entry, dict):
+                continue
+            shape = _shape_from_stats(entry)
+            total += 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
+        return float(total)
+
+    pareto_seed_records: list[dict] = []
+
     # Pareto sweep: for each target_bits, pick the (R, assignment)
     # with the lowest predicted Δloss among all ratios in the sweep.
     targets = [float(x) for x in args.pareto_targets.split(",")]
@@ -833,6 +880,23 @@ def main():
             **{f"layers_{k}": v for k, v in format_counts.items()},
             **{f"params_{k}": v for k, v in format_params.items()},
         })
+        if args.pareto_output_dir:
+            expanded = _expand_assignment_for_seed_json(
+                best["assignment"],
+                best["pruned_map"],
+            )
+            expanded_counts = defaultdict(int)
+            for fmt in expanded.values():
+                expanded_counts[fmt] += 1
+            pareto_seed_records.append({
+                "target_bits": float(t),
+                "achieved_bits": float(best["achieved_bits"]),
+                "predicted_dloss": float(best["predicted_dloss"]),
+                "global_prune_ratio": float(best["ratio"]),
+                "assignment": expanded,
+                "format_counts": dict(sorted(expanded_counts.items())),
+                "bits_total": _assignment_bits_total(expanded),
+            })
 
     # Output Pareto CSV
     keys = sorted({k for row in curve for k in row.keys()})
@@ -842,6 +906,59 @@ def main():
         for row in curve:
             w.writerow(row)
     print(f"[alloc] Pareto curve → {args.pareto_csv}")
+
+    if args.pareto_output_dir:
+        out_dir = Path(args.pareto_output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_rows = []
+        seen_payloads: set[str] = set()
+        for idx, record in enumerate(pareto_seed_records):
+            assignment = record["assignment"]
+            digest_src = json.dumps(assignment, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(digest_src.encode()).hexdigest()[:12]
+            if digest in seen_payloads:
+                continue
+            seen_payloads.add(digest)
+            label = (
+                f"allocator_target_{record['target_bits']:.4f}"
+                f"_achieved_{record['achieved_bits']:.4f}_{digest}"
+            ).replace(".", "p")
+            path = out_dir / f"{label}.json"
+            payload = {
+                "schema": "prismaquant.allocator.pareto_assignment.v1",
+                "label": label,
+                "source": "allocator_pareto",
+                "target_bits": float(record["target_bits"]),
+                "achieved_bits": float(record["achieved_bits"]),
+                "bits_total": float(record["bits_total"]),
+                "predicted_dloss": float(record["predicted_dloss"]),
+                "global_prune_ratio": float(record["global_prune_ratio"]),
+                "format_counts": record["format_counts"],
+                "assignment": dict(sorted(assignment.items())),
+            }
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            manifest_rows.append({
+                "label": label,
+                "path": str(path),
+                "target_bits": float(record["target_bits"]),
+                "achieved_bits": float(record["achieved_bits"]),
+                "bits_total": float(record["bits_total"]),
+                "predicted_dloss": float(record["predicted_dloss"]),
+                "format_counts": record["format_counts"],
+            })
+        (out_dir / "manifest.json").write_text(json.dumps({
+            "schema": "prismaquant.allocator.pareto_manifest.v1",
+            "probe": str(args.probe),
+            "costs": str(args.costs),
+            "formats": [s.name for s in specs_sorted],
+            "target_bits": [float(x) for x in targets],
+            "candidates": manifest_rows,
+        }, indent=2, sort_keys=True) + "\n")
+        print(
+            f"[alloc] Pareto seed assignments → {out_dir} "
+            f"({len(manifest_rows)} unique)",
+            flush=True,
+        )
 
     # Kneedle
     feasible = [row for row in curve if row.get("feasible")]

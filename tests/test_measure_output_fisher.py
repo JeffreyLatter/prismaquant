@@ -10,7 +10,11 @@ import math
 
 import pytest
 import torch
+import torch.nn as nn
+from types import SimpleNamespace
 
+from prismaquant import block_clado as bc
+from prismaquant import format_registry as fr
 from prismaquant import measure_output_fisher as of
 
 
@@ -220,3 +224,113 @@ def test_omega_ij_correct_when_aggregated_across_samples():
     omega_concat = of.fisher_omega_ij([p_all], [a_all], [b_all])
 
     assert omega_split == pytest.approx(omega_concat, rel=1e-6)
+
+
+def test_collect_output_fisher_pins_lm_head_before_measurement(monkeypatch, tmp_path):
+    """Pinned output heads should not request missing production-cache weights."""
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = nn.Parameter(torch.zeros(()))
+
+    bf16 = bc.FormatCost(fmt="BF16", omega_ii=0.0, bits_per_param=16.0, memory_bytes=8)
+    nvfp4 = bc.FormatCost(fmt="NVFP4", omega_ii=0.0, bits_per_param=4.0, memory_bytes=2)
+    lm_head = bc.DecisionUnit(
+        name="lm_head",
+        block_id="lm_head",
+        member_qnames=("lm_head",),
+        options=(nvfp4, bf16),
+    )
+
+    monkeypatch.setattr(
+        of,
+        "discover_blocks",
+        lambda model, profile, formats: ({}, [lm_head], {"lm_head": 4}),
+    )
+    monkeypatch.setattr(
+        of,
+        "_forward_logits",
+        lambda model, calib_ids, **kwargs: [
+            torch.zeros((calib_ids.size(1), 4), dtype=torch.float32)
+        ],
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("lm_head non-BF16 perturbation should be pinned away")
+
+    monkeypatch.setattr(of, "_forward_logits_with_assignment", fail_if_called)
+
+    payload = of.collect_output_fisher(
+        DummyModel(),
+        torch.ones((1, 1), dtype=torch.long),
+        [fr.get_format("NVFP4"), fr.get_format("BF16")],
+        cache_dir=tmp_path,
+    )
+
+    options = payload["singletons"]["lm_head"]["options"]
+    assert set(options) == {"BF16"}
+
+
+def test_auto_reduction_device_stays_cpu_for_cpu_model():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = nn.Parameter(torch.zeros(()))
+            self.config = type("Config", (), {"vocab_size": 1024})()
+
+    dev = of._resolve_reduction_device(
+        DummyModel(),
+        "auto",
+        calib_ids=torch.ones((2, 8), dtype=torch.long),
+        is_sandwich=True,
+    )
+    assert dev.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_auto_reduction_device_uses_cuda_only_inside_budget(monkeypatch):
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = nn.Parameter(torch.zeros((), device="cuda"))
+            self.config = type("Config", (), {"vocab_size": 1024})()
+
+    model = DummyModel()
+    calib_ids = torch.ones((2, 8), dtype=torch.long)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (10 << 30, 12 << 30))
+
+    small = of._resolve_reduction_device(
+        model, "auto", calib_ids=calib_ids, is_sandwich=True,
+    )
+    assert small.type == "cuda"
+
+    model.config.vocab_size = 1_000_000_000
+    large = of._resolve_reduction_device(
+        model, "auto", calib_ids=calib_ids, is_sandwich=True,
+    )
+    assert large.type == "cpu"
+
+
+def test_forward_logits_last_token_scope_slices_sequence():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = nn.Parameter(torch.zeros(()))
+
+        def forward(self, input_ids):
+            batch, seqlen = input_ids.shape
+            logits = torch.arange(
+                batch * seqlen * 4,
+                dtype=torch.float32,
+            ).reshape(batch, seqlen, 4)
+            return SimpleNamespace(logits=logits)
+
+    calib = torch.ones((2, 3), dtype=torch.long)
+    full = of._forward_logits(DummyModel(), calib, logit_scope="full_sequence")
+    last = of._forward_logits(DummyModel(), calib, logit_scope="last_token")
+
+    assert [tuple(t.shape) for t in full] == [(3, 4), (3, 4)]
+    assert [tuple(t.shape) for t in last] == [(1, 4), (1, 4)]
+    assert torch.equal(last[0], full[0][-1:, :])
+    assert torch.equal(last[1], full[1][-1:, :])

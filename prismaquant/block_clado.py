@@ -147,6 +147,57 @@ class GlobalSolveResult:
     per_block_bits: dict[str, float]
 
 
+def unit_is_bf16_pinned(
+    unit: DecisionUnit,
+    pin_to_bf16: Sequence[str] = ("lm_head",),
+) -> bool:
+    """Return True when a decision unit should only expose BF16.
+
+    Matching uses dotted-path tokens rather than substring matching, so a
+    pin token such as ``lm_head`` will not match ``lm_head_norm``.
+    """
+    pin_tokens = [str(tok) for tok in (pin_to_bf16 or []) if str(tok)]
+    if not pin_tokens:
+        return False
+    for candidate in (unit.name, *unit.member_qnames):
+        parts = str(candidate).split(".")
+        if any(tok in parts for tok in pin_tokens):
+            return True
+    return False
+
+
+def apply_bf16_pins_to_units(
+    blocks: Mapping[str, Sequence[DecisionUnit]],
+    singletons: Sequence[DecisionUnit],
+    *,
+    pin_to_bf16: Sequence[str] = ("lm_head",),
+) -> tuple[dict[str, list[DecisionUnit]], list[DecisionUnit]]:
+    """Restrict pinned units to their BF16 option before measurement/solve."""
+
+    def _pin(unit: DecisionUnit) -> DecisionUnit:
+        if not unit_is_bf16_pinned(unit, pin_to_bf16):
+            return unit
+        bf16_options = tuple(
+            opt for opt in unit.options
+            if fr.canonical_format_name(opt.fmt) == "BF16"
+        )
+        if not bf16_options:
+            return unit
+        return DecisionUnit(
+            name=unit.name,
+            block_id=unit.block_id,
+            member_qnames=unit.member_qnames,
+            options=bf16_options,
+        )
+
+    pinned_blocks = {
+        str(block_id): [_pin(unit) for unit in units]
+        for block_id, units in blocks.items()
+    }
+    pinned_singletons = [_pin(unit) for unit in singletons]
+    return pinned_blocks, pinned_singletons
+
+
 # ---------------------------------------------------------------------------
 # Block enumeration
 # ---------------------------------------------------------------------------

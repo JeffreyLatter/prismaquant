@@ -217,6 +217,7 @@ def _center_assignment_for_units(
     units_by_name: Mapping[str, bc.DecisionUnit],
     singletons_by_name: Mapping[str, bc.DecisionUnit],
     center_assignment: Mapping[str, str] | None,
+    pin_to_bf16: Sequence[str] = ("lm_head",),
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Build the per-Linear base assignment for sandwich recalibration.
 
@@ -229,7 +230,9 @@ def _center_assignment_for_units(
     all_units = list(units_by_name.values()) + list(singletons_by_name.values())
     for unit in all_units:
         chosen = None
-        if center_assignment:
+        if bc.unit_is_bf16_pinned(unit, pin_to_bf16):
+            chosen = "BF16"
+        elif center_assignment:
             for member in unit.member_qnames:
                 if member in center_assignment:
                     chosen = fr.canonical_format_name(str(center_assignment[member]))
@@ -283,6 +286,7 @@ def collect_block_clado(
     center_assignment: Mapping[str, str] | None = None,
     use_frozen_weight_cache: bool = False,
     production_weight_cache=None,
+    pin_to_bf16: Sequence[str] = ("lm_head",),
 ) -> dict:
     """Run the Block-CLADO measurement.
 
@@ -312,6 +316,9 @@ def collect_block_clado(
     specs_sorted = [spec_by_name[name] for name in sorted(spec_by_name)]
 
     blocks, singletons, n_params_by_unit = discover_blocks(model, profile, specs_sorted)
+    blocks, singletons = bc.apply_bf16_pins_to_units(
+        blocks, singletons, pin_to_bf16=pin_to_bf16,
+    )
     units_by_name = {
         unit.name: unit
         for units in blocks.values()
@@ -335,7 +342,7 @@ def collect_block_clado(
         ref_log_probs = cache_reference_log_probs(model, calib_ids, device)
 
         base, per_unit_center = _center_assignment_for_units(
-            units_by_name, singletons_by_name, center_assignment,
+            units_by_name, singletons_by_name, center_assignment, pin_to_bf16,
         )
         center_kl = 0.0
         if center_assignment is not None and any(

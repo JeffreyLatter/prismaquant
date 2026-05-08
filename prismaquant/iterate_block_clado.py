@@ -88,6 +88,64 @@ def assignment_hash(assignment: dict[str, str]) -> str:
     return f"{h:08x}"
 
 
+def load_assignment_json(path: str | Path) -> dict[str, str]:
+    """Load a per-Linear assignment from the common candidate JSON shapes."""
+    raw = json.loads(Path(path).read_text())
+    if isinstance(raw, dict):
+        for key in ("assignment", "chosen_assignment", "final_assignment"):
+            value = raw.get(key)
+            if isinstance(value, dict):
+                return {str(k): str(v) for k, v in value.items()}
+        selection = raw.get("selection")
+        if isinstance(selection, dict):
+            chosen = selection.get("chosen")
+            if isinstance(chosen, dict) and isinstance(chosen.get("assignment"), dict):
+                return {str(k): str(v) for k, v in chosen["assignment"].items()}
+        if raw and all(isinstance(k, str) for k in raw):
+            return {str(k): str(v) for k, v in raw.items()}
+    raise ValueError(f"unsupported assignment JSON shape: {path}")
+
+
+def assignment_for_units(
+    assignment: dict[str, str] | None,
+    units: Sequence[bc.DecisionUnit],
+) -> dict[str, str]:
+    """Normalize a partial per-Linear assignment over the current units."""
+
+    def _canonical_assignment_fmt(value: str) -> str:
+        raw = str(value).strip()
+        canonical = fr.canonical_format_name(raw)
+        if canonical in fr.REGISTRY:
+            return canonical
+        upper = fr.canonical_format_name(raw.upper())
+        if upper in fr.REGISTRY:
+            return upper
+        for known in (*fr.REGISTRY.keys(), *fr.FORMAT_ALIASES.keys()):
+            if known.casefold() == raw.casefold():
+                return fr.canonical_format_name(known)
+        return canonical
+
+    source = assignment or {}
+    out: dict[str, str] = {}
+    for unit in units:
+        chosen = None
+        for member in unit.member_qnames:
+            if member in source:
+                chosen = _canonical_assignment_fmt(str(source[member]))
+                break
+        if chosen is None:
+            chosen = "BF16"
+        legal = {
+            fr.canonical_format_name(str(opt.fmt))
+            for opt in unit.options
+        }
+        if chosen not in legal:
+            chosen = "BF16" if "BF16" in legal else next(iter(sorted(legal)))
+        for member in unit.member_qnames:
+            out[member] = chosen
+    return out
+
+
 def run_iteration(
     *,
     model,
@@ -109,6 +167,10 @@ def run_iteration(
     use_frozen_weight_cache: bool = False,
     measure_method: str = "four_term",
     production_weight_cache=None,
+    calib_microbatch: int = 1,
+    output_fisher_reduction_device: str = "auto",
+    output_fisher_logit_scope: str = "full_sequence",
+    include_activation_quant: bool = True,
     log_callback=None,
 ) -> IterationResult:
     """One iteration: measure → sweep → kneedle → validate → polish."""
@@ -129,6 +191,28 @@ def run_iteration(
         # OF now supports sandwich centering as well — pass through.
         log(event="measure_start", iter=iter_idx, method="output_fisher",
             centered=(center_assignment is not None))
+
+        def _of_progress(event: dict) -> None:
+            kind = str(event.get("event", ""))
+            if kind == "perturbation_done":
+                completed = int(event.get("completed", 0))
+                total = int(event.get("total", 0))
+                if completed % 10 != 0 and completed != total:
+                    return
+            elif kind == "block_pairs_done":
+                block_id = str(event.get("block_id", ""))
+                if "layers." in block_id:
+                    try:
+                        if int(block_id.rsplit(".", 1)[-1]) % 8 != 0:
+                            return
+                    except Exception:
+                        pass
+            log(
+                event=f"output_fisher_{kind}",
+                iter=iter_idx,
+                **{k: v for k, v in event.items() if k != "event"},
+            )
+
         payload = collect_output_fisher(
             model, calib_ids, formats,
             profile=profile,
@@ -137,8 +221,12 @@ def run_iteration(
             skip_pairs=False,
             center_assignment=center_assignment,
             use_frozen_weight_cache=use_frozen_weight_cache,
-            include_activation_quant=True,
+            include_activation_quant=include_activation_quant,
             production_weight_cache=production_weight_cache,
+            calib_microbatch=calib_microbatch,
+            reduction_device=output_fisher_reduction_device,
+            logit_scope=output_fisher_logit_scope,
+            progress_callback=_of_progress,
         )
         payload_path = iter_dir / "block_clado.json"
         payload_path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -169,6 +257,11 @@ def run_iteration(
     # ---- sweep
     block_states = bc.build_block_states(payload)
     total_params = bc.total_param_count(payload)
+    blocks_back, singletons_back, pairs_back = bc.parse_payload(payload)
+    units = []
+    for unit_list in blocks_back.values():
+        units.extend(unit_list)
+    units.extend(singletons_back)
     sweep_results = bc.lambda_sweep(
         block_states, lambda_min=1e-12, lambda_max=1e-3, n_lambdas=61,
     )
@@ -226,6 +319,7 @@ def run_iteration(
             work_root=work_root, profile=profile,
             use_frozen_weight_cache=use_frozen_weight_cache,
             production_weight_cache=production_weight_cache, rng_seed=0,
+            include_activation_quant=include_activation_quant,
         )
         validation.append({
             "bpp": r["bpp"],
@@ -237,6 +331,21 @@ def run_iteration(
         log(event="validate_done", iter=iter_idx,
             bpp=r["bpp"], real_kl=float(kl),
             is_kneedle=(i == knee_in_sorted))
+
+    if center_assignment is not None and center_kl > 0.0:
+        center_complete = assignment_for_units(center_assignment, units)
+        center_bits = cdp._assignment_bits(units, center_complete)
+        center_bpp = center_bits / float(total_params) if total_params else 0.0
+        validation.append({
+            "bpp": center_bpp,
+            "surrogate_cost": 0.0,
+            "real_kl": float(center_kl),
+            "is_kneedle": False,
+            "is_center_baseline": True,
+            "assignment": center_complete,
+        })
+        log(event="validate_center_baseline", iter=iter_idx,
+            bpp=center_bpp, real_kl=float(center_kl))
 
     (iter_dir / "validation.json").write_text(json.dumps({
         "schema": "prismaquant.block_clado.iter.validation.v1",
@@ -255,11 +364,6 @@ def run_iteration(
     # upgrades on a small number of high-impact layers, but not all the
     # way to BF16-everywhere.
     log(event="polish_start", iter=iter_idx)
-    units = []
-    blocks_back, singletons_back, pairs_back = bc.parse_payload(payload)
-    for unit_list in blocks_back.values():
-        units.extend(unit_list)
-    units.extend(singletons_back)
     if skip_polish:
         log(event="polish_skipped", iter=iter_idx)
         polish_result = cdp.PolishResult(
@@ -290,6 +394,7 @@ def run_iteration(
             steepest_first=polish_steepest_first,
             use_frozen_weight_cache=use_frozen_weight_cache,
             production_weight_cache=production_weight_cache,
+            include_activation_quant=include_activation_quant,
             progress_callback=_polish_progress,
         )
     log(event="polish_done", iter=iter_idx,
@@ -347,10 +452,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--formats", default="NVFP4,MXFP8_E4M3,BF16")
     parser.add_argument("--n-calib-samples", type=int, default=2)
     parser.add_argument("--calib-seqlen", type=int, default=128)
+    parser.add_argument("--calib-microbatch", type=int, default=1)
     parser.add_argument("--calib-split", default="train")
     parser.add_argument("--calib-seed", type=int, default=42)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--attn-implementation",
+        default="sdpa",
+        help=(
+            "Transformers attention backend for model load. Accepts built-ins "
+            "such as sdpa/flash_attention_2 and Kernel Hub backends such as "
+            "kernels-community/flash-attn2."
+        ),
+    )
     parser.add_argument("--n-neighbors-validate", type=int, default=4)
     parser.add_argument("--polish-max-passes", type=int, default=8)
     parser.add_argument("--polish-noise-floor", type=float, default=1e-5)
@@ -383,6 +498,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--no-activation-quant",
+        action="store_true",
+        help="Skip activation quantization in surrogate validation and polish KL.",
+    )
+    parser.add_argument(
         "--skip-polish",
         action="store_true",
         help=(
@@ -396,10 +516,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=["four_term", "output_fisher"],
         default="four_term",
         help=(
-            "Surrogate measurement method.  'output_fisher' uses the "
-            "analytic per-token Fisher and is much cheaper on the BF16-"
-            "centered iter 0; sandwich iter 1+ falls back to four_term "
-            "automatically (Fisher form doesn't support non-zero centers)."
+            "Surrogate measurement method. 'output_fisher' uses the analytic "
+            "per-token Fisher and supports sandwich centering at a supplied "
+            "or previous polished assignment."
+        ),
+    )
+    parser.add_argument(
+        "--output-fisher-reduction-device",
+        choices=["cpu", "cuda", "auto"],
+        default="auto",
+        help=(
+            "Device for output-Fisher full-vocab reductions when "
+            "--measure-method=output_fisher. 'cuda' improves utilization on "
+            "small/medium calibration stacks; 'auto' uses CUDA only when the "
+            "estimated full-vocab tensor stack fits a conservative memory budget."
+        ),
+    )
+    parser.add_argument(
+        "--output-fisher-logit-scope",
+        choices=["full_sequence", "last_token"],
+        default="full_sequence",
+        help=(
+            "Output-Fisher KL scope. Use last_token for long calibration "
+            "windows until full-sequence teacher/center streaming is wired."
         ),
     )
     parser.add_argument("--local-files-only", action="store_true")
@@ -412,6 +551,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             "/ output-Fisher measurements, cone validation, and polish all "
             "use production-faithful δw (GPTQ + scale_sweep on NVFP4) "
             "instead of bare RTN."
+        ),
+    )
+    parser.add_argument(
+        "--production-cache-dir-override",
+        default=None,
+        help="Relocate a loaded disk-streamed production cache to this shard directory.",
+    )
+    parser.add_argument(
+        "--production-cache-lru-gb",
+        type=float,
+        default=16.0,
+        help="LRU budget for lazily loaded production-cache shards. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--production-cache-prefetch",
+        choices=["none", "initial_center", "all"],
+        default="initial_center",
+        help=(
+            "Production-cache prefetch policy. 'initial_center' prefetches "
+            "cached low-bit weights used by --initial-center-assignment; "
+            "'all' materializes every shard within the LRU budget; 'none' "
+            "only lazy-loads on demand."
+        ),
+    )
+    parser.add_argument(
+        "--initial-center-assignment",
+        default=None,
+        help=(
+            "Optional per-Linear assignment JSON to use as the first "
+            "sandwich center. This lets Block-CLADO refine around an "
+            "externally measured allocator/frontier candidate instead of "
+            "spending iteration 0 centered at BF16."
         ),
     )
     args = parser.parse_args(argv)
@@ -440,6 +611,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         load_kwargs = {
             "torch_dtype": dtype, "trust_remote_code": True,
             "local_files_only": local_only,
+            "attn_implementation": args.attn_implementation,
         }
         if device == "cuda":
             load_kwargs["device_map"] = "cuda"
@@ -460,6 +632,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             import pickle
             with open(args.production_weight_cache, "rb") as fh:
                 production_weight_cache = pickle.load(fh)
+            if args.production_cache_dir_override:
+                production_weight_cache.relocate(args.production_cache_dir_override)
+            if getattr(production_weight_cache, "cache_dir", None) is not None:
+                verify = production_weight_cache.verify_files()
+                if verify.get("missing"):
+                    raise RuntimeError(
+                        "production cache has missing shard files after relocation; "
+                        f"sample={verify['missing'][:5]}"
+                    )
+            lru_gb = float(args.production_cache_lru_gb)
+            if lru_gb > 0.0:
+                production_weight_cache.enable_lru(int(lru_gb * (1024 ** 3)))
             print(
                 f"[iter] loaded production cache with "
                 f"{len(production_weight_cache)} entries",
@@ -472,6 +656,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         center_assignment: dict[str, str] | None = None
         center_label = "BF16"
+        if args.initial_center_assignment:
+            center_assignment = load_assignment_json(args.initial_center_assignment)
+            center_label = f"initial:{Path(args.initial_center_assignment).stem}"
+            print(
+                f"[iter] initial center assignment {args.initial_center_assignment} "
+                f"({len(center_assignment)} entries)",
+                flush=True,
+            )
+        if production_weight_cache is not None:
+            prefetch_mode = str(args.production_cache_prefetch)
+            if prefetch_mode == "all":
+                n_loaded = production_weight_cache.prefetch()
+                print(f"[iter] production cache prefetched all: {n_loaded}", flush=True)
+            elif prefetch_mode == "initial_center" and center_assignment:
+                keys = [
+                    (qname, fmt.upper())
+                    for qname, fmt in center_assignment.items()
+                    if fmt.upper() not in {"BF16", "MXFP8", "MXFP8_E4M3"}
+                ]
+                n_loaded = production_weight_cache.prefetch(keys)
+                print(
+                    f"[iter] production cache prefetched initial_center: {n_loaded}",
+                    flush=True,
+                )
         prev_polish_hash: str | None = None
         best_overall: IterationResult | None = None
         for iter_idx in range(int(args.max_iterations)):
@@ -495,6 +703,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 use_frozen_weight_cache=bool(args.use_frozen_weight_cache),
                 measure_method=str(args.measure_method),
                 production_weight_cache=production_weight_cache,
+                calib_microbatch=int(args.calib_microbatch),
+                output_fisher_reduction_device=str(args.output_fisher_reduction_device),
+                output_fisher_logit_scope=str(args.output_fisher_logit_scope),
+                include_activation_quant=not bool(args.no_activation_quant),
                 log_callback=log,
             )
             summary_rows.append(result)
