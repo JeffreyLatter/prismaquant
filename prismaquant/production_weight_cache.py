@@ -645,7 +645,14 @@ def fill_production_weight_cache(
             with torch.no_grad():
                 for i in range(calib_ids.size(0)):
                     batch = calib_ids[i:i + 1].to(device)
-                    model(batch)
+                    try:
+                        model(batch, use_cache=False)
+                    except TypeError:
+                        # Some non-HF or older model wrappers do not expose
+                        # use_cache. The cache is only an inference speed
+                        # feature; activation collection is still correct
+                        # without the explicit flag on those models.
+                        model(batch)
         finally:
             collector.remove()
         activations = collector.collected()
