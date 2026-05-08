@@ -6,6 +6,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +30,7 @@ from prismaquant.kl_sensitivity_probe import (
 )
 from prismaquant.iterate_perturbed_allocation import measure_assignment_kl
 from prismaquant.model_profiles import Qwen3Profile
+from prismaquant.production_weight_cache import ProductionWeightCache
 from prismaquant.propagated_cost import resolve_kl_scope
 
 
@@ -402,6 +404,62 @@ def test_replay_cache_auto_window_caps_effective_lane_batch():
     )
 
     assert window == 4
+
+
+def test_production_cache_metadata_validates_identity_and_entries():
+    args = SimpleNamespace(
+        model="/tmp/qwen",
+        target_profile="qwen3",
+        calib_split="train",
+        calib_seed=42,
+        production_cache_levers="gptq,scale_sweep",
+        production_cache_max_act_rows=512,
+    )
+    calib_ids = torch.arange(8, dtype=torch.long).reshape(2, 4)
+    expected = ksp._production_cache_expected_metadata(
+        args,
+        calib_ids,
+        ["model.layers.0.mlp.down_proj"],
+        ["NVFP4"],
+        {"model.layers.0.mlp.down_proj": "bf16"},
+    )
+    cache = ProductionWeightCache(
+        weights={
+            ("model.layers.0.mlp.down_proj", "NVFP4"): torch.zeros(
+                (2, 2), dtype=torch.bfloat16
+            )
+        },
+        levers={"gptq": True, "scale_sweep": True},
+    )
+
+    metadata = ksp._attach_production_cache_metadata(cache, expected)
+    status = ksp._validate_production_cache_metadata(cache, expected)
+
+    assert metadata["identity_sha256"] == expected["identity_sha256"]
+    assert status["validated"] is True
+    assert status["status"] == "validated"
+
+    changed_expected = ksp._production_cache_expected_metadata(
+        args,
+        calib_ids,
+        ["model.layers.0.mlp.down_proj"],
+        ["NVFP4"],
+        {"model.layers.0.mlp.down_proj": "fp8"},
+    )
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        ksp._validate_production_cache_metadata(cache, changed_expected)
+
+    legacy = ProductionWeightCache(
+        weights={
+            ("model.layers.0.mlp.down_proj", "NVFP4"): torch.zeros(
+                (2, 2), dtype=torch.bfloat16
+            )
+        },
+        levers={"gptq": True, "scale_sweep": True},
+    )
+    legacy_status = ksp._validate_production_cache_metadata(legacy, expected)
+    assert legacy_status["status"] == "legacy_missing"
+    assert legacy_status["validated"] is False
 
 
 def test_kl_sensitivity_probe_help_parses():

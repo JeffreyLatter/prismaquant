@@ -102,6 +102,13 @@ def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _empty_cache_each_replay_batch() -> bool:
+    return _env_flag_enabled(
+        "PRISMAQUANT_EMPTY_CACHE_EACH_REPLAY_BATCH",
+        default=False,
+    )
+
+
 def resolve_kl_scope(kl_scope: KLScope | None = None) -> KLScope:
     """Resolve KL reduction scope, preserving the legacy env override.
 
@@ -2295,6 +2302,7 @@ def _lane_replay_cache_logits(
     lane_count: int,
     base_batch: int,
     target_names: set[str],
+    last_token_only: bool = False,
 ) -> torch.Tensor:
     """Replay a populated LayerHiddenStateCache with lane-repeated state.
 
@@ -2340,7 +2348,10 @@ def _lane_replay_cache_logits(
             for module_id, value in original_activation_quantizers.items()
             if module_id not in target_module_ids
         }
-        return replay_cache.replay_from(layer_idx)
+        return replay_cache.replay_from(
+            layer_idx,
+            last_token_only=last_token_only,
+        )
     finally:
         replay_cache.layer_inputs = original_inputs
         replay_cache._layer_call_templates = original_templates
@@ -2355,6 +2366,7 @@ def _override_replay_cache_logits(
     lane_count: int,
     base_batch: int,
     target_names: set[str],
+    last_token_only: bool = False,
 ) -> torch.Tensor:
     """Replay a populated cache with one full override-set per lane."""
     return _lane_replay_cache_logits(
@@ -2363,6 +2375,7 @@ def _override_replay_cache_logits(
         lane_count=lane_count,
         base_batch=base_batch,
         target_names=target_names,
+        last_token_only=last_token_only,
     )
 
 
@@ -3341,6 +3354,7 @@ def measure_lane_batched_kl_deltas(
                                 lane_count=len(lanes),
                                 base_batch=base_batch,
                                 target_names=target_names,
+                                last_token_only=not full_sequence_kl,
                             )
                         )
                         if logits.dim() >= 3:
@@ -3425,7 +3439,11 @@ def measure_lane_batched_kl_deltas(
             finally:
                 if target_hooks is not None:
                     target_hooks.remove()
-                if device.type == "cuda" and torch.cuda.is_available():
+                if (
+                    device.type == "cuda"
+                    and torch.cuda.is_available()
+                    and _empty_cache_each_replay_batch()
+                ):
                     torch.cuda.empty_cache()
             _lb_dt = time.monotonic() - _lb_t_batch
             _lb_elapsed = time.monotonic() - _lb_t0
@@ -3872,6 +3890,7 @@ def measure_override_set_kl(
                                 lane_count=len(lane_overrides),
                                 base_batch=base_batch,
                                 target_names=target_names,
+                                last_token_only=not full_sequence_kl,
                             )
                         )
                         if logits.dim() >= 3:
@@ -3945,7 +3964,11 @@ def measure_override_set_kl(
             finally:
                 if target_hooks is not None:
                     target_hooks.remove()
-                if device.type == "cuda" and torch.cuda.is_available():
+                if (
+                    device.type == "cuda"
+                    and torch.cuda.is_available()
+                    and _empty_cache_each_replay_batch()
+                ):
                     torch.cuda.empty_cache()
             dt = time.monotonic() - _batch_t0
             elapsed = time.monotonic() - _t0

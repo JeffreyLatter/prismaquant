@@ -398,6 +398,7 @@ class LayerHiddenStateCache:
         weight_override: Mapping[str, torch.Tensor] | None = None,
         *,
         return_logits: bool = True,
+        last_token_only: bool = False,
     ) -> torch.Tensor:
         """Replay from cached decoder-layer input through the model tail."""
         self._require_populated()
@@ -418,6 +419,8 @@ class LayerHiddenStateCache:
             hidden = self._apply_final_norm(hidden)
             if not return_logits:
                 return hidden
+            if last_token_only and hidden.dim() >= 3:
+                hidden = hidden[:, -1:, :]
             return self._apply_lm_head(hidden)
 
     def invalidate(self) -> None:

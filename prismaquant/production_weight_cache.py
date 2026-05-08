@@ -93,6 +93,7 @@ class ProductionWeightCache:
     activation_max_abs: dict[str, float] | None = None
     failed: dict[tuple[str, str], str] | None = None
     cache_dir: str | None = None  # set when disk-streaming was used at fill time
+    metadata: dict[str, object] | None = None
     # Backward-compat alias for code that still reads ``activation_scales``.
     activation_scales: dict[str, float] | None = None
     # LRU eviction state for memoized tensor loads.  When non-None, the

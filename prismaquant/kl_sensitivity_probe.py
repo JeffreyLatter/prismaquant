@@ -45,7 +45,8 @@ from prismaquant.propagated_cost import (
 from prismaquant.production_weight_cache import fill_production_weight_cache
 
 
-SCHEMA = "prismaquant.kl_sensitivity_probe.v1"
+SCHEMA = "prismaquant.kl_sensitivity_probe.v2"
+PRODUCTION_CACHE_SCHEMA = "prismaquant.production_weight_cache.v1"
 
 
 @dataclass(frozen=True)
@@ -237,6 +238,156 @@ def _parse_levers(value: str | None) -> dict[str, bool]:
     return {name: True for name in enabled}
 
 
+def _normalized_production_cache_levers(value: str | None) -> dict[str, bool]:
+    levers = _parse_levers(value)
+    levers.setdefault("gptq", True)
+    levers.setdefault("scale_sweep", True)
+    levers.setdefault("awq", False)
+    levers.setdefault("awq_round", False)
+    return dict(sorted(levers.items()))
+
+
+def _production_cache_entries_digest(cache: object) -> str:
+    entries: list[dict[str, object]] = []
+    weights = getattr(cache, "weights", {}) or {}
+    cache_dir = getattr(cache, "cache_dir", None)
+    for key, value in sorted(weights.items()):
+        qname, fmt = key
+        item: dict[str, object] = {
+            "qname": str(qname),
+            "format": str(fmt),
+        }
+        if isinstance(value, torch.Tensor):
+            item.update({
+                "storage": "tensor",
+                "dtype": str(value.dtype).replace("torch.", ""),
+                "shape": [int(dim) for dim in value.shape],
+                "numel": int(value.numel()),
+            })
+        else:
+            path = str(value)
+            resolved = Path(path)
+            if cache_dir and not resolved.is_absolute():
+                resolved = Path(cache_dir) / path
+            size = resolved.stat().st_size if resolved.is_file() else None
+            item.update({
+                "storage": "file",
+                "path": path,
+                "bytes": None if size is None else int(size),
+            })
+        entries.append(item)
+    return _json_digest({"entries": entries})
+
+
+def _production_cache_expected_metadata(
+    args: argparse.Namespace,
+    calib_ids: torch.Tensor,
+    qnames: Sequence[str],
+    formats: Sequence[str],
+    source_manifest: Mapping[str, str | None],
+) -> dict[str, object]:
+    qname_list = sorted(str(q) for q in qnames)
+    fmt_list = sorted(fr.canonical_format_name(fmt) for fmt in formats)
+    relevant_source = {
+        qname: source_manifest.get(qname)
+        for qname in qname_list
+    }
+    payload: dict[str, object] = {
+        "schema": PRODUCTION_CACHE_SCHEMA,
+        "model_path": str(Path(args.model).expanduser()),
+        "target_profile": str(args.target_profile),
+        "calibration": {
+            "split": str(args.calib_split),
+            "n_calib_samples": int(calib_ids.size(0)),
+            "seqlen": int(calib_ids.size(1)) if calib_ids.dim() >= 2 else None,
+            "seed": int(args.calib_seed),
+            "hash": calibration_data_hash(calib_ids),
+        },
+        "formats": fmt_list,
+        "qname_count": int(len(qname_list)),
+        "qnames_sha256": _json_digest({"qnames": qname_list}),
+        "source_manifest_sha256": _json_digest(relevant_source),
+        "levers": _normalized_production_cache_levers(
+            args.production_cache_levers
+        ),
+        "max_act_rows": int(args.production_cache_max_act_rows),
+    }
+    payload["identity_sha256"] = _json_digest(payload)
+    return payload
+
+
+def _attach_production_cache_metadata(
+    cache: object,
+    expected: Mapping[str, object],
+) -> dict[str, object]:
+    metadata = dict(expected)
+    metadata["entries_sha256"] = _production_cache_entries_digest(cache)
+    metadata["manifest_sha256"] = _json_digest({
+        "identity_sha256": metadata.get("identity_sha256"),
+        "entries_sha256": metadata.get("entries_sha256"),
+    })
+    setattr(cache, "metadata", metadata)
+    return metadata
+
+
+def _production_cache_metadata_diag(
+    metadata: Mapping[str, object] | None,
+    expected: Mapping[str, object],
+    *,
+    status: str,
+    validated: bool,
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "validated": bool(validated),
+        "schema": None if metadata is None else metadata.get("schema"),
+        "cache_identity_sha256": (
+            None if metadata is None else metadata.get("identity_sha256")
+        ),
+        "expected_cache_identity_sha256": expected.get("identity_sha256"),
+        "entries_sha256": (
+            None if metadata is None else metadata.get("entries_sha256")
+        ),
+        "manifest_sha256": (
+            None if metadata is None else metadata.get("manifest_sha256")
+        ),
+    }
+
+
+def _validate_production_cache_metadata(
+    cache: object,
+    expected: Mapping[str, object],
+) -> dict[str, object]:
+    metadata = getattr(cache, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return _production_cache_metadata_diag(
+            None,
+            expected,
+            status="legacy_missing",
+            validated=False,
+        )
+    actual_identity = metadata.get("identity_sha256")
+    expected_identity = expected.get("identity_sha256")
+    if actual_identity != expected_identity:
+        raise RuntimeError(
+            "production weight cache identity mismatch; "
+            f"expected={expected_identity} actual={actual_identity}"
+        )
+    actual_entries = metadata.get("entries_sha256")
+    computed_entries = _production_cache_entries_digest(cache)
+    if actual_entries != computed_entries:
+        raise RuntimeError(
+            "production weight cache entry manifest mismatch; "
+            f"expected={actual_entries} actual={computed_entries}"
+        )
+    return _production_cache_metadata_diag(
+        metadata,
+        expected,
+        status="validated",
+        validated=True,
+    )
+
+
 def _production_cache_formats(
     requested_formats: Sequence[str],
     floor_format: str,
@@ -300,6 +451,8 @@ def _prepare_production_weight_cache(
         "lru_gb": None,
         "prefetch": str(args.production_cache_prefetch),
         "built": False,
+        "expected_cache_identity_sha256": None,
+        "metadata": {"status": "not_used", "validated": False},
     }
     if args.candidate_recipe == "raw":
         return None, diag
@@ -308,6 +461,24 @@ def _prepare_production_weight_cache(
     diag["formats"] = list(formats)
     if not formats:
         return None, diag
+
+    cache_qnames = _production_cache_qnames(
+        targets,
+        formats,
+        source_manifest=source_manifest,
+        target_profile=args.target_profile,
+    )
+    diag["qname_count"] = int(len(cache_qnames))
+    if not cache_qnames:
+        return None, diag
+    expected_metadata = _production_cache_expected_metadata(
+        args,
+        calib_ids,
+        cache_qnames,
+        formats,
+        source_manifest,
+    )
+    diag["expected_cache_identity_sha256"] = expected_metadata["identity_sha256"]
 
     cache = None
     cache_path: Path | None = None
@@ -321,15 +492,6 @@ def _prepare_production_weight_cache(
             flush=True,
         )
     else:
-        cache_qnames = _production_cache_qnames(
-            targets,
-            formats,
-            source_manifest=source_manifest,
-            target_profile=args.target_profile,
-        )
-        diag["qname_count"] = int(len(cache_qnames))
-        if not cache_qnames:
-            return None, diag
         cache_dir = (
             Path(args.production_cache_dir)
             if args.production_cache_dir
@@ -354,10 +516,17 @@ def _prepare_production_weight_cache(
             max_act_rows=int(args.production_cache_max_act_rows),
             cache_dir=cache_dir,
         )
+        metadata = _attach_production_cache_metadata(cache, expected_metadata)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "wb") as fh:
             pickle.dump(cache, fh, protocol=pickle.HIGHEST_PROTOCOL)
         diag["built"] = True
+        diag["metadata"] = _production_cache_metadata_diag(
+            metadata,
+            expected_metadata,
+            status="built",
+            validated=True,
+        )
         print(
             f"[kl-probe] wrote production weight cache manifest {cache_path}",
             flush=True,
@@ -369,6 +538,18 @@ def _prepare_production_weight_cache(
     if args.production_cache_dir_override:
         cache.relocate(args.production_cache_dir_override)
     setattr(cache, "_prismaquant_prefetch_policy", args.production_cache_prefetch)
+    if args.production_weight_cache:
+        diag["metadata"] = _validate_production_cache_metadata(
+            cache,
+            expected_metadata,
+        )
+        if not diag["metadata"].get("validated"):
+            print(
+                "[kl-probe] WARNING: loaded production cache has no v1 "
+                "metadata; shard presence and coverage will be checked, but "
+                "calibration/source/lever identity is unverified",
+                flush=True,
+            )
 
     cache_dir_value = getattr(cache, "cache_dir", None)
     diag["path"] = str(cache_path) if cache_path is not None else None
@@ -384,15 +565,8 @@ def _prepare_production_weight_cache(
                 f"missing={len(missing)} sample={missing[:5]}"
             )
 
-    qnames = _production_cache_qnames(
-        targets,
-        formats,
-        source_manifest=source_manifest,
-        target_profile=args.target_profile,
-    )
-    diag["qname_count"] = int(len(qnames))
-    if qnames and not args.allow_incomplete_production_cache:
-        cache.validate_coverage(qnames, formats)
+    if cache_qnames and not args.allow_incomplete_production_cache:
+        cache.validate_coverage(cache_qnames, formats)
 
     lru_gb = float(args.production_cache_lru_gb)
     if lru_gb > 0 and hasattr(cache, "enable_lru"):
@@ -1336,6 +1510,8 @@ def run_probe(args: argparse.Namespace) -> dict:
         "trust_remote_code": True,
         "local_files_only": local_only,
     }
+    if str(args.attn_implementation).lower() != "auto":
+        load_kwargs["attn_implementation"] = str(args.attn_implementation)
     if device.type == "cuda":
         load_kwargs["device_map"] = "cuda"
     model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
@@ -1344,6 +1520,8 @@ def run_probe(args: argparse.Namespace) -> dict:
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
+    attn_impl = getattr(getattr(model, "config", None), "_attn_implementation", None)
+    print(f"[kl-probe] attention_implementation={attn_impl}", flush=True)
 
     try:
         profile = detect_profile(args.model)
@@ -1734,7 +1912,7 @@ def run_probe(args: argparse.Namespace) -> dict:
     )
     payload = {
         "schema": SCHEMA,
-        "version": 1,
+        "version": 2,
         "git_commit": _git_commit(),
         "model_path": str(Path(args.model).expanduser()),
         "staged_model_path": staged,
@@ -1792,6 +1970,7 @@ def run_probe(args: argparse.Namespace) -> dict:
             "device": str(device),
             "dtype": str(dtype).replace("torch.", ""),
             "torch_version": torch.__version__,
+            "attention_implementation": attn_impl,
             "cuda_available": bool(torch.cuda.is_available()),
             "cuda_device_name": (
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
@@ -2027,6 +2206,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(measure_frontier_kl=True)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--attn-implementation",
+        default="sdpa",
+        help=(
+            "Transformers attention backend for model load. Accepts built-ins "
+            "such as sdpa/flash_attention_2 and Kernel Hub backends such as "
+            "kernels-community/flash-attn2. Default sdpa avoids the slow eager "
+            "attention path on long-sequence replay workloads."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument(
         "--target-profile",

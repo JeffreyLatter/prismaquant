@@ -45,6 +45,16 @@ class _TinyCausalLM(nn.Module):
         return SimpleNamespace(logits=self.lm_head(hidden), last_hidden_state=hidden)
 
 
+class _CountingHead(nn.Linear):
+    def __init__(self, hidden: int, vocab: int):
+        super().__init__(hidden, vocab, bias=False)
+        self.last_input_shape = None
+
+    def forward(self, input):  # noqa: A002 - mirrors torch.nn.Module API
+        self.last_input_shape = tuple(input.shape)
+        return super().forward(input)
+
+
 class _MemoryDecoder(nn.Module):
     def __init__(self, vocab: int, hidden: int, layers: int):
         super().__init__()
@@ -96,6 +106,24 @@ def test_layer_state_cache_replay_from_mid_with_no_override():
     for layer_idx in (1, 2, 4):
         replay_logits = cache.replay_from(layer_idx)
         torch.testing.assert_close(replay_logits, full_logits, rtol=0, atol=0)
+
+
+def test_layer_state_cache_last_token_logits_skips_full_sequence_lm_head():
+    torch.manual_seed(11)
+    model = _TinyCausalLM(layers=5).eval()
+    hidden = model.lm_head.in_features
+    vocab = model.lm_head.out_features
+    model.lm_head = _CountingHead(hidden, vocab)
+    calib_ids = _calib_ids(batch=2, seq=7)
+    cache = LayerHiddenStateCache(model)
+
+    cache.populate({}, calib_ids, device="cpu", dtype=torch.float32)
+
+    full_logits = model(calib_ids).logits
+    last_logits = cache.replay_from(2, last_token_only=True)
+
+    torch.testing.assert_close(last_logits, full_logits[:, -1:, :], rtol=0, atol=0)
+    assert model.lm_head.last_input_shape == (2, 1, hidden)
 
 
 def test_layer_state_cache_replay_with_weight_override():
