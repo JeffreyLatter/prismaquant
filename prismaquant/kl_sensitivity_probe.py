@@ -1281,6 +1281,40 @@ def choose_kneedle_point(
     return max(range(len(scores)), key=lambda idx: (scores[idx], ys[idx]))
 
 
+def measured_pareto_frontier_indices(
+    frontier: Sequence[FrontierPoint],
+) -> list[int]:
+    """Return indices whose measured gain improves the best gain at lower bits."""
+    indexed = sorted(
+        enumerate(frontier),
+        key=lambda item: (item[1].bits_total, item[0]),
+    )
+    indices: list[int] = []
+    best_gain = -math.inf
+    for idx, point in indexed:
+        gain = point.measured_gain
+        if gain is None or not math.isfinite(float(gain)):
+            continue
+        gain_f = float(gain)
+        if gain_f > best_gain + 1e-12 or not indices:
+            indices.append(idx)
+            best_gain = gain_f
+    return indices
+
+
+def choose_measured_pareto_kneedle_point(
+    frontier: Sequence[FrontierPoint],
+) -> tuple[int, list[int]]:
+    indices = measured_pareto_frontier_indices(frontier)
+    if not indices:
+        return -1, []
+    pareto = [frontier[idx] for idx in indices]
+    local_idx = choose_kneedle_point(pareto, use_measured=True)
+    if local_idx < 0:
+        return -1, indices
+    return indices[local_idx], indices
+
+
 def _model_hidden_size(model: nn.Module) -> int | None:
     config = getattr(model, "config", None)
     for attr in ("hidden_size", "n_embd", "d_model"):
@@ -2920,7 +2954,13 @@ def run_probe(args: argparse.Namespace) -> dict:
             diag["measured_gain"] = (
                 None if point.measured_gain is None else float(point.measured_gain)
             )
-    knee_idx = choose_kneedle_point(frontier, use_measured=measured_frontier)
+    if measured_frontier:
+        knee_idx, selection_frontier_indices = choose_measured_pareto_kneedle_point(
+            frontier
+        )
+    else:
+        knee_idx = choose_kneedle_point(frontier, use_measured=False)
+        selection_frontier_indices = list(range(len(frontier)))
     chosen = frontier[knee_idx] if knee_idx >= 0 else None
     if chosen is None:
         chosen_assignment = dict(floor_assignment)
@@ -2991,6 +3031,10 @@ def run_probe(args: argparse.Namespace) -> dict:
             "kneedle_gain_source": (
                 "measured_gain" if measured_frontier else "predicted_gain_first_order"
             ),
+            "kneedle_frontier_filter": (
+                "measured_pareto" if measured_frontier else "predicted_pareto"
+            ),
+            "kneedle_frontier_indices": [int(idx) for idx in selection_frontier_indices],
             "frontier": [point.to_json() for point in frontier],
             "seed_assignments": seed_assignment_diagnostics,
             "knee_index": int(knee_idx),

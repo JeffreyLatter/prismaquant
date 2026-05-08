@@ -22,9 +22,11 @@ from prismaquant.kl_sensitivity_probe import (
     ProbeRow,
     UnitOption,
     choose_kneedle_point,
+    choose_measured_pareto_kneedle_point,
     _build_unit_options,
     _fused_assignment_violations,
     measure_frontier_points,
+    measured_pareto_frontier_indices,
     _replay_cache_window_size,
     solve_multi_choice_frontier,
 )
@@ -242,6 +244,54 @@ def test_kneedle_can_select_from_measured_frontier_gain():
     assert choose_kneedle_point(measured, use_measured=True) >= 0
     with pytest.raises(ValueError):
         choose_kneedle_point(points, use_measured=True)
+
+
+def test_measured_kneedle_ignores_regressing_seed_points():
+    floor = FrontierPoint(
+        budget_bits=100.0,
+        bits_total=100.0,
+        bits_delta=0.0,
+        gain=0.0,
+        predicted_kl=1.0,
+        unit_assignment={"a": "NVFP4"},
+        assignment={"a": "NVFP4"},
+        promotion_count=0,
+        measured_kl=1.0,
+        measured_gain=0.0,
+    )
+    regressing_seed = replace(
+        floor,
+        budget_bits=125.0,
+        bits_total=125.0,
+        bits_delta=25.0,
+        assignment={"a": "MXFP8_E4M3"},
+        unit_assignment={"a": "MXFP8_E4M3"},
+        promotion_count=1,
+        measured_kl=1.2,
+        measured_gain=-0.2,
+        source="seed_assignment",
+        label="bad_seed",
+    )
+    improving_seed = replace(
+        floor,
+        budget_bits=200.0,
+        bits_total=200.0,
+        bits_delta=100.0,
+        assignment={"a": "BF16"},
+        unit_assignment={"a": "BF16"},
+        promotion_count=1,
+        measured_kl=0.2,
+        measured_gain=0.8,
+        source="seed_assignment",
+        label="good_seed",
+    )
+    frontier = [floor, regressing_seed, improving_seed]
+
+    assert measured_pareto_frontier_indices(frontier) == [0, 2]
+    knee_idx, selection_indices = choose_measured_pareto_kneedle_point(frontier)
+
+    assert selection_indices == [0, 2]
+    assert knee_idx == 2
 
 
 def test_measure_frontier_points_reuses_floor_kl(monkeypatch, tmp_path):
