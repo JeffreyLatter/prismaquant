@@ -355,7 +355,7 @@ def test_seed_assignment_loader_normalizes_current_oracle_candidate(tmp_path):
     assert diag["included"] is True
 
 
-def test_seed_assignment_points_dedupe_against_frontier(tmp_path):
+def test_seed_assignment_points_dedupe_against_frontier():
     floor_assignment = {"a": "NVFP4", "b": "NVFP4"}
     frontier = [
         FrontierPoint(
