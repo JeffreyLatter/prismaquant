@@ -5105,23 +5105,35 @@ def main():
                          "against the same cache.")
     ap.add_argument("--halo-mode", default="off",
                     choices=("off", "random"),
-                    help="HALO rotation preprocessor (#4). When 'random', "
-                         "applies a random Hadamard rotation R to the "
-                         "residual stream and absorbs R into adjacent "
-                         "Linear weights. Diffuses outliers across "
-                         "channels — downstream NVFP4/MXFP8 quantization "
-                         "has lower reconstruction error. No new vLLM "
-                         "kernel required (R is absorbed into weights "
-                         "and norms). Expected gain: ~0.20-0.30 PPL on "
-                         "Llama-class models. Critical: assumes standard "
+                    help="HALO rotation preprocessor (EXPERIMENTAL, opt-in; "
+                         "default OFF). When 'random', applies a random "
+                         "Hadamard rotation R to the residual stream and "
+                         "absorbs R into adjacent Linear weights. Diffuses "
+                         "outliers across channels — downstream NVFP4/MXFP8 "
+                         "RTN reconstruction error is lower in theory. No "
+                         "new vLLM kernel required (R is absorbed into "
+                         "weights and norms). Literature gain on Llama-class "
+                         "W4A4 is ~0.20-0.30 PPL against an RTN baseline; "
+                         "the gain on top of PrismaQuant's full GPTQ + "
+                         "scale_sweep + activation_clip + sibling-globals "
+                         "stack is UNMEASURED on every architecture as of "
+                         "2026-05-09 — the published Qwen3.6-27B artifact "
+                         "does not use HALO. Use only for research / Pareto "
+                         "exploration, not ship-grade artifacts, until "
+                         "per-arch quality wins have been measured against "
+                         "the no-HALO baseline. Correctness verified on "
+                         "Qwen3.5/3.6 dense (untied-lm_head + offset-residual "
+                         "RMSNorm fold). Critical: assumes standard "
                          "transformer block topology (input_layernorm + "
                          "q/k/v/o_proj, post_attention_layernorm + "
-                         "gate/up/down_proj), untied embeddings, and "
-                         "a standard dense residual stream. Non-power-of-2 "
+                         "gate/up/down_proj), untied embeddings, and a "
+                         "standard dense residual stream. Non-power-of-2 "
                          "hidden sizes use a structured block-Hadamard "
                          "rotation. Profile-specific overrides are still "
                          "needed for packed MoE or non-standard residual "
-                         "topologies.")
+                         "topologies. MTP spec-decode acceptance under HALO "
+                         "is unvalidated — manifest flags "
+                         "`mtp_policy: passthrough_requires_spec_decode_validation`.")
     ap.add_argument("--halo-seed", type=int, default=0,
                     help="RNG seed for HALO sign-diagonal in random "
                          "Hadamard. Saved alongside the artifact at "
@@ -5374,6 +5386,12 @@ def main():
     halo_R = None
     halo_meta = {"mode": "off"}
     if args.halo_mode == "random":
+        print("[halo] EXPERIMENTAL: HALO is enabled. Pareto win on top of "
+              "PrismaQuant's GPTQ + scale_sweep + activation_clip stack is "
+              "UNMEASURED as of 2026-05-09. Treat the resulting artifact as a "
+              "research output, not ship-grade, until KL/PPL has been "
+              "compared against the same recipe with --halo-mode off.",
+              flush=True)
         from .halo import _hadamard_block_sizes, random_hadamard
         from transformers import AutoConfig as _AC
 
