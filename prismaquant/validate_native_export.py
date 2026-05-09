@@ -76,6 +76,9 @@ def main():
                          "to exercise MTP heads, e.g. "
                          "'{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 3, "
                          "\"model\": \"<same model dir>\"}'.")
+    ap.add_argument("--no-enforce-eager", action="store_true",
+                    help="Allow vLLM compile/CUDA-graph execution instead of "
+                         "forcing eager mode. Use after the eager smoke passes.")
     args = ap.parse_args()
 
     if not args.no_flashinfer_upgrade:
@@ -99,7 +102,7 @@ def main():
         model=str(model_dir),
         quantization="compressed-tensors",
         trust_remote_code=True,
-        enforce_eager=True,
+        enforce_eager=not args.no_enforce_eager,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         max_num_seqs=1,
