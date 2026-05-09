@@ -200,14 +200,18 @@ class ProductionWeightCache:
                 ),
             )
 
+        loaded_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            loaded = [item for item in pool.map(_load_one, keys) if item is not None]
-        for key, original_value, tensor in loaded:
-            if isinstance(self.weights.get(key), torch.Tensor):
-                continue
-            self.weights[key] = tensor
-            self._record_lru_load(key, original_value, tensor)
-        return len(loaded)
+            for item in pool.map(_load_one, keys):
+                if item is None:
+                    continue
+                key, original_value, tensor = item
+                if isinstance(self.weights.get(key), torch.Tensor):
+                    continue
+                self.weights[key] = tensor
+                self._record_lru_load(key, original_value, tensor)
+                loaded_count += 1
+        return loaded_count
 
     def _resolve_to_tensor(self, key: tuple[str, str]) -> torch.Tensor | None:
         """Return the tensor at ``key`` (lazy-load from disk if needed).
@@ -587,14 +591,22 @@ def fill_production_weight_cache(
         safe = qname.replace("/", "__").replace(".", "_")
         return f"{safe}__{fmt}.pt"
 
+    fmt_set = {f.upper() for f in formats}
+    activation_aware_formats = {"NVFP4"}
     qnames_to_render: set[str] = set(qname_set)
+    missing_formats_by_qname: dict[str, set[str]] = {
+        q: set(fmt_set) for q in qname_set
+    }
     if cache_dir_path is not None:
         # A qname is FULLY done if every requested format has a shard.
-        fmts_upper = [f.upper() for f in formats]
         prerendered = 0
         for q in list(qname_set):
-            if all((cache_dir_path / _safe_path_early(q, f)).is_file()
-                   for f in fmts_upper):
+            missing = {
+                f for f in fmt_set
+                if not (cache_dir_path / _safe_path_early(q, f)).is_file()
+            }
+            missing_formats_by_qname[q] = missing
+            if not missing:
                 qnames_to_render.discard(q)
                 prerendered += 1
         if progress and prerendered:
@@ -603,6 +615,10 @@ def fill_production_weight_cache(
                 f"({len(qnames_to_render)} still need rendering)",
                 flush=True,
             )
+    qnames_needing_activation = {
+        q for q, missing in missing_formats_by_qname.items()
+        if any(f in activation_aware_formats for f in missing)
+    }
 
     device = next(model.parameters()).device
     # RESUME: if all qnames are already rendered AND we have either a
@@ -616,10 +632,10 @@ def fill_production_weight_cache(
     )
     skip_forward = (
         cache_dir_path is not None
-        and not qnames_to_render
+        and not qnames_needing_activation
         and (
             (sidecar_path is not None and sidecar_path.is_file())
-            or "NVFP4" not in {f.upper() for f in formats}
+            or "NVFP4" not in fmt_set
         )
     )
     collector = None  # may stay None on the skip_forward path
@@ -638,7 +654,7 @@ def fill_production_weight_cache(
             model,
             qnames=qname_set,
             max_rows=max_act_rows,
-            store_qnames=qnames_to_render,
+            store_qnames=qnames_needing_activation,
         )
         collector.install()
         try:
@@ -688,7 +704,11 @@ def fill_production_weight_cache(
     # gets its own scale and vLLM's loader either rejects the artifact or
     # silently runs with degraded accuracy.
     joint_globals: dict[str, torch.Tensor] = {}
-    if "NVFP4" in {f.upper() for f in formats}:
+    needs_nvfp4_render = any(
+        "NVFP4" in missing
+        for missing in missing_formats_by_qname.values()
+    )
+    if needs_nvfp4_render:
         from prismaquant.export_native_compressed import (
             _compute_nvfp4_joint_global,
         )
@@ -730,7 +750,6 @@ def fill_production_weight_cache(
                     flush=True,
                 )
 
-    fmt_set = {f.upper() for f in formats}
     if "NVFP4" in fmt_set:
         # Group by fused sibling key for max-across-siblings unification.
         from prismaquant.block_clado import fused_group_key

@@ -134,6 +134,61 @@ def _resolve_weight_session_snapshot_dir(
     return _output_fisher_weight_session_snapshot_dir(cache_dir)
 
 
+def _production_cache_key_variants(qname: str, fmt: str):
+    yield (qname, fmt)
+    if qname.endswith(".weight"):
+        yield (qname[:-len(".weight")], fmt)
+    if qname.startswith("model.language_model."):
+        yield ("model." + qname[len("model.language_model."):], fmt)
+    elif qname.startswith("model."):
+        yield ("model.language_model." + qname[len("model."):], fmt)
+
+
+def _prefetch_block_weight_options(
+    production_weight_cache,
+    units: Sequence[bc.DecisionUnit],
+    *,
+    per_unit_center: Mapping[str, str],
+) -> tuple[int, int]:
+    """Prefetch cache-backed weights needed by a block's OF swaps.
+
+    Output-Fisher applies many one-unit assignment deltas inside a block.
+    Without this look-ahead, each delta can synchronously ``torch.load`` a
+    large shard, producing the CPU/disk-heavy sawtooth we see on 27B.  The
+    underlying cache remains LRU-bounded, so this is a bounded block-local
+    warmup rather than full materialization.
+    """
+    if production_weight_cache is None or not hasattr(production_weight_cache, "prefetch"):
+        return 0, 0
+    cache_weights = getattr(production_weight_cache, "weights", {}) or {}
+    if not cache_weights:
+        return 0, 0
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for unit in units:
+        center_fmt = fr.canonical_format_name(
+            str(per_unit_center.get(unit.name, "BF16"))
+        )
+        target_fmts = {center_fmt}
+        for opt in unit.options:
+            target_fmts.add(fr.canonical_format_name(str(opt.fmt)))
+        target_fmts.discard("BF16")
+        for member in unit.member_qnames:
+            for fmt in target_fmts:
+                chosen = None
+                for key in _production_cache_key_variants(str(member), fmt):
+                    if key in cache_weights:
+                        chosen = key
+                        break
+                if chosen is None or chosen in seen:
+                    continue
+                seen.add(chosen)
+                keys.append(chosen)
+    if not keys:
+        return 0, 0
+    return len(keys), int(production_weight_cache.prefetch(keys))
+
+
 _OF_CHECKPOINT_SCHEMA = "prismaquant.output_fisher.checkpoint.v1"
 
 
@@ -987,6 +1042,19 @@ def collect_output_fisher(
                         "total": int(n_pert_total),
                     })
                 continue
+            if not include_activation_quant and weight_session is not None:
+                n_prefetch_keys, n_prefetch_loaded = _prefetch_block_weight_options(
+                    production_weight_cache,
+                    units_in_block,
+                    per_unit_center=per_unit_center,
+                )
+                if progress_callback is not None and n_prefetch_keys:
+                    progress_callback({
+                        "event": "production_cache_block_prefetch",
+                        "block_id": block_id,
+                        "keys": int(n_prefetch_keys),
+                        "loaded": int(n_prefetch_loaded),
+                    })
             block_cache: dict[tuple[str, str], list[torch.Tensor]] = {}
             for unit in units_in_block:
                 center_fmt = per_unit_center[unit.name]
