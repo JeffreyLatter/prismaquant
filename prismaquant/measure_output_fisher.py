@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import shutil
@@ -120,6 +121,191 @@ def _output_fisher_weight_session_snapshot_dir(cache_dir: Path) -> str | None:
     if _env_truthy("PRISMAQUANT_OF_SPILL_WEIGHT_SESSION"):
         return str(cache_dir / "weight_session_snapshots")
     return None
+
+
+_OF_CHECKPOINT_SCHEMA = "prismaquant.output_fisher.checkpoint.v1"
+
+
+def _output_fisher_checkpoint_enabled() -> bool:
+    return not _env_truthy("PRISMAQUANT_OF_DISABLE_CHECKPOINT", default=False)
+
+
+def _output_fisher_checkpoint_path(cache_dir: Path) -> Path:
+    return cache_dir / "output_fisher_checkpoint.json"
+
+
+def _output_fisher_signature(
+    *,
+    calib_ids: torch.Tensor,
+    specs_sorted: Sequence[fr.FormatSpec],
+    blocks: Mapping[str, Sequence[bc.DecisionUnit]],
+    singletons: Sequence[bc.DecisionUnit],
+    base_assignment: Mapping[str, str],
+    per_unit_center: Mapping[str, str],
+    include_activation_quant: bool,
+    use_frozen_weight_cache: bool,
+    skip_pairs: bool,
+    logit_scope: str,
+    calib_microbatch: int,
+    reduction_dev: torch.device,
+    delta_z_dtype: torch.dtype,
+    pin_to_bf16: Sequence[str],
+) -> dict:
+    """Stable signature for checkpoint compatibility checks."""
+    units = []
+    for unit in [
+        *(u for ulist in blocks.values() for u in ulist),
+        *singletons,
+    ]:
+        units.append({
+            "name": unit.name,
+            "block_id": unit.block_id,
+            "members": list(unit.member_qnames),
+            "options": [
+                {
+                    "fmt": opt.fmt,
+                    "bits_per_param": float(opt.bits_per_param),
+                    "memory_bytes": int(opt.memory_bytes),
+                }
+                for opt in unit.options
+            ],
+        })
+    units.sort(key=lambda u: (u["block_id"], u["name"]))
+    payload = {
+        "calibration_hash": calibration_data_hash(calib_ids),
+        "calib_shape": list(calib_ids.shape),
+        "formats": [s.name for s in specs_sorted],
+        "include_activation_quant": bool(include_activation_quant),
+        "use_frozen_weight_cache": bool(use_frozen_weight_cache),
+        "skip_pairs": bool(skip_pairs),
+        "logit_scope": str(logit_scope),
+        "calib_microbatch": int(max(int(calib_microbatch), 1)),
+        "reduction_device": str(reduction_dev),
+        "delta_z_dtype": str(delta_z_dtype),
+        "pin_to_bf16": [str(p) for p in pin_to_bf16],
+        "base_assignment": sorted((str(k), str(v)) for k, v in base_assignment.items()),
+        "per_unit_center": sorted((str(k), str(v)) for k, v in per_unit_center.items()),
+        "units": units,
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "sha256": hashlib.sha256(blob).hexdigest(),
+        "payload": payload,
+    }
+
+
+def _serialize_omega_ii(values: Mapping[tuple[str, str], float]) -> list[dict]:
+    return [
+        {"unit": unit, "fmt": fmt, "value": float(value)}
+        for (unit, fmt), value in sorted(values.items())
+    ]
+
+
+def _deserialize_omega_ii(rows: Sequence[Mapping]) -> dict[tuple[str, str], float]:
+    out: dict[tuple[str, str], float] = {}
+    for row in rows:
+        out[(str(row["unit"]), str(row["fmt"]))] = float(row["value"])
+    return out
+
+
+def _serialize_pairs_by_block(
+    pairs_by_block: Mapping[str, Sequence[bc.BlockPair]],
+) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for block_id, pairs in pairs_by_block.items():
+        out[str(block_id)] = [
+            {
+                "unit_a": pair.unit_a,
+                "unit_b": pair.unit_b,
+                "block_id": pair.block_id,
+                "omega_ij": [
+                    {"fmt_a": fmt_a, "fmt_b": fmt_b, "value": float(value)}
+                    for (fmt_a, fmt_b), value in sorted(pair.omega_ij.items())
+                ],
+            }
+            for pair in pairs
+        ]
+    return out
+
+
+def _deserialize_pairs_by_block(
+    payload: Mapping[str, Sequence[Mapping]],
+) -> dict[str, list[bc.BlockPair]]:
+    out: dict[str, list[bc.BlockPair]] = {}
+    for block_id, rows in payload.items():
+        out[str(block_id)] = [
+            bc.BlockPair(
+                unit_a=str(row["unit_a"]),
+                unit_b=str(row["unit_b"]),
+                block_id=str(row.get("block_id", block_id)),
+                omega_ij={
+                    (str(item["fmt_a"]), str(item["fmt_b"])): float(item["value"])
+                    for item in row.get("omega_ij", [])
+                },
+            )
+            for row in rows
+        ]
+    return out
+
+
+def _load_output_fisher_checkpoint(
+    path: Path,
+    signature: Mapping,
+) -> dict | None:
+    if not _output_fisher_checkpoint_enabled() or not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        return None
+    if raw.get("schema") != _OF_CHECKPOINT_SCHEMA:
+        return None
+    if raw.get("signature", {}).get("sha256") != signature.get("sha256"):
+        return None
+    try:
+        return {
+            "omega_ii": _deserialize_omega_ii(raw.get("omega_ii", [])),
+            "pairs_by_block": _deserialize_pairs_by_block(
+                raw.get("pairs_by_block", {}),
+            ),
+            "completed_blocks": set(raw.get("completed_blocks", [])),
+            "completed_singletons": {
+                (str(row["unit"]), str(row["fmt"]))
+                for row in raw.get("completed_singletons", [])
+            },
+            "updated_at": raw.get("updated_at"),
+        }
+    except Exception:
+        return None
+
+
+def _write_output_fisher_checkpoint(
+    path: Path,
+    *,
+    signature: Mapping,
+    omega_ii: Mapping[tuple[str, str], float],
+    pairs_by_block: Mapping[str, Sequence[bc.BlockPair]],
+    completed_blocks: set[str],
+    completed_singletons: set[tuple[str, str]],
+) -> None:
+    if not _output_fisher_checkpoint_enabled():
+        return
+    payload = {
+        "schema": _OF_CHECKPOINT_SCHEMA,
+        "signature": dict(signature),
+        "updated_at": time.time(),
+        "omega_ii": _serialize_omega_ii(omega_ii),
+        "pairs_by_block": _serialize_pairs_by_block(pairs_by_block),
+        "completed_blocks": sorted(str(b) for b in completed_blocks),
+        "completed_singletons": [
+            {"unit": unit, "fmt": fmt}
+            for unit, fmt in sorted(completed_singletons)
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +795,63 @@ def collect_output_fisher(
             sum(1 for opt in u.options if opt.fmt != per_unit_center[u.name])
             for u in all_units
         )
-        n_pert_done = 0
+        pairs_by_block: dict[str, list[bc.BlockPair]] = {}
+        completed_blocks: set[str] = set()
+        completed_singletons: set[tuple[str, str]] = set()
+        checkpoint_path = _output_fisher_checkpoint_path(cache_dir)
+        checkpoint_signature = _output_fisher_signature(
+            calib_ids=calib_ids,
+            specs_sorted=specs_sorted,
+            blocks=blocks,
+            singletons=singletons,
+            base_assignment=base_assignment,
+            per_unit_center=per_unit_center,
+            include_activation_quant=include_activation_quant,
+            use_frozen_weight_cache=use_frozen_weight_cache,
+            skip_pairs=skip_pairs,
+            logit_scope=logit_scope,
+            calib_microbatch=calib_microbatch,
+            reduction_dev=reduction_dev,
+            delta_z_dtype=delta_z_dtype,
+            pin_to_bf16=pin_to_bf16,
+        )
+        checkpoint = _load_output_fisher_checkpoint(
+            checkpoint_path,
+            checkpoint_signature,
+        )
+        checkpoint_resumed = False
+        if checkpoint is not None:
+            omega_ii.update(checkpoint["omega_ii"])
+            pairs_by_block.update(checkpoint["pairs_by_block"])
+            completed_blocks = set(checkpoint["completed_blocks"])
+            completed_singletons = set(checkpoint["completed_singletons"])
+            checkpoint_resumed = bool(completed_blocks or completed_singletons)
+        n_pert_done = sum(
+            1
+            for unit in all_units
+            for opt in unit.options
+            if opt.fmt != per_unit_center[unit.name]
+            and (unit.name, opt.fmt) in omega_ii
+        )
+        if progress_callback is not None and checkpoint_resumed:
+            progress_callback({
+                "event": "checkpoint_loaded",
+                "path": str(checkpoint_path),
+                "completed": int(n_pert_done),
+                "total": int(n_pert_total),
+                "completed_blocks": len(completed_blocks),
+                "completed_singletons": len(completed_singletons),
+            })
+
+        def _write_checkpoint() -> None:
+            _write_output_fisher_checkpoint(
+                checkpoint_path,
+                signature=checkpoint_signature,
+                omega_ii=omega_ii,
+                pairs_by_block=pairs_by_block,
+                completed_blocks=completed_blocks,
+                completed_singletons=completed_singletons,
+            )
 
         def _measure_delta_for_option(
             unit: bc.DecisionUnit,
@@ -707,8 +949,16 @@ def collect_output_fisher(
             del z_pert
             return [t.to(delta_z_dtype).contiguous() for t in delta_z]
 
-        pairs_by_block: dict[str, list[bc.BlockPair]] = {}
         for block_id, units_in_block in blocks.items():
+            if block_id in completed_blocks and block_id in pairs_by_block:
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "checkpoint_block_skipped",
+                        "block_id": block_id,
+                        "completed": int(n_pert_done),
+                        "total": int(n_pert_total),
+                    })
+                continue
             block_cache: dict[tuple[str, str], list[torch.Tensor]] = {}
             for unit in units_in_block:
                 center_fmt = per_unit_center[unit.name]
@@ -763,6 +1013,8 @@ def collect_output_fisher(
                         "n_pairs": len(pair_list),
                     })
 
+            completed_blocks.add(block_id)
+            _write_checkpoint()
             del block_cache
             gc.collect()
 
@@ -772,8 +1024,16 @@ def collect_output_fisher(
                 if opt.fmt == center_fmt:
                     omega_ii[(unit.name, opt.fmt)] = 0.0
                     continue
+                if (
+                    (unit.name, opt.fmt) in completed_singletons
+                    and (unit.name, opt.fmt) in omega_ii
+                ):
+                    continue
                 delta_z = _measure_delta_for_option(unit, opt)
                 del delta_z
+                if (unit.name, opt.fmt) in omega_ii:
+                    completed_singletons.add((unit.name, opt.fmt))
+                    _write_checkpoint()
 
         # ---------------------------------------------------------------
         # Phase 4: assemble payload
@@ -843,6 +1103,13 @@ def collect_output_fisher(
             "n_perturbation_forwards": int(n_pert_done) + (2 if is_sandwich else 1),
             "skip_pairs": bool(skip_pairs),
             "delta_z_dtype": str(delta_z_dtype),
+            "checkpoint": {
+                "enabled": bool(_output_fisher_checkpoint_enabled()),
+                "path": str(checkpoint_path),
+                "resumed": bool(checkpoint_resumed),
+                "completed_blocks": len(completed_blocks),
+                "completed_singletons": len(completed_singletons),
+            },
         }
         return bc.units_and_pairs_to_payload(
             blocks=new_blocks,

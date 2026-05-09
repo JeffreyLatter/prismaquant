@@ -272,6 +272,76 @@ def test_collect_output_fisher_pins_lm_head_before_measurement(monkeypatch, tmp_
     assert set(options) == {"BF16"}
 
 
+def test_collect_output_fisher_resumes_completed_block_checkpoint(monkeypatch, tmp_path):
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = nn.Parameter(torch.zeros(()))
+
+    bf16 = bc.FormatCost(fmt="BF16", omega_ii=0.0, bits_per_param=16.0, memory_bytes=8)
+    nvfp4 = bc.FormatCost(fmt="NVFP4", omega_ii=0.0, bits_per_param=4.0, memory_bytes=2)
+    unit_a = bc.DecisionUnit(
+        name="block.a",
+        block_id="block.0",
+        member_qnames=("block.a",),
+        options=(bf16, nvfp4),
+    )
+    unit_b = bc.DecisionUnit(
+        name="block.b",
+        block_id="block.0",
+        member_qnames=("block.b",),
+        options=(bf16, nvfp4),
+    )
+
+    monkeypatch.setattr(
+        of,
+        "discover_blocks",
+        lambda model, profile, formats: ({"block.0": [unit_a, unit_b]}, [], {}),
+    )
+    monkeypatch.setattr(
+        of,
+        "_forward_logits",
+        lambda model, calib_ids, **kwargs: [torch.zeros((1, 4), dtype=torch.float32)],
+    )
+    calls = {"perturbed": 0}
+
+    def perturbed_logits(model, assignment, calib_ids, **kwargs):
+        calls["perturbed"] += 1
+        value = float(calls["perturbed"])
+        return [torch.tensor([[value, 0.0, -value, 0.5]], dtype=torch.float32)]
+
+    monkeypatch.setattr(of, "_forward_logits_with_assignment", perturbed_logits)
+
+    first = of.collect_output_fisher(
+        DummyModel(),
+        torch.ones((1, 1), dtype=torch.long),
+        [fr.get_format("NVFP4"), fr.get_format("BF16")],
+        cache_dir=tmp_path,
+        include_activation_quant=True,
+    )
+    assert calls["perturbed"] == 2
+    assert (tmp_path / "output_fisher_checkpoint.json").is_file()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("completed block should have been loaded from checkpoint")
+
+    monkeypatch.setattr(of, "_forward_logits_with_assignment", fail_if_called)
+    events = []
+    second = of.collect_output_fisher(
+        DummyModel(),
+        torch.ones((1, 1), dtype=torch.long),
+        [fr.get_format("NVFP4"), fr.get_format("BF16")],
+        cache_dir=tmp_path,
+        include_activation_quant=True,
+        progress_callback=events.append,
+    )
+
+    assert second["blocks"]["block.0"]["units"] == first["blocks"]["block.0"]["units"]
+    assert len(second["blocks"]["block.0"]["pairs"]) == 1
+    assert any(e.get("event") == "checkpoint_loaded" for e in events)
+    assert any(e.get("event") == "checkpoint_block_skipped" for e in events)
+
+
 def test_auto_reduction_device_stays_cpu_for_cpu_model():
     class DummyModel(nn.Module):
         def __init__(self):
