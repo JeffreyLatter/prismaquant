@@ -14,6 +14,51 @@ that should be used for new runs.
 from .format_registry import FormatSpec, REGISTRY, register_format
 
 
+def _ensure_triton_cache_writable() -> None:
+    """Keep Triton-backed model code from falling back to CPU.
+
+    Some of the Qwen linear-attention dependencies import FLA, which asks
+    Triton for the active CUDA target at import time.  If Triton cannot write
+    its cache, FLA catches the exception, decides the platform is CPU-only,
+    and later crashes in the CUDA forward path.  Respect an explicit
+    TRITON_CACHE_DIR; otherwise redirect only when the default cache is not
+    writable by this user.
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+
+    def _is_writable_dir(path: Path) -> bool:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                prefix=".prismaquant-write-",
+                dir=path,
+                delete=True,
+            ):
+                pass
+            return True
+        except Exception:
+            return False
+
+    configured = os.environ.get("TRITON_CACHE_DIR")
+    if configured:
+        try:
+            Path(configured).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return
+
+    default = Path.home() / ".triton" / "cache"
+    if _is_writable_dir(default):
+        return
+
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    fallback = base / "prismaquant" / "triton"
+    fallback.mkdir(parents=True, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = str(fallback)
+
+
 # Transformers compatibility polyfill.
 # Some remote modeling files (e.g. MiniMax-M2/M2.7's modeling_minimax_m2.py)
 # import `OutputRecorder` from `transformers.utils.generic`. In
@@ -105,5 +150,7 @@ def _polyfill_transformers() -> None:
         pass
 
 
+_ensure_triton_cache_writable()
 _polyfill_transformers()
+del _ensure_triton_cache_writable
 del _polyfill_transformers
