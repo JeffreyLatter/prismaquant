@@ -258,6 +258,11 @@ def _parse_levers(value: str | None) -> dict[str, bool]:
 def _normalized_production_cache_levers(value: str | None) -> dict[str, bool]:
     levers = _parse_levers(value)
     levers.setdefault("gptq", True)
+    levers.setdefault(
+        "gptq_damp_sweep",
+        bool(levers.get("gptq", True))
+        and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
+    )
     levers.setdefault("scale_sweep", True)
     levers.setdefault("awq", False)
     levers.setdefault("awq_round", False)
@@ -3324,7 +3329,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="gptq,scale_sweep",
         help=(
             "Comma-separated production cleanup levers for on-the-fly cache "
-            "builds. Default: gptq,scale_sweep."
+            "builds. Default: gptq,scale_sweep; GPTQ damp-sweep follows "
+            "PRISMAQUANT_GPTQ_DAMP_SWEEP and is recorded in cache metadata."
         ),
     )
     parser.add_argument(

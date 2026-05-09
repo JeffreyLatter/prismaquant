@@ -54,6 +54,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import torch
@@ -567,6 +568,11 @@ def fill_production_weight_cache(
     """
     levers = dict(levers) if levers is not None else {}
     levers.setdefault("gptq", True)
+    levers.setdefault(
+        "gptq_damp_sweep",
+        bool(levers.get("gptq", True))
+        and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
+    )
     levers.setdefault("scale_sweep", True)
     levers.setdefault("awq", False)
     levers.setdefault("awq_round", False)
@@ -574,6 +580,9 @@ def fill_production_weight_cache(
     qname_set = set(qnames)
     if not qname_set:
         return ProductionWeightCache(weights={}, levers=dict(levers))
+
+    if progress:
+        print(f"[prod-cache] levers={dict(sorted(levers.items()))}", flush=True)
 
     # RESUME: when disk-streaming is on and prior shards exist, only
     # collect activations for Linears whose shards we still need to
