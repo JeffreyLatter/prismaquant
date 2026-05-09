@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import pytest
 
 from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
 from prismaquant.production_weight_cache import ProductionWeightCache
 from prismaquant.production_weight_cache import fill_production_weight_cache
+from prismaquant.production_recache import recache_production_weight_cache
 
 
 def test_prefetch_loads_disk_entries_and_respects_lru(tmp_path):
@@ -55,3 +57,60 @@ def test_production_cache_records_damp_sweep_lever(monkeypatch):
     assert _normalized_production_cache_levers(
         "gptq,scale_sweep"
     )["gptq_damp_sweep"] is True
+
+
+class _TinyChain(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(4, 32)
+        self.l1 = nn.Linear(32, 32, bias=False)
+        self.l2 = nn.Linear(32, 32, bias=False)
+        with torch.no_grad():
+            self.embed.weight.zero_()
+            self.embed.weight[0, 0] = 1.0
+            self.embed.weight[1, 1] = 2.0
+            self.l1.weight.copy_(torch.eye(32))
+            self.l2.weight.fill_(1.0)
+
+    def forward(self, input_ids, use_cache=False):
+        x = self.embed(input_ids)
+        x = self.l1(x)
+        return self.l2(x)
+
+
+def test_production_recache_measures_quantized_upstream_activation_range():
+    model = _TinyChain()
+    cache = ProductionWeightCache(
+        weights={("l1", "NVFP4"): 3.0 * torch.eye(32)},
+        levers={"gptq": True, "scale_sweep": True},
+        activation_max_abs={"l1": 2.0, "l2": 2.0},
+    )
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+
+    max_abs = recache_production_weight_cache(
+        model,
+        calib_ids,
+        {"l1": "NVFP4", "l2": "BF16"},
+        cache,
+        include_activation_quant=False,
+        progress=False,
+    )
+
+    assert max_abs["l1"] == pytest.approx(2.0)
+    assert max_abs["l2"] == pytest.approx(6.0)
+    assert cache.activation_max_abs["l2"] == pytest.approx(6.0)
+    assert cache.metadata["activation_recache"]["status"] == "applied"
+
+
+def test_fill_production_cache_recache_requires_concrete_assignment():
+    model = nn.Linear(1, 1, bias=False)
+    calib_ids = torch.empty((0, 1), dtype=torch.long)
+
+    with pytest.raises(ValueError, match="recache_assignment"):
+        fill_production_weight_cache(
+            model,
+            calib_ids,
+            qnames=[],
+            progress=False,
+            recache_pass=True,
+        )

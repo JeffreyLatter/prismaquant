@@ -553,6 +553,10 @@ def fill_production_weight_cache(
     max_act_rows: int = 256,
     progress: bool = True,
     cache_dir: str | Path | None = None,
+    recache_pass: bool = False,
+    recache_assignment: Mapping[str, str] | None = None,
+    recache_include_activation_quant: bool = True,
+    recache_microbatch_size: int = 1,
 ) -> ProductionWeightCache:
     """End-to-end fill: collect activations, render production δw per
     (qname, fmt), return a `ProductionWeightCache`.
@@ -565,7 +569,18 @@ def fill_production_weight_cache(
       formats: which formats to pre-render.  MXFP8/BF16 are RTN-equivalent
         so we still cache them so the lookup is uniform.
       levers: which production levers to enable (default: gptq+scale_sweep).
+      recache_pass: when True, run a second calibration forward with the
+        concrete production assignment installed from this cache and refit
+        ``activation_max_abs`` under quantized upstream weights.
+      recache_assignment: required when ``recache_pass`` is True.  Candidate
+        caches with multiple possible formats per Linear are ambiguous; recache
+        needs the actual export assignment.
     """
+    if recache_pass and not recache_assignment:
+        raise ValueError(
+            "recache_pass=True requires recache_assignment with the concrete "
+            "production assignment"
+        )
     levers = dict(levers) if levers is not None else {}
     levers.setdefault("gptq", True)
     levers.setdefault(
@@ -918,10 +933,25 @@ def fill_production_weight_cache(
             f"({skipped_resumed} resumed from disk); {len(failed)} failures",
             flush=True,
         )
-    return ProductionWeightCache(
+    cache = ProductionWeightCache(
         weights=weights,
         levers=dict(levers),
         activation_max_abs=activation_max_abs or None,
         failed=failed,
         cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
     )
+    if recache_pass:
+        from prismaquant.production_recache import recache_production_weight_cache
+
+        if progress:
+            print("[prod-cache] running production activation re-cache", flush=True)
+        recache_production_weight_cache(
+            model,
+            calib_ids,
+            recache_assignment or {},
+            cache,
+            include_activation_quant=recache_include_activation_quant,
+            microbatch_size=recache_microbatch_size,
+            progress=progress,
+        )
+    return cache

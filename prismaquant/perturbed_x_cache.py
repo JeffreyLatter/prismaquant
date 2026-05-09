@@ -336,6 +336,7 @@ class PerturbedActivationCache:
             self._activation_scales = {}
         self._snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._rows_got: dict[str, int] = defaultdict(int)
+        self.max_abs: dict[str, float] = {}
         self._handles = []
         self._frozen_weight_cache: OrderedDict[
             tuple[int, str], torch.Tensor
@@ -591,7 +592,10 @@ class PerturbedActivationCache:
 
     def _capture(self, plan: _ModulePlan, x: torch.Tensor) -> None:
         flat = x.detach().reshape(-1, x.size(-1))
+        mx = float(flat.abs().max().item())
         for name in plan.cache_names:
+            if mx > self.max_abs.get(name, 0.0):
+                self.max_abs[name] = mx
             need = self.input_rows - self._rows_got[name]
             if need <= 0:
                 continue
