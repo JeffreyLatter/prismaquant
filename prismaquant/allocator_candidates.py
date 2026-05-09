@@ -172,6 +172,33 @@ def check_format_applicability(
     return FormatApplicability(True)
 
 
+def check_stats_format_applicability(
+    stats_entry: dict,
+    format_spec_or_name: fr.FormatSpec | str,
+    *,
+    qname: str | None = None,
+    source_kind: str | None = None,
+    target_profile: str | None = None,
+) -> FormatApplicability:
+    """Stats-entry wrapper for ``check_format_applicability``.
+
+    This is the path allocator-like code should use when it only has the
+    probe stats table.  Rank-1 legacy stats do not carry enough shape
+    information for kernel preflight, so they remain admissible and the
+    exporter keeps the final safety check.
+    """
+    shape = _shape_from_stats(dict(stats_entry))
+    if len(shape) < 2:
+        return FormatApplicability(True)
+    return check_format_applicability(
+        shape,
+        format_spec_or_name,
+        qname=qname,
+        source_kind=source_kind,
+        target_profile=target_profile,
+    )
+
+
 def _flashinfer_kernel_accepts(fmt_name: str, in_features: int,
                                out_features: int) -> bool | None:
     """Ask FlashInfer's own problem-size validator when available."""
@@ -274,15 +301,11 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                     break
             if entry is None or "error" in entry:
                 continue
-            verdict = (
-                check_format_applicability(
-                    shape,
-                    spec,
-                    qname=name,
-                    source_kind=source_kind,
-                )
-                if len(shape) >= 2
-                else FormatApplicability(True)
+            verdict = check_stats_format_applicability(
+                s,
+                spec,
+                qname=name,
+                source_kind=source_kind,
             )
             if not verdict.legal:
                 masked.setdefault(

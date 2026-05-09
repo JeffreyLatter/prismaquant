@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from prismaquant import format_registry as fr
 from prismaquant.allocator_candidates import (
     _stats_indicates_packed_expert,
+    check_stats_format_applicability,
     cost_entry_predicted_dloss,
 )
 from prismaquant.allocator_solver import Candidate, _shape_from_stats, solve_allocation
@@ -523,6 +524,12 @@ def _available_formats_for_name(
         if (
             canonical not in seen
             and l2_cost_value(stats, costs, name, canonical) is not None
+            and check_stats_format_applicability(
+                dict(stats[name]),
+                spec,
+                qname=name,
+                target_profile="research",
+            ).legal
         ):
             available.append(canonical)
             seen.add(canonical)
@@ -845,6 +852,13 @@ def build_l3_candidates(
             if "error" in entry or "propagated_end_kl" not in entry:
                 continue
             spec = specs_by_name[canonical]
+            if not check_stats_format_applicability(
+                dict(stats[name]),
+                spec,
+                qname=name,
+                target_profile="research",
+            ).legal:
+                continue
             cands.append(
                 Candidate(
                     fmt=canonical,

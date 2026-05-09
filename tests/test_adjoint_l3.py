@@ -191,6 +191,34 @@ def test_solver_accepts_mxfp8_alias_and_can_choose_it():
     assert result.objective == pytest.approx(0.1)
 
 
+def test_adjoint_candidates_drop_runtime_illegal_mxfp8_shape():
+    payload = {
+        "schema": l3a.SCHEMA,
+        "rank": 1,
+        "units": {
+            "layer.a": {
+                "formats": {
+                    "NVFP4": {"sketch": [1.0], "diagonal_cost": 0.2},
+                    "MXFP8": {"sketch": [0.5], "diagonal_cost": 0.1},
+                    "BF16": {"sketch": [0.0], "diagonal_cost": 0.0},
+                }
+            }
+        },
+    }
+    stats = {
+        "layer.a": {
+            "n_params": 5120 * 48,
+            "in_features": 5120,
+            "out_features": 48,
+        }
+    }
+    formats = [fr.get_format("NVFP4"), fr.get_format("MXFP8"), fr.get_format("BF16")]
+
+    candidates = l3a.build_adjoint_l3_candidates(stats, payload, formats)
+
+    assert [cand.fmt for cand in candidates["layer.a"]] == ["NVFP4", "BF16"]
+
+
 def test_collapse_assignment_to_solve_units_majority_seeds_fused_groups():
     payload = {
         "schema": l3a.SCHEMA,

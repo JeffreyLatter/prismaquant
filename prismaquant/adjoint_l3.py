@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import format_registry as fr
+from .allocator_candidates import check_stats_format_applicability
 from .allocator_solver import Candidate, _shape_from_stats
 
 
@@ -301,6 +302,16 @@ def adjoint_units_from_payload(
     for name, unit_payload in payload["units"].items():
         options = []
         for fmt, entry in unit_payload["formats"].items():
+            canonical = fr.canonical_format_name(fmt)
+            if stats is not None and specs_by_name is not None and name in stats:
+                spec = specs_by_name.get(canonical)
+                if spec is not None and not check_stats_format_applicability(
+                    dict(stats[name]),
+                    spec,
+                    qname=name,
+                    target_profile="research",
+                ).legal:
+                    continue
             options.append(_option_from_entry(
                 name,
                 fmt,

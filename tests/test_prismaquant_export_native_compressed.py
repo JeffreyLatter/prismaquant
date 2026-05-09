@@ -21,6 +21,7 @@ from prismaquant.export_native_compressed import (
     NVFP4_MAX,
     PER_EXPERT_MOE_REGEX,
     _compute_layer_joint_nvfp4,
+    _coerce_runtime_legal_assignment,
     _passthrough_dtype,
     _passthrough_tensor,
     _quantize_2d,
@@ -867,6 +868,41 @@ class TestMtpCoverageValidation(unittest.TestCase):
                 {"mtp.fc": "BF16"},
                 self._Profile(),
             )
+
+
+class TestRuntimeLegalAssignment(unittest.TestCase):
+    def test_coerces_runtime_illegal_mxfp8_shape_to_bf16(self):
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard = td / "model-00001-of-00001.safetensors"
+            save_file({
+                "model.layers.0.linear_attn.in_proj_a.weight": torch.zeros(
+                    48, 5120, dtype=torch.bfloat16
+                ),
+                "model.layers.0.self_attn.o_proj.weight": torch.zeros(
+                    128, 5120, dtype=torch.bfloat16
+                ),
+            }, str(shard))
+            with open(td / "model.safetensors.index.json", "w") as f:
+                json.dump({
+                    "weight_map": {
+                        "model.layers.0.linear_attn.in_proj_a.weight": shard.name,
+                        "model.layers.0.self_attn.o_proj.weight": shard.name,
+                    }
+                }, f)
+
+            assignment, coerced = _coerce_runtime_legal_assignment(str(td), {
+                "model.layers.0.linear_attn.in_proj_a": "MXFP8",
+                "model.layers.0.self_attn.o_proj": "MXFP8",
+            })
+
+        self.assertEqual(assignment["model.layers.0.linear_attn.in_proj_a"], "BF16")
+        self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "MXFP8")
+        self.assertEqual(coerced, [
+            ("model.layers.0.linear_attn.in_proj_a", [48, 5120])
+        ])
 
 
 class TestDeltaNetFusedSiblingJointScale(unittest.TestCase):

@@ -70,6 +70,7 @@ import torch.nn as nn
 from accelerate import init_empty_weights
 from safetensors.torch import save_file
 
+from .allocator_candidates import check_format_applicability
 from .expert_prune import raise_expert_prune_disabled
 from .model_profiles.qwen3_5 import Qwen3_5Profile
 from .schemas import validate_layer_config_payload, validate_prune_manifest_payload
@@ -504,8 +505,13 @@ def _coerce_runtime_legal_assignment(
         shape = _source_weight_shape_for_recipe(src_model, qname)
         if shape is None or len(shape) != 2:
             continue
-        out_features = int(shape[0])
-        if out_features < 128:
+        verdict = check_format_applicability(
+            tuple(shape),
+            "MXFP8",
+            qname=qname,
+            target_profile="research",
+        )
+        if not verdict.legal:
             out[qname] = "BF16"
             coerced.append((qname, shape))
     return out, coerced
@@ -5308,7 +5314,7 @@ def main():
         print(
             "[export-stream] runtime format coercions: "
             f"{len(runtime_coerced)} MXFP8 Linears -> BF16 "
-            "(vLLM MXFP8 requires out_features >= 128). "
+            "(target runtime does not support those MXFP8 shapes). "
             f"sample={runtime_coerced[:6]}",
             flush=True,
         )

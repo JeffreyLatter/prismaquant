@@ -81,6 +81,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import format_registry as fr
+from .allocator_candidates import check_format_applicability
 from .allocator_solver import _shape_from_stats
 
 
@@ -299,20 +300,31 @@ def discover_units(
         members = sorted(set(members))
         block_ids = [block_id_from_qname(m) for m in members]
         block_id = max(set(block_ids), key=block_ids.count) if block_ids else group_name
-        member_shapes: list[tuple[int, ...]] = []
+        member_shapes_by_name: dict[str, tuple[int, ...]] = {}
         for member in members:
             shape = _shape_of_param(model, member)
             if shape is None:
                 continue
-            member_shapes.append(shape)
-        if not member_shapes:
+            member_shapes_by_name[member] = shape
+        if not member_shapes_by_name:
             continue
+        member_shapes = list(member_shapes_by_name.values())
         n_params_unit = sum(int(_prod(s)) for s in member_shapes)
         n_params_by_unit[group_name] = n_params_unit
 
         options = []
         for spec in formats:
             spec_canon = fr.canonical_format_name(spec.name)
+            if not all(
+                check_format_applicability(
+                    shape,
+                    spec,
+                    qname=member,
+                    target_profile="research",
+                ).legal
+                for member, shape in member_shapes_by_name.items()
+            ):
+                continue
             mem_bytes = sum(spec.memory_bytes_for_shape(s) for s in member_shapes)
             bits_per_param = 8.0 * mem_bytes / max(n_params_unit, 1)
             options.append(FormatCost(
@@ -321,6 +333,8 @@ def discover_units(
                 bits_per_param=float(bits_per_param),
                 memory_bytes=int(mem_bytes),
             ))
+        if not options:
+            continue
         options.sort(key=lambda opt: (opt.bits_per_param, opt.fmt))
         unit = DecisionUnit(
             name=group_name,

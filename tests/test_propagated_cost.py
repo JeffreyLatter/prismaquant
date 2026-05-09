@@ -433,6 +433,43 @@ def test_select_formats_uses_current_neighbors_and_bf16():
     assert got == ("NVFP4", "MXFP8_E4M3", "BF16")
 
 
+def test_select_formats_drops_runtime_illegal_mxfp8_shape():
+    stats = {
+        "layer": {
+            **_stat(5120 * 48),
+            "in_features": 5120,
+            "out_features": 48,
+        }
+    }
+    costs = {"layer": _cost_table()}
+    assignment = {"layer": "NVFP4"}
+
+    got = select_formats_for_l3(stats, costs, assignment, "layer", _specs())
+
+    assert got == ("NVFP4", "BF16")
+
+
+def test_build_l3_candidates_drops_runtime_illegal_mxfp8_shape():
+    stats = {
+        "layer": {
+            **_stat(5120 * 48),
+            "in_features": 5120,
+            "out_features": 48,
+        }
+    }
+    propagated = {
+        "layer": {
+            "NVFP4": {"propagated_end_kl": 0.2},
+            "MXFP8": {"propagated_end_kl": 0.1},
+            "BF16": {"propagated_end_kl": 0.0},
+        }
+    }
+
+    cands = build_l3_candidates(stats, propagated, _specs())
+
+    assert [cand.fmt for cand in cands["layer"]] == ["NVFP4", "BF16"]
+
+
 def test_tail_forward_from_layer_matches_full_forward_from_layer_output():
     model = _TailToy().eval()
     x = torch.tensor([[1.0, -2.0], [0.5, 0.25]])

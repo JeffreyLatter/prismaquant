@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 
 import pytest
+import torch.nn as nn
 
+from prismaquant import format_registry as fr
 from prismaquant import block_clado as bc
 
 
@@ -46,6 +48,24 @@ def test_pair_key_roundtrip():
     key = bc._pair_key("NVFP4", "MXFP8_E4M3")
     a, b = bc._parse_pair_key(key)
     assert (a, b) == ("NVFP4", "MXFP8_E4M3")
+
+
+def test_discover_units_drops_runtime_illegal_mxfp8_shape():
+    model = nn.Module()
+    model.small = nn.Linear(5120, 48, bias=False)
+    model.large = nn.Linear(5120, 128, bias=False)
+    formats = [fr.get_format("NVFP4"), fr.get_format("MXFP8"), fr.get_format("BF16")]
+
+    blocks, singletons, _ = bc.discover_units(model, None, formats)
+    units = {unit.name: unit for unit in singletons}
+    for unit_list in blocks.values():
+        units.update({unit.name: unit for unit in unit_list})
+
+    small_formats = {option.fmt for option in units["small"].options}
+    large_formats = {option.fmt for option in units["large"].options}
+
+    assert small_formats == {"NVFP4", "BF16"}
+    assert "MXFP8_E4M3" in large_formats
 
 
 # ---------------------------------------------------------------------------
