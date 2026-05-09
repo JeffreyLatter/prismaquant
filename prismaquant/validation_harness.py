@@ -730,8 +730,12 @@ def _entry_format_name(entry: Any) -> str | None:
         if bits == 4:
             return "MXFP4"
         if bits == 6:
-            return "MXFP6_E3M2"
+            elt = str(entry.get("weight_element_dtype", "fp6_e3m2")).lower()
+            return "MXFP6_E2M3" if elt == "fp6_e2m3" else "MXFP6_E3M2"
         if bits == 8:
+            elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
+            if elt == "fp8_e5m2":
+                return "MXFP8_E5M2" if act_bits == 8 else None
             return "MXFP8" if act_bits == 8 else "MXFP8A16"
     if data_type == "int":
         if bits == 8:

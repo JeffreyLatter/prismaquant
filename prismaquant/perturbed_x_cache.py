@@ -442,7 +442,7 @@ class PerturbedActivationCache:
             else:
                 if (
                     self._production_weight_cache is not None
-                    and fmt not in {"BF16", "MXFP8", "MXFP8_E4M3"}
+                    and fmt != "BF16"
                     and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
                 ):
                     raise RuntimeError(
@@ -637,7 +637,7 @@ class PerturbedActivationCache:
                         device=param.device, dtype=param.dtype,
                     ).contiguous()
                 elif (
-                    fmt_canon not in {"BF16", "MXFP8", "MXFP8_E4M3"}
+                    fmt_canon != "BF16"
                     and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
                 ):
                     raise RuntimeError(

@@ -219,7 +219,7 @@ class WeightSession:
             if cached is not None:
                 self._cache_hits += 1
                 return cached
-            if fmt_canon not in {"BF16", "MXFP8", "MXFP8_E4M3"}:
+            if fmt_canon != "BF16":
                 self._cache_misses.append((qname, fmt_canon))
                 if self._strict_production_cache:
                     raise RuntimeError(
@@ -231,8 +231,8 @@ class WeightSession:
                     )
         # Fall back to RTN-quantize from BF16 source (matches what the
         # OLD per-module hook path does when production cache misses).
-        # MXFP8 commonly takes this path because the production cache
-        # only fills NVFP4 by default.
+        # Strict production-cache mode turns this into a hard miss for
+        # every non-BF16 format.
         self._rtn_fallbacks.append((qname, fmt_canon))
         bf16 = self._ensure_bf16_snapshot(qname)
         if bf16 is None:

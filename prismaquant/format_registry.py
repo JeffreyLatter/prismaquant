@@ -447,8 +447,9 @@ def _nv_autoround(bits=4, gsize=16, act_bits=4):
 def _mx_autoround(bits=8, gsize=32, act_bits=8, elt="fp8_e4m3"):
     return dict(
         bits=bits, group_size=gsize, sym=True, data_type="mx_fp",
+        weight_element_dtype=elt,
         act_bits=act_bits, act_group_size=gsize, act_sym=True,
-        act_data_type="mx_fp", act_dynamic=True,
+        act_data_type="mx_fp", act_element_dtype=elt, act_dynamic=True,
     )
 
 

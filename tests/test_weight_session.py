@@ -39,16 +39,29 @@ def test_weight_session_rejects_strict_production_cache_miss():
         session.initialize({"model.proj": "NVFP4"}, units=[])
 
 
-def test_weight_session_allows_mxfp8_rtn_fallback_with_nvfp4_only_cache():
+def test_weight_session_rejects_strict_mxfp8_cache_miss():
     model = _ModelWithBody().eval()
     cache = ProductionWeightCache(weights={}, levers={})
     session = WeightSession(model, production_weight_cache=cache)
+
+    with pytest.raises(RuntimeError, match="production_weight_cache miss"):
+        session.initialize({"model.proj": "MXFP8_E4M3"}, units=[])
+
+
+def test_weight_session_allows_mxfp8_rtn_fallback_when_not_strict():
+    model = _ModelWithBody().eval()
+    cache = ProductionWeightCache(weights={}, levers={})
+    session = WeightSession(
+        model,
+        production_weight_cache=cache,
+        strict_production_cache=False,
+    )
 
     session.initialize({"model.proj": "MXFP8_E4M3"}, units=[])
 
     diag = session.diagnostics()
     assert diag["n_rtn_fallbacks"] == 1
-    assert diag["n_cache_misses"] == 0
+    assert diag["n_cache_misses"] == 1
 
 
 def test_weight_session_reuses_existing_spilled_snapshot(tmp_path):

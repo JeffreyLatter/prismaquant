@@ -335,7 +335,7 @@ class ProductionWeightCache:
         misses: list[tuple[str, str]] = []
         for q in expected_qnames:
             for f in formats:
-                if f.upper() in {"BF16", "MXFP8", "MXFP8_E4M3"}:
+                if f.upper() == "BF16":
                     continue
                 if _has_key(q, f.upper()):
                     hits.append((q, f.upper()))
@@ -509,9 +509,9 @@ def render_production_weight(
 
     Returns a tensor matching ``weight.shape`` and dtype.  For NVFP4 this
     runs GPTQ + scale_sweep (the activation-aware passes) with the joint
-    fused-sibling NVFP4 global if supplied; for MXFP8 / BF16 it falls
-    back to the format's quantize_dequantize because those formats don't
-    benefit from activation-aware refinement in the production pipeline.
+    fused-sibling NVFP4 global if supplied; for BF16 and RTN-only formats
+    it falls back to the registry quantize_dequantize because those formats
+    don't benefit from activation-aware refinement in the production pipeline.
 
     ``joint_global_real`` is the max-across-fused-siblings NVFP4 global
     used to keep q/k/v (or gate/up) per-tensor scales unified — same as
@@ -520,14 +520,12 @@ def render_production_weight(
     isolated Linears with no fused siblings).
     """
     fmt = fmt.upper()
-    if fmt in ("MXFP8", "MXFP8_E4M3", "BF16"):
+    if fmt != "NVFP4":
         from prismaquant import format_registry as fr
         spec = fr.get_format(fmt)
         return spec.quantize_dequantize(weight.detach().clone()).to(
             device=weight.device, dtype=weight.dtype,
         )
-    if fmt != "NVFP4":
-        raise ValueError(f"render_production_weight: unsupported fmt={fmt!r}")
 
     from prismaquant.export_native_compressed import _quantize_2d
 

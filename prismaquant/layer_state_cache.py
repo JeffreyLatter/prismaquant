@@ -483,7 +483,7 @@ class LayerHiddenStateCache:
                 else:
                     if (
                         self._production_weight_cache is not None
-                        and canonical not in {"BF16", "MXFP8", "MXFP8_E4M3"}
+                        and canonical != "BF16"
                         and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
                     ):
                         raise RuntimeError(

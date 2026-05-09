@@ -87,7 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Assignment path or label=path. Solve-result JSONs are overlaid on base.",
     )
     parser.add_argument("--output", required=True)
-    parser.add_argument("--formats", default="NVFP4,MXFP8_E4M3,BF16")
+    parser.add_argument("--formats", default="NVFP4,MXFP8_E4M3,FP8_E4M3,BF16")
     parser.add_argument("--n-calib-samples", type=int, default=2)
     parser.add_argument("--calib-seqlen", type=int, default=128)
     parser.add_argument("--calib-split", default="train")

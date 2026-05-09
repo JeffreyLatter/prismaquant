@@ -413,11 +413,7 @@ def _production_cache_formats(
         fr.canonical_format_name(fmt)
         for fmt in [*requested_formats, floor_format]
     }
-    return sorted(
-        fmt
-        for fmt in formats
-        if fmt not in {"BF16", "MXFP8", "MXFP8_E4M3"}
-    )
+    return sorted(fmt for fmt in formats if fmt != "BF16")
 
 
 def _production_cache_qnames(
@@ -3118,10 +3114,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--floor-format", default="NVFP4")
     parser.add_argument(
         "--formats",
-        default="NVFP4,MXFP8_E4M3,BF16",
+        default="NVFP4,MXFP8_E4M3,FP8_E4M3,BF16",
         help=(
             "'registry' or a comma-separated format list. Defaults to the "
-            "shipping triad: NVFP4, MXFP8_E4M3, BF16."
+            "vLLM-backed production menu: NVFP4, MXFP8_E4M3, FP8_E4M3, BF16."
         ),
     )
     parser.add_argument("--pin", action="append", default=[])

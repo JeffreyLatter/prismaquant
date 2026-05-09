@@ -589,6 +589,10 @@ def _pack_production_cached_2d(
         w_work = w.to(device=target_device, dtype=torch.float32)
         q, qs = quantize_dequantize_mxfp8(w_work, group_size=32)
         return {"weight": q, "weight_scale": qs}
+    if fmt == "FP8_E4M3":
+        w_work = w.to(device=target_device, dtype=torch.float32)
+        q, qs = quantize_dequantize_fp8_dynamic(w_work)
+        return {"weight": q, "weight_scale": qs}
     if fmt == "BF16":
         return {"weight": w.to(device=target_device, dtype=torch.bfloat16)}
     return None
@@ -1675,11 +1679,13 @@ def quantize_dequantize_fp8_dynamic_packed(packed: torch.Tensor
 # accepts the allocator's exact AutoRound-shaped output.
 # ---------------------------------------------------------------------------
 def canonicalize_format(scheme_dict: dict | str | int) -> str:
-    """Map a layer_config entry to one of {NVFP4, MXFP4, MXFP8, BF16}.
+    """Map a layer_config entry to a supported export format.
 
     Accepts the dicts emitted by allocator.py via FormatSpec.autoround_config()
-    (data_type=nv_fp/mx_fp/float, bits=4/8/16) plus a few tolerant
-    string aliases.
+    (data_type=nv_fp/mx_fp/float/fp8_e4m3, bits=4/8/16) plus a few tolerant
+    string aliases. E5M2 registry entries are intentionally not exportable on
+    the vLLM production path yet; compressed-tensors/vLLM weight dispatch is
+    validated for E4M3 here.
     """
     if isinstance(scheme_dict, dict):
         dt = scheme_dict.get("data_type")
@@ -1689,6 +1695,12 @@ def canonicalize_format(scheme_dict: dict | str | int) -> str:
         if dt == "mx_fp" and bits == 4:
             return "MXFP4"
         if dt == "mx_fp" and bits == 8:
+            elt = str(scheme_dict.get("weight_element_dtype", "fp8_e4m3")).lower()
+            if elt == "fp8_e5m2":
+                raise ValueError(
+                    "MXFP8_E5M2 is registered for research probing but is not "
+                    "exportable on the vLLM compressed-tensors weight path"
+                )
             return "MXFP8"
         if dt in ("float", "bfloat16") and bits in (16, 0):
             return "BF16"
@@ -1696,16 +1708,27 @@ def canonicalize_format(scheme_dict: dict | str | int) -> str:
             # group_size disambiguates: FP8_SOURCE ships with group_size=128
             # (128×128 block-scaled, as stored in native-FP8 checkpoints
             # like MiniMax-M2/M2.7 and DeepSeek-V3); MXFP8 uses group_size=32
-            # with E8M0 scales. Earlier versions collapsed both onto MXFP8
-            # when FP8_SOURCE didn't exist yet — preserve that fallback for
-            # unknown group sizes, but route recognizable FP8_SOURCE picks
-            # to the passthrough branch in _quantize_2d so the 128-block
-            # source tensors land on disk bit-identical to the input.
-            if int(scheme_dict.get("group_size", 0)) == 128:
+            # with E8M0 scales; plain FP8_E4M3 is dense per-channel W8A8.
+            group_size = int(scheme_dict.get("group_size", 0))
+            if group_size == 128:
                 return "FP8_SOURCE"
+            if group_size == 32:
+                return "MXFP8"
+            if group_size in (0, -1):
+                return "FP8_E4M3"
             return "MXFP8"
+        if dt == "fp8_e5m2" and bits == 8:
+            raise ValueError(
+                "FP8_E5M2 is registered for research probing but is not "
+                "exportable on the vLLM compressed-tensors weight path"
+            )
         # MXFP6 variants (load-time dequant to MXFP8).
-        if dt in ("mx_fp", "fp6_e3m2") and bits == 6:
+        if dt == "mx_fp" and bits == 6:
+            elt = str(scheme_dict.get("weight_element_dtype", "fp6_e3m2")).lower()
+            if elt == "fp6_e2m3":
+                return "MXFP6_E2M3"
+            return "MXFP6_E3M2"
+        if dt == "fp6_e3m2" and bits == 6:
             return "MXFP6_E3M2"
         if dt == "fp6_e2m3" and bits == 6:
             return "MXFP6_E2M3"
@@ -1716,8 +1739,15 @@ def canonicalize_format(scheme_dict: dict | str | int) -> str:
             return "NVFP4"
         if s in ("mxfp4", "mx_fp4"):
             return "MXFP4"
-        if s in ("mxfp8", "mxfp8_e4m3", "fp8", "8"):
+        if s in ("mxfp8", "mxfp8_e4m3", "8"):
             return "MXFP8"
+        if s in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
+            return "FP8_E4M3"
+        if s in ("mxfp8_e5m2", "fp8_e5m2"):
+            raise ValueError(
+                "E5M2 FP8 formats are not exportable on the vLLM "
+                "compressed-tensors weight path"
+            )
         if s in ("bf16", "bfloat16", "16"):
             return "BF16"
     if isinstance(scheme_dict, int):
@@ -2380,6 +2410,10 @@ def _quantize_2d(
         # as NVFP4 but the marginal benefit doesn't justify it.
         w_work = weight.to(torch.float32)
         w, ws = quantize_dequantize_mxfp8(w_work, group_size=32)
+        return {"weight": w, "weight_scale": ws}
+    if fmt == "FP8_E4M3":
+        w_work = weight.to(torch.float32)
+        w, ws = quantize_dequantize_fp8_dynamic(w_work)
         return {"weight": w, "weight_scale": ws}
     if fmt == "MXFP4":
         w_work = weight.to(torch.float32)
@@ -4392,6 +4426,18 @@ FP8_SOURCE_SCHEME = {
         "observer": "memoryless_minmax",
     },
 }
+FP8_E4M3_SCHEME = {
+    "format": "float-quantized",
+    "weights": {
+        "num_bits": 8, "type": "float", "strategy": "channel",
+        "symmetric": True, "dynamic": False,
+        "observer": "memoryless_minmax",
+    },
+    "input_activations": {
+        "num_bits": 8, "type": "float", "strategy": "token",
+        "symmetric": True, "dynamic": True,
+    },
+}
 def _bf16_packed_expert_ignore_regex(
         recipe_key: str,
         profile,
@@ -4506,6 +4552,7 @@ FORMAT_SCHEME = {
     "NVFP4": NVFP4_SCHEME,
     "MXFP4": MXFP4_SCHEME,
     "MXFP8": MXFP8_SCHEME,
+    "FP8_E4M3": FP8_E4M3_SCHEME,
     "FP8_SOURCE": FP8_SOURCE_SCHEME,
 }
 
@@ -4787,7 +4834,7 @@ def build_quantization_config(
 def _canonicalize_assignment(raw: dict) -> dict[str, str]:
     """Accept either AutoRound-style dicts (`{key: {bits: 4, data_type: nv_fp,
     ...}}`) or shorthand (`{key: "NVFP4"}`). Return `{key: fmt_str}` with
-    fmt in {"NVFP4", "MXFP8", "FP8_SOURCE", "BF16"}."""
+    fmt in {"NVFP4", "MXFP8", "FP8_E4M3", "FP8_SOURCE", "BF16"}."""
     out: dict[str, str] = {}
     for k, v in raw.items():
         name = _strip_weight(k)

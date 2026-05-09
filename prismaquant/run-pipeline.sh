@@ -5,7 +5,7 @@
 # Usage:
 #   MODEL_PATH=/path/to/Qwen3.6-35B-A3B \
 #   WORK_DIR=./dq-runs/qwen36 \
-#   FORMATS=NVFP4,MXFP8_E4M3,BF16 \
+#   FORMATS=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16 \
 #   TARGET_BITS=4.75 \
 #   VISUAL_FORMAT=BF16 \
 #   CALIBRATION_MODALITY=text-only \
@@ -41,7 +41,7 @@ set -euo pipefail
 
 : "${MODEL_PATH:?Set MODEL_PATH to the source HF model directory}"
 : "${WORK_DIR:?Set WORK_DIR to a writable directory for artifacts}"
-: "${FORMATS:=NVFP4,MXFP8_E4M3,BF16}"
+: "${FORMATS:=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16}"
 : "${TARGET_BITS:=4.75}"
 : "${PARETO_TARGETS:=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25}"
 # Calibration defaults. 4x256 was the historical minimum for correctness

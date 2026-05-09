@@ -14,6 +14,19 @@ PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
     "BF16": "bf16",
 }
 
+VLLM_QWEN35_EXPERT_FORMATS = {
+    "NVFP4",
+    "MXFP4",
+    "MXFP8",
+    "MXFP8_E4M3",
+    "BF16",
+}
+VLLM_QWEN35_DENSE_UNSUPPORTED_FORMATS = {
+    "MXFP4",
+    "MXFP8_E5M2",
+    "FP8_E5M2",
+}
+
 
 def _is_passthrough_format(format_name: str) -> bool:
     return format_name in PASSTHROUGH_SOURCE_REQUIREMENTS
@@ -48,20 +61,22 @@ def _profile_allows_format(
     if target_profile == "vllm_qwen3_5_packed_moe":
         qname = name or ""
         if ".mlp.experts" in qname:
-            if fmt in {"NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"}:
+            if fmt in VLLM_QWEN35_EXPERT_FORMATS:
                 return FormatApplicability(True)
             return FormatApplicability(
                 False,
                 "profile_mismatch",
                 "Qwen3.5/3.6 packed MoE serving path only supports "
-                "NVFP4, MXFP4, MXFP8_E4M3, or BF16 for expert tensors",
+                "NVFP4, MXFP4, MXFP8_E4M3, or BF16 for expert tensors; "
+                "plain FP8 and E5M2 stay research-only until a vLLM "
+                "packed-MoE load smoke passes",
             )
-        if fmt == "MXFP4":
+        if fmt in VLLM_QWEN35_DENSE_UNSUPPORTED_FORMATS:
             return FormatApplicability(
                 False,
                 "profile_mismatch",
-                "MXFP4 is only enabled for packed MoE experts in this "
-                "serving profile",
+                f"{fmt} is not enabled for dense Linears in this serving "
+                "profile",
             )
         return FormatApplicability(True)
     return FormatApplicability(

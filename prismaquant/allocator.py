@@ -168,7 +168,7 @@ def _allowed_format(target_profile: str, name: str, fmt: str) -> bool:
             # local vLLM; dense MXFP4 is weight-only and not part of the
             # Qwen3.6 MoE shipping profile.
             return fmt in {"NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"}
-        if fmt == "MXFP4":
+        if fmt in {"MXFP4", "MXFP8_E5M2", "FP8_E5M2"}:
             return False
         return True
     raise ValueError(f"Unknown target profile: {target_profile}")
