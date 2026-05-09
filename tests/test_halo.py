@@ -21,6 +21,8 @@ from prismaquant.halo import (
     apply_halo_to_head,
     apply_halo_to_layer,
     apply_halo_rotation,
+    block_hadamard_matrix,
+    block_specs_for_layer,
     default_block_specs,
     fold_gamma_into_linears,
     hadamard_matrix,
@@ -47,8 +49,17 @@ def test_hadamard_matrix_rejects_non_power_of_two():
         hadamard_matrix(12)
 
 
+def test_block_hadamard_matrix_supports_non_power_of_two():
+    H = block_hadamard_matrix(12, dtype=torch.float64)
+    I = torch.eye(12, dtype=torch.float64)
+    assert torch.allclose(H @ H.t(), I, atol=1e-9)
+    # Greedy partition is 8+4, so the off-block regions remain zero.
+    assert torch.count_nonzero(H[:8, 8:]).item() == 0
+    assert torch.count_nonzero(H[8:, :8]).item() == 0
+
+
 def test_random_hadamard_orthogonal():
-    for d in (8, 16, 64, 4096):
+    for d in (8, 12, 16, 64, 96, 4096):
         R = random_hadamard(d, seed=42, dtype=torch.float64)
         I = torch.eye(d, dtype=torch.float64)
         assert torch.allclose(R @ R.t(), I, atol=1e-9), \
@@ -217,6 +228,20 @@ def test_halo_rotation_preserves_output():
         "mismatch between default_block_specs and the actual model.")
 
 
+def test_halo_rotation_preserves_output_non_power_of_two_hidden():
+    torch.manual_seed(0)
+    model = _TinyModel(d=24, ff=48, n_layers=1, vocab=80).eval()
+    ids = torch.randint(0, 80, (2, 8))
+    with torch.no_grad():
+        logits_before = model(ids)
+        spec = default_block_specs(model)
+        R = apply_halo_rotation(model, spec, seed=11)
+        assert torch.allclose(R @ R.t(), torch.eye(24), atol=1e-5)
+        logits_after = model(ids)
+    diff = (logits_before - logits_after).abs().max().item()
+    assert diff < 1e-3
+
+
 def test_halo_actually_changes_weights():
     """Sanity check: rotation must actually modify weights, not be a
     silent no-op (which would also pass `test_halo_rotation_preserves_output`).
@@ -243,6 +268,34 @@ def test_streaming_layer_halo_strict_rejects_unsupported_topology():
         apply_halo_to_layer(model, model.layer, "layer", torch.eye(8))
 
 
+def test_qwen_linear_attention_layer_specs_are_rotated():
+    class _LinearAttn(nn.Module):
+        def __init__(self, d: int):
+            super().__init__()
+            self.in_proj_qkv = nn.Linear(d, d, bias=False)
+            self.in_proj_z = nn.Linear(d, d, bias=False)
+            self.in_proj_b = nn.Linear(d, 4, bias=False)
+            self.in_proj_a = nn.Linear(d, 4, bias=False)
+            self.out_proj = nn.Linear(d, d, bias=False)
+
+    class _Layer(nn.Module):
+        def __init__(self, d: int):
+            super().__init__()
+            self.input_layernorm = _RMSNorm(d)
+            self.linear_attn = _LinearAttn(d)
+            self.post_attention_layernorm = _RMSNorm(d)
+            self.mlp = _MLP(d, d * 2)
+
+    layer = _Layer(16)
+    specs = block_specs_for_layer(layer, "model.layers.0", 16)
+    names = {s.name for s in specs}
+    assert "model.layers.0.linear_attn" in names
+    lin = next(s for s in specs if s.name == "model.layers.0.linear_attn")
+    assert "model.layers.0.linear_attn.in_proj_qkv" in lin.input_linears
+    assert "model.layers.0.linear_attn.in_proj_a" in lin.input_linears
+    assert lin.output_linears == ["model.layers.0.linear_attn.out_proj"]
+
+
 def test_head_halo_strict_rejects_tied_embeddings():
     class _HeadOnly(nn.Module):
         def __init__(self):
@@ -264,12 +317,15 @@ def test_export_halo_validator_rejects_unsupported_configs():
 
     default_profile = SimpleNamespace(name="default", has_mtp=lambda: False)
     qwen35_profile = SimpleNamespace(name="qwen3_5", has_mtp=lambda: False)
+    qwen35_dense_mtp_profile = SimpleNamespace(
+        name="qwen3_5_dense", has_mtp=lambda: True)
     tied_cfg = SimpleNamespace(hidden_size=64, tie_word_embeddings=True)
     untied_cfg = SimpleNamespace(hidden_size=64, tie_word_embeddings=False)
+    nonpow_cfg = SimpleNamespace(hidden_size=96, tie_word_embeddings=False)
 
     with pytest.raises(RuntimeError, match="tied embeddings"):
         _validate_halo_export_support(default_profile, tied_cfg, 64)
     with pytest.raises(RuntimeError, match="profile 'qwen3_5'"):
         _validate_halo_export_support(qwen35_profile, untied_cfg, 64)
-    with pytest.raises(RuntimeError, match="power-of-2"):
-        _validate_halo_export_support(default_profile, untied_cfg, 96)
+    _validate_halo_export_support(default_profile, nonpow_cfg, 96)
+    _validate_halo_export_support(qwen35_dense_mtp_profile, nonpow_cfg, 96)

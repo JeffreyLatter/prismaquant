@@ -4924,35 +4924,26 @@ def _halo_config_bool(cfg, key: str) -> bool:
     return False
 
 
-def _is_power_of_two(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
-
-
 def _validate_halo_export_support(profile, cfg, hidden: int) -> None:
     """Fail fast for HALO topologies this exporter cannot rotate safely."""
-    if not _is_power_of_two(hidden):
+    if hidden <= 0:
         raise RuntimeError(
-            f"[halo] random mode requires power-of-2 hidden_size; got "
-            f"{hidden}. Dense QR fallback is disabled because it is slow "
-            "and changes the intended Hadamard structure. Disable HALO "
-            "or add a structured padded/block Hadamard path.")
+            f"[halo] random mode requires a positive hidden_size; got {hidden}.")
     if _halo_config_bool(cfg, "tie_word_embeddings"):
         raise RuntimeError(
             "[halo] tied embeddings/lm_head are unsupported. HALO needs "
             "separate embedding and lm_head rotations after final-norm "
             "gamma folding; materialize an untied lm_head first or "
             "disable HALO.")
-    if getattr(profile, "has_mtp", lambda: False)():
-        raise RuntimeError(
-            f"[halo] profile {profile.name!r} has MTP heads; HALO is "
-            "not wired for MTP residual/head rotations yet.")
-    supported = {"default", "qwen3"}
+    supported = {"default", "qwen3", "qwen3_5_dense"}
     if getattr(profile, "name", None) not in supported:
         raise RuntimeError(
             f"[halo] profile {getattr(profile, 'name', '<unknown>')!r} "
             "is not supported by generic HALO. Current support is limited "
-            "to standard dense transformer profiles with embed/layers/"
-            "final_norm/lm_head topology.")
+            "to dense transformer profiles with embed/layers/final_norm/"
+            "lm_head topology. Qwen3.5/3.6 dense linear-attention layers "
+            "are supported; packed-MoE profiles still need profile-specific "
+            "expert rotation.")
 
 
 def main():
@@ -5126,9 +5117,11 @@ def main():
                          "transformer block topology (input_layernorm + "
                          "q/k/v/o_proj, post_attention_layernorm + "
                          "gate/up/down_proj), untied embeddings, and "
-                         "power-of-2 hidden_size. Profile-specific "
-                         "overrides needed for multimodal, MTP, MoE, or "
-                         "non-standard architectures.")
+                         "a standard dense residual stream. Non-power-of-2 "
+                         "hidden sizes use a structured block-Hadamard "
+                         "rotation. Profile-specific overrides are still "
+                         "needed for packed MoE or non-standard residual "
+                         "topologies.")
     ap.add_argument("--halo-seed", type=int, default=0,
                     help="RNG seed for HALO sign-diagonal in random "
                          "Hadamard. Saved alongside the artifact at "
@@ -5379,8 +5372,9 @@ def main():
     # HALO rotation matrix (#4). Generated once; applied in
     # materialize_tensors_streaming to head + each layer.
     halo_R = None
+    halo_meta = {"mode": "off"}
     if args.halo_mode == "random":
-        from .halo import random_hadamard
+        from .halo import _hadamard_block_sizes, random_hadamard
         from transformers import AutoConfig as _AC
 
         # Discover residual-stream dim from config. Multimodal configs
@@ -5398,12 +5392,36 @@ def main():
                 "llm_config.hidden_size.")
         _validate_halo_export_support(profile, _cfg, _hidden)
         halo_R = random_hadamard(_hidden, seed=args.halo_seed)
+        halo_blocks = _hadamard_block_sizes(_hidden)
+        mtp_policy = "not_present"
+        if getattr(profile, "has_mtp", lambda: False)():
+            mtp_policy = "passthrough_requires_spec_decode_validation"
+            print(
+                "[halo] profile has MTP weights; body/head HALO is enabled "
+                "and MTP tensors remain on the normal export path. Target "
+                "logits without speculative decoding are covered; MTP "
+                "acceptance should be validated separately when serving with "
+                "speculative decoding.",
+                flush=True,
+            )
+        halo_meta = {
+            "mode": "random",
+            "seed": args.halo_seed,
+            "dim": _hidden,
+            "hidden_path": _hidden_path,
+            "block_sizes": halo_blocks,
+            "profile": profile.name,
+            "mtp_policy": mtp_policy,
+        }
         print(f"[halo] mode=random seed={args.halo_seed} "
-              f"dim={_hidden} hidden_path={_hidden_path}", flush=True)
+              f"dim={_hidden} hidden_path={_hidden_path} "
+              f"blocks={halo_blocks}", flush=True)
         # Persist R alongside the artifact for forensic reproducibility.
         os.makedirs(out_dir, exist_ok=True)
         torch.save({"R": halo_R.cpu(), "seed": args.halo_seed,
-                    "mode": "random", "dim": _hidden},
+                    "mode": "random", "dim": _hidden,
+                    "block_sizes": halo_blocks,
+                    "mtp_policy": mtp_policy},
                    os.path.join(out_dir, "halo_rotation.pt"))
 
     tensors, hist = materialize_tensors_streaming(
@@ -5544,6 +5562,7 @@ def main():
             "source_recipe": args.layer_config,
             "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
             "n_assignment_entries": len(assignment),
+            "halo": halo_meta,
             "runtime_coercions": [
                 {"name": name, "shape": shape, "from": "MXFP8", "to": "BF16"}
                 for name, shape in runtime_coerced

@@ -71,14 +71,58 @@ def hadamard_matrix(d: int, device: torch.device | str = "cpu",
         "streaming export.")
 
 
+def _hadamard_block_sizes(d: int) -> list[int]:
+    """Greedy power-of-two partition for structured non-power-of-two HALO.
+
+    Qwen3.5/3.6 dense uses hidden_size=5120, which decomposes cleanly as
+    4096+1024. A block-diagonal Hadamard remains exactly orthogonal, avoids
+    dense QR, and keeps the rotation absorbable into existing weights.
+    """
+    if d <= 0:
+        raise ValueError(f"Hadamard dimension must be positive; got {d}")
+    blocks: list[int] = []
+    remaining = int(d)
+    while remaining:
+        block = 1 << (remaining.bit_length() - 1)
+        blocks.append(block)
+        remaining -= block
+    return blocks
+
+
+def block_hadamard_matrix(d: int, device: torch.device | str = "cpu",
+                          dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Structured orthogonal Hadamard rotation for any positive dimension.
+
+    For power-of-two dimensions this is the usual Sylvester Hadamard. For
+    other dimensions it is a block diagonal matrix whose block sizes are the
+    greedy binary partition of ``d``. This preserves exact orthogonality
+    without introducing the slow dense-QR fallback that streaming export
+    intentionally avoids.
+    """
+    blocks = _hadamard_block_sizes(d)
+    if len(blocks) == 1:
+        return hadamard_matrix(d, device=device, dtype=dtype)
+    out = torch.zeros((d, d), device=device, dtype=dtype)
+    offset = 0
+    for block in blocks:
+        h = hadamard_matrix(block, device=device, dtype=dtype)
+        out[offset:offset + block, offset:offset + block] = h
+        offset += block
+    return out
+
+
 def random_hadamard(d: int, seed: int = 0,
                     device: torch.device | str = "cpu",
                     dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Randomized Hadamard rotation: Sylvester Hadamard composed with a
-    random sign diagonal. Equivalent in incoherence properties to the
-    Walsh-Hadamard + random sign trick used by QuIP#/QuaRot.
+    """Randomized Hadamard rotation composed with a random sign diagonal.
+
+    Power-of-two dimensions use the usual Sylvester Hadamard. Other
+    dimensions use ``block_hadamard_matrix``; for example Qwen3.6's 5120
+    hidden size becomes a 4096+1024 block rotation. This is weaker than a
+    learned dense rotation but is orthogonal, deterministic, and exportable
+    with no runtime kernel changes.
     """
-    H = hadamard_matrix(d, device=device, dtype=dtype)
+    H = block_hadamard_matrix(d, device=device, dtype=dtype)
     g = torch.Generator(device=device)
     g.manual_seed(seed)
     sign = torch.randint(0, 2, (d,), generator=g, device=device,
@@ -364,6 +408,26 @@ def block_specs_for_layer(layer_mod: nn.Module, layer_qname: str,
             norm_qname=f"{layer_qname}.input_layernorm",
             input_linears=attn_in,
             output_linears=attn_out,
+        ))
+
+    # Qwen3.5/3.6 Gated DeltaNet linear attention. The projections read the
+    # residual stream and out_proj writes back to it; the internal conv/state
+    # tensors operate in the unrotated projected space and need no rotation.
+    lin_attn_in: list[str] = []
+    for proj in ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
+                 "linear_attn.in_proj_b", "linear_attn.in_proj_a"):
+        if _has(proj):
+            lin_attn_in.append(f"{layer_qname}.{proj}")
+    lin_attn_out: list[str] = []
+    if _has("linear_attn.out_proj"):
+        lin_attn_out.append(f"{layer_qname}.linear_attn.out_proj")
+    if lin_attn_in and lin_attn_out and _has("input_layernorm"):
+        blocks.append(HaloBlockSpec(
+            name=f"{layer_qname}.linear_attn",
+            dim=dim,
+            norm_qname=f"{layer_qname}.input_layernorm",
+            input_linears=lin_attn_in,
+            output_linears=lin_attn_out,
         ))
 
     # MLP / MoE block. Standard MLP has gate/up/down. MoE has experts
