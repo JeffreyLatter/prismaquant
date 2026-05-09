@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import shutil
@@ -61,6 +62,8 @@ from prismaquant.measure_block_clado import (
 from prismaquant.measure_output_fisher import collect_output_fisher
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 
+_VALIDATION_CHECKPOINT_SCHEMA = "prismaquant.block_clado.validation_checkpoint.v1"
+
 
 @dataclass
 class IterationResult:
@@ -88,6 +91,109 @@ def assignment_hash(assignment: dict[str, str]) -> str:
     for c in s:
         h = (h * 33 + ord(c)) & 0xFFFFFFFF
     return f"{h:08x}"
+
+
+def _stable_json_sha256(payload) -> str:
+    blob = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _validation_candidate_key(row: Mapping) -> str:
+    return _stable_json_sha256({
+        "bpp": float(row["bpp"]),
+        "surrogate_cost": float(row["cost_total"]),
+        "assignment": sorted((str(k), str(v)) for k, v in row["assignment"].items()),
+    })
+
+
+def _validation_center_key(center_assignment: Mapping[str, str], center_kl: float) -> str:
+    return _stable_json_sha256({
+        "kind": "center_baseline",
+        "center_kl": float(center_kl),
+        "assignment": sorted((str(k), str(v)) for k, v in center_assignment.items()),
+    })
+
+
+def _validation_checkpoint_signature(
+    *,
+    payload: Mapping,
+    sorted_rows: Sequence[Mapping],
+    indices: Sequence[int],
+    center_assignment: Mapping[str, str] | None,
+    center_kl: float,
+    include_activation_quant: bool,
+    validation_delta_quantize: bool,
+    production_weight_cache,
+) -> dict:
+    candidate_keys = [
+        _validation_candidate_key(sorted_rows[i])
+        for i in indices
+    ]
+    center_key = (
+        _validation_center_key(center_assignment, center_kl)
+        if center_assignment is not None and center_kl > 0.0 else None
+    )
+    signature_payload = {
+        "payload_hash": _stable_json_sha256(payload),
+        "candidate_keys": candidate_keys,
+        "center_key": center_key,
+        "include_activation_quant": bool(include_activation_quant),
+        "validation_delta_quantize": bool(validation_delta_quantize),
+        "production_cache": bool(production_weight_cache is not None),
+    }
+    return {
+        "sha256": _stable_json_sha256(signature_payload),
+        "payload": signature_payload,
+    }
+
+
+def _load_validation_checkpoint(
+    path: Path,
+    signature: Mapping,
+) -> dict[str, dict]:
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        return {}
+    if raw.get("schema") != _VALIDATION_CHECKPOINT_SCHEMA:
+        return {}
+    if raw.get("signature", {}).get("sha256") != signature.get("sha256"):
+        return {}
+    rows: dict[str, dict] = {}
+    for item in raw.get("rows", []):
+        key = str(item.get("selection_key", ""))
+        row = item.get("row")
+        if key and isinstance(row, dict):
+            rows[key] = dict(row)
+    return rows
+
+
+def _write_validation_checkpoint(
+    path: Path,
+    *,
+    signature: Mapping,
+    rows_by_key: Mapping[str, Mapping],
+) -> None:
+    payload = {
+        "schema": _VALIDATION_CHECKPOINT_SCHEMA,
+        "signature": dict(signature),
+        "updated_at": time.time(),
+        "rows": [
+            {"selection_key": key, "row": dict(row)}
+            for key, row in sorted(rows_by_key.items())
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
 
 
 def load_assignment_json(path: str | Path) -> dict[str, str]:
@@ -383,6 +489,39 @@ def run_iteration(
 
     # ---- validate cone with real KL
     validation: list[dict] = []
+    validation_checkpoint_path = iter_dir / "validation_checkpoint.json"
+    validation_checkpoint_signature = _validation_checkpoint_signature(
+        payload=payload,
+        sorted_rows=sorted_rows,
+        indices=indices,
+        center_assignment=(
+            assignment_for_units(center_assignment, units)
+            if center_assignment is not None else None
+        ),
+        center_kl=center_kl,
+        include_activation_quant=include_activation_quant,
+        validation_delta_quantize=validation_delta_quantize,
+        production_weight_cache=production_weight_cache,
+    )
+    validation_rows_by_key = _load_validation_checkpoint(
+        validation_checkpoint_path,
+        validation_checkpoint_signature,
+    )
+    if validation_rows_by_key:
+        log(
+            event="validation_checkpoint_loaded",
+            iter=iter_idx,
+            path=str(validation_checkpoint_path),
+            rows=len(validation_rows_by_key),
+        )
+
+    def _save_validation_checkpoint() -> None:
+        _write_validation_checkpoint(
+            validation_checkpoint_path,
+            signature=validation_checkpoint_signature,
+            rows_by_key=validation_rows_by_key,
+        )
+
     validation_weight_session = None
     validate_env_cm = (
         _temporary_env("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT", "1")
@@ -426,6 +565,18 @@ def run_iteration(
                 assignment = bc.expand_sweep_row_to_linear_assignment(
                     payload, r["assignment"],
                 )
+                selection_key = _validation_candidate_key(r)
+                cached_row = validation_rows_by_key.get(selection_key)
+                if cached_row is not None:
+                    cached_validation_row = dict(cached_row)
+                    cached_validation_row["is_kneedle"] = (i == knee_in_sorted)
+                    validation.append(cached_validation_row)
+                    log(event="validation_checkpoint_row_skipped",
+                        iter=iter_idx,
+                        bpp=cached_validation_row.get("bpp"),
+                        real_kl=cached_validation_row.get("real_kl"),
+                        is_kneedle=cached_validation_row.get("is_kneedle", False))
+                    continue
                 measure_frozen_cache = use_frozen_weight_cache
                 if validation_weight_session is not None:
                     current_assignment = validation_weight_session.current_assignment()
@@ -451,13 +602,16 @@ def run_iteration(
                     production_weight_cache=production_weight_cache, rng_seed=0,
                     include_activation_quant=include_activation_quant,
                 )
-                validation.append({
+                validation_row = {
                     "bpp": r["bpp"],
                     "surrogate_cost": r["cost_total"],
                     "real_kl": float(kl),
                     "is_kneedle": (i == knee_in_sorted),
                     "assignment": assignment,
-                })
+                }
+                validation.append(validation_row)
+                validation_rows_by_key[selection_key] = dict(validation_row)
+                _save_validation_checkpoint()
                 log(event="validate_done", iter=iter_idx,
                     bpp=r["bpp"], real_kl=float(kl),
                     is_kneedle=(i == knee_in_sorted))
@@ -478,18 +632,30 @@ def run_iteration(
 
     if center_assignment is not None and center_kl > 0.0:
         center_complete = assignment_for_units(center_assignment, units)
-        center_bits = cdp._assignment_bits(units, center_complete)
-        center_bpp = center_bits / float(total_params) if total_params else 0.0
-        validation.append({
-            "bpp": center_bpp,
-            "surrogate_cost": 0.0,
-            "real_kl": float(center_kl),
-            "is_kneedle": False,
-            "is_center_baseline": True,
-            "assignment": center_complete,
-        })
-        log(event="validate_center_baseline", iter=iter_idx,
-            bpp=center_bpp, real_kl=float(center_kl))
+        center_key = _validation_center_key(center_complete, center_kl)
+        cached_center = validation_rows_by_key.get(center_key)
+        if cached_center is not None:
+            validation.append(dict(cached_center))
+            log(event="validation_checkpoint_row_skipped", iter=iter_idx,
+                bpp=cached_center.get("bpp"),
+                real_kl=cached_center.get("real_kl"),
+                is_center_baseline=True)
+        else:
+            center_bits = cdp._assignment_bits(units, center_complete)
+            center_bpp = center_bits / float(total_params) if total_params else 0.0
+            center_row = {
+                "bpp": center_bpp,
+                "surrogate_cost": 0.0,
+                "real_kl": float(center_kl),
+                "is_kneedle": False,
+                "is_center_baseline": True,
+                "assignment": center_complete,
+            }
+            validation.append(center_row)
+            validation_rows_by_key[center_key] = dict(center_row)
+            _save_validation_checkpoint()
+            log(event="validate_center_baseline", iter=iter_idx,
+                bpp=center_bpp, real_kl=float(center_kl))
 
     (iter_dir / "validation.json").write_text(json.dumps({
         "schema": "prismaquant.block_clado.iter.validation.v1",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -200,3 +201,85 @@ def test_run_iteration_delta_validation_restores_bf16_and_skips_frozen_cache(
     assert all(row["external"] == "1" for row in seen)
     assert any(row["assignment"]["linear"] == "NVFP4" for row in seen)
     torch.testing.assert_close(model.linear.weight, original)
+
+
+def test_run_iteration_resumes_validation_checkpoint(tmp_path, monkeypatch):
+    unit = bc.DecisionUnit(
+        name="a",
+        block_id="model.layers.0",
+        member_qnames=("a.weight",),
+        options=(
+            bc.FormatCost("NVFP4", 0.02, 4.0, 50),
+            bc.FormatCost("MXFP8_E4M3", 0.01, 8.0, 100),
+            bc.FormatCost("BF16", 0.0, 16.0, 200),
+        ),
+    )
+    payload = bc.units_and_pairs_to_payload(
+        blocks={"model.layers.0": [unit]},
+        singletons=[],
+        pairs_by_block={"model.layers.0": []},
+        meta={"elapsed_seconds": 0.0, "center_kl": 0.0, "centered": False},
+    )
+    sweep_rows = [
+        SimpleNamespace(lambda_used=0.0, bits_total=50, cost_total=0.02,
+                        assignment={"model.layers.0": ("NVFP4",)}),
+        SimpleNamespace(lambda_used=1.0, bits_total=100, cost_total=0.01,
+                        assignment={"model.layers.0": ("MXFP8_E4M3",)}),
+        SimpleNamespace(lambda_used=2.0, bits_total=200, cost_total=0.001,
+                        assignment={"model.layers.0": ("BF16",)}),
+    ]
+
+    monkeypatch.setattr(ibc, "collect_output_fisher", lambda *args, **kwargs: payload)
+    monkeypatch.setattr(ibc.bc, "lambda_sweep", lambda *args, **kwargs: sweep_rows)
+    monkeypatch.setattr(ibc.bc, "kneedle_pick", lambda points: (1, 0.5, False))
+
+    calls = {"n": 0}
+
+    def fake_measure(model, assignment, calib_ids, ref_log_probs, **kwargs):
+        calls["n"] += 1
+        return 0.01 * calls["n"]
+
+    monkeypatch.setattr(ibc, "measure_assignment_kl", fake_measure)
+    first = ibc.run_iteration(
+        model=None,
+        calib_ids=None,
+        ref_log_probs=None,
+        profile=None,
+        formats=[],
+        work_root=tmp_path / "work",
+        iter_idx=0,
+        center_assignment=None,
+        center_label="BF16",
+        output_root=tmp_path / "out",
+        n_neighbors_validate=4,
+        skip_polish=True,
+        measure_method="output_fisher",
+    )
+    assert calls["n"] == 3
+    assert (tmp_path / "out" / "iter_0" / "validation_checkpoint.json").is_file()
+
+    def fail_measure(*args, **kwargs):
+        raise AssertionError("validation row should have been loaded from checkpoint")
+
+    monkeypatch.setattr(ibc, "measure_assignment_kl", fail_measure)
+    events = []
+    second = ibc.run_iteration(
+        model=None,
+        calib_ids=None,
+        ref_log_probs=None,
+        profile=None,
+        formats=[],
+        work_root=tmp_path / "work2",
+        iter_idx=0,
+        center_assignment=None,
+        center_label="BF16",
+        output_root=tmp_path / "out",
+        n_neighbors_validate=4,
+        skip_polish=True,
+        measure_method="output_fisher",
+        log_callback=lambda **kw: events.append(kw),
+    )
+
+    assert second.best_validated_kl == pytest.approx(first.best_validated_kl)
+    assert any(e.get("event") == "validation_checkpoint_loaded" for e in events)
+    assert sum(e.get("event") == "validation_checkpoint_row_skipped" for e in events) == 3
