@@ -45,6 +45,8 @@ PROD_CALIB_SEQLEN="${PROD_CALIB_SEQLEN:-${CALIB_SEQLEN}}"
 PROD_MAX_ACT_ROWS="${PROD_MAX_ACT_ROWS:-512}"
 PRODUCTION_CACHE_LRU_GB="${PRODUCTION_CACHE_LRU_GB:-16}"
 PRODUCTION_CACHE_PREFETCH="${PRODUCTION_CACHE_PREFETCH:-batch}"
+WEIGHT_SESSION_SNAPSHOT_DIR="${WEIGHT_SESSION_SNAPSHOT_DIR:-}"
+OF_WEIGHT_SESSION_SNAPSHOT_DIR="${OF_WEIGHT_SESSION_SNAPSHOT_DIR:-${WEIGHT_SESSION_SNAPSHOT_DIR}}"
 
 ALLOCATOR_PROBE="${ALLOCATOR_PROBE:-}"
 ALLOCATOR_COSTS="${ALLOCATOR_COSTS:-}"
@@ -62,6 +64,8 @@ REFINE_POLISH_BUDGET_CREEP="${REFINE_POLISH_BUDGET_CREEP:-0.05}"
 REFINE_LOGIT_SCOPE="${REFINE_LOGIT_SCOPE:-last_token}"
 OUTPUT_FISHER_REDUCTION_DEVICE="${OUTPUT_FISHER_REDUCTION_DEVICE:-auto}"
 REFINE_SKIP_POLISH="${REFINE_SKIP_POLISH:-0}"
+REFINE_PRODUCTION_CACHE_LRU_GB="${REFINE_PRODUCTION_CACHE_LRU_GB:-${PRODUCTION_CACHE_LRU_GB}}"
+REFINE_PRODUCTION_CACHE_PREFETCH="${REFINE_PRODUCTION_CACHE_PREFETCH:-none}"
 
 NO_ACTIVATION_QUANT="${NO_ACTIVATION_QUANT:-1}"
 ENABLE_CUDA_GRAPHS="${ENABLE_CUDA_GRAPHS:-0}"
@@ -94,6 +98,15 @@ fi
 cuda_graph_args=()
 if [[ "${ENABLE_CUDA_GRAPHS}" == "1" ]]; then
   cuda_graph_args+=(--enable-cuda-graphs)
+fi
+
+if [[ -n "${OF_WEIGHT_SESSION_SNAPSHOT_DIR}" ]]; then
+  export PRISMAQUANT_OF_WEIGHT_SESSION_SNAPSHOT_DIR="${OF_WEIGHT_SESSION_SNAPSHOT_DIR}"
+fi
+
+weight_session_args=()
+if [[ -n "${WEIGHT_SESSION_SNAPSHOT_DIR}" ]]; then
+  weight_session_args+=(--weight-session-snapshot-dir "${WEIGHT_SESSION_SNAPSHOT_DIR}")
 fi
 
 refine_polish_args=()
@@ -200,6 +213,7 @@ if [[ "${RUN_SEED_PROBE}" == "1" ]]; then
     --device cuda \
     "${activation_args[@]}" \
     "${cuda_graph_args[@]}" \
+    "${weight_session_args[@]}" \
     "${common_local_args[@]}" \
     "${seed_args[@]}" \
     2>&1 | tee "${RUN_ROOT}/logs/seed_frontier_probe.log"
@@ -241,8 +255,8 @@ if [[ "${RUN_REFINE}" == "1" ]]; then
     "${refine_polish_args[@]}" \
     --production-weight-cache "${PRODUCTION_CACHE_PKL}" \
     --production-cache-dir-override "${PRODUCTION_CACHE_DIR}" \
-    --production-cache-lru-gb "${PRODUCTION_CACHE_LRU_GB}" \
-    --production-cache-prefetch initial_center \
+    --production-cache-lru-gb "${REFINE_PRODUCTION_CACHE_LRU_GB}" \
+    --production-cache-prefetch "${REFINE_PRODUCTION_CACHE_PREFETCH}" \
     --initial-center-assignment "${SEED_PROBE_JSON}" \
     "${activation_args[@]}" \
     "${common_local_args[@]}" \

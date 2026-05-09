@@ -110,6 +110,18 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _output_fisher_weight_session_snapshot_dir(cache_dir: Path) -> str | None:
+    explicit = (
+        os.environ.get("PRISMAQUANT_OF_WEIGHT_SESSION_SNAPSHOT_DIR")
+        or os.environ.get("PRISMAQUANT_WEIGHT_SESSION_SNAPSHOT_DIR")
+    )
+    if explicit:
+        return explicit
+    if _env_truthy("PRISMAQUANT_OF_SPILL_WEIGHT_SESSION"):
+        return str(cache_dir / "weight_session_snapshots")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Weight perturbation helpers
 # ---------------------------------------------------------------------------
@@ -512,11 +524,7 @@ def collect_output_fisher(
                 weight_session = WeightSession(
                     model,
                     production_weight_cache=production_weight_cache,
-                    snapshot_dir=(
-                        str(cache_dir / "weight_session_snapshots")
-                        if _env_truthy("PRISMAQUANT_OF_SPILL_WEIGHT_SESSION")
-                        else None
-                    ),
+                    snapshot_dir=_output_fisher_weight_session_snapshot_dir(cache_dir),
                 )
                 weight_session.initialize(sandwich_base, all_units)
                 z_centered = _forward_logits(
@@ -573,11 +581,7 @@ def collect_output_fisher(
             weight_session = WeightSession(
                 model,
                 production_weight_cache=production_weight_cache,
-                snapshot_dir=(
-                    str(cache_dir / "weight_session_snapshots")
-                    if _env_truthy("PRISMAQUANT_OF_SPILL_WEIGHT_SESSION")
-                    else None
-                ),
+                snapshot_dir=_output_fisher_weight_session_snapshot_dir(cache_dir),
             )
             weight_session.initialize(base_assignment, all_units)
         dirty_weight_members: set[str] = set()
