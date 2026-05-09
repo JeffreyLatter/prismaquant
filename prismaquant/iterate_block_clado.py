@@ -29,12 +29,14 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -146,6 +148,74 @@ def assignment_for_units(
     return out
 
 
+def bf16_assignment_for_units(units: Sequence[bc.DecisionUnit]) -> dict[str, str]:
+    return {
+        member: "BF16"
+        for unit in units
+        for member in unit.member_qnames
+    }
+
+
+@contextmanager
+def _temporary_env(name: str, value: str):
+    prev = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = prev
+
+
+def _production_cache_key_variants(qname: str, fmt: str):
+    yield (qname, fmt)
+    if qname.endswith(".weight"):
+        yield (qname[:-len(".weight")], fmt)
+    if qname.startswith("model.language_model."):
+        yield ("model." + qname[len("model.language_model."):], fmt)
+    elif qname.startswith("model."):
+        yield ("model.language_model." + qname[len("model."):], fmt)
+
+
+def _prefetch_assignment_delta(
+    production_weight_cache,
+    current: Mapping[str, str],
+    target: Mapping[str, str],
+) -> tuple[int, int]:
+    """Prefetch cache-backed tensors needed to move current -> target.
+
+    The production cache is already LRU-bounded; this only gives the cache a
+    small look-ahead before WeightSession applies assignment deltas.  It avoids
+    the previous startup-only prefetch policy, which left validation to
+    synchronously torch.load each candidate's changed weights.
+    """
+    if production_weight_cache is None or not hasattr(production_weight_cache, "prefetch"):
+        return 0, 0
+    cache_weights = getattr(production_weight_cache, "weights", {}) or {}
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for qname, raw_fmt in target.items():
+        fmt = fr.canonical_format_name(str(raw_fmt))
+        prev = fr.canonical_format_name(str(current.get(qname, "BF16")))
+        if fmt == prev or fmt == "BF16":
+            continue
+        chosen = None
+        for key in _production_cache_key_variants(str(qname), fmt):
+            if key in cache_weights:
+                chosen = key
+                break
+        if chosen is None:
+            continue
+        if chosen not in seen:
+            seen.add(chosen)
+            keys.append(chosen)
+    if not keys:
+        return 0, 0
+    return len(keys), int(production_weight_cache.prefetch(keys))
+
+
 def run_iteration(
     *,
     model,
@@ -171,6 +241,8 @@ def run_iteration(
     output_fisher_reduction_device: str = "auto",
     output_fisher_logit_scope: str = "full_sequence",
     include_activation_quant: bool = True,
+    validation_delta_quantize: bool = True,
+    weight_session_snapshot_dir: str | Path | None = None,
     log_callback=None,
 ) -> IterationResult:
     """One iteration: measure → sweep → kneedle → validate → polish."""
@@ -311,26 +383,98 @@ def run_iteration(
 
     # ---- validate cone with real KL
     validation: list[dict] = []
-    for i in indices:
-        r = sorted_rows[i]
-        assignment = bc.expand_sweep_row_to_linear_assignment(payload, r["assignment"])
-        kl = measure_assignment_kl(
-            model, assignment, calib_ids, ref_log_probs,
-            work_root=work_root, profile=profile,
-            use_frozen_weight_cache=use_frozen_weight_cache,
-            production_weight_cache=production_weight_cache, rng_seed=0,
-            include_activation_quant=include_activation_quant,
-        )
-        validation.append({
-            "bpp": r["bpp"],
-            "surrogate_cost": r["cost_total"],
-            "real_kl": float(kl),
-            "is_kneedle": (i == knee_in_sorted),
-            "assignment": assignment,
-        })
-        log(event="validate_done", iter=iter_idx,
-            bpp=r["bpp"], real_kl=float(kl),
-            is_kneedle=(i == knee_in_sorted))
+    validation_weight_session = None
+    validate_env_cm = (
+        _temporary_env("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT", "1")
+        if validation_delta_quantize and production_weight_cache is not None
+        else nullcontext()
+    )
+    with validate_env_cm:
+        if validation_delta_quantize and production_weight_cache is not None:
+            from prismaquant.weight_session import WeightSession
+
+            validation_weight_session = WeightSession(
+                model,
+                production_weight_cache=production_weight_cache,
+                snapshot_dir=(
+                    str(weight_session_snapshot_dir)
+                    if weight_session_snapshot_dir is not None else None
+                ),
+            )
+            base_for_validation = (
+                assignment_for_units(center_assignment, units)
+                if center_assignment is not None
+                else bf16_assignment_for_units(units)
+            )
+            n_prefetch, n_loaded = _prefetch_assignment_delta(
+                production_weight_cache,
+                bf16_assignment_for_units(units),
+                base_for_validation,
+            )
+            validation_weight_session.initialize(base_for_validation, units)
+            log(
+                event="validation_weight_session_initialized",
+                iter=iter_idx,
+                n_prefetch_keys=n_prefetch,
+                n_prefetch_loaded=n_loaded,
+                diagnostics=validation_weight_session.diagnostics(),
+            )
+
+        try:
+            for i in indices:
+                r = sorted_rows[i]
+                assignment = bc.expand_sweep_row_to_linear_assignment(
+                    payload, r["assignment"],
+                )
+                measure_frozen_cache = use_frozen_weight_cache
+                if validation_weight_session is not None:
+                    current_assignment = validation_weight_session.current_assignment()
+                    n_prefetch, n_loaded = _prefetch_assignment_delta(
+                        production_weight_cache,
+                        current_assignment,
+                        assignment,
+                    )
+                    n_changed = validation_weight_session.apply_assignment(assignment)
+                    measure_frozen_cache = False
+                    log(
+                        event="validation_delta_assignment_applied",
+                        iter=iter_idx,
+                        bpp=r["bpp"],
+                        n_changed=n_changed,
+                        n_prefetch_keys=n_prefetch,
+                        n_prefetch_loaded=n_loaded,
+                    )
+                kl = measure_assignment_kl(
+                    model, assignment, calib_ids, ref_log_probs,
+                    work_root=work_root, profile=profile,
+                    use_frozen_weight_cache=measure_frozen_cache,
+                    production_weight_cache=production_weight_cache, rng_seed=0,
+                    include_activation_quant=include_activation_quant,
+                )
+                validation.append({
+                    "bpp": r["bpp"],
+                    "surrogate_cost": r["cost_total"],
+                    "real_kl": float(kl),
+                    "is_kneedle": (i == knee_in_sorted),
+                    "assignment": assignment,
+                })
+                log(event="validate_done", iter=iter_idx,
+                    bpp=r["bpp"], real_kl=float(kl),
+                    is_kneedle=(i == knee_in_sorted))
+        finally:
+            if validation_weight_session is not None:
+                try:
+                    n_restored = validation_weight_session.apply_assignment(
+                        bf16_assignment_for_units(units),
+                    )
+                    log(
+                        event="validation_weight_session_restored",
+                        iter=iter_idx,
+                        n_changed=n_restored,
+                        diagnostics=validation_weight_session.diagnostics(),
+                    )
+                finally:
+                    validation_weight_session = None
 
     if center_assignment is not None and center_kl > 0.0:
         center_complete = assignment_for_units(center_assignment, units)
@@ -395,6 +539,10 @@ def run_iteration(
             use_frozen_weight_cache=use_frozen_weight_cache,
             production_weight_cache=production_weight_cache,
             include_activation_quant=include_activation_quant,
+            delta_quantize=production_weight_cache is not None,
+            weight_session_spill_to_disk=weight_session_snapshot_dir is not None,
+            weight_session_snapshot_dir=weight_session_snapshot_dir,
+            restore_bf16_on_exit=True,
             progress_callback=_polish_progress,
         )
     log(event="polish_done", iter=iter_idx,
@@ -576,6 +724,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--validation-delta-quantize",
+        dest="validation_delta_quantize",
+        action="store_true",
+        default=True,
+        help=(
+            "Validate frontier candidates by materializing assignment deltas "
+            "with WeightSession instead of rebuilding a whole frozen-weight "
+            "cache per candidate. Enabled by default when a production cache "
+            "is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--no-validation-delta-quantize",
+        dest="validation_delta_quantize",
+        action="store_false",
+        help="Disable WeightSession-backed validation and use the legacy hook path.",
+    )
+    parser.add_argument(
+        "--weight-session-snapshot-dir",
+        default=os.environ.get("PRISMAQUANT_WEIGHT_SESSION_SNAPSHOT_DIR"),
+        help=(
+            "Optional shared directory for BF16 WeightSession snapshots used "
+            "by output-Fisher, validation delta materialization, and polish."
+        ),
+    )
+    parser.add_argument(
         "--initial-center-assignment",
         default=None,
         help=(
@@ -670,14 +844,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 n_loaded = production_weight_cache.prefetch()
                 print(f"[iter] production cache prefetched all: {n_loaded}", flush=True)
             elif prefetch_mode == "initial_center" and center_assignment:
-                keys = [
-                    (qname, fmt.upper())
-                    for qname, fmt in center_assignment.items()
-                    if fmt.upper() not in {"BF16", "MXFP8", "MXFP8_E4M3"}
-                ]
-                n_loaded = production_weight_cache.prefetch(keys)
+                n_keys, n_loaded = _prefetch_assignment_delta(
+                    production_weight_cache,
+                    {},
+                    center_assignment,
+                )
                 print(
-                    f"[iter] production cache prefetched initial_center: {n_loaded}",
+                    "[iter] production cache prefetched initial_center: "
+                    f"{n_loaded} loaded / {n_keys} keys",
                     flush=True,
                 )
         prev_polish_hash: str | None = None
@@ -707,6 +881,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_fisher_reduction_device=str(args.output_fisher_reduction_device),
                 output_fisher_logit_scope=str(args.output_fisher_logit_scope),
                 include_activation_quant=not bool(args.no_activation_quant),
+                validation_delta_quantize=bool(args.validation_delta_quantize),
+                weight_session_snapshot_dir=args.weight_session_snapshot_dir,
                 log_callback=log,
             )
             summary_rows.append(result)

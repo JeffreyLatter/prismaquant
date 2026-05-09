@@ -316,6 +316,8 @@ class WeightSession:
         if live is None:
             return None
         prev_weight = live.detach().clone()
+        if prev_fmt == "BF16" and new_canon != "BF16":
+            self._ensure_bf16_snapshot_recorded(qname)
         replacement = self._format_weight(qname, new_canon)
         if replacement is None:
             return None
@@ -354,8 +356,11 @@ class WeightSession:
                     self._stage_missing.append(qname)
                 continue
             new_canon = fr.canonical_format_name(fmt)
-            if self._current.get(qname, "BF16") == new_canon:
+            prev_canon = self._current.get(qname, "BF16")
+            if prev_canon == new_canon:
                 continue
+            if prev_canon == "BF16" and new_canon != "BF16":
+                self._ensure_bf16_snapshot_recorded(qname)
             replacement = self._format_weight(qname, new_canon)
             if replacement is None:
                 continue

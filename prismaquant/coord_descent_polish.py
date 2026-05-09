@@ -213,6 +213,8 @@ def coord_descent_polish(
     kl_scope: str | None = "last_token",
     include_activation_quant: bool = True,
     weight_session_spill_to_disk: bool = False,
+    weight_session_snapshot_dir: str | Path | None = None,
+    restore_bf16_on_exit: bool = False,
     progress_callback=None,
 ) -> PolishResult:
     """Polish a starting assignment via real-KL-gated single-flip moves.
@@ -356,8 +358,12 @@ def coord_descent_polish(
                 model,
                 production_weight_cache=production_weight_cache,
                 snapshot_dir=(
-                    str(work_root / "weight_session_snapshots")
-                    if weight_session_spill_to_disk else None
+                    str(weight_session_snapshot_dir)
+                    if weight_session_snapshot_dir is not None
+                    else (
+                        str(work_root / "weight_session_snapshots")
+                        if weight_session_spill_to_disk else None
+                    )
                 ),
             )
             weight_session.initialize(current, units)
@@ -607,6 +613,26 @@ def coord_descent_polish(
             },
         )
     finally:
+        if use_delta_quant and restore_bf16_on_exit and weight_session is not None:
+            try:
+                restore_assignment = {
+                    member: "BF16"
+                    for unit in units
+                    for member in unit.member_qnames
+                }
+                n_restored = weight_session.apply_assignment(restore_assignment)
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "weight_session_restored",
+                        "n_changed": int(n_restored),
+                        "diagnostics": weight_session.diagnostics(),
+                    })
+            except Exception as exc:
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "weight_session_restore_error",
+                        "error": str(exc),
+                    })
         # Restore PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT to its prior
         # value so we do not poison subsequent in-process callers
         # (L3 measurement, validation, model.eval loops) that expect

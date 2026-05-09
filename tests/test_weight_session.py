@@ -65,3 +65,26 @@ def test_weight_session_reuses_existing_spilled_snapshot(tmp_path):
     assert reused is not None
     torch.testing.assert_close(reused, torch.ones_like(reused))
     assert second.diagnostics()["n_bf16_snapshots"] == 1
+
+
+def test_apply_assignment_records_bf16_before_overwrite(tmp_path):
+    model = _ModelWithBody().eval()
+    original = model.model.proj.weight.detach().clone()
+    rendered = torch.full_like(original, 0.125)
+    cache = ProductionWeightCache(
+        weights={("model.proj", "NVFP4"): rendered.clone()},
+        levers={},
+    )
+    session = WeightSession(
+        model,
+        production_weight_cache=cache,
+        snapshot_dir=str(tmp_path),
+    )
+
+    session.initialize({"model.proj": "BF16"}, units=[])
+    session.apply_assignment({"model.proj": "NVFP4"})
+    torch.testing.assert_close(model.model.proj.weight, rendered)
+    assert session.diagnostics()["n_bf16_snapshots"] == 1
+
+    session.apply_assignment({"model.proj": "BF16"})
+    torch.testing.assert_close(model.model.proj.weight, original)

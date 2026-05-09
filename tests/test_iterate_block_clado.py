@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
+import torch
+import torch.nn as nn
 
 from prismaquant import block_clado as bc
 from prismaquant import iterate_block_clado as ibc
 from prismaquant.iterate_block_clado import assignment_for_units, load_assignment_json
+from prismaquant.production_weight_cache import ProductionWeightCache
 
 
 def test_load_assignment_json_accepts_allocator_seed_payload(tmp_path):
@@ -124,3 +128,75 @@ def test_run_iteration_keeps_center_when_validated_candidates_regress(tmp_path, 
     center_rows = [row for row in validation["rows"] if row.get("is_center_baseline")]
     assert len(center_rows) == 1
     assert center_rows[0]["real_kl"] == pytest.approx(0.05)
+
+
+class _ToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4, bias=False)
+
+
+def test_run_iteration_delta_validation_restores_bf16_and_skips_frozen_cache(
+    tmp_path,
+    monkeypatch,
+):
+    model = _ToyModel().eval()
+    original = model.linear.weight.detach().clone()
+    rendered = torch.full_like(original, 0.25)
+    cache = ProductionWeightCache(
+        weights={("linear", "NVFP4"): rendered.clone()},
+        levers={},
+    )
+    unit = bc.DecisionUnit(
+        name="linear",
+        block_id="model.layers.0",
+        member_qnames=("linear",),
+        options=(
+            bc.FormatCost("NVFP4", 0.02, 4.0, 16),
+            bc.FormatCost("MXFP8_E4M3", 0.01, 8.0, 32),
+            bc.FormatCost("BF16", 0.0, 16.0, 64),
+        ),
+    )
+    payload = bc.units_and_pairs_to_payload(
+        blocks={"model.layers.0": [unit]},
+        singletons=[],
+        pairs_by_block={"model.layers.0": []},
+        meta={"elapsed_seconds": 0.0, "center_kl": 0.01, "centered": True},
+    )
+    seen = []
+
+    def fake_measure(model, assignment, calib_ids, ref_log_probs, **kwargs):
+        seen.append({
+            "assignment": dict(assignment),
+            "use_frozen_weight_cache": kwargs.get("use_frozen_weight_cache"),
+            "external": os.environ.get("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT"),
+        })
+        return 0.02
+
+    monkeypatch.setattr(ibc, "collect_output_fisher", lambda *args, **kwargs: payload)
+    monkeypatch.setattr(ibc, "measure_assignment_kl", fake_measure)
+
+    ibc.run_iteration(
+        model=model,
+        calib_ids=torch.ones(1, 2, dtype=torch.long),
+        ref_log_probs=None,
+        profile=None,
+        formats=[],
+        work_root=tmp_path / "work",
+        iter_idx=0,
+        center_assignment={"linear": "BF16"},
+        center_label="seed",
+        output_root=tmp_path / "out",
+        n_neighbors_validate=4,
+        skip_polish=True,
+        measure_method="output_fisher",
+        production_weight_cache=cache,
+        validation_delta_quantize=True,
+        weight_session_snapshot_dir=tmp_path / "snapshots",
+    )
+
+    assert seen
+    assert all(row["use_frozen_weight_cache"] is False for row in seen)
+    assert all(row["external"] == "1" for row in seen)
+    assert any(row["assignment"]["linear"] == "NVFP4" for row in seen)
+    torch.testing.assert_close(model.linear.weight, original)

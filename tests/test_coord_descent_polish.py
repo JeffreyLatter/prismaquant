@@ -99,7 +99,7 @@ def test_weight_session_stages_reverts_and_commits(tmp_path):
 
     assert session.stage_format("linear", "NVFP4") is not None
     torch.testing.assert_close(model.linear.weight, rendered)
-    assert session.n_bf16_snapshots == 0
+    assert session.n_bf16_snapshots == 1
     session.revert_last()
     torch.testing.assert_close(model.linear.weight, original)
 
@@ -150,6 +150,46 @@ def test_delta_quantize_polish_restores_external_weight_env(monkeypatch, tmp_pat
     assert result.final_assignment == {"linear": "NVFP4"}
     torch.testing.assert_close(model.linear.weight, rendered)
     assert os.environ.get("PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT") == "sentinel"
+
+
+def test_delta_quantize_polish_can_restore_bf16_on_exit(tmp_path):
+    model = _ToyLinearModel()
+    original = model.linear.weight.detach().clone()
+    rendered = torch.full_like(original, 0.125)
+    cache = ProductionWeightCache(
+        weights={("linear", "NVFP4"): rendered},
+        levers={},
+    )
+    unit = _mk_unit(
+        "linear",
+        ("linear",),
+        [("BF16", 0.0, 16, 2048), ("NVFP4", 0.1, 4.5, 512)],
+    )
+
+    def fake_measure(model, assignment, calib_ids, ref_log_probs, **_):
+        return 0.5 if assignment["linear"] == "NVFP4" else 1.0
+
+    with patch(
+        "prismaquant.coord_descent_polish.measure_assignment_kl",
+        side_effect=fake_measure,
+    ):
+        result = cdp.coord_descent_polish(
+            model=model,
+            calib_ids=object(),
+            ref_log_probs=object(),
+            units=[unit],
+            starting_assignment={"linear": "BF16"},
+            work_root=str(tmp_path),
+            noise_floor=0.0,
+            max_passes=2,
+            production_weight_cache=cache,
+            delta_quantize=True,
+            weight_session_snapshot_dir=tmp_path / "snapshots",
+            restore_bf16_on_exit=True,
+        )
+
+    assert result.final_assignment == {"linear": "NVFP4"}
+    torch.testing.assert_close(model.linear.weight, original)
 
 
 def test_polish_accepts_strict_improvement():
