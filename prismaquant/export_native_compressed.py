@@ -4993,6 +4993,20 @@ def _validate_halo_export_support(profile, cfg, hidden: int) -> None:
             "expert rotation.")
 
 
+def _validate_halo_cache_inputs(args) -> None:
+    """Reject HALO/cache combinations that cannot preserve semantics."""
+    if args.halo_mode != "off" and args.production_weight_cache:
+        raise RuntimeError(
+            "[halo] --production-weight-cache is incompatible with "
+            "--halo-mode random. A ProductionWeightCache contains "
+            "already-rendered no-HALO compressed weights, but HALO must "
+            "rotate weights before NVFP4/MXFP8 quantization/rendering. "
+            "Re-render a HALO-specific production cache from activations, "
+            "or export without --production-weight-cache for a research-only "
+            "RTN/GPTQ path."
+        )
+
+
 def main():
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
     global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
@@ -5184,6 +5198,7 @@ def main():
                          "Hadamard. Saved alongside the artifact at "
                          "halo_rotation.pt for forensic reproducibility.")
     args = ap.parse_args()
+    _validate_halo_cache_inputs(args)
 
     from .model_profiles import detect_profile
     profile = detect_profile(args.model)

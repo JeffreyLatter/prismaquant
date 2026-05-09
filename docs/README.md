@@ -4,6 +4,8 @@ Current docs in this directory describe the live PrismaQuant implementation:
 
 - `runtime_flags.md`: environment controls used by production runs.
 - `calibration_diverse_v1.md`: fixed mixed-domain calibration recipe.
+- `halo_27b_attempt_2026-05-09.md`: invalidated HALO 27B attempt and
+  production-cache guardrail.
 - `validation_harness.md`: validation harness behavior and CLI notes.
 - `v20_memory_and_scheduling.md`: memory scheduling notes.
 - `vectorization_refactor.md`: vectorization implementation notes.

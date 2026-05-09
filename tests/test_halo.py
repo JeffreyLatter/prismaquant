@@ -453,3 +453,23 @@ def test_export_halo_validator_rejects_unsupported_configs():
         _validate_halo_export_support(qwen35_profile, untied_cfg, 64)
     _validate_halo_export_support(default_profile, nonpow_cfg, 96)
     _validate_halo_export_support(qwen35_dense_mtp_profile, nonpow_cfg, 96)
+
+
+def test_export_halo_rejects_prerendered_production_cache():
+    from prismaquant.export_native_compressed import (
+        _validate_halo_cache_inputs,
+    )
+
+    _validate_halo_cache_inputs(
+        SimpleNamespace(halo_mode="off", production_weight_cache="cache.pkl")
+    )
+    _validate_halo_cache_inputs(
+        SimpleNamespace(halo_mode="random", production_weight_cache=None)
+    )
+    with pytest.raises(RuntimeError, match="production-weight-cache"):
+        _validate_halo_cache_inputs(
+            SimpleNamespace(
+                halo_mode="random",
+                production_weight_cache="cache.pkl",
+            )
+        )
