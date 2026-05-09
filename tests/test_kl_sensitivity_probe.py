@@ -30,10 +30,9 @@ from prismaquant.kl_sensitivity_probe import (
     _replay_cache_window_size,
     solve_multi_choice_frontier,
 )
-from prismaquant.iterate_perturbed_allocation import measure_assignment_kl
+from prismaquant.kl_measurement import measure_assignment_kl, resolve_kl_scope
 from prismaquant.model_profiles import Qwen3Profile
 from prismaquant.production_weight_cache import ProductionWeightCache
-from prismaquant.propagated_cost import resolve_kl_scope
 
 
 def test_full_sequence_kl_equals_average_of_position_kls():

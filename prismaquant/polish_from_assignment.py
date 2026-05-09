@@ -1,11 +1,11 @@
 """Polish a saved assignment with production-faithful weights.
 
 Loads:
-  - a Block-CLADO payload (for the unit/pair structure)
+  - a decision-unit payload (for the fused-sibling unit/pair structure)
   - a kneedle-style assignment JSON (any cone candidate)
   - optionally a ProductionWeightCache pickle
 
-Runs ``coord_descent_polish`` on it and writes the polished assignment +
+Runs measured single-flip polish on it and writes the polished assignment +
 trace to ``--output`` JSON.
 """
 from __future__ import annotations
@@ -25,20 +25,20 @@ from pathlib import Path
 import torch
 
 from prismaquant import format_registry as fr
-from prismaquant import block_clado as bc
+from prismaquant import decision_units as du
 from prismaquant.build_rtn_cache import (
     cache_reference_log_probs,
     stage_multimodal,
 )
-from prismaquant.coord_descent_polish import (
+from prismaquant.polish import (
     _assignment_bits,
     coord_descent_polish,
 )
-from prismaquant.iterate_perturbed_allocation import measure_assignment_kl
-from prismaquant.measure_adjoint_l3 import (
+from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
+from prismaquant.kl_measurement import measure_assignment_kl
 from prismaquant.perturbed_x_cache import calibration_data_hash
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 
@@ -71,7 +71,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Defaults match the shipping artifact's validation calibration
     # (8 samples × 512 tokens = 4 096 tokens).  An older default of
     # 2 × 128 was a sanity-run config that should not back any
-    # publishable KL claim — see the 2026-05-03 PrismaSCOUT handover.
+    # publishable KL claim; it is a legacy sanity-run config.
     p.add_argument("--n-calib-samples", type=int, default=8)
     p.add_argument("--calib-seqlen", type=int, default=512)
     p.add_argument("--calib-split", default="train")
@@ -202,9 +202,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     from prismaquant._fast_kernel_guard import require_fast_kernels
     require_fast_kernels(args.model)
 
-    payload = bc.load_payload(args.payload)
-    blocks_back, singletons_back, pairs_back = bc.parse_payload(payload)
-    units: list[bc.DecisionUnit] = []
+    payload = du.load_payload(args.payload)
+    blocks_back, singletons_back, pairs_back = du.parse_payload(payload)
+    units: list[du.DecisionUnit] = []
     for unit_list in blocks_back.values():
         units.extend(unit_list)
     units.extend(singletons_back)
@@ -425,7 +425,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         elapsed = time.monotonic() - t0
 
-        n_params = bc.total_param_count(payload)
+        n_params = du.total_param_count(payload)
         final_bits = _assignment_bits(units, polish_result.final_assignment)
         final_bpp = final_bits / float(n_params) if n_params else 0.0
 

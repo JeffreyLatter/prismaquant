@@ -14,13 +14,12 @@ import torch
 
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import cache_reference_log_probs, stage_multimodal
-from prismaquant.iterate_perturbed_allocation import measure_assignment_kl
-from prismaquant.measure_adjoint_l3 import (
+from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
 from prismaquant.model_profiles import DefaultProfile, detect_profile
-from prismaquant.propagated_cost import assignment_bit_total
+from prismaquant.kl_measurement import assignment_bit_total, measure_assignment_kl
 
 
 def _load_json(path: str | Path):

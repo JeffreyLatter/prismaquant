@@ -3,13 +3,13 @@
 Current production path:
     1. incremental_probe.py              stream Fisher and activation shards
     2. incremental_measure_quant_cost.py build per-Linear format costs
-    3. iterate_perturbed_allocation.py   generate and validate PrismaSCOUT knees
-    4. polish_from_assignment.py         run production-faithful local polish
-    5. export_native_compressed.py       write compressed-tensors artifacts
+    3. kl_sensitivity_probe.py           build measured per-Linear frontiers
+    4. allocator.py                      choose the layer-format assignment
+    5. polish_from_assignment.py         run production-faithful local polish
+    6. export_native_compressed.py       write compressed-tensors artifacts
 
-Older additive, interaction, Block-CLADO, and adjoint allocators remain importable
-for artifact replay and comparison, but the package entrypoint documents the path
-that should be used for new runs.
+Older cross-layer allocators are archived under archive/cross_layer_2026-05-09
+for artifact replay and comparison.
 """
 from .format_registry import FormatSpec, REGISTRY, register_format
 

@@ -31,7 +31,7 @@ import os
 import torch
 import torch.nn as nn
 
-from prismaquant import block_clado as bc
+from prismaquant import decision_units as du
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 
@@ -249,7 +249,7 @@ class WeightSession:
     def initialize(
         self,
         assignment: Mapping[str, str],
-        units: Sequence[bc.DecisionUnit],
+        units: Sequence[du.DecisionUnit],
     ) -> None:
         """Apply ``assignment`` to live model.params.
 
@@ -258,7 +258,7 @@ class WeightSession:
         Units assigned BF16 are left as-is on the live model but still
         snapshotted so future reverts work.
         """
-        member_to_unit: dict[str, bc.DecisionUnit] = {}
+        member_to_unit: dict[str, du.DecisionUnit] = {}
         for unit in units:
             for member in unit.member_qnames:
                 member_to_unit[member] = unit
@@ -396,7 +396,7 @@ class WeightSession:
     # Sibling-aware multi-flip helpers (a fused unit's members all flip
     # together — committed/reverted as one atomic group).
     # ------------------------------------------------------------------
-    def stage_unit(self, unit: bc.DecisionUnit, new_fmt: str) -> int:
+    def stage_unit(self, unit: du.DecisionUnit, new_fmt: str) -> int:
         """Stage all members of ``unit`` to ``new_fmt``.  Returns the
         number of stage_format calls accepted (== number of undo
         entries pushed).  Use ``revert_unit_last(n)`` /

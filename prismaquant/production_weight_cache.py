@@ -1,10 +1,10 @@
-"""Production-faithful δw cache for Block-CLADO measurement.
+"""Production-faithful rendered-weight cache for measured candidates.
 
-Block-CLADO's surrogate (four-term identity) and real-KL gates measure
-how perturbations propagate downstream.  Without this cache the
-perturbation rendered into the model is bare RTN.  The export pipeline
-renders weights with several activation-aware passes; the shipped δw is
-much smaller than the RTN δw at the same format.
+Per-Linear candidate probes and real-KL gates need to measure the same
+rendered weights that export will ship. Without this cache the perturbation
+installed into the model is bare RTN. The export pipeline renders weights with
+several activation-aware passes; the shipped δw is much smaller than the RTN
+δw at the same format.
 
 This module pre-renders `W_tilde[name, fmt]` once, using the production
 quantization path:
@@ -36,8 +36,8 @@ quantization path:
 
 PerturbedActivationCache installs `W_tilde` (and applies the calibrated
 `input_global_scale` on activations) instead of RTN-quantizing on the
-fly, so every measurement — four-term, cone validate, polish gate — uses
-the same δw the export will deliver, modulo the v2 gaps above.
+fly, so per-Linear probes, frontier validation, and polish gates use the
+same δw the export will deliver, modulo the v2 gaps above.
 
 Usage:
 
@@ -752,7 +752,7 @@ def fill_production_weight_cache(
 
     if "NVFP4" in fmt_set:
         # Group by fused sibling key for max-across-siblings unification.
-        from prismaquant.block_clado import fused_group_key
+        from prismaquant.decision_units import fused_group_key
         try:
             from prismaquant.model_profiles import detect_profile
             profile = detect_profile(getattr(model, "name_or_path", "")) \

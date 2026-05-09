@@ -6,11 +6,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from prismaquant import iterate_perturbed_allocation as ipa
+from prismaquant import kl_measurement as km
 from prismaquant import memory_management as mm
-from prismaquant import propagated_cost as pc
 from prismaquant.perturbed_x_cache import PerturbedActivationCache
-from prismaquant.propagated_cost import CUDAGraphRegistry, _CUDAGraphEntry
+from prismaquant.kl_measurement import CUDAGraphRegistry, _CUDAGraphEntry
 from prismaquant.memory_management import enforce_gpu_memory_budget, report_graph_memory
 
 
@@ -98,7 +97,7 @@ def test_cuda_graph_registries_share_lazy_pool(monkeypatch):
     sentinel = object()
     calls = []
     monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "1")
-    monkeypatch.setattr(pc, "_PRISMAQUANT_GRAPH_POOL", None)
+    monkeypatch.setattr(km, "_PRISMAQUANT_GRAPH_POOL", None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
         torch.cuda,
@@ -112,7 +111,7 @@ def test_cuda_graph_registries_share_lazy_pool(monkeypatch):
 
     assert first.graph_pool() is sentinel
     assert second.graph_pool() is sentinel
-    assert pc.get_prismaquant_graph_pool() is sentinel
+    assert km.get_prismaquant_graph_pool() is sentinel
     assert calls == ["pool"]
     assert first.graph_pool_id() == second.graph_pool_id()
 
@@ -136,10 +135,10 @@ def test_cuda_graph_shared_pool_env_can_disable(monkeypatch):
 def test_output_clone_overridden_when_shared_pool_enabled(monkeypatch, capsys):
     monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "1")
     monkeypatch.setenv("PRISMAQUANT_GRAPH_OUTPUT_CLONE", "0")
-    monkeypatch.setattr(pc, "_NOCLONE_OVERRIDE_WARNED", False)
+    monkeypatch.setattr(km, "_NOCLONE_OVERRIDE_WARNED", False)
     value = torch.tensor([1.0, 2.0])
 
-    cloned = pc._clone_cuda_graph_output(value)
+    cloned = km._clone_cuda_graph_output(value)
 
     captured = capsys.readouterr()
     assert cloned is not value
@@ -150,11 +149,11 @@ def test_output_clone_overridden_when_shared_pool_enabled(monkeypatch, capsys):
 def test_output_clone_override_warning_emitted_once(monkeypatch, capsys):
     monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "1")
     monkeypatch.setenv("PRISMAQUANT_GRAPH_OUTPUT_CLONE", "0")
-    monkeypatch.setattr(pc, "_NOCLONE_OVERRIDE_WARNED", False)
+    monkeypatch.setattr(km, "_NOCLONE_OVERRIDE_WARNED", False)
     value = torch.tensor([1.0, 2.0])
 
     for _ in range(5):
-        cloned = pc._clone_cuda_graph_output(value)
+        cloned = km._clone_cuda_graph_output(value)
         assert cloned is not value
 
     captured = capsys.readouterr()
@@ -164,10 +163,10 @@ def test_output_clone_override_warning_emitted_once(monkeypatch, capsys):
 def test_output_clone_skipped_when_only_clone_disabled(monkeypatch, capsys):
     monkeypatch.setenv("PRISMAQUANT_GRAPH_SHARED_POOL", "0")
     monkeypatch.setenv("PRISMAQUANT_GRAPH_OUTPUT_CLONE", "0")
-    monkeypatch.setattr(pc, "_NOCLONE_OVERRIDE_WARNED", False)
+    monkeypatch.setattr(km, "_NOCLONE_OVERRIDE_WARNED", False)
     value = torch.tensor([1.0, 2.0])
 
-    output = pc._clone_cuda_graph_output(value)
+    output = km._clone_cuda_graph_output(value)
 
     captured = capsys.readouterr()
     assert output is value
@@ -186,8 +185,8 @@ def test_cuda_graph_output_clone_can_return_static_replay_tensor(monkeypatch):
         registry.label,
         "alias",
         ("key",),
-        pc._tensor_tree_signature((arg,)),
-        pc._tensor_tree_signature({}),
+        km._tensor_tree_signature((arg,)),
+        km._tensor_tree_signature({}),
     )
 
     registry.entries[full_key] = _CUDAGraphEntry(
@@ -276,7 +275,7 @@ def test_phase_boundary_cleanup_called(monkeypatch):
     monkeypatch.setattr(torch.cuda, "empty_cache", _empty_cache)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
-    ipa._phase_boundary_cleanup("l2_to_l3")
+    mm.phase_boundary_memory_cleanup("l2_to_l3")
 
     assert calls["empty_cache"] == 1
 

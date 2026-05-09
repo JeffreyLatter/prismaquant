@@ -1,4 +1,4 @@
-"""Coordinate-descent polish for Block-CLADO assignments.
+"""Measured single-flip polish for per-Linear assignments.
 
 Takes a per-Linear starting assignment, the model + calibration set, and a
 list of fused-sibling decision units.  For each pass, evaluates every single-
@@ -11,12 +11,7 @@ Properties:
   improves the metric we ship on.
 * Fused-sibling aware: a flip applies to all members of a fused group at
   once, preserving serving compatibility.
-* No surrogate involved: this is pure measured KL gating.  It will catch
-  flips the surrogate missed and reject flips the surrogate predicted but
-  reality didn't reward.
-
-This is the same lever that produced PrismaSCOUT's largest single-step KL
-win (the "6 flips → 0.245 KL" result on Qwen 4B).
+* No surrogate involved: this is pure measured KL gating.
 """
 from __future__ import annotations
 
@@ -32,17 +27,17 @@ from pathlib import Path
 
 import torch
 
-from prismaquant import block_clado as bc
+from prismaquant import decision_units as du
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import (
     cache_reference_log_probs,
     stage_multimodal,
 )
-from prismaquant.iterate_perturbed_allocation import measure_assignment_kl
-from prismaquant.measure_adjoint_l3 import (
+from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
+from prismaquant.kl_measurement import measure_assignment_kl
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 
 
@@ -73,7 +68,7 @@ class PolishResult:
 
 def _override_unit(
     assignment: Mapping[str, str],
-    unit: bc.DecisionUnit,
+    unit: du.DecisionUnit,
     fmt: str,
 ) -> dict[str, str]:
     """Return a new assignment with all members of ``unit`` set to ``fmt``."""
@@ -86,7 +81,7 @@ def _override_unit(
 
 def _current_unit_format(
     assignment: Mapping[str, str],
-    unit: bc.DecisionUnit,
+    unit: du.DecisionUnit,
 ) -> str | None:
     """Return the format applied to the first member; None if missing."""
     for member in unit.member_qnames:
@@ -97,7 +92,7 @@ def _current_unit_format(
 
 
 def _assignment_bits(
-    units: Sequence[bc.DecisionUnit],
+    units: Sequence[du.DecisionUnit],
     assignment: Mapping[str, str],
 ) -> float:
     """Return the total bits implied by ``assignment`` across ``units``."""
@@ -114,8 +109,8 @@ def _assignment_bits(
 
 
 def _surrogate_candidate_priority(
-    units: Sequence[bc.DecisionUnit],
-    pairs_by_block: Mapping[str, Sequence[bc.BlockPair]],
+    units: Sequence[du.DecisionUnit],
+    pairs_by_block: Mapping[str, Sequence[du.BlockPair]],
     current_assignment: Mapping[str, str],
 ) -> dict[tuple[str, str], float]:
     """Return surrogate-predicted ΔCost for every (unit, target_fmt) flip.
@@ -142,7 +137,7 @@ def _surrogate_candidate_priority(
                 )
                 break
     # Build a quick lookup of the block each unit is in.
-    units_by_block: dict[str, list[bc.DecisionUnit]] = {}
+    units_by_block: dict[str, list[du.DecisionUnit]] = {}
     for unit in units:
         units_by_block.setdefault(unit.block_id, []).append(unit)
 
@@ -194,7 +189,7 @@ def coord_descent_polish(
     calib_ids: torch.Tensor,
     ref_log_probs,
     *,
-    units: Sequence[bc.DecisionUnit],
+    units: Sequence[du.DecisionUnit],
     starting_assignment: Mapping[str, str],
     profile=None,
     work_root: str | Path | None = None,
@@ -202,7 +197,7 @@ def coord_descent_polish(
     max_passes: int = 8,
     bits_budget: float | None = None,
     bits_tolerance: float = 0.0,
-    pairs_by_block: Mapping[str, Sequence[bc.BlockPair]] | None = None,
+    pairs_by_block: Mapping[str, Sequence[du.BlockPair]] | None = None,
     steepest_first: bool = False,
     use_frozen_weight_cache: bool = False,
     production_weight_cache=None,
@@ -411,7 +406,7 @@ def coord_descent_polish(
             })
 
         for pass_idx in range(max_passes):
-            best_move: tuple[bc.DecisionUnit, str] | None = None
+            best_move: tuple[du.DecisionUnit, str] | None = None
             if direction == "bottom_up":
                 # Sentinel: any move with KL strictly below current beats this.
                 best_kl_after = float(current_kl)
@@ -428,7 +423,7 @@ def coord_descent_polish(
             # sweep lexicographically (greedy-best).
             pinned = set(pinned_units or set())
 
-            def _is_pinned(unit: bc.DecisionUnit) -> bool:
+            def _is_pinned(unit: du.DecisionUnit) -> bool:
                 if unit.name in pinned:
                     return True
                 for member in getattr(unit, "member_qnames", []) or []:
@@ -436,7 +431,7 @@ def coord_descent_polish(
                         return True
                 return False
 
-            order: list[tuple[bc.DecisionUnit, "bc.FormatCost"]]
+            order: list[tuple[du.DecisionUnit, du.FormatCost]]
             if steepest_first and pairs_by_block is not None:
                 priority = _surrogate_candidate_priority(
                     units, pairs_by_block, current,
@@ -648,12 +643,12 @@ def coord_descent_polish(
             shutil.rmtree(work_root, ignore_errors=True)
 
 
-def units_from_payload(payload_path: str | Path) -> list[bc.DecisionUnit]:
-    """Load DecisionUnits from a Block-CLADO measurement payload."""
+def units_from_payload(payload_path: str | Path) -> list[du.DecisionUnit]:
+    """Load DecisionUnits from a decision-unit payload."""
     with Path(payload_path).open("r", encoding="utf-8") as fh:
         payload = json.load(fh)
-    blocks, singletons, _pairs = bc.parse_payload(payload)
-    units: list[bc.DecisionUnit] = []
+    blocks, singletons, _pairs = du.parse_payload(payload)
+    units: list[du.DecisionUnit] = []
     for unit_list in blocks.values():
         units.extend(unit_list)
     units.extend(singletons)
@@ -662,15 +657,15 @@ def units_from_payload(payload_path: str | Path) -> list[bc.DecisionUnit]:
 
 def units_and_pairs_from_payload(
     payload_path: str | Path,
-) -> tuple[list[bc.DecisionUnit], dict[str, list[bc.BlockPair]]]:
-    """Load DecisionUnits AND intra-block pairs from a Block-CLADO payload.
+) -> tuple[list[du.DecisionUnit], dict[str, list[du.BlockPair]]]:
+    """Load DecisionUnits AND intra-block pairs from a decision-unit payload.
 
     Returns ``(units, pairs_by_block)`` for use with ``steepest_first``.
     """
     with Path(payload_path).open("r", encoding="utf-8") as fh:
         payload = json.load(fh)
-    blocks, singletons, pairs = bc.parse_payload(payload)
-    units: list[bc.DecisionUnit] = []
+    blocks, singletons, pairs = du.parse_payload(payload)
+    units: list[du.DecisionUnit] = []
     for unit_list in blocks.values():
         units.extend(unit_list)
     units.extend(singletons)
@@ -707,7 +702,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Coord-descent polish")
     parser.add_argument("--model", required=True)
     parser.add_argument("--payload", required=True,
-                        help="Block-CLADO payload JSON; provides DecisionUnits")
+                        help="Decision-unit payload JSON")
     parser.add_argument("--starting-assignment", required=True,
                         help="Per-Linear assignment JSON (kneedle output)")
     parser.add_argument("--output", required=True)

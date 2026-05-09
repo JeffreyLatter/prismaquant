@@ -27,21 +27,19 @@ from prismaquant.allocator_candidates import (
 from prismaquant.build_rtn_cache import (
     iter_quantizable_tensors,
 )
-from prismaquant.iterate_perturbed_allocation import (
-    _assignment_digest,
-    measure_assignment_kl,
-)
 from prismaquant.layer_state_cache import LayerHiddenStateCache
 from prismaquant.memory_management import phase_boundary_memory_cleanup
-from prismaquant.measure_adjoint_l3 import load_wikitext_calibration_windowed
+from prismaquant.calibration_data import load_wikitext_calibration_windowed
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 from prismaquant.perturbed_x_cache import (
     calibration_data_hash,
     stage_text_only_under_work_root,
 )
-from prismaquant.propagated_cost import (
+from prismaquant.kl_measurement import (
+    _assignment_digest,
     KLScope,
     layer_depth,
+    measure_assignment_kl,
     measure_lane_batched_kl_deltas,
     measure_override_set_kl,
 )

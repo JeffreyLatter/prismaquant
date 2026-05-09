@@ -5030,12 +5030,10 @@ def main():
     ap.add_argument("--production-cache-prefetch-workers", type=int, default=4,
                     help="Thread count for production-cache prefetch.")
     ap.add_argument("--perturbed-x-dir", default=None,
-                    help="Directory produced by iterate_perturbed_allocation.py. "
-                         "When supplied, defaults --layer-config to "
-                         "final_layer_config.json and --activation-cache-dir "
-                         "to the final perturbed activation cache so GPTQ, "
-                         "scale-sweep, and block-output-match use the "
-                         "converged activation distribution.")
+                    help="Directory containing final_layer_config.json and "
+                         "activation cache files from a prior production "
+                         "calibration/polish run. When supplied, defaults "
+                         "--layer-config and --activation-cache-dir from it.")
     # Activation-aware passes.
     #
     # AWQ defaults to OFF — per-channel input scaling fights NVFP4's

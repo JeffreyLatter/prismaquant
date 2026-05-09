@@ -42,14 +42,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import cache_reference_log_probs
-from prismaquant.iterate_perturbed_allocation import (
-    coordinate_descent_polish,
+from prismaquant.kl_measurement import (
+    L3NeighborhoodEntry,
     measure_assignment_kl,
+    measure_propagated_costs,
 )
 from prismaquant.measure_quant_cost import ActivationIndex, run_cost_pass
 from prismaquant.memory_management import report_graph_memory
 from prismaquant.perturbed_x_cache import capture_perturbed_activation_cache
-from prismaquant.propagated_cost import L3NeighborhoodEntry, measure_propagated_costs
 
 
 MODEL_CANDIDATES = (
@@ -299,26 +299,9 @@ def main() -> int:
                 output_mse_names=[],
             ),
         )
-        _phase(
-            records,
-            "coord-descent-replay-graph",
-            lambda: coordinate_descent_polish(
-                model,
-                assignment,
-                l3_costs or l2_costs,
-                specs,
-                16.0,
-                calib_ids,
-                ref_log_probs,
-                stats=stats,
-                work_root=work_root,
-                current_kl=float(current_kl),
-                max_passes=1,
-                early_stop_streak=2,
-                max_lanes_per_batch=2,
-                emit=print,
-            ),
-        )
+        # The old L3 coordinate-descent graph smoke belonged to the archived
+        # cross-layer stack. The live graph smoke keeps assignment KL and
+        # lane-batched propagated KL coverage.
 
         print(f"model={model_id} target={target_name}")
         print("phase,before_gb,peak_gb,after_gb,delta_peak_gb,elapsed_s")

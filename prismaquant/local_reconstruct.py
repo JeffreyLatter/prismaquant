@@ -22,8 +22,8 @@ import torch
 from . import format_registry as fr
 from .allocator import aggregate_moe_candidates, build_candidates, promote_fused, solve_allocation
 from .calibrate_allocator import load_inputs
-from .interaction_refine import build_refinement_units, select_critical_units
 from .measure_quant_cost import ActivationIndex, _load_live_model
+from .refinement_units import build_refinement_units, select_critical_units
 
 
 def _sym_clip(x: torch.Tensor, factor, group_size: int | None = None) -> torch.Tensor:

@@ -33,7 +33,7 @@ from prismaquant.build_rtn_cache import (
     iter_quantizable_tensors,
     stage_multimodal,
 )
-from prismaquant.measure_adjoint_l3 import (
+from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )

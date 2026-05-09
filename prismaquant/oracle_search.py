@@ -32,7 +32,11 @@ from prismaquant.calibrate_allocator import (
     measure_avg_last_token_kl,
     restore_in_place,
 )
-from prismaquant.interaction_refine import RefinementUnit, UnitOption, expand_unit_assignment
+from prismaquant.refinement_units import (
+    RefinementUnit,
+    UnitOption,
+    expand_unit_assignment,
+)
 
 
 def _load_units(payload: dict):

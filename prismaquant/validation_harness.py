@@ -36,7 +36,7 @@ _VALIDATION_CUDA_GRAPH_REGISTRY = None
 def _validation_cuda_graph_registry():
     global _VALIDATION_CUDA_GRAPH_REGISTRY
     if _VALIDATION_CUDA_GRAPH_REGISTRY is None:
-        from .propagated_cost import CUDAGraphRegistry
+        from .kl_measurement import CUDAGraphRegistry
 
         _VALIDATION_CUDA_GRAPH_REGISTRY = CUDAGraphRegistry(
             label="validation",
@@ -47,7 +47,7 @@ def _validation_cuda_graph_registry():
 
 
 def _validation_cuda_graph_enabled() -> bool:
-    from .propagated_cost import _env_flag_enabled
+    from .kl_measurement import _env_flag_enabled
 
     return _env_flag_enabled("PRISMAQUANT_VALIDATION_CUDA_GRAPHS", default=True)
 
@@ -585,7 +585,7 @@ def _end_kl(
         return 0.0
 
     import torch
-    from .iterate_perturbed_allocation import measure_assignment_kl
+    from .kl_measurement import measure_assignment_kl
 
     calib_ids = _fixed_calib_ids(
         tokenizer,
