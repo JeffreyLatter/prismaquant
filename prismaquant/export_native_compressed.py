@@ -2970,6 +2970,9 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
         rope_init_fn = rotary.compute_default_rope_parameters
     except AttributeError:
         return
+    if hasattr(rotary, "reset_rope_cache"):
+        rotary.reset_rope_cache(device)
+        return
     inv_freq, attention_scaling = rope_init_fn(cfg, device)
     rotary.register_buffer("inv_freq", inv_freq.to(dtype=torch.float32,
                                                    device=device),

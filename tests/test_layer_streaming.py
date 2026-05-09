@@ -1,11 +1,51 @@
 import unittest
 
 import torch
+import torch.nn as nn
 
 from prismaquant.layer_streaming import LayerCache
+from prismaquant.streaming_model import _init_rotary_inplace
+
+
+class _ResettableRotary(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = object()
+        with torch.device("meta"):
+            self.register_buffer("inv_freq", torch.empty(4), persistent=False)
+            self.register_buffer("cos_cached", torch.empty(8, 8), persistent=False)
+            self.register_buffer("sin_cached", torch.empty(8, 8), persistent=False)
+
+    def compute_default_rope_parameters(self, config, device):
+        del config
+        return torch.arange(4, device=device, dtype=torch.float32), 1.0
+
+    def reset_rope_cache(self, device=None):
+        inv, self.attention_scaling = self.compute_default_rope_parameters(
+            self.config,
+            device,
+        )
+        self.register_buffer("inv_freq", inv, persistent=False)
+        self.register_buffer("cos_cached", torch.ones(8, 8, device=device), persistent=False)
+        self.register_buffer("sin_cached", torch.zeros(8, 8, device=device), persistent=False)
+
+
+class _RotaryBase(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rotary_emb = _ResettableRotary()
 
 
 class TestLayerCache(unittest.TestCase):
+    def test_rotary_reset_cache_materializes_all_buffers(self):
+        base = _RotaryBase()
+
+        _init_rotary_inplace(base, torch.device("cpu"), torch.float32)
+
+        self.assertFalse(base.rotary_emb.inv_freq.is_meta)
+        self.assertFalse(base.rotary_emb.cos_cached.is_meta)
+        self.assertFalse(base.rotary_emb.sin_cached.is_meta)
+
     def test_eviction_and_residency_summary(self):
         cache = LayerCache(max_bytes=64)
         t0 = {"a": torch.zeros(8, dtype=torch.float32)}

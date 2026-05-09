@@ -163,6 +163,10 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
         # Defensive: fall through to default if profile dispatch breaks.
         pass
 
+    if hasattr(rotary, "reset_rope_cache"):
+        rotary.reset_rope_cache(device)
+        return
+
     # Single-rope path (the common case for Qwen / MiniMax / DSv3).
     inv_freq, attention_scaling = rope_init_fn(cfg, device)
     rotary.register_buffer("inv_freq", inv_freq.to(

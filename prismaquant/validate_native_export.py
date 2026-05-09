@@ -85,6 +85,7 @@ def main():
     summarize_quantization_config(model_dir / "config.json")
 
     print(f"[validate] starting vLLM ...", flush=True)
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from vllm import LLM, SamplingParams
     spec = None
     if args.speculative_config:
