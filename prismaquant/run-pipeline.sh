@@ -85,10 +85,11 @@ set -euo pipefail
 : "${MM_DATASET:=synthetic}"
 : "${MTP_FORMAT:=BF16}"
 # Production-cache export path. Enabled by default so export packs the same
-# rendered weights that KL/polish paths measure. Re-cache is still opt-in until
-# the Qwen3.5-0.8B / 4B smoke ladder clears.
+# rendered weights that KL/polish paths measure. Re-cache is enabled by default
+# after the Qwen3.5-0.8B and Qwen3-4B smoke ladder cleared vLLM eager/graph
+# serving; set PRODUCTION_RECACHE=0 for an explicit no-recache ablation.
 : "${PRODUCTION_CACHE:=1}"
-: "${PRODUCTION_RECACHE:=0}"
+: "${PRODUCTION_RECACHE:=1}"
 : "${PRODUCTION_CACHE_MAX_ACT_ROWS:=512}"
 : "${PRODUCTION_CACHE_LRU_GB:=24.0}"
 : "${PRODUCTION_CACHE_PREFETCH_WORKERS:=4}"
