@@ -123,6 +123,17 @@ def _output_fisher_weight_session_snapshot_dir(cache_dir: Path) -> str | None:
     return None
 
 
+def _resolve_weight_session_snapshot_dir(
+    cache_dir: Path,
+    override: str | Path | None,
+) -> str | None:
+    if override is not None and str(override):
+        path = Path(override)
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    return _output_fisher_weight_session_snapshot_dir(cache_dir)
+
+
 _OF_CHECKPOINT_SCHEMA = "prismaquant.output_fisher.checkpoint.v1"
 
 
@@ -585,6 +596,7 @@ def collect_output_fisher(
     reduction_device: str | torch.device | None = "auto",
     pin_to_bf16: Sequence[str] = ("lm_head",),
     logit_scope: str = "full_sequence",
+    weight_session_snapshot_dir: str | Path | None = None,
 ) -> dict:
     """Build the Output-Fisher Block-CLADO payload.
 
@@ -644,6 +656,10 @@ def collect_output_fisher(
     weight_session = None
     restore_assignment: dict[str, str] | None = None
     try:
+        resolved_snapshot_dir = _resolve_weight_session_snapshot_dir(
+            cache_dir,
+            weight_session_snapshot_dir,
+        )
         # ---------------------------------------------------------------
         # Phase 1: teacher logits + teacher probs (always needed for the
         # linear correction term in sandwich mode).
@@ -710,9 +726,15 @@ def collect_output_fisher(
                 weight_session = WeightSession(
                     model,
                     production_weight_cache=production_weight_cache,
-                    snapshot_dir=_output_fisher_weight_session_snapshot_dir(cache_dir),
+                    snapshot_dir=resolved_snapshot_dir,
                 )
                 weight_session.initialize(sandwich_base, all_units)
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "weight_session_initialized",
+                        "phase": "centered_forward",
+                        "diagnostics": weight_session.diagnostics(),
+                    })
                 z_centered = _forward_logits(
                     model,
                     calib_ids,
@@ -767,9 +789,15 @@ def collect_output_fisher(
             weight_session = WeightSession(
                 model,
                 production_weight_cache=production_weight_cache,
-                snapshot_dir=_output_fisher_weight_session_snapshot_dir(cache_dir),
+                snapshot_dir=resolved_snapshot_dir,
             )
             weight_session.initialize(base_assignment, all_units)
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "weight_session_initialized",
+                    "phase": "perturbation_base",
+                    "diagnostics": weight_session.diagnostics(),
+                })
         dirty_weight_members: set[str] = set()
 
         # ---------------------------------------------------------------
@@ -1103,6 +1131,7 @@ def collect_output_fisher(
             "n_perturbation_forwards": int(n_pert_done) + (2 if is_sandwich else 1),
             "skip_pairs": bool(skip_pairs),
             "delta_z_dtype": str(delta_z_dtype),
+            "weight_session_snapshot_dir": str(resolved_snapshot_dir or ""),
             "checkpoint": {
                 "enabled": bool(_output_fisher_checkpoint_enabled()),
                 "path": str(checkpoint_path),
@@ -1154,6 +1183,17 @@ def _progress_printer(event: dict) -> None:
         print(
             f"[output-fisher] centered forward done "
             f"center_kl={float(event['center_kl']):.6g}",
+            flush=True,
+        )
+    elif kind == "weight_session_initialized":
+        diag = event.get("diagnostics") or {}
+        print(
+            f"[output-fisher] weight session initialized "
+            f"phase={event.get('phase', '')} "
+            f"applied={int(diag.get('n_applied', 0))} "
+            f"snapshots={int(diag.get('n_bf16_snapshots', 0))} "
+            f"cache_hits={int(diag.get('n_cache_hits', 0))} "
+            f"rtn_fallbacks={int(diag.get('n_rtn_fallbacks', 0))}",
             flush=True,
         )
     elif kind == "perturbation_done":
@@ -1255,6 +1295,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "activation-quant is enabled)."
         ),
     )
+    parser.add_argument(
+        "--weight-session-snapshot-dir",
+        default=(
+            os.environ.get("PRISMAQUANT_OF_WEIGHT_SESSION_SNAPSHOT_DIR")
+            or os.environ.get("PRISMAQUANT_WEIGHT_SESSION_SNAPSHOT_DIR")
+        ),
+        help=(
+            "Optional shared directory for BF16 WeightSession snapshots used "
+            "by centered Output-Fisher measurements."
+        ),
+    )
     args = parser.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -1321,6 +1372,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             calib_microbatch=int(args.calib_microbatch),
             reduction_device=args.reduction_device,
             logit_scope=args.logit_scope,
+            weight_session_snapshot_dir=args.weight_session_snapshot_dir,
             progress_callback=_progress_printer,
         )
         out_path = Path(args.output)

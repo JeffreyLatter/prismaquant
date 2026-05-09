@@ -463,6 +463,7 @@ def run_iteration(
             calib_microbatch=calib_microbatch,
             reduction_device=output_fisher_reduction_device,
             logit_scope=output_fisher_logit_scope,
+            weight_session_snapshot_dir=weight_session_snapshot_dir,
             progress_callback=_of_progress,
         )
         payload_path = iter_dir / "block_clado.json"
