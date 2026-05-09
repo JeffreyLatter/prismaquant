@@ -18,7 +18,9 @@ from prismaquant import coord_descent_polish as cdp
 from prismaquant.build_rtn_cache import cache_reference_log_probs, stage_multimodal
 from prismaquant.iterate_block_clado import (
     _temporary_env,
+    _prefetch_assignment_delta,
     assignment_for_units,
+    bf16_assignment_for_units,
     load_assignment_json,
 )
 from prismaquant.iterate_perturbed_allocation import measure_assignment_kl
@@ -185,9 +187,15 @@ def _measure_points(
                 production_weight_cache=production_weight_cache,
                 snapshot_dir=weight_session_snapshot_dir,
             )
+            n_prefetch, n_loaded = _prefetch_assignment_delta(
+                production_weight_cache,
+                bf16_assignment_for_units(units),
+                points[0]["assignment"],
+            )
             weight_session.initialize(points[0]["assignment"], units)
             print(
                 "[validate-flips] weight session initialized "
+                f"prefetch={n_prefetch}/{n_loaded} "
                 f"{weight_session.diagnostics()}",
                 flush=True,
             )
@@ -196,9 +204,22 @@ def _measure_points(
             for idx, point in enumerate(points):
                 assignment = dict(point["assignment"])
                 if weight_session is not None:
-                    changed = (
-                        0 if idx == 0 else weight_session.apply_assignment(assignment)
-                    )
+                    if idx == 0:
+                        changed = 0
+                    else:
+                        current_assignment = weight_session.current_assignment()
+                        n_prefetch, n_loaded = _prefetch_assignment_delta(
+                            production_weight_cache,
+                            current_assignment,
+                            assignment,
+                        )
+                        changed = weight_session.apply_assignment(assignment)
+                        print(
+                            "[validate-flips] applied assignment delta "
+                            f"{point['label']} changed={changed} "
+                            f"prefetch={n_prefetch}/{n_loaded}",
+                            flush=True,
+                        )
                 else:
                     changed = None
                 existing = completed.get(str(point["label"]))

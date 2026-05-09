@@ -389,7 +389,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         def progress(event):
             kind = event.get("event")
-            if kind in {"accept_move", "starting", "budget_set"}:
+            if kind in {
+                "accept_move",
+                "budget_set",
+                "starting",
+                "weight_session_initialized",
+            }:
                 print(f"[polish] {json.dumps(event, default=str)}", flush=True)
 
         t0 = time.monotonic()

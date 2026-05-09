@@ -324,7 +324,11 @@ def _prefetch_assignment_delta(
             keys.append(chosen)
     if not keys:
         return 0, 0
-    return len(keys), int(production_weight_cache.prefetch(keys))
+    # With an LRU-bounded disk cache, prefetching a whole assignment in the
+    # same order WeightSession will consume it leaves the tail resident and
+    # forces synchronous loads for the head.  Load in reverse so the first
+    # materialization window is hot; small one-unit deltas are unaffected.
+    return len(keys), int(production_weight_cache.prefetch(list(reversed(keys))))
 
 
 def _label_validation_row(row: Mapping, index: int) -> str:
