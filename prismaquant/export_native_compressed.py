@@ -63,7 +63,7 @@ import time
 from collections import Counter, defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -351,6 +351,191 @@ def _activation_index_fingerprint(index, cache_dir: Path) -> dict[str, object]:
         "hash": digest,
     }
 
+
+def _production_cache_format_candidates(fmt: str) -> tuple[str, ...]:
+    fmt_u = str(fmt).upper()
+    if fmt_u == "MXFP8":
+        return ("MXFP8", "MXFP8_E4M3")
+    if fmt_u == "MXFP8_E4M3":
+        return ("MXFP8_E4M3", "MXFP8")
+    return (fmt_u,)
+
+
+def _production_cache_name_candidates(name: str) -> tuple[str, ...]:
+    names = [name]
+    if name.endswith(".weight"):
+        names.append(name[:-len(".weight")])
+    if name.startswith("model.language_model."):
+        names.append("model." + name[len("model.language_model."):])
+    return tuple(dict.fromkeys(names))
+
+
+def _production_cache_lookup_key(name: str, fmt: str):
+    cache = _PRODUCTION_WEIGHT_CACHE
+    if cache is None:
+        return None
+    weights = getattr(cache, "weights", {}) or {}
+    for cand_name in _production_cache_name_candidates(name):
+        for cand_fmt in _production_cache_format_candidates(fmt):
+            key = (cand_name, cand_fmt)
+            if key in weights:
+                return key
+    return None
+
+
+def _production_cache_expected_keys(
+    assignment: dict[str, str],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    keys: list[tuple[str, str]] = []
+    missing: list[tuple[str, str]] = []
+    for qname, fmt in assignment.items():
+        fmt = _canonical_export_format(fmt)
+        if fmt == "BF16":
+            continue
+        key = _production_cache_lookup_key(qname, fmt)
+        if key is None:
+            missing.append((qname, fmt))
+        else:
+            keys.append(key)
+    return keys, missing
+
+
+def _production_cache_fingerprint(
+    cache,
+    expected_keys: Sequence[tuple[str, str]],
+) -> dict[str, object]:
+    """Cheap identity for direct production-cache export.
+
+    The direct path packs already-rendered GPTQ/scale-sweep weights. Bind the
+    export layer cache to the backing shard names, mtimes, lever metadata, and
+    activation-scale summary so a stale export cache cannot be reused across
+    production-cache changes.
+    """
+    import hashlib
+    import json as _json
+
+    weights = getattr(cache, "weights", {}) or {}
+    cache_dir = getattr(cache, "cache_dir", None)
+    rows = []
+    for key in sorted(set(expected_keys)):
+        value = weights.get(key)
+        if isinstance(value, torch.Tensor):
+            rows.append([key[0], key[1], "tensor",
+                         list(value.shape), str(value.dtype)])
+            continue
+        if value is None:
+            rows.append([key[0], key[1], "missing"])
+            continue
+        path = Path(str(value))
+        if cache_dir and not path.is_absolute():
+            path = Path(cache_dir) / path
+        try:
+            st = path.stat()
+            rows.append([key[0], key[1], path.name, st.st_size, st.st_mtime_ns])
+        except OSError:
+            rows.append([key[0], key[1], path.name, "missing"])
+    act = getattr(cache, "activation_max_abs", None) or {}
+    act_digest = hashlib.sha256(
+        _json.dumps(act, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    digest = hashlib.sha256(
+        _json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    return {
+        "path": str(Path(cache_dir).resolve()) if cache_dir else None,
+        "n_entries": len(rows),
+        "hash": digest,
+        "activation_max_abs_hash": act_digest,
+        "levers": dict(getattr(cache, "levers", {}) or {}),
+    }
+
+
+def _production_cache_scales(cache) -> dict[str, float]:
+    activation_max_abs = getattr(cache, "activation_max_abs", None) or {}
+    scales = {
+        name: (6.0 / float(max_abs))
+        for name, max_abs in activation_max_abs.items()
+        if max_abs and float(max_abs) > 0.0
+    }
+    return _unify_input_global_scales_across_fused_siblings(scales)
+
+
+def _production_cache_prefetch_assignment(
+    assignment: dict[str, str],
+    *,
+    prefix: str | None = None,
+) -> int:
+    cache = _PRODUCTION_WEIGHT_CACHE
+    if cache is None or not hasattr(cache, "prefetch"):
+        return 0
+    keys: list[tuple[str, str]] = []
+    for qname, fmt in assignment.items():
+        if prefix is not None and not (qname == prefix or qname.startswith(prefix + ".")):
+            continue
+        if _canonical_export_format(fmt) == "BF16":
+            continue
+        key = _production_cache_lookup_key(qname, fmt)
+        if key is not None:
+            keys.append(key)
+    if not keys:
+        return 0
+    return int(cache.prefetch(keys, max_workers=_PRODUCTION_CACHE_PREFETCH_WORKERS))
+
+
+def _pack_production_cached_2d(
+    linear_name: str,
+    fmt: str,
+    *,
+    nvfp4_global_real_override: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor] | None:
+    """Pack a pre-rendered production weight for export.
+
+    ProductionWeightCache stores dequantized weights after the production
+    numerical passes. For export we only need to re-pack those weights into the
+    native compressed-tensors layout; running GPTQ/scale-sweep again would
+    measure a different artifact.
+    """
+    cache = _PRODUCTION_WEIGHT_CACHE
+    if cache is None:
+        return None
+    fmt = _canonical_export_format(fmt)
+    key = _production_cache_lookup_key(linear_name, fmt)
+    if key is None:
+        return None
+    w = cache.get(key[0], key[1])
+    if w is None:
+        return None
+    target_device = device or torch.device("cpu")
+    if fmt == "NVFP4":
+        w_work = w.to(device=target_device, dtype=torch.float32)
+        wp, ws, wg = quantize_dequantize_nvfp4(
+            w_work,
+            group_size=16,
+            global_real_override=nvfp4_global_real_override,
+        )
+        input_scale = (
+            _INPUT_GLOBAL_SCALES.get(linear_name) if _INPUT_GLOBAL_SCALES
+            else None
+        )
+        if input_scale is None:
+            input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+        return {
+            "weight_packed": wp,
+            "weight_scale": ws,
+            "weight_global_scale": wg.reshape(1) if wg.dim() == 0 else wg,
+            "input_global_scale": torch.tensor(
+                [float(input_scale)], dtype=torch.float32, device=target_device,
+            ),
+        }
+    if fmt == "MXFP8":
+        w_work = w.to(device=target_device, dtype=torch.float32)
+        q, qs = quantize_dequantize_mxfp8(w_work, group_size=32)
+        return {"weight": q, "weight_scale": qs}
+    if fmt == "BF16":
+        return {"weight": w.to(device=target_device, dtype=torch.bfloat16)}
+    return None
+
 # Module-level flag bundle that controls which activation-aware
 # passes run when `_quantize_2d` is invoked from main()'s streaming
 # loop. Kept as module-level state (mirroring _INPUT_GLOBAL_SCALES)
@@ -362,6 +547,9 @@ _ACT_AWARE_FLAGS: dict[str, bool] = {
     "awq_round": False,
     "scale_sweep": False,
 }
+_PRODUCTION_WEIGHT_CACHE = None
+_PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
+_PRODUCTION_CACHE_PREFETCH_WORKERS = 4
 
 # Proper-AWQ fold scales: maps target Linear recipe name -> float32 1D
 # tensor `s[in_features]` that was folded into the predecessor RMSNorm
@@ -2958,11 +3146,18 @@ def materialize_tensors_streaming(
                 f"head weights, add the passthrough path here.")
         if fmt is not None and fmt != "BF16":
             joint = None
-            compressed = _quantize_2d(
-                param.detach().float(), fmt,
+            compressed = _pack_production_cached_2d(
+                recipe_key,
+                fmt,
                 nvfp4_global_real_override=joint,
-                linear_name=recipe_key,
+                device=device,
             )
+            if compressed is None:
+                compressed = _quantize_2d(
+                    param.detach().float(), fmt,
+                    nvfp4_global_real_override=joint,
+                    linear_name=recipe_key,
+                )
             for suffix, t in compressed.items():
                 base_name = (full_qname[:-len(".weight")]
                              if full_qname.endswith(".weight")
@@ -3043,6 +3238,7 @@ def materialize_tensors_streaming(
                 "PRISMAQUANT_BATCHED_NVFP4_EXPORT", "1"),
             "ACT_AWARE_FLAGS": dict(sorted(_ACT_AWARE_FLAGS.items())),
             "activation_cache_fingerprint": _ACTIVATION_CACHE_FINGERPRINT,
+            "production_cache_fingerprint": _PRODUCTION_CACHE_FINGERPRINT,
         }
         # Hash the assignment dict (layer_config recipe) too — recipe
         # changes invalidate per-Linear quantization output.
@@ -3102,6 +3298,18 @@ def materialize_tensors_streaming(
         layer_qname = f"{layers_prefix}{L}".rstrip(".")
         if layer_qname.endswith("."):
             layer_qname = layer_qname[:-1]
+        if _PRODUCTION_WEIGHT_CACHE is not None:
+            layer_recipe_prefix = profile.live_to_recipe_name(layer_qname)
+            prefetched = _production_cache_prefetch_assignment(
+                assignment,
+                prefix=layer_recipe_prefix,
+            )
+            if prefetched and (L % 4 == 0 or L == num_layers - 1):
+                print(
+                    f"[export-stream] layer {L:02d} production-cache "
+                    f"prefetch={prefetched}",
+                    flush=True,
+                )
 
         # v25: cache hit — skip quantization, replay cached tensor dict.
         cf = _layer_cache_file(L)
@@ -3355,6 +3563,23 @@ def materialize_tensors_streaming(
                 covered.add(full)
                 continue
 
+            override = joint_globals.get(recipe_key) if fmt == "NVFP4" else None
+            cached_compressed = _pack_production_cached_2d(
+                recipe_key,
+                fmt,
+                nvfp4_global_real_override=override,
+                device=device,
+            )
+            if cached_compressed is not None:
+                for suffix, t in cached_compressed.items():
+                    out[f"{emit_full}.{suffix}"] = t.cpu()
+                if mod.bias is not None:
+                    out[f"{emit_full}.bias"], _ = _passthrough_tensor(
+                        f"{full}.bias", mod.bias, source_dtype_by_name)
+                hist[("linear", f"{fmt}_PRODUCTION_CACHE")] += 1
+                covered.add(full)
+                continue
+
             if fmt == "MXFP8" and mod.weight.dim() == 2:
                 shape = (int(mod.weight.shape[0]), int(mod.weight.shape[1]))
                 grouped_linears[(fmt, shape)].append((full, emit_full, recipe_key, mod))
@@ -3369,8 +3594,6 @@ def materialize_tensors_streaming(
                 grouped_nvfp4_batched[shape].append(
                     (full, emit_full, recipe_key, mod))
                 continue
-
-            override = joint_globals.get(recipe_key) if fmt == "NVFP4" else None
 
             # #12 Block-output match: when enabled AND this is a
             # standard "block" Linear (q/k/v/o or gate/up/down) on
@@ -4677,9 +4900,13 @@ def _validate_halo_export_support(profile, cfg, hidden: int) -> None:
 
 def main():
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
+    global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
+    global _PRODUCTION_CACHE_PREFETCH_WORKERS
     _INPUT_GLOBAL_SCALES = None
     _CACHED_ACTIVATIONS = None
     _ACTIVATION_CACHE_FINGERPRINT = None
+    _PRODUCTION_WEIGHT_CACHE = None
+    _PRODUCTION_CACHE_FINGERPRINT = None
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
@@ -4737,6 +4964,23 @@ def main():
                          "computed from cached activations "
                          "(max_abs/6.0) instead of the 1.0 default. "
                          "Typically ~1-3%% PPL improvement on NVFP4.")
+    ap.add_argument("--production-weight-cache", default=None,
+                    help="Pickled ProductionWeightCache containing "
+                         "already-rendered production weights. When "
+                         "supplied, export packs those weights directly "
+                         "instead of recomputing GPTQ/scale-sweep from "
+                         "raw activations. This is the faithful path for "
+                         "candidates measured with production_weight_cache.")
+    ap.add_argument("--production-cache-dir-override", default=None,
+                    help="Override the backing shard directory stored "
+                         "inside --production-weight-cache, for caches "
+                         "moved between containers or host paths.")
+    ap.add_argument("--production-cache-lru-gb", type=float, default=24.0,
+                    help="Resident tensor budget for disk-backed production "
+                         "cache loads. Layer export always prefetches the "
+                         "current layer into this LRU.")
+    ap.add_argument("--production-cache-prefetch-workers", type=int, default=4,
+                    help="Thread count for production-cache prefetch.")
     ap.add_argument("--perturbed-x-dir", default=None,
                     help="Directory produced by iterate_perturbed_allocation.py. "
                          "When supplied, defaults --layer-config to "
@@ -4853,6 +5097,53 @@ def main():
     if args.layer_config is None:
         ap.error("--layer-config is required unless --perturbed-x-dir is supplied")
 
+    with open(args.layer_config) as _lc_for_cache:
+        _layer_config_payload_for_cache = json.load(_lc_for_cache)
+    validate_layer_config_payload(_layer_config_payload_for_cache, args.layer_config)
+    _assignment_for_cache = _canonicalize_assignment(_layer_config_payload_for_cache)
+
+    if args.production_weight_cache:
+        import pickle
+
+        with open(args.production_weight_cache, "rb") as fh:
+            production_cache = pickle.load(fh)
+        if args.production_cache_dir_override:
+            production_cache.relocate(args.production_cache_dir_override)
+        if args.production_cache_lru_gb and args.production_cache_lru_gb > 0:
+            production_cache.enable_lru(
+                int(float(args.production_cache_lru_gb) * 1024**3)
+            )
+        _PRODUCTION_WEIGHT_CACHE = production_cache
+        _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
+            1, int(args.production_cache_prefetch_workers)
+        )
+        expected_keys, missing_keys = _production_cache_expected_keys(
+            _assignment_for_cache
+        )
+        if missing_keys:
+            raise RuntimeError(
+                "[export-stream] production-weight-cache missing recipe "
+                f"entries: {len(missing_keys)} sample={missing_keys[:8]}"
+            )
+        files = production_cache.verify_files(expected_keys)
+        if files["missing"]:
+            raise RuntimeError(
+                "[export-stream] production-weight-cache backing files "
+                f"missing: {len(files['missing'])} sample={files['missing'][:8]}"
+            )
+        _PRODUCTION_CACHE_FINGERPRINT = _production_cache_fingerprint(
+            production_cache,
+            expected_keys,
+        )
+        _INPUT_GLOBAL_SCALES = _production_cache_scales(production_cache)
+        print(
+            "[export-stream] production-weight-cache direct path: "
+            f"{len(expected_keys)} entries, "
+            f"lru={args.production_cache_lru_gb:.1f} GiB, "
+            f"prefetch_workers={_PRODUCTION_CACHE_PREFETCH_WORKERS}",
+            flush=True,
+        )
+
     # Resolve flag defaults.
     cache_supplied = bool(args.activation_cache_dir)
     # AWQ: OFF unless explicitly requested. Incompatible with NVFP4
@@ -4891,7 +5182,12 @@ def main():
     # `_quantize_2d` for NVFP4 linears) from cached activations.
     # Same cache is reused to populate _CACHED_ACTIVATIONS when any
     # act-aware pass is enabled.
-    if args.activation_cache_dir:
+    if args.activation_cache_dir and _PRODUCTION_WEIGHT_CACHE is not None:
+        print("[export-stream] production-weight-cache supplied; using its "
+              "activation scales and pre-rendered weights for assigned "
+              "Linears. Raw activation cache will not drive body export.",
+              flush=True)
+    elif args.activation_cache_dir:
         from .measure_quant_cost import ActivationIndex
         cache_dir = Path(args.activation_cache_dir)
         if not cache_dir.exists():

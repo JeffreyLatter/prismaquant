@@ -639,6 +639,60 @@ class TestQuantize2DDispatch(unittest.TestCase):
         self.assertEqual(tuple(ws.shape), (2, 6, 1))
 
 
+class TestProductionCacheExportPath(unittest.TestCase):
+    def test_packs_cached_nvfp4_weight_with_cached_input_scale(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        W = torch.randn(8, 16) * 0.1
+        cache = ProductionWeightCache(
+            weights={("model.layers.0.mlp.down_proj", "NVFP4"): W},
+            levers={"gptq": True, "scale_sweep": True},
+            activation_max_abs={"model.layers.0.mlp.down_proj": 3.0},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_scales = m._INPUT_GLOBAL_SCALES
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._INPUT_GLOBAL_SCALES = m._production_cache_scales(cache)
+            out = m._pack_production_cached_2d(
+                "model.layers.0.mlp.down_proj",
+                "NVFP4",
+                device=torch.device("cpu"),
+            )
+            self.assertIsNotNone(out)
+            self.assertIn("weight_packed", out)
+            self.assertIn("input_global_scale", out)
+            self.assertAlmostEqual(
+                float(out["input_global_scale"].item()), 2.0, places=5)
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._INPUT_GLOBAL_SCALES = saved_scales
+
+    def test_mxfp8_alias_hits_e4m3_cache_key(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        W = torch.randn(8, 32) * 0.1
+        cache = ProductionWeightCache(
+            weights={("model.layers.0.self_attn.q_proj", "MXFP8_E4M3"): W},
+            levers={},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            out = m._pack_production_cached_2d(
+                "model.layers.0.self_attn.q_proj",
+                "MXFP8",
+                device=torch.device("cpu"),
+            )
+            self.assertIsNotNone(out)
+            self.assertEqual(out["weight"].dtype, torch.float8_e4m3fn)
+            self.assertEqual(out["weight_scale"].dtype, torch.uint8)
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+
+
 class TestFusedSiblingJointGlobalScale(unittest.TestCase):
     """vLLM warns when q/k/v/gate/up have different weight_global_scale.
     The exporter pre-computes a joint per-tensor scale across each
