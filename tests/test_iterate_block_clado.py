@@ -84,7 +84,10 @@ def test_assignment_for_units_normalizes_missing_and_illegal_formats():
     }
 
 
-def test_run_iteration_keeps_center_when_validated_candidates_regress(tmp_path, monkeypatch):
+def test_run_iteration_keeps_center_as_quality_anchor_but_polishes_kneedle(
+    tmp_path,
+    monkeypatch,
+):
     unit = bc.DecisionUnit(
         name="a",
         block_id="model.layers.0",
@@ -122,7 +125,9 @@ def test_run_iteration_keeps_center_when_validated_candidates_regress(tmp_path, 
     )
 
     assert result.best_validated_kl == pytest.approx(0.05)
-    assert result.polished_kl == pytest.approx(0.05)
+    assert result.polish_start_label == "kneedle"
+    assert result.polish_start_kl == pytest.approx(0.2)
+    assert result.polished_kl == pytest.approx(0.2)
     assert result.best_validated_assignment == {"a.weight": "NVFP4"}
 
     validation = json.loads((tmp_path / "out" / "iter_0" / "validation.json").read_text())

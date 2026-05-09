@@ -74,10 +74,15 @@ class IterationResult:
     kneedle_label: str
     kneedle_bpp: float
     kneedle_surrogate_cost: float
+    polish_start_label: str
+    polish_start_kl: float
+    polish_start_bpp: float
+    polish_start_assignment: dict[str, str]
     best_validated_kl: float
     best_validated_bpp: float
     best_validated_assignment: dict[str, str]
     polished_kl: float
+    polished_bpp: float
     polished_assignment: dict[str, str]
     polish_steps: int
     elapsed_seconds: float
@@ -322,6 +327,59 @@ def _prefetch_assignment_delta(
     return len(keys), int(production_weight_cache.prefetch(keys))
 
 
+def _label_validation_row(row: Mapping, index: int) -> str:
+    if row.get("is_kneedle"):
+        return "kneedle"
+    if row.get("is_center_baseline"):
+        return "center_baseline"
+    bpp = row.get("bpp")
+    if bpp is not None:
+        try:
+            return f"validated_bpp_{float(bpp):.4f}"
+        except Exception:
+            pass
+    return f"validated_row_{index}"
+
+
+def select_polish_start(
+    validation: Sequence[Mapping],
+    *,
+    mode: str,
+    kneedle_bpp: float,
+) -> tuple[dict, str]:
+    """Select the validation row that should seed polish.
+
+    The lowest-KL validation row is often the current high-bit center.  It is
+    useful as a quality anchor, but polishing it changes the objective from
+    "improve the selected budget" into "spend more bits until KL is lowest".
+    Default to the geometric kneedle so the polish stage preserves the
+    allocator's budget decision.
+    """
+    if not validation:
+        raise ValueError("cannot select polish start from an empty validation set")
+    normalized = [dict(row) for row in validation]
+    requested = str(mode).strip().lower()
+    if requested in {"lowest_kl", "best_validated", "best_kl"}:
+        idx, row = min(
+            enumerate(normalized),
+            key=lambda pair: float(pair[1].get("real_kl", float("inf"))),
+        )
+        return row, _label_validation_row(row, idx)
+    if requested != "kneedle":
+        raise ValueError(
+            "polish_start mode must be 'kneedle' or 'lowest_kl', "
+            f"got {mode!r}"
+        )
+    for idx, row in enumerate(normalized):
+        if row.get("is_kneedle"):
+            return row, _label_validation_row(row, idx)
+    idx, row = min(
+        enumerate(normalized),
+        key=lambda pair: abs(float(pair[1].get("bpp", 0.0)) - float(kneedle_bpp)),
+    )
+    return row, f"kneedle_nearest_{_label_validation_row(row, idx)}"
+
+
 def run_iteration(
     *,
     model,
@@ -349,6 +407,7 @@ def run_iteration(
     include_activation_quant: bool = True,
     validation_delta_quantize: bool = True,
     weight_session_snapshot_dir: str | Path | None = None,
+    polish_start: str = "kneedle",
     log_callback=None,
 ) -> IterationResult:
     """One iteration: measure → sweep → kneedle → validate → polish."""
@@ -668,8 +727,21 @@ def run_iteration(
     best_validated = min(validation, key=lambda v: v["real_kl"])
     log(event="best_validated", iter=iter_idx,
         bpp=best_validated["bpp"], real_kl=best_validated["real_kl"])
+    polish_row, polish_start_label = select_polish_start(
+        validation,
+        mode=polish_start,
+        kneedle_bpp=float(feasible_rows[knee_idx]["bpp"]),
+    )
+    log(
+        event="polish_start_selected",
+        iter=iter_idx,
+        mode=str(polish_start),
+        label=polish_start_label,
+        bpp=polish_row["bpp"],
+        real_kl=polish_row["real_kl"],
+    )
 
-    # ---- polish the best validated assignment.  Allow modest budget
+    # ---- polish the selected budget assignment.  Allow modest budget
     # creep (default 5%) so polish can take Pareto-beneficial precision
     # upgrades on a small number of high-impact layers, but not all the
     # way to BF16-everywhere.
@@ -677,12 +749,12 @@ def run_iteration(
     if skip_polish:
         log(event="polish_skipped", iter=iter_idx)
         polish_result = cdp.PolishResult(
-            initial_kl=float(best_validated["real_kl"]),
-            final_kl=float(best_validated["real_kl"]),
-            final_assignment=dict(best_validated["assignment"]),
+            initial_kl=float(polish_row["real_kl"]),
+            final_kl=float(polish_row["real_kl"]),
+            final_assignment=dict(polish_row["assignment"]),
         )
     else:
-        starting_bits = cdp._assignment_bits(units, best_validated["assignment"])
+        starting_bits = cdp._assignment_bits(units, polish_row["assignment"])
         polish_budget = starting_bits * (1.0 + polish_budget_creep)
         def _polish_progress(event):
             kind = event.get("event")
@@ -694,7 +766,7 @@ def run_iteration(
         polish_result = cdp.coord_descent_polish(
             model, calib_ids, ref_log_probs,
             units=units,
-            starting_assignment=best_validated["assignment"],
+            starting_assignment=polish_row["assignment"],
             profile=profile,
             work_root=work_root,
             noise_floor=polish_noise_floor,
@@ -716,12 +788,17 @@ def run_iteration(
         final_kl=polish_result.final_kl,
         n_steps=len(polish_result.steps),
         n_meas=polish_result.n_kl_measurements)
+    polished_bits = cdp._assignment_bits(units, polish_result.final_assignment)
+    polished_bpp = polished_bits / float(total_params) if total_params else 0.0
 
     polish_path = iter_dir / "polish.json"
     polish_path.write_text(json.dumps({
         "schema": "prismaquant.coord_descent_polish.v1",
+        "starting_label": polish_start_label,
+        "starting_bpp": float(polish_row["bpp"]),
         "initial_kl": polish_result.initial_kl,
         "final_kl": polish_result.final_kl,
+        "final_bpp": float(polished_bpp),
         "improvement": polish_result.initial_kl - polish_result.final_kl,
         "n_steps_accepted": len(polish_result.steps),
         "n_kl_measurements": polish_result.n_kl_measurements,
@@ -748,10 +825,15 @@ def run_iteration(
         kneedle_label=f"frontier_bpp_{feasible_rows[knee_idx]['bpp']:.4f}",
         kneedle_bpp=float(feasible_rows[knee_idx]["bpp"]),
         kneedle_surrogate_cost=float(feasible_rows[knee_idx]["cost_total"]),
+        polish_start_label=polish_start_label,
+        polish_start_kl=float(polish_row["real_kl"]),
+        polish_start_bpp=float(polish_row["bpp"]),
+        polish_start_assignment=dict(polish_row["assignment"]),
         best_validated_kl=float(best_validated["real_kl"]),
         best_validated_bpp=float(best_validated["bpp"]),
         best_validated_assignment=dict(best_validated["assignment"]),
         polished_kl=float(polish_result.final_kl),
+        polished_bpp=float(polished_bpp),
         polished_assignment=dict(polish_result.final_assignment),
         polish_steps=len(polish_result.steps),
         elapsed_seconds=float(time.time() - start),
@@ -800,6 +882,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Order polish candidates by surrogate ΔΩ; accept the first "
             "real-KL improvement.  Faster than greedy-best when the "
             "surrogate ranks moves accurately around the current point."
+        ),
+    )
+    parser.add_argument(
+        "--polish-start",
+        choices=["kneedle", "lowest_kl"],
+        default="kneedle",
+        help=(
+            "Validation row to seed polish. Default 'kneedle' preserves the "
+            "Pareto budget selected by the allocator. 'lowest_kl' is a "
+            "diagnostic quality-anchor mode that may select a much higher-bit "
+            "center row."
         ),
     )
     parser.add_argument(
@@ -1049,6 +1142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 include_activation_quant=not bool(args.no_activation_quant),
                 validation_delta_quantize=bool(args.validation_delta_quantize),
                 weight_session_snapshot_dir=args.weight_session_snapshot_dir,
+                polish_start=str(args.polish_start),
                 log_callback=log,
             )
             summary_rows.append(result)
@@ -1057,7 +1151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log(event="best_overall_updated",
                     iter=iter_idx,
                     polished_kl=result.polished_kl,
-                    bpp=result.best_validated_bpp)
+                    bpp=result.polished_bpp)
             log(event="iter_summary",
                 iter=iter_idx,
                 kneedle_bpp=result.kneedle_bpp,
@@ -1082,9 +1176,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "centered_at": r.centered_at,
                     "kneedle_bpp": r.kneedle_bpp,
                     "kneedle_surrogate_cost": r.kneedle_surrogate_cost,
+                    "polish_start_label": r.polish_start_label,
+                    "polish_start_kl": r.polish_start_kl,
+                    "polish_start_bpp": r.polish_start_bpp,
                     "best_validated_kl": r.best_validated_kl,
                     "best_validated_bpp": r.best_validated_bpp,
                     "polished_kl": r.polished_kl,
+                    "polished_bpp": r.polished_bpp,
                     "polish_steps": r.polish_steps,
                     "elapsed_seconds": r.elapsed_seconds,
                 }
@@ -1094,6 +1192,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "iteration": best_overall.iteration,
                     "polished_kl": best_overall.polished_kl,
+                    "polished_bpp": best_overall.polished_bpp,
+                    "polish_start_bpp": best_overall.polish_start_bpp,
                     "best_validated_bpp": best_overall.best_validated_bpp,
                     "polish_steps": best_overall.polish_steps,
                 }
@@ -1106,6 +1206,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "schema": "prismaquant.block_clado.best.v1",
                 "iteration": best_overall.iteration,
                 "polished_kl": best_overall.polished_kl,
+                "polished_bpp": best_overall.polished_bpp,
+                "polish_start_bpp": best_overall.polish_start_bpp,
                 "best_validated_bpp": best_overall.best_validated_bpp,
                 "assignment": best_overall.polished_assignment,
             }, indent=2) + "\n")
