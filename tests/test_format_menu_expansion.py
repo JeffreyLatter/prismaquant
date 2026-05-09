@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from prismaquant import format_registry as fr
-from prismaquant.allocator import filter_candidates_for_profile
+from prismaquant.allocator import (
+    apply_mtp_format_override,
+    filter_candidates_for_profile,
+)
 from prismaquant.allocator_candidates import check_format_applicability
 from prismaquant.allocator_solver import Candidate
 from prismaquant.export_native_compressed import (
@@ -126,3 +129,17 @@ def test_export_rejects_e5m2_until_vllm_weight_dispatch_is_validated():
         canonicalize_format("FP8_E5M2")
     with pytest.raises(ValueError, match="E5M2"):
         canonicalize_format(fr.get_format("MXFP8_E5M2").autoround_config())
+
+
+def test_mtp_format_override_keeps_body_assignment_intact():
+    assignment = {
+        "model.layers.0.mlp.down_proj": "NVFP4",
+        "mtp.fc": "NVFP4",
+        "mtp.layers.0.mlp.down_proj": "NVFP4",
+    }
+
+    out = apply_mtp_format_override(assignment, "BF16")
+
+    assert out["model.layers.0.mlp.down_proj"] == "NVFP4"
+    assert out["mtp.fc"] == "BF16"
+    assert out["mtp.layers.0.mlp.down_proj"] == "BF16"

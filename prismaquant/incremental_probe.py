@@ -390,9 +390,14 @@ def build_extended_shard_regexes(
         n_mtp_actual = _count_mtp_layers_from_safetensors(model_path)
         # Empirical safetensors count is ground truth: a config may
         # declare MTP layers (inherited from a base) when the finetune
-        # actually stripped the weights. Take the min so we never
-        # schedule MTP shards the runner can't fulfill.
-        n_mtp = min(n_mtp_config, n_mtp_actual) if n_mtp_actual > 0 else 0
+        # actually stripped the weights. Conversely, local Qwen3.5/3.6
+        # exports can carry `mtp.*` weights even when the text config omits
+        # the count. Use actual safetensors as the fallback, and cap declared
+        # counts to actual when both are present.
+        if n_mtp_actual > 0:
+            n_mtp = min(n_mtp_config, n_mtp_actual) if n_mtp_config > 0 else n_mtp_actual
+        else:
+            n_mtp = 0
         if n_mtp_config > 0 and n_mtp_actual == 0:
             print(f"[shard-schedule] config declares "
                   f"{n_mtp_config} MTP layer(s) but safetensors index "

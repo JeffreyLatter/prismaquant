@@ -83,6 +83,7 @@ set -euo pipefail
 # `HuggingFaceM4/COCO`) for real image calibration when
 # CALIBRATION_MODALITY=multimodal.
 : "${MM_DATASET:=synthetic}"
+: "${MTP_FORMAT:=BF16}"
 # Production-cache export path. Enabled by default so export packs the same
 # rendered weights that KL/polish paths measure. Re-cache is still opt-in until
 # the Qwen3.5-0.8B / 4B smoke ladder clears.
@@ -107,6 +108,7 @@ echo "  NSAMPLES=$NSAMPLES SEQLEN=$SEQLEN LAYERS_PER_SHARD=$LAYERS_PER_SHARD"
 echo "  PREFETCH_LOOKAHEAD=$PREFETCH_LOOKAHEAD PREFETCH_WORKERS=$PREFETCH_WORKERS"
 echo "  ACTIVATION_ROWS_LIMIT=$ACTIVATION_ROWS_LIMIT"
 echo "  VISUAL_FORMAT=$VISUAL_FORMAT"
+echo "  MTP_FORMAT=$MTP_FORMAT"
 echo "  CALIBRATION_MODALITY=$CALIBRATION_MODALITY  MM_DATASET=$MM_DATASET"
 echo "  PRODUCTION_CACHE=$PRODUCTION_CACHE PRODUCTION_RECACHE=$PRODUCTION_RECACHE"
 echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
@@ -193,6 +195,7 @@ if [[ ! -f "${COST_PATH}" ]]; then
     --mode batched --chunk-size 256 \
     --layers-per-shard "$LAYERS_PER_SHARD" \
     --skip-missing-activations \
+    --no-include-lm-head \
     --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-2048}" \
     2>&1 | tee "${WORK_DIR}/logs/cost.log"
 else
@@ -222,6 +225,7 @@ python3 -m prismaquant.allocator \
   --pareto-targets "$PARETO_TARGETS" \
   --visual-format "$VISUAL_FORMAT" \
   --visual-sensitivity "$VISUAL_SENSITIVITY" \
+  --mtp-format "$MTP_FORMAT" \
   --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
   --pareto-csv "${WORK_DIR}/artifacts/pareto.csv" \
   2>&1 | tee "${WORK_DIR}/logs/allocator.log"

@@ -41,6 +41,21 @@ from typing import Any
 import torch
 from safetensors import safe_open
 
+try:
+    from accelerate import init_empty_weights
+except ModuleNotFoundError:
+    @contextmanager
+    def init_empty_weights():
+        with torch.device("meta"):
+            yield
+
+try:
+    from accelerate.hooks import remove_hook_from_module
+except ModuleNotFoundError:
+    def remove_hook_from_module(module, recurse: bool = False):
+        del recurse
+        return module
+
 from .layer_streaming import (
     _build_fp8_scale_inv_map,
     LayerCache,
@@ -54,6 +69,7 @@ from .layer_streaming import (
     _read_layer_to_device,
     _resolve_base_prefix,
     _unload,
+    set_module_tensor_to_device,
 )
 
 
@@ -608,8 +624,6 @@ def _build_streaming_context(model_path: str, *,
         (pixel_values → visual_tower → merged inputs_embeds → streamed
         body → lm_head → CE)."""
     import psutil
-    from accelerate import init_empty_weights
-    from accelerate.hooks import remove_hook_from_module
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from .sensitivity_probe import stage_multimodal, stage_text_only
@@ -711,7 +725,6 @@ def _build_streaming_context(model_path: str, *,
                 fp8_scale_inv_map=fp8_scale_inv_map)
             print(f"{log_prefix} materializing visual tower: "
                   f"{len(tensors)}/{len(vis_keys)} tensors -> {device}", flush=True)
-            from accelerate.utils.modeling import set_module_tensor_to_device
             for model_name, t in tensors.items():
                 set_module_tensor_to_device(model, model_name, device, value=t)
             if visual_requires_grad:

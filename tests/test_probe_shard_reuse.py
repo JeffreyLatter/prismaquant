@@ -125,6 +125,30 @@ def test_extended_shards_skip_declared_mtp_when_index_has_no_mtp(tmp_path, capsy
     assert "skipping MTP shards" in capsys.readouterr().out
 
 
+def test_extended_shards_include_mtp_when_index_has_mtp_but_config_omits_count(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({
+        "num_hidden_layers": 2,
+    }))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "model.layers.0.self_attn.q_proj.weight": "model-00001.safetensors",
+            "model.layers.1.self_attn.q_proj.weight": "model-00001.safetensors",
+            "mtp.fc.weight": "model-00001.safetensors",
+            "mtp.layers.0.self_attn.q_proj.weight": "model-00001.safetensors",
+        }
+    }))
+
+    regexes = build_extended_shard_regexes(
+        str(tmp_path),
+        1,
+        include_body=False,
+        include_visual=False,
+        include_lm_head=False,
+    )
+
+    assert regexes == [r"(?:mtp\.fc|mtp\.layers\.0\.)"]
+
+
 # ---------------------------------------------------------------------------
 # scan_cached_linear_stats
 # ---------------------------------------------------------------------------

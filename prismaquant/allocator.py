@@ -244,6 +244,24 @@ def apply_visual_format_override(
     return out
 
 
+def apply_mtp_format_override(
+    assignment: dict[str, str],
+    mtp_format: str,
+) -> dict[str, str]:
+    """Force MTP Linears to a recipe-level format.
+
+    The production vLLM path currently validates main-target logits and keeps
+    MTP in BF16 until speculative-decode acceptance is measured.  This override
+    is applied after DP/fused-sibling promotion so a sensitive MTP projection
+    cannot be accidentally quantized by the allocator.
+    """
+    out = dict(assignment)
+    for name in list(out.keys()):
+        if name.startswith("mtp."):
+            out[name] = mtp_format
+    return out
+
+
 def discover_visual_linears_from_source(model_path: str) -> list[str]:
     """Scan the source safetensors index for `model.visual.blocks.*.weight`
     entries with rank-2 shapes — these are the Linear modules the visual
@@ -490,6 +508,12 @@ def main():
                          "back to uniform --visual-format. 'uniform' forces "
                          "the Phase 1 path: every visual Linear gets "
                          "--visual-format regardless of what's in the probe.")
+    ap.add_argument("--mtp-format",
+                    choices=["BF16", "NVFP4", "MXFP8"],
+                    default="BF16",
+                    help="Uniform format for MTP Linears. BF16 is the "
+                         "production default until MTP speculative-decode "
+                         "acceptance is validated for quantized MTP weights.")
     args = ap.parse_args()
     if args.enable_expert_prune:
         raise SystemExit(f"[alloc] {EXPERT_PRUNE_DISABLED_MESSAGE}")
@@ -1185,6 +1209,18 @@ def main():
             print(f"[alloc] --visual-format={visual_format}: no visual "
                   f"Linears found in source checkpoint — override is a "
                   f"no-op", flush=True)
+
+    mtp_count = sum(1 for n in assignment_expanded if n.startswith("mtp."))
+    if mtp_count:
+        assignment_expanded = apply_mtp_format_override(
+            assignment_expanded,
+            args.mtp_format,
+        )
+        print(
+            f"[alloc] --mtp-format={args.mtp_format}: assigned "
+            f"{mtp_count} MTP Linears uniformly",
+            flush=True,
+        )
 
     # Passthrough-integrity belt-and-suspenders. The filter in
     # build_candidates drops mismatched FP8_SOURCE / BF16 per-Linear
