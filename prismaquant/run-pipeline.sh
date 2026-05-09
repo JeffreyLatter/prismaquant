@@ -64,7 +64,7 @@ set -euo pipefail
 : "${PREFETCH_WORKERS:=auto}"
 : "${PREFETCH_MIN_AVAILABLE_GB:=auto}"
 : "${ACTIVATION_ROWS_LIMIT:=256}"
-: "${DATASET:=ultrachat_200k}"
+: "${DATASET:=/home/rob/dq-runs/calibration/diverse-v1.jsonl}"
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
