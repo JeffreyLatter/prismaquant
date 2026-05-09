@@ -58,6 +58,11 @@ def summarize_quantization_config(cfg_path: Path) -> None:
     print(f"[validate]   ignore: {len(qc.get('ignore', []))} entries")
 
 
+def _speculative_config_uses_embedded_mtp(spec: dict) -> bool:
+    method = str(spec.get("method") or "").lower()
+    return method == "mtp" or method.endswith("_mtp")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True,
@@ -93,9 +98,11 @@ def main():
     spec = None
     if args.speculative_config:
         spec = json.loads(args.speculative_config)
-        # If caller omitted "model", default to the same checkpoint — MTP
-        # weights travel with the target model.
-        if "model" not in spec:
+        # If caller omitted "model", default to the same checkpoint for
+        # draft-model style configs. MTP-family methods are the exception:
+        # their extra heads travel with the target checkpoint, and vLLM expects
+        # model to be absent/null so it can take the embedded-MTP path.
+        if "model" not in spec and not _speculative_config_uses_embedded_mtp(spec):
             spec["model"] = str(model_dir)
         print(f"[validate] speculative config: {spec}", flush=True)
     llm = LLM(
