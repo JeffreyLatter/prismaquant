@@ -9,6 +9,7 @@ from prismaquant.production_weight_cache import ProductionWeightCache
 from prismaquant.production_weight_cache import fill_production_weight_cache
 from prismaquant.production_recache import (
     _load_assignment,
+    activation_max_abs_delta_summary,
     assignment_digest,
     recache_production_weight_cache,
 )
@@ -108,6 +109,26 @@ def test_production_recache_measures_quantized_upstream_activation_range():
     assert cache.metadata["activation_recache"]["assignment_sha256"] == assignment_digest(
         {"l2": "BF16", "l1": "NVFP4"}
     )
+    delta = cache.metadata["activation_recache"]["activation_max_abs_delta"]
+    assert delta["n_common"] == 2
+    assert delta["changed_gt_5pct"] == 1
+    assert delta["ratio_p50"] == pytest.approx(2.0)
+
+
+def test_activation_max_abs_delta_summary_reports_ratio_quantiles():
+    summary = activation_max_abs_delta_summary(
+        {"a": 1.0, "b": 2.0, "c": 4.0, "missing": 3.0},
+        {"a": 1.0, "b": 3.0, "c": 2.0},
+    )
+
+    assert summary["n_common"] == 3
+    assert summary["n_before"] == 4
+    assert summary["n_after"] == 3
+    assert summary["ratio_min"] == pytest.approx(0.5)
+    assert summary["ratio_p50"] == pytest.approx(1.0)
+    assert summary["ratio_max"] == pytest.approx(1.5)
+    assert summary["changed_gt_1pct"] == 2
+    assert summary["changed_gt_5pct"] == 2
 
 
 def test_fill_production_cache_recache_requires_concrete_assignment():

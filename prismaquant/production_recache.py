@@ -130,6 +130,7 @@ def apply_activation_max_abs_to_cache(
     metadata: Mapping[str, object] | None = None,
 ) -> None:
     """Update a ProductionWeightCache with re-fitted activation ranges."""
+    previous = dict(getattr(production_weight_cache, "activation_max_abs", {}) or {})
     values = {str(k): float(v) for k, v in activation_max_abs.items() if v > 0}
     production_weight_cache.activation_max_abs = values or None
     production_weight_cache.activation_scales = production_weight_cache.activation_max_abs
@@ -137,8 +138,55 @@ def apply_activation_max_abs_to_cache(
     recache_meta = dict(metadata or {})
     recache_meta.setdefault("status", "applied")
     recache_meta.setdefault("n_activation_max_abs", len(values))
+    delta = activation_max_abs_delta_summary(previous, values)
+    if delta:
+        recache_meta.setdefault("activation_max_abs_delta", delta)
     meta["activation_recache"] = recache_meta
     production_weight_cache.metadata = meta
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * pct
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
+def activation_max_abs_delta_summary(
+    before: Mapping[str, float] | None,
+    after: Mapping[str, float] | None,
+) -> dict[str, float | int]:
+    """Summarize how much re-cache moved activation ranges."""
+    before = before or {}
+    after = after or {}
+    ratios: list[float] = []
+    for qname, old in before.items():
+        new = after.get(qname)
+        if old and old > 0 and new and new > 0:
+            ratios.append(float(new) / float(old))
+    if not ratios:
+        return {}
+
+    changed_1pct = sum(abs(r - 1.0) > 0.01 for r in ratios)
+    changed_5pct = sum(abs(r - 1.0) > 0.05 for r in ratios)
+    return {
+        "n_common": len(ratios),
+        "n_before": len(before),
+        "n_after": len(after),
+        "ratio_min": min(ratios),
+        "ratio_p05": _percentile(ratios, 0.05),
+        "ratio_p50": _percentile(ratios, 0.50),
+        "ratio_p95": _percentile(ratios, 0.95),
+        "ratio_max": max(ratios),
+        "changed_gt_1pct": changed_1pct,
+        "changed_gt_5pct": changed_5pct,
+    }
 
 
 def assignment_digest(assignment: Mapping[str, str]) -> str:
@@ -189,6 +237,21 @@ def recache_production_weight_cache(
     if write_sidecar and cache_dir:
         sidecar = Path(cache_dir) / "activation_max_abs.json"
         sidecar.write_text(json.dumps(max_abs, indent=2))
+        delta = (
+            getattr(production_weight_cache, "metadata", {}) or {}
+        ).get("activation_recache", {}).get("activation_max_abs_delta")
+        if delta:
+            delta_sidecar = Path(cache_dir) / "activation_max_abs_delta.json"
+            delta_sidecar.write_text(json.dumps(delta, indent=2))
+            if progress:
+                print(
+                    "[prod-recache] activation max_abs after/before "
+                    f"ratio p50={delta['ratio_p50']:.4g} "
+                    f"p95={delta['ratio_p95']:.4g} "
+                    f"max={delta['ratio_max']:.4g}; "
+                    f"moved>5%={delta['changed_gt_5pct']}/{delta['n_common']}",
+                    flush=True,
+                )
     return max_abs
 
 
