@@ -78,6 +78,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--calib-seed", type=int, default=42)
     p.add_argument("--dtype", default="bf16")
     p.add_argument(
+        "--attn-implementation",
+        default=None,
+        help=(
+            "Optional Transformers attention backend for model load. "
+            "Examples: sdpa, flash_attention_2, kernels-community/flash-attn2."
+        ),
+    )
+    p.add_argument(
         "--kl-scope",
         choices=["last_token", "full_sequence"],
         default="last_token",
@@ -149,6 +157,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Required for very-large models (e.g. 70B+ on a 121 GB UMA host) "
         "where the cumulative BF16-source footprint of every quantizable "
         "Linear would exceed the budget.",
+    )
+    p.add_argument(
+        "--weight-session-snapshot-dir",
+        default=os.environ.get("PRISMAQUANT_WEIGHT_SESSION_SNAPSHOT_DIR"),
+        help=(
+            "Optional shared directory for WeightSession BF16 snapshots. "
+            "Use this with --weight-session-spill-to-disk to reuse snapshots "
+            "across polish/validation runs."
+        ),
     )
     p.add_argument(
         "--lru-gb",
@@ -334,6 +351,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "torch_dtype": dtype, "trust_remote_code": True,
             "local_files_only": local_only,
         }
+        if args.attn_implementation:
+            load_kwargs["attn_implementation"] = args.attn_implementation
         if device.type == "cuda":
             load_kwargs["device_map"] = "cuda"
         model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
@@ -396,6 +415,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             weight_session_spill_to_disk=bool(
                 args.weight_session_spill_to_disk
             ),
+            weight_session_snapshot_dir=args.weight_session_snapshot_dir,
             progress_callback=progress,
         )
         elapsed = time.monotonic() - t0
@@ -476,6 +496,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "delta_quantize": args.delta_quantize,
                     "weight_session_spill_to_disk": bool(
                         args.weight_session_spill_to_disk
+                    ),
+                    "weight_session_snapshot_dir": str(
+                        args.weight_session_snapshot_dir or ""
                     ),
                     "lru_gb": float(args.lru_gb),
                     "prefetch_cache": bool(args.prefetch_cache),
