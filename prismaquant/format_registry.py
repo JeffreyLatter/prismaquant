@@ -464,12 +464,12 @@ def _int_autoround(bits, gsize, act_bits=16):
 
 def _plain_fp8_autoround(elt="fp8_e4m3", act_bits=8):
     # Plain per-channel FP8 (no microscaling).  AutoRound's "fp8_e4m3" /
-    # "fp8_e5m2" dtypes use group_size=-1 i.e. per-tensor scale on weights,
-    # and per-token dynamic scale on activations (matches vLLM's native
-    # FP8 serving path and compressed-tensors FP8 scheme).
+    # "fp8_e5m2" dtypes are represented in PrismaQuant layer_config as
+    # group_size=0 (non-grouped) with per-token dynamic activation scaling.
+    # The exporter maps this to compressed-tensors' native FP8 scheme.
     return dict(
-        bits=8, group_size=-1, sym=True, data_type=elt,
-        act_bits=act_bits, act_group_size=-1, act_sym=True,
+        bits=8, group_size=0, sym=True, data_type=elt,
+        act_bits=act_bits, act_group_size=0, act_sym=True,
         act_data_type=elt if act_bits == 8 else "float",
         act_dynamic=True,
     )
