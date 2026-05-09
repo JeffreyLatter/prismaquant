@@ -555,6 +555,7 @@ def fill_production_weight_cache(
     cache_dir: str | Path | None = None,
     recache_pass: bool = False,
     recache_assignment: Mapping[str, str] | None = None,
+    recache_profile=None,
     recache_include_activation_quant: bool = True,
     recache_microbatch_size: int = 1,
 ) -> ProductionWeightCache:
@@ -950,6 +951,7 @@ def fill_production_weight_cache(
             calib_ids,
             recache_assignment or {},
             cache,
+            profile=recache_profile,
             include_activation_quant=recache_include_activation_quant,
             microbatch_size=recache_microbatch_size,
             progress=progress,

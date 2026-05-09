@@ -13,6 +13,7 @@ import pickle
 import tempfile
 import time
 import argparse
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -140,6 +141,16 @@ def apply_activation_max_abs_to_cache(
     production_weight_cache.metadata = meta
 
 
+def assignment_digest(assignment: Mapping[str, str]) -> str:
+    """Stable digest for the concrete assignment used during re-cache."""
+    payload = json.dumps(
+        {str(k): str(v) for k, v in sorted(assignment.items())},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 @torch.no_grad()
 def recache_production_weight_cache(
     model: nn.Module,
@@ -170,6 +181,8 @@ def recache_production_weight_cache(
         metadata={
             "include_activation_quant": bool(include_activation_quant),
             "microbatch_size": int(microbatch_size),
+            "assignment_sha256": assignment_digest(assignment),
+            "assignment_entries": int(len(assignment)),
         },
     )
     cache_dir = getattr(production_weight_cache, "cache_dir", None)
@@ -179,14 +192,77 @@ def recache_production_weight_cache(
     return max_abs
 
 
+def _strip_weight(name: str) -> str:
+    return name[:-7] if name.endswith(".weight") else name
+
+
+def _canonicalize_layer_format(entry: dict | str | int) -> str:
+    if isinstance(entry, dict):
+        dt = entry.get("data_type")
+        bits = int(entry.get("bits", 0))
+        if dt == "nv_fp" and bits == 4:
+            return "NVFP4"
+        if dt == "mx_fp" and bits == 4:
+            return "MXFP4"
+        if dt == "mx_fp" and bits == 8:
+            elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
+            if elt == "fp8_e5m2":
+                raise ValueError("MXFP8_E5M2 is not exportable on the vLLM path")
+            return "MXFP8"
+        if dt in ("float", "bfloat16") and bits in (16, 0):
+            return "BF16"
+        if dt == "fp8_e4m3" and bits == 8:
+            group_size = int(entry.get("group_size", 0))
+            if group_size == 128:
+                return "FP8_SOURCE"
+            if group_size == 32:
+                return "MXFP8"
+            if group_size in (0, -1):
+                return "FP8_E4M3"
+            return "MXFP8"
+        if dt == "fp8_e5m2" and bits == 8:
+            raise ValueError("FP8_E5M2 is not exportable on the vLLM path")
+        if dt == "mx_fp" and bits == 6:
+            elt = str(entry.get("weight_element_dtype", "fp6_e3m2")).lower()
+            return "MXFP6_E2M3" if elt == "fp6_e2m3" else "MXFP6_E3M2"
+        if dt == "fp6_e3m2" and bits == 6:
+            return "MXFP6_E3M2"
+        if dt == "fp6_e2m3" and bits == 6:
+            return "MXFP6_E2M3"
+        raise ValueError(f"unsupported layer-config entry: {entry!r}")
+    if isinstance(entry, str):
+        value = entry.lower()
+        if value in ("nvfp4", "fp4", "4"):
+            return "NVFP4"
+        if value in ("mxfp4", "mx_fp4"):
+            return "MXFP4"
+        if value in ("mxfp8", "mxfp8_e4m3", "8"):
+            return "MXFP8"
+        if value in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
+            return "FP8_E4M3"
+        if value in ("mxfp8_e5m2", "fp8_e5m2"):
+            raise ValueError("E5M2 FP8 formats are not exportable on the vLLM path")
+        if value in ("bf16", "bfloat16", "16"):
+            return "BF16"
+    if isinstance(entry, int):
+        if entry <= 4:
+            return "NVFP4"
+        if entry <= 8:
+            return "MXFP8"
+        return "BF16"
+    raise ValueError(f"unrecognized layer-config entry: {entry!r}")
+
+
 def _load_assignment(layer_config: str | Path) -> dict[str, str]:
-    from prismaquant.export_native_compressed import _canonicalize_assignment
     from prismaquant.schemas import validate_layer_config_payload
 
     path = Path(layer_config)
     payload = json.loads(path.read_text())
     validate_layer_config_payload(payload, str(path))
-    return _canonicalize_assignment(payload)
+    return {
+        _strip_weight(str(name)): _canonicalize_layer_format(entry)
+        for name, entry in payload.items()
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -222,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     from transformers import AutoTokenizer
 
     from prismaquant.calibration_data import _dtype_from_name
+    from prismaquant.model_profiles import DefaultProfile, detect_profile
     from prismaquant.perturbed_x_cache import load_text_model_under_work_root
     from prismaquant.sensitivity_probe import load_calibration
 
@@ -257,11 +334,16 @@ def main(argv: list[str] | None = None) -> int:
         args.calib_seqlen,
     )
     assignment = _load_assignment(args.layer_config)
+    try:
+        profile = detect_profile(args.model)
+    except Exception:
+        profile = DefaultProfile()
     max_abs = recache_production_weight_cache(
         model,
         calib_ids,
         assignment,
         cache,
+        profile=profile,
         include_activation_quant=not args.no_activation_quant,
         microbatch_size=args.microbatch_size,
         progress=True,

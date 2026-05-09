@@ -37,9 +37,12 @@ from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
+from prismaquant.model_profiles import DefaultProfile, detect_profile
+from prismaquant.production_recache import _load_assignment
 from prismaquant.production_weight_cache import (
     fill_production_weight_cache,
 )
+from prismaquant.sensitivity_probe import load_calibration
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -56,6 +59,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--calib-seqlen", type=int, default=256)
     p.add_argument("--calib-split", default="train")
     p.add_argument("--calib-seed", type=int, default=42)
+    p.add_argument(
+        "--dataset",
+        default=None,
+        help="Optional calibration source accepted by sensitivity_probe "
+        "(HF dataset id, .jsonl, or .txt). When omitted, preserves the "
+        "historical wikitext-2 windowed loader.",
+    )
     p.add_argument("--dtype", default="bf16")
     p.add_argument(
         "--max-act-rows",
@@ -103,6 +113,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         "is unused.  Excluding lm_head also avoids the OOM-prone last "
         "render on big models with linear-attention forward fallbacks.",
     )
+    p.add_argument(
+        "--recache-layer-config",
+        default=None,
+        help="Optional concrete layer_config.json assignment. When set, "
+        "after rendering the cache, replay calibration with those production "
+        "weights installed and re-fit activation_max_abs for export.",
+    )
+    p.add_argument(
+        "--recache-microbatch-size",
+        type=int,
+        default=1,
+        help="Calibration microbatch size for the production activation "
+        "re-cache replay.",
+    )
+    p.add_argument(
+        "--no-recache-activation-quant",
+        action="store_true",
+        help="During re-cache, install production weights but leave activation "
+        "quantization disabled in replay hooks.",
+    )
     args = p.parse_args(argv)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -124,13 +154,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokenizer = AutoTokenizer.from_pretrained(
             staged, trust_remote_code=True, local_files_only=local_only,
         )
-        calib_ids = load_wikitext_calibration_windowed(
-            tokenizer,
-            args.n_calib_samples,
-            args.calib_seqlen,
-            split=args.calib_split,
-            seed=args.calib_seed,
-        )
+        if args.dataset:
+            calib_ids = load_calibration(
+                tokenizer,
+                args.dataset,
+                args.n_calib_samples,
+                args.calib_seqlen,
+            )
+        else:
+            calib_ids = load_wikitext_calibration_windowed(
+                tokenizer,
+                args.n_calib_samples,
+                args.calib_seqlen,
+                split=args.calib_split,
+                seed=args.calib_seed,
+            )
         load_kwargs = {
             "torch_dtype": dtype,
             "trust_remote_code": True,
@@ -138,10 +176,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         if device.type == "cuda":
             load_kwargs["device_map"] = "cuda"
-        model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+        except ValueError as exc:
+            if "requires `accelerate`" not in str(exc) and "requires accelerate" not in str(exc):
+                raise
+            load_kwargs.pop("device_map", None)
+            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+            model.to(device)
         if device.type != "cuda":
             model.to(device)
         model.eval()
+        try:
+            profile = detect_profile(args.model)
+        except Exception:
+            profile = DefaultProfile()
 
         skip_tokens = list(args.skip_qnames or [])
         qnames: list[str] = []
@@ -169,6 +218,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
 
+        recache_assignment = (
+            _load_assignment(args.recache_layer_config)
+            if args.recache_layer_config else None
+        )
         t0 = time.monotonic()
         cache = fill_production_weight_cache(
             model, calib_ids, qnames,
@@ -176,6 +229,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             levers=levers,
             max_act_rows=args.max_act_rows,
             cache_dir=args.cache_dir,
+            recache_pass=recache_assignment is not None,
+            recache_assignment=recache_assignment,
+            recache_profile=profile,
+            recache_include_activation_quant=not args.no_recache_activation_quant,
+            recache_microbatch_size=args.recache_microbatch_size,
         )
         elapsed = time.monotonic() - t0
 

@@ -23,7 +23,54 @@ from collections import defaultdict
 
 import torch
 import torch.nn as nn
-from accelerate.utils.modeling import set_module_tensor_to_device
+try:
+    from accelerate.utils.modeling import set_module_tensor_to_device
+except ModuleNotFoundError:
+    def set_module_tensor_to_device(
+        module: nn.Module,
+        tensor_name: str,
+        device,
+        *,
+        value: torch.Tensor | None = None,
+    ) -> None:
+        if "." in tensor_name:
+            parent_name, attr = tensor_name.rsplit(".", 1)
+            parent = module.get_submodule(parent_name)
+        else:
+            parent, attr = module, tensor_name
+        target_device = torch.device(device)
+        if attr in parent._parameters:
+            old = parent._parameters[attr]
+            if value is None:
+                if old is None:
+                    raise ValueError(f"missing parameter value for {tensor_name}")
+                target = torch.empty(
+                    tuple(old.shape),
+                    dtype=old.dtype,
+                    device=target_device,
+                )
+            else:
+                target = value if value.device == target_device else value.to(target_device)
+            parent._parameters[attr] = nn.Parameter(
+                target,
+                requires_grad=bool(getattr(old, "requires_grad", False)),
+            )
+            return
+        if attr in parent._buffers:
+            old = parent._buffers[attr]
+            if value is None:
+                if old is None:
+                    raise ValueError(f"missing buffer value for {tensor_name}")
+                target = torch.empty(
+                    tuple(old.shape),
+                    dtype=old.dtype,
+                    device=target_device,
+                )
+            else:
+                target = value if value.device == target_device else value.to(target_device)
+            parent._buffers[attr] = target
+            return
+        raise AttributeError(f"{tensor_name!r} is not a parameter or buffer")
 from safetensors import safe_open
 
 

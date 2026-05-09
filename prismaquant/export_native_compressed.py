@@ -60,6 +60,7 @@ import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
 from collections import Counter, defaultdict
 from copy import deepcopy
 from pathlib import Path
@@ -67,7 +68,13 @@ from typing import Callable, Iterable, Sequence
 
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights
+try:
+    from accelerate import init_empty_weights
+except ModuleNotFoundError:
+    @contextmanager
+    def init_empty_weights():
+        with torch.device("meta"):
+            yield
 from safetensors.torch import save_file
 
 from .allocator_candidates import check_format_applicability

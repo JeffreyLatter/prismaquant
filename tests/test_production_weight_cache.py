@@ -7,7 +7,11 @@ import pytest
 from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
 from prismaquant.production_weight_cache import ProductionWeightCache
 from prismaquant.production_weight_cache import fill_production_weight_cache
-from prismaquant.production_recache import recache_production_weight_cache
+from prismaquant.production_recache import (
+    _load_assignment,
+    assignment_digest,
+    recache_production_weight_cache,
+)
 
 
 def test_prefetch_loads_disk_entries_and_respects_lru(tmp_path):
@@ -100,6 +104,10 @@ def test_production_recache_measures_quantized_upstream_activation_range():
     assert max_abs["l2"] == pytest.approx(6.0)
     assert cache.activation_max_abs["l2"] == pytest.approx(6.0)
     assert cache.metadata["activation_recache"]["status"] == "applied"
+    assert cache.metadata["activation_recache"]["assignment_entries"] == 2
+    assert cache.metadata["activation_recache"]["assignment_sha256"] == assignment_digest(
+        {"l2": "BF16", "l1": "NVFP4"}
+    )
 
 
 def test_fill_production_cache_recache_requires_concrete_assignment():
@@ -114,3 +122,22 @@ def test_fill_production_cache_recache_requires_concrete_assignment():
             progress=False,
             recache_pass=True,
         )
+
+
+def test_recache_assignment_loader_is_exporter_independent(monkeypatch, tmp_path):
+    path = tmp_path / "layer_config.json"
+    path.write_text(
+        '{"layer.weight": {"bits": 4, "group_size": 16, "data_type": "nv_fp", '
+        '"act_bits": 4, "act_group_size": 16, "act_data_type": "nv_fp"}}'
+    )
+
+    real_import = __import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name in {"accelerate", "prismaquant.export_native_compressed"}:
+            raise ModuleNotFoundError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", guarded_import)
+
+    assert _load_assignment(path) == {"layer": "NVFP4"}

@@ -1567,7 +1567,6 @@ def load_calibration(tokenizer, source: str, n_samples: int,
     {"messages": [...]} for chat-style data.
     """
     import os
-    from datasets import load_dataset
 
     texts: list[str] = []
     if source.endswith(".jsonl") and os.path.exists(source):
@@ -1599,6 +1598,8 @@ def load_calibration(tokenizer, source: str, n_samples: int,
         with open(source) as f:
             texts = [ln.strip() for ln in f if ln.strip()]
     elif source == "ultrachat_200k":
+        from datasets import load_dataset
+
         ds = load_dataset("HuggingFaceH4/ultrachat_200k",
                           split="train_sft", streaming=True)
         for row in ds:
@@ -1621,6 +1622,14 @@ def load_calibration(tokenizer, source: str, n_samples: int,
             if len(texts) >= n_samples * 8:
                 break
     else:
+        try:
+            from datasets import load_dataset
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Loading HuggingFace calibration datasets requires the "
+                "'datasets' package. Local .jsonl and .txt calibration files "
+                "do not require it."
+            ) from exc
         # Generic HF dataset loader. Handles three common schemas:
         #   1. {"text": "..."} — raw text corpora (pile, wikitext, etc.)
         #   2. {"messages": [...]} — chat-format SFT (ultrachat, tulu-3, etc.)

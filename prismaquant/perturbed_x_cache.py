@@ -1139,13 +1139,20 @@ def load_text_model_under_work_root(
 
     staged = stage_text_only_under_work_root(model_path, work_root)
     load_device_map = device_map if device_map is not None else device
-    model = AutoModelForCausalLM.from_pretrained(
-        staged,
-        torch_dtype=dtype,
-        device_map=load_device_map,
-        low_cpu_mem_usage=False,
-        trust_remote_code=True,
-    )
+    load_kwargs = {
+        "torch_dtype": dtype,
+        "device_map": load_device_map,
+        "low_cpu_mem_usage": False,
+        "trust_remote_code": True,
+    }
+    try:
+        model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+    except ValueError as exc:
+        if "requires `accelerate`" not in str(exc) and "requires accelerate" not in str(exc):
+            raise
+        load_kwargs.pop("device_map", None)
+        model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+        model.to(torch.device(device))
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)

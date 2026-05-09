@@ -83,6 +83,16 @@ set -euo pipefail
 # `HuggingFaceM4/COCO`) for real image calibration when
 # CALIBRATION_MODALITY=multimodal.
 : "${MM_DATASET:=synthetic}"
+# Production-cache export path. Enabled by default so export packs the same
+# rendered weights that KL/polish paths measure. Re-cache is still opt-in until
+# the Qwen3.5-0.8B / 4B smoke ladder clears.
+: "${PRODUCTION_CACHE:=1}"
+: "${PRODUCTION_RECACHE:=0}"
+: "${PRODUCTION_CACHE_MAX_ACT_ROWS:=512}"
+: "${PRODUCTION_CACHE_LRU_GB:=24.0}"
+: "${PRODUCTION_CACHE_PREFETCH_WORKERS:=4}"
+: "${PRODUCTION_RECACHE_MICROBATCH:=1}"
+: "${PRODUCTION_CACHE_FORMATS:=auto}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
@@ -98,6 +108,8 @@ echo "  PREFETCH_LOOKAHEAD=$PREFETCH_LOOKAHEAD PREFETCH_WORKERS=$PREFETCH_WORKER
 echo "  ACTIVATION_ROWS_LIMIT=$ACTIVATION_ROWS_LIMIT"
 echo "  VISUAL_FORMAT=$VISUAL_FORMAT"
 echo "  CALIBRATION_MODALITY=$CALIBRATION_MODALITY  MM_DATASET=$MM_DATASET"
+echo "  PRODUCTION_CACHE=$PRODUCTION_CACHE PRODUCTION_RECACHE=$PRODUCTION_RECACHE"
+echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
 echo
 
 # -----------------------------------------------------------------------
@@ -215,16 +227,105 @@ python3 -m prismaquant.allocator \
   2>&1 | tee "${WORK_DIR}/logs/allocator.log"
 
 # -----------------------------------------------------------------------
-# 4. Native compressed-tensors export
+# 4. Production cache + native compressed-tensors export
 # -----------------------------------------------------------------------
+PRODUCTION_CACHE_PATH=""
+if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTION_CACHE" != "False" ]]; then
+  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache"
+  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_raw.pkl"
+  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache_recached.pkl"
+  CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
+  if [[ "$CACHE_FORMATS" == "auto" ]]; then
+    CACHE_FORMATS="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'
+import sys
+from prismaquant.production_recache import _load_assignment
+
+assignment = _load_assignment(sys.argv[1])
+formats = sorted({fmt for fmt in assignment.values() if fmt.upper() != "BF16"})
+print(",".join(formats))
+PY
+)"
+    echo "[pipeline] production cache formats selected from assignment: ${CACHE_FORMATS:-none}"
+  fi
+  if [[ -z "$CACHE_FORMATS" ]]; then
+    echo "[pipeline] production cache requested but no non-BF16 formats are in FORMATS; skipping cache"
+  elif [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
+    if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
+      if [[ ! -f "$PROD_CACHE_RAW" ]]; then
+        echo "[pipeline] [4/4] building production cache + re-fitting activation scales ..."
+        python3 -m prismaquant.build_production_cache \
+          --model "$MODEL_PATH" \
+          --output "$PROD_CACHE_RECACHED" \
+          --formats "$CACHE_FORMATS" \
+          --dataset "$DATASET" \
+          --n-calib-samples "$NSAMPLES" \
+          --calib-seqlen "$SEQLEN" \
+          --dtype bf16 \
+          --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+          --cache-dir "$PROD_CACHE_DIR" \
+          --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+          --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+          2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
+      else
+        echo "[pipeline] [4/4] re-fitting production activation scales ..."
+        python3 -m prismaquant.production_recache \
+          --model "$MODEL_PATH" \
+          --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+          --production-weight-cache "$PROD_CACHE_RAW" \
+          --output "$PROD_CACHE_RECACHED" \
+          --cache-dir-override "$PROD_CACHE_DIR" \
+          --dataset "$DATASET" \
+          --n-calib-samples "$NSAMPLES" \
+          --calib-seqlen "$SEQLEN" \
+          --dtype bf16 \
+          --device "$DEVICE" \
+          --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
+          --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+          2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
+      fi
+    else
+      echo "[pipeline] [4/4] recached production cache exists, skipping"
+    fi
+    PRODUCTION_CACHE_PATH="$PROD_CACHE_RECACHED"
+  else
+    if [[ ! -f "$PROD_CACHE_RAW" ]]; then
+      echo "[pipeline] [4/4] building production cache ..."
+      python3 -m prismaquant.build_production_cache \
+        --model "$MODEL_PATH" \
+        --output "$PROD_CACHE_RAW" \
+        --formats "$CACHE_FORMATS" \
+        --dataset "$DATASET" \
+        --n-calib-samples "$NSAMPLES" \
+        --calib-seqlen "$SEQLEN" \
+        --dtype bf16 \
+        --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+        --cache-dir "$PROD_CACHE_DIR" \
+        2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
+    else
+      echo "[pipeline] [4/4] production cache exists, skipping"
+    fi
+    PRODUCTION_CACHE_PATH="$PROD_CACHE_RAW"
+  fi
+fi
+
 echo "[pipeline] [4/4] exporting to compressed-tensors ..."
-python3 -m prismaquant.export_native_compressed \
-  --model "$MODEL_PATH" \
-  --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-  --output "${WORK_DIR}/exported" \
-  --device "$EXPORT_DEVICE" \
-  --activation-cache-dir "${WORK_DIR}/act" \
-  2>&1 | tee "${WORK_DIR}/logs/export.log"
+EXPORT_ARGS=(
+  python3 -m prismaquant.export_native_compressed
+  --model "$MODEL_PATH"
+  --layer-config "${WORK_DIR}/artifacts/layer_config.json"
+  --output "${WORK_DIR}/exported"
+  --device "$EXPORT_DEVICE"
+  --activation-cache-dir "${WORK_DIR}/act"
+)
+if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
+  EXPORT_ARGS+=(
+    --production-weight-cache "$PRODUCTION_CACHE_PATH"
+    --production-cache-dir-override "${WORK_DIR}/artifacts/production_weight_cache"
+    --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB"
+    --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
+  )
+fi
+"${EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
 
 echo
 echo "[pipeline] done."
