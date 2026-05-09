@@ -200,21 +200,62 @@ def _get_module_by_qname(model: nn.Module, qname: str) -> nn.Module:
     return cur
 
 
+# RMSNorm classes whose forward computes `(1 + weight) * normalize(x)` rather
+# than the Llama-style `weight * normalize(x)`. The Qwen3.5/3.6 family adopts
+# the offset-residual form (weight init to zeros, learned residual centered on
+# 1). For these, the *effective* gamma absorbed into the downstream Linear is
+# `1 + weight`, and after fold the norm should compute identity scaling —
+# which means setting `weight = 0` (so `1 + 0 = 1`) rather than `weight = 1`.
+_OFFSET_RESIDUAL_NORM_CLASSES: frozenset[str] = frozenset({
+    "Qwen3_5RMSNorm",
+})
+
+
+def _is_offset_residual_norm(norm: nn.Module) -> bool:
+    """Auto-detect offset-residual RMSNorm by class name.
+
+    Used as the default when callers don't pass an explicit override. The
+    class-name lookup keeps detection localized to HALO and avoids importing
+    transformers (which would couple PrismaQuant to specific model classes).
+    """
+    return type(norm).__name__ in _OFFSET_RESIDUAL_NORM_CLASSES
+
+
 def fold_gamma_into_linears(model: nn.Module, norm_qname: str,
-                            downstream_linears: list[str]) -> None:
+                            downstream_linears: list[str], *,
+                            offset_residual: bool | None = None) -> None:
     """Fold an RMSNorm's gamma into one or more downstream Linear weights
     by per-input-channel scaling. After this:
-      - The Linear's effective behavior on `gamma * normalize(x)` is
-        unchanged from its prior behavior on the same input.
-      - The norm's gamma is reset to 1.0 so subsequent rotation is valid.
+      - The Linear's effective behavior on `effective_gamma * normalize(x)`
+        is unchanged from its prior behavior on the same input.
+      - The norm's residual weight is reset so the post-fold norm computes
+        identity scaling, leaving `R · LN(x) = LN(R · x)` valid for the
+        subsequent rotation step.
 
     For shared norms feeding multiple Linears (the standard q/k/v fan-out
     after input_layernorm), each Linear absorbs the full gamma.
+
+    Two RMSNorm conventions are handled:
+
+      Llama-style (default): `forward(x) = weight * normalize(x)`.
+        `effective_gamma = weight`. Reset `weight = 1` post-fold so the
+        norm computes `1 * normalize(x) = normalize(x)`.
+
+      Offset-residual (Qwen3.5/3.6 `Qwen3_5RMSNorm`):
+        `forward(x) = (1 + weight) * normalize(x)`.
+        `effective_gamma = 1 + weight`. Reset `weight = 0` post-fold so the
+        norm computes `(1 + 0) * normalize(x) = normalize(x)`.
+
+    If `offset_residual=None`, the convention is auto-detected by inspecting
+    the norm's Python class against `_OFFSET_RESIDUAL_NORM_CLASSES`.
     """
     norm = _get_module_by_qname(model, norm_qname)
     if not hasattr(norm, "weight"):
         return
-    gamma = norm.weight.detach().to(torch.float32)
+    if offset_residual is None:
+        offset_residual = _is_offset_residual_norm(norm)
+    weight_raw = norm.weight.detach().to(torch.float32)
+    gamma = weight_raw + 1.0 if offset_residual else weight_raw
     for linear_qname in downstream_linears:
         lin = _get_module_by_qname(model, linear_qname)
         if not hasattr(lin, "weight"):
@@ -227,9 +268,12 @@ def fold_gamma_into_linears(model: nn.Module, norm_qname: str,
                 f"{W.shape[1]} for {linear_qname}")
         W = W * gamma[None, :]
         lin.weight.data = W.to(lin.weight.dtype)
-    # Reset gamma to 1 so future operations don't double-apply.
+    # Post-fold the residual weight must yield identity scaling: weight=1 for
+    # Llama-style norms (so `1 * normalize(x)`), weight=0 for offset-residual
+    # norms (so `(1 + 0) * normalize(x)`).
+    reset_value = 0.0 if offset_residual else 1.0
     with torch.no_grad():
-        norm.weight.fill_(1.0)
+        norm.weight.fill_(reset_value)
 
 
 # ---------------------------------------------------------------------------
@@ -592,54 +636,17 @@ def default_block_specs(model: nn.Module, *,
     for i in range(n_layers):
         layer_qname = f"{body_layer_prefix}.{i}"
 
-        # Attention block.
-        attn_in = []
-        for proj in ("self_attn.q_proj", "self_attn.k_proj",
-                     "self_attn.v_proj"):
-            try:
-                _get_module_by_qname(model, f"{layer_qname}.{proj}")
-                attn_in.append(f"{layer_qname}.{proj}")
-            except AttributeError:
-                pass
-        attn_out = []
-        for proj in ("self_attn.o_proj", "self_attn.out_proj"):
-            try:
-                _get_module_by_qname(model, f"{layer_qname}.{proj}")
-                attn_out.append(f"{layer_qname}.{proj}")
-                break
-            except AttributeError:
-                continue
-        if attn_in and attn_out:
-            blocks.append(HaloBlockSpec(
-                name=f"layer{i}.attn",
-                dim=hidden,
-                norm_qname=f"{layer_qname}.input_layernorm",
-                input_linears=attn_in,
-                output_linears=attn_out,
-            ))
-
-        # MLP / MoE block.
-        mlp_in = []
-        for proj in ("mlp.gate_proj", "mlp.up_proj"):
-            try:
-                _get_module_by_qname(model, f"{layer_qname}.{proj}")
-                mlp_in.append(f"{layer_qname}.{proj}")
-            except AttributeError:
-                pass
-        mlp_out = []
+        # Resolve the layer module from the qname so we can defer all
+        # attention/linear_attn/MLP block detection to `block_specs_for_layer`.
+        # Sharing one source of truth keeps the streaming export path and the
+        # in-memory full-model path emitting identical specs — otherwise (as
+        # the 2026-05-09 qwen3_5 smoke proved) the in-memory path silently
+        # skips linear_attn blocks while the streaming path includes them.
         try:
-            _get_module_by_qname(model, f"{layer_qname}.mlp.down_proj")
-            mlp_out.append(f"{layer_qname}.mlp.down_proj")
+            layer_mod = _get_module_by_qname(model, layer_qname)
         except AttributeError:
-            pass
-        if mlp_in and mlp_out:
-            blocks.append(HaloBlockSpec(
-                name=f"layer{i}.mlp",
-                dim=hidden,
-                norm_qname=f"{layer_qname}.post_attention_layernorm",
-                input_linears=mlp_in,
-                output_linears=mlp_out,
-            ))
+            continue
+        blocks.extend(block_specs_for_layer(layer_mod, layer_qname, hidden))
 
     return HaloModelSpec(
         dim=hidden,

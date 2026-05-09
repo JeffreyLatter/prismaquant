@@ -91,6 +91,27 @@ class _RMSNorm(nn.Module):
         return self.weight * x
 
 
+class _Qwen35RMSNorm(nn.Module):
+    """Offset-residual RMSNorm matching transformers Qwen3_5RMSNorm.
+
+    Forward computes `(1 + weight) * normalize(x)`; weight is initialized to
+    zeros and learned as a centered residual around 1. HALO's gamma fold must
+    treat the effective gamma as `1 + weight` rather than `weight`, otherwise
+    the post-fold residual stream is mismultiplied by `(2 * weight) / (1 +
+    weight)` per fold site (catastrophic for small pretrained weights).
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        # Match transformers' init: zeros, not ones.
+        self.weight = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        var = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps)
+        return (1.0 + self.weight) * x
+
+
 class _NormThenLinear(nn.Module):
     def __init__(self, d: int):
         super().__init__()
@@ -100,6 +121,23 @@ class _NormThenLinear(nn.Module):
         with torch.no_grad():
             self.norm.weight.copy_(
                 torch.linspace(0.5, 1.5, d, dtype=torch.float32))
+
+    def forward(self, x):
+        return self.lin(self.norm(x))
+
+
+class _OffsetResidualNormThenLinear(nn.Module):
+    """`_NormThenLinear` variant using `_Qwen35RMSNorm` with non-trivial
+    learned residual."""
+    def __init__(self, d: int):
+        super().__init__()
+        self.norm = _Qwen35RMSNorm(d)
+        self.lin = nn.Linear(d, d, bias=False)
+        with torch.no_grad():
+            # Centered residual ~0.0 with light spread, mimicking pretrained
+            # qwen3_5 magnitudes (effective gamma = 1 + weight ≈ [0.7, 1.3]).
+            self.norm.weight.copy_(
+                torch.linspace(-0.3, 0.3, d, dtype=torch.float32))
 
     def forward(self, x):
         return self.lin(self.norm(x))
@@ -118,6 +156,92 @@ def test_fold_gamma_preserves_output():
     assert torch.allclose(model.norm.weight, torch.ones(d), atol=1e-7)
     assert torch.allclose(y_before, y_after, atol=1e-5), \
         f"max diff = {(y_before - y_after).abs().max().item()}"
+
+
+def test_fold_gamma_offset_residual_preserves_output():
+    """Offset-residual (Qwen3_5-style) RMSNorm fold must absorb effective
+    gamma `(1 + weight)` and reset `weight = 0` post-fold so the norm computes
+    identity scaling. Verifies the patch that fixes the qwen3_5_dense HALO
+    smoke regression on 2026-05-09."""
+    torch.manual_seed(0)
+    d = 32
+    model = _OffsetResidualNormThenLinear(d).eval()
+    x = torch.randn(4, d, dtype=torch.float32)
+    with torch.no_grad():
+        y_before = model(x)
+        fold_gamma_into_linears(model, "norm", ["lin"], offset_residual=True)
+        y_after = model(x)
+    # For offset-residual norms, post-fold weight must be 0 (so `(1 + 0) = 1`
+    # — identity scaling), NOT 1 (which would scale by 2).
+    assert torch.allclose(model.norm.weight, torch.zeros(d), atol=1e-7), (
+        f"offset-residual norm.weight should reset to 0; got "
+        f"{model.norm.weight}")
+    assert torch.allclose(y_before, y_after, atol=1e-5), \
+        f"max diff = {(y_before - y_after).abs().max().item()}"
+
+
+class Qwen3_5RMSNorm(nn.Module):
+    """Test-local class whose name matches the production transformers
+    `Qwen3_5RMSNorm`, so HALO's class-name-based auto-detect of the
+    offset-residual convention fires without importing transformers."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        var = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps)
+        return (1.0 + self.weight) * x
+
+
+def test_fold_gamma_offset_residual_autodetects_qwen35_class():
+    """`fold_gamma_into_linears` should auto-detect the offset-residual
+    convention when the norm class name matches the production
+    `Qwen3_5RMSNorm`. No explicit override should be required."""
+    torch.manual_seed(0)
+    d = 32
+
+    class _Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = Qwen3_5RMSNorm(d)
+            self.lin = nn.Linear(d, d, bias=False)
+            with torch.no_grad():
+                self.norm.weight.copy_(
+                    torch.linspace(-0.3, 0.3, d, dtype=torch.float32))
+
+        def forward(self, x):
+            return self.lin(self.norm(x))
+
+    model = _Wrapper().eval()
+    x = torch.randn(4, d, dtype=torch.float32)
+    with torch.no_grad():
+        y_before = model(x)
+        # No explicit override — auto-detect via class name must fire.
+        fold_gamma_into_linears(model, "norm", ["lin"])
+        y_after = model(x)
+    assert torch.allclose(model.norm.weight, torch.zeros(d), atol=1e-7), (
+        f"offset-residual auto-detect failed; norm.weight={model.norm.weight}")
+    assert torch.allclose(y_before, y_after, atol=1e-5), \
+        f"max diff = {(y_before - y_after).abs().max().item()}"
+
+
+def test_fold_gamma_llama_style_unaffected_by_patch():
+    """Regression guard: the Llama-style fold must still work the same
+    (weight=1 post-fold, output preserved) when offset_residual is left at
+    default and the norm class isn't in the offset-residual whitelist."""
+    torch.manual_seed(0)
+    d = 32
+    model = _NormThenLinear(d).eval()
+    x = torch.randn(4, d, dtype=torch.float32)
+    with torch.no_grad():
+        y_before = model(x)
+        fold_gamma_into_linears(model, "norm", ["lin"])  # auto-detect: False
+        y_after = model(x)
+    # Standard Llama-style fold: weight should land at 1.0.
+    assert torch.allclose(model.norm.weight, torch.ones(d), atol=1e-7)
+    assert torch.allclose(y_before, y_after, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
