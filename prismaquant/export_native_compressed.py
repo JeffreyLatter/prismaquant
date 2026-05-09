@@ -460,6 +460,57 @@ def _production_cache_scales(cache) -> dict[str, float]:
     return _unify_input_global_scales_across_fused_siblings(scales)
 
 
+def _source_weight_shape_for_recipe(
+    src_model: str,
+    recipe_key: str,
+) -> list[int] | None:
+    idx_path = Path(src_model) / "model.safetensors.index.json"
+    if not idx_path.exists():
+        return None
+    with open(idx_path) as f:
+        weight_map = json.load(f).get("weight_map", {})
+    candidates = [recipe_key + ".weight"]
+    if recipe_key.startswith("model."):
+        candidates.append(
+            "model.language_model." + recipe_key[len("model."):] + ".weight"
+        )
+    for ckpt_key in dict.fromkeys(candidates):
+        shard = weight_map.get(ckpt_key)
+        if shard is None:
+            continue
+        from safetensors import safe_open
+        with safe_open(str(Path(src_model) / shard), framework="pt") as sf:
+            return list(sf.get_slice(ckpt_key).get_shape())
+    return None
+
+
+def _coerce_runtime_legal_assignment(
+    src_model: str,
+    assignment: dict[str, str],
+) -> tuple[dict[str, str], list[tuple[str, list[int]]]]:
+    """Adjust assignments that the target runtime cannot execute.
+
+    vLLM's current FlashInfer MXFP8 linear kernel requires output
+    dimension >= 128. Qwen3.6's GDN linear-attention in_proj_a/b shards can be
+    96-wide; exporting those as MXFP8 produces a checkpoint that loads but
+    fails on vLLM's profile run. BF16 is conservative for quality and keeps
+    the runtime contract explicit.
+    """
+    out = dict(assignment)
+    coerced: list[tuple[str, list[int]]] = []
+    for qname, fmt in assignment.items():
+        if _canonical_export_format(fmt) != "MXFP8":
+            continue
+        shape = _source_weight_shape_for_recipe(src_model, qname)
+        if shape is None or len(shape) != 2:
+            continue
+        out_features = int(shape[0])
+        if out_features < 128:
+            out[qname] = "BF16"
+            coerced.append((qname, shape))
+    return out, coerced
+
+
 def _production_cache_prefetch_assignment(
     assignment: dict[str, str],
     *,
@@ -5101,6 +5152,10 @@ def main():
         _layer_config_payload_for_cache = json.load(_lc_for_cache)
     validate_layer_config_payload(_layer_config_payload_for_cache, args.layer_config)
     _assignment_for_cache = _canonicalize_assignment(_layer_config_payload_for_cache)
+    _assignment_for_cache, _ = _coerce_runtime_legal_assignment(
+        args.model,
+        _assignment_for_cache,
+    )
 
     if args.production_weight_cache:
         import pickle
@@ -5245,6 +5300,18 @@ def main():
         raw_recipe = json.load(f)
     validate_layer_config_payload(raw_recipe, args.layer_config)
     assignment = _canonicalize_assignment(raw_recipe)
+    assignment, runtime_coerced = _coerce_runtime_legal_assignment(
+        args.model,
+        assignment,
+    )
+    if runtime_coerced:
+        print(
+            "[export-stream] runtime format coercions: "
+            f"{len(runtime_coerced)} MXFP8 Linears -> BF16 "
+            "(vLLM MXFP8 requires out_features >= 128). "
+            f"sample={runtime_coerced[:6]}",
+            flush=True,
+        )
     validate_mtp_assignment_coverage(args.model, assignment, profile)
     fmts = Counter(assignment.values())
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
@@ -5471,6 +5538,10 @@ def main():
             "source_recipe": args.layer_config,
             "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
             "n_assignment_entries": len(assignment),
+            "runtime_coercions": [
+                {"name": name, "shape": shape, "from": "MXFP8", "to": "BF16"}
+                for name, shape in runtime_coerced
+            ],
             "ignore": sorted(bf16_passthrough),
             "prune": prune_summary,
         }, f, indent=2)
