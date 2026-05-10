@@ -20,6 +20,7 @@ from prismaquant.export_native_compressed import (
     FP8_E4M3_MAX,
     NVFP4_MAX,
     PER_EXPERT_MOE_REGEX,
+    _bf16_upgrade_audit,
     _compute_layer_joint_nvfp4,
     _coerce_runtime_legal_assignment,
     _passthrough_dtype,
@@ -693,6 +694,30 @@ class TestProductionCacheExportPath(unittest.TestCase):
         finally:
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
 
+    def test_mxfp8_scale_sweep_cache_defers_to_export_recompute(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        W = torch.randn(8, 32) * 0.1
+        cache = ProductionWeightCache(
+            weights={("model.layers.0.self_attn.q_proj", "MXFP8_E4M3"): W},
+            levers={"scale_sweep": True},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_acts = m._CACHED_ACTIVATIONS
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._CACHED_ACTIVATIONS = object()
+            out = m._pack_production_cached_2d(
+                "model.layers.0.self_attn.q_proj",
+                "MXFP8_E4M3",
+                device=torch.device("cpu"),
+            )
+            self.assertIsNone(out)
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._CACHED_ACTIVATIONS = saved_acts
+
 
 class TestFusedSiblingJointGlobalScale(unittest.TestCase):
     """vLLM warns when q/k/v/gate/up have different weight_global_scale.
@@ -894,7 +919,7 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
                 }, f)
 
             assignment, coerced = _coerce_runtime_legal_assignment(str(td), {
-                "model.layers.0.linear_attn.in_proj_a": "MXFP8",
+                "model.layers.0.linear_attn.in_proj_a": "MXFP8_E4M3",
                 "model.layers.0.self_attn.o_proj": "MXFP8",
             })
 
@@ -903,6 +928,49 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
         self.assertEqual(coerced, [
             ("model.layers.0.linear_attn.in_proj_a", [48, 5120])
         ])
+
+    def test_bf16_audit_classifies_allocator_bf16_candidates(self):
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard = td / "model-00001-of-00001.safetensors"
+            save_file({
+                "model.layers.0.self_attn.o_proj.weight": torch.zeros(
+                    128, 5120, dtype=torch.bfloat16
+                ),
+                "model.layers.0.linear_attn.in_proj_a.weight": torch.zeros(
+                    48, 5120, dtype=torch.bfloat16
+                ),
+            }, str(shard))
+            with open(td / "model.safetensors.index.json", "w") as f:
+                json.dump({
+                    "weight_map": {
+                        "model.layers.0.self_attn.o_proj.weight": shard.name,
+                        "model.layers.0.linear_attn.in_proj_a.weight": shard.name,
+                    }
+                }, f)
+
+            audit = _bf16_upgrade_audit(
+                str(td),
+                {
+                    "model.layers.0.self_attn.o_proj": "BF16",
+                    "model.layers.0.linear_attn.in_proj_a": "BF16",
+                },
+                set(),
+                [("model.layers.0.linear_attn.in_proj_a", [48, 5120])],
+                Qwen3_5Profile(),
+            )
+
+        reasons = {entry["name"]: entry["reason"] for entry in audit["entries"]}
+        self.assertEqual(
+            reasons["model.layers.0.linear_attn.in_proj_a"],
+            "runtime_coerced_from_mxfp8",
+        )
+        self.assertEqual(
+            reasons["model.layers.0.self_attn.o_proj"],
+            "allocator_selected_bf16_mxfp8_legal",
+        )
 
 
 class TestDeltaNetFusedSiblingJointScale(unittest.TestCase):
@@ -1141,6 +1209,63 @@ class TestActivationAwarePasses(unittest.TestCase):
         import torch
         torch.manual_seed(42)
 
+    def test_activation_matrix_explicit_threshold_overrides_quantile(self):
+        import os
+        import torch
+        import prismaquant.export_native_compressed as m
+
+        saved = os.environ.get("PRISMAQUANT_ACT_CLIP_QUANTILE")
+        os.environ["PRISMAQUANT_ACT_CLIP_QUANTILE"] = "0.5"
+        try:
+            x = torch.tensor([[1.0, -2.0, 100.0, -100.0]])
+            out = m._activation_matrix_for_gptq(
+                x,
+                4,
+                clip_threshold=10.0,
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("PRISMAQUANT_ACT_CLIP_QUANTILE", None)
+            else:
+                os.environ["PRISMAQUANT_ACT_CLIP_QUANTILE"] = saved
+
+        expected = torch.tensor([[1.0, -2.0, 10.0, -10.0]])
+        self.assertTrue(torch.equal(out, expected))
+
+    def test_activation_matrix_applies_fisher_row_weights(self):
+        import torch
+        import prismaquant.export_native_compressed as m
+
+        x = torch.ones(2, 2)
+        out = m._activation_matrix_for_gptq(
+            x,
+            2,
+            clip_quantile=0.0,
+            row_weights=torch.tensor([0.0, 2.0]),
+        )
+
+        self.assertTrue(torch.allclose(out[0], torch.zeros(2)))
+        self.assertTrue(torch.allclose(out[1], torch.full((2,), 2 ** 0.5)))
+
+    def test_mxfp8_scale_sweep_is_no_worse_than_baseline(self):
+        import torch
+        import prismaquant.export_native_compressed as m
+
+        torch.manual_seed(7)
+        W = torch.randn(16, 64) * 0.2
+        X = torch.randn(32, 64)
+        q, s = m.quantize_dequantize_mxfp8(W, group_size=32)
+        baseline = m._mxfp8_dequantize_grouped(
+            q.reshape(16, 2, 32),
+            s,
+        ).reshape_as(W)
+        _, _, swept = m._mxfp8_scale_sweep_quantize(W, X, group_size=32)
+
+        imp = X.pow(2).mean(dim=0).reshape(1, 2, 32)
+        base_err = ((W.reshape(16, 2, 32) - baseline.reshape(16, 2, 32)).pow(2) * imp).sum()
+        swept_err = ((W.reshape(16, 2, 32) - swept.reshape(16, 2, 32)).pow(2) * imp).sum()
+        self.assertLessEqual(float(swept_err), float(base_err) + 1e-6)
+
     def _decode_nvfp4(self, wp, ws, wg):
         import torch
         from prismaquant.export_native_compressed import (
@@ -1371,6 +1496,53 @@ class TestActivationAwarePasses(unittest.TestCase):
                         out_without["weight_packed"]),
             "act-aware flags had no effect on output",
         )
+
+    def test_awq_skip_leaves_do_not_skip_gptq_or_scale_sweep(self):
+        """AWQ cannot fold through post-nonlinearity readers such as
+        down_proj/o_proj, but GPTQ and scale_sweep are still valid there.
+        A regression accidentally reused the AWQ skip list to suppress
+        every activation-aware pass on those Linears."""
+        import os
+        import torch
+        import prismaquant.export_native_compressed as m
+
+        calls = []
+
+        def fake_gptq(weight, activations, **kwargs):
+            calls.append("gptq")
+            return weight.to(torch.float32)
+
+        def fake_scale_sweep(weight, activations, **kwargs):
+            calls.append("scale_sweep")
+            return weight.to(torch.float32)
+
+        W = torch.randn(32, 32)
+        X = torch.randn(16, 32)
+        saved_gptq = m._gptq_obs_rounding_nvfp4_swept
+        saved_scale_sweep = m._scale_sweep_nvfp4
+        saved_dnh = os.environ.get("PRISMAQUANT_DO_NO_HARM")
+        os.environ["PRISMAQUANT_DO_NO_HARM"] = "0"
+        try:
+            m._gptq_obs_rounding_nvfp4_swept = fake_gptq
+            m._scale_sweep_nvfp4 = fake_scale_sweep
+            m._quantize_2d(
+                W,
+                "NVFP4",
+                linear_name="model.layers.0.mlp.down_proj",
+                gptq_enabled=True,
+                scale_sweep_enabled=True,
+                cached_activations=X,
+                compute_only=True,
+            )
+        finally:
+            m._gptq_obs_rounding_nvfp4_swept = saved_gptq
+            m._scale_sweep_nvfp4 = saved_scale_sweep
+            if saved_dnh is None:
+                os.environ.pop("PRISMAQUANT_DO_NO_HARM", None)
+            else:
+                os.environ["PRISMAQUANT_DO_NO_HARM"] = saved_dnh
+
+        self.assertEqual(calls, ["gptq", "scale_sweep"])
 
     def test_awq_fold_end_to_end_matches_baseline_on_mixed_readers(self):
         """Full invariant: after `_awq_fold_layer_predecessors` runs on

@@ -28,11 +28,17 @@ Before implementing new functionality, read this file and
    apples KL, bpp, and runtime measurements. Compare against the relevant
    shipped or current baseline using the same calibration set, sequence
    length, layer assignment semantics, and production cache behavior.
-6. **Reuse local abstractions.** Prefer the existing format registry,
+6. **Report bpp over quantizable parameters only.** Bits-per-parameter
+   accounting must exclude immutable BF16 regions that the allocator is not
+   allowed to quantize, including `lm_head` and any profile-pinned model
+   components. Published NVFP4/MXFP8 comparisons do not average in
+   unquantizable parameters; PrismaQuant reports should follow the same
+   convention.
+7. **Reuse local abstractions.** Prefer the existing format registry,
    allocator, production cache, recache, validation harness, and pipeline
    flags. If an abstraction is missing, add it at the shared layer rather
    than building a one-off call site.
-7. **Keep cross-layer machinery archived unless explicitly requested.**
+8. **Keep cross-layer machinery archived unless explicitly requested.**
    The archived CLADO, propagated-cost, output-Fisher, PrismaSCOUT iteration,
    QUBO, and polish-of-many code is research context, not a production
    shipping lever.
@@ -56,4 +62,3 @@ Before finishing:
   based on a run.
 - Leave experimental methods opt-in until the validation gate in
   `docs/design_guidelines.md` is satisfied.
-

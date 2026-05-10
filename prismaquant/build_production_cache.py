@@ -1,9 +1,14 @@
 """Build a production-faithful δw cache for a model checkpoint.
 
-Renders W_tilde[name, fmt] for every quantizable Linear using the export
-pipeline's activation-aware passes (GPTQ damp-sweep + scale_sweep on
-NVFP4; RTN passthrough on MXFP8 / BF16) and saves a pickle that
+Renders W_tilde[name, fmt] using the export pipeline's activation-aware
+passes (GPTQ damp-sweep + scale_sweep on NVFP4; activation-weighted scale
+search on MXFP8; passthrough on BF16) and saves a pickle that
 PerturbedActivationCache can load via ``production_weight_cache=...``.
+
+By default this standalone CLI renders the explicit ``--formats`` menu for
+all quantizable Linears. Pipeline callers should pass ``--render-scope
+assignment --render-layer-config layer_config.json`` to render only the
+concrete non-BF16 entries the export assignment will consume.
 
 Usage:
 
@@ -53,7 +58,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--formats",
         default="NVFP4",
         help="Comma-separated formats to render. MXFP8 / BF16 cache is "
-        "RTN/passthrough so usually only NVFP4 is worth caching.",
+        "cheap compared with NVFP4, but MXFP8 still benefits from "
+        "activation-weighted scale search when scale_sweep is enabled.",
+    )
+    p.add_argument(
+        "--render-scope",
+        choices=("format-menu", "assignment"),
+        default="format-menu",
+        help="format-menu renders every requested format for every eligible "
+        "Linear. assignment renders only the concrete non-BF16 entries from "
+        "--render-layer-config. The pipeline defaults to assignment to avoid "
+        "wasting compute on unused cache entries.",
+    )
+    p.add_argument(
+        "--render-layer-config",
+        default=None,
+        help="Concrete layer_config.json assignment used when "
+        "--render-scope=assignment. Non-BF16 entries are rendered exactly; "
+        "BF16 entries are ignored because they do not need cache weights.",
     )
     p.add_argument("--n-calib-samples", type=int, default=8)
     p.add_argument("--calib-seqlen", type=int, default=256)
@@ -79,7 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--enable",
         default="gptq,scale_sweep",
         help="Comma-separated levers to enable. Currently honored: "
-        "{gptq, scale_sweep}.  AWQ predecessor folding is NOT yet wired "
+        "{gptq, scale_sweep, act_clip_solver, fisher_gptq}.  AWQ predecessor folding is NOT yet wired "
         "into render_production_weight (v2 work); passing 'awq' silently "
         "has no effect.  Joint NVFP4 sibling globals + calibrated "
         "input_global_scale are computed unconditionally when NVFP4 is in "
@@ -102,6 +124,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "The pickle becomes a small manifest; PerturbedActivationCache "
         "lazy-loads each weight on first access at hook time.  Required "
         "for arbitrarily-large models (e.g. 27B+ on a 121 GB UMA box).",
+    )
+    p.add_argument(
+        "--h-detail-dir",
+        default=None,
+        help="Optional h-detail directory from incremental_probe. When "
+        "'fisher_gptq' is enabled, g2_per_token vectors from this directory "
+        "weight NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives.",
     )
     p.add_argument(
         "--skip-qnames",
@@ -263,10 +292,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             _load_assignment(args.recache_layer_config)
             if args.recache_layer_config else None
         )
+        render_assignment = None
+        if args.render_scope == "assignment":
+            layer_config = args.render_layer_config or args.recache_layer_config
+            if not layer_config:
+                print(
+                    "[build-prod-cache] FAIL: --render-scope=assignment "
+                    "requires --render-layer-config",
+                    flush=True,
+                )
+                return 2
+            render_assignment = _load_assignment(layer_config)
+            non_bf16 = sum(
+                1 for fmt in render_assignment.values()
+                if str(fmt).strip().upper() != "BF16"
+            )
+            print(
+                f"[build-prod-cache] assignment render scope: "
+                f"{non_bf16} non-BF16 entries from {layer_config}",
+                flush=True,
+            )
         t0 = time.monotonic()
         cache = fill_production_weight_cache(
             model, calib_ids, qnames,
             formats=formats,
+            render_assignment=render_assignment,
             levers=levers,
             max_act_rows=args.max_act_rows,
             cache_dir=args.cache_dir,
@@ -275,6 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             recache_profile=profile,
             recache_include_activation_quant=not args.no_recache_activation_quant,
             recache_microbatch_size=args.recache_microbatch_size,
+            h_detail_dir=args.h_detail_dir,
         )
         elapsed = time.monotonic() - t0
         meta = dict(getattr(cache, "metadata", {}) or {})
@@ -286,7 +337,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         # failures, and any other silent gaps that would otherwise fall
         # through to RTN at hook time.
         try:
-            cache.validate_coverage(qnames, formats)
+            if render_assignment is not None:
+                _, missing = cache.assignment_keys(render_assignment)
+                failed = list((cache.failed or {}).keys())
+                if missing or failed:
+                    samples = missing[:5] + failed[:5]
+                    raise RuntimeError(
+                        f"ProductionWeightCache assignment coverage failure: "
+                        f"{len(missing)} misses, {len(failed)} failed "
+                        f"renders; sample={samples}"
+                    )
+            else:
+                cache.validate_coverage(qnames, formats)
             print("[build-prod-cache] coverage check passed", flush=True)
         except RuntimeError as e:
             if args.allow_incomplete:

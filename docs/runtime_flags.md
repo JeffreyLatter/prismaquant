@@ -26,6 +26,15 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | env var | default | what it does |
 |---|---|---|
 | `PRISMAQUANT_BATCHED_NVFP4_EXPORT` | **on** (when act-aware passes fire and an activation cache is supplied) | Routes NVFP4 same-shape Linears through the batched GPTQ + scale_sweep path (`export_batched_gptq.py`). Stacks per-layer experts into `(E, out, in)` tensors and runs Cholesky / column update batched across E. ~5-10% faster on MiniMax, more on bigger MoE models. |
+| `PRISMAQUANT_ACT_CLIP_SOLVER` | **off** | Enables the production-cache NVFP4 activation-clipping solver. The solver picks one scalar render-time activation clamp per Linear/fused-sibling group, scores candidates on original unclipped activations, and stores only selected thresholds in cache metadata. |
+| `PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS` | `6` | Maximum threshold evaluations per eligible group for the log-space scalar solver. Higher values can improve the threshold but multiply NVFP4 render cost. |
+| `PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN` | `0` | Minimum relative output-MSE gain over the existing render path before a solved threshold is selected. Otherwise the group keeps the baseline behavior. |
+| `PRISMAQUANT_ACT_CLIP_SOLVER_TOP_FRACTION` | `1.0` | Restrict threshold search to the highest-baseline-error fraction of eligible fused groups. All groups still get baseline-scored; skipped groups keep baseline behavior. |
+| `PRISMAQUANT_ACT_CLIP_SOLVER_TOP_K` | `0` | Optional hard cap on threshold-solved groups after baseline-error ranking. `0` means no cap. |
+| `PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE` | **off** | Prints per-group solver decisions while filling the production cache. |
+| `PRISMAQUANT_FISHER_WEIGHTED_GPTQ` | **off** | Enables Fisher/output-weighted local objectives when an h-detail cache is supplied. NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep weight activation rows by normalized `g2_per_token`. |
+| `PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP` | `64` | Caps normalized per-token Fisher weights before re-normalizing, preventing a single calibration token from dominating the local solve. |
+| `PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS` | `-2,-1,0,1,2` | Candidate E8M0 exponent shifts for MXFP8 activation-weighted scale search. |
 
 ## Pipeline production-cache flags
 
@@ -36,6 +45,9 @@ These are `run-pipeline.sh` environment variables rather than
 |---|---|---|
 | `PRODUCTION_CACHE` | `1` | Build and use a `ProductionWeightCache` so export packs the same rendered weights that KL/polish measured. |
 | `PRODUCTION_RECACHE` | `1` | Replay calibration with production weights installed and re-fit `activation_max_abs` before export. |
+| `PRODUCTION_CACHE_LEVERS` | `gptq,scale_sweep` | Render-time quality levers for the production cache. `FISHER_WEIGHTED_GPTQ=1` appends `fisher_gptq`; `PRISMAQUANT_ACT_CLIP_SOLVER=1` enables the clip solver through the cache code. |
+| `FISHER_WEIGHTED_GPTQ` | `0` | Pipeline switch that writes h-detail during probe, passes it into production cache fill, and uses a distinct `_fisher` cache path. |
+| `H_DETAIL_DIR` | `$WORK_DIR/h_detail` | h-detail directory used when `FISHER_WEIGHTED_GPTQ=1`. |
 | `PRODUCTION_CACHE_LRU_GB` | `64.0` | Resident tensor budget for disk-backed production-cache use in recache and export. The 27B n=8 recache smoke needed `45.32 GiB` for the selected assignment. |
 | `PRODUCTION_CACHE_PREFETCH` | `require` | Standalone recache prefetch policy. `require` fails fast when assignment-required weights cannot fit resident, preventing silent NVMe-bound replay. |
 | `PRODUCTION_CACHE_PREFETCH_WORKERS` | `4` | Thread count for eager production-cache prefetch. |

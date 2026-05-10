@@ -96,11 +96,32 @@ set -euo pipefail
 : "${PRODUCTION_CACHE_PREFETCH_WORKERS:=4}"
 : "${PRODUCTION_RECACHE_MICROBATCH:=1}"
 : "${PRODUCTION_CACHE_FORMATS:=auto}"
+# assignment: render only concrete non-BF16 entries from layer_config.json.
+# format-menu: render every requested format for every quantizable Linear,
+# useful when intentionally building a reusable cache for reallocations.
+: "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
+: "${PRODUCTION_CACHE_LEVERS:=gptq,scale_sweep}"
+: "${FISHER_WEIGHTED_GPTQ:=0}"
+: "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 : "${HALO_MODE:=off}"
 : "${HALO_SEED:=0}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
+
+PROBE_H_DETAIL_ARGS=()
+PROD_H_DETAIL_ARGS=()
+case "$FISHER_WEIGHTED_GPTQ" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    PROBE_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
+    PROD_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
+    case ",$PRODUCTION_CACHE_LEVERS," in
+      *,fisher_gptq,*) ;;
+      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},fisher_gptq" ;;
+    esac
+    ;;
+esac
 
 mkdir -p "${WORK_DIR}"/{artifacts,act,work,logs,exported}
 
@@ -116,6 +137,9 @@ echo "  MTP_FORMAT=$MTP_FORMAT"
 echo "  CALIBRATION_MODALITY=$CALIBRATION_MODALITY  MM_DATASET=$MM_DATASET"
 echo "  PRODUCTION_CACHE=$PRODUCTION_CACHE PRODUCTION_RECACHE=$PRODUCTION_RECACHE"
 echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
+echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
+echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
+echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
 echo
@@ -142,6 +166,7 @@ if [[ ! -f "${PROBE_PATH}" ]]; then
     --calibration-modality "$CALIBRATION_MODALITY" \
     --mm-dataset "$MM_DATASET" \
     --mm-nsamples 8 --mm-max-text-len 128 \
+    "${PROBE_H_DETAIL_ARGS[@]}" \
     2>&1 | tee "${WORK_DIR}/logs/probe.log"
 else
   # Reuse guard: make sure the pre-existing probe.pkl matches the
@@ -179,6 +204,12 @@ except Exception as e:
     echo "             Delete the stale probe to regenerate:"
     echo "               rm ${PROBE_PATH}"
     echo "             Or unset CALIBRATION_MODALITY to match the probe."
+    exit 2
+  fi
+  if [[ "${#PROBE_H_DETAIL_ARGS[@]}" -gt 0 && ! -d "$H_DETAIL_DIR" ]]; then
+    echo "[pipeline] [1/4] ABORT: FISHER_WEIGHTED_GPTQ=1 but"
+    echo "             h-detail dir is missing: $H_DETAIL_DIR"
+    echo "             Delete ${PROBE_PATH} to regenerate probe+h-detail."
     exit 2
   fi
   echo "[pipeline] [1/4] probe.pkl exists (modality=${probe_modality}), skipping"
@@ -245,9 +276,18 @@ if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTI
   if [[ "$HALO_MODE" != "off" ]]; then
     HALO_CACHE_TAG="_halo-${HALO_MODE}-seed${HALO_SEED}"
   fi
-  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}"
-  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}_raw.pkl"
-  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}_recached.pkl"
+  LEVER_CACHE_TAG=""
+  case "$FISHER_WEIGHTED_GPTQ" in
+    0|false|False|FALSE|no|No|NO|"") ;;
+    *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_fisher" ;;
+  esac
+  case "${PRISMAQUANT_ACT_CLIP_SOLVER:-0}" in
+    0|false|False|FALSE|no|No|NO|"") ;;
+    *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_clip" ;;
+  esac
+  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}"
+  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_raw.pkl"
+  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_recached.pkl"
   CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
   if [[ "$CACHE_FORMATS" == "auto" ]]; then
     CACHE_FORMATS="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'
@@ -276,11 +316,15 @@ PY
           --calib-seqlen "$SEQLEN" \
           --dtype bf16 \
           --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+          --enable "$PRODUCTION_CACHE_LEVERS" \
           --cache-dir "$PROD_CACHE_DIR" \
+          --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
+          --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
           --halo-mode "$HALO_MODE" \
           --halo-seed "$HALO_SEED" \
+          "${PROD_H_DETAIL_ARGS[@]}" \
           2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
       else
         echo "[pipeline] [4/4] re-fitting production activation scales ..."
@@ -319,9 +363,13 @@ PY
         --calib-seqlen "$SEQLEN" \
         --dtype bf16 \
         --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+        --enable "$PRODUCTION_CACHE_LEVERS" \
         --cache-dir "$PROD_CACHE_DIR" \
+        --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
+        --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
         --halo-mode "$HALO_MODE" \
         --halo-seed "$HALO_SEED" \
+        "${PROD_H_DETAIL_ARGS[@]}" \
         2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
     else
       echo "[pipeline] [4/4] production cache exists, skipping"
@@ -342,12 +390,12 @@ EXPORT_ARGS=(
   --halo-seed "$HALO_SEED"
 )
 if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
-  EXPORT_ARGS+=(
-    --production-weight-cache "$PRODUCTION_CACHE_PATH"
-    --production-cache-dir-override "${WORK_DIR}/artifacts/production_weight_cache"
-    --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB"
-    --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
-  )
+	  EXPORT_ARGS+=(
+	    --production-weight-cache "$PRODUCTION_CACHE_PATH"
+	    --production-cache-dir-override "$PROD_CACHE_DIR"
+	    --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB"
+	    --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
+	  )
 fi
 "${EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
 

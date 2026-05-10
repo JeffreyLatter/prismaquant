@@ -266,6 +266,16 @@ def _normalized_production_cache_levers(value: str | None) -> dict[str, bool]:
     levers.setdefault("scale_sweep", True)
     levers.setdefault("awq", False)
     levers.setdefault("awq_round", False)
+    levers.setdefault(
+        "act_clip_solver",
+        os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER", "0").strip().lower()
+        not in {"", "0", "false", "no", "off"},
+    )
+    levers.setdefault(
+        "fisher_gptq",
+        os.environ.get("PRISMAQUANT_FISHER_WEIGHTED_GPTQ", "0").strip().lower()
+        not in {"", "0", "false", "no", "off"},
+    )
     return dict(sorted(levers.items()))
 
 
@@ -342,7 +352,8 @@ def _attach_production_cache_metadata(
     cache: object,
     expected: Mapping[str, object],
 ) -> dict[str, object]:
-    metadata = dict(expected)
+    metadata = dict(getattr(cache, "metadata", {}) or {})
+    metadata.update(expected)
     metadata["entries_sha256"] = _production_cache_entries_digest(cache)
     metadata["manifest_sha256"] = _json_digest({
         "identity_sha256": metadata.get("identity_sha256"),
@@ -533,6 +544,7 @@ def _prepare_production_weight_cache(
             levers=_parse_levers(args.production_cache_levers),
             max_act_rows=int(args.production_cache_max_act_rows),
             cache_dir=cache_dir,
+            h_detail_dir=args.production_cache_h_detail_dir,
         )
         metadata = _attach_production_cache_metadata(cache, expected_metadata)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3329,8 +3341,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="gptq,scale_sweep",
         help=(
             "Comma-separated production cleanup levers for on-the-fly cache "
-            "builds. Default: gptq,scale_sweep; GPTQ damp-sweep follows "
-            "PRISMAQUANT_GPTQ_DAMP_SWEEP and is recorded in cache metadata."
+            "builds. Default: gptq,scale_sweep; add act_clip_solver to "
+            "solve explicit NVFP4 render-time activation clamps and "
+            "fisher_gptq to use h-detail per-token weights when available. "
+            "GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
+            "recorded in cache metadata."
         ),
     )
     parser.add_argument(
@@ -3340,6 +3355,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum activation rows stored per Linear while rendering the "
             "production weight cache."
+        ),
+    )
+    parser.add_argument(
+        "--production-cache-h-detail-dir",
+        default=None,
+        help=(
+            "Optional h-detail directory for on-the-fly production cache "
+            "builds. Used only when fisher_gptq is enabled."
         ),
     )
     parser.add_argument(

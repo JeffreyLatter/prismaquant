@@ -17,6 +17,10 @@ quantization path:
     * calibrated `input_global_scale` per fused-sibling group
       (max_abs(activations) / 6.0; the same value the export persists
       to the artifact)
+    * optional explicit activation-clipping solver for NVFP4 render-time
+      GPTQ + scale_sweep inputs
+    * optional Fisher-weighted local objectives from h-detail
+    * activation-weighted MXFP8 E8M0 scale search when scale_sweep is enabled
 
   KNOWN GAPS (v2 work, NOT implemented):
     * batched NVFP4 GPTQ + scale-sweep across same-shape Linears
@@ -29,10 +33,9 @@ quantization path:
     * any export-only refinements added after this docstring is written
 
   MXFP8/BF16:
-    * MXFP8 is RTN-only by construction in the export.
+    * MXFP8 uses the same activation-weighted scale search as export when
+      activations are available and scale_sweep is enabled; otherwise RTN.
     * BF16 is passthrough.
-    Both produce the same weight under this cache as under
-    `spec.quantize_dequantize`, so they get fast-path passthrough here.
 
 PerturbedActivationCache installs `W_tilde` (and applies the calibrated
 `input_global_scale` on activations) instead of RTN-quantizing on the
@@ -54,8 +57,10 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
+import re
 
 import torch
 import torch.nn as nn
@@ -658,6 +663,466 @@ class _DictActivations:
         return a
 
 
+class _FisherRowWeightCache:
+    """Lazy loader for h-detail `g2_per_token` vectors."""
+
+    _FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
+
+    def __init__(self, h_detail_dir: str | Path | None):
+        self.detail_dir = Path(h_detail_dir) if h_detail_dir else None
+        self._cache: dict[str, torch.Tensor | None] = {}
+        self.loads = 0
+        self.misses = 0
+
+    def get(self, qname: str) -> torch.Tensor | None:
+        if self.detail_dir is None:
+            return None
+        if qname in self._cache:
+            return self._cache[qname]
+        path = self.detail_dir / (self._FNAME_SUB.sub("__", qname) + ".pt")
+        if not path.is_file():
+            self.misses += 1
+            self._cache[qname] = None
+            return None
+        try:
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+            weights = blob.get("g2_per_token") if isinstance(blob, dict) else None
+            if not isinstance(weights, torch.Tensor) or weights.numel() == 0:
+                weights = None
+            else:
+                weights = weights.detach().to(torch.float32).cpu()
+        except Exception:
+            weights = None
+        if weights is None:
+            self.misses += 1
+        else:
+            self.loads += 1
+        self._cache[qname] = weights
+        return weights
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = int(default)
+    return max(lo, min(hi, value))
+
+
+def _env_float(name: str, default: float, *, lo: float, hi: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        value = float(default)
+    return max(lo, min(hi, value))
+
+
+def _activation_output_error(
+    weight: torch.Tensor,
+    rendered: torch.Tensor,
+    activations: torch.Tensor,
+    *,
+    row_chunk: int = 128,
+) -> float:
+    """Score ``rendered`` by output MSE on original, unclipped activations."""
+    rows, cols = weight.shape
+    if rendered.shape != weight.shape or activations.shape[-1] != cols:
+        return float("inf")
+    device = weight.device
+    diff_t = (
+        weight.detach().to(device=device, dtype=torch.float32)
+        - rendered.detach().to(device=device, dtype=torch.float32)
+    ).t().contiguous()
+    X = activations.detach().to(device=device, dtype=torch.float32).reshape(-1, cols)
+    total = 0.0
+    with torch.no_grad():
+        for start in range(0, X.shape[0], row_chunk):
+            y = X[start:start + row_chunk] @ diff_t
+            total += float(y.pow(2).sum().item())
+    return total / max(1, int(X.shape[0]) * int(rows))
+
+
+def _group_activation_bounds(
+    members: Sequence[str],
+    activations: Mapping[str, torch.Tensor],
+) -> tuple[float, float] | None:
+    max_abs = 0.0
+    sq_sum = 0.0
+    count = 0
+    for qname in members:
+        a = activations.get(qname)
+        if a is None or a.numel() == 0:
+            return None
+        af = a.detach().to(torch.float32)
+        max_abs = max(max_abs, float(af.abs().max().item()))
+        sq_sum += float(af.pow(2).sum().item())
+        count += int(af.numel())
+    if count <= 0 or max_abs <= 0.0:
+        return None
+    rms = math.sqrt(max(sq_sum / count, 1e-30))
+    lo = max(max_abs * 1e-4, rms)
+    if not math.isfinite(lo) or not math.isfinite(max_abs) or lo >= max_abs:
+        return None
+    return lo, max_abs
+
+
+def _store_rendered_weight_entry(
+    *,
+    weights: dict[tuple[str, str], object],
+    cache_dir_path: Path | None,
+    qname: str,
+    fmt: str,
+    tensor: torch.Tensor,
+    weight_dtype: torch.dtype,
+) -> None:
+    fmt = fmt.upper()
+    target_dtype = weight_dtype if weight_dtype != torch.float32 else torch.bfloat16
+    stored = tensor.to(target_dtype).cpu()
+    if cache_dir_path is not None:
+        fname = _cache_weight_filename(qname, fmt)
+        final_path = cache_dir_path / fname
+        tmp_path = cache_dir_path / (fname + ".tmp")
+        torch.save(stored, tmp_path)
+        os.replace(tmp_path, final_path)
+        weights[(qname, fmt)] = fname
+        del stored
+    else:
+        weights[(qname, fmt)] = stored
+
+
+def _solve_nvfp4_activation_clip_groups(
+    *,
+    groups: Mapping[str, Sequence[str]],
+    qname_to_module: Mapping[str, nn.Module],
+    activations: Mapping[str, torch.Tensor],
+    levers: Mapping[str, bool],
+    joint_globals: Mapping[str, torch.Tensor],
+    activation_max_abs: Mapping[str, float],
+    fisher_rows: _FisherRowWeightCache | None,
+    weights_out: dict[tuple[str, str], object],
+    cache_dir_path: Path | None,
+    progress: bool,
+) -> tuple[dict[str, float | None], dict[str, object]]:
+    """Solve one scalar render-time activation clamp per fused NVFP4 group.
+
+    The baseline is the existing render path.  Candidate thresholds are
+    optimized in log space, and every candidate is scored against original
+    unclipped activations so the solver cannot win by merely hiding outliers
+    from its evaluator.
+    """
+    max_evals = _env_int(
+        "PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS",
+        6,
+        lo=4,
+        hi=16,
+    )
+    min_gain = 0.0
+    try:
+        min_gain = float(os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN", "0"))
+    except Exception:
+        min_gain = 0.0
+    top_fraction = _env_float(
+        "PRISMAQUANT_ACT_CLIP_SOLVER_TOP_FRACTION",
+        1.0,
+        lo=0.0,
+        hi=1.0,
+    )
+    top_k = _env_int(
+        "PRISMAQUANT_ACT_CLIP_SOLVER_TOP_K",
+        0,
+        lo=0,
+        hi=1_000_000,
+    )
+    verbose = _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE", False)
+    threshold_by_qname: dict[str, float | None] = {}
+    metadata: dict[str, object] = {
+        "enabled": True,
+        "format": "NVFP4",
+        "objective": "output_mse_original_activations",
+        "solver": "log_golden_section",
+        "max_evals": int(max_evals),
+        "min_gain": float(min_gain),
+        "top_fraction": float(top_fraction),
+        "top_k": int(top_k),
+        "groups": {},
+        "selected_by_qname": {},
+        "prewritten_qnames": [],
+    }
+
+    def render_member(qname: str, threshold: float | None) -> torch.Tensor:
+        mod = qname_to_module[qname]
+        max_abs = activation_max_abs.get(qname)
+        export_scale = (
+            6.0 / max_abs
+            if max_abs is not None and max_abs > 0.0
+            else None
+        )
+        return render_production_weight(
+            mod.weight.data,
+            "NVFP4",
+            qname=qname,
+            activations=activations,
+            levers=levers,
+            joint_global_real=joint_globals.get(qname),
+            input_global_scale=export_scale,
+            act_clip_threshold=threshold,
+            fisher_row_weights=(
+                fisher_rows.get(qname) if fisher_rows is not None else None
+            ),
+        )
+
+    group_entries: list[dict[str, object]] = []
+
+    def evaluate_members(
+        members: Sequence[str],
+        threshold: float | None,
+        *,
+        keep_weights: bool = False,
+    ) -> tuple[float, dict[str, torch.Tensor] | None]:
+        score = 0.0
+        kept: dict[str, torch.Tensor] | None = {} if keep_weights else None
+        for qname in members:
+            w_dq = render_member(qname, threshold)
+            score += _activation_output_error(
+                qname_to_module[qname].weight.data,
+                w_dq,
+                activations[qname],
+            )
+            if kept is not None:
+                kept[qname] = w_dq
+            else:
+                del w_dq
+        return score, kept
+
+    baseline_items = list(sorted(groups.items()))
+    for idx, (group_key, raw_members) in enumerate(baseline_items, start=1):
+        members = [
+            q for q in sorted(set(raw_members))
+            if q in qname_to_module and activations.get(q) is not None
+        ]
+        if not members:
+            continue
+        bounds = _group_activation_bounds(members, activations)
+        if bounds is None:
+            continue
+        lo, hi = bounds
+
+        try:
+            baseline_score, _ = evaluate_members(members, None)
+        except Exception as e:
+            metadata["groups"][group_key] = {
+                "members": members,
+                "status": "baseline_failed",
+                "error": str(e),
+            }
+            continue
+        group_entries.append({
+            "group_key": group_key,
+            "members": members,
+            "lo": float(lo),
+            "hi": float(hi),
+            "baseline_score": float(baseline_score),
+        })
+        if progress and (idx % 10 == 0 or idx == len(baseline_items)):
+            print(
+                f"[prod-cache] clip-solver baseline "
+                f"{idx}/{len(baseline_items)} groups",
+                flush=True,
+            )
+
+    ranked = sorted(
+        group_entries,
+        key=lambda item: float(item["baseline_score"]),
+        reverse=True,
+    )
+    keep = len(ranked)
+    if top_fraction < 1.0:
+        keep = min(keep, max(1, math.ceil(len(ranked) * top_fraction)))
+    if top_k > 0:
+        keep = min(keep, top_k)
+    eligible_groups = {
+        str(item["group_key"]) for item in ranked[:keep]
+    }
+    metadata["eligible_groups"] = int(len(eligible_groups))
+    metadata["total_groups"] = int(len(ranked))
+    if progress:
+        print(
+            f"[prod-cache] clip-solver threshold search: "
+            f"{len(eligible_groups)}/{len(ranked)} groups "
+            f"(top_fraction={top_fraction:.3g}, top_k={top_k})",
+            flush=True,
+        )
+
+    eligible_done = 0
+    for item in group_entries:
+        group_key = str(item["group_key"])
+        members = list(item["members"])
+        lo = float(item["lo"])
+        hi = float(item["hi"])
+        baseline_score = float(item["baseline_score"])
+        if group_key not in eligible_groups:
+            for qname in members:
+                threshold_by_qname[qname] = None
+                metadata["selected_by_qname"][qname] = None
+            metadata["groups"][group_key] = {
+                "members": members,
+                "status": "skipped_low_error",
+                "selected": "baseline",
+                "selected_threshold": None,
+                "baseline_score": float(baseline_score),
+                "best_score": float(baseline_score),
+                "relative_gain": 0.0,
+                "lo": float(lo),
+                "hi": float(hi),
+                "n_evals": 0,
+            }
+            continue
+
+        log_lo = math.log(lo)
+        log_hi = math.log(hi)
+        inv_phi = (math.sqrt(5.0) - 1.0) / 2.0
+        cache: dict[float, float] = {}
+        best_candidate_threshold: float | None = None
+        best_candidate_score = float("inf")
+        best_candidate_weights: dict[str, torch.Tensor] | None = None
+
+        def eval_log(log_threshold: float) -> float:
+            nonlocal best_candidate_threshold, best_candidate_score
+            nonlocal best_candidate_weights
+            threshold = float(math.exp(log_threshold))
+            key = round(threshold, 12)
+            if key not in cache:
+                score, cand_weights = evaluate_members(
+                    members,
+                    threshold,
+                    keep_weights=True,
+                )
+                cache[key] = score
+                if score < best_candidate_score:
+                    if best_candidate_weights is not None:
+                        for old in best_candidate_weights.values():
+                            del old
+                    best_candidate_threshold = float(key)
+                    best_candidate_score = float(score)
+                    best_candidate_weights = cand_weights
+                elif cand_weights is not None:
+                    for old in cand_weights.values():
+                        del old
+            return cache[key]
+
+        try:
+            eval_log(log_lo)
+            eval_log(log_hi)
+            a = log_lo
+            b = log_hi
+            c = b - inv_phi * (b - a)
+            d = a + inv_phi * (b - a)
+            fc = eval_log(c)
+            fd = eval_log(d)
+            iterations = 0
+            while len(cache) < max_evals and iterations < max_evals * 4:
+                iterations += 1
+                if fc < fd:
+                    b = d
+                    d = c
+                    fd = fc
+                    c = b - inv_phi * (b - a)
+                    fc = eval_log(c)
+                else:
+                    a = c
+                    c = d
+                    fc = fd
+                    d = a + inv_phi * (b - a)
+                    fd = eval_log(d)
+        except Exception as e:
+            if best_candidate_weights is not None:
+                for old in best_candidate_weights.values():
+                    del old
+                best_candidate_weights = None
+            metadata["groups"][group_key] = {
+                "members": members,
+                "status": "solver_failed",
+                "baseline_score": float(baseline_score),
+                "error": str(e),
+            }
+            for qname in members:
+                threshold_by_qname[qname] = None
+                metadata["selected_by_qname"][qname] = None
+            continue
+
+        best_threshold = best_candidate_threshold
+        best_score = min(float(baseline_score), float(best_candidate_score))
+        denom = max(abs(float(baseline_score)), 1e-30)
+        rel_gain = (float(baseline_score) - float(best_score)) / denom
+        selected = (
+            best_threshold is not None
+            and float(best_candidate_score) < float(baseline_score)
+            and rel_gain >= min_gain
+        )
+        if not selected:
+            best_threshold = None
+            best_score = float(baseline_score)
+            rel_gain = 0.0
+            if best_candidate_weights is not None:
+                for old in best_candidate_weights.values():
+                    del old
+                best_candidate_weights = None
+        for qname in members:
+            threshold_by_qname[qname] = best_threshold
+            metadata["selected_by_qname"][qname] = best_threshold
+        if selected and best_candidate_weights is not None:
+            for qname, tensor in best_candidate_weights.items():
+                _store_rendered_weight_entry(
+                    weights=weights_out,
+                    cache_dir_path=cache_dir_path,
+                    qname=qname,
+                    fmt="NVFP4",
+                    tensor=tensor,
+                    weight_dtype=qname_to_module[qname].weight.dtype,
+                )
+                metadata["prewritten_qnames"].append(qname)
+                del tensor
+            best_candidate_weights.clear()
+            best_candidate_weights = None
+        metadata["groups"][group_key] = {
+            "members": members,
+            "status": "solved",
+            "selected": "solved" if selected else "baseline",
+            "selected_threshold": best_threshold,
+            "baseline_score": float(baseline_score),
+            "best_score": float(best_score),
+            "relative_gain": float(rel_gain),
+            "lo": float(lo),
+            "hi": float(hi),
+            "n_evals": int(len(cache)),
+        }
+        if progress and verbose:
+            print(
+                f"[prod-cache] clip-solver {group_key}: "
+                f"{'solved' if selected else 'baseline'} "
+                f"gain={rel_gain:.4%} threshold={best_threshold}",
+                flush=True,
+            )
+        eligible_done += 1
+        if progress and (
+            eligible_done % 5 == 0 or eligible_done == len(eligible_groups)
+        ):
+            print(
+                f"[prod-cache] clip-solver searched "
+                f"{eligible_done}/{len(eligible_groups)} eligible groups",
+                flush=True,
+            )
+
+    return threshold_by_qname, metadata
+
+
 def render_production_weight(
     weight: torch.Tensor,
     fmt: str,
@@ -667,6 +1132,8 @@ def render_production_weight(
     levers: Mapping[str, bool],
     joint_global_real: torch.Tensor | None = None,
     input_global_scale: float | None = None,
+    act_clip_threshold: float | None = None,
+    fisher_row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute the production-faithful dequantized weight for ``(qname, fmt)``.
 
@@ -681,9 +1148,30 @@ def render_production_weight(
     the export's ``_compute_nvfp4_joint_global``.  When ``None`` the
     per-Linear computed value is used (legacy behavior, only correct for
     isolated Linears with no fused siblings).
+
+    ``act_clip_threshold`` is an optional scalar clamp for activation-aware
+    render passes. ``fisher_row_weights`` optionally weights local objectives
+    by per-token gradient² from h-detail.
     """
     fmt = fmt.upper()
     if fmt != "NVFP4":
+        if (
+            fmt in {"MXFP8", "MXFP8_E4M3"}
+            and bool(levers.get("scale_sweep", True))
+            and qname in activations
+        ):
+            from prismaquant.export_native_compressed import (
+                _mxfp8_scale_sweep_quantize,
+            )
+
+            _, _, w_dq = _mxfp8_scale_sweep_quantize(
+                weight.detach().to(torch.float32),
+                activations[qname],
+                group_size=32,
+                clip_threshold=act_clip_threshold,
+                fisher_row_weights=fisher_row_weights,
+            )
+            return w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
         from prismaquant import format_registry as fr
         spec = fr.get_format(fmt)
         return spec.quantize_dequantize(weight.detach().clone()).to(
@@ -699,6 +1187,8 @@ def render_production_weight(
             linear_name=qname,
             nvfp4_global_real_override=joint_global_real,
             input_global_scale_override=input_global_scale,
+            act_clip_threshold=act_clip_threshold,
+            fisher_row_weights=fisher_row_weights,
             compute_only=True,
         )
     w_dq = result["_w_dq"]
@@ -711,6 +1201,7 @@ def fill_production_weight_cache(
     qnames: Sequence[str],
     *,
     formats: Sequence[str] = ("NVFP4",),
+    render_assignment: Mapping[str, str] | None = None,
     levers: Mapping[str, bool] | None = None,
     max_act_rows: int = 256,
     progress: bool = True,
@@ -720,6 +1211,7 @@ def fill_production_weight_cache(
     recache_profile=None,
     recache_include_activation_quant: bool = True,
     recache_microbatch_size: int = 1,
+    h_detail_dir: str | Path | None = None,
 ) -> ProductionWeightCache:
     """End-to-end fill: collect activations, render production δw per
     (qname, fmt), return a `ProductionWeightCache`.
@@ -727,10 +1219,14 @@ def fill_production_weight_cache(
     Args:
       model: live HF model on the export device.
       calib_ids: ``[N, T]`` token id tensor for activation collection.
-      qnames: which Linears to render (skips MoE packed experts; handle
-        those separately via `_quantize_3d_packed` extensions).
-      formats: which formats to pre-render.  MXFP8/BF16 are RTN-equivalent
-        so we still cache them so the lookup is uniform.
+      qnames: which Linears are eligible to render (skips MoE packed
+        experts; handle those separately via `_quantize_3d_packed`
+        extensions).
+      formats: which formats to pre-render when `render_assignment` is not
+        supplied.
+      render_assignment: optional concrete export assignment. When supplied,
+        render exactly the non-BF16 `(qname, fmt)` entries used by that
+        assignment instead of the full `qnames x formats` menu.
       levers: which production levers to enable (default: gptq+scale_sweep).
       recache_pass: when True, run a second calibration forward with the
         concrete production assignment installed from this cache and refit
@@ -738,6 +1234,9 @@ def fill_production_weight_cache(
       recache_assignment: required when ``recache_pass`` is True.  Candidate
         caches with multiple possible formats per Linear are ambiguous; recache
         needs the actual export assignment.
+      h_detail_dir: optional probe h-detail directory. When `fisher_gptq` is
+        enabled, per-token `g2_per_token` vectors from this directory weight
+        NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives.
     """
     if recache_pass and not recache_assignment:
         raise ValueError(
@@ -754,13 +1253,69 @@ def fill_production_weight_cache(
     levers.setdefault("scale_sweep", True)
     levers.setdefault("awq", False)
     levers.setdefault("awq_round", False)
+    levers.setdefault(
+        "act_clip_solver",
+        _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER", False),
+    )
+    levers.setdefault(
+        "fisher_gptq",
+        _env_flag("PRISMAQUANT_FISHER_WEIGHTED_GPTQ", False),
+    )
 
-    qname_set = set(qnames)
+    from prismaquant import format_registry as fr
+
+    def _canon(fmt: str) -> str:
+        return fr.canonical_format_name(str(fmt).strip().upper())
+
+    requested_formats = tuple(
+        dict.fromkeys(_canon(f) for f in formats if str(f).strip())
+    )
+    eligible_qnames = set(qnames)
+    if render_assignment is not None:
+        render_formats_by_qname: dict[str, tuple[str, ...]] = {}
+        for qname, fmt in render_assignment.items():
+            q = str(qname)
+            if q not in eligible_qnames:
+                continue
+            fmt_canon = _canon(fmt)
+            if fmt_canon == "BF16":
+                continue
+            render_formats_by_qname[q] = (fmt_canon,)
+        qname_set = set(render_formats_by_qname)
+        render_scope = "assignment"
+    else:
+        non_bf16_formats = tuple(
+            f for f in requested_formats if f != "BF16"
+        )
+        render_formats_by_qname = {
+            q: non_bf16_formats for q in eligible_qnames
+        }
+        qname_set = {
+            q for q, fmts in render_formats_by_qname.items() if fmts
+        }
+        render_scope = "format-menu"
+
     if not qname_set:
-        return ProductionWeightCache(weights={}, levers=dict(levers))
+        return ProductionWeightCache(
+            weights={},
+            levers=dict(levers),
+            metadata={
+                "render_scope": render_scope,
+                "requested_formats": list(requested_formats),
+                "requested_entries": 0,
+            },
+        )
 
     if progress:
+        requested_entries = sum(
+            len(fmts) for fmts in render_formats_by_qname.values()
+        )
         print(f"[prod-cache] levers={dict(sorted(levers.items()))}", flush=True)
+        print(
+            f"[prod-cache] render_scope={render_scope} "
+            f"qnames={len(qname_set)} entries={requested_entries}",
+            flush=True,
+        )
 
     # RESUME: when disk-streaming is on and prior shards exist, only
     # collect activations for Linears whose shards we still need to
@@ -772,18 +1327,24 @@ def fill_production_weight_cache(
         cache_dir_path = Path(cache_dir)
         cache_dir_path.mkdir(parents=True, exist_ok=True)
 
-    fmt_set = {f.upper() for f in formats}
+    fmt_set = {
+        fmt
+        for fmts in render_formats_by_qname.values()
+        for fmt in fmts
+    }
     activation_aware_formats = {"NVFP4"}
+    if bool(levers.get("scale_sweep", True)):
+        activation_aware_formats.update({"MXFP8", "MXFP8_E4M3"})
     qnames_to_render: set[str] = set(qname_set)
     missing_formats_by_qname: dict[str, set[str]] = {
-        q: set(fmt_set) for q in qname_set
+        q: set(render_formats_by_qname.get(q, ())) for q in qname_set
     }
     if cache_dir_path is not None:
         # A qname is FULLY done if every requested format has a shard.
         prerendered = 0
         for q in list(qname_set):
             missing = {
-                f for f in fmt_set
+                f for f in render_formats_by_qname.get(q, ())
                 if not (cache_dir_path / _cache_weight_filename(q, f)).is_file()
             }
             missing_formats_by_qname[q] = missing
@@ -875,12 +1436,32 @@ def fill_production_weight_cache(
         if qname in qname_set:
             qname_to_module[qname] = mod
 
+    fisher_rows = (
+        _FisherRowWeightCache(h_detail_dir)
+        if bool(levers.get("fisher_gptq", False)) and h_detail_dir
+        else None
+    )
+    if progress and bool(levers.get("fisher_gptq", False)):
+        if fisher_rows is None:
+            print(
+                "[prod-cache] fisher_gptq requested but no h_detail_dir "
+                "was provided; falling back to unweighted objectives",
+                flush=True,
+            )
+        else:
+            print(
+                f"[prod-cache] fisher_gptq using h-detail dir "
+                f"{fisher_rows.detail_dir}",
+                flush=True,
+            )
+
     # HIGH-1: compute joint NVFP4 fused-sibling globals so q/k/v share a
     # per-tensor scale (and gate/up likewise), matching the export's
     # `_compute_nvfp4_joint_global` behavior.  Without this each sibling
     # gets its own scale and vLLM's loader either rejects the artifact or
     # silently runs with degraded accuracy.
     joint_globals: dict[str, torch.Tensor] = {}
+    profile = None
     needs_nvfp4_render = any(
         "NVFP4" in missing
         for missing in missing_formats_by_qname.values()
@@ -988,9 +1569,55 @@ def fill_production_weight_cache(
             import json as _json
             sidecar_path.write_text(_json.dumps(activation_max_abs, indent=2))
 
-    n = len(qname_to_module) * len(formats)
+    solved_nvfp4_thresholds: dict[str, float | None] = {}
+    clip_solver_metadata: dict[str, object] = {
+        "enabled": bool(levers.get("act_clip_solver", False)),
+        "format": "NVFP4",
+        "status": "disabled",
+    }
+    if bool(levers.get("act_clip_solver", False)) and needs_nvfp4_render:
+        from prismaquant.decision_units import fused_group_key
+
+        solver_groups: dict[str, list[str]] = {}
+        for qname, missing in missing_formats_by_qname.items():
+            if "NVFP4" not in missing:
+                continue
+            if qname not in qname_to_module or qname not in activations:
+                continue
+            try:
+                group_key = fused_group_key(profile, qname) if profile else qname
+            except Exception:
+                group_key = qname
+            solver_groups.setdefault(group_key, []).append(qname)
+        if solver_groups:
+            if progress:
+                print(
+                    f"[prod-cache] solving NVFP4 activation clip for "
+                    f"{len(solver_groups)} fused groups",
+                    flush=True,
+                )
+            solved_nvfp4_thresholds, clip_solver_metadata = (
+                _solve_nvfp4_activation_clip_groups(
+                    groups=solver_groups,
+                    qname_to_module=qname_to_module,
+                    activations=activations,
+                    levers=levers,
+                    joint_globals=joint_globals,
+                    activation_max_abs=activation_max_abs,
+                    fisher_rows=fisher_rows,
+                    weights_out=weights,
+                    cache_dir_path=cache_dir_path,
+                    progress=progress,
+                )
+            )
+            clip_solver_metadata["status"] = "applied"
+        else:
+            clip_solver_metadata["status"] = "no_eligible_groups"
+
+    n = sum(len(render_formats_by_qname.get(q, ())) for q in qname_to_module)
     done = 0
     skipped_resumed = 0
+    skipped_prewritten = 0
     # MEM: free per-Linear activation tensors after each render so peak
     # memory stays bounded.  On 27B, 497 Linears × ~10K in_features × 512
     # rows × fp32 = ~10 GB just for activations.  Freeing in-loop drops
@@ -1007,7 +1634,14 @@ def fill_production_weight_cache(
         # we pass the correct convention so the metadata is honest in
         # case future code consumes it.
         export_scale = (6.0 / max_abs) if (max_abs is not None and max_abs > 0) else None
-        for fmt in formats:
+        for fmt in render_formats_by_qname.get(qname, ()):
+            key = (qname, fmt.upper())
+            if key in weights:
+                skipped_prewritten += 1
+                done += 1
+                if progress and done % 25 == 0:
+                    print(f"[prod-cache] {done}/{n}", flush=True)
+                continue
             # RESUME: in disk-streaming mode, if a shard already exists
             # for (qname, fmt) on disk, treat it as previously rendered
             # and skip re-rendering.  This lets a job that OOM'd at 95%
@@ -1033,6 +1667,13 @@ def fill_production_weight_cache(
                     levers=levers,
                     joint_global_real=joint,
                     input_global_scale=export_scale,
+                    act_clip_threshold=(
+                        solved_nvfp4_thresholds.get(qname)
+                        if fmt.upper() == "NVFP4" else None
+                    ),
+                    fisher_row_weights=(
+                        fisher_rows.get(qname) if fisher_rows is not None else None
+                    ),
                 )
             except Exception as e:
                 failed[(qname, fmt.upper())] = str(e)
@@ -1047,26 +1688,14 @@ def fill_production_weight_cache(
             # fp32 but we always re-cast at install time, so storing fp32
             # is wasteful (2× memory).  On 27B this drops the cache from
             # ~25 GB to ~12 GB.
-            target_dtype = weight.dtype if weight.dtype != torch.float32 else torch.bfloat16
-            tensor = w_dq.to(target_dtype).cpu()
-            if cache_dir_path is not None:
-                # Disk-streaming mode: save to per-Linear .pt and store
-                # only the relative filename in the cache.  Peak memory
-                # during fill is bounded by the largest single render.
-                # Atomic via tmp + rename: if the process is killed
-                # mid-write, resume sees no .pt at all (and re-renders)
-                # rather than a corrupt one (which would deserialize-
-                # crash later).
-                fname = _cache_weight_filename(qname, fmt.upper())
-                final_path = cache_dir_path / fname
-                tmp_path = cache_dir_path / (fname + ".tmp")
-                torch.save(tensor, tmp_path)
-                import os as _os
-                _os.replace(tmp_path, final_path)
-                weights[(qname, fmt.upper())] = fname
-                del tensor
-            else:
-                weights[(qname, fmt.upper())] = tensor
+            _store_rendered_weight_entry(
+                weights=weights,
+                cache_dir_path=cache_dir_path,
+                qname=qname,
+                fmt=fmt,
+                tensor=w_dq,
+                weight_dtype=weight.dtype,
+            )
             done += 1
             del w_dq
             if progress and done % 25 == 0:
@@ -1085,7 +1714,9 @@ def fill_production_weight_cache(
     if progress:
         print(
             f"[prod-cache] rendered {len(weights)} (qname, fmt) entries "
-            f"({skipped_resumed} resumed from disk); {len(failed)} failures",
+            f"({skipped_resumed} resumed from disk, "
+            f"{skipped_prewritten} prewritten by solver); "
+            f"{len(failed)} failures",
             flush=True,
         )
     cache = ProductionWeightCache(
@@ -1094,6 +1725,18 @@ def fill_production_weight_cache(
         activation_max_abs=activation_max_abs or None,
         failed=failed,
         cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
+        metadata={
+            "activation_clip_solver": clip_solver_metadata,
+            "fisher_weighted_gptq": {
+                "enabled": bool(levers.get("fisher_gptq", False)),
+                "h_detail_dir": str(h_detail_dir) if h_detail_dir else None,
+                "loaded": int(fisher_rows.loads) if fisher_rows is not None else 0,
+                "misses": int(fisher_rows.misses) if fisher_rows is not None else 0,
+            },
+            "render_scope": render_scope,
+            "requested_formats": list(requested_formats),
+            "requested_entries": int(n),
+        },
     )
     if recache_pass:
         from prismaquant.production_recache import recache_production_weight_cache
