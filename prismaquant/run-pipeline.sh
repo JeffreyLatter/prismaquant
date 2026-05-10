@@ -91,7 +91,8 @@ set -euo pipefail
 : "${PRODUCTION_CACHE:=1}"
 : "${PRODUCTION_RECACHE:=1}"
 : "${PRODUCTION_CACHE_MAX_ACT_ROWS:=512}"
-: "${PRODUCTION_CACHE_LRU_GB:=24.0}"
+: "${PRODUCTION_CACHE_LRU_GB:=64.0}"
+: "${PRODUCTION_CACHE_PREFETCH:=require}"
 : "${PRODUCTION_CACHE_PREFETCH_WORKERS:=4}"
 : "${PRODUCTION_RECACHE_MICROBATCH:=1}"
 : "${PRODUCTION_CACHE_FORMATS:=auto}"
@@ -113,6 +114,7 @@ echo "  MTP_FORMAT=$MTP_FORMAT"
 echo "  CALIBRATION_MODALITY=$CALIBRATION_MODALITY  MM_DATASET=$MM_DATASET"
 echo "  PRODUCTION_CACHE=$PRODUCTION_CACHE PRODUCTION_RECACHE=$PRODUCTION_RECACHE"
 echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
+echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo
 
 # -----------------------------------------------------------------------
@@ -285,6 +287,8 @@ PY
           --dtype bf16 \
           --device "$DEVICE" \
           --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
+          --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
+          --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
           --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
           2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
       fi

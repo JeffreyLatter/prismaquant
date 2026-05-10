@@ -101,10 +101,33 @@ Logs:
 - Replay: `/home/rob/dq-runs/qwen36-27b-recache-smoke-20260509T235955Z/production_recache_compact.log`
 - Delta JSON: `/home/rob/dq-runs/qwen36-27b-recache-smoke-20260509T235955Z/recache_delta_summary.json`
 
-An attempted `n=8`, `seqlen=256` replay against the same 91G disk-backed
-cache was stopped because it became NVMe-bound: about 1.3GB/s read throughput
-and low GPU utilization. Do not use that path for final 27B attribution unless
-the rendered cache can stay resident enough to make the replay GPU-bound.
+An initial `n=8`, `seqlen=256` replay against the same 91G disk-backed cache
+was stopped because it became NVMe-bound: about 1.3GB/s read throughput and
+low GPU utilization. The rerun used assignment-required cache prefetch with
+`--production-cache-prefetch require`, `--production-cache-lru-gb 64`, and
+8 preload workers.
+
+Prefetch-required rerun:
+
+`/home/rob/dq-runs/qwen36-27b-recache-prefetch-n8s256-20260510T001700Z`
+
+Result:
+
+- Preloaded `422` assignment-required rendered weights, `45.32 GiB`, before
+  replay.
+- Replay observed GPU utilization in the `51-75%` range and no NVMe hot-path
+  traffic after preload.
+- Production-weight replay measured `497` activation ranges in `68.5` seconds.
+- Activation range movement versus the source cache: median after/before
+  max-abs ratio `0.9924`, p05 `0.4225`, max `1.8203`, and `198/496` common
+  ranges moved by more than 5%.
+- The recached manifest compacted back to path references before pickle:
+  `110940` bytes, `992` weight entries, `0` resident tensors.
+
+Logs:
+
+- Replay: `/home/rob/dq-runs/qwen36-27b-recache-prefetch-n8s256-20260510T001700Z/production_recache.log`
+- Delta JSON: `/home/rob/dq-runs/qwen36-27b-recache-prefetch-n8s256-20260510T001700Z/recache_delta_summary.json`
 
 ## Notes
 
@@ -115,6 +138,9 @@ the rendered cache can stay resident enough to make the replay GPU-bound.
   vLLM expects the model field absent/null so it can use the embedded-MTP path.
 - `run-pipeline.sh` now defaults `PRODUCTION_RECACHE=1`. Use
   `PRODUCTION_RECACHE=0` for explicit no-recache ablations.
+- `run-pipeline.sh` defaults production recache prefetch to fail-fast
+  residency mode: `PRODUCTION_CACHE_PREFETCH=require` and
+  `PRODUCTION_CACHE_LRU_GB=64.0`.
 - Disk-backed `ProductionWeightCache` manifests now compact resident tensors
   back to path references before pickle; this prevents re-cache replay from
   turning a small manifest into a multi-GB tensor pickle.

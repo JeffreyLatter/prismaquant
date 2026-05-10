@@ -27,6 +27,19 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 |---|---|---|
 | `PRISMAQUANT_BATCHED_NVFP4_EXPORT` | **on** (when act-aware passes fire and an activation cache is supplied) | Routes NVFP4 same-shape Linears through the batched GPTQ + scale_sweep path (`export_batched_gptq.py`). Stacks per-layer experts into `(E, out, in)` tensors and runs Cholesky / column update batched across E. ~5-10% faster on MiniMax, more on bigger MoE models. |
 
+## Pipeline production-cache flags
+
+These are `run-pipeline.sh` environment variables rather than
+`PRISMAQUANT_*` flags.
+
+| env var | default | what it does |
+|---|---|---|
+| `PRODUCTION_CACHE` | `1` | Build and use a `ProductionWeightCache` so export packs the same rendered weights that KL/polish measured. |
+| `PRODUCTION_RECACHE` | `1` | Replay calibration with production weights installed and re-fit `activation_max_abs` before export. |
+| `PRODUCTION_CACHE_LRU_GB` | `64.0` | Resident tensor budget for disk-backed production-cache use in recache and export. The 27B n=8 recache smoke needed `45.32 GiB` for the selected assignment. |
+| `PRODUCTION_CACHE_PREFETCH` | `require` | Standalone recache prefetch policy. `require` fails fast when assignment-required weights cannot fit resident, preventing silent NVMe-bound replay. |
+| `PRODUCTION_CACHE_PREFETCH_WORKERS` | `4` | Thread count for eager production-cache prefetch. |
+
 ## CUDA / system flags
 
 | env var | recommended | what it does |

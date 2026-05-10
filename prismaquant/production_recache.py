@@ -64,6 +64,9 @@ def production_cache_keys_for_assignment(
     assignment: Mapping[str, str],
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Return concrete non-BF16 cache keys and missing assignment entries."""
+    if hasattr(production_weight_cache, "assignment_keys"):
+        return production_weight_cache.assignment_keys(assignment)
+
     keys: list[tuple[str, str]] = []
     missing: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -100,6 +103,16 @@ def preload_production_cache_for_assignment(
     selected assignment cannot fit inside the resident cache budget, ``require``
     turns that into a hard failure instead of silently streaming from NVMe.
     """
+    if hasattr(production_weight_cache, "prefetch_assignment"):
+        return production_weight_cache.prefetch_assignment(
+            assignment,
+            max_resident_bytes=max_resident_bytes,
+            max_workers=max_workers,
+            require=require,
+            progress=progress,
+            log_prefix="[prod-recache]",
+        )
+
     keys, missing = production_cache_keys_for_assignment(
         production_weight_cache,
         assignment,
@@ -463,7 +476,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--production-weight-cache", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache-dir-override", default=None)
-    parser.add_argument("--production-cache-lru-gb", type=float, default=24.0)
+    parser.add_argument("--production-cache-lru-gb", type=float, default=64.0)
     parser.add_argument(
         "--dataset",
         default="/home/rob/dq-runs/calibration/diverse-v1.jsonl",
@@ -478,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--production-cache-prefetch",
         choices=("auto", "off", "require"),
-        default="auto",
+        default="require",
         help="Preload assignment-required rendered weights before replay. "
              "'auto' preloads only when they fit the LRU/resident budget; "
              "'require' fails instead of allowing an NVMe-bound replay.",

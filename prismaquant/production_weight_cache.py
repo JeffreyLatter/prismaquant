@@ -214,6 +214,104 @@ class ProductionWeightCache:
                 total += Path(self._path_for_value(value)).stat().st_size
         return total
 
+    def assignment_keys(
+        self,
+        assignment: Mapping[str, str],
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """Return concrete non-BF16 cache keys needed by an assignment.
+
+        This centralizes recipe alias handling for recache, polish, KL
+        probes, and export: callers should ask the cache which stored key a
+        recipe entry maps to, then feed those keys into ``prefetch``.
+        """
+        from prismaquant import format_registry as fr
+
+        keys: list[tuple[str, str]] = []
+        missing: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for qname, fmt in assignment.items():
+            fmt_canon = fr.canonical_format_name(str(fmt))
+            if fmt_canon == "BF16":
+                continue
+            key = self.resolve_key(str(qname), fmt_canon)
+            if key is None:
+                missing.append((str(qname), fmt_canon))
+                continue
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
+        return keys, missing
+
+    def prefetch_assignment(
+        self,
+        assignment: Mapping[str, str],
+        *,
+        max_resident_bytes: int | None = None,
+        max_workers: int = 4,
+        require: bool = False,
+        progress: bool = False,
+        log_prefix: str = "[prod-cache]",
+    ) -> dict[str, object]:
+        """Prefetch rendered weights required by a concrete assignment.
+
+        ``require`` converts missing entries or resident-budget overflow into
+        a hard failure.  That is the production-safe mode for GPU-bound
+        recache/export runs because it prevents accidental NVMe streaming.
+        """
+        keys, missing = self.assignment_keys(assignment)
+        nbytes = self.estimate_nbytes(keys)
+        budget = (
+            int(max_resident_bytes)
+            if max_resident_bytes is not None and int(max_resident_bytes) > 0
+            else None
+        )
+        stats: dict[str, object] = {
+            "keys": len(keys),
+            "missing": len(missing),
+            "bytes": int(nbytes),
+            "budget_bytes": int(budget or 0),
+            "loaded": 0,
+            "skipped": False,
+        }
+        if missing:
+            stats["missing_sample"] = missing[:8]
+            msg = (
+                f"production cache missing {len(missing)} assignment entries; "
+                f"sample={missing[:8]}"
+            )
+            if require:
+                raise RuntimeError(msg)
+            if progress:
+                print(f"{log_prefix} WARNING: {msg}", flush=True)
+        if budget is not None and nbytes > budget:
+            stats["skipped"] = True
+            msg = (
+                "production cache preload would exceed resident budget: "
+                f"{nbytes / 1024**3:.2f} GiB needed, "
+                f"{budget / 1024**3:.2f} GiB budget"
+            )
+            if require:
+                raise RuntimeError(msg)
+            if progress:
+                print(f"{log_prefix} WARNING: {msg}; skipping preload", flush=True)
+            return stats
+
+        if progress:
+            print(
+                f"{log_prefix} preloading production cache: "
+                f"{len(keys)} entries, {nbytes / 1024**3:.2f} GiB",
+                flush=True,
+            )
+        loaded = self.prefetch(keys, max_workers=max_workers)
+        stats["loaded"] = int(loaded)
+        if progress:
+            print(
+                f"{log_prefix} preloaded {loaded}/{len(keys)} production "
+                "cache entries",
+                flush=True,
+            )
+        return stats
+
     def _record_lru_load(
         self,
         key: tuple[str, str],
@@ -994,15 +1092,11 @@ def fill_production_weight_cache(
         cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
     )
     if recache_pass:
-        from prismaquant.production_recache import (
-            preload_production_cache_for_assignment,
-            recache_production_weight_cache,
-        )
+        from prismaquant.production_recache import recache_production_weight_cache
 
         if progress:
             print("[prod-cache] running production activation re-cache", flush=True)
-        preload_production_cache_for_assignment(
-            cache,
+        cache.prefetch_assignment(
             recache_assignment or {},
             max_resident_bytes=(
                 cache._lru_max_bytes if cache._lru_max_bytes > 0 else None

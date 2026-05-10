@@ -75,12 +75,14 @@ def test_recache_preload_respects_resident_budget(tmp_path):
     )
     assignment = {"a": "NVFP4", "b": "MXFP8", "c": "BF16"}
     keys, missing = production_cache_keys_for_assignment(cache, assignment)
+    method_keys, method_missing = cache.assignment_keys(assignment)
 
     assert keys == [("a", "NVFP4"), ("b", "MXFP8_E4M3")]
     assert missing == []
+    assert method_keys == keys
+    assert method_missing == []
 
-    stats = preload_production_cache_for_assignment(
-        cache,
+    stats = cache.prefetch_assignment(
         assignment,
         max_resident_bytes=1,
         require=False,
