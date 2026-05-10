@@ -1,0 +1,108 @@
+"""Shared layer-config parsing helpers.
+
+PrismaQuant writes allocator assignments in a few shapes: shorthand strings,
+integer bit widths, and AutoRound-style dictionaries. Keep the production
+parser in one place so export, recache, KL validation, and small tools cannot
+silently disagree about the same recipe.
+"""
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+
+from prismaquant.schemas import validate_layer_config_payload
+
+
+def strip_weight(name: str) -> str:
+    """Normalize tensor names to module qnames."""
+    return name[:-len(".weight")] if name.endswith(".weight") else name
+
+
+def canonicalize_format(entry: dict | str | int) -> str:
+    """Map a layer-config entry to an export/runtime format name.
+
+    E5M2 registry entries are intentionally still rejected here: they are
+    useful for research probing but not yet validated on the vLLM
+    compressed-tensors weight path.
+    """
+    if isinstance(entry, dict):
+        dt = entry.get("data_type")
+        bits = int(entry.get("bits", 0))
+        if dt == "nv_fp" and bits == 4:
+            return "NVFP4"
+        if dt == "mx_fp" and bits == 4:
+            return "MXFP4"
+        if dt == "mx_fp" and bits == 8:
+            elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
+            if elt == "fp8_e5m2":
+                raise ValueError(
+                    "MXFP8_E5M2 is registered for research probing but is not "
+                    "exportable on the vLLM compressed-tensors weight path"
+                )
+            return "MXFP8"
+        if dt in ("float", "bfloat16") and bits in (16, 0):
+            return "BF16"
+        if dt == "fp8_e4m3" and bits == 8:
+            group_size = int(entry.get("group_size", 0))
+            if group_size == 128:
+                return "FP8_SOURCE"
+            if group_size == 32:
+                return "MXFP8"
+            if group_size in (0, -1):
+                return "FP8_E4M3"
+            return "MXFP8"
+        if dt == "fp8_e5m2" and bits == 8:
+            raise ValueError(
+                "FP8_E5M2 is registered for research probing but is not "
+                "exportable on the vLLM compressed-tensors weight path"
+            )
+        if dt == "mx_fp" and bits == 6:
+            elt = str(entry.get("weight_element_dtype", "fp6_e3m2")).lower()
+            if elt == "fp6_e2m3":
+                return "MXFP6_E2M3"
+            return "MXFP6_E3M2"
+        if dt == "fp6_e3m2" and bits == 6:
+            return "MXFP6_E3M2"
+        if dt == "fp6_e2m3" and bits == 6:
+            return "MXFP6_E2M3"
+        raise ValueError(f"unsupported scheme: {entry!r}")
+    if isinstance(entry, str):
+        value = entry.lower()
+        if value in ("nvfp4", "fp4", "4"):
+            return "NVFP4"
+        if value in ("mxfp4", "mx_fp4"):
+            return "MXFP4"
+        if value in ("mxfp8", "mxfp8_e4m3", "8"):
+            return "MXFP8"
+        if value in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
+            return "FP8_E4M3"
+        if value in ("mxfp8_e5m2", "fp8_e5m2"):
+            raise ValueError(
+                "E5M2 FP8 formats are registered for research probing but "
+                "are not exportable on the vLLM compressed-tensors weight path"
+            )
+        if value in ("bf16", "bfloat16", "16"):
+            return "BF16"
+        raise ValueError(f"unsupported format string: {entry!r}")
+    if isinstance(entry, int):
+        if entry <= 4:
+            return "NVFP4"
+        if entry <= 8:
+            return "MXFP8"
+        return "BF16"
+    raise ValueError(f"unsupported scheme: {entry!r}")
+
+
+def canonicalize_assignment(raw: Mapping) -> dict[str, str]:
+    return {
+        strip_weight(str(name)): canonicalize_format(entry)
+        for name, entry in raw.items()
+    }
+
+
+def load_assignment(path: str | Path) -> dict[str, str]:
+    path = Path(path)
+    payload = json.loads(path.read_text())
+    validate_layer_config_payload(payload, str(path))
+    return canonicalize_assignment(payload)

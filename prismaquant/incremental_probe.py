@@ -32,6 +32,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from prismaquant.incremental_shards import (
+    annotate_incremental_shard as annotate_probe_shard,
+    read_pickle as _read_pickle,
+)
+
 # Must be set before the cuda allocator initializes. On Spark's UMA,
 # cuda and cpu share one LPDDR5X pool; without `expandable_segments`
 # the caching allocator hoards freed blocks, causing the OS to swap
@@ -681,11 +686,6 @@ def _route_stats_from_counts(
     return out
 
 
-def _read_pickle(path: Path) -> Any:
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
 def _expected_probe_shard_meta(args, *,
                                linear_include: str,
                                shard_idx: int,
@@ -727,17 +727,6 @@ def probe_shard_is_reusable(path: Path, expected_meta: dict[str, Any]) -> bool:
         if probe_meta.get(key) != expected:
             return False
     return True
-
-
-def annotate_probe_shard(path: Path, extra_meta: dict[str, Any]) -> None:
-    data = _read_pickle(path)
-    meta = dict(data.get("meta", {}))
-    inc = dict(meta.get("incremental_shard", {}))
-    inc.update(extra_meta)
-    meta["incremental_shard"] = inc
-    data["meta"] = meta
-    with open(path, "wb") as f:
-        pickle.dump(data, f)
 
 
 # Fields whose equality makes two shards' per-Linear Fisher stats

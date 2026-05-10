@@ -19,6 +19,26 @@ _NOCLONE_OVERRIDE_FRAGMENT = (
 )
 
 
+def test_env_truthy_preserves_strict_truthy_semantics(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_TEST_FLAG", raising=False)
+    assert mm.env_truthy("PRISMAQUANT_TEST_FLAG") is False
+    assert mm.env_truthy("PRISMAQUANT_TEST_FLAG", default=True) is True
+
+    for value in ("1", "true", "YES", "on"):
+        monkeypatch.setenv("PRISMAQUANT_TEST_FLAG", value)
+        assert mm.env_truthy("PRISMAQUANT_TEST_FLAG") is True
+
+    for value in ("0", "false", "no", "off", "maybe", ""):
+        monkeypatch.setenv("PRISMAQUANT_TEST_FLAG", value)
+        assert mm.env_truthy("PRISMAQUANT_TEST_FLAG") is False
+
+
+def test_model_device_ignores_meta_parameters():
+    model = nn.Sequential(nn.Linear(2, 2, device="meta"), nn.Linear(2, 2))
+
+    assert mm.model_device(model) == torch.device("cpu")
+
+
 class _ManyLinear(nn.Module):
     def __init__(self, count: int):
         super().__init__()

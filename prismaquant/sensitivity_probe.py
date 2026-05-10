@@ -1030,7 +1030,7 @@ class FisherAccumulator:
         # Per-token squared gradient norm: ‖∇W_t‖²_F = ‖gy_t‖²·‖x_t‖² as a
         # scalar per (Linear, token). Stored as a list of per-chunk CPU
         # vectors during the hook; concatenated at finalize() and saved to
-        # h_detail so local_reconstruct can build the literally-correct
+        # h_detail so research reconstruction tools can build the
         # Fisher-weighted GPTQ Hessian H = X^T diag(g²_t) X. Storage cost
         # is ~4 GB total at 32k tokens × 33k Linears × 4 bytes.
         self._per_token_grad_norm: dict[str, list[torch.Tensor]] = {}
@@ -1438,8 +1438,9 @@ class FisherAccumulator:
                 gpu_w2.add_(w2_contrib)
             # --- Per-token grad-norm² (Task #36, DeepSeek's correct form) ---
             # Stored as a list of per-chunk vectors; flushed to disk at
-            # finalize() into h_detail so local_reconstruct can build the
-            # truly Fisher-weighted GPTQ Hessian H = X^T diag(g²_t) X.
+            # finalize() into h_detail so archived/research reconstruction
+            # tools can build the truly Fisher-weighted GPTQ Hessian
+            # H = X^T diag(g²_t) X.
             ptl = self._per_token_grad_norm.setdefault(name, [])
             ptl.append(per_token_grad_norm_sq.detach().cpu())
             self.stats[name]["n_tokens_seen"] += T
@@ -1520,8 +1521,8 @@ class FisherAccumulator:
                     h = acc.to(torch.float32).cpu() / tokens
                 # Per-token gradient² (g²_t) — concatenate the chunk vectors
                 # collected during the hook. This is the per-token Fisher
-                # weight, used by local_reconstruct's Fisher-weighted GPTQ
-                # Hessian: H = X^T diag(g²_t) X.
+                # weight, used by archived/research Fisher-weighted GPTQ
+                # reconstruction tools: H = X^T diag(g²_t) X.
                 ptl = self._per_token_grad_norm.get(name, [])
                 g2_per_token = (torch.cat(ptl, dim=0) if ptl
                                 else torch.empty(0, dtype=torch.float32))

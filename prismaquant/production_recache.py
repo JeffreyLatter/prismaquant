@@ -22,18 +22,13 @@ import torch.nn as nn
 
 from prismaquant import format_registry as fr
 from prismaquant.decision_units import fused_group_key
+from prismaquant.layer_config import load_assignment as _load_assignment
+from prismaquant.memory_management import model_device as _model_device
 from prismaquant.perturbed_x_cache import (
     PerturbedActivationCache,
     calibration_data_hash,
     iter_calibration_forwards,
 )
-
-
-def _model_device(model: nn.Module) -> torch.device:
-    for p in model.parameters():
-        if not p.is_meta:
-            return p.device
-    return torch.device("cpu")
 
 
 def _unify_fused_max_abs(
@@ -391,79 +386,6 @@ def recache_production_weight_cache(
                     flush=True,
                 )
     return max_abs
-
-
-def _strip_weight(name: str) -> str:
-    return name[:-7] if name.endswith(".weight") else name
-
-
-def _canonicalize_layer_format(entry: dict | str | int) -> str:
-    if isinstance(entry, dict):
-        dt = entry.get("data_type")
-        bits = int(entry.get("bits", 0))
-        if dt == "nv_fp" and bits == 4:
-            return "NVFP4"
-        if dt == "mx_fp" and bits == 4:
-            return "MXFP4"
-        if dt == "mx_fp" and bits == 8:
-            elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
-            if elt == "fp8_e5m2":
-                raise ValueError("MXFP8_E5M2 is not exportable on the vLLM path")
-            return "MXFP8"
-        if dt in ("float", "bfloat16") and bits in (16, 0):
-            return "BF16"
-        if dt == "fp8_e4m3" and bits == 8:
-            group_size = int(entry.get("group_size", 0))
-            if group_size == 128:
-                return "FP8_SOURCE"
-            if group_size == 32:
-                return "MXFP8"
-            if group_size in (0, -1):
-                return "FP8_E4M3"
-            return "MXFP8"
-        if dt == "fp8_e5m2" and bits == 8:
-            raise ValueError("FP8_E5M2 is not exportable on the vLLM path")
-        if dt == "mx_fp" and bits == 6:
-            elt = str(entry.get("weight_element_dtype", "fp6_e3m2")).lower()
-            return "MXFP6_E2M3" if elt == "fp6_e2m3" else "MXFP6_E3M2"
-        if dt == "fp6_e3m2" and bits == 6:
-            return "MXFP6_E3M2"
-        if dt == "fp6_e2m3" and bits == 6:
-            return "MXFP6_E2M3"
-        raise ValueError(f"unsupported layer-config entry: {entry!r}")
-    if isinstance(entry, str):
-        value = entry.lower()
-        if value in ("nvfp4", "fp4", "4"):
-            return "NVFP4"
-        if value in ("mxfp4", "mx_fp4"):
-            return "MXFP4"
-        if value in ("mxfp8", "mxfp8_e4m3", "8"):
-            return "MXFP8"
-        if value in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
-            return "FP8_E4M3"
-        if value in ("mxfp8_e5m2", "fp8_e5m2"):
-            raise ValueError("E5M2 FP8 formats are not exportable on the vLLM path")
-        if value in ("bf16", "bfloat16", "16"):
-            return "BF16"
-    if isinstance(entry, int):
-        if entry <= 4:
-            return "NVFP4"
-        if entry <= 8:
-            return "MXFP8"
-        return "BF16"
-    raise ValueError(f"unrecognized layer-config entry: {entry!r}")
-
-
-def _load_assignment(layer_config: str | Path) -> dict[str, str]:
-    from prismaquant.schemas import validate_layer_config_payload
-
-    path = Path(layer_config)
-    payload = json.loads(path.read_text())
-    validate_layer_config_payload(payload, str(path))
-    return {
-        _strip_weight(str(name)): _canonicalize_layer_format(entry)
-        for name, entry in payload.items()
-    }
 
 
 def main(argv: list[str] | None = None) -> int:

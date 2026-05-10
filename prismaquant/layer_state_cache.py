@@ -32,7 +32,6 @@ Design summary:
 from __future__ import annotations
 
 import inspect
-import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
@@ -41,17 +40,11 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
+from prismaquant.memory_management import env_truthy as _env_truthy
 from prismaquant.perturbed_x_cache import _maybe_clip_activations
 
 
 _HIDDEN_SENTINEL = object()
-
-
-def _env_truthy(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sys
 import tempfile
@@ -30,6 +29,8 @@ from prismaquant.build_rtn_cache import iter_quantizable_tensors
 from prismaquant.memory_management import (
     enforce_gpu_memory_budget,
     env_int,
+    env_truthy as _env_truthy,
+    model_device as _model_device,
     register_budget_evictor,
 )
 
@@ -38,13 +39,6 @@ _SHARED_FROZEN_WEIGHT_FORMAT_CACHE: OrderedDict[
     tuple[str, str, int, str, str],
     torch.Tensor,
 ] = OrderedDict()
-
-
-def _env_truthy(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # Clamping inputs to the calibrated max(|activations|) before per-group
@@ -961,13 +955,6 @@ class PerturbedActivationCache:
             "missing": sorted(self.missing),
             "skipped_activation_quant": self.skipped,
         }
-
-
-def _model_device(model: nn.Module) -> torch.device:
-    for p in model.parameters():
-        if not p.is_meta:
-            return p.device
-    return torch.device("cpu")
 
 
 def _to_device(value, device: torch.device):

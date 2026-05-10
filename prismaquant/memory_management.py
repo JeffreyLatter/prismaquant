@@ -24,6 +24,13 @@ def env_flag_enabled(name: str, *, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def env_float(name: str, default: float) -> float:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -57,6 +64,13 @@ def unregister_budget_evictor(evictor: object) -> None:
         _BUDGET_EVICTORS.discard(evictor)
     except TypeError:
         pass
+
+
+def model_device(model) -> torch.device:
+    for p in model.parameters():
+        if not p.is_meta:
+            return p.device
+    return torch.device("cpu")
 
 
 def cuda_memory_info(device: torch.device | None = None) -> tuple[int, int] | None:

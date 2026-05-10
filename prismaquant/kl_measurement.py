@@ -41,6 +41,9 @@ from prismaquant.memory_management import (
     GPUMemoryBudgetExceeded,
     cuda_memory_info,
     enforce_gpu_memory_budget,
+    env_flag_enabled as _env_flag_enabled,
+    env_float as _env_float,
+    env_int as _env_int,
     max_gpu_memory_bytes,
     register_budget_evictor,
 )
@@ -96,13 +99,6 @@ class QuantWeightCache:
             if cached is not None:
                 return cached
         return None
-
-
-def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return bool(default)
-    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _empty_cache_each_replay_batch() -> bool:
@@ -162,27 +158,6 @@ def _env_cuda_graphs_enabled_for_call_count(
 
     threshold = _env_int(f"{name}_MIN_CALLS", int(min_calls))
     return int(call_count) >= max(int(threshold), 1)
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return float(default)
-    try:
-        return float(value)
-    except ValueError:
-        return float(default)
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return int(default)
-    try:
-        parsed = int(value)
-    except ValueError:
-        return int(default)
-    return max(parsed, 0)
 
 
 def _bytes_to_gb(num_bytes: int | float) -> float:

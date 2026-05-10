@@ -5,11 +5,6 @@ import torch.nn as nn
 
 from prismaquant import format_registry as fr
 from prismaquant.allocator import Candidate, build_candidates, filter_candidates_for_profile
-from prismaquant.calibrate_allocator import (
-    install_activation_hooks,
-    per_format_predicted_breakdown,
-    select_targets,
-)
 from prismaquant.sensitivity_probe import discover_moe_structure
 
 
@@ -243,45 +238,6 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             fr.get_format("BF16").memory_bytes_for_shape((4, 8, 16)),
         )
 
-    def test_calibration_breakdown_uses_allocator_candidate_basis(self):
-        assignment = {
-            "layer.output_measured": "NVFP4",
-            "layer.packed_expert": "MXFP4",
-        }
-        stats = {
-            "layer.output_measured": {
-                "h_trace": 2.0,
-                "out_features": 8,
-                "in_features": 16,
-                "n_params": 128,
-            },
-            "layer.packed_expert": {
-                "h_trace": 3.0,
-                "out_features": 8,
-                "in_features": 16,
-                "n_params": 256,
-                "num_experts": 2,
-            },
-        }
-        costs = {
-            "layer.output_measured": {
-                "NVFP4": {"weight_mse": 10.0, "output_mse": 0.25},
-            },
-            "layer.packed_expert": {
-                "MXFP4": {
-                    "weight_mse": 0.20,
-                    "output_mse": 0.0,
-                    "output_mse_measured": False,
-                    "predicted_dloss": 5.0,
-                },
-            },
-        }
-
-        breakdown = per_format_predicted_breakdown(assignment, stats, costs)
-
-        self.assertAlmostEqual(breakdown["NVFP4"], 0.5 * 2.0 * 0.25)
-        self.assertAlmostEqual(breakdown["MXFP4"], 5.0)
-
     def test_qwen_packed_moe_profile_allows_only_exportable_expert_formats(self):
         name = "model.layers.0.mlp.experts.gate_up_proj"
         candidates = {
@@ -307,59 +263,6 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             ["NVFP4", "MXFP8", "MXFP8_E4M3", "MXFP4", "BF16"],
         )
         self.assertNotIn("model.layers.0.self_attn.q_proj", filtered)
-
-    def test_select_targets_returns_baseline_knee_high(self):
-        curve = [
-            {"feasible": True, "achieved_bits": 4.5, "predicted_dloss": 10.0},
-            {"feasible": True, "achieved_bits": 5.0, "predicted_dloss": 4.0},
-            {"feasible": True, "achieved_bits": 6.0, "predicted_dloss": 3.0},
-            {"feasible": True, "achieved_bits": 8.0, "predicted_dloss": 2.8},
-        ]
-        picks = select_targets(curve, "baseline,knee,high")
-        self.assertEqual(picks[0], 0)
-        self.assertEqual(picks[-1], 3)
-        self.assertEqual(len(picks), 3)
-
-
-class TestCalibrationHooks(unittest.TestCase):
-    def test_install_activation_hooks_skips_conflicting_module_formats(self):
-        linear = torch.nn.Linear(4, 4, bias=False)
-        quant_map = {
-            "a.weight": (linear, "weight"),
-            "b.weight": (linear, "weight"),
-        }
-        handles, active, skipped = install_activation_hooks(
-            {"a.weight": "NVFP4", "b.weight": "MXFP8"},
-            quant_map,
-        )
-        try:
-            self.assertEqual(active, [])
-            self.assertEqual(len(skipped), 1)
-            self.assertEqual(set(skipped[0]["formats"]), {"MXFP8_E4M3", "NVFP4"})
-        finally:
-            for handle in handles:
-                handle.remove()
-
-    def test_install_activation_hooks_quantizes_input(self):
-        linear = torch.nn.Linear(4, 4, bias=False)
-        quant_map = {"a.weight": (linear, "weight")}
-        handles, active, skipped = install_activation_hooks({"a.weight": "NVFP4"}, quant_map)
-        seen = {}
-
-        def recorder(_mod, args):
-            seen["input"] = args[0].detach().clone()
-
-        capture = linear.register_forward_pre_hook(recorder)
-        x = torch.tensor([[0.13, -0.51, 1.77, -3.25]], dtype=torch.float32)
-        try:
-            linear(x)
-            self.assertEqual(len(active), 1)
-            self.assertEqual(skipped, [])
-            self.assertFalse(torch.equal(seen["input"], x))
-        finally:
-            capture.remove()
-            for handle in handles:
-                handle.remove()
 
 
 class _ToyExpertsLinearLoop(nn.Module):

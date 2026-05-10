@@ -35,6 +35,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from prismaquant.incremental_shards import (
+    annotate_incremental_shard as annotate_cost_shard,
+    read_pickle as _read_pickle,
+)
+
 # Must be set before the cuda allocator initializes. On Spark's UMA,
 # cuda and cpu share one LPDDR5X pool; without `expandable_segments`
 # the caching allocator hoards freed blocks, causing the OS to swap
@@ -99,11 +104,6 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
         }, f)
 
 
-def _read_pickle(path: Path) -> Any:
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
 def _expected_cost_shard_meta(*,
                               model: str,
                               probe_path: Path,
@@ -158,17 +158,6 @@ def cost_shard_is_reusable(path: Path, expected_meta: dict[str, Any]) -> bool:
         if meta.get(key) != expected:
             return False
     return True
-
-
-def annotate_cost_shard(path: Path, extra_meta: dict[str, Any]) -> None:
-    data = _read_pickle(path)
-    meta = dict(data.get("meta", {}))
-    inc = dict(meta.get("incremental_shard", {}))
-    inc.update(extra_meta)
-    meta["incremental_shard"] = inc
-    data["meta"] = meta
-    with open(path, "wb") as f:
-        pickle.dump(data, f)
 
 
 # ---------------------------------------------------------------------------

@@ -772,9 +772,6 @@ def fill_production_weight_cache(
         cache_dir_path = Path(cache_dir)
         cache_dir_path.mkdir(parents=True, exist_ok=True)
 
-    def _safe_path_early(qname: str, fmt: str) -> str:
-        return _cache_weight_filename(qname, fmt)
-
     fmt_set = {f.upper() for f in formats}
     activation_aware_formats = {"NVFP4"}
     qnames_to_render: set[str] = set(qname_set)
@@ -787,7 +784,7 @@ def fill_production_weight_cache(
         for q in list(qname_set):
             missing = {
                 f for f in fmt_set
-                if not (cache_dir_path / _safe_path_early(q, f)).is_file()
+                if not (cache_dir_path / _cache_weight_filename(q, f)).is_file()
             }
             missing_formats_by_qname[q] = missing
             if not missing:
@@ -871,8 +868,6 @@ def fill_production_weight_cache(
     if cache_dir_path is not None and progress:
         print(f"[prod-cache] streaming cache to {cache_dir_path}/", flush=True)
 
-    def _safe_path(qname: str, fmt: str) -> str:
-        return _cache_weight_filename(qname, fmt)
     for full_name, mod, attr in iter_quantizable_tensors(model):
         if attr != "weight" or not isinstance(mod, nn.Linear):
             continue
@@ -1019,7 +1014,7 @@ def fill_production_weight_cache(
             # resume without re-doing the work — just rebuild the manifest
             # from the surviving .pt files.
             if cache_dir_path is not None:
-                fname = _safe_path(qname, fmt.upper())
+                fname = _cache_weight_filename(qname, fmt.upper())
                 if (cache_dir_path / fname).is_file():
                     weights[(qname, fmt.upper())] = fname
                     skipped_resumed += 1
@@ -1062,7 +1057,7 @@ def fill_production_weight_cache(
                 # mid-write, resume sees no .pt at all (and re-renders)
                 # rather than a corrupt one (which would deserialize-
                 # crash later).
-                fname = _safe_path(qname, fmt.upper())
+                fname = _cache_weight_filename(qname, fmt.upper())
                 final_path = cache_dir_path / fname
                 tmp_path = cache_dir_path / (fname + ".tmp")
                 torch.save(tensor, tmp_path)

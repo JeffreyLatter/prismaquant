@@ -18,7 +18,7 @@ from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
-from prismaquant.export_native_compressed import canonicalize_format
+from prismaquant.layer_config import canonicalize_format
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 from prismaquant.kl_measurement import assignment_bit_total, measure_assignment_kl
 from prismaquant.sensitivity_probe import load_calibration

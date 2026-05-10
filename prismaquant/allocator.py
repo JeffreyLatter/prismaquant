@@ -63,11 +63,11 @@ Fused-projection siblings (q/k/v/o, gate/up, ...) are post-processed:
   tightened target until achieved is within tolerance.
 
 Optional empirical calibration:
-  If `--calibration` points at a JSON produced by calibrate_allocator.py
-  containing `calibrated_gains[fmt] = α_fmt`, the predicted Δloss for
-  format f is multiplied by α_f before the DP runs. This corrects for
-  systematic over- or under-prediction per format observed against
-  measured KL on the bake-off frontier.
+  If `--calibration` points at a JSON containing
+  `calibrated_gains[fmt] = α_fmt`, the predicted Δloss for format f is
+  multiplied by α_f before the DP runs. The historical tiny-bakeoff
+  producer for this payload is archived; production recipes normally run
+  uncalibrated and validate assignments with direct KL measurement.
 
 Auto-Pareto knee via Kneedle (Satopää et al.). Reports the knee target
 plus a few flanking points so you can eyeball.
@@ -475,9 +475,9 @@ def main():
                          "to legal packed serving units and restricts MoE "
                          "formats to the existing vLLM path.")
     ap.add_argument("--calibration", default=None,
-                    help="Optional path to a calibrate_allocator.py JSON "
-                         "containing 'calibrated_gains[fmt] = α_fmt'. When "
-                         "present, the per-(layer, format) predicted Δloss "
+                    help="Optional path to a JSON containing "
+                         "'calibrated_gains[fmt] = α_fmt'. When present, "
+                         "the per-(layer, format) predicted Δloss "
                          "is multiplied by α_fmt before the DP runs.")
     ap.add_argument("--overshoot-tolerance", type=float, default=0.01,
                     help="Maximum allowed overshoot (bits/param) of the "
@@ -595,8 +595,8 @@ def main():
     print(f"[alloc] formats (low→high bits): "
           f"{[f'{s.name}({s.effective_bits:.2f}b)' for s in specs_sorted]}")
 
-    # Optional empirical calibration: per-format scalar gain α_f produced
-    # by calibrate_allocator.py. When absent, all gains default to 1.0.
+    # Optional empirical calibration: per-format scalar gain α_f. When
+    # absent, all gains default to 1.0.
     calibrated_gains: dict[str, float] = {}
     if args.calibration:
         with open(args.calibration) as f:

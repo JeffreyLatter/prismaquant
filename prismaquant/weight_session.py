@@ -27,13 +27,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import os
 import torch
 import torch.nn as nn
 
 from prismaquant import decision_units as du
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
+from prismaquant.memory_management import env_truthy as _env_truthy
 
 
 @dataclass
@@ -448,13 +448,6 @@ class WeightSession:
             "stage_missing_sample": list(self._stage_missing[:5]),
             "strict_production_cache": self._strict_production_cache,
         }
-
-
-def _env_truthy(name: str, *, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return bool(default)
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _qname_aliases(qname: str) -> set[str]:

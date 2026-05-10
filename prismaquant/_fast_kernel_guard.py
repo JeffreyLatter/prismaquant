@@ -16,11 +16,7 @@ do want to debug-run on the slow path.
 """
 from __future__ import annotations
 
-import os
-
-
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+from prismaquant.memory_management import env_truthy as _env_truthy
 
 
 def require_fast_kernels(model_id_or_path: str | None = None) -> None:

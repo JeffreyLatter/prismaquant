@@ -79,6 +79,10 @@ from safetensors.torch import save_file
 
 from .allocator_candidates import check_format_applicability
 from .expert_prune import raise_expert_prune_disabled
+from .layer_config import (
+    canonicalize_assignment as _canonicalize_assignment,
+    canonicalize_format,
+)
 from .model_profiles.qwen3_5 import Qwen3_5Profile
 from .schemas import validate_layer_config_payload, validate_prune_manifest_payload
 
@@ -1690,95 +1694,6 @@ def quantize_dequantize_fp8_dynamic_packed(packed: torch.Tensor
     s = p_f.abs().amax(dim=-1, keepdim=True).clamp_min(2.0 ** -127) / MXFP8_E4M3_MAX
     quant = (p_f / s).clamp(-MXFP8_E4M3_MAX, MXFP8_E4M3_MAX).to(torch.float8_e4m3fn)
     return quant, s.to(torch.float32)
-
-
-# ---------------------------------------------------------------------------
-# Recipe parsing — mirrors export_mixed_native.canonicalize_format but
-# accepts the allocator's exact AutoRound-shaped output.
-# ---------------------------------------------------------------------------
-def canonicalize_format(scheme_dict: dict | str | int) -> str:
-    """Map a layer_config entry to a supported export format.
-
-    Accepts the dicts emitted by allocator.py via FormatSpec.autoround_config()
-    (data_type=nv_fp/mx_fp/float/fp8_e4m3, bits=4/8/16) plus a few tolerant
-    string aliases. E5M2 registry entries are intentionally not exportable on
-    the vLLM production path yet; compressed-tensors/vLLM weight dispatch is
-    validated for E4M3 here.
-    """
-    if isinstance(scheme_dict, dict):
-        dt = scheme_dict.get("data_type")
-        bits = int(scheme_dict.get("bits", 0))
-        if dt == "nv_fp" and bits == 4:
-            return "NVFP4"
-        if dt == "mx_fp" and bits == 4:
-            return "MXFP4"
-        if dt == "mx_fp" and bits == 8:
-            elt = str(scheme_dict.get("weight_element_dtype", "fp8_e4m3")).lower()
-            if elt == "fp8_e5m2":
-                raise ValueError(
-                    "MXFP8_E5M2 is registered for research probing but is not "
-                    "exportable on the vLLM compressed-tensors weight path"
-                )
-            return "MXFP8"
-        if dt in ("float", "bfloat16") and bits in (16, 0):
-            return "BF16"
-        if dt == "fp8_e4m3" and bits == 8:
-            # group_size disambiguates: FP8_SOURCE ships with group_size=128
-            # (128×128 block-scaled, as stored in native-FP8 checkpoints
-            # like MiniMax-M2/M2.7 and DeepSeek-V3); MXFP8 uses group_size=32
-            # with E8M0 scales; plain FP8_E4M3 is dense per-channel W8A8.
-            group_size = int(scheme_dict.get("group_size", 0))
-            if group_size == 128:
-                return "FP8_SOURCE"
-            if group_size == 32:
-                return "MXFP8"
-            if group_size in (0, -1):
-                return "FP8_E4M3"
-            return "MXFP8"
-        if dt == "fp8_e5m2" and bits == 8:
-            raise ValueError(
-                "FP8_E5M2 is registered for research probing but is not "
-                "exportable on the vLLM compressed-tensors weight path"
-            )
-        # MXFP6 variants (load-time dequant to MXFP8).
-        if dt == "mx_fp" and bits == 6:
-            elt = str(scheme_dict.get("weight_element_dtype", "fp6_e3m2")).lower()
-            if elt == "fp6_e2m3":
-                return "MXFP6_E2M3"
-            return "MXFP6_E3M2"
-        if dt == "fp6_e3m2" and bits == 6:
-            return "MXFP6_E3M2"
-        if dt == "fp6_e2m3" and bits == 6:
-            return "MXFP6_E2M3"
-        raise ValueError(f"unsupported scheme: {scheme_dict!r}")
-    if isinstance(scheme_dict, str):
-        s = scheme_dict.lower()
-        if s in ("nvfp4", "fp4", "4"):
-            return "NVFP4"
-        if s in ("mxfp4", "mx_fp4"):
-            return "MXFP4"
-        if s in ("mxfp8", "mxfp8_e4m3", "8"):
-            return "MXFP8"
-        if s in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
-            return "FP8_E4M3"
-        if s in ("mxfp8_e5m2", "fp8_e5m2"):
-            raise ValueError(
-                "E5M2 FP8 formats are not exportable on the vLLM "
-                "compressed-tensors weight path"
-            )
-        if s in ("bf16", "bfloat16", "16"):
-            return "BF16"
-    if isinstance(scheme_dict, int):
-        if scheme_dict <= 4:
-            return "NVFP4"
-        if scheme_dict <= 8:
-            return "MXFP8"
-        return "BF16"
-    raise ValueError(f"unrecognized layer-config entry: {scheme_dict!r}")
-
-
-def _strip_weight(name: str) -> str:
-    return name[:-7] if name.endswith(".weight") else name
 
 
 def _explicit_regex(name: str) -> str:
@@ -4852,17 +4767,6 @@ def build_quantization_config(
 # ---------------------------------------------------------------------------
 # Recipe canonicalization + Main
 # ---------------------------------------------------------------------------
-def _canonicalize_assignment(raw: dict) -> dict[str, str]:
-    """Accept either AutoRound-style dicts (`{key: {bits: 4, data_type: nv_fp,
-    ...}}`) or shorthand (`{key: "NVFP4"}`). Return `{key: fmt_str}` with
-    fmt in {"NVFP4", "MXFP8", "FP8_E4M3", "FP8_SOURCE", "BF16"}."""
-    out: dict[str, str] = {}
-    for k, v in raw.items():
-        name = _strip_weight(k)
-        out[name] = canonicalize_format(v)
-    return out
-
-
 # Per-expert siblings map to a fused packed parent at recipe level.
 # If the parent IS quantized, the per-expert source keys are already
 # covered and must NOT be added to `extra_ignore` — otherwise vLLM's
@@ -4947,23 +4851,6 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
             continue
         extra_ignore.append(base)
     return extra_ignore
-
-
-def _cfg_value(obj, key: str):
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj.get(key)
-    return getattr(obj, key, None)
-
-
-def _cfg_path_value(cfg, path: str):
-    cur = cfg
-    for part in path.split("."):
-        cur = _cfg_value(cur, part)
-        if cur is None:
-            return None
-    return cur
 
 
 def _halo_hidden_from_config(cfg) -> tuple[int | None, str | None]:
