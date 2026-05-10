@@ -49,6 +49,109 @@ Logs:
 - Eager: `/home/rob/dq-runs/qwen3-4b-pipeline-recache-smoke-20260509T233407Z/logs/validate_native_spawn.log`
 - Graph: `/home/rob/dq-runs/qwen3-4b-pipeline-recache-smoke-20260509T233407Z/logs/validate_native_graph.log`
 
+## Current Recipe Smoke Ladder, 2026-05-10
+
+These runs used the expanded production recipe shape:
+
+- `FORMATS=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16`
+- `PRODUCTION_CACHE=1`
+- `PRODUCTION_RECACHE=1`
+- `PRODUCTION_CACHE_PREFETCH=require`
+- `PRODUCTION_CACHE_LRU_GB=64.0`
+- `MTP_FORMAT=BF16`
+- Docker image: `vllm-fresh-b12x-fla:latest`
+
+Qwen3.5-0.8B run:
+
+`/home/rob/dq-runs/qwen35-0p8b-current-recipe-smoke-docker-20260510T012126Z`
+
+Result:
+
+- Pipeline completed end-to-end on CUDA.
+- Allocator selected a `4.751 bpp` body assignment:
+  `NVFP4=95`, `FP8_E4M3=23`, `BF16=1`.
+- Production cache rendered `372` entries with `0` failures.
+- Re-cache preloaded `184` selected entries, `0.93 GiB`, before replay.
+- Re-cache measured `186` Linears in `0.6s`; activation range movement was
+  p50 `1.0`, p95 `1.039`, max `1.5`, with `26/186` ranges moving by more
+  than 5%.
+- Export recipe mix was `{'BF16': 60, 'NVFP4': 148, 'FP8_E4M3': 36}`.
+- vLLM eager and graph-mode load/generation both passed.
+
+Logs:
+
+- Eager: `/home/rob/dq-runs/qwen35-0p8b-current-recipe-smoke-docker-20260510T012126Z/logs/validate_eager.log`
+- Graph: `/home/rob/dq-runs/qwen35-0p8b-current-recipe-smoke-docker-20260510T012126Z/logs/validate_graph.log`
+
+Qwen3-4B run:
+
+`/home/rob/dq-runs/qwen3-4b-current-recipe-smoke-docker-20260510T012846Z`
+
+Result:
+
+- Pipeline completed end-to-end on CUDA.
+- Probe kept the model resident on GPU with no swap or pressure trim.
+- Allocator selected a `4.742 bpp` body assignment:
+  `NVFP4=135`, `FP8_E4M3=8`, `BF16=1`.
+- Production cache rendered `504` entries with `0` failures.
+- Re-cache preloaded `251` selected entries, `6.72 GiB`, before replay.
+- Re-cache measured `252` Linears in `1.6s`; activation range movement was
+  p50 `1.0`, p95 `1.037`, max `1.09`, with `35/252` ranges moving by more
+  than 5%.
+- Export recipe mix was `{'NVFP4': 230, 'FP8_E4M3': 21, 'BF16': 1}`.
+- vLLM eager and graph-mode load/generation both passed.
+
+Logs:
+
+- Eager: `/home/rob/dq-runs/qwen3-4b-current-recipe-smoke-docker-20260510T012846Z/logs/validate_eager.log`
+- Graph: `/home/rob/dq-runs/qwen3-4b-current-recipe-smoke-docker-20260510T012846Z/logs/validate_graph.log`
+
+Production-path KL baselines on the same tiny diverse slice
+(`n=2`, `seqlen=128`, production cache prefetch required):
+
+- Qwen3.5-0.8B no-HALO:
+  `KL=0.016742826`, `5.065402 bpp`.
+  JSON: `/home/rob/dq-runs/qwen35-0p8b-current-recipe-smoke-docker-20260510T012126Z/artifacts/nohalo_prodkl_n2s128.json`
+- Qwen3-4B no-HALO:
+  `KL=0.12141372`, `4.742221 bpp`.
+  JSON: `/home/rob/dq-runs/qwen3-4b-current-recipe-smoke-docker-20260510T012846Z/artifacts/nohalo_prodkl_n2s128.json`
+
+HALO production-cache smoke:
+
+- Tied source checkpoints were staged with materialized `lm_head.weight` via
+  `tools/stage_untied_lm_head.py`.
+- Qwen3.5-0.8B HALO run:
+  `/home/rob/dq-runs/qwen35-0p8b-halo-current-recipe-smoke-docker-20260510T015002Z`
+- Qwen3.5-0.8B HALO rotation:
+  `dim=1024`, blocks `[1024]`, hash `71f38f41364ae3da`.
+- Qwen3.5-0.8B HALO result:
+  pipeline passed, vLLM eager and graph passed, but tiny-slice KL regressed
+  to `0.019127593` at `5.065402 bpp`.
+- Qwen3-4B HALO run:
+  `/home/rob/dq-runs/qwen3-4b-halo-current-recipe-smoke-docker-20260510T015701Z`
+- Qwen3-4B HALO rotation:
+  `dim=2560`, blocks `[2048, 512]`, hash `6766c8b5bc5c5bdd`.
+- Qwen3-4B HALO result:
+  pipeline passed, vLLM eager and graph passed, and tiny-slice KL improved to
+  `0.10303419` at `4.742221 bpp`.
+- Qwen3-4B HALO re-cache preloaded all selected entries (`251`, `6.72 GiB`)
+  and moved `73/252` activation ranges by more than 5%.
+
+HALO logs:
+
+- 0.8B eager:
+  `/home/rob/dq-runs/qwen35-0p8b-halo-current-recipe-smoke-docker-20260510T015002Z/logs/validate_eager.log`
+- 0.8B graph:
+  `/home/rob/dq-runs/qwen35-0p8b-halo-current-recipe-smoke-docker-20260510T015002Z/logs/validate_graph.log`
+- 0.8B KL:
+  `/home/rob/dq-runs/qwen35-0p8b-halo-current-recipe-smoke-docker-20260510T015002Z/artifacts/halo_prodkl_n2s128.json`
+- 4B eager:
+  `/home/rob/dq-runs/qwen3-4b-halo-current-recipe-smoke-docker-20260510T015701Z/logs/validate_eager.log`
+- 4B graph:
+  `/home/rob/dq-runs/qwen3-4b-halo-current-recipe-smoke-docker-20260510T015701Z/logs/validate_graph.log`
+- 4B KL:
+  `/home/rob/dq-runs/qwen3-4b-halo-current-recipe-smoke-docker-20260510T015701Z/artifacts/halo_prodkl_n2s128.json`
+
 ## Shipped Qwen3.6-27B Artifact
 
 Artifact:

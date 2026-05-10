@@ -96,6 +96,8 @@ set -euo pipefail
 : "${PRODUCTION_CACHE_PREFETCH_WORKERS:=4}"
 : "${PRODUCTION_RECACHE_MICROBATCH:=1}"
 : "${PRODUCTION_CACHE_FORMATS:=auto}"
+: "${HALO_MODE:=off}"
+: "${HALO_SEED:=0}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
@@ -115,6 +117,7 @@ echo "  CALIBRATION_MODALITY=$CALIBRATION_MODALITY  MM_DATASET=$MM_DATASET"
 echo "  PRODUCTION_CACHE=$PRODUCTION_CACHE PRODUCTION_RECACHE=$PRODUCTION_RECACHE"
 echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
+echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
 echo
 
 # -----------------------------------------------------------------------
@@ -238,9 +241,13 @@ python3 -m prismaquant.allocator \
 # -----------------------------------------------------------------------
 PRODUCTION_CACHE_PATH=""
 if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTION_CACHE" != "False" ]]; then
-  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache"
-  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_raw.pkl"
-  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache_recached.pkl"
+  HALO_CACHE_TAG=""
+  if [[ "$HALO_MODE" != "off" ]]; then
+    HALO_CACHE_TAG="_halo-${HALO_MODE}-seed${HALO_SEED}"
+  fi
+  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}"
+  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}_raw.pkl"
+  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}_recached.pkl"
   CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
   if [[ "$CACHE_FORMATS" == "auto" ]]; then
     CACHE_FORMATS="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'
@@ -272,6 +279,8 @@ PY
           --cache-dir "$PROD_CACHE_DIR" \
           --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+          --halo-mode "$HALO_MODE" \
+          --halo-seed "$HALO_SEED" \
           2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
       else
         echo "[pipeline] [4/4] re-fitting production activation scales ..."
@@ -290,6 +299,8 @@ PY
           --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
           --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
           --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+          --halo-mode "$HALO_MODE" \
+          --halo-seed "$HALO_SEED" \
           2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
       fi
     else
@@ -309,6 +320,8 @@ PY
         --dtype bf16 \
         --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
         --cache-dir "$PROD_CACHE_DIR" \
+        --halo-mode "$HALO_MODE" \
+        --halo-seed "$HALO_SEED" \
         2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
     else
       echo "[pipeline] [4/4] production cache exists, skipping"
@@ -325,6 +338,8 @@ EXPORT_ARGS=(
   --output "${WORK_DIR}/exported"
   --device "$EXPORT_DEVICE"
   --activation-cache-dir "${WORK_DIR}/act"
+  --halo-mode "$HALO_MODE"
+  --halo-seed "$HALO_SEED"
 )
 if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
   EXPORT_ARGS+=(

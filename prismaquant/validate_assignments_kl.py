@@ -18,8 +18,10 @@ from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
+from prismaquant.export_native_compressed import canonicalize_format
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 from prismaquant.kl_measurement import assignment_bit_total, measure_assignment_kl
+from prismaquant.sensitivity_probe import load_calibration
 
 
 def _load_json(path: str | Path):
@@ -41,13 +43,13 @@ def _load_probe_stats(path: str | Path) -> dict:
 def load_assignment_json(path: str | Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
     payload = _load_json(path)
     if isinstance(payload, Mapping) and isinstance(payload.get("assignment"), Mapping):
-        assignment = {str(k): fr.canonical_format_name(str(v)) for k, v in payload["assignment"].items()}
+        assignment = {str(k): canonicalize_format(v) for k, v in payload["assignment"].items()}
     elif isinstance(payload, Mapping):
-        assignment = {str(k): fr.canonical_format_name(str(v)) for k, v in payload.items()}
+        assignment = {str(k): canonicalize_format(v) for k, v in payload.items()}
     else:
         raise ValueError(f"unsupported assignment JSON shape: {path}")
     if base is not None:
-        merged = {str(k): fr.canonical_format_name(str(v)) for k, v in base.items()}
+        merged = {str(k): canonicalize_format(v) for k, v in base.items()}
         merged.update(assignment)
         return merged
     return assignment
@@ -92,12 +94,56 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calib-seqlen", type=int, default=128)
     parser.add_argument("--calib-split", default="train")
     parser.add_argument("--calib-seed", type=int, default=42)
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Optional calibration source accepted by sensitivity_probe "
+        "(HF dataset id, .jsonl, or .txt). When omitted, preserves the "
+        "historical wikitext-2 windowed loader.",
+    )
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--device-map", default=None)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--work-dir", default=None)
     parser.add_argument("--disable-frozen-weight-cache", action="store_true")
+    parser.add_argument(
+        "--production-weight-cache",
+        default=None,
+        help="Optional pickled ProductionWeightCache. When supplied, KL is "
+        "measured on the same production-rendered W_tilde path used by export.",
+    )
+    parser.add_argument(
+        "--production-cache-dir-override",
+        default=None,
+        help="Relocate disk-backed production cache entries to this directory.",
+    )
+    parser.add_argument(
+        "--production-cache-lru-gb",
+        type=float,
+        default=64.0,
+        help="Resident tensor budget for disk-backed production cache use.",
+    )
+    parser.add_argument(
+        "--production-cache-prefetch",
+        choices=("auto", "off", "require"),
+        default="require",
+        help="Preload assignment-required rendered weights before KL replay. "
+             "'require' fails instead of allowing an NVMe-bound validation.",
+    )
+    parser.add_argument(
+        "--production-cache-prefetch-workers",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--halo-mode",
+        choices=("off", "random"),
+        default="off",
+        help="Apply HALO to the BF16 model before reference/candidate KL. "
+        "Required when measuring a HALO-rendered production cache.",
+    )
+    parser.add_argument("--halo-seed", type=int, default=0)
     args = parser.parse_args(argv)
 
     if args.disable_frozen_weight_cache:
@@ -125,7 +171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     work_root.mkdir(parents=True, exist_ok=True)
     remove_work_root = args.work_dir is None
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         tokenizer_kwargs = {
             "trust_remote_code": True,
@@ -141,27 +187,120 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif device.type == "cuda":
             load_kwargs["device_map"] = device_str
         tokenizer = AutoTokenizer.from_pretrained(staged, **tokenizer_kwargs)
-        calib_ids = load_wikitext_calibration_windowed(
-            tokenizer,
-            args.n_calib_samples,
-            args.calib_seqlen,
-            split=args.calib_split,
-            seed=args.calib_seed,
-        )
-        model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+        if args.dataset:
+            calib_ids = load_calibration(
+                tokenizer,
+                args.dataset,
+                args.n_calib_samples,
+                args.calib_seqlen,
+            )
+        else:
+            calib_ids = load_wikitext_calibration_windowed(
+                tokenizer,
+                args.n_calib_samples,
+                args.calib_seqlen,
+                split=args.calib_split,
+                seed=args.calib_seed,
+            )
+        try:
+            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+        except ValueError as exc:
+            if (
+                "requires `accelerate`" not in str(exc)
+                and "requires accelerate" not in str(exc)
+            ):
+                raise
+            load_kwargs.pop("device_map", None)
+            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+            if device.type == "cuda":
+                model.to(device)
         if not args.device_map and device.type != "cuda":
             model.to(device)
         model.eval()
         model_device = next(model.parameters()).device
+        production_cache = None
+        if args.production_weight_cache:
+            import pickle
+
+            with Path(args.production_weight_cache).open("rb") as fh:
+                production_cache = pickle.load(fh)
+            if args.production_cache_dir_override:
+                production_cache.relocate(args.production_cache_dir_override)
+            if (
+                args.production_cache_lru_gb
+                and float(args.production_cache_lru_gb) > 0
+                and hasattr(production_cache, "enable_lru")
+            ):
+                production_cache.enable_lru(
+                    int(float(args.production_cache_lru_gb) * 1024**3)
+                )
+
         try:
             profile = detect_profile(args.model)
         except Exception:
             profile = DefaultProfile()
+        cache_halo = dict(
+            (getattr(production_cache, "metadata", {}) or {}).get("halo", {}) or {}
+        ) if production_cache is not None else {"mode": "off"}
+        cache_halo_mode = str(cache_halo.get("mode", "off"))
+        if args.halo_mode == "off":
+            if cache_halo_mode != "off":
+                raise RuntimeError(
+                    "[validate-kl] production cache was rendered with "
+                    f"HALO mode={cache_halo_mode!r}; re-run validation with "
+                    "matching --halo-mode/--halo-seed."
+                )
+        else:
+            from prismaquant.halo import apply_random_halo_to_model
+
+            if production_cache is not None:
+                if cache_halo_mode != args.halo_mode:
+                    raise RuntimeError(
+                        "[validate-kl] production cache HALO mode mismatch: "
+                        f"cache={cache_halo_mode!r} requested={args.halo_mode!r}")
+                if int(cache_halo.get("seed", -1)) != int(args.halo_seed):
+                    raise RuntimeError(
+                        "[validate-kl] production cache HALO seed mismatch: "
+                        f"cache={cache_halo.get('seed')!r} "
+                        f"requested={args.halo_seed!r}")
+            cfg = AutoConfig.from_pretrained(staged, **tokenizer_kwargs)
+            _, halo_meta = apply_random_halo_to_model(
+                model,
+                profile,
+                cfg,
+                seed=args.halo_seed,
+                verbose=True,
+            )
+            if production_cache is not None:
+                for key in ("dim", "rotation_hash", "profile"):
+                    expected = halo_meta.get(key)
+                    actual = cache_halo.get(key)
+                    if expected is not None and actual != expected:
+                        raise RuntimeError(
+                            "[validate-kl] production cache HALO metadata "
+                            f"mismatch for {key}: cache={actual!r} "
+                            f"expected={expected!r}")
         ref_log_probs = cache_reference_log_probs(model, calib_ids, model_device)
 
         results = []
         for label, assignment, path in assignments:
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            prefetch_stats = None
+            if (
+                production_cache is not None
+                and args.production_cache_prefetch != "off"
+            ):
+                preload_budget = (
+                    getattr(production_cache, "_lru_max_bytes", 0) or None
+                )
+                prefetch_stats = production_cache.prefetch_assignment(
+                    assignment,
+                    max_resident_bytes=preload_budget,
+                    max_workers=args.production_cache_prefetch_workers,
+                    require=args.production_cache_prefetch == "require",
+                    progress=True,
+                    log_prefix="[validate-kl]",
+                )
             kl = measure_assignment_kl(
                 model,
                 assignment,
@@ -170,6 +309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 work_root=work_root,
                 profile=profile,
                 use_frozen_weight_cache=not args.disable_frozen_weight_cache,
+                production_weight_cache=production_cache,
             )
             counts = dict(Counter(assignment.values()))
             changed = sum(
@@ -186,6 +326,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "changed_vs_base": int(changed),
                 "assignment_entries": len(assignment),
             }
+            if prefetch_stats is not None:
+                result["production_cache_prefetch"] = prefetch_stats
             results.append(result)
             print(
                 f"[validate-kl] {label}: KL={kl:.8g} "
@@ -206,6 +348,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "calib_seqlen": int(args.calib_seqlen),
                 "calib_split": args.calib_split,
                 "calib_seed": int(args.calib_seed),
+                "dataset": args.dataset,
+            },
+            "production_cache": {
+                "path": args.production_weight_cache,
+                "cache_dir_override": args.production_cache_dir_override,
+                "lru_gb": float(args.production_cache_lru_gb),
+                "prefetch": args.production_cache_prefetch,
+                "prefetch_workers": int(args.production_cache_prefetch_workers),
+            } if args.production_weight_cache else None,
+            "halo": {
+                "mode": args.halo_mode,
+                "seed": int(args.halo_seed),
             },
             "results": results,
         }

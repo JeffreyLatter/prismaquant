@@ -133,9 +133,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="During re-cache, install production weights but leave activation "
         "quantization disabled in replay hooks.",
     )
+    p.add_argument(
+        "--halo-mode",
+        choices=("off", "random"),
+        default="off",
+        help="Apply HALO before rendering production weights. A HALO cache is "
+        "only valid with matching export --halo-mode/--halo-seed.",
+    )
+    p.add_argument(
+        "--halo-seed",
+        type=int,
+        default=0,
+        help="RNG seed for HALO random Hadamard sign diagonal.",
+    )
     args = p.parse_args(argv)
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +204,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile = detect_profile(args.model)
         except Exception:
             profile = DefaultProfile()
+        halo_meta = {"mode": "off"}
+        if args.halo_mode == "random":
+            from prismaquant.halo import apply_random_halo_to_model
+
+            cfg = AutoConfig.from_pretrained(
+                staged,
+                trust_remote_code=True,
+                local_files_only=local_only,
+            )
+            print(
+                f"[build-prod-cache] applying HALO mode=random "
+                f"seed={args.halo_seed}",
+                flush=True,
+            )
+            _, halo_meta = apply_random_halo_to_model(
+                model,
+                profile,
+                cfg,
+                seed=args.halo_seed,
+                verbose=True,
+            )
+            print(
+                "[build-prod-cache] HALO applied: "
+                f"dim={halo_meta['dim']} "
+                f"blocks={halo_meta['block_sizes']} "
+                f"hash={halo_meta['rotation_hash']}",
+                flush=True,
+            )
 
         skip_tokens = list(args.skip_qnames or [])
         qnames: list[str] = []
@@ -236,6 +277,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             recache_microbatch_size=args.recache_microbatch_size,
         )
         elapsed = time.monotonic() - t0
+        meta = dict(getattr(cache, "metadata", {}) or {})
+        meta["halo"] = halo_meta
+        cache.metadata = meta
 
         # Strict coverage validation: every (qname, NVFP4) must be present
         # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky
@@ -264,6 +308,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 return 2
 
+        compacted = (
+            cache.compact_for_pickle()
+            if hasattr(cache, "compact_for_pickle")
+            else 0
+        )
+        if compacted:
+            print(
+                f"[build-prod-cache] compacted {compacted} resident cache "
+                "tensors back to path references before writing",
+                flush=True,
+            )
         with open(output_path, "wb") as fh:
             pickle.dump(cache, fh, protocol=pickle.HIGHEST_PROTOCOL)
         print(

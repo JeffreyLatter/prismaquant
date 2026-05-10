@@ -446,6 +446,15 @@ def _production_cache_fingerprint(
     act_digest = hashlib.sha256(
         _json.dumps(act, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:16]
+    metadata = dict(getattr(cache, "metadata", {}) or {})
+    metadata_digest = hashlib.sha256(
+        _json.dumps(
+            metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+    ).hexdigest()[:16]
     digest = hashlib.sha256(
         _json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:16]
@@ -454,6 +463,8 @@ def _production_cache_fingerprint(
         "n_entries": len(rows),
         "hash": digest,
         "activation_max_abs_hash": act_digest,
+        "metadata_hash": metadata_digest,
+        "halo": metadata.get("halo", {"mode": "off"}),
         "levers": dict(getattr(cache, "levers", {}) or {}),
     }
 
@@ -4956,65 +4967,73 @@ def _cfg_path_value(cfg, path: str):
 
 
 def _halo_hidden_from_config(cfg) -> tuple[int | None, str | None]:
-    for path in (
-        "hidden_size",
-        "text_config.hidden_size",
-        "language_model_config.hidden_size",
-        "llm_config.hidden_size",
-    ):
-        val = _cfg_path_value(cfg, path)
-        if isinstance(val, int) and val > 0:
-            return val, path
-    return None, None
+    from .halo import halo_hidden_from_config
+
+    return halo_hidden_from_config(cfg)
 
 
 def _halo_config_bool(cfg, key: str) -> bool:
-    for path in (
-        key,
-        f"text_config.{key}",
-        f"language_model_config.{key}",
-        f"llm_config.{key}",
-    ):
-        val = _cfg_path_value(cfg, path)
-        if val is not None:
-            return bool(val)
-    return False
+    from .halo import halo_config_bool
+
+    return halo_config_bool(cfg, key)
 
 
 def _validate_halo_export_support(profile, cfg, hidden: int) -> None:
     """Fail fast for HALO topologies this exporter cannot rotate safely."""
-    if hidden <= 0:
-        raise RuntimeError(
-            f"[halo] random mode requires a positive hidden_size; got {hidden}.")
-    if _halo_config_bool(cfg, "tie_word_embeddings"):
-        raise RuntimeError(
-            "[halo] tied embeddings/lm_head are unsupported. HALO needs "
-            "separate embedding and lm_head rotations after final-norm "
-            "gamma folding; materialize an untied lm_head first or "
-            "disable HALO.")
-    supported = {"default", "qwen3", "qwen3_5_dense"}
-    if getattr(profile, "name", None) not in supported:
-        raise RuntimeError(
-            f"[halo] profile {getattr(profile, 'name', '<unknown>')!r} "
-            "is not supported by generic HALO. Current support is limited "
-            "to dense transformer profiles with embed/layers/final_norm/"
-            "lm_head topology. Qwen3.5/3.6 dense linear-attention layers "
-            "are supported; packed-MoE profiles still need profile-specific "
-            "expert rotation.")
+    from .halo import validate_halo_export_support
+
+    validate_halo_export_support(profile, cfg, hidden)
 
 
-def _validate_halo_cache_inputs(args) -> None:
+def _validate_halo_cache_inputs(
+    args,
+    production_cache=None,
+    *,
+    expected_halo: dict[str, object] | None = None,
+) -> None:
     """Reject HALO/cache combinations that cannot preserve semantics."""
-    if args.halo_mode != "off" and args.production_weight_cache:
+    if not args.production_weight_cache or production_cache is None:
+        return
+    meta = dict(getattr(production_cache, "metadata", {}) or {})
+    cache_halo = dict(meta.get("halo", {}) or {})
+    cache_mode = str(cache_halo.get("mode", "off"))
+    requested_mode = str(args.halo_mode)
+
+    if requested_mode == "off":
+        if cache_mode != "off":
+            raise RuntimeError(
+                "[halo] production-weight-cache was rendered with "
+                f"HALO mode={cache_mode!r}, but export requested "
+                "--halo-mode off. Export with matching --halo-mode/seed "
+                "or use a no-HALO production cache."
+            )
+        return
+
+    if cache_mode == "off":
         raise RuntimeError(
             "[halo] --production-weight-cache is incompatible with "
-            "--halo-mode random. A ProductionWeightCache contains "
-            "already-rendered no-HALO compressed weights, but HALO must "
-            "rotate weights before NVFP4/MXFP8 quantization/rendering. "
-            "Re-render a HALO-specific production cache from activations, "
-            "or export without --production-weight-cache for a research-only "
-            "RTN/GPTQ path."
+            "--halo-mode random unless the cache metadata confirms it "
+            "was rendered from the same HALO-rotated source. Re-render a "
+            "HALO-specific production cache from activations, or export "
+            "without --production-weight-cache for a research-only path."
         )
+    if cache_mode != requested_mode:
+        raise RuntimeError(
+            "[halo] production-weight-cache HALO mode mismatch: "
+            f"cache={cache_mode!r} requested={requested_mode!r}")
+    cache_seed = cache_halo.get("seed")
+    if cache_seed is None or int(cache_seed) != int(args.halo_seed):
+        raise RuntimeError(
+            "[halo] production-weight-cache HALO seed mismatch: "
+            f"cache={cache_seed!r} requested={args.halo_seed!r}")
+    if expected_halo is not None:
+        for key in ("dim", "rotation_hash", "profile"):
+            expected = expected_halo.get(key)
+            actual = cache_halo.get(key)
+            if expected is not None and actual != expected:
+                raise RuntimeError(
+                    "[halo] production-weight-cache HALO metadata mismatch "
+                    f"for {key}: cache={actual!r} expected={expected!r}")
 
 
 def main():
@@ -5249,6 +5268,7 @@ def main():
             production_cache.enable_lru(
                 int(float(args.production_cache_lru_gb) * 1024**3)
             )
+        _validate_halo_cache_inputs(args, production_cache)
         _PRODUCTION_WEIGHT_CACHE = production_cache
         _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
             1, int(args.production_cache_prefetch_workers)
@@ -5462,7 +5482,7 @@ def main():
               "research output, not ship-grade, until KL/PPL has been "
               "compared against the same recipe with --halo-mode off.",
               flush=True)
-        from .halo import _hadamard_block_sizes, random_hadamard
+        from .halo import halo_metadata, random_hadamard
         from transformers import AutoConfig as _AC
 
         # Discover residual-stream dim from config. Multimodal configs
@@ -5480,7 +5500,6 @@ def main():
                 "llm_config.hidden_size.")
         _validate_halo_export_support(profile, _cfg, _hidden)
         halo_R = random_hadamard(_hidden, seed=args.halo_seed)
-        halo_blocks = _hadamard_block_sizes(_hidden)
         mtp_policy = "not_present"
         if getattr(profile, "has_mtp", lambda: False)():
             mtp_policy = "passthrough_requires_spec_decode_validation"
@@ -5492,23 +5511,30 @@ def main():
                 "speculative decoding.",
                 flush=True,
             )
-        halo_meta = {
-            "mode": "random",
-            "seed": args.halo_seed,
-            "dim": _hidden,
-            "hidden_path": _hidden_path,
-            "block_sizes": halo_blocks,
-            "profile": profile.name,
-            "mtp_policy": mtp_policy,
-        }
+        halo_meta = halo_metadata(
+            halo_R,
+            mode="random",
+            seed=args.halo_seed,
+            hidden_path=_hidden_path,
+            profile=profile,
+            mtp_policy=mtp_policy,
+        )
+        if _PRODUCTION_WEIGHT_CACHE is not None:
+            _validate_halo_cache_inputs(
+                args,
+                _PRODUCTION_WEIGHT_CACHE,
+                expected_halo=halo_meta,
+            )
         print(f"[halo] mode=random seed={args.halo_seed} "
               f"dim={_hidden} hidden_path={_hidden_path} "
-              f"blocks={halo_blocks}", flush=True)
+              f"blocks={halo_meta['block_sizes']} "
+              f"hash={halo_meta['rotation_hash']}", flush=True)
         # Persist R alongside the artifact for forensic reproducibility.
         os.makedirs(out_dir, exist_ok=True)
         torch.save({"R": halo_R.cpu(), "seed": args.halo_seed,
                     "mode": "random", "dim": _hidden,
-                    "block_sizes": halo_blocks,
+                    "block_sizes": halo_meta["block_sizes"],
+                    "rotation_hash": halo_meta["rotation_hash"],
                     "mtp_policy": mtp_policy},
                    os.path.join(out_dir, "halo_rotation.pt"))
 

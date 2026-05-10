@@ -63,6 +63,11 @@ import torch.nn as nn
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 
 
+def _cache_weight_filename(qname: str, fmt: str) -> str:
+    safe = qname.replace("/", "__").replace(".", "_")
+    return f"{safe}__{fmt}.pt"
+
+
 @dataclass
 class ProductionWeightCache:
     """Dict-like cache of production-faithful dequantized weights.
@@ -146,13 +151,20 @@ class ProductionWeightCache:
         portable by replacing resident LRU-loaded tensors with their original
         paths before serialization.  Returns the number of entries compacted.
         """
-        if not self._lru_paths:
-            return 0
         compacted = 0
-        for key, path in self._lru_paths.items():
+        for key, path in (self._lru_paths or {}).items():
             if isinstance(self.weights.get(key), torch.Tensor):
                 self.weights[key] = path
                 compacted += 1
+        if self.cache_dir:
+            cache_dir = Path(self.cache_dir)
+            for key, value in list(self.weights.items()):
+                if not isinstance(value, torch.Tensor):
+                    continue
+                fname = _cache_weight_filename(key[0], key[1])
+                if (cache_dir / fname).is_file():
+                    self.weights[key] = fname
+                    compacted += 1
         self._lru_order = [] if self._lru_order is not None else None
         self._lru_bytes = 0
         return compacted
@@ -318,12 +330,12 @@ class ProductionWeightCache:
         original_value: object,
         tensor: torch.Tensor,
     ) -> None:
-        if self._lru_order is None:
-            return
         if self._lru_paths is None:
             self._lru_paths = {}
         if key not in self._lru_paths:
             self._lru_paths[key] = str(original_value)
+        if self._lru_order is None:
+            return
         if key in self._lru_order:
             self._lru_order.remove(key)
         self._lru_bytes += tensor.element_size() * tensor.numel()
@@ -761,8 +773,7 @@ def fill_production_weight_cache(
         cache_dir_path.mkdir(parents=True, exist_ok=True)
 
     def _safe_path_early(qname: str, fmt: str) -> str:
-        safe = qname.replace("/", "__").replace(".", "_")
-        return f"{safe}__{fmt}.pt"
+        return _cache_weight_filename(qname, fmt)
 
     fmt_set = {f.upper() for f in formats}
     activation_aware_formats = {"NVFP4"}
@@ -861,9 +872,7 @@ def fill_production_weight_cache(
         print(f"[prod-cache] streaming cache to {cache_dir_path}/", flush=True)
 
     def _safe_path(qname: str, fmt: str) -> str:
-        # Replace path-unsafe chars in qnames with __ for filename use.
-        safe = qname.replace("/", "__").replace(".", "_")
-        return f"{safe}__{fmt}.pt"
+        return _cache_weight_filename(qname, fmt)
     for full_name, mod, attr in iter_quantizable_tensors(model):
         if attr != "weight" or not isinstance(mod, nn.Linear):
             continue

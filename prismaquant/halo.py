@@ -35,6 +35,7 @@ References:
 from __future__ import annotations
 
 import math
+import hashlib
 from dataclasses import dataclass, field
 
 import torch
@@ -123,13 +124,89 @@ def random_hadamard(d: int, seed: int = 0,
     with no runtime kernel changes.
     """
     H = block_hadamard_matrix(d, device=device, dtype=dtype)
-    g = torch.Generator(device=device)
+    # Generate signs on CPU so seed->rotation is identical whether the caller
+    # builds the matrix on CPU (streaming export) or CUDA (production-cache
+    # fill). The sign vector is tiny compared with the rotation matmuls.
+    g = torch.Generator(device="cpu")
     g.manual_seed(seed)
-    sign = torch.randint(0, 2, (d,), generator=g, device=device,
+    sign = torch.randint(0, 2, (d,), generator=g, device="cpu",
                          dtype=torch.int32) * 2 - 1
-    sign = sign.to(dtype=dtype)
+    sign = sign.to(device=device, dtype=dtype)
     # H @ diag(sign) — sign-shuffled rows of H. Still orthogonal.
     return H * sign[None, :]
+
+
+def halo_rotation_hash(R: torch.Tensor) -> str:
+    """Stable short hash for a generated HALO rotation."""
+    R32 = R.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    return hashlib.sha256(R32.numpy().tobytes()).hexdigest()[:16]
+
+
+def _cfg_value(obj, key: str):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _cfg_path_value(cfg, path: str):
+    cur = cfg
+    for part in path.split("."):
+        cur = _cfg_value(cur, part)
+        if cur is None:
+            return None
+    return cur
+
+
+def halo_hidden_from_config(cfg) -> tuple[int | None, str | None]:
+    """Return the residual hidden size from common HF config layouts."""
+    for path in (
+        "hidden_size",
+        "text_config.hidden_size",
+        "language_model_config.hidden_size",
+        "llm_config.hidden_size",
+    ):
+        val = _cfg_path_value(cfg, path)
+        if isinstance(val, int) and val > 0:
+            return val, path
+    return None, None
+
+
+def halo_config_bool(cfg, key: str) -> bool:
+    """Read a boolean config key from common nested text-model layouts."""
+    for path in (
+        key,
+        f"text_config.{key}",
+        f"language_model_config.{key}",
+        f"llm_config.{key}",
+    ):
+        val = _cfg_path_value(cfg, path)
+        if val is not None:
+            return bool(val)
+    return False
+
+
+def validate_halo_export_support(profile, cfg, hidden: int) -> None:
+    """Fail fast for HALO topologies this exporter cannot rotate safely."""
+    if hidden <= 0:
+        raise RuntimeError(
+            f"[halo] random mode requires a positive hidden_size; got {hidden}.")
+    if halo_config_bool(cfg, "tie_word_embeddings"):
+        raise RuntimeError(
+            "[halo] tied embeddings/lm_head are unsupported. HALO needs "
+            "separate embedding and lm_head rotations after final-norm "
+            "gamma folding; materialize an untied lm_head first or "
+            "disable HALO.")
+    supported = {"default", "qwen3", "qwen3_5_dense"}
+    if getattr(profile, "name", None) not in supported:
+        raise RuntimeError(
+            f"[halo] profile {getattr(profile, 'name', '<unknown>')!r} "
+            "is not supported by generic HALO. Current support is limited "
+            "to dense transformer profiles with embed/layers/final_norm/"
+            "lm_head topology. Qwen3.5/3.6 dense linear-attention layers "
+            "are supported; packed-MoE profiles still need profile-specific "
+            "expert rotation.")
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +443,17 @@ def apply_halo_rotation(model: nn.Module, spec: HaloModelSpec, *,
     Returns the rotation matrix `R` (saved alongside the artifact for
     forensic reproducibility).
     """
-    R = random_hadamard(spec.dim, seed=seed, dtype=torch.float32)
+    try:
+        first_param = next(model.parameters())
+        rotation_device = first_param.device
+    except StopIteration:
+        rotation_device = torch.device("cpu")
+    R = random_hadamard(
+        spec.dim,
+        seed=seed,
+        device=rotation_device,
+        dtype=torch.float32,
+    )
 
     # 1. Fold gammas first (block norms + final norm).
     for bspec in spec.block_specs:
@@ -655,3 +742,118 @@ def default_block_specs(model: nn.Module, *,
         final_norm_qname=final_norm_qname,
         block_specs=blocks,
     )
+
+
+def _standard_body_root(body_layer_prefix: str) -> str:
+    if body_layer_prefix.endswith(".layers"):
+        return body_layer_prefix[:-len(".layers")]
+    if body_layer_prefix == "layers":
+        return ""
+    return "model"
+
+
+def standard_halo_qnames(profile) -> tuple[str, str, str, str]:
+    """Return body/embed/norm/head qnames for standard dense profiles."""
+    body_layer_prefix = (
+        profile.body_layer_prefix()
+        if hasattr(profile, "body_layer_prefix")
+        else "model.layers"
+    )
+    root = _standard_body_root(body_layer_prefix)
+    embed_qname = f"{root}.embed_tokens" if root else "embed_tokens"
+    final_norm_qname = f"{root}.norm" if root else "norm"
+    lm_head_qname = (
+        profile.lm_head_name()
+        if hasattr(profile, "lm_head_name")
+        else "lm_head"
+    )
+    return body_layer_prefix, embed_qname, final_norm_qname, lm_head_qname
+
+
+def halo_metadata(
+    R: torch.Tensor,
+    *,
+    mode: str,
+    seed: int,
+    hidden_path: str | None,
+    profile,
+    mtp_policy: str = "not_present",
+) -> dict[str, object]:
+    """Build the metadata persisted into artifacts and production caches."""
+    dim = int(R.shape[0])
+    return {
+        "mode": mode,
+        "seed": int(seed),
+        "dim": dim,
+        "hidden_path": hidden_path,
+        "block_sizes": _hadamard_block_sizes(dim),
+        "profile": getattr(profile, "name", "<unknown>"),
+        "rotation_hash": halo_rotation_hash(R),
+        "mtp_policy": mtp_policy,
+    }
+
+
+def apply_random_halo_to_model(
+    model: nn.Module,
+    profile,
+    cfg,
+    *,
+    seed: int = 0,
+    verbose: bool = False,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Apply the supported random HALO profile to an in-memory model.
+
+    This is the full-model integration point used by production-cache fill and
+    re-cache. Streaming export still applies head/layer rotation lazily, but it
+    uses the same qname policy and metadata shape.
+    """
+    hidden, hidden_path = halo_hidden_from_config(cfg)
+    if hidden is None:
+        raise RuntimeError(
+            "[halo] cannot determine hidden_size from config; probed "
+            "hidden_size, text_config.hidden_size, "
+            "language_model_config.hidden_size, llm_config.hidden_size.")
+    validate_halo_export_support(profile, cfg, hidden)
+    body_layer_prefix, embed_qname, final_norm_qname, lm_head_qname = (
+        standard_halo_qnames(profile)
+    )
+    spec = default_block_specs(
+        model,
+        body_layer_prefix=body_layer_prefix,
+        embed_qname=embed_qname,
+        lm_head_qname=lm_head_qname,
+        final_norm_qname=final_norm_qname,
+    )
+    if int(spec.dim) != int(hidden):
+        raise RuntimeError(
+            f"[halo] config hidden_size={hidden} but model spec dim={spec.dim}")
+
+    # apply_halo_rotation does the actual tied-weight data_ptr guard through
+    # apply_halo_to_head in the streaming path, but the full-model path rotates
+    # directly. Keep the same safety check here before mutating weights.
+    embed = _get_module_by_qname(model, embed_qname)
+    head = _get_module_by_qname(model, lm_head_qname)
+    if (
+        hasattr(embed, "weight")
+        and hasattr(head, "weight")
+        and (
+            embed.weight is head.weight
+            or embed.weight.data_ptr() == head.weight.data_ptr()
+        )
+    ):
+        raise RuntimeError(
+            f"[halo] {embed_qname}.weight and {lm_head_qname}.weight are tied")
+
+    R = apply_halo_rotation(model, spec, seed=seed, verbose=verbose)
+    mtp_policy = "not_present"
+    if getattr(profile, "has_mtp", lambda: False)():
+        mtp_policy = "passthrough_requires_spec_decode_validation"
+    meta = halo_metadata(
+        R,
+        mode="random",
+        seed=seed,
+        hidden_path=hidden_path,
+        profile=profile,
+        mtp_policy=mtp_policy,
+    )
+    return R, meta

@@ -455,13 +455,23 @@ def test_export_halo_validator_rejects_unsupported_configs():
     _validate_halo_export_support(qwen35_dense_mtp_profile, nonpow_cfg, 96)
 
 
-def test_export_halo_rejects_prerendered_production_cache():
+def test_export_halo_validates_production_cache_metadata():
     from prismaquant.export_native_compressed import (
         _validate_halo_cache_inputs,
     )
 
+    no_halo_cache = SimpleNamespace(metadata={})
+    halo_cache = SimpleNamespace(metadata={"halo": {
+        "mode": "random",
+        "seed": 7,
+        "dim": 32,
+        "rotation_hash": "abc123",
+        "profile": "qwen3",
+    }})
+
     _validate_halo_cache_inputs(
-        SimpleNamespace(halo_mode="off", production_weight_cache="cache.pkl")
+        SimpleNamespace(halo_mode="off", production_weight_cache="cache.pkl"),
+        no_halo_cache,
     )
     _validate_halo_cache_inputs(
         SimpleNamespace(halo_mode="random", production_weight_cache=None)
@@ -470,6 +480,53 @@ def test_export_halo_rejects_prerendered_production_cache():
         _validate_halo_cache_inputs(
             SimpleNamespace(
                 halo_mode="random",
+                halo_seed=0,
                 production_weight_cache="cache.pkl",
-            )
+            ),
+            no_halo_cache,
+        )
+    with pytest.raises(RuntimeError, match="HALO seed mismatch"):
+        _validate_halo_cache_inputs(
+            SimpleNamespace(
+                halo_mode="random",
+                halo_seed=0,
+                production_weight_cache="cache.pkl",
+            ),
+            halo_cache,
+        )
+    _validate_halo_cache_inputs(
+        SimpleNamespace(
+            halo_mode="random",
+            halo_seed=7,
+            production_weight_cache="cache.pkl",
+        ),
+        halo_cache,
+        expected_halo={
+            "dim": 32,
+            "rotation_hash": "abc123",
+            "profile": "qwen3",
+        },
+    )
+    with pytest.raises(RuntimeError, match="HALO metadata mismatch"):
+        _validate_halo_cache_inputs(
+            SimpleNamespace(
+                halo_mode="random",
+                halo_seed=7,
+                production_weight_cache="cache.pkl",
+            ),
+            halo_cache,
+            expected_halo={
+                "dim": 32,
+                "rotation_hash": "different",
+                "profile": "qwen3",
+            },
+        )
+    with pytest.raises(RuntimeError, match="rendered with HALO"):
+        _validate_halo_cache_inputs(
+            SimpleNamespace(
+                halo_mode="off",
+                halo_seed=0,
+                production_weight_cache="cache.pkl",
+            ),
+            halo_cache,
         )
