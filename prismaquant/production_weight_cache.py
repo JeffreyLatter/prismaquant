@@ -20,7 +20,8 @@ quantization path:
     * optional explicit activation-clipping solver for NVFP4 render-time
       GPTQ + scale_sweep inputs
     * optional Fisher-weighted local objectives from h-detail
-    * activation-weighted MXFP8 E8M0 scale search when scale_sweep is enabled
+    * opt-in activation-weighted MXFP8 E8M0 scale search when nonzero
+      PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS are configured
 
   KNOWN GAPS (v2 work, NOT implemented):
     * batched NVFP4 GPTQ + scale-sweep across same-shape Linears
@@ -33,8 +34,8 @@ quantization path:
     * any export-only refinements added after this docstring is written
 
   MXFP8/BF16:
-    * MXFP8 uses the same activation-weighted scale search as export when
-      activations are available and scale_sweep is enabled; otherwise RTN.
+    * MXFP8 uses the same scale path as export. The default is RTN-equivalent;
+      nonzero exponent-shift search remains opt-in pending a positive KL gate.
     * BF16 is passthrough.
 
 PerturbedActivationCache installs `W_tilde` (and applies the calibrated
@@ -674,15 +675,18 @@ class _FisherRowWeightCache:
         self.loads = 0
         self.misses = 0
 
-    def get(self, qname: str) -> torch.Tensor | None:
+    def _path_for_name(self, name: str) -> Path | None:
         if self.detail_dir is None:
             return None
-        if qname in self._cache:
-            return self._cache[qname]
-        path = self.detail_dir / (self._FNAME_SUB.sub("__", qname) + ".pt")
+        return self.detail_dir / (self._FNAME_SUB.sub("__", name) + ".pt")
+
+    def _load_exact(self, name: str) -> torch.Tensor | None:
+        if self.detail_dir is None:
+            return None
+        path = self._path_for_name(name)
+        if path is None:
+            return None
         if not path.is_file():
-            self.misses += 1
-            self._cache[qname] = None
             return None
         try:
             blob = torch.load(path, map_location="cpu", weights_only=False)
@@ -693,6 +697,56 @@ class _FisherRowWeightCache:
                 weights = weights.detach().to(torch.float32).cpu()
         except Exception:
             weights = None
+        return weights
+
+    @staticmethod
+    def _split_fused_names(qname: str) -> tuple[str, ...]:
+        if qname.endswith(".qkv_proj"):
+            prefix = qname[:-len(".qkv_proj")]
+            return (
+                f"{prefix}.q_proj",
+                f"{prefix}.k_proj",
+                f"{prefix}.v_proj",
+            )
+        if qname.endswith(".gate_up_proj"):
+            prefix = qname[:-len(".gate_up_proj")]
+            return (f"{prefix}.gate_proj", f"{prefix}.up_proj")
+        if qname.endswith(".in_proj_qkvz"):
+            prefix = qname[:-len(".in_proj_qkvz")]
+            return (f"{prefix}.in_proj_qkv", f"{prefix}.in_proj_z")
+        return ()
+
+    @staticmethod
+    def _combine_split_weights(parts: Sequence[torch.Tensor]) -> torch.Tensor | None:
+        tensors = [
+            p.detach().reshape(-1).to(torch.float32).cpu()
+            for p in parts
+            if isinstance(p, torch.Tensor) and p.numel() > 0
+        ]
+        if not tensors:
+            return None
+        n = min(int(t.numel()) for t in tensors)
+        if n <= 0:
+            return None
+        stacked = torch.stack([t[:n] for t in tensors], dim=0)
+        return stacked.mean(dim=0)
+
+    def get(self, qname: str) -> torch.Tensor | None:
+        if self.detail_dir is None:
+            return None
+        if qname in self._cache:
+            return self._cache[qname]
+
+        weights = self._load_exact(qname)
+        if weights is None:
+            split = self._split_fused_names(qname)
+            if split:
+                parts = [
+                    part for name in split
+                    if (part := self._load_exact(name)) is not None
+                ]
+                weights = self._combine_split_weights(parts)
+
         if weights is None:
             self.misses += 1
         else:

@@ -1053,6 +1053,7 @@ class GlobalPrecompute:
     ids: torch.Tensor  # shape (N, T), dtype long, on device
     resident_stats: dict[str, dict]
     resident_h_full: dict[str, torch.Tensor]
+    resident_g2_per_token: dict[str, torch.Tensor]
     resident_act_snaps: dict[str, list[torch.Tensor]]
     expert_saliency: dict[str, dict[int, float]]
     expert_info: dict[str, tuple[str, str]]
@@ -1223,6 +1224,7 @@ def _compute_global_precompute(
 
     resident_stats: dict[str, dict] = {}
     resident_h_full: dict[str, torch.Tensor] = {}
+    resident_g2_per_token: dict[str, list[torch.Tensor]] = defaultdict(list)
     resident_saved_inputs: dict[str, torch.Tensor] = {}
     resident_handles: list = []
     resident_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -1264,6 +1266,9 @@ def _compute_global_precompute(
             gy2_sq = gy2.pow(2)                  # bf16 (T, out)
             x2_sq = x2.pow(2)                    # bf16 (T, in)
             chunk_h = (gy2_sq.t() @ x2_sq).float()  # bf16 matmul + fp32 result
+            resident_g2_per_token[name].append(
+                gy2_sq.sum(dim=1).detach().to("cpu", dtype=torch.float32)
+            )
             acc = resident_h_full.get(name)
             if acc is None:
                 acc = torch.zeros(
@@ -1378,6 +1383,11 @@ def _compute_global_precompute(
         ids=ids,
         resident_stats=resident_stats,
         resident_h_full=resident_h_full,
+        resident_g2_per_token={
+            name: torch.cat(parts, dim=0)
+            for name, parts in resident_g2_per_token.items()
+            if parts
+        },
         resident_act_snaps=dict(resident_act_snaps),
         expert_saliency=phase1_expert_saliency,
         expert_info=phase1_expert_info,
@@ -1401,6 +1411,7 @@ def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
         "ids_cpu": pre.ids.detach().cpu(),
         "resident_stats": pre.resident_stats,
         "resident_h_full": pre.resident_h_full,
+        "resident_g2_per_token": pre.resident_g2_per_token,
         "resident_act_snaps": pre.resident_act_snaps,
         "expert_saliency": pre.expert_saliency,
         "expert_info": pre.expert_info,
@@ -1436,6 +1447,7 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
         ids=data["ids_cpu"].to(device),
         resident_stats=data["resident_stats"],
         resident_h_full=data["resident_h_full"],
+        resident_g2_per_token=data.get("resident_g2_per_token", {}),
         resident_act_snaps=data["resident_act_snaps"],
         # REAP expert pruning is archived. Ignore any saliency persisted
         # by older precompute caches so resumed probes do not re-emit it.
@@ -1555,6 +1567,7 @@ def _run_body_streaming_shard(
 
     merged_stats: dict[str, dict] = {}
     merged_h_full: dict[str, torch.Tensor] = {}
+    merged_g2_per_token: dict[str, list[torch.Tensor]] = defaultdict(list)
 
     tokens_in_sample = calib.size(-1)
     batch_size = calib.size(0)
@@ -1599,6 +1612,9 @@ def _run_body_streaming_shard(
         h = precomputed.resident_h_full.get(fqn)
         if h is not None:
             merged_h_full[fqn] = h.clone()
+        g2 = precomputed.resident_g2_per_token.get(fqn)
+        if g2 is not None:
+            merged_g2_per_token[fqn].append(g2.detach().to(torch.float32).cpu())
 
     # Activation snap accumulators (populated during Phase-3 for body
     # Linears; resident snaps were populated during Phase-2 hooks above).
@@ -1725,6 +1741,7 @@ def _run_body_streaming_shard(
 
             tracked_here = layer_linear_names[L]
             acc_h_full: dict[str, torch.Tensor] = {}
+            acc_g2_per_token: dict[str, list[torch.Tensor]] = defaultdict(list)
             acc_stats: dict[str, dict] = {}
             saved_inputs: dict[str, torch.Tensor] = {}
             handles: list = []
@@ -1821,6 +1838,11 @@ def _run_body_streaming_shard(
                                 trace_per_e = per_token.sum(dim=1)
                                 for i, (_eid, lname, _X, _gy, T, w_ref) in enumerate(chunk_items):
                                     acc_stats[lname]["h_trace_raw"] += float(trace_per_e[i].item())
+                                    if collect_h_full:
+                                        acc_g2_per_token[lname].append(
+                                            gy_norm[i, :T].detach().to(
+                                                "cpu", dtype=torch.float32)
+                                        )
                                     if collect_h_full:
                                         acc = acc_h_full.get(lname)
                                         if acc is None:
@@ -1957,6 +1979,11 @@ def _run_body_streaming_shard(
                     gy2_sq = gy2.pow(2)                        # bf16
                     x2_sq = x2.pow(2)                          # bf16
                     chunk_h = (gy2_sq.t() @ x2_sq).float()    # bf16 matmul + fp32 cast
+                    if collect_h_full:
+                        acc_g2_per_token[name].append(
+                            gy2_sq.sum(dim=1).detach().to(
+                                "cpu", dtype=torch.float32)
+                        )
                     if collect_h_full:
                         acc = acc_h_full.get(name)
                         if acc is None:
@@ -2143,6 +2170,11 @@ def _run_body_streaming_shard(
                     x2_sq = x2.pow(2)
                     chunk_h = (gy2_sq.t() @ x2_sq).float()
                     if collect_h_full:
+                        acc_g2_per_token[name].append(
+                            gy2_sq.sum(dim=1).detach().to(
+                                "cpu", dtype=torch.float32)
+                        )
+                    if collect_h_full:
                         acc = acc_h_full.get(name)
                         if acc is None:
                             acc = torch.zeros(
@@ -2262,6 +2294,9 @@ def _run_body_streaming_shard(
                         merged_h_full[fqn].add_(h)
                     else:
                         merged_h_full[fqn] = h.clone()
+                for fqn, parts in acc_g2_per_token.items():
+                    if parts:
+                        merged_g2_per_token[fqn].extend(parts)
             if packed_full_acc:
                 detail_dir = Path(h_detail_dir)
                 detail_dir.mkdir(parents=True, exist_ok=True)
@@ -2287,7 +2322,7 @@ def _run_body_streaming_shard(
             # each in-scope layer prevents the cumulative-residue OOM
             # we hit at the L7 transition. For out-of-scope layers (no
             # hooks fired), the empty_cache is essentially a no-op.
-            del x_in, out, saved_inputs, acc_stats, acc_h_full, handles
+            del x_in, out, saved_inputs, acc_stats, acc_h_full, acc_g2_per_token, handles
             if L in in_scope_layers:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -2335,7 +2370,20 @@ def _run_body_streaming_shard(
         detail_dir.mkdir(parents=True, exist_ok=True)
         for fqn, h in merged_h_full.items():
             fname = re.sub(r"[^A-Za-z0-9_-]", "__", fqn) + ".pt"
-            torch.save({"H": h, "name": fqn}, detail_dir / fname)
+            g2_parts = merged_g2_per_token.get(fqn, [])
+            g2_per_token = (
+                torch.cat(g2_parts, dim=0).to(torch.float32).cpu()
+                if g2_parts else torch.empty(0, dtype=torch.float32)
+            )
+            torch.save(
+                {
+                    "H": h,
+                    "name": fqn,
+                    "g2_per_token": g2_per_token,
+                    "h_detail_version": 2,
+                },
+                detail_dir / fname,
+            )
 
     # Flush activation snapshots.
     if cache_dir is not None:

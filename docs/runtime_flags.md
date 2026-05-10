@@ -34,7 +34,7 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE` | **off** | Prints per-group solver decisions while filling the production cache. |
 | `PRISMAQUANT_FISHER_WEIGHTED_GPTQ` | **off** | Enables Fisher/output-weighted local objectives when an h-detail cache is supplied. NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep weight activation rows by normalized `g2_per_token`. |
 | `PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP` | `64` | Caps normalized per-token Fisher weights before re-normalizing, preventing a single calibration token from dominating the local solve. |
-| `PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS` | `-2,-1,0,1,2` | Candidate E8M0 exponent shifts for MXFP8 activation-weighted scale search. |
+| `PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS` | `0` | Candidate E8M0 exponent shifts for MXFP8 activation-weighted scale search. Nonzero shifts are experimental; .8B and 4B A/Bs on 2026-05-10 regressed KL, so production defaults to RTN-equivalent MXFP8. |
 
 ## Pipeline production-cache flags
 

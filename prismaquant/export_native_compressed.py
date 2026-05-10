@@ -1903,6 +1903,18 @@ def _mxfp8_scale_sweep_quantize(
         raise ValueError(f"MXFP8 scale sweep requires group_size={group_size} ∤ {cols}")
     W = weight.to(torch.float32)
     grouped = W.reshape(rows, cols // group_size, group_size)
+    raw_shifts = os.environ.get("PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS", "0")
+    try:
+        shifts = [int(x.strip()) for x in raw_shifts.split(",") if x.strip()]
+    except Exception:
+        shifts = [0]
+    if not shifts:
+        shifts = [0]
+    if shifts == [0]:
+        quant_fp8, e8m0_uint8 = _mxfp8_quantize_grouped(grouped)
+        dequant = _mxfp8_dequantize_grouped(quant_fp8, e8m0_uint8)
+        return quant_fp8.reshape(rows, cols), e8m0_uint8, dequant.reshape(rows, cols)
+
     col_importance = _activation_col_importance_for_gptq(
         activations,
         cols,
@@ -1913,13 +1925,6 @@ def _mxfp8_scale_sweep_quantize(
 
     max_abs = grouped.abs().amax(dim=-1).clamp_min(2.0 ** -127)
     base_e = torch.ceil(torch.log2(max_abs / MXFP8_E4M3_MAX)).clamp(-127, 127)
-    raw_shifts = os.environ.get("PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS", "-2,-1,0,1,2")
-    try:
-        shifts = [int(x.strip()) for x in raw_shifts.split(",") if x.strip()]
-    except Exception:
-        shifts = [-2, -1, 0, 1, 2]
-    if not shifts:
-        shifts = [0]
     shift_t = torch.tensor(shifts, device=W.device, dtype=torch.float32)
 
     best_err: torch.Tensor | None = None

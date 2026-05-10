@@ -1248,6 +1248,7 @@ class TestActivationAwarePasses(unittest.TestCase):
         self.assertTrue(torch.allclose(out[1], torch.full((2,), 2 ** 0.5)))
 
     def test_mxfp8_scale_sweep_is_no_worse_than_baseline(self):
+        import os
         import torch
         import prismaquant.export_native_compressed as m
 
@@ -1259,7 +1260,17 @@ class TestActivationAwarePasses(unittest.TestCase):
             q.reshape(16, 2, 32),
             s,
         ).reshape_as(W)
-        _, _, swept = m._mxfp8_scale_sweep_quantize(W, X, group_size=32)
+        saved = os.environ.pop("PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS", None)
+        try:
+            _, _, default = m._mxfp8_scale_sweep_quantize(W, X, group_size=32)
+            self.assertTrue(torch.equal(default, baseline))
+            os.environ["PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS"] = "-2,-1,0,1,2"
+            _, _, swept = m._mxfp8_scale_sweep_quantize(W, X, group_size=32)
+        finally:
+            if saved is None:
+                os.environ.pop("PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS", None)
+            else:
+                os.environ["PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS"] = saved
 
         imp = X.pow(2).mean(dim=0).reshape(1, 2, 32)
         base_err = ((W.reshape(16, 2, 32) - baseline.reshape(16, 2, 32)).pow(2) * imp).sum()
