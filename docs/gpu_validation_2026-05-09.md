@@ -70,6 +70,37 @@ Logs:
 - MTP eager: `/home/rob/dq-runs/qwen36-27b-step00-production-cache-vllmlegal-export-main-20260509T073125Z/validate_native_mtp_codex.log`
 - Graph: `/home/rob/dq-runs/qwen36-27b-step00-production-cache-vllmlegal-export-main-20260509T073125Z/validate_native_graph_codex.log`
 
+## Qwen3.6-27B Re-cache Replay Smoke
+
+Run:
+
+`/home/rob/dq-runs/qwen36-27b-recache-smoke-20260509T235955Z`
+
+Inputs:
+
+- source model: `/home/rob/.cache/huggingface/qwen36-27b-bf16`
+- layer config: `/home/rob/dq-runs/qwen36-27b-center-polish-validation-main-20260509T063717Z/selected_step_00/layer_config_mtp_bf16.json`
+- production cache manifest: `/home/rob/dq-runs/qwen3p6-27b-kl-probe-triad-n64-production-20260508T032958Z-directpy/production_weight_cache_nvfp4_mxfp8.pkl`
+- production cache directory: `/home/rob/dq-runs/qwen3p6-27b-kl-probe-triad-n64-production-20260508T032958Z-directpy/production_weight_cache`
+- calibration: `diverse-v1.jsonl`, `n=1`, `seqlen=128`
+
+Result:
+
+- Production-weight replay ran on CUDA and measured 497 activation ranges in
+  65.3 seconds.
+- The source production cache sidecars were left untouched via
+  `--no-write-sidecar`.
+- Re-cache materially changed activation ranges even on this tiny smoke:
+  median after/before max-abs ratio `0.9156`, p05 `0.2154`, max `1.1688`,
+  and `351/496` common ranges moved by more than 5%.
+- The recached manifest compacted back to path references before pickle:
+  `109K`, `992` weight entries, `0` resident tensors.
+
+Logs:
+
+- Replay: `/home/rob/dq-runs/qwen36-27b-recache-smoke-20260509T235955Z/production_recache_compact.log`
+- Delta JSON: `/home/rob/dq-runs/qwen36-27b-recache-smoke-20260509T235955Z/recache_delta_summary.json`
+
 ## Notes
 
 - The validation harness now sets `VLLM_WORKER_MULTIPROC_METHOD=spawn` before
@@ -79,3 +110,6 @@ Logs:
   vLLM expects the model field absent/null so it can use the embedded-MTP path.
 - `run-pipeline.sh` now defaults `PRODUCTION_RECACHE=1`. Use
   `PRODUCTION_RECACHE=0` for explicit no-recache ablations.
+- Disk-backed `ProductionWeightCache` manifests now compact resident tensors
+  back to path references before pickle; this prevents re-cache replay from
+  turning a small manifest into a multi-GB tensor pickle.
