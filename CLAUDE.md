@@ -1,5 +1,9 @@
 # Claude Handover
 
+Before implementing new functionality, read `AGENTS.md` and
+`docs/design_guidelines.md`. Those files are the normative design rules for
+GPU-first execution, cache reuse, vLLM gating, and measurement discipline.
+
 Before working on PrismaQuant, read in order:
 
 - `.claude/prismaquant-handover-2026-05-02.md` — **CURRENT STATE.**
@@ -12,4 +16,3 @@ Before working on PrismaQuant, read in order:
   Δloss bug + the design that became PrismaSCOUT. User's conceptual core.
 - `.claude/prismaquant-handover-2026-04-29.md` — older session context
   (HALO landing, wins stack, overnight 4B smoke).
-

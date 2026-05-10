@@ -2,6 +2,9 @@
 
 Current docs in this directory describe the live PrismaQuant implementation:
 
+- `design_guidelines.md`: mandatory design rules for new functionality,
+  including GPU-first execution, cache reuse, vLLM gates, and measurement
+  discipline.
 - `runtime_flags.md`: environment controls used by production runs.
 - `calibration_diverse_v1.md`: fixed mixed-domain calibration recipe.
 - `halo_27b_attempt_2026-05-09.md`: invalidated HALO 27B attempt and
