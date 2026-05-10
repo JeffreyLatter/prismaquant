@@ -11,6 +11,8 @@ from prismaquant.production_recache import (
     _load_assignment,
     activation_max_abs_delta_summary,
     assignment_digest,
+    preload_production_cache_for_assignment,
+    production_cache_keys_for_assignment,
     recache_production_weight_cache,
 )
 
@@ -42,6 +44,60 @@ def test_prefetch_loads_disk_entries_and_respects_lru(tmp_path):
     assert cache.compact_for_pickle() >= 1
     assert all(not isinstance(value, torch.Tensor) for value in cache.weights.values())
     assert cache._lru_bytes == 0
+
+
+def test_production_cache_resolves_format_aliases_and_sizes(tmp_path):
+    tensor = torch.ones((2, 2), dtype=torch.float32)
+    path = tmp_path / "layer.pt"
+    torch.save(tensor, path)
+    cache = ProductionWeightCache(
+        weights={("layer", "MXFP8_E4M3"): path.name},
+        levers={"gptq": True},
+        cache_dir=str(tmp_path),
+    )
+
+    assert cache.resolve_key("layer", "MXFP8") == ("layer", "MXFP8_E4M3")
+    assert ("layer", "MXFP8") in cache
+    assert cache.estimate_nbytes([("layer", "MXFP8_E4M3")]) == path.stat().st_size
+    assert torch.equal(cache.get("layer", "MXFP8"), tensor)
+
+
+def test_recache_preload_respects_resident_budget(tmp_path):
+    for name in ("a", "b"):
+        torch.save(torch.ones((2, 2)), tmp_path / f"{name}.pt")
+    cache = ProductionWeightCache(
+        weights={
+            ("a", "NVFP4"): "a.pt",
+            ("b", "MXFP8_E4M3"): "b.pt",
+        },
+        levers={"gptq": True},
+        cache_dir=str(tmp_path),
+    )
+    assignment = {"a": "NVFP4", "b": "MXFP8", "c": "BF16"}
+    keys, missing = production_cache_keys_for_assignment(cache, assignment)
+
+    assert keys == [("a", "NVFP4"), ("b", "MXFP8_E4M3")]
+    assert missing == []
+
+    stats = preload_production_cache_for_assignment(
+        cache,
+        assignment,
+        max_resident_bytes=1,
+        require=False,
+        progress=False,
+    )
+    assert stats["skipped"] is True
+    assert stats["loaded"] == 0
+
+    stats = preload_production_cache_for_assignment(
+        cache,
+        assignment,
+        max_resident_bytes=10_000_000,
+        require=True,
+        progress=False,
+    )
+    assert stats["loaded"] == 2
+    assert all(isinstance(cache.weights[k], torch.Tensor) for k in keys)
 
 
 def test_production_cache_records_damp_sweep_lever(monkeypatch):

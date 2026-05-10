@@ -163,6 +163,57 @@ class ProductionWeightCache:
             path = str(Path(self.cache_dir) / path)
         return path
 
+    def _name_candidates(self, name: str) -> list[str]:
+        candidates = [name]
+        if name.endswith(".weight"):
+            candidates.append(name[:-len(".weight")])
+        if name.startswith("model.language_model."):
+            candidates.append("model." + name[len("model.language_model."):])
+        return list(dict.fromkeys(candidates))
+
+    def _format_candidates(self, fmt: str) -> list[str]:
+        raw = str(fmt)
+        candidates = [raw, raw.upper()]
+        try:
+            from prismaquant import format_registry as fr
+            candidates.append(fr.canonical_format_name(raw))
+        except Exception:
+            pass
+        if "MXFP8_E4M3" in candidates:
+            candidates.append("MXFP8")
+        if "MXFP8" in candidates:
+            candidates.append("MXFP8_E4M3")
+        if "FP8_E4M3" in candidates:
+            candidates.append("FP8")
+        if "FP8" in candidates:
+            candidates.append("FP8_E4M3")
+        return list(dict.fromkeys(candidates))
+
+    def resolve_key(self, name: str, fmt: str) -> tuple[str, str] | None:
+        """Resolve recipe aliases to the concrete stored cache key."""
+        for cand in self._name_candidates(name):
+            for fmt_cand in self._format_candidates(fmt):
+                key = (cand, fmt_cand)
+                if key in self.weights:
+                    return key
+        return None
+
+    def estimate_nbytes(
+        self,
+        keys: Sequence[tuple[str, str]] | None = None,
+    ) -> int:
+        """Estimate resident bytes for cache entries without loading them."""
+        total = 0
+        for key in (list(self.weights) if keys is None else list(keys)):
+            value = self.weights.get(key)
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                total += value.element_size() * value.numel()
+            else:
+                total += Path(self._path_for_value(value)).stat().st_size
+        return total
+
     def _record_lru_load(
         self,
         key: tuple[str, str],
@@ -257,15 +308,9 @@ class ProductionWeightCache:
         return loaded
 
     def get(self, name: str, fmt: str) -> torch.Tensor | None:
-        # Try canonical alias variants the perturbed map exposes.
-        candidates = [name]
-        if name.endswith(".weight"):
-            candidates.append(name[:-len(".weight")])
-        if name.startswith("model.language_model."):
-            candidates.append("model." + name[len("model.language_model."):])
-        for cand in candidates:
-            if (cand, fmt) in self.weights:
-                return self._resolve_to_tensor((cand, fmt))
+        key = self.resolve_key(name, fmt)
+        if key is not None:
+            return self._resolve_to_tensor(key)
         return None
 
     def relocate(self, new_cache_dir: str | Path) -> None:
@@ -322,12 +367,7 @@ class ProductionWeightCache:
     def __contains__(self, key: tuple[str, str]) -> bool:
         # Mirror the alias-resolution that ``get`` performs.
         name, fmt = key
-        candidates = [name]
-        if name.endswith(".weight"):
-            candidates.append(name[:-len(".weight")])
-        if name.startswith("model.language_model."):
-            candidates.append("model." + name[len("model.language_model."):])
-        return any((c, fmt) in self.weights for c in candidates)
+        return self.resolve_key(name, fmt) is not None
 
     def __len__(self) -> int:
         return len(self.weights)
@@ -344,21 +384,13 @@ class ProductionWeightCache:
         tensors — so it stays cheap on disk-streaming caches with
         thousands of entries totalling tens of GB.
         """
-        def _has_key(name: str, fmt: str) -> bool:
-            cands = [name]
-            if name.endswith(".weight"):
-                cands.append(name[:-len(".weight")])
-            if name.startswith("model.language_model."):
-                cands.append("model." + name[len("model.language_model."):])
-            return any((c, fmt) in self.weights for c in cands)
-
         hits: list[tuple[str, str]] = []
         misses: list[tuple[str, str]] = []
         for q in expected_qnames:
             for f in formats:
                 if f.upper() == "BF16":
                     continue
-                if _has_key(q, f.upper()):
+                if self.resolve_key(q, f.upper()) is not None:
                     hits.append((q, f.upper()))
                 else:
                     misses.append((q, f.upper()))
@@ -962,10 +994,23 @@ def fill_production_weight_cache(
         cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
     )
     if recache_pass:
-        from prismaquant.production_recache import recache_production_weight_cache
+        from prismaquant.production_recache import (
+            preload_production_cache_for_assignment,
+            recache_production_weight_cache,
+        )
 
         if progress:
             print("[prod-cache] running production activation re-cache", flush=True)
+        preload_production_cache_for_assignment(
+            cache,
+            recache_assignment or {},
+            max_resident_bytes=(
+                cache._lru_max_bytes if cache._lru_max_bytes > 0 else None
+            ),
+            max_workers=4,
+            require=False,
+            progress=progress,
+        )
         recache_production_weight_cache(
             model,
             calib_ids,

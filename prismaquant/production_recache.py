@@ -20,6 +20,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from prismaquant import format_registry as fr
 from prismaquant.decision_units import fused_group_key
 from prismaquant.perturbed_x_cache import (
     PerturbedActivationCache,
@@ -58,6 +59,109 @@ def _unify_fused_max_abs(
     return unified
 
 
+def production_cache_keys_for_assignment(
+    production_weight_cache,
+    assignment: Mapping[str, str],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Return concrete non-BF16 cache keys and missing assignment entries."""
+    keys: list[tuple[str, str]] = []
+    missing: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for qname, fmt in assignment.items():
+        fmt_canon = fr.canonical_format_name(str(fmt))
+        if fmt_canon == "BF16":
+            continue
+        key = (
+            production_weight_cache.resolve_key(qname, fmt_canon)
+            if hasattr(production_weight_cache, "resolve_key")
+            else None
+        )
+        if key is None:
+            missing.append((str(qname), fmt_canon))
+            continue
+        if key not in seen:
+            keys.append(key)
+            seen.add(key)
+    return keys, missing
+
+
+def preload_production_cache_for_assignment(
+    production_weight_cache,
+    assignment: Mapping[str, str],
+    *,
+    max_resident_bytes: int | None = None,
+    max_workers: int = 4,
+    require: bool = False,
+    progress: bool = True,
+) -> dict[str, object]:
+    """Preload the concrete rendered weights needed by ``assignment``.
+
+    This is an explicit guardrail against disk-bound recache replay.  If the
+    selected assignment cannot fit inside the resident cache budget, ``require``
+    turns that into a hard failure instead of silently streaming from NVMe.
+    """
+    keys, missing = production_cache_keys_for_assignment(
+        production_weight_cache,
+        assignment,
+    )
+    nbytes = (
+        production_weight_cache.estimate_nbytes(keys)
+        if hasattr(production_weight_cache, "estimate_nbytes")
+        else 0
+    )
+    budget = (
+        int(max_resident_bytes)
+        if max_resident_bytes is not None and int(max_resident_bytes) > 0
+        else None
+    )
+    stats: dict[str, object] = {
+        "keys": len(keys),
+        "missing": len(missing),
+        "bytes": int(nbytes),
+        "budget_bytes": int(budget or 0),
+        "loaded": 0,
+        "skipped": False,
+    }
+    if missing:
+        stats["missing_sample"] = missing[:8]
+        msg = (
+            f"production cache missing {len(missing)} assignment entries; "
+            f"sample={missing[:8]}"
+        )
+        if require:
+            raise RuntimeError(msg)
+        if progress:
+            print(f"[prod-recache] WARNING: {msg}", flush=True)
+    if budget is not None and nbytes > budget:
+        stats["skipped"] = True
+        msg = (
+            "production cache preload would exceed resident budget: "
+            f"{nbytes / 1024**3:.2f} GiB needed, "
+            f"{budget / 1024**3:.2f} GiB budget"
+        )
+        if require:
+            raise RuntimeError(msg)
+        if progress:
+            print(f"[prod-recache] WARNING: {msg}; skipping preload", flush=True)
+        return stats
+
+    if progress:
+        print(
+            "[prod-recache] preloading production cache: "
+            f"{len(keys)} entries, {nbytes / 1024**3:.2f} GiB",
+            flush=True,
+        )
+    loaded = production_weight_cache.prefetch(keys, max_workers=max_workers)
+    stats["loaded"] = int(loaded)
+    if progress:
+        print(
+            f"[prod-recache] preloaded {loaded}/{len(keys)} production "
+            "cache entries",
+            flush=True,
+        )
+    return stats
+
+
 @torch.no_grad()
 def measure_production_activation_max_abs(
     model: nn.Module,
@@ -68,6 +172,10 @@ def measure_production_activation_max_abs(
     profile=None,
     include_activation_quant: bool = True,
     microbatch_size: int = 1,
+    preload_production_cache: bool = False,
+    preload_max_bytes: int | None = None,
+    preload_max_workers: int = 4,
+    require_preload: bool = False,
     progress: bool = True,
 ) -> dict[str, float]:
     """Measure activation max-abs under quantized upstream weights.
@@ -85,6 +193,15 @@ def measure_production_activation_max_abs(
     started = time.monotonic()
     device = _model_device(model)
     cal_hash = calibration_data_hash(calibration_data)
+    if preload_production_cache:
+        preload_production_cache_for_assignment(
+            production_weight_cache,
+            assignment,
+            max_resident_bytes=preload_max_bytes,
+            max_workers=preload_max_workers,
+            require=require_preload,
+            progress=progress,
+        )
     with tempfile.TemporaryDirectory(prefix="prismaquant_recache_") as tmp:
         builder = PerturbedActivationCache(
             model,
@@ -209,6 +326,10 @@ def recache_production_weight_cache(
     profile=None,
     include_activation_quant: bool = True,
     microbatch_size: int = 1,
+    preload_production_cache: bool = False,
+    preload_max_bytes: int | None = None,
+    preload_max_workers: int = 4,
+    require_preload: bool = False,
     progress: bool = True,
     write_sidecar: bool = True,
 ) -> dict[str, float]:
@@ -221,6 +342,10 @@ def recache_production_weight_cache(
         profile=profile,
         include_activation_quant=include_activation_quant,
         microbatch_size=microbatch_size,
+        preload_production_cache=preload_production_cache,
+        preload_max_bytes=preload_max_bytes,
+        preload_max_workers=preload_max_workers,
+        require_preload=require_preload,
         progress=progress,
     )
     apply_activation_max_abs_to_cache(
@@ -351,6 +476,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work-root", default=None)
     parser.add_argument("--microbatch-size", type=int, default=1)
     parser.add_argument(
+        "--production-cache-prefetch",
+        choices=("auto", "off", "require"),
+        default="auto",
+        help="Preload assignment-required rendered weights before replay. "
+             "'auto' preloads only when they fit the LRU/resident budget; "
+             "'require' fails instead of allowing an NVMe-bound replay.",
+    )
+    parser.add_argument("--production-cache-prefetch-workers", type=int, default=4)
+    parser.add_argument(
         "--no-activation-quant",
         action="store_true",
         help="Measure ranges with production weights installed but without "
@@ -416,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
         profile=profile,
         include_activation_quant=not args.no_activation_quant,
         microbatch_size=args.microbatch_size,
+        preload_production_cache=args.production_cache_prefetch != "off",
+        preload_max_bytes=(
+            getattr(cache, "_lru_max_bytes", 0) or None
+        ),
+        preload_max_workers=args.production_cache_prefetch_workers,
+        require_preload=args.production_cache_prefetch == "require",
         progress=True,
         write_sidecar=not args.no_write_sidecar,
     )
