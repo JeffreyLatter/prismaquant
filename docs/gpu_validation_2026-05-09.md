@@ -101,6 +101,11 @@ Logs:
 - Replay: `/home/rob/dq-runs/qwen36-27b-recache-smoke-20260509T235955Z/production_recache_compact.log`
 - Delta JSON: `/home/rob/dq-runs/qwen36-27b-recache-smoke-20260509T235955Z/recache_delta_summary.json`
 
+An attempted `n=8`, `seqlen=256` replay against the same 91G disk-backed
+cache was stopped because it became NVMe-bound: about 1.3GB/s read throughput
+and low GPU utilization. Do not use that path for final 27B attribution unless
+the rendered cache can stay resident enough to make the replay GPU-bound.
+
 ## Notes
 
 - The validation harness now sets `VLLM_WORKER_MULTIPROC_METHOD=spawn` before
