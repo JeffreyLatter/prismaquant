@@ -356,6 +356,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Measure ranges with production weights installed but without "
         "activation quantization in the replay hooks.",
     )
+    parser.add_argument(
+        "--no-write-sidecar",
+        action="store_true",
+        help="Do not update activation_max_abs sidecars in the production "
+             "cache directory. Use when reusing a shared source cache for "
+             "an ablation or smoke run.",
+    )
     args = parser.parse_args(argv)
 
     from transformers import AutoTokenizer
@@ -410,7 +417,19 @@ def main(argv: list[str] | None = None) -> int:
         include_activation_quant=not args.no_activation_quant,
         microbatch_size=args.microbatch_size,
         progress=True,
+        write_sidecar=not args.no_write_sidecar,
     )
+    compacted = (
+        cache.compact_for_pickle()
+        if hasattr(cache, "compact_for_pickle")
+        else 0
+    )
+    if compacted:
+        print(
+            f"[prod-recache] compacted {compacted} resident cache tensors "
+            "back to path references before writing",
+            flush=True,
+        )
     with open(output, "wb") as fh:
         pickle.dump(cache, fh, protocol=pickle.HIGHEST_PROTOCOL)
     print(

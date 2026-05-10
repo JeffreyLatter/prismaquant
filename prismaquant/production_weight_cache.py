@@ -137,6 +137,26 @@ class ProductionWeightCache:
                 if self._lru_paths is not None and evict_key in self._lru_paths:
                     self.weights[evict_key] = self._lru_paths[evict_key]
 
+    def compact_for_pickle(self) -> int:
+        """Restore disk-backed resident tensors to path references.
+
+        A recache/polish pass may lazily load many disk-streamed entries into
+        ``weights``.  Pickling that state would serialize the tensors and turn a
+        small manifest into a multi-GB file.  This method keeps the cache
+        portable by replacing resident LRU-loaded tensors with their original
+        paths before serialization.  Returns the number of entries compacted.
+        """
+        if not self._lru_paths:
+            return 0
+        compacted = 0
+        for key, path in self._lru_paths.items():
+            if isinstance(self.weights.get(key), torch.Tensor):
+                self.weights[key] = path
+                compacted += 1
+        self._lru_order = [] if self._lru_order is not None else None
+        self._lru_bytes = 0
+        return compacted
+
     def _path_for_value(self, value: object) -> str:
         path = str(value)
         if self.cache_dir and not Path(path).is_absolute():
@@ -956,4 +976,11 @@ def fill_production_weight_cache(
             microbatch_size=recache_microbatch_size,
             progress=progress,
         )
+        compacted = cache.compact_for_pickle()
+        if progress and compacted:
+            print(
+                f"[prod-cache] compacted {compacted} resident cache tensors "
+                "back to path references after re-cache",
+                flush=True,
+            )
     return cache

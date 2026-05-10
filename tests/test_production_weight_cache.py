@@ -39,6 +39,10 @@ def test_prefetch_loads_disk_entries_and_respects_lru(tmp_path):
     assert cache._lru_bytes <= 2 * tensor_nbytes
     assert torch.equal(cache.get("a", "NVFP4"), torch.zeros((2, 2)))
 
+    assert cache.compact_for_pickle() >= 1
+    assert all(not isinstance(value, torch.Tensor) for value in cache.weights.values())
+    assert cache._lru_bytes == 0
+
 
 def test_production_cache_records_damp_sweep_lever(monkeypatch):
     model = nn.Linear(1, 1, bias=False)
