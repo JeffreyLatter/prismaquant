@@ -78,6 +78,7 @@ from prismaquant.build_rtn_cache import iter_quantizable_tensors
 
 
 DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN = 0.0
+DEFAULT_ACT_CLIP_SOLVER_HOLDOUT_FRACTION = 0.25
 
 
 def _cache_weight_filename(qname: str, fmt: str) -> str:
@@ -846,6 +847,33 @@ def _activation_output_error(
     return total / max(1, int(X.shape[0]) * int(rows))
 
 
+def _prismaclip_activation_split(
+    activations: torch.Tensor,
+    *,
+    split: str,
+    holdout_stride: int,
+    holdout_offset: int,
+) -> torch.Tensor:
+    """Return deterministic train/holdout activation rows for PrismaClip scoring."""
+    if split == "all" or holdout_stride <= 1:
+        return activations
+    cols = int(activations.shape[-1])
+    X = activations.detach().reshape(-1, cols)
+    if X.shape[0] < 2:
+        return activations
+    row_ids = torch.arange(X.shape[0], device=X.device)
+    holdout = (row_ids % holdout_stride) == (holdout_offset % holdout_stride)
+    if split == "train":
+        mask = ~holdout
+    elif split == "holdout":
+        mask = holdout
+    else:
+        raise ValueError(f"unknown PrismaClip activation split: {split}")
+    if not bool(mask.any()):
+        return activations
+    return X[mask]
+
+
 _AWQ_CACHE_FORMATS = frozenset({"NVFP4", "MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
 _AWQ_INPUT_LN_LEAVES = frozenset({
     "q_proj", "k_proj", "v_proj",
@@ -1441,18 +1469,50 @@ def _solve_nvfp4_activation_clip_groups(
         lo=0,
         hi=1_000_000,
     )
+    holdout_enabled = _env_flag(
+        "PRISMAQUANT_ACT_CLIP_SOLVER_HOLDOUT",
+        False,
+    )
+    holdout_fraction = _env_float(
+        "PRISMAQUANT_ACT_CLIP_SOLVER_HOLDOUT_FRACTION",
+        DEFAULT_ACT_CLIP_SOLVER_HOLDOUT_FRACTION,
+        lo=0.0,
+        hi=0.5,
+    )
+    holdout_min_gain = _env_float(
+        "PRISMAQUANT_ACT_CLIP_SOLVER_HOLDOUT_MIN_GAIN",
+        0.0,
+        lo=0.0,
+        hi=1.0,
+    )
+    holdout_stride = (
+        max(2, int(round(1.0 / max(holdout_fraction, 1e-9))))
+        if holdout_enabled and holdout_fraction > 0.0
+        else 0
+    )
+    if holdout_stride <= 1:
+        holdout_enabled = False
     verbose = _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE", False)
     threshold_by_qname: dict[str, float | None] = {}
     metadata: dict[str, object] = {
         "enabled": True,
         "method": "PrismaClip",
         "format": "NVFP4",
-        "objective": "output_mse_original_activations",
+        "objective": (
+            "output_mse_original_activations_holdout_veto"
+            if holdout_enabled else
+            "output_mse_original_activations"
+        ),
         "solver": "log_golden_section",
         "max_evals": int(max_evals),
         "min_gain": float(min_gain),
         "top_fraction": float(top_fraction),
         "top_k": int(top_k),
+        "holdout_enabled": bool(holdout_enabled),
+        "holdout_fraction": float(holdout_fraction if holdout_enabled else 0.0),
+        "holdout_stride": int(holdout_stride),
+        "holdout_offset": 0,
+        "holdout_min_gain": float(holdout_min_gain),
         "groups": {},
         "selected_by_qname": {},
         "prewritten_qnames": [],
@@ -1666,8 +1726,9 @@ def _solve_nvfp4_activation_clip_groups(
         threshold: float | None,
         *,
         keep_weights: bool = False,
-    ) -> tuple[float, dict[str, torch.Tensor] | None]:
-        score = 0.0
+        score_splits: Sequence[str] = ("all",),
+    ) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
+        scores = {split: 0.0 for split in score_splits}
         kept: dict[str, torch.Tensor] | None = {} if keep_weights else None
         rendered = render_members_batched(members, threshold)
         if rendered is not None:
@@ -1680,16 +1741,23 @@ def _solve_nvfp4_activation_clip_groups(
             )
             rendered = {qname: render_member(qname, threshold) for qname in members}
         for qname, w_dq in rendered.items():
-            score += _activation_output_error(
-                qname_to_module[qname].weight.data,
-                w_dq,
-                activations[qname],
-            )
+            for split in score_splits:
+                split_activations = _prismaclip_activation_split(
+                    activations[qname],
+                    split=split,
+                    holdout_stride=holdout_stride,
+                    holdout_offset=0,
+                )
+                scores[split] += _activation_output_error(
+                    qname_to_module[qname].weight.data,
+                    w_dq,
+                    split_activations,
+                )
             if kept is not None:
                 kept[qname] = w_dq
             else:
                 del w_dq
-        return score, kept
+        return scores, kept
 
     baseline_items = list(sorted(groups.items()))
     for idx, (group_key, raw_members) in enumerate(baseline_items, start=1):
@@ -1706,10 +1774,12 @@ def _solve_nvfp4_activation_clip_groups(
 
         baseline_weights: dict[str, torch.Tensor] | None = None
         try:
-            baseline_score, baseline_weights = evaluate_members(
+            score_splits = ("all", "holdout") if holdout_enabled else ("all",)
+            baseline_scores, baseline_weights = evaluate_members(
                 members,
                 None,
                 keep_weights=bool(metadata["prewrite_baseline"]),
+                score_splits=score_splits,
             )
         except Exception as e:
             metadata["groups"][group_key] = {
@@ -1736,7 +1806,10 @@ def _solve_nvfp4_activation_clip_groups(
             "members": members,
             "lo": float(lo),
             "hi": float(hi),
-            "baseline_score": float(baseline_score),
+            "baseline_score": float(baseline_scores["all"]),
+            "baseline_holdout_score": (
+                float(baseline_scores["holdout"]) if holdout_enabled else None
+            ),
         })
         if progress and (idx % 10 == 0 or idx == len(baseline_items)):
             print(
@@ -1775,6 +1848,11 @@ def _solve_nvfp4_activation_clip_groups(
         lo = float(item["lo"])
         hi = float(item["hi"])
         baseline_score = float(item["baseline_score"])
+        baseline_holdout_score = (
+            float(item["baseline_holdout_score"])
+            if item.get("baseline_holdout_score") is not None
+            else None
+        )
         if group_key not in eligible_groups:
             for qname in members:
                 threshold_by_qname[qname] = None
@@ -1785,7 +1863,11 @@ def _solve_nvfp4_activation_clip_groups(
                 "selected": "baseline",
                 "selected_threshold": None,
                 "baseline_score": float(baseline_score),
+                "baseline_holdout_score": baseline_holdout_score,
                 "best_score": float(baseline_score),
+                "holdout_score": baseline_holdout_score,
+                "holdout_relative_gain": 0.0,
+                "holdout_accepted": None,
                 "relative_gain": 0.0,
                 "lo": float(lo),
                 "hi": float(hi),
@@ -1800,21 +1882,33 @@ def _solve_nvfp4_activation_clip_groups(
         eval_trace: list[dict[str, float | int]] = []
         best_candidate_threshold: float | None = None
         best_candidate_score = float("inf")
+        best_candidate_holdout_score: float | None = None
         best_candidate_weights: dict[str, torch.Tensor] | None = None
         best_candidate_eval_index: int | None = None
         denom = max(abs(float(baseline_score)), 1e-30)
+        holdout_denom = max(
+            abs(float(baseline_holdout_score)),
+            1e-30,
+        ) if baseline_holdout_score is not None else 1e-30
 
         def eval_log(log_threshold: float) -> float:
             nonlocal best_candidate_threshold, best_candidate_score
+            nonlocal best_candidate_holdout_score
             nonlocal best_candidate_weights
             nonlocal best_candidate_eval_index
             threshold = float(math.exp(log_threshold))
             key = round(threshold, 12)
             if key not in cache:
-                score, cand_weights = evaluate_members(
+                score_splits = ("all", "holdout") if holdout_enabled else ("all",)
+                scores, cand_weights = evaluate_members(
                     members,
                     threshold,
                     keep_weights=True,
+                    score_splits=score_splits,
+                )
+                score = float(scores["all"])
+                holdout_score = (
+                    float(scores["holdout"]) if holdout_enabled else None
                 )
                 cache[key] = score
                 if score < best_candidate_score:
@@ -1824,12 +1918,13 @@ def _solve_nvfp4_activation_clip_groups(
                     best_candidate_eval_index = len(eval_trace) + 1
                     best_candidate_threshold = float(key)
                     best_candidate_score = float(score)
+                    best_candidate_holdout_score = holdout_score
                     best_candidate_weights = cand_weights
                 elif cand_weights is not None:
                     for old in cand_weights.values():
                         del old
                 best_so_far = min(float(baseline_score), float(best_candidate_score))
-                eval_trace.append({
+                trace_entry: dict[str, float | int] = {
                     "eval": int(len(eval_trace) + 1),
                     "threshold": float(key),
                     "score": float(score),
@@ -1837,7 +1932,14 @@ def _solve_nvfp4_activation_clip_groups(
                     "relative_gain": float(
                         (float(baseline_score) - best_so_far) / denom
                     ),
-                })
+                }
+                if holdout_enabled and holdout_score is not None:
+                    trace_entry["holdout_score"] = float(holdout_score)
+                    trace_entry["holdout_relative_gain"] = float(
+                        (float(baseline_holdout_score) - holdout_score)
+                        / holdout_denom
+                    )
+                eval_trace.append(trace_entry)
             return cache[key]
 
         try:
@@ -1883,10 +1985,28 @@ def _solve_nvfp4_activation_clip_groups(
         best_threshold = best_candidate_threshold
         best_score = min(float(baseline_score), float(best_candidate_score))
         rel_gain = (float(baseline_score) - float(best_score)) / denom
+        holdout_score = best_candidate_holdout_score
+        holdout_rel_gain = (
+            (float(baseline_holdout_score) - float(holdout_score))
+            / holdout_denom
+            if holdout_enabled
+            and baseline_holdout_score is not None
+            and holdout_score is not None
+            else None
+        )
+        holdout_accepted = (
+            None if not holdout_enabled else bool(
+                holdout_score is not None
+                and baseline_holdout_score is not None
+                and float(holdout_score) < float(baseline_holdout_score)
+                and float(holdout_rel_gain) >= holdout_min_gain
+            )
+        )
         selected = (
             best_threshold is not None
             and float(best_candidate_score) < float(baseline_score)
             and rel_gain >= min_gain
+            and (not holdout_enabled or bool(holdout_accepted))
         )
         if not selected:
             best_threshold = None
@@ -1919,8 +2039,20 @@ def _solve_nvfp4_activation_clip_groups(
             "selected": "solved" if selected else "baseline",
             "selected_threshold": best_threshold,
             "baseline_score": float(baseline_score),
+            "baseline_holdout_score": baseline_holdout_score,
             "best_score": float(best_score),
             "relative_gain": float(rel_gain),
+            "holdout_score": (
+                float(holdout_score)
+                if holdout_score is not None and selected else
+                baseline_holdout_score
+            ),
+            "holdout_relative_gain": (
+                float(holdout_rel_gain)
+                if holdout_rel_gain is not None and selected else
+                0.0
+            ),
+            "holdout_accepted": holdout_accepted,
             "lo": float(lo),
             "hi": float(hi),
             "n_evals": int(len(cache)),

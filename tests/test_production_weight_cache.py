@@ -288,6 +288,65 @@ def test_production_cache_act_clip_solver_prewrite_default_off(monkeypatch):
     assert meta["prewritten_baseline_qnames"] == []
 
 
+def test_production_cache_act_clip_solver_holdout_rejects_overfit(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+
+    modules = {"a": nn.Linear(2, 2, bias=False)}
+    activations = {
+        "a": torch.tensor([
+            [100.0, 0.0],  # default holdout row: index 0 mod 4
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+        ])
+    }
+    weights: dict[tuple[str, str], object] = {}
+
+    def fake_render_production_weight(
+        weight,
+        fmt,
+        *,
+        act_clip_threshold=None,
+        **_kwargs,
+    ):
+        delta = 1.0 if act_clip_threshold is None else 0.5
+        return weight.detach().to(torch.float32) + delta
+
+    def fake_activation_output_error(weight, rendered, activations, **_kwargs):
+        delta = float((rendered - weight.to(rendered.dtype)).abs().mean())
+        is_holdout = float(activations.reshape(-1, activations.shape[-1])[:, 0].mean()) > 50.0
+        if delta < 0.75:
+            return 10.0 if is_holdout else 0.5
+        return 1.0
+
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+    monkeypatch.setattr(pwc, "_activation_output_error", fake_activation_output_error)
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_HOLDOUT", "1")
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+
+    thresholds, meta = _solve_nvfp4_activation_clip_groups(
+        groups={"a": ["a"]},
+        qname_to_module=modules,
+        activations=activations,
+        levers={"gptq": False, "scale_sweep": False},
+        joint_globals={},
+        activation_max_abs={"a": 100.0},
+        fisher_rows=None,
+        weights_out=weights,
+        cache_dir_path=None,
+        progress=False,
+    )
+
+    group_meta = meta["groups"]["a"]
+    assert meta["holdout_enabled"] is True
+    assert thresholds == {"a": None}
+    assert meta["selected_by_qname"]["a"] is None
+    assert group_meta["selected"] == "baseline"
+    assert group_meta["holdout_accepted"] is False
+    assert group_meta["eval_trace"][0]["holdout_score"] == pytest.approx(10.0)
+    assert weights == {}
+
+
 def test_production_cache_act_clip_solver_batches_same_shape_groups(monkeypatch):
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED", "1")
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE", "1")

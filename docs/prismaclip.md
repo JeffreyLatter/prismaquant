@@ -23,12 +23,20 @@ using local output MSE. This prevents the solver from appearing to win simply
 because it hid outliers from its own evaluator.
 
 The current implementation searches in log space with a small evaluation
-budget controlled by `PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS`. A candidate must
-clear `PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN` before it is selected. The default
-is `0.0`: the 4B FourOverSix+PrismaClip run showed that many individually tiny
-local-MSE wins can be collectively useful, so a nonzero floor is an ablation
-knob rather than a production default. Cache metadata records every threshold
-evaluation so convergence can be audited after the run.
+budget controlled by `PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS`. Candidate
+thresholds are selected using the full local activation output-error score. A
+candidate must clear `PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN` before it is
+selected. The default is `0.0`: the 4B FourOverSix+PrismaClip run showed that
+many individually tiny local-MSE wins can be collectively useful, so a nonzero
+floor is an ablation knob rather than a production default. Cache metadata
+records every threshold evaluation so convergence can be audited after the run.
+
+An experimental holdout-veto gate is available with
+`PRISMAQUANT_ACT_CLIP_SOLVER_HOLDOUT=1`. It selects thresholds by the full
+local score, then requires the same rendered weight to improve deterministic
+held-out activation rows. This is off by default: an .8B smoke on
+2026-05-11 measured KL `0.34022548` with the holdout veto versus `0.12600227`
+for the no-prewrite PrismaClip baseline.
 
 The solver can optionally write the baseline NVFP4 rendering to
 `ProductionWeightCache` when it scores the baseline. This is controlled by
@@ -50,6 +58,10 @@ Hardlink-patching only those three files back from the known-good cache
 restored KL exactly to `0.056417932`, so the issue is PrismaClip's local
 threshold selection/render stability for a few groups, not assignment,
 bpp accounting, cache prefetch, or validation.
+
+The holdout gate was added after that finding. It is not a proof of global KL
+monotonicity, and the first .8B smoke regressed badly, so it remains an opt-in
+diagnostic rather than part of PrismaClip's default acceptance rule.
 
 Same-shape fused groups can also try the existing batched NVFP4
 GPTQ/scale-sweep path when `PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED=1`. This is
@@ -87,8 +99,9 @@ batched damp selector but still measured `0.060248224` KL versus the scalar
   `/home/rob/dq-runs/qwen3-4b-prismaclip-no-prewrite-20260511T170732Z`
   rerun measured KL `0.16388227`. Restoring only the three differing NVFP4
   sidecars from the known-good scalar cache restored KL to `0.056417932`.
-  PrismaClip should not be used for a 27B Pareto run until it has a stronger
-  acceptance gate than same-sample local output MSE.
+- The experimental holdout-veto gate is not a fix: an .8B smoke measured KL
+  `0.34022548` versus `0.12600227` for the no-prewrite PrismaClip baseline.
+  Keep it opt-in unless a later variant validates on both .8B and 4B.
 
 ## Naming
 
