@@ -468,6 +468,14 @@ def main(argv: list[str] | None = None) -> int:
     work_root = Path(args.work_root) if args.work_root else output.parent / "recache_work"
     work_root.mkdir(parents=True, exist_ok=True)
     dtype = _dtype_from_name(args.dtype)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+
+    require_cuda_hot_path("production_recache", args.device)
+    if args.device_map not in (None, "cuda"):
+        raise RuntimeError(
+            "production_recache requires a CUDA-resident model. CPU/offload "
+            f"device_map={args.device_map!r} is not allowed."
+        )
     model = load_text_model_under_work_root(
         args.model,
         device=args.device,

@@ -85,6 +85,11 @@ from .layer_config import (
 )
 from .model_profiles.qwen3_5 import Qwen3_5Profile
 from .schemas import validate_layer_config_payload, validate_prune_manifest_payload
+from .awq import (
+    AwqSearchTarget,
+    legacy_activation_awq_scale,
+    search_awq_scale,
+)
 
 # ---------------------------------------------------------------------------
 # NVFP4 packing (inlined from compressed-tensors fp4_quantized.py to avoid
@@ -643,6 +648,29 @@ def _production_cache_scales(cache) -> dict[str, float]:
     return _unify_input_global_scales_across_fused_siblings(scales)
 
 
+def _production_cache_awq_scale(
+    cache,
+    name: str,
+    *,
+    width: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    scales = getattr(cache, "awq_scales", None) or {}
+    for cand in _production_cache_name_candidates(name):
+        scale = scales.get(cand)
+        if scale is None:
+            continue
+        if not isinstance(scale, torch.Tensor):
+            try:
+                scale = torch.as_tensor(scale)
+            except Exception:
+                continue
+        if scale.numel() != int(width):
+            continue
+        return scale.to(device=device, dtype=torch.float32).clamp_min(1e-12)
+    return None
+
+
 def _source_weight_shape_for_recipe(
     src_model: str,
     recipe_key: str,
@@ -844,8 +872,16 @@ def _pack_production_cached_2d(
     if w is None:
         return None
     target_device = device or torch.device("cpu")
+    awq_s = _production_cache_awq_scale(
+        cache,
+        key[0],
+        width=int(w.shape[1]) if getattr(w, "dim", lambda: 0)() == 2 else 0,
+        device=target_device,
+    )
     if fmt == "NVFP4":
         w_work = w.to(device=target_device, dtype=torch.float32)
+        if awq_s is not None:
+            w_work = w_work * awq_s.unsqueeze(0)
         wp, ws, wg = quantize_dequantize_nvfp4(
             w_work,
             group_size=16,
@@ -873,13 +909,21 @@ def _pack_production_cached_2d(
         # cache is available we recompute the MXFP8 render from source weights
         # through `_quantize_2d` instead of using the dequant cache directly.
         cache_levers = getattr(cache, "levers", {}) or {}
-        if bool(cache_levers.get("scale_sweep", False)) and _CACHED_ACTIVATIONS is not None:
+        if (
+            bool(cache_levers.get("scale_sweep", False))
+            and _CACHED_ACTIVATIONS is not None
+            and awq_s is None
+        ):
             return None
         w_work = w.to(device=target_device, dtype=torch.float32)
+        if awq_s is not None:
+            w_work = w_work * awq_s.unsqueeze(0)
         q, qs = quantize_dequantize_mxfp8(w_work, group_size=32)
         return {"weight": q, "weight_scale": qs}
     if fmt == "FP8_E4M3":
         w_work = w.to(device=target_device, dtype=torch.float32)
+        if awq_s is not None:
+            w_work = w_work * awq_s.unsqueeze(0)
         q, qs = quantize_dequantize_fp8_dynamic(w_work)
         return {"weight": q, "weight_scale": qs}
     if fmt == "BF16":
@@ -936,38 +980,18 @@ _AWQ_SKIP_LEAF_NAMES = frozenset({
 def _awq_channel_scale(activations: torch.Tensor, eps: float = 1e-4,
                        clamp_ratio: float = 10.0,
                        ) -> torch.Tensor:
-    """Compute AWQ per-input-channel scale `s[c] = mean|a[:, c]|^0.5`,
-    normalized by the geometric mean of its max and min (AutoAWQ /
-    LMQuant convention), and HARD-CLAMPED to a log-symmetric window
-    `[1/clamp_ratio, clamp_ratio]` for bf16-runtime numerical safety.
+    """Legacy activation-only AWQ scale kept for ablation compatibility.
 
-    Why geomean not max: max-normalization pushes low-activation
-    channels toward `eps`, making `γ/s` blow up by 1/eps at inference
-    time. In bf16 runtime the cancellation `(W*s)·(γ/s) = W·γ` loses
-    precision catastrophically when the ratio is extreme. Geomean
-    normalization centers `s` around 1 in log space; the extra hard
-    clamp at 10× caps bf16 error accumulation on real-world channel
-    imbalance (some Qwen layers have max/min activation-mean ratios
-    of ~1e4 which the geomean alone only tames to ~100×).
-
-    Returns a float32 1D tensor of length `in_features`.
+    The production AWQ path no longer uses this fixed alpha=0.5 formula.
+    `_awq_fold_layer_predecessors` now calls the AWQ-v2 output-MSE scale
+    search in `prismaquant.awq`. Tests still exercise this helper because it
+    documents the old behavior and provides a useful control.
     """
-    a = activations.detach().to(torch.float32).reshape(-1, activations.shape[-1])
-    mean_abs = a.abs().mean(dim=0)                       # [in_features]
-    s = mean_abs.clamp_min(eps).pow(0.5)                 # α = 0.5
-    # Geomean normalization: s / sqrt(s_max * s_min) — centers around 1
-    # in log space. See AutoAWQ `quantize/quantizer.py:406` and llm-awq
-    # `auto_scale.py:130`.
-    norm = (s.max() * s.min()).sqrt().clamp_min(eps)
-    s = s / norm
-    # Hard clamp on the ratio — bf16 mantissa is 8 bits, so per-product
-    # error is ~0.4%. Keeping max(s)/min(s) ≤ clamp_ratio² bounds the
-    # accumulated matmul error from the cancellation pattern `W*s · γ/s`.
-    s = s.clamp(1.0 / clamp_ratio, clamp_ratio)
-    # Defensive nan/inf guard — a constant-zero activation channel can
-    # otherwise poison the entire scale vector.
-    s = torch.nan_to_num(s, nan=1.0, posinf=1.0, neginf=1.0)
-    return s
+    return legacy_activation_awq_scale(
+        activations,
+        eps=eps,
+        clamp_ratio=clamp_ratio,
+    )
 
 
 def _awq_rescale_weight(weight: torch.Tensor, activations: torch.Tensor
@@ -1010,29 +1034,19 @@ def _awq_joint_channel_scale(
     activations_list: list[torch.Tensor], eps: float = 1e-4,
     clamp_ratio: float = 10.0,
 ) -> torch.Tensor:
-    """Compute a single AWQ per-input-channel scale from a list of
-    cached activations that all feed through the SAME predecessor
-    (e.g. q/k/v all read from the same input_layernorm output, so all
-    three share identical activations at that tap — but callers still
-    pass the list for defensive stacking in case only a subset is
-    present).
-
-    Applies the same geomean normalization + hard clamp as
-    `_awq_channel_scale`. See that function's docstring for the
-    bf16-numerical-safety rationale.
-    """
+    """Legacy joint activation-only AWQ scale for older tests."""
+    if not activations_list:
+        raise ValueError("AWQ joint scale requires activations")
     combined = torch.cat(
         [a.detach().to(torch.float32).reshape(-1, a.shape[-1])
          for a in activations_list],
         dim=0,
     )
-    mean_abs = combined.abs().mean(dim=0)
-    s = mean_abs.clamp_min(eps).pow(0.5)
-    norm = (s.max() * s.min()).sqrt().clamp_min(eps)
-    s = s / norm
-    s = s.clamp(1.0 / clamp_ratio, clamp_ratio)
-    s = torch.nan_to_num(s, nan=1.0, posinf=1.0, neginf=1.0)
-    return s
+    return legacy_activation_awq_scale(
+        combined,
+        eps=eps,
+        clamp_ratio=clamp_ratio,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1100,6 +1114,72 @@ _AWQ_PREDECESSOR_KIND: dict[str, str] = {
 _PACKED_READERS_OF_POST_LN = frozenset({
     "gate_proj", "up_proj", "gate_up_proj", "w1", "w3",
 })
+
+_AWQ_SEARCH_FORMATS = frozenset({"NVFP4", "MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
+
+
+def _awq_format_group_size(fmt: str) -> int:
+    fmt = _canonical_export_format(fmt)
+    if fmt == "NVFP4":
+        return 16
+    if fmt == "MXFP8":
+        return 32
+    return 0
+
+
+def _dequantize_export_2d(result: dict[str, torch.Tensor], fmt: str) -> torch.Tensor:
+    fmt = _canonical_export_format(fmt)
+    if fmt == "NVFP4":
+        return result["_w_dq"].to(torch.float32)
+    if fmt == "MXFP8":
+        if "weight" not in result or "weight_scale" not in result:
+            raise ValueError("MXFP8 result missing weight/weight_scale")
+        return _mxfp8_dequantize_grouped(
+            result["weight"].reshape(
+                result["weight"].shape[0],
+                result["weight"].shape[1] // 32,
+                32,
+            ),
+            result["weight_scale"],
+        ).reshape(result["weight"].shape).to(torch.float32)
+    if fmt == "FP8_E4M3":
+        if "weight" not in result or "weight_scale" not in result:
+            raise ValueError("FP8 result missing weight/weight_scale")
+        return result["weight"].to(torch.float32) * result["weight_scale"].to(torch.float32)
+    raise ValueError(f"AWQ renderer does not support format {fmt!r}")
+
+
+def _render_awq_scaled_2d(
+    weight_scaled: torch.Tensor,
+    activations_scaled: torch.Tensor,
+    fmt: str,
+    *,
+    linear_name: str,
+    nvfp4_global_real_override: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Render a scaled AWQ candidate and return dequantized scaled weights."""
+    fmt = _canonical_export_format(fmt)
+    if fmt not in {"NVFP4", "MXFP8", "FP8_E4M3"}:
+        raise ValueError(f"AWQ scaled render unsupported for {fmt}")
+    prev_flags = dict(_ACT_AWARE_FLAGS)
+    try:
+        _ACT_AWARE_FLAGS["awq"] = False
+        result = _quantize_2d(
+            weight_scaled,
+            fmt,
+            linear_name=linear_name,
+            nvfp4_global_real_override=nvfp4_global_real_override,
+            cached_activations=activations_scaled,
+            awq_enabled=False,
+            gptq_enabled=bool(prev_flags.get("gptq", False)),
+            awq_round_enabled=bool(prev_flags.get("awq_round", False)),
+            scale_sweep_enabled=bool(prev_flags.get("scale_sweep", False)),
+            compute_only=(fmt == "NVFP4"),
+        )
+    finally:
+        _ACT_AWARE_FLAGS.clear()
+        _ACT_AWARE_FLAGS.update(prev_flags)
+    return _dequantize_export_2d(result, fmt)
 
 
 def _awq_discover_layer_readers(
@@ -1204,24 +1284,20 @@ def _awq_fold_layer_predecessors(
     For each predecessor γ we:
       1. Enumerate every reader (all formats: NVFP4, MXFP8, BF16, packed
          experts). The `_awq_discover_layer_readers` helper finds them.
-      2. Compute the joint scale `s` from cached activations of the
-         NVFP4 readers ONLY. The scale represents "which channels need
-         more FP4 quant grid budget" — an NVFP4-specific quantity. Non-
-         NVFP4 readers don't contribute to the scale but ARE scaled by
-         it so the identity holds.
-      3. If no NVFP4 reader has cached activations (e.g. only BF16
-         readers), skip this γ entirely — no fold.
+      2. Search the joint scale `s` over quantized readers that have cached
+         activations, using real rendered-weight output MSE. NVFP4, MXFP8, and
+         FP8_E4M3 readers can contribute; BF16 readers do not affect the score
+         but are still scaled so the identity holds.
+      3. If no quantized reader has cached activations, skip this γ entirely.
       4. Fold `γ /= s` once, and multiply every reader's weight by `s`
          on the input dim in-place. For nn.Linear, scale `.weight.data`
          on columns (dim 1). For packed experts, scale the 3D param
          `.data` on dim 2 (`[E, out, in]`).
 
-    Returns `{recipe_key -> s}` for every NVFP4 LINEAR reader (only —
-    packed experts and non-NVFP4 readers don't appear). This dict is
-    used downstream by `_quantize_2d` to divide cached activations by
-    `s` when running GPTQ / activation-weighted rounding: at runtime
-    the reader sees `a/s`, so the importance weighting and covariance
-    must match.
+    Returns `{recipe_key -> s}` for every quantized LINEAR reader. This dict is
+    used downstream by `_quantize_2d` to divide cached activations by `s` when
+    running GPTQ / activation-weighted scale search: at runtime the reader sees
+    `a/s`, so local objectives must match.
     """
     readers_by_pred = _awq_discover_layer_readers(layer_mod)
     if not readers_by_pred:
@@ -1229,12 +1305,8 @@ def _awq_fold_layer_predecessors(
 
     per_target_scale: dict[str, torch.Tensor] = {}
     for pred_mod, readers in readers_by_pred.items():
-        # Gather NVFP4-reader activations for scale computation. Non-
-        # NVFP4 readers' activations are not loaded and the scale is
-        # a weighting designed for 4-bit quant error — using non-NVFP4
-        # readers' inputs would dilute the signal.
-        nvfp4_readers: list[dict] = []
-        acts_for_scale: list[torch.Tensor] = []
+        quantized_readers: list[dict] = []
+        targets: list[AwqSearchTarget] = []
         for r in readers:
             # Build full qname. For Linear readers, sub_name already
             # ends in the leaf (e.g. `self_attn.q_proj`). For packed
@@ -1249,7 +1321,9 @@ def _awq_fold_layer_predecessors(
             recipe_key = profile.live_to_recipe_name(full)
             r["recipe_key"] = recipe_key
             r["full"] = full
-            if assignment.get(recipe_key) != "NVFP4":
+            fmt = _canonical_export_format(assignment.get(recipe_key, "BF16"))
+            r["fmt"] = fmt
+            if fmt not in _AWQ_SEARCH_FORMATS:
                 continue
             if r["kind"] != "linear":
                 # Packed-expert activations are keyed by the experts
@@ -1257,36 +1331,75 @@ def _awq_fold_layer_predecessors(
                 # the param itself doesn't match that cache key. Skip
                 # packed experts in the scale computation; they still
                 # get scaled below.
-                nvfp4_readers.append(r)
+                quantized_readers.append(r)
                 continue
             acts = activation_lookup.get(recipe_key)
             if acts is None:
-                nvfp4_readers.append(r)
+                quantized_readers.append(r)
                 continue
-            acts_for_scale.append(acts)
-            nvfp4_readers.append(r)
+            lin_mod: nn.Linear = r["mod"]
+            targets.append(AwqSearchTarget(
+                name=recipe_key,
+                fmt=fmt,
+                weight=lin_mod.weight.detach().to(device=device, dtype=torch.float32),
+                activations=acts.to(device=device, dtype=torch.float32),
+                group_size=_awq_format_group_size(fmt),
+            ))
+            quantized_readers.append(r)
 
-        if not acts_for_scale:
-            # No NVFP4 Linear with cached activations reads this γ —
-            # nothing to fold. (Purely-BF16 or purely-packed buckets
-            # land here; that's fine, fold is an optional optimization
-            # for NVFP4 quant error.)
+        if not targets:
+            # No quantized Linear with cached activations reads this γ.
             continue
 
-        # Sanity-check dim agreement across readers. `acts_for_scale`
-        # all have `a.shape[-1] == in_features_nvfp4`. All other readers
+        # Sanity-check dim agreement across readers. All target activations
+        # have `a.shape[-1] == in_features`. All other readers
         # must agree on in_features (because they all read the same γ).
-        in_features = acts_for_scale[0].shape[-1]
+        in_features = targets[0].activations.shape[-1]
         for r in readers:
             if r["in_features"] != in_features:
                 raise RuntimeError(
                     f"[awq-fold] inconsistent in_features in layer "
                     f"{layer_qname!r}: γ at {type(pred_mod).__name__} "
                     f"feeds reader {r['sub_name']!r}.{r['leaf']} "
-                    f"(in={r['in_features']}) but NVFP4 reader has "
+                    f"(in={r['in_features']}) but AWQ target has "
                     f"in={in_features}. Aborting — fold would corrupt.")
 
-        s = _awq_joint_channel_scale(acts_for_scale).to(device)
+        def _render_target(idx, w_scaled, a_scaled, scale):
+            target = targets[idx]
+            return _render_awq_scaled_2d(
+                w_scaled,
+                a_scaled,
+                target.fmt,
+                linear_name=target.name,
+            )
+
+        from prismaquant.awq import DEFAULT_AWQ_MIN_GAIN
+
+        try:
+            search = search_awq_scale(
+                targets,
+                _render_target,
+                n_grid=int(os.environ.get("PRISMAQUANT_AWQ_GRID", "20")),
+                duo_scaling=os.environ.get("PRISMAQUANT_AWQ_DUO", "1")
+                not in {"0", "false", "False", "no", "NO"},
+                clamp_ratio=float(os.environ.get("PRISMAQUANT_AWQ_CLAMP", "10.0")),
+                min_gain=float(os.environ.get(
+                    "PRISMAQUANT_AWQ_MIN_GAIN",
+                    str(DEFAULT_AWQ_MIN_GAIN),
+                )),
+            )
+            s = search.scale.to(device)
+        except Exception as exc:
+            if os.environ.get("PRISMAQUANT_AWQ_STRICT", "0") not in {
+                "0", "", "false", "False", "no", "NO",
+            }:
+                raise
+            print(
+                f"[awq-fold] layer {layer_qname}: search failed for "
+                f"{len(targets)} targets ({exc}); skipping fold",
+                flush=True,
+            )
+            continue
         s_safe = s.clamp_min(1e-12)
 
         # 1) Fold γ /= s (in-place on the layer-resident RMSNorm).
@@ -1317,17 +1430,95 @@ def _awq_fold_layer_predecessors(
             else:
                 raise RuntimeError(f"unknown reader kind: {r['kind']!r}")
 
-        # 3) Report scale for each NVFP4 LINEAR reader so `_quantize_2d`
-        # can divide cached activations by `s` for GPTQ / act-round.
+        # 3) Report scale for each quantized LINEAR reader so `_quantize_2d`
+        # can divide cached activations by `s` for GPTQ / scale-sweep.
         # Packed experts don't have per-param cached activations (they
         # share a single `experts`-module cache under a different key),
         # so emitting a scale for them would mislead `_quantize_2d`'s
         # lookup. The weight is already pre-scaled via the in-place
         # fold; when the packed path runs downstream it just quantizes
         # the scaled weights directly.
-        for r in nvfp4_readers:
+        for r in quantized_readers:
             if r["kind"] == "linear":
                 per_target_scale[r["recipe_key"]] = s
+
+    return per_target_scale
+
+
+def _awq_fold_layer_precomputed_scales(
+    layer_mod: "nn.Module",
+    layer_qname: str,
+    assignment: dict[str, str],
+    profile,
+    scale_lookup: dict[str, torch.Tensor],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Apply AWQ folds from scales precomputed by ProductionWeightCache."""
+    readers_by_pred = _awq_discover_layer_readers(layer_mod)
+    if not readers_by_pred:
+        return {}
+
+    per_target_scale: dict[str, torch.Tensor] = {}
+    for pred_mod, readers in readers_by_pred.items():
+        chosen: torch.Tensor | None = None
+        quantized_readers: list[dict] = []
+        for r in readers:
+            full = f"{layer_qname}.{r['sub_name']}" if layer_qname else r["sub_name"]
+            if r["kind"] == "packed":
+                full = f"{full}.{r['param_name']}"
+            recipe_key = profile.live_to_recipe_name(full)
+            r["recipe_key"] = recipe_key
+            fmt = _canonical_export_format(assignment.get(recipe_key, "BF16"))
+            if fmt not in _AWQ_SEARCH_FORMATS:
+                continue
+            scale = scale_lookup.get(recipe_key)
+            if scale is None:
+                continue
+            if scale.numel() != int(r["in_features"]):
+                raise RuntimeError(
+                    f"[awq-fold] precomputed scale width {scale.numel()} "
+                    f"does not match {recipe_key} in_features={r['in_features']}"
+                )
+            scale = scale.to(device=device, dtype=torch.float32).clamp_min(1e-12)
+            if chosen is None:
+                chosen = scale
+            elif not torch.allclose(chosen, scale, rtol=1e-4, atol=1e-6):
+                raise RuntimeError(
+                    f"[awq-fold] inconsistent precomputed scales under "
+                    f"{layer_qname}: {recipe_key} differs from sibling scale"
+                )
+            quantized_readers.append(r)
+        if chosen is None:
+            continue
+
+        in_features = int(chosen.numel())
+        for r in readers:
+            if r["in_features"] != in_features:
+                raise RuntimeError(
+                    f"[awq-fold] inconsistent in_features in layer "
+                    f"{layer_qname!r}: reader {r['sub_name']!r}.{r['leaf']} "
+                    f"has {r['in_features']} but AWQ scale has {in_features}"
+                )
+
+        gamma = pred_mod.weight
+        g = gamma.detach().to(torch.float32).to(device)
+        gamma.data.copy_((g / chosen).to(device=gamma.device, dtype=gamma.dtype))
+        for r in readers:
+            if r["kind"] == "linear":
+                w = r["mod"].weight
+                w_scaled = w.detach().to(torch.float32).to(device) * chosen.unsqueeze(0)
+                w.data.copy_(w_scaled.to(device=w.device, dtype=w.dtype))
+            elif r["kind"] == "packed":
+                param = getattr(r["mod"], r["param_name"])
+                p_scaled = (
+                    param.detach().to(torch.float32).to(device)
+                    * chosen.reshape(1, 1, -1)
+                )
+                param.data.copy_(p_scaled.to(device=param.device, dtype=param.dtype))
+
+        for r in quantized_readers:
+            if r["kind"] == "linear":
+                per_target_scale[r["recipe_key"]] = chosen
 
     return per_target_scale
 
@@ -2773,10 +2964,25 @@ def _quantize_2d(
         # by the NVFP4 scale pass. This is still an exact vLLM MXFP8 artifact:
         # only the stored fp8 weights and uint8 E8M0 scales change.
         w_work = weight.to(torch.float32)
-        if scale_sweep_enabled and acts is not None and acts.shape[-1] == w_work.shape[1]:
+        acts_work = acts
+        if (
+            awq_enabled
+            and linear_name is not None
+            and linear_name in _AWQ_PROPER_SCALES
+            and acts is not None
+        ):
+            s_cand = _AWQ_PROPER_SCALES[linear_name]
+            if s_cand.numel() == w_work.shape[1]:
+                awq_s = s_cand.to(device=w_work.device, dtype=torch.float32)
+                acts_work = (
+                    acts.to(torch.float32).reshape(-1, acts.shape[-1])
+                    / awq_s.clamp_min(1e-12).unsqueeze(0)
+                )
+        if (scale_sweep_enabled and acts_work is not None
+                and acts_work.shape[-1] == w_work.shape[1]):
             w, ws, _ = _mxfp8_scale_sweep_quantize(
                 w_work,
-                acts,
+                acts_work,
                 group_size=32,
                 clip_threshold=act_clip_threshold,
                 fisher_row_weights=fisher_row_weights,
@@ -3838,6 +4044,20 @@ def materialize_tensors_streaming(
             layer_scales = _awq_fold_layer_predecessors(
                 layer_mod, layer_qname, assignment, profile,
                 _CACHED_ACTIVATIONS, device,
+            )
+            _AWQ_PROPER_SCALES.update(layer_scales)
+        elif (
+            _ACT_AWARE_FLAGS.get("awq")
+            and _PRODUCTION_WEIGHT_CACHE is not None
+            and getattr(_PRODUCTION_WEIGHT_CACHE, "awq_scales", None)
+        ):
+            layer_scales = _awq_fold_layer_precomputed_scales(
+                layer_mod,
+                layer_qname,
+                assignment,
+                profile,
+                getattr(_PRODUCTION_WEIGHT_CACHE, "awq_scales", {}) or {},
+                device,
             )
             _AWQ_PROPER_SCALES.update(layer_scales)
         else:
@@ -5369,12 +5589,14 @@ def main():
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
     global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
     global _PRODUCTION_CACHE_PREFETCH_WORKERS, _NVFP4_SCALE_RULE
+    global _AWQ_PROPER_SCALES
     _INPUT_GLOBAL_SCALES = None
     _CACHED_ACTIVATIONS = None
     _ACTIVATION_CACHE_FINGERPRINT = None
     _PRODUCTION_WEIGHT_CACHE = None
     _PRODUCTION_CACHE_FINGERPRINT = None
     _NVFP4_SCALE_RULE = resolve_nvfp4_scale_rule()
+    _AWQ_PROPER_SCALES = {}
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
@@ -5399,10 +5621,11 @@ def main():
     ap.add_argument("--shard-bytes", type=int, default=5 * 1024**3,
                     help="Approx per-shard size in bytes (default 5 GiB)")
     ap.add_argument("--device", default="cuda",
-                    help="Device for quantization arithmetic. Layer "
+                    help="CUDA device for quantization arithmetic. Layer "
                          "weights are read into this device; "
                          "_quantize_2d / _quantize_3d_packed run here; "
-                         "outputs are moved to CPU before storage.")
+                         "outputs are moved to CPU before storage. CPU is "
+                         "rejected for production quantization.")
     ap.add_argument("--offload-folder", default=None,
                     help="Accelerate disk-offload folder (defaults to "
                          "sibling of output).")
@@ -5456,28 +5679,16 @@ def main():
                          "--layer-config and --activation-cache-dir from it.")
     # Activation-aware passes.
     #
-    # AWQ defaults to OFF — per-channel input scaling fights NVFP4's
-    # 16-channel group_size: each FP4 group ends up with a mix of
-    # scale-boosted (up to 10×) and scale-damped (down to 0.1×) input
-    # channels, inflating per-group max-abs and DOUBLING quant error
-    # instead of reducing it. Measured PPL on Qwen3.6-35B:
-    #     baseline (no act-aware)  4.97
-    #     AWQ only                 16.44   (+230%, much worse)
-    #     GPTQ only                 4.84   (-2.7%)
-    #     act-weighted-round only   4.88   (-1.8%)
-    # AWQ was designed for W4A16 per-channel quant where no group
-    # structure competes with its rescaling. For group-quant like
-    # NVFP4 (or any 8/16-wide group), prefer GPTQ + act-weighted
-    # rounding which ARE group-aware. Set --awq explicitly to opt in.
-    #
-    # GPTQ and --act-weighted-round remain tri-state "auto-on when
-    # --activation-cache-dir is supplied" because they measurably help.
+    # AWQ is a preconditioner, not a replacement for GPTQ/scale_sweep:
+    # search a per-predecessor scale by rendered-weight output MSE, fold the
+    # reciprocal into RMSNorm gamma, then run the existing objectives in the
+    # transformed activation coordinates. It stays opt-in until measured.
     ap.add_argument("--awq", dest="awq", default=None,
                     action=argparse.BooleanOptionalAction,
-                    help="AWQ per-input-channel rescale + γ-fold. OFF "
-                         "by default — incompatible with NVFP4 "
-                         "group_size=16 (see source comment). Pass "
-                         "--awq to opt in.")
+                    help="AWQ-v2 per-input-channel scale search + gamma fold. "
+                         "Opt-in unless the supplied production cache was "
+                         "built with awq. Runs before GPTQ/scale_sweep and "
+                         "is experimental until KL gates clear.")
     ap.add_argument("--gptq", dest="gptq", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="GPTQ one-shot OBS rounding with block-wise "
@@ -5632,9 +5843,14 @@ def main():
 
     # Resolve flag defaults.
     cache_supplied = bool(args.activation_cache_dir)
-    # AWQ: OFF unless explicitly requested. Incompatible with NVFP4
-    # group_size=16 (see long comment on the argparse definition).
-    awq_enabled = bool(args.awq) if args.awq is not None else False
+    cache_awq_enabled = (
+        _PRODUCTION_WEIGHT_CACHE is not None
+        and bool((getattr(_PRODUCTION_WEIGHT_CACHE, "levers", {}) or {}).get("awq", False))
+        and bool(getattr(_PRODUCTION_WEIGHT_CACHE, "awq_scales", None))
+    )
+    # AWQ: explicit flag wins; otherwise inherit from an AWQ-rendered
+    # production cache so export folds the precomputed scales.
+    awq_enabled = bool(args.awq) if args.awq is not None else cache_awq_enabled
     # GPTQ + scale-sweep: ON iff activation cache supplied.
     gptq_enabled = args.gptq if args.gptq is not None else cache_supplied
     # act_round: OFF by default (bake-off showed it reverts GPTQ to RTN).
@@ -5647,7 +5863,7 @@ def main():
     # The activation-aware passes need the actual activations, not just
     # the scale summary. We only load raw activations when at least one
     # pass is enabled.
-    if act_passes_any and not cache_supplied:
+    if act_passes_any and not cache_supplied and not cache_awq_enabled:
         print("[export-stream] WARN activation-aware passes requested "
               "but no --activation-cache-dir; disabling.", flush=True)
         awq_enabled = gptq_enabled = awq_round_enabled = False
@@ -5762,8 +5978,13 @@ def main():
     else:
         prune_manifest = _load_prune_manifest(args.prune_manifest)
 
+    from prismaquant.gpu_guard import require_cuda_hot_path
+
     dtype = torch.bfloat16
-    device = torch.device(args.device)
+    device = require_cuda_hot_path(
+        "export_native_compressed",
+        args.device,
+    )
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 

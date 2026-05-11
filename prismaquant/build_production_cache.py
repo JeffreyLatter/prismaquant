@@ -10,6 +10,8 @@ all quantizable Linears. Pipeline callers should pass ``--render-scope
 assignment --render-layer-config layer_config.json`` to render only the
 concrete non-BF16 entries the export assignment will consume.
 
+This CLI is GPU-or-bust and refuses CPU execution.
+
 Usage:
 
     python -m prismaquant.build_production_cache \\
@@ -19,8 +21,9 @@ Usage:
         --n-calib-samples 8 \\
         --calib-seqlen 256
 
-The output pickle is a ``ProductionWeightCache`` whose ``weights`` are
-CPU tensors keyed by ``(qname, fmt_canonical)``.
+The output pickle is a ``ProductionWeightCache`` keyed by
+``(qname, fmt_canonical)``. Payloads are either resident tensors or references
+into the configured streaming cache directory.
 """
 from __future__ import annotations
 
@@ -42,6 +45,7 @@ from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
+from prismaquant.gpu_guard import require_cuda_hot_path
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 from prismaquant.production_recache import _load_assignment
 from prismaquant.production_weight_cache import (
@@ -101,9 +105,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--enable",
         default="gptq,scale_sweep",
         help="Comma-separated levers to enable. Currently honored: "
-        "{gptq, scale_sweep, act_clip_solver, fisher_gptq}.  AWQ predecessor folding is NOT yet wired "
-        "into render_production_weight (v2 work); passing 'awq' silently "
-        "has no effect.  Joint NVFP4 sibling globals + calibrated "
+        "{gptq, scale_sweep, act_clip_solver, fisher_gptq, awq, smoothquant}.  "
+        "AWQ and SmoothQuant require --render-scope=assignment because the "
+        "fold scale is tied to the concrete format assignment.  Joint NVFP4 "
+        "sibling globals + calibrated "
         "input_global_scale are computed unconditionally when NVFP4 is in "
         "the format menu. NVFP4 block scaling follows "
         "PRISMAQUANT_NVFP4_SCALE_RULE.",
@@ -191,7 +196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     dtype = _dtype_from_name(args.dtype)
     staged, cleanup = stage_multimodal(args.model)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = require_cuda_hot_path("build_production_cache")
+    print(f"[build-prod-cache] device={device}", flush=True)
     try:
         local_only = Path(staged).exists()
         tokenizer = AutoTokenizer.from_pretrained(

@@ -2432,6 +2432,8 @@ def run_probe(args: argparse.Namespace) -> dict:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    device = require_cuda_hot_path("kl_sensitivity_probe", device)
     staged = stage_text_only_under_work_root(args.model, work_root)
     local_only = bool(args.local_files_only or Path(staged).exists())
 

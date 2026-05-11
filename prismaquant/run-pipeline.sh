@@ -68,6 +68,19 @@ set -euo pipefail
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
+
+if [[ "$DEVICE" != cuda* || "$EXPORT_DEVICE" != cuda* ]]; then
+  echo "[pipeline] ERROR: PrismaQuant production pipeline is GPU-or-bust; DEVICE and EXPORT_DEVICE must be cuda*" >&2
+  exit 2
+fi
+python3 - <<'PY'
+import sys
+import torch
+
+if not torch.cuda.is_available():
+    print("[pipeline] ERROR: CUDA is not available; refusing CPU quantization", file=sys.stderr)
+    raise SystemExit(2)
+PY
 # Visual encoder format: fallback for visual Linears. See header docstring
 # for the full text-only vs multimodal semantics. BF16 (default) is
 # passthrough; NVFP4 / MXFP8 uniformly quantize non-Fisher-allocated
@@ -102,6 +115,7 @@ set -euo pipefail
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
 : "${PRODUCTION_CACHE_LEVERS:=gptq,scale_sweep}"
 : "${FISHER_WEIGHTED_GPTQ:=0}"
+: "${AWQ:=0}"
 : "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 : "${HALO_MODE:=off}"
 : "${HALO_SEED:=0}"
@@ -119,6 +133,15 @@ case "$FISHER_WEIGHTED_GPTQ" in
     case ",$PRODUCTION_CACHE_LEVERS," in
       *,fisher_gptq,*) ;;
       *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},fisher_gptq" ;;
+    esac
+    ;;
+esac
+case "$AWQ" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    case ",$PRODUCTION_CACHE_LEVERS," in
+      *,awq,*) ;;
+      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},awq" ;;
     esac
     ;;
 esac
@@ -140,7 +163,7 @@ echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
 echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
 echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
-echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ H_DETAIL_DIR=$H_DETAIL_DIR"
+echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ AWQ=$AWQ H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
 echo
@@ -286,6 +309,9 @@ if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTI
     0|false|False|FALSE|no|No|NO|"") ;;
     *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_clip" ;;
   esac
+  case ",$PRODUCTION_CACHE_LEVERS," in
+    *,awq,*) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_awq" ;;
+  esac
   PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}"
   PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_raw.pkl"
   PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_recached.pkl"
@@ -398,6 +424,10 @@ if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
 	    --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
 	  )
 fi
+case "$AWQ" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *) EXPORT_ARGS+=(--awq) ;;
+esac
 "${EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
 
 echo

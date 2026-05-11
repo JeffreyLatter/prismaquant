@@ -18,6 +18,7 @@ from prismaquant.calibration_data import (
     _dtype_from_name,
     load_wikitext_calibration_windowed,
 )
+from prismaquant.gpu_guard import require_cuda_hot_path
 from prismaquant.layer_config import canonicalize_format
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 from prismaquant.kl_measurement import assignment_bit_total, measure_assignment_kl
@@ -164,7 +165,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
 
     device_str = _device_arg(args.device)
-    device = torch.device(device_str)
+    device = require_cuda_hot_path("validate_assignments_kl", device_str)
+    device_str = str(device)
+    if args.device_map not in (None, "cuda"):
+        raise RuntimeError(
+            "validate_assignments_kl requires a CUDA-resident model. CPU/offload "
+            f"device_map={args.device_map!r} is not allowed."
+        )
     dtype = _dtype_from_name(args.dtype)
     staged, cleanup = stage_multimodal(args.model)
     work_root = Path(args.work_dir or tempfile.mkdtemp(prefix="prismaquant_validate_kl_"))

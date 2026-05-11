@@ -22,6 +22,8 @@ quantization path:
     * optional Fisher-weighted local objectives from h-detail
     * opt-in activation-weighted MXFP8 E8M0 scale search when nonzero
       PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS are configured
+    * opt-in AWQ-v2 normalization-predecessor fold scales, searched by
+      rendered-weight output MSE and stored as effective cache weights
 
   KNOWN GAPS (v2 work, NOT implemented):
     * batched NVFP4 GPTQ + scale-sweep across same-shape Linears
@@ -30,7 +32,6 @@ quantization path:
     * block-output match (post-GPTQ refinement against BF16 block output)
     * HALO Hadamard rotation (only relevant when tied embeddings are
       untied; not used on Qwen3-4B / 27B)
-    * AWQ predecessor folding (`_awq_fold_layer_predecessors`)
     * any export-only refinements added after this docstring is written
 
   MXFP8/BF16:
@@ -66,6 +67,13 @@ import re
 import torch
 import torch.nn as nn
 
+from prismaquant.awq import (
+    DEFAULT_AWQ_MIN_GAIN,
+    AwqSearchTarget,
+    awq_output_mse,
+    normalize_awq_scale,
+    search_awq_scale,
+)
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 
 
@@ -108,6 +116,11 @@ class ProductionWeightCache:
     metadata: dict[str, object] | None = None
     # Backward-compat alias for code that still reads ``activation_scales``.
     activation_scales: dict[str, float] | None = None
+    # Per-Linear AWQ fold scales.  Cache weights are stored in original
+    # coordinates as Q(W*s)/s for faithful measurement in the unfolded model;
+    # export multiplies by this scale and folds predecessor norms so the
+    # artifact stores Q(W*s) and serves the same function.
+    awq_scales: dict[str, torch.Tensor] | None = None
     # LRU eviction state for memoized tensor loads.  When non-None, the
     # in-memory cache holds at most ``mem_lru_max_bytes`` of tensor data;
     # least-recently-used entries are evicted back to their on-disk
@@ -539,7 +552,7 @@ class _LinearActivationCollector:
     """Hook every quantizable nn.Linear's input on a forward pass.
 
     Stores up to ``max_rows`` rows of activations per Linear (concatenated
-    across calibration samples) as float32 CPU tensors.  Only handles
+    across calibration samples) on the configured resident device.  Only handles
     ``nn.Linear`` for now — packed MoE experts route through different
     APIs in the export pipeline and would need a separate collector.
 
@@ -550,14 +563,25 @@ class _LinearActivationCollector:
     metadata even for Linears whose render is skipped via resume.
     """
 
-    def __init__(self, model: nn.Module, qnames: set[str], max_rows: int,
-                 store_qnames: set[str] | None = None):
+    def __init__(
+        self,
+        model: nn.Module,
+        qnames: set[str],
+        max_rows: int,
+        store_qnames: set[str] | None = None,
+        *,
+        store_device: torch.device | str | None = None,
+        store_dtype: torch.dtype = torch.float32,
+    ):
         self.model = model
         self.qnames = qnames
         self.store_qnames = set(store_qnames) if store_qnames is not None else set(qnames)
         self.max_rows = int(max_rows)
+        self.store_device = torch.device(store_device or "cpu")
+        self.store_dtype = store_dtype
         self.activations: dict[str, list[torch.Tensor]] = {}
         self.max_abs: dict[str, float] = {}
+        self._max_abs_tensors: dict[str, torch.Tensor] = {}
         self._handles: list = []
         self._name_by_id: dict[int, str] = {}
         for full_name, mod, attr in iter_quantizable_tensors(model):
@@ -591,15 +615,22 @@ class _LinearActivationCollector:
             # Always update the cheap per-Linear max_abs scalar — needed
             # even for Linears we won't store activations for (so cache
             # has act-clip values for every assigned Linear).
-            x_abs_max = float(x.detach().abs().max().item())
-            prev = self.max_abs.get(key, 0.0)
-            if x_abs_max > prev:
-                self.max_abs[key] = x_abs_max
+            x_abs_max = x.detach().abs().amax()
+            prev = self._max_abs_tensors.get(key)
+            self._max_abs_tensors[key] = (
+                x_abs_max.detach()
+                if prev is None
+                else torch.maximum(prev, x_abs_max.detach())
+            )
             # Only store the full activation tensor if this Linear is in
             # the store set.  Memory bound: store_qnames × max_rows × in.
             if key not in self.store_qnames:
                 return
-            flat = x.detach().reshape(-1, x.shape[-1]).to(torch.float32).cpu()
+            flat = x.detach().reshape(-1, x.shape[-1]).to(
+                device=self.store_device,
+                dtype=self.store_dtype,
+                non_blocking=True,
+            )
             existing = sum(t.shape[0] for t in self.activations[key])
             if existing >= self.max_rows:
                 return
@@ -618,6 +649,10 @@ class _LinearActivationCollector:
             if not parts:
                 continue
             out[key] = torch.cat(parts, dim=0)
+        self.max_abs = {
+            key: float(value.detach().to("cpu").item())
+            for key, value in self._max_abs_tensors.items()
+        }
         return out
 
 
@@ -808,6 +843,504 @@ def _activation_output_error(
     return total / max(1, int(X.shape[0]) * int(rows))
 
 
+_AWQ_CACHE_FORMATS = frozenset({"NVFP4", "MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
+_AWQ_INPUT_LN_LEAVES = frozenset({
+    "q_proj", "k_proj", "v_proj",
+    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
+})
+_AWQ_POST_LN_LEAVES = frozenset({
+    "gate_proj", "up_proj", "gate_up_proj", "w1", "w3", "gate", "router",
+})
+
+
+def _awq_group_key_from_qname(qname: str) -> str | None:
+    """Return the normalization predecessor group an AWQ scale can fold into."""
+    from prismaquant.decision_units import block_id_from_qname
+
+    leaf = qname.rsplit(".", 1)[-1]
+    block = block_id_from_qname(qname)
+    if leaf in _AWQ_INPUT_LN_LEAVES:
+        return f"{block}.input_layernorm"
+    if leaf in _AWQ_POST_LN_LEAVES:
+        return f"{block}.post_attention_layernorm"
+    return None
+
+
+def _awq_format_group_size(fmt: str) -> int:
+    fmt = fmt.upper()
+    if fmt == "NVFP4":
+        return 16
+    if fmt in {"MXFP8", "MXFP8_E4M3"}:
+        return 32
+    return 0
+
+
+def _render_awq_scaled_for_cache(
+    *,
+    qname: str,
+    fmt: str,
+    weight_scaled: torch.Tensor,
+    activations_scaled: torch.Tensor,
+    levers: Mapping[str, object],
+    joint_global_real: torch.Tensor | None,
+    act_clip_threshold: float | None = None,
+    fisher_row_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    from prismaquant import export_native_compressed as enc
+
+    fmt = fmt.upper()
+    with _temporarily_install_act_aware(
+        {qname: activations_scaled},
+        {**dict(levers), "awq": False},
+    ):
+        result = enc._quantize_2d(
+            weight_scaled,
+            fmt,
+            linear_name=qname,
+            nvfp4_global_real_override=joint_global_real,
+            cached_activations=activations_scaled,
+            awq_enabled=False,
+            gptq_enabled=bool(levers.get("gptq", True)),
+            awq_round_enabled=bool(levers.get("awq_round", False)),
+            scale_sweep_enabled=bool(levers.get("scale_sweep", True)),
+            act_clip_threshold=act_clip_threshold,
+            fisher_row_weights=fisher_row_weights,
+            compute_only=(fmt == "NVFP4"),
+        )
+    if fmt == "NVFP4":
+        return result["_w_dq"].to(torch.float32)
+    if fmt in {"MXFP8", "MXFP8_E4M3"}:
+        weight = result["weight"]
+        scale = result["weight_scale"]
+        grouped = weight.reshape(weight.shape[0], weight.shape[1] // 32, 32)
+        return enc._mxfp8_dequantize_grouped(grouped, scale).reshape(weight.shape)
+    if fmt == "FP8_E4M3":
+        return result["weight"].to(torch.float32) * result["weight_scale"].to(torch.float32)
+    raise ValueError(f"AWQ cache renderer unsupported for {fmt}")
+
+
+def _compute_awq_scaled_joint_globals(
+    *,
+    qname_to_module: Mapping[str, nn.Module],
+    render_formats_by_qname: Mapping[str, Sequence[str]],
+    awq_scales: Mapping[str, torch.Tensor],
+    profile,
+) -> dict[str, torch.Tensor]:
+    """Compute NVFP4 joint globals after AWQ column scaling."""
+    from prismaquant.decision_units import fused_group_key
+    from prismaquant.export_native_compressed import compute_nvfp4_global_real
+
+    groups: dict[str, list[str]] = {}
+    for qname, fmts in render_formats_by_qname.items():
+        if "NVFP4" not in {str(f).upper() for f in fmts}:
+            continue
+        if qname not in qname_to_module:
+            continue
+        try:
+            gk = fused_group_key(profile, qname) if profile else qname
+        except Exception:
+            gk = qname
+        groups.setdefault(gk, []).append(qname)
+
+    out: dict[str, torch.Tensor] = {}
+    for _gk, members in groups.items():
+        candidates = []
+        for qname in members:
+            weight = qname_to_module[qname].weight.detach().to(torch.float32)
+            scale = awq_scales.get(qname)
+            if scale is not None and scale.numel() == weight.shape[1]:
+                weight = weight * scale.to(weight.device, dtype=torch.float32).unsqueeze(0)
+            candidates.append(compute_nvfp4_global_real(weight))
+        if not candidates:
+            continue
+        joint = torch.stack(candidates).max()
+        for qname in members:
+            out[qname] = joint
+    return out
+
+
+def _solve_awq_scales(
+    *,
+    qname_to_module: Mapping[str, nn.Module],
+    activations: Mapping[str, torch.Tensor],
+    render_formats_by_qname: Mapping[str, Sequence[str]],
+    levers: Mapping[str, object],
+    progress: bool,
+) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+    """Solve normalization-fold AWQ scales for a concrete assignment."""
+    groups: dict[str, list[str]] = {}
+    for qname, fmts in render_formats_by_qname.items():
+        if qname not in qname_to_module or qname not in activations:
+            continue
+        fmt = next((str(f).upper() for f in fmts if str(f).upper() != "BF16"), "")
+        if fmt not in _AWQ_CACHE_FORMATS:
+            continue
+        group_key = _awq_group_key_from_qname(qname)
+        if group_key is None:
+            continue
+        groups.setdefault(group_key, []).append(qname)
+
+    metadata: dict[str, object] = {
+        "enabled": True,
+        "mode": "duo_output_mse",
+        "groups": {},
+        "scales": {},
+        "n_groups": 0,
+        "n_scaled_linears": 0,
+    }
+    scales: dict[str, torch.Tensor] = {}
+    if not groups:
+        metadata["status"] = "no_eligible_groups"
+        return scales, metadata
+
+    n_grid = _env_int("PRISMAQUANT_AWQ_GRID", 20, lo=2, hi=80)
+    clamp_ratio = _env_float("PRISMAQUANT_AWQ_CLAMP", 10.0, lo=1.0, hi=100.0)
+    min_gain = _env_float(
+        "PRISMAQUANT_AWQ_MIN_GAIN",
+        DEFAULT_AWQ_MIN_GAIN,
+        lo=-1.0,
+        hi=1.0,
+    )
+    duo = _env_flag("PRISMAQUANT_AWQ_DUO", True)
+    search_levers = dict(levers)
+    search_levers["gptq"] = _env_flag("PRISMAQUANT_AWQ_SEARCH_GPTQ", False)
+    search_levers["scale_sweep"] = _env_flag(
+        "PRISMAQUANT_AWQ_SEARCH_SCALE_SWEEP",
+        bool(levers.get("scale_sweep", True)),
+    )
+    search_levers["fisher_gptq"] = _env_flag(
+        "PRISMAQUANT_AWQ_SEARCH_FISHER_GPTQ",
+        False,
+    )
+    search_levers["awq_round"] = _env_flag(
+        "PRISMAQUANT_AWQ_SEARCH_AWQ_ROUND",
+        False,
+    )
+    metadata["min_gain"] = float(min_gain)
+    metadata["n_grid"] = int(n_grid)
+    metadata["clamp_ratio"] = float(clamp_ratio)
+    metadata["duo_scaling"] = bool(duo)
+    metadata["search_levers"] = {
+        "gptq": bool(search_levers.get("gptq", False)),
+        "scale_sweep": bool(search_levers.get("scale_sweep", True)),
+        "fisher_gptq": bool(search_levers.get("fisher_gptq", False)),
+        "awq_round": bool(search_levers.get("awq_round", False)),
+    }
+
+    for idx, (group_key, raw_members) in enumerate(sorted(groups.items()), start=1):
+        members = sorted(set(raw_members))
+        targets: list[AwqSearchTarget] = []
+        target_qnames: list[str] = []
+        for qname in members:
+            fmt = next(
+                (str(f).upper() for f in render_formats_by_qname[qname]
+                 if str(f).upper() != "BF16"),
+                "",
+            )
+            weight = qname_to_module[qname].weight.detach().to(torch.float32)
+            acts = activations[qname].detach().to(weight.device, dtype=torch.float32)
+            targets.append(AwqSearchTarget(
+                name=qname,
+                fmt=fmt,
+                weight=weight,
+                activations=acts,
+                group_size=_awq_format_group_size(fmt),
+            ))
+            target_qnames.append(qname)
+        if not targets:
+            continue
+
+        def render_target(tidx, w_scaled, a_scaled, scale):
+            target = targets[tidx]
+            return _render_awq_scaled_for_cache(
+                qname=target.name,
+                fmt=target.fmt,
+                weight_scaled=w_scaled,
+                activations_scaled=a_scaled,
+                levers=search_levers,
+                joint_global_real=None,
+            )
+
+        try:
+            result = search_awq_scale(
+                targets,
+                render_target,
+                n_grid=n_grid,
+                duo_scaling=duo,
+                clamp_ratio=clamp_ratio,
+                min_gain=min_gain,
+            )
+        except Exception as exc:
+            metadata["groups"][group_key] = {
+                "members": target_qnames,
+                "status": "failed",
+                "error": str(exc),
+            }
+            if _env_flag("PRISMAQUANT_AWQ_STRICT", False):
+                raise
+            continue
+
+        selected = result.selected_label != "identity"
+        for qname in target_qnames:
+            if selected:
+                scales[qname] = result.scale.detach().cpu()
+                metadata["scales"][qname] = {
+                    "group": group_key,
+                    "selected_label": result.selected_label,
+                    "relative_gain": result.relative_gain,
+                }
+        metadata["groups"][group_key] = {
+            "members": target_qnames,
+            "status": "solved",
+            "selected": result.selected_label,
+            "selected_ratio": result.selected_ratio,
+            "baseline_score": result.baseline_score,
+            "best_score": result.best_score,
+            "relative_gain": result.relative_gain,
+            "n_candidates": result.n_candidates,
+            "trace": result.trace,
+        }
+        if progress and (idx % 10 == 0 or idx == len(groups)):
+            print(
+                f"[prod-cache] AWQ searched {idx}/{len(groups)} groups",
+                flush=True,
+            )
+
+    metadata["status"] = "applied"
+    metadata["n_groups"] = len(groups)
+    metadata["n_scaled_linears"] = len(scales)
+    return scales, metadata
+
+
+def _env_float_list(name: str, default: Sequence[float]) -> list[float]:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return [float(v) for v in default]
+    out: list[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            val = float(part)
+        except ValueError:
+            continue
+        if 0.0 <= val <= 1.0:
+            out.append(val)
+    return out or [float(v) for v in default]
+
+
+def _smoothquant_scale_from_targets(
+    targets: Sequence[AwqSearchTarget],
+    *,
+    alpha: float,
+    clamp_ratio: float,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    if not targets:
+        raise ValueError("SmoothQuant requires at least one target")
+    cols = int(targets[0].weight.shape[1])
+    device = targets[0].weight.device
+    x_max = torch.zeros(cols, device=device, dtype=torch.float32)
+    w_max = torch.zeros(cols, device=device, dtype=torch.float32)
+    for target in targets:
+        if int(target.weight.shape[1]) != cols:
+            raise ValueError("all SmoothQuant targets must share input width")
+        x = target.activations.detach().to(device=device, dtype=torch.float32)
+        x = x.reshape(-1, cols)
+        w = target.weight.detach().to(device=device, dtype=torch.float32)
+        x_max = torch.maximum(x_max, x.abs().amax(dim=0))
+        w_max = torch.maximum(w_max, w.abs().amax(dim=0))
+    a = float(alpha)
+    raw = x_max.clamp_min(eps).pow(a) / w_max.clamp_min(eps).pow(1.0 - a)
+    return normalize_awq_scale(raw, eps=eps, clamp_ratio=clamp_ratio)
+
+
+def _solve_smoothquant_scales(
+    *,
+    qname_to_module: Mapping[str, nn.Module],
+    activations: Mapping[str, torch.Tensor],
+    render_formats_by_qname: Mapping[str, Sequence[str]],
+    levers: Mapping[str, object],
+    progress: bool,
+) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+    """Solve SmoothQuant-style normalization-fold scales for an assignment."""
+    groups: dict[str, list[str]] = {}
+    for qname, fmts in render_formats_by_qname.items():
+        if qname not in qname_to_module or qname not in activations:
+            continue
+        fmt = next((str(f).upper() for f in fmts if str(f).upper() != "BF16"), "")
+        if fmt not in _AWQ_CACHE_FORMATS:
+            continue
+        group_key = _awq_group_key_from_qname(qname)
+        if group_key is None:
+            continue
+        groups.setdefault(group_key, []).append(qname)
+
+    metadata: dict[str, object] = {
+        "enabled": True,
+        "mode": "max_stat_alpha_search",
+        "groups": {},
+        "scales": {},
+        "n_groups": 0,
+        "n_scaled_linears": 0,
+    }
+    scales: dict[str, torch.Tensor] = {}
+    if not groups:
+        metadata["status"] = "no_eligible_groups"
+        return scales, metadata
+
+    alphas = _env_float_list("PRISMAQUANT_SMOOTHQUANT_ALPHAS", [0.5])
+    clamp_ratio = _env_float("PRISMAQUANT_SMOOTHQUANT_CLAMP", 10.0, lo=1.0, hi=100.0)
+    min_gain = _env_float("PRISMAQUANT_SMOOTHQUANT_MIN_GAIN", 0.0, lo=-1.0, hi=1.0)
+    search_levers = dict(levers)
+    search_levers["gptq"] = _env_flag("PRISMAQUANT_SMOOTHQUANT_SEARCH_GPTQ", False)
+    search_levers["scale_sweep"] = _env_flag(
+        "PRISMAQUANT_SMOOTHQUANT_SEARCH_SCALE_SWEEP",
+        False,
+    )
+    search_levers["fisher_gptq"] = _env_flag(
+        "PRISMAQUANT_SMOOTHQUANT_SEARCH_FISHER_GPTQ",
+        False,
+    )
+    search_levers["awq_round"] = False
+    metadata["alphas"] = [float(a) for a in alphas]
+    metadata["clamp_ratio"] = float(clamp_ratio)
+    metadata["min_gain"] = float(min_gain)
+    metadata["search_levers"] = {
+        "gptq": bool(search_levers.get("gptq", False)),
+        "scale_sweep": bool(search_levers.get("scale_sweep", False)),
+        "fisher_gptq": bool(search_levers.get("fisher_gptq", False)),
+        "awq_round": False,
+    }
+
+    for idx, (group_key, raw_members) in enumerate(sorted(groups.items()), start=1):
+        members = sorted(set(raw_members))
+        targets: list[AwqSearchTarget] = []
+        target_qnames: list[str] = []
+        for qname in members:
+            fmt = next(
+                (str(f).upper() for f in render_formats_by_qname[qname]
+                 if str(f).upper() != "BF16"),
+                "",
+            )
+            weight = qname_to_module[qname].weight.detach().to(torch.float32)
+            acts = activations[qname].detach().to(weight.device, dtype=torch.float32)
+            targets.append(AwqSearchTarget(
+                name=qname,
+                fmt=fmt,
+                weight=weight,
+                activations=acts,
+                group_size=_awq_format_group_size(fmt),
+            ))
+            target_qnames.append(qname)
+        if not targets:
+            continue
+
+        def score_scale(scale: torch.Tensor) -> float:
+            total = 0.0
+            scale = scale.to(device=targets[0].weight.device, dtype=torch.float32)
+            for tidx, target in enumerate(targets):
+                w = target.weight.detach().to(dtype=torch.float32)
+                x = target.activations.detach().to(w.device, dtype=torch.float32)
+                w_scaled = w * scale.unsqueeze(0)
+                a_scaled = x.reshape(-1, x.shape[-1]) / scale.clamp_min(1e-12).unsqueeze(0)
+                rendered = _render_awq_scaled_for_cache(
+                    qname=target.name,
+                    fmt=target.fmt,
+                    weight_scaled=w_scaled,
+                    activations_scaled=a_scaled,
+                    levers=search_levers,
+                    joint_global_real=None,
+                )
+                effective = (
+                    rendered.to(w.device, dtype=torch.float32)
+                    / scale.clamp_min(1e-12).unsqueeze(0)
+                )
+                total += awq_output_mse(
+                    w,
+                    effective,
+                    target.activations,
+                )
+            return float(total)
+
+        try:
+            identity = torch.ones(
+                int(targets[0].weight.shape[1]),
+                device=targets[0].weight.device,
+                dtype=torch.float32,
+            )
+            baseline_score = score_scale(identity)
+            best_scale = identity
+            best_alpha: float | None = None
+            best_score = float(baseline_score)
+            trace: list[dict[str, float | str | None]] = [{
+                "label": "identity",
+                "alpha": None,
+                "score": float(baseline_score),
+                "best_score": float(best_score),
+            }]
+            for alpha in alphas:
+                cand = _smoothquant_scale_from_targets(
+                    targets,
+                    alpha=float(alpha),
+                    clamp_ratio=clamp_ratio,
+                )
+                score = score_scale(cand)
+                if score < best_score:
+                    best_score = float(score)
+                    best_scale = cand.detach().clone()
+                    best_alpha = float(alpha)
+                trace.append({
+                    "label": f"alpha_{float(alpha):.4f}",
+                    "alpha": float(alpha),
+                    "score": float(score),
+                    "best_score": float(best_score),
+                })
+        except Exception as exc:
+            metadata["groups"][group_key] = {
+                "members": target_qnames,
+                "status": "failed",
+                "error": str(exc),
+            }
+            if _env_flag("PRISMAQUANT_SMOOTHQUANT_STRICT", False):
+                raise
+            continue
+
+        denom = max(abs(float(baseline_score)), 1e-30)
+        relative_gain = (float(baseline_score) - float(best_score)) / denom
+        selected = best_alpha is not None and relative_gain >= float(min_gain)
+        if selected:
+            for qname in target_qnames:
+                scales[qname] = best_scale.detach().cpu()
+                metadata["scales"][qname] = {
+                    "group": group_key,
+                    "selected_alpha": best_alpha,
+                    "relative_gain": relative_gain,
+                }
+        metadata["groups"][group_key] = {
+            "members": target_qnames,
+            "status": "solved",
+            "selected": "identity" if not selected else f"alpha_{best_alpha:.4f}",
+            "selected_alpha": None if not selected else best_alpha,
+            "baseline_score": float(baseline_score),
+            "best_score": float(best_score if selected else baseline_score),
+            "relative_gain": float(relative_gain if selected else 0.0),
+            "n_candidates": len(alphas) + 1,
+            "trace": trace,
+        }
+        if progress and (idx % 10 == 0 or idx == len(groups)):
+            print(
+                f"[prod-cache] SmoothQuant searched {idx}/{len(groups)} groups",
+                flush=True,
+            )
+
+    metadata["status"] = "applied"
+    metadata["n_groups"] = len(groups)
+    metadata["n_scaled_linears"] = len(scales)
+    return scales, metadata
+
+
 def _group_activation_bounds(
     members: Sequence[str],
     activations: Mapping[str, torch.Tensor],
@@ -868,6 +1401,7 @@ def _solve_nvfp4_activation_clip_groups(
     weights_out: dict[tuple[str, str], object],
     cache_dir_path: Path | None,
     progress: bool,
+    awq_scales: Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, float | None], dict[str, object]]:
     """Solve one scalar render-time activation clamp per fused NVFP4 group.
 
@@ -935,6 +1469,7 @@ def _solve_nvfp4_activation_clip_groups(
             fisher_row_weights=(
                 fisher_rows.get(qname) if fisher_rows is not None else None
             ),
+            awq_scale=(awq_scales or {}).get(qname),
         )
 
     group_entries: list[dict[str, object]] = []
@@ -1213,6 +1748,7 @@ def render_production_weight(
     input_global_scale: float | None = None,
     act_clip_threshold: float | None = None,
     fisher_row_weights: torch.Tensor | None = None,
+    awq_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute the production-faithful dequantized weight for ``(qname, fmt)``.
 
@@ -1230,9 +1766,37 @@ def render_production_weight(
 
     ``act_clip_threshold`` is an optional scalar clamp for activation-aware
     render passes. ``fisher_row_weights`` optionally weights local objectives
-    by per-token gradient² from h-detail.
+    by per-token gradient² from h-detail. ``awq_scale`` stores weights in the
+    cache's measurement coordinates: Q(W*s)/s, while export later multiplies by
+    ``s`` and folds the predecessor norm to emit Q(W*s).
     """
     fmt = fmt.upper()
+    if awq_scale is not None:
+        scale = awq_scale.to(device=weight.device, dtype=torch.float32)
+        if scale.numel() != weight.shape[1]:
+            raise ValueError(
+                f"AWQ scale width {scale.numel()} != {qname} weight.in {weight.shape[1]}"
+            )
+        acts = activations.get(qname)
+        if acts is None:
+            raise ValueError(f"AWQ render for {qname} requires activations")
+        scaled = _render_awq_scaled_for_cache(
+            qname=qname,
+            fmt=fmt,
+            weight_scaled=weight.detach().to(torch.float32) * scale.unsqueeze(0),
+            activations_scaled=(
+                acts.detach().to(device=weight.device, dtype=torch.float32)
+                .reshape(-1, acts.shape[-1])
+                / scale.clamp_min(1e-12).unsqueeze(0)
+            ),
+            levers=levers,
+            joint_global_real=joint_global_real,
+            act_clip_threshold=act_clip_threshold,
+            fisher_row_weights=fisher_row_weights,
+        )
+        effective = scaled / scale.clamp_min(1e-12).unsqueeze(0)
+        return effective.to(device=weight.device, dtype=weight.dtype).contiguous()
+
     if fmt != "NVFP4":
         if (
             fmt in {"MXFP8", "MXFP8_E4M3"}
@@ -1332,6 +1896,7 @@ def fill_production_weight_cache(
     levers.setdefault("scale_sweep", True)
     levers.setdefault("awq", False)
     levers.setdefault("awq_round", False)
+    levers.setdefault("smoothquant", False)
     levers.setdefault(
         "act_clip_solver",
         _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER", False),
@@ -1342,6 +1907,8 @@ def fill_production_weight_cache(
     )
     from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
     levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
+    if bool(levers.get("awq", False)) and bool(levers.get("smoothquant", False)):
+        raise ValueError("AWQ and SmoothQuant are mutually exclusive fold-scale levers")
 
     from prismaquant import format_registry as fr
 
@@ -1416,6 +1983,10 @@ def fill_production_weight_cache(
     activation_aware_formats = {"NVFP4"}
     if bool(levers.get("scale_sweep", True)):
         activation_aware_formats.update({"MXFP8", "MXFP8_E4M3"})
+    if bool(levers.get("awq", False)):
+        activation_aware_formats.update(_AWQ_CACHE_FORMATS)
+    if bool(levers.get("smoothquant", False)):
+        activation_aware_formats.update(_AWQ_CACHE_FORMATS)
     qnames_to_render: set[str] = set(qname_set)
     missing_formats_by_qname: dict[str, set[str]] = {
         q: set(render_formats_by_qname.get(q, ())) for q in qname_set
@@ -1442,8 +2013,31 @@ def fill_production_weight_cache(
         q for q, missing in missing_formats_by_qname.items()
         if any(f in activation_aware_formats for f in missing)
     }
+    if bool(levers.get("awq", False)):
+        qnames_needing_activation.update(
+            q for q, fmts in render_formats_by_qname.items()
+            if any(str(f).upper() in _AWQ_CACHE_FORMATS for f in fmts)
+        )
+    if bool(levers.get("smoothquant", False)):
+        qnames_needing_activation.update(
+            q for q, fmts in render_formats_by_qname.items()
+            if any(str(f).upper() in _AWQ_CACHE_FORMATS for f in fmts)
+        )
 
     device = next(model.parameters()).device
+    awq_enabled = bool(levers.get("awq", False))
+    activation_store_device = (
+        device if device.type == "cuda" else torch.device("cpu")
+    )
+    activation_store_dtype = torch.float32
+    if progress and qnames_needing_activation:
+        print(
+            f"[prod-cache] activation_capture "
+            f"store_device={activation_store_device} "
+            f"store_dtype={activation_store_dtype} "
+            f"qnames={len(qnames_needing_activation)}",
+            flush=True,
+        )
     # RESUME: if all qnames are already rendered AND we have either a
     # sidecar OR no need for max_abs (no NVFP4 in formats), skip the
     # forward pass entirely.  Avoids OOM from the model's forward pass
@@ -1456,6 +2050,7 @@ def fill_production_weight_cache(
     skip_forward = (
         cache_dir_path is not None
         and not qnames_needing_activation
+        and not bool(levers.get("awq", False))
         and (
             (sidecar_path is not None and sidecar_path.is_file())
             or "NVFP4" not in fmt_set
@@ -1478,6 +2073,8 @@ def fill_production_weight_cache(
             qnames=qname_set,
             max_rows=max_act_rows,
             store_qnames=qnames_needing_activation,
+            store_device=activation_store_device,
+            store_dtype=activation_store_dtype,
         )
         collector.install()
         try:
@@ -1496,10 +2093,28 @@ def fill_production_weight_cache(
             collector.remove()
         activations = collector.collected()
 
+    if device.type == "cuda" and qnames_needing_activation:
+        cpu_activations = [
+            name for name, acts in activations.items()
+            if acts.device.type != "cuda"
+        ]
+        if cpu_activations:
+            raise RuntimeError(
+                "production cache captured non-CUDA activations for "
+                f"{len(cpu_activations)} Linears; sample={cpu_activations[:3]}"
+            )
+
     if progress:
+        activation_bytes = sum(
+            int(t.numel()) * int(t.element_size())
+            for t in activations.values()
+        )
+        activation_devices = sorted({str(t.device) for t in activations.values()})
         print(
             f"[prod-cache] collected activations for "
-            f"{len(activations)}/{len(qname_set)} Linears",
+            f"{len(activations)}/{len(qname_set)} Linears "
+            f"resident_bytes={activation_bytes:,} "
+            f"devices={activation_devices}",
             flush=True,
         )
 
@@ -1650,6 +2265,76 @@ def fill_production_weight_cache(
             import json as _json
             sidecar_path.write_text(_json.dumps(activation_max_abs, indent=2))
 
+    awq_scales: dict[str, torch.Tensor] = {}
+    awq_metadata: dict[str, object] = {
+        "enabled": bool(levers.get("awq", False)),
+        "status": "disabled",
+    }
+    smoothquant_metadata: dict[str, object] = {
+        "enabled": bool(levers.get("smoothquant", False)),
+        "status": "disabled",
+    }
+    if bool(levers.get("awq", False)):
+        if render_assignment is None:
+            raise ValueError(
+                "production AWQ requires render_assignment/assignment scope; "
+                "format-menu AWQ would need multiple incompatible fold scales "
+                "for the same predecessor"
+            )
+        if progress:
+            print("[prod-cache] solving AWQ scales", flush=True)
+        awq_scales, awq_metadata = _solve_awq_scales(
+            qname_to_module=qname_to_module,
+            activations=activations,
+            render_formats_by_qname=render_formats_by_qname,
+            levers=levers,
+            progress=progress,
+        )
+        if needs_nvfp4_render and awq_scales:
+            joint_globals = _compute_awq_scaled_joint_globals(
+                qname_to_module=qname_to_module,
+                render_formats_by_qname=render_formats_by_qname,
+                awq_scales=awq_scales,
+                profile=profile,
+            )
+            if progress:
+                print(
+                    f"[prod-cache] recomputed joint NVFP4 globals after "
+                    f"AWQ for {len(joint_globals)} fused-sibling members",
+                    flush=True,
+                )
+
+    if bool(levers.get("smoothquant", False)):
+        if render_assignment is None:
+            raise ValueError(
+                "production SmoothQuant requires render_assignment/assignment "
+                "scope because fold scales are tied to the concrete format "
+                "assignment"
+            )
+        if progress:
+            print("[prod-cache] solving SmoothQuant scales", flush=True)
+        awq_scales, smoothquant_metadata = _solve_smoothquant_scales(
+            qname_to_module=qname_to_module,
+            activations=activations,
+            render_formats_by_qname=render_formats_by_qname,
+            levers=levers,
+            progress=progress,
+        )
+        if needs_nvfp4_render and awq_scales:
+            joint_globals = _compute_awq_scaled_joint_globals(
+                qname_to_module=qname_to_module,
+                render_formats_by_qname=render_formats_by_qname,
+                awq_scales=awq_scales,
+                profile=profile,
+            )
+            if progress:
+                print(
+                    f"[prod-cache] recomputed joint NVFP4 globals after "
+                    f"SmoothQuant for {len(joint_globals)} fused-sibling "
+                    "members",
+                    flush=True,
+                )
+
     solved_nvfp4_thresholds: dict[str, float | None] = {}
     clip_solver_metadata: dict[str, object] = {
         "enabled": bool(levers.get("act_clip_solver", False)),
@@ -1689,6 +2374,7 @@ def fill_production_weight_cache(
                     weights_out=weights,
                     cache_dir_path=cache_dir_path,
                     progress=progress,
+                    awq_scales=awq_scales,
                 )
             )
             clip_solver_metadata["status"] = "applied"
@@ -1755,6 +2441,10 @@ def fill_production_weight_cache(
                     fisher_row_weights=(
                         fisher_rows.get(qname) if fisher_rows is not None else None
                     ),
+                    awq_scale=(
+                        awq_scales.get(qname)
+                        if fmt.upper() in _AWQ_CACHE_FORMATS else None
+                    ),
                 )
             except Exception as e:
                 failed[(qname, fmt.upper())] = str(e)
@@ -1808,6 +2498,8 @@ def fill_production_weight_cache(
         cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
         metadata={
             "activation_clip_solver": clip_solver_metadata,
+            "awq": awq_metadata,
+            "smoothquant": smoothquant_metadata,
             "fisher_weighted_gptq": {
                 "enabled": bool(levers.get("fisher_gptq", False)),
                 "h_detail_dir": str(h_detail_dir) if h_detail_dir else None,
@@ -1818,6 +2510,7 @@ def fill_production_weight_cache(
             "requested_formats": list(requested_formats),
             "requested_entries": int(n),
         },
+        awq_scales=awq_scales or None,
     )
     if recache_pass:
         from prismaquant.production_recache import recache_production_weight_cache

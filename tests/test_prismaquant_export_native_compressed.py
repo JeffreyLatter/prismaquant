@@ -1715,6 +1715,8 @@ class TestActivationAwarePasses(unittest.TestCase):
         """
         import torch
         import torch.nn as nn
+        import prismaquant.export_native_compressed as m
+        from prismaquant.awq import AwqSearchResult
         from prismaquant.export_native_compressed import (
             _awq_fold_layer_predecessors,
         )
@@ -1754,10 +1756,29 @@ class TestActivationAwarePasses(unittest.TestCase):
             "gate": "BF16",        # BF16 reader must still get W *= s
         }
         act_cache = {"gate_proj": acts}
-        _ = _awq_fold_layer_predecessors(
-            layer, "", assignment, profile, act_cache,
-            torch.device("cpu"),
-        )
+        forced_scale = torch.linspace(0.5, 1.5, hidden)
+        saved_search = m.search_awq_scale
+
+        def fake_search(*_args, **_kwargs):
+            return AwqSearchResult(
+                scale=forced_scale,
+                selected_label="forced",
+                selected_ratio=None,
+                baseline_score=2.0,
+                best_score=1.0,
+                relative_gain=0.5,
+                n_candidates=1,
+                trace=[],
+            )
+
+        try:
+            m.search_awq_scale = fake_search
+            _ = _awq_fold_layer_predecessors(
+                layer, "", assignment, profile, act_cache,
+                torch.device("cpu"),
+            )
+        finally:
+            m.search_awq_scale = saved_search
 
         # BF16 reader's weight must have changed — the fold is required
         # to multiply by `s` regardless of target format.
