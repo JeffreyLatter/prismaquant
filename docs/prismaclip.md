@@ -36,6 +36,21 @@ The solver can optionally write the baseline NVFP4 rendering to
 default: .8B validation on 2026-05-11 regressed from KL `0.12600227` with
 prewrite off to `0.21575844` with prewrite on.
 
+That .8B result does not make no-prewrite universally safe. A Qwen3-4B
+rerun on 2026-05-11 with the same FourOverSix+PrismaClip assignment,
+`PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE=0`, and resident cache
+prefetch regressed to KL `0.16388227`. The cache differed from the
+known-good `0.056417932` cache in exactly three NVFP4 sidecars:
+
+- `model.layers.8.self_attn.o_proj`
+- `model.layers.14.mlp.gate_proj`
+- `model.layers.14.mlp.up_proj`
+
+Hardlink-patching only those three files back from the known-good cache
+restored KL exactly to `0.056417932`, so the issue is PrismaClip's local
+threshold selection/render stability for a few groups, not assignment,
+bpp accounting, cache prefetch, or validation.
+
 Same-shape fused groups can also try the existing batched NVFP4
 GPTQ/scale-sweep path when `PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED=1`. This is
 currently opt-in: a 4B validation run on 2026-05-11 improved over the broken
@@ -68,6 +83,12 @@ batched damp selector but still measured `0.060248224` KL versus the scalar
 - Baseline prewrite is not production-safe yet. A .8B isolation rerun showed
   `0.21575844` KL with prewrite on versus `0.12600227` with prewrite off, so
   prewrite remains opt-in.
+- No-prewrite is also not sufficient as a 4B stability fix. The
+  `/home/rob/dq-runs/qwen3-4b-prismaclip-no-prewrite-20260511T170732Z`
+  rerun measured KL `0.16388227`. Restoring only the three differing NVFP4
+  sidecars from the known-good scalar cache restored KL to `0.056417932`.
+  PrismaClip should not be used for a 27B Pareto run until it has a stronger
+  acceptance gate than same-sample local output MSE.
 
 ## Naming
 
