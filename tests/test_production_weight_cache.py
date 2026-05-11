@@ -206,6 +206,52 @@ def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
     )
 
 
+def test_production_cache_act_clip_solver_skips_tiny_default_gain(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+
+    def fake_render_production_weight(
+        weight,
+        fmt,
+        *,
+        act_clip_threshold=None,
+        **_kwargs,
+    ):
+        if fmt.upper() != "NVFP4":
+            return weight.detach().clone()
+        delta = 1.0 if act_clip_threshold is None else 0.9995
+        return weight.detach().to(torch.float32) + delta
+
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER", "1")
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+    monkeypatch.delenv("PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN", raising=False)
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["NVFP4"],
+        levers={"gptq": False, "scale_sweep": False, "act_clip_solver": True},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    meta = cache.metadata["activation_clip_solver"]
+    group_meta = next(iter(meta["groups"].values()))
+    assert meta["min_gain"] == pytest.approx(0.002)
+    assert meta["selected_by_qname"]["l1"] is None
+    assert group_meta["selected"] == "baseline"
+    assert group_meta["relative_gain"] == 0.0
+    assert torch.allclose(
+        cache.get("l1", "NVFP4").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32) + 1.0,
+        atol=1e-6,
+    )
+
+
 def test_production_cache_passes_fisher_row_weights(monkeypatch, tmp_path):
     import prismaquant.production_weight_cache as pwc
 

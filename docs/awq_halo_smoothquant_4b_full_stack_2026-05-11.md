@@ -47,19 +47,52 @@ resident, with `0` missing.
 - SmoothQuant selected only one group, layer 28 `q/k/v` (`3` Linears), with
   local pseudo-rendered MSE gain `3.64%`.
 - Those selected groups are in the MXFP8 attention promotion region, so these
-  tests did apply fold-scale methods where they make sense for MXFP8. Local
-  rendered-MSE gains did not predict end-to-end KL improvement.
+  tests did apply fold-scale methods where they make sense for MXFP8.
+
+## SmoothQuant Follow-Up Attribution
+
+Run root:
+`/home/rob/dq-runs/qwen3-4b-smoothquant-targeted-20260511T113334Z`.
+
+The full SmoothQuant cache differed from the baseline cache in exactly six
+files: the intended layer 28 MXFP8 `q/k/v` files plus three unrelated NVFP4
+PrismaClip rerender files.
+
+| Isolated cache variant | KL |
+|---|---:|
+| Baseline manifest | `0.056417932` |
+| SmoothQuant layer 28 `q/k/v` only | `0.055455598` |
+| Three unrelated NVFP4 rerender files only | `0.163882268` |
+| All six differing files, no SmoothQuant metadata | `0.167588803` |
+| All six differing files, with SmoothQuant scales/metadata | `0.167588803` |
+
+Single-file NVFP4 isolation:
+
+| NVFP4 file replaced from second render | KL |
+|---|---:|
+| `model.layers.8.self_attn.o_proj` | `0.133624067` |
+| `model.layers.14.mlp.gate_proj` | `0.081835703` |
+| `model.layers.14.mlp.up_proj` | `0.067776848` |
+| `model.layers.14.mlp.gate_proj` + `up_proj` | `0.061268054` |
+
+Conclusion: the `0.167588803` SmoothQuant full-cache result is not evidence
+that the selected SmoothQuant MXFP8 `q/k/v` fold regressed. The selected fold
+slightly improved KL in isolation. The regression was caused by unstable
+PrismaClip NVFP4 rerender choices with sub-0.2% local-MSE gains. The default
+PrismaClip selection floor is now `PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN=0.002`
+to avoid accepting numerically tiny local wins.
 
 ## Decision
 
-Keep AWQ, HALO, and SmoothQuant out of production recipes for this stack.
-Do not combine HALO+AWQ: both individual arms regressed heavily. Do not use
-local rendered-MSE fold-scale gates as a promotion signal for MXFP8 without a
-KL-level validation gate.
+Keep AWQ, HALO, and full-cache SmoothQuant rerenders out of production recipes
+for this stack until they pass the follow-up gates. Do not combine HALO+AWQ:
+both individual arms regressed heavily. SmoothQuant is still a research lever:
+the isolated MXFP8 layer 28 `q/k/v` replacement was slightly positive, but it
+needs a rerun under the stricter PrismaClip gate and then an allocation-aware
+validation before promotion.
 
 The current production-facing winner remains:
 
 ```text
 GPTQ + damp sweep + scale sweep + FourOverSix + full activation clip solver
 ```
-

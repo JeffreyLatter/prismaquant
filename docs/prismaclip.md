@@ -23,7 +23,10 @@ using local output MSE. This prevents the solver from appearing to win simply
 because it hid outliers from its own evaluator.
 
 The current implementation searches in log space with a small evaluation
-budget controlled by `PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS`.
+budget controlled by `PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS`. A candidate must
+clear `PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN` (default `0.002`) before it is
+selected; this avoids accepting numerically tiny local-MSE wins that can move
+end-to-end KL in the wrong direction.
 
 ## Scope
 

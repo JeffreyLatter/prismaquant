@@ -77,6 +77,9 @@ from prismaquant.awq import (
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 
 
+DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN = 0.002
+
+
 def _cache_weight_filename(qname: str, fmt: str) -> str:
     safe = qname.replace("/", "__").replace(".", "_")
     return f"{safe}__{fmt}.pt"
@@ -1416,11 +1419,16 @@ def _solve_nvfp4_activation_clip_groups(
         lo=4,
         hi=16,
     )
-    min_gain = 0.0
+    min_gain = DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN
     try:
-        min_gain = float(os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN", "0"))
+        min_gain = float(
+            os.environ.get(
+                "PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN",
+                str(DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN),
+            )
+        )
     except Exception:
-        min_gain = 0.0
+        min_gain = DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN
     top_fraction = _env_float(
         "PRISMAQUANT_ACT_CLIP_SOLVER_TOP_FRACTION",
         1.0,

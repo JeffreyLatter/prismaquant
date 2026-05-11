@@ -22,26 +22,41 @@ Results:
 | FourOverSix + PrismaClip | `0.056417932` | baseline |
 | AWQ-v2 + full stack | `0.225788253` | `+300.2%` worse |
 | HALO + full stack | `0.177460096` | `+214.5%` worse |
-| SmoothQuant + full stack | `0.167588803` | `+197.0%` worse |
+| SmoothQuant full-cache rerender | `0.167588803` | `+197.0%` worse |
 
 The hot path was not CPU/NVMe-bound. The failure mode is numerical or
 measurement-contract mismatch.
+
+Follow-up isolation in
+`/home/rob/dq-runs/qwen3-4b-smoothquant-targeted-20260511T113334Z` split the
+SmoothQuant full-cache result:
+
+- selected SmoothQuant layer 28 MXFP8 `q/k/v` only: `0.055455598`
+  (`1.7%` better than baseline);
+- three unrelated NVFP4 PrismaClip rerender files only: `0.163882268`;
+- all six changed files, with or without SmoothQuant metadata:
+  `0.167588803`.
+
+So the SmoothQuant row above is a full-cache rerender regression, not a
+conviction of the selected SmoothQuant fold itself.
 
 ## Working Hypotheses
 
 ### 1. Local output MSE is a poor gate for attention q/k/v
 
-AWQ and SmoothQuant each selected only one input-layernorm reader group:
+AWQ selected one input-layernorm reader group:
 
 - AWQ: layer 29 `q_proj/k_proj/v_proj`, local rendered-MSE gain `3.50%`
-- SmoothQuant: layer 28 `q_proj/k_proj/v_proj`, local rendered-MSE gain
-  `3.64%`
 
-Both selected groups are in the MXFP8 attention promotion region. A small
+That selected group is in the MXFP8 attention promotion region. A small
 improvement in individual Q/K/V output MSE can still worsen attention logits:
 Q and K errors are multiplied through the softmax score matrix, and V error is
 weighted by the changed attention distribution. A per-Linear MSE gate does not
 see that nonlinearity.
+
+SmoothQuant's selected layer 28 `q/k/v` group did not regress in isolation;
+it slightly improved KL. The full-cache SmoothQuant regression came from
+unrelated PrismaClip NVFP4 rerender files whose local gains were below `0.2%`.
 
 ### 2. The fast AWQ/SmoothQuant search is not fully production-faithful
 
@@ -53,6 +68,11 @@ search itself defaults to a cheaper objective:
 
 That can choose a scale that wins in the cheap search and loses after GPTQ,
 damp sweep, scale sweep, FourOverSix, and PrismaClip are recomputed.
+
+For SmoothQuant, the immediate issue was not the selected scale. The isolated
+scale was slightly positive. The broader lesson is that rerendering a full
+cache can introduce unrelated PrismaClip differences unless tiny local gains
+are filtered.
 
 ### 3. The full stack may already remove the outlier problem
 
