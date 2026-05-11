@@ -421,6 +421,7 @@ def test_prismafisherclip_vetoes_unweighted_clip_choice(monkeypatch, tmp_path):
 
     monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+    monkeypatch.setenv("PRISMAQUANT_PRISMAFISHERCLIP_MODE", "veto")
 
     thresholds, meta = pwc._solve_nvfp4_activation_clip_groups(
         groups={"a": ["a"]},
@@ -444,6 +445,65 @@ def test_prismafisherclip_vetoes_unweighted_clip_choice(monkeypatch, tmp_path):
     assert group_meta["best_score"] == pytest.approx(group_meta["baseline_score"])
     assert seen_render_weights and all(value is None for value in seen_render_weights)
     assert weights == {}
+
+
+def test_prismafisherclip_default_audits_unweighted_clip_choice(
+    monkeypatch, tmp_path
+):
+    import prismaquant.production_weight_cache as pwc
+
+    modules = {"a": nn.Linear(2, 1, bias=False)}
+    with torch.no_grad():
+        modules["a"].weight.zero_()
+    activations = {
+        "a": torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ])
+    }
+    weights: dict[tuple[str, str], object] = {}
+    torch.save(
+        {"g2_per_token": torch.tensor([0.1, 10.0], dtype=torch.float32)},
+        tmp_path / "a.pt",
+    )
+
+    def fake_render_production_weight(
+        weight,
+        fmt,
+        *,
+        act_clip_threshold=None,
+        fisher_row_weights=None,
+        **_kwargs,
+    ):
+        assert fisher_row_weights is None
+        if act_clip_threshold is None:
+            return torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+        return torch.tensor([[0.1, 0.8]], dtype=torch.float32)
+
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+
+    thresholds, meta = pwc._solve_nvfp4_activation_clip_groups(
+        groups={"a": ["a"]},
+        qname_to_module=modules,
+        activations=activations,
+        levers={"gptq": False, "scale_sweep": False, "fisher_clip": True},
+        joint_globals={},
+        activation_max_abs={"a": 1.0},
+        fisher_rows=pwc._FisherRowWeightCache(tmp_path),
+        weights_out=weights,
+        cache_dir_path=None,
+        progress=False,
+    )
+
+    group_meta = meta["groups"]["a"]
+    assert meta["method"] == "PrismaFisherClip"
+    assert meta["fisher_clip_mode"] == "audit"
+    assert meta["fisher_clip_available"] is True
+    assert thresholds["a"] is not None
+    assert group_meta["selected"] == "solved"
+    assert group_meta["fisher_accepted"] is None
+    assert group_meta["best_fisher_score"] is not None
 
 
 def test_production_cache_act_clip_solver_batches_same_shape_groups(monkeypatch):

@@ -1562,22 +1562,40 @@ def _solve_nvfp4_activation_clip_groups(
     fisher_clip_enabled = bool(levers.get("fisher_clip", False))
     fisher_render_enabled = bool(levers.get("fisher_gptq", False))
     fisher_clip_available = bool(fisher_clip_enabled and fisher_rows is not None)
+    fisher_clip_mode = str(
+        os.environ.get("PRISMAQUANT_PRISMAFISHERCLIP_MODE", "audit")
+    ).strip().lower()
+    if fisher_clip_mode not in {"audit", "veto", "score"}:
+        fisher_clip_mode = "audit"
+    if not fisher_clip_available:
+        fisher_clip_mode = "off"
+    fisher_primary = fisher_clip_available and fisher_clip_mode == "score"
+    fisher_veto = fisher_clip_available and fisher_clip_mode == "veto"
+    fisher_min_gain = _env_float(
+        "PRISMAQUANT_PRISMAFISHERCLIP_MIN_GAIN",
+        0.0,
+        lo=0.0,
+        hi=1.0,
+    )
     verbose = _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE", False)
     threshold_by_qname: dict[str, float | None] = {}
     method_name = "PrismaFisherClip" if fisher_clip_available else "PrismaClip"
+    objective = (
+        "fisher_weighted_output_mse_original_activations"
+        if fisher_primary else
+        "output_mse_original_activations_fisher_veto"
+        if fisher_veto else
+        "output_mse_original_activations_fisher_audit"
+        if fisher_clip_available else
+        "output_mse_original_activations"
+    )
+    if holdout_enabled:
+        objective += "_holdout_veto"
     metadata: dict[str, object] = {
         "enabled": True,
         "method": method_name,
         "format": "NVFP4",
-        "objective": (
-            "fisher_weighted_output_mse_original_activations_holdout_veto"
-            if fisher_clip_available and holdout_enabled else
-            "fisher_weighted_output_mse_original_activations"
-            if fisher_clip_available else
-            "output_mse_original_activations_holdout_veto"
-            if holdout_enabled else
-            "output_mse_original_activations"
-        ),
+        "objective": objective,
         "solver": "log_golden_section",
         "max_evals": int(max_evals),
         "min_gain": float(min_gain),
@@ -1585,6 +1603,8 @@ def _solve_nvfp4_activation_clip_groups(
         "top_k": int(top_k),
         "fisher_clip_enabled": bool(fisher_clip_enabled),
         "fisher_clip_available": bool(fisher_clip_available),
+        "fisher_clip_mode": str(fisher_clip_mode),
+        "fisher_clip_min_gain": float(fisher_min_gain),
         "fisher_clip_render_weighted": bool(fisher_render_enabled),
         "holdout_enabled": bool(holdout_enabled),
         "holdout_fraction": float(holdout_fraction if holdout_enabled else 0.0),
@@ -1813,6 +1833,9 @@ def _solve_nvfp4_activation_clip_groups(
         score_splits: Sequence[str] = ("all",),
     ) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
         scores = {split: 0.0 for split in score_splits}
+        if fisher_clip_available:
+            for split in score_splits:
+                scores[f"fisher_{split}"] = 0.0
         kept: dict[str, torch.Tensor] | None = {} if keep_weights else None
         rendered = render_members_batched(members, threshold)
         if rendered is not None:
@@ -1837,6 +1860,13 @@ def _solve_nvfp4_activation_clip_groups(
                     holdout_stride=holdout_stride,
                     holdout_offset=0,
                 )
+                scores[split] += _activation_output_error(
+                    qname_to_module[qname].weight.data,
+                    w_dq,
+                    split_activations,
+                )
+                if not fisher_clip_available:
+                    continue
                 split_row_weights = _prismaclip_row_weight_split(
                     score_row_weights,
                     activations[qname],
@@ -1844,7 +1874,7 @@ def _solve_nvfp4_activation_clip_groups(
                     holdout_stride=holdout_stride,
                     holdout_offset=0,
                 )
-                scores[split] += _activation_output_error(
+                scores[f"fisher_{split}"] += _activation_output_error(
                     qname_to_module[qname].weight.data,
                     w_dq,
                     split_activations,
@@ -1856,6 +1886,8 @@ def _solve_nvfp4_activation_clip_groups(
                 del w_dq
         return scores, kept
 
+    primary_score_key = "fisher_all" if fisher_primary else "all"
+    primary_holdout_key = "fisher_holdout" if fisher_primary else "holdout"
     baseline_items = list(sorted(groups.items()))
     for idx, (group_key, raw_members) in enumerate(baseline_items, start=1):
         members = [
@@ -1898,15 +1930,29 @@ def _solve_nvfp4_activation_clip_groups(
                 metadata["prewritten_baseline_qnames"].append(qname)
                 del tensor
             baseline_weights.clear()
+        baseline_score = float(baseline_scores[primary_score_key])
+        baseline_fisher_score = (
+            float(baseline_scores["fisher_all"])
+            if fisher_clip_available else None
+        )
+        baseline_unweighted_score = float(baseline_scores["all"])
+        baseline_holdout_score = (
+            float(baseline_scores[primary_holdout_key]) if holdout_enabled else None
+        )
+        baseline_fisher_holdout_score = (
+            float(baseline_scores["fisher_holdout"])
+            if fisher_clip_available and holdout_enabled else None
+        )
         group_entries.append({
             "group_key": group_key,
             "members": members,
             "lo": float(lo),
             "hi": float(hi),
-            "baseline_score": float(baseline_scores["all"]),
-            "baseline_holdout_score": (
-                float(baseline_scores["holdout"]) if holdout_enabled else None
-            ),
+            "baseline_score": float(baseline_score),
+            "baseline_unweighted_score": float(baseline_unweighted_score),
+            "baseline_fisher_score": baseline_fisher_score,
+            "baseline_holdout_score": baseline_holdout_score,
+            "baseline_fisher_holdout_score": baseline_fisher_holdout_score,
         })
         if progress and (idx % 10 == 0 or idx == len(baseline_items)):
             print(
@@ -1945,10 +1991,21 @@ def _solve_nvfp4_activation_clip_groups(
         lo = float(item["lo"])
         hi = float(item["hi"])
         baseline_score = float(item["baseline_score"])
+        baseline_unweighted_score = float(
+            item.get("baseline_unweighted_score", baseline_score)
+        )
+        baseline_fisher_score = (
+            float(item["baseline_fisher_score"])
+            if item.get("baseline_fisher_score") is not None else None
+        )
         baseline_holdout_score = (
             float(item["baseline_holdout_score"])
             if item.get("baseline_holdout_score") is not None
             else None
+        )
+        baseline_fisher_holdout_score = (
+            float(item["baseline_fisher_holdout_score"])
+            if item.get("baseline_fisher_holdout_score") is not None else None
         )
         if group_key not in eligible_groups:
             for qname in members:
@@ -1960,11 +2017,17 @@ def _solve_nvfp4_activation_clip_groups(
                 "selected": "baseline",
                 "selected_threshold": None,
                 "baseline_score": float(baseline_score),
+                "baseline_unweighted_score": float(baseline_unweighted_score),
+                "baseline_fisher_score": baseline_fisher_score,
                 "baseline_holdout_score": baseline_holdout_score,
+                "baseline_fisher_holdout_score": baseline_fisher_holdout_score,
                 "best_score": float(baseline_score),
+                "best_fisher_score": baseline_fisher_score,
                 "holdout_score": baseline_holdout_score,
                 "holdout_relative_gain": 0.0,
                 "holdout_accepted": None,
+                "fisher_relative_gain": 0.0,
+                "fisher_accepted": None,
                 "relative_gain": 0.0,
                 "lo": float(lo),
                 "hi": float(hi),
@@ -1979,10 +2042,16 @@ def _solve_nvfp4_activation_clip_groups(
         eval_trace: list[dict[str, float | int]] = []
         best_candidate_threshold: float | None = None
         best_candidate_score = float("inf")
+        best_candidate_unweighted_score: float | None = None
+        best_candidate_fisher_score: float | None = None
         best_candidate_holdout_score: float | None = None
         best_candidate_weights: dict[str, torch.Tensor] | None = None
         best_candidate_eval_index: int | None = None
         denom = max(abs(float(baseline_score)), 1e-30)
+        fisher_denom = (
+            max(abs(float(baseline_fisher_score)), 1e-30)
+            if baseline_fisher_score is not None else 1e-30
+        )
         holdout_denom = max(
             abs(float(baseline_holdout_score)),
             1e-30,
@@ -1990,6 +2059,8 @@ def _solve_nvfp4_activation_clip_groups(
 
         def eval_log(log_threshold: float) -> float:
             nonlocal best_candidate_threshold, best_candidate_score
+            nonlocal best_candidate_unweighted_score
+            nonlocal best_candidate_fisher_score
             nonlocal best_candidate_holdout_score
             nonlocal best_candidate_weights
             nonlocal best_candidate_eval_index
@@ -2003,9 +2074,13 @@ def _solve_nvfp4_activation_clip_groups(
                     keep_weights=True,
                     score_splits=score_splits,
                 )
-                score = float(scores["all"])
+                score = float(scores[primary_score_key])
+                unweighted_score = float(scores["all"])
+                fisher_score = (
+                    float(scores["fisher_all"]) if fisher_clip_available else None
+                )
                 holdout_score = (
-                    float(scores["holdout"]) if holdout_enabled else None
+                    float(scores[primary_holdout_key]) if holdout_enabled else None
                 )
                 cache[key] = score
                 if score < best_candidate_score:
@@ -2015,6 +2090,8 @@ def _solve_nvfp4_activation_clip_groups(
                     best_candidate_eval_index = len(eval_trace) + 1
                     best_candidate_threshold = float(key)
                     best_candidate_score = float(score)
+                    best_candidate_unweighted_score = float(unweighted_score)
+                    best_candidate_fisher_score = fisher_score
                     best_candidate_holdout_score = holdout_score
                     best_candidate_weights = cand_weights
                 elif cand_weights is not None:
@@ -2025,11 +2102,18 @@ def _solve_nvfp4_activation_clip_groups(
                     "eval": int(len(eval_trace) + 1),
                     "threshold": float(key),
                     "score": float(score),
+                    "unweighted_score": float(unweighted_score),
                     "best_score": float(best_so_far),
                     "relative_gain": float(
                         (float(baseline_score) - best_so_far) / denom
                     ),
                 }
+                if fisher_score is not None and baseline_fisher_score is not None:
+                    trace_entry["fisher_score"] = float(fisher_score)
+                    trace_entry["fisher_relative_gain"] = float(
+                        (float(baseline_fisher_score) - float(fisher_score))
+                        / fisher_denom
+                    )
                 if holdout_enabled and holdout_score is not None:
                     trace_entry["holdout_score"] = float(holdout_score)
                     trace_entry["holdout_relative_gain"] = float(
@@ -2082,6 +2166,21 @@ def _solve_nvfp4_activation_clip_groups(
         best_threshold = best_candidate_threshold
         best_score = min(float(baseline_score), float(best_candidate_score))
         rel_gain = (float(baseline_score) - float(best_score)) / denom
+        fisher_rel_gain = (
+            (float(baseline_fisher_score) - float(best_candidate_fisher_score))
+            / fisher_denom
+            if baseline_fisher_score is not None
+            and best_candidate_fisher_score is not None
+            else None
+        )
+        fisher_accepted = (
+            None if not fisher_veto else bool(
+                baseline_fisher_score is not None
+                and best_candidate_fisher_score is not None
+                and float(best_candidate_fisher_score) < float(baseline_fisher_score)
+                and float(fisher_rel_gain) >= fisher_min_gain
+            )
+        )
         holdout_score = best_candidate_holdout_score
         holdout_rel_gain = (
             (float(baseline_holdout_score) - float(holdout_score))
@@ -2103,12 +2202,14 @@ def _solve_nvfp4_activation_clip_groups(
             best_threshold is not None
             and float(best_candidate_score) < float(baseline_score)
             and rel_gain >= min_gain
+            and (not fisher_veto or bool(fisher_accepted))
             and (not holdout_enabled or bool(holdout_accepted))
         )
         if not selected:
             best_threshold = None
             best_score = float(baseline_score)
             rel_gain = 0.0
+            fisher_rel_gain = 0.0
             if best_candidate_weights is not None:
                 for old in best_candidate_weights.values():
                     del old
@@ -2136,9 +2237,26 @@ def _solve_nvfp4_activation_clip_groups(
             "selected": "solved" if selected else "baseline",
             "selected_threshold": best_threshold,
             "baseline_score": float(baseline_score),
+            "baseline_unweighted_score": float(baseline_unweighted_score),
+            "baseline_fisher_score": baseline_fisher_score,
             "baseline_holdout_score": baseline_holdout_score,
+            "baseline_fisher_holdout_score": baseline_fisher_holdout_score,
             "best_score": float(best_score),
+            "best_unweighted_score": (
+                float(best_candidate_unweighted_score)
+                if best_candidate_unweighted_score is not None and selected
+                else float(baseline_unweighted_score)
+            ),
+            "best_fisher_score": (
+                float(best_candidate_fisher_score)
+                if best_candidate_fisher_score is not None and selected
+                else baseline_fisher_score
+            ),
             "relative_gain": float(rel_gain),
+            "fisher_relative_gain": (
+                float(fisher_rel_gain) if fisher_rel_gain is not None else 0.0
+            ),
+            "fisher_accepted": fisher_accepted,
             "holdout_score": (
                 float(holdout_score)
                 if holdout_score is not None and selected else

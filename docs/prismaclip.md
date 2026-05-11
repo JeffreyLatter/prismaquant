@@ -65,14 +65,21 @@ diagnostic rather than part of PrismaClip's default acceptance rule.
 
 ## PrismaFisherClip
 
-PrismaFisherClip is an experimental scorer for the same PrismaClip threshold
-search. It does not add a new cache, runtime format, or export path. It reuses
-the probe's h-detail `g2_per_token` vectors and scores each threshold as
-Fisher-weighted local output error:
+PrismaFisherClip is an experimental Fisher diagnostic for the same PrismaClip
+threshold search. It does not add a new cache, runtime format, or export path.
+It reuses the probe's h-detail `g2_per_token` vectors to evaluate each
+candidate's Fisher-weighted local output error:
 
 ```text
 E_t[ normalized_g2_t * ||X_t @ (W - W_rendered)^T||^2 ]
 ```
+
+The default mode is `audit`: ordinary PrismaClip still optimizes and accepts
+thresholds with unweighted local output MSE, while PrismaFisherClip records
+the Fisher-weighted score for diagnostics. `veto` requires the selected
+threshold to improve the Fisher-weighted score too, and `score` makes the
+Fisher-weighted score the primary optimizer. Both non-audit modes are kept for
+ablation only.
 
 This targets the observed failure mode where a threshold can have a small
 average local-MSE win while hurting the tokens that matter most to the loss.
@@ -83,7 +90,10 @@ enable Fisher-weighted GPTQ unless `fisher_gptq` / `FISHER_WEIGHTED_GPTQ=1` is
 also set.
 
 Default: off until it beats or matches fixed clipping on both .8B and 4B under
-the same calibration contract.
+the same calibration contract. On the 2026-05-11 .8B smoke, `score` regressed
+from KL `0.14918706` to `0.19577897`, and `veto` regressed to `0.19948923`.
+That is why Fisher is diagnostic by default rather than part of the clip
+acceptance rule.
 
 Same-shape fused groups can also try the existing batched NVFP4
 GPTQ/scale-sweep path when `PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED=1`. This is
