@@ -564,6 +564,112 @@ class ProductionWeightCache:
             )
 
 
+class ProductionWeightCacheVariantView:
+    """Read-only cache view that maps runtime formats to rendered variants.
+
+    PrismaClip is not a runtime format. The base assignment still says NVFP4,
+    while selected qnames may need the cache entry rendered under the internal
+    ``NVFP4_CLIPPED`` key. This view keeps that distinction out of allocator
+    and layer-config format space.
+    """
+
+    def __init__(
+        self,
+        base: ProductionWeightCache,
+        format_overrides: Mapping[str, str],
+    ):
+        self.base = base
+        self.format_overrides = {
+            str(name): str(fmt).strip().upper()
+            for name, fmt in dict(format_overrides or {}).items()
+            if str(name).strip() and str(fmt).strip()
+        }
+
+    def __getattr__(self, name: str):
+        return getattr(self.base, name)
+
+    def _variant_for(self, name: str, fmt: str) -> str:
+        fmt_u = str(fmt).strip().upper()
+        if _render_base_format(fmt_u) != "NVFP4":
+            return fmt_u
+        for cand in self.base._name_candidates(str(name)):
+            override = self.format_overrides.get(cand)
+            if override:
+                return override
+        return fmt_u
+
+    def resolve_key(self, name: str, fmt: str) -> tuple[str, str] | None:
+        return self.base.resolve_key(name, self._variant_for(name, fmt))
+
+    def get(self, name: str, fmt: str) -> torch.Tensor | None:
+        return self.base.get(name, self._variant_for(name, fmt))
+
+    def prefetch(
+        self,
+        keys: Sequence[tuple[str, str]] | None = None,
+        max_workers: int = 4,
+    ) -> int:
+        if keys is not None:
+            keys = [
+                (str(name), self._variant_for(str(name), str(fmt)))
+                for name, fmt in keys
+            ]
+        return self.base.prefetch(keys, max_workers=max_workers)
+
+    def verify_files(
+        self,
+        expected: Sequence[tuple[str, str]] | None = None,
+    ) -> dict[str, list[tuple[str, str]]]:
+        if expected is not None:
+            expected = [
+                (str(name), self._variant_for(str(name), str(fmt)))
+                for name, fmt in expected
+            ]
+        return self.base.verify_files(expected)
+
+    def assignment_keys(
+        self,
+        assignment: Mapping[str, str],
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        keys, missing = self.base.assignment_keys(assignment)
+        if not self.format_overrides:
+            return keys, missing
+        keys = []
+        missing = []
+        seen: set[tuple[str, str]] = set()
+        for qname, fmt in assignment.items():
+            fmt_u = str(fmt).strip().upper()
+            if _render_base_format(fmt_u) == "BF16":
+                continue
+            key = self.resolve_key(str(qname), fmt_u)
+            if key is None:
+                missing.append((str(qname), self._variant_for(str(qname), fmt_u)))
+                continue
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
+        return keys, missing
+
+    def prefetch_assignment(self, *args, **kwargs):
+        # Reuse the base implementation against this view's assignment_keys.
+        return ProductionWeightCache.prefetch_assignment(self, *args, **kwargs)
+
+    def estimate_nbytes(self, keys: Sequence[tuple[str, str]] | None = None) -> int:
+        if keys is not None:
+            keys = [
+                (str(name), self._variant_for(str(name), str(fmt)))
+                for name, fmt in keys
+            ]
+        return self.base.estimate_nbytes(keys)
+
+    def __contains__(self, key: tuple[str, str]) -> bool:
+        name, fmt = key
+        return self.resolve_key(name, fmt) is not None
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+
 class _LinearActivationCollector:
     """Hook every quantizable nn.Linear's input on a forward pass.
 
@@ -2506,7 +2612,10 @@ def fill_production_weight_cache(
     from prismaquant import format_registry as fr
 
     def _canon(fmt: str) -> str:
-        return fr.canonical_format_name(str(fmt).strip().upper())
+        fmt_u = str(fmt).strip().upper()
+        if fmt_u == PRISMACLIP_FORMAT:
+            return PRISMACLIP_FORMAT
+        return fr.canonical_format_name(fmt_u)
 
     requested_formats = tuple(
         dict.fromkeys(_canon(f) for f in formats if str(f).strip())

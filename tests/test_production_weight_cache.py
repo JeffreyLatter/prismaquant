@@ -6,6 +6,7 @@ import pytest
 
 from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
 from prismaquant.production_weight_cache import ProductionWeightCache
+from prismaquant.production_weight_cache import ProductionWeightCacheVariantView
 from prismaquant.production_weight_cache import fill_production_weight_cache
 from prismaquant.production_weight_cache import _solve_nvfp4_activation_clip_groups
 from prismaquant.production_recache import (
@@ -84,6 +85,31 @@ def test_production_cache_resolves_prismaclip_variant_as_distinct_key(tmp_path):
     )
     assert torch.equal(cache.get("layer", "NVFP4"), base)
     assert torch.equal(cache.get("layer", "NVFP4_CLIPPED"), clipped)
+
+
+def test_production_cache_variant_view_maps_runtime_nvfp4_to_prismaclip(tmp_path):
+    base = torch.zeros((2, 2), dtype=torch.float32)
+    clipped = torch.ones((2, 2), dtype=torch.float32)
+    torch.save(base, tmp_path / "base.pt")
+    torch.save(clipped, tmp_path / "clip.pt")
+    cache = ProductionWeightCache(
+        weights={
+            ("layer", "NVFP4"): "base.pt",
+            ("layer", "NVFP4_CLIPPED"): "clip.pt",
+        },
+        levers={},
+        cache_dir=str(tmp_path),
+    )
+    view = ProductionWeightCacheVariantView(
+        cache,
+        {"layer": "NVFP4_CLIPPED"},
+    )
+
+    assert view.resolve_key("layer", "NVFP4") == ("layer", "NVFP4_CLIPPED")
+    assert torch.equal(view.get("layer", "NVFP4"), clipped)
+    keys, missing = view.assignment_keys({"layer": "NVFP4"})
+    assert keys == [("layer", "NVFP4_CLIPPED")]
+    assert missing == []
 
 
 def test_recache_preload_respects_resident_budget(tmp_path):

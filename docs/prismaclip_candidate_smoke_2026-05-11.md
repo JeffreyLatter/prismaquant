@@ -1,8 +1,11 @@
 # PrismaClip Candidate-Mode Smoke - 2026-05-11
 
-Purpose: verify that PrismaClip can be measured as a same-bpp candidate
-without globally rewriting baseline NVFP4, and that the pseudo-format does not
-leak into vLLM metadata.
+Purpose: historical smoke for the first PrismaClip candidate-mode wiring.
+This has been superseded by the direct KL-gated cache-variant design: runtime
+layer configs now stay at ordinary `NVFP4`, and accepted clipped cache entries
+are passed to export through `chosen_cache_variants` /
+`--production-cache-variant-map`. `NVFP4_CLIPPED` remains only an internal
+`ProductionWeightCache` key.
 
 ## Setup
 
@@ -20,10 +23,12 @@ the host user-site CPU PyTorch and PrismaQuant correctly refused to run.
 
 ## Targeted Recipe
 
-The smoke config assigned:
+The smoke config assigned one Linear to the internal clipped cache key in the
+old prototype:
 
 - `model.layers.1.mlp.gate_proj`: `NVFP4`
-- `model.layers.1.mlp.up_proj`: `NVFP4_CLIPPED`
+- `model.layers.1.mlp.up_proj`: `NVFP4_CLIPPED` (now represented as
+  `NVFP4` in layer config plus a cache-variant sidecar)
 - `model.layers.1.linear_attn.in_proj_qkv`: `MXFP8`
 - `model.layers.1.linear_attn.in_proj_z`: `MXFP8`
 - MTP Linears: `BF16`
@@ -47,7 +52,10 @@ Production cache build:
 
 Export:
 
-- Recipe mix: `{'MXFP8': 2, 'NVFP4': 1, 'NVFP4_CLIPPED': 1, 'BF16': 5}`
+- Prototype recipe mix:
+  `{'MXFP8': 2, 'NVFP4': 1, 'NVFP4_CLIPPED': 1, 'BF16': 5}`. Current exports
+  would report that as `{'MXFP8': 2, 'NVFP4': 2, 'BF16': 5}` plus one
+  `chosen_cache_variants` entry.
 - Materialization hist included `2` MXFP8 production-cache Linears and `2`
   NVFP4 production-cache Linears.
 - Exported `config.json` contains no `NVFP4_CLIPPED` string; the clipped

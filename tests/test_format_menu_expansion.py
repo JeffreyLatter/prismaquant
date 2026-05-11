@@ -30,6 +30,12 @@ def test_production_cache_formats_include_all_non_bf16_registry_picks():
         "NVFP4",
     ) == ["FP8_E5M2", "MXFP8_E5M2", "NVFP4"]
 
+    assert _production_cache_formats(
+        ["NVFP4", "BF16"],
+        "NVFP4",
+        include_prismaclip=True,
+    ) == ["NVFP4", "NVFP4_CLIPPED"]
+
 
 def test_vllm_profile_allows_dense_fp8_e4m3_but_not_e5m2():
     dense = "model.layers.0.self_attn.q_proj"
@@ -66,14 +72,6 @@ def test_vllm_profile_keeps_packed_moe_menu_conservative():
         source_kind="bf16",
         target_profile=VLLM_PROFILE,
     ).legal
-    assert check_format_applicability(
-        shape,
-        "NVFP4_CLIPPED",
-        qname=expert,
-        source_kind="bf16",
-        target_profile=VLLM_PROFILE,
-    ).legal
-
     for fmt in ("FP8_E4M3", "MXFP8_E5M2", "FP8_E5M2"):
         verdict = check_format_applicability(
             shape,
@@ -99,7 +97,6 @@ def test_allocator_profile_filter_keeps_only_vllm_backed_fp8_choices():
         ],
         expert: [
             Candidate("NVFP4", 4.5, 100, 1.0),
-            Candidate("NVFP4_CLIPPED", 4.5, 100, 0.9),
             Candidate("MXFP4", 4.25, 96, 0.9),
             Candidate("FP8_E4M3", 8.5, 190, 0.1),
             Candidate("MXFP8_E4M3", 8.25, 180, 0.2),
@@ -116,7 +113,6 @@ def test_allocator_profile_filter_keeps_only_vllm_backed_fp8_choices():
     ]
     assert [c.fmt for c in filtered[expert]] == [
         "NVFP4",
-        "NVFP4_CLIPPED",
         "MXFP4",
         "MXFP8_E4M3",
         "BF16",

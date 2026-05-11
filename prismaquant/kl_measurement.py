@@ -91,7 +91,13 @@ class QuantWeightCache:
 
     def get(self, module_name: str, fmt: str) -> torch.Tensor | None:
         seen: set[str] = set()
-        for candidate in (fmt, fr.canonical_format_name(fmt), *fr.aliases_for(fmt)):
+        candidates = [str(fmt), str(fmt).upper()]
+        try:
+            canonical = fr.canonical_format_name(fmt)
+            candidates.extend([canonical, *fr.aliases_for(canonical)])
+        except Exception:
+            pass
+        for candidate in candidates:
             if candidate in seen:
                 continue
             seen.add(candidate)
@@ -2243,6 +2249,20 @@ def _override_sets_graph_key(
     return tuple(_assignment_graph_key(override) for override in overrides)
 
 
+def _cache_override_sets_graph_key(
+    overrides: Sequence[Mapping[str, str]],
+) -> tuple[tuple[tuple[str, str], ...], ...]:
+    return tuple(
+        tuple(
+            sorted(
+                (str(name), str(fmt).strip().upper())
+                for name, fmt in override.items()
+            )
+        )
+        for override in overrides
+    )
+
+
 def _split_lanes(tensor: torch.Tensor, base_batch: int, lane_count: int):
     if tensor.dim() == 0 or tensor.size(0) != base_batch * lane_count:
         return None
@@ -2682,6 +2702,8 @@ class _OverrideSetTargetHooks:
         include_activation_quant: bool = True,
         activation_max_abs: Mapping[str, float] | None = None,
         source_weight_resolver: Callable[[str, str], torch.Tensor | None] | None = None,
+        production_weight_cache=None,
+        lane_cache_overrides: Sequence[Mapping[str, str]] | None = None,
     ):
         self.model = model
         self.assignment = _canonical_assignment(assignment)
@@ -2693,11 +2715,25 @@ class _OverrideSetTargetHooks:
             }
             for override in lane_overrides
         ]
+        if lane_cache_overrides is None:
+            lane_cache_overrides = [{} for _ in self.lane_overrides]
+        if len(lane_cache_overrides) != len(self.lane_overrides):
+            raise ValueError(
+                "lane_cache_overrides length must match lane_overrides"
+            )
+        self.lane_cache_overrides = [
+            {
+                str(name): str(fmt).strip().upper()
+                for name, fmt in override.items()
+            }
+            for override in lane_cache_overrides
+        ]
         self.base_batch = int(base_batch)
         self.quant_weight_cache = quant_weight_cache
         self.include_activation_quant = bool(include_activation_quant)
         self.activation_max_abs = dict(activation_max_abs or {})
         self.source_weight_resolver = source_weight_resolver
+        self.production_weight_cache = production_weight_cache
         self.handles = []
         self.missing: list[str] = []
 
@@ -2735,6 +2771,15 @@ class _OverrideSetTargetHooks:
         override = self.lane_overrides[lane_idx]
         return override.get(module_name, self.assignment.get(module_name, "BF16"))
 
+    def _cache_format_for_lane(
+        self,
+        module_name: str,
+        lane_idx: int,
+        runtime_fmt: str,
+    ) -> str:
+        override = self.lane_cache_overrides[lane_idx]
+        return override.get(module_name, runtime_fmt)
+
     def _make_hook(self, module_name: str):
         def _hook(module, args, kwargs, output):
             y = _first_tensor_output(output)
@@ -2759,13 +2804,22 @@ class _OverrideSetTargetHooks:
             bias = module.bias.detach() if module.bias is not None else None
             for lane_idx, (y_lane, x_lane) in enumerate(zip(chunks, x_chunks)):
                 fmt = self._format_for_lane(module_name, lane_idx)
+                cache_fmt = self._cache_format_for_lane(module_name, lane_idx, fmt)
                 baseline_fmt = self.assignment.get(module_name, "BF16")
                 if fmt == "BF16":
                     w_hat = (
-                        self.quant_weight_cache.get(module_name, fmt)
+                        self.quant_weight_cache.get(module_name, cache_fmt)
                         if self.quant_weight_cache is not None
                         else None
                     )
+                    if (
+                        w_hat is None
+                        and self.production_weight_cache is not None
+                        and cache_fmt != fmt
+                    ):
+                        w_hat = self.production_weight_cache.get(
+                            module_name, cache_fmt,
+                        )
                     if (
                         w_hat is None
                         and self.source_weight_resolver is not None
@@ -2795,7 +2849,21 @@ class _OverrideSetTargetHooks:
                     continue
                 w_hat = None
                 if self.quant_weight_cache is not None:
-                    w_hat = self.quant_weight_cache.get(module_name, fmt)
+                    w_hat = self.quant_weight_cache.get(module_name, cache_fmt)
+                if (
+                    w_hat is None
+                    and self.production_weight_cache is not None
+                    and cache_fmt != fmt
+                ):
+                    w_hat = self.production_weight_cache.get(
+                        module_name, cache_fmt,
+                    )
+                    if w_hat is None:
+                        raise RuntimeError(
+                            f"production_weight_cache miss for variant "
+                            f"({module_name!r}, {cache_fmt!r}); refusing "
+                            "to measure a clip proposal with fallback math."
+                        )
                 if (
                     w_hat is None
                     and self.source_weight_resolver is not None
@@ -3811,6 +3879,7 @@ def measure_override_set_kl(
     use_replay_cache: bool | None = None,
     production_weight_cache=None,
     source_weight_resolver: Callable[[str, str], torch.Tensor | None] | None = None,
+    candidate_cache_overrides: Sequence[Mapping[str, str]] | None = None,
 ) -> list[float]:
     """Measure end-KL for simultaneous multi-Linear override candidates.
 
@@ -3825,6 +3894,20 @@ def measure_override_set_kl(
     full_sequence_kl = effective_kl_scope == "full_sequence"
     assignment_c = _canonical_assignment(baseline_assignment)
     overrides = [_normalise_override_set(override) for override in candidate_overrides]
+    if candidate_cache_overrides is None:
+        cache_overrides = [{} for _ in overrides]
+    else:
+        if len(candidate_cache_overrides) != len(overrides):
+            raise ValueError(
+                "candidate_cache_overrides length must match candidate_overrides"
+            )
+        cache_overrides = [
+            {
+                str(name): str(fmt).strip().upper()
+                for name, fmt in override.items()
+            }
+            for override in candidate_cache_overrides
+        ]
 
     format_names = set(assignment_c.values())
     for override in overrides:
@@ -3851,7 +3934,14 @@ def measure_override_set_kl(
                 regrouped.extend(window)
         ref_log_probs = regrouped
 
-    batches = _override_sets_microbatches(overrides, max_lanes_per_batch)
+    batch_size = max(int(max_lanes_per_batch), 1)
+    batches = [
+        (
+            overrides[start:start + batch_size],
+            cache_overrides[start:start + batch_size],
+        )
+        for start in range(0, len(overrides), batch_size)
+    ]
     cal_hash = calibration_data_hash(calib_ids)
     tmp_parent = str(work_root) if work_root is not None else None
     use_prequant_cache = _env_flag_enabled(
@@ -3882,7 +3972,7 @@ def measure_override_set_kl(
     measured: list[float] = []
     _t0 = time.monotonic()
     _total = sum(1 for batch in batches if batch)
-    for batch_idx, lane_overrides in enumerate(batches, start=1):
+    for batch_idx, (lane_overrides, lane_cache_overrides) in enumerate(batches, start=1):
         if not lane_overrides:
             continue
         _batch_t0 = time.monotonic()
@@ -3918,6 +4008,14 @@ def measure_override_set_kl(
         cache_specs = list({id(spec): spec for spec in specs_by_name.values()}.values())
         if source_weight_resolver is not None:
             cache_specs = [*cache_specs, fr.get_format("BF16")]
+        variant_keys = [
+            (str(name), str(cache_fmt).strip().upper())
+            for override in lane_cache_overrides
+            for name, cache_fmt in override.items()
+        ]
+        if variant_keys and production_weight_cache is not None:
+            if getattr(production_weight_cache, "_prismaquant_prefetch_policy", "batch") != "none":
+                production_weight_cache.prefetch(variant_keys)
         group_quant_cache = (
             (
                 _prefetch_production_weight_cache(
@@ -3993,6 +4091,8 @@ def measure_override_set_kl(
                         include_activation_quant=include_activation_quant,
                         activation_max_abs=activation_max_abs,
                         source_weight_resolver=source_weight_resolver,
+                        production_weight_cache=production_weight_cache,
+                        lane_cache_overrides=lane_cache_overrides,
                     )
                     target_hooks.install()
 
@@ -4027,6 +4127,7 @@ def measure_override_set_kl(
                             effective_kl_scope,
                             bool(include_activation_quant),
                             _override_sets_graph_key(lane_overrides),
+                            _cache_override_sets_graph_key(lane_cache_overrides),
                             tuple(sorted(target_names)),
                             id(production_weight_cache)
                             if production_weight_cache is not None else 0,
@@ -4169,6 +4270,8 @@ def measure_override_set_kl(
                             include_activation_quant=include_activation_quant,
                             activation_max_abs=activation_max_abs,
                             source_weight_resolver=source_weight_resolver,
+                            production_weight_cache=production_weight_cache,
+                            lane_cache_overrides=lane_cache_overrides,
                         )
                         target_hooks.install()
                     rep_args, rep_kwargs = _repeat_inputs_for_lanes(
@@ -4197,6 +4300,7 @@ def measure_override_set_kl(
                             effective_kl_scope,
                             bool(include_activation_quant),
                             _override_sets_graph_key(lane_overrides),
+                            _cache_override_sets_graph_key(lane_cache_overrides),
                             tuple(sorted(target_names)),
                             id(production_weight_cache)
                             if production_weight_cache is not None else 0,

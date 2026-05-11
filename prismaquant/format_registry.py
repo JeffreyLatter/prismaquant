@@ -486,15 +486,6 @@ register_format(FormatSpec(
     activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
 ))
 register_format(FormatSpec(
-    name="NVFP4_CLIPPED",
-    weight_bits=4, group_size=16, scale_bits=8, scale_dtype_name="fp8_e4m3",
-    weight_element_dtype="fp4_e2m1", act_bits=4, act_dtype_name="fp4_e2m1",
-    act_group_size=16, family="nv", min_capability_sm=100,
-    autoround_config=lambda: _nv_autoround(4, 16, 4),
-    quantize_dequantize=_make_rtn("fp4_e2m1", 16),
-    activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
-))
-register_format(FormatSpec(
     name="NVFP4A16",
     weight_bits=4, group_size=16, scale_bits=8, scale_dtype_name="fp8_e4m3",
     weight_element_dtype="fp4_e2m1", act_bits=None,

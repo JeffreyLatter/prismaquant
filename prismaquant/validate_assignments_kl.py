@@ -22,6 +22,7 @@ from prismaquant.gpu_guard import require_cuda_hot_path
 from prismaquant.layer_config import canonicalize_format
 from prismaquant.model_profiles import DefaultProfile, detect_profile
 from prismaquant.kl_measurement import assignment_bit_total, measure_assignment_kl
+from prismaquant.production_weight_cache import ProductionWeightCacheVariantView
 from prismaquant.sensitivity_probe import load_calibration
 
 
@@ -62,6 +63,31 @@ def _parse_labeled_path(value: str) -> tuple[str, Path]:
         return label, Path(path)
     path = Path(value)
     return path.stem, path
+
+
+def _load_cache_variant_map(path: str | None) -> dict[str, str]:
+    if not path:
+        return {}
+    payload = _load_json(path)
+    if not isinstance(payload, Mapping):
+        raise ValueError("--production-cache-variant-map must contain a JSON object")
+    raw = payload.get("chosen_cache_variants")
+    if raw is None:
+        numeric = payload.get("numeric_variants")
+        if isinstance(numeric, Mapping):
+            raw = numeric.get("chosen_cache_variants")
+    if raw is None:
+        raw = payload
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            "--production-cache-variant-map must be a qname->cache-format map "
+            "or a probe payload containing chosen_cache_variants"
+        )
+    return {
+        str(qname): str(fmt).strip().upper()
+        for qname, fmt in raw.items()
+        if str(qname).strip() and str(fmt).strip()
+    }
 
 
 def _assignment_bpp(stats: Mapping, assignment: Mapping[str, str], specs_by_name: Mapping[str, fr.FormatSpec]) -> float:
@@ -113,6 +139,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional pickled ProductionWeightCache. When supplied, KL is "
         "measured on the same production-rendered W_tilde path used by export.",
+    )
+    parser.add_argument(
+        "--production-cache-variant-map",
+        default=None,
+        help="JSON qname->internal cache-format map, or a probe payload "
+        "containing chosen_cache_variants.",
     )
     parser.add_argument(
         "--production-cache-dir-override",
@@ -240,6 +272,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ):
                 production_cache.enable_lru(
                     int(float(args.production_cache_lru_gb) * 1024**3)
+                )
+            variant_map = _load_cache_variant_map(args.production_cache_variant_map)
+            if variant_map:
+                production_cache = ProductionWeightCacheVariantView(
+                    production_cache,
+                    variant_map,
                 )
 
         try:

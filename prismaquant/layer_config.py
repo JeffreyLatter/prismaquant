@@ -71,8 +71,6 @@ def canonicalize_format(entry: dict | str | int) -> str:
         value = entry.lower()
         if value in ("nvfp4", "fp4", "4"):
             return "NVFP4"
-        if value in ("nvfp4_clipped", "nvfp4-prismaclip", "nvfp4_prismaclip"):
-            return "NVFP4_CLIPPED"
         if value in ("mxfp4", "mx_fp4"):
             return "MXFP4"
         if value in ("mxfp8", "mxfp8_e4m3", "8"):

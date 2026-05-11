@@ -11,20 +11,24 @@ normal compressed-tensors path.
 
 ## Candidate Mode
 
-The preferred production-facing path is to measure PrismaClip as a same-bpp
-candidate instead of rewriting baseline NVFP4 globally. `NVFP4_CLIPPED` is a
-recipe/cache format that renders the PrismaClip variant into its own
-`ProductionWeightCache` key while exporting as ordinary NVFP4 compressed
-tensors. vLLM still sees the standard NVFP4 runtime format and kernel.
+The preferred production-facing path is to direct-KL-gate PrismaClip proposals
+instead of rewriting baseline NVFP4 globally. `NVFP4_CLIPPED` is an internal
+`ProductionWeightCache` key only. It is not a registry format, allocator
+candidate, or layer-config value. vLLM still sees the standard NVFP4 runtime
+format and kernel.
 
 Use `kl_sensitivity_probe.py --prismaclip-candidates` with
-`--candidate-recipe production` and `--floor-format NVFP4`. The probe adds
-`NVFP4_CLIPPED` beside the normal menu, so each Linear or fused decision unit
-can keep baseline NVFP4, use PrismaClip, or promote to MXFP8/BF16 if the
-measured KL/cost tradeoff says the wider format is justified.
-Allocator-emitted layer configs preserve `NVFP4_CLIPPED` as an explicit string
-so the production cache can render the clipped candidate instead of collapsing
-it back to ordinary NVFP4.
+`--candidate-recipe production` and `--floor-format NVFP4`. The probe renders
+the internal clipped cache entries, measures each proposal by KL against the
+ordinary NVFP4 floor, accepts only individually positive proposals, then
+re-measures the combined accepted floor. If the combined floor improves, the
+probe writes ordinary `chosen_assignment` formats plus `chosen_cache_variants`
+for the accepted PrismaClip cache entries.
+
+Export keeps the layer config as NVFP4 and consumes the sidecar with
+`--production-cache-variant-map <probe-output.json>`. That flag selects the
+internal rendered cache entry while emitting normal NVFP4 compressed-tensors
+metadata.
 
 This mode exists because local clipping scores have shown real wins but also
 occasional global KL regressions. Treating PrismaClip as a candidate keeps the
@@ -133,7 +137,8 @@ batched damp selector but still measured `0.060248224` KL versus the scalar
 - Runtime: no additional serving mechanism beyond the exported activation
   scale metadata.
 - Default: off. Enable global rewrite with `PRISMAQUANT_ACT_CLIP_SOLVER=1`,
-  or enable measured candidate mode with `--prismaclip-candidates`.
+  or enable measured KL-gated cache-variant mode with
+  `--prismaclip-candidates`.
 
 ## Validation Notes
 

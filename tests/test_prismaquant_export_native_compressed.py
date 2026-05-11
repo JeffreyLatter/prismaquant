@@ -442,7 +442,20 @@ class TestRecipeParsing(unittest.TestCase):
         self.assertEqual(canonicalize_format(mx8), "MXFP8")
         self.assertEqual(canonicalize_format(bf), "BF16")
         self.assertEqual(canonicalize_format({"bits": 4, "data_type": "mx_fp"}), "MXFP4")
-        self.assertEqual(canonicalize_format("NVFP4_CLIPPED"), "NVFP4_CLIPPED")
+        with self.assertRaises(ValueError):
+            canonicalize_format("NVFP4_CLIPPED")
+
+    def test_load_production_cache_variant_map_from_probe_payload(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "probe.json"
+            path.write_text(json.dumps({
+                "chosen_assignment": {"layer": "NVFP4"},
+                "chosen_cache_variants": {"layer": "NVFP4_CLIPPED"},
+            }))
+            self.assertEqual(
+                enc._load_production_cache_variant_map(str(path)),
+                {"layer": "NVFP4_CLIPPED"},
+            )
 
 
 class TestVLLMInternalNaming(unittest.TestCase):
@@ -780,17 +793,24 @@ class TestProductionCacheExportPath(unittest.TestCase):
 
     def test_prismaclip_variant_hits_distinct_cache_key_but_packs_nvfp4(self):
         import prismaquant.export_native_compressed as m
-        from prismaquant.production_weight_cache import ProductionWeightCache
+        from prismaquant.production_weight_cache import (
+            ProductionWeightCache,
+            ProductionWeightCacheVariantView,
+        )
 
         base = torch.zeros((8, 16), dtype=torch.float32)
         clipped = torch.ones((8, 16), dtype=torch.float32) * 0.1
-        cache = ProductionWeightCache(
+        base_cache = ProductionWeightCache(
             weights={
                 ("model.layers.0.mlp.down_proj", "NVFP4"): base,
                 ("model.layers.0.mlp.down_proj", "NVFP4_CLIPPED"): clipped,
             },
             levers={},
             activation_max_abs={"model.layers.0.mlp.down_proj": 3.0},
+        )
+        cache = ProductionWeightCacheVariantView(
+            base_cache,
+            {"model.layers.0.mlp.down_proj": "NVFP4_CLIPPED"},
         )
         saved_cache = m._PRODUCTION_WEIGHT_CACHE
         saved_scales = m._INPUT_GLOBAL_SCALES
@@ -799,7 +819,7 @@ class TestProductionCacheExportPath(unittest.TestCase):
             m._INPUT_GLOBAL_SCALES = m._production_cache_scales(cache)
             key = m._production_cache_lookup_key(
                 "model.layers.0.mlp.down_proj",
-                "NVFP4_CLIPPED",
+                "NVFP4",
             )
             self.assertEqual(
                 key,
@@ -807,7 +827,7 @@ class TestProductionCacheExportPath(unittest.TestCase):
             )
             out = m._pack_production_cached_2d(
                 "model.layers.0.mlp.down_proj",
-                "NVFP4_CLIPPED",
+                "NVFP4",
                 device=torch.device("cpu"),
             )
             self.assertIsNotNone(out)

@@ -556,6 +556,10 @@ def _production_cache_lookup_key(name: str, fmt: str):
     cache = _PRODUCTION_WEIGHT_CACHE
     if cache is None:
         return None
+    if hasattr(cache, "resolve_key"):
+        key = cache.resolve_key(name, fmt)
+        if key is not None:
+            return key
     weights = getattr(cache, "weights", {}) or {}
     for cand_name in _production_cache_name_candidates(name):
         for cand_fmt in _production_cache_format_candidates(fmt):
@@ -563,6 +567,35 @@ def _production_cache_lookup_key(name: str, fmt: str):
             if key in weights:
                 return key
     return None
+
+
+def _load_production_cache_variant_map(path: str | None) -> dict[str, str]:
+    if not path:
+        return {}
+    with open(path) as fh:
+        payload = json.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError("--production-cache-variant-map must contain a JSON object")
+    raw = payload.get("chosen_cache_variants")
+    if raw is None:
+        numeric = payload.get("numeric_variants")
+        if isinstance(numeric, dict):
+            raw = numeric.get("chosen_cache_variants")
+    if raw is None:
+        raw = payload
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "--production-cache-variant-map must be a qname->cache-format map "
+            "or a probe payload containing chosen_cache_variants"
+        )
+    out: dict[str, str] = {}
+    for qname, fmt in raw.items():
+        q = str(qname).strip()
+        f = str(fmt).strip().upper()
+        if not q or not f:
+            continue
+        out[q] = f
+    return out
 
 
 def _production_cache_expected_keys(
@@ -5686,6 +5719,13 @@ def main():
                          "instead of recomputing GPTQ/scale-sweep from "
                          "raw activations. This is the faithful path for "
                          "candidates measured with production_weight_cache.")
+    ap.add_argument("--production-cache-variant-map", default=None,
+                    help="JSON qname->internal cache-format map, or a "
+                         "kl_sensitivity_probe payload containing "
+                         "chosen_cache_variants. Runtime formats remain "
+                         "those in --layer-config; this only selects "
+                         "alternate rendered cache entries such as "
+                         "PrismaClip's NVFP4 variant.")
     ap.add_argument("--production-cache-dir-override", default=None,
                     help="Override the backing shard directory stored "
                          "inside --production-weight-cache, for caches "
@@ -5832,6 +5872,23 @@ def main():
         if args.production_cache_lru_gb and args.production_cache_lru_gb > 0:
             production_cache.enable_lru(
                 int(float(args.production_cache_lru_gb) * 1024**3)
+            )
+        variant_map = _load_production_cache_variant_map(
+            args.production_cache_variant_map
+        )
+        if variant_map:
+            from prismaquant.production_weight_cache import (
+                ProductionWeightCacheVariantView,
+            )
+
+            production_cache = ProductionWeightCacheVariantView(
+                production_cache,
+                variant_map,
+            )
+            print(
+                "[export-stream] production-cache variants: "
+                f"{len(variant_map)} qnames",
+                flush=True,
             )
         _validate_halo_cache_inputs(args, production_cache)
         _PRODUCTION_WEIGHT_CACHE = production_cache
