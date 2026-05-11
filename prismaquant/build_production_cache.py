@@ -106,6 +106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="gptq,scale_sweep",
         help="Comma-separated levers to enable. Currently honored: "
         "{gptq, scale_sweep, act_clip_solver, fisher_gptq, awq, smoothquant}.  "
+        "act_clip_solver is PrismaClip, the production-rendered NVFP4 "
+        "activation clipping solver. "
         "AWQ and SmoothQuant require --render-scope=assignment because the "
         "fold scale is tied to the concrete format assignment.  Joint NVFP4 "
         "sibling globals + calibrated "

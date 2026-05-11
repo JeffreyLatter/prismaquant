@@ -17,7 +17,7 @@ quantization path:
     * calibrated `input_global_scale` per fused-sibling group
       (max_abs(activations) / 6.0; the same value the export persists
       to the artifact)
-    * optional explicit activation-clipping solver for NVFP4 render-time
+    * optional PrismaClip explicit activation-clipping solver for NVFP4 render-time
       GPTQ + scale_sweep inputs
     * optional Fisher-weighted local objectives from h-detail
     * opt-in activation-weighted MXFP8 E8M0 scale search when nonzero
@@ -1437,6 +1437,7 @@ def _solve_nvfp4_activation_clip_groups(
     threshold_by_qname: dict[str, float | None] = {}
     metadata: dict[str, object] = {
         "enabled": True,
+        "method": "PrismaClip",
         "format": "NVFP4",
         "objective": "output_mse_original_activations",
         "solver": "log_golden_section",
@@ -1526,7 +1527,7 @@ def _solve_nvfp4_activation_clip_groups(
         })
         if progress and (idx % 10 == 0 or idx == len(baseline_items)):
             print(
-                f"[prod-cache] clip-solver baseline "
+                f"[prod-cache] PrismaClip baseline "
                 f"{idx}/{len(baseline_items)} groups",
                 flush=True,
             )
@@ -1548,7 +1549,7 @@ def _solve_nvfp4_activation_clip_groups(
     metadata["total_groups"] = int(len(ranked))
     if progress:
         print(
-            f"[prod-cache] clip-solver threshold search: "
+            f"[prod-cache] PrismaClip threshold search: "
             f"{len(eligible_groups)}/{len(ranked)} groups "
             f"(top_fraction={top_fraction:.3g}, top_k={top_k})",
             flush=True,
@@ -1719,7 +1720,7 @@ def _solve_nvfp4_activation_clip_groups(
         }
         if progress and verbose:
             print(
-                f"[prod-cache] clip-solver {group_key}: "
+                f"[prod-cache] PrismaClip {group_key}: "
                 f"{'solved' if selected else 'baseline'} "
                 f"gain={rel_gain:.4%} threshold={best_threshold}",
                 flush=True,
@@ -1729,7 +1730,7 @@ def _solve_nvfp4_activation_clip_groups(
             eligible_done % 5 == 0 or eligible_done == len(eligible_groups)
         ):
             print(
-                f"[prod-cache] clip-solver searched "
+                f"[prod-cache] PrismaClip searched "
                 f"{eligible_done}/{len(eligible_groups)} eligible groups",
                 flush=True,
             )
@@ -2338,6 +2339,7 @@ def fill_production_weight_cache(
     solved_nvfp4_thresholds: dict[str, float | None] = {}
     clip_solver_metadata: dict[str, object] = {
         "enabled": bool(levers.get("act_clip_solver", False)),
+        "method": "PrismaClip",
         "format": "NVFP4",
         "status": "disabled",
     }
@@ -2358,7 +2360,7 @@ def fill_production_weight_cache(
         if solver_groups:
             if progress:
                 print(
-                    f"[prod-cache] solving NVFP4 activation clip for "
+                    f"[prod-cache] solving PrismaClip NVFP4 thresholds for "
                     f"{len(solver_groups)} fused groups",
                     flush=True,
                 )

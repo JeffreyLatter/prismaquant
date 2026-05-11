@@ -671,6 +671,21 @@ def _production_cache_awq_scale(
     return None
 
 
+def _production_cache_fold_scale_enabled(cache) -> bool:
+    """Whether a production cache needs predecessor fold scales at export.
+
+    AWQ and SmoothQuant both store their precomputed per-channel fold scales in
+    `ProductionWeightCache.awq_scales`. The name is historical; export only
+    cares that a norm-predecessor fold was solved and must be materialized.
+    """
+    if cache is None:
+        return False
+    if not bool(getattr(cache, "awq_scales", None)):
+        return False
+    levers = getattr(cache, "levers", {}) or {}
+    return bool(levers.get("awq", False) or levers.get("smoothquant", False))
+
+
 def _source_weight_shape_for_recipe(
     src_model: str,
     recipe_key: str,
@@ -5843,14 +5858,13 @@ def main():
 
     # Resolve flag defaults.
     cache_supplied = bool(args.activation_cache_dir)
-    cache_awq_enabled = (
-        _PRODUCTION_WEIGHT_CACHE is not None
-        and bool((getattr(_PRODUCTION_WEIGHT_CACHE, "levers", {}) or {}).get("awq", False))
-        and bool(getattr(_PRODUCTION_WEIGHT_CACHE, "awq_scales", None))
+    cache_fold_scale_enabled = _production_cache_fold_scale_enabled(
+        _PRODUCTION_WEIGHT_CACHE,
     )
-    # AWQ: explicit flag wins; otherwise inherit from an AWQ-rendered
-    # production cache so export folds the precomputed scales.
-    awq_enabled = bool(args.awq) if args.awq is not None else cache_awq_enabled
+    # Fold-scale transforms: explicit AWQ flag wins for legacy activation-cache
+    # export; otherwise inherit from an AWQ/SmoothQuant-rendered production
+    # cache so export folds the precomputed scales.
+    awq_enabled = bool(args.awq) if args.awq is not None else cache_fold_scale_enabled
     # GPTQ + scale-sweep: ON iff activation cache supplied.
     gptq_enabled = args.gptq if args.gptq is not None else cache_supplied
     # act_round: OFF by default (bake-off showed it reverts GPTQ to RTN).
@@ -5863,7 +5877,7 @@ def main():
     # The activation-aware passes need the actual activations, not just
     # the scale summary. We only load raw activations when at least one
     # pass is enabled.
-    if act_passes_any and not cache_supplied and not cache_awq_enabled:
+    if act_passes_any and not cache_supplied and not cache_fold_scale_enabled:
         print("[export-stream] WARN activation-aware passes requested "
               "but no --activation-cache-dir; disabling.", flush=True)
         awq_enabled = gptq_enabled = awq_round_enabled = False

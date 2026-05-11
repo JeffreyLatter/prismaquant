@@ -26,6 +26,7 @@ from prismaquant.export_native_compressed import (
     _coerce_runtime_legal_assignment,
     _passthrough_dtype,
     _passthrough_tensor,
+    _production_cache_fold_scale_enabled,
     _quantize_2d,
     _quantize_3d_packed,
     _resolve_perturbed_x_export_inputs,
@@ -691,6 +692,39 @@ class TestQuantize2DDispatch(unittest.TestCase):
 
 
 class TestProductionCacheExportPath(unittest.TestCase):
+    def test_fold_scale_cache_detection_accepts_awq_and_smoothquant(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        scale = {"model.layers.0.self_attn.q_proj": torch.ones(16)}
+        self.assertTrue(_production_cache_fold_scale_enabled(
+            ProductionWeightCache(
+                weights={},
+                levers={"awq": True, "smoothquant": False},
+                awq_scales=scale,
+            )
+        ))
+        self.assertTrue(_production_cache_fold_scale_enabled(
+            ProductionWeightCache(
+                weights={},
+                levers={"awq": False, "smoothquant": True},
+                awq_scales=scale,
+            )
+        ))
+        self.assertFalse(_production_cache_fold_scale_enabled(
+            ProductionWeightCache(
+                weights={},
+                levers={"awq": False, "smoothquant": False},
+                awq_scales=scale,
+            )
+        ))
+        self.assertFalse(_production_cache_fold_scale_enabled(
+            ProductionWeightCache(
+                weights={},
+                levers={"smoothquant": True},
+                awq_scales=None,
+            )
+        ))
+
     def test_packs_cached_nvfp4_weight_with_cached_input_scale(self):
         import prismaquant.export_native_compressed as m
         from prismaquant.production_weight_cache import ProductionWeightCache

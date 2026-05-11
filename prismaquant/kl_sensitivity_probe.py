@@ -3346,7 +3346,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated production cleanup levers for on-the-fly cache "
             "builds. Default: gptq,scale_sweep; add act_clip_solver to "
-            "solve explicit NVFP4 render-time activation clamps and "
+            "enable PrismaClip, the explicit NVFP4 render-time activation "
+            "clamp solver, and "
             "fisher_gptq to use h-detail per-token weights when available. "
             "GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
             "recorded in cache metadata. NVFP4 block scaling follows "
