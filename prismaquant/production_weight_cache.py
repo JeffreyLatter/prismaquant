@@ -77,7 +77,7 @@ from prismaquant.awq import (
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 
 
-DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN = 0.002
+DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN = 0.0
 
 
 def _cache_weight_filename(qname: str, fmt: str) -> str:
@@ -1456,6 +1456,17 @@ def _solve_nvfp4_activation_clip_groups(
         "groups": {},
         "selected_by_qname": {},
         "prewritten_qnames": [],
+        "prewrite_baseline": _env_flag(
+            "PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE",
+            True,
+        ),
+        "prewritten_baseline_qnames": [],
+        "batched_same_shape": _env_flag(
+            "PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED",
+            False,
+        ),
+        "batched_evaluations": 0,
+        "scalar_evaluations": 0,
     }
 
     def render_member(qname: str, threshold: float | None) -> torch.Tensor:
@@ -1483,6 +1494,173 @@ def _solve_nvfp4_activation_clip_groups(
 
     group_entries: list[dict[str, object]] = []
 
+    def render_members_batched(
+        members: Sequence[str],
+        threshold: float | None,
+    ) -> dict[str, torch.Tensor] | None:
+        if not metadata["batched_same_shape"] or len(members) < 2:
+            return None
+        if bool(levers.get("awq_round", False)):
+            return None
+        if any((awq_scales or {}).get(qname) is not None for qname in members):
+            return None
+        modules = [qname_to_module[qname] for qname in members]
+        shapes = {tuple(mod.weight.shape) for mod in modules}
+        if len(shapes) != 1:
+            return None
+        device = modules[0].weight.device
+        dtype = modules[0].weight.dtype
+        if any(mod.weight.device != device for mod in modules):
+            return None
+        cols = int(modules[0].weight.shape[1])
+        if any(
+            activations.get(qname) is None
+            or activations[qname].shape[-1] != cols
+            for qname in members
+        ):
+            return None
+        overrides = [joint_globals.get(qname) for qname in members]
+        if all(value is not None for value in overrides):
+            global_real_overrides = torch.stack([
+                value.to(device=device, dtype=torch.float32).reshape(())
+                for value in overrides
+            ])
+        elif all(value is None for value in overrides):
+            global_real_overrides = None
+        else:
+            return None
+
+        try:
+            from prismaquant.export_batched_gptq import (
+                gptq_obs_rounding_nvfp4_batched,
+                scale_sweep_nvfp4_batched,
+            )
+            from prismaquant.export_native_compressed import (
+                _activation_col_importance_for_gptq,
+                _activation_matrix_for_gptq,
+                _rtn_dequant_nvfp4,
+            )
+        except Exception:
+            return None
+
+        weights = torch.stack([
+            mod.weight.detach().to(device=device, dtype=torch.float32)
+            for mod in modules
+        ], dim=0)
+        reference_weights = weights.clone()
+        acts_list = [
+            activations[qname].detach().to(device=device, dtype=torch.float32)
+            for qname in members
+        ]
+        row_weights_list = [
+            fisher_rows.get(qname) if fisher_rows is not None else None
+            for qname in members
+        ]
+        row_weights_list = [
+            value.to(device=device, dtype=torch.float32)
+            if isinstance(value, torch.Tensor) else None
+            for value in row_weights_list
+        ]
+
+        if bool(levers.get("gptq", True)):
+            damp_sweep_on = (
+                os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0"
+            )
+            if damp_sweep_on:
+                damp_candidates = (0.001, 0.005, 0.01, 0.05, 0.1)
+                best_w: torch.Tensor | None = None
+                best_err: torch.Tensor | None = None
+                h_eval = torch.empty(
+                    (len(members), cols, cols),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                for idx, acts in enumerate(acts_list):
+                    x_eval = _activation_matrix_for_gptq(
+                        acts,
+                        cols,
+                        device=device,
+                        clip_threshold=threshold,
+                        row_weights=row_weights_list[idx],
+                    )
+                    h_eval[idx] = x_eval.t() @ x_eval
+                for damp in damp_candidates:
+                    cand_w = gptq_obs_rounding_nvfp4_batched(
+                        weights,
+                        acts_list,
+                        damp=damp,
+                        global_real_overrides=global_real_overrides,
+                        clip_threshold=threshold,
+                        row_weights_list=row_weights_list,
+                    )
+                    diff = reference_weights - cand_w
+                    err = torch.einsum("eoi,eij,eoj->e", diff, h_eval, diff)
+                    if best_w is None or best_err is None:
+                        best_w = cand_w
+                        best_err = err
+                    else:
+                        take = err < best_err
+                        if take.any():
+                            idx = take.nonzero(as_tuple=True)[0]
+                            best_w[idx] = cand_w[idx]
+                            best_err[idx] = err[idx]
+                if best_w is not None:
+                    weights = best_w
+            else:
+                weights = gptq_obs_rounding_nvfp4_batched(
+                    weights,
+                    acts_list,
+                    global_real_overrides=global_real_overrides,
+                    clip_threshold=threshold,
+                    row_weights_list=row_weights_list,
+                )
+
+        if bool(levers.get("scale_sweep", True)):
+            weights = scale_sweep_nvfp4_batched(
+                weights,
+                acts_list,
+                reference_weights=reference_weights,
+                global_real_overrides=global_real_overrides,
+                clip_threshold=threshold,
+                row_weights_list=row_weights_list,
+            )
+
+        if (
+            bool(levers.get("gptq", True))
+            and os.environ.get("PRISMAQUANT_DO_NO_HARM", "1") != "0"
+        ):
+            try:
+                for idx, qname in enumerate(members):
+                    override = overrides[idx]
+                    w_rtn = _rtn_dequant_nvfp4(
+                        reference_weights[idx],
+                        group_size=16,
+                        global_real_override=override,
+                    )
+                    imp = _activation_col_importance_for_gptq(
+                        acts_list[idx],
+                        cols,
+                        device=device,
+                        clip_threshold=threshold,
+                        row_weights=row_weights_list[idx],
+                    )
+                    ref = reference_weights[idx]
+                    mse_pass = float(
+                        (imp * (ref - weights[idx]).pow(2).sum(dim=0)).sum()
+                    )
+                    mse_rtn = float(
+                        (imp * (ref - w_rtn).pow(2).sum(dim=0)).sum()
+                    )
+                    if mse_rtn < mse_pass:
+                        weights[idx] = w_rtn
+            except Exception:
+                pass
+
+        return {
+            qname: weights[idx].to(device=device, dtype=dtype).contiguous()
+            for idx, qname in enumerate(members)
+        }
+
     def evaluate_members(
         members: Sequence[str],
         threshold: float | None,
@@ -1491,8 +1669,17 @@ def _solve_nvfp4_activation_clip_groups(
     ) -> tuple[float, dict[str, torch.Tensor] | None]:
         score = 0.0
         kept: dict[str, torch.Tensor] | None = {} if keep_weights else None
-        for qname in members:
-            w_dq = render_member(qname, threshold)
+        rendered = render_members_batched(members, threshold)
+        if rendered is not None:
+            metadata["batched_evaluations"] = (
+                int(metadata.get("batched_evaluations", 0)) + 1
+            )
+        else:
+            metadata["scalar_evaluations"] = (
+                int(metadata.get("scalar_evaluations", 0)) + len(members)
+            )
+            rendered = {qname: render_member(qname, threshold) for qname in members}
+        for qname, w_dq in rendered.items():
             score += _activation_output_error(
                 qname_to_module[qname].weight.data,
                 w_dq,
@@ -1517,8 +1704,13 @@ def _solve_nvfp4_activation_clip_groups(
             continue
         lo, hi = bounds
 
+        baseline_weights: dict[str, torch.Tensor] | None = None
         try:
-            baseline_score, _ = evaluate_members(members, None)
+            baseline_score, baseline_weights = evaluate_members(
+                members,
+                None,
+                keep_weights=bool(metadata["prewrite_baseline"]),
+            )
         except Exception as e:
             metadata["groups"][group_key] = {
                 "members": members,
@@ -1526,6 +1718,19 @@ def _solve_nvfp4_activation_clip_groups(
                 "error": str(e),
             }
             continue
+        if baseline_weights is not None:
+            for qname, tensor in baseline_weights.items():
+                _store_rendered_weight_entry(
+                    weights=weights_out,
+                    cache_dir_path=cache_dir_path,
+                    qname=qname,
+                    fmt="NVFP4",
+                    tensor=tensor,
+                    weight_dtype=qname_to_module[qname].weight.dtype,
+                )
+                metadata["prewritten_baseline_qnames"].append(qname)
+                del tensor
+            baseline_weights.clear()
         group_entries.append({
             "group_key": group_key,
             "members": members,

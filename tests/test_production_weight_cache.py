@@ -7,6 +7,7 @@ import pytest
 from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
 from prismaquant.production_weight_cache import ProductionWeightCache
 from prismaquant.production_weight_cache import fill_production_weight_cache
+from prismaquant.production_weight_cache import _solve_nvfp4_activation_clip_groups
 from prismaquant.production_recache import (
     _load_assignment,
     activation_max_abs_delta_summary,
@@ -206,11 +207,12 @@ def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
     )
 
 
-def test_production_cache_act_clip_solver_skips_tiny_default_gain(monkeypatch):
+def test_production_cache_act_clip_solver_skips_tiny_configured_gain(monkeypatch):
     import prismaquant.production_weight_cache as pwc
 
     model = _TinyChain()
     calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    calls: list[float | None] = []
 
     def fake_render_production_weight(
         weight,
@@ -219,6 +221,7 @@ def test_production_cache_act_clip_solver_skips_tiny_default_gain(monkeypatch):
         act_clip_threshold=None,
         **_kwargs,
     ):
+        calls.append(act_clip_threshold)
         if fmt.upper() != "NVFP4":
             return weight.detach().clone()
         delta = 1.0 if act_clip_threshold is None else 0.9995
@@ -227,7 +230,7 @@ def test_production_cache_act_clip_solver_skips_tiny_default_gain(monkeypatch):
     monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER", "1")
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
-    monkeypatch.delenv("PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN", "0.002")
 
     cache = fill_production_weight_cache(
         model,
@@ -242,14 +245,102 @@ def test_production_cache_act_clip_solver_skips_tiny_default_gain(monkeypatch):
     meta = cache.metadata["activation_clip_solver"]
     group_meta = next(iter(meta["groups"].values()))
     assert meta["min_gain"] == pytest.approx(0.002)
+    assert meta["prewrite_baseline"] is True
+    assert meta["prewritten_baseline_qnames"] == ["l1"]
     assert meta["selected_by_qname"]["l1"] is None
     assert group_meta["selected"] == "baseline"
     assert group_meta["relative_gain"] == 0.0
+    assert calls.count(None) == 1
     assert torch.allclose(
         cache.get("l1", "NVFP4").to(torch.float32),
         model.l1.weight.detach().to(torch.float32) + 1.0,
         atol=1e-6,
     )
+
+
+def test_production_cache_act_clip_solver_batches_same_shape_groups(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED", "1")
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+
+    modules = {
+        "a": nn.Linear(4, 4, bias=False),
+        "b": nn.Linear(4, 4, bias=False),
+    }
+    activations = {
+        "a": torch.randn(8, 4),
+        "b": torch.randn(8, 4),
+    }
+    weights: dict[tuple[str, str], object] = {}
+
+    thresholds, meta = _solve_nvfp4_activation_clip_groups(
+        groups={"fused": ["a", "b"]},
+        qname_to_module=modules,
+        activations=activations,
+        levers={"gptq": False, "scale_sweep": False},
+        joint_globals={},
+        activation_max_abs={
+            name: float(act.abs().max().item())
+            for name, act in activations.items()
+        },
+        fisher_rows=None,
+        weights_out=weights,
+        cache_dir_path=None,
+        progress=False,
+    )
+
+    assert thresholds == {"a": None, "b": None}
+    assert meta["batched_same_shape"] is True
+    assert meta["batched_evaluations"] >= 1
+    assert meta["scalar_evaluations"] == 0
+    assert sorted(meta["prewritten_baseline_qnames"]) == ["a", "b"]
+    assert set(weights) == {("a", "NVFP4"), ("b", "NVFP4")}
+
+
+def test_production_cache_batched_clip_baseline_matches_scalar(monkeypatch):
+    torch.manual_seed(0)
+    modules = {
+        "a": nn.Linear(16, 8, bias=False),
+        "b": nn.Linear(16, 8, bias=False),
+    }
+    activations = {
+        "a": torch.randn(24, 16),
+        "b": torch.randn(24, 16),
+    }
+
+    def solve(batched: bool) -> dict[tuple[str, str], object]:
+        monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED", "1" if batched else "0")
+        monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE", "1")
+        monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+        monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN", "999")
+        monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1")
+        weights: dict[tuple[str, str], object] = {}
+        _solve_nvfp4_activation_clip_groups(
+            groups={"fused": ["a", "b"]},
+            qname_to_module=modules,
+            activations=activations,
+            levers={"gptq": True, "scale_sweep": True},
+            joint_globals={},
+            activation_max_abs={
+                name: float(act.abs().max().item())
+                for name, act in activations.items()
+            },
+            fisher_rows=None,
+            weights_out=weights,
+            cache_dir_path=None,
+            progress=False,
+        )
+        return weights
+
+    scalar = solve(False)
+    batched = solve(True)
+
+    for key in scalar:
+        assert torch.allclose(
+            scalar[key],
+            batched[key],
+            atol=1e-4,
+            rtol=1e-3,
+        ), key
 
 
 def test_production_cache_passes_fisher_row_weights(monkeypatch, tmp_path):

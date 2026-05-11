@@ -78,9 +78,10 @@ Single-file NVFP4 isolation:
 Conclusion: the `0.167588803` SmoothQuant full-cache result is not evidence
 that the selected SmoothQuant MXFP8 `q/k/v` fold regressed. The selected fold
 slightly improved KL in isolation. The regression was caused by unstable
-PrismaClip NVFP4 rerender choices with sub-0.2% local-MSE gains. The default
-PrismaClip selection floor is now `PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN=0.002`
-to avoid accepting numerically tiny local wins.
+PrismaClip NVFP4 rerender choices with sub-0.2% local-MSE gains. A later 4B
+isolation run showed that making `PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN=0.002`
+the default removed many collectively useful clips, so the production default
+returned to `0.0`; nonzero floors are ablation knobs only.
 
 ## Decision
 

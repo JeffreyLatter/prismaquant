@@ -43,6 +43,8 @@ def _build_H_stack(
     in_features: int,
     device: torch.device,
     damp: float = 0.01,
+    clip_threshold: float | None = None,
+    row_weights_list: list[torch.Tensor | None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build a stacked activation covariance tensor across E Linears.
 
@@ -83,7 +85,18 @@ def _build_H_stack(
         # the host. Moving X to the GPU lets the bmm/matmul run as
         # a real CUDA kernel and is what delivers the projected
         # speedup at production scale.
-        X = _activation_matrix_for_gptq(a, in_features, device=device)
+        row_weights = (
+            row_weights_list[e]
+            if row_weights_list is not None and e < len(row_weights_list)
+            else None
+        )
+        X = _activation_matrix_for_gptq(
+            a,
+            in_features,
+            device=device,
+            clip_threshold=clip_threshold,
+            row_weights=row_weights,
+        )
         H = X.t() @ X
         diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
         H.diagonal().add_(damp * diag_mean)
@@ -113,6 +126,8 @@ def gptq_obs_rounding_nvfp4_batched(
     group_size: int = 16,
     damp: float = 0.01,
     global_real_overrides: torch.Tensor | None = None,
+    clip_threshold: float | None = None,
+    row_weights_list: list[torch.Tensor | None] | None = None,
     expert_chunk: int = 32,
 ) -> torch.Tensor:
     """Batched NVFP4 GPTQ across E same-shape Linears.
@@ -164,7 +179,14 @@ def gptq_obs_rounding_nvfp4_batched(
         # 1. Build H_stack + dead_mask for this E-chunk.
         H_stack, dead_mask = _build_H_stack(
             activations_list[e_start:e_end],
-            in_features, device, damp=damp,
+            in_features,
+            device,
+            damp=damp,
+            clip_threshold=clip_threshold,
+            row_weights_list=(
+                row_weights_list[e_start:e_end]
+                if row_weights_list is not None else None
+            ),
         )
         # Zero out dead weight columns up front (matches per-Linear path).
         W = torch.where(
@@ -283,6 +305,8 @@ def scale_sweep_nvfp4_batched(
     reference_weights: torch.Tensor,
     group_size: int = 16,
     global_real_overrides: torch.Tensor | None = None,
+    clip_threshold: float | None = None,
+    row_weights_list: list[torch.Tensor | None] | None = None,
     grid: int = 32,
     span: tuple[float, float] = (0.5, 1.5),
     expert_chunk: int = 32,
@@ -338,8 +362,20 @@ def scale_sweep_nvfp4_batched(
             # Same v23 device-fix as in the GPTQ path: move X to the
             # target device so the per-column statistics run as CUDA
             # ops rather than on the host.
-            a32 = a.detach().to(device, dtype=torch.float32).reshape(
-                -1, in_features)
+            row_weights = (
+                row_weights_list[e_start + j]
+                if row_weights_list is not None
+                and (e_start + j) < len(row_weights_list)
+                else None
+            )
+            a32 = _activation_matrix_for_gptq(
+                a,
+                in_features,
+                device=device,
+                clip_threshold=clip_threshold,
+                clip_quantile=0.0 if clip_threshold is None else None,
+                row_weights=row_weights,
+            )
             col_imp[j] = a32.pow(2).mean(dim=0).clamp_min(1e-12)
         col_imp_g = col_imp.reshape(Ec, 1, n_g, group_size)  # [Ec, 1, n_g, gs]
 

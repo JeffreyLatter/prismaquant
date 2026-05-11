@@ -71,8 +71,10 @@ damp sweep, scale sweep, FourOverSix, and PrismaClip are recomputed.
 
 For SmoothQuant, the immediate issue was not the selected scale. The isolated
 scale was slightly positive. The broader lesson is that rerendering a full
-cache can introduce unrelated PrismaClip differences unless tiny local gains
-are filtered.
+cache can introduce unrelated PrismaClip differences unless those cache changes
+are held fixed or explicitly attributed. A later 4B run showed that filtering
+tiny local PrismaClip gains with a `0.002` floor removed collectively useful
+clips, so nonzero floors are ablation knobs rather than production defaults.
 
 ### 3. The full stack may already remove the outlier problem
 
