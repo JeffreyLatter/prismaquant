@@ -1458,7 +1458,7 @@ def _solve_nvfp4_activation_clip_groups(
         "prewritten_qnames": [],
         "prewrite_baseline": _env_flag(
             "PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE",
-            True,
+            False,
         ),
         "prewritten_baseline_qnames": [],
         "batched_same_shape": _env_flag(

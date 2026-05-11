@@ -30,10 +30,11 @@ local-MSE wins can be collectively useful, so a nonzero floor is an ablation
 knob rather than a production default. Cache metadata records every threshold
 evaluation so convergence can be audited after the run.
 
-The solver writes the baseline NVFP4 rendering to `ProductionWeightCache` when
-it scores the baseline. If no threshold clears the gain floor, the final cache
-fill reuses that prewritten baseline instead of rendering the same Linear a
-second time.
+The solver can optionally write the baseline NVFP4 rendering to
+`ProductionWeightCache` when it scores the baseline. This is controlled by
+`PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE=1` and is currently off by
+default: .8B validation on 2026-05-11 regressed from KL `0.12600227` with
+prewrite off to `0.21575844` with prewrite on.
 
 Same-shape fused groups can also try the existing batched NVFP4
 GPTQ/scale-sweep path when `PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED=1`. This is
@@ -64,8 +65,9 @@ batched damp selector but still measured `0.060248224` KL versus the scalar
 - Fixed batched damp-sweep evaluation selected 161 qnames and improved to KL
   `0.060248224`, but did not match scalar quality, so
   `PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED` remains opt-in.
-- Baseline prewrite engaged safely in both reruns, with 225 NVFP4 entries
-  prewritten by the solver before final cache fill.
+- Baseline prewrite is not production-safe yet. A .8B isolation rerun showed
+  `0.21575844` KL with prewrite on versus `0.12600227` with prewrite off, so
+  prewrite remains opt-in.
 
 ## Naming
 

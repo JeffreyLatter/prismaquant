@@ -231,6 +231,7 @@ def test_production_cache_act_clip_solver_skips_tiny_configured_gain(monkeypatch
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER", "1")
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN", "0.002")
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE", "1")
 
     cache = fill_production_weight_cache(
         model,
@@ -258,8 +259,38 @@ def test_production_cache_act_clip_solver_skips_tiny_configured_gain(monkeypatch
     )
 
 
+def test_production_cache_act_clip_solver_prewrite_default_off(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+
+    def fake_render_production_weight(weight, fmt, **_kwargs):
+        return weight.detach().to(torch.float32)
+
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER", "1")
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+    monkeypatch.delenv("PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE", raising=False)
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["NVFP4"],
+        levers={"gptq": False, "scale_sweep": False, "act_clip_solver": True},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    meta = cache.metadata["activation_clip_solver"]
+    assert meta["prewrite_baseline"] is False
+    assert meta["prewritten_baseline_qnames"] == []
+
+
 def test_production_cache_act_clip_solver_batches_same_shape_groups(monkeypatch):
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED", "1")
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE", "1")
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
 
     modules = {
