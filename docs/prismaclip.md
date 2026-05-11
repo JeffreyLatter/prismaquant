@@ -63,6 +63,28 @@ The holdout gate was added after that finding. It is not a proof of global KL
 monotonicity, and the first .8B smoke regressed badly, so it remains an opt-in
 diagnostic rather than part of PrismaClip's default acceptance rule.
 
+## PrismaFisherClip
+
+PrismaFisherClip is an experimental scorer for the same PrismaClip threshold
+search. It does not add a new cache, runtime format, or export path. It reuses
+the probe's h-detail `g2_per_token` vectors and scores each threshold as
+Fisher-weighted local output error:
+
+```text
+E_t[ normalized_g2_t * ||X_t @ (W - W_rendered)^T||^2 ]
+```
+
+This targets the observed failure mode where a threshold can have a small
+average local-MSE win while hurting the tokens that matter most to the loss.
+PrismaFisherClip is enabled with `PRISMAFISHERCLIP=1` in `run-pipeline.sh`, or
+with the lower-level `fisher_clip` production-cache lever plus an h-detail
+directory. It forces `act_clip_solver` on and requires h-detail. It does not
+enable Fisher-weighted GPTQ unless `fisher_gptq` / `FISHER_WEIGHTED_GPTQ=1` is
+also set.
+
+Default: off until it beats or matches fixed clipping on both .8B and 4B under
+the same calibration contract.
+
 Same-shape fused groups can also try the existing batched NVFP4
 GPTQ/scale-sweep path when `PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED=1`. This is
 currently opt-in: a 4B validation run on 2026-05-11 improved over the broken

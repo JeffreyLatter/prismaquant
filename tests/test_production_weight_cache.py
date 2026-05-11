@@ -288,6 +288,19 @@ def test_production_cache_act_clip_solver_prewrite_default_off(monkeypatch):
     assert meta["prewritten_baseline_qnames"] == []
 
 
+def test_prismafisherclip_requires_h_detail_dir():
+    model = nn.Linear(1, 1, bias=False)
+    with pytest.raises(ValueError, match="PrismaFisherClip requires h_detail_dir"):
+        fill_production_weight_cache(
+            model,
+            torch.empty((0, 1), dtype=torch.long),
+            qnames=[],
+            formats=["NVFP4"],
+            levers={"gptq": False, "scale_sweep": False, "fisher_clip": True},
+            progress=False,
+        )
+
+
 def test_production_cache_act_clip_solver_holdout_rejects_overfit(monkeypatch):
     import prismaquant.production_weight_cache as pwc
 
@@ -344,6 +357,92 @@ def test_production_cache_act_clip_solver_holdout_rejects_overfit(monkeypatch):
     assert group_meta["selected"] == "baseline"
     assert group_meta["holdout_accepted"] is False
     assert group_meta["eval_trace"][0]["holdout_score"] == pytest.approx(10.0)
+    assert weights == {}
+
+
+def test_activation_output_error_accepts_fisher_row_weights():
+    import prismaquant.production_weight_cache as pwc
+
+    weight = torch.zeros((1, 2), dtype=torch.float32)
+    activations = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+    baseline = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    candidate = torch.tensor([[0.1, 0.8]], dtype=torch.float32)
+
+    assert pwc._activation_output_error(weight, candidate, activations) < (
+        pwc._activation_output_error(weight, baseline, activations)
+    )
+    assert pwc._activation_output_error(
+        weight,
+        candidate,
+        activations,
+        row_weights=torch.tensor([0.1, 10.0]),
+    ) > pwc._activation_output_error(
+        weight,
+        baseline,
+        activations,
+        row_weights=torch.tensor([0.1, 10.0]),
+    )
+
+
+def test_prismafisherclip_vetoes_unweighted_clip_choice(monkeypatch, tmp_path):
+    import prismaquant.production_weight_cache as pwc
+
+    modules = {"a": nn.Linear(2, 1, bias=False)}
+    with torch.no_grad():
+        modules["a"].weight.zero_()
+    activations = {
+        "a": torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ])
+    }
+    weights: dict[tuple[str, str], object] = {}
+    torch.save(
+        {"g2_per_token": torch.tensor([0.1, 10.0], dtype=torch.float32)},
+        tmp_path / "a.pt",
+    )
+    seen_render_weights: list[torch.Tensor | None] = []
+
+    def fake_render_production_weight(
+        weight,
+        fmt,
+        *,
+        act_clip_threshold=None,
+        fisher_row_weights=None,
+        **_kwargs,
+    ):
+        seen_render_weights.append(fisher_row_weights)
+        if act_clip_threshold is None:
+            return torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+        return torch.tensor([[0.1, 0.8]], dtype=torch.float32)
+
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+
+    thresholds, meta = pwc._solve_nvfp4_activation_clip_groups(
+        groups={"a": ["a"]},
+        qname_to_module=modules,
+        activations=activations,
+        levers={"gptq": False, "scale_sweep": False, "fisher_clip": True},
+        joint_globals={},
+        activation_max_abs={"a": 1.0},
+        fisher_rows=pwc._FisherRowWeightCache(tmp_path),
+        weights_out=weights,
+        cache_dir_path=None,
+        progress=False,
+    )
+
+    group_meta = meta["groups"]["a"]
+    assert meta["method"] == "PrismaFisherClip"
+    assert meta["fisher_clip_available"] is True
+    assert meta["fisher_clip_render_weighted"] is False
+    assert thresholds == {"a": None}
+    assert group_meta["selected"] == "baseline"
+    assert group_meta["best_score"] == pytest.approx(group_meta["baseline_score"])
+    assert seen_render_weights and all(value is None for value in seen_render_weights)
     assert weights == {}
 
 

@@ -105,9 +105,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--enable",
         default="gptq,scale_sweep",
         help="Comma-separated levers to enable. Currently honored: "
-        "{gptq, scale_sweep, act_clip_solver, fisher_gptq, awq, smoothquant}.  "
+        "{gptq, scale_sweep, act_clip_solver, fisher_gptq, fisher_clip, "
+        "awq, smoothquant}.  "
         "act_clip_solver is PrismaClip, the production-rendered NVFP4 "
-        "activation clipping solver. "
+        "activation clipping solver. fisher_clip is PrismaFisherClip: it "
+        "uses h-detail per-token Fisher weights to score clip candidates "
+        "without enabling Fisher-weighted GPTQ. "
         "AWQ and SmoothQuant require --render-scope=assignment because the "
         "fold scale is tied to the concrete format assignment.  Joint NVFP4 "
         "sibling globals + calibrated "
@@ -138,7 +141,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional h-detail directory from incremental_probe. When "
         "'fisher_gptq' is enabled, g2_per_token vectors from this directory "
-        "weight NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives.",
+        "weight NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives. "
+        "When 'fisher_clip' is enabled, they weight PrismaClip candidate "
+        "scoring only.",
     )
     p.add_argument(
         "--skip-qnames",

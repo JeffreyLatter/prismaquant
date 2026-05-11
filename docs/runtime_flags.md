@@ -38,6 +38,8 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_ACT_CLIP_SOLVER_TOP_FRACTION` | `1.0` | Restrict PrismaClip threshold search to the highest-baseline-error fraction of eligible fused groups. All groups still get baseline-scored; skipped groups keep baseline behavior. |
 | `PRISMAQUANT_ACT_CLIP_SOLVER_TOP_K` | `0` | Optional hard cap on PrismaClip threshold-solved groups after baseline-error ranking. `0` means no cap. |
 | `PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE` | **off** | Prints per-group PrismaClip decisions while filling the production cache. |
+| `PRISMAQUANT_PRISMAFISHERCLIP` | **off** | Enables **PrismaFisherClip**, an experimental PrismaClip scorer that reuses h-detail `g2_per_token` vectors to Fisher-weight clip candidate acceptance. It requires an h-detail directory and does not enable Fisher-weighted GPTQ unless `fisher_gptq` is also enabled. |
+| `PRISMAQUANT_ACT_CLIP_SOLVER_FISHER` | **off** | Alias for `PRISMAQUANT_PRISMAFISHERCLIP`; kept for explicit activation-clip naming in ad hoc smokes. |
 | `PRISMAQUANT_FISHER_WEIGHTED_GPTQ` | **off** | Enables Fisher/output-weighted local objectives when an h-detail cache is supplied. NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep weight activation rows by normalized `g2_per_token`. |
 | `PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP` | `64` | Caps normalized per-token Fisher weights before re-normalizing, preventing a single calibration token from dominating the local solve. |
 | `PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS` | `0` | Candidate E8M0 exponent shifts for MXFP8 activation-weighted scale search. Nonzero shifts are experimental; .8B and 4B A/Bs on 2026-05-10 regressed KL, so production defaults to RTN-equivalent MXFP8. |
@@ -53,7 +55,8 @@ These are `run-pipeline.sh` environment variables rather than
 | `PRODUCTION_RECACHE` | `1` | Replay calibration with production weights installed and re-fit `activation_max_abs` before export. |
 | `PRODUCTION_CACHE_LEVERS` | `gptq,scale_sweep` | Render-time quality levers for the production cache. `FISHER_WEIGHTED_GPTQ=1` appends `fisher_gptq`; `PRISMAQUANT_ACT_CLIP_SOLVER=1` enables PrismaClip through the cache code. |
 | `FISHER_WEIGHTED_GPTQ` | `0` | Pipeline switch that writes h-detail during probe, passes it into production cache fill, and uses a distinct `_fisher` cache path. |
-| `H_DETAIL_DIR` | `$WORK_DIR/h_detail` | h-detail directory used when `FISHER_WEIGHTED_GPTQ=1`. |
+| `PRISMAFISHERCLIP` | `0` | Pipeline switch that writes h-detail during probe, enables `act_clip_solver,fisher_clip`, and tags the production cache with `_fisherclip`. This scores clip thresholds with Fisher weights but leaves Fisher-weighted GPTQ off unless `FISHER_WEIGHTED_GPTQ=1`. |
+| `H_DETAIL_DIR` | `$WORK_DIR/h_detail` | h-detail directory used when `FISHER_WEIGHTED_GPTQ=1` or `PRISMAFISHERCLIP=1`. |
 | `PRODUCTION_CACHE_LRU_GB` | `64.0` | Resident tensor budget for disk-backed production-cache use in recache and export. The 27B n=8 recache smoke needed `45.32 GiB` for the selected assignment. |
 | `PRODUCTION_CACHE_PREFETCH` | `require` | Standalone recache prefetch policy. `require` fails fast when assignment-required weights cannot fit resident, preventing silent NVMe-bound replay. |
 | `PRODUCTION_CACHE_PREFETCH_WORKERS` | `4` | Thread count for eager production-cache prefetch. |

@@ -19,6 +19,8 @@ quantization path:
       to the artifact)
     * optional PrismaClip explicit activation-clipping solver for NVFP4 render-time
       GPTQ + scale_sweep inputs
+    * optional PrismaFisherClip candidate scoring, which reuses h-detail
+      per-token Fisher weights to accept/reject PrismaClip thresholds
     * optional Fisher-weighted local objectives from h-detail
     * opt-in activation-weighted MXFP8 E8M0 scale search when nonzero
       PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS are configured
@@ -827,6 +829,7 @@ def _activation_output_error(
     rendered: torch.Tensor,
     activations: torch.Tensor,
     *,
+    row_weights: torch.Tensor | None = None,
     row_chunk: int = 128,
 ) -> float:
     """Score ``rendered`` by output MSE on original, unclipped activations."""
@@ -839,12 +842,48 @@ def _activation_output_error(
         - rendered.detach().to(device=device, dtype=torch.float32)
     ).t().contiguous()
     X = activations.detach().to(device=device, dtype=torch.float32).reshape(-1, cols)
-    total = 0.0
+    rw = None
+    if row_weights is not None and X.numel() > 0:
+        rw = _normalize_prismafisherclip_row_weights(
+            row_weights,
+            X.shape[0],
+            device,
+        )
+    total = torch.zeros((), dtype=torch.float32, device=device)
     with torch.no_grad():
         for start in range(0, X.shape[0], row_chunk):
             y = X[start:start + row_chunk] @ diff_t
-            total += float(y.pow(2).sum().item())
-    return total / max(1, int(X.shape[0]) * int(rows))
+            err = y.pow(2)
+            if rw is not None:
+                err = err * rw[start:start + err.shape[0]].unsqueeze(1)
+            total = total + err.sum()
+    return float(total.item()) / max(1, int(X.shape[0]) * int(rows))
+
+
+def _normalize_prismafisherclip_row_weights(
+    row_weights: torch.Tensor | None,
+    n_rows: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if row_weights is None or n_rows <= 0:
+        return None
+    try:
+        rw = row_weights.detach().reshape(-1).to(device=device, dtype=torch.float32)
+    except Exception:
+        return None
+    if rw.numel() < n_rows:
+        return None
+    rw = torch.nan_to_num(rw[:n_rows], nan=0.0, posinf=0.0, neginf=0.0)
+    rw = rw.clamp_min(0.0)
+    rw = rw / rw.mean().clamp_min(1e-12)
+    try:
+        clip = float(os.environ.get("PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP", "64"))
+    except Exception:
+        clip = 64.0
+    if clip > 0.0:
+        rw = rw.clamp_max(float(clip))
+        rw = rw / rw.mean().clamp_min(1e-12)
+    return rw
 
 
 def _prismaclip_activation_split(
@@ -872,6 +911,34 @@ def _prismaclip_activation_split(
     if not bool(mask.any()):
         return activations
     return X[mask]
+
+
+def _prismaclip_row_weight_split(
+    row_weights: torch.Tensor | None,
+    activations: torch.Tensor,
+    *,
+    split: str,
+    holdout_stride: int,
+    holdout_offset: int,
+) -> torch.Tensor | None:
+    if row_weights is None or split == "all" or holdout_stride <= 1:
+        return row_weights
+    cols = int(activations.shape[-1])
+    n_rows = int(activations.detach().reshape(-1, cols).shape[0])
+    rw = row_weights.detach().reshape(-1)
+    if rw.numel() < n_rows or n_rows < 2:
+        return row_weights
+    row_ids = torch.arange(n_rows, device=rw.device)
+    holdout = (row_ids % holdout_stride) == (holdout_offset % holdout_stride)
+    if split == "train":
+        mask = ~holdout
+    elif split == "holdout":
+        mask = holdout
+    else:
+        raise ValueError(f"unknown PrismaClip activation split: {split}")
+    if not bool(mask.any()):
+        return row_weights
+    return rw[:n_rows][mask]
 
 
 _AWQ_CACHE_FORMATS = frozenset({"NVFP4", "MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
@@ -1492,13 +1559,21 @@ def _solve_nvfp4_activation_clip_groups(
     )
     if holdout_stride <= 1:
         holdout_enabled = False
+    fisher_clip_enabled = bool(levers.get("fisher_clip", False))
+    fisher_render_enabled = bool(levers.get("fisher_gptq", False))
+    fisher_clip_available = bool(fisher_clip_enabled and fisher_rows is not None)
     verbose = _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE", False)
     threshold_by_qname: dict[str, float | None] = {}
+    method_name = "PrismaFisherClip" if fisher_clip_available else "PrismaClip"
     metadata: dict[str, object] = {
         "enabled": True,
-        "method": "PrismaClip",
+        "method": method_name,
         "format": "NVFP4",
         "objective": (
+            "fisher_weighted_output_mse_original_activations_holdout_veto"
+            if fisher_clip_available and holdout_enabled else
+            "fisher_weighted_output_mse_original_activations"
+            if fisher_clip_available else
             "output_mse_original_activations_holdout_veto"
             if holdout_enabled else
             "output_mse_original_activations"
@@ -1508,6 +1583,9 @@ def _solve_nvfp4_activation_clip_groups(
         "min_gain": float(min_gain),
         "top_fraction": float(top_fraction),
         "top_k": int(top_k),
+        "fisher_clip_enabled": bool(fisher_clip_enabled),
+        "fisher_clip_available": bool(fisher_clip_available),
+        "fisher_clip_render_weighted": bool(fisher_render_enabled),
         "holdout_enabled": bool(holdout_enabled),
         "holdout_fraction": float(holdout_fraction if holdout_enabled else 0.0),
         "holdout_stride": int(holdout_stride),
@@ -1547,7 +1625,9 @@ def _solve_nvfp4_activation_clip_groups(
             input_global_scale=export_scale,
             act_clip_threshold=threshold,
             fisher_row_weights=(
-                fisher_rows.get(qname) if fisher_rows is not None else None
+                fisher_rows.get(qname)
+                if fisher_render_enabled and fisher_rows is not None
+                else None
             ),
             awq_scale=(awq_scales or {}).get(qname),
         )
@@ -1613,7 +1693,11 @@ def _solve_nvfp4_activation_clip_groups(
             for qname in members
         ]
         row_weights_list = [
-            fisher_rows.get(qname) if fisher_rows is not None else None
+            (
+                fisher_rows.get(qname)
+                if fisher_render_enabled and fisher_rows is not None
+                else None
+            )
             for qname in members
         ]
         row_weights_list = [
@@ -1741,8 +1825,20 @@ def _solve_nvfp4_activation_clip_groups(
             )
             rendered = {qname: render_member(qname, threshold) for qname in members}
         for qname, w_dq in rendered.items():
+            score_row_weights = (
+                fisher_rows.get(qname)
+                if fisher_clip_available and fisher_rows is not None
+                else None
+            )
             for split in score_splits:
                 split_activations = _prismaclip_activation_split(
+                    activations[qname],
+                    split=split,
+                    holdout_stride=holdout_stride,
+                    holdout_offset=0,
+                )
+                split_row_weights = _prismaclip_row_weight_split(
+                    score_row_weights,
                     activations[qname],
                     split=split,
                     holdout_stride=holdout_stride,
@@ -1752,6 +1848,7 @@ def _solve_nvfp4_activation_clip_groups(
                     qname_to_module[qname].weight.data,
                     w_dq,
                     split_activations,
+                    row_weights=split_row_weights,
                 )
             if kept is not None:
                 kept[qname] = w_dq
@@ -2225,7 +2322,10 @@ def fill_production_weight_cache(
         needs the actual export assignment.
       h_detail_dir: optional probe h-detail directory. When `fisher_gptq` is
         enabled, per-token `g2_per_token` vectors from this directory weight
-        NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives.
+        NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives. When
+        `fisher_clip` is enabled, the same vectors weight PrismaClip candidate
+        scoring without changing the render objective unless `fisher_gptq` is
+        also enabled.
     """
     if recache_pass and not recache_assignment:
         raise ValueError(
@@ -2251,6 +2351,18 @@ def fill_production_weight_cache(
         "fisher_gptq",
         _env_flag("PRISMAQUANT_FISHER_WEIGHTED_GPTQ", False),
     )
+    levers.setdefault(
+        "fisher_clip",
+        _env_flag("PRISMAQUANT_PRISMAFISHERCLIP", False)
+        or _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER_FISHER", False),
+    )
+    if bool(levers.get("fisher_clip", False)):
+        levers["act_clip_solver"] = True
+        if not h_detail_dir:
+            raise ValueError(
+                "fisher_clip/PrismaFisherClip requires h_detail_dir with "
+                "per-token g2_per_token weights"
+            )
     from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
     levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
     if bool(levers.get("awq", False)) and bool(levers.get("smoothquant", False)):
@@ -2480,19 +2592,26 @@ def fill_production_weight_cache(
 
     fisher_rows = (
         _FisherRowWeightCache(h_detail_dir)
-        if bool(levers.get("fisher_gptq", False)) and h_detail_dir
+        if (
+            (bool(levers.get("fisher_gptq", False))
+             or bool(levers.get("fisher_clip", False)))
+            and h_detail_dir
+        )
         else None
     )
-    if progress and bool(levers.get("fisher_gptq", False)):
+    if progress and (
+        bool(levers.get("fisher_gptq", False))
+        or bool(levers.get("fisher_clip", False))
+    ):
         if fisher_rows is None:
             print(
-                "[prod-cache] fisher_gptq requested but no h_detail_dir "
+                "[prod-cache] Fisher weighting requested but no h_detail_dir "
                 "was provided; falling back to unweighted objectives",
                 flush=True,
             )
         else:
             print(
-                f"[prod-cache] fisher_gptq using h-detail dir "
+                f"[prod-cache] Fisher weighting using h-detail dir "
                 f"{fisher_rows.detail_dir}",
                 flush=True,
             )
@@ -2786,7 +2905,10 @@ def fill_production_weight_cache(
                         if fmt.upper() == "NVFP4" else None
                     ),
                     fisher_row_weights=(
-                        fisher_rows.get(qname) if fisher_rows is not None else None
+                        fisher_rows.get(qname)
+                        if bool(levers.get("fisher_gptq", False))
+                        and fisher_rows is not None
+                        else None
                     ),
                     awq_scale=(
                         awq_scales.get(qname)
@@ -2850,8 +2972,34 @@ def fill_production_weight_cache(
             "fisher_weighted_gptq": {
                 "enabled": bool(levers.get("fisher_gptq", False)),
                 "h_detail_dir": str(h_detail_dir) if h_detail_dir else None,
-                "loaded": int(fisher_rows.loads) if fisher_rows is not None else 0,
-                "misses": int(fisher_rows.misses) if fisher_rows is not None else 0,
+                "loaded": (
+                    int(fisher_rows.loads)
+                    if fisher_rows is not None
+                    and bool(levers.get("fisher_gptq", False))
+                    else 0
+                ),
+                "misses": (
+                    int(fisher_rows.misses)
+                    if fisher_rows is not None
+                    and bool(levers.get("fisher_gptq", False))
+                    else 0
+                ),
+            },
+            "prismafisherclip": {
+                "enabled": bool(levers.get("fisher_clip", False)),
+                "h_detail_dir": str(h_detail_dir) if h_detail_dir else None,
+                "loaded": (
+                    int(fisher_rows.loads)
+                    if fisher_rows is not None
+                    and bool(levers.get("fisher_clip", False))
+                    else 0
+                ),
+                "misses": (
+                    int(fisher_rows.misses)
+                    if fisher_rows is not None
+                    and bool(levers.get("fisher_clip", False))
+                    else 0
+                ),
             },
             "render_scope": render_scope,
             "requested_formats": list(requested_formats),

@@ -115,6 +115,7 @@ PY
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
 : "${PRODUCTION_CACHE_LEVERS:=gptq,scale_sweep}"
 : "${FISHER_WEIGHTED_GPTQ:=0}"
+: "${PRISMAFISHERCLIP:=0}"
 : "${AWQ:=0}"
 : "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 : "${HALO_MODE:=off}"
@@ -133,6 +134,23 @@ case "$FISHER_WEIGHTED_GPTQ" in
     case ",$PRODUCTION_CACHE_LEVERS," in
       *,fisher_gptq,*) ;;
       *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},fisher_gptq" ;;
+    esac
+    ;;
+esac
+case "$PRISMAFISHERCLIP" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    PROBE_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
+    PROD_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
+    export PRISMAQUANT_PRISMAFISHERCLIP=1
+    export PRISMAQUANT_ACT_CLIP_SOLVER=1
+    case ",$PRODUCTION_CACHE_LEVERS," in
+      *,act_clip_solver,*) ;;
+      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},act_clip_solver" ;;
+    esac
+    case ",$PRODUCTION_CACHE_LEVERS," in
+      *,fisher_clip,*) ;;
+      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},fisher_clip" ;;
     esac
     ;;
 esac
@@ -163,7 +181,7 @@ echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
 echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
 echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
-echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ AWQ=$AWQ H_DETAIL_DIR=$H_DETAIL_DIR"
+echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ PRISMAFISHERCLIP=$PRISMAFISHERCLIP AWQ=$AWQ H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
 echo
@@ -231,7 +249,7 @@ except Exception as e:
     exit 2
   fi
   if [[ "${#PROBE_H_DETAIL_ARGS[@]}" -gt 0 && ! -d "$H_DETAIL_DIR" ]]; then
-    echo "[pipeline] [1/4] ABORT: FISHER_WEIGHTED_GPTQ=1 but"
+    echo "[pipeline] [1/4] ABORT: Fisher h-detail was requested but"
     echo "             h-detail dir is missing: $H_DETAIL_DIR"
     echo "             Delete ${PROBE_PATH} to regenerate probe+h-detail."
     exit 2
@@ -308,6 +326,10 @@ if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTI
   case "${PRISMAQUANT_ACT_CLIP_SOLVER:-0}" in
     0|false|False|FALSE|no|No|NO|"") ;;
     *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_clip" ;;
+  esac
+  case "$PRISMAFISHERCLIP" in
+    0|false|False|FALSE|no|No|NO|"") ;;
+    *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_fisherclip" ;;
   esac
   case ",$PRODUCTION_CACHE_LEVERS," in
     *,awq,*) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_awq" ;;

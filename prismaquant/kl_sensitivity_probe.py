@@ -276,6 +276,15 @@ def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
         os.environ.get("PRISMAQUANT_FISHER_WEIGHTED_GPTQ", "0").strip().lower()
         not in {"", "0", "false", "no", "off"},
     )
+    levers.setdefault(
+        "fisher_clip",
+        os.environ.get("PRISMAQUANT_PRISMAFISHERCLIP", "0").strip().lower()
+        not in {"", "0", "false", "no", "off"}
+        or os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER_FISHER", "0").strip().lower()
+        not in {"", "0", "false", "no", "off"},
+    )
+    if bool(levers.get("fisher_clip", False)):
+        levers["act_clip_solver"] = True
     from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
     levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
     return dict(sorted(levers.items()))
@@ -3348,7 +3357,9 @@ def build_parser() -> argparse.ArgumentParser:
             "builds. Default: gptq,scale_sweep; add act_clip_solver to "
             "enable PrismaClip, the explicit NVFP4 render-time activation "
             "clamp solver, and "
-            "fisher_gptq to use h-detail per-token weights when available. "
+            "fisher_gptq to use h-detail per-token weights in render "
+            "objectives, or fisher_clip to use the same weights only for "
+            "PrismaClip candidate scoring. "
             "GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
             "recorded in cache metadata. NVFP4 block scaling follows "
             "PRISMAQUANT_NVFP4_SCALE_RULE."
@@ -3368,7 +3379,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional h-detail directory for on-the-fly production cache "
-            "builds. Used only when fisher_gptq is enabled."
+            "builds. Used when fisher_gptq or fisher_clip is enabled."
         ),
     )
     parser.add_argument(
