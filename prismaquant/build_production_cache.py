@@ -105,7 +105,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "into render_production_weight (v2 work); passing 'awq' silently "
         "has no effect.  Joint NVFP4 sibling globals + calibrated "
         "input_global_scale are computed unconditionally when NVFP4 is in "
-        "the format menu.",
+        "the format menu. NVFP4 block scaling follows "
+        "PRISMAQUANT_NVFP4_SCALE_RULE.",
     )
     p.add_argument(
         "--allow-incomplete",

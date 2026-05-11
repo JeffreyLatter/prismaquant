@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 import torch
+import prismaquant.export_native_compressed as enc
 
 from prismaquant.allocator import promote_fused
 from prismaquant.export_native_compressed import (
@@ -34,6 +35,7 @@ from prismaquant.export_native_compressed import (
     validate_mtp_assignment_coverage,
     build_quantization_config,
     canonicalize_format,
+    compute_nvfp4_global_real,
     pack_fp4_indices,
     quantize_dequantize_fp8_dynamic,
     quantize_dequantize_fp8_dynamic_packed,
@@ -315,6 +317,53 @@ class TestRoundTrip(unittest.TestCase):
             W.abs().max().item(),
             places=3,
         )
+
+    def test_nvfp4_four_over_six_picks_lower_mse_block_scale(self):
+        W = torch.tensor(
+            [[10.0, 20.0, 30.0, 40.0] * 4],
+            dtype=torch.float32,
+        )
+        prev = enc._NVFP4_SCALE_RULE
+        try:
+            enc._NVFP4_SCALE_RULE = "static_6"
+            wp6, ws6, wg6 = quantize_dequantize_nvfp4(W)
+            dq6 = _nvfp4_dequantize(wp6, ws6, wg6)
+            mse6 = (W - dq6).pow(2).mean().item()
+
+            enc._NVFP4_SCALE_RULE = "four_over_six_mse"
+            wp4, ws4, wg4 = quantize_dequantize_nvfp4(W)
+            dq4 = _nvfp4_dequantize(wp4, ws4, wg4)
+            mse4 = (W - dq4).pow(2).mean().item()
+        finally:
+            enc._NVFP4_SCALE_RULE = prev
+
+        self.assertLess(mse4, mse6)
+        self.assertLess(mse4, 1e-5)
+        self.assertAlmostEqual(
+            ws4.float()[0, 0].item() / wg4.item(),
+            10.0,
+            places=4,
+        )
+
+    def test_nvfp4_four_over_six_global_real_matches_chosen_scales(self):
+        W = torch.tensor(
+            [
+                [10.0, 20.0, 30.0, 40.0] * 4,
+                [1.0, 2.0, 3.0, 6.0] * 4,
+            ],
+            dtype=torch.float32,
+        )
+        prev = enc._NVFP4_SCALE_RULE
+        try:
+            enc._NVFP4_SCALE_RULE = "static_6"
+            g6 = compute_nvfp4_global_real(W).item()
+            enc._NVFP4_SCALE_RULE = "four_over_six_mse"
+            g4 = compute_nvfp4_global_real(W).item()
+        finally:
+            enc._NVFP4_SCALE_RULE = prev
+
+        self.assertGreater(g4, g6)
+        self.assertAlmostEqual(g4 / g6, 1.5, places=4)
 
     def test_nvfp4_packed_per_expert_global_scale(self):
         # Each expert's global_scale is independent.

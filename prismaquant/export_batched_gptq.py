@@ -32,6 +32,7 @@ from .export_native_compressed import (
     _activation_matrix_for_gptq,
     _nvfp4_codebook,
     _round_to_codebook,
+    _select_nvfp4_group_scales,
     NVFP4_MAX,
     FP8_E4M3_MAX,
 )
@@ -217,8 +218,7 @@ def gptq_obs_rounding_nvfp4_batched(
             grouped_full = W.reshape(
                 Ec, out_features, in_features // group_size, group_size,
             )
-            max_abs_full = grouped_full.abs().amax(dim=-1).clamp_min(1e-12)
-            s_g_real_full = max_abs_full / NVFP4_MAX
+            s_g_real_full = _select_nvfp4_group_scales(grouped_full)
             global_real = (
                 s_g_real_full.reshape(Ec, -1).amax(dim=-1) / FP8_E4M3_MAX
             ).clamp_min(1e-12)  # [Ec]
@@ -234,8 +234,7 @@ def gptq_obs_rounding_nvfp4_batched(
             block = W[:, :, block_start:block_end]      # [Ec, out, gs]
 
             # Per-Linear per-row max within the block → scale.
-            block_max = block.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
-            s_g_real = block_max / NVFP4_MAX            # [Ec, out, 1]
+            s_g_real = _select_nvfp4_group_scales(block).unsqueeze(-1)
             fp8_scale_real = (s_g_real / global_real_b).clamp(0, FP8_E4M3_MAX)
             eff_scale = (fp8_scale_real * global_real_b).clamp_min(1e-12)
             in_grid = (block / eff_scale).clamp(-NVFP4_MAX, NVFP4_MAX)
@@ -346,8 +345,7 @@ def scale_sweep_nvfp4_batched(
 
         ref_g = W_ref.reshape(Ec, out_features, n_g, group_size)
         in_g = W_in.reshape(Ec, out_features, n_g, group_size)
-        max_abs = ref_g.abs().amax(dim=-1).clamp_min(1e-12)  # [Ec, out, n_g]
-        s_g_real = max_abs / NVFP4_MAX
+        s_g_real = _select_nvfp4_group_scales(ref_g)
         if global_real_overrides is not None:
             global_real = global_real_overrides[e_start:e_end].to(
                 device, dtype=torch.float32).clamp_min(1e-12)

@@ -126,6 +126,22 @@ def test_production_cache_records_damp_sweep_lever(monkeypatch):
     )["gptq_damp_sweep"] is True
 
 
+def test_production_cache_records_nvfp4_scale_rule(monkeypatch):
+    model = nn.Linear(1, 1, bias=False)
+    calib_ids = torch.empty((0, 1), dtype=torch.long)
+
+    monkeypatch.setenv("PRISMAQUANT_NVFP4_SCALE_RULE", "four_over_six_mse")
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=[],
+        levers={"gptq": False, "scale_sweep": False},
+        progress=False,
+    )
+
+    assert cache.levers["nvfp4_scale_rule"] == "four_over_six_mse"
+
+
 def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
     import prismaquant.production_weight_cache as pwc
 
@@ -166,8 +182,21 @@ def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
 
     meta = cache.metadata["activation_clip_solver"]
     selected = meta["selected_by_qname"]["l1"]
+    group_meta = next(iter(meta["groups"].values()))
     assert meta["status"] == "applied"
     assert selected is not None
+    assert group_meta["selected"] == "solved"
+    assert group_meta["selected_eval_index"] is not None
+    assert 1 <= group_meta["selected_eval_index"] <= group_meta["n_evals"]
+    assert len(group_meta["eval_trace"]) == group_meta["n_evals"]
+    assert group_meta["eval_trace"]
+    assert all(
+        later["best_score"] <= earlier["best_score"]
+        for earlier, later in zip(
+            group_meta["eval_trace"],
+            group_meta["eval_trace"][1:],
+        )
+    )
     assert any(value is None for value in calls)
     assert any(value is not None for value in calls)
     assert torch.allclose(

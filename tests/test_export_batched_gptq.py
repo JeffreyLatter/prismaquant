@@ -12,6 +12,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import prismaquant.export_native_compressed as enc
 from prismaquant.export_native_compressed import (
     _gptq_obs_rounding_nvfp4,
     _scale_sweep_nvfp4,
@@ -144,6 +145,45 @@ def test_scale_sweep_batched_with_overrides(seeded):
         expert_chunk=2,
     )
     assert torch.allclose(per_stack, batch_out, atol=1e-4, rtol=1e-3)
+
+
+def test_batched_paths_match_per_linear_with_four_over_six(seeded):
+    E, out_features, in_features = 3, 24, 48
+    weights, activations_list = _make_inputs(E, out_features, in_features, T=96)
+    reference_weights = weights.clone()
+
+    prev = enc._NVFP4_SCALE_RULE
+    try:
+        enc._NVFP4_SCALE_RULE = "four_over_six_mse"
+        per_gptq = torch.stack([
+            _gptq_obs_rounding_nvfp4(
+                weights[e], activations_list[e], group_size=16,
+            )
+            for e in range(E)
+        ], dim=0)
+        batch_gptq = gptq_obs_rounding_nvfp4_batched(
+            weights, activations_list, group_size=16, expert_chunk=2,
+        )
+
+        per_sweep = torch.stack([
+            _scale_sweep_nvfp4(
+                weights[e], activations_list[e],
+                reference_weight=reference_weights[e],
+                group_size=16,
+            )
+            for e in range(E)
+        ], dim=0)
+        batch_sweep = scale_sweep_nvfp4_batched(
+            weights, activations_list,
+            reference_weights=reference_weights,
+            group_size=16,
+            expert_chunk=2,
+        )
+    finally:
+        enc._NVFP4_SCALE_RULE = prev
+
+    assert torch.allclose(per_gptq, batch_gptq, atol=1e-4, rtol=1e-3)
+    assert torch.allclose(per_sweep, batch_sweep, atol=1e-4, rtol=1e-3)
 
 
 def test_gptq_batched_realistic_moe_shape(seeded):

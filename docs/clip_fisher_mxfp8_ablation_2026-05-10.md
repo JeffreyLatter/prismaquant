@@ -66,6 +66,69 @@ production-cache metadata confirmed `232` loaded and `0` misses.
 - Do not compose these with HALO yet. The next production-facing candidate is
   the activation clipper, measured on 27B with the same validation contract.
 
+## FourOverSix Additivity Smoke
+
+Run root:
+`/home/rob/dq-runs/fouroversix-smoke-20260510T225344Z`
+
+FourOverSix was tested as an NVFP4 block-scale rule, not a new runtime
+format. `PRISMAQUANT_NVFP4_SCALE_RULE=four_over_six_mse` tries max-to-6
+and max-to-4 per 16-weight block and keeps the lower block-MSE scale while
+preserving the same compressed-tensors NVFP4 schema and vLLM kernel.
+
+Settings were assignment-scoped production-cache renders, required resident
+prefetch for KL, rotations disabled, Fisher disabled, MXFP8 exponent shifts
+disabled, GPTQ + damp sweep + scale_sweep enabled. Clip arms used
+`PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS=6` over all eligible fused groups.
+
+### 0.8B FourOverSix
+
+Run root:
+`/home/rob/dq-runs/fouroversix-smoke-20260510T225344Z/qwen35-0p8b`
+
+Settings: `nsamples=32`, `seqlen=1024`, measured at `5.080835` bpp.
+Assignment counts were constant across arms: `146 NVFP4`, `4 MXFP8`,
+`94 BF16`.
+
+| Arm | KL | Relative to static |
+|---|---:|---:|
+| static | 0.204225378 | - |
+| FourOverSix | 0.212856986 | +4.23% worse |
+| clip solver | 0.227983240 | +11.63% worse |
+| FourOverSix + clip solver | 0.149187058 | -26.95% better |
+
+Clip metadata: static+clip accepted thresholds for `64/94` fused groups
+(`103` qnames). FourOverSix+clip accepted `68/94` fused groups (`111`
+qnames). The `.8B` signal is noisy for individual levers but strongly favors
+the composition.
+
+### 4B FourOverSix
+
+Run root:
+`/home/rob/dq-runs/fouroversix-smoke-20260510T225344Z/qwen3-4b`
+
+Settings: `nsamples=16`, `seqlen=1024`, measured at `4.999639` bpp.
+Assignment counts were constant across arms: `225 NVFP4`, `7 MXFP8`,
+`20 BF16`.
+
+| Arm | KL | Relative to static |
+|---|---:|---:|
+| static | 0.158064165 | - |
+| FourOverSix | 0.069056227 | -56.31% better |
+| clip solver | 0.065697306 | -58.44% better |
+| FourOverSix + clip solver | 0.056417932 | -64.31% better |
+
+The 4B composition improved `18.30%` over FourOverSix alone and `14.12%`
+over clipping alone. Clip metadata: static+clip accepted thresholds for
+`87/133` fused groups (`164` qnames). FourOverSix+clip accepted `79/133`
+fused groups (`157` qnames), so FourOverSix reduced the number of selected
+clip groups while still improving the combined KL.
+
+Decision: keep FourOverSix opt-in, but promote it to the same candidate tier
+as the clip solver. The next production-facing measurement should test
+`four_over_six_mse + act_clip_solver` on 27B before HALO/rotation work
+resumes.
+
 ## BF16 / FP8 Audit
 
 The 2026-05-10 current-recipe smokes validated dense `FP8_E4M3` in vLLM eager

@@ -255,7 +255,7 @@ def _parse_levers(value: str | None) -> dict[str, bool]:
     return {name: True for name in enabled}
 
 
-def _normalized_production_cache_levers(value: str | None) -> dict[str, bool]:
+def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
     levers = _parse_levers(value)
     levers.setdefault("gptq", True)
     levers.setdefault(
@@ -276,6 +276,8 @@ def _normalized_production_cache_levers(value: str | None) -> dict[str, bool]:
         os.environ.get("PRISMAQUANT_FISHER_WEIGHTED_GPTQ", "0").strip().lower()
         not in {"", "0", "false", "no", "off"},
     )
+    from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
+    levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
     return dict(sorted(levers.items()))
 
 
@@ -3345,7 +3347,8 @@ def build_parser() -> argparse.ArgumentParser:
             "solve explicit NVFP4 render-time activation clamps and "
             "fisher_gptq to use h-detail per-token weights when available. "
             "GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
-            "recorded in cache metadata."
+            "recorded in cache metadata. NVFP4 block scaling follows "
+            "PRISMAQUANT_NVFP4_SCALE_RULE."
         ),
     )
     parser.add_argument(

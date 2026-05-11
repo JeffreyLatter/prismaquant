@@ -94,6 +94,22 @@ from .schemas import validate_layer_config_payload, validate_prune_manifest_payl
 FLOAT_TO_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 NVFP4_MAX = 6.0     # max(|FLOAT_TO_E2M1|)
 FP8_E4M3_MAX = 448.0  # max representable in torch.float8_e4m3fn
+NVFP4_SCALE_RULE_ENV = "PRISMAQUANT_NVFP4_SCALE_RULE"
+NVFP4_SCALE_RULE_STATIC_6 = "static_6"
+NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE = "four_over_six_mse"
+_NVFP4_SCALE_RULE_ALIASES = {
+    "": NVFP4_SCALE_RULE_STATIC_6,
+    "default": NVFP4_SCALE_RULE_STATIC_6,
+    "static": NVFP4_SCALE_RULE_STATIC_6,
+    "static_6": NVFP4_SCALE_RULE_STATIC_6,
+    "six": NVFP4_SCALE_RULE_STATIC_6,
+    "6": NVFP4_SCALE_RULE_STATIC_6,
+    "4/6": NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+    "4over6": NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+    "four_over_six": NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+    "four_over_six_mse": NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+    "mse": NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+}
 
 # Back-compat exports for unit tests that validate the Qwen3.5 naming
 # and per-expert catch-all contract via the historical helper symbols.
@@ -127,6 +143,86 @@ def _to_vllm_internal_name(checkpoint_name: str) -> str:
 
 def _nvfp4_codebook(device, dtype=torch.float32) -> torch.Tensor:
     return torch.tensor(FLOAT_TO_E2M1, device=device, dtype=dtype)
+
+
+def resolve_nvfp4_scale_rule(raw: str | None = None) -> str:
+    """Canonicalize the NVFP4 block-scale rule.
+
+    ``static_6`` is the compressed-tensors/llm-compressor default: every
+    16-value block maps its maximum magnitude to FP4 code ±6.  FourOverSix
+    evaluates max-to-6 and max-to-4 and keeps the lower block-MSE scale while
+    preserving the same NVFP4 on-disk schema and vLLM runtime kernel.
+    """
+    if raw is None:
+        raw = os.environ.get(NVFP4_SCALE_RULE_ENV, NVFP4_SCALE_RULE_STATIC_6)
+    key = str(raw).strip().lower().replace("-", "_")
+    try:
+        return _NVFP4_SCALE_RULE_ALIASES[key]
+    except KeyError as exc:
+        allowed = ", ".join(
+            sorted({NVFP4_SCALE_RULE_STATIC_6, NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE})
+        )
+        raise ValueError(
+            f"unsupported {NVFP4_SCALE_RULE_ENV}={raw!r}; "
+            f"expected one of: {allowed}"
+        ) from exc
+
+
+def _nvfp4_scale_rule_from_env() -> str:
+    override = globals().get("_NVFP4_SCALE_RULE", None)
+    if override is not None:
+        return resolve_nvfp4_scale_rule(str(override))
+    return resolve_nvfp4_scale_rule()
+
+
+def _decode_nvfp4_indices(
+    fp4_idx: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    cb = _nvfp4_codebook(fp4_idx.device, dtype=torch.float32)
+    abs_idx = fp4_idx & 0x7
+    sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
+    return sign * cb[abs_idx] * scale.unsqueeze(-1)
+
+
+def _nvfp4_mse_for_group_scale(
+    grouped: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    in_grid = (grouped / scale.unsqueeze(-1).clamp_min(1e-12)).clamp(
+        -NVFP4_MAX, NVFP4_MAX,
+    )
+    fp4_idx = _round_to_codebook(in_grid)
+    dq = _decode_nvfp4_indices(fp4_idx, scale)
+    return (grouped - dq).pow(2).sum(dim=-1)
+
+
+def _select_nvfp4_group_scales(
+    grouped: torch.Tensor,
+    *,
+    scale_rule: str | None = None,
+) -> torch.Tensor:
+    """Return per-block real NVFP4 scales for ``grouped[..., group_size]``.
+
+    The returned tensor has shape ``grouped.shape[:-1]``.  This function is
+    the single scale-selection point used by RTN, GPTQ block quantization,
+    scale-sweep initialization, packed experts, and final export packing.
+    """
+    rule = (
+        _nvfp4_scale_rule_from_env()
+        if scale_rule is None
+        else resolve_nvfp4_scale_rule(scale_rule)
+    )
+    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
+    scale_6 = max_abs / NVFP4_MAX
+    if rule == NVFP4_SCALE_RULE_STATIC_6:
+        return scale_6
+    if rule == NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE:
+        scale_4 = max_abs / 4.0
+        mse_6 = _nvfp4_mse_for_group_scale(grouped, scale_6)
+        mse_4 = _nvfp4_mse_for_group_scale(grouped, scale_4)
+        return torch.where(mse_4 < mse_6, scale_4, scale_6)
+    raise AssertionError(f"unhandled NVFP4 scale rule: {rule!r}")
 
 
 def _round_to_codebook(values_in_grid: torch.Tensor) -> torch.Tensor:
@@ -801,6 +897,7 @@ _ACT_AWARE_FLAGS: dict[str, bool] = {
     "awq_round": False,
     "scale_sweep": False,
 }
+_NVFP4_SCALE_RULE: str | None = None
 _PRODUCTION_WEIGHT_CACHE = None
 _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
@@ -1315,8 +1412,7 @@ def _gptq_obs_rounding_nvfp4(
         global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
     else:
         grouped_full = W.reshape(rows, cols // group_size, group_size)
-        max_abs_full = grouped_full.abs().amax(dim=-1).clamp_min(1e-12)
-        s_g_real_full = max_abs_full / NVFP4_MAX
+        s_g_real_full = _select_nvfp4_group_scales(grouped_full)
         global_real = (s_g_real_full.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
 
     cb = _nvfp4_codebook(W.device, dtype=torch.float32)   # [8] abs values
@@ -1329,8 +1425,7 @@ def _gptq_obs_rounding_nvfp4(
 
         # Per-block RTN to NVFP4: per-row max within this block gives
         # the per-group scale (matching quantize_dequantize_nvfp4).
-        block_max = block.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
-        s_g_real = block_max / NVFP4_MAX                  # [rows, 1]
+        s_g_real = _select_nvfp4_group_scales(block).unsqueeze(-1)
         # fp8 per-group scale in the [0, 448] range after /global_real.
         fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
         # Effective per-element scale = fp8_scale_real * global_real.
@@ -1476,8 +1571,7 @@ def _activation_weighted_round_nvfp4(
     # Compute per-tensor outer scale consistently with
     # quantize_dequantize_nvfp4.
     grouped = W.reshape(rows, cols // group_size, group_size)
-    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)       # [rows, n_g]
-    s_g_real = max_abs / NVFP4_MAX
+    s_g_real = _select_nvfp4_group_scales(grouped)
     if global_real_override is not None:
         global_real = global_real_override.to(W.device).clamp_min(1e-12).float()
     else:
@@ -1546,9 +1640,10 @@ def _scale_sweep_nvfp4(
     scale is RTN (optimal conditional on the scale).
 
     Output is a dequantized tensor on valid NVFP4 grid points under the
-    new per-group scales — the downstream packer re-derives fp8_scale
-    from `max_abs(W_dq) / NVFP4_MAX` per group, which recovers the
-    swept scales losslessly.
+    new per-group scales. The downstream packer re-derives fp8_scale
+    through the active NVFP4 scale rule; FourOverSix gives the packer a
+    second legal max-to-4 representation when max-to-6 would lose a swept
+    scale choice.
     """
     W_in = weight.to(torch.float32).contiguous()
     W_ref = (reference_weight if reference_weight is not None else W_in
@@ -1583,8 +1678,7 @@ def _scale_sweep_nvfp4(
     # and to measure MSE against.
     ref_grouped = W_ref.reshape(rows, cols // group_size, group_size)
     in_grouped = W_in.reshape(rows, cols // group_size, group_size)
-    max_abs = ref_grouped.abs().amax(dim=-1).clamp_min(1e-12)  # [rows, n_g]
-    s_g_real = max_abs / NVFP4_MAX
+    s_g_real = _select_nvfp4_group_scales(ref_grouped)
     if global_real_override is not None:
         global_real = global_real_override.to(W_in.device).clamp_min(1e-12).float()
     else:
@@ -1656,8 +1750,7 @@ def compute_nvfp4_global_real(weight: torch.Tensor, group_size: int = 16
     `quantize_dequantize_nvfp4(global_real_override=...)`."""
     rows, cols = weight.shape
     grouped = weight.float().reshape(rows, cols // group_size, group_size)
-    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
-    s_g_real = max_abs / NVFP4_MAX
+    s_g_real = _select_nvfp4_group_scales(grouped)
     return (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
 
 
@@ -1669,7 +1762,8 @@ def quantize_dequantize_nvfp4(
     on-disk triple `(weight_packed, weight_scale, weight_global_scale)`
     in the **compressed-tensors NVFP4 convention**:
 
-      - per-group dequant scale  s_g_real = max-abs(group) / NVFP4_MAX
+      - per-group dequant scale  s_g_real from active NVFP4 scale rule
+        (`static_6` maps max-abs(group) to ±6; FourOverSix also tests ±4)
       - per-tensor outer scale   global   = max(s_g_real) / FP8_E4M3_MAX
         (so the fp8-stored per-group scale stays inside [0, 448])
       - on-disk weight_scale (fp8) = s_g_real / global  ∈ [0, 448]
@@ -1690,8 +1784,7 @@ def quantize_dequantize_nvfp4(
         raise ValueError(f"NVFP4 group_size={group_size} ∤ {cols}")
     n_groups = cols // group_size
     grouped = weight.float().reshape(rows, n_groups, group_size)
-    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)               # [rows, n_groups]
-    s_g_real = max_abs / NVFP4_MAX                                       # the actual per-group scale
+    s_g_real = _select_nvfp4_group_scales(grouped)                       # the actual per-group scale
     if global_real_override is not None:
         global_real = global_real_override.to(weight.device).clamp_min(1e-12)
     else:
@@ -1722,8 +1815,7 @@ def _rtn_dequant_nvfp4(
     n_groups = cols // group_size
     W = weight.float()
     grouped = W.reshape(rows, n_groups, group_size)
-    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
-    s_g_real = max_abs / NVFP4_MAX
+    s_g_real = _select_nvfp4_group_scales(grouped)
     if global_real_override is not None:
         global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
     else:
@@ -1752,8 +1844,7 @@ def quantize_dequantize_nvfp4_packed(
         raise ValueError(f"NVFP4 group_size={group_size} ∤ {N}")
     g = N // group_size
     grouped = packed.float().reshape(E, M, g, group_size)
-    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
-    s_g_real = max_abs / NVFP4_MAX                                          # [E, M, g]
+    s_g_real = _select_nvfp4_group_scales(grouped)                          # [E, M, g]
     global_real = (s_g_real.reshape(E, -1).amax(dim=-1) / FP8_E4M3_MAX).clamp_min(1e-12)  # [E]
     fp8_scale_real = (s_g_real / global_real.view(E, 1, 1)).clamp(0, FP8_E4M3_MAX)
     in_grid = grouped / s_g_real.unsqueeze(-1).clamp_min(1e-12)
@@ -3612,6 +3703,7 @@ def materialize_tensors_streaming(
                 "PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1"),
             "PRISMAQUANT_BATCHED_NVFP4_EXPORT": os.environ.get(
                 "PRISMAQUANT_BATCHED_NVFP4_EXPORT", "1"),
+            NVFP4_SCALE_RULE_ENV: _nvfp4_scale_rule_from_env(),
             "ACT_AWARE_FLAGS": dict(sorted(_ACT_AWARE_FLAGS.items())),
             "activation_cache_fingerprint": _ACTIVATION_CACHE_FINGERPRINT,
             "production_cache_fingerprint": _PRODUCTION_CACHE_FINGERPRINT,
@@ -5276,12 +5368,13 @@ def _validate_halo_cache_inputs(
 def main():
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
     global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
-    global _PRODUCTION_CACHE_PREFETCH_WORKERS
+    global _PRODUCTION_CACHE_PREFETCH_WORKERS, _NVFP4_SCALE_RULE
     _INPUT_GLOBAL_SCALES = None
     _CACHED_ACTIVATIONS = None
     _ACTIVATION_CACHE_FINGERPRINT = None
     _PRODUCTION_WEIGHT_CACHE = None
     _PRODUCTION_CACHE_FINGERPRINT = None
+    _NVFP4_SCALE_RULE = resolve_nvfp4_scale_rule()
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
@@ -5563,6 +5656,8 @@ def main():
     print(f"[export-stream] act-aware passes: awq={awq_enabled} "
           f"gptq={gptq_enabled} awq_round={awq_round_enabled} "
           f"scale_sweep={scale_sweep_enabled}", flush=True)
+    print(f"[export-stream] NVFP4 scale rule: {_nvfp4_scale_rule_from_env()}",
+          flush=True)
     # Publish to the module-level config so `_quantize_2d` picks them
     # up from every call site without needing the flags threaded
     # through `materialize_tensors_streaming` + MTP helpers.

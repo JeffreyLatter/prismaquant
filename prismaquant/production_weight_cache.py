@@ -624,7 +624,7 @@ class _LinearActivationCollector:
 @contextmanager
 def _temporarily_install_act_aware(
     activations: Mapping[str, torch.Tensor],
-    levers: Mapping[str, bool],
+    levers: Mapping[str, object],
 ):
     """Install module-level state expected by ``_quantize_2d``.
 
@@ -636,6 +636,7 @@ def _temporarily_install_act_aware(
 
     prev_cache = enc._CACHED_ACTIVATIONS
     prev_flags = dict(enc._ACT_AWARE_FLAGS)
+    prev_scale_rule = enc._NVFP4_SCALE_RULE
     enc._CACHED_ACTIVATIONS = _DictActivations(activations)
     enc._ACT_AWARE_FLAGS = {
         "awq": bool(levers.get("awq", False)),
@@ -643,12 +644,16 @@ def _temporarily_install_act_aware(
         "awq_round": bool(levers.get("awq_round", False)),
         "scale_sweep": bool(levers.get("scale_sweep", True)),
     }
+    enc._NVFP4_SCALE_RULE = enc.resolve_nvfp4_scale_rule(
+        str(levers.get("nvfp4_scale_rule", "static_6"))
+    )
     try:
         yield
     finally:
         enc._CACHED_ACTIVATIONS = prev_cache
         enc._ACT_AWARE_FLAGS.clear()
         enc._ACT_AWARE_FLAGS.update(prev_flags)
+        enc._NVFP4_SCALE_RULE = prev_scale_rule
 
 
 class _DictActivations:
@@ -1043,13 +1048,17 @@ def _solve_nvfp4_activation_clip_groups(
         log_hi = math.log(hi)
         inv_phi = (math.sqrt(5.0) - 1.0) / 2.0
         cache: dict[float, float] = {}
+        eval_trace: list[dict[str, float | int]] = []
         best_candidate_threshold: float | None = None
         best_candidate_score = float("inf")
         best_candidate_weights: dict[str, torch.Tensor] | None = None
+        best_candidate_eval_index: int | None = None
+        denom = max(abs(float(baseline_score)), 1e-30)
 
         def eval_log(log_threshold: float) -> float:
             nonlocal best_candidate_threshold, best_candidate_score
             nonlocal best_candidate_weights
+            nonlocal best_candidate_eval_index
             threshold = float(math.exp(log_threshold))
             key = round(threshold, 12)
             if key not in cache:
@@ -1063,12 +1072,23 @@ def _solve_nvfp4_activation_clip_groups(
                     if best_candidate_weights is not None:
                         for old in best_candidate_weights.values():
                             del old
+                    best_candidate_eval_index = len(eval_trace) + 1
                     best_candidate_threshold = float(key)
                     best_candidate_score = float(score)
                     best_candidate_weights = cand_weights
                 elif cand_weights is not None:
                     for old in cand_weights.values():
                         del old
+                best_so_far = min(float(baseline_score), float(best_candidate_score))
+                eval_trace.append({
+                    "eval": int(len(eval_trace) + 1),
+                    "threshold": float(key),
+                    "score": float(score),
+                    "best_score": float(best_so_far),
+                    "relative_gain": float(
+                        (float(baseline_score) - best_so_far) / denom
+                    ),
+                })
             return cache[key]
 
         try:
@@ -1113,7 +1133,6 @@ def _solve_nvfp4_activation_clip_groups(
 
         best_threshold = best_candidate_threshold
         best_score = min(float(baseline_score), float(best_candidate_score))
-        denom = max(abs(float(baseline_score)), 1e-30)
         rel_gain = (float(baseline_score) - float(best_score)) / denom
         selected = (
             best_threshold is not None
@@ -1156,6 +1175,12 @@ def _solve_nvfp4_activation_clip_groups(
             "lo": float(lo),
             "hi": float(hi),
             "n_evals": int(len(cache)),
+            "selected_eval_index": (
+                int(best_candidate_eval_index)
+                if selected and best_candidate_eval_index is not None
+                else None
+            ),
+            "eval_trace": eval_trace,
         }
         if progress and verbose:
             print(
@@ -1183,7 +1208,7 @@ def render_production_weight(
     *,
     qname: str,
     activations: Mapping[str, torch.Tensor],
-    levers: Mapping[str, bool],
+    levers: Mapping[str, object],
     joint_global_real: torch.Tensor | None = None,
     input_global_scale: float | None = None,
     act_clip_threshold: float | None = None,
@@ -1315,6 +1340,8 @@ def fill_production_weight_cache(
         "fisher_gptq",
         _env_flag("PRISMAQUANT_FISHER_WEIGHTED_GPTQ", False),
     )
+    from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
+    levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
 
     from prismaquant import format_registry as fr
 
