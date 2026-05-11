@@ -4,7 +4,12 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
-from prismaquant.allocator import Candidate, build_candidates, filter_candidates_for_profile
+from prismaquant.allocator import (
+    Candidate,
+    build_candidates,
+    filter_candidates_for_profile,
+    layer_config_entry_for_format,
+)
 from prismaquant.sensitivity_probe import discover_moe_structure
 
 
@@ -21,6 +26,17 @@ class TestPrismaQuantFormatRegistry(unittest.TestCase):
         self.assertEqual(fr.canonical_format_name("MXFP8"), "MXFP8_E4M3")
         self.assertEqual(fr.get_format("MXFP8").name, "MXFP8_E4M3")
         self.assertIn("MXFP8", fr.aliases_for("MXFP8_E4M3"))
+
+    def test_prismaclip_layer_config_entry_preserves_candidate_label(self):
+        specs = {"NVFP4_CLIPPED": fr.get_format("NVFP4_CLIPPED")}
+        self.assertEqual(
+            layer_config_entry_for_format("NVFP4_CLIPPED", specs),
+            "NVFP4_CLIPPED",
+        )
+        self.assertNotEqual(
+            layer_config_entry_for_format("NVFP4_CLIPPED", specs),
+            fr.get_format("NVFP4").autoround_config(),
+        )
 
     def test_low_bit_custom_kernel_formats_are_not_registered(self):
         for name in ("INT2", "INT3", "NVINT2", "NVINT3", "NVFP3"):
@@ -243,6 +259,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         candidates = {
             name: [
                 Candidate("NVFP4", 4.5, 100, 1.0),
+                Candidate("NVFP4_CLIPPED", 4.5, 100, 0.8),
                 Candidate("MXFP8", 8.25, 180, 0.2),
                 Candidate("MXFP8_E4M3", 8.25, 180, 0.2),
                 Candidate("MXFP4", 4.25, 96, 0.9),
@@ -260,7 +277,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
 
         self.assertEqual(
             [c.fmt for c in filtered[name]],
-            ["NVFP4", "MXFP8", "MXFP8_E4M3", "MXFP4", "BF16"],
+            ["NVFP4", "NVFP4_CLIPPED", "MXFP8", "MXFP8_E4M3", "MXFP4", "BF16"],
         )
         self.assertNotIn("model.layers.0.self_attn.q_proj", filtered)
 

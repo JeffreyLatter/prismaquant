@@ -2490,6 +2490,27 @@ def run_probe(args: argparse.Namespace) -> dict:
             [*requested_specs, floor_spec],
             key=lambda spec: (spec.effective_bits, spec.name),
         )
+    if bool(getattr(args, "prismaclip_candidates", False)):
+        if floor_format != "NVFP4":
+            print(
+                "[kl-probe] --prismaclip-candidates ignored because "
+                f"--floor-format is {floor_format}, not NVFP4",
+                flush=True,
+            )
+        elif args.candidate_recipe != "production":
+            print(
+                "[kl-probe] --prismaclip-candidates ignored because "
+                "--candidate-recipe=raw cannot render production PrismaClip "
+                "weights",
+                flush=True,
+            )
+        elif "NVFP4_CLIPPED" not in {
+            fr.canonical_format_name(spec.name) for spec in requested_specs
+        }:
+            requested_specs = sorted(
+                [*requested_specs, fr.get_format("NVFP4_CLIPPED")],
+                key=lambda spec: (spec.effective_bits, spec.name),
+            )
     requested_formats = [fr.canonical_format_name(spec.name) for spec in requested_specs]
 
     targets = _linear_targets(model, pins)
@@ -3247,6 +3268,16 @@ def build_parser() -> argparse.ArgumentParser:
             "'production' renders each unit/format with the same GPTQ/"
             "scale-sweep cache used by export; 'raw' is the older RTN/QDQ "
             "diagnostic path."
+        ),
+    )
+    parser.add_argument(
+        "--prismaclip-candidates",
+        action="store_true",
+        help=(
+            "Add NVFP4_CLIPPED as a same-bpp production candidate. The "
+            "production cache stores it separately from baseline NVFP4, and "
+            "candidate KL decides whether each fused unit keeps unclipped "
+            "NVFP4, uses PrismaClip, or promotes to MXFP8/BF16."
         ),
     )
     parser.add_argument(

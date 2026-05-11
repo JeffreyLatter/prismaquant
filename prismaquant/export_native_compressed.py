@@ -252,7 +252,10 @@ def _round_to_codebook(values_in_grid: torch.Tensor) -> torch.Tensor:
 
 
 def _canonical_export_format(fmt: str) -> str:
-    if str(fmt).upper() == "MXFP8_E4M3":
+    fmt_u = str(fmt).upper()
+    if fmt_u == "NVFP4_CLIPPED":
+        return "NVFP4"
+    if fmt_u == "MXFP8_E4M3":
         return "MXFP8"
     return fmt
 
@@ -531,6 +534,8 @@ def _activation_index_fingerprint(index, cache_dir: Path) -> dict[str, object]:
 
 def _production_cache_format_candidates(fmt: str) -> tuple[str, ...]:
     fmt_u = str(fmt).upper()
+    if fmt_u == "NVFP4_CLIPPED":
+        return ("NVFP4_CLIPPED",)
     if fmt_u == "MXFP8":
         return ("MXFP8", "MXFP8_E4M3")
     if fmt_u == "MXFP8_E4M3":
@@ -566,12 +571,12 @@ def _production_cache_expected_keys(
     keys: list[tuple[str, str]] = []
     missing: list[tuple[str, str]] = []
     for qname, fmt in assignment.items():
-        fmt = _canonical_export_format(fmt)
-        if fmt == "BF16":
+        cache_fmt = str(fmt).upper()
+        if _canonical_export_format(cache_fmt) == "BF16":
             continue
-        key = _production_cache_lookup_key(qname, fmt)
+        key = _production_cache_lookup_key(qname, cache_fmt)
         if key is None:
-            missing.append((qname, fmt))
+            missing.append((qname, cache_fmt))
         else:
             keys.append(key)
     return keys, missing
@@ -852,9 +857,10 @@ def _production_cache_prefetch_assignment(
     for qname, fmt in assignment.items():
         if prefix is not None and not (qname == prefix or qname.startswith(prefix + ".")):
             continue
-        if _canonical_export_format(fmt) == "BF16":
+        cache_fmt = str(fmt).upper()
+        if _canonical_export_format(cache_fmt) == "BF16":
             continue
-        key = _production_cache_lookup_key(qname, fmt)
+        key = _production_cache_lookup_key(qname, cache_fmt)
         if key is not None:
             keys.append(key)
     if not keys:
@@ -879,8 +885,9 @@ def _pack_production_cached_2d(
     cache = _PRODUCTION_WEIGHT_CACHE
     if cache is None:
         return None
-    fmt = _canonical_export_format(fmt)
-    key = _production_cache_lookup_key(linear_name, fmt)
+    cache_fmt = str(fmt).upper()
+    fmt = _canonical_export_format(cache_fmt)
+    key = _production_cache_lookup_key(linear_name, cache_fmt)
     if key is None:
         return None
     w = cache.get(key[0], key[1])
@@ -2685,7 +2692,7 @@ def _compute_nvfp4_joint_global(
     for qname, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
-        if assignment.get(qname) != "NVFP4":
+        if _canonical_export_format(assignment.get(qname, "BF16")) != "NVFP4":
             continue
         g = _fused_dense_group(qname)
         if g is None:
@@ -3442,7 +3449,7 @@ def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
             recipe_key = profile.live_to_recipe_name(full)
             fmt = assignment.get(recipe_key)
             fqn_fmt.append((full, recipe_key, fmt, mod))
-        fmts = {f for _, _, f, _ in fqn_fmt}
+        fmts = {_canonical_export_format(f) for _, _, f, _ in fqn_fmt}
         if fmts != {"NVFP4"}:
             continue
         candidates = [
@@ -3815,7 +3822,8 @@ def materialize_tensors_streaming(
         # allocator chose for them.
         if recipe_key.endswith(".weight"):
             recipe_key = recipe_key[:-len(".weight")]
-        fmt = assignment.get(recipe_key)
+        recipe_fmt = assignment.get(recipe_key)
+        fmt = recipe_fmt
         # Respect the passthrough set (e.g. `--ignore lm_head`) even if
         # the allocator assigned NVFP4/MXFP8 to this head module. See
         # the --ignore docstring for why lm_head is passthrough by
@@ -3836,7 +3844,7 @@ def materialize_tensors_streaming(
             joint = None
             compressed = _pack_production_cached_2d(
                 recipe_key,
-                fmt,
+                recipe_fmt if recipe_fmt is not None else fmt,
                 nvfp4_global_real_override=joint,
                 device=device,
             )
@@ -4180,9 +4188,8 @@ def materialize_tensors_streaming(
                 emit_full = full
 
             recipe_key = profile.live_to_recipe_name(full)
-            fmt = assignment.get(recipe_key)
-            if fmt is not None:
-                fmt = _canonical_export_format(fmt)
+            recipe_fmt = assignment.get(recipe_key)
+            fmt = _canonical_export_format(recipe_fmt) if recipe_fmt is not None else None
             source_weight_key = f"{full}.weight"
             source_weight_dtype = source_dtype_by_name.get(source_weight_key)
             source_is_fp8_scaled = (
@@ -4269,7 +4276,7 @@ def materialize_tensors_streaming(
             override = joint_globals.get(recipe_key) if fmt == "NVFP4" else None
             cached_compressed = _pack_production_cached_2d(
                 recipe_key,
-                fmt,
+                recipe_fmt if recipe_fmt is not None else fmt,
                 nvfp4_global_real_override=override,
                 device=device,
             )
@@ -5204,6 +5211,7 @@ def build_quantization_config(
     for n in extra_ignore:
         ignore.append(profile.to_vllm_internal_name(n))
     for name, fmt in sorted(assignment.items()):
+        fmt = _canonical_export_format(fmt)
         vllm_name = profile.to_vllm_internal_name(name)
         if fmt == "BF16":
             ignore.append(vllm_name)
@@ -5244,6 +5252,7 @@ def build_quantization_config(
         # siblings under names that match known fused patterns.
         bf16_name_set = set(ignore)
         for name, fmt in list(assignment.items()):
+            fmt = _canonical_export_format(fmt)
             if fmt != "BF16":
                 continue
             leaf = name.rsplit(".", 1)[-1]

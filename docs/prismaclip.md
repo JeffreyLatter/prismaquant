@@ -9,6 +9,28 @@ fused-sibling group, then stores only the selected thresholds in
 `ProductionWeightCache` metadata. Export consumes those thresholds through the
 normal compressed-tensors path.
 
+## Candidate Mode
+
+The preferred production-facing path is to measure PrismaClip as a same-bpp
+candidate instead of rewriting baseline NVFP4 globally. `NVFP4_CLIPPED` is a
+recipe/cache format that renders the PrismaClip variant into its own
+`ProductionWeightCache` key while exporting as ordinary NVFP4 compressed
+tensors. vLLM still sees the standard NVFP4 runtime format and kernel.
+
+Use `kl_sensitivity_probe.py --prismaclip-candidates` with
+`--candidate-recipe production` and `--floor-format NVFP4`. The probe adds
+`NVFP4_CLIPPED` beside the normal menu, so each Linear or fused decision unit
+can keep baseline NVFP4, use PrismaClip, or promote to MXFP8/BF16 if the
+measured KL/cost tradeoff says the wider format is justified.
+Allocator-emitted layer configs preserve `NVFP4_CLIPPED` as an explicit string
+so the production cache can render the clipped candidate instead of collapsing
+it back to ordinary NVFP4.
+
+This mode exists because local clipping scores have shown real wins but also
+occasional global KL regressions. Treating PrismaClip as a candidate keeps the
+per-Linear contract intact and lets MXFP8 do the job it is meant to do for
+layers where NVFP4 is not accurate enough.
+
 ## What It Optimizes
 
 For each candidate threshold, PrismaClip renders the actual production NVFP4
@@ -110,7 +132,8 @@ batched damp selector but still measured `0.060248224` KL versus the scalar
   opt-in while parity is under validation.
 - Runtime: no additional serving mechanism beyond the exported activation
   scale metadata.
-- Default: off unless `PRISMAQUANT_ACT_CLIP_SOLVER=1`.
+- Default: off. Enable global rewrite with `PRISMAQUANT_ACT_CLIP_SOLVER=1`,
+  or enable measured candidate mode with `--prismaclip-candidates`.
 
 ## Validation Notes
 

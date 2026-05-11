@@ -442,6 +442,7 @@ class TestRecipeParsing(unittest.TestCase):
         self.assertEqual(canonicalize_format(mx8), "MXFP8")
         self.assertEqual(canonicalize_format(bf), "BF16")
         self.assertEqual(canonicalize_format({"bits": 4, "data_type": "mx_fp"}), "MXFP4")
+        self.assertEqual(canonicalize_format("NVFP4_CLIPPED"), "NVFP4_CLIPPED")
 
 
 class TestVLLMInternalNaming(unittest.TestCase):
@@ -776,6 +777,46 @@ class TestProductionCacheExportPath(unittest.TestCase):
             self.assertEqual(out["weight_scale"].dtype, torch.uint8)
         finally:
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
+
+    def test_prismaclip_variant_hits_distinct_cache_key_but_packs_nvfp4(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        base = torch.zeros((8, 16), dtype=torch.float32)
+        clipped = torch.ones((8, 16), dtype=torch.float32) * 0.1
+        cache = ProductionWeightCache(
+            weights={
+                ("model.layers.0.mlp.down_proj", "NVFP4"): base,
+                ("model.layers.0.mlp.down_proj", "NVFP4_CLIPPED"): clipped,
+            },
+            levers={},
+            activation_max_abs={"model.layers.0.mlp.down_proj": 3.0},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_scales = m._INPUT_GLOBAL_SCALES
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._INPUT_GLOBAL_SCALES = m._production_cache_scales(cache)
+            key = m._production_cache_lookup_key(
+                "model.layers.0.mlp.down_proj",
+                "NVFP4_CLIPPED",
+            )
+            self.assertEqual(
+                key,
+                ("model.layers.0.mlp.down_proj", "NVFP4_CLIPPED"),
+            )
+            out = m._pack_production_cached_2d(
+                "model.layers.0.mlp.down_proj",
+                "NVFP4_CLIPPED",
+                device=torch.device("cpu"),
+            )
+            self.assertIsNotNone(out)
+            self.assertIn("weight_packed", out)
+            self.assertIn("weight_global_scale", out)
+            self.assertIn("input_global_scale", out)
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._INPUT_GLOBAL_SCALES = saved_scales
 
     def test_mxfp8_scale_sweep_cache_defers_to_export_recompute(self):
         import prismaquant.export_native_compressed as m

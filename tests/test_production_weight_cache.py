@@ -63,6 +63,29 @@ def test_production_cache_resolves_format_aliases_and_sizes(tmp_path):
     assert torch.equal(cache.get("layer", "MXFP8"), tensor)
 
 
+def test_production_cache_resolves_prismaclip_variant_as_distinct_key(tmp_path):
+    base = torch.zeros((2, 2), dtype=torch.float32)
+    clipped = torch.ones((2, 2), dtype=torch.float32)
+    torch.save(base, tmp_path / "base.pt")
+    torch.save(clipped, tmp_path / "clip.pt")
+    cache = ProductionWeightCache(
+        weights={
+            ("layer", "NVFP4"): "base.pt",
+            ("layer", "NVFP4_CLIPPED"): "clip.pt",
+        },
+        levers={},
+        cache_dir=str(tmp_path),
+    )
+
+    assert cache.resolve_key("layer", "NVFP4") == ("layer", "NVFP4")
+    assert cache.resolve_key("layer", "NVFP4_CLIPPED") == (
+        "layer",
+        "NVFP4_CLIPPED",
+    )
+    assert torch.equal(cache.get("layer", "NVFP4"), base)
+    assert torch.equal(cache.get("layer", "NVFP4_CLIPPED"), clipped)
+
+
 def test_recache_preload_respects_resident_budget(tmp_path):
     for name in ("a", "b"):
         torch.save(torch.ones((2, 2)), tmp_path / f"{name}.pt")
@@ -202,6 +225,61 @@ def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
     assert any(value is not None for value in calls)
     assert torch.allclose(
         cache.get("l1", "NVFP4").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32) + abs(float(selected) - 1.0),
+        atol=1e-2,
+    )
+
+
+def test_production_cache_prismaclip_candidate_preserves_baseline_nvfp4(
+    monkeypatch,
+):
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+
+    def fake_render_production_weight(
+        weight,
+        fmt,
+        *,
+        act_clip_threshold=None,
+        **_kwargs,
+    ):
+        assert fmt.upper() == "NVFP4"
+        delta = (
+            3.0
+            if act_clip_threshold is None
+            else abs(float(act_clip_threshold) - 1.0)
+        )
+        return weight.detach().to(torch.float32) + delta
+
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+    monkeypatch.delenv("PRISMAQUANT_ACT_CLIP_SOLVER", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["NVFP4", "NVFP4_CLIPPED"],
+        levers={"gptq": False, "scale_sweep": False},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    meta = cache.metadata["activation_clip_solver"]
+    selected = meta["selected_by_qname"]["l1"]
+    assert cache.levers["act_clip_candidates"] is True
+    assert meta["status"] == "applied"
+    assert meta["candidate_format"] == "NVFP4_CLIPPED"
+    assert selected is not None
+    assert torch.allclose(
+        cache.get("l1", "NVFP4").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32) + 3.0,
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        cache.get("l1", "NVFP4_CLIPPED").to(torch.float32),
         model.l1.weight.detach().to(torch.float32) + abs(float(selected) - 1.0),
         atol=1e-2,
     )

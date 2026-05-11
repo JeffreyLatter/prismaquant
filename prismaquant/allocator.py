@@ -167,7 +167,14 @@ def _allowed_format(target_profile: str, name: str, fmt: str) -> bool:
             # passthrough. MXFP4 is exportable only for MoE experts in
             # local vLLM; dense MXFP4 is weight-only and not part of the
             # Qwen3.6 MoE shipping profile.
-            return fmt in {"NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"}
+            return fmt in {
+                "NVFP4",
+                "NVFP4_CLIPPED",
+                "MXFP4",
+                "MXFP8",
+                "MXFP8_E4M3",
+                "BF16",
+            }
         if fmt in {"MXFP4", "MXFP8_E5M2", "FP8_E5M2"}:
             return False
         return True
@@ -184,6 +191,25 @@ def filter_candidates_for_profile(
         if kept:
             out[name] = kept
     return out
+
+
+def layer_config_entry_for_format(
+    fmt: str,
+    format_specs: dict[str, fr.FormatSpec],
+) -> dict | str:
+    """Return the layer_config entry for a chosen internal format label.
+
+    Some PrismaQuant candidates are measurement/export recipes rather than
+    distinct vLLM runtime formats. They must survive the layer_config round
+    trip as explicit strings; their AutoRound dict would otherwise collapse
+    back to the underlying runtime format.
+    """
+    fmt = str(fmt)
+    if fmt == "NVFP4_CLIPPED":
+        return fmt
+    if fmt in format_specs:
+        return format_specs[fmt].autoround_config()
+    return fr.get_format(fmt).autoround_config()
 
 
 # ---------------------------------------------------------------------------
@@ -1260,13 +1286,10 @@ def main():
 
     layer_cfg = {}
     for name, fmt in assignment_expanded.items():
-        if fmt in format_specs:
-            layer_cfg[name] = format_specs[fmt].autoround_config()
-        else:
-            # Visual format outside the body's format set (e.g., user
-            # passed --formats NVFP4,BF16 plus --visual-format MXFP8).
-            # Resolve from the global registry.
-            layer_cfg[name] = fr.get_format(fmt).autoround_config()
+        # Visual formats can be outside the body's format set (e.g., user
+        # passed --formats NVFP4,BF16 plus --visual-format MXFP8), so the
+        # helper falls back to the global registry.
+        layer_cfg[name] = layer_config_entry_for_format(fmt, format_specs)
 
     out = Path(args.layer_config)
     out.parent.mkdir(parents=True, exist_ok=True)

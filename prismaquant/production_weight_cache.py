@@ -81,6 +81,16 @@ from prismaquant.build_rtn_cache import iter_quantizable_tensors
 
 DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN = 0.0
 DEFAULT_ACT_CLIP_SOLVER_HOLDOUT_FRACTION = 0.25
+PRISMACLIP_FORMAT = "NVFP4_CLIPPED"
+
+
+def _is_prismaclip_format(fmt: str) -> bool:
+    return str(fmt).strip().upper() == PRISMACLIP_FORMAT
+
+
+def _render_base_format(fmt: str) -> str:
+    fmt_u = str(fmt).strip().upper()
+    return "NVFP4" if fmt_u == PRISMACLIP_FORMAT else fmt_u
 
 
 def _cache_weight_filename(qname: str, fmt: str) -> str:
@@ -965,7 +975,7 @@ def _awq_group_key_from_qname(qname: str) -> str | None:
 
 
 def _awq_format_group_size(fmt: str) -> int:
-    fmt = fmt.upper()
+    fmt = _render_base_format(fmt)
     if fmt == "NVFP4":
         return 16
     if fmt in {"MXFP8", "MXFP8_E4M3"}:
@@ -986,7 +996,7 @@ def _render_awq_scaled_for_cache(
 ) -> torch.Tensor:
     from prismaquant import export_native_compressed as enc
 
-    fmt = fmt.upper()
+    fmt = _render_base_format(fmt)
     with _temporarily_install_act_aware(
         {qname: activations_scaled},
         {**dict(levers), "awq": False},
@@ -1500,6 +1510,7 @@ def _solve_nvfp4_activation_clip_groups(
     cache_dir_path: Path | None,
     progress: bool,
     awq_scales: Mapping[str, torch.Tensor] | None = None,
+    cache_formats: Sequence[str] = ("NVFP4",),
 ) -> tuple[dict[str, float | None], dict[str, object]]:
     """Solve one scalar render-time activation clamp per fused NVFP4 group.
 
@@ -1578,6 +1589,9 @@ def _solve_nvfp4_activation_clip_groups(
         hi=1.0,
     )
     verbose = _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE", False)
+    output_cache_formats = tuple(
+        dict.fromkeys(str(fmt).strip().upper() for fmt in cache_formats if str(fmt).strip())
+    ) or ("NVFP4",)
     threshold_by_qname: dict[str, float | None] = {}
     method_name = "PrismaFisherClip" if fisher_clip_available else "PrismaClip"
     objective = (
@@ -1595,6 +1609,7 @@ def _solve_nvfp4_activation_clip_groups(
         "enabled": True,
         "method": method_name,
         "format": "NVFP4",
+        "cache_formats": list(output_cache_formats),
         "objective": objective,
         "solver": "log_golden_section",
         "max_evals": int(max_evals),
@@ -1919,14 +1934,15 @@ def _solve_nvfp4_activation_clip_groups(
             continue
         if baseline_weights is not None:
             for qname, tensor in baseline_weights.items():
-                _store_rendered_weight_entry(
-                    weights=weights_out,
-                    cache_dir_path=cache_dir_path,
-                    qname=qname,
-                    fmt="NVFP4",
-                    tensor=tensor,
-                    weight_dtype=qname_to_module[qname].weight.dtype,
-                )
+                for cache_fmt in output_cache_formats:
+                    _store_rendered_weight_entry(
+                        weights=weights_out,
+                        cache_dir_path=cache_dir_path,
+                        qname=qname,
+                        fmt=cache_fmt,
+                        tensor=tensor,
+                        weight_dtype=qname_to_module[qname].weight.dtype,
+                    )
                 metadata["prewritten_baseline_qnames"].append(qname)
                 del tensor
             baseline_weights.clear()
@@ -2219,14 +2235,15 @@ def _solve_nvfp4_activation_clip_groups(
             metadata["selected_by_qname"][qname] = best_threshold
         if selected and best_candidate_weights is not None:
             for qname, tensor in best_candidate_weights.items():
-                _store_rendered_weight_entry(
-                    weights=weights_out,
-                    cache_dir_path=cache_dir_path,
-                    qname=qname,
-                    fmt="NVFP4",
-                    tensor=tensor,
-                    weight_dtype=qname_to_module[qname].weight.dtype,
-                )
+                for cache_fmt in output_cache_formats:
+                    _store_rendered_weight_entry(
+                        weights=weights_out,
+                        cache_dir_path=cache_dir_path,
+                        qname=qname,
+                        fmt=cache_fmt,
+                        tensor=tensor,
+                        weight_dtype=qname_to_module[qname].weight.dtype,
+                    )
                 metadata["prewritten_qnames"].append(qname)
                 del tensor
             best_candidate_weights.clear()
@@ -2494,6 +2511,8 @@ def fill_production_weight_cache(
     requested_formats = tuple(
         dict.fromkeys(_canon(f) for f in formats if str(f).strip())
     )
+    if PRISMACLIP_FORMAT in requested_formats:
+        levers["act_clip_candidates"] = True
     eligible_qnames = set(qnames)
     if render_assignment is not None:
         render_formats_by_qname: dict[str, tuple[str, ...]] = {}
@@ -2556,7 +2575,8 @@ def fill_production_weight_cache(
         for fmts in render_formats_by_qname.values()
         for fmt in fmts
     }
-    activation_aware_formats = {"NVFP4"}
+    render_base_fmt_set = {_render_base_format(fmt) for fmt in fmt_set}
+    activation_aware_formats = {"NVFP4", PRISMACLIP_FORMAT}
     if bool(levers.get("scale_sweep", True)):
         activation_aware_formats.update({"MXFP8", "MXFP8_E4M3"})
     if bool(levers.get("awq", False)):
@@ -2629,7 +2649,7 @@ def fill_production_weight_cache(
         and not bool(levers.get("awq", False))
         and (
             (sidecar_path is not None and sidecar_path.is_file())
-            or "NVFP4" not in fmt_set
+            or "NVFP4" not in render_base_fmt_set
         )
     )
     collector = None  # may stay None on the skip_forward path
@@ -2742,7 +2762,7 @@ def fill_production_weight_cache(
     joint_globals: dict[str, torch.Tensor] = {}
     profile = None
     needs_nvfp4_render = any(
-        "NVFP4" in missing
+        any(_render_base_format(fmt) == "NVFP4" for fmt in missing)
         for missing in missing_formats_by_qname.values()
     )
     if needs_nvfp4_render:
@@ -2787,7 +2807,7 @@ def fill_production_weight_cache(
                     flush=True,
                 )
 
-    if "NVFP4" in fmt_set:
+    if "NVFP4" in render_base_fmt_set:
         # Group by fused sibling key for max-across-siblings unification.
         from prismaquant.decision_units import fused_group_key
         try:
@@ -2919,18 +2939,27 @@ def fill_production_weight_cache(
                 )
 
     solved_nvfp4_thresholds: dict[str, float | None] = {}
+    solve_global_nvfp4_clip = bool(levers.get("act_clip_solver", False))
+    solve_variant_nvfp4_clip = any(
+        PRISMACLIP_FORMAT in missing
+        for missing in missing_formats_by_qname.values()
+    )
     clip_solver_metadata: dict[str, object] = {
-        "enabled": bool(levers.get("act_clip_solver", False)),
+        "enabled": bool(solve_global_nvfp4_clip or solve_variant_nvfp4_clip),
         "method": "PrismaClip",
         "format": "NVFP4",
+        "candidate_format": PRISMACLIP_FORMAT if solve_variant_nvfp4_clip else None,
         "status": "disabled",
     }
-    if bool(levers.get("act_clip_solver", False)) and needs_nvfp4_render:
+    if (solve_global_nvfp4_clip or solve_variant_nvfp4_clip) and needs_nvfp4_render:
         from prismaquant.decision_units import fused_group_key
 
         solver_groups: dict[str, list[str]] = {}
         for qname, missing in missing_formats_by_qname.items():
-            if "NVFP4" not in missing:
+            if not (
+                (solve_global_nvfp4_clip and "NVFP4" in missing)
+                or PRISMACLIP_FORMAT in missing
+            ):
                 continue
             if qname not in qname_to_module or qname not in activations:
                 continue
@@ -2946,6 +2975,11 @@ def fill_production_weight_cache(
                     f"{len(solver_groups)} fused groups",
                     flush=True,
                 )
+            clip_cache_formats: list[str] = []
+            if solve_global_nvfp4_clip:
+                clip_cache_formats.append("NVFP4")
+            if solve_variant_nvfp4_clip:
+                clip_cache_formats.append(PRISMACLIP_FORMAT)
             solved_nvfp4_thresholds, clip_solver_metadata = (
                 _solve_nvfp4_activation_clip_groups(
                     groups=solver_groups,
@@ -2959,7 +2993,11 @@ def fill_production_weight_cache(
                     cache_dir_path=cache_dir_path,
                     progress=progress,
                     awq_scales=awq_scales,
+                    cache_formats=clip_cache_formats,
                 )
+            )
+            clip_solver_metadata["candidate_format"] = (
+                PRISMACLIP_FORMAT if solve_variant_nvfp4_clip else None
             )
             clip_solver_metadata["status"] = "applied"
         else:
@@ -2986,7 +3024,9 @@ def fill_production_weight_cache(
         # case future code consumes it.
         export_scale = (6.0 / max_abs) if (max_abs is not None and max_abs > 0) else None
         for fmt in render_formats_by_qname.get(qname, ()):
-            key = (qname, fmt.upper())
+            fmt_key = str(fmt).upper()
+            render_fmt = _render_base_format(fmt_key)
+            key = (qname, fmt_key)
             if key in weights:
                 skipped_prewritten += 1
                 done += 1
@@ -2999,9 +3039,9 @@ def fill_production_weight_cache(
             # resume without re-doing the work — just rebuild the manifest
             # from the surviving .pt files.
             if cache_dir_path is not None:
-                fname = _cache_weight_filename(qname, fmt.upper())
+                fname = _cache_weight_filename(qname, fmt_key)
                 if (cache_dir_path / fname).is_file():
-                    weights[(qname, fmt.upper())] = fname
+                    weights[(qname, fmt_key)] = fname
                     skipped_resumed += 1
                     # Do NOT pop activations_local[qname] here: this
                     # loop iterates through every format for this
@@ -3012,7 +3052,7 @@ def fill_production_weight_cache(
                     continue
             try:
                 w_dq = render_production_weight(
-                    weight, fmt,
+                    weight, render_fmt,
                     qname=qname,
                     activations=activations_local,
                     levers=levers,
@@ -3020,7 +3060,11 @@ def fill_production_weight_cache(
                     input_global_scale=export_scale,
                     act_clip_threshold=(
                         solved_nvfp4_thresholds.get(qname)
-                        if fmt.upper() == "NVFP4" else None
+                        if (
+                            _is_prismaclip_format(fmt_key)
+                            or (solve_global_nvfp4_clip and render_fmt == "NVFP4")
+                        )
+                        else None
                     ),
                     fisher_row_weights=(
                         fisher_rows.get(qname)
@@ -3030,11 +3074,11 @@ def fill_production_weight_cache(
                     ),
                     awq_scale=(
                         awq_scales.get(qname)
-                        if fmt.upper() in _AWQ_CACHE_FORMATS else None
+                        if render_fmt in _AWQ_CACHE_FORMATS else None
                     ),
                 )
             except Exception as e:
-                failed[(qname, fmt.upper())] = str(e)
+                failed[(qname, fmt_key)] = str(e)
                 if progress:
                     print(
                         f"[prod-cache] FAILED {qname} @ {fmt}: {e}",
@@ -3050,7 +3094,7 @@ def fill_production_weight_cache(
                 weights=weights,
                 cache_dir_path=cache_dir_path,
                 qname=qname,
-                fmt=fmt,
+                fmt=fmt_key,
                 tensor=w_dq,
                 weight_dtype=weight.dtype,
             )

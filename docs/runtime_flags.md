@@ -21,6 +21,12 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_PROBE_DOMAIN` | (per-chunk) | Tag each chunk's probe pickle with a domain label (used by adaptive-sampling per-domain saliency). Set automatically by `multi_chunk_probe` based on `chunk_<domain>_<idx>.jsonl` filename. |
 | `PRISMAQUANT_COST_PREFETCH_ACT` | **on** | `measure_batched_gpu` prefetches chunk N+1's activation files on a thread pool while chunk N runs on the GPU. Hides ~30-40% of the cost step's wall on big models. |
 
+Probe CLI: `kl_sensitivity_probe.py --prismaclip-candidates` adds
+`NVFP4_CLIPPED` as a same-bpp candidate beside baseline NVFP4. It uses the
+existing production cache, stores the clipped rendering under a distinct cache
+key, and still exports through the normal NVFP4 vLLM runtime format. This is
+the preferred way to use PrismaClip when MXFP8/BF16 promotions are available.
+
 ## Export flags
 
 | env var | default | what it does |
