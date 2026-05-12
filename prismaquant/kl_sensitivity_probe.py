@@ -27,6 +27,7 @@ from prismaquant.allocator_candidates import (
 from prismaquant.build_rtn_cache import (
     iter_quantizable_tensors,
 )
+from prismaquant.layer_config import load_assignment as load_layer_assignment
 from prismaquant.layer_state_cache import LayerHiddenStateCache
 from prismaquant.memory_management import phase_boundary_memory_cleanup
 from prismaquant.calibration_data import load_wikitext_calibration_windowed
@@ -1124,6 +1125,62 @@ def _load_seed_assignment_points(
             })
             raise
     return points, diagnostics
+
+
+def _load_floor_assignment_override(
+    path: str | Path,
+    *,
+    floor_assignment: Mapping[str, str],
+    floor_kl: float,
+    targets: Sequence[LinearTarget],
+    profile,
+    requested_formats: Sequence[str],
+    source_manifest: Mapping[str, str | None],
+    target_profile: str,
+) -> tuple[dict[str, str], dict[str, object]]:
+    """Load a concrete assignment and use it as the probe floor.
+
+    The normal ``--floor-format`` path builds a model-wide baseline.  For
+    production-faithful follow-up probes we need an existing layer_config to be
+    the effective floor before production-cache fill, KL measurement, and
+    PrismaClip cache-variant gating.  Reuse the seed-assignment normalizer so
+    pins, fused siblings, and format legality stay identical.
+    """
+    assignment_path = Path(path).expanduser()
+    try:
+        raw_assignment = load_layer_assignment(assignment_path)
+        label = assignment_path.stem
+        source_key = "layer_config"
+    except Exception as layer_exc:
+        try:
+            payload = json.loads(assignment_path.read_text())
+            raw_assignment, label, source_key = _extract_seed_assignment(
+                payload,
+                path=assignment_path,
+            )
+        except Exception as payload_exc:
+            raise ValueError(
+                f"could not load floor assignment {assignment_path}: "
+                f"layer_config error={layer_exc}; assignment error={payload_exc}"
+            ) from payload_exc
+
+    point, diag = _seed_assignment_point(
+        path=assignment_path,
+        raw_assignment=raw_assignment,
+        label=label,
+        source_key=source_key,
+        floor_assignment=floor_assignment,
+        floor_kl=floor_kl,
+        targets=targets,
+        profile=profile,
+        requested_formats=requested_formats,
+        source_manifest=source_manifest,
+        target_profile=target_profile,
+    )
+    diag = dict(diag)
+    diag["source"] = "floor_assignment"
+    diag["fallback_floor_assignment_hash"] = _assignment_digest(floor_assignment)
+    return dict(point.assignment), diag
 
 
 def _append_unique_frontier_points(
@@ -2791,6 +2848,27 @@ def run_probe(args: argparse.Namespace) -> dict:
         targets,
         profile,
     )
+    floor_assignment_diag: dict[str, object] = {
+        "source": "floor_format",
+        "format": floor_format,
+        "path": None,
+    }
+    if getattr(args, "floor_assignment", None):
+        floor_assignment, floor_assignment_diag = _load_floor_assignment_override(
+            args.floor_assignment,
+            floor_assignment=floor_assignment,
+            floor_kl=0.0,
+            targets=targets,
+            profile=profile,
+            requested_formats=requested_formats,
+            source_manifest=source_manifest,
+            target_profile=args.target_profile,
+        )
+        print(
+            "[kl-probe] loaded floor assignment override "
+            f"{args.floor_assignment} counts={_format_counts(floor_assignment)}",
+            flush=True,
+        )
     production_weight_cache, production_cache_diag = _prepare_production_weight_cache(
         args,
         model,
@@ -3344,6 +3422,7 @@ def run_probe(args: argparse.Namespace) -> dict:
         },
         "floor": {
             "format": floor_format,
+            "assignment_source": floor_assignment_diag,
             "pinned": sorted(pins),
             "assignment_hash": _assignment_digest(floor_assignment),
             "assignment_sha256": _json_digest(floor_assignment),
@@ -3436,6 +3515,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--work-root", default=None)
     parser.add_argument("--floor-format", default="NVFP4")
+    parser.add_argument(
+        "--floor-assignment",
+        default=None,
+        help=(
+            "Optional concrete layer_config/assignment JSON to use as the "
+            "effective floor before production-cache fill, KL measurement, "
+            "and PrismaClip cache-variant gating. Missing entries fall back "
+            "to --floor-format and pinned entries remain pinned."
+        ),
+    )
     parser.add_argument(
         "--formats",
         default="NVFP4,MXFP8_E4M3,FP8_E4M3,BF16",

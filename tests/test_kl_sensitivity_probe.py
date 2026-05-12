@@ -404,6 +404,56 @@ def test_seed_assignment_loader_normalizes_current_oracle_candidate(tmp_path):
     assert diag["included"] is True
 
 
+def test_floor_assignment_override_accepts_layer_config_and_respects_pins(tmp_path):
+    class _Profile:
+        def fused_sibling_group(self, qname):
+            if qname.endswith(("gate_proj", "up_proj")):
+                return "model.layers.0.mlp.gate_up_proj"
+            return None
+
+    targets = [
+        LinearTarget("model.layers.0.mlp.gate_proj", (128, 128), 16384),
+        LinearTarget("model.layers.0.mlp.up_proj", (128, 128), 16384),
+        LinearTarget("model.layers.0.mlp.down_proj", (128, 128), 16384),
+        LinearTarget("lm_head", (128, 128), 16384, pinned=True),
+    ]
+    floor_assignment = {
+        target.qname: ("BF16" if target.pinned else "NVFP4")
+        for target in targets
+    }
+    layer_config_path = tmp_path / "layer_config.json"
+    layer_config_path.write_text(json.dumps({
+        "model.layers.0.mlp.gate_proj": {
+            "bits": 8,
+            "group_size": 32,
+            "data_type": "mx_fp",
+        },
+        "model.layers.0.mlp.down_proj": "BF16",
+        "lm_head": "NVFP4",
+        "not.in.this.model": "BF16",
+    }))
+
+    assignment, diag = ksp._load_floor_assignment_override(
+        layer_config_path,
+        floor_assignment=floor_assignment,
+        floor_kl=0.0,
+        targets=targets,
+        profile=_Profile(),
+        requested_formats=["NVFP4", "MXFP8_E4M3", "BF16"],
+        source_manifest={target.qname: "bf16" for target in targets},
+        target_profile="research",
+    )
+
+    assert assignment["model.layers.0.mlp.gate_proj"] == "MXFP8_E4M3"
+    assert assignment["model.layers.0.mlp.up_proj"] == "MXFP8_E4M3"
+    assert assignment["model.layers.0.mlp.down_proj"] == "BF16"
+    assert assignment["lm_head"] == "BF16"
+    assert diag["source"] == "floor_assignment"
+    assert diag["source_key"] == "layer_config"
+    assert diag["unknown_entries"] == 1
+    assert diag["pinned_conflicts"][0]["qname"] == "lm_head"
+
+
 def test_seed_assignment_points_dedupe_against_frontier():
     floor_assignment = {"a": "NVFP4", "b": "NVFP4"}
     frontier = [
