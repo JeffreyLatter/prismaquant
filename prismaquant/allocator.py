@@ -632,6 +632,7 @@ def main():
     candidates = build_candidates(
         stats, costs, specs_sorted, calibrated_gains,
         source_manifest=source_manifest,
+        target_profile=args.target_profile,
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 

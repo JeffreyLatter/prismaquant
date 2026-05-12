@@ -293,8 +293,14 @@ def cost_entry_predicted_dloss(
 def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                      calibrated_gains: dict[str, float] | None = None,
                      source_manifest: dict[str, str] | None = None,
+                     target_profile: str | None = None,
                      ) -> dict[str, list[Candidate]]:
-    """Build legal format candidates for every measured Linear."""
+    """Build runtime-legal format candidates for every measured Linear.
+
+    This is the optimizer's first legality gate. Export keeps a final
+    defensive check for stale or hand-written recipes, but the DP must never
+    see choices that the selected serving profile cannot run.
+    """
     gains = calibrated_gains or {}
     out: dict[str, list[Candidate]] = {}
     masked: dict[tuple[str, str], list[str]] = {}
@@ -321,6 +327,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 spec,
                 qname=name,
                 source_kind=source_kind,
+                target_profile=target_profile,
             )
             if not verdict.legal:
                 masked.setdefault(

@@ -126,3 +126,38 @@ def test_build_candidates_drops_mxfp8_on_small_n_shape():
     # gate_proj (5120, 17408): MXFP8 should be kept.
     g_formats = [c.fmt for c in cands["model.layers.0.mlp.gate_proj"]]
     assert "MXFP8_E4M3" in g_formats
+
+
+def test_build_candidates_applies_serving_profile_before_dp():
+    """The optimizer should not see formats outside the target vLLM profile."""
+    stats = {
+        "model.layers.0.self_attn.o_proj": {
+            "h_trace": 0.8,
+            "n_params": 5120 * 5120,
+            "in_features": 5120,
+            "out_features": 5120,
+        },
+    }
+    costs = {
+        "model.layers.0.self_attn.o_proj": {
+            "MXFP4": {"weight_mse": 0.002, "predicted_dloss": 0.001},
+            "BF16": {"weight_mse": 0.0, "predicted_dloss": 0.0},
+        },
+    }
+    specs = [fr.REGISTRY["MXFP4"], fr.REGISTRY["BF16"]]
+
+    research = build_candidates(stats, costs, specs, target_profile="research")
+    serving = build_candidates(
+        stats,
+        costs,
+        specs,
+        target_profile="vllm_qwen3_5_packed_moe",
+    )
+
+    assert [c.fmt for c in research["model.layers.0.self_attn.o_proj"]] == [
+        "MXFP4",
+        "BF16",
+    ]
+    assert [c.fmt for c in serving["model.layers.0.self_attn.o_proj"]] == [
+        "BF16",
+    ]
