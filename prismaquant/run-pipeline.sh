@@ -125,6 +125,7 @@ PY
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
 : "${PRODUCTION_CACHE_LEVERS:=gptq,scale_sweep}"
 : "${FISHER_WEIGHTED_GPTQ:=0}"
+: "${FISHER_OUTPUT_MSE_ALLOCATOR:=0}"
 : "${PRISMACLIP:=0}"
 : "${PRISMAFISHERCLIP:=0}"
 : "${PRISMAFISHERCLIP_MODE:=audit}"
@@ -142,11 +143,23 @@ PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
 
 PROBE_H_DETAIL_ARGS=()
+COST_H_DETAIL_ARGS=()
 PROD_H_DETAIL_ARGS=()
+case "$FISHER_OUTPUT_MSE_ALLOCATOR" in
+  0|false|False|FALSE|no|No|NO|"")
+    export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
+    ;;
+  *)
+    PROBE_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
+    COST_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
+    export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=1
+    ;;
+esac
 case "$FISHER_WEIGHTED_GPTQ" in
   0|false|False|FALSE|no|No|NO|"") ;;
   *)
     PROBE_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
+    COST_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
     PROD_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
     case ",$PRODUCTION_CACHE_LEVERS," in
       *,fisher_gptq,*) ;;
@@ -175,6 +188,7 @@ case "$PRISMAFISHERCLIP" in
   0|false|False|FALSE|no|No|NO|"") ;;
   *)
     PROBE_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
+    COST_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
     PROD_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
     export PRISMAQUANT_PRISMAFISHERCLIP=1
     export PRISMAQUANT_PRISMAFISHERCLIP_MODE="$PRISMAFISHERCLIP_MODE"
@@ -224,7 +238,7 @@ echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
 echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
 echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
-echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ PRISMACLIP=$PRISMACLIP PRISMACLIP_RBC=$PRISMACLIP_RBC PRISMAFISHERCLIP=$PRISMAFISHERCLIP PRISMAFISHERCLIP_MODE=$PRISMAFISHERCLIP_MODE AWQ=$AWQ H_DETAIL_DIR=$H_DETAIL_DIR"
+echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ FISHER_OUTPUT_MSE_ALLOCATOR=$FISHER_OUTPUT_MSE_ALLOCATOR PRISMACLIP=$PRISMACLIP PRISMACLIP_RBC=$PRISMACLIP_RBC PRISMAFISHERCLIP=$PRISMAFISHERCLIP PRISMAFISHERCLIP_MODE=$PRISMAFISHERCLIP_MODE AWQ=$AWQ H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING=${PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING:-none}"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
@@ -321,10 +335,84 @@ if [[ ! -f "${COST_PATH}" ]]; then
     --skip-missing-activations \
     --no-include-lm-head \
     --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-2048}" \
+    "${COST_H_DETAIL_ARGS[@]}" \
     2>&1 | tee "${WORK_DIR}/logs/cost.log"
 else
+  if [[ "${#COST_H_DETAIL_ARGS[@]}" -gt 0 ]]; then
+    cost_h_detail_status=$(python3 - "$COST_PATH" "$H_DETAIL_DIR" <<'PY'
+import pickle
+import sys
+from pathlib import Path
+
+with open(sys.argv[1], "rb") as f:
+    blob = pickle.load(f)
+meta = blob.get("meta", {}) if isinstance(blob, dict) else {}
+expected = str(Path(sys.argv[2]))
+actual = meta.get("h_detail_dir")
+if actual is None:
+    shards = meta.get("shards") or []
+    vals = {
+        (
+            s.get("h_detail_dir")
+            or (
+                s.get("incremental_shard", {}).get("h_detail_dir")
+                if isinstance(s.get("incremental_shard"), dict)
+                else None
+            )
+        )
+        for s in shards
+        if isinstance(s, dict)
+    }
+    vals.discard(None)
+    if len(vals) == 1:
+        actual = next(iter(vals))
+    elif len(vals) > 1:
+        actual = "__mixed__"
+print("ok" if actual == expected else f"bad:{actual}")
+PY
+)
+    if [[ "$cost_h_detail_status" != "ok" ]]; then
+      echo "[pipeline] [2/4] ABORT: cost.pkl was not measured with requested h-detail dir."
+      echo "             expected: $H_DETAIL_DIR"
+      echo "             actual:   ${cost_h_detail_status#bad:}"
+      echo "             Delete stale cost artifacts to regenerate:"
+      echo "               rm ${COST_PATH}"
+      echo "               rm -rf ${WORK_DIR}/work/shards"
+      exit 2
+    fi
+  fi
   echo "[pipeline] [2/4] cost.pkl exists, skipping"
 fi
+case "$FISHER_OUTPUT_MSE_ALLOCATOR" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    fisher_output_mse_cost_status=$(python3 - "$COST_PATH" <<'PY'
+import pickle
+import sys
+
+with open(sys.argv[1], "rb") as f:
+    blob = pickle.load(f)
+costs = blob.get("costs", {}) if isinstance(blob, dict) else {}
+count = 0
+for per_name in costs.values():
+    if not isinstance(per_name, dict):
+        continue
+    for entry in per_name.values():
+        if isinstance(entry, dict) and "fisher_output_mse" in entry:
+            count += 1
+print(count)
+PY
+)
+    if [[ "${fisher_output_mse_cost_status:-0}" == "0" ]]; then
+      echo "[pipeline] [2/4] ABORT: FISHER_OUTPUT_MSE_ALLOCATOR=1 but cost.pkl has no fisher_output_mse entries."
+      echo "             Regenerate probe activation cache, h-detail, and cost with current code:"
+      echo "               rm ${PROBE_PATH} ${COST_PATH}"
+      echo "               rm -rf ${WORK_DIR}/act ${WORK_DIR}/h_detail ${WORK_DIR}/work/shards"
+      exit 2
+    fi
+    echo "[pipeline] [2/4] Fisher output-MSE cost entries: $fisher_output_mse_cost_status"
+    ;;
+esac
 
 # -----------------------------------------------------------------------
 # 3. Allocator (multi-choice knapsack over per-layer formats)

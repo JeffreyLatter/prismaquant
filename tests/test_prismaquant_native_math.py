@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -96,6 +97,37 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         )
         self.assertAlmostEqual(by_fmt["FP8_E4M3"].predicted_dloss, 0.5 * 2.0 * 0.25)
         self.assertAlmostEqual(by_fmt["BF16"].predicted_dloss, 0.0)
+
+    def test_build_candidates_can_use_fisher_output_mse(self):
+        stats = {
+            "layer.weight": {
+                "h_trace": 2.0,
+                "out_features": 5,
+                "in_features": 7,
+                "n_params": 35,
+            }
+        }
+        costs = {
+            "layer.weight": {
+                "FP8_E4M3": {
+                    "weight_mse": 0.10,
+                    "output_mse": 0.25,
+                    "fisher_output_mse": 0.05,
+                },
+            }
+        }
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            cands = build_candidates(stats, costs, [fr.get_format("FP8_E4M3")])
+        self.assertAlmostEqual(cands["layer.weight"][0].predicted_dloss, 0.25)
+
+        with mock.patch.dict(
+            "os.environ",
+            {"PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR": "1"},
+            clear=True,
+        ):
+            cands = build_candidates(stats, costs, [fr.get_format("FP8_E4M3")])
+        self.assertAlmostEqual(cands["layer.weight"][0].predicted_dloss, 0.05)
 
     def test_build_candidates_prices_source_fp8_below_mxfp8(self):
         stats = {

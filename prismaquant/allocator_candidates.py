@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -268,6 +269,13 @@ def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
     return True
 
 
+def _fisher_output_mse_allocator_enabled() -> bool:
+    value = os.environ.get("PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR")
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def cost_entry_predicted_dloss(
     stats_entry: dict,
     cost_entry: dict,
@@ -276,6 +284,15 @@ def cost_entry_predicted_dloss(
 ) -> float:
     """Return the allocator's authoritative Δloss for one cost entry."""
     if _has_measured_output_mse(stats_entry, cost_entry):
+        if (
+            _fisher_output_mse_allocator_enabled()
+            and "fisher_output_mse" in cost_entry
+        ):
+            return predicted_dloss(
+                stats_entry["h_trace"],
+                float(cost_entry["fisher_output_mse"]),
+                gain=gain,
+            )
         return predicted_dloss(
             stats_entry["h_trace"],
             float(cost_entry["output_mse"]),

@@ -93,6 +93,17 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
+        h_detail_dirs = set()
+        for shard_meta in shard_metas:
+            if not isinstance(shard_meta, dict):
+                continue
+            h_detail_dir = shard_meta.get("h_detail_dir")
+            if h_detail_dir is None:
+                nested = shard_meta.get("incremental_shard")
+                if isinstance(nested, dict):
+                    h_detail_dir = nested.get("h_detail_dir")
+            if h_detail_dir is not None:
+                h_detail_dirs.add(h_detail_dir)
         pickle.dump({
             "costs": merged_costs,
             "formats": merged_formats or [],
@@ -100,6 +111,11 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
                 "incremental": True,
                 "n_shards": len(paths),
                 "shards": shard_metas,
+                "h_detail_dir": (
+                    next(iter(h_detail_dirs))
+                    if len(h_detail_dirs) == 1
+                    else None
+                ),
             },
         }, f)
 
@@ -706,7 +722,8 @@ def main():
     ap.add_argument("--h-detail-dir", default=None,
                     help="If set, read per-Linear Fisher H diagonal (from "
                          "incremental_probe's --h-detail-dir) and emit "
-                         "per-(layer, format) predicted_dloss alongside "
+                         "per-(layer, format) predicted_dloss and "
+                         "Fisher row-weighted fisher_output_mse alongside "
                          "weight_mse in cost.pkl.")
     args = ap.parse_args()
 
@@ -788,7 +805,8 @@ def main():
         if detail_path.exists():
             h_detail = HDetailIndex(detail_path, set(stats.keys()))
             print(f"[incremental-cost] h-detail cache: {len(h_detail)} Linears "
-                  "→ full per-weight Δloss cost model", flush=True)
+                  "→ per-weight Δloss + Fisher row-weighted output MSE",
+                  flush=True)
         else:
             print(f"[incremental-cost] WARN: h-detail dir {detail_path} not "
                   f"found; falling back to scalar proxy", flush=True)

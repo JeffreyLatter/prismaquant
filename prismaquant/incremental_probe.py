@@ -1055,6 +1055,7 @@ class GlobalPrecompute:
     resident_h_full: dict[str, torch.Tensor]
     resident_g2_per_token: dict[str, torch.Tensor]
     resident_act_snaps: dict[str, list[torch.Tensor]]
+    resident_act_row_indices: dict[str, list[torch.Tensor]]
     expert_saliency: dict[str, dict[int, float]]
     expert_info: dict[str, tuple[str, str]]
     router_counts: dict[str, dict[str, float]]
@@ -1228,7 +1229,9 @@ def _compute_global_precompute(
     resident_saved_inputs: dict[str, torch.Tensor] = {}
     resident_handles: list = []
     resident_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
+    resident_act_row_indices: dict[str, list[torch.Tensor]] = defaultdict(list)
     resident_act_rows: dict[str, int] = defaultdict(int)
+    resident_act_token_offsets: dict[str, int] = defaultdict(int)
     resident_input_rows_limit = 256
     _resident_cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
     if _resident_cache_dir is not None:
@@ -1240,12 +1243,19 @@ def _compute_global_precompute(
             resident_saved_inputs[name] = x.detach()
             if _resident_cache_dir is not None:
                 need = resident_input_rows_limit - resident_act_rows[name]
+                flat = x.detach().reshape(-1, x.size(-1))
+                base = int(resident_act_token_offsets[name])
+                resident_act_token_offsets[name] += int(flat.size(0))
                 if need > 0:
-                    flat = x.detach().reshape(-1, x.size(-1))
                     if flat.size(0) > need:
                         idx = torch.randperm(flat.size(0), device=flat.device)[:need]
                         flat = flat.index_select(0, idx)
+                    else:
+                        idx = torch.arange(flat.size(0), device=flat.device)
                     resident_act_snaps[name].append(flat.to("cpu"))
+                    resident_act_row_indices[name].append(
+                        (idx.detach().to("cpu", dtype=torch.long) + base)
+                    )
                     resident_act_rows[name] += flat.size(0)
         return hook
 
@@ -1389,6 +1399,7 @@ def _compute_global_precompute(
             if parts
         },
         resident_act_snaps=dict(resident_act_snaps),
+        resident_act_row_indices=dict(resident_act_row_indices),
         expert_saliency=phase1_expert_saliency,
         expert_info=phase1_expert_info,
         router_counts=phase1_router_counts,
@@ -1413,6 +1424,7 @@ def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
         "resident_h_full": pre.resident_h_full,
         "resident_g2_per_token": pre.resident_g2_per_token,
         "resident_act_snaps": pre.resident_act_snaps,
+        "resident_act_row_indices": pre.resident_act_row_indices,
         "expert_saliency": pre.expert_saliency,
         "expert_info": pre.expert_info,
         "router_counts": pre.router_counts,
@@ -1449,6 +1461,7 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
         resident_h_full=data["resident_h_full"],
         resident_g2_per_token=data.get("resident_g2_per_token", {}),
         resident_act_snaps=data["resident_act_snaps"],
+        resident_act_row_indices=data.get("resident_act_row_indices", {}),
         # REAP expert pruning is archived. Ignore any saliency persisted
         # by older precompute caches so resumed probes do not re-emit it.
         expert_saliency={},
@@ -1601,6 +1614,11 @@ def _run_body_streaming_shard(
         for n, snaps in precomputed.resident_act_snaps.items()
         if n in resident_linears
     }
+    resident_act_row_indices: dict[str, list[torch.Tensor]] = {
+        n: list(indices)
+        for n, indices in precomputed.resident_act_row_indices.items()
+        if n in resident_linears
+    }
 
     # Fold resident Fisher stats + H-diag into the main accumulators so
     # downstream finalization / h-detail / pickle write paths are agnostic
@@ -1619,7 +1637,9 @@ def _run_body_streaming_shard(
     # Activation snap accumulators (populated during Phase-3 for body
     # Linears; resident snaps were populated during Phase-2 hooks above).
     activation_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
+    activation_row_indices: dict[str, list[torch.Tensor]] = defaultdict(list)
     activation_rows: dict[str, int] = defaultdict(int)
+    activation_token_offsets: dict[str, int] = defaultdict(int)
     input_rows_limit = max(1, int(activation_rows_limit))
     cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
     if cache_dir is not None:
@@ -1649,7 +1669,10 @@ def _run_body_streaming_shard(
     def _act_save_one(path, payload):
         torch.save(payload, path)
 
-    def flush_activation_snapshots(snaps_by_name: dict[str, list[torch.Tensor]]):
+    def flush_activation_snapshots(
+        snaps_by_name: dict[str, list[torch.Tensor]],
+        indices_by_name: dict[str, list[torch.Tensor]] | None = None,
+    ):
         if cache_dir is None:
             return
         for name in list(snaps_by_name.keys()):
@@ -1670,14 +1693,23 @@ def _run_body_streaming_shard(
             X = torch.cat(snaps, dim=0).to(
                 "cpu", dtype=cache_dtype
             ).contiguous()
+            row_indices = None
+            if indices_by_name is not None:
+                index_parts = indices_by_name.pop(name, [])
+                if index_parts:
+                    row_indices = torch.cat(index_parts, dim=0).to(
+                        torch.long
+                    ).contiguous()
+            payload = {"inputs": X, "name": name}
+            if row_indices is not None and row_indices.numel() == X.shape[0]:
+                payload["row_indices"] = row_indices
             fname = act_fname_sub.sub("__", name) + ".pt"
             target = cache_dir / fname
             if _act_pool is not None:
-                fut = _act_pool.submit(
-                    _act_save_one, target, {"inputs": X, "name": name})
+                fut = _act_pool.submit(_act_save_one, target, payload)
                 _act_pending.append(fut)
             else:
-                torch.save({"inputs": X, "name": name}, target)
+                torch.save(payload, target)
 
     def drain_activation_writes():
         """Block until all background activation-cache writes have
@@ -1869,11 +1901,15 @@ def _run_body_streaming_shard(
                     saved_inputs[name] = x.detach()
                     if cache_dir is not None:
                         need = input_rows_limit - activation_rows[name]
+                        flat = x.detach().reshape(-1, x.size(-1))
+                        base = int(activation_token_offsets[name])
+                        activation_token_offsets[name] += int(flat.size(0))
                         if need > 0:
-                            flat = x.detach().reshape(-1, x.size(-1))
                             if flat.size(0) > need:
                                 idx = torch.randperm(flat.size(0), device=flat.device)[:need]
                                 flat = flat.index_select(0, idx)
+                            else:
+                                idx = torch.arange(flat.size(0), device=flat.device)
                             # v22 Fix C: keep on device when async writes
                             # are enabled. Each per-Linear .to("cpu") in
                             # the inline path forces a device→host
@@ -1886,6 +1922,9 @@ def _run_body_streaming_shard(
                                 activation_snaps[name].append(flat.detach())
                             else:
                                 activation_snaps[name].append(flat.to("cpu"))
+                            activation_row_indices[name].append(
+                                (idx.detach().to("cpu", dtype=torch.long) + base)
+                            )
                             activation_rows[name] += flat.size(0)
                 return hook
 
@@ -2311,7 +2350,7 @@ def _run_body_streaming_shard(
             # Holding every target expert's sampled inputs until shard
             # finalization adds several GB of avoidable host pressure on
             # MiniMax's 256-expert layers.
-            flush_activation_snapshots(activation_snaps)
+            flush_activation_snapshots(activation_snaps, activation_row_indices)
             flush_activation_snapshots(packed_act_snaps)
 
             phase_pressure_trim_bytes += int(ctx.unload(L) or 0)
@@ -2387,7 +2426,7 @@ def _run_body_streaming_shard(
 
     # Flush activation snapshots.
     if cache_dir is not None:
-        flush_activation_snapshots(activation_snaps)
+        flush_activation_snapshots(activation_snaps, activation_row_indices)
         flush_activation_snapshots(packed_act_snaps)
         cache_dtype = (torch.float32
                        if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32", "1") != "0"
@@ -2396,8 +2435,16 @@ def _run_body_streaming_shard(
             if not snaps:
                 continue
             X = torch.cat(snaps, dim=0).to(cache_dtype).contiguous()
+            row_parts = resident_act_row_indices.get(name, [])
+            row_indices = (
+                torch.cat(row_parts, dim=0).to(torch.long).contiguous()
+                if row_parts else None
+            )
+            payload = {"inputs": X, "name": name}
+            if row_indices is not None and row_indices.numel() == X.shape[0]:
+                payload["row_indices"] = row_indices
             fname = act_fname_sub.sub("__", name) + ".pt"
-            torch.save({"inputs": X, "name": name}, cache_dir / fname)
+            torch.save(payload, cache_dir / fname)
         # v22 Fix C: block until any async writes have completed so the
         # cost step sees a fully-flushed activation cache directory.
         drain_activation_writes()

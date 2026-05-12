@@ -20,6 +20,8 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_PROBE_CTX_CACHE` | (set by `multi_chunk_probe`) | Lets `incremental_probe.main()` reuse a cached `StreamingContext` across N invocations in the same Python process. Don't set manually unless you know what you're doing. |
 | `PRISMAQUANT_PROBE_DOMAIN` | (per-chunk) | Tag each chunk's probe pickle with a domain label (used by adaptive-sampling per-domain saliency). Set automatically by `multi_chunk_probe` based on `chunk_<domain>_<idx>.jsonl` filename. |
 | `PRISMAQUANT_COST_PREFETCH_ACT` | **on** | `measure_batched_gpu` prefetches chunk N+1's activation files on a thread pool while chunk N runs on the GPU. Hides ~30-40% of the cost step's wall on big models. |
+| `PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR` | **off** | Makes allocator candidate construction use `fisher_output_mse` from the cost table when present. This is a Fisher row-weighted local objective: output reconstruction error weighted by per-token end-loss gradient² from h-detail. |
+| `PRISMAQUANT_FISHER_OUTPUT_MSE_ROW_WEIGHT_CLIP` | `PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP` or `64` | Caps normalized `g2_per_token` row weights when computing `fisher_output_mse`, then re-normalizes to mean 1. |
 
 Probe CLI: `kl_sensitivity_probe.py --prismaclip-candidates` direct-KL-gates
 PrismaClip proposals without adding a pseudo-format to allocation. It uses the
@@ -66,10 +68,11 @@ These are `run-pipeline.sh` environment variables rather than
 | `PRODUCTION_RECACHE` | `1` | Replay calibration with production weights installed and re-fit `activation_max_abs` before export. |
 | `PRODUCTION_CACHE_LEVERS` | `gptq,scale_sweep` | Render-time quality levers for the production cache. `FISHER_WEIGHTED_GPTQ=1` appends `fisher_gptq`; `PRISMAQUANT_ACT_CLIP_SOLVER=1` enables PrismaClip through the cache code. |
 | `FISHER_WEIGHTED_GPTQ` | `0` | Pipeline switch that writes h-detail during probe, passes it into production cache fill, and uses a distinct `_fisher` cache path. |
+| `FISHER_OUTPUT_MSE_ALLOCATOR` | `0` | Pipeline switch that writes h-detail during probe, records activation-cache row indices, passes h-detail into cost measurement, and exports `PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=1` so the allocator optimizes the Fisher row-weighted `fisher_output_mse` objective. It does not change render-time quantization math by itself. |
 | `PRISMACLIP` | `0` | Pipeline switch for PrismaClip. Appends `act_clip_solver` to `PRODUCTION_CACHE_LEVERS` and sets `PRISMAQUANT_ACT_CLIP_SOLVER=1`, so NVFP4 production-cache renders use the local output-MSE clipping solver while runtime layer configs still emit ordinary NVFP4. |
 | `PRISMACLIP_RBC` | `0` | **Disabled.** Setting this to a truthy value makes the pipeline fail fast pending investigation of the 2026-05-12 .8B KL regression and ~10x cache-fill slowdown. |
 | `PRISMAFISHERCLIP` | `0` | Pipeline switch that writes h-detail during probe, enables `act_clip_solver,fisher_clip`, and tags the production cache with `_fisherclip`. This scores clip thresholds with Fisher weights but leaves Fisher-weighted GPTQ off unless `FISHER_WEIGHTED_GPTQ=1`. |
-| `H_DETAIL_DIR` | `$WORK_DIR/h_detail` | h-detail directory used when `FISHER_WEIGHTED_GPTQ=1` or `PRISMAFISHERCLIP=1`. |
+| `H_DETAIL_DIR` | `$WORK_DIR/h_detail` | h-detail directory used when `FISHER_WEIGHTED_GPTQ=1`, `FISHER_OUTPUT_MSE_ALLOCATOR=1`, or `PRISMAFISHERCLIP=1`. |
 | `SELECTION_MODE` | `surrogate` | `surrogate` preserves the normal allocator-selected `TARGET_BITS` assignment. `validated-surrogate` writes allocator Pareto assignments, builds a format-menu production cache, measures real assignment KL for each Pareto point, selects the measured KL/bpp kneedle with `prismaquant.select_validated_frontier`, then recaches and exports the selected assignment. |
 | `VALIDATED_FRONTIER_NSAMPLES` / `VALIDATED_FRONTIER_SEQLEN` | `$NSAMPLES` / `$SEQLEN` | Calibration size for measured-frontier KL selection. Keep these at the artifact validation contract for 27B decisions; lower values are smoke-only. |
 | `VALIDATED_FRONTIER_PICK` | `kneedle` | Selection rule for `SELECTION_MODE=validated-surrogate`: `kneedle`, `best-kl`, or `lowest-bpp`. Production selection should use `kneedle` unless the run is explicitly an ablation. |

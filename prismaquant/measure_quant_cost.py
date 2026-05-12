@@ -18,7 +18,8 @@ Two execution modes:
 
 Output format is identical between modes: a dict keyed by Linear name,
 each entry mapping format name to {weight_mse, output_mse,
-rel_output_mse}.
+rel_output_mse}. When h-detail is supplied, entries may also include
+`predicted_dloss` and `fisher_output_mse`.
 """
 from __future__ import annotations
 
@@ -58,6 +59,7 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                        weight_mse: float, output_mse: float,
                        rel_output_mse: float,
                        predicted_dloss: float | None = None,
+                       fisher_output_mse: float | None = None,
                        output_mse_measured: bool = True):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
@@ -67,6 +69,8 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_rel_output_mse_sum": 0.0,
         "_predicted_dloss_sum": 0.0,
         "_predicted_dloss_count": 0,
+        "_fisher_output_mse_sum": 0.0,
+        "_fisher_output_mse_count": 0,
         "_output_mse_measured": True,
     })
     acc["_count"] += 1
@@ -76,6 +80,9 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
     if predicted_dloss is not None:
         acc["_predicted_dloss_sum"] += predicted_dloss
         acc["_predicted_dloss_count"] += 1
+    if fisher_output_mse is not None:
+        acc["_fisher_output_mse_sum"] += fisher_output_mse
+        acc["_fisher_output_mse_count"] += 1
     acc["_output_mse_measured"] = bool(
         acc["_output_mse_measured"] and output_mse_measured
     )
@@ -92,6 +99,8 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             n = max(int(acc.pop("_count", 1)), 1)
             dloss_n = int(acc.pop("_predicted_dloss_count", 0) or 0)
             dloss_sum = acc.pop("_predicted_dloss_sum", 0.0)
+            fisher_n = int(acc.pop("_fisher_output_mse_count", 0) or 0)
+            fisher_sum = acc.pop("_fisher_output_mse_sum", 0.0)
             output_mse_measured = bool(acc.pop("_output_mse_measured", True))
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
@@ -105,6 +114,11 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 # allocator prefers this scalar over the scalar-proxy
                 # fallback when it's present.
                 entry["predicted_dloss"] = dloss_sum / dloss_n
+            if fisher_n > 0:
+                # Fisher row-weighted output reconstruction objective:
+                # local output MSE with rows weighted by end-loss
+                # gradient² from the probe's h-detail.
+                entry["fisher_output_mse"] = fisher_sum / fisher_n
             out[name][fmt] = entry
     return out
 
@@ -138,13 +152,62 @@ class HDetailIndex:
     def load(self, name: str) -> torch.Tensor:
         blob = torch.load(self._paths[name], map_location="cpu",
                           weights_only=False)
-        return blob["h_diag"]
+        return self.h_diag_from_blob(blob)
 
     def load_blob(self, name: str) -> dict:
         """Return the full saved dict (for callers that want g2_per_token,
         kind, version, etc., not just h_diag)."""
         return torch.load(self._paths[name], map_location="cpu",
                           weights_only=False)
+
+    @staticmethod
+    def h_diag_from_blob(blob: dict) -> torch.Tensor:
+        if "h_diag" in blob:
+            return blob["h_diag"]
+        if "H" in blob:
+            return blob["H"]
+        raise KeyError("h-detail blob has neither 'h_diag' nor 'H'")
+
+
+def _normalize_fisher_output_mse_row_weights(
+    row_weights: torch.Tensor | None,
+    row_indices: torch.Tensor | None,
+    n_rows: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return non-negative per-row Fisher weights normalized to mean 1."""
+    if row_weights is None or row_indices is None or n_rows <= 0:
+        return None
+    try:
+        source = row_weights.detach().reshape(-1).to(device=device, dtype=torch.float32)
+        idx = row_indices.detach().reshape(-1).to(device=device, dtype=torch.long)
+    except Exception:
+        return None
+    if idx.numel() < n_rows or source.numel() <= 0:
+        return None
+    idx = idx[:n_rows]
+    if int(idx.min().item()) < 0 or int(idx.max().item()) >= int(source.numel()):
+        return None
+    rw = source.index_select(0, idx)
+    rw = torch.nan_to_num(rw, nan=0.0, posinf=0.0, neginf=0.0)
+    rw = rw.clamp_min(0.0)
+    mean = rw.mean()
+    if not torch.isfinite(mean) or float(mean.item()) <= 0.0:
+        return None
+    rw = rw / mean.clamp_min(1e-12)
+    try:
+        clip = float(os.environ.get(
+            "PRISMAQUANT_FISHER_OUTPUT_MSE_ROW_WEIGHT_CLIP",
+            os.environ.get("PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP", "64"),
+        ))
+    except Exception:
+        clip = 64.0
+    if clip > 0.0:
+        rw = rw.clamp_max(float(clip))
+        mean2 = rw.mean()
+        if torch.isfinite(mean2) and float(mean2.item()) > 0.0:
+            rw = rw / mean2.clamp_min(1e-12)
+    return rw
 
 
 # ---------------------------------------------------------------------------
@@ -181,9 +244,19 @@ class ActivationIndex:
         return len(self._paths)
 
     def load(self, name: str) -> torch.Tensor:
-        blob = torch.load(self._paths[name], map_location="cpu",
-                          weights_only=False)
+        blob = self.load_blob(name)
         return blob["inputs"]
+
+    def load_blob(self, name: str) -> dict:
+        return torch.load(self._paths[name], map_location="cpu",
+                          weights_only=False)
+
+    def load_with_row_indices(self, name: str) -> tuple[torch.Tensor, torch.Tensor | None]:
+        blob = self.load_blob(name)
+        row_indices = blob.get("row_indices") if isinstance(blob, dict) else None
+        if not isinstance(row_indices, torch.Tensor):
+            row_indices = None
+        return blob["inputs"], row_indices
 
     def names(self):
         return self._paths.keys()
@@ -284,9 +357,9 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
     """One-Linear-at-a-time measurement. Simple, safe, slow on small ops
     running through unified memory but robust when batching isn't an option.
 
-    When `h_detail` is provided, also emits a full per-weight Δloss
-    `0.5 · <H_full, (W - W_hat)²>` per (Linear, format) — the allocator
-    prefers this scalar over the scalar-proxy fallback when present.
+    When `h_detail` is provided, also emits full per-weight Δloss
+    `0.5 · <H_full, (W - W_hat)²>` and a Fisher row-weighted
+    `fisher_output_mse` from `g2_per_token` when those tensors are present.
     """
     accum: dict[str, dict[str, dict]] = {}
     processed = 0
@@ -301,15 +374,28 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
         if canonical_name not in act_cache:
             continue
         W = mod.weight.detach()
-        X = act_cache.load(canonical_name).to(W.dtype).to(W.device)
+        X_cpu, row_indices = act_cache.load_with_row_indices(canonical_name)
+        X = X_cpu.to(W.dtype).to(W.device)
         y_ref = X @ W.T
         ref_energy = float(y_ref.float().pow(2).mean().item())
-        # Per-weight H diagonal if available. Shape matches W.
+        # Per-weight H diagonal and per-token g² weights if available.
+        # Shape of H matches W; g² aligns with rows of X.
         h_full = None
+        gq_rows = None
         if h_detail is not None and canonical_name in h_detail:
-            h_full = h_detail.load(canonical_name).to(W.device).float()
-            if h_full.shape != W.shape:
-                h_full = None  # shape mismatch → fall back to scalar only
+            blob = h_detail.load_blob(canonical_name)
+            try:
+                h_full = HDetailIndex.h_diag_from_blob(blob).to(W.device).float()
+                if h_full.shape != W.shape:
+                    h_full = None  # shape mismatch → fall back to scalar only
+            except Exception:
+                h_full = None
+            gq_rows = _normalize_fisher_output_mse_row_weights(
+                blob.get("g2_per_token") if isinstance(blob, dict) else None,
+                row_indices,
+                int(X.shape[0]),
+                W.device,
+            )
 
         for spec in specs:
             try:
@@ -318,7 +404,13 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                 err = (W - W_hat).float()
                 weight_mse = float(err.pow(2).mean().item())
                 y_q = X_hat @ W_hat.T
-                output_mse = float((y_ref - y_q).float().pow(2).mean().item())
+                y_err_sq = (y_ref - y_q).float().pow(2)
+                output_mse = float(y_err_sq.mean().item())
+                fisher_output_mse = None
+                if gq_rows is not None:
+                    fisher_output_mse = float(
+                        (y_err_sq * gq_rows.unsqueeze(1)).mean().item()
+                    )
                 predicted_dloss = None
                 if h_full is not None:
                     predicted_dloss = float(0.5 * (h_full * err.pow(2)).sum().item())
@@ -330,6 +422,7 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                     output_mse,
                     output_mse / max(ref_energy, 1e-12),
                     predicted_dloss=predicted_dloss,
+                    fisher_output_mse=fisher_output_mse,
                 )
             except Exception as e:
                 accum.setdefault(canonical_name, {})[spec.name] = {"error": str(e)}
@@ -579,9 +672,9 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     rows × 2048 = 128 MB activations; 3 formats × (W, Ŵ, Y_ref, Y_q) peak
     ~2 GB. Safe at chunk_size=256 on any GPU with 4+ GB free.
 
-    When `h_detail` is provided, also emits a full per-weight Δloss
-    `0.5 · <H_full, (W - W_hat)²>` per (Linear, format) alongside the
-    scalar output_mse.
+    When `h_detail` is provided, also emits full per-weight Δloss
+    `0.5 · <H_full, (W - W_hat)²>` and a Fisher row-weighted
+    `fisher_output_mse` from `g2_per_token` when those tensors are present.
     """
     dev = torch.device(device)
     groups = _group_by_shape(model, target_names)
@@ -613,7 +706,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     _prefetch_pool = _Pool(max_workers=2) if _prefetch_enabled else None
 
     def _load_chunk_acts(_names):
-        return [act_cache.load(n) for n in _names]
+        return [act_cache.load_with_row_indices(n) for n in _names]
 
     for (in_f, out_f), entries in groups.items():
         entries_with_acts = [(n, m) for n, m in entries if n in act_cache]
@@ -638,7 +731,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
             # enabled, the future is already in flight from the prior
             # iteration (or kicked off above for the first chunk).
             if _prefetch_enabled:
-                acts_cpu = next_acts_fut.result()
+                act_items_cpu = next_acts_fut.result()
                 # Submit the NEXT chunk's load before we touch the GPU
                 # so the disk reads overlap with the upcoming bmm.
                 if chunk_i + 1 < len(chunks_list):
@@ -648,7 +741,9 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 else:
                     next_acts_fut = None
             else:
-                acts_cpu = [act_cache.load(n) for n in names]
+                act_items_cpu = [act_cache.load_with_row_indices(n) for n in names]
+            acts_cpu = [item[0] for item in act_items_cpu]
+            row_indices_cpu = [item[1] for item in act_items_cpu]
             chunk_min_rows = min(a.size(0) for a in acts_cpu)
             # Stack weights
             W = torch.stack([m.weight.detach().to(device=dev, dtype=dtype)
@@ -657,7 +752,11 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
             X = torch.stack(
                 [a[:chunk_min_rows].to(device=dev, dtype=dtype)
                  for a in acts_cpu], dim=0)               # (N, rows, in)
-            del acts_cpu
+            row_indices_cpu = [
+                idx[:chunk_min_rows] if isinstance(idx, torch.Tensor) else None
+                for idx in row_indices_cpu
+            ]
+            del acts_cpu, act_items_cpu
             # Reference output (per-item BMM): shape (N, rows, out)
             y_ref = torch.bmm(X, W.transpose(1, 2))
             ref_energy = y_ref.float().pow(2).mean(dim=(1, 2))   # (N,)
@@ -665,22 +764,46 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
             # Per-item H full tensor stacked across the chunk, for the
             # per-weight Δloss computation. Missing items get None.
             h_stacked = None
-            h_avail = [False] * N
+            gq_stacked = None
             if h_detail is not None:
                 h_items = []
-                all_have = True
-                for nm in names:
+                gq_items = []
+                all_have_h = True
+                all_have_gq = True
+                for idx_nm, nm in enumerate(names):
                     if nm in h_detail:
-                        h = h_detail.load(nm)
-                        if h.shape == (W.size(1), W.size(2)):
+                        blob = h_detail.load_blob(nm)
+                        try:
+                            h = HDetailIndex.h_diag_from_blob(blob)
+                        except Exception:
+                            h = None
+                        if h is not None and h.shape == (W.size(1), W.size(2)):
                             h_items.append(h.to(dev).float())
-                            continue
-                    all_have = False
-                    break
-                if all_have and h_items:
+                        else:
+                            all_have_h = False
+                        gq = (
+                            blob.get("g2_per_token")
+                            if isinstance(blob, dict)
+                            else None
+                        )
+                        gq_rows = _normalize_fisher_output_mse_row_weights(
+                            gq,
+                            row_indices_cpu[idx_nm],
+                            chunk_min_rows,
+                            dev,
+                        )
+                        if gq_rows is not None:
+                            gq_items.append(gq_rows)
+                        else:
+                            all_have_gq = False
+                    else:
+                        all_have_h = False
+                        all_have_gq = False
+                if all_have_h and len(h_items) == N:
                     h_stacked = torch.stack(h_items, dim=0)   # (N, out, in)
-                    h_avail = [True] * N
-                    del h_items
+                if all_have_gq and len(gq_items) == N:
+                    gq_stacked = torch.stack(gq_items, dim=0)  # (N, rows)
+                del h_items, gq_items
 
             for spec in specs:
                 try:
@@ -689,8 +812,14 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     err = (W - W_hat).float()
                     weight_mse = err.pow(2).mean(dim=(1, 2))  # (N,)
                     y_q = torch.bmm(X_hat, W_hat.transpose(1, 2))
-                    output_mse = (y_ref - y_q).float().pow(2).mean(dim=(1, 2))  # (N,)
+                    y_err_sq = (y_ref - y_q).float().pow(2)
+                    output_mse = y_err_sq.mean(dim=(1, 2))  # (N,)
                     rel_mse = output_mse / ref_energy.clamp_min(1e-12)
+                    fisher_output_mse = None
+                    if gq_stacked is not None:
+                        fisher_output_mse = (
+                            y_err_sq * gq_stacked.unsqueeze(2)
+                        ).mean(dim=(1, 2))
                     # Per-item predicted Δloss from full per-weight
                     # Fisher. shape (N,).
                     dloss_per = None
@@ -699,18 +828,19 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     # Move all scalar metrics back to the host in one shot.
                     # Calling `.item()` per Linear forces a CUDA sync for each
                     # row and turns the batched path back into serialized work.
-                    metrics = torch.stack(
-                        (weight_mse, output_mse, rel_mse), dim=1
-                    ).detach().cpu().tolist()
+                    metric_cols = [weight_mse, output_mse, rel_mse]
+                    if fisher_output_mse is not None:
+                        metric_cols.append(fisher_output_mse)
+                    metrics = torch.stack(metric_cols, dim=1).detach().cpu().tolist()
                     if dloss_per is not None:
                         dloss_values = dloss_per.detach().cpu().tolist()
                     else:
                         dloss_values = [None] * N
 
                     # Unpack per-item into results dict after the single sync.
-                    for name, (w_mse, out_mse, rel), dloss_val in zip(
-                        names, metrics, dloss_values
-                    ):
+                    for name, row, dloss_val in zip(names, metrics, dloss_values):
+                        w_mse, out_mse, rel = row[:3]
+                        fisher_val = row[3] if len(row) > 3 else None
                         _accumulate_result(
                             accum,
                             name,
@@ -723,16 +853,28 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                                 if dloss_val is not None
                                 else None
                             ),
+                            fisher_output_mse=(
+                                float(fisher_val)
+                                if fisher_val is not None
+                                else None
+                            ),
                         )
-                    del W_hat, X_hat, err, y_q, weight_mse, output_mse, rel_mse
+                    del W_hat, X_hat, err, y_q, y_err_sq
+                    del weight_mse, output_mse, rel_mse
                     del metrics, dloss_values
                     if dloss_per is not None:
                         del dloss_per
+                    if fisher_output_mse is not None:
+                        del fisher_output_mse
                 except Exception as e:
                     for name in names:
                         accum.setdefault(name, {})[spec.name] = {"error": str(e)}
 
             del W, X, y_ref, ref_energy
+            if h_stacked is not None:
+                del h_stacked
+            if gq_stacked is not None:
+                del gq_stacked
             processed += N
             if processed % (chunk_size * 4) == 0 or processed == total_linears:
                 elapsed = time.time() - tstart
@@ -802,8 +944,9 @@ def run_cost_pass(model: nn.Module,
         if detail_path.exists():
             h_detail = HDetailIndex(detail_path, target_names)
             print(f"[cost] h-detail cache: {len(h_detail)} / {len(target_names)} "
-                  "Linears have full Fisher diagonal → using per-weight "
-                  "Δloss cost model", flush=True)
+                  "Linears have h-detail → using per-weight Δloss and "
+                  "Fisher row-weighted output MSE when available",
+                  flush=True)
         else:
             print(f"[cost] WARN: h-detail dir {detail_path} not found; "
                   "falling back to scalar proxy", flush=True)
@@ -846,6 +989,7 @@ def run_cost_pass(model: nn.Module,
                 "n_linears": len(results),
                 "missing_activations": missing_act,
                 "mode": chosen_mode,
+                "h_detail_dir": str(Path(h_detail_dir)) if h_detail_dir else None,
             },
         }, f)
     print(f"[cost] wrote {out_path} ({len(results)} Linears)")

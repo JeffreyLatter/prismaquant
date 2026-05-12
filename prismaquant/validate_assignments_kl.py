@@ -155,12 +155,14 @@ def _assignment_cost_summary(
     sums = {
         "weight_mse": 0.0,
         "output_mse": 0.0,
+        "fisher_output_mse": 0.0,
         "rel_output_mse": 0.0,
         "predicted_dloss": 0.0,
     }
     counts = {
         "weight_mse": 0,
         "output_mse": 0,
+        "fisher_output_mse": 0,
         "rel_output_mse": 0,
         "predicted_dloss": 0,
     }
@@ -200,6 +202,8 @@ def _assignment_cost_summary(
         "weight_mse_mean": means["weight_mse"],
         "output_mse_sum": float(sums["output_mse"]),
         "output_mse_mean": means["output_mse"],
+        "fisher_output_mse_sum": float(sums["fisher_output_mse"]),
+        "fisher_output_mse_mean": means["fisher_output_mse"],
         "rel_output_mse_sum": float(sums["rel_output_mse"]),
         "rel_output_mse_mean": means["rel_output_mse"],
         "predicted_dloss_sum": float(sums["predicted_dloss"]),

@@ -1008,6 +1008,8 @@ class FisherAccumulator:
         self.h_detail_dir = Path(h_detail_dir) if h_detail_dir else None
         self.input_rows = input_rows
         self._input_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
+        self._input_row_indices: dict[str, list[torch.Tensor]] = defaultdict(list)
+        self._input_token_offsets: dict[str, int] = defaultdict(int)
         self._rows_got: dict[str, int] = defaultdict(int)
         # Packed expert grad-norm accumulator: written by _GradNormCapture
         # during backward, read in finalize().
@@ -1253,12 +1255,19 @@ class FisherAccumulator:
                     stats["w_norm_sq"] = float(wd.pow(2).sum().item())
             if self.cache_dir is not None:
                 need = self.input_rows - self._rows_got[name]
+                flat = x.detach().reshape(-1, x.size(-1))
+                base = int(self._input_token_offsets[name])
+                self._input_token_offsets[name] += int(flat.size(0))
                 if need > 0:
-                    flat = x.detach().reshape(-1, x.size(-1))
                     if flat.size(0) > need:
                         idx = torch.randperm(flat.size(0), device=flat.device)[:need]
                         flat = flat.index_select(0, idx)
+                    else:
+                        idx = torch.arange(flat.size(0), device=flat.device)
                     self._input_snaps[name].append(flat.to("cpu"))
+                    self._input_row_indices[name].append(
+                        (idx.detach().to("cpu", dtype=torch.long) + base)
+                    )
                     self._rows_got[name] += flat.size(0)
         return hook
 
@@ -1486,9 +1495,16 @@ class FisherAccumulator:
                 if not snaps:
                     continue
                 X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
+                row_parts = self._input_row_indices.get(name, [])
+                row_indices = (
+                    torch.cat(row_parts, dim=0).to(torch.long).contiguous()
+                    if row_parts else None
+                )
+                payload = {"inputs": X, "name": name}
+                if row_indices is not None and row_indices.numel() == X.shape[0]:
+                    payload["row_indices"] = row_indices
                 fname = re.sub(r"[^A-Za-z0-9_-]", "__", name) + ".pt"
-                torch.save({"inputs": X, "name": name},
-                           self.cache_dir / fname)
+                torch.save(payload, self.cache_dir / fname)
             # Also write packed-experts module input snapshots. We key
             # these by the experts module qname (not the parameter name);
             # measure_quant_cost looks for the same input regardless of

@@ -44,6 +44,7 @@ def test_assignment_cost_summary_reports_local_mse_and_aliases():
             "NVFP4": {
                 "weight_mse": 1.0,
                 "output_mse": 2.0,
+                "fisher_output_mse": 1.5,
                 "rel_output_mse": 0.2,
                 "predicted_dloss": 3.0,
             },
@@ -52,6 +53,7 @@ def test_assignment_cost_summary_reports_local_mse_and_aliases():
             "MXFP8_E4M3": {
                 "weight_mse": 0.5,
                 "output_mse": 0.25,
+                "fisher_output_mse": 0.10,
                 "rel_output_mse": 0.025,
             },
         },
@@ -62,10 +64,12 @@ def test_assignment_cost_summary_reports_local_mse_and_aliases():
     )
 
     assert abs(summary["output_mse_sum"] - 2.25) < 1e-12
+    assert abs(summary["fisher_output_mse_sum"] - 1.60) < 1e-12
     assert abs(summary["weight_mse_sum"] - 1.5) < 1e-12
     assert abs(summary["rel_output_mse_sum"] - 0.225) < 1e-12
     assert abs(summary["predicted_dloss_sum"] - 3.0) < 1e-12
     assert summary["counts"]["output_mse"] == 3
+    assert summary["counts"]["fisher_output_mse"] == 2
     assert summary["counts"]["predicted_dloss"] == 1
     assert summary["missing_count"] == 1
     assert summary["missing_sample"] == ["missing"]

@@ -63,11 +63,19 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
             for name in sorted(target_names):
                 safe = ActivationIndex._FNAME_SUB.sub("__", name) + ".pt"
                 torch.save(
-                    {"inputs": torch.randn(7, 16), "name": name},
+                    {
+                        "inputs": torch.randn(7, 16),
+                        "row_indices": torch.arange(7, dtype=torch.long),
+                        "name": name,
+                    },
                     act_dir / safe,
                 )
                 torch.save(
-                    {"h_diag": torch.rand(4, 16), "name": name},
+                    {
+                        "H": torch.rand(4, 16),
+                        "g2_per_token": torch.linspace(0.25, 2.0, steps=7),
+                        "name": name,
+                    },
                     h_dir / safe,
                 )
 
@@ -104,6 +112,7 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
                     "output_mse",
                     "rel_output_mse",
                     "predicted_dloss",
+                    "fisher_output_mse",
                 ):
                     self.assertAlmostEqual(
                         batched[name][fmt][field],
@@ -111,6 +120,64 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
                         places=6,
                         msg=f"{name} {fmt} {field}",
                     )
+
+    def test_fisher_output_mse_uses_activation_row_indices(self):
+        model = nn.Module()
+        model.a = nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            model.a.weight.copy_(torch.tensor([[1.0, 2.0]]))
+
+        target_names = {"a"}
+        spec = fr.get_format("FP8_E4M3")
+        X = torch.tensor(
+            [
+                [0.2, -0.3],
+                [3.0, 0.5],
+                [-0.7, 1.2],
+            ],
+            dtype=torch.float32,
+        )
+        row_indices = torch.tensor([5, 2, 9], dtype=torch.long)
+        g2 = torch.ones(10, dtype=torch.float32)
+        g2[2] = 10.0
+        g2[5] = 1.0
+        g2[9] = 4.0
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            act_dir = root / "act"
+            h_dir = root / "h"
+            act_dir.mkdir()
+            h_dir.mkdir()
+            safe = ActivationIndex._FNAME_SUB.sub("__", "a") + ".pt"
+            torch.save(
+                {"inputs": X, "row_indices": row_indices, "name": "a"},
+                act_dir / safe,
+            )
+            torch.save(
+                {"h_diag": torch.ones(1, 2), "g2_per_token": g2, "name": "a"},
+                h_dir / safe,
+            )
+
+            act_cache = ActivationIndex(act_dir, target_names)
+            h_detail = HDetailIndex(h_dir, target_names)
+            got = measure_unbatched(
+                model,
+                act_cache,
+                target_names,
+                [spec],
+                device="cpu",
+                dtype=torch.float32,
+                h_detail=h_detail,
+            )["a"][spec.name]
+
+        W = model.a.weight.detach()
+        W_hat = spec.quantize_dequantize(W.clone())
+        y_err_sq = (X @ W.T - spec.activation_quantize_dequantize(X.clone()) @ W_hat.T).pow(2)
+        weights = g2.index_select(0, row_indices)
+        weights = weights / weights.mean()
+        expected = float((y_err_sq * weights.unsqueeze(1)).mean().item())
+        self.assertAlmostEqual(got["fisher_output_mse"], expected, places=6)
 
 
 if __name__ == "__main__":
