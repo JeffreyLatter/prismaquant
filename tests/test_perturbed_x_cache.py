@@ -140,6 +140,28 @@ def test_perturbed_cache_can_skip_activation_quant_for_probe(tmp_path, monkeypat
         without_act.remove()
 
 
+def test_perturbed_cache_can_disable_capture_for_inplace_replay(tmp_path):
+    model = nn.Sequential(nn.Linear(64, 64, bias=False)).eval()
+    x = torch.randn(2, 64)
+    cache = PerturbedActivationCache(
+        model,
+        {"0": "BF16"},
+        tmp_path,
+        input_rows=8,
+        cal_hash="test",
+        capture_inputs=False,
+    )
+
+    cache.install()
+    try:
+        _ = model(x)
+    finally:
+        cache.remove()
+
+    assert cache.max_abs == {}
+    assert cache.finalize()["written"] == []
+
+
 def test_stage_text_only_uses_work_root_for_tempdir(tmp_path):
     src = tmp_path / "model"
     src.mkdir()

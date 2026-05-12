@@ -77,6 +77,7 @@ from prismaquant.awq import (
     search_awq_scale,
 )
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
+from prismaquant.source_prefetch import prefetch_files_to_page_cache
 
 
 DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN = 0.0
@@ -288,6 +289,100 @@ class ProductionWeightCache:
                 keys.append(key)
                 seen.add(key)
         return keys, missing
+
+    def assignment_file_paths(
+        self,
+        assignment: Mapping[str, str],
+    ) -> tuple[list[Path], list[tuple[str, str]], list[tuple[str, str]]]:
+        """Return disk files backing an assignment without loading tensors.
+
+        This is a page-cache residency helper for validation paths that
+        destructively materialize one assignment into the model. It reuses the
+        same cache key resolution as ``prefetch_assignment`` but intentionally
+        does not call ``torch.load`` or create another rendered-weight cache.
+        """
+        keys, missing = self.assignment_keys(assignment)
+        paths: list[Path] = []
+        in_memory: list[tuple[str, str]] = []
+        seen_paths: set[Path] = set()
+        for key in keys:
+            value = self.weights.get(key)
+            if value is None:
+                missing.append(key)
+                continue
+            if isinstance(value, torch.Tensor):
+                path_value = (
+                    self._lru_paths.get(key)
+                    if self._lru_paths is not None else None
+                )
+                if path_value is None:
+                    in_memory.append(key)
+                    continue
+                value = path_value
+            path = Path(self._path_for_value(value)).resolve()
+            if path not in seen_paths:
+                paths.append(path)
+                seen_paths.add(path)
+        return paths, missing, in_memory
+
+    def prefetch_assignment_file_pages(
+        self,
+        assignment: Mapping[str, str],
+        *,
+        mode: str = "require",
+        max_resident_bytes: int | None = None,
+        headroom_gb: float = 24.0,
+        max_workers: int = 4,
+        progress: bool = False,
+        log_prefix: str = "[prod-cache-files]",
+    ) -> dict[str, object]:
+        """Prefetch assignment cache files into the OS page cache.
+
+        Unlike ``prefetch_assignment``, this keeps rendered weights out of the
+        Python heap. The following ``get`` calls still go through
+        ``ProductionWeightCache`` and its LRU, but deserialization reads from
+        resident file pages instead of faulting against NVMe.
+        """
+        paths, missing, in_memory = self.assignment_file_paths(assignment)
+        mode = str(mode or "off").lower()
+        if paths:
+            stats = prefetch_files_to_page_cache(
+                paths,
+                mode=mode,
+                max_resident_bytes=max_resident_bytes,
+                headroom_gb=headroom_gb,
+                workers=max_workers,
+                progress=progress,
+                log_prefix=log_prefix,
+                label="production cache files",
+            )
+        else:
+            stats = {
+                "mode": mode,
+                "label": "production cache files",
+                "files": 0,
+                "bytes": 0,
+                "max_resident_bytes": int(max_resident_bytes or 0),
+                "available_bytes": None,
+                "prefetched_bytes": 0,
+                "elapsed_seconds": 0.0,
+                "skipped": True,
+                "reason": "no disk-backed production cache files",
+            }
+        stats["keys"] = len(paths) + len(in_memory)
+        stats["in_memory"] = len(in_memory)
+        stats["missing"] = len(missing)
+        if missing:
+            stats["missing_sample"] = missing[:8]
+            msg = (
+                f"production cache missing {len(missing)} assignment entries; "
+                f"sample={missing[:8]}"
+            )
+            if mode == "require":
+                raise RuntimeError(msg)
+            if progress:
+                print(f"{log_prefix} WARNING: {msg}", flush=True)
+        return stats
 
     def prefetch_assignment(
         self,
@@ -649,6 +744,17 @@ class ProductionWeightCacheVariantView:
                 keys.append(key)
                 seen.add(key)
         return keys, missing
+
+    def assignment_file_paths(
+        self,
+        assignment: Mapping[str, str],
+    ) -> tuple[list[Path], list[tuple[str, str]], list[tuple[str, str]]]:
+        return ProductionWeightCache.assignment_file_paths(self, assignment)
+
+    def prefetch_assignment_file_pages(self, *args, **kwargs):
+        return ProductionWeightCache.prefetch_assignment_file_pages(
+            self, *args, **kwargs
+        )
 
     def prefetch_assignment(self, *args, **kwargs):
         # Reuse the base implementation against this view's assignment_keys.

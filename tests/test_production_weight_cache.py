@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import pytest
@@ -150,6 +152,45 @@ def test_recache_preload_respects_resident_budget(tmp_path):
     )
     assert stats["loaded"] == 2
     assert all(isinstance(cache.weights[k], torch.Tensor) for k in keys)
+
+
+def test_production_cache_file_page_prefetch_does_not_load_tensors(tmp_path, monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+
+    for name in ("a", "b"):
+        torch.save(torch.ones((2, 2)), tmp_path / f"{name}.pt")
+    cache = ProductionWeightCache(
+        weights={
+            ("a", "NVFP4"): "a.pt",
+            ("b", "MXFP8_E4M3"): "b.pt",
+        },
+        levers={},
+        cache_dir=str(tmp_path),
+    )
+    seen_paths = []
+
+    def fake_prefetch(paths, **kwargs):
+        seen_paths.extend(Path(path).name for path in paths)
+        return {
+            "mode": kwargs["mode"],
+            "files": len(paths),
+            "bytes": 123,
+            "prefetched_bytes": 123,
+            "skipped": False,
+        }
+
+    monkeypatch.setattr(pwc, "prefetch_files_to_page_cache", fake_prefetch)
+
+    stats = cache.prefetch_assignment_file_pages(
+        {"a": "NVFP4", "b": "MXFP8", "c": "BF16"},
+        mode="require",
+        progress=False,
+    )
+
+    assert sorted(seen_paths) == ["a.pt", "b.pt"]
+    assert stats["keys"] == 2
+    assert stats["missing"] == 0
+    assert all(not isinstance(value, torch.Tensor) for value in cache.weights.values())
 
 
 def test_production_cache_records_damp_sweep_lever(monkeypatch):

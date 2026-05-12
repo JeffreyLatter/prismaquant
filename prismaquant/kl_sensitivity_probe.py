@@ -50,6 +50,7 @@ from prismaquant.production_weight_cache import (
     ProductionWeightCacheVariantView,
     fill_production_weight_cache,
 )
+from prismaquant.source_prefetch import prefetch_safetensors_checkpoint
 
 
 SCHEMA = "prismaquant.kl_sensitivity_probe.v2"
@@ -2752,6 +2753,19 @@ def run_probe(args: argparse.Namespace) -> dict:
             split=args.calib_split,
             seed=args.calib_seed,
         )
+    source_prefetch_diag = prefetch_safetensors_checkpoint(
+        staged,
+        mode=args.source_prefetch,
+        max_resident_bytes=(
+            int(float(args.source_prefetch_max_gb) * 1024**3)
+            if float(args.source_prefetch_max_gb) > 0
+            else None
+        ),
+        headroom_gb=float(args.source_prefetch_headroom_gb),
+        workers=int(args.source_prefetch_workers),
+        progress=True,
+        log_prefix="[kl-probe/source]",
+    )
     load_kwargs = {
         "torch_dtype": dtype,
         "trust_remote_code": True,
@@ -3488,6 +3502,7 @@ def run_probe(args: argparse.Namespace) -> dict:
             "source_manifest_entries": int(len(source_manifest)),
             "production_cache_used": bool(production_weight_cache is not None),
             "production_weight_cache": production_cache_diag,
+            "source_prefetch": source_prefetch_diag,
             "prismaclip_candidates": prismaclip_diag,
             "weight_session": weight_session_diag,
             "include_activation_quant": bool(not args.no_activation_quant),
@@ -3871,6 +3886,31 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument(
+        "--source-prefetch",
+        choices=("off", "auto", "require"),
+        default="require",
+        help=(
+            "Prefetch local BF16 source safetensors before loading the "
+            "teacher model. Default 'require' fails instead of allowing "
+            "first-forward NVMe page faults in production KL probes."
+        ),
+    )
+    parser.add_argument(
+        "--source-prefetch-max-gb",
+        type=float,
+        default=0.0,
+        help=(
+            "Resident byte budget for source safetensors prefetch. 0 derives "
+            "the budget from available memory minus --source-prefetch-headroom-gb."
+        ),
+    )
+    parser.add_argument(
+        "--source-prefetch-headroom-gb",
+        type=float,
+        default=16.0,
+    )
+    parser.add_argument("--source-prefetch-workers", type=int, default=2)
     parser.add_argument(
         "--target-profile",
         choices=["research", "vllm_qwen3_5_packed_moe"],

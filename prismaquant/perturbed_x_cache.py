@@ -301,11 +301,13 @@ class PerturbedActivationCache:
         profile=None,
         production_weight_cache=None,
         include_activation_quant: bool = True,
+        capture_inputs: bool = True,
     ):
         self.model = model
         self.cache_dir = Path(cache_dir)
         self.input_rows = int(input_rows)
         self.include_activation_quant = bool(include_activation_quant)
+        self.capture_inputs = bool(capture_inputs)
         self.subsampler = SharedRowSubsampler(input_rows, cal_hash, profile)
         self.plans, self.missing, self.skipped = _build_module_plans(
             model, assignment
@@ -585,6 +587,8 @@ class PerturbedActivationCache:
                 param_plan.spec = previous_spec
 
     def _capture(self, plan: _ModulePlan, x: torch.Tensor) -> None:
+        if not self.capture_inputs:
+            return
         flat = x.detach().reshape(-1, x.size(-1))
         mx = float(flat.abs().max().item())
         for name in plan.cache_names:
