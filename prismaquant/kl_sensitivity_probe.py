@@ -35,6 +35,7 @@ from prismaquant.perturbed_x_cache import (
     calibration_data_hash,
     stage_text_only_under_work_root,
 )
+from prismaquant.sensitivity_probe import load_calibration
 from prismaquant.kl_measurement import (
     _assignment_digest,
     KLScope,
@@ -344,6 +345,7 @@ def _production_cache_expected_metadata(
         "model_path": str(Path(args.model).expanduser()),
         "target_profile": str(args.target_profile),
         "calibration": {
+            "dataset": getattr(args, "dataset", None),
             "split": str(args.calib_split),
             "n_calib_samples": int(calib_ids.size(0)),
             "seqlen": int(calib_ids.size(1)) if calib_ids.dim() >= 2 else None,
@@ -2678,13 +2680,21 @@ def run_probe(args: argparse.Namespace) -> dict:
         trust_remote_code=True,
         local_files_only=local_only,
     )
-    calib_ids = load_wikitext_calibration_windowed(
-        tokenizer,
-        args.n_calib_samples,
-        args.calib_seqlen,
-        split=args.calib_split,
-        seed=args.calib_seed,
-    )
+    if args.dataset:
+        calib_ids = load_calibration(
+            tokenizer,
+            args.dataset,
+            args.n_calib_samples,
+            args.calib_seqlen,
+        )
+    else:
+        calib_ids = load_wikitext_calibration_windowed(
+            tokenizer,
+            args.n_calib_samples,
+            args.calib_seqlen,
+            split=args.calib_split,
+            seed=args.calib_seed,
+        )
     load_kwargs = {
         "torch_dtype": dtype,
         "trust_remote_code": True,
@@ -2692,10 +2702,17 @@ def run_probe(args: argparse.Namespace) -> dict:
     }
     if str(args.attn_implementation).lower() != "auto":
         load_kwargs["attn_implementation"] = str(args.attn_implementation)
+    used_device_map = False
     if device.type == "cuda":
-        load_kwargs["device_map"] = "cuda"
+        try:
+            import accelerate  # noqa: F401
+        except ModuleNotFoundError:
+            used_device_map = False
+        else:
+            load_kwargs["device_map"] = "cuda"
+            used_device_map = True
     model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
-    if device.type != "cuda":
+    if device.type != "cuda" or not used_device_map:
         model.to(device)
     model.eval()
     for param in model.parameters():
@@ -3318,6 +3335,7 @@ def run_probe(args: argparse.Namespace) -> dict:
         "target_profile": args.target_profile,
         "kl_scope": args.kl_scope,
         "calibration": {
+            "dataset": args.dataset,
             "split": args.calib_split,
             "n_calib_samples": int(args.n_calib_samples),
             "seqlen": int(args.calib_seqlen),
@@ -3428,6 +3446,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pin", action="append", default=[])
     parser.add_argument("--calib-split", default="train")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help=(
+            "Optional calibration source accepted by sensitivity_probe "
+            "(HF dataset id, .jsonl, or .txt). When omitted, preserves the "
+            "historical wikitext-2 windowed loader."
+        ),
+    )
     parser.add_argument("--n-calib-samples", type=int, default=128)
     parser.add_argument("--calib-seqlen", type=int, default=2048)
     parser.add_argument("--calib-seed", type=int, default=42)
