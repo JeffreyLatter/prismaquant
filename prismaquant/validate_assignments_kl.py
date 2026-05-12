@@ -5,6 +5,7 @@ import argparse
 import gc
 import json
 import os
+import pickle
 import shutil
 import tempfile
 import time
@@ -39,6 +40,7 @@ from prismaquant.perturbed_x_cache import (
     calibration_data_hash,
 )
 from prismaquant.production_weight_cache import ProductionWeightCacheVariantView
+from prismaquant.schemas import validate_cost_payload
 from prismaquant.sensitivity_probe import load_calibration
 from prismaquant.source_prefetch import prefetch_safetensors_checkpoint
 
@@ -48,8 +50,6 @@ def _load_json(path: str | Path):
 
 
 def _load_probe_stats(path: str | Path) -> dict:
-    import pickle
-
     with Path(path).open("rb") as fh:
         payload = pickle.load(fh)
     if isinstance(payload, Mapping) and isinstance(payload.get("stats"), Mapping):
@@ -57,6 +57,13 @@ def _load_probe_stats(path: str | Path) -> dict:
     if isinstance(payload, Mapping):
         return dict(payload)
     raise ValueError(f"probe file {path} does not contain a stats mapping")
+
+
+def _load_costs(path: str | Path) -> dict:
+    with Path(path).open("rb") as fh:
+        payload = pickle.load(fh)
+    validate_cost_payload(payload, str(path))
+    return dict(payload["costs"])
 
 
 def load_assignment_json(path: str | Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -113,6 +120,96 @@ def _assignment_bpp(stats: Mapping, assignment: Mapping[str, str], specs_by_name
     if total_params <= 0:
         return 0.0
     return assignment_bit_total(stats, assignment, specs_by_name) / float(total_params)
+
+
+def _lookup_cost_entry(costs: Mapping, name: str, fmt: str) -> Mapping | None:
+    per_name = costs.get(name)
+    if not isinstance(per_name, Mapping):
+        return None
+    candidates = [str(fmt)]
+    try:
+        candidates.extend(fr.aliases_for(str(fmt)))
+    except Exception:
+        candidates.append(fr.canonical_format_name(str(fmt)))
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).strip().upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        entry = per_name.get(key)
+        if isinstance(entry, Mapping) and "error" not in entry:
+            return entry
+    return None
+
+
+def _assignment_cost_summary(
+    costs: Mapping,
+    assignment: Mapping[str, str],
+) -> dict[str, object]:
+    """Summarize local cost-table MSE for an assignment.
+
+    These are local render/probe metrics, not end-to-end KL.  BF16 entries are
+    counted as zero-error because they preserve the original Linear weights.
+    """
+    sums = {
+        "weight_mse": 0.0,
+        "output_mse": 0.0,
+        "rel_output_mse": 0.0,
+        "predicted_dloss": 0.0,
+    }
+    counts = {
+        "weight_mse": 0,
+        "output_mse": 0,
+        "rel_output_mse": 0,
+        "predicted_dloss": 0,
+    }
+    missing: list[str] = []
+    unmeasured_output = 0
+    format_counts: Counter[str] = Counter()
+    for name, raw_fmt in assignment.items():
+        fmt = fr.canonical_format_name(str(raw_fmt).strip().upper())
+        format_counts[fmt] += 1
+        if fmt == "BF16":
+            for key in ("weight_mse", "output_mse", "rel_output_mse"):
+                counts[key] += 1
+            continue
+        entry = _lookup_cost_entry(costs, str(name), fmt)
+        if entry is None:
+            missing.append(str(name))
+            continue
+        if entry.get("output_mse_measured") is False:
+            unmeasured_output += 1
+        for key in sums:
+            value = entry.get(key)
+            if value is None:
+                continue
+            try:
+                value_f = float(value)
+            except Exception:
+                continue
+            sums[key] += value_f
+            counts[key] += 1
+    means = {
+        key: (sums[key] / counts[key] if counts[key] else None)
+        for key in sums
+    }
+    return {
+        "objective": "local_cost_table_mse",
+        "weight_mse_sum": float(sums["weight_mse"]),
+        "weight_mse_mean": means["weight_mse"],
+        "output_mse_sum": float(sums["output_mse"]),
+        "output_mse_mean": means["output_mse"],
+        "rel_output_mse_sum": float(sums["rel_output_mse"]),
+        "rel_output_mse_mean": means["rel_output_mse"],
+        "predicted_dloss_sum": float(sums["predicted_dloss"]),
+        "predicted_dloss_mean": means["predicted_dloss"],
+        "counts": dict(counts),
+        "formats": dict(format_counts),
+        "missing_count": int(len(missing)),
+        "missing_sample": missing[:8],
+        "output_mse_unmeasured_count": int(unmeasured_output),
+    }
 
 
 def _device_arg(value: str) -> str:
@@ -368,6 +465,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate assignment JSONs with real KL")
     parser.add_argument("--model", required=True)
     parser.add_argument("--probe", required=True)
+    parser.add_argument(
+        "--costs",
+        default=None,
+        help="Optional measure_quant_cost pickle. When supplied, each result "
+        "includes assignment-level local MSE / predicted-Δloss summaries "
+        "from the same cost table the allocator optimized.",
+    )
     parser.add_argument("--base-assignment", required=True)
     parser.add_argument(
         "--assignment",
@@ -512,6 +616,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.environ["PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE"] = "0"
 
     stats = _load_probe_stats(args.probe)
+    costs = _load_costs(args.costs) if args.costs else None
     specs = [fr.get_format(part.strip()) for part in args.formats.split(",") if part.strip()]
     specs_by_name = {spec.name: spec for spec in specs}
     specs_by_name.update({fr.canonical_format_name(spec.name): spec for spec in specs})
@@ -782,12 +887,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "assignment_materialization": materialization_mode,
                 "replay": replay_stats,
             }
+            if costs is not None:
+                result["mse"] = _assignment_cost_summary(costs, assignment)
             if prefetch_stats is not None:
                 result["production_cache_prefetch"] = prefetch_stats
             results.append(result)
+            mse_msg = ""
+            if costs is not None:
+                mse = result["mse"]
+                mse_msg = (
+                    f" output_mse={mse['output_mse_sum']:.6g}"
+                    f" pred_dloss={mse['predicted_dloss_sum']:.6g}"
+                    f" mse_missing={mse['missing_count']}"
+                )
             print(
                 f"[validate-kl] {label}: KL={kl:.8g} "
-                f"bpp={result['bpp']:.6f} changed={changed} counts={counts}",
+                f"bpp={result['bpp']:.6f}{mse_msg} "
+                f"changed={changed} counts={counts}",
                 flush=True,
             )
             gc.collect()
@@ -797,6 +913,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         out = {
             "model": args.model,
             "probe": args.probe,
+            "costs": args.costs,
             "base_assignment": args.base_assignment,
             "formats": [spec.name for spec in specs],
             "calibration": {

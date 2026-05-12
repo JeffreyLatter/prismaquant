@@ -85,6 +85,12 @@ DEFAULT_ACT_CLIP_SOLVER_HOLDOUT_FRACTION = 0.25
 PRISMACLIP_FORMAT = "NVFP4_CLIPPED"
 
 
+@dataclass(frozen=True)
+class _ClipCandidate:
+    threshold: float | None
+    rescale: str = "none"
+
+
 def _is_prismaclip_format(fmt: str) -> bool:
     return str(fmt).strip().upper() == PRISMACLIP_FORMAT
 
@@ -1046,6 +1052,52 @@ def _env_float(name: str, default: float, *, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def _normalize_clip_rescale_mode(mode: object) -> str:
+    raw = str(mode if mode is not None else "none").strip().lower().replace("-", "_")
+    if raw in {"", "0", "false", "no", "off", "none"}:
+        return "none"
+    if raw in {"rbc", "row_rms", "row_l2", "rms"}:
+        return "row_rms"
+    if raw in {"row_mean_abs", "mean_abs", "l1"}:
+        return "row_mean_abs"
+    raise ValueError(
+        f"unknown PrismaClip rescale mode {mode!r}; "
+        "expected none, row_rms, or row_mean_abs"
+    )
+
+
+def _prismaclip_rescale_candidates() -> tuple[str, ...]:
+    raw = os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING", "none")
+    if str(raw).strip().lower() in {"rbc", "auto", "joint"}:
+        raw = "none,row_rms"
+    out: list[str] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        mode = _normalize_clip_rescale_mode(part)
+        if mode not in out:
+            out.append(mode)
+    return tuple(out) or ("none",)
+
+
+@contextmanager
+def _temporary_act_clip_rescale(mode: str):
+    previous = os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING")
+    mode = _normalize_clip_rescale_mode(mode)
+    if mode == "none":
+        os.environ.pop("PRISMAQUANT_ACT_CLIP_RESCALING", None)
+    else:
+        os.environ["PRISMAQUANT_ACT_CLIP_RESCALING"] = mode
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PRISMAQUANT_ACT_CLIP_RESCALING", None)
+        else:
+            os.environ["PRISMAQUANT_ACT_CLIP_RESCALING"] = previous
+
+
 def _activation_output_error(
     weight: torch.Tensor,
     rendered: torch.Tensor,
@@ -1080,6 +1132,148 @@ def _activation_output_error(
                 err = err * rw[start:start + err.shape[0]].unsqueeze(1)
             total = total + err.sum()
     return float(total.item()) / max(1, int(X.shape[0]) * int(rows))
+
+
+def _prismaclip_activation_distribution_stats(
+    members: Sequence[str],
+    activations: Mapping[str, torch.Tensor],
+    candidate: _ClipCandidate,
+) -> dict[str, float | int | str | None]:
+    total_values = 0
+    total_rows = 0
+    saturated = 0
+    rms_before_sum = 0.0
+    rms_clipped_sum = 0.0
+    rms_rescaled_sum = 0.0
+    max_abs_before = 0.0
+    max_abs_after = 0.0
+    max_rescale = 1.0
+    threshold = candidate.threshold
+    mode = _normalize_clip_rescale_mode(candidate.rescale)
+    for qname in members:
+        a = activations.get(qname)
+        if a is None or a.numel() == 0:
+            continue
+        cols = int(a.shape[-1])
+        X = a.detach().to(torch.float32).reshape(-1, cols)
+        if X.numel() == 0:
+            continue
+        X_abs = X.abs()
+        X_work = X
+        if threshold is not None and threshold > 0.0:
+            thresh = torch.tensor(float(threshold), device=X.device, dtype=X.dtype)
+            saturated += int((X_abs > thresh).sum().item())
+            X_clipped = X.clamp(min=-thresh, max=thresh)
+        else:
+            X_clipped = X
+        if mode == "row_rms" and threshold is not None and threshold > 0.0:
+            orig_stat = X.pow(2).mean(dim=1, keepdim=True).sqrt()
+            clip_stat = X_clipped.pow(2).mean(dim=1, keepdim=True).sqrt()
+            scale = orig_stat / clip_stat.clamp_min(1e-12)
+            scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0)
+            scale = scale.clamp(min=1.0, max=_env_float(
+                "PRISMAQUANT_ACT_CLIP_RBC_MAX_RESCALE",
+                8.0,
+                lo=1.0,
+                hi=1024.0,
+            ))
+            X_work = X_clipped * scale
+            max_rescale = max(max_rescale, float(scale.max().item()))
+        elif mode == "row_mean_abs" and threshold is not None and threshold > 0.0:
+            orig_stat = X.abs().mean(dim=1, keepdim=True)
+            clip_stat = X_clipped.abs().mean(dim=1, keepdim=True)
+            scale = orig_stat / clip_stat.clamp_min(1e-12)
+            scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0)
+            scale = scale.clamp(min=1.0, max=_env_float(
+                "PRISMAQUANT_ACT_CLIP_RBC_MAX_RESCALE",
+                8.0,
+                lo=1.0,
+                hi=1024.0,
+            ))
+            X_work = X_clipped * scale
+            max_rescale = max(max_rescale, float(scale.max().item()))
+        else:
+            X_work = X_clipped
+        rows = int(X.shape[0])
+        total_rows += rows
+        total_values += int(X.numel())
+        rms_before_sum += float(X.pow(2).mean(dim=1).sqrt().sum().item())
+        rms_clipped_sum += float(X_clipped.pow(2).mean(dim=1).sqrt().sum().item())
+        rms_rescaled_sum += float(X_work.pow(2).mean(dim=1).sqrt().sum().item())
+        max_abs_before = max(max_abs_before, float(X_abs.max().item()))
+        max_abs_after = max(max_abs_after, float(X_work.abs().max().item()))
+    if total_values <= 0 or total_rows <= 0:
+        return {
+            "threshold": float(threshold) if threshold is not None else None,
+            "rescale": mode,
+            "n_values": 0,
+            "n_rows": 0,
+        }
+    return {
+        "threshold": float(threshold) if threshold is not None else None,
+        "rescale": mode,
+        "n_values": int(total_values),
+        "n_rows": int(total_rows),
+        "saturation_fraction": float(saturated / max(total_values, 1)),
+        "row_rms_before_mean": float(rms_before_sum / total_rows),
+        "row_rms_clipped_mean": float(rms_clipped_sum / total_rows),
+        "row_rms_rescaled_mean": float(rms_rescaled_sum / total_rows),
+        "max_abs_before": float(max_abs_before),
+        "max_abs_after": float(max_abs_after),
+        "max_rescale": float(max_rescale),
+    }
+
+
+def _output_error_distribution_stats(
+    weight: torch.Tensor,
+    rendered: torch.Tensor,
+    activations: torch.Tensor,
+    *,
+    row_chunk: int = 128,
+) -> dict[str, float]:
+    rows, cols = weight.shape
+    if rendered.shape != weight.shape or activations.shape[-1] != cols:
+        return {
+            "mse": float("inf"),
+            "p50_abs": float("inf"),
+            "p99_abs": float("inf"),
+            "max_abs": float("inf"),
+            "tail_ratio_p99_p50": float("inf"),
+        }
+    device = weight.device
+    diff_t = (
+        weight.detach().to(device=device, dtype=torch.float32)
+        - rendered.detach().to(device=device, dtype=torch.float32)
+    ).t().contiguous()
+    X = activations.detach().to(device=device, dtype=torch.float32).reshape(-1, cols)
+    chunks: list[torch.Tensor] = []
+    total_sq = torch.zeros((), dtype=torch.float32, device=device)
+    n_values = 0
+    with torch.no_grad():
+        for start in range(0, X.shape[0], row_chunk):
+            y_abs = (X[start:start + row_chunk] @ diff_t).abs()
+            total_sq = total_sq + y_abs.pow(2).sum()
+            n_values += int(y_abs.numel())
+            chunks.append(y_abs.detach().flatten())
+    if n_values <= 0:
+        return {
+            "mse": 0.0,
+            "p50_abs": 0.0,
+            "p99_abs": 0.0,
+            "max_abs": 0.0,
+            "tail_ratio_p99_p50": 0.0,
+        }
+    values = torch.cat(chunks).to(torch.float32)
+    p50 = float(values.quantile(0.50).item())
+    p99 = float(values.quantile(0.99).item())
+    max_abs = float(values.max().item())
+    return {
+        "mse": float(total_sq.item()) / n_values,
+        "p50_abs": p50,
+        "p99_abs": p99,
+        "max_abs": max_abs,
+        "tail_ratio_p99_p50": float(p99 / max(p50, 1e-12)),
+    }
 
 
 def _normalize_prismafisherclip_row_weights(
@@ -1204,6 +1398,7 @@ def _render_awq_scaled_for_cache(
     levers: Mapping[str, object],
     joint_global_real: torch.Tensor | None,
     act_clip_threshold: float | None = None,
+    act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from prismaquant import export_native_compressed as enc
@@ -1224,6 +1419,7 @@ def _render_awq_scaled_for_cache(
             awq_round_enabled=bool(levers.get("awq_round", False)),
             scale_sweep_enabled=bool(levers.get("scale_sweep", True)),
             act_clip_threshold=act_clip_threshold,
+            act_clip_rescale=act_clip_rescale,
             fisher_row_weights=fisher_row_weights,
             compute_only=(fmt == "NVFP4"),
         )
@@ -1723,13 +1919,14 @@ def _solve_nvfp4_activation_clip_groups(
     progress: bool,
     awq_scales: Mapping[str, torch.Tensor] | None = None,
     cache_formats: Sequence[str] = ("NVFP4",),
-) -> tuple[dict[str, float | None], dict[str, object]]:
-    """Solve one scalar render-time activation clamp per fused NVFP4 group.
+) -> tuple[dict[str, _ClipCandidate], dict[str, object]]:
+    """Solve one render-time activation clamp candidate per fused NVFP4 group.
 
     The baseline is the existing render path.  Candidate thresholds are
-    optimized in log space, and every candidate is scored against original
-    unclipped activations so the solver cannot win by merely hiding outliers
-    from its evaluator.
+    optimized in log space.  When PrismaClip-RBC is enabled, each threshold
+    is evaluated with and without row-wise rescaling of the clipped activation
+    matrix.  Every candidate is scored against original, unclipped activations
+    so the solver cannot win by merely hiding outliers from its evaluator.
     """
     max_evals = _env_int(
         "PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS",
@@ -1801,11 +1998,14 @@ def _solve_nvfp4_activation_clip_groups(
         hi=1.0,
     )
     verbose = _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE", False)
+    rescale_candidates = _prismaclip_rescale_candidates()
     output_cache_formats = tuple(
         dict.fromkeys(str(fmt).strip().upper() for fmt in cache_formats if str(fmt).strip())
     ) or ("NVFP4",)
-    threshold_by_qname: dict[str, float | None] = {}
+    candidate_by_qname: dict[str, _ClipCandidate] = {}
     method_name = "PrismaFisherClip" if fisher_clip_available else "PrismaClip"
+    if any(mode != "none" for mode in rescale_candidates):
+        method_name = f"{method_name}-RBC"
     objective = (
         "fisher_weighted_output_mse_original_activations"
         if fisher_primary else
@@ -1824,6 +2024,7 @@ def _solve_nvfp4_activation_clip_groups(
         "cache_formats": list(output_cache_formats),
         "objective": objective,
         "solver": "log_golden_section",
+        "rescale_candidates": list(rescale_candidates),
         "max_evals": int(max_evals),
         "min_gain": float(min_gain),
         "top_fraction": float(top_fraction),
@@ -1840,6 +2041,7 @@ def _solve_nvfp4_activation_clip_groups(
         "holdout_min_gain": float(holdout_min_gain),
         "groups": {},
         "selected_by_qname": {},
+        "selected_candidate_by_qname": {},
         "prewritten_qnames": [],
         "prewrite_baseline": _env_flag(
             "PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE",
@@ -1854,7 +2056,7 @@ def _solve_nvfp4_activation_clip_groups(
         "scalar_evaluations": 0,
     }
 
-    def render_member(qname: str, threshold: float | None) -> torch.Tensor:
+    def render_member(qname: str, candidate: _ClipCandidate) -> torch.Tensor:
         mod = qname_to_module[qname]
         max_abs = activation_max_abs.get(qname)
         export_scale = (
@@ -1862,28 +2064,30 @@ def _solve_nvfp4_activation_clip_groups(
             if max_abs is not None and max_abs > 0.0
             else None
         )
-        return render_production_weight(
-            mod.weight.data,
-            "NVFP4",
-            qname=qname,
-            activations=activations,
-            levers=levers,
-            joint_global_real=joint_globals.get(qname),
-            input_global_scale=export_scale,
-            act_clip_threshold=threshold,
-            fisher_row_weights=(
-                fisher_rows.get(qname)
-                if fisher_render_enabled and fisher_rows is not None
-                else None
-            ),
-            awq_scale=(awq_scales or {}).get(qname),
-        )
+        with _temporary_act_clip_rescale(candidate.rescale):
+            return render_production_weight(
+                mod.weight.data,
+                "NVFP4",
+                qname=qname,
+                activations=activations,
+                levers=levers,
+                joint_global_real=joint_globals.get(qname),
+                input_global_scale=export_scale,
+                act_clip_threshold=candidate.threshold,
+                act_clip_rescale=candidate.rescale,
+                fisher_row_weights=(
+                    fisher_rows.get(qname)
+                    if fisher_render_enabled and fisher_rows is not None
+                    else None
+                ),
+                awq_scale=(awq_scales or {}).get(qname),
+            )
 
     group_entries: list[dict[str, object]] = []
 
     def render_members_batched(
         members: Sequence[str],
-        threshold: float | None,
+        candidate: _ClipCandidate,
     ) -> dict[str, torch.Tensor] | None:
         if not metadata["batched_same_shape"] or len(members) < 2:
             return None
@@ -1971,7 +2175,8 @@ def _solve_nvfp4_activation_clip_groups(
                         acts,
                         cols,
                         device=device,
-                        clip_threshold=threshold,
+                        clip_threshold=candidate.threshold,
+                        clip_rescale=candidate.rescale,
                         row_weights=row_weights_list[idx],
                     )
                     h_eval[idx] = x_eval.t() @ x_eval
@@ -1981,7 +2186,8 @@ def _solve_nvfp4_activation_clip_groups(
                         acts_list,
                         damp=damp,
                         global_real_overrides=global_real_overrides,
-                        clip_threshold=threshold,
+                        clip_threshold=candidate.threshold,
+                        clip_rescale=candidate.rescale,
                         row_weights_list=row_weights_list,
                     )
                     diff = reference_weights - cand_w
@@ -2002,7 +2208,8 @@ def _solve_nvfp4_activation_clip_groups(
                     weights,
                     acts_list,
                     global_real_overrides=global_real_overrides,
-                    clip_threshold=threshold,
+                    clip_threshold=candidate.threshold,
+                    clip_rescale=candidate.rescale,
                     row_weights_list=row_weights_list,
                 )
 
@@ -2012,7 +2219,8 @@ def _solve_nvfp4_activation_clip_groups(
                 acts_list,
                 reference_weights=reference_weights,
                 global_real_overrides=global_real_overrides,
-                clip_threshold=threshold,
+                clip_threshold=candidate.threshold,
+                clip_rescale=candidate.rescale,
                 row_weights_list=row_weights_list,
             )
 
@@ -2032,7 +2240,8 @@ def _solve_nvfp4_activation_clip_groups(
                         acts_list[idx],
                         cols,
                         device=device,
-                        clip_threshold=threshold,
+                        clip_threshold=candidate.threshold,
+                        clip_rescale=candidate.rescale,
                         row_weights=row_weights_list[idx],
                     )
                     ref = reference_weights[idx]
@@ -2054,17 +2263,29 @@ def _solve_nvfp4_activation_clip_groups(
 
     def evaluate_members(
         members: Sequence[str],
-        threshold: float | None,
+        candidate: _ClipCandidate,
         *,
         keep_weights: bool = False,
         score_splits: Sequence[str] = ("all",),
-    ) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
+        distribution_stats: bool = False,
+    ) -> tuple[dict[str, float], dict[str, torch.Tensor] | None, dict[str, object] | None]:
         scores = {split: 0.0 for split in score_splits}
         if fisher_clip_available:
             for split in score_splits:
                 scores[f"fisher_{split}"] = 0.0
         kept: dict[str, torch.Tensor] | None = {} if keep_weights else None
-        rendered = render_members_batched(members, threshold)
+        dist_stats: dict[str, object] | None = (
+            {
+                "activation": _prismaclip_activation_distribution_stats(
+                    members,
+                    activations,
+                    candidate,
+                ),
+                "output_error": {},
+            }
+            if distribution_stats else None
+        )
+        rendered = render_members_batched(members, candidate)
         if rendered is not None:
             metadata["batched_evaluations"] = (
                 int(metadata.get("batched_evaluations", 0)) + 1
@@ -2073,7 +2294,7 @@ def _solve_nvfp4_activation_clip_groups(
             metadata["scalar_evaluations"] = (
                 int(metadata.get("scalar_evaluations", 0)) + len(members)
             )
-            rendered = {qname: render_member(qname, threshold) for qname in members}
+            rendered = {qname: render_member(qname, candidate) for qname in members}
         for qname, w_dq in rendered.items():
             score_row_weights = (
                 fisher_rows.get(qname)
@@ -2107,11 +2328,17 @@ def _solve_nvfp4_activation_clip_groups(
                     split_activations,
                     row_weights=split_row_weights,
                 )
+            if dist_stats is not None:
+                dist_stats["output_error"][qname] = _output_error_distribution_stats(
+                    qname_to_module[qname].weight.data,
+                    w_dq,
+                    activations[qname],
+                )
             if kept is not None:
                 kept[qname] = w_dq
             else:
                 del w_dq
-        return scores, kept
+        return scores, kept, dist_stats
 
     primary_score_key = "fisher_all" if fisher_primary else "all"
     primary_holdout_key = "fisher_holdout" if fisher_primary else "holdout"
@@ -2131,9 +2358,9 @@ def _solve_nvfp4_activation_clip_groups(
         baseline_weights: dict[str, torch.Tensor] | None = None
         try:
             score_splits = ("all", "holdout") if holdout_enabled else ("all",)
-            baseline_scores, baseline_weights = evaluate_members(
+            baseline_scores, baseline_weights, _ = evaluate_members(
                 members,
-                None,
+                _ClipCandidate(None, "none"),
                 keep_weights=bool(metadata["prewrite_baseline"]),
                 score_splits=score_splits,
             )
@@ -2237,13 +2464,15 @@ def _solve_nvfp4_activation_clip_groups(
         )
         if group_key not in eligible_groups:
             for qname in members:
-                threshold_by_qname[qname] = None
+                candidate_by_qname[qname] = _ClipCandidate(None, "none")
                 metadata["selected_by_qname"][qname] = None
+                metadata["selected_candidate_by_qname"][qname] = None
             metadata["groups"][group_key] = {
                 "members": members,
                 "status": "skipped_low_error",
                 "selected": "baseline",
                 "selected_threshold": None,
+                "selected_rescale": "none",
                 "baseline_score": float(baseline_score),
                 "baseline_unweighted_score": float(baseline_unweighted_score),
                 "baseline_fisher_score": baseline_fisher_score,
@@ -2266,13 +2495,15 @@ def _solve_nvfp4_activation_clip_groups(
         log_lo = math.log(lo)
         log_hi = math.log(hi)
         inv_phi = (math.sqrt(5.0) - 1.0) / 2.0
-        cache: dict[float, float] = {}
-        eval_trace: list[dict[str, float | int]] = []
+        cache: dict[tuple[float, str], float] = {}
+        eval_trace: list[dict[str, float | int | str]] = []
         best_candidate_threshold: float | None = None
+        best_candidate_rescale = "none"
         best_candidate_score = float("inf")
         best_candidate_unweighted_score: float | None = None
         best_candidate_fisher_score: float | None = None
         best_candidate_holdout_score: float | None = None
+        best_candidate_distribution: dict[str, object] | None = None
         best_candidate_weights: dict[str, torch.Tensor] | None = None
         best_candidate_eval_index: int | None = None
         denom = max(abs(float(baseline_score)), 1e-30)
@@ -2287,18 +2518,26 @@ def _solve_nvfp4_activation_clip_groups(
 
         def eval_log(log_threshold: float) -> float:
             nonlocal best_candidate_threshold, best_candidate_score
+            nonlocal best_candidate_rescale
             nonlocal best_candidate_unweighted_score
             nonlocal best_candidate_fisher_score
             nonlocal best_candidate_holdout_score
+            nonlocal best_candidate_distribution
             nonlocal best_candidate_weights
             nonlocal best_candidate_eval_index
             threshold = float(math.exp(log_threshold))
-            key = round(threshold, 12)
-            if key not in cache:
+            key_threshold = round(threshold, 12)
+            best_for_threshold = float("inf")
+            for rescale_mode in rescale_candidates:
+                key = (key_threshold, str(rescale_mode))
+                if key in cache:
+                    best_for_threshold = min(best_for_threshold, cache[key])
+                    continue
                 score_splits = ("all", "holdout") if holdout_enabled else ("all",)
-                scores, cand_weights = evaluate_members(
+                candidate = _ClipCandidate(float(key_threshold), str(rescale_mode))
+                scores, cand_weights, _ = evaluate_members(
                     members,
-                    threshold,
+                    candidate,
                     keep_weights=True,
                     score_splits=score_splits,
                 )
@@ -2311,24 +2550,28 @@ def _solve_nvfp4_activation_clip_groups(
                     float(scores[primary_holdout_key]) if holdout_enabled else None
                 )
                 cache[key] = score
+                best_for_threshold = min(best_for_threshold, score)
                 if score < best_candidate_score:
                     if best_candidate_weights is not None:
                         for old in best_candidate_weights.values():
                             del old
                     best_candidate_eval_index = len(eval_trace) + 1
-                    best_candidate_threshold = float(key)
+                    best_candidate_threshold = float(key_threshold)
+                    best_candidate_rescale = str(rescale_mode)
                     best_candidate_score = float(score)
                     best_candidate_unweighted_score = float(unweighted_score)
                     best_candidate_fisher_score = fisher_score
                     best_candidate_holdout_score = holdout_score
+                    best_candidate_distribution = None
                     best_candidate_weights = cand_weights
                 elif cand_weights is not None:
                     for old in cand_weights.values():
                         del old
                 best_so_far = min(float(baseline_score), float(best_candidate_score))
-                trace_entry: dict[str, float | int] = {
+                trace_entry: dict[str, float | int | str] = {
                     "eval": int(len(eval_trace) + 1),
-                    "threshold": float(key),
+                    "threshold": float(key_threshold),
+                    "rescale": str(rescale_mode),
                     "score": float(score),
                     "unweighted_score": float(unweighted_score),
                     "best_score": float(best_so_far),
@@ -2349,7 +2592,7 @@ def _solve_nvfp4_activation_clip_groups(
                         / holdout_denom
                     )
                 eval_trace.append(trace_entry)
-            return cache[key]
+            return best_for_threshold
 
         try:
             eval_log(log_lo)
@@ -2361,7 +2604,10 @@ def _solve_nvfp4_activation_clip_groups(
             fc = eval_log(c)
             fd = eval_log(d)
             iterations = 0
-            while len(cache) < max_evals and iterations < max_evals * 4:
+            while (
+                len({threshold_key for threshold_key, _ in cache}) < max_evals
+                and iterations < max_evals * 4
+            ):
                 iterations += 1
                 if fc < fd:
                     b = d
@@ -2387,11 +2633,13 @@ def _solve_nvfp4_activation_clip_groups(
                 "error": str(e),
             }
             for qname in members:
-                threshold_by_qname[qname] = None
+                candidate_by_qname[qname] = _ClipCandidate(None, "none")
                 metadata["selected_by_qname"][qname] = None
+                metadata["selected_candidate_by_qname"][qname] = None
             continue
 
         best_threshold = best_candidate_threshold
+        best_rescale = best_candidate_rescale
         best_score = min(float(baseline_score), float(best_candidate_score))
         rel_gain = (float(baseline_score) - float(best_score)) / denom
         fisher_rel_gain = (
@@ -2435,6 +2683,7 @@ def _solve_nvfp4_activation_clip_groups(
         )
         if not selected:
             best_threshold = None
+            best_rescale = "none"
             best_score = float(baseline_score)
             rel_gain = 0.0
             fisher_rel_gain = 0.0
@@ -2442,9 +2691,35 @@ def _solve_nvfp4_activation_clip_groups(
                 for old in best_candidate_weights.values():
                     del old
                 best_candidate_weights = None
+        elif best_candidate_weights is not None:
+            best_candidate_distribution = {
+                "activation": _prismaclip_activation_distribution_stats(
+                    members,
+                    activations,
+                    _ClipCandidate(best_threshold, best_rescale),
+                ),
+                "output_error": {
+                    qname: _output_error_distribution_stats(
+                        qname_to_module[qname].weight.data,
+                        tensor,
+                        activations[qname],
+                    )
+                    for qname, tensor in best_candidate_weights.items()
+                },
+            }
         for qname in members:
-            threshold_by_qname[qname] = best_threshold
-            metadata["selected_by_qname"][qname] = best_threshold
+            candidate_by_qname[qname] = _ClipCandidate(best_threshold, best_rescale)
+            metadata["selected_by_qname"][qname] = (
+                None if best_threshold is None else float(best_threshold)
+            )
+            metadata["selected_candidate_by_qname"][qname] = (
+                None
+                if best_threshold is None
+                else {
+                    "threshold": float(best_threshold),
+                    "rescale": str(best_rescale),
+                }
+            )
         if selected and best_candidate_weights is not None:
             for qname, tensor in best_candidate_weights.items():
                 for cache_fmt in output_cache_formats:
@@ -2465,6 +2740,8 @@ def _solve_nvfp4_activation_clip_groups(
             "status": "solved",
             "selected": "solved" if selected else "baseline",
             "selected_threshold": best_threshold,
+            "selected_rescale": str(best_rescale),
+            "selected_distribution": best_candidate_distribution if selected else None,
             "baseline_score": float(baseline_score),
             "baseline_unweighted_score": float(baseline_unweighted_score),
             "baseline_fisher_score": baseline_fisher_score,
@@ -2511,7 +2788,8 @@ def _solve_nvfp4_activation_clip_groups(
             print(
                 f"[prod-cache] PrismaClip {group_key}: "
                 f"{'solved' if selected else 'baseline'} "
-                f"gain={rel_gain:.4%} threshold={best_threshold}",
+                f"gain={rel_gain:.4%} threshold={best_threshold} "
+                f"rescale={best_rescale}",
                 flush=True,
             )
         eligible_done += 1
@@ -2524,7 +2802,7 @@ def _solve_nvfp4_activation_clip_groups(
                 flush=True,
             )
 
-    return threshold_by_qname, metadata
+    return candidate_by_qname, metadata
 
 
 def render_production_weight(
@@ -2537,6 +2815,7 @@ def render_production_weight(
     joint_global_real: torch.Tensor | None = None,
     input_global_scale: float | None = None,
     act_clip_threshold: float | None = None,
+    act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
     awq_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -2555,12 +2834,19 @@ def render_production_weight(
     isolated Linears with no fused siblings).
 
     ``act_clip_threshold`` is an optional scalar clamp for activation-aware
-    render passes. ``fisher_row_weights`` optionally weights local objectives
-    by per-token gradient² from h-detail. ``awq_scale`` stores weights in the
-    cache's measurement coordinates: Q(W*s)/s, while export later multiplies by
-    ``s`` and folds the predecessor norm to emit Q(W*s).
+    render passes. ``act_clip_rescale`` enables PrismaClip-RBC row-wise
+    rescaling after an explicit clamp. ``fisher_row_weights`` optionally
+    weights local objectives by per-token gradient² from h-detail.
+    ``awq_scale`` stores weights in the cache's measurement coordinates:
+    Q(W*s)/s, while export later multiplies by ``s`` and folds the predecessor
+    norm to emit Q(W*s).
     """
     fmt = fmt.upper()
+    clip_rescale = _normalize_clip_rescale_mode(
+        act_clip_rescale
+        if act_clip_rescale is not None
+        else os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING", "none")
+    )
     if awq_scale is not None:
         scale = awq_scale.to(device=weight.device, dtype=torch.float32)
         if scale.numel() != weight.shape[1]:
@@ -2582,6 +2868,7 @@ def render_production_weight(
             levers=levers,
             joint_global_real=joint_global_real,
             act_clip_threshold=act_clip_threshold,
+            act_clip_rescale=clip_rescale,
             fisher_row_weights=fisher_row_weights,
         )
         effective = scaled / scale.clamp_min(1e-12).unsqueeze(0)
@@ -2602,6 +2889,7 @@ def render_production_weight(
                 activations[qname],
                 group_size=32,
                 clip_threshold=act_clip_threshold,
+                clip_rescale=clip_rescale,
                 fisher_row_weights=fisher_row_weights,
             )
             return w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
@@ -2621,6 +2909,7 @@ def render_production_weight(
             nvfp4_global_real_override=joint_global_real,
             input_global_scale_override=input_global_scale,
             act_clip_threshold=act_clip_threshold,
+            act_clip_rescale=clip_rescale,
             fisher_row_weights=fisher_row_weights,
             compute_only=True,
         )
@@ -3153,7 +3442,7 @@ def fill_production_weight_cache(
                     flush=True,
                 )
 
-    solved_nvfp4_thresholds: dict[str, float | None] = {}
+    solved_nvfp4_candidates: dict[str, _ClipCandidate] = {}
     solve_global_nvfp4_clip = bool(levers.get("act_clip_solver", False))
     solve_variant_nvfp4_clip = any(
         PRISMACLIP_FORMAT in missing
@@ -3195,7 +3484,7 @@ def fill_production_weight_cache(
                 clip_cache_formats.append("NVFP4")
             if solve_variant_nvfp4_clip:
                 clip_cache_formats.append(PRISMACLIP_FORMAT)
-            solved_nvfp4_thresholds, clip_solver_metadata = (
+            solved_nvfp4_candidates, clip_solver_metadata = (
                 _solve_nvfp4_activation_clip_groups(
                     groups=solver_groups,
                     qname_to_module=qname_to_module,
@@ -3266,32 +3555,35 @@ def fill_production_weight_cache(
                     # drops it once all formats are done.
                     continue
             try:
-                w_dq = render_production_weight(
-                    weight, render_fmt,
-                    qname=qname,
-                    activations=activations_local,
-                    levers=levers,
-                    joint_global_real=joint,
-                    input_global_scale=export_scale,
-                    act_clip_threshold=(
-                        solved_nvfp4_thresholds.get(qname)
-                        if (
-                            _is_prismaclip_format(fmt_key)
-                            or (solve_global_nvfp4_clip and render_fmt == "NVFP4")
-                        )
-                        else None
-                    ),
-                    fisher_row_weights=(
-                        fisher_rows.get(qname)
-                        if bool(levers.get("fisher_gptq", False))
-                        and fisher_rows is not None
-                        else None
-                    ),
-                    awq_scale=(
-                        awq_scales.get(qname)
-                        if render_fmt in _AWQ_CACHE_FORMATS else None
-                    ),
+                clip_candidate = (
+                    solved_nvfp4_candidates.get(qname, _ClipCandidate(None, "none"))
+                    if (
+                        _is_prismaclip_format(fmt_key)
+                        or (solve_global_nvfp4_clip and render_fmt == "NVFP4")
+                    )
+                    else _ClipCandidate(None, "none")
                 )
+                with _temporary_act_clip_rescale(clip_candidate.rescale):
+                    w_dq = render_production_weight(
+                        weight, render_fmt,
+                        qname=qname,
+                        activations=activations_local,
+                        levers=levers,
+                        joint_global_real=joint,
+                        input_global_scale=export_scale,
+                        act_clip_threshold=clip_candidate.threshold,
+                        act_clip_rescale=clip_candidate.rescale,
+                        fisher_row_weights=(
+                            fisher_rows.get(qname)
+                            if bool(levers.get("fisher_gptq", False))
+                            and fisher_rows is not None
+                            else None
+                        ),
+                        awq_scale=(
+                            awq_scales.get(qname)
+                            if render_fmt in _AWQ_CACHE_FORMATS else None
+                        ),
+                    )
             except Exception as e:
                 failed[(qname, fmt_key)] = str(e)
                 if progress:

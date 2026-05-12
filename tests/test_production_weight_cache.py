@@ -352,6 +352,59 @@ def test_production_cache_prismaclip_candidate_preserves_baseline_nvfp4(
     )
 
 
+def test_production_cache_prismaclip_rbc_searches_rescale_modes(monkeypatch):
+    import os
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    seen_modes: list[str] = []
+
+    def fake_render_production_weight(
+        weight,
+        fmt,
+        *,
+        act_clip_threshold=None,
+        **_kwargs,
+    ):
+        seen_modes.append(os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING", "none"))
+        if act_clip_threshold is None:
+            delta = 3.0
+        elif os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING") == "row_rms":
+            delta = 0.0
+        else:
+            delta = 2.0
+        return weight.detach().to(torch.float32) + delta
+
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER", "1")
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING", "none,row_rms")
+    monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["NVFP4"],
+        levers={"gptq": False, "scale_sweep": False, "act_clip_solver": True},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    meta = cache.metadata["activation_clip_solver"]
+    selected = meta["selected_candidate_by_qname"]["l1"]
+    group_meta = next(iter(meta["groups"].values()))
+    assert meta["method"] == "PrismaClip-RBC"
+    assert meta["rescale_candidates"] == ["none", "row_rms"]
+    assert selected["rescale"] == "row_rms"
+    assert group_meta["selected_rescale"] == "row_rms"
+    assert any(mode == "row_rms" for mode in seen_modes)
+    torch.testing.assert_close(
+        cache.get("l1", "NVFP4").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32),
+    )
+
+
 def test_production_cache_act_clip_solver_skips_tiny_configured_gain(monkeypatch):
     import prismaquant.production_weight_cache as pwc
 
@@ -497,7 +550,7 @@ def test_production_cache_act_clip_solver_holdout_rejects_overfit(monkeypatch):
 
     group_meta = meta["groups"]["a"]
     assert meta["holdout_enabled"] is True
-    assert thresholds == {"a": None}
+    assert thresholds["a"].threshold is None
     assert meta["selected_by_qname"]["a"] is None
     assert group_meta["selected"] == "baseline"
     assert group_meta["holdout_accepted"] is False
@@ -585,7 +638,7 @@ def test_prismafisherclip_vetoes_unweighted_clip_choice(monkeypatch, tmp_path):
     assert meta["method"] == "PrismaFisherClip"
     assert meta["fisher_clip_available"] is True
     assert meta["fisher_clip_render_weighted"] is False
-    assert thresholds == {"a": None}
+    assert thresholds["a"].threshold is None
     assert group_meta["selected"] == "baseline"
     assert group_meta["best_score"] == pytest.approx(group_meta["baseline_score"])
     assert seen_render_weights and all(value is None for value in seen_render_weights)
@@ -645,7 +698,7 @@ def test_prismafisherclip_default_audits_unweighted_clip_choice(
     assert meta["method"] == "PrismaFisherClip"
     assert meta["fisher_clip_mode"] == "audit"
     assert meta["fisher_clip_available"] is True
-    assert thresholds["a"] is not None
+    assert thresholds["a"].threshold is not None
     assert group_meta["selected"] == "solved"
     assert group_meta["fisher_accepted"] is None
     assert group_meta["best_fisher_score"] is not None
@@ -682,7 +735,8 @@ def test_production_cache_act_clip_solver_batches_same_shape_groups(monkeypatch)
         progress=False,
     )
 
-    assert thresholds == {"a": None, "b": None}
+    assert thresholds["a"].threshold is None
+    assert thresholds["b"].threshold is None
     assert meta["batched_same_shape"] is True
     assert meta["batched_evaluations"] >= 1
     assert meta["scalar_evaluations"] == 0

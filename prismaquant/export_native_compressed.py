@@ -272,6 +272,60 @@ def _resolve_act_clip_quantile(default: str = "0.999") -> float | None:
     return q if 0.0 < q < 1.0 else None
 
 
+def _normalize_act_clip_rescale(mode: str | None) -> str:
+    if mode is None:
+        mode = os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING", "none")
+    normalized = str(mode).strip().lower().replace("-", "_")
+    if normalized in {"", "0", "false", "no", "off", "none"}:
+        return "none"
+    if normalized in {"rbc", "row_rms", "row_l2", "rms"}:
+        return "row_rms"
+    if normalized in {"row_mean_abs", "mean_abs", "l1"}:
+        return "row_mean_abs"
+    raise ValueError(
+        f"unknown activation clip rescale mode {mode!r}; "
+        "expected none, row_rms, or row_mean_abs"
+    )
+
+
+def _act_clip_rescale_max(default: float = 8.0) -> float:
+    try:
+        value = float(os.environ.get("PRISMAQUANT_ACT_CLIP_RBC_MAX_RESCALE", default))
+    except Exception:
+        value = default
+    return max(1.0, min(float(value), 1024.0))
+
+
+def _rescale_clipped_activation_matrix(
+    original: torch.Tensor,
+    clipped: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    """Rescale clipped activation rows for PrismaClip-RBC.
+
+    Row-RMS mode preserves each row's pre-clipping energy after clamping its
+    extremes. This keeps outlier rows visible to the optimizer while reducing
+    the dominance of the outlier channel itself. The cap prevents a heavily
+    clipped row from being amplified into a new pathological objective.
+    """
+    mode = _normalize_act_clip_rescale(mode)
+    if mode == "none" or original.numel() == 0:
+        return clipped
+    if mode == "row_rms":
+        orig_stat = original.pow(2).mean(dim=1, keepdim=True).sqrt()
+        clip_stat = clipped.pow(2).mean(dim=1, keepdim=True).sqrt()
+    elif mode == "row_mean_abs":
+        orig_stat = original.abs().mean(dim=1, keepdim=True)
+        clip_stat = clipped.abs().mean(dim=1, keepdim=True)
+    else:
+        raise ValueError(f"unsupported activation clip rescale mode {mode!r}")
+    scale = orig_stat / clip_stat.clamp_min(1e-12)
+    scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0)
+    scale = scale.clamp(min=1.0, max=_act_clip_rescale_max())
+    return clipped * scale
+
+
 def _activation_matrix_for_gptq(
     activations: torch.Tensor,
     cols: int,
@@ -279,6 +333,7 @@ def _activation_matrix_for_gptq(
     device: torch.device | None = None,
     clip_threshold: float | None = None,
     clip_quantile: float | None = None,
+    clip_rescale: str | None = None,
     row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Flatten activations and apply the same optional clipping used by GPTQ.
@@ -295,7 +350,12 @@ def _activation_matrix_for_gptq(
     if clip_threshold is not None and clip_threshold > 0.0 and X.numel() > 0:
         thresh = torch.tensor(
             float(clip_threshold), device=X.device, dtype=X.dtype)
-        X = X.clamp(min=-thresh, max=thresh)
+        X_clipped = X.clamp(min=-thresh, max=thresh)
+        X = _rescale_clipped_activation_matrix(
+            X,
+            X_clipped,
+            mode=_normalize_act_clip_rescale(clip_rescale),
+        )
     else:
         q = _resolve_act_clip_quantile() if clip_quantile is None else clip_quantile
         if q is not None and 0.0 < q < 1.0 and X.numel() > 0:
@@ -355,6 +415,7 @@ def _activation_col_importance_for_gptq(
     device: torch.device | None = None,
     clip_threshold: float | None = None,
     clip_quantile: float | None = None,
+    clip_rescale: str | None = None,
     row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     X = _activation_matrix_for_gptq(
@@ -363,6 +424,7 @@ def _activation_col_importance_for_gptq(
         device=device,
         clip_threshold=clip_threshold,
         clip_quantile=clip_quantile,
+        clip_rescale=clip_rescale,
         row_weights=row_weights,
     )
     if X.numel() == 0:
@@ -1583,6 +1645,7 @@ def _gptq_obs_rounding_nvfp4(
     group_size: int = 16, damp: float = 0.01,
     global_real_override: torch.Tensor | None = None,
     clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """GPTQ one-shot OBS rounding for NVFP4 weights.
@@ -1620,6 +1683,7 @@ def _gptq_obs_rounding_nvfp4(
         cols,
         device=W.device,
         clip_threshold=clip_threshold,
+        clip_rescale=clip_rescale,
         row_weights=fisher_row_weights,
     )
     # H = X^T X; guard against near-zero diagonal (dead channels).
@@ -1647,8 +1711,14 @@ def _gptq_obs_rounding_nvfp4(
         U = torch.linalg.cholesky(Hinv, upper=True)
     except Exception:
         # Fall back to RTN if the Cholesky numerically fails (rare:
-        # extreme activation degeneracy). Caller proceeds with vanilla.
-        return W
+        # extreme activation degeneracy).  Returning the original weight
+        # here is not a valid NVFP4 render in compute_only/cache paths and
+        # can make downstream local-MSE gates see an impossible zero error.
+        return _rtn_dequant_nvfp4(
+            weight,
+            group_size=group_size,
+            global_real_override=global_real_override,
+        )
 
     # Target NVFP4 grid. Pre-compute the per-tensor global_real so the
     # per-block quantization uses the same outer scale as the final
@@ -1716,6 +1786,7 @@ def _gptq_obs_rounding_nvfp4_swept(
     global_real_override: torch.Tensor | None = None,
     damp_candidates: tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.1),
     clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-Linear GPTQ damping sweep.
@@ -1744,6 +1815,7 @@ def _gptq_obs_rounding_nvfp4_swept(
         weight.shape[1],
         device=weight.device,
         clip_threshold=clip_threshold,
+        clip_rescale=clip_rescale,
         row_weights=fisher_row_weights,
     )
     H_full = X.t() @ X  # [in, in], shared evaluator
@@ -1756,6 +1828,7 @@ def _gptq_obs_rounding_nvfp4_swept(
                 weight, activations, group_size=group_size,
                 damp=damp, global_real_override=global_real_override,
                 clip_threshold=clip_threshold,
+                clip_rescale=clip_rescale,
                 fisher_row_weights=fisher_row_weights,
             )
         except Exception:
@@ -1768,7 +1841,11 @@ def _gptq_obs_rounding_nvfp4_swept(
             best_err = err
             best_w = w_q
     if best_w is None:
-        return W_orig  # all candidates failed, fall back to RTN-equivalent
+        return _rtn_dequant_nvfp4(
+            W_orig,
+            group_size=group_size,
+            global_real_override=global_real_override,
+        )
     return best_w
 
 
@@ -1777,6 +1854,7 @@ def _activation_weighted_round_nvfp4(
     group_size: int = 16,
     global_real_override: torch.Tensor | None = None,
     clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """For each weight, pick the NVFP4 grid neighbor (above or below)
@@ -1800,6 +1878,7 @@ def _activation_weighted_round_nvfp4(
             cols,
             device=W.device,
             clip_threshold=clip_threshold,
+            clip_rescale=clip_rescale,
             row_weights=fisher_row_weights,
         )
     else:
@@ -1861,6 +1940,7 @@ def _scale_sweep_nvfp4(
     span: tuple[float, float] = (0.5, 1.5),
     reference_weight: torch.Tensor | None = None,
     clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-group joint (scale, rounding) closed-form polish.
@@ -1908,6 +1988,7 @@ def _scale_sweep_nvfp4(
             cols,
             device=W_in.device,
             clip_threshold=clip_threshold,
+            clip_rescale=clip_rescale,
             row_weights=fisher_row_weights,
         )
     else:
@@ -2225,6 +2306,7 @@ def _mxfp8_scale_sweep_quantize(
     *,
     group_size: int = 32,
     clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Activation-weighted E8M0 scale search for MXFP8 E4M3.
@@ -2257,6 +2339,7 @@ def _mxfp8_scale_sweep_quantize(
         cols,
         device=W.device,
         clip_threshold=clip_threshold,
+        clip_rescale=clip_rescale,
         row_weights=fisher_row_weights,
     ).reshape(1, cols // group_size, group_size)
 
@@ -2758,6 +2841,7 @@ def _quantize_2d(
     nvfp4_global_real_override: torch.Tensor | None = None,
     input_global_scale_override: float | None = None,
     act_clip_threshold: float | None = None,
+    act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
     linear_name: str | None = None,
     awq_enabled: bool = False,
@@ -2798,9 +2882,11 @@ def _quantize_2d(
     is set, `_CACHED_ACTIVATIONS[linear_name]` is used.
 
     `act_clip_threshold`: optional scalar clamp for the render-time
-    activation-aware NVFP4 passes.  When None, legacy behavior is
+    activation-aware NVFP4/MXFP8 passes.  When None, legacy behavior is
     preserved: GPTQ/do-no-harm honor PRISMAQUANT_ACT_CLIP_QUANTILE,
     while scale_sweep and act-round use raw cached activations.
+    `act_clip_rescale` controls PrismaClip-RBC's row-wise rescaling after
+    an explicit clamp; supported values are none, row_rms, and row_mean_abs.
 
     `fisher_row_weights`: optional per-token gradient² weights aligned to
     cached activation rows. When provided, GPTQ/scale-sweep local objectives
@@ -2895,6 +2981,7 @@ def _quantize_2d(
                         w_work, acts_work, group_size=16,
                         global_real_override=nvfp4_global_real_override,
                         clip_threshold=act_clip_threshold,
+                        clip_rescale=act_clip_rescale,
                         fisher_row_weights=fisher_row_weights,
                     )
                 else:
@@ -2902,6 +2989,7 @@ def _quantize_2d(
                         w_work, acts_work, group_size=16,
                         global_real_override=nvfp4_global_real_override,
                         clip_threshold=act_clip_threshold,
+                        clip_rescale=act_clip_rescale,
                         fisher_row_weights=fisher_row_weights,
                     )
 
@@ -2916,6 +3004,7 @@ def _quantize_2d(
                     w_work, acts_work, group_size=16,
                     global_real_override=nvfp4_global_real_override,
                     clip_threshold=act_clip_threshold,
+                    clip_rescale=act_clip_rescale,
                     fisher_row_weights=fisher_row_weights,
                 )
 
@@ -2932,6 +3021,7 @@ def _quantize_2d(
                     global_real_override=nvfp4_global_real_override,
                     reference_weight=weight.to(torch.float32),
                     clip_threshold=act_clip_threshold,
+                    clip_rescale=act_clip_rescale,
                     fisher_row_weights=fisher_row_weights,
                 )
 
@@ -2955,6 +3045,7 @@ def _quantize_2d(
                     w_orig_f.shape[1],
                     device=w_orig_f.device,
                     clip_threshold=act_clip_threshold,
+                    clip_rescale=act_clip_rescale,
                     row_weights=fisher_row_weights,
                 )
                 mse_rtn = float((a2 * (w_orig_f - w_rtn).pow(2)
@@ -3040,6 +3131,7 @@ def _quantize_2d(
                 acts_work,
                 group_size=32,
                 clip_threshold=act_clip_threshold,
+                clip_rescale=act_clip_rescale,
                 fisher_row_weights=fisher_row_weights,
             )
         else:

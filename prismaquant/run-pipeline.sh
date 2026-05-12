@@ -115,12 +115,19 @@ PY
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
 : "${PRODUCTION_CACHE_LEVERS:=gptq,scale_sweep}"
 : "${FISHER_WEIGHTED_GPTQ:=0}"
+: "${PRISMACLIP:=0}"
+: "${PRISMACLIP_RBC:=0}"
 : "${PRISMAFISHERCLIP:=0}"
 : "${PRISMAFISHERCLIP_MODE:=audit}"
 : "${AWQ:=0}"
 : "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 : "${HALO_MODE:=off}"
 : "${HALO_SEED:=0}"
+: "${SELECTION_MODE:=surrogate}"
+: "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
+: "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
+: "${VALIDATED_FRONTIER_KL_SCOPE:=last_token}"
+: "${VALIDATED_FRONTIER_PICK:=kneedle}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
@@ -135,6 +142,23 @@ case "$FISHER_WEIGHTED_GPTQ" in
     case ",$PRODUCTION_CACHE_LEVERS," in
       *,fisher_gptq,*) ;;
       *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},fisher_gptq" ;;
+    esac
+    ;;
+esac
+case "$PRISMACLIP_RBC" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    PRISMACLIP=1
+    export PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING="${PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING:-none,row_rms}"
+    ;;
+esac
+case "$PRISMACLIP" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    export PRISMAQUANT_ACT_CLIP_SOLVER=1
+    case ",$PRODUCTION_CACHE_LEVERS," in
+      *,act_clip_solver,*) ;;
+      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},act_clip_solver" ;;
     esac
     ;;
 esac
@@ -168,6 +192,14 @@ esac
 
 mkdir -p "${WORK_DIR}"/{artifacts,act,work,logs,exported}
 
+case "$SELECTION_MODE" in
+  surrogate|validated-surrogate) ;;
+  *)
+    echo "[pipeline] ERROR: SELECTION_MODE must be surrogate or validated-surrogate" >&2
+    exit 2
+    ;;
+esac
+
 echo "[pipeline] config:"
 echo "  MODEL_PATH=$MODEL_PATH"
 echo "  WORK_DIR=$WORK_DIR"
@@ -183,9 +215,11 @@ echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
 echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
 echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
-echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ PRISMAFISHERCLIP=$PRISMAFISHERCLIP PRISMAFISHERCLIP_MODE=$PRISMAFISHERCLIP_MODE AWQ=$AWQ H_DETAIL_DIR=$H_DETAIL_DIR"
+echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ PRISMACLIP=$PRISMACLIP PRISMACLIP_RBC=$PRISMACLIP_RBC PRISMAFISHERCLIP=$PRISMAFISHERCLIP PRISMAFISHERCLIP_MODE=$PRISMAFISHERCLIP_MODE AWQ=$AWQ H_DETAIL_DIR=$H_DETAIL_DIR"
+echo "  PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING=${PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING:-none}"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
+echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
 echo
 
 # -----------------------------------------------------------------------
@@ -297,6 +331,13 @@ if [[ "$CALIBRATION_MODALITY" == "multimodal" ]]; then
 else
   VISUAL_SENSITIVITY=uniform
 fi
+ALLOCATOR_PARETO_ARGS=()
+if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
+  ALLOCATOR_PARETO_DIR="${WORK_DIR}/artifacts/pareto_assignments"
+  ALLOCATOR_PARETO_ARGS=(--pareto-output-dir "$ALLOCATOR_PARETO_DIR")
+else
+  ALLOCATOR_PARETO_DIR=""
+fi
 python3 -m prismaquant.allocator \
   --probe "${PROBE_PATH}" \
   --costs "${COST_PATH}" \
@@ -309,12 +350,17 @@ python3 -m prismaquant.allocator \
   --mtp-format "$MTP_FORMAT" \
   --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
   --pareto-csv "${WORK_DIR}/artifacts/pareto.csv" \
+  "${ALLOCATOR_PARETO_ARGS[@]}" \
   2>&1 | tee "${WORK_DIR}/logs/allocator.log"
 
 # -----------------------------------------------------------------------
 # 4. Production cache + native compressed-tensors export
 # -----------------------------------------------------------------------
 PRODUCTION_CACHE_PATH=""
+if [[ "$SELECTION_MODE" == "validated-surrogate" ]] && [[ "$PRODUCTION_CACHE" == "0" || "$PRODUCTION_CACHE" == "false" || "$PRODUCTION_CACHE" == "False" ]]; then
+  echo "[pipeline] ERROR: SELECTION_MODE=validated-surrogate requires PRODUCTION_CACHE=1 so KL validates production-rendered weights." >&2
+  exit 2
+fi
 if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTION_CACHE" != "False" ]]; then
   HALO_CACHE_TAG=""
   if [[ "$HALO_MODE" != "off" ]]; then
@@ -340,7 +386,155 @@ if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTI
   PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_raw.pkl"
   PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_recached.pkl"
   CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
-  if [[ "$CACHE_FORMATS" == "auto" ]]; then
+  if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
+    case ",$PRODUCTION_CACHE_LEVERS," in
+      *,awq,*|*,smoothquant,*)
+        echo "[pipeline] ERROR: SELECTION_MODE=validated-surrogate requires a format-menu cache, but AWQ/SmoothQuant fold scales are assignment-specific." >&2
+        echo "                 Disable AWQ/SmoothQuant for frontier selection, then rerun them as a selected-assignment ablation." >&2
+        exit 2
+        ;;
+    esac
+    if [[ -z "$ALLOCATOR_PARETO_DIR" || ! -f "$ALLOCATOR_PARETO_DIR/manifest.json" ]]; then
+      echo "[pipeline] ERROR: validated-surrogate selection requires allocator pareto assignments at $ALLOCATOR_PARETO_DIR" >&2
+      exit 2
+    fi
+    if [[ "$CACHE_FORMATS" == "auto" ]]; then
+      CACHE_FORMATS="$(python3 - "$FORMATS" <<'PY'
+import sys
+from prismaquant import format_registry as fr
+
+seen = []
+for raw in sys.argv[1].split(","):
+    name = raw.strip()
+    if not name:
+        continue
+    canon = fr.canonical_format_name(name)
+    if canon != "BF16" and canon not in seen:
+        seen.append(canon)
+print(",".join(seen))
+PY
+)"
+      echo "[pipeline] frontier production cache formats selected from FORMATS: ${CACHE_FORMATS:-none}"
+    fi
+    if [[ -z "$CACHE_FORMATS" ]]; then
+      echo "[pipeline] ERROR: validated-surrogate selection has no non-BF16 cache formats" >&2
+      exit 2
+    fi
+    PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
+    PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_frontier_raw.pkl"
+    if [[ ! -f "$PROD_CACHE_RAW" ]]; then
+      echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
+      python3 -m prismaquant.build_production_cache \
+        --model "$MODEL_PATH" \
+        --output "$PROD_CACHE_RAW" \
+        --formats "$CACHE_FORMATS" \
+        --dataset "$DATASET" \
+        --n-calib-samples "$NSAMPLES" \
+        --calib-seqlen "$SEQLEN" \
+        --dtype bf16 \
+        --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+        --enable "$PRODUCTION_CACHE_LEVERS" \
+        --cache-dir "$PROD_CACHE_DIR" \
+        --render-scope format-menu \
+        --halo-mode "$HALO_MODE" \
+        --halo-seed "$HALO_SEED" \
+        "${PROD_H_DETAIL_ARGS[@]}" \
+        2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
+    else
+      echo "[pipeline] [4/4] frontier production cache exists, skipping"
+    fi
+
+    VALIDATED_ASSIGNMENT_ARGS=()
+    while IFS=$'\t' read -r label path; do
+      [[ -n "$label" && -n "$path" ]] || continue
+      VALIDATED_ASSIGNMENT_ARGS+=(--assignment "${label}=${path}")
+    done < <(python3 - "$ALLOCATOR_PARETO_DIR/manifest.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1]))
+for row in payload.get("candidates", []):
+    print(f"{row['label']}\t{row['path']}")
+PY
+)
+    if [[ "${#VALIDATED_ASSIGNMENT_ARGS[@]}" -eq 0 ]]; then
+      echo "[pipeline] ERROR: no Pareto assignments found for validated frontier" >&2
+      exit 2
+    fi
+
+    VALIDATION_JSON="${WORK_DIR}/artifacts/validated_frontier_kl.json"
+    VALIDATED_ASSIGNMENT_COUNT=$(( ${#VALIDATED_ASSIGNMENT_ARGS[@]} / 2 ))
+    echo "[pipeline] [4/4] measuring real KL for ${VALIDATED_ASSIGNMENT_COUNT} Pareto assignments ..."
+    python3 -m prismaquant.validate_assignments_kl \
+      --model "$MODEL_PATH" \
+      --probe "$PROBE_PATH" \
+      --costs "$COST_PATH" \
+      --base-assignment "${WORK_DIR}/artifacts/layer_config.json" \
+      "${VALIDATED_ASSIGNMENT_ARGS[@]}" \
+      --output "$VALIDATION_JSON" \
+      --formats "$FORMATS" \
+      --dataset "$DATASET" \
+      --n-calib-samples "$VALIDATED_FRONTIER_NSAMPLES" \
+      --calib-seqlen "$VALIDATED_FRONTIER_SEQLEN" \
+      --dtype bf16 \
+      --device "$DEVICE" \
+      --kl-scope "$VALIDATED_FRONTIER_KL_SCOPE" \
+      --assignment-materialization hooks \
+      --production-weight-cache "$PROD_CACHE_RAW" \
+      --production-cache-dir-override "$PROD_CACHE_DIR" \
+      --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
+      --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
+      --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
+      --halo-mode "$HALO_MODE" \
+      --halo-seed "$HALO_SEED" \
+      2>&1 | tee "${WORK_DIR}/logs/validated_frontier_kl.log"
+
+    echo "[pipeline] [4/4] selecting measured frontier point ..."
+    python3 -m prismaquant.select_validated_frontier \
+      --validation-json "$VALIDATION_JSON" \
+      --mode "$VALIDATED_FRONTIER_PICK" \
+      --output-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+      --output-assignment "${WORK_DIR}/artifacts/layer_config_validated_assignment.json" \
+      --output-summary "${WORK_DIR}/artifacts/validated_frontier_selection.json" \
+      2>&1 | tee "${WORK_DIR}/logs/validated_frontier_select.log"
+
+    if [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
+      SELECTED_DIGEST="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()[:12])
+PY
+)"
+      PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_frontier_${SELECTED_DIGEST}_recached.pkl"
+      if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
+        echo "[pipeline] [4/4] re-fitting activation scales for selected measured-${VALIDATED_FRONTIER_PICK} assignment ..."
+        python3 -m prismaquant.production_recache \
+          --model "$MODEL_PATH" \
+          --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+          --production-weight-cache "$PROD_CACHE_RAW" \
+          --output "$PROD_CACHE_RECACHED" \
+          --cache-dir-override "$PROD_CACHE_DIR" \
+          --dataset "$DATASET" \
+          --n-calib-samples "$NSAMPLES" \
+          --calib-seqlen "$SEQLEN" \
+          --dtype bf16 \
+          --device "$DEVICE" \
+          --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
+          --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
+          --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
+          --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+          --halo-mode "$HALO_MODE" \
+          --halo-seed "$HALO_SEED" \
+          2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
+      else
+        echo "[pipeline] [4/4] selected-assignment recached production cache exists, skipping"
+      fi
+      PRODUCTION_CACHE_PATH="$PROD_CACHE_RECACHED"
+    else
+      PRODUCTION_CACHE_PATH="$PROD_CACHE_RAW"
+    fi
+  elif [[ "$CACHE_FORMATS" == "auto" ]]; then
     CACHE_FORMATS="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'
 import sys
 from prismaquant.production_recache import _load_assignment
@@ -352,7 +546,9 @@ PY
 )"
     echo "[pipeline] production cache formats selected from assignment: ${CACHE_FORMATS:-none}"
   fi
-  if [[ -z "$CACHE_FORMATS" ]]; then
+  if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
+    :
+  elif [[ -z "$CACHE_FORMATS" ]]; then
     echo "[pipeline] production cache requested but no non-BF16 formats are in FORMATS; skipping cache"
   elif [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
     if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then

@@ -31,6 +31,7 @@ import torch
 from .export_native_compressed import (
     _activation_matrix_for_gptq,
     _nvfp4_codebook,
+    _rtn_dequant_nvfp4,
     _round_to_codebook,
     _select_nvfp4_group_scales,
     NVFP4_MAX,
@@ -44,6 +45,7 @@ def _build_H_stack(
     device: torch.device,
     damp: float = 0.01,
     clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
     row_weights_list: list[torch.Tensor | None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build a stacked activation covariance tensor across E Linears.
@@ -95,6 +97,7 @@ def _build_H_stack(
             in_features,
             device=device,
             clip_threshold=clip_threshold,
+            clip_rescale=clip_rescale,
             row_weights=row_weights,
         )
         H = X.t() @ X
@@ -127,6 +130,7 @@ def gptq_obs_rounding_nvfp4_batched(
     damp: float = 0.01,
     global_real_overrides: torch.Tensor | None = None,
     clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
     row_weights_list: list[torch.Tensor | None] | None = None,
     expert_chunk: int = 32,
 ) -> torch.Tensor:
@@ -183,6 +187,7 @@ def gptq_obs_rounding_nvfp4_batched(
             device,
             damp=damp,
             clip_threshold=clip_threshold,
+            clip_rescale=clip_rescale,
             row_weights_list=(
                 row_weights_list[e_start:e_end]
                 if row_weights_list is not None else None
@@ -291,7 +296,17 @@ def gptq_obs_rounding_nvfp4_batched(
         # pack will RTN-quantize as if no GPTQ ran.
         if failed_mask.any():
             failed_idx = failed_mask.nonzero(as_tuple=True)[0]
-            W[failed_idx] = weights[e_start:e_end][failed_idx]
+            for j in failed_idx.tolist():
+                override = (
+                    global_real[j]
+                    if global_real_overrides is not None
+                    else None
+                )
+                W[j] = _rtn_dequant_nvfp4(
+                    weights[e_start + j],
+                    group_size=group_size,
+                    global_real_override=override,
+                )
 
         out_buf[e_start:e_end] = W
 
@@ -306,6 +321,7 @@ def scale_sweep_nvfp4_batched(
     group_size: int = 16,
     global_real_overrides: torch.Tensor | None = None,
     clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
     row_weights_list: list[torch.Tensor | None] | None = None,
     grid: int = 32,
     span: tuple[float, float] = (0.5, 1.5),
@@ -373,6 +389,7 @@ def scale_sweep_nvfp4_batched(
                 in_features,
                 device=device,
                 clip_threshold=clip_threshold,
+                clip_rescale=clip_rescale,
                 clip_quantile=0.0 if clip_threshold is None else None,
                 row_weights=row_weights,
             )

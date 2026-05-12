@@ -9,12 +9,14 @@ different reduction tree than the per-Linear sequential path).
 from __future__ import annotations
 
 import pytest
+from unittest import mock
 
 torch = pytest.importorskip("torch")
 
 import prismaquant.export_native_compressed as enc
 from prismaquant.export_native_compressed import (
     _gptq_obs_rounding_nvfp4,
+    _rtn_dequant_nvfp4,
     _scale_sweep_nvfp4,
 )
 from prismaquant.export_batched_gptq import (
@@ -95,6 +97,26 @@ def test_gptq_batched_with_global_real_overrides(seeded):
         global_real_overrides=overrides, expert_chunk=2,
     )
     assert torch.allclose(per_stack, batch_out, atol=1e-4, rtol=1e-3)
+
+
+def test_gptq_batched_cholesky_failure_falls_back_to_rtn(seeded):
+    E, out_features, in_features = 3, 16, 32
+    weights, activations_list = _make_inputs(E, out_features, in_features, T=64)
+
+    with mock.patch("torch.linalg.cholesky", side_effect=RuntimeError("boom")):
+        out = gptq_obs_rounding_nvfp4_batched(
+            weights,
+            activations_list,
+            group_size=16,
+            expert_chunk=4,
+        )
+
+    expected = torch.stack([
+        _rtn_dequant_nvfp4(weights[e], group_size=16)
+        for e in range(E)
+    ], dim=0)
+    torch.testing.assert_close(out, expected)
+    assert float((out - weights).pow(2).mean().item()) > 0.0
 
 
 def test_scale_sweep_batched_matches_per_linear(seeded):

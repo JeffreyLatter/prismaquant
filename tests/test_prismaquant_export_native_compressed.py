@@ -1376,6 +1376,33 @@ class TestActivationAwarePasses(unittest.TestCase):
         expected = torch.tensor([[1.0, -2.0, 10.0, -10.0]])
         self.assertTrue(torch.equal(out, expected))
 
+    def test_activation_matrix_rbc_preserves_row_rms_after_clip(self):
+        import torch
+        import prismaquant.export_native_compressed as m
+
+        x = torch.tensor([[1.0, 2.0, 120.0, -3.0]], dtype=torch.float32)
+        clipped = m._activation_matrix_for_gptq(
+            x,
+            4,
+            clip_threshold=20.0,
+            clip_rescale="none",
+        )
+        rbc = m._activation_matrix_for_gptq(
+            x,
+            4,
+            clip_threshold=20.0,
+            clip_rescale="row_rms",
+        )
+
+        self.assertLess(float(clipped.pow(2).mean().sqrt()), float(x.pow(2).mean().sqrt()))
+        self.assertTrue(torch.allclose(
+            rbc.pow(2).mean().sqrt(),
+            x.pow(2).mean().sqrt(),
+            rtol=1e-5,
+            atol=1e-5,
+        ))
+        self.assertLess(float(rbc[0, 2]), 120.0)
+
     def test_activation_matrix_applies_fisher_row_weights(self):
         import torch
         import prismaquant.export_native_compressed as m
@@ -1504,6 +1531,32 @@ class TestActivationAwarePasses(unittest.TestCase):
         mse = (W_gptq - dq).pow(2).mean().item()
         self.assertLess(mse, 1e-2,
                         f"GPTQ output not grid-aligned, mse={mse:.3e}")
+
+    def test_gptq_cholesky_failure_falls_back_to_rtn_not_original(self):
+        """A failed GPTQ solve must still return a valid NVFP4 render.
+
+        Returning the original BF16 weight makes local output-MSE gates see
+        impossible zero error in compute_only/production-cache paths.
+        """
+        import torch
+        from unittest import mock
+        from prismaquant.export_native_compressed import (
+            _gptq_obs_rounding_nvfp4,
+            _gptq_obs_rounding_nvfp4_swept,
+            _rtn_dequant_nvfp4,
+        )
+
+        torch.manual_seed(911)
+        W = torch.randn(16, 32) * 0.3
+        X = torch.randn(24, 32)
+        W_rtn = _rtn_dequant_nvfp4(W, group_size=16)
+        with mock.patch("torch.linalg.cholesky", side_effect=RuntimeError("boom")):
+            W_failed = _gptq_obs_rounding_nvfp4(W, X, group_size=16)
+            W_swept = _gptq_obs_rounding_nvfp4_swept(W, X, group_size=16)
+
+        torch.testing.assert_close(W_failed, W_rtn)
+        torch.testing.assert_close(W_swept, W_rtn)
+        self.assertGreater(float((W - W_failed).pow(2).mean().item()), 0.0)
 
     def test_activation_weighted_round_prefers_high_importance_channels(self):
         """Activation-weighted rounding should pick the grid neighbor
