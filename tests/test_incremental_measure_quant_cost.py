@@ -13,6 +13,7 @@ from prismaquant.measure_quant_cost import (
     measure_batched_gpu,
     measure_unbatched,
 )
+from prismaquant.sensitivity_probe import FisherAccumulator
 from prismaquant import format_registry as fr
 
 
@@ -178,6 +179,61 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
         weights = weights / weights.mean()
         expected = float((y_err_sq * weights.unsqueeze(1)).mean().item())
         self.assertAlmostEqual(got["fisher_output_mse"], expected, places=6)
+
+    def test_fisher_accumulator_writes_mtp_h_detail_and_row_indices(self):
+        class TinyMtpWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mtp = nn.Module()
+                self.mtp.fc = nn.Linear(2, 1, bias=False)
+
+            def forward(self, x):
+                return self.mtp.fc(x)
+
+        torch.manual_seed(0)
+        model = TinyMtpWrapper()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            act_dir = root / "act"
+            h_dir = root / "h"
+            acc = FisherAccumulator(
+                model,
+                ["mtp.fc"],
+                {},
+                act_cache_dir=act_dir,
+                input_rows=3,
+                h_detail_dir=h_dir,
+            )
+            try:
+                x = torch.tensor(
+                    [[[0.25, -0.5], [1.0, 0.75], [-0.125, 0.5]]],
+                    dtype=torch.float32,
+                    requires_grad=True,
+                )
+                loss = model(x).pow(2).sum()
+                loss.backward()
+                acc.finalize(tracker=None)
+            finally:
+                acc.remove_hooks()
+
+            safe = ActivationIndex._FNAME_SUB.sub("__", "mtp.fc") + ".pt"
+            act_payload = torch.load(act_dir / safe, map_location="cpu")
+            h_payload = torch.load(h_dir / safe, map_location="cpu")
+
+        self.assertEqual(act_payload["name"], "mtp.fc")
+        self.assertEqual(tuple(act_payload["inputs"].shape), (3, 2))
+        self.assertTrue(torch.equal(
+            act_payload["row_indices"],
+            torch.tensor([0, 1, 2], dtype=torch.long),
+        ))
+        self.assertEqual(h_payload["name"], "mtp.fc")
+        self.assertEqual(h_payload["kind"], "linear")
+        self.assertEqual(tuple(h_payload["h_diag"].shape), (1, 2))
+        self.assertEqual(tuple(h_payload["g2_per_token"].shape), (3,))
+        self.assertEqual(
+            acc.stats["mtp.fc"]["h_detail_path"],
+            safe,
+        )
 
 
 if __name__ == "__main__":

@@ -705,6 +705,7 @@ def _expected_probe_shard_meta(args, *,
             r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)"
         ),
         "h_detail_dir": str(Path(args.h_detail_dir)) if args.h_detail_dir else None,
+        "activation_rows_limit": int(args.activation_rows_limit),
         "shard_idx": shard_idx,
     }
 
@@ -738,7 +739,7 @@ _CONTENT_META_KEYS: tuple[str, ...] = (
     "model", "dataset", "nsamples", "seqlen", "dtype",
     "requested_device", "requested_device_map",
     "importance_weighting", "activation_cache_dir",
-    "linear_exclude", "h_detail_dir",
+    "linear_exclude", "h_detail_dir", "activation_rows_limit",
 )
 
 
@@ -1566,6 +1567,8 @@ def _run_body_streaming_shard(
                     "top_k": read_top_k(model, default=2),
                     "importance_weighting": importance_weighting,
                     "activation_cache_dir": activation_cache_dir,
+                    "h_detail_dir": h_detail_dir,
+                    "activation_rows_limit": int(activation_rows_limit),
                     "linear_include": linear_include,
                     "linear_exclude": linear_exclude,
                 },
@@ -2537,6 +2540,8 @@ def _run_body_streaming_shard(
                 "top_k": top_k,
                 "importance_weighting": importance_weighting,
                 "activation_cache_dir": activation_cache_dir,
+                "h_detail_dir": h_detail_dir,
+                "activation_rows_limit": int(activation_rows_limit),
                 "linear_include": linear_include,
                 "linear_exclude": linear_exclude,
             },
@@ -2561,12 +2566,14 @@ def _run_mtp_streaming_shard(
     linear_exclude: str,
     importance_weighting: bool,
     activation_cache_dir: str | None,
+    h_detail_dir: str | None,
     output_path: str,
     dataset_name: str,
     dtype_name: str,
     seqlen: int,
     model_path: str,
     prefetch_lookahead: int = 3,
+    activation_rows_limit: int = 256,
     precomputed: GlobalPrecompute | None = None,
 ):
     # Lazy import to avoid depending on transformers subpath at module load.
@@ -2631,6 +2638,8 @@ def _run_mtp_streaming_shard(
                     "execution_device": str(device),
                     "linear_include": linear_include,
                     "linear_exclude": linear_exclude,
+                    "h_detail_dir": h_detail_dir,
+                    "activation_rows_limit": max(1, int(activation_rows_limit)),
                     "skipped_reason": "no MTP weights in source",
                 },
             }, f)
@@ -2662,7 +2671,16 @@ def _run_mtp_streaming_shard(
     cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
-    acc = FisherAccumulator(mtp_wrapper, tracked, expert_info, cache_dir)
+    detail_dir = Path(h_detail_dir) if h_detail_dir else None
+    input_rows_limit = max(1, int(activation_rows_limit))
+    acc = FisherAccumulator(
+        mtp_wrapper,
+        tracked,
+        expert_info,
+        cache_dir,
+        input_rows=input_rows_limit,
+        h_detail_dir=detail_dir,
+    )
 
     # lm_head lives on the body model (resident).
     lm_head = model.get_output_embeddings()
@@ -2756,6 +2774,8 @@ def _run_mtp_streaming_shard(
                 "top_k": top_k,
                 "importance_weighting": importance_weighting,
                 "activation_cache_dir": activation_cache_dir,
+                "h_detail_dir": h_detail_dir,
+                "activation_rows_limit": input_rows_limit,
                 "linear_include": linear_include,
                 "linear_exclude": linear_exclude,
                 "mtp_probe": True,
@@ -3197,6 +3217,7 @@ def main():
         ),
         "h_detail_dir": (str(Path(args.h_detail_dir))
                          if args.h_detail_dir else None),
+        "activation_rows_limit": int(args.activation_rows_limit),
     }
     linear_cache = scan_cached_linear_stats(shard_dir, content_meta_anchor)
     if linear_cache:
@@ -3304,12 +3325,14 @@ def main():
                     linear_exclude=linear_exclude,
                     importance_weighting=args.importance_weighting,
                     activation_cache_dir=args.activation_cache_dir,
+                    h_detail_dir=args.h_detail_dir,
                     output_path=str(shard_path),
                     dataset_name=args.dataset,
                     dtype_name=args.dtype,
                     seqlen=args.seqlen,
                     model_path=args.model,
                     prefetch_lookahead=_prefetch_lookahead(),
+                    activation_rows_limit=args.activation_rows_limit,
                     precomputed=pre,
                 )
             elif kind == "lm_head":
