@@ -352,13 +352,12 @@ def test_production_cache_prismaclip_candidate_preserves_baseline_nvfp4(
     )
 
 
-def test_production_cache_prismaclip_rbc_searches_rescale_modes(monkeypatch):
-    import os
+def test_production_cache_prismaclip_rbc_is_disabled(monkeypatch):
+    import pytest
     import prismaquant.production_weight_cache as pwc
 
     model = _TinyChain()
     calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
-    seen_modes: list[str] = []
 
     def fake_render_production_weight(
         weight,
@@ -367,11 +366,8 @@ def test_production_cache_prismaclip_rbc_searches_rescale_modes(monkeypatch):
         act_clip_threshold=None,
         **_kwargs,
     ):
-        seen_modes.append(os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING", "none"))
         if act_clip_threshold is None:
             delta = 3.0
-        elif os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING") == "row_rms":
-            delta = 0.0
         else:
             delta = 2.0
         return weight.detach().to(torch.float32) + delta
@@ -381,28 +377,16 @@ def test_production_cache_prismaclip_rbc_searches_rescale_modes(monkeypatch):
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING", "none,row_rms")
     monkeypatch.setenv("PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS", "4")
 
-    cache = fill_production_weight_cache(
-        model,
-        calib_ids,
-        qnames=["l1"],
-        formats=["NVFP4"],
-        levers={"gptq": False, "scale_sweep": False, "act_clip_solver": True},
-        max_act_rows=8,
-        progress=False,
-    )
-
-    meta = cache.metadata["activation_clip_solver"]
-    selected = meta["selected_candidate_by_qname"]["l1"]
-    group_meta = next(iter(meta["groups"].values()))
-    assert meta["method"] == "PrismaClip-RBC"
-    assert meta["rescale_candidates"] == ["none", "row_rms"]
-    assert selected["rescale"] == "row_rms"
-    assert group_meta["selected_rescale"] == "row_rms"
-    assert any(mode == "row_rms" for mode in seen_modes)
-    torch.testing.assert_close(
-        cache.get("l1", "NVFP4").to(torch.float32),
-        model.l1.weight.detach().to(torch.float32),
-    )
+    with pytest.raises(RuntimeError, match="PrismaClip-RBC.*disabled"):
+        fill_production_weight_cache(
+            model,
+            calib_ids,
+            qnames=["l1"],
+            formats=["NVFP4"],
+            levers={"gptq": False, "scale_sweep": False, "act_clip_solver": True},
+            max_act_rows=8,
+            progress=False,
+        )
 
 
 def test_production_cache_act_clip_solver_skips_tiny_configured_gain(monkeypatch):

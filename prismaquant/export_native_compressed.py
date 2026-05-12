@@ -279,9 +279,17 @@ def _normalize_act_clip_rescale(mode: str | None) -> str:
     if normalized in {"", "0", "false", "no", "off", "none"}:
         return "none"
     if normalized in {"rbc", "row_rms", "row_l2", "rms"}:
-        return "row_rms"
+        raise RuntimeError(
+            "PrismaClip-RBC activation rescaling is disabled pending "
+            "investigation: the 2026-05-12 Qwen3.5-0.8B smoke regressed KL "
+            "and was about 10x slower in production-cache fill."
+        )
     if normalized in {"row_mean_abs", "mean_abs", "l1"}:
-        return "row_mean_abs"
+        raise RuntimeError(
+            "PrismaClip-RBC activation rescaling is disabled pending "
+            "investigation: the 2026-05-12 Qwen3.5-0.8B smoke regressed KL "
+            "and was about 10x slower in production-cache fill."
+        )
     raise ValueError(
         f"unknown activation clip rescale mode {mode!r}; "
         "expected none, row_rms, or row_mean_abs"

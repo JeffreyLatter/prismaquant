@@ -1057,9 +1057,17 @@ def _normalize_clip_rescale_mode(mode: object) -> str:
     if raw in {"", "0", "false", "no", "off", "none"}:
         return "none"
     if raw in {"rbc", "row_rms", "row_l2", "rms"}:
-        return "row_rms"
+        raise RuntimeError(
+            "PrismaClip-RBC activation rescaling is disabled pending "
+            "investigation: the 2026-05-12 Qwen3.5-0.8B smoke regressed KL "
+            "and was about 10x slower in production-cache fill."
+        )
     if raw in {"row_mean_abs", "mean_abs", "l1"}:
-        return "row_mean_abs"
+        raise RuntimeError(
+            "PrismaClip-RBC activation rescaling is disabled pending "
+            "investigation: the 2026-05-12 Qwen3.5-0.8B smoke regressed KL "
+            "and was about 10x slower in production-cache fill."
+        )
     raise ValueError(
         f"unknown PrismaClip rescale mode {mode!r}; "
         "expected none, row_rms, or row_mean_abs"
@@ -1069,7 +1077,10 @@ def _normalize_clip_rescale_mode(mode: object) -> str:
 def _prismaclip_rescale_candidates() -> tuple[str, ...]:
     raw = os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING", "none")
     if str(raw).strip().lower() in {"rbc", "auto", "joint"}:
-        raw = "none,row_rms"
+        raise RuntimeError(
+            "PrismaClip-RBC activation rescaling is disabled pending "
+            "investigation; use PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING=none."
+        )
     out: list[str] = []
     for part in str(raw).split(","):
         part = part.strip()

@@ -68,6 +68,16 @@ set -euo pipefail
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
+: "${PRISMACLIP_RBC:=0}"
+
+case "$PRISMACLIP_RBC" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    echo "[pipeline] ERROR: PRISMACLIP_RBC is disabled pending investigation." >&2
+    echo "                 The 2026-05-12 Qwen3.5-0.8B smoke regressed KL and made production-cache fill ~10x slower." >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$DEVICE" != cuda* || "$EXPORT_DEVICE" != cuda* ]]; then
   echo "[pipeline] ERROR: PrismaQuant production pipeline is GPU-or-bust; DEVICE and EXPORT_DEVICE must be cuda*" >&2
@@ -116,7 +126,6 @@ PY
 : "${PRODUCTION_CACHE_LEVERS:=gptq,scale_sweep}"
 : "${FISHER_WEIGHTED_GPTQ:=0}"
 : "${PRISMACLIP:=0}"
-: "${PRISMACLIP_RBC:=0}"
 : "${PRISMAFISHERCLIP:=0}"
 : "${PRISMAFISHERCLIP_MODE:=audit}"
 : "${AWQ:=0}"
@@ -145,11 +154,11 @@ case "$FISHER_WEIGHTED_GPTQ" in
     esac
     ;;
 esac
-case "$PRISMACLIP_RBC" in
-  0|false|False|FALSE|no|No|NO|"") ;;
+case "${PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING:-none}" in
+  ""|0|false|False|FALSE|no|No|NO|off|Off|OFF|none|None|NONE) ;;
   *)
-    PRISMACLIP=1
-    export PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING="${PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING:-none,row_rms}"
+    echo "[pipeline] ERROR: PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING must be none; PrismaClip-RBC is disabled pending investigation." >&2
+    exit 2
     ;;
 esac
 case "$PRISMACLIP" in

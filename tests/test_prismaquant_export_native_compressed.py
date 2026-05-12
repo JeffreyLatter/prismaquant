@@ -1376,32 +1376,18 @@ class TestActivationAwarePasses(unittest.TestCase):
         expected = torch.tensor([[1.0, -2.0, 10.0, -10.0]])
         self.assertTrue(torch.equal(out, expected))
 
-    def test_activation_matrix_rbc_preserves_row_rms_after_clip(self):
+    def test_activation_matrix_rbc_rescale_is_disabled(self):
         import torch
         import prismaquant.export_native_compressed as m
 
         x = torch.tensor([[1.0, 2.0, 120.0, -3.0]], dtype=torch.float32)
-        clipped = m._activation_matrix_for_gptq(
-            x,
-            4,
-            clip_threshold=20.0,
-            clip_rescale="none",
-        )
-        rbc = m._activation_matrix_for_gptq(
-            x,
-            4,
-            clip_threshold=20.0,
-            clip_rescale="row_rms",
-        )
-
-        self.assertLess(float(clipped.pow(2).mean().sqrt()), float(x.pow(2).mean().sqrt()))
-        self.assertTrue(torch.allclose(
-            rbc.pow(2).mean().sqrt(),
-            x.pow(2).mean().sqrt(),
-            rtol=1e-5,
-            atol=1e-5,
-        ))
-        self.assertLess(float(rbc[0, 2]), 120.0)
+        with self.assertRaisesRegex(RuntimeError, "PrismaClip-RBC.*disabled"):
+            m._activation_matrix_for_gptq(
+                x,
+                4,
+                clip_threshold=20.0,
+                clip_rescale="row_rms",
+            )
 
     def test_activation_matrix_applies_fisher_row_weights(self):
         import torch
