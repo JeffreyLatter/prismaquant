@@ -27,6 +27,10 @@ class Qwen3_5DenseProfile(Qwen3_5Profile):
         # Catch the dense arch before the MoE catch-all in Qwen3_5Profile.
         # Dense: Qwen3_5ForConditionalGeneration / Qwen3_5ForCausalLM
         # MoE:   Qwen3_5MoeForConditionalGeneration / Qwen3_5MoeForCausalLM
+        if model_type in {"qwen3_5", "qwen3_6"} and not any(
+            "Moe" in arch for arch in architectures
+        ):
+            return True
         for arch in architectures:
             if "Moe" in arch:
                 return False

@@ -3,7 +3,7 @@
   "id": "qwen3_5_dense",
   "default_serving_profile": "vllm_qwen3_5_packed_moe",
   "match": {
-    "model_type": ["qwen3_5"],
+    "model_type": ["qwen3_5", "qwen3_6"],
     "architectures": ["Qwen3_5For*", "Qwen3.5For*", "Qwen3_6For*", "Qwen3.6For*"]
   },
   "naming": {

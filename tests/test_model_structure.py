@@ -290,6 +290,23 @@ def test_qwen35_dense_profile_uses_dense_structure_spec():
     )
 
 
+def test_qwen36_model_type_aliases_route_dense_and_moe_profiles():
+    dense = profile_from_config({
+        "model_type": "qwen3_6",
+        "architectures": [],
+    })
+    moe = profile_from_config({
+        "model_type": "qwen3_6_moe",
+        "architectures": [],
+    })
+
+    assert isinstance(dense, Qwen3_5DenseProfile)
+    assert dense.structure_spec().id == "qwen3_5_dense"
+    assert isinstance(moe, Qwen3_5Profile)
+    assert not isinstance(moe, Qwen3_5DenseProfile)
+    assert moe.structure_spec().id == "qwen3_5"
+
+
 def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
     profile = Gemma4Profile()
     spec = profile.structure_spec()

@@ -42,7 +42,14 @@ class Qwen3_5Profile(ModelProfile):
 
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
-        if model_type in {"qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5"}:
+        if model_type in {
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+            "qwen3_5",
+            "qwen3_6_moe",
+            "qwen3_6_moe_text",
+            "qwen3_6",
+        }:
             return True
         for arch in architectures:
             if arch.startswith("Qwen3_5") or arch.startswith("Qwen3.5") \
