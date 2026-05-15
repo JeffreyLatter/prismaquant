@@ -220,6 +220,22 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
         r"re:^model[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+"
         r"[.](gate|up|down)_proj$"
     )
+    packed_group = moe.packed_expert_format_group(
+        "model.layers.0.mlp.experts.gate_up_proj"
+    )
+    assert packed_group == moe.packed_expert_format_group(
+        "model.layers.0.mlp.experts.down_proj"
+    )
+    split_group = moe.packed_expert_format_group(
+        "model.layers.0.mlp.experts.7.gate_proj"
+    )
+    assert split_group == moe.packed_expert_format_group(
+        "model.layers.0.mlp.experts.7.up_proj"
+    )
+    assert split_group == moe.packed_expert_format_group(
+        "model.layers.0.mlp.experts.7.down_proj"
+    )
+    assert split_group != packed_group
 
 
 def test_qwen3_dense_graph_marks_linears_and_fused_groups():
@@ -291,6 +307,14 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
     assert profile.to_vllm_internal_name(recipe) == (
         "language_model.model.layers.0.moe.experts.gate_up_proj"
     )
+    assert profile.packed_expert_format_group(recipe) == (
+        profile.packed_expert_format_group("model.layers.0.experts.down_proj")
+    )
+    assert profile.packed_expert_format_group(
+        "model.layers.0.experts.3.gate_proj"
+    ) == profile.packed_expert_format_group(
+        "model.layers.0.experts.3.down_proj"
+    )
     assert profile.source_passthrough_prefixes() == (
         "model.vision_tower.",
         "model.audio_tower.",
@@ -351,3 +375,9 @@ def test_deepseek_model_graph_marks_packed_experts():
     assert packed.source_name == "layers.0.ffn.experts.gate_up_proj"
     assert packed.quantizable is True
     assert "packed_expert_decomposition" in packed.constraints
+    profile = DeepseekV4Profile()
+    assert profile.packed_expert_format_group(
+        "model.layers.0.mlp.experts.gate_up_proj"
+    ) == profile.packed_expert_format_group(
+        "model.layers.0.mlp.experts.down_proj"
+    )

@@ -59,7 +59,12 @@
   "fused_groups": [],
   "packed_experts": {
     "param_names": ["gate_up_proj", "down_proj"],
-    "split_for_formats": ["*"]
+    "split_for_formats": ["*"],
+    "format_groups": [
+      ["gate_up_proj", "down_proj"],
+      ["gate_proj", "up_proj", "down_proj"],
+      ["w1", "w2", "w3"]
+    ]
   },
   "passthrough_prefixes": [],
   "pinned_names": ["lm_head", "head"]

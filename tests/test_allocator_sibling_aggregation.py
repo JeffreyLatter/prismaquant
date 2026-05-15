@@ -32,6 +32,7 @@ from prismaquant.allocator import (
     build_candidates,
     compute_achieved,
     expand_fused_sibling_assignment,
+    promote_moe_pair,
     solve_with_promotion,
 )
 
@@ -48,6 +49,21 @@ class _FakeProfile:
             return name.rsplit(".", 1)[0] + ".qkv_proj"
         if name.endswith(".gate_proj") or name.endswith(".up_proj"):
             return name.rsplit(".", 1)[0] + ".gate_up_proj"
+        return None
+
+
+class _FakePackedProfile:
+    """Profile stub for a non-Qwen expert naming scheme.
+
+    The old allocator regex only knew ``.experts`` paths. This profile proves
+    serving-format coupling can now come from the model/profile layer.
+    """
+
+    def packed_expert_format_group(self, name: str) -> str | None:
+        if name.startswith("blocks.0.router_bank.") and name.endswith(
+            (".left", ".right")
+        ):
+            return "blocks.0.router_bank.lr"
         return None
 
 
@@ -270,6 +286,22 @@ def test_aggregation_is_no_op_without_profile():
     stats_ext, costs_ext, cands_ext = aggregate_fused_siblings(
         stats, costs, specs, cands, profile=None)
     assert cands_ext is cands or cands_ext == cands
+
+
+def test_promote_moe_pair_uses_profile_format_groups():
+    assignment = {
+        "blocks.0.router_bank.left": "NVFP4",
+        "blocks.0.router_bank.right": "BF16",
+        "blocks.0.router_bank.other": "NVFP4",
+    }
+    promoted = promote_moe_pair(
+        assignment,
+        {"NVFP4": 0, "BF16": 1},
+        profile=_FakePackedProfile(),
+    )
+    assert promoted["blocks.0.router_bank.left"] == "BF16"
+    assert promoted["blocks.0.router_bank.right"] == "BF16"
+    assert promoted["blocks.0.router_bank.other"] == "NVFP4"
 
 
 # ---------------------------------------------------------------------------

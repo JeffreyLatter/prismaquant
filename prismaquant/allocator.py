@@ -643,7 +643,7 @@ def main():
         expanded = dict(assignment)
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
-        return promote_moe_pair(expanded, format_rank)
+        return promote_moe_pair(expanded, format_rank, profile=model_profile)
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
         total = 0.0
@@ -797,7 +797,11 @@ def main():
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. This keeps per-Linear assignments serveable without
     # collapsing experts into allocator super-items.
-    assignment_expanded = promote_moe_pair(assignment_expanded, format_rank)
+    assignment_expanded = promote_moe_pair(
+        assignment_expanded,
+        format_rank,
+        profile=model_profile,
+    )
 
     # Visual-encoder Linear handling. Two paths:
     #

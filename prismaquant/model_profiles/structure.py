@@ -90,6 +90,7 @@ class FusedGroupSpec:
 class PackedExpertSpec:
     param_names: tuple[str, ...] = ()
     split_for_formats: tuple[str, ...] = ()
+    format_groups: tuple[tuple[str, ...], ...] = ()
     declared: bool = False
 
     @classmethod
@@ -103,6 +104,10 @@ class PackedExpertSpec:
             param_names=tuple(str(v) for v in payload.get("param_names", ())),
             split_for_formats=tuple(
                 str(v) for v in payload.get("split_for_formats", ())
+            ),
+            format_groups=tuple(
+                tuple(str(member) for member in group)
+                for group in payload.get("format_groups", ())
             ),
             declared=declared,
         )
@@ -185,6 +190,45 @@ class ModelStructureSpec:
             return None
         fmt_upper = str(fmt).upper()
         return any(rule == "*" or rule.upper() == fmt_upper for rule in rules)
+
+    def packed_expert_format_group(self, qname: str) -> str | None:
+        """Return the serving-format group key for a packed expert tensor.
+
+        ``format_groups`` describes projection names that the serving runtime
+        must load under one quantization scheme.  The matcher handles both the
+        packed recipe form (``...experts.gate_up_proj``) and the split
+        per-expert export form (``...experts.7.gate_proj``).
+        """
+        groups = self.packed_experts.format_groups
+        if not groups:
+            return None
+        parts = str(qname).split(".")
+        try:
+            experts_idx = len(parts) - 1 - list(reversed(parts)).index("experts")
+        except ValueError:
+            return None
+        tail = parts[experts_idx + 1:]
+        split_per_expert = False
+        if len(tail) == 1:
+            leaf = tail[0]
+            parent = ".".join(parts[:experts_idx + 1])
+        elif len(tail) == 2 and tail[0].isdigit():
+            leaf = tail[1]
+            parent = ".".join(parts[:experts_idx + 2])
+            split_per_expert = True
+        else:
+            return None
+        for group in groups:
+            if leaf in group:
+                if split_per_expert and "gate_up_proj" in group:
+                    continue
+                if (
+                    not split_per_expert
+                    and {"gate_proj", "up_proj"}.intersection(group)
+                ):
+                    continue
+                return f"{parent}::__packed_format__:{','.join(group)}"
+        return None
 
 
 @dataclass(frozen=True)

@@ -315,6 +315,19 @@ class ModelProfile(ABC):
                 return decision
         return fmt != "BF16"
 
+    def packed_expert_format_group(self, qname: str) -> str | None:
+        """Return a group key for packed-expert projections that must
+        share one serving format.
+
+        This is the model/profile side of vLLM FusedMoE scheme coupling.
+        The allocator asks the profile for this key instead of hardcoding
+        Qwen/Gemma expert path regexes in the solver.
+        """
+        spec = self.structure_spec()
+        if spec is not None:
+            return spec.packed_expert_format_group(qname)
+        return None
+
     # ------------------------------------------------------------
     # Source passthrough + text-only staging
     # ------------------------------------------------------------

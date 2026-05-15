@@ -60,25 +60,47 @@ def fused_siblings(name: str, profile=None) -> tuple[tuple[str, ...], str] | Non
     return (name,), key
 
 
-def promote_moe_pair(assignment: dict[str, str],
-                     format_rank: dict[str, int]) -> dict[str, str]:
-    """Promote MoE expert projections that must share one serving format."""
-    out = dict(assignment)
-    groups: dict[tuple[str, str], list[str]] = {}
-
+def _legacy_packed_expert_format_group(name: str) -> str | None:
+    """Fallback for pre-profile callers and older custom profiles."""
     post_fused_re = re.compile(r"^(.+\.experts)\.(gate_up_proj|down_proj)$")
     per_expert_re = re.compile(
         r"^(.+\.experts)\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)$"
     )
+    m = post_fused_re.match(name)
+    if m:
+        return f"{m.group(1)}::__packed_format__:gate_up_proj,down_proj"
+    m = per_expert_re.match(name)
+    if not m:
+        return None
+    leaf = m.group(3)
+    members = "w1,w2,w3" if leaf in {"w1", "w2", "w3"} else (
+        "gate_proj,up_proj,down_proj"
+    )
+    return f"{m.group(1)}.{m.group(2)}::__packed_format__:{members}"
+
+
+def promote_moe_pair(
+    assignment: dict[str, str],
+    format_rank: dict[str, int],
+    *,
+    profile=None,
+) -> dict[str, str]:
+    """Promote packed MoE projections that must share one serving format."""
+    out = dict(assignment)
+    groups: dict[str, list[str]] = {}
+    profile_group_fn = getattr(profile, "packed_expert_format_group", None)
 
     for name in assignment:
-        m = post_fused_re.match(name)
-        if m:
-            groups.setdefault((m.group(1), "__post__"), []).append(name)
-            continue
-        m = per_expert_re.match(name)
-        if m:
-            groups.setdefault((m.group(1), m.group(2)), []).append(name)
+        group_key = None
+        if callable(profile_group_fn):
+            try:
+                group_key = profile_group_fn(name)
+            except Exception:
+                group_key = None
+        if group_key is None:
+            group_key = _legacy_packed_expert_format_group(name)
+        if group_key is not None:
+            groups.setdefault(group_key, []).append(name)
 
     for members in groups.values():
         if len(members) < 2:
@@ -307,7 +329,7 @@ def solve_with_promotion(
         del chosen_cands
         if not no_fused_promote:
             assign = promote_fused(assign, format_rank, profile=profile)
-        assign = promote_moe_pair(assign, format_rank)
+        assign = promote_moe_pair(assign, format_rank, profile=profile)
         achieved, _ = compute_achieved(
             stats, assign, format_specs,
             candidates=candidates,
