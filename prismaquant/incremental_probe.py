@@ -997,7 +997,7 @@ _PROBE_CTX_CACHE: dict = {}
 # the cumulative GPU pipeline gap was several seconds per chunk.
 #
 # This cache is keyed by (fqn, weight.data_ptr) so a model swap or
-# in-place weight modification (export pass, AWQ fold, etc.) invalidates
+# in-place weight modification (export pass, HALO, etc.) invalidates
 # automatically — different storage, different key. Within a single
 # probe run the weights are immutable, so the cache holds for the whole
 # multi-chunk driver lifetime.
@@ -2896,7 +2896,7 @@ def main():
                          "per-visual-Linear Fisher + activation snapshots "
                          "land in the probe pickle + activation cache, so "
                          "the allocator treats visual Linears as regular DP "
-                         "candidates and the exporter's AWQ/GPTQ/AR passes "
+                         "candidates and the exporter's GPTQ/AR passes "
                          "apply. Multimodal requires enough RAM for the full "
                          "model; on 122B-scale models it falls back to the "
                          "Phase 1 --visual-format override automatically on "

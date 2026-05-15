@@ -21,11 +21,16 @@ quantization path:
       GPTQ + scale_sweep inputs
     * optional PrismaFisherClip candidate scoring, which reuses h-detail
       per-token Fisher weights to accept/reject PrismaClip thresholds
+    * progressive local render gates for FourOverSix, GPTQ/Fisher-GPTQ,
+      scale_sweep, MXFP8 scale-sweep, and FP8 scale-sweep; regressive candidates fall back to
+      the previous accepted render and record metadata
     * optional Fisher-weighted local objectives from h-detail
-    * opt-in activation-weighted MXFP8 E8M0 scale search when nonzero
-      PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS are configured
-    * opt-in AWQ-v2 normalization-predecessor fold scales, searched by
-      rendered-weight output MSE and stored as effective cache weights
+    * activation-weighted MXFP8 E8M0 scale search and FP8 dynamic per-row
+      scale search when scale_sweep is enabled
+    * retired input-axis fold/rotation experiments (AWQ-v2, SmoothQuant,
+      BlockOrtho-G) are archived under
+      ``archive/foldscale_orthog_2026-05-13/`` and are not part of the
+      production cache path.
 
   KNOWN GAPS (v2 work, NOT implemented):
     * batched NVFP4 GPTQ + scale-sweep across same-shape Linears
@@ -36,9 +41,8 @@ quantization path:
       untied; not used on Qwen3-4B / 27B)
     * any export-only refinements added after this docstring is written
 
-  MXFP8/BF16:
-    * MXFP8 uses the same scale path as export. The default is RTN-equivalent;
-      nonzero exponent-shift search remains opt-in pending a positive KL gate.
+  MXFP8/FP8/BF16:
+    * MXFP8 and FP8 use the same scale paths as export under scale_sweep.
     * BF16 is passthrough.
 
 PerturbedActivationCache installs `W_tilde` (and applies the calibrated
@@ -58,7 +62,7 @@ Usage:
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import math
@@ -69,20 +73,27 @@ import re
 import torch
 import torch.nn as nn
 
-from prismaquant.awq import (
-    DEFAULT_AWQ_MIN_GAIN,
-    AwqSearchTarget,
-    awq_output_mse,
-    normalize_awq_scale,
-    search_awq_scale,
-)
+from prismaquant.activation_sampling import update_priority_reservoir
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
+from prismaquant.render_score import (
+    gate_render_candidate,
+    normalize_row_weights,
+    output_error_distribution_stats,
+    resolve_render_mechanism_order,
+    score_render_error,
+)
 from prismaquant.source_prefetch import prefetch_files_to_page_cache
 
 
 DEFAULT_ACT_CLIP_SOLVER_MIN_GAIN = 0.0
 DEFAULT_ACT_CLIP_SOLVER_HOLDOUT_FRACTION = 0.25
 PRISMACLIP_FORMAT = "NVFP4_CLIPPED"
+ARCHIVED_INPUT_AXIS_TRANSFORM_DIR = "archive/foldscale_orthog_2026-05-13"
+ARCHIVED_INPUT_AXIS_TRANSFORM_LEVERS = frozenset({
+    "awq",
+    "smoothquant",
+    "block_rotation",
+})
 
 
 @dataclass(frozen=True)
@@ -139,11 +150,6 @@ class ProductionWeightCache:
     metadata: dict[str, object] | None = None
     # Backward-compat alias for code that still reads ``activation_scales``.
     activation_scales: dict[str, float] | None = None
-    # Per-Linear AWQ fold scales.  Cache weights are stored in original
-    # coordinates as Q(W*s)/s for faithful measurement in the unfolded model;
-    # export multiplies by this scale and folds predecessor norms so the
-    # artifact stores Q(W*s) and serves the same function.
-    awq_scales: dict[str, torch.Tensor] | None = None
     # LRU eviction state for memoized tensor loads.  When non-None, the
     # in-memory cache holds at most ``mem_lru_max_bytes`` of tensor data;
     # least-recently-used entries are evicted back to their on-disk
@@ -814,6 +820,9 @@ class _LinearActivationCollector:
         self.store_device = torch.device(store_device or "cpu")
         self.store_dtype = store_dtype
         self.activations: dict[str, list[torch.Tensor]] = {}
+        self._activation_priorities: dict[str, torch.Tensor] = {}
+        self._activation_generator = torch.Generator(device="cpu")
+        self._activation_generator.manual_seed(42)
         self.max_abs: dict[str, float] = {}
         self._max_abs_tensors: dict[str, torch.Tensor] = {}
         self._handles: list = []
@@ -865,11 +874,23 @@ class _LinearActivationCollector:
                 dtype=self.store_dtype,
                 non_blocking=True,
             )
-            existing = sum(t.shape[0] for t in self.activations[key])
-            if existing >= self.max_rows:
-                return
-            take = min(flat.shape[0], self.max_rows - existing)
-            self.activations[key].append(flat[:take].clone())
+            current = (
+                torch.cat(self.activations[key], dim=0)
+                if self.activations[key]
+                else None
+            )
+            sampled, priorities = update_priority_reservoir(
+                current,
+                self._activation_priorities.get(key),
+                flat,
+                max_rows=self.max_rows,
+                generator=self._activation_generator,
+            )
+            self.activations[key] = [] if sampled is None else [sampled]
+            if priorities is None:
+                self._activation_priorities.pop(key, None)
+            else:
+                self._activation_priorities[key] = priorities
         return hook
 
     def remove(self) -> None:
@@ -908,10 +929,12 @@ def _temporarily_install_act_aware(
     prev_scale_rule = enc._NVFP4_SCALE_RULE
     enc._CACHED_ACTIVATIONS = _DictActivations(activations)
     enc._ACT_AWARE_FLAGS = {
-        "awq": bool(levers.get("awq", False)),
+        "awq": False,
         "gptq": bool(levers.get("gptq", True)),
         "awq_round": bool(levers.get("awq_round", False)),
         "scale_sweep": bool(levers.get("scale_sweep", True)),
+        "static_act_order": bool(levers.get("static_act_order", False)),
+        "joint_scale_opt": bool(levers.get("joint_scale_opt", False)),
     }
     enc._NVFP4_SCALE_RULE = enc.resolve_nvfp4_scale_rule(
         str(levers.get("nvfp4_scale_rule", "static_6"))
@@ -1052,6 +1075,28 @@ def _env_float(name: str, default: float, *, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def _archived_input_axis_levers_requested(
+    levers: Mapping[str, object],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            name for name in ARCHIVED_INPUT_AXIS_TRANSFORM_LEVERS
+            if bool(levers.get(name, False))
+        )
+    )
+
+
+def _reject_archived_input_axis_levers(levers: Mapping[str, object]) -> None:
+    requested = _archived_input_axis_levers_requested(levers)
+    if requested:
+        raise ValueError(
+            "AWQ, SmoothQuant, and BlockOrtho-G have been archived and "
+            "removed from the production render path. Requested retired "
+            f"lever(s): {', '.join(requested)}. Archived implementation: "
+            f"{ARCHIVED_INPUT_AXIS_TRANSFORM_DIR}."
+        )
+
+
 def _normalize_clip_rescale_mode(mode: object) -> str:
     raw = str(mode if mode is not None else "none").strip().lower().replace("-", "_")
     if raw in {"", "0", "false", "no", "off", "none"}:
@@ -1109,6 +1154,18 @@ def _temporary_act_clip_rescale(mode: str):
             os.environ["PRISMAQUANT_ACT_CLIP_RESCALING"] = previous
 
 
+@contextmanager
+def _temporary_nvfp4_scale_rule(rule: str):
+    from prismaquant import export_native_compressed as enc
+
+    previous = enc._NVFP4_SCALE_RULE
+    enc._NVFP4_SCALE_RULE = enc.resolve_nvfp4_scale_rule(rule)
+    try:
+        yield
+    finally:
+        enc._NVFP4_SCALE_RULE = previous
+
+
 def _activation_output_error(
     weight: torch.Tensor,
     rendered: torch.Tensor,
@@ -1118,31 +1175,13 @@ def _activation_output_error(
     row_chunk: int = 128,
 ) -> float:
     """Score ``rendered`` by output MSE on original, unclipped activations."""
-    rows, cols = weight.shape
-    if rendered.shape != weight.shape or activations.shape[-1] != cols:
-        return float("inf")
-    device = weight.device
-    diff_t = (
-        weight.detach().to(device=device, dtype=torch.float32)
-        - rendered.detach().to(device=device, dtype=torch.float32)
-    ).t().contiguous()
-    X = activations.detach().to(device=device, dtype=torch.float32).reshape(-1, cols)
-    rw = None
-    if row_weights is not None and X.numel() > 0:
-        rw = _normalize_prismafisherclip_row_weights(
-            row_weights,
-            X.shape[0],
-            device,
-        )
-    total = torch.zeros((), dtype=torch.float32, device=device)
-    with torch.no_grad():
-        for start in range(0, X.shape[0], row_chunk):
-            y = X[start:start + row_chunk] @ diff_t
-            err = y.pow(2)
-            if rw is not None:
-                err = err * rw[start:start + err.shape[0]].unsqueeze(1)
-            total = total + err.sum()
-    return float(total.item()) / max(1, int(X.shape[0]) * int(rows))
+    return score_render_error(
+        weight,
+        rendered,
+        activations,
+        row_weights=row_weights,
+        row_chunk=row_chunk,
+    )
 
 
 def _prismaclip_activation_distribution_stats(
@@ -1242,49 +1281,12 @@ def _output_error_distribution_stats(
     *,
     row_chunk: int = 128,
 ) -> dict[str, float]:
-    rows, cols = weight.shape
-    if rendered.shape != weight.shape or activations.shape[-1] != cols:
-        return {
-            "mse": float("inf"),
-            "p50_abs": float("inf"),
-            "p99_abs": float("inf"),
-            "max_abs": float("inf"),
-            "tail_ratio_p99_p50": float("inf"),
-        }
-    device = weight.device
-    diff_t = (
-        weight.detach().to(device=device, dtype=torch.float32)
-        - rendered.detach().to(device=device, dtype=torch.float32)
-    ).t().contiguous()
-    X = activations.detach().to(device=device, dtype=torch.float32).reshape(-1, cols)
-    chunks: list[torch.Tensor] = []
-    total_sq = torch.zeros((), dtype=torch.float32, device=device)
-    n_values = 0
-    with torch.no_grad():
-        for start in range(0, X.shape[0], row_chunk):
-            y_abs = (X[start:start + row_chunk] @ diff_t).abs()
-            total_sq = total_sq + y_abs.pow(2).sum()
-            n_values += int(y_abs.numel())
-            chunks.append(y_abs.detach().flatten())
-    if n_values <= 0:
-        return {
-            "mse": 0.0,
-            "p50_abs": 0.0,
-            "p99_abs": 0.0,
-            "max_abs": 0.0,
-            "tail_ratio_p99_p50": 0.0,
-        }
-    values = torch.cat(chunks).to(torch.float32)
-    p50 = float(values.quantile(0.50).item())
-    p99 = float(values.quantile(0.99).item())
-    max_abs = float(values.max().item())
-    return {
-        "mse": float(total_sq.item()) / n_values,
-        "p50_abs": p50,
-        "p99_abs": p99,
-        "max_abs": max_abs,
-        "tail_ratio_p99_p50": float(p99 / max(p50, 1e-12)),
-    }
+    return output_error_distribution_stats(
+        weight,
+        rendered,
+        activations,
+        row_chunk=row_chunk,
+    )
 
 
 def _normalize_prismafisherclip_row_weights(
@@ -1292,25 +1294,7 @@ def _normalize_prismafisherclip_row_weights(
     n_rows: int,
     device: torch.device,
 ) -> torch.Tensor | None:
-    if row_weights is None or n_rows <= 0:
-        return None
-    try:
-        rw = row_weights.detach().reshape(-1).to(device=device, dtype=torch.float32)
-    except Exception:
-        return None
-    if rw.numel() < n_rows:
-        return None
-    rw = torch.nan_to_num(rw[:n_rows], nan=0.0, posinf=0.0, neginf=0.0)
-    rw = rw.clamp_min(0.0)
-    rw = rw / rw.mean().clamp_min(1e-12)
-    try:
-        clip = float(os.environ.get("PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP", "64"))
-    except Exception:
-        clip = 64.0
-    if clip > 0.0:
-        rw = rw.clamp_max(float(clip))
-        rw = rw / rw.mean().clamp_min(1e-12)
-    return rw
+    return normalize_row_weights(row_weights, n_rows, device)
 
 
 def _prismaclip_activation_split(
@@ -1368,506 +1352,6 @@ def _prismaclip_row_weight_split(
     return rw[:n_rows][mask]
 
 
-_AWQ_CACHE_FORMATS = frozenset({"NVFP4", "MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
-_AWQ_INPUT_LN_LEAVES = frozenset({
-    "q_proj", "k_proj", "v_proj",
-    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
-})
-_AWQ_POST_LN_LEAVES = frozenset({
-    "gate_proj", "up_proj", "gate_up_proj", "w1", "w3", "gate", "router",
-})
-
-
-def _awq_group_key_from_qname(qname: str) -> str | None:
-    """Return the normalization predecessor group an AWQ scale can fold into."""
-    from prismaquant.decision_units import block_id_from_qname
-
-    leaf = qname.rsplit(".", 1)[-1]
-    block = block_id_from_qname(qname)
-    if leaf in _AWQ_INPUT_LN_LEAVES:
-        return f"{block}.input_layernorm"
-    if leaf in _AWQ_POST_LN_LEAVES:
-        return f"{block}.post_attention_layernorm"
-    return None
-
-
-def _awq_format_group_size(fmt: str) -> int:
-    fmt = _render_base_format(fmt)
-    if fmt == "NVFP4":
-        return 16
-    if fmt in {"MXFP8", "MXFP8_E4M3"}:
-        return 32
-    return 0
-
-
-def _render_awq_scaled_for_cache(
-    *,
-    qname: str,
-    fmt: str,
-    weight_scaled: torch.Tensor,
-    activations_scaled: torch.Tensor,
-    levers: Mapping[str, object],
-    joint_global_real: torch.Tensor | None,
-    act_clip_threshold: float | None = None,
-    act_clip_rescale: str | None = None,
-    fisher_row_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    from prismaquant import export_native_compressed as enc
-
-    fmt = _render_base_format(fmt)
-    with _temporarily_install_act_aware(
-        {qname: activations_scaled},
-        {**dict(levers), "awq": False},
-    ):
-        result = enc._quantize_2d(
-            weight_scaled,
-            fmt,
-            linear_name=qname,
-            nvfp4_global_real_override=joint_global_real,
-            cached_activations=activations_scaled,
-            awq_enabled=False,
-            gptq_enabled=bool(levers.get("gptq", True)),
-            awq_round_enabled=bool(levers.get("awq_round", False)),
-            scale_sweep_enabled=bool(levers.get("scale_sweep", True)),
-            act_clip_threshold=act_clip_threshold,
-            act_clip_rescale=act_clip_rescale,
-            fisher_row_weights=fisher_row_weights,
-            compute_only=(fmt == "NVFP4"),
-        )
-    if fmt == "NVFP4":
-        return result["_w_dq"].to(torch.float32)
-    if fmt in {"MXFP8", "MXFP8_E4M3"}:
-        weight = result["weight"]
-        scale = result["weight_scale"]
-        grouped = weight.reshape(weight.shape[0], weight.shape[1] // 32, 32)
-        return enc._mxfp8_dequantize_grouped(grouped, scale).reshape(weight.shape)
-    if fmt == "FP8_E4M3":
-        return result["weight"].to(torch.float32) * result["weight_scale"].to(torch.float32)
-    raise ValueError(f"AWQ cache renderer unsupported for {fmt}")
-
-
-def _compute_awq_scaled_joint_globals(
-    *,
-    qname_to_module: Mapping[str, nn.Module],
-    render_formats_by_qname: Mapping[str, Sequence[str]],
-    awq_scales: Mapping[str, torch.Tensor],
-    profile,
-) -> dict[str, torch.Tensor]:
-    """Compute NVFP4 joint globals after AWQ column scaling."""
-    from prismaquant.decision_units import fused_group_key
-    from prismaquant.export_native_compressed import compute_nvfp4_global_real
-
-    groups: dict[str, list[str]] = {}
-    for qname, fmts in render_formats_by_qname.items():
-        if "NVFP4" not in {str(f).upper() for f in fmts}:
-            continue
-        if qname not in qname_to_module:
-            continue
-        try:
-            gk = fused_group_key(profile, qname) if profile else qname
-        except Exception:
-            gk = qname
-        groups.setdefault(gk, []).append(qname)
-
-    out: dict[str, torch.Tensor] = {}
-    for _gk, members in groups.items():
-        candidates = []
-        for qname in members:
-            weight = qname_to_module[qname].weight.detach().to(torch.float32)
-            scale = awq_scales.get(qname)
-            if scale is not None and scale.numel() == weight.shape[1]:
-                weight = weight * scale.to(weight.device, dtype=torch.float32).unsqueeze(0)
-            candidates.append(compute_nvfp4_global_real(weight))
-        if not candidates:
-            continue
-        joint = torch.stack(candidates).max()
-        for qname in members:
-            out[qname] = joint
-    return out
-
-
-def _solve_awq_scales(
-    *,
-    qname_to_module: Mapping[str, nn.Module],
-    activations: Mapping[str, torch.Tensor],
-    render_formats_by_qname: Mapping[str, Sequence[str]],
-    levers: Mapping[str, object],
-    progress: bool,
-) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
-    """Solve normalization-fold AWQ scales for a concrete assignment."""
-    groups: dict[str, list[str]] = {}
-    for qname, fmts in render_formats_by_qname.items():
-        if qname not in qname_to_module or qname not in activations:
-            continue
-        fmt = next((str(f).upper() for f in fmts if str(f).upper() != "BF16"), "")
-        if fmt not in _AWQ_CACHE_FORMATS:
-            continue
-        group_key = _awq_group_key_from_qname(qname)
-        if group_key is None:
-            continue
-        groups.setdefault(group_key, []).append(qname)
-
-    metadata: dict[str, object] = {
-        "enabled": True,
-        "mode": "duo_output_mse",
-        "groups": {},
-        "scales": {},
-        "n_groups": 0,
-        "n_scaled_linears": 0,
-    }
-    scales: dict[str, torch.Tensor] = {}
-    if not groups:
-        metadata["status"] = "no_eligible_groups"
-        return scales, metadata
-
-    n_grid = _env_int("PRISMAQUANT_AWQ_GRID", 20, lo=2, hi=80)
-    clamp_ratio = _env_float("PRISMAQUANT_AWQ_CLAMP", 10.0, lo=1.0, hi=100.0)
-    min_gain = _env_float(
-        "PRISMAQUANT_AWQ_MIN_GAIN",
-        DEFAULT_AWQ_MIN_GAIN,
-        lo=-1.0,
-        hi=1.0,
-    )
-    duo = _env_flag("PRISMAQUANT_AWQ_DUO", True)
-    search_levers = dict(levers)
-    search_levers["gptq"] = _env_flag("PRISMAQUANT_AWQ_SEARCH_GPTQ", False)
-    search_levers["scale_sweep"] = _env_flag(
-        "PRISMAQUANT_AWQ_SEARCH_SCALE_SWEEP",
-        bool(levers.get("scale_sweep", True)),
-    )
-    search_levers["fisher_gptq"] = _env_flag(
-        "PRISMAQUANT_AWQ_SEARCH_FISHER_GPTQ",
-        False,
-    )
-    search_levers["awq_round"] = _env_flag(
-        "PRISMAQUANT_AWQ_SEARCH_AWQ_ROUND",
-        False,
-    )
-    metadata["min_gain"] = float(min_gain)
-    metadata["n_grid"] = int(n_grid)
-    metadata["clamp_ratio"] = float(clamp_ratio)
-    metadata["duo_scaling"] = bool(duo)
-    metadata["search_levers"] = {
-        "gptq": bool(search_levers.get("gptq", False)),
-        "scale_sweep": bool(search_levers.get("scale_sweep", True)),
-        "fisher_gptq": bool(search_levers.get("fisher_gptq", False)),
-        "awq_round": bool(search_levers.get("awq_round", False)),
-    }
-
-    for idx, (group_key, raw_members) in enumerate(sorted(groups.items()), start=1):
-        members = sorted(set(raw_members))
-        targets: list[AwqSearchTarget] = []
-        target_qnames: list[str] = []
-        for qname in members:
-            fmt = next(
-                (str(f).upper() for f in render_formats_by_qname[qname]
-                 if str(f).upper() != "BF16"),
-                "",
-            )
-            weight = qname_to_module[qname].weight.detach().to(torch.float32)
-            acts = activations[qname].detach().to(weight.device, dtype=torch.float32)
-            targets.append(AwqSearchTarget(
-                name=qname,
-                fmt=fmt,
-                weight=weight,
-                activations=acts,
-                group_size=_awq_format_group_size(fmt),
-            ))
-            target_qnames.append(qname)
-        if not targets:
-            continue
-
-        def render_target(tidx, w_scaled, a_scaled, scale):
-            target = targets[tidx]
-            return _render_awq_scaled_for_cache(
-                qname=target.name,
-                fmt=target.fmt,
-                weight_scaled=w_scaled,
-                activations_scaled=a_scaled,
-                levers=search_levers,
-                joint_global_real=None,
-            )
-
-        try:
-            result = search_awq_scale(
-                targets,
-                render_target,
-                n_grid=n_grid,
-                duo_scaling=duo,
-                clamp_ratio=clamp_ratio,
-                min_gain=min_gain,
-            )
-        except Exception as exc:
-            metadata["groups"][group_key] = {
-                "members": target_qnames,
-                "status": "failed",
-                "error": str(exc),
-            }
-            if _env_flag("PRISMAQUANT_AWQ_STRICT", False):
-                raise
-            continue
-
-        selected = result.selected_label != "identity"
-        for qname in target_qnames:
-            if selected:
-                scales[qname] = result.scale.detach().cpu()
-                metadata["scales"][qname] = {
-                    "group": group_key,
-                    "selected_label": result.selected_label,
-                    "relative_gain": result.relative_gain,
-                }
-        metadata["groups"][group_key] = {
-            "members": target_qnames,
-            "status": "solved",
-            "selected": result.selected_label,
-            "selected_ratio": result.selected_ratio,
-            "baseline_score": result.baseline_score,
-            "best_score": result.best_score,
-            "relative_gain": result.relative_gain,
-            "n_candidates": result.n_candidates,
-            "trace": result.trace,
-        }
-        if progress and (idx % 10 == 0 or idx == len(groups)):
-            print(
-                f"[prod-cache] AWQ searched {idx}/{len(groups)} groups",
-                flush=True,
-            )
-
-    metadata["status"] = "applied"
-    metadata["n_groups"] = len(groups)
-    metadata["n_scaled_linears"] = len(scales)
-    return scales, metadata
-
-
-def _env_float_list(name: str, default: Sequence[float]) -> list[float]:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return [float(v) for v in default]
-    out: list[float] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            val = float(part)
-        except ValueError:
-            continue
-        if 0.0 <= val <= 1.0:
-            out.append(val)
-    return out or [float(v) for v in default]
-
-
-def _smoothquant_scale_from_targets(
-    targets: Sequence[AwqSearchTarget],
-    *,
-    alpha: float,
-    clamp_ratio: float,
-    eps: float = 1e-4,
-) -> torch.Tensor:
-    if not targets:
-        raise ValueError("SmoothQuant requires at least one target")
-    cols = int(targets[0].weight.shape[1])
-    device = targets[0].weight.device
-    x_max = torch.zeros(cols, device=device, dtype=torch.float32)
-    w_max = torch.zeros(cols, device=device, dtype=torch.float32)
-    for target in targets:
-        if int(target.weight.shape[1]) != cols:
-            raise ValueError("all SmoothQuant targets must share input width")
-        x = target.activations.detach().to(device=device, dtype=torch.float32)
-        x = x.reshape(-1, cols)
-        w = target.weight.detach().to(device=device, dtype=torch.float32)
-        x_max = torch.maximum(x_max, x.abs().amax(dim=0))
-        w_max = torch.maximum(w_max, w.abs().amax(dim=0))
-    a = float(alpha)
-    raw = x_max.clamp_min(eps).pow(a) / w_max.clamp_min(eps).pow(1.0 - a)
-    return normalize_awq_scale(raw, eps=eps, clamp_ratio=clamp_ratio)
-
-
-def _solve_smoothquant_scales(
-    *,
-    qname_to_module: Mapping[str, nn.Module],
-    activations: Mapping[str, torch.Tensor],
-    render_formats_by_qname: Mapping[str, Sequence[str]],
-    levers: Mapping[str, object],
-    progress: bool,
-) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
-    """Solve SmoothQuant-style normalization-fold scales for an assignment."""
-    groups: dict[str, list[str]] = {}
-    for qname, fmts in render_formats_by_qname.items():
-        if qname not in qname_to_module or qname not in activations:
-            continue
-        fmt = next((str(f).upper() for f in fmts if str(f).upper() != "BF16"), "")
-        if fmt not in _AWQ_CACHE_FORMATS:
-            continue
-        group_key = _awq_group_key_from_qname(qname)
-        if group_key is None:
-            continue
-        groups.setdefault(group_key, []).append(qname)
-
-    metadata: dict[str, object] = {
-        "enabled": True,
-        "mode": "max_stat_alpha_search",
-        "groups": {},
-        "scales": {},
-        "n_groups": 0,
-        "n_scaled_linears": 0,
-    }
-    scales: dict[str, torch.Tensor] = {}
-    if not groups:
-        metadata["status"] = "no_eligible_groups"
-        return scales, metadata
-
-    alphas = _env_float_list("PRISMAQUANT_SMOOTHQUANT_ALPHAS", [0.5])
-    clamp_ratio = _env_float("PRISMAQUANT_SMOOTHQUANT_CLAMP", 10.0, lo=1.0, hi=100.0)
-    min_gain = _env_float("PRISMAQUANT_SMOOTHQUANT_MIN_GAIN", 0.0, lo=-1.0, hi=1.0)
-    search_levers = dict(levers)
-    search_levers["gptq"] = _env_flag("PRISMAQUANT_SMOOTHQUANT_SEARCH_GPTQ", False)
-    search_levers["scale_sweep"] = _env_flag(
-        "PRISMAQUANT_SMOOTHQUANT_SEARCH_SCALE_SWEEP",
-        False,
-    )
-    search_levers["fisher_gptq"] = _env_flag(
-        "PRISMAQUANT_SMOOTHQUANT_SEARCH_FISHER_GPTQ",
-        False,
-    )
-    search_levers["awq_round"] = False
-    metadata["alphas"] = [float(a) for a in alphas]
-    metadata["clamp_ratio"] = float(clamp_ratio)
-    metadata["min_gain"] = float(min_gain)
-    metadata["search_levers"] = {
-        "gptq": bool(search_levers.get("gptq", False)),
-        "scale_sweep": bool(search_levers.get("scale_sweep", False)),
-        "fisher_gptq": bool(search_levers.get("fisher_gptq", False)),
-        "awq_round": False,
-    }
-
-    for idx, (group_key, raw_members) in enumerate(sorted(groups.items()), start=1):
-        members = sorted(set(raw_members))
-        targets: list[AwqSearchTarget] = []
-        target_qnames: list[str] = []
-        for qname in members:
-            fmt = next(
-                (str(f).upper() for f in render_formats_by_qname[qname]
-                 if str(f).upper() != "BF16"),
-                "",
-            )
-            weight = qname_to_module[qname].weight.detach().to(torch.float32)
-            acts = activations[qname].detach().to(weight.device, dtype=torch.float32)
-            targets.append(AwqSearchTarget(
-                name=qname,
-                fmt=fmt,
-                weight=weight,
-                activations=acts,
-                group_size=_awq_format_group_size(fmt),
-            ))
-            target_qnames.append(qname)
-        if not targets:
-            continue
-
-        def score_scale(scale: torch.Tensor) -> float:
-            total = 0.0
-            scale = scale.to(device=targets[0].weight.device, dtype=torch.float32)
-            for tidx, target in enumerate(targets):
-                w = target.weight.detach().to(dtype=torch.float32)
-                x = target.activations.detach().to(w.device, dtype=torch.float32)
-                w_scaled = w * scale.unsqueeze(0)
-                a_scaled = x.reshape(-1, x.shape[-1]) / scale.clamp_min(1e-12).unsqueeze(0)
-                rendered = _render_awq_scaled_for_cache(
-                    qname=target.name,
-                    fmt=target.fmt,
-                    weight_scaled=w_scaled,
-                    activations_scaled=a_scaled,
-                    levers=search_levers,
-                    joint_global_real=None,
-                )
-                effective = (
-                    rendered.to(w.device, dtype=torch.float32)
-                    / scale.clamp_min(1e-12).unsqueeze(0)
-                )
-                total += awq_output_mse(
-                    w,
-                    effective,
-                    target.activations,
-                )
-            return float(total)
-
-        try:
-            identity = torch.ones(
-                int(targets[0].weight.shape[1]),
-                device=targets[0].weight.device,
-                dtype=torch.float32,
-            )
-            baseline_score = score_scale(identity)
-            best_scale = identity
-            best_alpha: float | None = None
-            best_score = float(baseline_score)
-            trace: list[dict[str, float | str | None]] = [{
-                "label": "identity",
-                "alpha": None,
-                "score": float(baseline_score),
-                "best_score": float(best_score),
-            }]
-            for alpha in alphas:
-                cand = _smoothquant_scale_from_targets(
-                    targets,
-                    alpha=float(alpha),
-                    clamp_ratio=clamp_ratio,
-                )
-                score = score_scale(cand)
-                if score < best_score:
-                    best_score = float(score)
-                    best_scale = cand.detach().clone()
-                    best_alpha = float(alpha)
-                trace.append({
-                    "label": f"alpha_{float(alpha):.4f}",
-                    "alpha": float(alpha),
-                    "score": float(score),
-                    "best_score": float(best_score),
-                })
-        except Exception as exc:
-            metadata["groups"][group_key] = {
-                "members": target_qnames,
-                "status": "failed",
-                "error": str(exc),
-            }
-            if _env_flag("PRISMAQUANT_SMOOTHQUANT_STRICT", False):
-                raise
-            continue
-
-        denom = max(abs(float(baseline_score)), 1e-30)
-        relative_gain = (float(baseline_score) - float(best_score)) / denom
-        selected = best_alpha is not None and relative_gain >= float(min_gain)
-        if selected:
-            for qname in target_qnames:
-                scales[qname] = best_scale.detach().cpu()
-                metadata["scales"][qname] = {
-                    "group": group_key,
-                    "selected_alpha": best_alpha,
-                    "relative_gain": relative_gain,
-                }
-        metadata["groups"][group_key] = {
-            "members": target_qnames,
-            "status": "solved",
-            "selected": "identity" if not selected else f"alpha_{best_alpha:.4f}",
-            "selected_alpha": None if not selected else best_alpha,
-            "baseline_score": float(baseline_score),
-            "best_score": float(best_score if selected else baseline_score),
-            "relative_gain": float(relative_gain if selected else 0.0),
-            "n_candidates": len(alphas) + 1,
-            "trace": trace,
-        }
-        if progress and (idx % 10 == 0 or idx == len(groups)):
-            print(
-                f"[prod-cache] SmoothQuant searched {idx}/{len(groups)} groups",
-                flush=True,
-            )
-
-    metadata["status"] = "applied"
-    metadata["n_groups"] = len(groups)
-    metadata["n_scaled_linears"] = len(scales)
-    return scales, metadata
-
-
 def _group_activation_bounds(
     members: Sequence[str],
     activations: Mapping[str, torch.Tensor],
@@ -1890,6 +1374,8 @@ def _group_activation_bounds(
     if not math.isfinite(lo) or not math.isfinite(max_abs) or lo >= max_abs:
         return None
     return lo, max_abs
+
+
 
 
 def _store_rendered_weight_entry(
@@ -1928,7 +1414,6 @@ def _solve_nvfp4_activation_clip_groups(
     weights_out: dict[tuple[str, str], object],
     cache_dir_path: Path | None,
     progress: bool,
-    awq_scales: Mapping[str, torch.Tensor] | None = None,
     cache_formats: Sequence[str] = ("NVFP4",),
 ) -> tuple[dict[str, _ClipCandidate], dict[str, object]]:
     """Solve one render-time activation clamp candidate per fused NVFP4 group.
@@ -2053,6 +1538,10 @@ def _solve_nvfp4_activation_clip_groups(
         "groups": {},
         "selected_by_qname": {},
         "selected_candidate_by_qname": {},
+        "input_groups": 0,
+        "bounded_groups": 0,
+        "skipped_empty_groups": 0,
+        "skipped_no_clip_interval": 0,
         "prewritten_qnames": [],
         "prewrite_baseline": _env_flag(
             "PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE",
@@ -2065,9 +1554,17 @@ def _solve_nvfp4_activation_clip_groups(
         ),
         "batched_evaluations": 0,
         "scalar_evaluations": 0,
+        "capture_render_gate_traces": _env_flag(
+            "PRISMAQUANT_ACT_CLIP_SOLVER_CAPTURE_GATE_TRACES",
+            True,
+        ),
     }
 
-    def render_member(qname: str, candidate: _ClipCandidate) -> torch.Tensor:
+    def render_member(
+        qname: str,
+        candidate: _ClipCandidate,
+        gate_trace: list[dict[str, object]] | None = None,
+    ) -> torch.Tensor:
         mod = qname_to_module[qname]
         max_abs = activation_max_abs.get(qname)
         export_scale = (
@@ -2091,7 +1588,7 @@ def _solve_nvfp4_activation_clip_groups(
                     if fisher_render_enabled and fisher_rows is not None
                     else None
                 ),
-                awq_scale=(awq_scales or {}).get(qname),
+                gate_trace=gate_trace,
             )
 
     group_entries: list[dict[str, object]] = []
@@ -2103,8 +1600,6 @@ def _solve_nvfp4_activation_clip_groups(
         if not metadata["batched_same_shape"] or len(members) < 2:
             return None
         if bool(levers.get("awq_round", False)):
-            return None
-        if any((awq_scales or {}).get(qname) is not None for qname in members):
             return None
         modules = [qname_to_module[qname] for qname in members]
         shapes = {tuple(mod.weight.shape) for mod in modules}
@@ -2200,6 +1695,12 @@ def _solve_nvfp4_activation_clip_groups(
                         clip_threshold=candidate.threshold,
                         clip_rescale=candidate.rescale,
                         row_weights_list=row_weights_list,
+                        static_act_order=bool(
+                            levers.get("static_act_order", False)
+                        ),
+                        joint_scale_opt=bool(
+                            levers.get("joint_scale_opt", False)
+                        ),
                     )
                     diff = reference_weights - cand_w
                     err = torch.einsum("eoi,eij,eoj->e", diff, h_eval, diff)
@@ -2222,6 +1723,12 @@ def _solve_nvfp4_activation_clip_groups(
                     clip_threshold=candidate.threshold,
                     clip_rescale=candidate.rescale,
                     row_weights_list=row_weights_list,
+                    static_act_order=bool(
+                        levers.get("static_act_order", False)
+                    ),
+                    joint_scale_opt=bool(
+                        levers.get("joint_scale_opt", False)
+                    ),
                 )
 
         if bool(levers.get("scale_sweep", True)):
@@ -2279,6 +1786,7 @@ def _solve_nvfp4_activation_clip_groups(
         keep_weights: bool = False,
         score_splits: Sequence[str] = ("all",),
         distribution_stats: bool = False,
+        gate_traces_out: dict[str, list[dict[str, object]]] | None = None,
     ) -> tuple[dict[str, float], dict[str, torch.Tensor] | None, dict[str, object] | None]:
         scores = {split: 0.0 for split in score_splits}
         if fisher_clip_available:
@@ -2296,7 +1804,10 @@ def _solve_nvfp4_activation_clip_groups(
             }
             if distribution_stats else None
         )
-        rendered = render_members_batched(members, candidate)
+        rendered = (
+            None if gate_traces_out is not None
+            else render_members_batched(members, candidate)
+        )
         if rendered is not None:
             metadata["batched_evaluations"] = (
                 int(metadata.get("batched_evaluations", 0)) + 1
@@ -2305,7 +1816,14 @@ def _solve_nvfp4_activation_clip_groups(
             metadata["scalar_evaluations"] = (
                 int(metadata.get("scalar_evaluations", 0)) + len(members)
             )
-            rendered = {qname: render_member(qname, candidate) for qname in members}
+            rendered = {}
+            for qname in members:
+                q_trace: list[dict[str, object]] | None = (
+                    [] if gate_traces_out is not None else None
+                )
+                rendered[qname] = render_member(qname, candidate, q_trace)
+                if gate_traces_out is not None:
+                    gate_traces_out[qname] = q_trace or []
         for qname, w_dq in rendered.items():
             score_row_weights = (
                 fisher_rows.get(qname)
@@ -2354,19 +1872,59 @@ def _solve_nvfp4_activation_clip_groups(
     primary_score_key = "fisher_all" if fisher_primary else "all"
     primary_holdout_key = "fisher_holdout" if fisher_primary else "holdout"
     baseline_items = list(sorted(groups.items()))
+    metadata["input_groups"] = int(len(baseline_items))
     for idx, (group_key, raw_members) in enumerate(baseline_items, start=1):
         members = [
             q for q in sorted(set(raw_members))
             if q in qname_to_module and activations.get(q) is not None
         ]
         if not members:
+            metadata["skipped_empty_groups"] = (
+                int(metadata.get("skipped_empty_groups", 0)) + 1
+            )
+            metadata["groups"][str(group_key)] = {
+                "members": [],
+                "status": "skipped_empty_group",
+                "selected": "baseline",
+                "gate_reason": "skipped_empty_group",
+                "local_gate_accepted": False,
+                "rejection_reason": "skipped_empty_group",
+                "selected_threshold": None,
+                "selected_rescale": "none",
+                "n_evals": 0,
+            }
             continue
         bounds = _group_activation_bounds(members, activations)
         if bounds is None:
+            metadata["skipped_no_clip_interval"] = (
+                int(metadata.get("skipped_no_clip_interval", 0)) + 1
+            )
+            for qname in members:
+                candidate_by_qname[qname] = _ClipCandidate(None, "none")
+                metadata["selected_by_qname"][qname] = None
+                metadata["selected_candidate_by_qname"][qname] = None
+            metadata["groups"][str(group_key)] = {
+                "members": members,
+                "status": "skipped_no_clip_interval",
+                "selected": "baseline",
+                "gate_reason": "skipped_no_clip_interval",
+                "local_gate_accepted": False,
+                "rejection_reason": "skipped_no_clip_interval",
+                "selected_threshold": None,
+                "selected_rescale": "none",
+                "n_evals": 0,
+            }
             continue
         lo, hi = bounds
 
         baseline_weights: dict[str, torch.Tensor] | None = None
+        capture_group_gate_traces = (
+            bool(metadata.get("capture_render_gate_traces", True))
+            and not bool(metadata.get("batched_same_shape", False))
+        )
+        baseline_gate_traces: dict[str, list[dict[str, object]]] | None = (
+            {} if capture_group_gate_traces else None
+        )
         try:
             score_splits = ("all", "holdout") if holdout_enabled else ("all",)
             baseline_scores, baseline_weights, _ = evaluate_members(
@@ -2374,6 +1932,7 @@ def _solve_nvfp4_activation_clip_groups(
                 _ClipCandidate(None, "none"),
                 keep_weights=bool(metadata["prewrite_baseline"]),
                 score_splits=score_splits,
+                gate_traces_out=baseline_gate_traces,
             )
         except Exception as e:
             metadata["groups"][group_key] = {
@@ -2419,6 +1978,7 @@ def _solve_nvfp4_activation_clip_groups(
             "baseline_fisher_score": baseline_fisher_score,
             "baseline_holdout_score": baseline_holdout_score,
             "baseline_fisher_holdout_score": baseline_fisher_holdout_score,
+            "baseline_render_gate_traces": baseline_gate_traces,
         })
         if progress and (idx % 10 == 0 or idx == len(baseline_items)):
             print(
@@ -2441,6 +2001,7 @@ def _solve_nvfp4_activation_clip_groups(
         str(item["group_key"]) for item in ranked[:keep]
     }
     metadata["eligible_groups"] = int(len(eligible_groups))
+    metadata["bounded_groups"] = int(len(ranked))
     metadata["total_groups"] = int(len(ranked))
     if progress:
         print(
@@ -2473,6 +2034,7 @@ def _solve_nvfp4_activation_clip_groups(
             float(item["baseline_fisher_holdout_score"])
             if item.get("baseline_fisher_holdout_score") is not None else None
         )
+        baseline_render_gate_traces = item.get("baseline_render_gate_traces")
         if group_key not in eligible_groups:
             for qname in members:
                 candidate_by_qname[qname] = _ClipCandidate(None, "none")
@@ -2482,6 +2044,9 @@ def _solve_nvfp4_activation_clip_groups(
                 "members": members,
                 "status": "skipped_low_error",
                 "selected": "baseline",
+                "gate_reason": "skipped_low_error",
+                "local_gate_accepted": False,
+                "rejection_reason": "skipped_low_error",
                 "selected_threshold": None,
                 "selected_rescale": "none",
                 "baseline_score": float(baseline_score),
@@ -2489,6 +2054,9 @@ def _solve_nvfp4_activation_clip_groups(
                 "baseline_fisher_score": baseline_fisher_score,
                 "baseline_holdout_score": baseline_holdout_score,
                 "baseline_fisher_holdout_score": baseline_fisher_holdout_score,
+                "baseline_render_gate_traces": item.get(
+                    "baseline_render_gate_traces"
+                ),
                 "best_score": float(baseline_score),
                 "best_fisher_score": baseline_fisher_score,
                 "holdout_score": baseline_holdout_score,
@@ -2516,6 +2084,7 @@ def _solve_nvfp4_activation_clip_groups(
         best_candidate_holdout_score: float | None = None
         best_candidate_distribution: dict[str, object] | None = None
         best_candidate_weights: dict[str, torch.Tensor] | None = None
+        best_candidate_gate_traces: dict[str, list[dict[str, object]]] | None = None
         best_candidate_eval_index: int | None = None
         denom = max(abs(float(baseline_score)), 1e-30)
         fisher_denom = (
@@ -2535,6 +2104,7 @@ def _solve_nvfp4_activation_clip_groups(
             nonlocal best_candidate_holdout_score
             nonlocal best_candidate_distribution
             nonlocal best_candidate_weights
+            nonlocal best_candidate_gate_traces
             nonlocal best_candidate_eval_index
             threshold = float(math.exp(log_threshold))
             key_threshold = round(threshold, 12)
@@ -2546,11 +2116,18 @@ def _solve_nvfp4_activation_clip_groups(
                     continue
                 score_splits = ("all", "holdout") if holdout_enabled else ("all",)
                 candidate = _ClipCandidate(float(key_threshold), str(rescale_mode))
+                cand_gate_traces: dict[str, list[dict[str, object]]] | None = (
+                    {} if (
+                        bool(metadata.get("capture_render_gate_traces", True))
+                        and not bool(metadata.get("batched_same_shape", False))
+                    ) else None
+                )
                 scores, cand_weights, _ = evaluate_members(
                     members,
                     candidate,
                     keep_weights=True,
                     score_splits=score_splits,
+                    gate_traces_out=cand_gate_traces,
                 )
                 score = float(scores[primary_score_key])
                 unweighted_score = float(scores["all"])
@@ -2575,6 +2152,7 @@ def _solve_nvfp4_activation_clip_groups(
                     best_candidate_holdout_score = holdout_score
                     best_candidate_distribution = None
                     best_candidate_weights = cand_weights
+                    best_candidate_gate_traces = cand_gate_traces
                 elif cand_weights is not None:
                     for old in cand_weights.values():
                         del old
@@ -2637,9 +2215,14 @@ def _solve_nvfp4_activation_clip_groups(
                 for old in best_candidate_weights.values():
                     del old
                 best_candidate_weights = None
+            best_candidate_gate_traces = None
             metadata["groups"][group_key] = {
                 "members": members,
                 "status": "solver_failed",
+                "selected": "baseline",
+                "gate_reason": "solver_failed",
+                "local_gate_accepted": False,
+                "rejection_reason": "solver_failed",
                 "baseline_score": float(baseline_score),
                 "error": str(e),
             }
@@ -2651,8 +2234,18 @@ def _solve_nvfp4_activation_clip_groups(
 
         best_threshold = best_candidate_threshold
         best_rescale = best_candidate_rescale
-        best_score = min(float(baseline_score), float(best_candidate_score))
-        rel_gain = (float(baseline_score) - float(best_score)) / denom
+        gate_decision = gate_render_candidate(
+            baseline_score=float(baseline_score),
+            candidate_score=float(best_candidate_score),
+            metric=str(primary_score_key),
+            min_relative_gain=float(min_gain),
+        )
+        best_score = (
+            float(best_candidate_score)
+            if gate_decision.accepted
+            else float(baseline_score)
+        )
+        rel_gain = float(gate_decision.relative_gain)
         fisher_rel_gain = (
             (float(baseline_fisher_score) - float(best_candidate_fisher_score))
             / fisher_denom
@@ -2687,11 +2280,20 @@ def _solve_nvfp4_activation_clip_groups(
         )
         selected = (
             best_threshold is not None
-            and float(best_candidate_score) < float(baseline_score)
-            and rel_gain >= min_gain
+            and gate_decision.accepted
             and (not fisher_veto or bool(fisher_accepted))
             and (not holdout_enabled or bool(holdout_accepted))
         )
+        if selected:
+            rejection_reason = None
+        elif not gate_decision.accepted:
+            rejection_reason = str(gate_decision.reason)
+        elif fisher_veto and not bool(fisher_accepted):
+            rejection_reason = "fisher_veto"
+        elif holdout_enabled and not bool(holdout_accepted):
+            rejection_reason = "holdout_veto"
+        else:
+            rejection_reason = "not_selected"
         if not selected:
             best_threshold = None
             best_rescale = "none"
@@ -2702,6 +2304,7 @@ def _solve_nvfp4_activation_clip_groups(
                 for old in best_candidate_weights.values():
                     del old
                 best_candidate_weights = None
+            best_candidate_gate_traces = None
         elif best_candidate_weights is not None:
             best_candidate_distribution = {
                 "activation": _prismaclip_activation_distribution_stats(
@@ -2752,10 +2355,26 @@ def _solve_nvfp4_activation_clip_groups(
             "selected": "solved" if selected else "baseline",
             "selected_threshold": best_threshold,
             "selected_rescale": str(best_rescale),
+            "gate_reason": str(gate_decision.reason),
+            "local_gate_accepted": bool(gate_decision.accepted),
+            "rejection_reason": rejection_reason,
             "selected_distribution": best_candidate_distribution if selected else None,
+            "baseline_render_gate_traces": baseline_render_gate_traces,
+            "selected_render_gate_traces": (
+                best_candidate_gate_traces if selected else None
+            ),
             "baseline_score": float(baseline_score),
             "baseline_unweighted_score": float(baseline_unweighted_score),
             "baseline_fisher_score": baseline_fisher_score,
+            "candidate_score": float(best_candidate_score),
+            "candidate_unweighted_score": (
+                float(best_candidate_unweighted_score)
+                if best_candidate_unweighted_score is not None else None
+            ),
+            "candidate_fisher_score": (
+                float(best_candidate_fisher_score)
+                if best_candidate_fisher_score is not None else None
+            ),
             "baseline_holdout_score": baseline_holdout_score,
             "baseline_fisher_holdout_score": baseline_fisher_holdout_score,
             "best_score": float(best_score),
@@ -2816,6 +2435,454 @@ def _solve_nvfp4_activation_clip_groups(
     return candidate_by_qname, metadata
 
 
+@dataclass
+class _RenderedCandidate:
+    label: str
+    weight: torch.Tensor
+    score: float
+    metric: str
+    scale_rule: str
+    package: tuple[str, ...]
+    has_gptq: bool
+
+
+def _render_score_for_gate(
+    reference_weight: torch.Tensor,
+    rendered_weight: torch.Tensor,
+    activations: torch.Tensor | None,
+    *,
+    row_weights: torch.Tensor | None,
+) -> tuple[float, str]:
+    """Score a local render candidate with the shared scorer.
+
+    Activations should normally be present in production cache renders.  The
+    weight-MSE fallback keeps pure RTN/FourOverSix unit tests and non-act-aware
+    formats measurable without adding a second scoring abstraction.
+    """
+    if (
+        activations is not None
+        and activations.numel() > 0
+        and int(activations.shape[-1]) == int(reference_weight.shape[1])
+    ):
+        metric = "fisher_output_mse" if row_weights is not None else "output_mse"
+        return (
+            score_render_error(
+                reference_weight,
+                rendered_weight,
+                activations,
+                row_weights=row_weights,
+            ),
+            metric,
+        )
+    diff = (
+        reference_weight.detach().to(torch.float32)
+        - rendered_weight.detach().to(
+            device=reference_weight.device,
+            dtype=torch.float32,
+        )
+    )
+    return float(diff.pow(2).mean().item()), "weight_mse"
+
+
+def _render_nvfp4_progressive_candidate(
+    *,
+    qname: str,
+    weight_scaled: torch.Tensor,
+    activations_scaled: torch.Tensor | None,
+    levers: Mapping[str, object],
+    scale_rule: str,
+    joint_global_real: torch.Tensor | None,
+    act_clip_threshold: float | None,
+    act_clip_rescale: str | None,
+    fisher_row_weights: torch.Tensor | None,
+    include_gptq: bool,
+    include_scale_sweep: bool,
+) -> torch.Tensor:
+    from prismaquant import export_native_compressed as enc
+
+    with _temporary_nvfp4_scale_rule(scale_rule):
+        current = enc._rtn_dequant_nvfp4(
+            weight_scaled,
+            group_size=16,
+            global_real_override=joint_global_real,
+        )
+        if activations_scaled is None or activations_scaled.numel() == 0:
+            return current
+        if include_gptq:
+            if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+                current = enc._gptq_obs_rounding_nvfp4_swept(
+                    weight_scaled,
+                    activations_scaled,
+                    group_size=16,
+                    global_real_override=joint_global_real,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=act_clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                    static_act_order=bool(
+                        levers.get("static_act_order", False)
+                    ),
+                    joint_scale_opt=bool(
+                        levers.get("joint_scale_opt", False)
+                    ),
+                )
+            else:
+                current = enc._gptq_obs_rounding_nvfp4(
+                    weight_scaled,
+                    activations_scaled,
+                    group_size=16,
+                    global_real_override=joint_global_real,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=act_clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                    static_act_order=bool(
+                        levers.get("static_act_order", False)
+                    ),
+                    joint_scale_opt=bool(
+                        levers.get("joint_scale_opt", False)
+                    ),
+                )
+            if bool(levers.get("awq_round", False)):
+                current = enc._activation_weighted_round_nvfp4(
+                    current,
+                    activations_scaled,
+                    group_size=16,
+                    global_real_override=joint_global_real,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=act_clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                )
+        if include_scale_sweep:
+            current = enc._scale_sweep_nvfp4(
+                current,
+                activations_scaled,
+                group_size=16,
+                global_real_override=joint_global_real,
+                reference_weight=weight_scaled,
+                clip_threshold=act_clip_threshold,
+                clip_rescale=act_clip_rescale,
+                fisher_row_weights=fisher_row_weights,
+            )
+        return current
+
+
+def _render_nvfp4_progressively(
+    weight: torch.Tensor,
+    *,
+    qname: str,
+    activations: Mapping[str, torch.Tensor],
+    levers: Mapping[str, object],
+    joint_global_real: torch.Tensor | None,
+    act_clip_threshold: float | None,
+    act_clip_rescale: str | None,
+    fisher_row_weights: torch.Tensor | None,
+    gate_trace: list[dict[str, object]] | None,
+) -> torch.Tensor:
+    from prismaquant import export_native_compressed as enc
+
+    requested_rule = enc.resolve_nvfp4_scale_rule(
+        str(levers.get("nvfp4_scale_rule", "static_6"))
+    )
+    f6_enabled = requested_rule == enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE
+    gptq_enabled = bool(levers.get("gptq", True))
+    scale_sweep_enabled = bool(levers.get("scale_sweep", True))
+    static_act_order_enabled = bool(
+        gptq_enabled and levers.get("static_act_order", False)
+    )
+    joint_scale_opt_enabled = bool(
+        gptq_enabled and levers.get("joint_scale_opt", False)
+    )
+    gptq_modifiers = tuple(
+        name for name, enabled in (
+            ("static_act_order", static_act_order_enabled),
+            ("joint_scale_opt", joint_scale_opt_enabled),
+        )
+        if enabled
+    )
+    gptq_scale_rule = (
+        enc.NVFP4_SCALE_RULE_JOINT_MSE
+        if joint_scale_opt_enabled
+        else None
+    )
+    min_gain = _env_float(
+        "PRISMAQUANT_RENDER_GATE_MIN_GAIN",
+        0.0,
+        lo=-1.0,
+        hi=1.0,
+    )
+
+    reference = weight.detach().to(device=weight.device, dtype=torch.float32)
+    acts = activations.get(qname)
+    acts_for_render = (
+        acts.detach().to(device=weight.device, dtype=torch.float32)
+        if acts is not None and int(acts.shape[-1]) == int(weight.shape[1])
+        else None
+    )
+    reference_for_render = reference
+
+    def candidate(
+        *,
+        label: str,
+        scale_rule: str,
+        package: tuple[str, ...],
+        include_gptq: bool,
+        include_scale_sweep: bool,
+    ) -> _RenderedCandidate:
+        rendered_scaled = _render_nvfp4_progressive_candidate(
+            qname=qname,
+            weight_scaled=reference_for_render,
+            activations_scaled=acts_for_render,
+            levers=levers,
+            scale_rule=scale_rule,
+            joint_global_real=joint_global_real,
+            act_clip_threshold=act_clip_threshold,
+            act_clip_rescale=act_clip_rescale,
+            fisher_row_weights=fisher_row_weights,
+            include_gptq=include_gptq,
+            include_scale_sweep=include_scale_sweep,
+        )
+        rendered = rendered_scaled
+        score, metric = _render_score_for_gate(
+            reference,
+            rendered,
+            acts,
+            row_weights=fisher_row_weights,
+        )
+        return _RenderedCandidate(
+            label=label,
+            weight=rendered,
+            score=float(score),
+            metric=metric,
+            scale_rule=scale_rule,
+            package=package,
+            has_gptq=bool(include_gptq),
+        )
+
+    static_rule = enc.NVFP4_SCALE_RULE_STATIC_6
+    current = candidate(
+        label="rtn_static_6",
+        scale_rule=static_rule,
+        package=(),
+        include_gptq=False,
+        include_scale_sweep=False,
+    )
+    if gate_trace is not None:
+        gate_trace.append({
+            "mechanism": "baseline",
+            "selected": current.label,
+            "score": float(current.score),
+            "metric": current.metric,
+            "scale_rule": current.scale_rule,
+            "package": list(current.package),
+        })
+
+    def apply_gate(
+        *,
+        mechanism: str,
+        candidates: Sequence[_RenderedCandidate],
+    ) -> None:
+        nonlocal current
+        if not candidates:
+            return
+        best = min(candidates, key=lambda item: item.score)
+        decision = gate_render_candidate(
+            baseline_score=current.score,
+            candidate_score=best.score,
+            metric=best.metric,
+            min_relative_gain=min_gain,
+        )
+        accepted = bool(decision.accepted)
+        if gate_trace is not None:
+            gate_trace.append({
+                "mechanism": mechanism,
+                "accepted": accepted,
+                "selected": best.label if accepted else current.label,
+                "candidate": best.label,
+                "baseline_score": float(current.score),
+                "candidate_score": float(best.score),
+                "relative_gain": float(decision.relative_gain),
+                "metric": best.metric,
+                "reason": str(decision.reason),
+                "scale_rule": best.scale_rule,
+                "package": list(best.package),
+                "candidates": [
+                    {
+                        "label": cand.label,
+                        "score": float(cand.score),
+                        "metric": cand.metric,
+                        "scale_rule": cand.scale_rule,
+                        "package": list(cand.package),
+                    }
+                    for cand in candidates
+                ],
+            })
+        if accepted:
+            old = current.weight
+            current = best
+            if old is not best.weight:
+                del old
+        for cand in candidates:
+            if cand is not current:
+                del cand.weight
+
+    if f6_enabled:
+        apply_gate(
+            mechanism="four_over_six",
+            candidates=[
+                candidate(
+                    label="four_over_six",
+                    scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+                    package=("four_over_six",),
+                    include_gptq=False,
+                    include_scale_sweep=False,
+                )
+            ],
+        )
+
+    if gptq_enabled and acts_for_render is not None:
+        gptq_name = "fisher_gptq" if fisher_row_weights is not None else "gptq"
+        primary_scale_rule = gptq_scale_rule or current.scale_rule
+        primary_package = (
+            (gptq_name, "gptq") if gptq_name != "gptq" else ("gptq",)
+        )
+        primary_package = tuple(dict.fromkeys((*gptq_modifiers, *primary_package)))
+        packages: list[_RenderedCandidate] = [
+            candidate(
+                label="+".join((primary_scale_rule, *gptq_modifiers, gptq_name)),
+                scale_rule=primary_scale_rule,
+                package=primary_package,
+                include_gptq=True,
+                include_scale_sweep=False,
+            )
+        ]
+        if (
+            f6_enabled
+            and not joint_scale_opt_enabled
+            and current.scale_rule != enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE
+        ):
+            packages.append(candidate(
+                label=f"four_over_six+{gptq_name}",
+                scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+                package=(
+                    (*gptq_modifiers, "four_over_six", gptq_name, "gptq")
+                    if gptq_name != "gptq" else
+                    (*gptq_modifiers, "four_over_six", "gptq")
+                ),
+                include_gptq=True,
+                include_scale_sweep=False,
+            ))
+        apply_gate(mechanism=gptq_name, candidates=packages)
+
+    if scale_sweep_enabled and acts_for_render is not None:
+        scale_candidates: list[_RenderedCandidate] = [
+            candidate(
+                label=f"{current.label}+scale_sweep",
+                scale_rule=current.scale_rule,
+                package=tuple(dict.fromkeys((*current.package, "scale_sweep"))),
+                include_gptq=current.has_gptq,
+                include_scale_sweep=True,
+            )
+        ]
+        if gptq_enabled and not current.has_gptq:
+            gptq_name = "fisher_gptq" if fisher_row_weights is not None else "gptq"
+            scale_rule = gptq_scale_rule or current.scale_rule
+            pkg = (
+                (gptq_name, "gptq", "scale_sweep")
+                if gptq_name != "gptq" else
+                ("gptq", "scale_sweep")
+            )
+            pkg = tuple(dict.fromkeys((*gptq_modifiers, *pkg)))
+            scale_candidates.append(candidate(
+                label="+".join((scale_rule, *gptq_modifiers, gptq_name, "scale_sweep")),
+                scale_rule=scale_rule,
+                package=pkg,
+                include_gptq=True,
+                include_scale_sweep=True,
+            ))
+        if (
+            f6_enabled
+            and not joint_scale_opt_enabled
+            and current.scale_rule != enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE
+        ):
+            gptq_name = "fisher_gptq" if fisher_row_weights is not None else "gptq"
+            include_gptq = bool(gptq_enabled)
+            pkg = [*gptq_modifiers, "four_over_six"]
+            if include_gptq:
+                if gptq_name != "gptq":
+                    pkg.extend([gptq_name, "gptq"])
+                else:
+                    pkg.append("gptq")
+            pkg.append("scale_sweep")
+            scale_candidates.append(candidate(
+                label="+".join(pkg),
+                scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+                package=tuple(pkg),
+                include_gptq=include_gptq,
+                include_scale_sweep=True,
+            ))
+        apply_gate(mechanism="scale_sweep", candidates=scale_candidates)
+
+    return current.weight.to(device=weight.device, dtype=weight.dtype).contiguous()
+
+
+def _summarize_render_gate_records(
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "enabled": True,
+        "entries": int(len(records)),
+        "mechanisms": {},
+    }
+    mechanisms: dict[str, dict[str, object]] = {}
+    for record in records:
+        for step in record.get("trace", []):  # type: ignore[union-attr]
+            if not isinstance(step, Mapping):
+                continue
+            mech = str(step.get("mechanism", "unknown"))
+            if mech == "baseline":
+                continue
+            bucket = mechanisms.setdefault(mech, {
+                "accepted": 0,
+                "rejected": 0,
+                "reasons": {},
+                "package_accepted": 0,
+            })
+            accepted = bool(step.get("accepted", False))
+            if accepted:
+                bucket["accepted"] = int(bucket["accepted"]) + 1
+                package = step.get("package")
+                if (
+                    isinstance(package, Sequence)
+                    and not isinstance(package, str)
+                    and mech in package
+                ):
+                    bucket["package_accepted"] = int(bucket["package_accepted"]) + 1
+            else:
+                bucket["rejected"] = int(bucket["rejected"]) + 1
+            reason = str(step.get("reason", "unknown"))
+            reasons = bucket["reasons"]
+            if isinstance(reasons, dict):
+                reasons[reason] = int(reasons.get(reason, 0)) + 1
+
+            package = step.get("package")
+            if isinstance(package, Sequence) and not isinstance(package, str):
+                for member in package:
+                    member_name = str(member)
+                    if member_name == mech:
+                        continue
+                    member_bucket = mechanisms.setdefault(member_name, {
+                        "accepted": 0,
+                        "rejected": 0,
+                        "reasons": {},
+                        "package_accepted": 0,
+                    })
+                    if accepted:
+                        member_bucket["package_accepted"] = (
+                            int(member_bucket["package_accepted"]) + 1
+                        )
+    summary["mechanisms"] = mechanisms
+    return summary
+
+
 def render_production_weight(
     weight: torch.Tensor,
     fmt: str,
@@ -2828,7 +2895,7 @@ def render_production_weight(
     act_clip_threshold: float | None = None,
     act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
-    awq_scale: torch.Tensor | None = None,
+    gate_trace: list[dict[str, object]] | None = None,
 ) -> torch.Tensor:
     """Compute the production-faithful dequantized weight for ``(qname, fmt)``.
 
@@ -2848,9 +2915,7 @@ def render_production_weight(
     render passes. ``act_clip_rescale`` enables PrismaClip-RBC row-wise
     rescaling after an explicit clamp. ``fisher_row_weights`` optionally
     weights local objectives by per-token gradient² from h-detail.
-    ``awq_scale`` stores weights in the cache's measurement coordinates:
-    Q(W*s)/s, while export later multiplies by ``s`` and folds the predecessor
-    norm to emit Q(W*s).
+
     """
     fmt = fmt.upper()
     clip_rescale = _normalize_clip_rescale_mode(
@@ -2858,34 +2923,26 @@ def render_production_weight(
         if act_clip_rescale is not None
         else os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING", "none")
     )
-    if awq_scale is not None:
-        scale = awq_scale.to(device=weight.device, dtype=torch.float32)
-        if scale.numel() != weight.shape[1]:
-            raise ValueError(
-                f"AWQ scale width {scale.numel()} != {qname} weight.in {weight.shape[1]}"
-            )
-        acts = activations.get(qname)
-        if acts is None:
-            raise ValueError(f"AWQ render for {qname} requires activations")
-        scaled = _render_awq_scaled_for_cache(
+    progressive_gates = _env_flag("PRISMAQUANT_RENDER_PROGRESSIVE_GATES", True)
+    if fmt == "NVFP4" and progressive_gates:
+        return _render_nvfp4_progressively(
+            weight,
             qname=qname,
-            fmt=fmt,
-            weight_scaled=weight.detach().to(torch.float32) * scale.unsqueeze(0),
-            activations_scaled=(
-                acts.detach().to(device=weight.device, dtype=torch.float32)
-                .reshape(-1, acts.shape[-1])
-                / scale.clamp_min(1e-12).unsqueeze(0)
-            ),
+            activations=activations,
             levers=levers,
             joint_global_real=joint_global_real,
             act_clip_threshold=act_clip_threshold,
             act_clip_rescale=clip_rescale,
             fisher_row_weights=fisher_row_weights,
+            gate_trace=gate_trace,
         )
-        effective = scaled / scale.clamp_min(1e-12).unsqueeze(0)
-        return effective.to(device=weight.device, dtype=weight.dtype).contiguous()
 
     if fmt != "NVFP4":
+        from prismaquant import format_registry as fr
+        spec = fr.get_format(fmt)
+        baseline = spec.quantize_dequantize(weight.detach().clone()).to(
+            device=weight.device, dtype=weight.dtype,
+        )
         if (
             fmt in {"MXFP8", "MXFP8_E4M3"}
             and bool(levers.get("scale_sweep", True))
@@ -2903,12 +2960,121 @@ def render_production_weight(
                 clip_rescale=clip_rescale,
                 fisher_row_weights=fisher_row_weights,
             )
-            return w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
-        from prismaquant import format_registry as fr
-        spec = fr.get_format(fmt)
-        return spec.quantize_dequantize(weight.detach().clone()).to(
-            device=weight.device, dtype=weight.dtype,
-        )
+            candidate = w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
+            if progressive_gates:
+                baseline_score, metric = _render_score_for_gate(
+                    weight.detach().to(torch.float32),
+                    baseline,
+                    activations.get(qname),
+                    row_weights=fisher_row_weights,
+                )
+                candidate_score, _ = _render_score_for_gate(
+                    weight.detach().to(torch.float32),
+                    candidate,
+                    activations.get(qname),
+                    row_weights=fisher_row_weights,
+                )
+                decision = gate_render_candidate(
+                    baseline_score=baseline_score,
+                    candidate_score=candidate_score,
+                    metric=metric,
+                    min_relative_gain=_env_float(
+                        "PRISMAQUANT_RENDER_GATE_MIN_GAIN",
+                        0.0,
+                        lo=-1.0,
+                        hi=1.0,
+                    ),
+                )
+                if gate_trace is not None:
+                    gate_trace.append({
+                        "mechanism": "baseline",
+                        "selected": fmt,
+                        "score": float(baseline_score),
+                        "metric": metric,
+                        "package": [],
+                    })
+                    gate_trace.append({
+                        "mechanism": "scale_sweep",
+                        "accepted": bool(decision.accepted),
+                        "selected": "mxfp8_scale_sweep" if decision.accepted else fmt,
+                        "candidate": "mxfp8_scale_sweep",
+                        "baseline_score": float(baseline_score),
+                        "candidate_score": float(candidate_score),
+                        "relative_gain": float(decision.relative_gain),
+                        "metric": metric,
+                        "reason": str(decision.reason),
+                        "package": ["scale_sweep"],
+                    })
+                if decision.accepted:
+                    return candidate
+                return baseline.contiguous()
+            return candidate
+        if (
+            fmt == "FP8_E4M3"
+            and bool(levers.get("scale_sweep", True))
+            and qname in activations
+        ):
+            from prismaquant.export_native_compressed import (
+                _fp8_dynamic_scale_sweep_quantize,
+            )
+
+            _, _, w_dq = _fp8_dynamic_scale_sweep_quantize(
+                weight.detach().to(torch.float32),
+                activations[qname],
+                clip_threshold=act_clip_threshold,
+                clip_rescale=clip_rescale,
+                fisher_row_weights=fisher_row_weights,
+            )
+            candidate = w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
+            if progressive_gates:
+                baseline_score, metric = _render_score_for_gate(
+                    weight.detach().to(torch.float32),
+                    baseline,
+                    activations.get(qname),
+                    row_weights=fisher_row_weights,
+                )
+                candidate_score, _ = _render_score_for_gate(
+                    weight.detach().to(torch.float32),
+                    candidate,
+                    activations.get(qname),
+                    row_weights=fisher_row_weights,
+                )
+                decision = gate_render_candidate(
+                    baseline_score=baseline_score,
+                    candidate_score=candidate_score,
+                    metric=metric,
+                    min_relative_gain=_env_float(
+                        "PRISMAQUANT_RENDER_GATE_MIN_GAIN",
+                        0.0,
+                        lo=-1.0,
+                        hi=1.0,
+                    ),
+                )
+                if gate_trace is not None:
+                    gate_trace.append({
+                        "mechanism": "baseline",
+                        "selected": fmt,
+                        "score": float(baseline_score),
+                        "metric": metric,
+                        "package": [],
+                    })
+                    gate_trace.append({
+                        "mechanism": "scale_sweep",
+                        "accepted": bool(decision.accepted),
+                        "selected": "fp8_scale_sweep" if decision.accepted else fmt,
+                        "candidate": "fp8_scale_sweep",
+                        "baseline_score": float(baseline_score),
+                        "candidate_score": float(candidate_score),
+                        "relative_gain": float(decision.relative_gain),
+                        "metric": metric,
+                        "reason": str(decision.reason),
+                        "package": ["scale_sweep"],
+                    })
+                if decision.accepted:
+                    return candidate
+                return baseline.contiguous()
+            return candidate
+        return baseline.contiguous()
 
     from prismaquant.export_native_compressed import _quantize_2d
 
@@ -2980,6 +3146,19 @@ def fill_production_weight_cache(
             "production assignment"
         )
     levers = dict(levers) if levers is not None else {}
+    default_optional_levers = not bool(levers.pop("none", False))
+    if not default_optional_levers:
+        for name in (
+            "gptq",
+            "scale_sweep",
+            "awq_round",
+            "act_clip_solver",
+            "fisher_gptq",
+            "fisher_clip",
+            "static_act_order",
+            "joint_scale_opt",
+        ):
+            levers.setdefault(name, False)
     levers.setdefault("gptq", True)
     levers.setdefault(
         "gptq_damp_sweep",
@@ -2987,9 +3166,19 @@ def fill_production_weight_cache(
         and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
     )
     levers.setdefault("scale_sweep", True)
-    levers.setdefault("awq", False)
+    _reject_archived_input_axis_levers(levers)
     levers.setdefault("awq_round", False)
-    levers.setdefault("smoothquant", False)
+    levers.setdefault(
+        "static_act_order",
+        _env_flag("PRISMAQUANT_GPTQ_STATIC_ACT_ORDER", False),
+    )
+    levers.setdefault(
+        "joint_scale_opt",
+        _env_flag("PRISMAQUANT_NVFP4_JOINT_SCALE_OPT", False),
+    )
+    if not bool(levers.get("gptq", True)):
+        levers["static_act_order"] = False
+        levers["joint_scale_opt"] = False
     levers.setdefault(
         "act_clip_solver",
         _env_flag("PRISMAQUANT_ACT_CLIP_SOLVER", False),
@@ -3010,10 +3199,46 @@ def fill_production_weight_cache(
                 "fisher_clip/PrismaFisherClip requires h_detail_dir with "
                 "per-token g2_per_token weights"
             )
-    from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
+    from prismaquant.export_native_compressed import (
+        NVFP4_SCALE_RULE_ENV,
+        NVFP4_SCALE_RULE_JOINT_MSE,
+        resolve_nvfp4_scale_rule,
+    )
+    if (
+        bool(levers.get("joint_scale_opt", False))
+        and "nvfp4_scale_rule" not in levers
+        and NVFP4_SCALE_RULE_ENV not in os.environ
+    ):
+        levers["nvfp4_scale_rule"] = NVFP4_SCALE_RULE_JOINT_MSE
     levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
-    if bool(levers.get("awq", False)) and bool(levers.get("smoothquant", False)):
-        raise ValueError("AWQ and SmoothQuant are mutually exclusive fold-scale levers")
+    enabled_mechanisms: list[str] = []
+    if bool(levers.get("fisher_clip", False)):
+        enabled_mechanisms.append("prismafisherclip")
+    elif bool(levers.get("act_clip_solver", False)):
+        enabled_mechanisms.append("prismaclip")
+    if str(levers.get("nvfp4_scale_rule", "")).strip() == "four_over_six_mse":
+        enabled_mechanisms.append("four_over_six")
+    if bool(levers.get("gptq", True)):
+        enabled_mechanisms.append("gptq")
+    if bool(levers.get("static_act_order", False)):
+        enabled_mechanisms.append("static_act_order")
+    if bool(levers.get("joint_scale_opt", False)):
+        enabled_mechanisms.append("joint_scale_opt")
+    if bool(levers.get("fisher_gptq", False)):
+        enabled_mechanisms.append("fisher_gptq")
+    if bool(levers.get("scale_sweep", True)):
+        enabled_mechanisms.append("scale_sweep")
+    mechanism_plan = resolve_render_mechanism_order(enabled_mechanisms)
+    if mechanism_plan.errors:
+        raise ValueError(
+            "invalid render mechanism plan: " + "; ".join(mechanism_plan.errors)
+        )
+    if progress and mechanism_plan.ordered:
+        print(
+            "[prod-cache] render mechanism order: "
+            + " -> ".join(spec.name for spec in mechanism_plan.ordered),
+            flush=True,
+        )
 
     from prismaquant import format_registry as fr
 
@@ -3093,11 +3318,7 @@ def fill_production_weight_cache(
     render_base_fmt_set = {_render_base_format(fmt) for fmt in fmt_set}
     activation_aware_formats = {"NVFP4", PRISMACLIP_FORMAT}
     if bool(levers.get("scale_sweep", True)):
-        activation_aware_formats.update({"MXFP8", "MXFP8_E4M3"})
-    if bool(levers.get("awq", False)):
-        activation_aware_formats.update(_AWQ_CACHE_FORMATS)
-    if bool(levers.get("smoothquant", False)):
-        activation_aware_formats.update(_AWQ_CACHE_FORMATS)
+        activation_aware_formats.update({"MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
     qnames_to_render: set[str] = set(qname_set)
     missing_formats_by_qname: dict[str, set[str]] = {
         q: set(render_formats_by_qname.get(q, ())) for q in qname_set
@@ -3124,19 +3345,7 @@ def fill_production_weight_cache(
         q for q, missing in missing_formats_by_qname.items()
         if any(f in activation_aware_formats for f in missing)
     }
-    if bool(levers.get("awq", False)):
-        qnames_needing_activation.update(
-            q for q, fmts in render_formats_by_qname.items()
-            if any(str(f).upper() in _AWQ_CACHE_FORMATS for f in fmts)
-        )
-    if bool(levers.get("smoothquant", False)):
-        qnames_needing_activation.update(
-            q for q, fmts in render_formats_by_qname.items()
-            if any(str(f).upper() in _AWQ_CACHE_FORMATS for f in fmts)
-        )
-
     device = next(model.parameters()).device
-    awq_enabled = bool(levers.get("awq", False))
     activation_store_device = (
         device if device.type == "cuda" else torch.device("cpu")
     )
@@ -3161,7 +3370,6 @@ def fill_production_weight_cache(
     skip_forward = (
         cache_dir_path is not None
         and not qnames_needing_activation
-        and not bool(levers.get("awq", False))
         and (
             (sidecar_path is not None and sidecar_path.is_file())
             or "NVFP4" not in render_base_fmt_set
@@ -3383,75 +3591,12 @@ def fill_production_weight_cache(
             import json as _json
             sidecar_path.write_text(_json.dumps(activation_max_abs, indent=2))
 
-    awq_scales: dict[str, torch.Tensor] = {}
-    awq_metadata: dict[str, object] = {
-        "enabled": bool(levers.get("awq", False)),
-        "status": "disabled",
+    archived_input_axis_metadata: dict[str, object] = {
+        "enabled": False,
+        "status": "archived",
+        "archive": ARCHIVED_INPUT_AXIS_TRANSFORM_DIR,
+        "methods": ["awq", "smoothquant", "block_rotation"],
     }
-    smoothquant_metadata: dict[str, object] = {
-        "enabled": bool(levers.get("smoothquant", False)),
-        "status": "disabled",
-    }
-    if bool(levers.get("awq", False)):
-        if render_assignment is None:
-            raise ValueError(
-                "production AWQ requires render_assignment/assignment scope; "
-                "format-menu AWQ would need multiple incompatible fold scales "
-                "for the same predecessor"
-            )
-        if progress:
-            print("[prod-cache] solving AWQ scales", flush=True)
-        awq_scales, awq_metadata = _solve_awq_scales(
-            qname_to_module=qname_to_module,
-            activations=activations,
-            render_formats_by_qname=render_formats_by_qname,
-            levers=levers,
-            progress=progress,
-        )
-        if needs_nvfp4_render and awq_scales:
-            joint_globals = _compute_awq_scaled_joint_globals(
-                qname_to_module=qname_to_module,
-                render_formats_by_qname=render_formats_by_qname,
-                awq_scales=awq_scales,
-                profile=profile,
-            )
-            if progress:
-                print(
-                    f"[prod-cache] recomputed joint NVFP4 globals after "
-                    f"AWQ for {len(joint_globals)} fused-sibling members",
-                    flush=True,
-                )
-
-    if bool(levers.get("smoothquant", False)):
-        if render_assignment is None:
-            raise ValueError(
-                "production SmoothQuant requires render_assignment/assignment "
-                "scope because fold scales are tied to the concrete format "
-                "assignment"
-            )
-        if progress:
-            print("[prod-cache] solving SmoothQuant scales", flush=True)
-        awq_scales, smoothquant_metadata = _solve_smoothquant_scales(
-            qname_to_module=qname_to_module,
-            activations=activations,
-            render_formats_by_qname=render_formats_by_qname,
-            levers=levers,
-            progress=progress,
-        )
-        if needs_nvfp4_render and awq_scales:
-            joint_globals = _compute_awq_scaled_joint_globals(
-                qname_to_module=qname_to_module,
-                render_formats_by_qname=render_formats_by_qname,
-                awq_scales=awq_scales,
-                profile=profile,
-            )
-            if progress:
-                print(
-                    f"[prod-cache] recomputed joint NVFP4 globals after "
-                    f"SmoothQuant for {len(joint_globals)} fused-sibling "
-                    "members",
-                    flush=True,
-                )
 
     solved_nvfp4_candidates: dict[str, _ClipCandidate] = {}
     solve_global_nvfp4_clip = bool(levers.get("act_clip_solver", False))
@@ -3507,7 +3652,6 @@ def fill_production_weight_cache(
                     weights_out=weights,
                     cache_dir_path=cache_dir_path,
                     progress=progress,
-                    awq_scales=awq_scales,
                     cache_formats=clip_cache_formats,
                 )
             )
@@ -3522,6 +3666,69 @@ def fill_production_weight_cache(
     done = 0
     skipped_resumed = 0
     skipped_prewritten = 0
+    render_gate_records: list[dict[str, object]] = []
+
+    def append_clip_solver_gate_records() -> None:
+        if not isinstance(clip_solver_metadata, Mapping):
+            return
+        groups_meta = clip_solver_metadata.get("groups")
+        if not isinstance(groups_meta, Mapping):
+            return
+        selected_qnames = {
+            str(qname)
+            for qname in clip_solver_metadata.get("prewritten_qnames", [])
+        }
+        baseline_qnames = {
+            str(qname)
+            for qname in clip_solver_metadata.get(
+                "prewritten_baseline_qnames",
+                [],
+            )
+        }
+
+        def append_trace_map(
+            *,
+            group_key: str,
+            trace_map: object,
+            allowed_qnames: set[str],
+            source: str,
+        ) -> None:
+            if not allowed_qnames or not isinstance(trace_map, Mapping):
+                return
+            for qname_obj, trace in trace_map.items():
+                qname = str(qname_obj)
+                if qname not in allowed_qnames:
+                    continue
+                if not isinstance(trace, list) or not trace:
+                    continue
+                render_gate_records.append({
+                    "qname": qname,
+                    "format": "NVFP4",
+                    "render_format": "NVFP4",
+                    "source": source,
+                    "group": group_key,
+                    "trace": trace,
+                })
+
+        for group_key_obj, group_meta in groups_meta.items():
+            if not isinstance(group_meta, Mapping):
+                continue
+            group_key = str(group_key_obj)
+            append_trace_map(
+                group_key=group_key,
+                trace_map=group_meta.get("selected_render_gate_traces"),
+                allowed_qnames=selected_qnames,
+                source="activation_clip_solver_selected",
+            )
+            append_trace_map(
+                group_key=group_key,
+                trace_map=group_meta.get("baseline_render_gate_traces"),
+                allowed_qnames=baseline_qnames,
+                source="activation_clip_solver_baseline",
+            )
+
+    append_clip_solver_gate_records()
+
     # MEM: free per-Linear activation tensors after each render so peak
     # memory stays bounded.  On 27B, 497 Linears × ~10K in_features × 512
     # rows × fp32 = ~10 GB just for activations.  Freeing in-loop drops
@@ -3574,6 +3781,7 @@ def fill_production_weight_cache(
                     )
                     else _ClipCandidate(None, "none")
                 )
+                gate_trace: list[dict[str, object]] = []
                 with _temporary_act_clip_rescale(clip_candidate.rescale):
                     w_dq = render_production_weight(
                         weight, render_fmt,
@@ -3590,11 +3798,17 @@ def fill_production_weight_cache(
                             and fisher_rows is not None
                             else None
                         ),
-                        awq_scale=(
-                            awq_scales.get(qname)
-                            if render_fmt in _AWQ_CACHE_FORMATS else None
-                        ),
+                        gate_trace=gate_trace,
                     )
+                if gate_trace:
+                    render_gate_records.append({
+                        "qname": qname,
+                        "format": fmt_key,
+                        "render_format": render_fmt,
+                        "clip_threshold": clip_candidate.threshold,
+                        "clip_rescale": clip_candidate.rescale,
+                        "trace": gate_trace,
+                    })
             except Exception as e:
                 failed[(qname, fmt_key)] = str(e)
                 if progress:
@@ -3639,6 +3853,7 @@ def fill_production_weight_cache(
             f"{len(failed)} failures",
             flush=True,
         )
+    render_gate_summary = _summarize_render_gate_records(render_gate_records)
     cache = ProductionWeightCache(
         weights=weights,
         levers=dict(levers),
@@ -3646,9 +3861,40 @@ def fill_production_weight_cache(
         failed=failed,
         cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
         metadata={
+            "render_mechanism_order": [
+                {
+                    "name": spec.name,
+                    "operation": spec.operation,
+                    "scope": spec.scope,
+                    "gate_metric": spec.gate_metric,
+                }
+                for spec in mechanism_plan.ordered
+            ],
+            "render_failures": {
+                f"{qname}|{fmt}": str(error)
+                for (qname, fmt), error in sorted(failed.items())
+            },
             "activation_clip_solver": clip_solver_metadata,
-            "awq": awq_metadata,
-            "smoothquant": smoothquant_metadata,
+            "render_gates": {
+                **render_gate_summary,
+                "records": render_gate_records,
+            },
+            "four_over_six": (
+                render_gate_summary.get("mechanisms", {}).get("four_over_six", {
+                    "accepted": 0,
+                    "rejected": 0,
+                    "package_accepted": 0,
+                    "reasons": {},
+                })
+                if isinstance(render_gate_summary.get("mechanisms"), dict)
+                else {
+                    "accepted": 0,
+                    "rejected": 0,
+                    "package_accepted": 0,
+                    "reasons": {},
+                }
+            ),
+            "archived_input_axis_transforms": archived_input_axis_metadata,
             "fisher_weighted_gptq": {
                 "enabled": bool(levers.get("fisher_gptq", False)),
                 "h_detail_dir": str(h_detail_dir) if h_detail_dir else None,
@@ -3685,7 +3931,6 @@ def fill_production_weight_cache(
             "requested_formats": list(requested_formats),
             "requested_entries": int(n),
         },
-        awq_scales=awq_scales or None,
     )
     if recache_pass:
         from prismaquant.production_recache import recache_production_weight_cache

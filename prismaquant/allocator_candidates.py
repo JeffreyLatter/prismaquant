@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -311,6 +312,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                      calibrated_gains: dict[str, float] | None = None,
                      source_manifest: dict[str, str] | None = None,
                      target_profile: str | None = None,
+                     mask_records: list[dict] | None = None,
                      ) -> dict[str, list[Candidate]]:
     """Build runtime-legal format candidates for every measured Linear.
 
@@ -347,6 +349,17 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 target_profile=target_profile,
             )
             if not verdict.legal:
+                if mask_records is not None:
+                    mask_records.append({
+                        "qname": name,
+                        "format": spec.name,
+                        "reason": verdict.reason or "not_applicable",
+                        "detail": verdict.detail,
+                        "shape": [out_features, in_features],
+                        "out_features": out_features,
+                        "in_features": in_features,
+                        "source_kind": source_kind,
+                    })
                 masked.setdefault(
                     (spec.name, verdict.reason or "not_applicable"),
                     [],
@@ -374,6 +387,66 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 flush=True,
             )
     return out
+
+
+def summarize_applicability_masks(records: list[dict]) -> dict:
+    """Summarize format candidates removed before the optimizer sees them.
+
+    The allocator's legality gate is part of the optimization layer: illegal
+    candidates are excluded before DP, rather than caught later by export.
+    This summary is intentionally small enough to save beside Pareto curves
+    while still preserving exact qnames and kernel shapes for debugging.
+    """
+    summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    by_shape: dict[tuple[str, str], dict[tuple[int, int], dict]] = defaultdict(dict)
+    for rec in records:
+        fmt = str(rec.get("format", ""))
+        reason = str(rec.get("reason", "not_applicable"))
+        summary[fmt][reason] += 1
+        out_features = int(rec.get("out_features", 0) or 0)
+        in_features = int(rec.get("in_features", 0) or 0)
+        shape_key = (out_features, in_features)
+        bucket_key = (fmt, reason)
+        bucket = by_shape[bucket_key].setdefault(shape_key, {
+            "shape": [out_features, in_features],
+            "count": 0,
+            "sample": [],
+            "detail": rec.get("detail", ""),
+        })
+        bucket["count"] += 1
+        if len(bucket["sample"]) < 8:
+            bucket["sample"].append(rec.get("qname", ""))
+
+    shape_payload: dict[str, dict[str, list[dict]]] = defaultdict(dict)
+    for (fmt, reason), shapes in by_shape.items():
+        shape_payload[fmt][reason] = sorted(
+            shapes.values(),
+            key=lambda row: (-int(row["count"]), row["shape"]),
+        )
+
+    return {
+        "summary": {
+            fmt: dict(sorted(reason_counts.items()))
+            for fmt, reason_counts in sorted(summary.items())
+        },
+        "by_shape": {
+            fmt: {
+                reason: rows
+                for reason, rows in sorted(reason_map.items())
+            }
+            for fmt, reason_map in sorted(shape_payload.items())
+        },
+        "records": sorted(
+            records,
+            key=lambda row: (
+                str(row.get("format", "")),
+                str(row.get("reason", "")),
+                int(row.get("out_features", 0) or 0),
+                int(row.get("in_features", 0) or 0),
+                str(row.get("qname", "")),
+            ),
+        ),
+    }
 
 
 _FUSED_SIBLING_MARKER = ".__siblings__."

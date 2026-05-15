@@ -115,6 +115,42 @@ Use these states for new functionality:
 
 Regression or inconclusive results should demote the feature back to research.
 
+### Progressive Local Gates
+
+Local render mechanisms must use the shared scorer in
+`prismaquant/render_score.py` unless there is a documented exception. The
+default gate is Fisher-weighted output MSE when h-detail exists, otherwise
+activation output MSE on the same calibration rows. A candidate that regresses
+the active score is skipped and the previous rendered baseline is kept.
+For mechanisms that function as initializers, such as FourOverSix before
+GPTQ/scale-sweep, the production cache may gate a candidate package so a
+neutral standalone initializer can still be accepted when the composed package
+improves the active score.
+
+Mechanism ordering is declared by operation type, not by ad hoc flag order.
+See `docs/progressive_render_pipeline.md` for the current order and extension
+contract. Global basis transforms such as HALO are full-recipe arms, not local
+progressive steps.
+
+AWQ-v2, SmoothQuant fold scales, and BlockOrtho-G were archived on
+2026-05-13 under `archive/foldscale_orthog_2026-05-13/`. Hadamard-DuQuant
+was archived on 2026-05-14 under `archive/hdq_2026-05-14/`. These methods
+must not be reintroduced into production cache fill, allocator cost overrides,
+export metadata, or pipeline flags unless the user explicitly asks to revive
+the corresponding archive.
+
+### Rotation Transforms
+
+Rotation methods are production-eligible only when the exported graph remains
+vanilla vLLM. A rotation that changes the residual-stream basis between
+layers, such as full layer-wise ReSpinQuant, needs a residual transition
+operator unless it collapses to a single global basis. That runtime adapter is
+not allowed in production artifacts without an explicit vLLM/kernel support
+decision. The 2026-05-13 ReSpinQuant attempt is archived under
+`archive/respinquant_2026-05-13/`; do not reintroduce a layer-wise residual
+basis path into cache fill or export unless that runtime-support decision is
+made first.
+
 ## Design Review Checklist
 
 Before implementation, answer these in the PR, commit notes, or working doc:
@@ -138,4 +174,3 @@ state:
 - why the existing mechanism cannot be used;
 - how the exception is isolated behind a flag or research path;
 - what result would justify promoting, deleting, or replacing it.
-

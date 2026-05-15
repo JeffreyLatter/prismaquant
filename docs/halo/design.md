@@ -121,7 +121,7 @@ is its own mini-block and gets its own rotation.
 1. New module `prismaquant/halo.py`:
    - `compute_random_hadamard(d: int, seed: int) -> torch.Tensor`
    - `compute_learned_rotation(W: torch.Tensor, H: torch.Tensor) -> torch.Tensor` (SVD-based)
-   - `apply_block_rotation(block: nn.Module, R: torch.Tensor, block_kind: str) -> None`
+   - `apply_halo_rotation(block: nn.Module, R: torch.Tensor, block_kind: str) -> None`
 
 2. Model-profile API extension:
    - `profile.halo_blocks(model) -> list[BlockSpec]`
@@ -165,11 +165,10 @@ is its own mini-block and gets its own rotation.
    Solution: rotation goes into Linear weights, NOT into norm
    parameters. Norm γ is unchanged.
 
-4. **Interaction with AWQ scale folding.** prismaquant already folds
-   AWQ per-channel scales into RMSNorm γ. HALO rotation is orthogonal
-   (different math, different absorption target — Linear weights vs
-   norm γ). They compose, but ordering matters: AWQ first (folds into
-   γ), then HALO (folds into W). Document the ordering.
+4. **Interaction with archived fold-scale work.** AWQ/SmoothQuant
+   predecessor folds were archived on 2026-05-13 and should not be
+   composed into HALO runs. HALO rotates Linear weights only; keep it
+   as a separate recipe arm until a new transform path is validated.
 
 5. **MoE expert rotations.** Each expert is a separate Linear set.
    They can either share a layer-level rotation (uniform across experts

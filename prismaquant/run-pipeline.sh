@@ -68,16 +68,20 @@ set -euo pipefail
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
-: "${PRISMACLIP_RBC:=0}"
 
-case "$PRISMACLIP_RBC" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *)
-    echo "[pipeline] ERROR: PRISMACLIP_RBC is disabled pending investigation." >&2
-    echo "                 The 2026-05-12 Qwen3.5-0.8B smoke regressed KL and made production-cache fill ~10x slower." >&2
+# PrismaClip / PrismaClip-RBC / PrismaFisherClip are archived under
+# archive/prismaclip_2026-05-14. Any attempt to enable them fails fast.
+for _legacy_clip_var in PRISMACLIP PRISMACLIP_RBC PRISMACLIP_RESEARCH_OVERRIDE \
+                       PRISMAFISHERCLIP PRISMAFISHERCLIP_MODE \
+                       PRISMAQUANT_ALLOW_RESEARCH_PRISMACLIP \
+                       PRISMAQUANT_ACT_CLIP_SOLVER PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING \
+                       PRISMAQUANT_PRISMAFISHERCLIP PRISMAQUANT_PRISMAFISHERCLIP_MODE; do
+  if [[ -n "${!_legacy_clip_var:-}" ]]; then
+    echo "[pipeline] ERROR: $_legacy_clip_var is archived under archive/prismaclip_2026-05-14 and is not available on the production path." >&2
     exit 2
-    ;;
-esac
+  fi
+done
+unset _legacy_clip_var
 
 if [[ "$DEVICE" != cuda* || "$EXPORT_DEVICE" != cuda* ]]; then
   echo "[pipeline] ERROR: PrismaQuant production pipeline is GPU-or-bust; DEVICE and EXPORT_DEVICE must be cuda*" >&2
@@ -124,12 +128,13 @@ PY
 # useful when intentionally building a reusable cache for reallocations.
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
 : "${PRODUCTION_CACHE_LEVERS:=gptq,joint_scale_opt,scale_sweep}"
+: "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
+: "${EXPORT_GPTQ:=auto}"
+: "${EXPORT_SCALE_SWEEP:=auto}"
 : "${FISHER_WEIGHTED_GPTQ:=0}"
 : "${FISHER_OUTPUT_MSE_ALLOCATOR:=0}"
-: "${PRISMACLIP:=0}"
-: "${PRISMAFISHERCLIP:=0}"
-: "${PRISMAFISHERCLIP_MODE:=audit}"
 : "${AWQ:=0}"
+: "${BLOCK_ROTATION:=0}"
 : "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 : "${HALO_MODE:=off}"
 : "${HALO_SEED:=0}"
@@ -167,49 +172,37 @@ case "$FISHER_WEIGHTED_GPTQ" in
     esac
     ;;
 esac
-case "${PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING:-none}" in
-  ""|0|false|False|FALSE|no|No|NO|off|Off|OFF|none|None|NONE) ;;
-  *)
-    echo "[pipeline] ERROR: PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING must be none; PrismaClip-RBC is disabled pending investigation." >&2
+case ",$PRODUCTION_CACHE_LEVERS," in
+  *,act_clip_solver,*|*,fisher_clip,*)
+    echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes act_clip_solver or fisher_clip; PrismaClip / PrismaFisherClip are archived under archive/prismaclip_2026-05-14." >&2
     exit 2
-    ;;
-esac
-case "$PRISMACLIP" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *)
-    export PRISMAQUANT_ACT_CLIP_SOLVER=1
-    case ",$PRODUCTION_CACHE_LEVERS," in
-      *,act_clip_solver,*) ;;
-      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},act_clip_solver" ;;
-    esac
-    ;;
-esac
-case "$PRISMAFISHERCLIP" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *)
-    PROBE_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
-    COST_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
-    PROD_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
-    export PRISMAQUANT_PRISMAFISHERCLIP=1
-    export PRISMAQUANT_PRISMAFISHERCLIP_MODE="$PRISMAFISHERCLIP_MODE"
-    export PRISMAQUANT_ACT_CLIP_SOLVER=1
-    case ",$PRODUCTION_CACHE_LEVERS," in
-      *,act_clip_solver,*) ;;
-      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},act_clip_solver" ;;
-    esac
-    case ",$PRODUCTION_CACHE_LEVERS," in
-      *,fisher_clip,*) ;;
-      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},fisher_clip" ;;
-    esac
     ;;
 esac
 case "$AWQ" in
   0|false|False|FALSE|no|No|NO|"") ;;
   *)
-    case ",$PRODUCTION_CACHE_LEVERS," in
-      *,awq,*) ;;
-      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},awq" ;;
-    esac
+    echo "[pipeline] ERROR: AWQ is archived under archive/foldscale_orthog_2026-05-13 and is not available on the production path." >&2
+    exit 2
+    ;;
+esac
+case "$BLOCK_ROTATION" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    echo "[pipeline] ERROR: BlockOrtho-G is archived under archive/foldscale_orthog_2026-05-13 and is not available on the production path." >&2
+    exit 2
+    ;;
+esac
+case "${HADAMARD_DUQUANT:-}" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    echo "[pipeline] ERROR: Hadamard-DuQuant is archived under archive/hdq_2026-05-14 and is not available on the production path." >&2
+    exit 2
+    ;;
+esac
+case ",$PRODUCTION_CACHE_LEVERS," in
+  *,awq,*|*,smoothquant,*|*,block_rotation,*|*,hadamard_duquant,*)
+    echo "[pipeline] ERROR: AWQ/SmoothQuant/BlockOrtho-G levers are archived under archive/foldscale_orthog_2026-05-13; Hadamard-DuQuant is archived under archive/hdq_2026-05-14." >&2
+    exit 2
     ;;
 esac
 
@@ -237,9 +230,10 @@ echo "  PRODUCTION_CACHE=$PRODUCTION_CACHE PRODUCTION_RECACHE=$PRODUCTION_RECACH
 echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
 echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
 echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
+echo "  PRODUCTION_CACHE_DISABLE_LEVERS=$PRODUCTION_CACHE_DISABLE_LEVERS"
+echo "  EXPORT_GPTQ=$EXPORT_GPTQ EXPORT_SCALE_SWEEP=$EXPORT_SCALE_SWEEP"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
-echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ FISHER_OUTPUT_MSE_ALLOCATOR=$FISHER_OUTPUT_MSE_ALLOCATOR PRISMACLIP=$PRISMACLIP PRISMACLIP_RBC=$PRISMACLIP_RBC PRISMAFISHERCLIP=$PRISMAFISHERCLIP PRISMAFISHERCLIP_MODE=$PRISMAFISHERCLIP_MODE AWQ=$AWQ H_DETAIL_DIR=$H_DETAIL_DIR"
-echo "  PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING=${PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING:-none}"
+echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ FISHER_OUTPUT_MSE_ALLOCATOR=$FISHER_OUTPUT_MSE_ALLOCATOR H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
@@ -468,29 +462,11 @@ if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTI
     0|false|False|FALSE|no|No|NO|"") ;;
     *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_fisher" ;;
   esac
-  case "${PRISMAQUANT_ACT_CLIP_SOLVER:-0}" in
-    0|false|False|FALSE|no|No|NO|"") ;;
-    *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_clip" ;;
-  esac
-  case "$PRISMAFISHERCLIP" in
-    0|false|False|FALSE|no|No|NO|"") ;;
-    *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_fisherclip" ;;
-  esac
-  case ",$PRODUCTION_CACHE_LEVERS," in
-    *,awq,*) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_awq" ;;
-  esac
   PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}"
   PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_raw.pkl"
   PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_recached.pkl"
   CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
   if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
-    case ",$PRODUCTION_CACHE_LEVERS," in
-      *,awq,*|*,smoothquant,*)
-        echo "[pipeline] ERROR: SELECTION_MODE=validated-surrogate requires a format-menu cache, but AWQ/SmoothQuant fold scales are assignment-specific." >&2
-        echo "                 Disable AWQ/SmoothQuant for frontier selection, then rerun them as a selected-assignment ablation." >&2
-        exit 2
-        ;;
-    esac
     if [[ -z "$ALLOCATOR_PARETO_DIR" || ! -f "$ALLOCATOR_PARETO_DIR/manifest.json" ]]; then
       echo "[pipeline] ERROR: validated-surrogate selection requires allocator pareto assignments at $ALLOCATOR_PARETO_DIR" >&2
       exit 2
@@ -531,6 +507,7 @@ PY
         --dtype bf16 \
         --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
         --enable "$PRODUCTION_CACHE_LEVERS" \
+        --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
         --cache-dir "$PROD_CACHE_DIR" \
         --render-scope format-menu \
         --halo-mode "$HALO_MODE" \
@@ -661,6 +638,7 @@ PY
           --dtype bf16 \
           --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
           --enable "$PRODUCTION_CACHE_LEVERS" \
+          --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
           --cache-dir "$PROD_CACHE_DIR" \
           --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
           --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
@@ -708,6 +686,7 @@ PY
         --dtype bf16 \
         --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
         --enable "$PRODUCTION_CACHE_LEVERS" \
+        --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
         --cache-dir "$PROD_CACHE_DIR" \
         --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
         --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
@@ -733,6 +712,24 @@ EXPORT_ARGS=(
   --halo-mode "$HALO_MODE"
   --halo-seed "$HALO_SEED"
 )
+case "$EXPORT_GPTQ" in
+  0|false|False|FALSE|no|No|NO) EXPORT_ARGS+=(--no-gptq) ;;
+  1|true|True|TRUE|yes|Yes|YES) EXPORT_ARGS+=(--gptq) ;;
+  auto|"") ;;
+  *)
+    echo "[pipeline] ERROR: EXPORT_GPTQ must be auto, 0, or 1" >&2
+    exit 2
+    ;;
+esac
+case "$EXPORT_SCALE_SWEEP" in
+  0|false|False|FALSE|no|No|NO) EXPORT_ARGS+=(--no-scale-sweep) ;;
+  1|true|True|TRUE|yes|Yes|YES) EXPORT_ARGS+=(--scale-sweep) ;;
+  auto|"") ;;
+  *)
+    echo "[pipeline] ERROR: EXPORT_SCALE_SWEEP must be auto, 0, or 1" >&2
+    exit 2
+    ;;
+esac
 if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
 	  EXPORT_ARGS+=(
 	    --production-weight-cache "$PRODUCTION_CACHE_PATH"
@@ -741,10 +738,6 @@ if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
 	    --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
 	  )
 fi
-case "$AWQ" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *) EXPORT_ARGS+=(--awq) ;;
-esac
 "${EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
 
 echo

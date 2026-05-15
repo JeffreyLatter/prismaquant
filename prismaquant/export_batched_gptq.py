@@ -30,6 +30,7 @@ import torch
 # duplicating the FP4 grid definition.
 from .export_native_compressed import (
     _activation_matrix_for_gptq,
+    _gptq_obs_rounding_nvfp4,
     _nvfp4_codebook,
     _rtn_dequant_nvfp4,
     _round_to_codebook,
@@ -133,6 +134,8 @@ def gptq_obs_rounding_nvfp4_batched(
     clip_rescale: str | None = None,
     row_weights_list: list[torch.Tensor | None] | None = None,
     expert_chunk: int = 32,
+    static_act_order: bool = False,
+    joint_scale_opt: bool = False,
 ) -> torch.Tensor:
     """Batched NVFP4 GPTQ across E same-shape Linears.
 
@@ -171,6 +174,33 @@ def gptq_obs_rounding_nvfp4_batched(
         raise ValueError(
             f"global_real_overrides must have shape [E={E}]; "
             f"got {global_real_overrides.shape}")
+
+    if static_act_order or joint_scale_opt:
+        outputs = []
+        for e in range(E):
+            override = (
+                global_real_overrides[e]
+                if global_real_overrides is not None
+                else None
+            )
+            row_weights = (
+                row_weights_list[e]
+                if row_weights_list is not None and e < len(row_weights_list)
+                else None
+            )
+            outputs.append(_gptq_obs_rounding_nvfp4(
+                weights[e],
+                activations_list[e],
+                group_size=group_size,
+                damp=damp,
+                global_real_override=override,
+                clip_threshold=clip_threshold,
+                clip_rescale=clip_rescale,
+                fisher_row_weights=row_weights,
+                static_act_order=static_act_order,
+                joint_scale_opt=joint_scale_opt,
+            ))
+        return torch.stack(outputs, dim=0)
 
     device = weights.device
     cb = _nvfp4_codebook(device, dtype=torch.float32)

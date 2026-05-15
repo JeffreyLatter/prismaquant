@@ -23,6 +23,8 @@ import math
 
 import torch
 
+from prismaquant.render_score import gate_render_candidate, score_render_error
+
 
 DEFAULT_AWQ_MIN_GAIN = 0.03
 
@@ -37,6 +39,7 @@ class AwqSearchTarget:
     activations: torch.Tensor
     group_size: int = 0
     score_weight: float = 1.0
+    row_weights: torch.Tensor | None = None
 
 
 @dataclass
@@ -49,6 +52,7 @@ class AwqSearchResult:
     relative_gain: float
     n_candidates: int
     trace: list[dict[str, float | str | None]]
+    gate_reason: str = "improved"
 
 
 RenderScaledFn = Callable[
@@ -194,27 +198,17 @@ def awq_output_mse(
     rendered_effective: torch.Tensor,
     activations: torch.Tensor,
     *,
+    row_weights: torch.Tensor | None = None,
     row_chunk: int = 128,
 ) -> float:
     """Mean output-space MSE for ``rendered_effective`` on ``activations``."""
-
-    if rendered_effective.shape != weight.shape:
-        return float("inf")
-    rows, cols = weight.shape
-    if activations.shape[-1] != cols:
-        return float("inf")
-    device = weight.device
-    diff_t = (
-        rendered_effective.detach().to(device=device, dtype=torch.float32)
-        - weight.detach().to(device=device, dtype=torch.float32)
-    ).t().contiguous()
-    x = _flatten_activations(activations, cols, device=device)
-    total = 0.0
-    with torch.no_grad():
-        for start in range(0, x.shape[0], int(row_chunk)):
-            y = x[start:start + int(row_chunk)] @ diff_t
-            total += float(y.pow(2).sum().item())
-    return total / max(1, int(x.shape[0]) * int(rows))
+    return score_render_error(
+        weight,
+        rendered_effective,
+        activations,
+        row_weights=row_weights,
+        row_chunk=row_chunk,
+    )
 
 
 def _candidate_scales(
@@ -340,6 +334,7 @@ def search_awq_scale(
                     w,
                     effective,
                     target.activations,
+                    row_weights=target.row_weights,
                     row_chunk=row_chunk,
                 )
                 total += float(target.score_weight) * score
@@ -359,9 +354,18 @@ def search_awq_scale(
 
     if not math.isfinite(baseline_score):
         baseline_score = best_score
-    denom = max(abs(float(baseline_score)), 1e-30)
-    relative_gain = (float(baseline_score) - float(best_score)) / denom
-    if best_label != "identity" and relative_gain < float(min_gain):
+    gate = gate_render_candidate(
+        baseline_score=float(baseline_score),
+        candidate_score=float(best_score),
+        metric="output_mse",
+        min_relative_gain=float(min_gain),
+    )
+    relative_gain = float(gate.relative_gain)
+    gate_reason = str(gate.reason)
+    if best_label == "identity":
+        gate_reason = "identity"
+        relative_gain = 0.0
+    if best_label != "identity" and not gate.accepted:
         best_scale = candidates[0][2].to(device=device, dtype=torch.float32)
         best_label = "identity"
         best_ratio = None
@@ -377,4 +381,5 @@ def search_awq_scale(
         relative_gain=float(relative_gain),
         n_candidates=len(candidates),
         trace=trace,
+        gate_reason=gate_reason,
     )

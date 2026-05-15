@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytest
 
 from prismaquant import format_registry as fr
 from prismaquant.perturbed_x_cache import (
@@ -12,6 +13,7 @@ from prismaquant.perturbed_x_cache import (
     capture_perturbed_activation_cache,
     stage_text_only_under_work_root,
 )
+from prismaquant.production_weight_cache import ProductionWeightCache
 
 
 class _TwoLinear(nn.Module):

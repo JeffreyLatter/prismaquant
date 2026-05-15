@@ -590,8 +590,8 @@ class PerturbedActivationCache:
         if not self.capture_inputs:
             return
         flat = x.detach().reshape(-1, x.size(-1))
-        mx = float(flat.abs().max().item())
         for name in plan.cache_names:
+            mx = float(flat.abs().max().item())
             if mx > self.max_abs.get(name, 0.0):
                 self.max_abs[name] = mx
             need = self.input_rows - self._rows_got[name]
@@ -866,13 +866,14 @@ class PerturbedActivationCache:
         x: torch.Tensor,
     ) -> torch.Tensor:
         self._capture(plan, x)
+        x_runtime = x
         act_spec = self._active_activation_spec(plan)
         fused_active = (
             fr.canonical_format_name(param_plan.spec.name) == "NVFP4"
             and act_spec is not None
             and fr.canonical_format_name(act_spec.name) == "NVFP4"
-            and x.is_cuda
-            and x.shape[-1] % 16 == 0
+            and x_runtime.is_cuda
+            and x_runtime.shape[-1] % 16 == 0
         )
         if not fused_active:
             return self._reference_linear_forward(plan, param_plan, x)
@@ -882,7 +883,7 @@ class PerturbedActivationCache:
         w_packed, w_scales, w_global_scale = self._packed_nvfp4_weight_for(
             plan, param_plan
         )
-        flat_x = x.reshape(-1, x.shape[-1])
+        flat_x = x_runtime.reshape(-1, x_runtime.shape[-1])
         # MED-3: act-clip the activation to the calibrated max_abs before
         # the fused kernel's internal per-group RTN.  Same rationale as
         # ``_reference_linear_forward``: pre-scale + post-multiply
@@ -893,7 +894,7 @@ class PerturbedActivationCache:
             flat_x, self._activation_scales, param_plan.name,
         )
         out = nvfp4_fused_aw_matmul(flat_x, w_packed, w_scales, w_global_scale)
-        out = out.reshape(*x.shape[:-1], plan.module.out_features)
+        out = out.reshape(*x_runtime.shape[:-1], plan.module.out_features)
         if plan.module.bias is not None:
             out = out + plan.module.bias.to(device=out.device, dtype=out.dtype)
         return out
@@ -912,6 +913,11 @@ class PerturbedActivationCache:
             where, key, x = _first_tensor_location(args, kwargs)
             if isinstance(x, torch.Tensor):
                 self._capture(plan, x)
+                member_name = next(
+                    (p.name for p in plan.params if p.attr == "weight"),
+                    plan.params[0].name if plan.params else None,
+                )
+                x_runtime = x
                 act_spec = self._active_activation_spec(plan)
                 if act_spec is not None:
                     # MED-3: act-clip to the calibrated max_abs before the
@@ -919,15 +925,14 @@ class PerturbedActivationCache:
                     # scales.  See ``_maybe_clip_activations`` for the
                     # math; pre-scale + post-multiply was a no-op (codex
                     # round-3 caught Q(x/s)*s == Q(x)).
-                    member_name = next(
-                        (p.name for p in plan.params if p.attr == "weight"),
-                        None,
-                    )
                     x_in = _maybe_clip_activations(
-                        x, self._activation_scales, member_name,
+                        x_runtime, self._activation_scales, member_name,
                     )
-                    qx = act_spec.activation_quantize_dequantize(x_in)
-                    args, kwargs = _replace_tensor_input(args, kwargs, where, key, qx)
+                    x_runtime = act_spec.activation_quantize_dequantize(x_in)
+                if x_runtime is not x:
+                    args, kwargs = _replace_tensor_input(
+                        args, kwargs, where, key, x_runtime,
+                    )
             self._apply_weight_quant(plan)
             return args, kwargs
 

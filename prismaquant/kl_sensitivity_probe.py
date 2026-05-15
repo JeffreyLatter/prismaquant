@@ -264,6 +264,26 @@ def _parse_levers(value: str | None) -> dict[str, bool]:
 
 def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
     levers = _parse_levers(value)
+    default_optional_levers = not bool(levers.pop("none", False))
+    if not default_optional_levers:
+        for name in (
+            "gptq",
+            "scale_sweep",
+            "awq_round",
+            "act_clip_solver",
+            "fisher_gptq",
+            "fisher_clip",
+            "static_act_order",
+            "joint_scale_opt",
+        ):
+            levers.setdefault(name, False)
+    archived = {"awq", "smoothquant", "block_rotation"} & set(levers)
+    if archived:
+        raise ValueError(
+            "Production cache levers archived under "
+            "archive/foldscale_orthog_2026-05-13 are not supported: "
+            + ", ".join(sorted(archived))
+        )
     levers.setdefault("gptq", True)
     levers.setdefault(
         "gptq_damp_sweep",
@@ -271,8 +291,20 @@ def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
         and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
     )
     levers.setdefault("scale_sweep", True)
-    levers.setdefault("awq", False)
     levers.setdefault("awq_round", False)
+    levers.setdefault(
+        "static_act_order",
+        os.environ.get("PRISMAQUANT_GPTQ_STATIC_ACT_ORDER", "0").strip().lower()
+        not in {"", "0", "false", "no", "off"},
+    )
+    levers.setdefault(
+        "joint_scale_opt",
+        os.environ.get("PRISMAQUANT_NVFP4_JOINT_SCALE_OPT", "0").strip().lower()
+        not in {"", "0", "false", "no", "off"},
+    )
+    if not bool(levers.get("gptq", True)):
+        levers["static_act_order"] = False
+        levers["joint_scale_opt"] = False
     levers.setdefault(
         "act_clip_solver",
         os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER", "0").strip().lower()
@@ -292,7 +324,17 @@ def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
     )
     if bool(levers.get("fisher_clip", False)):
         levers["act_clip_solver"] = True
-    from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
+    from prismaquant.export_native_compressed import (
+        NVFP4_SCALE_RULE_ENV,
+        NVFP4_SCALE_RULE_JOINT_MSE,
+        resolve_nvfp4_scale_rule,
+    )
+    if (
+        bool(levers.get("joint_scale_opt", False))
+        and "nvfp4_scale_rule" not in levers
+        and NVFP4_SCALE_RULE_ENV not in os.environ
+    ):
+        levers["nvfp4_scale_rule"] = NVFP4_SCALE_RULE_JOINT_MSE
     levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
     return dict(sorted(levers.items()))
 

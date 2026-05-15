@@ -153,10 +153,16 @@ def test_production_cache_records_awq_scales(monkeypatch):
     assert cache.metadata["awq"]["status"] == "applied"
     assert cache.metadata["awq"]["n_scaled_linears"] == 1
     assert cache.metadata["awq"]["min_gain"] == 0.03
+    assert cache.metadata["awq"]["groups"]["model.layers.0.input_layernorm"][
+        "gate_reason"
+    ] == "improved"
     assert cache.metadata["awq"]["search_levers"]["gptq"] is False
     assert seen_kwargs["min_gain"] == 0.03
     assert render_levers[0]["gptq"] is False
-    assert render_levers[-1]["gptq"] is True
+    assert cache.metadata["render_gates"]["entries"] == 1
+    mechanisms = cache.metadata["render_gates"]["mechanisms"]
+    assert "gptq" in mechanisms
+    assert "scale_sweep" in mechanisms
 
 
 def test_precomputed_awq_fold_preserves_mixed_reader_outputs():
@@ -204,7 +210,7 @@ def test_precomputed_awq_fold_preserves_mixed_reader_outputs():
     assert torch.allclose(after_b, ref_b, rtol=2e-3, atol=2e-3)
 
 
-def test_awq_and_smoothquant_are_mutually_exclusive():
+def test_fold_scale_methods_are_mutually_exclusive():
     import pytest
     import prismaquant.production_weight_cache as pwc
 
@@ -224,5 +230,198 @@ def test_awq_and_smoothquant_are_mutually_exclusive():
             qnames=["proj"],
             formats=["NVFP4"],
             levers={"awq": True, "smoothquant": True},
+            progress=False,
+        )
+
+
+def test_smoothquant_alpha_limit_defaults_to_requested_hi(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+
+    monkeypatch.delenv("PRISMAQUANT_SMOOTHQUANT_NVFP4_ALPHA_MAX", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_SMOOTHQUANT_MXFP8_ALPHA_MAX", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_SMOOTHQUANT_FP8_E4M3_ALPHA_MAX", raising=False)
+    monkeypatch.delenv(
+        "PRISMAQUANT_SMOOTHQUANT_PROMOTED_ALPHA_MAX",
+        raising=False,
+    )
+
+    assert pwc._smoothquant_alpha_hi_for_formats(
+        ["NVFP4"],
+        requested_hi=1.0,
+    ) == 1.0
+    assert pwc._smoothquant_alpha_hi_for_formats(
+        ["MXFP8_E4M3"],
+        requested_hi=1.0,
+    ) == 1.0
+    assert pwc._smoothquant_alpha_hi_for_formats(
+        ["FP8_E4M3"],
+        requested_hi=1.0,
+    ) == 1.0
+    assert pwc._smoothquant_alpha_hi_for_formats(
+        ["NVFP4", "MXFP8_E4M3"],
+        requested_hi=1.0,
+    ) == 1.0
+    assert pwc._smoothquant_alpha_hi_for_formats(
+        ["NVFP4"],
+        requested_hi=0.7,
+    ) == 0.7
+
+    monkeypatch.setenv("PRISMAQUANT_SMOOTHQUANT_NVFP4_ALPHA_MAX", "0.375")
+    assert pwc._smoothquant_alpha_hi_for_formats(
+        ["NVFP4"],
+        requested_hi=1.0,
+    ) == 0.375
+    monkeypatch.setenv("PRISMAQUANT_SMOOTHQUANT_MXFP8_ALPHA_MAX", "0.625")
+    assert pwc._smoothquant_alpha_hi_for_formats(
+        ["MXFP8_E4M3"],
+        requested_hi=1.0,
+    ) == 0.625
+    monkeypatch.setenv("PRISMAQUANT_SMOOTHQUANT_PROMOTED_ALPHA_MAX", "0.75")
+    monkeypatch.delenv("PRISMAQUANT_SMOOTHQUANT_MXFP8_ALPHA_MAX", raising=False)
+    assert pwc._smoothquant_alpha_hi_for_formats(
+        ["MXFP8_E4M3"],
+        requested_hi=1.0,
+    ) == 0.75
+
+
+def test_smoothquant_solver_uses_requested_alpha_hi_by_default(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+
+    qname = "model.layers.0.self_attn.q_proj"
+    mod = nn.Linear(16, 16, bias=False)
+    acts = torch.randn(8, 16)
+    seen_hi: list[float] = []
+
+    def fake_render_awq_scaled_for_cache(*, weight_scaled, **_kwargs):
+        return weight_scaled
+
+    def fake_golden_section_search(f, a, b, *, tol, max_iter):
+        seen_hi.append(float(b))
+        x = 0.5 * (float(a) + float(b))
+        return x, float(f(x))
+
+    monkeypatch.setattr(
+        pwc,
+        "_render_awq_scaled_for_cache",
+        fake_render_awq_scaled_for_cache,
+    )
+    monkeypatch.setattr(
+        pwc,
+        "_golden_section_search",
+        fake_golden_section_search,
+    )
+    monkeypatch.delenv("PRISMAQUANT_SMOOTHQUANT_NVFP4_ALPHA_MAX", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_SMOOTHQUANT_MXFP8_ALPHA_MAX", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_SMOOTHQUANT_FP8_E4M3_ALPHA_MAX", raising=False)
+    monkeypatch.delenv(
+        "PRISMAQUANT_SMOOTHQUANT_PROMOTED_ALPHA_MAX",
+        raising=False,
+    )
+
+    _scales, meta = pwc._solve_smoothquant_scales(
+        qname_to_module={qname: mod},
+        activations={qname: acts},
+        render_formats_by_qname={qname: ("NVFP4",)},
+        levers={"smoothquant": True},
+        progress=False,
+    )
+
+    assert seen_hi == [1.0]
+    group = meta["groups"]["model.layers.0.input_layernorm"]
+    assert group["effective_alpha_hi"] == 1.0
+    assert group["format_alpha_caps"]["NVFP4"] == 1.0
+
+    seen_hi.clear()
+    _scales, meta = pwc._solve_smoothquant_scales(
+        qname_to_module={qname: mod},
+        activations={qname: acts},
+        render_formats_by_qname={qname: ("MXFP8_E4M3",)},
+        levers={"smoothquant": True},
+        progress=False,
+    )
+
+    assert seen_hi == [1.0]
+    group = meta["groups"]["model.layers.0.input_layernorm"]
+    assert group["effective_alpha_hi"] == 1.0
+    assert group["format_alpha_caps"]["MXFP8_E4M3"] == 1.0
+
+    seen_hi.clear()
+    _scales, meta = pwc._solve_smoothquant_scales(
+        qname_to_module={qname: mod},
+        activations={qname: acts},
+        render_formats_by_qname={qname: ("FP8_E4M3",)},
+        levers={"smoothquant": True},
+        progress=False,
+    )
+
+    assert seen_hi == [1.0]
+    group = meta["groups"]["model.layers.0.input_layernorm"]
+    assert group["effective_alpha_hi"] == 1.0
+    assert group["format_alpha_caps"]["FP8_E4M3"] == 1.0
+
+
+def test_smoothquant_solver_honors_explicit_alpha_cap(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+
+    qname = "model.layers.0.self_attn.q_proj"
+    mod = nn.Linear(16, 16, bias=False)
+    acts = torch.randn(8, 16)
+    seen_hi: list[float] = []
+
+    def fake_render_awq_scaled_for_cache(*, weight_scaled, **_kwargs):
+        return weight_scaled
+
+    def fake_golden_section_search(f, a, b, *, tol, max_iter):
+        seen_hi.append(float(b))
+        x = 0.5 * (float(a) + float(b))
+        return x, float(f(x))
+
+    monkeypatch.setattr(
+        pwc,
+        "_render_awq_scaled_for_cache",
+        fake_render_awq_scaled_for_cache,
+    )
+    monkeypatch.setattr(
+        pwc,
+        "_golden_section_search",
+        fake_golden_section_search,
+    )
+    monkeypatch.setenv("PRISMAQUANT_SMOOTHQUANT_FP8_E4M3_ALPHA_MAX", "0.0")
+
+    _scales, meta = pwc._solve_smoothquant_scales(
+        qname_to_module={qname: mod},
+        activations={qname: acts},
+        render_formats_by_qname={qname: ("FP8_E4M3",)},
+        levers={"smoothquant": True},
+        progress=False,
+    )
+
+    assert seen_hi == []
+    group = meta["groups"]["model.layers.0.input_layernorm"]
+    assert group["effective_alpha_hi"] == 0.0
+    assert group["format_alpha_caps"]["FP8_E4M3"] == 0.0
+    assert group["selected"] == "identity"
+
+
+def test_block_rotation_is_mutually_exclusive_with_awq():
+    import pytest
+    import prismaquant.production_weight_cache as pwc
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8, bias=False)
+
+        def forward(self, input_ids, use_cache=False):
+            x = torch.nn.functional.one_hot(input_ids % 8, num_classes=8)
+            return self.proj(x.to(self.proj.weight.dtype))
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        pwc.fill_production_weight_cache(
+            TinyModel(),
+            torch.tensor([[0, 1, 2]], dtype=torch.long),
+            qnames=["proj"],
+            formats=["NVFP4"],
+            levers={"awq": True, "block_rotation": True},
             progress=False,
         )

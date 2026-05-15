@@ -24,6 +24,7 @@ from prismaquant.allocator import (
     _format_kernel_supports_shape,
     build_candidates,
 )
+from prismaquant.allocator_candidates import summarize_applicability_masks
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +115,8 @@ def test_build_candidates_drops_mxfp8_on_small_n_shape():
     }
     specs = [fr.REGISTRY["NVFP4"], fr.REGISTRY["MXFP8_E4M3"], fr.REGISTRY["BF16"]]
 
-    cands = build_candidates(stats, costs, specs)
+    mask_records = []
+    cands = build_candidates(stats, costs, specs, mask_records=mask_records)
 
     # in_proj_a (out=48): MXFP8 should be dropped.
     a_formats = [c.fmt for c in cands["model.layers.0.linear_attn.in_proj_a"]]
@@ -126,6 +128,29 @@ def test_build_candidates_drops_mxfp8_on_small_n_shape():
     # gate_proj (5120, 17408): MXFP8 should be kept.
     g_formats = [c.fmt for c in cands["model.layers.0.mlp.gate_proj"]]
     assert "MXFP8_E4M3" in g_formats
+
+    assert mask_records == [
+        {
+            "qname": "model.layers.0.linear_attn.in_proj_a",
+            "format": "MXFP8_E4M3",
+            "reason": "kernel_shape",
+            "detail": (
+                "MXFP8_E4M3 kernel does not support "
+                "(out_features=48, in_features=5120)"
+            ),
+            "shape": [48, 5120],
+            "out_features": 48,
+            "in_features": 5120,
+            "source_kind": None,
+        },
+    ]
+
+    summary = summarize_applicability_masks(mask_records)
+    assert summary["summary"] == {"MXFP8_E4M3": {"kernel_shape": 1}}
+    assert summary["by_shape"]["MXFP8_E4M3"]["kernel_shape"][0]["shape"] == [
+        48,
+        5120,
+    ]
 
 
 def test_build_candidates_applies_serving_profile_before_dp():

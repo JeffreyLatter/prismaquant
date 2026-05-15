@@ -217,6 +217,60 @@ def test_production_cache_records_damp_sweep_lever(monkeypatch):
     )["gptq_damp_sweep"] is True
 
 
+def test_production_cache_none_lever_disables_defaults(monkeypatch):
+    model = nn.Linear(1, 1, bias=False)
+    calib_ids = torch.empty((0, 1), dtype=torch.long)
+
+    monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1")
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=[],
+        levers={"none": True},
+        progress=False,
+    )
+
+    assert cache.levers["gptq"] is False
+    assert cache.levers["gptq_damp_sweep"] is False
+    assert cache.levers["scale_sweep"] is False
+    normalized = _normalized_production_cache_levers("none")
+    assert normalized["gptq"] is False
+    assert normalized["gptq_damp_sweep"] is False
+    assert normalized["scale_sweep"] is False
+    assert normalized["static_act_order"] is False
+    assert normalized["joint_scale_opt"] is False
+
+
+def test_production_cache_records_lift_gptq_levers(monkeypatch):
+    model = nn.Linear(1, 1, bias=False)
+    calib_ids = torch.empty((0, 1), dtype=torch.long)
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=[],
+        levers={"gptq": True, "static_act_order": True, "joint_scale_opt": True},
+        progress=False,
+    )
+    normalized = _normalized_production_cache_levers(
+        "gptq,static_act_order,joint_scale_opt"
+    )
+
+    assert cache.levers["static_act_order"] is True
+    assert cache.levers["joint_scale_opt"] is True
+    assert cache.levers["nvfp4_scale_rule"] == "joint_mse"
+    assert normalized["static_act_order"] is True
+    assert normalized["joint_scale_opt"] is True
+    assert normalized["nvfp4_scale_rule"] == "joint_mse"
+    from prismaquant.render_score import resolve_render_mechanism_order
+
+    names = resolve_render_mechanism_order(
+        ("gptq", "static_act_order", "joint_scale_opt")
+    ).names()
+    assert "static_act_order" in names
+    assert "joint_scale_opt" in names
+
+
 def test_production_cache_records_nvfp4_scale_rule(monkeypatch):
     model = nn.Linear(1, 1, bias=False)
     calib_ids = torch.empty((0, 1), dtype=torch.long)
@@ -233,6 +287,37 @@ def test_production_cache_records_nvfp4_scale_rule(monkeypatch):
     assert cache.levers["nvfp4_scale_rule"] == "four_over_six_mse"
 
 
+def test_production_cache_gates_four_over_six_as_first_class_plugin(monkeypatch):
+    model = _TinyChain()
+    with torch.no_grad():
+        model.l1.weight.zero_()
+        model.l1.weight[:, 0] = 1.0
+        model.l1.weight[:, 1] = 0.75
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+
+    monkeypatch.setenv("PRISMAQUANT_NVFP4_SCALE_RULE", "four_over_six_mse")
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["NVFP4"],
+        levers={"gptq": False, "scale_sweep": False},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    f6 = cache.metadata["four_over_six"]
+    assert f6["accepted"] >= 1
+    assert cache.metadata["render_gates"]["mechanisms"]["four_over_six"][
+        "accepted"
+    ] >= 1
+    trace = cache.metadata["render_gates"]["records"][0]["trace"]
+    assert any(
+        step.get("mechanism") == "four_over_six" and step.get("accepted")
+        for step in trace
+    )
+
+
 def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
     import prismaquant.production_weight_cache as pwc
 
@@ -245,7 +330,7 @@ def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
         fmt,
         *,
         act_clip_threshold=None,
-        **_kwargs,
+        **kwargs,
     ):
         calls.append(act_clip_threshold)
         if fmt.upper() != "NVFP4":
@@ -255,6 +340,35 @@ def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
             if act_clip_threshold is None
             else abs(float(act_clip_threshold) - 1.0)
         )
+        gate_trace = kwargs.get("gate_trace")
+        if gate_trace is not None:
+            gate_trace.append({
+                "mechanism": "baseline",
+                "selected": "fake_baseline",
+                "score": 3.0,
+                "metric": "test_mse",
+                "package": [],
+            })
+            gate_trace.append({
+                "mechanism": "test_gate",
+                "accepted": act_clip_threshold is not None,
+                "selected": (
+                    "fake_candidate"
+                    if act_clip_threshold is not None else
+                    "fake_baseline"
+                ),
+                "candidate": "fake_candidate",
+                "baseline_score": 3.0,
+                "candidate_score": float(delta),
+                "relative_gain": float((3.0 - delta) / 3.0),
+                "metric": "test_mse",
+                "reason": (
+                    "improved"
+                    if act_clip_threshold is not None else
+                    "regressed_or_tied"
+                ),
+                "package": ["test_gate"] if act_clip_threshold is not None else [],
+            })
         return weight.detach().to(torch.float32) + delta
 
     monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
@@ -280,6 +394,14 @@ def test_production_cache_act_clip_solver_selects_rendered_nvfp4(monkeypatch):
     assert group_meta["selected_eval_index"] is not None
     assert 1 <= group_meta["selected_eval_index"] <= group_meta["n_evals"]
     assert len(group_meta["eval_trace"]) == group_meta["n_evals"]
+    assert group_meta["selected_render_gate_traces"]["l1"]
+    assert cache.metadata["render_gates"]["entries"] >= 1
+    assert cache.metadata["render_gates"]["records"][0]["source"] == (
+        "activation_clip_solver_selected"
+    )
+    assert cache.metadata["render_gates"]["mechanisms"]["test_gate"][
+        "accepted"
+    ] >= 1
     assert group_meta["eval_trace"]
     assert all(
         later["best_score"] <= earlier["best_score"]
@@ -433,6 +555,10 @@ def test_production_cache_act_clip_solver_skips_tiny_configured_gain(monkeypatch
     assert meta["selected_by_qname"]["l1"] is None
     assert group_meta["selected"] == "baseline"
     assert group_meta["relative_gain"] == 0.0
+    assert group_meta["rejection_reason"] in {
+        "regressed_or_tied",
+        "below_min_gain",
+    }
     assert calls.count(None) == 1
     assert torch.allclose(
         cache.get("l1", "NVFP4").to(torch.float32),
@@ -468,6 +594,39 @@ def test_production_cache_act_clip_solver_prewrite_default_off(monkeypatch):
     meta = cache.metadata["activation_clip_solver"]
     assert meta["prewrite_baseline"] is False
     assert meta["prewritten_baseline_qnames"] == []
+
+
+def test_act_clip_solver_records_groups_without_clip_interval(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+
+    modules = {"a": nn.Linear(2, 1, bias=False)}
+    activations = {"a": torch.ones(4, 2)}
+    weights: dict[tuple[str, str], object] = {}
+
+    def fake_render_production_weight(weight, fmt, **_kwargs):
+        return weight.detach().to(torch.float32)
+
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+    thresholds, meta = pwc._solve_nvfp4_activation_clip_groups(
+        groups={"a": ["a"]},
+        qname_to_module=modules,
+        activations=activations,
+        levers={"gptq": False, "scale_sweep": False},
+        joint_globals={},
+        activation_max_abs={"a": 1.0},
+        fisher_rows=None,
+        weights_out=weights,
+        cache_dir_path=None,
+        progress=False,
+    )
+
+    group_meta = meta["groups"]["a"]
+    assert meta["input_groups"] == 1
+    assert meta["bounded_groups"] == 0
+    assert meta["skipped_no_clip_interval"] == 1
+    assert thresholds["a"].threshold is None
+    assert group_meta["status"] == "skipped_no_clip_interval"
+    assert group_meta["selected"] == "baseline"
 
 
 def test_prismafisherclip_requires_h_detail_dir():
@@ -537,6 +696,7 @@ def test_production_cache_act_clip_solver_holdout_rejects_overfit(monkeypatch):
     assert thresholds["a"].threshold is None
     assert meta["selected_by_qname"]["a"] is None
     assert group_meta["selected"] == "baseline"
+    assert group_meta["rejection_reason"] == "holdout_veto"
     assert group_meta["holdout_accepted"] is False
     assert group_meta["eval_trace"][0]["holdout_score"] == pytest.approx(10.0)
     assert weights == {}
@@ -625,6 +785,7 @@ def test_prismafisherclip_vetoes_unweighted_clip_choice(monkeypatch, tmp_path):
     assert thresholds["a"].threshold is None
     assert group_meta["selected"] == "baseline"
     assert group_meta["best_score"] == pytest.approx(group_meta["baseline_score"])
+    assert group_meta["rejection_reason"] == "fisher_veto"
     assert seen_render_weights and all(value is None for value in seen_render_weights)
     assert weights == {}
 
@@ -913,10 +1074,53 @@ def test_production_cache_mxfp8_uses_activation_scale_sweep(monkeypatch):
     )
 
     assert calls
-    assert torch.allclose(
+    # The fake candidate is intentionally bad; progressive gates should keep
+    # the MXFP8 baseline instead of blindly accepting the scale-sweep output.
+    assert not torch.allclose(
         cache.get("l1", "MXFP8_E4M3").to(torch.float32),
         model.l1.weight.detach().to(torch.float32) + 2.0,
     )
+    scale_meta = cache.metadata["render_gates"]["mechanisms"]["scale_sweep"]
+    assert scale_meta["rejected"] == 1
+    assert scale_meta["reasons"]["regressed_or_tied"] == 1
+
+
+def test_production_cache_fp8_uses_activation_scale_sweep(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    calls = []
+
+    def fake_fp8_scale_sweep(weight, activations, **_kwargs):
+        calls.append(activations.shape)
+        rows, _cols = weight.shape
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
+            torch.ones((rows, 1), dtype=torch.float32),
+            weight.detach().to(torch.float32) + 2.0,
+        )
+
+    monkeypatch.setattr(enc, "_fp8_dynamic_scale_sweep_quantize", fake_fp8_scale_sweep)
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["FP8_E4M3"],
+        levers={"gptq": False, "scale_sweep": True},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    assert calls
+    assert not torch.allclose(
+        cache.get("l1", "FP8_E4M3").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32) + 2.0,
+    )
+    scale_meta = cache.metadata["render_gates"]["mechanisms"]["scale_sweep"]
+    assert scale_meta["rejected"] == 1
+    assert scale_meta["reasons"]["regressed_or_tied"] == 1
 
 
 def test_fill_production_cache_assignment_scope_only_renders_selected_formats(
@@ -970,6 +1174,23 @@ class _TinyChain(nn.Module):
         x = self.embed(input_ids)
         x = self.l1(x)
         return self.l2(x)
+
+
+def test_archived_input_axis_levers_are_rejected():
+    for lever in ("awq", "smoothquant", "block_rotation"):
+        with pytest.raises(ValueError, match="archived"):
+            _normalized_production_cache_levers(lever)
+
+        with pytest.raises(ValueError, match="archived"):
+            fill_production_weight_cache(
+                _TinyChain(),
+                torch.tensor([[0, 1]], dtype=torch.long),
+                qnames=["l1"],
+                formats=["NVFP4"],
+                levers={"gptq": False, "scale_sweep": False, lever: True},
+                max_act_rows=8,
+                progress=False,
+            )
 
 
 def test_production_recache_measures_quantized_upstream_activation_range():

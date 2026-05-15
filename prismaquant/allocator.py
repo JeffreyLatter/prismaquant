@@ -109,6 +109,7 @@ from .allocator_candidates import (
     aggregate_fused_siblings,
     build_candidates,
     expand_fused_sibling_assignment,
+    summarize_applicability_masks,
 )
 from .allocator_prune import (
     _aggregate_candidate_memory_bits,
@@ -388,6 +389,15 @@ def main():
                     help="Output AutoRound layer_config JSON")
     ap.add_argument("--pareto-csv", required=True, help="Output Pareto CSV")
     ap.add_argument(
+        "--applicability-report",
+        default=None,
+        help=(
+            "Optional JSON sidecar for candidates masked before DP by source, "
+            "profile, divisibility, or runtime kernel-shape constraints. "
+            "Defaults to format_applicability.json beside --pareto-csv."
+        ),
+    )
+    ap.add_argument(
         "--pareto-output-dir",
         default=None,
         help=(
@@ -414,8 +424,8 @@ def main():
                     help="Knapsack bit-bin granularity in avg-bits/param "
                          "(smaller = slower; default 0.0001 → ~50000 bins). "
                          "Measured on MiniMax-M2.7: going from 0.001 to 0.0001 "
-                         "cuts predicted Δloss ~10% at the same bit budget. "
-                         "Coarser values (0.01) leave 40% on the table.")
+                         "cuts predicted Δloss ~10%% at the same bit budget. "
+                         "Coarser values (0.01) leave 40%% on the table.")
     ap.add_argument("--threads", type=int, default=0,
                     help="OMP/numpy threads for DP (0 = default)")
     ap.add_argument("--expert-granularity", choices=["layer", "expert"],
@@ -629,12 +639,28 @@ def main():
                   f"{n_bf16} bf16 (gates FP8_SOURCE/BF16 per source)",
                   flush=True)
 
+    candidate_mask_records: list[dict] = []
     candidates = build_candidates(
         stats, costs, specs_sorted, calibrated_gains,
         source_manifest=source_manifest,
         target_profile=args.target_profile,
+        mask_records=candidate_mask_records,
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
+
+    applicability_report_path = (
+        Path(args.applicability_report)
+        if args.applicability_report
+        else Path(args.pareto_csv).with_name("format_applicability.json")
+    )
+    applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
+    pre_aggregation_availability = {
+        spec.name: sum(
+            1 for per_name in candidates.values()
+            if any(c.fmt == spec.name for c in per_name)
+        )
+        for spec in specs_sorted
+    }
 
     # Joint REAP-prune + quant: ingest the observer-collected saliency
     # and expert_info from the probe pickle. Both are empty dicts for
@@ -774,6 +800,29 @@ def main():
               f"(qkv_proj / gate_up_proj / ...)")
 
     candidates = filter_candidates_for_profile(candidates, args.target_profile)
+
+    post_aggregation_availability = {
+        spec.name: sum(
+            1 for per_name in candidates.values()
+            if any(c.fmt == spec.name for c in per_name)
+        )
+        for spec in specs_sorted
+    }
+    applicability_payload = {
+        "schema": "prismaquant.format_applicability.v1",
+        "target_profile": args.target_profile,
+        "model_profile": getattr(model_profile, "name", ""),
+        "formats": [spec.name for spec in specs_sorted],
+        "probe": str(args.probe),
+        "costs": str(args.costs),
+        "pre_aggregation_candidate_availability": pre_aggregation_availability,
+        "post_aggregation_candidate_availability": post_aggregation_availability,
+        **summarize_applicability_masks(candidate_mask_records),
+    }
+    applicability_report_path.write_text(
+        json.dumps(applicability_payload, indent=2, sort_keys=True) + "\n"
+    )
+    print(f"[alloc] format applicability → {applicability_report_path}")
 
     # `candidates` is now fully aggregated (MoE, fused siblings) and
     # filtered. For the packed-3D prune sweep we clone it per ratio
