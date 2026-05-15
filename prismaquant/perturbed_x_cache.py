@@ -207,13 +207,29 @@ class _ModulePlan:
         return [p.name for p in self.params]
 
 
-def build_quantizable_map(model: nn.Module) -> dict[str, tuple[nn.Module, str]]:
+def build_quantizable_map(
+    model: nn.Module,
+    profile=None,
+) -> dict[str, tuple[nn.Module, str]]:
     """Map recipe/probe names to live module parameters."""
     out: dict[str, tuple[nn.Module, str]] = {}
     for full_name, mod, attr in iter_quantizable_tensors(model):
         names = {full_name}
         if full_name.endswith(".weight"):
             names.add(full_name[:-7])
+        if profile is not None:
+            qname = (
+                full_name[:-7]
+                if attr == "weight" and full_name.endswith(".weight")
+                else full_name
+            )
+            try:
+                recipe_name = profile.live_to_recipe_name(qname)
+            except Exception:
+                recipe_name = qname
+            names.add(recipe_name)
+            if attr == "weight":
+                names.add(f"{recipe_name}.{attr}")
         for name in list(names):
             if name.startswith("model."):
                 suffix = name[len("model."):]
@@ -226,8 +242,9 @@ def build_quantizable_map(model: nn.Module) -> dict[str, tuple[nn.Module, str]]:
 def _build_module_plans(
     model: nn.Module,
     assignment: Mapping[str, str],
+    profile=None,
 ) -> tuple[list[_ModulePlan], list[str], list[dict]]:
-    quant_map = build_quantizable_map(model)
+    quant_map = build_quantizable_map(model, profile=profile)
     by_module: dict[int, _ModulePlan] = {}
     missing: list[str] = []
     for name, fmt in assignment.items():
@@ -310,7 +327,7 @@ class PerturbedActivationCache:
         self.capture_inputs = bool(capture_inputs)
         self.subsampler = SharedRowSubsampler(input_rows, cal_hash, profile)
         self.plans, self.missing, self.skipped = _build_module_plans(
-            model, assignment
+            model, assignment, profile=profile
         )
         self._production_weight_cache = production_weight_cache
         # MED-3: per-Linear calibrated max(|activations|), unified across
