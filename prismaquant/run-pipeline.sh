@@ -129,6 +129,15 @@ PY
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
 : "${PRODUCTION_CACHE_LEVERS:=gptq,joint_scale_opt}"
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
+# PRODUCTION_CACHE_UNION=1 switches the validated-surrogate frontier path
+# from full format-menu rendering (every Linear × every quantized format)
+# to a smart-union render that only adds MXFP8 / FP8 fallback entries for
+# Linears whose NVFP4 output_mse exceeds the band thresholds. ~40-60%
+# fewer renders without sacrificing assignment coverage in practice on
+# typical bit budgets.
+: "${PRODUCTION_CACHE_UNION:=0}"
+: "${PRODUCTION_CACHE_UNION_P_MXFP8:=0.50}"
+: "${PRODUCTION_CACHE_UNION_P_FP8:=0.75}"
 : "${EXPORT_GPTQ:=auto}"
 : "${EXPORT_SCALE_SWEEP:=auto}"
 # Fisher-weighted GPTQ + Fisher output-MSE allocator are archived under
@@ -489,24 +498,44 @@ PY
     PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
     PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_frontier_raw.pkl"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
-      echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
-      python3 -m prismaquant.build_production_cache \
-        --model "$MODEL_PATH" \
-        --output "$PROD_CACHE_RAW" \
-        --formats "$CACHE_FORMATS" \
-        --dataset "$DATASET" \
-        --n-calib-samples "$NSAMPLES" \
-        --calib-seqlen "$SEQLEN" \
-        --dtype bf16 \
-        --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
-        --enable "$PRODUCTION_CACHE_LEVERS" \
-        --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
-        --cache-dir "$PROD_CACHE_DIR" \
-        --render-scope format-menu \
-        --halo-mode "$HALO_MODE" \
-        --halo-seed "$HALO_SEED" \
-        "${PROD_H_DETAIL_ARGS[@]}" \
-        2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
+      if [[ "${PRODUCTION_CACHE_UNION:-0}" == "1" ]]; then
+        # Smart-union render: only render MXFP8/FP8 fallbacks for Linears
+        # whose NVFP4 output_mse is above the threshold percentiles. Same
+        # cache layout as format-menu, just fewer entries.
+        echo "[pipeline] [4/4] building smart-union production cache for validated frontier ..."
+        python3 -m tools.build_union_cache \
+          --model "$MODEL_PATH" \
+          --cost-pkl "$COST_PATH" \
+          --input-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+          --output-cache-dir "$PROD_CACHE_DIR" \
+          --output-pkl "$PROD_CACHE_RAW" \
+          --dataset "$DATASET" \
+          --n-calib-samples "$NSAMPLES" \
+          --calib-seqlen "$SEQLEN" \
+          --levers "$PRODUCTION_CACHE_LEVERS" \
+          --p-mxfp8 "${PRODUCTION_CACHE_UNION_P_MXFP8:-0.50}" \
+          --p-fp8 "${PRODUCTION_CACHE_UNION_P_FP8:-0.75}" \
+          2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
+      else
+        echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
+        python3 -m prismaquant.build_production_cache \
+          --model "$MODEL_PATH" \
+          --output "$PROD_CACHE_RAW" \
+          --formats "$CACHE_FORMATS" \
+          --dataset "$DATASET" \
+          --n-calib-samples "$NSAMPLES" \
+          --calib-seqlen "$SEQLEN" \
+          --dtype bf16 \
+          --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+          --enable "$PRODUCTION_CACHE_LEVERS" \
+          --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+          --cache-dir "$PROD_CACHE_DIR" \
+          --render-scope format-menu \
+          --halo-mode "$HALO_MODE" \
+          --halo-seed "$HALO_SEED" \
+          "${PROD_H_DETAIL_ARGS[@]}" \
+          2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
+      fi
     else
       echo "[pipeline] [4/4] frontier production cache exists, skipping"
     fi
