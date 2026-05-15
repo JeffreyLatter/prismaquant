@@ -932,7 +932,7 @@ def _temporarily_install_act_aware(
         "awq": False,
         "gptq": bool(levers.get("gptq", True)),
         "awq_round": bool(levers.get("awq_round", False)),
-        "scale_sweep": bool(levers.get("scale_sweep", True)),
+        "scale_sweep": bool(levers.get("scale_sweep", False)),
         "static_act_order": bool(levers.get("static_act_order", False)),
         "joint_scale_opt": bool(levers.get("joint_scale_opt", False)),
     }
@@ -1731,7 +1731,7 @@ def _solve_nvfp4_activation_clip_groups(
                     ),
                 )
 
-        if bool(levers.get("scale_sweep", True)):
+        if bool(levers.get("scale_sweep", False)):
             weights = scale_sweep_nvfp4_batched(
                 weights,
                 acts_list,
@@ -2584,7 +2584,7 @@ def _render_nvfp4_progressively(
     )
     f6_enabled = requested_rule == enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE
     gptq_enabled = bool(levers.get("gptq", True))
-    scale_sweep_enabled = bool(levers.get("scale_sweep", True))
+    scale_sweep_enabled = bool(levers.get("scale_sweep", False))
     static_act_order_enabled = bool(
         gptq_enabled and levers.get("static_act_order", False)
     )
@@ -2945,7 +2945,7 @@ def render_production_weight(
         )
         if (
             fmt in {"MXFP8", "MXFP8_E4M3"}
-            and bool(levers.get("scale_sweep", True))
+            and bool(levers.get("scale_sweep", False))
             and qname in activations
         ):
             from prismaquant.export_native_compressed import (
@@ -3011,7 +3011,7 @@ def render_production_weight(
             return candidate
         if (
             fmt == "FP8_E4M3"
-            and bool(levers.get("scale_sweep", True))
+            and bool(levers.get("scale_sweep", False))
             and qname in activations
         ):
             from prismaquant.export_native_compressed import (
@@ -3165,7 +3165,7 @@ def fill_production_weight_cache(
         bool(levers.get("gptq", True))
         and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
     )
-    levers.setdefault("scale_sweep", True)
+    levers.setdefault("scale_sweep", False)
     _reject_archived_input_axis_levers(levers)
     levers.setdefault("awq_round", False)
     levers.setdefault(
@@ -3226,7 +3226,7 @@ def fill_production_weight_cache(
         enabled_mechanisms.append("joint_scale_opt")
     if bool(levers.get("fisher_gptq", False)):
         enabled_mechanisms.append("fisher_gptq")
-    if bool(levers.get("scale_sweep", True)):
+    if bool(levers.get("scale_sweep", False)):
         enabled_mechanisms.append("scale_sweep")
     mechanism_plan = resolve_render_mechanism_order(enabled_mechanisms)
     if mechanism_plan.errors:
@@ -3317,7 +3317,7 @@ def fill_production_weight_cache(
     }
     render_base_fmt_set = {_render_base_format(fmt) for fmt in fmt_set}
     activation_aware_formats = {"NVFP4", PRISMACLIP_FORMAT}
-    if bool(levers.get("scale_sweep", True)):
+    if bool(levers.get("scale_sweep", False)):
         activation_aware_formats.update({"MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
     qnames_to_render: set[str] = set(qname_set)
     missing_formats_by_qname: dict[str, set[str]] = {
