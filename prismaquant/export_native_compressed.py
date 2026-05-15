@@ -1455,6 +1455,7 @@ def _gptq_obs_rounding_nvfp4_swept(
     fisher_row_weights: torch.Tensor | None = None,
     static_act_order: bool = False,
     joint_scale_opt: bool = False,
+    linear_name: str | None = None,
 ) -> torch.Tensor:
     """Per-Linear GPTQ damping sweep.
 
@@ -1487,8 +1488,27 @@ def _gptq_obs_rounding_nvfp4_swept(
     )
     H_full = X.t() @ X  # [in, in], shared evaluator
 
+    # Optional research instrumentation (#46-followup): log per-Linear
+    # H spectrum + per-damp errors so we can fit an analytical damp
+    # picker. Env-gated; cost is one eigvalsh per Linear (~O(n^3)
+    # where n=in_features; tens of ms on 4k×4k).
+    log_path = os.environ.get("PRISMAQUANT_DAMP_SWEEP_LOG")
+    if log_path:
+        try:
+            eigvals = torch.linalg.eigvalsh(H_full.to(torch.float64)).to(torch.float32)
+            lambda_max = float(eigvals[-1].item())
+            positive = eigvals[eigvals > 1e-30]
+            lambda_min = float(positive.min().item()) if positive.numel() > 0 else 0.0
+            mean_diag = float(torch.diagonal(H_full).mean().item())
+        except Exception:
+            lambda_max = float("nan")
+            lambda_min = float("nan")
+            mean_diag = float("nan")
+
     best_w = None
     best_err = float("inf")
+    best_damp: float | None = None
+    per_damp_err: dict[float, float] = {}
     for damp in damp_candidates:
         try:
             w_q = _gptq_obs_rounding_nvfp4(
@@ -1501,14 +1521,34 @@ def _gptq_obs_rounding_nvfp4_swept(
                 joint_scale_opt=joint_scale_opt,
             )
         except Exception:
+            per_damp_err[damp] = float("inf")
             continue
         # Hessian-weighted reconstruction error (no damp injected here —
         # we want raw H for fair comparison across candidates).
         diff = W_orig - w_q.to(torch.float32)
         err = float(torch.einsum("oi,ij,oj->", diff, H_full, diff))
+        per_damp_err[damp] = err
         if err < best_err:
             best_err = err
             best_w = w_q
+            best_damp = damp
+    if log_path:
+        import json as _json
+        entry = {
+            "linear_name": linear_name,
+            "shape": list(weight.shape),
+            "lambda_max": lambda_max,
+            "lambda_min": lambda_min,
+            "mean_diag": mean_diag,
+            "best_damp": best_damp,
+            "best_err": best_err if best_err != float("inf") else None,
+            "per_damp_err": {f"{k:.4g}": v for k, v in per_damp_err.items()},
+        }
+        try:
+            with open(log_path, "a") as f:
+                f.write(_json.dumps(entry) + "\n")
+        except Exception:
+            pass
     if best_w is None:
         return _rtn_dequant_nvfp4(
             W_orig,
@@ -2713,6 +2753,7 @@ def _quantize_2d(
                         fisher_row_weights=fisher_row_weights,
                         static_act_order=static_act_order_enabled,
                         joint_scale_opt=joint_scale_opt_enabled,
+                        linear_name=linear_name,
                     )
                 else:
                     w_work = _gptq_obs_rounding_nvfp4(
