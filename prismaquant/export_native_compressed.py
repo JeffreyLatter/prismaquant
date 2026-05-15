@@ -910,6 +910,11 @@ def _coerce_runtime_legal_assignment(
         fmt_canonical = _canonical_export_format(fmt)
         if fmt_canonical == "BF16":
             continue
+        if fmt_canonical not in FORMAT_SCHEME:
+            shape = _source_weight_shape_for_recipe(src_model, qname, profile)
+            out[qname] = "BF16"
+            coerced.append((qname, shape or [], fmt_canonical))
+            continue
         shape = _source_weight_shape_for_recipe(src_model, qname, profile)
         if shape is None or len(shape) != 2:
             continue
@@ -2279,8 +2284,26 @@ def _fused_dense_group(name: str) -> tuple[str, tuple[str, ...]] | None:
     return None
 
 
+def _fused_group_key_for_name(name: str, profile=None) -> str | None:
+    group_fn = getattr(profile, "fused_sibling_group", None)
+    if callable(group_fn):
+        try:
+            group = group_fn(name)
+        except Exception:
+            group = None
+        if group:
+            return str(group)
+    fallback = _fused_dense_group(name)
+    if fallback is None:
+        return None
+    prefix, members = fallback
+    return f"{prefix}::__fused__:{','.join(members)}"
+
+
 def _unify_input_global_scales_across_fused_siblings(
     scales: dict[str, float],
+    *,
+    profile=None,
 ) -> dict[str, float]:
     """Post-process per-Linear input_global_scale values so fused-
     sibling groups share one scale.
@@ -2300,9 +2323,9 @@ def _unify_input_global_scales_across_fused_siblings(
     Siblings that weren't NVFP4-assigned pass through unchanged.
     """
     # Bucket siblings by fused group.
-    groups: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+    groups: dict[str, list[str]] = {}
     for name in scales:
-        g = _fused_dense_group(name)
+        g = _fused_group_key_for_name(name, profile)
         if g is None:
             continue
         groups.setdefault(g, []).append(name)
@@ -2338,7 +2361,10 @@ def _unify_input_global_scales_across_fused_siblings(
 
 
 def _compute_nvfp4_joint_global(
-    model: nn.Module, assignment: dict[str, str],
+    model: nn.Module,
+    assignment: dict[str, str],
+    *,
+    profile=None,
 ) -> dict[str, torch.Tensor]:
     """Pre-pass over the model: for each fused-sibling group whose
     members are all assigned to NVFP4, compute the joint global_real
@@ -2346,19 +2372,27 @@ def _compute_nvfp4_joint_global(
     to the shared global_real tensor."""
     # Bucket siblings by (parent_prefix, kind). Missing siblings are
     # OK — vLLM's loader handles partial fusion fine.
-    groups: dict[tuple[str, tuple[str, ...]], list[tuple[str, nn.Linear]]] = {}
+    groups: dict[str, list[tuple[str, nn.Linear]]] = {}
     for qname, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
-        if _canonical_export_format(assignment.get(qname, "BF16")) != "NVFP4":
+        live_to_recipe = getattr(profile, "live_to_recipe_name", None)
+        if callable(live_to_recipe):
+            try:
+                recipe_qname = live_to_recipe(qname)
+            except Exception:
+                recipe_qname = qname
+        else:
+            recipe_qname = qname
+        if _canonical_export_format(assignment.get(recipe_qname, "BF16")) != "NVFP4":
             continue
-        g = _fused_dense_group(qname)
+        g = _fused_group_key_for_name(recipe_qname, profile)
         if g is None:
             continue
-        groups.setdefault(g, []).append((qname, mod))
+        groups.setdefault(g, []).append((recipe_qname, mod))
 
     out: dict[str, torch.Tensor] = {}
-    for (_pre, _members), siblings in groups.items():
+    for _group_key, siblings in groups.items():
         # Need every sibling to also be NVFP4 — otherwise vLLM allocates
         # the fused tensor under a different scheme and our joint scale
         # wouldn't apply consistently. The allocator's promote_fused
@@ -3012,31 +3046,6 @@ def _export_vector_chunk_len(
 # materializer below). The whole-model variant `_compute_nvfp4_joint_global`
 # lives above and is kept for the MTP path + unit tests.
 # ---------------------------------------------------------------------------
-_FUSED_SIBLINGS = {
-    "q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv",
-    "gate_proj": "gate_up", "up_proj": "gate_up",
-    # MiniMax M2 MoE expert MLP uses `w1` (gate-equivalent) +
-    # `w3` (up-equivalent) + `w2` (down-equivalent). vLLM's
-    # NVFP4 MoE kernel fuses w1+w3 into a single packed weight at
-    # load time and expects ONE shared `weight_global_scale`. The
-    # original Qwen-style `gate_proj`/`up_proj` entries above don't
-    # match MiniMax's naming; without these `w1`/`w3` entries every
-    # expert ends up with mismatched per-Linear globals and vLLM
-    # warns about reduced accuracy. `w2` has no sibling (it's the
-    # down-projection, not part of a gate/up pair) and is excluded.
-    "w1": "gate_up", "w3": "gate_up",
-    # Qwen3.5/3.6 DeltaNet linear-attention pairs. vLLM fuses
-    # `in_proj_qkv + in_proj_z → in_proj_qkvz` and
-    # `in_proj_b + in_proj_a → in_proj_ba` at load time; the fused
-    # packed Linear needs ONE shared NVFP4 `weight_global_scale`.
-    # Omitting these triggers vLLM's
-    # `compressed_tensors_w4a4_nvfp4.py:97` warning about reduced
-    # accuracy from mismatched parallel-layer scales.
-    "in_proj_qkv": "qkvz", "in_proj_z": "qkvz",
-    "in_proj_b": "ba", "in_proj_a": "ba",
-}
-
-
 def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
                                layer_qname: str,
                                assignment: dict[str, str],
@@ -3048,23 +3057,24 @@ def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
 
     Semantically equivalent to a scoped `_compute_nvfp4_joint_global`
     across just this layer's modules."""
-    groups: dict[tuple[str, str], list[tuple[str, nn.Linear]]] = defaultdict(list)
+    groups: dict[str, list[tuple[str, str, nn.Linear]]] = defaultdict(list)
     for sub_name, mod in layer_mod.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
-        last = sub_name.rsplit(".", 1)[-1]
-        fam = _FUSED_SIBLINGS.get(last)
-        if fam is None:
+        full = f"{layer_qname}.{sub_name}" if sub_name else layer_qname
+        try:
+            recipe_key = profile.live_to_recipe_name(full)
+        except Exception:
+            recipe_key = full
+        group_key = _fused_group_key_for_name(recipe_key, profile)
+        if group_key is None:
             continue
-        parent = sub_name.rsplit(".", 1)[0] if "." in sub_name else ""
-        groups[(parent, fam)].append((sub_name, mod))
+        groups[group_key].append((full, recipe_key, mod))
 
     out: dict[str, torch.Tensor] = {}
-    for (_, _), members in groups.items():
+    for _group_key, members in groups.items():
         fqn_fmt = []
-        for sub_name, mod in members:
-            full = f"{layer_qname}.{sub_name}" if sub_name else layer_qname
-            recipe_key = profile.live_to_recipe_name(full)
+        for full, recipe_key, mod in members:
             fmt = assignment.get(recipe_key)
             fqn_fmt.append((full, recipe_key, fmt, mod))
         fmts = {_canonical_export_format(f) for _, _, f, _ in fqn_fmt}
@@ -4220,7 +4230,11 @@ def _materialize_tensors_inmemory(
 
     # Pre-pass: joint NVFP4 global_scale per fused-sibling group so
     # q/k/v (or gate/up, etc.) share one weight_global_scale slot.
-    nvfp4_joint_global = _compute_nvfp4_joint_global(model, assignment)
+    nvfp4_joint_global = _compute_nvfp4_joint_global(
+        model,
+        assignment,
+        profile=profile,
+    )
 
     for qname, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
@@ -4556,6 +4570,59 @@ FORMAT_SCHEME = {
 }
 
 
+def _fused_modules_mapping_for_profile(profile) -> dict[str, tuple[str, ...]]:
+    """Return fused-module leaf mapping for target emission.
+
+    Prefer vLLM's runtime mapping when available, then fall back to the
+    profile's declarative model-structure spec. The returned shape mirrors
+    vLLM's ``packed_modules_mapping``: ``{"qkv_proj": ("q_proj", ...)}``.
+    """
+
+    try:
+        from .model_profiles.vllm_registry import (
+            packed_modules_mapping_from_class,
+            vllm_class_for_architecture,
+        )
+        vllm_cls = vllm_class_for_architecture(
+            profile.vllm_architecture_class() or ""
+        )
+        packed_mapping = packed_modules_mapping_from_class(vllm_cls)
+        if packed_mapping:
+            return {
+                str(fused): tuple(str(sibling) for sibling in siblings)
+                for fused, siblings in packed_mapping.items()
+            }
+    except Exception:
+        pass
+
+    spec_getter = getattr(profile, "structure_spec", None)
+    spec = spec_getter() if callable(spec_getter) else None
+    if spec is None:
+        return {}
+
+    mapping: dict[str, tuple[str, ...]] = {}
+    for group in getattr(spec, "fused_groups", ()):
+        target_parent, target_leaf = _suffix_parent_leaf(group.target_suffix)
+        member_leafs: list[str] = []
+        valid = True
+        for member in group.member_suffixes:
+            member_parent, member_leaf = _suffix_parent_leaf(member)
+            if target_parent and member_parent and member_parent != target_parent:
+                valid = False
+                break
+            member_leafs.append(member_leaf)
+        if valid and len(member_leafs) > 1:
+            mapping[target_leaf] = tuple(member_leafs)
+    return mapping
+
+
+def _suffix_parent_leaf(suffix: str) -> tuple[str, str]:
+    if "." not in suffix:
+        return "", str(suffix)
+    parent, leaf = str(suffix).rsplit(".", 1)
+    return parent, leaf
+
+
 def build_quantization_config(
     assignment: dict[str, str],
     bf16_passthrough: set[str],
@@ -4578,9 +4645,6 @@ def build_quantization_config(
     names, no catch-all regexes) when omitted.
     """
     from .model_profiles import DefaultProfile
-    from .model_profiles.vllm_registry import (
-        vllm_class_for_architecture, packed_modules_mapping_from_class,
-    )
     profile = profile or DefaultProfile()
 
     by_fmt: dict[str, list[str]] = {}
@@ -4608,18 +4672,17 @@ def build_quantization_config(
             continue
         by_fmt.setdefault(fmt, []).append(vllm_name)
 
-    # Fill in fused-sibling members that exist in the live vLLM
-    # model but weren't in the probe assignment — e.g. Gemma 4's
+    # Fill in fused-sibling members that exist in the serving model
+    # but weren't in the probe assignment — e.g. Gemma 4's
     # full_attention layers have no v_proj on disk, so the probe
     # never saw it, but vLLM's QKVParallelLinear still instantiates
     # a v_proj sub-module that gets k_proj's weights at load. Scheme
     # dispatch requires all fused siblings to have consistent
     # scheme. We infer missing siblings by walking the assignment for
     # fused groups that landed in `ignore` and filling in every
-    # sibling from vLLM's `packed_modules_mapping` — including ones
-    # we never saw weights for.
-    vllm_cls = vllm_class_for_architecture(profile.vllm_architecture_class() or "")
-    packed_mapping = packed_modules_mapping_from_class(vllm_cls)
+    # sibling from vLLM's `packed_modules_mapping` or the declarative
+    # model-structure spec — including ones we never saw weights for.
+    packed_mapping = _fused_modules_mapping_for_profile(profile)
     if packed_mapping:
         # Reverse map: sibling-leaf-name -> fused-name (e.g.
         # q_proj -> qkv_proj).
@@ -5203,7 +5266,10 @@ def main():
             # max/6 values can drift by a float-precision tick. Take
             # the max over the group so vLLM runs on the conservative
             # (larger) scale for every sibling.
-            scales = _unify_input_global_scales_across_fused_siblings(scales)
+            scales = _unify_input_global_scales_across_fused_siblings(
+                scales,
+                profile=profile,
+            )
             _INPUT_GLOBAL_SCALES = scales
             if act_passes_any:
                 _CACHED_ACTIVATIONS = _LazyActivationCache(idx)

@@ -15,6 +15,11 @@ This refactor separates four concerns that were previously easy to couple:
    allocator asks `serving_profiles.py`; it should not branch on a hardcoded
    vLLM profile id.
 
+   Layer-config parsing is runtime-neutral. Research formats such as
+   `MXFP8_E5M2` and `FP8_E5M2` may be parsed and carried through the research
+   stack; production legality is enforced later by the selected serving
+   profile and exporter runtime-coercion gate.
+
 3. **Pipeline artifacts and gates** live in `prismaquant/pipeline.py`.
    `PipelineSpec` describes stages, typed artifacts, metric gates, and cache
    ownership. The current production flow is exposed by

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from prismaquant import format_registry as fr
 from prismaquant.allocator import (
     apply_mtp_format_override,
@@ -123,11 +121,22 @@ def test_export_canonicalizes_and_configures_dense_fp8_e4m3():
     assert FORMAT_SCHEME["FP8_E4M3"]["input_activations"]["strategy"] == "token"
 
 
-def test_export_rejects_e5m2_until_vllm_weight_dispatch_is_validated():
-    with pytest.raises(ValueError, match="E5M2"):
-        canonicalize_format("FP8_E5M2")
-    with pytest.raises(ValueError, match="E5M2"):
+def test_e5m2_is_parsed_then_gated_by_serving_profile():
+    assert canonicalize_format("FP8_E5M2") == "FP8_E5M2"
+    assert (
         canonicalize_format(fr.get_format("MXFP8_E5M2").autoround_config())
+        == "MXFP8_E5M2"
+    )
+    assert "FP8_E5M2" not in FORMAT_SCHEME
+    verdict = check_format_applicability(
+        (128, 128),
+        "FP8_E5M2",
+        qname="model.layers.0.self_attn.o_proj",
+        target_profile=VLLM_PROFILE,
+    )
+    assert not verdict.legal
+    assert verdict.reason == "profile_mismatch"
+    assert "not enabled for dense Linears" in verdict.detail
 
 
 def test_mtp_format_override_keeps_body_assignment_intact():

@@ -647,6 +647,46 @@ class TestBuildQuantizationConfig(unittest.TestCase):
                                     "do not use a 'Linear' class-name catch-all; "
                                     "it short-circuits fused-layer match")
 
+    def test_fused_targets_are_emitted_from_structure_spec(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.mlp.gate_proj": "NVFP4",
+            "model.layers.0.mlp.up_proj": "NVFP4",
+        }
+        qc = build_quantization_config(
+            assignment, bf16_passthrough=set(), profile=profile,
+        )
+        targets = {
+            target
+            for group in qc["config_groups"].values()
+            for target in group["targets"]
+        }
+
+        self.assertIn(
+            "re:^language_model[.]model[.]layers[.]0[.]mlp[.]gate_up_proj$",
+            targets,
+        )
+
+    def test_missing_bf16_fused_siblings_are_ignored_from_structure_spec(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "BF16",
+            "model.layers.0.self_attn.k_proj": "BF16",
+            "model.layers.0.mlp.down_proj": "NVFP4",
+        }
+        qc = build_quantization_config(
+            assignment, bf16_passthrough=set(), profile=profile,
+        )
+
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.v_proj",
+            qc["ignore"],
+        )
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.qkv_proj",
+            qc["ignore"],
+        )
+
 
 class TestQuantize2DDispatch(unittest.TestCase):
     def test_nvfp4_emits_input_global_scale(self):
@@ -867,6 +907,70 @@ class TestFusedSiblingJointGlobalScale(unittest.TestCase):
             m.model.layers[0].self_attn.k_proj.weight.float()).item()
         self.assertAlmostEqual(joint_value, natural, places=5)
 
+    def test_profile_fused_group_drives_joint_global_without_baked_pattern(self):
+        from prismaquant.export_native_compressed import _compute_nvfp4_joint_global
+
+        class TinyBlock(torch.nn.Module):
+            def __init__(s):
+                super().__init__()
+                s.a_proj = torch.nn.Linear(32, 32, bias=False)
+                s.b_proj = torch.nn.Linear(32, 32, bias=False)
+
+        class TinyModel(torch.nn.Module):
+            def __init__(s):
+                super().__init__()
+                s.model = torch.nn.Module()
+                s.model.layers = torch.nn.ModuleList([TinyBlock()])
+
+        class CustomProfile:
+            def fused_sibling_group(self, qname: str) -> str | None:
+                if qname.endswith(".a_proj") or qname.endswith(".b_proj"):
+                    return qname.rsplit(".", 1)[0] + ".ab_proj"
+                return None
+
+        torch.manual_seed(0)
+        m = TinyModel()
+        with torch.no_grad():
+            m.model.layers[0].b_proj.weight.mul_(10.0)
+        assignment = {
+            "model.layers.0.a_proj": "NVFP4",
+            "model.layers.0.b_proj": "NVFP4",
+        }
+
+        joint = _compute_nvfp4_joint_global(
+            m,
+            assignment,
+            profile=CustomProfile(),
+        )
+
+        self.assertEqual(set(joint), set(assignment))
+        self.assertEqual(
+            joint["model.layers.0.a_proj"].item(),
+            joint["model.layers.0.b_proj"].item(),
+        )
+
+    def test_profile_fused_group_drives_input_scale_unification(self):
+        from prismaquant.export_native_compressed import (
+            _unify_input_global_scales_across_fused_siblings,
+        )
+
+        class CustomProfile:
+            def fused_sibling_group(self, qname: str) -> str | None:
+                if qname.endswith(".a_proj") or qname.endswith(".b_proj"):
+                    return qname.rsplit(".", 1)[0] + ".ab_proj"
+                return None
+
+        out = _unify_input_global_scales_across_fused_siblings(
+            {
+                "model.layers.0.a_proj": 0.50,
+                "model.layers.0.b_proj": 0.25,
+            },
+            profile=CustomProfile(),
+        )
+
+        self.assertEqual(out["model.layers.0.a_proj"], 0.25)
+        self.assertEqual(out["model.layers.0.b_proj"], 0.25)
+
 
 class TestPackedExpertSplit(unittest.TestCase):
     def test_quantize_3d_packed_nvfp4_returns_per_expert_dim(self):
@@ -1031,6 +1135,37 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
         self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "BF16")
         self.assertEqual(coerced, [
             ("model.layers.0.self_attn.o_proj", [128, 5120], "MXFP4")
+        ])
+
+    def test_coerces_parsed_research_format_without_export_scheme_to_bf16(self):
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard = td / "model-00001-of-00001.safetensors"
+            save_file({
+                "model.language_model.layers.0.self_attn.o_proj.weight": (
+                    torch.zeros(128, 5120, dtype=torch.bfloat16)
+                ),
+            }, str(shard))
+            with open(td / "model.safetensors.index.json", "w") as f:
+                json.dump({
+                    "weight_map": {
+                        "model.language_model.layers.0.self_attn.o_proj.weight": (
+                            shard.name
+                        ),
+                    }
+                }, f)
+
+            assignment, coerced = _coerce_runtime_legal_assignment(
+                str(td),
+                {"model.layers.0.self_attn.o_proj": "FP8_E5M2"},
+                Qwen3_5Profile(),
+            )
+
+        self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "BF16")
+        self.assertEqual(coerced, [
+            ("model.layers.0.self_attn.o_proj", [128, 5120], "FP8_E5M2")
         ])
 
     def test_bf16_audit_classifies_allocator_bf16_candidates(self):
