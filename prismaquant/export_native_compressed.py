@@ -852,7 +852,7 @@ def _coerce_runtime_legal_assignment(
 
 def _allocator_target_profile_for_audit(profile) -> str | None:
     name = str(getattr(profile, "name", "") or "")
-    if name in {"qwen3_5", "qwen3_5_dense", "qwen3"}:
+    if name in {"qwen3_5", "qwen3_5_dense", "qwen3", "qwen3_next"}:
         return "vllm_qwen3_5_packed_moe"
     return None
 
@@ -5995,8 +5995,29 @@ def main():
         _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
             1, int(args.production_cache_prefetch_workers)
         )
+        # Filter the assignment to only qnames the cache was built to cover.
+        # Packed MoE expert layers (3D tensors) are quantized directly by the
+        # export and never stored in the production weight cache; checking them
+        # here produces false-positive misses.
+        #
+        # Preferred: "eligible_qnames" in cache metadata lists exactly which
+        # qnames were rendered (set by fill_production_weight_cache).
+        # Fallback for older caches: infer from the cache's own weight keys.
+        # In both cases BF16 entries are already skipped by the inner loop.
+        _cache_meta = dict(getattr(production_cache, "metadata", {}) or {})
+        _cache_eligible = _cache_meta.get("eligible_qnames")
+        if _cache_eligible is None:
+            _cache_eligible = {
+                q for q, _ in (getattr(production_cache, "weights", {}) or {})
+            }
+        _assignment_to_check = (
+            {q: fmt for q, fmt in _assignment_for_cache.items()
+             if q in _cache_eligible}
+            if _cache_eligible
+            else _assignment_for_cache
+        )
         expected_keys, missing_keys = _production_cache_expected_keys(
-            _assignment_for_cache
+            _assignment_to_check
         )
         if missing_keys:
             raise RuntimeError(

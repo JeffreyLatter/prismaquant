@@ -37,9 +37,11 @@ from .qwen3_5_dense import Qwen3_5DenseProfile
 # allocator Pareto runs without uprooting the archive commit.
 from .minimax_m2 import MiniMaxM2Profile
 from .deepseek_v4 import DeepseekV4Profile
+from .qwen3_next import Qwen3NextProfile
 
 
 _REGISTERED: list[type[ModelProfile]] = [
+    Qwen3NextProfile,     # before Qwen3_5/Qwen3 — distinct model_type "qwen3_next"
     Qwen3_5DenseProfile,  # must precede Qwen3_5Profile (dense is a subset)
     Qwen3_5Profile,
     Qwen3Profile,  # original Qwen3 (dense, no MoE, no MTP) — after the 3.5 siblings

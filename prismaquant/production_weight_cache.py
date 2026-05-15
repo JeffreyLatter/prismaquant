@@ -3684,6 +3684,7 @@ def fill_production_weight_cache(
             "render_scope": render_scope,
             "requested_formats": list(requested_formats),
             "requested_entries": int(n),
+            "eligible_qnames": sorted(qname_set),
         },
         awq_scales=awq_scales or None,
     )
@@ -3693,7 +3694,8 @@ def fill_production_weight_cache(
         if progress:
             print("[prod-cache] running production activation re-cache", flush=True)
         cache.prefetch_assignment(
-            recache_assignment or {},
+            {q: fmt for q, fmt in (recache_assignment or {}).items()
+             if q in eligible_qnames},
             max_resident_bytes=(
                 cache._lru_max_bytes if cache._lru_max_bytes > 0 else None
             ),

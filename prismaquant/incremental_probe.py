@@ -1164,18 +1164,15 @@ def _compute_global_precompute(
         if L % 8 == 0 or L == num_layers - 1:
             print(f"[incremental/global] fwd L{L:02d}  src={src}  "
                   f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
-    # v22 Fix E1: batched device→host transfer for the activations
-    # captured during phase-1. All have the same (B, T, H) shape so we
-    # stack into one (L+1, B, T, H) tensor and do a single .cpu() —
-    # 62 individual transfers collapsed into one. After the copy lands,
-    # we split back into a list of CPU tensors so the rest of the code
-    # (precompute cache pickle, phase-3 reads) sees the original layout.
+    # Transfer device activations to CPU one at a time.  The previous
+    # torch.stack(...).cpu() + [stacked[i].clone()] pattern created three
+    # simultaneous copies of all layer activations (stack temp + stacked_host +
+    # clone outputs = 3×20 GB = 60 GB on 27B), leaving only ~0.4 GB margin
+    # on 121 GB UMA and causing OOM kills.  Per-element .cpu() peaks at 2×
+    # (device_acts still alive + host copy building) = 40 GB total.
     t_h2h = time.time()
-    stacked = torch.stack(device_acts, dim=0).cpu()
-    activations_cpu: list[torch.Tensor] = [
-        stacked[i].clone() for i in range(stacked.size(0))
-    ]
-    del device_acts, stacked
+    activations_cpu: list[torch.Tensor] = [t.cpu() for t in device_acts]
+    del device_acts
     print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
           f"(host transfer {time.time()-t_h2h:.1f}s)  "
           f"{ctx.layer_cache.summary()}", flush=True)

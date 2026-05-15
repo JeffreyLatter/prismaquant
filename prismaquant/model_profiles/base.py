@@ -124,6 +124,30 @@ class ModelProfile(ABC):
             "gate_proj", "up_proj",        # some HF layouts
         })
 
+    def pack_checkpoint_expert_tensors(
+        self, layer_prefix: str, tensors: dict
+    ) -> dict:
+        """Pack per-expert checkpoint tensors into 3D form.
+
+        Called by the streaming loader after reading raw tensors for a
+        layer. The default is a no-op. Architectures that store experts
+        as individual 2D tensors on disk but load them as a single 3D-
+        packed ``nn.Parameter`` in the HF model (e.g. Qwen3-Coder-Next)
+        override this to perform the packing so ``_fast_install`` finds
+        the packed keys in the install resolver.
+
+        Args:
+            layer_prefix: the current layer prefix including trailing
+                dot, e.g. ``"model.layers.0."``.
+            tensors: dict mapping model name → tensor as returned by
+                ``_read_layer_to_device``.
+
+        Returns:
+            A (possibly new) dict with per-expert tensors replaced by
+            their 3D-packed equivalents.
+        """
+        return tensors
+
     def per_expert_moe_regex(self) -> str | None:
         """Regex matching vLLM's per-expert Linear qnames at scheme
         dispatch time. Added to the config_groups catch-all so every

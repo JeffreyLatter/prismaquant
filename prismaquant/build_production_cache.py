@@ -355,9 +355,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky
         # failures, and any other silent gaps that would otherwise fall
         # through to RTN at hook time.
+        #
+        # Packed MoE experts (3D tensors) are intentionally excluded from the
+        # production weight cache — the export pipeline quantizes them directly
+        # via _quantize_2d without reading the cache.  Filter the assignment
+        # to only the eligible_qnames (nn.Linear modules) before checking
+        # coverage so expert qnames don't produce false-positive misses.
         try:
             if render_assignment is not None:
-                _, missing = cache.assignment_keys(render_assignment)
+                eligible_set = set(qnames)
+                cacheable_assignment = {
+                    q: fmt for q, fmt in render_assignment.items()
+                    if q in eligible_set
+                }
+                n_skipped_experts = len(render_assignment) - len(cacheable_assignment)
+                if n_skipped_experts:
+                    print(
+                        f"[build-prod-cache] coverage check: skipping "
+                        f"{n_skipped_experts} packed-expert assignment entries "
+                        f"(export handles them directly, not via cache)",
+                        flush=True,
+                    )
+                _, missing = cache.assignment_keys(cacheable_assignment)
                 failed = list((cache.failed or {}).keys())
                 if missing or failed:
                     samples = missing[:5] + failed[:5]

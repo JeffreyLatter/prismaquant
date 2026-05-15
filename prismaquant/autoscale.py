@@ -210,14 +210,21 @@ def pick_cache_headroom_gb(
     layers_per_shard: int = 1,
     nsamples: int = 32,
     seqlen: int = 1024,
+    fixed_overhead_gb: float = DEFAULT_FIXED_OVERHEAD_GB,
+    dtype_bytes: int = DEFAULT_DTYPE_BYTES,
     default: float = 75.0,
 ) -> tuple[float, dict]:
     """Pick `cache_headroom_gb` so the layer cache gets (available - headroom)
     bytes for fitting decoder layers. Returns `(headroom_gb, diagnostics)`.
 
-    The probe's active working set dominates the headroom: safety margin
-    + gradients/activations for `layers_per_shard` layers. Anything
-    leftover goes to the streaming cache.
+    Headroom is the max of two non-overlapping phases:
+
+    - Phase-1 forward pass: device_acts list (all layer outputs on device,
+      (n_layers+1) tensors) plus the simultaneous host copy being built by
+      [t.cpu() for t in device_acts].  On UMA both draw from the same pool.
+    - Shard phase (backward sweeps): shard_working + full_graph_act overhead.
+
+    The binding constraint (larger headroom) wins.
     """
     cfg_path = Path(model_path) / "config.json"
     if not cfg_path.exists():
@@ -233,13 +240,29 @@ def pick_cache_headroom_gb(
         model_path, n_layers, hidden, nsamples, seqlen,
     )
     shard_working_bytes = layers_per_shard * per_layer_active
-    headroom_bytes = shard_working_bytes + int(safety_gb * 1024 ** 3)
+
+    # Phase-1 peak: device_acts (accumulates all layer outputs on device)
+    # + host copy being built simultaneously in [t.cpu() for t in device_acts].
+    # Factor of 2 captures both sides alive at the same time.
+    phase1_single = (n_layers + 1) * nsamples * seqlen * hidden * dtype_bytes
+    phase1_peak_bytes = 2 * phase1_single
+
+    fixed_bytes = int(fixed_overhead_gb * 1024 ** 3)
+    safety_bytes = int(safety_gb * 1024 ** 3)
+
+    shard_headroom = shard_working_bytes + fixed_bytes + safety_bytes
+    phase1_headroom = phase1_peak_bytes + fixed_bytes + safety_bytes
+    headroom_bytes = max(shard_headroom, phase1_headroom)
     headroom_gb = headroom_bytes / 1024 ** 3
     return headroom_gb, {
         "headroom_gb": headroom_gb,
         "shard_working_gb": shard_working_bytes / 1024 ** 3,
+        "phase1_device_acts_gb": phase1_single / 1024 ** 3,
+        "phase1_peak_gb": phase1_peak_bytes / 1024 ** 3,
+        "fixed_overhead_gb": fixed_overhead_gb,
         "safety_gb": safety_gb,
         "layers_per_shard": layers_per_shard,
+        "binding_constraint": "phase1" if phase1_headroom >= shard_headroom else "shard",
     }
 
 

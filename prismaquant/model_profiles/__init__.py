@@ -5,6 +5,7 @@ Exports:
   - DefaultProfile: generic fallback
   - Qwen3Profile: covers Qwen3 dense (0.6B-32B)
   - Qwen3_5Profile: covers Qwen3.5 and Qwen3.6 MoE (w/ MTP)
+  - Qwen3NextProfile: covers Qwen3-Coder-Next (hybrid DeltaNet + sparse MoE)
   - Gemma4Profile: covers Gemma 4 dense + MoE multimodal
   - detect_profile(model_path): auto-detect profile from HF config
   - register_profile(cls): register a custom profile at runtime
@@ -18,6 +19,7 @@ from .gemma4 import Gemma4Profile
 from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
 from .qwen3_5_dense import Qwen3_5DenseProfile
+from .qwen3_next import Qwen3NextProfile
 from .registry import (
     detect_profile,
     profile_from_config,
@@ -32,6 +34,7 @@ __all__ = [
     "Qwen3Profile",
     "Qwen3_5Profile",
     "Qwen3_5DenseProfile",
+    "Qwen3NextProfile",
     "Gemma4Profile",
     "detect_profile",
     "profile_from_config",
