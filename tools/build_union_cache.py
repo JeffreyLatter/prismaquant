@@ -131,8 +131,18 @@ def main(argv=None) -> int:
     print(f"[union] cost.pkl: {len(costs)} entries", flush=True)
 
     base = _load_layer_config(Path(args.input_layer_config))
-    nvfp4_eligible = [qn for qn, e in base.items() if _is_nvfp4(e)]
-    print(f"[union] NVFP4-eligible from input layer_config: {len(nvfp4_eligible)}", flush=True)
+    # NVFP4-eligible = every Linear that cost.pkl has an NVFP4 measurement
+    # for. This is the SUPERSET — covers every Pareto target's assignment.
+    # The input_layer_config is used only for per-Linear metadata (act_*,
+    # passthrough overrides).
+    cost_quantizable = {qn for qn in costs
+                        if _get_output_mse(costs[qn], "NVFP4") is not None}
+    base_nvfp4_set = {qn for qn, e in base.items() if _is_nvfp4(e)}
+    # Union: anything cost.pkl can quantize OR anything the input config flags as NVFP4
+    nvfp4_eligible = sorted(cost_quantizable | base_nvfp4_set)
+    print(f"[union] NVFP4-eligible from cost.pkl ∪ input layer_config: {len(nvfp4_eligible)} "
+          f"(cost-quantizable={len(cost_quantizable)}, input-cfg-nvfp4={len(base_nvfp4_set)})",
+          flush=True)
 
     # ---- Decide thresholds + per-Linear render plan ----
     per_linear: dict[str, dict] = {}
