@@ -1962,6 +1962,12 @@ def fill_production_weight_cache(
     # silently runs with degraded accuracy.
     joint_globals: dict[str, torch.Tensor] = {}
     profile = None
+    try:
+        from prismaquant.model_profiles import detect_profile
+        model_path = getattr(model, "name_or_path", "")
+        profile = detect_profile(model_path) if model_path else None
+    except Exception:
+        profile = None
     needs_nvfp4_render = any(
         any(_render_base_format(fmt) == "NVFP4" for fmt in missing)
         for missing in missing_formats_by_qname.values()
@@ -1971,7 +1977,11 @@ def fill_production_weight_cache(
             _compute_nvfp4_joint_global,
         )
         synthetic_assignment = {q: "NVFP4" for q in qname_to_module}
-        joint_globals = _compute_nvfp4_joint_global(model, synthetic_assignment)
+        joint_globals = _compute_nvfp4_joint_global(
+            model,
+            synthetic_assignment,
+            profile=profile,
+        )
         if progress:
             print(
                 f"[prod-cache] computed joint NVFP4 globals for "
@@ -2011,12 +2021,6 @@ def fill_production_weight_cache(
     if "NVFP4" in render_base_fmt_set:
         # Group by fused sibling key for max-across-siblings unification.
         from prismaquant.decision_units import fused_group_key
-        try:
-            from prismaquant.model_profiles import detect_profile
-            profile = detect_profile(getattr(model, "name_or_path", "")) \
-                if hasattr(model, "name_or_path") else None
-        except Exception:
-            profile = None
 
         per_qname_max_abs: dict[str, float] = {}
         for qname, _ in qname_to_module.items():
