@@ -1505,6 +1505,65 @@ def _gptq_obs_rounding_nvfp4_swept(
             lambda_min = float("nan")
             mean_diag = float("nan")
 
+    # Optional analytical damp picker: skip the 5-candidate sweep and
+    # pick damp = c * lambda_max(H) / mean(diag(H)) directly.
+    # Equivalent to a kappa-target with K=10 (kappa target reduces to
+    # this form when lambda_min ~= 0, which is true on nearly every
+    # production Linear). c=1.784e-5 fitted on Qwen3-4B's 450 logged
+    # damp-sweep winners (log-MSE 0.172 = typical prediction within
+    # ~2.4x of the parabolic-interpolated continuous optimum, well
+    # inside the 5x gap between sweep candidates).
+    # Cost: 1 GPTQ pass + ~10-iter power iteration for lambda_max,
+    # vs 5 GPTQ passes for the sweep. Net ~5x speedup.
+    if os.environ.get("PRISMAQUANT_DAMP_ANALYTICAL", "").lower() in {
+        "1", "true", "yes", "on", "kappa_target",
+    }:
+        try:
+            c = float(os.environ.get("PRISMAQUANT_DAMP_ANALYTICAL_C", "1.784e-5"))
+            mean_diag_a = float(torch.diagonal(H_full).mean().item())
+            if mean_diag_a > 0:
+                # Power iteration for the dominant eigenvalue of H.
+                n = H_full.shape[0]
+                H_f = H_full.to(torch.float32)
+                v = torch.randn(n, device=H_full.device, dtype=torch.float32)
+                v = v / v.norm().clamp_min(1e-30)
+                for _ in range(10):
+                    v = H_f @ v
+                    v = v / v.norm().clamp_min(1e-30)
+                lambda_max_est = float((v @ (H_f @ v)).item())
+                damp_pred = c * lambda_max_est / mean_diag_a
+                damp_pred = min(max(damp_pred, 0.001), 0.1)
+                w_q = _gptq_obs_rounding_nvfp4(
+                    weight, activations, group_size=group_size,
+                    damp=damp_pred, global_real_override=global_real_override,
+                    clip_threshold=clip_threshold,
+                    clip_rescale=clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                    static_act_order=static_act_order,
+                    joint_scale_opt=joint_scale_opt,
+                )
+                diff = W_orig - w_q.to(torch.float32)
+                err = float(torch.einsum("oi,ij,oj->", diff, H_full, diff))
+                if math.isfinite(err) and err > 0:
+                    if log_path:
+                        import json as _json
+                        entry = {
+                            "linear_name": linear_name,
+                            "shape": list(weight.shape),
+                            "lambda_max_est": lambda_max_est,
+                            "mean_diag": mean_diag_a,
+                            "analytical_damp": damp_pred,
+                            "analytical_err": err,
+                        }
+                        try:
+                            with open(log_path, "a") as f:
+                                f.write(_json.dumps(entry) + "\n")
+                        except Exception:
+                            pass
+                    return w_q
+        except Exception:
+            pass  # fall through to the 5-candidate sweep
+
     best_w = None
     best_err = float("inf")
     best_damp: float | None = None
