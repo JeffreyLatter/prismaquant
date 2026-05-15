@@ -307,6 +307,7 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
     assert profile.to_vllm_internal_name(recipe) == (
         "language_model.model.layers.0.moe.experts.gate_up_proj"
     )
+    assert profile.serving_profile_id() == "vllm_qwen3_5_packed_moe"
     assert profile.packed_expert_format_group(recipe) == (
         profile.packed_expert_format_group("model.layers.0.experts.down_proj")
     )

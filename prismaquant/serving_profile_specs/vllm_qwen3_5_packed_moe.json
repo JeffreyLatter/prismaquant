@@ -8,7 +8,7 @@
     {
       "id": "packed_moe_expert_formats",
       "when": {
-        "contains": ".mlp.experts"
+        "regex": "(^|[.])(?:mlp[.]|moe[.])?experts([.]|$)"
       },
       "allow_formats": ["NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"],
       "reason": "profile_mismatch",
@@ -17,7 +17,7 @@
     {
       "id": "dense_formats_without_vllm_fast_path",
       "when": {
-        "not_contains": ".mlp.experts"
+        "not_regex": "(^|[.])(?:mlp[.]|moe[.])?experts([.]|$)"
       },
       "deny_formats": ["MXFP4", "MXFP8_E5M2", "FP8_E5M2"],
       "reason": "profile_mismatch",

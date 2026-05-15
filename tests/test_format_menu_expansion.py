@@ -55,12 +55,20 @@ def test_vllm_profile_allows_dense_fp8_e4m3_but_not_e5m2():
 
 def test_vllm_profile_keeps_packed_moe_menu_conservative():
     expert = "model.layers.0.mlp.experts.gate_up_proj"
+    gemma_expert = "model.layers.0.experts.gate_up_proj"
     shape = (5120, 17408)
 
     assert check_format_applicability(
         shape,
         "MXFP8_E4M3",
         qname=expert,
+        source_kind="bf16",
+        target_profile=VLLM_PROFILE,
+    ).legal
+    assert check_format_applicability(
+        shape,
+        "MXFP4",
+        qname=gemma_expert,
         source_kind="bf16",
         target_profile=VLLM_PROFILE,
     ).legal

@@ -1,6 +1,7 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "gemma4",
+  "default_serving_profile": "vllm_qwen3_5_packed_moe",
   "match": {
     "model_type": ["gemma4", "gemma4_text"],
     "architectures": ["Gemma4*"]

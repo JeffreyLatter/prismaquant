@@ -33,6 +33,7 @@ class NameCondition:
     not_contains: str | None = None
     prefix: str | None = None
     regex: str | None = None
+    not_regex: str | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "NameCondition":
@@ -41,6 +42,7 @@ class NameCondition:
             not_contains=_optional_str(payload.get("not_contains")),
             prefix=_optional_str(payload.get("prefix")),
             regex=_optional_str(payload.get("regex")),
+            not_regex=_optional_str(payload.get("not_regex")),
         )
 
     def matches(self, name: str) -> bool:
@@ -51,6 +53,8 @@ class NameCondition:
         if self.prefix is not None and not name.startswith(self.prefix):
             return False
         if self.regex is not None and re.search(self.regex, name) is None:
+            return False
+        if self.not_regex is not None and re.search(self.not_regex, name) is not None:
             return False
         return True
 
