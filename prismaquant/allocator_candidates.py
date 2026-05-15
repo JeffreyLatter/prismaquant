@@ -559,16 +559,15 @@ def _scan_source_dtype_manifest(
     profile=None,
 ) -> dict[str, str]:
     """Classify source Linear weights as ``fp8`` or ``bf16`` for passthrough gating."""
-    del profile
     src = Path(model_path)
     idx_path = src / "model.safetensors.index.json"
-    if not idx_path.exists():
-        return {}
-    try:
-        with open(idx_path) as f:
-            weight_map = json.load(f).get("weight_map", {})
-    except Exception:
-        return {}
+    weight_map = {}
+    if idx_path.exists():
+        try:
+            with open(idx_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+        except Exception:
+            weight_map = {}
     bases: dict[str, set[str]] = {}
     for key in weight_map:
         for suffix in (".weight_scale_inv", ".weight"):
@@ -577,7 +576,30 @@ def _scan_source_dtype_manifest(
                 bases.setdefault(base, set()).add(suffix[1:])
                 break
 
-    def _to_live_name(ck_base: str) -> str:
+    def _strip_weight_suffix(name: str) -> str:
+        return name[:-7] if name.endswith(".weight") else name
+
+    def _to_recipe_name(ck_base: str) -> str:
+        weight_key = f"{ck_base}.weight"
+        if profile is not None:
+            mapper = getattr(profile, "checkpoint_to_live_name", None)
+            if callable(mapper):
+                try:
+                    live_param = mapper(weight_key, multimodal=False)
+                except TypeError:
+                    live_param = mapper(weight_key)
+                except Exception:
+                    live_param = None
+                if live_param is None:
+                    return ""
+                live_qname = _strip_weight_suffix(str(live_param))
+                recipe_mapper = getattr(profile, "live_to_recipe_name", None)
+                if callable(recipe_mapper):
+                    try:
+                        return str(recipe_mapper(live_qname))
+                    except Exception:
+                        return live_qname
+                return live_qname
         if (ck_base.startswith("model.visual.")
                 or ck_base.startswith("model.audio_tower.")
                 or ck_base.startswith("model.vision_tower.")
@@ -594,8 +616,26 @@ def _scan_source_dtype_manifest(
         if "weight" not in suffixes:
             continue
         source_kind = "fp8" if "weight_scale_inv" in suffixes else "bf16"
-        live_name = _to_live_name(base)
-        if not live_name:
+        recipe_name = _to_recipe_name(base)
+        if not recipe_name:
             continue
-        manifest[live_name] = source_kind
+        manifest[recipe_name] = source_kind
+    fp8_pairs = None
+    if profile is not None:
+        pairs_fn = getattr(profile, "fp8_scale_pairs", None)
+        if callable(pairs_fn):
+            try:
+                fp8_pairs = pairs_fn(model_path)
+            except Exception:
+                fp8_pairs = None
+    if fp8_pairs:
+        recipe_mapper = getattr(profile, "live_to_recipe_name", None)
+        for live_param in fp8_pairs:
+            live_qname = _strip_weight_suffix(str(live_param))
+            if callable(recipe_mapper):
+                try:
+                    live_qname = str(recipe_mapper(live_qname))
+                except Exception:
+                    pass
+            manifest[live_qname] = "fp8"
     return manifest

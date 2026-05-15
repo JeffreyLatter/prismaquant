@@ -1,3 +1,5 @@
+import json
+import tempfile
 import unittest
 from unittest import mock
 
@@ -5,11 +7,13 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
+from prismaquant.allocator_candidates import _scan_source_dtype_manifest
 from prismaquant.allocator import (
     Candidate,
     build_candidates,
     filter_candidates_for_profile,
 )
+from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 from prismaquant.sensitivity_probe import discover_moe_structure
 
 
@@ -159,6 +163,45 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         self.assertEqual(by_fmt["FP8_SOURCE"].memory_bytes, 128 * 128 + 4)
         self.assertAlmostEqual(by_fmt["FP8_SOURCE"].bits_per_param, 8.001953125)
         self.assertAlmostEqual(by_fmt["MXFP8_E4M3"].bits_per_param, 8.25)
+
+    def test_source_dtype_manifest_uses_profile_name_mapping(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = {
+                "weight_map": {
+                    "model.language_model.layers.0.mlp.gate_proj.weight": "s0",
+                    "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv": "s0",
+                    "model.visual.blocks.0.attn.proj.weight": "s0",
+                }
+            }
+            with open(f"{td}/model.safetensors.index.json", "w") as f:
+                json.dump(payload, f)
+
+            manifest = _scan_source_dtype_manifest(td, Qwen3_5Profile())
+
+        self.assertEqual(
+            manifest,
+            {"model.layers.0.mlp.gate_proj": "fp8"},
+        )
+
+    def test_source_dtype_manifest_uses_profile_fp8_scale_pairs(self):
+        class _ScaleProfile:
+            def checkpoint_to_live_name(self, key, *, multimodal=False):
+                del multimodal
+                if key == "ck.foo.weight":
+                    return "live.foo.weight"
+                return None
+
+            def live_to_recipe_name(self, qname):
+                return qname.replace("live.", "recipe.", 1)
+
+            def fp8_scale_pairs(self, model_path):
+                del model_path
+                return {"live.foo.weight": ("s0", "ck.foo.scale")}
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = _scan_source_dtype_manifest(td, _ScaleProfile())
+
+        self.assertEqual(manifest, {"recipe.foo": "fp8"})
 
     def test_build_candidates_applies_calibrated_gains(self):
         stats = {
