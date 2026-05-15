@@ -136,8 +136,19 @@ PY
 : "${AWQ:=0}"
 : "${BLOCK_ROTATION:=0}"
 : "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
+# HALO is archived under archive/halo_2026-05-15/. The defaults stay at
+# "off"/0 so downstream --halo-mode / --halo-seed CLI args still parse
+# (the modules still take them), but any HALO_MODE override here hits the
+# archive stub at run-time.
 : "${HALO_MODE:=off}"
 : "${HALO_SEED:=0}"
+case "$HALO_MODE" in
+  off|"") ;;
+  *)
+    echo "[pipeline] ERROR: HALO_MODE=$HALO_MODE — HALO is archived under archive/halo_2026-05-15." >&2
+    exit 2
+    ;;
+esac
 : "${SELECTION_MODE:=surrogate}"
 : "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
