@@ -131,8 +131,29 @@ PY
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
 : "${EXPORT_GPTQ:=auto}"
 : "${EXPORT_SCALE_SWEEP:=auto}"
+# Fisher-weighted GPTQ + Fisher output-MSE allocator are archived under
+# archive/fisher_2026-05-15/ (the row-weighting + allocator-objective code
+# paths remain in the live tree but are unreachable from the production
+# pipeline). Any explicit override here fails fast.
 : "${FISHER_WEIGHTED_GPTQ:=0}"
 : "${FISHER_OUTPUT_MSE_ALLOCATOR:=0}"
+for _legacy_fisher_var in FISHER_WEIGHTED_GPTQ FISHER_OUTPUT_MSE_ALLOCATOR; do
+  case "${!_legacy_fisher_var}" in
+    0|false|False|FALSE|no|No|NO|"") ;;
+    *)
+      echo "[pipeline] ERROR: $_legacy_fisher_var=${!_legacy_fisher_var} — Fisher levers are archived under archive/fisher_2026-05-15." >&2
+      exit 2
+      ;;
+  esac
+done
+unset _legacy_fisher_var
+case ",$PRODUCTION_CACHE_LEVERS," in
+  *,fisher_gptq,*)
+    echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes fisher_gptq — Fisher levers are archived under archive/fisher_2026-05-15." >&2
+    exit 2
+    ;;
+esac
+export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
 : "${AWQ:=0}"
 : "${BLOCK_ROTATION:=0}"
 : "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
@@ -161,28 +182,9 @@ COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
 PROBE_H_DETAIL_ARGS=()
 COST_H_DETAIL_ARGS=()
 PROD_H_DETAIL_ARGS=()
-case "$FISHER_OUTPUT_MSE_ALLOCATOR" in
-  0|false|False|FALSE|no|No|NO|"")
-    export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
-    ;;
-  *)
-    PROBE_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
-    COST_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
-    export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=1
-    ;;
-esac
-case "$FISHER_WEIGHTED_GPTQ" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *)
-    PROBE_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
-    COST_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
-    PROD_H_DETAIL_ARGS=(--h-detail-dir "$H_DETAIL_DIR")
-    case ",$PRODUCTION_CACHE_LEVERS," in
-      *,fisher_gptq,*) ;;
-      *) PRODUCTION_CACHE_LEVERS="${PRODUCTION_CACHE_LEVERS},fisher_gptq" ;;
-    esac
-    ;;
-esac
+# Fisher-weighted GPTQ / output-MSE allocator legacy case blocks deleted;
+# the archive guard above already errors out when any Fisher variable is
+# set, so this section can no longer reach the enable branches.
 case ",$PRODUCTION_CACHE_LEVERS," in
   *,act_clip_solver,*|*,fisher_clip,*)
     echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes act_clip_solver or fisher_clip; PrismaClip / PrismaFisherClip are archived under archive/prismaclip_2026-05-14." >&2
@@ -244,7 +246,7 @@ echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
 echo "  PRODUCTION_CACHE_DISABLE_LEVERS=$PRODUCTION_CACHE_DISABLE_LEVERS"
 echo "  EXPORT_GPTQ=$EXPORT_GPTQ EXPORT_SCALE_SWEEP=$EXPORT_SCALE_SWEEP"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
-echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ FISHER_OUTPUT_MSE_ALLOCATOR=$FISHER_OUTPUT_MSE_ALLOCATOR H_DETAIL_DIR=$H_DETAIL_DIR"
+echo "  H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
@@ -388,36 +390,8 @@ PY
   fi
   echo "[pipeline] [2/4] cost.pkl exists, skipping"
 fi
-case "$FISHER_OUTPUT_MSE_ALLOCATOR" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *)
-    fisher_output_mse_cost_status=$(python3 - "$COST_PATH" <<'PY'
-import pickle
-import sys
-
-with open(sys.argv[1], "rb") as f:
-    blob = pickle.load(f)
-costs = blob.get("costs", {}) if isinstance(blob, dict) else {}
-count = 0
-for per_name in costs.values():
-    if not isinstance(per_name, dict):
-        continue
-    for entry in per_name.values():
-        if isinstance(entry, dict) and "fisher_output_mse" in entry:
-            count += 1
-print(count)
-PY
-)
-    if [[ "${fisher_output_mse_cost_status:-0}" == "0" ]]; then
-      echo "[pipeline] [2/4] ABORT: FISHER_OUTPUT_MSE_ALLOCATOR=1 but cost.pkl has no fisher_output_mse entries."
-      echo "             Regenerate probe activation cache, h-detail, and cost with current code:"
-      echo "               rm ${PROBE_PATH} ${COST_PATH}"
-      echo "               rm -rf ${WORK_DIR}/act ${WORK_DIR}/h_detail ${WORK_DIR}/work/shards"
-      exit 2
-    fi
-    echo "[pipeline] [2/4] Fisher output-MSE cost entries: $fisher_output_mse_cost_status"
-    ;;
-esac
+# Fisher output-MSE allocator cost-status check removed; the archive guard
+# at the top of this file errors out before reaching here if the var is set.
 
 # -----------------------------------------------------------------------
 # 3. Allocator (multi-choice knapsack over per-layer formats)
