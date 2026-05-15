@@ -29,8 +29,12 @@ from pathlib import Path
 ARMS = {
     "vanilla_gptq_nvfp4":      "gptq",
     "joint_scale_opt_nvfp4":   "gptq,joint_scale_opt",
-    "static_act_order_nvfp4":  "gptq,static_act_order",
-    "jso_sao_nvfp4":           "gptq,joint_scale_opt,static_act_order",
+    # scale_sweep validation: JSO vs JSO + post-GPTQ scale_sweep polish.
+    "jso_nvfp4_no_sweep":      "gptq,joint_scale_opt",
+    "jso_nvfp4_sweep":         "gptq,joint_scale_opt,scale_sweep",
+    # static_act_order_nvfp4 / jso_sao_nvfp4 arms removed 2026-05-15: SAO
+    # showed no win on its own activation-weighted objective and is
+    # archive-walled in the pipeline. See archive/sao_2026-05-15/ (TBD).
 }
 
 
@@ -82,11 +86,6 @@ def main(argv=None) -> int:
         help="Comma-separated arm labels to run.",
     )
     p.add_argument(
-        "--sao-scope",
-        default="within_block",
-        help="PRISMAQUANT_SAO_SCOPE for the SAO arms ({within_block,global}).",
-    )
-    p.add_argument(
         "--skip-build",
         action="store_true",
         help="Use existing production_weight_cache.pkl in each arm dir; just run KL.",
@@ -123,15 +122,12 @@ def main(argv=None) -> int:
             f"dataset={args.dataset}",
             f"n_calib={args.n_calib}",
             f"seqlen={args.calib_seqlen}",
-            "scale_sweep=disabled",
-            f"sao_scope={args.sao_scope}",
             f"arms={','.join(selected)}",
             "",
         ])
     )
 
     env = os.environ.copy()
-    env["PRISMAQUANT_SAO_SCOPE"] = args.sao_scope
     env.setdefault("HF_HOME", "/home/rob/.cache/huggingface")
     env.setdefault("PYTHONPATH", "/home/rob/prismaquant")
 
@@ -204,6 +200,12 @@ def main(argv=None) -> int:
             kl_json = trial_dir / "kl.json"
 
             if not args.skip_build or not cache_pkl.exists():
+                enable_list = ARMS[arm]
+                # Disable scale_sweep only when the arm itself doesn't ask for it.
+                disable_list = (
+                    "" if "scale_sweep" in enable_list.split(",")
+                    else "scale_sweep"
+                )
                 build_cmd = [
                     sys.executable, "-m", "prismaquant.build_production_cache",
                     "--model", args.model,
@@ -214,8 +216,8 @@ def main(argv=None) -> int:
                     "--n-calib-samples", str(args.n_calib),
                     "--calib-seqlen", str(args.calib_seqlen),
                     "--dataset", args.dataset,
-                    "--enable", ARMS[arm],
-                    "--disable", "scale_sweep",
+                    "--enable", enable_list,
+                    "--disable", disable_list,
                     "--cache-dir", str(cache_dir),
                 ]
                 run(build_cmd, env=env, log_path=trial_dir / "build.log",

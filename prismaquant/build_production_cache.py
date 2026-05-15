@@ -106,18 +106,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--enable",
         default="gptq,joint_scale_opt",
         help="Comma-separated levers to enable. Currently honored: "
-        "{none, gptq, scale_sweep, fisher_gptq, awq_round, "
-        "static_act_order, joint_scale_opt}.  "
+        "{none, gptq, joint_scale_opt}. "
         "Use none for RTN-only rendering with no local production levers. "
-        "AWQ, SmoothQuant, and BlockOrtho-G are archived under "
-        "archive/foldscale_orthog_2026-05-13 and are rejected by the "
-        "production cache path. PrismaClip (act_clip_solver) and "
-        "PrismaFisherClip (fisher_clip) are archived under "
-        "archive/prismaclip_2026-05-14. Joint NVFP4 "
-        "sibling globals + calibrated "
-        "input_global_scale are computed unconditionally when NVFP4 is in "
-        "the format menu. NVFP4 block scaling follows "
-        "PRISMAQUANT_NVFP4_SCALE_RULE.",
+        "Default `gptq,joint_scale_opt` ships GPTQ (with the always-on "
+        "per-Linear damp sweep) plus JSO. "
+        "scale_sweep regresses end-to-end KL on Qwen3-4B and was dropped "
+        "from defaults 2026-05-15. "
+        "static_act_order (SAO), awq_round, fisher_gptq, act_clip_solver, "
+        "and fisher_clip are archived legacy names; if passed in --enable "
+        "they are still parsed by the lever wiring but the corresponding "
+        "subsystems are walled off (see archive/foldscale_orthog_2026-05-13, "
+        "archive/prismaclip_2026-05-14, archive/fisher_2026-05-15, "
+        "archive/halo_2026-05-15). "
+        "Joint NVFP4 sibling globals + calibrated input_global_scale are "
+        "computed unconditionally when NVFP4 is in the format menu. "
+        "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
     )
     p.add_argument(
         "--disable",

@@ -190,6 +190,14 @@ case ",$PRODUCTION_CACHE_LEVERS," in
     echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes act_clip_solver or fisher_clip; PrismaClip / PrismaFisherClip are archived under archive/prismaclip_2026-05-14." >&2
     exit 2
     ;;
+  *,static_act_order,*)
+    echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes static_act_order — SAO showed no win on its own activation-weighted objective; dropped 2026-05-15." >&2
+    exit 2
+    ;;
+  *,awq_round,*)
+    echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes awq_round — not part of the core stack." >&2
+    exit 2
+    ;;
 esac
 case "$AWQ" in
   0|false|False|FALSE|no|No|NO|"") ;;
