@@ -103,10 +103,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--enable",
-        default="gptq,scale_sweep",
+        default="gptq,joint_scale_opt,scale_sweep",
         help="Comma-separated levers to enable. Currently honored: "
-        "{gptq, scale_sweep, act_clip_solver, fisher_gptq, fisher_clip, "
-        "awq, smoothquant}.  "
+        "{gptq, joint_scale_opt, scale_sweep, act_clip_solver, "
+        "fisher_gptq, fisher_clip, awq, smoothquant}.  "
         "act_clip_solver is PrismaClip, the production-rendered NVFP4 "
         "activation clipping solver. Requesting the internal "
         "NVFP4_CLIPPED cache format renders PrismaClip as a separate "
