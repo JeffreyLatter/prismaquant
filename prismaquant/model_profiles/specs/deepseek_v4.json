@@ -1,0 +1,66 @@
+{
+  "schema": "prismaquant.model_structure.v1",
+  "id": "deepseek_v4",
+  "match": {
+    "model_type": ["deepseek_v4", "deepseek-v4"],
+    "architectures": ["DeepseekV4*", "DeepSeek-V4*"]
+  },
+  "naming": {
+    "recipe_to_source": [
+      {
+        "exact": "lm_head.weight",
+        "replace": "head.weight",
+        "stop": true
+      },
+      {
+        "exact": "model.embed_tokens.weight",
+        "replace": "embed.weight",
+        "stop": true
+      },
+      {
+        "exact": "model.norm.weight",
+        "replace": "norm.weight",
+        "stop": true
+      },
+      {
+        "prefix": "model.",
+        "replace": ""
+      },
+      {
+        "regex": "(^|\\.)layers\\.(\\d+)\\.self_attn\\.",
+        "replace": "\\1layers.\\2.attn."
+      },
+      {
+        "regex": "(^|\\.)layers\\.(\\d+)\\.mlp\\.",
+        "replace": "\\1layers.\\2.ffn."
+      },
+      {
+        "regex": "(^|\\.)layers\\.(\\d+)\\.attn_hc\\.",
+        "replace": "\\1layers.\\2.hc_attn_"
+      },
+      {
+        "regex": "(^|\\.)layers\\.(\\d+)\\.ffn_hc\\.",
+        "replace": "\\1layers.\\2.hc_ffn_"
+      },
+      {
+        "regex": "ffn\\.shared_experts\\.gate_proj\\.",
+        "replace": "ffn.shared_experts.w1."
+      },
+      {
+        "regex": "ffn\\.shared_experts\\.up_proj\\.",
+        "replace": "ffn.shared_experts.w3."
+      },
+      {
+        "regex": "ffn\\.shared_experts\\.down_proj\\.",
+        "replace": "ffn.shared_experts.w2."
+      }
+    ]
+  },
+  "fused_groups": [],
+  "packed_experts": {
+    "param_names": ["gate_up_proj", "down_proj"],
+    "split_for_formats": ["*"]
+  },
+  "passthrough_prefixes": [],
+  "pinned_names": ["lm_head", "head"]
+}

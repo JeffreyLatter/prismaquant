@@ -126,6 +126,8 @@ PY
 : "${PRODUCTION_CACHE_UNION_P_FP8:=0.75}"
 : "${EXPORT_GPTQ:=auto}"
 : "${EXPORT_SCALE_SWEEP:=auto}"
+: "${PIPELINE_SPEC_PATH:=${WORK_DIR}/artifacts/pipeline_spec.json}"
+: "${PIPELINE_SPEC_VALIDATE:=1}"
 # Fisher-weighted GPTQ + Fisher output-MSE allocator are archived under
 # archive/fisher_2026-05-15/ (the row-weighting + allocator-objective code
 # paths remain in the live tree but are unreachable from the production
@@ -208,11 +210,33 @@ echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
 echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
 echo "  PRODUCTION_CACHE_DISABLE_LEVERS=$PRODUCTION_CACHE_DISABLE_LEVERS"
 echo "  EXPORT_GPTQ=$EXPORT_GPTQ EXPORT_SCALE_SWEEP=$EXPORT_SCALE_SWEEP"
+echo "  PIPELINE_SPEC_PATH=$PIPELINE_SPEC_PATH"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
 echo "  H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
 echo
+
+PIPELINE_SPEC_ARGS=(
+  python3 -m prismaquant.pipeline
+  --write-default-production "$PIPELINE_SPEC_PATH"
+  --render-mechanisms "$PRODUCTION_CACHE_LEVERS"
+  --disable-render-mechanisms "$PRODUCTION_CACHE_DISABLE_LEVERS"
+  --model-path "$MODEL_PATH"
+  --work-dir "$WORK_DIR"
+  --formats "$FORMATS"
+  --target-bits "$TARGET_BITS"
+  --target-profile "$TARGET_PROFILE"
+  --calibration-modality "$CALIBRATION_MODALITY"
+  --selection-mode "$SELECTION_MODE"
+  --production-cache "$PRODUCTION_CACHE"
+  --production-recache "$PRODUCTION_RECACHE"
+)
+case "$PIPELINE_SPEC_VALIDATE" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *) PIPELINE_SPEC_ARGS+=(--validate) ;;
+esac
+"${PIPELINE_SPEC_ARGS[@]}"
 
 # -----------------------------------------------------------------------
 # 1. Sensitivity probe (per-Linear empirical Fisher diagonal trace,

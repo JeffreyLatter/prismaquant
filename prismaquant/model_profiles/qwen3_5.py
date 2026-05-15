@@ -81,22 +81,27 @@ class Qwen3_5Profile(ModelProfile):
             )
             pm = (
                 packed_modules_mapping_from_class(self._vllm_cls)
-                or _QWEN3_5_FALLBACK_PACKED_MODULES
             )
-            self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
+            if pm:
+                self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
+            else:
+                spec = self.structure_spec()
+                if spec is not None and spec.fused_groups:
+                    self._fused_matcher = spec.fused_group_for
+                else:
+                    self._fused_matcher = fused_sibling_matcher_from_packed_mapping(
+                        _QWEN3_5_FALLBACK_PACKED_MODULES
+                    )
         return self._fused_matcher(linear_qname)
 
     # ------------------------------------------------------------
     # MoE
     # ------------------------------------------------------------
     def packed_expert_param_names(self) -> frozenset[str]:
-        return frozenset({"gate_up_proj", "down_proj"})
+        return super().packed_expert_param_names()
 
     def per_expert_moe_regex(self) -> str | None:
-        # vLLM constructs per-expert Linears under
-        # language_model.model.layers.X.mlp.experts.Y.{gate|up|down}_proj
-        return (r"re:^language_model[.]model[.]layers[.][0-9]+"
-                r"[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$")
+        return super().per_expert_moe_regex()
 
     def split_packed_experts_for_format(self, fmt: str) -> bool:
         # Qwen3.5's vLLM load_weights has a latching is_fused_expert
@@ -115,7 +120,7 @@ class Qwen3_5Profile(ModelProfile):
         # iteration. Force split for EVERY format on Qwen3.5 so the
         # artifact has a uniform per-expert form and the latching bug
         # never triggers.
-        return True
+        return super().split_packed_experts_for_format(fmt)
 
     # ------------------------------------------------------------
     # MTP
@@ -127,8 +132,7 @@ class Qwen3_5Profile(ModelProfile):
         # MTP prefix stays `mtp.` at scheme dispatch (Qwen3_5MTP passes
         # prefix="mtp" to its inner predictor). The `mtp.→model.` rewrite
         # only happens in the weight loader.
-        return (r"re:^mtp[.]layers[.][0-9]+"
-                r"[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$")
+        return super().per_expert_mtp_regex()
 
     def mtp_layer_count(self, cfg: dict) -> int:
         # Use base implementation first.
@@ -257,7 +261,7 @@ class Qwen3_5Profile(ModelProfile):
     def source_passthrough_prefixes(self) -> tuple[str, ...]:
         # Visual encoder is passthrough (real calibration deferred); MTP
         # weights without a layer_config entry go through passthrough too.
-        return ("model.visual.", "mtp.")
+        return super().source_passthrough_prefixes()
 
     def stage_text_only_strip_keys(self) -> tuple[str, ...]:
         return (

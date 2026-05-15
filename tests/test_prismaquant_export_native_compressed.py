@@ -47,6 +47,7 @@ from prismaquant.export_native_compressed import (
     quantize_dequantize_nvfp4_packed,
 )
 from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
+from prismaquant.model_profiles.gemma4 import Gemma4Profile
 
 
 class _IdentityProfile:
@@ -998,7 +999,38 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
         self.assertEqual(assignment["model.layers.0.linear_attn.in_proj_a"], "BF16")
         self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "MXFP8")
         self.assertEqual(coerced, [
-            ("model.layers.0.linear_attn.in_proj_a", [48, 5120])
+            ("model.layers.0.linear_attn.in_proj_a", [48, 5120], "MXFP8")
+        ])
+
+    def test_coerces_profile_illegal_dense_format_to_bf16(self):
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard = td / "model-00001-of-00001.safetensors"
+            save_file({
+                "model.language_model.layers.0.self_attn.o_proj.weight": (
+                    torch.zeros(128, 5120, dtype=torch.bfloat16)
+                ),
+            }, str(shard))
+            with open(td / "model.safetensors.index.json", "w") as f:
+                json.dump({
+                    "weight_map": {
+                        "model.language_model.layers.0.self_attn.o_proj.weight": (
+                            shard.name
+                        ),
+                    }
+                }, f)
+
+            assignment, coerced = _coerce_runtime_legal_assignment(
+                str(td),
+                {"model.layers.0.self_attn.o_proj": "MXFP4"},
+                Qwen3_5Profile(),
+            )
+
+        self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "BF16")
+        self.assertEqual(coerced, [
+            ("model.layers.0.self_attn.o_proj", [128, 5120], "MXFP4")
         ])
 
     def test_bf16_audit_classifies_allocator_bf16_candidates(self):
@@ -1212,6 +1244,39 @@ class TestComputeExtraIgnorePerExpertSiblings(unittest.TestCase):
             "model.language_model.layers.0.self_attn.q_proj", extra)
         self.assertIn(
             "model.language_model.layers.0.mlp.shared_expert_gate", extra)
+
+    def test_profile_remap_excludes_gemma_per_expert_siblings(self):
+        """Gemma inserts `.moe.experts` in multimodal source names while
+        the recipe uses `.experts`; profile naming must drive coverage."""
+        assignment = {
+            "model.layers.0.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.experts.down_proj": "NVFP4",
+        }
+        source_iter = [
+            (
+                "model.language_model.layers.0.moe.experts.0.gate_proj.weight",
+                [512, 1024],
+            ),
+            (
+                "model.language_model.layers.0.moe.experts.0.down_proj.weight",
+                [1024, 512],
+            ),
+            (
+                "model.language_model.layers.0.moe.shared_gate.weight",
+                [32, 1024],
+            ),
+        ]
+        extra = compute_extra_ignore(source_iter, assignment, Gemma4Profile())
+
+        self.assertNotIn(
+            "model.language_model.layers.0.moe.experts.0.gate_proj",
+            extra,
+        )
+        self.assertNotIn(
+            "model.language_model.layers.0.moe.experts.0.down_proj",
+            extra,
+        )
+        self.assertIn("model.language_model.layers.0.moe.shared_gate", extra)
 
 
 if __name__ == "__main__":

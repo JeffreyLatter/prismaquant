@@ -3,8 +3,7 @@
 Runtime GEMM kernels for NVFP4 / MXFP8 have alignment constraints that
 the knapsack DP must respect — otherwise the solver picks an
 unservable format and the artifact fails at vLLM load. The
-`_format_kernel_supports_shape` helper gates each format candidate on
-its kernel's shape rules before the DP sees it.
+serving-profile shape rules gate each format candidate before the DP sees it.
 
 These tests pin the known rules so silent kernel changes don't
 regress the shape-mask:

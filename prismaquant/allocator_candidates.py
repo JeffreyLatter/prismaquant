@@ -9,26 +9,16 @@ from pathlib import Path
 
 from . import format_registry as fr
 from .allocator_solver import Candidate, _shape_from_stats, predicted_dloss
+from .serving_profiles import (
+    check_serving_format,
+    check_serving_shape,
+)
 
 
 PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
     "FP8_SOURCE": "fp8",
     "BF16": "bf16",
 }
-
-VLLM_QWEN35_EXPERT_FORMATS = {
-    "NVFP4",
-    "MXFP4",
-    "MXFP8",
-    "MXFP8_E4M3",
-    "BF16",
-}
-VLLM_QWEN35_DENSE_UNSUPPORTED_FORMATS = {
-    "MXFP4",
-    "MXFP8_E5M2",
-    "FP8_E5M2",
-}
-
 
 def _is_passthrough_format(format_name: str) -> bool:
     return format_name in PASSTHROUGH_SOURCE_REQUIREMENTS
@@ -58,33 +48,11 @@ def _profile_allows_format(
     name: str | None,
     fmt: str,
 ) -> FormatApplicability:
-    if target_profile in (None, "", "research"):
-        return FormatApplicability(True)
-    if target_profile == "vllm_qwen3_5_packed_moe":
-        qname = name or ""
-        if ".mlp.experts" in qname:
-            if fmt in VLLM_QWEN35_EXPERT_FORMATS:
-                return FormatApplicability(True)
-            return FormatApplicability(
-                False,
-                "profile_mismatch",
-                "Qwen3.5/3.6 packed MoE serving path only supports "
-                "NVFP4, MXFP4, MXFP8_E4M3, or BF16 for expert tensors; "
-                "plain FP8 and E5M2 stay research-only until a vLLM "
-                "packed-MoE load smoke passes",
-            )
-        if fmt in VLLM_QWEN35_DENSE_UNSUPPORTED_FORMATS:
-            return FormatApplicability(
-                False,
-                "profile_mismatch",
-                f"{fmt} is not enabled for dense Linears in this serving "
-                "profile",
-            )
-        return FormatApplicability(True)
+    decision = check_serving_format(target_profile, name, fmt)
     return FormatApplicability(
-        False,
-        "profile_mismatch",
-        f"unknown target profile {target_profile!r}",
+        decision.legal,
+        decision.reason,
+        decision.detail,
     )
 
 
@@ -96,17 +64,12 @@ def _format_kernel_supports_shape(fmt_name: str, in_features: int,
     if flashinfer_verdict is False:
         return False
 
-    if fmt_name.startswith("MXFP8"):
-        if out_features < 128 or in_features < 128:
-            return False
-        if in_features % 32 != 0:
-            return False
-        if out_features % 128 != 0:
-            return False
-        return True
-    if fmt_name.startswith("NVFP4"):
-        return in_features % 16 == 0
-    return True
+    return check_serving_shape(
+        "research",
+        fmt_name,
+        in_features=in_features,
+        out_features=out_features,
+    ).legal
 
 
 def check_format_applicability(
@@ -179,12 +142,17 @@ def check_format_applicability(
                 f"(out_features={out_features}, in_features={in_features})",
             )
 
-    if not _format_kernel_supports_shape(fmt, in_features, out_features):
+    shape_decision = check_serving_shape(
+        target_profile,
+        fmt,
+        in_features=in_features,
+        out_features=out_features,
+    )
+    if not shape_decision.legal:
         return FormatApplicability(
             False,
-            "kernel_shape",
-            f"{fmt} kernel does not support (out_features={out_features}, "
-            f"in_features={in_features})",
+            shape_decision.reason or "kernel_shape",
+            shape_decision.detail,
         )
     return FormatApplicability(True)
 

@@ -49,28 +49,16 @@ class Gemma4Profile(ModelProfile):
     # MoE (only on MoE variants like gemma-4-26b-a4b)
     # ------------------------------------------------------------
     def packed_expert_param_names(self) -> frozenset[str]:
-        return frozenset({"gate_up_proj", "down_proj"})
+        return super().packed_expert_param_names()
 
     def per_expert_moe_regex(self) -> str | None:
-        # vLLM constructs per-expert Linears under
-        # language_model.model.layers.X.moe.experts.Y.{gate|up|down}_proj
-        # — Gemma 4 uses `moe` as the MoE block name (not `mlp.experts`
-        # like Qwen3.5). Dense Gemma 4 variants (31b-it) simply won't
-        # have any MoE tensors, so this regex matches nothing on disk
-        # and the allocator produces a single format group.
-        return (r"re:^language_model[.]model[.]layers[.][0-9]+"
-                r"[.]moe[.]experts[.][0-9]+[.](gate|up|down)_proj$")
+        return super().per_expert_moe_regex()
 
     # ------------------------------------------------------------
     # Source passthrough (multimodal towers stay BF16 for v1)
     # ------------------------------------------------------------
     def source_passthrough_prefixes(self) -> tuple[str, ...]:
-        return (
-            "model.vision_tower.",
-            "model.audio_tower.",
-            "model.embed_vision.",
-            "model.embed_audio.",
-        )
+        return super().source_passthrough_prefixes()
 
     def stage_text_only_strip_keys(self) -> tuple[str, ...]:
         return (
@@ -102,14 +90,23 @@ class Gemma4Profile(ModelProfile):
         the HF text-only class exposes them directly
         (`...layers.X.experts.Y.*`). Strip both prefixes to match the
         recipe keys."""
-        if live_qname.startswith("model.language_model."):
-            live_qname = "model." + live_qname[len("model.language_model."):]
-        # Collapse `...layers.X.moe.experts...` → `...layers.X.experts...`
-        # to match the text-only probe's module tree.
-        import re as _re
-        live_qname = _re.sub(r"(\.layers\.\d+)\.moe\.experts",
-                             r"\1.experts", live_qname)
-        return live_qname
+        return super().live_to_recipe_name(live_qname)
+
+    def export_tensor_name(self, model_qname: str) -> str:
+        """Keep body/expert export keys in recipe form.
+
+        Gemma 4's vLLM weight iterator performs its own body and
+        `.experts` -> `.moe.experts` remaps. Source lookup still uses the
+        declarative `recipe_to_source` rules, but export must not pre-apply
+        those remaps or vLLM sees doubled `.moe.` prefixes.
+        """
+        if (
+            model_qname.startswith("model.layers.")
+            or model_qname.startswith("model.embed_tokens")
+            or model_qname.startswith("model.norm")
+        ):
+            return model_qname
+        return super().export_tensor_name(model_qname)
 
     def stage_text_only_promote_inner_model_type(self) -> bool:
         # `Gemma4ForCausalLM.config: Gemma4TextConfig`. We need

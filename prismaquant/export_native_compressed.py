@@ -867,6 +867,7 @@ def _production_cache_scales(cache) -> dict[str, float]:
 def _source_weight_shape_for_recipe(
     src_model: str,
     recipe_key: str,
+    profile=None,
 ) -> list[int] | None:
     idx_path = Path(src_model) / "model.safetensors.index.json"
     if not idx_path.exists():
@@ -874,6 +875,10 @@ def _source_weight_shape_for_recipe(
     with open(idx_path) as f:
         weight_map = json.load(f).get("weight_map", {})
     candidates = [recipe_key + ".weight"]
+    if profile is not None:
+        source_name = profile.source_tensor_name(recipe_key)
+        candidates.append(source_name + ".weight")
+        candidates.append(profile.source_tensor_name(recipe_key + ".weight"))
     if recipe_key.startswith("model."):
         candidates.append(
             "model.language_model." + recipe_key[len("model."):] + ".weight"
@@ -891,47 +896,49 @@ def _source_weight_shape_for_recipe(
 def _coerce_runtime_legal_assignment(
     src_model: str,
     assignment: dict[str, str],
-) -> tuple[dict[str, str], list[tuple[str, list[int]]]]:
+    profile=None,
+) -> tuple[dict[str, str], list[tuple[str, list[int], str]]]:
     """Adjust assignments that the target runtime cannot execute.
 
-    vLLM's current FlashInfer MXFP8 linear kernel requires output
-    dimension >= 128. Qwen3.6's GDN linear-attention in_proj_a/b shards can be
-    96-wide; exporting those as MXFP8 produces a checkpoint that loads but
-    fails on vLLM's profile run. BF16 is conservative for quality and keeps
-    the runtime contract explicit.
+    Shape and format legality comes from serving-profile config. BF16 is the
+    conservative runtime fallback when an assigned format is not executable.
     """
     out = dict(assignment)
-    coerced: list[tuple[str, list[int]]] = []
+    coerced: list[tuple[str, list[int], str]] = []
+    target_profile = _allocator_target_profile_for_audit(profile) or "research"
     for qname, fmt in assignment.items():
-        if _canonical_export_format(fmt) != "MXFP8":
+        fmt_canonical = _canonical_export_format(fmt)
+        if fmt_canonical == "BF16":
             continue
-        shape = _source_weight_shape_for_recipe(src_model, qname)
+        shape = _source_weight_shape_for_recipe(src_model, qname, profile)
         if shape is None or len(shape) != 2:
             continue
         verdict = check_format_applicability(
             tuple(shape),
-            "MXFP8",
+            fmt,
             qname=qname,
-            target_profile="research",
+            target_profile=target_profile,
         )
         if not verdict.legal:
             out[qname] = "BF16"
-            coerced.append((qname, shape))
+            coerced.append((qname, shape, fmt_canonical))
     return out, coerced
 
 
 def _allocator_target_profile_for_audit(profile) -> str | None:
-    name = str(getattr(profile, "name", "") or "")
-    if name in {"qwen3_5", "qwen3_5_dense", "qwen3"}:
-        return "vllm_qwen3_5_packed_moe"
-    return None
+    if profile is None:
+        return None
+    serving_profile = getattr(profile, "serving_profile_id", None)
+    if serving_profile is None:
+        return None
+    return serving_profile()
 
 
 def _bf16_upgrade_audit(
     src_model: str,
     assignment: dict[str, str],
     bf16_passthrough: set[str],
-    runtime_coerced: Sequence[tuple[str, list[int]]],
+    runtime_coerced: Sequence[tuple],
     profile,
 ) -> dict[str, object]:
     """Classify BF16 entries by immutability, runtime gates, or allocation.
@@ -941,7 +948,14 @@ def _bf16_upgrade_audit(
     format support, and which are real numerical/budget choices where enhanced
     MXFP8/FP8 may be worth trying next.
     """
-    coerced = {name: shape for name, shape in runtime_coerced}
+    coerced: dict[str, tuple[list[int], str]] = {}
+    for row in runtime_coerced:
+        if len(row) >= 3:
+            name, shape, from_fmt = row[:3]
+        else:
+            name, shape = row[:2]
+            from_fmt = "MXFP8"
+        coerced[str(name)] = (shape, str(from_fmt))
     target_profile = _allocator_target_profile_for_audit(profile)
     candidate_formats = ("MXFP8_E4M3", "MXFP8_E5M2", "FP8_E4M3", "FP8_E5M2")
     entries: list[dict[str, object]] = []
@@ -950,12 +964,20 @@ def _bf16_upgrade_audit(
     for qname, fmt in sorted(assignment.items()):
         if _canonical_export_format(fmt) != "BF16":
             continue
-        shape = coerced.get(qname) or _source_weight_shape_for_recipe(src_model, qname)
+        coerced_entry = coerced.get(qname)
+        shape = (
+            coerced_entry[0]
+            if coerced_entry is not None
+            else _source_weight_shape_for_recipe(src_model, qname, profile)
+        )
         shape_tuple = tuple(shape) if shape is not None else None
         if qname in bf16_passthrough:
             reason = "passthrough_or_immutable"
-        elif qname in coerced:
-            reason = "runtime_coerced_from_mxfp8"
+        elif coerced_entry is not None:
+            reason = (
+                "runtime_coerced_from_"
+                + coerced_entry[1].lower().replace("-", "_")
+            )
         else:
             verdicts: dict[str, dict[str, object]] = {}
             any_legal = False
@@ -4833,7 +4855,11 @@ def _per_expert_parent(base: str) -> str | None:
     return f"{m.group('prefix')}.{parent}"
 
 
-def compute_extra_ignore(source_shape_iter, assignment: dict[str, str]) -> list[str]:
+def compute_extra_ignore(
+    source_shape_iter,
+    assignment: dict[str, str],
+    profile=None,
+) -> list[str]:
     """Return the list of 2D `.weight` basenames that must be added to
     the compressed-tensors `ignore` set because the recipe doesn't cover
     them.
@@ -4855,9 +4881,12 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str]) -> list[
         if not ckpt_key.endswith(".weight"):
             continue
         base = ckpt_key[:-7]
-        recipe_name = ("model." + base[len("model.language_model."):]
-                       if base.startswith("model.language_model.")
-                       else base)
+        if profile is not None:
+            recipe_name = profile.live_to_recipe_name(base)
+        else:
+            recipe_name = ("model." + base[len("model.language_model."):]
+                           if base.startswith("model.language_model.")
+                           else base)
         if recipe_name in seen_recipe:
             continue
         parent = _per_expert_parent(recipe_name)
@@ -5020,6 +5049,7 @@ def main():
     _assignment_for_cache, _ = _coerce_runtime_legal_assignment(
         args.model,
         _assignment_for_cache,
+        profile,
     )
 
     if args.production_weight_cache:
@@ -5192,12 +5222,13 @@ def main():
     assignment, runtime_coerced = _coerce_runtime_legal_assignment(
         args.model,
         assignment,
+        profile,
     )
     if runtime_coerced:
         print(
             "[export-stream] runtime format coercions: "
-            f"{len(runtime_coerced)} MXFP8 Linears -> BF16 "
-            "(target runtime does not support those MXFP8 shapes). "
+            f"{len(runtime_coerced)} Linears -> BF16 "
+            "(target runtime does not support those format/shape pairs). "
             f"sample={runtime_coerced[:6]}",
             flush=True,
         )
@@ -5220,37 +5251,20 @@ def main():
     if args.offload_folder is None:
         args.offload_folder = str(out_dir / "_streaming_offload")
 
-    # Rename body keys → `model.language_model.` on disk for multimodal-
-    # umbrella arches (Qwen3.5/3.6 ConditionalGeneration, Gemma 4
-    # ConditionalGeneration). Our streaming loop produces the text-only
-    # `model.layers.X.*` form.
-    body_infix = getattr(profile, "body_ondisk_infix", None)
-    if callable(body_infix):
-        infix = body_infix()
-    else:
-        # Default: Qwen3.5/3.6 pattern. Profiles for non-multimodal
-        # archs can return "" and we'll skip the rename.
-        infix = "language_model." if profile.name.startswith("qwen3_5") else ""
-
     def _rename_body_batch(
         batch: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        if not infix:
-            return batch
-        renamed: dict[str, torch.Tensor] = {}
-        for k, v in batch.items():
-            if (k.startswith("model.layers.")
-                    or k.startswith("model.embed_tokens")
-                    or k.startswith("model.norm")):
-                renamed[f"model.{infix}{k[len('model.'):]}"] = v
-            else:
-                renamed[k] = v
-        return renamed
+        return {profile.export_tensor_name(k): v for k, v in batch.items()}
 
     writer = IncrementalSafetensorsWriter(out_dir, args.shard_bytes)
-    if infix:
-        print(f"[export-stream] streaming body rename → model.{infix}...",
-              flush=True)
+    sample_recipe_key = "model.layers.0.self_attn.q_proj.weight"
+    sample_source_key = profile.export_tensor_name(sample_recipe_key)
+    if sample_source_key != sample_recipe_key:
+        print(
+            "[export-stream] streaming source-name remap via profile: "
+            f"{sample_recipe_key} -> {sample_source_key}",
+            flush=True,
+        )
 
     tensors, hist = materialize_tensors_streaming(
         args.model, assignment,
@@ -5354,7 +5368,7 @@ def main():
                         shape = None
                     yield k, shape
 
-    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment)
+    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment, profile)
     print(f"[export-stream] extra ignore (unmapped Linears): "
           f"{len(extra_ignore)}", flush=True)
 
@@ -5371,8 +5385,8 @@ def main():
             "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
             "n_assignment_entries": len(assignment),
             "runtime_coercions": [
-                {"name": name, "shape": shape, "from": "MXFP8", "to": "BF16"}
-                for name, shape in runtime_coerced
+                {"name": name, "shape": shape, "from": from_fmt, "to": "BF16"}
+                for name, shape, from_fmt in runtime_coerced
             ],
             "bf16_audit": _bf16_upgrade_audit(
                 args.model,

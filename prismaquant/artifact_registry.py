@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+from .pipeline import MetricGateSpec
+
 
 DEFAULT_REGISTRY_PATH = Path("/home/rob/dq-runs/prismaquant-artifact-registry.json")
 COMPARE_EPSILON = 0.005
@@ -129,23 +131,42 @@ class ArtifactRegistry:
         baseline = self._record_by_id(baseline_id)
 
         metrics = {
-            "end_kl": _lower_is_better(
+            "end_kl": _compare_metric(
+                "end_kl",
                 candidate.end_kl,
                 baseline.end_kl,
-                strict=True,
-                epsilon=0.0,
+                MetricGateSpec(
+                    name="artifact.end_kl_improves",
+                    metric="end_kl",
+                    direction="lower_is_better",
+                    mode="all",
+                ),
             ),
-            "ppl_wikitext": _lower_is_better(
+            "ppl_wikitext": _compare_metric(
+                "ppl_wikitext",
                 candidate.ppl_wikitext,
                 baseline.ppl_wikitext,
-                strict=False,
-                epsilon=COMPARE_EPSILON,
+                MetricGateSpec(
+                    name="artifact.ppl_wikitext_preserved",
+                    metric="ppl_wikitext",
+                    direction="lower_is_better",
+                    mode="all",
+                    require_improvement=False,
+                    max_relative_regression=COMPARE_EPSILON,
+                ),
             ),
-            "ppl_mmlu_acc": _higher_is_better(
+            "ppl_mmlu_acc": _compare_metric(
+                "ppl_mmlu_acc",
                 candidate.ppl_mmlu_acc,
                 baseline.ppl_mmlu_acc,
-                strict=False,
-                epsilon=COMPARE_EPSILON,
+                MetricGateSpec(
+                    name="artifact.ppl_mmlu_acc_preserved",
+                    metric="ppl_mmlu_acc",
+                    direction="higher_is_better",
+                    mode="all",
+                    require_improvement=False,
+                    max_relative_regression=COMPARE_EPSILON,
+                ),
             ),
         }
         reasons = [
@@ -209,51 +230,25 @@ def _missing_metric(candidate: float | None, baseline: float | None) -> dict:
     }
 
 
-def _lower_is_better(
+def _compare_metric(
+    metric: str,
     candidate: float | None,
     baseline: float | None,
-    *,
-    strict: bool,
-    epsilon: float,
+    gate: MetricGateSpec,
 ) -> dict:
-    if candidate is None or baseline is None:
+    evaluation = gate.evaluate(
+        baseline={metric: baseline},
+        candidate={metric: candidate},
+    )
+    decision = evaluation.decisions[0] if evaluation.decisions else None
+    if decision is None or candidate is None or baseline is None:
         return _missing_metric(candidate, baseline)
     delta = float(candidate) - float(baseline)
     rel = delta / abs(float(baseline)) if baseline else delta
-    if strict:
-        passed = float(candidate) < float(baseline)
-    else:
-        threshold = float(baseline) * (1.0 + float(epsilon))
-        passed = float(candidate) <= threshold
     return {
         "candidate": float(candidate),
         "baseline": float(baseline),
         "delta": delta,
         "relative_delta": rel,
-        "passed": bool(passed),
-    }
-
-
-def _higher_is_better(
-    candidate: float | None,
-    baseline: float | None,
-    *,
-    strict: bool,
-    epsilon: float,
-) -> dict:
-    if candidate is None or baseline is None:
-        return _missing_metric(candidate, baseline)
-    delta = float(candidate) - float(baseline)
-    rel = delta / abs(float(baseline)) if baseline else delta
-    if strict:
-        passed = float(candidate) > float(baseline)
-    else:
-        threshold = float(baseline) * (1.0 - float(epsilon))
-        passed = float(candidate) >= threshold
-    return {
-        "candidate": float(candidate),
-        "baseline": float(baseline),
-        "delta": delta,
-        "relative_delta": rel,
-        "passed": bool(passed),
+        "passed": bool(decision.accepted),
     }

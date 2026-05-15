@@ -106,6 +106,7 @@ from .allocator_candidates import (
     expand_fused_sibling_assignment,
     summarize_applicability_masks,
 )
+from .serving_profiles import check_serving_format, serving_profile_names
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
@@ -135,21 +136,10 @@ def kneedle(x: list[float], y: list[float]) -> int:
 
 
 def _allowed_format(target_profile: str, name: str, fmt: str) -> bool:
-    if target_profile == "research":
-        return True
-    if target_profile == "vllm_qwen3_5_packed_moe":
-        if ".mlp.experts" in name:
-            # Packed Qwen3.5/3.6 experts are emitted by
-            # export_native_compressed as compressed-tensors MoE units.
-            # Keep this allow-list aligned with FORMAT_SCHEME plus BF16
-            # passthrough. MXFP4 is exportable only for MoE experts in
-            # local vLLM; dense MXFP4 is weight-only and not part of the
-            # Qwen3.6 MoE shipping profile.
-            return fmt in {"NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"}
-        if fmt in {"MXFP4", "MXFP8_E5M2", "FP8_E5M2"}:
-            return False
-        return True
-    raise ValueError(f"Unknown target profile: {target_profile}")
+    decision = check_serving_format(target_profile, name, fmt)
+    if not decision.legal and decision.detail.startswith("unknown target profile"):
+        raise ValueError(decision.detail)
+    return decision.legal
 
 
 def filter_candidates_for_profile(
@@ -406,11 +396,10 @@ def main():
     ap.add_argument("--threads", type=int, default=0,
                     help="OMP/numpy threads for DP (0 = default)")
     ap.add_argument("--target-profile",
-                    choices=["research", "vllm_qwen3_5_packed_moe"],
+                    choices=serving_profile_names(),
                     default="research",
-                    help="Serving/backend constraint profile. "
-                         "'vllm_qwen3_5_packed_moe' restricts packed MoE "
-                         "formats to the existing vLLM path.")
+                    help="Serving/backend constraint profile loaded from "
+                         "prismaquant/serving_profile_specs.")
     ap.add_argument("--calibration", default=None,
                     help="Optional path to a JSON containing "
                          "'calibrated_gains[fmt] = α_fmt'. When present, "

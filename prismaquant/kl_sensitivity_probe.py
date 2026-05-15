@@ -46,6 +46,7 @@ from prismaquant.kl_measurement import (
     measure_override_set_kl,
 )
 from prismaquant.production_weight_cache import fill_production_weight_cache
+from prismaquant.serving_profiles import serving_profile_names
 from prismaquant.source_prefetch import prefetch_safetensors_checkpoint
 
 
@@ -3663,7 +3664,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-prefetch-workers", type=int, default=2)
     parser.add_argument(
         "--target-profile",
-        choices=["research", "vllm_qwen3_5_packed_moe"],
+        choices=serving_profile_names(),
         default="research",
     )
     parser.add_argument("--selection-budget-points", type=int, default=64)

@@ -67,9 +67,17 @@ class Qwen3Profile(ModelProfile):
             )
             pm = (
                 packed_modules_mapping_from_class(self._vllm_cls)
-                or _QWEN3_VLLM_PACKED_MODULES
             )
-            self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
+            if pm:
+                self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
+            else:
+                spec = self.structure_spec()
+                if spec is not None and spec.fused_groups:
+                    self._fused_matcher = spec.fused_group_for
+                else:
+                    self._fused_matcher = fused_sibling_matcher_from_packed_mapping(
+                        _QWEN3_VLLM_PACKED_MODULES
+                    )
         return self._fused_matcher(linear_qname)
 
     # No MoE.

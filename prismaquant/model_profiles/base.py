@@ -48,6 +48,8 @@ class ModelProfile(ABC):
         self._vllm_cls_loaded = False
         self._fused_matcher = None
         self._name_remapper = None
+        self._structure_spec = None
+        self._structure_spec_loaded = False
 
     # ------------------------------------------------------------
     # Identity + match
@@ -106,7 +108,11 @@ class ModelProfile(ABC):
             )
             pm = packed_modules_mapping_from_class(self._vllm_cls)
             if not pm:
-                self._fused_matcher = lambda _qname: None
+                spec = self.structure_spec()
+                if spec is not None and spec.fused_groups:
+                    self._fused_matcher = spec.fused_group_for
+                else:
+                    self._fused_matcher = lambda _qname: None
             else:
                 self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
         return self._fused_matcher(linear_qname)
@@ -118,6 +124,9 @@ class ModelProfile(ABC):
         """Parameter attribute names (on a `*Experts` module) that hold
         3D packed MoE weight tensors. Union across all known architectures
         is a safe default; specific profiles can narrow."""
+        spec = self.structure_spec()
+        if spec is not None and spec.packed_experts.declared:
+            return frozenset(spec.packed_experts.param_names)
         return frozenset({
             "gate_up_proj", "down_proj",   # Qwen3.5 / 3.6
             "w1", "w2", "w3",              # Mixtral
@@ -129,6 +138,9 @@ class ModelProfile(ABC):
         dispatch time. Added to the config_groups catch-all so every
         per-expert per-projection tensor picks up the catch-all format
         without ~30k explicit targets."""
+        spec = self.structure_spec()
+        if spec is not None and spec.per_expert_moe_regex:
+            return spec.per_expert_moe_regex
         return None
 
     # ------------------------------------------------------------
@@ -174,6 +186,9 @@ class ModelProfile(ABC):
     def per_expert_mtp_regex(self) -> str | None:
         """Regex matching MTP per-expert Linear qnames at scheme dispatch.
         Returns None if no MoE MTP in this architecture."""
+        spec = self.structure_spec()
+        if spec is not None and spec.per_expert_mtp_regex:
+            return spec.per_expert_mtp_regex
         return None
 
     # ------------------------------------------------------------
@@ -203,6 +218,11 @@ class ModelProfile(ABC):
             )
             prefix = hf_to_vllm_prefix_map_from_class(self._vllm_cls)
             self._name_remapper = name_remapper_from_prefix_map(prefix)
+        spec = self.structure_spec()
+        if spec is not None and spec.recipe_to_vllm:
+            mapped = spec.rewrite_recipe_to_vllm(checkpoint_name)
+            if mapped != checkpoint_name:
+                return mapped
         return self._name_remapper(checkpoint_name)
 
     def source_tensor_name(self, model_qname: str) -> str:
@@ -214,7 +234,19 @@ class ModelProfile(ABC):
         (`model.language_model.layers.X.*`) that vLLM expects.
 
         Default: identity. Multimodal architectures override."""
+        spec = self.structure_spec()
+        if spec is not None and spec.recipe_to_source:
+            return spec.rewrite_recipe_to_source(model_qname)
         return model_qname
+
+    def export_tensor_name(self, model_qname: str) -> str:
+        """Rewrite an emitted tensor key to the checkpoint key to write.
+
+        This usually matches ``source_tensor_name``. Profiles may override
+        when source-checkpoint lookup and export-load naming intentionally
+        differ because the serving runtime performs its own loader remap.
+        """
+        return self.source_tensor_name(model_qname)
 
     def live_to_recipe_name(self, live_qname: str) -> str:
         """Map a live HF-module qname (from `named_modules()` on the
@@ -229,6 +261,9 @@ class ModelProfile(ABC):
         infix so the allocator's assignment dict lookups succeed.
 
         Default: identity. Multimodal architectures override."""
+        spec = self.structure_spec()
+        if spec is not None and spec.live_to_recipe:
+            return spec.rewrite_live_to_recipe(live_qname)
         return live_qname
 
     def on_disk_expert_qname(self, live_hf_qname: str) -> str:
@@ -273,6 +308,11 @@ class ModelProfile(ABC):
         When True, the exporter splits along the row dim (gate/up
         halves for `gate_up_proj`) and emits per-expert 2D tensors
         named `<parent>.{expert_id}.{proj_name}.weight[.suffix]`."""
+        spec = self.structure_spec()
+        if spec is not None:
+            decision = spec.split_packed_experts_for_format(fmt)
+            if decision is not None:
+                return decision
         return fmt != "BF16"
 
     # ------------------------------------------------------------
@@ -282,7 +322,17 @@ class ModelProfile(ABC):
         """Prefixes of checkpoint keys that should be copied from the
         source checkpoint as-is (typically visual encoder + MTP when
         not being quantized)."""
+        spec = self.structure_spec()
+        if spec is not None and spec.passthrough_prefixes:
+            return spec.passthrough_prefixes
         return ()
+
+    def serving_profile_id(self) -> str | None:
+        """Default serving/backend constraint profile for this model family."""
+        spec = self.structure_spec()
+        if spec is not None:
+            return spec.default_serving_profile
+        return None
 
     def stage_text_only_strip_keys(self) -> tuple[str, ...]:
         """HF config keys to drop when creating a text-only staged
@@ -513,6 +563,35 @@ class ModelProfile(ABC):
         code (DSv4) use this to install monkey-patches and register
         with AutoConfig / AutoModelForCausalLM. Default: no-op."""
         pass
+
+    # ------------------------------------------------------------
+    # Declarative structure graph
+    # ------------------------------------------------------------
+    def structure_spec(self):
+        """Return this profile's declarative structure spec, if present.
+
+        The spec is an additive, no-behavior-change description of naming,
+        grouping, passthrough, and decomposition rules.  Existing production
+        paths continue to use the executable profile methods until call sites
+        explicitly opt into a ``ModelGraph``.
+        """
+        from .structure import load_structure_spec
+
+        if not self._structure_spec_loaded:
+            self._structure_spec = load_structure_spec(self.name)
+            self._structure_spec_loaded = True
+        return self._structure_spec
+
+    def build_model_graph(self, model):
+        """Build a typed graph from a live model using this profile.
+
+        This is intentionally not called from hot paths yet.  It provides a
+        single graph artifact for future allocator/cache/export migration while
+        preserving the current cache and prefetch implementations.
+        """
+        from .structure import build_model_graph
+
+        return build_model_graph(model, self, spec=self.structure_spec())
 
 
 # ---------------------------------------------------------------------------
