@@ -1,4 +1,4 @@
-"""In-process multi-chunk REAP probe driver.
+"""In-process multi-chunk expert-saliency probe driver.
 
 Loads the source model + StreamingContext + LayerCache once, then iterates
 N calibration chunks through the standard `incremental_probe.main()` loop
@@ -412,7 +412,7 @@ def main() -> int:
         if per is not None:
             s["h_trace_per_expert"] = [float(v) / tokens for v in per]
 
-    # REAP expert pruning is archived. Preserve compatibility fields but
+    # Expert pruning is archived. Preserve compatibility fields but
     # do not propagate old per-chunk saliency into new merged probes.
     expert_saliency_per_domain = {}
     expert_saliency_global = {}

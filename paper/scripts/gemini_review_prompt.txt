@@ -22,8 +22,8 @@ Three orthogonal questions:
      iterate_perturbed_allocation.py:segmented_kneedle_point and
      adaptive_validated_frontier_kneedle.
    - The historical attribution of commits / numerical incidents
-     (the stacking-interference paragraph in section 2.5, the AWQ
-     defaulted-off claim, the do-no-harm gate, the propagated-cost L3
+     (the stacking-interference paragraph in section 2.5, the
+     do-no-harm gate, the propagated-cost L3
      paired-baseline semantics).
    - The relationship between v1 (the per-Linear sensitivity allocator
      plus per-tensor toolkit) and PrismaSCOUT (the validated-frontier
@@ -85,11 +85,10 @@ Source material to consult
 3. Figures: /home/rob/prismaquant/paper/figures/*.tex
 4. Codebase the paper describes: /home/rob/prismaquant/prismaquant/
    (especially iterate_perturbed_allocation.py, propagated_cost.py,
-   perturbed_x_cache.py, allocator_solver.py, halo.py,
-   measure_quant_cost.py, kernels/nvfp4_fused.py)
+   perturbed_x_cache.py, allocator_solver.py, measure_quant_cost.py,
+   kernels/nvfp4_fused.py)
 5. Documentation: /home/rob/prismaquant/docs/prismascout_overview.md,
-   /home/rob/prismaquant/docs/propagated_cost.md,
-   /home/rob/prismaquant/docs/halo/design.md
+   /home/rob/prismaquant/docs/propagated_cost.md
 6. Handover record:
    /home/rob/prismaquant/.claude/prismaquant-handover-2026-04-29.md,
    /home/rob/prismaquant/.claude/codex-handover-2026-04-29-pm.md,

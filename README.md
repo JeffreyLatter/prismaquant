@@ -20,11 +20,11 @@ vllm serve $WORK_DIR/exported --quantization compressed-tensors
 | **PrismaSCOUT** (5.31 bpp) | **20.17 GB** | **5.31** | **0.0151** |
 | Change | **−2.5 GB (−11%)** | −0.19 | **−0.0324 (−68%)** |
 
-Same source weights, same per-tensor toolkit (HALO, GPTQ damp sweep, scale sweep, block-output match). Only the selection routine changed. Public artifact: [`rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm`](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm) (DOI `10.57967/hf/8656`).
+Same source weights, same per-tensor toolkit (GPTQ damp sweep, scale sweep, block-output match). Only the selection routine changed. Public artifact: [`rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm`](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm) (DOI `10.57967/hf/8656`).
 
 **Production-faithful polish — provisional, calibration re-measurement in flight.**
 
-A second selection-only upgrade evaluates candidate format flips against the export-aligned per-Linear weight path (joint NVFP4 sibling-coherent input global scales, GPTQ reconstruction, scale sweep, and calibrated activation clip; block-output match and HALO remain on the export-only side). On Qwen3.6-27B it drops the polish-time KL from `0.0151` to `0.0054` at `5.39` bpp, on a matched 2×128 token calibration. **A re-measurement on the larger 8×512 split is in flight; treat the 0.0054 number as a polish-time signal until that completes.**
+A second selection-only upgrade evaluates candidate format flips against the export-aligned per-Linear weight path (joint NVFP4 sibling-coherent input global scales, GPTQ reconstruction, scale sweep, and calibrated activation clip; block-output match remains on the export-only side). On Qwen3.6-27B it drops the polish-time KL from `0.0151` to `0.0054` at `5.39` bpp, on a matched 2×128 token calibration. **A re-measurement on the larger 8×512 split is in flight; treat the 0.0054 number as a polish-time signal until that completes.**
 
 **Qwen3.6-35B-A3B at 4.75 bpp — wins 8 of 9 zero-shot metrics vs uniform NVFP4.**
 
@@ -86,13 +86,13 @@ python -m prismaquant.polish_from_assignment \
 
 ## How it works
 
-Mixed-precision quantization decomposes naturally into two questions: **how should each Linear be rounded** (per-tensor toolkit — GPTQ, AutoRound, HALO, scale sweep) and **how many bits should each Linear get** (allocator). The first question is well-studied; the second is where PrismaQuant operates.
+Mixed-precision quantization decomposes naturally into two questions: **how should each Linear be rounded** (per-tensor toolkit — GPTQ, AutoRound, scale sweep) and **how many bits should each Linear get** (allocator). The first question is well-studied; the second is where PrismaQuant operates.
 
 The classical answer is to assign a per-Linear sensitivity score and pack a multi-choice knapsack under a total-bit budget. This is the v1 PrismaQuant pipeline:
 
 $$\Delta\mathrm{loss} \approx \tfrac{1}{2} \cdot H_\mathrm{trace} \cdot \mathrm{MSE}_W$$
 
-`H_trace` is the empirical Fisher diagonal trace (one calibration pass), `MSE_W` is the measured per-format round-trip error on the actual weights, and the knapsack is solved in seconds. **Each bit goes where it buys the most likelihood.** For MoE, the knapsack lifts naturally to `(format, dropped_expert_ids)` — joint expert pruning + quantization is a first-class operation, not a post-processing pass.
+`H_trace` is the empirical Fisher diagonal trace (one calibration pass), `MSE_W` is the measured per-format round-trip error on the actual weights, and the knapsack is solved in seconds. **Each bit goes where it buys the most likelihood.**
 
 The structural problem with that pipeline, observed across the mixed-precision allocation literature: per-Linear sensitivity scores are **biased estimators of joint quantization error**. When the allocator commits many flips at once, the additive surrogate's predicted loss systematically overshoots the measured KL by 30–50%. **CLADO** (Deng et al. 2023, [arXiv:2307.05657](https://arxiv.org/abs/2307.05657)) is the foundational treatment of this: it measures the residual pairwise quantization-error coupling between Linears on a small data subset and solves the resulting integer quadratic program directly. HAWQ-V3 uses second-order ILP; CoopQ takes a cooperative-game view. PrismaSCOUT takes a different tack:
 
@@ -106,7 +106,7 @@ PrismaSCOUT keeps the additive surrogate as a cheap candidate generator but rout
 
 A **validated-frontier kneedle** runs the cascade at multiple anchor budgets, validates each candidate on the held-out split, filters by `η`-dominance, and selects the elbow on measured `(bpp, KL)`. A **monotone coordinate-descent polish** then perturbs the chosen assignment locally and accepts only flips that strictly improve real KL — provably non-regressive on the polish-time evaluator.
 
-The **production-faithful polish** is the most recent refinement: instead of evaluating polish flips on RTN-quantized proxy weights (which the v1 polish did), it evaluates on the export-aligned per-Linear weight path (joint NVFP4 sibling-coherent input global scales, GPTQ, scale sweep, calibrated activation clip; block-output match and HALO remain export-only). The polish move set is a set of **Block-CLADO decision units** — fused-sibling Linears (e.g., `q/k/v` in attention, `gate_up/down` in MoE) grouped into atomic flip targets, following the structural framing of CLADO (Deng et al. 2023). A delta-quantize `WeightSession` swaps one decision unit's weight in place per trial instead of cloning the model, which makes the polish tractable on a 27B model under a 121 GB UMA budget.
+The **production-faithful polish** is the most recent refinement: instead of evaluating polish flips on RTN-quantized proxy weights (which the v1 polish did), it evaluates on the export-aligned per-Linear weight path (joint NVFP4 sibling-coherent input global scales, GPTQ, scale sweep, calibrated activation clip; block-output match remains export-only). The polish move set is a set of **Block-CLADO decision units** — fused-sibling Linears (e.g., `q/k/v` in attention, `gate_up/down` in MoE) grouped into atomic flip targets, following the structural framing of CLADO (Deng et al. 2023). A delta-quantize `WeightSession` swaps one decision unit's weight in place per trial instead of cloning the model, which makes the polish tractable on a 27B model under a 121 GB UMA budget.
 
 For full method derivations, the `_GradNormCapture` MoE Fisher estimator, the L3 paired-baseline construction, the calibration-disjointness discipline, and the rejected detours we considered (Lagrangian λ-bisection, sandwich proximal recalibration, block-DP over architectural cliques, sparse pairwise QUBO, top-K Hessian covering): see [`paper/main.pdf`](paper/main.pdf) and the source comments in `prismaquant/`.
 
@@ -115,7 +115,7 @@ For full method derivations, the `_GradNormCapture` MoE Fisher estimator, the L3
 ## Pipeline
 
 ```
-sensitivity_probe ──► probe.pkl     (Fisher H_trace per Linear + per-expert REAP saliency)
+sensitivity_probe ──► probe.pkl     (Fisher H_trace per Linear + router statistics)
         │
 measure_quant_cost ─► cost.pkl      (per-(Linear, format) MSE — L1)
         │
@@ -212,13 +212,12 @@ The full paper draft is at [`paper/main.pdf`](paper/main.pdf).
 
 ## Acknowledgements
 
-PrismaQuant builds on a decade of mixed-precision quantization research. The closed-form cost model, Fisher-diagonal sensitivity estimator, multi-choice knapsack formulation, and per-expert REAP saliency are assembled from published ideas. Selected key influences:
+PrismaQuant builds on a decade of mixed-precision quantization research. The closed-form cost model, Fisher-diagonal sensitivity estimator, and multi-choice knapsack formulation are assembled from published ideas. Selected key influences:
 
 - **Cross-layer dependency in allocation (foundational)** — CLADO (Deng et al. 2023, [arXiv:2307.05657](https://arxiv.org/abs/2307.05657)) for the integer-quadratic-programming formulation over pairwise quantization-error coupling and the decision-unit framing PrismaQuant's Block-CLADO pipeline builds on
 - **Mixed-precision allocation** — HAWQ-V1/V2/V3 (Dong et al. 2019–2021), CoopQ (Zhao et al. 2025), AMQ (Lee et al. 2025)
-- **Post-training quantization** — GPTQ (Frantar et al. 2022), AutoRound (Cheng et al. 2023), AWQ (Lin et al. 2023)
-- **Outlier handling** — SqueezeLLM (Kim et al. 2023), SpQR (Dettmers et al. 2023), SmoothQuant (Xiao et al. 2022)
-- **MoE pruning** — REAP (Lasby et al. 2025) for the dropout-loss saliency formulation
+- **Post-training quantization** — GPTQ (Frantar et al. 2022), AutoRound (Cheng et al. 2023)
+- **Outlier handling** — SqueezeLLM (Kim et al. 2023), SpQR (Dettmers et al. 2023)
 - **Pareto-knee detection** — Kneedle (Satopaa et al. 2011)
 - **Foundation** — Cover & Thomas, *Elements of Information Theory* (2006), Chapter 13 on rate-distortion bit allocation
 - **Geometry-aware rounding** — Chen et al. 2026 (GPTQ as Babai's nearest plane algorithm)

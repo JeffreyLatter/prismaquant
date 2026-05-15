@@ -112,12 +112,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "per-Linear damp sweep) plus JSO. "
         "scale_sweep regresses end-to-end KL on Qwen3-4B and was dropped "
         "from defaults 2026-05-15. "
-        "static_act_order (SAO), awq_round, fisher_gptq, act_clip_solver, "
-        "and fisher_clip are archived legacy names; if passed in --enable "
-        "they are still parsed by the lever wiring but the corresponding "
-        "subsystems are walled off (see archive/foldscale_orthog_2026-05-13, "
-        "archive/prismaclip_2026-05-14, archive/fisher_2026-05-15, "
-        "archive/halo_2026-05-15). "
+        "static_act_order (SAO) and fisher_gptq are archived legacy names "
+        "and must not be used for V1 production artifacts. "
         "Joint NVFP4 sibling globals + calibrated input_global_scale are "
         "computed unconditionally when NVFP4 is in the format menu. "
         "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
@@ -183,19 +179,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="During re-cache, install production weights but leave activation "
         "quantization disabled in replay hooks.",
     )
-    p.add_argument(
-        "--halo-mode",
-        choices=("off", "random"),
-        default="off",
-        help="Apply HALO before rendering production weights. A HALO cache is "
-        "only valid with matching export --halo-mode/--halo-seed.",
-    )
-    p.add_argument(
-        "--halo-seed",
-        type=int,
-        default=0,
-        help="RNG seed for HALO random Hadamard sign diagonal.",
-    )
     args = p.parse_args(argv)
 
     # Opt-in deterministic CUDA path. The default lever ablations on small
@@ -224,7 +207,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
 
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -284,35 +267,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile = detect_profile(args.model)
         except Exception:
             profile = DefaultProfile()
-        halo_meta = {"mode": "off"}
-        if args.halo_mode == "random":
-            from prismaquant.halo import apply_random_halo_to_model
-
-            cfg = AutoConfig.from_pretrained(
-                staged,
-                trust_remote_code=True,
-                local_files_only=local_only,
-            )
-            print(
-                f"[build-prod-cache] applying HALO mode=random "
-                f"seed={args.halo_seed}",
-                flush=True,
-            )
-            _, halo_meta = apply_random_halo_to_model(
-                model,
-                profile,
-                cfg,
-                seed=args.halo_seed,
-                verbose=True,
-            )
-            print(
-                "[build-prod-cache] HALO applied: "
-                f"dim={halo_meta['dim']} "
-                f"blocks={halo_meta['block_sizes']} "
-                f"hash={halo_meta['rotation_hash']}",
-                flush=True,
-            )
-
         skip_tokens = list(args.skip_qnames or [])
         qnames: list[str] = []
         skipped: list[str] = []
@@ -379,10 +333,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             h_detail_dir=args.h_detail_dir,
         )
         elapsed = time.monotonic() - t0
-        meta = dict(getattr(cache, "metadata", {}) or {})
-        meta["halo"] = halo_meta
-        cache.metadata = meta
-
         # Strict coverage validation: every (qname, NVFP4) must be present
         # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky
         # failures, and any other silent gaps that would otherwise fall

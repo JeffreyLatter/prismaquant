@@ -72,24 +72,15 @@ def test_builtin_mechanism_order_uses_operation_semantics():
         "gptq",
         "fisher_gptq",
         "four_over_six",
-        "prismaclip",
     ])
 
     assert plan.errors == ()
     assert plan.names() == (
-        "prismaclip",
         "four_over_six",
         "fisher_gptq",
         "gptq",
         "scale_sweep",
     )
-
-
-def test_archived_fold_transforms_are_not_registered():
-    plan = resolve_render_mechanism_order(["awq"])
-
-    assert plan.errors
-    assert "unknown render mechanism" in plan.errors[0]
 
 
 def test_plugin_mechanism_can_declare_phase_and_dependency():

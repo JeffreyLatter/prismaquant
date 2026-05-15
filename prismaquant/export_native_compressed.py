@@ -78,13 +78,12 @@ except ModuleNotFoundError:
 from safetensors.torch import save_file
 
 from .allocator_candidates import check_format_applicability
-from .expert_prune import raise_expert_prune_disabled
 from .layer_config import (
     canonicalize_assignment as _canonicalize_assignment,
     canonicalize_format,
 )
 from .model_profiles.qwen3_5 import Qwen3_5Profile
-from .schemas import validate_layer_config_payload, validate_prune_manifest_payload
+from .schemas import validate_layer_config_payload
 
 # ---------------------------------------------------------------------------
 # NVFP4 packing (inlined from compressed-tensors fp4_quantized.py to avoid
@@ -436,12 +435,6 @@ def _round_to_codebook(values_in_grid: torch.Tensor) -> torch.Tensor:
 
 def _canonical_export_format(fmt: str) -> str:
     fmt_u = str(fmt).upper()
-    if fmt_u == "NVFP4_CLIPPED":
-        raise ValueError(
-            "NVFP4_CLIPPED is the PrismaClip cache variant; PrismaClip is "
-            "archived under archive/prismaclip_2026-05-14 and is no longer "
-            "available on the production path. Use NVFP4."
-        )
     if fmt_u == "MXFP8_E4M3":
         return "MXFP8"
     return fmt
@@ -461,34 +454,11 @@ def _resolve_act_clip_quantile(default: str = "0.999") -> float | None:
 
 def _normalize_act_clip_rescale(mode: str | None) -> str:
     if mode is None:
-        mode = os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING", "none")
+        mode = "none"
     normalized = str(mode).strip().lower().replace("-", "_")
     if normalized in {"", "0", "false", "no", "off", "none"}:
         return "none"
-    if normalized in {"rbc", "row_rms", "row_l2", "rms"}:
-        raise RuntimeError(
-            "PrismaClip-RBC activation rescaling is disabled pending "
-            "investigation: the 2026-05-12 Qwen3.5-0.8B smoke regressed KL "
-            "and was about 10x slower in production-cache fill."
-        )
-    if normalized in {"row_mean_abs", "mean_abs", "l1"}:
-        raise RuntimeError(
-            "PrismaClip-RBC activation rescaling is disabled pending "
-            "investigation: the 2026-05-12 Qwen3.5-0.8B smoke regressed KL "
-            "and was about 10x slower in production-cache fill."
-        )
-    raise ValueError(
-        f"unknown activation clip rescale mode {mode!r}; "
-        "expected none, row_rms, or row_mean_abs"
-    )
-
-
-def _act_clip_rescale_max(default: float = 8.0) -> float:
-    try:
-        value = float(os.environ.get("PRISMAQUANT_ACT_CLIP_RBC_MAX_RESCALE", default))
-    except Exception:
-        value = default
-    return max(1.0, min(float(value), 1024.0))
+    raise ValueError("activation clip rescaling is not supported")
 
 
 def _rescale_clipped_activation_matrix(
@@ -497,28 +467,11 @@ def _rescale_clipped_activation_matrix(
     *,
     mode: str,
 ) -> torch.Tensor:
-    """Rescale clipped activation rows for PrismaClip-RBC.
-
-    Row-RMS mode preserves each row's pre-clipping energy after clamping its
-    extremes. This keeps outlier rows visible to the optimizer while reducing
-    the dominance of the outlier channel itself. The cap prevents a heavily
-    clipped row from being amplified into a new pathological objective.
-    """
+    """Return clipped activations, rejecting retired row-rescale modes."""
     mode = _normalize_act_clip_rescale(mode)
     if mode == "none" or original.numel() == 0:
         return clipped
-    if mode == "row_rms":
-        orig_stat = original.pow(2).mean(dim=1, keepdim=True).sqrt()
-        clip_stat = clipped.pow(2).mean(dim=1, keepdim=True).sqrt()
-    elif mode == "row_mean_abs":
-        orig_stat = original.abs().mean(dim=1, keepdim=True)
-        clip_stat = clipped.abs().mean(dim=1, keepdim=True)
-    else:
-        raise ValueError(f"unsupported activation clip rescale mode {mode!r}")
-    scale = orig_stat / clip_stat.clamp_min(1e-12)
-    scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0)
-    scale = scale.clamp(min=1.0, max=_act_clip_rescale_max())
-    return clipped * scale
+    raise ValueError("activation clip rescaling is not supported")
 
 
 def _activation_matrix_for_gptq(
@@ -823,36 +776,6 @@ def _production_cache_lookup_key(name: str, fmt: str):
                 return key
     return None
 
-
-def _load_production_cache_variant_map(path: str | None) -> dict[str, str]:
-    if not path:
-        return {}
-    with open(path) as fh:
-        payload = json.load(fh)
-    if not isinstance(payload, dict):
-        raise ValueError("--production-cache-variant-map must contain a JSON object")
-    raw = payload.get("chosen_cache_variants")
-    if raw is None:
-        numeric = payload.get("numeric_variants")
-        if isinstance(numeric, dict):
-            raw = numeric.get("chosen_cache_variants")
-    if raw is None:
-        raw = payload
-    if not isinstance(raw, dict):
-        raise ValueError(
-            "--production-cache-variant-map must be a qname->cache-format map "
-            "or a probe payload containing chosen_cache_variants"
-        )
-    out: dict[str, str] = {}
-    for qname, fmt in raw.items():
-        q = str(qname).strip()
-        f = str(fmt).strip().upper()
-        if not q or not f:
-            continue
-        out[q] = f
-    return out
-
-
 def _production_cache_expected_keys(
     assignment: dict[str, str],
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -926,7 +849,6 @@ def _production_cache_fingerprint(
         "hash": digest,
         "activation_max_abs_hash": act_digest,
         "metadata_hash": metadata_digest,
-        "halo": metadata.get("halo", {"mode": "off"}),
         "levers": dict(getattr(cache, "levers", {}) or {}),
     }
 
@@ -1202,9 +1124,7 @@ def _pack_production_cached_2d(
 # so we don't have to thread 3 boolean kwargs through every call
 # site — unit tests pass the flags directly via kwargs.
 _ACT_AWARE_FLAGS: dict[str, bool] = {
-    "awq": False,
     "gptq": False,
-    "awq_round": False,
     "scale_sweep": False,
     "static_act_order": False,
     "joint_scale_opt": False,
@@ -1592,6 +1512,7 @@ def _gptq_obs_rounding_nvfp4_swept(
             best_w = w_q
             best_damp = damp
     if log_path:
+        import hashlib
         import json as _json
         entry = {
             "linear_name": linear_name,
@@ -1617,89 +1538,6 @@ def _gptq_obs_rounding_nvfp4_swept(
     return best_w
 
 
-def _activation_weighted_round_nvfp4(
-    weight: torch.Tensor, activations: torch.Tensor,
-    group_size: int = 16,
-    global_real_override: torch.Tensor | None = None,
-    clip_threshold: float | None = None,
-    clip_rescale: str | None = None,
-    fisher_row_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """For each weight, pick the NVFP4 grid neighbor (above or below)
-    that minimizes per-column `|Δw|² · E[|a|²]`.
-
-    Closed-form, no iteration: evaluate both rounding choices, keep
-    the one with lower activation-weighted squared error per column.
-    Returns dequantized weight `[out, in]` (float32) — caller still
-    runs the NVFP4 packer on it, and because each weight lands on a
-    valid grid point, the packed result matches this dequantized
-    tensor bit-for-bit.
-    """
-    W = weight.to(torch.float32).contiguous()
-    rows, cols = W.shape
-    if cols % group_size != 0:
-        raise ValueError(f"act-round requires group_size={group_size} ∤ {cols}")
-
-    if clip_threshold is not None and clip_threshold > 0.0:
-        a = _activation_matrix_for_gptq(
-            activations,
-            cols,
-            device=W.device,
-            clip_threshold=clip_threshold,
-            clip_rescale=clip_rescale,
-            row_weights=fisher_row_weights,
-        )
-    else:
-        a = _activation_matrix_for_gptq(
-            activations,
-            cols,
-            device=W.device,
-            clip_quantile=0.0,
-            row_weights=fisher_row_weights,
-        )
-    # Per-input-channel importance = E[a^2]. Clamp to avoid degenerate
-    # channels (all-zero activations) making rounding indifferent.
-    col_importance = a.pow(2).mean(dim=0).clamp_min(1e-12)     # [in]
-
-    # Compute per-tensor outer scale consistently with
-    # quantize_dequantize_nvfp4.
-    grouped = W.reshape(rows, cols // group_size, group_size)
-    s_g_real = _select_nvfp4_group_scales(grouped)
-    if global_real_override is not None:
-        global_real = global_real_override.to(W.device).clamp_min(1e-12).float()
-    else:
-        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
-    fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
-    eff_scale = (fp8_scale_real * global_real).unsqueeze(-1).clamp_min(1e-12)
-    # Scale into grid.
-    in_grid = grouped / eff_scale                                # [rows, n_g, gs]
-
-    cb = _nvfp4_codebook(W.device, dtype=torch.float32)          # [8]
-    abs_x = in_grid.abs()
-    idx = torch.bucketize(abs_x, cb)
-    idx_lo = (idx - 1).clamp_min(0).clamp_max(cb.numel() - 1)
-    idx_hi = idx.clamp_max(cb.numel() - 1)
-    lo_v = cb[idx_lo]
-    hi_v = cb[idx_hi]
-    sign = torch.where(in_grid >= 0, 1.0, -1.0)
-    neigh_lo = sign * lo_v
-    neigh_hi = sign * hi_v
-    # Deltas in grid space. Convert to weight space by multiplying
-    # eff_scale. That preserves the per-column importance weighting
-    # on real Δw² (what actually enters the output-space error).
-    delta_lo = (neigh_lo - in_grid) * eff_scale                  # [rows, n_g, gs]
-    delta_hi = (neigh_hi - in_grid) * eff_scale
-    # col_importance broadcast: [cols] → [1, n_g, gs]
-    col_imp = col_importance.reshape(1, cols // group_size, group_size)
-    err_lo = delta_lo.pow(2) * col_imp
-    err_hi = delta_hi.pow(2) * col_imp
-    pick_hi = err_hi < err_lo
-    chosen = torch.where(pick_hi, neigh_hi, neigh_lo)            # [rows, n_g, gs]
-
-    W_dq = (chosen * eff_scale).reshape(rows, cols)
-    return W_dq
-
-
 def _scale_sweep_nvfp4(
     weight: torch.Tensor, activations: torch.Tensor,
     group_size: int = 16,
@@ -1719,8 +1557,7 @@ def _scale_sweep_nvfp4(
     on the NVFP4 codebook and compute the activation-weighted MSE
     `sum_j a_j²·(w_orig,j - w_q,j)²` against the ORIGINAL (pre-pass)
     weight. Keep the configuration minimizing MSE per group, with an
-    improve-or-keep gate against whatever `weight` is coming in (which
-    may already be post-GPTQ / post-awq_round).
+    improve-or-keep gate against whatever `weight` is coming in.
 
     `reference_weight`: the pre-pass (float32) weight used to measure
     MSE. Defaults to `weight` (the post-pass state) when not supplied
@@ -2338,11 +2175,8 @@ def _build_target_list(vllm_names: list[str]) -> list[str]:
         inner_r = inner.replace(".", "[.]")
         # Always emit the [0-9]+ wildcard for the expert position. vLLM's
         # FusedMoE.get_moe_method probes the synthetic name `experts.0.X_proj`
-        # against this regex, and the saved checkpoint uses dense renumbered
-        # eids (0..K-1) — so any literal alternation built from the source
-        # checkpoint's *original* eids would miss expert 0 whenever expert 0
-        # was pruned out. Per FusedMoE semantics every kept expert in a layer
-        # shares the same scheme, so wildcarding is also semantically correct.
+        # against this regex, and every expert in a layer shares the same
+        # scheme, so wildcarding is semantically correct.
         expr = "[0-9]+"
         collapsed.append(
             f"re:^{prefix_r}layers[.]{L}[.]{inner_r}[.]experts[.]{expr}"
@@ -2386,159 +2220,6 @@ def _packed_experts_param_names(module: nn.Module) -> list[str]:
             and p.dim() == 3
             and n in _PACKED_EXPERT_PARAM_NAMES)
     )
-
-
-# ---------------------------------------------------------------------------
-# Prune-manifest plumbing (REAP-style expert drop + reindex)
-# ---------------------------------------------------------------------------
-# Sidecar file written by the allocator next to `layer_config.json` as
-# `<layer_config>.prune.json`. One entry per MoE layer that had experts
-# dropped, keyed by router qname (e.g. `model.layers.0.mlp.gate`). Each
-# entry carries:
-#   num_experts_orig, num_experts_kept — the before/after counts
-#   pruned_expert_ids : list[int]      — original eids to drop
-#   kept_expert_ids   : list[int]      — original eids that survive
-#   orig_to_new_eid   : {str(orig): new_dense_idx}  — reindex map
-# The exporter uses this to (a) skip the pruned experts' tensors, (b)
-# reindex kept experts to a contiguous 0..K-1 range in the output keys
-# (vLLM's FusedMoE / ModuleList indexing requires dense), (c) shrink
-# the router weight's out-dim to K rows in kept-order, and (d) update
-# HF config num_experts fields.
-_EXPERT_IDX_IN_QNAME_RE = re.compile(
-    r"^(?P<parent>.+)\.experts\.(?P<eid>\d+)(?:\.(?P<rest>.+))?$"
-)
-
-
-def _load_prune_manifest(path: Path | str | None) -> dict[str, dict]:
-    """Load a prune-sidecar JSON. Returns an empty dict when the file
-    doesn't exist — non-prune exports are the default case."""
-    if path is None:
-        return {}
-    p = Path(path)
-    if not p.exists():
-        return {}
-    with open(p) as f:
-        data = json.load(f)
-    validate_prune_manifest_payload(data, str(p))
-    if data:
-        raise_expert_prune_disabled("export prune manifest")
-    return data
-
-
-def _index_prune_by_parent(manifest: dict[str, dict]) -> dict[str, dict]:
-    """Re-index the router-keyed manifest by the parent qname common to
-    both the router and the experts module (e.g. `model.layers.0.mlp`
-    for router `.mlp.gate` and experts container `.mlp.experts`).
-
-    Return dicts carry the router_qname alongside the entry so callers
-    can distinguish the router from its experts when they share a
-    parent.
-    """
-    by_parent: dict[str, dict] = {}
-    for router_qname, entry in manifest.items():
-        parent = router_qname.rsplit(".", 1)[0]
-        by_parent[parent] = {"router_qname": router_qname, **entry}
-    return by_parent
-
-
-def _resolve_linear_prune_action(
-    full_qname: str,
-    prune_by_parent: dict[str, dict],
-) -> tuple[str, dict] | None:
-    """Map a live nn.Linear's qname to a prune action.
-
-    Returns one of:
-      ("router", entry)  — this IS the gated router; shrink out-dim to
-                           kept_expert_ids (in order).
-      ("drop",   entry)  — this is a PRUNED per-expert Linear; skip it.
-      ("reindex", entry) — this is a KEPT per-expert Linear; emit under
-                           a reindexed qname. `entry["new_full"]` has
-                           the rewritten qname.
-      None               — not MoE-prune-relevant; fall through to the
-                           default code path.
-    """
-    if not prune_by_parent:
-        return None
-    # Router check: exact qname match.
-    parent = full_qname.rsplit(".", 1)[0]
-    entry = prune_by_parent.get(parent)
-    if entry is not None and entry["router_qname"] == full_qname:
-        return "router", entry
-    # Per-expert Linear: qname shape `<parent>.experts.<eid>.<rest>`.
-    m = _EXPERT_IDX_IN_QNAME_RE.match(full_qname)
-    if m is None:
-        return None
-    parent = m.group("parent")
-    entry = prune_by_parent.get(parent)
-    if entry is None:
-        return None
-    try:
-        eid = int(m.group("eid"))
-    except (TypeError, ValueError):
-        return None
-    if eid in set(entry["pruned_expert_ids"]):
-        return "drop", entry
-    new_eid = entry["orig_to_new_eid"].get(str(eid))
-    if new_eid is None:
-        return None
-    rest = m.group("rest")
-    new_full = (
-        f"{parent}.experts.{new_eid}.{rest}" if rest
-        else f"{parent}.experts.{new_eid}"
-    )
-    out_entry = dict(entry)
-    out_entry["new_full"] = new_full
-    out_entry["orig_eid"] = eid
-    out_entry["new_eid"] = int(new_eid)
-    return "reindex", out_entry
-
-
-def _resolve_packed_experts_prune(
-    experts_qname: str,
-    prune_by_parent: dict[str, dict],
-) -> dict | None:
-    """For a packed-experts module at `experts_qname` (e.g.
-    `model.layers.0.mlp.experts`), return the prune entry keyed by its
-    parent (`model.layers.0.mlp`) if this layer is pruned. Otherwise
-    None.
-    """
-    if not prune_by_parent:
-        return None
-    parent = experts_qname.rsplit(".", 1)[0]
-    return prune_by_parent.get(parent)
-
-
-def _shrink_router_weight(
-    mod: nn.Linear,
-    entry: dict,
-) -> torch.Tensor:
-    """Drop rows of the router's output dim, keeping `kept_expert_ids`
-    in order. Validates against `num_experts_orig` up-front — a size
-    mismatch means the manifest and the live router disagree and we
-    would emit a silently-broken artifact otherwise.
-    """
-    w = mod.weight.detach()
-    kept = entry["kept_expert_ids"]
-    n_orig = int(entry["num_experts_orig"])
-    if w.shape[0] != n_orig:
-        raise RuntimeError(
-            f"[export-stream] prune: router weight rows "
-            f"({w.shape[0]}) != manifest num_experts_orig "
-            f"({n_orig}). Manifest was built against a different "
-            f"model — refusing to shrink."
-        )
-    idx = torch.as_tensor(kept, dtype=torch.long, device=w.device)
-    return w.index_select(0, idx).contiguous()
-
-
-# HF config field names that hold the MoE expert count. Different
-# archs use different ones; we update whichever exist.
-_MOE_EXPERT_COUNT_FIELDS = (
-    "num_experts",
-    "num_local_experts",
-    "num_routed_experts",
-    "n_routed_experts",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -2683,9 +2364,7 @@ def _quantize_2d(
     act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
     linear_name: str | None = None,
-    awq_enabled: bool = False,
     gptq_enabled: bool = False,
-    awq_round_enabled: bool = False,
     scale_sweep_enabled: bool = False,
     static_act_order_enabled: bool = False,
     joint_scale_opt_enabled: bool = False,
@@ -2710,14 +2389,10 @@ def _quantize_2d(
     otherwise vLLM's runtime activation quant uses an undersized
     dynamic range.
 
-    `gptq_enabled`, `awq_round_enabled`: activation-aware
-    passes composed on the NVFP4 path, order = per-group RTN → GPTQ
-    error prop → activation-weighted rounding polish. Each
-    requires `cached_activations` (looked up from _CACHED_ACTIVATIONS
-    by `linear_name` when not supplied explicitly). MXFP8 ignores
-    gptq_enabled (8-bit quant noise is too small to justify the
-    compute cost); scale-sweep and activation-weighted rounding still
-    run if enabled.
+    `gptq_enabled` and `scale_sweep_enabled` compose activation-aware passes
+    on the NVFP4 path. Each requires `cached_activations` (looked up from
+    _CACHED_ACTIVATIONS by `linear_name` when not supplied explicitly). MXFP8
+    ignores gptq_enabled; scale-sweep still runs when enabled.
 
     `cached_activations`: optional `[N, in_features]` float tensor of
     probe-captured inputs for this Linear. If None and `linear_name`
@@ -2726,9 +2401,7 @@ def _quantize_2d(
     `act_clip_threshold`: optional scalar clamp for the render-time
     activation-aware NVFP4/MXFP8 passes.  When None, legacy behavior is
     preserved: GPTQ/do-no-harm honor PRISMAQUANT_ACT_CLIP_QUANTILE,
-    while scale_sweep and act-round use raw cached activations.
-    `act_clip_rescale` controls PrismaClip-RBC's row-wise rescaling after
-    an explicit clamp; supported values are none, row_rms, and row_mean_abs.
+    while scale_sweep uses raw cached activations.
 
     `fisher_row_weights`: optional per-token gradient² weights aligned to
     cached activation rows. When provided, GPTQ/scale-sweep local objectives
@@ -2760,27 +2433,17 @@ def _quantize_2d(
     # once without threading through every call site. Kwargs still
     # win when any is set True (unit tests pass them explicitly).
     if not (
-        awq_enabled
-        or gptq_enabled
-        or awq_round_enabled
+        gptq_enabled
         or scale_sweep_enabled
         or static_act_order_enabled
         or joint_scale_opt_enabled
     ):
-        awq_enabled = bool(_ACT_AWARE_FLAGS.get("awq"))
         gptq_enabled = bool(_ACT_AWARE_FLAGS.get("gptq"))
-        awq_round_enabled = bool(_ACT_AWARE_FLAGS.get("awq_round"))
         scale_sweep_enabled = bool(_ACT_AWARE_FLAGS.get("scale_sweep"))
         static_act_order_enabled = bool(_ACT_AWARE_FLAGS.get("static_act_order"))
         joint_scale_opt_enabled = bool(_ACT_AWARE_FLAGS.get("joint_scale_opt"))
     static_act_order_enabled = bool(gptq_enabled and static_act_order_enabled)
     joint_scale_opt_enabled = bool(gptq_enabled and joint_scale_opt_enabled)
-    if awq_enabled:
-        raise RuntimeError(
-            "AWQ export has been archived under "
-            "archive/foldscale_orthog_2026-05-13 and is not available "
-            "on the production path."
-        )
 
     if fmt == "NVFP4":
         w_work = weight.to(torch.float32)
@@ -2825,22 +2488,7 @@ def _quantize_2d(
                         joint_scale_opt=joint_scale_opt_enabled,
                     )
 
-        # Step 3: activation-weighted rounding polish. Measured to be
-        # a no-op-at-best / GPTQ-undo-at-worst in the permutation
-        # bake-off (see PrismaQuant repo notes). Off by default; leave
-        # the code path here for A/B testing.
-        if awq_round_enabled:
-            acts_work = _acts_for_error_passes()
-            if acts_work is not None:
-                w_work = _activation_weighted_round_nvfp4(
-                    w_work, acts_work, group_size=16,
-                    global_real_override=nvfp4_global_real_override,
-                    clip_threshold=act_clip_threshold,
-                    clip_rescale=act_clip_rescale,
-                    fisher_row_weights=fisher_row_weights,
-                )
-
-        # Step 3b: closed-form per-group scale sweep. Joint (scale,
+        # Step 3: closed-form per-group scale sweep. Joint (scale,
         # rounding-set) search on the NVFP4 codebook, activation-
         # weighted MSE against the ORIGINAL pre-pass weight, with an
         # improve-or-keep gate against the current w_work. Recovers
@@ -3617,10 +3265,8 @@ def materialize_tensors_streaming(
     dtype: torch.dtype = torch.bfloat16,
     device: torch.device = torch.device("cuda"),
     offload_folder: str | None = None,
-    prune_manifest: dict[str, dict] | None = None,
     tensor_sink: Callable[[dict[str, torch.Tensor]], None] | None = None,
     export_cache_dir: str | None = None,
-    halo_R: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict]:
     """Stream decoder layers through quantize → emit → unload. Never
     holds the full model in memory. Small models still exercise this
@@ -3632,8 +3278,6 @@ def materialize_tensors_streaming(
     When `tensor_sink` is supplied, each emitted head/layer batch is
     passed to the sink and cleared immediately; the returned tensor dict
     is then intentionally empty."""
-    if prune_manifest:
-        raise_expert_prune_disabled("streaming export prune manifest")
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from .layer_streaming import (
@@ -3697,17 +3341,6 @@ def materialize_tensors_streaming(
     # to copy source fp8 + scale_inv bytes verbatim into the output.
     # Distinct key format from the loader-side dequant map above.
     fp8_source_map = _build_fp8_source_map(model_path)
-    prune_by_parent = _index_prune_by_parent(prune_manifest or {})
-    if prune_by_parent:
-        n_pruned_total = sum(
-            e["num_experts_orig"] - e["num_experts_kept"]
-            for e in prune_by_parent.values()
-        )
-        print(
-            f"[export-stream] prune manifest: {len(prune_by_parent)} "
-            f"MoE layers, {n_pruned_total} experts dropped total",
-            flush=True,
-        )
     if fp8_source_map:
         print(f"[export-stream] fp8 source-emit map: {len(fp8_source_map)} "
               f"Linears available for FP8_SOURCE passthrough", flush=True)
@@ -3736,30 +3369,6 @@ def materialize_tensors_streaming(
     # passthrough UNLESS `lm_head` (or similar) is explicitly in the
     # assignment.
     t_head = time.time()
-
-    # HALO rotation on the head section (#4). Folds final_norm gamma into
-    # lm_head and right-rotates embedding + lm_head so the residual
-    # stream starts in the rotated frame. Per-layer rotation continues
-    # in the streaming loop below. See prismaquant/halo.py.
-    if halo_R is not None:
-        from .halo import apply_halo_to_head
-        # Resolve embed/norm qnames from the resolved base_prefix —
-        # multimodal Qwen has body at model.language_model.*, dense
-        # transformer-style models have body at model.*.
-        _embed_qname = (f"{base_prefix}.embed_tokens"
-                        if base_prefix else "model.embed_tokens")
-        _final_norm_qname = (f"{base_prefix}.norm"
-                             if base_prefix else "model.norm")
-        n_head = apply_halo_to_head(
-            model, halo_R,
-            embed_qname=_embed_qname,
-            lm_head_qname=profile.lm_head_name(),
-            final_norm_qname=_final_norm_qname,
-            strict=True,
-        )
-        print(f"[halo] head rotation: {n_head} tensors "
-              f"(embed={_embed_qname}, norm={_final_norm_qname})",
-              flush=True)
 
     def _emit_head_param(full_qname: str, param: nn.Parameter):
         recipe_key = profile.live_to_recipe_name(full_qname)
@@ -3860,16 +3469,8 @@ def materialize_tensors_streaming(
         # the cache is silently wrong because the saved layer tensors
         # were quantized under a different recipe. Write/check a
         # manifest.json; mismatch invalidates the cache wholesale.
-        import hashlib
         import json as _json
         fp_state = {
-            "halo_R_present": halo_R is not None,
-            "halo_R_shape": (
-                list(halo_R.shape) if halo_R is not None else None),
-            "halo_R_hash": (
-                hashlib.sha256(
-                    halo_R.detach().cpu().contiguous().numpy().tobytes()
-                ).hexdigest()[:16] if halo_R is not None else None),
             "PRISMAQUANT_DO_NO_HARM": os.environ.get(
                 "PRISMAQUANT_DO_NO_HARM", "1"),
             "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
@@ -3985,20 +3586,6 @@ def materialize_tensors_streaming(
 
         layer_mod = model.get_submodule(layer_qname)
 
-        # HALO per-layer rotation (#4). Applied AFTER weights are
-        # on-device but BEFORE quantization passes so the rotated
-        # weights are what GPTQ/scale_sweep target. Folds the layer's
-        # input_layernorm + post_attention_layernorm gammas into
-        # downstream Linears, then right-rotates q/k/v/gate/up and
-        # left-rotates o_proj/down_proj. No effect when halo_R is None.
-        if halo_R is not None:
-            from .halo import apply_halo_to_layer
-            n_rotated = apply_halo_to_layer(model, layer_mod, layer_qname,
-                                            halo_R, strict=True)
-            if n_rotated:
-                print(f"[halo] layer {L:02d}: rotated {n_rotated} linears",
-                      flush=True)
-
         # 3b. Joint NVFP4 scales across fused siblings in this layer.
         joint_globals = _compute_layer_joint_nvfp4(
             layer_mod, layer_qname, assignment, profile,
@@ -4057,44 +3644,7 @@ def materialize_tensors_streaming(
                 continue
             linear_count += 1
             full = f"{layer_qname}.{sub_name}"
-
-            # Prune-aware routing: resolve once per Linear. Actions:
-            #   "router"  → shrink output dim to kept experts + BF16-emit
-            #   "drop"    → pruned expert; do not emit this Linear at all
-            #   "reindex" → kept expert; rewrite qname eid and continue
-            #               through the normal emit path
-            prune_action = _resolve_linear_prune_action(full, prune_by_parent)
-            if prune_action is not None:
-                kind, p_entry = prune_action
-                if kind == "router":
-                    if not mod.weight.is_meta:
-                        w_shrunk = _shrink_router_weight(mod, p_entry)
-                        out[f"{full}.weight"], label = _passthrough_tensor(
-                            f"{full}.weight", w_shrunk, source_dtype_by_name)
-                        if mod.bias is not None and not mod.bias.is_meta:
-                            b_idx = torch.as_tensor(
-                                p_entry["kept_expert_ids"], dtype=torch.long,
-                                device=mod.bias.device,
-                            )
-                            out[f"{full}.bias"], _ = _passthrough_tensor(
-                                f"{full}.bias",
-                                mod.bias.detach().index_select(0, b_idx),
-                                source_dtype_by_name,
-                            )
-                        hist[("linear", f"{label}_router_shrunk")] += 1
-                        covered.add(full)
-                    continue
-                if kind == "drop":
-                    # Skip pruned expert entirely. Mark covered so the
-                    # residual-params loop doesn't re-emit its bias as
-                    # a leftover buffer.
-                    hist[("linear", "PRUNED")] += 1
-                    covered.add(full)
-                    continue
-                # kind == "reindex": emit under the reindexed qname.
-                emit_full = p_entry["new_full"]
-            else:
-                emit_full = full
+            emit_full = full
 
             recipe_key = profile.live_to_recipe_name(full)
             recipe_fmt = assignment.get(recipe_key)
@@ -4516,49 +4066,11 @@ def materialize_tensors_streaming(
                 disk_qname = profile.on_disk_expert_qname(experts_qname)
                 should_split = profile.split_packed_experts_for_format(fmt)
 
-                # Prune handling for this experts module. If the layer
-                # is pruned, `iter_experts` enumerates (orig_eid, new_eid)
-                # pairs — only kept experts appear. On the non-pruned
-                # path it's `((e, e) for e in range(E))`, preserving
-                # exact legacy behavior.
-                prune_entry = _resolve_packed_experts_prune(
-                    experts_qname, prune_by_parent,
-                )
-                if prune_entry is not None:
-                    if E != int(prune_entry["num_experts_orig"]):
-                        raise RuntimeError(
-                            f"[export-stream] prune: packed experts at "
-                            f"{experts_qname} have E={E} but manifest "
-                            f"has num_experts_orig="
-                            f"{prune_entry['num_experts_orig']}. "
-                            f"Manifest was built against a different "
-                            f"model — refusing to emit."
-                        )
-                    iter_experts = [
-                        (int(orig_s), int(new)) for orig_s, new in
-                        prune_entry["orig_to_new_eid"].items()
-                    ]
-                    # Sort by new_eid so the output tensor ordering is
-                    # dense 0..K-1 in a predictable order.
-                    iter_experts.sort(key=lambda x: x[1])
-                else:
-                    iter_experts = [(e, e) for e in range(E)]
+                iter_experts = [(e, e) for e in range(E)]
 
                 if not should_split:
-                    if prune_entry is not None:
-                        # Keep-packed path after prune: slice the 3D
-                        # tensor on dim 0 to kept experts in new-id
-                        # order, emit under the same unsliced name.
-                        kept_idx = torch.as_tensor(
-                            [o for o, _ in iter_experts],
-                            dtype=torch.long, device=packed_param.device,
-                        )
-                        shrunk = packed_param_src.index_select(0, kept_idx)
-                        out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
-                            full, shrunk, source_dtype_by_name)
-                    else:
-                        out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
-                            full, packed_param_src, source_dtype_by_name)
+                    out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
+                        full, packed_param_src, source_dtype_by_name)
                     covered.add(full)
                     hist[("packed_moe", label if is_bf16 else fmt)] += 1
                     del packed_param, packed_param_src
@@ -4594,10 +4106,6 @@ def materialize_tensors_streaming(
                                 out[key] = t.cpu()
                 covered.add(full)
                 hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
-                if prune_entry is not None:
-                    hist[("packed_moe_pruned", "experts")] += (
-                        E - prune_entry["num_experts_kept"]
-                    )
                 del packed_param, packed_param_src, proj_split
 
         # 3e. Remaining layer-scoped params (norms, conv1d, biases on
@@ -4610,44 +4118,6 @@ def materialize_tensors_streaming(
                 continue
             if param.is_meta:
                 continue
-            # Prune skip/reindex: pruned expert sub-params (e.g. a norm
-            # inside a dropped expert) must not leak through; kept
-            # experts' leftover params must be emitted under their new
-            # eid. The Linear path already marked pruned Linears as
-            # covered, but non-Linear params inside expert modules need
-            # a separate resolve.
-            leftover_action = _resolve_linear_prune_action(full, prune_by_parent)
-            if leftover_action is not None:
-                kind, p_entry = leftover_action
-                if kind == "drop":
-                    continue
-                if kind == "reindex":
-                    out[p_entry["new_full"]], label = _passthrough_tensor(
-                        full, param, source_dtype_by_name)
-                    hist[("layer_passthrough", label)] += 1
-                    continue
-            # Router-weight shrink for non-Linear routers. Qwen3.5's
-            # `Qwen3_5MoeTopKRouter` is a bare nn.Module with a `.weight`
-            # Parameter — NOT an nn.Linear — so the Linear-loop's router
-            # path never sees it. Detect by stripping `.weight` and
-            # testing against prune_by_parent's router_qname.
-            if prune_by_parent and full.endswith(".weight"):
-                trimmed = full[: -len(".weight")]
-                parent_r = trimmed.rsplit(".", 1)[0]
-                entry_r = prune_by_parent.get(parent_r)
-                if (entry_r is not None
-                        and entry_r["router_qname"] == trimmed
-                        and param.dim() >= 1
-                        and int(param.shape[0]) == int(entry_r["num_experts_orig"])):
-                    idx = torch.as_tensor(
-                        entry_r["kept_expert_ids"], dtype=torch.long,
-                        device=param.device,
-                    )
-                    shrunk = param.detach().index_select(0, idx).contiguous()
-                    out[full], label = _passthrough_tensor(
-                        full, shrunk, source_dtype_by_name)
-                    hist[("router_weight_shrunk", label)] += 1
-                    continue
             out[full], label = _passthrough_tensor(
                 full, param, source_dtype_by_name)
             hist[("layer_passthrough", label)] += 1
@@ -4661,28 +4131,6 @@ def materialize_tensors_streaming(
                 full = f"{full_modpath}.{buf_name}"
                 if full in out or buf.is_meta:
                     continue
-                # Buffer-shrink for pruned MoE: per-expert bias-like buffers
-                # (e.g. MiniMax's `e_score_correction_bias` on the MoE block,
-                # or any other shape-num_experts_orig persistent buffer that
-                # lives on the same parent as the router) must be index-
-                # selected down to kept_expert_ids so their first dim matches
-                # what the native vLLM module allocates (num_local_experts =
-                # kept count). Without this, vLLM's bias loader asserts on
-                # the size mismatch (256 vs 176) and engine init dies.
-                if prune_by_parent:
-                    entry_b = prune_by_parent.get(full_modpath)
-                    if (entry_b is not None
-                            and buf.dim() >= 1
-                            and int(buf.shape[0]) == int(entry_b["num_experts_orig"])):
-                        b_idx = torch.as_tensor(
-                            entry_b["kept_expert_ids"], dtype=torch.long,
-                            device=buf.device,
-                        )
-                        shrunk = buf.detach().index_select(0, b_idx).contiguous()
-                        out[full], label = _passthrough_tensor(
-                            full, shrunk, source_dtype_by_name)
-                        hist[("layer_buffer_shrunk", label)] += 1
-                        continue
                 out[full], label = _passthrough_tensor(
                     full, buf, source_dtype_by_name)
                 hist[("layer_buffer", label)] += 1
@@ -5385,8 +4833,7 @@ def _per_expert_parent(base: str) -> str | None:
     return f"{m.group('prefix')}.{parent}"
 
 
-def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
-                         prune_manifest: dict | None = None) -> list[str]:
+def compute_extra_ignore(source_shape_iter, assignment: dict[str, str]) -> list[str]:
     """Return the list of 2D `.weight` basenames that must be added to
     the compressed-tensors `ignore` set because the recipe doesn't cover
     them.
@@ -5401,27 +4848,9 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
     covers them at vLLM load time, and adding the per-expert name to
     `ignore` would mark the FusedMoE layer as un-quantized.
 
-    `prune_manifest` (when supplied) is the allocator's expert-prune
-    sidecar keyed by router qname. Pruned experts are dropped from the
-    output checkpoint and their slots renumbered to dense 0..K-1, so
-    referring to them in `ignore` by their *original* eid produces
-    stale entries that don't match any module vLLM ever constructs.
-    Filter them out — the kept experts are already covered by the
-    parent FusedMoE scheme, and pruned ones simply don't exist anymore.
     """
     extra_ignore: list[str] = []
     seen_recipe = set(assignment)
-    # Build set of pruned (full source eid path prefixes) we should drop.
-    # Each manifest entry's router_qname is the parent of `.experts.N.X_proj`,
-    # so pruned eids live at f"{parent}.experts.{eid}" where parent is the
-    # router_qname's parent. e.g. router=model.layers.0.mlp.gate ->
-    # parent=model.layers.0.mlp, pruned base=model.layers.0.mlp.experts.102
-    pruned_bases: set[str] = set()
-    if prune_manifest:
-        for _router_qname, entry in prune_manifest.items():
-            parent_path = _router_qname.rsplit(".", 1)[0]
-            for orig_eid in entry.get("pruned_expert_ids", []):
-                pruned_bases.add(f"{parent_path}.experts.{orig_eid}")
     for ckpt_key, shape in source_shape_iter:
         if not ckpt_key.endswith(".weight"):
             continue
@@ -5431,14 +4860,6 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
                        else base)
         if recipe_name in seen_recipe:
             continue
-        # Skip pruned experts — they're absent from the renumbered output
-        # checkpoint, so emitting an ignore for their original-eid path
-        # produces stale config entries that match nothing in the served
-        # model.
-        if pruned_bases and any(
-                recipe_name.startswith(p + ".") or recipe_name == p
-                for p in pruned_bases):
-            continue
         parent = _per_expert_parent(recipe_name)
         if parent is not None and parent in seen_recipe:
             continue
@@ -5446,76 +4867,6 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
             continue
         extra_ignore.append(base)
     return extra_ignore
-
-
-def _halo_hidden_from_config(cfg) -> tuple[int | None, str | None]:
-    from .halo import halo_hidden_from_config
-
-    return halo_hidden_from_config(cfg)
-
-
-def _halo_config_bool(cfg, key: str) -> bool:
-    from .halo import halo_config_bool
-
-    return halo_config_bool(cfg, key)
-
-
-def _validate_halo_export_support(profile, cfg, hidden: int) -> None:
-    """Fail fast for HALO topologies this exporter cannot rotate safely."""
-    from .halo import validate_halo_export_support
-
-    validate_halo_export_support(profile, cfg, hidden)
-
-
-def _validate_halo_cache_inputs(
-    args,
-    production_cache=None,
-    *,
-    expected_halo: dict[str, object] | None = None,
-) -> None:
-    """Reject HALO/cache combinations that cannot preserve semantics."""
-    if not args.production_weight_cache or production_cache is None:
-        return
-    meta = dict(getattr(production_cache, "metadata", {}) or {})
-    cache_halo = dict(meta.get("halo", {}) or {})
-    cache_mode = str(cache_halo.get("mode", "off"))
-    requested_mode = str(args.halo_mode)
-
-    if requested_mode == "off":
-        if cache_mode != "off":
-            raise RuntimeError(
-                "[halo] production-weight-cache was rendered with "
-                f"HALO mode={cache_mode!r}, but export requested "
-                "--halo-mode off. Export with matching --halo-mode/seed "
-                "or use a no-HALO production cache."
-            )
-        return
-
-    if cache_mode == "off":
-        raise RuntimeError(
-            "[halo] --production-weight-cache is incompatible with "
-            "--halo-mode random unless the cache metadata confirms it "
-            "was rendered from the same HALO-rotated source. Re-render a "
-            "HALO-specific production cache from activations, or export "
-            "without --production-weight-cache for a research-only path."
-        )
-    if cache_mode != requested_mode:
-        raise RuntimeError(
-            "[halo] production-weight-cache HALO mode mismatch: "
-            f"cache={cache_mode!r} requested={requested_mode!r}")
-    cache_seed = cache_halo.get("seed")
-    if cache_seed is None or int(cache_seed) != int(args.halo_seed):
-        raise RuntimeError(
-            "[halo] production-weight-cache HALO seed mismatch: "
-            f"cache={cache_seed!r} requested={args.halo_seed!r}")
-    if expected_halo is not None:
-        for key in ("dim", "rotation_hash", "profile"):
-            expected = expected_halo.get(key)
-            actual = cache_halo.get(key)
-            if expected is not None and actual != expected:
-                raise RuntimeError(
-                    "[halo] production-weight-cache HALO metadata mismatch "
-                    f"for {key}: cache={actual!r} expected={expected!r}")
 
 
 def main():
@@ -5535,18 +4886,6 @@ def main():
     ap.add_argument("--layer-config", default=None,
                     help="layer_config.json from allocator.py. Optional when "
                          "--perturbed-x-dir is supplied.")
-    ap.add_argument("--prune-manifest", default=None,
-                    help="Optional path to an expert-prune sidecar JSON "
-                         "emitted by the allocator at "
-                         "`<layer_config>.prune.json`. When omitted, the "
-                         "exporter auto-detects that path and uses it if "
-                         "it exists; pass an empty string to force a "
-                         "non-prune export even when a sidecar is "
-                         "present. A non-empty manifest drops pruned "
-                         "experts' weights, reindexes kept experts to "
-                         "dense 0..K-1, shrinks the router weight's "
-                         "out-dim, and updates config.json's expert "
-                         "count fields.")
     ap.add_argument("--output", required=True,
                     help="Output directory for the compressed checkpoint")
     ap.add_argument("--shard-bytes", type=int, default=5 * 1024**3,
@@ -5593,13 +4932,6 @@ def main():
                          "instead of recomputing GPTQ/scale-sweep from "
                          "raw activations. This is the faithful path for "
                          "candidates measured with production_weight_cache.")
-    ap.add_argument("--production-cache-variant-map", default=None,
-                    help="JSON qname->internal cache-format map, or a "
-                         "kl_sensitivity_probe payload containing "
-                         "chosen_cache_variants. Runtime formats remain "
-                         "those in --layer-config; this only selects "
-                         "alternate rendered cache entries such as "
-                         "PrismaClip's NVFP4 variant.")
     ap.add_argument("--production-cache-dir-override", default=None,
                     help="Override the backing shard directory stored "
                          "inside --production-weight-cache, for caches "
@@ -5615,11 +4947,6 @@ def main():
                          "activation cache files from a prior production "
                          "calibration/polish run. When supplied, defaults "
                          "--layer-config and --activation-cache-dir from it.")
-    ap.add_argument("--awq", dest="awq", default=None,
-                    action=argparse.BooleanOptionalAction,
-                    help="Archived. AWQ-v2 was removed from the production "
-                         "export path; use archive/foldscale_orthog_2026-05-13 "
-                         "for research context.")
     ap.add_argument("--gptq", dest="gptq", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="GPTQ one-shot OBS rounding with block-wise "
@@ -5637,15 +4964,6 @@ def main():
                     help="Opt-in Lift/MR-GPTQ joint NVFP4 scale search inside "
                          "GPTQ. The candidate set includes FourOverSix and "
                          "additional codebook-aligned max-to-level scales.")
-    ap.add_argument("--act-weighted-round", dest="awq_round", default=None,
-                    action=argparse.BooleanOptionalAction,
-                    help="Activation-weighted rounding polish on NVFP4 "
-                         "(per-weight Δw²·E[a²] minimization at fixed "
-                         "group scale). OFF by default — permutation "
-                         "bake-off showed it undoes most of GPTQ's "
-                         "benefit (geomean out_mse ratio: GPTQ=0.41, "
-                         "GPTQ+act_round=0.99 ≈ RTN). Pass "
-                         "--act-weighted-round to opt in.")
     ap.add_argument("--scale-sweep", dest="scale_sweep", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="Per-group 1-D scale sweep with RTN rounding on "
@@ -5674,49 +4992,7 @@ def main():
                     help="Don't remove --export-cache-dir on success. "
                          "Useful for debugging or comparing two exports "
                          "against the same cache.")
-    ap.add_argument("--halo-mode", default="off",
-                    choices=("off", "random"),
-                    help="HALO rotation preprocessor (EXPERIMENTAL, opt-in; "
-                         "default OFF). When 'random', applies a random "
-                         "Hadamard rotation R to the residual stream and "
-                         "absorbs R into adjacent Linear weights. Diffuses "
-                         "outliers across channels — downstream NVFP4/MXFP8 "
-                         "RTN reconstruction error is lower in theory. No "
-                         "new vLLM kernel required (R is absorbed into "
-                         "weights and norms). Literature gain on Llama-class "
-                         "W4A4 is ~0.20-0.30 PPL against an RTN baseline; "
-                         "the gain on top of PrismaQuant's full GPTQ + "
-                         "scale_sweep + activation_clip + sibling-globals "
-                         "stack is UNMEASURED on every architecture as of "
-                         "2026-05-09 — the published Qwen3.6-27B artifact "
-                         "does not use HALO. Use only for research / Pareto "
-                         "exploration, not ship-grade artifacts, until "
-                         "per-arch quality wins have been measured against "
-                         "the no-HALO baseline. Correctness verified on "
-                         "Qwen3.5/3.6 dense (untied-lm_head + offset-residual "
-                         "RMSNorm fold). Critical: assumes standard "
-                         "transformer block topology (input_layernorm + "
-                         "q/k/v/o_proj, post_attention_layernorm + "
-                         "gate/up/down_proj), untied embeddings, and a "
-                         "standard dense residual stream. Non-power-of-2 "
-                         "hidden sizes use a structured block-Hadamard "
-                         "rotation. Profile-specific overrides are still "
-                         "needed for packed MoE or non-standard residual "
-                         "topologies. MTP spec-decode acceptance under HALO "
-                         "is unvalidated — manifest flags "
-                         "`mtp_policy: passthrough_requires_spec_decode_validation`.")
-    ap.add_argument("--halo-seed", type=int, default=0,
-                    help="RNG seed for HALO sign-diagonal in random "
-                         "Hadamard. Saved alongside the artifact at "
-                         "halo_rotation.pt for forensic reproducibility.")
     args = ap.parse_args()
-    if args.awq:
-        raise RuntimeError(
-            "AWQ export has been archived under "
-            "archive/foldscale_orthog_2026-05-13 and is not available "
-            "on the production path."
-        )
-    _validate_halo_cache_inputs(args)
 
     from .model_profiles import detect_profile
     profile = detect_profile(args.model)
@@ -5757,24 +5033,6 @@ def main():
             production_cache.enable_lru(
                 int(float(args.production_cache_lru_gb) * 1024**3)
             )
-        variant_map = _load_production_cache_variant_map(
-            args.production_cache_variant_map
-        )
-        if variant_map:
-            from prismaquant.production_weight_cache import (
-                ProductionWeightCacheVariantView,
-            )
-
-            production_cache = ProductionWeightCacheVariantView(
-                production_cache,
-                variant_map,
-            )
-            print(
-                "[export-stream] production-cache variants: "
-                f"{len(variant_map)} qnames",
-                flush=True,
-            )
-        _validate_halo_cache_inputs(args, production_cache)
         _PRODUCTION_WEIGHT_CACHE = production_cache
         _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
             1, int(args.production_cache_prefetch_workers)
@@ -5808,11 +5066,8 @@ def main():
 
     # Resolve flag defaults.
     cache_supplied = bool(args.activation_cache_dir)
-    awq_enabled = False
     # GPTQ + scale-sweep: ON iff activation cache supplied.
     gptq_enabled = args.gptq if args.gptq is not None else cache_supplied
-    # act_round: OFF by default (bake-off showed it reverts GPTQ to RTN).
-    awq_round_enabled = bool(args.awq_round) if args.awq_round is not None else False
     # scale_sweep: ON iff activation cache supplied.
     scale_sweep_enabled = (args.scale_sweep if args.scale_sweep is not None
                            else cache_supplied)
@@ -5840,20 +5095,20 @@ def main():
         and _NVFP4_SCALE_RULE == NVFP4_SCALE_RULE_STATIC_6
     ):
         _NVFP4_SCALE_RULE = NVFP4_SCALE_RULE_JOINT_MSE
-    act_passes_any = gptq_enabled or awq_round_enabled or scale_sweep_enabled
+    act_passes_any = gptq_enabled or scale_sweep_enabled
     # The activation-aware passes need the actual activations, not just
     # the scale summary. We only load raw activations when at least one
     # pass is enabled.
     if act_passes_any and not cache_supplied:
         print("[export-stream] WARN activation-aware passes requested "
               "but no --activation-cache-dir; disabling.", flush=True)
-        awq_enabled = gptq_enabled = awq_round_enabled = False
+        gptq_enabled = False
         scale_sweep_enabled = False
         static_act_order_enabled = False
         joint_scale_opt_enabled = False
         act_passes_any = False
     print(f"[export-stream] act-aware passes: "
-          f"gptq={gptq_enabled} awq_round={awq_round_enabled} "
+          f"gptq={gptq_enabled} "
           f"scale_sweep={scale_sweep_enabled} "
           f"static_act_order={static_act_order_enabled} "
           f"joint_scale_opt={joint_scale_opt_enabled}", flush=True)
@@ -5862,9 +5117,7 @@ def main():
     # Publish to the module-level config so `_quantize_2d` picks them
     # up from every call site without needing the flags threaded
     # through `materialize_tensors_streaming` + MTP helpers.
-    _ACT_AWARE_FLAGS["awq"] = False
     _ACT_AWARE_FLAGS["gptq"] = gptq_enabled
-    _ACT_AWARE_FLAGS["awq_round"] = awq_round_enabled
     _ACT_AWARE_FLAGS["scale_sweep"] = scale_sweep_enabled
     _ACT_AWARE_FLAGS["static_act_order"] = static_act_order_enabled
     _ACT_AWARE_FLAGS["joint_scale_opt"] = joint_scale_opt_enabled
@@ -5953,18 +5206,6 @@ def main():
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
           flush=True)
 
-    # Prune manifest: explicit path (empty string = opt-out), else
-    # auto-discover sidecar next to layer_config.json.
-    if args.prune_manifest is None:
-        default_sidecar = Path(args.layer_config + ".prune.json")
-        prune_manifest = _load_prune_manifest(
-            default_sidecar if default_sidecar.exists() else None
-        )
-    elif args.prune_manifest == "":
-        prune_manifest = {}
-    else:
-        prune_manifest = _load_prune_manifest(args.prune_manifest)
-
     from prismaquant.gpu_guard import require_cuda_hot_path
 
     dtype = torch.bfloat16
@@ -6011,82 +5252,13 @@ def main():
         print(f"[export-stream] streaming body rename → model.{infix}...",
               flush=True)
 
-    # HALO rotation matrix (#4). Generated once; applied in
-    # materialize_tensors_streaming to head + each layer.
-    halo_R = None
-    halo_meta = {"mode": "off"}
-    if args.halo_mode == "random":
-        print("[halo] EXPERIMENTAL: HALO is enabled. Pareto win on top of "
-              "PrismaQuant's GPTQ + scale_sweep + activation_clip stack is "
-              "UNMEASURED as of 2026-05-09. Treat the resulting artifact as a "
-              "research output, not ship-grade, until KL/PPL has been "
-              "compared against the same recipe with --halo-mode off.",
-              flush=True)
-        from .halo import halo_metadata, random_hadamard
-        from transformers import AutoConfig as _AC
-
-        # Discover residual-stream dim from config. Multimodal configs
-        # nest hidden_size under text_config/language_model_config. The
-        # validator below rejects unsupported topologies before we spend
-        # time materializing heads or accidentally reusing a stale cache.
-        _cfg = _AC.from_pretrained(args.model, trust_remote_code=True)
-        _hidden, _hidden_path = _halo_hidden_from_config(_cfg)
-        if _hidden is None:
-            raise RuntimeError(
-                "[halo] cannot determine hidden_size from config — "
-                "needed for HALO rotation dimension. Probed: "
-                "hidden_size, text_config.hidden_size, "
-                "language_model_config.hidden_size, "
-                "llm_config.hidden_size.")
-        _validate_halo_export_support(profile, _cfg, _hidden)
-        halo_R = random_hadamard(_hidden, seed=args.halo_seed)
-        mtp_policy = "not_present"
-        if getattr(profile, "has_mtp", lambda: False)():
-            mtp_policy = "passthrough_requires_spec_decode_validation"
-            print(
-                "[halo] profile has MTP weights; body/head HALO is enabled "
-                "and MTP tensors remain on the normal export path. Target "
-                "logits without speculative decoding are covered; MTP "
-                "acceptance should be validated separately when serving with "
-                "speculative decoding.",
-                flush=True,
-            )
-        halo_meta = halo_metadata(
-            halo_R,
-            mode="random",
-            seed=args.halo_seed,
-            hidden_path=_hidden_path,
-            profile=profile,
-            mtp_policy=mtp_policy,
-        )
-        if _PRODUCTION_WEIGHT_CACHE is not None:
-            _validate_halo_cache_inputs(
-                args,
-                _PRODUCTION_WEIGHT_CACHE,
-                expected_halo=halo_meta,
-            )
-        print(f"[halo] mode=random seed={args.halo_seed} "
-              f"dim={_hidden} hidden_path={_hidden_path} "
-              f"blocks={halo_meta['block_sizes']} "
-              f"hash={halo_meta['rotation_hash']}", flush=True)
-        # Persist R alongside the artifact for forensic reproducibility.
-        os.makedirs(out_dir, exist_ok=True)
-        torch.save({"R": halo_R.cpu(), "seed": args.halo_seed,
-                    "mode": "random", "dim": _hidden,
-                    "block_sizes": halo_meta["block_sizes"],
-                    "rotation_hash": halo_meta["rotation_hash"],
-                    "mtp_policy": mtp_policy},
-                   os.path.join(out_dir, "halo_rotation.pt"))
-
     tensors, hist = materialize_tensors_streaming(
         args.model, assignment,
         profile=profile, bf16_passthrough=bf16_passthrough,
         dtype=dtype, device=device,
         offload_folder=args.offload_folder,
-        prune_manifest=prune_manifest,
         tensor_sink=lambda batch: writer.add_tensors(_rename_body_batch(batch)),
         export_cache_dir=args.export_cache_dir,
-        halo_R=halo_R,
     )
     print(f"[export-stream] streamed materialization complete "
           f"resident_tensors={len(tensors)}  hist={hist}",
@@ -6182,34 +5354,15 @@ def main():
                         shape = None
                     yield k, shape
 
-    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment,
-                                        prune_manifest=prune_manifest)
+    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment)
     print(f"[export-stream] extra ignore (unmapped Linears): "
           f"{len(extra_ignore)}", flush=True)
 
     write_config_with_quantization(
         args.model, out_dir, assignment, bf16_passthrough,
         extra_ignore=extra_ignore,
-        prune_manifest=prune_manifest,
         transform_config=None)
     _copy_tokenizer(args.model, out_dir)
-
-    prune_summary: dict | None = None
-    if prune_manifest:
-        prune_summary = {
-            "n_layers_pruned": len(prune_manifest),
-            "n_experts_orig_total": sum(
-                int(e["num_experts_orig"]) for e in prune_manifest.values()
-            ),
-            "n_experts_kept_total": sum(
-                int(e["num_experts_kept"]) for e in prune_manifest.values()
-            ),
-            "manifest_file": "prune_manifest.json",
-        }
-        # Also persist the manifest into the output dir for traceability
-        # (the validator + any downstream re-export tooling can read it).
-        with open(out_dir / "prune_manifest.json", "w") as f:
-            json.dump(prune_manifest, f, indent=2, sort_keys=True)
 
     with open(out_dir / "mixed_native_manifest.json", "w") as f:
         json.dump({
@@ -6217,7 +5370,6 @@ def main():
             "source_recipe": args.layer_config,
             "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
             "n_assignment_entries": len(assignment),
-            "halo": halo_meta,
             "runtime_coercions": [
                 {"name": name, "shape": shape, "from": "MXFP8", "to": "BF16"}
                 for name, shape in runtime_coerced
@@ -6230,7 +5382,6 @@ def main():
                 profile,
             ),
             "ignore": sorted(bf16_passthrough),
-            "prune": prune_summary,
         }, f, indent=2)
 
     # v25: clear the per-layer cache on successful export. --keep-export-cache
@@ -6439,11 +5590,8 @@ def write_config_with_quantization(
     assignment: dict[str, str],
     bf16_passthrough: set[str],
     extra_ignore: Iterable[str] = (),
-    prune_manifest: dict[str, dict] | None = None,
     transform_config: dict | None = None,
 ) -> None:
-    if prune_manifest:
-        raise_expert_prune_disabled("write config prune manifest")
     from .model_profiles import detect_profile
     profile = detect_profile(src_model)
     src_cfg_path = Path(src_model) / "config.json"
@@ -6454,41 +5602,6 @@ def write_config_with_quantization(
         if transform_config:
             qc["transform_config"] = transform_config
         cfg["quantization_config"] = qc
-
-    # Prune: shrink MoE expert counts in the config so vLLM / HF
-    # instantiate a ModuleList of the right size. We update every
-    # common HF field name that exists in the source config, so the
-    # loader finds the expected field regardless of arch convention.
-    # All manifest entries must agree on num_experts_kept (same arch)
-    # — mixing kept counts across layers isn't supported by the
-    # shared-config convention.
-    if prune_manifest:
-        kept_counts = {int(e["num_experts_kept"]) for e in prune_manifest.values()}
-        if len(kept_counts) != 1:
-            raise RuntimeError(
-                f"[export-stream] prune: manifest has inconsistent "
-                f"num_experts_kept across layers ({sorted(kept_counts)}). "
-                f"HF config carries a single scalar field — mixed "
-                f"per-layer counts need a schema change."
-            )
-        new_k = next(iter(kept_counts))
-        patched: list[tuple[str, int, int]] = []
-
-        def _patch_scalar(d: dict) -> None:
-            for field in _MOE_EXPERT_COUNT_FIELDS:
-                if field in d and isinstance(d[field], int):
-                    old = int(d[field])
-                    if old != new_k:
-                        d[field] = new_k
-                        patched.append((field, old, new_k))
-
-        _patch_scalar(cfg)
-        # Some multimodal configs nest the text config (e.g. Qwen3.5/3.6
-        # ConditionalGeneration). Patch there too if present.
-        if isinstance(cfg.get("text_config"), dict):
-            _patch_scalar(cfg["text_config"])
-        for field, old, new in patched:
-            print(f"[export-stream] config: {field} {old} → {new}", flush=True)
 
     with open(out_dir / "config.json", "w") as f:
         json.dump(cfg, f, indent=2)

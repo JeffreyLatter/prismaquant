@@ -3,7 +3,7 @@ from __future__ import annotations
 
 
 EXPERT_PRUNE_DISABLED_MESSAGE = (
-    "Expert pruning is disabled: the REAP-based expert-drop path is archived "
+    "Expert pruning is disabled: the expert-drop path is archived "
     "and must not be used for shipping artifacts."
 )
 

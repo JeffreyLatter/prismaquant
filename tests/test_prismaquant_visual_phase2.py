@@ -364,7 +364,6 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
                 W, "NVFP4",
                 linear_name=visual_name,
                 gptq_enabled=True,
-                awq_round_enabled=False,
             )
         finally:
             exp._CACHED_ACTIVATIONS = prev_cache

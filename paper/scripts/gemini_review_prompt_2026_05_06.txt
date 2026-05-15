@@ -30,7 +30,7 @@ some have not. Your job is to assess each in the current code:
 
 3. MEDIUM: "production-faithful" claim is close but not literally exact.
    prismaquant/production_weight_cache.py:21 lists gaps: block-output
-   match, HALO, AWQ predecessor folding, future export-only refinements
+   match and future export-only refinements
    not implemented. README.md:238 says "exact per-Linear weight the
    exporter would render" — soften unless those levers were definitely
    off for the claimed artifact.

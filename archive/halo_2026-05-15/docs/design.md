@@ -165,10 +165,9 @@ is its own mini-block and gets its own rotation.
    Solution: rotation goes into Linear weights, NOT into norm
    parameters. Norm γ is unchanged.
 
-4. **Interaction with archived fold-scale work.** AWQ/SmoothQuant
-   predecessor folds were archived on 2026-05-13 and should not be
-   composed into HALO runs. HALO rotates Linear weights only; keep it
-   as a separate recipe arm until a new transform path is validated.
+4. **Interaction with retired transform work.** Predecessor folds should not
+   be composed into HALO runs. HALO rotates Linear weights only; keep it as a
+   separate recipe arm until a new transform path is validated.
 
 5. **MoE expert rotations.** Each expert is a separate Linear set.
    They can either share a layer-level rotation (uniform across experts

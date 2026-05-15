@@ -16,47 +16,20 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_ACT_CACHE_ASYNC` | **on** | Activation-cache writes (per-Linear `.pt` files) submit to a small thread pool instead of blocking the main thread. Drains at end of shard so the cost step sees a fully-flushed cache. |
 | `PRISMAQUANT_ACT_CACHE_WORKERS` | `4` | Pool size for the above. Higher = more parallel disk writes, but contends with the CPU readers in cost step. |
 | `PRISMAQUANT_DIRECT_CUDA_LOAD` | **on** | Pass `device=cuda:N` to `safetensors.safe_open` so layer tensors land on the GPU directly instead of going through a host stage. ~10-30 ms saved per layer load. Falls back transparently if safetensors complains. |
-| `PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK` | **on** | (set automatically by `multi_chunk_probe --retain-cross-chunk-cache`, default true.) Keep LayerCache contents across chunk boundaries — layer weights are model-invariant, so an entry that fit the budget at end of chunk N is still valid for chunk N+1. Disable on small boxes. |
-| `PRISMAQUANT_PROBE_CTX_CACHE` | (set by `multi_chunk_probe`) | Lets `incremental_probe.main()` reuse a cached `StreamingContext` across N invocations in the same Python process. Don't set manually unless you know what you're doing. |
-| `PRISMAQUANT_PROBE_DOMAIN` | (per-chunk) | Tag each chunk's probe pickle with a domain label (used by adaptive-sampling per-domain saliency). Set automatically by `multi_chunk_probe` based on `chunk_<domain>_<idx>.jsonl` filename. |
 | `PRISMAQUANT_COST_PREFETCH_ACT` | **on** | `measure_batched_gpu` prefetches chunk N+1's activation files on a thread pool while chunk N runs on the GPU. Hides ~30-40% of the cost step's wall on big models. |
-| `PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR` | **off** | Makes allocator candidate construction use `fisher_output_mse` from the cost table when present. This is a Fisher row-weighted local objective: output reconstruction error weighted by per-token end-loss gradient² from h-detail. |
-| `PRISMAQUANT_FISHER_OUTPUT_MSE_ROW_WEIGHT_CLIP` | `PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP` or `64` | Caps normalized `g2_per_token` row weights when computing `fisher_output_mse`, then re-normalizes to mean 1. |
-
-Probe CLI: `kl_sensitivity_probe.py --prismaclip-candidates` direct-KL-gates
-PrismaClip proposals without adding a pseudo-format to allocation. It uses the
-existing production cache, stores the clipped rendering under the internal
-`NVFP4_CLIPPED` cache key, emits ordinary runtime formats in
-`chosen_assignment`, and writes `chosen_cache_variants` for export via
-`--production-cache-variant-map`.
+| `PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR` | **archived** | Historical Fisher row-weighted allocator objective. The production pipeline rejects it; archive context lives under `archive/fisher_2026-05-15/`. |
+| `PRISMAQUANT_FISHER_OUTPUT_MSE_ROW_WEIGHT_CLIP` | archived companion | Historical cap for Fisher output-MSE allocation; not used by the production pipeline. |
 
 ## Export flags
 
 | env var | default | what it does |
 |---|---|---|
-| `PRISMAQUANT_BATCHED_NVFP4_EXPORT` | **on** (when act-aware passes fire and an activation cache is supplied) | Routes NVFP4 same-shape Linears through the batched GPTQ + scale_sweep path (`export_batched_gptq.py`). Stacks per-layer experts into `(E, out, in)` tensors and runs Cholesky / column update batched across E. ~5-10% faster on MiniMax, more on bigger MoE models. |
+| `PRISMAQUANT_BATCHED_NVFP4_EXPORT` | **on** (when act-aware passes fire and an activation cache is supplied) | Routes NVFP4 same-shape Linears through the batched GPTQ / optional scale_sweep path (`export_batched_gptq.py`). Stacks per-layer experts into `(E, out, in)` tensors and runs Cholesky / column update batched across E. |
 | `PRISMAQUANT_NVFP4_SCALE_RULE` | `static_6` | NVFP4 local block-scale rule. `static_6` is standard NVFP4 max-to-6 scaling. `four_over_six_mse` tries max-to-6 and max-to-4 per 16-value block and keeps the lower block-MSE scale while preserving the same compressed-tensors NVFP4 schema and vLLM kernel. Experimental until .8B/4B/27B KL and vLLM smokes land. |
-| `PRISMAQUANT_RENDER_PROGRESSIVE_GATES` | **on** | Production-cache render gate for local mechanisms. NVFP4 renders score FourOverSix, GPTQ/Fisher-GPTQ, and scale_sweep candidate packages with the shared output/Fisher scorer and keep the prior render when a candidate regresses. MXFP8 scale_sweep is gated the same way. Cache metadata records decisions in `render_gates`; FourOverSix has a compact `four_over_six` summary. |
+| `PRISMAQUANT_RENDER_PROGRESSIVE_GATES` | **on** | Production-cache render gate for local mechanisms. NVFP4 renders score FourOverSix, GPTQ, joint-scale optimization, and optional scale_sweep candidate packages with the shared scorer and keep the prior render when a candidate regresses. MXFP8/FP8 scale_sweep is gated the same way when enabled. Cache metadata records decisions in `render_gates`; FourOverSix has a compact `four_over_six` summary. |
 | `PRISMAQUANT_RENDER_GATE_MIN_GAIN` | `0.0` | Optional minimum relative gain required by the progressive render gate. Keep at `0.0` for normal runs so tiny local improvements can accumulate; raise only for ablations. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER` | **off / research-only** | Enables **PrismaClip**, the production-cache NVFP4 activation-clipping solver. PrismaClip picks one scalar render-time activation clamp per Linear/fused-sibling group, scores candidates on original unclipped activations, and stores only selected thresholds in cache metadata. It is disabled for production pipeline runs after the 2026-05-13 27B top-32 run proved too time-consuming; use only for explicit ablations. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING` | `none` | **Disabled except `none`.** Non-`none` values fail fast while PrismaClip-RBC is investigated. The 2026-05-12 Qwen3.5-0.8B smoke regressed KL from `0.25855137` to `0.28497164` and increased production-cache fill from `104.3s` to `1034.8s`. |
-| `PRISMAQUANT_ACT_CLIP_RBC_MAX_RESCALE` | `8.0` | Dormant while PrismaClip-RBC is disabled. Previously capped row-wise amplification after an RBC clamp. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_MAX_EVALS` | `6` | Maximum threshold evaluations per eligible group for PrismaClip's log-space scalar solver. Higher values can improve the threshold but multiply NVFP4 render cost. Cache metadata records each group's evaluation trace so convergence can be audited without rerunning the solver. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_MIN_GAIN` | `0.0` | Optional minimum relative output-MSE gain over the existing render path before PrismaClip selects a solved threshold. A nonzero floor is useful for ablations, but is not the default because tiny per-group gains can be collectively useful. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_HOLDOUT` | **off** | Experimental stability gate requiring each PrismaClip threshold selected by the full local activation score to also improve held-out activation rows before it is stored. Kept off by default: an .8B smoke on 2026-05-11 measured KL `0.34022548` with the holdout veto versus `0.12600227` for the no-prewrite PrismaClip baseline. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_HOLDOUT_FRACTION` | `0.25` | Fraction of activation rows reserved for PrismaClip holdout scoring, implemented as deterministic row striding so the split stays GPU-resident and reproducible. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_HOLDOUT_MIN_GAIN` | `0.0` | Optional minimum relative holdout gain required in addition to a positive holdout improvement. Keep at `0.0` unless running an explicit stability ablation. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_PREWRITE_BASELINE` | **off** | Opt-in baseline NVFP4 prewrite while PrismaClip scores candidates. Kept off by default: .8B validation on 2026-05-11 regressed from KL `0.12600227` with prewrite off to `0.21575844` with prewrite on. A 4B no-prewrite rerun still regressed to KL `0.16388227`, so PrismaClip itself remains experimental until its threshold acceptance gate is strengthened. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_BATCHED` | **off** | Opt-in use of the existing same-shape batched NVFP4 GPTQ/scale-sweep path for PrismaClip threshold evaluations when all group members support it. Falls back to scalar rendering for incompatible shapes. Kept off by default until 4B KL parity with scalar rendering is proven. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_TOP_FRACTION` | `1.0` | Restrict PrismaClip threshold search to the highest-baseline-error fraction of eligible fused groups. All groups still get baseline-scored; skipped groups keep baseline behavior. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_TOP_K` | `0` | Optional hard cap on PrismaClip threshold-solved groups after baseline-error ranking. `0` means no cap. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_VERBOSE` | **off** | Prints per-group PrismaClip decisions while filling the production cache. |
-| `PRISMAQUANT_PRISMAFISHERCLIP` | **off** | Enables **PrismaFisherClip**, an experimental PrismaClip diagnostic that reuses h-detail `g2_per_token` vectors to score clip candidates with Fisher weights. It requires an h-detail directory and does not enable Fisher-weighted GPTQ unless `fisher_gptq` is also enabled. |
-| `PRISMAQUANT_ACT_CLIP_SOLVER_FISHER` | **off** | Alias for `PRISMAQUANT_PRISMAFISHERCLIP`; kept for explicit activation-clip naming in ad hoc smokes. |
-| `PRISMAQUANT_PRISMAFISHERCLIP_MODE` / `PRISMAFISHERCLIP_MODE` | `audit` | `audit` records Fisher-weighted clip scores but keeps normal PrismaClip decisions. `veto` additionally requires Fisher-weighted improvement, and `score` makes Fisher-weighted score the primary objective; both are ablation modes after the 2026-05-11 .8B regressions. |
-| `PRISMAQUANT_PRISMAFISHERCLIP_MIN_GAIN` | `0.0` | Optional minimum relative Fisher-weighted gain required in `veto` mode. Keep at `0.0` unless running an explicit stability ablation. |
-| `PRISMAQUANT_FISHER_WEIGHTED_GPTQ` | **off** | Enables Fisher/output-weighted local objectives when an h-detail cache is supplied. NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep weight activation rows by normalized `g2_per_token`. |
-| `PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP` | `64` | Caps normalized per-token Fisher weights before re-normalizing, preventing a single calibration token from dominating the local solve. |
+| `PRISMAQUANT_FISHER_WEIGHTED_GPTQ` | **archived** | Fisher-weighted GPTQ is archived under `archive/fisher_2026-05-15/` and rejected by the production pipeline. |
+| `PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP` | archived companion | Historical Fisher-weighted GPTQ row-weight cap; not used by the production pipeline. |
 | `PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS` | `0` | Candidate E8M0 exponent shifts for MXFP8 activation-weighted scale search. Nonzero shifts are experimental; .8B and 4B A/Bs on 2026-05-10 regressed KL, so production defaults to RTN-equivalent MXFP8. |
 
 ## Pipeline production-cache flags
@@ -64,22 +37,17 @@ existing production cache, stores the clipped rendering under the internal
 These are `run-pipeline.sh` environment variables rather than
 `PRISMAQUANT_*` flags.
 
-AWQ, SmoothQuant, and BlockOrtho-G were archived on 2026-05-13 under
-`archive/foldscale_orthog_2026-05-13/`. The production cache and pipeline now
-fail fast if `awq`, `smoothquant`, or `block_rotation` are requested.
+Research levers outside the current production recipe live under `archive/`.
+The production pipeline fails fast when archived Fisher levers are requested.
 
 | env var | default | what it does |
 |---|---|---|
 | `PRODUCTION_CACHE` | `1` | Build and use a `ProductionWeightCache` so export packs the same rendered weights that KL/polish measured. |
 | `PRODUCTION_RECACHE` | `1` | Replay calibration with production weights installed and re-fit `activation_max_abs` before export. |
-| `PRODUCTION_CACHE_LEVERS` | `gptq,scale_sweep` | Render-time quality levers for the production cache. `FISHER_WEIGHTED_GPTQ=1` appends `fisher_gptq`; `PRISMAQUANT_ACT_CLIP_SOLVER=1` enables PrismaClip through the cache code. |
-| `FISHER_WEIGHTED_GPTQ` | `0` | Pipeline switch that writes h-detail during probe, passes it into production cache fill, and uses a distinct `_fisher` cache path. |
-| `FISHER_OUTPUT_MSE_ALLOCATOR` | `0` | Pipeline switch that writes h-detail during probe, records activation-cache row indices, passes h-detail into cost measurement, and exports `PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=1` so the allocator optimizes the Fisher row-weighted `fisher_output_mse` objective. It does not change render-time quantization math by itself. |
-| `PRISMACLIP` | `0` | **Disabled for production.** The pipeline now rejects truthy `PRISMACLIP` unless `PRISMACLIP_RESEARCH_OVERRIDE=1` is also set. PrismaClip remains available only for explicit research ablations because the 2026-05-13 27B top-32 run stayed GPU-bound but was still too slow to be useful. |
-| `PRISMACLIP_RESEARCH_OVERRIDE` | `0` | Explicit override that permits `PRISMACLIP=1` in `run-pipeline.sh` for ablations. Do not use for production artifacts. |
-| `PRISMACLIP_RBC` | `0` | **Disabled.** Setting this to a truthy value makes the pipeline fail fast pending investigation of the 2026-05-12 .8B KL regression and ~10x cache-fill slowdown. |
-| `PRISMAFISHERCLIP` | `0` | **Disabled for production.** Pipeline switch that writes h-detail during probe, enables `act_clip_solver,fisher_clip`, and tags the production cache with `_fisherclip`. Because it depends on PrismaClip, the pipeline rejects it unless `PRISMACLIP_RESEARCH_OVERRIDE=1` is set for an explicit ablation. |
-| `H_DETAIL_DIR` | `$WORK_DIR/h_detail` | h-detail directory used when `FISHER_WEIGHTED_GPTQ=1`, `FISHER_OUTPUT_MSE_ALLOCATOR=1`, or `PRISMAFISHERCLIP=1`. |
+| `PRODUCTION_CACHE_LEVERS` | `gptq,joint_scale_opt` | V1 production render levers: GPTQ with damp sweep plus joint NVFP4 scale optimization. `scale_sweep` remains available for explicit ablations but is no longer the default. |
+| `FISHER_WEIGHTED_GPTQ` | archived | Any truthy value is rejected; archive context lives under `archive/fisher_2026-05-15/`. |
+| `FISHER_OUTPUT_MSE_ALLOCATOR` | archived | Any truthy value is rejected; V1 allocation uses the non-Fisher objective plus measured frontier validation. |
+| `H_DETAIL_DIR` | `$WORK_DIR/h_detail` | Historical h-detail location for archived Fisher levers; not required for V1 production defaults. |
 | `SELECTION_MODE` | `surrogate` | `surrogate` preserves the normal allocator-selected `TARGET_BITS` assignment. `validated-surrogate` writes allocator Pareto assignments, builds a format-menu production cache, measures real assignment KL for each Pareto point, selects the measured KL/bpp kneedle with `prismaquant.select_validated_frontier`, then recaches and exports the selected assignment. |
 | `VALIDATED_FRONTIER_NSAMPLES` / `VALIDATED_FRONTIER_SEQLEN` | `$NSAMPLES` / `$SEQLEN` | Calibration size for measured-frontier KL selection. Keep these at the artifact validation contract for 27B decisions; lower values are smoke-only. |
 | `VALIDATED_FRONTIER_PICK` | `kneedle` | Selection rule for `SELECTION_MODE=validated-surrogate`: `kneedle`, `best-kl`, or `lowest-bpp`. Production selection should use `kneedle` unless the run is explicitly an ablation. |
@@ -104,7 +72,7 @@ To revert a single flag for A/B comparison:
 
 ```bash
 PRISMAQUANT_DEFERRED_FISHER_COMPUTE=0 \
-  python -m prismaquant.multi_chunk_probe ...
+  python -m prismaquant.incremental_probe ...
 ```
 
 To revert ALL perf flags (legacy v20 behavior):

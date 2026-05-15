@@ -1,4 +1,4 @@
-"""Joint REAP-prune + quant candidate generation in the allocator.
+"""Joint expert-prune + quant candidate generation in the allocator.
 
 Verifies:
   1. When prune is disabled (empty prune_ratios or missing saliency),
@@ -9,7 +9,7 @@ Verifies:
      memory_bytes (proportional to kept experts) and drops the
      lowest-saliency expert ids first.
   3. The prune Δloss formula is α · S_j per dropped expert, where S_j
-     is the probe's REAP dropout-loss estimate, matching
+     is the probe's dropout-loss estimate, matching
      `_prune_cost_per_expert`.
   4. The DP's existing numerical invariants (ordering by cost) still
      hold — the allocator's downstream DP is format-agnostic about
@@ -40,7 +40,7 @@ import prismaquant.format_registry as fr
 
 
 pytestmark = pytest.mark.skip(
-    reason="REAP expert pruning is archived; old prune-candidate mechanics retained only as reference."
+    reason="Expert pruning is archived; old prune-candidate mechanics retained only as reference."
 )
 
 
@@ -188,7 +188,7 @@ def test_prune_drops_lowest_saliency_first():
 def test_route_floor_protects_rare_high_impact_expert():
     """Route mass floors preserve conditional impact for rare experts.
 
-    Expert 1 has lower raw token-normalized REAP saliency, but only one
+    Expert 1 has lower raw token-normalized saliency, but only one
     weighted routed-token of evidence. With a 10-token floor its implied
     conditional impact is high enough that expert 0 should be dropped.
     """
@@ -387,7 +387,7 @@ def test_expert_ids_in_group_helper():
 
 
 def test_unit_prune_cost_formula():
-    # Saliency is already REAP dropout loss units, so α=0.5, S=0.5 → 0.25.
+    # Saliency is already in dropout-loss units, so α=0.5, S=0.5 -> 0.25.
     got = _prune_cost_per_expert(saliency=0.5, h_trace=0.1, n_params=100, alpha=0.5)
     assert got == pytest.approx(0.25, rel=1e-12)
     # Degenerate cases

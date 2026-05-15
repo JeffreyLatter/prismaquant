@@ -441,20 +441,6 @@ class TestRecipeParsing(unittest.TestCase):
         self.assertEqual(canonicalize_format(mx8), "MXFP8")
         self.assertEqual(canonicalize_format(bf), "BF16")
         self.assertEqual(canonicalize_format({"bits": 4, "data_type": "mx_fp"}), "MXFP4")
-        with self.assertRaises(ValueError):
-            canonicalize_format("NVFP4_CLIPPED")
-
-    def test_load_production_cache_variant_map_from_probe_payload(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "probe.json"
-            path.write_text(json.dumps({
-                "chosen_assignment": {"layer": "NVFP4"},
-                "chosen_cache_variants": {"layer": "NVFP4_CLIPPED"},
-            }))
-            self.assertEqual(
-                enc._load_production_cache_variant_map(str(path)),
-                {"layer": "NVFP4_CLIPPED"},
-            )
 
 
 class TestVLLMInternalNaming(unittest.TestCase):
@@ -756,53 +742,6 @@ class TestProductionCacheExportPath(unittest.TestCase):
             self.assertEqual(out["weight_scale"].dtype, torch.uint8)
         finally:
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
-
-    def test_prismaclip_variant_hits_distinct_cache_key_but_packs_nvfp4(self):
-        import prismaquant.export_native_compressed as m
-        from prismaquant.production_weight_cache import (
-            ProductionWeightCache,
-            ProductionWeightCacheVariantView,
-        )
-
-        base = torch.zeros((8, 16), dtype=torch.float32)
-        clipped = torch.ones((8, 16), dtype=torch.float32) * 0.1
-        base_cache = ProductionWeightCache(
-            weights={
-                ("model.layers.0.mlp.down_proj", "NVFP4"): base,
-                ("model.layers.0.mlp.down_proj", "NVFP4_CLIPPED"): clipped,
-            },
-            levers={},
-            activation_max_abs={"model.layers.0.mlp.down_proj": 3.0},
-        )
-        cache = ProductionWeightCacheVariantView(
-            base_cache,
-            {"model.layers.0.mlp.down_proj": "NVFP4_CLIPPED"},
-        )
-        saved_cache = m._PRODUCTION_WEIGHT_CACHE
-        saved_scales = m._INPUT_GLOBAL_SCALES
-        try:
-            m._PRODUCTION_WEIGHT_CACHE = cache
-            m._INPUT_GLOBAL_SCALES = m._production_cache_scales(cache)
-            key = m._production_cache_lookup_key(
-                "model.layers.0.mlp.down_proj",
-                "NVFP4",
-            )
-            self.assertEqual(
-                key,
-                ("model.layers.0.mlp.down_proj", "NVFP4_CLIPPED"),
-            )
-            out = m._pack_production_cached_2d(
-                "model.layers.0.mlp.down_proj",
-                "NVFP4",
-                device=torch.device("cpu"),
-            )
-            self.assertIsNotNone(out)
-            self.assertIn("weight_packed", out)
-            self.assertIn("weight_global_scale", out)
-            self.assertIn("input_global_scale", out)
-        finally:
-            m._PRODUCTION_WEIGHT_CACHE = saved_cache
-            m._INPUT_GLOBAL_SCALES = saved_scales
 
     def test_mxfp8_scale_sweep_cache_defers_to_export_recompute(self):
         import prismaquant.export_native_compressed as m
@@ -1365,19 +1304,6 @@ class TestActivationAwarePasses(unittest.TestCase):
         expected = torch.tensor([[1.0, -2.0, 10.0, -10.0]])
         self.assertTrue(torch.equal(out, expected))
 
-    def test_activation_matrix_rbc_rescale_is_disabled(self):
-        import torch
-        import prismaquant.export_native_compressed as m
-
-        x = torch.tensor([[1.0, 2.0, 120.0, -3.0]], dtype=torch.float32)
-        with self.assertRaisesRegex(RuntimeError, "PrismaClip-RBC.*disabled"):
-            m._activation_matrix_for_gptq(
-                x,
-                4,
-                clip_threshold=20.0,
-                clip_rescale="row_rms",
-            )
-
     def test_activation_matrix_applies_fisher_row_weights(self):
         import torch
         import prismaquant.export_native_compressed as m
@@ -1554,45 +1480,10 @@ class TestActivationAwarePasses(unittest.TestCase):
         torch.testing.assert_close(W_swept, W_rtn)
         self.assertGreater(float((W - W_failed).pow(2).mean().item()), 0.0)
 
-    def test_activation_weighted_round_prefers_high_importance_channels(self):
-        """Activation-weighted rounding should pick the grid neighbor
-        that minimizes weighted error. We construct a weight that's
-        ambiguous between two grid points in a high-importance column
-        and verify the output is closer to the true value there than
-        pure RTN would be (pure RTN ignores column importance)."""
-        import torch
-        from prismaquant.export_native_compressed import (
-            _activation_weighted_round_nvfp4, quantize_dequantize_nvfp4,
-        )
-        W = torch.randn(8, 16) * 0.3
-        # Create heavily imbalanced activations: column 0 has huge
-        # magnitude, the rest are small.
-        X = torch.randn(100, 16) * 0.01
-        X[:, 0] *= 100.0
-        W_aw = _activation_weighted_round_nvfp4(W, X, group_size=16)
-        self.assertEqual(W_aw.shape, W.shape)
-        # Compare to pure RTN: the act-weighted pass should give at
-        # least as low an output-space error (weighted by X).
-        wp_rtn, ws_rtn, wg_rtn = quantize_dequantize_nvfp4(W)
-        W_rtn = self._decode_nvfp4(wp_rtn, ws_rtn, wg_rtn)
-        out_true = W @ X.t()
-        out_rtn = W_rtn @ X.t()
-        out_aw = W_aw @ X.t()
-        err_rtn = (out_true - out_rtn).pow(2).mean().item()
-        err_aw = (out_true - out_aw).pow(2).mean().item()
-        # The activation-weighted polish should not be worse than RTN.
-        # Tolerance allows the test to pass even when the two agree
-        # exactly (the column-importance weighting doesn't flip any
-        # decisions on small toy inputs). The point is: it's closed-
-        # form and doesn't regress.
-        self.assertLessEqual(err_aw, err_rtn * 1.01,
-                             f"act-weighted {err_aw:.3e} > rtn {err_rtn:.3e}")
-
     def test_composed_passes_reduce_output_space_error_vs_rtn(self):
         """Integration test: synthetic linear + imbalanced activations.
-        Running `_quantize_2d` with all 3 act-aware passes enabled
-        should give lower activation-weighted output-space MSE than
-        pure RTN (`_quantize_2d` with flags off)."""
+        Running `_quantize_2d` with GPTQ enabled should give no worse
+        activation-weighted output-space MSE than pure RTN."""
         import torch
         from prismaquant.export_native_compressed import (
             _quantize_2d,
@@ -1615,10 +1506,10 @@ class TestActivationAwarePasses(unittest.TestCase):
             out_rtn["weight_packed"], out_rtn["weight_scale"],
             out_rtn["weight_global_scale"],
         )
-        # GPTQ + activation-weighted rounding on, activations passed explicitly.
+        # GPTQ on, activations passed explicitly.
         out_aa = _quantize_2d(
             W, "NVFP4",
-            awq_enabled=False, gptq_enabled=True, awq_round_enabled=True,
+            gptq_enabled=True,
             cached_activations=X,
         )
         W_aa = self._decode_nvfp4(
@@ -1642,18 +1533,13 @@ class TestActivationAwarePasses(unittest.TestCase):
         from prismaquant.export_native_compressed import (
             _ACT_AWARE_FLAGS,
         )
-        self.assertFalse(_ACT_AWARE_FLAGS["awq"])
         self.assertFalse(_ACT_AWARE_FLAGS["gptq"])
-        self.assertFalse(_ACT_AWARE_FLAGS["awq_round"])
         self.assertFalse(_ACT_AWARE_FLAGS["static_act_order"])
         self.assertFalse(_ACT_AWARE_FLAGS["joint_scale_opt"])
 
     def test_quantize_2d_picks_up_module_flags(self):
-        """When `_ACT_AWARE_FLAGS` is set, GPTQ/activation-weighted
-        rounding are selected by `_quantize_2d` based on the module-
-        level flag bundle. We use GPTQ here (which measurably reshapes
-        the packed weight via block-wise error propagation) to verify
-        the flag dispatch works independently of archived transform flags."""
+        """When `_ACT_AWARE_FLAGS` is set, GPTQ is selected by `_quantize_2d`
+        based on the module-level flag bundle."""
         import torch
         import prismaquant.export_native_compressed as m
         torch.manual_seed(11)
@@ -1675,7 +1561,7 @@ class TestActivationAwarePasses(unittest.TestCase):
         os.environ["PRISMAQUANT_DO_NO_HARM"] = "0"
         try:
             m._ACT_AWARE_FLAGS.update({
-                "awq": False, "gptq": True, "awq_round": False,
+                "gptq": True,
                 "static_act_order": False, "joint_scale_opt": False,
             })
             m._CACHED_ACTIVATIONS = {"demo.linear": X}
@@ -1683,7 +1569,7 @@ class TestActivationAwarePasses(unittest.TestCase):
                 W, "NVFP4", linear_name="demo.linear",
             )
             m._ACT_AWARE_FLAGS.update({
-                "awq": False, "gptq": False, "awq_round": False,
+                "gptq": False,
                 "static_act_order": False, "joint_scale_opt": False,
             })
             out_without = m._quantize_2d(
@@ -1786,15 +1672,3 @@ class TestActivationAwarePasses(unittest.TestCase):
                 os.environ["PRISMAQUANT_DO_NO_HARM"] = saved_dnh
 
         self.assertEqual(calls, ["gptq", "scale_sweep"])
-
-    def test_awq_enabled_is_archived(self):
-        import torch
-        from prismaquant.export_native_compressed import _quantize_2d
-
-        with self.assertRaisesRegex(RuntimeError, "AWQ export has been archived"):
-            _quantize_2d(
-                torch.randn(8, 16),
-                "NVFP4",
-                awq_enabled=True,
-                cached_activations=torch.randn(4, 16),
-            )

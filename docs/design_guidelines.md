@@ -129,15 +129,13 @@ improves the active score.
 
 Mechanism ordering is declared by operation type, not by ad hoc flag order.
 See `docs/progressive_render_pipeline.md` for the current order and extension
-contract. Global basis transforms such as HALO are full-recipe arms, not local
-progressive steps.
+contract. Global basis transforms are full-recipe arms, not local progressive
+steps.
 
-AWQ-v2, SmoothQuant fold scales, and BlockOrtho-G were archived on
-2026-05-13 under `archive/foldscale_orthog_2026-05-13/`. Hadamard-DuQuant
-was archived on 2026-05-14 under `archive/hdq_2026-05-14/`. These methods
-must not be reintroduced into production cache fill, allocator cost overrides,
-export metadata, or pipeline flags unless the user explicitly asks to revive
-the corresponding archive.
+Research-only transform families live under `archive/`. They must not be
+reintroduced into production cache fill, allocator cost overrides, export
+metadata, or pipeline flags unless the user explicitly asks to revive the
+corresponding archive.
 
 ### Rotation Transforms
 

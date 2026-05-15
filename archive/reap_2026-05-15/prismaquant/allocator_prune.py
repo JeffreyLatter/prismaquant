@@ -67,7 +67,7 @@ def _prune_cost_per_expert(
     n_params: int,
     alpha: float,
 ) -> float:
-    """Predicted loss for dropping one expert from its REAP saliency."""
+    """Predicted loss for dropping one expert from its saliency."""
     del h_trace, n_params
     if saliency <= 0:
         return 0.0
@@ -125,7 +125,7 @@ def _router_conditional_saliency_prior(
 ) -> float | None:
     """Median conditional saliency among observed experts on a router.
 
-    REAP dropout saliency is token-normalized:
+    Dropout-loss saliency is token-normalized:
         S_j = route_prob_j * E[g_norm_sq | routed to j]
 
     For experts with too little route mass, the allocator uses this
@@ -157,7 +157,7 @@ def _route_floor_adjusted_saliency(
     route_floor_mass: float,
     conditional_prior: float | None,
 ) -> float:
-    """Apply a routed-token-mass floor to a REAP dropout score.
+    """Apply a routed-token-mass floor to a dropout-loss score.
 
     With enough route evidence this returns `saliency` unchanged. With
     too little evidence, it preserves the expert's observed conditional

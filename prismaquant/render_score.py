@@ -5,8 +5,8 @@ fused-sibling transforms: compare the candidate rendered weight against the
 current baseline on the same activation rows, optionally weighted by per-token
 Fisher/output importance. Lower is better.
 
-Global basis transforms such as HALO are intentionally outside this local
-gate; they must be evaluated as full recipe arms.
+Global basis transforms are intentionally outside this local gate; they must
+be evaluated as full recipe arms.
 """
 
 from __future__ import annotations
@@ -71,8 +71,8 @@ def score_render_error(
 ) -> float:
     """Mean output-space MSE for one rendered weight candidate.
 
-    With ``row_weights`` this becomes the Fisher/output-weighted variant used
-    by PrismaFisherClip and Fisher-weighted local objectives.
+    With ``row_weights`` this becomes the Fisher/output-weighted local
+    objective.
     """
 
     rows, cols = reference_weight.shape

@@ -1,9 +1,8 @@
-"""Router-weighted expert activation pruning — observer.
+"""Router-weighted expert activation saliency observer.
 
-Implements the REAP saliency score (Cerebras 2510.13999, Eq. 9) as a
-pure-observer class: forward hooks on the router + each expert module
-accumulate per-(router, expert) saliency during calibration, without
-modifying model weights or the forward path.
+Forward hooks on the router and each expert module accumulate
+per-(router, expert) saliency during calibration, without modifying model
+weights or the forward path.
 
     S_j = mean_{t in tokens_active(j)} [ g_j(t) · ||f_j(t)||_2 ]
 
@@ -19,10 +18,9 @@ The score measures the average output magnitude an expert adds to a
 layer, weighted by how strongly the router selected it. High-saliency
 experts handle either many tokens OR a few tokens with large-norm
 outputs (niche experts) — both patterns are correctly protected.
-Low-saliency experts get pruned first by the allocator. For the
-joint prune+quant optimizer, callers should use
-`saliency(reduction="reap_dropout")`, which returns REAP's direct
-dropout-loss estimate:
+For legacy expert-drop research, callers used
+`saliency(reduction="dropout_loss")`, which returns a direct dropout-loss
+estimate:
 
     Δ L_j ≈ (1/T_cal) · Σ_t g_j(t) · ||f_j(t)||_2²
 
@@ -101,7 +99,7 @@ _PACKED_ALL_NAMES = _PACKED_GATE_UP_NAMES + _PACKED_DOWN_NAMES + ("w1", "w2", "w
 # Tracker
 # ---------------------------------------------------------------------------
 class ExpertSaliencyTracker:
-    """Install forward hooks that accumulate REAP saliency per expert.
+    """Install forward hooks that accumulate saliency per expert.
 
     Lifecycle:
         tracker = ExpertSaliencyTracker(model, routers_and_experts, top_k)
@@ -161,7 +159,7 @@ class ExpertSaliencyTracker:
         # Per-(router, expert) accumulators in fp64. Lazily allocated on
         # the hook's firing device (first time the router's forward runs
         # after materialization). `sum_g_norm` / `count` feed the mean-
-        # contribution saliency (REAP's published formula); `max_g_norm`
+        # contribution saliency; `max_g_norm`
         # feeds the niche-protecting saliency that prefers experts with
         # a few large-magnitude contributions. Device-local storage
         # avoids CPU↔GPU duplication on unified-memory systems and
@@ -173,19 +171,19 @@ class ExpertSaliencyTracker:
         self.count: dict[str, torch.Tensor] = {}
         self.max_g_norm: dict[str, torch.Tensor] = {}
         # `sum_g_norm_sq[router][j]` accumulates Σ_t g_j(t) · ||f_j(t)||²
-        # over active tokens — REAP's "dropout loss" per expert, before
+        # over active tokens - expert dropout loss before
         # normalization. Divided by total tokens seen in `saliency(
-        # reduction="reap_dropout")` to produce Δ L_j in units directly
+        # reduction="dropout_loss")` to produce Δ L_j in units directly
         # comparable to the allocator's weight-MSE·Fisher Δloss terms.
         self.sum_g_norm_sq: dict[str, torch.Tensor] = {}
         # `total_tokens_by_router[router]` is the batch-size × seq-len
         # count of tokens across all calibration forwards on this
-        # router — the normalizer for the REAP dropout formula. Not
+        # router - the normalizer for the dropout-loss formula. Not
         # per-expert; every token contributes to the router's total
         # regardless of which top-k set included a given expert.
         self.total_tokens_by_router: dict[str, torch.Tensor] = {}
         # Route-mass traces used by the allocator as a confidence prior
-        # when deciding whether a low observed REAP score is reliable.
+        # when deciding whether a low observed saliency score is reliable.
         # `route_mass[j] = Σ_t g_j(t)` over selected top-k entries;
         # `route_count[j]` is the unweighted number of top-k selections.
         self.route_mass: dict[str, torch.Tensor] = {}
@@ -377,7 +375,7 @@ class ExpertSaliencyTracker:
             # hop. topk_i is already int64 on the device; no cast needed.
             self._last_topk_probs[router_qname] = probs.detach()
             self._last_topk_ids[router_qname] = topk_i.detach()
-            # Accumulate the router's total-tokens-seen for REAP's
+            # Accumulate the router's total-tokens-seen for the
             # dropout-loss normalizer (Δ L_j = Σ g·||f||² / T_cal). The
             # router fires exactly once per forward, so this counts
             # each token exactly once regardless of top-k.
@@ -465,7 +463,7 @@ class ExpertSaliencyTracker:
                 # contribution is >= 0 (which they are — norm and prob
                 # are both non-negative).
                 contrib_max = contribution_full.max()
-                # REAP dropout loss contribution per token: g·||f||²
+                # Dropout-loss contribution per token: g·||f||²
                 # (not (g·||f||)²). Zero on inactive tokens by the
                 # gate mask.
                 contribution_sq = torch.where(
@@ -551,7 +549,7 @@ class ExpertSaliencyTracker:
             - ``"max_mean_geomean"``: geometric mean of max and mean —
               a mid-point that punishes "tiny-mean but tiny-max" experts
               harder than mean alone while still weighting frequency.
-            - ``"reap_dropout"`` (REAP paper Eq. 11): the direct
+            - ``"dropout_loss"``: the direct
               per-expert DROPOUT LOSS
               ``Δ L_j ≈ (1/T_cal) Σ_t g_j(t) · ||f_j(t)||²``. Units
               match the allocator's other Δloss terms (weight-MSE ·
@@ -561,7 +559,7 @@ class ExpertSaliencyTracker:
         Experts that never activated during calibration get a saliency
         of 0.0 — the allocator can treat them as "safe to drop" directly.
         """
-        if reduction not in ("mean", "max", "max_mean_geomean", "reap_dropout"):
+        if reduction not in ("mean", "max", "max_mean_geomean", "dropout_loss"):
             raise ValueError(f"unknown reduction {reduction!r}")
         out: dict[str, dict[int, float]] = {}
         # Cover dead routers (no hook fires → no accumulators allocated)
@@ -605,7 +603,7 @@ class ExpertSaliencyTracker:
                     slc[int(e)] = max_val
                 elif reduction == "max_mean_geomean":
                     slc[int(e)] = float((mean_val * max_val) ** 0.5)
-                else:  # reap_dropout
+                else:  # dropout_loss
                     slc[int(e)] = (
                         float(sq_cpu[e].item()) / tt_val if tt_val > 0 else 0.0
                     )
@@ -724,7 +722,7 @@ def _qwen3_5_moe_experts_saliency_forward(
     """Instance-level replacement for ``Qwen3_5MoeExperts.forward``.
 
     Bit-identical output semantics to the upstream implementation; the
-    only addition is REAP saliency accumulation inside the per-expert
+    only addition is saliency accumulation inside the per-expert
     loop. ``self._pq_saliency_tracker`` and ``self._pq_saliency_router``
     are set by ``ExpertSaliencyTracker._install_packed_experts_patch``.
     """
@@ -778,13 +776,13 @@ def _qwen3_5_moe_experts_saliency_forward(
         inter = self.act_fn(gate) * up
         expert_out = F.linear(inter, self.down_proj[e_int])
 
-        # REAP saliency: f_j BEFORE routing-weight multiply, weighted
+        # Expert saliency: f_j BEFORE routing-weight multiply, weighted
         # by the top-k prob that routed each token to this expert.
         if acc_sum is not None:
             gate_vals = top_k_weights[token_idx, top_k_pos].to(torch.float64)
             norms = expert_out.to(torch.float64).norm(dim=-1)
             contribution = gate_vals * norms                   # g·||f||
-            contribution_sq = gate_vals * norms.pow(2)         # g·||f||² (REAP)
+            contribution_sq = gate_vals * norms.pow(2)         # g·||f||²
             acc_sum[e_int] += contribution.sum()
             acc_count[e_int] += norms.numel()
             if norms.numel() > 0:

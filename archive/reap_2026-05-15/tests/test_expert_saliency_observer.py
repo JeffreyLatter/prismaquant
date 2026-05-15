@@ -4,7 +4,7 @@ Builds a tiny hand-made MoE module that mirrors the HF nested layout
 (`parent.gate` Linear + `parent.experts` nn.ModuleList of expert
 submodules) and verifies:
 
-1. The REAP saliency formula `S_j = mean[g_j · ||f_j||_2]` matches a
+1. The expert-saliency formula `S_j = mean[g_j · ||f_j||_2]` matches a
    pure-Python reference within fp64 accumulation tolerance.
 2. Both `reduction="mean"` and `reduction="max"` return sensible,
    monotone-in-their-definition values.
@@ -185,7 +185,7 @@ def test_saliency_geomean_blend():
         assert geo[e] == pytest.approx(expected, abs=1e-9, rel=1e-8), (e, geo[e], expected)
 
 
-def test_saliency_reap_dropout_matches_reference():
+def test_saliency_dropout_loss_matches_reference():
     torch.manual_seed(11)
     dim, inter, n_experts, top_k = 24, 48, 5, 2
     layer = _DummyMoeLayer(dim, inter, n_experts, top_k)
@@ -226,7 +226,7 @@ def test_saliency_reap_dropout_matches_reference():
             / x.shape[0]
         )
 
-    got = tracker.saliency(reduction="reap_dropout")["mlp.gate"]
+    got = tracker.saliency(reduction="dropout_loss")["mlp.gate"]
     for e in range(n_experts):
         assert got[e] == pytest.approx(expected[e], abs=1e-10, rel=1e-8), (
             e, got[e], expected[e]
@@ -396,7 +396,7 @@ class _FakeSparseMoeBlock(nn.Module):
         return self.experts(x.reshape(-1, x.shape[-1]), topi, topv)
 
 
-def _pure_python_reap_saliency(block: _FakeSparseMoeBlock, x: torch.Tensor):
+def _pure_python_dropout_loss_saliency(block: _FakeSparseMoeBlock, x: torch.Tensor):
     """Reference saliency via one eager re-run of each expert's forward;
     independent of the tracker so a mismatch here is a real bug."""
     x_flat = x.reshape(-1, x.shape[-1])
@@ -456,7 +456,7 @@ def test_packed_saliency_patched_forward_matches_reference():
     x = torch.randn(50, dim)
 
     # Reference first — before any patching.
-    ref_mean, ref_max, ref_count = _pure_python_reap_saliency(block, x)
+    ref_mean, ref_max, ref_count = _pure_python_dropout_loss_saliency(block, x)
     with torch.no_grad():
         ref_out = block(x)
 

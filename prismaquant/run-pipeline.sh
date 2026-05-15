@@ -69,20 +69,6 @@ set -euo pipefail
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
 
-# PrismaClip / PrismaClip-RBC / PrismaFisherClip are archived under
-# archive/prismaclip_2026-05-14. Any attempt to enable them fails fast.
-for _legacy_clip_var in PRISMACLIP PRISMACLIP_RBC PRISMACLIP_RESEARCH_OVERRIDE \
-                       PRISMAFISHERCLIP PRISMAFISHERCLIP_MODE \
-                       PRISMAQUANT_ALLOW_RESEARCH_PRISMACLIP \
-                       PRISMAQUANT_ACT_CLIP_SOLVER PRISMAQUANT_ACT_CLIP_SOLVER_RESCALING \
-                       PRISMAQUANT_PRISMAFISHERCLIP PRISMAQUANT_PRISMAFISHERCLIP_MODE; do
-  if [[ -n "${!_legacy_clip_var:-}" ]]; then
-    echo "[pipeline] ERROR: $_legacy_clip_var is archived under archive/prismaclip_2026-05-14 and is not available on the production path." >&2
-    exit 2
-  fi
-done
-unset _legacy_clip_var
-
 if [[ "$DEVICE" != cuda* || "$EXPORT_DEVICE" != cuda* ]]; then
   echo "[pipeline] ERROR: PrismaQuant production pipeline is GPU-or-bust; DEVICE and EXPORT_DEVICE must be cuda*" >&2
   exit 2
@@ -163,22 +149,7 @@ case ",$PRODUCTION_CACHE_LEVERS," in
     ;;
 esac
 export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
-: "${AWQ:=0}"
-: "${BLOCK_ROTATION:=0}"
 : "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
-# HALO is archived under archive/halo_2026-05-15/. The defaults stay at
-# "off"/0 so downstream --halo-mode / --halo-seed CLI args still parse
-# (the modules still take them), but any HALO_MODE override here hits the
-# archive stub at run-time.
-: "${HALO_MODE:=off}"
-: "${HALO_SEED:=0}"
-case "$HALO_MODE" in
-  off|"") ;;
-  *)
-    echo "[pipeline] ERROR: HALO_MODE=$HALO_MODE — HALO is archived under archive/halo_2026-05-15." >&2
-    exit 2
-    ;;
-esac
 : "${SELECTION_MODE:=surrogate}"
 : "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
@@ -191,34 +162,9 @@ COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
 PROBE_H_DETAIL_ARGS=()
 COST_H_DETAIL_ARGS=()
 PROD_H_DETAIL_ARGS=()
-# Fisher-weighted GPTQ / output-MSE allocator legacy case blocks deleted;
-# the archive guard above already errors out when any Fisher variable is
-# set, so this section can no longer reach the enable branches.
 case ",$PRODUCTION_CACHE_LEVERS," in
-  *,act_clip_solver,*|*,fisher_clip,*)
-    echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes act_clip_solver or fisher_clip; PrismaClip / PrismaFisherClip are archived under archive/prismaclip_2026-05-14." >&2
-    exit 2
-    ;;
   *,static_act_order,*)
     echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes static_act_order — SAO showed no win on its own activation-weighted objective; dropped 2026-05-15." >&2
-    exit 2
-    ;;
-  *,awq_round,*)
-    echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes awq_round — not part of the core stack." >&2
-    exit 2
-    ;;
-esac
-case "$AWQ" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *)
-    echo "[pipeline] ERROR: AWQ is archived under archive/foldscale_orthog_2026-05-13 and is not available on the production path." >&2
-    exit 2
-    ;;
-esac
-case "$BLOCK_ROTATION" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *)
-    echo "[pipeline] ERROR: BlockOrtho-G is archived under archive/foldscale_orthog_2026-05-13 and is not available on the production path." >&2
     exit 2
     ;;
 esac
@@ -230,8 +176,8 @@ case "${HADAMARD_DUQUANT:-}" in
     ;;
 esac
 case ",$PRODUCTION_CACHE_LEVERS," in
-  *,awq,*|*,smoothquant,*|*,block_rotation,*|*,hadamard_duquant,*)
-    echo "[pipeline] ERROR: AWQ/SmoothQuant/BlockOrtho-G levers are archived under archive/foldscale_orthog_2026-05-13; Hadamard-DuQuant is archived under archive/hdq_2026-05-14." >&2
+  *,hadamard_duquant,*)
+    echo "[pipeline] ERROR: Hadamard-DuQuant is archived under archive/hdq_2026-05-14." >&2
     exit 2
     ;;
 esac
@@ -265,7 +211,6 @@ echo "  EXPORT_GPTQ=$EXPORT_GPTQ EXPORT_SCALE_SWEEP=$EXPORT_SCALE_SWEEP"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
 echo "  H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
-echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
 echo
 
@@ -455,18 +400,14 @@ if [[ "$SELECTION_MODE" == "validated-surrogate" ]] && [[ "$PRODUCTION_CACHE" ==
   exit 2
 fi
 if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTION_CACHE" != "False" ]]; then
-  HALO_CACHE_TAG=""
-  if [[ "$HALO_MODE" != "off" ]]; then
-    HALO_CACHE_TAG="_halo-${HALO_MODE}-seed${HALO_SEED}"
-  fi
   LEVER_CACHE_TAG=""
   case "$FISHER_WEIGHTED_GPTQ" in
     0|false|False|FALSE|no|No|NO|"") ;;
     *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_fisher" ;;
   esac
-  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}"
-  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_raw.pkl"
-  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_recached.pkl"
+  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}"
+  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_raw.pkl"
+  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_recached.pkl"
   CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
   if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
     if [[ -z "$ALLOCATOR_PARETO_DIR" || ! -f "$ALLOCATOR_PARETO_DIR/manifest.json" ]]; then
@@ -496,7 +437,7 @@ PY
       exit 2
     fi
     PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
-    PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_frontier_raw.pkl"
+    PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_frontier_raw.pkl"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       if [[ "${PRODUCTION_CACHE_UNION:-0}" == "1" ]]; then
         # Smart-union render: only render MXFP8/FP8 fallbacks for Linears
@@ -531,8 +472,6 @@ PY
           --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
           --cache-dir "$PROD_CACHE_DIR" \
           --render-scope format-menu \
-          --halo-mode "$HALO_MODE" \
-          --halo-seed "$HALO_SEED" \
           "${PROD_H_DETAIL_ARGS[@]}" \
           2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
       fi
@@ -581,8 +520,6 @@ PY
       --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
       --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
       --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
-      --halo-mode "$HALO_MODE" \
-      --halo-seed "$HALO_SEED" \
       2>&1 | tee "${WORK_DIR}/logs/validated_frontier_kl.log"
 
     echo "[pipeline] [4/4] selecting measured frontier point ..."
@@ -602,7 +539,7 @@ import sys
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()[:12])
 PY
 )"
-      PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_frontier_${SELECTED_DIGEST}_recached.pkl"
+      PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_frontier_${SELECTED_DIGEST}_recached.pkl"
       if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
         echo "[pipeline] [4/4] re-fitting activation scales for selected measured-${VALIDATED_FRONTIER_PICK} assignment ..."
         python3 -m prismaquant.production_recache \
@@ -620,8 +557,6 @@ PY
           --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
           --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
           --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
-          --halo-mode "$HALO_MODE" \
-          --halo-seed "$HALO_SEED" \
           2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
       else
         echo "[pipeline] [4/4] selected-assignment recached production cache exists, skipping"
@@ -666,8 +601,6 @@ PY
           --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
-          --halo-mode "$HALO_MODE" \
-          --halo-seed "$HALO_SEED" \
           "${PROD_H_DETAIL_ARGS[@]}" \
           2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
       else
@@ -687,8 +620,6 @@ PY
           --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
           --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
           --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
-          --halo-mode "$HALO_MODE" \
-          --halo-seed "$HALO_SEED" \
           2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
       fi
     else
@@ -712,8 +643,6 @@ PY
         --cache-dir "$PROD_CACHE_DIR" \
         --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
         --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-        --halo-mode "$HALO_MODE" \
-        --halo-seed "$HALO_SEED" \
         "${PROD_H_DETAIL_ARGS[@]}" \
         2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
     else
@@ -731,8 +660,6 @@ EXPORT_ARGS=(
   --output "${WORK_DIR}/exported"
   --device "$EXPORT_DEVICE"
   --activation-cache-dir "${WORK_DIR}/act"
-  --halo-mode "$HALO_MODE"
-  --halo-seed "$HALO_SEED"
 )
 case "$EXPORT_GPTQ" in
   0|false|False|FALSE|no|No|NO) EXPORT_ARGS+=(--no-gptq) ;;

@@ -30,12 +30,6 @@ def test_production_cache_formats_include_all_non_bf16_registry_picks():
         "NVFP4",
     ) == ["FP8_E5M2", "MXFP8_E5M2", "NVFP4"]
 
-    assert _production_cache_formats(
-        ["NVFP4", "BF16"],
-        "NVFP4",
-        include_prismaclip=True,
-    ) == ["NVFP4", "NVFP4_CLIPPED"]
-
 
 def test_vllm_profile_allows_dense_fp8_e4m3_but_not_e5m2():
     dense = "model.layers.0.self_attn.q_proj"

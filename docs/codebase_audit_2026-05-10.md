@@ -71,7 +71,6 @@ intentional standalone tools:
 - `kl_fisher`
 - `kl_sensitivity_probe`
 - `model_profiles.validate`
-- `multi_chunk_probe`
 - `polish_from_assignment`
 - `validate_assignments_kl`
 - `validate_native_export`

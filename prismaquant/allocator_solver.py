@@ -18,7 +18,6 @@ class Candidate:
     bits_per_param: float
     memory_bytes: int
     predicted_dloss: float
-    pruned_expert_ids: tuple[int, ...] = ()
 
 
 def _shape_from_stats(entry: dict) -> tuple[int, ...]:
@@ -224,24 +223,9 @@ def _candidate_for_assignment(
     name: str,
     fmt: str,
     candidates: dict[str, list[Candidate]],
-    pruned_map: dict[str, tuple[int, ...]] | None = None,
 ) -> Candidate | None:
     """Resolve the scored candidate for one assignment entry."""
     cands_for_name = candidates.get(name, [])
-    target_drops = tuple(sorted((pruned_map or {}).get(name, ())))
-    for cand in cands_for_name:
-        if cand.fmt == fmt and tuple(sorted(cand.pruned_expert_ids)) == target_drops:
-            return cand
-    if target_drops:
-        available = [
-            (c.fmt, tuple(sorted(c.pruned_expert_ids)))
-            for c in cands_for_name
-        ]
-        raise AssertionError(
-            f"assignment {name!r} picked fmt={fmt!r} with pruned_expert_ids="
-            f"{target_drops}, but no exact candidate exists. Available "
-            f"candidates: {available[:8]}"
-        )
     for cand in cands_for_name:
         if cand.fmt == fmt:
             return cand
@@ -251,17 +235,15 @@ def _candidate_for_assignment(
 def compute_achieved(stats: dict, assignment: dict[str, str],
                      format_specs: dict[str, fr.FormatSpec],
                      candidates: dict[str, list[Candidate]] | None = None,
-                     pruned_map: dict[str, tuple[int, ...]] | None = None,
                      ) -> tuple[float, float]:
     """Return ``(avg_bits, total_predicted_dloss)`` for an assignment."""
     total_params = sum(stats[n]["n_params"] for n in assignment)
     total_bits = 0.0
     total_predicted_dloss = 0.0
-    pm = pruned_map or {}
     cs = candidates or {}
     for n in assignment:
         fmt = assignment[n]
-        chosen_cand = _candidate_for_assignment(n, fmt, cs, pm)
+        chosen_cand = _candidate_for_assignment(n, fmt, cs)
         if chosen_cand is not None:
             total_bits += 8.0 * chosen_cand.memory_bytes
             total_predicted_dloss += float(
@@ -282,13 +264,11 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
 def compute_assignment_predicted_dloss(
     assignment: dict[str, str],
     candidates: dict[str, list[Candidate]],
-    pruned_map: dict[str, tuple[int, ...]] | None = None,
 ) -> float:
     """Sum predicted loss for a concrete assignment."""
     total = 0.0
-    pm = pruned_map or {}
     for name, fmt in assignment.items():
-        chosen = _candidate_for_assignment(name, fmt, candidates, pm)
+        chosen = _candidate_for_assignment(name, fmt, candidates)
         if chosen is None:
             raise AssertionError(
                 f"assignment {name!r} picked fmt={fmt!r}, but no candidate "
@@ -312,42 +292,36 @@ def solve_with_promotion(
     stall_threshold: float = 1e-4,
     stall_grace: int = 3,
     profile=None,
-) -> tuple[dict[str, str] | None, dict[str, tuple[int, ...]], float]:
+) -> tuple[dict[str, str] | None, float]:
     """Solve, promote coupled tensors, and retry if promotion exceeds budget."""
     tightened = float(target_bits)
     last_assign: dict[str, str] | None = None
-    last_pruned: dict[str, tuple[int, ...]] = {}
     last_achieved = float("nan")
     prev_overshoot = float("inf")
     stall_count = 0
     for _iteration in range(max_iters):
         result = solve_allocation(stats, candidates, tightened, bit_precision)
         if result is None:
-            return last_assign, last_pruned, last_achieved
+            return last_assign, last_achieved
         assign, chosen_cands = result
-        pruned_map = {
-            n: c.pruned_expert_ids
-            for n, c in chosen_cands.items()
-            if c.pruned_expert_ids
-        }
+        del chosen_cands
         if not no_fused_promote:
             assign = promote_fused(assign, format_rank, profile=profile)
         assign = promote_moe_pair(assign, format_rank)
         achieved, _ = compute_achieved(
             stats, assign, format_specs,
-            candidates=candidates, pruned_map=pruned_map,
+            candidates=candidates,
         )
         last_assign = assign
-        last_pruned = pruned_map
         last_achieved = achieved
         overshoot = achieved - target_bits
         if overshoot <= overshoot_tolerance:
-            return assign, pruned_map, achieved
+            return assign, achieved
 
         if abs(prev_overshoot - overshoot) < stall_threshold:
             stall_count += 1
             if stall_count >= stall_grace:
-                return assign, pruned_map, achieved
+                return assign, achieved
         else:
             stall_count = 0
         prev_overshoot = overshoot
@@ -355,4 +329,4 @@ def solve_with_promotion(
         tightened -= overshoot / 2.0
         if tightened <= 0:
             break
-    return last_assign, last_pruned, last_achieved
+    return last_assign, last_achieved

@@ -2,7 +2,7 @@
 
 Two responsibilities:
 
-  1. **Adaptive sampling (#3).** Given the per-chunk REAP saliency values
+  1. **Adaptive sampling (#3).** Given the per-chunk expert-saliency values
      emitted by `ExpertSaliencyTracker`, decide which experts have
      stabilized in rank and can be skipped on the next chunk's phase-3
      reverse sweep. The contested ~5–15% of experts (those that sit near

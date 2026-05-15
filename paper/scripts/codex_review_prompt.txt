@@ -28,8 +28,7 @@ Sources you should consult (in priority order)
      a) The kneedle formula in Equation 6 of the paper vs.
         `segmented_kneedle_point()` in iterate_perturbed_allocation.py.
      b) The L1 probe formula description vs. the actual probe code
-        (incremental_probe.py / multi_chunk_probe.py /
-        observers/expert_saliency.py).
+        (incremental_probe.py).
      c) The L2 perturbed-X iteration description vs. perturbed_x_cache.py.
      d) The L3 propagated-cost paired-baseline description vs.
         measure_propagated_costs() in propagated_cost.py.
@@ -94,7 +93,7 @@ CONTENT
   proposition. Are the definitions tight? Are the dependencies between
   L1/L2/L3 stated correctly?
 - Accuracy of cited prior work: do the descriptions of HAWQ-V3, CLADO,
-  AWQ, GPTQ, kneedle (Satopaa 2011), ORD (Ortega/Ramchandran 1998), and
+  GPTQ, kneedle (Satopaa 2011), ORD (Ortega/Ramchandran 1998), and
   the microscaling spec match the actual content of those references?
   Flag anything that mischaracterizes a prior work.
 - Empirical numbers: cross-check every numeric claim against handovers,

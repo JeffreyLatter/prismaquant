@@ -98,8 +98,8 @@ calibration. The artifact is published with DOI \texttt{10.57967/hf/8656}
 upgraded to use a closer approximation of the per-Linear quantized weight
 the exporter ultimately ships --- joint-NVFP4 sibling-coherent input
 global scales, GPTQ reconstruction, scale-sweep, and calibrated activation
-clip; block-output match, HALO, and AWQ predecessor folding remain on the
-export-only side --- and the move set is restructured to start from a
+clip; block-output match remains on the export-only side --- and
+the move set is restructured to start from a
 low-bpp floor with a small bits-budget creep, drives the polish-time KL
 on Qwen3.6\nobreakdash-27B from $0.0151$ at $5.31$~bpp to $0.0054$ at
 $5.39$~bpp on a matched 2$\times$128 token calibration. A re-measurement
@@ -119,8 +119,8 @@ path.
 \section{Introduction}
 
 Post-training quantization has converged on two dominant axes. Per-tensor
-methods --- GPTQ \cite{gptq2022}, AWQ \cite{awq2024}, AutoRound
-\cite{autoround2023}, HALO/HQQ-style rotation preprocessors, and most
+methods --- GPTQ \cite{gptq2022}, AutoRound
+\cite{autoround2023}, rotation preprocessors, and most
 recently ParoQuant \cite{paroquant} --- improve the per-Linear quantization
 error of a fixed format. Allocation methods --- HAWQ-V3 \cite{hawqv3}, the
 cross-layer-dependency-aware integer-quadratic-programming approach of
@@ -171,8 +171,8 @@ new:
 \end{enumerate}
 
 \noindent\textbf{Headline empirical result.} On Qwen3.6\nobreakdash-27B, with
-identical source weights and identical export-time per-tensor tricks (HALO,
-GPTQ damp sweep, scale sweep, block-output match), \textsc{PrismaSCOUT} produces
+identical source weights and identical export-time per-tensor tricks (GPTQ damp
+sweep, scale sweep, block-output match), \textsc{PrismaSCOUT} produces
 a 5.31~bpp artifact with held-out KL $0.0151$. The previously published
 \textsc{PrismaQuant}~v1 artifact at the same source was 5.50~bpp with held-out
 KL $0.0475$ from the same calibration. The new artifact is 11\% smaller and the
@@ -204,13 +204,11 @@ Section~\ref{sec:discussion} discusses limitations.
 
 \paragraph{Per-tensor quantization.} GPTQ \cite{gptq2022} is the workhorse
 weight-only quantizer for transformers, posed as Hessian-weighted least squares
-over reconstruction error. AWQ \cite{awq2024} reweights salient channels.
-SmoothQuant \cite{smoothquant} pushes activation quantization tractable by
-migrating activation magnitude into weights. AutoRound \cite{autoround2023}
-sign-rounds via signSGD. HALO/HQQ-style rotations preprocess weight matrices to
-reduce outlier counts before integer quantization. These methods take a single
-matrix and a fixed format and produce a high-quality quantized version of that
-matrix; they do not decide \emph{which} matrix gets which format.
+over reconstruction error. AutoRound \cite{autoround2023} sign-rounds via
+signSGD. Rotation preprocessors transform weight matrices to reduce outlier
+counts before integer quantization. These methods take a single matrix and a
+fixed format and produce a high-quality quantized version of that matrix; they
+do not decide \emph{which} matrix gets which format.
 
 \paragraph{Mixed-precision allocation.} HAWQ-V3 \cite{hawqv3} formulates
 mixed-precision quantization as an integer linear program over per-layer
@@ -268,7 +266,7 @@ allocator itself}: each Linear in the model independently picks its
 serving format from $\{$BF16, MXFP8, NVFP4, MXFP4, source-passthrough$\}$
 under a global bits-per-parameter budget, rather than every Linear
 sharing one quantization scheme as in single-format methods like GPTQ
-\cite{gptq2022} or AWQ \cite{awq2024}. A tuned per-tensor toolkit runs
+\cite{gptq2022}. A tuned per-tensor toolkit runs
 \emph{under} whatever format the allocator picks for a given Linear; the
 allocator decides where bits should be spent. v1 is worth describing in
 its own right both because PrismaSCOUT inherits it wholesale (only the
@@ -310,12 +308,6 @@ a distribution no single-format method can produce.
 allocator has picked its format, v1 composes:
 
 \begin{itemize}[leftmargin=*,itemsep=2pt]
-  \item \textbf{HALO rotation preprocessing} \cite{prismaquant} ---
-    a Hadamard-style orthogonal rotation applied to the weight matrix
-    before integer quantization, which spreads outlier-channel mass
-    over the rotated basis and reduces the per-element representation
-    range. Particularly effective for $4$-bit weight-only formats whose
-    error is dominated by tail outliers.
   \item \textbf{Per-layer GPTQ} \cite{gptq2022}, the workhorse
     Hessian-weighted least-squares rounding. v1 ships an adaptive
     \emph{damp probe} (commit \texttt{0cbaddb}) that tries multiple
@@ -354,10 +346,9 @@ $4$-bit storage and which need $8$ or $16$ --- and the per-tensor
 toolkit solves the \emph{local} question --- given a chosen format,
 what is the lowest-error rounding for this specific weight matrix. Each
 per-tensor component attacks one term of the per-Linear quadratic
-$\tfrac12 \langle H_i, (W_i - \hat W_i)^2 \rangle$: HALO reduces
-$\|W_i - \hat W_i\|$ by spreading outliers; GPTQ minimizes
+$\tfrac12 \langle H_i, (W_i - \hat W_i)^2 \rangle$: GPTQ minimizes
 $\langle H_i, (W_i - \hat W_i)^2 \rangle$ under the chosen format;
-scale sweep tunes the post-rotation per-tensor scale to minimize the
+scale sweep tunes the per-tensor scale to minimize the
 remaining error; block-output match closes the gap to the
 \emph{block-level} reference, absorbing some of the inter-Linear
 coupling without an explicit cross-layer cost model. The HAWQ-style
@@ -388,11 +379,7 @@ four wins enabled lost roughly half the gain of activation-clipping
 applied alone, with the do-no-harm gate reverting clip-improved Linears
 because its cached MSE comparison ran on the unclipped activation
 distribution while the upstream pass had optimized under the clipped
-one. \textsc{AWQ} \cite{awq2024} surfaces the same family from a
-different angle: it was defaulted off in v1 after empirical bakeoffs
-showed it \emph{worsened} NVFP4 group quantization on most Linears,
-despite being a strict win on uniform-format $4$-bit settings. The
-per-Linear ``do no harm'' gate (commit \texttt{ed9c60c}) is the
+one. The per-Linear ``do no harm'' gate (commit \texttt{ed9c60c}) is the
 direct band-aid: after GPTQ + scale-sweep, compare against pure RTN
 on the cached activations and revert that Linear if RTN beats the
 post-pass weight. Both observations are artifacts of the same
@@ -1314,7 +1301,7 @@ have measured.
 The Qwen3.6-27B PrismaSCOUT artifact (DOI \texttt{10.57967/hf/8656},
 \cite{Tand2026hf}) is produced from the same source weights and
 the same per-tensor toolkit
-(HALO, GPTQ damp sweep, scale sweep, block-output match) as the previously
+(GPTQ damp sweep, scale sweep, block-output match) as the previously
 shipped \textsc{PrismaQuant}~v1 5.5~bpp artifact \cite{Tand2026hf_prev}. Only
 the selection routine changed. Both artifacts are the empirical operating
 point each selection regime deployed: $5.5$~bpp was where v1's
@@ -1435,8 +1422,8 @@ delta-quantize \texttt{WeightSession} swaps one decision unit's weight in
 place per trial, weights are rendered through a closer approximation of
 the export pipeline (GPTQ, scale-sweep, joint sibling-coherent NVFP4
 input global scales, calibrated activation clip; block-output match,
-HALO, and AWQ predecessor folding remain on the export-only side and are
-not yet replicated in the polish-time evaluator), and the move set is a
+remains on the export-only side and is not yet replicated in the
+polish-time evaluator), and the move set is a
 single bottom-up sweep from a low-bpp floor under a $5\%$ bits-budget
 creep. Table~\ref{tab:27b_prodpolish} reports the polish-time KL outcome
 on Qwen3.6-27B; both rows are evaluated on the same matched
@@ -1649,17 +1636,9 @@ repository for audit.
   Accurate post-training quantization for generative pre-trained transformers.
   \emph{ICLR}, 2023. \url{https://arxiv.org/abs/2210.17323}.
 
-\bibitem{awq2024} J.~Lin, J.~Tang, H.~Tang, S.~Yang, X.~Dang, C.~Gan, and S.~Han.
-  AWQ: Activation-aware weight quantization for LLM compression and
-  acceleration. \emph{MLSys}, 2024. \url{https://arxiv.org/abs/2306.00978}.
-
 \bibitem{autoround2023} W.~Cheng, Y.~Lv, W.~Zhang, and H.~Shen. Optimize weight
   rounding via signed gradient descent for the quantization of LLMs.
   \emph{arXiv:2309.05516}, 2023.
-
-\bibitem{smoothquant} G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, and S.~Han.
-  SmoothQuant: Accurate and efficient post-training quantization for large
-  language models. \emph{ICML}, 2023.
 
 \bibitem{hawqv3} Z.~Yao, Z.~Dong, Z.~Zheng, A.~Gholami, J.~Yu, E.~Tan, L.~Wang,
   Q.~Huang, Y.~Wang, M.~W.~Mahoney, and K.~Keutzer.

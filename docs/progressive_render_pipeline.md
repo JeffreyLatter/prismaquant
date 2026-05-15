@@ -25,29 +25,27 @@ Mechanisms declare what kind of operation they perform. The production cache
 resolves the order from those declarations rather than from the text order in
 an environment variable.
 
-Current local order:
+Current V1 production order:
 
 ```text
-activation candidate:      PrismaClip or PrismaFisherClip
 NVFP4 scale rule:          FourOverSix
-rounding objective:        Fisher-weighted GPTQ
+NVFP4 scale optimizer:     joint_scale_opt
 rounding solver:           GPTQ
-codebook scale refine:     scale_sweep
+codebook scale refine:     scale_sweep (explicit ablation only)
 ```
 
-AWQ, SmoothQuant, and BlockOrtho-G were archived on 2026-05-13 under
-`archive/foldscale_orthog_2026-05-13/` and are no longer registered render
-mechanisms. The production cache and pipeline reject their levers so they do
-not enter the shipping path by accident.
+Historical research-only render paths live under `archive/`. V1 production
+defaults use `gptq,joint_scale_opt`; scale_sweep remains available for
+explicit ablations but is not part of the default recipe.
 
-HALO is excluded from this local sequence because it is a global basis
-transform; evaluate it as a separate full-recipe arm.
+Global basis transforms are excluded from this local sequence; evaluate them
+as separate full-recipe arms.
 
-FourOverSix is a first-class NVFP4 scale-rule plugin. The production cache
-tests `static_6` against `four_over_six_mse` directly, then also lets
-FourOverSix participate in GPTQ/scale-sweep packages. This catches the case
-where FourOverSix alone is neutral or negative, but FourOverSix plus a
-downstream rounding/scale refine improves the active score.
+FourOverSix is a first-class NVFP4 scale-rule plugin. When enabled, the
+production cache tests `static_6` against `four_over_six_mse` directly, then
+also lets FourOverSix participate in downstream GPTQ packages. This catches
+the case where FourOverSix alone is neutral or negative, but FourOverSix plus
+rounding improves the active score.
 
 MXFP8 scale-sweep uses the same progressive gate: if the activation-aware
 candidate regresses the active score, the MXFP8 baseline render is kept.
