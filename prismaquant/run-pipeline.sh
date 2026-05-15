@@ -127,7 +127,7 @@ PY
 # format-menu: render every requested format for every quantizable Linear,
 # useful when intentionally building a reusable cache for reallocations.
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
-: "${PRODUCTION_CACHE_LEVERS:=gptq,joint_scale_opt,scale_sweep}"
+: "${PRODUCTION_CACHE_LEVERS:=gptq,joint_scale_opt}"
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
 : "${EXPORT_GPTQ:=auto}"
 : "${EXPORT_SCALE_SWEEP:=auto}"

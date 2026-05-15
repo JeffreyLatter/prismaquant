@@ -104,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--enable",
-        default="gptq,joint_scale_opt,scale_sweep",
+        default="gptq,joint_scale_opt",
         help="Comma-separated levers to enable. Currently honored: "
         "{none, gptq, scale_sweep, fisher_gptq, awq_round, "
         "static_act_order, joint_scale_opt}.  "
