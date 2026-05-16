@@ -236,6 +236,55 @@ def test_production_cache_records_nvfp4_scale_rule(monkeypatch):
     assert cache.levers["nvfp4_scale_rule"] == "four_over_six_mse"
 
 
+def test_production_cache_unifies_activation_max_abs_for_profile_fused_siblings(
+    monkeypatch,
+):
+    import prismaquant.export_native_compressed as enc
+    import prismaquant.production_weight_cache as pwc
+
+    class FusedActivationTiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q = nn.Linear(32, 32, bias=False)
+            self.k = nn.Linear(32, 32, bias=False)
+
+        def forward(self, input_ids, use_cache=False):
+            batch, seqlen = input_ids.shape
+            q_input = torch.ones((batch, seqlen, 32), dtype=torch.float32)
+            k_input = torch.full((batch, seqlen, 32), 7.0, dtype=torch.float32)
+            return self.q(q_input) + self.k(k_input)
+
+    class Profile:
+        def fused_sibling_group(self, qname):
+            if qname in {"q", "k"}:
+                return "qk_fused"
+            return None
+
+    def fake_render_production_weight(weight, fmt, **_kwargs):
+        return weight.detach().to(torch.float32)
+
+    monkeypatch.setattr(
+        enc,
+        "_compute_nvfp4_joint_global",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(pwc, "render_production_weight", fake_render_production_weight)
+
+    cache = fill_production_weight_cache(
+        FusedActivationTiny(),
+        torch.tensor([[0, 1]], dtype=torch.long),
+        qnames=["q", "k"],
+        formats=["NVFP4"],
+        levers={"gptq": False, "scale_sweep": False},
+        max_act_rows=8,
+        recache_profile=Profile(),
+        progress=False,
+    )
+
+    assert cache.activation_max_abs["q"] == pytest.approx(7.0)
+    assert cache.activation_max_abs["k"] == pytest.approx(7.0)
+
+
 def test_production_cache_gates_four_over_six_as_first_class_plugin(monkeypatch):
     model = _TinyChain()
     with torch.no_grad():

@@ -2082,7 +2082,10 @@ def fill_production_weight_cache(
         groups: dict[str, list[str]] = {}
         for qname in per_qname_max_abs:
             try:
-                gk = fused_group_key(profile, qname) if profile else qname
+                gk = (
+                    fused_group_key(model_profile, qname)
+                    if model_profile is not None else qname
+                )
             except Exception:
                 gk = qname
             groups.setdefault(gk, []).append(qname)
