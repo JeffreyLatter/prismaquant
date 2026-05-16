@@ -1,7 +1,7 @@
 From 091842eb5e3265e1c576d0dc080aeb96621b937d Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 19:19:10 +0200
-Subject: [PATCH 4/6] fork: Section 4 - test-pipeline.sh local harness
+Subject: [PATCH 4/7] fork: Section 4 - test-pipeline.sh local harness
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
