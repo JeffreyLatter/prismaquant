@@ -1,0 +1,36 @@
+From c6a2605416aaa4e9ba74b49c4cb7c2cf2edbe72c Mon Sep 17 00:00:00 2001
+From: jeffrey <jeffrey@SparkThree.vpn.dk>
+Date: Sat, 16 May 2026 11:20:35 +0200
+Subject: [PATCH 2/6] fork: Section 2 - GB10 CUDA mask default off
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+_mask_cuda_queries_during_meta_init caused lru_cache poisoning in
+transformers.utils.import_utils (is_torch_cuda_available, is_causal_conv1d_available)
+and poisoned fla constants (device_torch_lib = torch.cpu) when fla was imported
+under the mask. Downstream effects: SSM fast-path disabled, AttributeError at
+runtime on any fla kernel call.
+
+Changed default from '1' to '0'. The mask body is preserved for systems that
+genuinely need it — re-enable with PRISMAQUANT_MASK_CUDA_DURING_META_INIT=1.
+---
+ prismaquant/streaming_model.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/prismaquant/streaming_model.py b/prismaquant/streaming_model.py
+index ee0ced3..7daf8d6 100644
+--- a/prismaquant/streaming_model.py
++++ b/prismaquant/streaming_model.py
+@@ -110,7 +110,7 @@ def _mask_cuda_queries_during_meta_init(log_prefix: str):
+     initializing CUDA or changing the requested runtime device.
+     """
+     enabled = os.environ.get(
+-        "PRISMAQUANT_MASK_CUDA_DURING_META_INIT", "1"
++        "PRISMAQUANT_MASK_CUDA_DURING_META_INIT", "0"
+     ).lower() not in {"0", "false", "no"}
+     if not enabled or torch.cuda.is_initialized():
+         yield
+-- 
+2.43.0
+

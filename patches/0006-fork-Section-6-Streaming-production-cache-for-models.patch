@@ -1,0 +1,729 @@
+From 087501050ab3b960106e3a343483d27f51571f28 Mon Sep 17 00:00:00 2001
+From: jeffrey <jeffrey@SparkThree.vpn.dk>
+Date: Sat, 16 May 2026 11:30:27 +0200
+Subject: [PATCH 6/6] fork: Section 6 - Streaming production cache for models
+ too large for CUDA
+
+Qwen3-Coder-Next (79.67B params, ~159 GB BF16) exceeds the GB10 Grace-Blackwell's
+121.63 GB CUDA-visible UMA. AutoModelForCausalLM.from_pretrained triggers
+caching_allocator_warmup which allocates 120.43 GiB in a single fp16 tensor;
+118.94 GiB were free -> OOM.
+
+_estimate_model_bytes_from_index(): reads total_size from
+model.safetensors.index.json; falls back to single-shard file size.
+
+_fill_production_cache_streaming(): reuses _build_streaming_context /
+_call_layer infrastructure (same as Fisher probe). Per layer: install ->
+run all N calibration samples -> compute NVFP4 joint globals -> render GPTQ
+weights -> unload. Peak CUDA: ~4 GB (one layer) + 134 MB (hidden states).
+
+main(): auto-routes to streaming path when model_bytes > cuda_total - 4 GB;
+adds --halo-mode/--halo-seed argparse args (lost in upstream merge) and
+AutoConfig import for HALO non-streaming path.
+
+Limitations: HALO, recache, AWQ, SmoothQuant, fisher passes are unsupported
+in the streaming path (all require full model resident).
+---
+ prismaquant/build_production_cache.py | 655 +++++++++++++++++++++++---
+ 1 file changed, 590 insertions(+), 65 deletions(-)
+
+diff --git a/prismaquant/build_production_cache.py b/prismaquant/build_production_cache.py
+index 9014236..840ca57 100644
+--- a/prismaquant/build_production_cache.py
++++ b/prismaquant/build_production_cache.py
+@@ -55,6 +55,454 @@ from prismaquant.production_weight_cache import (
+ from prismaquant.sensitivity_probe import load_calibration
+ 
+ 
++def _estimate_model_bytes_from_index(model_path: str) -> int:
++    """Return total param bytes from the safetensors shard index, 0 if unknown."""
++    import json
++    import os
++    idx_path = os.path.join(model_path, "model.safetensors.index.json")
++    if os.path.exists(idx_path):
++        try:
++            with open(idx_path) as fh:
++                d = json.load(fh)
++            total = int((d.get("metadata") or {}).get("total_size", 0))
++            if total > 0:
++                return total
++        except Exception:
++            pass
++    single = os.path.join(model_path, "model.safetensors")
++    if os.path.exists(single):
++        return os.path.getsize(single)
++    return 0
++
++
++def _fill_production_cache_streaming(
++    *,
++    model_path: str,
++    staged: str,
++    calib_ids: "torch.Tensor",
++    device: "torch.device",
++    dtype: "torch.dtype",
++    formats: "list[str]",
++    levers: dict,
++    max_act_rows: int,
++    cache_dir: "str | None",
++    render_assignment: "dict | None",
++    skip_qnames: "list[str]",
++    h_detail_dir: "str | None" = None,
++    progress: bool = True,
++) -> "tuple":
++    """Streaming production cache fill for models too large to fit in CUDA.
++
++    Builds the model skeleton once (head modules resident, decoder layers
++    streamed from disk), then for each layer: install → collect activations
++    from all calibration samples → compute NVFP4 joint globals → render GPTQ
++    weight → unload.  Peak CUDA memory is approximately one layer plus the
++    hidden-state buffer instead of the full model.
++
++    Returns ``(cache, qnames, skipped)`` where ``qnames`` is the list of
++    eligible nn.Linear qnames derived from the skeleton and ``skipped`` lists
++    qnames excluded by ``skip_qnames``.
++
++    Limitations compared to ``fill_production_weight_cache``:
++      - AWQ, SmoothQuant, HALO, and recache passes are not supported.
++      - ``h_detail_dir`` (fisher_gptq/fisher_clip) is silently ignored.
++    """
++    import gc
++    import json
++    import re
++    import tempfile
++    from pathlib import Path
++
++    import torch
++    import torch.nn as nn
++
++    from prismaquant.build_rtn_cache import iter_quantizable_tensors
++    from prismaquant.layer_streaming import (
++        _call_layer,
++        _compute_position_embeddings,
++        _make_causal_mask,
++    )
++    from prismaquant.production_weight_cache import (
++        ProductionWeightCache,
++        _LinearActivationCollector,
++        _cache_weight_filename,
++        _render_base_format,
++        _store_rendered_weight_entry,
++        render_production_weight,
++    )
++    # PRISMACLIP_FORMAT was removed from upstream; keep the literal for guard logic.
++    _PRISMACLIP_FORMAT = "NVFP4_CLIPPED"
++    from prismaquant.streaming_model import _build_streaming_context
++    from prismaquant import format_registry as fr
++    from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
++
++    # Normalise levers. AWQ, SmoothQuant, and fisher passes are unsupported.
++    levers = dict(levers)
++    levers.setdefault("gptq", True)
++    levers.setdefault("gptq_damp_sweep", bool(levers.get("gptq", True)))
++    levers.setdefault("scale_sweep", True)
++    levers.setdefault("act_clip_solver", False)
++    levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
++    for _unsup in ("awq", "awq_round", "smoothquant", "fisher_gptq", "fisher_clip"):
++        if levers.pop(_unsup, False) and progress:
++            print(
++                f"[prod-cache-stream] WARNING: '{_unsup}' not supported in "
++                "streaming path; disabled",
++                flush=True,
++            )
++
++    def _canon(fmt: str) -> str:
++        fmt_u = str(fmt).strip().upper()
++        if fmt_u == _PRISMACLIP_FORMAT:
++            return _PRISMACLIP_FORMAT
++        return fr.canonical_format_name(fmt_u)
++
++    requested_formats = tuple(
++        dict.fromkeys(_canon(f) for f in formats if str(f).strip())
++    )
++
++    offload_folder = tempfile.mkdtemp(prefix="prod_cache_stream_offload_")
++    try:
++        ctx = _build_streaming_context(
++            model_path,
++            device=device,
++            dtype=dtype,
++            offload_folder=offload_folder,
++            log_prefix="[prod-cache-stream]",
++        )
++        skeleton = ctx.model
++        base_model = ctx.base_model
++        layers = ctx.layers
++        num_layers = ctx.num_layers
++        layers_prefix = ctx.layers_prefix
++        profile = ctx.profile
++
++        # Build qnames from skeleton (meta tensors have correct shapes).
++        skip_tokens_set = set(skip_qnames or [])
++        qnames: list[str] = []
++        skipped_list: list[str] = []
++        qname_to_module: dict[str, nn.Module] = {}
++        for full_name, mod, attr in iter_quantizable_tensors(skeleton):
++            if attr != "weight" or not isinstance(mod, nn.Linear):
++                continue
++            qname = full_name[:-7] if full_name.endswith(".weight") else full_name
++            tokens = qname.split(".")
++            if any(s in tokens for s in skip_tokens_set):
++                skipped_list.append(qname)
++                continue
++            qnames.append(qname)
++            qname_to_module[qname] = mod
++        eligible_qnames = set(qnames)
++
++        # Resolve per-qname format lists.
++        if render_assignment is not None:
++            render_formats_by_qname: dict[str, list[str]] = {}
++            for q, fmt in render_assignment.items():
++                if q not in eligible_qnames:
++                    continue
++                fmt_canon = _canon(fmt)
++                if fmt_canon == "BF16":
++                    continue
++                render_formats_by_qname[q] = [fmt_canon]
++            render_scope = "assignment"
++        else:
++            non_bf16_formats = [f for f in requested_formats if f != "BF16"]
++            render_formats_by_qname = {q: non_bf16_formats for q in eligible_qnames}
++            render_scope = "format-menu"
++
++        qname_set: set[str] = set(render_formats_by_qname)
++        if not qname_set:
++            return (
++                ProductionWeightCache(
++                    weights={},
++                    levers=dict(levers),
++                    metadata={"render_scope": render_scope, "streaming": True},
++                ),
++                qnames,
++                skipped_list,
++            )
++
++        activation_aware_formats = {"NVFP4", _PRISMACLIP_FORMAT}
++        if bool(levers.get("scale_sweep", True)):
++            activation_aware_formats.update({"MXFP8", "MXFP8_E4M3"})
++        qnames_needing_activation: set[str] = {
++            q for q, fmts in render_formats_by_qname.items()
++            if any(f in activation_aware_formats for f in fmts)
++        }
++        needs_nvfp4_render = any(
++            any(_render_base_format(fmt) == "NVFP4" for fmt in fmts)
++            for fmts in render_formats_by_qname.values()
++        )
++
++        if progress:
++            total_entries = sum(
++                len(render_formats_by_qname.get(q, []))
++                for q in qname_set
++            )
++            print(
++                f"[prod-cache-stream] render_scope={render_scope} "
++                f"qnames={len(qname_set)} entries={total_entries} "
++                f"levers={dict(sorted(levers.items()))}",
++                flush=True,
++            )
++
++        cache_dir_path: Path | None = None
++        if cache_dir is not None:
++            cache_dir_path = Path(cache_dir)
++            cache_dir_path.mkdir(parents=True, exist_ok=True)
++
++        sidecar_path: Path | None = (
++            cache_dir_path / "activation_max_abs.json"
++            if cache_dir_path is not None else None
++        )
++
++        # Partition render qnames by decoder-layer index.
++        layer_pat = re.compile(rf'^{re.escape(layers_prefix)}(\d+)\.')
++        layer_qnames: dict[int, list[str]] = {L: [] for L in range(num_layers)}
++        head_qnames: list[str] = []
++        for qname in qnames:
++            m = layer_pat.match(qname)
++            if m:
++                L = int(m.group(1))
++                if 0 <= L < num_layers:
++                    layer_qnames[L].append(qname)
++            else:
++                head_qnames.append(qname)
++
++        # Install activation collector on skeleton once.
++        collector = _LinearActivationCollector(
++            skeleton,
++            qnames=eligible_qnames,
++            max_rows=max_act_rows,
++            store_qnames=qnames_needing_activation,
++            store_device=device,
++            store_dtype=torch.float32,
++        )
++        collector.install()
++
++        # Embed all N calibration samples (embed_tokens is always resident).
++        N = calib_ids.size(0)
++        T = calib_ids.size(1)
++        with torch.no_grad():
++            embed = base_model.embed_tokens
++            hidden_states: list[torch.Tensor] = [
++                embed(calib_ids[i:i + 1].to(device)).to(dtype=dtype)
++                for i in range(N)
++            ]
++
++        position_ids = torch.arange(T, device=device).unsqueeze(0)
++        position_embeddings = _compute_position_embeddings(
++            base_model, hidden_states[0], position_ids)
++        attention_mask = _make_causal_mask(T, device=device, dtype=dtype)
++
++        # Load max_abs sidecar for resume support.
++        activation_max_abs: dict[str, float] = {}
++        if sidecar_path is not None and sidecar_path.is_file():
++            try:
++                activation_max_abs.update(json.loads(sidecar_path.read_text()))
++            except Exception:
++                pass
++
++        weights: dict = {}
++        failed: dict = {}
++        done = 0
++        n_total = sum(
++            len(render_formats_by_qname.get(q, []))
++            for L in range(num_layers)
++            for q in layer_qnames[L]
++            if q in qname_set
++        )
++
++        for L in range(num_layers):
++            layer_q = [q for q in layer_qnames.get(L, []) if q in qname_set]
++            ctx.install(L)
++
++            with torch.no_grad():
++                for i in range(N):
++                    extra_kw = (
++                        profile.extra_layer_kwargs(
++                            input_ids=calib_ids[i:i + 1].to(device))
++                        if profile is not None else {}
++                    )
++                    out = _call_layer(
++                        layers[L], hidden_states[i],
++                        position_embeddings=position_embeddings,
++                        attention_mask=attention_mask,
++                        position_ids=position_ids,
++                        **extra_kw,
++                    )
++                    hidden_states[i] = out
++
++            if layer_q:
++                layer_joint_globals: dict[str, torch.Tensor] = {}
++                if needs_nvfp4_render:
++                    from prismaquant.export_native_compressed import (
++                        _compute_nvfp4_joint_global,
++                    )
++                    try:
++                        layer_joint_globals = _compute_nvfp4_joint_global(
++                            skeleton, {q: "NVFP4" for q in layer_q})
++                    except Exception as e:
++                        if progress:
++                            print(
++                                f"[prod-cache-stream] L{L}: joint global "
++                                f"failed ({e!r}); using per-Linear globals",
++                                flush=True,
++                            )
++
++                layer_activations: dict[str, torch.Tensor] = {}
++                for q in layer_q:
++                    parts = collector.activations.get(q, [])
++                    if parts:
++                        layer_activations[q] = torch.cat(parts, dim=0)
++
++                if needs_nvfp4_render:
++                    from prismaquant.decision_units import fused_group_key
++                    per_qname_max: dict[str, float] = {}
++                    for q in layer_q:
++                        if q in activation_max_abs:
++                            per_qname_max[q] = activation_max_abs[q]
++                            continue
++                        t = collector._max_abs_tensors.get(q)
++                        mx = float(t.item()) if t is not None else 0.0
++                        if mx <= 0:
++                            acts = layer_activations.get(q)
++                            if acts is not None:
++                                mx = float(acts.abs().max().item())
++                        if mx > 0:
++                            per_qname_max[q] = mx
++                    grps: dict[str, list[str]] = {}
++                    for q in per_qname_max:
++                        try:
++                            gk = fused_group_key(profile, q) if profile else q
++                        except Exception:
++                            gk = q
++                        grps.setdefault(gk, []).append(q)
++                    for gk, members in grps.items():
++                        shared = max(per_qname_max[m] for m in members)
++                        for m in members:
++                            activation_max_abs[m] = shared
++
++                for q in layer_q:
++                    mod = qname_to_module.get(q)
++                    if mod is None:
++                        continue
++                    weight = mod.weight.data
++                    joint = layer_joint_globals.get(q)
++                    max_abs_val = activation_max_abs.get(q)
++                    export_scale = (
++                        (6.0 / max_abs_val)
++                        if (max_abs_val is not None and max_abs_val > 0)
++                        else None
++                    )
++                    for fmt in render_formats_by_qname.get(q, ()):
++                        fmt_key = str(fmt).upper()
++                        key = (q, fmt_key)
++                        if key in weights:
++                            done += 1
++                            continue
++                        if cache_dir_path is not None:
++                            fname = _cache_weight_filename(q, fmt_key)
++                            if (cache_dir_path / fname).is_file():
++                                weights[key] = fname
++                                done += 1
++                                continue
++                        try:
++                            w_dq = render_production_weight(
++                                weight,
++                                _render_base_format(fmt_key),
++                                qname=q,
++                                activations=layer_activations,
++                                levers=levers,
++                                joint_global_real=joint,
++                                input_global_scale=export_scale,
++                            )
++                        except Exception as e:
++                            failed[key] = str(e)
++                            done += 1
++                            continue
++                        _store_rendered_weight_entry(
++                            weights=weights,
++                            cache_dir_path=cache_dir_path,
++                            qname=q,
++                            fmt=fmt_key,
++                            tensor=w_dq,
++                            weight_dtype=weight.dtype,
++                        )
++                        del w_dq
++                        done += 1
++                        if progress and done % 25 == 0:
++                            print(
++                                f"[prod-cache-stream] {done}/{n_total}",
++                                flush=True,
++                            )
++
++            ctx.unload(L)
++            for q in layer_qnames.get(L, []):
++                collector.activations.pop(q, None)
++                collector._max_abs_tensors.pop(q, None)
++            gc.collect()
++            if torch.cuda.is_available():
++                torch.cuda.empty_cache()
++
++        collector.remove()
++
++        # Render always-resident head qnames (lm_head typically skipped).
++        for qname in head_qnames:
++            if qname not in qname_set:
++                continue
++            mod = qname_to_module.get(qname)
++            if mod is None:
++                continue
++            weight = mod.weight.data
++            for fmt in render_formats_by_qname.get(qname, ()):
++                fmt_key = str(fmt).upper()
++                key = (qname, fmt_key)
++                if key in weights:
++                    continue
++                if cache_dir_path is not None:
++                    fname = _cache_weight_filename(qname, fmt_key)
++                    if (cache_dir_path / fname).is_file():
++                        weights[key] = fname
++                        continue
++                try:
++                    w_dq = render_production_weight(
++                        weight, _render_base_format(fmt_key),
++                        qname=qname, activations={}, levers=levers,
++                        joint_global_real=None, input_global_scale=None,
++                    )
++                except Exception as e:
++                    failed[(qname, fmt_key)] = str(e)
++                    continue
++                _store_rendered_weight_entry(
++                    weights=weights, cache_dir_path=cache_dir_path,
++                    qname=qname, fmt=fmt_key, tensor=w_dq,
++                    weight_dtype=weight.dtype,
++                )
++                del w_dq
++
++        if sidecar_path is not None and activation_max_abs:
++            sidecar_path.write_text(json.dumps(activation_max_abs, indent=2))
++
++        cache = ProductionWeightCache(
++            weights=weights,
++            levers=dict(levers),
++            activation_max_abs=activation_max_abs or None,
++            failed=failed,
++            cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
++            metadata={
++                "render_scope": render_scope,
++                "requested_formats": list(requested_formats),
++                "streaming": True,
++                "num_layers": num_layers,
++            },
++        )
++        return cache, qnames, skipped_list
++
++    finally:
++        shutil.rmtree(offload_folder, ignore_errors=True)
++
++
+ def main(argv: Sequence[str] | None = None) -> int:
+     p = argparse.ArgumentParser(description="Build production δw cache")
+     p.add_argument("--model", required=True)
+@@ -178,6 +626,19 @@ def main(argv: Sequence[str] | None = None) -> int:
+         help="During re-cache, install production weights but leave activation "
+         "quantization disabled in replay hooks.",
+     )
++    p.add_argument(
++        "--halo-mode",
++        choices=("off", "random"),
++        default="off",
++        help="Apply HALO before rendering production weights. A HALO cache is "
++        "only valid with matching export --halo-mode/--halo-seed.",
++    )
++    p.add_argument(
++        "--halo-seed",
++        type=int,
++        default=0,
++        help="RNG seed for HALO random Hadamard sign diagonal.",
++    )
+     args = p.parse_args(argv)
+ 
+     # Opt-in deterministic CUDA path. The default lever ablations on small
+@@ -206,7 +667,7 @@ def main(argv: Sequence[str] | None = None) -> int:
+             flush=True,
+         )
+ 
+-    from transformers import AutoModelForCausalLM, AutoTokenizer
++    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+ 
+     output_path = Path(args.output)
+     output_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -244,58 +705,22 @@ def main(argv: Sequence[str] | None = None) -> int:
+                 split=args.calib_split,
+                 seed=args.calib_seed,
+             )
+-        load_kwargs = {
+-            "torch_dtype": dtype,
+-            "trust_remote_code": True,
+-            "local_files_only": local_only,
+-        }
++        # Route to streaming path when model exceeds available CUDA memory.
++        _use_streaming = False
+         if device.type == "cuda":
+-            load_kwargs["device_map"] = "cuda"
+-        try:
+-            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+-        except ValueError as exc:
+-            if "requires `accelerate`" not in str(exc) and "requires accelerate" not in str(exc):
+-                raise
+-            load_kwargs.pop("device_map", None)
+-            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+-            model.to(device)
+-        if device.type != "cuda":
+-            model.to(device)
+-        model.eval()
+-        try:
+-            profile = detect_profile(args.model)
+-        except Exception:
+-            profile = DefaultProfile()
+-        skip_tokens = list(
+-            args.skip_qnames
+-            if args.skip_qnames is not None
+-            else profile.pinned_names()
+-        )
+-        qnames: list[str] = []
+-        skipped: list[str] = []
+-        for full_name, mod, attr in iter_quantizable_tensors(model, profile):
+-            if attr != "weight" or not isinstance(mod, nn.Linear):
+-                continue
+-            qname = full_name[:-7] if full_name.endswith(".weight") else full_name
+-            # Exact dotted-token match against --skip-qnames substrings.
+-            tokens = qname.split(".")
+-            if any(s in tokens for s in skip_tokens):
+-                skipped.append(qname)
+-                continue
+-            qnames.append(qname)
+-        print(
+-            f"[build-prod-cache] {len(qnames)} quantizable Linears, "
+-            f"formats={formats}, levers={sorted(levers)}",
+-            flush=True,
+-        )
+-        if skipped:
+-            print(
+-                f"[build-prod-cache] skipped {len(skipped)} qnames matching "
+-                f"{skip_tokens} (typically pinned-BF16 in polish): "
+-                f"{skipped if len(skipped) <= 5 else skipped[:5] + ['...']}",
+-                flush=True,
+-            )
++            _model_bytes = _estimate_model_bytes_from_index(staged)
++            if _model_bytes > 0:
++                _cuda_total = torch.cuda.get_device_properties(device).total_memory
++                if _model_bytes > _cuda_total - 4 * 1024 ** 3:
++                    _use_streaming = True
++                    print(
++                        f"[build-prod-cache] model {_model_bytes / (1024**3):.1f} GB > "
++                        f"CUDA {_cuda_total / (1024**3):.1f} GB - 4 GB headroom; "
++                        "routing to streaming production cache path",
++                        flush=True,
++                    )
+ 
++        # render_assignment resolution shared across both paths.
+         recache_assignment = (
+             _load_assignment(args.recache_layer_config)
+             if args.recache_layer_config else None
+@@ -320,21 +745,121 @@ def main(argv: Sequence[str] | None = None) -> int:
+                 f"{non_bf16} non-BF16 entries from {layer_config}",
+                 flush=True,
+             )
++
+         t0 = time.monotonic()
+-        cache = fill_production_weight_cache(
+-            model, calib_ids, qnames,
+-            formats=formats,
+-            render_assignment=render_assignment,
+-            levers=levers,
+-            max_act_rows=args.max_act_rows,
+-            cache_dir=args.cache_dir,
+-            recache_pass=recache_assignment is not None,
+-            recache_assignment=recache_assignment,
+-            recache_profile=profile,
+-            recache_include_activation_quant=not args.no_recache_activation_quant,
+-            recache_microbatch_size=args.recache_microbatch_size,
+-            h_detail_dir=args.h_detail_dir,
+-        )
++        if _use_streaming:
++            halo_meta = {"mode": "off"}
++            if args.halo_mode != "off":
++                print(
++                    "[build-prod-cache] WARNING: HALO not supported in streaming "
++                    "production cache path; --halo-mode ignored",
++                    flush=True,
++                )
++            if recache_assignment is not None:
++                print(
++                    "[build-prod-cache] WARNING: --recache-layer-config not "
++                    "supported in streaming production cache path; ignoring",
++                    flush=True,
++                )
++            cache, qnames, skipped = _fill_production_cache_streaming(
++                model_path=args.model,
++                staged=staged,
++                calib_ids=calib_ids,
++                device=device,
++                dtype=dtype,
++                formats=formats,
++                levers=levers,
++                max_act_rows=args.max_act_rows,
++                cache_dir=args.cache_dir,
++                render_assignment=render_assignment,
++                skip_qnames=list(args.skip_qnames or []),
++                h_detail_dir=args.h_detail_dir,
++            )
++            print(
++                f"[build-prod-cache] {len(qnames)} quantizable Linears, "
++                f"formats={formats}, levers={sorted(levers)}",
++                flush=True,
++            )
++            if skipped:
++                print(
++                    f"[build-prod-cache] skipped {len(skipped)} qnames",
++                    flush=True,
++                )
++        else:
++            load_kwargs = {
++                "torch_dtype": dtype,
++                "trust_remote_code": True,
++                "local_files_only": local_only,
++            }
++            if device.type == "cuda":
++                load_kwargs["device_map"] = "cuda"
++            try:
++                model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
++            except ValueError as exc:
++                if "requires `accelerate`" not in str(exc) and "requires accelerate" not in str(exc):
++                    raise
++                load_kwargs.pop("device_map", None)
++                model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
++                model.to(device)
++            if device.type != "cuda":
++                model.to(device)
++            model.eval()
++            try:
++                profile = detect_profile(args.model)
++            except Exception:
++                profile = DefaultProfile()
++            halo_meta = {"mode": "off"}
++            if args.halo_mode == "random":
++                from prismaquant.halo import apply_random_halo_to_model
++                cfg = AutoConfig.from_pretrained(
++                    staged, trust_remote_code=True, local_files_only=local_only)
++                print(
++                    f"[build-prod-cache] applying HALO mode=random "
++                    f"seed={args.halo_seed}", flush=True)
++                _, halo_meta = apply_random_halo_to_model(
++                    model, profile, cfg, seed=args.halo_seed, verbose=True)
++            skip_tokens = list(
++                args.skip_qnames
++                if args.skip_qnames is not None
++                else profile.pinned_names()
++            )
++            qnames: list[str] = []
++            skipped: list[str] = []
++            for full_name, mod, attr in iter_quantizable_tensors(model, profile):
++                if attr != "weight" or not isinstance(mod, nn.Linear):
++                    continue
++                qname = full_name[:-7] if full_name.endswith(".weight") else full_name
++                tokens = qname.split(".")
++                if any(s in tokens for s in skip_tokens):
++                    skipped.append(qname)
++                    continue
++                qnames.append(qname)
++            print(
++                f"[build-prod-cache] {len(qnames)} quantizable Linears, "
++                f"formats={formats}, levers={sorted(levers)}",
++                flush=True,
++            )
++            if skipped:
++                print(
++                    f"[build-prod-cache] skipped {len(skipped)} qnames matching "
++                    f"{skip_tokens} (typically pinned-BF16 in polish): "
++                    f"{skipped if len(skipped) <= 5 else skipped[:5] + ['...']}",
++                    flush=True,
++                )
++            cache = fill_production_weight_cache(
++                model, calib_ids, qnames,
++                formats=formats,
++                render_assignment=render_assignment,
++                levers=levers,
++                max_act_rows=args.max_act_rows,
++                cache_dir=args.cache_dir,
++                recache_pass=recache_assignment is not None,
++                recache_assignment=recache_assignment,
++                recache_profile=profile,
++                recache_include_activation_quant=not args.no_recache_activation_quant,
++                recache_microbatch_size=args.recache_microbatch_size,
++                h_detail_dir=args.h_detail_dir,
++            )
+         elapsed = time.monotonic() - t0
+         # Strict coverage validation: every (qname, NVFP4) must be present
+         # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky
+-- 
+2.43.0
+

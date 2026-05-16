@@ -1,0 +1,85 @@
+From fd50e051fdfd24aa5b7dc3f6ff8fcff82369ab46 Mon Sep 17 00:00:00 2001
+From: jeffrey <jeffrey@SparkThree.vpn.dk>
+Date: Sat, 16 May 2026 11:20:12 +0200
+Subject: [PATCH 1/6] fork: Section 1 - MoE expert coverage false-positive fix
+
+Packed MoE expert tensors (3D params, e.g. mlp.experts.gate_up_proj) are
+quantized directly by the export pipeline and never stored in the production
+weight cache. Two coverage checks that didn't account for this produced
+false-positive failures (190 misses on Qwen3.6-35B-A3B).
+
+build_production_cache.py: filter render_assignment to eligible_set (nn.Linear
+qnames actually rendered) before assignment_keys check; print skipped count.
+export_native_compressed.py: filter _assignment_for_cache via eligible_qnames
+from cache metadata (or inferred from cache weight keys) before
+_production_cache_expected_keys call.
+---
+ prismaquant/build_production_cache.py   | 19 ++++++++++++++++++-
+ prismaquant/export_native_compressed.py | 20 +++++++++++++++++++-
+ 2 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/prismaquant/build_production_cache.py b/prismaquant/build_production_cache.py
+index e9730a5..9014236 100644
+--- a/prismaquant/build_production_cache.py
++++ b/prismaquant/build_production_cache.py
+@@ -342,7 +342,24 @@ def main(argv: Sequence[str] | None = None) -> int:
+         # through to RTN at hook time.
+         try:
+             if render_assignment is not None:
+-                _, missing = cache.assignment_keys(render_assignment)
++                # Filter to nn.Linear qnames only — packed MoE expert tensors
++                # (3D params) are quantized directly by the export pipeline and
++                # never stored in the production weight cache.  Including them
++                # here produces false-positive coverage failures.
++                eligible_set = set(qnames)
++                cacheable_assignment = {
++                    q: fmt for q, fmt in render_assignment.items()
++                    if q in eligible_set
++                }
++                n_skipped_experts = len(render_assignment) - len(cacheable_assignment)
++                if n_skipped_experts:
++                    print(
++                        f"[build-prod-cache] coverage check: skipping "
++                        f"{n_skipped_experts} packed-expert assignment entries "
++                        "(export handles them directly, not via cache)",
++                        flush=True,
++                    )
++                _, missing = cache.assignment_keys(cacheable_assignment)
+                 failed = list((cache.failed or {}).keys())
+                 if missing or failed:
+                     samples = missing[:5] + failed[:5]
+diff --git a/prismaquant/export_native_compressed.py b/prismaquant/export_native_compressed.py
+index 8792d3c..29992a6 100644
+--- a/prismaquant/export_native_compressed.py
++++ b/prismaquant/export_native_compressed.py
+@@ -5288,8 +5288,26 @@ def main():
+         _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
+             1, int(args.production_cache_prefetch_workers)
+         )
++        # Filter to qnames the cache was built for. Packed MoE expert tensors
++        # (3D params) are not in the cache — they're quantized by export
++        # directly. Checking them here produces false-positive misses.
++        # "eligible_qnames" in cache metadata is the authoritative list;
++        # fall back to inferring from the cache's own weight keys for older
++        # caches without that metadata key.
++        _cache_meta = dict(getattr(production_cache, "metadata", {}) or {})
++        _cache_eligible = _cache_meta.get("eligible_qnames")
++        if _cache_eligible is None:
++            _cache_eligible = {
++                q for q, _ in (getattr(production_cache, "weights", {}) or {})
++            }
++        _assignment_to_check = (
++            {q: fmt for q, fmt in _assignment_for_cache.items()
++             if q in _cache_eligible}
++            if _cache_eligible
++            else _assignment_for_cache
++        )
+         expected_keys, missing_keys = _production_cache_expected_keys(
+-            _assignment_for_cache
++            _assignment_to_check
+         )
+         if missing_keys:
+             raise RuntimeError(
+-- 
+2.43.0
+

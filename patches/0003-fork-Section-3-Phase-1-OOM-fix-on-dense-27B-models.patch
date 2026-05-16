@@ -1,0 +1,108 @@
+From e45484633fcb6ee49a2ca20d15adad2ad263d9b8 Mon Sep 17 00:00:00 2001
+From: jeffrey <jeffrey@SparkThree.vpn.dk>
+Date: Sat, 16 May 2026 11:21:52 +0200
+Subject: [PATCH 3/6] fork: Section 3 - Phase-1 OOM fix on dense 27B+ models
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two bugs combined to OOM-kill the pipeline on Qwen3.6-27B (64L, h=5120,
+N=32, T=1024) — 120.6 GB peak vs 121 GB UMA.
+
+incremental_probe.py: replace torch.stack(device_acts).cpu() + clone loop with
+[t.cpu() for t in device_acts]. Drops triple-copy peak from 60.9 GB to 40.6 GB
+(device_acts + host copy in flight simultaneously, no extra stack or clone).
+
+autoscale.py (pick_cache_headroom_gb): headroom now accounts for phase-1
+activation stash as a second non-overlapping phase. Binding constraint is
+max(shard_headroom, phase1_headroom). For 27B this changes cache headroom from
+37.9 GB to 75.6 GB, giving a 42 GB cache budget — partially streaming,
+combined peak 97.8 GB with 23 GB margin.
+---
+ prismaquant/autoscale.py         | 31 +++++++++++++++++++++++++++----
+ prismaquant/incremental_probe.py |  9 ++++-----
+ 2 files changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/prismaquant/autoscale.py b/prismaquant/autoscale.py
+index 0a17b54..b409349 100644
+--- a/prismaquant/autoscale.py
++++ b/prismaquant/autoscale.py
+@@ -210,14 +210,21 @@ def pick_cache_headroom_gb(
+     layers_per_shard: int = 1,
+     nsamples: int = 32,
+     seqlen: int = 1024,
++    fixed_overhead_gb: float = DEFAULT_FIXED_OVERHEAD_GB,
++    dtype_bytes: int = DEFAULT_DTYPE_BYTES,
+     default: float = 75.0,
+ ) -> tuple[float, dict]:
+     """Pick `cache_headroom_gb` so the layer cache gets (available - headroom)
+     bytes for fitting decoder layers. Returns `(headroom_gb, diagnostics)`.
+ 
+-    The probe's active working set dominates the headroom: safety margin
+-    + gradients/activations for `layers_per_shard` layers. Anything
+-    leftover goes to the streaming cache.
++    Headroom is the max of two non-overlapping phases:
++
++    - Phase-1 forward pass: device_acts list (all layer outputs on device,
++      (n_layers+1) tensors) plus the simultaneous host copy being built by
++      [t.cpu() for t in device_acts].  On UMA both draw from the same pool.
++    - Shard phase (backward sweeps): shard_working + full_graph_act overhead.
++
++    The binding constraint (larger headroom) wins.
+     """
+     cfg_path = Path(model_path) / "config.json"
+     if not cfg_path.exists():
+@@ -233,13 +240,29 @@ def pick_cache_headroom_gb(
+         model_path, n_layers, hidden, nsamples, seqlen,
+     )
+     shard_working_bytes = layers_per_shard * per_layer_active
+-    headroom_bytes = shard_working_bytes + int(safety_gb * 1024 ** 3)
++
++    # Phase-1 peak: device_acts (accumulates all layer outputs on device)
++    # + host copy being built simultaneously in [t.cpu() for t in device_acts].
++    # Factor of 2 captures both sides alive at the same time.
++    phase1_single = (n_layers + 1) * nsamples * seqlen * hidden * dtype_bytes
++    phase1_peak_bytes = 2 * phase1_single
++
++    fixed_bytes = int(fixed_overhead_gb * 1024 ** 3)
++    safety_bytes = int(safety_gb * 1024 ** 3)
++
++    shard_headroom = shard_working_bytes + fixed_bytes + safety_bytes
++    phase1_headroom = phase1_peak_bytes + fixed_bytes + safety_bytes
++    headroom_bytes = max(shard_headroom, phase1_headroom)
+     headroom_gb = headroom_bytes / 1024 ** 3
+     return headroom_gb, {
+         "headroom_gb": headroom_gb,
+         "shard_working_gb": shard_working_bytes / 1024 ** 3,
++        "phase1_device_acts_gb": phase1_single / 1024 ** 3,
++        "phase1_peak_gb": phase1_peak_bytes / 1024 ** 3,
++        "fixed_overhead_gb": fixed_overhead_gb,
+         "safety_gb": safety_gb,
+         "layers_per_shard": layers_per_shard,
++        "binding_constraint": "phase1" if phase1_headroom >= shard_headroom else "shard",
+     }
+ 
+ 
+diff --git a/prismaquant/incremental_probe.py b/prismaquant/incremental_probe.py
+index bff9f54..9b518e3 100644
+--- a/prismaquant/incremental_probe.py
++++ b/prismaquant/incremental_probe.py
+@@ -1180,11 +1180,10 @@ def _compute_global_precompute(
+     # we split back into a list of CPU tensors so the rest of the code
+     # (precompute cache pickle, phase-3 reads) sees the original layout.
+     t_h2h = time.time()
+-    stacked = torch.stack(device_acts, dim=0).cpu()
+-    activations_cpu: list[torch.Tensor] = [
+-        stacked[i].clone() for i in range(stacked.size(0))
+-    ]
+-    del device_acts, stacked
++    # Transfer one tensor at a time to avoid the triple-copy peak
++    # (device_acts + stacked + stacked.cpu() + clone = 4× in flight).
++    activations_cpu: list[torch.Tensor] = [t.cpu() for t in device_acts]
++    del device_acts
+     print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
+           f"(host transfer {time.time()-t_h2h:.1f}s)  "
+           f"{ctx.layer_cache.summary()}", flush=True)
+-- 
+2.43.0
+
