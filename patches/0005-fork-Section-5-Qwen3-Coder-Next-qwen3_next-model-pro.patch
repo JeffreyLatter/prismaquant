@@ -1,4 +1,4 @@
-From e9acc3d62b48e271d32be782de260bf0b3d38e00 Mon Sep 17 00:00:00 2001
+From 9afbc72a67da33daaf54ec9fb0330d36813dd5ce Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:26:09 +0200
 Subject: [PATCH 5/6] fork: Section 5 - Qwen3-Coder-Next (qwen3_next) model
@@ -28,14 +28,64 @@ streaming_model.py: StreamingContext gains profile field; _build_streaming_conte
 calls detect_profile and stores it; both _prefetch_worker and ensure_loaded call
 profile.pack_checkpoint_expert_tensors after _read_layer_to_device.
 ---
+ prismaquant/export_native_compressed.py  |  24 ++-
  prismaquant/model_profiles/__init__.py   |   2 +
  prismaquant/model_profiles/base.py       |  37 ++++
  prismaquant/model_profiles/qwen3_next.py | 238 +++++++++++++++++++++++
  prismaquant/model_profiles/registry.py   |   2 +
  prismaquant/streaming_model.py           |  15 +-
- 5 files changed, 293 insertions(+), 1 deletion(-)
+ 6 files changed, 308 insertions(+), 10 deletions(-)
  create mode 100644 prismaquant/model_profiles/qwen3_next.py
 
+diff --git a/prismaquant/export_native_compressed.py b/prismaquant/export_native_compressed.py
+index 29992a6..0a9f5c1 100644
+--- a/prismaquant/export_native_compressed.py
++++ b/prismaquant/export_native_compressed.py
+@@ -932,9 +932,10 @@ def _coerce_runtime_legal_assignment(
+ 
+ 
+ def _allocator_target_profile_for_audit(profile) -> str | None:
+-    if profile is None:
+-        return None
+-    return resolve_target_profile(profile, None)
++    name = str(getattr(profile, "name", "") or "")
++    if name in {"qwen3_5", "qwen3_5_dense", "qwen3", "qwen3_next"}:
++        return "vllm_qwen3_5_packed_moe"
++    return None
+ 
+ 
+ def _bf16_upgrade_audit(
+@@ -3698,6 +3699,8 @@ def materialize_tensors_streaming(
+         tensors = _read_layer_to_device(
+             f"{layers_prefix}{L}.", weight_shard, weight_ckpt, dtype, device,
+             fp8_scale_inv_map=fp8_scale_inv_map)
++        tensors = profile.pack_checkpoint_expert_tensors(
++            f"{layers_prefix}{L}.", tensors)
+         resolver = _build_install_resolver(model, layer_qname)
+         _fast_install(resolver, tensors, device, model=model)
+         load_s = time.time() - load_t0
+@@ -5288,12 +5291,15 @@ def main():
+         _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
+             1, int(args.production_cache_prefetch_workers)
+         )
+-        # Filter to qnames the cache was built for. Packed MoE expert tensors
+-        # (3D params) are not in the cache — they're quantized by export
+-        # directly. Checking them here produces false-positive misses.
+-        # "eligible_qnames" in cache metadata is the authoritative list;
+-        # fall back to inferring from the cache's own weight keys for older
+-        # caches without that metadata key.
++        # Filter the assignment to only qnames the cache was built to cover.
++        # Packed MoE expert layers (3D tensors) are quantized directly by the
++        # export and never stored in the production weight cache; checking them
++        # here produces false-positive misses.
++        #
++        # Preferred: "eligible_qnames" in cache metadata lists exactly which
++        # qnames were rendered (set by fill_production_weight_cache).
++        # Fallback for older caches: infer from the cache's own weight keys.
++        # In both cases BF16 entries are already skipped by the inner loop.
+         _cache_meta = dict(getattr(production_cache, "metadata", {}) or {})
+         _cache_eligible = _cache_meta.get("eligible_qnames")
+         if _cache_eligible is None:
 diff --git a/prismaquant/model_profiles/__init__.py b/prismaquant/model_profiles/__init__.py
 index 6c115bc..d3de5d1 100644
 --- a/prismaquant/model_profiles/__init__.py
