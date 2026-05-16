@@ -237,6 +237,14 @@ fi
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
 : "${VALIDATED_FRONTIER_KL_SCOPE:=last_token}"
 : "${VALIDATED_FRONTIER_PICK:=kneedle}"
+# PRODUCTION_CACHE_UNION=1 switches the validated-surrogate frontier cache
+# from full format-menu rendering (every Linear × every quantized format) to
+# a smart-union render that only adds MXFP8 / FP8 fallback entries for
+# Linears whose NVFP4 output_mse exceeds the band percentiles — ~40-60%
+# fewer renders without sacrificing assignment coverage at typical budgets.
+: "${PRODUCTION_CACHE_UNION:=0}"
+: "${PRODUCTION_CACHE_UNION_P_MXFP8:=0.50}"
+: "${PRODUCTION_CACHE_UNION_P_FP8:=0.75}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
@@ -294,6 +302,7 @@ echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
 if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
   echo "  VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_KL_SCOPE=$VALIDATED_FRONTIER_KL_SCOPE"
+  echo "  PRODUCTION_CACHE_UNION=$PRODUCTION_CACHE_UNION P_MXFP8=$PRODUCTION_CACHE_UNION_P_MXFP8 P_FP8=$PRODUCTION_CACHE_UNION_P_FP8"
 fi
 echo
 
@@ -656,23 +665,44 @@ PY
     PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
     PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_frontier_raw.pkl"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
-      echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
-      python3 -m prismaquant.build_production_cache \
-        --model "$MODEL_PATH" \
-        --output "$PROD_CACHE_RAW" \
-        --formats "$CACHE_FORMATS" \
-        --dataset "$DATASET" \
-        --n-calib-samples "$NSAMPLES" \
-        --calib-seqlen "$SEQLEN" \
-        --dtype bf16 \
-        --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
-        --enable "$PRODUCTION_CACHE_LEVERS" \
-        --cache-dir "$PROD_CACHE_DIR" \
-        --render-scope format-menu \
-        --halo-mode "$HALO_MODE" \
-        --halo-seed "$HALO_SEED" \
-        "${PROD_H_DETAIL_ARGS[@]}" \
-        2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
+      if [[ "$PRODUCTION_CACHE_UNION" == "1" || "$PRODUCTION_CACHE_UNION" == "true" \
+            || "$PRODUCTION_CACHE_UNION" == "True" ]]; then
+        # Smart-union render: only render MXFP8/FP8 fallbacks for Linears
+        # whose NVFP4 output_mse is above the band percentiles. Same cache
+        # layout as format-menu, just fewer entries.
+        echo "[pipeline] [4/4] building smart-union production cache for validated frontier ..."
+        python3 -m tools.build_union_cache \
+          --model "$MODEL_PATH" \
+          --cost-pkl "$COST_PATH" \
+          --input-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+          --output-cache-dir "$PROD_CACHE_DIR" \
+          --output-pkl "$PROD_CACHE_RAW" \
+          --dataset "$DATASET" \
+          --n-calib-samples "$NSAMPLES" \
+          --calib-seqlen "$SEQLEN" \
+          --levers "$PRODUCTION_CACHE_LEVERS" \
+          --p-mxfp8 "$PRODUCTION_CACHE_UNION_P_MXFP8" \
+          --p-fp8 "$PRODUCTION_CACHE_UNION_P_FP8" \
+          2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
+      else
+        echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
+        python3 -m prismaquant.build_production_cache \
+          --model "$MODEL_PATH" \
+          --output "$PROD_CACHE_RAW" \
+          --formats "$CACHE_FORMATS" \
+          --dataset "$DATASET" \
+          --n-calib-samples "$NSAMPLES" \
+          --calib-seqlen "$SEQLEN" \
+          --dtype bf16 \
+          --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+          --enable "$PRODUCTION_CACHE_LEVERS" \
+          --cache-dir "$PROD_CACHE_DIR" \
+          --render-scope format-menu \
+          --halo-mode "$HALO_MODE" \
+          --halo-seed "$HALO_SEED" \
+          "${PROD_H_DETAIL_ARGS[@]}" \
+          2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
+      fi
     else
       echo "[pipeline] [4/4] frontier production cache exists, skipping"
     fi
@@ -930,6 +960,7 @@ INFO_PRODUCTION_CACHE="$PRODUCTION_CACHE" \
 INFO_PRODUCTION_RECACHE="$PRODUCTION_RECACHE" \
 INFO_CACHE_LEVERS="$PRODUCTION_CACHE_LEVERS" \
 INFO_CACHE_RENDER_SCOPE="$PRODUCTION_CACHE_RENDER_SCOPE" \
+INFO_CACHE_UNION="$PRODUCTION_CACHE_UNION" \
 INFO_NVFP4_SCALE_RULE="${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}" \
 INFO_VISUAL_FORMAT="$VISUAL_FORMAT" \
 INFO_MTP_FORMAT="$MTP_FORMAT" \
@@ -1006,6 +1037,15 @@ _extra_rows = ["| Selection mode | %s |" % selection_mode]
 if measured_kl is not None:
     _extra_rows.append("| Measured KL (selected) | %s |" % measured_kl)
 compression_extra = "\n".join(_extra_rows)
+
+# Frontier cache render mode — only meaningful under validated-surrogate.
+config_extra = ""
+if selection_mode == "validated-surrogate":
+    _union = E.get("INFO_CACHE_UNION", "0")
+    _frontier_cache = (
+        "smart-union" if _union in ("1", "true", "True") else "format-menu"
+    )
+    config_extra = "\n| Frontier cache render | %s |" % _frontier_cache
 
 # Architecture profile.
 _p = re.search(r"\[alloc\] model profile: (\S+)", alloc_log)
@@ -1119,7 +1159,7 @@ Exported tensor histogram:
 | Production weight cache | {E.get("INFO_PRODUCTION_CACHE", "")} |
 | Production recache | {E.get("INFO_PRODUCTION_RECACHE", "")} |
 | Render levers | {E.get("INFO_CACHE_LEVERS", "")} |
-| Cache render scope | {E.get("INFO_CACHE_RENDER_SCOPE", "")} |
+| Cache render scope | {E.get("INFO_CACHE_RENDER_SCOPE", "")} |{config_extra}
 | NVFP4 scale rule | {E.get("INFO_NVFP4_SCALE_RULE", "")} |
 | Visual encoder format | {E.get("INFO_VISUAL_FORMAT", "")} |
 | MTP format | {E.get("INFO_MTP_FORMAT", "")} |
