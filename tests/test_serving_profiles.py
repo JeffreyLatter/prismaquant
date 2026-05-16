@@ -155,6 +155,46 @@ def test_runtime_shape_validator_rules_are_config_backed(monkeypatch):
     assert decision.reason == "kernel_shape"
 
 
+def test_runtime_shape_validator_treats_fp8_setup_failure_as_unavailable(
+    monkeypatch,
+):
+    import sys
+    import types
+
+    from prismaquant.runtime_shape_validators import (
+        flashinfer_mxfp8_problem_size_accepts,
+    )
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.uint8 = object()
+
+    def fake_empty(*_args, **_kwargs):
+        raise RuntimeError("fp8 setup unavailable")
+
+    fake_torch.empty = fake_empty
+
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_gemm = types.ModuleType("flashinfer.gemm")
+    fake_gemm_base = types.ModuleType("flashinfer.gemm.gemm_base")
+    fake_gemm_base._check_mm_mxfp8_problem_size = lambda *_args: True
+    fake_gemm_base._mxfp8_swizzled_scale_len = lambda *_args: 1
+    fake_gemm_base.SfLayout = types.SimpleNamespace(layout_8x4=object())
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.gemm", fake_gemm)
+    monkeypatch.setitem(sys.modules, "flashinfer.gemm.gemm_base", fake_gemm_base)
+
+    assert (
+        flashinfer_mxfp8_problem_size_accepts(
+            "MXFP8_E4M3",
+            in_features=5120,
+            out_features=10240,
+        )
+        is None
+    )
+
+
 def test_runtime_shape_validator_legacy_id_fallback(monkeypatch):
     import prismaquant.serving_profiles as serving_profiles
 

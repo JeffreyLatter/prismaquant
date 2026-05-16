@@ -40,10 +40,7 @@ def _unify_fused_max_abs(
     for qname, value in max_abs.items():
         if value <= 0:
             continue
-        try:
-            group = fused_group_key(profile, qname) if profile else qname
-        except Exception:
-            group = qname
+        group = fused_group_key(profile, qname) if profile else qname
         groups.setdefault(group, []).append(qname)
 
     unified: dict[str, float] = {}

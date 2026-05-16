@@ -29,20 +29,23 @@ def flashinfer_mxfp8_problem_size_accepts(
     except Exception:
         return None
 
-    a = torch.empty((1, in_features), dtype=torch.float8_e4m3fn)
-    b = torch.empty((in_features, out_features), dtype=torch.float8_e4m3fn)
-    a_desc_len = _mxfp8_swizzled_scale_len(
-        a.shape[0],
-        a.shape[1],
-        SfLayout.layout_8x4,
-    )
-    b_desc_len = _mxfp8_swizzled_scale_len(
-        b.shape[1],
-        b.shape[0],
-        SfLayout.layout_8x4,
-    )
-    a_desc = torch.empty((a_desc_len,), dtype=torch.uint8)
-    b_desc = torch.empty((b_desc_len,), dtype=torch.uint8)
+    try:
+        a = torch.empty((1, in_features), dtype=torch.float8_e4m3fn)
+        b = torch.empty((in_features, out_features), dtype=torch.float8_e4m3fn)
+        a_desc_len = _mxfp8_swizzled_scale_len(
+            a.shape[0],
+            a.shape[1],
+            SfLayout.layout_8x4,
+        )
+        b_desc_len = _mxfp8_swizzled_scale_len(
+            b.shape[1],
+            b.shape[0],
+            SfLayout.layout_8x4,
+        )
+        a_desc = torch.empty((a_desc_len,), dtype=torch.uint8)
+        b_desc = torch.empty((b_desc_len,), dtype=torch.uint8)
+    except Exception:
+        return None
     try:
         return _check_mm_mxfp8_problem_size(a, b, a_desc, b_desc) is True
     except Exception:

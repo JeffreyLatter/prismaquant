@@ -2081,13 +2081,10 @@ def fill_production_weight_cache(
         # Unify across fused sibling groups by taking the max.
         groups: dict[str, list[str]] = {}
         for qname in per_qname_max_abs:
-            try:
-                gk = (
-                    fused_group_key(model_profile, qname)
-                    if model_profile is not None else qname
-                )
-            except Exception:
-                gk = qname
+            gk = (
+                fused_group_key(model_profile, qname)
+                if model_profile is not None else qname
+            )
             groups.setdefault(gk, []).append(qname)
         for gk, members in groups.items():
             shared = max(per_qname_max_abs[m] for m in members)
@@ -2302,7 +2299,7 @@ def fill_production_weight_cache(
             calib_ids,
             recache_assignment or {},
             cache,
-            profile=recache_profile,
+            profile=model_profile,
             include_activation_quant=recache_include_activation_quant,
             microbatch_size=recache_microbatch_size,
             progress=progress,
