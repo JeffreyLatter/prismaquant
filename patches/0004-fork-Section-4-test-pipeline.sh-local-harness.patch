@@ -1,4 +1,4 @@
-From 84b03cf085ae61909f52790640c4ad05af696d5b Mon Sep 17 00:00:00 2001
+From 94d65aa6020faa515993373147b8711dc2eaff2c Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:22:02 +0200
 Subject: [PATCH 4/6] fork: Section 4 - test-pipeline.sh local harness
@@ -10,16 +10,16 @@ Local test harness derived from prismaquant/run-pipeline.sh with:
 - PRISMAQUANT_MASK_CUDA_DURING_META_INIT=0 export
 - --halo-mode / --halo-seed flags passed through to build_production_cache
 ---
- test-pipeline.sh | 685 +++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 685 insertions(+)
+ test-pipeline.sh | 683 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 683 insertions(+)
  create mode 100755 test-pipeline.sh
 
 diff --git a/test-pipeline.sh b/test-pipeline.sh
 new file mode 100755
-index 0000000..cf00b9f
+index 0000000..ea0e67e
 --- /dev/null
 +++ b/test-pipeline.sh
-@@ -0,0 +1,685 @@
+@@ -0,0 +1,683 @@
 +#!/usr/bin/env bash
 +# run-pipeline.sh — end-to-end PrismaQuant pipeline: probe → cost →
 +# allocator → native compressed-tensors export → vLLM validate.
@@ -661,8 +661,6 @@ index 0000000..cf00b9f
 +  --output "${WORK_DIR}/exported"
 +  --device "$EXPORT_DEVICE"
 +  --activation-cache-dir "${WORK_DIR}/act"
-+  --halo-mode "$HALO_MODE"
-+  --halo-seed "$HALO_SEED"
 +)
 +if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
 +          EXPORT_ARGS+=(

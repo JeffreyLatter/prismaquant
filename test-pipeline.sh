@@ -639,8 +639,6 @@ EXPORT_ARGS=(
   --output "${WORK_DIR}/exported"
   --device "$EXPORT_DEVICE"
   --activation-cache-dir "${WORK_DIR}/act"
-  --halo-mode "$HALO_MODE"
-  --halo-seed "$HALO_SEED"
 )
 if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
           EXPORT_ARGS+=(
