@@ -203,6 +203,19 @@ class ModelProfile(ABC):
         """
         return tensors
 
+    def pinned_names(self) -> tuple[str, ...]:
+        """Recipe/module names that must remain unquantized (BF16 passthrough).
+
+        The default reads from the declarative structure spec when present,
+        falling back to ('lm_head',) which covers all current vLLM serving
+        targets. Override in profiles where the head has a different name
+        (e.g. DeepSeek uses 'head').
+        """
+        spec = self.structure_spec()
+        if spec is not None:
+            return tuple(spec.pinned_names)
+        return ("lm_head",)
+
     def per_expert_moe_regex(self) -> str | None:
         """Regex matching vLLM's per-expert Linear qnames at scheme
         dispatch time. Added to the config_groups catch-all so every
