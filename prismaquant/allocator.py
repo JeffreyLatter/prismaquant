@@ -86,22 +86,16 @@ from pathlib import Path
 from . import format_registry as fr
 from .allocator_solver import (
     Candidate,
-    _candidate_for_assignment,
-    _group_by_profile,
     _shape_from_stats,
     compute_achieved,
     compute_assignment_predicted_dloss,
-    fused_siblings,
-    predicted_dloss,
     promote_fused,
     promote_moe_pair,
-    solve_allocation,
     solve_with_promotion,
 )
 from .allocator_candidates import (
     PASSTHROUGH_SOURCE_REQUIREMENTS,
     _FUSED_SIBLING_MARKER,
-    _flashinfer_kernel_accepts,
     _format_kernel_supports_shape,
     _is_passthrough_format,
     _passthrough_source_ok,
@@ -109,25 +103,13 @@ from .allocator_candidates import (
     aggregate_fused_siblings,
     build_candidates,
     expand_fused_sibling_assignment,
+    summarize_applicability_masks,
 )
-from .allocator_prune import (
-    _aggregate_candidate_memory_bits,
-    _expert_ids_in_group,
-    _moe_group_and_projection,
-    _packed_entry_router_qname,
-    _prune_cost_per_expert,
-    _saliency_complete_for_eids,
-    _saliency_has_eid,
-    _saliency_lookup,
-    aggregate_moe_candidates,
-    apply_consensus_prune,
-    apply_global_prune_ratio,
-    apply_nested_global_prune_ratio,
-    build_prune_manifest,
-    compute_max_prune_ratio,
-    expand_moe_assignment,
+from .serving_profiles import (
+    check_serving_format,
+    resolve_target_profile,
+    serving_profile_names,
 )
-from .expert_prune import EXPERT_PRUNE_DISABLED_MESSAGE
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
@@ -157,21 +139,10 @@ def kneedle(x: list[float], y: list[float]) -> int:
 
 
 def _allowed_format(target_profile: str, name: str, fmt: str) -> bool:
-    if target_profile == "research":
-        return True
-    if target_profile == "vllm_qwen3_5_packed_moe":
-        if ".mlp.experts" in name:
-            # Packed Qwen3.5/3.6 experts are emitted by
-            # export_native_compressed as compressed-tensors MoE units.
-            # Keep this allow-list aligned with FORMAT_SCHEME plus BF16
-            # passthrough. MXFP4 is exportable only for MoE experts in
-            # local vLLM; dense MXFP4 is weight-only and not part of the
-            # Qwen3.6 MoE shipping profile.
-            return fmt in {"NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"}
-        if fmt in {"MXFP4", "MXFP8_E5M2", "FP8_E5M2"}:
-            return False
-        return True
-    raise ValueError(f"Unknown target profile: {target_profile}")
+    decision = check_serving_format(target_profile, name, fmt)
+    if not decision.legal and decision.detail.startswith("unknown target profile"):
+        raise ValueError(decision.detail)
+    return decision.legal
 
 
 def filter_candidates_for_profile(
@@ -184,6 +155,10 @@ def filter_candidates_for_profile(
         if kept:
             out[name] = kept
     return out
+
+
+def _format_cli_choices() -> tuple[str, ...]:
+    return tuple(sorted(set(fr.REGISTRY) | set(fr.FORMAT_ALIASES)))
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +363,15 @@ def main():
                     help="Output AutoRound layer_config JSON")
     ap.add_argument("--pareto-csv", required=True, help="Output Pareto CSV")
     ap.add_argument(
+        "--applicability-report",
+        default=None,
+        help=(
+            "Optional JSON sidecar for candidates masked before DP by source, "
+            "profile, divisibility, or runtime kernel-shape constraints. "
+            "Defaults to format_applicability.json beside --pareto-csv."
+        ),
+    )
+    ap.add_argument(
         "--pareto-output-dir",
         default=None,
         help=(
@@ -414,66 +398,17 @@ def main():
                     help="Knapsack bit-bin granularity in avg-bits/param "
                          "(smaller = slower; default 0.0001 → ~50000 bins). "
                          "Measured on MiniMax-M2.7: going from 0.001 to 0.0001 "
-                         "cuts predicted Δloss ~10% at the same bit budget. "
-                         "Coarser values (0.01) leave 40% on the table.")
+                         "cuts predicted Δloss ~10%% at the same bit budget. "
+                         "Coarser values (0.01) leave 40%% on the table.")
     ap.add_argument("--threads", type=int, default=0,
                     help="OMP/numpy threads for DP (0 = default)")
-    ap.add_argument("--expert-granularity", choices=["layer", "expert"],
-                    default="layer",
-                    help="MoE experts allocation granularity. 'layer' (default) "
-                         "assigns one format to all experts in a layer's fused "
-                         "tensor — required for full-speed fused-MoE serving "
-                         "on every major stack (vLLM FlashInfer/Marlin, SGLang, "
-                         "TensorRT-LLM). 'expert' allows per-expert mixing but "
-                         "forces slower sequential serving and is noise-floor "
-                         "limited at typical calibration budgets.")
-    ap.add_argument("--enable-expert-prune", action="store_true",
-                    help="Archived. Any use now exits with an error; expert "
-                         "pruning via REAP is disabled for shipping artifacts.")
-    ap.add_argument("--prune-ratios",
-                    default="0.0,0.125,0.25,0.375,0.5",
-                    help="Comma-separated candidate prune ratios per MoE "
-                         "super-Linear. Each ratio R triggers dropping the "
-                         "floor(R · num_experts) lowest-saliency experts. "
-                         "0.0 always included implicitly (no-prune candidate).")
-    ap.add_argument("--prune-alpha", type=float, default=0.5,
-                    help="Scalar calibration on the prune Δloss formula "
-                         "α · S_j, where S_j is the probe's REAP dropout-"
-                         "loss estimate for the expert. Smaller α makes "
-                         "pruning cheaper (the DP prunes more aggressively); "
-                         "larger α protects experts.")
-    ap.add_argument("--expert-route-floor-mass", type=float, default=4.0,
-                    help="Minimum weighted routed-token mass used when "
-                         "pricing expert DROP candidates. New probes emit "
-                         "router_counts/router_totals; when available, a "
-                         "low-mass expert's REAP score is evaluated at "
-                         "least this many routed-token equivalents so rare "
-                         "or unseen experts are not treated as free drops "
-                         "from tiny calibration samples. Set 0 to disable.")
-    ap.add_argument("--prune-domain-policy",
-                    choices=["global", "union", "intersection", "mean"],
-                    default="global",
-                    help="How to collapse per-domain expert saliency into "
-                         "the prune candidate score when probe.pkl carries "
-                         "an `expert_saliency_per_domain` map (multi-chunk "
-                         "probe with domain-tagged calibration). "
-                         "`global` (default): use the legacy token-weighted "
-                         "average — preserves v20 behavior. "
-                         "`union`: max across domains — keeps an expert "
-                         "if it's load-bearing in ANY domain (recommended "
-                         "when every cal-mix domain must be served well). "
-                         "`intersection`: min across domains — drops an "
-                         "expert only when it's clearly droppable in EVERY "
-                         "domain (most aggressive). "
-                         "`mean`: equal-weight average per domain. "
-                         "No-op when probe.pkl has no per-domain map.")
     ap.add_argument("--target-profile",
-                    choices=["research", "vllm_qwen3_5_packed_moe"],
-                    default="research",
-                    help="Serving/backend constraint profile. "
-                         "'vllm_qwen3_5_packed_moe' collapses Qwen3.5/3.6 MoE "
-                         "to legal packed serving units and restricts MoE "
-                         "formats to the existing vLLM path.")
+                    choices=serving_profile_names(),
+                    default=None,
+                    help="Serving/backend constraint profile loaded from "
+                         "prismaquant/serving_profile_specs. Defaults to "
+                         "the detected model profile's configured serving "
+                         "profile, or research when none is declared.")
     ap.add_argument("--calibration", default=None,
                     help="Optional path to a JSON containing "
                          "'calibrated_gains[fmt] = α_fmt'. When present, "
@@ -485,7 +420,7 @@ def main():
                          "fused-sibling promotion. The DP is re-run with a "
                          "tightened target until overshoot is within tol.")
     ap.add_argument("--visual-format",
-                    choices=["BF16", "NVFP4", "MXFP8"],
+                    choices=_format_cli_choices(),
                     default="BF16",
                     help="Uniform format for all visual-encoder Linears "
                          "(`model.visual.blocks.*`). Phase 1 fallback: "
@@ -509,14 +444,12 @@ def main():
                          "the Phase 1 path: every visual Linear gets "
                          "--visual-format regardless of what's in the probe.")
     ap.add_argument("--mtp-format",
-                    choices=["BF16", "NVFP4", "MXFP8"],
+                    choices=_format_cli_choices(),
                     default="BF16",
                     help="Uniform format for MTP Linears. BF16 is the "
                          "production default until MTP speculative-decode "
                          "acceptance is validated for quantized MTP weights.")
     args = ap.parse_args()
-    if args.enable_expert_prune:
-        raise SystemExit(f"[alloc] {EXPERT_PRUNE_DISABLED_MESSAGE}")
 
     if args.threads > 0:
         import os
@@ -543,6 +476,10 @@ def main():
         model_profile = detect_profile(probe_model_path)
         print(f"[alloc] model profile: {model_profile.name} "
               f"(derived from {probe_model_path})", flush=True)
+    target_profile = resolve_target_profile(model_profile, args.target_profile)
+    if target_profile not in serving_profile_names():
+        raise SystemExit(f"[alloc] ERROR: unknown target profile {target_profile!r}")
+    print(f"[alloc] target profile: {target_profile}", flush=True)
 
     with open(args.probe, "rb") as f:
         probe = pickle.load(f)
@@ -629,135 +566,28 @@ def main():
                   f"{n_bf16} bf16 (gates FP8_SOURCE/BF16 per source)",
                   flush=True)
 
+    candidate_mask_records: list[dict] = []
     candidates = build_candidates(
         stats, costs, specs_sorted, calibrated_gains,
         source_manifest=source_manifest,
-        target_profile=args.target_profile,
+        target_profile=target_profile,
+        mask_records=candidate_mask_records,
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
-    # Joint REAP-prune + quant: ingest the observer-collected saliency
-    # and expert_info from the probe pickle. Both are empty dicts for
-    # dense models or legacy probes; the aggregator falls through to
-    # format-only candidates when either is empty.
-    probe_expert_saliency = probe.get("expert_saliency", {}) if args.enable_expert_prune else {}
-    probe_expert_info = probe.get("expert_info", {}) if args.enable_expert_prune else {}
-    probe_router_counts = probe.get("router_counts", {}) if args.enable_expert_prune else {}
-    probe_router_totals = probe.get("router_totals", {}) if args.enable_expert_prune else {}
-    # v21: when the probe carries per-domain saliency (multi-chunk
-    # probe with domain-tagged calibration), apply the user's
-    # cross-domain policy. Default `global` returns the legacy
-    # token-weighted average unchanged so single-domain runs behave
-    # exactly as before.
-    if args.enable_expert_prune:
-        from .adaptive_sampling import saliency_with_policy
-        probe_expert_saliency_per_domain = probe.get(
-            "expert_saliency_per_domain") or {}
-        if probe_expert_saliency_per_domain:
-            probe_expert_saliency = saliency_with_policy(
-                probe_expert_saliency_per_domain,
-                probe_expert_saliency,
-                args.prune_domain_policy,
-            )
-            print(
-                f"[alloc] per-domain saliency: "
-                f"{len(probe_expert_saliency_per_domain)} domains, "
-                f"policy={args.prune_domain_policy}", flush=True,
-            )
-    # Parse the user's ratio list as a SWEEP. For packed-3D models we
-    # couple every layer to the same ratio (below) to match vLLM's
-    # uniform-num_experts constraint — so "multi-ratio" means "try each
-    # of these values globally and pick the best per target_bits."
-    # For nested-MoE models we still hand the list down to
-    # `aggregate_moe_candidates`'s per-layer prune path.
-    user_prune_ratios = tuple(
-        float(x) for x in args.prune_ratios.split(",")
-        if x.strip() and float(x) > 0.0
-    ) if args.enable_expert_prune else ()
-    # Top-k safety floor: we must never drop below `top_k` experts
-    # kept per layer, else routing has fewer experts than it tries to
-    # select. Read top_k from the probe meta; default 8 for Qwen3.5.
-    top_k = 8
-    probe_meta = probe.get("meta", {}) if isinstance(probe.get("meta"), dict) else {}
-    if "top_k" in probe_meta:
-        top_k = int(probe_meta["top_k"])
-    # Filter ratios to those satisfying min-kept >= top_k.
-    global_ratio_sweep: list[float] = [0.0]
-    if args.enable_expert_prune and probe_expert_saliency:
-        try:
-            max_r = compute_max_prune_ratio(stats, top_k)
-        except ValueError as e:
-            raise SystemExit(f"[alloc] {e}")
-        above_floor = [r for r in user_prune_ratios if r > max_r]
-        valid = sorted({r for r in user_prune_ratios if 0 < r <= max_r})
-        if above_floor:
-            print(
-                f"[alloc] dropped prune ratios above kept>=top_k "
-                f"(top_k={top_k}, max_R={max_r:.3f}): "
-                f"{sorted(above_floor)}", flush=True,
-            )
-        global_ratio_sweep = [0.0] + valid
-        n_routers_with_saliency = sum(
-            1 for r in probe_expert_saliency.values() if r
-        )
-        print(
-            f"[alloc] expert-prune ENABLED: saliency routers="
-            f"{n_routers_with_saliency}, sweep ratios={global_ratio_sweep}, "
-            f"top_k={top_k}, alpha={args.prune_alpha}, "
-            f"route_floor_mass={args.expert_route_floor_mass}", flush=True,
-        )
-        if args.expert_route_floor_mass > 0 and not probe_router_counts:
-            print(
-                "[alloc] expert-prune route floor requested, but probe has "
-                "no router_counts; falling back to raw REAP saliency.",
-                flush=True,
-            )
-
-    # Nested-MoE aggregation with per-layer prune variants (research
-    # path). For packed-3D models `aggregate_moe_candidates` is a
-    # no-op here because no super-Linears form.
-    if args.target_profile == "vllm_qwen3_5_packed_moe":
-        stats, costs, candidates = aggregate_moe_candidates(
-            stats, costs, specs_sorted, candidates, granularity="layer",
-            calibrated_gains=calibrated_gains,
-            expert_saliency=probe_expert_saliency,
-            expert_info=probe_expert_info,
-            router_counts=probe_router_counts,
-            router_totals=probe_router_totals,
-            route_floor_mass=args.expert_route_floor_mass,
-            prune_ratios=(),  # packed-3D path handles prune below
-            prune_alpha=args.prune_alpha,
-            source_manifest=source_manifest)
-        moe_groups = sum(1 for n in candidates if ".__fused__." in n)
-        print(f"[alloc] packed-MoE serving aggregation: {moe_groups} fused MoE blocks")
-    elif args.expert_granularity == "layer":
-        stats, costs, candidates = aggregate_moe_candidates(
-            stats, costs, specs_sorted, candidates, granularity="projection",
-            calibrated_gains=calibrated_gains,
-            expert_saliency=probe_expert_saliency,
-            expert_info=probe_expert_info,
-            router_counts=probe_router_counts,
-            router_totals=probe_router_totals,
-            route_floor_mass=args.expert_route_floor_mass,
-            prune_ratios=user_prune_ratios,
-            prune_alpha=args.prune_alpha,
-            source_manifest=source_manifest)
-        moe_groups = sum(1 for n in candidates if ".__fused__." in n)
-        print(f"[alloc] MoE aggregation: {moe_groups} fused-expert super-Linears")
-
-    # MiniMax-style nested MoE exports also carry one scalar expert-count
-    # field in config.json. They therefore need the same global-ratio
-    # discipline as packed-3D MoE: the DP may choose quant formats per
-    # group, but not independently choose each layer's prune ratio.
-    nested_global_prune = (
-        args.enable_expert_prune
-        and args.expert_granularity == "layer"
-        and args.target_profile == "research"
-        and getattr(model_profile, "name", "") in {"minimax_m2"}
+    applicability_report_path = (
+        Path(args.applicability_report)
+        if args.applicability_report
+        else Path(args.pareto_csv).with_name("format_applicability.json")
     )
-    if nested_global_prune:
-        print("[alloc] nested-MoE global prune sweep enabled "
-              f"(profile={model_profile.name})", flush=True)
+    applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
+    pre_aggregation_availability = {
+        spec.name: sum(
+            1 for per_name in candidates.values()
+            if any(c.fmt == spec.name for c in per_name)
+        )
+        for spec in specs_sorted
+    }
 
     # Pre-aggregate fused siblings (qkv_proj, gate_up_proj, ...) into
     # single DP items. The DP can't pick mixed-sibling solutions because
@@ -773,86 +603,60 @@ def main():
         print(f"[alloc] fused-sibling aggregation: {sib_groups} groups "
               f"(qkv_proj / gate_up_proj / ...)")
 
-    candidates = filter_candidates_for_profile(candidates, args.target_profile)
+    candidates = filter_candidates_for_profile(candidates, target_profile)
 
-    # `candidates` is now fully aggregated (MoE, fused siblings) and
-    # filtered. For the packed-3D prune sweep we clone it per ratio
-    # and rewrite the packed entries in place via
-    # `apply_global_prune_ratio`. The original is preserved as the
-    # R=0 baseline.
-    import copy as _copy
+    post_aggregation_availability = {
+        spec.name: sum(
+            1 for per_name in candidates.values()
+            if any(c.fmt == spec.name for c in per_name)
+        )
+        for spec in specs_sorted
+    }
+    applicability_payload = {
+        "schema": "prismaquant.format_applicability.v1",
+        "target_profile": target_profile,
+        "model_profile": getattr(model_profile, "name", ""),
+        "formats": [spec.name for spec in specs_sorted],
+        "probe": str(args.probe),
+        "costs": str(args.costs),
+        "pre_aggregation_candidate_availability": pre_aggregation_availability,
+        "post_aggregation_candidate_availability": post_aggregation_availability,
+        **summarize_applicability_masks(candidate_mask_records),
+    }
+    applicability_report_path.write_text(
+        json.dumps(applicability_payload, indent=2, sort_keys=True) + "\n"
+    )
+    print(f"[alloc] format applicability → {applicability_report_path}")
 
-    def _solve_for_ratio(R: float, target_bits: float):
-        """Solve the DP at a single (ratio, target_bits) combination.
-        Returns (assignment, pruned_map, achieved, total_dloss) or
-        (None, {}, nan, inf) if infeasible."""
-        # Clear any lingering packed-entry memory maps from a previous
-        # R's apply_global_prune_ratio — otherwise R=0 would pick up
-        # the last non-zero ratio's shrunk bytes from stats. Safe to
-        # pop unconditionally; apply_global_prune_ratio repopulates
-        # when R > 0.
-        for name, s in stats.items():
-            if (_packed_entry_router_qname(name) is not None
-                    and isinstance(s, dict)):
-                s.pop("_memory_bytes_by_format", None)
-        if R > 0.0 and probe_expert_saliency:
-            c = _copy.deepcopy(candidates)
-            apply_global_prune_ratio(
-                c, stats, probe_expert_saliency,
-                global_ratio=R, prune_alpha=args.prune_alpha,
-                router_counts=probe_router_counts,
-                router_totals=probe_router_totals,
-                route_floor_mass=args.expert_route_floor_mass,
-            )
-        else:
-            c = candidates
-        if nested_global_prune:
-            filtered, filter_warnings = apply_nested_global_prune_ratio(
-                c, stats, global_ratio=R,
-            )
-            if filtered is None:
-                if filter_warnings:
-                    print("[alloc] nested-MoE global prune ratio "
-                          f"R={R:.6g} infeasible: {filter_warnings[0]}",
-                          flush=True)
-                return None, {}, float("nan"), float("inf")
-            c = filtered
-        assign, pruned_map_r, achieved_r = solve_with_promotion(
-            stats, c, target_bits, format_specs, format_rank,
+    def _solve_for_target(target_bits: float):
+        """Solve the DP at one target bit budget."""
+        assign, achieved_r = solve_with_promotion(
+            stats, candidates, target_bits, format_specs, format_rank,
             args.bit_precision,
             no_fused_promote=args.no_fused_promote,
             overshoot_tolerance=args.overshoot_tolerance,
             profile=model_profile,
         )
         if assign is None:
-            return None, {}, float("nan"), float("inf")
-        total = compute_assignment_predicted_dloss(assign, c, pruned_map_r)
-        return assign, pruned_map_r, achieved_r, total
+            return None, float("nan"), float("inf")
+        total = compute_assignment_predicted_dloss(assign, candidates)
+        return assign, achieved_r, total
 
     def _expand_assignment_for_seed_json(
         assignment: dict[str, str],
-        pruned_map: dict[str, tuple[int, ...]] | dict[str, list[int]] | None,
     ) -> dict[str, str]:
         """Expand DP super-items into the per-Linear seed-assignment shape.
 
-        The allocator often solves over fused-sibling and MoE super-items.
+        The allocator can solve over fused-sibling super-items.
         The KL probe's seed path wants ordinary module qnames; it already
         handles legality, pinning, and fused coherence, but giving it expanded
         names preserves the intended frontier point instead of making the
         super-item markers look like unknown entries.
         """
-        if args.expert_granularity == "layer":
-            expanded = expand_moe_assignment(
-                assignment,
-                stats,
-                pruned_map=pruned_map or {},
-                expert_info=probe_expert_info,
-            )
-        else:
-            expanded = dict(assignment)
+        expanded = dict(assignment)
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
-        return promote_moe_pair(expanded, format_rank)
+        return promote_moe_pair(expanded, format_rank, profile=model_profile)
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
         total = 0.0
@@ -866,58 +670,36 @@ def main():
 
     pareto_seed_records: list[dict] = []
 
-    # Pareto sweep: for each target_bits, pick the (R, assignment)
-    # with the lowest predicted Δloss among all ratios in the sweep.
+    # Pareto sweep.
     targets = [float(x) for x in args.pareto_targets.split(",")]
     curve = []
     for t in targets:
-        best = None
-        for R in global_ratio_sweep:
-            assign, pruned_r, achieved, total = _solve_for_ratio(R, t)
-            if assign is None:
-                continue
-            if best is None or total < best["predicted_dloss"]:
-                best = {
-                    "ratio": R,
-                    "assignment": assign,
-                    "pruned_map": pruned_r,
-                    "achieved_bits": achieved,
-                    "predicted_dloss": total,
-                }
-        if best is None:
+        assign, achieved, total = _solve_for_target(t)
+        if assign is None:
             curve.append({"target_bits": t, "feasible": False})
             continue
         format_counts = defaultdict(int)
         format_params = defaultdict(int)
-        for name, fmt in best["assignment"].items():
+        for name, fmt in assign.items():
             format_counts[fmt] += 1
             format_params[fmt] += stats[name]["n_params"]
-        n_layers_pruned = len(best["pruned_map"])
-        n_experts_dropped = sum(len(v) for v in best["pruned_map"].values())
         curve.append({
             "target_bits": t,
             "feasible": True,
-            "achieved_bits": best["achieved_bits"],
-            "predicted_dloss": best["predicted_dloss"],
-            "global_prune_ratio": best["ratio"],
-            "n_layers_pruned": n_layers_pruned,
-            "n_experts_dropped": n_experts_dropped,
+            "achieved_bits": achieved,
+            "predicted_dloss": total,
             **{f"layers_{k}": v for k, v in format_counts.items()},
             **{f"params_{k}": v for k, v in format_params.items()},
         })
         if args.pareto_output_dir:
-            expanded = _expand_assignment_for_seed_json(
-                best["assignment"],
-                best["pruned_map"],
-            )
+            expanded = _expand_assignment_for_seed_json(assign)
             expanded_counts = defaultdict(int)
             for fmt in expanded.values():
                 expanded_counts[fmt] += 1
             pareto_seed_records.append({
                 "target_bits": float(t),
-                "achieved_bits": float(best["achieved_bits"]),
-                "predicted_dloss": float(best["predicted_dloss"]),
-                "global_prune_ratio": float(best["ratio"]),
+                "achieved_bits": float(achieved),
+                "predicted_dloss": float(total),
                 "assignment": expanded,
                 "format_counts": dict(sorted(expanded_counts.items())),
                 "bits_total": _assignment_bits_total(expanded),
@@ -957,7 +739,6 @@ def main():
                 "achieved_bits": float(record["achieved_bits"]),
                 "bits_total": float(record["bits_total"]),
                 "predicted_dloss": float(record["predicted_dloss"]),
-                "global_prune_ratio": float(record["global_prune_ratio"]),
                 "format_counts": record["format_counts"],
                 "assignment": dict(sorted(assignment.items())),
             }
@@ -1007,143 +788,33 @@ def main():
         print(f"  {row['target_bits']:>6.3f}  {row['achieved_bits']:>7.3f}  "
               f"{row['predicted_dloss']:>14.4e}   {fmt_str}")
 
-    # Emit chosen layer_config for target_bits. Same outer-loop-over-R
-    # pattern as the Pareto sweep — pick the ratio that minimizes
-    # predicted Δloss at the requested target.
-    best_final = None
-    for R in global_ratio_sweep:
-        assign, pruned_r, achieved_r, total = _solve_for_ratio(
-            R, args.target_bits,
-        )
-        if assign is None:
-            continue
-        if best_final is None or total < best_final["predicted_dloss"]:
-            best_final = {
-                "ratio": R,
-                "assignment": assign,
-                "pruned_map": pruned_r,
-                "achieved_bits": achieved_r,
-                "predicted_dloss": total,
-            }
-    if best_final is None:
+    # Emit chosen layer_config for target_bits.
+    assignment, achieved, total = _solve_for_target(args.target_bits)
+    if assignment is None:
         raise SystemExit(
             f"Infeasible at target_bits={args.target_bits}. "
             "Consider raising the target or widening the format set.")
-    assignment = best_final["assignment"]
-    pruned_map = best_final["pruned_map"]
-    achieved = best_final["achieved_bits"]
-    chosen_ratio = best_final["ratio"]
-    if chosen_ratio > 0.0:
-        print(
-            f"[alloc] target_bits={args.target_bits}: picked global prune "
-            f"ratio R={chosen_ratio:.4f} (achieved_bits={achieved:.3f}, "
-            f"Δloss={best_final['predicted_dloss']:.3e})",
-            flush=True,
-        )
+    print(
+        f"[alloc] target_bits={args.target_bits}: "
+        f"achieved_bits={achieved:.3f}, Δloss={total:.3e}",
+        flush=True,
+    )
 
-    # Build the prune manifest (router-keyed, consensus-intersected)
-    # from the DP's winning candidates. Empty when prune is disabled or
-    # saliency is absent. Coerce each super-Linear's dropped set to the
-    # router consensus so expansion and the sidecar agree.
-    prune_manifest: dict[str, dict] = {}
-    prune_warnings: list[str] = []
-    if pruned_map:
-        # expert_info may be empty for packed-3D models (no per-expert
-        # leaves to discover). build_prune_manifest handles that via
-        # _packed_entry_router_qname; no gating on expert_info here.
-        # expert_saliency feeds the uniform-kept coercion pass
-        # (padding lighter-pruned layers to match the heaviest prune,
-        # using lowest-saliency experts as the extras).
-        uniform_kept = (
-            args.target_profile == "vllm_qwen3_5_packed_moe"
-            or nested_global_prune
-        )
-        prune_manifest, prune_warnings = build_prune_manifest(
-            pruned_map, stats, probe_expert_info,
-            expert_saliency=probe_expert_saliency,
-            router_counts=probe_router_counts,
-            router_totals=probe_router_totals,
-            route_floor_mass=args.expert_route_floor_mass,
-            uniform_kept=uniform_kept,
-        )
-        if uniform_kept:
-            post_dp_warnings = [
-                w for w in prune_warnings
-                if "padded drops" in w or "DP chose no prune" in w
-            ]
-            if post_dp_warnings:
-                sample = "\n  ".join(post_dp_warnings[:5])
-                raise SystemExit(
-                    "[alloc] prune uniform-kept would add unscored drops "
-                    "after the DP. This means the packed global-ratio "
-                    "candidate set did not cover every saliency router. "
-                    f"Refusing to emit a sidecar that differs from the "
-                    f"scored plan. Sample:\n  {sample}"
-                )
-        pruned_map = apply_consensus_prune(
-            pruned_map, prune_manifest, stats, probe_expert_info,
-        )
-        for w in prune_warnings:
-            print(f"[alloc] prune-consensus: {w}", flush=True)
-        if not uniform_kept and prune_manifest:
-            kept_counts = {
-                int(e["num_experts_kept"]) for e in prune_manifest.values()
-            }
-            if len(kept_counts) > 1:
-                print(
-                    "[alloc] WARNING: prune manifest has mixed "
-                    f"num_experts_kept values {sorted(kept_counts)}. "
-                    "The exporter will reject this for HF/vLLM configs "
-                    "with a single scalar expert-count field; use a "
-                    "global packed-MoE prune ratio for serveable uniform "
-                    "expert counts.",
-                    flush=True,
-                )
-        total_orig = sum(r["num_experts_orig"] for r in prune_manifest.values())
-        total_kept = sum(r["num_experts_kept"] for r in prune_manifest.values())
-        print(
-            f"[alloc] prune: {len(prune_manifest)} MoE layers, "
-            f"{total_orig - total_kept}/{total_orig} experts dropped "
-            f"(kept {total_kept})",
-            flush=True,
-        )
-
-    # Expand MoE super-Linears back to per-expert entries before writing
-    # the AutoRound layer_config (which expects one entry per individual
-    # nn.Linear module name). When prune is active, dropped experts are
-    # omitted from the expanded assignment — their leaves won't appear
-    # in layer_config.json and the exporter won't quantize/export them.
-    if args.expert_granularity == "layer":
-        assignment_expanded = expand_moe_assignment(
-            assignment, stats,
-            pruned_map=pruned_map,
-            expert_info=probe_expert_info,
-        )
-    else:
-        assignment_expanded = dict(assignment)
+    assignment_expanded = dict(assignment)
 
     # Expand fused-sibling super-Linears (qkv_proj / gate_up_proj).
-    # Complementary to the MoE expansion above — the MoE path handles
-    # `.__fused__.` markers; the sibling path handles `.__siblings__.`
-    # markers. Running both is idempotent on any assignment that doesn't
-    # contain the relevant marker.
     if not args.no_fused_aggregation:
         assignment_expanded = expand_fused_sibling_assignment(
             assignment_expanded, stats)
 
-    # Post-expansion MoE unity promotion. The super-Linear solver picks
-    # a format per (layer, projection); expansion propagates that to
-    # all per-expert leaves with the same projection. But vLLM's
-    # FusedMoE requires ALL projections (gate+up+down) of the SAME
-    # expert to share one scheme — so when the solver picks e.g.
-    # w1=MXFP8 and w2=NVFP4 for layer L, every (L, expert_i) triple
-    # would disagree and the serve-time dispatch raises 'All MoE
-    # projections need same scheme'. This pass groups expanded leaves
-    # by (experts-prefix, expert-idx) and bumps the lower-rank
-    # projections to match the highest. Costs a little bpp on layers
-    # where gate/up/down really wanted different formats, but that
-    # cost is the ticket for serveability.
-    assignment_expanded = promote_moe_pair(assignment_expanded, format_rank)
+    # vLLM's FusedMoE requires all projections of the same expert to share
+    # one scheme. This keeps per-Linear assignments serveable without
+    # collapsing experts into allocator super-items.
+    assignment_expanded = promote_moe_pair(
+        assignment_expanded,
+        format_rank,
+        profile=model_profile,
+    )
 
     # Visual-encoder Linear handling. Two paths:
     #
@@ -1273,21 +944,6 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
         json.dump(layer_cfg, f, indent=2)
-
-    # Prune sidecar: emitted alongside layer_config.json when any MoE
-    # layer had experts dropped. Exporter reads this to drop the router
-    # rows, reindex kept experts to dense 0..K-1, and update
-    # config.json's num_experts. Absent sidecar => no pruning happened
-    # and the exporter uses its pre-prune code path.
-    prune_sidecar_path = out.with_suffix(out.suffix + ".prune.json")
-    if prune_manifest:
-        with open(prune_sidecar_path, "w") as f:
-            json.dump(prune_manifest, f, indent=2, sort_keys=True)
-        print(f"Prune manifest → {prune_sidecar_path}")
-    elif prune_sidecar_path.exists():
-        # Stale sidecar from an earlier prune run would silently taint
-        # a subsequent non-prune run. Remove it.
-        prune_sidecar_path.unlink()
 
     counts = defaultdict(int)
     for fmt in assignment.values():

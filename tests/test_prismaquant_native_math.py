@@ -1,3 +1,5 @@
+import json
+import tempfile
 import unittest
 from unittest import mock
 
@@ -5,11 +7,13 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
+from prismaquant.allocator_candidates import _scan_source_dtype_manifest
 from prismaquant.allocator import (
     Candidate,
     build_candidates,
     filter_candidates_for_profile,
 )
+from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 from prismaquant.sensitivity_probe import discover_moe_structure
 
 
@@ -160,6 +164,45 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         self.assertAlmostEqual(by_fmt["FP8_SOURCE"].bits_per_param, 8.001953125)
         self.assertAlmostEqual(by_fmt["MXFP8_E4M3"].bits_per_param, 8.25)
 
+    def test_source_dtype_manifest_uses_profile_name_mapping(self):
+        with tempfile.TemporaryDirectory() as td:
+            payload = {
+                "weight_map": {
+                    "model.language_model.layers.0.mlp.gate_proj.weight": "s0",
+                    "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv": "s0",
+                    "model.visual.blocks.0.attn.proj.weight": "s0",
+                }
+            }
+            with open(f"{td}/model.safetensors.index.json", "w") as f:
+                json.dump(payload, f)
+
+            manifest = _scan_source_dtype_manifest(td, Qwen3_5Profile())
+
+        self.assertEqual(
+            manifest,
+            {"model.layers.0.mlp.gate_proj": "fp8"},
+        )
+
+    def test_source_dtype_manifest_uses_profile_fp8_scale_pairs(self):
+        class _ScaleProfile:
+            def checkpoint_to_live_name(self, key, *, multimodal=False):
+                del multimodal
+                if key == "ck.foo.weight":
+                    return "live.foo.weight"
+                return None
+
+            def live_to_recipe_name(self, qname):
+                return qname.replace("live.", "recipe.", 1)
+
+            def fp8_scale_pairs(self, model_path):
+                del model_path
+                return {"live.foo.weight": ("s0", "ck.foo.scale")}
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = _scan_source_dtype_manifest(td, _ScaleProfile())
+
+        self.assertEqual(manifest, {"recipe.foo": "fp8"})
+
     def test_build_candidates_applies_calibrated_gains(self):
         stats = {
             "layer.weight": {
@@ -291,7 +334,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         }
 
         filtered = filter_candidates_for_profile(
-            candidates, "vllm_qwen3_5_packed_moe"
+            candidates, "vllm_packed_moe"
         )
 
         self.assertEqual(
@@ -310,6 +353,27 @@ class _ToyExpertsLinearLoop(nn.Module):
         self.down_proj = nn.ModuleList(
             [nn.Linear(intermediate, hidden, bias=False) for _ in range(num_experts)]
         )
+
+
+class _ToyCustomExpertsLinearLoop(nn.Module):
+    def __init__(self, num_experts=3, hidden=4, intermediate=6):
+        super().__init__()
+        self.w13 = nn.ModuleList(
+            [nn.Linear(hidden, 2 * intermediate, bias=False) for _ in range(num_experts)]
+        )
+        self.w2 = nn.ModuleList(
+            [nn.Linear(intermediate, hidden, bias=False) for _ in range(num_experts)]
+        )
+
+
+class _CustomPackedProfile:
+    def packed_expert_param_names(self) -> frozenset[str]:
+        return frozenset({"w13", "w2"})
+
+    def packed_expert_projection_names(self, param_name: str) -> tuple[str, ...]:
+        if param_name == "w13":
+            return ("w1_proj", "w3_proj")
+        return (param_name,)
 
 
 class _ToyMoeBlock(nn.Module):
@@ -340,6 +404,16 @@ class _ToyModel(nn.Module):
         self.model.layers[0].mlp = _ToyMoeBlock()
 
 
+class _ToyCustomModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Module()])
+        self.model.layers[0].mlp = nn.Module()
+        self.model.layers[0].mlp.gate = nn.Linear(4, 3, bias=False)
+        self.model.layers[0].mlp.experts = _ToyCustomExpertsLinearLoop()
+
+
 class TestMoeDiscovery(unittest.TestCase):
     def test_discover_moe_structure_handles_linear_loop_projection_lists(self):
         toy = _ToyModel()
@@ -353,6 +427,20 @@ class TestMoeDiscovery(unittest.TestCase):
         toy.model.layers[0].mlp = _ToyMoeBlockCustomRouter()
         info = discover_moe_structure(toy)
         self.assertEqual(info["model.layers.0.mlp.experts.gate_up_proj.1"], ("model.layers.0.mlp.gate", "1"))
+        self.assertEqual(len(info), 6)
+
+    def test_discover_moe_structure_uses_profile_projection_names(self):
+        toy = _ToyCustomModel()
+        info = discover_moe_structure(toy, profile=_CustomPackedProfile())
+
+        self.assertEqual(
+            info["model.layers.0.mlp.experts.w13.0"],
+            ("model.layers.0.mlp.gate", "0"),
+        )
+        self.assertEqual(
+            info["model.layers.0.mlp.experts.w2.2"],
+            ("model.layers.0.mlp.gate", "2"),
+        )
         self.assertEqual(len(info), 6)
 
 

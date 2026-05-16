@@ -16,7 +16,7 @@ math. Memory is identical (same parameter count, no aliasing).
 Only used at probe time; vLLM serving uses the packed format from
 PR #40860 directly. `register_deepseek_v4()` swaps in this class
 unconditionally — having per-expert structure during probe is what
-makes Fisher / saliency / REAP scoring work.
+makes Fisher and expert-saliency scoring work.
 """
 from __future__ import annotations
 

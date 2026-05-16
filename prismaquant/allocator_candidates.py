@@ -3,31 +3,22 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import format_registry as fr
 from .allocator_solver import Candidate, _shape_from_stats, predicted_dloss
+from .serving_profiles import (
+    check_serving_format,
+    check_serving_shape,
+)
 
 
 PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
     "FP8_SOURCE": "fp8",
     "BF16": "bf16",
 }
-
-VLLM_QWEN35_EXPERT_FORMATS = {
-    "NVFP4",
-    "MXFP4",
-    "MXFP8",
-    "MXFP8_E4M3",
-    "BF16",
-}
-VLLM_QWEN35_DENSE_UNSUPPORTED_FORMATS = {
-    "MXFP4",
-    "MXFP8_E5M2",
-    "FP8_E5M2",
-}
-
 
 def _is_passthrough_format(format_name: str) -> bool:
     return format_name in PASSTHROUGH_SOURCE_REQUIREMENTS
@@ -57,55 +48,23 @@ def _profile_allows_format(
     name: str | None,
     fmt: str,
 ) -> FormatApplicability:
-    if target_profile in (None, "", "research"):
-        return FormatApplicability(True)
-    if target_profile == "vllm_qwen3_5_packed_moe":
-        qname = name or ""
-        if ".mlp.experts" in qname:
-            if fmt in VLLM_QWEN35_EXPERT_FORMATS:
-                return FormatApplicability(True)
-            return FormatApplicability(
-                False,
-                "profile_mismatch",
-                "Qwen3.5/3.6 packed MoE serving path only supports "
-                "NVFP4, MXFP4, MXFP8_E4M3, or BF16 for expert tensors; "
-                "plain FP8 and E5M2 stay research-only until a vLLM "
-                "packed-MoE load smoke passes",
-            )
-        if fmt in VLLM_QWEN35_DENSE_UNSUPPORTED_FORMATS:
-            return FormatApplicability(
-                False,
-                "profile_mismatch",
-                f"{fmt} is not enabled for dense Linears in this serving "
-                "profile",
-            )
-        return FormatApplicability(True)
+    decision = check_serving_format(target_profile, name, fmt)
     return FormatApplicability(
-        False,
-        "profile_mismatch",
-        f"unknown target profile {target_profile!r}",
+        decision.legal,
+        decision.reason,
+        decision.detail,
     )
 
 
 def _format_kernel_supports_shape(fmt_name: str, in_features: int,
                                   out_features: int) -> bool:
     """Return True if the runtime kernel can handle this Linear shape."""
-    flashinfer_verdict = _flashinfer_kernel_accepts(
-        fmt_name, in_features, out_features)
-    if flashinfer_verdict is False:
-        return False
-
-    if fmt_name.startswith("MXFP8"):
-        if out_features < 128 or in_features < 128:
-            return False
-        if in_features % 32 != 0:
-            return False
-        if out_features % 128 != 0:
-            return False
-        return True
-    if fmt_name.startswith("NVFP4"):
-        return in_features % 16 == 0
-    return True
+    return check_serving_shape(
+        "research",
+        fmt_name,
+        in_features=in_features,
+        out_features=out_features,
+    ).legal
 
 
 def check_format_applicability(
@@ -178,12 +137,18 @@ def check_format_applicability(
                 f"(out_features={out_features}, in_features={in_features})",
             )
 
-    if not _format_kernel_supports_shape(fmt, in_features, out_features):
+    shape_decision = check_serving_shape(
+        target_profile,
+        fmt,
+        qname=qname,
+        in_features=in_features,
+        out_features=out_features,
+    )
+    if not shape_decision.legal:
         return FormatApplicability(
             False,
-            "kernel_shape",
-            f"{fmt} kernel does not support (out_features={out_features}, "
-            f"in_features={in_features})",
+            shape_decision.reason or "kernel_shape",
+            shape_decision.detail,
         )
     return FormatApplicability(True)
 
@@ -217,29 +182,14 @@ def check_stats_format_applicability(
 
 def _flashinfer_kernel_accepts(fmt_name: str, in_features: int,
                                out_features: int) -> bool | None:
-    """Ask FlashInfer's own problem-size validator when available."""
-    try:
-        if fmt_name.startswith("MXFP8"):
-            from flashinfer.gemm.gemm_base import _check_mm_mxfp8_problem_size
-            import torch
-            a = torch.empty((1, in_features), dtype=torch.float8_e4m3fn)
-            b = torch.empty((in_features, out_features),
-                            dtype=torch.float8_e4m3fn)
-            from flashinfer.gemm.gemm_base import _mxfp8_swizzled_scale_len
-            from flashinfer.gemm.gemm_base import SfLayout
-            a_desc_len = _mxfp8_swizzled_scale_len(
-                a.shape[0], a.shape[1], SfLayout.layout_8x4)
-            b_desc_len = _mxfp8_swizzled_scale_len(
-                b.shape[1], b.shape[0], SfLayout.layout_8x4)
-            a_desc = torch.empty((a_desc_len,), dtype=torch.uint8)
-            b_desc = torch.empty((b_desc_len,), dtype=torch.uint8)
-            try:
-                return _check_mm_mxfp8_problem_size(a, b, a_desc, b_desc) is True
-            except Exception:
-                return False
-        return None
-    except Exception:
-        return None
+    """Compatibility wrapper for the config-backed FlashInfer validator."""
+    from .runtime_shape_validators import flashinfer_mxfp8_problem_size_accepts
+
+    return flashinfer_mxfp8_problem_size_accepts(
+        fmt_name,
+        in_features=in_features,
+        out_features=out_features,
+    )
 
 
 def _stats_indicates_packed_expert(stats_entry: dict) -> bool:
@@ -311,6 +261,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                      calibrated_gains: dict[str, float] | None = None,
                      source_manifest: dict[str, str] | None = None,
                      target_profile: str | None = None,
+                     mask_records: list[dict] | None = None,
                      ) -> dict[str, list[Candidate]]:
     """Build runtime-legal format candidates for every measured Linear.
 
@@ -347,6 +298,17 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 target_profile=target_profile,
             )
             if not verdict.legal:
+                if mask_records is not None:
+                    mask_records.append({
+                        "qname": name,
+                        "format": spec.name,
+                        "reason": verdict.reason or "not_applicable",
+                        "detail": verdict.detail,
+                        "shape": [out_features, in_features],
+                        "out_features": out_features,
+                        "in_features": in_features,
+                        "source_kind": source_kind,
+                    })
                 masked.setdefault(
                     (spec.name, verdict.reason or "not_applicable"),
                     [],
@@ -374,6 +336,66 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 flush=True,
             )
     return out
+
+
+def summarize_applicability_masks(records: list[dict]) -> dict:
+    """Summarize format candidates removed before the optimizer sees them.
+
+    The allocator's legality gate is part of the optimization layer: illegal
+    candidates are excluded before DP, rather than caught later by export.
+    This summary is intentionally small enough to save beside Pareto curves
+    while still preserving exact qnames and kernel shapes for debugging.
+    """
+    summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    by_shape: dict[tuple[str, str], dict[tuple[int, int], dict]] = defaultdict(dict)
+    for rec in records:
+        fmt = str(rec.get("format", ""))
+        reason = str(rec.get("reason", "not_applicable"))
+        summary[fmt][reason] += 1
+        out_features = int(rec.get("out_features", 0) or 0)
+        in_features = int(rec.get("in_features", 0) or 0)
+        shape_key = (out_features, in_features)
+        bucket_key = (fmt, reason)
+        bucket = by_shape[bucket_key].setdefault(shape_key, {
+            "shape": [out_features, in_features],
+            "count": 0,
+            "sample": [],
+            "detail": rec.get("detail", ""),
+        })
+        bucket["count"] += 1
+        if len(bucket["sample"]) < 8:
+            bucket["sample"].append(rec.get("qname", ""))
+
+    shape_payload: dict[str, dict[str, list[dict]]] = defaultdict(dict)
+    for (fmt, reason), shapes in by_shape.items():
+        shape_payload[fmt][reason] = sorted(
+            shapes.values(),
+            key=lambda row: (-int(row["count"]), row["shape"]),
+        )
+
+    return {
+        "summary": {
+            fmt: dict(sorted(reason_counts.items()))
+            for fmt, reason_counts in sorted(summary.items())
+        },
+        "by_shape": {
+            fmt: {
+                reason: rows
+                for reason, rows in sorted(reason_map.items())
+            }
+            for fmt, reason_map in sorted(shape_payload.items())
+        },
+        "records": sorted(
+            records,
+            key=lambda row: (
+                str(row.get("format", "")),
+                str(row.get("reason", "")),
+                int(row.get("out_features", 0) or 0),
+                int(row.get("in_features", 0) or 0),
+                str(row.get("qname", "")),
+            ),
+        ),
+    }
 
 
 _FUSED_SIBLING_MARKER = ".__siblings__."
@@ -518,16 +540,15 @@ def _scan_source_dtype_manifest(
     profile=None,
 ) -> dict[str, str]:
     """Classify source Linear weights as ``fp8`` or ``bf16`` for passthrough gating."""
-    del profile
     src = Path(model_path)
     idx_path = src / "model.safetensors.index.json"
-    if not idx_path.exists():
-        return {}
-    try:
-        with open(idx_path) as f:
-            weight_map = json.load(f).get("weight_map", {})
-    except Exception:
-        return {}
+    weight_map = {}
+    if idx_path.exists():
+        try:
+            with open(idx_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+        except Exception:
+            weight_map = {}
     bases: dict[str, set[str]] = {}
     for key in weight_map:
         for suffix in (".weight_scale_inv", ".weight"):
@@ -536,7 +557,30 @@ def _scan_source_dtype_manifest(
                 bases.setdefault(base, set()).add(suffix[1:])
                 break
 
-    def _to_live_name(ck_base: str) -> str:
+    def _strip_weight_suffix(name: str) -> str:
+        return name[:-7] if name.endswith(".weight") else name
+
+    def _to_recipe_name(ck_base: str) -> str:
+        weight_key = f"{ck_base}.weight"
+        if profile is not None:
+            mapper = getattr(profile, "checkpoint_to_live_name", None)
+            if callable(mapper):
+                try:
+                    live_param = mapper(weight_key, multimodal=False)
+                except TypeError:
+                    live_param = mapper(weight_key)
+                except Exception:
+                    live_param = None
+                if live_param is None:
+                    return ""
+                live_qname = _strip_weight_suffix(str(live_param))
+                recipe_mapper = getattr(profile, "live_to_recipe_name", None)
+                if callable(recipe_mapper):
+                    try:
+                        return str(recipe_mapper(live_qname))
+                    except Exception:
+                        return live_qname
+                return live_qname
         if (ck_base.startswith("model.visual.")
                 or ck_base.startswith("model.audio_tower.")
                 or ck_base.startswith("model.vision_tower.")
@@ -553,8 +597,26 @@ def _scan_source_dtype_manifest(
         if "weight" not in suffixes:
             continue
         source_kind = "fp8" if "weight_scale_inv" in suffixes else "bf16"
-        live_name = _to_live_name(base)
-        if not live_name:
+        recipe_name = _to_recipe_name(base)
+        if not recipe_name:
             continue
-        manifest[live_name] = source_kind
+        manifest[recipe_name] = source_kind
+    fp8_pairs = None
+    if profile is not None:
+        pairs_fn = getattr(profile, "fp8_scale_pairs", None)
+        if callable(pairs_fn):
+            try:
+                fp8_pairs = pairs_fn(model_path)
+            except Exception:
+                fp8_pairs = None
+    if fp8_pairs:
+        recipe_mapper = getattr(profile, "live_to_recipe_name", None)
+        for live_param in fp8_pairs:
+            live_qname = _strip_weight_suffix(str(live_param))
+            if callable(recipe_mapper):
+                try:
+                    live_qname = str(recipe_mapper(live_qname))
+                except Exception:
+                    pass
+            manifest[live_qname] = "fp8"
     return manifest

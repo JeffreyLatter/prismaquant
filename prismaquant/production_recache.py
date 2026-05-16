@@ -40,10 +40,7 @@ def _unify_fused_max_abs(
     for qname, value in max_abs.items():
         if value <= 0:
             continue
-        try:
-            group = fused_group_key(profile, qname) if profile else qname
-        except Exception:
-            group = qname
+        group = fused_group_key(profile, qname) if profile else qname
         groups.setdefault(group, []).append(qname)
 
     unified: dict[str, float] = {}
@@ -432,25 +429,11 @@ def main(argv: list[str] | None = None) -> int:
              "cache directory. Use when reusing a shared source cache for "
              "an ablation or smoke run.",
     )
-    parser.add_argument(
-        "--halo-mode",
-        choices=("off", "random"),
-        default="off",
-        help="Apply HALO to the model before production-weight replay. Must "
-        "match the ProductionWeightCache halo metadata.",
-    )
-    parser.add_argument(
-        "--halo-seed",
-        type=int,
-        default=0,
-        help="RNG seed for HALO random Hadamard sign diagonal.",
-    )
     args = parser.parse_args(argv)
 
-    from transformers import AutoConfig, AutoTokenizer
+    from transformers import AutoTokenizer
 
     from prismaquant.calibration_data import _dtype_from_name
-    from prismaquant.halo import apply_random_halo_to_model
     from prismaquant.model_profiles import DefaultProfile, detect_profile
     from prismaquant.perturbed_x_cache import load_text_model_under_work_root
     from prismaquant.sensitivity_probe import load_calibration
@@ -499,43 +482,6 @@ def main(argv: list[str] | None = None) -> int:
         profile = detect_profile(args.model)
     except Exception:
         profile = DefaultProfile()
-    cache_halo = dict((getattr(cache, "metadata", {}) or {}).get("halo", {}) or {})
-    cache_halo_mode = str(cache_halo.get("mode", "off"))
-    if args.halo_mode == "off":
-        if cache_halo_mode != "off":
-            raise RuntimeError(
-                "[prod-recache] production cache was rendered with "
-                f"HALO mode={cache_halo_mode!r}, but recache requested "
-                "--halo-mode off. Re-run with matching --halo-mode/seed."
-            )
-    else:
-        if cache_halo_mode != args.halo_mode:
-            raise RuntimeError(
-                "[prod-recache] production cache HALO mode mismatch: "
-                f"cache={cache_halo_mode!r} requested={args.halo_mode!r}")
-        if int(cache_halo.get("seed", -1)) != int(args.halo_seed):
-            raise RuntimeError(
-                "[prod-recache] production cache HALO seed mismatch: "
-                f"cache={cache_halo.get('seed')!r} requested={args.halo_seed!r}")
-        cfg = AutoConfig.from_pretrained(
-            args.model,
-            trust_remote_code=True,
-            local_files_only=Path(args.model).exists(),
-        )
-        _, halo_meta = apply_random_halo_to_model(
-            model,
-            profile,
-            cfg,
-            seed=args.halo_seed,
-            verbose=True,
-        )
-        for key in ("dim", "rotation_hash", "profile"):
-            expected = halo_meta.get(key)
-            actual = cache_halo.get(key)
-            if expected is not None and actual != expected:
-                raise RuntimeError(
-                    "[prod-recache] production cache HALO metadata mismatch "
-                    f"for {key}: cache={actual!r} expected={expected!r}")
     max_abs = recache_production_weight_cache(
         model,
         calib_ids,

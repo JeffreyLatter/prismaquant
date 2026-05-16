@@ -2,7 +2,7 @@
 
 Renders W_tilde[name, fmt] using the export pipeline's activation-aware
 passes (GPTQ damp-sweep + scale_sweep on NVFP4; activation-weighted scale
-search on MXFP8; passthrough on BF16) and saves a pickle that
+search on MXFP8/FP8; passthrough on BF16) and saves a pickle that
 PerturbedActivationCache can load via ``production_weight_cache=...``.
 
 By default this standalone CLI renders the explicit ``--formats`` menu for
@@ -28,6 +28,7 @@ into the configured streaming cache directory.
 from __future__ import annotations
 
 import argparse
+import os
 import pickle
 import shutil
 import time
@@ -124,7 +125,6 @@ def _fill_production_cache_streaming(
         _make_causal_mask,
     )
     from prismaquant.production_weight_cache import (
-        PRISMACLIP_FORMAT,
         ProductionWeightCache,
         _LinearActivationCollector,
         _cache_weight_filename,
@@ -132,6 +132,8 @@ def _fill_production_cache_streaming(
         _store_rendered_weight_entry,
         render_production_weight,
     )
+    # PRISMACLIP_FORMAT was removed from upstream; keep the literal for guard logic.
+    _PRISMACLIP_FORMAT = "NVFP4_CLIPPED"
     from prismaquant.streaming_model import _build_streaming_context
     from prismaquant import format_registry as fr
     from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
@@ -153,8 +155,8 @@ def _fill_production_cache_streaming(
 
     def _canon(fmt: str) -> str:
         fmt_u = str(fmt).strip().upper()
-        if fmt_u == PRISMACLIP_FORMAT:
-            return PRISMACLIP_FORMAT
+        if fmt_u == _PRISMACLIP_FORMAT:
+            return _PRISMACLIP_FORMAT
         return fr.canonical_format_name(fmt_u)
 
     requested_formats = tuple(
@@ -229,7 +231,7 @@ def _fill_production_cache_streaming(
                 skipped_list,
             )
 
-        activation_aware_formats = {"NVFP4", PRISMACLIP_FORMAT}
+        activation_aware_formats = {"NVFP4", _PRISMACLIP_FORMAT}
         if bool(levers.get("scale_sweep", True)):
             activation_aware_formats.update({"MXFP8", "MXFP8_E4M3"})
         qnames_needing_activation: set[str] = {
@@ -565,9 +567,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--formats",
         default="NVFP4",
-        help="Comma-separated formats to render. MXFP8 / BF16 cache is "
-        "cheap compared with NVFP4, but MXFP8 still benefits from "
-        "activation-weighted scale search when scale_sweep is enabled.",
+        help="Comma-separated formats to render. MXFP8 / FP8 / BF16 cache "
+        "is cheap compared with NVFP4, but MXFP8 and FP8 still benefit "
+        "from activation-weighted scale search when scale_sweep is enabled.",
     )
     p.add_argument(
         "--render-scope",
@@ -607,25 +609,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--enable",
-        default="gptq,scale_sweep",
+        default="gptq,joint_scale_opt",
         help="Comma-separated levers to enable. Currently honored: "
-        "{gptq, scale_sweep, act_clip_solver, fisher_gptq, fisher_clip, "
-        "awq, smoothquant}.  "
-        "act_clip_solver is PrismaClip, the production-rendered NVFP4 "
-        "activation clipping solver. Requesting the internal "
-        "NVFP4_CLIPPED cache format renders PrismaClip as a separate "
-        "cache variant; layer configs still use ordinary NVFP4. "
-        "fisher_clip is PrismaFisherClip: it "
-        "uses h-detail per-token Fisher weights to audit clip candidates "
-        "without enabling Fisher-weighted GPTQ; set "
-        "PRISMAQUANT_PRISMAFISHERCLIP_MODE=veto or score for explicit "
-        "ablations. "
-        "AWQ and SmoothQuant require --render-scope=assignment because the "
-        "fold scale is tied to the concrete format assignment.  Joint NVFP4 "
-        "sibling globals + calibrated "
-        "input_global_scale are computed unconditionally when NVFP4 is in "
-        "the format menu. NVFP4 block scaling follows "
-        "PRISMAQUANT_NVFP4_SCALE_RULE.",
+        "{none, gptq, joint_scale_opt}. "
+        "Use none for RTN-only rendering with no local production levers. "
+        "Default `gptq,joint_scale_opt` ships GPTQ (with the always-on "
+        "per-Linear damp sweep) plus JSO. "
+        "scale_sweep regresses end-to-end KL on Qwen3-4B and was dropped "
+        "from defaults 2026-05-15. "
+        "static_act_order (SAO) and fisher_gptq are archived legacy names "
+        "and must not be used for V1 production artifacts. "
+        "Joint NVFP4 sibling globals + calibrated input_global_scale are "
+        "computed unconditionally when NVFP4 is in the format menu. "
+        "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
+    )
+    p.add_argument(
+        "--disable",
+        default="",
+        help="Comma-separated levers to FORCE off (overrides defaults). "
+        "Use this to run RTN-only ablations, e.g. --disable gptq,scale_sweep.",
     )
     p.add_argument(
         "--allow-incomplete",
@@ -650,19 +652,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional h-detail directory from incremental_probe. When "
         "'fisher_gptq' is enabled, g2_per_token vectors from this directory "
-        "weight NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives. "
-        "When 'fisher_clip' is enabled, they weight PrismaClip candidate "
-        "scoring only.",
+        "weight NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives.",
     )
     p.add_argument(
         "--skip-qnames",
         nargs="*",
-        default=["lm_head"],
+        default=None,
         help="Substrings on qname components that should be EXCLUDED from "
-        "the cache fill.  Default: lm_head — we always pin it to BF16 in "
-        "polish (vLLM ParallelLMHead constraint), so a NVFP4 cache entry "
-        "is unused.  Excluding lm_head also avoids the OOM-prone last "
-        "render on big models with linear-attention forward fallbacks.",
+        "the cache fill. Default: the active model profile's pinned_names "
+        "(typically lm_head/head). Pass --skip-qnames with no values to "
+        "disable this skip.",
     )
     p.add_argument(
         "--recache-layer-config",
@@ -699,6 +698,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
+    # Opt-in deterministic CUDA path. The default lever ablations on small
+    # models show ~2-4% per-Linear weight variance across re-runs of the
+    # same configuration, driven by non-deterministic CUDA reduction order
+    # inside the GPTQ Cholesky + U-update. Enable
+    # PRISMAQUANT_DETERMINISTIC=1 to force bit-reproducible builds at a
+    # ~5-15% throughput cost. Required for any A/B comparison where the
+    # expected gain is comparable to or smaller than the noise floor.
+    if os.environ.get("PRISMAQUANT_DETERMINISTIC", "0").lower() in {"1", "true", "yes"}:
+        import torch as _torch_det
+        # cuBLAS workspace fix is the main lever for deterministic matmul
+        # reductions; torch.use_deterministic_algorithms(True) additionally
+        # forces some kernels into slow paths that produce numerically
+        # different results — those differences then cascade into NaN KL
+        # downstream even though per-Linear MSE looks healthy. Keep only
+        # the cuBLAS workspace + seeded RNGs for now.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        _torch_det.manual_seed(int(args.calib_seed))
+        if _torch_det.cuda.is_available():
+            _torch_det.cuda.manual_seed_all(int(args.calib_seed))
+        print(
+            f"[build-prod-cache] deterministic mode ON "
+            f"(CUBLAS_WORKSPACE_CONFIG={os.environ['CUBLAS_WORKSPACE_CONFIG']}, "
+            f"seed={args.calib_seed}, use_deterministic_algorithms=False)",
+            flush=True,
+        )
+
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     output_path = Path(args.output)
@@ -709,6 +734,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             x.strip() for x in args.enable.split(",")
         ) if name
     }
+    for name in (x.strip() for x in args.disable.split(",")):
+        if name:
+            levers[name] = False
 
     dtype = _dtype_from_name(args.dtype)
     staged, cleanup = stage_multimodal(args.model)
@@ -910,10 +938,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 h_detail_dir=args.h_detail_dir,
             )
         elapsed = time.monotonic() - t0
-        meta = dict(getattr(cache, "metadata", {}) or {})
-        meta["halo"] = halo_meta
-        cache.metadata = meta
-
         # Strict coverage validation: every (qname, NVFP4) must be present
         # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky
         # failures, and any other silent gaps that would otherwise fall

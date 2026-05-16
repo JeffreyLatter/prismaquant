@@ -217,26 +217,61 @@ def should_always_skip(name: str) -> bool:
     return False
 
 
-def is_fused_moe_experts(module) -> bool:
-    """True if this module is a fused-experts container (Qwen3.5 MoE style)."""
-    return type(module).__name__ in ("Qwen3_5MoeExperts", "Qwen35MoeExperts")
+def is_fused_moe_experts(module, profile=None) -> bool:
+    """Legacy fallback for profile-declared fused-experts containers."""
+    getter = getattr(profile, "packed_expert_module_class_names", None)
+    if not callable(getter):
+        return False
+    try:
+        names = getter()
+    except Exception:
+        return False
+    return type(module).__name__ in set(str(name) for name in names)
 
 
-def iter_quantizable_tensors(model):
+def _packed_expert_param_names_for_module(module, profile=None) -> list[str]:
+    names = _packed_experts_param_names(module, profile)
+    if names:
+        return names
+    if not is_fused_moe_experts(module, profile):
+        return []
+    if profile is None:
+        try:
+            from prismaquant.model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            return sorted(profile.packed_expert_param_names())
+        except Exception:
+            pass
+    return []
+
+
+def iter_quantizable_tensors(model, profile=None):
     """Yield (full_name, module, param_attr) for each quantizable weight.
     Caller uses module.{param_attr}.data to read, and can REPLACE the data
     attribute to free storage. Handles nn.Linear and 3D packed MoE experts."""
+    if profile is None:
+        try:
+            from prismaquant.model_profiles import profile_from_model
+            profile = profile_from_model(model)
+        except Exception:
+            profile = None
     for name, mod in model.named_modules():
         # Regular nn.Linear
         if isinstance(mod, nn.Linear) and mod.weight.numel() >= 1000:
             if should_always_skip(name):
                 continue
             yield (f"{name}.weight", mod, "weight")
-        # Packed MoE experts (for example gate_up_proj/down_proj, w1/w2/w3).
-        elif _is_packed_experts_module(mod) or is_fused_moe_experts(mod):
-            param_names = _packed_experts_param_names(mod)
-            if not param_names and is_fused_moe_experts(mod):
-                param_names = ["gate_up_proj", "down_proj"]
+        # Packed MoE experts. The profile/spec owns the accepted parameter
+        # names; legacy class-name fallback only exists for old runtimes.
+        elif (
+            _is_packed_experts_module(mod, profile)
+            or is_fused_moe_experts(mod, profile)
+        ):
+            param_names = _packed_expert_param_names_for_module(mod, profile)
             for param_name in param_names:
                 if not hasattr(mod, param_name):
                     continue
@@ -432,6 +467,11 @@ def main():
         )
         tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
         device = next(model.parameters()).device
+        try:
+            from prismaquant.model_profiles import detect_profile
+            profile = detect_profile(args.model)
+        except Exception:
+            profile = None
         print(f"[rtn-cache]   {sum(p.numel() for p in model.parameters()):,} params", flush=True)
 
         # Stage 1: reference log probs
@@ -454,7 +494,7 @@ def main():
             nonlocal model
             print(f"[rtn-cache] RTN-{quantizer_name} pass: quantize in place", flush=True)
             n_quantized = 0
-            for full_name, mod, attr in iter_quantizable_tensors(model):
+            for full_name, mod, attr in iter_quantizable_tensors(model, profile):
                 t = getattr(mod, attr).data
                 q = quantize_fn(t)
                 getattr(mod, attr).data.copy_(q)
@@ -495,7 +535,7 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            for full_name, mod, attr in iter_quantizable_tensors(model):
+            for full_name, mod, attr in iter_quantizable_tensors(model, profile):
                 param = getattr(mod, attr)
                 t = param.data.cpu().clone()
                 shard_dict[full_name] = t

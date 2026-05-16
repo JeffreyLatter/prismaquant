@@ -1,0 +1,136 @@
+{
+  "schema": "prismaquant.model_structure.v1",
+  "id": "qwen3_5",
+  "default_serving_profile": "vllm_packed_moe",
+  "runtime_requirements": {
+    "fast_kernel_packages": [
+      {
+        "module": "causal_conv1d",
+        "package": "causal-conv1d (Dao-AILab/causal-conv1d)"
+      },
+      {
+        "module": "fla",
+        "package": "flash-linear-attention (fla-org/flash-linear-attention)"
+      }
+    ]
+  },
+  "match": {
+    "model_type": [
+      "qwen3_5_moe",
+      "qwen3_5_moe_text",
+      "qwen3_5",
+      "qwen3_6_moe",
+      "qwen3_6_moe_text",
+      "qwen3_6"
+    ],
+    "architectures": ["Qwen3_5*", "Qwen3.5*", "Qwen3_6*", "Qwen3.6*"]
+  },
+  "staging": {
+    "text_only_strip_keys": [
+      "vision_config",
+      "audio_config",
+      "speech_config",
+      "image_token_id",
+      "video_token_id",
+      "vision_start_token_id",
+      "vision_end_token_id"
+    ],
+    "promote_inner_model_type": true
+  },
+  "shard_regexes": {
+    "visual_config_key": "vision_config",
+    "visual_layer_prefix": "model.visual.blocks",
+    "mtp_extra_linear_names": ["mtp.fc"]
+  },
+  "naming": {
+    "live_to_recipe": [
+      {
+        "strip_prefix": "model.language_model.",
+        "add_prefix": "model."
+      }
+    ],
+    "recipe_to_source": [
+      {
+        "prefix": "mtp.",
+        "replace": "mtp.",
+        "stop": true
+      },
+      {
+        "prefix": "model.visual.",
+        "replace": "model.visual.",
+        "stop": true
+      },
+      {
+        "prefix": "model.language_model.",
+        "replace": "model.language_model.",
+        "stop": true
+      },
+      {
+        "prefix": "model.",
+        "replace": "model.language_model."
+      }
+    ],
+    "recipe_to_vllm": [
+      {
+        "prefix": "mtp.",
+        "replace": "mtp.",
+        "stop": true
+      },
+      {
+        "exact": "lm_head",
+        "replace": "language_model.lm_head",
+        "stop": true
+      },
+      {
+        "prefix": "model.visual.",
+        "replace": "visual.",
+        "stop": true
+      },
+      {
+        "prefix": "model.language_model.",
+        "replace": "language_model.model."
+      },
+      {
+        "prefix": "model.",
+        "replace": "language_model.model."
+      }
+    ]
+  },
+  "fused_groups": [
+    {
+      "target": "self_attn.qkv_proj",
+      "members": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    },
+    {
+      "target": "mlp.gate_up_proj",
+      "members": ["mlp.gate_proj", "mlp.up_proj"]
+    },
+    {
+      "target": "linear_attn.in_proj_qkvz",
+      "members": ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"]
+    },
+    {
+      "target": "linear_attn.in_proj_ba",
+      "members": ["linear_attn.in_proj_b", "linear_attn.in_proj_a"]
+    }
+  ],
+  "packed_experts": {
+    "param_names": ["gate_up_proj", "down_proj"],
+    "module_class_names": ["Qwen3_5MoeExperts", "Qwen35MoeExperts"],
+    "split_for_formats": ["*"],
+    "projection_splits": {
+      "gate_up_proj": ["gate_proj", "up_proj"]
+    },
+    "format_groups": [
+      ["gate_up_proj", "down_proj"],
+      ["gate_proj", "up_proj", "down_proj"],
+      ["w1", "w2", "w3"]
+    ]
+  },
+  "moe": {
+    "per_expert_regex": "re:^language_model[.]model[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$",
+    "per_expert_mtp_regex": "re:^mtp[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$"
+  },
+  "passthrough_prefixes": ["model.visual.", "mtp."],
+  "pinned_names": ["lm_head"]
+}

@@ -78,18 +78,13 @@ except ModuleNotFoundError:
 from safetensors.torch import save_file
 
 from .allocator_candidates import check_format_applicability
-from .expert_prune import raise_expert_prune_disabled
+from .serving_profiles import resolve_target_profile
 from .layer_config import (
     canonicalize_assignment as _canonicalize_assignment,
     canonicalize_format,
 )
 from .model_profiles.qwen3_5 import Qwen3_5Profile
-from .schemas import validate_layer_config_payload, validate_prune_manifest_payload
-from .awq import (
-    AwqSearchTarget,
-    legacy_activation_awq_scale,
-    search_awq_scale,
-)
+from .schemas import validate_layer_config_payload
 
 # ---------------------------------------------------------------------------
 # NVFP4 packing (inlined from compressed-tensors fp4_quantized.py to avoid
@@ -102,6 +97,7 @@ FP8_E4M3_MAX = 448.0  # max representable in torch.float8_e4m3fn
 NVFP4_SCALE_RULE_ENV = "PRISMAQUANT_NVFP4_SCALE_RULE"
 NVFP4_SCALE_RULE_STATIC_6 = "static_6"
 NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE = "four_over_six_mse"
+NVFP4_SCALE_RULE_JOINT_MSE = "joint_mse"
 _NVFP4_SCALE_RULE_ALIASES = {
     "": NVFP4_SCALE_RULE_STATIC_6,
     "default": NVFP4_SCALE_RULE_STATIC_6,
@@ -114,6 +110,12 @@ _NVFP4_SCALE_RULE_ALIASES = {
     "four_over_six": NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
     "four_over_six_mse": NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
     "mse": NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+    "joint": NVFP4_SCALE_RULE_JOINT_MSE,
+    "joint_mse": NVFP4_SCALE_RULE_JOINT_MSE,
+    "joint_scale": NVFP4_SCALE_RULE_JOINT_MSE,
+    "joint_scale_opt": NVFP4_SCALE_RULE_JOINT_MSE,
+    "joint_scale_optimization": NVFP4_SCALE_RULE_JOINT_MSE,
+    "codebook_mse": NVFP4_SCALE_RULE_JOINT_MSE,
 }
 
 # Back-compat exports for unit tests that validate the Qwen3.5 naming
@@ -157,6 +159,8 @@ def resolve_nvfp4_scale_rule(raw: str | None = None) -> str:
     16-value block maps its maximum magnitude to FP4 code ±6.  FourOverSix
     evaluates max-to-6 and max-to-4 and keeps the lower block-MSE scale while
     preserving the same NVFP4 on-disk schema and vLLM runtime kernel.
+    ``joint_mse`` extends that packer-compatible candidate set to every
+    positive NVFP4 codebook level, making FourOverSix a strict subset.
     """
     if raw is None:
         raw = os.environ.get(NVFP4_SCALE_RULE_ENV, NVFP4_SCALE_RULE_STATIC_6)
@@ -164,9 +168,11 @@ def resolve_nvfp4_scale_rule(raw: str | None = None) -> str:
     try:
         return _NVFP4_SCALE_RULE_ALIASES[key]
     except KeyError as exc:
-        allowed = ", ".join(
-            sorted({NVFP4_SCALE_RULE_STATIC_6, NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE})
-        )
+        allowed = ", ".join(sorted({
+            NVFP4_SCALE_RULE_STATIC_6,
+            NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+            NVFP4_SCALE_RULE_JOINT_MSE,
+        }))
         raise ValueError(
             f"unsupported {NVFP4_SCALE_RULE_ENV}={raw!r}; "
             f"expected one of: {allowed}"
@@ -202,6 +208,35 @@ def _nvfp4_mse_for_group_scale(
     return (grouped - dq).pow(2).sum(dim=-1)
 
 
+def _nvfp4_best_max_to_level_scale(
+    grouped: torch.Tensor,
+    levels: Sequence[float],
+) -> torch.Tensor:
+    """Pick the best max-to-codebook-level scale for each NVFP4 group.
+
+    ``four_over_six_mse`` is the two-level subset ``levels=(6, 4)``. The
+    joint scale rule extends that candidate set while staying final-pack
+    compatible because every chosen scale is ``max_abs / codebook_level``.
+    """
+
+    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
+    best_scale: torch.Tensor | None = None
+    best_mse: torch.Tensor | None = None
+    for level in levels:
+        scale = max_abs / float(level)
+        mse = _nvfp4_mse_for_group_scale(grouped, scale)
+        if best_mse is None:
+            best_mse = mse
+            best_scale = scale
+            continue
+        take = mse < best_mse
+        best_mse = torch.where(take, mse, best_mse)
+        assert best_scale is not None
+        best_scale = torch.where(take, scale, best_scale)
+    assert best_scale is not None
+    return best_scale
+
+
 def _select_nvfp4_group_scales(
     grouped: torch.Tensor,
     *,
@@ -223,11 +258,159 @@ def _select_nvfp4_group_scales(
     if rule == NVFP4_SCALE_RULE_STATIC_6:
         return scale_6
     if rule == NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE:
-        scale_4 = max_abs / 4.0
-        mse_6 = _nvfp4_mse_for_group_scale(grouped, scale_6)
-        mse_4 = _nvfp4_mse_for_group_scale(grouped, scale_4)
-        return torch.where(mse_4 < mse_6, scale_4, scale_6)
+        return _nvfp4_best_max_to_level_scale(grouped, (6.0, 4.0))
+    if rule == NVFP4_SCALE_RULE_JOINT_MSE:
+        return _nvfp4_best_max_to_level_scale(
+            grouped,
+            (6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.5),
+        )
     raise AssertionError(f"unhandled NVFP4 scale rule: {rule!r}")
+
+
+_NVFP4_JOINT_SCALE_LEVELS = (6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.5)
+
+
+def _env_int_clamped(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = int(default)
+    return max(int(lo), min(int(hi), int(value)))
+
+
+def _nvfp4_effective_scale_from_real(
+    scale_real: torch.Tensor,
+    global_real: torch.Tensor,
+    *,
+    quantize_fp8: bool,
+) -> torch.Tensor:
+    fp8_scale_real = (
+        scale_real / global_real.to(scale_real.device, dtype=torch.float32)
+    ).clamp(0, FP8_E4M3_MAX)
+    if quantize_fp8:
+        fp8_scale_real = fp8_scale_real.to(torch.float8_e4m3fn).to(torch.float32)
+    return (fp8_scale_real * global_real.to(scale_real.device, dtype=torch.float32)
+            ).clamp_min(1e-12)
+
+
+def _nvfp4_quant_dequant_with_eff_scale(
+    values: torch.Tensor,
+    eff_scale: torch.Tensor,
+) -> torch.Tensor:
+    in_grid = (values / eff_scale.clamp_min(1e-12)).clamp(
+        -NVFP4_MAX,
+        NVFP4_MAX,
+    )
+    fp4_idx = _round_to_codebook(in_grid)
+    cb = _nvfp4_codebook(values.device, dtype=torch.float32)
+    abs_idx = fp4_idx & 0x7
+    sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
+    return sign * cb[abs_idx] * eff_scale
+
+
+def _select_nvfp4_joint_gptq_eff_scale(
+    grouped: torch.Tensor,
+    global_real: torch.Tensor,
+    *,
+    col_importance: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return GPTQ-time effective scales for Lift-style joint scale search.
+
+    Candidate group scales include max-to-6 and max-to-4, so FourOverSix is a
+    strict subset. Additional max-to-codebook-level choices keep the output
+    representable by the same NVFP4 compressed-tensors metadata when the
+    final packer uses ``joint_mse``.
+    """
+
+    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
+    weight = None
+    if col_importance is not None:
+        weight = col_importance.to(grouped.device, dtype=torch.float32)
+        view_shape = (1,) * (grouped.dim() - 1) + (grouped.shape[-1],)
+        weight = weight.reshape(view_shape)
+
+    best_scale: torch.Tensor | None = None
+    best_mse: torch.Tensor | None = None
+    for level in _NVFP4_JOINT_SCALE_LEVELS:
+        scale = max_abs / float(level)
+        eff = _nvfp4_effective_scale_from_real(
+            scale,
+            global_real,
+            quantize_fp8=True,
+        )
+        dq = _nvfp4_quant_dequant_with_eff_scale(grouped, eff.unsqueeze(-1))
+        err = (grouped - dq).pow(2)
+        if weight is not None:
+            err = err * weight
+        mse = err.sum(dim=-1)
+        if best_mse is None:
+            best_mse = mse
+            best_scale = eff
+            continue
+        take = mse < best_mse
+        best_mse = torch.where(take, mse, best_mse)
+        assert best_scale is not None
+        best_scale = torch.where(take, eff, best_scale)
+    assert best_scale is not None
+    return best_scale.clamp_min(1e-12)
+
+
+def _optimize_nvfp4_joint_global_real(
+    weight: torch.Tensor,
+    *,
+    group_size: int,
+    base_global_real: torch.Tensor,
+) -> torch.Tensor:
+    """Choose a tensor global scale jointly with group-scale candidates.
+
+    The search is deliberately small and opt-in. It scores candidate tensor
+    globals after FP8 realization of group scales, chunking rows so large
+    Linears do not materialize a candidate dimension over the full weight.
+    """
+
+    grid = _env_int_clamped(
+        "PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_GRID",
+        5,
+        1,
+        33,
+    )
+    if grid <= 1:
+        return base_global_real.clamp_min(1e-12)
+    span_lo = float(os.environ.get(
+        "PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_SPAN_LO",
+        "0.75",
+    ))
+    span_hi = float(os.environ.get(
+        "PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_SPAN_HI",
+        "1.25",
+    ))
+    if not math.isfinite(span_lo) or span_lo <= 0.0:
+        span_lo = 0.75
+    if not math.isfinite(span_hi) or span_hi < span_lo:
+        span_hi = max(span_lo, 1.25)
+    W = weight.to(torch.float32)
+    rows, cols = W.shape
+    grouped = W.reshape(rows, cols // group_size, group_size)
+    candidates = (
+        base_global_real.to(W.device, dtype=torch.float32).reshape(())
+        * torch.linspace(span_lo, span_hi, grid, device=W.device, dtype=torch.float32)
+    ).clamp_min(1e-12)
+
+    n_groups = cols // group_size
+    bytes_per_row = max(1, n_groups * group_size * 4 * 4)
+    row_chunk = min(rows, max(1, (512 * 1024 * 1024) // bytes_per_row))
+    scores = torch.zeros((grid,), device=W.device, dtype=torch.float64)
+    for idx, global_real in enumerate(candidates):
+        total = torch.zeros((), device=W.device, dtype=torch.float64)
+        for r0 in range(0, rows, row_chunk):
+            r1 = min(r0 + row_chunk, rows)
+            chunk = grouped[r0:r1]
+            eff = _select_nvfp4_joint_gptq_eff_scale(chunk, global_real)
+            dq = _nvfp4_quant_dequant_with_eff_scale(chunk, eff.unsqueeze(-1))
+            total = total + (chunk - dq).pow(2).sum().to(torch.float64)
+        scores[idx] = total
+    best = int(scores.argmin().item())
+    return candidates[best].reshape(()).clamp_min(1e-12)
 
 
 def _round_to_codebook(values_in_grid: torch.Tensor) -> torch.Tensor:
@@ -253,8 +436,6 @@ def _round_to_codebook(values_in_grid: torch.Tensor) -> torch.Tensor:
 
 def _canonical_export_format(fmt: str) -> str:
     fmt_u = str(fmt).upper()
-    if fmt_u == "NVFP4_CLIPPED":
-        return "NVFP4"
     if fmt_u == "MXFP8_E4M3":
         return "MXFP8"
     return fmt
@@ -274,34 +455,11 @@ def _resolve_act_clip_quantile(default: str = "0.999") -> float | None:
 
 def _normalize_act_clip_rescale(mode: str | None) -> str:
     if mode is None:
-        mode = os.environ.get("PRISMAQUANT_ACT_CLIP_RESCALING", "none")
+        mode = "none"
     normalized = str(mode).strip().lower().replace("-", "_")
     if normalized in {"", "0", "false", "no", "off", "none"}:
         return "none"
-    if normalized in {"rbc", "row_rms", "row_l2", "rms"}:
-        raise RuntimeError(
-            "PrismaClip-RBC activation rescaling is disabled pending "
-            "investigation: the 2026-05-12 Qwen3.5-0.8B smoke regressed KL "
-            "and was about 10x slower in production-cache fill."
-        )
-    if normalized in {"row_mean_abs", "mean_abs", "l1"}:
-        raise RuntimeError(
-            "PrismaClip-RBC activation rescaling is disabled pending "
-            "investigation: the 2026-05-12 Qwen3.5-0.8B smoke regressed KL "
-            "and was about 10x slower in production-cache fill."
-        )
-    raise ValueError(
-        f"unknown activation clip rescale mode {mode!r}; "
-        "expected none, row_rms, or row_mean_abs"
-    )
-
-
-def _act_clip_rescale_max(default: float = 8.0) -> float:
-    try:
-        value = float(os.environ.get("PRISMAQUANT_ACT_CLIP_RBC_MAX_RESCALE", default))
-    except Exception:
-        value = default
-    return max(1.0, min(float(value), 1024.0))
+    raise ValueError("activation clip rescaling is not supported")
 
 
 def _rescale_clipped_activation_matrix(
@@ -310,28 +468,11 @@ def _rescale_clipped_activation_matrix(
     *,
     mode: str,
 ) -> torch.Tensor:
-    """Rescale clipped activation rows for PrismaClip-RBC.
-
-    Row-RMS mode preserves each row's pre-clipping energy after clamping its
-    extremes. This keeps outlier rows visible to the optimizer while reducing
-    the dominance of the outlier channel itself. The cap prevents a heavily
-    clipped row from being amplified into a new pathological objective.
-    """
+    """Return clipped activations, rejecting retired row-rescale modes."""
     mode = _normalize_act_clip_rescale(mode)
     if mode == "none" or original.numel() == 0:
         return clipped
-    if mode == "row_rms":
-        orig_stat = original.pow(2).mean(dim=1, keepdim=True).sqrt()
-        clip_stat = clipped.pow(2).mean(dim=1, keepdim=True).sqrt()
-    elif mode == "row_mean_abs":
-        orig_stat = original.abs().mean(dim=1, keepdim=True)
-        clip_stat = clipped.abs().mean(dim=1, keepdim=True)
-    else:
-        raise ValueError(f"unsupported activation clip rescale mode {mode!r}")
-    scale = orig_stat / clip_stat.clamp_min(1e-12)
-    scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0)
-    scale = scale.clamp(min=1.0, max=_act_clip_rescale_max())
-    return clipped * scale
+    raise ValueError("activation clip rescaling is not supported")
 
 
 def _activation_matrix_for_gptq(
@@ -483,7 +624,7 @@ _INPUT_GLOBAL_SCALES: dict[str, float] | None = None
 
 # Module-level raw-activation cache populated by main() when
 # --activation-cache-dir is provided AND any of the activation-aware
-# passes (--awq / --gptq / --act-weighted-round) is enabled. Keyed
+# passes (--gptq / --act-weighted-round / --scale-sweep) are enabled. Keyed
 # by recipe name; values are 2D `[N, in_features]` float32 tensors
 # (lazily upcast from the on-disk bfloat16 for numerical stability
 # during Hessian + per-channel stats). None means "not loaded".
@@ -604,8 +745,6 @@ def _activation_index_fingerprint(index, cache_dir: Path) -> dict[str, object]:
 
 def _production_cache_format_candidates(fmt: str) -> tuple[str, ...]:
     fmt_u = str(fmt).upper()
-    if fmt_u == "NVFP4_CLIPPED":
-        return ("NVFP4_CLIPPED",)
     if fmt_u == "MXFP8":
         return ("MXFP8", "MXFP8_E4M3")
     if fmt_u == "MXFP8_E4M3":
@@ -637,36 +776,6 @@ def _production_cache_lookup_key(name: str, fmt: str):
             if key in weights:
                 return key
     return None
-
-
-def _load_production_cache_variant_map(path: str | None) -> dict[str, str]:
-    if not path:
-        return {}
-    with open(path) as fh:
-        payload = json.load(fh)
-    if not isinstance(payload, dict):
-        raise ValueError("--production-cache-variant-map must contain a JSON object")
-    raw = payload.get("chosen_cache_variants")
-    if raw is None:
-        numeric = payload.get("numeric_variants")
-        if isinstance(numeric, dict):
-            raw = numeric.get("chosen_cache_variants")
-    if raw is None:
-        raw = payload
-    if not isinstance(raw, dict):
-        raise ValueError(
-            "--production-cache-variant-map must be a qname->cache-format map "
-            "or a probe payload containing chosen_cache_variants"
-        )
-    out: dict[str, str] = {}
-    for qname, fmt in raw.items():
-        q = str(qname).strip()
-        f = str(fmt).strip().upper()
-        if not q or not f:
-            continue
-        out[q] = f
-    return out
-
 
 def _production_cache_expected_keys(
     assignment: dict[str, str],
@@ -741,7 +850,6 @@ def _production_cache_fingerprint(
         "hash": digest,
         "activation_max_abs_hash": act_digest,
         "metadata_hash": metadata_digest,
-        "halo": metadata.get("halo", {"mode": "off"}),
         "levers": dict(getattr(cache, "levers", {}) or {}),
     }
 
@@ -756,47 +864,11 @@ def _production_cache_scales(cache) -> dict[str, float]:
     return _unify_input_global_scales_across_fused_siblings(scales)
 
 
-def _production_cache_awq_scale(
-    cache,
-    name: str,
-    *,
-    width: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    scales = getattr(cache, "awq_scales", None) or {}
-    for cand in _production_cache_name_candidates(name):
-        scale = scales.get(cand)
-        if scale is None:
-            continue
-        if not isinstance(scale, torch.Tensor):
-            try:
-                scale = torch.as_tensor(scale)
-            except Exception:
-                continue
-        if scale.numel() != int(width):
-            continue
-        return scale.to(device=device, dtype=torch.float32).clamp_min(1e-12)
-    return None
-
-
-def _production_cache_fold_scale_enabled(cache) -> bool:
-    """Whether a production cache needs predecessor fold scales at export.
-
-    AWQ and SmoothQuant both store their precomputed per-channel fold scales in
-    `ProductionWeightCache.awq_scales`. The name is historical; export only
-    cares that a norm-predecessor fold was solved and must be materialized.
-    """
-    if cache is None:
-        return False
-    if not bool(getattr(cache, "awq_scales", None)):
-        return False
-    levers = getattr(cache, "levers", {}) or {}
-    return bool(levers.get("awq", False) or levers.get("smoothquant", False))
-
 
 def _source_weight_shape_for_recipe(
     src_model: str,
     recipe_key: str,
+    profile=None,
 ) -> list[int] | None:
     idx_path = Path(src_model) / "model.safetensors.index.json"
     if not idx_path.exists():
@@ -804,6 +876,10 @@ def _source_weight_shape_for_recipe(
     with open(idx_path) as f:
         weight_map = json.load(f).get("weight_map", {})
     candidates = [recipe_key + ".weight"]
+    if profile is not None:
+        source_name = profile.source_tensor_name(recipe_key)
+        candidates.append(source_name + ".weight")
+        candidates.append(profile.source_tensor_name(recipe_key + ".weight"))
     if recipe_key.startswith("model."):
         candidates.append(
             "model.language_model." + recipe_key[len("model."):] + ".weight"
@@ -821,32 +897,37 @@ def _source_weight_shape_for_recipe(
 def _coerce_runtime_legal_assignment(
     src_model: str,
     assignment: dict[str, str],
-) -> tuple[dict[str, str], list[tuple[str, list[int]]]]:
+    profile=None,
+) -> tuple[dict[str, str], list[tuple[str, list[int], str]]]:
     """Adjust assignments that the target runtime cannot execute.
 
-    vLLM's current FlashInfer MXFP8 linear kernel requires output
-    dimension >= 128. Qwen3.6's GDN linear-attention in_proj_a/b shards can be
-    96-wide; exporting those as MXFP8 produces a checkpoint that loads but
-    fails on vLLM's profile run. BF16 is conservative for quality and keeps
-    the runtime contract explicit.
+    Shape and format legality comes from serving-profile config. BF16 is the
+    conservative runtime fallback when an assigned format is not executable.
     """
     out = dict(assignment)
-    coerced: list[tuple[str, list[int]]] = []
+    coerced: list[tuple[str, list[int], str]] = []
+    target_profile = _allocator_target_profile_for_audit(profile) or "research"
     for qname, fmt in assignment.items():
-        if _canonical_export_format(fmt) != "MXFP8":
+        fmt_canonical = _canonical_export_format(fmt)
+        if fmt_canonical == "BF16":
             continue
-        shape = _source_weight_shape_for_recipe(src_model, qname)
+        if fmt_canonical not in FORMAT_SCHEME:
+            shape = _source_weight_shape_for_recipe(src_model, qname, profile)
+            out[qname] = "BF16"
+            coerced.append((qname, shape or [], fmt_canonical))
+            continue
+        shape = _source_weight_shape_for_recipe(src_model, qname, profile)
         if shape is None or len(shape) != 2:
             continue
         verdict = check_format_applicability(
             tuple(shape),
-            "MXFP8",
+            fmt,
             qname=qname,
-            target_profile="research",
+            target_profile=target_profile,
         )
         if not verdict.legal:
             out[qname] = "BF16"
-            coerced.append((qname, shape))
+            coerced.append((qname, shape, fmt_canonical))
     return out, coerced
 
 
@@ -861,7 +942,7 @@ def _bf16_upgrade_audit(
     src_model: str,
     assignment: dict[str, str],
     bf16_passthrough: set[str],
-    runtime_coerced: Sequence[tuple[str, list[int]]],
+    runtime_coerced: Sequence[tuple],
     profile,
 ) -> dict[str, object]:
     """Classify BF16 entries by immutability, runtime gates, or allocation.
@@ -871,7 +952,14 @@ def _bf16_upgrade_audit(
     format support, and which are real numerical/budget choices where enhanced
     MXFP8/FP8 may be worth trying next.
     """
-    coerced = {name: shape for name, shape in runtime_coerced}
+    coerced: dict[str, tuple[list[int], str]] = {}
+    for row in runtime_coerced:
+        if len(row) >= 3:
+            name, shape, from_fmt = row[:3]
+        else:
+            name, shape = row[:2]
+            from_fmt = "MXFP8"
+        coerced[str(name)] = (shape, str(from_fmt))
     target_profile = _allocator_target_profile_for_audit(profile)
     candidate_formats = ("MXFP8_E4M3", "MXFP8_E5M2", "FP8_E4M3", "FP8_E5M2")
     entries: list[dict[str, object]] = []
@@ -880,12 +968,20 @@ def _bf16_upgrade_audit(
     for qname, fmt in sorted(assignment.items()):
         if _canonical_export_format(fmt) != "BF16":
             continue
-        shape = coerced.get(qname) or _source_weight_shape_for_recipe(src_model, qname)
+        coerced_entry = coerced.get(qname)
+        shape = (
+            coerced_entry[0]
+            if coerced_entry is not None
+            else _source_weight_shape_for_recipe(src_model, qname, profile)
+        )
         shape_tuple = tuple(shape) if shape is not None else None
         if qname in bf16_passthrough:
             reason = "passthrough_or_immutable"
-        elif qname in coerced:
-            reason = "runtime_coerced_from_mxfp8"
+        elif coerced_entry is not None:
+            reason = (
+                "runtime_coerced_from_"
+                + coerced_entry[1].lower().replace("-", "_")
+            )
         else:
             verdicts: dict[str, dict[str, object]] = {}
             any_legal = False
@@ -997,16 +1093,8 @@ def _pack_production_cached_2d(
     if w is None:
         return None
     target_device = device or torch.device("cpu")
-    awq_s = _production_cache_awq_scale(
-        cache,
-        key[0],
-        width=int(w.shape[1]) if getattr(w, "dim", lambda: 0)() == 2 else 0,
-        device=target_device,
-    )
     if fmt == "NVFP4":
         w_work = w.to(device=target_device, dtype=torch.float32)
-        if awq_s is not None:
-            w_work = w_work * awq_s.unsqueeze(0)
         wp, ws, wg = quantize_dequantize_nvfp4(
             w_work,
             group_size=16,
@@ -1037,18 +1125,19 @@ def _pack_production_cached_2d(
         if (
             bool(cache_levers.get("scale_sweep", False))
             and _CACHED_ACTIVATIONS is not None
-            and awq_s is None
         ):
             return None
         w_work = w.to(device=target_device, dtype=torch.float32)
-        if awq_s is not None:
-            w_work = w_work * awq_s.unsqueeze(0)
         q, qs = quantize_dequantize_mxfp8(w_work, group_size=32)
         return {"weight": q, "weight_scale": qs}
     if fmt == "FP8_E4M3":
+        cache_levers = getattr(cache, "levers", {}) or {}
+        if (
+            bool(cache_levers.get("scale_sweep", False))
+            and _CACHED_ACTIVATIONS is not None
+        ):
+            return None
         w_work = w.to(device=target_device, dtype=torch.float32)
-        if awq_s is not None:
-            w_work = w_work * awq_s.unsqueeze(0)
         q, qs = quantize_dequantize_fp8_dynamic(w_work)
         return {"weight": q, "weight_scale": qs}
     if fmt == "BF16":
@@ -1061,591 +1150,15 @@ def _pack_production_cached_2d(
 # so we don't have to thread 3 boolean kwargs through every call
 # site — unit tests pass the flags directly via kwargs.
 _ACT_AWARE_FLAGS: dict[str, bool] = {
-    "awq": False,
     "gptq": False,
-    "awq_round": False,
     "scale_sweep": False,
+    "static_act_order": False,
+    "joint_scale_opt": False,
 }
 _NVFP4_SCALE_RULE: str | None = None
 _PRODUCTION_WEIGHT_CACHE = None
 _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
-
-# Proper-AWQ fold scales: maps target Linear recipe name -> float32 1D
-# tensor `s[in_features]` that was folded into the predecessor RMSNorm
-# γ and simultaneously multiplied into the target's weight IN-PLACE by
-# `_awq_fold_layer_predecessors`. Populated per-layer by the streaming
-# loop. The entry is only used downstream to DIVIDE the cached
-# activations for GPTQ and activation-weighted rounding — at runtime
-# vLLM will feed `a/s` into the Linear because γ already has 1/s folded
-# in, so for any error-minimization pass that references cached
-# activations, we must divide by `s` to match the runtime distribution.
-# The weight path does not consult this dict: weights have already been
-# pre-scaled in-place by the fold pass.
-_AWQ_PROPER_SCALES: dict[str, torch.Tensor] = {}
-
-# Targets whose predecessor is a non-linearity (softmax, silu*up, linear-
-# attn recurrent state, etc.). Proper AWQ cannot fold into these, so AWQ
-# leaves them unscaled. GPTQ / scale_sweep are independent and still run.
-_AWQ_SKIP_LEAF_NAMES = frozenset({
-    "o_proj",          # attention V->softmax@V->o_proj path
-    "down_proj",       # silu(gate) * up nonlinear product
-    "out_proj",        # DeltaNet internal recurrent state
-})
-
-
-# ---------------------------------------------------------------------------
-# Activation-aware quantization passes (closed-form, no iterative search).
-#
-# All three reuse the probe's already-cached activations; none of them
-# perform gradient-based optimization. Composed in the NVFP4 path of
-# `_quantize_2d`:  AWQ rescale → per-group RTN → GPTQ error prop →
-# activation-weighted rounding polish.
-# ---------------------------------------------------------------------------
-def _awq_channel_scale(activations: torch.Tensor, eps: float = 1e-4,
-                       clamp_ratio: float = 10.0,
-                       ) -> torch.Tensor:
-    """Legacy activation-only AWQ scale kept for ablation compatibility.
-
-    The production AWQ path no longer uses this fixed alpha=0.5 formula.
-    `_awq_fold_layer_predecessors` now calls the AWQ-v2 output-MSE scale
-    search in `prismaquant.awq`. Tests still exercise this helper because it
-    documents the old behavior and provides a useful control.
-    """
-    return legacy_activation_awq_scale(
-        activations,
-        eps=eps,
-        clamp_ratio=clamp_ratio,
-    )
-
-
-def _awq_rescale_weight(weight: torch.Tensor, activations: torch.Tensor
-                        ) -> tuple[torch.Tensor, torch.Tensor]:
-    """AWQ-style per-input-channel rescaling of a 2D `[out, in]` weight.
-
-    APPROXIMATE AWQ: the true AWQ algorithm (Lin et al. 2023) folds the
-    reciprocal per-channel scale `1/s[c]` into the PREVIOUS layer's
-    output (usually a LayerNorm or a residual add), so the inference-
-    time composition `Q(W*s) @ (x/s) ≈ Q(W*s) · (1/s) @ x = Q(W*s) / s @ x`
-    recovers `W @ x` up to quant noise. We can't fold the reciprocal
-    back through the network at export time without knowing the full
-    graph.
-
-    Instead: rescale `W * s` to bias the FP4 group-scale math toward
-    high-activation channels (they get finer grid resolution because
-    the per-group max-abs along the scaled input dim is dominated by
-    the scaled-up channels), quantize in that space, then divide out
-    `s` from the dequantized result before storage. Net effect: quant
-    noise in the final stored weight is redistributed — high-activation
-    channels get proportionally less noise per unit of activation
-    energy, at the cost of more noise in low-activation channels
-    (whose contribution to the output is dampened anyway).
-
-    Returns `(W_scaled, s)` where `W_scaled = W * s[None, :]` is ready
-    for group-quant and `s` is the per-input-channel scale the caller
-    must divide out post-quant (`W_dq_final = W_dq_scaled / s`).
-    """
-    if weight.shape[1] != activations.shape[-1]:
-        raise ValueError(
-            f"AWQ rescale: weight.in={weight.shape[1]} ≠ "
-            f"act.in={activations.shape[-1]}"
-        )
-    s = _awq_channel_scale(activations).to(weight.device)
-    W_scaled = weight.to(torch.float32) * s.unsqueeze(0)
-    return W_scaled, s
-
-
-def _awq_joint_channel_scale(
-    activations_list: list[torch.Tensor], eps: float = 1e-4,
-    clamp_ratio: float = 10.0,
-) -> torch.Tensor:
-    """Legacy joint activation-only AWQ scale for older tests."""
-    if not activations_list:
-        raise ValueError("AWQ joint scale requires activations")
-    combined = torch.cat(
-        [a.detach().to(torch.float32).reshape(-1, a.shape[-1])
-         for a in activations_list],
-        dim=0,
-    )
-    return legacy_activation_awq_scale(
-        combined,
-        eps=eps,
-        clamp_ratio=clamp_ratio,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Proper AWQ: fold reciprocal into predecessor (RMSNorm γ) with weight
-# pre-scaling of EVERY reader of that γ. This is the only way to preserve
-# the math invariant across mixed-format readers and packed-expert tensors.
-#
-# Invariant (per γ we fold):
-#   γ_new := γ / s
-#   For every reader M of γ:   M.W_new[:, in] := M.W[:, in] * s[in]
-# then at runtime:    M(γ_new · x) = M.W_new · (γ/s · x) = (M.W * s) · (γ/s · x)
-#                   = M.W · γ · x  =  M_original(γ · x)           (identity)
-#
-# The scale `s` is computed from the NVFP4 readers' cached activations
-# (those are the readers we want to minimize quant error for). But the
-# fold applies to ALL readers — NVFP4, MXFP8, BF16, packed experts.
-# Missing this for any reader breaks the identity: γ feeds `x/s` but the
-# reader still uses `W`, producing `(γ/s·x) · W` ≠ `γ·x · W`.
-# ---------------------------------------------------------------------------
-
-# Maps a layer-relative submodule path (or packed-expert param name) to
-# the name of its predecessor RMSNorm on the decoder layer. Readers
-# whose predecessor is nonlinear ("skip") do NOT participate in AWQ —
-# neither the γ nor the reader's weight are touched.
-#
-# The mapping is indexed by LEAF NAME (last dotted segment) because both
-# dense Linears and packed-expert param names share a flat leaf-name
-# space at their respective containers. Submodule-path prefixes are used
-# to disambiguate (e.g. `self_attn.q_proj` vs a hypothetical top-level
-# `q_proj`).
-_AWQ_PREDECESSOR_KIND: dict[str, str] = {
-    # Full-attention path.
-    "q_proj": "input_layernorm",
-    "k_proj": "input_layernorm",
-    "v_proj": "input_layernorm",
-    "o_proj": "skip",
-    # Linear-attention (DeltaNet) path.
-    "in_proj_qkv": "input_layernorm",
-    "in_proj_z": "input_layernorm",
-    "in_proj_a": "input_layernorm",
-    "in_proj_b": "input_layernorm",
-    "out_proj": "skip",
-    # MLP path (dense, shared_expert, and packed-expert readers that
-    # sit directly on `post_attention_layernorm(hidden)` — gate_proj /
-    # up_proj / gate_up_proj / w1 / w3 all read the LN output).
-    "gate_proj": "post_attention_layernorm",
-    "up_proj": "post_attention_layernorm",
-    "gate_up_proj": "post_attention_layernorm",
-    "w1": "post_attention_layernorm",
-    "w3": "post_attention_layernorm",
-    # MoE router — also reads directly from post_attention_layernorm.
-    # Qwen variants call it `gate`, Gemma/Mixtral call it `router`,
-    # DeepSeek calls it `router.classifier`. We catch the common leaf
-    # names here; `_awq_discover_layer_readers` adds a positional
-    # check so other aliases still fold correctly.
-    "gate": "post_attention_layernorm",
-    "router": "post_attention_layernorm",
-    # Nonlinear predecessors — do not fold.
-    "down_proj": "skip",
-    "w2": "skip",
-}
-
-# Packed-expert param names that read from `post_attention_layernorm`
-# (i.e. their input dim is the LN output dim) vs those that don't.
-_PACKED_READERS_OF_POST_LN = frozenset({
-    "gate_proj", "up_proj", "gate_up_proj", "w1", "w3",
-})
-
-_AWQ_SEARCH_FORMATS = frozenset({"NVFP4", "MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
-
-
-def _awq_format_group_size(fmt: str) -> int:
-    fmt = _canonical_export_format(fmt)
-    if fmt == "NVFP4":
-        return 16
-    if fmt == "MXFP8":
-        return 32
-    return 0
-
-
-def _dequantize_export_2d(result: dict[str, torch.Tensor], fmt: str) -> torch.Tensor:
-    fmt = _canonical_export_format(fmt)
-    if fmt == "NVFP4":
-        return result["_w_dq"].to(torch.float32)
-    if fmt == "MXFP8":
-        if "weight" not in result or "weight_scale" not in result:
-            raise ValueError("MXFP8 result missing weight/weight_scale")
-        return _mxfp8_dequantize_grouped(
-            result["weight"].reshape(
-                result["weight"].shape[0],
-                result["weight"].shape[1] // 32,
-                32,
-            ),
-            result["weight_scale"],
-        ).reshape(result["weight"].shape).to(torch.float32)
-    if fmt == "FP8_E4M3":
-        if "weight" not in result or "weight_scale" not in result:
-            raise ValueError("FP8 result missing weight/weight_scale")
-        return result["weight"].to(torch.float32) * result["weight_scale"].to(torch.float32)
-    raise ValueError(f"AWQ renderer does not support format {fmt!r}")
-
-
-def _render_awq_scaled_2d(
-    weight_scaled: torch.Tensor,
-    activations_scaled: torch.Tensor,
-    fmt: str,
-    *,
-    linear_name: str,
-    nvfp4_global_real_override: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Render a scaled AWQ candidate and return dequantized scaled weights."""
-    fmt = _canonical_export_format(fmt)
-    if fmt not in {"NVFP4", "MXFP8", "FP8_E4M3"}:
-        raise ValueError(f"AWQ scaled render unsupported for {fmt}")
-    prev_flags = dict(_ACT_AWARE_FLAGS)
-    try:
-        _ACT_AWARE_FLAGS["awq"] = False
-        result = _quantize_2d(
-            weight_scaled,
-            fmt,
-            linear_name=linear_name,
-            nvfp4_global_real_override=nvfp4_global_real_override,
-            cached_activations=activations_scaled,
-            awq_enabled=False,
-            gptq_enabled=bool(prev_flags.get("gptq", False)),
-            awq_round_enabled=bool(prev_flags.get("awq_round", False)),
-            scale_sweep_enabled=bool(prev_flags.get("scale_sweep", False)),
-            compute_only=(fmt == "NVFP4"),
-        )
-    finally:
-        _ACT_AWARE_FLAGS.clear()
-        _ACT_AWARE_FLAGS.update(prev_flags)
-    return _dequantize_export_2d(result, fmt)
-
-
-def _awq_discover_layer_readers(
-    layer_mod: "nn.Module",
-) -> dict["nn.Module", list[dict]]:
-    """Enumerate every reader of every RMSNorm predecessor in the layer.
-
-    Returns a dict mapping each predecessor module (γ-holder) to a list
-    of reader records. Each reader record is one of:
-
-      linear reader:
-        {"kind": "linear", "sub_name": "self_attn.q_proj",
-         "leaf": "q_proj", "mod": <nn.Linear>, "in_features": int}
-
-      packed-expert reader:
-        {"kind": "packed", "sub_name": "mlp.experts", "leaf": "gate_proj",
-         "mod": <ExpertsModule>, "param_name": "gate_proj",
-         "in_features": int}
-
-    All modules that read the γ are included — regardless of their
-    assigned format (NVFP4 / MXFP8 / BF16). The caller decides which
-    readers contribute ACTIVATIONS (NVFP4 only) to compute the scale,
-    but every reader is still weight-scaled by that scale.
-
-    Predecessors whose kind is "skip" (post-nonlinearity readers like
-    o_proj, down_proj) are excluded: those are not in the returned dict
-    because there's no γ we can fold into on that path.
-    """
-    buckets: dict["nn.Module", list[dict]] = defaultdict(list)
-    # First pass: nn.Linear readers.
-    for sub_name, mod in layer_mod.named_modules():
-        if not isinstance(mod, nn.Linear):
-            continue
-        leaf = sub_name.rsplit(".", 1)[-1]
-        kind = _AWQ_PREDECESSOR_KIND.get(leaf)
-        if kind is None or kind == "skip":
-            continue
-        try:
-            pred_mod = layer_mod.get_submodule(kind)
-        except AttributeError:
-            continue
-        if getattr(pred_mod, "weight", None) is None:
-            continue
-        buckets[pred_mod].append({
-            "kind": "linear",
-            "sub_name": sub_name,
-            "leaf": leaf,
-            "mod": mod,
-            "in_features": int(mod.weight.shape[1]),
-        })
-    # Second pass: packed-experts readers. Params whose in-dim is the
-    # post_attention_layernorm output participate; params after a
-    # nonlinearity (down_proj / w2) are skipped.
-    for sub_name, mod in layer_mod.named_modules():
-        if not _is_packed_experts_module(mod):
-            continue
-        try:
-            post_ln = layer_mod.get_submodule("post_attention_layernorm")
-        except AttributeError:
-            continue
-        if getattr(post_ln, "weight", None) is None:
-            continue
-        for pn in _packed_experts_param_names(mod):
-            if pn not in _PACKED_READERS_OF_POST_LN:
-                continue
-            p = getattr(mod, pn)
-            if p.dim() != 3:
-                continue
-            in_features = int(p.shape[2])
-            # Sanity: the γ we're about to fold into has dim matching the
-            # reader's input dim. If not, skip this reader — folding would
-            # corrupt. This guards against exotic layouts (e.g. gate_up_proj
-            # shaped [E, 2*hidden, in] where in != hidden).
-            if int(post_ln.weight.shape[-1]) != in_features:
-                continue
-            buckets[post_ln].append({
-                "kind": "packed",
-                "sub_name": sub_name,
-                "leaf": pn,
-                "mod": mod,
-                "param_name": pn,
-                "in_features": in_features,
-            })
-    return buckets
-
-
-def _awq_fold_layer_predecessors(
-    layer_mod: "nn.Module",
-    layer_qname: str,
-    assignment: dict[str, str],
-    profile,
-    activation_lookup: dict[str, torch.Tensor],
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Apply the proper-AWQ fold pass in-place on one resident decoder
-    layer.
-
-    Invariant established per predecessor γ:
-        γ      ← γ / s
-        M.W    ← M.W * s  (for every reader M of γ — Linear or packed)
-
-    For each predecessor γ we:
-      1. Enumerate every reader (all formats: NVFP4, MXFP8, BF16, packed
-         experts). The `_awq_discover_layer_readers` helper finds them.
-      2. Search the joint scale `s` over quantized readers that have cached
-         activations, using real rendered-weight output MSE. NVFP4, MXFP8, and
-         FP8_E4M3 readers can contribute; BF16 readers do not affect the score
-         but are still scaled so the identity holds.
-      3. If no quantized reader has cached activations, skip this γ entirely.
-      4. Fold `γ /= s` once, and multiply every reader's weight by `s`
-         on the input dim in-place. For nn.Linear, scale `.weight.data`
-         on columns (dim 1). For packed experts, scale the 3D param
-         `.data` on dim 2 (`[E, out, in]`).
-
-    Returns `{recipe_key -> s}` for every quantized LINEAR reader. This dict is
-    used downstream by `_quantize_2d` to divide cached activations by `s` when
-    running GPTQ / activation-weighted scale search: at runtime the reader sees
-    `a/s`, so local objectives must match.
-    """
-    readers_by_pred = _awq_discover_layer_readers(layer_mod)
-    if not readers_by_pred:
-        return {}
-
-    per_target_scale: dict[str, torch.Tensor] = {}
-    for pred_mod, readers in readers_by_pred.items():
-        quantized_readers: list[dict] = []
-        targets: list[AwqSearchTarget] = []
-        for r in readers:
-            # Build full qname. For Linear readers, sub_name already
-            # ends in the leaf (e.g. `self_attn.q_proj`). For packed
-            # experts, sub_name is the experts module (`mlp.experts`)
-            # and the param_name is the suffix (`gate_proj`).
-            if layer_qname:
-                full = f"{layer_qname}.{r['sub_name']}"
-            else:
-                full = r["sub_name"]
-            if r["kind"] == "packed":
-                full = f"{full}.{r['param_name']}"
-            recipe_key = profile.live_to_recipe_name(full)
-            r["recipe_key"] = recipe_key
-            r["full"] = full
-            fmt = _canonical_export_format(assignment.get(recipe_key, "BF16"))
-            r["fmt"] = fmt
-            if fmt not in _AWQ_SEARCH_FORMATS:
-                continue
-            if r["kind"] != "linear":
-                # Packed-expert activations are keyed by the experts
-                # module qname (not per-param), and the recipe key for
-                # the param itself doesn't match that cache key. Skip
-                # packed experts in the scale computation; they still
-                # get scaled below.
-                quantized_readers.append(r)
-                continue
-            acts = activation_lookup.get(recipe_key)
-            if acts is None:
-                quantized_readers.append(r)
-                continue
-            lin_mod: nn.Linear = r["mod"]
-            targets.append(AwqSearchTarget(
-                name=recipe_key,
-                fmt=fmt,
-                weight=lin_mod.weight.detach().to(device=device, dtype=torch.float32),
-                activations=acts.to(device=device, dtype=torch.float32),
-                group_size=_awq_format_group_size(fmt),
-            ))
-            quantized_readers.append(r)
-
-        if not targets:
-            # No quantized Linear with cached activations reads this γ.
-            continue
-
-        # Sanity-check dim agreement across readers. All target activations
-        # have `a.shape[-1] == in_features`. All other readers
-        # must agree on in_features (because they all read the same γ).
-        in_features = targets[0].activations.shape[-1]
-        for r in readers:
-            if r["in_features"] != in_features:
-                raise RuntimeError(
-                    f"[awq-fold] inconsistent in_features in layer "
-                    f"{layer_qname!r}: γ at {type(pred_mod).__name__} "
-                    f"feeds reader {r['sub_name']!r}.{r['leaf']} "
-                    f"(in={r['in_features']}) but AWQ target has "
-                    f"in={in_features}. Aborting — fold would corrupt.")
-
-        def _render_target(idx, w_scaled, a_scaled, scale):
-            target = targets[idx]
-            return _render_awq_scaled_2d(
-                w_scaled,
-                a_scaled,
-                target.fmt,
-                linear_name=target.name,
-            )
-
-        from prismaquant.awq import DEFAULT_AWQ_MIN_GAIN
-
-        try:
-            search = search_awq_scale(
-                targets,
-                _render_target,
-                n_grid=int(os.environ.get("PRISMAQUANT_AWQ_GRID", "20")),
-                duo_scaling=os.environ.get("PRISMAQUANT_AWQ_DUO", "1")
-                not in {"0", "false", "False", "no", "NO"},
-                clamp_ratio=float(os.environ.get("PRISMAQUANT_AWQ_CLAMP", "10.0")),
-                min_gain=float(os.environ.get(
-                    "PRISMAQUANT_AWQ_MIN_GAIN",
-                    str(DEFAULT_AWQ_MIN_GAIN),
-                )),
-            )
-            s = search.scale.to(device)
-        except Exception as exc:
-            if os.environ.get("PRISMAQUANT_AWQ_STRICT", "0") not in {
-                "0", "", "false", "False", "no", "NO",
-            }:
-                raise
-            print(
-                f"[awq-fold] layer {layer_qname}: search failed for "
-                f"{len(targets)} targets ({exc}); skipping fold",
-                flush=True,
-            )
-            continue
-        s_safe = s.clamp_min(1e-12)
-
-        # 1) Fold γ /= s (in-place on the layer-resident RMSNorm).
-        gamma = pred_mod.weight
-        g = gamma.detach().to(torch.float32).to(device)
-        g_folded = g / s_safe
-        gamma.data.copy_(g_folded.to(device=gamma.device, dtype=gamma.dtype))
-
-        # 2) Scale every reader's weight on the input dim. In-place on
-        # the resident weight storage. Both nn.Linear (2D) and packed
-        # experts (3D [E, out, in]) receive the same logical update.
-        for r in readers:
-            if r["kind"] == "linear":
-                lin_mod: nn.Linear = r["mod"]
-                w = lin_mod.weight
-                w_scaled = (w.detach().to(torch.float32).to(device)
-                            * s.unsqueeze(0))
-                w.data.copy_(w_scaled.to(device=w.device, dtype=w.dtype))
-            elif r["kind"] == "packed":
-                experts_mod = r["mod"]
-                pn = r["param_name"]
-                param = getattr(experts_mod, pn)
-                # Scale on the in dim (index 2). Broadcast to [E, out, in].
-                p_scaled = (param.detach().to(torch.float32).to(device)
-                            * s.reshape(1, 1, -1))
-                param.data.copy_(
-                    p_scaled.to(device=param.device, dtype=param.dtype))
-            else:
-                raise RuntimeError(f"unknown reader kind: {r['kind']!r}")
-
-        # 3) Report scale for each quantized LINEAR reader so `_quantize_2d`
-        # can divide cached activations by `s` for GPTQ / scale-sweep.
-        # Packed experts don't have per-param cached activations (they
-        # share a single `experts`-module cache under a different key),
-        # so emitting a scale for them would mislead `_quantize_2d`'s
-        # lookup. The weight is already pre-scaled via the in-place
-        # fold; when the packed path runs downstream it just quantizes
-        # the scaled weights directly.
-        for r in quantized_readers:
-            if r["kind"] == "linear":
-                per_target_scale[r["recipe_key"]] = s
-
-    return per_target_scale
-
-
-def _awq_fold_layer_precomputed_scales(
-    layer_mod: "nn.Module",
-    layer_qname: str,
-    assignment: dict[str, str],
-    profile,
-    scale_lookup: dict[str, torch.Tensor],
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Apply AWQ folds from scales precomputed by ProductionWeightCache."""
-    readers_by_pred = _awq_discover_layer_readers(layer_mod)
-    if not readers_by_pred:
-        return {}
-
-    per_target_scale: dict[str, torch.Tensor] = {}
-    for pred_mod, readers in readers_by_pred.items():
-        chosen: torch.Tensor | None = None
-        quantized_readers: list[dict] = []
-        for r in readers:
-            full = f"{layer_qname}.{r['sub_name']}" if layer_qname else r["sub_name"]
-            if r["kind"] == "packed":
-                full = f"{full}.{r['param_name']}"
-            recipe_key = profile.live_to_recipe_name(full)
-            r["recipe_key"] = recipe_key
-            fmt = _canonical_export_format(assignment.get(recipe_key, "BF16"))
-            if fmt not in _AWQ_SEARCH_FORMATS:
-                continue
-            scale = scale_lookup.get(recipe_key)
-            if scale is None:
-                continue
-            if scale.numel() != int(r["in_features"]):
-                raise RuntimeError(
-                    f"[awq-fold] precomputed scale width {scale.numel()} "
-                    f"does not match {recipe_key} in_features={r['in_features']}"
-                )
-            scale = scale.to(device=device, dtype=torch.float32).clamp_min(1e-12)
-            if chosen is None:
-                chosen = scale
-            elif not torch.allclose(chosen, scale, rtol=1e-4, atol=1e-6):
-                raise RuntimeError(
-                    f"[awq-fold] inconsistent precomputed scales under "
-                    f"{layer_qname}: {recipe_key} differs from sibling scale"
-                )
-            quantized_readers.append(r)
-        if chosen is None:
-            continue
-
-        in_features = int(chosen.numel())
-        for r in readers:
-            if r["in_features"] != in_features:
-                raise RuntimeError(
-                    f"[awq-fold] inconsistent in_features in layer "
-                    f"{layer_qname!r}: reader {r['sub_name']!r}.{r['leaf']} "
-                    f"has {r['in_features']} but AWQ scale has {in_features}"
-                )
-
-        gamma = pred_mod.weight
-        g = gamma.detach().to(torch.float32).to(device)
-        gamma.data.copy_((g / chosen).to(device=gamma.device, dtype=gamma.dtype))
-        for r in readers:
-            if r["kind"] == "linear":
-                w = r["mod"].weight
-                w_scaled = w.detach().to(torch.float32).to(device) * chosen.unsqueeze(0)
-                w.data.copy_(w_scaled.to(device=w.device, dtype=w.dtype))
-            elif r["kind"] == "packed":
-                param = getattr(r["mod"], r["param_name"])
-                p_scaled = (
-                    param.detach().to(torch.float32).to(device)
-                    * chosen.reshape(1, 1, -1)
-                )
-                param.data.copy_(p_scaled.to(device=param.device, dtype=param.dtype))
-
-        for r in quantized_readers:
-            if r["kind"] == "linear":
-                per_target_scale[r["recipe_key"]] = chosen
-
-    return per_target_scale
 
 
 def _gptq_obs_rounding_nvfp4(
@@ -1655,6 +1168,8 @@ def _gptq_obs_rounding_nvfp4(
     clip_threshold: float | None = None,
     clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
+    static_act_order: bool = False,
+    joint_scale_opt: bool = False,
 ) -> torch.Tensor:
     """GPTQ one-shot OBS rounding for NVFP4 weights.
 
@@ -1673,6 +1188,15 @@ def _gptq_obs_rounding_nvfp4(
     `damp = 0.01` adds `0.01·mean(diag(H))` to `diag(H)` for Cholesky
     stability. `global_real_override` threads through for fused-sibling
     consistency (same semantics as `quantize_dequantize_nvfp4`).
+
+    `static_act_order` applies Lift/MR-GPTQ style activation ordering without
+    requiring a runtime column permutation: scales are selected in the original
+    NVFP4 group layout, columns are processed in descending activation
+    importance, then the result is unpermuted before packing.
+
+    `joint_scale_opt` jointly searches the NVFP4 tensor global and per-group
+    max-to-codebook-level scale choices used by GPTQ. Its candidate set
+    contains max-to-6 and max-to-4, so FourOverSix is a strict subset.
     """
     W = weight.to(torch.float32).clone()
     rows, cols = W.shape
@@ -1707,6 +1231,66 @@ def _gptq_obs_rounding_nvfp4(
         H[dead, dead] = 1.0
         W[:, dead] = 0.0
 
+    col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
+
+    # Target NVFP4 grid. Pre-compute the per-tensor global_real so the
+    # per-block quantization uses the same outer scale as the final
+    # on-disk packing (otherwise error propagation would be under an
+    # inconsistent scale). This mirrors quantize_dequantize_nvfp4.
+    if global_real_override is not None:
+        global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
+    else:
+        grouped_full = W.reshape(rows, cols // group_size, group_size)
+        scale_rule = (
+            NVFP4_SCALE_RULE_JOINT_MSE
+            if joint_scale_opt
+            else None
+        )
+        s_g_real_full = _select_nvfp4_group_scales(
+            grouped_full,
+            scale_rule=scale_rule,
+        )
+        global_real = (s_g_real_full.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+        if joint_scale_opt:
+            global_real = _optimize_nvfp4_joint_global_real(
+                W,
+                group_size=group_size,
+                base_global_real=global_real,
+            )
+
+    scale_by_ordered_col: torch.Tensor | None = None
+    inverse_perm: torch.Tensor | None = None
+    if static_act_order:
+        scales_by_group = torch.empty(
+            (rows, cols // group_size),
+            dtype=torch.float32,
+            device=W.device,
+        )
+        for group_idx, block_start in enumerate(range(0, cols, group_size)):
+            block_end = block_start + group_size
+            block = W[:, block_start:block_end]
+            if joint_scale_opt:
+                eff = _select_nvfp4_joint_gptq_eff_scale(
+                    block,
+                    global_real,
+                    col_importance=col_importance[block_start:block_end],
+                )
+            else:
+                s_g_real = _select_nvfp4_group_scales(block)
+                eff = _nvfp4_effective_scale_from_real(
+                    s_g_real,
+                    global_real,
+                    quantize_fp8=False,
+                )
+            scales_by_group[:, group_idx] = eff
+        scale_by_col = scales_by_group.repeat_interleave(group_size, dim=1)
+        perm = torch.argsort(col_importance, descending=True)
+        inverse_perm = torch.empty_like(perm)
+        inverse_perm[perm] = torch.arange(cols, device=W.device)
+        W = W.index_select(1, perm).contiguous()
+        H = H.index_select(0, perm).index_select(1, perm).contiguous()
+        scale_by_ordered_col = scale_by_col.index_select(1, perm).contiguous()
+
     # Compute Cholesky + inverse. We follow the GPTQ paper's trick of
     # computing an upper-triangular inverse (`torch.cholesky_inverse`
     # then Cholesky again) so the column-wise update becomes a simple
@@ -1728,20 +1312,32 @@ def _gptq_obs_rounding_nvfp4(
             global_real_override=global_real_override,
         )
 
-    # Target NVFP4 grid. Pre-compute the per-tensor global_real so the
-    # per-block quantization uses the same outer scale as the final
-    # on-disk packing (otherwise error propagation would be under an
-    # inconsistent scale). This mirrors quantize_dequantize_nvfp4.
-    if global_real_override is not None:
-        global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
-    else:
-        grouped_full = W.reshape(rows, cols // group_size, group_size)
-        s_g_real_full = _select_nvfp4_group_scales(grouped_full)
-        global_real = (s_g_real_full.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
-
     cb = _nvfp4_codebook(W.device, dtype=torch.float32)   # [8] abs values
-    # Build signed grid once: the 16 possible FP4 values.
-    signed_grid = torch.cat([cb, -cb[1:]]).to(W.device)   # dedup 0
+
+    if static_act_order:
+        assert scale_by_ordered_col is not None
+        for col in range(cols):
+            block = W[:, col:col + 1]
+            eff_scale = scale_by_ordered_col[:, col:col + 1].clamp_min(1e-12)
+            in_grid = (block / eff_scale).clamp(-NVFP4_MAX, NVFP4_MAX)
+            fp4_idx = _round_to_codebook(in_grid)
+            abs_idx = fp4_idx & 0x7
+            sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
+            q_vals = sign * cb[abs_idx]
+            block_dq = q_vals * eff_scale
+            block_err = block - block_dq
+
+            if col + 1 < cols:
+                denom = U[col, col].clamp_min(1e-12)
+                W[:, col + 1:] = (
+                    W[:, col + 1:]
+                    - (block_err / denom) * U[col, col + 1:].unsqueeze(0)
+                )
+
+            W[:, col:col + 1] = block_dq
+
+        assert inverse_perm is not None
+        return W.index_select(1, inverse_perm).contiguous()
 
     for block_start in range(0, cols, group_size):
         block_end = min(block_start + group_size, cols)
@@ -1749,11 +1345,18 @@ def _gptq_obs_rounding_nvfp4(
 
         # Per-block RTN to NVFP4: per-row max within this block gives
         # the per-group scale (matching quantize_dequantize_nvfp4).
-        s_g_real = _select_nvfp4_group_scales(block).unsqueeze(-1)
-        # fp8 per-group scale in the [0, 448] range after /global_real.
-        fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
-        # Effective per-element scale = fp8_scale_real * global_real.
-        eff_scale = (fp8_scale_real * global_real).clamp_min(1e-12)
+        if joint_scale_opt:
+            eff_scale = _select_nvfp4_joint_gptq_eff_scale(
+                block,
+                global_real,
+                col_importance=col_importance[block_start:block_end],
+            ).unsqueeze(-1)
+        else:
+            s_g_real = _select_nvfp4_group_scales(block).unsqueeze(-1)
+            # fp8 per-group scale in the [0, 448] range after /global_real.
+            fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
+            # Effective per-element scale = fp8_scale_real * global_real.
+            eff_scale = (fp8_scale_real * global_real).clamp_min(1e-12)
         in_grid = block / eff_scale                        # scaled into [-6, 6]
         in_grid = in_grid.clamp(-NVFP4_MAX, NVFP4_MAX)
         fp4_idx = _round_to_codebook(in_grid)              # [rows, group_size]
@@ -1796,6 +1399,9 @@ def _gptq_obs_rounding_nvfp4_swept(
     clip_threshold: float | None = None,
     clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
+    static_act_order: bool = False,
+    joint_scale_opt: bool = False,
+    linear_name: str | None = None,
 ) -> torch.Tensor:
     """Per-Linear GPTQ damping sweep.
 
@@ -1828,8 +1434,86 @@ def _gptq_obs_rounding_nvfp4_swept(
     )
     H_full = X.t() @ X  # [in, in], shared evaluator
 
+    # Optional research instrumentation (#46-followup): log per-Linear
+    # H spectrum + per-damp errors so we can fit an analytical damp
+    # picker. Env-gated; cost is one eigvalsh per Linear (~O(n^3)
+    # where n=in_features; tens of ms on 4k×4k).
+    log_path = os.environ.get("PRISMAQUANT_DAMP_SWEEP_LOG")
+    if log_path:
+        try:
+            eigvals = torch.linalg.eigvalsh(H_full.to(torch.float64)).to(torch.float32)
+            lambda_max = float(eigvals[-1].item())
+            positive = eigvals[eigvals > 1e-30]
+            lambda_min = float(positive.min().item()) if positive.numel() > 0 else 0.0
+            mean_diag = float(torch.diagonal(H_full).mean().item())
+        except Exception:
+            lambda_max = float("nan")
+            lambda_min = float("nan")
+            mean_diag = float("nan")
+
+    # Optional analytical damp picker: skip the 5-candidate sweep and
+    # pick damp = c * lambda_max(H) / mean(diag(H)) directly.
+    # Equivalent to a kappa-target with K=10 (kappa target reduces to
+    # this form when lambda_min ~= 0, which is true on nearly every
+    # production Linear). c=1.784e-5 fitted on Qwen3-4B's 450 logged
+    # damp-sweep winners (log-MSE 0.172 = typical prediction within
+    # ~2.4x of the parabolic-interpolated continuous optimum, well
+    # inside the 5x gap between sweep candidates).
+    # Cost: 1 GPTQ pass + ~10-iter power iteration for lambda_max,
+    # vs 5 GPTQ passes for the sweep. Net ~5x speedup.
+    if os.environ.get("PRISMAQUANT_DAMP_ANALYTICAL", "").lower() in {
+        "1", "true", "yes", "on", "kappa_target",
+    }:
+        try:
+            c = float(os.environ.get("PRISMAQUANT_DAMP_ANALYTICAL_C", "1.784e-5"))
+            mean_diag_a = float(torch.diagonal(H_full).mean().item())
+            if mean_diag_a > 0:
+                # Power iteration for the dominant eigenvalue of H.
+                n = H_full.shape[0]
+                H_f = H_full.to(torch.float32)
+                v = torch.randn(n, device=H_full.device, dtype=torch.float32)
+                v = v / v.norm().clamp_min(1e-30)
+                for _ in range(10):
+                    v = H_f @ v
+                    v = v / v.norm().clamp_min(1e-30)
+                lambda_max_est = float((v @ (H_f @ v)).item())
+                damp_pred = c * lambda_max_est / mean_diag_a
+                damp_pred = min(max(damp_pred, 0.001), 0.1)
+                w_q = _gptq_obs_rounding_nvfp4(
+                    weight, activations, group_size=group_size,
+                    damp=damp_pred, global_real_override=global_real_override,
+                    clip_threshold=clip_threshold,
+                    clip_rescale=clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                    static_act_order=static_act_order,
+                    joint_scale_opt=joint_scale_opt,
+                )
+                diff = W_orig - w_q.to(torch.float32)
+                err = float(torch.einsum("oi,ij,oj->", diff, H_full, diff))
+                if math.isfinite(err) and err > 0:
+                    if log_path:
+                        import json as _json
+                        entry = {
+                            "linear_name": linear_name,
+                            "shape": list(weight.shape),
+                            "lambda_max_est": lambda_max_est,
+                            "mean_diag": mean_diag_a,
+                            "analytical_damp": damp_pred,
+                            "analytical_err": err,
+                        }
+                        try:
+                            with open(log_path, "a") as f:
+                                f.write(_json.dumps(entry) + "\n")
+                        except Exception:
+                            pass
+                    return w_q
+        except Exception:
+            pass  # fall through to the 5-candidate sweep
+
     best_w = None
     best_err = float("inf")
+    best_damp: float | None = None
+    per_damp_err: dict[float, float] = {}
     for damp in damp_candidates:
         try:
             w_q = _gptq_obs_rounding_nvfp4(
@@ -1838,16 +1522,39 @@ def _gptq_obs_rounding_nvfp4_swept(
                 clip_threshold=clip_threshold,
                 clip_rescale=clip_rescale,
                 fisher_row_weights=fisher_row_weights,
+                static_act_order=static_act_order,
+                joint_scale_opt=joint_scale_opt,
             )
         except Exception:
+            per_damp_err[damp] = float("inf")
             continue
         # Hessian-weighted reconstruction error (no damp injected here —
         # we want raw H for fair comparison across candidates).
         diff = W_orig - w_q.to(torch.float32)
         err = float(torch.einsum("oi,ij,oj->", diff, H_full, diff))
+        per_damp_err[damp] = err
         if err < best_err:
             best_err = err
             best_w = w_q
+            best_damp = damp
+    if log_path:
+        import hashlib
+        import json as _json
+        entry = {
+            "linear_name": linear_name,
+            "shape": list(weight.shape),
+            "lambda_max": lambda_max,
+            "lambda_min": lambda_min,
+            "mean_diag": mean_diag,
+            "best_damp": best_damp,
+            "best_err": best_err if best_err != float("inf") else None,
+            "per_damp_err": {f"{k:.4g}": v for k, v in per_damp_err.items()},
+        }
+        try:
+            with open(log_path, "a") as f:
+                f.write(_json.dumps(entry) + "\n")
+        except Exception:
+            pass
     if best_w is None:
         return _rtn_dequant_nvfp4(
             W_orig,
@@ -1855,89 +1562,6 @@ def _gptq_obs_rounding_nvfp4_swept(
             global_real_override=global_real_override,
         )
     return best_w
-
-
-def _activation_weighted_round_nvfp4(
-    weight: torch.Tensor, activations: torch.Tensor,
-    group_size: int = 16,
-    global_real_override: torch.Tensor | None = None,
-    clip_threshold: float | None = None,
-    clip_rescale: str | None = None,
-    fisher_row_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """For each weight, pick the NVFP4 grid neighbor (above or below)
-    that minimizes per-column `|Δw|² · E[|a|²]`.
-
-    Closed-form, no iteration: evaluate both rounding choices, keep
-    the one with lower activation-weighted squared error per column.
-    Returns dequantized weight `[out, in]` (float32) — caller still
-    runs the NVFP4 packer on it, and because each weight lands on a
-    valid grid point, the packed result matches this dequantized
-    tensor bit-for-bit.
-    """
-    W = weight.to(torch.float32).contiguous()
-    rows, cols = W.shape
-    if cols % group_size != 0:
-        raise ValueError(f"act-round requires group_size={group_size} ∤ {cols}")
-
-    if clip_threshold is not None and clip_threshold > 0.0:
-        a = _activation_matrix_for_gptq(
-            activations,
-            cols,
-            device=W.device,
-            clip_threshold=clip_threshold,
-            clip_rescale=clip_rescale,
-            row_weights=fisher_row_weights,
-        )
-    else:
-        a = _activation_matrix_for_gptq(
-            activations,
-            cols,
-            device=W.device,
-            clip_quantile=0.0,
-            row_weights=fisher_row_weights,
-        )
-    # Per-input-channel importance = E[a^2]. Clamp to avoid degenerate
-    # channels (all-zero activations) making rounding indifferent.
-    col_importance = a.pow(2).mean(dim=0).clamp_min(1e-12)     # [in]
-
-    # Compute per-tensor outer scale consistently with
-    # quantize_dequantize_nvfp4.
-    grouped = W.reshape(rows, cols // group_size, group_size)
-    s_g_real = _select_nvfp4_group_scales(grouped)
-    if global_real_override is not None:
-        global_real = global_real_override.to(W.device).clamp_min(1e-12).float()
-    else:
-        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
-    fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
-    eff_scale = (fp8_scale_real * global_real).unsqueeze(-1).clamp_min(1e-12)
-    # Scale into grid.
-    in_grid = grouped / eff_scale                                # [rows, n_g, gs]
-
-    cb = _nvfp4_codebook(W.device, dtype=torch.float32)          # [8]
-    abs_x = in_grid.abs()
-    idx = torch.bucketize(abs_x, cb)
-    idx_lo = (idx - 1).clamp_min(0).clamp_max(cb.numel() - 1)
-    idx_hi = idx.clamp_max(cb.numel() - 1)
-    lo_v = cb[idx_lo]
-    hi_v = cb[idx_hi]
-    sign = torch.where(in_grid >= 0, 1.0, -1.0)
-    neigh_lo = sign * lo_v
-    neigh_hi = sign * hi_v
-    # Deltas in grid space. Convert to weight space by multiplying
-    # eff_scale. That preserves the per-column importance weighting
-    # on real Δw² (what actually enters the output-space error).
-    delta_lo = (neigh_lo - in_grid) * eff_scale                  # [rows, n_g, gs]
-    delta_hi = (neigh_hi - in_grid) * eff_scale
-    # col_importance broadcast: [cols] → [1, n_g, gs]
-    col_imp = col_importance.reshape(1, cols // group_size, group_size)
-    err_lo = delta_lo.pow(2) * col_imp
-    err_hi = delta_hi.pow(2) * col_imp
-    pick_hi = err_hi < err_lo
-    chosen = torch.where(pick_hi, neigh_hi, neigh_lo)            # [rows, n_g, gs]
-
-    W_dq = (chosen * eff_scale).reshape(rows, cols)
-    return W_dq
 
 
 def _scale_sweep_nvfp4(
@@ -1959,8 +1583,7 @@ def _scale_sweep_nvfp4(
     on the NVFP4 codebook and compute the activation-weighted MSE
     `sum_j a_j²·(w_orig,j - w_q,j)²` against the ORIGINAL (pre-pass)
     weight. Keep the configuration minimizing MSE per group, with an
-    improve-or-keep gate against whatever `weight` is coming in (which
-    may already be post-GPTQ / post-awq_round).
+    improve-or-keep gate against whatever `weight` is coming in.
 
     `reference_weight`: the pre-pass (float32) weight used to measure
     MSE. Defaults to `weight` (the post-pass state) when not supplied
@@ -2428,6 +2051,77 @@ def quantize_dequantize_fp8_dynamic(weight: torch.Tensor
     return quant, s.to(torch.float32)
 
 
+def _fp8_scale_sweep_factors() -> tuple[float, ...]:
+    raw = os.environ.get(
+        "PRISMAQUANT_FP8_SCALE_SWEEP_FACTORS",
+        "0.25,0.3535533906,0.5,0.7071067812,0.8408964153,"
+        "1.0,1.189207115,1.414213562,2.0",
+    )
+    vals: list[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError:
+            continue
+        if math.isfinite(value) and value > 0.0:
+            vals.append(value)
+    vals.append(1.0)
+    return tuple(sorted(set(vals)))
+
+
+def _fp8_dynamic_scale_sweep_quantize(
+    weight: torch.Tensor,
+    activations: torch.Tensor,
+    *,
+    clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
+    fisher_row_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Activation-weighted per-row scale search for vLLM FP8 E4M3."""
+    if weight.dim() != 2:
+        raise ValueError("FP8 scale sweep expects a 2D Linear weight")
+    rows, cols = weight.shape
+    w_f = weight.detach().to(torch.float32)
+    if activations.shape[-1] != cols:
+        q, s = quantize_dequantize_fp8_dynamic(w_f)
+        return q, s, q.to(torch.float32) * s.to(torch.float32)
+    col_importance = _activation_col_importance_for_gptq(
+        activations,
+        cols,
+        device=w_f.device,
+        clip_threshold=clip_threshold,
+        clip_rescale=clip_rescale,
+        row_weights=fisher_row_weights,
+    ).to(device=w_f.device, dtype=torch.float32)
+    base = (
+        w_f.abs().amax(dim=-1, keepdim=True).clamp_min(2.0 ** -127)
+        / FP8_E4M3_MAX
+    )
+    best_score = torch.full((rows,), float("inf"), device=w_f.device)
+    best_dequant = torch.empty_like(w_f)
+    best_scale = torch.empty((rows, 1), device=w_f.device, dtype=torch.float32)
+    for factor in _fp8_scale_sweep_factors():
+        scale = base * float(factor)
+        quant = (w_f / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
+            torch.float8_e4m3fn
+        )
+        dequant = quant.to(torch.float32) * scale
+        score = ((w_f - dequant).pow(2) * col_importance.unsqueeze(0)).sum(dim=1)
+        take = score < best_score
+        if bool(take.any().item()):
+            best_score = torch.where(take, score, best_score)
+            best_dequant = torch.where(take.unsqueeze(1), dequant, best_dequant)
+            best_scale = torch.where(take.unsqueeze(1), scale, best_scale)
+    best_quant = (best_dequant / best_scale).clamp(
+        -FP8_E4M3_MAX,
+        FP8_E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    return best_quant.contiguous(), best_scale.contiguous(), best_dequant.contiguous()
+
+
 def quantize_dequantize_fp8_dynamic_packed(packed: torch.Tensor
                                            ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-expert FP8 W8A8 dynamic per-channel for `[E, M, N]` packed.
@@ -2452,7 +2146,7 @@ def _explicit_regex(name: str) -> str:
 # profile's `to_vllm_internal_name`.)
 _PER_EXPERT_LINEAR_RE = re.compile(
     r"^(?P<prefix>.*[.])layers[.](?P<L>\d+)[.](?P<inner>.*mlp)[.]"
-    r"experts[.](?P<E>\d+)[.](?P<proj>gate|up|down)_proj$"
+    r"experts[.](?P<E>\d+)[.](?P<proj>[^.]+)$"
 )
 
 
@@ -2507,15 +2201,12 @@ def _build_target_list(vllm_names: list[str]) -> list[str]:
         inner_r = inner.replace(".", "[.]")
         # Always emit the [0-9]+ wildcard for the expert position. vLLM's
         # FusedMoE.get_moe_method probes the synthetic name `experts.0.X_proj`
-        # against this regex, and the saved checkpoint uses dense renumbered
-        # eids (0..K-1) — so any literal alternation built from the source
-        # checkpoint's *original* eids would miss expert 0 whenever expert 0
-        # was pruned out. Per FusedMoE semantics every kept expert in a layer
-        # shares the same scheme, so wildcarding is also semantically correct.
+        # against this regex, and every expert in a layer shares the same
+        # scheme, so wildcarding is semantically correct.
         expr = "[0-9]+"
         collapsed.append(
             f"re:^{prefix_r}layers[.]{L}[.]{inner_r}[.]experts[.]{expr}"
-            f"[.]{proj}_proj$"
+            f"[.]{proj}$"
         )
 
     out = (
@@ -2530,184 +2221,108 @@ def _build_target_list(vllm_names: list[str]) -> list[str]:
 # Module / parameter discovery — mirrors what install_packed_expert_hooks
 # detects, so the export sees the same units as the probe.
 # ---------------------------------------------------------------------------
-_PACKED_EXPERT_PARAM_NAMES = {
-    "gate_up_proj", "down_proj", "w1", "w2", "w3",
-    "gate_proj", "up_proj",
-}
+def _packed_expert_param_name_set(profile=None) -> set[str]:
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            return set(profile.packed_expert_param_names())
+        except Exception:
+            pass
+    return set()
 
 
-def _is_packed_experts_module(module: nn.Module) -> bool:
+def _is_packed_experts_module(module: nn.Module, profile=None) -> bool:
+    names = _packed_expert_param_name_set(profile)
     cls_name = type(module).__name__.lower()
     if "expert" not in cls_name:
         return False
     for n, p in module.named_parameters(recurse=False):
         if (isinstance(p, nn.Parameter)
                 and p.dim() == 3
-                and n in _PACKED_EXPERT_PARAM_NAMES):
+                and n in names):
             return True
     return False
 
 
-def _packed_experts_param_names(module: nn.Module) -> list[str]:
+def _packed_experts_param_names(module: nn.Module, profile=None) -> list[str]:
+    names = _packed_expert_param_name_set(profile)
     return sorted(
         n for n, p in module.named_parameters(recurse=False)
         if (isinstance(p, nn.Parameter)
             and p.dim() == 3
-            and n in _PACKED_EXPERT_PARAM_NAMES)
+            and n in names)
     )
 
 
-# ---------------------------------------------------------------------------
-# Prune-manifest plumbing (REAP-style expert drop + reindex)
-# ---------------------------------------------------------------------------
-# Sidecar file written by the allocator next to `layer_config.json` as
-# `<layer_config>.prune.json`. One entry per MoE layer that had experts
-# dropped, keyed by router qname (e.g. `model.layers.0.mlp.gate`). Each
-# entry carries:
-#   num_experts_orig, num_experts_kept — the before/after counts
-#   pruned_expert_ids : list[int]      — original eids to drop
-#   kept_expert_ids   : list[int]      — original eids that survive
-#   orig_to_new_eid   : {str(orig): new_dense_idx}  — reindex map
-# The exporter uses this to (a) skip the pruned experts' tensors, (b)
-# reindex kept experts to a contiguous 0..K-1 range in the output keys
-# (vLLM's FusedMoE / ModuleList indexing requires dense), (c) shrink
-# the router weight's out-dim to K rows in kept-order, and (d) update
-# HF config num_experts fields.
-_EXPERT_IDX_IN_QNAME_RE = re.compile(
-    r"^(?P<parent>.+)\.experts\.(?P<eid>\d+)(?:\.(?P<rest>.+))?$"
-)
+def _packed_expert_projection_names(profile, param_name: str) -> tuple[str, ...]:
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            projections = tuple(profile.packed_expert_projection_names(param_name))
+            if projections:
+                return projections
+        except Exception:
+            pass
+    return (str(param_name),)
 
 
-def _load_prune_manifest(path: Path | str | None) -> dict[str, dict]:
-    """Load a prune-sidecar JSON. Returns an empty dict when the file
-    doesn't exist — non-prune exports are the default case."""
-    if path is None:
-        return {}
-    p = Path(path)
-    if not p.exists():
-        return {}
-    with open(p) as f:
-        data = json.load(f)
-    validate_prune_manifest_payload(data, str(p))
-    if data:
-        raise_expert_prune_disabled("export prune manifest")
-    return data
+def _packed_expert_parent_for_projection(profile, projection_name: str) -> str | None:
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            return profile.packed_expert_parent_for_projection(projection_name)
+        except Exception:
+            pass
+    return None
 
 
-def _index_prune_by_parent(manifest: dict[str, dict]) -> dict[str, dict]:
-    """Re-index the router-keyed manifest by the parent qname common to
-    both the router and the experts module (e.g. `model.layers.0.mlp`
-    for router `.mlp.gate` and experts container `.mlp.experts`).
-
-    Return dicts carry the router_qname alongside the entry so callers
-    can distinguish the router from its experts when they share a
-    parent.
-    """
-    by_parent: dict[str, dict] = {}
-    for router_qname, entry in manifest.items():
-        parent = router_qname.rsplit(".", 1)[0]
-        by_parent[parent] = {"router_qname": router_qname, **entry}
-    return by_parent
+def _all_packed_expert_projection_names(profile) -> tuple[str, ...]:
+    projections: list[str] = []
+    seen: set[str] = set()
+    for param_name in sorted(_packed_expert_param_name_set(profile)):
+        for projection in _packed_expert_projection_names(profile, param_name):
+            if projection in seen:
+                continue
+            projections.append(projection)
+            seen.add(projection)
+    return tuple(projections)
 
 
-def _resolve_linear_prune_action(
-    full_qname: str,
-    prune_by_parent: dict[str, dict],
-) -> tuple[str, dict] | None:
-    """Map a live nn.Linear's qname to a prune action.
-
-    Returns one of:
-      ("router", entry)  — this IS the gated router; shrink out-dim to
-                           kept_expert_ids (in order).
-      ("drop",   entry)  — this is a PRUNED per-expert Linear; skip it.
-      ("reindex", entry) — this is a KEPT per-expert Linear; emit under
-                           a reindexed qname. `entry["new_full"]` has
-                           the rewritten qname.
-      None               — not MoE-prune-relevant; fall through to the
-                           default code path.
-    """
-    if not prune_by_parent:
-        return None
-    # Router check: exact qname match.
-    parent = full_qname.rsplit(".", 1)[0]
-    entry = prune_by_parent.get(parent)
-    if entry is not None and entry["router_qname"] == full_qname:
-        return "router", entry
-    # Per-expert Linear: qname shape `<parent>.experts.<eid>.<rest>`.
-    m = _EXPERT_IDX_IN_QNAME_RE.match(full_qname)
-    if m is None:
-        return None
-    parent = m.group("parent")
-    entry = prune_by_parent.get(parent)
-    if entry is None:
-        return None
-    try:
-        eid = int(m.group("eid"))
-    except (TypeError, ValueError):
-        return None
-    if eid in set(entry["pruned_expert_ids"]):
-        return "drop", entry
-    new_eid = entry["orig_to_new_eid"].get(str(eid))
-    if new_eid is None:
-        return None
-    rest = m.group("rest")
-    new_full = (
-        f"{parent}.experts.{new_eid}.{rest}" if rest
-        else f"{parent}.experts.{new_eid}"
-    )
-    out_entry = dict(entry)
-    out_entry["new_full"] = new_full
-    out_entry["orig_eid"] = eid
-    out_entry["new_eid"] = int(new_eid)
-    return "reindex", out_entry
-
-
-def _resolve_packed_experts_prune(
-    experts_qname: str,
-    prune_by_parent: dict[str, dict],
-) -> dict | None:
-    """For a packed-experts module at `experts_qname` (e.g.
-    `model.layers.0.mlp.experts`), return the prune entry keyed by its
-    parent (`model.layers.0.mlp`) if this layer is pruned. Otherwise
-    None.
-    """
-    if not prune_by_parent:
-        return None
-    parent = experts_qname.rsplit(".", 1)[0]
-    return prune_by_parent.get(parent)
-
-
-def _shrink_router_weight(
-    mod: nn.Linear,
-    entry: dict,
-) -> torch.Tensor:
-    """Drop rows of the router's output dim, keeping `kept_expert_ids`
-    in order. Validates against `num_experts_orig` up-front — a size
-    mismatch means the manifest and the live router disagree and we
-    would emit a silently-broken artifact otherwise.
-    """
-    w = mod.weight.detach()
-    kept = entry["kept_expert_ids"]
-    n_orig = int(entry["num_experts_orig"])
-    if w.shape[0] != n_orig:
-        raise RuntimeError(
-            f"[export-stream] prune: router weight rows "
-            f"({w.shape[0]}) != manifest num_experts_orig "
-            f"({n_orig}). Manifest was built against a different "
-            f"model — refusing to shrink."
+def _split_packed_expert_tensor(
+    packed_param: torch.Tensor,
+    param_name: str,
+    profile,
+) -> list[tuple[str, torch.Tensor]]:
+    projections = _packed_expert_projection_names(profile, param_name)
+    if projections == (param_name,):
+        return [(param_name, packed_param)]
+    rows = int(packed_param.shape[1])
+    n_parts = len(projections)
+    if rows % n_parts != 0:
+        raise ValueError(
+            f"packed expert tensor {param_name!r} with rows={rows} cannot "
+            f"split evenly into configured projections {projections!r}"
         )
-    idx = torch.as_tensor(kept, dtype=torch.long, device=w.device)
-    return w.index_select(0, idx).contiguous()
-
-
-# HF config field names that hold the MoE expert count. Different
-# archs use different ones; we update whichever exist.
-_MOE_EXPERT_COUNT_FIELDS = (
-    "num_experts",
-    "num_local_experts",
-    "num_routed_experts",
-    "n_routed_experts",
-)
+    chunk = rows // n_parts
+    return [
+        (proj_name, packed_param[:, i * chunk:(i + 1) * chunk, :])
+        for i, proj_name in enumerate(projections)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2718,8 +2333,8 @@ _MOE_EXPERT_COUNT_FIELDS = (
 # weight_global_scale. We compute the max over each fused group's natural
 # global_scale and force every sibling to use it.
 #
-# Patterns mirror vLLM's `packed_modules_mapping` for qwen3_5; if a new
-# model family is added, mirror its packed_modules_mapping here.
+# Legacy fallback for callers that do not pass a ModelProfile. New model
+# families should declare fused groups in their profile structure spec.
 _FUSED_DENSE_PATTERNS = [
     (re.compile(r"^(?P<pre>.+)\.self_attn\.(?P<sib>q_proj|k_proj|v_proj)$"),
      ("q_proj", "k_proj", "v_proj")),
@@ -2745,8 +2360,37 @@ def _fused_dense_group(name: str) -> tuple[str, tuple[str, ...]] | None:
     return None
 
 
+def _fused_group_key_for_name(name: str, profile=None) -> str | None:
+    group_fn = getattr(profile, "fused_sibling_group", None)
+    if callable(group_fn):
+        try:
+            group = group_fn(name)
+        except Exception:
+            group = None
+        if group:
+            return str(group)
+    mapping_fn = getattr(profile, "fused_sibling_leaf_mapping", None)
+    if callable(mapping_fn) and "." in name:
+        try:
+            mapping = mapping_fn()
+        except Exception:
+            mapping = None
+        if mapping:
+            prefix, leaf = name.rsplit(".", 1)
+            for fused, members in mapping.items():
+                if leaf in set(str(member) for member in members):
+                    return f"{prefix}.{fused}"
+    fallback = _fused_dense_group(name)
+    if fallback is None:
+        return None
+    prefix, members = fallback
+    return f"{prefix}::__fused__:{','.join(members)}"
+
+
 def _unify_input_global_scales_across_fused_siblings(
     scales: dict[str, float],
+    *,
+    profile=None,
 ) -> dict[str, float]:
     """Post-process per-Linear input_global_scale values so fused-
     sibling groups share one scale.
@@ -2766,9 +2410,9 @@ def _unify_input_global_scales_across_fused_siblings(
     Siblings that weren't NVFP4-assigned pass through unchanged.
     """
     # Bucket siblings by fused group.
-    groups: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+    groups: dict[str, list[str]] = {}
     for name in scales:
-        g = _fused_dense_group(name)
+        g = _fused_group_key_for_name(name, profile)
         if g is None:
             continue
         groups.setdefault(g, []).append(name)
@@ -2804,7 +2448,10 @@ def _unify_input_global_scales_across_fused_siblings(
 
 
 def _compute_nvfp4_joint_global(
-    model: nn.Module, assignment: dict[str, str],
+    model: nn.Module,
+    assignment: dict[str, str],
+    *,
+    profile=None,
 ) -> dict[str, torch.Tensor]:
     """Pre-pass over the model: for each fused-sibling group whose
     members are all assigned to NVFP4, compute the joint global_real
@@ -2812,19 +2459,27 @@ def _compute_nvfp4_joint_global(
     to the shared global_real tensor."""
     # Bucket siblings by (parent_prefix, kind). Missing siblings are
     # OK — vLLM's loader handles partial fusion fine.
-    groups: dict[tuple[str, tuple[str, ...]], list[tuple[str, nn.Linear]]] = {}
+    groups: dict[str, list[tuple[str, nn.Linear]]] = {}
     for qname, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
-        if _canonical_export_format(assignment.get(qname, "BF16")) != "NVFP4":
+        live_to_recipe = getattr(profile, "live_to_recipe_name", None)
+        if callable(live_to_recipe):
+            try:
+                recipe_qname = live_to_recipe(qname)
+            except Exception:
+                recipe_qname = qname
+        else:
+            recipe_qname = qname
+        if _canonical_export_format(assignment.get(recipe_qname, "BF16")) != "NVFP4":
             continue
-        g = _fused_dense_group(qname)
+        g = _fused_group_key_for_name(recipe_qname, profile)
         if g is None:
             continue
-        groups.setdefault(g, []).append((qname, mod))
+        groups.setdefault(g, []).append((recipe_qname, mod))
 
     out: dict[str, torch.Tensor] = {}
-    for (_pre, _members), siblings in groups.items():
+    for _group_key, siblings in groups.items():
         # Need every sibling to also be NVFP4 — otherwise vLLM allocates
         # the fused tensor under a different scheme and our joint scale
         # wouldn't apply consistently. The allocator's promote_fused
@@ -2852,10 +2507,10 @@ def _quantize_2d(
     act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
     linear_name: str | None = None,
-    awq_enabled: bool = False,
     gptq_enabled: bool = False,
-    awq_round_enabled: bool = False,
     scale_sweep_enabled: bool = False,
+    static_act_order_enabled: bool = False,
+    joint_scale_opt_enabled: bool = False,
     cached_activations: torch.Tensor | None = None,
     compute_only: bool = False,
 ) -> dict[str, torch.Tensor]:
@@ -2877,13 +2532,10 @@ def _quantize_2d(
     otherwise vLLM's runtime activation quant uses an undersized
     dynamic range.
 
-    `awq_enabled`, `gptq_enabled`, `awq_round_enabled`: activation-aware
-    passes composed on the NVFP4 path, order = AWQ rescale → per-group
-    RTN → GPTQ error prop → activation-weighted rounding polish. Each
-    requires `cached_activations` (looked up from _CACHED_ACTIVATIONS
-    by `linear_name` when not supplied explicitly). MXFP8 ignores
-    gptq_enabled (8-bit quant noise is too small to justify the
-    compute cost); AWQ + act-weighted rounding still run if enabled.
+    `gptq_enabled` and `scale_sweep_enabled` compose activation-aware passes
+    on the NVFP4 path. Each requires `cached_activations` (looked up from
+    _CACHED_ACTIVATIONS by `linear_name` when not supplied explicitly). MXFP8
+    ignores gptq_enabled; scale-sweep still runs when enabled.
 
     `cached_activations`: optional `[N, in_features]` float tensor of
     probe-captured inputs for this Linear. If None and `linear_name`
@@ -2892,9 +2544,7 @@ def _quantize_2d(
     `act_clip_threshold`: optional scalar clamp for the render-time
     activation-aware NVFP4/MXFP8 passes.  When None, legacy behavior is
     preserved: GPTQ/do-no-harm honor PRISMAQUANT_ACT_CLIP_QUANTILE,
-    while scale_sweep and act-round use raw cached activations.
-    `act_clip_rescale` controls PrismaClip-RBC's row-wise rescaling after
-    an explicit clamp; supported values are none, row_rms, and row_mean_abs.
+    while scale_sweep uses raw cached activations.
 
     `fisher_row_weights`: optional per-token gradient² weights aligned to
     cached activation rows. When provided, GPTQ/scale-sweep local objectives
@@ -2914,7 +2564,7 @@ def _quantize_2d(
     # Device fix: cached activations are stored on CPU (float32) to
     # amortize load cost across many quant calls; weights land on the
     # export device (typically CUDA). Move activations to the weight's
-    # device here so every downstream op (_awq_*, GPTQ H matrix,
+    # device here so every downstream op (GPTQ H matrix,
     # act-weighted rounding) runs on a consistent device. Repairs
     # `Expected all tensors to be on the same device, but found at
     # least two devices, cuda:0 and cpu!` in live Qwen3.6-35B export.
@@ -2925,52 +2575,27 @@ def _quantize_2d(
     # were explicitly enabled via kwargs — lets main() turn them on
     # once without threading through every call site. Kwargs still
     # win when any is set True (unit tests pass them explicitly).
-    if not (awq_enabled or gptq_enabled or awq_round_enabled or scale_sweep_enabled):
-        awq_enabled = bool(_ACT_AWARE_FLAGS.get("awq"))
+    if not (
+        gptq_enabled
+        or scale_sweep_enabled
+        or static_act_order_enabled
+        or joint_scale_opt_enabled
+    ):
         gptq_enabled = bool(_ACT_AWARE_FLAGS.get("gptq"))
-        awq_round_enabled = bool(_ACT_AWARE_FLAGS.get("awq_round"))
         scale_sweep_enabled = bool(_ACT_AWARE_FLAGS.get("scale_sweep"))
+        static_act_order_enabled = bool(_ACT_AWARE_FLAGS.get("static_act_order"))
+        joint_scale_opt_enabled = bool(_ACT_AWARE_FLAGS.get("joint_scale_opt"))
+    static_act_order_enabled = bool(gptq_enabled and static_act_order_enabled)
+    joint_scale_opt_enabled = bool(gptq_enabled and joint_scale_opt_enabled)
 
     if fmt == "NVFP4":
         w_work = weight.to(torch.float32)
-        # Proper AWQ contract: when the per-layer fold pass
-        # `_awq_fold_layer_predecessors` has run, it has ALREADY
-        # multiplied `W *= s` in-place on the caller's weight storage
-        # (and divided the predecessor γ by the same `s`). The
-        # `weight` argument we received here already carries that
-        # scaling, so we do NOT re-scale inside `_quantize_2d`. The
-        # `_AWQ_PROPER_SCALES[linear_name]` entry (if present) exists
-        # solely to tell us "runtime activations for this module will
-        # be `a/s` after γ-fold, so divide cached activations by `s`
-        # when computing GPTQ covariance and activation-weighted
-        # rounding importance."
-        #
-        # Test-path / inline callers that don't run the fold pass
-        # simply leave `_AWQ_PROPER_SCALES` empty, in which case the
-        # cached activations are used verbatim. AWQ by itself then
-        # contributes nothing here — the rescaling IS the fold. GPTQ
-        # and activation-weighted rounding still run unchanged.
-        leaf_name = (linear_name or "").rsplit(".", 1)[-1]
-        awq_unavailable = leaf_name in _AWQ_SKIP_LEAF_NAMES
-        awq_s: torch.Tensor | None = None
-        if (awq_enabled and not awq_unavailable and linear_name is not None
-                and linear_name in _AWQ_PROPER_SCALES):
-            s_cand = _AWQ_PROPER_SCALES[linear_name]
-            if s_cand.numel() == w_work.shape[1]:
-                awq_s = s_cand.to(device=w_work.device, dtype=torch.float32)
 
         def _acts_for_error_passes() -> torch.Tensor | None:
-            """Return cached activations adjusted for the runtime
-            distribution seen by this Linear. Under proper AWQ the
-            predecessor now emits `a/s`, so GPTQ's H matrix and act-
-            rounding's column importance must be computed from `a/s`.
-            Without AWQ, use the raw cached activations directly."""
+            """Return cached activations aligned to this Linear."""
             if acts is None or acts.shape[-1] != w_work.shape[1]:
                 return None
-            if awq_s is None:
-                return acts
-            a2 = acts.to(torch.float32).reshape(-1, acts.shape[-1])
-            return a2 / awq_s.clamp_min(1e-12).unsqueeze(0)
+            return acts
 
         # Step 2: GPTQ one-shot OBS rounding (block-wise error prop).
         # Produces an already-dequantized tensor living on the NVFP4
@@ -2991,6 +2616,9 @@ def _quantize_2d(
                         clip_threshold=act_clip_threshold,
                         clip_rescale=act_clip_rescale,
                         fisher_row_weights=fisher_row_weights,
+                        static_act_order=static_act_order_enabled,
+                        joint_scale_opt=joint_scale_opt_enabled,
+                        linear_name=linear_name,
                     )
                 else:
                     w_work = _gptq_obs_rounding_nvfp4(
@@ -2999,24 +2627,11 @@ def _quantize_2d(
                         clip_threshold=act_clip_threshold,
                         clip_rescale=act_clip_rescale,
                         fisher_row_weights=fisher_row_weights,
+                        static_act_order=static_act_order_enabled,
+                        joint_scale_opt=joint_scale_opt_enabled,
                     )
 
-        # Step 3: activation-weighted rounding polish. Measured to be
-        # a no-op-at-best / GPTQ-undo-at-worst in the permutation
-        # bake-off (see PrismaQuant repo notes). Off by default; leave
-        # the code path here for A/B testing.
-        if awq_round_enabled:
-            acts_work = _acts_for_error_passes()
-            if acts_work is not None:
-                w_work = _activation_weighted_round_nvfp4(
-                    w_work, acts_work, group_size=16,
-                    global_real_override=nvfp4_global_real_override,
-                    clip_threshold=act_clip_threshold,
-                    clip_rescale=act_clip_rescale,
-                    fisher_row_weights=fisher_row_weights,
-                )
-
-        # Step 3b: closed-form per-group scale sweep. Joint (scale,
+        # Step 3: closed-form per-group scale sweep. Joint (scale,
         # rounding-set) search on the NVFP4 codebook, activation-
         # weighted MSE against the ORIGINAL pre-pass weight, with an
         # improve-or-keep gate against the current w_work. Recovers
@@ -3071,10 +2686,8 @@ def _quantize_2d(
             except Exception as _e:
                 pass  # never fail the export over the gate
 
-        # Step 4: final NVFP4 pack. `w_work` is the post-AWQ,
-        # post-GPTQ, post-act-round, post-scale-sweep weight. Store it
-        # as-is — the fold pass preserved the matmul identity
-        # externally.
+        # Step 4: final NVFP4 pack. `w_work` is the post-GPTQ,
+        # post-act-round, post-scale-sweep weight.
         input_scale = input_global_scale_override
         if input_scale is None and linear_name is not None and _INPUT_GLOBAL_SCALES:
             input_scale = _INPUT_GLOBAL_SCALES.get(linear_name)
@@ -3119,19 +2732,6 @@ def _quantize_2d(
         # only the stored fp8 weights and uint8 E8M0 scales change.
         w_work = weight.to(torch.float32)
         acts_work = acts
-        if (
-            awq_enabled
-            and linear_name is not None
-            and linear_name in _AWQ_PROPER_SCALES
-            and acts is not None
-        ):
-            s_cand = _AWQ_PROPER_SCALES[linear_name]
-            if s_cand.numel() == w_work.shape[1]:
-                awq_s = s_cand.to(device=w_work.device, dtype=torch.float32)
-                acts_work = (
-                    acts.to(torch.float32).reshape(-1, acts.shape[-1])
-                    / awq_s.clamp_min(1e-12).unsqueeze(0)
-                )
         if (scale_sweep_enabled and acts_work is not None
                 and acts_work.shape[-1] == w_work.shape[1]):
             w, ws, _ = _mxfp8_scale_sweep_quantize(
@@ -3147,7 +2747,18 @@ def _quantize_2d(
         return {"weight": w, "weight_scale": ws}
     if fmt == "FP8_E4M3":
         w_work = weight.to(torch.float32)
-        w, ws = quantize_dequantize_fp8_dynamic(w_work)
+        acts_work = acts
+        if (scale_sweep_enabled and acts_work is not None
+                and acts_work.shape[-1] == w_work.shape[1]):
+            w, ws, _ = _fp8_dynamic_scale_sweep_quantize(
+                w_work,
+                acts_work,
+                clip_threshold=act_clip_threshold,
+                clip_rescale=act_clip_rescale,
+                fisher_row_weights=fisher_row_weights,
+            )
+        else:
+            w, ws = quantize_dequantize_fp8_dynamic(w_work)
         return {"weight": w, "weight_scale": ws}
     if fmt == "MXFP4":
         w_work = weight.to(torch.float32)
@@ -3267,12 +2878,8 @@ def _quantize_2d_nvfp4_group_batched(
     list of compressed dicts in the same order, ready to be merged
     into the export's `out` dict by the caller.
 
-    AWQ rescale is assumed to have been applied IN PLACE on
-    `mod.weight` by `_awq_fold_layer_predecessors` before this is
-    called; we therefore use `mod.weight` directly as the post-AWQ
-    starting point for GPTQ. The reference weight passed to scale_sweep
-    is the same post-AWQ weight (matching the per-Linear path's
-    `weight.to(float32)` argument).
+    The reference weight passed to scale_sweep is the same original weight
+    used by the per-Linear path's `weight.to(float32)` argument.
     """
     from .export_batched_gptq import (
         gptq_obs_rounding_nvfp4_batched,
@@ -3283,16 +2890,13 @@ def _quantize_2d_nvfp4_group_batched(
     if n == 0:
         return []
 
-    # Stack post-AWQ weights into [E, out, in]. All shapes must match.
+    # Stack weights into [E, out, in]. All shapes must match.
     weights = torch.stack(
         [it[3].weight.detach().to(torch.float32) for it in items], dim=0,
     ).to(device)
     reference_weights = weights.clone()  # pre-pass reference for scale_sweep
 
-    # Per-Linear activation tensors (None where missing). When AWQ
-    # has produced a per-Linear scale `awq_s`, divide the cached
-    # activations by it — same semantics as `_acts_for_error_passes`
-    # in the per-Linear path.
+    # Per-Linear activation tensors (None where missing).
     acts_list: list = []
     for full, emit_full, recipe_key, mod in items:
         a = None
@@ -3300,9 +2904,6 @@ def _quantize_2d_nvfp4_group_batched(
             raw = _CACHED_ACTIVATIONS.get(recipe_key)
             if raw is not None and raw.shape[-1] == mod.weight.shape[1]:
                 a = raw.to(torch.float32).reshape(-1, raw.shape[-1])
-                awq_s = _AWQ_PROPER_SCALES.get(recipe_key)
-                if awq_s is not None:
-                    a = a / awq_s.to(a.device).clamp_min(1e-12).unsqueeze(0)
         acts_list.append(a if a is not None else torch.zeros(
             0, weights.shape[2], dtype=torch.float32, device=device))
 
@@ -3371,6 +2972,12 @@ def _quantize_2d_nvfp4_group_batched(
                     damp=damp,
                     global_real_overrides=global_real_overrides,
                     expert_chunk=expert_chunk,
+                    static_act_order=bool(
+                        _ACT_AWARE_FLAGS.get("static_act_order", False)
+                    ),
+                    joint_scale_opt=bool(
+                        _ACT_AWARE_FLAGS.get("joint_scale_opt", False)
+                    ),
                 )
                 # Per-Linear activation-weighted MSE vs reference.
                 diff = reference_weights - cand_w
@@ -3390,6 +2997,12 @@ def _quantize_2d_nvfp4_group_batched(
                 weights, acts_list,
                 global_real_overrides=global_real_overrides,
                 expert_chunk=expert_chunk,
+                static_act_order=bool(
+                    _ACT_AWARE_FLAGS.get("static_act_order", False)
+                ),
+                joint_scale_opt=bool(
+                    _ACT_AWARE_FLAGS.get("joint_scale_opt", False)
+                ),
             )
     if _ACT_AWARE_FLAGS["scale_sweep"]:
         weights = scale_sweep_nvfp4_batched(
@@ -3520,31 +3133,6 @@ def _export_vector_chunk_len(
 # materializer below). The whole-model variant `_compute_nvfp4_joint_global`
 # lives above and is kept for the MTP path + unit tests.
 # ---------------------------------------------------------------------------
-_FUSED_SIBLINGS = {
-    "q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv",
-    "gate_proj": "gate_up", "up_proj": "gate_up",
-    # MiniMax M2 MoE expert MLP uses `w1` (gate-equivalent) +
-    # `w3` (up-equivalent) + `w2` (down-equivalent). vLLM's
-    # NVFP4 MoE kernel fuses w1+w3 into a single packed weight at
-    # load time and expects ONE shared `weight_global_scale`. The
-    # original Qwen-style `gate_proj`/`up_proj` entries above don't
-    # match MiniMax's naming; without these `w1`/`w3` entries every
-    # expert ends up with mismatched per-Linear globals and vLLM
-    # warns about reduced accuracy. `w2` has no sibling (it's the
-    # down-projection, not part of a gate/up pair) and is excluded.
-    "w1": "gate_up", "w3": "gate_up",
-    # Qwen3.5/3.6 DeltaNet linear-attention pairs. vLLM fuses
-    # `in_proj_qkv + in_proj_z → in_proj_qkvz` and
-    # `in_proj_b + in_proj_a → in_proj_ba` at load time; the fused
-    # packed Linear needs ONE shared NVFP4 `weight_global_scale`.
-    # Omitting these triggers vLLM's
-    # `compressed_tensors_w4a4_nvfp4.py:97` warning about reduced
-    # accuracy from mismatched parallel-layer scales.
-    "in_proj_qkv": "qkvz", "in_proj_z": "qkvz",
-    "in_proj_b": "ba", "in_proj_a": "ba",
-}
-
-
 def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
                                layer_qname: str,
                                assignment: dict[str, str],
@@ -3554,32 +3142,26 @@ def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
     groups inside this decoder layer. Only keys assigned NVFP4 get an
     override entry; the rest compute per-Linear scales at quantize time.
 
-    Under proper AWQ, fused siblings' weights have already been
-    pre-scaled in-place by `_awq_fold_layer_predecessors` (q/k/v or
-    gate/up share a γ, so they all receive the same `s`). Reading
-    `mod.weight` here returns the already-scaled weight, so
-    `compute_nvfp4_global_real` naturally produces the correct joint
-    global for the post-AWQ stored weight.
-
     Semantically equivalent to a scoped `_compute_nvfp4_joint_global`
     across just this layer's modules."""
-    groups: dict[tuple[str, str], list[tuple[str, nn.Linear]]] = defaultdict(list)
+    groups: dict[str, list[tuple[str, str, nn.Linear]]] = defaultdict(list)
     for sub_name, mod in layer_mod.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
-        last = sub_name.rsplit(".", 1)[-1]
-        fam = _FUSED_SIBLINGS.get(last)
-        if fam is None:
+        full = f"{layer_qname}.{sub_name}" if sub_name else layer_qname
+        try:
+            recipe_key = profile.live_to_recipe_name(full)
+        except Exception:
+            recipe_key = full
+        group_key = _fused_group_key_for_name(recipe_key, profile)
+        if group_key is None:
             continue
-        parent = sub_name.rsplit(".", 1)[0] if "." in sub_name else ""
-        groups[(parent, fam)].append((sub_name, mod))
+        groups[group_key].append((full, recipe_key, mod))
 
     out: dict[str, torch.Tensor] = {}
-    for (_, _), members in groups.items():
+    for _group_key, members in groups.items():
         fqn_fmt = []
-        for sub_name, mod in members:
-            full = f"{layer_qname}.{sub_name}" if sub_name else layer_qname
-            recipe_key = profile.live_to_recipe_name(full)
+        for full, recipe_key, mod in members:
             fmt = assignment.get(recipe_key)
             fqn_fmt.append((full, recipe_key, fmt, mod))
         fmts = {_canonical_export_format(f) for _, _, f, _ in fqn_fmt}
@@ -3802,10 +3384,8 @@ def materialize_tensors_streaming(
     dtype: torch.dtype = torch.bfloat16,
     device: torch.device = torch.device("cuda"),
     offload_folder: str | None = None,
-    prune_manifest: dict[str, dict] | None = None,
     tensor_sink: Callable[[dict[str, torch.Tensor]], None] | None = None,
     export_cache_dir: str | None = None,
-    halo_R: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict]:
     """Stream decoder layers through quantize → emit → unload. Never
     holds the full model in memory. Small models still exercise this
@@ -3817,8 +3397,6 @@ def materialize_tensors_streaming(
     When `tensor_sink` is supplied, each emitted head/layer batch is
     passed to the sink and cleared immediately; the returned tensor dict
     is then intentionally empty."""
-    if prune_manifest:
-        raise_expert_prune_disabled("streaming export prune manifest")
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from .layer_streaming import (
@@ -3882,17 +3460,6 @@ def materialize_tensors_streaming(
     # to copy source fp8 + scale_inv bytes verbatim into the output.
     # Distinct key format from the loader-side dequant map above.
     fp8_source_map = _build_fp8_source_map(model_path)
-    prune_by_parent = _index_prune_by_parent(prune_manifest or {})
-    if prune_by_parent:
-        n_pruned_total = sum(
-            e["num_experts_orig"] - e["num_experts_kept"]
-            for e in prune_by_parent.values()
-        )
-        print(
-            f"[export-stream] prune manifest: {len(prune_by_parent)} "
-            f"MoE layers, {n_pruned_total} experts dropped total",
-            flush=True,
-        )
     if fp8_source_map:
         print(f"[export-stream] fp8 source-emit map: {len(fp8_source_map)} "
               f"Linears available for FP8_SOURCE passthrough", flush=True)
@@ -3921,30 +3488,6 @@ def materialize_tensors_streaming(
     # passthrough UNLESS `lm_head` (or similar) is explicitly in the
     # assignment.
     t_head = time.time()
-
-    # HALO rotation on the head section (#4). Folds final_norm gamma into
-    # lm_head and right-rotates embedding + lm_head so the residual
-    # stream starts in the rotated frame. Per-layer rotation continues
-    # in the streaming loop below. See prismaquant/halo.py.
-    if halo_R is not None:
-        from .halo import apply_halo_to_head
-        # Resolve embed/norm qnames from the resolved base_prefix —
-        # multimodal Qwen has body at model.language_model.*, dense
-        # transformer-style models have body at model.*.
-        _embed_qname = (f"{base_prefix}.embed_tokens"
-                        if base_prefix else "model.embed_tokens")
-        _final_norm_qname = (f"{base_prefix}.norm"
-                             if base_prefix else "model.norm")
-        n_head = apply_halo_to_head(
-            model, halo_R,
-            embed_qname=_embed_qname,
-            lm_head_qname=profile.lm_head_name(),
-            final_norm_qname=_final_norm_qname,
-            strict=True,
-        )
-        print(f"[halo] head rotation: {n_head} tensors "
-              f"(embed={_embed_qname}, norm={_final_norm_qname})",
-              flush=True)
 
     def _emit_head_param(full_qname: str, param: nn.Parameter):
         recipe_key = profile.live_to_recipe_name(full_qname)
@@ -4045,16 +3588,8 @@ def materialize_tensors_streaming(
         # the cache is silently wrong because the saved layer tensors
         # were quantized under a different recipe. Write/check a
         # manifest.json; mismatch invalidates the cache wholesale.
-        import hashlib
         import json as _json
         fp_state = {
-            "halo_R_present": halo_R is not None,
-            "halo_R_shape": (
-                list(halo_R.shape) if halo_R is not None else None),
-            "halo_R_hash": (
-                hashlib.sha256(
-                    halo_R.detach().cpu().contiguous().numpy().tobytes()
-                ).hexdigest()[:16] if halo_R is not None else None),
             "PRISMAQUANT_DO_NO_HARM": os.environ.get(
                 "PRISMAQUANT_DO_NO_HARM", "1"),
             "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
@@ -4170,60 +3705,7 @@ def materialize_tensors_streaming(
 
         layer_mod = model.get_submodule(layer_qname)
 
-        # HALO per-layer rotation (#4). Applied AFTER weights are
-        # on-device but BEFORE quantization passes so the rotated
-        # weights are what GPTQ/scale_sweep target. Folds the layer's
-        # input_layernorm + post_attention_layernorm gammas into
-        # downstream Linears, then right-rotates q/k/v/gate/up and
-        # left-rotates o_proj/down_proj. No effect when halo_R is None.
-        if halo_R is not None:
-            from .halo import apply_halo_to_layer
-            n_rotated = apply_halo_to_layer(model, layer_mod, layer_qname,
-                                            halo_R, strict=True)
-            if n_rotated:
-                print(f"[halo] layer {L:02d}: rotated {n_rotated} linears",
-                      flush=True)
-
-        # 3b. Proper-AWQ fold pass — modifies predecessor RMSNorm γ
-        # AND every reader's weight (nn.Linear + packed experts)
-        # IN-PLACE so the matmul identity `(W*s) @ (γ/s · x) = W·γ·x`
-        # holds at runtime regardless of each reader's assigned format.
-        # Must run BEFORE the fused-sibling joint NVFP4 pass and BEFORE
-        # any `_quantize_2d` call so downstream passes see post-AWQ
-        # weights. Returned dict maps NVFP4 Linear recipe_keys → `s`,
-        # used only for dividing cached activations in GPTQ / act-
-        # weighted rounding (runtime sees `a/s` after γ-fold, so the
-        # error-minimization passes must too).
-        global _AWQ_PROPER_SCALES
-        if (_ACT_AWARE_FLAGS.get("awq")
-                and _CACHED_ACTIVATIONS is not None):
-            layer_scales = _awq_fold_layer_predecessors(
-                layer_mod, layer_qname, assignment, profile,
-                _CACHED_ACTIVATIONS, device,
-            )
-            _AWQ_PROPER_SCALES.update(layer_scales)
-        elif (
-            _ACT_AWARE_FLAGS.get("awq")
-            and _PRODUCTION_WEIGHT_CACHE is not None
-            and getattr(_PRODUCTION_WEIGHT_CACHE, "awq_scales", None)
-        ):
-            layer_scales = _awq_fold_layer_precomputed_scales(
-                layer_mod,
-                layer_qname,
-                assignment,
-                profile,
-                getattr(_PRODUCTION_WEIGHT_CACHE, "awq_scales", {}) or {},
-                device,
-            )
-            _AWQ_PROPER_SCALES.update(layer_scales)
-        else:
-            layer_scales = {}
-
-        # 3b'. Joint NVFP4 scales across fused siblings in this layer.
-        # Proper-AWQ pre-scaling has already been applied in-place by
-        # `_awq_fold_layer_predecessors`, so `mod.weight` is the post-
-        # AWQ weight. `_compute_layer_joint_nvfp4` reads those
-        # weights directly — no separate awq_scales kwarg needed.
+        # 3b. Joint NVFP4 scales across fused siblings in this layer.
         joint_globals = _compute_layer_joint_nvfp4(
             layer_mod, layer_qname, assignment, profile,
         )
@@ -4281,44 +3763,7 @@ def materialize_tensors_streaming(
                 continue
             linear_count += 1
             full = f"{layer_qname}.{sub_name}"
-
-            # Prune-aware routing: resolve once per Linear. Actions:
-            #   "router"  → shrink output dim to kept experts + BF16-emit
-            #   "drop"    → pruned expert; do not emit this Linear at all
-            #   "reindex" → kept expert; rewrite qname eid and continue
-            #               through the normal emit path
-            prune_action = _resolve_linear_prune_action(full, prune_by_parent)
-            if prune_action is not None:
-                kind, p_entry = prune_action
-                if kind == "router":
-                    if not mod.weight.is_meta:
-                        w_shrunk = _shrink_router_weight(mod, p_entry)
-                        out[f"{full}.weight"], label = _passthrough_tensor(
-                            f"{full}.weight", w_shrunk, source_dtype_by_name)
-                        if mod.bias is not None and not mod.bias.is_meta:
-                            b_idx = torch.as_tensor(
-                                p_entry["kept_expert_ids"], dtype=torch.long,
-                                device=mod.bias.device,
-                            )
-                            out[f"{full}.bias"], _ = _passthrough_tensor(
-                                f"{full}.bias",
-                                mod.bias.detach().index_select(0, b_idx),
-                                source_dtype_by_name,
-                            )
-                        hist[("linear", f"{label}_router_shrunk")] += 1
-                        covered.add(full)
-                    continue
-                if kind == "drop":
-                    # Skip pruned expert entirely. Mark covered so the
-                    # residual-params loop doesn't re-emit its bias as
-                    # a leftover buffer.
-                    hist[("linear", "PRUNED")] += 1
-                    covered.add(full)
-                    continue
-                # kind == "reindex": emit under the reindexed qname.
-                emit_full = p_entry["new_full"]
-            else:
-                emit_full = full
+            emit_full = full
 
             recipe_key = profile.live_to_recipe_name(full)
             recipe_fmt = assignment.get(recipe_key)
@@ -4698,10 +4143,10 @@ def materialize_tensors_streaming(
         # 3d. Emit packed MoE experts, scoped to this layer.
         packed_count = 0
         for sub_name, mod in layer_mod.named_modules():
-            if not _is_packed_experts_module(mod):
+            if not _is_packed_experts_module(mod, profile):
                 continue
             packed_count += 1
-            for pn in _packed_experts_param_names(mod):
+            for pn in _packed_experts_param_names(mod, profile):
                 experts_qname = (f"{layer_qname}.{sub_name}"
                                  if sub_name else layer_qname)
                 full = f"{experts_qname}.{pn}"
@@ -4727,62 +4172,21 @@ def materialize_tensors_streaming(
                 packed_param_src = getattr(mod, pn).detach()
                 packed_param = packed_param_src.float()
                 E, M, N = packed_param.shape
-                if pn == "gate_up_proj":
-                    half = M // 2
-                    proj_split = [
-                        ("gate_proj", packed_param[:, :half, :]),
-                        ("up_proj",   packed_param[:, half:, :]),
-                    ]
-                else:
-                    proj_split = [(pn, packed_param)]
+                proj_split = _split_packed_expert_tensor(
+                    packed_param,
+                    pn,
+                    profile,
+                )
 
                 is_bf16 = fmt == "BF16" or full in bf16_passthrough
                 disk_qname = profile.on_disk_expert_qname(experts_qname)
                 should_split = profile.split_packed_experts_for_format(fmt)
 
-                # Prune handling for this experts module. If the layer
-                # is pruned, `iter_experts` enumerates (orig_eid, new_eid)
-                # pairs — only kept experts appear. On the non-pruned
-                # path it's `((e, e) for e in range(E))`, preserving
-                # exact legacy behavior.
-                prune_entry = _resolve_packed_experts_prune(
-                    experts_qname, prune_by_parent,
-                )
-                if prune_entry is not None:
-                    if E != int(prune_entry["num_experts_orig"]):
-                        raise RuntimeError(
-                            f"[export-stream] prune: packed experts at "
-                            f"{experts_qname} have E={E} but manifest "
-                            f"has num_experts_orig="
-                            f"{prune_entry['num_experts_orig']}. "
-                            f"Manifest was built against a different "
-                            f"model — refusing to emit."
-                        )
-                    iter_experts = [
-                        (int(orig_s), int(new)) for orig_s, new in
-                        prune_entry["orig_to_new_eid"].items()
-                    ]
-                    # Sort by new_eid so the output tensor ordering is
-                    # dense 0..K-1 in a predictable order.
-                    iter_experts.sort(key=lambda x: x[1])
-                else:
-                    iter_experts = [(e, e) for e in range(E)]
+                iter_experts = [(e, e) for e in range(E)]
 
                 if not should_split:
-                    if prune_entry is not None:
-                        # Keep-packed path after prune: slice the 3D
-                        # tensor on dim 0 to kept experts in new-id
-                        # order, emit under the same unsliced name.
-                        kept_idx = torch.as_tensor(
-                            [o for o, _ in iter_experts],
-                            dtype=torch.long, device=packed_param.device,
-                        )
-                        shrunk = packed_param_src.index_select(0, kept_idx)
-                        out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
-                            full, shrunk, source_dtype_by_name)
-                    else:
-                        out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
-                            full, packed_param_src, source_dtype_by_name)
+                    out[f"{disk_qname}.{pn}"], label = _passthrough_tensor(
+                        full, packed_param_src, source_dtype_by_name)
                     covered.add(full)
                     hist[("packed_moe", label if is_bf16 else fmt)] += 1
                     del packed_param, packed_param_src
@@ -4818,10 +4222,6 @@ def materialize_tensors_streaming(
                                 out[key] = t.cpu()
                 covered.add(full)
                 hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
-                if prune_entry is not None:
-                    hist[("packed_moe_pruned", "experts")] += (
-                        E - prune_entry["num_experts_kept"]
-                    )
                 del packed_param, packed_param_src, proj_split
 
         # 3e. Remaining layer-scoped params (norms, conv1d, biases on
@@ -4834,44 +4234,6 @@ def materialize_tensors_streaming(
                 continue
             if param.is_meta:
                 continue
-            # Prune skip/reindex: pruned expert sub-params (e.g. a norm
-            # inside a dropped expert) must not leak through; kept
-            # experts' leftover params must be emitted under their new
-            # eid. The Linear path already marked pruned Linears as
-            # covered, but non-Linear params inside expert modules need
-            # a separate resolve.
-            leftover_action = _resolve_linear_prune_action(full, prune_by_parent)
-            if leftover_action is not None:
-                kind, p_entry = leftover_action
-                if kind == "drop":
-                    continue
-                if kind == "reindex":
-                    out[p_entry["new_full"]], label = _passthrough_tensor(
-                        full, param, source_dtype_by_name)
-                    hist[("layer_passthrough", label)] += 1
-                    continue
-            # Router-weight shrink for non-Linear routers. Qwen3.5's
-            # `Qwen3_5MoeTopKRouter` is a bare nn.Module with a `.weight`
-            # Parameter — NOT an nn.Linear — so the Linear-loop's router
-            # path never sees it. Detect by stripping `.weight` and
-            # testing against prune_by_parent's router_qname.
-            if prune_by_parent and full.endswith(".weight"):
-                trimmed = full[: -len(".weight")]
-                parent_r = trimmed.rsplit(".", 1)[0]
-                entry_r = prune_by_parent.get(parent_r)
-                if (entry_r is not None
-                        and entry_r["router_qname"] == trimmed
-                        and param.dim() >= 1
-                        and int(param.shape[0]) == int(entry_r["num_experts_orig"])):
-                    idx = torch.as_tensor(
-                        entry_r["kept_expert_ids"], dtype=torch.long,
-                        device=param.device,
-                    )
-                    shrunk = param.detach().index_select(0, idx).contiguous()
-                    out[full], label = _passthrough_tensor(
-                        full, shrunk, source_dtype_by_name)
-                    hist[("router_weight_shrunk", label)] += 1
-                    continue
             out[full], label = _passthrough_tensor(
                 full, param, source_dtype_by_name)
             hist[("layer_passthrough", label)] += 1
@@ -4885,28 +4247,6 @@ def materialize_tensors_streaming(
                 full = f"{full_modpath}.{buf_name}"
                 if full in out or buf.is_meta:
                     continue
-                # Buffer-shrink for pruned MoE: per-expert bias-like buffers
-                # (e.g. MiniMax's `e_score_correction_bias` on the MoE block,
-                # or any other shape-num_experts_orig persistent buffer that
-                # lives on the same parent as the router) must be index-
-                # selected down to kept_expert_ids so their first dim matches
-                # what the native vLLM module allocates (num_local_experts =
-                # kept count). Without this, vLLM's bias loader asserts on
-                # the size mismatch (256 vs 176) and engine init dies.
-                if prune_by_parent:
-                    entry_b = prune_by_parent.get(full_modpath)
-                    if (entry_b is not None
-                            and buf.dim() >= 1
-                            and int(buf.shape[0]) == int(entry_b["num_experts_orig"])):
-                        b_idx = torch.as_tensor(
-                            entry_b["kept_expert_ids"], dtype=torch.long,
-                            device=buf.device,
-                        )
-                        shrunk = buf.detach().index_select(0, b_idx).contiguous()
-                        out[full], label = _passthrough_tensor(
-                            full, shrunk, source_dtype_by_name)
-                        hist[("layer_buffer_shrunk", label)] += 1
-                        continue
                 out[full], label = _passthrough_tensor(
                     full, buf, source_dtype_by_name)
                 hist[("layer_buffer", label)] += 1
@@ -4974,7 +4314,11 @@ def _materialize_tensors_inmemory(
 
     # Pre-pass: joint NVFP4 global_scale per fused-sibling group so
     # q/k/v (or gate/up, etc.) share one weight_global_scale slot.
-    nvfp4_joint_global = _compute_nvfp4_joint_global(model, assignment)
+    nvfp4_joint_global = _compute_nvfp4_joint_global(
+        model,
+        assignment,
+        profile=profile,
+    )
 
     for qname, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
@@ -5009,9 +4353,9 @@ def _materialize_tensors_inmemory(
         hist[("linear", fmt)] += 1
 
     for qname, mod in model.named_modules():
-        if not _is_packed_experts_module(mod):
+        if not _is_packed_experts_module(mod, profile):
             continue
-        for pn in _packed_experts_param_names(mod):
+        for pn in _packed_experts_param_names(mod, profile):
             full_name = f"{qname}.{pn}" if qname else pn
             recipe_key = remap(full_name)
             fmt = assignment.get(recipe_key)
@@ -5022,16 +4366,11 @@ def _materialize_tensors_inmemory(
             packed_param_src = getattr(mod, pn).detach()
             packed_param = packed_param_src.float()
             E, M, N = packed_param.shape
-            if pn == "gate_up_proj":
-                half = M // 2
-                proj_split = [
-                    ("gate_proj", packed_param[:, :half, :]),
-                    ("up_proj",   packed_param[:, half:, :]),
-                ]
-            elif pn in ("down_proj", "w1", "w2", "w3", "gate_proj", "up_proj"):
-                proj_split = [(pn, packed_param)]
-            else:
-                proj_split = [(pn, packed_param)]
+            proj_split = _split_packed_expert_tensor(
+                packed_param,
+                pn,
+                profile,
+            )
 
             is_bf16 = fmt == "BF16" or full_name in bf16_passthrough
             disk_qname = profile.on_disk_expert_qname(qname)
@@ -5190,30 +4529,75 @@ FP8_E4M3_SCHEME = {
         "symmetric": True, "dynamic": True,
     },
 }
+
+
+def _pin_regex_to_layer(body: str, layer_idx: str | None) -> str | None:
+    if layer_idx is None:
+        return None
+    return re.sub(
+        r"layers\[\.\]\[0-9\]\+",
+        f"layers[.]{layer_idx}",
+        str(body),
+        count=1,
+    )
+
+
+def _constrain_per_expert_projection_regex(
+    body: str,
+    proj_options: str,
+) -> str:
+    """Constrain a profile per-expert regex to selected projections.
+
+    Profile specs own projection names.  Older specs spell Qwen-style
+    projections as ``(gate|up|down)_proj``; newer/custom specs may provide
+    complete alternatives like ``(w1_proj|w3_proj|w2)``.  This helper rewrites
+    the final projection segment after ``experts.<id>.`` without hardcoding
+    either naming family into the export path.
+    """
+    replacement = f"({proj_options})"
+    for legacy in (
+        "(gate|up|down)_proj",
+        "(gate_proj|up_proj|down_proj)",
+    ):
+        if legacy in body:
+            return body.replace(legacy, replacement)
+
+    for pattern in (
+        r"(?P<prefix>experts\[\.\]\[0-9\]\+\[\.\])(?P<proj>.+?)(?P<suffix>\$)$",
+        r"(?P<prefix>experts\\\.\[0-9\]\+\\\.)(?P<proj>.+?)(?P<suffix>\$)$",
+        r"(?P<prefix>experts\.\[0-9\]\+\.)(?P<proj>.+?)(?P<suffix>\$)$",
+    ):
+        constrained, count = re.subn(
+            pattern,
+            rf"\g<prefix>{replacement}\g<suffix>",
+            body,
+            count=1,
+        )
+        if count:
+            return constrained
+    return body
+
+
 def _bf16_packed_expert_ignore_regex(
         recipe_key: str,
         profile,
 ) -> list[str]:
-    """If `recipe_key` names a BF16 packed-MoE tensor
-    (`...experts.gate_up_proj` or `...experts.down_proj`), return one or
-    more regex strings that match the corresponding per-expert Linear
-    qnames at scheme-dispatch time, so vLLM's `find_matched_target`
-    routes them to `ignore` instead of a config_groups target.
+    """If `recipe_key` names a BF16 packed-MoE tensor, return regex
+    strings for the corresponding per-expert Linear qnames at
+    scheme-dispatch time.
 
-    For `gate_up_proj` we emit two patterns (one for `gate_proj`, one
-    for `up_proj`) because the packed tensor splits into both at
-    materialize time. Returns `[]` if the recipe_key doesn't look
-    like a packed-expert entry or the profile has no vLLM class to
-    derive naming from."""
+    The packed-parameter to per-projection decomposition comes from the
+    active model profile/spec, so export metadata stays aligned with model
+    structure config instead of baking Qwen-specific names into this path.
+    """
     import re as _re
 
     # Does this recipe key name a packed-expert tensor?
-    m = _re.match(r"^(.*\.)(experts)\.(gate_up_proj|down_proj|w\d|gate_proj|up_proj)$",
-                  recipe_key)
-    if not m:
+    if ".experts." not in recipe_key:
         return []
-    parent = m.group(1)          # `model.layers.X.`  or `model.layers.X.moe.`
-    pn = m.group(3)
+    pn = recipe_key.rsplit(".", 1)[-1]
+    if pn not in _packed_expert_param_name_set(profile):
+        return []
 
     # Convert the recipe parent prefix to a live-model prefix by
     # asking the profile. `profile.live_to_recipe_name` is the
@@ -5233,14 +4617,8 @@ def _bf16_packed_expert_ignore_regex(
     lm = _re.search(r"\.layers\.(\d+)\.", recipe_key)
     if lm:
         layer_idx = lm.group(1)
-    # Build per-proj regex. `gate_up_proj` splits into `gate_proj`
-    # and `up_proj` on disk; `down_proj` stays as `down_proj`.
-    if pn == "gate_up_proj":
-        proj_options = "gate_proj|up_proj"
-    elif pn == "down_proj":
-        proj_options = "down_proj"
-    else:
-        proj_options = _re.escape(pn)
+    projections = _packed_expert_projection_names(profile, pn)
+    proj_options = "|".join(_re.escape(proj) for proj in projections)
 
     # Use the profile's own regex as the base; swap its `(gate|up|down)_proj`
     # group with the exact projections we emit, and constrain to this
@@ -5252,13 +4630,10 @@ def _bf16_packed_expert_ignore_regex(
         mtp_base = profile.per_expert_mtp_regex() if profile else None
         if mtp_base and mtp_base.startswith("re:"):
             body = mtp_base[len("re:"):]
-            pinned = _re.sub(
-                r"layers\[\.\]\[0-9\]\+", f"layers[.]{layer_idx}",
-                body, count=1,
-            )
-            pinned = pinned.replace(
-                "(gate|up|down)_proj", f"({proj_options})",
-            )
+            pinned = _pin_regex_to_layer(body, layer_idx)
+            if pinned is None:
+                return []
+            pinned = _constrain_per_expert_projection_regex(pinned, proj_options)
             return [f"re:{pinned}"]
         # Fallback: emit an `mtp.layers.N.*` regex directly.
         if layer_idx is None:
@@ -5290,13 +4665,10 @@ def _bf16_packed_expert_ignore_regex(
     # Profile-provided regex. Strip the `re:` prefix, pin to this
     # layer index, constrain to the emitted projections.
     body = base[len("re:"):]
-    # Replace [0-9]+ between layers.X. and .experts. with the specific
-    # layer index. Fall back to leaving as-is if the pattern doesn't
-    # match our expectations.
-    pinned = _re.sub(r"layers\[\.\]\[0-9\]\+", f"layers[.]{layer_idx}", body, count=1)
-    # Replace `(gate|up|down)_proj` with only the split projections we
-    # actually emitted (so we don't over-ignore).
-    pinned = pinned.replace("(gate|up|down)_proj", f"({proj_options})")
+    pinned = _pin_regex_to_layer(body, layer_idx)
+    if pinned is None:
+        return []
+    pinned = _constrain_per_expert_projection_regex(pinned, proj_options)
     return [f"re:{pinned}"]
 
 
@@ -5308,6 +4680,72 @@ FORMAT_SCHEME = {
     "FP8_E4M3": FP8_E4M3_SCHEME,
     "FP8_SOURCE": FP8_SOURCE_SCHEME,
 }
+
+
+def _fused_modules_mapping_for_profile(profile) -> dict[str, tuple[str, ...]]:
+    """Return fused-module leaf mapping for target emission.
+
+    The returned shape mirrors vLLM's ``packed_modules_mapping``:
+    ``{"qkv_proj": ("q_proj", ...)}``.
+    """
+    if profile is None:
+        return {}
+
+    getter = getattr(profile, "fused_sibling_leaf_mapping", None)
+    if callable(getter):
+        try:
+            mapping = getter()
+        except Exception:
+            mapping = None
+        if mapping:
+            return {
+                str(fused): tuple(str(sibling) for sibling in siblings)
+                for fused, siblings in mapping.items()
+            }
+
+    try:
+        from .model_profiles.vllm_registry import (
+            packed_modules_mapping_from_class,
+            vllm_class_for_architecture,
+        )
+        vllm_cls = vllm_class_for_architecture(
+            profile.vllm_architecture_class() or ""
+        )
+        packed_mapping = packed_modules_mapping_from_class(vllm_cls)
+        if packed_mapping:
+            return {
+                str(fused): tuple(str(sibling) for sibling in siblings)
+                for fused, siblings in packed_mapping.items()
+            }
+    except Exception:
+        pass
+
+    spec_getter = getattr(profile, "structure_spec", None)
+    spec = spec_getter() if callable(spec_getter) else None
+    if spec is None:
+        return {}
+
+    mapping: dict[str, tuple[str, ...]] = {}
+    for group in getattr(spec, "fused_groups", ()):
+        target_parent, target_leaf = _suffix_parent_leaf(group.target_suffix)
+        member_leafs: list[str] = []
+        valid = True
+        for member in group.member_suffixes:
+            member_parent, member_leaf = _suffix_parent_leaf(member)
+            if target_parent and member_parent and member_parent != target_parent:
+                valid = False
+                break
+            member_leafs.append(member_leaf)
+        if valid and len(member_leafs) > 1:
+            mapping[target_leaf] = tuple(member_leafs)
+    return mapping
+
+
+def _suffix_parent_leaf(suffix: str) -> tuple[str, str]:
+    if "." not in suffix:
+        return "", str(suffix)
+    parent, leaf = str(suffix).rsplit(".", 1)
+    return parent, leaf
 
 
 def build_quantization_config(
@@ -5332,9 +4770,6 @@ def build_quantization_config(
     names, no catch-all regexes) when omitted.
     """
     from .model_profiles import DefaultProfile
-    from .model_profiles.vllm_registry import (
-        vllm_class_for_architecture, packed_modules_mapping_from_class,
-    )
     profile = profile or DefaultProfile()
 
     by_fmt: dict[str, list[str]] = {}
@@ -5362,18 +4797,17 @@ def build_quantization_config(
             continue
         by_fmt.setdefault(fmt, []).append(vllm_name)
 
-    # Fill in fused-sibling members that exist in the live vLLM
-    # model but weren't in the probe assignment — e.g. Gemma 4's
+    # Fill in fused-sibling members that exist in the serving model
+    # but weren't in the probe assignment — e.g. Gemma 4's
     # full_attention layers have no v_proj on disk, so the probe
     # never saw it, but vLLM's QKVParallelLinear still instantiates
     # a v_proj sub-module that gets k_proj's weights at load. Scheme
     # dispatch requires all fused siblings to have consistent
     # scheme. We infer missing siblings by walking the assignment for
     # fused groups that landed in `ignore` and filling in every
-    # sibling from vLLM's `packed_modules_mapping` — including ones
-    # we never saw weights for.
-    vllm_cls = vllm_class_for_architecture(profile.vllm_architecture_class() or "")
-    packed_mapping = packed_modules_mapping_from_class(vllm_cls)
+    # sibling from vLLM's `packed_modules_mapping` or the declarative
+    # model-structure spec — including ones we never saw weights for.
+    packed_mapping = _fused_modules_mapping_for_profile(profile)
     if packed_mapping:
         # Reverse map: sibling-leaf-name -> fused-name (e.g.
         # q_proj -> qkv_proj).
@@ -5401,17 +4835,17 @@ def build_quantization_config(
                     ignore.append(vllm_name)
                     bf16_name_set.add(vllm_name)
 
-    # Packed-3D MoE target emission. vLLM's Qwen3_5/3_6 MoE loads as a
-    # single FusedMoE module at qname `<block>.experts` that owns the
-    # 3D packed expert tensors internally. Scheme dispatch
+    # Packed-3D MoE target emission. Serving runtimes such as vLLM load
+    # packed expert tensors through one FusedMoE module at qname
+    # `<block>.experts`. Scheme dispatch
     # (`get_moe_method`) probes targets via THREE synthetic layer
     # names built off the FusedMoE prefix:
     #   `<block>.experts.0.gate_proj`
     #   `<block>.experts.0.up_proj`
     #   `<block>.experts.0.down_proj`
     # — this is the "Linear-before-fusion" naming convention, not the
-    # packed-tensor qnames (`experts.gate_up_proj`, `experts.down_proj`)
-    # we emit in the safetensors. Without matching targets on that
+    # packed-tensor qnames (for example `experts.gate_up_proj`) we emit
+    # in the safetensors. Without matching targets on that
     # per-expert form, no scheme binds to FusedMoE, `w2_input_global_scale`
     # etc. are never registered, and load_weights KeyErrors on our
     # per-expert input scale keys.
@@ -5420,17 +4854,53 @@ def build_quantization_config(
     # replace it with a per-expert regex pinned to that layer index so
     # vLLM's scheme dispatch gets a match on expert 0's projection
     # names. One regex per layer covers all (expert, projection)
-    # combinations. `promote_moe_pair` ensures gate_up_proj and
-    # down_proj of a single layer share a scheme — we crash loud on
+    # combinations. The profile's packed-expert format groups ensure the
+    # projections of a single FusedMoE share a scheme — we crash loud on
     # mismatch.
-    _packed_moe_re = re.compile(r"^(.+\.experts)\.(gate_up_proj|down_proj)$")
     packed_fused_states: dict[str, set[str]] = {}
+    packed_fused_projections: dict[str, list[str]] = {}
+
+    def _packed_expert_vllm_match(vname: str) -> tuple[str, str] | None:
+        if vname.startswith("re:"):
+            return None
+        if "." not in vname:
+            return None
+        fused_qname, leaf = vname.rsplit(".", 1)
+        if not fused_qname.endswith(".experts"):
+            return None
+        if leaf not in _packed_expert_param_name_set(profile):
+            return None
+        return fused_qname, leaf
+
+    def _packed_format_group_members(fused_qname: str, leaf: str) -> tuple[str, ...]:
+        group_getter = getattr(profile, "packed_expert_format_group", None)
+        if callable(group_getter):
+            group_key = group_getter(f"{fused_qname}.{leaf}")
+            marker = "::__packed_format__:"
+            if group_key and marker in group_key:
+                return tuple(
+                    member for member in group_key.split(marker, 1)[1].split(",")
+                    if member
+                )
+        return (leaf,)
+
+    def _record_packed_fused_state(fused_qname: str, leaf: str, state: str) -> None:
+        packed_fused_states.setdefault(fused_qname, set()).add(state)
+        seen = set(packed_fused_projections.setdefault(fused_qname, []))
+        for member in _packed_format_group_members(fused_qname, leaf):
+            for projection in _packed_expert_projection_names(profile, member):
+                if projection in seen:
+                    continue
+                packed_fused_projections[fused_qname].append(projection)
+                seen.add(projection)
+
     for fmt, names in list(by_fmt.items()):
         kept = []
         for vname in names:
-            m = _packed_moe_re.match(vname)
-            if m:
-                packed_fused_states.setdefault(m.group(1), set()).add(fmt)
+            packed = _packed_expert_vllm_match(vname)
+            if packed is not None:
+                fused_qname, leaf = packed
+                _record_packed_fused_state(fused_qname, leaf, fmt)
             else:
                 kept.append(vname)
         by_fmt[fmt] = kept
@@ -5442,33 +4912,43 @@ def build_quantization_config(
         if vname.startswith("re:"):
             ignore_kept.append(vname)
             continue
-        m = _packed_moe_re.match(vname)
-        if m:
-            packed_fused_states.setdefault(m.group(1), set()).add("IGNORE")
+        packed = _packed_expert_vllm_match(vname)
+        if packed is not None:
+            fused_qname, leaf = packed
+            _record_packed_fused_state(fused_qname, leaf, "IGNORE")
         else:
             ignore_kept.append(vname)
     ignore = ignore_kept
 
-    def _per_expert_regex_for(fused_qname: str) -> str:
+    def _per_expert_regex_for(
+        fused_qname: str,
+        projections: list[str],
+    ) -> str:
         """Regex matching any `<fused_qname>.<eid>.<proj>` where
-        proj ∈ {gate_proj, up_proj, down_proj}. Uses `[.]` (not `\\.`)
-        for literal-dot escapes, matching the rest of this file's
-        regex-target style."""
+        proj is one of the configured per-expert projections. Uses `[.]`
+        for literal-dot escapes, matching the rest of this file's regex
+        target style."""
         escaped = fused_qname.replace(".", "[.]")
+        if not projections:
+            projections = list(_all_packed_expert_projection_names(profile))
+        proj_options = "|".join(re.escape(proj) for proj in projections)
         return (
-            f"re:^{escaped}[.][0-9]+[.](gate_proj|up_proj|down_proj)$"
+            f"re:^{escaped}[.][0-9]+[.]({proj_options})$"
         )
 
     for fused_qname, states in packed_fused_states.items():
         if len(states) > 1:
             raise RuntimeError(
                 f"[export-stream] FusedMoE at {fused_qname!r} has mixed "
-                f"states across projections {states}; promote_moe_pair "
-                f"should have forced gate_up_proj and down_proj to share "
-                f"a scheme before this point."
+                f"states across packed expert projections {states}; "
+                f"the allocator's packed-expert format group should have "
+                f"forced one scheme before this point."
             )
         state = next(iter(states))
-        regex = _per_expert_regex_for(fused_qname)
+        regex = _per_expert_regex_for(
+            fused_qname,
+            packed_fused_projections.get(fused_qname, []),
+        )
         if state == "IGNORE":
             ignore.append(regex)
         else:
@@ -5593,24 +5073,28 @@ def build_quantization_config(
 # and the NVFP4 scale params (w2_input_global_scale, ...) never get
 # registered, crashing at weight-load.
 _PER_EXPERT_RE = re.compile(
-    r"^(?P<prefix>.+\.experts)\.\d+\.(?P<proj>gate|up|down)_proj$")
+    r"^(?P<prefix>.+\.experts)\.\d+\.(?P<proj>[^.]+)$")
 
 
-def _per_expert_parent(base: str) -> str | None:
+def _per_expert_parent(base: str, profile=None) -> str | None:
     """Map a per-expert source tensor base like
     `model.layers.0.mlp.experts.3.gate_proj` to its packed parent
-    `model.layers.0.mlp.experts.gate_up_proj` / `.down_proj`, or None
+    (for example `model.layers.0.mlp.experts.gate_up_proj`), or None
     if `base` is not a per-expert tensor."""
     m = _PER_EXPERT_RE.match(base)
     if not m:
         return None
-    proj = m.group("proj")
-    parent = "gate_up_proj" if proj in ("gate", "up") else "down_proj"
+    parent = _packed_expert_parent_for_projection(profile, m.group("proj"))
+    if parent is None:
+        return None
     return f"{m.group('prefix')}.{parent}"
 
 
-def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
-                         prune_manifest: dict | None = None) -> list[str]:
+def compute_extra_ignore(
+    source_shape_iter,
+    assignment: dict[str, str],
+    profile=None,
+) -> list[str]:
     """Return the list of 2D `.weight` basenames that must be added to
     the compressed-tensors `ignore` set because the recipe doesn't cover
     them.
@@ -5625,45 +5109,22 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
     covers them at vLLM load time, and adding the per-expert name to
     `ignore` would mark the FusedMoE layer as un-quantized.
 
-    `prune_manifest` (when supplied) is the allocator's expert-prune
-    sidecar keyed by router qname. Pruned experts are dropped from the
-    output checkpoint and their slots renumbered to dense 0..K-1, so
-    referring to them in `ignore` by their *original* eid produces
-    stale entries that don't match any module vLLM ever constructs.
-    Filter them out — the kept experts are already covered by the
-    parent FusedMoE scheme, and pruned ones simply don't exist anymore.
     """
     extra_ignore: list[str] = []
     seen_recipe = set(assignment)
-    # Build set of pruned (full source eid path prefixes) we should drop.
-    # Each manifest entry's router_qname is the parent of `.experts.N.X_proj`,
-    # so pruned eids live at f"{parent}.experts.{eid}" where parent is the
-    # router_qname's parent. e.g. router=model.layers.0.mlp.gate ->
-    # parent=model.layers.0.mlp, pruned base=model.layers.0.mlp.experts.102
-    pruned_bases: set[str] = set()
-    if prune_manifest:
-        for _router_qname, entry in prune_manifest.items():
-            parent_path = _router_qname.rsplit(".", 1)[0]
-            for orig_eid in entry.get("pruned_expert_ids", []):
-                pruned_bases.add(f"{parent_path}.experts.{orig_eid}")
     for ckpt_key, shape in source_shape_iter:
         if not ckpt_key.endswith(".weight"):
             continue
         base = ckpt_key[:-7]
-        recipe_name = ("model." + base[len("model.language_model."):]
-                       if base.startswith("model.language_model.")
-                       else base)
+        if profile is not None:
+            recipe_name = profile.live_to_recipe_name(base)
+        else:
+            recipe_name = ("model." + base[len("model.language_model."):]
+                           if base.startswith("model.language_model.")
+                           else base)
         if recipe_name in seen_recipe:
             continue
-        # Skip pruned experts — they're absent from the renumbered output
-        # checkpoint, so emitting an ignore for their original-eid path
-        # produces stale config entries that match nothing in the served
-        # model.
-        if pruned_bases and any(
-                recipe_name.startswith(p + ".") or recipe_name == p
-                for p in pruned_bases):
-            continue
-        parent = _per_expert_parent(recipe_name)
+        parent = _per_expert_parent(recipe_name, profile)
         if parent is not None and parent in seen_recipe:
             continue
         if shape is None or len(shape) != 2:
@@ -5672,88 +5133,16 @@ def compute_extra_ignore(source_shape_iter, assignment: dict[str, str],
     return extra_ignore
 
 
-def _halo_hidden_from_config(cfg) -> tuple[int | None, str | None]:
-    from .halo import halo_hidden_from_config
-
-    return halo_hidden_from_config(cfg)
-
-
-def _halo_config_bool(cfg, key: str) -> bool:
-    from .halo import halo_config_bool
-
-    return halo_config_bool(cfg, key)
-
-
-def _validate_halo_export_support(profile, cfg, hidden: int) -> None:
-    """Fail fast for HALO topologies this exporter cannot rotate safely."""
-    from .halo import validate_halo_export_support
-
-    validate_halo_export_support(profile, cfg, hidden)
-
-
-def _validate_halo_cache_inputs(
-    args,
-    production_cache=None,
-    *,
-    expected_halo: dict[str, object] | None = None,
-) -> None:
-    """Reject HALO/cache combinations that cannot preserve semantics."""
-    if not args.production_weight_cache or production_cache is None:
-        return
-    meta = dict(getattr(production_cache, "metadata", {}) or {})
-    cache_halo = dict(meta.get("halo", {}) or {})
-    cache_mode = str(cache_halo.get("mode", "off"))
-    requested_mode = str(args.halo_mode)
-
-    if requested_mode == "off":
-        if cache_mode != "off":
-            raise RuntimeError(
-                "[halo] production-weight-cache was rendered with "
-                f"HALO mode={cache_mode!r}, but export requested "
-                "--halo-mode off. Export with matching --halo-mode/seed "
-                "or use a no-HALO production cache."
-            )
-        return
-
-    if cache_mode == "off":
-        raise RuntimeError(
-            "[halo] --production-weight-cache is incompatible with "
-            "--halo-mode random unless the cache metadata confirms it "
-            "was rendered from the same HALO-rotated source. Re-render a "
-            "HALO-specific production cache from activations, or export "
-            "without --production-weight-cache for a research-only path."
-        )
-    if cache_mode != requested_mode:
-        raise RuntimeError(
-            "[halo] production-weight-cache HALO mode mismatch: "
-            f"cache={cache_mode!r} requested={requested_mode!r}")
-    cache_seed = cache_halo.get("seed")
-    if cache_seed is None or int(cache_seed) != int(args.halo_seed):
-        raise RuntimeError(
-            "[halo] production-weight-cache HALO seed mismatch: "
-            f"cache={cache_seed!r} requested={args.halo_seed!r}")
-    if expected_halo is not None:
-        for key in ("dim", "rotation_hash", "profile"):
-            expected = expected_halo.get(key)
-            actual = cache_halo.get(key)
-            if expected is not None and actual != expected:
-                raise RuntimeError(
-                    "[halo] production-weight-cache HALO metadata mismatch "
-                    f"for {key}: cache={actual!r} expected={expected!r}")
-
-
 def main():
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
     global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
     global _PRODUCTION_CACHE_PREFETCH_WORKERS, _NVFP4_SCALE_RULE
-    global _AWQ_PROPER_SCALES
     _INPUT_GLOBAL_SCALES = None
     _CACHED_ACTIVATIONS = None
     _ACTIVATION_CACHE_FINGERPRINT = None
     _PRODUCTION_WEIGHT_CACHE = None
     _PRODUCTION_CACHE_FINGERPRINT = None
     _NVFP4_SCALE_RULE = resolve_nvfp4_scale_rule()
-    _AWQ_PROPER_SCALES = {}
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
@@ -5761,18 +5150,6 @@ def main():
     ap.add_argument("--layer-config", default=None,
                     help="layer_config.json from allocator.py. Optional when "
                          "--perturbed-x-dir is supplied.")
-    ap.add_argument("--prune-manifest", default=None,
-                    help="Optional path to an expert-prune sidecar JSON "
-                         "emitted by the allocator at "
-                         "`<layer_config>.prune.json`. When omitted, the "
-                         "exporter auto-detects that path and uses it if "
-                         "it exists; pass an empty string to force a "
-                         "non-prune export even when a sidecar is "
-                         "present. A non-empty manifest drops pruned "
-                         "experts' weights, reindexes kept experts to "
-                         "dense 0..K-1, shrinks the router weight's "
-                         "out-dim, and updates config.json's expert "
-                         "count fields.")
     ap.add_argument("--output", required=True,
                     help="Output directory for the compressed checkpoint")
     ap.add_argument("--shard-bytes", type=int, default=5 * 1024**3,
@@ -5786,26 +5163,13 @@ def main():
     ap.add_argument("--offload-folder", default=None,
                     help="Accelerate disk-offload folder (defaults to "
                          "sibling of output).")
-    ap.add_argument("--ignore", nargs="*", default=["lm_head"],
+    ap.add_argument("--ignore", nargs="*", default=None,
                     help="Module qnames to keep at bf16 even if the "
-                         "allocator assigned another format. "
-                         "lm_head is ignored by default because vLLM's "
-                         "ParallelLMHead module only accepts a single "
-                         "`weight` parameter — it does not support the "
-                         "compressed-tensors NVFP4/MXFP8 layout "
-                         "(weight_packed + weight_scale + global_scales). "
-                         "Quantizing lm_head here produces a valid recipe "
-                         "but vLLM rejects it at load time with "
-                         "'There is no module or parameter named "
-                         "lm_head.input_global_scale in "
-                         "<ForCausalLM>'. This is a RUNTIME limitation, "
-                         "not an allocator choice — the probe + cost "
-                         "stages measure lm_head's sensitivity correctly "
-                         "and the allocator will happily place NVFP4 for "
-                         "it (saving ~0.7 GB on 35B / ~1.1 GB on 122B). "
-                         "Remove this default only if you're exporting "
-                         "for a runtime that supports quantized "
-                         "ParallelLMHead or patches vLLM's registration.")
+                         "allocator assigned another format. Default: the "
+                         "active model profile's pinned_names (typically "
+                         "lm_head/head for current vLLM serving targets). "
+                         "Pass --ignore with no values to disable profile "
+                         "pinning for a runtime that supports quantized heads.")
     ap.add_argument("--activation-cache-dir", default=None,
                     help="Probe's activation cache directory. When "
                          "supplied, per-Linear input_global_scale is "
@@ -5819,13 +5183,6 @@ def main():
                          "instead of recomputing GPTQ/scale-sweep from "
                          "raw activations. This is the faithful path for "
                          "candidates measured with production_weight_cache.")
-    ap.add_argument("--production-cache-variant-map", default=None,
-                    help="JSON qname->internal cache-format map, or a "
-                         "kl_sensitivity_probe payload containing "
-                         "chosen_cache_variants. Runtime formats remain "
-                         "those in --layer-config; this only selects "
-                         "alternate rendered cache entries such as "
-                         "PrismaClip's NVFP4 variant.")
     ap.add_argument("--production-cache-dir-override", default=None,
                     help="Override the backing shard directory stored "
                          "inside --production-weight-cache, for caches "
@@ -5841,33 +5198,23 @@ def main():
                          "activation cache files from a prior production "
                          "calibration/polish run. When supplied, defaults "
                          "--layer-config and --activation-cache-dir from it.")
-    # Activation-aware passes.
-    #
-    # AWQ is a preconditioner, not a replacement for GPTQ/scale_sweep:
-    # search a per-predecessor scale by rendered-weight output MSE, fold the
-    # reciprocal into RMSNorm gamma, then run the existing objectives in the
-    # transformed activation coordinates. It stays opt-in until measured.
-    ap.add_argument("--awq", dest="awq", default=None,
-                    action=argparse.BooleanOptionalAction,
-                    help="AWQ-v2 per-input-channel scale search + gamma fold. "
-                         "Opt-in unless the supplied production cache was "
-                         "built with awq. Runs before GPTQ/scale_sweep and "
-                         "is experimental until KL gates clear.")
     ap.add_argument("--gptq", dest="gptq", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="GPTQ one-shot OBS rounding with block-wise "
                          "error propagation (NVFP4 only; skipped on "
                          "MXFP8). Auto-on when --activation-cache-dir "
                          "is supplied. Measured -2.7%% PPL on Qwen3.6-35B.")
-    ap.add_argument("--act-weighted-round", dest="awq_round", default=None,
-                    action=argparse.BooleanOptionalAction,
-                    help="Activation-weighted rounding polish on NVFP4 "
-                         "(per-weight Δw²·E[a²] minimization at fixed "
-                         "group scale). OFF by default — permutation "
-                         "bake-off showed it undoes most of GPTQ's "
-                         "benefit (geomean out_mse ratio: GPTQ=0.41, "
-                         "GPTQ+act_round=0.99 ≈ RTN). Pass "
-                         "--act-weighted-round to opt in.")
+    ap.add_argument("--gptq-static-act-order", dest="gptq_static_act_order",
+                    default=None, action=argparse.BooleanOptionalAction,
+                    help="Opt-in Lift/MR-GPTQ static activation ordering. "
+                         "Columns are processed by activation importance "
+                         "during GPTQ but restored before export, so no "
+                         "runtime permutation is introduced.")
+    ap.add_argument("--gptq-joint-scale-opt", dest="gptq_joint_scale_opt",
+                    default=None, action=argparse.BooleanOptionalAction,
+                    help="Opt-in Lift/MR-GPTQ joint NVFP4 scale search inside "
+                         "GPTQ. The candidate set includes FourOverSix and "
+                         "additional codebook-aligned max-to-level scales.")
     ap.add_argument("--scale-sweep", dest="scale_sweep", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="Per-group 1-D scale sweep with RTN rounding on "
@@ -5884,7 +5231,7 @@ def main():
                          "after quantization. On a restart, layers whose "
                          "cache file exists are SKIPPED — their tensors "
                          "are loaded from cache and replayed into the "
-                         "shard writer without redoing the AWQ + GPTQ + "
+                         "shard writer without redoing the GPTQ + "
                          "scale_sweep work. Recovers full progress on a "
                          "mid-flight kill (which today restarts from "
                          "layer 0 every time). Cache is removed at end of "
@@ -5896,43 +5243,7 @@ def main():
                     help="Don't remove --export-cache-dir on success. "
                          "Useful for debugging or comparing two exports "
                          "against the same cache.")
-    ap.add_argument("--halo-mode", default="off",
-                    choices=("off", "random"),
-                    help="HALO rotation preprocessor (EXPERIMENTAL, opt-in; "
-                         "default OFF). When 'random', applies a random "
-                         "Hadamard rotation R to the residual stream and "
-                         "absorbs R into adjacent Linear weights. Diffuses "
-                         "outliers across channels — downstream NVFP4/MXFP8 "
-                         "RTN reconstruction error is lower in theory. No "
-                         "new vLLM kernel required (R is absorbed into "
-                         "weights and norms). Literature gain on Llama-class "
-                         "W4A4 is ~0.20-0.30 PPL against an RTN baseline; "
-                         "the gain on top of PrismaQuant's full GPTQ + "
-                         "scale_sweep + activation_clip + sibling-globals "
-                         "stack is UNMEASURED on every architecture as of "
-                         "2026-05-09 — the published Qwen3.6-27B artifact "
-                         "does not use HALO. Use only for research / Pareto "
-                         "exploration, not ship-grade artifacts, until "
-                         "per-arch quality wins have been measured against "
-                         "the no-HALO baseline. Correctness verified on "
-                         "Qwen3.5/3.6 dense (untied-lm_head + offset-residual "
-                         "RMSNorm fold). Critical: assumes standard "
-                         "transformer block topology (input_layernorm + "
-                         "q/k/v/o_proj, post_attention_layernorm + "
-                         "gate/up/down_proj), untied embeddings, and a "
-                         "standard dense residual stream. Non-power-of-2 "
-                         "hidden sizes use a structured block-Hadamard "
-                         "rotation. Profile-specific overrides are still "
-                         "needed for packed MoE or non-standard residual "
-                         "topologies. MTP spec-decode acceptance under HALO "
-                         "is unvalidated — manifest flags "
-                         "`mtp_policy: passthrough_requires_spec_decode_validation`.")
-    ap.add_argument("--halo-seed", type=int, default=0,
-                    help="RNG seed for HALO sign-diagonal in random "
-                         "Hadamard. Saved alongside the artifact at "
-                         "halo_rotation.pt for forensic reproducibility.")
     args = ap.parse_args()
-    _validate_halo_cache_inputs(args)
 
     from .model_profiles import detect_profile
     profile = detect_profile(args.model)
@@ -5960,6 +5271,7 @@ def main():
     _assignment_for_cache, _ = _coerce_runtime_legal_assignment(
         args.model,
         _assignment_for_cache,
+        profile,
     )
 
     if args.production_weight_cache:
@@ -5973,24 +5285,6 @@ def main():
             production_cache.enable_lru(
                 int(float(args.production_cache_lru_gb) * 1024**3)
             )
-        variant_map = _load_production_cache_variant_map(
-            args.production_cache_variant_map
-        )
-        if variant_map:
-            from prismaquant.production_weight_cache import (
-                ProductionWeightCacheVariantView,
-            )
-
-            production_cache = ProductionWeightCacheVariantView(
-                production_cache,
-                variant_map,
-            )
-            print(
-                "[export-stream] production-cache variants: "
-                f"{len(variant_map)} qnames",
-                flush=True,
-            )
-        _validate_halo_cache_inputs(args, production_cache)
         _PRODUCTION_WEIGHT_CACHE = production_cache
         _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
             1, int(args.production_cache_prefetch_workers)
@@ -6045,43 +5339,61 @@ def main():
 
     # Resolve flag defaults.
     cache_supplied = bool(args.activation_cache_dir)
-    cache_fold_scale_enabled = _production_cache_fold_scale_enabled(
-        _PRODUCTION_WEIGHT_CACHE,
-    )
-    # Fold-scale transforms: explicit AWQ flag wins for legacy activation-cache
-    # export; otherwise inherit from an AWQ/SmoothQuant-rendered production
-    # cache so export folds the precomputed scales.
-    awq_enabled = bool(args.awq) if args.awq is not None else cache_fold_scale_enabled
     # GPTQ + scale-sweep: ON iff activation cache supplied.
     gptq_enabled = args.gptq if args.gptq is not None else cache_supplied
-    # act_round: OFF by default (bake-off showed it reverts GPTQ to RTN).
-    awq_round_enabled = bool(args.awq_round) if args.awq_round is not None else False
     # scale_sweep: ON iff activation cache supplied.
     scale_sweep_enabled = (args.scale_sweep if args.scale_sweep is not None
                            else cache_supplied)
-    act_passes_any = (awq_enabled or gptq_enabled or awq_round_enabled
-                      or scale_sweep_enabled)
+    static_act_order_enabled = (
+        args.gptq_static_act_order
+        if args.gptq_static_act_order is not None
+        else os.environ.get(
+            "PRISMAQUANT_GPTQ_STATIC_ACT_ORDER",
+            "0",
+        ).strip().lower() not in {"", "0", "false", "no", "off"}
+    )
+    joint_scale_opt_enabled = (
+        args.gptq_joint_scale_opt
+        if args.gptq_joint_scale_opt is not None
+        else os.environ.get(
+            "PRISMAQUANT_NVFP4_JOINT_SCALE_OPT",
+            "0",
+        ).strip().lower() not in {"", "0", "false", "no", "off"}
+    )
+    static_act_order_enabled = bool(gptq_enabled and static_act_order_enabled)
+    joint_scale_opt_enabled = bool(gptq_enabled and joint_scale_opt_enabled)
+    if (
+        joint_scale_opt_enabled
+        and NVFP4_SCALE_RULE_ENV not in os.environ
+        and _NVFP4_SCALE_RULE == NVFP4_SCALE_RULE_STATIC_6
+    ):
+        _NVFP4_SCALE_RULE = NVFP4_SCALE_RULE_JOINT_MSE
+    act_passes_any = gptq_enabled or scale_sweep_enabled
     # The activation-aware passes need the actual activations, not just
     # the scale summary. We only load raw activations when at least one
     # pass is enabled.
-    if act_passes_any and not cache_supplied and not cache_fold_scale_enabled:
+    if act_passes_any and not cache_supplied:
         print("[export-stream] WARN activation-aware passes requested "
               "but no --activation-cache-dir; disabling.", flush=True)
-        awq_enabled = gptq_enabled = awq_round_enabled = False
+        gptq_enabled = False
         scale_sweep_enabled = False
+        static_act_order_enabled = False
+        joint_scale_opt_enabled = False
         act_passes_any = False
-    print(f"[export-stream] act-aware passes: awq={awq_enabled} "
-          f"gptq={gptq_enabled} awq_round={awq_round_enabled} "
-          f"scale_sweep={scale_sweep_enabled}", flush=True)
+    print(f"[export-stream] act-aware passes: "
+          f"gptq={gptq_enabled} "
+          f"scale_sweep={scale_sweep_enabled} "
+          f"static_act_order={static_act_order_enabled} "
+          f"joint_scale_opt={joint_scale_opt_enabled}", flush=True)
     print(f"[export-stream] NVFP4 scale rule: {_nvfp4_scale_rule_from_env()}",
           flush=True)
     # Publish to the module-level config so `_quantize_2d` picks them
     # up from every call site without needing the flags threaded
     # through `materialize_tensors_streaming` + MTP helpers.
-    _ACT_AWARE_FLAGS["awq"] = awq_enabled
     _ACT_AWARE_FLAGS["gptq"] = gptq_enabled
-    _ACT_AWARE_FLAGS["awq_round"] = awq_round_enabled
     _ACT_AWARE_FLAGS["scale_sweep"] = scale_sweep_enabled
+    _ACT_AWARE_FLAGS["static_act_order"] = static_act_order_enabled
+    _ACT_AWARE_FLAGS["joint_scale_opt"] = joint_scale_opt_enabled
 
     # Populate the module-level input-global-scale cache (used by
     # `_quantize_2d` for NVFP4 linears) from cached activations.
@@ -6134,12 +5446,15 @@ def main():
             # max/6 values can drift by a float-precision tick. Take
             # the max over the group so vLLM runs on the conservative
             # (larger) scale for every sibling.
-            scales = _unify_input_global_scales_across_fused_siblings(scales)
+            scales = _unify_input_global_scales_across_fused_siblings(
+                scales,
+                profile=profile,
+            )
             _INPUT_GLOBAL_SCALES = scales
             if act_passes_any:
                 _CACHED_ACTIVATIONS = _LazyActivationCache(idx)
                 print(f"[export-stream] raw activations will be loaded "
-                      f"lazily for AWQ/GPTQ/round passes "
+                      f"lazily for GPTQ/round/scale-sweep passes "
                       f"({len(idx)}/{len(_recipe_names)} Linears indexed)",
                       flush=True)
             print(f"[export-stream] input_global_scale calibrated for "
@@ -6153,12 +5468,13 @@ def main():
     assignment, runtime_coerced = _coerce_runtime_legal_assignment(
         args.model,
         assignment,
+        profile,
     )
     if runtime_coerced:
         print(
             "[export-stream] runtime format coercions: "
-            f"{len(runtime_coerced)} MXFP8 Linears -> BF16 "
-            "(target runtime does not support those MXFP8 shapes). "
+            f"{len(runtime_coerced)} Linears -> BF16 "
+            "(target runtime does not support those format/shape pairs). "
             f"sample={runtime_coerced[:6]}",
             flush=True,
         )
@@ -6166,18 +5482,6 @@ def main():
     fmts = Counter(assignment.values())
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
           flush=True)
-
-    # Prune manifest: explicit path (empty string = opt-out), else
-    # auto-discover sidecar next to layer_config.json.
-    if args.prune_manifest is None:
-        default_sidecar = Path(args.layer_config + ".prune.json")
-        prune_manifest = _load_prune_manifest(
-            default_sidecar if default_sidecar.exists() else None
-        )
-    elif args.prune_manifest == "":
-        prune_manifest = {}
-    else:
-        prune_manifest = _load_prune_manifest(args.prune_manifest)
 
     from prismaquant.gpu_guard import require_cuda_hot_path
 
@@ -6189,118 +5493,36 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bf16_passthrough = set(args.ignore)
+    bf16_passthrough = set(
+        args.ignore
+        if args.ignore is not None
+        else profile.pinned_names()
+    )
     if args.offload_folder is None:
         args.offload_folder = str(out_dir / "_streaming_offload")
-
-    # Rename body keys → `model.language_model.` on disk for multimodal-
-    # umbrella arches (Qwen3.5/3.6 ConditionalGeneration, Gemma 4
-    # ConditionalGeneration). Our streaming loop produces the text-only
-    # `model.layers.X.*` form.
-    body_infix = getattr(profile, "body_ondisk_infix", None)
-    if callable(body_infix):
-        infix = body_infix()
-    else:
-        # Default: Qwen3.5/3.6 pattern. Profiles for non-multimodal
-        # archs can return "" and we'll skip the rename.
-        infix = "language_model." if profile.name.startswith("qwen3_5") else ""
 
     def _rename_body_batch(
         batch: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        if not infix:
-            return batch
-        renamed: dict[str, torch.Tensor] = {}
-        for k, v in batch.items():
-            if (k.startswith("model.layers.")
-                    or k.startswith("model.embed_tokens")
-                    or k.startswith("model.norm")):
-                renamed[f"model.{infix}{k[len('model.'):]}"] = v
-            else:
-                renamed[k] = v
-        return renamed
+        return {profile.export_tensor_name(k): v for k, v in batch.items()}
 
     writer = IncrementalSafetensorsWriter(out_dir, args.shard_bytes)
-    if infix:
-        print(f"[export-stream] streaming body rename → model.{infix}...",
-              flush=True)
-
-    # HALO rotation matrix (#4). Generated once; applied in
-    # materialize_tensors_streaming to head + each layer.
-    halo_R = None
-    halo_meta = {"mode": "off"}
-    if args.halo_mode == "random":
-        print("[halo] EXPERIMENTAL: HALO is enabled. Pareto win on top of "
-              "PrismaQuant's GPTQ + scale_sweep + activation_clip stack is "
-              "UNMEASURED as of 2026-05-09. Treat the resulting artifact as a "
-              "research output, not ship-grade, until KL/PPL has been "
-              "compared against the same recipe with --halo-mode off.",
-              flush=True)
-        from .halo import halo_metadata, random_hadamard
-        from transformers import AutoConfig as _AC
-
-        # Discover residual-stream dim from config. Multimodal configs
-        # nest hidden_size under text_config/language_model_config. The
-        # validator below rejects unsupported topologies before we spend
-        # time materializing heads or accidentally reusing a stale cache.
-        _cfg = _AC.from_pretrained(args.model, trust_remote_code=True)
-        _hidden, _hidden_path = _halo_hidden_from_config(_cfg)
-        if _hidden is None:
-            raise RuntimeError(
-                "[halo] cannot determine hidden_size from config — "
-                "needed for HALO rotation dimension. Probed: "
-                "hidden_size, text_config.hidden_size, "
-                "language_model_config.hidden_size, "
-                "llm_config.hidden_size.")
-        _validate_halo_export_support(profile, _cfg, _hidden)
-        halo_R = random_hadamard(_hidden, seed=args.halo_seed)
-        mtp_policy = "not_present"
-        if getattr(profile, "has_mtp", lambda: False)():
-            mtp_policy = "passthrough_requires_spec_decode_validation"
-            print(
-                "[halo] profile has MTP weights; body/head HALO is enabled "
-                "and MTP tensors remain on the normal export path. Target "
-                "logits without speculative decoding are covered; MTP "
-                "acceptance should be validated separately when serving with "
-                "speculative decoding.",
-                flush=True,
-            )
-        halo_meta = halo_metadata(
-            halo_R,
-            mode="random",
-            seed=args.halo_seed,
-            hidden_path=_hidden_path,
-            profile=profile,
-            mtp_policy=mtp_policy,
+    sample_recipe_key = "model.layers.0.self_attn.q_proj.weight"
+    sample_source_key = profile.export_tensor_name(sample_recipe_key)
+    if sample_source_key != sample_recipe_key:
+        print(
+            "[export-stream] streaming source-name remap via profile: "
+            f"{sample_recipe_key} -> {sample_source_key}",
+            flush=True,
         )
-        if _PRODUCTION_WEIGHT_CACHE is not None:
-            _validate_halo_cache_inputs(
-                args,
-                _PRODUCTION_WEIGHT_CACHE,
-                expected_halo=halo_meta,
-            )
-        print(f"[halo] mode=random seed={args.halo_seed} "
-              f"dim={_hidden} hidden_path={_hidden_path} "
-              f"blocks={halo_meta['block_sizes']} "
-              f"hash={halo_meta['rotation_hash']}", flush=True)
-        # Persist R alongside the artifact for forensic reproducibility.
-        os.makedirs(out_dir, exist_ok=True)
-        torch.save({"R": halo_R.cpu(), "seed": args.halo_seed,
-                    "mode": "random", "dim": _hidden,
-                    "block_sizes": halo_meta["block_sizes"],
-                    "rotation_hash": halo_meta["rotation_hash"],
-                    "mtp_policy": mtp_policy},
-                   os.path.join(out_dir, "halo_rotation.pt"))
 
     tensors, hist = materialize_tensors_streaming(
         args.model, assignment,
         profile=profile, bf16_passthrough=bf16_passthrough,
         dtype=dtype, device=device,
         offload_folder=args.offload_folder,
-        prune_manifest=prune_manifest,
         tensor_sink=lambda batch: writer.add_tensors(_rename_body_batch(batch)),
         export_cache_dir=args.export_cache_dir,
-        halo_R=halo_R,
     )
     print(f"[export-stream] streamed materialization complete "
           f"resident_tensors={len(tensors)}  hist={hist}",
@@ -6338,12 +5560,10 @@ def main():
                     base = k[:-len(suf)] + ".weight"
                     break
             materialized_bases.add(base)
-            m = re.match(r"^(mtp\.layers\.\d+\.mlp\.experts)\.\d+\.(gate|up|down)_proj\.", k)
-            if m:
-                if m.group(2) in ("gate", "up"):
-                    materialized_bases.add(f"{m.group(1)}.gate_up_proj")
-                else:
-                    materialized_bases.add(f"{m.group(1)}.down_proj")
+            if base.endswith(".weight"):
+                parent = _per_expert_parent(base[:-len(".weight")], profile)
+                if parent is not None:
+                    materialized_bases.add(parent)
         src_extra = {k: v for k, v in src_extra.items()
                      if k not in materialized_bases}
         for k in list(src_extra.keys()):
@@ -6396,33 +5616,15 @@ def main():
                         shape = None
                     yield k, shape
 
-    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment,
-                                        prune_manifest=prune_manifest)
+    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment, profile)
     print(f"[export-stream] extra ignore (unmapped Linears): "
           f"{len(extra_ignore)}", flush=True)
 
     write_config_with_quantization(
         args.model, out_dir, assignment, bf16_passthrough,
         extra_ignore=extra_ignore,
-        prune_manifest=prune_manifest)
+        transform_config=None)
     _copy_tokenizer(args.model, out_dir)
-
-    prune_summary: dict | None = None
-    if prune_manifest:
-        prune_summary = {
-            "n_layers_pruned": len(prune_manifest),
-            "n_experts_orig_total": sum(
-                int(e["num_experts_orig"]) for e in prune_manifest.values()
-            ),
-            "n_experts_kept_total": sum(
-                int(e["num_experts_kept"]) for e in prune_manifest.values()
-            ),
-            "manifest_file": "prune_manifest.json",
-        }
-        # Also persist the manifest into the output dir for traceability
-        # (the validator + any downstream re-export tooling can read it).
-        with open(out_dir / "prune_manifest.json", "w") as f:
-            json.dump(prune_manifest, f, indent=2, sort_keys=True)
 
     with open(out_dir / "mixed_native_manifest.json", "w") as f:
         json.dump({
@@ -6430,10 +5632,9 @@ def main():
             "source_recipe": args.layer_config,
             "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
             "n_assignment_entries": len(assignment),
-            "halo": halo_meta,
             "runtime_coercions": [
-                {"name": name, "shape": shape, "from": "MXFP8", "to": "BF16"}
-                for name, shape in runtime_coerced
+                {"name": name, "shape": shape, "from": from_fmt, "to": "BF16"}
+                for name, shape, from_fmt in runtime_coerced
             ],
             "bf16_audit": _bf16_upgrade_audit(
                 args.model,
@@ -6443,7 +5644,6 @@ def main():
                 profile,
             ),
             "ignore": sorted(bf16_passthrough),
-            "prune": prune_summary,
         }, f, indent=2)
 
     # v25: clear the per-layer cache on successful export. --keep-export-cache
@@ -6652,10 +5852,8 @@ def write_config_with_quantization(
     assignment: dict[str, str],
     bf16_passthrough: set[str],
     extra_ignore: Iterable[str] = (),
-    prune_manifest: dict[str, dict] | None = None,
+    transform_config: dict | None = None,
 ) -> None:
-    if prune_manifest:
-        raise_expert_prune_disabled("write config prune manifest")
     from .model_profiles import detect_profile
     profile = detect_profile(src_model)
     src_cfg_path = Path(src_model) / "config.json"
@@ -6663,42 +5861,9 @@ def write_config_with_quantization(
     qc = build_quantization_config(assignment, bf16_passthrough,
                                    extra_ignore, profile=profile)
     if qc:
+        if transform_config:
+            qc["transform_config"] = transform_config
         cfg["quantization_config"] = qc
-
-    # Prune: shrink MoE expert counts in the config so vLLM / HF
-    # instantiate a ModuleList of the right size. We update every
-    # common HF field name that exists in the source config, so the
-    # loader finds the expected field regardless of arch convention.
-    # All manifest entries must agree on num_experts_kept (same arch)
-    # — mixing kept counts across layers isn't supported by the
-    # shared-config convention.
-    if prune_manifest:
-        kept_counts = {int(e["num_experts_kept"]) for e in prune_manifest.values()}
-        if len(kept_counts) != 1:
-            raise RuntimeError(
-                f"[export-stream] prune: manifest has inconsistent "
-                f"num_experts_kept across layers ({sorted(kept_counts)}). "
-                f"HF config carries a single scalar field — mixed "
-                f"per-layer counts need a schema change."
-            )
-        new_k = next(iter(kept_counts))
-        patched: list[tuple[str, int, int]] = []
-
-        def _patch_scalar(d: dict) -> None:
-            for field in _MOE_EXPERT_COUNT_FIELDS:
-                if field in d and isinstance(d[field], int):
-                    old = int(d[field])
-                    if old != new_k:
-                        d[field] = new_k
-                        patched.append((field, old, new_k))
-
-        _patch_scalar(cfg)
-        # Some multimodal configs nest the text config (e.g. Qwen3.5/3.6
-        # ConditionalGeneration). Patch there too if present.
-        if isinstance(cfg.get("text_config"), dict):
-            _patch_scalar(cfg["text_config"])
-        for field, old, new in patched:
-            print(f"[export-stream] config: {field} {old} → {new}", flush=True)
 
     with open(out_dir / "config.json", "w") as f:
         json.dump(cfg, f, indent=2)

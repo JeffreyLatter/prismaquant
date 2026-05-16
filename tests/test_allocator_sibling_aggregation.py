@@ -14,7 +14,7 @@ These tests pin:
   - aggregate_fused_siblings respects the profile's fused_sibling_group
     and groups 2+-member groups while passing singletons through
   - The super-Linear's per-format predicted_dloss equals the exact sum
-    of member predicted_dlosses (MoE aggregation already guarantees
+    of member predicted_dlosses (sibling aggregation already guarantees
     this mathematically; we replicate it here for siblings)
   - expand_fused_sibling_assignment broadcasts the super-Linear's
     chosen format back to every member
@@ -32,6 +32,7 @@ from prismaquant.allocator import (
     build_candidates,
     compute_achieved,
     expand_fused_sibling_assignment,
+    promote_moe_pair,
     solve_with_promotion,
 )
 
@@ -48,6 +49,21 @@ class _FakeProfile:
             return name.rsplit(".", 1)[0] + ".qkv_proj"
         if name.endswith(".gate_proj") or name.endswith(".up_proj"):
             return name.rsplit(".", 1)[0] + ".gate_up_proj"
+        return None
+
+
+class _FakePackedProfile:
+    """Profile stub for a non-Qwen expert naming scheme.
+
+    The old allocator regex only knew ``.experts`` paths. This profile proves
+    serving-format coupling can now come from the model/profile layer.
+    """
+
+    def packed_expert_format_group(self, name: str) -> str | None:
+        if name.startswith("blocks.0.router_bank.") and name.endswith(
+            (".left", ".right")
+        ):
+            return "blocks.0.router_bank.lr"
         return None
 
 
@@ -272,6 +288,46 @@ def test_aggregation_is_no_op_without_profile():
     assert cands_ext is cands or cands_ext == cands
 
 
+def test_promote_moe_pair_uses_profile_format_groups():
+    assignment = {
+        "blocks.0.router_bank.left": "NVFP4",
+        "blocks.0.router_bank.right": "BF16",
+        "blocks.0.router_bank.other": "NVFP4",
+    }
+    promoted = promote_moe_pair(
+        assignment,
+        {"NVFP4": 0, "BF16": 1},
+        profile=_FakePackedProfile(),
+    )
+    assert promoted["blocks.0.router_bank.left"] == "BF16"
+    assert promoted["blocks.0.router_bank.right"] == "BF16"
+    assert promoted["blocks.0.router_bank.other"] == "NVFP4"
+
+
+def test_promote_moe_pair_uses_default_profile_common_packed_groups():
+    assignment = {
+        "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+        "model.layers.0.mlp.experts.down_proj": "BF16",
+        "model.layers.1.mlp.experts.0.gate_proj": "NVFP4",
+        "model.layers.1.mlp.experts.0.up_proj": "BF16",
+        "model.layers.1.mlp.experts.0.down_proj": "NVFP4",
+        "model.layers.2.mlp.experts.0.w1": "NVFP4",
+        "model.layers.2.mlp.experts.0.w2": "BF16",
+        "model.layers.2.mlp.experts.0.w3": "NVFP4",
+    }
+
+    promoted = promote_moe_pair(assignment, {"NVFP4": 0, "BF16": 1})
+
+    assert promoted["model.layers.0.mlp.experts.gate_up_proj"] == "BF16"
+    assert promoted["model.layers.0.mlp.experts.down_proj"] == "BF16"
+    assert promoted["model.layers.1.mlp.experts.0.gate_proj"] == "BF16"
+    assert promoted["model.layers.1.mlp.experts.0.up_proj"] == "BF16"
+    assert promoted["model.layers.1.mlp.experts.0.down_proj"] == "BF16"
+    assert promoted["model.layers.2.mlp.experts.0.w1"] == "BF16"
+    assert promoted["model.layers.2.mlp.experts.0.w2"] == "BF16"
+    assert promoted["model.layers.2.mlp.experts.0.w3"] == "BF16"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: pre-aggregation hits target without overshoot
 # ---------------------------------------------------------------------------
@@ -293,7 +349,7 @@ def test_pre_aggregation_respects_budget_without_overshoot():
     format_rank = {"NVFP4": 0, "BF16": 1}
 
     target = 8.0  # something mid-range between NVFP4 (~4.5) and BF16 (16)
-    assignment, _pruned, achieved = solve_with_promotion(
+    assignment, achieved = solve_with_promotion(
         stats_ext, cands_ext, target,
         format_specs, format_rank,
         bit_precision=0.001,
@@ -326,7 +382,7 @@ def test_solve_with_promotion_stops_on_stall():
     # BF16 if the DP picks mixed formats, overshooting; tightening can
     # only push until we hit the floor. The stall guard caps iteration.
     target = 4.6
-    assignment, _pruned, achieved = solve_with_promotion(
+    assignment, achieved = solve_with_promotion(
         stats, cands, target, format_specs, format_rank,
         bit_precision=0.001,
         stall_threshold=1e-3,

@@ -67,6 +67,16 @@ def _load_llm(args, *, max_model_len: int) -> LLM:
     return LLM(**kwargs)
 
 
+def _resolve_vocab_size(llm: LLM, tokenizer) -> int:
+    hf_config = llm.llm_engine.model_config.hf_config
+    vocab_size = int(getattr(hf_config, "vocab_size", 0) or 0)
+    if vocab_size <= 0:
+        vocab_size = int(len(tokenizer))
+    if vocab_size <= 0:
+        raise RuntimeError("could not resolve model vocabulary size")
+    return vocab_size
+
+
 def _logprob_vector(logprobs, *, vocab_size: int) -> torch.Tensor:
     vec = torch.full((vocab_size,), float("-inf"), dtype=torch.float32)
     for key, value in logprobs.items():
@@ -137,11 +147,13 @@ def _teacher(args) -> int:
         flush=True,
     )
     llm = _load_llm(args, max_model_len=args.seqlen + 16)
-    hf_config = llm.llm_engine.model_config.hf_config
-    vocab_size = max(
-        int(getattr(hf_config, "vocab_size", len(tokenizer))),
-        int(args.max_logprobs),
-    )
+    vocab_size = _resolve_vocab_size(llm, tokenizer)
+    if int(args.max_logprobs) < vocab_size:
+        raise RuntimeError(
+            f"--max-logprobs={args.max_logprobs} is smaller than "
+            f"model vocab_size={vocab_size}; full-vocab KL requires "
+            "requesting at least the full vocabulary"
+        )
     logprobs = _measure_logprobs(llm, prompts, vocab_size=vocab_size)
     payload = {
         "teacher_logprobs": logprobs,

@@ -499,6 +499,7 @@ def _available_formats_for_name(
     costs: Mapping,
     name: str,
     specs: list[fr.FormatSpec],
+    target_profile: str | None = None,
 ) -> list[str]:
     available: list[str] = []
     seen: set[str] = set()
@@ -511,7 +512,7 @@ def _available_formats_for_name(
                 dict(stats[name]),
                 spec,
                 qname=name,
-                target_profile="research",
+                target_profile=target_profile,
             ).legal
         ):
             available.append(canonical)
@@ -530,13 +531,20 @@ def select_formats_for_l3(
     assignment: Mapping[str, str],
     name: str,
     specs: list[fr.FormatSpec],
+    target_profile: str | None = None,
 ) -> tuple[str, ...]:
     """Choose current + one cheaper + one more accurate + BF16 when present."""
     if name not in stats or name not in assignment:
         return ()
     specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
     current = fr.canonical_format_name(assignment[name])
-    available = _available_formats_for_name(stats, costs, name, specs)
+    available = _available_formats_for_name(
+        stats,
+        costs,
+        name,
+        specs,
+        target_profile=target_profile,
+    )
     if current not in available:
         return ()
 
@@ -619,13 +627,20 @@ def _current_has_cheaper_available_format(
     assignment: Mapping[str, str],
     name: str,
     specs: list[fr.FormatSpec],
+    target_profile: str | None = None,
 ) -> bool:
     current = fr.canonical_format_name(assignment[name])
     specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
     if current not in specs_by_name:
         return False
     current_bits = _bits_for_name(stats, name, specs_by_name[current])
-    for fmt in _available_formats_for_name(stats, costs, name, specs):
+    for fmt in _available_formats_for_name(
+        stats,
+        costs,
+        name,
+        specs,
+        target_profile=target_profile,
+    ):
         if fmt == current or fmt not in specs_by_name:
             continue
         if _bits_for_name(stats, name, specs_by_name[fmt]) < current_bits - 1e-12:
@@ -639,6 +654,7 @@ def select_l3_neighborhood(
     assignment: Mapping[str, str],
     specs: list[fr.FormatSpec],
     *,
+    target_profile: str | None = None,
     uncertainty_rel_tol: float = 0.10,
     min_fraction: float = 0.05,
     max_fraction: float = 0.30,
@@ -656,7 +672,14 @@ def select_l3_neighborhood(
         current_cost = l2_cost_value(stats, costs, name, current)
         if current_cost is None:
             continue
-        fmts = select_formats_for_l3(stats, costs, assignment, name, specs)
+        fmts = select_formats_for_l3(
+            stats,
+            costs,
+            assignment,
+            name,
+            specs,
+            target_profile=target_profile,
+        )
         if not fmts:
             continue
         alt_costs = [
@@ -736,7 +759,12 @@ def select_l3_neighborhood(
         entry
         for entry in eligible
         if _current_has_cheaper_available_format(
-            stats, costs, assignment, entry.name, specs
+            stats,
+            costs,
+            assignment,
+            entry.name,
+            specs,
+            target_profile=target_profile,
         )
     ]
     benefit_by_name = {
@@ -778,6 +806,7 @@ def build_global_l3_neighborhood(
     costs: Mapping,
     assignment: Mapping[str, str],
     specs: list[fr.FormatSpec],
+    target_profile: str | None = None,
 ) -> list[L3NeighborhoodEntry]:
     """Build an L3 measurement neighborhood covering every eligible Linear."""
     selected: list[L3NeighborhoodEntry] = []
@@ -791,7 +820,14 @@ def build_global_l3_neighborhood(
         current_cost = l2_cost_value(stats, costs, name, current)
         if current_cost is None:
             continue
-        fmts = select_formats_for_l3(stats, costs, assignment, name, specs)
+        fmts = select_formats_for_l3(
+            stats,
+            costs,
+            assignment,
+            name,
+            specs,
+            target_profile=target_profile,
+        )
         if not fmts:
             continue
         alt_costs = [
@@ -819,6 +855,7 @@ def build_l3_candidates(
     stats: Mapping,
     propagated_costs: Mapping[str, Mapping[str, Mapping]],
     specs: list[fr.FormatSpec],
+    target_profile: str | None = None,
 ) -> dict[str, list[Candidate]]:
     """Build DP candidates from propagated end-KL costs only."""
     specs_by_name = {fr.canonical_format_name(s.name): s for s in specs}
@@ -839,7 +876,7 @@ def build_l3_candidates(
                 dict(stats[name]),
                 spec,
                 qname=name,
-                target_profile="research",
+                target_profile=target_profile,
             ).legal:
                 continue
             cands.append(

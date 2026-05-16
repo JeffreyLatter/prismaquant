@@ -262,6 +262,37 @@ def test_batched_paths_match_per_linear_with_clip_and_fisher(seeded):
     assert torch.allclose(per_sweep, batch_sweep, atol=1e-4, rtol=1e-3)
 
 
+def test_gptq_batched_matches_per_linear_with_lift_options(seeded):
+    E, out_features, in_features = 3, 24, 48
+    weights, activations_list = _make_inputs(E, out_features, in_features, T=96)
+
+    prev = enc._NVFP4_SCALE_RULE
+    try:
+        enc._NVFP4_SCALE_RULE = enc.NVFP4_SCALE_RULE_JOINT_MSE
+        per_gptq = torch.stack([
+            _gptq_obs_rounding_nvfp4(
+                weights[e],
+                activations_list[e],
+                group_size=16,
+                static_act_order=True,
+                joint_scale_opt=True,
+            )
+            for e in range(E)
+        ], dim=0)
+        batch_gptq = gptq_obs_rounding_nvfp4_batched(
+            weights,
+            activations_list,
+            group_size=16,
+            expert_chunk=2,
+            static_act_order=True,
+            joint_scale_opt=True,
+        )
+    finally:
+        enc._NVFP4_SCALE_RULE = prev
+
+    assert torch.allclose(per_gptq, batch_gptq, atol=1e-5, rtol=1e-5)
+
+
 def test_gptq_batched_realistic_moe_shape(seeded):
     """Production-scale equivalence: 16 experts × `[3072, 1408]` weight
     (similar to MiniMax down_proj proportions, scaled down). Verifies
@@ -301,7 +332,7 @@ def test_quantize_2d_nvfp4_group_batched_integration(seeded):
 
     This does NOT compare to per-Linear `_quantize_2d` because that
     function reads from the module-level `_CACHED_ACTIVATIONS` /
-    `_AWQ_PROPER_SCALES` / `_INPUT_GLOBAL_SCALES` globals; recreating
+    `_INPUT_GLOBAL_SCALES` globals; recreating
     that side-channel state in a unit test is more invasive than the
     test itself. The math is already covered by the per-function
     equivalence tests above; this test just exercises the integration
@@ -311,7 +342,6 @@ def test_quantize_2d_nvfp4_group_batched_integration(seeded):
         _quantize_2d_nvfp4_group_batched,
         _ACT_AWARE_FLAGS,
         _CACHED_ACTIVATIONS,
-        _AWQ_PROPER_SCALES,
     )
     import prismaquant.export_native_compressed as enc
 

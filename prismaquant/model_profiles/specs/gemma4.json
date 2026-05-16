@@ -1,0 +1,144 @@
+{
+  "schema": "prismaquant.model_structure.v1",
+  "id": "gemma4",
+  "default_serving_profile": "vllm_packed_moe",
+  "match": {
+    "model_type": ["gemma4", "gemma4_text"],
+    "architectures": ["Gemma4*"]
+  },
+  "staging": {
+    "text_only_strip_keys": [
+      "vision_config",
+      "audio_config",
+      "speech_config",
+      "image_token_id",
+      "video_token_id",
+      "audio_token_id",
+      "vision_start_token_id",
+      "vision_end_token_id"
+    ],
+    "promote_inner_model_type": true
+  },
+  "shard_regexes": {
+    "visual_config_key": "vision_config",
+    "visual_layer_prefix": "model.vision_tower.vision_model.encoder.layers"
+  },
+  "naming": {
+    "live_to_recipe": [
+      {
+        "strip_prefix": "model.language_model.",
+        "add_prefix": "model."
+      },
+      {
+        "regex": "(\\.layers\\.\\d+)\\.moe\\.experts",
+        "replace": "\\1.experts"
+      }
+    ],
+    "recipe_to_source": [
+      {
+        "prefix": "model.vision_tower.",
+        "replace": "model.vision_tower.",
+        "stop": true
+      },
+      {
+        "prefix": "model.audio_tower.",
+        "replace": "model.audio_tower.",
+        "stop": true
+      },
+      {
+        "prefix": "model.embed_vision.",
+        "replace": "model.embed_vision.",
+        "stop": true
+      },
+      {
+        "prefix": "model.embed_audio.",
+        "replace": "model.embed_audio.",
+        "stop": true
+      },
+      {
+        "prefix": "model.language_model.",
+        "replace": "model.language_model.",
+        "stop": true
+      },
+      {
+        "regex": "(\\.layers\\.\\d+)\\.experts(?=\\.|$)",
+        "replace": "\\1.moe.experts"
+      },
+      {
+        "prefix": "model.",
+        "replace": "model.language_model."
+      }
+    ],
+    "recipe_to_vllm": [
+      {
+        "exact": "lm_head",
+        "replace": "language_model.lm_head",
+        "stop": true
+      },
+      {
+        "prefix": "model.vision_tower.",
+        "replace": "vision_tower.",
+        "stop": true
+      },
+      {
+        "prefix": "model.audio_tower.",
+        "replace": "audio_tower.",
+        "stop": true
+      },
+      {
+        "prefix": "model.embed_vision.",
+        "replace": "embed_vision.",
+        "stop": true
+      },
+      {
+        "prefix": "model.embed_audio.",
+        "replace": "embed_audio.",
+        "stop": true
+      },
+      {
+        "regex": "(\\.layers\\.\\d+)\\.experts(?=\\.|$)",
+        "replace": "\\1.moe.experts"
+      },
+      {
+        "prefix": "model.language_model.",
+        "replace": "language_model.model."
+      },
+      {
+        "prefix": "model.",
+        "replace": "language_model.model."
+      }
+    ]
+  },
+  "fused_groups": [
+    {
+      "target": "self_attn.qkv_proj",
+      "members": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    },
+    {
+      "target": "mlp.gate_up_proj",
+      "members": ["mlp.gate_proj", "mlp.up_proj"]
+    }
+  ],
+  "packed_experts": {
+    "param_names": ["gate_up_proj", "down_proj"],
+    "split_for_formats": [],
+    "projection_splits": {
+      "gate_up_proj": ["gate_proj", "up_proj"]
+    },
+    "format_groups": [
+      ["gate_up_proj", "down_proj"],
+      ["gate_proj", "up_proj", "down_proj"],
+      ["w1", "w2", "w3"]
+    ]
+  },
+  "moe": {
+    "per_expert_regex": "re:^language_model[.]model[.]layers[.][0-9]+[.]moe[.]experts[.][0-9]+[.](gate|up|down)_proj$"
+  },
+  "passthrough_prefixes": [
+    "model.vision_tower.",
+    "model.audio_tower.",
+    "model.embed_vision.",
+    "model.embed_audio."
+  ],
+  "pinned_names": ["lm_head"]
+}

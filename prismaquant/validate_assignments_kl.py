@@ -39,7 +39,6 @@ from prismaquant.perturbed_x_cache import (
     build_quantizable_map,
     calibration_data_hash,
 )
-from prismaquant.production_weight_cache import ProductionWeightCacheVariantView
 from prismaquant.schemas import validate_cost_payload
 from prismaquant.sensitivity_probe import load_calibration
 from prismaquant.source_prefetch import prefetch_safetensors_checkpoint
@@ -87,32 +86,6 @@ def _parse_labeled_path(value: str) -> tuple[str, Path]:
         return label, Path(path)
     path = Path(value)
     return path.stem, path
-
-
-def _load_cache_variant_map(path: str | None) -> dict[str, str]:
-    if not path:
-        return {}
-    payload = _load_json(path)
-    if not isinstance(payload, Mapping):
-        raise ValueError("--production-cache-variant-map must contain a JSON object")
-    raw = payload.get("chosen_cache_variants")
-    if raw is None:
-        numeric = payload.get("numeric_variants")
-        if isinstance(numeric, Mapping):
-            raw = numeric.get("chosen_cache_variants")
-    if raw is None:
-        raw = payload
-    if not isinstance(raw, Mapping):
-        raise ValueError(
-            "--production-cache-variant-map must be a qname->cache-format map "
-            "or a probe payload containing chosen_cache_variants"
-        )
-    return {
-        str(qname): str(fmt).strip().upper()
-        for qname, fmt in raw.items()
-        if str(qname).strip() and str(fmt).strip()
-    }
-
 
 def _assignment_bpp(stats: Mapping, assignment: Mapping[str, str], specs_by_name: Mapping[str, fr.FormatSpec]) -> float:
     names = [name for name in assignment if name in stats]
@@ -561,12 +534,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "measured on the same production-rendered W_tilde path used by export.",
     )
     parser.add_argument(
-        "--production-cache-variant-map",
-        default=None,
-        help="JSON qname->internal cache-format map, or a probe payload "
-        "containing chosen_cache_variants.",
-    )
-    parser.add_argument(
         "--production-cache-dir-override",
         default=None,
         help="Relocate disk-backed production cache entries to this directory.",
@@ -604,14 +571,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=24.0,
     )
-    parser.add_argument(
-        "--halo-mode",
-        choices=("off", "random"),
-        default="off",
-        help="Apply HALO to the BF16 model before reference/candidate KL. "
-        "Required when measuring a HALO-rendered production cache.",
-    )
-    parser.add_argument("--halo-seed", type=int, default=0)
     args = parser.parse_args(argv)
 
     if args.disable_frozen_weight_cache:
@@ -646,7 +605,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     work_root.mkdir(parents=True, exist_ok=True)
     remove_work_root = args.work_dir is None
     try:
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tokenizer_kwargs = {
             "trust_remote_code": True,
@@ -722,12 +681,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 production_cache.enable_lru(
                     int(float(args.production_cache_lru_gb) * 1024**3)
                 )
-            variant_map = _load_cache_variant_map(args.production_cache_variant_map)
-            if variant_map:
-                production_cache = ProductionWeightCacheVariantView(
-                    production_cache,
-                    variant_map,
-                )
         materialization_mode = args.assignment_materialization
         if materialization_mode == "auto":
             if production_cache is not None and len(assignments) == 1:
@@ -756,47 +709,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile = detect_profile(args.model)
         except Exception:
             profile = DefaultProfile()
-        cache_halo = dict(
-            (getattr(production_cache, "metadata", {}) or {}).get("halo", {}) or {}
-        ) if production_cache is not None else {"mode": "off"}
-        cache_halo_mode = str(cache_halo.get("mode", "off"))
-        if args.halo_mode == "off":
-            if cache_halo_mode != "off":
-                raise RuntimeError(
-                    "[validate-kl] production cache was rendered with "
-                    f"HALO mode={cache_halo_mode!r}; re-run validation with "
-                    "matching --halo-mode/--halo-seed."
-                )
-        else:
-            from prismaquant.halo import apply_random_halo_to_model
-
-            if production_cache is not None:
-                if cache_halo_mode != args.halo_mode:
-                    raise RuntimeError(
-                        "[validate-kl] production cache HALO mode mismatch: "
-                        f"cache={cache_halo_mode!r} requested={args.halo_mode!r}")
-                if int(cache_halo.get("seed", -1)) != int(args.halo_seed):
-                    raise RuntimeError(
-                        "[validate-kl] production cache HALO seed mismatch: "
-                        f"cache={cache_halo.get('seed')!r} "
-                        f"requested={args.halo_seed!r}")
-            cfg = AutoConfig.from_pretrained(staged, **tokenizer_kwargs)
-            _, halo_meta = apply_random_halo_to_model(
-                model,
-                profile,
-                cfg,
-                seed=args.halo_seed,
-                verbose=True,
-            )
-            if production_cache is not None:
-                for key in ("dim", "rotation_hash", "profile"):
-                    expected = halo_meta.get(key)
-                    actual = cache_halo.get(key)
-                    if expected is not None and actual != expected:
-                        raise RuntimeError(
-                            "[validate-kl] production cache HALO metadata "
-                            f"mismatch for {key}: cache={actual!r} "
-                            f"expected={expected!r}")
         ref_log_probs = cache_reference_log_probs(
             model,
             calib_ids,
@@ -944,10 +856,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
             } if args.production_weight_cache else None,
             "source_prefetch": source_prefetch_stats,
-            "halo": {
-                "mode": args.halo_mode,
-                "seed": int(args.halo_seed),
-            },
             "results": results,
         }
         output = Path(args.output)
