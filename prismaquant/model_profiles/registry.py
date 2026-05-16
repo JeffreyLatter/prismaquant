@@ -31,6 +31,7 @@ from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
 from .qwen3_5_dense import Qwen3_5DenseProfile
 from .qwen3_moe import Qwen3MoeProfile
+from .qwen3_next import Qwen3NextProfile
 
 # MiniMaxM2Profile: re-imported from its live mirror after the 2026-04-24
 # session's Phase-3 archive move. The profile is still tracked under
@@ -38,11 +39,10 @@ from .qwen3_moe import Qwen3MoeProfile
 # allocator Pareto runs without uprooting the archive commit.
 from .minimax_m2 import MiniMaxM2Profile
 from .deepseek_v4 import DeepseekV4Profile
-from .qwen3_next import Qwen3NextProfile
 
 
 _REGISTERED: list[type[ModelProfile]] = [
-    Qwen3NextProfile,     # before Qwen3_5/Qwen3 — distinct model_type "qwen3_next"
+    Qwen3NextProfile,     # distinct model_type "qwen3_next" — before Qwen3 siblings
     Qwen3_5DenseProfile,  # must precede Qwen3_5Profile (dense is a subset)
     Qwen3_5Profile,
     Qwen3MoeProfile,  # must precede Qwen3Profile (MoE model_type includes qwen3)

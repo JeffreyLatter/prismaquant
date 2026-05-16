@@ -683,6 +683,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="During re-cache, install production weights but leave activation "
         "quantization disabled in replay hooks.",
     )
+    p.add_argument(
+        "--halo-mode",
+        choices=("off", "random"),
+        default="off",
+        help="Apply HALO before rendering production weights. A HALO cache is "
+        "only valid with matching export --halo-mode/--halo-seed.",
+    )
+    p.add_argument(
+        "--halo-seed",
+        type=int,
+        default=0,
+        help="RNG seed for HALO random Hadamard sign diagonal.",
+    )
     args = p.parse_args(argv)
 
     # Opt-in deterministic CUDA path. The default lever ablations on small

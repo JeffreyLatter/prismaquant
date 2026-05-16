@@ -179,21 +179,68 @@ class ModelProfile(ABC):
             "gate_proj", "up_proj",        # some HF layouts
         })
 
+    def packed_expert_module_class_names(self) -> frozenset[str]:
+        """Legacy packed-expert container class names accepted by this profile.
+
+        Most current architectures expose profile-declared 3D parameters and
+        never need class-name fallback. Specs can list older wrapper classes
+        when parameter discovery needs a second hint.
+        """
+        spec = self.structure_spec()
+        if spec is not None and spec.packed_experts.declared:
+            return frozenset(spec.packed_experts.module_class_names)
+        return frozenset()
+
+    def pinned_names(self) -> tuple[str, ...]:
+        """Recipe/module names that must remain unquantized for this profile."""
+        spec = self.structure_spec()
+        if spec is not None:
+            return tuple(spec.pinned_names)
+        return ("lm_head",)
+
+    def is_pinned_name(self, qname: str) -> bool:
+        """Return True when ``qname`` is covered by this profile's pins."""
+        name = str(qname)
+        module_name = name[:-7] if name.endswith(".weight") else name
+        for pinned in self.pinned_names():
+            pin = str(pinned)
+            pin_module = pin[:-7] if pin.endswith(".weight") else pin
+            if module_name == pin_module or module_name.endswith("." + pin_module):
+                return True
+            if name == pin or name.endswith("." + pin):
+                return True
+        return False
+
+    def fast_kernel_requirements(self) -> tuple[tuple[str, str], ...]:
+        """Required Python modules for production-speed forwards.
+
+        Returns ``(module_name, install/display_name)`` pairs. Profiles use
+        this for fail-fast guards around architecture-specific optimized
+        kernels without making callers parse model names.
+        """
+        spec = self.structure_spec()
+        if spec is None:
+            return ()
+        return tuple(
+            (req.module, req.package)
+            for req in spec.fast_kernel_requirements
+        )
+
     def pack_checkpoint_expert_tensors(
         self, layer_prefix: str, tensors: dict
     ) -> dict:
         """Pack per-expert checkpoint tensors into 3D form.
 
         Called by the streaming loader after reading raw tensors for a
-        layer. The default is a no-op. Architectures that store experts
-        as individual 2D tensors on disk but load them as a single 3D-
-        packed ``nn.Parameter`` in the HF model (e.g. Qwen3-Coder-Next)
-        override this to perform the packing so ``_fast_install`` finds
-        the packed keys in the install resolver.
+        layer. The default is a no-op. Architectures that store experts as
+        individual 2D tensors on disk but load them as a single 3D-packed
+        ``nn.Parameter`` in the HF model (e.g. Qwen3-Coder-Next) override
+        this to perform the packing so ``_fast_install`` finds the packed
+        keys in the install resolver.
 
         Args:
-            layer_prefix: the current layer prefix including trailing
-                dot, e.g. ``"model.layers.0."``.
+            layer_prefix: the current layer prefix including trailing dot,
+                e.g. ``"model.layers.0."``.
             tensors: dict mapping model name → tensor as returned by
                 ``_read_layer_to_device``.
 

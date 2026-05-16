@@ -101,17 +101,13 @@ def _minimax_native_fp8_checkpoint(model_path: str) -> bool:
 def _mask_cuda_queries_during_meta_init(log_prefix: str):
     """Keep HF meta-skeleton construction from probing CUDA.
 
-    `init_empty_weights()` should be a pure Python/meta-tensor path, but some
-    model constructors or optional attention backends call `torch.cuda` while
-    choosing implementation details. On systems with a wedged or slow NVML path
-    that can hang before PrismaQuant reaches its own streaming loader, setting
-    PRISMAQUANT_MASK_CUDA_DURING_META_INIT=1 patches `torch.cuda.is_available`
-    to return False for the duration of the `with` block.
-
-    Disabled by default (PRISMAQUANT_MASK_CUDA_DURING_META_INIT=0) because the
-    masking causes @lru_cache poisoning in transformers helpers and suppresses
-    fla/Triton device-state initialisation that must run with CUDA live.
-    Only enable it on systems where NVML probing during meta-init causes hangs.
+    `init_empty_weights()` should be a pure Python/meta-tensor path. Some model
+    constructors or optional attention backends still ask `torch.cuda` whether
+    a device exists while choosing implementation details. On systems with a
+    wedged or slow UVM/NVML path that can burn CPU or hang before PrismaQuant
+    reaches its own streaming loader. The skeleton does not need CUDA, so make
+    those availability checks return "no CUDA" for this short block without
+    initializing CUDA or changing the requested runtime device.
     """
     enabled = os.environ.get(
         "PRISMAQUANT_MASK_CUDA_DURING_META_INIT", "0"
@@ -342,10 +338,6 @@ class StreamingContext:
         self.prefetch_workers = int(prefetch_workers)
         self.prefetch_min_available_bytes = int(prefetch_min_available_bytes or 0)
         self.prefetch_memory_skips = 0
-        # Architecture profile — used to pack per-expert checkpoint tensors
-        # (e.g. Qwen3Next) before _fast_install. None for profiles with no
-        # checkpoint-to-live packing needed (most architectures).
-        self.profile = profile
         # Native-FP8 checkpoint dequant map: `{live_weight_key:
         # (shard_path, scale_inv_ckpt_key)}`. When non-empty, every
         # per-layer reload via `_read_layer_to_device` applies the
@@ -353,6 +345,10 @@ class StreamingContext:
         # dequanted weights, not raw fp8 codes cast to bf16. Empty dict
         # for BF16-native checkpoints — loader path is unchanged.
         self.fp8_scale_inv_map = fp8_scale_inv_map or {}
+        # Architecture profile — used to pack per-expert checkpoint tensors
+        # (e.g. Qwen3Next) before _fast_install. None for profiles with no
+        # checkpoint-to-model tensor layout mismatch.
+        self.profile = profile
         self._inflight: dict[int, Any] = {}
         self._inflight_lock = threading.Lock()
         self.configure_runtime_pressure_floor()
@@ -695,9 +691,6 @@ def _build_streaming_context(model_path: str, *,
         p.requires_grad_(False)
     base_model, layers = _get_layer_list(model)
 
-    from .model_profiles import detect_profile as _detect_profile
-    _profile = _detect_profile(model_path)
-
     weight_shard, weight_ckpt = _build_weight_map(model_path, multimodal=multimodal)
     # Native-FP8 source dequant map. Populated only for checkpoints that
     # ship `.weight_scale_inv` siblings (MiniMax-M2/M2.7, DeepSeek-V3).
@@ -841,6 +834,9 @@ def _build_streaming_context(model_path: str, *,
 
     prefetch_pool = ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="prefetch")
+
+    from .model_profiles import detect_profile as _detect_profile
+    _profile = _detect_profile(model_path)
 
     return StreamingContext(
         model=model, base_model=base_model, layers=layers,
