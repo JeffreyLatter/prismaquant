@@ -1,4 +1,4 @@
-From 98fb3935754d44fb6ab2a3c68bb244dc4db728c4 Mon Sep 17 00:00:00 2001
+From e9acc3d62b48e271d32be782de260bf0b3d38e00 Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:26:09 +0200
 Subject: [PATCH 5/6] fork: Section 5 - Qwen3-Coder-Next (qwen3_next) model
@@ -29,11 +29,11 @@ calls detect_profile and stores it; both _prefetch_worker and ensure_loaded call
 profile.pack_checkpoint_expert_tensors after _read_layer_to_device.
 ---
  prismaquant/model_profiles/__init__.py   |   2 +
- prismaquant/model_profiles/base.py       |  24 +++
+ prismaquant/model_profiles/base.py       |  37 ++++
  prismaquant/model_profiles/qwen3_next.py | 238 +++++++++++++++++++++++
  prismaquant/model_profiles/registry.py   |   2 +
  prismaquant/streaming_model.py           |  15 +-
- 5 files changed, 280 insertions(+), 1 deletion(-)
+ 5 files changed, 293 insertions(+), 1 deletion(-)
  create mode 100644 prismaquant/model_profiles/qwen3_next.py
 
 diff --git a/prismaquant/model_profiles/__init__.py b/prismaquant/model_profiles/__init__.py
@@ -57,10 +57,10 @@ index 6c115bc..d3de5d1 100644
      "Qwen3_5DenseProfile",
      "Gemma4Profile",
 diff --git a/prismaquant/model_profiles/base.py b/prismaquant/model_profiles/base.py
-index b72873c..d8bce99 100644
+index b72873c..78ef413 100644
 --- a/prismaquant/model_profiles/base.py
 +++ b/prismaquant/model_profiles/base.py
-@@ -226,6 +226,30 @@ class ModelProfile(ABC):
+@@ -226,6 +226,43 @@ class ModelProfile(ABC):
              for req in spec.fast_kernel_requirements
          )
  
@@ -87,6 +87,19 @@ index b72873c..d8bce99 100644
 +            their 3D-packed equivalents.
 +        """
 +        return tensors
++
++    def pinned_names(self) -> tuple[str, ...]:
++        """Recipe/module names that must remain unquantized (BF16 passthrough).
++
++        The default reads from the declarative structure spec when present,
++        falling back to ('lm_head',) which covers all current vLLM serving
++        targets. Override in profiles where the head has a different name
++        (e.g. DeepSeek uses 'head').
++        """
++        spec = self.structure_spec()
++        if spec is not None:
++            return tuple(spec.pinned_names)
++        return ("lm_head",)
 +
      def per_expert_moe_regex(self) -> str | None:
          """Regex matching vLLM's per-expert Linear qnames at scheme
