@@ -693,6 +693,12 @@ def main():
         })
         if args.pareto_output_dir:
             expanded = _expand_assignment_for_seed_json(assign)
+            # Mirror the main layer_config: MTP Linears are pinned to
+            # --mtp-format. The per-target DP may have quantized them, but
+            # the pipeline keeps MTP at the recipe format. Without this the
+            # validated-surrogate frontier cache (built body-only) has no
+            # rendered weights for mtp.* and prefetch_assignment fails.
+            expanded = apply_mtp_format_override(expanded, args.mtp_format)
             expanded_counts = defaultdict(int)
             for fmt in expanded.values():
                 expanded_counts[fmt] += 1
