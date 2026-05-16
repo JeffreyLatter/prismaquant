@@ -369,3 +369,73 @@ before the Qwen3.5 family (distinct `model_type` avoids any overlap).
 
 Added `"qwen3_next"` to the set that maps to `"vllm_qwen3_5_packed_moe"`, so the
 BF16 audit knows to use the MoE-aware allocator profile for format coverage checks.
+
+---
+
+## 6. Streaming production cache for models too large for CUDA UMA
+
+**Files changed:**
+- `prismaquant/build_production_cache.py`
+
+### Background
+
+Qwen3-Coder-Next (79.67B params) is approximately 159 GB in BF16, larger than the GB10
+Grace-Blackwell's 121.63 GB CUDA-visible UMA. The standard
+`AutoModelForCausalLM.from_pretrained(device_map="cuda")` path triggers transformers'
+`caching_allocator_warmup` which attempts to pre-allocate
+`min(model_bytes, cuda_total - 1.2 GB) = 120.43 GiB` in a single `torch.empty(fp16)`,
+immediately OOM-ing with 118.94 GiB free.
+
+Even without the warmup, a 159 GB model cannot be fully resident in 121 GB.
+
+### Solution: streaming production cache
+
+`_fill_production_cache_streaming` replaces the full-model load for models that exceed
+`cuda_total - 4 GB`. It reuses the existing streaming infrastructure
+(`_build_streaming_context`, `_call_layer`, `LayerCache`) already used by
+the Fisher probe:
+
+1. **Build skeleton**: same `init_empty_weights()` meta-skeleton approach as incremental_probe.
+   Only the always-resident head modules (embed_tokens, norm, lm_head, rotary) go on GPU.
+   Peak GPU: ~0.5 GB.
+
+2. **Build qnames from skeleton**: `iter_quantizable_tensors(skeleton)` yields the same
+   `nn.Linear` modules as on the live model (meta tensors have correct shapes). The
+   `qname_to_module` dict stores direct module references that remain valid through
+   `install(L)` / `unload(L)` cycles (module identity is stable, only `.weight` attribute changes).
+
+3. **Per-layer streaming loop** (`for L in range(num_layers)`):
+   - `ctx.install(L)`: swap layer L weights from disk → GPU (~3–4 GB for Qwen3Next)
+   - Run all N calibration samples through layer L: `_call_layer(layers[L], hidden[i], ...)`
+     — activation hooks installed on the skeleton fire and collect per-qname tensors.
+   - Compute NVFP4 joint globals via `_compute_nvfp4_joint_global(skeleton, layer_assignment)`:
+     works because layer L's modules have GPU weights while installed.
+   - Compute per-qname `activation_max_abs` with sibling unification.
+   - Render production weights while layer is installed: `render_production_weight(mod.weight.data, ...)`.
+   - `ctx.unload(L)`: weights freed back to meta.
+   - Free this layer's activation tensors from the collector.
+
+4. **Hidden-state propagation**: `hidden_states[i]` accumulates the running output of all
+   completed layers for sample i. Between layers, the total hidden-state buffer is
+   `N × T × H × 2 bytes = 32 × 1024 × 2048 × 2 ≈ 134 MB` — trivial.
+
+5. **Resume support**: checks `cache_dir/<qname>__<fmt>.pt` files before rendering
+   (same as `fill_production_weight_cache`). Writes `activation_max_abs.json` sidecar after
+   completion.
+
+Peak memory:
+- Standard path: 159 GB (OOM on 121 GB system)
+- Streaming path: ~4 GB (one layer) + 134 MB (hidden states) + ~30 MB (activations) ≈ 4.2 GB
+
+### Limitations
+
+- HALO not supported (requires full model for Hadamard rotation).
+- Recache pass (`--recache-layer-config`) not supported.
+- AWQ, SmoothQuant, `fisher_gptq`, `fisher_clip` not supported.
+- Default pipeline (`gptq,scale_sweep` on NVFP4) is fully supported.
+
+### Detection logic
+
+`main()` calls `_estimate_model_bytes_from_index(staged)` to read `total_size` from
+`model.safetensors.index.json`. If `model_bytes > cuda_total - 4 GB`, streaming is
+used automatically. No CLI flag required — the routing is transparent.
