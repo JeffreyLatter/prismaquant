@@ -1,4 +1,4 @@
-From e45484633fcb6ee49a2ca20d15adad2ad263d9b8 Mon Sep 17 00:00:00 2001
+From ea7739127c0112b3f96f65fd54a6dd32330badd5 Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:21:52 +0200
 Subject: [PATCH 3/6] fork: Section 3 - Phase-1 OOM fix on dense 27B+ models
@@ -20,8 +20,8 @@ max(shard_headroom, phase1_headroom). For 27B this changes cache headroom from
 combined peak 97.8 GB with 23 GB margin.
 ---
  prismaquant/autoscale.py         | 31 +++++++++++++++++++++++++++----
- prismaquant/incremental_probe.py |  9 ++++-----
- 2 files changed, 31 insertions(+), 9 deletions(-)
+ prismaquant/incremental_probe.py | 19 ++++++++-----------
+ 2 files changed, 35 insertions(+), 15 deletions(-)
 
 diff --git a/prismaquant/autoscale.py b/prismaquant/autoscale.py
 index 0a17b54..b409349 100644
@@ -84,20 +84,31 @@ index 0a17b54..b409349 100644
  
  
 diff --git a/prismaquant/incremental_probe.py b/prismaquant/incremental_probe.py
-index bff9f54..9b518e3 100644
+index bff9f54..3107726 100644
 --- a/prismaquant/incremental_probe.py
 +++ b/prismaquant/incremental_probe.py
-@@ -1180,11 +1180,10 @@ def _compute_global_precompute(
-     # we split back into a list of CPU tensors so the rest of the code
-     # (precompute cache pickle, phase-3 reads) sees the original layout.
+@@ -1173,18 +1173,15 @@ def _compute_global_precompute(
+         if L % 8 == 0 or L == num_layers - 1:
+             print(f"[incremental/global] fwd L{L:02d}  src={src}  "
+                   f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+-    # v22 Fix E1: batched device→host transfer for the activations
+-    # captured during phase-1. All have the same (B, T, H) shape so we
+-    # stack into one (L+1, B, T, H) tensor and do a single .cpu() —
+-    # 62 individual transfers collapsed into one. After the copy lands,
+-    # we split back into a list of CPU tensors so the rest of the code
+-    # (precompute cache pickle, phase-3 reads) sees the original layout.
++    # Transfer device activations to CPU one at a time.  The previous
++    # torch.stack(...).cpu() + [stacked[i].clone()] pattern created three
++    # simultaneous copies of all layer activations (stack temp + stacked_host +
++    # clone outputs = 3×20 GB = 60 GB on 27B), leaving only ~0.4 GB margin
++    # on 121 GB UMA and causing OOM kills.  Per-element .cpu() peaks at 2×
++    # (device_acts still alive + host copy building) = 40 GB total.
      t_h2h = time.time()
 -    stacked = torch.stack(device_acts, dim=0).cpu()
 -    activations_cpu: list[torch.Tensor] = [
 -        stacked[i].clone() for i in range(stacked.size(0))
 -    ]
 -    del device_acts, stacked
-+    # Transfer one tensor at a time to avoid the triple-copy peak
-+    # (device_acts + stacked + stacked.cpu() + clone = 4× in flight).
 +    activations_cpu: list[torch.Tensor] = [t.cpu() for t in device_acts]
 +    del device_acts
      print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
