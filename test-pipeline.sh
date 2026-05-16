@@ -45,6 +45,27 @@ CALIBRATION_MODALITY=text-only \
 
 set -euo pipefail
 
+# ── CLI argument parsing ─────────────────────────────────────────────────────
+# --repo <org/model>   Set MODEL_PATH to a HuggingFace repo ID; resolved via
+#                      _resolve_hf_model_path() to the local cache snapshot.
+# --auto-accept        Skip interactive knee-point and format-leg prompts;
+#                      auto-accept the suggested knee bpp and auto-drop
+#                      zero-layer format legs without waiting for input.
+_AUTO_ACCEPT=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)
+      [[ $# -ge 2 ]] || { echo "[pipeline] ERROR: --repo requires an argument" >&2; exit 1; }
+      MODEL_PATH="$2"; shift 2 ;;
+    --auto-accept)
+      _AUTO_ACCEPT=1; shift ;;
+    --) shift; break ;;
+    -*) echo "[pipeline] ERROR: unknown option '$1'" >&2; exit 1 ;;
+    *)  break ;;
+  esac
+done
+# ── end CLI parsing ───────────────────────────────────────────────────────────
+
 # Sum bytes of all .safetensors files under a directory tree
 _sum_safetensors_bytes() {
   find -L "$1" -name "*.safetensors" -printf '%s\n' 2>/dev/null \
@@ -410,7 +431,10 @@ if [[ -n "$_knee" && "$_knee" != "$TARGET_BITS" ]]; then
     printf "  [Y]es    accept suggested %s bpp\n" "$_knee"
     printf "  [N]o     keep current %s bpp\n" "$TARGET_BITS"
     printf "  [I]nput  enter a custom bpp value\n"
-    if ! read -t 1200 -r -p "  [Y/n/i] > " _knee_ans; then
+    if [[ "${_AUTO_ACCEPT}" == "1" ]]; then
+      echo "[pipeline] --auto-accept: accepting suggested ${_knee} bpp"
+      _knee_ans="Y"
+    elif ! read -t 1200 -r -p "  [Y/n/i] > " _knee_ans; then
       echo ""
       echo "[pipeline] 20-minute timeout — auto-accepting suggested ${_knee} bpp"
       _knee_ans="Y"
@@ -482,7 +506,10 @@ if [[ "$_any_zero" -eq 1 ]]; then
     printf "  [Y]es    proceed with FORMATS=%s\n" "$FORMATS"
     printf "  [D]rop   remove zero-layer formats and re-run allocator\n"
     printf "  [I]nput  enter a custom format list (e.g. NVFP4,BF16)\n"
-    if ! read -t 1200 -r -p "  [Y/d/i] > " _fmt_ans; then
+    if [[ "${_AUTO_ACCEPT}" == "1" ]]; then
+      echo "[pipeline] --auto-accept: dropping zero-layer format legs"
+      _fmt_ans="D"
+    elif ! read -t 1200 -r -p "  [Y/d/i] > " _fmt_ans; then
       echo ""
       echo "[pipeline] 20-minute timeout — auto-dropping zero-layer format legs"
       _fmt_ans="D"
