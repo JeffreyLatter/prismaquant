@@ -1,4 +1,4 @@
-From 2d64c0af31de677a3e885b9385a4def143574c56 Mon Sep 17 00:00:00 2001
+From c2a5ed34e11df9de2cbb309751eabefd0ec979ff Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:26:09 +0200
 Subject: [PATCH 5/6] fork: Section 5 - Qwen3-Coder-Next (qwen3_next) model
@@ -30,10 +30,10 @@ profile.pack_checkpoint_expert_tensors after _read_layer_to_device.
 ---
  prismaquant/model_profiles/__init__.py   |   2 +
  prismaquant/model_profiles/base.py       |  24 +++
- prismaquant/model_profiles/qwen3_next.py | 218 +++++++++++++++++++++++
+ prismaquant/model_profiles/qwen3_next.py | 238 +++++++++++++++++++++++
  prismaquant/model_profiles/registry.py   |   2 +
  prismaquant/streaming_model.py           |  15 +-
- 5 files changed, 260 insertions(+), 1 deletion(-)
+ 5 files changed, 280 insertions(+), 1 deletion(-)
  create mode 100644 prismaquant/model_profiles/qwen3_next.py
 
 diff --git a/prismaquant/model_profiles/__init__.py b/prismaquant/model_profiles/__init__.py
@@ -93,10 +93,10 @@ index b72873c..d8bce99 100644
          dispatch time. Added to the config_groups catch-all so every
 diff --git a/prismaquant/model_profiles/qwen3_next.py b/prismaquant/model_profiles/qwen3_next.py
 new file mode 100644
-index 0000000..c217427
+index 0000000..fe99df0
 --- /dev/null
 +++ b/prismaquant/model_profiles/qwen3_next.py
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,238 @@
 +"""Qwen3-Coder-Next (qwen3_next) profile.
 +
 +Covers:
@@ -192,6 +192,26 @@ index 0000000..c217427
 +
 +    def vllm_architecture_class(self) -> str | None:
 +        return "Qwen3NextForCausalLM"
++
++    def register_vendored_modeling(self) -> None:
++        # DeltaNet (linear_attn) layers use FLA's Triton backward kernel when
++        # _flash_linear_attention_available is True. PrismaQuant's
++        # ACTIVATION_ROWS_LIMIT slicing produces strided views that violate the
++        # kernel's alignment requirements, causing "misaligned address" on the
++        # backward pass. Force the eager fallback on all modeling modules that
++        # bake in this flag at import time.
++        import importlib
++        for _mod in (
++            "transformers.models.qwen3_5.modeling_qwen3_5",
++            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
++            "transformers.models.qwen3_next.modeling_qwen3_next",
++        ):
++            try:
++                m = importlib.import_module(_mod)
++                if getattr(m, "_flash_linear_attention_available", False):
++                    m._flash_linear_attention_available = False
++            except ImportError:
++                pass
 +
 +    def fused_sibling_group(self, linear_qname: str) -> str | None:
 +        if self._fused_matcher is None:

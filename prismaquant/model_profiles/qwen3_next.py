@@ -88,8 +88,31 @@ class Qwen3NextProfile(ModelProfile):
     def name(self) -> str:
         return "qwen3_next"
 
+    def serving_profile_id(self) -> str | None:
+        return "vllm_qwen3_5_packed_moe"
+
     def vllm_architecture_class(self) -> str | None:
         return "Qwen3NextForCausalLM"
+
+    def register_vendored_modeling(self) -> None:
+        # DeltaNet (linear_attn) layers use FLA's Triton backward kernel when
+        # _flash_linear_attention_available is True. PrismaQuant's
+        # ACTIVATION_ROWS_LIMIT slicing produces strided views that violate the
+        # kernel's alignment requirements, causing "misaligned address" on the
+        # backward pass. Force the eager fallback on all modeling modules that
+        # bake in this flag at import time.
+        import importlib
+        for _mod in (
+            "transformers.models.qwen3_5.modeling_qwen3_5",
+            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "transformers.models.qwen3_next.modeling_qwen3_next",
+        ):
+            try:
+                m = importlib.import_module(_mod)
+                if getattr(m, "_flash_linear_attention_available", False):
+                    m._flash_linear_attention_available = False
+            except ImportError:
+                pass
 
     def fused_sibling_group(self, linear_qname: str) -> str | None:
         if self._fused_matcher is None:
