@@ -26,6 +26,12 @@ import torch
 
 _FLASHINFER = None
 _AVAILABLE: bool | None = None
+_GEMM_CALLS = 0
+
+
+def gemm_call_count() -> int:
+    """Hardware NVFP4 GEMMs issued this process (observability / A/B)."""
+    return _GEMM_CALLS
 
 
 def _flashinfer():
@@ -104,6 +110,15 @@ def gemm(
     ``[M, out_features]``.
     """
     fi = _flashinfer()
+    global _GEMM_CALLS
+    if _GEMM_CALLS == 0:
+        import sys
+        print(
+            "[fp4-gemm] hardware NVFP4 GEMM engaged "
+            "(flashinfer mm_fp4, backend=cutlass)",
+            file=sys.stderr, flush=True,
+        )
+    _GEMM_CALLS += 1
     xpacked, xsf, xg = xq
     wpacked, wsf, wg = wq
     alpha = (1.0 / (xg * wg)).to(torch.float32)
