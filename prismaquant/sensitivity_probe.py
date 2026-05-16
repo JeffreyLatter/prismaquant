@@ -58,10 +58,13 @@ Model-agnostic:
 """
 from __future__ import annotations
 
+import atexit
 import json
 import pickle
 import random
 import re
+import shutil
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -69,6 +72,44 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Model staging — temporary symlink trees
+# ---------------------------------------------------------------------------
+# A staging dir is a symlink tree mirroring the source checkpoint plus a
+# rewritten config.json. It is only needed while the model loads, but an
+# OOM-killed or interrupted run never reaches teardown, so the dirs pile up
+# in $TMPDIR (302 found in one 9-day window). Two defenses:
+#   1. atexit removes the dir this process created — covers normal exit and
+#      unhandled exceptions (not SIGKILL).
+#   2. On each new staging dir, sweep sibling dirs older than the staleness
+#      window so SIGKILL-orphaned dirs from earlier runs do not accumulate.
+#      The age gate keeps a concurrently-running probe's fresh dir safe.
+_STAGING_STALE_SECONDS = 6 * 3600
+
+
+def _new_staging_dir(prefix: str) -> Path:
+    """mkdtemp a staging dir, sweeping stale siblings and registering the
+    new dir for removal at interpreter exit.
+
+    rmtree on a symlink tree removes the links, never their targets, so the
+    HuggingFace cache the links point into is left untouched.
+    """
+    tmp_root = Path(tempfile.gettempdir())
+    cutoff = time.time() - _STAGING_STALE_SECONDS
+    try:
+        for old in tmp_root.glob(f"{prefix}*"):
+            try:
+                if old.is_dir() and old.stat().st_mtime < cutoff:
+                    shutil.rmtree(old, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    staged = Path(tempfile.mkdtemp(prefix=prefix))
+    atexit.register(shutil.rmtree, staged, ignore_errors=True)
+    return staged
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +154,6 @@ def stage_text_only(model_path: str) -> str:
     promote_inner_mt = (profile.stage_text_only_promote_inner_model_type()
                         if profile is not None else False)
 
-    import tempfile
     for k in strip_keys:
         cfg.pop(k, None)
 
@@ -154,7 +194,7 @@ def stage_text_only(model_path: str) -> str:
             a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
         ]
 
-    staged = Path(tempfile.mkdtemp(prefix="prismaquant_stage_"))
+    staged = _new_staging_dir("prismaquant_stage_")
     skip = {"config.json", "preprocessor_config.json",
             "video_preprocessor_config.json", "processor_config.json"}
     for p in src.iterdir():
@@ -200,8 +240,7 @@ def stage_multimodal(model_path: str) -> str:
                                   "speech_config")):
         return str(src)
 
-    import tempfile
-    staged = Path(tempfile.mkdtemp(prefix="prismaquant_mm_stage_"))
+    staged = _new_staging_dir("prismaquant_mm_stage_")
     for p in src.iterdir():
         if p.name == "config.json":
             continue
