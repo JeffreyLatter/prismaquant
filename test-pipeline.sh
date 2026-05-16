@@ -214,7 +214,11 @@ fi
 # format-menu: render every requested format for every quantizable Linear,
 # useful when intentionally building a reusable cache for reallocations.
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
-: "${PRODUCTION_CACHE_LEVERS:=gptq,scale_sweep}"
+# V1 production render recipe: GPTQ with damp sweep + joint NVFP4 scale
+# optimization (see docs/runtime_flags.md). This is the lowest-loss render
+# combination for a given bit budget. `scale_sweep` is available for
+# explicit ablations but is no longer the default.
+: "${PRODUCTION_CACHE_LEVERS:=gptq,joint_scale_opt}"
 : "${FISHER_WEIGHTED_GPTQ:=0}"
 : "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 : "${HALO_MODE:=off}"
@@ -697,14 +701,230 @@ _ratio=$(awk -v o="$_orig_bytes" -v e="$_exported_bytes" \
   'BEGIN{if (e > 0) printf "%.2fx\n", o/e; else print "N/A"}')
 end_time_readable=$(date -d "@$end_time_seconds" "$@"+'%Y-%m-%d %H:%M:%S')
 
+# 3. Calculate total duration
+runtime_seconds=$((end_time_seconds - start_time_seconds))
+_runtime_str=$(printf "%02d:%02d:%02d" \
+  $((runtime_seconds/3600)) $((runtime_seconds%3600/60)) $((runtime_seconds%60)))
+
+# -----------------------------------------------------------------------
+# 5. exported_model_info.txt — PrismaQuant config + achieved compression,
+#    bpp, and layer-config summary. Markdown-formatted so it can be copied
+#    to README.md and used directly as a HuggingFace model card. Always
+#    regenerated at the end of a run (cheap); never skipped.
+# -----------------------------------------------------------------------
+_INFO_PATH="${WORK_DIR}/exported/exported_model_info.txt"
+_pq_git=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --short HEAD \
+  2>/dev/null || echo unknown)
+_info_date=$(date -u '+%Y-%m-%d')
+INFO_WORK_DIR="$WORK_DIR" \
+INFO_MODEL_SHORT="$_model_short" \
+INFO_BASE_MODEL="$_model_input" \
+INFO_TARGET_PROFILE="$TARGET_PROFILE" \
+INFO_FORMATS="$FORMATS" \
+INFO_TARGET_BITS="$TARGET_BITS" \
+INFO_NSAMPLES="$NSAMPLES" \
+INFO_SEQLEN="$SEQLEN" \
+INFO_DATASET="$DATASET" \
+INFO_CALIB_MODALITY="$CALIBRATION_MODALITY" \
+INFO_DEVICE="$DEVICE" \
+INFO_EXPORT_DEVICE="$EXPORT_DEVICE" \
+INFO_PRODUCTION_CACHE="$PRODUCTION_CACHE" \
+INFO_PRODUCTION_RECACHE="$PRODUCTION_RECACHE" \
+INFO_CACHE_LEVERS="$PRODUCTION_CACHE_LEVERS" \
+INFO_CACHE_RENDER_SCOPE="$PRODUCTION_CACHE_RENDER_SCOPE" \
+INFO_NVFP4_SCALE_RULE="${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}" \
+INFO_VISUAL_FORMAT="$VISUAL_FORMAT" \
+INFO_MTP_FORMAT="$MTP_FORMAT" \
+INFO_HALO_MODE="$HALO_MODE" \
+INFO_ORIG_HUMAN="$_orig_human" \
+INFO_EXP_HUMAN="$_exp_human" \
+INFO_RATIO="$_ratio" \
+INFO_SAVINGS_HUMAN="$_savings_human" \
+INFO_RUNTIME="$_runtime_str" \
+INFO_GIT="$_pq_git" \
+INFO_DATE="$_info_date" \
+python3 - > "${_INFO_PATH}" <<'PY' || echo "[pipeline] WARN: failed to write ${_INFO_PATH}"
+import json, os, re
+
+E = os.environ
+work = E.get("INFO_WORK_DIR", ".")
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+alloc_log = _read(os.path.join(work, "logs", "allocator.log"))
+export_log = _read(os.path.join(work, "logs", "export.log"))
+
+# Achieved bit budget + predicted Δloss — last allocator run in the log wins.
+_m = re.findall(
+    r"\[alloc\] target_bits=([0-9.]+): achieved_bits=([0-9.]+), .loss=([0-9.eE+-]+)",
+    alloc_log,
+)
+achieved_bpp, dloss = (_m[-1][1], _m[-1][2]) if _m else ("n/a", "n/a")
+
+# Architecture profile.
+_p = re.search(r"\[alloc\] model profile: (\S+)", alloc_log)
+profile = _p.group(1) if _p else "unknown"
+
+
+def _label(entry):
+    bits = entry.get("bits")
+    dtype = (entry.get("data_type") or "").lower()
+    if bits == 16:
+        return "BF16 (passthrough)", 16
+    if dtype.startswith("nv_fp"):
+        return "NVFP4", 4
+    if dtype.startswith("mx_fp") or "mxfp" in dtype:
+        return "MXFP8_E4M3", 8
+    if dtype.startswith("fp8"):
+        return "FP8_E4M3", 8
+    return (dtype or "unknown") + "/%sb" % bits, bits or 0
+
+
+# Per-Linear format counts — ground truth of what was exported.
+counts, bits_of, total_linears = {}, {}, 0
+try:
+    layer_config = json.load(
+        open(os.path.join(work, "artifacts", "layer_config.json"))
+    )
+    total_linears = len(layer_config)
+    for entry in layer_config.values():
+        label, bits = _label(entry)
+        counts[label] = counts.get(label, 0) + 1
+        bits_of[label] = bits
+except (OSError, ValueError):
+    pass
+
+_order = ["NVFP4", "MXFP8_E4M3", "FP8_E4M3", "BF16 (passthrough)"]
+fmt_rows = "\n".join(
+    "| %s | %s | %d |" % (k, bits_of.get(k, "?"), counts[k])
+    for k in sorted(counts, key=lambda k: _order.index(k) if k in _order else 99)
+) or "| _(layer_config.json not found)_ | | |"
+
+_h = re.search(
+    r"streamed materialization complete[^\n]*?hist=(\{[^\n]*\})", export_log
+)
+hist = _h.group(1) if _h else "(not found in export log)"
+
+_pt = re.search(
+    r"\n(\s*target\s+achieved.*?)\n\[alloc\] target_bits=", alloc_log, re.S
+)
+pareto = _pt.group(1).strip("\n") if _pt else "(not available)"
+
+base_model = E.get("INFO_BASE_MODEL", "")
+is_repo = "/" in base_model and not base_model.startswith((".", "/", "~"))
+
+front = ["---"]
+if is_repo:
+    front.append("base_model: %s" % base_model)
+front += [
+    "tags:",
+    "- prismaquant",
+    "- compressed-tensors",
+    "- quantized",
+    "license: other   # TODO: set to the base model's license before publishing",
+    "---",
+]
+
+print("\n".join(front))
+print(f'''
+# {E.get("INFO_MODEL_SHORT", "model")} — PrismaQuant compressed
+
+`{E.get("INFO_MODEL_SHORT", "model")}` quantized with **PrismaQuant** to a
+mixed-precision `compressed-tensors` checkpoint on {E.get("INFO_DATE", "")}.
+
+- **Base model:** `{base_model or "n/a"}`
+- **Architecture profile:** `{profile}`
+- **Serving target:** `{E.get("INFO_TARGET_PROFILE", "n/a")}`
+
+## Compression
+
+| Metric | Value |
+|---|---|
+| Original size | {E.get("INFO_ORIG_HUMAN", "?")} |
+| Compressed size | {E.get("INFO_EXP_HUMAN", "?")} |
+| Compression ratio | {E.get("INFO_RATIO", "?")} |
+| Disk saved | {E.get("INFO_SAVINGS_HUMAN", "?")} |
+| Target bit budget | {E.get("INFO_TARGET_BITS", "?")} bpp |
+| Achieved bit budget | {achieved_bpp} bpp |
+| Predicted Δloss | {dloss} |
+| Pipeline wall-time | {E.get("INFO_RUNTIME", "?")} |
+
+## Quantization assignment
+
+{total_linears} Linear layers, assigned per layer by the PrismaQuant
+allocator (multi-choice knapsack over measured per-format error):
+
+| Format | Bits | Linears |
+|---|---|---|
+{fmt_rows}
+
+Exported tensor histogram:
+
+```
+{hist}
+```
+
+## PrismaQuant configuration
+
+| Setting | Value |
+|---|---|
+| Formats offered | {E.get("INFO_FORMATS", "")} |
+| Production weight cache | {E.get("INFO_PRODUCTION_CACHE", "")} |
+| Production recache | {E.get("INFO_PRODUCTION_RECACHE", "")} |
+| Render levers | {E.get("INFO_CACHE_LEVERS", "")} |
+| Cache render scope | {E.get("INFO_CACHE_RENDER_SCOPE", "")} |
+| NVFP4 scale rule | {E.get("INFO_NVFP4_SCALE_RULE", "")} |
+| Visual encoder format | {E.get("INFO_VISUAL_FORMAT", "")} |
+| MTP format | {E.get("INFO_MTP_FORMAT", "")} |
+| HALO mode | {E.get("INFO_HALO_MODE", "")} |
+| Quant device | {E.get("INFO_DEVICE", "")} |
+| Export device | {E.get("INFO_EXPORT_DEVICE", "")} |
+
+## Calibration
+
+| Setting | Value |
+|---|---|
+| Dataset | `{E.get("INFO_DATASET", "")}` |
+| Samples | {E.get("INFO_NSAMPLES", "")} |
+| Sequence length | {E.get("INFO_SEQLEN", "")} |
+| Modality | {E.get("INFO_CALIB_MODALITY", "")} |
+
+## Serving (vLLM)
+
+```bash
+vllm serve <path-to-this-directory> \\
+  --quantization compressed-tensors --trust-remote-code
+```
+
+Validate the export:
+
+```bash
+python3 -m prismaquant.validate_native_export --model <path-to-this-directory>
+```
+
+## Allocator Pareto frontier
+
+```
+{pareto}
+```
+
+---
+Generated by `test-pipeline.sh` · PrismaQuant `{E.get("INFO_GIT", "unknown")}` · {E.get("INFO_DATE", "")}
+To publish on the HuggingFace Hub, copy this file to `README.md`.
+''')
+PY
+
 echo "----------------------------------------"
 echo "END TIME:   $end_time_readable"
 echo "ORIGINAL:   ${_orig_human} (safetensors)"
 echo "COMPRESSED: ${_exp_human} (safetensors)  →  ${_ratio} compression  (saves ${_savings_human})"
-
-# 3. Calculate and print total duration
-runtime_seconds=$((end_time_seconds - start_time_seconds))
-
-# Format the duration into Hours:Minutes:Seconds
-printf "TOTAL TIME: %02d:%02d:%02d\n" $((runtime_seconds/3600)) $((runtime_seconds%3600/60)) $((runtime_seconds%60))
+echo "MODEL INFO: ${_INFO_PATH}"
+printf "TOTAL TIME: %s\n" "$_runtime_str"
 echo "========================================"
