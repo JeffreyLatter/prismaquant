@@ -32,6 +32,24 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP` | archived companion | Historical Fisher-weighted GPTQ row-weight cap; not used by the production pipeline. |
 | `PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS` | `0` | Candidate E8M0 exponent shifts for MXFP8 activation-weighted scale search. Nonzero shifts are experimental; .8B and 4B A/Bs on 2026-05-10 regressed KL, so production defaults to RTN-equivalent MXFP8. |
 
+## GB10 hardware NVFP4 GEMM (opt-in, experimental)
+
+Routes NVFP4 measurement-loop GEMMs onto the GB10 / sm_121 hardware FP4
+tensor cores via `flashinfer.mm_fp4` (CUTLASS 4.5.0 block-scaled,
+`backend='cutlass'`). Lives on the `gb10` branch.
+
+EXPERIMENTAL — not a transparent speedup. PrismaQuant's NVFP4 cost model
+uses continuous fp32 block scales; the hardware path uses fp8_e4m3 block
+scales (the faithful, vLLM-served form). A micro-benchmark put the
+per-NVFP4-layer output shift at ~10%. It is therefore opt-in and must clear
+an apples-to-apples KL/bpp A/B (see `docs/design_guidelines.md`) before it
+can be promoted to default-on.
+
+| env var | default | what it does |
+|---|---|---|
+| `PRISMAQUANT_FP4_GEMM` | `0` (off) | When set, NVFP4-weight × NVFP4-activation Linears in the perturbed-x reference forward run through `flashinfer.mm_fp4` instead of dequant-to-bf16 + `F.linear`. Measured 3.3–5.9× faster on the GEMM for medium/large Linears. Below `PRISMAQUANT_FP4_GEMM_MIN_MNK` it transparently falls back to the bf16 path. Like the Triton fused kernel, it is refused when a production weight cache is active unless `PRISMAQUANT_FUSED_KERNEL_OVER_PROD_CACHE` is also set. |
+| `PRISMAQUANT_FP4_GEMM_MIN_MNK` | `2000000000` | Minimum GEMM `M*N*K` below which the FP4 path is skipped — sub-~2e9-flop GEMMs are launch-bound and the micro-benchmark showed no reliable win there. |
+
 ## Pipeline production-cache flags
 
 These are `run-pipeline.sh` environment variables rather than

@@ -685,7 +685,14 @@ class PerturbedActivationCache:
         return None
 
     def _nvfp4_fused_param_plan(self, plan: _ModulePlan) -> _ParamPlan | None:
-        if not _env_truthy("PRISMAQUANT_FUSED_KERNEL_NVFP4"):
+        # Enabled by either the Triton fused kernel flag or the GB10
+        # hardware NVFP4 GEMM flag (PRISMAQUANT_FP4_GEMM). Both route
+        # through the same fused-forward install; the backend is chosen
+        # in _nvfp4_fused_linear_forward.
+        if not (
+            _env_truthy("PRISMAQUANT_FUSED_KERNEL_NVFP4")
+            or _env_truthy("PRISMAQUANT_FP4_GEMM")
+        ):
             return None
         # When a production cache is active, the fused fast path's
         # `nvfp4_pack_weight` re-computes per-group scales locally and
@@ -714,9 +721,20 @@ class PerturbedActivationCache:
         param_plan = self._nvfp4_fused_param_plan(plan)
         if param_plan is None:
             return False
-        try:
-            from prismaquant.kernels.nvfp4_fused import nvfp4_fused_aw_matmul  # noqa: F401
-        except Exception:
+        # Require at least one working NVFP4 backend before swapping the
+        # module forward. The GB10 hardware path (flashinfer mm_fp4) and
+        # the Triton fused kernel are independent — either one is enough.
+        backend_ok = False
+        if _env_truthy("PRISMAQUANT_FP4_GEMM"):
+            from prismaquant.kernels import nvfp4_mm_fp4
+            backend_ok = nvfp4_mm_fp4.is_available()
+        if not backend_ok:
+            try:
+                from prismaquant.kernels.nvfp4_fused import nvfp4_fused_aw_matmul  # noqa: F401
+                backend_ok = True
+            except Exception:
+                backend_ok = False
+        if not backend_ok:
             return False
 
         module = plan.module
@@ -895,7 +913,18 @@ class PerturbedActivationCache:
         if not fused_active:
             return self._reference_linear_forward(plan, param_plan, x)
 
-        from prismaquant.kernels.nvfp4_fused import nvfp4_fused_aw_matmul
+        # GB10 hardware NVFP4 GEMM (opt-in, PRISMAQUANT_FP4_GEMM). Returns
+        # None below the speedup threshold or when unavailable — fall
+        # through to the Triton kernel, then the reference path.
+        if _env_truthy("PRISMAQUANT_FP4_GEMM"):
+            out = self._mm_fp4_linear_forward(plan, param_plan, x_runtime)
+            if out is not None:
+                return out
+
+        try:
+            from prismaquant.kernels.nvfp4_fused import nvfp4_fused_aw_matmul
+        except Exception:
+            return self._reference_linear_forward(plan, param_plan, x)
 
         w_packed, w_scales, w_global_scale = self._packed_nvfp4_weight_for(
             plan, param_plan
@@ -912,6 +941,105 @@ class PerturbedActivationCache:
         )
         out = nvfp4_fused_aw_matmul(flat_x, w_packed, w_scales, w_global_scale)
         out = out.reshape(*x_runtime.shape[:-1], plan.module.out_features)
+        if plan.module.bias is not None:
+            out = out + plan.module.bias.to(device=out.device, dtype=out.dtype)
+        return out
+
+    def _mm_fp4_weight_for(
+        self,
+        plan: _ModulePlan,
+        param_plan: _ParamPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Cached flashinfer-NVFP4 quantization of the Linear weight.
+
+        Mirrors ``_packed_nvfp4_weight_for``: prefers the production
+        cache's GPTQ/scale-opt rendered weight so the hardware path
+        quantizes the same weight the export would ship. Cached per
+        (name, device, dtype, data_ptr) since the weight is fixed across
+        the many activation forwards of one measurement.
+        """
+        from prismaquant.kernels import nvfp4_mm_fp4
+
+        param = getattr(plan.module, param_plan.attr)
+        if not isinstance(param, torch.nn.Parameter) or param.is_meta:
+            return None
+        cache = getattr(self, "_mm_fp4_weight_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._mm_fp4_weight_cache = cache
+        cache_key = (
+            param_plan.name, str(param.device), str(param.dtype),
+            int(param.data_ptr()),
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            cache.move_to_end(cache_key)
+            return cached
+        source = param.detach()
+        if self._production_weight_cache is not None:
+            w_dq = self._production_weight_cache.get(param_plan.name, "NVFP4")
+            if w_dq is not None:
+                source = w_dq.to(
+                    device=param.device, dtype=param.dtype,
+                ).contiguous()
+            elif _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE"):
+                raise RuntimeError(
+                    f"production_weight_cache miss for ({param_plan.name!r}, "
+                    f"'NVFP4') on the mm_fp4 fast path; set "
+                    f"PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 to allow "
+                    f"raw-weight fallback or rebuild the cache."
+                )
+        try:
+            wq = nvfp4_mm_fp4.quantize(source)
+        except Exception:
+            return None
+        cache[cache_key] = wq
+        cache.move_to_end(cache_key)
+        while len(cache) > 8:
+            cache.popitem(last=False)
+        return wq
+
+    def _mm_fp4_linear_forward(
+        self,
+        plan: _ModulePlan,
+        param_plan: _ParamPlan,
+        x_runtime: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """GB10 hardware NVFP4 forward via flashinfer ``mm_fp4``.
+
+        Returns ``None`` (caller falls back) when the path is unavailable
+        or the problem is below the speedup threshold. Opt-in:
+        ``PRISMAQUANT_FP4_GEMM``. See ``kernels/nvfp4_mm_fp4`` — this is a
+        measurement-fidelity change (e4m3 vs fp32 block scales), not a
+        transparent drop-in, and stays opt-in until an A/B clears it.
+        """
+        from prismaquant.kernels import nvfp4_mm_fp4
+
+        if not nvfp4_mm_fp4.is_available():
+            return None
+        flat_x = x_runtime.reshape(-1, x_runtime.shape[-1])
+        flat_x = _maybe_clip_activations(
+            flat_x, self._activation_scales, param_plan.name,
+        )
+        N = plan.module.out_features
+        K = flat_x.shape[-1]
+        M = flat_x.shape[0]
+        if K % 16 != 0 or M * N * K < nvfp4_mm_fp4.min_problem_size():
+            return None
+        wq = self._mm_fp4_weight_for(plan, param_plan)
+        if wq is None:
+            return None
+        # flashinfer's 128x4 scale swizzle wants M a multiple of 128;
+        # pad with zero rows (zero output rows) and slice back.
+        m_pad = (M + 127) // 128 * 128
+        try:
+            xin = flat_x.contiguous()
+            if m_pad != M:
+                xin = F.pad(xin, (0, 0, 0, m_pad - M))
+            out = nvfp4_mm_fp4.gemm(nvfp4_mm_fp4.quantize(xin), wq, N)
+        except Exception:
+            return None
+        out = out[:M].reshape(*x_runtime.shape[:-1], N)
         if plan.module.bias is not None:
             out = out + plan.module.bias.to(device=out.device, dtype=out.dtype)
         return out
