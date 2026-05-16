@@ -304,6 +304,30 @@ def test_promote_moe_pair_uses_profile_format_groups():
     assert promoted["blocks.0.router_bank.other"] == "NVFP4"
 
 
+def test_promote_moe_pair_uses_default_profile_common_packed_groups():
+    assignment = {
+        "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+        "model.layers.0.mlp.experts.down_proj": "BF16",
+        "model.layers.1.mlp.experts.0.gate_proj": "NVFP4",
+        "model.layers.1.mlp.experts.0.up_proj": "BF16",
+        "model.layers.1.mlp.experts.0.down_proj": "NVFP4",
+        "model.layers.2.mlp.experts.0.w1": "NVFP4",
+        "model.layers.2.mlp.experts.0.w2": "BF16",
+        "model.layers.2.mlp.experts.0.w3": "NVFP4",
+    }
+
+    promoted = promote_moe_pair(assignment, {"NVFP4": 0, "BF16": 1})
+
+    assert promoted["model.layers.0.mlp.experts.gate_up_proj"] == "BF16"
+    assert promoted["model.layers.0.mlp.experts.down_proj"] == "BF16"
+    assert promoted["model.layers.1.mlp.experts.0.gate_proj"] == "BF16"
+    assert promoted["model.layers.1.mlp.experts.0.up_proj"] == "BF16"
+    assert promoted["model.layers.1.mlp.experts.0.down_proj"] == "BF16"
+    assert promoted["model.layers.2.mlp.experts.0.w1"] == "BF16"
+    assert promoted["model.layers.2.mlp.experts.0.w2"] == "BF16"
+    assert promoted["model.layers.2.mlp.experts.0.w3"] == "BF16"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: pre-aggregation hits target without overshoot
 # ---------------------------------------------------------------------------

@@ -153,7 +153,7 @@ def test_production_pipeline_spec_records_run_config():
         work_dir="/runs/qwen",
         formats="NVFP4,BF16",
         target_bits=4.75,
-        target_profile="vllm_qwen3_5_packed_moe",
+        target_profile="vllm_packed_moe",
         calibration_modality="text-only",
         selection_mode="surrogate",
         production_cache="1",
@@ -162,7 +162,7 @@ def test_production_pipeline_spec_records_run_config():
 
     assert spec.validate().ok is True
     assert spec.metadata["render_mechanisms"] == ["joint_scale_opt", "gptq"]
-    assert spec.metadata["target_profile"] == "vllm_qwen3_5_packed_moe"
+    assert spec.metadata["target_profile"] == "vllm_packed_moe"
     assert spec.metadata["formats"] == "NVFP4,BF16"
 
 

@@ -10,6 +10,7 @@ from prismaquant.incremental_measure_quant_cost import merge_cost_pickles
 from prismaquant.measure_quant_cost import (
     ActivationIndex,
     HDetailIndex,
+    canonical_linear_name,
     measure_batched_gpu,
     measure_unbatched,
 )
@@ -17,7 +18,41 @@ from prismaquant.sensitivity_probe import FisherAccumulator
 from prismaquant import format_registry as fr
 
 
+class _CustomPackedCostProfile:
+    def packed_expert_parent_for_projection(self, projection_name: str) -> str | None:
+        if projection_name in {"w1_proj", "w3_proj"}:
+            return "w13"
+        if projection_name == "w2":
+            return "w2"
+        return None
+
+
 class TestIncrementalMeasureQuantCost(unittest.TestCase):
+    def test_canonical_linear_name_uses_profile_decomposition(self):
+        profile = _CustomPackedCostProfile()
+
+        self.assertEqual(
+            canonical_linear_name(
+                "model.layers.0.mlp.experts.3.w1_proj",
+                profile,
+            ),
+            "model.layers.0.mlp.experts.w13.3",
+        )
+        self.assertEqual(
+            canonical_linear_name(
+                "model.layers.0.mlp.experts.3.w2",
+                profile,
+            ),
+            "model.layers.0.mlp.experts.w2.3",
+        )
+        self.assertEqual(
+            canonical_linear_name(
+                "model.layers.0.mlp.experts.3.side",
+                profile,
+            ),
+            "model.layers.0.mlp.experts.3.side",
+        )
+
     def test_merge_cost_pickles_combines_disjoint_shards(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -234,6 +269,28 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
             acc.stats["mtp.fc"]["h_detail_path"],
             safe,
         )
+
+    def test_fisher_accumulator_skips_profile_pinned_head(self):
+        class TinyHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Linear(2, 2, bias=False)
+
+        class Profile:
+            def is_pinned_name(self, qname):
+                return qname == "head"
+
+        model = TinyHead()
+        acc = FisherAccumulator(
+            model,
+            ["head"],
+            {},
+            model_profile=Profile(),
+        )
+        try:
+            self.assertIn("head", acc._fisher_skip)
+        finally:
+            acc.remove_hooks()
 
 
 if __name__ == "__main__":

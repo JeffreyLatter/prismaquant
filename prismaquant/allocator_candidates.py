@@ -59,11 +59,6 @@ def _profile_allows_format(
 def _format_kernel_supports_shape(fmt_name: str, in_features: int,
                                   out_features: int) -> bool:
     """Return True if the runtime kernel can handle this Linear shape."""
-    flashinfer_verdict = _flashinfer_kernel_accepts(
-        fmt_name, in_features, out_features)
-    if flashinfer_verdict is False:
-        return False
-
     return check_serving_shape(
         "research",
         fmt_name,
@@ -145,6 +140,7 @@ def check_format_applicability(
     shape_decision = check_serving_shape(
         target_profile,
         fmt,
+        qname=qname,
         in_features=in_features,
         out_features=out_features,
     )
@@ -186,29 +182,14 @@ def check_stats_format_applicability(
 
 def _flashinfer_kernel_accepts(fmt_name: str, in_features: int,
                                out_features: int) -> bool | None:
-    """Ask FlashInfer's own problem-size validator when available."""
-    try:
-        if fmt_name.startswith("MXFP8"):
-            from flashinfer.gemm.gemm_base import _check_mm_mxfp8_problem_size
-            import torch
-            a = torch.empty((1, in_features), dtype=torch.float8_e4m3fn)
-            b = torch.empty((in_features, out_features),
-                            dtype=torch.float8_e4m3fn)
-            from flashinfer.gemm.gemm_base import _mxfp8_swizzled_scale_len
-            from flashinfer.gemm.gemm_base import SfLayout
-            a_desc_len = _mxfp8_swizzled_scale_len(
-                a.shape[0], a.shape[1], SfLayout.layout_8x4)
-            b_desc_len = _mxfp8_swizzled_scale_len(
-                b.shape[1], b.shape[0], SfLayout.layout_8x4)
-            a_desc = torch.empty((a_desc_len,), dtype=torch.uint8)
-            b_desc = torch.empty((b_desc_len,), dtype=torch.uint8)
-            try:
-                return _check_mm_mxfp8_problem_size(a, b, a_desc, b_desc) is True
-            except Exception:
-                return False
-        return None
-    except Exception:
-        return None
+    """Compatibility wrapper for the config-backed FlashInfer validator."""
+    from .runtime_shape_validators import flashinfer_mxfp8_problem_size_accepts
+
+    return flashinfer_mxfp8_problem_size_accepts(
+        fmt_name,
+        in_features=in_features,
+        out_features=out_features,
+    )
 
 
 def _stats_indicates_packed_expert(stats_entry: dict) -> bool:

@@ -213,7 +213,7 @@ def build_quantizable_map(
 ) -> dict[str, tuple[nn.Module, str]]:
     """Map recipe/probe names to live module parameters."""
     out: dict[str, tuple[nn.Module, str]] = {}
-    for full_name, mod, attr in iter_quantizable_tensors(model):
+    for full_name, mod, attr in iter_quantizable_tensors(model, profile):
         names = {full_name}
         if full_name.endswith(".weight"):
             names.add(full_name[:-7])

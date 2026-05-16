@@ -1,10 +1,27 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "gemma4",
-  "default_serving_profile": "vllm_qwen3_5_packed_moe",
+  "default_serving_profile": "vllm_packed_moe",
   "match": {
     "model_type": ["gemma4", "gemma4_text"],
     "architectures": ["Gemma4*"]
+  },
+  "staging": {
+    "text_only_strip_keys": [
+      "vision_config",
+      "audio_config",
+      "speech_config",
+      "image_token_id",
+      "video_token_id",
+      "audio_token_id",
+      "vision_start_token_id",
+      "vision_end_token_id"
+    ],
+    "promote_inner_model_type": true
+  },
+  "shard_regexes": {
+    "visual_config_key": "vision_config",
+    "visual_layer_prefix": "model.vision_tower.vision_model.encoder.layers"
   },
   "naming": {
     "live_to_recipe": [
@@ -105,6 +122,9 @@
   "packed_experts": {
     "param_names": ["gate_up_proj", "down_proj"],
     "split_for_formats": [],
+    "projection_splits": {
+      "gate_up_proj": ["gate_proj", "up_proj"]
+    },
     "format_groups": [
       ["gate_up_proj", "down_proj"],
       ["gate_proj", "up_proj", "down_proj"],

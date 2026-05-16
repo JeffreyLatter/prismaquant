@@ -78,6 +78,7 @@ except ModuleNotFoundError:
 from safetensors.torch import save_file
 
 from .allocator_candidates import check_format_applicability
+from .serving_profiles import resolve_target_profile
 from .layer_config import (
     canonicalize_assignment as _canonicalize_assignment,
     canonicalize_format,
@@ -933,10 +934,7 @@ def _coerce_runtime_legal_assignment(
 def _allocator_target_profile_for_audit(profile) -> str | None:
     if profile is None:
         return None
-    serving_profile = getattr(profile, "serving_profile_id", None)
-    if serving_profile is None:
-        return None
-    return serving_profile()
+    return resolve_target_profile(profile, None)
 
 
 def _bf16_upgrade_audit(
@@ -2147,7 +2145,7 @@ def _explicit_regex(name: str) -> str:
 # profile's `to_vllm_internal_name`.)
 _PER_EXPERT_LINEAR_RE = re.compile(
     r"^(?P<prefix>.*[.])layers[.](?P<L>\d+)[.](?P<inner>.*mlp)[.]"
-    r"experts[.](?P<E>\d+)[.](?P<proj>gate|up|down)_proj$"
+    r"experts[.](?P<E>\d+)[.](?P<proj>[^.]+)$"
 )
 
 
@@ -2207,7 +2205,7 @@ def _build_target_list(vllm_names: list[str]) -> list[str]:
         expr = "[0-9]+"
         collapsed.append(
             f"re:^{prefix_r}layers[.]{L}[.]{inner_r}[.]experts[.]{expr}"
-            f"[.]{proj}_proj$"
+            f"[.]{proj}$"
         )
 
     out = (
@@ -2222,31 +2220,108 @@ def _build_target_list(vllm_names: list[str]) -> list[str]:
 # Module / parameter discovery — mirrors what install_packed_expert_hooks
 # detects, so the export sees the same units as the probe.
 # ---------------------------------------------------------------------------
-_PACKED_EXPERT_PARAM_NAMES = {
-    "gate_up_proj", "down_proj", "w1", "w2", "w3",
-    "gate_proj", "up_proj",
-}
+def _packed_expert_param_name_set(profile=None) -> set[str]:
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            return set(profile.packed_expert_param_names())
+        except Exception:
+            pass
+    return set()
 
 
-def _is_packed_experts_module(module: nn.Module) -> bool:
+def _is_packed_experts_module(module: nn.Module, profile=None) -> bool:
+    names = _packed_expert_param_name_set(profile)
     cls_name = type(module).__name__.lower()
     if "expert" not in cls_name:
         return False
     for n, p in module.named_parameters(recurse=False):
         if (isinstance(p, nn.Parameter)
                 and p.dim() == 3
-                and n in _PACKED_EXPERT_PARAM_NAMES):
+                and n in names):
             return True
     return False
 
 
-def _packed_experts_param_names(module: nn.Module) -> list[str]:
+def _packed_experts_param_names(module: nn.Module, profile=None) -> list[str]:
+    names = _packed_expert_param_name_set(profile)
     return sorted(
         n for n, p in module.named_parameters(recurse=False)
         if (isinstance(p, nn.Parameter)
             and p.dim() == 3
-            and n in _PACKED_EXPERT_PARAM_NAMES)
+            and n in names)
     )
+
+
+def _packed_expert_projection_names(profile, param_name: str) -> tuple[str, ...]:
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            projections = tuple(profile.packed_expert_projection_names(param_name))
+            if projections:
+                return projections
+        except Exception:
+            pass
+    return (str(param_name),)
+
+
+def _packed_expert_parent_for_projection(profile, projection_name: str) -> str | None:
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            return profile.packed_expert_parent_for_projection(projection_name)
+        except Exception:
+            pass
+    return None
+
+
+def _all_packed_expert_projection_names(profile) -> tuple[str, ...]:
+    projections: list[str] = []
+    seen: set[str] = set()
+    for param_name in sorted(_packed_expert_param_name_set(profile)):
+        for projection in _packed_expert_projection_names(profile, param_name):
+            if projection in seen:
+                continue
+            projections.append(projection)
+            seen.add(projection)
+    return tuple(projections)
+
+
+def _split_packed_expert_tensor(
+    packed_param: torch.Tensor,
+    param_name: str,
+    profile,
+) -> list[tuple[str, torch.Tensor]]:
+    projections = _packed_expert_projection_names(profile, param_name)
+    if projections == (param_name,):
+        return [(param_name, packed_param)]
+    rows = int(packed_param.shape[1])
+    n_parts = len(projections)
+    if rows % n_parts != 0:
+        raise ValueError(
+            f"packed expert tensor {param_name!r} with rows={rows} cannot "
+            f"split evenly into configured projections {projections!r}"
+        )
+    chunk = rows // n_parts
+    return [
+        (proj_name, packed_param[:, i * chunk:(i + 1) * chunk, :])
+        for i, proj_name in enumerate(projections)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2257,8 +2332,8 @@ def _packed_experts_param_names(module: nn.Module) -> list[str]:
 # weight_global_scale. We compute the max over each fused group's natural
 # global_scale and force every sibling to use it.
 #
-# Patterns mirror vLLM's `packed_modules_mapping` for qwen3_5; if a new
-# model family is added, mirror its packed_modules_mapping here.
+# Legacy fallback for callers that do not pass a ModelProfile. New model
+# families should declare fused groups in their profile structure spec.
 _FUSED_DENSE_PATTERNS = [
     (re.compile(r"^(?P<pre>.+)\.self_attn\.(?P<sib>q_proj|k_proj|v_proj)$"),
      ("q_proj", "k_proj", "v_proj")),
@@ -2293,6 +2368,17 @@ def _fused_group_key_for_name(name: str, profile=None) -> str | None:
             group = None
         if group:
             return str(group)
+    mapping_fn = getattr(profile, "fused_sibling_leaf_mapping", None)
+    if callable(mapping_fn) and "." in name:
+        try:
+            mapping = mapping_fn()
+        except Exception:
+            mapping = None
+        if mapping:
+            prefix, leaf = name.rsplit(".", 1)
+            for fused, members in mapping.items():
+                if leaf in set(str(member) for member in members):
+                    return f"{prefix}.{fused}"
     fallback = _fused_dense_group(name)
     if fallback is None:
         return None
@@ -4056,10 +4142,10 @@ def materialize_tensors_streaming(
         # 3d. Emit packed MoE experts, scoped to this layer.
         packed_count = 0
         for sub_name, mod in layer_mod.named_modules():
-            if not _is_packed_experts_module(mod):
+            if not _is_packed_experts_module(mod, profile):
                 continue
             packed_count += 1
-            for pn in _packed_experts_param_names(mod):
+            for pn in _packed_experts_param_names(mod, profile):
                 experts_qname = (f"{layer_qname}.{sub_name}"
                                  if sub_name else layer_qname)
                 full = f"{experts_qname}.{pn}"
@@ -4085,14 +4171,11 @@ def materialize_tensors_streaming(
                 packed_param_src = getattr(mod, pn).detach()
                 packed_param = packed_param_src.float()
                 E, M, N = packed_param.shape
-                if pn == "gate_up_proj":
-                    half = M // 2
-                    proj_split = [
-                        ("gate_proj", packed_param[:, :half, :]),
-                        ("up_proj",   packed_param[:, half:, :]),
-                    ]
-                else:
-                    proj_split = [(pn, packed_param)]
+                proj_split = _split_packed_expert_tensor(
+                    packed_param,
+                    pn,
+                    profile,
+                )
 
                 is_bf16 = fmt == "BF16" or full in bf16_passthrough
                 disk_qname = profile.on_disk_expert_qname(experts_qname)
@@ -4269,9 +4352,9 @@ def _materialize_tensors_inmemory(
         hist[("linear", fmt)] += 1
 
     for qname, mod in model.named_modules():
-        if not _is_packed_experts_module(mod):
+        if not _is_packed_experts_module(mod, profile):
             continue
-        for pn in _packed_experts_param_names(mod):
+        for pn in _packed_experts_param_names(mod, profile):
             full_name = f"{qname}.{pn}" if qname else pn
             recipe_key = remap(full_name)
             fmt = assignment.get(recipe_key)
@@ -4282,16 +4365,11 @@ def _materialize_tensors_inmemory(
             packed_param_src = getattr(mod, pn).detach()
             packed_param = packed_param_src.float()
             E, M, N = packed_param.shape
-            if pn == "gate_up_proj":
-                half = M // 2
-                proj_split = [
-                    ("gate_proj", packed_param[:, :half, :]),
-                    ("up_proj",   packed_param[:, half:, :]),
-                ]
-            elif pn in ("down_proj", "w1", "w2", "w3", "gate_proj", "up_proj"):
-                proj_split = [(pn, packed_param)]
-            else:
-                proj_split = [(pn, packed_param)]
+            proj_split = _split_packed_expert_tensor(
+                packed_param,
+                pn,
+                profile,
+            )
 
             is_bf16 = fmt == "BF16" or full_name in bf16_passthrough
             disk_qname = profile.on_disk_expert_qname(qname)
@@ -4450,30 +4528,75 @@ FP8_E4M3_SCHEME = {
         "symmetric": True, "dynamic": True,
     },
 }
+
+
+def _pin_regex_to_layer(body: str, layer_idx: str | None) -> str | None:
+    if layer_idx is None:
+        return None
+    return re.sub(
+        r"layers\[\.\]\[0-9\]\+",
+        f"layers[.]{layer_idx}",
+        str(body),
+        count=1,
+    )
+
+
+def _constrain_per_expert_projection_regex(
+    body: str,
+    proj_options: str,
+) -> str:
+    """Constrain a profile per-expert regex to selected projections.
+
+    Profile specs own projection names.  Older specs spell Qwen-style
+    projections as ``(gate|up|down)_proj``; newer/custom specs may provide
+    complete alternatives like ``(w1_proj|w3_proj|w2)``.  This helper rewrites
+    the final projection segment after ``experts.<id>.`` without hardcoding
+    either naming family into the export path.
+    """
+    replacement = f"({proj_options})"
+    for legacy in (
+        "(gate|up|down)_proj",
+        "(gate_proj|up_proj|down_proj)",
+    ):
+        if legacy in body:
+            return body.replace(legacy, replacement)
+
+    for pattern in (
+        r"(?P<prefix>experts\[\.\]\[0-9\]\+\[\.\])(?P<proj>.+?)(?P<suffix>\$)$",
+        r"(?P<prefix>experts\\\.\[0-9\]\+\\\.)(?P<proj>.+?)(?P<suffix>\$)$",
+        r"(?P<prefix>experts\.\[0-9\]\+\.)(?P<proj>.+?)(?P<suffix>\$)$",
+    ):
+        constrained, count = re.subn(
+            pattern,
+            rf"\g<prefix>{replacement}\g<suffix>",
+            body,
+            count=1,
+        )
+        if count:
+            return constrained
+    return body
+
+
 def _bf16_packed_expert_ignore_regex(
         recipe_key: str,
         profile,
 ) -> list[str]:
-    """If `recipe_key` names a BF16 packed-MoE tensor
-    (`...experts.gate_up_proj` or `...experts.down_proj`), return one or
-    more regex strings that match the corresponding per-expert Linear
-    qnames at scheme-dispatch time, so vLLM's `find_matched_target`
-    routes them to `ignore` instead of a config_groups target.
+    """If `recipe_key` names a BF16 packed-MoE tensor, return regex
+    strings for the corresponding per-expert Linear qnames at
+    scheme-dispatch time.
 
-    For `gate_up_proj` we emit two patterns (one for `gate_proj`, one
-    for `up_proj`) because the packed tensor splits into both at
-    materialize time. Returns `[]` if the recipe_key doesn't look
-    like a packed-expert entry or the profile has no vLLM class to
-    derive naming from."""
+    The packed-parameter to per-projection decomposition comes from the
+    active model profile/spec, so export metadata stays aligned with model
+    structure config instead of baking Qwen-specific names into this path.
+    """
     import re as _re
 
     # Does this recipe key name a packed-expert tensor?
-    m = _re.match(r"^(.*\.)(experts)\.(gate_up_proj|down_proj|w\d|gate_proj|up_proj)$",
-                  recipe_key)
-    if not m:
+    if ".experts." not in recipe_key:
         return []
-    parent = m.group(1)          # `model.layers.X.`  or `model.layers.X.moe.`
-    pn = m.group(3)
+    pn = recipe_key.rsplit(".", 1)[-1]
+    if pn not in _packed_expert_param_name_set(profile):
+        return []
 
     # Convert the recipe parent prefix to a live-model prefix by
     # asking the profile. `profile.live_to_recipe_name` is the
@@ -4493,14 +4616,8 @@ def _bf16_packed_expert_ignore_regex(
     lm = _re.search(r"\.layers\.(\d+)\.", recipe_key)
     if lm:
         layer_idx = lm.group(1)
-    # Build per-proj regex. `gate_up_proj` splits into `gate_proj`
-    # and `up_proj` on disk; `down_proj` stays as `down_proj`.
-    if pn == "gate_up_proj":
-        proj_options = "gate_proj|up_proj"
-    elif pn == "down_proj":
-        proj_options = "down_proj"
-    else:
-        proj_options = _re.escape(pn)
+    projections = _packed_expert_projection_names(profile, pn)
+    proj_options = "|".join(_re.escape(proj) for proj in projections)
 
     # Use the profile's own regex as the base; swap its `(gate|up|down)_proj`
     # group with the exact projections we emit, and constrain to this
@@ -4512,13 +4629,10 @@ def _bf16_packed_expert_ignore_regex(
         mtp_base = profile.per_expert_mtp_regex() if profile else None
         if mtp_base and mtp_base.startswith("re:"):
             body = mtp_base[len("re:"):]
-            pinned = _re.sub(
-                r"layers\[\.\]\[0-9\]\+", f"layers[.]{layer_idx}",
-                body, count=1,
-            )
-            pinned = pinned.replace(
-                "(gate|up|down)_proj", f"({proj_options})",
-            )
+            pinned = _pin_regex_to_layer(body, layer_idx)
+            if pinned is None:
+                return []
+            pinned = _constrain_per_expert_projection_regex(pinned, proj_options)
             return [f"re:{pinned}"]
         # Fallback: emit an `mtp.layers.N.*` regex directly.
         if layer_idx is None:
@@ -4550,13 +4664,10 @@ def _bf16_packed_expert_ignore_regex(
     # Profile-provided regex. Strip the `re:` prefix, pin to this
     # layer index, constrain to the emitted projections.
     body = base[len("re:"):]
-    # Replace [0-9]+ between layers.X. and .experts. with the specific
-    # layer index. Fall back to leaving as-is if the pattern doesn't
-    # match our expectations.
-    pinned = _re.sub(r"layers\[\.\]\[0-9\]\+", f"layers[.]{layer_idx}", body, count=1)
-    # Replace `(gate|up|down)_proj` with only the split projections we
-    # actually emitted (so we don't over-ignore).
-    pinned = pinned.replace("(gate|up|down)_proj", f"({proj_options})")
+    pinned = _pin_regex_to_layer(body, layer_idx)
+    if pinned is None:
+        return []
+    pinned = _constrain_per_expert_projection_regex(pinned, proj_options)
     return [f"re:{pinned}"]
 
 
@@ -4573,10 +4684,23 @@ FORMAT_SCHEME = {
 def _fused_modules_mapping_for_profile(profile) -> dict[str, tuple[str, ...]]:
     """Return fused-module leaf mapping for target emission.
 
-    Prefer vLLM's runtime mapping when available, then fall back to the
-    profile's declarative model-structure spec. The returned shape mirrors
-    vLLM's ``packed_modules_mapping``: ``{"qkv_proj": ("q_proj", ...)}``.
+    The returned shape mirrors vLLM's ``packed_modules_mapping``:
+    ``{"qkv_proj": ("q_proj", ...)}``.
     """
+    if profile is None:
+        return {}
+
+    getter = getattr(profile, "fused_sibling_leaf_mapping", None)
+    if callable(getter):
+        try:
+            mapping = getter()
+        except Exception:
+            mapping = None
+        if mapping:
+            return {
+                str(fused): tuple(str(sibling) for sibling in siblings)
+                for fused, siblings in mapping.items()
+            }
 
     try:
         from .model_profiles.vllm_registry import (
@@ -4710,17 +4834,17 @@ def build_quantization_config(
                     ignore.append(vllm_name)
                     bf16_name_set.add(vllm_name)
 
-    # Packed-3D MoE target emission. vLLM's Qwen3_5/3_6 MoE loads as a
-    # single FusedMoE module at qname `<block>.experts` that owns the
-    # 3D packed expert tensors internally. Scheme dispatch
+    # Packed-3D MoE target emission. Serving runtimes such as vLLM load
+    # packed expert tensors through one FusedMoE module at qname
+    # `<block>.experts`. Scheme dispatch
     # (`get_moe_method`) probes targets via THREE synthetic layer
     # names built off the FusedMoE prefix:
     #   `<block>.experts.0.gate_proj`
     #   `<block>.experts.0.up_proj`
     #   `<block>.experts.0.down_proj`
     # — this is the "Linear-before-fusion" naming convention, not the
-    # packed-tensor qnames (`experts.gate_up_proj`, `experts.down_proj`)
-    # we emit in the safetensors. Without matching targets on that
+    # packed-tensor qnames (for example `experts.gate_up_proj`) we emit
+    # in the safetensors. Without matching targets on that
     # per-expert form, no scheme binds to FusedMoE, `w2_input_global_scale`
     # etc. are never registered, and load_weights KeyErrors on our
     # per-expert input scale keys.
@@ -4729,17 +4853,53 @@ def build_quantization_config(
     # replace it with a per-expert regex pinned to that layer index so
     # vLLM's scheme dispatch gets a match on expert 0's projection
     # names. One regex per layer covers all (expert, projection)
-    # combinations. `promote_moe_pair` ensures gate_up_proj and
-    # down_proj of a single layer share a scheme — we crash loud on
+    # combinations. The profile's packed-expert format groups ensure the
+    # projections of a single FusedMoE share a scheme — we crash loud on
     # mismatch.
-    _packed_moe_re = re.compile(r"^(.+\.experts)\.(gate_up_proj|down_proj)$")
     packed_fused_states: dict[str, set[str]] = {}
+    packed_fused_projections: dict[str, list[str]] = {}
+
+    def _packed_expert_vllm_match(vname: str) -> tuple[str, str] | None:
+        if vname.startswith("re:"):
+            return None
+        if "." not in vname:
+            return None
+        fused_qname, leaf = vname.rsplit(".", 1)
+        if not fused_qname.endswith(".experts"):
+            return None
+        if leaf not in _packed_expert_param_name_set(profile):
+            return None
+        return fused_qname, leaf
+
+    def _packed_format_group_members(fused_qname: str, leaf: str) -> tuple[str, ...]:
+        group_getter = getattr(profile, "packed_expert_format_group", None)
+        if callable(group_getter):
+            group_key = group_getter(f"{fused_qname}.{leaf}")
+            marker = "::__packed_format__:"
+            if group_key and marker in group_key:
+                return tuple(
+                    member for member in group_key.split(marker, 1)[1].split(",")
+                    if member
+                )
+        return (leaf,)
+
+    def _record_packed_fused_state(fused_qname: str, leaf: str, state: str) -> None:
+        packed_fused_states.setdefault(fused_qname, set()).add(state)
+        seen = set(packed_fused_projections.setdefault(fused_qname, []))
+        for member in _packed_format_group_members(fused_qname, leaf):
+            for projection in _packed_expert_projection_names(profile, member):
+                if projection in seen:
+                    continue
+                packed_fused_projections[fused_qname].append(projection)
+                seen.add(projection)
+
     for fmt, names in list(by_fmt.items()):
         kept = []
         for vname in names:
-            m = _packed_moe_re.match(vname)
-            if m:
-                packed_fused_states.setdefault(m.group(1), set()).add(fmt)
+            packed = _packed_expert_vllm_match(vname)
+            if packed is not None:
+                fused_qname, leaf = packed
+                _record_packed_fused_state(fused_qname, leaf, fmt)
             else:
                 kept.append(vname)
         by_fmt[fmt] = kept
@@ -4751,33 +4911,43 @@ def build_quantization_config(
         if vname.startswith("re:"):
             ignore_kept.append(vname)
             continue
-        m = _packed_moe_re.match(vname)
-        if m:
-            packed_fused_states.setdefault(m.group(1), set()).add("IGNORE")
+        packed = _packed_expert_vllm_match(vname)
+        if packed is not None:
+            fused_qname, leaf = packed
+            _record_packed_fused_state(fused_qname, leaf, "IGNORE")
         else:
             ignore_kept.append(vname)
     ignore = ignore_kept
 
-    def _per_expert_regex_for(fused_qname: str) -> str:
+    def _per_expert_regex_for(
+        fused_qname: str,
+        projections: list[str],
+    ) -> str:
         """Regex matching any `<fused_qname>.<eid>.<proj>` where
-        proj ∈ {gate_proj, up_proj, down_proj}. Uses `[.]` (not `\\.`)
-        for literal-dot escapes, matching the rest of this file's
-        regex-target style."""
+        proj is one of the configured per-expert projections. Uses `[.]`
+        for literal-dot escapes, matching the rest of this file's regex
+        target style."""
         escaped = fused_qname.replace(".", "[.]")
+        if not projections:
+            projections = list(_all_packed_expert_projection_names(profile))
+        proj_options = "|".join(re.escape(proj) for proj in projections)
         return (
-            f"re:^{escaped}[.][0-9]+[.](gate_proj|up_proj|down_proj)$"
+            f"re:^{escaped}[.][0-9]+[.]({proj_options})$"
         )
 
     for fused_qname, states in packed_fused_states.items():
         if len(states) > 1:
             raise RuntimeError(
                 f"[export-stream] FusedMoE at {fused_qname!r} has mixed "
-                f"states across projections {states}; promote_moe_pair "
-                f"should have forced gate_up_proj and down_proj to share "
-                f"a scheme before this point."
+                f"states across packed expert projections {states}; "
+                f"the allocator's packed-expert format group should have "
+                f"forced one scheme before this point."
             )
         state = next(iter(states))
-        regex = _per_expert_regex_for(fused_qname)
+        regex = _per_expert_regex_for(
+            fused_qname,
+            packed_fused_projections.get(fused_qname, []),
+        )
         if state == "IGNORE":
             ignore.append(regex)
         else:
@@ -4902,19 +5072,20 @@ def build_quantization_config(
 # and the NVFP4 scale params (w2_input_global_scale, ...) never get
 # registered, crashing at weight-load.
 _PER_EXPERT_RE = re.compile(
-    r"^(?P<prefix>.+\.experts)\.\d+\.(?P<proj>gate|up|down)_proj$")
+    r"^(?P<prefix>.+\.experts)\.\d+\.(?P<proj>[^.]+)$")
 
 
-def _per_expert_parent(base: str) -> str | None:
+def _per_expert_parent(base: str, profile=None) -> str | None:
     """Map a per-expert source tensor base like
     `model.layers.0.mlp.experts.3.gate_proj` to its packed parent
-    `model.layers.0.mlp.experts.gate_up_proj` / `.down_proj`, or None
+    (for example `model.layers.0.mlp.experts.gate_up_proj`), or None
     if `base` is not a per-expert tensor."""
     m = _PER_EXPERT_RE.match(base)
     if not m:
         return None
-    proj = m.group("proj")
-    parent = "gate_up_proj" if proj in ("gate", "up") else "down_proj"
+    parent = _packed_expert_parent_for_projection(profile, m.group("proj"))
+    if parent is None:
+        return None
     return f"{m.group('prefix')}.{parent}"
 
 
@@ -4952,7 +5123,7 @@ def compute_extra_ignore(
                            else base)
         if recipe_name in seen_recipe:
             continue
-        parent = _per_expert_parent(recipe_name)
+        parent = _per_expert_parent(recipe_name, profile)
         if parent is not None and parent in seen_recipe:
             continue
         if shape is None or len(shape) != 2:
@@ -4991,26 +5162,13 @@ def main():
     ap.add_argument("--offload-folder", default=None,
                     help="Accelerate disk-offload folder (defaults to "
                          "sibling of output).")
-    ap.add_argument("--ignore", nargs="*", default=["lm_head"],
+    ap.add_argument("--ignore", nargs="*", default=None,
                     help="Module qnames to keep at bf16 even if the "
-                         "allocator assigned another format. "
-                         "lm_head is ignored by default because vLLM's "
-                         "ParallelLMHead module only accepts a single "
-                         "`weight` parameter — it does not support the "
-                         "compressed-tensors NVFP4/MXFP8 layout "
-                         "(weight_packed + weight_scale + global_scales). "
-                         "Quantizing lm_head here produces a valid recipe "
-                         "but vLLM rejects it at load time with "
-                         "'There is no module or parameter named "
-                         "lm_head.input_global_scale in "
-                         "<ForCausalLM>'. This is a RUNTIME limitation, "
-                         "not an allocator choice — the probe + cost "
-                         "stages measure lm_head's sensitivity correctly "
-                         "and the allocator will happily place NVFP4 for "
-                         "it (saving ~0.7 GB on 35B / ~1.1 GB on 122B). "
-                         "Remove this default only if you're exporting "
-                         "for a runtime that supports quantized "
-                         "ParallelLMHead or patches vLLM's registration.")
+                         "allocator assigned another format. Default: the "
+                         "active model profile's pinned_names (typically "
+                         "lm_head/head for current vLLM serving targets). "
+                         "Pass --ignore with no values to disable profile "
+                         "pinning for a runtime that supports quantized heads.")
     ap.add_argument("--activation-cache-dir", default=None,
                     help="Probe's activation cache directory. When "
                          "supplied, per-Linear input_global_scale is "
@@ -5313,7 +5471,11 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bf16_passthrough = set(args.ignore)
+    bf16_passthrough = set(
+        args.ignore
+        if args.ignore is not None
+        else profile.pinned_names()
+    )
     if args.offload_folder is None:
         args.offload_folder = str(out_dir / "_streaming_offload")
 
@@ -5376,12 +5538,10 @@ def main():
                     base = k[:-len(suf)] + ".weight"
                     break
             materialized_bases.add(base)
-            m = re.match(r"^(mtp\.layers\.\d+\.mlp\.experts)\.\d+\.(gate|up|down)_proj\.", k)
-            if m:
-                if m.group(2) in ("gate", "up"):
-                    materialized_bases.add(f"{m.group(1)}.gate_up_proj")
-                else:
-                    materialized_bases.add(f"{m.group(1)}.down_proj")
+            if base.endswith(".weight"):
+                parent = _per_expert_parent(base[:-len(".weight")], profile)
+                if parent is not None:
+                    materialized_bases.add(parent)
         src_extra = {k: v for k, v in src_extra.items()
                      if k not in materialized_bases}
         for k in list(src_extra.keys()):

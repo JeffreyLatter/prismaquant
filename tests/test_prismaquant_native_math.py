@@ -334,7 +334,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
         }
 
         filtered = filter_candidates_for_profile(
-            candidates, "vllm_qwen3_5_packed_moe"
+            candidates, "vllm_packed_moe"
         )
 
         self.assertEqual(
@@ -353,6 +353,27 @@ class _ToyExpertsLinearLoop(nn.Module):
         self.down_proj = nn.ModuleList(
             [nn.Linear(intermediate, hidden, bias=False) for _ in range(num_experts)]
         )
+
+
+class _ToyCustomExpertsLinearLoop(nn.Module):
+    def __init__(self, num_experts=3, hidden=4, intermediate=6):
+        super().__init__()
+        self.w13 = nn.ModuleList(
+            [nn.Linear(hidden, 2 * intermediate, bias=False) for _ in range(num_experts)]
+        )
+        self.w2 = nn.ModuleList(
+            [nn.Linear(intermediate, hidden, bias=False) for _ in range(num_experts)]
+        )
+
+
+class _CustomPackedProfile:
+    def packed_expert_param_names(self) -> frozenset[str]:
+        return frozenset({"w13", "w2"})
+
+    def packed_expert_projection_names(self, param_name: str) -> tuple[str, ...]:
+        if param_name == "w13":
+            return ("w1_proj", "w3_proj")
+        return (param_name,)
 
 
 class _ToyMoeBlock(nn.Module):
@@ -383,6 +404,16 @@ class _ToyModel(nn.Module):
         self.model.layers[0].mlp = _ToyMoeBlock()
 
 
+class _ToyCustomModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Module()])
+        self.model.layers[0].mlp = nn.Module()
+        self.model.layers[0].mlp.gate = nn.Linear(4, 3, bias=False)
+        self.model.layers[0].mlp.experts = _ToyCustomExpertsLinearLoop()
+
+
 class TestMoeDiscovery(unittest.TestCase):
     def test_discover_moe_structure_handles_linear_loop_projection_lists(self):
         toy = _ToyModel()
@@ -396,6 +427,20 @@ class TestMoeDiscovery(unittest.TestCase):
         toy.model.layers[0].mlp = _ToyMoeBlockCustomRouter()
         info = discover_moe_structure(toy)
         self.assertEqual(info["model.layers.0.mlp.experts.gate_up_proj.1"], ("model.layers.0.mlp.gate", "1"))
+        self.assertEqual(len(info), 6)
+
+    def test_discover_moe_structure_uses_profile_projection_names(self):
+        toy = _ToyCustomModel()
+        info = discover_moe_structure(toy, profile=_CustomPackedProfile())
+
+        self.assertEqual(
+            info["model.layers.0.mlp.experts.w13.0"],
+            ("model.layers.0.mlp.gate", "0"),
+        )
+        self.assertEqual(
+            info["model.layers.0.mlp.experts.w2.2"],
+            ("model.layers.0.mlp.gate", "2"),
+        )
         self.assertEqual(len(info), 6)
 
 

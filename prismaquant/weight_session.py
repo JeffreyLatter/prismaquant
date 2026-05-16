@@ -64,6 +64,7 @@ class WeightSession:
         production_weight_cache=None,
         snapshot_dir: str | None = None,
         strict_production_cache: bool | None = None,
+        profile=None,
     ):
         """If ``snapshot_dir`` is provided, BF16 source snapshots are
         spilled to disk after capture instead of held in memory.  This
@@ -83,7 +84,14 @@ class WeightSession:
             )
         self._strict_production_cache = bool(strict_production_cache)
         self._linear_by_qname: dict[str, tuple[nn.Module, str]] = {}
-        for full_name, mod, attr in iter_quantizable_tensors(model):
+        if profile is None:
+            try:
+                from prismaquant.model_profiles import profile_from_model
+                profile = profile_from_model(model)
+            except Exception:
+                profile = None
+        self._profile = profile
+        for full_name, mod, attr in iter_quantizable_tensors(model, self._profile):
             if attr != "weight" or not isinstance(mod, nn.Linear):
                 continue
             qname = full_name[:-7] if full_name.endswith(".weight") else full_name

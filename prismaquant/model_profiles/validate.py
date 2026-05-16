@@ -48,6 +48,9 @@ Checks performed:
      tensor in the source's safetensors index (otherwise the prefix
      is dead weight).
 
+  8. **Serving profile sanity.** The model's default serving profile
+     exists, and its configured runtime validator callables import.
+
 Exit code 0 if every check passes, 1 otherwise. Each failure prints
 a ✗ line with context; each success prints a ✓. Intended to be
 CI-friendly so new profiles get a clear pass/fail signal before
@@ -156,6 +159,24 @@ def _check_vllm_class(profile) -> CheckResult:
     from .vllm_registry import vllm_class_for_architecture
     cls = vllm_class_for_architecture(arch)
     if cls is None:
+        vllm_available = True
+        try:
+            import vllm  # noqa: F401
+        except Exception:
+            vllm_available = False
+        spec = None
+        try:
+            spec = profile.structure_spec()
+        except Exception:
+            spec = None
+        if not vllm_available and spec is not None:
+            return CheckResult(
+                "vllm_architecture_class() resolves",
+                True,
+                f"vLLM is not importable here; arch='{arch}' will be "
+                f"cross-checked in a vLLM environment, and CPU paths use "
+                f"declarative spec '{spec.id}' as fallback",
+            )
         return CheckResult(
             "vllm_architecture_class() resolves", False,
             f"arch='{arch}' not found in vLLM registry; "
@@ -312,12 +333,59 @@ def _check_packed_experts(profile, model_path: str) -> CheckResult:
         "packed_expert_param_names() cover actual 3D params", True, detail)
 
 
+def _check_serving_profile(profile) -> CheckResult:
+    from ..serving_profiles import (
+        _LEGACY_RUNTIME_VALIDATORS,
+        _load_runtime_validator,
+        load_serving_profile,
+        resolve_target_profile,
+    )
+
+    profile_id = resolve_target_profile(profile, None)
+    try:
+        serving_profile = load_serving_profile(profile_id)
+    except Exception as e:
+        return CheckResult(
+            "serving profile exists + validator callables import",
+            False,
+            f"{profile_id!r} failed to load: {type(e).__name__}: {e}",
+        )
+
+    failures = []
+    for rule in serving_profile.runtime_shape_validators:
+        callable_path = (
+            rule.callable_path
+            or _LEGACY_RUNTIME_VALIDATORS.get(rule.id)
+        )
+        if not callable_path:
+            continue
+        try:
+            _load_runtime_validator(callable_path)
+        except Exception as e:
+            failures.append(
+                f"{rule.id}: {callable_path}: {type(e).__name__}: {e}"
+            )
+    if failures:
+        return CheckResult(
+            "serving profile exists + validator callables import",
+            False,
+            "; ".join(failures),
+        )
+    return CheckResult(
+        "serving profile exists + validator callables import",
+        True,
+        f"{profile_id} ({len(serving_profile.runtime_shape_validators)} "
+        "runtime validators)",
+    )
+
+
 def validate_profile(profile, model_path: str, cfg: dict) -> list[CheckResult]:
     checks = [
         _check_matches(profile, cfg),
         _check_vllm_class(profile),
         _check_fused_siblings(profile),
         _check_name_remap(profile),
+        _check_serving_profile(profile),
         _check_packed_experts(profile, model_path),
         _check_source_passthrough(profile, model_path),
         _check_mtp(profile, cfg, model_path),

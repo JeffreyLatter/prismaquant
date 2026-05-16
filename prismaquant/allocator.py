@@ -96,7 +96,6 @@ from .allocator_solver import (
 from .allocator_candidates import (
     PASSTHROUGH_SOURCE_REQUIREMENTS,
     _FUSED_SIBLING_MARKER,
-    _flashinfer_kernel_accepts,
     _format_kernel_supports_shape,
     _is_passthrough_format,
     _passthrough_source_ok,
@@ -106,7 +105,11 @@ from .allocator_candidates import (
     expand_fused_sibling_assignment,
     summarize_applicability_masks,
 )
-from .serving_profiles import check_serving_format, serving_profile_names
+from .serving_profiles import (
+    check_serving_format,
+    resolve_target_profile,
+    serving_profile_names,
+)
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
@@ -152,6 +155,10 @@ def filter_candidates_for_profile(
         if kept:
             out[name] = kept
     return out
+
+
+def _format_cli_choices() -> tuple[str, ...]:
+    return tuple(sorted(set(fr.REGISTRY) | set(fr.FORMAT_ALIASES)))
 
 
 # ---------------------------------------------------------------------------
@@ -397,9 +404,11 @@ def main():
                     help="OMP/numpy threads for DP (0 = default)")
     ap.add_argument("--target-profile",
                     choices=serving_profile_names(),
-                    default="research",
+                    default=None,
                     help="Serving/backend constraint profile loaded from "
-                         "prismaquant/serving_profile_specs.")
+                         "prismaquant/serving_profile_specs. Defaults to "
+                         "the detected model profile's configured serving "
+                         "profile, or research when none is declared.")
     ap.add_argument("--calibration", default=None,
                     help="Optional path to a JSON containing "
                          "'calibrated_gains[fmt] = α_fmt'. When present, "
@@ -411,7 +420,7 @@ def main():
                          "fused-sibling promotion. The DP is re-run with a "
                          "tightened target until overshoot is within tol.")
     ap.add_argument("--visual-format",
-                    choices=["BF16", "NVFP4", "MXFP8"],
+                    choices=_format_cli_choices(),
                     default="BF16",
                     help="Uniform format for all visual-encoder Linears "
                          "(`model.visual.blocks.*`). Phase 1 fallback: "
@@ -435,7 +444,7 @@ def main():
                          "the Phase 1 path: every visual Linear gets "
                          "--visual-format regardless of what's in the probe.")
     ap.add_argument("--mtp-format",
-                    choices=["BF16", "NVFP4", "MXFP8"],
+                    choices=_format_cli_choices(),
                     default="BF16",
                     help="Uniform format for MTP Linears. BF16 is the "
                          "production default until MTP speculative-decode "
@@ -467,6 +476,10 @@ def main():
         model_profile = detect_profile(probe_model_path)
         print(f"[alloc] model profile: {model_profile.name} "
               f"(derived from {probe_model_path})", flush=True)
+    target_profile = resolve_target_profile(model_profile, args.target_profile)
+    if target_profile not in serving_profile_names():
+        raise SystemExit(f"[alloc] ERROR: unknown target profile {target_profile!r}")
+    print(f"[alloc] target profile: {target_profile}", flush=True)
 
     with open(args.probe, "rb") as f:
         probe = pickle.load(f)
@@ -557,7 +570,7 @@ def main():
     candidates = build_candidates(
         stats, costs, specs_sorted, calibrated_gains,
         source_manifest=source_manifest,
-        target_profile=args.target_profile,
+        target_profile=target_profile,
         mask_records=candidate_mask_records,
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
@@ -590,7 +603,7 @@ def main():
         print(f"[alloc] fused-sibling aggregation: {sib_groups} groups "
               f"(qkv_proj / gate_up_proj / ...)")
 
-    candidates = filter_candidates_for_profile(candidates, args.target_profile)
+    candidates = filter_candidates_for_profile(candidates, target_profile)
 
     post_aggregation_availability = {
         spec.name: sum(
@@ -601,7 +614,7 @@ def main():
     }
     applicability_payload = {
         "schema": "prismaquant.format_applicability.v1",
-        "target_profile": args.target_profile,
+        "target_profile": target_profile,
         "model_profile": getattr(model_profile, "name", ""),
         "formats": [spec.name for spec in specs_sorted],
         "probe": str(args.probe),

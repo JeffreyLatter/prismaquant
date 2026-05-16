@@ -2,26 +2,6 @@
   "schema": "prismaquant.serving_profile.v1",
   "id": "vllm_qwen3_5_packed_moe",
   "runtime": "vllm",
-  "extends": ["research"],
-  "description": "vLLM serving constraints for Qwen3.5/3.6 packed-MoE compressed-tensors artifacts.",
-  "format_rules": [
-    {
-      "id": "packed_moe_expert_formats",
-      "when": {
-        "regex": "(^|[.])(?:mlp[.]|moe[.])?experts([.]|$)"
-      },
-      "allow_formats": ["NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"],
-      "reason": "profile_mismatch",
-      "detail": "Qwen3.5/3.6 packed MoE serving path only supports NVFP4, MXFP4, MXFP8_E4M3, or BF16 for expert tensors; plain FP8 and E5M2 stay research-only until a vLLM packed-MoE load smoke passes"
-    },
-    {
-      "id": "dense_formats_without_vllm_fast_path",
-      "when": {
-        "not_regex": "(^|[.])(?:mlp[.]|moe[.])?experts([.]|$)"
-      },
-      "deny_formats": ["MXFP4", "MXFP8_E5M2", "FP8_E5M2"],
-      "reason": "profile_mismatch",
-      "detail": "This format is not enabled for dense Linears in the selected vLLM serving profile"
-    }
-  ]
+  "extends": ["vllm_packed_moe"],
+  "description": "Compatibility alias for older Qwen3.5/3.6 packed-MoE runs. New model specs should use vllm_packed_moe."
 }

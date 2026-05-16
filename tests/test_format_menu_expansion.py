@@ -4,6 +4,7 @@ from prismaquant import format_registry as fr
 from prismaquant.allocator import (
     apply_mtp_format_override,
     filter_candidates_for_profile,
+    resolve_target_profile,
 )
 from prismaquant.allocator_candidates import check_format_applicability
 from prismaquant.allocator_solver import Candidate
@@ -14,7 +15,12 @@ from prismaquant.export_native_compressed import (
 from prismaquant.kl_sensitivity_probe import _production_cache_formats
 
 
-VLLM_PROFILE = "vllm_qwen3_5_packed_moe"
+VLLM_PROFILE = "vllm_packed_moe"
+
+
+class _ProfileWithServingDefault:
+    def serving_profile_id(self) -> str:
+        return VLLM_PROFILE
 
 
 def test_production_cache_formats_include_all_non_bf16_registry_picks():
@@ -27,6 +33,14 @@ def test_production_cache_formats_include_all_non_bf16_registry_picks():
         ["MXFP8_E5M2", "FP8_E5M2", "BF16"],
         "NVFP4",
     ) == ["FP8_E5M2", "MXFP8_E5M2", "NVFP4"]
+
+
+def test_allocator_target_profile_defaults_to_model_profile_config():
+    assert resolve_target_profile(_ProfileWithServingDefault()) == VLLM_PROFILE
+    assert (
+        resolve_target_profile(_ProfileWithServingDefault(), "research")
+        == "research"
+    )
 
 
 def test_vllm_profile_allows_dense_fp8_e4m3_but_not_e5m2():

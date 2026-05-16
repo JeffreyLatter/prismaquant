@@ -59,6 +59,73 @@ class _IdentityProfile:
         return live_qname
 
 
+class _CustomPackedProfile:
+    """Profile stub with a non-Qwen packed expert decomposition."""
+
+    def live_to_recipe_name(self, live_qname: str) -> str:
+        return live_qname
+
+    def to_vllm_internal_name(self, checkpoint_name: str) -> str:
+        return checkpoint_name
+
+    def per_expert_moe_regex(self) -> str | None:
+        return None
+
+    def per_expert_mtp_regex(self) -> str | None:
+        return None
+
+    def packed_expert_param_names(self) -> frozenset[str]:
+        return frozenset({"w13", "w2"})
+
+    def packed_expert_projection_names(self, param_name: str) -> tuple[str, ...]:
+        if param_name == "w13":
+            return ("w1_proj", "w3_proj")
+        return (param_name,)
+
+    def packed_expert_parent_for_projection(
+        self,
+        projection_name: str,
+    ) -> str | None:
+        if projection_name in {"w1_proj", "w3_proj"}:
+            return "w13"
+        if projection_name == "w2":
+            return "w2"
+        return None
+
+    def packed_expert_format_group(self, qname: str) -> str | None:
+        if ".experts." not in qname:
+            return None
+        parent, leaf = qname.rsplit(".", 1)
+        if leaf in {"w13", "w2"}:
+            return f"{parent}::__packed_format__:w13,w2"
+        return None
+
+
+class _CustomPackedRegexProfile(_CustomPackedProfile):
+    """Custom packed profile with a serving-side per-expert regex."""
+
+    def to_vllm_internal_name(self, checkpoint_name: str) -> str:
+        return checkpoint_name.replace(
+            "model.layers.",
+            "serving.layers.",
+        ).replace(
+            ".mlp.experts.",
+            ".moe.experts.",
+        )
+
+    def per_expert_moe_regex(self) -> str | None:
+        return (
+            "re:^serving[.]layers[.][0-9]+[.]moe[.]experts"
+            "[.][0-9]+[.](w1_proj|w3_proj|w2)$"
+        )
+
+    def per_expert_mtp_regex(self) -> str | None:
+        return (
+            "re:^mtp[.]layers[.][0-9]+[.]moe[.]experts"
+            "[.][0-9]+[.](w1_proj|w3_proj|w2)$"
+        )
+
+
 class TestPassthroughDtype(unittest.TestCase):
     def test_passthrough_preserves_source_precision_policy(self):
         self.assertEqual(
@@ -584,6 +651,55 @@ class TestBuildQuantizationConfig(unittest.TestCase):
             self.assertFalse(
                 t.endswith("mlp[.]experts[.]down_proj$"),
                 f"packed tensor name leaked: {t}")
+
+    def test_packed_moe_regex_uses_profile_projection_splits(self):
+        profile = _CustomPackedProfile()
+        assignment = {
+            "model.layers.0.mlp.experts.w13": "NVFP4",
+            "model.layers.0.mlp.experts.w2": "NVFP4",
+            "model.layers.0.self_attn.q_proj": "MXFP8",
+        }
+        qc = build_quantization_config(
+            assignment, bf16_passthrough=set(), profile=profile,
+        )
+        targets = [
+            target
+            for group in qc["config_groups"].values()
+            for target in group["targets"]
+        ]
+
+        packed_targets = [
+            target for target in targets
+            if "mlp[.]experts[.][0-9]+[.]" in target
+        ]
+        self.assertEqual(
+            packed_targets,
+            [
+                "re:^model[.]layers[.]0[.]mlp[.]experts"
+                "[.][0-9]+[.](w1_proj|w3_proj|w2)$"
+            ],
+        )
+        self.assertNotIn(
+            "(gate_proj|up_proj|down_proj)",
+            packed_targets[0],
+        )
+
+    def test_bf16_packed_ignore_uses_profile_projection_regex(self):
+        profile = _CustomPackedRegexProfile()
+        regexes = enc._bf16_packed_expert_ignore_regex(
+            "model.layers.3.mlp.experts.w13",
+            profile,
+        )
+
+        self.assertEqual(
+            regexes,
+            [
+                "re:^serving[.]layers[.]3[.]moe[.]experts"
+                "[.][0-9]+[.](w1_proj|w3_proj)$"
+            ],
+        )
+        self.assertNotIn("w2", regexes[0])
+        self.assertNotIn("gate|up|down", regexes[0])
 
     def test_bf16_mtp_ignore_does_not_taint_body_layer(self):
         """A BF16 MTP `mtp.layers.N.mlp.experts.*` assignment must emit
@@ -1412,6 +1528,28 @@ class TestComputeExtraIgnorePerExpertSiblings(unittest.TestCase):
             extra,
         )
         self.assertIn("model.language_model.layers.0.moe.shared_gate", extra)
+
+    def test_profile_decomposition_excludes_custom_per_expert_siblings(self):
+        assignment = {
+            "model.layers.0.mlp.experts.w13": "NVFP4",
+            "model.layers.0.mlp.experts.w2": "NVFP4",
+        }
+        source_iter = [
+            ("model.layers.0.mlp.experts.0.w1_proj.weight", [512, 1024]),
+            ("model.layers.0.mlp.experts.0.w3_proj.weight", [512, 1024]),
+            ("model.layers.0.mlp.experts.0.w2.weight", [1024, 512]),
+            ("model.layers.0.mlp.experts.0.side.weight", [512, 1024]),
+        ]
+        extra = compute_extra_ignore(
+            source_iter,
+            assignment,
+            _CustomPackedProfile(),
+        )
+
+        self.assertNotIn("model.layers.0.mlp.experts.0.w1_proj", extra)
+        self.assertNotIn("model.layers.0.mlp.experts.0.w3_proj", extra)
+        self.assertNotIn("model.layers.0.mlp.experts.0.w2", extra)
+        self.assertIn("model.layers.0.mlp.experts.0.side", extra)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from importlib import import_module
 from importlib import resources
 from typing import Any, Mapping
 
@@ -103,6 +104,7 @@ class ServingFormatRule:
 class ShapeRule:
     id: str
     formats: tuple[str, ...]
+    when: NameCondition = field(default_factory=NameCondition)
     min_in_features: int | None = None
     min_out_features: int | None = None
     in_features_multiple_of: int | None = None
@@ -115,6 +117,7 @@ class ShapeRule:
         return cls(
             id=str(payload["id"]),
             formats=tuple(str(v) for v in payload.get("formats", ())),
+            when=NameCondition.from_dict(payload.get("when") or {}),
             min_in_features=_optional_int(payload.get("min_in_features")),
             min_out_features=_optional_int(payload.get("min_out_features")),
             in_features_multiple_of=_optional_int(
@@ -131,10 +134,13 @@ class ShapeRule:
         self,
         fmt: str,
         *,
+        qname: str | None = None,
         in_features: int,
         out_features: int,
     ) -> ServingFormatDecision | None:
         if not _format_in(fmt, self.formats):
+            return None
+        if not self.when.matches(qname or ""):
             return None
         legal = True
         if self.min_in_features is not None and in_features < self.min_in_features:
@@ -161,12 +167,102 @@ class ShapeRule:
 
 
 @dataclass(frozen=True)
+class RuntimeShapeValidatorRule:
+    id: str
+    formats: tuple[str, ...]
+    when: NameCondition = field(default_factory=NameCondition)
+    callable_path: str | None = None
+    optional: bool = True
+    reason: str = "kernel_shape"
+    detail: str = ""
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeShapeValidatorRule":
+        return cls(
+            id=str(payload["id"]),
+            formats=tuple(str(v) for v in payload.get("formats", ())),
+            when=NameCondition.from_dict(payload.get("when") or {}),
+            callable_path=_optional_str(
+                payload.get("callable") or payload.get("callable_path")
+            ),
+            optional=bool(payload.get("optional", True)),
+            reason=str(payload.get("reason", "kernel_shape")),
+            detail=str(payload.get("detail", "")),
+        )
+
+    def check(
+        self,
+        fmt: str,
+        *,
+        qname: str | None = None,
+        in_features: int,
+        out_features: int,
+    ) -> ServingFormatDecision | None:
+        if not _format_in(fmt, self.formats):
+            return None
+        if not self.when.matches(qname or ""):
+            return None
+        verdict = _runtime_shape_validator_accepts(
+            self.id,
+            fmt,
+            in_features=in_features,
+            out_features=out_features,
+            callable_path=self.callable_path,
+        )
+        if verdict is None:
+            if self.optional:
+                return ServingFormatDecision(True, rule=self.id)
+            return ServingFormatDecision(
+                False,
+                self.reason,
+                self.detail or f"runtime shape validator {self.id!r} unavailable",
+                self.id,
+            )
+        if verdict:
+            return ServingFormatDecision(True, rule=self.id)
+        detail = self.detail or (
+            f"{fmt} runtime validator {self.id} rejected "
+            f"(out_features={out_features}, in_features={in_features})"
+        )
+        return ServingFormatDecision(False, self.reason, detail, self.id)
+
+
+@dataclass(frozen=True)
+class RuntimePackageSpec:
+    id: str
+    module: str | None = None
+    version: str | None = None
+    pip_packages: tuple[str, ...] = ()
+    env: tuple[tuple[str, str], ...] = ()
+    optional: bool = True
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimePackageSpec":
+        return cls(
+            id=str(payload["id"]),
+            module=_optional_str(payload.get("module")),
+            version=_optional_str(payload.get("version")),
+            pip_packages=tuple(str(v) for v in payload.get("pip_packages", ())),
+            env=tuple(
+                (str(key), str(value))
+                for key, value in (payload.get("env") or {}).items()
+            ),
+            optional=bool(payload.get("optional", True)),
+        )
+
+    def env_dict(self) -> dict[str, str]:
+        return dict(self.env)
+
+
+@dataclass(frozen=True)
 class ServingProfile:
     id: str
     runtime: str = ""
     extends: tuple[str, ...] = ()
     format_rules: tuple[ServingFormatRule, ...] = ()
     shape_rules: tuple[ShapeRule, ...] = ()
+    runtime_shape_validators: tuple[RuntimeShapeValidatorRule, ...] = ()
+    runtime_packages: tuple[RuntimePackageSpec, ...] = ()
     description: str = ""
 
     @classmethod
@@ -186,6 +282,14 @@ class ServingProfile:
                 ShapeRule.from_dict(entry)
                 for entry in payload.get("shape_rules", ())
             ),
+            runtime_shape_validators=tuple(
+                RuntimeShapeValidatorRule.from_dict(entry)
+                for entry in payload.get("runtime_shape_validators", ())
+            ),
+            runtime_packages=tuple(
+                RuntimePackageSpec.from_dict(entry)
+                for entry in payload.get("runtime_packages", ())
+            ),
             description=str(payload.get("description", "")),
         )
 
@@ -197,16 +301,33 @@ class ServingProfile:
                 return decision
         return ServingFormatDecision(True)
 
+    def runtime_package(self, package_id: str) -> RuntimePackageSpec | None:
+        for package in reversed(self.runtime_packages):
+            if package.id == package_id:
+                return package
+        return None
+
     def check_shape(
         self,
         fmt: str,
         *,
+        qname: str | None = None,
         in_features: int,
         out_features: int,
     ) -> ServingFormatDecision:
+        for rule in self.runtime_shape_validators:
+            decision = rule.check(
+                fmt,
+                qname=qname,
+                in_features=in_features,
+                out_features=out_features,
+            )
+            if decision is not None and not decision.legal:
+                return decision
         for rule in self.shape_rules:
             decision = rule.check(
                 fmt,
+                qname=qname,
                 in_features=in_features,
                 out_features=out_features,
             )
@@ -251,10 +372,45 @@ def load_serving_profile(profile_id: str | None) -> ServingProfile:
                 for base in bases
                 for rule in base.shape_rules
             ) + profile.shape_rules,
+            runtime_shape_validators=tuple(
+                rule
+                for base in bases
+                for rule in base.runtime_shape_validators
+            ) + profile.runtime_shape_validators,
+            runtime_packages=tuple(
+                package
+                for base in bases
+                for package in base.runtime_packages
+            ) + profile.runtime_packages,
             description=profile.description,
         )
     _CACHE[profile_name] = profile
     return profile
+
+
+def resolve_target_profile(
+    profile=None,
+    requested: str | None = None,
+    *,
+    default: str = "research",
+) -> str:
+    """Resolve the serving/backend constraint profile for a run.
+
+    Explicit CLI/API input wins. Otherwise a model profile may declare its
+    default serving profile in the structure spec. The fallback is the
+    research profile, which only carries generic kernel-shape rules.
+    """
+    if requested:
+        return str(requested)
+    getter = getattr(profile, "serving_profile_id", None)
+    if callable(getter):
+        try:
+            profile_id = getter()
+            if profile_id:
+                return str(profile_id)
+        except Exception:
+            pass
+    return str(default)
 
 
 def check_serving_format(
@@ -277,6 +433,7 @@ def check_serving_shape(
     profile_id: str | None,
     fmt: str,
     *,
+    qname: str | None = None,
     in_features: int,
     out_features: int,
 ) -> ServingFormatDecision:
@@ -286,6 +443,7 @@ def check_serving_shape(
         profile = load_serving_profile("research")
     return profile.check_shape(
         fmt,
+        qname=qname,
         in_features=in_features,
         out_features=out_features,
     )
@@ -302,6 +460,41 @@ def _load_serving_profile_uncached(profile_id: str) -> ServingProfile:
 def _format_in(fmt: str, names: tuple[str, ...]) -> bool:
     candidates = {fmt, fr.canonical_format_name(fmt), *fr.aliases_for(fmt)}
     return bool(candidates.intersection(names))
+
+
+def _runtime_shape_validator_accepts(
+    validator_id: str,
+    fmt: str,
+    *,
+    in_features: int,
+    out_features: int,
+    callable_path: str | None = None,
+) -> bool | None:
+    path = callable_path or _LEGACY_RUNTIME_VALIDATORS.get(validator_id)
+    if not path:
+        return None
+    validator = _load_runtime_validator(path)
+    return validator(fmt, in_features=in_features, out_features=out_features)
+
+
+_LEGACY_RUNTIME_VALIDATORS = {
+    "flashinfer_mxfp8_problem_size": (
+        "prismaquant.runtime_shape_validators:"
+        "flashinfer_mxfp8_problem_size_accepts"
+    ),
+}
+
+
+def _load_runtime_validator(callable_path: str):
+    if ":" in callable_path:
+        module_name, attr_name = callable_path.split(":", 1)
+    else:
+        module_name, attr_name = callable_path.rsplit(".", 1)
+    module = import_module(module_name)
+    validator = getattr(module, attr_name)
+    if not callable(validator):
+        raise TypeError(f"runtime validator {callable_path!r} is not callable")
+    return validator
 
 
 def _optional_str(value: object) -> str | None:

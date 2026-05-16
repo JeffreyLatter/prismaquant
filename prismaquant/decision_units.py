@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import format_registry as fr
 from .allocator_candidates import check_format_applicability
+from .serving_profiles import resolve_target_profile
 
 
 SCHEMA = "prismaquant.block_clado.v1"
@@ -82,20 +83,20 @@ def _recipe_name(full_name: str) -> str:
     return full_name[:-7] if full_name.endswith(".weight") else full_name
 
 
-def _enumerate_quantizable_linears(model) -> list[str]:
+def _enumerate_quantizable_linears(model, profile=None) -> list[str]:
     from .build_rtn_cache import iter_quantizable_tensors
 
     names: list[str] = []
-    for full_name, _module, _attr in iter_quantizable_tensors(model):
+    for full_name, _module, _attr in iter_quantizable_tensors(model, profile):
         names.append(_recipe_name(full_name))
     return sorted(set(names))
 
 
-def _shape_of_param(model, qname: str) -> tuple[int, ...] | None:
+def _shape_of_param(model, qname: str, profile=None) -> tuple[int, ...] | None:
     from .build_rtn_cache import iter_quantizable_tensors
 
     target = qname
-    for full_name, module, attr in iter_quantizable_tensors(model):
+    for full_name, module, attr in iter_quantizable_tensors(model, profile):
         if _recipe_name(full_name) == target:
             param = getattr(module, attr, None)
             if param is None:
@@ -115,9 +116,20 @@ def discover_units(
     model,
     profile,
     formats: Sequence["fr.FormatSpec"],
+    *,
+    target_profile: str | None = None,
 ) -> tuple[dict[str, list[DecisionUnit]], list[DecisionUnit], dict[str, int]]:
     """Build fused-sibling decision units directly from the model."""
-    qnames = _enumerate_quantizable_linears(model)
+    graph_units = _discover_units_from_model_graph(
+        model,
+        profile,
+        formats,
+        target_profile=target_profile,
+    )
+    if graph_units is not None:
+        return graph_units
+
+    qnames = _enumerate_quantizable_linears(model, profile)
     groups: dict[str, list[str]] = defaultdict(list)
     for qname in qnames:
         groups[fused_group_key(profile, qname)].append(qname)
@@ -132,7 +144,7 @@ def discover_units(
         block_id = max(set(block_ids), key=block_ids.count) if block_ids else group_name
         member_shapes_by_name: dict[str, tuple[int, ...]] = {}
         for member in members:
-            shape = _shape_of_param(model, member)
+            shape = _shape_of_param(model, member, profile)
             if shape is not None:
                 member_shapes_by_name[member] = shape
         if not member_shapes_by_name:
@@ -148,7 +160,7 @@ def discover_units(
                     shape,
                     spec,
                     qname=member,
-                    target_profile="research",
+                    target_profile=_target_profile_id(profile, target_profile),
                 ).legal
                 for member, shape in member_shapes_by_name.items()
             ):
@@ -184,6 +196,106 @@ def discover_units(
         else:
             pruned_blocks[block_id] = units
     return pruned_blocks, singletons, n_params_by_unit
+
+
+def _discover_units_from_model_graph(
+    model,
+    profile,
+    formats: Sequence["fr.FormatSpec"],
+    *,
+    target_profile: str | None = None,
+) -> tuple[dict[str, list[DecisionUnit]], list[DecisionUnit], dict[str, int]] | None:
+    if profile is None or not hasattr(profile, "build_model_graph"):
+        return None
+    try:
+        graph = profile.build_model_graph(model)
+    except Exception:
+        return None
+
+    shapes_by_name = {
+        _recipe_name(tensor.recipe_name): tensor.shape
+        for tensor in graph.quantizable_tensors()
+    }
+    if not shapes_by_name:
+        return None
+
+    blocks: dict[str, list[DecisionUnit]] = defaultdict(list)
+    singletons: list[DecisionUnit] = []
+    n_params_by_unit: dict[str, int] = {}
+    serving_profile = _target_profile_id(profile, target_profile)
+    for opt_unit in graph.optimization_units():
+        unit_name = _decision_unit_name_from_graph_unit(opt_unit.id)
+        members = tuple(
+            _recipe_name(member)
+            for member in opt_unit.members
+            if _recipe_name(member) in shapes_by_name
+        )
+        if not members:
+            continue
+        member_shapes_by_name = {
+            member: shapes_by_name[member]
+            for member in members
+        }
+        n_params_unit = sum(int(_prod(s)) for s in member_shapes_by_name.values())
+        n_params_by_unit[unit_name] = n_params_unit
+        options = []
+        for spec in formats:
+            spec_canon = fr.canonical_format_name(spec.name)
+            if not all(
+                check_format_applicability(
+                    shape,
+                    spec,
+                    qname=member,
+                    target_profile=serving_profile,
+                ).legal
+                for member, shape in member_shapes_by_name.items()
+            ):
+                continue
+            mem_bytes = sum(
+                spec.memory_bytes_for_shape(s)
+                for s in member_shapes_by_name.values()
+            )
+            options.append(FormatCost(
+                fmt=spec_canon,
+                omega_ii=0.0,
+                bits_per_param=8.0 * mem_bytes / max(n_params_unit, 1),
+                memory_bytes=int(mem_bytes),
+            ))
+        if not options:
+            continue
+        options.sort(key=lambda opt: (opt.bits_per_param, opt.fmt))
+        block_id = opt_unit.block or block_id_from_qname(members[0])
+        unit = DecisionUnit(
+            name=unit_name,
+            block_id=block_id,
+            member_qnames=members,
+            options=tuple(options),
+        )
+        if block_id == unit_name and ".layers." not in block_id:
+            singletons.append(unit)
+        else:
+            blocks[block_id].append(unit)
+
+    if not blocks and not singletons:
+        return None
+    pruned_blocks: dict[str, list[DecisionUnit]] = {}
+    for block_id, units in blocks.items():
+        if len(units) == 1 and ".layers." not in block_id:
+            singletons.append(units[0])
+        else:
+            pruned_blocks[block_id] = units
+    return pruned_blocks, singletons, n_params_by_unit
+
+
+def _target_profile_id(profile, target_profile: str | None) -> str:
+    return resolve_target_profile(profile, target_profile)
+
+
+def _decision_unit_name_from_graph_unit(unit_id: str) -> str:
+    for prefix in ("fused:", "packed_expert:", "tensor:"):
+        if unit_id.startswith(prefix):
+            return _recipe_name(unit_id[len(prefix):])
+    return _recipe_name(unit_id)
 
 
 def _parse_pair_key(key: str) -> tuple[str, str]:

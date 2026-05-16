@@ -1,7 +1,7 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "qwen3",
-  "default_serving_profile": "vllm_qwen3_5_packed_moe",
+  "default_serving_profile": "vllm_packed_moe",
   "match": {
     "model_type": ["qwen3"],
     "architectures": ["Qwen3ForCausalLM"]

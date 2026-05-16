@@ -664,8 +664,10 @@ class _LinearActivationCollector:
         *,
         store_device: torch.device | str | None = None,
         store_dtype: torch.dtype = torch.float32,
+        profile=None,
     ):
         self.model = model
+        self.profile = profile
         self.qnames = qnames
         self.store_qnames = set(store_qnames) if store_qnames is not None else set(qnames)
         self.max_rows = int(max_rows)
@@ -679,7 +681,7 @@ class _LinearActivationCollector:
         self._max_abs_tensors: dict[str, torch.Tensor] = {}
         self._handles: list = []
         self._name_by_id: dict[int, str] = {}
-        for full_name, mod, attr in iter_quantizable_tensors(model):
+        for full_name, mod, attr in iter_quantizable_tensors(model, self.profile):
             if attr != "weight" or not isinstance(mod, nn.Linear):
                 continue
             qname = full_name[:-7] if full_name.endswith(".weight") else full_name
@@ -692,7 +694,10 @@ class _LinearActivationCollector:
 
     def install(self) -> None:
         for mod_id, key in self._name_by_id.items():
-            for full_name, mod, attr in iter_quantizable_tensors(self.model):
+            for full_name, mod, attr in iter_quantizable_tensors(
+                self.model,
+                self.profile,
+            ):
                 if id(mod) != mod_id or attr != "weight":
                     continue
                 self._handles.append(
@@ -816,8 +821,16 @@ class _FisherRowWeightCache:
 
     _FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
 
-    def __init__(self, h_detail_dir: str | Path | None):
+    def __init__(
+        self,
+        h_detail_dir: str | Path | None,
+        fused_sibling_mapping: Mapping[str, Sequence[str]] | None = None,
+    ):
         self.detail_dir = Path(h_detail_dir) if h_detail_dir else None
+        self.fused_sibling_mapping = {
+            str(fused): tuple(str(member) for member in members)
+            for fused, members in (fused_sibling_mapping or {}).items()
+        }
         self._cache: dict[str, torch.Tensor | None] = {}
         self.loads = 0
         self.misses = 0
@@ -846,22 +859,14 @@ class _FisherRowWeightCache:
             weights = None
         return weights
 
-    @staticmethod
-    def _split_fused_names(qname: str) -> tuple[str, ...]:
-        if qname.endswith(".qkv_proj"):
-            prefix = qname[:-len(".qkv_proj")]
-            return (
-                f"{prefix}.q_proj",
-                f"{prefix}.k_proj",
-                f"{prefix}.v_proj",
-            )
-        if qname.endswith(".gate_up_proj"):
-            prefix = qname[:-len(".gate_up_proj")]
-            return (f"{prefix}.gate_proj", f"{prefix}.up_proj")
-        if qname.endswith(".in_proj_qkvz"):
-            prefix = qname[:-len(".in_proj_qkvz")]
-            return (f"{prefix}.in_proj_qkv", f"{prefix}.in_proj_z")
-        return ()
+    def _split_fused_names(self, qname: str) -> tuple[str, ...]:
+        if "." not in qname:
+            return ()
+        prefix, leaf = qname.rsplit(".", 1)
+        members = self.fused_sibling_mapping.get(leaf)
+        if not members:
+            return ()
+        return tuple(f"{prefix}.{member}" for member in members)
 
     @staticmethod
     def _combine_split_weights(parts: Sequence[torch.Tensor]) -> torch.Tensor | None:
@@ -900,6 +905,22 @@ class _FisherRowWeightCache:
             self.loads += 1
         self._cache[qname] = weights
         return weights
+
+
+def _fused_sibling_leaf_mapping_from_profile(profile) -> dict[str, tuple[str, ...]]:
+    if profile is None:
+        return {}
+    getter = getattr(profile, "fused_sibling_leaf_mapping", None)
+    if not callable(getter):
+        return {}
+    try:
+        mapping = getter()
+    except Exception:
+        return {}
+    return {
+        str(fused): tuple(str(member) for member in members)
+        for fused, members in (mapping or {}).items()
+    }
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -1773,6 +1794,13 @@ def fill_production_weight_cache(
                 "requested_entries": 0,
             },
         )
+    model_profile = recache_profile
+    if model_profile is None:
+        try:
+            from .model_profiles import profile_from_model
+            model_profile = profile_from_model(model)
+        except Exception:
+            model_profile = None
 
     if progress:
         requested_entries = sum(
@@ -1879,6 +1907,7 @@ def fill_production_weight_cache(
             store_qnames=qnames_needing_activation,
             store_device=activation_store_device,
             store_dtype=activation_store_dtype,
+            profile=model_profile,
         )
         collector.install()
         try:
@@ -1929,15 +1958,23 @@ def fill_production_weight_cache(
     if cache_dir_path is not None and progress:
         print(f"[prod-cache] streaming cache to {cache_dir_path}/", flush=True)
 
-    for full_name, mod, attr in iter_quantizable_tensors(model):
+    for full_name, mod, attr in iter_quantizable_tensors(model, model_profile):
         if attr != "weight" or not isinstance(mod, nn.Linear):
             continue
         qname = full_name[:-7] if full_name.endswith(".weight") else full_name
         if qname in qname_set:
             qname_to_module[qname] = mod
 
+    fused_sibling_mapping = (
+        _fused_sibling_leaf_mapping_from_profile(model_profile)
+        if model_profile is not None
+        else {}
+    )
     fisher_rows = (
-        _FisherRowWeightCache(h_detail_dir)
+        _FisherRowWeightCache(
+            h_detail_dir,
+            fused_sibling_mapping or None,
+        )
         if (bool(levers.get("fisher_gptq", False)) and h_detail_dir)
         else None
     )
@@ -1961,13 +1998,6 @@ def fill_production_weight_cache(
     # gets its own scale and vLLM's loader either rejects the artifact or
     # silently runs with degraded accuracy.
     joint_globals: dict[str, torch.Tensor] = {}
-    profile = None
-    try:
-        from prismaquant.model_profiles import detect_profile
-        model_path = getattr(model, "name_or_path", "")
-        profile = detect_profile(model_path) if model_path else None
-    except Exception:
-        profile = None
     needs_nvfp4_render = any(
         any(_render_base_format(fmt) == "NVFP4" for fmt in missing)
         for missing in missing_formats_by_qname.values()
@@ -1980,7 +2010,7 @@ def fill_production_weight_cache(
         joint_globals = _compute_nvfp4_joint_global(
             model,
             synthetic_assignment,
-            profile=profile,
+            profile=model_profile,
         )
         if progress:
             print(

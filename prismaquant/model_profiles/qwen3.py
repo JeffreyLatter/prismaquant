@@ -22,12 +22,6 @@ from __future__ import annotations
 from .base import ModelProfile
 
 
-_QWEN3_VLLM_PACKED_MODULES = {
-    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-    "gate_up_proj": ["gate_proj", "up_proj"],
-}
-
-
 class Qwen3Profile(ModelProfile):
 
     @classmethod
@@ -49,50 +43,6 @@ class Qwen3Profile(ModelProfile):
 
     def vllm_architecture_class(self) -> str | None:
         return "Qwen3ForCausalLM"
-
-    def fused_sibling_group(self, linear_qname: str) -> str | None:
-        """Return the vLLM packed-module key for Qwen3 dense Linears.
-
-        This is a serving/export constraint, not a Qwen mathematical
-        constraint: vLLM packs q/k/v and gate/up at load time and expects one
-        quantization scheme for every member of the packed module.  Keep a
-        local fallback so probes and allocators remain deployable on hosts
-        where vLLM is not importable in-process.
-        """
-        if self._fused_matcher is None:
-            self._ensure_vllm_class()
-            from .vllm_registry import (
-                fused_sibling_matcher_from_packed_mapping,
-                packed_modules_mapping_from_class,
-            )
-            pm = (
-                packed_modules_mapping_from_class(self._vllm_cls)
-            )
-            if pm:
-                self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
-            else:
-                spec = self.structure_spec()
-                if spec is not None and spec.fused_groups:
-                    self._fused_matcher = spec.fused_group_for
-                else:
-                    self._fused_matcher = fused_sibling_matcher_from_packed_mapping(
-                        _QWEN3_VLLM_PACKED_MODULES
-                    )
-        return self._fused_matcher(linear_qname)
-
-    # No MoE.
-    def packed_expert_param_names(self) -> frozenset[str]:
-        return frozenset()
-
-    def per_expert_moe_regex(self) -> str | None:
-        return None
-
-    # No MTP.
-    def has_mtp(self) -> bool:
-        return False
-
-    def per_expert_mtp_regex(self) -> str | None:
-        return None
 
     def register_vendored_modeling(self) -> None:
         """Install the vendored Qwen3 causal-LM class with cached RoPE."""

@@ -46,7 +46,10 @@ from prismaquant.kl_measurement import (
     measure_override_set_kl,
 )
 from prismaquant.production_weight_cache import fill_production_weight_cache
-from prismaquant.serving_profiles import serving_profile_names
+from prismaquant.serving_profiles import (
+    resolve_target_profile,
+    serving_profile_names,
+)
 from prismaquant.source_prefetch import prefetch_safetensors_checkpoint
 
 
@@ -217,10 +220,14 @@ def _is_pinned(qname: str, pins: set[str]) -> bool:
     return any(pin == qname or pin in tokens or qname.endswith(pin) for pin in pins)
 
 
-def _linear_targets(model: nn.Module, pins: set[str]) -> list[LinearTarget]:
+def _linear_targets(
+    model: nn.Module,
+    pins: set[str],
+    profile=None,
+) -> list[LinearTarget]:
     targets: list[LinearTarget] = []
     seen: set[str] = set()
-    for full_name, module, attr in iter_quantizable_tensors(model):
+    for full_name, module, attr in iter_quantizable_tensors(model, profile):
         if attr != "weight" or not isinstance(module, nn.Linear):
             continue
         qname = full_name[:-7] if full_name.endswith(".weight") else full_name
@@ -2611,6 +2618,12 @@ def run_probe(args: argparse.Namespace) -> dict:
         profile = detect_profile(args.model)
     except Exception:
         profile = DefaultProfile()
+    args.target_profile = resolve_target_profile(profile, args.target_profile)
+    if args.target_profile not in serving_profile_names():
+        raise SystemExit(
+            f"[kl-probe] ERROR: unknown target profile {args.target_profile!r}"
+        )
+    print(f"[kl-probe] target_profile={args.target_profile}", flush=True)
 
     pins = _parse_pins(args.pin)
     floor_format = fr.canonical_format_name(args.floor_format)
@@ -2623,7 +2636,7 @@ def run_probe(args: argparse.Namespace) -> dict:
         )
     requested_formats = [fr.canonical_format_name(spec.name) for spec in requested_specs]
 
-    targets = _linear_targets(model, pins)
+    targets = _linear_targets(model, pins, profile)
     if args.target_offset:
         targets = targets[max(int(args.target_offset), 0):]
     if args.max_targets is not None:
@@ -3665,7 +3678,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-profile",
         choices=serving_profile_names(),
-        default="research",
+        default=None,
     )
     parser.add_argument("--selection-budget-points", type=int, default=64)
     parser.add_argument("--selection-bit-precision", type=float, default=None)

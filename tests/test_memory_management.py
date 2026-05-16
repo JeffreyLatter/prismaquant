@@ -318,6 +318,7 @@ def test_memory_budget_evicts_when_low(monkeypatch):
 
     evictor = _Evictor()
     monkeypatch.setenv("PRISMAQUANT_MAX_GPU_MEM_GB", "1")
+    monkeypatch.setenv("PRISMAQUANT_UMA_MEMORY_INFO", "0")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args: next(mem_info))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)

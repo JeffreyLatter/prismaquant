@@ -11,12 +11,13 @@
 #   CALIBRATION_MODALITY=text-only \
 #   ./prismaquant/run-pipeline.sh
 #
-# VISUAL_FORMAT (BF16 | NVFP4 | MXFP8) applies to visual-encoder Linears
-# on multimodal models. In text-only calibration mode it's the Phase 1
-# uniform override for every visual Linear. In multimodal mode it's the
-# fallback applied to un-probed visual Linears the allocator's Fisher-
-# driven DP didn't touch (plus the graceful OOM fallback on 122B-scale
-# VLMs that can't fit the whole model in RAM for the multimodal pass).
+# VISUAL_FORMAT accepts any format registry name allowed by the target
+# serving profile and applies to visual-encoder Linears on multimodal models.
+# In text-only calibration mode it's the Phase 1 uniform override for every
+# visual Linear. In multimodal mode it's the fallback applied to un-probed
+# visual Linears the allocator's Fisher-driven DP didn't touch (plus the
+# graceful OOM fallback on 122B-scale VLMs that can't fit the whole model in
+# RAM for the multimodal pass).
 #
 # CALIBRATION_MODALITY (text-only | multimodal):
 #   - text-only (default): body-only streaming probe + cost. Visual
@@ -67,7 +68,7 @@ set -euo pipefail
 : "${DATASET:=/home/rob/dq-runs/calibration/diverse-v1.jsonl}"
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
-: "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
+: "${TARGET_PROFILE:=vllm_packed_moe}"
 
 if [[ "$DEVICE" != cuda* || "$EXPORT_DEVICE" != cuda* ]]; then
   echo "[pipeline] ERROR: PrismaQuant production pipeline is GPU-or-bust; DEVICE and EXPORT_DEVICE must be cuda*" >&2
@@ -83,8 +84,8 @@ if not torch.cuda.is_available():
 PY
 # Visual encoder format: fallback for visual Linears. See header docstring
 # for the full text-only vs multimodal semantics. BF16 (default) is
-# passthrough; NVFP4 / MXFP8 uniformly quantize non-Fisher-allocated
-# visual Linears via the existing RTN math at export time.
+# passthrough; non-BF16 registry formats uniformly quantize
+# non-Fisher-allocated visual Linears via the existing RTN math at export time.
 : "${VISUAL_FORMAT:=BF16}"
 # Calibration modality. `text-only` (default) is the streaming body probe
 # alone; `multimodal` adds a second non-streaming pass over the full

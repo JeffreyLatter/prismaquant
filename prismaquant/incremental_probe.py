@@ -350,6 +350,17 @@ def build_layer_shard_regexes(num_hidden_layers: int,
     return regexes
 
 
+def _detect_profile_for_shards(model_path: str):
+    try:
+        from .model_profiles.registry import detect_profile
+
+        return detect_profile(model_path)
+    except Exception:
+        from .model_profiles.default import DefaultProfile
+
+        return DefaultProfile()
+
+
 def build_extended_shard_regexes(
     model_path: str,
     layers_per_shard: int,
@@ -359,36 +370,37 @@ def build_extended_shard_regexes(
     include_visual: bool = True,
     include_lm_head: bool = True,
 ) -> list[str]:
-    """Extended shard list covering everything quantizable in a
-    multimodal Qwen3.5/3.6 checkpoint:
+    """Extended shard list covering the profile-declared probe regions:
 
-      - body transformer    (`model.layers.X.*`)         — N shards
-      - MTP block(s)        (`mtp.fc`, `mtp.layers.X.*`) — 1 shard typically
-      - visual ViT blocks   (`model.visual.blocks.X.*`)  — depth/N shards
-      - lm_head             (`^lm_head$`)                — 1 shard
+      - body transformer layers
+      - optional MTP block(s)
+      - optional visual/audio tower layers
+      - optional lm_head
     """
+    profile = _detect_profile_for_shards(model_path)
     src_cfg_path = Path(model_path) / "config.json"
     with open(src_cfg_path) as f:
         cfg = json.load(f)
     text_cfg = cfg.get("text_config", cfg)
-    vis_cfg = cfg.get("vision_config", {})
+    body_prefix = profile.body_layer_prefix()
+    mtp_prefix = profile.mtp_layer_prefix()
+    visual_key = profile.visual_config_key()
+    visual_prefix = profile.visual_layer_prefix()
+    lm_head_name = profile.lm_head_name()
 
     regexes: list[str] = []
 
     if include_body:
         n_body = int(text_cfg.get("num_hidden_layers", cfg.get("num_hidden_layers", 0)))
         regexes.extend(build_layer_shard_regexes(
-            n_body, layers_per_shard, layer_prefix="model.layers"))
+            n_body, layers_per_shard, layer_prefix=body_prefix))
 
     if include_mtp:
-        n_mtp_config = int(
-            text_cfg.get("num_nextn_predict_layers")
-            or cfg.get("num_nextn_predict_layers")
-            or text_cfg.get("num_mtp_layers")
-            or cfg.get("num_mtp_layers")
-            or 0
+        n_mtp_config = int(profile.mtp_layer_count(cfg) or 0)
+        n_mtp_actual = _count_mtp_layers_from_safetensors(
+            model_path,
+            layer_prefix=mtp_prefix,
         )
-        n_mtp_actual = _count_mtp_layers_from_safetensors(model_path)
         # Empirical safetensors count is ground truth: a config may
         # declare MTP layers (inherited from a base) when the finetune
         # actually stripped the weights. Conversely, local Qwen3.5/3.6
@@ -402,36 +414,42 @@ def build_extended_shard_regexes(
         if n_mtp_config > 0 and n_mtp_actual == 0:
             print(f"[shard-schedule] config declares "
                   f"{n_mtp_config} MTP layer(s) but safetensors index "
-                  f"has no `mtp.*` keys; skipping MTP shards "
-                  f"(common on Qwen3.5/3.6 finetunes that strip MTP)",
+                  f"has no `{mtp_prefix}.*` keys; skipping MTP shards "
+                  f"(common on finetunes that strip MTP)",
                   flush=True)
         if n_mtp > 0:
             mtp_regexes = build_layer_shard_regexes(
-                n_mtp, layers_per_shard, layer_prefix="mtp.layers")
-            # `mtp.fc` is a top-level MTP Linear, not under
-            # `mtp.layers.0.*`; include it in the first MTP shard so
-            # probe/cost/allocation coverage stays aligned.
-            if mtp_regexes:
-                mtp_regexes[0] = rf"(?:mtp\.fc|{mtp_regexes[0]})"
+                n_mtp, layers_per_shard, layer_prefix=mtp_prefix)
+            if mtp_regexes and profile.mtp_extra_linear_names():
+                extra = "|".join(
+                    re.escape(name) for name in profile.mtp_extra_linear_names()
+                )
+                mtp_regexes[0] = rf"(?:{extra}|{mtp_regexes[0]})"
             regexes.extend(mtp_regexes)
 
-    if include_visual:
+    if include_visual and visual_key and visual_prefix:
+        vis_cfg = cfg.get(visual_key, {})
         n_vis = int(vis_cfg.get("depth") or vis_cfg.get("num_hidden_layers") or 0)
         if n_vis > 0:
             vis_per_shard = max(layers_per_shard, 4)
             regexes.extend(build_layer_shard_regexes(
-                n_vis, vis_per_shard, layer_prefix="model.visual.blocks"))
+                n_vis, vis_per_shard, layer_prefix=visual_prefix))
 
     if include_lm_head:
-        regexes.append(r"^lm_head$")
+        regexes.append(rf"^{re.escape(lm_head_name)}$")
 
     return regexes
 
 
-def _count_mtp_layers_from_safetensors(model_path: str) -> int:
+def _count_mtp_layers_from_safetensors(
+    model_path: str,
+    *,
+    layer_prefix: str = "mtp.layers",
+) -> int:
     """Fallback for when the config doesn't carry an MTP layer count:
-    scan the source safetensors index and count `mtp.layers.<N>.` paths."""
+    scan the source safetensors index and count `<layer_prefix>.<N>.` paths."""
     src = Path(model_path)
+    layer_re = re.compile(rf"^{re.escape(layer_prefix)}\.(\d+)\.")
     idx_path = src / "model.safetensors.index.json"
     if not idx_path.exists():
         try:
@@ -442,7 +460,7 @@ def _count_mtp_layers_from_safetensors(model_path: str) -> int:
                     continue
                 with safe_open(str(src / f), framework="pt") as sf:
                     for k in sf.keys():
-                        m = re.match(r"^mtp\.layers\.(\d+)\.", k)
+                        m = layer_re.match(k)
                         if m:
                             mtp_indices.add(int(m.group(1)))
             return max(mtp_indices) + 1 if mtp_indices else 0
@@ -452,7 +470,7 @@ def _count_mtp_layers_from_safetensors(model_path: str) -> int:
         wm = json.load(f)["weight_map"]
     mtp_indices = set()
     for k in wm:
-        m = re.match(r"^mtp\.layers\.(\d+)\.", k)
+        m = layer_re.match(k)
         if m:
             mtp_indices.add(int(m.group(1)))
     return max(mtp_indices) + 1 if mtp_indices else 0
@@ -477,7 +495,7 @@ class ShardEntry:
     linear_include: str
     kind: str  # "body", "mtp", "visual", "lm_head"
     layer_indices: frozenset[int]
-    layer_prefix: str | None  # "model.layers", "mtp.layers", "model.visual.blocks"; None for lm_head
+    layer_prefix: str | None  # Profile-declared layer prefix; None for lm_head.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -496,16 +514,20 @@ class ShardSchedule:
     def regexes(self) -> list[str]:
         return [e.linear_include for e in self.entries]
 
-    def body_layer_indices(self,
-                           layer_prefix: str = "model.layers") -> frozenset[int]:
+    def body_layer_indices(
+        self,
+        layer_prefix: str | None = None,
+    ) -> frozenset[int]:
         out: set[int] = set()
         for e in self.entries:
-            if e.layer_prefix == layer_prefix:
+            if e.kind != "body":
+                continue
+            if layer_prefix is None or e.layer_prefix == layer_prefix:
                 out |= e.layer_indices
         return frozenset(out)
 
     def layers_done_after(self, shard_idx: int,
-                          layer_prefix: str = "model.layers") -> frozenset[int]:
+                          layer_prefix: str | None = None) -> frozenset[int]:
         """Layer indices in shard_idx's scope that no later shard touches.
 
         For the canonical body-shard layout (contiguous, disjoint ranges
@@ -516,6 +538,8 @@ class ShardSchedule:
         if shard_idx >= len(self.entries):
             return frozenset()
         cur = self.entries[shard_idx]
+        if layer_prefix is None:
+            layer_prefix = cur.layer_prefix
         if cur.layer_prefix != layer_prefix:
             return frozenset()
         future: set[int] = set()
@@ -565,11 +589,17 @@ def build_shard_schedule(
 
     body_layer_range = (first_layer, last_layer_exclusive) — slices the
     body shard list to this range (default (0, num_body_layers))."""
+    profile = _detect_profile_for_shards(model_path)
+    body_prefix = profile.body_layer_prefix()
+    mtp_prefix = profile.mtp_layer_prefix()
+    visual_key = profile.visual_config_key()
+    visual_prefix = profile.visual_layer_prefix()
+    lm_head_name = profile.lm_head_name()
     sidx = 0
 
     # Body shards (mirror old slice semantics).
     body_entries_full = _build_body_shard_entries(
-        num_body_layers, body_layers_per_shard, "model.layers", "body", sidx)
+        num_body_layers, body_layers_per_shard, body_prefix, "body", sidx)
     first = body_layer_range[0] // body_layers_per_shard
     last = (body_layer_range[1] + body_layers_per_shard - 1) // body_layers_per_shard
     body_entries = body_entries_full[first:last]
@@ -590,7 +620,7 @@ def build_shard_schedule(
             linear_include=union,
             kind="body",
             layer_indices=union_layers,
-            layer_prefix="model.layers",
+            layer_prefix=body_prefix,
         )]
         sidx = 1
 
@@ -598,42 +628,51 @@ def build_shard_schedule(
     src_cfg_path = Path(model_path) / "config.json"
     with open(src_cfg_path) as f:
         cfg = json.load(f)
-    text_cfg = cfg.get("text_config", cfg)
-    vis_cfg = cfg.get("vision_config", {})
 
     if include_mtp:
-        n_mtp = int(
-            text_cfg.get("num_nextn_predict_layers")
-            or cfg.get("num_nextn_predict_layers")
-            or text_cfg.get("num_mtp_layers")
-            or cfg.get("num_mtp_layers")
-            or _count_mtp_layers_from_safetensors(model_path)
-            or 0
+        n_mtp_config = int(profile.mtp_layer_count(cfg) or 0)
+        n_mtp_actual = _count_mtp_layers_from_safetensors(
+            model_path,
+            layer_prefix=mtp_prefix,
         )
+        if n_mtp_actual > 0:
+            n_mtp = min(n_mtp_config, n_mtp_actual) if n_mtp_config > 0 else n_mtp_actual
+        else:
+            n_mtp = 0
+        if n_mtp_config > 0 and n_mtp_actual == 0:
+            print(f"[shard-schedule] config declares "
+                  f"{n_mtp_config} MTP layer(s) but safetensors index "
+                  f"has no `{mtp_prefix}.*` keys; skipping MTP shards "
+                  f"(common on finetunes that strip MTP)",
+                  flush=True)
         if n_mtp > 0:
             mtp_entries = _build_body_shard_entries(
-                n_mtp, body_layers_per_shard, "mtp.layers", "mtp", sidx)
-            if mtp_entries:
+                n_mtp, body_layers_per_shard, mtp_prefix, "mtp", sidx)
+            if mtp_entries and profile.mtp_extra_linear_names():
+                extra = "|".join(
+                    re.escape(name) for name in profile.mtp_extra_linear_names()
+                )
                 mtp_entries[0] = dataclasses.replace(
                     mtp_entries[0],
-                    linear_include=rf"(?:mtp\.fc|{mtp_entries[0].linear_include})",
+                    linear_include=rf"(?:{extra}|{mtp_entries[0].linear_include})",
                 )
             extras.extend(mtp_entries)
             sidx += len(mtp_entries)
 
-    if include_visual:
+    if include_visual and visual_key and visual_prefix:
+        vis_cfg = cfg.get(visual_key, {})
         n_vis = int(vis_cfg.get("depth") or vis_cfg.get("num_hidden_layers") or 0)
         if n_vis > 0:
             vis_per_shard = max(body_layers_per_shard, 4)
             vis_entries = _build_body_shard_entries(
-                n_vis, vis_per_shard, "model.visual.blocks", "visual", sidx)
+                n_vis, vis_per_shard, visual_prefix, "visual", sidx)
             extras.extend(vis_entries)
             sidx += len(vis_entries)
 
     if include_lm_head:
         extras.append(ShardEntry(
             shard_idx=sidx,
-            linear_include=r"^lm_head$",
+            linear_include=rf"^{re.escape(lm_head_name)}$",
             kind="lm_head",
             layer_indices=frozenset(),
             layer_prefix=None,
@@ -1068,6 +1107,8 @@ def _compute_global_precompute(
     dtype = ctx.dtype
     model = ctx.model
     base_model = ctx.base_model
+    from .model_profiles import profile_from_model as _profile_from_model
+    profile = _profile_from_model(model)
     layers = ctx.layers
     num_layers = ctx.num_layers
     layers_prefix = ctx.layers_prefix
@@ -1080,8 +1121,14 @@ def _compute_global_precompute(
 
     prefetch_depth = prefetch_lookahead
 
+    # Profile-driven hidden-state shape adapter (refactor #32). Default
+    # profile passes through; DSv4 expands single-stream `[B, S, H]` to
+    # multi-stream `[B, S, hc_mult, H]` (mirrors `DeepseekV4Model.forward`).
+    from .model_profiles import profile_from_model as _profile_from_model
+    _profile = _profile_from_model(base_model)
+
     # ---- Phase 1: streaming forward, cache activations on CPU ----
-    phase1_expert_info = discover_moe_structure(model)
+    phase1_expert_info = discover_moe_structure(model, profile=_profile)
 
     t_phase = time.time()
     with torch.no_grad():
@@ -1089,11 +1136,6 @@ def _compute_global_precompute(
     position_embeddings = _compute_position_embeddings(
         base_model, hidden, position_ids)
 
-    # Profile-driven hidden-state shape adapter (refactor #32). Default
-    # profile passes through; DSv4 expands single-stream `[B, S, H]` to
-    # multi-stream `[B, S, hc_mult, H]` (mirrors `DeepseekV4Model.forward`).
-    from .model_profiles import profile_from_model as _profile_from_model
-    _profile = _profile_from_model(base_model)
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
 
     print(f"[incremental/global] phase-1 N={batch_size} T={tokens_in_sample} "
@@ -2079,6 +2121,7 @@ def _run_body_streaming_shard(
                 layers[L], accumulator=packed_grad_acc,
                 channel_accumulator=packed_channel_acc,
                 full_accumulator=packed_full_acc,
+                profile=_shard_profile,
             ) if layer_in_scope else {}
             layer_prefix = f"{layers_prefix}{L}."
             layer_packed_handles: list = []
@@ -2560,7 +2603,7 @@ def _run_mtp_streaming_shard(
                if isinstance(m, nn.Linear) and not re.search(r"mlp\.gate$", n)]
     print(f"[incremental/mtp] tracking {len(tracked)} MTP Linears", flush=True)
 
-    expert_info_all = discover_moe_structure(mtp_wrapper)
+    expert_info_all = discover_moe_structure(mtp_wrapper, profile=profile)
     expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
     top_k = read_top_k(mtp_wrapper, default=2)
 
@@ -2720,13 +2763,13 @@ def main():
     ap.add_argument("--no-importance-weighting", action="store_false",
                     dest="importance_weighting")
     ap.add_argument("--include-mtp", action="store_true", default=True,
-                    help="Probe MTP layers (`mtp.layers.X.*`).")
+                    help="Probe profile-declared MTP layers.")
     ap.add_argument("--no-include-mtp", action="store_false", dest="include_mtp")
     ap.add_argument("--include-visual", action="store_true", default=True,
-                    help="Probe visual encoder blocks (`model.visual.blocks.X.*`).")
+                    help="Probe profile-declared visual encoder blocks.")
     ap.add_argument("--no-include-visual", action="store_false", dest="include_visual")
     ap.add_argument("--include-lm-head", action="store_true", default=True,
-                    help="Probe lm_head (`^lm_head$`).")
+                    help="Probe the profile-declared language-model head.")
     ap.add_argument("--no-include-lm-head", action="store_false", dest="include_lm_head")
     ap.add_argument("--h-detail-dir", default=None,
                     help="If set, write per-Linear full Fisher diagonal "

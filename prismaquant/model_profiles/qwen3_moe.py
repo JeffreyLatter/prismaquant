@@ -10,7 +10,6 @@ regex needed for compressed-tensors scheme dispatch.
 """
 from __future__ import annotations
 
-from .base import ModelProfile
 from .qwen3 import Qwen3Profile
 
 
@@ -28,15 +27,6 @@ class Qwen3MoeProfile(Qwen3Profile):
 
     def vllm_architecture_class(self) -> str | None:
         return "Qwen3MoeForCausalLM"
-
-    def packed_expert_param_names(self) -> frozenset[str]:
-        return ModelProfile.packed_expert_param_names(self)
-
-    def per_expert_moe_regex(self) -> str | None:
-        return ModelProfile.per_expert_moe_regex(self)
-
-    def split_packed_experts_for_format(self, fmt: str) -> bool:
-        return ModelProfile.split_packed_experts_for_format(self, fmt)
 
     def register_vendored_modeling(self) -> None:
         # The vendored dense Qwen3 modeling patch is intentionally scoped to

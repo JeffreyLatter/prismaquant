@@ -4,8 +4,8 @@ Minimal coverage:
   - Fused-sibling promotion via vLLM's `packed_modules_mapping` when
     the model's declared HF architecture resolves to a vLLM class
     (most standard LLaMA / Qwen / Mistral / Gemma variants do).
-    Falls back to "no promotion" silently when vLLM doesn't know the
-    class.
+    Falls back to conservative common fused groups when vLLM doesn't
+    know the class.
   - No MTP support.
   - No visual encoder.
   - Identity name remap (`to_vllm_internal_name` returns input unchanged).
@@ -54,3 +54,25 @@ class DefaultProfile(ModelProfile):
         # to_vllm_internal_name) degrades to its pre-registry identity
         # default — same as before this override.
         return self._architectures[0] if self._architectures else None
+
+    def fused_sibling_leaf_mapping(self) -> dict[str, tuple[str, ...]]:
+        mapping = super().fused_sibling_leaf_mapping()
+        if mapping:
+            return mapping
+        return {
+            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+            "gate_up_proj": ("gate_proj", "up_proj"),
+            "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+        }
+
+    def fused_sibling_group(self, linear_qname: str) -> str | None:
+        group = super().fused_sibling_group(linear_qname)
+        if group:
+            return group
+        if "." not in linear_qname:
+            return None
+        prefix, leaf = linear_qname.rsplit(".", 1)
+        for fused, members in self.fused_sibling_leaf_mapping().items():
+            if leaf in members:
+                return f"{prefix}.{fused}"
+        return None

@@ -38,7 +38,22 @@ import torch.nn as nn
 from . import format_registry as fr
 
 
-def canonical_linear_name(name: str) -> str:
+def _packed_expert_parent_for_projection(profile, projection_name: str) -> str | None:
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            return profile.packed_expert_parent_for_projection(projection_name)
+        except Exception:
+            pass
+    return None
+
+
+def canonical_linear_name(name: str, profile=None) -> str:
     """Map live module names onto the probe's canonical naming.
 
     Qwen3.5/3.6 MoE can unfuse into per-expert:
@@ -46,13 +61,14 @@ def canonical_linear_name(name: str) -> str:
     while the probe/cost pipeline historically keys those as:
       experts.gate_up_proj.<eid> / experts.down_proj.<eid>
     """
-    m = re.match(r"^(.+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)$", name)
+    m = re.match(r"^(.+\.experts)\.(\d+)\.([^.]+)$", name)
     if not m:
         return name
     prefix, expert_id, proj = m.groups()
-    if proj in {"gate_proj", "up_proj"}:
-        return f"{prefix}.gate_up_proj.{expert_id}"
-    return f"{prefix}.down_proj.{expert_id}"
+    parent = _packed_expert_parent_for_projection(profile, proj)
+    if parent is None:
+        return name
+    return f"{prefix}.{parent}.{expert_id}"
 
 
 def _accumulate_result(bucket: dict, name: str, fmt: str,
@@ -353,7 +369,8 @@ def _load_live_model(model_path: str, device: str, dtype: torch.dtype,
 def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                      target_names: set[str], specs: list[fr.FormatSpec],
                      device: str, dtype: torch.dtype,
-                     h_detail: "HDetailIndex | None" = None) -> dict:
+                     h_detail: "HDetailIndex | None" = None,
+                     profile=None) -> dict:
     """One-Linear-at-a-time measurement. Simple, safe, slow on small ops
     running through unified memory but robust when batching isn't an option.
 
@@ -368,7 +385,7 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
     n_total = len(target_list)
 
     for name, mod in model.named_modules():
-        canonical_name = canonical_linear_name(name)
+        canonical_name = canonical_linear_name(name, profile)
         if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
             continue
         if canonical_name not in act_cache:
@@ -437,7 +454,7 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
 # ---------------------------------------------------------------------------
 # Batched GPU path (fast)
 # ---------------------------------------------------------------------------
-def _group_by_shape(model: nn.Module, target_names: set[str]
+def _group_by_shape(model: nn.Module, target_names: set[str], profile=None
                     ) -> dict[tuple[int, int], list[tuple[str, nn.Linear]]]:
     """Group target Linears by (in_features, out_features).
 
@@ -447,7 +464,7 @@ def _group_by_shape(model: nn.Module, target_names: set[str]
     """
     groups: dict[tuple[int, int], list[tuple[str, nn.Linear]]] = {}
     for name, mod in model.named_modules():
-        canonical_name = canonical_linear_name(name)
+        canonical_name = canonical_linear_name(name, profile)
         if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
             continue
         key = (mod.in_features, mod.out_features)
@@ -460,7 +477,8 @@ def _chunked(seq, size):
         yield seq[i:i + size]
 
 
-def _enumerate_packed_experts(model: nn.Module, target_names: set[str]
+def _enumerate_packed_experts(model: nn.Module, target_names: set[str],
+                              profile=None,
                               ) -> list[tuple[str, nn.Parameter]]:
     """Find every 3D nn.Parameter that lives directly under a module
     named like an MoE experts container. Uses the same class-name +
@@ -475,9 +493,9 @@ def _enumerate_packed_experts(model: nn.Module, target_names: set[str]
     from .sensitivity_probe import _is_packed_experts_module, _packed_experts_param_names
     out = []
     for qname, mod in model.named_modules():
-        if not _is_packed_experts_module(mod):
+        if not _is_packed_experts_module(mod, profile):
             continue
-        for pn in _packed_experts_param_names(mod):
+        for pn in _packed_experts_param_names(mod, profile):
             p = getattr(mod, pn)
             full = f"{qname}.{pn}" if qname else pn
             if full in target_names:
@@ -493,6 +511,7 @@ def _measure_packed_experts(
     dtype: torch.dtype,
     accum: dict,
     h_detail: "HDetailIndex | None" = None,
+    profile=None,
 ) -> None:
     """Measure per-format weight_mse for each packed-expert tensor.
 
@@ -513,7 +532,7 @@ def _measure_packed_experts(
     that the scalar trace loses.
     """
     dev = torch.device(device)
-    entries = _enumerate_packed_experts(model, target_names)
+    entries = _enumerate_packed_experts(model, target_names, profile)
     if not entries:
         return
     for full_name, packed_param in entries:
@@ -659,7 +678,8 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                        target_names: set[str], specs: list[fr.FormatSpec],
                        device: str, dtype: torch.dtype,
                        chunk_size: int = 256,
-                       h_detail: "HDetailIndex | None" = None) -> dict:
+                       h_detail: "HDetailIndex | None" = None,
+                       profile=None) -> dict:
     """Batched GPU measurement.
 
     Groups Linears by shape, then within each group processes `chunk_size`
@@ -677,7 +697,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     `fisher_output_mse` from `g2_per_token` when those tensors are present.
     """
     dev = torch.device(device)
-    groups = _group_by_shape(model, target_names)
+    groups = _group_by_shape(model, target_names, profile)
     total_linears = sum(len(v) for v in groups.values())
     print(f"[cost] batched: {len(groups)} shape groups, "
           f"{total_linears} Linears total", flush=True)
@@ -937,6 +957,11 @@ def run_cost_pass(model: nn.Module,
     if chosen_mode == "auto":
         chosen_mode = "batched" if device.startswith("cuda") else "unbatched"
     print(f"[cost] mode: {chosen_mode}")
+    try:
+        from .model_profiles import profile_from_model
+        model_profile = profile_from_model(model)
+    except Exception:
+        model_profile = None
 
     h_detail: "HDetailIndex | None" = None
     if h_detail_dir:
@@ -955,18 +980,21 @@ def run_cost_pass(model: nn.Module,
         results = measure_batched_gpu(model, act_cache, target_names, specs,
                                       device, dtype,
                                       chunk_size=chunk_size,
-                                      h_detail=h_detail)
+                                      h_detail=h_detail,
+                                      profile=model_profile)
     else:
         results = measure_unbatched(model, act_cache, target_names, specs,
                                     device, dtype,
-                                    h_detail=h_detail)
+                                    h_detail=h_detail,
+                                    profile=model_profile)
 
     # Packed-expert tensors aren't visible to the nn.Linear-based path.
     # Measure them separately. Both paths share the same accumulator
     # format so finalization is uniform.
     packed_accum: dict[str, dict] = {}
     _measure_packed_experts(model, target_names, specs, device, dtype,
-                            packed_accum, h_detail=h_detail)
+                            packed_accum, h_detail=h_detail,
+                            profile=model_profile)
     if packed_accum:
         results.update(_finalize_results(packed_accum))
         n_packed = len(packed_accum)

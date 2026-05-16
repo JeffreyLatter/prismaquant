@@ -3,6 +3,15 @@
   "id": "research",
   "runtime": "generic_gpu_kernel",
   "description": "Research/default profile: no serving format menu restrictions, but keep known runtime kernel shape constraints out of allocator candidates.",
+  "runtime_shape_validators": [
+    {
+      "id": "flashinfer_mxfp8_problem_size",
+      "formats": ["MXFP8", "MXFP8_E4M3", "MXFP8_E5M2"],
+      "callable": "prismaquant.runtime_shape_validators:flashinfer_mxfp8_problem_size_accepts",
+      "optional": true,
+      "reason": "kernel_shape"
+    }
+  ],
   "shape_rules": [
     {
       "id": "mxfp8_cutlass_shape",

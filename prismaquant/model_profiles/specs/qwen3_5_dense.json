@@ -1,10 +1,39 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "qwen3_5_dense",
-  "default_serving_profile": "vllm_qwen3_5_packed_moe",
+  "default_serving_profile": "vllm_packed_moe",
+  "runtime_requirements": {
+    "fast_kernel_packages": [
+      {
+        "module": "causal_conv1d",
+        "package": "causal-conv1d (Dao-AILab/causal-conv1d)"
+      },
+      {
+        "module": "fla",
+        "package": "flash-linear-attention (fla-org/flash-linear-attention)"
+      }
+    ]
+  },
   "match": {
     "model_type": ["qwen3_5", "qwen3_6"],
     "architectures": ["Qwen3_5For*", "Qwen3.5For*", "Qwen3_6For*", "Qwen3.6For*"]
+  },
+  "staging": {
+    "text_only_strip_keys": [
+      "vision_config",
+      "audio_config",
+      "speech_config",
+      "image_token_id",
+      "video_token_id",
+      "vision_start_token_id",
+      "vision_end_token_id"
+    ],
+    "promote_inner_model_type": true
+  },
+  "shard_regexes": {
+    "visual_config_key": "vision_config",
+    "visual_layer_prefix": "model.visual.blocks",
+    "mtp_extra_linear_names": ["mtp.fc"]
   },
   "naming": {
     "live_to_recipe": [

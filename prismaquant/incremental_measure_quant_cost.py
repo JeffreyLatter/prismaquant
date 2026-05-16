@@ -51,8 +51,7 @@ import torch.nn as nn
 
 from . import format_registry as fr
 from .incremental_probe import (
-    build_extended_shard_regexes,
-    build_layer_shard_regexes,
+    build_shard_schedule,
     load_num_hidden_layers,
 )
 from .measure_quant_cost import (
@@ -193,6 +192,7 @@ def _run_cost_measurement(
     chunk_size: int,
     h_detail: "HDetailIndex | None",
     log_prefix: str,
+    profile=None,
 ) -> dict:
     chosen_mode = mode
     if chosen_mode == "auto":
@@ -203,16 +203,16 @@ def _run_cost_measurement(
     if chosen_mode == "batched":
         results = measure_batched_gpu(
             module, act_cache, target_names, specs, device, dtype,
-            chunk_size=chunk_size, h_detail=h_detail)
+            chunk_size=chunk_size, h_detail=h_detail, profile=profile)
     else:
         results = measure_unbatched(
             module, act_cache, target_names, specs, device, dtype,
-            h_detail=h_detail)
+            h_detail=h_detail, profile=profile)
 
     packed_accum: dict[str, dict] = {}
     _measure_packed_experts(
         module, target_names, specs, device, dtype, packed_accum,
-        h_detail=h_detail)
+        h_detail=h_detail, profile=profile)
     if packed_accum:
         results.update(_finalize_results(packed_accum))
         print(f"{log_prefix} measured {len(packed_accum)} packed-expert tensors",
@@ -244,6 +244,11 @@ def _run_body_cost_shard(
     probe_path: str,
 ):
     model = ctx.model
+    try:
+        from .model_profiles import profile_from_model
+        profile = profile_from_model(model)
+    except Exception:
+        profile = None
     num_layers = ctx.num_layers
     layers_prefix = ctx.layers_prefix
 
@@ -323,6 +328,7 @@ def _run_body_cost_shard(
             chunk_size=chunk_size,
             h_detail=h_detail,
             log_prefix=f"[incremental-cost/{shard_kind}]",
+            profile=profile,
         )
     finally:
         for L in installed:
@@ -385,6 +391,11 @@ def _run_mtp_cost_shard(
     from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
 
     inc = re.compile(linear_include)
+    try:
+        from .model_profiles import profile_from_model
+        profile = profile_from_model(ctx.model)
+    except Exception:
+        profile = None
     # Prune the probe stats to this MTP shard's regex before building
     # anything — if there's nothing to measure, emit an empty pickle.
     shard_targets: set[str] = {n for n in probe_stats if inc.search(n)}
@@ -432,12 +443,15 @@ def _run_mtp_cost_shard(
         n for n, m in mtp_wrapper.named_modules()
         if isinstance(m, nn.Linear) and not n.endswith(".mlp.gate")
     }
+    from .sensitivity_probe import (
+        _is_packed_experts_module,
+        _packed_experts_param_names,
+    )
     for name, module in mtp_wrapper.named_modules():
-        if not type(module).__name__.lower().endswith("experts"):
+        if not _is_packed_experts_module(module, profile):
             continue
-        for pn, p in module.named_parameters(recurse=False):
-            if p.dim() == 3 and pn in {"gate_up_proj", "down_proj"}:
-                mtp_linears.add(f"{name}.{pn}")
+        for pn in _packed_experts_param_names(module, profile):
+            mtp_linears.add(f"{name}.{pn}")
 
     target_names = shard_targets & mtp_linears
     if not target_names:
@@ -475,6 +489,7 @@ def _run_mtp_cost_shard(
             chunk_size=chunk_size,
             h_detail=h_detail,
             log_prefix="[incremental-cost/mtp]",
+            profile=profile,
         )
     finally:
         del mtp_wrapper, inner_mtp, raw
@@ -630,6 +645,11 @@ def _run_visual_cost_shard(
         return mm_ctx
 
     model = mm_ctx.model
+    try:
+        from .model_profiles import profile_from_model
+        profile = profile_from_model(model)
+    except Exception:
+        profile = None
     live_linears = {n for n, m in model.named_modules()
                     if isinstance(m, nn.Linear)
                     and getattr(m, "weight", None) is not None
@@ -656,6 +676,7 @@ def _run_visual_cost_shard(
         chunk_size=chunk_size,
         h_detail=h_detail,
         log_prefix="[incremental-cost/visual]",
+        profile=profile,
     )
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
@@ -706,17 +727,16 @@ def main():
     ap.add_argument("--start-layer", type=int, default=0)
     ap.add_argument("--end-layer", type=int, default=None)
     ap.add_argument("--include-mtp", action="store_true", default=True,
-                    help="Measure cost for MTP layers (`mtp.layers.X.*`).")
+                    help="Measure cost for profile-declared MTP layers.")
     ap.add_argument("--no-include-mtp", action="store_false", dest="include_mtp")
     ap.add_argument("--include-visual", action="store_true", default=True,
-                    help="Measure cost for visual encoder blocks "
-                         "(`model.visual.blocks.X.*`) — currently emits "
-                         "empty shard pickles since text-only staging "
-                         "strips them.")
+                    help="Measure cost for profile-declared visual encoder "
+                         "blocks. Text-only staging may still emit empty "
+                         "shard pickles for unsupported multimodal paths.")
     ap.add_argument("--no-include-visual", action="store_false",
                     dest="include_visual")
     ap.add_argument("--include-lm-head", action="store_true", default=True,
-                    help="Measure cost for lm_head (`^lm_head$`).")
+                    help="Measure cost for the profile-declared LM head.")
     ap.add_argument("--no-include-lm-head", action="store_false",
                     dest="include_lm_head")
     ap.add_argument("--h-detail-dir", default=None,
@@ -759,22 +779,21 @@ def main():
     else:
         args.layers_per_shard = int(lps_arg)
 
-    body_regexes = build_layer_shard_regexes(
-        n_layers, args.layers_per_shard, layer_prefix="model.layers")
-    first_shard = start // args.layers_per_shard
-    last_shard = (end + args.layers_per_shard - 1) // args.layers_per_shard
-    shard_regexes = body_regexes[first_shard:last_shard]
-
-    extra = build_extended_shard_regexes(
-        args.model, args.layers_per_shard,
-        include_body=False,
+    schedule = build_shard_schedule(
+        model_path=args.model,
+        num_body_layers=n_layers,
+        body_layers_per_shard=args.layers_per_shard,
+        body_layer_range=(start, end),
         include_mtp=args.include_mtp,
         include_visual=args.include_visual,
         include_lm_head=args.include_lm_head,
+        unified_body_sweep=False,
     )
-    shard_regexes = shard_regexes + extra
+    shard_regexes = schedule.regexes()
+    n_body_shards = sum(1 for entry in schedule if entry.kind == "body")
+    n_extra_shards = len(schedule) - n_body_shards
     print(f"[incremental-cost] shard regexes: {len(shard_regexes)} total "
-          f"(body={len(body_regexes[first_shard:last_shard])}, extras={len(extra)})",
+          f"(body={n_body_shards}, extras={n_extra_shards})",
           flush=True)
 
     work_dir = Path(args.work_dir)

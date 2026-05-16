@@ -128,21 +128,16 @@ def test_build_candidates_drops_mxfp8_on_small_n_shape():
     g_formats = [c.fmt for c in cands["model.layers.0.mlp.gate_proj"]]
     assert "MXFP8_E4M3" in g_formats
 
-    assert mask_records == [
-        {
-            "qname": "model.layers.0.linear_attn.in_proj_a",
-            "format": "MXFP8_E4M3",
-            "reason": "kernel_shape",
-            "detail": (
-                "MXFP8_E4M3 kernel does not support "
-                "(out_features=48, in_features=5120)"
-            ),
-            "shape": [48, 5120],
-            "out_features": 48,
-            "in_features": 5120,
-            "source_kind": None,
-        },
-    ]
+    assert len(mask_records) == 1
+    record = mask_records[0]
+    assert record["qname"] == "model.layers.0.linear_attn.in_proj_a"
+    assert record["format"] == "MXFP8_E4M3"
+    assert record["reason"] == "kernel_shape"
+    assert "out_features=48, in_features=5120" in record["detail"]
+    assert record["shape"] == [48, 5120]
+    assert record["out_features"] == 48
+    assert record["in_features"] == 5120
+    assert record["source_kind"] is None
 
     summary = summarize_applicability_masks(mask_records)
     assert summary["summary"] == {"MXFP8_E4M3": {"kernel_shape": 1}}
@@ -175,7 +170,7 @@ def test_build_candidates_applies_serving_profile_before_dp():
         stats,
         costs,
         specs,
-        target_profile="vllm_qwen3_5_packed_moe",
+        target_profile="vllm_packed_moe",
     )
 
     assert [c.fmt for c in research["model.layers.0.self_attn.o_proj"]] == [

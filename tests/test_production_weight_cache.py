@@ -375,6 +375,27 @@ def test_production_cache_fisher_rows_resolve_fused_qkv_and_gate_up(
     assert cache.metadata["fisher_weighted_gptq"]["misses"] == 0
 
 
+def test_fisher_row_cache_uses_configured_fused_sibling_mapping(tmp_path):
+    import prismaquant.production_weight_cache as pwc
+
+    def save_detail(name: str, values: list[float]) -> None:
+        safe = pwc._FisherRowWeightCache._FNAME_SUB.sub("__", name)
+        torch.save({"g2_per_token": torch.tensor(values)}, tmp_path / f"{safe}.pt")
+
+    save_detail("model.layers.0.custom.left", [1.0, 3.0])
+    save_detail("model.layers.0.custom.right", [5.0, 7.0])
+
+    cache = pwc._FisherRowWeightCache(
+        tmp_path,
+        fused_sibling_mapping={"combo": ("left", "right")},
+    )
+
+    assert torch.equal(
+        cache.get("model.layers.0.custom.combo"),
+        torch.tensor([3.0, 5.0]),
+    )
+
+
 def test_production_cache_mxfp8_uses_activation_scale_sweep(monkeypatch):
     import prismaquant.export_native_compressed as enc
 

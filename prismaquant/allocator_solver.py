@@ -6,7 +6,6 @@ re-exports these symbols for backwards compatibility.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 from . import format_registry as fr
@@ -60,25 +59,6 @@ def fused_siblings(name: str, profile=None) -> tuple[tuple[str, ...], str] | Non
     return (name,), key
 
 
-def _legacy_packed_expert_format_group(name: str) -> str | None:
-    """Fallback for pre-profile callers and older custom profiles."""
-    post_fused_re = re.compile(r"^(.+\.experts)\.(gate_up_proj|down_proj)$")
-    per_expert_re = re.compile(
-        r"^(.+\.experts)\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)$"
-    )
-    m = post_fused_re.match(name)
-    if m:
-        return f"{m.group(1)}::__packed_format__:gate_up_proj,down_proj"
-    m = per_expert_re.match(name)
-    if not m:
-        return None
-    leaf = m.group(3)
-    members = "w1,w2,w3" if leaf in {"w1", "w2", "w3"} else (
-        "gate_proj,up_proj,down_proj"
-    )
-    return f"{m.group(1)}.{m.group(2)}::__packed_format__:{members}"
-
-
 def promote_moe_pair(
     assignment: dict[str, str],
     format_rank: dict[str, int],
@@ -86,6 +66,9 @@ def promote_moe_pair(
     profile=None,
 ) -> dict[str, str]:
     """Promote packed MoE projections that must share one serving format."""
+    if profile is None:
+        from .model_profiles import DefaultProfile
+        profile = DefaultProfile()
     out = dict(assignment)
     groups: dict[str, list[str]] = {}
     profile_group_fn = getattr(profile, "packed_expert_format_group", None)
@@ -97,8 +80,6 @@ def promote_moe_pair(
                 group_key = profile_group_fn(name)
             except Exception:
                 group_key = None
-        if group_key is None:
-            group_key = _legacy_packed_expert_format_group(name)
         if group_key is not None:
             groups.setdefault(group_key, []).append(name)
 

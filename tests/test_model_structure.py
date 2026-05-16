@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from prismaquant.model_profiles.default import DefaultProfile
 from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
 from prismaquant.model_profiles.gemma4 import Gemma4Profile
 from prismaquant.model_profiles.qwen3 import Qwen3Profile
@@ -11,6 +12,7 @@ from prismaquant.model_profiles.qwen3_5_dense import Qwen3_5DenseProfile
 from prismaquant.model_profiles.qwen3_moe import Qwen3MoeProfile
 from prismaquant.model_profiles.registry import profile_from_config
 from prismaquant.model_profiles.structure import (
+    ModelStructureSpec,
     build_model_graph,
     load_structure_spec,
 )
@@ -43,6 +45,7 @@ class _Qwen3Toy(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(4, 4)
         self.model.layers = nn.ModuleList([_QwenLayer()])
         self.lm_head = nn.Linear(4, 4, bias=False)
 
@@ -157,6 +160,39 @@ def test_qwen_structure_spec_matches_profile_naming():
         r"re:^mtp[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+"
         r"[.](gate|up|down)_proj$"
     )
+    assert profile.pinned_names() == ("lm_head",)
+    assert profile.is_pinned_name("lm_head")
+    assert profile.is_pinned_name("language_model.lm_head")
+    assert profile.stage_text_only_strip_keys() == (
+        "vision_config",
+        "audio_config",
+        "speech_config",
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    )
+    assert profile.stage_text_only_promote_inner_model_type() is True
+    assert profile.visual_config_key() == "vision_config"
+    assert profile.visual_layer_prefix() == "model.visual.blocks"
+
+
+def test_default_profile_common_fused_groups_are_profile_owned():
+    profile = DefaultProfile()
+
+    assert profile.fused_sibling_leaf_mapping()["qkv_proj"] == (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+    )
+    assert (
+        profile.fused_sibling_group("model.layers.0.self_attn.q_proj")
+        == "model.layers.0.self_attn.qkv_proj"
+    )
+    assert (
+        profile.fused_sibling_group("model.layers.0.mlp.gate_proj")
+        == "model.layers.0.mlp.gate_up_proj"
+    )
 
 
 def test_qwen_model_graph_records_recipe_group_and_pinned_head():
@@ -208,13 +244,18 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
     assert isinstance(moe, Qwen3MoeProfile)
     assert dense.structure_spec().id == "qwen3"
     assert moe.structure_spec().id == "qwen3_moe"
-    assert dense.serving_profile_id() == "vllm_qwen3_5_packed_moe"
-    assert moe.serving_profile_id() == "vllm_qwen3_5_packed_moe"
+    assert dense.serving_profile_id() == "vllm_packed_moe"
+    assert moe.serving_profile_id() == "vllm_packed_moe"
     assert dense.packed_expert_param_names() == frozenset()
     assert moe.packed_expert_param_names() == frozenset({
         "gate_up_proj",
         "down_proj",
     })
+    assert moe.packed_expert_projection_names("gate_up_proj") == (
+        "gate_proj",
+        "up_proj",
+    )
+    assert moe.packed_expert_parent_for_projection("up_proj") == "gate_up_proj"
     assert moe.split_packed_experts_for_format("BF16") is True
     assert moe.per_expert_moe_regex() == (
         r"re:^model[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+"
@@ -241,6 +282,10 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
 def test_qwen3_dense_graph_marks_linears_and_fused_groups():
     graph = Qwen3Profile().build_model_graph(_Qwen3Toy())
     by_recipe = graph.by_recipe_name()
+
+    embed = by_recipe["model.embed_tokens.weight"]
+    assert embed.role == "embedding_weight"
+    assert embed.quantizable is False
 
     gate = by_recipe["model.layers.0.mlp.gate_proj.weight"]
     assert gate.live_name == "model.layers.0.mlp.gate_proj.weight"
@@ -274,6 +319,57 @@ def test_qwen3_moe_graph_marks_packed_experts_without_multimodal_rewrite():
     assert "packed_expert_decomposition" in packed_unit.constraints
 
 
+def test_probe_packed_expert_detection_respects_profile_spec():
+    from prismaquant.sensitivity_probe import (
+        _is_packed_experts_module,
+        _packed_experts_param_names,
+    )
+
+    experts = _PackedExperts()
+
+    assert _is_packed_experts_module(experts, Qwen3MoeProfile()) is True
+    assert _packed_experts_param_names(experts, Qwen3MoeProfile()) == [
+        "down_proj",
+        "gate_up_proj",
+    ]
+    assert _is_packed_experts_module(experts, Qwen3Profile()) is False
+    assert _packed_experts_param_names(experts, Qwen3Profile()) == []
+
+
+def test_packed_expert_format_group_uses_declared_projection_splits():
+    spec = ModelStructureSpec.from_dict({
+        "schema": "prismaquant.model_structure.v1",
+        "id": "custom",
+        "packed_experts": {
+            "param_names": ["w13", "w2"],
+            "projection_splits": {
+                "w13": ["w1_proj", "w3_proj"],
+            },
+            "format_groups": [
+                ["w13", "w2"],
+                ["w1_proj", "w3_proj", "w2"],
+            ],
+        },
+    })
+
+    packed_group = spec.packed_expert_format_group(
+        "model.layers.0.mlp.experts.w13"
+    )
+    assert packed_group == spec.packed_expert_format_group(
+        "model.layers.0.mlp.experts.w2"
+    )
+    split_group = spec.packed_expert_format_group(
+        "model.layers.0.mlp.experts.7.w1_proj"
+    )
+    assert split_group == spec.packed_expert_format_group(
+        "model.layers.0.mlp.experts.7.w3_proj"
+    )
+    assert split_group == spec.packed_expert_format_group(
+        "model.layers.0.mlp.experts.7.w2"
+    )
+    assert split_group != packed_group
+
+
 def test_qwen35_dense_profile_uses_dense_structure_spec():
     profile = profile_from_config({
         "model_type": "qwen3_5",
@@ -282,7 +378,7 @@ def test_qwen35_dense_profile_uses_dense_structure_spec():
 
     assert isinstance(profile, Qwen3_5DenseProfile)
     assert profile.structure_spec().id == "qwen3_5_dense"
-    assert profile.serving_profile_id() == "vllm_qwen3_5_packed_moe"
+    assert profile.serving_profile_id() == "vllm_packed_moe"
     assert profile.packed_expert_param_names() == frozenset()
     assert profile.per_expert_moe_regex() is None
     assert profile.to_vllm_internal_name("model.layers.0.mlp.gate_proj") == (
@@ -324,9 +420,16 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
     assert profile.to_vllm_internal_name(recipe) == (
         "language_model.model.layers.0.moe.experts.gate_up_proj"
     )
-    assert profile.serving_profile_id() == "vllm_qwen3_5_packed_moe"
+    assert profile.serving_profile_id() == "vllm_packed_moe"
     assert profile.packed_expert_format_group(recipe) == (
         profile.packed_expert_format_group("model.layers.0.experts.down_proj")
+    )
+    assert profile.packed_expert_projection_names("gate_up_proj") == (
+        "gate_proj",
+        "up_proj",
+    )
+    assert profile.packed_expert_parent_for_projection("gate_proj") == (
+        "gate_up_proj"
     )
     assert profile.packed_expert_format_group(
         "model.layers.0.experts.3.gate_proj"
@@ -338,6 +441,21 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
         "model.audio_tower.",
         "model.embed_vision.",
         "model.embed_audio.",
+    )
+    assert profile.stage_text_only_strip_keys() == (
+        "vision_config",
+        "audio_config",
+        "speech_config",
+        "image_token_id",
+        "video_token_id",
+        "audio_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    )
+    assert profile.stage_text_only_promote_inner_model_type() is True
+    assert profile.visual_config_key() == "vision_config"
+    assert profile.visual_layer_prefix() == (
+        "model.vision_tower.vision_model.encoder.layers"
     )
 
 
@@ -365,6 +483,9 @@ def test_deepseek_structure_spec_matches_profile_source_naming():
     profile = DeepseekV4Profile()
 
     assert spec is not None
+    assert profile.pinned_names() == ("lm_head", "head")
+    assert profile.is_pinned_name("head")
+    assert profile.is_pinned_name("model.head")
     cases = {
         "lm_head.weight": "head.weight",
         "model.embed_tokens.weight": "embed.weight",

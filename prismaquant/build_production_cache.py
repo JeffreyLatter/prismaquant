@@ -152,12 +152,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--skip-qnames",
         nargs="*",
-        default=["lm_head"],
+        default=None,
         help="Substrings on qname components that should be EXCLUDED from "
-        "the cache fill.  Default: lm_head — we always pin it to BF16 in "
-        "polish (vLLM ParallelLMHead constraint), so a NVFP4 cache entry "
-        "is unused.  Excluding lm_head also avoids the OOM-prone last "
-        "render on big models with linear-attention forward fallbacks.",
+        "the cache fill. Default: the active model profile's pinned_names "
+        "(typically lm_head/head). Pass --skip-qnames with no values to "
+        "disable this skip.",
     )
     p.add_argument(
         "--recache-layer-config",
@@ -267,10 +266,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile = detect_profile(args.model)
         except Exception:
             profile = DefaultProfile()
-        skip_tokens = list(args.skip_qnames or [])
+        skip_tokens = list(
+            args.skip_qnames
+            if args.skip_qnames is not None
+            else profile.pinned_names()
+        )
         qnames: list[str] = []
         skipped: list[str] = []
-        for full_name, mod, attr in iter_quantizable_tensors(model):
+        for full_name, mod, attr in iter_quantizable_tensors(model, profile):
             if attr != "weight" or not isinstance(mod, nn.Linear):
                 continue
             qname = full_name[:-7] if full_name.endswith(".weight") else full_name

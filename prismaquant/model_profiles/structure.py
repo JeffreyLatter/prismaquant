@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from importlib import resources
 from typing import Any
 
+import torch.nn as nn
+
 
 SCHEMA = "prismaquant.model_structure.v1"
 
@@ -89,7 +91,9 @@ class FusedGroupSpec:
 @dataclass(frozen=True)
 class PackedExpertSpec:
     param_names: tuple[str, ...] = ()
+    module_class_names: tuple[str, ...] = ()
     split_for_formats: tuple[str, ...] = ()
+    projection_splits: tuple[tuple[str, tuple[str, ...]], ...] = ()
     format_groups: tuple[tuple[str, ...], ...] = ()
     declared: bool = False
 
@@ -102,14 +106,36 @@ class PackedExpertSpec:
     ) -> "PackedExpertSpec":
         return cls(
             param_names=tuple(str(v) for v in payload.get("param_names", ())),
+            module_class_names=tuple(
+                str(v) for v in payload.get("module_class_names", ())
+            ),
             split_for_formats=tuple(
                 str(v) for v in payload.get("split_for_formats", ())
+            ),
+            projection_splits=tuple(
+                (str(param_name), tuple(str(v) for v in projections))
+                for param_name, projections in (
+                    payload.get("projection_splits") or {}
+                ).items()
             ),
             format_groups=tuple(
                 tuple(str(member) for member in group)
                 for group in payload.get("format_groups", ())
             ),
             declared=declared,
+        )
+
+
+@dataclass(frozen=True)
+class PackageRequirement:
+    module: str
+    package: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "PackageRequirement":
+        return cls(
+            module=str(payload["module"]),
+            package=str(payload.get("package") or payload["module"]),
         )
 
 
@@ -128,8 +154,18 @@ class ModelStructureSpec:
     per_expert_moe_regex: str | None = None
     per_expert_mtp_regex: str | None = None
     default_serving_profile: str | None = None
+    fast_kernel_requirements: tuple[PackageRequirement, ...] = ()
+    probe_skip_module_class_names: tuple[str, ...] = ()
     passthrough_prefixes: tuple[str, ...] = ()
     pinned_names: tuple[str, ...] = ("lm_head",)
+    stage_text_only_strip_keys: tuple[str, ...] | None = None
+    stage_text_only_promote_inner_model_type: bool | None = None
+    body_layer_prefix: str | None = None
+    mtp_layer_prefix: str | None = None
+    mtp_extra_linear_names: tuple[str, ...] = ()
+    visual_layer_prefix: str | None = None
+    visual_config_key: str | None = None
+    lm_head_name: str | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ModelStructureSpec":
@@ -139,6 +175,10 @@ class ModelStructureSpec:
         naming = payload.get("naming") or {}
         moe = payload.get("moe") or {}
         packed_payload = payload.get("packed_experts")
+        runtime = payload.get("runtime_requirements") or {}
+        probe = payload.get("probe") or {}
+        staging = payload.get("staging") or {}
+        shard_regexes = payload.get("shard_regexes") or {}
         return cls(
             id=str(payload["id"]),
             schema=schema,
@@ -157,10 +197,33 @@ class ModelStructureSpec:
             per_expert_moe_regex=_optional_str(moe.get("per_expert_regex")),
             per_expert_mtp_regex=_optional_str(moe.get("per_expert_mtp_regex")),
             default_serving_profile=_optional_str(payload.get("default_serving_profile")),
+            fast_kernel_requirements=tuple(
+                PackageRequirement.from_dict(entry)
+                for entry in runtime.get("fast_kernel_packages", ())
+            ),
+            probe_skip_module_class_names=tuple(
+                str(v) for v in probe.get("skip_module_class_names", ())
+            ),
             passthrough_prefixes=tuple(
                 str(v) for v in payload.get("passthrough_prefixes", ())
             ),
             pinned_names=tuple(str(v) for v in payload.get("pinned_names", ("lm_head",))),
+            stage_text_only_strip_keys=_optional_str_tuple(
+                staging.get("text_only_strip_keys")
+                if "text_only_strip_keys" in staging else None
+            ),
+            stage_text_only_promote_inner_model_type=(
+                bool(staging["promote_inner_model_type"])
+                if "promote_inner_model_type" in staging else None
+            ),
+            body_layer_prefix=_optional_str(shard_regexes.get("body_layer_prefix")),
+            mtp_layer_prefix=_optional_str(shard_regexes.get("mtp_layer_prefix")),
+            mtp_extra_linear_names=tuple(
+                str(v) for v in shard_regexes.get("mtp_extra_linear_names", ())
+            ),
+            visual_layer_prefix=_optional_str(shard_regexes.get("visual_layer_prefix")),
+            visual_config_key=_optional_str(shard_regexes.get("visual_config_key")),
+            lm_head_name=_optional_str(shard_regexes.get("lm_head_name")),
         )
 
     def rewrite_live_to_recipe(self, name: str) -> str:
@@ -191,6 +254,21 @@ class ModelStructureSpec:
         fmt_upper = str(fmt).upper()
         return any(rule == "*" or rule.upper() == fmt_upper for rule in rules)
 
+    def packed_expert_projection_names(self, param_name: str) -> tuple[str, ...]:
+        for packed_name, projections in self.packed_experts.projection_splits:
+            if packed_name == param_name:
+                return projections
+        return (str(param_name),)
+
+    def packed_expert_parent_for_projection(self, projection_name: str) -> str | None:
+        for packed_name, projections in self.packed_experts.projection_splits:
+            if projection_name in projections:
+                return packed_name
+        packed_names = set(self.packed_experts.param_names)
+        if projection_name in packed_names:
+            return projection_name
+        return None
+
     def packed_expert_format_group(self, qname: str) -> str | None:
         """Return the serving-format group key for a packed expert tensor.
 
@@ -220,15 +298,32 @@ class ModelStructureSpec:
             return None
         for group in groups:
             if leaf in group:
-                if split_per_expert and "gate_up_proj" in group:
-                    continue
-                if (
-                    not split_per_expert
-                    and {"gate_proj", "up_proj"}.intersection(group)
+                if not self._packed_expert_group_matches_representation(
+                    group,
+                    split_per_expert=split_per_expert,
                 ):
                     continue
                 return f"{parent}::__packed_format__:{','.join(group)}"
         return None
+
+    def _packed_expert_group_matches_representation(
+        self,
+        group: tuple[str, ...],
+        *,
+        split_per_expert: bool,
+    ) -> bool:
+        packed_names = set(self.packed_experts.param_names)
+        if split_per_expert:
+            return not any(
+                member in packed_names
+                and self.packed_expert_projection_names(member) != (member,)
+                for member in group
+            )
+        return not any(
+            member not in packed_names
+            and self.packed_expert_parent_for_projection(member) is not None
+            for member in group
+        )
 
 
 @dataclass(frozen=True)
@@ -368,11 +463,13 @@ def build_model_graph(
         spec = load_structure_spec(profile.name)
 
     packed_names = set(profile.packed_expert_param_names())
-    pinned_names = set((spec.pinned_names if spec is not None else ("lm_head",)))
+    pinned_names = set(profile.pinned_names())
+    modules_by_qname = dict(model.named_modules())
     tensors: list[ModelTensor] = []
     for full_name, param in model.named_parameters():
         shape = tuple(int(dim) for dim in getattr(param, "shape", ()))
         qname, attr = _split_param_name(full_name)
+        owner = modules_by_qname.get(qname)
         recipe_qname = profile.live_to_recipe_name(qname)
         live_param_name = full_name
         recipe_param_name = f"{recipe_qname}.{attr}" if attr else recipe_qname
@@ -380,7 +477,7 @@ def build_model_graph(
         export_name = profile.export_tensor_name(recipe_param_name)
         vllm_name = profile.to_vllm_internal_name(recipe_qname)
         group = profile.fused_sibling_group(recipe_qname)
-        role = _infer_role(attr, shape, qname, packed_names)
+        role = _infer_role(attr, shape, qname, owner, packed_names)
         pinned = _is_pinned(recipe_qname, recipe_param_name, pinned_names)
         quantizable = role in {"linear_weight", "packed_expert_weight"} and not pinned
         constraints = _constraints_for(role, group, pinned)
@@ -427,6 +524,12 @@ def _optional_str(value: object) -> str | None:
     return str(value)
 
 
+def _optional_str_tuple(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    return tuple(str(v) for v in value)
+
+
 def _assert_unique(label: str, values: Iterable[str]) -> None:
     seen: set[str] = set()
     dupes: set[str] = set()
@@ -450,13 +553,16 @@ def _infer_role(
     attr: str,
     shape: tuple[int, ...],
     qname: str,
+    owner: nn.Module | None,
     packed_names: set[str],
 ) -> str:
     leaf = qname.rsplit(".", 1)[-1]
     if attr in packed_names and len(shape) == 3:
         return "packed_expert_weight"
-    if attr == "weight" and len(shape) == 2:
+    if isinstance(owner, nn.Linear) and attr == "weight" and len(shape) == 2:
         return "linear_weight"
+    if isinstance(owner, nn.Embedding) and attr == "weight":
+        return "embedding_weight"
     if leaf in packed_names and len(shape) == 3:
         return "packed_expert_weight"
     if attr == "bias":
