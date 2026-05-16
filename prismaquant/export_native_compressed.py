@@ -3699,6 +3699,8 @@ def materialize_tensors_streaming(
         tensors = _read_layer_to_device(
             f"{layers_prefix}{L}.", weight_shard, weight_ckpt, dtype, device,
             fp8_scale_inv_map=fp8_scale_inv_map)
+        tensors = profile.pack_checkpoint_expert_tensors(
+            f"{layers_prefix}{L}.", tensors)
         resolver = _build_install_resolver(model, layer_qname)
         _fast_install(resolver, tensors, device, model=model)
         load_s = time.time() - load_t0
