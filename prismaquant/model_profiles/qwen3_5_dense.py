@@ -27,6 +27,10 @@ class Qwen3_5DenseProfile(Qwen3_5Profile):
         # Catch the dense arch before the MoE catch-all in Qwen3_5Profile.
         # Dense: Qwen3_5ForConditionalGeneration / Qwen3_5ForCausalLM
         # MoE:   Qwen3_5MoeForConditionalGeneration / Qwen3_5MoeForCausalLM
+        if model_type in {"qwen3_5", "qwen3_6"} and not any(
+            "Moe" in arch for arch in architectures
+        ):
+            return True
         for arch in architectures:
             if "Moe" in arch:
                 return False
@@ -41,22 +45,9 @@ class Qwen3_5DenseProfile(Qwen3_5Profile):
         return "qwen3_5_dense"
 
     def vllm_architecture_class(self) -> str | None:
-        # Dense vLLM class. Falls back to the MoE class's packed_modules
-        # mapping via _QWEN3_5_FALLBACK_PACKED_MODULES if vLLM doesn't
-        # ship the dense class yet on the host.
+        # Dense vLLM class. If vLLM doesn't ship it on the host, the base
+        # profile falls back to this profile's declarative structure spec.
         return "Qwen3_5ForConditionalGeneration"
-
-    # ------------------------------------------------------------
-    # MoE — disabled
-    # ------------------------------------------------------------
-    def packed_expert_param_names(self) -> frozenset[str]:
-        return frozenset()
-
-    def per_expert_moe_regex(self) -> str | None:
-        return None
-
-    def per_expert_mtp_regex(self) -> str | None:
-        return None
 
     # ------------------------------------------------------------
     # MTP — dense decoder layer (Qwen3_5 / Qwen3_6 share the class)

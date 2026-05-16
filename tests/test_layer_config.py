@@ -19,6 +19,8 @@ def test_canonicalize_format_accepts_supported_recipe_shapes():
     assert canonicalize_format("MXFP4") == "MXFP4"
     assert canonicalize_format("8") == "MXFP8"
     assert canonicalize_format("fp8_e4m3") == "FP8_E4M3"
+    assert canonicalize_format("fp8_e5m2") == "FP8_E5M2"
+    assert canonicalize_format("mxfp8_e5m2") == "MXFP8_E5M2"
     assert canonicalize_format("bf16") == "BF16"
     assert canonicalize_format(4) == "NVFP4"
     assert canonicalize_format(8) == "MXFP8"
@@ -26,6 +28,14 @@ def test_canonicalize_format_accepts_supported_recipe_shapes():
     assert canonicalize_format({"data_type": "nv_fp", "bits": 4}) == "NVFP4"
     assert canonicalize_format({"data_type": "mx_fp", "bits": 4}) == "MXFP4"
     assert canonicalize_format({"data_type": "mx_fp", "bits": 8}) == "MXFP8"
+    assert (
+        canonicalize_format({
+            "data_type": "mx_fp",
+            "bits": 8,
+            "weight_element_dtype": "fp8_e5m2",
+        })
+        == "MXFP8_E5M2"
+    )
     assert canonicalize_format({"data_type": "float", "bits": 16}) == "BF16"
     assert (
         canonicalize_format({"data_type": "fp8_e4m3", "bits": 8, "group_size": 0})
@@ -37,17 +47,7 @@ def test_canonicalize_format_accepts_supported_recipe_shapes():
     )
 
 
-def test_canonicalize_format_rejects_unexportable_or_unknown_formats():
-    with pytest.raises(ValueError, match="E5M2"):
-        canonicalize_format("fp8_e5m2")
-    with pytest.raises(ValueError, match="E5M2"):
-        canonicalize_format(
-            {
-                "data_type": "mx_fp",
-                "bits": 8,
-                "weight_element_dtype": "fp8_e5m2",
-            }
-        )
+def test_canonicalize_format_rejects_unknown_formats():
     with pytest.raises(ValueError, match="unsupported"):
         canonicalize_format("nvint2")
     with pytest.raises(ValueError, match="unsupported"):

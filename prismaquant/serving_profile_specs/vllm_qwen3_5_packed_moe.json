@@ -1,0 +1,7 @@
+{
+  "schema": "prismaquant.serving_profile.v1",
+  "id": "vllm_qwen3_5_packed_moe",
+  "runtime": "vllm",
+  "extends": ["vllm_packed_moe"],
+  "description": "Compatibility alias for older Qwen3.5/3.6 packed-MoE runs. New model specs should use vllm_packed_moe."
+}

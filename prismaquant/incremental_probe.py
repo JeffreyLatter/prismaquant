@@ -64,10 +64,6 @@ from .layer_streaming import (
     _compute_position_embeddings,
     _make_causal_mask,
 )
-from .observers import (
-    saliency_from_moe_structure,
-    saliency_from_packed_moe,
-)
 from .sensitivity_probe import (
     FisherAccumulator,
     RouterTracker,
@@ -237,7 +233,7 @@ def _minimax_fast_experts_forward(
         h_mid = act_fn(h1) * h3
         y_padded = torch.bmm(h_mid, w2.transpose(1, 2))
 
-        # REAP saliency accumulation (fast-MoE path). The chunked compute
+        # Expert-saliency accumulation (fast-MoE path). The chunked compute
         # above bypasses per-expert nn.Module forward, so the tracker's
         # per-expert forward_hooks never fire. Accumulate inline here:
         # `y_pre_gate` is the expert output BEFORE gate-weight multiply
@@ -258,7 +254,7 @@ def _minimax_fast_experts_forward(
                 norms = y_pre_gate.to(torch.float64).norm(dim=-1)  # [n_assign]
                 gates64 = weights_sl.to(torch.float64)              # [n_assign]
                 contribution = gates64 * norms                      # g·||f||
-                contribution_sq = gates64 * norms.pow(2)            # g·||f||² (REAP)
+                contribution_sq = gates64 * norms.pow(2)            # g·||f||²
                 ones_assign = torch.ones_like(experts_sl, dtype=torch.int64)
                 acc_sum.index_add_(0, experts_sl, contribution)
                 acc_sum_sq.index_add_(0, experts_sl, contribution_sq)
@@ -354,6 +350,17 @@ def build_layer_shard_regexes(num_hidden_layers: int,
     return regexes
 
 
+def _detect_profile_for_shards(model_path: str):
+    try:
+        from .model_profiles.registry import detect_profile
+
+        return detect_profile(model_path)
+    except Exception:
+        from .model_profiles.default import DefaultProfile
+
+        return DefaultProfile()
+
+
 def build_extended_shard_regexes(
     model_path: str,
     layers_per_shard: int,
@@ -363,36 +370,37 @@ def build_extended_shard_regexes(
     include_visual: bool = True,
     include_lm_head: bool = True,
 ) -> list[str]:
-    """Extended shard list covering everything quantizable in a
-    multimodal Qwen3.5/3.6 checkpoint:
+    """Extended shard list covering the profile-declared probe regions:
 
-      - body transformer    (`model.layers.X.*`)         — N shards
-      - MTP block(s)        (`mtp.fc`, `mtp.layers.X.*`) — 1 shard typically
-      - visual ViT blocks   (`model.visual.blocks.X.*`)  — depth/N shards
-      - lm_head             (`^lm_head$`)                — 1 shard
+      - body transformer layers
+      - optional MTP block(s)
+      - optional visual/audio tower layers
+      - optional lm_head
     """
+    profile = _detect_profile_for_shards(model_path)
     src_cfg_path = Path(model_path) / "config.json"
     with open(src_cfg_path) as f:
         cfg = json.load(f)
     text_cfg = cfg.get("text_config", cfg)
-    vis_cfg = cfg.get("vision_config", {})
+    body_prefix = profile.body_layer_prefix()
+    mtp_prefix = profile.mtp_layer_prefix()
+    visual_key = profile.visual_config_key()
+    visual_prefix = profile.visual_layer_prefix()
+    lm_head_name = profile.lm_head_name()
 
     regexes: list[str] = []
 
     if include_body:
         n_body = int(text_cfg.get("num_hidden_layers", cfg.get("num_hidden_layers", 0)))
         regexes.extend(build_layer_shard_regexes(
-            n_body, layers_per_shard, layer_prefix="model.layers"))
+            n_body, layers_per_shard, layer_prefix=body_prefix))
 
     if include_mtp:
-        n_mtp_config = int(
-            text_cfg.get("num_nextn_predict_layers")
-            or cfg.get("num_nextn_predict_layers")
-            or text_cfg.get("num_mtp_layers")
-            or cfg.get("num_mtp_layers")
-            or 0
+        n_mtp_config = int(profile.mtp_layer_count(cfg) or 0)
+        n_mtp_actual = _count_mtp_layers_from_safetensors(
+            model_path,
+            layer_prefix=mtp_prefix,
         )
-        n_mtp_actual = _count_mtp_layers_from_safetensors(model_path)
         # Empirical safetensors count is ground truth: a config may
         # declare MTP layers (inherited from a base) when the finetune
         # actually stripped the weights. Conversely, local Qwen3.5/3.6
@@ -406,36 +414,42 @@ def build_extended_shard_regexes(
         if n_mtp_config > 0 and n_mtp_actual == 0:
             print(f"[shard-schedule] config declares "
                   f"{n_mtp_config} MTP layer(s) but safetensors index "
-                  f"has no `mtp.*` keys; skipping MTP shards "
-                  f"(common on Qwen3.5/3.6 finetunes that strip MTP)",
+                  f"has no `{mtp_prefix}.*` keys; skipping MTP shards "
+                  f"(common on finetunes that strip MTP)",
                   flush=True)
         if n_mtp > 0:
             mtp_regexes = build_layer_shard_regexes(
-                n_mtp, layers_per_shard, layer_prefix="mtp.layers")
-            # `mtp.fc` is a top-level MTP Linear, not under
-            # `mtp.layers.0.*`; include it in the first MTP shard so
-            # probe/cost/allocation coverage stays aligned.
-            if mtp_regexes:
-                mtp_regexes[0] = rf"(?:mtp\.fc|{mtp_regexes[0]})"
+                n_mtp, layers_per_shard, layer_prefix=mtp_prefix)
+            if mtp_regexes and profile.mtp_extra_linear_names():
+                extra = "|".join(
+                    re.escape(name) for name in profile.mtp_extra_linear_names()
+                )
+                mtp_regexes[0] = rf"(?:{extra}|{mtp_regexes[0]})"
             regexes.extend(mtp_regexes)
 
-    if include_visual:
+    if include_visual and visual_key and visual_prefix:
+        vis_cfg = cfg.get(visual_key, {})
         n_vis = int(vis_cfg.get("depth") or vis_cfg.get("num_hidden_layers") or 0)
         if n_vis > 0:
             vis_per_shard = max(layers_per_shard, 4)
             regexes.extend(build_layer_shard_regexes(
-                n_vis, vis_per_shard, layer_prefix="model.visual.blocks"))
+                n_vis, vis_per_shard, layer_prefix=visual_prefix))
 
     if include_lm_head:
-        regexes.append(r"^lm_head$")
+        regexes.append(rf"^{re.escape(lm_head_name)}$")
 
     return regexes
 
 
-def _count_mtp_layers_from_safetensors(model_path: str) -> int:
+def _count_mtp_layers_from_safetensors(
+    model_path: str,
+    *,
+    layer_prefix: str = "mtp.layers",
+) -> int:
     """Fallback for when the config doesn't carry an MTP layer count:
-    scan the source safetensors index and count `mtp.layers.<N>.` paths."""
+    scan the source safetensors index and count `<layer_prefix>.<N>.` paths."""
     src = Path(model_path)
+    layer_re = re.compile(rf"^{re.escape(layer_prefix)}\.(\d+)\.")
     idx_path = src / "model.safetensors.index.json"
     if not idx_path.exists():
         try:
@@ -446,7 +460,7 @@ def _count_mtp_layers_from_safetensors(model_path: str) -> int:
                     continue
                 with safe_open(str(src / f), framework="pt") as sf:
                     for k in sf.keys():
-                        m = re.match(r"^mtp\.layers\.(\d+)\.", k)
+                        m = layer_re.match(k)
                         if m:
                             mtp_indices.add(int(m.group(1)))
             return max(mtp_indices) + 1 if mtp_indices else 0
@@ -456,7 +470,7 @@ def _count_mtp_layers_from_safetensors(model_path: str) -> int:
         wm = json.load(f)["weight_map"]
     mtp_indices = set()
     for k in wm:
-        m = re.match(r"^mtp\.layers\.(\d+)\.", k)
+        m = layer_re.match(k)
         if m:
             mtp_indices.add(int(m.group(1)))
     return max(mtp_indices) + 1 if mtp_indices else 0
@@ -481,7 +495,7 @@ class ShardEntry:
     linear_include: str
     kind: str  # "body", "mtp", "visual", "lm_head"
     layer_indices: frozenset[int]
-    layer_prefix: str | None  # "model.layers", "mtp.layers", "model.visual.blocks"; None for lm_head
+    layer_prefix: str | None  # Profile-declared layer prefix; None for lm_head.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -500,16 +514,20 @@ class ShardSchedule:
     def regexes(self) -> list[str]:
         return [e.linear_include for e in self.entries]
 
-    def body_layer_indices(self,
-                           layer_prefix: str = "model.layers") -> frozenset[int]:
+    def body_layer_indices(
+        self,
+        layer_prefix: str | None = None,
+    ) -> frozenset[int]:
         out: set[int] = set()
         for e in self.entries:
-            if e.layer_prefix == layer_prefix:
+            if e.kind != "body":
+                continue
+            if layer_prefix is None or e.layer_prefix == layer_prefix:
                 out |= e.layer_indices
         return frozenset(out)
 
     def layers_done_after(self, shard_idx: int,
-                          layer_prefix: str = "model.layers") -> frozenset[int]:
+                          layer_prefix: str | None = None) -> frozenset[int]:
         """Layer indices in shard_idx's scope that no later shard touches.
 
         For the canonical body-shard layout (contiguous, disjoint ranges
@@ -520,6 +538,8 @@ class ShardSchedule:
         if shard_idx >= len(self.entries):
             return frozenset()
         cur = self.entries[shard_idx]
+        if layer_prefix is None:
+            layer_prefix = cur.layer_prefix
         if cur.layer_prefix != layer_prefix:
             return frozenset()
         future: set[int] = set()
@@ -569,11 +589,17 @@ def build_shard_schedule(
 
     body_layer_range = (first_layer, last_layer_exclusive) — slices the
     body shard list to this range (default (0, num_body_layers))."""
+    profile = _detect_profile_for_shards(model_path)
+    body_prefix = profile.body_layer_prefix()
+    mtp_prefix = profile.mtp_layer_prefix()
+    visual_key = profile.visual_config_key()
+    visual_prefix = profile.visual_layer_prefix()
+    lm_head_name = profile.lm_head_name()
     sidx = 0
 
     # Body shards (mirror old slice semantics).
     body_entries_full = _build_body_shard_entries(
-        num_body_layers, body_layers_per_shard, "model.layers", "body", sidx)
+        num_body_layers, body_layers_per_shard, body_prefix, "body", sidx)
     first = body_layer_range[0] // body_layers_per_shard
     last = (body_layer_range[1] + body_layers_per_shard - 1) // body_layers_per_shard
     body_entries = body_entries_full[first:last]
@@ -594,7 +620,7 @@ def build_shard_schedule(
             linear_include=union,
             kind="body",
             layer_indices=union_layers,
-            layer_prefix="model.layers",
+            layer_prefix=body_prefix,
         )]
         sidx = 1
 
@@ -602,42 +628,51 @@ def build_shard_schedule(
     src_cfg_path = Path(model_path) / "config.json"
     with open(src_cfg_path) as f:
         cfg = json.load(f)
-    text_cfg = cfg.get("text_config", cfg)
-    vis_cfg = cfg.get("vision_config", {})
 
     if include_mtp:
-        n_mtp = int(
-            text_cfg.get("num_nextn_predict_layers")
-            or cfg.get("num_nextn_predict_layers")
-            or text_cfg.get("num_mtp_layers")
-            or cfg.get("num_mtp_layers")
-            or _count_mtp_layers_from_safetensors(model_path)
-            or 0
+        n_mtp_config = int(profile.mtp_layer_count(cfg) or 0)
+        n_mtp_actual = _count_mtp_layers_from_safetensors(
+            model_path,
+            layer_prefix=mtp_prefix,
         )
+        if n_mtp_actual > 0:
+            n_mtp = min(n_mtp_config, n_mtp_actual) if n_mtp_config > 0 else n_mtp_actual
+        else:
+            n_mtp = 0
+        if n_mtp_config > 0 and n_mtp_actual == 0:
+            print(f"[shard-schedule] config declares "
+                  f"{n_mtp_config} MTP layer(s) but safetensors index "
+                  f"has no `{mtp_prefix}.*` keys; skipping MTP shards "
+                  f"(common on finetunes that strip MTP)",
+                  flush=True)
         if n_mtp > 0:
             mtp_entries = _build_body_shard_entries(
-                n_mtp, body_layers_per_shard, "mtp.layers", "mtp", sidx)
-            if mtp_entries:
+                n_mtp, body_layers_per_shard, mtp_prefix, "mtp", sidx)
+            if mtp_entries and profile.mtp_extra_linear_names():
+                extra = "|".join(
+                    re.escape(name) for name in profile.mtp_extra_linear_names()
+                )
                 mtp_entries[0] = dataclasses.replace(
                     mtp_entries[0],
-                    linear_include=rf"(?:mtp\.fc|{mtp_entries[0].linear_include})",
+                    linear_include=rf"(?:{extra}|{mtp_entries[0].linear_include})",
                 )
             extras.extend(mtp_entries)
             sidx += len(mtp_entries)
 
-    if include_visual:
+    if include_visual and visual_key and visual_prefix:
+        vis_cfg = cfg.get(visual_key, {})
         n_vis = int(vis_cfg.get("depth") or vis_cfg.get("num_hidden_layers") or 0)
         if n_vis > 0:
             vis_per_shard = max(body_layers_per_shard, 4)
             vis_entries = _build_body_shard_entries(
-                n_vis, vis_per_shard, "model.visual.blocks", "visual", sidx)
+                n_vis, vis_per_shard, visual_prefix, "visual", sidx)
             extras.extend(vis_entries)
             sidx += len(vis_entries)
 
     if include_lm_head:
         extras.append(ShardEntry(
             shard_idx=sidx,
-            linear_include=r"^lm_head$",
+            linear_include=rf"^{re.escape(lm_head_name)}$",
             kind="lm_head",
             layer_indices=frozenset(),
             layer_prefix=None,
@@ -837,7 +872,6 @@ def synthesize_shard_from_linear_cache(
         "router_counts": {},
         "router_totals": {},
         "router_active_counts": {},
-        "expert_route_stats": {},
         "expert_info": {},
         "meta": {
             **dict(expected_meta),
@@ -858,9 +892,6 @@ def merge_probe_pickles(paths: list[Path], output_path: Path):
     merged_router_totals = defaultdict(int)
     merged_router_active_counts = {}
     merged_expert_info = {}
-    # REAP expert pruning is archived. Keep the compatibility field
-    # present but empty even when older shards carry saliency.
-    merged_expert_saliency: dict[str, dict[int, float]] = {}
     shard_metas = []
 
     for path in paths:
@@ -892,19 +923,13 @@ def merge_probe_pickles(paths: list[Path], output_path: Path):
         merged_router_counts, merged_router_totals, merged_router_active_counts,
     )
     merged["expert_info"] = merged_expert_info
-    merged["expert_saliency"] = merged_expert_saliency
     merged_meta = {
         **merged.get("meta", {}),
         "incremental": True,
         "n_shards": len(paths),
         "shards": shard_metas,
     }
-    # v21 #3 + per-domain saliency: propagate the calibration-chunk
-    # domain label into the chunk-level pickle meta. multi_chunk_probe
-    # sets PRISMAQUANT_PROBE_DOMAIN per chunk so the merged chunk
-    # pickle records which calibration slice it represents. Single-
-    # chunk runs without the env var get the synthetic "_global"
-    # domain so downstream consumers always see a value.
+    # Propagate the calibration-chunk domain label into the merged pickle meta.
     domain_env = os.environ.get("PRISMAQUANT_PROBE_DOMAIN")
     if domain_env:
         merged_meta["domain"] = domain_env
@@ -981,7 +1006,7 @@ def _compute_precompute_key(model_path: str, dataset_name: str,
 
 # In-process StreamingContext + tokenizer cache. Populated when
 # `PRISMAQUANT_PROBE_CTX_CACHE=1` is set. Keyed by (model_path, device,
-# dtype). Lets the multi_chunk_main driver reuse a single loaded model
+# dtype). Lets an in-process driver reuse a single loaded model
 # across N calibration chunks instead of paying the offload + tokenizer
 # rebuild cost N times.
 _PROBE_CTX_CACHE: dict = {}
@@ -997,7 +1022,7 @@ _PROBE_CTX_CACHE: dict = {}
 # the cumulative GPU pipeline gap was several seconds per chunk.
 #
 # This cache is keyed by (fqn, weight.data_ptr) so a model swap or
-# in-place weight modification (export pass, AWQ fold, etc.) invalidates
+# in-place weight modification (for example, an export pass) invalidates
 # automatically — different storage, different key. Within a single
 # probe run the weights are immutable, so the cache holds for the whole
 # multi-chunk driver lifetime.
@@ -1041,13 +1066,8 @@ class GlobalPrecompute:
       runner filters these dicts to its own include regex.
     - `resident_act_snaps` holds (per-fqn) CPU activation snapshots for
       resident linears, used by the cost stage's ActivationIndex.
-    - `expert_saliency` is retained as an empty compatibility field.
-      REAP expert pruning is archived and new probes do not emit
-      saliency suitable for expert DROP decisions.
     - `expert_info` mirrors `sensitivity_probe.discover_moe_structure`'s
-      output (Linear qname -> (router_qname, expert_id_str)); the
-      allocator uses it to map per-Linear quantization decisions back to
-      their owning expert when DROP candidates are considered.
+      output (Linear qname -> (router_qname, expert_id_str)).
     """
     activations_cpu: list[torch.Tensor]
     grad_at_tail: torch.Tensor
@@ -1057,7 +1077,6 @@ class GlobalPrecompute:
     resident_g2_per_token: dict[str, torch.Tensor]
     resident_act_snaps: dict[str, list[torch.Tensor]]
     resident_act_row_indices: dict[str, list[torch.Tensor]]
-    expert_saliency: dict[str, dict[int, float]]
     expert_info: dict[str, tuple[str, str]]
     router_counts: dict[str, dict[str, float]]
     router_totals: dict[str, int]
@@ -1088,6 +1107,8 @@ def _compute_global_precompute(
     dtype = ctx.dtype
     model = ctx.model
     base_model = ctx.base_model
+    from .model_profiles import profile_from_model as _profile_from_model
+    profile = _profile_from_model(model)
     layers = ctx.layers
     num_layers = ctx.num_layers
     layers_prefix = ctx.layers_prefix
@@ -1100,21 +1121,14 @@ def _compute_global_precompute(
 
     prefetch_depth = prefetch_lookahead
 
+    # Profile-driven hidden-state shape adapter (refactor #32). Default
+    # profile passes through; DSv4 expands single-stream `[B, S, H]` to
+    # multi-stream `[B, S, hc_mult, H]` (mirrors `DeepseekV4Model.forward`).
+    from .model_profiles import profile_from_model as _profile_from_model
+    _profile = _profile_from_model(base_model)
+
     # ---- Phase 1: streaming forward, cache activations on CPU ----
-    #
-    # REAP expert pruning is archived. We still discover MoE structure
-    # for compatibility metadata, but no saliency hooks are installed
-    # and new probes emit empty expert_saliency fields.
-    phase1_expert_info = discover_moe_structure(model)
-    _saliency_triples = saliency_from_moe_structure(phase1_expert_info)
-    _packed_moe_blocks = saliency_from_packed_moe(model)
-    saliency_tracker = None
-    if _saliency_triples or _packed_moe_blocks:
-        print(
-            "[incremental/global] expert-saliency tracker disabled "
-            "(REAP expert pruning archived)",
-            flush=True,
-        )
+    phase1_expert_info = discover_moe_structure(model, profile=_profile)
 
     t_phase = time.time()
     with torch.no_grad():
@@ -1122,11 +1136,6 @@ def _compute_global_precompute(
     position_embeddings = _compute_position_embeddings(
         base_model, hidden, position_ids)
 
-    # Profile-driven hidden-state shape adapter (refactor #32). Default
-    # profile passes through; DSv4 expands single-stream `[B, S, H]` to
-    # multi-stream `[B, S, hc_mult, H]` (mirrors `DeepseekV4Model.forward`).
-    from .model_profiles import profile_from_model as _profile_from_model
-    _profile = _profile_from_model(base_model)
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
 
     print(f"[incremental/global] phase-1 N={batch_size} T={tokens_in_sample} "
@@ -1177,35 +1186,10 @@ def _compute_global_precompute(
           f"(host transfer {time.time()-t_h2h:.1f}s)  "
           f"{ctx.layer_cache.summary()}", flush=True)
 
-    # Collect saliency and drop hooks before Phase-2 begins (Phase-2 replays
-    # embeddings + final norm + lm_head only — no MoE modules fire — but we
-    # free the hook handles proactively so there's no chance of ghost
-    # accumulation during downstream forward passes in the same session).
-    if saliency_tracker is not None:
-        # Harvest as REAP dropout loss (Δ L_j ≈ (1/T) Σ g·||f||²).
-        # Units match the allocator's Fisher·weight-MSE Δloss terms,
-        # so the packed-prune path can use this directly as per-expert
-        # prune cost with no α/h/n scaling.
-        phase1_expert_saliency = saliency_tracker.saliency(reduction="reap_dropout")
-        phase1_router_counts = saliency_tracker.router_counts()
-        phase1_router_totals = saliency_tracker.router_totals()
-        phase1_router_active_counts = saliency_tracker.router_active_counts()
-        phase1_expert_route_stats = saliency_tracker.route_stats()
-        saliency_tracker.remove_hooks()
-        nonzero_counts = sum(
-            1 for rq_saliencies in phase1_expert_saliency.values()
-            for s in rq_saliencies.values() if s > 0.0
-        )
-        total_slots = sum(len(v) for v in phase1_expert_saliency.values())
-        print(f"[incremental/global] expert-saliency: "
-              f"{nonzero_counts}/{total_slots} experts activated "
-              f"(route mass emitted for allocator drop priors)", flush=True)
-    else:
-        phase1_expert_saliency = {}
-        phase1_router_counts = {}
-        phase1_router_totals = {}
-        phase1_router_active_counts = {}
-        phase1_expert_route_stats = {}
+    phase1_router_counts = {}
+    phase1_router_totals = {}
+    phase1_router_active_counts = {}
+    phase1_expert_route_stats = {}
 
     # ---- Phase 2: final norm + lm_head + CE loss; grad at final hidden ----
     ctx.layer_cache.clear()
@@ -1398,7 +1382,6 @@ def _compute_global_precompute(
         },
         resident_act_snaps=dict(resident_act_snaps),
         resident_act_row_indices=dict(resident_act_row_indices),
-        expert_saliency=phase1_expert_saliency,
         expert_info=phase1_expert_info,
         router_counts=phase1_router_counts,
         router_totals=phase1_router_totals,
@@ -1423,7 +1406,6 @@ def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
         "resident_g2_per_token": pre.resident_g2_per_token,
         "resident_act_snaps": pre.resident_act_snaps,
         "resident_act_row_indices": pre.resident_act_row_indices,
-        "expert_saliency": pre.expert_saliency,
         "expert_info": pre.expert_info,
         "router_counts": pre.router_counts,
         "router_totals": pre.router_totals,
@@ -1460,9 +1442,6 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
         resident_g2_per_token=data.get("resident_g2_per_token", {}),
         resident_act_snaps=data["resident_act_snaps"],
         resident_act_row_indices=data.get("resident_act_row_indices", {}),
-        # REAP expert pruning is archived. Ignore any saliency persisted
-        # by older precompute caches so resumed probes do not re-emit it.
-        expert_saliency={},
         expert_info=data.get("expert_info", {}),
         router_counts={},
         router_totals={},
@@ -2139,6 +2118,7 @@ def _run_body_streaming_shard(
                 layers[L], accumulator=packed_grad_acc,
                 channel_accumulator=packed_channel_acc,
                 full_accumulator=packed_full_acc,
+                profile=_shard_profile,
             ) if layer_in_scope else {}
             layer_prefix = f"{layers_prefix}{L}."
             layer_packed_handles: list = []
@@ -2449,50 +2429,13 @@ def _run_body_streaming_shard(
         # cost step sees a fully-flushed activation cache directory.
         drain_activation_writes()
 
-    # Filter precomputed expert_info / expert_saliency to the subset of
-    # routers whose experts are within this shard's include-regex scope.
-    # That keeps per-shard pickles small and self-consistent — the
-    # allocator merges shards via _merge_nested_counts-style logic in
-    # `_merge_probe_pickles` below.
+    # Filter precomputed expert_info to the subset of routers whose experts are
+    # within this shard's include-regex scope.
     shard_expert_info = {
         k: v for k, v in precomputed.expert_info.items() if k in all_tracked
     }
-    # expert_saliency is keyed by router_qname, not expert linear qname.
-    # Two layouts coexist:
-    #   (a) nested — each expert is an nn.Module leaf, so we can test
-    #       "router's experts are tracked in this shard" via expert_info.
-    #   (b) packed-3D — no per-expert leaves, so expert_info has no
-    #       entry for the router. Check whether any of the shard's
-    #       tracked names belong to this router's layer prefix
-    #       (strip `.gate` → MoE-block qname → `.mlp.experts.*`
-    #       packed stat lives under its layer).
     shard_routers_in_scope: set[str] = {
         rq for (rq, _eid) in shard_expert_info.values()
-    }
-    # Packed path: walk every router in the precompute and admit it when
-    # the shard tracks a stat rooted at the same MoE-block qname prefix.
-    # This is O(routers · tracked) but both are tiny (40 × ~40).
-    for rq in precomputed.expert_saliency:
-        if rq in shard_routers_in_scope:
-            continue
-        # router_qname conventionally ends in ".gate"; stripping that
-        # gives the MoE-block qname. Admit the router when the shard
-        # tracks ANY nn.Linear under the same MoE block (e.g. the
-        # shared_expert's gate_proj lives at
-        # "<block>.shared_expert.gate_proj" and IS tracked). The packed
-        # experts 3D param isn't a Linear and so won't appear in
-        # all_tracked directly.
-        if not rq.endswith(".gate"):
-            continue
-        block_prefix = rq[: -len(".gate")] + "."
-        for tracked in all_tracked:
-            if tracked.startswith(block_prefix):
-                shard_routers_in_scope.add(rq)
-                break
-    shard_expert_saliency = {
-        rq: per_expert_map
-        for rq, per_expert_map in precomputed.expert_saliency.items()
-        if rq in shard_routers_in_scope
     }
     shard_router_counts = {
         rq: per_expert_map
@@ -2525,7 +2468,6 @@ def _run_body_streaming_shard(
             "router_active_counts": shard_router_active_counts,
             "expert_route_stats": shard_expert_route_stats,
             "expert_info": shard_expert_info,
-            "expert_saliency": shard_expert_saliency,
             "meta": {
                 "model": model_path,
                 "dataset": dataset_name,
@@ -2543,9 +2485,7 @@ def _run_body_streaming_shard(
                 "linear_exclude": linear_exclude,
             },
         }, f)
-    print(f"[incremental] wrote {out_path}  "
-          f"expert_saliency={sum(len(v) for v in shard_expert_saliency.values())} entries",
-          flush=True)
+    print(f"[incremental] wrote {out_path}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2625,7 +2565,6 @@ def _run_mtp_streaming_shard(
                 "router_counts": {},
                 "router_totals": {},
                 "expert_info": {},
-                "expert_saliency": {},
                 "meta": {
                     "model": model_path,
                     "dataset": dataset_name,
@@ -2661,7 +2600,7 @@ def _run_mtp_streaming_shard(
                if isinstance(m, nn.Linear) and not re.search(r"mlp\.gate$", n)]
     print(f"[incremental/mtp] tracking {len(tracked)} MTP Linears", flush=True)
 
-    expert_info_all = discover_moe_structure(mtp_wrapper)
+    expert_info_all = discover_moe_structure(mtp_wrapper, profile=profile)
     expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
     top_k = read_top_k(mtp_wrapper, default=2)
 
@@ -2821,13 +2760,13 @@ def main():
     ap.add_argument("--no-importance-weighting", action="store_false",
                     dest="importance_weighting")
     ap.add_argument("--include-mtp", action="store_true", default=True,
-                    help="Probe MTP layers (`mtp.layers.X.*`).")
+                    help="Probe profile-declared MTP layers.")
     ap.add_argument("--no-include-mtp", action="store_false", dest="include_mtp")
     ap.add_argument("--include-visual", action="store_true", default=True,
-                    help="Probe visual encoder blocks (`model.visual.blocks.X.*`).")
+                    help="Probe profile-declared visual encoder blocks.")
     ap.add_argument("--no-include-visual", action="store_false", dest="include_visual")
     ap.add_argument("--include-lm-head", action="store_true", default=True,
-                    help="Probe lm_head (`^lm_head$`).")
+                    help="Probe the profile-declared language-model head.")
     ap.add_argument("--no-include-lm-head", action="store_false", dest="include_lm_head")
     ap.add_argument("--h-detail-dir", default=None,
                     help="If set, write per-Linear full Fisher diagonal "
@@ -2893,7 +2832,7 @@ def main():
                          "per-visual-Linear Fisher + activation snapshots "
                          "land in the probe pickle + activation cache, so "
                          "the allocator treats visual Linears as regular DP "
-                         "candidates and the exporter's AWQ/GPTQ/AR passes "
+                         "candidates and the exporter's GPTQ/AR passes "
                          "apply. Multimodal requires enough RAM for the full "
                          "model; on 122B-scale models it falls back to the "
                          "Phase 1 --visual-format override automatically on "

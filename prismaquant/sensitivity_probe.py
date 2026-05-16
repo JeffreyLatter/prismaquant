@@ -504,18 +504,25 @@ class _GradNormCapture(torch.autograd.Function):
         return None, None, None, None, None
 
 
-_PACKED_EXPERT_PARAM_NAMES = {
-    "gate_up_proj", "down_proj",            # Qwen3.5 / 3.6 packed MoE
-    "w1", "w2", "w3",                       # Mixtral-style legacy
-    "gate_proj", "up_proj",                 # Some HF layouts
-}
+def _packed_expert_param_name_set(profile=None) -> set[str]:
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        try:
+            return set(profile.packed_expert_param_names())
+        except Exception:
+            pass
+    return set()
 
 
-def _is_packed_experts_module(module: nn.Module) -> bool:
+def _is_packed_experts_module(module: nn.Module, profile=None) -> bool:
     """A module qualifies as a packed-experts container iff (a) its
     class name contains "Experts" (case-insensitive), and (b) it owns
-    at least one 3D nn.Parameter whose attribute name is in
-    `_PACKED_EXPERT_PARAM_NAMES`.
+    at least one profile-declared 3D packed expert parameter.
 
     The class-name check excludes other modules that happen to own 3D
     parameters — most importantly Conv1d in linear-attention paths,
@@ -523,28 +530,41 @@ def _is_packed_experts_module(module: nn.Module) -> bool:
     is a second safety net against unusual modules with unrelated 3D
     state.
     """
+    names = _packed_expert_param_name_set(profile)
     cls_name = type(module).__name__.lower()
     if "expert" not in cls_name:
         return False
     for n, p in module.named_parameters(recurse=False):
         if (isinstance(p, nn.Parameter)
                 and p.dim() == 3
-                and n in _PACKED_EXPERT_PARAM_NAMES):
+                and n in names):
             return True
     return False
 
 
-def _packed_experts_param_names(module: nn.Module) -> list[str]:
+def _packed_experts_param_names(module: nn.Module, profile=None) -> list[str]:
     """Return the attribute names of all 3D packed parameters on
     `module`, restricted to the known MoE expert names. Order is stable
     across Python runs."""
+    names_allowed = _packed_expert_param_name_set(profile)
     names = []
     for n, p in module.named_parameters(recurse=False):
         if (isinstance(p, nn.Parameter)
                 and p.dim() == 3
-                and n in _PACKED_EXPERT_PARAM_NAMES):
+                and n in names_allowed):
             names.append(n)
     return sorted(names)
+
+
+def _packed_expert_projection_candidate_names(profile=None) -> tuple[str, ...]:
+    names = set(_packed_expert_param_name_set(profile))
+    if profile is not None:
+        for name in list(names):
+            try:
+                names.update(profile.packed_expert_projection_names(name))
+            except Exception:
+                pass
+    return tuple(sorted(names))
 
 
 _PRISMAQUANT_PATCH_SENTINEL = "_prismaquant_packed_expert_patch"
@@ -557,6 +577,7 @@ def install_packed_expert_hooks(
     accumulator: dict,
     channel_accumulator: dict | None = None,
     full_accumulator: dict | None = None,
+    profile=None,
 ) -> dict[str, dict]:
     """Patch every packed-experts module's forward so its 3D parameters
     route through `_GradNormCapture` before each use.
@@ -586,9 +607,9 @@ def install_packed_expert_hooks(
     """
     meta: dict[str, dict] = {}
     for qname, module in model.named_modules():
-        if not _is_packed_experts_module(module):
+        if not _is_packed_experts_module(module, profile):
             continue
-        param_names = _packed_experts_param_names(module)
+        param_names = _packed_experts_param_names(module, profile)
         if not param_names:
             continue
 
@@ -751,7 +772,10 @@ def resolve_execution_device(model: nn.Module, requested_device: str) -> torch.d
 # ---------------------------------------------------------------------------
 # Model-agnostic MoE discovery
 # ---------------------------------------------------------------------------
-def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
+def discover_moe_structure(
+    model: nn.Module,
+    profile=None,
+) -> dict[str, tuple[str, str]]:
     """Return {expert_linear_qname: (router_qname, expert_id_str)}.
 
     Walk the module tree.  For any module that has a child attribute named
@@ -759,6 +783,14 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
     sibling Linear in the same parent whose out_features equals len(experts).
     That Linear is the router.
     """
+    if profile is None:
+        try:
+            from .model_profiles import profile_from_model
+            profile = profile_from_model(model)
+        except Exception:
+            profile = None
+    projection_candidates = _packed_expert_projection_candidate_names(profile)
+
     def _router_matches_num_experts(child: nn.Module, num_experts: int) -> bool:
         if isinstance(child, nn.Linear) and child.out_features == num_experts:
             return True
@@ -803,7 +835,7 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
             #   experts.gate_up_proj.<expert_idx>
             #   experts.down_proj.<expert_idx>
             projection_lists = {}
-            for proj_name in ("gate_up_proj", "down_proj", "w1", "w2", "w3"):
+            for proj_name in projection_candidates:
                 proj = getattr(experts_container, proj_name, None)
                 if proj is None or not isinstance(proj, nn.Module):
                     continue
@@ -850,7 +882,7 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
                     leaf = f"{experts_root}.{eid_str}.{sub_name}"
                     expert_info[leaf] = (router_qname, eid_str)
         else:
-            for proj_name in ("gate_up_proj", "down_proj", "w1", "w2", "w3"):
+            for proj_name in projection_candidates:
                 proj = getattr(experts_container, proj_name, None)
                 if proj is None or not isinstance(proj, nn.Module):
                     continue
@@ -998,7 +1030,8 @@ class FisherAccumulator:
                  act_cache_dir: Path | None = None,
                  input_rows: int = 256,
                  hook_packed_experts: bool = True,
-                 h_detail_dir: Path | None = None):
+                 h_detail_dir: Path | None = None,
+                 model_profile=None):
         self.stats: dict[str, dict] = {}
         self._saved_inputs: dict[str, torch.Tensor] = {}
         self._fwd_handles, self._bwd_handles = [], []
@@ -1021,6 +1054,13 @@ class FisherAccumulator:
         # measure_quant_cost can read packed expert inputs.
         self._packed_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._packed_act_rows: dict[str, int] = defaultdict(int)
+        if model_profile is None:
+            try:
+                from .model_profiles import profile_from_model
+                model_profile = profile_from_model(model)
+            except Exception:
+                model_profile = None
+        self.model_profile = model_profile
 
         # Per-layer accumulator for full per-weight Fisher diagonal.
         # Keyed by Linear qname -> CPU fp64 tensor of shape [out, in]
@@ -1068,14 +1108,15 @@ class FisherAccumulator:
         # per-weight for 80 packed tensors at 35B scale is 160+ GB;
         # per-channel is 160 MB total — still a vector form.
         self._h_packed_channel: dict[str, torch.Tensor] = {}
-        # Pre-compute the BF16-skip set: Linears we know will end up
-        # BF16 in serving (lm_head + embed_tokens), so accumulating the
-        # full per-weight Fisher matrix for them is dead work. The hook
-        # short-circuits these. Allocator's lm_head ignore + ParallelLMHead's
-        # BF16-only constraint make this a safe assumption for our pipeline.
-        _BF16_SKIP_RE = re.compile(
-            r"^(?:lm_head$|.*\.lm_head$|model\.embed_tokens$|.*\.embed_tokens$)"
-        )
+        # Pre-compute the BF16-skip set: profile-pinned Linears end up BF16
+        # in serving, so accumulating their full per-weight Fisher matrix is
+        # dead work. Keep the embedding fallback for older profiles; embeddings
+        # are normally not nn.Linear and therefore never enter this loop.
+        def _skip_fisher_name(qname: str) -> bool:
+            checker = getattr(self.model_profile, "is_pinned_name", None)
+            if checker is not None and checker(qname):
+                return True
+            return qname == "model.embed_tokens" or qname.endswith(".embed_tokens")
 
         # Detect MoE expert blocks for batched Fisher accumulation. A block
         # qualifies if its immediate children all expose w1/w2/w3 nn.Linear
@@ -1149,7 +1190,7 @@ class FisherAccumulator:
         for name, mod in model.named_modules():
             if name not in self.tracked or not isinstance(mod, nn.Linear):
                 continue
-            if _BF16_SKIP_RE.match(name):
+            if _skip_fisher_name(name):
                 self._fisher_skip.add(name)
             w = mod.weight
             router_qname, eid = expert_info.get(name, (None, None))
@@ -1196,6 +1237,7 @@ class FisherAccumulator:
                 model,
                 accumulator=self._packed_grad_acc,
                 channel_accumulator=self._h_packed_channel,
+                profile=self.model_profile,
             )
             for full_name, meta in packed_meta.items():
                 # Filter against the tracked set when tracked is a regex

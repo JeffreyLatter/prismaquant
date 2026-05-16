@@ -14,5 +14,4 @@ Before working on PrismaQuant, read in order:
   list inside.
 - `.claude/prismaquant-handover-2026-05-01.md` — earlier state. Allocator
   Δloss bug + the design that became PrismaSCOUT. User's conceptual core.
-- `.claude/prismaquant-handover-2026-04-29.md` — older session context
-  (HALO landing, wins stack, overnight 4B smoke).
+- `.claude/prismaquant-handover-2026-04-29.md` — older session context.

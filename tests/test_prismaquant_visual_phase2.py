@@ -2,7 +2,7 @@
 
 Phase 2 adds real activation + Fisher capture for visual Linears so
 they enter the allocator's DP as regular candidates and get the same
-AWQ/GPTQ/AR treatment at export. Covers:
+GPTQ/scale-sweep/AR treatment at export. Covers:
 
   1. sensitivity_probe.stage_multimodal — preserves vision_config (vs
      stage_text_only which strips it).
@@ -346,10 +346,9 @@ class TestAllocatorVisualSensitivityModes(unittest.TestCase):
 class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
     """The NVFP4 path in _quantize_2d consults `_CACHED_ACTIVATIONS`
     by recipe name. When the multimodal probe populates visual Linear
-    activations under matching names, AWQ / GPTQ / AR rounding apply
-    — this test confirms the cache lookup triggers the AWQ pass."""
+    activations under matching names, GPTQ / AR rounding apply."""
 
-    def test_awq_enabled_reads_visual_activations_from_cache(self):
+    def test_gptq_enabled_reads_visual_activations_from_cache(self):
         from prismaquant import export_native_compressed as exp
 
         visual_name = "model.visual.blocks.0.attn.qkv"
@@ -364,24 +363,21 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
             out = exp._quantize_2d(
                 W, "NVFP4",
                 linear_name=visual_name,
-                awq_enabled=True,          # AWQ on → needs activations
-                gptq_enabled=False,
-                awq_round_enabled=False,
+                gptq_enabled=True,
             )
         finally:
             exp._CACHED_ACTIVATIONS = prev_cache
-        # NVFP4 path emits the full triple whether or not AWQ fired;
-        # we just confirm the call returned a valid compressed tensor
-        # structure (no crash when activations come from the module-
-        # level cache).
+        # NVFP4 path emits the full triple; we just confirm the call returned
+        # a valid compressed tensor structure when activations come from the
+        # module-level cache.
         for key in ("weight_packed", "weight_scale",
                     "weight_global_scale", "input_global_scale"):
             self.assertIn(key, out)
 
-    def test_awq_fallback_when_activation_cache_missing_key(self):
-        # If _CACHED_ACTIVATIONS doesn't have the visual key, AWQ is a
-        # no-op (the path checks `acts is not None` at each step).
-        # Still produces a valid NVFP4 triple.
+    def test_gptq_fallback_when_activation_cache_missing_key(self):
+        # If _CACHED_ACTIVATIONS doesn't have the visual key, the
+        # activation-aware pass is skipped and a valid NVFP4 triple is
+        # still produced.
         from prismaquant import export_native_compressed as exp
 
         visual_name = "model.visual.merger.mlp.0"
@@ -394,7 +390,7 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
             out = exp._quantize_2d(
                 W, "NVFP4",
                 linear_name=visual_name,
-                awq_enabled=True,
+                gptq_enabled=True,
             )
         finally:
             exp._CACHED_ACTIVATIONS = prev_cache
@@ -418,11 +414,11 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
             }
             visual = exp._quantize_2d(
                 W, "NVFP4", linear_name="model.visual.blocks.0.mlp.fc1",
-                awq_enabled=True,
+                gptq_enabled=True,
             )
             body = exp._quantize_2d(
                 W, "NVFP4", linear_name="model.layers.0.mlp.gate_proj",
-                awq_enabled=True,
+                gptq_enabled=True,
             )
         finally:
             exp._CACHED_ACTIVATIONS = prev

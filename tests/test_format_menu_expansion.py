@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import pytest
-
 from prismaquant import format_registry as fr
 from prismaquant.allocator import (
     apply_mtp_format_override,
     filter_candidates_for_profile,
+    resolve_target_profile,
 )
 from prismaquant.allocator_candidates import check_format_applicability
 from prismaquant.allocator_solver import Candidate
@@ -16,7 +15,12 @@ from prismaquant.export_native_compressed import (
 from prismaquant.kl_sensitivity_probe import _production_cache_formats
 
 
-VLLM_PROFILE = "vllm_qwen3_5_packed_moe"
+VLLM_PROFILE = "vllm_packed_moe"
+
+
+class _ProfileWithServingDefault:
+    def serving_profile_id(self) -> str:
+        return VLLM_PROFILE
 
 
 def test_production_cache_formats_include_all_non_bf16_registry_picks():
@@ -30,11 +34,13 @@ def test_production_cache_formats_include_all_non_bf16_registry_picks():
         "NVFP4",
     ) == ["FP8_E5M2", "MXFP8_E5M2", "NVFP4"]
 
-    assert _production_cache_formats(
-        ["NVFP4", "BF16"],
-        "NVFP4",
-        include_prismaclip=True,
-    ) == ["NVFP4", "NVFP4_CLIPPED"]
+
+def test_allocator_target_profile_defaults_to_model_profile_config():
+    assert resolve_target_profile(_ProfileWithServingDefault()) == VLLM_PROFILE
+    assert (
+        resolve_target_profile(_ProfileWithServingDefault(), "research")
+        == "research"
+    )
 
 
 def test_vllm_profile_allows_dense_fp8_e4m3_but_not_e5m2():
@@ -63,12 +69,20 @@ def test_vllm_profile_allows_dense_fp8_e4m3_but_not_e5m2():
 
 def test_vllm_profile_keeps_packed_moe_menu_conservative():
     expert = "model.layers.0.mlp.experts.gate_up_proj"
+    gemma_expert = "model.layers.0.experts.gate_up_proj"
     shape = (5120, 17408)
 
     assert check_format_applicability(
         shape,
         "MXFP8_E4M3",
         qname=expert,
+        source_kind="bf16",
+        target_profile=VLLM_PROFILE,
+    ).legal
+    assert check_format_applicability(
+        shape,
+        "MXFP4",
+        qname=gemma_expert,
         source_kind="bf16",
         target_profile=VLLM_PROFILE,
     ).legal
@@ -129,11 +143,22 @@ def test_export_canonicalizes_and_configures_dense_fp8_e4m3():
     assert FORMAT_SCHEME["FP8_E4M3"]["input_activations"]["strategy"] == "token"
 
 
-def test_export_rejects_e5m2_until_vllm_weight_dispatch_is_validated():
-    with pytest.raises(ValueError, match="E5M2"):
-        canonicalize_format("FP8_E5M2")
-    with pytest.raises(ValueError, match="E5M2"):
+def test_e5m2_is_parsed_then_gated_by_serving_profile():
+    assert canonicalize_format("FP8_E5M2") == "FP8_E5M2"
+    assert (
         canonicalize_format(fr.get_format("MXFP8_E5M2").autoround_config())
+        == "MXFP8_E5M2"
+    )
+    assert "FP8_E5M2" not in FORMAT_SCHEME
+    verdict = check_format_applicability(
+        (128, 128),
+        "FP8_E5M2",
+        qname="model.layers.0.self_attn.o_proj",
+        target_profile=VLLM_PROFILE,
+    )
+    assert not verdict.legal
+    assert verdict.reason == "profile_mismatch"
+    assert "not enabled for dense Linears" in verdict.detail
 
 
 def test_mtp_format_override_keeps_body_assignment_intact():

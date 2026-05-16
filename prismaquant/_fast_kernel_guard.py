@@ -16,7 +16,16 @@ do want to debug-run on the slow path.
 """
 from __future__ import annotations
 
+import importlib
+from pathlib import Path
+
 from prismaquant.memory_management import env_truthy as _env_truthy
+
+
+_QWEN_HYBRID_FAST_KERNEL_REQUIREMENTS = (
+    ("causal_conv1d", "causal-conv1d (Dao-AILab/causal-conv1d)"),
+    ("fla", "flash-linear-attention (fla-org/flash-linear-attention)"),
+)
 
 
 def require_fast_kernels(model_id_or_path: str | None = None) -> None:
@@ -33,33 +42,20 @@ def require_fast_kernels(model_id_or_path: str | None = None) -> None:
     if _env_truthy("PRISMAQUANT_ALLOW_PYTORCH_FALLBACK"):
         return
 
-    if model_id_or_path is not None:
-        # Only Qwen3.5/3.6 hybrid attention-SSM lines use the gated
-        # delta rule kernels.  Other architectures (DeepSeek, Mistral,
-        # Gemma, GLM, etc.) ignore these libs and don't need the check.
-        lower = str(model_id_or_path).lower()
-        is_hybrid_qwen = any(
-            tok in lower for tok in (
-                "qwen3.5", "qwen3p5", "qwen35",
-                "qwen3.6", "qwen3p6", "qwen36",
-            )
-        )
-        if not is_hybrid_qwen:
-            return
+    requirements = _requirements_for_model(model_id_or_path)
+    if not requirements:
+        return
 
     missing: list[str] = []
-    try:
-        import causal_conv1d  # noqa: F401
-    except ImportError:
-        missing.append("causal-conv1d (Dao-AILab/causal-conv1d)")
-    try:
-        import fla  # noqa: F401
-    except ImportError:
-        missing.append("flash-linear-attention (fla-org/flash-linear-attention)")
+    for module_name, package_name in requirements:
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing.append(package_name)
 
     if missing:
         raise RuntimeError(
-            "Required fast-kernel packages missing for Qwen3.5/3.6 "
+            "Required fast-kernel packages missing for this model's "
             "linear-attention forwards: " + ", ".join(missing) + ". "
             "The Python torch fallback is ~5-10x slower than the "
             "optimized kernel path and silently destroys polish wall-"
@@ -68,3 +64,29 @@ def require_fast_kernels(model_id_or_path: str | None = None) -> None:
             "Or set PRISMAQUANT_ALLOW_PYTORCH_FALLBACK=1 to bypass "
             "this guard (debug runs only — never in production)."
         )
+
+
+def _requirements_for_model(
+    model_id_or_path: str | None,
+) -> tuple[tuple[str, str], ...]:
+    if model_id_or_path is None:
+        return _QWEN_HYBRID_FAST_KERNEL_REQUIREMENTS
+
+    path = Path(str(model_id_or_path))
+    if (path / "config.json").is_file():
+        try:
+            from prismaquant.model_profiles import detect_profile
+
+            return tuple(detect_profile(str(path)).fast_kernel_requirements())
+        except Exception:
+            return ()
+
+    # Backward-compatible fallback for remote IDs or nonlocal shorthand paths.
+    lower = str(model_id_or_path).lower()
+    is_hybrid_qwen = any(
+        tok in lower for tok in (
+            "qwen3.5", "qwen3p5", "qwen35",
+            "qwen3.6", "qwen3p6", "qwen36",
+        )
+    )
+    return _QWEN_HYBRID_FAST_KERNEL_REQUIREMENTS if is_hybrid_qwen else ()

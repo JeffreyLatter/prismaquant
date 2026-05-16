@@ -3,8 +3,7 @@
 Runtime GEMM kernels for NVFP4 / MXFP8 have alignment constraints that
 the knapsack DP must respect — otherwise the solver picks an
 unservable format and the artifact fails at vLLM load. The
-`_format_kernel_supports_shape` helper gates each format candidate on
-its kernel's shape rules before the DP sees it.
+serving-profile shape rules gate each format candidate before the DP sees it.
 
 These tests pin the known rules so silent kernel changes don't
 regress the shape-mask:
@@ -24,6 +23,7 @@ from prismaquant.allocator import (
     _format_kernel_supports_shape,
     build_candidates,
 )
+from prismaquant.allocator_candidates import summarize_applicability_masks
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +114,8 @@ def test_build_candidates_drops_mxfp8_on_small_n_shape():
     }
     specs = [fr.REGISTRY["NVFP4"], fr.REGISTRY["MXFP8_E4M3"], fr.REGISTRY["BF16"]]
 
-    cands = build_candidates(stats, costs, specs)
+    mask_records = []
+    cands = build_candidates(stats, costs, specs, mask_records=mask_records)
 
     # in_proj_a (out=48): MXFP8 should be dropped.
     a_formats = [c.fmt for c in cands["model.layers.0.linear_attn.in_proj_a"]]
@@ -126,6 +127,24 @@ def test_build_candidates_drops_mxfp8_on_small_n_shape():
     # gate_proj (5120, 17408): MXFP8 should be kept.
     g_formats = [c.fmt for c in cands["model.layers.0.mlp.gate_proj"]]
     assert "MXFP8_E4M3" in g_formats
+
+    assert len(mask_records) == 1
+    record = mask_records[0]
+    assert record["qname"] == "model.layers.0.linear_attn.in_proj_a"
+    assert record["format"] == "MXFP8_E4M3"
+    assert record["reason"] == "kernel_shape"
+    assert "out_features=48, in_features=5120" in record["detail"]
+    assert record["shape"] == [48, 5120]
+    assert record["out_features"] == 48
+    assert record["in_features"] == 5120
+    assert record["source_kind"] is None
+
+    summary = summarize_applicability_masks(mask_records)
+    assert summary["summary"] == {"MXFP8_E4M3": {"kernel_shape": 1}}
+    assert summary["by_shape"]["MXFP8_E4M3"]["kernel_shape"][0]["shape"] == [
+        48,
+        5120,
+    ]
 
 
 def test_build_candidates_applies_serving_profile_before_dp():
@@ -151,7 +170,7 @@ def test_build_candidates_applies_serving_profile_before_dp():
         stats,
         costs,
         specs,
-        target_profile="vllm_qwen3_5_packed_moe",
+        target_profile="vllm_packed_moe",
     )
 
     assert [c.fmt for c in research["model.layers.0.self_attn.o_proj"]] == [

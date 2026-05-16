@@ -30,6 +30,7 @@ from .gemma4 import Gemma4Profile
 from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
 from .qwen3_5_dense import Qwen3_5DenseProfile
+from .qwen3_moe import Qwen3MoeProfile
 
 # MiniMaxM2Profile: re-imported from its live mirror after the 2026-04-24
 # session's Phase-3 archive move. The profile is still tracked under
@@ -44,6 +45,7 @@ _REGISTERED: list[type[ModelProfile]] = [
     Qwen3NextProfile,     # before Qwen3_5/Qwen3 — distinct model_type "qwen3_next"
     Qwen3_5DenseProfile,  # must precede Qwen3_5Profile (dense is a subset)
     Qwen3_5Profile,
+    Qwen3MoeProfile,  # must precede Qwen3Profile (MoE model_type includes qwen3)
     Qwen3Profile,  # original Qwen3 (dense, no MoE, no MTP) — after the 3.5 siblings
     Gemma4Profile,
     MiniMaxM2Profile,

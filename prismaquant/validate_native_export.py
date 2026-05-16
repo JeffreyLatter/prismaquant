@@ -10,7 +10,7 @@ Usage (from inside a vllm-node container):
         --max-new-tokens 16
 
 The script can optionally upgrade the container's flashinfer to a
-specific version before loading; this is needed for some vLLM builds
+serving-profile-pinned version before loading; this is needed for some vLLM builds
 that ship with a flashinfer that can't dispatch the NVFP4 MoE backend
 on Blackwell. Pass `--no-flashinfer-upgrade` to skip.
 """
@@ -24,25 +24,71 @@ import sys
 from pathlib import Path
 
 
-def maybe_upgrade_flashinfer(version: str) -> None:
+_DEFAULT_FLASHINFER_PACKAGES = ("flashinfer-python", "flashinfer-cubin")
+
+
+def maybe_upgrade_flashinfer(
+    version: str,
+    *,
+    package_names: tuple[str, ...] = _DEFAULT_FLASHINFER_PACKAGES,
+    env: dict[str, str] | None = None,
+) -> None:
     """Upgrade flashinfer-python and flashinfer-cubin to `version` and
     set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass the AOT-cache pin
     that lags behind PyPI. No-op if already at the target version.
     """
-    os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    for key, value in (env or {"FLASHINFER_DISABLE_VERSION_CHECK": "1"}).items():
+        os.environ.setdefault(key, value)
     try:
         import flashinfer
         if getattr(flashinfer, "__version__", "0.0") == version:
             return
     except ImportError:
         pass
-    print(f"[validate] upgrading flashinfer-python + flashinfer-cubin "
-          f"to {version}", flush=True)
+    package_specs = [f"{name}=={version}" for name in package_names]
+    print(f"[validate] upgrading {', '.join(package_names)} to {version}",
+          flush=True)
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "--upgrade", "-q",
-        f"flashinfer-python=={version}",
-        f"flashinfer-cubin=={version}",
+        *package_specs,
     ])
+
+
+def _flashinfer_runtime_package(target_profile: str):
+    from .serving_profiles import load_serving_profile
+
+    profile = load_serving_profile(target_profile)
+    spec = profile.runtime_package("flashinfer")
+    if spec is None:
+        return (
+            "0.6.8.post1",
+            _DEFAULT_FLASHINFER_PACKAGES,
+            {"FLASHINFER_DISABLE_VERSION_CHECK": "1"},
+        )
+    return (
+        spec.version or "0.6.8.post1",
+        spec.pip_packages or _DEFAULT_FLASHINFER_PACKAGES,
+        spec.env_dict() or {"FLASHINFER_DISABLE_VERSION_CHECK": "1"},
+    )
+
+
+def _resolve_validation_target_profile(
+    model_dir: str | Path,
+    requested: str | None,
+) -> str:
+    """Resolve the serving profile for an exported checkpoint smoke."""
+    from .model_profiles.registry import detect_profile
+    from .serving_profiles import resolve_target_profile
+
+    try:
+        profile = detect_profile(str(model_dir))
+    except Exception:
+        profile = None
+    return resolve_target_profile(
+        profile,
+        requested,
+        default="vllm_packed_moe",
+    )
 
 
 def summarize_quantization_config(cfg_path: Path) -> None:
@@ -64,6 +110,8 @@ def _speculative_config_uses_embedded_mtp(spec: dict) -> bool:
 
 
 def main():
+    from .serving_profiles import serving_profile_names
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True,
                     help="Compressed-tensors checkpoint directory.")
@@ -71,9 +119,15 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=16)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.55)
     ap.add_argument("--max-model-len", type=int, default=2048)
-    ap.add_argument("--flashinfer-version", default="0.6.8.post1",
-                    help="Pinned flashinfer-python + flashinfer-cubin "
-                         "version installed via pip before loading vLLM.")
+    ap.add_argument("--target-profile", default=None,
+                    choices=serving_profile_names(),
+                    help="Serving profile whose runtime package pins should "
+                         "be used for validation preflight. Defaults to the "
+                         "exported model profile's configured serving "
+                         "profile, then vllm_packed_moe.")
+    ap.add_argument("--flashinfer-version", default=None,
+                    help="Override the serving profile's flashinfer package "
+                         "version before loading vLLM.")
     ap.add_argument("--no-flashinfer-upgrade", action="store_true",
                     help="Skip the flashinfer pre-flight upgrade.")
     ap.add_argument("--speculative-config", default=None,
@@ -86,10 +140,19 @@ def main():
                          "forcing eager mode. Use after the eager smoke passes.")
     args = ap.parse_args()
 
-    if not args.no_flashinfer_upgrade:
-        maybe_upgrade_flashinfer(args.flashinfer_version)
-
     model_dir = Path(args.model)
+    target_profile = _resolve_validation_target_profile(
+        model_dir,
+        args.target_profile,
+    )
+    print(f"[validate] target profile: {target_profile}", flush=True)
+
+    if not args.no_flashinfer_upgrade:
+        version, package_names, env = _flashinfer_runtime_package(target_profile)
+        if args.flashinfer_version:
+            version = args.flashinfer_version
+        maybe_upgrade_flashinfer(version, package_names=package_names, env=env)
+
     summarize_quantization_config(model_dir / "config.json")
 
     print(f"[validate] starting vLLM ...", flush=True)

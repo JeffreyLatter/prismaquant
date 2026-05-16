@@ -17,8 +17,8 @@ Each profile captures three kinds of knowledge:
 
 Profiles are picked per-run by `registry.detect_profile(model_path)`
 from HF config + architectures. Unknown architectures fall back to
-`DefaultProfile` which runs the generic path (no fused-sibling
-promotion, no MTP support, plain `model.layers.*` naming).
+`DefaultProfile` which runs the generic path (common fused-sibling
+groups, no MTP support, plain `model.layers.*` naming).
 """
 from __future__ import annotations
 
@@ -48,6 +48,8 @@ class ModelProfile(ABC):
         self._vllm_cls_loaded = False
         self._fused_matcher = None
         self._name_remapper = None
+        self._structure_spec = None
+        self._structure_spec_loaded = False
 
     # ------------------------------------------------------------
     # Identity + match
@@ -106,10 +108,60 @@ class ModelProfile(ABC):
             )
             pm = packed_modules_mapping_from_class(self._vllm_cls)
             if not pm:
-                self._fused_matcher = lambda _qname: None
+                spec = self.structure_spec()
+                if spec is not None and spec.fused_groups:
+                    self._fused_matcher = spec.fused_group_for
+                else:
+                    self._fused_matcher = lambda _qname: None
             else:
                 self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
         return self._fused_matcher(linear_qname)
+
+    def fused_sibling_leaf_mapping(self) -> dict[str, tuple[str, ...]]:
+        """Return fused-module leaf names to their member leaf names.
+
+        This is the structured form of ``fused_sibling_group`` for call sites
+        that need to resolve sidecar artifacts such as h-detail row weights.
+        Prefer vLLM metadata when available, then the declarative
+        model-structure spec.
+        """
+        try:
+            self._ensure_vllm_class()
+            from .vllm_registry import packed_modules_mapping_from_class
+
+            mapping = packed_modules_mapping_from_class(self._vllm_cls)
+            if mapping:
+                return {
+                    str(fused): tuple(str(member) for member in members)
+                    for fused, members in mapping.items()
+                }
+        except Exception:
+            pass
+
+        spec = self.structure_spec()
+        if spec is None:
+            return {}
+        out: dict[str, tuple[str, ...]] = {}
+        for group in getattr(spec, "fused_groups", ()):
+            target_suffix = str(group.target_suffix)
+            if "." not in target_suffix:
+                continue
+            target_parent, target_leaf = target_suffix.rsplit(".", 1)
+            members: list[str] = []
+            valid = True
+            for member in group.member_suffixes:
+                member = str(member)
+                if "." not in member:
+                    valid = False
+                    break
+                member_parent, member_leaf = member.rsplit(".", 1)
+                if member_parent != target_parent:
+                    valid = False
+                    break
+                members.append(member_leaf)
+            if valid and members:
+                out[target_leaf] = tuple(members)
+        return out
 
     # ------------------------------------------------------------
     # MoE packing
@@ -118,6 +170,9 @@ class ModelProfile(ABC):
         """Parameter attribute names (on a `*Experts` module) that hold
         3D packed MoE weight tensors. Union across all known architectures
         is a safe default; specific profiles can narrow."""
+        spec = self.structure_spec()
+        if spec is not None and spec.packed_experts.declared:
+            return frozenset(spec.packed_experts.param_names)
         return frozenset({
             "gate_up_proj", "down_proj",   # Qwen3.5 / 3.6
             "w1", "w2", "w3",              # Mixtral
@@ -153,6 +208,9 @@ class ModelProfile(ABC):
         dispatch time. Added to the config_groups catch-all so every
         per-expert per-projection tensor picks up the catch-all format
         without ~30k explicit targets."""
+        spec = self.structure_spec()
+        if spec is not None and spec.per_expert_moe_regex:
+            return spec.per_expert_moe_regex
         return None
 
     # ------------------------------------------------------------
@@ -198,6 +256,9 @@ class ModelProfile(ABC):
     def per_expert_mtp_regex(self) -> str | None:
         """Regex matching MTP per-expert Linear qnames at scheme dispatch.
         Returns None if no MoE MTP in this architecture."""
+        spec = self.structure_spec()
+        if spec is not None and spec.per_expert_mtp_regex:
+            return spec.per_expert_mtp_regex
         return None
 
     # ------------------------------------------------------------
@@ -227,6 +288,11 @@ class ModelProfile(ABC):
             )
             prefix = hf_to_vllm_prefix_map_from_class(self._vllm_cls)
             self._name_remapper = name_remapper_from_prefix_map(prefix)
+        spec = self.structure_spec()
+        if spec is not None and spec.recipe_to_vllm:
+            mapped = spec.rewrite_recipe_to_vllm(checkpoint_name)
+            if mapped != checkpoint_name:
+                return mapped
         return self._name_remapper(checkpoint_name)
 
     def source_tensor_name(self, model_qname: str) -> str:
@@ -238,7 +304,19 @@ class ModelProfile(ABC):
         (`model.language_model.layers.X.*`) that vLLM expects.
 
         Default: identity. Multimodal architectures override."""
+        spec = self.structure_spec()
+        if spec is not None and spec.recipe_to_source:
+            return spec.rewrite_recipe_to_source(model_qname)
         return model_qname
+
+    def export_tensor_name(self, model_qname: str) -> str:
+        """Rewrite an emitted tensor key to the checkpoint key to write.
+
+        This usually matches ``source_tensor_name``. Profiles may override
+        when source-checkpoint lookup and export-load naming intentionally
+        differ because the serving runtime performs its own loader remap.
+        """
+        return self.source_tensor_name(model_qname)
 
     def live_to_recipe_name(self, live_qname: str) -> str:
         """Map a live HF-module qname (from `named_modules()` on the
@@ -253,6 +331,9 @@ class ModelProfile(ABC):
         infix so the allocator's assignment dict lookups succeed.
 
         Default: identity. Multimodal architectures override."""
+        spec = self.structure_spec()
+        if spec is not None and spec.live_to_recipe:
+            return spec.rewrite_live_to_recipe(live_qname)
         return live_qname
 
     def on_disk_expert_qname(self, live_hf_qname: str) -> str:
@@ -297,7 +378,116 @@ class ModelProfile(ABC):
         When True, the exporter splits along the row dim (gate/up
         halves for `gate_up_proj`) and emits per-expert 2D tensors
         named `<parent>.{expert_id}.{proj_name}.weight[.suffix]`."""
+        spec = self.structure_spec()
+        if spec is not None:
+            decision = spec.split_packed_experts_for_format(fmt)
+            if decision is not None:
+                return decision
         return fmt != "BF16"
+
+    def packed_expert_projection_names(self, param_name: str) -> tuple[str, ...]:
+        """Per-expert projection names emitted when a packed 3D parameter
+        is split on disk.
+
+        Declarative specs own the model-specific decomposition. The legacy
+        fallback keeps older profiles working until they are migrated.
+        """
+        spec = self.structure_spec()
+        if spec is not None and spec.packed_experts.declared:
+            return spec.packed_expert_projection_names(param_name)
+        if param_name == "gate_up_proj":
+            return ("gate_proj", "up_proj")
+        return (str(param_name),)
+
+    def packed_expert_parent_for_projection(
+        self,
+        projection_name: str,
+    ) -> str | None:
+        """Inverse of :meth:`packed_expert_projection_names` for
+        per-expert source keys such as ``experts.7.gate_proj``.
+        """
+        spec = self.structure_spec()
+        if spec is not None and spec.packed_experts.declared:
+            return spec.packed_expert_parent_for_projection(projection_name)
+        if projection_name in {"gate_proj", "up_proj"}:
+            return "gate_up_proj"
+        if projection_name == "down_proj":
+            return "down_proj"
+        if projection_name in self.packed_expert_param_names():
+            return projection_name
+        return None
+
+    def _fallback_packed_expert_format_groups(self) -> tuple[tuple[str, ...], ...]:
+        """Common legacy packed-MoE coupling groups for profiles without specs.
+
+        This keeps pre-spec profiles working while preserving the boundary:
+        the solver asks the profile for groups; it does not parse model names
+        itself. New model families should declare ``packed_experts`` format
+        groups in the JSON structure spec instead of depending on this fallback.
+        """
+        return (
+            ("gate_up_proj", "down_proj"),
+            ("gate_proj", "up_proj", "down_proj"),
+            ("w1", "w2", "w3"),
+        )
+
+    def _packed_expert_group_matches_representation(
+        self,
+        group: tuple[str, ...],
+        *,
+        split_per_expert: bool,
+    ) -> bool:
+        packed_names = set(self.packed_expert_param_names())
+        if split_per_expert:
+            return not any(
+                member in packed_names
+                and self.packed_expert_projection_names(member) != (member,)
+                for member in group
+            )
+        return not any(
+            member not in packed_names
+            and self.packed_expert_parent_for_projection(member) is not None
+            for member in group
+        )
+
+    def packed_expert_format_group(self, qname: str) -> str | None:
+        """Return a group key for packed-expert projections that must
+        share one serving format.
+
+        This is the model/profile side of vLLM FusedMoE scheme coupling.
+        The allocator asks the profile for this key instead of hardcoding
+        Qwen/Gemma expert path regexes in the solver.
+        """
+        spec = self.structure_spec()
+        if spec is not None:
+            return spec.packed_expert_format_group(qname)
+        parts = str(qname).split(".")
+        try:
+            experts_idx = len(parts) - 1 - list(reversed(parts)).index("experts")
+        except ValueError:
+            return None
+        tail = parts[experts_idx + 1:]
+        if len(tail) == 1:
+            parent = ".".join(parts[:experts_idx + 1])
+            leaf = tail[0]
+            split_per_expert = False
+        elif len(tail) == 2 and tail[0].isdigit():
+            parent = ".".join(parts[:experts_idx + 2])
+            leaf = tail[1]
+            split_per_expert = True
+        else:
+            return None
+
+        for group in self._fallback_packed_expert_format_groups():
+            if leaf not in group:
+                continue
+            if not self._packed_expert_group_matches_representation(
+                group,
+                split_per_expert=split_per_expert,
+            ):
+                continue
+            return f"{parent}::__packed_format__:{','.join(group)}"
+        return None
 
     # ------------------------------------------------------------
     # Source passthrough + text-only staging
@@ -306,12 +496,25 @@ class ModelProfile(ABC):
         """Prefixes of checkpoint keys that should be copied from the
         source checkpoint as-is (typically visual encoder + MTP when
         not being quantized)."""
+        spec = self.structure_spec()
+        if spec is not None and spec.passthrough_prefixes:
+            return spec.passthrough_prefixes
         return ()
+
+    def serving_profile_id(self) -> str | None:
+        """Default serving/backend constraint profile for this model family."""
+        spec = self.structure_spec()
+        if spec is not None:
+            return spec.default_serving_profile
+        return None
 
     def stage_text_only_strip_keys(self) -> tuple[str, ...]:
         """HF config keys to drop when creating a text-only staged
         config for probe/cost model loading (e.g. `vision_config` on
         multimodal models so `AutoModelForCausalLM` can load)."""
+        spec = self.structure_spec()
+        if spec is not None and spec.stage_text_only_strip_keys is not None:
+            return spec.stage_text_only_strip_keys
         return ("vision_config", "audio_config", "speech_config")
 
     def stage_text_only_promote_inner_model_type(self) -> bool:
@@ -336,6 +539,12 @@ class ModelProfile(ABC):
 
         Default False (Qwen-like). Families that take a standalone
         text config class override to True."""
+        spec = self.structure_spec()
+        if (
+            spec is not None
+            and spec.stage_text_only_promote_inner_model_type is not None
+        ):
+            return bool(spec.stage_text_only_promote_inner_model_type)
         return False
 
     # ------------------------------------------------------------
@@ -356,7 +565,6 @@ class ModelProfile(ABC):
         with open(src_cfg_path) as f:
             cfg = json.load(f)
         text_cfg = cfg.get("text_config", cfg)
-        vis_cfg = cfg.get("vision_config", {})
 
         regexes: list[str] = []
         if include_body:
@@ -368,12 +576,21 @@ class ModelProfile(ABC):
         if include_mtp and self.has_mtp():
             n_mtp = int(self.mtp_layer_count(cfg) or 0)
             if n_mtp > 0:
-                regexes.extend(
+                mtp_regexes = (
                     _build_layer_shard_regexes(n_mtp, layers_per_shard,
                                                layer_prefix=self.mtp_layer_prefix()))
-        if include_visual and self.visual_config_key():
-            n_vis = int(vis_cfg.get("depth")
-                        or vis_cfg.get("num_hidden_layers") or 0)
+                if mtp_regexes and self.mtp_extra_linear_names():
+                    extra = "|".join(
+                        re.escape(name) for name in self.mtp_extra_linear_names()
+                    )
+                    mtp_regexes[0] = rf"(?:{extra}|{mtp_regexes[0]})"
+                regexes.extend(mtp_regexes)
+        visual_key = self.visual_config_key()
+        if include_visual and visual_key:
+            vis_cfg = cfg.get(visual_key, {})
+            n_vis = int(
+                vis_cfg.get("depth") or vis_cfg.get("num_hidden_layers") or 0
+            )
             if n_vis > 0:
                 regexes.extend(
                     _build_layer_shard_regexes(n_vis,
@@ -386,24 +603,46 @@ class ModelProfile(ABC):
     def body_layer_prefix(self) -> str:
         """Prefix used for body-layer names in the checkpoint (before
         the numeric index)."""
+        spec = self.structure_spec()
+        if spec is not None and spec.body_layer_prefix is not None:
+            return spec.body_layer_prefix
         return "model.layers"
 
     def mtp_layer_prefix(self) -> str:
         """Prefix used for MTP-layer names in the checkpoint."""
+        spec = self.structure_spec()
+        if spec is not None and spec.mtp_layer_prefix is not None:
+            return spec.mtp_layer_prefix
         return "mtp.layers"
+
+    def mtp_extra_linear_names(self) -> tuple[str, ...]:
+        """Top-level MTP Linear qnames to include in the first MTP shard."""
+        spec = self.structure_spec()
+        if spec is not None:
+            return tuple(spec.mtp_extra_linear_names)
+        return ("mtp.fc",)
 
     def visual_layer_prefix(self) -> str | None:
         """Prefix used for visual-encoder block names, or None if this
         model has no visual encoder."""
+        spec = self.structure_spec()
+        if spec is not None and spec.visual_layer_prefix is not None:
+            return spec.visual_layer_prefix
         return None
 
     def visual_config_key(self) -> str | None:
         """Top-level HF config key under which the vision_config dict
         lives, or None if this model has no visual encoder."""
+        spec = self.structure_spec()
+        if spec is not None and spec.visual_config_key is not None:
+            return spec.visual_config_key
         return None
 
     def lm_head_name(self) -> str:
         """Qualified name of the lm_head Linear in the checkpoint."""
+        spec = self.structure_spec()
+        if spec is not None and spec.lm_head_name is not None:
+            return spec.lm_head_name
         return "lm_head"
 
     def mtp_layer_count(self, cfg: dict) -> int:
@@ -529,7 +768,14 @@ class ModelProfile(ABC):
         Profiles may also use this to skip e.g. router gates that
         shouldn't carry Fisher info."""
         import torch.nn as _nn
-        return isinstance(mod, _nn.Linear)
+        if not isinstance(mod, _nn.Linear):
+            return False
+        spec = self.structure_spec()
+        if spec is not None:
+            skipped = set(spec.probe_skip_module_class_names)
+            if type(mod).__name__ in skipped:
+                return False
+        return True
 
     def register_vendored_modeling(self) -> None:
         """Called once when this profile is instantiated by
@@ -537,6 +783,35 @@ class ModelProfile(ABC):
         code (DSv4) use this to install monkey-patches and register
         with AutoConfig / AutoModelForCausalLM. Default: no-op."""
         pass
+
+    # ------------------------------------------------------------
+    # Declarative structure graph
+    # ------------------------------------------------------------
+    def structure_spec(self):
+        """Return this profile's declarative structure spec, if present.
+
+        The spec is an additive, no-behavior-change description of naming,
+        grouping, passthrough, and decomposition rules.  Existing production
+        paths continue to use the executable profile methods until call sites
+        explicitly opt into a ``ModelGraph``.
+        """
+        from .structure import load_structure_spec
+
+        if not self._structure_spec_loaded:
+            self._structure_spec = load_structure_spec(self.name)
+            self._structure_spec_loaded = True
+        return self._structure_spec
+
+    def build_model_graph(self, model):
+        """Build a typed graph from a live model using this profile.
+
+        This is intentionally not called from hot paths yet.  It provides a
+        single graph artifact for future allocator/cache/export migration while
+        preserving the current cache and prefetch implementations.
+        """
+        from .structure import build_model_graph
+
+        return build_model_graph(model, self, spec=self.structure_spec())
 
 
 # ---------------------------------------------------------------------------

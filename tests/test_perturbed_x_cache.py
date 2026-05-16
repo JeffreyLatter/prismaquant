@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytest
 
 from prismaquant import format_registry as fr
 from prismaquant.perturbed_x_cache import (
@@ -12,6 +13,8 @@ from prismaquant.perturbed_x_cache import (
     capture_perturbed_activation_cache,
     stage_text_only_under_work_root,
 )
+from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
+from prismaquant.production_weight_cache import ProductionWeightCache
 
 
 class _TwoLinear(nn.Module):
@@ -74,6 +77,20 @@ class _SiblingInputModel(nn.Module):
         return self.self_attn.q_proj(x) + self.self_attn.k_proj(x)
 
 
+class _QwenLiveNameModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.layers = nn.ModuleList([nn.Module()])
+        layer = self.model.language_model.layers[0]
+        layer.mlp = nn.Module()
+        layer.mlp.gate_proj = nn.Linear(64, 64, bias=False)
+
+    def forward(self, x):
+        return self.model.language_model.layers[0].mlp.gate_proj(x)
+
+
 def test_perturbed_cache_shares_row_subsample_for_fused_siblings(tmp_path):
     model = _SiblingInputModel().eval()
     x = torch.arange(320, dtype=torch.float32).reshape(1, 5, 64)
@@ -91,6 +108,29 @@ def test_perturbed_cache_shares_row_subsample_for_fused_siblings(tmp_path):
     k_rows = _load_cache(tmp_path, "self_attn.k_proj")
     assert q_rows.shape == (2, 64)
     torch.testing.assert_close(q_rows, k_rows)
+
+
+def test_perturbed_cache_uses_profile_live_to_recipe_names(tmp_path):
+    model = _QwenLiveNameModel().eval()
+    x = torch.randn(2, 64)
+
+    manifest = capture_perturbed_activation_cache(
+        model,
+        {"model.layers.0.mlp.gate_proj": "BF16"},
+        x,
+        tmp_path,
+        input_rows=4,
+        profile=Qwen3_5Profile(),
+    )
+
+    assert manifest["missing"] == []
+    assert manifest["written"] == ["model.layers.0.mlp.gate_proj"]
+    torch.testing.assert_close(
+        _load_cache(tmp_path, "model.layers.0.mlp.gate_proj"),
+        x,
+        rtol=0.01,
+        atol=0.01,
+    )
 
 
 def test_perturbed_cache_can_skip_activation_quant_for_probe(tmp_path, monkeypatch):

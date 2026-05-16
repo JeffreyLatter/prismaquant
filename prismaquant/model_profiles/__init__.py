@@ -4,11 +4,13 @@ Exports:
   - ModelProfile: abstract base class
   - DefaultProfile: generic fallback
   - Qwen3Profile: covers Qwen3 dense (0.6B-32B)
+  - Qwen3MoeProfile: covers Qwen3 MoE
   - Qwen3_5Profile: covers Qwen3.5 and Qwen3.6 MoE (w/ MTP)
   - Qwen3NextProfile: covers Qwen3-Coder-Next (hybrid DeltaNet + sparse MoE)
   - Gemma4Profile: covers Gemma 4 dense + MoE multimodal
   - detect_profile(model_path): auto-detect profile from HF config
   - register_profile(cls): register a custom profile at runtime
+  - ModelGraph / ModelStructureSpec: typed model decomposition artifacts
 
 MiniMaxM2Profile was archived 2026-04-24; see archive/minimax_m2p7/README.md.
 """
@@ -26,12 +28,21 @@ from .registry import (
     profile_from_model,
     register_profile,
 )
+from .structure import (
+    ModelGraph,
+    ModelStructureSpec,
+    ModelTensor,
+    OptimizationUnit,
+    build_model_graph,
+    load_structure_spec,
+)
 
 __all__ = [
     "ModelProfile",
     "DefaultProfile",
     "DeepseekV4Profile",
     "Qwen3Profile",
+    "Qwen3MoeProfile",
     "Qwen3_5Profile",
     "Qwen3_5DenseProfile",
     "Qwen3NextProfile",
@@ -40,4 +51,10 @@ __all__ = [
     "profile_from_config",
     "profile_from_model",
     "register_profile",
+    "ModelGraph",
+    "ModelStructureSpec",
+    "ModelTensor",
+    "OptimizationUnit",
+    "build_model_graph",
+    "load_structure_spec",
 ]

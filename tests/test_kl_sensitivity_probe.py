@@ -30,7 +30,11 @@ from prismaquant.kl_sensitivity_probe import (
     _replay_cache_window_size,
     solve_multi_choice_frontier,
 )
-from prismaquant.kl_measurement import measure_assignment_kl, resolve_kl_scope
+from prismaquant.kl_measurement import (
+    measure_assignment_kl,
+    resolve_kl_scope,
+    select_formats_for_l3,
+)
 from prismaquant.model_profiles import Qwen3Profile
 from prismaquant.production_weight_cache import ProductionWeightCache
 
@@ -153,7 +157,7 @@ def test_format_applicability_positive_and_negative_cases():
         fr.get_format("MXFP4"),
         qname="model.layers.0.self_attn.q_proj",
         source_kind="bf16",
-        target_profile="vllm_qwen3_5_packed_moe",
+        target_profile="vllm_packed_moe",
     )
     assert not profile_bad.legal
     assert profile_bad.reason == "profile_mismatch"
@@ -177,6 +181,42 @@ def test_format_applicability_positive_and_negative_cases():
     )
     assert not source_unknown.legal
     assert source_unknown.reason == "source_dtype_mismatch"
+
+
+def test_l3_format_selection_respects_target_profile():
+    stats = {
+        "model.layers.0.self_attn.o_proj": {
+            "h_trace": 1.0,
+            "n_params": 128 * 128,
+            "in_features": 128,
+            "out_features": 128,
+        },
+    }
+    costs = {
+        "model.layers.0.self_attn.o_proj": {
+            "MXFP4": {"weight_mse": 0.01},
+            "BF16": {"weight_mse": 0.0},
+        },
+    }
+    assignment = {"model.layers.0.self_attn.o_proj": "MXFP4"}
+    specs = [fr.get_format("MXFP4"), fr.get_format("BF16")]
+
+    assert select_formats_for_l3(
+        stats,
+        costs,
+        assignment,
+        "model.layers.0.self_attn.o_proj",
+        specs,
+        target_profile="research",
+    ) == ("MXFP4", "BF16")
+    assert select_formats_for_l3(
+        stats,
+        costs,
+        assignment,
+        "model.layers.0.self_attn.o_proj",
+        specs,
+        target_profile="vllm_packed_moe",
+    ) == ()
 
 
 def test_multi_choice_frontier_finds_non_greedy_knapsack_optimum():

@@ -45,10 +45,10 @@ from prismaquant.kl_measurement import (
     measure_lane_batched_kl_deltas,
     measure_override_set_kl,
 )
-from prismaquant.production_weight_cache import (
-    PRISMACLIP_FORMAT,
-    ProductionWeightCacheVariantView,
-    fill_production_weight_cache,
+from prismaquant.production_weight_cache import fill_production_weight_cache
+from prismaquant.serving_profiles import (
+    resolve_target_profile,
+    serving_profile_names,
 )
 from prismaquant.source_prefetch import prefetch_safetensors_checkpoint
 
@@ -220,10 +220,14 @@ def _is_pinned(qname: str, pins: set[str]) -> bool:
     return any(pin == qname or pin in tokens or qname.endswith(pin) for pin in pins)
 
 
-def _linear_targets(model: nn.Module, pins: set[str]) -> list[LinearTarget]:
+def _linear_targets(
+    model: nn.Module,
+    pins: set[str],
+    profile=None,
+) -> list[LinearTarget]:
     targets: list[LinearTarget] = []
     seen: set[str] = set()
-    for full_name, module, attr in iter_quantizable_tensors(model):
+    for full_name, module, attr in iter_quantizable_tensors(model, profile):
         if attr != "weight" or not isinstance(module, nn.Linear):
             continue
         qname = full_name[:-7] if full_name.endswith(".weight") else full_name
@@ -264,35 +268,52 @@ def _parse_levers(value: str | None) -> dict[str, bool]:
 
 def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
     levers = _parse_levers(value)
+    default_optional_levers = not bool(levers.pop("none", False))
+    if not default_optional_levers:
+        for name in (
+            "gptq",
+            "scale_sweep",
+            "fisher_gptq",
+            "static_act_order",
+            "joint_scale_opt",
+        ):
+            levers.setdefault(name, False)
     levers.setdefault("gptq", True)
     levers.setdefault(
         "gptq_damp_sweep",
         bool(levers.get("gptq", True))
         and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
     )
-    levers.setdefault("scale_sweep", True)
-    levers.setdefault("awq", False)
-    levers.setdefault("awq_round", False)
+    levers.setdefault("scale_sweep", False)
     levers.setdefault(
-        "act_clip_solver",
-        os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER", "0").strip().lower()
+        "static_act_order",
+        os.environ.get("PRISMAQUANT_GPTQ_STATIC_ACT_ORDER", "0").strip().lower()
         not in {"", "0", "false", "no", "off"},
     )
+    levers.setdefault(
+        "joint_scale_opt",
+        os.environ.get("PRISMAQUANT_NVFP4_JOINT_SCALE_OPT", "0").strip().lower()
+        not in {"", "0", "false", "no", "off"},
+    )
+    if not bool(levers.get("gptq", True)):
+        levers["static_act_order"] = False
+        levers["joint_scale_opt"] = False
     levers.setdefault(
         "fisher_gptq",
         os.environ.get("PRISMAQUANT_FISHER_WEIGHTED_GPTQ", "0").strip().lower()
         not in {"", "0", "false", "no", "off"},
     )
-    levers.setdefault(
-        "fisher_clip",
-        os.environ.get("PRISMAQUANT_PRISMAFISHERCLIP", "0").strip().lower()
-        not in {"", "0", "false", "no", "off"}
-        or os.environ.get("PRISMAQUANT_ACT_CLIP_SOLVER_FISHER", "0").strip().lower()
-        not in {"", "0", "false", "no", "off"},
+    from prismaquant.export_native_compressed import (
+        NVFP4_SCALE_RULE_ENV,
+        NVFP4_SCALE_RULE_JOINT_MSE,
+        resolve_nvfp4_scale_rule,
     )
-    if bool(levers.get("fisher_clip", False)):
-        levers["act_clip_solver"] = True
-    from prismaquant.export_native_compressed import resolve_nvfp4_scale_rule
+    if (
+        bool(levers.get("joint_scale_opt", False))
+        and "nvfp4_scale_rule" not in levers
+        and NVFP4_SCALE_RULE_ENV not in os.environ
+    ):
+        levers["nvfp4_scale_rule"] = NVFP4_SCALE_RULE_JOINT_MSE
     levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
     return dict(sorted(levers.items()))
 
@@ -443,28 +464,20 @@ def _validate_production_cache_metadata(
 def _production_cache_formats(
     requested_formats: Sequence[str],
     floor_format: str,
-    *,
-    include_prismaclip: bool = False,
 ) -> list[str]:
     formats = {
         _production_cache_canonical_format(fmt)
         for fmt in [*requested_formats, floor_format]
     }
-    if include_prismaclip and "NVFP4" in formats:
-        formats.add(PRISMACLIP_FORMAT)
     return sorted(fmt for fmt in formats if fmt != "BF16")
 
 
 def _production_cache_canonical_format(fmt: str) -> str:
-    fmt_u = str(fmt).strip().upper()
-    if fmt_u == PRISMACLIP_FORMAT:
-        return PRISMACLIP_FORMAT
-    return fr.canonical_format_name(fmt_u)
+    return fr.canonical_format_name(str(fmt).strip().upper())
 
 
 def _production_cache_runtime_format(fmt: str) -> str:
-    fmt_u = _production_cache_canonical_format(fmt)
-    return "NVFP4" if fmt_u == PRISMACLIP_FORMAT else fmt_u
+    return _production_cache_canonical_format(fmt)
 
 
 def _production_cache_qnames(
@@ -521,13 +534,7 @@ def _prepare_production_weight_cache(
     if args.candidate_recipe == "raw":
         return None, diag
 
-    formats = _production_cache_formats(
-        requested_formats,
-        floor_format,
-        include_prismaclip=bool(
-            getattr(args, "_prismaclip_candidate_enabled", False)
-        ),
-    )
+    formats = _production_cache_formats(requested_formats, floor_format)
     diag["formats"] = list(formats)
     if not formats:
         return None, diag
@@ -1143,9 +1150,9 @@ def _load_floor_assignment_override(
 
     The normal ``--floor-format`` path builds a model-wide baseline.  For
     production-faithful follow-up probes we need an existing layer_config to be
-    the effective floor before production-cache fill, KL measurement, and
-    PrismaClip cache-variant gating.  Reuse the seed-assignment normalizer so
-    pins, fused siblings, and format legality stay identical.
+    the effective floor before production-cache fill and KL measurement. Reuse
+    the seed-assignment normalizer so pins, fused siblings, and format legality
+    stay identical.
     """
     assignment_path = Path(path).expanduser()
     try:
@@ -1911,190 +1918,6 @@ def measure_candidate_overrides(
     ordered_values = [total / max(count, 1) for total in totals]
     return [ordered_values[inverse[idx]] for idx in range(len(inverse))]
 
-
-def _measure_prismaclip_variant_gate(
-    model: nn.Module,
-    floor_assignment: Mapping[str, str],
-    *,
-    floor_kl: float,
-    targets: Sequence[LinearTarget],
-    profile,
-    production_weight_cache,
-    calib_ids: torch.Tensor,
-    ref_log_probs: Sequence[torch.Tensor],
-    work_root: Path,
-    args: argparse.Namespace,
-    dtype: torch.dtype,
-    calib_microbatch_size: int,
-    use_cuda_graphs: bool,
-) -> tuple[float, object | None, dict[str, str], dict[str, object]]:
-    """Directly KL-gate internal PrismaClip cache variants.
-
-    Runtime assignments stay at NVFP4.  A candidate lane may instead read the
-    rendered PrismaClip cache key for that qname.  Only qnames whose individual
-    proposal improves KL, and whose combined floor also improves KL, survive
-    into the returned cache view.
-    """
-    diag: dict[str, object] = {
-        "enabled": bool(getattr(args, "_prismaclip_candidate_enabled", False)),
-        "internal_cache_format": PRISMACLIP_FORMAT,
-        "candidate_count": 0,
-        "measured_count": 0,
-        "accepted_individual_count": 0,
-        "adopted": False,
-        "unclipped_floor_kl": float(floor_kl),
-        "clipped_floor_kl": None,
-        "accepted_qnames": [],
-        "skipped_units": {},
-        "units": [],
-    }
-    if not diag["enabled"] or production_weight_cache is None:
-        return float(floor_kl), production_weight_cache, {}, diag
-
-    candidate_overrides: list[dict[str, str]] = []
-    candidate_cache_overrides: list[dict[str, str]] = []
-    units: list[tuple[str, tuple[str, ...]]] = []
-    skipped: Counter[str] = Counter()
-    for unit, members in _members_by_decision_unit(targets, profile).items():
-        baseline_formats = {
-            fr.canonical_format_name(floor_assignment.get(member, "BF16"))
-            for member in members
-        }
-        if baseline_formats != {"NVFP4"}:
-            skipped["non_nvfp4_floor"] += 1
-            continue
-        missing_variant = [
-            member for member in members
-            if production_weight_cache.resolve_key(member, PRISMACLIP_FORMAT) is None
-        ]
-        if missing_variant:
-            skipped["missing_prismaclip_cache"] += 1
-            continue
-        units.append((unit, members))
-        candidate_overrides.append({member: "NVFP4" for member in members})
-        candidate_cache_overrides.append({
-            member: PRISMACLIP_FORMAT for member in members
-        })
-
-    diag["candidate_count"] = int(len(candidate_overrides))
-    diag["skipped_units"] = dict(sorted(skipped.items()))
-    if not candidate_overrides:
-        print(
-            "[kl-probe] PrismaClip candidate gate found no eligible "
-            "NVFP4 units with clipped cache entries",
-            flush=True,
-        )
-        return float(floor_kl), production_weight_cache, {}, diag
-
-    print(
-        "[kl-probe] measuring PrismaClip cache-variant proposals "
-        f"units={len(candidate_overrides)}",
-        flush=True,
-    )
-    candidate_kls = measure_candidate_overrides(
-        model,
-        floor_assignment,
-        candidate_overrides,
-        calib_ids,
-        ref_log_probs,
-        work_root=work_root,
-        profile=profile,
-        kl_scope=args.kl_scope,
-        max_lanes_per_batch=args.max_lanes_per_batch,
-        calib_microbatch_size=calib_microbatch_size,
-        include_activation_quant=not args.no_activation_quant,
-        use_cuda_graphs=use_cuda_graphs,
-        use_tail_replay=not args.no_tail_replay,
-        replay_cache_window=args.replay_cache_window,
-        replay_cache_max_gb=float(args.replay_cache_max_gb),
-        replay_cache_max_effective_batch=int(args.replay_cache_max_effective_batch),
-        dtype=dtype,
-        production_weight_cache=production_weight_cache,
-        source_weight_resolver=None,
-        candidate_cache_overrides=candidate_cache_overrides,
-    )
-    diag["measured_count"] = int(len(candidate_kls))
-    accepted_variants: dict[str, str] = {}
-    unit_rows: list[dict[str, object]] = []
-    for (unit, members), candidate_kl in zip(units, candidate_kls):
-        gain = float(floor_kl - float(candidate_kl))
-        accepted = bool(math.isfinite(float(candidate_kl)) and gain > 0.0)
-        if accepted:
-            for member in members:
-                accepted_variants[member] = PRISMACLIP_FORMAT
-        unit_rows.append({
-            "unit": unit,
-            "members": list(members),
-            "candidate_kl": float(candidate_kl),
-            "gain": gain,
-            "accepted_individual": accepted,
-        })
-    diag["units"] = unit_rows
-    diag["accepted_individual_count"] = int(len(accepted_variants))
-    if not accepted_variants:
-        print(
-            "[kl-probe] PrismaClip candidate gate accepted no individual "
-            "cache variants",
-            flush=True,
-        )
-        return float(floor_kl), production_weight_cache, {}, diag
-
-    variant_view = ProductionWeightCacheVariantView(
-        production_weight_cache,
-        accepted_variants,
-    )
-    if getattr(variant_view, "_prismaquant_prefetch_policy", "batch") != "none":
-        variant_view.prefetch_assignment(
-            floor_assignment,
-            require=False,
-            progress=True,
-            log_prefix="[kl-probe][prismaclip]",
-        )
-    print(
-        "[kl-probe] measuring combined PrismaClip accepted floor "
-        f"qnames={len(accepted_variants)}",
-        flush=True,
-    )
-    clipped_floor_kl = measure_assignment_kl(
-        model,
-        floor_assignment,
-        calib_ids,
-        ref_log_probs,
-        work_root=work_root,
-        profile=profile,
-        use_frozen_weight_cache=True,
-        rng_seed=0,
-        kl_scope=args.kl_scope,
-        include_activation_quant=not args.no_activation_quant,
-        stream_ref_log_probs=args.kl_scope == "full_sequence",
-        use_cuda_graphs=bool(args.enable_cuda_graphs),
-        production_weight_cache=variant_view,
-    )
-    diag["clipped_floor_kl"] = float(clipped_floor_kl)
-    if float(clipped_floor_kl) < float(floor_kl):
-        diag["adopted"] = True
-        diag["accepted_qnames"] = sorted(accepted_variants)
-        print(
-            "[kl-probe] adopted PrismaClip cache variants: "
-            f"floor_kl {floor_kl:.8g} -> {clipped_floor_kl:.8g} "
-            f"qnames={len(accepted_variants)}",
-            flush=True,
-        )
-        return (
-            float(clipped_floor_kl),
-            variant_view,
-            dict(sorted(accepted_variants.items())),
-            diag,
-        )
-
-    print(
-        "[kl-probe] discarded PrismaClip cache variants after combined "
-        f"floor check: {floor_kl:.8g} -> {clipped_floor_kl:.8g}",
-        flush=True,
-    )
-    return float(floor_kl), production_weight_cache, {}, diag
-
-
 def _candidate_group_sort_key(candidate_meta: Sequence[CandidateMeta], idx: int) -> tuple:
     unit, members, _member_targets, fmt, _baseline_bits, bits_total = candidate_meta[idx]
     depths = [layer_depth(member) for member in members]
@@ -2795,6 +2618,12 @@ def run_probe(args: argparse.Namespace) -> dict:
         profile = detect_profile(args.model)
     except Exception:
         profile = DefaultProfile()
+    args.target_profile = resolve_target_profile(profile, args.target_profile)
+    if args.target_profile not in serving_profile_names():
+        raise SystemExit(
+            f"[kl-probe] ERROR: unknown target profile {args.target_profile!r}"
+        )
+    print(f"[kl-probe] target_profile={args.target_profile}", flush=True)
 
     pins = _parse_pins(args.pin)
     floor_format = fr.canonical_format_name(args.floor_format)
@@ -2805,28 +2634,9 @@ def run_probe(args: argparse.Namespace) -> dict:
             [*requested_specs, floor_spec],
             key=lambda spec: (spec.effective_bits, spec.name),
         )
-    prismaclip_candidate_requested = bool(getattr(args, "prismaclip_candidates", False))
-    prismaclip_candidate_enabled = False
-    if prismaclip_candidate_requested:
-        if floor_format != "NVFP4":
-            print(
-                "[kl-probe] --prismaclip-candidates ignored because "
-                f"--floor-format is {floor_format}, not NVFP4",
-                flush=True,
-            )
-        elif args.candidate_recipe != "production":
-            print(
-                "[kl-probe] --prismaclip-candidates ignored because "
-                "--candidate-recipe=raw cannot render production PrismaClip "
-                "weights",
-                flush=True,
-            )
-        else:
-            prismaclip_candidate_enabled = True
-    setattr(args, "_prismaclip_candidate_enabled", prismaclip_candidate_enabled)
     requested_formats = [fr.canonical_format_name(spec.name) for spec in requested_specs]
 
-    targets = _linear_targets(model, pins)
+    targets = _linear_targets(model, pins, profile)
     if args.target_offset:
         targets = targets[max(int(args.target_offset), 0):]
     if args.max_targets is not None:
@@ -2976,27 +2786,6 @@ def run_probe(args: argparse.Namespace) -> dict:
     )
     print(f"[kl-probe] floor_kl={floor_kl:.8g}", flush=True)
     phase_boundary_memory_cleanup("after_floor_kl")
-
-    floor_kl, production_weight_cache, chosen_cache_variants, prismaclip_diag = (
-        _measure_prismaclip_variant_gate(
-            model,
-            floor_assignment,
-            floor_kl=float(floor_kl),
-            targets=targets,
-            profile=profile,
-            production_weight_cache=production_weight_cache,
-            calib_ids=calib_ids,
-            ref_log_probs=ref_log_probs,
-            work_root=work_root,
-            args=args,
-            dtype=dtype,
-            calib_microbatch_size=chosen_calib_micro,
-            use_cuda_graphs=candidate_cuda_graphs,
-        )
-    )
-    if prismaclip_diag.get("adopted"):
-        print(f"[kl-probe] effective_floor_kl={floor_kl:.8g}", flush=True)
-        phase_boundary_memory_cleanup("after_prismaclip_gate")
 
     weight_session = None
     weight_session_diag: dict[str, object] = {
@@ -3403,12 +3192,6 @@ def run_probe(args: argparse.Namespace) -> dict:
         profile,
         label="chosen_assignment",
     )
-    final_cache_variants = {
-        str(qname): str(fmt)
-        for qname, fmt in chosen_cache_variants.items()
-        if fr.canonical_format_name(chosen_assignment.get(qname, "BF16")) == "NVFP4"
-    }
-
     row_json = [
         row.to_json(decision_unit=unit_for_qname.get(row.qname))
         for row in rows
@@ -3441,7 +3224,6 @@ def run_probe(args: argparse.Namespace) -> dict:
             "assignment_hash": _assignment_digest(floor_assignment),
             "assignment_sha256": _json_digest(floor_assignment),
             "kl": float(floor_kl),
-            "unclipped_kl": prismaclip_diag.get("unclipped_floor_kl"),
             "bits_total": float(floor_bits_total),
             "format_counts": _format_counts(floor_assignment),
         },
@@ -3480,7 +3262,6 @@ def run_probe(args: argparse.Namespace) -> dict:
             "missing_units": missing_units,
         },
         "chosen_assignment": dict(sorted(chosen_assignment.items())),
-        "chosen_cache_variants": dict(sorted(final_cache_variants.items())),
         "diagnostics": {
             "elapsed_seconds": float(time.time() - start),
             "device": str(device),
@@ -3503,7 +3284,6 @@ def run_probe(args: argparse.Namespace) -> dict:
             "production_cache_used": bool(production_weight_cache is not None),
             "production_weight_cache": production_cache_diag,
             "source_prefetch": source_prefetch_diag,
-            "prismaclip_candidates": prismaclip_diag,
             "weight_session": weight_session_diag,
             "include_activation_quant": bool(not args.no_activation_quant),
             "calib_microbatch_size": int(chosen_calib_micro),
@@ -3535,8 +3315,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional concrete layer_config/assignment JSON to use as the "
-            "effective floor before production-cache fill, KL measurement, "
-            "and PrismaClip cache-variant gating. Missing entries fall back "
+            "effective floor before production-cache fill and KL measurement. "
+            "Missing entries fall back "
             "to --floor-format and pinned entries remain pinned."
         ),
     )
@@ -3652,18 +3432,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Candidate weight recipe used for sensitivity measurement. "
             "'production' renders each unit/format with the same GPTQ/"
-            "scale-sweep cache used by export; 'raw' is the older RTN/QDQ "
-            "diagnostic path."
-        ),
-    )
-    parser.add_argument(
-        "--prismaclip-candidates",
-        action="store_true",
-        help=(
-            "Direct-KL-gate PrismaClip as an internal NVFP4 cache variant. "
-            "The probe writes ordinary chosen_assignment formats plus "
-            "chosen_cache_variants; export consumes the latter with "
-            "--production-cache-variant-map."
+            "joint-scale production cache used by export; 'raw' is the "
+            "older RTN/QDQ diagnostic path."
         ),
     )
     parser.add_argument(
@@ -3768,18 +3538,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--production-cache-levers",
-        default="gptq,scale_sweep",
+        default="gptq,joint_scale_opt",
         help=(
             "Comma-separated production cleanup levers for on-the-fly cache "
-            "builds. Default: gptq,scale_sweep; add act_clip_solver to "
-            "enable PrismaClip, the explicit NVFP4 render-time activation "
-            "clamp solver, and "
-            "fisher_gptq to use h-detail per-token weights in render "
-            "objectives, or fisher_clip to use the same weights only for "
-            "PrismaFisherClip candidate diagnostics. Set "
-            "PRISMAQUANT_PRISMAFISHERCLIP_MODE=veto or score for explicit "
-            "ablation modes. "
-            "GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
+            "builds. Default: gptq,joint_scale_opt. scale_sweep remains "
+            "available for explicit ablations but is no longer a production "
+            "default. GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
             "recorded in cache metadata. NVFP4 block scaling follows "
             "PRISMAQUANT_NVFP4_SCALE_RULE."
         ),
@@ -3798,7 +3562,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional h-detail directory for on-the-fly production cache "
-            "builds. Used when fisher_gptq or fisher_clip is enabled."
+            "builds. Used only by archived Fisher ablations."
         ),
     )
     parser.add_argument(
@@ -3913,8 +3677,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-prefetch-workers", type=int, default=2)
     parser.add_argument(
         "--target-profile",
-        choices=["research", "vllm_qwen3_5_packed_moe"],
-        default="research",
+        choices=serving_profile_names(),
+        default=None,
     )
     parser.add_argument("--selection-budget-points", type=int, default=64)
     parser.add_argument("--selection-bit-precision", type=float, default=None)

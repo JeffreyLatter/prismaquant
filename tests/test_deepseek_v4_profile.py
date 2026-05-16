@@ -9,6 +9,7 @@ evolves.
 from __future__ import annotations
 
 import pytest
+import torch.nn as nn
 
 from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
 
@@ -39,6 +40,35 @@ def test_layer_prefixes(profile):
 
 def test_packed_expert_param_names(profile):
     assert profile.packed_expert_param_names() == frozenset({"gate_up_proj", "down_proj"})
+
+
+def test_source_passthrough_prefixes_are_spec_backed(profile):
+    assert profile.source_passthrough_prefixes() == (
+        "attn_sink",
+        "hc_",
+        "compressor.ape",
+        "tid2eid",
+        "kv_norm",
+        "q_norm",
+        "norm.",
+    )
+
+
+def test_probe_skip_linear_class_names_are_spec_backed(profile):
+    DeepseekV4GroupedLinear = type(
+        "DeepseekV4GroupedLinear",
+        (nn.Linear,),
+        {},
+    )
+
+    assert profile.structure_spec().probe_skip_module_class_names == (
+        "DeepseekV4GroupedLinear",
+    )
+    assert profile.should_probe_linear("model.layers.0.self_attn.wq_a", nn.Linear(4, 4))
+    assert not profile.should_probe_linear(
+        "model.layers.0.self_attn.wo_a",
+        DeepseekV4GroupedLinear(4, 4),
+    )
 
 
 def test_split_packed_for_export(profile):

@@ -22,9 +22,9 @@ def strip_weight(name: str) -> str:
 def canonicalize_format(entry: dict | str | int) -> str:
     """Map a layer-config entry to an export/runtime format name.
 
-    E5M2 registry entries are intentionally still rejected here: they are
-    useful for research probing but not yet validated on the vLLM
-    compressed-tensors weight path.
+    This parser is runtime-neutral: research formats such as E5M2 are
+    canonicalized here, then serving/export profiles decide whether they are
+    legal for a concrete backend.
     """
     if isinstance(entry, dict):
         dt = entry.get("data_type")
@@ -36,10 +36,7 @@ def canonicalize_format(entry: dict | str | int) -> str:
         if dt == "mx_fp" and bits == 8:
             elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
             if elt == "fp8_e5m2":
-                raise ValueError(
-                    "MXFP8_E5M2 is registered for research probing but is not "
-                    "exportable on the vLLM compressed-tensors weight path"
-                )
+                return "MXFP8_E5M2"
             return "MXFP8"
         if dt in ("float", "bfloat16") and bits in (16, 0):
             return "BF16"
@@ -53,10 +50,7 @@ def canonicalize_format(entry: dict | str | int) -> str:
                 return "FP8_E4M3"
             return "MXFP8"
         if dt == "fp8_e5m2" and bits == 8:
-            raise ValueError(
-                "FP8_E5M2 is registered for research probing but is not "
-                "exportable on the vLLM compressed-tensors weight path"
-            )
+            return "FP8_E5M2"
         if dt == "mx_fp" and bits == 6:
             elt = str(entry.get("weight_element_dtype", "fp6_e3m2")).lower()
             if elt == "fp6_e2m3":
@@ -77,11 +71,10 @@ def canonicalize_format(entry: dict | str | int) -> str:
             return "MXFP8"
         if value in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
             return "FP8_E4M3"
-        if value in ("mxfp8_e5m2", "fp8_e5m2"):
-            raise ValueError(
-                "E5M2 FP8 formats are registered for research probing but "
-                "are not exportable on the vLLM compressed-tensors weight path"
-            )
+        if value in ("mxfp8_e5m2", "mx_fp8_e5m2"):
+            return "MXFP8_E5M2"
+        if value in ("fp8_e5m2", "fp8_e5m2fn"):
+            return "FP8_E5M2"
         if value in ("bf16", "bfloat16", "16"):
             return "BF16"
         raise ValueError(f"unsupported format string: {entry!r}")

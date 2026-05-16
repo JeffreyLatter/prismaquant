@@ -1,25 +1,7 @@
-"""Calibration-time observer classes for prismaquant.
+"""Calibration-time observer package for PrismaQuant.
 
-Lightweight forward-hook-based measurement utilities that plug into the
-probe pipeline to collect signals beyond weight sensitivity. Unlike the
-main `sensitivity_probe` Fisher accumulator, observers here do not
-modify backward passes and never touch weight gradients — they are
-purely forward-pass measurements.
-
-Current observers:
-  - `ExpertSaliencyTracker` — REAP-style router-weighted expert
-    activation pruning saliency. Feeds per-expert DROP candidates into
-    the allocator.
+Observer implementations that are no longer part of the production probe
+contract live under `archive/`.
 """
 
-from .expert_saliency import (
-    ExpertSaliencyTracker,
-    saliency_from_moe_structure,
-    saliency_from_packed_moe,
-)
-
-__all__ = [
-    "ExpertSaliencyTracker",
-    "saliency_from_moe_structure",
-    "saliency_from_packed_moe",
-]
+__all__: list[str] = []

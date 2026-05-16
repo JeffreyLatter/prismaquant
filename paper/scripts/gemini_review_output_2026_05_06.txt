@@ -15,7 +15,7 @@ Gemini review of PrismaQuant production-faithful polish, dated Wednesday, May 6,
    - **Fix:** The paper touts the shipped 0.0151 KL result as a "held-out" baseline (implying the 8x512 split). The handover doc specifically states this was a sanity run on "tiny calibration (2 x 128)" and should not be used to claim final model quality. Re-measure the 0.0151 artifact on the true 8x512 split before claiming a 2.8x reduction, or add an explicit footnote clarifying the differing calibration sizes.
 3. **"Production-faithful" claim is close but not literally exact:** PARTIALLY-CLOSED.
    - **Location:** `README.md:238`
-   - **Fix:** While the paper's text was softened, `README.md` still claims "the exact per-Linear weight the exporter would render". As listed in `production_weight_cache.py`, gaps like block-output match and AWQ predecessor folding remain. Change "exact" to "functionally identical" or "structurally representative".
+   - **Fix:** While the paper's text was softened, `README.md` still claims "the exact per-Linear weight the exporter would render". As listed in `production_weight_cache.py`, gaps like block-output match remain. Change "exact" to "functionally identical" or "structurally representative".
 4. **KL metric defaults to last-token KL:** STILL-OPEN.
    - **Location:** `prismaquant/iterate_perturbed_allocation.py:8550`
    - **Fix:** The code still defaults to `PRISMAQUANT_FULL_SEQUENCE_KL=False`. If the paper's "held-out KL" claims depend on full-sequence perplexity-style metrics, the default should be explicitly synchronized, or the paper must specify that it is reporting last-token KL. 

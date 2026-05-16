@@ -106,7 +106,7 @@ docker run -d --gpus all --ipc=host --shm-size=8g \
         --model-override "${MODEL_PATH}" \
         --target-bits "${ANCHOR_BITS}" \
         --formats "${FORMATS}" \
-        --target-profile vllm_qwen3_5_packed_moe \
+        --target-profile vllm_packed_moe \
         --pareto-targets "${PARETO_TARGETS}" \
         --visual-format "${VISUAL_FORMAT}" \
         --visual-sensitivity "${VISUAL_SENSITIVITY}" \

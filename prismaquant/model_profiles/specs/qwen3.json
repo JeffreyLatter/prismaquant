@@ -1,0 +1,25 @@
+{
+  "schema": "prismaquant.model_structure.v1",
+  "id": "qwen3",
+  "default_serving_profile": "vllm_packed_moe",
+  "match": {
+    "model_type": ["qwen3"],
+    "architectures": ["Qwen3ForCausalLM"]
+  },
+  "fused_groups": [
+    {
+      "target": "self_attn.qkv_proj",
+      "members": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    },
+    {
+      "target": "mlp.gate_up_proj",
+      "members": ["mlp.gate_proj", "mlp.up_proj"]
+    }
+  ],
+  "packed_experts": {
+    "param_names": [],
+    "split_for_formats": []
+  },
+  "passthrough_prefixes": [],
+  "pinned_names": ["lm_head"]
+}
