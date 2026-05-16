@@ -1,4 +1,4 @@
-From ada407df4c57413bb6c7c8f3bb4c29803cb394fe Mon Sep 17 00:00:00 2001
+From ef3f98ef6de7f3d9bdc356653e10039f3724ada3 Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:30:27 +0200
 Subject: [PATCH 6/6] fork: Section 6 - Streaming production cache for models
@@ -24,14 +24,14 @@ AutoConfig import for HALO non-streaming path.
 Limitations: HALO, recache, AWQ, SmoothQuant, fisher passes are unsupported
 in the streaming path (all require full model resident).
 ---
- prismaquant/build_production_cache.py | 655 +++++++++++++++++++++++---
- 1 file changed, 590 insertions(+), 65 deletions(-)
+ prismaquant/build_production_cache.py | 744 +++++++++++++++++++++++---
+ 1 file changed, 674 insertions(+), 70 deletions(-)
 
 diff --git a/prismaquant/build_production_cache.py b/prismaquant/build_production_cache.py
-index 9014236..840ca57 100644
+index 9014236..64d0208 100644
 --- a/prismaquant/build_production_cache.py
 +++ b/prismaquant/build_production_cache.py
-@@ -55,6 +55,454 @@ from prismaquant.production_weight_cache import (
+@@ -55,6 +55,511 @@ from prismaquant.production_weight_cache import (
  from prismaquant.sensitivity_probe import load_calibration
  
  
@@ -80,11 +80,13 @@ index 9014236..840ca57 100644
 +    hidden-state buffer instead of the full model.
 +
 +    Returns ``(cache, qnames, skipped)`` where ``qnames`` is the list of
-+    eligible nn.Linear qnames derived from the skeleton and ``skipped`` lists
++    eligible nn.Linear qnames derived from the skeleton (same as the
++    non-streaming path would derive from the live model) and ``skipped`` lists
 +    qnames excluded by ``skip_qnames``.
 +
 +    Limitations compared to ``fill_production_weight_cache``:
-+      - AWQ, SmoothQuant, HALO, and recache passes are not supported.
++      - AWQ, SmoothQuant, HALO, and recache passes are not supported (all
++        require the full model resident at once).
 +      - ``h_detail_dir`` (fisher_gptq/fisher_clip) is silently ignored.
 +    """
 +    import gc
@@ -157,7 +159,7 @@ index 9014236..840ca57 100644
 +        layers_prefix = ctx.layers_prefix
 +        profile = ctx.profile
 +
-+        # Build qnames from skeleton (meta tensors have correct shapes).
++        # Build qnames from skeleton (meta tensors have correct shapes/strides).
 +        skip_tokens_set = set(skip_qnames or [])
 +        qnames: list[str] = []
 +        skipped_list: list[str] = []
@@ -173,6 +175,13 @@ index 9014236..840ca57 100644
 +            qnames.append(qname)
 +            qname_to_module[qname] = mod
 +        eligible_qnames = set(qnames)
++
++        if progress:
++            print(
++                f"[prod-cache-stream] {len(qnames)} quantizable Linears from "
++                f"skeleton; formats={list(requested_formats)}",
++                flush=True,
++            )
 +
 +        # Resolve per-qname format lists.
 +        if render_assignment is not None:
@@ -249,7 +258,17 @@ index 9014236..840ca57 100644
 +            else:
 +                head_qnames.append(qname)
 +
-+        # Install activation collector on skeleton once.
++        if head_qnames and progress:
++            sample = head_qnames[:3]
++            print(
++                f"[prod-cache-stream] {len(head_qnames)} head qnames outside "
++                f"decoder layers (always resident): {sample}"
++                f"{'...' if len(head_qnames) > 3 else ''}",
++                flush=True,
++            )
++
++        # Install activation collector on skeleton once.  Hooks fire per-sample
++        # as each layer is called; other layers' hooks are silent (never called).
 +        collector = _LinearActivationCollector(
 +            skeleton,
 +            qnames=eligible_qnames,
@@ -280,8 +299,18 @@ index 9014236..840ca57 100644
 +        if sidecar_path is not None and sidecar_path.is_file():
 +            try:
 +                activation_max_abs.update(json.loads(sidecar_path.read_text()))
-+            except Exception:
-+                pass
++                if progress:
++                    print(
++                        f"[prod-cache-stream] resume: loaded "
++                        f"{len(activation_max_abs)} max_abs entries from sidecar",
++                        flush=True,
++                    )
++            except Exception as e:
++                if progress:
++                    print(
++                        f"[prod-cache-stream] sidecar load failed ({e}); recomputing",
++                        flush=True,
++                    )
 +
 +        weights: dict = {}
 +        failed: dict = {}
@@ -295,8 +324,10 @@ index 9014236..840ca57 100644
 +
 +        for L in range(num_layers):
 +            layer_q = [q for q in layer_qnames.get(L, []) if q in qname_set]
++
 +            ctx.install(L)
 +
++            # Run all N samples through layer L; hooks collect activations.
 +            with torch.no_grad():
 +                for i in range(N):
 +                    extra_kw = (
@@ -314,6 +345,7 @@ index 9014236..840ca57 100644
 +                    hidden_states[i] = out
 +
 +            if layer_q:
++                # Joint NVFP4 globals — computed while layer weights are on GPU.
 +                layer_joint_globals: dict[str, torch.Tensor] = {}
 +                if needs_nvfp4_render:
 +                    from prismaquant.export_native_compressed import (
@@ -330,12 +362,14 @@ index 9014236..840ca57 100644
 +                                flush=True,
 +                            )
 +
++                # Extract activations accumulated for this layer's qnames.
 +                layer_activations: dict[str, torch.Tensor] = {}
 +                for q in layer_q:
 +                    parts = collector.activations.get(q, [])
 +                    if parts:
 +                        layer_activations[q] = torch.cat(parts, dim=0)
 +
++                # Compute activation_max_abs with sibling unification.
 +                if needs_nvfp4_render:
 +                    from prismaquant.decision_units import fused_group_key
 +                    per_qname_max: dict[str, float] = {}
@@ -363,6 +397,7 @@ index 9014236..840ca57 100644
 +                        for m in members:
 +                            activation_max_abs[m] = shared
 +
++                # Render production weights — layer weights still on GPU.
 +                for q in layer_q:
 +                    mod = qname_to_module.get(q)
 +                    if mod is None:
@@ -399,6 +434,11 @@ index 9014236..840ca57 100644
 +                            )
 +                        except Exception as e:
 +                            failed[key] = str(e)
++                            if progress:
++                                print(
++                                    f"[prod-cache-stream] FAILED {q} @ {fmt}: {e}",
++                                    flush=True,
++                                )
 +                            done += 1
 +                            continue
 +                        _store_rendered_weight_entry(
@@ -418,6 +458,8 @@ index 9014236..840ca57 100644
 +                            )
 +
 +            ctx.unload(L)
++
++            # Free this layer's activation entries from the accumulator.
 +            for q in layer_qnames.get(L, []):
 +                collector.activations.pop(q, None)
 +                collector._max_abs_tensors.pop(q, None)
@@ -427,7 +469,7 @@ index 9014236..840ca57 100644
 +
 +        collector.remove()
 +
-+        # Render always-resident head qnames (lm_head typically skipped).
++        # Render always-resident head qnames (lm_head is typically skipped).
 +        for qname in head_qnames:
 +            if qname not in qname_set:
 +                continue
@@ -447,22 +489,37 @@ index 9014236..840ca57 100644
 +                        continue
 +                try:
 +                    w_dq = render_production_weight(
-+                        weight, _render_base_format(fmt_key),
-+                        qname=qname, activations={}, levers=levers,
-+                        joint_global_real=None, input_global_scale=None,
++                        weight,
++                        _render_base_format(fmt_key),
++                        qname=qname,
++                        activations={},
++                        levers=levers,
++                        joint_global_real=None,
++                        input_global_scale=None,
 +                    )
 +                except Exception as e:
 +                    failed[(qname, fmt_key)] = str(e)
 +                    continue
 +                _store_rendered_weight_entry(
-+                    weights=weights, cache_dir_path=cache_dir_path,
-+                    qname=qname, fmt=fmt_key, tensor=w_dq,
++                    weights=weights,
++                    cache_dir_path=cache_dir_path,
++                    qname=qname,
++                    fmt=fmt_key,
++                    tensor=w_dq,
 +                    weight_dtype=weight.dtype,
 +                )
 +                del w_dq
 +
++        # Persist max_abs sidecar for future resume runs.
 +        if sidecar_path is not None and activation_max_abs:
 +            sidecar_path.write_text(json.dumps(activation_max_abs, indent=2))
++
++        if progress:
++            print(
++                f"[prod-cache-stream] rendered {len(weights)} (qname, fmt) entries "
++                f"({len(failed)} failures)",
++                flush=True,
++            )
 +
 +        cache = ProductionWeightCache(
 +            weights=weights,
@@ -486,7 +543,7 @@ index 9014236..840ca57 100644
  def main(argv: Sequence[str] | None = None) -> int:
      p = argparse.ArgumentParser(description="Build production δw cache")
      p.add_argument("--model", required=True)
-@@ -178,6 +626,19 @@ def main(argv: Sequence[str] | None = None) -> int:
+@@ -178,6 +683,19 @@ def main(argv: Sequence[str] | None = None) -> int:
          help="During re-cache, install production weights but leave activation "
          "quantization disabled in replay hooks.",
      )
@@ -506,7 +563,7 @@ index 9014236..840ca57 100644
      args = p.parse_args(argv)
  
      # Opt-in deterministic CUDA path. The default lever ablations on small
-@@ -206,7 +667,7 @@ def main(argv: Sequence[str] | None = None) -> int:
+@@ -206,7 +724,7 @@ def main(argv: Sequence[str] | None = None) -> int:
              flush=True,
          )
  
@@ -515,7 +572,7 @@ index 9014236..840ca57 100644
  
      output_path = Path(args.output)
      output_path.parent.mkdir(parents=True, exist_ok=True)
-@@ -244,58 +705,22 @@ def main(argv: Sequence[str] | None = None) -> int:
+@@ -244,58 +762,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                  split=args.calib_split,
                  seed=args.calib_seed,
              )
@@ -584,11 +641,11 @@ index 9014236..840ca57 100644
 +                        flush=True,
 +                    )
  
-+        # render_assignment resolution shared across both paths.
++        # render_assignment resolution is shared across both paths.
          recache_assignment = (
              _load_assignment(args.recache_layer_config)
              if args.recache_layer_config else None
-@@ -320,21 +745,121 @@ def main(argv: Sequence[str] | None = None) -> int:
+@@ -320,32 +802,154 @@ def main(argv: Sequence[str] | None = None) -> int:
                  f"{non_bf16} non-BF16 entries from {layer_config}",
                  flush=True,
              )
@@ -643,7 +700,10 @@ index 9014236..840ca57 100644
 +            )
 +            if skipped:
 +                print(
-+                    f"[build-prod-cache] skipped {len(skipped)} qnames",
++                    f"[build-prod-cache] skipped {len(skipped)} qnames matching "
++                    f"{list(args.skip_qnames or [])} (typically pinned-BF16 in "
++                    f"polish): "
++                    f"{skipped if len(skipped) <= 5 else skipped[:5] + ['...']}",
 +                    flush=True,
 +                )
 +        else:
@@ -672,24 +732,40 @@ index 9014236..840ca57 100644
 +            halo_meta = {"mode": "off"}
 +            if args.halo_mode == "random":
 +                from prismaquant.halo import apply_random_halo_to_model
++
 +                cfg = AutoConfig.from_pretrained(
-+                    staged, trust_remote_code=True, local_files_only=local_only)
++                    staged,
++                    trust_remote_code=True,
++                    local_files_only=local_only,
++                )
 +                print(
 +                    f"[build-prod-cache] applying HALO mode=random "
-+                    f"seed={args.halo_seed}", flush=True)
++                    f"seed={args.halo_seed}",
++                    flush=True,
++                )
 +                _, halo_meta = apply_random_halo_to_model(
-+                    model, profile, cfg, seed=args.halo_seed, verbose=True)
-+            skip_tokens = list(
-+                args.skip_qnames
-+                if args.skip_qnames is not None
-+                else profile.pinned_names()
-+            )
++                    model,
++                    profile,
++                    cfg,
++                    seed=args.halo_seed,
++                    verbose=True,
++                )
++                print(
++                    "[build-prod-cache] HALO applied: "
++                    f"dim={halo_meta['dim']} "
++                    f"blocks={halo_meta['block_sizes']} "
++                    f"hash={halo_meta['rotation_hash']}",
++                    flush=True,
++                )
++
++            skip_tokens = list(args.skip_qnames or [])
 +            qnames: list[str] = []
 +            skipped: list[str] = []
-+            for full_name, mod, attr in iter_quantizable_tensors(model, profile):
++            for full_name, mod, attr in iter_quantizable_tensors(model):
 +                if attr != "weight" or not isinstance(mod, nn.Linear):
 +                    continue
 +                qname = full_name[:-7] if full_name.endswith(".weight") else full_name
++                # Exact dotted-token match against --skip-qnames substrings.
 +                tokens = qname.split(".")
 +                if any(s in tokens for s in skip_tokens):
 +                    skipped.append(qname)
@@ -707,6 +783,7 @@ index 9014236..840ca57 100644
 +                    f"{skipped if len(skipped) <= 5 else skipped[:5] + ['...']}",
 +                    flush=True,
 +                )
++
 +            cache = fill_production_weight_cache(
 +                model, calib_ids, qnames,
 +                formats=formats,
@@ -724,6 +801,32 @@ index 9014236..840ca57 100644
          elapsed = time.monotonic() - t0
          # Strict coverage validation: every (qname, NVFP4) must be present
          # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky
+         # failures, and any other silent gaps that would otherwise fall
+         # through to RTN at hook time.
++        #
++        # Packed MoE experts (3D tensors) are intentionally excluded from the
++        # production weight cache — the export pipeline quantizes them directly
++        # via _quantize_2d without reading the cache.  Filter the assignment
++        # to only the eligible_qnames (nn.Linear modules) before checking
++        # coverage so expert qnames don't produce false-positive misses.
+         try:
+             if render_assignment is not None:
+-                # Filter to nn.Linear qnames only — packed MoE expert tensors
+-                # (3D params) are quantized directly by the export pipeline and
+-                # never stored in the production weight cache.  Including them
+-                # here produces false-positive coverage failures.
+                 eligible_set = set(qnames)
+                 cacheable_assignment = {
+                     q: fmt for q, fmt in render_assignment.items()
+@@ -356,7 +960,7 @@ def main(argv: Sequence[str] | None = None) -> int:
+                     print(
+                         f"[build-prod-cache] coverage check: skipping "
+                         f"{n_skipped_experts} packed-expert assignment entries "
+-                        "(export handles them directly, not via cache)",
++                        f"(export handles them directly, not via cache)",
+                         flush=True,
+                     )
+                 _, missing = cache.assignment_keys(cacheable_assignment)
 -- 
 2.43.0
 

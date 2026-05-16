@@ -1,25 +1,31 @@
-From ba366a58ad72b085a88a1d7cc9334e244ad9d5ee Mon Sep 17 00:00:00 2001
+From 215f129454e362aad251781ee8f92bb831e03cea Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
-Date: Sat, 16 May 2026 11:22:02 +0200
+Date: Sat, 16 May 2026 19:19:10 +0200
 Subject: [PATCH 4/6] fork: Section 4 - test-pipeline.sh local harness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Local test harness derived from prismaquant/run-pipeline.sh with:
-- Hardcoded paths for Qwen3-Coder-Next on this machine
+- --repo <org/model> + --auto-accept CLI flags
 - Timing and compression summary at end of run
 - Interactive allocator prompts (knee-point and format-leg usage)
-- PRISMAQUANT_MASK_CUDA_DURING_META_INIT=0 export
+- SELECTION_MODE=validated-surrogate measured-KL frontier selection,
+  with PRODUCTION_CACHE_UNION smart-union frontier cache
+- exported_model_info.txt — PrismaQuant config + achieved compression
+  model card (markdown; copy to README.md for the HuggingFace Hub)
 - --halo-mode / --halo-seed flags passed through to build_production_cache
 ---
- test-pipeline.sh | 710 +++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 710 insertions(+)
+ test-pipeline.sh | 1210 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 1210 insertions(+)
  create mode 100755 test-pipeline.sh
 
 diff --git a/test-pipeline.sh b/test-pipeline.sh
 new file mode 100755
-index 0000000..db80477
+index 0000000..02f6f1a
 --- /dev/null
 +++ b/test-pipeline.sh
-@@ -0,0 +1,710 @@
+@@ -0,0 +1,1210 @@
 +#!/usr/bin/env bash
 +# run-pipeline.sh — end-to-end PrismaQuant pipeline: probe → cost →
 +# allocator → native compressed-tensors export → vLLM validate.
@@ -236,11 +242,37 @@ index 0000000..db80477
 +# format-menu: render every requested format for every quantizable Linear,
 +# useful when intentionally building a reusable cache for reallocations.
 +: "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
-+: "${PRODUCTION_CACHE_LEVERS:=gptq,scale_sweep}"
++# V1 production render recipe: GPTQ with damp sweep + joint NVFP4 scale
++# optimization (see docs/runtime_flags.md). This is the lowest-loss render
++# combination for a given bit budget. `scale_sweep` is available for
++# explicit ablations but is no longer the default.
++: "${PRODUCTION_CACHE_LEVERS:=gptq,joint_scale_opt}"
 +: "${FISHER_WEIGHTED_GPTQ:=0}"
 +: "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 +: "${HALO_MODE:=off}"
 +: "${HALO_SEED:=0}"
++# ── frontier selection mode ──────────────────────────────────────────────────
++# SELECTION_MODE=surrogate (default): export the allocator's surrogate-cost
++#   assignment at TARGET_BITS directly.
++# SELECTION_MODE=validated-surrogate: build a format-menu production cache,
++#   measure real assignment-KL for every allocator Pareto point, and export
++#   the measured KL/bpp point chosen by VALIDATED_FRONTIER_PICK. Highest-
++#   fidelity loss/compression tradeoff. Requires PRODUCTION_CACHE=1 and
++#   bypasses the interactive knee-point / format-leg prompts (the measured
++#   frontier supersedes the surrogate knee).
++: "${SELECTION_MODE:=surrogate}"
++: "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
++: "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
++: "${VALIDATED_FRONTIER_KL_SCOPE:=last_token}"
++: "${VALIDATED_FRONTIER_PICK:=kneedle}"
++# PRODUCTION_CACHE_UNION=1 switches the validated-surrogate frontier cache
++# from full format-menu rendering (every Linear × every quantized format) to
++# a smart-union render that only adds MXFP8 / FP8 fallback entries for
++# Linears whose NVFP4 output_mse exceeds the band percentiles — ~40-60%
++# fewer renders without sacrificing assignment coverage at typical budgets.
++: "${PRODUCTION_CACHE_UNION:=0}"
++: "${PRODUCTION_CACHE_UNION_P_MXFP8:=0.50}"
++: "${PRODUCTION_CACHE_UNION_P_FP8:=0.75}"
 +
 +PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 +COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
@@ -260,6 +292,19 @@ index 0000000..db80477
 +esac
 +
 +mkdir -p "${WORK_DIR}"/{artifacts,act,work,logs,exported}
++
++case "$SELECTION_MODE" in
++  surrogate|validated-surrogate) ;;
++  *)
++    echo "[pipeline] ERROR: SELECTION_MODE must be 'surrogate' or 'validated-surrogate'" >&2
++    exit 1 ;;
++esac
++if [[ "$SELECTION_MODE" == "validated-surrogate" ]] \
++   && [[ "$PRODUCTION_CACHE" == "0" || "$PRODUCTION_CACHE" == "false" || "$PRODUCTION_CACHE" == "False" ]]; then
++  echo "[pipeline] ERROR: SELECTION_MODE=validated-surrogate requires PRODUCTION_CACHE=1" >&2
++  echo "             so measured KL validates production-rendered weights." >&2
++  exit 1
++fi
 +
 +# Snapshot original model size before the pipeline runs
 +_orig_bytes=$(_sum_safetensors_bytes "$MODEL_PATH")
@@ -282,6 +327,11 @@ index 0000000..db80477
 +echo "  FISHER_WEIGHTED_GPTQ=$FISHER_WEIGHTED_GPTQ H_DETAIL_DIR=$H_DETAIL_DIR"
 +echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 +echo "  HALO_MODE=$HALO_MODE HALO_SEED=$HALO_SEED"
++echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
++if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
++  echo "  VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_KL_SCOPE=$VALIDATED_FRONTIER_KL_SCOPE"
++  echo "  PRODUCTION_CACHE_UNION=$PRODUCTION_CACHE_UNION P_MXFP8=$PRODUCTION_CACHE_UNION_P_MXFP8 P_FP8=$PRODUCTION_CACHE_UNION_P_FP8"
++fi
 +echo
 +
 +# -----------------------------------------------------------------------
@@ -393,6 +443,14 @@ index 0000000..db80477
 +else
 +  VISUAL_SENSITIVITY=uniform
 +fi
++# validated-surrogate needs per-Pareto-point assignment JSONs written to disk
++# for the measured-KL frontier sweep; plain surrogate mode does not.
++ALLOCATOR_PARETO_ARGS=()
++ALLOCATOR_PARETO_DIR=""
++if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
++  ALLOCATOR_PARETO_DIR="${WORK_DIR}/artifacts/pareto_assignments"
++  ALLOCATOR_PARETO_ARGS=(--pareto-output-dir "$ALLOCATOR_PARETO_DIR")
++fi
 +python3 -m prismaquant.allocator \
 +  --probe "${PROBE_PATH}" \
 +  --costs "${COST_PATH}" \
@@ -405,6 +463,7 @@ index 0000000..db80477
 +  --mtp-format "$MTP_FORMAT" \
 +  --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
 +  --pareto-csv "${WORK_DIR}/artifacts/pareto.csv" \
++  "${ALLOCATOR_PARETO_ARGS[@]}" \
 +  2>&1 | tee "${WORK_DIR}/logs/allocator.log"
 +
 +# -----------------------------------------------------------------------
@@ -425,6 +484,7 @@ index 0000000..db80477
 +    --mtp-format         "$MTP_FORMAT" \
 +    --layer-config       "${WORK_DIR}/artifacts/layer_config.json" \
 +    --pareto-csv         "${WORK_DIR}/artifacts/pareto.csv" \
++    "${ALLOCATOR_PARETO_ARGS[@]}" \
 +    2>&1 | tee "${WORK_DIR}/logs/allocator.log"
 +  echo "[pipeline] allocator re-run complete."
 +}
@@ -432,12 +492,15 @@ index 0000000..db80477
 +# ── Prompt 1: knee-point / target-bits ──────────────────────────────────────
 +# Parse suggested knee from the allocator log. If it differs from TARGET_BITS
 +# offer Y (accept) / N (keep) / I (enter custom bpp) before continuing.
++# Skipped entirely under validated-surrogate: the measured-KL frontier picks
++# the operating point, so the surrogate knee is not consulted.
 +_knee=$(grep -oP '\[alloc\] suggested knee: target=\K[0-9.]+' \
 +  "${WORK_DIR}/logs/allocator.log" 2>/dev/null | tail -1)
 +_achieved=$(grep -oP '\[alloc\] suggested knee:.*?achieved=\K[0-9.]+' \
 +  "${WORK_DIR}/logs/allocator.log" 2>/dev/null | tail -1)
 +
-+if [[ -n "$_knee" && "$_knee" != "$TARGET_BITS" ]]; then
++if [[ "$SELECTION_MODE" != "validated-surrogate" \
++      && -n "$_knee" && "$_knee" != "$TARGET_BITS" ]]; then
 +  echo ""
 +  echo "┌─────────────────────────────────────────────────────────────────┐"
 +  printf "│  [pipeline] Allocator suggests a better knee point              │\n"
@@ -506,7 +569,9 @@ index 0000000..db80477
 +  [[ "${_fmt_counts[$_fmt]:-0}" -eq 0 ]] && _any_zero=1 && break
 +done
 +
-+if [[ "$_any_zero" -eq 1 ]]; then
++# Skipped under validated-surrogate: the frontier sweep renders the full
++# format menu and the measured-KL selection decides which legs are used.
++if [[ "$_any_zero" -eq 1 && "$SELECTION_MODE" != "validated-surrogate" ]]; then
 +  echo ""
 +  echo "┌─────────────────────────────────────────────────────────────────┐"
 +  printf "│  [pipeline] Format leg usage after allocation                   │\n"
@@ -591,7 +656,177 @@ index 0000000..db80477
 +  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_raw.pkl"
 +  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_recached.pkl"
 +  CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
-+  if [[ "$CACHE_FORMATS" == "auto" ]]; then
++
++  # ── validated-surrogate: measured-KL frontier selection ────────────────────
++  # Build a format-menu production cache, measure real assignment-KL for every
++  # allocator Pareto point, select the measured KL/bpp point, and (optionally)
++  # recache the selection. Sets PRODUCTION_CACHE_PATH and rewrites
++  # layer_config.json in place so export packs the selected assignment.
++  if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
++    if [[ -z "$ALLOCATOR_PARETO_DIR" || ! -f "$ALLOCATOR_PARETO_DIR/manifest.json" ]]; then
++      echo "[pipeline] ERROR: validated-surrogate needs allocator Pareto" >&2
++      echo "             assignments at ${ALLOCATOR_PARETO_DIR}/manifest.json" >&2
++      exit 1
++    fi
++    if [[ "$CACHE_FORMATS" == "auto" ]]; then
++      CACHE_FORMATS="$(python3 - "$FORMATS" <<'PY'
++import sys
++from prismaquant import format_registry as fr
++
++seen = []
++for raw in sys.argv[1].split(","):
++    name = raw.strip()
++    if not name:
++        continue
++    canon = fr.canonical_format_name(name)
++    if canon != "BF16" and canon not in seen:
++        seen.append(canon)
++print(",".join(seen))
++PY
++)"
++      echo "[pipeline] frontier production cache formats from FORMATS: ${CACHE_FORMATS:-none}"
++    fi
++    if [[ -z "$CACHE_FORMATS" ]]; then
++      echo "[pipeline] ERROR: validated-surrogate has no non-BF16 cache formats" >&2
++      exit 1
++    fi
++    PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
++    PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_frontier_raw.pkl"
++    if [[ ! -f "$PROD_CACHE_RAW" ]]; then
++      if [[ "$PRODUCTION_CACHE_UNION" == "1" || "$PRODUCTION_CACHE_UNION" == "true" \
++            || "$PRODUCTION_CACHE_UNION" == "True" ]]; then
++        # Smart-union render: only render MXFP8/FP8 fallbacks for Linears
++        # whose NVFP4 output_mse is above the band percentiles. Same cache
++        # layout as format-menu, just fewer entries.
++        echo "[pipeline] [4/4] building smart-union production cache for validated frontier ..."
++        python3 -m tools.build_union_cache \
++          --model "$MODEL_PATH" \
++          --cost-pkl "$COST_PATH" \
++          --input-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
++          --output-cache-dir "$PROD_CACHE_DIR" \
++          --output-pkl "$PROD_CACHE_RAW" \
++          --dataset "$DATASET" \
++          --n-calib-samples "$NSAMPLES" \
++          --calib-seqlen "$SEQLEN" \
++          --levers "$PRODUCTION_CACHE_LEVERS" \
++          --p-mxfp8 "$PRODUCTION_CACHE_UNION_P_MXFP8" \
++          --p-fp8 "$PRODUCTION_CACHE_UNION_P_FP8" \
++          2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
++      else
++        echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
++        python3 -m prismaquant.build_production_cache \
++          --model "$MODEL_PATH" \
++          --output "$PROD_CACHE_RAW" \
++          --formats "$CACHE_FORMATS" \
++          --dataset "$DATASET" \
++          --n-calib-samples "$NSAMPLES" \
++          --calib-seqlen "$SEQLEN" \
++          --dtype bf16 \
++          --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
++          --enable "$PRODUCTION_CACHE_LEVERS" \
++          --cache-dir "$PROD_CACHE_DIR" \
++          --render-scope format-menu \
++          --halo-mode "$HALO_MODE" \
++          --halo-seed "$HALO_SEED" \
++          "${PROD_H_DETAIL_ARGS[@]}" \
++          2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
++      fi
++    else
++      echo "[pipeline] [4/4] frontier production cache exists, skipping"
++    fi
++
++    # Collect every Pareto-point assignment JSON the allocator wrote.
++    VALIDATED_ASSIGNMENT_ARGS=()
++    while IFS=$'\t' read -r _vlabel _vpath; do
++      [[ -n "$_vlabel" && -n "$_vpath" ]] || continue
++      VALIDATED_ASSIGNMENT_ARGS+=(--assignment "${_vlabel}=${_vpath}")
++    done < <(python3 - "$ALLOCATOR_PARETO_DIR/manifest.json" <<'PY'
++import json
++import sys
++
++payload = json.load(open(sys.argv[1]))
++for row in payload.get("candidates", []):
++    print(f"{row['label']}\t{row['path']}")
++PY
++)
++    if [[ "${#VALIDATED_ASSIGNMENT_ARGS[@]}" -eq 0 ]]; then
++      echo "[pipeline] ERROR: no Pareto assignments found for validated frontier" >&2
++      exit 1
++    fi
++
++    VALIDATION_JSON="${WORK_DIR}/artifacts/validated_frontier_kl.json"
++    _vassign_count=$(( ${#VALIDATED_ASSIGNMENT_ARGS[@]} / 2 ))
++    echo "[pipeline] [4/4] measuring real KL for ${_vassign_count} Pareto assignments ..."
++    python3 -m prismaquant.validate_assignments_kl \
++      --model "$MODEL_PATH" \
++      --probe "$PROBE_PATH" \
++      --costs "$COST_PATH" \
++      --base-assignment "${WORK_DIR}/artifacts/layer_config.json" \
++      "${VALIDATED_ASSIGNMENT_ARGS[@]}" \
++      --output "$VALIDATION_JSON" \
++      --formats "$FORMATS" \
++      --dataset "$DATASET" \
++      --n-calib-samples "$VALIDATED_FRONTIER_NSAMPLES" \
++      --calib-seqlen "$VALIDATED_FRONTIER_SEQLEN" \
++      --dtype bf16 \
++      --device "$DEVICE" \
++      --kl-scope "$VALIDATED_FRONTIER_KL_SCOPE" \
++      --assignment-materialization hooks \
++      --production-weight-cache "$PROD_CACHE_RAW" \
++      --production-cache-dir-override "$PROD_CACHE_DIR" \
++      --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
++      --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
++      --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
++      2>&1 | tee "${WORK_DIR}/logs/validated_frontier_kl.log"
++
++    echo "[pipeline] [4/4] selecting measured frontier point (pick=${VALIDATED_FRONTIER_PICK}) ..."
++    python3 -m prismaquant.select_validated_frontier \
++      --validation-json "$VALIDATION_JSON" \
++      --mode "$VALIDATED_FRONTIER_PICK" \
++      --output-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
++      --output-assignment "${WORK_DIR}/artifacts/layer_config_validated_assignment.json" \
++      --output-summary "${WORK_DIR}/artifacts/validated_frontier_selection.json" \
++      2>&1 | tee "${WORK_DIR}/logs/validated_frontier_select.log"
++
++    if [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
++      _sel_digest="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'
++import hashlib
++import pathlib
++import sys
++
++print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()[:12])
++PY
++)"
++      PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${HALO_CACHE_TAG}${LEVER_CACHE_TAG}_frontier_${_sel_digest}_recached.pkl"
++      if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
++        echo "[pipeline] [4/4] re-fitting activation scales for selected assignment ..."
++        python3 -m prismaquant.production_recache \
++          --model "$MODEL_PATH" \
++          --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
++          --production-weight-cache "$PROD_CACHE_RAW" \
++          --output "$PROD_CACHE_RECACHED" \
++          --cache-dir-override "$PROD_CACHE_DIR" \
++          --dataset "$DATASET" \
++          --n-calib-samples "$NSAMPLES" \
++          --calib-seqlen "$SEQLEN" \
++          --dtype bf16 \
++          --device "$DEVICE" \
++          --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
++          --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
++          --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
++          --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
++          2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
++      else
++        echo "[pipeline] [4/4] selected-assignment recached cache exists, skipping"
++      fi
++      PRODUCTION_CACHE_PATH="$PROD_CACHE_RECACHED"
++    else
++      PRODUCTION_CACHE_PATH="$PROD_CACHE_RAW"
++    fi
++  fi
++  # ── end validated-surrogate frontier ───────────────────────────────────────
++
++  if [[ "$SELECTION_MODE" != "validated-surrogate" && "$CACHE_FORMATS" == "auto" ]]; then
 +    CACHE_FORMATS="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'
 +import sys
 +from prismaquant.production_recache import _load_assignment
@@ -603,7 +838,9 @@ index 0000000..db80477
 +)"
 +    echo "[pipeline] production cache formats selected from assignment: ${CACHE_FORMATS:-none}"
 +  fi
-+  if [[ -z "$CACHE_FORMATS" ]]; then
++  if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
++    :  # frontier path above already built the cache + set PRODUCTION_CACHE_PATH
++  elif [[ -z "$CACHE_FORMATS" ]]; then
 +    echo "[pipeline] production cache requested but no non-BF16 formats are in FORMATS; skipping cache"
 +  elif [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
 +    if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
@@ -719,16 +956,285 @@ index 0000000..db80477
 +  'BEGIN{if (e > 0) printf "%.2fx\n", o/e; else print "N/A"}')
 +end_time_readable=$(date -d "@$end_time_seconds" "$@"+'%Y-%m-%d %H:%M:%S')
 +
++# 3. Calculate total duration
++runtime_seconds=$((end_time_seconds - start_time_seconds))
++_runtime_str=$(printf "%02d:%02d:%02d" \
++  $((runtime_seconds/3600)) $((runtime_seconds%3600/60)) $((runtime_seconds%60)))
++
++# -----------------------------------------------------------------------
++# 5. exported_model_info.txt — PrismaQuant config + achieved compression,
++#    bpp, and layer-config summary. Markdown-formatted so it can be copied
++#    to README.md and used directly as a HuggingFace model card. Always
++#    regenerated at the end of a run (cheap); never skipped.
++# -----------------------------------------------------------------------
++_INFO_PATH="${WORK_DIR}/exported/exported_model_info.txt"
++_pq_git=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --short HEAD \
++  2>/dev/null || echo unknown)
++_info_date=$(date -u '+%Y-%m-%d')
++INFO_WORK_DIR="$WORK_DIR" \
++INFO_MODEL_SHORT="$_model_short" \
++INFO_BASE_MODEL="$_model_input" \
++INFO_TARGET_PROFILE="$TARGET_PROFILE" \
++INFO_FORMATS="$FORMATS" \
++INFO_TARGET_BITS="$TARGET_BITS" \
++INFO_SELECTION_MODE="$SELECTION_MODE" \
++INFO_NSAMPLES="$NSAMPLES" \
++INFO_SEQLEN="$SEQLEN" \
++INFO_DATASET="$DATASET" \
++INFO_CALIB_MODALITY="$CALIBRATION_MODALITY" \
++INFO_DEVICE="$DEVICE" \
++INFO_EXPORT_DEVICE="$EXPORT_DEVICE" \
++INFO_PRODUCTION_CACHE="$PRODUCTION_CACHE" \
++INFO_PRODUCTION_RECACHE="$PRODUCTION_RECACHE" \
++INFO_CACHE_LEVERS="$PRODUCTION_CACHE_LEVERS" \
++INFO_CACHE_RENDER_SCOPE="$PRODUCTION_CACHE_RENDER_SCOPE" \
++INFO_CACHE_UNION="$PRODUCTION_CACHE_UNION" \
++INFO_NVFP4_SCALE_RULE="${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}" \
++INFO_VISUAL_FORMAT="$VISUAL_FORMAT" \
++INFO_MTP_FORMAT="$MTP_FORMAT" \
++INFO_HALO_MODE="$HALO_MODE" \
++INFO_ORIG_HUMAN="$_orig_human" \
++INFO_EXP_HUMAN="$_exp_human" \
++INFO_RATIO="$_ratio" \
++INFO_SAVINGS_HUMAN="$_savings_human" \
++INFO_RUNTIME="$_runtime_str" \
++INFO_GIT="$_pq_git" \
++INFO_DATE="$_info_date" \
++python3 - > "${_INFO_PATH}" <<'PY' || echo "[pipeline] WARN: failed to write ${_INFO_PATH}"
++import json, os, re
++
++E = os.environ
++work = E.get("INFO_WORK_DIR", ".")
++
++
++def _read(path):
++    try:
++        with open(path, encoding="utf-8", errors="replace") as fh:
++            return fh.read()
++    except OSError:
++        return ""
++
++
++alloc_log = _read(os.path.join(work, "logs", "allocator.log"))
++export_log = _read(os.path.join(work, "logs", "export.log"))
++
++# Achieved bit budget + predicted Δloss — last allocator run in the log wins.
++_m = re.findall(
++    r"\[alloc\] target_bits=([0-9.]+): achieved_bits=([0-9.]+), .loss=([0-9.eE+-]+)",
++    alloc_log,
++)
++achieved_bpp, dloss = (_m[-1][1], _m[-1][2]) if _m else ("n/a", "n/a")
++
++# Validated-surrogate frontier selection — when present, the measured-KL
++# point supersedes the surrogate achieved bpp.
++selection_mode = E.get("INFO_SELECTION_MODE", "surrogate")
++try:
++    _sel = json.load(
++        open(os.path.join(work, "artifacts", "validated_frontier_selection.json"))
++    )
++except (OSError, ValueError):
++    _sel = None
++
++measured_kl = None
++frontier_section = ""
++if isinstance(_sel, dict):
++    _picked = _sel.get("selected") or {}
++    if _picked.get("bpp") is not None:
++        achieved_bpp = "%.3f" % float(_picked["bpp"])
++    if _picked.get("kl") is not None:
++        measured_kl = "%.6g" % float(_picked["kl"])
++    _frows = []
++    for _pt in _sel.get("frontier") or []:
++        _mark = " **◄ selected**" if _pt.get("label") == _picked.get("label") else ""
++        _frows.append(
++            "| %s | %.4f | %.6g |%s"
++            % (_pt.get("label", "?"), float(_pt.get("bpp", 0)),
++               float(_pt.get("kl", 0)), _mark)
++        )
++    if _frows:
++        frontier_section = (
++            "\n## Validated frontier (measured KL)\n\n"
++            "Real assignment-KL was measured for each allocator Pareto point "
++            "on production-rendered weights; the `%s` rule picked the "
++            "exported assignment.\n\n"
++            "| Pareto point | bpp | last-token KL |\n|---|---|---|\n%s\n"
++            % (_sel.get("selection_mode", selection_mode), "\n".join(_frows))
++        )
++
++_extra_rows = ["| Selection mode | %s |" % selection_mode]
++if measured_kl is not None:
++    _extra_rows.append("| Measured KL (selected) | %s |" % measured_kl)
++compression_extra = "\n".join(_extra_rows)
++
++# Frontier cache render mode — only meaningful under validated-surrogate.
++config_extra = ""
++if selection_mode == "validated-surrogate":
++    _union = E.get("INFO_CACHE_UNION", "0")
++    _frontier_cache = (
++        "smart-union" if _union in ("1", "true", "True") else "format-menu"
++    )
++    config_extra = "\n| Frontier cache render | %s |" % _frontier_cache
++
++# Architecture profile.
++_p = re.search(r"\[alloc\] model profile: (\S+)", alloc_log)
++profile = _p.group(1) if _p else "unknown"
++
++
++def _label(entry):
++    bits = entry.get("bits")
++    dtype = (entry.get("data_type") or "").lower()
++    if bits == 16:
++        return "BF16 (passthrough)", 16
++    if dtype.startswith("nv_fp"):
++        return "NVFP4", 4
++    if dtype.startswith("mx_fp") or "mxfp" in dtype:
++        return "MXFP8_E4M3", 8
++    if dtype.startswith("fp8"):
++        return "FP8_E4M3", 8
++    return (dtype or "unknown") + "/%sb" % bits, bits or 0
++
++
++# Per-Linear format counts — ground truth of what was exported.
++counts, bits_of, total_linears = {}, {}, 0
++try:
++    layer_config = json.load(
++        open(os.path.join(work, "artifacts", "layer_config.json"))
++    )
++    total_linears = len(layer_config)
++    for entry in layer_config.values():
++        label, bits = _label(entry)
++        counts[label] = counts.get(label, 0) + 1
++        bits_of[label] = bits
++except (OSError, ValueError):
++    pass
++
++_order = ["NVFP4", "MXFP8_E4M3", "FP8_E4M3", "BF16 (passthrough)"]
++fmt_rows = "\n".join(
++    "| %s | %s | %d |" % (k, bits_of.get(k, "?"), counts[k])
++    for k in sorted(counts, key=lambda k: _order.index(k) if k in _order else 99)
++) or "| _(layer_config.json not found)_ | | |"
++
++_h = re.search(
++    r"streamed materialization complete[^\n]*?hist=(\{[^\n]*\})", export_log
++)
++hist = _h.group(1) if _h else "(not found in export log)"
++
++_pt = re.search(
++    r"\n(\s*target\s+achieved.*?)\n\[alloc\] target_bits=", alloc_log, re.S
++)
++pareto = _pt.group(1).strip("\n") if _pt else "(not available)"
++
++base_model = E.get("INFO_BASE_MODEL", "")
++is_repo = "/" in base_model and not base_model.startswith((".", "/", "~"))
++
++front = ["---"]
++if is_repo:
++    front.append("base_model: %s" % base_model)
++front += [
++    "tags:",
++    "- prismaquant",
++    "- compressed-tensors",
++    "- quantized",
++    "license: other   # TODO: set to the base model's license before publishing",
++    "---",
++]
++
++print("\n".join(front))
++print(f'''
++# {E.get("INFO_MODEL_SHORT", "model")} — PrismaQuant compressed
++
++`{E.get("INFO_MODEL_SHORT", "model")}` quantized with **PrismaQuant** to a
++mixed-precision `compressed-tensors` checkpoint on {E.get("INFO_DATE", "")}.
++
++- **Base model:** `{base_model or "n/a"}`
++- **Architecture profile:** `{profile}`
++- **Serving target:** `{E.get("INFO_TARGET_PROFILE", "n/a")}`
++
++## Compression
++
++| Metric | Value |
++|---|---|
++| Original size | {E.get("INFO_ORIG_HUMAN", "?")} |
++| Compressed size | {E.get("INFO_EXP_HUMAN", "?")} |
++| Compression ratio | {E.get("INFO_RATIO", "?")} |
++| Disk saved | {E.get("INFO_SAVINGS_HUMAN", "?")} |
++| Target bit budget | {E.get("INFO_TARGET_BITS", "?")} bpp |
++| Achieved bit budget | {achieved_bpp} bpp |
++| Predicted Δloss | {dloss} |
++{compression_extra}
++| Pipeline wall-time | {E.get("INFO_RUNTIME", "?")} |
++
++## Quantization assignment
++
++{total_linears} Linear layers, assigned per layer by the PrismaQuant
++allocator (multi-choice knapsack over measured per-format error):
++
++| Format | Bits | Linears |
++|---|---|---|
++{fmt_rows}
++
++Exported tensor histogram:
++
++```
++{hist}
++```
++
++## PrismaQuant configuration
++
++| Setting | Value |
++|---|---|
++| Formats offered | {E.get("INFO_FORMATS", "")} |
++| Production weight cache | {E.get("INFO_PRODUCTION_CACHE", "")} |
++| Production recache | {E.get("INFO_PRODUCTION_RECACHE", "")} |
++| Render levers | {E.get("INFO_CACHE_LEVERS", "")} |
++| Cache render scope | {E.get("INFO_CACHE_RENDER_SCOPE", "")} |{config_extra}
++| NVFP4 scale rule | {E.get("INFO_NVFP4_SCALE_RULE", "")} |
++| Visual encoder format | {E.get("INFO_VISUAL_FORMAT", "")} |
++| MTP format | {E.get("INFO_MTP_FORMAT", "")} |
++| HALO mode | {E.get("INFO_HALO_MODE", "")} |
++| Quant device | {E.get("INFO_DEVICE", "")} |
++| Export device | {E.get("INFO_EXPORT_DEVICE", "")} |
++
++## Calibration
++
++| Setting | Value |
++|---|---|
++| Dataset | `{E.get("INFO_DATASET", "")}` |
++| Samples | {E.get("INFO_NSAMPLES", "")} |
++| Sequence length | {E.get("INFO_SEQLEN", "")} |
++| Modality | {E.get("INFO_CALIB_MODALITY", "")} |
++
++## Serving (vLLM)
++
++```bash
++vllm serve <path-to-this-directory> \\
++  --quantization compressed-tensors --trust-remote-code
++```
++
++Validate the export:
++
++```bash
++python3 -m prismaquant.validate_native_export --model <path-to-this-directory>
++```
++{frontier_section}
++## Allocator Pareto frontier
++
++```
++{pareto}
++```
++
++---
++Generated by `test-pipeline.sh` · PrismaQuant `{E.get("INFO_GIT", "unknown")}` · {E.get("INFO_DATE", "")}
++To publish on the HuggingFace Hub, copy this file to `README.md`.
++''')
++PY
++
 +echo "----------------------------------------"
 +echo "END TIME:   $end_time_readable"
 +echo "ORIGINAL:   ${_orig_human} (safetensors)"
 +echo "COMPRESSED: ${_exp_human} (safetensors)  →  ${_ratio} compression  (saves ${_savings_human})"
-+
-+# 3. Calculate and print total duration
-+runtime_seconds=$((end_time_seconds - start_time_seconds))
-+
-+# Format the duration into Hours:Minutes:Seconds
-+printf "TOTAL TIME: %02d:%02d:%02d\n" $((runtime_seconds/3600)) $((runtime_seconds%3600/60)) $((runtime_seconds%60))
++echo "MODEL INFO: ${_INFO_PATH}"
++printf "TOTAL TIME: %s\n" "$_runtime_str"
 +echo "========================================"
 -- 
 2.43.0

@@ -1,4 +1,4 @@
-From 7f9b0fe74793449388e0dd5a0b46ea6c433956c4 Mon Sep 17 00:00:00 2001
+From 2cf923de838c043b268139fd12b991ba0c124fd9 Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:26:09 +0200
 Subject: [PATCH 5/6] fork: Section 5 - Qwen3-Coder-Next (qwen3_next) model
