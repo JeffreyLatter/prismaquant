@@ -132,13 +132,19 @@ class Qwen3NextProfile(ModelProfile):
     # MoE — per-expert 2D on disk, 3D packed in live HF model
     # ----------------------------------------------------------------
     def packed_expert_param_names(self) -> frozenset[str]:
-        # The CHECKPOINT has per-expert 2D tensors (experts.N.gate_proj.weight
-        # etc.), not 3D packed tensors. The validate check inspects safetensors
-        # keys, so returning empty here avoids a false-negative failure.
-        # The live HF model (Qwen3NextExperts) does hold 3D packed params
-        # (gate_up_proj, down_proj); the export path detects them via
-        # _is_packed_experts_module which checks the live model directly.
-        return frozenset()
+        # The live HF model (Qwen3NextExperts) holds the expert weights as 3D
+        # nn.Parameters: gate_up_proj [E, 2·d_ffn, d_model] and
+        # down_proj [E, d_model, d_ffn].  These names are what the probe's
+        # install_packed_expert_hooks and the export's step-3d use to detect
+        # and quantize the packed expert blocks.
+        #
+        # Note: the CHECKPOINT stores per-expert 2D tensors (experts.N.gate_proj
+        # etc.), not the packed 3D tensors.  The validate_native_export check
+        # that inspects safetensors keys already handles the empty-set case
+        # gracefully (returns True / "profile declares no packed-expert names"),
+        # so returning the correct live-model names here does NOT cause a false
+        # validate failure.
+        return frozenset({"gate_up_proj", "down_proj"})
 
     def pack_checkpoint_expert_tensors(
         self, layer_prefix: str, tensors: dict

@@ -1,4 +1,4 @@
-From 5a06bfbec4a0e3e7b40da17c3bba20ee0081761e Mon Sep 17 00:00:00 2001
+From 7f9b0fe74793449388e0dd5a0b46ea6c433956c4 Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:26:09 +0200
 Subject: [PATCH 5/6] fork: Section 5 - Qwen3-Coder-Next (qwen3_next) model
@@ -31,10 +31,10 @@ profile.pack_checkpoint_expert_tensors after _read_layer_to_device.
  prismaquant/export_native_compressed.py  |  24 ++-
  prismaquant/model_profiles/__init__.py   |   2 +
  prismaquant/model_profiles/base.py       |  37 ++++
- prismaquant/model_profiles/qwen3_next.py | 238 +++++++++++++++++++++++
+ prismaquant/model_profiles/qwen3_next.py | 244 +++++++++++++++++++++++
  prismaquant/model_profiles/registry.py   |   2 +
  prismaquant/streaming_model.py           |  15 +-
- 6 files changed, 308 insertions(+), 10 deletions(-)
+ 6 files changed, 314 insertions(+), 10 deletions(-)
  create mode 100644 prismaquant/model_profiles/qwen3_next.py
 
 diff --git a/prismaquant/export_native_compressed.py b/prismaquant/export_native_compressed.py
@@ -156,10 +156,10 @@ index b72873c..78ef413 100644
          dispatch time. Added to the config_groups catch-all so every
 diff --git a/prismaquant/model_profiles/qwen3_next.py b/prismaquant/model_profiles/qwen3_next.py
 new file mode 100644
-index 0000000..fe99df0
+index 0000000..451266a
 --- /dev/null
 +++ b/prismaquant/model_profiles/qwen3_next.py
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,244 @@
 +"""Qwen3-Coder-Next (qwen3_next) profile.
 +
 +Covers:
@@ -294,13 +294,19 @@ index 0000000..fe99df0
 +    # MoE — per-expert 2D on disk, 3D packed in live HF model
 +    # ----------------------------------------------------------------
 +    def packed_expert_param_names(self) -> frozenset[str]:
-+        # The CHECKPOINT has per-expert 2D tensors (experts.N.gate_proj.weight
-+        # etc.), not 3D packed tensors. The validate check inspects safetensors
-+        # keys, so returning empty here avoids a false-negative failure.
-+        # The live HF model (Qwen3NextExperts) does hold 3D packed params
-+        # (gate_up_proj, down_proj); the export path detects them via
-+        # _is_packed_experts_module which checks the live model directly.
-+        return frozenset()
++        # The live HF model (Qwen3NextExperts) holds the expert weights as 3D
++        # nn.Parameters: gate_up_proj [E, 2·d_ffn, d_model] and
++        # down_proj [E, d_model, d_ffn].  These names are what the probe's
++        # install_packed_expert_hooks and the export's step-3d use to detect
++        # and quantize the packed expert blocks.
++        #
++        # Note: the CHECKPOINT stores per-expert 2D tensors (experts.N.gate_proj
++        # etc.), not the packed 3D tensors.  The validate_native_export check
++        # that inspects safetensors keys already handles the empty-set case
++        # gracefully (returns True / "profile declares no packed-expert names"),
++        # so returning the correct live-model names here does NOT cause a false
++        # validate failure.
++        return frozenset({"gate_up_proj", "down_proj"})
 +
 +    def pack_checkpoint_expert_tensors(
 +        self, layer_prefix: str, tensors: dict
