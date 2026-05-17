@@ -253,19 +253,28 @@ def _auto_prefetch_workers(cache_bytes: int, layer_bytes: int,
 
 
 def _auto_prefetch_min_available_bytes(layer_bytes: int,
-                                       requested: Any = None) -> tuple[int, str]:
+                                       requested: Any = None,
+                                       workers: int = 2) -> tuple[int, str]:
     raw = requested
     if raw is None:
         raw = os.environ.get("PREFETCH_MIN_AVAILABLE_GB", "auto")
     if str(raw).strip().lower() not in ("", "auto"):
         return int(float(raw) * 1024 ** 3), "explicit"
-    # Keep enough slack for at least two full dequanted layers plus a
-    # fixed floor. On UMA systems this guards both CPU RAM and CUDA
-    # allocations, since they share the same physical memory.
+    # The prefetcher's OWN memory floor: cover the worst case where every
+    # prefetch worker holds a full dequanted layer in flight at once, plus
+    # a one-layer margin for a synchronous cold read racing alongside them.
+    # On UMA systems this guards both CPU RAM and CUDA allocations, since
+    # they share the same physical memory.
+    #
+    # This is deliberately decoupled from the LayerCache headroom reserve
+    # (see StreamingContext.prefetch_floor_bytes): the cache reserve sizes
+    # for the later gradient phase, and gating phase-1 prefetch on a
+    # phase-3-sized cushion stalls the forward pipeline because phase-3's
+    # memory is not yet allocated.
     floor = 8 * 1024 ** 3
     if layer_bytes <= 0:
         return floor, "auto-fallback"
-    return max(floor, int(2 * layer_bytes)), "auto"
+    return max(floor, int((max(1, workers) + 1) * layer_bytes)), "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -354,11 +363,28 @@ class StreamingContext:
         self.configure_runtime_pressure_floor()
 
     def memory_pressure_floor_bytes(self) -> int:
-        """Available-memory floor used for speculative loads and pressure trims."""
+        """Available-memory floor for the LayerCache's proactive eviction.
+
+        Tied to the cache's headroom reserve so the cache stays within
+        the budget sized for the later gradient phase. This is the
+        cache-eviction floor only — prefetch scheduling uses the
+        narrower `prefetch_floor_bytes` (see below)."""
         return max(
             int(self.prefetch_min_available_bytes or 0),
             int(self.layer_cache.dynamic_reserve_bytes or 0),
         )
+
+    def prefetch_floor_bytes(self) -> int:
+        """Available-memory floor for speculative prefetch loads.
+
+        This is the prefetcher's OWN requirement — room for every
+        in-flight worker load plus a margin — and is deliberately
+        decoupled from the LayerCache headroom reserve. The cache
+        reserve sizes for phase-3 gradient working memory; gating
+        phase-1 prefetch on it stalls the forward pipeline because
+        phase-3's memory is not even allocated yet (every layer ends
+        up read synchronously as `src=cold`)."""
+        return int(self.prefetch_min_available_bytes or 0)
 
     def configure_runtime_pressure_floor(self) -> int:
         floor = self.memory_pressure_floor_bytes()
@@ -370,7 +396,7 @@ class StreamingContext:
         # schedule_prefetch's check may be stale if the queue was deep,
         # and the cache's dynamic budget only kicks in at put() time —
         # which is too late on UMA where the read itself can OOM.
-        pressure_floor = self.memory_pressure_floor_bytes()
+        pressure_floor = self.prefetch_floor_bytes()
         if pressure_floor > 0:
             try:
                 import psutil
@@ -402,7 +428,7 @@ class StreamingContext:
             return None
         if self.layer_cache.peek(L):
             return None
-        pressure_floor = self.memory_pressure_floor_bytes()
+        pressure_floor = self.prefetch_floor_bytes()
         if pressure_floor > 0:
             try:
                 import psutil
@@ -566,12 +592,12 @@ class StreamingContext:
         with self._inflight_lock:
             inflight = len(self._inflight)
         est_gb = self.estimated_layer_bytes / (1024 ** 3)
-        min_gb = self.prefetch_min_available_bytes / (1024 ** 3)
-        floor_gb = self.memory_pressure_floor_bytes() / (1024 ** 3)
+        prefetch_floor_gb = self.prefetch_floor_bytes() / (1024 ** 3)
+        cache_evict_gb = self.memory_pressure_floor_bytes() / (1024 ** 3)
         return (f"Prefetch: workers={self.prefetch_workers} "
                 f"inflight={inflight} est_layer={est_gb:.1f}GB "
-                f"min_avail={min_gb:.1f}GB "
-                f"pressure_floor={floor_gb:.1f}GB "
+                f"prefetch_floor={prefetch_floor_gb:.1f}GB "
+                f"cache_evict_floor={cache_evict_gb:.1f}GB "
                 f"mem_skips={self.prefetch_memory_skips}")
 
 
@@ -816,7 +842,8 @@ def _build_streaming_context(model_path: str, *,
     worker_count, worker_src = _auto_prefetch_workers(
         cache_bytes, estimated_layer_bytes, requested=prefetch_workers)
     min_available_bytes, min_available_src = _auto_prefetch_min_available_bytes(
-        estimated_layer_bytes, requested=prefetch_min_available_gb)
+        estimated_layer_bytes, requested=prefetch_min_available_gb,
+        workers=worker_count)
     cache_slots = (
         int(cache_bytes // estimated_layer_bytes)
         if estimated_layer_bytes > 0 else 0
