@@ -75,3 +75,40 @@ Compare, on the same calibration contract:
 **Promote to default-on only if** KL/bpp is preserved or improved (the
 hardware path is the faithful one, so KL should not *worsen*) **and**
 wall-time drops. Regression or inconclusive → stays opt-in / research.
+
+## A/B result — Qwen/Qwen3.5-0.8B, 2026-05-17
+
+VERDICT: **NOT promoted. Stays opt-in / research.** The measurement-loop
+FP4 GEMM regresses measured KL.
+
+`validate_assignments_kl` Pareto-frontier KL, baseline vs candidate
+(identical frontier production cache — per-layer `output_mse` matched to
+~0.2%, confirming the caches are equivalent and KL is the only moving
+part):
+
+| bpp | KL FP4_GEMM=0 | KL FP4_GEMM=1 | Δ |
+|---|---|---|---|
+| 4.95 | 0.2871 | 0.2846 | −0.9% |
+| 5.02 | 0.2151 | 0.3332 | +54.9% |
+| 5.07 | 0.1976 | 0.3336 | +68.9% |
+| 5.17 | 0.2229 | 0.2903 | +30.2% |
+| 5.33/5.42 | 0.1727 | 0.2254 | +30.5% |
+| 6.23 | 0.1712 | 0.1742 | +1.8% |
+| 7.17 | 0.0828 | 0.0924 | +11.6% |
+| 8.25 | 0.0712 | 0.0688 | −3.4% |
+
+KL regresses at 10 of 13 Pareto points, by up to +69% in the
+production-relevant 5.0–5.4 bpp band. The noisier candidate curve pushed
+the kneedle selection from 5.33 bpp (KL 0.173) to 7.17 bpp (KL 0.092) —
+the FP4 GEMM measurement path made the pipeline export a *less*
+compressed model (1.49× vs 1.65×) to clear the knee.
+
+This confirms the predicted ~10% per-NVFP4-layer numerical shift: the
+hardware fp8_e4m3 block-scale path is not a transparent substitute for
+PrismaQuant's continuous-fp32 NVFP4 cost model in the measurement loop.
+Wall-time was inconclusive (the baseline reused a pre-built frontier
+cache; the FP4 GEMM only touches the measurement loop, not cache
+construction), but the KL regression alone fails the promotion gate.
+
+Keep `PRISMAQUANT_FP4_GEMM` default-off. It remains useful as a research
+lever and for any future faithful-fp8-scale cost-model variant.
