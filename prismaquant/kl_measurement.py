@@ -1116,6 +1116,10 @@ def solve_frozen_l3_neighborhood(
 
 _LAYER_DEPTH_RE = re.compile(r"(?:^|[.])layers[.](\d+)(?:[.]|$)")
 
+# Visual-encoder Linear prefix (raw `model.visual.*` and remapped `visual.*`).
+# Mirrors allocator._VISUAL_PREFIX_RE.
+_VISUAL_PREFIX_RE = re.compile(r"^(?:model\.)?visual\.")
+
 
 def layer_depth(name: str) -> int | None:
     """Best-effort decoder-layer depth parser for depth-grouped L3 batches."""
@@ -5395,10 +5399,24 @@ def measure_assignment_kl(
             "PRISMAQUANT_STRICT_ASSIGNMENT_COVERAGE",
             default=strict_coverage_default,
         ):
+            # Visual-encoder qnames are a recipe-level --visual-format pin the
+            # exporter applies directly; they are not part of this body-KL
+            # measurement. On a text-only-staged live model (visual tower
+            # stripped) they legitimately do not resolve, and the text-only
+            # KL forward never exercises the visual tower — so they must not
+            # count as a partial assignment. Only relax this when the live
+            # model genuinely has no visual tower; on a multimodal live model
+            # a missing visual qname is a real aliasing bug and still fails.
+            live_has_visual = any(
+                _VISUAL_PREFIX_RE.match(n) for n, _ in model.named_modules()
+            )
             missing = [
                 name for name in hooks.missing
                 if fr.canonical_format_name(assignment.get(name, "BF16"))
                 != "BF16"
+                and not (
+                    not live_has_visual and _VISUAL_PREFIX_RE.match(name)
+                )
             ]
             if missing:
                 raise RuntimeError(
