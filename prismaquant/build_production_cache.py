@@ -75,6 +75,168 @@ def _estimate_model_bytes_from_index(model_path: str) -> int:
     return 0
 
 
+def _load_visual_weights(
+    model_path: str, qnames: Sequence[str],
+) -> dict[str, torch.Tensor]:
+    """Load ``qname + '.weight'`` tensors for visual Linears from the
+    ORIGINAL (un-staged) checkpoint.
+
+    ``stage_multimodal`` strips the visual tower, so visual weights are not
+    present in the staged model the body cache is built from. This reads
+    them straight from the source safetensors shards.
+    """
+    import json
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return {}
+    src = Path(model_path)
+    want = {q + ".weight" for q in qnames}
+    out: dict[str, torch.Tensor] = {}
+    idx_path = src / "model.safetensors.index.json"
+    if idx_path.exists():
+        with open(idx_path) as f:
+            wm = json.load(f).get("weight_map", {})
+        by_shard: dict[str, list[str]] = {}
+        for key, shard in wm.items():
+            if key in want:
+                by_shard.setdefault(shard, []).append(key)
+        for shard, keys in by_shard.items():
+            shard_path = src / shard
+            if not shard_path.exists():
+                continue
+            with safe_open(str(shard_path), framework="pt") as sf:
+                for k in keys:
+                    out[k[: -len(".weight")]] = sf.get_tensor(k)
+    elif src.exists():
+        for f in sorted(os.listdir(src)):
+            if not f.endswith(".safetensors"):
+                continue
+            with safe_open(str(src / f), framework="pt") as sf:
+                for k in sf.keys():
+                    if k in want:
+                        out[k[: -len(".weight")]] = sf.get_tensor(k)
+    return out
+
+
+def _render_visual_into_cache(
+    *,
+    cache,
+    model_path: str,
+    formats: Sequence[str],
+    levers: dict,
+    render_assignment: dict | None,
+    device: torch.device,
+    dtype: torch.dtype,
+    progress: bool = True,
+) -> None:
+    """Render visual-encoder Linears into an already-built production cache.
+
+    The probe / cost / body-cache pipeline runs on a text-only-staged model
+    (``stage_multimodal`` strips the visual tower), so the body cache has no
+    ``model.visual.*`` entries. But the allocator pins every visual Linear to
+    ``--visual-format`` in each (Pareto) assignment, and
+    ``validate_assignments_kl`` refuses an assignment whose production cache
+    is incomplete — which made ``SELECTION_MODE=validated-surrogate`` unusable
+    on multimodal models with a non-BF16 ``--visual-format``.
+
+    This pass loads the visual weights from the ORIGINAL checkpoint and
+    renders them with no activations: text-only calibration never exercises
+    the visual tower, so there are no activations to drive GPTQ — RTN is the
+    only option, and it matches what the exporter emits for visual Linears.
+    """
+    from prismaquant.allocator import discover_visual_linears_from_source
+    from prismaquant.production_weight_cache import (
+        _cache_weight_filename,
+        _render_base_format,
+        _store_rendered_weight_entry,
+        render_production_weight,
+    )
+
+    visual_qnames = discover_visual_linears_from_source(model_path)
+    if not visual_qnames:
+        return
+
+    weights_tensors = _load_visual_weights(model_path, visual_qnames)
+    if not weights_tensors:
+        if progress:
+            print(
+                f"[build-prod-cache] visual: discovered {len(visual_qnames)} "
+                "visual Linears but loaded 0 weights from source; skipping",
+                flush=True,
+            )
+        return
+
+    non_bf16 = [f for f in formats if str(f).strip().upper() != "BF16"]
+    cache_dir_path = (
+        Path(cache.cache_dir) if getattr(cache, "cache_dir", None) else None
+    )
+    failed_map = getattr(cache, "failed", None)
+    rendered = 0
+    failed = 0
+    for q in visual_qnames:
+        weight = weights_tensors.get(q)
+        if weight is None:
+            continue
+        if render_assignment is not None:
+            fmt = str(render_assignment.get(q, "BF16")).strip().upper()
+            fmts = [fmt] if fmt != "BF16" else []
+        else:
+            fmts = list(non_bf16)
+        if not fmts:
+            continue
+        w = weight.to(device=device, dtype=dtype)
+        for fmt in fmts:
+            fmt_key = str(fmt).upper()
+            key = (q, fmt_key)
+            if key in cache.weights:
+                continue
+            if cache_dir_path is not None:
+                fname = _cache_weight_filename(q, fmt_key)
+                if (cache_dir_path / fname).is_file():
+                    cache.weights[key] = fname
+                    continue
+            try:
+                w_dq = render_production_weight(
+                    w,
+                    _render_base_format(fmt_key),
+                    qname=q,
+                    activations={},
+                    levers=levers,
+                    joint_global_real=None,
+                    input_global_scale=None,
+                )
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                if failed_map is not None:
+                    failed_map[key] = str(e)
+                if progress:
+                    print(
+                        f"[build-prod-cache] visual FAILED {q} @ {fmt_key}: {e}",
+                        flush=True,
+                    )
+                continue
+            _store_rendered_weight_entry(
+                weights=cache.weights,
+                cache_dir_path=cache_dir_path,
+                qname=q,
+                fmt=fmt_key,
+                tensor=w_dq,
+                weight_dtype=weight.dtype,
+            )
+            del w_dq
+            rendered += 1
+        del w
+    if progress:
+        print(
+            f"[build-prod-cache] visual: rendered {rendered} (qname, fmt) "
+            f"entries for {len(visual_qnames)} visual Linears "
+            f"({failed} failures)",
+            flush=True,
+        )
+
+
 def _fill_production_cache_streaming(
     *,
     model_path: str,
@@ -937,6 +1099,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 recache_microbatch_size=args.recache_microbatch_size,
                 h_detail_dir=args.h_detail_dir,
             )
+        # Render visual-encoder Linears into the cache. The body pipeline
+        # runs on a text-only-staged model with the visual tower stripped, so
+        # without this the cache has no model.visual.* entries and
+        # validate_assignments_kl rejects every assignment that pins visual
+        # Linears to a non-BF16 --visual-format (the validated-surrogate
+        # frontier path on multimodal models).
+        try:
+            _render_visual_into_cache(
+                cache=cache,
+                model_path=args.model,
+                formats=formats,
+                levers=levers,
+                render_assignment=render_assignment,
+                device=device,
+                dtype=dtype,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[build-prod-cache] WARNING: visual render pass failed ({e!r}); "
+                "cache has no visual entries",
+                flush=True,
+            )
+
         elapsed = time.monotonic() - t0
         # Strict coverage validation: every (qname, NVFP4) must be present
         # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky
