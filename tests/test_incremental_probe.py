@@ -121,5 +121,105 @@ class TestIncrementalProbe(unittest.TestCase):
                 p_fast.grad, p_ref.grad, atol=1e-6, rtol=1e-6))
 
 
+def _build_tiny_model(path: Path) -> int:
+    """Write a tiny Llama checkpoint + fast tokenizer to `path`.
+    Returns the number of decoder layers."""
+    from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    n_layers = 6
+    cfg = LlamaConfig(
+        vocab_size=256, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=n_layers, num_attention_heads=4,
+        num_key_value_heads=4, max_position_embeddings=128,
+        tie_word_embeddings=False)
+    LlamaForCausalLM(cfg).to(torch.bfloat16).save_pretrained(
+        path, safe_serialization=True)
+
+    words = ("the quick brown fox jumps over a lazy dog and then runs far "
+             "away into deep dark woods").split()
+    vocab = {"<unk>": 0, "<pad>": 1, "<s>": 2, "</s>": 3}
+    for w in sorted(set(words)):
+        vocab[w] = len(vocab)
+    tk = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tk.pre_tokenizer = pre_tokenizers.Whitespace()
+    PreTrainedTokenizerFast(
+        tokenizer_object=tk, unk_token="<unk>", pad_token="<pad>",
+        bos_token="<s>", eos_token="</s>", model_max_length=128,
+    ).save_pretrained(path)
+    return n_layers
+
+
+class TestPhase3GradCarry(unittest.TestCase):
+    """Part 1 of the pipeline-parallel work: the phase-3 reverse sweep
+    carries `grad_out` shard→shard instead of restarting from the model
+    tail every shard. That is a pure dead-code elimination — the chain
+    rule split at a layer boundary and resumed with the saved
+    intermediate is identical to the full sweep. This test proves it:
+    the merged probe.pkl Fisher stats must be bit-identical regardless
+    of `--layers-per-shard` (which controls how many shards, hence how
+    much carrying happens). lps=6 sweeps the whole model in one shard
+    with NO carry (the baseline); lps=1 carries between all 6 shards."""
+
+    def test_grad_carry_is_lps_invariant(self):
+        try:
+            import transformers  # noqa: F401
+            import tokenizers  # noqa: F401
+        except Exception:
+            self.skipTest("transformers/tokenizers not available")
+
+        import json
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model_dir = root / "tiny"
+            _build_tiny_model(model_dir)
+
+            calib = root / "calib.jsonl"
+            with open(calib, "w") as f:
+                f.write(json.dumps({"__manifest__": {
+                    "schema": "prismaquant.calibration.diverse_v1",
+                    "version": "test"}}) + "\n")
+                for _ in range(4):
+                    f.write(json.dumps({"text": " ".join(
+                        ["the quick brown fox jumps over a lazy dog"] * 6)})
+                        + "\n")
+
+            def run(lps: int) -> dict:
+                out = root / f"run{lps}"
+                subprocess.run(
+                    [sys.executable, "-m", "prismaquant.incremental_probe",
+                     "--model", str(model_dir), "--dataset", str(calib),
+                     "--nsamples", "4", "--seqlen", "32",
+                     "--device", "cpu", "--dtype", "bf16",
+                     "--output", str(out / "probe.pkl"),
+                     "--activation-cache-dir", str(out / "act"),
+                     "--work-dir", str(out / "work"),
+                     "--layers-per-shard", str(lps)],
+                    check=True, capture_output=True, text=True)
+                with open(out / "probe.pkl", "rb") as f:
+                    return pickle.load(f)["stats"]
+
+            baseline = run(6)   # one shard, full sweep, no carry
+            carried = run(1)    # six shards, carry between each
+
+            self.assertEqual(set(baseline), set(carried),
+                             "stat key sets differ between lps=1 and lps=6")
+            self.assertTrue(baseline, "probe produced no stats")
+            for fqn in baseline:
+                for k in ("h_trace", "h_w2_sum", "h_trace_raw",
+                          "h_w2_sum_raw", "n_tokens_seen"):
+                    vb = baseline[fqn].get(k)
+                    vc = carried[fqn].get(k)
+                    if vb is None or vc is None:
+                        continue
+                    self.assertEqual(
+                        float(vb), float(vc),
+                        f"{fqn}.{k}: carry (lps=1) {vc} != baseline "
+                        f"(lps=6) {vb} — grad carry changed the math")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1475,7 +1475,9 @@ def _run_body_streaming_shard(
     minimax_fast_moe_chunk_size: int = 32,
     activation_rows_limit: int = 256,
     precomputed: GlobalPrecompute | None = None,
-):
+    seed_grad: torch.Tensor | None = None,
+    seed_ceil: int | None = None,
+) -> tuple[torch.Tensor | None, int | None]:
     if precomputed is None:
         raise ValueError(
             "_run_body_streaming_shard requires precomputed Phase-1/Phase-2 "
@@ -1549,7 +1551,8 @@ def _run_body_streaming_shard(
                     "linear_exclude": linear_exclude,
                 },
             }, f)
-        return
+        # No layers swept -> no bottom-edge gradient for a lower shard.
+        return None, None
     print(f"[incremental] body shard: tracking {total_tracked} body Linears "
           f"across {sum(1 for x in layer_linear_names if x)} layers "
           f"+ {len(resident_linears)} resident Linears "
@@ -1717,6 +1720,9 @@ def _run_body_streaming_shard(
         # precompute; do not free it here — the caller reuses across
         # shards. `grad_at_tail` is a per-shard device copy.
         del grad_at_tail
+        # Resident-only shard: no body layers swept, so there is no
+        # bottom-edge gradient to hand to a lower shard.
+        bottom_edge_grad = None
     else:
         # ---- Phase 3: reverse sweep, Fisher collection only on tracked Linears ----
         _print_mem_snapshot("phase-3 start")
@@ -1726,25 +1732,72 @@ def _run_body_streaming_shard(
         phase_pressure_trim_bytes = 0
         load_by_src: dict[str, float] = defaultdict(float)
         count_by_src: dict[str, int] = defaultdict(int)
-        grad_out = grad_at_tail
+        in_scope_layers = {L for L in range(num_layers) if layer_linear_names[L]}
+        # Reverse-sweep bounds.
+        #
+        # Lower bound (`sweep_floor`): processing a layer L does exactly
+        # two things — (a) collect Fisher for tracked Linears IN layer L,
+        # and (b) produce grad_out for layer L-1. Below the shard's lowest
+        # tracked layer, (a) is empty and (b) feeds layers that are also
+        # out of scope, so the sweep can stop once `sweep_floor` is done.
+        # `total_tracked == 0` was handled above, so the set is non-empty.
+        #
+        # Upper bound + seed (`sweep_ceil` / `grad_out`): the reverse
+        # sweep is the chain rule applied layer by layer. Splitting that
+        # chain at a layer boundary and resuming with the saved
+        # intermediate gradient is mathematically identical to sweeping
+        # the whole chain at once. `seed_grad`, when the caller provides
+        # it, IS that saved intermediate — the gradient w.r.t. the output
+        # of this shard's highest tracked layer (grad w.r.t.
+        # activations_cpu[sweep_ceil + 1]). With it, the sweep starts at
+        # the shard's own top layer and never re-traverses the layers
+        # above. Without it (topmost shard, or resume with no carry on
+        # disk) the sweep seeds from the model-tail gradient and starts at
+        # num_layers-1 — the original behavior. Either path yields
+        # bit-identical per-layer Fisher; the seed only removes redundant
+        # re-traversal. This bound is derived purely from `in_scope_layers`
+        # (the shard's include scope), so it is correct for any model.
+        sweep_floor = min(in_scope_layers)
+        # Carry validity: `seed_grad` is the gradient w.r.t. the OUTPUT of
+        # layer `seed_ceil`. The seed is only usable if that layer is in
+        # fact this shard's highest tracked layer — otherwise the chain
+        # would be spliced at the wrong point. The caller derives the
+        # carry from the shard schedule; this check re-derives the bound
+        # from the shard's ACTUAL tracked layers, so a schedule/scope
+        # disagreement (e.g. a pathological layer with no tracked Linears)
+        # is caught here and the sweep falls back to a correct full-tail
+        # traversal rather than silently corrupting the gradient.
+        use_seed = (seed_grad is not None
+                    and seed_ceil == max(in_scope_layers))
+        if seed_grad is not None and not use_seed:
+            print(f"[incremental] phase-3 carry rejected (seed_ceil="
+                  f"{seed_ceil} != shard top L{max(in_scope_layers)}); "
+                  f"falling back to full-tail sweep", flush=True)
+        if use_seed:
+            grad_out = seed_grad
+            sweep_ceil = seed_ceil
+        else:
+            grad_out = grad_at_tail
+            sweep_ceil = num_layers - 1
         # Smart cache: register in-scope (tracked) layers as priority so the
         # cache prefers evicting out-of-scope entries first. Also configure
         # pressure-triggered eviction (Task #3) so spikes during MoE hook
-        # firing don't push the system to OOM. Threshold = max(prefetch
-        # pause floor, dynamic cache reserve).
-        in_scope_layers = {L for L in range(num_layers) if layer_linear_names[L]}
+        # firing don't push the system to OOM.
         ctx.layer_cache.set_priority_layers(in_scope_layers)
         ctx.configure_runtime_pressure_floor()
-        # Reverse-prefetch (Task #5): prefetcher should now look BACKWARD
-        # in layer index since reverse sweep walks num_layers-1 → 0.
-        # Schedule lookahead in the direction we're actually going.
+        # Reverse-prefetch (Task #5): prefetcher looks BACKWARD in layer
+        # index since the reverse sweep walks sweep_ceil → sweep_floor.
         for d in range(prefetch_depth):
-            ctx.schedule_prefetch(num_layers - 1 - d)
+            ctx.schedule_prefetch(sweep_ceil - d)
 
-        for L in reversed(range(num_layers)):
+        for L in reversed(range(sweep_floor, sweep_ceil + 1)):
             load_t0 = time.time()
             src = ctx.install(L)
-            ctx.schedule_prefetch(L - prefetch_depth)
+            # Don't prefetch below sweep_floor — those layers are never
+            # installed, so the read would be wasted I/O.
+            nxt = L - prefetch_depth
+            if nxt >= sweep_floor:
+                ctx.schedule_prefetch(nxt)
             load_s = time.time() - load_t0
             phase_load_s += load_s
             load_by_src[src] += load_s
@@ -2351,7 +2404,7 @@ def _run_body_streaming_shard(
                     import gc as _gc
                     _gc.collect()
 
-            if L % 8 == 0 or L == 0 or L == num_layers - 1:
+            if L % 8 == 0 or L == sweep_floor or L == sweep_ceil:
                 print(f"[incremental] bwd L{L:02d}  src={src}  load={load_s:.2f}s  "
                       f"bwd={bwd_s:.2f}s", flush=True)
 
@@ -2359,7 +2412,11 @@ def _run_body_streaming_shard(
             f"{k}:{load_by_src[k]:.1f}s/{count_by_src[k]}"
             for k in sorted(load_by_src)
         )
+        swept = sweep_ceil + 1 - sweep_floor
+        seed_src = "carry" if seed_grad is not None else "grad_at_tail"
         print(f"[incremental] phase-3 reverse sweep: {time.time()-t_phase:.1f}s  "
+              f"swept={swept}/{num_layers} "
+              f"(L{sweep_floor:02d}..L{sweep_ceil:02d}, seed={seed_src})  "
               f"load={phase_load_s:.1f}s bwd={phase_bwd_s:.1f}s "
               f"pressure_trim={phase_pressure_trim_bytes/(1024**3):.1f}GB "
               f"load_by_src=[{load_parts}]  "
@@ -2367,10 +2424,17 @@ def _run_body_streaming_shard(
               flush=True)
         _print_mem_snapshot("phase-3 done")
 
+        # `grad_out` after the loop holds the gradient w.r.t. the input
+        # of the lowest swept layer (== grad w.r.t. activations_cpu[
+        # sweep_floor]). That is exactly the seed the next-lower shard
+        # needs as its `seed_grad`. It is already a detached CPU tensor
+        # (see the `grad_out = x_in.grad.detach().clone().cpu()` line in
+        # the loop), so it is cheap to hand back / persist.
+        bottom_edge_grad = grad_out
         # `activations_cpu` is a shared reference into the global
         # precompute; do not free it here — the caller reuses across
-        # shards. `grad_at_tail` / `grad_out` are per-shard device copies.
-        del grad_at_tail, grad_out
+        # shards. `grad_at_tail` is a per-shard device copy.
+        del grad_at_tail
 
     # ---- Finalize ----
     for s in merged_stats.values():
@@ -2486,6 +2550,11 @@ def _run_body_streaming_shard(
             },
         }, f)
     print(f"[incremental] wrote {out_path}", flush=True)
+    # Return the bottom-edge gradient (grad w.r.t. activations_cpu[
+    # sweep_floor]) and that floor layer index, for the next-lower
+    # shard's `seed_grad` / carry bookkeeping. (None, None) for
+    # resident-only shards (no body layers swept).
+    return bottom_edge_grad, (sweep_floor if total_tracked != 0 else None)
 
 
 # ---------------------------------------------------------------------------
@@ -3186,11 +3255,104 @@ def main():
                   f"refused_so_far={ctx.layer_cache.refused_puts})",
                   flush=True)
 
+    # ---- Phase-3 shard→shard gradient carry ---------------------------
+    # The phase-3 reverse sweep is the chain rule. Historically every
+    # body shard restarted its sweep from `grad_at_tail` at the model
+    # tail, re-traversing all the layers above its own scope — O(N)
+    # redundant fwd/bwd per shard. Instead we process body shards in
+    # DESCENDING layer order and carry the bottom-edge gradient of each
+    # shard into the next-lower shard as its `seed_grad`, so each shard
+    # sweeps only its own layers. This is mathematically identical to the
+    # full sweep (splitting a chain-rule product at a layer boundary and
+    # resuming with the saved intermediate yields the same result); it
+    # only removes redundant recomputation.
+    #
+    # Body shards from `build_shard_schedule` are contiguous, disjoint
+    # layer ranges, so descending shard_idx == descending layer order and
+    # consecutive shards are adjacent. The carry is validated against the
+    # consumer's expected top layer; on any mismatch (or a missing
+    # boundary on resume) the consumer falls back to a full-tail sweep —
+    # correctness is never at risk, the optimization is simply skipped.
+    body_layer_bounds: dict[int, tuple[int, int]] = {
+        e.shard_idx: (min(e.layer_indices), max(e.layer_indices))
+        for e in schedule if e.kind == "body" and e.layer_indices
+    }
+    grad_dir = precompute_cache_path.parent
+    carry_grad: torch.Tensor | None = None
+    carry_top: int | None = None
+
+    def _boundary_path(idx: int) -> Path:
+        return grad_dir / f"grad_boundary_{idx:03d}.pt"
+
+    def _load_boundary(idx: int, expect_top: int) -> torch.Tensor | None:
+        p = _boundary_path(idx)
+        if not p.exists():
+            return None
+        try:
+            d = torch.load(p, map_location="cpu")
+            if int(d.get("top", -1)) == expect_top:
+                return d["grad"]
+        except Exception:
+            pass
+        return None
+
+    def _seed_for(shard_idx: int) -> tuple[torch.Tensor | None, int | None]:
+        """`(seed_grad, seed_ceil)` for this body shard: the gradient
+        entering its top layer plus the layer index that gradient is the
+        OUTPUT-grad of. `(None, None)` ⇒ seed from the model tail."""
+        if shard_idx == last_body_shard_idx or shard_idx not in body_layer_bounds:
+            return None, None  # topmost body shard
+        _lo, hi = body_layer_bounds[shard_idx]
+        if carry_grad is not None and carry_top == hi:
+            return carry_grad, hi
+        # In-memory carry unavailable (shard above reused/synthesized or
+        # this is a resumed run): try the boundary the shard above
+        # persisted. Its file carries `top == (its lo) - 1 == hi`.
+        disk = _load_boundary(shard_idx + 1, expect_top=hi)
+        return (disk, hi) if disk is not None else (None, None)
+
+    def _record_boundary(shard_idx: int,
+                         computed_bottom: torch.Tensor | None,
+                         computed_floor: int | None):
+        """Update the in-memory carry + persist the boundary for the
+        next-lower body shard. `computed_floor` is the ACTUAL lowest
+        layer the shard swept (returned by `_run_body_streaming_shard`),
+        so the persisted `top` is correct even if the shard's tracked
+        scope differs from the schedule's nominal layer range."""
+        nonlocal carry_grad, carry_top
+        if shard_idx not in body_layer_bounds:
+            return
+        lo, _hi = body_layer_bounds[shard_idx]
+        if computed_bottom is not None and computed_floor is not None:
+            carry_grad = computed_bottom
+            carry_top = computed_floor - 1
+            try:
+                grad_dir.mkdir(parents=True, exist_ok=True)
+                torch.save({"grad": computed_bottom, "top": computed_floor - 1},
+                           _boundary_path(shard_idx))
+            except Exception:
+                pass
+        else:
+            # Shard reused/synthesized this run — no fresh tensor. Fall
+            # back to a boundary persisted by a previous run, if any.
+            carry_grad = _load_boundary(shard_idx, expect_top=lo - 1)
+            carry_top = (lo - 1) if carry_grad is not None else None
+
+    # Body shards descending (carry flows tail→head), then non-body
+    # shards (mtp / lm_head / visual) in ascending order.
+    body_exec = sorted(
+        (e.shard_idx for e in schedule if e.kind == "body"), reverse=True)
+    nonbody_exec = sorted(
+        e.shard_idx for e in schedule if e.kind != "body")
+    exec_order = body_exec + nonbody_exec
+
     try:
         if not all_reusable:
             _ensure_ready()
 
-        for shard_idx, linear_include in enumerate(shard_regexes):
+        for shard_idx in exec_order:
+            linear_include = shard_regexes[shard_idx]
+            kind = _classify_shard(linear_include)
             # v20 fix #3: when crossing the body→non-body boundary,
             # mark body layers done before the next (non-body) shard
             # runs so its memory pressure benefits from the freed
@@ -3203,14 +3365,16 @@ def main():
             if shard_path.exists() and probe_shard_is_reusable(shard_path, expected_meta):
                 print(f"[incremental] reuse shard {shard_idx}: {shard_path}",
                       flush=True)
+                # Reused shard wasn't swept this run — refresh the carry
+                # from any boundary persisted by a prior run.
+                _record_boundary(shard_idx, None, None)
                 continue
 
             # LPS-invariant reuse: try to synthesize this shard from
             # cached per-Linear stats pooled from other compatible
             # shards. Skip body+lm_head+mtp kinds only — visual/empty
             # shards don't have per-Linear stats to reuse.
-            kind_for_synth = _classify_shard(linear_include)
-            if kind_for_synth in ("body", "mtp", "lm_head") and linear_cache:
+            if kind in ("body", "mtp", "lm_head") and linear_cache:
                 if synthesize_shard_from_linear_cache(
                     linear_include=linear_include,
                     linear_exclude=content_meta_anchor["linear_exclude"],
@@ -3220,20 +3384,22 @@ def main():
                 ):
                     annotate_probe_shard(shard_path, expected_meta)
                     print(f"[incremental] synthesize shard {shard_idx} "
-                          f"({kind_for_synth}): reused cached Linear stats "
+                          f"({kind}): reused cached Linear stats "
                           f"→ {shard_path}", flush=True)
+                    # Synthesized shard wasn't swept — refresh carry from disk.
+                    _record_boundary(shard_idx, None, None)
                     continue
             if shard_path.exists():
                 print(f"[incremental] stale shard {shard_idx}: "
                       f"recomputing {shard_path}", flush=True)
-            kind = _classify_shard(linear_include)
             print(f"[incremental] shard {shard_idx} ({kind}): "
                   f"include={linear_include!r}", flush=True)
             _ensure_ready()
 
             if kind == "body":
                 pre = _ensure_precompute()
-                _run_body_streaming_shard(
+                seed_g, seed_c = _seed_for(shard_idx)
+                bottom_grad, bottom_floor = _run_body_streaming_shard(
                     ctx,
                     calib=calib,
                     linear_include=linear_include,
@@ -3251,7 +3417,12 @@ def main():
                     minimax_fast_moe_chunk_size=args.minimax_fast_moe_chunk_size,
                     activation_rows_limit=args.activation_rows_limit,
                     precomputed=pre,
+                    seed_grad=seed_g,
+                    seed_ceil=seed_c,
                 )
+                # Hand this shard's bottom-edge gradient to the next
+                # (lower) body shard, and persist it for resume.
+                _record_boundary(shard_idx, bottom_grad, bottom_floor)
             elif kind == "mtp":
                 pre = _ensure_precompute()
                 _run_mtp_streaming_shard(
