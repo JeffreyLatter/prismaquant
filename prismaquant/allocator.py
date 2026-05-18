@@ -237,6 +237,11 @@ def apply_mtp_format_override(
     return out
 
 
+def _is_forced_mtp_passthrough(name: str, mtp_format: str) -> bool:
+    """True when MTP is explicitly kept outside the optimized budget."""
+    return str(name).startswith("mtp.") and fr.canonical_format_name(mtp_format) == "BF16"
+
+
 def discover_visual_linears_from_source(model_path: str) -> list[str]:
     """Scan the source safetensors index for `model.visual.blocks.*.weight`
     entries with rank-2 shapes — these are the Linear modules the visual
@@ -491,6 +496,25 @@ def main():
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
 
+    forced_passthrough_assignment: dict[str, str] = {}
+    allocation_excluded = []
+    for name in sorted(set(stats) | set(costs)):
+        if model_profile.is_pinned_name(name):
+            allocation_excluded.append(name)
+        elif _is_forced_mtp_passthrough(name, args.mtp_format):
+            forced_passthrough_assignment[name] = args.mtp_format
+            allocation_excluded.append(name)
+    if allocation_excluded:
+        excluded = set(allocation_excluded)
+        stats = {name: value for name, value in stats.items() if name not in excluded}
+        costs = {name: value for name, value in costs.items() if name not in excluded}
+        print(
+            "[alloc] forced passthrough excluded from DP budget: "
+            f"{len(allocation_excluded)} Linears "
+            f"(sample: {allocation_excluded[:8]})",
+            flush=True,
+        )
+
     if args.formats:
         fmt_names = [s.strip() for s in args.formats.split(",") if s.strip()]
     else:
@@ -656,6 +680,7 @@ def main():
         expanded = dict(assignment)
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
+        expanded.update(forced_passthrough_assignment)
         return promote_moe_pair(expanded, format_rank, profile=model_profile)
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
@@ -693,6 +718,11 @@ def main():
         })
         if args.pareto_output_dir:
             expanded = _expand_assignment_for_seed_json(assign)
+            if any(name.startswith("mtp.") for name in expanded):
+                expanded = apply_mtp_format_override(
+                    expanded,
+                    args.mtp_format,
+                )
             expanded_counts = defaultdict(int)
             for fmt in expanded.values():
                 expanded_counts[fmt] += 1
@@ -806,6 +836,8 @@ def main():
     if not args.no_fused_aggregation:
         assignment_expanded = expand_fused_sibling_assignment(
             assignment_expanded, stats)
+
+    assignment_expanded.update(forced_passthrough_assignment)
 
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. This keeps per-Linear assignments serveable without

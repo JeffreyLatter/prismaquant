@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import os
 import pickle
 import shutil
@@ -87,12 +88,71 @@ def _parse_labeled_path(value: str) -> tuple[str, Path]:
     path = Path(value)
     return path.stem, path
 
-def _assignment_bpp(stats: Mapping, assignment: Mapping[str, str], specs_by_name: Mapping[str, fr.FormatSpec]) -> float:
-    names = [name for name in assignment if name in stats]
+def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
+    if profile is None:
+        return False
+    is_pinned = getattr(profile, "is_pinned_name", None)
+    if callable(is_pinned) and bool(is_pinned(name)):
+        return True
+    if fr.canonical_format_name(fmt) != "BF16":
+        return False
+    passthrough_prefixes = getattr(profile, "source_passthrough_prefixes", None)
+    if callable(passthrough_prefixes):
+        for raw_prefix in passthrough_prefixes():
+            prefix = str(raw_prefix)
+            if not prefix:
+                continue
+            if name == prefix.rstrip(".") or name.startswith(prefix):
+                return True
+    return False
+
+
+def _assignment_bpp_details(
+    stats: Mapping,
+    assignment: Mapping[str, str],
+    specs_by_name: Mapping[str, fr.FormatSpec],
+    *,
+    profile=None,
+) -> dict[str, float | int]:
+    names = [
+        name for name, fmt in assignment.items()
+        if name in stats and not _profile_excludes_bpp_name(str(name), str(fmt), profile)
+    ]
     total_params = sum(int(stats[name].get("n_params", 0) or 0) for name in names)
     if total_params <= 0:
-        return 0.0
-    return assignment_bit_total(stats, assignment, specs_by_name) / float(total_params)
+        return {
+            "bpp": 0.0,
+            "quantizable_entries": 0,
+            "excluded_entries": sum(1 for name in assignment if name in stats),
+            "quantizable_params": 0,
+        }
+    filtered_assignment = {name: assignment[name] for name in names}
+    return {
+        "bpp": assignment_bit_total(stats, filtered_assignment, specs_by_name) / float(total_params),
+        "quantizable_entries": len(names),
+        "excluded_entries": sum(
+            1 for name, fmt in assignment.items()
+            if name in stats and _profile_excludes_bpp_name(str(name), str(fmt), profile)
+        ),
+        "quantizable_params": total_params,
+    }
+
+
+def _assignment_bpp(
+    stats: Mapping,
+    assignment: Mapping[str, str],
+    specs_by_name: Mapping[str, fr.FormatSpec],
+    *,
+    profile=None,
+) -> float:
+    return float(
+        _assignment_bpp_details(
+            stats,
+            assignment,
+            specs_by_name,
+            profile=profile,
+        )["bpp"]
+    )
 
 
 def _lookup_cost_entry(costs: Mapping, name: str, fmt: str) -> Mapping | None:
@@ -328,6 +388,76 @@ def _activation_quant_assignment(
     return out
 
 
+def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
+    repeats = max(int(args.calib_repeats), 1)
+    n_samples = int(args.n_calib_samples)
+    if repeats == 1:
+        if args.dataset:
+            return [load_calibration(
+                tokenizer,
+                args.dataset,
+                n_samples,
+                args.calib_seqlen,
+            )]
+        return [load_wikitext_calibration_windowed(
+            tokenizer,
+            n_samples,
+            args.calib_seqlen,
+            split=args.calib_split,
+            seed=args.calib_seed,
+        )]
+    if args.dataset:
+        all_ids = load_calibration(
+            tokenizer,
+            args.dataset,
+            n_samples * repeats,
+            args.calib_seqlen,
+        )
+        if all_ids.size(0) < n_samples * repeats:
+            raise RuntimeError(
+                f"requested {repeats} calibration repeats of {n_samples} samples, "
+                f"but only loaded {all_ids.size(0)} samples"
+            )
+        return [
+            all_ids[idx * n_samples:(idx + 1) * n_samples].contiguous()
+            for idx in range(repeats)
+        ]
+    stride = int(args.calib_repeat_seed_stride)
+    return [
+        load_wikitext_calibration_windowed(
+            tokenizer,
+            n_samples,
+            args.calib_seqlen,
+            split=args.calib_split,
+            seed=int(args.calib_seed) + idx * stride,
+        )
+        for idx in range(repeats)
+    ]
+
+
+def _kl_repeat_summary(values: Sequence[float], *, ucb_z: float) -> dict[str, object]:
+    vals = [float(value) for value in values]
+    if not vals:
+        raise ValueError("KL repeat summary received no values")
+    mean = sum(vals) / len(vals)
+    if len(vals) <= 1:
+        std = 0.0
+        stderr = 0.0
+    else:
+        var = sum((value - mean) ** 2 for value in vals) / (len(vals) - 1)
+        std = math.sqrt(max(var, 0.0))
+        stderr = std / math.sqrt(len(vals))
+    return {
+        "last_token_kl": float(mean),
+        "kl_repeats": vals,
+        "kl_repeat_count": len(vals),
+        "kl_std": float(std),
+        "kl_stderr": float(stderr),
+        "kl_ucb": float(mean + float(ucb_z) * stderr),
+        "kl_ucb_z": float(ucb_z),
+    }
+
+
 @torch.no_grad()
 def _measure_inplace_assignment_kl(
     model,
@@ -462,6 +592,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calib-seqlen", type=int, default=128)
     parser.add_argument("--calib-split", default="train")
     parser.add_argument("--calib-seed", type=int, default=42)
+    parser.add_argument(
+        "--calib-repeats",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent calibration chunks to measure per assignment. "
+            "For --dataset, a single larger load is split into repeat chunks; "
+            "for WikiText, seeds advance by --calib-repeat-seed-stride."
+        ),
+    )
+    parser.add_argument("--calib-repeat-seed-stride", type=int, default=997)
+    parser.add_argument(
+        "--kl-ucb-z",
+        type=float,
+        default=1.0,
+        help="Upper-confidence multiplier applied to KL stderr when repeats > 1.",
+    )
     parser.add_argument(
         "--dataset",
         default=None,
@@ -621,21 +768,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif device.type == "cuda":
             load_kwargs["device_map"] = device_str
         tokenizer = AutoTokenizer.from_pretrained(staged, **tokenizer_kwargs)
-        if args.dataset:
-            calib_ids = load_calibration(
-                tokenizer,
-                args.dataset,
-                args.n_calib_samples,
-                args.calib_seqlen,
-            )
-        else:
-            calib_ids = load_wikitext_calibration_windowed(
-                tokenizer,
-                args.n_calib_samples,
-                args.calib_seqlen,
-                split=args.calib_split,
-                seed=args.calib_seed,
-            )
+        calib_repeats = _load_calibration_repeats(tokenizer, args)
         source_prefetch_stats = prefetch_safetensors_checkpoint(
             staged,
             mode=args.source_prefetch,
@@ -709,12 +842,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile = detect_profile(args.model)
         except Exception:
             profile = DefaultProfile()
-        ref_log_probs = cache_reference_log_probs(
-            model,
-            calib_ids,
-            model_device,
-            kl_scope=args.kl_scope,
-        )
+        ref_log_prob_repeats = [
+            cache_reference_log_probs(
+                model,
+                calib_ids,
+                model_device,
+                kl_scope=args.kl_scope,
+            )
+            for calib_ids in calib_repeats
+        ]
 
         results = []
         for label, assignment, path in assignments:
@@ -752,50 +888,75 @@ def main(argv: Sequence[str] | None = None) -> int:
                         progress=True,
                         log_prefix="[validate-kl]",
                     )
-            if materialization_mode == "inplace":
-                kl, replay_stats = _measure_inplace_assignment_kl(
-                    model,
-                    assignment,
-                    calib_ids,
-                    ref_log_probs,
-                    work_root=work_root,
-                    profile=profile,
-                    production_cache=production_cache,
-                    kl_scope=args.kl_scope,
-                    use_cuda_graphs=(
-                        None if args.kl_cuda_graphs == "auto"
-                        else args.kl_cuda_graphs == "on"
-                    ),
-                )
-            else:
-                kl = measure_assignment_kl(
-                    model,
-                    assignment,
-                    calib_ids,
-                    ref_log_probs,
-                    work_root=work_root,
-                    profile=profile,
-                    use_frozen_weight_cache=not args.disable_frozen_weight_cache,
-                    production_weight_cache=production_cache,
-                    use_cuda_graphs=(
-                        None if args.kl_cuda_graphs == "auto"
-                        else args.kl_cuda_graphs == "on"
-                    ),
-                    kl_scope=args.kl_scope,
-                    stream_ref_log_probs=args.kl_scope == "full_sequence",
-                )
-                replay_stats = {"mode": "hooks"}
+            kl_values: list[float] = []
+            replay_runs: list[dict[str, object]] = []
+            for repeat_idx, (calib_ids, ref_log_probs) in enumerate(
+                zip(calib_repeats, ref_log_prob_repeats, strict=True)
+            ):
+                if materialization_mode == "inplace":
+                    kl_value, replay_stats = _measure_inplace_assignment_kl(
+                        model,
+                        assignment,
+                        calib_ids,
+                        ref_log_probs,
+                        work_root=work_root,
+                        profile=profile,
+                        production_cache=production_cache,
+                        kl_scope=args.kl_scope,
+                        use_cuda_graphs=(
+                            None if args.kl_cuda_graphs == "auto"
+                            else args.kl_cuda_graphs == "on"
+                        ),
+                    )
+                else:
+                    kl_value = measure_assignment_kl(
+                        model,
+                        assignment,
+                        calib_ids,
+                        ref_log_probs,
+                        work_root=work_root,
+                        profile=profile,
+                        use_frozen_weight_cache=not args.disable_frozen_weight_cache,
+                        production_weight_cache=production_cache,
+                        use_cuda_graphs=(
+                            None if args.kl_cuda_graphs == "auto"
+                            else args.kl_cuda_graphs == "on"
+                        ),
+                        kl_scope=args.kl_scope,
+                        stream_ref_log_probs=args.kl_scope == "full_sequence",
+                    )
+                    replay_stats = {"mode": "hooks"}
+                kl_values.append(float(kl_value))
+                replay_runs.append({
+                    "repeat": int(repeat_idx),
+                    **dict(replay_stats),
+                })
+            kl_summary = _kl_repeat_summary(kl_values, ucb_z=float(args.kl_ucb_z))
+            kl = float(kl_summary["last_token_kl"])
+            replay_stats = {
+                "mode": materialization_mode,
+                "repeats": replay_runs,
+            }
             counts = dict(Counter(assignment.values()))
             changed = sum(
                 1
                 for name, fmt in assignment.items()
                 if base_assignment.get(name) != fmt
             )
+            bpp_details = _assignment_bpp_details(
+                stats,
+                assignment,
+                specs_by_name,
+                profile=profile,
+            )
             result = {
                 "label": label,
                 "path": path,
-                "last_token_kl": float(kl),
-                "bpp": _assignment_bpp(stats, assignment, specs_by_name),
+                **kl_summary,
+                "bpp": float(bpp_details["bpp"]),
+                "bpp_quantizable_entries": int(bpp_details["quantizable_entries"]),
+                "bpp_excluded_entries": int(bpp_details["excluded_entries"]),
+                "bpp_quantizable_params": int(bpp_details["quantizable_params"]),
                 "format_counts": counts,
                 "changed_vs_base": int(changed),
                 "assignment_entries": len(assignment),
@@ -837,6 +998,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "calib_seqlen": int(args.calib_seqlen),
                 "calib_split": args.calib_split,
                 "calib_seed": int(args.calib_seed),
+                "calib_repeats": int(args.calib_repeats),
+                "calib_repeat_seed_stride": int(args.calib_repeat_seed_stride),
                 "dataset": args.dataset,
                 "kl_scope": args.kl_scope,
             },

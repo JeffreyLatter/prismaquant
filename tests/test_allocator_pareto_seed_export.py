@@ -22,7 +22,10 @@ def test_allocator_exports_expanded_pareto_seed_assignments(tmp_path):
         "model.layers.0.mlp.gate_proj",
         "model.layers.0.mlp.up_proj",
         "model.layers.0.mlp.down_proj",
+        "mtp.layers.0.mlp.down_proj",
+        "lm_head",
     ]
+    expected_assignment_names = set(names) - {"lm_head"}
     stats = {}
     costs = {}
     for idx, name in enumerate(names):
@@ -88,9 +91,11 @@ def test_allocator_exports_expanded_pareto_seed_assignments(tmp_path):
         payload = json.loads(Path(row["path"]).read_text())
         assert payload["schema"] == "prismaquant.allocator.pareto_assignment.v1"
         assignment = payload["assignment"]
-        assert set(assignment) == set(names)
+        assert set(assignment) == expected_assignment_names
         assert all(".__siblings__." not in name for name in assignment)
         assert len(payload["label"]) > len("allocator_target_")
+        assert assignment["mtp.layers.0.mlp.down_proj"] == "BF16"
+        assert "lm_head" not in assignment
         saw_mxfp8 = saw_mxfp8 or "MXFP8_E4M3" in assignment.values()
 
         qkv_formats = {
