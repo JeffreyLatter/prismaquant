@@ -184,6 +184,13 @@ case ",$PRODUCTION_CACHE_LEVERS," in
     exit 2
     ;;
 esac
+case "${MULTI_SHOT_PASSES:-1}" in
+  ""|1) ;;
+  *)
+    echo "[pipeline] ERROR: MULTI_SHOT_PASSES=${MULTI_SHOT_PASSES} — multi-shot recalibration is archived under archive/multi_shot_2026-05-19 (Qwen3-4B production-cal showed ΔKL=0 at 5/5 budgets; small-cal cross-eval showed mean -42.5% gap-closed with one budget regressing -154%). Not a production lever." >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "${WORK_DIR}"/{artifacts,act,work,logs,exported}
 
