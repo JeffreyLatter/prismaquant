@@ -399,35 +399,25 @@ def _apply_fp8_dequant_inplace(
 
     dequanted = 0
 
-    # Step 2.5: Batched NVFP4 dequant per shape-group.
+    # Step 2.5: Per-tensor NVFP4 dequant.
+    # Stacking E routed-expert tensors and indexing the codebook in one
+    # batched op produces an int64 intermediate of size
+    # E × out_dim × in_stored × 8 bytes — for DSv4-Flash's 512 FP4
+    # weights per layer at (2048, 2048) packed this is 16 GiB, which
+    # collides with the streaming prefetch's already-resident layer
+    # caches and OOMs the GPU. Per-tensor dequant keeps the int64 index
+    # tensor at ~32 MiB per call (a single nibble extract / table lookup
+    # at a time), which fits within the prefetch's free headroom.
+    # The host I/O cost (safetensors read of the packed bytes) dominates
+    # this loop anyway, so the extra kernel launches are not the
+    # bottleneck.
     if fp4_by_shape:
-        nvfp4_table = _nvfp4_table(device, torch.bfloat16)
-        for (out_dim, in_dim_stored), names in fp4_by_shape.items():
-            in_logical = in_dim_stored * 2
-            in_blocks = in_logical // nvfp4_block
-            E = len(names)
-            # Stack the packed uint8 codes: (E, out_dim, in_dim_stored).
-            w_stack = torch.stack(
-                [out[n].contiguous() for n in names], dim=0
-            ).to(device=device).view(torch.uint8)
-            low = (w_stack & 0x0F).long()
-            high = ((w_stack >> 4) & 0x0F).long()
-            # Interleave to (E, out_dim, in_logical) bf16.
-            unpacked = torch.stack(
-                [nvfp4_table[low], nvfp4_table[high]], dim=-1
-            ).flatten(2)
-            # Scales: (E, out_dim, in_blocks) → (E, out_dim, in_blocks, 1).
-            s_stack = torch.stack(
-                [loaded_scales[n] for n in names], dim=0
-            ).to(device=device, dtype=torch.bfloat16).reshape(
-                E, out_dim, in_blocks, 1)
-            dequanted_stack = (
-                unpacked.reshape(E, out_dim, in_blocks, nvfp4_block) * s_stack
-            ).reshape(E, out_dim, in_logical)
-            for i, n in enumerate(names):
-                out[n] = dequanted_stack[i].contiguous()
-            dequanted += E
-            del w_stack, low, high, unpacked, s_stack, dequanted_stack
+        for names in fp4_by_shape.values():
+            for name in names:
+                out[name] = _dequant_nvfp4_packed_weight(
+                    out[name], loaded_scales[name], block_size=nvfp4_block,
+                )
+                dequanted += 1
 
     # Step 3: Batched multiply per shape-group. Stack all weights of
     # the same shape along a new outer dim, stack their scales the

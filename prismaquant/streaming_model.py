@@ -182,16 +182,28 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
 
 def _safetensors_cache_dtype_bytes(dtype_name: str,
                                    target_dtype: torch.dtype) -> int:
-    """Bytes a safetensors tensor will occupy in the layer cache."""
+    """Bytes a safetensors tensor will occupy in the layer cache.
+
+    Floating checkpoint tensors are cast to the requested execution dtype
+    by `_read_layer_to_device` before caching. Native FP8 source weights
+    therefore cache as bf16/fp16/fp32 after block dequant.
+
+    DSv4-Flash stores NVFP4 (E2M1) routed-expert weights as packed I8 with
+    two fp4 codes per byte — so each I8 byte expands to *two* target-dtype
+    elements after the FP4 dequant in `_apply_fp8_dequant_inplace`. The I8
+    branch therefore returns ``2 * target_dtype.element_size()``. Plain
+    int8 weights (no paired `.scale` sibling) would over-estimate by 4×,
+    but no current architecture ships those, and erring high keeps the
+    prefetch lookahead conservative — the wrong direction would OOM.
+    """
     dtype_name = str(dtype_name).upper()
-    # Floating checkpoint tensors are cast to the requested execution
-    # dtype by `_read_layer_to_device` before caching. Native FP8 source
-    # weights therefore cache as bf16/fp16/fp32 after block dequant.
     if dtype_name.startswith("F") or dtype_name == "BF16":
         return torch.empty((), dtype=target_dtype).element_size()
+    if dtype_name == "I8":
+        return 2 * torch.empty((), dtype=target_dtype).element_size()
     return {
         "BOOL": 1,
-        "U8": 1, "I8": 1,
+        "U8": 1,
         "U16": 2, "I16": 2,
         "U32": 4, "I32": 4,
         "U64": 8, "I64": 8,
