@@ -2745,6 +2745,12 @@ def main():
                          "each chunk consumed. Pass a positive integer to "
                          "truncate to the first N samples (smoke tests).")
     ap.add_argument("--seqlen", type=int, default=256)
+    ap.add_argument("--calib-seed", type=int, default=42,
+                    help="Seed for calibration text-subset shuffle and "
+                         "within-text window start position. Different seeds "
+                         "give different sample subsets from the same dataset, "
+                         "useful for multi-probe robust-Fisher experiments. "
+                         "Default 42 reproduces historical behavior.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--device-map", default=None)
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -3022,7 +3028,8 @@ def main():
                     ns = 4  # legacy fallback for non-jsonl datasets
             args.nsamples = ns  # write back so meta records the actual count
             calib = load_calibration(
-                tokenizer, args.dataset, ns, args.seqlen)
+                tokenizer, args.dataset, ns, args.seqlen,
+                calib_seed=int(args.calib_seed))
             print(f"[incremental] calibration ready: {tuple(calib.shape)}",
                   flush=True)
 

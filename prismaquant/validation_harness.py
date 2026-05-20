@@ -114,9 +114,29 @@ def validate_artifact(
 
     metrics = {
         "ppl_wikitext": _finite_metric(raw_metrics, "ppl_wikitext"),
-        "ppl_mmlu_acc": _finite_metric(raw_metrics, "ppl_mmlu_acc"),
-        "end_kl": _finite_metric(raw_metrics, "end_kl"),
     }
+    raw_end_kl = raw_metrics.get("end_kl")
+    if raw_end_kl is None:
+        raise KeyError("validation backend did not return 'end_kl'")
+    end_kl_value = float(raw_end_kl)
+    skip_end_kl = os.environ.get(
+        "PRISMAQUANT_VALIDATION_SKIP_END_KL", "0"
+    ) not in ("", "0", "false", "False")
+    if math.isnan(end_kl_value) and skip_end_kl:
+        metrics["end_kl"] = end_kl_value
+    else:
+        metrics["end_kl"] = _finite_metric(raw_metrics, "end_kl")
+    # MMLU is skippable via n_mmlu_questions=0 → backend returns NaN.
+    # Treat NaN as "metric intentionally omitted" so a partial survey is
+    # still useful for the metrics that *were* requested.
+    raw_mmlu = raw_metrics.get("ppl_mmlu_acc")
+    if raw_mmlu is None:
+        raise KeyError("validation backend did not return 'ppl_mmlu_acc'")
+    mmlu_value = float(raw_mmlu)
+    if math.isnan(mmlu_value) and int(n_mmlu_questions) <= 0:
+        metrics["ppl_mmlu_acc"] = mmlu_value  # explicit-skip sentinel
+    else:
+        metrics["ppl_mmlu_acc"] = _finite_metric(raw_metrics, "ppl_mmlu_acc")
     metrics["model_sha"] = _sha256_model_reference(model_path)
     metrics["layer_config_sha"] = config_sha
     metrics["eval_seconds"] = float(time.monotonic() - started)
@@ -213,18 +233,21 @@ def _compute_metrics(
                 n_questions=n_mmlu_questions,
                 progress=progress,
             )
-        end_kl = _end_kl(
-            model=model,
-            tokenizer=tokenizer,
-            load_dataset=load_dataset,
-            assignment=assignment,
-            cache_dir=cache_dir,
-            device=torch_device,
-            calib_seqlen=calib_seqlen,
-            calib_n_samples=calib_n_samples,
-            cal_hash=cal_hash,
-            progress=progress,
-        )
+        if os.environ.get("PRISMAQUANT_VALIDATION_SKIP_END_KL", "0") not in ("", "0", "false", "False"):
+            end_kl = float("nan")
+        else:
+            end_kl = _end_kl(
+                model=model,
+                tokenizer=tokenizer,
+                load_dataset=load_dataset,
+                assignment=assignment,
+                cache_dir=cache_dir,
+                device=torch_device,
+                calib_seqlen=calib_seqlen,
+                calib_n_samples=calib_n_samples,
+                cal_hash=cal_hash,
+                progress=progress,
+            )
     return {
         "ppl_wikitext": float(ppl_wikitext),
         "ppl_mmlu_acc": float(ppl_mmlu_acc),
@@ -262,12 +285,26 @@ def _perturbed_model(
         return
     from .perturbed_x_cache import PerturbedActivationCache
 
+    prod_cache_obj = None
+    prod_cache_path = os.environ.get("PRISMAQUANT_VALIDATION_PROD_CACHE")
+    if prod_cache_path:
+        import pickle as _pickle
+        with open(prod_cache_path, "rb") as _fh:
+            prod_cache_obj = _pickle.load(_fh)
+        override_dir = os.environ.get("PRISMAQUANT_VALIDATION_PROD_CACHE_DIR")
+        if override_dir and hasattr(prod_cache_obj, "relocate"):
+            prod_cache_obj.relocate(override_dir)
+        lru_gb = float(os.environ.get("PRISMAQUANT_VALIDATION_PROD_CACHE_LRU_GB", "16"))
+        if lru_gb > 0 and hasattr(prod_cache_obj, "enable_lru"):
+            prod_cache_obj.enable_lru(int(lru_gb * 1024**3))
+
     hooks = PerturbedActivationCache(
         model,
         active,
         cache_dir / "validation_perturbed_hooks",
         input_rows=0,
         cal_hash=cal_hash,
+        production_weight_cache=prod_cache_obj,
     )
     if hooks.missing:
         preview = ", ".join(hooks.missing[:8])
@@ -401,6 +438,10 @@ def _mmlu_accuracy(
     n_questions: int,
     progress: bool,
 ) -> float:
+    if int(n_questions) <= 0:
+        # Caller opted out of MMLU. Return NaN so downstream metric handling
+        # treats it as missing instead of failing on a zero-question loop.
+        return float("nan")
     rows = _load_mmlu_rows(load_dataset, cache_dir)
     questions = _select_diverse_mmlu(rows, int(n_questions))
     if not questions:

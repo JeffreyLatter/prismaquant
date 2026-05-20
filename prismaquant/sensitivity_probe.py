@@ -1620,7 +1620,7 @@ class FisherAccumulator:
 # Calibration data
 # ---------------------------------------------------------------------------
 def load_calibration(tokenizer, source: str, n_samples: int,
-                     seqlen: int) -> torch.Tensor:
+                     seqlen: int, *, calib_seed: int = 42) -> torch.Tensor:
     """Load calibration from a HuggingFace dataset id, a local .jsonl, or
     a local .txt file. JSONL rows can have either {"text": ...} or
     {"messages": [...]} for chat-style data.
@@ -1760,7 +1760,13 @@ def load_calibration(tokenizer, source: str, n_samples: int,
     #   2) fallback packs multiple short samples together (separated by
     #      EOS) to reach seqlen. This makes SFT/chat datasets with short
     #      turns (tulu-3, glaive) usable without lowering seqlen.
-    random.seed(42)
+    # calib_seed controls (a) which subset of dataset texts is tried (shuffle)
+    # and (b) where within each text the seqlen window starts. Default 42 is
+    # the historical value and is byte-stable.
+    if calib_seed != 42:
+        rng_shuffle = random.Random(calib_seed)
+        rng_shuffle.shuffle(texts)
+    random.seed(calib_seed)
     samples = []
     for t in texts:
         ids = tokenizer(t, return_tensors="pt", truncation=False).input_ids
