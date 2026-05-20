@@ -2583,7 +2583,7 @@ def _run_mtp_streaming_shard(
     precomputed: GlobalPrecompute | None = None,
 ):
     # Lazy import to avoid depending on transformers subpath at module load.
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
+    from .mtp_module import _load_into_mtp, _load_mtp_state_dict
 
     if precomputed is None:
         raise ValueError(
@@ -2594,6 +2594,7 @@ def _run_mtp_streaming_shard(
     dtype = ctx.dtype
     model = ctx.model
     base_model = ctx.base_model
+    profile = ctx.profile
 
     tokens_in_sample = calib.size(-1)
     batch_size = calib.size(0)
@@ -2617,7 +2618,43 @@ def _run_mtp_streaming_shard(
 
     # --- Synthesize MTP module, load its weights from safetensors ---
     text_config = model.config
-    inner_mtp = MtpModule(text_config)
+    inner_mtp = profile.build_mtp_module(text_config)
+    if inner_mtp is None:
+        # The profile declares has_mtp() = True but doesn't (yet) provide an
+        # MTP module replica. MTP weights pass through at BF16 via
+        # source_passthrough_prefixes() at export; the probe writes an empty
+        # shard pickle so the schedule completes cleanly and the allocator
+        # sees no mtp.* qnames (which combines with --mtp-format BF16 to keep
+        # MTP unquantized end-to-end).
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            pickle.dump({
+                "stats": {},
+                "router_counts": {},
+                "router_totals": {},
+                "expert_info": {},
+                "meta": {
+                    "model": model_path,
+                    "dataset": dataset_name,
+                    "nsamples": int(calib.size(0)),
+                    "seqlen": seqlen,
+                    "dtype": dtype_name,
+                    "execution_device": str(device),
+                    "linear_include": linear_include,
+                    "linear_exclude": linear_exclude,
+                    "h_detail_dir": h_detail_dir,
+                    "activation_rows_limit": max(1, int(activation_rows_limit)),
+                    "skipped_reason": (
+                        f"profile {profile.name!r} declares has_mtp() but "
+                        f"build_mtp_module() returned None — MTP weights "
+                        f"will pass through at BF16 at export"
+                    ),
+                },
+            }, f)
+        print(f"[incremental/mtp] profile {profile.name!r} has no MTP module "
+              f"replica; wrote empty shard pickle to {output_path} "
+              f"(MTP will pass through at BF16 at export)", flush=True)
+        return
     mtp_wrapper = nn.Module()
     mtp_wrapper.add_module("mtp", inner_mtp)
     mtp_wrapper.to(device=device, dtype=dtype)

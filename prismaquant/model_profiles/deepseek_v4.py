@@ -84,10 +84,17 @@ class DeepseekV4Profile(ModelProfile):
         return True
 
     def build_mtp_module(self, text_config) -> nn.Module | None:
-        # Defer MTP module standup until first need. The transformers
-        # vendored class includes MTP wiring inside the main model;
-        # we'll subclass and isolate it when the export pipeline
-        # actually needs to hook it.
+        # DSv4-Flash's MTPBlock is structurally novel vs. Qwen3.5/3.6's MTP
+        # (multi-stream HC input, separate e_proj/h_proj projections, own
+        # hc_head_{fn,base,scale} collapse params — see the reference
+        # inference/model.py:MTPBlock in the source checkpoint). Until that
+        # block has its own HF-side replica + per-architecture loader, MTP
+        # weights pass through at BF16 via `source_passthrough_prefixes()`
+        # (the "mtp." entry). The probe + cost runners detect the None
+        # return value and write empty shard pickles, so the allocator sees
+        # no mtp.* qnames and `--mtp-format BF16` (the production default)
+        # keeps MTP unquantized end-to-end. Replace this stub with a real
+        # DeepseekV4MtpModule when Fisher-driven MTP quantization is needed.
         return None
 
     # ------------------------------------------------------------

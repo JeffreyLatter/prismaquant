@@ -388,7 +388,7 @@ def _run_mtp_cost_shard(
     model_name: str,
     probe_path: str,
 ):
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
+    from .mtp_module import _load_into_mtp, _load_mtp_state_dict
 
     inc = re.compile(linear_include)
     try:
@@ -420,7 +420,34 @@ def _run_mtp_cost_shard(
 
     device_t = torch.device(device)
     text_config = ctx.model.config
-    inner_mtp = MtpModule(text_config)
+    inner_mtp = (
+        profile.build_mtp_module(text_config) if profile is not None else None
+    )
+    if inner_mtp is None:
+        # Profile has no MTP module replica — the probe wrote an empty pickle
+        # for this shard, so probe_stats has no mtp.* qnames here. The early
+        # shard_targets check above already returned in that case, but defend
+        # in depth: skip cost measurement entirely and write an empty pickle.
+        # MTP weights will pass through at BF16 at export.
+        print(f"[incremental-cost/mtp] profile "
+              f"{getattr(profile, 'name', None)!r} has no MTP module replica; "
+              f"writing empty pickle (MTP passes through at BF16 at export)",
+              flush=True)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            pickle.dump({
+                "costs": {},
+                "formats": [s.name for s in specs],
+                "meta": {
+                    "model": model_name,
+                    "probe": probe_path,
+                    "n_linears": 0,
+                    "mode": mode,
+                    "shard_kind": "mtp",
+                    "skipped_reason": "profile has no MTP module replica",
+                },
+            }, f)
+        return
     mtp_wrapper = nn.Module()
     mtp_wrapper.add_module("mtp", inner_mtp)
     mtp_wrapper.to(device=device_t, dtype=dtype)

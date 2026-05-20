@@ -88,7 +88,8 @@
     "tid2eid",
     "kv_norm",
     "q_norm",
-    "norm."
+    "norm.",
+    "mtp."
   ],
   "pinned_names": ["lm_head", "head"]
 }

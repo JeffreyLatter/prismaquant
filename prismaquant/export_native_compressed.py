@@ -5537,10 +5537,15 @@ def main():
     if profile.has_mtp():
         print("[export-stream] materializing MTP tensors ...", flush=True)
         mtp_tensors = _materialize_mtp_tensors(
-            args.model, assignment,
+            args.model, assignment, profile=profile,
             bf16_passthrough=bf16_passthrough, hist=hist,
             device=device)
-        print(f"[export-stream] MTP: {len(mtp_tensors)} tensors", flush=True)
+        if not mtp_tensors:
+            print(f"[export-stream] profile '{profile.name}' has has_mtp() but "
+                  f"no MTP module replica — MTP tensors will be picked up "
+                  f"from source via passthrough at BF16", flush=True)
+        else:
+            print(f"[export-stream] MTP: {len(mtp_tensors)} tensors", flush=True)
     else:
         print(f"[export-stream] profile '{profile.name}' has no MTP — "
               "skipping", flush=True)
@@ -5874,6 +5879,7 @@ def write_config_with_quantization(
 def _materialize_mtp_tensors(src_model: str,
                              assignment: dict[str, str],
                              *,
+                             profile=None,
                              bf16_passthrough: set[str],
                              hist: dict,
                              device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
@@ -5890,14 +5896,21 @@ def _materialize_mtp_tensors(src_model: str,
     Output tensor names match the checkpoint convention (`mtp.fc.*`,
     `mtp.layers.0.<rest>`). vLLM's `qwen3_5_mtp.load_weights` remaps
     `mtp.→model.` at load time.
+
+    When `profile.build_mtp_module()` returns `None` (architecture-specific
+    MTP module not yet wired up — e.g. DeepSeek-V4 today), return an empty
+    dict so the caller falls back to BF16 source passthrough via
+    `profile.source_passthrough_prefixes()`.
     """
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
+    from .mtp_module import _load_into_mtp, _load_mtp_state_dict
     from transformers import AutoConfig
 
     # Build an MTP wrapper with source weights.
     cfg = AutoConfig.from_pretrained(src_model, trust_remote_code=True)
     text_config = getattr(cfg, "text_config", cfg)
-    inner = MtpModule(text_config)
+    inner = profile.build_mtp_module(text_config) if profile is not None else None
+    if inner is None:
+        return {}
     wrapper = nn.Module()
     wrapper.add_module("mtp", inner)
     wrapper.to(dtype=torch.bfloat16)
