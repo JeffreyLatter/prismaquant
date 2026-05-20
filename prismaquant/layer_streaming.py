@@ -220,6 +220,58 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     return out
 
 
+# NVFP4 E2M1 codebook (DSv4-Flash routed experts).
+#   bits 0bSEEM: 0..7 are positive magnitudes, 8..15 are negative magnitudes.
+# Matches the FP4_TABLE in inference/convert.py of the DeepSeek-V4-Flash repo
+# and the OCP MX FP4 (E2M1) public spec.
+_NVFP4_E2M1_TABLE_F32 = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)
+
+
+def _nvfp4_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return the 16-entry NVFP4 E2M1 dequant codebook on `device` as `dtype`."""
+    return torch.tensor(_NVFP4_E2M1_TABLE_F32, device=device, dtype=dtype)
+
+
+def _dequant_nvfp4_packed_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """Unpack NVFP4 (E2M1) packed weights with per-row × per-block F8_E8M0 scales.
+
+    DSv4-Flash routed experts store FP4 as two codes per byte: the low nibble
+    is the even logical position, the high nibble is the odd one. Scales are
+    one F8_E8M0 per `block_size` logical elements along the in dim (row
+    stride is 1). Output is bf16 of logical shape (out_dim, in_stored*2).
+    """
+    out_dim, in_stored = weight.shape
+    in_logical = in_stored * 2
+    target_device = (scale.device if scale.device.type != "cpu"
+                     else weight.device)
+    if scale.shape != (out_dim, in_logical // block_size):
+        raise RuntimeError(
+            f"NVFP4 scale/weight shape mismatch: weight {tuple(weight.shape)}, "
+            f"scale {tuple(scale.shape)} (block_size={block_size}, "
+            f"expected scale shape ({out_dim}, {in_logical // block_size}))")
+    table = _nvfp4_table(target_device, torch.bfloat16)
+    # uint8 view: same bytes, lets us index 0..255 cleanly.
+    w_u8 = weight.to(device=target_device).contiguous().view(torch.uint8)
+    low = (w_u8 & 0x0F).long()
+    high = ((w_u8 >> 4) & 0x0F).long()
+    # Interleave the two nibbles back into logical positions, low first
+    # (matches the inference/convert.py packing).
+    unpacked = torch.stack([table[low], table[high]], dim=-1).flatten(1)
+    # unpacked: bf16 [out_dim, in_logical]
+    in_blocks = in_logical // block_size
+    s3 = scale.to(device=target_device, dtype=torch.bfloat16).reshape(
+        out_dim, in_blocks, 1)
+    return (unpacked.reshape(out_dim, in_blocks, block_size) * s3).reshape(
+        out_dim, in_logical)
+
+
 def _dequant_fp8_block_weight(
     weight: torch.Tensor,
     scale_inv: torch.Tensor,
@@ -311,24 +363,71 @@ def _apply_fp8_dequant_inplace(
             for model_name, scale_key in reads:
                 loaded_scales[model_name] = f.get_tensor(scale_key)
 
-    # Step 2: Group matched weights by (out_dim, in_dim) shape. We only
-    # batch along exact-128-multiple shapes; odd-shaped tensors (rare)
-    # fall back to the per-tensor path.
+    # Step 2: Split into three buckets:
+    #   (a) NVFP4 packed (DSv4 routed experts): int8 storage, 2 fp4 per byte,
+    #       scale shape (out_dim, in_logical/32) with block_size=32 along K.
+    #       Logical in_dim = stored in_dim * 2.
+    #   (b) V3-style FP8: F8_E4M3 weight, scale shape (out/128, in/128). Batched
+    #       per (out_dim, in_dim) shape — current fast path.
+    #   (c) Per-tensor fallback (odd shapes).
     block_r, block_c = 128, 128
+    nvfp4_block = 32
     by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
+    fp4_by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
     fallback: list[str] = []
     for name in loaded_scales:
         w = out[name]
+        s = loaded_scales[name]
         if w.dim() != 2:
             fallback.append(name)
             continue
-        out_dim, in_dim = w.shape
-        if out_dim % block_r != 0 or in_dim % block_c != 0:
-            fallback.append(name)
+        out_dim, in_dim_stored = w.shape
+        # (a) NVFP4 packed detection
+        if (w.dtype == torch.int8
+                and s.dim() == 2
+                and s.shape == (out_dim, (in_dim_stored * 2) // nvfp4_block)):
+            fp4_by_shape[(out_dim, in_dim_stored)].append(name)
             continue
-        by_shape[(out_dim, in_dim)].append(name)
+        # (b) V3-style 128×128
+        if (out_dim % block_r == 0 and in_dim_stored % block_c == 0
+                and s.dim() == 2
+                and s.shape == (out_dim // block_r, in_dim_stored // block_c)):
+            by_shape[(out_dim, in_dim_stored)].append(name)
+            continue
+        # (c) odd shape → per-tensor fallback
+        fallback.append(name)
 
     dequanted = 0
+
+    # Step 2.5: Batched NVFP4 dequant per shape-group.
+    if fp4_by_shape:
+        nvfp4_table = _nvfp4_table(device, torch.bfloat16)
+        for (out_dim, in_dim_stored), names in fp4_by_shape.items():
+            in_logical = in_dim_stored * 2
+            in_blocks = in_logical // nvfp4_block
+            E = len(names)
+            # Stack the packed uint8 codes: (E, out_dim, in_dim_stored).
+            w_stack = torch.stack(
+                [out[n].contiguous() for n in names], dim=0
+            ).to(device=device).view(torch.uint8)
+            low = (w_stack & 0x0F).long()
+            high = ((w_stack >> 4) & 0x0F).long()
+            # Interleave to (E, out_dim, in_logical) bf16.
+            unpacked = torch.stack(
+                [nvfp4_table[low], nvfp4_table[high]], dim=-1
+            ).flatten(2)
+            # Scales: (E, out_dim, in_blocks) → (E, out_dim, in_blocks, 1).
+            s_stack = torch.stack(
+                [loaded_scales[n] for n in names], dim=0
+            ).to(device=device, dtype=torch.bfloat16).reshape(
+                E, out_dim, in_blocks, 1)
+            dequanted_stack = (
+                unpacked.reshape(E, out_dim, in_blocks, nvfp4_block) * s_stack
+            ).reshape(E, out_dim, in_logical)
+            for i, n in enumerate(names):
+                out[n] = dequanted_stack[i].contiguous()
+            dequanted += E
+            del w_stack, low, high, unpacked, s_stack, dequanted_stack
 
     # Step 3: Batched multiply per shape-group. Stack all weights of
     # the same shape along a new outer dim, stack their scales the

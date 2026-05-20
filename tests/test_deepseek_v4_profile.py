@@ -51,6 +51,7 @@ def test_source_passthrough_prefixes_are_spec_backed(profile):
         "kv_norm",
         "q_norm",
         "norm.",
+        "mtp.",
     )
 
 
