@@ -155,7 +155,7 @@ else
   _model_short="${_model_short//--/-}"                     # → Qwen-Qwen3.6-27B
 fi
 : "${WORK_DIR:=./dq-runs/${_model_short}}"
-: "${FORMATS:=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16}"
+: "${FORMATS:=NVFP4,MXFP8_E4M3,FP8_E4M3,FP8_SOURCE,BF16}"
 : "${TARGET_BITS:=4.75}"
 : "${PARETO_TARGETS:=4.2,4.3,4.4,4.5,4.6,4.7,4.75,4.85,4.9,5.0,5.1,5.25,5.5,6.0,7.0,8.25}"
 # Calibration defaults. 4x256 was the historical minimum for correctness

@@ -209,9 +209,19 @@ class DeepseekV4Profile(ModelProfile):
         """DSv4 stores F8_E8M0 `.scale` siblings (not `.weight_scale_inv`).
         Build the `{live_weight_qname: (shard_path, scale_ckpt_key)}`
         map by pairing every `.scale` ckpt key with its `.weight`
-        sibling, then routing the weight key through `checkpoint_to_live_name`."""
+        sibling, then routing the weight key through `checkpoint_to_live_name`.
+
+        IMPORTANT: DSv4-Flash uses `.scale` for *two* distinct source
+        formats — FP8_E4M3 attention/shared (weight dtype = float8_e4m3fn)
+        AND NVFP4-packed routed experts (weight dtype = int8, two fp4
+        codes per byte). Only the first is FP8_SOURCE-compatible; copying
+        an int8-packed NVFP4 tensor verbatim under the FP8_SOURCE export
+        path would corrupt the output. Per-shard header inspection skips
+        int8 weights so the resulting dict only describes true FP8 source.
+        """
         import json as _json
         import os as _os
+        from collections import defaultdict
         from safetensors import safe_open as _safe_open
 
         index_file = _os.path.join(model_path, "model.safetensors.index.json")
@@ -226,7 +236,10 @@ class DeepseekV4Profile(ModelProfile):
                 raw = {k: single for k in f.keys()}
 
         weight_keys = {k for k in raw if k.endswith(".weight")}
-        out: dict[str, tuple[str, str]] = {}
+
+        # Group candidate weight keys by shard so we open each
+        # safetensors file at most once for the dtype probe.
+        candidates: list[tuple[str, str, str]] = []  # (ck_key, weight_ck, shard)
         for ck_key, shard in raw.items():
             if not ck_key.endswith(".scale"):
                 continue
@@ -234,10 +247,31 @@ class DeepseekV4Profile(ModelProfile):
             weight_ck = base + ".weight"
             if weight_ck not in weight_keys:
                 continue
-            weight_live = self.checkpoint_to_live_name(weight_ck)
-            if weight_live is None:
-                continue
-            out[weight_live] = (_os.path.join(model_path, shard), ck_key)
+            candidates.append((ck_key, weight_ck, shard))
+
+        by_shard: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for ck_key, weight_ck, shard in candidates:
+            by_shard[shard].append((ck_key, weight_ck))
+
+        out: dict[str, tuple[str, str]] = {}
+        for shard, items in by_shard.items():
+            with _safe_open(_os.path.join(model_path, shard),
+                            framework="pt") as f:
+                for ck_key, weight_ck in items:
+                    try:
+                        slice_obj = f.get_slice(weight_ck)
+                        dtype_name = str(slice_obj.get_dtype())
+                    except Exception:
+                        continue
+                    # Skip NVFP4-packed weights (stored as int8). Only
+                    # float8_e4m3fn / float8_e5m2 are true FP8_SOURCE.
+                    if not dtype_name.startswith("F8_"):
+                        continue
+                    weight_live = self.checkpoint_to_live_name(weight_ck)
+                    if weight_live is None:
+                        continue
+                    out[weight_live] = (
+                        _os.path.join(model_path, shard), ck_key)
         return out
 
     def head_resident_extra_prefixes(self, root) -> list[str]:
