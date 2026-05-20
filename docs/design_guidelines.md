@@ -92,11 +92,18 @@ For a new numerical method, record:
 - production-cache settings;
 - recache/prefetch settings;
 - vLLM smoke command and log path;
+- downstream serving-suite commands and log paths, including PPL/mean NLL,
+  log-likelihood task checks, and ToolEvalBench for materialized artifacts;
 - observed GPU utilization and whether NVMe/CPU was idle during the hot path.
 
 The default comparison is method A versus method A plus the new lever, with
 all dependent sweeps re-run for both arms. Do not compare a well-tuned baseline
 against an untuned candidate, or the reverse.
+
+KL is a screening metric, not a standalone promotion metric. A candidate that
+improves calibration KL but regresses held-out PPL/mean NLL or downstream
+log-likelihood checks should remain research-only unless there is a documented
+reason to prefer the KL tradeoff and the user explicitly accepts it.
 
 ## Promotion Gates
 
@@ -107,8 +114,8 @@ Use these states for new functionality:
 - **Candidate:** the feature has small-model GPU and vLLM smokes, plus a clear
   27B measurement plan.
 - **Production recipe:** the feature improves or preserves KL/bpp/runtime on
-  the target stack, passes vLLM serving checks, and has tests covering the
-  policy or metadata it changes.
+  the target stack, passes vLLM serving checks and the downstream serving
+  suite, and has tests covering the policy or metadata it changes.
 - **Default-on:** the feature has cleared the production recipe gate on the
   current target and at least one additional representative model or shape
   class, unless the user explicitly accepts a narrower default.

@@ -6,8 +6,11 @@ import sys
 from pathlib import Path
 
 from prismaquant.select_validated_frontier import (
+    leave_one_out_kneedle_diagnostic,
     measured_frontier,
+    practical_knee,
     select_frontier_point,
+    spearman_rank_correlation,
 )
 
 
@@ -35,6 +38,64 @@ def test_select_frontier_best_kl():
 
     assert selected["label"] == "b"
     assert [row["label"] for row in frontier] == ["a", "b"]
+
+
+def test_measured_frontier_can_use_ucb_metric():
+    results = [
+        {
+            "label": "a",
+            "path": "a.json",
+            "bpp": 4.5,
+            "last_token_kl": 0.10,
+            "kl_ucb": 0.30,
+        },
+        {
+            "label": "b",
+            "path": "b.json",
+            "bpp": 5.0,
+            "last_token_kl": 0.12,
+            "kl_ucb": 0.20,
+        },
+    ]
+
+    frontier = measured_frontier(results, metric="ucb")
+
+    assert [row["label"] for row in frontier] == ["a", "b"]
+    assert frontier[0]["kl"] == 0.30
+    assert frontier[1]["kl"] == 0.20
+
+
+def test_practical_knee_picks_lowest_bpp_within_tolerance():
+    frontier = [
+        {"label": "a", "path": "a.json", "bpp": 5.0, "kl": 0.101},
+        {"label": "b", "path": "b.json", "bpp": 5.5, "kl": 0.100},
+        {"label": "c", "path": "c.json", "bpp": 6.0, "kl": 0.090},
+    ]
+
+    selected = practical_knee(frontier, rel_eps=0.02)
+
+    assert selected["label"] == "c"
+    selected = practical_knee(frontier, rel_eps=0.13)
+    assert selected["label"] == "a"
+
+
+def test_select_frontier_reports_rank_and_leave_one_out_helpers():
+    frontier = [
+        {"label": "a", "path": "a.json", "bpp": 4.5, "kl": 0.30, "surrogate_loss": 3.0},
+        {"label": "b", "path": "b.json", "bpp": 5.0, "kl": 0.20, "surrogate_loss": 2.0},
+        {"label": "c", "path": "c.json", "bpp": 5.5, "kl": 0.10, "surrogate_loss": 1.0},
+        {"label": "d", "path": "d.json", "bpp": 6.0, "kl": 0.09, "surrogate_loss": 0.5},
+    ]
+
+    assert spearman_rank_correlation(frontier) > 0.9
+    diagnostic = leave_one_out_kneedle_diagnostic(
+        frontier,
+        frontier[1],
+        tolerance_bpp=10.0,
+        kl_noise_floor=10.0,
+    )
+    assert diagnostic["enabled"]
+    assert diagnostic["stable"]
 
 
 def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
@@ -68,6 +129,8 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
             "prismaquant.select_validated_frontier",
             "--validation-json",
             str(validation_path),
+            "--mode",
+            "practical-knee",
             "--output-layer-config",
             str(layer_config),
             "--output-assignment",

@@ -101,3 +101,24 @@ remote IDs that do not have a local `config.json`.
 resolved serving profile as well as the model profile: the target profile must
 load, and every configured runtime-validator callable must be importable before
 a long GPU/export run starts.
+
+## Shelved Cross-Layer Research
+
+CLADO and SMRF are archived, not registered pipeline components. The current
+ports and run notes live under `archive/cross_layer_2026-05-09/`:
+
+- `prismaquant/research_components/block_clado*.py`
+- `prismaquant/research_components/smrf*.py`
+- `tests/test_block_clado_runtime.py`
+- `tests/test_smrf_runtime.py`
+- `docs/qwen3_4b_clado_assignment_optimization.md`
+- `docs/qwen3_4b_smrf_optimization.md`
+- `docs/qwen3_27b_smrf_validation.md`
+
+`prismaquant.pipeline` still supports programmatic `PipelineComponentSpec`
+composition, but it does not import or register these archived components.
+Reviving one should be treated as a new research effort: port it from archive
+into an explicit opt-in component, keep rendered weights in
+`ProductionWeightCache`, keep activation replay in `PerturbedActivationCache`,
+and clear the measured KL/PPL/log-likelihood/ToolEvalBench gate before any
+candidate can feed export.
