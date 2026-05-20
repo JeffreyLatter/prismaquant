@@ -18,6 +18,7 @@ _VENDOR_DIR = Path(__file__).parent
 
 
 _QWEN3_REGISTERED = False
+_DSV4_REGISTERED = False
 
 
 def register_qwen3() -> None:
@@ -46,10 +47,23 @@ def register_deepseek_v4() -> None:
     - `transformers.models.deepseek_v4` is importable
     - `AutoConfig.from_pretrained` resolves model_type='deepseek_v4'
     - `AutoModelForCausalLM.from_pretrained` instantiates DeepseekV4ForCausalLM
+
+    Transformers v5+ ships a native DSv4 implementation whose attention
+    uses `q_a_proj`/`kv_proj`/`o_a_proj` layout, while DSv4-Flash's
+    checkpoint files (and our profile's name bridge) carry
+    `wq_a`/`wkv`/`wo_a`. Letting upstream's modeling load would yield a
+    skeleton whose live names don't match the safetensors map, so the
+    install resolver misses and `set_module_tensor_to_device` falls back
+    and crashes with `AttributeError: ... has no attribute 'wq_a'`.
+    The earlier `if pkg_name in sys.modules: return` short-circuit
+    silently lost this race — replaced by an explicit `_DSV4_REGISTERED`
+    sentinel so we always override the upstream slot.
     """
-    pkg_name = "transformers.models.deepseek_v4"
-    if pkg_name in sys.modules:
+    global _DSV4_REGISTERED
+    if _DSV4_REGISTERED:
         return
+
+    pkg_name = "transformers.models.deepseek_v4"
 
     # Ensure parent package is importable.
     importlib.import_module("transformers.models")
@@ -110,3 +124,5 @@ def register_deepseek_v4() -> None:
     # model construction in the probe path.
     from .dsv4_probe_experts import enable_per_expert_experts
     enable_per_expert_experts()
+
+    _DSV4_REGISTERED = True

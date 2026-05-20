@@ -679,6 +679,17 @@ def _build_streaming_context(model_path: str, *,
 
     from .sensitivity_probe import stage_multimodal, stage_text_only
 
+    # Detect the profile FIRST: profile resolution triggers
+    # `register_vendored_modeling()`, which (for DSv4) swaps upstream's
+    # native `transformers.models.deepseek_v4` for our checkpoint-named
+    # vendored copy. Doing this *before* `AutoConfig`/`from_config` runs
+    # is what makes the live skeleton carry the `wq_a`/`wkv`/`wo_a`
+    # attribute names that the safetensors map and the install resolver
+    # expect — otherwise upstream's `q_a_proj`/`kv_proj`/`o_a_proj`
+    # skeleton mismatches the checkpoint and install crashes.
+    from .model_profiles import detect_profile as _detect_profile
+    _profile = _detect_profile(model_path)
+
     bypass_hf_fp8_rewrite = False
     if multimodal:
         staged = stage_multimodal(model_path)
@@ -873,9 +884,6 @@ def _build_streaming_context(model_path: str, *,
 
     prefetch_pool = ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="prefetch")
-
-    from .model_profiles import detect_profile as _detect_profile
-    _profile = _detect_profile(model_path)
 
     return StreamingContext(
         model=model, base_model=base_model, layers=layers,
