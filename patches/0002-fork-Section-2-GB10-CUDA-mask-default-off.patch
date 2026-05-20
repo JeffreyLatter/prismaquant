@@ -1,4 +1,4 @@
-From 0a1d0133dcbcb6a62ab1d284181c5cb865c9a20a Mon Sep 17 00:00:00 2001
+From e42286a3ad37f8dc368361b749e7ca6370f5c2b8 Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:20:35 +0200
 Subject: [PATCH 2/7] fork: Section 2 - GB10 CUDA mask default off

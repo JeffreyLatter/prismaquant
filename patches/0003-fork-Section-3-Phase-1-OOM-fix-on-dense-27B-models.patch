@@ -1,4 +1,4 @@
-From ea7739127c0112b3f96f65fd54a6dd32330badd5 Mon Sep 17 00:00:00 2001
+From f0ffa964725b142121972e886df668dd959ef52f Mon Sep 17 00:00:00 2001
 From: jeffrey <jeffrey@SparkThree.vpn.dk>
 Date: Sat, 16 May 2026 11:21:52 +0200
 Subject: [PATCH 3/7] fork: Section 3 - Phase-1 OOM fix on dense 27B+ models
