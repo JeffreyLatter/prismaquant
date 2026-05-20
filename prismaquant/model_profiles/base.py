@@ -797,6 +797,14 @@ class ModelProfile(ABC):
         Default: False (single-rope path)."""
         return False
 
+    def rotary_call_kwargs(self) -> dict:
+        """Extra kwargs to pass when invoking the standalone rotary
+        module to precompute `(cos, sin)` for the decoder layer loop.
+        DSv4's rotary forward dispatches on a `layer_type` arg
+        (``"main"`` for the top-level layer call) because it carries
+        separate ``main_/compress_inv_freq`` buffers. Default: empty."""
+        return {}
+
     def expand_hidden_for_layers(self, hidden, base_model):
         """Optionally reshape the post-embedding hidden state before
         the per-layer forward loop. DSv4 expands single-stream

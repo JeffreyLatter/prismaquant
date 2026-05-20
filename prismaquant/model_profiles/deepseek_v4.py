@@ -284,6 +284,13 @@ class DeepseekV4Profile(ModelProfile):
             setattr(rotary, f"{layer_type}_attention_scaling", scaling_lt)
         return True
 
+    def rotary_call_kwargs(self) -> dict:
+        """DSv4 rotary dispatches on `layer_type`; the top-level
+        decoder loop uses ``"main"`` (the compressed branches call
+        their nested per-layer rotaries with ``"compress"`` internally).
+        Mirrors upstream ``DeepseekV4Model.forward``."""
+        return {"layer_type": "main"}
+
     def expand_hidden_for_layers(self, hidden, base_model):
         """Expand single-stream `[B, T, H]` to multi-stream
         `[B, T, hc_mult, H]` (mirrors `DeepseekV4Model.forward`)."""

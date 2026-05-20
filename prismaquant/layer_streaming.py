@@ -1087,12 +1087,21 @@ def _compute_position_embeddings(base_model: nn.Module,
                                  hidden: torch.Tensor,
                                  position_ids: torch.Tensor):
     """Call the rotary module to get (cos, sin). Returns None if
-    the model doesn't expose a standalone rotary (unusual)."""
+    the model doesn't expose a standalone rotary (unusual).
+
+    Profiles whose rotary takes extra kwargs (DSv4's `layer_type="main"`)
+    contribute them via `profile.rotary_call_kwargs()`."""
     rotary = _get_rotary(base_model)
     if rotary is None:
         return None
+    kwargs: dict = {}
+    try:
+        from .model_profiles import profile_from_model
+        kwargs = profile_from_model(base_model).rotary_call_kwargs()
+    except Exception:
+        kwargs = {}
     with torch.no_grad():
-        cos, sin = rotary(hidden, position_ids)
+        cos, sin = rotary(hidden, position_ids, **kwargs)
     return (cos, sin)
 
 
