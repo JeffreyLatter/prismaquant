@@ -57,10 +57,36 @@ class DeepseekV4Config(PreTrainedConfig):
     swiglu_limit (`float`): Clip routed experts' gate/up pre-activations.
     sliding_window (`int`): Local window size n_win used in every attention block's
         sliding-window branch.
-    o_groups (`int`), o_lora_rank (`int`): Grouped low-rank output projection (g, d_g).
-    index_n_heads, index_head_dim, index_topk (`int`): Lightning Indexer hyperparameters.
-    num_nextn_predict_layers (`int`): MTP layer count in the upstream checkpoint (not instantiated here).
+    o_groups (`int`): Output-projection group count g for the grouped low-rank
+        output projection.
+    o_lora_rank (`int`): Per-group low-rank dimension d_g for the grouped output
+        projection.
+    index_n_heads (`int`): Lightning Indexer head count.
+    index_head_dim (`int`): Lightning Indexer per-head dim.
+    index_topk (`int`): Number of compressed blocks the Lightning Indexer
+        selects per query (CSA only).
+    n_group (`int | None`): DeepSeek-V3-style routed-expert group count for
+        group-limited routing. ``None`` disables group-limited routing.
+    first_k_dense_replace (`int | None`): First k decoder layers replace MoE
+        with a single dense MLP (V3 backward-compat hook); ``None`` keeps MoE
+        in every layer.
+    rope_interleave (`bool | None`): If True, interleave RoPE pairs over the
+        head dimension instead of the contiguous-half default.
+    rope_theta (`float | int`): RoPE base for the main (non-compressed)
+        attention branches.
+    partial_rotary_factor (`float | None`): Fraction of the head dim that
+        gets rotary positional embedding. Auto-derived from
+        ``qk_rope_head_dim / head_dim`` when unset.
+    num_nextn_predict_layers (`int`): MTP layer count in the upstream
+        checkpoint (not instantiated here).
     """
+
+    # rope_parameters uses a per-branch (main / compress) layout rather than
+    # the per-layer-type layout transformers' validator expects, so the outer
+    # dict's keys "main" and "compress" surface as "unrecognized" otherwise.
+    # The actual rope init runs through `DeepseekV4Profile.init_rotaries`,
+    # which reads each branch's nested dict directly.
+    ignore_keys_at_rope_validation = {"main", "compress"}
 
     model_type = "deepseek_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
