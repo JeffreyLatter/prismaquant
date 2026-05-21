@@ -97,6 +97,20 @@ def register_deepseek_v4() -> None:
     if not (vendor_dir / "__init__.py").exists():
         raise RuntimeError(f"vendored DSv4 missing at {vendor_dir}")
 
+    # Purge any cached upstream DSv4 submodules. If any prior call (e.g.
+    # `AutoTokenizer.from_pretrained` resolving the tokenizer via the
+    # config) loaded upstream's `transformers.models.deepseek_v4` and its
+    # submodules, those submodule entries remain in sys.modules after we
+    # overwrite the parent slot below. Our subsequent
+    # `from transformers.models.deepseek_v4.configuration_deepseek_v4
+    # import DeepseekV4Config` would then return the *upstream* class
+    # (cached, no `num_hash_layers`) which we'd then register with
+    # AutoConfig — pairing upstream config with vendored modeling and
+    # crashing on `config.num_hash_layers` at MoE block init.
+    _stale_prefix = pkg_name + "."
+    for _k in [k for k in sys.modules if k == pkg_name or k.startswith(_stale_prefix)]:
+        del sys.modules[_k]
+
     spec = importlib.util.spec_from_file_location(
         pkg_name,
         str(vendor_dir / "__init__.py"),
