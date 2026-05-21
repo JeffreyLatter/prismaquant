@@ -185,11 +185,24 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     # return a fully populated map from `fp8_scale_pairs`. Profiles
     # without overrides return None and we fall through to the legacy
     # `.weight_scale_inv`-suffix scan.
+    #
+    # DSv4-Flash additionally reports NVFP4-packed routed-expert weights
+    # via `nvfp4_scale_pairs`. Merging them here makes the streaming
+    # dequant fire on both formats; `_apply_fp8_dequant_inplace`
+    # distinguishes them via the runtime dtype + scale-shape check.
+    # The allocator's FP8_SOURCE manifest still queries `fp8_scale_pairs`
+    # directly and stays NVFP4-free.
     from .model_profiles import detect_profile
     profile = detect_profile(model_path)
     explicit = profile.fp8_scale_pairs(model_path)
-    if explicit is not None:
-        return explicit
+    nvfp4 = profile.nvfp4_scale_pairs(model_path)
+    if explicit is not None or nvfp4 is not None:
+        merged: dict[str, tuple[str, str]] = {}
+        if explicit is not None:
+            merged.update(explicit)
+        if nvfp4 is not None:
+            merged.update(nvfp4)
+        return merged
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_file):

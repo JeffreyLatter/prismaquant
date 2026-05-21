@@ -775,6 +775,22 @@ class ModelProfile(ABC):
         Default: None (use the legacy `.weight_scale_inv` discovery)."""
         return None
 
+    def nvfp4_scale_pairs(self, model_path: str
+                          ) -> dict[str, tuple[str, str]] | None:
+        """Return `{model_weight_key: (scale_shard_path, scale_ckpt_key)}`
+        for every NVFP4-packed weight tensor (int8 storage, two fp4
+        codes per byte, paired E8M0 block scales). The streaming
+        loader merges this map with `fp8_scale_pairs` for `_apply_fp8_
+        dequant_inplace`, which detects NVFP4 vs FP8 via the runtime
+        dtype + scale shape check.
+
+        Kept separate from `fp8_scale_pairs` because the allocator
+        consumes `fp8_scale_pairs` to gate `FP8_SOURCE` rendering, and
+        NVFP4-packed weights are NOT FP8_SOURCE-compatible.
+
+        Default: None (no NVFP4 packed weights)."""
+        return None
+
     def head_resident_extra_prefixes(self, root) -> list[str]:
         """Extra prefixes (rooted under the base model where possible)
         to load with the head-resident batch (embed/norm/lm_head/rotary).

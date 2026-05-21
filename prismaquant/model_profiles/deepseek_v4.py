@@ -204,21 +204,15 @@ class DeepseekV4Profile(ModelProfile):
 
         return None
 
-    def fp8_scale_pairs(self, model_path: str
-                        ) -> dict[str, tuple[str, str]] | None:
-        """DSv4 stores F8_E8M0 `.scale` siblings (not `.weight_scale_inv`).
-        Build the `{live_weight_qname: (shard_path, scale_ckpt_key)}`
-        map by pairing every `.scale` ckpt key with its `.weight`
-        sibling, then routing the weight key through `checkpoint_to_live_name`.
+    def _scale_pairs_for_dtype(
+        self, model_path: str, accept_dtype
+    ) -> dict[str, tuple[str, str]]:
+        """Shared helper: build `{live_weight_qname: (shard_path, scale_ckpt_key)}`
+        for every `.weight` whose dtype passes `accept_dtype(dtype_name)`.
 
-        IMPORTANT: DSv4-Flash uses `.scale` for *two* distinct source
-        formats — FP8_E4M3 attention/shared (weight dtype = float8_e4m3fn)
-        AND NVFP4-packed routed experts (weight dtype = int8, two fp4
-        codes per byte). Only the first is FP8_SOURCE-compatible; copying
-        an int8-packed NVFP4 tensor verbatim under the FP8_SOURCE export
-        path would corrupt the output. Per-shard header inspection skips
-        int8 weights so the resulting dict only describes true FP8 source.
-        """
+        Used by both `fp8_scale_pairs` (F8_* filter, for allocator's
+        FP8_SOURCE gating) and `nvfp4_scale_pairs` (int8 filter, for
+        load-time NVFP4 dequant)."""
         import json as _json
         import os as _os
         from collections import defaultdict
@@ -237,9 +231,7 @@ class DeepseekV4Profile(ModelProfile):
 
         weight_keys = {k for k in raw if k.endswith(".weight")}
 
-        # Group candidate weight keys by shard so we open each
-        # safetensors file at most once for the dtype probe.
-        candidates: list[tuple[str, str, str]] = []  # (ck_key, weight_ck, shard)
+        by_shard: dict[str, list[tuple[str, str]]] = defaultdict(list)
         for ck_key, shard in raw.items():
             if not ck_key.endswith(".scale"):
                 continue
@@ -247,10 +239,6 @@ class DeepseekV4Profile(ModelProfile):
             weight_ck = base + ".weight"
             if weight_ck not in weight_keys:
                 continue
-            candidates.append((ck_key, weight_ck, shard))
-
-        by_shard: dict[str, list[tuple[str, str]]] = defaultdict(list)
-        for ck_key, weight_ck, shard in candidates:
             by_shard[shard].append((ck_key, weight_ck))
 
         out: dict[str, tuple[str, str]] = {}
@@ -263,9 +251,7 @@ class DeepseekV4Profile(ModelProfile):
                         dtype_name = str(slice_obj.get_dtype())
                     except Exception:
                         continue
-                    # Skip NVFP4-packed weights (stored as int8). Only
-                    # float8_e4m3fn / float8_e5m2 are true FP8_SOURCE.
-                    if not dtype_name.startswith("F8_"):
+                    if not accept_dtype(dtype_name):
                         continue
                     weight_live = self.checkpoint_to_live_name(weight_ck)
                     if weight_live is None:
@@ -273,6 +259,33 @@ class DeepseekV4Profile(ModelProfile):
                     out[weight_live] = (
                         _os.path.join(model_path, shard), ck_key)
         return out
+
+    def fp8_scale_pairs(self, model_path: str
+                        ) -> dict[str, tuple[str, str]] | None:
+        """Live-qname → (shard, scale_ckpt_key) map for *FP8_SOURCE-
+        compatible* weights only (dtype F8_E4M3 / F8_E5M2).
+
+        DSv4-Flash uses `.scale` siblings for two distinct source
+        formats — FP8_E4M3 attention/shared AND NVFP4-packed routed
+        experts (dtype = int8, two fp4 codes per byte). Copying an
+        int8-packed NVFP4 tensor verbatim under the FP8_SOURCE export
+        path would corrupt the output. The NVFP4 packed weights are
+        reported separately via `nvfp4_scale_pairs` so the streaming
+        loader can dequant them while the allocator's FP8_SOURCE
+        manifest stays clean."""
+        return self._scale_pairs_for_dtype(
+            model_path, lambda dt: dt.startswith("F8_"))
+
+    def nvfp4_scale_pairs(self, model_path: str
+                          ) -> dict[str, tuple[str, str]] | None:
+        """Live-qname → (shard, scale_ckpt_key) map for NVFP4-packed
+        weights (int8 storage with E8M0 block scales). DSv4-Flash's
+        routed experts (`layers.*.ffn.experts.*.w[123].weight`) ship in
+        this format. `_apply_fp8_dequant_inplace`'s NVFP4 detection
+        branch (int8 + scale shape `(out, in*2/32)`) unpacks these at
+        load time."""
+        return self._scale_pairs_for_dtype(
+            model_path, lambda dt: dt == "I8")
 
     def head_resident_extra_prefixes(self, root) -> list[str]:
         """DSv4 has a HyperHead module at `model.hc_head` that collapses
