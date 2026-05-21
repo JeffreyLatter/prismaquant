@@ -476,6 +476,16 @@ def _fill_production_cache_streaming(
             base_model, hidden_states[0], position_ids)
         attention_mask = _make_causal_mask(T, device=device, dtype=dtype)
 
+        # DSv4 (hc_mult>1) expects multi-stream hidden `[B, S, hc_mult, H]`
+        # entering each decoder layer; default profile is identity.
+        # Mirrors `incremental_probe._compute_global_precompute` ordering:
+        # position embeddings computed on un-expanded hidden, then expand.
+        if profile is not None:
+            hidden_states = [
+                profile.expand_hidden_for_layers(h, base_model)
+                for h in hidden_states
+            ]
+
         # Load max_abs sidecar for resume support.
         activation_max_abs: dict[str, float] = {}
         if sidecar_path is not None and sidecar_path.is_file():
