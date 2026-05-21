@@ -114,17 +114,8 @@ PY
 # format-menu: render every requested format for every quantizable Linear,
 # useful when intentionally building a reusable cache for reallocations.
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
-: "${PRODUCTION_CACHE_LEVERS:=gptq}"
+: "${PRODUCTION_CACHE_LEVERS:=gptq,joint_scale_opt}"
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
-# JSO (joint_scale_opt) regressed PPL 0.8-1.6% on Qwen3-4B at 5.0/5.5/6.0 bpp
-# with the grouped-cost allocator (2026-05-20 A/B; same local-vs-end-loss
-# failure shape as the archived scale_sweep). Walled off from defaults; still
-# accepted as an explicit opt-in for ablations.
-case ",${PRODUCTION_CACHE_LEVERS}," in
-  *,joint_scale_opt,*)
-    echo "[pipeline] WARNING: PRODUCTION_CACHE_LEVERS includes joint_scale_opt — JSO regressed PPL on Qwen3-4B 2026-05-20 and is walled off; continuing because it was explicitly requested." >&2
-    ;;
-esac
 # PRODUCTION_CACHE_UNION=1 switches the validated-surrogate frontier path
 # from full format-menu rendering (every Linear × every quantized format)
 # to a smart-union render that only adds MXFP8 / FP8 fallback entries for

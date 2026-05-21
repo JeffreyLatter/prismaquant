@@ -104,16 +104,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--enable",
-        default="gptq",
+        default="gptq,joint_scale_opt",
         help="Comma-separated levers to enable. Currently honored: "
         "{none, gptq, joint_scale_opt}. "
         "Use none for RTN-only rendering with no local production levers. "
-        "Default `gptq` ships GPTQ with the always-on per-Linear damp sweep. "
-        "joint_scale_opt (JSO) regressed PPL 0.8-1.6% across budgets on "
-        "Qwen3-4B (2026-05-20 A/B with grouped-cost allocator); same failure "
-        "shape as scale_sweep (local act-weighted MSE objective doesn't "
-        "track model-level loss). Walled off from defaults; still accepted "
-        "as an explicit opt-in for ablations. "
+        "Default `gptq,joint_scale_opt` ships GPTQ (with the always-on "
+        "per-Linear damp sweep) plus JSO. "
         "scale_sweep regresses end-to-end KL on Qwen3-4B and was dropped "
         "from defaults 2026-05-15. "
         "static_act_order (SAO) and fisher_gptq are archived legacy names "

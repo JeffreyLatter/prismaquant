@@ -3538,17 +3538,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--production-cache-levers",
-        default="gptq",
+        default="gptq,joint_scale_opt",
         help=(
             "Comma-separated production cleanup levers for on-the-fly cache "
-            "builds. Default: gptq. joint_scale_opt (JSO) regressed PPL "
-            "0.8-1.6% across budgets on Qwen3-4B 2026-05-20 with the "
-            "grouped-cost allocator (same local-vs-end-loss failure shape as "
-            "the archived scale_sweep) and was walled off from defaults. "
-            "scale_sweep also remains available for explicit ablations but is "
-            "no longer a production default. GPTQ damp-sweep follows "
-            "PRISMAQUANT_GPTQ_DAMP_SWEEP and is recorded in cache metadata. "
-            "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE."
+            "builds. Default: gptq,joint_scale_opt. scale_sweep remains "
+            "available for explicit ablations but is no longer a production "
+            "default. GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
+            "recorded in cache metadata. NVFP4 block scaling follows "
+            "PRISMAQUANT_NVFP4_SCALE_RULE."
         ),
     )
     parser.add_argument(
