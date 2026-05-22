@@ -9,9 +9,9 @@
 # on every TVM import and are harmless upstream noise.
 export TVM_LOG_LEVEL=ERROR
 
-MODEL_PATH=Qwen/Qwen3-Coder-Next \
+#MODEL_PATH=Qwen/Qwen3-Coder-Next \
 #WORK_DIR=./dq-runs/Qwen36-27B-Prism \
-FORMATS=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16 \
+FORMATS=NVFP4,MXFP8_E4M3,FP8_E4M3,FP8_SOURCE,BF16 \
 #TARGET_BITS=4.75 \
 VISUAL_FORMAT=NVFP4 \
 CALIBRATION_MODALITY=text-only \
@@ -198,11 +198,15 @@ fi
 # CALIBRATION_MODALITY=multimodal.
 : "${MM_DATASET:=synthetic}"
 : "${MTP_FORMAT:=BF16}"
-# Production-cache export path. Enabled by default so export packs the same
-# rendered weights that KL/polish paths measure. Re-cache is enabled by default
-# after the Qwen3.5-0.8B and Qwen3-4B smoke ladder cleared vLLM eager/graph
-# serving; set PRODUCTION_RECACHE=0 for an explicit no-recache ablation.
-: "${PRODUCTION_CACHE:=1}"
+# Production-cache export path. DISABLED by default: on large source-format
+# models (e.g. DeepSeek-V4-Flash) the format-menu render is several hundred GB
+# of disk. With it off, export renders weights inline from layer_config.json at
+# TARGET_BITS. Set PRODUCTION_CACHE=1 to pack the exact rendered weights that
+# KL/polish paths measure (required for SELECTION_MODE=validated-surrogate).
+# Re-cache (when the cache is on) is enabled by default after the Qwen3.5-0.8B
+# and Qwen3-4B smoke ladder cleared vLLM eager/graph serving; set
+# PRODUCTION_RECACHE=0 for an explicit no-recache ablation.
+: "${PRODUCTION_CACHE:=0}"
 : "${PRODUCTION_RECACHE:=1}"
 : "${PRODUCTION_CACHE_MAX_ACT_ROWS:=512}"
 : "${PRODUCTION_CACHE_LRU_GB:=64.0}"
@@ -225,13 +229,16 @@ fi
 : "${HALO_SEED:=0}"
 # ── frontier selection mode ──────────────────────────────────────────────────
 # SELECTION_MODE=surrogate (default): export the allocator's surrogate-cost
-#   assignment at TARGET_BITS directly.
+#   assignment at TARGET_BITS directly. No production cache needed; the
+#   interactive knee-point / format-leg prompts are active (use --auto-accept
+#   for an unattended run).
 # SELECTION_MODE=validated-surrogate: build a format-menu production cache,
 #   measure real assignment-KL for every allocator Pareto point, and export
 #   the measured KL/bpp point chosen by VALIDATED_FRONTIER_PICK. Highest-
-#   fidelity loss/compression tradeoff. Requires PRODUCTION_CACHE=1 and
-#   bypasses the interactive knee-point / format-leg prompts (the measured
-#   frontier supersedes the surrogate knee).
+#   fidelity loss/compression tradeoff but several hundred GB of cache on
+#   large models. Requires PRODUCTION_CACHE=1 (set it explicitly) and bypasses
+#   the interactive knee-point / format-leg prompts (the measured frontier
+#   supersedes the surrogate knee).
 : "${SELECTION_MODE:=surrogate}"
 : "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
@@ -395,7 +402,7 @@ if [[ ! -f "${COST_PATH}" ]]; then
     --layers-per-shard "$LAYERS_PER_SHARD" \
     --skip-missing-activations \
     --no-include-lm-head \
-    --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-2048}" \
+    --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-12288}" \
     2>&1 | tee "${WORK_DIR}/logs/cost.log"
 else
   echo "[pipeline] [2/4] cost.pkl exists, skipping"
