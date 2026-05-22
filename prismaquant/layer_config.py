@@ -37,7 +37,7 @@ def canonicalize_format(entry: dict | str | int) -> str:
             elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
             if elt == "fp8_e5m2":
                 return "MXFP8_E5M2"
-            return "MXFP8"
+            return "MXFP8_E4M3"
         if dt in ("float", "bfloat16") and bits in (16, 0):
             return "BF16"
         if dt == "fp8_e4m3" and bits == 8:
@@ -45,10 +45,10 @@ def canonicalize_format(entry: dict | str | int) -> str:
             if group_size == 128:
                 return "FP8_SOURCE"
             if group_size == 32:
-                return "MXFP8"
+                return "MXFP8_E4M3"
             if group_size in (0, -1):
                 return "FP8_E4M3"
-            return "MXFP8"
+            return "MXFP8_E4M3"
         if dt == "fp8_e5m2" and bits == 8:
             return "FP8_E5M2"
         if dt == "mx_fp" and bits == 6:
@@ -68,7 +68,7 @@ def canonicalize_format(entry: dict | str | int) -> str:
         if value in ("mxfp4", "mx_fp4"):
             return "MXFP4"
         if value in ("mxfp8", "mxfp8_e4m3", "8"):
-            return "MXFP8"
+            return "MXFP8_E4M3"
         if value in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
             return "FP8_E4M3"
         if value in ("mxfp8_e5m2", "mx_fp8_e5m2"):
@@ -82,7 +82,7 @@ def canonicalize_format(entry: dict | str | int) -> str:
         if entry <= 4:
             return "NVFP4"
         if entry <= 8:
-            return "MXFP8"
+            return "MXFP8_E4M3"
         return "BF16"
     raise ValueError(f"unsupported scheme: {entry!r}")
 

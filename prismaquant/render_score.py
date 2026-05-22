@@ -372,7 +372,7 @@ def _register_builtins() -> None:
         phase=60,
         gate_metric="output_mse",
         after=("gptq", "fisher_gptq"),
-        description="Closed-form NVFP4/MXFP8 scale refinement.",
+        description="Closed-form NVFP4/MXFP8_E4M3 scale refinement.",
     ))
 
 

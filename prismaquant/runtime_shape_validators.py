@@ -14,7 +14,7 @@ def flashinfer_mxfp8_problem_size_accepts(
     in_features: int,
     out_features: int,
 ) -> bool | None:
-    """Return FlashInfer's MXFP8 GEMM shape verdict, if FlashInfer exists."""
+    """Return FlashInfer's MXFP8_E4M3/MXFP8_E5M2 GEMM shape verdict."""
     try:
         canonical = fr.canonical_format_name(fmt)
     except Exception:

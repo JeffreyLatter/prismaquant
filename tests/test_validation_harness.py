@@ -114,6 +114,27 @@ class _ValidationTokenizer:
         return SimpleNamespace(input_ids=torch.tensor([ids], dtype=torch.long))
 
 
+def test_load_wikitext_ids_falls_back_to_legacy_dataset_name(tmp_path):
+    calls = []
+
+    def fake_load_dataset(name, config, *, split, cache_dir):
+        calls.append((name, config, split, cache_dir))
+        if name == "Salesforce/wikitext":
+            raise RuntimeError("namespaced dataset unavailable")
+        return [{"text": "hello"}, {"text": ""}, {"text": "world"}]
+
+    ids = vh._load_wikitext_ids(
+        _ValidationTokenizer(),
+        fake_load_dataset,
+        cache_dir=tmp_path,
+        split="test",
+        n_tokens=4,
+    )
+
+    assert ids.shape == (1, 4)
+    assert [call[0] for call in calls] == ["Salesforce/wikitext", "wikitext"]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_validation_with_cuda_graphs_matches_eager(monkeypatch):
     torch.manual_seed(0)

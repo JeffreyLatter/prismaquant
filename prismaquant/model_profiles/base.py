@@ -387,7 +387,7 @@ class ModelProfile(ABC):
             misses the 3D-only explode path and fails to route onto
             the fused `w13_weight` / `w2_weight` params.
 
-        Default: split for every non-BF16 format (NVFP4, MXFP8, etc.)
+        Default: split for every non-BF16 format (NVFP4, MXFP8_E4M3, etc.)
         and keep packed for BF16. Profiles can override when their
         vLLM loader has different expectations — for instance, Qwen
         3.5/3.6 would be free to split even at BF16, though there's

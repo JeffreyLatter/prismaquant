@@ -369,7 +369,16 @@ def _wikitext_ppl(
     if seq_len < 2:
         raise ValueError("WikiText tokenization produced fewer than two tokens")
 
-    stride = min(_model_context_length(model, tokenizer), 2048, seq_len)
+    max_stride = 2048
+    raw_stride = os.environ.get("PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE")
+    if raw_stride:
+        try:
+            max_stride = max(2, int(raw_stride))
+        except ValueError as exc:
+            raise ValueError(
+                "PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE must be an integer"
+            ) from exc
+    stride = min(_model_context_length(model, tokenizer), max_stride, seq_len)
     stride = max(int(stride), 2)
     nll_sum = 0.0
     token_count = 0
@@ -399,6 +408,13 @@ def _wikitext_ppl(
         nll_sum += float(loss.detach().float().item()) * float(trg_len)
         token_count += int(trg_len)
         prev_end = end
+        del loss, labels, window
+        if getattr(device, "type", None) == "cuda":
+            import gc
+            import torch
+
+            gc.collect()
+            torch.cuda.empty_cache()
         if end >= seq_len:
             break
     if token_count <= 0:
@@ -414,12 +430,21 @@ def _load_wikitext_ids(
     split: str,
     n_tokens: int | None = None,
 ):
-    ds = load_dataset(
-        "wikitext",
-        "wikitext-2-raw-v1",
-        split=split,
-        cache_dir=str(cache_dir / "datasets"),
-    )
+    last_error: Exception | None = None
+    for dataset_name in ("Salesforce/wikitext", "wikitext"):
+        try:
+            ds = load_dataset(
+                dataset_name,
+                "wikitext-2-raw-v1",
+                split=split,
+                cache_dir=str(cache_dir / "datasets"),
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        assert last_error is not None
+        raise last_error
     text = "\n\n".join(row["text"] for row in ds if row.get("text", "").strip())
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc.input_ids
@@ -777,7 +802,7 @@ def _entry_format_name(entry: Any) -> str | None:
             elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
             if elt == "fp8_e5m2":
                 return "MXFP8_E5M2" if act_bits == 8 else None
-            return "MXFP8" if act_bits == 8 else "MXFP8A16"
+            return "MXFP8_E4M3" if act_bits == 8 else "MXFP8A16"
     if data_type == "int":
         if bits == 8:
             return "INT8_W8A16"

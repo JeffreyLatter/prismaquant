@@ -22,7 +22,7 @@
       "when": {
         "regex": "(^|[.])(?:mlp[.]|moe[.])?experts([.]|$)"
       },
-      "allow_formats": ["NVFP4", "MXFP4", "MXFP8", "MXFP8_E4M3", "BF16"],
+      "allow_formats": ["NVFP4", "MXFP4", "MXFP8_E4M3", "BF16"],
       "reason": "profile_mismatch",
       "detail": "The selected vLLM packed-MoE serving path only supports NVFP4, MXFP4, MXFP8_E4M3, or BF16 for expert tensors; plain FP8 and E5M2 stay research-only until a vLLM packed-MoE load smoke passes"
     },

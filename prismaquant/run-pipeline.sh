@@ -5,7 +5,7 @@
 # Usage:
 #   MODEL_PATH=/path/to/Qwen3.6-35B-A3B \
 #   WORK_DIR=./dq-runs/qwen36 \
-#   FORMATS=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16 \
+#   FORMATS=NVFP4,MXFP8_E4M3,BF16 \
 #   TARGET_BITS=4.75 \
 #   VISUAL_FORMAT=BF16 \
 #   CALIBRATION_MODALITY=text-only \
@@ -42,7 +42,7 @@ set -euo pipefail
 
 : "${MODEL_PATH:?Set MODEL_PATH to the source HF model directory}"
 : "${WORK_DIR:?Set WORK_DIR to a writable directory for artifacts}"
-: "${FORMATS:=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16}"
+: "${FORMATS:=NVFP4,MXFP8_E4M3,BF16}"
 : "${TARGET_BITS:=4.75}"
 : "${PARETO_TARGETS:=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25}"
 # Calibration defaults. 4x256 was the historical minimum for correctness
@@ -118,13 +118,29 @@ PY
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
 # PRODUCTION_CACHE_UNION=1 switches the validated-surrogate frontier path
 # from full format-menu rendering (every Linear × every quantized format)
-# to a smart-union render that only adds MXFP8 / FP8 fallback entries for
-# Linears whose NVFP4 output_mse exceeds the band thresholds. ~40-60%
+# to a smart-union render that only adds explicit FP8_E4M3/FP8_E5M2 and
+# MXFP8_E4M3/MXFP8_E5M2 fallback entries for Linears whose NVFP4 output_mse
+# exceeds the band thresholds. ~40-60%
 # fewer renders without sacrificing assignment coverage in practice on
 # typical bit budgets.
 : "${PRODUCTION_CACHE_UNION:=0}"
 : "${PRODUCTION_CACHE_UNION_P_MXFP8:=0.50}"
 : "${PRODUCTION_CACHE_UNION_P_FP8:=0.75}"
+: "${COST_MODE:=production-render-score}"
+: "${GROUPED_KL_NSAMPLES:=8}"
+: "${GROUPED_KL_SEQLEN:=1024}"
+: "${GROUPED_KL_SEED:=42}"
+: "${GROUPED_KL_SCOPE:=full_sequence}"
+: "${GROUPED_KL_MAX_LANES:=4}"
+: "${PRODUCTION_RENDER_COST_NSAMPLES:=$GROUPED_KL_NSAMPLES}"
+: "${PRODUCTION_RENDER_COST_SEQLEN:=$GROUPED_KL_SEQLEN}"
+: "${PRODUCTION_RENDER_COST_SEED:=$GROUPED_KL_SEED}"
+: "${PRODUCTION_RENDER_COST_SCORE_FIELD:=output_mse}"
+: "${PRODUCTION_RENDER_COST_REQUIRE_SCORES:=0}"
+: "${PRODUCTION_RENDER_COST_REQUIRE_OUTPUT:=1}"
+: "${PRODUCTION_RENDER_COST_PROMOTE_FRACTION:=0.30}"
+: "${PRODUCTION_RENDER_COST_MIN_PROMOTE_SCORE:=}"
+: "${PRODUCTION_RENDER_COST_MAX_PROMOTIONS:=}"
 : "${EXPORT_GPTQ:=auto}"
 : "${EXPORT_SCALE_SWEEP:=auto}"
 : "${PIPELINE_SPEC_PATH:=${WORK_DIR}/artifacts/pipeline_spec.json}"
@@ -160,7 +176,44 @@ export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
 : "${VALIDATED_FRONTIER_PICK:=kneedle}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
-COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
+case "$COST_MODE" in
+  local)
+    BASE_COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
+    COST_PATH="${BASE_COST_PATH}"
+    GROUPED_KL_PATH=""
+    PRODUCTION_RENDER_COST_CACHE_PATH=""
+    PRODUCTION_RENDER_COST_CACHE_DIR=""
+    PRODUCTION_RENDER_COST_TAIL_QNAMES=""
+    ;;
+  grouped-kl)
+    BASE_COST_PATH="${WORK_DIR}/artifacts/cost_baseline.pkl"
+    COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
+    GROUPED_KL_PATH="${WORK_DIR}/artifacts/grouped_kl.pkl"
+    PRODUCTION_RENDER_COST_CACHE_PATH=""
+    PRODUCTION_RENDER_COST_CACHE_DIR=""
+    PRODUCTION_RENDER_COST_TAIL_QNAMES=""
+    ;;
+  production-render-score|production-render)
+    BASE_COST_PATH="${WORK_DIR}/artifacts/cost_baseline.pkl"
+    COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
+    GROUPED_KL_PATH=""
+    PRODUCTION_RENDER_COST_CACHE_PATH="${WORK_DIR}/artifacts/production_render_score_cache.pkl"
+    PRODUCTION_RENDER_COST_CACHE_DIR="${WORK_DIR}/artifacts/production_render_score_weight_cache"
+    PRODUCTION_RENDER_COST_TAIL_QNAMES=""
+    ;;
+  production-render-staged|production-render-tail)
+    BASE_COST_PATH="${WORK_DIR}/artifacts/cost_baseline.pkl"
+    COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
+    GROUPED_KL_PATH=""
+    PRODUCTION_RENDER_COST_CACHE_PATH="${WORK_DIR}/artifacts/production_render_score_staged_cache.pkl"
+    PRODUCTION_RENDER_COST_CACHE_DIR="${WORK_DIR}/artifacts/production_render_score_staged_weight_cache"
+    PRODUCTION_RENDER_COST_TAIL_QNAMES="${WORK_DIR}/artifacts/production_render_score_tail_qnames.txt"
+    ;;
+  *)
+    echo "[pipeline] ERROR: COST_MODE must be local, grouped-kl, production-render-score, or production-render-staged" >&2
+    exit 2
+    ;;
+esac
 
 PROBE_H_DETAIL_ARGS=()
 COST_H_DETAIL_ARGS=()
@@ -217,6 +270,13 @@ echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
 echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
 echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
 echo "  PRODUCTION_CACHE_DISABLE_LEVERS=$PRODUCTION_CACHE_DISABLE_LEVERS"
+echo "  COST_MODE=$COST_MODE"
+if [[ "$COST_MODE" == "grouped-kl" ]]; then
+  echo "  GROUPED_KL_NSAMPLES=$GROUPED_KL_NSAMPLES GROUPED_KL_SEQLEN=$GROUPED_KL_SEQLEN GROUPED_KL_SEED=$GROUPED_KL_SEED GROUPED_KL_SCOPE=$GROUPED_KL_SCOPE GROUPED_KL_MAX_LANES=$GROUPED_KL_MAX_LANES"
+fi
+if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" || "$COST_MODE" == "production-render-staged" || "$COST_MODE" == "production-render-tail" ]]; then
+  echo "  PRODUCTION_RENDER_COST_NSAMPLES=$PRODUCTION_RENDER_COST_NSAMPLES PRODUCTION_RENDER_COST_SEQLEN=$PRODUCTION_RENDER_COST_SEQLEN PRODUCTION_RENDER_COST_SEED=$PRODUCTION_RENDER_COST_SEED SCORE_FIELD=$PRODUCTION_RENDER_COST_SCORE_FIELD"
+fi
 echo "  EXPORT_GPTQ=$EXPORT_GPTQ EXPORT_SCALE_SWEEP=$EXPORT_SCALE_SWEEP"
 echo "  PIPELINE_SPEC_PATH=$PIPELINE_SPEC_PATH"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
@@ -321,14 +381,14 @@ fi
 # 2. Cost measurement (per-(Linear, format) measured RTN error,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
-if [[ ! -f "${COST_PATH}" ]]; then
+if [[ ! -f "${BASE_COST_PATH}" ]]; then
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
   python3 -m prismaquant.incremental_measure_quant_cost \
     --model "$MODEL_PATH" \
     --probe "${PROBE_PATH}" \
     --activation-cache-dir "${WORK_DIR}/act" \
     --formats "$FORMATS" \
-    --output "${COST_PATH}" \
+    --output "${BASE_COST_PATH}" \
     --work-dir "${WORK_DIR}/work" \
     --device "$DEVICE" --dtype bf16 \
     --mode batched --chunk-size 256 \
@@ -340,7 +400,7 @@ if [[ ! -f "${COST_PATH}" ]]; then
     2>&1 | tee "${WORK_DIR}/logs/cost.log"
 else
   if [[ "${#COST_H_DETAIL_ARGS[@]}" -gt 0 ]]; then
-    cost_h_detail_status=$(python3 - "$COST_PATH" "$H_DETAIL_DIR" <<'PY'
+    cost_h_detail_status=$(python3 - "$BASE_COST_PATH" "$H_DETAIL_DIR" <<'PY'
 import pickle
 import sys
 from pathlib import Path
@@ -377,15 +437,200 @@ PY
       echo "             expected: $H_DETAIL_DIR"
       echo "             actual:   ${cost_h_detail_status#bad:}"
       echo "             Delete stale cost artifacts to regenerate:"
-      echo "               rm ${COST_PATH}"
+      echo "               rm ${BASE_COST_PATH}"
       echo "               rm -rf ${WORK_DIR}/work/shards"
       exit 2
     fi
   fi
-  echo "[pipeline] [2/4] cost.pkl exists, skipping"
+  echo "[pipeline] [2/4] baseline cost exists, skipping"
 fi
 # Fisher output-MSE allocator cost-status check removed; the archive guard
 # at the top of this file errors out before reaching here if the var is set.
+
+if [[ "$COST_MODE" == "grouped-kl" ]]; then
+  if [[ ! -f "$GROUPED_KL_PATH" || ! -f "$COST_PATH" ]]; then
+    echo "[pipeline] [2b/4] measuring grouped-KL cost objective ..."
+    python3 -m prismaquant.grouped_kl_cost \
+      --model "$MODEL_PATH" \
+      --dataset "$DATASET" \
+      --n-calib-samples "$GROUPED_KL_NSAMPLES" \
+      --calib-seqlen "$GROUPED_KL_SEQLEN" \
+      --calib-seed "$GROUPED_KL_SEED" \
+      --formats "$FORMATS" \
+      --baseline-cost "$BASE_COST_PATH" \
+      --output "$GROUPED_KL_PATH" \
+      --output-cost "$COST_PATH" \
+      --work-root "${WORK_DIR}/grouped_kl_work" \
+      --device "$DEVICE" --dtype bf16 \
+      --target-profile "$TARGET_PROFILE" \
+      --kl-scope "$GROUPED_KL_SCOPE" \
+      --max-lanes-per-batch "$GROUPED_KL_MAX_LANES" \
+      --production-cache-dir "${WORK_DIR}/artifacts/grouped_kl_production_weight_cache" \
+      --production-cache-output "${WORK_DIR}/artifacts/grouped_kl_production_weight_cache.pkl" \
+      --production-cache-levers "$PRODUCTION_CACHE_LEVERS" \
+      --production-cache-max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+      --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
+      2>&1 | tee "${WORK_DIR}/logs/grouped_kl_cost.log"
+  else
+    echo "[pipeline] [2b/4] grouped-KL cost exists, skipping"
+  fi
+fi
+
+if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" ]]; then
+  if [[ ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
+    echo "[pipeline] [2b/4] rendering production weights for allocator cost ..."
+    python3 -m prismaquant.build_production_cache \
+      --model "$MODEL_PATH" \
+      --output "$PRODUCTION_RENDER_COST_CACHE_PATH" \
+      --formats "$FORMATS" \
+      --render-scope format-menu \
+      --n-calib-samples "$PRODUCTION_RENDER_COST_NSAMPLES" \
+      --calib-seqlen "$PRODUCTION_RENDER_COST_SEQLEN" \
+      --calib-seed "$PRODUCTION_RENDER_COST_SEED" \
+      --dataset "$DATASET" \
+      --dtype bf16 \
+      --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+      --enable "$PRODUCTION_CACHE_LEVERS" \
+      --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+      --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
+      2>&1 | tee "${WORK_DIR}/logs/production_render_score_cache.log"
+  else
+    echo "[pipeline] [2b/4] production-render cost cache exists, skipping"
+  fi
+  if [[ ! -f "$COST_PATH" ]]; then
+    echo "[pipeline] [2c/4] synthesizing production-render allocator cost ..."
+    PROD_RENDER_COST_ARGS=()
+    case "$PRODUCTION_RENDER_COST_REQUIRE_SCORES" in
+      1|true|True|TRUE|yes|Yes|YES|on|On|ON)
+        PROD_RENDER_COST_ARGS+=(--require-render-scores)
+        ;;
+    esac
+    case "$PRODUCTION_RENDER_COST_REQUIRE_OUTPUT" in
+      0|false|False|FALSE|no|No|NO|off|Off|OFF|"") ;;
+      *)
+        PROD_RENDER_COST_ARGS+=(--require-output-metric)
+        ;;
+    esac
+    python3 -m prismaquant.production_render_cost \
+      --production-cache "$PRODUCTION_RENDER_COST_CACHE_PATH" \
+      --baseline-cost "$BASE_COST_PATH" \
+      --output "$COST_PATH" \
+      --formats "$FORMATS" \
+      --score-field "$PRODUCTION_RENDER_COST_SCORE_FIELD" \
+      "${PROD_RENDER_COST_ARGS[@]}" \
+      2>&1 | tee "${WORK_DIR}/logs/production_render_cost.log"
+  else
+    echo "[pipeline] [2c/4] production-render allocator cost exists, skipping"
+  fi
+fi
+
+if [[ "$COST_MODE" == "production-render-staged" || "$COST_MODE" == "production-render-tail" ]]; then
+  PRODUCTION_RENDER_COST_NVFP4_CACHE="${WORK_DIR}/artifacts/production_render_score_staged_nvfp4_cache.pkl"
+  PRODUCTION_RENDER_COST_TAIL_SUMMARY="${WORK_DIR}/artifacts/production_render_score_tail_summary.json"
+  if [[ ! -f "$PRODUCTION_RENDER_COST_NVFP4_CACHE" ]]; then
+    echo "[pipeline] [2b/4] rendering NVFP4 production weights for staged allocator cost ..."
+    python3 -m prismaquant.build_production_cache \
+      --model "$MODEL_PATH" \
+      --output "$PRODUCTION_RENDER_COST_NVFP4_CACHE" \
+      --formats NVFP4 \
+      --render-scope format-menu \
+      --n-calib-samples "$PRODUCTION_RENDER_COST_NSAMPLES" \
+      --calib-seqlen "$PRODUCTION_RENDER_COST_SEQLEN" \
+      --calib-seed "$PRODUCTION_RENDER_COST_SEED" \
+      --dataset "$DATASET" \
+      --dtype bf16 \
+      --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+      --enable "$PRODUCTION_CACHE_LEVERS" \
+      --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+      --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
+      2>&1 | tee "${WORK_DIR}/logs/production_render_score_nvfp4_cache.log"
+  else
+    echo "[pipeline] [2b/4] staged NVFP4 production-render cache exists, skipping"
+  fi
+  if [[ ! -f "$PRODUCTION_RENDER_COST_TAIL_QNAMES" ]]; then
+    echo "[pipeline] [2c/4] selecting high-error NVFP4 tail for staged promotions ..."
+    SELECT_TAIL_ARGS=()
+    if [[ -n "$PRODUCTION_RENDER_COST_MIN_PROMOTE_SCORE" ]]; then
+      SELECT_TAIL_ARGS+=(--select-tail-min-score "$PRODUCTION_RENDER_COST_MIN_PROMOTE_SCORE")
+    fi
+    if [[ -n "$PRODUCTION_RENDER_COST_MAX_PROMOTIONS" ]]; then
+      SELECT_TAIL_ARGS+=(--select-tail-max-count "$PRODUCTION_RENDER_COST_MAX_PROMOTIONS")
+    fi
+    python3 -m prismaquant.production_render_cost \
+      --production-cache "$PRODUCTION_RENDER_COST_NVFP4_CACHE" \
+      --score-field "$PRODUCTION_RENDER_COST_SCORE_FIELD" \
+      --select-tail-output "$PRODUCTION_RENDER_COST_TAIL_QNAMES" \
+      --select-tail-summary "$PRODUCTION_RENDER_COST_TAIL_SUMMARY" \
+      --select-tail-format NVFP4 \
+      --select-tail-top-fraction "$PRODUCTION_RENDER_COST_PROMOTE_FRACTION" \
+      "${SELECT_TAIL_ARGS[@]}" \
+      2>&1 | tee "${WORK_DIR}/logs/production_render_tail.log"
+  else
+    echo "[pipeline] [2c/4] staged promotion tail exists, skipping"
+  fi
+  PRODUCTION_RENDER_COST_HIGH_FORMATS="$(python3 - "$FORMATS" <<'PY'
+import sys
+from prismaquant import format_registry as fr
+
+seen = []
+for raw in sys.argv[1].split(","):
+    name = raw.strip()
+    if not name:
+        continue
+    canon = fr.canonical_format_name(name)
+    if canon not in {"BF16", "NVFP4"} and canon not in seen:
+        seen.append(canon)
+print(",".join(seen))
+PY
+)"
+  if [[ -n "$PRODUCTION_RENDER_COST_HIGH_FORMATS" && ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
+    echo "[pipeline] [2d/4] rendering staged promotion formats (${PRODUCTION_RENDER_COST_HIGH_FORMATS}) for high-error tail ..."
+    python3 -m prismaquant.build_production_cache \
+      --model "$MODEL_PATH" \
+      --output "$PRODUCTION_RENDER_COST_CACHE_PATH" \
+      --formats "$PRODUCTION_RENDER_COST_HIGH_FORMATS" \
+      --render-scope format-menu \
+      --include-qnames-file "$PRODUCTION_RENDER_COST_TAIL_QNAMES" \
+      --n-calib-samples "$PRODUCTION_RENDER_COST_NSAMPLES" \
+      --calib-seqlen "$PRODUCTION_RENDER_COST_SEQLEN" \
+      --calib-seed "$PRODUCTION_RENDER_COST_SEED" \
+      --dataset "$DATASET" \
+      --dtype bf16 \
+      --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+      --enable "$PRODUCTION_CACHE_LEVERS" \
+      --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+      --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
+      2>&1 | tee "${WORK_DIR}/logs/production_render_score_tail_cache.log"
+  elif [[ -z "$PRODUCTION_RENDER_COST_HIGH_FORMATS" ]]; then
+    PRODUCTION_RENDER_COST_CACHE_PATH="$PRODUCTION_RENDER_COST_NVFP4_CACHE"
+    echo "[pipeline] [2d/4] no staged high formats requested"
+  else
+    echo "[pipeline] [2d/4] staged promotion-format cache exists, skipping"
+  fi
+  if [[ ! -f "$COST_PATH" ]]; then
+    echo "[pipeline] [2e/4] synthesizing staged production-render allocator cost ..."
+    PROD_RENDER_COST_ARGS=()
+    case "$PRODUCTION_RENDER_COST_REQUIRE_OUTPUT" in
+      0|false|False|FALSE|no|No|NO|off|Off|OFF|"") ;;
+      *)
+        PROD_RENDER_COST_ARGS+=(--require-output-metric)
+        ;;
+    esac
+    python3 -m prismaquant.production_render_cost \
+      --production-cache "$PRODUCTION_RENDER_COST_CACHE_PATH" \
+      --baseline-cost "$BASE_COST_PATH" \
+      --output "$COST_PATH" \
+      --formats "$FORMATS" \
+      --score-field "$PRODUCTION_RENDER_COST_SCORE_FIELD" \
+      --missing-render-score-policy unavailable \
+      --promotion-qnames-file "$PRODUCTION_RENDER_COST_TAIL_QNAMES" \
+      --bf16-policy promotion-set \
+      "${PROD_RENDER_COST_ARGS[@]}" \
+      2>&1 | tee "${WORK_DIR}/logs/production_render_cost.log"
+  else
+    echo "[pipeline] [2e/4] staged production-render allocator cost exists, skipping"
+  fi
+fi
 
 # -----------------------------------------------------------------------
 # 3. Allocator (multi-choice knapsack over per-layer formats)
@@ -472,7 +717,7 @@ PY
     PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_frontier_raw.pkl"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       if [[ "${PRODUCTION_CACHE_UNION:-0}" == "1" ]]; then
-        # Smart-union render: only render MXFP8/FP8 fallbacks for Linears
+        # Smart-union render: only render MXFP8_E4M3/FP8_E4M3 fallbacks for Linears
         # whose NVFP4 output_mse is above the threshold percentiles. Same
         # cache layout as format-menu, just fewer entries.
         echo "[pipeline] [4/4] building smart-union production cache for validated frontier ..."

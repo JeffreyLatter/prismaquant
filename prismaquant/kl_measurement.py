@@ -3920,7 +3920,7 @@ def measure_override_set_kl(
 ) -> list[float]:
     """Measure end-KL for simultaneous multi-Linear override candidates.
 
-    Each lane is a complete override mapping, e.g. q/k/v all set to MXFP8 for
+    Each lane is a complete override mapping, e.g. q/k/v all set to MXFP8_E4M3 for
     the vLLM-packed qkv decision unit.  The teacher remains the original BF16
     reference model; all non-target modules stay at ``baseline_assignment``.
     """

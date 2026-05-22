@@ -10,6 +10,8 @@ def test_production_recache_default_enabled_after_smoke_ladder():
     assert "PRODUCTION_RECACHE:=1" in script
     assert "PRODUCTION_RECACHE=0" in script
     assert "PIPELINE_SPEC_PATH:=${WORK_DIR}/artifacts/pipeline_spec.json" in script
+    assert "COST_MODE:=production-render-score" in script
+    assert "production-render-staged|production-render-tail" in script
     assert "python3 -m prismaquant.pipeline" in script
     assert "--write-default-production" in script
     assert "--target-profile \"$TARGET_PROFILE\"" in script

@@ -169,9 +169,9 @@ def _format_cli_choices() -> tuple[str, ...]:
 # `model.visual.blocks.*` Linears are zero — the knapsack DP has no
 # sensitivity signal to allocate on. Rather than let every visual Linear
 # default to the cheapest format or go through stale passthrough, we accept
-# a single uniform target format (`BF16`, `NVFP4`, or `MXFP8`) and assign
+# a single uniform target format (`BF16`, `NVFP4`, or `MXFP8_E4M3`) and assign
 # every visual Linear to it. BF16 (the default) reproduces the previous
-# passthrough behavior; NVFP4/MXFP8 shrink the tower to quantized storage
+# passthrough behavior; NVFP4/MXFP8_E4M3 shrink the tower to quantized storage
 # using the same RTN math the body gets.
 #
 # Phase 2 (tracked separately) will replace this override with a real
@@ -433,7 +433,8 @@ def main():
                          "--visual-sensitivity=uniform OR when --visual-"
                          "sensitivity=fisher but the probe / cost pickles "
                          "don't carry real visual Fisher data. BF16 (default) "
-                         "reproduces passthrough behavior; NVFP4 / MXFP8 "
+                         "reproduces passthrough behavior; NVFP4 / "
+                         "MXFP8_E4M3 "
                          "shrink the tower to quantized storage via the "
                          "existing RTN math at export time.")
     ap.add_argument("--visual-sensitivity",
@@ -543,9 +544,9 @@ def main():
                "noise, which is usually not what you want:\n"
                + "\n".join(f"  {k} bits: {v}" for k, v in collisions.items())
                + "\nRecommended bundles (vLLM serving, today):\n"
-               "  Ship-ready     : NVFP4,MXFP8       (validated)\n"
-               "  MX-pure        : MXFP4,MXFP8\n"
-               "  Experimental   : NVFP4,MXFP6_E3M2,MXFP8   "
+               "  Ship-ready     : NVFP4,MXFP8_E4M3       (validated)\n"
+               "  MX-pure        : MXFP4,MXFP8_E4M3\n"
+               "  Experimental   : NVFP4,MXFP6_E3M2,MXFP8_E4M3   "
                "(MXFP6 hardware-supported on Blackwell, vLLM kernels not yet landed)")
         if args.enforce_family_coherence:
             raise SystemExit(f"[alloc] ERROR: {msg}")
@@ -968,7 +969,7 @@ def main():
             layer_cfg[name] = format_specs[fmt].autoround_config()
         else:
             # Visual format outside the body's format set (e.g., user
-            # passed --formats NVFP4,BF16 plus --visual-format MXFP8).
+            # passed --formats NVFP4,BF16 plus --visual-format MXFP8_E4M3).
             # Resolve from the global registry.
             layer_cfg[name] = fr.get_format(fmt).autoround_config()
 

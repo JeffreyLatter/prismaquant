@@ -47,8 +47,10 @@ also lets FourOverSix participate in downstream GPTQ packages. This catches
 the case where FourOverSix alone is neutral or negative, but FourOverSix plus
 rounding improves the active score.
 
-MXFP8 scale-sweep uses the same progressive gate: if the activation-aware
-candidate regresses the active score, the MXFP8 baseline render is kept.
+MXFP8_E4M3 scale-sweep and the explicit FP8_E4M3/FP8_E5M2 plus
+MXFP8_E4M3/MXFP8_E5M2 GPTQ paths use the same progressive gate: if the
+activation-aware candidate regresses the active score, the baseline render is
+kept.
 
 The gate can be disabled only for debugging with
 `PRISMAQUANT_RENDER_PROGRESSIVE_GATES=0`. The minimum relative gain is

@@ -21,3 +21,4 @@ scratch/
 data/
 propagated-cost
 paper/scripts/gemini_review_stderr.txt
+tmp/

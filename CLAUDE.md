@@ -6,12 +6,16 @@ GPU-first execution, cache reuse, vLLM gating, and measurement discipline.
 
 Before working on PrismaQuant, read in order:
 
-- `.claude/prismaquant-handover-2026-05-02.md` — **CURRENT STATE.**
+- `.claude/prismaquant-handover-2026-05-20.md` — **CURRENT STATE.**
+  Grouped-KL cost surrogate validated on 27B (−3.52% PPL at 6.0 bpp,
+  fixes non-monotonicity). JSO 4B A/B saw jso_off win 0.8-1.6% PPL but
+  result has cost-surrogate confound; wall-off was committed then
+  REVERTED. Next: launch queued 27B JSO isolation A/B
+  (`/home/rob/dq-runs/qwen36_27b_jso_isolation.sh`). Open issues + file
+  map + commits inside.
+- `.claude/prismaquant-handover-2026-05-02.md` — earlier state.
   PrismaSCOUT L3-redesign landed end-to-end. v5 proved 34% KL improvement
-  over L2 at 4.5 bpp on Qwen 4B (KL 0.371 → 0.245). Kernel + graphs +
-  replay combo blocked by GB10 OOM on 121 GB UMA. Recommended path: ship
-  proven v5 config for Pareto sweep. Open issues + file map + commits
-  list inside.
+  over L2 at 4.5 bpp on Qwen 4B.
 - `.claude/prismaquant-handover-2026-05-01.md` — earlier state. Allocator
-  Δloss bug + the design that became PrismaSCOUT. User's conceptual core.
+  Δloss bug + the design that became PrismaSCOUT.
 - `.claude/prismaquant-handover-2026-04-29.md` — older session context.

@@ -48,7 +48,7 @@ class BlockSpec:
     `linears`: ordered list of (qname, dequantize_fn) pairs. The
     dequantize_fn takes a per-group fp8 scale tensor and returns the
     quantized weight to assign to the Linear. This abstracts away
-    NVFP4 / MXFP8 / etc. format-specifics so the refiner doesn't need
+    NVFP4 / MXFP8_E4M3 / etc. format-specifics so the refiner doesn't need
     to know which format a particular Linear uses.
 
     `forward_fn`: callable `(input_tensor) -> output_tensor` that runs

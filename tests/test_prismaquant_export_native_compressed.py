@@ -483,6 +483,40 @@ class TestRoundTrip(unittest.TestCase):
         self.assertEqual(tuple(s.shape), (E, M, 2))
         self.assertEqual(s.dtype, torch.uint8)
 
+    def test_fp8_e4m3_gptq_returns_exportable_tensors(self):
+        torch.manual_seed(0)
+        W = torch.randn(4, 32) * 0.1
+        X = torch.randn(12, 32)
+        q, s, dq = enc._gptq_obs_rounding_fp8_like(
+            W,
+            X,
+            fmt="FP8_E4M3",
+            damp=0.01,
+        )
+        self.assertEqual(q.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(q.shape), tuple(W.shape))
+        self.assertEqual(tuple(s.shape), (4, 1))
+        self.assertEqual(tuple(dq.shape), tuple(W.shape))
+        self.assertTrue(torch.allclose(dq, q.float() * s))
+
+    def test_mxfp8_e5m2_gptq_joint_scale_returns_explicit_format(self):
+        torch.manual_seed(0)
+        W = torch.randn(4, 32) * 0.1
+        X = torch.randn(12, 32)
+        q, s, dq = enc._gptq_obs_rounding_fp8_like(
+            W,
+            X,
+            fmt="MXFP8_E5M2",
+            damp=0.01,
+            joint_scale_opt=True,
+        )
+        self.assertEqual(q.dtype, torch.float8_e5m2)
+        self.assertEqual(tuple(q.shape), tuple(W.shape))
+        self.assertEqual(tuple(s.shape), (4, 1))
+        self.assertEqual(s.dtype, torch.uint8)
+        scales = torch.pow(2.0, s.to(torch.float32) - 127.0)
+        self.assertTrue(torch.allclose(dq, q.float() * scales.repeat_interleave(32, dim=1)))
+
 
 class TestPackBits(unittest.TestCase):
     def test_round_to_codebook_signed(self):
@@ -506,7 +540,7 @@ class TestRecipeParsing(unittest.TestCase):
         mx8 = {"bits": 8, "data_type": "mx_fp"}
         bf = {"bits": 16, "data_type": "float"}
         self.assertEqual(canonicalize_format(nv), "NVFP4")
-        self.assertEqual(canonicalize_format(mx8), "MXFP8")
+        self.assertEqual(canonicalize_format(mx8), "MXFP8_E4M3")
         self.assertEqual(canonicalize_format(bf), "BF16")
         self.assertEqual(canonicalize_format({"bits": 4, "data_type": "mx_fp"}), "MXFP4")
 
@@ -948,6 +982,54 @@ class TestProductionCacheExportPath(unittest.TestCase):
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
             m._CACHED_ACTIVATIONS = saved_acts
 
+    def test_fp8_gptq_cache_defers_to_export_recompute(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        W = torch.randn(8, 32) * 0.1
+        cache = ProductionWeightCache(
+            weights={("model.layers.0.self_attn.q_proj", "FP8_E4M3"): W},
+            levers={"gptq": True},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_acts = m._CACHED_ACTIVATIONS
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._CACHED_ACTIVATIONS = object()
+            out = m._pack_production_cached_2d(
+                "model.layers.0.self_attn.q_proj",
+                "FP8_E4M3",
+                device=torch.device("cpu"),
+            )
+            self.assertIsNone(out)
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._CACHED_ACTIVATIONS = saved_acts
+
+    def test_mxfp8_e4m3_gptq_cache_defers_to_export_recompute(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        W = torch.randn(8, 32) * 0.1
+        cache = ProductionWeightCache(
+            weights={("model.layers.0.self_attn.q_proj", "MXFP8_E4M3"): W},
+            levers={"gptq": True, "joint_scale_opt": True},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_acts = m._CACHED_ACTIVATIONS
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._CACHED_ACTIVATIONS = object()
+            out = m._pack_production_cached_2d(
+                "model.layers.0.self_attn.q_proj",
+                "MXFP8_E4M3",
+                device=torch.device("cpu"),
+            )
+            self.assertIsNone(out)
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._CACHED_ACTIVATIONS = saved_acts
+
 class TestFusedSiblingJointGlobalScale(unittest.TestCase):
     """vLLM warns when q/k/v/gate/up have different weight_global_scale.
     The exporter pre-computes a joint per-tensor scale across each
@@ -1217,9 +1299,12 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
             })
 
         self.assertEqual(assignment["model.layers.0.linear_attn.in_proj_a"], "BF16")
-        self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "MXFP8")
+        self.assertEqual(
+            assignment["model.layers.0.self_attn.o_proj"],
+            "MXFP8_E4M3",
+        )
         self.assertEqual(coerced, [
-            ("model.layers.0.linear_attn.in_proj_a", [48, 5120], "MXFP8")
+            ("model.layers.0.linear_attn.in_proj_a", [48, 5120], "MXFP8_E4M3")
         ])
 
     def test_coerces_profile_illegal_dense_format_to_bf16(self):
@@ -1320,7 +1405,7 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
         reasons = {entry["name"]: entry["reason"] for entry in audit["entries"]}
         self.assertEqual(
             reasons["model.layers.0.linear_attn.in_proj_a"],
-            "runtime_coerced_from_mxfp8",
+            "runtime_coerced_from_mxfp8_e4m3",
         )
         self.assertEqual(
             reasons["model.layers.0.self_attn.o_proj"],

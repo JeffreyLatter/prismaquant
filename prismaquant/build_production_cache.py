@@ -1,8 +1,9 @@
 """Build a production-faithful δw cache for a model checkpoint.
 
 Renders W_tilde[name, fmt] using the export pipeline's activation-aware
-passes (GPTQ damp-sweep + scale_sweep on NVFP4; activation-weighted scale
-search on MXFP8/FP8; passthrough on BF16) and saves a pickle that
+passes (GPTQ damp-sweep + scale_sweep on NVFP4; GPTQ on FP8_E4M3/FP8_E5M2;
+GPTQ plus optional legal E8M0 scale search on MXFP8_E4M3/MXFP8_E5M2;
+passthrough on BF16) and saves a pickle that
 PerturbedActivationCache can load via ``production_weight_cache=...``.
 
 By default this standalone CLI renders the explicit ``--formats`` menu for
@@ -62,9 +63,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--formats",
         default="NVFP4",
-        help="Comma-separated formats to render. MXFP8 / FP8 / BF16 cache "
-        "is cheap compared with NVFP4, but MXFP8 and FP8 still benefit "
-        "from activation-weighted scale search when scale_sweep is enabled.",
+        help="Comma-separated formats to render. FP8_E4M3/FP8_E5M2 and "
+        "MXFP8_E4M3/MXFP8_E5M2 cache is cheap compared with NVFP4, but "
+        "the FP8 and microscaled FP8 paths still benefit from GPTQ; the "
+        "microscaled E4M3/E5M2 paths can additionally use joint_scale_opt "
+        "to search legal E8M0 block scales.",
     )
     p.add_argument(
         "--render-scope",
@@ -116,6 +119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "and must not be used for V1 production artifacts. "
         "Joint NVFP4 sibling globals + calibrated input_global_scale are "
         "computed unconditionally when NVFP4 is in the format menu. "
+        "For MXFP8_E4M3/MXFP8_E5M2, joint_scale_opt searches legal E8M0 "
+        "block scales inside GPTQ. "
         "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
     )
     p.add_argument(
@@ -147,7 +152,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional h-detail directory from incremental_probe. When "
         "'fisher_gptq' is enabled, g2_per_token vectors from this directory "
-        "weight NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives.",
+        "weight NVFP4 GPTQ/scale-sweep and explicit microscaled-FP8 "
+        "objectives.",
     )
     p.add_argument(
         "--skip-qnames",
@@ -157,6 +163,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "the cache fill. Default: the active model profile's pinned_names "
         "(typically lm_head/head). Pass --skip-qnames with no values to "
         "disable this skip.",
+    )
+    p.add_argument(
+        "--include-qnames-file",
+        default=None,
+        help="Optional newline-delimited qname allowlist. After normal "
+        "profile/pinned skips, only qnames in this file are rendered. Used "
+        "by staged production-render cost to render FP8_E4M3/FP8_E5M2 and "
+        "MXFP8_E4M3/MXFP8_E5M2 only for the high-error NVFP4 tail.",
     )
     p.add_argument(
         "--recache-layer-config",
@@ -293,6 +307,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"[build-prod-cache] skipped {len(skipped)} qnames matching "
                 f"{skip_tokens} (typically pinned-BF16 in polish): "
                 f"{skipped if len(skipped) <= 5 else skipped[:5] + ['...']}",
+                flush=True,
+            )
+        if args.include_qnames_file:
+            include_path = Path(args.include_qnames_file)
+            allowed = {
+                line.strip()
+                for line in include_path.read_text().splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            }
+            before = len(qnames)
+            qnames = [q for q in qnames if q in allowed]
+            print(
+                f"[build-prod-cache] include-qnames-file={include_path} "
+                f"kept {len(qnames)}/{before} qnames",
                 flush=True,
             )
 
