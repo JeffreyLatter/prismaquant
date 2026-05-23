@@ -1,6 +1,10 @@
 # PrismaSCOUT Handover - 2026-05-03
 
 This note is for the next Codex instance picking up PrismaSCOUT/SMRF work.
+It is superseded by the archived validation notes under
+`archive/cross_layer_2026-05-09/`. After the NVFP4 fixes and the 2026-05-23
+revival check, SMRF/PrismaSCOUT should be treated as archived research, not as
+the main allocator/export path.
 
 ## Repository State
 
@@ -161,7 +165,8 @@ Interpretation:
 
    - Add Lagrangian/lambda sweep candidate generation, but require real KL validation before selection.
    - Add branch-and-bound or exact DP only where the subproblem is genuinely small.
-   - Treat SMRF as the main path; preserve time-bounded validation.
+   - Historical note only: SMRF was being treated as the main path at the
+     time. This is superseded; use corrected standard PQ as the live path.
    - Avoid dense all-pairs unless profiling shows it pays.
 
 5. Extend to MoE.
