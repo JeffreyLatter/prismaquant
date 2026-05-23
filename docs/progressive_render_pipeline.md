@@ -28,8 +28,8 @@ an environment variable.
 Current V1 production order:
 
 ```text
-NVFP4 scale rule:          FourOverSix
-NVFP4 scale optimizer:     joint_scale_opt
+format scale rule:         FourOverSix (NVFP4 only)
+format scale optimizer:    joint_scale_opt (NVFP4 only)
 rounding solver:           GPTQ
 codebook scale refine:     scale_sweep (explicit ablation only)
 ```
@@ -51,6 +51,17 @@ MXFP8_E4M3 scale-sweep and the explicit FP8_E4M3/FP8_E5M2 plus
 MXFP8_E4M3/MXFP8_E5M2 GPTQ paths use the same progressive gate: if the
 activation-aware candidate regresses the active score, the baseline render is
 kept.
+
+The pipeline order is shared across formats. Support is format-gated:
+
+- NVFP4 supports FourOverSix, GPTQ, joint_scale_opt, static_act_order, and
+  scale_sweep.
+- FP8_E4M3/FP8_E5M2 support GPTQ; FP8_E4M3 additionally supports dynamic
+  per-row scale_sweep.
+- MXFP8_E4M3/MXFP8_E5M2 support GPTQ with the canonical E8M0 scale rule;
+  MXFP8_E4M3 additionally supports E8M0 scale_sweep.
+- Unsupported mechanisms are skipped for that format rather than creating a
+  separate pipeline.
 
 The gate can be disabled only for debugging with
 `PRISMAQUANT_RENDER_PROGRESSIVE_GATES=0`. The minimum relative gain is

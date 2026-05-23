@@ -63,6 +63,7 @@ import time
 from contextlib import contextmanager
 from collections import Counter, defaultdict
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -190,21 +191,27 @@ def _decode_nvfp4_indices(
     fp4_idx: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
+    return _decode_nvfp4_indices_with_eff_scale(fp4_idx, scale.unsqueeze(-1))
+
+
+def _decode_nvfp4_indices_with_eff_scale(
+    fp4_idx: torch.Tensor,
+    eff_scale: torch.Tensor,
+) -> torch.Tensor:
     cb = _nvfp4_codebook(fp4_idx.device, dtype=torch.float32)
     abs_idx = fp4_idx & 0x7
     sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
-    return sign * cb[abs_idx] * scale.unsqueeze(-1)
+    return sign * cb[abs_idx] * eff_scale
 
 
 def _nvfp4_mse_for_group_scale(
     grouped: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    in_grid = (grouped / scale.unsqueeze(-1).clamp_min(1e-12)).clamp(
-        -NVFP4_MAX, NVFP4_MAX,
+    _idx, dq = _nvfp4_quantize_dequantize_with_eff_scale(
+        grouped,
+        scale.unsqueeze(-1),
     )
-    fp4_idx = _round_to_codebook(in_grid)
-    dq = _decode_nvfp4_indices(fp4_idx, scale)
     return (grouped - dq).pow(2).sum(dim=-1)
 
 
@@ -284,28 +291,92 @@ def _nvfp4_effective_scale_from_real(
     *,
     quantize_fp8: bool,
 ) -> torch.Tensor:
-    fp8_scale_real = (
+    fp8_scale = _nvfp4_fp8_scale_from_real(
+        scale_real,
+        global_real,
+        quantize_fp8=quantize_fp8,
+    )
+    return _nvfp4_effective_scale_from_fp8(fp8_scale, global_real)
+
+
+def _nvfp4_fp8_scale_from_real(
+    scale_real: torch.Tensor,
+    global_real: torch.Tensor,
+    *,
+    quantize_fp8: bool = True,
+) -> torch.Tensor:
+    fp8_scale = (
         scale_real / global_real.to(scale_real.device, dtype=torch.float32)
     ).clamp(0, FP8_E4M3_MAX)
     if quantize_fp8:
-        fp8_scale_real = fp8_scale_real.to(torch.float8_e4m3fn).to(torch.float32)
-    return (fp8_scale_real * global_real.to(scale_real.device, dtype=torch.float32)
-            ).clamp_min(1e-12)
+        fp8_scale = fp8_scale.to(torch.float8_e4m3fn)
+    return fp8_scale
+
+
+def _nvfp4_effective_scale_from_fp8(
+    fp8_scale: torch.Tensor,
+    global_real: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        fp8_scale.to(torch.float32)
+        * global_real.to(fp8_scale.device, dtype=torch.float32)
+    ).clamp_min(1e-12)
+
+
+def _nvfp4_quantize_dequantize_with_eff_scale(
+    values: torch.Tensor,
+    eff_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    in_grid = (values / eff_scale.clamp_min(1e-12)).clamp(
+        -NVFP4_MAX,
+        NVFP4_MAX,
+    )
+    fp4_idx = _round_to_codebook(in_grid)
+    return fp4_idx, _decode_nvfp4_indices_with_eff_scale(fp4_idx, eff_scale)
 
 
 def _nvfp4_quant_dequant_with_eff_scale(
     values: torch.Tensor,
     eff_scale: torch.Tensor,
 ) -> torch.Tensor:
-    in_grid = (values / eff_scale.clamp_min(1e-12)).clamp(
-        -NVFP4_MAX,
-        NVFP4_MAX,
+    _idx, dequant = _nvfp4_quantize_dequantize_with_eff_scale(
+        values,
+        eff_scale,
     )
-    fp4_idx = _round_to_codebook(in_grid)
-    cb = _nvfp4_codebook(values.device, dtype=torch.float32)
-    abs_idx = fp4_idx & 0x7
-    sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
-    return sign * cb[abs_idx] * eff_scale
+    return dequant
+
+
+def _nvfp4_quantize_grouped_codec(
+    grouped: torch.Tensor,
+    *,
+    global_real: torch.Tensor,
+    scale_real: torch.Tensor | None = None,
+    scale_rule: str | None = None,
+) -> _NVFP4CodecResult:
+    grouped_f = grouped.to(torch.float32)
+    if scale_real is None:
+        scale_real = _select_nvfp4_group_scales(
+            grouped_f,
+            scale_rule=scale_rule,
+        )
+    scale_fp8 = _nvfp4_fp8_scale_from_real(
+        scale_real.to(grouped_f.device, dtype=torch.float32),
+        global_real,
+        quantize_fp8=True,
+    )
+    eff_scale = _nvfp4_effective_scale_from_fp8(
+        scale_fp8,
+        global_real,
+    ).unsqueeze(-1)
+    fp4_idx, dequant = _nvfp4_quantize_dequantize_with_eff_scale(
+        grouped_f,
+        eff_scale,
+    )
+    return _NVFP4CodecResult(
+        indices=fp4_idx,
+        scale=scale_fp8,
+        dequant=dequant,
+    )
 
 
 def _select_nvfp4_joint_gptq_eff_scale(
@@ -436,6 +507,35 @@ def _round_to_codebook(values_in_grid: torch.Tensor) -> torch.Tensor:
 
 MXFP8_LEGACY_ALIAS = "MXFP8"
 MXFP8_EXPLICIT_FORMATS = {"MXFP8_E4M3", "MXFP8_E5M2"}
+
+
+@dataclass(frozen=True)
+class _NVFP4CodecResult:
+    indices: torch.Tensor
+    scale: torch.Tensor
+    dequant: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _FP8CodecResult:
+    quant: torch.Tensor
+    scale: torch.Tensor
+    dequant: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _MXFP8CodecResult:
+    quant: torch.Tensor
+    scale: torch.Tensor
+    dequant: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _MXFP4CodecResult:
+    indices: torch.Tensor
+    packed: torch.Tensor
+    scale: torch.Tensor
+    dequant: torch.Tensor
 
 
 def _canonical_export_format(fmt: str) -> str:
@@ -1299,7 +1399,7 @@ def _gptq_obs_rounding_nvfp4(
                 eff = _nvfp4_effective_scale_from_real(
                     s_g_real,
                     global_real,
-                    quantize_fp8=False,
+                    quantize_fp8=True,
                 )
             scales_by_group[:, group_idx] = eff
         scale_by_col = scales_by_group.repeat_interleave(group_size, dim=1)
@@ -1331,19 +1431,15 @@ def _gptq_obs_rounding_nvfp4(
             global_real_override=global_real_override,
         )
 
-    cb = _nvfp4_codebook(W.device, dtype=torch.float32)   # [8] abs values
-
     if static_act_order:
         assert scale_by_ordered_col is not None
         for col in range(cols):
             block = W[:, col:col + 1]
             eff_scale = scale_by_ordered_col[:, col:col + 1].clamp_min(1e-12)
-            in_grid = (block / eff_scale).clamp(-NVFP4_MAX, NVFP4_MAX)
-            fp4_idx = _round_to_codebook(in_grid)
-            abs_idx = fp4_idx & 0x7
-            sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
-            q_vals = sign * cb[abs_idx]
-            block_dq = q_vals * eff_scale
+            _idx, block_dq = _nvfp4_quantize_dequantize_with_eff_scale(
+                block,
+                eff_scale,
+            )
             block_err = block - block_dq
 
             if col + 1 < cols:
@@ -1372,18 +1468,15 @@ def _gptq_obs_rounding_nvfp4(
             ).unsqueeze(-1)
         else:
             s_g_real = _select_nvfp4_group_scales(block).unsqueeze(-1)
-            # fp8 per-group scale in the [0, 448] range after /global_real.
-            fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
-            # Effective per-element scale = fp8_scale_real * global_real.
-            eff_scale = (fp8_scale_real * global_real).clamp_min(1e-12)
-        in_grid = block / eff_scale                        # scaled into [-6, 6]
-        in_grid = in_grid.clamp(-NVFP4_MAX, NVFP4_MAX)
-        fp4_idx = _round_to_codebook(in_grid)              # [rows, group_size]
-        # Decode to value (signed codebook).
-        abs_idx = fp4_idx & 0x7
-        sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
-        q_vals = sign * cb[abs_idx]                        # [rows, group_size]
-        block_dq = q_vals * eff_scale                      # [rows, group_size]
+            eff_scale = _nvfp4_effective_scale_from_real(
+                s_g_real.squeeze(-1),
+                global_real,
+                quantize_fp8=True,
+            ).unsqueeze(-1)
+        _idx, block_dq = _nvfp4_quantize_dequantize_with_eff_scale(
+            block,
+            eff_scale,
+        )
         block_err = block - block_dq                       # [rows, group_size]
 
         # Propagate error to the remaining columns. Using the
@@ -1660,12 +1753,11 @@ def _scale_sweep_nvfp4(
         global_real = global_real_override.to(W_in.device).clamp_min(1e-12).float()
     else:
         global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
-    fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
-    eff_scale0 = (fp8_scale_real * global_real).unsqueeze(-1).clamp_min(1e-12)
-
-    # Full NVFP4 symmetric codebook (15 levels; duplicated 0 is harmless).
-    cb_pos = _nvfp4_codebook(W_in.device, dtype=torch.float32)  # [8] non-neg
-    cb = torch.cat([-cb_pos.flip(0), cb_pos[1:]], dim=0)  # [15] signed
+    eff_scale0 = _nvfp4_effective_scale_from_real(
+        s_g_real,
+        global_real,
+        quantize_fp8=True,
+    ).unsqueeze(-1)
     col_imp = col_importance.reshape(1, cols // group_size, group_size)  # [1, n_g, gs]
 
     # Incoming per-group MSE against reference.
@@ -1681,7 +1773,7 @@ def _scale_sweep_nvfp4(
     # Target per-chunk intermediate budget: ~2 GB max on the biggest
     # tensor `d = [chunk, n_g, grid, gs, len(cb)]` (float32).
     n_g = cols // group_size
-    bytes_per_row = n_g * grid * group_size * cb.numel() * 4
+    bytes_per_row = n_g * grid * group_size * (2 * len(FLOAT_TO_E2M1) - 1) * 4
     chunk_target = max(1, (2 * 1024 * 1024 * 1024) // max(1, bytes_per_row))
     row_chunk = min(rows, int(chunk_target))
 
@@ -1695,12 +1787,10 @@ def _scale_sweep_nvfp4(
 
         gexp = ref_c.unsqueeze(2)                   # [c, n_g, 1, gs]
         sexp = scales_c.unsqueeze(3)                # [c, n_g, grid, 1]
-        v = gexp / sexp                             # [c, n_g, grid, gs]
-        d = (v.unsqueeze(-1) - cb).abs()            # [c, n_g, grid, gs, 15]
-        idx = d.argmin(dim=-1)                      # [c, n_g, grid, gs]
-        del d, v
-        Wq_cand = cb[idx] * sexp                    # [c, n_g, grid, gs]
-        del idx
+        _idx, Wq_cand = _nvfp4_quantize_dequantize_with_eff_scale(
+            gexp,
+            sexp,
+        )                                           # [c, n_g, grid, gs]
         err = col_imp.unsqueeze(2) * (gexp - Wq_cand).pow(2)  # [c, n_g, grid, gs]
         mse = err.sum(dim=-1)                        # [c, n_g, grid]
         del err
@@ -1766,14 +1856,16 @@ def quantize_dequantize_nvfp4(
         global_real = global_real_override.to(weight.device).clamp_min(1e-12)
     else:
         global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)  # scalar
-    fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)     # [rows, n_groups], in [0, 448]
-    # Per-element grid mapping: weight / (fp8_scale_real * global_real) = weight / s_g_real
-    in_grid = grouped / s_g_real.unsqueeze(-1).clamp_min(1e-12)          # [rows, n_groups, group_size]
-    fp4_idx = _round_to_codebook(in_grid).reshape(rows, cols)
+    codec = _nvfp4_quantize_grouped_codec(
+        grouped,
+        global_real=global_real,
+        scale_real=s_g_real,
+    )
+    fp4_idx = codec.indices.reshape(rows, cols)
     weight_packed = pack_fp4_indices(fp4_idx, cols)
     return (
         weight_packed,
-        fp8_scale_real.to(torch.float8_e4m3fn),
+        codec.scale,
         (1.0 / global_real).to(torch.float32).reshape(1),  # divisor convention
     )
 
@@ -1797,15 +1889,12 @@ def _rtn_dequant_nvfp4(
         global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
     else:
         global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
-    fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
-    eff_scale = (fp8_scale_real * global_real).unsqueeze(-1).clamp_min(1e-12)
-    in_grid = (grouped / eff_scale).clamp(-NVFP4_MAX, NVFP4_MAX)
-    fp4_idx = _round_to_codebook(in_grid)
-    cb = _nvfp4_codebook(weight.device, dtype=torch.float32)
-    abs_idx = fp4_idx & 0x7
-    sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
-    q_vals = sign * cb[abs_idx]
-    return (q_vals * eff_scale).reshape(rows, cols)
+    codec = _nvfp4_quantize_grouped_codec(
+        grouped,
+        global_real=global_real,
+        scale_real=s_g_real,
+    )
+    return codec.dequant.reshape(rows, cols)
 
 
 def quantize_dequantize_nvfp4_packed(
@@ -1823,13 +1912,16 @@ def quantize_dequantize_nvfp4_packed(
     grouped = packed.float().reshape(E, M, g, group_size)
     s_g_real = _select_nvfp4_group_scales(grouped)                          # [E, M, g]
     global_real = (s_g_real.reshape(E, -1).amax(dim=-1) / FP8_E4M3_MAX).clamp_min(1e-12)  # [E]
-    fp8_scale_real = (s_g_real / global_real.view(E, 1, 1)).clamp(0, FP8_E4M3_MAX)
-    in_grid = grouped / s_g_real.unsqueeze(-1).clamp_min(1e-12)
-    fp4_idx = _round_to_codebook(in_grid).reshape(E, M, N)
+    codec = _nvfp4_quantize_grouped_codec(
+        grouped,
+        global_real=global_real.view(E, 1, 1),
+        scale_real=s_g_real,
+    )
+    fp4_idx = codec.indices.reshape(E, M, N)
     weight_packed = pack_fp4_indices(fp4_idx, N)
     return (
         weight_packed,
-        fp8_scale_real.to(torch.float8_e4m3fn),
+        codec.scale,
         (1.0 / global_real).to(torch.float32),
     )
 
@@ -1854,6 +1946,179 @@ def _fp8_element_dtype_and_max(fmt: str) -> tuple[torch.dtype, float]:
     return dtype, max_value
 
 
+def _fp8_codec(
+    values: torch.Tensor,
+    *,
+    scale: torch.Tensor,
+    element_dtype: torch.dtype = torch.float8_e4m3fn,
+    element_max: float = FP8_E4M3_MAX,
+) -> _FP8CodecResult:
+    values_f = values.to(torch.float32)
+    scale_f = scale.to(
+        device=values_f.device,
+        dtype=torch.float32,
+    ).clamp_min(2.0 ** -127)
+    quant = (values_f / scale_f).clamp(
+        -float(element_max),
+        float(element_max),
+    ).to(element_dtype)
+    dequant = quant.to(torch.float32) * scale_f
+    return _FP8CodecResult(
+        quant=quant,
+        scale=scale_f,
+        dequant=dequant,
+    )
+
+
+def _fp8_dynamic_codec(
+    values: torch.Tensor,
+    *,
+    element_dtype: torch.dtype = torch.float8_e4m3fn,
+    element_max: float = FP8_E4M3_MAX,
+) -> _FP8CodecResult:
+    values_f = values.to(torch.float32)
+    scale = (
+        values_f.abs().amax(dim=-1, keepdim=True).clamp_min(2.0 ** -127)
+        / float(element_max)
+    )
+    return _fp8_codec(
+        values_f,
+        scale=scale,
+        element_dtype=element_dtype,
+        element_max=element_max,
+    )
+
+
+def _fp8_dequantize(
+    quant: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    return quant.to(torch.float32) * scale.to(
+        device=quant.device,
+        dtype=torch.float32,
+    )
+
+
+def _mxfp8_e8m0_to_scale(
+    e8m0_uint8: torch.Tensor,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    target_device = device if device is not None else e8m0_uint8.device
+    e8m0 = e8m0_uint8.to(device=target_device, dtype=torch.int16)
+    exponent = e8m0.to(torch.float32) - 127.0
+    return torch.pow(
+        torch.tensor(2.0, device=target_device, dtype=torch.float32),
+        exponent,
+    )
+
+
+def _mx_rounded_amax_power2(amax: torch.Tensor) -> torch.Tensor:
+    """Match compressed-tensors' MX scale power-of-two rounding.
+
+    compressed-tensors derives MXFP4/MXFP8 E8M0 scales by first rounding the
+    block amax to a power of two with the FP4 mantissa-aware bit-mask rule,
+    then subtracting the element-format exponent offset. Reusing that rule
+    keeps PrismaQuant's stored scales byte-identical to the served consumer.
+    """
+    x = amax.to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
+    raw = x.view(torch.int32).to(torch.int64)
+    val_to_add = 1 << (23 - 1 - 1)
+    sign_exponent_mask = ((1 << (8 + 1)) - 1) << 23
+    rounded = torch.bitwise_and(
+        raw + val_to_add,
+        sign_exponent_mask,
+    )
+    return rounded.to(torch.int32).view(torch.float32)
+
+
+def _mx_base_exponent_from_amax(
+    amax: torch.Tensor,
+    *,
+    element_max: float,
+) -> torch.Tensor:
+    rounded = _mx_rounded_amax_power2(amax)
+    element_offset = int(math.floor(math.log2(float(element_max))))
+    exponent = torch.floor(torch.log2(rounded)) - float(element_offset)
+    return exponent.clamp(-127, 127)
+
+
+def _mxfp8_base_exponent(
+    grouped: torch.Tensor,
+    *,
+    element_max: float,
+) -> torch.Tensor:
+    return _mx_base_exponent_from_amax(
+        grouped.abs().amax(dim=-1),
+        element_max=element_max,
+    )
+
+
+def _mxfp8_grouped_codec(
+    grouped: torch.Tensor,
+    *,
+    e8m0_unbiased: torch.Tensor | None = None,
+    element_dtype: torch.dtype = torch.float8_e4m3fn,
+    element_max: float = MXFP8_E4M3_MAX,
+) -> _MXFP8CodecResult:
+    grouped_f = grouped.to(torch.float32)
+    if e8m0_unbiased is None:
+        e8m0_unbiased = _mxfp8_base_exponent(
+            grouped_f,
+            element_max=element_max,
+        )
+    e = e8m0_unbiased.to(grouped_f.device, dtype=torch.float32).clamp(-127, 127)
+    scale = torch.pow(
+        torch.tensor(2.0, device=grouped_f.device, dtype=torch.float32),
+        e,
+    )
+    fp8 = _fp8_codec(
+        grouped_f,
+        scale=scale.unsqueeze(-1),
+        element_dtype=element_dtype,
+        element_max=element_max,
+    )
+    e8m0_uint8 = (e + 127).to(torch.int32).clamp(0, 255).to(torch.uint8)
+    return _MXFP8CodecResult(
+        quant=fp8.quant,
+        scale=e8m0_uint8,
+        dequant=fp8.dequant,
+    )
+
+
+def _mxfp4_grouped_codec(grouped: torch.Tensor) -> _MXFP4CodecResult:
+    """Return MXFP4 packed codes, E8M0 scale, and reconstructed values.
+
+    ``grouped`` must have the 32-value MX block axis last. The same primitive
+    is used by dense export, packed-expert export, and renderer-side checks so
+    the E8M0 scale and FP4 codebook math cannot drift across call sites.
+    """
+    grouped_f = grouped.to(torch.float32)
+    group_size = grouped_f.shape[-1]
+    if group_size % 2 != 0:
+        raise ValueError("MXFP4 packing requires an even group size")
+    e8m0 = _mx_base_exponent_from_amax(
+        grouped_f.abs().amax(dim=-1),
+        element_max=MXFP4_E2M1_MAX,
+    )
+    scale = torch.pow(
+        torch.tensor(2.0, device=grouped_f.device, dtype=torch.float32),
+        e8m0,
+    )
+    indices, dequant = _nvfp4_quantize_dequantize_with_eff_scale(
+        grouped_f,
+        scale.unsqueeze(-1),
+    )
+    packed = pack_fp4_indices(indices, group_size)
+    e8m0_uint8 = (e8m0 + 127).to(torch.int32).clamp(0, 255).to(torch.uint8)
+    return _MXFP4CodecResult(
+        indices=indices,
+        packed=packed,
+        scale=e8m0_uint8,
+        dequant=dequant,
+    )
+
+
 def _mxfp4_quantize_grouped(grouped: torch.Tensor
                             ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute MXFP4 packed E2M1 values + E8M0 scale for grouped weights.
@@ -1863,22 +2128,8 @@ def _mxfp4_quantize_grouped(grouped: torch.Tensor
     two FP4 codes per byte along that final axis, and the scale tensor is
     uint8 E8M0 with the final group axis removed.
     """
-    group_size = grouped.shape[-1]
-    if group_size % 2 != 0:
-        raise ValueError("MXFP4 packing requires an even group size")
-    s_g_real = grouped.abs().amax(dim=-1).clamp_min(2.0 ** -127) / MXFP4_E2M1_MAX
-    # Use ceil so the scaled values never exceed the representable E2M1
-    # range. This mirrors the MXFP8_E4M3 export path and avoids saturation at
-    # group maxima after the scale is quantized to E8M0.
-    e8m0 = torch.ceil(torch.log2(s_g_real)).clamp(-127, 127)
-    s_g = torch.pow(2.0, e8m0)
-    quant_grid = (grouped / s_g.unsqueeze(-1).clamp_min(2.0 ** -127)).clamp(
-        -MXFP4_E2M1_MAX, MXFP4_E2M1_MAX,
-    )
-    fp4_idx = _round_to_codebook(quant_grid)
-    packed = pack_fp4_indices(fp4_idx, group_size)
-    e8m0_uint8 = (e8m0 + 127).to(torch.int32).clamp(0, 255).to(torch.uint8)
-    return packed, e8m0_uint8
+    codec = _mxfp4_grouped_codec(grouped)
+    return codec.packed, codec.scale
 
 
 def quantize_dequantize_mxfp4(weight: torch.Tensor, group_size: int = 32
@@ -1927,16 +2178,12 @@ def _mxfp8_quantize_grouped(
     guarantee s_g >= max-abs/fp8_max,
     keeping all quant_grid values inside the representable range.
     """
-    s_g_real = grouped.abs().amax(dim=-1).clamp_min(2.0 ** -127) / float(element_max)
-    log2_s = torch.log2(s_g_real)
-    e8m0 = torch.ceil(log2_s).clamp(-127, 127)
-    s_g = torch.pow(2.0, e8m0)
-    quant_grid = grouped / s_g.unsqueeze(-1).clamp_min(2.0 ** -127)
-    # Defensive clamp against numerical edge cases at the saturation boundary.
-    quant_grid = quant_grid.clamp(-float(element_max), float(element_max))
-    quant_fp8 = quant_grid.to(element_dtype)
-    e8m0_uint8 = (e8m0 + 127).to(torch.int32).clamp(0, 255).to(torch.uint8)
-    return quant_fp8, e8m0_uint8
+    codec = _mxfp8_grouped_codec(
+        grouped,
+        element_dtype=element_dtype,
+        element_max=element_max,
+    )
+    return codec.quant, codec.scale
 
 
 def quantize_dequantize_mxfp8(
@@ -1968,11 +2215,7 @@ def _mxfp8_dequantize_grouped(
     quant_fp8: torch.Tensor,
     e8m0_uint8: torch.Tensor,
 ) -> torch.Tensor:
-    e8m0 = e8m0_uint8.to(torch.int16).to(torch.float32) - 127.0
-    scale = torch.pow(
-        torch.tensor(2.0, device=quant_fp8.device, dtype=torch.float32),
-        e8m0.to(quant_fp8.device),
-    )
+    scale = _mxfp8_e8m0_to_scale(e8m0_uint8, device=quant_fp8.device)
     return quant_fp8.to(torch.float32) * scale.unsqueeze(-1)
 
 
@@ -2017,9 +2260,12 @@ def _mxfp8_scale_sweep_quantize(
     if not shifts:
         shifts = [0]
     if shifts == [0]:
-        quant_fp8, e8m0_uint8 = _mxfp8_quantize_grouped(grouped)
-        dequant = _mxfp8_dequantize_grouped(quant_fp8, e8m0_uint8)
-        return quant_fp8.reshape(rows, cols), e8m0_uint8, dequant.reshape(rows, cols)
+        codec = _mxfp8_grouped_codec(grouped)
+        return (
+            codec.quant.reshape(rows, cols),
+            codec.scale,
+            codec.dequant.reshape(rows, cols),
+        )
 
     col_importance = _activation_col_importance_for_gptq(
         activations,
@@ -2030,25 +2276,18 @@ def _mxfp8_scale_sweep_quantize(
         row_weights=fisher_row_weights,
     ).reshape(1, cols // group_size, group_size)
 
-    max_abs = grouped.abs().amax(dim=-1).clamp_min(2.0 ** -127)
-    base_e = torch.ceil(torch.log2(max_abs / MXFP8_E4M3_MAX)).clamp(-127, 127)
+    base_e = _mxfp8_base_exponent(grouped, element_max=MXFP8_E4M3_MAX)
     shift_t = torch.tensor(shifts, device=W.device, dtype=torch.float32)
 
     best_err: torch.Tensor | None = None
     best_e: torch.Tensor | None = None
     for shift in shift_t:
         e = (base_e + shift).clamp(-127, 127)
-        scale = torch.pow(
-            torch.tensor(2.0, device=W.device, dtype=torch.float32),
-            e,
+        codec = _mxfp8_grouped_codec(
+            grouped,
+            e8m0_unbiased=e,
         )
-        grid = (grouped / scale.unsqueeze(-1).clamp_min(2.0 ** -127)).clamp(
-            -MXFP8_E4M3_MAX,
-            MXFP8_E4M3_MAX,
-        )
-        q = grid.to(torch.float8_e4m3fn).to(torch.float32)
-        dq = q * scale.unsqueeze(-1)
-        err = ((grouped - dq).pow(2) * col_importance).sum(dim=-1)
+        err = ((grouped - codec.dequant).pow(2) * col_importance).sum(dim=-1)
         if best_err is None:
             best_err = err
             best_e = e
@@ -2058,18 +2297,15 @@ def _mxfp8_scale_sweep_quantize(
             best_e = torch.where(take, e, best_e)
 
     assert best_e is not None
-    scale = torch.pow(
-        torch.tensor(2.0, device=W.device, dtype=torch.float32),
-        best_e,
+    codec = _mxfp8_grouped_codec(
+        grouped,
+        e8m0_unbiased=best_e,
     )
-    grid = (grouped / scale.unsqueeze(-1).clamp_min(2.0 ** -127)).clamp(
-        -MXFP8_E4M3_MAX,
-        MXFP8_E4M3_MAX,
+    return (
+        codec.quant.reshape(rows, cols),
+        codec.scale,
+        codec.dequant.reshape(rows, cols),
     )
-    quant_fp8 = grid.to(torch.float8_e4m3fn)
-    e8m0_uint8 = (best_e + 127).to(torch.int32).clamp(0, 255).to(torch.uint8)
-    dequant = _mxfp8_dequantize_grouped(quant_fp8, e8m0_uint8)
-    return quant_fp8.reshape(rows, cols), e8m0_uint8, dequant.reshape(rows, cols)
 
 
 def quantize_dequantize_mxfp8_packed(
@@ -2089,12 +2325,12 @@ def quantize_dequantize_mxfp8_packed(
     if N % group_size != 0:
         raise ValueError(f"MXFP8_E4M3/MXFP8_E5M2 group_size={group_size} ∤ {N}")
     grouped = packed.float().reshape(E, M, N // group_size, group_size)
-    quant_fp8, e8m0_uint8 = _mxfp8_quantize_grouped(
+    codec = _mxfp8_grouped_codec(
         grouped,
         element_dtype=element_dtype,
         element_max=element_max,
     )
-    return quant_fp8.reshape(E, M, N), e8m0_uint8
+    return codec.quant.reshape(E, M, N), codec.scale
 
 
 def quantize_dequantize_fp8_dynamic(
@@ -2113,21 +2349,19 @@ def quantize_dequantize_fp8_dynamic(
     quantization is handled at runtime by vLLM (no on-disk activation
     scale needed).
     """
-    rows, cols = weight.shape
-    w_f = weight.float()
-    s = w_f.abs().amax(dim=-1, keepdim=True).clamp_min(2.0 ** -127) / float(element_max)
-    quant = (w_f / s).clamp(-float(element_max), float(element_max)).to(element_dtype)
-    return quant, s.to(torch.float32)
+    codec = _fp8_dynamic_codec(
+        weight,
+        element_dtype=element_dtype,
+        element_max=element_max,
+    )
+    return codec.quant, codec.scale
 
 
 def _dequantize_fp8_dynamic(
     quant: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    return quant.to(torch.float32) * scale.to(
-        device=quant.device,
-        dtype=torch.float32,
-    )
+    return _fp8_dequantize(quant, scale)
 
 
 def _rtn_dequant_fp8_dynamic(
@@ -2194,11 +2428,13 @@ def _fp8_quantize_dequantize_with_scale(
     element_dtype: torch.dtype,
     element_max: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q = (values / scale.clamp_min(2.0 ** -127)).clamp(
-        -float(element_max),
-        float(element_max),
-    ).to(element_dtype)
-    return q, q.to(torch.float32) * scale
+    codec = _fp8_codec(
+        values,
+        scale=scale,
+        element_dtype=element_dtype,
+        element_max=element_max,
+    )
+    return codec.quant, codec.dequant
 
 
 def _mxfp8_quantize_dequantize_block(
@@ -2218,24 +2454,19 @@ def _mxfp8_quantize_dequantize_block(
     interface compatibility but no longer consulted.
     """
     del col_importance  # unused after switch to unweighted block-MSE
-    max_abs = block.abs().amax(dim=-1).clamp_min(2.0 ** -127)
-    base_e = torch.ceil(torch.log2(max_abs / float(element_max))).clamp(-127, 127)
+    base_e = _mxfp8_base_exponent(block, element_max=element_max)
     if joint_scale_opt:
         best_err: torch.Tensor | None = None
         best_e: torch.Tensor | None = None
         for shift in _mxfp8_joint_scale_shifts():
             e = (base_e + float(shift)).clamp(-127, 127)
-            scale = torch.pow(
-                torch.tensor(2.0, device=block.device, dtype=torch.float32),
-                e,
-            ).unsqueeze(-1)
-            _q, dq = _fp8_quantize_dequantize_with_scale(
+            codec = _mxfp8_grouped_codec(
                 block,
-                scale,
                 element_dtype=element_dtype,
                 element_max=element_max,
+                e8m0_unbiased=e,
             )
-            score = (block - dq).pow(2).sum(dim=-1)
+            score = (block - codec.dequant).pow(2).sum(dim=-1)
             if best_err is None:
                 best_err = score
                 best_e = e
@@ -2248,18 +2479,13 @@ def _mxfp8_quantize_dequantize_block(
         e = best_e
     else:
         e = base_e
-    scale = torch.pow(
-        torch.tensor(2.0, device=block.device, dtype=torch.float32),
-        e,
-    ).unsqueeze(-1)
-    q, dq = _fp8_quantize_dequantize_with_scale(
+    codec = _mxfp8_grouped_codec(
         block,
-        scale,
+        e8m0_unbiased=e,
         element_dtype=element_dtype,
         element_max=element_max,
     )
-    e8m0_uint8 = (e + 127).to(torch.int32).clamp(0, 255).to(torch.uint8)
-    return q, e8m0_uint8, dq
+    return codec.quant, codec.scale, codec.dequant
 
 
 def _gptq_obs_rounding_fp8_like(
@@ -2285,6 +2511,11 @@ def _gptq_obs_rounding_fp8_like(
     is_plain = fmt_u in {"FP8_E4M3", "FP8_E5M2"}
     if not (is_mx or is_plain):
         raise ValueError(f"unsupported FP8 GPTQ format: {fmt}")
+    if is_mx:
+        # MXFP8 uses the canonical E8M0 block scale. The historical
+        # joint_scale_opt hook searched nearby legal exponents, but that
+        # is not part of the production MXFP8 recipe.
+        joint_scale_opt = False
 
     element_dtype, element_max = _fp8_element_dtype_and_max(fmt_u)
     W = weight.to(torch.float32).clone()
@@ -2331,13 +2562,11 @@ def _gptq_obs_rounding_fp8_like(
 
     q_out = torch.empty((rows, cols), device=W.device, dtype=element_dtype)
     if is_plain:
-        scale_out = (
-            weight.to(torch.float32)
-            .abs()
-            .amax(dim=-1, keepdim=True)
-            .clamp_min(2.0 ** -127)
-            / float(element_max)
-        ).to(torch.float32)
+        scale_out = _fp8_dynamic_codec(
+            weight.to(torch.float32),
+            element_dtype=element_dtype,
+            element_max=element_max,
+        ).scale
         block_size = _env_int_clamped(
             "PRISMAQUANT_FP8_GPTQ_BLOCK_SIZE",
             32,
@@ -2483,8 +2712,8 @@ def _fp8_dynamic_scale_sweep_quantize(
     rows, cols = weight.shape
     w_f = weight.detach().to(torch.float32)
     if activations.shape[-1] != cols:
-        q, s = quantize_dequantize_fp8_dynamic(w_f)
-        return q, s, q.to(torch.float32) * s.to(torch.float32)
+        codec = _fp8_dynamic_codec(w_f)
+        return codec.quant, codec.scale, codec.dequant
     col_importance = _activation_col_importance_for_gptq(
         activations,
         cols,
@@ -2502,21 +2731,39 @@ def _fp8_dynamic_scale_sweep_quantize(
     best_scale = torch.empty((rows, 1), device=w_f.device, dtype=torch.float32)
     for factor in _fp8_scale_sweep_factors():
         scale = base * float(factor)
-        quant = (w_f / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
+        codec = _fp8_codec(
+            w_f,
+            scale=scale,
+            element_dtype=torch.float8_e4m3fn,
+            element_max=FP8_E4M3_MAX,
         )
-        dequant = quant.to(torch.float32) * scale
-        score = ((w_f - dequant).pow(2) * col_importance.unsqueeze(0)).sum(dim=1)
+        score = (
+            (w_f - codec.dequant).pow(2) * col_importance.unsqueeze(0)
+        ).sum(dim=1)
         take = score < best_score
         if bool(take.any().item()):
             best_score = torch.where(take, score, best_score)
-            best_dequant = torch.where(take.unsqueeze(1), dequant, best_dequant)
-            best_scale = torch.where(take.unsqueeze(1), scale, best_scale)
-    best_quant = (best_dequant / best_scale).clamp(
-        -FP8_E4M3_MAX,
-        FP8_E4M3_MAX,
-    ).to(torch.float8_e4m3fn)
-    return best_quant.contiguous(), best_scale.contiguous(), best_dequant.contiguous()
+            best_dequant = torch.where(
+                take.unsqueeze(1),
+                codec.dequant,
+                best_dequant,
+            )
+            best_scale = torch.where(
+                take.unsqueeze(1),
+                codec.scale,
+                best_scale,
+            )
+    best = _fp8_codec(
+        best_dequant,
+        scale=best_scale,
+        element_dtype=torch.float8_e4m3fn,
+        element_max=FP8_E4M3_MAX,
+    )
+    return (
+        best.quant.contiguous(),
+        best.scale.contiguous(),
+        best.dequant.contiguous(),
+    )
 
 
 def quantize_dequantize_fp8_dynamic_packed(packed: torch.Tensor
@@ -2525,11 +2772,12 @@ def quantize_dequantize_fp8_dynamic_packed(packed: torch.Tensor
 
     Returns weight `[E, M, N]` fp8 and scale `[E, M, 1]` fp32.
     """
-    E, M, N = packed.shape
-    p_f = packed.float()
-    s = p_f.abs().amax(dim=-1, keepdim=True).clamp_min(2.0 ** -127) / MXFP8_E4M3_MAX
-    quant = (p_f / s).clamp(-MXFP8_E4M3_MAX, MXFP8_E4M3_MAX).to(torch.float8_e4m3fn)
-    return quant, s.to(torch.float32)
+    codec = _fp8_dynamic_codec(
+        packed,
+        element_dtype=torch.float8_e4m3fn,
+        element_max=MXFP8_E4M3_MAX,
+    )
+    return codec.quant, codec.scale
 
 
 def _explicit_regex(name: str) -> str:
@@ -3125,8 +3373,8 @@ def _quantize_2d(
         }
     if fmt in MXFP8_EXPLICIT_FORMATS:
         # MXFP8_E4M3/MXFP8_E5M2 GPTQ is export-faithful: it returns the FP8
-        # codes and E8M0 scale tensor directly. With joint_scale_opt enabled,
-        # the GPTQ block quantizer searches legal E8M0 scale exponents.
+        # codes and E8M0 scale tensor directly. MXFP8 deliberately does not
+        # consume joint_scale_opt; it uses the canonical E8M0 scale rule.
         w_work = weight.to(torch.float32)
         acts_work = acts
         element_dtype, element_max = _fp8_element_dtype_and_max(fmt)
@@ -3141,7 +3389,7 @@ def _quantize_2d(
                     clip_threshold=act_clip_threshold,
                     clip_rescale=act_clip_rescale,
                     fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=joint_scale_opt_enabled,
+                    joint_scale_opt=False,
                 )
             else:
                 w, ws, dq = _gptq_obs_rounding_fp8_like(
@@ -3152,7 +3400,7 @@ def _quantize_2d(
                     clip_threshold=act_clip_threshold,
                     clip_rescale=act_clip_rescale,
                     fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=joint_scale_opt_enabled,
+                    joint_scale_opt=False,
                 )
             if scale_sweep_enabled and fmt == "MXFP8_E4M3":
                 w, ws, _ = _mxfp8_scale_sweep_quantize(
@@ -5159,7 +5407,6 @@ FORMAT_SCHEME = {
     "MXFP8_E4M3": MXFP8_SCHEME,
     "MXFP8_E5M2": MXFP8_SCHEME,
     "FP8_E4M3": FP8_E4M3_SCHEME,
-    "FP8_E5M2": FP8_E4M3_SCHEME,
     "FP8_SOURCE": FP8_SOURCE_SCHEME,
 }
 

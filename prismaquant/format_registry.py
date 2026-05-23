@@ -174,21 +174,35 @@ def _rtn_uniform_int(w: torch.Tensor, bits: int, group_size: int,
     return w_rec.reshape(orig_shape).to(w.dtype)
 
 
-def _snap_scale_e8m0(scale: torch.Tensor) -> torch.Tensor:
-    """Snap a real-valued per-group scale to the serving E8M0 grid.
+def _mx_rounded_amax_power2(amax: torch.Tensor) -> torch.Tensor:
+    """Round a block amax to the MX scale power-of-two grid."""
+    x = amax.to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
+    raw = x.view(torch.int32).to(torch.int64)
+    val_to_add = 1 << (23 - 1 - 1)
+    sign_exponent_mask = ((1 << (8 + 1)) - 1) << 23
+    rounded = torch.bitwise_and(raw + val_to_add, sign_exponent_mask)
+    return rounded.to(torch.int32).view(torch.float32)
+
+
+def _snap_scale_e8m0(scale: torch.Tensor, *, element_max: torch.Tensor) -> torch.Tensor:
+    """Snap a real-valued per-group scale to the served MX E8M0 grid.
 
     The OCP MX spec encodes the per-block scale as an 8-bit E8M0 value:
     unsigned, exponent-only, range 2^(-127) to 2^127. Representable
-    values are exactly the powers of two. Export uses ceil(log2(scale)) so
-    the block maximum remains representable after snapping; nearest-power
-    snapping can round down and clip values that the serving packer would not
-    clip.
+    values are exactly powers of two. compressed-tensors derives MXFP4/MXFP8
+    weight scales by rounding the block amax to a power of two, then
+    subtracting the element-format exponent offset.
 
     For NV (non-MX) formats, scales are FP8 and effectively continuous;
     no snapping is applied.
     """
-    log2_s = torch.log2(scale.clamp_min(2.0 ** -127))
-    snapped_exp = torch.ceil(log2_s).clamp(-127.0, 127.0)
+    element_max_f = element_max.to(device=scale.device, dtype=torch.float32)
+    amax = scale.to(torch.float32) * element_max_f
+    rounded = _mx_rounded_amax_power2(amax)
+    element_offset = torch.floor(torch.log2(element_max_f))
+    snapped_exp = (
+        torch.floor(torch.log2(rounded)) - element_offset
+    ).clamp(-127.0, 127.0)
     return torch.pow(2.0, snapped_exp)
 
 
@@ -222,7 +236,7 @@ def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
     if mx_scale:
-        scale = _snap_scale_e8m0(scale)
+        scale = _snap_scale_e8m0(scale, element_max=cmax)
     x = w2 / scale                                    # shape (..., group)
 
     # Bucketize returns the insertion index: cb[idx-1] <= x < cb[idx].
@@ -381,7 +395,7 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
         max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
         scale = max_abs / cmax
         if mx_scale:
-            scale = _snap_scale_e8m0(scale)
+            scale = _snap_scale_e8m0(scale, element_max=cmax)
         x = w2 / scale
         idx = torch.bucketize(x.contiguous(), cb)
         idx_lo = (idx - 1).clamp_min(0)
@@ -433,6 +447,70 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
         return _inner(w, cb)
 
     return f
+
+
+def _mxfp8_e4m3_activation_vllm_rtn(x: torch.Tensor) -> torch.Tensor:
+    """Match vLLM's dynamic MXFP8 activation quantizer.
+
+    Runtime MXFP8 activation quantization derives each block's E8M0 scale from
+    ``amax / fp8_max`` and rounds up to a power of two before casting the
+    normalized values to E4M3. The scale exponent therefore includes the FP8
+    element-range offset; using the raw block amax exponent would under-use the
+    E4M3 range by roughly 2**8 for typical non-saturated blocks.
+    """
+    orig_shape = x.shape
+    in_f = int(orig_shape[-1])
+    max_pos = float(torch.finfo(torch.float8_e4m3fn).max)
+    if in_f % 32 != 0:
+        # Non-32 toy tensors appear in registry unit tests. Real MXFP8 serving
+        # shapes are profile-gated to multiples of 32; use plain dynamic FP8
+        # here so the generic FormatSpec activation hook remains total.
+        x_f = x.to(torch.float32)
+        scale = (
+            x_f.abs().amax(dim=-1, keepdim=True).clamp_min(2.0 ** -127)
+            / max_pos
+        )
+        quant = (x_f / scale).clamp(-max_pos, max_pos).to(torch.float8_e4m3fn)
+        return (quant.to(torch.float32) * scale).to(x.dtype)
+    x2 = x.reshape(-1, in_f).to(torch.float32)
+    blocked = x2.reshape(-1, in_f // 32, 32)
+    amax = blocked.abs().amax(dim=-1).clamp_min(torch.finfo(torch.float32).tiny)
+    scale_unbiased = torch.ceil(torch.log2(amax / max_pos)).clamp(-127, 127)
+    descale = torch.exp2(scale_unbiased)
+    quant = (
+        blocked / descale.unsqueeze(-1)
+    ).clamp(-max_pos, max_pos).reshape(orig_shape).to(torch.float8_e4m3fn)
+    dequant = (
+        quant.to(torch.float32).reshape_as(blocked)
+        * descale.unsqueeze(-1)
+    ).reshape(orig_shape)
+    return dequant.to(x.dtype)
+
+
+def _mxfp8_e4m3_weight_rtn(w: torch.Tensor) -> torch.Tensor:
+    """Renderer-side MXFP8_E4M3 weight RTN matching exported metadata."""
+    orig_shape = w.shape
+    in_f = int(orig_shape[-1])
+    group_size = 32
+    if in_f % group_size != 0:
+        raise ValueError(
+            f"MXFP8_E4M3 group_size={group_size} does not divide {in_f}"
+        )
+    max_pos = float(torch.finfo(torch.float8_e4m3fn).max)
+    w2 = w.reshape(-1, in_f).to(torch.float32)
+    grouped = w2.reshape(-1, in_f // group_size, group_size)
+    amax = grouped.abs().amax(dim=-1, keepdim=True)
+    rounded = _mx_rounded_amax_power2(amax)
+    element_offset = math.floor(math.log2(max_pos))
+    scale_unbiased = (
+        torch.floor(torch.log2(rounded)) - float(element_offset)
+    ).clamp(-127.0, 127.0)
+    scale = torch.exp2(scale_unbiased).clamp_min(2.0 ** -127)
+    quant = (
+        grouped / scale
+    ).clamp(-max_pos, max_pos).to(torch.float8_e4m3fn)
+    dequant = quant.to(torch.float32) * scale
+    return dequant.reshape(orig_shape).to(w.dtype)
 
 
 # -----------------------------------------------------------------------
@@ -540,8 +618,8 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
-    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
+    quantize_dequantize=_mxfp8_e4m3_weight_rtn,
+    activation_quantize_dequantize=_mxfp8_e4m3_activation_vllm_rtn,
 ))
 register_format(FormatSpec(
     name="MXFP8_E5M2",  # wider dynamic range, less mantissa precision
@@ -558,7 +636,7 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e4m3", act_bits=None,
     family="mx", min_capability_sm=80,  # W8A16 works on Marlin
     autoround_config=lambda: _mx_autoround(8, 32, 16, "fp8_e4m3"),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
+    quantize_dequantize=_mxfp8_e4m3_weight_rtn,
     activation_quantize_dequantize=lambda x: x,
 ))
 

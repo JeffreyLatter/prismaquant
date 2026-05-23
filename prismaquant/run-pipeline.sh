@@ -174,6 +174,12 @@ export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
 : "${VALIDATED_FRONTIER_KL_SCOPE:=last_token}"
 : "${VALIDATED_FRONTIER_PICK:=kneedle}"
+: "${VALIDATED_SOURCE_PREFETCH:=require}"
+: "${VALIDATED_SOURCE_PREFETCH_MAX_GB:=0}"
+: "${VALIDATED_SOURCE_PREFETCH_HEADROOM_GB:=16}"
+: "${VALIDATED_SOURCE_PREFETCH_WORKERS:=2}"
+: "${VALIDATED_FRONTIER_KL_CUDA_GRAPHS:=auto}"
+: "${VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE:=0}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 case "$COST_MODE" in
@@ -791,7 +797,13 @@ PY
       --dtype bf16 \
       --device "$DEVICE" \
       --kl-scope "$VALIDATED_FRONTIER_KL_SCOPE" \
+      --kl-cuda-graphs "$VALIDATED_FRONTIER_KL_CUDA_GRAPHS" \
       --assignment-materialization hooks \
+      --source-prefetch "$VALIDATED_SOURCE_PREFETCH" \
+      --source-prefetch-max-gb "$VALIDATED_SOURCE_PREFETCH_MAX_GB" \
+      --source-prefetch-headroom-gb "$VALIDATED_SOURCE_PREFETCH_HEADROOM_GB" \
+      --source-prefetch-workers "$VALIDATED_SOURCE_PREFETCH_WORKERS" \
+      $(if [[ "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "0" && "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "false" && "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "False" ]]; then echo "--disable-frozen-weight-cache"; fi) \
       --production-weight-cache "$PROD_CACHE_RAW" \
       --production-cache-dir-override "$PROD_CACHE_DIR" \
       --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \

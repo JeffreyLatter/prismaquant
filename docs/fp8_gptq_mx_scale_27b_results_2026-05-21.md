@@ -4,6 +4,9 @@ Date: 2026-05-21
 
 ## Code Path Tested
 
+Note: this historical run used the now-removed MXFP8 E8M0 joint-scale search.
+Current production MXFP8 uses GPTQ with the canonical E8M0 scale rule.
+
 - `FP8_E4M3`: GPTQ one-shot OBS rounding.
 - `MXFP8_E4M3`: GPTQ plus legal E8M0 joint scale optimization.
 - `MXFP8_E5M2`: GPTQ plus legal E8M0 joint scale optimization, measured for research but blocked by the current `vllm_packed_moe` dense-Linears profile.

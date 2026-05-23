@@ -2603,7 +2603,9 @@ def _run_mtp_streaming_shard(
                if isinstance(m, nn.Linear) and not re.search(r"mlp\.gate$", n)]
     print(f"[incremental/mtp] tracking {len(tracked)} MTP Linears", flush=True)
 
-    expert_info_all = discover_moe_structure(mtp_wrapper, profile=profile)
+    from .model_profiles import profile_from_model as _profile_from_model
+    mtp_profile = _profile_from_model(model)
+    expert_info_all = discover_moe_structure(mtp_wrapper, profile=mtp_profile)
     expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
     top_k = read_top_k(mtp_wrapper, default=2)
 

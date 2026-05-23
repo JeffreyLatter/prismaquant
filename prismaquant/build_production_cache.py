@@ -2,8 +2,7 @@
 
 Renders W_tilde[name, fmt] using the export pipeline's activation-aware
 passes (GPTQ damp-sweep + scale_sweep on NVFP4; GPTQ on FP8_E4M3/FP8_E5M2;
-GPTQ plus optional legal E8M0 scale search on MXFP8_E4M3/MXFP8_E5M2;
-passthrough on BF16) and saves a pickle that
+GPTQ on MXFP8_E4M3/MXFP8_E5M2; passthrough on BF16) and saves a pickle that
 PerturbedActivationCache can load via ``production_weight_cache=...``.
 
 By default this standalone CLI renders the explicit ``--formats`` menu for
@@ -65,9 +64,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="NVFP4",
         help="Comma-separated formats to render. FP8_E4M3/FP8_E5M2 and "
         "MXFP8_E4M3/MXFP8_E5M2 cache is cheap compared with NVFP4, but "
-        "the FP8 and microscaled FP8 paths still benefit from GPTQ; the "
-        "microscaled E4M3/E5M2 paths can additionally use joint_scale_opt "
-        "to search legal E8M0 block scales.",
+        "the FP8 and microscaled FP8 paths still benefit from GPTQ.",
     )
     p.add_argument(
         "--render-scope",
@@ -119,8 +116,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "and must not be used for V1 production artifacts. "
         "Joint NVFP4 sibling globals + calibrated input_global_scale are "
         "computed unconditionally when NVFP4 is in the format menu. "
-        "For MXFP8_E4M3/MXFP8_E5M2, joint_scale_opt searches legal E8M0 "
-        "block scales inside GPTQ. "
+        "joint_scale_opt applies only to NVFP4; MXFP8 uses the canonical "
+        "E8M0 scale rule inside GPTQ. "
         "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
     )
     p.add_argument(

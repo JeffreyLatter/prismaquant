@@ -17,15 +17,17 @@ quantization path:
     * calibrated `input_global_scale` per fused-sibling group
       (max_abs(activations) / 6.0; the same value the export persists
       to the artifact)
-    * progressive local render gates for FourOverSix, GPTQ,
-      optional scale_sweep, MXFP8_E4M3 scale-sweep, and FP8 scale-sweep;
-      regressive candidates fall back to the previous accepted render and
-      record metadata
+    * progressive local render gates using the shared mechanism order
+      baseline -> format scale rule -> GPTQ -> optional scale_sweep;
+      individual formats explicitly opt out of unsupported mechanisms,
+      and regressive candidates fall back to the previous accepted render
+      while recording metadata
     * activation-weighted MXFP8_E4M3 E8M0 scale search and FP8 dynamic per-row
-      scale search when scale_sweep is enabled
+      scale search when scale_sweep is enabled; these refine the current
+      accepted render rather than starting a separate format-specific path
     * activation-weighted GPTQ for FP8_E4M3/FP8_E5M2 and
-      MXFP8_E4M3/MXFP8_E5M2; the microscaled E4M3/E5M2 paths may also use
-      joint_scale_opt to search legal E8M0 block scales
+      MXFP8_E4M3/MXFP8_E5M2. NVFP4 is the only production format that uses
+      joint_scale_opt; MXFP8 uses the canonical E8M0 scale rule.
     * retired Fisher-weighted local objectives are archived under
       ``archive/fisher_2026-05-15/`` and are not part of the production
       pipeline
@@ -1074,6 +1076,11 @@ def _render_score_record(
     metric = raw_metric
     activation_quantized = False
     activation_clipped = False
+    activation_clip_max = (
+        activation_max_abs
+        if _format_uses_static_activation_clip(fmt) else
+        None
+    )
     if (
         activations is not None
         and activations.numel() > 0
@@ -1089,7 +1096,7 @@ def _render_score_record(
                     rendered_weight=rendered_weight,
                     activations=activations,
                     activation_quantize=spec.activation_quantize_dequantize,
-                    activation_max_abs=activation_max_abs,
+                    activation_max_abs=activation_clip_max,
                 )
             )
         except Exception as exc:
@@ -1131,13 +1138,26 @@ def _render_score_record(
         "activation_quantized": bool(activation_quantized),
         "activation_clipped": bool(activation_clipped),
         "activation_max_abs": (
-            float(activation_max_abs)
-            if activation_max_abs is not None and activation_max_abs > 0
+            float(activation_clip_max)
+            if activation_clip_max is not None and activation_clip_max > 0
             else None
         ),
         "out_features": int(rows),
         "in_features": int(cols),
     }
+
+
+def _format_uses_static_activation_clip(fmt: str) -> bool:
+    """Return whether local scoring should apply a calibrated activation max.
+
+    NVFP4 serving uses a calibrated tensor-level activation scale plus local
+    tensor-group quantization. MXFP8/FP8 dynamic serving computes activation
+    scales at runtime, so applying the NVFP4 activation max to those formats
+    prices the wrong kernel contract.
+    """
+    from prismaquant import format_registry as fr
+
+    return fr.canonical_format_name(str(fmt).strip().upper()) == "NVFP4"
 
 
 def _local_forward_render_score(
@@ -1223,6 +1243,34 @@ def _write_render_score_sidecar(
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(_json.dumps(payload, indent=2, sort_keys=True))
     os.replace(tmp, path)
+
+
+def _format_supports_render_mechanism(fmt: str, mechanism: str) -> bool:
+    """Return whether a shared render mechanism is meaningful for ``fmt``.
+
+    The production render pipeline is format-agnostic in order. Individual
+    formats opt out of mechanisms whose math or exported schema does not
+    apply.
+    """
+
+    fmt_u = str(fmt).strip().upper()
+    mech = str(mechanism).strip()
+    if fmt_u == "NVFP4":
+        return mech in {
+            "four_over_six",
+            "gptq",
+            "static_act_order",
+            "joint_scale_opt",
+            "fisher_gptq",
+            "scale_sweep",
+        }
+    if fmt_u in {"FP8_E4M3", "FP8_E5M2"}:
+        return mech == "gptq" or (mech == "scale_sweep" and fmt_u == "FP8_E4M3")
+    if fmt_u in {"MXFP8_E4M3", "MXFP8_E5M2"}:
+        return mech == "gptq" or (
+            mech == "scale_sweep" and fmt_u == "MXFP8_E4M3"
+        )
+    return False
 
 
 def _render_nvfp4_progressive_candidate(
@@ -1678,7 +1726,6 @@ def render_production_weight(
         baseline = spec.quantize_dequantize(weight.detach().clone()).to(
             device=weight.device, dtype=weight.dtype,
         )
-        current = baseline.contiguous()
         reference = weight.detach().to(torch.float32)
         acts = activations.get(qname)
         acts_for_render = (
@@ -1686,42 +1733,39 @@ def render_production_weight(
             if acts is not None and int(acts.shape[-1]) == int(weight.shape[1])
             else None
         )
+        baseline_score, baseline_metric = _render_score_for_gate(
+            reference,
+            baseline,
+            acts,
+        )
+        current = _RenderedCandidate(
+            label=f"{fmt.lower()}+rtn",
+            weight=baseline.contiguous(),
+            score=float(baseline_score),
+            metric=baseline_metric,
+            scale_rule="",
+            package=(),
+            has_gptq=False,
+        )
         if gate_trace is not None:
-            baseline_score, baseline_metric = _render_score_for_gate(
-                reference,
-                baseline,
-                acts,
-            )
             gate_trace.append({
                 "mechanism": "baseline",
-                "selected": fmt,
-                "score": float(baseline_score),
-                "metric": baseline_metric,
+                "selected": current.label,
+                "score": float(current.score),
+                "metric": current.metric,
                 "package": [],
             })
 
         def _apply_non_nv_gate(
             *,
             mechanism: str,
-            candidate: torch.Tensor,
-            package: Sequence[str],
-            label: str,
+            candidate: _RenderedCandidate,
         ) -> None:
             nonlocal current
-            baseline_score, metric = _render_score_for_gate(
-                reference,
-                current,
-                acts,
-            )
-            candidate_score, _ = _render_score_for_gate(
-                reference,
-                candidate,
-                acts,
-            )
             decision = gate_render_candidate(
-                baseline_score=baseline_score,
-                candidate_score=candidate_score,
-                metric=metric,
+                baseline_score=current.score,
+                candidate_score=candidate.score,
+                metric=candidate.metric,
                 min_relative_gain=_env_float(
                     "PRISMAQUANT_RENDER_GATE_MIN_GAIN",
                     0.0,
@@ -1733,62 +1777,60 @@ def render_production_weight(
                 gate_trace.append({
                     "mechanism": mechanism,
                     "accepted": bool(decision.accepted),
-                    "selected": label if decision.accepted else fmt,
-                    "candidate": label,
-                    "baseline_score": float(baseline_score),
-                    "candidate_score": float(candidate_score),
+                    "selected": (
+                        candidate.label if decision.accepted else current.label
+                    ),
+                    "candidate": candidate.label,
+                    "baseline_score": float(current.score),
+                    "candidate_score": float(candidate.score),
                     "relative_gain": float(decision.relative_gain),
-                    "metric": metric,
+                    "metric": candidate.metric,
                     "reason": str(decision.reason),
-                    "package": list(package),
+                    "package": list(candidate.package),
                 })
             if decision.accepted:
-                current = candidate.contiguous()
+                old = current.weight
+                current = candidate
+                if old is not candidate.weight:
+                    del old
+            elif candidate.weight is not current.weight:
+                del candidate.weight
 
-        if (
-            fmt in {"FP8_E4M3", "FP8_E5M2"}
-            and bool(levers.get("gptq", True))
-            and acts_for_render is not None
-        ):
-            from prismaquant import export_native_compressed as enc
-
-            if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
-                _q, _s, candidate = enc._gptq_obs_rounding_fp8_like_swept(
-                    reference,
-                    acts_for_render,
-                    fmt=fmt,
-                    clip_threshold=act_clip_threshold,
-                    clip_rescale=clip_rescale,
-                    fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=False,
-                )
-            else:
-                _q, _s, candidate = enc._gptq_obs_rounding_fp8_like(
-                    reference,
-                    acts_for_render,
-                    fmt=fmt,
-                    clip_threshold=act_clip_threshold,
-                    clip_rescale=clip_rescale,
-                    fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=False,
-                )
-            _apply_non_nv_gate(
-                mechanism="gptq",
-                candidate=candidate.to(device=weight.device, dtype=weight.dtype),
-                package=("gptq",),
-                label=f"{fmt.lower()}+gptq",
+        def _non_nv_candidate(
+            *,
+            label: str,
+            weight_dq: torch.Tensor,
+            package: tuple[str, ...],
+            has_gptq: bool,
+        ) -> _RenderedCandidate:
+            rendered = weight_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
+            score, metric = _render_score_for_gate(reference, rendered, acts)
+            return _RenderedCandidate(
+                label=label,
+                weight=rendered,
+                score=float(score),
+                metric=metric,
+                scale_rule="",
+                package=package,
+                has_gptq=bool(has_gptq),
             )
 
         if (
-            fmt in {"MXFP8_E4M3", "MXFP8_E5M2"}
+            _format_supports_render_mechanism(fmt, "gptq")
             and bool(levers.get("gptq", True))
             and acts_for_render is not None
         ):
             from prismaquant import export_native_compressed as enc
 
-            package = ["gptq"]
-            if bool(levers.get("joint_scale_opt", False)):
-                package.insert(0, "joint_scale_opt")
+            joint_scale_opt = bool(
+                levers.get("joint_scale_opt", False)
+                and _format_supports_render_mechanism(fmt, "joint_scale_opt")
+            )
+            package = (
+                ("joint_scale_opt", "gptq")
+                if joint_scale_opt else
+                ("gptq",)
+            )
             if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
                 _q, _s, candidate = enc._gptq_obs_rounding_fp8_like_swept(
                     reference,
@@ -1798,7 +1840,7 @@ def render_production_weight(
                     clip_threshold=act_clip_threshold,
                     clip_rescale=clip_rescale,
                     fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=bool(levers.get("joint_scale_opt", False)),
+                    joint_scale_opt=joint_scale_opt,
                 )
             else:
                 _q, _s, candidate = enc._gptq_obs_rounding_fp8_like(
@@ -1809,69 +1851,62 @@ def render_production_weight(
                     clip_threshold=act_clip_threshold,
                     clip_rescale=clip_rescale,
                     fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=bool(levers.get("joint_scale_opt", False)),
+                    joint_scale_opt=joint_scale_opt,
                 )
             _apply_non_nv_gate(
                 mechanism="gptq",
-                candidate=candidate.to(device=weight.device, dtype=weight.dtype),
-                package=tuple(package),
-                label=f"{fmt.lower()}+{'+'.join(package)}",
+                candidate=_non_nv_candidate(
+                    label=f"{fmt.lower()}+{'+'.join(package)}",
+                    weight_dq=candidate,
+                    package=package,
+                    has_gptq=True,
+                ),
             )
 
         if (
-            fmt == "MXFP8_E4M3"
+            _format_supports_render_mechanism(fmt, "scale_sweep")
             and bool(levers.get("scale_sweep", False))
-            and qname in activations
+            and acts_for_render is not None
         ):
-            from prismaquant.export_native_compressed import (
-                _mxfp8_scale_sweep_quantize,
-            )
+            if fmt == "MXFP8_E4M3":
+                from prismaquant.export_native_compressed import (
+                    _mxfp8_scale_sweep_quantize,
+                )
 
-            _, _, w_dq = _mxfp8_scale_sweep_quantize(
-                weight.detach().to(torch.float32),
-                activations[qname],
-                group_size=32,
-                clip_threshold=act_clip_threshold,
-                clip_rescale=clip_rescale,
-                fisher_row_weights=fisher_row_weights,
+                _, _, w_dq = _mxfp8_scale_sweep_quantize(
+                    current.weight.detach().to(torch.float32),
+                    acts_for_render,
+                    group_size=32,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                )
+            else:
+                from prismaquant.export_native_compressed import (
+                    _fp8_dynamic_scale_sweep_quantize,
+                )
+
+                _, _, w_dq = _fp8_dynamic_scale_sweep_quantize(
+                    current.weight.detach().to(torch.float32),
+                    acts_for_render,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                )
+            candidate = _non_nv_candidate(
+                label=f"{current.label}+scale_sweep",
+                weight_dq=w_dq,
+                package=tuple(dict.fromkeys((*current.package, "scale_sweep"))),
+                has_gptq=current.has_gptq,
             )
-            candidate = w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
             if progressive_gates:
                 _apply_non_nv_gate(
                     mechanism="scale_sweep",
                     candidate=candidate,
-                    package=("scale_sweep",),
-                    label="mxfp8_scale_sweep",
                 )
-                return current.contiguous()
-            return candidate
-        if (
-            fmt == "FP8_E4M3"
-            and bool(levers.get("scale_sweep", False))
-            and qname in activations
-        ):
-            from prismaquant.export_native_compressed import (
-                _fp8_dynamic_scale_sweep_quantize,
-            )
-
-            _, _, w_dq = _fp8_dynamic_scale_sweep_quantize(
-                weight.detach().to(torch.float32),
-                activations[qname],
-                clip_threshold=act_clip_threshold,
-                clip_rescale=clip_rescale,
-                fisher_row_weights=fisher_row_weights,
-            )
-            candidate = w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
-            if progressive_gates:
-                _apply_non_nv_gate(
-                    mechanism="scale_sweep",
-                    candidate=candidate,
-                    package=("scale_sweep",),
-                    label="fp8_scale_sweep",
-                )
-                return current.contiguous()
-            return candidate
-        return current.contiguous()
+                return current.weight.contiguous()
+            return candidate.weight.contiguous()
+        return current.weight.contiguous()
 
     from prismaquant.export_native_compressed import _quantize_2d
 
