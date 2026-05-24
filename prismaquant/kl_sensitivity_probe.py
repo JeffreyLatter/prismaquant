@@ -237,18 +237,12 @@ def _linear_targets(
         shape = tuple(int(dim) for dim in module.weight.shape)
         if len(shape) != 2:
             continue
-        profile_pinned = False
-        if profile is not None:
-            try:
-                profile_pinned = bool(profile.is_pinned_name(qname))
-            except Exception:
-                profile_pinned = False
         targets.append(
             LinearTarget(
                 qname=qname,
                 shape=(int(shape[0]), int(shape[1])),
                 n_params=int(module.weight.numel()),
-                pinned=profile_pinned or _is_pinned(qname, pins),
+                pinned=_is_pinned(qname, pins),
             )
         )
     return sorted(targets, key=lambda target: (target.pinned, target.qname))
@@ -447,13 +441,6 @@ def _validate_production_cache_metadata(
         )
     actual_identity = metadata.get("identity_sha256")
     expected_identity = expected.get("identity_sha256")
-    if actual_identity is None:
-        return _production_cache_metadata_diag(
-            metadata,
-            expected,
-            status="legacy_missing",
-            validated=False,
-        )
     if actual_identity != expected_identity:
         raise RuntimeError(
             "production weight cache identity mismatch; "
@@ -676,24 +663,6 @@ def _decision_unit_for(profile, qname: str) -> str:
     except Exception:
         group = None
     return str(group) if group is not None else qname
-
-
-def _semantic_category(qname: str) -> str:
-    """Coarse functional bucket for measured composite seed overlays."""
-    name = str(qname)
-    if ".visual." in name or name.startswith("model.visual."):
-        return "visual"
-    if ".mlp.shared_expert." in name or name.endswith(".mlp.shared_expert_gate"):
-        return "shared_expert"
-    if ".self_attn." in name:
-        return "self_attn"
-    if ".linear_attn." in name:
-        return "linear_attn"
-    if ".mlp.experts." in name:
-        return "routed_experts"
-    if name.startswith("mtp."):
-        return "mtp"
-    return "other"
 
 
 def _members_by_decision_unit(
@@ -1163,90 +1132,6 @@ def _load_seed_assignment_points(
                 "error": str(exc),
             })
             raise
-    return points, diagnostics
-
-
-def _parse_semantic_seed_categories(value: str | None) -> list[str]:
-    if value is None:
-        return []
-    if str(value).strip().lower() in {"", "none", "off", "0"}:
-        return []
-    return [part.strip() for part in str(value).split(",") if part.strip()]
-
-
-def _semantic_seed_assignment_points(
-    categories: Sequence[str],
-    *,
-    seed_format: str,
-    floor_assignment: Mapping[str, str],
-    floor_kl: float,
-    targets: Sequence[LinearTarget],
-    profile,
-    requested_formats: Sequence[str],
-    source_manifest: Mapping[str, str | None],
-    target_profile: str,
-) -> tuple[list[FrontierPoint], list[dict[str, object]]]:
-    """Build measured composite seed candidates by semantic module class.
-
-    These seeds capture interaction/cumulative effects that single-unit
-    additive probes miss, for example "all shared experts currently below
-    BF16" or "all self-attn projections currently below BF16".
-    """
-    categories = [str(category).strip() for category in categories if str(category).strip()]
-    if not categories:
-        return [], []
-    target_format = fr.canonical_format_name(seed_format)
-    points: list[FrontierPoint] = []
-    diagnostics: list[dict[str, object]] = []
-    targets_by_category: dict[str, dict[str, str]] = defaultdict(dict)
-    for target in targets:
-        if target.pinned:
-            continue
-        category = _semantic_category(target.qname)
-        if category not in categories:
-            continue
-        floor_fmt = fr.canonical_format_name(floor_assignment.get(target.qname, "BF16"))
-        if floor_fmt == target_format:
-            continue
-        targets_by_category[category][target.qname] = target_format
-
-    for category in categories:
-        raw_assignment = targets_by_category.get(category, {})
-        label = f"semantic_seed:{category}->{target_format}"
-        path = Path(f"{label.replace(':', '_').replace('->', '_to_')}.json")
-        if not raw_assignment:
-            diagnostics.append({
-                "path": str(path),
-                "label": label,
-                "source_key": "semantic_seed",
-                "source": "semantic_seed",
-                "included": False,
-                "category": category,
-                "format": target_format,
-                "reason": "no_matching_floor_entries",
-            })
-            continue
-        point, diag = _seed_assignment_point(
-            path=path,
-            raw_assignment=raw_assignment,
-            label=label,
-            source_key="semantic_seed",
-            floor_assignment=floor_assignment,
-            floor_kl=floor_kl,
-            targets=targets,
-            profile=profile,
-            requested_formats=requested_formats,
-            source_manifest=source_manifest,
-            target_profile=target_profile,
-        )
-        points.append(replace(point, source="semantic_seed", label=label))
-        diag = dict(diag)
-        diag.update({
-            "source": "semantic_seed",
-            "category": category,
-            "format": target_format,
-        })
-        diagnostics.append(diag)
     return points, diagnostics
 
 
@@ -3218,50 +3103,19 @@ def run_probe(args: argparse.Namespace) -> dict:
     )
     seed_assignment_diagnostics: list[dict[str, object]] = []
     seed_assignment_points: list[FrontierPoint] = []
-    semantic_categories = _parse_semantic_seed_categories(
-        getattr(args, "semantic_seed_overlays", None)
-    )
-    if semantic_categories:
-        semantic_points, semantic_diagnostics = _semantic_seed_assignment_points(
-            semantic_categories,
-            seed_format=getattr(args, "semantic_seed_format", "BF16"),
-            floor_assignment=floor_assignment,
-            floor_kl=float(floor_kl),
-            targets=targets,
-            profile=profile,
-            requested_formats=requested_formats,
-            source_manifest=source_manifest,
-            target_profile=args.target_profile,
-        )
-        seed_assignment_points.extend(semantic_points)
-        seed_assignment_diagnostics.extend(semantic_diagnostics)
-        included = sum(1 for item in semantic_diagnostics if item.get("included"))
-        print(
-            f"[kl-probe] built semantic seed overlays "
-            f"included={included}/{len(semantic_diagnostics)} "
-            f"categories={semantic_categories}",
-            flush=True,
-        )
     if getattr(args, "seed_assignment", None):
-        file_seed_points, file_seed_diagnostics = _load_seed_assignment_points(
-            args.seed_assignment,
-            floor_assignment=floor_assignment,
-            floor_kl=float(floor_kl),
-            targets=targets,
-            profile=profile,
-            requested_formats=requested_formats,
-            source_manifest=source_manifest,
-            target_profile=args.target_profile,
+        seed_assignment_points, seed_assignment_diagnostics = (
+            _load_seed_assignment_points(
+                args.seed_assignment,
+                floor_assignment=floor_assignment,
+                floor_kl=float(floor_kl),
+                targets=targets,
+                profile=profile,
+                requested_formats=requested_formats,
+                source_manifest=source_manifest,
+                target_profile=args.target_profile,
+            )
         )
-        seed_assignment_points.extend(file_seed_points)
-        seed_assignment_diagnostics.extend(file_seed_diagnostics)
-        included = sum(1 for item in file_seed_diagnostics if item.get("included"))
-        print(
-            f"[kl-probe] loaded file seed assignments "
-            f"included={included}/{len(file_seed_diagnostics)}",
-            flush=True,
-        )
-    if seed_assignment_points:
         frontier, seed_assignment_diagnostics = _append_unique_frontier_points(
             frontier,
             seed_assignment_points,
@@ -3271,7 +3125,7 @@ def run_probe(args: argparse.Namespace) -> dict:
             1 for item in seed_assignment_diagnostics if item.get("included")
         )
         print(
-            f"[kl-probe] seed assignments on frontier "
+            f"[kl-probe] loaded seed assignments "
             f"included={included}/{len(seed_assignment_diagnostics)}",
             flush=True,
         )
@@ -3782,23 +3636,6 @@ def build_parser() -> argparse.ArgumentParser:
             "with the same production-faithful KL path as generated frontier "
             "points."
         ),
-    )
-    parser.add_argument(
-        "--semantic-seed-overlays",
-        default="",
-        help=(
-            "Comma-separated semantic categories to add as composite seed "
-            "assignments. Each seed changes all non-pinned targets in that "
-            "category whose floor format differs from --semantic-seed-format, "
-            "then measures the full assignment with the same KL path as other "
-            "frontier points. Useful for cumulative interaction classes such "
-            "as shared_expert,self_attn."
-        ),
-    )
-    parser.add_argument(
-        "--semantic-seed-format",
-        default="BF16",
-        help="Target format for --semantic-seed-overlays. Default BF16.",
     )
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="auto")
