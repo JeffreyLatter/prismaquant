@@ -1397,6 +1397,18 @@ class TestQwen35ProfileFallback(unittest.TestCase):
             ),
             "model.layers.25.self_attn.qkv_proj",
         )
+        self.assertEqual(
+            profile.fused_sibling_group(
+                "model.layers.25.mlp.shared_expert.gate_proj"
+            ),
+            "model.layers.25.mlp.shared_expert.gate_up_proj",
+        )
+        self.assertEqual(
+            profile.fused_sibling_group(
+                "model.layers.25.mlp.shared_expert.up_proj"
+            ),
+            "model.layers.25.mlp.shared_expert.gate_up_proj",
+        )
 
     def test_promote_fused_keeps_linear_attn_qkvz_coherent_without_vllm(self):
         profile = self._cpu_only_profile()

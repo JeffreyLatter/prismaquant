@@ -106,6 +106,10 @@
       "members": ["mlp.gate_proj", "mlp.up_proj"]
     },
     {
+      "target": "mlp.shared_expert.gate_up_proj",
+      "members": ["mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj"]
+    },
+    {
       "target": "linear_attn.in_proj_qkvz",
       "members": ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"]
     },
