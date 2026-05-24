@@ -105,6 +105,27 @@ def test_recache_preload_respects_resident_budget(tmp_path):
     assert all(isinstance(cache.weights[k], torch.Tensor) for k in keys)
 
 
+def test_assignment_keys_ignore_uncached_packed_expert_entries(tmp_path):
+    torch.save(torch.ones((2, 2)), tmp_path / "dense.pt")
+    cache = ProductionWeightCache(
+        weights={("dense", "NVFP4"): "dense.pt"},
+        levers={},
+        cache_dir=str(tmp_path),
+    )
+
+    keys, missing = cache.assignment_keys(
+        {
+            "dense": "NVFP4",
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "MXFP8_E4M3",
+            "missing_dense": "NVFP4",
+        }
+    )
+
+    assert keys == [("dense", "NVFP4")]
+    assert missing == [("missing_dense", "NVFP4")]
+
+
 def test_production_cache_file_page_prefetch_does_not_load_tensors(tmp_path, monkeypatch):
     import prismaquant.production_weight_cache as pwc
 

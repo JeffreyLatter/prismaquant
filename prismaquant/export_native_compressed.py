@@ -884,6 +884,8 @@ def _production_cache_lookup_key(name: str, fmt: str):
 def _production_cache_expected_keys(
     assignment: dict[str, str],
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    from prismaquant.production_weight_cache import is_uncached_packed_expert_qname
+
     keys: list[tuple[str, str]] = []
     missing: list[tuple[str, str]] = []
     for qname, fmt in assignment.items():
@@ -892,6 +894,8 @@ def _production_cache_expected_keys(
             continue
         key = _production_cache_lookup_key(qname, cache_fmt)
         if key is None:
+            if is_uncached_packed_expert_qname(qname):
+                continue
             missing.append((qname, cache_fmt))
         else:
             keys.append(key)

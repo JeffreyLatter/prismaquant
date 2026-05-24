@@ -94,6 +94,23 @@ def _cache_weight_filename(qname: str, fmt: str) -> str:
     return f"{safe}__{fmt}.pt"
 
 
+_UNCACHED_PACKED_EXPERT_RE = re.compile(
+    r"\.experts(?:\.\d+)?\."
+    r"(?:gate_up_proj|down_proj|gate_proj|up_proj|w1|w2|w3)$"
+)
+
+
+def is_uncached_packed_expert_qname(qname: str) -> bool:
+    """Return True for packed-MoE expert tensors not rendered by this cache.
+
+    ``ProductionWeightCache`` currently renders production-faithful 2D
+    ``nn.Linear`` weights. Packed 3D MoE expert tensors are quantized by the
+    packed exporter/validation fallback path, so missing cache entries for
+    those names must not fail production-cache residency checks.
+    """
+    return bool(_UNCACHED_PACKED_EXPERT_RE.search(str(qname)))
+
+
 @dataclass
 class ProductionWeightCache:
     """Dict-like cache of production-faithful dequantized weights.
@@ -273,6 +290,8 @@ class ProductionWeightCache:
                 continue
             key = self.resolve_key(str(qname), fmt_canon)
             if key is None:
+                if is_uncached_packed_expert_qname(str(qname)):
+                    continue
                 missing.append((str(qname), fmt_canon))
                 continue
             if key not in seen:
