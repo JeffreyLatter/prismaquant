@@ -183,6 +183,26 @@ def test_format_applicability_positive_and_negative_cases():
     assert source_unknown.reason == "source_dtype_mismatch"
 
 
+def test_linear_targets_honor_profile_pins():
+    class ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.body = torch.nn.Linear(64, 64, bias=False)
+            self.lm_head = torch.nn.Linear(64, 64, bias=False)
+
+    class Profile:
+        def is_pinned_name(self, qname):
+            return qname == "lm_head"
+
+    targets = {
+        target.qname: target
+        for target in ksp._linear_targets(ToyModel(), set(), Profile())
+    }
+
+    assert targets["body"].pinned is False
+    assert targets["lm_head"].pinned is True
+
+
 def test_l3_format_selection_respects_target_profile():
     stats = {
         "model.layers.0.self_attn.o_proj": {
@@ -924,6 +944,53 @@ def test_adaptive_group_candidate_search_fails_open_when_all_groups_prune(
     assert result.diagnostics["rounds"][1]["fail_open_candidates"] == 2
 
 
+def test_semantic_seed_assignment_points_promote_composite_category():
+    targets = [
+        LinearTarget(
+            "model.layers.0.mlp.shared_expert.gate_proj",
+            (16, 16),
+            256,
+        ),
+        LinearTarget(
+            "model.layers.0.mlp.shared_expert.up_proj",
+            (16, 16),
+            256,
+        ),
+        LinearTarget("model.layers.0.self_attn.q_proj", (16, 16), 256),
+        LinearTarget("model.layers.0.linear_attn.out_proj", (16, 16), 256),
+    ]
+    floor_assignment = {
+        "model.layers.0.mlp.shared_expert.gate_proj": "NVFP4",
+        "model.layers.0.mlp.shared_expert.up_proj": "MXFP8_E4M3",
+        "model.layers.0.self_attn.q_proj": "NVFP4",
+        "model.layers.0.linear_attn.out_proj": "BF16",
+    }
+
+    points, diagnostics = ksp._semantic_seed_assignment_points(
+        ["shared_expert", "self_attn"],
+        seed_format="BF16",
+        floor_assignment=floor_assignment,
+        floor_kl=0.25,
+        targets=targets,
+        profile=None,
+        requested_formats=["NVFP4", "MXFP8_E4M3", "BF16"],
+        source_manifest={},
+        target_profile="research",
+    )
+
+    assert [point.label for point in points] == [
+        "semantic_seed:shared_expert->BF16",
+        "semantic_seed:self_attn->BF16",
+    ]
+    shared = points[0]
+    assert shared.source == "semantic_seed"
+    assert shared.assignment["model.layers.0.mlp.shared_expert.gate_proj"] == "BF16"
+    assert shared.assignment["model.layers.0.mlp.shared_expert.up_proj"] == "BF16"
+    assert shared.assignment["model.layers.0.self_attn.q_proj"] == "NVFP4"
+    assert diagnostics[0]["matched_entries"] == 2
+    assert diagnostics[0]["category"] == "shared_expert"
+
+
 def test_production_cache_metadata_validates_identity_and_entries():
     args = SimpleNamespace(
         model="/tmp/qwen",
@@ -978,6 +1045,22 @@ def test_production_cache_metadata_validates_identity_and_entries():
     legacy_status = ksp._validate_production_cache_metadata(legacy, expected)
     assert legacy_status["status"] == "legacy_missing"
     assert legacy_status["validated"] is False
+
+    legacy_with_metadata = ProductionWeightCache(
+        weights={
+            ("model.layers.0.mlp.down_proj", "NVFP4"): torch.zeros(
+                (2, 2), dtype=torch.bfloat16
+            )
+        },
+        levers={"gptq": True, "scale_sweep": True},
+    )
+    legacy_with_metadata.metadata = {"schema": "pre_identity_metadata"}
+    legacy_with_metadata_status = ksp._validate_production_cache_metadata(
+        legacy_with_metadata,
+        expected,
+    )
+    assert legacy_with_metadata_status["status"] == "legacy_missing"
+    assert legacy_with_metadata_status["validated"] is False
 
 
 def test_kl_sensitivity_probe_help_parses():
