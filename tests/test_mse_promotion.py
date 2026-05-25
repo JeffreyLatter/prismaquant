@@ -4,6 +4,7 @@ import pytest
 
 from prismaquant.mse_promotion import (
     build_mse_promotion_assignment,
+    build_promotion_candidate_report,
     layer_config_from_assignment,
 )
 
@@ -103,6 +104,48 @@ def test_mse_promotion_respects_bpp_budget():
     assert promoted["model.layers.1.self_attn.q_proj"] == "NVFP4"
     assert report["selected_group_count"] == 1
     assert report["budget_skipped_count"] == 1
+
+
+def test_promotion_candidate_report_emits_current_format_overrides():
+    assignment = {
+        "model.layers.0.linear_attn.in_proj_qkv": "NVFP4",
+        "model.layers.0.linear_attn.in_proj_z": "MXFP8_E4M3",
+        "model.layers.1.self_attn.q_proj": "BF16",
+        "model.layers.1.mlp.shared_expert.down_proj": "NVFP4",
+    }
+    stats = {
+        name: _stats((64, 64))
+        for name in assignment
+    }
+    costs = {
+        "model.layers.0.linear_attn.in_proj_qkv": {
+            "NVFP4": {"output_mse": 0.40, "weight_mse": 0.01}
+        },
+        "model.layers.0.linear_attn.in_proj_z": {
+            "MXFP8_E4M3": {"output_mse": 0.20, "weight_mse": 0.01}
+        },
+        "model.layers.1.mlp.shared_expert.down_proj": {
+            "NVFP4": {"output_mse": 10.0, "weight_mse": 0.01}
+        },
+    }
+
+    payload = build_promotion_candidate_report(
+        assignment,
+        costs=costs,
+        stats=stats,
+        categories=["linear_attn", "self_attn"],
+        target_format="BF16",
+        group_by="layer_category",
+    )
+
+    candidates = payload["candidates"]
+    overrides = payload["current_format_overrides"]
+    assert [candidate.key for candidate in candidates] == ["linear_attn.layer_0"]
+    assert overrides["linear_attn.layer_0"] == {
+        "model.layers.0.linear_attn.in_proj_qkv": "NVFP4",
+        "model.layers.0.linear_attn.in_proj_z": "MXFP8_E4M3",
+    }
+    assert payload["base_bpp"] > 0.0
 
 
 def test_layer_config_from_assignment_writes_autoround_entries():

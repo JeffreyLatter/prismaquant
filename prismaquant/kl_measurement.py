@@ -2741,6 +2741,7 @@ class _OverrideSetTargetHooks:
         source_weight_resolver: Callable[[str, str], torch.Tensor | None] | None = None,
         production_weight_cache=None,
         lane_cache_overrides: Sequence[Mapping[str, str]] | None = None,
+        strict_production_weight_cache: bool = False,
     ):
         self.model = model
         self.assignment = _canonical_assignment(assignment)
@@ -2771,6 +2772,7 @@ class _OverrideSetTargetHooks:
         self.activation_max_abs = dict(activation_max_abs or {})
         self.source_weight_resolver = source_weight_resolver
         self.production_weight_cache = production_weight_cache
+        self.strict_production_weight_cache = bool(strict_production_weight_cache)
         self.handles = []
         self.missing: list[str] = []
 
@@ -2890,16 +2892,15 @@ class _OverrideSetTargetHooks:
                 if (
                     w_hat is None
                     and self.production_weight_cache is not None
-                    and cache_fmt != fmt
                 ):
                     w_hat = self.production_weight_cache.get(
                         module_name, cache_fmt,
                     )
-                    if w_hat is None:
+                    if w_hat is None and self.strict_production_weight_cache:
                         raise RuntimeError(
-                            f"production_weight_cache miss for variant "
+                            f"production_weight_cache miss for "
                             f"({module_name!r}, {cache_fmt!r}); refusing "
-                            "to measure a clip proposal with fallback math."
+                            "to measure an override with fallback math."
                         )
                 if (
                     w_hat is None
@@ -4431,6 +4432,10 @@ def measure_override_paired_kl_deltas(
     progress_callback: Callable[[dict], None] | None = None,
     tail_only: bool = True,
     cache_tail_layer_inputs: bool = True,
+    include_activation_quant: bool = True,
+    production_weight_cache=None,
+    strict_production_weight_cache: bool = False,
+    use_frozen_context_cache: bool | None = None,
 ) -> list[float]:
     """Measure paired propagated KL for multi-target override sets.
 
@@ -4452,6 +4457,7 @@ def measure_override_paired_kl_deltas(
     for override in overrides:
         format_names.update(override.values())
     specs_by_name = _specs_by_canonical_name(format_names)
+    activation_max_abs = _production_activation_max_abs(production_weight_cache)
 
     device = next(model.parameters()).device
     requested_max_lanes_per_batch = max(int(max_lanes_per_batch), 2)
@@ -4469,9 +4475,13 @@ def measure_override_paired_kl_deltas(
     )
     use_prequant_cache = _maybe_disable_l3_prequant_cache_for_memory(
         device, use_prequant_cache)
-    use_frozen_perturbed_cache = _env_flag_enabled(
-        "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
-        default=True,
+    use_frozen_perturbed_cache = (
+        _env_flag_enabled(
+            "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
+            default=True,
+        )
+        if use_frozen_context_cache is None
+        else bool(use_frozen_context_cache)
     )
     use_frozen_perturbed_cache = _maybe_disable_l3_frozen_cache_for_memory(
         device, use_frozen_perturbed_cache)
@@ -4502,6 +4512,8 @@ def measure_override_paired_kl_deltas(
                 input_rows=0,
                 cal_hash=cal_hash,
                 profile=profile,
+                production_weight_cache=production_weight_cache,
+                include_activation_quant=include_activation_quant,
             )
             frozen_context = (
                 context_hooks.frozen_weight_cache()
@@ -4650,10 +4662,17 @@ def measure_override_paired_kl_deltas(
             for name in sorted(target_names)
         ]
         group_quant_cache = (
-            build_quant_weight_cache(
-                model,
-                cache_entries,
-                list({id(spec): spec for spec in specs_by_name.values()}.values()),
+            (
+                _prefetch_production_weight_cache(
+                    production_weight_cache,
+                    cache_entries,
+                )
+                or build_quant_weight_cache(
+                    model,
+                    cache_entries,
+                    list({id(spec): spec for spec in specs_by_name.values()}.values()),
+                    production_weight_cache=production_weight_cache,
+                )
             )
             if use_prequant_cache
             else None
@@ -4669,6 +4688,8 @@ def measure_override_paired_kl_deltas(
             input_rows=0,
             cal_hash=cal_hash,
             profile=profile,
+            production_weight_cache=production_weight_cache,
+            include_activation_quant=include_activation_quant,
         )
         frozen_context = (
             context_hooks.frozen_weight_cache()
@@ -4705,6 +4726,12 @@ def measure_override_paired_kl_deltas(
                         execution_lane_overrides,
                         base_batch=base_batch,
                         quant_weight_cache=group_quant_cache,
+                        include_activation_quant=include_activation_quant,
+                        activation_max_abs=activation_max_abs,
+                        production_weight_cache=production_weight_cache,
+                        strict_production_weight_cache=(
+                            strict_production_weight_cache
+                        ),
                     )
                     target_hooks.install()
                 if use_tail_chunk:

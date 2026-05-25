@@ -278,6 +278,70 @@ def build_promotion_candidates(
     return candidates
 
 
+def build_promotion_candidate_report(
+    assignment: Mapping[str, str],
+    *,
+    costs: Mapping[str, object],
+    stats: Mapping[str, Mapping],
+    categories: Sequence[str],
+    target_format: str = "BF16",
+    group_by: str = "layer_category",
+    metric: str = "output_mse_per_bit",
+) -> dict[str, object]:
+    """Build auditable promotion candidates without selecting a budget.
+
+    The returned candidates are the same objects consumed by
+    ``build_mse_promotion_assignment``.  ``current_format_overrides`` is keyed
+    by candidate key and is the paired-KL candidate lane: the target group keeps
+    its current assignment while the paired baseline lane promotes the same
+    group to ``target_format``.
+    """
+    assignment_c = {
+        str(name): _canonical(fmt)
+        for name, fmt in assignment.items()
+        if str(name) in stats
+    }
+    specs = _specs_for_assignment(assignment_c, extra=(target_format,))
+    params = _total_params(stats, assignment_c)
+    base_bits = assignment_bit_total(stats, assignment_c, specs)
+    wanted_categories = {
+        str(category).strip()
+        for category in categories
+        if str(category).strip()
+    }
+    target_fmt = _canonical(target_format)
+    candidates = build_promotion_candidates(
+        assignment_c,
+        costs=costs,
+        stats=stats,
+        categories=wanted_categories,
+        target_format=target_fmt,
+        group_by=group_by,
+        metric=metric,
+        params=params,
+    )
+    overrides = {
+        candidate.key: {
+            member: assignment_c[member]
+            for member in candidate.members
+        }
+        for candidate in candidates
+    }
+    return {
+        "schema": "prismaquant.mse_promotion.candidates.v1",
+        "assignment": assignment_c,
+        "target_format": target_fmt,
+        "categories": sorted(wanted_categories),
+        "group_by": str(group_by),
+        "metric": str(metric),
+        "params": int(params),
+        "base_bits": float(base_bits),
+        "base_bpp": float(base_bits / max(float(params), 1.0)),
+        "candidates": candidates,
+        "current_format_overrides": overrides,
+    }
+
+
 def _group_key(name: str, group_by: str) -> str:
     category = semantic_category(name)
     layer = layer_number(name)
