@@ -100,6 +100,7 @@ def build_mse_promotion_assignment(
     target_bpp: float | None = None,
     group_by: str = "layer_category",
     metric: str = "output_mse_per_bit",
+    profile=None,
 ) -> dict[str, object]:
     """Return promoted assignment and an auditable report."""
     assignment_c = {
@@ -130,6 +131,7 @@ def build_mse_promotion_assignment(
         group_by=group_by,
         metric=metric,
         params=params,
+        profile=profile,
     )
 
     promoted = dict(assignment_c)
@@ -199,6 +201,7 @@ def build_promotion_candidates(
     group_by: str,
     metric: str,
     params: int,
+    profile=None,
 ) -> list[PromotionCandidate]:
     grouped: dict[str, list[str]] = defaultdict(list)
     for name, current_fmt in assignment.items():
@@ -209,7 +212,7 @@ def build_promotion_candidates(
             continue
         if name not in stats:
             continue
-        key = _group_key(name, group_by)
+        key = _group_key(name, group_by, profile=profile)
         grouped[key].append(name)
 
     candidates: list[PromotionCandidate] = []
@@ -287,6 +290,7 @@ def build_promotion_candidate_report(
     target_format: str = "BF16",
     group_by: str = "layer_category",
     metric: str = "output_mse_per_bit",
+    profile=None,
 ) -> dict[str, object]:
     """Build auditable promotion candidates without selecting a budget.
 
@@ -319,6 +323,7 @@ def build_promotion_candidate_report(
         group_by=group_by,
         metric=metric,
         params=params,
+        profile=profile,
     )
     overrides = {
         candidate.key: {
@@ -342,20 +347,39 @@ def build_promotion_candidate_report(
     }
 
 
-def _group_key(name: str, group_by: str) -> str:
+def _group_key(name: str, group_by: str, *, profile=None) -> str:
     category = semantic_category(name)
     layer = layer_number(name)
     mode = str(group_by)
     if mode == "name":
         return str(name)
+    if mode in {"serving_unit", "fused_unit"}:
+        fused = _fused_sibling_group(profile, name)
+        if fused:
+            return f"fused:{fused}"
+        return f"tensor:{name}"
     if mode == "category":
         return category
     if mode == "layer_category":
         return f"{category}.layer_{layer}"
     raise ValueError(
-        "group_by must be one of: name, layer_category, category; "
+        "group_by must be one of: name, serving_unit, fused_unit, "
+        "layer_category, category; "
         f"got {group_by!r}"
     )
+
+
+def _fused_sibling_group(profile, name: str) -> str | None:
+    if profile is None:
+        return None
+    group_fn = getattr(profile, "fused_sibling_group", None)
+    if group_fn is None:
+        return None
+    try:
+        group = group_fn(str(name))
+    except Exception:
+        return None
+    return str(group) if group else None
 
 
 def _candidate_score(

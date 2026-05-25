@@ -7,6 +7,9 @@ from prismaquant.mse_promotion import (
     build_promotion_candidate_report,
     layer_config_from_assignment,
 )
+from prismaquant.propagated_sensitivity_costs import (
+    apply_propagated_sensitivity_penalty,
+)
 
 
 def _stats(shape):
@@ -16,6 +19,17 @@ def _stats(shape):
         "in_features": in_features,
         "n_params": out_features * in_features,
     }
+
+
+class _FakeFusedProfile:
+    def fused_sibling_group(self, name: str) -> str | None:
+        if name.endswith((".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj")):
+            return name.rsplit(".", 1)[0] + ".qkv_proj"
+        if name.endswith((".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z")):
+            return name.rsplit(".", 1)[0] + ".in_proj_qkvz"
+        if name.endswith((".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj")):
+            return name.rsplit(".", 1)[0] + ".gate_up_proj"
+        return None
 
 
 def test_mse_promotion_selects_highest_output_mse_per_bit_group():
@@ -148,6 +162,70 @@ def test_promotion_candidate_report_emits_current_format_overrides():
     assert payload["base_bpp"] > 0.0
 
 
+def test_serving_unit_grouping_keeps_fused_siblings_atomic_not_layer_wide():
+    assignment = {
+        "model.layers.0.linear_attn.in_proj_qkv": "NVFP4",
+        "model.layers.0.linear_attn.in_proj_z": "MXFP8_E4M3",
+        "model.layers.0.linear_attn.out_proj": "NVFP4",
+        "model.layers.1.self_attn.q_proj": "NVFP4",
+        "model.layers.1.self_attn.k_proj": "NVFP4",
+        "model.layers.1.self_attn.v_proj": "MXFP8_E4M3",
+        "model.layers.1.self_attn.o_proj": "NVFP4",
+        "model.layers.2.mlp.shared_expert.gate_proj": "NVFP4",
+        "model.layers.2.mlp.shared_expert.up_proj": "NVFP4",
+        "model.layers.2.mlp.shared_expert.down_proj": "MXFP8_E4M3",
+    }
+    stats = {name: _stats((64, 64)) for name in assignment}
+    costs = {
+        name: {
+            fmt: {"output_mse": float(idx + 1), "weight_mse": 0.01}
+        }
+        for idx, (name, fmt) in enumerate(assignment.items())
+    }
+
+    payload = build_promotion_candidate_report(
+        assignment,
+        costs=costs,
+        stats=stats,
+        categories=["linear_attn", "self_attn", "shared_expert"],
+        target_format="BF16",
+        group_by="serving_unit",
+        profile=_FakeFusedProfile(),
+    )
+
+    by_key = {candidate.key: tuple(candidate.members)
+              for candidate in payload["candidates"]}
+    assert by_key["fused:model.layers.0.linear_attn.in_proj_qkvz"] == (
+        "model.layers.0.linear_attn.in_proj_qkv",
+        "model.layers.0.linear_attn.in_proj_z",
+    )
+    assert by_key["tensor:model.layers.0.linear_attn.out_proj"] == (
+        "model.layers.0.linear_attn.out_proj",
+    )
+    assert by_key["fused:model.layers.1.self_attn.qkv_proj"] == (
+        "model.layers.1.self_attn.k_proj",
+        "model.layers.1.self_attn.q_proj",
+        "model.layers.1.self_attn.v_proj",
+    )
+    assert by_key["tensor:model.layers.1.self_attn.o_proj"] == (
+        "model.layers.1.self_attn.o_proj",
+    )
+    assert by_key["fused:model.layers.2.mlp.shared_expert.gate_up_proj"] == (
+        "model.layers.2.mlp.shared_expert.gate_proj",
+        "model.layers.2.mlp.shared_expert.up_proj",
+    )
+    assert by_key["tensor:model.layers.2.mlp.shared_expert.down_proj"] == (
+        "model.layers.2.mlp.shared_expert.down_proj",
+    )
+
+    overrides = payload["current_format_overrides"]
+    assert overrides["fused:model.layers.0.linear_attn.in_proj_qkvz"] == {
+        "model.layers.0.linear_attn.in_proj_qkv": "NVFP4",
+        "model.layers.0.linear_attn.in_proj_z": "MXFP8_E4M3",
+    }
+    assert "linear_attn.layer_0" not in by_key
+
+
 def test_layer_config_from_assignment_writes_autoround_entries():
     layer_config = layer_config_from_assignment({
         "model.layers.0.linear_attn.in_proj_qkv": "BF16",
@@ -156,3 +234,75 @@ def test_layer_config_from_assignment_writes_autoround_entries():
 
     assert layer_config["model.layers.0.linear_attn.in_proj_qkv"]["bits"] == 16
     assert layer_config["model.layers.1.self_attn.q_proj"]["data_type"] == "nv_fp"
+
+
+def test_propagated_sensitivity_penalty_counts_fused_unit_once():
+    assignment = {
+        "model.layers.0.self_attn.q_proj": "NVFP4",
+        "model.layers.0.self_attn.k_proj": "NVFP4",
+    }
+    stats = {
+        name: {**_stats((64, 64)), "h_trace": 10.0}
+        for name in assignment
+    }
+    costs = {
+        name: {
+            "NVFP4": {
+                "output_mse": 0.2,
+                "output_mse_measured": True,
+                "weight_mse": 0.1,
+            },
+            "MXFP8_E4M3": {
+                "output_mse": 0.05,
+                "output_mse_measured": True,
+                "weight_mse": 0.01,
+            },
+            "BF16": {
+                "output_mse": 0.0,
+                "output_mse_measured": False,
+                "weight_mse": 0.0,
+                "predicted_dloss": 0.0,
+            },
+        }
+        for name in assignment
+    }
+    report = build_promotion_candidate_report(
+        assignment,
+        costs=costs,
+        stats=stats,
+        categories=["self_attn"],
+        target_format="BF16",
+        group_by="serving_unit",
+        profile=_FakeFusedProfile(),
+    )
+    row = report["candidates"][0].to_json()
+    row["candidate_lane_override"] = report["current_format_overrides"][row["key"]]
+    row["propagated_kl"] = 0.6
+    sensitivity_report = {
+        "target_format": "BF16",
+        "rows": [row],
+    }
+
+    adjusted, summary = apply_propagated_sensitivity_penalty(
+        costs,
+        stats=stats,
+        report=sensitivity_report,
+        scale=1.0,
+    )
+
+    assert summary["adjusted_entries"] == 4
+    assert summary["total_scaled_member_penalty"] == pytest.approx(0.75)
+    current_format_penalty = 0.0
+    for name in assignment:
+        nvfp4 = adjusted[name]["NVFP4"]
+        mxfp8 = adjusted[name]["MXFP8_E4M3"]
+        bf16 = adjusted[name]["BF16"]
+        assert nvfp4["propagated_kl_penalty"] == pytest.approx(0.3)
+        assert nvfp4["predicted_dloss"] == pytest.approx(1.3)
+        assert nvfp4["output_mse"] == pytest.approx(0.26)
+        assert mxfp8["propagated_kl_penalty"] == pytest.approx(0.075)
+        assert mxfp8["predicted_dloss"] == pytest.approx(0.325)
+        assert mxfp8["output_mse"] == pytest.approx(0.065)
+        assert bf16["output_mse"] == 0.0
+        current_format_penalty += nvfp4["propagated_kl_penalty"]
+    assert current_format_penalty == pytest.approx(0.6)

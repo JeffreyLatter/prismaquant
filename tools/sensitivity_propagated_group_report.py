@@ -164,7 +164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--group-by",
         default="layer_category",
-        choices=("name", "layer_category"),
+        choices=("name", "serving_unit", "fused_unit", "layer_category", "category"),
         help="Keep propagated probes same-depth by default.",
     )
     parser.add_argument(
@@ -215,6 +215,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     work_root.mkdir(parents=True, exist_ok=True)
 
+    try:
+        profile = detect_profile(args.model)
+    except Exception:
+        profile = DefaultProfile()
+
     assignment = load_assignment(args.base_assignment)
     costs = _load_costs(args.costs)
     stats = _load_pickle_mapping(args.probe, "stats")
@@ -226,6 +231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_format=args.target_format,
         group_by=args.group_by,
         metric=args.metric,
+        profile=profile,
     )
     candidates = list(candidate_payload["candidates"])
     if int(args.max_groups) > 0:
@@ -252,11 +258,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         work_root=work_root,
         device_map=args.device_map,
     )
-    try:
-        profile = detect_profile(args.model)
-    except Exception:
-        profile = DefaultProfile()
-
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(

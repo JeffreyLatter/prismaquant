@@ -49,6 +49,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     parser.add_argument("--base-assignment", required=True)
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Optional model path used to detect fused serving siblings when "
+            "--group-by=serving_unit or fused_unit."
+        ),
+    )
     parser.add_argument("--costs", required=True)
     parser.add_argument("--probe", required=True)
     parser.add_argument("--output-layer-config", required=True)
@@ -65,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--group-by",
         default="layer_category",
-        choices=("name", "layer_category", "category"),
+        choices=("name", "serving_unit", "fused_unit", "layer_category", "category"),
     )
     parser.add_argument(
         "--metric",
@@ -80,6 +88,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--top", type=int, default=20)
     args = parser.parse_args(argv)
 
+    profile = None
+    if args.model:
+        from prismaquant.model_profiles import detect_profile
+
+        profile = detect_profile(args.model)
+
     result = build_mse_promotion_assignment(
         load_assignment(args.base_assignment),
         costs=_load_costs(args.costs),
@@ -90,6 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_bpp=args.target_bpp,
         group_by=args.group_by,
         metric=args.metric,
+        profile=profile,
     )
     layer_config = layer_config_from_assignment(result["assignment"])
     report = result["report"]
