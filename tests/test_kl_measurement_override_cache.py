@@ -5,6 +5,7 @@ import torch
 
 from prismaquant.kl_measurement import (
     _OverrideSetTargetHooks,
+    _paired_override_baseline_lane,
     _specs_by_canonical_name,
 )
 
@@ -62,3 +63,23 @@ def test_override_set_hook_strict_production_cache_miss_raises():
     y = linear(x)
     with pytest.raises(RuntimeError, match="production_weight_cache miss"):
         hooks._make_hook("linear")(linear, (x,), {}, y)
+
+
+def test_paired_override_baseline_lane_modes():
+    assignment = {
+        "a": "NVFP4",
+        "b": "FP8_E4M3",
+    }
+
+    assert _paired_override_baseline_lane(
+        assignment,
+        ["b", "a"],
+        "target_bf16",
+    ) == {"a": "BF16", "b": "BF16"}
+    assert _paired_override_baseline_lane(
+        assignment,
+        ["b", "a"],
+        "assignment",
+    ) == {"a": "NVFP4", "b": "FP8_E4M3"}
+    with pytest.raises(ValueError, match="baseline_mode"):
+        _paired_override_baseline_lane(assignment, ["a"], "bad")  # type: ignore[arg-type]
