@@ -151,8 +151,13 @@ PY
 : "${MSE_PROMOTION_TARGET_FORMAT:=BF16}"
 : "${MSE_PROMOTION_MAX_BPP_DELTA:=}"
 : "${MSE_PROMOTION_TARGET_BPP:=}"
-: "${MSE_PROMOTION_GROUP_BY:=layer_category}"
+: "${MSE_PROMOTION_GROUP_BY:=serving_unit}"
 : "${MSE_PROMOTION_METRIC:=output_mse_per_bit}"
+: "${ALLOC_PROPAGATED_SENSITIVITY_REPORT:=}"
+: "${ALLOC_PROPAGATED_SENSITIVITY_SCALE:=1.0}"
+: "${ALLOC_PROPAGATED_SENSITIVITY_SCORE_FIELD:=propagated_kl}"
+: "${ALLOC_PROPAGATED_SENSITIVITY_FORMAT_EXTRAPOLATION:=local_mse_ratio}"
+: "${ALLOC_PROPAGATED_SENSITIVITY_TARGET_FORMAT:=}"
 : "${EXPORT_GPTQ:=auto}"
 : "${EXPORT_SCALE_SWEEP:=auto}"
 : "${PIPELINE_SPEC_PATH:=${WORK_DIR}/artifacts/pipeline_spec.json}"
@@ -671,6 +676,20 @@ if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
 else
   ALLOCATOR_PARETO_DIR=""
 fi
+ALLOCATOR_PROPAGATED_ARGS=()
+if [[ -n "$ALLOC_PROPAGATED_SENSITIVITY_REPORT" ]]; then
+  ALLOCATOR_PROPAGATED_ARGS+=(
+    --propagated-sensitivity-report "$ALLOC_PROPAGATED_SENSITIVITY_REPORT"
+    --propagated-sensitivity-scale "$ALLOC_PROPAGATED_SENSITIVITY_SCALE"
+    --propagated-sensitivity-score-field "$ALLOC_PROPAGATED_SENSITIVITY_SCORE_FIELD"
+    --propagated-sensitivity-format-extrapolation "$ALLOC_PROPAGATED_SENSITIVITY_FORMAT_EXTRAPOLATION"
+  )
+  if [[ -n "$ALLOC_PROPAGATED_SENSITIVITY_TARGET_FORMAT" ]]; then
+    ALLOCATOR_PROPAGATED_ARGS+=(
+      --propagated-sensitivity-target-format "$ALLOC_PROPAGATED_SENSITIVITY_TARGET_FORMAT"
+    )
+  fi
+fi
 python3 -m prismaquant.allocator \
   --probe "${PROBE_PATH}" \
   --costs "${COST_PATH}" \
@@ -684,6 +703,7 @@ python3 -m prismaquant.allocator \
   --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
   --pareto-csv "${WORK_DIR}/artifacts/pareto.csv" \
   "${ALLOCATOR_PARETO_ARGS[@]}" \
+  "${ALLOCATOR_PROPAGATED_ARGS[@]}" \
   2>&1 | tee "${WORK_DIR}/logs/allocator.log"
 
 # -----------------------------------------------------------------------
@@ -845,6 +865,7 @@ PY
       echo "[pipeline] applying MSE-driven promotion rewrite ..."
       python3 tools/build_mse_promotion_assignment.py \
         --base-assignment "${WORK_DIR}/artifacts/layer_config.json" \
+        --model "$MODEL_PATH" \
         --costs "$COST_PATH" \
         --probe "$PROBE_PATH" \
         --output-layer-config "${WORK_DIR}/artifacts/layer_config_mse_promoted.json" \

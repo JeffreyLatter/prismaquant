@@ -419,6 +419,29 @@ def main():
                          "'calibrated_gains[fmt] = α_fmt'. When present, "
                          "the per-(layer, format) predicted Δloss "
                          "is multiplied by α_fmt before the DP runs.")
+    ap.add_argument("--propagated-sensitivity-report", default=None,
+                    help="Optional sensitivity_propagated_group_report JSON. "
+                         "When provided, propagated KL is folded into the "
+                         "allocator costs before candidate construction.")
+    ap.add_argument("--propagated-sensitivity-scale", type=float, default=1.0,
+                    help="Multiplier for --propagated-sensitivity-report "
+                         "penalties. The report's current-format unit KL "
+                         "is preserved at scale=1 and distributed once over "
+                         "fused siblings by added-bit share.")
+    ap.add_argument("--propagated-sensitivity-score-field",
+                    default="propagated_kl",
+                    help="Numeric report row field to fold into allocator "
+                         "costs when --propagated-sensitivity-report is set.")
+    ap.add_argument("--propagated-sensitivity-format-extrapolation",
+                    choices=("local_mse_ratio", "current_only", "bits_interp"),
+                    default="local_mse_ratio",
+                    help="How to extrapolate measured current-format "
+                         "propagated sensitivity across alternative "
+                         "candidate formats.")
+    ap.add_argument("--propagated-sensitivity-target-format", default=None,
+                    help="Override target format for propagated-sensitivity "
+                         "bit-share accounting. Defaults to the report's "
+                         "target_format.")
     ap.add_argument("--overshoot-tolerance", type=float, default=0.01,
                     help="Maximum allowed overshoot (bits/param) of the "
                          "achieved budget over the requested target after "
@@ -513,6 +536,33 @@ def main():
             "[alloc] forced passthrough excluded from DP budget: "
             f"{len(allocation_excluded)} Linears "
             f"(sample: {allocation_excluded[:8]})",
+            flush=True,
+        )
+
+    propagated_sensitivity_summary: dict | None = None
+    if args.propagated_sensitivity_report:
+        from .propagated_sensitivity_costs import (
+            apply_propagated_sensitivity_penalty,
+        )
+
+        with open(args.propagated_sensitivity_report) as f:
+            propagated_report = json.load(f)
+        costs, propagated_sensitivity_summary = apply_propagated_sensitivity_penalty(
+            costs,
+            stats=stats,
+            report=propagated_report,
+            scale=float(args.propagated_sensitivity_scale),
+            target_format=args.propagated_sensitivity_target_format,
+            score_field=args.propagated_sensitivity_score_field,
+            format_extrapolation=args.propagated_sensitivity_format_extrapolation,
+        )
+        print(
+            "[alloc] propagated sensitivity costs: "
+            f"report={args.propagated_sensitivity_report} "
+            f"scale={propagated_sensitivity_summary['scale']:.6g} "
+            f"adjusted={propagated_sensitivity_summary['adjusted_entries']} "
+            f"skipped={propagated_sensitivity_summary['skipped']} "
+            f"penalty={propagated_sensitivity_summary['total_scaled_member_penalty']:.6g}",
             flush=True,
         )
 
@@ -644,6 +694,7 @@ def main():
         "formats": [spec.name for spec in specs_sorted],
         "probe": str(args.probe),
         "costs": str(args.costs),
+        "propagated_sensitivity_costs": propagated_sensitivity_summary,
         "pre_aggregation_candidate_availability": pre_aggregation_availability,
         "post_aggregation_candidate_availability": post_aggregation_availability,
         **summarize_applicability_masks(candidate_mask_records),
@@ -787,6 +838,7 @@ def main():
             "schema": "prismaquant.allocator.pareto_manifest.v1",
             "probe": str(args.probe),
             "costs": str(args.costs),
+            "propagated_sensitivity_costs": propagated_sensitivity_summary,
             "formats": [s.name for s in specs_sorted],
             "target_bits": [float(x) for x in targets],
             "candidates": manifest_rows,

@@ -72,7 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     budget.add_argument("--target-bpp", type=float, default=None)
     parser.add_argument(
         "--group-by",
-        default="layer_category",
+        default="serving_unit",
         choices=("name", "serving_unit", "fused_unit", "layer_category", "category"),
     )
     parser.add_argument(

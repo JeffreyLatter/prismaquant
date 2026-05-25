@@ -212,6 +212,8 @@ def build_promotion_candidates(
             continue
         if name not in stats:
             continue
+        if _stats_indicates_packed_expert(stats.get(name, {})):
+            continue
         key = _group_key(name, group_by, profile=profile)
         grouped[key].append(name)
 
@@ -481,6 +483,14 @@ def _cost_entry(costs: Mapping[str, object], name: str, fmt: str) -> Mapping | N
         if isinstance(entry, Mapping) and "error" not in entry:
             return entry
     return None
+
+
+def _stats_indicates_packed_expert(stats_entry: Mapping) -> bool:
+    return bool(
+        stats_entry.get("_packed_experts_module")
+        or stats_entry.get("_packed_param")
+        or int(stats_entry.get("num_experts", 0) or 0) > 0
+    )
 
 
 def _assignment_output_mse(

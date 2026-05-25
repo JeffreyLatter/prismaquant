@@ -163,9 +163,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--target-format", default="BF16")
     parser.add_argument(
         "--group-by",
-        default="layer_category",
+        default="serving_unit",
         choices=("name", "serving_unit", "fused_unit", "layer_category", "category"),
-        help="Keep propagated probes same-depth by default.",
+        help="Serving-unit probes respect fused siblings by default.",
     )
     parser.add_argument(
         "--metric",

@@ -219,6 +219,14 @@ def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
     return True
 
 
+def cost_entry_uses_measured_output_mse(
+    stats_entry: dict,
+    cost_entry: dict,
+) -> bool:
+    """Whether ``cost_entry_predicted_dloss`` will read ``output_mse``."""
+    return _has_measured_output_mse(stats_entry, cost_entry)
+
+
 def _fisher_output_mse_allocator_enabled() -> bool:
     value = os.environ.get("PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR")
     if value is None:

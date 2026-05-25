@@ -61,7 +61,30 @@ PYTHONPATH=. /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python \
 
 The propagated penalty is counted once per serving unit. For fused units it is
 distributed across siblings by added-bit share, then each candidate format is
-scaled by its local output-MSE ratio to the measured current format.
+scaled by its local output-MSE ratio to the measured current format. Packed
+expert rows are skipped so routed-expert aggregate stats do not compete as
+synthetic promotion units.
+The builder and allocator now report `total_scaled_current_format_penalty` and
+`max_current_format_penalty_abs_error`; for the scale-10 replay this was
+5.17225 with max error 6.94e-18, matching `10 * sum(measured_unit_KL)`.
+
+The same adjustment can now be applied directly inside the allocator:
+
+```bash
+python -m prismaquant.allocator \
+  --propagated-sensitivity-report <propagated_serving_unit_report.json> \
+  --propagated-sensitivity-scale 10 \
+  ...
+```
+
+This direct allocator path reproduced the materialized scale-10 layer_config
+exactly (`same_json=True`) against the earlier cost-pickle workflow.
+
+Claude review also prompted two regression guards in the allocator path:
+measured entries now update only `output_mse`, unmeasured entries update only
+`predicted_dloss`, and the summary records current-format penalty conservation
+plus >5x cost shifts for triage. The run-pipeline defaults now pass the model
+profile into MSE promotion and default grouping to `serving_unit`.
 
 Scale-10 was selected for materialization because it had the best hook KL and
 the strongest top-unit coverage.
@@ -74,6 +97,57 @@ the strongest top-unit coverage.
 | 2 | 0.021197 | 4.752571 | 0.004106 | 301 | 99 | 111 |
 | 5 | 0.012730 | 4.752501 | 0.004324 | 314 | 96 | 101 |
 | 10 | 0.011384 | 4.752337 | 0.005144 | 322 | 101 | 88 |
+
+Coverage guard for the scale-10 artifact:
+
+```text
+top10: all_bf16=10 no_nvfp4=10 nvfp4=0 missing=0
+top20: all_bf16=17 no_nvfp4=20 nvfp4=0 missing=0
+top40: all_bf16=32 no_nvfp4=40 nvfp4=0 missing=0
+```
+
+Coverage report:
+`/home/rob/dq-runs/qwen36-35b-propagated-servingunit-4p75-20260525T000000Z/metrics/servingunit_4p75_scale_10p0_sensitivity_coverage.json`
+
+## Extrapolation A/B
+
+Run root:
+`/home/rob/dq-runs/qwen36-35b-propagated-servingunit-extrap-ab-20260525T000000Z`
+
+Three extrapolation policies were tested at scale 10:
+
+- `local_mse_ratio`: default and the known-good policy above.
+- `current_only`: apply propagated penalty only to the measured current format.
+- `bits_interp`: scale by remaining added bits to the BF16 target.
+
+Hook KL on the WikiText n4/s512 screen preferred `current_only`, but the
+materialized vLLM full-vocab KL rejected it. Treat this as evidence that the
+hook screen is useful for triage but not sufficient for selecting replacements.
+
+| Policy | Hook KL n4/s512 | bpp | output_mse | BF16 | MXFP8 | NVFP4 |
+|---|---:|---:|---:|---:|---:|---:|
+| local_mse_ratio | 0.029963 | 4.752337 | 0.005144 | 322 | 101 | 88 |
+| current_only | 0.018104 | 4.753265 | 0.005301 | 306 | 113 | 92 |
+| bits_interp | 0.019575 | 4.750544 | 0.004895 | 342 | 61 | 108 |
+
+`current_only` materialization:
+`/home/rob/dq-runs/qwen36-35b-propagated-servingunit-extrap-ab-20260525T000000Z/exported_current_only`
+
+| Artifact | KL vs BF16 n8/s512 | PPL 8192/s512 | mean NLL |
+|---|---:|---:|---:|
+| shipped 4.75 | 0.0671039 | 9.639520 | 2.265871 |
+| serving-unit propagated scale-10 local_mse_ratio | 0.0361860 | 9.454371 | 2.246477 |
+| serving-unit propagated scale-10 current_only | 0.0825653 | 9.456875 | 2.246742 |
+
+The `current_only` artifact keeps the PPL gain but loses badly on full-vocab
+KL. Keep `local_mse_ratio` as the default until a stronger end-metric screen
+justifies changing it.
+
+Metric files:
+
+- `/home/rob/dq-runs/qwen36-35b-propagated-servingunit-extrap-ab-20260525T000000Z/metrics/extrapolation_ab_wikitext_kl_screen_n4_s512.json`
+- `/home/rob/dq-runs/qwen36-35b-propagated-servingunit-extrap-ab-20260525T000000Z/metrics/current_only_4p75_vllm_kl_vs_bf16_wikitext_n8_s512.json`
+- `/home/rob/dq-runs/qwen36-35b-propagated-servingunit-extrap-ab-20260525T000000Z/metrics/current_only_4p75_vllm_wikitext_ppl_8192_s512.json`
 
 ## Materialized Artifact
 

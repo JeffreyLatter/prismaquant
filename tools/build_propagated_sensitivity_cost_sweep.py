@@ -61,6 +61,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--scales", default="0.25,0.5,1,2,5,10")
     parser.add_argument("--output-prefix", default="cost_propagated_scale")
     parser.add_argument("--score-field", default="propagated_kl")
+    parser.add_argument(
+        "--format-extrapolation",
+        choices=("local_mse_ratio", "current_only", "bits_interp"),
+        default="local_mse_ratio",
+    )
     parser.add_argument("--target-format", default=None)
     parser.add_argument("--manifest", default=None)
     args = parser.parse_args(argv)
@@ -81,6 +86,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scale=scale,
             target_format=args.target_format,
             score_field=args.score_field,
+            format_extrapolation=args.format_extrapolation,
         )
         out_payload = adjusted_costs
         if payload is not None:
@@ -99,13 +105,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "adjusted_entries": summary["adjusted_entries"],
             "skipped": summary["skipped"],
             "total_scaled_member_penalty": summary["total_scaled_member_penalty"],
+            "total_scaled_current_format_penalty": summary[
+                "total_scaled_current_format_penalty"
+            ],
+            "max_current_format_penalty_abs_error": summary[
+                "max_current_format_penalty_abs_error"
+            ],
         }
         outputs.append(row)
         print(
             f"scale={scale:g} wrote {out_path} "
             f"adjusted={row['adjusted_entries']} "
             f"skipped={row['skipped']} "
-            f"penalty={row['total_scaled_member_penalty']:.6g}",
+            f"penalty={row['total_scaled_member_penalty']:.6g} "
+            f"current_penalty={row['total_scaled_current_format_penalty']:.6g} "
+            f"current_error={row['max_current_format_penalty_abs_error']:.3g}",
             flush=True,
         )
 
@@ -117,6 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "scales": _parse_scales(args.scales),
         "measured_units": len(report.get("rows", ())),
         "score_field": str(args.score_field),
+        "format_extrapolation": str(args.format_extrapolation),
         "target_format": args.target_format or report.get("target_format"),
         "total_unscaled_propagated_kl": float(
             sum(float(row.get(args.score_field, 0.0) or 0.0) for row in report.get("rows", ()))
