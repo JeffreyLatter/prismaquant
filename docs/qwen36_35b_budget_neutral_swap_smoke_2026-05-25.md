@@ -73,3 +73,48 @@ It touches two qnames, has net bit delta `-27,525,120`, and estimated
 single-swap KL delta `-0.006797803`. The second improving row was skipped
 because it promotes the same target qname and therefore conflicts with the
 selected row.
+
+Top32 follow-up:
+
+```bash
+RUN=/home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z
+PYTHONPATH=. PRISMAQUANT_L3_CUDA_GRAPHS=0 \
+/home/rob/dq-runs/venvs/prismaquant-cu130/bin/python \
+  tools/measure_budget_neutral_swaps.py \
+  --model /home/rob/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/53c43178507d69762986fbfa314f6e8d4d859409 \
+  --base-assignment /home/rob/dq-runs/qwen36-35b-current-4p75-strategic-20260524T144947Z/artifacts/layer_config.json \
+  --swaps "$RUN/budget_neutral_swaps_35b_4p75.json" \
+  --production-weight-cache /home/rob/dq-runs/qwen36-35b-current-4p75-strategic-20260524T144947Z/artifacts/production_weight_cache_4p7526_recached.pkl \
+  --output-report "$RUN/metrics/budget_neutral_swaps_35b_4p75_top32_n8_s512.json" \
+  --work-root "$RUN/work_top32_n8" \
+  --n-calib-samples 8 \
+  --calib-seqlen 512 \
+  --max-swaps 32 \
+  --max-lanes-per-batch 4 \
+  --production-cache-prefetch file-pages \
+  --production-cache-lru-gb 8
+```
+
+Top32 artifacts:
+
+- Measurement report:
+  `/home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/metrics/budget_neutral_swaps_35b_4p75_top32_n8_s512.json`
+- Log:
+  `/home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/logs/measure_budget_neutral_swaps_top32_n8_s512.log`
+- Selector report:
+  `/home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/metrics/budget_swaps_selection_top32_n8_s512.json`
+
+Top32 results:
+
+- Base assignment KL vs BF16 teacher: `0.015214228`.
+- Negative-delta swaps: `0 / 32`.
+- Best measured row:
+  `tensor:model.layers.20.mlp.shared_expert.down_proj::paid_by::tensor:model.layers.0.linear_attn.out_proj`,
+  delta KL `+0.001252776`, swap KL `0.016467003`, base drift
+  `0.015027539`, net bits `-27,525,120`.
+- Selector output: `selected=0`, `net_bits=0`, estimated selected KL delta
+  `0`.
+
+The top32 result supersedes the n=4 smoke for policy decisions. The smoke
+proved the measurement path; the n=8 pass says the current budget-neutral
+surrogate candidates should not be applied automatically yet.
