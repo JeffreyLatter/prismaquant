@@ -1,0 +1,8 @@
+[Unit]
+Description=PrismaQuant transient disk cleanup
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/python3 /home/rob/prismaquant/tools/cleanup_disk.py --apply --run-root /home/rob/dq-runs --repo-root /home/rob/prismaquant --min-age-hours 72 --log /home/rob/dq-runs/cleanup/prismaquant-disk-cleanup.log
