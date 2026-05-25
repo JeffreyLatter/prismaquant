@@ -113,6 +113,87 @@ class BudgetNeutralSwap:
         }
 
 
+def select_measured_budget_swaps(
+    assignment: Mapping[str, str],
+    rows: Sequence[Mapping[str, object]],
+    *,
+    min_kl_improvement: float = 0.0,
+    max_net_bits_increase: float = 0.0,
+    max_base_drift: float | None = None,
+    max_swaps: int = 0,
+) -> dict[str, object]:
+    """Apply empirically improving, non-conflicting measured swaps.
+
+    Selection is deliberately greedy and conservative: each row must improve
+    BF16-relative KL on its own, cumulative net bits must stay within the
+    configured budget guard, and no selected rows may touch the same qname.
+    """
+    selected_assignment = {
+        str(name): _canonical(fmt)
+        for name, fmt in assignment.items()
+    }
+    min_delta = -max(float(min_kl_improvement), 0.0)
+    allowed_net_bits = float(max_net_bits_increase)
+    selected: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    touched: set[str] = set()
+    cumulative_net_bits = 0.0
+    cumulative_delta_kl = 0.0
+
+    ordered = sorted(
+        [dict(row) for row in rows],
+        key=lambda row: (
+            float(row.get("swap_delta_kl_vs_bf16", float("inf"))),
+            int(row.get("measured_rank", 1_000_000)),
+            str(row.get("key", "")),
+        ),
+    )
+    for row in ordered:
+        reason = _measured_swap_skip_reason(
+            row,
+            touched=touched,
+            cumulative_net_bits=cumulative_net_bits,
+            allowed_net_bits=allowed_net_bits,
+            min_delta=min_delta,
+            max_base_drift=max_base_drift,
+            selected_count=len(selected),
+            max_swaps=max_swaps,
+        )
+        if reason is not None:
+            skipped.append(_selection_row(row, reason=reason))
+            continue
+        override = _row_override(row)
+        for name, fmt in override.items():
+            selected_assignment[name] = _canonical(fmt)
+        touched.update(override)
+        cumulative_net_bits += float(row.get("net_bits_delta", 0.0))
+        cumulative_delta_kl += float(row.get("swap_delta_kl_vs_bf16", 0.0))
+        selected.append(_selection_row(row, reason=None))
+
+    return {
+        "schema": "prismaquant.measured_budget_neutral_swap_selection.v1",
+        "assignment": selected_assignment,
+        "min_kl_improvement": float(min_kl_improvement),
+        "max_net_bits_increase": float(max_net_bits_increase),
+        "max_base_drift": (
+            None if max_base_drift is None else float(max_base_drift)
+        ),
+        "max_swaps": int(max_swaps),
+        "selected_count": len(selected),
+        "selected_member_count": len(touched),
+        "selected_net_bits_delta": float(cumulative_net_bits),
+        "selected_delta_kl_vs_bf16_sum": float(cumulative_delta_kl),
+        "base_format_counts": dict(sorted(Counter(
+            _canonical(fmt) for fmt in assignment.values()
+        ).items())),
+        "selected_format_counts": dict(sorted(Counter(
+            selected_assignment.values()
+        ).items())),
+        "selected": selected,
+        "skipped": skipped,
+    }
+
+
 def build_budget_neutral_swaps(
     assignment: Mapping[str, str],
     *,
@@ -268,6 +349,69 @@ def build_budget_neutral_swaps(
         "top_promotions": [unit.to_json() for unit in promotions[:50]],
         "top_demotions": [unit.to_json() for unit in demotions[:50]],
         "swaps": [swap.to_json() for swap in swaps],
+    }
+
+
+def _selection_row(
+    row: Mapping[str, object],
+    *,
+    reason: str | None,
+) -> dict[str, object]:
+    out = {
+        "key": str(row.get("key", "")),
+        "swap_delta_kl_vs_bf16": float(row.get("swap_delta_kl_vs_bf16", 0.0)),
+        "swap_kl_vs_bf16": float(row.get("swap_kl_vs_bf16", 0.0)),
+        "swap_kl_vs_base_assignment": float(
+            row.get("swap_kl_vs_base_assignment", 0.0)
+        ),
+        "net_bits_delta": float(row.get("net_bits_delta", 0.0)),
+        "override": dict(sorted(_row_override(row).items())),
+    }
+    if row.get("measured_rank") is not None:
+        out["measured_rank"] = int(row["measured_rank"])
+    if reason is not None:
+        out["skip_reason"] = reason
+    return out
+
+
+def _measured_swap_skip_reason(
+    row: Mapping[str, object],
+    *,
+    touched: set[str],
+    cumulative_net_bits: float,
+    allowed_net_bits: float,
+    min_delta: float,
+    max_base_drift: float | None,
+    selected_count: int,
+    max_swaps: int,
+) -> str | None:
+    if int(max_swaps) > 0 and selected_count >= int(max_swaps):
+        return "max_swaps"
+    delta = float(row.get("swap_delta_kl_vs_bf16", float("inf")))
+    if delta > min_delta:
+        return "below_min_kl_improvement"
+    if max_base_drift is not None:
+        drift = float(row.get("swap_kl_vs_base_assignment", float("inf")))
+        if drift > float(max_base_drift):
+            return "base_drift"
+    override = _row_override(row)
+    if not override:
+        return "empty_override"
+    if touched.intersection(override):
+        return "conflict"
+    net_bits = float(row.get("net_bits_delta", 0.0))
+    if cumulative_net_bits + net_bits > allowed_net_bits + 1e-6:
+        return "budget"
+    return None
+
+
+def _row_override(row: Mapping[str, object]) -> dict[str, str]:
+    override = row.get("override")
+    if not isinstance(override, Mapping):
+        return {}
+    return {
+        str(name): _canonical(fmt)
+        for name, fmt in override.items()
     }
 
 

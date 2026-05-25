@@ -56,3 +56,20 @@ Interpretation:
 - Two of the four first surrogate-ranked candidates improved the KL; two
   worsened it. The next phase should empirically measure a larger candidate set
   and select by BF16-relative delta, not by surrogate order alone.
+
+Selection output:
+
+```bash
+PYTHONPATH=. python3 tools/select_measured_budget_swaps.py \
+  --base-assignment /home/rob/dq-runs/qwen36-35b-current-4p75-strategic-20260524T144947Z/artifacts/layer_config.json \
+  --measurement-report /home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/metrics/budget_neutral_swaps_35b_4p75_smoke_n4_s512.json \
+  --output-layer-config /home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/artifacts/layer_config_budget_swaps_smoke_n4_s512.json \
+  --output-report /home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/metrics/budget_swaps_selection_smoke_n4_s512.json
+```
+
+The smoke selector chose one non-conflicting improving swap:
+`tensor:model.layers.5.mlp.shared_expert.down_proj::paid_by::tensor:model.layers.0.linear_attn.out_proj`.
+It touches two qnames, has net bit delta `-27,525,120`, and estimated
+single-swap KL delta `-0.006797803`. The second improving row was skipped
+because it promotes the same target qname and therefore conflicts with the
+selected row.

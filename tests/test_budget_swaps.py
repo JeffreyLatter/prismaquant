@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from prismaquant.budget_swaps import build_budget_neutral_swaps
+import pytest
+
+from prismaquant.budget_swaps import (
+    build_budget_neutral_swaps,
+    select_measured_budget_swaps,
+)
 
 
 def _stats(shape=(64, 64)):
@@ -164,3 +169,63 @@ def test_budget_swap_builder_skips_unfunded_promotions():
     assert payload["promotion_candidate_count"] == 2
     assert payload["demotion_candidate_count"] == 0
     assert payload["swap_count"] == 0
+
+
+def test_select_measured_budget_swaps_keeps_improving_disjoint_rows():
+    assignment = {
+        "a": "NVFP4",
+        "b": "MXFP8_E4M3",
+        "c": "NVFP4",
+        "d": "MXFP8_E4M3",
+    }
+    rows = [
+        {
+            "key": "good-1",
+            "measured_rank": 1,
+            "swap_delta_kl_vs_bf16": -0.02,
+            "swap_kl_vs_bf16": 0.10,
+            "swap_kl_vs_base_assignment": 0.01,
+            "net_bits_delta": -8.0,
+            "override": {"a": "MXFP8_E4M3", "b": "NVFP4"},
+        },
+        {
+            "key": "conflicts-with-good-1",
+            "measured_rank": 2,
+            "swap_delta_kl_vs_bf16": -0.01,
+            "swap_kl_vs_bf16": 0.11,
+            "swap_kl_vs_base_assignment": 0.02,
+            "net_bits_delta": -4.0,
+            "override": {"a": "BF16", "c": "NVFP4"},
+        },
+        {
+            "key": "worse",
+            "measured_rank": 3,
+            "swap_delta_kl_vs_bf16": 0.01,
+            "swap_kl_vs_bf16": 0.13,
+            "swap_kl_vs_base_assignment": 0.01,
+            "net_bits_delta": -4.0,
+            "override": {"d": "NVFP4"},
+        },
+        {
+            "key": "good-2",
+            "measured_rank": 4,
+            "swap_delta_kl_vs_bf16": -0.005,
+            "swap_kl_vs_bf16": 0.12,
+            "swap_kl_vs_base_assignment": 0.01,
+            "net_bits_delta": 4.0,
+            "override": {"c": "MXFP8_E4M3"},
+        },
+    ]
+
+    result = select_measured_budget_swaps(assignment, rows)
+
+    assert result["selected_count"] == 2
+    assert result["selected_net_bits_delta"] == -4.0
+    assert result["selected_delta_kl_vs_bf16_sum"] == pytest.approx(-0.025)
+    assert result["assignment"]["a"] == "MXFP8_E4M3"
+    assert result["assignment"]["b"] == "NVFP4"
+    assert result["assignment"]["c"] == "MXFP8_E4M3"
+    assert [row["key"] for row in result["selected"]] == ["good-1", "good-2"]
+    skipped = {row["key"]: row["skip_reason"] for row in result["skipped"]}
+    assert skipped["conflicts-with-good-1"] == "conflict"
+    assert skipped["worse"] == "below_min_kl_improvement"
