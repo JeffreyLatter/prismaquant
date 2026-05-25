@@ -141,6 +141,18 @@ PY
 : "${PRODUCTION_RENDER_COST_PROMOTE_FRACTION:=0.30}"
 : "${PRODUCTION_RENDER_COST_MIN_PROMOTE_SCORE:=}"
 : "${PRODUCTION_RENDER_COST_MAX_PROMOTIONS:=}"
+# Optional post-frontier MSE promotion rewrite. This is disabled by default
+# and only promotes existing quantized assignments to a higher target format
+# (BF16 by default), so it does not require additional production-cache
+# renders. It is intended as an explicit recipe arm for testing whether local
+# output-MSE can protect structurally sensitive regions without KL replay.
+: "${MSE_PROMOTION:=0}"
+: "${MSE_PROMOTION_CATEGORIES:=linear_attn,self_attn}"
+: "${MSE_PROMOTION_TARGET_FORMAT:=BF16}"
+: "${MSE_PROMOTION_MAX_BPP_DELTA:=}"
+: "${MSE_PROMOTION_TARGET_BPP:=}"
+: "${MSE_PROMOTION_GROUP_BY:=layer_category}"
+: "${MSE_PROMOTION_METRIC:=output_mse_per_bit}"
 : "${EXPORT_GPTQ:=auto}"
 : "${EXPORT_SCALE_SWEEP:=auto}"
 : "${PIPELINE_SPEC_PATH:=${WORK_DIR}/artifacts/pipeline_spec.json}"
@@ -819,6 +831,35 @@ PY
       --output-assignment "${WORK_DIR}/artifacts/layer_config_validated_assignment.json" \
       --output-summary "${WORK_DIR}/artifacts/validated_frontier_selection.json" \
       2>&1 | tee "${WORK_DIR}/logs/validated_frontier_select.log"
+
+    if [[ "$MSE_PROMOTION" != "0" && "$MSE_PROMOTION" != "false" && "$MSE_PROMOTION" != "False" ]]; then
+      MSE_PROMOTION_ARGS=()
+      if [[ -n "$MSE_PROMOTION_TARGET_BPP" ]]; then
+        MSE_PROMOTION_ARGS+=(--target-bpp "$MSE_PROMOTION_TARGET_BPP")
+      elif [[ -n "$MSE_PROMOTION_MAX_BPP_DELTA" ]]; then
+        MSE_PROMOTION_ARGS+=(--max-bpp-delta "$MSE_PROMOTION_MAX_BPP_DELTA")
+      else
+        echo "[pipeline] ERROR: MSE_PROMOTION requires MSE_PROMOTION_TARGET_BPP or MSE_PROMOTION_MAX_BPP_DELTA" >&2
+        exit 2
+      fi
+      echo "[pipeline] applying MSE-driven promotion rewrite ..."
+      python3 tools/build_mse_promotion_assignment.py \
+        --base-assignment "${WORK_DIR}/artifacts/layer_config.json" \
+        --costs "$COST_PATH" \
+        --probe "$PROBE_PATH" \
+        --output-layer-config "${WORK_DIR}/artifacts/layer_config_mse_promoted.json" \
+        --output-report "${WORK_DIR}/artifacts/mse_promotion_report.json" \
+        --categories "$MSE_PROMOTION_CATEGORIES" \
+        --target-format "$MSE_PROMOTION_TARGET_FORMAT" \
+        --group-by "$MSE_PROMOTION_GROUP_BY" \
+        --metric "$MSE_PROMOTION_METRIC" \
+        "${MSE_PROMOTION_ARGS[@]}" \
+        2>&1 | tee "${WORK_DIR}/logs/mse_promotion.log"
+      cp "${WORK_DIR}/artifacts/layer_config.json" \
+         "${WORK_DIR}/artifacts/layer_config_before_mse_promotion.json"
+      mv "${WORK_DIR}/artifacts/layer_config_mse_promoted.json" \
+         "${WORK_DIR}/artifacts/layer_config.json"
+    fi
 
     if [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
       SELECTED_DIGEST="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'
