@@ -118,3 +118,19 @@ Top32 results:
 The top32 result supersedes the n=4 smoke for policy decisions. The smoke
 proved the measurement path; the n=8 pass says the current budget-neutral
 surrogate candidates should not be applied automatically yet.
+
+Top32 n=8 rerun:
+
+- Measurement report:
+  `/home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/metrics/budget_neutral_swaps_35b_4p75_top32_n8_s512_rerun.json`
+- Log:
+  `/home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/logs/measure_budget_neutral_swaps_top32_n8_s512_rerun.log`
+- Selector report:
+  `/home/rob/dq-runs/empirical-budget-swaps-20260525T000000Z/metrics/budget_swaps_selection_top32_n8_s512_rerun.json`
+
+The rerun matched the prior n=8 ranked deltas exactly. Base KL was
+`0.015214228`; negative-delta swaps were again `0 / 32`; the best row was again
+`tensor:model.layers.20.mlp.shared_expert.down_proj::paid_by::tensor:model.layers.0.linear_attn.out_proj`
+with delta KL `+0.001252776`, swap KL `0.016467003`, base drift
+`0.015027539`, and net bits `-27,525,120`. Selector output was again
+`selected=0`, `net_bits=0`.
