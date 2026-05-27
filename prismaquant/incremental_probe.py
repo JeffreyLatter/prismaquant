@@ -3421,46 +3421,22 @@ def main():
             h_detail_dir=args.h_detail_dir,
         )
         if not ok:
-            idx_path = Path(args.model) / "model.safetensors.index.json"
-            total_size = 0
-            if idx_path.exists():
-                try:
-                    with idx_path.open() as f:
-                        total_size = int(
-                            json.load(f).get("metadata", {}).get("total_size", 0)
-                        )
-                except Exception:
-                    total_size = 0
-            try:
-                import psutil
-                avail_bytes = int(psutil.virtual_memory().available)
-            except Exception:
-                avail_bytes = 0
-            # The fallback loads the full multimodal model. On 122B-scale
-            # checkpoints that is an OOM path, not a recovery path.
-            if total_size and avail_bytes and total_size > int(avail_bytes * 0.75):
-                print("[incremental] streaming multimodal probe failed; "
-                      "skipping monolithic whole-model fallback because "
-                      f"checkpoint total_size={total_size / (1024 ** 3):.1f} GiB "
-                      f"exceeds 75% of available RAM="
-                      f"{avail_bytes / (1024 ** 3):.1f} GiB", flush=True)
-            else:
-                print("[incremental] streaming multimodal probe failed; "
-                      "trying monolithic whole-model fallback (fits only when "
-                      "total model weights < RAM)", flush=True)
-                ok = run_multimodal_visual_probe_pass(
-                    args.model,
-                    dataset_name=args.mm_dataset,
-                    n_samples=args.mm_nsamples,
-                    max_text_len=args.mm_max_text_len,
-                    requested_device=args.device,
-                    dtype=mm_dtype,
-                    linear_include=visual_include,
-                    linear_exclude=linear_exclude,
-                    activation_cache_dir=args.activation_cache_dir,
-                    output_path=str(visual_probe_path),
-                    h_detail_dir=args.h_detail_dir,
-                )
+            print("[incremental] streaming multimodal probe failed; "
+                  "trying monolithic whole-model fallback (fits only when "
+                  "total model weights < RAM)", flush=True)
+            ok = run_multimodal_visual_probe_pass(
+                args.model,
+                dataset_name=args.mm_dataset,
+                n_samples=args.mm_nsamples,
+                max_text_len=args.mm_max_text_len,
+                requested_device=args.device,
+                dtype=mm_dtype,
+                linear_include=visual_include,
+                linear_exclude=linear_exclude,
+                activation_cache_dir=args.activation_cache_dir,
+                output_path=str(visual_probe_path),
+                h_detail_dir=args.h_detail_dir,
+            )
         if not ok:
             print("[incremental] multimodal visual probe skipped / failed; "
                   "allocator will need --visual-format for visual Linears",

@@ -42,11 +42,6 @@ Before implementing new functionality, read this file and
    The archived CLADO, propagated-cost, output-Fisher, PrismaSCOUT iteration,
    QUBO, and polish-of-many code is research context, not a production
    shipping lever.
-9. **Use the known-good Docker environments.** PrismaQuant has Docker images
-   with the required CUDA, PyTorch, Transformers, vLLM, and pipeline
-   dependencies already installed. For GPU runs, validation, export, and
-   large-model experiments, use those working containers first instead of
-   assuming the host Python environment is sufficient or rebuilding ad hoc.
 
 ## Implementation Checklist
 

@@ -36,22 +36,7 @@ def _layer_config_from_assignment(assignment: Mapping[str, str]) -> dict:
     return out
 
 
-def _log_error_values(values: Sequence[float]) -> list[float]:
-    finite_positive = [
-        float(value) for value in values
-        if math.isfinite(float(value)) and float(value) > 0.0
-    ]
-    if not finite_positive:
-        return [0.0 for _ in values]
-    floor = max(min(finite_positive) * 1.0e-6, 1.0e-300)
-    return [math.log10(max(float(value), floor)) for value in values]
-
-
-def _kneedle_convex_decreasing(
-    points: Sequence[Mapping[str, float]],
-    *,
-    log_error: bool = True,
-) -> int:
+def _kneedle_convex_decreasing(points: Sequence[Mapping[str, float]]) -> int:
     """Return knee index for points sorted by increasing bpp, decreasing KL."""
     if len(points) < 3:
         return min(
@@ -60,8 +45,6 @@ def _kneedle_convex_decreasing(
         )
     xs = [float(p["bpp"]) for p in points]
     ys = [float(p["kl"]) for p in points]
-    if log_error:
-        ys = _log_error_values(ys)
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
     if xmax == xmin or ymax == ymin:
@@ -70,30 +53,6 @@ def _kneedle_convex_decreasing(
     y_norm = [(y - ymin) / (ymax - ymin) for y in ys]
     diffs = [yn - (1.0 - xn) for xn, yn in zip(x_norm, y_norm)]
     return min(range(len(diffs)), key=lambda i: diffs[i])
-
-
-def kneedle_comparison(points: Sequence[Mapping[str, float]]) -> dict:
-    if len(points) < 3:
-        return {"enabled": False, "reason": "too_few_frontier_points"}
-
-    def _record(mode: str, idx: int) -> dict:
-        row = points[idx]
-        return {
-            "mode": mode,
-            "label": row.get("label"),
-            "bpp": float(row["bpp"]),
-            "kl": float(row["kl"]),
-            "index": int(idx),
-        }
-
-    log_idx = _kneedle_convex_decreasing(points, log_error=True)
-    raw_idx = _kneedle_convex_decreasing(points, log_error=False)
-    return {
-        "enabled": True,
-        "primary": "log_error",
-        "log_error": _record("log_error", log_idx),
-        "raw_linear": _record("raw_linear", raw_idx),
-    }
 
 
 def _row_metric(row: Mapping, metric: str) -> float | None:
@@ -375,7 +334,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         abs_eps=args.practical_abs_eps,
         kl_noise_floor=args.kl_noise_floor,
     )
-    knee_cmp = kneedle_comparison(frontier)
     loo = (
         leave_one_out_kneedle_diagnostic(
             frontier,
@@ -412,7 +370,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "selected": selected,
         "frontier": frontier,
         "practical_knee": practical,
-        "kneedle_comparison": knee_cmp,
         "leave_one_out": loo,
         "surrogate_spearman": rank_corr,
         "kl_noise_floor": float(args.kl_noise_floor),
@@ -438,15 +395,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"KL={selected['kl']:.8g}{mse_msg} mode={args.mode}",
         flush=True,
     )
-    if knee_cmp.get("enabled"):
-        log_k = knee_cmp["log_error"]
-        raw_k = knee_cmp["raw_linear"]
-        print(
-            "[frontier-select] kneedle log-error="
-            f"{log_k['label']}@{log_k['bpp']:.6f} "
-            f"raw-linear={raw_k['label']}@{raw_k['bpp']:.6f}",
-            flush=True,
-        )
     print(f"[frontier-select] layer_config -> {layer_config_path}", flush=True)
     print(f"[frontier-select] summary -> {summary_path}", flush=True)
     return 0

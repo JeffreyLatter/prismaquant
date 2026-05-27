@@ -212,7 +212,7 @@ def _run_cost_measurement(
     packed_accum: dict[str, dict] = {}
     _measure_packed_experts(
         module, target_names, specs, device, dtype, packed_accum,
-        act_cache=act_cache, h_detail=h_detail, profile=profile)
+        h_detail=h_detail, profile=profile)
     if packed_accum:
         results.update(_finalize_results(packed_accum))
         print(f"{log_prefix} measured {len(packed_accum)} packed-expert tensors",

@@ -57,7 +57,6 @@ from prismaquant.perturbed_x_cache import (
 from prismaquant.layer_state_cache import LayerHiddenStateCache
 
 KLScope = Literal["last_token", "full_sequence"]
-PairedOverrideBaselineMode = Literal["target_bf16", "assignment"]
 
 
 @dataclass(frozen=True)
@@ -3899,24 +3898,6 @@ def _normalise_override_set(
     }
 
 
-def _paired_override_baseline_lane(
-    assignment: Mapping[str, str],
-    target_names: Sequence[str],
-    mode: PairedOverrideBaselineMode,
-) -> dict[str, str]:
-    if mode == "target_bf16":
-        return {str(name): "BF16" for name in sorted(target_names)}
-    if mode == "assignment":
-        return {
-            str(name): assignment.get(str(name), "BF16")
-            for name in sorted(target_names)
-        }
-    raise ValueError(
-        "baseline_mode must be one of: target_bf16, assignment; "
-        f"got {mode!r}"
-    )
-
-
 @torch.no_grad()
 def measure_override_set_kl(
     model: nn.Module,
@@ -3935,8 +3916,6 @@ def measure_override_set_kl(
     use_cuda_graphs: bool | None = None,
     use_replay_cache: bool | None = None,
     production_weight_cache=None,
-    strict_production_weight_cache: bool = False,
-    use_frozen_perturbed_cache: bool | None = None,
     source_weight_resolver: Callable[[str, str], torch.Tensor | None] | None = None,
     candidate_cache_overrides: Sequence[Mapping[str, str]] | None = None,
 ) -> list[float]:
@@ -4009,13 +3988,10 @@ def measure_override_set_kl(
     )
     use_prequant_cache = _maybe_disable_l3_prequant_cache_for_memory(
         device, use_prequant_cache)
-    if use_frozen_perturbed_cache is None:
-        use_frozen_perturbed_cache = _env_flag_enabled(
-            "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
-            default=True,
-        )
-    else:
-        use_frozen_perturbed_cache = bool(use_frozen_perturbed_cache)
+    use_frozen_perturbed_cache = _env_flag_enabled(
+        "PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE",
+        default=True,
+    )
     use_frozen_perturbed_cache = _maybe_disable_l3_frozen_cache_for_memory(
         device, use_frozen_perturbed_cache)
     if source_weight_resolver is not None:
@@ -4155,9 +4131,6 @@ def measure_override_set_kl(
                         source_weight_resolver=source_weight_resolver,
                         production_weight_cache=production_weight_cache,
                         lane_cache_overrides=lane_cache_overrides,
-                        strict_production_weight_cache=(
-                            strict_production_weight_cache
-                        ),
                     )
                     target_hooks.install()
 
@@ -4337,9 +4310,6 @@ def measure_override_set_kl(
                             source_weight_resolver=source_weight_resolver,
                             production_weight_cache=production_weight_cache,
                             lane_cache_overrides=lane_cache_overrides,
-                            strict_production_weight_cache=(
-                                strict_production_weight_cache
-                            ),
                         )
                         target_hooks.install()
                     rep_args, rep_kwargs = _repeat_inputs_for_lanes(
@@ -4466,15 +4436,13 @@ def measure_override_paired_kl_deltas(
     production_weight_cache=None,
     strict_production_weight_cache: bool = False,
     use_frozen_context_cache: bool | None = None,
-    baseline_mode: PairedOverrideBaselineMode = "target_bf16",
 ) -> list[float]:
     """Measure paired propagated KL for multi-target override sets.
 
-    By default, each candidate override is paired with a lane where the same
-    target modules are forced to BF16 while all other modules stay at
-    ``baseline_assignment``.  With ``baseline_mode="assignment"``, each
-    candidate is instead paired against the unmodified baseline assignment for
-    the same target modules; that is the budget-neutral swap probe semantics.
+    Each candidate override is paired with a lane where the same target modules
+    are forced to BF16 while all other modules stay at ``baseline_assignment``.
+    This gives pair/block interaction probes the same baseline semantics as
+    ``measure_propagated_costs`` uses for unary L3 costs.
     """
 
     if not candidate_overrides:
@@ -4608,11 +4576,7 @@ def measure_override_paired_kl_deltas(
         paired_indices: list[tuple[int, int]] = []
         for override in chunk:
             target_names = sorted(override)
-            baseline_override = _paired_override_baseline_lane(
-                assignment_c,
-                target_names,
-                baseline_mode,
-            )
+            baseline_override = {name: "BF16" for name in target_names}
             baseline_idx = len(lane_overrides)
             lane_overrides.append(baseline_override)
             candidate_idx = len(lane_overrides)

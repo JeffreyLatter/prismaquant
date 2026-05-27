@@ -4948,7 +4948,10 @@ def materialize_tensors_streaming(
                                 nvfp4_global_real_override=per_expert_joint[orig_e],
                             )
                             for suffix, t in compressed.items():
-                                out[f"{base}.{suffix}"] = t.cpu()
+                                key = (base
+                                       if suffix == "weight"
+                                       else f"{base}.{suffix}")
+                                out[key] = t.cpu()
                 covered.add(full)
                 hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
                 del packed_param, packed_param_src, proj_split
@@ -5136,7 +5139,8 @@ def _materialize_tensors_inmemory(
                             nvfp4_global_real_override=per_expert_joint[e],
                         )
                         for suffix, tensor in compressed.items():
-                            out[f"{base}.{suffix}"] = tensor.cpu()
+                            key = base if suffix == "weight" else f"{base}.{suffix}"
+                            out[key] = tensor.cpu()
             covered.add(full_name)
             hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
 
@@ -6258,12 +6262,25 @@ def main():
     if passthrough_prefixes:
         src_extra = _load_source_passthrough(
             args.model, prefix_filters=passthrough_prefixes)
-        src_extra = _filter_source_passthrough_against_materialized(
-            src_extra,
-            mtp_tensors,
-            profile=profile,
-            seen_keys=writer.seen_keys,
-        )
+        materialized_bases: set[str] = set()
+        for k in mtp_tensors:
+            base = k
+            for suf in (".weight_packed", ".weight_scale",
+                        ".weight_global_scale", ".input_global_scale",
+                        ".weight"):
+                if k.endswith(suf):
+                    base = k[:-len(suf)] + ".weight"
+                    break
+            materialized_bases.add(base)
+            if base.endswith(".weight"):
+                parent = _per_expert_parent(base[:-len(".weight")], profile)
+                if parent is not None:
+                    materialized_bases.add(parent)
+        src_extra = {k: v for k, v in src_extra.items()
+                     if k not in materialized_bases}
+        for k in list(src_extra.keys()):
+            if k in writer.seen_keys or k in mtp_tensors:
+                del src_extra[k]
 
         # Phase 1 visual-encoder quant: when the allocator's recipe
         # assigns a non-BF16 format to a visual Linear, run its 2D
@@ -6640,54 +6657,6 @@ def _load_source_passthrough(src_model: str,
                 if any(k.startswith(p) for p in prefix_filters):
                     out[k] = sf.get_tensor(k)
     return out
-
-
-def _filter_source_passthrough_against_materialized(
-    src_extra: dict[str, torch.Tensor],
-    materialized: dict[str, torch.Tensor],
-    *,
-    profile,
-    seen_keys: set[str] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Drop source passthrough tensors already represented by materialized output.
-
-    MTP is synthesized separately from raw `mtp.*` source tensors. For BF16
-    packed MTP experts, the synthesized form is the vLLM-loader aggregate
-    tensor (`...experts.gate_up_proj` / `...experts.down_proj`), while the
-    source checkpoint stores per-expert children
-    (`...experts.0.gate_proj.weight`, etc.). Those children must not be copied
-    too: vLLM loads the aggregate and then warns on the duplicate children.
-    """
-    materialized_bases: set[str] = set()
-    for key in materialized:
-        base = key
-        for suffix in (".weight_packed", ".weight_scale",
-                       ".weight_global_scale", ".input_global_scale",
-                       ".weight"):
-            if key.endswith(suffix):
-                base = key[:-len(suffix)] + ".weight"
-                break
-        materialized_bases.add(base)
-        if base.endswith(".weight"):
-            parent = _per_expert_parent(base[:-len(".weight")], profile)
-            if parent is not None:
-                materialized_bases.add(parent)
-
-    seen_keys = seen_keys or set()
-
-    def _covered_by_materialized_source_form(key: str) -> bool:
-        if key in materialized or key in materialized_bases or key in seen_keys:
-            return True
-        if key.endswith(".weight"):
-            parent = _per_expert_parent(key[:-len(".weight")], profile)
-            if parent is not None and parent in materialized_bases:
-                return True
-        return False
-
-    return {
-        key: value for key, value in src_extra.items()
-        if not _covered_by_materialized_source_form(key)
-    }
 
 
 _VISUAL_KEY_RE = re.compile(r"^(?:model\.)?visual\.")

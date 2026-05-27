@@ -78,7 +78,6 @@ import argparse
 import csv
 import hashlib
 import json
-import math
 import pickle
 import re
 from collections import defaultdict
@@ -118,7 +117,7 @@ from .schemas import validate_cost_payload, validate_probe_payload
 # ---------------------------------------------------------------------------
 # Kneedle knee detection
 # ---------------------------------------------------------------------------
-def _kneedle_convex_decreasing(x: list[float], y: list[float]) -> int:
+def kneedle(x: list[float], y: list[float]) -> int:
     """Return index of the knee in a convex-decreasing curve."""
     if len(x) < 3:
         return 0
@@ -135,66 +134,6 @@ def _kneedle_convex_decreasing(x: list[float], y: list[float]) -> int:
     diffs = [yn - (1.0 - xn) for xn, yn in zip(x_norm, y_norm)]
     # Convex-decreasing, so we want the most-negative diff (max dip).
     return min(range(len(diffs)), key=lambda i: diffs[i])
-
-
-def _log_error_values(y: list[float]) -> list[float]:
-    finite_positive = [
-        float(v) for v in y
-        if math.isfinite(float(v)) and float(v) > 0.0
-    ]
-    if not finite_positive:
-        return [0.0 for _ in y]
-    floor = max(min(finite_positive) * 1.0e-6, 1.0e-300)
-    return [math.log10(max(float(v), floor)) for v in y]
-
-
-def kneedle_raw_linear(x: list[float], y: list[float]) -> int:
-    """Return the historical raw-error Kneedle index."""
-    return _kneedle_convex_decreasing(x, y)
-
-
-def kneedle_log_error(x: list[float], y: list[float]) -> int:
-    """Return the primary Kneedle index on log10(error)."""
-    return _kneedle_convex_decreasing(x, _log_error_values(y))
-
-
-def kneedle(x: list[float], y: list[float]) -> int:
-    """Return the default allocator knee index.
-
-    The allocator's Δloss can span orders of magnitude. Running Kneedle
-    on raw error lets the largest point dominate the normalized curve and
-    tends to pick the first large absolute drop. The default therefore
-    runs on log-error; `kneedle_raw_linear` remains available for
-    diagnostics and backwards comparisons.
-    """
-    return kneedle_log_error(x, y)
-
-
-def _pareto_knee_summary(curve: list[dict]) -> dict:
-    feasible = [row for row in curve if row.get("feasible")]
-    if len(feasible) < 3:
-        return {"enabled": False, "reason": "too_few_feasible_points"}
-    xs = [float(r["achieved_bits"]) for r in feasible]
-    ys = [float(r["predicted_dloss"]) for r in feasible]
-
-    def _record(mode: str, idx: int) -> dict:
-        row = feasible[idx]
-        return {
-            "mode": mode,
-            "target_bits": float(row["target_bits"]),
-            "achieved_bits": float(row["achieved_bits"]),
-            "predicted_dloss": float(row["predicted_dloss"]),
-            "index": int(idx),
-        }
-
-    raw_idx = kneedle_raw_linear(xs, ys)
-    log_idx = kneedle_log_error(xs, ys)
-    return {
-        "enabled": True,
-        "primary": "log_error",
-        "log_error": _record("log_error", log_idx),
-        "raw_linear": _record("raw_linear", raw_idx),
-    }
 
 
 
@@ -298,22 +237,9 @@ def apply_mtp_format_override(
     return out
 
 
-def _is_mtp_linear(name: str) -> bool:
-    """True when `name` refers to an MTP Linear-like quantization target."""
-    return str(name).startswith("mtp.")
-
-
-def _find_candidate_for_format(
-    candidates: dict[str, list[Candidate]],
-    name: str,
-    fmt: str,
-) -> Candidate | None:
-    """Return the scored candidate for `name` at canonical format `fmt`."""
-    canonical = fr.get_format(fmt).name
-    for cand in candidates.get(name, []):
-        if fr.get_format(cand.fmt).name == canonical:
-            return cand
-    return None
+def _is_forced_mtp_passthrough(name: str, mtp_format: str) -> bool:
+    """True when MTP is explicitly kept outside the optimized budget."""
+    return str(name).startswith("mtp.") and fr.canonical_format_name(mtp_format) == "BF16"
 
 
 def discover_visual_linears_from_source(model_path: str) -> list[str]:
@@ -594,21 +520,24 @@ def main():
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
 
+    forced_passthrough_assignment: dict[str, str] = {}
     allocation_excluded = []
     for name in sorted(set(stats) | set(costs)):
         if model_profile.is_pinned_name(name):
+            allocation_excluded.append(name)
+        elif _is_forced_mtp_passthrough(name, args.mtp_format):
+            forced_passthrough_assignment[name] = args.mtp_format
             allocation_excluded.append(name)
     if allocation_excluded:
         excluded = set(allocation_excluded)
         stats = {name: value for name, value in stats.items() if name not in excluded}
         costs = {name: value for name, value in costs.items() if name not in excluded}
         print(
-            "[alloc] profile-pinned names excluded from DP budget: "
+            "[alloc] forced passthrough excluded from DP budget: "
             f"{len(allocation_excluded)} Linears "
             f"(sample: {allocation_excluded[:8]})",
             flush=True,
         )
-    accounting_stats = dict(stats)
 
     propagated_sensitivity_summary: dict | None = None
     if args.propagated_sensitivity_report:
@@ -673,14 +602,8 @@ def main():
             raise SystemExit(f"[alloc] ERROR: {msg}")
         else:
             print(f"[alloc] WARNING: {msg}", flush=True)
-    mtp_format_canonical = fr.get_format(args.mtp_format).name
-    visual_format_canonical = fr.get_format(args.visual_format).name
-    rank_specs = {s.name: s for s in specs_sorted}
-    rank_specs.setdefault(mtp_format_canonical, fr.get_format(mtp_format_canonical))
-    rank_specs.setdefault(visual_format_canonical, fr.get_format(visual_format_canonical))
-    rank_specs_sorted = sorted(rank_specs.values(), key=lambda s: s.effective_bits)
-    format_rank = {s.name: i for i, s in enumerate(rank_specs_sorted)}
-    format_specs = {s.name: s for s in rank_specs_sorted}
+    format_rank = {s.name: i for i, s in enumerate(specs_sorted)}
+    format_specs = {s.name: s for s in specs}
     print(f"[alloc] formats (low→high bits): "
           f"{[f'{s.name}({s.effective_bits:.2f}b)' for s in specs_sorted]}")
 
@@ -727,6 +650,12 @@ def main():
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
+    applicability_report_path = (
+        Path(args.applicability_report)
+        if args.applicability_report
+        else Path(args.pareto_csv).with_name("format_applicability.json")
+    )
+    applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
     pre_aggregation_availability = {
         spec.name: sum(
             1 for per_name in candidates.values()
@@ -734,114 +663,6 @@ def main():
         )
         for spec in specs_sorted
     }
-
-    fixed_format_assignment: dict[str, str] = {}
-    fixed_stats: dict[str, dict] = {}
-    fixed_chosen_candidates: dict[str, Candidate] = {}
-    mtp_names_without_costs = sorted(
-        n for n in stats if _is_mtp_linear(n) and n not in costs
-    )
-    if mtp_names_without_costs and mtp_format_canonical != "BF16":
-        sample = ", ".join(mtp_names_without_costs[:8])
-        raise SystemExit(
-            f"[alloc] --mtp-format={mtp_format_canonical} was requested, "
-            f"but the cost pickle lacks {len(mtp_names_without_costs)} MTP "
-            f"Linear(s). Sample: {sample}. Re-run cost measurement with "
-            "--include-mtp."
-        )
-    if mtp_names_without_costs:
-        print(
-            "[alloc] WARNING: probe has MTP Linears absent from the cost "
-            f"pickle; leaving {len(mtp_names_without_costs)} MTP Linears "
-            "out of allocator accounting. Re-run cost measurement with "
-            "--include-mtp to budget them explicitly.",
-            flush=True,
-        )
-    mtp_names = sorted(n for n in stats if _is_mtp_linear(n) and n in costs)
-    if mtp_names:
-        mtp_stats = {name: stats[name] for name in mtp_names}
-        mtp_costs = {name: costs[name] for name in mtp_names}
-        mtp_candidates = build_candidates(
-            mtp_stats,
-            mtp_costs,
-            [fr.get_format(mtp_format_canonical)],
-            calibrated_gains,
-            source_manifest=source_manifest,
-            target_profile=target_profile,
-            mask_records=candidate_mask_records,
-        )
-        missing_mtp_candidates = [
-            name for name in mtp_names
-            if _find_candidate_for_format(
-                mtp_candidates,
-                name,
-                mtp_format_canonical,
-            ) is None
-        ]
-        if missing_mtp_candidates:
-            sample = ", ".join(missing_mtp_candidates[:8])
-            raise SystemExit(
-                f"[alloc] --mtp-format={mtp_format_canonical} requires "
-                "measured, serveable MTP cost candidates, but "
-                f"{len(missing_mtp_candidates)} MTP Linear(s) are missing "
-                f"that candidate. Sample: {sample}. Re-run cost measurement "
-                "with --include-mtp for the requested MTP format."
-            )
-        fixed_format_assignment = {
-            name: mtp_format_canonical for name in mtp_names
-        }
-        fixed_stats = {name: stats[name] for name in mtp_names}
-        fixed_chosen_candidates = {
-            name: _find_candidate_for_format(
-                mtp_candidates,
-                name,
-                mtp_format_canonical,
-            )
-            for name in mtp_names
-        }
-        fixed_chosen_candidates = {
-            name: cand for name, cand in fixed_chosen_candidates.items()
-            if cand is not None
-        }
-        if fixed_format_assignment:
-            fixed_names = set(fixed_format_assignment)
-            stats = {
-                name: value for name, value in stats.items()
-                if name not in fixed_names
-            }
-            costs = {
-                name: value for name, value in costs.items()
-                if name not in fixed_names
-            }
-            candidates = {
-                name: value for name, value in candidates.items()
-                if name not in fixed_names
-            }
-            print(
-                f"[alloc] --mtp-format={mtp_format_canonical}: fixed "
-                f"{len(fixed_format_assignment)} MTP Linears before DP "
-                "and included them in bpp/Δloss accounting",
-                flush=True,
-            )
-
-    fixed_total_params = sum(
-        int(entry.get("n_params", 0) or 0) for entry in fixed_stats.values()
-    )
-    fixed_total_bits = sum(
-        8.0 * float(cand.memory_bytes)
-        for cand in fixed_chosen_candidates.values()
-    )
-    fixed_total_dloss = sum(
-        float(cand.predicted_dloss)
-        for cand in fixed_chosen_candidates.values()
-    )
-
-    applicability_report_path = (
-        Path(args.applicability_report)
-        if args.applicability_report
-        else Path(args.pareto_csv).with_name("format_applicability.json")
-    )
-    applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Pre-aggregate fused siblings (qkv_proj, gate_up_proj, ...) into
     # single DP items. The DP can't pick mixed-sibling solutions because
@@ -866,18 +687,6 @@ def main():
         )
         for spec in specs_sorted
     }
-    mutable_total_params = sum(
-        int(stats[n].get("n_params", 0) or 0) for n in candidates
-    )
-    allocation_total_params = mutable_total_params + fixed_total_params
-    if fixed_total_params:
-        fixed_bpp = fixed_total_bits / max(fixed_total_params, 1)
-        print(
-            "[alloc] fixed-format contribution: "
-            f"{fixed_total_params:,} params, {fixed_bpp:.4f} bpp, "
-            f"Δloss={fixed_total_dloss:.4e}",
-            flush=True,
-        )
     applicability_payload = {
         "schema": "prismaquant.format_applicability.v1",
         "target_profile": target_profile,
@@ -888,13 +697,6 @@ def main():
         "propagated_sensitivity_costs": propagated_sensitivity_summary,
         "pre_aggregation_candidate_availability": pre_aggregation_availability,
         "post_aggregation_candidate_availability": post_aggregation_availability,
-        "fixed_format_assignment": {
-            "mtp_format": mtp_format_canonical,
-            "linears": len(fixed_format_assignment),
-            "params": fixed_total_params,
-            "bits_total": fixed_total_bits,
-            "predicted_dloss": fixed_total_dloss,
-        },
         **summarize_applicability_masks(candidate_mask_records),
     }
     applicability_report_path.write_text(
@@ -902,57 +704,10 @@ def main():
     )
     print(f"[alloc] format applicability → {applicability_report_path}")
 
-    def _mutable_target_for_total_budget(target_bits: float) -> float:
-        if fixed_total_params <= 0:
-            return target_bits
-        if mutable_total_params <= 0:
-            return float("nan")
-        target_total_bits = float(target_bits) * allocation_total_params
-        return (target_total_bits - fixed_total_bits) / mutable_total_params
-
-    def _combine_with_fixed_metrics(
-        mutable_achieved_bits: float,
-        mutable_predicted_dloss: float,
-    ) -> tuple[float, float]:
-        if fixed_total_params <= 0:
-            return mutable_achieved_bits, mutable_predicted_dloss
-        mutable_total_bits = float(mutable_achieved_bits) * mutable_total_params
-        achieved_bits = (
-            mutable_total_bits + fixed_total_bits
-        ) / max(allocation_total_params, 1)
-        return achieved_bits, mutable_predicted_dloss + fixed_total_dloss
-
-    def _assignment_with_fixed(assignment: dict[str, str]) -> dict[str, str]:
-        out = dict(assignment)
-        out.update(fixed_format_assignment)
-        return out
-
-    def _stats_entry_for_assignment_name(name: str) -> dict | None:
-        entry = stats.get(name)
-        if isinstance(entry, dict):
-            return entry
-        fixed_entry = fixed_stats.get(name)
-        if isinstance(fixed_entry, dict):
-            return fixed_entry
-        original_entry = accounting_stats.get(name)
-        if isinstance(original_entry, dict):
-            return original_entry
-        return None
-
     def _solve_for_target(target_bits: float):
         """Solve the DP at one target bit budget."""
-        mutable_target_bits = _mutable_target_for_total_budget(target_bits)
-        if math.isnan(mutable_target_bits):
-            if fixed_total_params <= 0:
-                return None, float("nan"), float("inf")
-            fixed_bpp = fixed_total_bits / max(fixed_total_params, 1)
-            if fixed_bpp <= target_bits + args.overshoot_tolerance:
-                return {}, fixed_bpp, fixed_total_dloss
-            return None, float("nan"), float("inf")
-        if mutable_target_bits < 0.0:
-            return None, float("nan"), float("inf")
         assign, achieved_r = solve_with_promotion(
-            stats, candidates, mutable_target_bits, format_specs, format_rank,
+            stats, candidates, target_bits, format_specs, format_rank,
             args.bit_precision,
             no_fused_promote=args.no_fused_promote,
             overshoot_tolerance=args.overshoot_tolerance,
@@ -961,7 +716,6 @@ def main():
         if assign is None:
             return None, float("nan"), float("inf")
         total = compute_assignment_predicted_dloss(assign, candidates)
-        achieved_r, total = _combine_with_fixed_metrics(achieved_r, total)
         return assign, achieved_r, total
 
     def _expand_assignment_for_seed_json(
@@ -978,13 +732,13 @@ def main():
         expanded = dict(assignment)
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
-        expanded.update(fixed_format_assignment)
+        expanded.update(forced_passthrough_assignment)
         return promote_moe_pair(expanded, format_rank, profile=model_profile)
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
         total = 0.0
         for name, fmt in assignment.items():
-            entry = _stats_entry_for_assignment_name(name)
+            entry = stats.get(name)
             if not isinstance(entry, dict):
                 continue
             shape = _shape_from_stats(entry)
@@ -1003,12 +757,9 @@ def main():
             continue
         format_counts = defaultdict(int)
         format_params = defaultdict(int)
-        row_assignment = _assignment_with_fixed(assign)
-        for name, fmt in row_assignment.items():
+        for name, fmt in assign.items():
             format_counts[fmt] += 1
-            entry = _stats_entry_for_assignment_name(name)
-            if isinstance(entry, dict):
-                format_params[fmt] += int(entry.get("n_params", 0) or 0)
+            format_params[fmt] += stats[name]["n_params"]
         curve.append({
             "target_bits": t,
             "feasible": True,
@@ -1019,6 +770,11 @@ def main():
         })
         if args.pareto_output_dir:
             expanded = _expand_assignment_for_seed_json(assign)
+            if any(name.startswith("mtp.") for name in expanded):
+                expanded = apply_mtp_format_override(
+                    expanded,
+                    args.mtp_format,
+                )
             expanded_counts = defaultdict(int)
             for fmt in expanded.values():
                 expanded_counts[fmt] += 1
@@ -1039,10 +795,6 @@ def main():
         for row in curve:
             w.writerow(row)
     print(f"[alloc] Pareto curve → {args.pareto_csv}")
-    knee_summary = _pareto_knee_summary(curve)
-    knee_path = Path(args.pareto_csv).with_suffix(".knees.json")
-    knee_path.write_text(json.dumps(knee_summary, indent=2, sort_keys=True) + "\n")
-    print(f"[alloc] Pareto knees → {knee_path}")
 
     if args.pareto_output_dir:
         out_dir = Path(args.pareto_output_dir)
@@ -1089,7 +841,6 @@ def main():
             "propagated_sensitivity_costs": propagated_sensitivity_summary,
             "formats": [s.name for s in specs_sorted],
             "target_bits": [float(x) for x in targets],
-            "knees": knee_summary,
             "candidates": manifest_rows,
         }, indent=2, sort_keys=True) + "\n")
         print(
@@ -1099,16 +850,14 @@ def main():
         )
 
     # Kneedle
-    if knee_summary.get("enabled"):
-        knee = knee_summary["log_error"]
-        raw = knee_summary["raw_linear"]
-        print(f"[alloc] suggested knee (log-error): "
-              f"target={knee['target_bits']}, "
+    feasible = [row for row in curve if row.get("feasible")]
+    if len(feasible) >= 3:
+        kidx = kneedle([r["achieved_bits"] for r in feasible],
+                       [r["predicted_dloss"] for r in feasible])
+        knee = feasible[kidx]
+        print(f"[alloc] suggested knee: target={knee['target_bits']}, "
               f"achieved={knee['achieved_bits']:.3f}, "
               f"Δloss={knee['predicted_dloss']:.3e}")
-        print(f"[alloc] raw-linear knee: target={raw['target_bits']}, "
-              f"achieved={raw['achieved_bits']:.3f}, "
-              f"Δloss={raw['predicted_dloss']:.3e}")
 
     # Print table
     print("\n  target  achieved     Δloss (pred)   " + "   ".join(
@@ -1141,7 +890,7 @@ def main():
         assignment_expanded = expand_fused_sibling_assignment(
             assignment_expanded, stats)
 
-    assignment_expanded.update(fixed_format_assignment)
+    assignment_expanded.update(forced_passthrough_assignment)
 
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. This keeps per-Linear assignments serveable without
@@ -1220,20 +969,12 @@ def main():
 
     mtp_count = sum(1 for n in assignment_expanded if n.startswith("mtp."))
     if mtp_count:
-        mtp_fmts = {
-            assignment_expanded[n]
-            for n in assignment_expanded
-            if n.startswith("mtp.")
-        }
-        expected_mtp_fmts = {mtp_format_canonical}
-        if mtp_fmts != expected_mtp_fmts:
-            raise AssertionError(
-                f"MTP assignment drifted after fixed-format accounting: "
-                f"expected {sorted(expected_mtp_fmts)}, got "
-                f"{sorted(mtp_fmts)}"
-            )
+        assignment_expanded = apply_mtp_format_override(
+            assignment_expanded,
+            args.mtp_format,
+        )
         print(
-            f"[alloc] --mtp-format={mtp_format_canonical}: assigned "
+            f"[alloc] --mtp-format={args.mtp_format}: assigned "
             f"{mtp_count} MTP Linears uniformly",
             flush=True,
         )
@@ -1290,7 +1031,7 @@ def main():
         json.dump(layer_cfg, f, indent=2)
 
     counts = defaultdict(int)
-    for fmt in assignment_expanded.values():
+    for fmt in assignment.values():
         counts[fmt] += 1
     print(f"\n[alloc] target={args.target_bits} achieved={achieved:.3f}")
     for fmt, n in sorted(counts.items(), key=lambda kv: -kv[1]):
