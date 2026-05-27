@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import pickle
 import subprocess
@@ -112,3 +113,89 @@ def test_allocator_exports_expanded_pareto_seed_assignments(tmp_path):
         assert len(gate_up_formats) == 1
 
     assert saw_mxfp8
+
+
+def test_allocator_accounts_for_fixed_quantized_mtp_before_dp(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({
+        "model_type": "qwen3",
+        "architectures": ["Qwen3ForCausalLM"],
+    }))
+
+    names = [
+        "model.layers.0.mlp.down_proj",
+        "mtp.layers.0.mlp.down_proj",
+    ]
+    stats = {
+        name: {
+            "h_trace": 1.0,
+            "n_params": 128 * 128,
+            "in_features": 128,
+            "out_features": 128,
+        }
+        for name in names
+    }
+    costs = {
+        "model.layers.0.mlp.down_proj": {
+            "NVFP4": {"predicted_dloss": 100.0},
+            "BF16": {"predicted_dloss": 0.0},
+        },
+        "mtp.layers.0.mlp.down_proj": {
+            "NVFP4": {"predicted_dloss": 7.0},
+            "BF16": {"predicted_dloss": 0.0},
+        },
+    }
+
+    probe_path = tmp_path / "probe.pkl"
+    cost_path = tmp_path / "cost.pkl"
+    with open(probe_path, "wb") as f:
+        pickle.dump({"stats": stats, "meta": {"model": str(model_dir)}}, f)
+    with open(cost_path, "wb") as f:
+        pickle.dump({"costs": costs, "formats": ["NVFP4", "BF16"]}, f)
+
+    pareto_path = tmp_path / "pareto.csv"
+    layer_config_path = tmp_path / "layer_config.json"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.allocator",
+            "--probe",
+            str(probe_path),
+            "--costs",
+            str(cost_path),
+            "--model-override",
+            str(model_dir),
+            "--target-profile",
+            "research",
+            "--formats",
+            "NVFP4,BF16",
+            "--mtp-format",
+            "NVFP4",
+            "--target-bits",
+            "10.5",
+            "--pareto-targets",
+            "10.5",
+            "--bit-precision",
+            "0.1",
+            "--layer-config",
+            str(layer_config_path),
+            "--pareto-csv",
+            str(pareto_path),
+        ],
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    with open(pareto_path, newline="") as f:
+        row = next(csv.DictReader(f))
+
+    assert row["feasible"] == "True"
+    assert float(row["achieved_bits"]) == 10.25
+    assert float(row["predicted_dloss"]) == 7.0
+    assert int(row["layers_NVFP4"]) == 1
+    assert int(row["layers_BF16"]) == 1
+
+    layer_config = json.loads(layer_config_path.read_text())
+    assert layer_config["mtp.layers.0.mlp.down_proj"]["data_type"] == "nv_fp"

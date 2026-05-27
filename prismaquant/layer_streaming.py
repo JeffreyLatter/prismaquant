@@ -32,6 +32,7 @@ except ModuleNotFoundError:
         device,
         *,
         value: torch.Tensor | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         if "." in tensor_name:
             parent_name, attr = tensor_name.rsplit(".", 1)
@@ -51,6 +52,8 @@ except ModuleNotFoundError:
                 )
             else:
                 target = value if value.device == target_device else value.to(target_device)
+                if dtype is not None and target.is_floating_point():
+                    target = target.to(dtype)
             parent._parameters[attr] = nn.Parameter(
                 target,
                 requires_grad=bool(getattr(old, "requires_grad", False)),
@@ -68,6 +71,8 @@ except ModuleNotFoundError:
                 )
             else:
                 target = value if value.device == target_device else value.to(target_device)
+                if dtype is not None and target.is_floating_point():
+                    target = target.to(dtype)
             parent._buffers[attr] = target
             return
         raise AttributeError(f"{tensor_name!r} is not a parameter or buffer")
@@ -411,7 +416,9 @@ def _materialize(model: nn.Module, prefixes: list[str],
         _apply_fp8_dequant_inplace(out, fp8_scale_inv_map, device)
     loaded = 0
     for model_name, t in out.items():
-        set_module_tensor_to_device(model, model_name, device, value=t)
+        install_dtype = t.dtype if t.is_floating_point() else None
+        set_module_tensor_to_device(
+            model, model_name, device, value=t, dtype=install_dtype)
         loaded += 1
     return loaded
 
@@ -474,7 +481,9 @@ def _install_cached_tensors(model: nn.Module,
                             device: torch.device):
     """Install cached layer tensors into the model on `device`."""
     for model_name, t in cached_tensors.items():
-        set_module_tensor_to_device(model, model_name, device, value=t)
+        install_dtype = t.dtype if t.is_floating_point() else None
+        set_module_tensor_to_device(
+            model, model_name, device, value=t, dtype=install_dtype)
 
 
 def _build_install_resolver(model: nn.Module,
@@ -530,7 +539,9 @@ def _fast_install(resolver: dict[str, tuple],
             # happen in practice; if we see it, the resolver-build logic
             # missed a branch of the module tree.
             if model is not None:
-                set_module_tensor_to_device(model, model_name, device, value=t)
+                install_dtype = t.dtype if t.is_floating_point() else None
+                set_module_tensor_to_device(
+                    model, model_name, device, value=t, dtype=install_dtype)
             continue
         parent, attr, is_buffer = slot
         target = t if t.device == device else t.to(device, non_blocking=True)

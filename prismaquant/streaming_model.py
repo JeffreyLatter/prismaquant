@@ -730,7 +730,14 @@ def _build_streaming_context(model_path: str, *,
             print(f"{log_prefix} materializing visual tower: "
                   f"{len(tensors)}/{len(vis_keys)} tensors -> {device}", flush=True)
             for model_name, t in tensors.items():
-                set_module_tensor_to_device(model, model_name, device, value=t)
+                install_dtype = t.dtype if t.is_floating_point() else None
+                set_module_tensor_to_device(
+                    model, model_name, device, value=t, dtype=install_dtype)
+            # Some visual towers carry non-checkpoint buffers initialized by
+            # the module constructor. Keep them colocated with checkpoint
+            # tensors before the multimodal streaming probe calls visual
+            # helpers such as get_image_features.
+            visual_module.to(device=device, dtype=dtype)
             if visual_requires_grad:
                 # Enable grad on every Linear's weight + bias so backward
                 # hooks fire on the reverse sweep. Embeddings and norms

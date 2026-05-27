@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import prismaquant.export_native_compressed as enc
 
 from prismaquant.allocator import promote_fused
@@ -332,6 +333,60 @@ class TestGroupedExportQuantization(unittest.TestCase):
             _quantize_2d(weights[0], "NVINT2")
         with self.assertRaises(ValueError):
             _quantize_2d_group_same_shape(weights, "INT3")
+
+
+class _TinyQwenPackedExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(torch.randn(2, 128, 32))
+        self.down_proj = nn.Parameter(torch.randn(2, 32, 64))
+
+
+class TestPackedExpertExport(unittest.TestCase):
+    def test_mxfp8_split_experts_emit_weight_suffix_for_vllm_loader(self):
+        """Qwen3.5's split expert loader matches
+        `experts.<id>.<proj>.weight`; without the `.weight` suffix raw
+        MXFP8 expert weights fall through to the generic loader and are
+        skipped with "not found in params_dict" warnings.
+        """
+
+        root = nn.Module()
+        root.model = nn.Module()
+        root.model.language_model = nn.Module()
+        layer = nn.Module()
+        layer.mlp = nn.Module()
+        layer.mlp.experts = _TinyQwenPackedExperts()
+        root.model.language_model.layers = nn.ModuleList([layer])
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "MXFP8_E4M3",
+            "model.layers.0.mlp.experts.down_proj": "MXFP8_E4M3",
+        }
+
+        tensors, hist = enc._materialize_tensors_inmemory(
+            root,
+            assignment,
+            bf16_passthrough=set(),
+            profile=Qwen3_5Profile(),
+        )
+
+        prefix = "model.language_model.layers.0.mlp.experts"
+        expected = {
+            f"{prefix}.0.gate_proj.weight",
+            f"{prefix}.0.gate_proj.weight_scale",
+            f"{prefix}.0.up_proj.weight",
+            f"{prefix}.0.up_proj.weight_scale",
+            f"{prefix}.0.down_proj.weight",
+            f"{prefix}.0.down_proj.weight_scale",
+        }
+        self.assertTrue(expected.issubset(tensors.keys()))
+        self.assertNotIn(f"{prefix}.0.gate_proj", tensors)
+        self.assertNotIn(f"{prefix}.0.up_proj", tensors)
+        self.assertNotIn(f"{prefix}.0.down_proj", tensors)
+        self.assertEqual(
+            hist.get(("packed_moe_per_expert", "MXFP8_E4M3")),
+            2,
+        )
 
 
 def _nvfp4_dequantize(weight_packed, weight_scale_fp8, weight_global_scale_divisor):

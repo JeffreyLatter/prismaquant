@@ -4948,10 +4948,7 @@ def materialize_tensors_streaming(
                                 nvfp4_global_real_override=per_expert_joint[orig_e],
                             )
                             for suffix, t in compressed.items():
-                                key = (base
-                                       if suffix == "weight"
-                                       else f"{base}.{suffix}")
-                                out[key] = t.cpu()
+                                out[f"{base}.{suffix}"] = t.cpu()
                 covered.add(full)
                 hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
                 del packed_param, packed_param_src, proj_split
@@ -5139,8 +5136,7 @@ def _materialize_tensors_inmemory(
                             nvfp4_global_real_override=per_expert_joint[e],
                         )
                         for suffix, tensor in compressed.items():
-                            key = base if suffix == "weight" else f"{base}.{suffix}"
-                            out[key] = tensor.cpu()
+                            out[f"{base}.{suffix}"] = tensor.cpu()
             covered.add(full_name)
             hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
 
