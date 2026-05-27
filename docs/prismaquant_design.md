@@ -831,20 +831,18 @@ is a localised refactor.
 
 ### 10.3 MTP budgeting
 
-The older MTP policy treated MTP as "forced passthrough" at BF16 — excluded
-from the allocator's bpp/Δloss accounting entirely. The allocator now
-removes that trick:
-MTP Linears are budgeted explicitly, but **only when measured
-cost candidates exist** for them at the requested MTP format.
-Otherwise the allocator hard-fails with a clear error message
-asking the user to re-run cost measurement with `--include-mtp`.
+MTP and visual Linears are auxiliary serving decisions, not part of the
+language-model bit budget. The allocator stamps them into the exported
+`layer_config` through `--mtp-format` and `--visual-format`, but the default
+Pareto frontier, kneedle, bpp, and predicted Δloss report only the body
+Linears that are actually competing for the budget.
 
-This is a textbook example of **fail fast over silent fallback**.
-The previous behaviour silently produced an artifact whose true
-bpp was higher than the user-supplied target because MTP was
-off-the-books. The current allocator makes MTP a first-class budget citizen,
-which both improves report accuracy and exposes a class of bugs
-where a user expects an MTP format that they never measured.
+When MTP is explicitly quantized, measured candidates are still required so
+the run can record auxiliary Δloss and catch unsupported serving formats
+early. Those auxiliary numbers are written beside the Pareto rows as
+`aux_fixed_*` and `total_*_with_aux` fields, but they do not move the body
+kneedle or consume the target bpp. This keeps MTP/speculative-decode speed
+and quality decisions independent from the core language-model allocation.
 
 ---
 

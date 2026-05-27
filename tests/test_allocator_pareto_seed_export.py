@@ -115,7 +115,7 @@ def test_allocator_exports_expanded_pareto_seed_assignments(tmp_path):
     assert saw_mxfp8
 
 
-def test_allocator_accounts_for_fixed_quantized_mtp_before_dp(tmp_path):
+def test_allocator_excludes_fixed_quantized_mtp_from_body_budget(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({
@@ -192,10 +192,12 @@ def test_allocator_accounts_for_fixed_quantized_mtp_before_dp(tmp_path):
         row = next(csv.DictReader(f))
 
     assert row["feasible"] == "True"
-    assert float(row["achieved_bits"]) == 10.25
-    assert float(row["predicted_dloss"]) == 7.0
+    assert float(row["achieved_bits"]) == 4.5
+    assert float(row["predicted_dloss"]) == 100.0
+    assert float(row["aux_fixed_predicted_dloss"]) == 7.0
+    assert float(row["total_predicted_dloss_with_aux"]) == 107.0
     assert int(row["layers_NVFP4"]) == 1
-    assert int(row["layers_BF16"]) == 1
+    assert int(row.get("layers_BF16") or 0) == 0
 
     layer_config = json.loads(layer_config_path.read_text())
     assert layer_config["mtp.layers.0.mlp.down_proj"]["data_type"] == "nv_fp"

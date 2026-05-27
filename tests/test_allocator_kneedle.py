@@ -45,7 +45,7 @@ def test_allocator_pareto_knee_summary_reports_both_modes():
     assert summary["log_error"]["kneedle_error_source"] == "predicted_dloss"
 
 
-def test_allocator_pareto_knee_summary_uses_variable_loss_with_fixed_costs():
+def test_allocator_pareto_knee_summary_uses_body_loss_with_auxiliary_costs():
     achieved = [
         4.501,
         4.550,
@@ -83,9 +83,10 @@ def test_allocator_pareto_knee_summary_uses_variable_loss_with_fixed_costs():
         {
             "target_bits": x,
             "achieved_bits": x,
-            "predicted_dloss": y + fixed_dloss,
+            "predicted_dloss": y,
             "variable_predicted_dloss": y,
-            "fixed_predicted_dloss": fixed_dloss,
+            "aux_fixed_predicted_dloss": fixed_dloss,
+            "total_predicted_dloss_with_aux": y + fixed_dloss,
             "feasible": True,
         }
         for x, y in zip(achieved, variable_dloss)
@@ -95,5 +96,6 @@ def test_allocator_pareto_knee_summary_uses_variable_loss_with_fixed_costs():
 
     assert summary["log_error"]["achieved_bits"] == pytest.approx(4.976)
     assert summary["log_error"]["kneedle_dloss"] == pytest.approx(1.12)
-    assert summary["log_error"]["predicted_dloss"] == pytest.approx(859.12)
-    assert summary["log_error"]["kneedle_error_source"] == "variable_predicted_dloss"
+    assert summary["log_error"]["predicted_dloss"] == pytest.approx(1.12)
+    assert summary["log_error"]["total_predicted_dloss_with_aux"] == pytest.approx(859.12)
+    assert summary["log_error"]["kneedle_error_source"] == "predicted_dloss"

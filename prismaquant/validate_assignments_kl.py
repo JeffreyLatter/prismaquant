@@ -94,8 +94,6 @@ def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
     is_pinned = getattr(profile, "is_pinned_name", None)
     if callable(is_pinned) and bool(is_pinned(name)):
         return True
-    if fr.canonical_format_name(fmt) != "BF16":
-        return False
     passthrough_prefixes = getattr(profile, "source_passthrough_prefixes", None)
     if callable(passthrough_prefixes):
         for raw_prefix in passthrough_prefixes():
@@ -104,6 +102,8 @@ def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
                 continue
             if name == prefix.rstrip(".") or name.startswith(prefix):
                 return True
+    if fr.canonical_format_name(fmt) != "BF16":
+        return False
     return False
 
 

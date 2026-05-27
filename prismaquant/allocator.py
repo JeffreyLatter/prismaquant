@@ -81,7 +81,7 @@ import json
 import math
 import pickle
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from . import format_registry as fr
@@ -176,11 +176,7 @@ def _pareto_knee_summary(curve: list[dict]) -> dict:
     if len(feasible) < 3:
         return {"enabled": False, "reason": "too_few_feasible_points"}
     xs = [float(r["achieved_bits"]) for r in feasible]
-    error_key = (
-        "variable_predicted_dloss"
-        if any("variable_predicted_dloss" in r for r in feasible)
-        else "predicted_dloss"
-    )
+    error_key = "predicted_dloss"
     ys = [float(r.get(error_key, r["predicted_dloss"])) for r in feasible]
 
     def _record(mode: str, idx: int) -> dict:
@@ -194,8 +190,13 @@ def _pareto_knee_summary(curve: list[dict]) -> dict:
             "kneedle_error_source": error_key,
             "index": int(idx),
         }
-        if "fixed_predicted_dloss" in row:
-            record["fixed_predicted_dloss"] = float(row["fixed_predicted_dloss"])
+        for field in (
+            "aux_fixed_predicted_dloss",
+            "fixed_predicted_dloss",
+            "total_predicted_dloss_with_aux",
+        ):
+            if field in row:
+                record[field] = float(row[field])
         return record
 
     raw_idx = kneedle_raw_linear(xs, ys)
@@ -548,15 +549,13 @@ def main():
     ap.add_argument("--visual-sensitivity",
                     choices=["fisher", "uniform"],
                     default="fisher",
-                    help="How visual-encoder Linears enter the allocator. "
-                         "'fisher' (default) treats them as regular DP "
-                         "candidates when the probe pickle carries real "
-                         "multimodal Fisher stats (produced by "
-                         "`incremental_probe --calibration-modality="
-                         "multimodal`). If those stats are missing, falls "
-                         "back to uniform --visual-format. 'uniform' forces "
-                         "the Phase 1 path: every visual Linear gets "
-                         "--visual-format regardless of what's in the probe.")
+                    help="How visual-encoder Linears are assigned. Visual "
+                         "Linears are auxiliary to the language-model budget: "
+                         "they are stamped with --visual-format and excluded "
+                         "from default bpp/Δloss accounting. 'fisher' keeps "
+                         "measured visual cost rows available for audit "
+                         "metadata when present; 'uniform' uses only the "
+                         "Phase 1 source-scan override.")
     ap.add_argument("--mtp-format",
                     choices=_format_cli_choices(),
                     default="BF16",
@@ -738,14 +737,6 @@ def main():
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
-    pre_aggregation_availability = {
-        spec.name: sum(
-            1 for per_name in candidates.values()
-            if any(c.fmt == spec.name for c in per_name)
-        )
-        for spec in specs_sorted
-    }
-
     fixed_format_assignment: dict[str, str] = {}
     fixed_stats: dict[str, dict] = {}
     fixed_chosen_candidates: dict[str, Candidate] = {}
@@ -831,16 +822,85 @@ def main():
             print(
                 f"[alloc] --mtp-format={mtp_format_canonical}: fixed "
                 f"{len(fixed_format_assignment)} MTP Linears before DP "
-                "and included them in bpp/Δloss accounting",
+                "as auxiliary to body bpp/Δloss accounting",
                 flush=True,
             )
+
+    visual_names = sorted(n for n in stats if _is_visual_linear(n))
+    visual_aux_candidates: dict[str, Candidate] = {}
+    if visual_names:
+        visual_cost_names = [name for name in visual_names if name in costs]
+        if visual_cost_names and args.visual_sensitivity == "fisher":
+            visual_stats = {name: stats[name] for name in visual_cost_names}
+            visual_costs = {name: costs[name] for name in visual_cost_names}
+            visual_candidates = build_candidates(
+                visual_stats,
+                visual_costs,
+                [fr.get_format(visual_format_canonical)],
+                calibrated_gains,
+                source_manifest=source_manifest,
+                target_profile=target_profile,
+                mask_records=candidate_mask_records,
+            )
+            visual_aux_candidates = {
+                name: cand for name in visual_cost_names
+                if (
+                    cand := _find_candidate_for_format(
+                        visual_candidates,
+                        name,
+                        visual_format_canonical,
+                    )
+                ) is not None
+            }
+        fixed_format_assignment.update({
+            name: visual_format_canonical for name in visual_names
+        })
+        fixed_stats.update({name: stats[name] for name in visual_names})
+        fixed_chosen_candidates.update(visual_aux_candidates)
+        visual_names_set = set(visual_names)
+        stats = {
+            name: value for name, value in stats.items()
+            if name not in visual_names_set
+        }
+        costs = {
+            name: value for name, value in costs.items()
+            if name not in visual_names_set
+        }
+        candidates = {
+            name: value for name, value in candidates.items()
+            if name not in visual_names_set
+        }
+        print(
+            f"[alloc] --visual-format={visual_format_canonical}: fixed "
+            f"{len(visual_names)} visual Linears as auxiliary to body "
+            f"bpp/Δloss accounting"
+            + (
+                f" ({len(visual_aux_candidates)} measured cost rows tracked)"
+                if visual_aux_candidates else ""
+            ),
+            flush=True,
+        )
+
+    pre_aggregation_availability = {
+        spec.name: sum(
+            1 for per_name in candidates.values()
+            if any(c.fmt == spec.name for c in per_name)
+        )
+        for spec in specs_sorted
+    }
 
     fixed_total_params = sum(
         int(entry.get("n_params", 0) or 0) for entry in fixed_stats.values()
     )
+
+    def _bits_for_stats_entry(entry: dict, fmt: str) -> float:
+        shape = _shape_from_stats(entry)
+        return 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
+
     fixed_total_bits = sum(
-        8.0 * float(cand.memory_bytes)
-        for cand in fixed_chosen_candidates.values()
+        _bits_for_stats_entry(fixed_stats[name], fmt)
+        for name, fmt in fixed_format_assignment.items()
+        if name in fixed_stats
     )
     fixed_total_dloss = sum(
         float(cand.predicted_dloss)
@@ -880,11 +940,11 @@ def main():
     mutable_total_params = sum(
         int(stats[n].get("n_params", 0) or 0) for n in candidates
     )
-    allocation_total_params = mutable_total_params + fixed_total_params
     if fixed_total_params:
         fixed_bpp = fixed_total_bits / max(fixed_total_params, 1)
         print(
-            "[alloc] fixed-format contribution: "
+            "[alloc] auxiliary fixed-format contribution "
+            "(excluded from body budget/loss): "
             f"{fixed_total_params:,} params, {fixed_bpp:.4f} bpp, "
             f"Δloss={fixed_total_dloss:.4e}",
             flush=True,
@@ -901,10 +961,18 @@ def main():
         "post_aggregation_candidate_availability": post_aggregation_availability,
         "fixed_format_assignment": {
             "mtp_format": mtp_format_canonical,
+            "visual_format": visual_format_canonical,
             "linears": len(fixed_format_assignment),
+            "linears_by_kind": dict(Counter(
+                "mtp" if _is_mtp_linear(name)
+                else "visual" if _is_visual_linear(name)
+                else "other"
+                for name in fixed_format_assignment
+            )),
             "params": fixed_total_params,
             "bits_total": fixed_total_bits,
             "predicted_dloss": fixed_total_dloss,
+            "budget_scope": "auxiliary_excluded_from_body_budget",
         },
         **summarize_applicability_masks(candidate_mask_records),
     }
@@ -912,31 +980,6 @@ def main():
         json.dumps(applicability_payload, indent=2, sort_keys=True) + "\n"
     )
     print(f"[alloc] format applicability → {applicability_report_path}")
-
-    def _mutable_target_for_total_budget(target_bits: float) -> float:
-        if fixed_total_params <= 0:
-            return target_bits
-        if mutable_total_params <= 0:
-            return float("nan")
-        target_total_bits = float(target_bits) * allocation_total_params
-        return (target_total_bits - fixed_total_bits) / mutable_total_params
-
-    def _combine_with_fixed_metrics(
-        mutable_achieved_bits: float,
-        mutable_predicted_dloss: float,
-    ) -> tuple[float, float]:
-        if fixed_total_params <= 0:
-            return mutable_achieved_bits, mutable_predicted_dloss
-        mutable_total_bits = float(mutable_achieved_bits) * mutable_total_params
-        achieved_bits = (
-            mutable_total_bits + fixed_total_bits
-        ) / max(allocation_total_params, 1)
-        return achieved_bits, mutable_predicted_dloss + fixed_total_dloss
-
-    def _assignment_with_fixed(assignment: dict[str, str]) -> dict[str, str]:
-        out = dict(assignment)
-        out.update(fixed_format_assignment)
-        return out
 
     def _stats_entry_for_assignment_name(name: str) -> dict | None:
         entry = stats.get(name)
@@ -951,14 +994,11 @@ def main():
         return None
 
     def _solve_for_target(target_bits: float):
-        """Solve the DP at one target bit budget."""
-        mutable_target_bits = _mutable_target_for_total_budget(target_bits)
-        if math.isnan(mutable_target_bits):
-            if fixed_total_params <= 0:
-                return None, float("nan"), float("inf"), float("inf")
-            fixed_bpp = fixed_total_bits / max(fixed_total_params, 1)
-            if fixed_bpp <= target_bits + args.overshoot_tolerance:
-                return {}, fixed_bpp, fixed_total_dloss, 0.0
+        """Solve the body-budget DP at one target bit budget."""
+        mutable_target_bits = float(target_bits)
+        if mutable_total_params <= 0:
+            if fixed_total_params > 0 and mutable_target_bits >= 0.0:
+                return {}, 0.0, 0.0, 0.0
             return None, float("nan"), float("inf"), float("inf")
         if mutable_target_bits < 0.0:
             return None, float("nan"), float("inf"), float("inf")
@@ -972,11 +1012,13 @@ def main():
         if assign is None:
             return None, float("nan"), float("inf"), float("inf")
         mutable_total = compute_assignment_predicted_dloss(assign, candidates)
-        achieved_r, total = _combine_with_fixed_metrics(achieved_r, mutable_total)
+        total = mutable_total
         return assign, achieved_r, total, mutable_total
 
     def _expand_assignment_for_seed_json(
         assignment: dict[str, str],
+        *,
+        include_auxiliary: bool = True,
     ) -> dict[str, str]:
         """Expand DP super-items into the per-Linear seed-assignment shape.
 
@@ -989,7 +1031,8 @@ def main():
         expanded = dict(assignment)
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
-        expanded.update(fixed_format_assignment)
+        if include_auxiliary:
+            expanded.update(fixed_format_assignment)
         return promote_serving_units(expanded, format_rank, profile=model_profile)
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
@@ -1014,24 +1057,32 @@ def main():
             continue
         format_counts = defaultdict(int)
         format_params = defaultdict(int)
-        row_assignment = _assignment_with_fixed(assign)
-        for name, fmt in row_assignment.items():
+        for name, fmt in assign.items():
             format_counts[fmt] += 1
             entry = _stats_entry_for_assignment_name(name)
             if isinstance(entry, dict):
                 format_params[fmt] += int(entry.get("n_params", 0) or 0)
+        total_with_aux = total + fixed_total_dloss
         curve.append({
             "target_bits": t,
             "feasible": True,
             "achieved_bits": achieved,
             "predicted_dloss": total,
             "variable_predicted_dloss": mutable_total,
+            "aux_fixed_predicted_dloss": fixed_total_dloss,
             "fixed_predicted_dloss": fixed_total_dloss,
+            "total_predicted_dloss_with_aux": total_with_aux,
+            "aux_fixed_bits_total": fixed_total_bits,
+            "aux_fixed_params": fixed_total_params,
             **{f"layers_{k}": v for k, v in format_counts.items()},
             **{f"params_{k}": v for k, v in format_params.items()},
         })
         if args.pareto_output_dir:
             expanded = _expand_assignment_for_seed_json(assign)
+            budget_expanded = _expand_assignment_for_seed_json(
+                assign,
+                include_auxiliary=False,
+            )
             expanded_counts = defaultdict(int)
             for fmt in expanded.values():
                 expanded_counts[fmt] += 1
@@ -1040,10 +1091,13 @@ def main():
                 "achieved_bits": float(achieved),
                 "predicted_dloss": float(total),
                 "variable_predicted_dloss": float(mutable_total),
+                "aux_fixed_predicted_dloss": float(fixed_total_dloss),
                 "fixed_predicted_dloss": float(fixed_total_dloss),
+                "total_predicted_dloss_with_aux": float(total_with_aux),
                 "assignment": expanded,
                 "format_counts": dict(sorted(expanded_counts.items())),
-                "bits_total": _assignment_bits_total(expanded),
+                "bits_total": _assignment_bits_total(budget_expanded),
+                "bits_total_with_aux": _assignment_bits_total(expanded),
             })
 
     # Output Pareto CSV
@@ -1083,7 +1137,11 @@ def main():
                 "target_bits": float(record["target_bits"]),
                 "achieved_bits": float(record["achieved_bits"]),
                 "bits_total": float(record["bits_total"]),
+                "bits_total_with_aux": float(record["bits_total_with_aux"]),
                 "predicted_dloss": float(record["predicted_dloss"]),
+                "total_predicted_dloss_with_aux": float(
+                    record["total_predicted_dloss_with_aux"]
+                ),
                 "format_counts": record["format_counts"],
                 "assignment": dict(sorted(assignment.items())),
             }
@@ -1094,8 +1152,15 @@ def main():
                 "target_bits": float(record["target_bits"]),
                 "achieved_bits": float(record["achieved_bits"]),
                 "bits_total": float(record["bits_total"]),
+                "bits_total_with_aux": float(record["bits_total_with_aux"]),
                 "predicted_dloss": float(record["predicted_dloss"]),
+                "total_predicted_dloss_with_aux": float(
+                    record["total_predicted_dloss_with_aux"]
+                ),
                 "variable_predicted_dloss": float(record["variable_predicted_dloss"]),
+                "aux_fixed_predicted_dloss": float(
+                    record["aux_fixed_predicted_dloss"]
+                ),
                 "fixed_predicted_dloss": float(record["fixed_predicted_dloss"]),
                 "format_counts": record["format_counts"],
             })
@@ -1130,10 +1195,7 @@ def main():
               f"({raw['kneedle_error_source']})")
 
     # Print table
-    dloss_header = "Δloss (pred)"
-    if fixed_total_dloss:
-        dloss_header = "Δloss variable/total"
-    print(f"\n  target  achieved     {dloss_header:>20}   " + "   ".join(
+    print(f"\n  target  achieved     {'Δloss body':>20}   " + "   ".join(
         f"{s.name[:11]:>11}" for s in specs_sorted))
     for row in curve:
         if not row.get("feasible"):
@@ -1141,13 +1203,7 @@ def main():
             continue
         fmt_str = "   ".join(
             f"{row.get(f'layers_{s.name}', 0):>11,}" for s in specs_sorted)
-        if fixed_total_dloss:
-            dloss_str = (
-                f"{row['variable_predicted_dloss']:.4e}/"
-                f"{row['predicted_dloss']:.4e}"
-            )
-        else:
-            dloss_str = f"{row['predicted_dloss']:.4e}"
+        dloss_str = f"{row['predicted_dloss']:.4e}"
         print(f"  {row['target_bits']:>6.3f}  {row['achieved_bits']:>7.3f}  "
               f"{dloss_str:>20}   {fmt_str}")
 
@@ -1181,20 +1237,10 @@ def main():
         profile=model_profile,
     )
 
-    # Visual-encoder Linear handling. Two paths:
-    #
-    # 1. --visual-sensitivity=fisher (default) + probe/cost have real
-    #    visual entries → visual Linears already participated in the
-    #    knapsack DP above with their own per-Linear Fisher + per-format
-    #    RTN cost. No override needed; just make sure every discoverable
-    #    visual Linear has an assignment entry (fall back to --visual-
-    #    format for any that the probe missed, e.g. patch_embed Linears
-    #    that the probe's regex didn't hit).
-    #
-    # 2. --visual-sensitivity=uniform OR Fisher missing → Phase 1 path:
-    #    scan source checkpoint for visual Linears and stamp them all
-    #    with --visual-format.
-    visual_format = args.visual_format
+    # Visual-encoder Linears are auxiliary to the language-model budget.
+    # Stamp them with --visual-format for export, but keep them out of the
+    # body DP frontier, default bpp, and default Δloss.
+    visual_format = visual_format_canonical
     visual_sensitivity = args.visual_sensitivity
 
     def _visual_fisher_available(stats_d: dict, costs_d: dict) -> bool:
@@ -1204,9 +1250,14 @@ def main():
         any_visual_costs = any(_is_visual_linear(n) for n in costs_d)
         return any_visual_stats and any_visual_costs
 
-    fisher_visual_ok = (visual_sensitivity == "fisher"
-                        and _visual_fisher_available(stats, costs))
-    if visual_sensitivity == "fisher" and not fisher_visual_ok:
+    if visual_sensitivity == "fisher" and visual_names:
+        print(
+            "[alloc] --visual-sensitivity=fisher found visual Linears, "
+            "but visual assignments are auxiliary to the body budget; "
+            f"using --visual-format={visual_format} for the layer_config.",
+            flush=True,
+        )
+    elif visual_sensitivity == "fisher" and not _visual_fisher_available(stats, costs):
         print("[alloc] --visual-sensitivity=fisher requested but probe / "
               "cost pickles have no visual Linear entries; falling back "
               f"to --visual-format={visual_format} (Phase 1 uniform).",
@@ -1217,35 +1268,16 @@ def main():
     else:
         visual_names_src = []
 
-    if fisher_visual_ok:
-        # Fisher path: DP already placed visual Linears. Fill in any
-        # discoverable visual Linear that the DP missed (e.g. the probe
-        # regex matched only `visual.blocks.*` but the source has
-        # `visual.merger.*` or `visual.patch_embed.*` too) with the
-        # uniform --visual-format as a safety net.
-        dp_visual_count = sum(1 for n in assignment_expanded
-                              if _is_visual_linear(n))
-        filled = 0
+    if visual_names_src:
         for vname in visual_names_src:
-            if vname not in assignment_expanded:
-                assignment_expanded[vname] = visual_format
-                filled += 1
-        print(f"[alloc] --visual-sensitivity=fisher: DP placed "
-              f"{dp_visual_count} visual Linears via per-Linear Fisher; "
-              f"{filled} additional visual Linears (un-probed) stamped "
-              f"with --visual-format={visual_format}.", flush=True)
-    else:
-        # Uniform path (Phase 1): stamp every discoverable visual Linear.
-        if visual_names_src:
-            for vname in visual_names_src:
-                assignment_expanded[vname] = visual_format
-            print(f"[alloc] --visual-format={visual_format}: assigned "
-                  f"{len(visual_names_src)} visual Linears uniformly "
-                  f"(source={probe_model_path})", flush=True)
-        elif visual_format != "BF16":
-            print(f"[alloc] --visual-format={visual_format}: no visual "
-                  f"Linears found in source checkpoint — override is a "
-                  f"no-op", flush=True)
+            assignment_expanded[vname] = visual_format
+        print(f"[alloc] --visual-format={visual_format}: assigned "
+              f"{len(visual_names_src)} visual Linears uniformly "
+              f"(source={probe_model_path})", flush=True)
+    elif visual_format != "BF16":
+        print(f"[alloc] --visual-format={visual_format}: no visual "
+              f"Linears found in source checkpoint — override is a "
+              f"no-op", flush=True)
 
     mtp_count = sum(1 for n in assignment_expanded if n.startswith("mtp."))
     if mtp_count:

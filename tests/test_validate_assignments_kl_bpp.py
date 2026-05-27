@@ -23,7 +23,7 @@ def _stats(n_params: int = 256) -> dict:
     }
 
 
-def test_assignment_bpp_excludes_pinned_and_bf16_passthrough_entries():
+def test_assignment_bpp_excludes_pinned_and_auxiliary_entries():
     stats = {
         "model.layers.0.mlp.down_proj": _stats(),
         "mtp.layers.0.mlp.down_proj": _stats(),
@@ -55,7 +55,7 @@ def test_assignment_bpp_excludes_pinned_and_bf16_passthrough_entries():
     assert details["excluded_entries"] == 3
 
 
-def test_assignment_bpp_counts_non_bf16_passthrough_when_explicitly_quantized():
+def test_assignment_bpp_excludes_auxiliary_entries_even_when_quantized():
     stats = {
         "model.layers.0.mlp.down_proj": _stats(),
         "model.visual.blocks.0.mlp.fc1": _stats(),
@@ -73,8 +73,14 @@ def test_assignment_bpp_counts_non_bf16_passthrough_when_explicitly_quantized():
         profile=_Profile(),
     )
 
-    assert details["quantizable_entries"] == 2
-    assert details["excluded_entries"] == 0
+    expected = (
+        8.0
+        * fr.get_format("NVFP4").memory_bytes_for_shape((16, 16))
+        / 256.0
+    )
+    assert details["bpp"] == expected
+    assert details["quantizable_entries"] == 1
+    assert details["excluded_entries"] == 1
 
 
 def test_kl_repeat_summary_reports_stderr_and_ucb():
