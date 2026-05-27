@@ -600,6 +600,16 @@ def _find_visual_module(model) -> tuple[Any | None, str]:
     return None, ""
 
 
+def _module_has_meta_tensors(module: nn.Module) -> bool:
+    return any(
+        getattr(t, "is_meta", False)
+        for t in (
+            *module.parameters(recurse=True),
+            *module.buffers(recurse=True),
+        )
+    )
+
+
 def _build_streaming_context(model_path: str, *,
                              device: torch.device, dtype: torch.dtype,
                              offload_folder: str,
@@ -729,6 +739,8 @@ def _build_streaming_context(model_path: str, *,
                 fp8_scale_inv_map=fp8_scale_inv_map)
             print(f"{log_prefix} materializing visual tower: "
                   f"{len(tensors)}/{len(vis_keys)} tensors -> {device}", flush=True)
+            if _module_has_meta_tensors(visual_module):
+                visual_module.to_empty(device=device, recurse=True)
             for model_name, t in tensors.items():
                 install_dtype = t.dtype if t.is_floating_point() else None
                 set_module_tensor_to_device(

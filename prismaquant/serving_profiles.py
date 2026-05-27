@@ -163,6 +163,11 @@ class ShapeRule:
             f"{fmt} kernel does not support "
             f"(out_features={out_features}, in_features={in_features})"
         )
+        if self.detail:
+            detail = (
+                f"{detail} "
+                f"(out_features={out_features}, in_features={in_features})"
+            )
         return ServingFormatDecision(False, self.reason, detail, self.id)
 
 

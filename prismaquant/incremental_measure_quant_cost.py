@@ -57,8 +57,11 @@ from .incremental_probe import (
 from .measure_quant_cost import (
     ActivationIndex,
     HDetailIndex,
+    _accumulate_result,
     _finalize_results,
     _measure_packed_experts,
+    _normalize_fisher_output_mse_row_weights,
+    canonical_linear_name,
     measure_batched_gpu,
     measure_unbatched,
     prepare_cost_context,
@@ -129,8 +132,9 @@ def _expected_cost_shard_meta(*,
                               chunk_size: int,
                               h_detail_dir: str | None,
                               formats: list[str],
+                              render_path: str = "registry",
                               n_linears_expected: int = 0) -> dict[str, Any]:
-    return {
+    meta = {
         "model": model,
         "probe": str(probe_path),
         "activation_cache_dir": str(Path(activation_cache_dir)),
@@ -141,6 +145,19 @@ def _expected_cost_shard_meta(*,
         "shard_idx": shard_idx,
         "formats": list(formats),
         "n_linears_expected": int(n_linears_expected),
+    }
+    if render_path != "registry":
+        meta["render_path"] = render_path
+    return meta
+
+
+def _scheduled_probe_targets(stats: dict[str, Any],
+                             shard_regexes: list[str]) -> set[str]:
+    """Return probe rows that are actually reachable by the shard schedule."""
+    compiled = [re.compile(expr) for expr in shard_regexes]
+    return {
+        name for name in stats
+        if any(expr.search(name) for expr in compiled)
     }
 
 
@@ -193,14 +210,28 @@ def _run_cost_measurement(
     h_detail: "HDetailIndex | None",
     log_prefix: str,
     profile=None,
+    render_path: str = "registry",
 ) -> dict:
     chosen_mode = mode
     if chosen_mode == "auto":
         chosen_mode = "batched" if device.startswith("cuda") else "unbatched"
-    print(f"{log_prefix} mode={chosen_mode} targets={len(target_names)}",
-          flush=True)
+    render_path = str(render_path or "registry")
+    print(f"{log_prefix} mode={chosen_mode} render_path={render_path} "
+          f"targets={len(target_names)}", flush=True)
 
-    if chosen_mode == "batched":
+    if render_path == "production":
+        results = _measure_production_render_dense(
+            module,
+            act_cache=act_cache,
+            target_names=target_names,
+            specs=specs,
+            device=device,
+            dtype=dtype,
+            h_detail=h_detail,
+            profile=profile,
+            log_prefix=log_prefix,
+        )
+    elif chosen_mode == "batched":
         results = measure_batched_gpu(
             module, act_cache, target_names, specs, device, dtype,
             chunk_size=chunk_size, h_detail=h_detail, profile=profile)
@@ -219,6 +250,131 @@ def _run_cost_measurement(
               flush=True)
 
     return results
+
+
+def _measure_production_render_dense(
+    module: nn.Module,
+    *,
+    act_cache: ActivationIndex,
+    target_names: set[str],
+    specs: list[fr.FormatSpec],
+    device: str,
+    dtype: torch.dtype,
+    h_detail: "HDetailIndex | None",
+    profile=None,
+    log_prefix: str,
+) -> dict:
+    """Measure dense Linear costs using the production render primitive.
+
+    This path is deliberately one-Linear-at-a-time: production render may run
+    GPTQ and progressive gates that depend on the target's activation rows.
+    Packed experts are still measured by ``_measure_packed_experts`` in the
+    caller, matching the current split-export path for packed MoE experts.
+    """
+    from .production_weight_cache import render_production_weight
+
+    dev = torch.device(device)
+    accum: dict[str, dict[str, dict]] = {}
+    processed = 0
+    tstart = time.time()
+    n_total = len(target_names)
+    levers: dict[str, object] = {
+        "gptq": True,
+        "joint_scale_opt": True,
+        "scale_sweep": False,
+        "static_act_order": False,
+        "nvfp4_scale_rule": os.environ.get(
+            "PRISMAQUANT_NVFP4_SCALE_RULE",
+            "static_6",
+        ),
+    }
+
+    for name, mod in module.named_modules():
+        canonical_name = canonical_linear_name(name, profile)
+        if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
+            continue
+        if canonical_name not in act_cache:
+            continue
+
+        W = mod.weight.detach().to(device=dev, dtype=dtype)
+        X_cpu, row_indices = act_cache.load_with_row_indices(canonical_name)
+        X = X_cpu.to(device=dev, dtype=dtype)
+        y_ref = X @ W.T
+        ref_energy = float(y_ref.float().pow(2).mean().item())
+
+        h_full = None
+        gq_rows = None
+        if h_detail is not None and canonical_name in h_detail:
+            blob = h_detail.load_blob(canonical_name)
+            try:
+                h_full = HDetailIndex.h_diag_from_blob(blob).to(dev).float()
+                if h_full.shape != W.shape:
+                    h_full = None
+            except Exception:
+                h_full = None
+            gq_rows = _normalize_fisher_output_mse_row_weights(
+                blob.get("g2_per_token") if isinstance(blob, dict) else None,
+                row_indices,
+                int(X.shape[0]),
+                dev,
+            )
+
+        activations = {canonical_name: X.detach()}
+        for spec in specs:
+            fmt = fr.canonical_format_name(spec.name)
+            try:
+                if fmt == "BF16":
+                    W_hat = spec.quantize_dequantize(W.clone())
+                else:
+                    W_hat = render_production_weight(
+                        W.clone(),
+                        fmt,
+                        qname=canonical_name,
+                        activations=activations,
+                        levers=levers,
+                        fisher_row_weights=gq_rows,
+                    )
+                X_hat = spec.activation_quantize_dequantize(X.clone())
+                err = (W - W_hat).float()
+                y_q = X_hat @ W_hat.T
+                y_err_sq = (y_ref - y_q).float().pow(2)
+                fisher_output_mse = None
+                if gq_rows is not None:
+                    fisher_output_mse = float(
+                        (y_err_sq * gq_rows.unsqueeze(1)).mean().item()
+                    )
+                predicted_dloss = None
+                if h_full is not None:
+                    predicted_dloss = float(0.5 * (h_full * err.pow(2)).sum().item())
+                _accumulate_result(
+                    accum,
+                    canonical_name,
+                    spec.name,
+                    float(err.pow(2).mean().item()),
+                    float(y_err_sq.mean().item()),
+                    float(y_err_sq.mean().item()) / max(ref_energy, 1e-12),
+                    predicted_dloss=predicted_dloss,
+                    fisher_output_mse=fisher_output_mse,
+                )
+            except Exception as e:
+                accum.setdefault(canonical_name, {})[spec.name] = {
+                    "error": str(e),
+                    "render_path": "production",
+                }
+
+        processed += 1
+        if processed % 16 == 0:
+            elapsed = time.time() - tstart
+            eta = elapsed / processed * max(n_total - processed, 0)
+            print(f"{log_prefix} production-render {processed}/{n_total} "
+                  f"eta={eta:.0f}s", flush=True)
+
+    out = _finalize_results(accum)
+    for per_name in out.values():
+        for entry in per_name.values():
+            if isinstance(entry, dict):
+                entry.setdefault("render_path", "production")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +398,7 @@ def _run_body_cost_shard(
     output_path: str,
     model_name: str,
     probe_path: str,
+    render_path: str = "registry",
 ):
     model = ctx.model
     try:
@@ -329,6 +486,7 @@ def _run_body_cost_shard(
             h_detail=h_detail,
             log_prefix=f"[incremental-cost/{shard_kind}]",
             profile=profile,
+            render_path=render_path,
         )
     finally:
         for L in installed:
@@ -359,6 +517,7 @@ def _run_body_cost_shard(
                 "mode": ("batched" if mode == "auto" and device.startswith("cuda")
                          else ("unbatched" if mode == "auto" else mode)),
                 "shard_kind": shard_kind,
+                "render_path": render_path,
             },
         }, f)
     print(f"[incremental-cost] wrote {out_path} ({len(results)} entries)",
@@ -387,6 +546,7 @@ def _run_mtp_cost_shard(
     output_path: str,
     model_name: str,
     probe_path: str,
+    render_path: str = "registry",
 ):
     from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
 
@@ -490,6 +650,7 @@ def _run_mtp_cost_shard(
             h_detail=h_detail,
             log_prefix="[incremental-cost/mtp]",
             profile=profile,
+            render_path=render_path,
         )
     finally:
         del mtp_wrapper, inner_mtp, raw
@@ -510,6 +671,7 @@ def _run_mtp_cost_shard(
                 "mode": ("batched" if mode == "auto" and device.startswith("cuda")
                          else ("unbatched" if mode == "auto" else mode)),
                 "shard_kind": "mtp",
+                "render_path": render_path,
             },
         }, f)
     print(f"[incremental-cost/mtp] wrote {out_path} ({len(results)} entries)",
@@ -566,6 +728,7 @@ def _run_visual_cost_shard(
     probe_path: str,
     mm_ctx: "StreamingContext | None" = None,
     mm_offload_folder: str | None = None,
+    render_path: str = "registry",
 ) -> "StreamingContext | None":
     """Measure per-(visual-Linear, format) cost using an incremental
     multimodal streaming context (visual tower fully resident; body
@@ -677,6 +840,7 @@ def _run_visual_cost_shard(
         h_detail=h_detail,
         log_prefix="[incremental-cost/visual]",
         profile=profile,
+        render_path=render_path,
     )
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
@@ -694,6 +858,7 @@ def _run_visual_cost_shard(
                 "mode": ("batched" if mode == "auto" and device.startswith("cuda")
                          else ("unbatched" if mode == "auto" else mode)),
                 "shard_kind": "visual",
+                "render_path": render_path,
             },
         }, f)
     print(f"[incremental-cost/visual] wrote {out_path} "
@@ -718,6 +883,14 @@ def main():
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--mode", choices=["auto", "batched", "unbatched"],
                     default="auto")
+    ap.add_argument("--render-path", choices=["registry", "production"],
+                    default="registry",
+                    help="Weight renderer used for dense Linears. "
+                         "`registry` is the fast RTN path; `production` "
+                         "uses production_weight_cache.render_production_weight "
+                         "so FP8/MXFP8 costs include GPTQ gates. Packed "
+                         "experts keep the current export-faithful packed "
+                         "measurement path.")
     ap.add_argument("--chunk-size", type=int, default=256)
     ap.add_argument("--swap-grow-limit-mb", type=int, default=256)
     ap.add_argument("--min-mem-available-mb", type=int, default=2048)
@@ -809,12 +982,34 @@ def main():
 
     # Shared probe / activation / spec context — probe pickle stays in
     # memory so each shard can just intersect its regex against the stats.
-    _, stats, act_cache, _, missing_act, _, specs = prepare_cost_context(
+    #
+    # prepare_cost_context sees the whole probe pickle, including optional
+    # regions such as MTP and visual tower rows. Incremental runs can
+    # deliberately exclude those regions, so scope missing-activation
+    # validation to the actual shard schedule below.
+    _, stats, act_cache, _, missing_act_all, _, specs = prepare_cost_context(
         probe_path=args.probe,
         activation_cache_dir=args.activation_cache_dir,
         formats_csv=args.formats,
-        skip_missing_activations=args.skip_missing_activations,
+        skip_missing_activations=True,
     )
+    scheduled_targets = _scheduled_probe_targets(stats, shard_regexes)
+    missing_act = sorted(
+        name for name in missing_act_all
+        if name in scheduled_targets
+    )
+    ignored_missing = len(missing_act_all) - len(missing_act)
+    if ignored_missing:
+        print(f"[incremental-cost] ignored {ignored_missing} missing "
+              "activation(s) outside the requested shard schedule",
+              flush=True)
+    if missing_act and not args.skip_missing_activations:
+        preview = ", ".join(missing_act[:8])
+        suffix = " ..." if len(missing_act) > 8 else ""
+        raise SystemExit(
+            f"{len(missing_act)} scheduled Linears missing activation "
+            f"({preview}{suffix}); pass --skip-missing-activations to proceed."
+        )
 
     # H-detail is optional. Built against the full probe stat set so the
     # intersect-per-shard logic just checks `name in h_detail` when needed.
@@ -845,6 +1040,7 @@ def main():
             chunk_size=args.chunk_size,
             h_detail_dir=args.h_detail_dir,
             formats=[s.name for s in specs],
+            render_path=args.render_path,
             n_linears_expected=sum(
                 1 for n in stats if re.search(linear_include, n)
             ),
@@ -923,6 +1119,7 @@ def main():
                     output_path=str(shard_path),
                     model_name=args.model,
                     probe_path=args.probe,
+                    render_path=args.render_path,
                 )
             elif kind == "mtp":
                 _run_mtp_cost_shard(
@@ -940,6 +1137,7 @@ def main():
                     output_path=str(shard_path),
                     model_name=args.model,
                     probe_path=args.probe,
+                    render_path=args.render_path,
                 )
             elif kind == "visual":
                 # Phase 2 multimodal path: if the probe's multimodal pass
@@ -966,6 +1164,7 @@ def main():
                     probe_path=args.probe,
                     mm_ctx=mm_ctx,
                     mm_offload_folder=mm_offload_folder,
+                    render_path=args.render_path,
                 )
             else:
                 # Other unclassified shard kinds — keep the empty-pickle

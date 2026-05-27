@@ -640,8 +640,8 @@ register_format(FormatSpec(
     activation_quantize_dequantize=lambda x: x,
 ))
 
-# Plain FP8 (per-tensor scale on weights, no microscaling).  vLLM-native
-# serving path; works on Hopper (sm_90) and Blackwell (sm_100+).
+# Plain FP8 (per-output-channel FP32 scale on weights, no microscaling).
+# vLLM-native serving path; works on Hopper (sm_90) and Blackwell (sm_100+).
 register_format(FormatSpec(
     name="FP8_E4M3",
     weight_bits=8, group_size=0, scale_bits=32, scale_dtype_name="fp32",

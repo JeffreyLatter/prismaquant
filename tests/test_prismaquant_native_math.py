@@ -368,7 +368,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
 
         self.assertEqual(
             [c.fmt for c in filtered[name]],
-            ["NVFP4", "MXFP8", "MXFP8_E4M3", "MXFP4", "BF16"],
+            ["NVFP4", "MXFP8", "MXFP8_E4M3", "MXFP4", "FP8_E4M3", "BF16"],
         )
         self.assertNotIn("model.layers.0.self_attn.q_proj", filtered)
 

@@ -190,6 +190,20 @@ class TestVisualCostShardBasic(unittest.TestCase):
     """_run_visual_cost_shard handles empty / no-match / OOM paths
     without raising, and emits a shard pickle the merger can consume."""
 
+    def test_meta_visual_module_detection_includes_buffers(self):
+        from prismaquant.streaming_model import _module_has_meta_tensors
+
+        class TinyVisual(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(2, 2, device="meta")
+                self.register_buffer("pos", torch.empty(2, device="meta"))
+
+        module = TinyVisual()
+        self.assertTrue(_module_has_meta_tensors(module))
+        module.to_empty(device="cpu")
+        self.assertFalse(_module_has_meta_tensors(module))
+
     def test_empty_shard_when_no_matching_stats(self):
         from prismaquant.incremental_measure_quant_cost import (
             _run_visual_cost_shard,

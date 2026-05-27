@@ -1451,6 +1451,15 @@ class TestPackedExpertSplit(unittest.TestCase):
         self.assertEqual(out["weight_packed"].shape[0], E)
         self.assertEqual(out["weight_global_scale"].shape, torch.Size([E]))
 
+    def test_quantize_3d_packed_fp8_returns_per_expert_channel_scales(self):
+        E, M, N = 4, 32, 64
+        P = torch.randn(E, M, N) * 0.05
+        out = _quantize_3d_packed(P, "FP8_E4M3")
+        self.assertEqual(out["weight"].dtype, torch.float8_e4m3fn)
+        self.assertEqual(out["weight"].shape, torch.Size([E, M, N]))
+        self.assertEqual(out["weight_scale"].dtype, torch.float32)
+        self.assertEqual(out["weight_scale"].shape, torch.Size([E, M, 1]))
+
 
 class TestQwen35ProfileFallback(unittest.TestCase):
     def _cpu_only_profile(self):

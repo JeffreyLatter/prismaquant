@@ -45,17 +45,15 @@ def test_qwen_serving_profile_id_remains_compatibility_alias():
 
 def test_serving_profile_format_rules_are_config_backed():
     expert = "model.layers.0.mlp.experts.gate_up_proj"
-    gemma_expert = "model.layers.0.experts.gate_up_proj"
+    root_expert = "model.layers.0.experts.gate_up_proj"
     dense = "model.layers.0.self_attn.q_proj"
 
     assert check_serving_format(VLLM_PROFILE, expert, "MXFP8_E4M3").legal
-    assert check_serving_format(VLLM_PROFILE, gemma_expert, "MXFP4").legal
+    assert check_serving_format(VLLM_PROFILE, root_expert, "MXFP4").legal
     expert_fp8 = check_serving_format(VLLM_PROFILE, expert, "FP8_E4M3")
-    assert not expert_fp8.legal
-    assert expert_fp8.rule == "packed_moe_expert_formats"
-    gemma_fp8 = check_serving_format(VLLM_PROFILE, gemma_expert, "FP8_E4M3")
-    assert not gemma_fp8.legal
-    assert gemma_fp8.rule == "packed_moe_expert_formats"
+    assert expert_fp8.legal
+    root_fp8 = check_serving_format(VLLM_PROFILE, root_expert, "FP8_E4M3")
+    assert root_fp8.legal
 
     dense_mxfp4 = check_serving_format(VLLM_PROFILE, dense, "MXFP4")
     assert not dense_mxfp4.legal

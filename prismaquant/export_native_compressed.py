@@ -2176,11 +2176,11 @@ def _mxfp8_quantize_grouped(
       - quant_fp8: same shape as `grouped`, dtype torch.float8_*
       - e8m0_uint8: same shape minus the last dim, uint8 (E8M0)
 
-    Care: with E8M0 round-to-nearest the per-group scale can be
-    slightly smaller than max-abs/fp8_max, which would push quant_grid
-    past the FP8 max and produce NaN on cast. We use ceil() on log2 to
-    guarantee s_g >= max-abs/fp8_max,
-    keeping all quant_grid values inside the representable range.
+    Scale generation follows compressed-tensors' MX rule: round the block
+    amax to the nearest representable power-of-two, subtract the element
+    exponent offset, then store the biased E8M0 exponent. The resulting grid
+    may place the block amax above the finite FP8 max; `_fp8_codec` clamps
+    before casting so overflow cannot become NaN.
     """
     codec = _mxfp8_grouped_codec(
         grouped,
@@ -2770,16 +2770,20 @@ def _fp8_dynamic_scale_sweep_quantize(
     )
 
 
-def quantize_dequantize_fp8_dynamic_packed(packed: torch.Tensor
-                                           ) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_dequantize_fp8_dynamic_packed(
+    packed: torch.Tensor,
+    *,
+    element_dtype: torch.dtype = torch.float8_e4m3fn,
+    element_max: float = FP8_E4M3_MAX,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-expert FP8 W8A8 dynamic per-channel for `[E, M, N]` packed.
 
     Returns weight `[E, M, N]` fp8 and scale `[E, M, 1]` fp32.
     """
     codec = _fp8_dynamic_codec(
         packed,
-        element_dtype=torch.float8_e4m3fn,
-        element_max=MXFP8_E4M3_MAX,
+        element_dtype=element_dtype,
+        element_max=element_max,
     )
     return codec.quant, codec.scale
 
@@ -3515,6 +3519,14 @@ def _quantize_3d_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tenso
         w, ws = quantize_dequantize_mxfp8_packed(
             packed,
             group_size=32,
+            element_dtype=element_dtype,
+            element_max=element_max,
+        )
+        return {"weight": w, "weight_scale": ws}
+    if fmt in {"FP8_E4M3", "FP8_E5M2"}:
+        element_dtype, element_max = _fp8_element_dtype_and_max(fmt)
+        w, ws = quantize_dequantize_fp8_dynamic_packed(
+            packed.to(torch.float32),
             element_dtype=element_dtype,
             element_max=element_max,
         )
