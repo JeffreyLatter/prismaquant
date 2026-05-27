@@ -176,17 +176,27 @@ def _pareto_knee_summary(curve: list[dict]) -> dict:
     if len(feasible) < 3:
         return {"enabled": False, "reason": "too_few_feasible_points"}
     xs = [float(r["achieved_bits"]) for r in feasible]
-    ys = [float(r["predicted_dloss"]) for r in feasible]
+    error_key = (
+        "variable_predicted_dloss"
+        if any("variable_predicted_dloss" in r for r in feasible)
+        else "predicted_dloss"
+    )
+    ys = [float(r.get(error_key, r["predicted_dloss"])) for r in feasible]
 
     def _record(mode: str, idx: int) -> dict:
         row = feasible[idx]
-        return {
+        record = {
             "mode": mode,
             "target_bits": float(row["target_bits"]),
             "achieved_bits": float(row["achieved_bits"]),
             "predicted_dloss": float(row["predicted_dloss"]),
+            "kneedle_dloss": float(row.get(error_key, row["predicted_dloss"])),
+            "kneedle_error_source": error_key,
             "index": int(idx),
         }
+        if "fixed_predicted_dloss" in row:
+            record["fixed_predicted_dloss"] = float(row["fixed_predicted_dloss"])
+        return record
 
     raw_idx = kneedle_raw_linear(xs, ys)
     log_idx = kneedle_log_error(xs, ys)
@@ -945,13 +955,13 @@ def main():
         mutable_target_bits = _mutable_target_for_total_budget(target_bits)
         if math.isnan(mutable_target_bits):
             if fixed_total_params <= 0:
-                return None, float("nan"), float("inf")
+                return None, float("nan"), float("inf"), float("inf")
             fixed_bpp = fixed_total_bits / max(fixed_total_params, 1)
             if fixed_bpp <= target_bits + args.overshoot_tolerance:
-                return {}, fixed_bpp, fixed_total_dloss
-            return None, float("nan"), float("inf")
+                return {}, fixed_bpp, fixed_total_dloss, 0.0
+            return None, float("nan"), float("inf"), float("inf")
         if mutable_target_bits < 0.0:
-            return None, float("nan"), float("inf")
+            return None, float("nan"), float("inf"), float("inf")
         assign, achieved_r = solve_with_promotion(
             stats, candidates, mutable_target_bits, format_specs, format_rank,
             args.bit_precision,
@@ -960,10 +970,10 @@ def main():
             profile=model_profile,
         )
         if assign is None:
-            return None, float("nan"), float("inf")
-        total = compute_assignment_predicted_dloss(assign, candidates)
-        achieved_r, total = _combine_with_fixed_metrics(achieved_r, total)
-        return assign, achieved_r, total
+            return None, float("nan"), float("inf"), float("inf")
+        mutable_total = compute_assignment_predicted_dloss(assign, candidates)
+        achieved_r, total = _combine_with_fixed_metrics(achieved_r, mutable_total)
+        return assign, achieved_r, total, mutable_total
 
     def _expand_assignment_for_seed_json(
         assignment: dict[str, str],
@@ -998,7 +1008,7 @@ def main():
     targets = [float(x) for x in args.pareto_targets.split(",")]
     curve = []
     for t in targets:
-        assign, achieved, total = _solve_for_target(t)
+        assign, achieved, total, mutable_total = _solve_for_target(t)
         if assign is None:
             curve.append({"target_bits": t, "feasible": False})
             continue
@@ -1015,6 +1025,8 @@ def main():
             "feasible": True,
             "achieved_bits": achieved,
             "predicted_dloss": total,
+            "variable_predicted_dloss": mutable_total,
+            "fixed_predicted_dloss": fixed_total_dloss,
             **{f"layers_{k}": v for k, v in format_counts.items()},
             **{f"params_{k}": v for k, v in format_params.items()},
         })
@@ -1027,6 +1039,8 @@ def main():
                 "target_bits": float(t),
                 "achieved_bits": float(achieved),
                 "predicted_dloss": float(total),
+                "variable_predicted_dloss": float(mutable_total),
+                "fixed_predicted_dloss": float(fixed_total_dloss),
                 "assignment": expanded,
                 "format_counts": dict(sorted(expanded_counts.items())),
                 "bits_total": _assignment_bits_total(expanded),
@@ -1081,6 +1095,8 @@ def main():
                 "achieved_bits": float(record["achieved_bits"]),
                 "bits_total": float(record["bits_total"]),
                 "predicted_dloss": float(record["predicted_dloss"]),
+                "variable_predicted_dloss": float(record["variable_predicted_dloss"]),
+                "fixed_predicted_dloss": float(record["fixed_predicted_dloss"]),
                 "format_counts": record["format_counts"],
             })
         (out_dir / "manifest.json").write_text(json.dumps({
@@ -1106,13 +1122,18 @@ def main():
         print(f"[alloc] suggested knee (log-error): "
               f"target={knee['target_bits']}, "
               f"achieved={knee['achieved_bits']:.3f}, "
-              f"Δloss={knee['predicted_dloss']:.3e}")
+              f"Δloss={knee['kneedle_dloss']:.3e} "
+              f"({knee['kneedle_error_source']})")
         print(f"[alloc] raw-linear knee: target={raw['target_bits']}, "
               f"achieved={raw['achieved_bits']:.3f}, "
-              f"Δloss={raw['predicted_dloss']:.3e}")
+              f"Δloss={raw['kneedle_dloss']:.3e} "
+              f"({raw['kneedle_error_source']})")
 
     # Print table
-    print("\n  target  achieved     Δloss (pred)   " + "   ".join(
+    dloss_header = "Δloss (pred)"
+    if fixed_total_dloss:
+        dloss_header = "Δloss variable/total"
+    print(f"\n  target  achieved     {dloss_header:>20}   " + "   ".join(
         f"{s.name[:11]:>11}" for s in specs_sorted))
     for row in curve:
         if not row.get("feasible"):
@@ -1120,11 +1141,18 @@ def main():
             continue
         fmt_str = "   ".join(
             f"{row.get(f'layers_{s.name}', 0):>11,}" for s in specs_sorted)
+        if fixed_total_dloss:
+            dloss_str = (
+                f"{row['variable_predicted_dloss']:.4e}/"
+                f"{row['predicted_dloss']:.4e}"
+            )
+        else:
+            dloss_str = f"{row['predicted_dloss']:.4e}"
         print(f"  {row['target_bits']:>6.3f}  {row['achieved_bits']:>7.3f}  "
-              f"{row['predicted_dloss']:>14.4e}   {fmt_str}")
+              f"{dloss_str:>20}   {fmt_str}")
 
     # Emit chosen layer_config for target_bits.
-    assignment, achieved, total = _solve_for_target(args.target_bits)
+    assignment, achieved, total, mutable_total = _solve_for_target(args.target_bits)
     if assignment is None:
         raise SystemExit(
             f"Infeasible at target_bits={args.target_bits}. "
