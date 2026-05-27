@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -227,6 +227,23 @@ def cost_entry_uses_measured_output_mse(
     return _has_measured_output_mse(stats_entry, cost_entry)
 
 
+def cost_entry_source(stats_entry: dict, cost_entry: dict) -> str:
+    """Return the named cost source the allocator will use for one row."""
+    explicit = cost_entry.get("cost_source")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    if _has_measured_output_mse(stats_entry, cost_entry):
+        if (
+            _fisher_output_mse_allocator_enabled()
+            and "fisher_output_mse" in cost_entry
+        ):
+            return "fisher_output_mse"
+        return "output_mse"
+    if "predicted_dloss" in cost_entry:
+        return "predicted_dloss"
+    return "weight_mse"
+
+
 def _fisher_output_mse_allocator_enabled() -> bool:
     value = os.environ.get("PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR")
     if value is None:
@@ -280,6 +297,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
     gains = calibrated_gains or {}
     out: dict[str, list[Candidate]] = {}
     masked: dict[tuple[str, str], list[str]] = {}
+    source_counts: Counter[str] = Counter()
     for name, s in stats.items():
         if name not in costs:
             continue
@@ -328,6 +346,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             # cost_entry_predicted_dloss falls back to predicted_dloss or
             # weight_mse for those entries.
             predicted = cost_entry_predicted_dloss(s, entry, gain=gain)
+            source_counts[cost_entry_source(s, entry)] += 1
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=spec.effective_bits_for_shape(shape),
@@ -343,6 +362,11 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 f"dropped {fmt} reason={reason} (sample: {names[:3]})",
                 flush=True,
             )
+    if source_counts:
+        summary = ", ".join(
+            f"{source}={count}" for source, count in sorted(source_counts.items())
+        )
+        print(f"[alloc] cost-source usage: {summary}", flush=True)
     return out
 
 

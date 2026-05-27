@@ -92,6 +92,7 @@ from .allocator_solver import (
     compute_assignment_predicted_dloss,
     promote_fused,
     promote_moe_pair,
+    promote_serving_units,
     solve_with_promotion,
 )
 from .allocator_candidates import (
@@ -979,7 +980,7 @@ def main():
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
         expanded.update(fixed_format_assignment)
-        return promote_moe_pair(expanded, format_rank, profile=model_profile)
+        return promote_serving_units(expanded, format_rank, profile=model_profile)
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
         total = 0.0
@@ -1146,7 +1147,7 @@ def main():
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. This keeps per-Linear assignments serveable without
     # collapsing experts into allocator super-items.
-    assignment_expanded = promote_moe_pair(
+    assignment_expanded = promote_serving_units(
         assignment_expanded,
         format_rank,
         profile=model_profile,

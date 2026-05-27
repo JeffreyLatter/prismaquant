@@ -25,6 +25,7 @@ These tests pin:
 from __future__ import annotations
 
 from prismaquant import format_registry as fr
+from prismaquant.allocator_solver import promote_serving_units
 from prismaquant.allocator import (
     Candidate,
     _FUSED_SIBLING_MARKER,
@@ -65,6 +66,14 @@ class _FakePackedProfile:
         ):
             return "blocks.0.router_bank.lr"
         return None
+
+
+class _OverlappingProfile:
+    def fused_sibling_group(self, name: str) -> str | None:
+        return "overlap.fused" if name in {"overlap.left", "overlap.mid"} else None
+
+    def packed_expert_format_group(self, name: str) -> str | None:
+        return "overlap.moe" if name in {"overlap.mid", "overlap.right"} else None
 
 
 def _mk_stats_and_costs():
@@ -326,6 +335,24 @@ def test_promote_moe_pair_uses_default_profile_common_packed_groups():
     assert promoted["model.layers.2.mlp.experts.0.w1"] == "BF16"
     assert promoted["model.layers.2.mlp.experts.0.w2"] == "BF16"
     assert promoted["model.layers.2.mlp.experts.0.w3"] == "BF16"
+
+
+def test_serving_unit_promotion_handles_overlapping_groups_order_independently():
+    promoted = promote_serving_units(
+        {
+            "overlap.left": "NVFP4",
+            "overlap.mid": "MXFP8_E4M3",
+            "overlap.right": "BF16",
+        },
+        {"NVFP4": 0, "MXFP8_E4M3": 1, "BF16": 2},
+        profile=_OverlappingProfile(),
+    )
+
+    assert promoted == {
+        "overlap.left": "BF16",
+        "overlap.mid": "BF16",
+        "overlap.right": "BF16",
+    }
 
 
 # ---------------------------------------------------------------------------

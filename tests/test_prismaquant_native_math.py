@@ -7,7 +7,10 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
-from prismaquant.allocator_candidates import _scan_source_dtype_manifest
+from prismaquant.allocator_candidates import (
+    _scan_source_dtype_manifest,
+    cost_entry_source,
+)
 from prismaquant.allocator import (
     Candidate,
     build_candidates,
@@ -131,7 +134,33 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             clear=True,
         ):
             cands = build_candidates(stats, costs, [fr.get_format("FP8_E4M3")])
-        self.assertAlmostEqual(cands["layer.weight"][0].predicted_dloss, 0.05)
+            self.assertAlmostEqual(cands["layer.weight"][0].predicted_dloss, 0.05)
+
+    def test_cost_entry_source_reports_authoritative_fallback(self):
+        stats = {"h_trace": 2.0, "num_experts": 1}
+
+        self.assertEqual(
+            cost_entry_source(stats, {"output_mse": 0.25}),
+            "output_mse",
+        )
+        self.assertEqual(
+            cost_entry_source(
+                stats,
+                {
+                    "output_mse": 0.0,
+                    "output_mse_measured": False,
+                    "predicted_dloss": 7.0,
+                },
+            ),
+            "predicted_dloss",
+        )
+        self.assertEqual(
+            cost_entry_source(
+                stats,
+                {"predicted_dloss": 3.0, "cost_source": "grouped_kl_share"},
+            ),
+            "grouped_kl_share",
+        )
 
     def test_build_candidates_prices_source_fp8_below_mxfp8(self):
         stats = {

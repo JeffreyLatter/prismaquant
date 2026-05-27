@@ -48,6 +48,87 @@ def _group_by_profile(names, profile) -> dict[str, list[str]]:
     return groups
 
 
+def _packed_groups_by_profile(names, profile) -> dict[str, list[str]]:
+    """Group Linear names by the profile's packed-MoE serving unit key."""
+    groups: dict[str, list[str]] = {}
+    group_fn = getattr(profile, "packed_expert_format_group", None)
+    if not callable(group_fn):
+        return groups
+    for name in names:
+        try:
+            key = group_fn(name)
+        except Exception:
+            key = None
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(name)
+    return groups
+
+
+def _promote_group_components(
+    assignment: dict[str, str],
+    format_rank: dict[str, int],
+    groups: list[list[str]],
+) -> dict[str, str]:
+    """Promote connected serving-unit components to one shared format."""
+    out = dict(assignment)
+    parent = {name: name for name in out}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for group in groups:
+        members = [m for m in group if m in out]
+        if len(members) < 2:
+            continue
+        first = members[0]
+        for member in members[1:]:
+            union(first, member)
+
+    components: dict[str, list[str]] = {}
+    for name in out:
+        components.setdefault(find(name), []).append(name)
+
+    for members in components.values():
+        if len(members) < 2:
+            continue
+        best_fmt = max((out[member] for member in members), key=lambda fmt: format_rank[fmt])
+        best_rank = format_rank[best_fmt]
+        for member in members:
+            if format_rank[out[member]] < best_rank:
+                out[member] = best_fmt
+    return out
+
+
+def promote_serving_units(
+    assignment: dict[str, str],
+    format_rank: dict[str, int],
+    *,
+    profile=None,
+    include_fused: bool = True,
+    include_moe: bool = True,
+) -> dict[str, str]:
+    """Promote all serving-coupled units in one order-independent pass."""
+    if profile is None:
+        from .model_profiles import DefaultProfile
+        profile = DefaultProfile()
+    groups: list[list[str]] = []
+    if include_fused:
+        groups.extend(_group_by_profile(assignment.keys(), profile).values())
+    if include_moe:
+        groups.extend(_packed_groups_by_profile(assignment.keys(), profile).values())
+    return _promote_group_components(assignment, format_rank, groups)
+
+
 def fused_siblings(name: str, profile=None) -> tuple[tuple[str, ...], str] | None:
     """Legacy scalar sibling lookup kept for backward compatibility."""
     if profile is None:
@@ -69,30 +150,13 @@ def promote_moe_pair(
     if profile is None:
         from .model_profiles import DefaultProfile
         profile = DefaultProfile()
-    out = dict(assignment)
-    groups: dict[str, list[str]] = {}
-    profile_group_fn = getattr(profile, "packed_expert_format_group", None)
-
-    for name in assignment:
-        group_key = None
-        if callable(profile_group_fn):
-            try:
-                group_key = profile_group_fn(name)
-            except Exception:
-                group_key = None
-        if group_key is not None:
-            groups.setdefault(group_key, []).append(name)
-
-    for members in groups.values():
-        if len(members) < 2:
-            continue
-        ranks = [format_rank[out[m]] for m in members]
-        best = max(ranks)
-        best_fmt = next(k for k, v in format_rank.items() if v == best)
-        for m in members:
-            if format_rank[out[m]] < best:
-                out[m] = best_fmt
-    return out
+    return promote_serving_units(
+        assignment,
+        format_rank,
+        profile=profile,
+        include_fused=False,
+        include_moe=True,
+    )
 
 
 def promote_fused(assignment: dict[str, str],
@@ -102,7 +166,13 @@ def promote_fused(assignment: dict[str, str],
     if profile is None:
         from .model_profiles import DefaultProfile
         profile = DefaultProfile()
-    out = dict(assignment)
+    out = promote_serving_units(
+        assignment,
+        format_rank,
+        profile=profile,
+        include_fused=True,
+        include_moe=False,
+    )
     groups = _group_by_profile(assignment.keys(), profile)
     for members_present in groups.values():
         if len(members_present) < 2:
@@ -308,9 +378,13 @@ def solve_with_promotion(
             return last_assign, last_achieved
         assign, chosen_cands = result
         del chosen_cands
-        if not no_fused_promote:
-            assign = promote_fused(assign, format_rank, profile=profile)
-        assign = promote_moe_pair(assign, format_rank, profile=profile)
+        assign = promote_serving_units(
+            assign,
+            format_rank,
+            profile=profile,
+            include_fused=not no_fused_promote,
+            include_moe=True,
+        )
         achieved, _ = compute_achieved(
             stats, assign, format_specs,
             candidates=candidates,

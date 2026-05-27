@@ -3,10 +3,11 @@
 Current production path:
     1. incremental_probe.py              stream Fisher and activation shards
     2. incremental_measure_quant_cost.py build per-Linear format costs
-    3. kl_sensitivity_probe.py           build measured per-Linear frontiers
-    4. allocator.py                      choose the layer-format assignment
-    5. polish_from_assignment.py         run production-faithful local polish
-    6. export_native_compressed.py       write compressed-tensors artifacts
+    3. allocator.py                      choose Pareto layer-format assignments
+    4. validate_assignments_kl.py        measure held-out KL for candidates
+    5. export_native_compressed.py       write compressed-tensors artifacts
+    6. validate_native_export.py         run vLLM load/generation smoke
+    7. validate_quantized_model.py       run downstream quality checks
 
 Older cross-layer allocators are archived under archive/cross_layer_2026-05-09
 for artifact replay and comparison.

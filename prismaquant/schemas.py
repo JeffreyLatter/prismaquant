@@ -9,6 +9,25 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from numbers import Integral, Real
+from typing import NotRequired, TypedDict
+
+
+class CostEntry(TypedDict, total=False):
+    """Structural type for one per-format cost row.
+
+    Older artifacts are allowed to omit ``cost_source``; live producers should
+    set it when a cost was rewritten or comes from a non-default surrogate so
+    allocator logs can explain which objective priced the decision.
+    """
+
+    weight_mse: float
+    output_mse: float
+    rel_output_mse: float
+    predicted_dloss: float
+    fisher_output_mse: float
+    output_mse_measured: bool
+    cost_source: NotRequired[str]
+    error: str
 
 
 class SchemaValidationError(ValueError):
@@ -157,10 +176,28 @@ def validate_cost_payload(payload, path: str | None = None):
             if "error" in entry:
                 continue
             has_signal = False
-            for field in ("weight_mse", "predicted_dloss", "output_mse"):
+            for field in (
+                "weight_mse",
+                "predicted_dloss",
+                "output_mse",
+                "fisher_output_mse",
+            ):
                 if field in entry:
                     _as_number(entry[field], path, f".costs[{name!r}][{fmt!r}].{field}")
                     has_signal = True
+            if "cost_source" in entry and not isinstance(entry["cost_source"], str):
+                _fail(
+                    path,
+                    f".costs[{name!r}][{fmt!r}].cost_source",
+                    "must be a string when present",
+                )
+            if ("output_mse_measured" in entry
+                    and not isinstance(entry["output_mse_measured"], bool)):
+                _fail(
+                    path,
+                    f".costs[{name!r}][{fmt!r}].output_mse_measured",
+                    "must be a boolean when present",
+                )
             if not has_signal:
                 _fail(
                     path,
@@ -193,4 +230,3 @@ def validate_layer_config_payload(payload, path: str | None = None):
             continue
         _fail(path, where, "entry must be a format dict, string, or integer")
     return payload
-
