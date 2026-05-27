@@ -34,6 +34,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from . import format_registry as fr
 
@@ -247,14 +248,42 @@ class ActivationIndex:
     def __init__(self, cache_dir: Path, candidate_names):
         self.cache_dir = cache_dir
         self._paths: dict[str, Path] = {}
-        for name in candidate_names:
+        self._aliases: dict[str, str] = {}
+
+        def _add_name(name: str):
             fname = self._FNAME_SUB.sub("__", name) + ".pt"
-            fp = cache_dir / fname
+            fp = self.cache_dir / fname
             if fp.is_file():
                 self._paths[name] = fp
 
+        if isinstance(candidate_names, dict):
+            for name, meta in candidate_names.items():
+                _add_name(str(name))
+                if isinstance(meta, dict):
+                    experts_qname = meta.get("_packed_experts_module")
+                    if isinstance(experts_qname, str) and experts_qname:
+                        _add_name(experts_qname)
+                        if experts_qname in self._paths:
+                            self._aliases[str(name)] = experts_qname
+        else:
+            for name in candidate_names:
+                _add_name(str(name))
+
+    def _path_for_name(self, name: str) -> Path | None:
+        if name in self._paths:
+            return self._paths[name]
+        alias = self._aliases.get(name)
+        if alias is not None and alias in self._paths:
+            return self._paths[alias]
+        fname = self._FNAME_SUB.sub("__", name) + ".pt"
+        fp = self.cache_dir / fname
+        if fp.is_file():
+            self._paths[name] = fp
+            return fp
+        return None
+
     def __contains__(self, name: str) -> bool:
-        return name in self._paths
+        return self._path_for_name(name) is not None
 
     def __len__(self) -> int:
         return len(self._paths)
@@ -264,8 +293,10 @@ class ActivationIndex:
         return blob["inputs"]
 
     def load_blob(self, name: str) -> dict:
-        return torch.load(self._paths[name], map_location="cpu",
-                          weights_only=False)
+        fp = self._path_for_name(name)
+        if fp is None:
+            raise KeyError(name)
+        return torch.load(fp, map_location="cpu", weights_only=False)
 
     def load_with_row_indices(self, name: str) -> tuple[torch.Tensor, torch.Tensor | None]:
         blob = self.load_blob(name)
@@ -479,16 +510,17 @@ def _chunked(seq, size):
 
 def _enumerate_packed_experts(model: nn.Module, target_names: set[str],
                               profile=None,
-                              ) -> list[tuple[str, nn.Parameter]]:
+                              ) -> list[tuple[str, nn.Parameter, str, nn.Module]]:
     """Find every 3D nn.Parameter that lives directly under a module
     named like an MoE experts container. Uses the same class-name +
     param-name filters as sensitivity_probe._is_packed_experts_module
     so we never accidentally treat e.g. a Conv1d weight as a packed
     expert tensor.
 
-    Returns [(canonical_name, packed_param), ...] where canonical_name
-    is `<module_qname>.<param_name>` to match the probe's stat keys.
-    Only entries appearing in `target_names` are returned.
+    Returns [(canonical_name, packed_param, module_qname, module), ...]
+    where canonical_name is `<module_qname>.<param_name>` to match the
+    probe's stat keys. Only entries appearing in `target_names` are
+    returned.
     """
     from .sensitivity_probe import _is_packed_experts_module, _packed_experts_param_names
     out = []
@@ -499,8 +531,149 @@ def _enumerate_packed_experts(model: nn.Module, target_names: set[str],
             p = getattr(mod, pn)
             full = f"{qname}.{pn}" if qname else pn
             if full in target_names:
-                out.append((full, p))
+                out.append((full, p, qname, mod))
     return out
+
+
+def _packed_experts_parent_module(model: nn.Module, experts_qname: str) -> nn.Module | None:
+    if not experts_qname:
+        return None
+    if experts_qname.endswith(".experts"):
+        parent_qname = experts_qname[: -len(".experts")]
+    elif ".experts." in experts_qname:
+        parent_qname = experts_qname.rsplit(".experts.", 1)[0]
+    elif "." in experts_qname:
+        parent_qname = experts_qname.rsplit(".", 1)[0]
+    else:
+        return None
+    try:
+        return model.get_submodule(parent_qname)
+    except AttributeError:
+        return None
+
+
+def _packed_experts_router(parent_module: nn.Module | None) -> nn.Module | None:
+    if parent_module is None:
+        return None
+    for attr in ("gate", "router"):
+        router = getattr(parent_module, attr, None)
+        if isinstance(router, nn.Module):
+            return router
+    return None
+
+
+def _packed_router_topk(
+    router: nn.Module,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (top_k_index, top_k_weights) for a Qwen/DeepSeek-style router."""
+    out = router(hidden_states)
+    if isinstance(out, (tuple, list)):
+        if len(out) >= 3:
+            second = out[1]
+            third = out[2]
+            if not isinstance(second, torch.Tensor) or not isinstance(third, torch.Tensor):
+                raise ValueError("router tuple entries 1 and 2 must be tensors")
+            if second.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+                indices = second
+                weights = third
+            elif third.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+                weights = second
+                indices = third
+            else:
+                raise ValueError("router tuple does not expose integer top-k indices")
+            if weights.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+                raise ValueError("router top-k weights must be floating point")
+            return indices.to(device=hidden_states.device), weights.to(
+                device=hidden_states.device,
+            )
+        if len(out) >= 2:
+            first, second = out[0], out[1]
+            if isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor):
+                if second.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+                    return second.to(device=hidden_states.device), first.to(
+                        device=hidden_states.device,
+                    )
+                if first.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+                    return first.to(device=hidden_states.device), second.to(
+                        device=hidden_states.device,
+                    )
+                raise ValueError("router tuple does not expose integer top-k indices")
+    if not isinstance(out, torch.Tensor):
+        raise ValueError(f"unsupported router output type {type(out)!r}")
+    top_k = int(getattr(router, "top_k", 0) or 0)
+    if top_k <= 0:
+        raise ValueError("router returned logits only and exposes no top_k")
+    probs = torch.softmax(out.float(), dim=-1)
+    weights, indices = torch.topk(probs, top_k, dim=-1)
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return indices.to(device=hidden_states.device), weights.to(device=hidden_states.device)
+
+
+def _packed_experts_forward_with_weights(
+    experts_mod: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    *,
+    input_quantize=None,
+    intermediate_quantize=None,
+) -> torch.Tensor:
+    """Replay the packed-experts forward with explicit packed weights.
+
+    This mirrors the Qwen3.5/DeepSeek-style fused expert module: one
+    packed gate/up tensor, one packed down tensor, and router-provided
+    token-to-expert assignments. Quantization hooks are placed at the
+    same Linear boundaries as the dense measurement path.
+    """
+    num_experts = int(getattr(experts_mod, "num_experts", gate_up_weight.size(0)))
+    act_fn = getattr(experts_mod, "act_fn", None)
+    if act_fn is None:
+        raise ValueError("packed experts module exposes no act_fn")
+    final_hidden_states = torch.zeros_like(hidden_states)
+    with torch.no_grad():
+        expert_mask = F.one_hot(top_k_index.to(torch.long), num_classes=num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    for expert_idx_t in expert_hit:
+        expert_idx = int(expert_idx_t[0].item())
+        if expert_idx >= num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        if input_quantize is not None:
+            current_state = input_quantize(current_state)
+        gate_up = F.linear(current_state, gate_up_weight[expert_idx])
+        apply_gate = getattr(experts_mod, "_apply_gate", None)
+        if callable(apply_gate):
+            current_hidden_states = apply_gate(gate_up)
+        else:
+            gate, up = gate_up.chunk(2, dim=-1)
+            current_hidden_states = act_fn(gate) * up
+        if intermediate_quantize is not None:
+            current_hidden_states = intermediate_quantize(current_hidden_states)
+        current_hidden_states = F.linear(
+            current_hidden_states,
+            down_weight[expert_idx],
+        )
+        current_hidden_states = (
+            current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        )
+        final_hidden_states.index_add_(
+            0,
+            token_idx,
+            current_hidden_states.to(final_hidden_states.dtype),
+        )
+    return final_hidden_states
+
+
+def _packed_expert_activation_quantizer(spec: fr.FormatSpec):
+    def _quantize(x: torch.Tensor) -> torch.Tensor:
+        return spec.activation_quantize_dequantize(x.clone())
+    return _quantize
 
 
 def _measure_packed_experts(
@@ -510,19 +683,18 @@ def _measure_packed_experts(
     device: str,
     dtype: torch.dtype,
     accum: dict,
+    act_cache: "ActivationIndex | None" = None,
     h_detail: "HDetailIndex | None" = None,
     profile=None,
 ) -> None:
-    """Measure per-format weight_mse for each packed-expert tensor.
+    """Measure per-format cost for each packed-expert tensor.
 
     The 3D `[num_experts, out, in]` packed tensor reuses the existing
-    batched codebook RTN path with N = num_experts. We do not measure
-    output_mse for packed experts: the experts module's forward involves
-    token routing, so a clean per-tensor output MSE would require
-    per-expert masked input slices that are awkward to reconstruct
-    offline. A zero is recorded for output_mse so downstream schema
-    validation still sees a scalar, but the entry is marked unmeasured so
-    the allocator falls back to predicted_dloss or weight_mse.
+    batched codebook RTN path with N = num_experts. When the probe has
+    cached inputs for the experts module, this path now replays the routed
+    packed-MoE forward and records the same output_mse objective that
+    dense Linears use. If the router or activation cache is unavailable,
+    the entry is marked unmeasured so the allocator falls back explicitly.
 
     When `h_detail` is provided, we also emit a per-weight Δloss based
     on the packed H diagonal stored with per-expert per-output-channel
@@ -535,8 +707,57 @@ def _measure_packed_experts(
     entries = _enumerate_packed_experts(model, target_names, profile)
     if not entries:
         return
-    for full_name, packed_param in entries:
+    measured = 0
+    fallback = 0
+    for full_name, packed_param, experts_qname, experts_mod in entries:
         w = packed_param.detach().to(device=dev, dtype=dtype)
+        param_name = full_name.rsplit(".", 1)[-1]
+
+        X = None
+        top_k_index = None
+        top_k_weights = None
+        y_ref = None
+        ref_energy = None
+        gate_up = None
+        down = None
+        can_measure_output = False
+        if act_cache is not None and experts_qname in act_cache:
+            parent_mod = _packed_experts_parent_module(model, experts_qname)
+            router = _packed_experts_router(parent_mod)
+            try:
+                X_cpu = act_cache.load(experts_qname)
+                X = X_cpu.to(device=dev, dtype=dtype).reshape(-1, X_cpu.size(-1))
+                if router is None:
+                    raise ValueError(f"no router found for {experts_qname}")
+                gate_up_param = getattr(experts_mod, "gate_up_proj", None)
+                down_param = getattr(experts_mod, "down_proj", None)
+                if gate_up_param is None or down_param is None:
+                    raise ValueError("packed experts module lacks gate_up/down params")
+                gate_up = gate_up_param.detach().to(device=dev, dtype=dtype)
+                down = down_param.detach().to(device=dev, dtype=dtype)
+                with torch.no_grad():
+                    top_k_index, top_k_weights = _packed_router_topk(router, X)
+                    y_ref = _packed_experts_forward_with_weights(
+                        experts_mod,
+                        X,
+                        top_k_index,
+                        top_k_weights,
+                        gate_up,
+                        down,
+                    )
+                ref_energy = float(y_ref.float().pow(2).mean().item())
+                can_measure_output = True
+            except Exception as e:
+                print(f"[cost] WARN: packed output_mse unavailable for "
+                      f"{full_name}: {e}", flush=True)
+                X = None
+                top_k_index = None
+                top_k_weights = None
+                y_ref = None
+                ref_energy = None
+                gate_up = None
+                down = None
+
         # Per-(expert, out-channel) H, shape [E, M]. Expanded to [E, M, 1]
         # so broadcasting against (w-w_hat)² averaged over the in-features
         # dim gives a single Δloss scalar per (layer, format).
@@ -561,18 +782,70 @@ def _measure_packed_experts(
                         0.5 * (h_em * per_ch_mse).sum().item() * err.size(-1)
                     )
                     del per_ch_mse
+                output_mse = 0.0
+                rel_mse = 0.0
+                output_mse_measured = False
+                if can_measure_output:
+                    act_quant = _packed_expert_activation_quantizer(spec)
+                    with torch.no_grad():
+                        if param_name == "gate_up_proj":
+                            y_q = _packed_experts_forward_with_weights(
+                                experts_mod,
+                                X,
+                                top_k_index,
+                                top_k_weights,
+                                w_hat,
+                                down,
+                                input_quantize=act_quant,
+                            )
+                        elif param_name == "down_proj":
+                            y_q = _packed_experts_forward_with_weights(
+                                experts_mod,
+                                X,
+                                top_k_index,
+                                top_k_weights,
+                                gate_up,
+                                w_hat,
+                                intermediate_quantize=act_quant,
+                            )
+                        else:
+                            y_q = None
+                    if y_q is not None:
+                        y_err_sq = (y_ref - y_q).float().pow(2)
+                        output_mse = float(y_err_sq.mean().item())
+                        rel_mse = output_mse / max(float(ref_energy), 1e-12)
+                        output_mse_measured = True
+                        measured += 1
+                        del y_q, y_err_sq
+                if not output_mse_measured:
+                    fallback += 1
                 _accumulate_result(accum, full_name, spec.name,
-                                   weight_mse, 0.0, 0.0,
+                                   weight_mse, output_mse, rel_mse,
                                    predicted_dloss=dloss_val,
-                                   output_mse_measured=False)
+                                   output_mse_measured=output_mse_measured)
                 del w_hat, err
             except Exception as e:
                 accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
         del w
+        if X is not None:
+            del X
+        if top_k_index is not None:
+            del top_k_index
+        if top_k_weights is not None:
+            del top_k_weights
+        if y_ref is not None:
+            del y_ref
+        if gate_up is not None:
+            del gate_up
+        if down is not None:
+            del down
         if h_em is not None:
             del h_em
         if dev.type == "cuda":
             torch.cuda.empty_cache()
+    if measured or fallback:
+        print(f"[cost] packed experts output_mse measured={measured} "
+              f"fallback={fallback}", flush=True)
 
 
 def _batched_codebook_rtn(stacked_w: torch.Tensor, codebook: torch.Tensor,
@@ -593,11 +866,11 @@ def _batched_codebook_rtn(stacked_w: torch.Tensor, codebook: torch.Tensor,
         w2 = w2.unsqueeze(2)
 
     cb = codebook.to(device=w2.device, dtype=torch.float32).contiguous()
-    cmax = float(cb.abs().max().item())
+    cmax = cb.abs().max()
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
     if mx_scale:
-        scale = fr._snap_scale_e8m0(scale)
+        scale = fr._snap_scale_e8m0(scale, element_max=cmax)
     x = (w2 / scale).contiguous()
 
     # Bucketize returns int64 by default; cast to int32 to halve the index
@@ -927,12 +1200,22 @@ def prepare_cost_context(probe_path: str,
     specs = [fr.get_format(n) for n in fmt_names]
     print(f"[cost] measuring {len(specs)} formats: {[s.name for s in specs]}")
 
-    act_cache = ActivationIndex(cache, stats.keys())
+    act_cache = ActivationIndex(cache, stats)
     print(f"[cost] activation cache (lazy index): "
           f"{len(act_cache)} Linears mapped", flush=True)
 
     target_names = set(stats.keys())
-    missing_act = [n for n in target_names if n not in act_cache]
+    def _has_activation_for_target(name: str) -> bool:
+        if name in act_cache:
+            return True
+        meta = stats.get(name)
+        if isinstance(meta, dict):
+            experts_qname = meta.get("_packed_experts_module")
+            if isinstance(experts_qname, str) and experts_qname in act_cache:
+                return True
+        return False
+
+    missing_act = [n for n in target_names if not _has_activation_for_target(n)]
     if missing_act and not skip_missing_activations:
         raise SystemExit(f"{len(missing_act)} Linears missing activation; "
                          f"pass --skip-missing-activations to proceed.")
@@ -993,7 +1276,8 @@ def run_cost_pass(model: nn.Module,
     # format so finalization is uniform.
     packed_accum: dict[str, dict] = {}
     _measure_packed_experts(model, target_names, specs, device, dtype,
-                            packed_accum, h_detail=h_detail,
+                            packed_accum, act_cache=act_cache,
+                            h_detail=h_detail,
                             profile=model_profile)
     if packed_accum:
         results.update(_finalize_results(packed_accum))
