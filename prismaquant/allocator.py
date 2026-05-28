@@ -69,8 +69,12 @@ Optional empirical calibration:
   producer for this payload is archived; production recipes normally run
   uncalibrated and validate assignments with direct KL measurement.
 
-Auto-Pareto knee via Kneedle (Satopää et al.). Reports the knee target
-plus a few flanking points so you can eyeball.
+Auto-Pareto knee via Kneedle (Satopää et al.). The primary recommendation
+uses a post-cliff log-error knee: when the frontier spans multiple orders of
+magnitude, the first half of the log-error range is treated as the
+catastrophic region and Kneedle is applied to the remaining operational
+frontier. The global log-error and raw-linear knees are still reported as
+diagnostics.
 """
 from __future__ import annotations
 
@@ -149,14 +153,45 @@ def _log_error_values(y: list[float]) -> list[float]:
     return [math.log10(max(float(v), floor)) for v in y]
 
 
+def _log_error_tail_start(y: list[float]) -> int:
+    """Return the first index in the operational log-error frontier.
+
+    Full Pareto curves often contain a catastrophic low-bit prefix where error
+    drops by orders of magnitude before the useful shipping frontier starts.
+    Applying Kneedle over the whole log range can then select the transition
+    out of catastrophe instead of the real tradeoff knee. Trim that prefix once
+    the curve spans at least one decade, starting at the first point in the
+    lower half of the log-error range. Keep at least three points for Kneedle.
+    """
+    logs = _log_error_values(y)
+    if len(logs) < 3:
+        return 0
+    ymin, ymax = min(logs), max(logs)
+    if ymax - ymin < 1.0:
+        return 0
+    threshold = 0.5 * (ymin + ymax)
+    idx = next((i for i, v in enumerate(logs) if v <= threshold), 0)
+    return min(max(idx, 0), max(len(logs) - 3, 0))
+
+
 def kneedle_raw_linear(x: list[float], y: list[float]) -> int:
     """Return the historical raw-error Kneedle index."""
     return _kneedle_convex_decreasing(x, y)
 
 
-def kneedle_log_error(x: list[float], y: list[float]) -> int:
-    """Return the primary Kneedle index on log10(error)."""
+def kneedle_log_error_global(x: list[float], y: list[float]) -> int:
+    """Return Kneedle over the full log10(error) range."""
     return _kneedle_convex_decreasing(x, _log_error_values(y))
+
+
+def kneedle_log_error(x: list[float], y: list[float]) -> int:
+    """Return the primary post-cliff Kneedle index on log10(error)."""
+    start = _log_error_tail_start(y)
+    local = _kneedle_convex_decreasing(
+        x[start:],
+        _log_error_values(y[start:]),
+    )
+    return start + local
 
 
 def kneedle(x: list[float], y: list[float]) -> int:
@@ -164,9 +199,11 @@ def kneedle(x: list[float], y: list[float]) -> int:
 
     The allocator's Δloss can span orders of magnitude. Running Kneedle
     on raw error lets the largest point dominate the normalized curve and
-    tends to pick the first large absolute drop. The default therefore
-    runs on log-error; `kneedle_raw_linear` remains available for
-    diagnostics and backwards comparisons.
+    tends to pick the first large absolute drop. Running Kneedle over the
+    full log-error range can still pick the transition out of catastrophic
+    error. The default therefore runs on the post-cliff log-error frontier;
+    global-log and raw-linear knees remain available for diagnostics and
+    backwards comparisons.
     """
     return kneedle_log_error(x, y)
 
@@ -200,11 +237,13 @@ def _pareto_knee_summary(curve: list[dict]) -> dict:
         return record
 
     raw_idx = kneedle_raw_linear(xs, ys)
+    global_log_idx = kneedle_log_error_global(xs, ys)
     log_idx = kneedle_log_error(xs, ys)
     return {
         "enabled": True,
         "primary": "log_error",
         "log_error": _record("log_error", log_idx),
+        "global_log_error": _record("global_log_error", global_log_idx),
         "raw_linear": _record("raw_linear", raw_idx),
     }
 
