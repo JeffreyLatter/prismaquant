@@ -3,7 +3,7 @@
 cost.pkl as written by `measure_quant_cost` uses **bare RTN** quantization
 to score every (Linear, format) — it doesn't apply the production lever
 stack (GPTQ + JSO + damp_sweep). The allocator then promotes Linears to
-MXFP8/FP8/BF16 based on pessimistic RTN-quality estimates, even though
+FP8_DYNAMIC/BF16 based on pessimistic RTN-quality estimates, even though
 the production stack would fix many of them at NVFP4. The result is
 non-monotonic Pareto curves and over-promotion.
 
@@ -52,7 +52,7 @@ def main(argv=None) -> int:
     p.add_argument("--n-calib-samples", type=int, default=32)
     p.add_argument("--calib-seqlen", type=int, default=1024)
     p.add_argument("--device", default="cuda")
-    p.add_argument("--formats", default="NVFP4,MXFP8_E4M3,FP8_E4M3",
+    p.add_argument("--formats", default="NVFP4,FP8_DYNAMIC",
                    help="Comma-separated formats to re-measure. BF16 is a "
                    "passthrough so it stays at output_mse=0.")
     args = p.parse_args(argv)

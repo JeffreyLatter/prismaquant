@@ -5,6 +5,7 @@ import torch
 from prismaquant import format_registry as fr
 from prismaquant.export_native_compressed import (
     _mxfp8_dequantize_2d,
+    quantize_dequantize_fp8_dynamic,
     quantize_dequantize_mxfp8,
 )
 
@@ -29,6 +30,124 @@ def test_plain_fp8_rtn_uses_eager_path(monkeypatch):
     assert compile_calls == []
     assert y.shape == x.shape
     assert not torch.equal(y, x)
+
+
+def test_plain_fp8_weight_matches_compressed_tensors_fp8_dynamic():
+    from compressed_tensors.quantization.lifecycle.forward import fake_quantize
+    from compressed_tensors.quantization.quant_scheme import FP8_DYNAMIC
+    from compressed_tensors.quantization.utils.helpers import calculate_qparams
+
+    vals = torch.tensor(
+        [
+            0.0,
+            1e-12,
+            -1e-12,
+            1e-8,
+            -1e-8,
+            1e-6,
+            -1e-6,
+            1.0 / 1024.0,
+            -1.0 / 1024.0,
+            1.0 / 512.0,
+            -1.0 / 512.0,
+            240.0,
+            -240.0,
+            448.0,
+            -448.0,
+        ],
+        dtype=torch.float32,
+    )
+    w = vals.repeat(4, 1)
+    w[1] *= 1e-6
+    w[2] = 0.0
+
+    registry = fr.get_format("FP8_E4M3").quantize_dequantize(w)
+
+    args = FP8_DYNAMIC["weights"]
+    scale, zero_point = calculate_qparams(w.amin(dim=1), w.amax(dim=1), args)
+    compressed_tensors = fake_quantize(
+        w,
+        scale.reshape(-1, 1),
+        zero_point.reshape(-1, 1),
+        args,
+    )
+
+    export_q, export_scale = quantize_dequantize_fp8_dynamic(w)
+    export = export_q.float() * export_scale
+
+    assert torch.allclose(registry, compressed_tensors, atol=0.0, rtol=0.0)
+    assert torch.allclose(registry, export, atol=0.0, rtol=0.0)
+
+
+def test_plain_fp8_rank3_activation_matches_compressed_tensors_fp8_dynamic():
+    from compressed_tensors.quantization.lifecycle.forward import fake_quantize
+    from compressed_tensors.quantization.quant_scheme import FP8_DYNAMIC
+    from compressed_tensors.quantization.utils.helpers import (
+        compute_dynamic_scales_and_zp,
+    )
+
+    torch.manual_seed(19)
+    x = torch.randn(2, 5, 32, dtype=torch.float32) * 3.0
+    x[0, 0, :8] = torch.tensor(
+        [
+            0.0,
+            1.0 / 1024.0,
+            -1.0 / 1024.0,
+            1.0 / 512.0,
+            -1.0 / 512.0,
+            240.0,
+            448.0,
+            -448.0,
+        ],
+        dtype=torch.float32,
+    )
+
+    registry = fr.get_format("FP8_E4M3").activation_quantize_dequantize(x)
+
+    args = FP8_DYNAMIC["input_activations"]
+    dummy = torch.nn.Linear(x.shape[-1], 1, bias=False)
+    scale, zero_point = compute_dynamic_scales_and_zp(x, args, dummy)
+    compressed_tensors = fake_quantize(x, scale, zero_point, args)
+
+    assert torch.allclose(registry, compressed_tensors, atol=0.0, rtol=0.0)
+
+
+def test_plain_fp8_rank2_activation_matches_vllm_dynamic_token_reference():
+    x = torch.tensor(
+        [
+            [
+                0.0,
+                1e-12,
+                -1e-12,
+                1e-8,
+                -1e-8,
+                1e-6,
+                -1e-6,
+                1.0 / 1024.0,
+                -1.0 / 1024.0,
+                1.0 / 512.0,
+                -1.0 / 512.0,
+                1.0,
+                -1.0,
+                448.0,
+                -448.0,
+                0.25,
+            ],
+            torch.linspace(-3.0, 3.0, steps=16, dtype=torch.float32),
+        ],
+        dtype=torch.float32,
+    )
+    registry = fr.get_format("FP8_E4M3").activation_quantize_dequantize(x)
+
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    min_scale = 1.0 / (fp8_max * 512.0)
+    scale = (x.abs().amax(dim=-1, keepdim=True) / fp8_max).clamp_min(
+        min_scale,
+    )
+    quant = (x / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    reference = quant.float() * scale
+
+    assert torch.allclose(registry, reference, atol=0.0, rtol=0.0)
 
 
 def test_mx_e8m0_rtn_matches_export_scale_rounding():

@@ -1,8 +1,9 @@
 """Build a production-faithful δw cache for a model checkpoint.
 
 Renders W_tilde[name, fmt] using the export pipeline's activation-aware
-passes (GPTQ damp-sweep + scale_sweep on NVFP4; GPTQ on FP8_E4M3/FP8_E5M2;
-GPTQ on MXFP8_E4M3/MXFP8_E5M2; passthrough on BF16) and saves a pickle that
+passes (GPTQ damp-sweep + scale_sweep on NVFP4; GPTQ damp-sweep on
+FP8_DYNAMIC/FP8_E4M3; explicit MX formats only when requested; passthrough
+on BF16) and saves a pickle that
 PerturbedActivationCache can load via ``production_weight_cache=...``.
 
 By default this standalone CLI renders the explicit ``--formats`` menu for
@@ -62,9 +63,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--formats",
         default="NVFP4",
-        help="Comma-separated formats to render. FP8_E4M3/FP8_E5M2 and "
-        "MXFP8_E4M3/MXFP8_E5M2 cache is cheap compared with NVFP4, but "
-        "the FP8 and microscaled FP8 paths still benefit from GPTQ.",
+        help="Comma-separated formats to render. FP8_DYNAMIC is accepted "
+        "as an alias for FP8_E4M3 and uses GPTQ damp-sweep. MXFP8/E5M2 "
+        "are explicit opt-in research/legacy formats.",
     )
     p.add_argument(
         "--render-scope",
@@ -110,7 +111,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Use none for RTN-only rendering with no local production levers. "
         "Default `gptq,static_act_order,joint_scale_opt` ships GPTQ "
         "(with the always-on per-Linear damp sweep), static activation "
-        "ordering where the format supports it, plus JSO. "
+        "ordering where the format supports it, plus JSO. FP8_DYNAMIC "
+        "uses GPTQ damp-sweep; static activation ordering and JSO are "
+        "ignored for FP8 because its served representation is per-row "
+        "scaled FP8 dynamic. "
         "scale_sweep regresses end-to-end KL on Qwen3-4B and was dropped "
         "from defaults 2026-05-15. "
         "fisher_gptq is an archived legacy name and must not be used for "
@@ -119,7 +123,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "computed unconditionally when NVFP4 is in the format menu. "
         "static_act_order applies to production microscaling GPTQ formats "
         "(NVFP4, MXFP4, MXFP8); joint_scale_opt applies only to NVFP4. "
-        "MXFP4/MXFP8 use the canonical E8M0 scale rule inside GPTQ. "
+        "MXFP4/MXFP8 use the canonical E8M0 scale rule inside GPTQ when "
+        "explicitly requested. "
         "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
     )
     p.add_argument(
@@ -168,8 +173,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional newline-delimited qname allowlist. After normal "
         "profile/pinned skips, only qnames in this file are rendered. Used "
-        "by staged production-render cost to render FP8_E4M3/FP8_E5M2 and "
-        "MXFP8_E4M3/MXFP8_E5M2 only for the high-error NVFP4 tail.",
+        "by staged production-render cost to render FP8_DYNAMIC only for "
+        "the high-error NVFP4 tail.",
     )
     p.add_argument(
         "--recache-layer-config",

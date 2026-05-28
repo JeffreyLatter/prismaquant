@@ -69,6 +69,7 @@ from typing import Callable, Iterable, Sequence
 
 import torch
 import torch.nn as nn
+from compressed_tensors.quantization.utils.mxfp_utils import generate_mx_scales
 try:
     from accelerate import init_empty_weights
 except ModuleNotFoundError:
@@ -79,6 +80,8 @@ except ModuleNotFoundError:
 from safetensors.torch import save_file
 
 from .allocator_candidates import check_format_applicability
+from .fp8_dynamic import fp8_dynamic_weight_qdq
+from .mx_formats import e8m0_to_scale, mxfp8_e4m3_qdq
 from .serving_profiles import resolve_target_profile
 from .layer_config import (
     canonicalize_assignment as _canonicalize_assignment,
@@ -2016,16 +2019,15 @@ def _fp8_dynamic_codec(
     element_dtype: torch.dtype = torch.float8_e4m3fn,
     element_max: float = FP8_E4M3_MAX,
 ) -> _FP8CodecResult:
-    values_f = values.to(torch.float32)
-    scale = (
-        values_f.abs().amax(dim=-1, keepdim=True).clamp_min(2.0 ** -127)
-        / float(element_max)
-    )
-    return _fp8_codec(
-        values_f,
-        scale=scale,
+    result = fp8_dynamic_weight_qdq(
+        values,
         element_dtype=element_dtype,
         element_max=element_max,
+    )
+    return _FP8CodecResult(
+        quant=result.quant,
+        scale=result.scale,
+        dequant=result.dequant,
     )
 
 
@@ -2044,13 +2046,7 @@ def _mxfp8_e8m0_to_scale(
     *,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    target_device = device if device is not None else e8m0_uint8.device
-    e8m0 = e8m0_uint8.to(device=target_device, dtype=torch.int16)
-    exponent = e8m0.to(torch.float32) - 127.0
-    return torch.pow(
-        torch.tensor(2.0, device=target_device, dtype=torch.float32),
-        exponent,
-    )
+    return e8m0_to_scale(e8m0_uint8, device=device)
 
 
 def _mx_rounded_amax_power2(amax: torch.Tensor) -> torch.Tensor:
@@ -2077,6 +2073,13 @@ def _mx_base_exponent_from_amax(
     *,
     element_max: float,
 ) -> torch.Tensor:
+    if math.isclose(float(element_max), MXFP4_E2M1_MAX, rel_tol=0.0, abs_tol=1e-6):
+        return generate_mx_scales(amax, num_bits=4).to(torch.float32) - 127.0
+    if math.isclose(float(element_max), MXFP8_E4M3_MAX, rel_tol=0.0, abs_tol=1e-6):
+        return generate_mx_scales(amax, num_bits=8).to(torch.float32) - 127.0
+
+    # compressed-tensors only exposes MX scale generation for FP4 E2M1 and
+    # FP8 E4M3. Keep the local fallback for research-only FP8_E5M2.
     rounded = _mx_rounded_amax_power2(amax)
     element_offset = int(math.floor(math.log2(float(element_max))))
     exponent = torch.floor(torch.log2(rounded)) - float(element_offset)
@@ -2101,6 +2104,22 @@ def _mxfp8_grouped_codec(
     element_dtype: torch.dtype = torch.float8_e4m3fn,
     element_max: float = MXFP8_E4M3_MAX,
 ) -> _MXFP8CodecResult:
+    if (
+        e8m0_unbiased is None
+        and element_dtype == torch.float8_e4m3fn
+        and float(element_max) == float(MXFP8_E4M3_MAX)
+    ):
+        ungrouped = grouped.reshape(
+            *grouped.shape[:-2],
+            grouped.shape[-2] * grouped.shape[-1],
+        )
+        result = mxfp8_e4m3_qdq(ungrouped)
+        return _MXFP8CodecResult(
+            quant=result.quant.reshape_as(grouped),
+            scale=result.scale,
+            dequant=result.dequant.reshape_as(grouped),
+        )
+
     grouped_f = grouped.to(torch.float32)
     if e8m0_unbiased is None:
         e8m0_unbiased = _mxfp8_base_exponent(

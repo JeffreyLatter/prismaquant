@@ -22,12 +22,12 @@ quantization path:
       individual formats explicitly opt out of unsupported mechanisms,
       and regressive candidates fall back to the previous accepted render
       while recording metadata
-    * activation-weighted MXFP8_E4M3 E8M0 scale search and FP8 dynamic per-row
-      scale search when scale_sweep is enabled; these refine the current
+    * FP8_DYNAMIC/FP8_E4M3 per-row scale search when scale_sweep is enabled;
+      explicit MXFP8 E8M0 scale search remains opt-in. These refine the current
       accepted render rather than starting a separate format-specific path
-    * activation-weighted GPTQ for FP8_E4M3/FP8_E5M2 and
-      MXFP8_E4M3/MXFP8_E5M2. NVFP4 is the only production format that uses
-      joint_scale_opt; MXFP8 uses the canonical E8M0 scale rule.
+    * activation-weighted GPTQ for FP8_DYNAMIC/FP8_E4M3. Explicit MXFP8 keeps
+      GPTQ support for research/legacy artifacts. NVFP4 is the only production
+      format that uses joint_scale_opt; MXFP8 uses the canonical E8M0 scale rule.
     * retired Fisher-weighted local objectives are archived under
       ``archive/fisher_2026-05-15/`` and are not part of the production
       pipeline
@@ -41,9 +41,11 @@ quantization path:
     * block-output match (post-GPTQ refinement against BF16 block output)
     * any export-only refinements added after this docstring is written
 
-  FP8 / MXFP8_E4M3 / MXFP8_E5M2 / BF16:
-    * FP8_E4M3/FP8_E5M2 and MXFP8_E4M3/MXFP8_E5M2 use the same GPTQ and
-      scale paths as export when the corresponding levers are enabled.
+  FP8_DYNAMIC / BF16:
+    * FP8_DYNAMIC is represented by the canonical FP8_E4M3 format name:
+      per-output-row FP32 weight scales and per-token dynamic activation
+      scales. It uses GPTQ damp-sweep by default in production render.
+    * Explicit MXFP8/MXFP4 formats remain available only when requested.
     * BF16 is passthrough.
 
 PerturbedActivationCache installs `W_tilde` (and applies the calibrated
@@ -2215,7 +2217,7 @@ def fill_production_weight_cache(
     }
     render_base_fmt_set = {_render_base_format(fmt) for fmt in fmt_set}
     # Store activations for every missing rendered format.  NVFP4 needs them
-    # for GPTQ/JSO; FP8_E4M3/FP8_E5M2 and MXFP8_E4M3/MXFP8_E5M2 need them
+    # for GPTQ/JSO; FP8_DYNAMIC/FP8_E4M3 and explicit MX formats need them
     # for their activation-aware renders, and the production-render allocator
     # cost always needs them to score the final local forward error after the
     # format's activation quantizer.

@@ -242,10 +242,10 @@ def _format_cli_choices() -> tuple[str, ...]:
 # `model.visual.blocks.*` Linears are zero — the knapsack DP has no
 # sensitivity signal to allocate on. Rather than let every visual Linear
 # default to the cheapest format or go through stale passthrough, we accept
-# a single uniform target format (`BF16`, `NVFP4`, or `MXFP8_E4M3`) and assign
+# a single uniform target format (`BF16`, `NVFP4`, or `FP8_DYNAMIC`) and assign
 # every visual Linear to it. BF16 (the default) reproduces the previous
-# passthrough behavior; NVFP4/MXFP8_E4M3 shrink the tower to quantized storage
-# using the same RTN math the body gets.
+# passthrough behavior; quantized formats shrink the tower to quantized
+# storage using the same math the body gets.
 #
 # Phase 2 (tracked separately) will replace this override with a real
 # multimodal Fisher: load images + text, run full forward through the
@@ -543,8 +543,7 @@ def main():
                          "sensitivity=fisher but the probe / cost pickles "
                          "don't carry real visual Fisher data. BF16 (default) "
                          "reproduces passthrough behavior; NVFP4 / "
-                         "MXFP8_E4M3 "
-                         "shrink the tower to quantized storage via the "
+                         "FP8_DYNAMIC shrink the tower to quantized storage via the "
                          "existing RTN math at export time.")
     ap.add_argument("--visual-sensitivity",
                     choices=["fisher", "uniform"],
@@ -675,9 +674,9 @@ def main():
                "noise, which is usually not what you want:\n"
                + "\n".join(f"  {k} bits: {v}" for k, v in collisions.items())
                + "\nRecommended bundles (vLLM serving, today):\n"
-               "  Ship-ready     : NVFP4,MXFP8_E4M3       (validated)\n"
-               "  MX-pure        : MXFP4,MXFP8_E4M3\n"
-               "  Experimental   : NVFP4,MXFP6_E3M2,MXFP8_E4M3   "
+               "  Production     : NVFP4,FP8_DYNAMIC,BF16\n"
+               "  MX research    : MXFP4,MXFP8_E4M3,BF16\n"
+               "  Experimental   : NVFP4,MXFP6_E3M2,FP8_DYNAMIC,BF16   "
                "(MXFP6 hardware-supported on Blackwell, vLLM kernels not yet landed)")
         if args.enforce_family_coherence:
             raise SystemExit(f"[alloc] ERROR: {msg}")

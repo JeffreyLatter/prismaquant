@@ -485,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--n-calib-samples", type=int, default=8)
     parser.add_argument("--calib-seqlen", type=int, default=1024)
     parser.add_argument("--calib-seed", type=int, default=42)
-    parser.add_argument("--formats", default="NVFP4,MXFP8_E4M3,BF16")
+    parser.add_argument("--formats", default="NVFP4,FP8_DYNAMIC,BF16")
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--device-map", default=None)

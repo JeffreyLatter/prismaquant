@@ -3,24 +3,22 @@ derived from per-Linear output_mse already measured in cost.pkl.
 
 This avoids the wasted compute of full format-menu rendering (which
 builds every Linear × every format regardless of need). Most Linears
-quantize cleanly under NVFP4 and never benefit from MXFP8 / FP8
-fallback in any allocator assignment. The cost.pkl from the cost
-phase already knows which Linears are "suspect" — high output_mse
-under NVFP4 — so we render the fallback formats only for those.
+quantize cleanly under NVFP4 and never need an FP8_DYNAMIC fallback in
+any allocator assignment. The cost.pkl from the cost phase already knows
+which Linears are "suspect" — high output_mse under NVFP4 — so we render
+the fallback format only for those.
 
 Decision (per Linear):
-  output_mse_nvfp4 ≤ T_clean              → NVFP4 only
-  T_clean < output_mse_nvfp4 ≤ T_mxfp8    → NVFP4 + MXFP8  (if dim % 32 == 0)
-  T_mxfp8 < output_mse_nvfp4 ≤ T_fp8      → NVFP4 + MXFP8 + FP8
-  output_mse_nvfp4 > T_fp8                → all three (BF16 passthrough always available)
+  output_mse_nvfp4 ≤ T_fp8                → NVFP4 only
+  output_mse_nvfp4 > T_fp8                → NVFP4 + FP8_DYNAMIC
+                                             (BF16 passthrough always available)
 
 Thresholds default to percentiles of the per-Linear NVFP4 output_mse
-distribution: T_mxfp8 = p50, T_fp8 = p75 (configurable via flags).
+distribution: T_fp8 = p75 (configurable via flags).
 
 Phases:
   A. Render NVFP4 for every eligible Linear (one build_production_cache pass).
-  B. Compute thresholds from cost.pkl + render MXFP8 for the suspect subset.
-  C. Render FP8 for the very-suspect subset.
+  B. Compute threshold from cost.pkl + render FP8_DYNAMIC for the suspect subset.
 
 Output:
   - cache_dir/ containing the union of (qname, format) per-Linear tensors
@@ -69,7 +67,7 @@ def _get_output_mse(cost_entry_per_format: dict, fmt_name: str) -> float | None:
     candidates = {
         "NVFP4": ["NVFP4", "nvfp4"],
         "MXFP8_E4M3": ["MXFP8_E4M3", "MXFP8", "mxfp8_e4m3", "mxfp8"],
-        "FP8_E4M3": ["FP8_E4M3", "FP8", "fp8_e4m3", "fp8"],
+        "FP8_E4M3": ["FP8_E4M3", "FP8_DYNAMIC", "FP8", "fp8_e4m3", "fp8"],
     }
     for name in candidates.get(fmt_name, [fmt_name]):
         entry = cost_entry_per_format.get(name)
@@ -98,16 +96,13 @@ def main(argv=None) -> int:
     p.add_argument("--build-cache-prog", default="prismaquant.build_production_cache")
     p.add_argument("--levers", default="gptq,joint_scale_opt",
                    help="--enable list passed through to build_production_cache.")
-    p.add_argument("--threshold-mxfp8", type=float, default=None,
-                   help="Absolute output_mse threshold above which MXFP8 is rendered. "
-                   "If omitted, uses --p-mxfp8 percentile.")
     p.add_argument("--threshold-fp8", type=float, default=None,
-                   help="Absolute output_mse threshold above which FP8 is rendered. "
+                   help="Absolute output_mse threshold above which FP8_DYNAMIC is rendered. "
                    "If omitted, uses --p-fp8 percentile.")
-    p.add_argument("--p-mxfp8", type=float, default=0.50,
-                   help="Percentile of NVFP4 output_mse above which MXFP8 is rendered.")
     p.add_argument("--p-fp8", type=float, default=0.75,
-                   help="Percentile of NVFP4 output_mse above which FP8 is rendered.")
+                   help="Percentile of NVFP4 output_mse above which FP8_DYNAMIC is rendered.")
+    p.add_argument("--threshold-mxfp8", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--p-mxfp8", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--logs-dir", default=None)
     p.add_argument("--skip-render", action="store_true",
                    help="Just print the union plan; do not actually build.")
@@ -150,7 +145,6 @@ def main(argv=None) -> int:
     for qn in nvfp4_eligible:
         cost_for = costs.get(qn) or costs.get(qn.replace("model.", "model.language_model.")) or {}
         nvfp4_omse = _get_output_mse(cost_for, "NVFP4")
-        mxfp8_omse = _get_output_mse(cost_for, "MXFP8_E4M3")
         fp8_omse = _get_output_mse(cost_for, "FP8_E4M3")
         in_features = base[qn].get("in_features")
         # Look up in_features from cost.pkl if not in the layer_config
@@ -158,10 +152,8 @@ def main(argv=None) -> int:
             in_features = cost_for["in_features"]
         per_linear[qn] = {
             "nvfp4_output_mse": nvfp4_omse,
-            "mxfp8_output_mse": mxfp8_omse,
             "fp8_output_mse": fp8_omse,
             "in_features": in_features,
-            "mxfp8_compatible": (in_features is None) or (in_features % 32 == 0),
             "fp8_compatible": True,
         }
         if nvfp4_omse is not None:
@@ -171,35 +163,27 @@ def main(argv=None) -> int:
         raise SystemExit("[union] no NVFP4 output_mse data in cost.pkl; cannot triage")
     nvfp4_omses.sort()
 
-    if args.threshold_mxfp8 is not None:
-        t_mxfp8 = args.threshold_mxfp8
-    else:
-        t_mxfp8 = nvfp4_omses[min(len(nvfp4_omses) - 1, int(len(nvfp4_omses) * args.p_mxfp8))]
     if args.threshold_fp8 is not None:
         t_fp8 = args.threshold_fp8
     else:
         t_fp8 = nvfp4_omses[min(len(nvfp4_omses) - 1, int(len(nvfp4_omses) * args.p_fp8))]
 
-    mxfp8_set, fp8_set = [], []
+    fp8_set = []
     for qn, q in per_linear.items():
         n = q["nvfp4_output_mse"]
         if n is None:
-            # Without an output_mse measurement we conservatively render MXFP8 + FP8
-            mxfp8_set.append(qn)
+            # Without an output_mse measurement we conservatively render FP8_DYNAMIC.
             fp8_set.append(qn)
             continue
-        if n > t_mxfp8 and q["mxfp8_compatible"]:
-            mxfp8_set.append(qn)
         if n > t_fp8 and q["fp8_compatible"]:
             fp8_set.append(qn)
 
     n_nvfp4 = len(nvfp4_eligible)
-    full_menu = n_nvfp4 * 3
-    union_renders = n_nvfp4 + len(mxfp8_set) + len(fp8_set)
-    print(f"[union] thresholds (output_mse): t_mxfp8={t_mxfp8:.4e}, t_fp8={t_fp8:.4e}", flush=True)
+    full_menu = n_nvfp4 * 2
+    union_renders = n_nvfp4 + len(fp8_set)
+    print(f"[union] threshold (output_mse): t_fp8={t_fp8:.4e}", flush=True)
     print(f"[union] render plan:", flush=True)
     print(f"  NVFP4  : {n_nvfp4} Linears  (always)", flush=True)
-    print(f"  MXFP8  : {len(mxfp8_set):>3} Linears  ({100*len(mxfp8_set)/n_nvfp4:.1f}% of eligible)", flush=True)
     print(f"  FP8    : {len(fp8_set):>3} Linears  ({100*len(fp8_set)/n_nvfp4:.1f}% of eligible)", flush=True)
     print(f"  Total renders: {union_renders} vs full-format-menu {full_menu} "
           f"({100*union_renders/full_menu:.1f}% of format-menu)", flush=True)
@@ -211,11 +195,8 @@ def main(argv=None) -> int:
         "input_layer_config": str(args.input_layer_config),
         "output_cache_dir": str(output_cache_dir),
         "n_eligible": n_nvfp4,
-        "threshold_mxfp8_output_mse": t_mxfp8,
         "threshold_fp8_output_mse": t_fp8,
-        "p_mxfp8": args.p_mxfp8 if args.threshold_mxfp8 is None else None,
         "p_fp8": args.p_fp8 if args.threshold_fp8 is None else None,
-        "n_mxfp8_rendered": len(mxfp8_set),
         "n_fp8_rendered": len(fp8_set),
         "render_cost_vs_format_menu_pct": 100 * union_renders / full_menu,
         "linears": {
@@ -223,7 +204,6 @@ def main(argv=None) -> int:
                 **per_linear[qn],
                 "formats_rendered": (
                     ["NVFP4"]
-                    + (["MXFP8_E4M3"] if qn in mxfp8_set else [])
                     + (["FP8_E4M3"] if qn in fp8_set else [])
                 ),
             }
@@ -259,7 +239,7 @@ def main(argv=None) -> int:
     common_cmd = [
         sys.executable, "-m", args.build_cache_prog,
         "--model", args.model,
-        "--formats", "NVFP4,MXFP8_E4M3,FP8_E4M3",
+        "--formats", "NVFP4,FP8_DYNAMIC",
         "--render-scope", "assignment",
         "--n-calib-samples", str(args.n_calib_samples),
         "--calib-seqlen", str(args.calib_seqlen),
@@ -274,43 +254,25 @@ def main(argv=None) -> int:
     ]
     _shell(cmd_A, logs_dir / "phaseA_nvfp4_build.log", "Phase A: NVFP4 build", env)
 
-    # ---- Phase B: MXFP8 fallback (subset) ----
-    if mxfp8_set:
-        mxfp8_scheme = {
-            "bits": 8, "group_size": 32, "data_type": "mx_fp",
-            "act_bits": 16, "act_data_type": "bfloat16",
-        }
-        cfg = {qn: dict(mxfp8_scheme) for qn in mxfp8_set}
-        for qn, e in base.items():
-            if qn not in cfg:
-                cfg[qn] = e
-        cfg_path = work_dir / "union_phaseB_mxfp8_layer_config.json"
-        with cfg_path.open("w") as f:
-            json.dump(cfg, f, indent=2)
-        cmd_B = list(common_cmd) + [
-            "--output", str(work_dir / "union_phaseB_mxfp8.pkl"),
-            "--render-layer-config", str(cfg_path),
-        ]
-        _shell(cmd_B, logs_dir / "phaseB_mxfp8_build.log", "Phase B: MXFP8 fallback", env)
-
-    # ---- Phase C: FP8 fallback (subset) ----
+    # ---- Phase B: FP8_DYNAMIC fallback (subset) ----
     if fp8_set:
         fp8_scheme = {
             "bits": 8, "group_size": 0, "data_type": "fp8_e4m3",
-            "act_bits": 16, "act_data_type": "bfloat16",
+            "act_bits": 8, "act_group_size": 0, "act_data_type": "fp8_e4m3",
+            "act_dynamic": True,
         }
         cfg = {qn: dict(fp8_scheme) for qn in fp8_set}
         for qn, e in base.items():
             if qn not in cfg:
                 cfg[qn] = e
-        cfg_path = work_dir / "union_phaseC_fp8_layer_config.json"
+        cfg_path = work_dir / "union_phaseB_fp8_dynamic_layer_config.json"
         with cfg_path.open("w") as f:
             json.dump(cfg, f, indent=2)
         cmd_C = list(common_cmd) + [
-            "--output", str(work_dir / "union_phaseC_fp8.pkl"),
+            "--output", str(work_dir / "union_phaseB_fp8_dynamic.pkl"),
             "--render-layer-config", str(cfg_path),
         ]
-        _shell(cmd_C, logs_dir / "phaseC_fp8_build.log", "Phase C: FP8 fallback", env)
+        _shell(cmd_C, logs_dir / "phaseB_fp8_dynamic_build.log", "Phase B: FP8_DYNAMIC fallback", env)
 
     print(f"[union] complete. cache_dir={output_cache_dir}, manifest={manifest_path}", flush=True)
     return 0

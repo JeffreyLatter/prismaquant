@@ -34,6 +34,14 @@ class TestPrismaQuantFormatRegistry(unittest.TestCase):
         self.assertEqual(fr.get_format("MXFP8").name, "MXFP8_E4M3")
         self.assertIn("MXFP8", fr.aliases_for("MXFP8_E4M3"))
 
+    def test_fp8_dynamic_alias_targets_vllm_dynamic_fp8(self):
+        self.assertEqual(fr.canonical_format_name("FP8_DYNAMIC"), "FP8_E4M3")
+        self.assertEqual(fr.canonical_format_name("FP8"), "FP8_E4M3")
+        self.assertEqual(fr.canonical_format_name("fp8_dynamic"), "FP8_E4M3")
+        self.assertEqual(fr.get_format("FP8_DYNAMIC").name, "FP8_E4M3")
+        self.assertEqual(fr.get_format("fp8_dynamic").name, "FP8_E4M3")
+        self.assertIn("FP8_DYNAMIC", fr.aliases_for("FP8_E4M3"))
+
     def test_low_bit_custom_kernel_formats_are_not_registered(self):
         for name in ("INT2", "INT3", "NVINT2", "NVINT3", "NVFP3"):
             with self.assertRaises(KeyError):

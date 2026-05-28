@@ -3322,10 +3322,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--formats",
-        default="NVFP4,MXFP8_E4M3,FP8_E4M3,BF16",
+        default="NVFP4,FP8_DYNAMIC,BF16",
         help=(
             "'registry' or a comma-separated format list. Defaults to the "
-            "vLLM-backed production menu: NVFP4, MXFP8_E4M3, FP8_E4M3, BF16."
+            "vLLM-backed production menu: NVFP4, FP8_DYNAMIC, BF16. "
+            "MXFP8 remains available only when explicitly requested."
         ),
     )
     parser.add_argument("--pin", action="append", default=[])

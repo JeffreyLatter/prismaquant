@@ -5,7 +5,7 @@
 # Usage:
 #   MODEL_PATH=/path/to/Qwen3.6-35B-A3B \
 #   WORK_DIR=./dq-runs/qwen36 \
-#   FORMATS=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16 \
+#   FORMATS=NVFP4,FP8_DYNAMIC,BF16 \
 #   TARGET_BITS=4.75 \
 #   VISUAL_FORMAT=BF16 \
 #   CALIBRATION_MODALITY=text-only \
@@ -42,7 +42,7 @@ set -euo pipefail
 
 : "${MODEL_PATH:?Set MODEL_PATH to the source HF model directory}"
 : "${WORK_DIR:?Set WORK_DIR to a writable directory for artifacts}"
-: "${FORMATS:=NVFP4,MXFP8_E4M3,FP8_E4M3,BF16}"
+: "${FORMATS:=NVFP4,FP8_DYNAMIC,BF16}"
 : "${TARGET_BITS:=4.75}"
 : "${PARETO_TARGETS:=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25}"
 # Calibration defaults. 4x256 was the historical minimum for correctness
@@ -118,13 +118,10 @@ PY
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
 # PRODUCTION_CACHE_UNION=1 switches the validated-surrogate frontier path
 # from full format-menu rendering (every Linear × every quantized format)
-# to a smart-union render that only adds explicit FP8_E4M3/FP8_E5M2 and
-# MXFP8_E4M3/MXFP8_E5M2 fallback entries for Linears whose NVFP4 output_mse
-# exceeds the band thresholds. ~40-60%
-# fewer renders without sacrificing assignment coverage in practice on
-# typical bit budgets.
+# to a smart-union render that only adds FP8_DYNAMIC fallback entries for
+# Linears whose NVFP4 output_mse exceeds the band threshold. It deliberately
+# does not render MXFP8 or E5M2 fallbacks in the production path.
 : "${PRODUCTION_CACHE_UNION:=0}"
-: "${PRODUCTION_CACHE_UNION_P_MXFP8:=0.50}"
 : "${PRODUCTION_CACHE_UNION_P_FP8:=0.75}"
 : "${COST_MODE:=production-render-score}"
 : "${GROUPED_KL_NSAMPLES:=8}"
@@ -749,8 +746,8 @@ PY
     PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_frontier_raw.pkl"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       if [[ "${PRODUCTION_CACHE_UNION:-0}" == "1" ]]; then
-        # Smart-union render: only render MXFP8_E4M3/FP8_E4M3 fallbacks for Linears
-        # whose NVFP4 output_mse is above the threshold percentiles. Same
+        # Smart-union render: only render FP8_DYNAMIC fallbacks for Linears
+        # whose NVFP4 output_mse is above the threshold percentile. Same
         # cache layout as format-menu, just fewer entries.
         echo "[pipeline] [4/4] building smart-union production cache for validated frontier ..."
         python3 -m tools.build_union_cache \
@@ -763,7 +760,6 @@ PY
           --n-calib-samples "$NSAMPLES" \
           --calib-seqlen "$SEQLEN" \
           --levers "$PRODUCTION_CACHE_LEVERS" \
-          --p-mxfp8 "${PRODUCTION_CACHE_UNION_P_MXFP8:-0.50}" \
           --p-fp8 "${PRODUCTION_CACHE_UNION_P_FP8:-0.75}" \
           2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
       else

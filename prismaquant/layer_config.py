@@ -67,9 +67,9 @@ def canonicalize_format(entry: dict | str | int) -> str:
             return "NVFP4"
         if value in ("mxfp4", "mx_fp4"):
             return "MXFP4"
-        if value in ("mxfp8", "mxfp8_e4m3", "8"):
+        if value in ("mxfp8", "mxfp8_e4m3"):
             return "MXFP8_E4M3"
-        if value in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
+        if value in ("fp8", "fp8_dynamic", "fp8_e4m3", "fp8_e4m3fn", "8"):
             return "FP8_E4M3"
         if value in ("mxfp8_e5m2", "mx_fp8_e5m2"):
             return "MXFP8_E5M2"
@@ -82,7 +82,7 @@ def canonicalize_format(entry: dict | str | int) -> str:
         if entry <= 4:
             return "NVFP4"
         if entry <= 8:
-            return "MXFP8_E4M3"
+            return "FP8_E4M3"
         return "BF16"
     raise ValueError(f"unsupported scheme: {entry!r}")
 

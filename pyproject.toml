@@ -28,6 +28,7 @@ dependencies = [
     "transformers>=5.0",
     "datasets>=3.0",
     "accelerate>=0.30",
+    "compressed-tensors>=0.15",
     "tqdm",
 ]
 

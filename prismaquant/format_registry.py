@@ -26,6 +26,17 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
+from compressed_tensors.quantization.utils.mxfp_utils import generate_mx_scales
+
+from prismaquant.fp8_dynamic import (
+    fp8_dynamic_activation_qdq_vllm,
+    fp8_dynamic_weight_qdq,
+)
+from prismaquant.mx_formats import (
+    e8m0_to_scale,
+    mxfp8_e4m3_activation_qdq_vllm,
+    mxfp8_e4m3_weight_qdq,
+)
 
 
 @dataclass
@@ -122,6 +133,11 @@ FORMAT_ALIASES: dict[str, str] = {
     # Keep it accepted at every input boundary, but normalize persisted solver
     # and measurement output to the explicit FP8 variant.
     "MXFP8": "MXFP8_E4M3",
+    # User-facing production alias for vLLM FP8 dynamic quantization:
+    # per-output-row FP32 weight scales and per-token dynamic activation
+    # scales, serialized as compressed-tensors float-quantized FP8_E4M3.
+    "FP8": "FP8_E4M3",
+    "FP8_DYNAMIC": "FP8_E4M3",
 }
 
 
@@ -131,7 +147,17 @@ def register_format(spec: FormatSpec) -> FormatSpec:
 
 
 def canonical_format_name(name: str) -> str:
-    return FORMAT_ALIASES.get(name, name)
+    raw = str(name).strip()
+    if raw in FORMAT_ALIASES:
+        return FORMAT_ALIASES[raw]
+    if raw in REGISTRY:
+        return raw
+    upper = raw.upper()
+    if upper in FORMAT_ALIASES:
+        return FORMAT_ALIASES[upper]
+    if upper in REGISTRY:
+        return upper
+    return raw
 
 
 def aliases_for(name: str) -> tuple[str, ...]:
@@ -184,7 +210,12 @@ def _mx_rounded_amax_power2(amax: torch.Tensor) -> torch.Tensor:
     return rounded.to(torch.int32).view(torch.float32)
 
 
-def _snap_scale_e8m0(scale: torch.Tensor, *, element_max: torch.Tensor) -> torch.Tensor:
+def _snap_scale_e8m0(
+    scale: torch.Tensor,
+    *,
+    element_max: torch.Tensor,
+    num_bits: int | None = None,
+) -> torch.Tensor:
     """Snap a real-valued per-group scale to the served MX E8M0 grid.
 
     The OCP MX spec encodes the per-block scale as an 8-bit E8M0 value:
@@ -198,6 +229,12 @@ def _snap_scale_e8m0(scale: torch.Tensor, *, element_max: torch.Tensor) -> torch
     """
     element_max_f = element_max.to(device=scale.device, dtype=torch.float32)
     amax = scale.to(torch.float32) * element_max_f
+    if num_bits in {4, 8}:
+        e8m0 = generate_mx_scales(amax, num_bits=num_bits).to(torch.uint8)
+        return e8m0_to_scale(e8m0, device=scale.device)
+
+    # compressed-tensors only defines MX scale generation for FP4 E2M1 and
+    # FP8 E4M3. Keep the local fallback for research-only FP6/E5M2 variants.
     rounded = _mx_rounded_amax_power2(amax)
     element_offset = torch.floor(torch.log2(element_max_f))
     snapped_exp = (
@@ -207,7 +244,8 @@ def _snap_scale_e8m0(scale: torch.Tensor, *, element_max: torch.Tensor) -> torch
 
 
 def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
-                     group_size: int, mx_scale: bool = False) -> torch.Tensor:
+                     group_size: int, mx_scale: bool = False,
+                     mx_num_bits: int | None = None) -> torch.Tensor:
     """Round to nearest value in a small FP codebook, with per-group scaling.
 
     Vectorized via torch.bucketize on the sorted codebook. For each scaled
@@ -236,7 +274,11 @@ def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
     if mx_scale:
-        scale = _snap_scale_e8m0(scale, element_max=cmax)
+        scale = _snap_scale_e8m0(
+            scale,
+            element_max=cmax,
+            num_bits=mx_num_bits,
+        )
     x = w2 / scale                                    # shape (..., group)
 
     # Bucketize returns the insertion index: cb[idx-1] <= x < cb[idx].
@@ -376,6 +418,7 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
     argument to the compiled inner.
     """
     cb_cpu = _CODEBOOKS[codebook_name]
+    mx_num_bits = {"fp4_e2m1": 4, "fp8_e4m3": 8}.get(codebook_name)
 
     # Inner function takes a pre-resolved on-device codebook so the
     # compile can trace cleanly.  Functionally equivalent to
@@ -395,7 +438,11 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
         max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
         scale = max_abs / cmax
         if mx_scale:
-            scale = _snap_scale_e8m0(scale, element_max=cmax)
+            scale = _snap_scale_e8m0(
+                scale,
+                element_max=cmax,
+                num_bits=mx_num_bits,
+            )
         x = w2 / scale
         idx = torch.bucketize(x.contiguous(), cb)
         idx_lo = (idx - 1).clamp_min(0)
@@ -450,67 +497,44 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
 
 
 def _mxfp8_e4m3_activation_vllm_rtn(x: torch.Tensor) -> torch.Tensor:
-    """Match vLLM's dynamic MXFP8 activation quantizer.
-
-    Runtime MXFP8 activation quantization derives each block's E8M0 scale from
-    ``amax / fp8_max`` and rounds up to a power of two before casting the
-    normalized values to E4M3. The scale exponent therefore includes the FP8
-    element-range offset; using the raw block amax exponent would under-use the
-    E4M3 range by roughly 2**8 for typical non-saturated blocks.
-    """
-    orig_shape = x.shape
-    in_f = int(orig_shape[-1])
-    max_pos = float(torch.finfo(torch.float8_e4m3fn).max)
-    if in_f % 32 != 0:
-        # Non-32 toy tensors appear in registry unit tests. Real MXFP8 serving
-        # shapes are profile-gated to multiples of 32; use plain dynamic FP8
-        # here so the generic FormatSpec activation hook remains total.
-        x_f = x.to(torch.float32)
-        scale = (
-            x_f.abs().amax(dim=-1, keepdim=True).clamp_min(2.0 ** -127)
-            / max_pos
-        )
-        quant = (x_f / scale).clamp(-max_pos, max_pos).to(torch.float8_e4m3fn)
-        return (quant.to(torch.float32) * scale).to(x.dtype)
-    x2 = x.reshape(-1, in_f).to(torch.float32)
-    blocked = x2.reshape(-1, in_f // 32, 32)
-    amax = blocked.abs().amax(dim=-1).clamp_min(torch.finfo(torch.float32).tiny)
-    scale_unbiased = torch.ceil(torch.log2(amax / max_pos)).clamp(-127, 127)
-    descale = torch.exp2(scale_unbiased)
-    quant = (
-        blocked / descale.unsqueeze(-1)
-    ).clamp(-max_pos, max_pos).reshape(orig_shape).to(torch.float8_e4m3fn)
-    dequant = (
-        quant.to(torch.float32).reshape_as(blocked)
-        * descale.unsqueeze(-1)
-    ).reshape(orig_shape)
-    return dequant.to(x.dtype)
+    """Match vLLM/compressed-tensors dynamic MXFP8 activation quantization."""
+    return mxfp8_e4m3_activation_qdq_vllm(x).dequant.to(x.dtype)
 
 
 def _mxfp8_e4m3_weight_rtn(w: torch.Tensor) -> torch.Tensor:
     """Renderer-side MXFP8_E4M3 weight RTN matching exported metadata."""
-    orig_shape = w.shape
-    in_f = int(orig_shape[-1])
-    group_size = 32
-    if in_f % group_size != 0:
-        raise ValueError(
-            f"MXFP8_E4M3 group_size={group_size} does not divide {in_f}"
-        )
-    max_pos = float(torch.finfo(torch.float8_e4m3fn).max)
-    w2 = w.reshape(-1, in_f).to(torch.float32)
-    grouped = w2.reshape(-1, in_f // group_size, group_size)
-    amax = grouped.abs().amax(dim=-1, keepdim=True)
-    rounded = _mx_rounded_amax_power2(amax)
-    element_offset = math.floor(math.log2(max_pos))
-    scale_unbiased = (
-        torch.floor(torch.log2(rounded)) - float(element_offset)
-    ).clamp(-127.0, 127.0)
-    scale = torch.exp2(scale_unbiased).clamp_min(2.0 ** -127)
-    quant = (
-        grouped / scale
-    ).clamp(-max_pos, max_pos).to(torch.float8_e4m3fn)
-    dequant = quant.to(torch.float32) * scale
-    return dequant.reshape(orig_shape).to(w.dtype)
+    return mxfp8_e4m3_weight_qdq(w).dequant.to(w.dtype)
+
+
+def _make_plain_fp8_weight_rtn(
+    element_dtype: torch.dtype,
+    element_max: float,
+):
+    """Plain FP8 per-output-channel weight QDQ."""
+    def f(w: torch.Tensor) -> torch.Tensor:
+        return fp8_dynamic_weight_qdq(
+            w,
+            element_dtype=element_dtype,
+            element_max=element_max,
+        ).dequant.to(w.dtype)
+
+    return f
+
+
+def _make_plain_fp8_activation_vllm_rtn(
+    element_dtype: torch.dtype,
+    element_max: float,
+):
+    """vLLM dynamic per-token FP8 activation QDQ."""
+
+    def f(x: torch.Tensor) -> torch.Tensor:
+        return fp8_dynamic_activation_qdq_vllm(
+            x,
+            element_dtype=element_dtype,
+            element_max=element_max,
+        ).dequant.to(x.dtype)
+
+    return f
 
 
 # -----------------------------------------------------------------------
@@ -648,8 +672,12 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
     act_group_size=0, family="fp", min_capability_sm=90,
     autoround_config=lambda: _plain_fp8_autoround("fp8_e4m3", 8),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 0),
-    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 0),
+    quantize_dequantize=_make_plain_fp8_weight_rtn(
+        torch.float8_e4m3fn, 448.0,
+    ),
+    activation_quantize_dequantize=_make_plain_fp8_activation_vllm_rtn(
+        torch.float8_e4m3fn, 448.0,
+    ),
 ))
 register_format(FormatSpec(
     name="FP8_E5M2",
@@ -657,8 +685,12 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e5m2", act_bits=8, act_dtype_name="fp8_e5m2",
     act_group_size=0, family="fp", min_capability_sm=90,
     autoround_config=lambda: _plain_fp8_autoround("fp8_e5m2", 8),
-    quantize_dequantize=_make_rtn("fp8_e5m2", 0),
-    activation_quantize_dequantize=_make_rtn("fp8_e5m2", 0),
+    quantize_dequantize=_make_plain_fp8_weight_rtn(
+        torch.float8_e5m2, 57344.0,
+    ),
+    activation_quantize_dequantize=_make_plain_fp8_activation_vllm_rtn(
+        torch.float8_e5m2, 57344.0,
+    ),
 ))
 
 # INT8 per-channel / INT4 per-group
