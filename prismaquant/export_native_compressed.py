@@ -685,6 +685,34 @@ def _activation_col_importance_for_gptq(
     return X.pow(2).mean(dim=0).clamp_min(1e-12)
 
 
+def _activation_weighted_weight_error(
+    reference_weight: torch.Tensor,
+    rendered_weight: torch.Tensor,
+    activations: torch.Tensor,
+    *,
+    clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
+    row_weights: torch.Tensor | None = None,
+) -> float:
+    """Score a rendered weight with the same cheap local gate as NVFP4.
+
+    This is the diagonal form of output MSE: columns with larger calibration
+    activation energy matter more. It is intentionally used only as a local
+    do-no-harm gate; the production cache still uses the shared output scorer.
+    """
+    ref = reference_weight.to(torch.float32)
+    cand = rendered_weight.to(device=ref.device, dtype=torch.float32)
+    a2 = _activation_col_importance_for_gptq(
+        activations,
+        ref.shape[1],
+        device=ref.device,
+        clip_threshold=clip_threshold,
+        clip_rescale=clip_rescale,
+        row_weights=row_weights,
+    )
+    return float((a2 * (ref - cand).pow(2).sum(dim=0)).sum())
+
+
 def pack_fp4_indices(fp4_indices: torch.Tensor, last_dim: int) -> torch.Tensor:
     """Pack a tensor of 4-bit indices (final dim must be even) into
     uint8, two indices per byte. Preserves leading dimensions.
@@ -1263,6 +1291,13 @@ def _pack_production_cached_2d(
         w_work = w.to(device=target_device, dtype=torch.float32)
         q, qs = quantize_dequantize_fp8_dynamic(w_work)
         return {"weight": q, "weight_scale": qs}
+    if fmt == "MXFP4":
+        cache_levers = getattr(cache, "levers", {}) or {}
+        if bool(cache_levers.get("gptq", False)) and _CACHED_ACTIVATIONS is not None:
+            return None
+        w_work = w.to(device=target_device, dtype=torch.float32)
+        q, qs = quantize_dequantize_mxfp4(w_work, group_size=32)
+        return {"weight_packed": q, "weight_scale": qs}
     if fmt == "BF16":
         return {"weight": w.to(device=target_device, dtype=torch.bfloat16)}
     return None
@@ -2153,6 +2188,25 @@ def quantize_dequantize_mxfp4(weight: torch.Tensor, group_size: int = 32
     return packed.reshape(rows, cols // 2), e8m0_uint8
 
 
+def _mxfp4_dequantize_2d(
+    weight_packed: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int = 32,
+) -> torch.Tensor:
+    rows = weight_packed.shape[0]
+    cols = weight_packed.shape[1] * 2
+    if cols % group_size != 0:
+        raise ValueError(f"MXFP4 group_size={group_size} ∤ {cols}")
+    lo = (weight_packed & 0xF).to(torch.long)
+    hi = ((weight_packed >> 4) & 0xF).to(torch.long)
+    fp4_idx = torch.stack([lo, hi], dim=-1).reshape(rows, cols)
+    scale_by_col = _mxfp8_e8m0_to_scale(
+        scale,
+        device=weight_packed.device,
+    ).repeat_interleave(group_size, dim=1)
+    return _decode_nvfp4_indices_with_eff_scale(fp4_idx, scale_by_col)
+
+
 def quantize_dequantize_mxfp4_packed(packed: torch.Tensor, group_size: int = 32
                                      ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply MXFP4 RTN to a 3D packed-experts tensor `[E, M, N]`."""
@@ -2491,6 +2545,164 @@ def _mxfp8_quantize_dequantize_block(
         element_max=element_max,
     )
     return codec.quant, codec.scale, codec.dequant
+
+
+def _gptq_obs_rounding_mxfp4(
+    weight: torch.Tensor,
+    activations: torch.Tensor,
+    *,
+    group_size: int = 32,
+    damp: float = 0.01,
+    clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
+    fisher_row_weights: torch.Tensor | None = None,
+    static_act_order: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GPTQ one-shot OBS rounding for MXFP4 weights.
+
+    MXFP4 uses the same E2M1 FP4 codebook as NVFP4, but with an E8M0
+    per-32-value block scale and no tensor-global FP8 scale. The returned
+    tuple is directly exportable: packed FP4 bytes, E8M0 block scales, and
+    the served dequantized weight.
+    """
+    W = weight.to(torch.float32).clone()
+    rows, cols = W.shape
+    if cols % group_size != 0:
+        raise ValueError(f"MXFP4 GPTQ requires group_size={group_size} ∤ {cols}")
+
+    X = _activation_matrix_for_gptq(
+        activations,
+        cols,
+        device=W.device,
+        clip_threshold=clip_threshold,
+        clip_rescale=clip_rescale,
+        row_weights=fisher_row_weights,
+    )
+    H = X.t() @ X
+    diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
+    H.diagonal().add_(float(damp) * diag_mean)
+    dead = torch.diagonal(H) <= 0
+    if dead.any():
+        H[dead, dead] = 1.0
+        W[:, dead] = 0.0
+    col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
+
+    scale_out = torch.empty(
+        (rows, cols // group_size),
+        device=W.device,
+        dtype=torch.uint8,
+    )
+    for group_idx, block_start in enumerate(range(0, cols, group_size)):
+        block_end = block_start + group_size
+        codec = _mxfp4_grouped_codec(W[:, block_start:block_end])
+        scale_out[:, group_idx] = codec.scale
+    scale_by_col = _mxfp8_e8m0_to_scale(
+        scale_out,
+        device=W.device,
+    ).repeat_interleave(group_size, dim=1)
+
+    inverse_perm: torch.Tensor | None = None
+    if static_act_order:
+        perm = torch.argsort(col_importance, descending=True)
+        inverse_perm = torch.empty_like(perm)
+        inverse_perm[perm] = torch.arange(cols, device=W.device)
+        W = W.index_select(1, perm).contiguous()
+        H = H.index_select(0, perm).index_select(1, perm).contiguous()
+        scale_by_col = scale_by_col.index_select(1, perm).contiguous()
+
+    try:
+        L = torch.linalg.cholesky(H)
+        Hinv = torch.cholesky_inverse(L)
+        U = torch.linalg.cholesky(Hinv, upper=True)
+    except Exception:
+        q, scale = quantize_dequantize_mxfp4(
+            weight.to(torch.float32),
+            group_size=group_size,
+        )
+        return q, scale, _mxfp4_dequantize_2d(q, scale, group_size=group_size)
+
+    idx_work = torch.empty((rows, cols), device=W.device, dtype=torch.uint8)
+
+    def _quantize_mxfp4_col(col: torch.Tensor, col_idx: int) -> torch.Tensor:
+        scale = scale_by_col[:, col_idx:col_idx + 1].clamp_min(1e-12)
+        idx_col, col_dq = _nvfp4_quantize_dequantize_with_eff_scale(
+            col.unsqueeze(1),
+            scale,
+        )
+        idx_work[:, col_idx] = idx_col.squeeze(1)
+        return col_dq.squeeze(1)
+
+    _gptq_columnwise_update(
+        W,
+        U,
+        block_size=_gptq_column_block_size(cols),
+        quantize_column=_quantize_mxfp4_col,
+    )
+
+    idx_out = (
+        idx_work.index_select(1, inverse_perm).contiguous()
+        if inverse_perm is not None else
+        idx_work
+    )
+    q_out = pack_fp4_indices(idx_out, cols)
+    dequant = _mxfp4_dequantize_2d(q_out, scale_out, group_size=group_size)
+    return q_out.contiguous(), scale_out.contiguous(), dequant.contiguous()
+
+
+def _gptq_obs_rounding_mxfp4_swept(
+    weight: torch.Tensor,
+    activations: torch.Tensor,
+    *,
+    group_size: int = 32,
+    damp_candidates: tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.1),
+    clip_threshold: float | None = None,
+    clip_rescale: str | None = None,
+    fisher_row_weights: torch.Tensor | None = None,
+    static_act_order: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    W_orig = weight.to(torch.float32)
+    X = _activation_matrix_for_gptq(
+        activations,
+        W_orig.shape[1],
+        device=W_orig.device,
+        clip_threshold=clip_threshold,
+        clip_rescale=clip_rescale,
+        row_weights=fisher_row_weights,
+    )
+    H_full = X.t() @ X
+    best: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    best_err = float("inf")
+    for damp in damp_candidates:
+        try:
+            candidate = _gptq_obs_rounding_mxfp4(
+                W_orig,
+                activations,
+                group_size=group_size,
+                damp=damp,
+                clip_threshold=clip_threshold,
+                clip_rescale=clip_rescale,
+                fisher_row_weights=fisher_row_weights,
+                static_act_order=static_act_order,
+            )
+        except Exception:
+            continue
+        diff = W_orig - candidate[2].to(torch.float32)
+        err = float(torch.einsum("oi,ij,oj->", diff, H_full, diff))
+        if err < best_err:
+            best_err = err
+            best = candidate
+    if best is not None:
+        return best
+    return _gptq_obs_rounding_mxfp4(
+        W_orig,
+        activations,
+        group_size=group_size,
+        damp=0.01,
+        clip_threshold=clip_threshold,
+        clip_rescale=clip_rescale,
+        fisher_row_weights=fisher_row_weights,
+        static_act_order=static_act_order,
+    )
 
 
 def _gptq_obs_rounding_fp8_like(
@@ -3206,7 +3418,7 @@ def _quantize_2d(
     dynamic range.
 
     `gptq_enabled` and `scale_sweep_enabled` compose activation-aware passes
-    on NVFP4, FP8_E4M3/FP8_E5M2, and MXFP8_E4M3/MXFP8_E5M2 paths. Each
+    on NVFP4, MXFP4, FP8_E4M3/FP8_E5M2, and MXFP8_E4M3/MXFP8_E5M2 paths. Each
     requires `cached_activations` (looked up from _CACHED_ACTIVATIONS by
     `linear_name` when not supplied explicitly). For MXFP8_E4M3/MXFP8_E5M2,
     `joint_scale_opt_enabled` searches legal E8M0 block scales during GPTQ
@@ -3217,7 +3429,7 @@ def _quantize_2d(
     is set, `_CACHED_ACTIVATIONS[linear_name]` is used.
 
     `act_clip_threshold`: optional scalar clamp for the render-time
-    activation-aware NVFP4/MXFP8_E4M3/MXFP8_E5M2 passes.  When None, legacy behavior is
+    activation-aware NVFP4/MXFP4/MXFP8_E4M3/MXFP8_E5M2 passes.  When None, legacy behavior is
     preserved: GPTQ/do-no-harm honor PRISMAQUANT_ACT_CLIP_QUANTILE,
     while scale_sweep uses raw cached activations.
 
@@ -3406,10 +3618,38 @@ def _quantize_2d(
         w_work = weight.to(torch.float32)
         acts_work = acts
         element_dtype, element_max = _fp8_element_dtype_and_max(fmt)
-        if (gptq_enabled and acts_work is not None
-                and acts_work.shape[-1] == w_work.shape[1]):
-            if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
-                w, ws, dq = _gptq_obs_rounding_fp8_like_swept(
+        has_acts = (
+            acts_work is not None and acts_work.shape[-1] == w_work.shape[1]
+        )
+
+        def _mxfp8_rtn() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            q_rtn, s_rtn = quantize_dequantize_mxfp8(
+                w_work,
+                group_size=32,
+                element_dtype=element_dtype,
+                element_max=element_max,
+            )
+            return q_rtn, s_rtn, _mxfp8_dequantize_2d(q_rtn, s_rtn, group_size=32)
+
+        if gptq_enabled and has_acts:
+            assert acts_work is not None
+
+            def _mxfp8_gptq_candidate(
+                use_static_act_order: bool,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+                    return _gptq_obs_rounding_fp8_like_swept(
+                        w_work,
+                        acts_work,
+                        fmt=fmt,
+                        group_size=32,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=act_clip_rescale,
+                        fisher_row_weights=fisher_row_weights,
+                        joint_scale_opt=False,
+                        static_act_order=use_static_act_order,
+                    )
+                return _gptq_obs_rounding_fp8_like(
                     w_work,
                     acts_work,
                     fmt=fmt,
@@ -3418,22 +3658,25 @@ def _quantize_2d(
                     clip_rescale=act_clip_rescale,
                     fisher_row_weights=fisher_row_weights,
                     joint_scale_opt=False,
-                    static_act_order=static_act_order_enabled,
+                    static_act_order=use_static_act_order,
                 )
-            else:
-                w, ws, dq = _gptq_obs_rounding_fp8_like(
+
+            candidates = [_mxfp8_gptq_candidate(False)]
+            if static_act_order_enabled:
+                candidates.append(_mxfp8_gptq_candidate(True))
+            w, ws, dq = min(
+                candidates,
+                key=lambda cand: _activation_weighted_weight_error(
                     w_work,
+                    cand[2],
                     acts_work,
-                    fmt=fmt,
-                    group_size=32,
                     clip_threshold=act_clip_threshold,
                     clip_rescale=act_clip_rescale,
-                    fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=False,
-                    static_act_order=static_act_order_enabled,
-                )
+                    row_weights=fisher_row_weights,
+                ),
+            )
             if scale_sweep_enabled and fmt == "MXFP8_E4M3":
-                w, ws, _ = _mxfp8_scale_sweep_quantize(
+                w, ws, dq = _mxfp8_scale_sweep_quantize(
                     dq,
                     acts_work,
                     group_size=32,
@@ -3441,9 +3684,37 @@ def _quantize_2d(
                     clip_rescale=act_clip_rescale,
                     fisher_row_weights=fisher_row_weights,
                 )
-        elif (scale_sweep_enabled and acts_work is not None
-              and acts_work.shape[-1] == w_work.shape[1]
-              and fmt == "MXFP8_E4M3"):
+            if os.environ.get("PRISMAQUANT_DO_NO_HARM", "1") != "0":
+                try:
+                    q_rtn, s_rtn, dq_rtn = _mxfp8_rtn()
+                    err_rtn = _activation_weighted_weight_error(
+                        w_work,
+                        dq_rtn,
+                        acts_work,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=act_clip_rescale,
+                        row_weights=fisher_row_weights,
+                    )
+                    err_work = _activation_weighted_weight_error(
+                        w_work,
+                        dq,
+                        acts_work,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=act_clip_rescale,
+                        row_weights=fisher_row_weights,
+                    )
+                    if err_rtn < err_work:
+                        if os.environ.get(
+                            "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
+                            print(f"[do-no-harm] {linear_name}: "
+                                  f"reverted MXFP8 to RTN "
+                                  f"(mse {err_work:.3e} → {err_rtn:.3e})",
+                                  flush=True)
+                        w, ws, dq = q_rtn, s_rtn, dq_rtn
+                except Exception:
+                    pass
+        elif scale_sweep_enabled and has_acts and fmt == "MXFP8_E4M3":
+            assert acts_work is not None
             w, ws, _ = _mxfp8_scale_sweep_quantize(
                 w_work,
                 acts_work,
@@ -3453,12 +3724,7 @@ def _quantize_2d(
                 fisher_row_weights=fisher_row_weights,
             )
         else:
-            w, ws = quantize_dequantize_mxfp8(
-                w_work,
-                group_size=32,
-                element_dtype=element_dtype,
-                element_max=element_max,
-            )
+            w, ws, _ = _mxfp8_rtn()
         return {"weight": w, "weight_scale": ws}
     if fmt in {"FP8_E4M3", "FP8_E5M2"}:
         w_work = weight.to(torch.float32)
@@ -3510,7 +3776,86 @@ def _quantize_2d(
         return {"weight": w, "weight_scale": ws}
     if fmt == "MXFP4":
         w_work = weight.to(torch.float32)
-        wp, ws = quantize_dequantize_mxfp4(w_work, group_size=32)
+        acts_work = acts
+        has_acts = (
+            acts_work is not None and acts_work.shape[-1] == w_work.shape[1]
+        )
+
+        def _mxfp4_rtn() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            q_rtn, s_rtn = quantize_dequantize_mxfp4(w_work, group_size=32)
+            return q_rtn, s_rtn, _mxfp4_dequantize_2d(q_rtn, s_rtn, group_size=32)
+
+        if gptq_enabled and has_acts:
+            assert acts_work is not None
+
+            def _mxfp4_gptq_candidate(
+                use_static_act_order: bool,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+                    return _gptq_obs_rounding_mxfp4_swept(
+                        w_work,
+                        acts_work,
+                        group_size=32,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=act_clip_rescale,
+                        fisher_row_weights=fisher_row_weights,
+                        static_act_order=use_static_act_order,
+                    )
+                return _gptq_obs_rounding_mxfp4(
+                    w_work,
+                    acts_work,
+                    group_size=32,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=act_clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                    static_act_order=use_static_act_order,
+                )
+
+            candidates = [_mxfp4_gptq_candidate(False)]
+            if static_act_order_enabled:
+                candidates.append(_mxfp4_gptq_candidate(True))
+            wp, ws, dq = min(
+                candidates,
+                key=lambda cand: _activation_weighted_weight_error(
+                    w_work,
+                    cand[2],
+                    acts_work,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=act_clip_rescale,
+                    row_weights=fisher_row_weights,
+                ),
+            )
+            if os.environ.get("PRISMAQUANT_DO_NO_HARM", "1") != "0":
+                try:
+                    q_rtn, s_rtn, dq_rtn = _mxfp4_rtn()
+                    err_rtn = _activation_weighted_weight_error(
+                        w_work,
+                        dq_rtn,
+                        acts_work,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=act_clip_rescale,
+                        row_weights=fisher_row_weights,
+                    )
+                    err_work = _activation_weighted_weight_error(
+                        w_work,
+                        dq,
+                        acts_work,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=act_clip_rescale,
+                        row_weights=fisher_row_weights,
+                    )
+                    if err_rtn < err_work:
+                        if os.environ.get(
+                            "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
+                            print(f"[do-no-harm] {linear_name}: "
+                                  f"reverted MXFP4 to RTN "
+                                  f"(mse {err_work:.3e} → {err_rtn:.3e})",
+                                  flush=True)
+                        wp, ws, dq = q_rtn, s_rtn, dq_rtn
+                except Exception:
+                    pass
+        else:
+            wp, ws, _ = _mxfp4_rtn()
         return {"weight_packed": wp, "weight_scale": ws}
     if fmt == "BF16":
         return {"weight": weight.to(torch.bfloat16)}

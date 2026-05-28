@@ -117,9 +117,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "V1 production artifacts. "
         "Joint NVFP4 sibling globals + calibrated input_global_scale are "
         "computed unconditionally when NVFP4 is in the format menu. "
-        "static_act_order applies to NVFP4 and MXFP8; joint_scale_opt "
-        "applies only to NVFP4. MXFP8 uses the canonical E8M0 scale rule "
-        "inside GPTQ. "
+        "static_act_order applies to production microscaling GPTQ formats "
+        "(NVFP4, MXFP4, MXFP8); joint_scale_opt applies only to NVFP4. "
+        "MXFP4/MXFP8 use the canonical E8M0 scale rule inside GPTQ. "
         "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
     )
     p.add_argument(

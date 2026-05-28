@@ -1285,6 +1285,8 @@ def _format_supports_render_mechanism(fmt: str, mechanism: str) -> bool:
         }
     if fmt_u in {"FP8_E4M3", "FP8_E5M2"}:
         return mech == "gptq" or (mech == "scale_sweep" and fmt_u == "FP8_E4M3")
+    if fmt_u == "MXFP4":
+        return mech in {"gptq", "static_act_order"}
     if fmt_u in {"MXFP8_E4M3", "MXFP8_E5M2"}:
         return mech in {"gptq", "static_act_order"} or (
             mech == "scale_sweep" and fmt_u == "MXFP8_E4M3"
@@ -1880,7 +1882,28 @@ def render_production_weight(
                     ),
                     *base_package,
                 )))
-                if use_damp_sweep:
+                if fmt == "MXFP4":
+                    if use_damp_sweep:
+                        _q, _s, candidate = enc._gptq_obs_rounding_mxfp4_swept(
+                            reference,
+                            acts_for_render,
+                            group_size=32,
+                            clip_threshold=act_clip_threshold,
+                            clip_rescale=clip_rescale,
+                            fisher_row_weights=fisher_row_weights,
+                            static_act_order=use_static_act_order,
+                        )
+                    else:
+                        _q, _s, candidate = enc._gptq_obs_rounding_mxfp4(
+                            reference,
+                            acts_for_render,
+                            group_size=32,
+                            clip_threshold=act_clip_threshold,
+                            clip_rescale=clip_rescale,
+                            fisher_row_weights=fisher_row_weights,
+                            static_act_order=use_static_act_order,
+                        )
+                elif use_damp_sweep:
                     _q, _s, candidate = enc._gptq_obs_rounding_fp8_like_swept(
                         reference,
                         acts_for_render,

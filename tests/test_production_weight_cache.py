@@ -688,6 +688,11 @@ def test_production_cache_fp8_e4m3_uses_gptq(monkeypatch):
 def test_format_gate_disables_joint_scale_opt_for_mxfp8():
     assert _format_supports_render_mechanism("NVFP4", "joint_scale_opt")
     assert _format_supports_render_mechanism("NVFP4", "static_act_order")
+    assert _format_supports_render_mechanism("MXFP4", "gptq")
+    assert _format_supports_render_mechanism("MXFP4", "static_act_order")
+    assert not _format_supports_render_mechanism("MXFP4", "joint_scale_opt")
+    assert not _format_supports_render_mechanism("MXFP6_E3M2", "static_act_order")
+    assert not _format_supports_render_mechanism("MXFP6_E2M3", "static_act_order")
     assert not _format_supports_render_mechanism("FP8_E4M3", "static_act_order")
     assert not _format_supports_render_mechanism("FP8_E5M2", "static_act_order")
     assert _format_supports_render_mechanism("MXFP8_E4M3", "static_act_order")
@@ -842,6 +847,57 @@ def test_production_cache_mxfp8_static_act_order_do_no_harm(monkeypatch):
     assert calls == [False, True]
     assert torch.allclose(
         cache.get("l1", "MXFP8_E4M3").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32) + 1.0,
+    )
+    mechanisms = cache.metadata["render_gates"]["mechanisms"]
+    assert mechanisms["gptq"]["accepted"] == 1
+    assert mechanisms.get("static_act_order", {}).get("package_accepted", 0) == 0
+
+
+def test_production_cache_mxfp4_static_act_order_do_no_harm(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    calls = []
+
+    def fake_mxfp4_gptq(weight, activations, **kwargs):
+        del activations
+        use_static = bool(kwargs["static_act_order"])
+        calls.append(use_static)
+        rows, cols = weight.shape
+        candidate = (
+            weight.detach().to(torch.float32) + (2.0 if use_static else 1.0)
+        )
+        return (
+            torch.zeros((rows, cols // 2), dtype=torch.uint8),
+            torch.zeros((rows, cols // 32), dtype=torch.uint8),
+            candidate,
+        )
+
+    def fake_gate_score(reference_weight, rendered_weight, activations):
+        del activations
+        target = reference_weight.to(torch.float32) + 1.0
+        return float((rendered_weight.to(torch.float32) - target).pow(2).sum()), "output_mse"
+
+    monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0")
+    monkeypatch.setattr(enc, "_gptq_obs_rounding_mxfp4", fake_mxfp4_gptq)
+    monkeypatch.setattr(pwc, "_render_score_for_gate", fake_gate_score)
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["MXFP4"],
+        levers={"gptq": True, "static_act_order": True, "scale_sweep": False},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    assert calls == [False, True]
+    assert torch.allclose(
+        cache.get("l1", "MXFP4").to(torch.float32),
         model.l1.weight.detach().to(torch.float32) + 1.0,
     )
     mechanisms = cache.metadata["render_gates"]["mechanisms"]
