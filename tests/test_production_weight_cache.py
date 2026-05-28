@@ -656,7 +656,12 @@ def test_production_cache_fp8_e4m3_uses_gptq(monkeypatch):
     calls = []
 
     def fake_fp8_gptq(weight, activations, **kwargs):
-        calls.append((activations.shape, kwargs["fmt"], kwargs["joint_scale_opt"]))
+        calls.append((
+            activations.shape,
+            kwargs["fmt"],
+            kwargs["joint_scale_opt"],
+            kwargs["static_act_order"],
+        ))
         rows, _cols = weight.shape
         return (
             torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
@@ -672,16 +677,21 @@ def test_production_cache_fp8_e4m3_uses_gptq(monkeypatch):
         calib_ids,
         qnames=["l1"],
         formats=["FP8_E4M3"],
-        levers={"gptq": True, "scale_sweep": False},
+        levers={"gptq": True, "static_act_order": True, "scale_sweep": False},
         max_act_rows=8,
         progress=False,
     )
 
-    assert calls == [(torch.Size([2, 32]), "FP8_E4M3", False)]
+    assert calls == [(torch.Size([2, 32]), "FP8_E4M3", False, False)]
 
 
 def test_format_gate_disables_joint_scale_opt_for_mxfp8():
     assert _format_supports_render_mechanism("NVFP4", "joint_scale_opt")
+    assert _format_supports_render_mechanism("NVFP4", "static_act_order")
+    assert not _format_supports_render_mechanism("FP8_E4M3", "static_act_order")
+    assert not _format_supports_render_mechanism("FP8_E5M2", "static_act_order")
+    assert _format_supports_render_mechanism("MXFP8_E4M3", "static_act_order")
+    assert _format_supports_render_mechanism("MXFP8_E5M2", "static_act_order")
     assert not _format_supports_render_mechanism("FP8_E4M3", "joint_scale_opt")
     assert not _format_supports_render_mechanism("MXFP8_E4M3", "joint_scale_opt")
     assert not _format_supports_render_mechanism("MXFP8_E5M2", "joint_scale_opt")
@@ -755,6 +765,7 @@ def test_production_cache_mxfp8_e5m2_uses_gptq_without_joint_scale(monkeypatch):
             activations.shape,
             kwargs["fmt"],
             kwargs["joint_scale_opt"],
+            kwargs["static_act_order"],
         ))
         rows, cols = weight.shape
         return (
@@ -771,12 +782,71 @@ def test_production_cache_mxfp8_e5m2_uses_gptq_without_joint_scale(monkeypatch):
         calib_ids,
         qnames=["l1"],
         formats=["MXFP8_E5M2"],
-        levers={"gptq": True, "joint_scale_opt": True, "scale_sweep": False},
+        levers={
+            "gptq": True,
+            "joint_scale_opt": True,
+            "static_act_order": True,
+            "scale_sweep": False,
+        },
         max_act_rows=8,
         progress=False,
     )
 
-    assert calls == [(torch.Size([2, 32]), "MXFP8_E5M2", False)]
+    assert calls == [
+        (torch.Size([2, 32]), "MXFP8_E5M2", False, False),
+        (torch.Size([2, 32]), "MXFP8_E5M2", False, True),
+    ]
+
+
+def test_production_cache_mxfp8_static_act_order_do_no_harm(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    calls = []
+
+    def fake_mxfp8_gptq(weight, activations, **kwargs):
+        del activations
+        use_static = bool(kwargs["static_act_order"])
+        calls.append(use_static)
+        rows, cols = weight.shape
+        candidate = (
+            weight.detach().to(torch.float32) + (2.0 if use_static else 1.0)
+        )
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
+            torch.zeros((rows, cols // 32), dtype=torch.uint8),
+            candidate,
+        )
+
+    def fake_gate_score(reference_weight, rendered_weight, activations):
+        del activations
+        target = reference_weight.to(torch.float32) + 1.0
+        return float((rendered_weight.to(torch.float32) - target).pow(2).sum()), "output_mse"
+
+    monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0")
+    monkeypatch.setattr(enc, "_gptq_obs_rounding_fp8_like", fake_mxfp8_gptq)
+    monkeypatch.setattr(pwc, "_render_score_for_gate", fake_gate_score)
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["MXFP8_E4M3"],
+        levers={"gptq": True, "static_act_order": True, "scale_sweep": False},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    assert calls == [False, True]
+    assert torch.allclose(
+        cache.get("l1", "MXFP8_E4M3").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32) + 1.0,
+    )
+    mechanisms = cache.metadata["render_gates"]["mechanisms"]
+    assert mechanisms["gptq"]["accepted"] == 1
+    assert mechanisms.get("static_act_order", {}).get("package_accepted", 0) == 0
 
 
 def test_fill_production_cache_assignment_scope_only_renders_selected_formats(

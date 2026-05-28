@@ -621,9 +621,9 @@ def parse_render_mechanisms(
     """Normalize comma-separated render mechanism config.
 
     Production paths historically spell render levers as env vars such as
-    ``PRODUCTION_CACHE_LEVERS=gptq,joint_scale_opt``.  The pipeline contract
-    stores the resolved mechanism list so the run artifact records the same
-    plugins the cache fill will execute.
+    ``PRODUCTION_CACHE_LEVERS=gptq,static_act_order,joint_scale_opt``.  The
+    pipeline contract stores the resolved mechanism list so the run artifact
+    records the same plugins the cache fill will execute.
     """
 
     requested = _split_csv(enabled)
@@ -802,7 +802,12 @@ def render_mechanism_stage_specs(enabled: Iterable[str]) -> tuple[PipelineStageS
 
 def default_production_pipeline_spec(
     *,
-    render_mechanisms: Iterable[str] = ("four_over_six", "joint_scale_opt", "gptq"),
+    render_mechanisms: Iterable[str] = (
+        "four_over_six",
+        "static_act_order",
+        "joint_scale_opt",
+        "gptq",
+    ),
 ) -> PipelineSpec:
     """Return a declarative view of the current production pipeline."""
 

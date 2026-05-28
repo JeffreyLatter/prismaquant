@@ -94,6 +94,7 @@ def test_metric_gate_can_allow_bounded_metric_regression():
 def test_render_mechanisms_are_exposed_as_ordered_pipeline_stages():
     stages = render_mechanism_stage_specs((
         "gptq",
+        "static_act_order",
         "joint_scale_opt",
         "four_over_six",
     ))
@@ -101,6 +102,7 @@ def test_render_mechanisms_are_exposed_as_ordered_pipeline_stages():
     assert tuple(stage.name for stage in stages) == (
         "render.four_over_six",
         "render.joint_scale_opt",
+        "render.static_act_order",
         "render.gptq",
     )
     assert all(
@@ -117,6 +119,7 @@ def test_default_production_pipeline_contract_validates():
     assert result.ok is True
     assert result.errors == ()
     stages = {stage.name: stage for stage in spec.stages}
+    assert "render.static_act_order" in stages
     assert stages["cache.prefetch_assignment"].resources[0] == ResourceContract(
         resource="rendered_weights",
         owner="ProductionWeightCache",

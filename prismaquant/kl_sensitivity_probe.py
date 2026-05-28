@@ -3538,10 +3538,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--production-cache-levers",
-        default="gptq,joint_scale_opt",
+        default="gptq,static_act_order,joint_scale_opt",
         help=(
             "Comma-separated production cleanup levers for on-the-fly cache "
-            "builds. Default: gptq,joint_scale_opt. scale_sweep remains "
+            "builds. Default: gptq,static_act_order,joint_scale_opt. "
+            "scale_sweep remains "
             "available for explicit ablations but is no longer a production "
             "default. GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
             "recorded in cache metadata. NVFP4 block scaling follows "

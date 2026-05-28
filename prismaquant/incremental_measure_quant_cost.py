@@ -275,6 +275,7 @@ def _measure_production_render_dense(
 
     dev = torch.device(device)
     accum: dict[str, dict[str, dict]] = {}
+    render_gate_meta: dict[tuple[str, str], dict[str, object]] = {}
     processed = 0
     tstart = time.time()
     n_total = len(target_names)
@@ -282,7 +283,7 @@ def _measure_production_render_dense(
         "gptq": True,
         "joint_scale_opt": True,
         "scale_sweep": False,
-        "static_act_order": False,
+        "static_act_order": True,
         "nvfp4_scale_rule": os.environ.get(
             "PRISMAQUANT_NVFP4_SCALE_RULE",
             "static_6",
@@ -325,7 +326,9 @@ def _measure_production_render_dense(
             try:
                 if fmt == "BF16":
                     W_hat = spec.quantize_dequantize(W.clone())
+                    gate_trace = None
                 else:
+                    gate_trace = []
                     W_hat = render_production_weight(
                         W.clone(),
                         fmt,
@@ -333,7 +336,35 @@ def _measure_production_render_dense(
                         activations=activations,
                         levers=levers,
                         fisher_row_weights=gq_rows,
+                        gate_trace=gate_trace,
                     )
+                    gptq_steps = [
+                        step for step in gate_trace
+                        if isinstance(step, dict)
+                        and step.get("mechanism") == "gptq"
+                    ]
+                    if gptq_steps:
+                        step = gptq_steps[-1]
+                        render_gate_meta[(canonical_name, spec.name)] = {
+                            "render_gate_candidate": step.get("candidate"),
+                            "render_gate_package": list(
+                                step.get("package", [])
+                                if isinstance(step.get("package"), list)
+                                else []
+                            ),
+                            "render_gate_accepted": bool(
+                                step.get("accepted", False)
+                            ),
+                            "render_gate_candidates": [
+                                {
+                                    "label": cand.get("label"),
+                                    "score": cand.get("score"),
+                                    "package": cand.get("package", []),
+                                }
+                                for cand in step.get("candidates", [])
+                                if isinstance(cand, dict)
+                            ],
+                        }
                 X_hat = spec.activation_quantize_dequantize(X.clone())
                 err = (W - W_hat).float()
                 y_q = X_hat @ W_hat.T
@@ -374,6 +405,10 @@ def _measure_production_render_dense(
         for entry in per_name.values():
             if isinstance(entry, dict):
                 entry.setdefault("render_path", "production")
+    for (name, fmt), meta in render_gate_meta.items():
+        entry = out.get(name, {}).get(fmt)
+        if isinstance(entry, dict) and "error" not in entry:
+            entry.update(meta)
     return out
 
 

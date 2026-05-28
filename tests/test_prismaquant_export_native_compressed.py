@@ -10,6 +10,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -51,6 +52,52 @@ from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 from prismaquant.model_profiles.gemma4 import Gemma4Profile
 from prismaquant import format_registry as fr
 from prismaquant.layer_streaming import _dequant_fp8_block_weight
+
+
+def _fpquant_gptq_factors_for_test(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    *,
+    damp: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    W_work = W.to(torch.float32).clone()
+    H = X.to(torch.float32).t() @ X.to(torch.float32)
+    diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
+    H.diagonal().add_(float(damp) * diag_mean)
+    dead = torch.diagonal(H) <= 0
+    if dead.any():
+        H[dead, dead] = 1.0
+        W_work[:, dead] = 0.0
+    L = torch.linalg.cholesky(H)
+    Hinv = torch.cholesky_inverse(L)
+    return W_work, torch.linalg.cholesky(Hinv, upper=True)
+
+
+def _fpquant_columnwise_reference_for_test(
+    W: torch.Tensor,
+    U: torch.Tensor,
+    *,
+    block_size: int,
+    quantize_column,
+) -> torch.Tensor:
+    W_ref = W.to(torch.float32).clone()
+    cols = W_ref.shape[1]
+    for c1 in range(0, cols, block_size):
+        c2 = min(c1 + block_size, cols)
+        ncols = c2 - c1
+        w_blk = W_ref[:, c1:c2].clone()
+        errs = torch.zeros_like(w_blk)
+        U_blk = U[c1:c2, c1:c2]
+        for i in range(ncols):
+            w_ci = w_blk[:, i]
+            w_q = quantize_column(w_ci, c1 + i).to(torch.float32)
+            W_ref[:, c1 + i] = w_q
+            err = (w_ci - w_q) / U_blk[i, i]
+            w_blk[:, i:].addr_(err, U_blk[i, i:], alpha=-1)
+            errs[:, i] = err
+        if c2 < cols:
+            W_ref[:, c2:].addmm_(errs, U[c1:c2, c2:], alpha=-1)
+    return W_ref
 
 
 class _IdentityProfile:
@@ -751,6 +798,247 @@ class TestRoundTrip(unittest.TestCase):
         self.assertTrue(torch.equal(dq, dq_ref))
         scales = torch.pow(2.0, s.to(torch.float32) - 127.0)
         self.assertTrue(torch.allclose(dq, q.float() * scales.repeat_interleave(32, dim=1)))
+
+    def test_nvfp4_gptq_matches_fpquant_column_update(self):
+        torch.manual_seed(11)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        group_size = 4
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work, U = _fpquant_gptq_factors_for_test(W, X_gptq, damp=damp)
+        grouped = W_work.reshape(W.shape[0], W.shape[1] // group_size, group_size)
+        s_g_real = enc._select_nvfp4_group_scales(grouped)
+        global_real = (s_g_real.amax() / enc.FP8_E4M3_MAX).clamp_min(1e-12)
+        scale_by_col = enc._nvfp4_effective_scale_from_real(
+            s_g_real,
+            global_real,
+            quantize_fp8=True,
+        ).repeat_interleave(group_size, dim=1)
+
+        def quantize_column(col, col_idx):
+            _idx, dq = enc._nvfp4_quantize_dequantize_with_eff_scale(
+                col.unsqueeze(1),
+                scale_by_col[:, col_idx:col_idx + 1],
+            )
+            return dq.squeeze(1)
+
+        expected = _fpquant_columnwise_reference_for_test(
+            W_work,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            actual = enc._gptq_obs_rounding_nvfp4(
+                W,
+                X,
+                group_size=group_size,
+                damp=damp,
+                static_act_order=False,
+                joint_scale_opt=False,
+            )
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_fp8_gptq_matches_fpquant_column_update(self):
+        torch.manual_seed(12)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work, U = _fpquant_gptq_factors_for_test(W, X_gptq, damp=damp)
+        scale = enc._fp8_dynamic_codec(W).scale
+        q_ref = torch.empty_like(W, dtype=torch.float8_e4m3fn)
+
+        def quantize_column(col, col_idx):
+            q_col, dq = enc._fp8_quantize_dequantize_with_scale(
+                col.unsqueeze(1),
+                scale,
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.FP8_E4M3_MAX,
+            )
+            q_ref[:, col_idx] = q_col.squeeze(1)
+            return dq.squeeze(1)
+
+        expected = _fpquant_columnwise_reference_for_test(
+            W_work,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            q, s, dq = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="FP8_E4M3",
+                damp=damp,
+            )
+        self.assertTrue(torch.equal(q, q_ref))
+        torch.testing.assert_close(s, scale, atol=0, rtol=0)
+        torch.testing.assert_close(dq, expected, atol=0, rtol=0)
+
+    def test_mxfp8_gptq_matches_fpquant_column_update(self):
+        torch.manual_seed(13)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        group_size = 4
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work, U = _fpquant_gptq_factors_for_test(W, X_gptq, damp=damp)
+        scale = torch.empty((W.shape[0], W.shape[1] // group_size), dtype=torch.uint8)
+        for group_idx, block_start in enumerate(range(0, W.shape[1], group_size)):
+            _q_block, scale_block, _dq = enc._mxfp8_quantize_dequantize_block(
+                W[:, block_start:block_start + group_size],
+                col_importance=None,
+                joint_scale_opt=False,
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.MXFP8_E4M3_MAX,
+            )
+            scale[:, group_idx] = scale_block
+        scale_by_col = enc._mxfp8_e8m0_to_scale(scale).repeat_interleave(
+            group_size,
+            dim=1,
+        )
+        q_ref = torch.empty_like(W, dtype=torch.float8_e4m3fn)
+
+        def quantize_column(col, col_idx):
+            q_col, dq = enc._fp8_quantize_dequantize_with_scale(
+                col.unsqueeze(1),
+                scale_by_col[:, col_idx:col_idx + 1],
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.MXFP8_E4M3_MAX,
+            )
+            q_ref[:, col_idx] = q_col.squeeze(1)
+            return dq.squeeze(1)
+
+        _expected_w = _fpquant_columnwise_reference_for_test(
+            W_work,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        expected_dq = enc._mxfp8_dequantize_2d(q_ref, scale, group_size=group_size)
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            q, s, dq = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="MXFP8_E4M3",
+                group_size=group_size,
+                damp=damp,
+            )
+        self.assertTrue(torch.equal(q, q_ref))
+        self.assertTrue(torch.equal(s, scale))
+        torch.testing.assert_close(_expected_w, expected_dq, atol=0, rtol=0)
+        torch.testing.assert_close(dq, expected_dq, atol=0, rtol=0)
+        scales = torch.pow(2.0, s.to(torch.float32) - 127.0)
+        self.assertTrue(torch.allclose(dq, q.float() * scales.repeat_interleave(group_size, dim=1)))
+
+    def test_mxfp8_gptq_static_act_order_restores_export_order(self):
+        torch.manual_seed(14)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        group_size = 4
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work = W.to(torch.float32).clone()
+        H = X_gptq.to(torch.float32).t() @ X_gptq.to(torch.float32)
+        diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
+        H.diagonal().add_(float(damp) * diag_mean)
+        dead = torch.diagonal(H) <= 0
+        if dead.any():
+            H[dead, dead] = 1.0
+            W_work[:, dead] = 0.0
+        col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
+
+        scale = torch.empty((W.shape[0], W.shape[1] // group_size), dtype=torch.uint8)
+        for group_idx, block_start in enumerate(range(0, W.shape[1], group_size)):
+            _q_block, scale_block, _dq = enc._mxfp8_quantize_dequantize_block(
+                W_work[:, block_start:block_start + group_size],
+                col_importance=col_importance[block_start:block_start + group_size],
+                joint_scale_opt=False,
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.MXFP8_E4M3_MAX,
+            )
+            scale[:, group_idx] = scale_block
+        scale_by_col = enc._mxfp8_e8m0_to_scale(scale).repeat_interleave(
+            group_size,
+            dim=1,
+        )
+
+        perm = torch.argsort(col_importance, descending=True)
+        inverse_perm = torch.empty_like(perm)
+        inverse_perm[perm] = torch.arange(W.shape[1], device=W.device)
+        W_perm = W_work.index_select(1, perm).contiguous()
+        H_perm = H.index_select(0, perm).index_select(1, perm).contiguous()
+        L = torch.linalg.cholesky(H_perm)
+        Hinv = torch.cholesky_inverse(L)
+        U = torch.linalg.cholesky(Hinv, upper=True)
+        scale_by_perm_col = scale_by_col.index_select(1, perm).contiguous()
+        q_perm = torch.empty_like(W, dtype=torch.float8_e4m3fn)
+
+        def quantize_column(col, col_idx):
+            q_col, dq = enc._fp8_quantize_dequantize_with_scale(
+                col.unsqueeze(1),
+                scale_by_perm_col[:, col_idx:col_idx + 1],
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.MXFP8_E4M3_MAX,
+            )
+            q_perm[:, col_idx] = q_col.squeeze(1)
+            return dq.squeeze(1)
+
+        _expected_perm_w = _fpquant_columnwise_reference_for_test(
+            W_perm,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        expected_q = q_perm.index_select(1, inverse_perm).contiguous()
+        expected_dq = enc._mxfp8_dequantize_2d(
+            expected_q,
+            scale,
+            group_size=group_size,
+        )
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            q, s, dq = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="MXFP8_E4M3",
+                group_size=group_size,
+                damp=damp,
+                static_act_order=True,
+            )
+        self.assertTrue(torch.equal(q, expected_q))
+        self.assertTrue(torch.equal(s, scale))
+        torch.testing.assert_close(dq, expected_dq, atol=0, rtol=0)
+
+    def test_plain_fp8_gptq_ignores_static_act_order(self):
+        torch.manual_seed(15)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": "7"}):
+            q_ref, s_ref, dq_ref = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="FP8_E4M3",
+                static_act_order=False,
+            )
+            q, s, dq = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="FP8_E4M3",
+                static_act_order=True,
+            )
+        self.assertTrue(torch.equal(q, q_ref))
+        torch.testing.assert_close(s, s_ref, atol=0, rtol=0)
+        torch.testing.assert_close(dq, dq_ref, atol=0, rtol=0)
 
 
 class TestPackBits(unittest.TestCase):

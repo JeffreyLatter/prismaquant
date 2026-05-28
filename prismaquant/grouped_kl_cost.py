@@ -504,7 +504,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--production-cache-dir", default=None)
     parser.add_argument("--production-cache-output", default=None)
     parser.add_argument("--production-cache-dir-override", default=None)
-    parser.add_argument("--production-cache-levers", default="gptq,joint_scale_opt")
+    parser.add_argument(
+        "--production-cache-levers",
+        default="gptq,static_act_order,joint_scale_opt",
+    )
     parser.add_argument("--production-cache-max-act-rows", type=int, default=512)
     parser.add_argument("--production-cache-lru-gb", type=float, default=16.0)
     args = parser.parse_args(argv)

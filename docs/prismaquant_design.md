@@ -456,7 +456,8 @@ not by environment-variable text order. Current V1 order:
 
 ```
 FourOverSix (NVFP4 only)   →  joint_scale_opt (NVFP4 only)  →
-GPTQ                        →  scale_sweep (explicit ablations only)
+static_act_order (NVFP4 and MXFP8 only)  →  GPTQ  →
+scale_sweep (explicit ablations only)
 ```
 
 ### 5.2 Plugin contract

@@ -114,7 +114,7 @@ PY
 # format-menu: render every requested format for every quantizable Linear,
 # useful when intentionally building a reusable cache for reallocations.
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
-: "${PRODUCTION_CACHE_LEVERS:=gptq,joint_scale_opt}"
+: "${PRODUCTION_CACHE_LEVERS:=gptq,static_act_order,joint_scale_opt}"
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
 # PRODUCTION_CACHE_UNION=1 switches the validated-surrogate frontier path
 # from full format-menu rendering (every Linear × every quantized format)
@@ -241,12 +241,6 @@ esac
 PROBE_H_DETAIL_ARGS=()
 COST_H_DETAIL_ARGS=()
 PROD_H_DETAIL_ARGS=()
-case ",$PRODUCTION_CACHE_LEVERS," in
-  *,static_act_order,*)
-    echo "[pipeline] ERROR: PRODUCTION_CACHE_LEVERS includes static_act_order — SAO showed no win on its own activation-weighted objective; dropped 2026-05-15." >&2
-    exit 2
-    ;;
-esac
 case "${HADAMARD_DUQUANT:-}" in
   0|false|False|FALSE|no|No|NO|"") ;;
   *)

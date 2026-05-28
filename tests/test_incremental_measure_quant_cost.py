@@ -289,6 +289,7 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
         self.assertEqual(calls[0][1], "a")
         self.assertEqual(calls[0][2], ["a"])
         self.assertTrue(calls[0][3]["gptq"])
+        self.assertTrue(calls[0][3]["static_act_order"])
         self.assertEqual(got["render_path"], "production")
         self.assertGreater(got["output_mse"], 0.0)
 

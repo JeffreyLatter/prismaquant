@@ -1284,6 +1284,60 @@ _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
 
 
+def _gptq_column_block_size(cols: int) -> int:
+    raw = os.environ.get(
+        "PRISMAQUANT_GPTQ_BLOCK_SIZE",
+        os.environ.get("PRISMAQUANT_FP8_GPTQ_BLOCK_SIZE", "128"),
+    )
+    try:
+        value = int(raw)
+    except Exception:
+        value = 128
+    return max(1, min(int(cols), int(value)))
+
+
+def _gptq_columnwise_update(
+    W: torch.Tensor,
+    U: torch.Tensor,
+    *,
+    block_size: int,
+    quantize_column: Callable[[torch.Tensor, int], torch.Tensor],
+) -> torch.Tensor:
+    """Run the FP-Quant/GPTQ column update with fixed quantizer params.
+
+    This matches FP-Quant's block loop: quantize one column, propagate the
+    OBS error through the remaining columns in the current GPTQ block, then
+    apply the accumulated block error to later blocks.
+    """
+    _rows, cols = W.shape
+    block_size = max(1, min(int(block_size), int(cols)))
+    for block_start in range(0, cols, block_size):
+        block_end = min(block_start + block_size, cols)
+        ncols = block_end - block_start
+        block = W[:, block_start:block_end].clone()
+        errs = torch.zeros_like(block)
+        U_block = U[block_start:block_end, block_start:block_end]
+        for i in range(ncols):
+            col = block[:, i]
+            col_idx = block_start + i
+            col_dq = quantize_column(col, col_idx).to(
+                device=W.device,
+                dtype=W.dtype,
+            )
+            W[:, col_idx] = col_dq
+            denom = U_block[i, i].clamp_min(1e-12)
+            err = (col - col_dq) / denom
+            block[:, i:].addr_(err, U_block[i, i:], alpha=-1)
+            errs[:, i] = err
+        if block_end < cols:
+            W[:, block_end:].addmm_(
+                errs,
+                U[block_start:block_end, block_end:],
+                alpha=-1,
+            )
+    return W
+
+
 def _gptq_obs_rounding_nvfp4(
     weight: torch.Tensor, activations: torch.Tensor,
     group_size: int = 16, damp: float = 0.01,
@@ -1297,9 +1351,8 @@ def _gptq_obs_rounding_nvfp4(
     """GPTQ one-shot OBS rounding for NVFP4 weights.
 
     Standard GPTQ (Frantar et al. 2022): build the activation covariance
-    `H = X^T X + λ·diag(H)`, invert via Cholesky, then round columns in
-    blocks (group_size=16 matching NVFP4's group structure). Error from
-    each block's quant is propagated to the remaining columns via
+    `H = X^T X + λ·diag(H)`, invert via Cholesky, then round columns with
+    fixed per-group scales. Error from each column's quant is propagated via
     `H_inv`, which is the closed-form OBS update for least-squares loss
     `||W - W_q||_H^2`.
 
@@ -1381,38 +1434,38 @@ def _gptq_obs_rounding_nvfp4(
                 base_global_real=global_real,
             )
 
-    scale_by_ordered_col: torch.Tensor | None = None
+    scales_by_group = torch.empty(
+        (rows, cols // group_size),
+        dtype=torch.float32,
+        device=W.device,
+    )
+    for group_idx, block_start in enumerate(range(0, cols, group_size)):
+        block_end = block_start + group_size
+        block = W[:, block_start:block_end]
+        if joint_scale_opt:
+            eff = _select_nvfp4_joint_gptq_eff_scale(
+                block,
+                global_real,
+                col_importance=col_importance[block_start:block_end],
+            )
+        else:
+            s_g_real = _select_nvfp4_group_scales(block)
+            eff = _nvfp4_effective_scale_from_real(
+                s_g_real,
+                global_real,
+                quantize_fp8=True,
+            )
+        scales_by_group[:, group_idx] = eff
+    scale_by_col = scales_by_group.repeat_interleave(group_size, dim=1)
+
     inverse_perm: torch.Tensor | None = None
     if static_act_order:
-        scales_by_group = torch.empty(
-            (rows, cols // group_size),
-            dtype=torch.float32,
-            device=W.device,
-        )
-        for group_idx, block_start in enumerate(range(0, cols, group_size)):
-            block_end = block_start + group_size
-            block = W[:, block_start:block_end]
-            if joint_scale_opt:
-                eff = _select_nvfp4_joint_gptq_eff_scale(
-                    block,
-                    global_real,
-                    col_importance=col_importance[block_start:block_end],
-                )
-            else:
-                s_g_real = _select_nvfp4_group_scales(block)
-                eff = _nvfp4_effective_scale_from_real(
-                    s_g_real,
-                    global_real,
-                    quantize_fp8=True,
-                )
-            scales_by_group[:, group_idx] = eff
-        scale_by_col = scales_by_group.repeat_interleave(group_size, dim=1)
         perm = torch.argsort(col_importance, descending=True)
         inverse_perm = torch.empty_like(perm)
         inverse_perm[perm] = torch.arange(cols, device=W.device)
         W = W.index_select(1, perm).contiguous()
         H = H.index_select(0, perm).index_select(1, perm).contiguous()
-        scale_by_ordered_col = scale_by_col.index_select(1, perm).contiguous()
+        scale_by_col = scale_by_col.index_select(1, perm).contiguous()
 
     # Compute Cholesky + inverse. We follow the GPTQ paper's trick of
     # computing an upper-triangular inverse (`torch.cholesky_inverse`
@@ -1435,75 +1488,23 @@ def _gptq_obs_rounding_nvfp4(
             global_real_override=global_real_override,
         )
 
-    if static_act_order:
-        assert scale_by_ordered_col is not None
-        for col in range(cols):
-            block = W[:, col:col + 1]
-            eff_scale = scale_by_ordered_col[:, col:col + 1].clamp_min(1e-12)
-            _idx, block_dq = _nvfp4_quantize_dequantize_with_eff_scale(
-                block,
-                eff_scale,
-            )
-            block_err = block - block_dq
-
-            if col + 1 < cols:
-                denom = U[col, col].clamp_min(1e-12)
-                W[:, col + 1:] = (
-                    W[:, col + 1:]
-                    - (block_err / denom) * U[col, col + 1:].unsqueeze(0)
-                )
-
-            W[:, col:col + 1] = block_dq
-
-        assert inverse_perm is not None
-        return W.index_select(1, inverse_perm).contiguous()
-
-    for block_start in range(0, cols, group_size):
-        block_end = min(block_start + group_size, cols)
-        block = W[:, block_start:block_end]                # [rows, group_size]
-
-        # Per-block RTN to NVFP4: per-row max within this block gives
-        # the per-group scale (matching quantize_dequantize_nvfp4).
-        if joint_scale_opt:
-            eff_scale = _select_nvfp4_joint_gptq_eff_scale(
-                block,
-                global_real,
-                col_importance=col_importance[block_start:block_end],
-            ).unsqueeze(-1)
-        else:
-            s_g_real = _select_nvfp4_group_scales(block).unsqueeze(-1)
-            eff_scale = _nvfp4_effective_scale_from_real(
-                s_g_real.squeeze(-1),
-                global_real,
-                quantize_fp8=True,
-            ).unsqueeze(-1)
-        _idx, block_dq = _nvfp4_quantize_dequantize_with_eff_scale(
-            block,
+    def _quantize_nvfp4_col(col: torch.Tensor, col_idx: int) -> torch.Tensor:
+        eff_scale = scale_by_col[:, col_idx:col_idx + 1].clamp_min(1e-12)
+        _idx, col_dq = _nvfp4_quantize_dequantize_with_eff_scale(
+            col.unsqueeze(1),
             eff_scale,
         )
-        block_err = block - block_dq                       # [rows, group_size]
+        return col_dq.squeeze(1)
 
-        # Propagate error to the remaining columns. Using the
-        # upper-triangular factor U (Hinv = U^T U), the closed-form
-        # update from GPTQ's paper (eq. 5) is:
-        #   W[:, j+1:] -= (err / U[j,j]) · U[j, j+1:]
-        # applied one column at a time within the block. Because we
-        # quantize the whole block at once, the within-block error
-        # propagation is skipped — the block's per-group scale is
-        # already set, so per-column updates within the block would
-        # re-trigger quantization.  The between-block propagation
-        # handles inter-group error.
-        if block_end < cols:
-            # Treat each column's error as propagating with its own
-            # diagonal divisor U[j,j], then dot with the row slice.
-            # Batched: err_block / diag(U[block]) @ U[block, rest]
-            U_block_diag = torch.diagonal(U)[block_start:block_end].clamp_min(1e-12)
-            U_offdiag = U[block_start:block_end, block_end:]   # [gs, rest]
-            prop = (block_err / U_block_diag.unsqueeze(0)) @ U_offdiag  # [rows, rest]
-            W[:, block_end:] = W[:, block_end:] - prop
-
-        W[:, block_start:block_end] = block_dq
-
+    W = _gptq_columnwise_update(
+        W,
+        U,
+        block_size=_gptq_column_block_size(cols),
+        quantize_column=_quantize_nvfp4_col,
+    )
+    if static_act_order:
+        assert inverse_perm is not None
+        return W.index_select(1, inverse_perm).contiguous()
     return W
 
 
@@ -2503,6 +2504,7 @@ def _gptq_obs_rounding_fp8_like(
     clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
     joint_scale_opt: bool = False,
+    static_act_order: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """GPTQ one-shot OBS rounding for FP8_E4M3/E5M2 and MXFP8_E4M3/E5M2 weights.
 
@@ -2520,6 +2522,10 @@ def _gptq_obs_rounding_fp8_like(
         # joint_scale_opt hook searched nearby legal exponents, but that
         # is not part of the production MXFP8 recipe.
         joint_scale_opt = False
+    else:
+        # Plain FP8 has a per-output-row dynamic scale, so static activation
+        # ordering is not part of the current production recipe.
+        static_act_order = False
 
     element_dtype, element_max = _fp8_element_dtype_and_max(fmt_u)
     W = weight.to(torch.float32).clone()
@@ -2544,6 +2550,43 @@ def _gptq_obs_rounding_fp8_like(
         W[:, dead] = 0.0
     col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
 
+    if is_plain:
+        scale_out = _fp8_dynamic_codec(
+            weight.to(torch.float32),
+            element_dtype=element_dtype,
+            element_max=element_max,
+        ).scale
+        scale_by_col = scale_out.expand(rows, cols)
+    else:
+        scale_out = torch.empty(
+            (rows, cols // group_size),
+            device=W.device,
+            dtype=torch.uint8,
+        )
+        for group_idx, block_start in enumerate(range(0, cols, group_size)):
+            block_end = block_start + group_size
+            _q_block, scale_block, _block_dq = _mxfp8_quantize_dequantize_block(
+                W[:, block_start:block_end],
+                col_importance=col_importance[block_start:block_end],
+                joint_scale_opt=joint_scale_opt,
+                element_dtype=element_dtype,
+                element_max=element_max,
+            )
+            scale_out[:, group_idx] = scale_block
+        scale_by_col = _mxfp8_e8m0_to_scale(
+            scale_out,
+            device=W.device,
+        ).repeat_interleave(group_size, dim=1)
+
+    inverse_perm: torch.Tensor | None = None
+    if static_act_order:
+        perm = torch.argsort(col_importance, descending=True)
+        inverse_perm = torch.empty_like(perm)
+        inverse_perm[perm] = torch.arange(cols, device=W.device)
+        W = W.index_select(1, perm).contiguous()
+        H = H.index_select(0, perm).index_select(1, perm).contiguous()
+        scale_by_col = scale_by_col.index_select(1, perm).contiguous()
+
     try:
         L = torch.linalg.cholesky(H)
         Hinv = torch.cholesky_inverse(L)
@@ -2564,57 +2607,31 @@ def _gptq_obs_rounding_fp8_like(
         )
         return q, scale, _dequantize_fp8_dynamic(q, scale)
 
-    q_out = torch.empty((rows, cols), device=W.device, dtype=element_dtype)
-    if is_plain:
-        scale_out = _fp8_dynamic_codec(
-            weight.to(torch.float32),
+    q_work = torch.empty((rows, cols), device=W.device, dtype=element_dtype)
+
+    def _quantize_fp8_col(col: torch.Tensor, col_idx: int) -> torch.Tensor:
+        scale = scale_by_col[:, col_idx:col_idx + 1].clamp_min(2.0 ** -127)
+        q_col, col_dq = _fp8_quantize_dequantize_with_scale(
+            col.unsqueeze(1),
+            scale,
             element_dtype=element_dtype,
             element_max=element_max,
-        ).scale
-        block_size = _env_int_clamped(
-            "PRISMAQUANT_FP8_GPTQ_BLOCK_SIZE",
-            32,
-            1,
-            max(1, cols),
         )
-    else:
-        scale_out = torch.empty(
-            (rows, cols // group_size),
-            device=W.device,
-            dtype=torch.uint8,
-        )
-        block_size = group_size
+        q_work[:, col_idx] = q_col.squeeze(1)
+        return col_dq.squeeze(1)
 
-    for block_start in range(0, cols, block_size):
-        block_end = min(block_start + block_size, cols)
-        block = W[:, block_start:block_end]
-        if is_plain:
-            q_block, block_dq = _fp8_quantize_dequantize_with_scale(
-                block,
-                scale_out,
-                element_dtype=element_dtype,
-                element_max=element_max,
-            )
-        else:
-            if block_end - block_start != group_size:
-                raise ValueError("MXFP8_E4M3/MXFP8_E5M2 GPTQ block size must equal group_size")
-            q_block, scale_block, block_dq = _mxfp8_quantize_dequantize_block(
-                block,
-                col_importance=col_importance[block_start:block_end],
-                joint_scale_opt=joint_scale_opt,
-                element_dtype=element_dtype,
-                element_max=element_max,
-            )
-            scale_out[:, block_start // group_size] = scale_block
-        block_err = block - block_dq
-        if block_end < cols:
-            U_block_diag = torch.diagonal(U)[block_start:block_end].clamp_min(1e-12)
-            U_offdiag = U[block_start:block_end, block_end:]
-            prop = (block_err / U_block_diag.unsqueeze(0)) @ U_offdiag
-            W[:, block_end:] = W[:, block_end:] - prop
-        W[:, block_start:block_end] = block_dq
-        q_out[:, block_start:block_end] = q_block
+    W = _gptq_columnwise_update(
+        W,
+        U,
+        block_size=_gptq_column_block_size(cols),
+        quantize_column=_quantize_fp8_col,
+    )
 
+    q_out = (
+        q_work.index_select(1, inverse_perm).contiguous()
+        if inverse_perm is not None else
+        q_work
+    )
     if is_mx:
         dequant = _mxfp8_dequantize_2d(q_out, scale_out, group_size=group_size)
     else:
@@ -2633,6 +2650,7 @@ def _gptq_obs_rounding_fp8_like_swept(
     clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
     joint_scale_opt: bool = False,
+    static_act_order: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     W_orig = weight.to(torch.float32)
     X = _activation_matrix_for_gptq(
@@ -2658,6 +2676,7 @@ def _gptq_obs_rounding_fp8_like_swept(
                 clip_rescale=clip_rescale,
                 fisher_row_weights=fisher_row_weights,
                 joint_scale_opt=joint_scale_opt,
+                static_act_order=static_act_order,
             )
         except Exception:
             continue
@@ -2678,6 +2697,7 @@ def _gptq_obs_rounding_fp8_like_swept(
         clip_rescale=clip_rescale,
         fisher_row_weights=fisher_row_weights,
         joint_scale_opt=joint_scale_opt,
+        static_act_order=static_act_order,
     )
 
 
@@ -3398,6 +3418,7 @@ def _quantize_2d(
                     clip_rescale=act_clip_rescale,
                     fisher_row_weights=fisher_row_weights,
                     joint_scale_opt=False,
+                    static_act_order=static_act_order_enabled,
                 )
             else:
                 w, ws, dq = _gptq_obs_rounding_fp8_like(
@@ -3409,6 +3430,7 @@ def _quantize_2d(
                     clip_rescale=act_clip_rescale,
                     fisher_row_weights=fisher_row_weights,
                     joint_scale_opt=False,
+                    static_act_order=static_act_order_enabled,
                 )
             if scale_sweep_enabled and fmt == "MXFP8_E4M3":
                 w, ws, _ = _mxfp8_scale_sweep_quantize(

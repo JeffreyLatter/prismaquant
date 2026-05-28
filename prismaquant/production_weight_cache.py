@@ -1286,7 +1286,7 @@ def _format_supports_render_mechanism(fmt: str, mechanism: str) -> bool:
     if fmt_u in {"FP8_E4M3", "FP8_E5M2"}:
         return mech == "gptq" or (mech == "scale_sweep" and fmt_u == "FP8_E4M3")
     if fmt_u in {"MXFP8_E4M3", "MXFP8_E5M2"}:
-        return mech == "gptq" or (
+        return mech in {"gptq", "static_act_order"} or (
             mech == "scale_sweep" and fmt_u == "MXFP8_E4M3"
         )
     return False
@@ -1778,13 +1778,16 @@ def render_production_weight(
         def _apply_non_nv_gate(
             *,
             mechanism: str,
-            candidate: _RenderedCandidate,
+            candidates: Sequence[_RenderedCandidate],
         ) -> None:
             nonlocal current
+            if not candidates:
+                return
+            best = min(candidates, key=lambda item: item.score)
             decision = gate_render_candidate(
                 baseline_score=current.score,
-                candidate_score=candidate.score,
-                metric=candidate.metric,
+                candidate_score=best.score,
+                metric=best.metric,
                 min_relative_gain=_env_float(
                     "PRISMAQUANT_RENDER_GATE_MIN_GAIN",
                     0.0,
@@ -1797,23 +1800,33 @@ def render_production_weight(
                     "mechanism": mechanism,
                     "accepted": bool(decision.accepted),
                     "selected": (
-                        candidate.label if decision.accepted else current.label
+                        best.label if decision.accepted else current.label
                     ),
-                    "candidate": candidate.label,
+                    "candidate": best.label,
                     "baseline_score": float(current.score),
-                    "candidate_score": float(candidate.score),
+                    "candidate_score": float(best.score),
                     "relative_gain": float(decision.relative_gain),
-                    "metric": candidate.metric,
+                    "metric": best.metric,
                     "reason": str(decision.reason),
-                    "package": list(candidate.package),
+                    "package": list(best.package),
+                    "candidates": [
+                        {
+                            "label": cand.label,
+                            "score": float(cand.score),
+                            "metric": cand.metric,
+                            "package": list(cand.package),
+                        }
+                        for cand in candidates
+                    ],
                 })
             if decision.accepted:
                 old = current.weight
-                current = candidate
-                if old is not candidate.weight:
+                current = best
+                if old is not best.weight:
                     del old
-            elif candidate.weight is not current.weight:
-                del candidate.weight
+            for cand in candidates:
+                if cand is not current and cand.weight is not current.weight:
+                    del cand.weight
 
         def _non_nv_candidate(
             *,
@@ -1845,41 +1858,65 @@ def render_production_weight(
                 levers.get("joint_scale_opt", False)
                 and _format_supports_render_mechanism(fmt, "joint_scale_opt")
             )
-            package = (
+            static_act_order = bool(
+                levers.get("static_act_order", False)
+                and _format_supports_render_mechanism(fmt, "static_act_order")
+            )
+            base_package = (
                 ("joint_scale_opt", "gptq")
                 if joint_scale_opt else
                 ("gptq",)
             )
-            if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
-                _q, _s, candidate = enc._gptq_obs_rounding_fp8_like_swept(
-                    reference,
-                    acts_for_render,
-                    fmt=fmt,
-                    group_size=32,
-                    clip_threshold=act_clip_threshold,
-                    clip_rescale=clip_rescale,
-                    fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=joint_scale_opt,
-                )
-            else:
-                _q, _s, candidate = enc._gptq_obs_rounding_fp8_like(
-                    reference,
-                    acts_for_render,
-                    fmt=fmt,
-                    group_size=32,
-                    clip_threshold=act_clip_threshold,
-                    clip_rescale=clip_rescale,
-                    fisher_row_weights=fisher_row_weights,
-                    joint_scale_opt=joint_scale_opt,
-                )
-            _apply_non_nv_gate(
-                mechanism="gptq",
-                candidate=_non_nv_candidate(
+            use_damp_sweep = (
+                os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0"
+            )
+
+            def _gptq_candidate(use_static_act_order: bool) -> _RenderedCandidate:
+                package = tuple(dict.fromkeys((
+                    *(
+                        ("static_act_order",)
+                        if use_static_act_order else
+                        ()
+                    ),
+                    *base_package,
+                )))
+                if use_damp_sweep:
+                    _q, _s, candidate = enc._gptq_obs_rounding_fp8_like_swept(
+                        reference,
+                        acts_for_render,
+                        fmt=fmt,
+                        group_size=32,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=clip_rescale,
+                        fisher_row_weights=fisher_row_weights,
+                        joint_scale_opt=joint_scale_opt,
+                        static_act_order=use_static_act_order,
+                    )
+                else:
+                    _q, _s, candidate = enc._gptq_obs_rounding_fp8_like(
+                        reference,
+                        acts_for_render,
+                        fmt=fmt,
+                        group_size=32,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=clip_rescale,
+                        fisher_row_weights=fisher_row_weights,
+                        joint_scale_opt=joint_scale_opt,
+                        static_act_order=use_static_act_order,
+                    )
+                return _non_nv_candidate(
                     label=f"{fmt.lower()}+{'+'.join(package)}",
                     weight_dq=candidate,
                     package=package,
                     has_gptq=True,
-                ),
+                )
+
+            gptq_candidates = [_gptq_candidate(False)]
+            if static_act_order:
+                gptq_candidates.append(_gptq_candidate(True))
+            _apply_non_nv_gate(
+                mechanism="gptq",
+                candidates=gptq_candidates,
             )
 
         if (
@@ -1921,7 +1958,7 @@ def render_production_weight(
             if progressive_gates:
                 _apply_non_nv_gate(
                     mechanism="scale_sweep",
-                    candidate=candidate,
+                    candidates=[candidate],
                 )
                 return current.weight.contiguous()
             return candidate.weight.contiguous()

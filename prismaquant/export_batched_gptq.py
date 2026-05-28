@@ -30,6 +30,7 @@ import torch
 # duplicating the FP4 grid definition.
 from .export_native_compressed import (
     _activation_matrix_for_gptq,
+    _gptq_column_block_size,
     _gptq_obs_rounding_nvfp4,
     _nvfp4_effective_scale_from_real,
     _nvfp4_quantize_dequantize_with_eff_scale,
@@ -269,42 +270,47 @@ def gptq_obs_rounding_nvfp4_batched(
             global_real = (
                 s_g_real_full.reshape(Ec, -1).amax(dim=-1) / FP8_E4M3_MAX
             ).clamp_min(1e-12)  # [Ec]
-        U_diag = torch.diagonal(U, dim1=-2, dim2=-1)  # [Ec, in]
+        grouped = W.reshape(Ec, out_features, in_features // group_size, group_size)
+        s_g_real = _select_nvfp4_group_scales(grouped)
+        scale_by_col = _nvfp4_effective_scale_from_real(
+            s_g_real,
+            global_real.view(Ec, 1, 1),
+            quantize_fp8=True,
+        ).repeat_interleave(group_size, dim=2)
 
-        # 4. Block-by-block column update. Within a block, batch over
-        # the expert dimension so each column update issues one bmm
-        # for all Ec experts instead of Ec separate matmuls.
-        for block_start in range(0, in_features, group_size):
-            block_end = min(block_start + group_size, in_features)
-            block = W[:, :, block_start:block_end]      # [Ec, out, gs]
-
-            # Per-Linear per-row max within the block → scale.
-            s_g_real = _select_nvfp4_group_scales(block)
-            eff_scale = _nvfp4_effective_scale_from_real(
-                s_g_real,
-                global_real.view(Ec, 1),
-                quantize_fp8=True,
-            ).unsqueeze(-1)
-            _idx, block_dq = _nvfp4_quantize_dequantize_with_eff_scale(
-                block,
-                eff_scale,
-            )
-            block_err = block - block_dq                 # [Ec, out, gs]
-
-            # 5. Propagate error to the remaining columns.
+        # 4. FP-Quant/GPTQ column update. Quantizer parameters are fixed
+        # before the solve, then each column's OBS error is propagated
+        # through later columns inside the GPTQ block and later blocks.
+        block_size = _gptq_column_block_size(in_features)
+        for block_start in range(0, in_features, block_size):
+            block_end = min(block_start + block_size, in_features)
+            ncols = block_end - block_start
+            block = W[:, :, block_start:block_end].clone()  # [Ec, out, bs]
+            errs = torch.zeros_like(block)
+            U_block = U[:, block_start:block_end, block_start:block_end]
+            for i in range(ncols):
+                col_idx = block_start + i
+                col = block[:, :, i]  # [Ec, out]
+                eff_scale = scale_by_col[:, :, col_idx].unsqueeze(-1)
+                _idx, col_dq = _nvfp4_quantize_dequantize_with_eff_scale(
+                    col.unsqueeze(-1),
+                    eff_scale,
+                )
+                col_dq = col_dq.squeeze(-1)
+                W[:, :, col_idx] = col_dq
+                denom = U_block[:, i, i].clamp_min(1e-12)
+                err = (col - col_dq) / denom.view(Ec, 1)
+                block[:, :, i:] = (
+                    block[:, :, i:]
+                    - err.unsqueeze(-1) * U_block[:, i, i:].unsqueeze(1)
+                )
+                errs[:, :, i] = err
             if block_end < in_features:
-                U_block_diag = U_diag[:, block_start:block_end].clamp_min(
-                    1e-12)                              # [Ec, gs]
-                U_offdiag = U[:, block_start:block_end, block_end:]
-                # ^ [Ec, gs, rest]
-                # err_scaled = block_err / U_block_diag (broadcast on out dim)
-                err_scaled = block_err / U_block_diag.unsqueeze(1)
-                # Batched matmul across experts: each Ec gets its own
-                # [out, gs] @ [gs, rest] = [out, rest].
-                prop = torch.bmm(err_scaled, U_offdiag)  # [Ec, out, rest]
+                prop = torch.bmm(
+                    errs,
+                    U[:, block_start:block_end, block_end:],
+                )
                 W[:, :, block_end:] = W[:, :, block_end:] - prop
-
-            W[:, :, block_start:block_end] = block_dq
 
         # v26 per-Linear failure handling: any Linear whose Cholesky
         # failed gets the un-error-propagated input weight back. The

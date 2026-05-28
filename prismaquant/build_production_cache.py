@@ -104,20 +104,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--enable",
-        default="gptq,joint_scale_opt",
+        default="gptq,static_act_order,joint_scale_opt",
         help="Comma-separated levers to enable. Currently honored: "
-        "{none, gptq, joint_scale_opt}. "
+        "{none, gptq, static_act_order, joint_scale_opt}. "
         "Use none for RTN-only rendering with no local production levers. "
-        "Default `gptq,joint_scale_opt` ships GPTQ (with the always-on "
-        "per-Linear damp sweep) plus JSO. "
+        "Default `gptq,static_act_order,joint_scale_opt` ships GPTQ "
+        "(with the always-on per-Linear damp sweep), static activation "
+        "ordering where the format supports it, plus JSO. "
         "scale_sweep regresses end-to-end KL on Qwen3-4B and was dropped "
         "from defaults 2026-05-15. "
-        "static_act_order (SAO) and fisher_gptq are archived legacy names "
-        "and must not be used for V1 production artifacts. "
+        "fisher_gptq is an archived legacy name and must not be used for "
+        "V1 production artifacts. "
         "Joint NVFP4 sibling globals + calibrated input_global_scale are "
         "computed unconditionally when NVFP4 is in the format menu. "
-        "joint_scale_opt applies only to NVFP4; MXFP8 uses the canonical "
-        "E8M0 scale rule inside GPTQ. "
+        "static_act_order applies to NVFP4 and MXFP8; joint_scale_opt "
+        "applies only to NVFP4. MXFP8 uses the canonical E8M0 scale rule "
+        "inside GPTQ. "
         "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
     )
     p.add_argument(
