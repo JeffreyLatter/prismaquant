@@ -54,6 +54,32 @@ class Gemma4Profile(ModelProfile):
     # Overriding to inject `.moe.` ourselves produces a double `.moe.`
     # after vLLM's remap runs — verified experimentally.
 
+    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
+        """Gemma 4's text rotary is multi-layer-type: it registers one
+        ``<layer_type>_inv_freq`` buffer per entry in ``config.layer_types``,
+        with *mixed* rope types (e.g. ``sliding_attention``=default,
+        ``full_attention``=proportional). The generic single-rope fallback in
+        ``_init_rotary_inplace`` calls ``compute_default_rope_parameters(cfg,
+        device)`` with no ``layer_type`` → ``KeyError: None`` on
+        ``config.rope_parameters[layer_type]`` (issue #6).
+
+        Re-run the rotary's own ``__init__`` on the real device: it rebuilds
+        every ``<layer_type>_inv_freq`` / ``<layer_type>_attention_scaling``
+        with the correct per-type rope init function (proportional / linear /
+        default, plus any per-type kwargs). A hand-rolled
+        ``compute_default_rope_parameters`` loop would silently apply the
+        *default* formula to the proportional layer and produce wrong
+        frequencies."""
+        if getattr(rotary, "layer_types", None) is None:
+            return False
+        if getattr(cfg, "rope_parameters", None) is None:
+            return False
+        try:
+            type(rotary).__init__(rotary, cfg, device=device)
+        except Exception:
+            return False
+        return True
+
     def export_tensor_name(self, model_qname: str) -> str:
         """Keep body/expert export keys in recipe form.
 
