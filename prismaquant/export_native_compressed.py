@@ -91,9 +91,15 @@ from .model_profiles.qwen3_5 import Qwen3_5Profile
 from .schemas import validate_layer_config_payload
 
 # ---------------------------------------------------------------------------
-# NVFP4 packing (inlined from compressed-tensors fp4_quantized.py to avoid
-# importing the library's __init__ which pulls in transformers internals
-# that are not stable across the 4.x → 5.x break).
+# NVFP4 packing. The byte layout (two 4-bit indices/byte, element-0 low nibble,
+# element-1 high nibble) matches compressed-tensors'
+# `compressed_tensors.compressors.nvfp4.helpers.pack_fp4_to_uint8` and is
+# verified byte-identical in tests. We pack indices directly rather than call
+# that helper because (a) it takes a FLOAT tensor and runs its own argmin
+# codebook assignment + clamping, whereas our scale-rule / JSO / four-over-six
+# `_round_to_codebook` path already produces the indices; and (b) importing the
+# library's package __init__ pulls in transformers internals that are not
+# stable across the transformers 4.x -> 5.x break.
 # ---------------------------------------------------------------------------
 FLOAT_TO_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 NVFP4_MAX = 6.0     # max(|FLOAT_TO_E2M1|)
@@ -2041,14 +2047,6 @@ def _fp8_dequantize(
     )
 
 
-def _mxfp8_e8m0_to_scale(
-    e8m0_uint8: torch.Tensor,
-    *,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    return e8m0_to_scale(e8m0_uint8, device=device)
-
-
 def _mx_rounded_amax_power2(amax: torch.Tensor) -> torch.Tensor:
     """Match compressed-tensors' MX scale power-of-two rounding.
 
@@ -2219,7 +2217,7 @@ def _mxfp4_dequantize_2d(
     lo = (weight_packed & 0xF).to(torch.long)
     hi = ((weight_packed >> 4) & 0xF).to(torch.long)
     fp4_idx = torch.stack([lo, hi], dim=-1).reshape(rows, cols)
-    scale_by_col = _mxfp8_e8m0_to_scale(
+    scale_by_col = e8m0_to_scale(
         scale,
         device=weight_packed.device,
     ).repeat_interleave(group_size, dim=1)
@@ -2293,7 +2291,7 @@ def _mxfp8_dequantize_grouped(
     quant_fp8: torch.Tensor,
     e8m0_uint8: torch.Tensor,
 ) -> torch.Tensor:
-    scale = _mxfp8_e8m0_to_scale(e8m0_uint8, device=quant_fp8.device)
+    scale = e8m0_to_scale(e8m0_uint8, device=quant_fp8.device)
     return quant_fp8.to(torch.float32) * scale.unsqueeze(-1)
 
 
@@ -2615,7 +2613,7 @@ def _gptq_obs_rounding_mxfp4(
         block_end = block_start + group_size
         codec = _mxfp4_grouped_codec(W[:, block_start:block_end])
         scale_out[:, group_idx] = codec.scale
-    scale_by_col = _mxfp8_e8m0_to_scale(
+    scale_by_col = e8m0_to_scale(
         scale_out,
         device=W.device,
     ).repeat_interleave(group_size, dim=1)
@@ -2804,7 +2802,7 @@ def _gptq_obs_rounding_fp8_like(
                 element_max=element_max,
             )
             scale_out[:, group_idx] = scale_block
-        scale_by_col = _mxfp8_e8m0_to_scale(
+        scale_by_col = e8m0_to_scale(
             scale_out,
             device=W.device,
         ).repeat_interleave(group_size, dim=1)
@@ -3193,6 +3191,31 @@ def _packed_expert_parent_for_projection(profile, projection_name: str) -> str |
         except Exception:
             pass
     return None
+
+
+def _vllm_moe_scheme_projection_names(profile, param_name: str) -> tuple[str, ...]:
+    """vLLM FusedMoE scheme-probe / ignore projection names for a packed
+    expert param — the canonical ``gate_proj``/``up_proj``/``down_proj``
+    that vLLM's ``get_moe_method`` and ignore matching dispatch on,
+    regardless of the on-disk weight names. Used ONLY for config_groups
+    targets + ignore regexes; weight export still uses the on-disk names.
+    See ModelProfile.vllm_fused_moe_scheme_projection_names."""
+    if profile is None:
+        try:
+            from .model_profiles import DefaultProfile
+            profile = DefaultProfile()
+        except Exception:
+            profile = None
+    if profile is not None:
+        getter = getattr(profile, "vllm_fused_moe_scheme_projection_names", None)
+        if callable(getter):
+            try:
+                projections = tuple(getter(param_name))
+                if projections:
+                    return projections
+            except Exception:
+                pass
+    return _packed_expert_projection_names(profile, param_name)
 
 
 def _all_packed_expert_projection_names(profile) -> tuple[str, ...]:
@@ -4530,6 +4553,7 @@ def materialize_tensors_streaming(
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from .layer_streaming import (
+        _build_expert_packer,
         _build_fp8_scale_inv_map,
         _build_install_resolver,
         _build_weight_map,
@@ -4572,6 +4596,12 @@ def materialize_tensors_streaming(
 
     weight_shard, weight_ckpt = _build_weight_map(model_path)
     source_dtype_by_name = _build_source_dtype_map(weight_shard, weight_ckpt)
+    # Per-expert -> packed-3D bridge for checkpoints that ship MoE experts
+    # unfused while the live module is packed (driven by the model profile;
+    # None for every other model). Keeps the exporter's source read aligned
+    # with the streaming probe/cost path — a raw checkpoint exports without
+    # an out-of-band pre-pack.
+    expert_packer = _build_expert_packer(model, weight_ckpt)
     # Native-FP8 dequant map, keyed by live weight-qname. Passed to
     # every `_read_layer_to_device` / `_materialize` call so fp8 source
     # weights land on the module as TRUE dequanted bf16 — not raw fp8
@@ -4828,7 +4858,7 @@ def materialize_tensors_streaming(
         load_t0 = time.time()
         tensors = _read_layer_to_device(
             f"{layers_prefix}{L}.", weight_shard, weight_ckpt, dtype, device,
-            fp8_scale_inv_map=fp8_scale_inv_map)
+            fp8_scale_inv_map=fp8_scale_inv_map, pack_experts=expert_packer)
         resolver = _build_install_resolver(model, layer_qname)
         _fast_install(resolver, tensors, device, model=model)
         load_s = time.time() - load_t0
@@ -5743,7 +5773,11 @@ def _bf16_packed_expert_ignore_regex(
     lm = _re.search(r"\.layers\.(\d+)\.", recipe_key)
     if lm:
         layer_idx = lm.group(1)
-    projections = _packed_expert_projection_names(profile, pn)
+    # vLLM's should_ignore_layer probes the canonical gate_proj/up_proj/
+    # down_proj names; emit the ignore regex with those (not the on-disk
+    # w1/w3/w2), else BF16 experts are not recognized as ignored and fall
+    # through to a quantized catch-all scheme.
+    projections = _vllm_moe_scheme_projection_names(profile, pn)
     proj_options = "|".join(_re.escape(proj) for proj in projections)
 
     # Use the profile's own regex as the base; swap its `(gate|up|down)_proj`
@@ -6015,7 +6049,9 @@ def build_quantization_config(
         packed_fused_states.setdefault(fused_qname, set()).add(state)
         seen = set(packed_fused_projections.setdefault(fused_qname, []))
         for member in _packed_format_group_members(fused_qname, leaf):
-            for projection in _packed_expert_projection_names(profile, member):
+            # vLLM scheme dispatch probes canonical gate_proj/up_proj/down_proj
+            # names, not the on-disk projection names (w1/w3/w2 on LFM2.5).
+            for projection in _vllm_moe_scheme_projection_names(profile, member):
                 if projection in seen:
                     continue
                 packed_fused_projections[fused_qname].append(projection)
@@ -6173,10 +6209,26 @@ def build_quantization_config(
         # per-expert regexes remain as a safety-net for any
         # per-expert Linear not captured by the collapse (e.g.
         # stray experts the recipe didn't enumerate).
+        # The profile per-expert regexes name on-disk projections; vLLM's
+        # scheme probe uses canonical gate_proj/up_proj/down_proj. Rewrite
+        # the projection group ONLY when the on-disk names differ from
+        # canonical (LFM2.5's w1/w3/w2) — left verbatim when the profile is
+        # already canonical (e.g. Qwen), so shipped configs don't churn.
+        ondisk: set[str] = set()
+        canon: set[str] = set()
+        for pname in sorted(_packed_expert_param_name_set(profile)):
+            ondisk.update(_packed_expert_projection_names(profile, pname))
+            canon.update(_vllm_moe_scheme_projection_names(profile, pname))
+        need_canon = ondisk != canon and bool(canon)
+        canon_opts = "|".join(sorted(canon)) or "gate_proj|up_proj|down_proj"
         expert_regexes = []
-        if (r := profile.per_expert_moe_regex()) is not None:
-            expert_regexes.append(r)
-        if (r := profile.per_expert_mtp_regex()) is not None:
+        for getter in (profile.per_expert_moe_regex, profile.per_expert_mtp_regex):
+            r = getter()
+            if r is None:
+                continue
+            if need_canon:
+                body = r[len("re:"):] if r.startswith("re:") else r
+                r = f"re:{_constrain_per_expert_projection_regex(body, canon_opts)}"
             expert_regexes.append(r)
         scheme["targets"] = _build_target_list(by_fmt[catchall]) + expert_regexes
         config_groups[f"group_{idx}"] = scheme

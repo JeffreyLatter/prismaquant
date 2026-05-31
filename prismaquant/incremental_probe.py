@@ -62,6 +62,7 @@ import torch.nn.functional as F
 from .layer_streaming import (
     _call_layer,
     _compute_position_embeddings,
+    _get_final_norm,
     _make_causal_mask,
 )
 from .sensitivity_probe import (
@@ -102,13 +103,15 @@ from .streaming_model import (
 # ---------------------------------------------------------------------------
 
 
-def _is_minimax_m2_experts_module(module: nn.Module) -> bool:
+def _is_minimax_m2_experts_module(
+    module: nn.Module, proj_names: tuple[str, ...] = ("w1", "w2", "w3")
+) -> bool:
     return (
         type(module).__name__ == "MiniMaxM2Experts"
         and hasattr(module, "num_experts")
         and hasattr(module, "top_k")
         and len(module) > 0
-        and all(hasattr(module[0], n) for n in ("w1", "w2", "w3", "act_fn"))
+        and all(hasattr(module[0], n) for n in (*proj_names, "act_fn"))
     )
 
 
@@ -275,16 +278,19 @@ def _set_minimax_fast_moe(
     enabled: bool,
     *,
     chunk_size: int = 32,
+    proj_names: tuple[str, ...] = ("w1", "w2", "w3"),
 ) -> int:
     """Enable/disable chunked batched MiniMax-M2 expert replay on a layer.
 
     Returns the number of MiniMax expert containers patched under `layer`.
     The patch is instance-local and falls back to the original forward
-    whenever `_pq_fast_moe_enabled` is False.
+    whenever `_pq_fast_moe_enabled` is False. ``proj_names`` are the per-expert
+    projection attribute names (from the model profile; default Qwen/MiniMax
+    ``('w1','w2','w3')``).
     """
     patched = 0
     for module in layer.modules():
-        if not _is_minimax_m2_experts_module(module):
+        if not _is_minimax_m2_experts_module(module, proj_names):
             continue
         if not hasattr(module, "_pq_original_forward"):
             module._pq_original_forward = module.forward
@@ -1316,7 +1322,7 @@ def _compute_global_precompute(
     # fold multi-stream `[B, T, hc_mult, H]` back to `[B, T, H]`.
     final_hidden_for_norm = _profile.collapse_hidden_after_layers(
         final_hidden, base_model)
-    norm_out = base_model.norm(final_hidden_for_norm)
+    norm_out = _get_final_norm(base_model)(final_hidden_for_norm)
     norm_out_d = norm_out.detach().requires_grad_(True)
     grad_buf = torch.zeros_like(norm_out_d)
     chunk_T = 256
@@ -1771,6 +1777,13 @@ def _run_body_streaming_shard(
             moe_linear_to_block: dict[str, tuple[str, int, str]] = {}
             moe_block_pending: dict[str, dict[tuple[int, str], tuple]] = {}
             moe_block_handles: list = []
+            # Per-expert projection attribute names from the model profile so
+            # unpacked-expert families that don't use w1/w2/w3 still get the
+            # batched-Fisher block path instead of silently falling back to the
+            # (correct but slower) per-Linear hooks. Default keeps Qwen behavior.
+            _moe_proj = getattr(
+                _shard_profile, "unpacked_expert_projection_names", None)
+            moe_w_attrs = tuple(_moe_proj()) if callable(_moe_proj) else ("w1", "w2", "w3")
             for block_name, block in layers[L].named_modules():
                 full_block_name = f"{layers_prefix}{L}.{block_name}" if block_name else f"{layers_prefix}{L}"
                 children = list(block.named_children())
@@ -1778,7 +1791,7 @@ def _run_body_streaming_shard(
                     continue
                 ok = True
                 for _, child in children:
-                    for w in ("w1", "w2", "w3"):
+                    for w in moe_w_attrs:
                         if not isinstance(getattr(child, w, None), nn.Linear):
                             ok = False
                             break
@@ -1793,7 +1806,7 @@ def _run_body_streaming_shard(
                         eid = int(cname)
                     except ValueError:
                         ok = False; break
-                    for w in ("w1", "w2", "w3"):
+                    for w in moe_w_attrs:
                         ln = f"{full_block_name}.{cname}.{w}"
                         if ln in tracked_set:
                             moe_linear_to_block[ln] = (full_block_name, eid, w)
@@ -2112,10 +2125,13 @@ def _run_body_streaming_shard(
             # original ModuleList expert loop so per-expert nn.Linear
             # hooks collect Fisher exactly as before.
             if minimax_fast_moe:
+                _mmx_proj = getattr(
+                    _shard_profile, "unpacked_expert_projection_names", None)
                 _set_minimax_fast_moe(
                     layers[L],
                     enabled=not layer_in_scope,
                     chunk_size=minimax_fast_moe_chunk_size,
+                    proj_names=tuple(_mmx_proj()) if callable(_mmx_proj) else ("w1", "w2", "w3"),
                 )
             packed_meta = install_packed_expert_hooks(
                 layers[L], accumulator=packed_grad_acc,
@@ -2541,7 +2557,7 @@ def _run_mtp_streaming_shard(
     inputs_embeds_cpu = precomputed.activations_cpu[0]
     with torch.no_grad():
         pre_norm = precomputed.activations_cpu[-1].to(device).to(dtype)
-        body_final_cpu = base_model.norm(pre_norm).detach().cpu()
+        body_final_cpu = _get_final_norm(base_model)(pre_norm).detach().cpu()
         del pre_norm
     print(f"[incremental/mtp] body forward reused from global precompute "
           f"(norm only: {time.time()-t_phase:.1f}s)", flush=True)

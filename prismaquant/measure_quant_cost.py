@@ -736,7 +736,19 @@ def _measure_packed_experts(
                 gate_up = gate_up_param.detach().to(device=dev, dtype=dtype)
                 down = down_param.detach().to(device=dev, dtype=dtype)
                 with torch.no_grad():
-                    top_k_index, top_k_weights = _packed_router_topk(router, X)
+                    # Prefer the MoE block's own routing when it exposes a
+                    # `route_tokens_to_experts` method — that is faithful to
+                    # whatever selection the architecture actually uses (e.g.
+                    # sigmoid scores + expert_bias top-k + norm + routed
+                    # scaling, with `top_k` living on the block rather than the
+                    # bare gate Linear) instead of the generic softmax top-k.
+                    # Falls back to the generic extraction for routers that
+                    # don't expose it (Qwen/DeepSeek-style bare gate Linears).
+                    _route_fn = getattr(parent_mod, "route_tokens_to_experts", None)
+                    if callable(_route_fn):
+                        top_k_index, top_k_weights = _route_fn(router(X))
+                    else:
+                        top_k_index, top_k_weights = _packed_router_topk(router, X)
                     y_ref = _packed_experts_forward_with_weights(
                         experts_mod,
                         X,
@@ -758,9 +770,10 @@ def _measure_packed_experts(
                 gate_up = None
                 down = None
 
-        # Per-(expert, out-channel) H, shape [E, M]. Expanded to [E, M, 1]
-        # so broadcasting against (w-w_hat)² averaged over the in-features
-        # dim gives a single Δloss scalar per (layer, format).
+        # Per-(expert, out-channel) Fisher row-sum h_em, shape [E, M]
+        # (= Σ_n grad² over in-features; see the Δloss derivation below).
+        # Weighted elementwise against per-row mean err² to yield one
+        # Δloss scalar per (layer, format).
         h_em = None
         if h_detail is not None and full_name in h_detail:
             h = h_detail.load(full_name).to(dev).float()
@@ -773,13 +786,24 @@ def _measure_packed_experts(
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
                 if h_em is not None:
-                    # err² shape [E, M, N]; mean over N turns into [E, M]
-                    # so per-channel H values weight the corresponding
-                    # per-channel average MSE. Multiply by N to recover
-                    # a sum-over-weights interpretation.
+                    # h_em[e,m] = Σ_n g[e,m,n]² — the per-row SUM over
+                    # in-features of the per-weight gradient² (see
+                    # sensitivity_probe channel_accumulator). The exact
+                    # per-weight Fisher-OBS loss is 0.5·Σ_{e,m,n} g²·err²
+                    # (a sum-of-products), matching the dense path at
+                    # line 464 / 1120. With only the row-summed h_em and
+                    # per-weight err², the mean-field estimate (g² ≈ const
+                    # across n within a row) is
+                    #   0.5·Σ_{e,m} h_em · mean_n(err²),
+                    # which is on the SAME scale as the dense 0.5·Σ g²·err².
+                    # Do NOT multiply by N here: h_em is already summed over
+                    # n, so an extra ×N would make this a product-of-sums
+                    # (Σ_n g²)(Σ_n err²) and inflate packed-expert Δloss ~N×
+                    # relative to dense Linears, over-promoting experts in
+                    # the allocator (N = in-features ≈ 1.5k–4k).
                     per_ch_mse = err.pow(2).mean(dim=-1)   # [E, M]
                     dloss_val = float(
-                        0.5 * (h_em * per_ch_mse).sum().item() * err.size(-1)
+                        0.5 * (h_em * per_ch_mse).sum().item()
                     )
                     del per_ch_mse
                 output_mse = 0.0

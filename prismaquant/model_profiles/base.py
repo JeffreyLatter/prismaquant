@@ -440,6 +440,60 @@ class ModelProfile(ABC):
             return projection_name
         return None
 
+    def vllm_fused_moe_scheme_projection_names(
+        self, param_name: str
+    ) -> tuple[str, ...]:
+        """Per-expert projection names vLLM's FusedMoE scheme detection
+        (`get_moe_method`) and ignore-matching probe at load time.
+
+        vLLM builds synthetic per-expert names ``experts.0.gate_proj`` /
+        ``up_proj`` / ``down_proj`` to look up the FusedMoE quant scheme,
+        regardless of the checkpoint's actual projection names. So
+        compressed-tensors ``config_groups`` targets and ``ignore`` regexes
+        for packed experts must use THESE canonical names — not
+        :meth:`packed_expert_projection_names`, which names the on-disk
+        weights (e.g. LFM2.5's ``w1``/``w3``/``w2``). Using the on-disk
+        names makes vLLM mis-resolve the scheme (it loses the input-
+        activation spec → builds the weight-only NVFP4A16 variant, or marks
+        BF16 experts un-ignored) and the artifact fails to load. The weights
+        themselves still load via the model's expert mapping
+        (``gate_proj``=w1, ``up_proj``=w3, ``down_proj``=w2)."""
+        if param_name == "gate_up_proj":
+            return ("gate_proj", "up_proj")
+        if param_name == "down_proj":
+            return ("down_proj",)
+        if param_name in ("gate_proj", "up_proj", "down_proj"):
+            return (param_name,)
+        # Unknown packed param: fall back to the on-disk projection names.
+        return self.packed_expert_projection_names(param_name)
+
+    def unpacked_expert_projection_names(self) -> tuple[str, ...]:
+        """Per-expert *module attribute* names for UNPACKED MoE experts.
+
+        Applies only to architectures where each routed expert is its own
+        ``nn.Module`` exposing per-projection ``nn.Linear`` attributes (the
+        MiniMax-M2 / Qwen3 / Qwen3.5 MoE layout, e.g. ``.w1``/``.w2``/``.w3``).
+        The batched-Fisher MoE-block detector and the fast-MoE forward swap in
+        the probes use these names to recognize an expert container; if the
+        names don't match, those optimizations silently no-op (probe speed
+        only — per-Linear Fisher still accumulates via the regular hooks).
+
+        Packed-expert architectures (DeepSeek-V4: 3D ``gate_up_proj`` /
+        ``down_proj`` tensors, no per-expert modules) have no such attributes
+        and never match the consumers of this accessor, so the default is
+        harmless for them. A declarative structure spec may override via an
+        ``unpacked_expert_projection_names`` field; otherwise the default is
+        the Qwen3/Qwen3.5 standard ``('w1', 'w2', 'w3')``. Profiles whose
+        unpacked experts use different attribute names should override this.
+        """
+        spec = self.structure_spec()
+        declared = getattr(spec, "unpacked_expert_projection_names", None)
+        if declared:
+            names = declared() if callable(declared) else declared
+            if names:
+                return tuple(names)
+        return ("w1", "w2", "w3")
+
     def _fallback_packed_expert_format_groups(self) -> tuple[tuple[str, ...], ...]:
         """Common legacy packed-MoE coupling groups for profiles without specs.
 
