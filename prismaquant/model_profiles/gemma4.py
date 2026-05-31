@@ -80,6 +80,41 @@ class Gemma4Profile(ModelProfile):
             return False
         return True
 
+    # ------------------------------------------------------------
+    # Cross-layer KV sharing.  Gemma4's last `num_kv_shared_layers`
+    # attention layers have no k/v_proj — they reuse the K/V computed by
+    # the last non-shared layer of their `layer_type`, passed via a
+    # `shared_kv_states` dict the model forward threads through every layer.
+    # ------------------------------------------------------------
+    def new_forward_pass_state(self) -> dict:
+        return {"shared_kv_states": {}}
+
+    def capture_forward_pass_state(self, pass_state: dict):
+        """After phase-1's sequential forward, `shared_kv_states[type]` holds
+        the (full-length) K/V the shared layers reuse. Snapshot to CPU."""
+        skv = (pass_state or {}).get("shared_kv_states") or {}
+        out = {}
+        for lt, kv in skv.items():
+            try:
+                out[lt] = tuple(t.detach().to("cpu") for t in kv)
+            except Exception:
+                pass
+        return out
+
+    def isolated_layer_pass_state(self, captured, layer) -> dict:
+        """For an isolated (phase-3) layer forward: a shared layer needs its
+        type's captured K/V (the attention moves them to the right device
+        itself); a non-shared layer just needs a writable dict to store into.
+        Always returns a `shared_kv_states` dict so the layer never sees
+        `None`."""
+        attn = getattr(layer, "self_attn", None)
+        if getattr(attn, "is_kv_shared_layer", False) and captured:
+            lt = getattr(attn, "layer_type", None)
+            kv = captured.get(lt)
+            if kv is not None:
+                return {"shared_kv_states": {lt: kv}}
+        return {"shared_kv_states": {}}
+
     def export_tensor_name(self, model_qname: str) -> str:
         """Keep body/expert export keys in recipe form.
 
