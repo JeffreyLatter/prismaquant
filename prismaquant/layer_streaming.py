@@ -1153,7 +1153,8 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
         if pe is None:
             # Unknown/missing layer_type — fall back to any entry rather than
             # crash (single-type rope, or a layer that doesn't tag its type).
-            pe = next(iter(position_embeddings.values()))
+            # `None` default guards against an empty dict (StopIteration).
+            pe = next(iter(position_embeddings.values()), None)
     out = layer(
         hidden_states=hidden,
         attention_mask=attention_mask,

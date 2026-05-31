@@ -4414,37 +4414,11 @@ def _passthrough_tensor(
     return tensor.detach().to(dtype).cpu(), _dtype_hist_label(dtype)
 
 
-def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
-                         dtype: torch.dtype) -> None:
-    """After init_empty_weights, rotary modules exist but their
-    `inv_freq` buffers are on meta. Re-run the module's own rope init
-    (which is deterministic from config) so `inv_freq` lives on the
-    exec device with correct values — matching what `from_pretrained`
-    would have produced."""
-    from .layer_streaming import _get_rotary
-    rotary = _get_rotary(base_model)
-    if rotary is None:
-        return
-    cfg = getattr(rotary, "config", None)
-    if cfg is None:
-        return
-    try:
-        rope_init_fn = rotary.compute_default_rope_parameters
-    except AttributeError:
-        return
-    if hasattr(rotary, "reset_rope_cache"):
-        rotary.reset_rope_cache(device)
-        return
-    inv_freq, attention_scaling = rope_init_fn(cfg, device)
-    rotary.register_buffer("inv_freq", inv_freq.to(dtype=torch.float32,
-                                                   device=device),
-                           persistent=False)
-    if hasattr(rotary, "original_inv_freq"):
-        rotary.register_buffer(
-            "original_inv_freq",
-            inv_freq.to(dtype=torch.float32, device=device).clone(),
-            persistent=False)
-    rotary.attention_scaling = attention_scaling
+# NOTE: `_init_rotary_inplace` is imported from `streaming_model` (single
+# source of truth). It includes the profile-driven `init_rotaries` dispatch
+# for multi-layer-type rotaries (DSv4/Gemma3/Gemma4); a stale duplicate here
+# previously lacked it and would crash Gemma4 export at rotary init
+# (KeyError: None on rope_parameters[None]).
 
 
 def _build_fp8_source_map(
@@ -4566,6 +4540,8 @@ def materialize_tensors_streaming(
         _unload,
     )
     from .sensitivity_probe import stage_text_only
+    # Canonical rotary init (profile-driven multi-layer-type dispatch).
+    from .streaming_model import _init_rotary_inplace
 
     # ----- 1. Meta skeleton + manual head materialization -----
     # Pure `init_empty_weights` path — avoids accelerate's

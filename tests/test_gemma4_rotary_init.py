@@ -60,3 +60,19 @@ def test_gemma4_init_rotaries_defers_when_not_multilayer():
         pass
     assert Gemma4Profile().init_rotaries(
         _Plain(), _Cfg(), torch.device("cpu"), torch.float32) is False
+
+
+def test_export_uses_shared_rotary_init_with_dispatch():
+    """Guard against the regression where the exporter kept a stale duplicate
+    `_init_rotary_inplace` lacking the profile dispatch (broke Gemma4 export at
+    rotary init). The exporter must reuse streaming_model's canonical version,
+    which carries the profile-driven `init_rotaries` dispatch."""
+    import inspect
+    import prismaquant.export_native_compressed as enc
+    from prismaquant.streaming_model import _init_rotary_inplace
+
+    assert not hasattr(enc, "_init_rotary_inplace"), (
+        "export_native_compressed must not define its own _init_rotary_inplace; "
+        "import streaming_model's canonical one")
+    assert "init_rotaries" in inspect.getsource(_init_rotary_inplace), (
+        "canonical _init_rotary_inplace lost its profile-driven dispatch")
