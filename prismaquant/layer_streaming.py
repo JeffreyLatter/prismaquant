@@ -1138,14 +1138,29 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     profile's `extra_layer_kwargs(...)` (e.g. DSv4-Flash hash-routing
     layers consume `input_ids` for the `tid2eid` lookup). Layers that
     don't consume those kwargs ignore them via `**kwargs` absorption.
+
+    When `position_embeddings` is a `{layer_type: (cos, sin)}` dict (produced
+    by `_compute_position_embeddings` for multi-layer-type-rope models like
+    Gemma3/Gemma4), select this layer's entry via its attention `layer_type`
+    so sliding- and full-attention layers each get their own rope.
     """
+    pe = position_embeddings
+    if isinstance(pe, dict):
+        lt = (getattr(layer, "layer_type", None)
+              or getattr(getattr(layer, "self_attn", None), "layer_type", None)
+              or getattr(getattr(layer, "attention", None), "layer_type", None))
+        pe = pe.get(lt)
+        if pe is None:
+            # Unknown/missing layer_type — fall back to any entry rather than
+            # crash (single-type rope, or a layer that doesn't tag its type).
+            pe = next(iter(position_embeddings.values()))
     out = layer(
         hidden_states=hidden,
         attention_mask=attention_mask,
         position_ids=position_ids,
         past_key_values=past_key_values,
         use_cache=False,
-        position_embeddings=position_embeddings,
+        position_embeddings=pe,
         **extra,
     )
     if isinstance(out, tuple):
@@ -1156,12 +1171,30 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
 def _compute_position_embeddings(base_model: nn.Module,
                                  hidden: torch.Tensor,
                                  position_ids: torch.Tensor):
-    """Call the rotary module to get (cos, sin). Returns None if
-    the model doesn't expose a standalone rotary (unusual)."""
+    """Call the rotary module to get position embeddings.
+
+    Single-rope models return a `(cos, sin)` tuple. Multi-layer-type-rope
+    models (Gemma3/Gemma4: separate rope per attention type, e.g.
+    sliding vs full with different `rope_theta`) expose `rotary.layer_types`
+    and a `forward(x, position_ids, layer_type=...)`; for those we return a
+    `{layer_type: (cos, sin)}` dict and `_call_layer` selects the right entry
+    per layer. Returns None if the model exposes no standalone rotary."""
     rotary = _get_rotary(base_model)
     if rotary is None:
         return None
+    layer_types = getattr(rotary, "layer_types", None)
     with torch.no_grad():
+        if layer_types:
+            per_type: dict = {}
+            for lt in layer_types:
+                try:
+                    per_type[lt] = tuple(rotary(hidden, position_ids,
+                                                layer_type=lt))
+                except TypeError:
+                    # Rotary forward doesn't take layer_type (e.g. DSv4 uses
+                    # one rope for all layers) — same embeddings for each.
+                    per_type[lt] = tuple(rotary(hidden, position_ids))
+            return per_type
         cos, sin = rotary(hidden, position_ids)
     return (cos, sin)
 
