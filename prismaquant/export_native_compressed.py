@@ -6163,14 +6163,35 @@ def build_quantization_config(
                 if len(sibs) < 2:
                     continue
                 states = [leaf_state.get((parent, s)) for s in sibs]
-                if any(s is None for s in states):
-                    continue  # not all siblings present → skip
-                if len(set(states)) != 1:
-                    continue  # mixed formats → caller's bug; don't emit
-                state = states[0]
+                present = [s for s in states if s is not None]
+                if not present:
+                    continue  # none of this group present here
                 fused_vllm_name = f"{parent}.{fused_name}"
                 if fused_vllm_name in fused_emitted:
                     continue
+                absent_leaves = [sibs[i] for i, s in enumerate(states)
+                                 if s is None]
+                if absent_leaves:
+                    # Incomplete fused group: a sibling is absent from the
+                    # checkpoint (e.g. Gemma4 ``attention_k_eq_v`` synthesizes
+                    # v=k, so v_proj is never materialized). vLLM fuses the
+                    # group into one packed Linear and requires a single scheme
+                    # across q/k/v. If every PRESENT sibling is BF16-ignored,
+                    # the synthesized absent sibling is BF16 too → emit the
+                    # absent siblings AND the fused name into ignore so the
+                    # fused module loads uniformly unquantized. (Quantized
+                    # incomplete groups are pinned to BF16 upstream by the
+                    # allocator's incomplete-fused-group rule, so a
+                    # mixed-and-incomplete group should not reach here.)
+                    if set(present) == {"IGNORE"}:
+                        fused_emitted.add(fused_vllm_name)
+                        for leaf in absent_leaves:
+                            ignore.append(f"{parent}.{leaf}")
+                        ignore.append(fused_vllm_name)
+                    continue
+                if len(set(states)) != 1:
+                    continue  # mixed formats → caller's bug; don't emit
+                state = states[0]
                 fused_emitted.add(fused_vllm_name)
                 if state == "IGNORE":
                     ignore.append(fused_vllm_name)
