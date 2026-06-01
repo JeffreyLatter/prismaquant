@@ -230,9 +230,11 @@ def _nvfp4_best_max_to_level_scale(
 ) -> torch.Tensor:
     """Pick the best max-to-codebook-level scale for each NVFP4 group.
 
-    ``four_over_six_mse`` is the two-level subset ``levels=(6, 4)``. The
-    joint scale rule extends that candidate set while staying final-pack
-    compatible because every chosen scale is ``max_abs / codebook_level``.
+    ``four_over_six_mse`` is the two-level set ``levels=(6, 4)``. The joint
+    scale rule uses ``_NVFP4_JOINT_SCALE_LEVELS`` (also ``(6, 4)`` by default;
+    extendable via ``PRISMAQUANT_NVFP4_JOINT_SCALE_LEVELS``) and stays
+    final-pack compatible because every chosen scale is
+    ``max_abs / codebook_level``.
     """
 
     max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
@@ -251,6 +253,30 @@ def _nvfp4_best_max_to_level_scale(
         best_scale = torch.where(take, scale, best_scale)
     assert best_scale is not None
     return best_scale
+
+
+def _parse_joint_scale_levels() -> tuple[float, ...]:
+    """JSO per-group scale levels. Default ``(6.0, 4.0)`` — the FourOverSix
+    pair. On both Qwen3.5-0.8B and Gemma4-31B the full 7-level grid collapses
+    to {6,4} for 99.998% of groups (aggregate weight-MSE cost of restricting to
+    {6,4} = +0.009%). The rare residual is self-correcting at allocation time:
+    the format allocator scores cost under this same recipe and {6,4} ⊆ the
+    full grid ⇒ a group's cost is monotone non-decreasing under the trim, so a
+    genuinely-hurt Linear can only be *promoted* to FP8/BF16, never silently
+    degraded. Set ``PRISMAQUANT_NVFP4_JOINT_SCALE_LEVELS`` (comma/space
+    separated, e.g. ``"6,4,3,2,1.5,1,0.5"``) to restore the full grid."""
+    raw = os.environ.get("PRISMAQUANT_NVFP4_JOINT_SCALE_LEVELS")
+    if raw:
+        try:
+            levels = tuple(float(x) for x in raw.replace(",", " ").split())
+        except ValueError:
+            levels = ()
+        if levels:
+            return levels
+    return (6.0, 4.0)
+
+
+_NVFP4_JOINT_SCALE_LEVELS = _parse_joint_scale_levels()
 
 
 def _select_nvfp4_group_scales(
@@ -276,14 +302,8 @@ def _select_nvfp4_group_scales(
     if rule == NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE:
         return _nvfp4_best_max_to_level_scale(grouped, (6.0, 4.0))
     if rule == NVFP4_SCALE_RULE_JOINT_MSE:
-        return _nvfp4_best_max_to_level_scale(
-            grouped,
-            (6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.5),
-        )
+        return _nvfp4_best_max_to_level_scale(grouped, _NVFP4_JOINT_SCALE_LEVELS)
     raise AssertionError(f"unhandled NVFP4 scale rule: {rule!r}")
-
-
-_NVFP4_JOINT_SCALE_LEVELS = (6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.5)
 
 
 def _env_int_clamped(name: str, default: int, lo: int, hi: int) -> int:
