@@ -63,6 +63,34 @@ def _hidden_size(cfg: dict) -> int:
                or cfg.get("hidden_size", 0))
 
 
+def _act_width(cfg: dict) -> int:
+    """Widest per-Linear activation the probe/cost retains.
+
+    The retained-activation estimate must track the *widest* projection
+    activation a layer holds, not just ``hidden_size``. A transformer MLP's
+    ``down_proj`` reads an ``intermediate_size``-wide input, and the cost
+    step's batched render materializes ``intermediate_size``-wide outputs
+    (gate/up) in fp32 scratch. On models where ``intermediate_size`` ≫
+    ``hidden_size`` (Gemma4-31B: 21504 vs 5376, 4×) sizing on ``hidden_size``
+    undershoots host RAM ~4× and the watchdog aborts the shard.
+
+    Returns ``max(hidden, ffn, moe_ffn)`` so the estimate is governed by the
+    true widest activation. Collapses to ``hidden_size`` when no FFN width is
+    declared (== hidden for plain models)."""
+    tc = cfg.get("text_config") or cfg
+    hidden = _hidden_size(cfg)
+    widths = [hidden]
+    for key in ("intermediate_size", "moe_intermediate_size",
+                "ffn_dim", "n_inner", "shared_expert_intermediate_size"):
+        v = tc.get(key) or cfg.get(key)
+        if v:
+            try:
+                widths.append(int(v))
+            except (TypeError, ValueError):
+                pass
+    return max(w for w in widths if w > 0) if any(w > 0 for w in widths) else hidden
+
+
 def _model_weight_bytes_on_disk(model_path: str) -> int:
     """Sum of all *.safetensors blob sizes. Works on both HF snapshots
     and staged copies. Falls back to 0 if the dir doesn't exist yet."""
@@ -97,12 +125,17 @@ def estimate_per_layer_bytes(
     seqlen: int,
     dtype_bytes: int = DEFAULT_DTYPE_BYTES,
     act_mult: int = DEFAULT_ACT_MULT,
+    act_width: int | None = None,
 ) -> tuple[int, int]:
     """Return `(per_layer_weight_bytes, per_layer_active_shard_bytes)`.
 
     - weight bytes: disk size / num_layers, minus head/embed approximation
     - active_shard bytes: gradients (~weight) + retained activations
-      (N·T·hidden·dtype·act_mult)
+      (N·T·act_width·dtype·act_mult)
+
+    `act_width` is the widest per-Linear activation the layer retains —
+    `max(hidden, intermediate)` (see `_act_width`). Defaults to `hidden_size`
+    for back-compat; pass the FFN-aware width so large-MLP models size right.
     """
     total_disk = _model_weight_bytes_on_disk(model_path)
     if total_disk > 0 and num_layers > 0:
@@ -113,7 +146,8 @@ def estimate_per_layer_bytes(
         per_layer_weight = 1 * 1024 ** 3  # 1 GB fallback
 
     grad_bytes = per_layer_weight  # same shape, same dtype
-    act_bytes = nsamples * seqlen * hidden_size * dtype_bytes * act_mult
+    width = act_width if act_width else hidden_size
+    act_bytes = nsamples * seqlen * width * dtype_bytes * act_mult
     per_layer_active = grad_bytes + act_bytes
     return per_layer_weight, per_layer_active
 
@@ -153,7 +187,7 @@ def pick_layers_per_shard(
 
     per_layer_weight, per_layer_active = estimate_per_layer_bytes(
         model_path, n_layers, hidden, nsamples, seqlen,
-        dtype_bytes=dtype_bytes, act_mult=act_mult,
+        dtype_bytes=dtype_bytes, act_mult=act_mult, act_width=_act_width(cfg),
     )
     avail = available_ram_bytes if available_ram_bytes is not None else _available_ram_bytes()
     safety = int(safety_gb * 1024 ** 3)
@@ -230,7 +264,7 @@ def pick_cache_headroom_gb(
         return default, {"reason": "missing layer/hidden", "headroom_gb": default}
 
     _, per_layer_active = estimate_per_layer_bytes(
-        model_path, n_layers, hidden, nsamples, seqlen,
+        model_path, n_layers, hidden, nsamples, seqlen, act_width=_act_width(cfg),
     )
     shard_working_bytes = layers_per_shard * per_layer_active
     headroom_bytes = shard_working_bytes + int(safety_gb * 1024 ** 3)

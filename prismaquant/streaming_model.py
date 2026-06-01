@@ -117,6 +117,33 @@ def _mask_cuda_queries_during_meta_init(log_prefix: str):
         yield
         return
 
+    # Prime transformers' lru_cached fla / causal-conv1d availability checks
+    # with CUDA visible BEFORE masking it. Several modeling files
+    # (Qwen3.5/3.6 MoE, Qwen3-Next, OLMo-hybrid) bind their gated-delta-rule
+    # FAST PATH at *module import time* behind
+    # `if is_flash_linear_attention_available():`. That check is
+    # `@lru_cache`d and CUDA-gated, so if the module is first imported inside
+    # this mask it caches `False`, the fla ops are never imported, and the
+    # fast path is silently lost for the whole process — falling back to the
+    # slow torch gated-delta-rule path (issue #4). Re-priming the caches here
+    # pins them to the real CUDA state so the subsequent masked import still
+    # binds the fast path. No-op when the packages aren't installed; the
+    # availability call is a lightweight `torch.cuda.is_available()` (set
+    # PRISMAQUANT_MASK_CUDA_DURING_META_INIT=0 to skip the mask entirely on a
+    # pathologically-wedged UVM where even that probe is slow).
+    try:
+        from transformers.utils import import_utils as _tiu
+        for _avail in ("is_flash_linear_attention_available",
+                       "is_causal_conv1d_available"):
+            _f = getattr(_tiu, _avail, None)
+            if _f is None:
+                continue
+            if hasattr(_f, "cache_clear"):
+                _f.cache_clear()
+            _f()  # prime with CUDA visible (result cached for the process)
+    except Exception:
+        pass
+
     old_is_available = torch.cuda.is_available
     old_device_count = torch.cuda.device_count
     old_current_device = torch.cuda.current_device

@@ -835,6 +835,37 @@ class ModelProfile(ABC):
         (which the layer's `**kwargs` absorbs)."""
         return {}
 
+    # ------------------------------------------------------------------
+    # Cross-layer shared forward state (e.g. Gemma4 KV sharing).
+    #
+    # Some architectures share activations ACROSS layers within one forward
+    # pass — Gemma4's last `num_kv_shared_layers` reuse the K/V computed by
+    # the last non-shared layer of their type (those layers have no v_proj).
+    # PrismaQuant's phase-1 forward is sequential (so a shared dict threaded
+    # through it works), but phase-3 Fisher / cost re-forward each layer in
+    # ISOLATION — a shared layer then has no source for its borrowed state.
+    # These hooks let a profile (a) create per-pass mutable state threaded
+    # through phase-1, (b) snapshot it for reuse, and (c) reconstruct the
+    # per-layer slice for an isolated forward. Defaults are no-ops.
+    # ------------------------------------------------------------------
+    def new_forward_pass_state(self) -> dict:
+        """Mutable kwargs created ONCE per sequential forward pass and
+        threaded into every layer call (so later layers see earlier layers'
+        contributions). Default: none."""
+        return {}
+
+    def capture_forward_pass_state(self, pass_state: dict):
+        """Snapshot the per-pass state after a full sequential forward, in a
+        form cheap to store (e.g. tensors moved to CPU) and reuse later.
+        Default: nothing to capture."""
+        return None
+
+    def isolated_layer_pass_state(self, captured, layer) -> dict:
+        """Reconstruct the shared-state kwargs a single `layer` needs when
+        forwarded in isolation (phase-3 / cost), from `captured`. Default:
+        none."""
+        return {}
+
     def should_probe_linear(self, name: str, mod) -> bool:
         """Whether to register Fisher hooks on this Linear module.
         DSv4 returns False for `DeepseekV4GroupedLinear` (its weight

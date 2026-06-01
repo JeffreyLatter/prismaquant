@@ -54,6 +54,67 @@ class Gemma4Profile(ModelProfile):
     # Overriding to inject `.moe.` ourselves produces a double `.moe.`
     # after vLLM's remap runs — verified experimentally.
 
+    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
+        """Gemma 4's text rotary is multi-layer-type: it registers one
+        ``<layer_type>_inv_freq`` buffer per entry in ``config.layer_types``,
+        with *mixed* rope types (e.g. ``sliding_attention``=default,
+        ``full_attention``=proportional). The generic single-rope fallback in
+        ``_init_rotary_inplace`` calls ``compute_default_rope_parameters(cfg,
+        device)`` with no ``layer_type`` → ``KeyError: None`` on
+        ``config.rope_parameters[layer_type]`` (issue #6).
+
+        Re-run the rotary's own ``__init__`` on the real device: it rebuilds
+        every ``<layer_type>_inv_freq`` / ``<layer_type>_attention_scaling``
+        with the correct per-type rope init function (proportional / linear /
+        default, plus any per-type kwargs). A hand-rolled
+        ``compute_default_rope_parameters`` loop would silently apply the
+        *default* formula to the proportional layer and produce wrong
+        frequencies."""
+        if getattr(rotary, "layer_types", None) is None:
+            return False
+        if getattr(cfg, "rope_parameters", None) is None:
+            return False
+        try:
+            type(rotary).__init__(rotary, cfg, device=device)
+        except Exception:
+            return False
+        return True
+
+    # ------------------------------------------------------------
+    # Cross-layer KV sharing.  Gemma4's last `num_kv_shared_layers`
+    # attention layers have no k/v_proj — they reuse the K/V computed by
+    # the last non-shared layer of their `layer_type`, passed via a
+    # `shared_kv_states` dict the model forward threads through every layer.
+    # ------------------------------------------------------------
+    def new_forward_pass_state(self) -> dict:
+        return {"shared_kv_states": {}}
+
+    def capture_forward_pass_state(self, pass_state: dict):
+        """After phase-1's sequential forward, `shared_kv_states[type]` holds
+        the (full-length) K/V the shared layers reuse. Snapshot to CPU."""
+        skv = (pass_state or {}).get("shared_kv_states") or {}
+        out = {}
+        for lt, kv in skv.items():
+            try:
+                out[lt] = tuple(t.detach().to("cpu") for t in kv)
+            except Exception:
+                pass
+        return out
+
+    def isolated_layer_pass_state(self, captured, layer) -> dict:
+        """For an isolated (phase-3) layer forward: a shared layer needs its
+        type's captured K/V (the attention moves them to the right device
+        itself); a non-shared layer just needs a writable dict to store into.
+        Always returns a `shared_kv_states` dict so the layer never sees
+        `None`."""
+        attn = getattr(layer, "self_attn", None)
+        if getattr(attn, "is_kv_shared_layer", False) and captured:
+            lt = getattr(attn, "layer_type", None)
+            kv = captured.get(lt)
+            if kv is not None:
+                return {"shared_kv_states": {lt: kv}}
+        return {"shared_kv_states": {}}
+
     def export_tensor_name(self, model_qname: str) -> str:
         """Keep body/expert export keys in recipe form.
 

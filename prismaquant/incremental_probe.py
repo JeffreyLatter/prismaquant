@@ -1088,6 +1088,10 @@ class GlobalPrecompute:
     router_totals: dict[str, int]
     router_active_counts: dict[str, dict[str, int]]
     expert_route_stats: dict[str, dict]
+    # Per-pass shared forward state (e.g. Gemma4 shared_kv_states): captured at
+    # the end of phase-1's sequential forward, reused in phase-3's isolated
+    # per-layer forwards so KV-sharing layers see their borrowed K/V.
+    shared_pass_state: dict | None = None
     # Reusable forward-state derivable from ids + model; recomputed on demand.
 
 
@@ -1144,6 +1148,11 @@ def _compute_global_precompute(
 
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
 
+    # Per-pass shared forward state (e.g. Gemma4 cross-layer KV sharing),
+    # threaded into every layer call in the sequential loop below and
+    # captured afterward for phase-3's isolated forwards.
+    pass_state = _profile.new_forward_pass_state()
+
     print(f"[incremental/global] phase-1 N={batch_size} T={tokens_in_sample} "
           f"hidden={tuple(hidden.shape)}", flush=True)
 
@@ -1171,6 +1180,7 @@ def _compute_global_precompute(
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 **_profile.extra_layer_kwargs(input_ids=ids),
+                **pass_state,
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
@@ -1179,6 +1189,12 @@ def _compute_global_precompute(
         if L % 8 == 0 or L == num_layers - 1:
             print(f"[incremental/global] fwd L{L:02d}  src={src}  "
                   f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+    # Snapshot the cross-layer shared state (e.g. Gemma4 shared_kv_states)
+    # now that the full sequential forward is done — it holds the K/V the
+    # KV-sharing layers reuse. Captured to CPU for the pickled precompute so
+    # phase-3's isolated forwards can reconstruct it.
+    shared_pass_state = _profile.capture_forward_pass_state(pass_state)
+
     # v22 Fix E1: batched device→host transfer for the activations
     # captured during phase-1. All have the same (B, T, H) shape so we
     # stack into one (L+1, B, T, H) tensor and do a single .cpu() —
@@ -1396,6 +1412,7 @@ def _compute_global_precompute(
         router_totals=phase1_router_totals,
         router_active_counts=phase1_router_active_counts,
         expert_route_stats=phase1_expert_route_stats,
+        shared_pass_state=shared_pass_state,
     )
 
 
@@ -2184,6 +2201,10 @@ def _run_body_streaming_shard(
                 position_ids=position_ids,
                 **_shard_profile.extra_layer_kwargs(
                     input_ids=calib.to(device) if calib is not None else None),
+                # KV-sharing layers (Gemma4) reuse K/V captured in phase-1;
+                # reconstruct that per-layer slice for this isolated forward.
+                **_shard_profile.isolated_layer_pass_state(
+                    precomputed.shared_pass_state, layers[L]),
             )
             out.backward(grad_out.to(device))
             bwd_s = time.time() - bwd_t0
