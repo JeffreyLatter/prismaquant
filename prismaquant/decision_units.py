@@ -79,6 +79,45 @@ def fused_group_key(profile, qname: str) -> str:
     return qname
 
 
+def incomplete_fused_group_members(names: Iterable[str], profile) -> set[str]:
+    """Present members of fused-sibling groups that are MISSING a sibling.
+
+    vLLM loads a fused projection (e.g. ``qkv_proj`` = q/k/v, ``gate_up_proj`` =
+    gate/up) as a single quantized unit. If a group is incomplete — a sibling is
+    absent from the checkpoint, e.g. Gemma4 ``k_eq_v`` full-attention layers
+    synthesize ``v = k`` and ship no ``v_proj`` (and vLLM never creates a
+    ``v_scale`` param) — the present members CANNOT be quantized: the fused load
+    would look up a scale param that doesn't exist (``KeyError`` on
+    ``k_proj.weight_scale``). Those present members must ship BF16 instead.
+
+    This is a generic vLLM fused-load invariant, not model-specific: it is
+    driven entirely by the profile's ``fused_sibling_group`` +
+    ``fused_sibling_leaf_mapping``. Returns the set of qnames to force to BF16.
+    """
+    if profile is None:
+        return set()
+    try:
+        leaf_map = profile.fused_sibling_leaf_mapping() or {}
+    except Exception:
+        leaf_map = {}
+    if not leaf_map:
+        return set()
+    groups: dict[str, set[str]] = defaultdict(set)
+    for n in names:
+        groups[fused_group_key(profile, n)].add(n)
+    pinned: set[str] = set()
+    for gk, present in groups.items():
+        fused_leaf = gk.rsplit(".", 1)[-1]
+        members = leaf_map.get(fused_leaf)
+        if not members:
+            continue  # not a recognized fused group (bare qname, o_proj, ...)
+        prefix = gk[: len(gk) - len(fused_leaf)]
+        expected = {prefix + m for m in members}
+        if expected - present:            # at least one expected sibling absent
+            pinned |= present & expected  # → present siblings must ship BF16
+    return pinned
+
+
 def _recipe_name(full_name: str) -> str:
     return full_name[:-7] if full_name.endswith(".weight") else full_name
 

@@ -900,6 +900,23 @@ def main():
     for name in sorted(set(stats) | set(costs)):
         if model_profile.is_pinned_name(name):
             allocation_excluded.append(name)
+    # vLLM fused-load invariant: a fused-sibling group missing a member (e.g.
+    # Gemma4 k_eq_v full-attention layers synthesize v=k and ship no v_proj /
+    # v_scale) cannot be partially quantized — the present members must ship
+    # BF16, else the fused load KeyErrors on a non-existent scale param.
+    # Generic + profile-driven (no model-specific code here).
+    from .decision_units import incomplete_fused_group_members
+    incomplete_members = incomplete_fused_group_members(
+        set(stats) | set(costs), model_profile)
+    incomplete_added = sorted(incomplete_members - set(allocation_excluded))
+    allocation_excluded.extend(incomplete_added)
+    if incomplete_added:
+        print(
+            "[alloc] incomplete fused-sibling groups → BF16 (vLLM fused-load "
+            f"invariant): {len(incomplete_added)} Linears "
+            f"(sample: {incomplete_added[:8]})",
+            flush=True,
+        )
     if allocation_excluded:
         excluded = set(allocation_excluded)
         stats = {name: value for name, value in stats.items() if name not in excluded}
