@@ -256,8 +256,20 @@ def check_generation_sanity(base_url: str, model_name: str,
 
 def check_perplexity(base_url: str, model_name: str,
                      max_ppl: float, max_p99_nll: float,
-                     max_mean_nll: float) -> CheckResult:
+                     max_mean_nll: float,
+                     bos_token: str | None = None,
+                     add_special_tokens: bool = True) -> CheckResult:
     """Compute per-token NLL across the eval prompt suite.
+
+    **BOS sensitivity (Gemma et al.):** models that key on a leading BOS
+    return ~ln(vocab_size) (uniform-random) per-token NLL when the prompt is
+    teacher-forced without one. Some exports ship ``add_bos_token=false`` in
+    their tokenizer_config, so ``add_special_tokens=True`` alone does NOT add
+    it — pass ``bos_token`` (e.g. ``"<bos>"``) to prepend it explicitly. When
+    ``bos_token`` is given the request uses ``add_special_tokens=False`` to
+    avoid a double-BOS. NOTE: raw-text PPL is also a weak quant-quality signal
+    on heavily instruction-tuned models (the off-distribution penalty swamps
+    the quantization delta); prefer KL-vs-BF16 for quant A/Bs there.
 
     Hard fails when mean NLL exceeds threshold OR when p99 per-prompt
     NLL exceeds threshold. p99 catches bimodal-failure where the model
@@ -291,16 +303,19 @@ def check_perplexity(base_url: str, model_name: str,
     total_tokens = 0
     total_nll = 0.0
     for i, prompt in enumerate(EVAL_PROMPTS, 1):
+        req_prompt = (bos_token + prompt) if bos_token else prompt
         try:
             r = _post_json(
                 f"{base_url}/v1/completions",
                 {
                     "model": model_name,
-                    "prompt": prompt,
+                    "prompt": req_prompt,
                     "max_tokens": 1,
                     "temperature": 0.0,
                     "logprobs": 1,
                     "echo": True,
+                    # manual BOS already prepended -> don't let the server add another
+                    "add_special_tokens": False if bos_token else add_special_tokens,
                 },
             )
         except Exception as e:
