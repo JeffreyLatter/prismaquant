@@ -758,6 +758,43 @@ def _build_streaming_context(model_path: str, *,
     print(f"{log_prefix} head materialized ({loaded_head} tensors, "
           f"rotary re-init) in {time.time()-t0:.1f}s", flush=True)
 
+    # Constructor-derived NON-PERSISTENT head buffers (e.g. gemma4_unified's
+    # `embed_scale = sqrt(hidden)`) are absent from the checkpoint, so
+    # `_materialize` never assigns them and they stay on `meta` — and
+    # PrismaQuant globally no-ops `_initialize_weights` (prismaquant/__init__),
+    # so the modeling's `_init_weights` that would set them never runs. The
+    # first forward op (`embed_tokens(ids)` multiplies by `embed_scale`) then
+    # faults "Tensor on device meta". Re-create such buffers on `device` from
+    # the owning module's retained python scalar (`scalar_<attr>`). Generic
+    # (any arch following this pattern); scoped to non-`layers` modules since
+    # streaming decoder buffers load per shard. Persistent buffers (e.g.
+    # `layer_scalar`) come from the checkpoint and are untouched.
+    _meta_fixed = 0
+    for _bname, _buf in list(base_model.named_buffers(recurse=True)):
+        if _buf is None or not _buf.is_meta or _bname.split(".", 1)[0] == "layers":
+            continue
+        _mod_name, _, _attr = _bname.rpartition(".")
+        _owner = base_model.get_submodule(_mod_name) if _mod_name else base_model
+        if _attr not in getattr(_owner, "_non_persistent_buffers_set", set()):
+            continue  # persistent buffers are loaded from the checkpoint
+        _scalar = getattr(_owner, "scalar_" + _attr, None)
+        if _scalar is None:
+            continue
+        _owner.register_buffer(
+            _attr, torch.tensor(_scalar, device=device, dtype=_buf.dtype),
+            persistent=False)
+        _meta_fixed += 1
+    _stuck = [n for n, b in base_model.named_buffers(recurse=True)
+              if b is not None and b.is_meta and n.split(".", 1)[0] != "layers"]
+    if _stuck:
+        raise RuntimeError(
+            f"{log_prefix} head buffers left on meta after materialization "
+            f"(no scalar_ init source): {_stuck[:8]} — extend the "
+            f"non-persistent-buffer sweep in _build_streaming_context")
+    if _meta_fixed:
+        print(f"{log_prefix} materialized {_meta_fixed} non-persistent head "
+              f"buffer(s) off meta (e.g. embed_scale)", flush=True)
+
     # Locate the visual module on the meta skeleton. When multimodal is
     # set, fully materialize the visual tower onto `device`; body
     # layers remain meta and stream per shard.

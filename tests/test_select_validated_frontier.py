@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from prismaquant.select_validated_frontier import (
+    _saturation_pick,
     leave_one_out_kneedle_diagnostic,
     measured_frontier,
     practical_knee,
@@ -13,6 +14,52 @@ from prismaquant.select_validated_frontier import (
     spearman_rank_correlation,
     worst_rank_inversion,
 )
+
+
+def _sat_results(stderr):
+    # flat tail (6.0..8.0 within noise of asymptote), decreasing before it
+    rows = [(4.5, 0.10), (5.0, 0.06), (6.0, 0.030), (7.0, 0.029), (8.0, 0.028)]
+    out = []
+    for bpp, kl in rows:
+        r = {"label": f"a{bpp}", "path": f"/x/a{bpp}.json", "bpp": bpp,
+             "last_token_kl": kl, "format_counts": {}}
+        if stderr is not None:
+            r["kl_stderr"] = stderr
+        out.append(r)
+    return out
+
+
+def test_saturation_mode_picks_bstar_with_real_stderr():
+    sel, frontier = select_frontier_point(
+        _sat_results(3e-3), mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 6.0   # 6/7/8 indistinguishable within the band -> B*=6
+    idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is False
+    assert frontier[idx]["bpp"] == 6.0
+
+
+def test_saturation_mode_zero_stderr_flags_no_noise_floor():
+    sel, frontier = select_frontier_point(
+        _sat_results(0.0), mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 8.0   # band collapses -> densest asymptote (most bits)
+    _idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is True
+
+
+def test_saturation_mode_missing_stderr_key_is_no_noise_floor():
+    # rows entirely lacking kl_stderr must not KeyError; treated as 0 stderr.
+    sel, frontier = select_frontier_point(
+        _sat_results(None), mode="saturation", sat_z=2.0)
+    _idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is True
+    assert sel["bpp"] == 8.0
+
+
+def test_saturation_single_point_frontier_does_not_crash():
+    res = [{"label": "only", "path": "/x/only.json", "bpp": 6.0,
+            "last_token_kl": 0.03, "kl_stderr": 1e-3}]
+    sel, frontier = select_frontier_point(res, mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 6.0 and len(frontier) == 1
 
 
 def test_measured_frontier_drops_dominated_points():

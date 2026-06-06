@@ -183,6 +183,17 @@ export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
 : "${VALIDATED_FRONTIER_KL_SCOPE:=last_token}"
 : "${VALIDATED_FRONTIER_PICK:=kneedle}"
+: "${VALIDATED_FRONTIER_SAT_Z:=2.0}"
+# Saturation (B*) needs a real per-bpp noise floor: validate_assignments_kl's
+# kl_stderr is computed across calib-repeats, so a single repeat -> stderr=0 ->
+# the saturation band collapses and B* degenerates to the asymptote. Auto-bump
+# repeats to 4 when PICK=saturation (CLAUDE.md's --calib-repeats>=4 discipline);
+# other picks keep 1 repeat (backwards-compatible). Override explicitly to pin.
+if [[ "$VALIDATED_FRONTIER_PICK" == "saturation" ]]; then
+  : "${VALIDATED_FRONTIER_CALIB_REPEATS:=4}"
+else
+  : "${VALIDATED_FRONTIER_CALIB_REPEATS:=1}"
+fi
 : "${VALIDATED_SOURCE_PREFETCH:=require}"
 : "${VALIDATED_SOURCE_PREFETCH_MAX_GB:=0}"
 : "${VALIDATED_SOURCE_PREFETCH_HEADROOM_GB:=16}"
@@ -772,6 +783,7 @@ PY
       --dataset "$DATASET" \
       --n-calib-samples "$VALIDATED_FRONTIER_NSAMPLES" \
       --calib-seqlen "$VALIDATED_FRONTIER_SEQLEN" \
+      --calib-repeats "$VALIDATED_FRONTIER_CALIB_REPEATS" \
       --dtype bf16 \
       --device "$DEVICE" \
       --kl-scope "$VALIDATED_FRONTIER_KL_SCOPE" \
@@ -793,6 +805,7 @@ PY
     python3 -m prismaquant.select_validated_frontier \
       --validation-json "$VALIDATION_JSON" \
       --mode "$VALIDATED_FRONTIER_PICK" \
+      --sat-z "$VALIDATED_FRONTIER_SAT_Z" \
       --output-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
       --output-assignment "${WORK_DIR}/artifacts/layer_config_validated_assignment.json" \
       --output-summary "${WORK_DIR}/artifacts/validated_frontier_selection.json" \

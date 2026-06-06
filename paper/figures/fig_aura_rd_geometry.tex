@@ -1,0 +1,61 @@
+% fig_aura_rd_geometry.tex
+% AURA paper: the operational rate-distortion geometry.
+% (a) the format MENU, not the sensitivity distribution, creates the knee
+%     (Qwen3-4B, RTN weight-only measured KL-vs-BF16; memory: fp8-missing-rung).
+% (b) the apparent LINEARITY is a log-KL-axis artifact: the same measured 27B
+%     served-vLLM frontier is convex on linear axes, straight in log-KL.
+% Data are verbatim from /home/rob/dq-runs/{aura-sat-validate-4b,aura-27b-flagship}.
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.49\textwidth, height=5.0cm,
+    xlabel={bits per parameter (body)},
+    ylabel={measured KL vs.\ BF16},
+    xmin=4, xmax=16.5, ymin=0,
+    title={\small (a) the menu makes the knee},
+    legend style={font=\scriptsize, at={(0.97,0.97)}, anchor=north east, draw=none},
+    grid=both, grid style={lightgray!40},
+    tick label style={font=\scriptsize}, label style={font=\small},
+]
+% Qwen3-4B, NVFP4+BF16 only (2 rungs): roughly linear to zero at all-BF16
+\addplot[accent2, mark=*, thick] coordinates {
+  (4.5,0.228) (6.0,0.184) (8.0,0.137) (10.0,0.105) (16.0,0.0) };
+\addlegendentry{\{NVFP4,\,BF16\}}
+% Qwen3-4B, +FP8 middle rung (3 rungs): sharp knee at ~8 bpp
+\addplot[accent3, mark=triangle*, thick] coordinates {
+  (4.5,0.228) (6.0,0.122) (8.0,0.023) (10.0,0.013) (16.0,0.0) };
+\addlegendentry{\{NVFP4,\,FP8,\,BF16\}}
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.49\textwidth, height=5.0cm,
+    xlabel={bits per parameter (body)},
+    ylabel={served KL vs.\ BF16 (linear)},
+    xmin=4.3, xmax=8.2, ymin=0.024, ymax=0.052,
+    title={\small (b) ``linear'' is a log-axis artifact},
+    grid=both, grid style={lightgray!40},
+    tick label style={font=\scriptsize}, label style={font=\small},
+]
+% Qwen3.6-27B, served vLLM KL, 2-rung NVFP4+BF16 (the flagship menu): convex on linear axes
+\addplot[accent, mark=*, thick] coordinates {
+  (4.50,0.0495) (4.85,0.0425) (5.00,0.0441) (5.25,0.0418) (5.50,0.0387)
+  (5.75,0.0382) (6.00,0.0365) (6.50,0.0306) (7.00,0.0305) (8.00,0.0264) };
+\node[font=\scriptsize, accent] at (axis cs:6.5,0.047) {convex (knee $\approx 6.5$)};
+\end{axis}
+\end{tikzpicture}
+\caption{\textbf{The rate--distortion frontier is convex, and a sharp knee is a
+property of the format \emph{menu}, not of the sensitivity distribution.}
+\textbf{(a)} On Qwen3-4B (RTN weight-only, measured KL-vs-BF16), the
+two-rung $\{$NVFP4,\,BF16$\}$ menu yields a near-linear frontier; adding the
+intermediate-efficiency FP8 rung introduces a cost-per-bit discontinuity that
+bends it into a sharp knee near $8$~bpp ($6\!\times$ lower KL at matched bytes).
+\textbf{(b)} The shipped Qwen3.6-27B served-vLLM frontier (two-rung)
+is genuinely convex on linear axes (chord curvature $24.5\%$; the per-Linear
+cost-per-bit has weighted Gini $0.45$, far from democratic); it only \emph{looks}
+linear when plotted as $\log_{10}\kl$ over the narrow $4.5$--$6.0$~bpp window
+where production allocations live. A better cost (AURA) shifts this frontier
+\emph{down}, orthogonally to its curvature.}
+\label{fig:aura_rd_geometry}
+\end{figure}
