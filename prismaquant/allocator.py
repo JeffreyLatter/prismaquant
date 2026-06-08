@@ -889,6 +889,18 @@ def main():
                          "container run but is now only accessible via a "
                          "different mount). Overrides both profile detection "
                          "and visual-Linear source discovery.")
+    ap.add_argument("--allow-default-profile", action="store_true",
+                    help="Permit a multi-format allocation to run on "
+                         "DefaultProfile when no model path is available "
+                         "(probe meta['model'] unset and no --model-override). "
+                         "DefaultProfile only enforces the universal fused "
+                         "groups (qkv_proj/gate_up_proj), so architecture-"
+                         "specific merged columns (e.g. Qwen3.x DeltaNet "
+                         "in_proj_ba) are NOT coherence-protected and may "
+                         "produce an unservable or silently-corrupt artifact. "
+                         "Only safe for vanilla transformers. Off by default: "
+                         "the allocator hard-errors instead and asks for "
+                         "--model-override.")
     ap.add_argument("--target-bits", type=float, default=4.75)
     ap.add_argument("--target-disk-gb", type=float, default=None,
                     help="Fit-the-card ship selection: instead of --target-bits, "
@@ -1075,10 +1087,28 @@ def main():
     if args.model_override:
         probe_model_path = args.model_override
         print(f"[alloc] model-override: {probe_model_path}", flush=True)
+    used_default_fallback = False
     if probe_model_path:
         model_profile = detect_profile(probe_model_path)
         print(f"[alloc] model profile: {model_profile.name} "
               f"(derived from {probe_model_path})", flush=True)
+    else:
+        # No model path (probe lacks meta['model'] and no --model-override):
+        # we fall back to DefaultProfile, which only knows the UNIVERSAL fused
+        # groups (qkv_proj, gate_up_proj). Arch-specific merged columns (e.g.
+        # Qwen3.x DeltaNet in_proj_ba / in_proj_qkvz) are invisible, so the
+        # fused-sibling promotion can leave them with mixed formats -> an
+        # unservable / silently-corrupt checkpoint. A SINGLE-format menu is
+        # always safe (every Linear gets the same format, so fused groups are
+        # trivially coherent); a multi-format menu is gated to a hard error
+        # below unless --allow-default-profile is set.
+        used_default_fallback = True
+        print(
+            "[alloc] WARNING: no model path (probe meta['model'] is unset and "
+            "no --model-override) -> using DefaultProfile. Architecture-"
+            "specific fused-sibling groups will NOT be enforced. Pass "
+            "--model-override <model> (or rebuild the probe with meta['model'] "
+            "set) so detect_profile resolves the real profile.", flush=True)
     target_profile = resolve_target_profile(model_profile, args.target_profile)
     if target_profile not in serving_profile_names():
         raise SystemExit(f"[alloc] ERROR: unknown target profile {target_profile!r}")
@@ -1167,6 +1197,35 @@ def main():
         fmt_names = cost_data["formats"]
     specs = [fr.get_format(n) for n in fmt_names]
     specs_sorted = sorted(specs, key=lambda s: s.effective_bits)
+
+    # Fused-coherence guard: a multi-format menu under DefaultProfile cannot
+    # enforce architecture-specific fused-sibling coherence (e.g. Qwen3.x
+    # DeltaNet in_proj_ba) or packed-MoE expert uniformity, so the allocation
+    # can ship an unservable or silently-corrupt checkpoint. DefaultProfile is
+    # the RESOLVED profile either when no model path was available OR when the
+    # model architecture is not registered -- key off the resolved profile, not
+    # just the no-model fallback, so an unrecognized model with a path is also
+    # caught (and so packed-MoE archs are protected by the same gate). Fail
+    # PROACTIVELY here rather than rely only on the export's last-line hard-fail.
+    # Single-format menus are always coherent; --allow-default-profile is the
+    # explicit escape for vanilla transformers. The menu is de-duped by format
+    # NAME so an alias/duplicate cannot false-trigger.
+    using_default_profile = isinstance(model_profile, DefaultProfile)
+    distinct_fmt_names = sorted({s.name for s in specs_sorted})
+    if (using_default_profile and len(distinct_fmt_names) > 1
+            and not args.allow_default_profile):
+        raise SystemExit(
+            "[alloc] ERROR: multi-format menu "
+            f"({distinct_fmt_names}) resolved to DefaultProfile (no probe "
+            "meta['model'] / --model-override, or the model architecture is "
+            "not registered) -> DefaultProfile cannot enforce architecture-"
+            "specific fused-sibling coherence (e.g. Qwen3.x DeltaNet "
+            "in_proj_ba/in_proj_qkvz) or packed-MoE expert uniformity, which "
+            "risks an unservable or silently-corrupt artifact. Pass "
+            "--model-override <model> so detect_profile resolves the real "
+            "profile, or --allow-default-profile to proceed anyway (only safe "
+            "for vanilla transformers whose only fused groups are "
+            "qkv_proj/gate_up_proj).")
 
     # --- Format-family coherence check -----------------------------------
     # A sensible format ladder has at most ONE format per bit tier. Having

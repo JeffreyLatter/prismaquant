@@ -6099,9 +6099,15 @@ def build_quantization_config(
         if len(states) > 1:
             raise RuntimeError(
                 f"[export-stream] FusedMoE at {fused_qname!r} has mixed "
-                f"states across packed expert projections {states}; "
-                f"the allocator's packed-expert format group should have "
-                f"forced one scheme before this point."
+                f"states across packed expert projections {states}; vLLM "
+                "fuses the experts into one kernel needing a single scheme, so "
+                "this is unservable. The allocator's packed-expert format group "
+                "should have forced one scheme -- this is the same failure "
+                "class as the fused-sibling coherence violation: usually an "
+                "allocation produced under the WRONG model profile (probe "
+                "lacked meta['model'] -> DefaultProfile never saw the packed-"
+                "expert grouping). Re-run the allocator with --model-override "
+                "<model> so detect_profile resolves the real profile."
             )
         state = next(iter(states))
         regex = _per_expert_regex_for(
@@ -6125,11 +6131,6 @@ def build_quantization_config(
     # `fused_sibling_group` pre-pass — but we defensively skip emitting
     # a fused target in that case rather than guess.
     if packed_mapping:
-        # Map leaf sibling → fused-name, using packed_mapping that vLLM
-        # reads at load time.
-        leaf_to_fused = {s: fused for fused, sibs in packed_mapping.items()
-                         for s in sibs}
-
         # Build parent-path → {leaf: (fmt|IGNORE, vllm_name)} for every
         # live entry (assignment + extra_ignore + bf16_passthrough).
         def _parent_leaf(vname: str):
@@ -6156,8 +6157,15 @@ def build_quantization_config(
         # For each (parent, fused) pair where all siblings are present
         # and share a state, emit the fused-name target.
         fused_emitted: set[str] = set()
+        # vLLM fuses these siblings into ONE packed Linear with ONE scheme, so
+        # any group whose present siblings carry MIXED formats yields a wrong
+        # artifact -- either a crash at load (>=2 distinct quantized schemes) or
+        # a silent corruption (quantized + BF16). Collect such groups and fail
+        # the export rather than silently emit. Each entry is
+        # (fused_vllm_name, kind, {sibling_leaf: format}).
+        fused_coherence_violations: list[tuple[str, str, dict[str, str]]] = []
         parents = {p for (p, _) in leaf_state}
-        for parent in parents:
+        for parent in sorted(parents):  # deterministic violation ordering
             for fused_name, sibs in packed_mapping.items():
                 # Skip degenerate fused definitions (single-sibling).
                 if len(sibs) < 2:
@@ -6183,6 +6191,18 @@ def build_quantization_config(
                     # incomplete groups are pinned to BF16 upstream by the
                     # allocator's incomplete-fused-group rule, so a
                     # mixed-and-incomplete group should not reach here.)
+                    #
+                    # We deliberately do NOT fail here on a quantized-present +
+                    # absent-sibling mix: at this layer we only see the config
+                    # dict, so we cannot distinguish a GENUINELY absent sibling
+                    # (synthesized/tied, e.g. Gemma4 v=k) from one merely not in
+                    # a PARTIAL assignment (some build_quantization_config call
+                    # sites pass a subset). That genuine-absent + quantized case
+                    # is the allocator's job (incomplete_fused_group_members pins
+                    # present members to BF16, and the allocator now hard-errors
+                    # when it can't resolve the real profile) -- it knows the
+                    # model's true module list; the export does not. The
+                    # all-present mixed case below IS unambiguous and is failed.
                     if set(present) == {"IGNORE"}:
                         fused_emitted.add(fused_vllm_name)
                         for leaf in absent_leaves:
@@ -6190,13 +6210,55 @@ def build_quantization_config(
                         ignore.append(fused_vllm_name)
                     continue
                 if len(set(states)) != 1:
-                    continue  # mixed formats → caller's bug; don't emit
+                    # Present siblings disagree -> a fused-coherence violation.
+                    # vLLM fuses them into ONE packed Linear with ONE scheme,
+                    # and BOTH mixed cases produce a wrong artifact:
+                    #  - >=2 distinct QUANTIZED schemes (e.g. FP8 + NVFP4):
+                    #    hard CRASH at load (merged-column scale-shape assert);
+                    #  - quantized + BF16/IGNORE: LOADS but SILENTLY CORRUPTS
+                    #    the merged Linear (the BF16 slice is read under the
+                    #    quant sibling's scheme). Measured 4.3x worse served KL
+                    #    on Qwen3.x DeltaNet in_proj_ba gate projections
+                    #    (0.106 -> 0.025 at matched bpp; surgical isolation).
+                    # Refuse to emit either -- a coherent allocation (correct
+                    # model profile) never reaches this branch.
+                    members = {s: leaf_state.get((parent, s), "ABSENT")
+                               for s in sibs}
+                    quant_states = {s for s in present if s != "IGNORE"}
+                    kind = ("crash@load" if len(quant_states) > 1
+                            else "silent-corruption")
+                    fused_coherence_violations.append(
+                        (fused_vllm_name, kind, members))
+                    continue  # do not emit a fused target for a mixed group
                 state = states[0]
                 fused_emitted.add(fused_vllm_name)
                 if state == "IGNORE":
                     ignore.append(fused_vllm_name)
                 else:
                     by_fmt.setdefault(state, []).append(fused_vllm_name)
+
+        if fused_coherence_violations:
+            detail = "; ".join(
+                f"{fused} [{kind}] <- " + ", ".join(
+                    f"{leaf}={fmt}" for leaf, fmt in members.items())
+                for fused, kind, members in fused_coherence_violations)
+            raise RuntimeError(
+                "fused-sibling coherence violation: "
+                f"{len(fused_coherence_violations)} merged-column group(s) "
+                "carry MIXED formats among their siblings. vLLM fuses each "
+                "group into one packed Linear with one scheme, so a mix either "
+                "CRASHES at load (>=2 distinct quantized schemes -> scale-shape "
+                "assert) or SILENTLY CORRUPTS the merged Linear (quantized + "
+                "BF16 -> the BF16 slice is read under the quant scheme; "
+                f"measured 4.3x worse served KL on DeltaNet gates): {detail}. "
+                "This is almost always an allocation produced under the WRONG "
+                "model profile -- e.g. the probe lacked meta['model'], so the "
+                "allocator fell back to DefaultProfile and never saw this "
+                "architecture's fused group (in_proj_ba / in_proj_qkvz on "
+                "Qwen3.x DeltaNet, etc.). Re-run the allocator with "
+                "--model-override <model> (or rebuild the probe with "
+                "meta['model'] set) so detect_profile resolves the real "
+                "profile and promote_fused coerces each group to one format.")
 
     if not by_fmt:
         return {}
@@ -6441,9 +6503,24 @@ def main():
                          "against the same cache.")
     args = ap.parse_args()
 
-    from .model_profiles import detect_profile
+    from .model_profiles import detect_profile, DefaultProfile
     profile = detect_profile(args.model)
     print(f"[export-stream] model profile: {profile.name}", flush=True)
+    if isinstance(profile, DefaultProfile):
+        # The export's fused-coherence gate keys off this profile's
+        # packed_modules_mapping. Under DefaultProfile only the UNIVERSAL fused
+        # groups (qkv_proj/gate_up_proj) are checked -- architecture-specific
+        # merged columns (e.g. Qwen3.x DeltaNet in_proj_ba) and packed-MoE
+        # experts are INVISIBLE here, so a mixed-format group in those can ship
+        # undetected. This happens when --model's architecture is not
+        # registered. Make the export's blind spot loud.
+        print(
+            "[export-stream] WARNING: resolved DefaultProfile for "
+            f"{args.model!r} -- architecture not registered. Fused-coherence "
+            "checks cover only qkv_proj/gate_up_proj; arch-specific merged "
+            "columns / packed-MoE experts are NOT verified and may ship "
+            "silently corrupt. Register a ModelProfile for this architecture "
+            "or confirm it is a vanilla transformer.", flush=True)
 
     if args.perturbed_x_dir:
         px_layer_config, px_cache_dir = _resolve_perturbed_x_export_inputs(
