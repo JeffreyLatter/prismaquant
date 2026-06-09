@@ -32,8 +32,11 @@ requires); memory-safe (one autograd graph at a time, watchdog-gated).
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
 import os
 import pickle
+import subprocess
 import time
 from pathlib import Path
 from typing import Sequence
@@ -45,6 +48,18 @@ import prismaquant.format_registry as fr
 from prismaquant.kl_fisher import fisher_probe_scalar
 
 SCHEMA = "prismaquant.aura_cost.v1"
+
+
+def _git_commit() -> str | None:
+    """Best-effort commit of the prismaquant tree this cost was computed by."""
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or None
+    except Exception:
+        return None
 
 # Passthrough formats -> zero predicted_dloss. This is the *passthrough rule*
 # (see allocator_candidates.PASSTHROUGH_SOURCE_REQUIREMENTS): zero cost is
@@ -118,13 +133,17 @@ def _delta_w(
     cache: object | None,
     *,
     strict: bool = False,
-) -> torch.Tensor | None:
-    """Q_f(W)-W: production-rendered error if the cache has it, else RTN.
+) -> tuple[torch.Tensor, str] | None:
+    """Q_f(W)-W plus its provenance: ``(delta, "rendered"|"rtn")``.
 
-    ``strict`` (require_production_cache): when a cache is supplied but lacks the
-    rendered (name, fmt), fail fast with a clear coverage error instead of
-    silently falling back to RTN -- so a 'production-faithful' run cannot quietly
-    mix RTN deltas into the cost. Default off preserves the RTN fallback used by
+    "rendered" = production-rendered error from the cache (the bytes export
+    ships); "rtn" = format-registry RTN fallback. The distinction is recorded
+    per cost row because it is result-changing: RTN-vs-rendered dW moved FP8
+    allocations by +36% served KL (2026-06 A/B). ``strict``
+    (require_production_cache): when a cache is supplied but lacks the rendered
+    (name, fmt), fail fast with a clear coverage error instead of silently
+    falling back to RTN -- so a 'production-faithful' run cannot quietly mix
+    RTN deltas into the cost. Default off preserves the RTN fallback used by
     non-production ablations."""
     if cache is not None:
         try:
@@ -132,7 +151,8 @@ def _delta_w(
         except Exception:
             rendered = None
         if rendered is not None:
-            return (rendered.to(weight.device, torch.float32) - weight.float())
+            delta = rendered.to(weight.device, torch.float32) - weight.float()
+            return delta, "rendered"
         if strict:
             raise RuntimeError(
                 f"require_production_cache: production-rendered weight missing "
@@ -143,7 +163,7 @@ def _delta_w(
     if qdq is None:
         return None
     try:
-        return qdq(weight.float()) - weight.float()
+        return qdq(weight.float()) - weight.float(), "rtn"
     except Exception:
         return None
 
@@ -235,6 +255,32 @@ def compute_aura_cost(
     _dw_torch_dtype = torch.float32 if str(dw_dtype) == "float32" else torch.bfloat16
     device = next(model.parameters()).device
     linears = _target_linears(model, include_lm_head=include_lm_head)
+    if include_lm_head:
+        # Tied-embeddings guard: with tie_word_embeddings the lm_head Parameter
+        # IS the input embedding. The retained probe gradient on the shared
+        # tensor then includes the embedding-path contribution, so the measured
+        # cost prices quantizing BOTH uses -- while export ships only the
+        # quantized lm_head view. That cost is wrong for the decision the
+        # allocator actually makes; fail fast instead of silently mis-costing.
+        embed = None
+        get_embed = getattr(model, "get_input_embeddings", None)
+        if callable(get_embed):
+            try:
+                embed = get_embed()
+            except Exception:
+                embed = None
+        tied = [
+            n for n, mod in linears.items()
+            if "lm_head" in n and embed is not None
+            and mod.weight is embed.weight
+        ]
+        if tied:
+            raise RuntimeError(
+                f"include_lm_head: {tied!r} shares its Parameter with the "
+                f"input embedding (tie_word_embeddings). The probe gradient "
+                f"includes the embedding-path contribution, so this cost would "
+                f"not measure the lm_head-only decision the allocator prices. "
+                f"Drop --include-lm-head for tied models.")
     names = list(linears.keys())
     fmts = [fr.canonical_format_name(f) for f in formats]
     nonzero_fmts = [f for f in fmts if f not in _ZERO_COST_FORMATS]
@@ -276,6 +322,8 @@ def compute_aura_cost(
     ]
     chunks = [c for c in chunks if c]
     s2: dict[tuple[str, str], float] = {}
+    s4: dict[tuple[str, str], float] = {}  # Σ(x²)² for the per-row stderr
+    dw_src: dict[tuple[str, str], str] = {}  # "rendered" | "rtn" per row
     g_trace: dict[str, float] = {}  # KL-Fisher weight-grad energy
     inv = 1.0 / float(n_probes)
 
@@ -287,12 +335,16 @@ def compute_aura_cost(
         with torch.no_grad():
             for f in nonzero_fmts:
                 for n in chunk:
-                    d = _delta_w(n, f, linears[n].weight.data, production_cache,
-                                 strict=require_production_cache)
-                    if d is not None:
+                    res = _delta_w(n, f, linears[n].weight.data,
+                                   production_cache,
+                                   strict=require_production_cache)
+                    if res is not None:
+                        d, src = res
                         dW[(n, f)] = d.to(_dw_torch_dtype)  # dot upcasts to fp32
+                        dw_src[(n, f)] = src
         for key in dW:
             s2.setdefault(key, 0.0)
+            s4.setdefault(key, 0.0)
         for n in chunk:
             g_trace.setdefault(n, 0.0)
         # dW is now materialized for this chunk; the cache's LRU-resident
@@ -344,8 +396,10 @@ def compute_aura_cost(
                     for f in nonzero_fmts:
                         key = (n, f)
                         if key in dW:
-                            s2[key] += float(
+                            x2 = float(
                                 (gf * dW[key].float()).sum().item()) ** 2
+                            s2[key] += x2
+                            s4[key] += x2 * x2
                     linears[n].weight.grad = None
             del logits, probe
             torch.cuda.empty_cache()
@@ -390,11 +444,21 @@ def compute_aura_cost(
             key = (n, f)
             if key not in s2:
                 continue  # format illegal / no dW for this Linear
+            # predicted_dloss = 0.5·mean_k(x²); its sampling stderr over the K
+            # probes is 0.5·std(x²)/√K. This is the row's *risk*, free from the
+            # same projections -- it feeds 'are K probes enough' introspection
+            # and the additivity-gate threshold without seed-sweeping.
+            mean_x2 = inv * s2[key]
+            var_x2 = max(inv * s4[key] - mean_x2 * mean_x2, 0.0)
             costs[n][f] = {
-                "predicted_dloss": 0.5 * inv * s2[key],
+                "predicted_dloss": 0.5 * mean_x2,
+                "predicted_dloss_stderr": 0.5 * math.sqrt(var_x2 * inv),
+                "dw_source": dw_src[key],
                 "output_mse_measured": False,
                 "cost_source": "aura",
             }
+    n_rendered = sum(1 for v in dw_src.values() if v == "rendered")
+    n_rtn = sum(1 for v in dw_src.values() if v == "rtn")
     return {
         "schema": SCHEMA,
         "n_probes": n_probes,
@@ -402,6 +466,25 @@ def compute_aura_cost(
         "token_scope": token_scope,
         "stats": stats,
         "costs": costs,
+        # Reproducibility provenance (CLAUDE.md §5: an irreproducible number
+        # is quarantined). seed_base is result-changing (allocation is
+        # probe-seed-noisy); the rendered/RTN dW split is result-changing
+        # (+36% served KL at FP8). main() adds model/calib identity on top.
+        "provenance": {
+            "seed_base": int(seed_base),
+            "temperature": float(temperature),
+            "dw_dtype": str(dw_dtype),
+            "measurement_dtype": str(next(model.parameters()).dtype),
+            "include_lm_head": bool(include_lm_head),
+            "n_linear_chunks": int(n_linear_chunks),
+            "calib_shape": list(calib_ids.shape),
+            "calib_sha256": hashlib.sha256(
+                calib_ids.detach().cpu().contiguous().numpy().tobytes()
+            ).hexdigest(),
+            "dw_rendered_rows": n_rendered,
+            "dw_rtn_fallback_rows": n_rtn,
+            "git_commit": _git_commit(),
+        },
     }
 
 
@@ -512,12 +595,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         dw_dtype=args.dw_dtype,
         include_lm_head=args.include_lm_head,
     )
+    payload["provenance"].update({
+        "model": str(args.model),
+        "calib_source": f"wikitext:{args.calib_split}",
+        "n_calib_samples": int(args.n_calib_samples),
+        "calib_seqlen": int(args.calib_seqlen),
+        "production_cache": str(args.production_cache or ""),
+    })
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:
         pickle.dump(payload, fh)
     nz = sum(1 for n in payload["costs"] for f in payload["costs"][n]
              if payload["costs"][n][f].get("predicted_dloss", 0.0) > 0)
-    _log(f"wrote {args.output}: {len(payload['costs'])} Linears, {nz} non-zero cost entries")
+    prov = payload["provenance"]
+    _log(f"wrote {args.output}: {len(payload['costs'])} Linears, {nz} non-zero "
+         f"cost entries (dW rendered={prov['dw_rendered_rows']} "
+         f"rtn={prov['dw_rtn_fallback_rows']}, seed_base={prov['seed_base']})")
     return 0
 
 
