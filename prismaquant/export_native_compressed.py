@@ -1391,6 +1391,13 @@ _ACT_AWARE_FLAGS: dict[str, bool] = {
 }
 _NVFP4_SCALE_RULE: str | None = None
 _PRODUCTION_WEIGHT_CACHE = None
+# Research/A-B escape hatch (Codex-recommended): when set, packed experts skip
+# the production-cache GPTQ read and the RTN-by-omission hard-fail, exporting
+# source RTN instead. ONLY for the served RTN-vs-GPTQ expert A/B — NEVER a
+# production path (NVFP4 experts under RTN is a severe quality regression).
+_ALLOW_PACKED_EXPERT_RTN = (
+    os.environ.get("PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN", "0") == "1"
+)
 _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
 
@@ -5416,10 +5423,12 @@ def materialize_tensors_streaming(
                 cached_3d = None
                 cached_split = None
                 if not is_bf16:
-                    cached_3d = _read_cached_packed_expert(
-                        full, fmt, device=device)
+                    if not _ALLOW_PACKED_EXPERT_RTN:
+                        cached_3d = _read_cached_packed_expert(
+                            full, fmt, device=device)
                     if cached_3d is None:
-                        if _PRODUCTION_WEIGHT_CACHE is not None:
+                        if (_PRODUCTION_WEIGHT_CACHE is not None
+                                and not _ALLOW_PACKED_EXPERT_RTN):
                             raise RuntimeError(
                                 f"[export-stream] packed expert {full} @ {fmt} "
                                 f"has no production-cache render. Non-BF16 "
@@ -5428,13 +5437,16 @@ def materialize_tensors_streaming(
                                 f"(fill_packed_expert_cache_entries) — RTN on "
                                 f"NVFP4 experts is a silent quality regression "
                                 f"and is banned. Re-run build_production_cache "
-                                f"with the packed experts in scope, or set the "
-                                f"expert to BF16 in the assignment.")
+                                f"with the packed experts in scope, set the "
+                                f"expert to BF16, or set "
+                                f"PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN=1 for an "
+                                f"explicit research/A-B RTN export.")
                         print(
                             f"[export-stream] WARNING: RTN-rendering packed "
-                            f"expert {full} @ {fmt} (no production cache "
-                            f"active). This is NOT a production path — "
-                            f"NVFP4 experts need GPTQ+JSO.",
+                            f"expert {full} @ {fmt} "
+                            f"({'PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN research/A-B export' if _ALLOW_PACKED_EXPERT_RTN else 'no production cache active'}). "
+                            f"This is NOT a production path — NVFP4 experts "
+                            f"need GPTQ+JSO.",
                             flush=True)
                     else:
                         cached_split = _split_packed_expert_tensor(
@@ -5663,9 +5675,11 @@ def _materialize_tensors_inmemory(
             cached_3d = None
             cached_split = None
             if not is_bf16:
-                cached_3d = _read_cached_packed_expert(full_name, fmt)
+                if not _ALLOW_PACKED_EXPERT_RTN:
+                    cached_3d = _read_cached_packed_expert(full_name, fmt)
                 if cached_3d is None:
-                    if _PRODUCTION_WEIGHT_CACHE is not None:
+                    if (_PRODUCTION_WEIGHT_CACHE is not None
+                            and not _ALLOW_PACKED_EXPERT_RTN):
                         raise RuntimeError(
                             f"[export-inmemory] packed expert {full_name} @ "
                             f"{fmt} has no production-cache render. Non-BF16 "
@@ -5673,10 +5687,12 @@ def _materialize_tensors_inmemory(
                             f"deliberate GPTQ path "
                             f"(fill_packed_expert_cache_entries) — RTN on NVFP4 "
                             f"experts is a silent quality regression and is "
-                            f"banned.")
+                            f"banned. Set PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN=1 "
+                            f"for an explicit research/A-B RTN export.")
                     print(
                         f"[export-inmemory] WARNING: RTN-rendering packed "
-                        f"expert {full_name} @ {fmt} (no production cache).",
+                        f"expert {full_name} @ {fmt} "
+                        f"({'research/A-B flag' if _ALLOW_PACKED_EXPERT_RTN else 'no production cache'}).",
                         flush=True)
                 else:
                     cached_split = _split_packed_expert_tensor(

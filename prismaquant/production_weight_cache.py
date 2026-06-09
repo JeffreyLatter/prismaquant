@@ -2869,7 +2869,7 @@ def fill_packed_expert_cache_entries(
     render_assignment: Mapping[str, str],
     levers: Mapping[str, object],
     profile,
-    module_token_budget: int = 65536,
+    module_token_budget: int = 32768,
     max_rows_per_expert: int = 2048,
     eval_rows_per_expert: int = 128,
     cache_dir: str | Path | None = None,
@@ -3030,12 +3030,17 @@ def fill_packed_expert_cache_entries(
     module_acts: dict[str, torch.Tensor] = {}
     if work_remaining:
         # 2. Capture module-level X for each experts module (one calib forward).
-        store_device = device if device.type == "cuda" else torch.device("cpu")
+        # Store the (large) per-module reservoirs on CPU/host, NOT in the CUDA
+        # allocator pool: on the GB10 unified-memory box the model already
+        # occupies ~67 GB of GPU pool, and 40 modules × budget × hidden × fp32
+        # in the CUDA pool fragments/OOMs the capture (observed). CPU storage
+        # keeps them out of the CUDA segment pool; derive moves one module's X
+        # back to GPU transiently. Pinned for faster H2D at render.
         collector = _PackedExpertActivationCollector(
             model,
             experts_qnames,
             module_token_budget=module_token_budget,
-            store_device=store_device,
+            store_device=torch.device("cpu"),
             store_dtype=torch.float32,
             profile=profile,
         )
@@ -3067,6 +3072,13 @@ def fill_packed_expert_cache_entries(
 
     # 3. Render each in-scope tensor per-expert through render_production_weight.
     derived_by_module: dict[str, dict] = {}
+    # Index of each module's LAST in-scope param, so we can free its (large,
+    # GPU-resident) derived per-expert activations + captured X as soon as both
+    # its params (gate_up + down) are rendered — otherwise they accumulate
+    # across all 40 modules (~2.5 GB/module on GPU) and OOM the box.
+    last_idx_by_module: dict[str, int] = {}
+    for _i, (_q, _m, _p, _pn, _full, _fmt) in enumerate(in_scope):
+        last_idx_by_module[_q] = _i
     weights = cache.weights
     t0 = _time.monotonic()
     for idx, (experts_qname, mod, parent, pn, full, fmt) in enumerate(in_scope):
@@ -3297,6 +3309,12 @@ def fill_packed_expert_cache_entries(
             "had_activations": True,
         }
         del rendered, packed_param, proj_split
+        # Free this module's GPU-resident derived activations + captured X once
+        # its last param is rendered (bounds peak to ~one module's working set).
+        if idx == last_idx_by_module.get(experts_qname):
+            derived = None
+            derived_by_module.pop(experts_qname, None)
+            module_acts.pop(experts_qname, None)
         if device.type == "cuda":
             torch.cuda.empty_cache()
         if progress:
