@@ -56,6 +56,14 @@ from prismaquant.production_weight_cache import (
 from prismaquant.sensitivity_probe import load_calibration
 
 
+def _model_has_packed_experts(model: nn.Module, profile) -> bool:
+    from prismaquant.sensitivity_probe import _is_packed_experts_module
+    return any(
+        _is_packed_experts_module(m, profile)
+        for _, m in model.named_modules()
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Build production δw cache")
     p.add_argument("--model", required=True)
@@ -367,6 +375,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             recache_microbatch_size=args.recache_microbatch_size,
             h_detail_dir=args.h_detail_dir,
         )
+        # Render packed-MoE experts through the SAME deliberate path. They are
+        # 3-D packed tensors, not nn.Linear, so fill_production_weight_cache
+        # skips them; without this they would be RTN'd by omission at export
+        # (a severe NVFP4 quality regression — banned). Requires a concrete
+        # assignment (which format each expert gets).
+        expert_assignment = render_assignment or recache_assignment
+        expert_coverage: dict = {}
+        if expert_assignment is not None:
+            from prismaquant.production_weight_cache import (
+                fill_packed_expert_cache_entries,
+            )
+            expert_coverage = fill_packed_expert_cache_entries(
+                cache, model, calib_ids,
+                render_assignment=expert_assignment,
+                levers=cache.levers,
+                profile=profile,
+                cache_dir=args.cache_dir,
+            )
+            if expert_coverage:
+                if cache.metadata is None:
+                    cache.metadata = {}
+                cache.metadata["packed_expert_coverage"] = expert_coverage
+        elif _model_has_packed_experts(model, profile):
+            print(
+                "[build-prod-cache] WARNING: model has packed-MoE experts but "
+                "no concrete assignment (--render-layer-config) was provided; "
+                "experts will RTN at export. Build with --render-scope "
+                "assignment for a production artifact.",
+                flush=True,
+            )
+
         elapsed = time.monotonic() - t0
         # Strict coverage validation: every (qname, NVFP4) must be present
         # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky

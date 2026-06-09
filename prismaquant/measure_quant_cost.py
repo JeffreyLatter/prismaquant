@@ -670,6 +670,94 @@ def _packed_experts_forward_with_weights(
     return final_hidden_states
 
 
+def derive_per_expert_activations(
+    experts_mod: nn.Module,
+    X: torch.Tensor,
+    parent_mod: nn.Module | None,
+    *,
+    capture_down: bool = True,
+    max_rows_per_expert: int | None = None,
+    subsample_seed: int = 1234,
+) -> dict:
+    """Single source of truth for per-expert GPTQ activations.
+
+    Routes the module-level expert input ``X`` ([*, hidden]) through the MoE
+    block's own router and collects, per expert ``e``, exactly the tensors the
+    per-expert GPTQ Hessian needs — identical to the routed forward in
+    ``_packed_experts_forward_with_weights``, but COLLECTING activations instead
+    of producing the output. Shared by the cost path and the export render path
+    so the routing + SwiGLU derivation lives in ONE place (no duplication).
+
+    Returns a dict of length-E lists:
+      - ``gate_up``: each [n_e, hidden]  — the routed input to ``gate_up_proj``.
+      - ``down``:    each [n_e, inter]   — the post-SwiGLU input to ``down_proj``
+                     (``_apply_gate(gate_up)`` when present, else ``act_fn(gate)*up``).
+                     Empty list when ``capture_down=False``.
+      - ``gate_weights``: each [n_e]     — the router weight per routed token.
+      - ``row_counts``: list[int]        — routed tokens/expert BEFORE subsample
+                     (use for the fail-on-insufficient-routed-rows gate).
+
+    Subsampling (``max_rows_per_expert``) is deterministic (fixed ``subsample_seed``)
+    so the render is reproducible. ``None`` keeps every routed row. Raises (never
+    silently degrades) if the router / act_fn cannot be resolved.
+    """
+    gate_up_w = getattr(experts_mod, "gate_up_proj", None)
+    if gate_up_w is None:
+        raise ValueError("packed experts module lacks gate_up_proj")
+    num_experts = int(getattr(experts_mod, "num_experts", gate_up_w.size(0)))
+    act_fn = getattr(experts_mod, "act_fn", None)
+    apply_gate = getattr(experts_mod, "_apply_gate", None)
+    router = _packed_experts_router(parent_mod)
+    if router is None:
+        raise ValueError("no router found for packed-experts module")
+    Xf = X.reshape(-1, X.size(-1))
+    dev, dt, hidden = Xf.device, Xf.dtype, Xf.size(-1)
+    inter = gate_up_w.size(1) // 2
+    with torch.no_grad():
+        route_fn = getattr(parent_mod, "route_tokens_to_experts", None)
+        if callable(route_fn):
+            top_k_index, top_k_weights = route_fn(router(Xf))
+        else:
+            top_k_index, top_k_weights = _packed_router_topk(router, Xf)
+        expert_mask = F.one_hot(
+            top_k_index.to(torch.long), num_classes=num_experts).permute(2, 1, 0)
+    gate_up_list: list[torch.Tensor] = []
+    down_list: list[torch.Tensor] = []
+    gw_list: list[torch.Tensor] = []
+    counts: list[int] = []
+    for e in range(num_experts):
+        top_k_pos, token_idx = torch.where(expert_mask[e])
+        n = int(token_idx.numel())
+        counts.append(n)
+        if n == 0:
+            gate_up_list.append(torch.empty(0, hidden, device=dev, dtype=dt))
+            gw_list.append(torch.empty(0, device=dev, dtype=dt))
+            if capture_down:
+                down_list.append(torch.empty(0, inter, device=dev, dtype=dt))
+            continue
+        if max_rows_per_expert is not None and n > max_rows_per_expert:
+            gen = torch.Generator(device=dev).manual_seed(subsample_seed + e)
+            keep = torch.randperm(n, device=dev, generator=gen)[:max_rows_per_expert]
+            token_idx, top_k_pos = token_idx[keep], top_k_pos[keep]
+        Xe = Xf[token_idx]
+        gate_up_list.append(Xe)
+        gw_list.append(top_k_weights[token_idx, top_k_pos])
+        if capture_down:
+            with torch.no_grad():
+                gate_up = F.linear(Xe, gate_up_w[e])
+                if callable(apply_gate):
+                    di = apply_gate(gate_up)
+                elif act_fn is not None:
+                    g, u = gate_up.chunk(2, dim=-1)
+                    di = act_fn(g) * u
+                else:
+                    raise ValueError(
+                        "packed experts module exposes neither _apply_gate nor act_fn")
+            down_list.append(di)
+    return {"gate_up": gate_up_list, "down": down_list,
+            "gate_weights": gw_list, "row_counts": counts}
+
+
 def _packed_expert_activation_quantizer(spec: fr.FormatSpec):
     def _quantize(x: torch.Tensor) -> torch.Tensor:
         return spec.activation_quantize_dequantize(x.clone())

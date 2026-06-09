@@ -1331,6 +1331,53 @@ def _pack_production_cached_2d(
         return {"weight": w.to(device=target_device, dtype=torch.bfloat16)}
     return None
 
+
+def _read_cached_packed_expert(
+    experts_param_name: str,
+    fmt: str,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor | None:
+    """Return the GPTQ-rendered 3-D dequant ``[E, out, in]`` for a packed-MoE
+    expert tensor from the production cache, or ``None`` if absent.
+
+    Mirrors ``_pack_production_cached_2d`` but for packed experts: the cache
+    stores the per-expert GPTQ dequant (in the model dtype, usually bf16).  The
+    caller splits this into per-expert slices and re-packs each by re-deriving
+    NVFP4 codes + per-group scales from the cached dequant — the SAME
+    re-derive-from-dequant approximation the shipped 2-D path uses
+    (``_pack_production_cached_2d``).  This is NOT bit-lossless (the re-derived
+    group scales differ slightly from those used during the render, ~1e-3
+    weight error), but it is the established production contract and within
+    NVFP4 noise; served KL is the final arbiter.
+    """
+    cache = _PRODUCTION_WEIGHT_CACHE
+    if cache is None:
+        return None
+    w = cache.get(experts_param_name, str(fmt).upper())
+    if w is None:
+        return None
+    target_device = device or torch.device("cpu")
+    return w.to(device=target_device, dtype=torch.float32)
+
+
+def _packed_expert_input_global_scale(experts_param_name: str) -> float | None:
+    """Calibrated W4A4 input_global_scale (FP4_MAX/max_abs) for a packed-expert
+    tensor, read from the production cache's per-param activation max_abs.
+
+    Returns ``None`` when no cache/scale is available, so the caller falls back
+    to ``DEFAULT_INPUT_GLOBAL_SCALE`` (only on the no-cache research path).
+    """
+    cache = _PRODUCTION_WEIGHT_CACHE
+    if cache is None:
+        return None
+    max_abs_map = getattr(cache, "activation_max_abs", None) or {}
+    mx = max_abs_map.get(experts_param_name)
+    if mx is None or float(mx) <= 0:
+        return None
+    return float(_FP4_E2M1_MAX / float(mx))
+
+
 # Module-level flag bundle that controls which activation-aware
 # passes run when `_quantize_2d` is invoked from main()'s streaming
 # loop. Kept as module-level state (mirroring _INPUT_GLOBAL_SCALES)
@@ -5359,23 +5406,87 @@ def materialize_tensors_streaming(
                         ]
                         per_expert_joint[orig_e] = torch.stack(cands).max()
 
-                for proj_name, sub_packed in proj_split:
+                # Pull the GPTQ-rendered dequant from the production cache.
+                # Packed experts go through the SAME deliberate render as 2-D
+                # Linears (fill_packed_expert_cache_entries); export re-packs
+                # the cached dequant per expert.  RTN-by-omission on packed
+                # experts is a severe NVFP4 quality regression, so when a
+                # production cache is active we HARD-FAIL rather than silently
+                # RTN a non-BF16 expert that the cache didn't render.
+                cached_3d = None
+                cached_split = None
+                if not is_bf16:
+                    cached_3d = _read_cached_packed_expert(
+                        full, fmt, device=device)
+                    if cached_3d is None:
+                        if _PRODUCTION_WEIGHT_CACHE is not None:
+                            raise RuntimeError(
+                                f"[export-stream] packed expert {full} @ {fmt} "
+                                f"has no production-cache render. Non-BF16 "
+                                f"packed experts MUST be rendered through the "
+                                f"deliberate GPTQ+JSO path "
+                                f"(fill_packed_expert_cache_entries) — RTN on "
+                                f"NVFP4 experts is a silent quality regression "
+                                f"and is banned. Re-run build_production_cache "
+                                f"with the packed experts in scope, or set the "
+                                f"expert to BF16 in the assignment.")
+                        print(
+                            f"[export-stream] WARNING: RTN-rendering packed "
+                            f"expert {full} @ {fmt} (no production cache "
+                            f"active). This is NOT a production path — "
+                            f"NVFP4 experts need GPTQ+JSO.",
+                            flush=True)
+                    else:
+                        cached_split = _split_packed_expert_tensor(
+                            cached_3d, pn, profile)
+
+                # Calibrated input_global_scale (W4A4 activation clip): one
+                # per packed param, calibrated from the routed activations at
+                # cache-build time. Without it experts ship the 1.0 placeholder.
+                expert_input_scale = _packed_expert_input_global_scale(full)
+                if (cached_3d is not None and expert_input_scale is None
+                        and fmt == "NVFP4"):
+                    raise RuntimeError(
+                        f"[export-stream] packed expert {full} @ {fmt} has a "
+                        f"cached render but no calibrated input_global_scale "
+                        f"(would ship the 1.0 placeholder). The cache's "
+                        f"packed_expert_max_abs sidecar is missing this entry "
+                        f"— re-run build_production_cache so the scale is "
+                        f"recomputed, or delete the expert shard to force a "
+                        f"full re-render.")
+
+                for pi, (proj_name, sub_packed) in enumerate(proj_split):
+                    cached_sub = (
+                        cached_split[pi][1] if cached_split is not None else None
+                    )
                     for orig_e, new_e in iter_experts:
-                        expert_2d = sub_packed[orig_e]
                         base = f"{disk_qname}.{new_e}.{proj_name}"
                         if is_bf16:
+                            expert_2d = sub_packed[orig_e]
                             out[f"{base}.weight"], label = _passthrough_tensor(
                                 full, expert_2d, source_dtype_by_name)
                         else:
+                            # Re-pack the GPTQ-rendered dequant when cached
+                            # (re-derives codes from the dequant, same ~1e-3
+                            # approximation as the 2-D path — not bit-lossless);
+                            # fall back to source only on the no-cache warning.
+                            expert_2d = (
+                                cached_sub[orig_e]
+                                if cached_sub is not None
+                                else sub_packed[orig_e]
+                            )
                             compressed = _quantize_2d(
                                 expert_2d, fmt,
                                 nvfp4_global_real_override=per_expert_joint[orig_e],
+                                input_global_scale_override=expert_input_scale,
                             )
                             for suffix, t in compressed.items():
                                 out[f"{base}.{suffix}"] = t.cpu()
                 covered.add(full)
                 hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
                 del packed_param, packed_param_src, proj_split
+                if cached_3d is not None:
+                    del cached_3d, cached_split
 
         # 3e. Remaining layer-scoped params (norms, conv1d, biases on
         # passthrough-only modules) and persistent buffers.
@@ -5546,18 +5657,60 @@ def _materialize_tensors_inmemory(
                     ]
                     per_expert_joint[e] = torch.stack(candidates).max()
 
-            for proj_name, sub_packed in proj_split:
+            # Read the GPTQ-rendered dequant from the production cache (same
+            # contract as the streaming path); hard-fail on RTN-by-omission
+            # when a cache is active.
+            cached_3d = None
+            cached_split = None
+            if not is_bf16:
+                cached_3d = _read_cached_packed_expert(full_name, fmt)
+                if cached_3d is None:
+                    if _PRODUCTION_WEIGHT_CACHE is not None:
+                        raise RuntimeError(
+                            f"[export-inmemory] packed expert {full_name} @ "
+                            f"{fmt} has no production-cache render. Non-BF16 "
+                            f"packed experts MUST be rendered through the "
+                            f"deliberate GPTQ path "
+                            f"(fill_packed_expert_cache_entries) — RTN on NVFP4 "
+                            f"experts is a silent quality regression and is "
+                            f"banned.")
+                    print(
+                        f"[export-inmemory] WARNING: RTN-rendering packed "
+                        f"expert {full_name} @ {fmt} (no production cache).",
+                        flush=True)
+                else:
+                    cached_split = _split_packed_expert_tensor(
+                        cached_3d, pn, profile)
+
+            expert_input_scale = _packed_expert_input_global_scale(full_name)
+            if (cached_3d is not None and expert_input_scale is None
+                    and fmt == "NVFP4"):
+                raise RuntimeError(
+                    f"[export-inmemory] packed expert {full_name} @ {fmt} has "
+                    f"a cached render but no calibrated input_global_scale "
+                    f"(would ship the 1.0 placeholder). Re-run "
+                    f"build_production_cache to recompute the scale, or delete "
+                    f"the expert shard to force a full re-render.")
+
+            for pi, (proj_name, sub_packed) in enumerate(proj_split):
+                cached_sub = (
+                    cached_split[pi][1] if cached_split is not None else None
+                )
                 E_p, Mp, Np = sub_packed.shape
                 for e in range(E_p):
-                    expert_2d = sub_packed[e]
                     base = f"{disk_qname}.{e}.{proj_name}"
                     if is_bf16:
                         out[f"{base}.weight"], label = _passthrough_tensor(
-                            full_name, expert_2d)
+                            full_name, sub_packed[e])
                     else:
+                        expert_2d = (
+                            cached_sub[e] if cached_sub is not None
+                            else sub_packed[e]
+                        )
                         compressed = _quantize_2d(
                             expert_2d, fmt,
                             nvfp4_global_real_override=per_expert_joint[e],
+                            input_global_scale_override=expert_input_scale,
                         )
                         for suffix, tensor in compressed.items():
                             out[f"{base}.{suffix}"] = tensor.cpu()
