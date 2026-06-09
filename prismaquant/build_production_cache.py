@@ -120,6 +120,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--expert-gate-seqlen", type=int, default=None,
         help="Sequence length for --expert-gate-dataset (default: --calib-seqlen).",
     )
+    p.add_argument(
+        "--expert-token-budget", type=int, default=32768,
+        help="Per-module reservoir budget (tokens) for packed-expert GPTQ "
+        "fit activations. CPU-resident, but on unified-memory hosts it still "
+        "consumes the shared pool: budget × hidden × 4B × n_modules.",
+    )
+    p.add_argument(
+        "--expert-gate-token-budget", type=int, default=None,
+        help="Per-module reservoir budget for the cross-domain gate corpus "
+        "(default: --expert-token-budget). The gate only judges (needs "
+        "~eval_rows_per_expert routed rows/expert), so this can be much "
+        "smaller than the fit budget.",
+    )
+    p.add_argument(
+        "--expert-render-mode", default="batched",
+        choices=["batched", "per_expert"],
+        help="Packed-expert render path. 'batched' vectorizes GPTQ across "
+        "experts (fixed damp, no JSO/act-order; ~13 min/35B). 'per_expert' "
+        "runs every expert through render_production_weight — the IDENTICAL "
+        "GPTQ+damp_sweep+act_order+JSO stack dense Linears get (production "
+        "homogeneity; ~16h/35B).",
+    )
     p.add_argument("--dtype", default="bf16")
     p.add_argument(
         "--max-act-rows",
@@ -418,7 +440,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 levers=cache.levers,
                 profile=profile,
                 cache_dir=args.cache_dir,
+                module_token_budget=args.expert_token_budget,
+                render_mode=args.expert_render_mode,
                 gate_calib_ids=gate_calib_ids,
+                gate_token_budget=args.expert_gate_token_budget,
             )
             if expert_coverage:
                 if cache.metadata is None:
