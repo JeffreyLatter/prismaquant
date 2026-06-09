@@ -102,6 +102,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "(HF dataset id, .jsonl, or .txt). When omitted, preserves the "
         "historical wikitext-2 windowed loader.",
     )
+    p.add_argument(
+        "--expert-gate-dataset",
+        default=None,
+        help="Optional corpus DISJOINT from --dataset for the packed-expert "
+        "GPTQ-vs-RTN do-no-harm gate. When set, each expert's gate is judged "
+        "on this corpus's routed rows (and GPTQ fits on all fit-corpus rows) "
+        "instead of a same-corpus held-out slice — a same-domain holdout "
+        "cannot catch calibration-domain overfit (the 2026-06-09 35B served "
+        "inversion). Same source formats as --dataset.",
+    )
+    p.add_argument(
+        "--expert-gate-samples", type=int, default=None,
+        help="Sample count for --expert-gate-dataset (default: --n-calib-samples).",
+    )
+    p.add_argument(
+        "--expert-gate-seqlen", type=int, default=None,
+        help="Sequence length for --expert-gate-dataset (default: --calib-seqlen).",
+    )
     p.add_argument("--dtype", default="bf16")
     p.add_argument(
         "--max-act-rows",
@@ -386,12 +404,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             from prismaquant.production_weight_cache import (
                 fill_packed_expert_cache_entries,
             )
+            gate_calib_ids = None
+            if args.expert_gate_dataset:
+                gate_calib_ids = load_calibration(
+                    tokenizer,
+                    args.expert_gate_dataset,
+                    args.expert_gate_samples or args.n_calib_samples,
+                    args.expert_gate_seqlen or args.calib_seqlen,
+                )
             expert_coverage = fill_packed_expert_cache_entries(
                 cache, model, calib_ids,
                 render_assignment=expert_assignment,
                 levers=cache.levers,
                 profile=profile,
                 cache_dir=args.cache_dir,
+                gate_calib_ids=gate_calib_ids,
             )
             if expert_coverage:
                 if cache.metadata is None:

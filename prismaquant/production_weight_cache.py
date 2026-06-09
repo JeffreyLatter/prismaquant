@@ -2876,6 +2876,8 @@ def fill_packed_expert_cache_entries(
     progress: bool = True,
     max_layers: int | None = None,
     render_mode: str = "batched",
+    gate_calib_ids: torch.Tensor | None = None,
+    gate_token_budget: int | None = None,
 ) -> dict:
     """Render packed-MoE experts through the SAME shared GPTQ core as 2-D
     Linears and store the per-expert dequant into ``cache``.
@@ -2889,6 +2891,16 @@ def fill_packed_expert_cache_entries(
         ``render_production_weight`` stack (progressive gates + damp-sweep +
         JSO + do-no-harm). Faithful to the dense path but ~hours on a 35B;
         used for the fidelity A/B that justifies the production default.
+
+    ``gate_calib_ids``: optional token ids from a corpus DISJOINT from
+    ``calib_ids``. When given, the per-expert GPTQ-vs-RTN do-no-harm gate is
+    judged on this corpus's routed rows instead of a same-corpus held-out
+    slice, and GPTQ fits on ALL fit-corpus rows. Rationale (2026-06-09 served
+    A/B): per-expert Hessians are thin (sparse routing), so GPTQ overfits its
+    calibration *domain* — a same-domain holdout catches in-sample overfit but
+    passed renders that LOST on served cross-domain KL (RTN 0.0302 vs GPTQ
+    0.0334 confident). Experts the gate corpus never routes to fall back to
+    the same-domain holdout. Default ``None`` preserves prior behavior.
 
     This closes the packed-expert RTN-by-omission gap: every non-BF16 packed
     expert tensor is rendered per-expert through ``render_production_weight``
@@ -3070,8 +3082,42 @@ def fill_packed_expert_cache_entries(
             flush=True,
         )
 
+    # 2b. Cross-domain gate corpus: capture a SECOND reservoir per module from
+    # the disjoint gate corpus. Same CPU-storage rationale as the fit reservoir.
+    gate_module_acts: dict[str, torch.Tensor] = {}
+    if work_remaining and gate_calib_ids is not None:
+        gate_collector = _PackedExpertActivationCollector(
+            model,
+            experts_qnames,
+            module_token_budget=int(gate_token_budget or module_token_budget),
+            store_device=torch.device("cpu"),
+            store_dtype=torch.float32,
+            profile=profile,
+        )
+        gate_collector.install()
+        t_cap = _time.monotonic()
+        try:
+            with torch.no_grad():
+                for i in range(gate_calib_ids.size(0)):
+                    batch = gate_calib_ids[i:i + 1].to(device)
+                    try:
+                        model(batch, use_cache=False)
+                    except TypeError:
+                        model(batch)
+        finally:
+            gate_collector.remove()
+        gate_module_acts = gate_collector.collected()
+        if progress:
+            print(
+                f"[prod-cache/experts] captured {len(gate_module_acts)} "
+                f"cross-domain gate-module activations in "
+                f"{_time.monotonic() - t_cap:.1f}s",
+                flush=True,
+            )
+
     # 3. Render each in-scope tensor per-expert through render_production_weight.
     derived_by_module: dict[str, dict] = {}
+    gate_derived_by_module: dict[str, dict | None] = {}
     # Index of each module's LAST in-scope param, so we can free its (large,
     # GPU-resident) derived per-expert activations + captured X as soon as both
     # its params (gate_up + down) are rendered — otherwise they accumulate
@@ -3105,19 +3151,32 @@ def fill_packed_expert_cache_entries(
                 f"path (would silently fall back to RTN). Increase the calib "
                 f"set or module_token_budget."
             )
+        mod_dtype = getattr(mod, pn).dtype
         if experts_qname not in derived_by_module:
             # The router forward inside derive_per_expert_activations runs in
             # the model's compute dtype (bf16); X was stored as fp32 for the
             # reservoir, so cast it back to the experts module dtype before
             # routing. The per-expert activations are re-promoted to fp32 by
             # render_production_weight's GPTQ path.
-            mod_dtype = getattr(mod, pn).dtype
             derived_by_module[experts_qname] = derive_per_expert_activations(
                 mod, X.to(device=device, dtype=mod_dtype), parent,
                 capture_down=True,
                 max_rows_per_expert=max_rows_per_expert,
             )
         derived = derived_by_module[experts_qname]
+        if gate_module_acts and experts_qname not in gate_derived_by_module:
+            # Cross-domain gate rows: same routing derivation, capped at the
+            # eval budget — the gate only judges, it never fits.
+            Xg = gate_module_acts.get(experts_qname)
+            gate_derived_by_module[experts_qname] = (
+                derive_per_expert_activations(
+                    mod, Xg.to(device=device, dtype=mod_dtype), parent,
+                    capture_down=True,
+                    max_rows_per_expert=eval_rows_per_expert,
+                )
+                if Xg is not None and Xg.numel() > 0 else None
+            )
+        gate_derived = gate_derived_by_module.get(experts_qname)
         packed_param = getattr(mod, pn).detach().float()  # [E, out, in]
         E = packed_param.shape[0]
         proj_split = _split_packed_expert_tensor(packed_param, pn, profile)
@@ -3174,6 +3233,7 @@ def fill_packed_expert_cache_entries(
 
         rtn_fallbacks = 0
         heldout_reverts = 0
+        cross_gated = 0
         use_batched = (render_mode == "batched" and fmt == "NVFP4")
         if use_batched:
             from prismaquant.export_batched_gptq import (
@@ -3187,9 +3247,21 @@ def fill_packed_expert_cache_entries(
             # render provably non-regressive vs RTN on data the expert was not
             # fit to — catching the rank-deficient-Hessian overfit where
             # in-sample GPTQ always "wins" but generalizes worse than RTN
-            # (observed on down_proj at low row counts). Empty experts (no rows)
-            # get source RTN, never the batched core's all-zero dead-column output.
+            # (observed on down_proj at low row counts). When a cross-domain
+            # gate corpus is available for this expert, the eval set comes from
+            # THAT corpus (and GPTQ fits on all fit-corpus rows) — a same-domain
+            # holdout cannot catch calibration-DOMAIN overfit, which is the
+            # failure the 2026-06-09 served A/B actually exhibited. Empty
+            # experts (no rows) get source RTN, never the batched core's
+            # all-zero dead-column output.
             per_expert_gw = derived.get("gate_weights")
+            gate_acts_lists = (
+                gate_derived[acts_key] if gate_derived is not None else None
+            )
+            gate_gw_lists = (
+                gate_derived.get("gate_weights")
+                if gate_derived is not None else None
+            )
             render_acts: list[torch.Tensor] = []
             eval_acts: list[torch.Tensor | None] = []
             eval_gw: list[torch.Tensor | None] = []
@@ -3200,6 +3272,14 @@ def fill_packed_expert_cache_entries(
                     if per_expert_gw is not None and e < len(per_expert_gw)
                     else None
                 )
+                xa = None
+                xw = None
+                if gate_acts_lists is not None and e < len(gate_acts_lists):
+                    cand = gate_acts_lists[e]
+                    if cand is not None and cand.numel() > 0:
+                        xa = cand
+                        if gate_gw_lists is not None and e < len(gate_gw_lists):
+                            xw = gate_gw_lists[e]
                 if a is None or a.numel() == 0:
                     render_acts.append(
                         torch.zeros((0, hidden_in), device=device,
@@ -3208,6 +3288,18 @@ def fill_packed_expert_cache_entries(
                     eval_gw.append(None)
                     continue
                 a = a.to(device=device, dtype=torch.float32)
+                if xa is not None:
+                    # Cross-domain do-no-harm: fit on ALL fit-corpus rows,
+                    # judge on the disjoint gate corpus's routed rows.
+                    render_acts.append(a)
+                    eval_acts.append(
+                        xa.to(device=device, dtype=torch.float32))
+                    eval_gw.append(
+                        xw.to(device=device, dtype=torch.float32).pow(2)
+                        if xw is not None else None
+                    )
+                    cross_gated += 1
+                    continue
                 n = int(a.shape[0])
                 n_eval = min(eval_rows_per_expert, n // 5) if n >= 20 else 0
                 if n_eval > 0:
@@ -3305,6 +3397,11 @@ def fill_packed_expert_cache_entries(
             "heldout_reverts": int(heldout_reverts),
             "gptq_experts": int(E - rtn_fallbacks),
             "render_mode": render_mode,
+            "gate_mode": (
+                "cross-domain" if (use_batched and gate_derived is not None)
+                else "in-domain-holdout"
+            ),
+            "cross_gated_experts": int(cross_gated),
             "rendered": True,
             "had_activations": True,
         }
@@ -3313,15 +3410,19 @@ def fill_packed_expert_cache_entries(
         # its last param is rendered (bounds peak to ~one module's working set).
         if idx == last_idx_by_module.get(experts_qname):
             derived = None
+            gate_derived = None
             derived_by_module.pop(experts_qname, None)
             module_acts.pop(experts_qname, None)
+            gate_derived_by_module.pop(experts_qname, None)
+            gate_module_acts.pop(experts_qname, None)
         if device.type == "cuda":
             torch.cuda.empty_cache()
         if progress:
             print(
                 f"[prod-cache/experts] {idx + 1}/{len(in_scope)} {full} @ {fmt} "
                 f"E={E} empty={empties} rtn_fallback={rtn_fallbacks} "
-                f"(heldout_reverts={heldout_reverts}) gptq={E - rtn_fallbacks} "
+                f"(heldout_reverts={heldout_reverts}, "
+                f"cross_gated={cross_gated}) gptq={E - rtn_fallbacks} "
                 f"min_rows={coverage[full]['min_rows']} "
                 f"({_time.monotonic() - t0:.1f}s elapsed)",
                 flush=True,
