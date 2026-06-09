@@ -1,8 +1,7 @@
 # PrismaQuant — Working Agreement & Project Brain
 
 This file is the durable, code-validated brief for working on PrismaQuant with
-Robert Tand. It is written to make you a partner, not a typist. Read it fully
-before touching anything.
+Robert Tand.
 
 > **Prime directive — read every other doc incredulously.** This repo accretes
 > handovers, results docs, READMEs, and a paper. They go stale *fast* and
@@ -37,9 +36,9 @@ method structurally can. The headline proof: against RedHatAI's uniform
 metrics**. That gap is what end-to-end measurement buys over guessing.
 
 **Author / coordinates.** Robert Tand, independent researcher. GitHub
-`RobTand/prismaquant`; HF artifacts under `rdtand/`. Paper:
-*"PrismaQuant and PrismaSCOUT: Operational Rate-Distortion for Mixed-Precision
-LLM Quantization"* (`paper/main.tex`). The flagship artifact (Qwen3.6-27B
+`RobTand/prismaquant`; HF artifacts under `rdtand/`. Paper: `paper/main.tex`,
+now AURA-spined (*"AURA: Production-Faithful KL–Fisher Allocation"*; the
+PrismaSCOUT spine was retired 2026-06-08). The flagship artifact (Qwen3.6-27B
 PrismaSCOUT) has DOI `10.57967/hf/8656`. ~60k HF downloads across the family in
 the first two weeks — that traction is treated as hard evidence and a hard bar.
 
@@ -53,22 +52,19 @@ publish it.
 
 - **He is paper-author-level on this material.** He weighs HALO vs ParoQuant
   himself, derives the allocator's Fisher expansion, and judges rotation
-  tradeoffs. Talk to him as a peer. Bring the principled answer, not the
-  reassuring one.
+  tradeoffs.
 - **Terse, demanding, allergic to slowness and to band-aids.** *"this is
   unreasonably slow"* / *"what has changed so wildly to make this perform like
   such dogshit?"* If a hot path crawls, that is a bug to fix, not a cost to accept.
 - **Multi-model deliberation is his method.** On hard design questions he convenes
   Claude (facilitate/read/synthesize), **Codex** (implement + run production,
   burns freely), and **Gemini** (sparse, high-leverage math). Disagreement is
-  expected and wanted — *"disagree directly with the parts you think are wrong,"*
-  cite line numbers, don't flatter. He resolves ties by deferring to whoever
-  holds production evidence. The `scratch/deliberation/` and `.claude/codex-*`
-  files are the archive of this.
+  expected and wanted; he resolves ties by deferring to whoever holds production
+  evidence. The `scratch/deliberation/` and `.claude/codex-*` files are the
+  archive of this.
 - **Once a path is authorized, don't pause.** *"Wish you hadn't waited for me,
-  we've lost an hour."* Chain probe→cost→allocate→validate→iterate autonomously.
-  Surface a question only at a real fork with no default, or before something
-  destructive/irreversible/outward-facing.
+  we've lost an hour."* Surface a question only at a real fork with no default,
+  or before something destructive/irreversible/outward-facing.
 - **He runs long autonomous mandates** (*"iterate and make as much progress as
   possible,"* *"make changes yourself or delegate to codex"*) and wants an honest
   morning summary: what worked, what didn't, what's next.
@@ -151,10 +147,8 @@ the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
    stuck, ask: **measurement gap or optimizer gap? It is almost always a
    measurement gap.**
 2. **No heuristics when an explicit exists.** Derive thresholds and decisions
-   from the objective, never from intuition. Bad: *"skip rotation if
-   peakiness < 1.5."* Good: *"apply it, measure the cost change, accept only if
-   cost drops."* The only acceptable constants come from the numerical precision
-   of a dtype.
+   from the objective, never from intuition. The only acceptable constants come
+   from the numerical precision of a dtype.
 3. **Promote on the serving metric, not the screen.** Local-allocator / HF-PPL /
    last-token-KL screens are for triage. A win counts only when it holds on
    **exact full-vocab vLLM KL-vs-BF16 + direct WikiText PPL on the served
@@ -488,8 +482,7 @@ lever ones (grouped-KL, Fisher, HDQ, multi-shot) **fail-fast with `exit 2`** fro
 
 ## 11. Where to read more — and how skeptically
 
-Read these for *depth*, but apply §Prime-directive: confirm against code before
-acting on any specific claim.
+Read these for *depth*; the prime directive applies.
 
 - **`docs/prismaquant_design.md`** — the master design doc (57 KB): the *why*
   behind the cascade, the knapsack DP + log-error kneedle, the render pipeline,
