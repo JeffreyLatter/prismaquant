@@ -234,3 +234,17 @@ def test_additivity_gate_reports_uncovered_and_passthrough():
     assert out["n_zero_cost"] == 1
     assert out["uncovered"] == ["model.layers.99.fake|NVFP4"]
     assert out["n_covered"] == 0
+
+
+def test_cost_ucb_z_charges_stderr(monkeypatch):
+    from prismaquant.allocator_candidates import cost_entry_predicted_dloss
+
+    stats = {"h_trace": 1.0}
+    row = {"predicted_dloss": 0.010, "predicted_dloss_stderr": 0.002,
+           "output_mse_measured": False}
+    assert cost_entry_predicted_dloss(stats, row) == 0.010  # default: identical
+    monkeypatch.setenv("PRISMAQUANT_COST_UCB_Z", "2")
+    assert abs(cost_entry_predicted_dloss(stats, row) - 0.014) < 1e-15
+    # rows without stderr (old payloads) are unaffected even with z set
+    old = {"predicted_dloss": 0.010, "output_mse_measured": False}
+    assert cost_entry_predicted_dloss(stats, old) == 0.010

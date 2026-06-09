@@ -274,12 +274,32 @@ def cost_entry_predicted_dloss(
             gain=gain,
         )
     if "predicted_dloss" in cost_entry:
-        return float(cost_entry["predicted_dloss"]) * float(gain)
+        base = float(cost_entry["predicted_dloss"])
+        # Uncertainty-aware allocation (opt-in): charge z·stderr on top of the
+        # point estimate. The knapsack optimizes over noisy estimates, so it
+        # systematically harvests lucky draws (winner's curse — the observed
+        # ±0.017-KL between-seed allocation lottery). UCB takes an aggressive
+        # format choice only when it is CONFIDENTLY cheap: a non-regressive
+        # bias whose penalty is derived from the measurement's own sampling
+        # noise, not a tuned constant. z=0 (default) is bit-identical to
+        # prior behavior.
+        z = _cost_ucb_z()
+        if z > 0.0:
+            base += z * float(cost_entry.get("predicted_dloss_stderr", 0.0))
+        return base * float(gain)
     return predicted_dloss(
         stats_entry["h_trace"],
         float(cost_entry.get("weight_mse", 0.0)),
         gain=gain,
     )
+
+
+def _cost_ucb_z() -> float:
+    """PRISMAQUANT_COST_UCB_Z: stderr multiples added to predicted_dloss."""
+    try:
+        return max(0.0, float(os.environ.get("PRISMAQUANT_COST_UCB_Z", "0")))
+    except Exception:
+        return 0.0
 
 
 def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
