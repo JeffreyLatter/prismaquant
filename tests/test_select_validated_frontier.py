@@ -268,3 +268,39 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
 
     selected = json.loads(summary.read_text())["selected"]
     assert selected["label"] == "candidate"
+
+
+def test_load_assignment_canonicalizes_autoround_dicts(tmp_path):
+    # Regression: AutoRound-style dict entries used to be silently
+    # stringified ("{'DATA_TYPE': 'NV_FP', ...}") instead of parsed.
+    from prismaquant.select_validated_frontier import _load_assignment
+
+    path = tmp_path / "assignment.json"
+    path.write_text(json.dumps({
+        "model.layers.0.mlp.experts.gate_up_proj": {
+            "data_type": "nv_fp", "bits": 4, "group_size": 16, "sym": True,
+        },
+        "model.layers.0.self_attn.q_proj": {
+            "data_type": "fp8_e4m3", "bits": 8, "group_size": 0,
+        },
+        "model.layers.0.self_attn.o_proj": "bf16",
+        "model.layers.1.self_attn.o_proj": "FP8_SOURCE",
+    }))
+    assignment = _load_assignment(path)
+    assert assignment == {
+        "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+        "model.layers.0.self_attn.q_proj": "FP8_E4M3",
+        "model.layers.0.self_attn.o_proj": "BF16",
+        "model.layers.1.self_attn.o_proj": "FP8_SOURCE",
+    }
+
+
+def test_load_assignment_unwraps_assignment_key(tmp_path):
+    from prismaquant.select_validated_frontier import _load_assignment
+
+    path = tmp_path / "wrapped.json"
+    path.write_text(json.dumps({
+        "schema": "prismaquant.validated_frontier_assignment.v1",
+        "assignment": {"model.layers.0.mlp.up_proj": "nvfp4"},
+    }))
+    assert _load_assignment(path) == {"model.layers.0.mlp.up_proj": "NVFP4"}

@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from prismaquant import format_registry as fr
+from prismaquant.layer_config import canonicalize_format
 from prismaquant.saturation_select import find_saturation_bpp
 
 
@@ -56,8 +57,18 @@ def _load_assignment(path: str | Path) -> dict[str, str]:
         raw = payload
     if not isinstance(raw, Mapping):
         raise ValueError(f"{path}: expected assignment JSON object")
+    # Entries may be format-name strings ({qname: "NVFP4"}) or AutoRound-style
+    # dicts ({qname: {"data_type": "nv_fp", "bits": 4, ...}}); str().upper() on
+    # a dict silently fabricates a garbage format name. Strings go through the
+    # registry canonicalizer (which keeps FP8_SOURCE & friends); dicts go
+    # through the layer-config parser. Unknown names still fail loudly at
+    # fr.get_format in _layer_config_from_assignment.
     return {
-        str(name): str(fmt).strip().upper()
+        str(name): (
+            fr.canonical_format_name(fmt.strip().upper())
+            if isinstance(fmt, str)
+            else canonicalize_format(fmt)
+        )
         for name, fmt in raw.items()
         if str(name).strip()
     }
