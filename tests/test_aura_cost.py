@@ -173,3 +173,64 @@ def test_provenance_records_seed_and_dw_split():
     assert prov["calib_shape"] == list(ids.shape)
     assert len(prov["calib_sha256"]) == 64
     assert payload["costs"]["body"]["NVFP4"]["dw_source"] == "rendered"
+
+
+def test_per_probe_samples_align_and_reproduce_mean():
+    model = TinyLM().eval()
+    payload = compute_aura_cost(
+        model, _ids(), ["NVFP4"],
+        n_probes=6, min_free_gib=0.0, n_linear_chunks=2,
+    )
+    for n, rows in payload["costs"].items():
+        row = rows["NVFP4"]
+        xs = row["x2_per_probe"]
+        assert len(xs) == 6
+        assert abs(0.5 * sum(xs) / 6 - row["predicted_dloss"]) < 1e-12
+
+
+def test_additivity_gate_exact_correlated_stderr():
+    import math
+    from prismaquant.aura_additivity_gate import additivity_gate
+
+    model = TinyLM().eval()
+    payload = compute_aura_cost(
+        model, _ids(), ["NVFP4"],
+        n_probes=8, min_free_gib=0.0, n_linear_chunks=1,
+    )
+    assignment = {n: "NVFP4" for n in payload["costs"]}
+    # Exact stderr must equal the std-of-per-probe-sums computed by hand.
+    K = 8
+    sums = [0.0] * K
+    for n in payload["costs"]:
+        for k, x2 in enumerate(payload["costs"][n]["NVFP4"]["x2_per_probe"]):
+            sums[k] += x2
+    mean_s = sum(sums) / K
+    var_s = sum((v - mean_s) ** 2 for v in sums) / (K - 1)
+    expected_stderr = 0.5 * math.sqrt(var_s / K)
+    expected_sum = 0.5 * mean_s
+
+    out = additivity_gate(payload, assignment, measured_kl=expected_sum * 1.1)
+    assert out["stderr_method"] == "per_probe_exact"
+    assert abs(out["predicted_sum"] - expected_sum) < 1e-12
+    assert abs(out["predicted_stderr"] - expected_stderr) < 1e-12
+    assert abs(out["residual"] - 0.1 * expected_sum) < 1e-9
+    assert out["n_covered"] == len(assignment)
+    assert out["uncovered"] == []
+
+
+def test_additivity_gate_reports_uncovered_and_passthrough():
+    from prismaquant.aura_additivity_gate import additivity_gate
+
+    model = TinyLM().eval()
+    payload = compute_aura_cost(
+        model, _ids(), ["NVFP4", "BF16"],
+        n_probes=4, min_free_gib=0.0, n_linear_chunks=1,
+    )
+    assignment = {
+        "body": "BF16",                      # passthrough -> zero-cost row
+        "model.layers.99.fake": "NVFP4",     # no cost row -> uncovered
+    }
+    out = additivity_gate(payload, assignment, measured_kl=0.0)
+    assert out["n_zero_cost"] == 1
+    assert out["uncovered"] == ["model.layers.99.fake|NVFP4"]
+    assert out["n_covered"] == 0

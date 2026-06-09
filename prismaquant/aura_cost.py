@@ -323,6 +323,11 @@ def compute_aura_cost(
     chunks = [c for c in chunks if c]
     s2: dict[tuple[str, str], float] = {}
     s4: dict[tuple[str, str], float] = {}  # Σ(x²)² for the per-row stderr
+    # Per-probe x² samples per row. Rows share the same K probes, so their
+    # errors are CORRELATED — any sum of rows (an assignment's predicted KL)
+    # needs the per-probe joint samples for an honest stderr; √Σσ² would
+    # understate it. K floats per row (~256KB for a 500-Linear model).
+    x2_probe: dict[tuple[str, str], list[float]] = {}
     dw_src: dict[tuple[str, str], str] = {}  # "rendered" | "rtn" per row
     g_trace: dict[str, float] = {}  # KL-Fisher weight-grad energy
     inv = 1.0 / float(n_probes)
@@ -345,6 +350,7 @@ def compute_aura_cost(
         for key in dW:
             s2.setdefault(key, 0.0)
             s4.setdefault(key, 0.0)
+            x2_probe.setdefault(key, [])
         for n in chunk:
             g_trace.setdefault(n, 0.0)
         # dW is now materialized for this chunk; the cache's LRU-resident
@@ -400,6 +406,7 @@ def compute_aura_cost(
                                 (gf * dW[key].float()).sum().item()) ** 2
                             s2[key] += x2
                             s4[key] += x2 * x2
+                            x2_probe[key].append(x2)
                     linears[n].weight.grad = None
             del logits, probe
             torch.cuda.empty_cache()
@@ -453,6 +460,10 @@ def compute_aura_cost(
             costs[n][f] = {
                 "predicted_dloss": 0.5 * mean_x2,
                 "predicted_dloss_stderr": 0.5 * math.sqrt(var_x2 * inv),
+                # raw per-probe x² samples (predicted_dloss = 0.5·mean of
+                # these). Probe-aligned across rows — the additivity gate sums
+                # them per probe for the exact correlated-sum stderr.
+                "x2_per_probe": x2_probe[key],
                 "dw_source": dw_src[key],
                 "output_mse_measured": False,
                 "cost_source": "aura",
