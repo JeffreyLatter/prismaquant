@@ -551,6 +551,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "allocator can choose its format by budget-value rather "
                         "than a hardcoded pin. dW falls back to RTN if the cache "
                         "lacks a rendered lm_head.")
+    p.add_argument("--gradient-checkpointing", action="store_true",
+                   help="Recompute activations during the probe backward "
+                        "instead of storing the graph. Required for fp32 "
+                        "measurement of ~27B models on the 121GB box: the "
+                        "resident model (~108GB) + a stored 4x256 graph "
+                        "(~10-15GB) OOM-kills between watchdog checks "
+                        "(observed 2026-06-10). ~30% slower; numerically "
+                        "identical recompute in fp32.")
     p.add_argument("--device", default="cuda")
     args = p.parse_args(argv)
 
@@ -584,6 +592,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
         model.to(args.device)
     model.eval()
+    if args.gradient_checkpointing:
+        # Non-reentrant variant: works with mostly-frozen params (only the
+        # current chunk's weights require grad).
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        _log("gradient checkpointing ON (non-reentrant)")
     calib = load_wikitext_calibration_windowed(
         tok, args.n_calib_samples, args.calib_seqlen, split=args.calib_split,
     ).to(args.device)
