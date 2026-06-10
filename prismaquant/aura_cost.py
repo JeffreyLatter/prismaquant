@@ -593,11 +593,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         model.to(args.device)
     model.eval()
     if args.gradient_checkpointing:
-        # Non-reentrant variant: works with mostly-frozen params (only the
-        # current chunk's weights require grad).
+        # transformers gates checkpointing on self.training — in eval() the
+        # checkpointed path is silently bypassed and the full graph is stored
+        # (observed OOM 2026-06-10). train() arms it; that is numerically
+        # identical to eval() ONLY when no dropout/batchnorm is active, so
+        # refuse otherwise instead of silently measuring under noise.
+        for mod_name, mod in model.named_modules():
+            if isinstance(mod, torch.nn.Dropout) and mod.p > 0:
+                raise RuntimeError(
+                    f"--gradient-checkpointing needs train() mode, but "
+                    f"{mod_name} has dropout p={mod.p} — train() would not "
+                    f"be eval-equivalent on this architecture.")
+            if isinstance(mod, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d,
+                                torch.nn.BatchNorm3d)):
+                raise RuntimeError(
+                    f"--gradient-checkpointing needs train() mode, but "
+                    f"{mod_name} is BatchNorm — train() would update "
+                    f"running stats.")
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
-        _log("gradient checkpointing ON (non-reentrant)")
+        model.train()
+        _log("gradient checkpointing ON (non-reentrant, train-mode armed, "
+             "no active dropout/batchnorm)")
     calib = load_wikitext_calibration_windowed(
         tok, args.n_calib_samples, args.calib_seqlen, split=args.calib_split,
     ).to(args.device)
