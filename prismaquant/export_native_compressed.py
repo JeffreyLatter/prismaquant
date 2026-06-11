@@ -4830,6 +4830,8 @@ def materialize_tensors_streaming(
                 "PRISMAQUANT_DO_NO_HARM", "1"),
             "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
                 "PRISMAQUANT_GPTQ_DAMP_SWEEP", "1"),
+            "PRISMAQUANT_GPTQ_DAMP": os.environ.get(
+                "PRISMAQUANT_GPTQ_DAMP", ""),
             "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
                 "PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999"),
             "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(

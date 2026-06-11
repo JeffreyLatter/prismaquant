@@ -99,6 +99,7 @@ def main() -> int:
 
     nll = 0.0
     count = 0
+    chunk_nlls: list[float] = []
     chunks = [
         ids[start : min(start + int(args.seqlen), len(ids))]
         for start in range(0, len(ids), int(args.seqlen))
@@ -114,9 +115,12 @@ def main() -> int:
         prompt_logprobs = result.prompt_logprobs
         if prompt_logprobs is None:
             raise RuntimeError("vLLM did not return prompt_logprobs")
+        chunk_nll = 0.0
         for pos in range(1, len(chunk)):
-            nll -= _logprob_value(prompt_logprobs[pos], int(chunk[pos]))
+            chunk_nll -= _logprob_value(prompt_logprobs[pos], int(chunk[pos]))
             count += 1
+        nll += chunk_nll
+        chunk_nlls.append(chunk_nll / max(len(chunk) - 1, 1))
         print(
             f"[ppl] chunk {index}/{len(chunks)} tokens={len(chunk)} "
             f"wall={time.monotonic() - t0:.2f}s",
@@ -133,6 +137,8 @@ def main() -> int:
         "seqlen": int(args.seqlen),
         "mean_nll": float(mean_nll),
         "ppl": float(math.exp(mean_nll)),
+        "per_chunk_mean_nll": [float(v) for v in chunk_nlls],
+        "max_chunk_mean_nll": float(max(chunk_nlls)) if chunk_nlls else None,
         "elapsed_s": float(time.monotonic() - started),
     }
     output.write_text(json.dumps(result, indent=2) + "\n")

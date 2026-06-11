@@ -2072,6 +2072,14 @@ def fill_production_weight_cache(
         bool(levers.get("gptq", True))
         and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
     )
+    if not levers["gptq_damp_sweep"]:
+        # Provenance: which fixed damp the no-sweep renders used
+        # (PRISMAQUANT_GPTQ_DAMP, default 0.01) — without this, two
+        # fixed-damp caches are metadata-indistinguishable.
+        from prismaquant.export_native_compressed import (
+            _resolve_gptq_fixed_damp,
+        )
+        levers.setdefault("gptq_fixed_damp", _resolve_gptq_fixed_damp())
     levers.setdefault("scale_sweep", False)
     levers.setdefault(
         "static_act_order",
