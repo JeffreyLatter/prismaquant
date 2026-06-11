@@ -176,6 +176,7 @@ def _auto_n_chunks(
     n_nonzero_fmts: int = 1,
     dw_bytes: int = 2,
     accurate_chunk_bytes: bool = False,
+    hook_harvest: bool = False,
 ) -> int:
     """Pick the number of Linear chunks so peak memory stays under budget.
 
@@ -207,17 +208,26 @@ def _auto_n_chunks(
         return 1
     import math
     numel = sum(linears[n].weight.numel() for n in names)
-    budget = max(free - (min_free_gib + 12.0), 4.0)
-    if not accurate_chunk_bytes:
+    # Headroom: 12 GiB covers a stored autograd graph + slack (the legacy
+    # regime). With hook-harvest the graph is gone (checkpointing) and grads
+    # are freed inside the backward, so the transient is ~one param's fp32
+    # grad + logits buffers — 4 GiB suffices and the budget roughly triples
+    # on a 90%-occupied box.
+    headroom = 4.0 if hook_harvest else 12.0
+    budget = max(free - (min_free_gib + headroom), 4.0)
+    if not accurate_chunk_bytes and not hook_harvest:
         # Legacy path, preserved bit-for-bit: 2 bytes/weight, peak ~ 2*W/G.
         wgib = numel * 2 / (1024 ** 3)
         return max(1, min(math.ceil(2.0 * wgib / budget), len(names)))
     # Accurate: grad/weight footprint follows the model param dtype; dW is one
     # bf16 (``dw_bytes``) delta per nonzero format. Peak over the resident model
-    # per chunk = numel/G * (grad_bytes + n_nonzero_fmts * dw_bytes).
+    # per chunk = numel/G * (grad_bytes + n_nonzero_fmts * dw_bytes); with
+    # hook-harvest the chunk-wide grad term drops out entirely.
     grad_bytes = (
         next(iter(linears.values())).weight.element_size() if linears else 4
     )
+    if hook_harvest:
+        grad_bytes = 0
     per_weight_bytes = grad_bytes + max(1, n_nonzero_fmts) * max(1, dw_bytes)
     peak_gib = numel * per_weight_bytes / (1024 ** 3)
     return max(1, min(math.ceil(peak_gib / budget), len(names)))
@@ -240,6 +250,7 @@ def compute_aura_cost(
     require_production_cache: bool = False,
     dw_dtype: str = "bfloat16",
     include_lm_head: bool = False,
+    hook_harvest: bool = False,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -306,6 +317,7 @@ def compute_aura_cost(
             n_nonzero_fmts=len(nonzero_fmts),
             dw_bytes=_dw_torch_dtype.itemsize,
             accurate_chunk_bytes=accurate_chunk_bytes,
+            hook_harvest=hook_harvest,
         )
     n_linear_chunks = max(1, min(n_linear_chunks, len(names)))
     _log(f"targets={len(names)} formats={fmts} probes={n_probes} "
@@ -379,7 +391,38 @@ def compute_aura_cost(
                  f"dW pairs={len(dW)}; free={_free_gib():.1f}")
 
         # K probe backward passes; one autograd graph alive at a time (fresh
-        # forward per probe). Grads retained for this chunk only.
+        # forward per probe). Two harvest modes:
+        #  * legacy: grads retained for the whole chunk, harvested after
+        #    backward (chunk memory = grads + dW);
+        #  * hook_harvest: post-accumulate-grad hooks project each grad the
+        #    moment it lands and free it inside the backward — chunk memory
+        #    is dW only, so chunks are ~3-4x larger and total backwards
+        #    proportionally fewer. Per-(key,probe) values are identical
+        #    (same reductions, just earlier).
+        hook_handles = []
+        if hook_harvest:
+            def _make_hook(name: str):
+                def _hook(param: torch.Tensor) -> None:
+                    g = param.grad
+                    if g is None:
+                        return
+                    with torch.no_grad():
+                        gf = g.float()
+                        g_trace[name] += float((gf * gf).sum().item())
+                        for f in nonzero_fmts:
+                            key = (name, f)
+                            if key in dW:
+                                x2 = float(
+                                    (gf * dW[key].float()).sum().item()) ** 2
+                                s2[key] += x2
+                                s4[key] += x2 * x2
+                                x2_probe[key].append(x2)
+                    param.grad = None
+                return _hook
+            for n in chunk:
+                hook_handles.append(
+                    linears[n].weight.register_post_accumulate_grad_hook(
+                        _make_hook(n)))
         for k in range(n_probes):
             if _free_gib() < min_free_gib:
                 raise RuntimeError(
@@ -392,27 +435,30 @@ def compute_aura_cost(
                 temperature=temperature, distribution="rademacher",
             )
             probe.backward()
-            with torch.no_grad():
-                for n in chunk:
-                    g = linears[n].weight.grad
-                    if g is None:
-                        continue
-                    gf = g.float()
-                    g_trace[n] += float((gf * gf).sum().item())
-                    for f in nonzero_fmts:
-                        key = (n, f)
-                        if key in dW:
-                            x2 = float(
-                                (gf * dW[key].float()).sum().item()) ** 2
-                            s2[key] += x2
-                            s4[key] += x2 * x2
-                            x2_probe[key].append(x2)
-                    linears[n].weight.grad = None
+            if not hook_harvest:
+                with torch.no_grad():
+                    for n in chunk:
+                        g = linears[n].weight.grad
+                        if g is None:
+                            continue
+                        gf = g.float()
+                        g_trace[n] += float((gf * gf).sum().item())
+                        for f in nonzero_fmts:
+                            key = (n, f)
+                            if key in dW:
+                                x2 = float(
+                                    (gf * dW[key].float()).sum().item()) ** 2
+                                s2[key] += x2
+                                s4[key] += x2 * x2
+                                x2_probe[key].append(x2)
+                        linears[n].weight.grad = None
             del logits, probe
             torch.cuda.empty_cache()
             if (k + 1) % 8 == 0:
                 _log(f"  chunk {ci+1}/{len(chunks)} probe {k+1}/{n_probes}; "
                      f"free={_free_gib():.1f}")
+        for h in hook_handles:
+            h.remove()
         # Release this chunk's dW + grad enablement before the next chunk.
         del dW
         for n in chunk:
@@ -551,6 +597,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "allocator can choose its format by budget-value rather "
                         "than a hardcoded pin. dW falls back to RTN if the cache "
                         "lacks a rendered lm_head.")
+    p.add_argument("--hook-harvest", action="store_true",
+                   help="Project each gradient onto dW inside the backward "
+                        "(post-accumulate-grad hooks) and free it immediately. "
+                        "Chunk memory becomes dW-only, so chunks grow ~3-4x "
+                        "and total backwards shrink proportionally. Identical "
+                        "per-probe values; pair with --gradient-checkpointing "
+                        "for large fp32 models.")
     p.add_argument("--gradient-checkpointing", action="store_true",
                    help="Recompute activations during the probe backward "
                         "instead of storing the graph. Required for fp32 "
@@ -636,6 +689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_production_cache=args.require_production_cache,
         dw_dtype=args.dw_dtype,
         include_lm_head=args.include_lm_head,
+        hook_harvest=args.hook_harvest,
     )
     payload["provenance"].update({
         "model": str(args.model),

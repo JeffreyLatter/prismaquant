@@ -248,3 +248,26 @@ def test_cost_ucb_z_charges_stderr(monkeypatch):
     # rows without stderr (old payloads) are unaffected even with z set
     old = {"predicted_dloss": 0.010, "output_mse_measured": False}
     assert cost_entry_predicted_dloss(stats, old) == 0.010
+
+
+def test_hook_harvest_matches_legacy_and_frees_grads():
+    torch.manual_seed(21)
+    model = TinyLM().eval()
+    ids = _ids(seed=2)
+    kw = dict(n_probes=6, min_free_gib=0.0, n_linear_chunks=2)
+
+    legacy = compute_aura_cost(model, ids, ["NVFP4"], **kw)
+    hooked = compute_aura_cost(model, ids, ["NVFP4"], hook_harvest=True, **kw)
+
+    for n in legacy["costs"]:
+        a, b = legacy["costs"][n]["NVFP4"], hooked["costs"][n]["NVFP4"]
+        assert a["predicted_dloss"] == b["predicted_dloss"], n
+        assert a["x2_per_probe"] == b["x2_per_probe"], n
+    for n in legacy["stats"]:
+        assert legacy["stats"][n]["h_trace"] == hooked["stats"][n]["h_trace"]
+    # hooks removed cleanly: a fresh legacy run still matches
+    again = compute_aura_cost(model, ids, ["NVFP4"], **kw)
+    assert again["costs"].keys() == legacy["costs"].keys()
+    for n in legacy["costs"]:
+        assert (again["costs"][n]["NVFP4"]["predicted_dloss"]
+                == legacy["costs"][n]["NVFP4"]["predicted_dloss"])
