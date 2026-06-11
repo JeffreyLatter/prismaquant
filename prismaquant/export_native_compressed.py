@@ -1456,9 +1456,29 @@ def _gptq_columnwise_update(
     return W
 
 
+def _resolve_gptq_fixed_damp(default: float = 0.01) -> float:
+    """Fixed GPTQ damp used when the damp sweep is disabled.
+
+    ``PRISMAQUANT_GPTQ_DAMP`` overrides the vanilla-GPTQ constant 0.01.
+    Research lever for the unified-render-theory V1 served A/B: held-out
+    Hessian-weighted basins put the per-Linear optimum at damp 0.3-1.0,
+    not 0.01 (docs/unified_render_theory.md §8 V0b/V0c) — but that is
+    local-proxy evidence, so the default stays 0.01 until the served
+    A/B clears. Sweep paths pass explicit candidates and ignore this.
+    """
+    raw = os.environ.get("PRISMAQUANT_GPTQ_DAMP", "")
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return v if v > 0.0 else default
+
+
 def _gptq_obs_rounding_nvfp4(
     weight: torch.Tensor, activations: torch.Tensor,
-    group_size: int = 16, damp: float = 0.01,
+    group_size: int = 16, damp: float | None = None,
     global_real_override: torch.Tensor | None = None,
     clip_threshold: float | None = None,
     clip_rescale: str | None = None,
@@ -1492,6 +1512,8 @@ def _gptq_obs_rounding_nvfp4(
     max-to-codebook-level scale choices used by GPTQ. Its candidate set
     contains max-to-6 and max-to-4, so FourOverSix is a strict subset.
     """
+    if damp is None:
+        damp = _resolve_gptq_fixed_damp()
     W = weight.to(torch.float32).clone()
     rows, cols = W.shape
     if cols % group_size != 0:
@@ -2643,7 +2665,7 @@ def _gptq_obs_rounding_mxfp4(
     activations: torch.Tensor,
     *,
     group_size: int = 32,
-    damp: float = 0.01,
+    damp: float | None = None,
     clip_threshold: float | None = None,
     clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
@@ -2669,6 +2691,8 @@ def _gptq_obs_rounding_mxfp4(
         clip_rescale=clip_rescale,
         row_weights=fisher_row_weights,
     )
+    if damp is None:
+        damp = _resolve_gptq_fixed_damp()
     H = X.t() @ X
     diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
     H.diagonal().add_(float(damp) * diag_mean)
@@ -2802,7 +2826,7 @@ def _gptq_obs_rounding_fp8_like(
     *,
     fmt: str,
     group_size: int = 32,
-    damp: float = 0.01,
+    damp: float | None = None,
     clip_threshold: float | None = None,
     clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
@@ -2844,6 +2868,8 @@ def _gptq_obs_rounding_fp8_like(
         clip_rescale=clip_rescale,
         row_weights=fisher_row_weights,
     )
+    if damp is None:
+        damp = _resolve_gptq_fixed_damp()
     H = X.t() @ X
     diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
     H.diagonal().add_(float(damp) * diag_mean)
