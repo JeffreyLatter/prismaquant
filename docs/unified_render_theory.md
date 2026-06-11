@@ -171,8 +171,17 @@ Magnitude sanity against the 31-row log: d/n_eff ≈ 5–19 there, winners at
 damp 0.001–0.01 ⇒ implied SNR̄ ≈ 500–19000 ⇒ per-column R² ≈ 0.998–0.9999.
 LLM activation channels are exactly that mutually predictable, most of all
 the attention-head outputs feeding o_proj — which is the role the log shows
-wanting the smallest damp. The formula's scale is right, and its ordering
-across roles matches the data before any fitting.
+wanting the smallest damp.
+
+**V0 status (2026-06-11): the closed form as stated is NOT implementable
+from in-sample quantities — measured, not speculated.** At production's
+n < d, small-λ ridge interpolates the calibration rows: d_eff(λ) → n, the
+dof correction degenerates, in-sample RSS ≈ 0 carries no information about
+σ², and the fixed point diverges to damp* → ∞ on 28/31 real 4B Linears
+(`v0_law_check_results.json`). The structural law (shrinkage ∝ evidence)
+stands; the *estimator* of SNR must come from held-out rows, not in-sample
+residuals. See §8 V0/V0b for what that audit then uncovered about the
+production sweep itself.
 
 Implementation note (load-bearing): any shrinkage must act **inside** the
 loop — scale the OBS update vector, or equivalently use `H_λ̃*` — never by
@@ -296,10 +305,12 @@ Partial data from the deferred damp study
   winner bucket) — the graveyard's κ-target rejection, re-confirmed in-data.
 - **o_proj `[2560,4096]` is the entire heavy tail**: always wins at 0.001,
   fixed-0.01 regret +47–85% while every other role's regret is ≤ 5%, and
-  fixed-0.1 regret up to 10.4×. The law's reading: attention-head outputs
-  are highly mutually predictable (high ᾱ²) → smallest λ̃* in the block → the
-  role most damaged by any fixed constant. A per-Linear λ̃* targets exactly
-  these rows.
+  fixed-0.1 regret up to 10.4×. *(Held-out postscript, V0b: this entire
+  structure is in-sample artifact — o_proj's input is the most predictable,
+  so it shows the most apparent in-sample signal and overfits hardest; its
+  held-out optimum is damp ≈ 1.0 like the rest of attention. Kept here as
+  the cleanest demonstration of why in-sample winner logs cannot be trusted
+  as ground truth.)*
 
 ### 6.3 Why JSO/{6,4} is safe at every evidence level
 
@@ -314,15 +325,22 @@ measured scales unconditionally and shrinks only the regression.
 ### 6.4 The honest tension: the +137.5% sweep-removal measurement
 
 `damp_sweep_4b_essential` (2026-05): disabling the sweep (→ fixed 0.01) cost
-+137.5% KL on Qwen3-4B. But the 31-row local regrets (median +2%, tail +85%
-confined to o_proj) do not obviously sum to +137% under fp32 additivity.
-Candidate explanations: (a) JSO evaluates inside each damp pass, so the sweep
-also selects different {6,4} patterns — the May A/B measured sweep×scale
-jointly, not damp alone; (b) era drift (pre-JSO-default code); (c) o_proj
-sits on the residual stream and its Fisher weight amplifies the tail. **This
-is unresolved and blocks any production change** — V1 below settles it. Until
-then the sweep stays the default (core principle: defaults stay
-backwards-compatible; the law ships as an opt-in lever).
++137.5% KL on Qwen3-4B. **Metric-tier correction (checked at source,
+2026-06-11):** that number is *last-token hook KL* — the triage screen, tier
+5 in the metric authority ladder — on n=2 trials; it was never confirmed on
+served full-vocab KL. The same run's local activation-weighted MSE actually
+*favored* sweep-off slightly, and its per-kind breakdown fingered
+`self_attn.o_proj` as the only kind where the sweep helps locally (+5.45%) —
+independently re-found by the 31-row log (o_proj is the entire fixed-damp
+regret tail) and consistent with the law (highest cross-channel
+predictability → optimum farthest from any fixed constant). So the "sweep is
+essential" claim is screen-grade evidence of *something real centered on
+o_proj*, not a gold-metric fact. The 31-row local regrets (median +2%, tail
++85% on o_proj) summing to far less than +137% under fp32 additivity is
+consistent with the screen overstating it. **Still unresolved and still
+blocks any production change** — V1 measures sweep vs fixed vs CV-selected
+on the gold metric. Until then the sweep stays the default (defaults stay
+backwards-compatible; everything here ships as opt-in levers).
 
 ---
 
@@ -333,8 +351,15 @@ per Linear (dense or expert, identical code path):
   1. H = XᵀX  (routing/Fisher row weights as today)
   2. n_eff  (ESS: weights + autocorrelation, §5.1)         ~free
   3. Cholesky of H_λ (start damp=0.01); read [H_λ⁻¹]_jj     already computed
-  4. SNR̄ from the ridge fit (dof = d_eff(λ̃)); per-role t̂;
-     damp* = (d/n_eff)/(t̂·SNR̄); iterate ×2                   arithmetic
+  4. damp* selection — in order of simplicity (all pending V1 served):
+       a. simplest, V0c-validated locally: a SINGLE fixed damp in 0.3–1.0
+          (no sweep, no selector; within ~2% of per-Linear optimal held-out;
+          5× faster than today). One pass. This is the "uncomplicated loop".
+       b. refinement (~2% more, sweep-cost): held-out CV — fit candidates on
+          half the rows, score on the other half, refit winner on all rows;
+       c. closed form (open): damp* = (d/n_eff)/(t̂·SNR̄) with a held-out
+          SNR estimator — in-sample version diverges (§3.2 V0 status);
+          leave-column-out GCV is the candidate
      (thin/shifted evidence ⇒ damp* large ⇒ compensation → 0: the render
       degrades continuously into RTN + measured {6,4} scales; this IS the
       expert path, derived not configured)
@@ -355,18 +380,66 @@ serialization contract.
 
 ## 8. Validation ladder (graveyard bar explicit)
 
-- **V0 — in-objective, ~minutes (GPU):** recompute H for the 31 logged 4B
-  Linears, evaluate `damp* = (d/n_eff)/SNR̄` per row, check it lands in the
-  measured per-damp-error basin (within ~5% of the swept optimum's error,
-  parabolic-interpolated). Also verify the regime premise directly:
-  `d_eff(damp_win) ≲ n_eff` on every row (the reason GPTQ works at n < d at
-  all). The κ-target predecessor fails this on sight; the law must pass it
-  before anything end-to-end.
+- **V0 — RUN (2026-06-11), and it failed forward.** Recomputed H for the 31
+  logged 4B Linears and evaluated `damp* = (d/n_eff)/SNR̄`: the in-sample
+  fixed point **diverges** (interpolation regime, §3.2 status note) —
+  honest negative, the closed form needs a held-out SNR estimator. The audit
+  then surfaced something bigger: **the production damp sweep's evaluator is
+  itself in-sample** — `_gptq_obs_rounding_nvfp4_swept` fits each candidate's
+  compensation on H and scores `tr(diff·H·diffᵀ)` on the *same* H from the
+  same ≤512 rows. At n < d that systematically rewards overfit,
+  under-damped compensation. The "measured winners" the sweep returns are
+  biased, and the bias direction is exactly the §9.1 anti-conservative one.
+  Measurement gap, not optimizer gap — the house diagnosis, found *in our
+  own evaluator* by following the theory.
+- **V0b/V0c — held-out basins, COMPLETE (2026-06-11):** 1024 reservoir rows
+  per Linear; GPTQ-fit each damp in {0.0003…1.0}∪{3,10,100}∪{RTN} on a
+  production-faithful 512 rows, score Hessian-weighted error on the held-out
+  512. All 31 Linears, all basins interior. Results
+  (`v0b_heldout_results.json` + `v0c_supplement_results.json`):
+  - **31/31 in-sample winners are under-damped.** Held-out optima sit at
+    damp 0.1–3.0 (attention → 1.0, gate/up → 0.1–0.3, down_proj → 3.0) —
+    one to three *orders of magnitude* above the in-sample winners
+    (0.0003–0.01) and above the production grid's center of mass.
+  - **The in-sample sweep is worse than the constant it replaces:** geomean
+    held-out regret vs per-Linear optimum — in-sample-sweep winner **+35.4%**,
+    fixed-0.01 **+26.1%**. The 5× sweep pays compute to pick *worse* damps.
+  - **RTN loses decisively on dense:** geomean **2.04×** (up to 14.3× on
+    gate_proj). Compensation transfers at n < d — it just needs ~100× more
+    shrinkage than the in-sample evaluator chooses. The law's dense-regime
+    prediction (partial compensation ≫ both endpoints) is confirmed; the
+    held-out objective is sane (it does not collapse to RTN).
+  - **The basin top is wide and flat — one constant nearly suffices:** any
+    single fixed damp in **0.3–1.0** gets within **+1.6–2.6% geomean
+    (worst +7–12%)** of the per-Linear optimum. Per-Linear selection buys
+    only ~2% beyond the right decade. This is the strongest possible
+    endorsement of the "single uncomplicated loop": no sweep, no selector —
+    one theory-located constant (Robert's "fix it to 0.1" instinct lands
+    within 8% of optimal; 0.3 is the data's center).
+  - The in-sample o_proj structure (§6.2's "regret tail") inverts held-out:
+    o_proj's apparently-special tiny-damp preference was the *most overfit*
+    pick (most predictable input ⇒ most apparent in-sample signal); its
+    held-out optimum is 1.0 like the rest of attention. The May screen's
+    per-kind o_proj finding was likewise in-sample.
+  - Naive GCV-by-rows on the full design is degenerate (the target column
+    sits in its own design; picks λ→0) — the closed form needs the
+    leave-column-out variant, open (§9.7).
+  Caveats: local held-out MSE (V1 served is the gate); 4B layers 0–4 at
+  512-row fits; JSO off in these fits (scale-rule interaction untested).
+- **Bridge caveat for V0b→V1:** held-out *output-MSE* is still a local
+  proxy; the selection objective that matches the platform's currency is
+  held-out **AURA cost** of the rendered candidate (the same Fisher-quadratic
+  the allocator prices — `aura_cost.py` prices rendered dW directly). Local
+  proxies have inverted against serving twice this spring (scale_sweep,
+  grouped-KL); V1 is served-KL for exactly this reason.
 - **V1 — the bar the old analytical damp failed:** Qwen3-4B end-to-end
-  served KL at matched bpp: λ̃*-single-pass vs 5-sweep vs fixed-0.01,
-  `--calib-repeats ≥ 4`. Acceptance: λ̃* ∊ [sweep − noise, sweep] and the
-  fixed-0.01 arm reproduces (or fails to reproduce) the +137.5% anomaly,
-  resolving §6.4. (Predecessor scored +100–161% here; that is the bar.)
+  served KL at matched bpp, ≥3 arms: (i) production in-sample 5-sweep,
+  (ii) fixed-0.01, (iii) held-out-CV damp selection (fit half, score half,
+  refit at winner — same pass count as today's sweep, unbiased evaluator),
+  `--calib-repeats ≥ 4`. This simultaneously resolves §6.4 on the gold
+  metric and tests whether fixing the evaluator bias is worth real KL.
+  (The κ-target predecessor scored +100–161% here; that is the bar any
+  closed form must also clear once its held-out estimator exists.)
 - **V2 — regime audit, no new builds:** compute ν = n_eff/d and adjusted-R²
   for the 35B packed experts and the 27B dense Linears from existing caches;
   the law must place experts in the s*≈0 branch and dense in s*≈1. Pure
@@ -422,6 +495,12 @@ V0+V1 → default only after V2–V3 and a second model/shape.
    flag, don't fix preemptively.
 6. **t̂ estimation noise** per role: needs the gate corpus sized so t̂'s
    stderr ≪ its distance from the s* decision boundary.
+7. **Leave-column-out GCV closed form:** full-design GCV-by-rows is
+   degenerate (V0b). The leave-column-out ridge coefficients come free from
+   the full precision matrix (β̂_j = −[H_λ⁻¹]_{j,−j}/[H_λ⁻¹]_{jj} holds for
+   ridge exactly, by partitioned inverse), but the matching row-held-out
+   dof/GCV denominator per column is unworked. Practical priority is low:
+   V0c shows the basin top is flat — a located constant captures ~98%.
 
 ---
 
