@@ -23,4 +23,6 @@ MAJOR-M22 FIXED 3fd3dce
 MAJOR-M23 FIXED 718cfa3
 MAJOR-M24 FIXED 0283d3f
 MAJOR-M25 FIXED 0283d3f
+MAJOR-M26 SKIPPED-NEEDS-DESIGN proposal: final validated-frontier KL scope/defaults overlap the queue's protected run-pipeline holdout/stage wiring; switch production final selection to a full-sequence held-out evaluator in that critical branch, or require an explicit smoke-only last-token override.
+MAJOR-M27 FIXED 013b0c2
 MAJOR-M34 FIXED a92eb7f
