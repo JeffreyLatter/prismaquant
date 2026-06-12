@@ -35,7 +35,9 @@ from prismaquant.allocator import (
     expand_fused_sibling_assignment,
     promote_moe_pair,
     solve_with_promotion,
+    validate_default_profile_format_menu,
 )
+from prismaquant.model_profiles import DefaultProfile
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +355,29 @@ def test_serving_unit_promotion_handles_overlapping_groups_order_independently()
         "overlap.mid": "BF16",
         "overlap.right": "BF16",
     }
+
+
+def test_default_profile_rejects_multi_format_menu_without_escape():
+    specs = [fr.REGISTRY["NVFP4"], fr.REGISTRY["BF16"]]
+
+    try:
+        validate_default_profile_format_menu(DefaultProfile(), specs)
+    except SystemExit as exc:
+        assert "DefaultProfile cannot enforce" in str(exc)
+    else:
+        raise AssertionError("multi-format DefaultProfile menu should fail")
+
+
+def test_default_profile_allows_single_format_or_explicit_escape():
+    validate_default_profile_format_menu(
+        DefaultProfile(),
+        [fr.REGISTRY["NVFP4"]],
+    )
+    validate_default_profile_format_menu(
+        DefaultProfile(),
+        [fr.REGISTRY["NVFP4"], fr.REGISTRY["BF16"]],
+        allow_default_profile=True,
+    )
 
 
 # ---------------------------------------------------------------------------

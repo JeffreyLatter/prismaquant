@@ -29,7 +29,7 @@ from prismaquant.calibration_data import (
 )
 from prismaquant.gpu_guard import require_cuda_hot_path
 from prismaquant.layer_config import canonicalize_format
-from prismaquant.model_profiles import DefaultProfile, detect_profile
+from prismaquant.model_profiles import detect_profile_with_warning
 from prismaquant.kl_measurement import (
     assignment_bit_total,
     assignment_hash,
@@ -398,6 +398,7 @@ def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
                 args.dataset,
                 n_samples,
                 args.calib_seqlen,
+                calib_seed=args.calib_seed,
             )]
         return [load_wikitext_calibration_windowed(
             tokenizer,
@@ -412,6 +413,7 @@ def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
             args.dataset,
             n_samples * repeats,
             args.calib_seqlen,
+            calib_seed=args.calib_seed,
         )
         if all_ids.size(0) < n_samples * repeats:
             raise RuntimeError(
@@ -838,10 +840,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--production-cache-lru-gb budget"
                 )
 
-        try:
-            profile = detect_profile(args.model)
-        except Exception:
-            profile = DefaultProfile()
+        profile = detect_profile_with_warning(
+            args.model,
+            entrypoint="validate-kl",
+        )
         ref_log_prob_repeats = [
             cache_reference_log_probs(
                 model,

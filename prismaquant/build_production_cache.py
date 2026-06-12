@@ -48,7 +48,7 @@ from prismaquant.calibration_data import (
     load_wikitext_calibration_windowed,
 )
 from prismaquant.gpu_guard import require_cuda_hot_path
-from prismaquant.model_profiles import DefaultProfile, detect_profile
+from prismaquant.model_profiles import detect_profile_with_warning
 from prismaquant.production_recache import _load_assignment
 from prismaquant.production_weight_cache import (
     fill_production_weight_cache,
@@ -61,6 +61,24 @@ def _model_has_packed_experts(model: nn.Module, profile) -> bool:
     return any(
         _is_packed_experts_module(m, profile)
         for _, m in model.named_modules()
+    )
+
+
+def _load_cache_calibration(tokenizer, args) -> torch.Tensor:
+    if args.dataset:
+        return load_calibration(
+            tokenizer,
+            args.dataset,
+            args.n_calib_samples,
+            args.calib_seqlen,
+            calib_seed=args.calib_seed,
+        )
+    return load_wikitext_calibration_windowed(
+        tokenizer,
+        args.n_calib_samples,
+        args.calib_seqlen,
+        split=args.calib_split,
+        seed=args.calib_seed,
     )
 
 
@@ -295,21 +313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokenizer = AutoTokenizer.from_pretrained(
             staged, trust_remote_code=True, local_files_only=local_only,
         )
-        if args.dataset:
-            calib_ids = load_calibration(
-                tokenizer,
-                args.dataset,
-                args.n_calib_samples,
-                args.calib_seqlen,
-            )
-        else:
-            calib_ids = load_wikitext_calibration_windowed(
-                tokenizer,
-                args.n_calib_samples,
-                args.calib_seqlen,
-                split=args.calib_split,
-                seed=args.calib_seed,
-            )
+        calib_ids = _load_cache_calibration(tokenizer, args)
         load_kwargs = {
             "torch_dtype": dtype,
             "trust_remote_code": True,
@@ -328,10 +332,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if device.type != "cuda":
             model.to(device)
         model.eval()
-        try:
-            profile = detect_profile(args.model)
-        except Exception:
-            profile = DefaultProfile()
+        profile = detect_profile_with_warning(
+            args.model,
+            entrypoint="build-prod-cache",
+        )
         skip_tokens = list(
             args.skip_qnames
             if args.skip_qnames is not None
@@ -433,6 +437,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.expert_gate_dataset,
                     args.expert_gate_samples or args.n_calib_samples,
                     args.expert_gate_seqlen or args.calib_seqlen,
+                    calib_seed=args.calib_seed,
                 )
             expert_coverage = fill_packed_expert_cache_entries(
                 cache, model, calib_ids,

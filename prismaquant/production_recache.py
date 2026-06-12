@@ -434,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
     from transformers import AutoTokenizer
 
     from prismaquant.calibration_data import _dtype_from_name
-    from prismaquant.model_profiles import DefaultProfile, detect_profile
+    from prismaquant.model_profiles import detect_profile_with_warning
     from prismaquant.perturbed_x_cache import load_text_model_under_work_root
     from prismaquant.sensitivity_probe import load_calibration
 
@@ -478,10 +478,10 @@ def main(argv: list[str] | None = None) -> int:
         args.calib_seqlen,
     )
     assignment = _load_assignment(args.layer_config)
-    try:
-        profile = detect_profile(args.model)
-    except Exception:
-        profile = DefaultProfile()
+    profile = detect_profile_with_warning(
+        args.model,
+        entrypoint="production-recache",
+    )
     max_abs = recache_production_weight_cache(
         model,
         calib_ids,

@@ -877,6 +877,37 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def validate_default_profile_format_menu(
+    model_profile,
+    specs_sorted,
+    *,
+    allow_default_profile: bool = False,
+) -> None:
+    """Reject multi-format menus when only DefaultProfile was resolved."""
+    from .model_profiles import DefaultProfile
+
+    using_default_profile = isinstance(model_profile, DefaultProfile)
+    distinct_fmt_names = sorted({s.name for s in specs_sorted})
+    if (
+        using_default_profile
+        and len(distinct_fmt_names) > 1
+        and not allow_default_profile
+    ):
+        raise SystemExit(
+            "[alloc] ERROR: multi-format menu "
+            f"({distinct_fmt_names}) resolved to DefaultProfile (no probe "
+            "meta['model'] / --model-override, or the model architecture is "
+            "not registered) -> DefaultProfile cannot enforce architecture-"
+            "specific fused-sibling coherence (e.g. Qwen3.x DeltaNet "
+            "in_proj_ba/in_proj_qkvz) or packed-MoE expert uniformity, which "
+            "risks an unservable or silently-corrupt artifact. Pass "
+            "--model-override <model> so detect_profile resolves the real "
+            "profile, or --allow-default-profile to proceed anyway (only safe "
+            "for vanilla transformers whose only fused groups are "
+            "qkv_proj/gate_up_proj)."
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
@@ -1210,22 +1241,11 @@ def main():
     # Single-format menus are always coherent; --allow-default-profile is the
     # explicit escape for vanilla transformers. The menu is de-duped by format
     # NAME so an alias/duplicate cannot false-trigger.
-    using_default_profile = isinstance(model_profile, DefaultProfile)
-    distinct_fmt_names = sorted({s.name for s in specs_sorted})
-    if (using_default_profile and len(distinct_fmt_names) > 1
-            and not args.allow_default_profile):
-        raise SystemExit(
-            "[alloc] ERROR: multi-format menu "
-            f"({distinct_fmt_names}) resolved to DefaultProfile (no probe "
-            "meta['model'] / --model-override, or the model architecture is "
-            "not registered) -> DefaultProfile cannot enforce architecture-"
-            "specific fused-sibling coherence (e.g. Qwen3.x DeltaNet "
-            "in_proj_ba/in_proj_qkvz) or packed-MoE expert uniformity, which "
-            "risks an unservable or silently-corrupt artifact. Pass "
-            "--model-override <model> so detect_profile resolves the real "
-            "profile, or --allow-default-profile to proceed anyway (only safe "
-            "for vanilla transformers whose only fused groups are "
-            "qkv_proj/gate_up_proj).")
+    validate_default_profile_format_menu(
+        model_profile,
+        specs_sorted,
+        allow_default_profile=args.allow_default_profile,
+    )
 
     # --- Format-family coherence check -----------------------------------
     # A sensible format ladder has at most ONE format per bit tier. Having

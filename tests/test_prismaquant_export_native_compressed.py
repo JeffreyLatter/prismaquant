@@ -1507,6 +1507,47 @@ class TestBuildQuantizationConfig(unittest.TestCase):
                 assignment, bf16_passthrough=set(), profile=profile,
             )
 
+    def test_dense_fused_sibling_mixed_quantized_formats_rejected(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "MXFP8",
+            "model.layers.0.self_attn.v_proj": "NVFP4",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "crash@load"):
+            build_quantization_config(
+                assignment, bf16_passthrough=set(), profile=profile,
+            )
+
+    def test_dense_fused_sibling_quantized_bf16_mix_rejected(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "BF16",
+            "model.layers.0.self_attn.v_proj": "BF16",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "silent-corruption"):
+            build_quantization_config(
+                assignment, bf16_passthrough=set(), profile=profile,
+            )
+
+    def test_quantization_config_preflight_rejects_before_render(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "BF16",
+            "model.layers.0.self_attn.v_proj": "BF16",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "before rendering"):
+            enc._preflight_quantization_config(
+                assignment,
+                set(),
+                profile=profile,
+            )
+
     def test_no_class_name_catchall_target(self):
         # The class-name catch-all "Linear" short-circuits vLLM's
         # fused-layer match path and was the bug that produced wrong

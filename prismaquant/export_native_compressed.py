@@ -6518,6 +6518,26 @@ def build_quantization_config(
     }
 
 
+def _preflight_quantization_config(
+    assignment: dict[str, str],
+    bf16_passthrough: set[str],
+    *,
+    profile: "ModelProfile | None",
+) -> None:
+    """Run config-only export gates before GPU render and shard writes."""
+    try:
+        build_quantization_config(
+            assignment,
+            bf16_passthrough,
+            profile=profile,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "[export-stream] quantization-config preflight failed before "
+            f"rendering or shard writes: {exc}"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Recipe canonicalization + Main
 # ---------------------------------------------------------------------------
@@ -6932,6 +6952,18 @@ def main():
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
           flush=True)
 
+    bf16_passthrough = set(
+        args.ignore
+        if args.ignore is not None
+        else profile.pinned_names()
+    )
+    _preflight_quantization_config(
+        assignment,
+        bf16_passthrough,
+        profile=profile,
+    )
+    print("[export-stream] quantization-config preflight passed", flush=True)
+
     from prismaquant.gpu_guard import require_cuda_hot_path
 
     dtype = torch.bfloat16
@@ -6942,11 +6974,6 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bf16_passthrough = set(
-        args.ignore
-        if args.ignore is not None
-        else profile.pinned_names()
-    )
     if args.offload_folder is None:
         args.offload_folder = str(out_dir / "_streaming_offload")
 
