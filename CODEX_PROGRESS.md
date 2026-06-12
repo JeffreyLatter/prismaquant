@@ -16,4 +16,6 @@ MAJOR-M15 FIXED d9457f1
 MAJOR-M16 FIXED 82baaa2
 MAJOR-M17 FIXED 1da086b
 MAJOR-M18 FIXED ada08a8
+MAJOR-M19 SKIPPED-NEEDS-DESIGN proposal: persist production-cache render artifacts at the packed-code/scale or render-metadata level so export can ship exactly the validated bytes; changing the cache payload/selection contract is larger than a queue-batch patch.
+MAJOR-M20 FIXED 5bf80ac
 MAJOR-M34 FIXED a92eb7f
