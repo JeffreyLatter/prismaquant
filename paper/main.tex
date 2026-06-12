@@ -496,7 +496,8 @@ an exponential $\kl\!\sim\!10^{-aR}$ is straight in log-KL by construction
 knee appears only when the FP8 rung is added (Figure~\ref{fig:aura_rd_geometry}a):
 on Qwen3-4B the two-rung frontier is near-linear while
 $\{$NVFP4, FP8, BF16$\}$ bends to a knee near $8$~bpp ($6\times$ lower KL at
-matched bytes). Crucially, a better cost model (\textsc{Aura} vs.\ the baseline)
+matched bytes in a resident RTN weight-only train-split screen, not a served
+held-out result). Crucially, a better cost model (\textsc{Aura} vs.\ the baseline)
 shifts the frontier \emph{down} at fixed bpp --- a vertical translation
 orthogonal to its curvature --- so ``\textsc{Aura} is the better ranker'' and
 ``the two-rung frontier looks linear'' are simultaneously true. We therefore

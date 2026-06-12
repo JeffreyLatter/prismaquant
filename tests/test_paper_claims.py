@@ -19,3 +19,19 @@ def test_27b_corpus_count_does_not_call_wikitext_window_third_disjoint_corpus():
     assert "two disjoint held-out corpora" in text
     assert "second WikiText-test" in text
     assert "measurement window" in text
+
+
+def test_fp8_knee_claim_discloses_resident_train_split_screen():
+    text = (ROOT / "paper" / "main.tex").read_text()
+
+    assert "$6\\times$ lower KL at\nmatched bytes in a resident RTN weight-only train-split screen" in text
+    assert "not a served\nheld-out result" in text
+
+
+def test_claude_paper_map_points_to_aura_and_archive():
+    text = (ROOT / "CLAUDE.md").read_text()
+
+    assert "paper/figures/fig_aura_rd_geometry.tex" in text
+    assert "paper/archive/prismascout_paper_2026-06-05.tex" in text
+    assert "paper/figures/fig_validated_27b.tex" not in text
+    assert "paper's \"Methods Considered and Rejected\" section exists" not in text

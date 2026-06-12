@@ -72,8 +72,10 @@ publish it.
   retracts his own overstated claims the moment a comparison is found
   non-rigorous (the grouped-KL "−3.52% win", the "4× lower KL" framing, the
   "17 promotions / 0.0056 KL" polish headline — all retracted by him). Negative
-  results are recorded *with the durable lesson*. The paper's "Methods Considered
-  and Rejected" section exists on purpose. **Never sell a screen as a result.**
+  results are recorded *with the durable lesson*. The retired PrismaSCOUT
+  paper's rejected-methods catalog lives in
+  `paper/archive/prismascout_paper_2026-06-05.tex`; the current AURA paper keeps
+  the limits and caveats in its own spine. **Never sell a screen as a result.**
 - **Verify "done."** Agent/wrapper "completed" signals fire before child
   processes exit. Check `git log`, read the log file, confirm the artifact.
 
@@ -94,8 +96,9 @@ is the part he thinks *"could radically change all quantization if done right."*
 
 Everything downstream follows from this. Cheap, biased surrogates *propose*
 candidates; expensive, faithful end-to-end KL on a held-out split *decides* what
-ships. The named system that does this is **PrismaSCOUT** (Surrogate-Cascaded
-Optimization Under Tradeoff; an earlier internal name for the L3-polish piece was
+ships. The current paper's additive production-faithful allocator is **AURA**;
+**PrismaSCOUT** is the retired prior cascade (Surrogate-Cascaded Optimization
+Under Tradeoff; an earlier internal name for the L3-polish piece was
 *PrismaClade*).
 
 ### The cost cascade (cheap→faithful, each level gates the next)
@@ -498,10 +501,12 @@ Read these for *depth*; the prime directive applies.
 - **`docs/progressive_render_pipeline.md`** + **`docs/pluggable_refactor.md`** +
   **`docs/propagated_cost.md`** — render-gate ordering, the plugin contract, the
   L3 propagated-cost spec.
-- **`paper/main.tex`** — the thesis, the monotone-polish proposition (and its
-  scope caveat), the honest downstream-regression tables, and the full
-  rejected-methods catalog. `paper/figures/fig_validated_27b.tex` is the key
-  evidence figure.
+- **`paper/main.tex`** — the current AURA spine: production-faithful KL--Fisher
+  allocation, additivity/cancellation analysis, served KL/PPL evidence, and
+  limitations. `paper/figures/fig_aura_rd_geometry.tex` is the key geometry
+  figure. The retired PrismaSCOUT paper, including monotone-polish and the
+  rejected-methods catalog, is archived at
+  `paper/archive/prismascout_paper_2026-06-05.tex`.
 - **`.claude/prismaquant-handover-*.md`** — session history, newest first. Useful
   for narrative arc; **assume the "open items" are stale** (the 2026-05-28 one
   lists the cancelled JSO A/B). Codex/Gemini deliberations: `.claude/codex-*`,
