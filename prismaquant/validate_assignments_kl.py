@@ -391,14 +391,33 @@ def _activation_quant_assignment(
 def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
     repeats = max(int(args.calib_repeats), 1)
     n_samples = int(args.n_calib_samples)
+    skip = max(int(getattr(args, "calib_skip_first", 0) or 0), 0)
+
+    def _load_jsonl(n: int) -> torch.Tensor:
+        # --calib-skip-first K: drop the first K windows of the deterministic
+        # loader so selection KL is measured on windows DISJOINT from the
+        # probe/cost/render calibration (which consumes windows [0, K)).
+        # load_calibration is prefix-stable at a fixed seed, so [K, K+n) is
+        # token-disjoint from [0, K) by construction. House rule: held-out
+        # split is disjoint from cost generation (review criticals C3/C5).
+        all_ids = load_calibration(
+            tokenizer,
+            args.dataset,
+            n + skip,
+            args.calib_seqlen,
+            calib_seed=int(getattr(args, "calib_seed", 42) or 42),
+        )
+        if all_ids.size(0) < n + skip:
+            raise RuntimeError(
+                f"calibration source yielded {all_ids.size(0)} windows; "
+                f"need {n + skip} (n={n} + skip-first={skip}). Use a larger "
+                "corpus or reduce --calib-skip-first."
+            )
+        return all_ids[skip:]
+
     if repeats == 1:
         if args.dataset:
-            return [load_calibration(
-                tokenizer,
-                args.dataset,
-                n_samples,
-                args.calib_seqlen,
-            )]
+            return [_load_jsonl(n_samples)]
         return [load_wikitext_calibration_windowed(
             tokenizer,
             n_samples,
@@ -407,12 +426,7 @@ def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
             seed=args.calib_seed,
         )]
     if args.dataset:
-        all_ids = load_calibration(
-            tokenizer,
-            args.dataset,
-            n_samples * repeats,
-            args.calib_seqlen,
-        )
+        all_ids = _load_jsonl(n_samples * repeats)
         if all_ids.size(0) < n_samples * repeats:
             raise RuntimeError(
                 f"requested {repeats} calibration repeats of {n_samples} samples, "
@@ -592,6 +606,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calib-seqlen", type=int, default=128)
     parser.add_argument("--calib-split", default="train")
     parser.add_argument("--calib-seed", type=int, default=42)
+    parser.add_argument(
+        "--calib-skip-first", type=int, default=0,
+        help="Drop the first K windows of the deterministic calibration "
+        "loader before drawing validation windows. Pass the render "
+        "calibration's NSAMPLES here to make selection KL token-disjoint "
+        "from probe/cost/render calibration (review criticals C3/C5).")
     parser.add_argument(
         "--calib-repeats",
         type=int,

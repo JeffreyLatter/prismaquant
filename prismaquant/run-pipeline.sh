@@ -181,6 +181,17 @@ export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
 : "${SELECTION_MODE:=surrogate}"
 : "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
+# Held-out selection (review criticals C3/C5): the frontier-selecting KL
+# must be measured on text disjoint from probe/cost/render calibration
+# (house rule: "held-out split is disjoint from cost generation"). The
+# loader is prefix-stable, so skipping the first NSAMPLES windows makes
+# the validation windows token-disjoint by construction. Default ON —
+# the prior in-sample wiring was a bug, not a behavior. Set
+# VALIDATED_FRONTIER_SKIP_CALIB=0 only to reproduce historical runs.
+: "${VALIDATED_FRONTIER_SKIP_CALIB:=$NSAMPLES}"
+# Optional fully separate validation corpus (overrides skip-first
+# disjointness with corpus-level disjointness when provided).
+: "${VALIDATED_FRONTIER_DATASET:=$DATASET}"
 : "${VALIDATED_FRONTIER_KL_SCOPE:=last_token}"
 : "${VALIDATED_FRONTIER_PICK:=kneedle}"
 : "${VALIDATED_FRONTIER_SAT_Z:=2.0}"
@@ -292,6 +303,7 @@ echo "  PIPELINE_SPEC_PATH=$PIPELINE_SPEC_PATH"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
 echo "  H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
+echo "  VALIDATED_FRONTIER_SKIP_CALIB=$VALIDATED_FRONTIER_SKIP_CALIB VALIDATED_FRONTIER_DATASET=$VALIDATED_FRONTIER_DATASET"
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
 echo
 
@@ -780,7 +792,8 @@ PY
       "${VALIDATED_ASSIGNMENT_ARGS[@]}" \
       --output "$VALIDATION_JSON" \
       --formats "$FORMATS" \
-      --dataset "$DATASET" \
+      --dataset "$VALIDATED_FRONTIER_DATASET" \
+      --calib-skip-first "$(if [[ "$VALIDATED_FRONTIER_DATASET" == "$DATASET" ]]; then echo "$VALIDATED_FRONTIER_SKIP_CALIB"; else echo 0; fi)" \
       --n-calib-samples "$VALIDATED_FRONTIER_NSAMPLES" \
       --calib-seqlen "$VALIDATED_FRONTIER_SEQLEN" \
       --calib-repeats "$VALIDATED_FRONTIER_CALIB_REPEATS" \
