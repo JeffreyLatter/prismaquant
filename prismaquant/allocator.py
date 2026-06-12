@@ -1403,6 +1403,16 @@ def main():
     if probe_model_path:
         source_manifest = _scan_source_dtype_manifest(
             probe_model_path, model_profile)
+        if source_manifest is not None and not source_manifest:
+            # Empty scan = the model dir has no safetensors to classify
+            # (config-only dirs, probe-only flows). No evidence is not
+            # evidence of mismatch: fall back to legacy gating (BF16
+            # passthrough allowed) rather than mapping every name to
+            # "unknown" and silently stripping the BF16 rung.
+            print("[alloc] source-dtype manifest EMPTY (no safetensors "
+                  f"found under {probe_model_path}) — passthrough formats "
+                  "allowed WITHOUT source verification", flush=True)
+            source_manifest = None
         if source_manifest:
             n_fp8 = sum(1 for v in source_manifest.values() if v == "fp8")
             n_bf16 = sum(1 for v in source_manifest.values() if v == "bf16")
