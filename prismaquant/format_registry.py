@@ -307,7 +307,10 @@ def _e3m2_codebook() -> torch.Tensor:
     codes = set([0.0])
     for exp in range(8):
         for m in range(4):
-            val = (1 + m / 4) * (2 ** (exp - 3))
+            if exp == 0:
+                val = (m / 4) * (2 ** -2)
+            else:
+                val = (1 + m / 4) * (2 ** (exp - 3))
             codes.add(+val); codes.add(-val)
     return torch.tensor(sorted(codes), dtype=torch.float32)
 
@@ -317,7 +320,10 @@ def _e2m3_codebook() -> torch.Tensor:
     codes = set([0.0])
     for exp in range(4):
         for m in range(8):
-            val = (1 + m / 8) * (2 ** (exp - 1))
+            if exp == 0:
+                val = (m / 8) * (2 ** 0)
+            else:
+                val = (1 + m / 8) * (2 ** (exp - 1))
             codes.add(+val); codes.add(-val)
     return torch.tensor(sorted(codes), dtype=torch.float32)
 
@@ -341,7 +347,7 @@ def _e4m3_codebook() -> torch.Tensor:
 def _e5m2_codebook() -> torch.Tensor:
     # 8-bit FP e5m2. Wider range, less mantissa precision.
     codes = set([0.0])
-    for exp in range(32):
+    for exp in range(31):
         for m in range(4):
             if exp == 0:
                 val = (m / 4) * (2 ** -14)

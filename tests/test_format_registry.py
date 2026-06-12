@@ -33,6 +33,27 @@ def test_plain_fp8_rtn_uses_eager_path(monkeypatch):
     assert not torch.equal(y, x)
 
 
+def test_e5m2_codebook_excludes_special_exp31_values():
+    cb = fr._CODEBOOKS["fp8_e5m2"]
+
+    assert float(cb.abs().max()) == 57344.0
+    assert not torch.any(cb.abs() > 57344.0)
+    assert torch.any(cb == torch.tensor(57344.0))
+
+
+def test_fp6_codebooks_include_ocp_subnormals():
+    e3m2 = fr._CODEBOOKS["fp6_e3m2"]
+    e2m3 = fr._CODEBOOKS["fp6_e2m3"]
+
+    for value in (0.0625, 0.125, 0.1875):
+        assert torch.any(e3m2 == torch.tensor(value))
+    assert not torch.any(e3m2 == torch.tensor(0.15625))
+
+    for i in range(1, 8):
+        assert torch.any(e2m3 == torch.tensor(i / 8.0))
+    assert not torch.any(e2m3 == torch.tensor(0.0625))
+
+
 def test_plain_fp8_weight_matches_compressed_tensors_fp8_dynamic():
     from compressed_tensors.quantization.lifecycle.forward import fake_quantize
     from compressed_tensors.quantization.quant_scheme import FP8_DYNAMIC
