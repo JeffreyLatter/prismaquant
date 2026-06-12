@@ -32,8 +32,11 @@ requires); memory-safe (one autograd graph at a time, watchdog-gated).
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
 import os
 import pickle
+import subprocess
 import time
 from pathlib import Path
 from typing import Sequence
@@ -45,6 +48,18 @@ import prismaquant.format_registry as fr
 from prismaquant.kl_fisher import fisher_probe_scalar
 
 SCHEMA = "prismaquant.aura_cost.v1"
+
+
+def _git_commit() -> str | None:
+    """Best-effort commit of the prismaquant tree this cost was computed by."""
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or None
+    except Exception:
+        return None
 
 # Passthrough formats -> zero predicted_dloss. This is the *passthrough rule*
 # (see allocator_candidates.PASSTHROUGH_SOURCE_REQUIREMENTS): zero cost is
@@ -118,13 +133,17 @@ def _delta_w(
     cache: object | None,
     *,
     strict: bool = False,
-) -> torch.Tensor | None:
-    """Q_f(W)-W: production-rendered error if the cache has it, else RTN.
+) -> tuple[torch.Tensor, str] | None:
+    """Q_f(W)-W plus its provenance: ``(delta, "rendered"|"rtn")``.
 
-    ``strict`` (require_production_cache): when a cache is supplied but lacks the
-    rendered (name, fmt), fail fast with a clear coverage error instead of
-    silently falling back to RTN -- so a 'production-faithful' run cannot quietly
-    mix RTN deltas into the cost. Default off preserves the RTN fallback used by
+    "rendered" = production-rendered error from the cache (the bytes export
+    ships); "rtn" = format-registry RTN fallback. The distinction is recorded
+    per cost row because it is result-changing: RTN-vs-rendered dW moved FP8
+    allocations by +36% served KL (2026-06 A/B). ``strict``
+    (require_production_cache): when a cache is supplied but lacks the rendered
+    (name, fmt), fail fast with a clear coverage error instead of silently
+    falling back to RTN -- so a 'production-faithful' run cannot quietly mix
+    RTN deltas into the cost. Default off preserves the RTN fallback used by
     non-production ablations."""
     if cache is not None:
         try:
@@ -132,7 +151,8 @@ def _delta_w(
         except Exception:
             rendered = None
         if rendered is not None:
-            return (rendered.to(weight.device, torch.float32) - weight.float())
+            delta = rendered.to(weight.device, torch.float32) - weight.float()
+            return delta, "rendered"
         if strict:
             raise RuntimeError(
                 f"require_production_cache: production-rendered weight missing "
@@ -143,7 +163,7 @@ def _delta_w(
     if qdq is None:
         return None
     try:
-        return qdq(weight.float()) - weight.float()
+        return qdq(weight.float()) - weight.float(), "rtn"
     except Exception:
         return None
 
@@ -156,6 +176,7 @@ def _auto_n_chunks(
     n_nonzero_fmts: int = 1,
     dw_bytes: int = 2,
     accurate_chunk_bytes: bool = False,
+    hook_harvest: bool = False,
 ) -> int:
     """Pick the number of Linear chunks so peak memory stays under budget.
 
@@ -187,17 +208,26 @@ def _auto_n_chunks(
         return 1
     import math
     numel = sum(linears[n].weight.numel() for n in names)
-    budget = max(free - (min_free_gib + 12.0), 4.0)
-    if not accurate_chunk_bytes:
+    # Headroom: 12 GiB covers a stored autograd graph + slack (the legacy
+    # regime). With hook-harvest the graph is gone (checkpointing) and grads
+    # are freed inside the backward, so the transient is ~one param's fp32
+    # grad + logits buffers — 4 GiB suffices and the budget roughly triples
+    # on a 90%-occupied box.
+    headroom = 4.0 if hook_harvest else 12.0
+    budget = max(free - (min_free_gib + headroom), 4.0)
+    if not accurate_chunk_bytes and not hook_harvest:
         # Legacy path, preserved bit-for-bit: 2 bytes/weight, peak ~ 2*W/G.
         wgib = numel * 2 / (1024 ** 3)
         return max(1, min(math.ceil(2.0 * wgib / budget), len(names)))
     # Accurate: grad/weight footprint follows the model param dtype; dW is one
     # bf16 (``dw_bytes``) delta per nonzero format. Peak over the resident model
-    # per chunk = numel/G * (grad_bytes + n_nonzero_fmts * dw_bytes).
+    # per chunk = numel/G * (grad_bytes + n_nonzero_fmts * dw_bytes); with
+    # hook-harvest the chunk-wide grad term drops out entirely.
     grad_bytes = (
         next(iter(linears.values())).weight.element_size() if linears else 4
     )
+    if hook_harvest:
+        grad_bytes = 0
     per_weight_bytes = grad_bytes + max(1, n_nonzero_fmts) * max(1, dw_bytes)
     peak_gib = numel * per_weight_bytes / (1024 ** 3)
     return max(1, min(math.ceil(peak_gib / budget), len(names)))
@@ -220,6 +250,7 @@ def compute_aura_cost(
     require_production_cache: bool = False,
     dw_dtype: str = "bfloat16",
     include_lm_head: bool = False,
+    hook_harvest: bool = False,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -235,6 +266,32 @@ def compute_aura_cost(
     _dw_torch_dtype = torch.float32 if str(dw_dtype) == "float32" else torch.bfloat16
     device = next(model.parameters()).device
     linears = _target_linears(model, include_lm_head=include_lm_head)
+    if include_lm_head:
+        # Tied-embeddings guard: with tie_word_embeddings the lm_head Parameter
+        # IS the input embedding. The retained probe gradient on the shared
+        # tensor then includes the embedding-path contribution, so the measured
+        # cost prices quantizing BOTH uses -- while export ships only the
+        # quantized lm_head view. That cost is wrong for the decision the
+        # allocator actually makes; fail fast instead of silently mis-costing.
+        embed = None
+        get_embed = getattr(model, "get_input_embeddings", None)
+        if callable(get_embed):
+            try:
+                embed = get_embed()
+            except Exception:
+                embed = None
+        tied = [
+            n for n, mod in linears.items()
+            if "lm_head" in n and embed is not None
+            and mod.weight is embed.weight
+        ]
+        if tied:
+            raise RuntimeError(
+                f"include_lm_head: {tied!r} shares its Parameter with the "
+                f"input embedding (tie_word_embeddings). The probe gradient "
+                f"includes the embedding-path contribution, so this cost would "
+                f"not measure the lm_head-only decision the allocator prices. "
+                f"Drop --include-lm-head for tied models.")
     names = list(linears.keys())
     fmts = [fr.canonical_format_name(f) for f in formats]
     nonzero_fmts = [f for f in fmts if f not in _ZERO_COST_FORMATS]
@@ -260,6 +317,7 @@ def compute_aura_cost(
             n_nonzero_fmts=len(nonzero_fmts),
             dw_bytes=_dw_torch_dtype.itemsize,
             accurate_chunk_bytes=accurate_chunk_bytes,
+            hook_harvest=hook_harvest,
         )
     n_linear_chunks = max(1, min(n_linear_chunks, len(names)))
     _log(f"targets={len(names)} formats={fmts} probes={n_probes} "
@@ -276,6 +334,13 @@ def compute_aura_cost(
     ]
     chunks = [c for c in chunks if c]
     s2: dict[tuple[str, str], float] = {}
+    s4: dict[tuple[str, str], float] = {}  # Σ(x²)² for the per-row stderr
+    # Per-probe x² samples per row. Rows share the same K probes, so their
+    # errors are CORRELATED — any sum of rows (an assignment's predicted KL)
+    # needs the per-probe joint samples for an honest stderr; √Σσ² would
+    # understate it. K floats per row (~256KB for a 500-Linear model).
+    x2_probe: dict[tuple[str, str], list[float]] = {}
+    dw_src: dict[tuple[str, str], str] = {}  # "rendered" | "rtn" per row
     g_trace: dict[str, float] = {}  # KL-Fisher weight-grad energy
     inv = 1.0 / float(n_probes)
 
@@ -287,12 +352,17 @@ def compute_aura_cost(
         with torch.no_grad():
             for f in nonzero_fmts:
                 for n in chunk:
-                    d = _delta_w(n, f, linears[n].weight.data, production_cache,
-                                 strict=require_production_cache)
-                    if d is not None:
+                    res = _delta_w(n, f, linears[n].weight.data,
+                                   production_cache,
+                                   strict=require_production_cache)
+                    if res is not None:
+                        d, src = res
                         dW[(n, f)] = d.to(_dw_torch_dtype)  # dot upcasts to fp32
+                        dw_src[(n, f)] = src
         for key in dW:
             s2.setdefault(key, 0.0)
+            s4.setdefault(key, 0.0)
+            x2_probe.setdefault(key, [])
         for n in chunk:
             g_trace.setdefault(n, 0.0)
         # dW is now materialized for this chunk; the cache's LRU-resident
@@ -321,7 +391,38 @@ def compute_aura_cost(
                  f"dW pairs={len(dW)}; free={_free_gib():.1f}")
 
         # K probe backward passes; one autograd graph alive at a time (fresh
-        # forward per probe). Grads retained for this chunk only.
+        # forward per probe). Two harvest modes:
+        #  * legacy: grads retained for the whole chunk, harvested after
+        #    backward (chunk memory = grads + dW);
+        #  * hook_harvest: post-accumulate-grad hooks project each grad the
+        #    moment it lands and free it inside the backward — chunk memory
+        #    is dW only, so chunks are ~3-4x larger and total backwards
+        #    proportionally fewer. Per-(key,probe) values are identical
+        #    (same reductions, just earlier).
+        hook_handles = []
+        if hook_harvest:
+            def _make_hook(name: str):
+                def _hook(param: torch.Tensor) -> None:
+                    g = param.grad
+                    if g is None:
+                        return
+                    with torch.no_grad():
+                        gf = g.float()
+                        g_trace[name] += float((gf * gf).sum().item())
+                        for f in nonzero_fmts:
+                            key = (name, f)
+                            if key in dW:
+                                x2 = float(
+                                    (gf * dW[key].float()).sum().item()) ** 2
+                                s2[key] += x2
+                                s4[key] += x2 * x2
+                                x2_probe[key].append(x2)
+                    param.grad = None
+                return _hook
+            for n in chunk:
+                hook_handles.append(
+                    linears[n].weight.register_post_accumulate_grad_hook(
+                        _make_hook(n)))
         for k in range(n_probes):
             if _free_gib() < min_free_gib:
                 raise RuntimeError(
@@ -334,24 +435,30 @@ def compute_aura_cost(
                 temperature=temperature, distribution="rademacher",
             )
             probe.backward()
-            with torch.no_grad():
-                for n in chunk:
-                    g = linears[n].weight.grad
-                    if g is None:
-                        continue
-                    gf = g.float()
-                    g_trace[n] += float((gf * gf).sum().item())
-                    for f in nonzero_fmts:
-                        key = (n, f)
-                        if key in dW:
-                            s2[key] += float(
-                                (gf * dW[key].float()).sum().item()) ** 2
-                    linears[n].weight.grad = None
+            if not hook_harvest:
+                with torch.no_grad():
+                    for n in chunk:
+                        g = linears[n].weight.grad
+                        if g is None:
+                            continue
+                        gf = g.float()
+                        g_trace[n] += float((gf * gf).sum().item())
+                        for f in nonzero_fmts:
+                            key = (n, f)
+                            if key in dW:
+                                x2 = float(
+                                    (gf * dW[key].float()).sum().item()) ** 2
+                                s2[key] += x2
+                                s4[key] += x2 * x2
+                                x2_probe[key].append(x2)
+                        linears[n].weight.grad = None
             del logits, probe
             torch.cuda.empty_cache()
             if (k + 1) % 8 == 0:
                 _log(f"  chunk {ci+1}/{len(chunks)} probe {k+1}/{n_probes}; "
                      f"free={_free_gib():.1f}")
+        for h in hook_handles:
+            h.remove()
         # Release this chunk's dW + grad enablement before the next chunk.
         del dW
         for n in chunk:
@@ -390,11 +497,25 @@ def compute_aura_cost(
             key = (n, f)
             if key not in s2:
                 continue  # format illegal / no dW for this Linear
+            # predicted_dloss = 0.5·mean_k(x²); its sampling stderr over the K
+            # probes is 0.5·std(x²)/√K. This is the row's *risk*, free from the
+            # same projections -- it feeds 'are K probes enough' introspection
+            # and the additivity-gate threshold without seed-sweeping.
+            mean_x2 = inv * s2[key]
+            var_x2 = max(inv * s4[key] - mean_x2 * mean_x2, 0.0)
             costs[n][f] = {
-                "predicted_dloss": 0.5 * inv * s2[key],
+                "predicted_dloss": 0.5 * mean_x2,
+                "predicted_dloss_stderr": 0.5 * math.sqrt(var_x2 * inv),
+                # raw per-probe x² samples (predicted_dloss = 0.5·mean of
+                # these). Probe-aligned across rows — the additivity gate sums
+                # them per probe for the exact correlated-sum stderr.
+                "x2_per_probe": x2_probe[key],
+                "dw_source": dw_src[key],
                 "output_mse_measured": False,
                 "cost_source": "aura",
             }
+    n_rendered = sum(1 for v in dw_src.values() if v == "rendered")
+    n_rtn = sum(1 for v in dw_src.values() if v == "rtn")
     return {
         "schema": SCHEMA,
         "n_probes": n_probes,
@@ -402,6 +523,25 @@ def compute_aura_cost(
         "token_scope": token_scope,
         "stats": stats,
         "costs": costs,
+        # Reproducibility provenance (CLAUDE.md §5: an irreproducible number
+        # is quarantined). seed_base is result-changing (allocation is
+        # probe-seed-noisy); the rendered/RTN dW split is result-changing
+        # (+36% served KL at FP8). main() adds model/calib identity on top.
+        "provenance": {
+            "seed_base": int(seed_base),
+            "temperature": float(temperature),
+            "dw_dtype": str(dw_dtype),
+            "measurement_dtype": str(next(model.parameters()).dtype),
+            "include_lm_head": bool(include_lm_head),
+            "n_linear_chunks": int(n_linear_chunks),
+            "calib_shape": list(calib_ids.shape),
+            "calib_sha256": hashlib.sha256(
+                calib_ids.detach().cpu().contiguous().numpy().tobytes()
+            ).hexdigest(),
+            "dw_rendered_rows": n_rendered,
+            "dw_rtn_fallback_rows": n_rtn,
+            "git_commit": _git_commit(),
+        },
     }
 
 
@@ -457,6 +597,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "allocator can choose its format by budget-value rather "
                         "than a hardcoded pin. dW falls back to RTN if the cache "
                         "lacks a rendered lm_head.")
+    p.add_argument("--hook-harvest", action="store_true",
+                   help="Project each gradient onto dW inside the backward "
+                        "(post-accumulate-grad hooks) and free it immediately. "
+                        "Chunk memory becomes dW-only, so chunks grow ~3-4x "
+                        "and total backwards shrink proportionally. Identical "
+                        "per-probe values; pair with --gradient-checkpointing "
+                        "for large fp32 models.")
+    p.add_argument("--gradient-checkpointing", action="store_true",
+                   help="Recompute activations during the probe backward "
+                        "instead of storing the graph. Required for fp32 "
+                        "measurement of ~27B models on the 121GB box: the "
+                        "resident model (~108GB) + a stored 4x256 graph "
+                        "(~10-15GB) OOM-kills between watchdog checks "
+                        "(observed 2026-06-10). ~30% slower; numerically "
+                        "identical recompute in fp32.")
     p.add_argument("--device", default="cuda")
     args = p.parse_args(argv)
 
@@ -490,6 +645,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
         model.to(args.device)
     model.eval()
+    if args.gradient_checkpointing:
+        # transformers gates checkpointing on self.training — in eval() the
+        # checkpointed path is silently bypassed and the full graph is stored
+        # (observed OOM 2026-06-10). train() arms it; that is numerically
+        # identical to eval() ONLY when no dropout/batchnorm is active, so
+        # refuse otherwise instead of silently measuring under noise.
+        for mod_name, mod in model.named_modules():
+            if isinstance(mod, torch.nn.Dropout) and mod.p > 0:
+                raise RuntimeError(
+                    f"--gradient-checkpointing needs train() mode, but "
+                    f"{mod_name} has dropout p={mod.p} — train() would not "
+                    f"be eval-equivalent on this architecture.")
+            if isinstance(mod, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d,
+                                torch.nn.BatchNorm3d)):
+                raise RuntimeError(
+                    f"--gradient-checkpointing needs train() mode, but "
+                    f"{mod_name} is BatchNorm — train() would update "
+                    f"running stats.")
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.train()
+        _log("gradient checkpointing ON (non-reentrant, train-mode armed, "
+             "no active dropout/batchnorm)")
     calib = load_wikitext_calibration_windowed(
         tok, args.n_calib_samples, args.calib_seqlen, split=args.calib_split,
     ).to(args.device)
@@ -511,13 +689,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_production_cache=args.require_production_cache,
         dw_dtype=args.dw_dtype,
         include_lm_head=args.include_lm_head,
+        hook_harvest=args.hook_harvest,
     )
+    payload["provenance"].update({
+        "model": str(args.model),
+        "calib_source": f"wikitext:{args.calib_split}",
+        "n_calib_samples": int(args.n_calib_samples),
+        "calib_seqlen": int(args.calib_seqlen),
+        "production_cache": str(args.production_cache or ""),
+    })
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:
         pickle.dump(payload, fh)
     nz = sum(1 for n in payload["costs"] for f in payload["costs"][n]
              if payload["costs"][n][f].get("predicted_dloss", 0.0) > 0)
-    _log(f"wrote {args.output}: {len(payload['costs'])} Linears, {nz} non-zero cost entries")
+    prov = payload["provenance"]
+    _log(f"wrote {args.output}: {len(payload['costs'])} Linears, {nz} non-zero "
+         f"cost entries (dW rendered={prov['dw_rendered_rows']} "
+         f"rtn={prov['dw_rtn_fallback_rows']}, seed_base={prov['seed_base']})")
     return 0
 
 
