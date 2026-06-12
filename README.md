@@ -45,7 +45,7 @@ Mean Δ vs BF16: **−0.56 pp** for PrismaQuant, **−2.21 pp** for uniform NVFP
 ```bash
 export MODEL_PATH=/path/to/Qwen3.6-35B-A3B
 export WORK_DIR=./dq-runs/qwen36
-export FORMATS=NVFP4,MXFP8_E4M3,BF16
+export FORMATS=NVFP4,FP8_DYNAMIC,BF16
 export TARGET_BITS=4.75
 
 ./prismaquant/run-pipeline.sh
@@ -146,7 +146,7 @@ Hardware support:
 | MXFP8 / FP8  | ✓ (CUTLASS)        | ✓          | ✓                  |
 | INT4 / INT8  | all NV             | all NV     | ✓ (Marlin)         |
 
-Recommended bundle for shipping today: `--formats NVFP4,MXFP8_E4M3,BF16`. The allocator is constraint-aware: it never picks a format vLLM can't serve.
+Recommended bundle for shipping today: `--formats NVFP4,FP8_DYNAMIC,BF16`. The allocator is constraint-aware: it never picks a format vLLM can't serve.
 
 ---
 
