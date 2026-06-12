@@ -2303,8 +2303,8 @@ def run_streaming_multimodal_visual_probe_pass(
 
     from .layer_streaming import (
         _call_layer,
+        _compute_attention_mask,
         _compute_position_embeddings,
-        _make_causal_mask,
     )
     from .streaming_model import _build_streaming_context
 
@@ -2504,7 +2504,8 @@ def run_streaming_multimodal_visual_probe_pass(
             # Save per-layer CPU activations for the reverse sweep.
             T = inputs_embeds.size(1)
             position_ids = torch.arange(T, device=device).unsqueeze(0)
-            causal_mask = _make_causal_mask(T, device, dtype)
+            causal_mask = _compute_attention_mask(
+                base_model, inputs_embeds, position_ids)
             position_embeddings = _compute_position_embeddings(
                 base_model, inputs_embeds, position_ids)
 

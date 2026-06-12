@@ -9,9 +9,11 @@ the single-rope non-regression — without any transformers modeling dependency.
 """
 import torch
 import torch.nn as nn
+from transformers import PreTrainedConfig
 
 from prismaquant.layer_streaming import (
     _call_layer,
+    _compute_attention_mask,
     _compute_position_embeddings,
 )
 
@@ -43,9 +45,10 @@ class _MultiRotaryNoLayerKwarg(nn.Module):
 
 
 class _Base(nn.Module):
-    def __init__(self, rotary):
+    def __init__(self, rotary, config=None):
         super().__init__()
         self.rotary_emb = rotary
+        self.config = config
 
 
 class _Layer(nn.Module):
@@ -56,9 +59,11 @@ class _Layer(nn.Module):
             self.self_attn = nn.Module()
             self.self_attn.layer_type = layer_type
         self.received = None
+        self.received_mask = None
 
     def forward(self, *, hidden_states, position_embeddings, **kw):
         self.received = position_embeddings
+        self.received_mask = kw.get("attention_mask")
         return hidden_states
 
 
@@ -81,6 +86,26 @@ def test_multilayer_without_layer_kwarg_falls_back():
     pe = _compute_position_embeddings(_Base(_MultiRotaryNoLayerKwarg()), torch.zeros(1), torch.zeros(1))
     assert isinstance(pe, dict)
     assert all(float(v[0][0]) == 7.0 for v in pe.values())
+
+
+# --- _compute_attention_mask -----------------------------------------------
+def test_multilayer_sliding_attention_builds_per_type_masks():
+    cfg = PreTrainedConfig()
+    cfg.is_causal = True
+    cfg.layer_types = ["sliding_attention", "full_attention"]
+    cfg.sliding_window = 2
+    cfg._attn_implementation = "eager"
+    base = _Base(_SingleRotary(), config=cfg)
+    hidden = torch.zeros(1, 4, 8)
+    position_ids = torch.arange(4).unsqueeze(0)
+
+    masks = _compute_attention_mask(base, hidden, position_ids)
+
+    assert set(masks) == {"sliding_attention", "full_attention"}
+    assert masks["full_attention"].shape == (1, 1, 4, 4)
+    assert masks["sliding_attention"].shape == (1, 1, 4, 4)
+    assert float(masks["full_attention"][0, 0, 3, 0]) == 0.0
+    assert float(masks["sliding_attention"][0, 0, 3, 0]) < -1e20
 
 
 # --- _call_layer selection -------------------------------------------------
@@ -107,3 +132,24 @@ def test_call_layer_dict_unknown_type_falls_back():
     _call_layer(layer, torch.zeros(1), position_embeddings=pe,
                 attention_mask=None, position_ids=None)
     assert layer.received == ("x", "x")  # falls back to an entry, no crash
+
+
+def test_call_layer_selects_attention_mask_by_layer_type():
+    masks = {"sliding_attention": "sliding", "full_attention": "full"}
+    for lt, expect in (("sliding_attention", "sliding"), ("full_attention", "full")):
+        layer = _Layer(layer_type=lt)
+        _call_layer(layer, torch.zeros(1), position_embeddings=None,
+                    attention_mask=masks, position_ids=None)
+        assert layer.received_mask == expect
+
+
+def test_call_layer_rejects_unknown_attention_mask_type():
+    layer = _Layer(layer_type="missing")
+    try:
+        _call_layer(layer, torch.zeros(1), position_embeddings=None,
+                    attention_mask={"full_attention": "mask"},
+                    position_ids=None)
+    except RuntimeError as exc:
+        assert "per-layer attention mask" in str(exc)
+    else:  # pragma: no cover - assert path keeps compatibility without pytest.raises
+        raise AssertionError("unknown layer_type accepted for attention mask")

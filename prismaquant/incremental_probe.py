@@ -61,9 +61,9 @@ import torch.nn.functional as F
 
 from .layer_streaming import (
     _call_layer,
+    _compute_attention_mask,
     _compute_position_embeddings,
     _get_final_norm,
-    _make_causal_mask,
 )
 from .sensitivity_probe import (
     FisherAccumulator,
@@ -1127,7 +1127,6 @@ def _compute_global_precompute(
     batch_size = calib.size(0)
     ids = calib.to(device)
     position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
-    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
 
     prefetch_depth = prefetch_lookahead
 
@@ -1145,6 +1144,7 @@ def _compute_global_precompute(
         hidden = base_model.embed_tokens(ids).to(dtype)
     position_embeddings = _compute_position_embeddings(
         base_model, hidden, position_ids)
+    causal_mask = _compute_attention_mask(base_model, hidden, position_ids)
 
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
 
@@ -1591,7 +1591,6 @@ def _run_body_streaming_shard(
     batch_size = calib.size(0)
 
     position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
-    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
 
     prefetch_depth = prefetch_lookahead
 
@@ -1606,6 +1605,7 @@ def _run_body_streaming_shard(
         embed0 = activations_cpu[0].to(device).to(dtype)
         position_embeddings = _compute_position_embeddings(
             base_model, embed0, position_ids)
+        causal_mask = _compute_attention_mask(base_model, embed0, position_ids)
         del embed0
     print(f"[incremental] shard reuses global precompute "
           f"N={batch_size} T={tokens_in_sample} "
