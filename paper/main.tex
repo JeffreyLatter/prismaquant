@@ -568,8 +568,10 @@ and, if anything, strengthens: $\mathbf{-39.4\%}$ confident-KL at 4B
 (\textsc{Aura} $0.245$ vs.\ $0.405$; $-37.7\%$ all-position) and
 $\mathbf{-33.5\%}$ at 27B (\textsc{Aura} $0.0344$ vs.\ $0.0517$; $-22.1\%$
 all-position). The 27B confident-KL gap is therefore $-17$ to $-34\%$ across
-three disjoint held-out corpora --- always substantial, always favouring
-\textsc{Aura}. (Caveat for our own tooling: a resident HF W4A4 \emph{emulation}
+two disjoint held-out corpora, with the $-33.5\%$ point a second WikiText-test
+measurement window rather than an independent third corpus --- always
+substantial, always favouring \textsc{Aura}. (Caveat for our own tooling: a
+resident HF W4A4 \emph{emulation}
 of the same allocations badly under-counts the baseline's penalty at 4B versus
 the vLLM CUTLASS kernel; the served numbers here are the authority.)
 
@@ -619,7 +621,7 @@ held-out corpus & \textsc{Aura} & Fisher$\times$MSE & $\Delta$ (conf.) \\
 small (798 conf.\ pos.)            & $0.02646$ & $0.03193$ & $-17.1\%$ \\
 WikiText-test (4393 conf.\ pos.)   & $0.05594$ & $0.06815$ & $-17.9\%$ \\
 \midrule
-\multicolumn{4}{l}{\emph{all-position} KL (WikiText-test): $0.03575$ vs $0.04094$, $-12.7\%$; top-1 $+0.57$pp}\\
+\multicolumn{4}{l}{\emph{all-position} KL (WikiText-test): $0.06969$ vs $0.07899$, $-11.8\%$; top-1 $+0.57$pp}\\
 \bottomrule
 \end{tabular}
 \end{table}
