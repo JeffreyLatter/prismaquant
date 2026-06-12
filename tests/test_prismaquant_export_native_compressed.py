@@ -1607,6 +1607,90 @@ class TestBuildQuantizationConfig(unittest.TestCase):
                 profile=profile,
             )
 
+    def test_fp8_source_overlay_keeps_config_matched_to_emitted_bytes(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.o_proj": "BF16",
+        }
+        bf16_passthrough = {
+            "model.layers.0.self_attn.o_proj",
+            "lm_head",
+        }
+        fp8_map = {
+            "model.layers.0.self_attn.o_proj": ("shard0", "o.scale"),
+            "model.layers.0.mlp.down_proj": ("shard0", "down.scale"),
+        }
+        source_dtypes = {
+            "model.layers.0.self_attn.o_proj.weight": torch.float8_e4m3fn,
+            "model.layers.0.mlp.down_proj.weight": torch.float8_e4m3fn,
+        }
+
+        with (
+            patch.object(enc, "_build_fp8_source_map", return_value=fp8_map),
+            patch(
+                "prismaquant.layer_streaming._build_weight_map",
+                return_value=({}, {}),
+            ),
+            patch.object(enc, "_build_source_dtype_map", return_value=source_dtypes),
+        ):
+            config_assignment, config_bf16, overrides = (
+                enc._fp8_source_config_overlay(
+                    "/model",
+                    assignment,
+                    bf16_passthrough,
+                    profile,
+                )
+            )
+
+        self.assertEqual(
+            config_assignment["model.layers.0.self_attn.o_proj"],
+            "FP8_SOURCE",
+        )
+        self.assertEqual(
+            config_assignment["model.layers.0.mlp.down_proj"],
+            "FP8_SOURCE",
+        )
+        self.assertEqual(
+            overrides,
+            {
+                "model.layers.0.self_attn.o_proj",
+                "model.layers.0.mlp.down_proj",
+            },
+        )
+        self.assertNotIn("model.layers.0.self_attn.o_proj", config_bf16)
+        self.assertIn("lm_head", config_bf16)
+
+        source_iter = [
+            ("model.layers.0.self_attn.o_proj.weight", [128, 128]),
+            ("model.layers.0.mlp.down_proj.weight", [128, 128]),
+        ]
+        self.assertEqual(
+            compute_extra_ignore(source_iter, config_assignment, profile),
+            [],
+        )
+        qc = build_quantization_config(
+            config_assignment,
+            config_bf16,
+            profile=profile,
+        )
+        targets = {
+            target
+            for group in qc["config_groups"].values()
+            for target in group["targets"]
+        }
+        self.assertIn(
+            "re:^language_model[.]model[.]layers[.]0[.]self_attn[.]o_proj$",
+            targets,
+        )
+        self.assertIn(
+            "re:^language_model[.]model[.]layers[.]0[.]mlp[.]down_proj$",
+            targets,
+        )
+        self.assertNotIn(
+            "language_model.model.layers.0.self_attn.o_proj",
+            qc["ignore"],
+        )
+
     def test_no_class_name_catchall_target(self):
         # The class-name catch-all "Linear" short-circuits vLLM's
         # fused-layer match path and was the bug that produced wrong

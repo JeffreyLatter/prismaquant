@@ -4545,7 +4545,7 @@ def _passthrough_tensor(
 
 
 def _build_fp8_source_map(
-    model_path: str, *, multimodal: bool = False,
+    model_path: str, *, profile=None, multimodal: bool = False,
 ) -> dict[str, tuple[str, str]]:
     """Scan the source safetensors index for native-FP8 block-scaled
     Linears and return `{live_base_name: (shard_path, ckpt_scale_inv_key)}`.
@@ -4568,6 +4568,16 @@ def _build_fp8_source_map(
     case the FP8_SOURCE format is inert (allocator's passthrough-
     integrity filter drops it from every Linear's candidate set).
     """
+    if profile is not None:
+        pairs_fn = getattr(profile, "fp8_scale_pairs", None)
+        if callable(pairs_fn):
+            explicit = pairs_fn(model_path)
+            if explicit is not None:
+                return {
+                    (key[:-7] if key.endswith(".weight") else key): value
+                    for key, value in explicit.items()
+                }
+
     idx_path = os.path.join(model_path, "model.safetensors.index.json")
     if not os.path.exists(idx_path):
         single = os.path.join(model_path, "model.safetensors")
@@ -4580,7 +4590,26 @@ def _build_fp8_source_map(
         with open(idx_path) as f:
             raw = json.load(f)["weight_map"]
 
-    def _rename(k: str) -> str | None:
+    def _rename_weight(k: str) -> str | None:
+        weight_key = f"{k}.weight"
+        if profile is not None:
+            mapper = getattr(profile, "checkpoint_to_live_name", None)
+            if callable(mapper):
+                try:
+                    live_weight = mapper(weight_key, multimodal=multimodal)
+                except TypeError:
+                    live_weight = mapper(weight_key)
+                except Exception:
+                    live_weight = None
+                if live_weight is None:
+                    return None
+                live_weight = str(live_weight)
+                return (
+                    live_weight[:-7]
+                    if live_weight.endswith(".weight")
+                    else live_weight
+                )
+
         # Mirror `layer_streaming._rename_text_only`, but WITHOUT the
         # `.weight_scale_inv` drop — we need those keys preserved.
         if not multimodal:
@@ -4606,7 +4635,7 @@ def _build_fp8_source_map(
         for suffix in (".weight_scale_inv", ".weight"):
             if ck_key.endswith(suffix):
                 ck_base = ck_key[: -len(suffix)]
-                live_base = _rename(ck_base)
+                live_base = _rename_weight(ck_base)
                 if live_base is None:
                     break
                 bases.setdefault(live_base, {})[suffix[1:]] = (
@@ -4623,6 +4652,81 @@ def _build_fp8_source_map(
             shard, ckpt_scale_inv_key = kinds["weight_scale_inv"]
             out[live_base] = (shard, ckpt_scale_inv_key)
     return out
+
+
+def _recipe_name_for_live_qname(qname: str, profile) -> str:
+    if profile is None:
+        return qname
+    mapper = getattr(profile, "live_to_recipe_name", None)
+    if not callable(mapper):
+        return qname
+    try:
+        return str(mapper(qname))
+    except Exception:
+        return qname
+
+
+def _fp8_source_passthrough_recipe_keys(
+    fp8_source_map: dict[str, tuple[str, str]],
+    source_dtype_by_name: dict[str, torch.dtype],
+    profile,
+) -> set[str]:
+    """Return recipe keys that can be emitted as source-native FP8 bytes."""
+    out: set[str] = set()
+    for live_base in fp8_source_map:
+        source_weight_key = f"{live_base}.weight"
+        source_weight_dtype = source_dtype_by_name.get(source_weight_key)
+        if source_weight_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            continue
+        out.add(_recipe_name_for_live_qname(live_base, profile))
+    return out
+
+
+def _fp8_source_config_overlay(
+    model_path: str,
+    assignment: dict[str, str],
+    bf16_passthrough: set[str],
+    profile,
+) -> tuple[dict[str, str], set[str], set[str]]:
+    """Mirror streaming materialization's FP8_SOURCE passthrough in config.
+
+    Native-FP8 checkpoints load source weights as dequanted BF16 for render
+    work, but BF16/unassigned source-FP8 Linears are emitted by copying the
+    original FP8 bytes and scale sidecars. The compressed-tensors config must
+    describe those emitted bytes as FP8_SOURCE instead of putting the same
+    names in ignore.
+    """
+    fp8_source_map = _build_fp8_source_map(model_path, profile=profile)
+    if not fp8_source_map:
+        return dict(assignment), set(bf16_passthrough), set()
+
+    from .layer_streaming import _build_weight_map
+
+    weight_shard, weight_ckpt = _build_weight_map(model_path)
+    source_dtype_by_name = _build_source_dtype_map(weight_shard, weight_ckpt)
+    source_recipe_keys = _fp8_source_passthrough_recipe_keys(
+        fp8_source_map,
+        source_dtype_by_name,
+        profile,
+    )
+    if not source_recipe_keys:
+        return dict(assignment), set(bf16_passthrough), set()
+
+    config_assignment = dict(assignment)
+    overrides: set[str] = set()
+    for recipe_key in sorted(source_recipe_keys):
+        recipe_fmt = config_assignment.get(recipe_key)
+        fmt = (
+            _canonical_export_format(recipe_fmt)
+            if recipe_fmt is not None
+            else None
+        )
+        if fmt is None or fmt == "BF16" or recipe_key in bf16_passthrough:
+            config_assignment[recipe_key] = "FP8_SOURCE"
+            overrides.add(recipe_key)
+
+    config_bf16_passthrough = set(bf16_passthrough) - overrides
+    return config_assignment, config_bf16_passthrough, overrides
 
 
 def materialize_tensors_streaming(
@@ -4718,7 +4822,7 @@ def materialize_tensors_streaming(
     # `.weight` suffix), used by the `fmt == 'FP8_SOURCE'` emit branch
     # to copy source fp8 + scale_inv bytes verbatim into the output.
     # Distinct key format from the loader-side dequant map above.
-    fp8_source_map = _build_fp8_source_map(model_path)
+    fp8_source_map = _build_fp8_source_map(model_path, profile=profile)
     if fp8_source_map:
         print(f"[export-stream] fp8 source-emit map: {len(fp8_source_map)} "
               f"Linears available for FP8_SOURCE passthrough", flush=True)
@@ -6996,9 +7100,23 @@ def main():
         if args.ignore is not None
         else profile.pinned_names()
     )
+    config_assignment, config_bf16_passthrough, fp8_source_overrides = (
+        _fp8_source_config_overlay(
+            args.model,
+            assignment,
+            bf16_passthrough,
+            profile,
+        )
+    )
+    if fp8_source_overrides:
+        print(
+            "[export-stream] config FP8_SOURCE passthrough overrides: "
+            f"{len(fp8_source_overrides)} source-FP8 Linears",
+            flush=True,
+        )
     _preflight_quantization_config(
-        assignment,
-        bf16_passthrough,
+        config_assignment,
+        config_bf16_passthrough,
         profile=profile,
     )
     print("[export-stream] quantization-config preflight passed", flush=True)
@@ -7118,12 +7236,16 @@ def main():
                         shape = None
                     yield k, shape
 
-    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment, profile)
+    extra_ignore = compute_extra_ignore(
+        _source_shape_iter(),
+        config_assignment,
+        profile,
+    )
     print(f"[export-stream] extra ignore (unmapped Linears): "
           f"{len(extra_ignore)}", flush=True)
 
     write_config_with_quantization(
-        args.model, out_dir, assignment, bf16_passthrough,
+        args.model, out_dir, config_assignment, config_bf16_passthrough,
         extra_ignore=extra_ignore,
         transform_config=None)
     _copy_tokenizer(args.model, out_dir)
@@ -7133,20 +7255,22 @@ def main():
             "source_model": args.model,
             "source_recipe": args.layer_config,
             "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
-            "n_assignment_entries": len(assignment),
+            "n_assignment_entries": len(config_assignment),
+            "source_assignment_entries": len(assignment),
+            "fp8_source_passthrough_overrides": sorted(fp8_source_overrides),
             "runtime_coercions": [
                 {"name": name, "shape": shape, "from": from_fmt, "to": "BF16"}
                 for name, shape, from_fmt in runtime_coerced
             ],
             "bf16_audit": _bf16_upgrade_audit(
                 args.model,
-                assignment,
-                bf16_passthrough,
+                config_assignment,
+                config_bf16_passthrough,
                 runtime_coerced,
                 profile,
             ),
             "packed_expert_export": _packed_expert_export_provenance(),
-            "ignore": sorted(bf16_passthrough),
+            "ignore": sorted(config_bf16_passthrough),
         }, f, indent=2)
 
     # v25: clear the per-layer cache on successful export. --keep-export-cache
