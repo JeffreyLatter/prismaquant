@@ -536,11 +536,22 @@ V0+V1 → default only after V2–V3 and a second model/shape.
    arbitrary β in the proportional regime (Patil et al. 2021, Hastie et al.
    2022); matched the true grid argmin in all 6 referee worlds including
    both divergence corners. Remaining known gaps: the ~×0.5 shrinking-set
-   correction, ε²-weighted column aggregation, near-iid rows. Real-data
-   gate (V0d′): GCV-damp vs the 31 measured held-out GPTQ basins.
-   Production note: the referee predicts fixed-0.3 ≈ ×1.02 geomean there —
-   the closed form's value is regime portability (experts, other calib
-   budgets), not beating the constant on dense.
+   correction, ε²-weighted column aggregation, near-iid rows.
+   **V0d′ RESULT (2026-06-12): REFUTED on real data.** Against the 31
+   measured held-out basins, leave-column-out GCV collapses to the grid
+   floor on 31/31 Linears (damp ≈ 1e-4): geomean regret ×1.59 (worst
+   ×1.96) vs fixed-0.3 ×1.026 / fixed-1.0 ×1.016
+   (`dq-runs/damp-collapse-4b/v0d_gcv_results.json`). The referee's
+   synthetic Gaussian worlds missed the failure; prime suspect is GCV's
+   i.i.d.-rows assumption — calibration tokens within a window are
+   strongly dependent, so the dof correction over-counts evidence and
+   under-damps: the same n_eff disease as the rest of this arc. Successor
+   when revisited: leave-WINDOW-out (block) CV — real refits, not closed
+   form. **Status: two principled closed forms (split-half D-W, LOO-column
+   GCV) refuted on real data. Production = fixed constant, hard-coded
+   2026-06-12 per Robert; the seed-44 tiebreak moved it to damp 1.0
+   (wins KL 3/3 draws + PPL 2/3 vs 0.3). 'Derive it from the weights'
+   remains open.**
 
 ---
 
