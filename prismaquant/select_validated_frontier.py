@@ -154,18 +154,12 @@ def _row_metric(row: Mapping, metric: str) -> float | None:
     return None
 
 
-def measured_frontier(
+def measured_rows(
     results: Sequence[Mapping],
     *,
     metric: str = "kl",
-    kl_noise_floor: float = 0.0,
 ) -> list[dict]:
-    """Return non-dominated measured KL/bpp points sorted by bpp.
-
-    A point is dominated when a lower-or-equal bpp assignment already has
-    lower-or-equal KL. Kneedle should operate on this measured lower envelope,
-    not on noisy interior points.
-    """
+    """Return finite measured KL/bpp rows sorted by bpp."""
     rows: list[dict] = []
     for row in results:
         kl = _row_metric(row, metric)
@@ -201,6 +195,22 @@ def measured_frontier(
             "kl_ucb": row.get("kl_ucb", row.get("validation_kl_ucb")),
         })
     rows.sort(key=lambda r: (r["bpp"], r["kl"], r["label"]))
+    return rows
+
+
+def measured_frontier(
+    results: Sequence[Mapping],
+    *,
+    metric: str = "kl",
+    kl_noise_floor: float = 0.0,
+) -> list[dict]:
+    """Return non-dominated measured KL/bpp points sorted by bpp.
+
+    A point is dominated when a lower-or-equal bpp assignment already has
+    lower-or-equal KL. Kneedle should operate on this measured lower envelope,
+    not on noisy interior points.
+    """
+    rows = measured_rows(results, metric=metric)
     frontier: list[dict] = []
     best_kl = float("inf")
     floor = max(float(kl_noise_floor), 0.0)
@@ -276,7 +286,7 @@ def spearman_rank_correlation(rows: Sequence[Mapping]) -> float | None:
 
 
 def worst_rank_inversion(rows: Sequence[Mapping]) -> dict | None:
-    """Surface the single most-misranked pair of frontier points.
+    """Surface the single most-misranked pair of measured rows.
 
     Uses the same (surrogate_loss, kl) pairing as ``spearman_rank_correlation``
     so the two agree on which rows count. Returns the pair whose surrogate-rank
@@ -528,8 +538,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.mode == "kneedle"
         else {"enabled": False, "reason": "mode_not_kneedle"}
     )
-    rank_corr = spearman_rank_correlation(frontier)
-    worst_inversion = worst_rank_inversion(frontier)
+    diagnostic_rows = measured_rows(results, metric=args.metric)
+    rank_corr = spearman_rank_correlation(diagnostic_rows)
+    worst_inversion = worst_rank_inversion(diagnostic_rows)
     assignment = _load_assignment(selected["path"])
     layer_config = _layer_config_from_assignment(assignment)
 
@@ -623,7 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print(
             "[frontier-select] surrogate-vs-KL fidelity: unavailable "
-            "(need >=3 frontier points carrying predicted_dloss_sum)",
+            "(need >=3 measured points carrying predicted_dloss_sum)",
             flush=True,
         )
     print(f"[frontier-select] layer_config -> {layer_config_path}", flush=True)
