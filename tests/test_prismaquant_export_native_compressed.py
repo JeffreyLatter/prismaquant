@@ -1502,6 +1502,23 @@ class TestVLLMInternalNaming(unittest.TestCase):
 
 
 class TestBuildQuantizationConfig(unittest.TestCase):
+    def test_batched_nvfp4_export_comment_matches_default_on(self):
+        text = Path(enc.__file__).read_text()
+
+        self.assertNotIn("disabled by default while", text)
+        self.assertIn("PRISMAQUANT_BATCHED_NVFP4_EXPORT=0", text)
+
+    def test_build_target_list_documents_sparse_expert_wildcard(self):
+        doc = enc._build_target_list.__doc__ or ""
+
+        self.assertIn("always emit a `[0-9]+`", doc)
+        targets = enc._build_target_list([
+            "model.layers.0.mlp.experts.2.gate_proj",
+        ])
+        self.assertEqual(targets, [
+            "re:^model[.]layers[.]0[.]mlp[.]experts[.][0-9]+[.]gate_proj$",
+        ])
+
     def test_minimal_two_format_assignment(self):
         profile = Qwen3_5Profile()
         # Lots of NVFP4, fewer MXFP8 → NVFP4 becomes the catch-all

@@ -1561,15 +1561,30 @@ def _gptq_columnwise_update(
     return W
 
 
-def _resolve_gptq_fixed_damp(default: float = 0.01) -> float:
+def gptq_damp_sweep_enabled() -> bool:
+    """Whether GPTQ runs the legacy 5-candidate in-sample damp sweep.
+
+    DEFAULT OFF as of 2026-06-12 (Robert: "hard code it for now to your
+    empirical best finding"). The V1 served A/B found the sweep's
+    in-sample evaluator picks inverted winners: fixed damp 0.3 beat the
+    sweep on every gold-lane readout across two calibration draws
+    (all-position KL −6.6/−11.5%, WikiText-test PPL −0.9/−1.4%, tail NLL
+    improved) at ~4.4x less render time (docs/unified_render_theory.md
+    §8 V1). Set PRISMAQUANT_GPTQ_DAMP_SWEEP=1 to reproduce historical
+    sweep-rendered artifacts.
+    """
+    return os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0") != "0"
+
+
+def _resolve_gptq_fixed_damp(default: float = 0.3) -> float:
     """Fixed GPTQ damp used when the damp sweep is disabled.
 
-    ``PRISMAQUANT_GPTQ_DAMP`` overrides the vanilla-GPTQ constant 0.01.
-    Research lever for the unified-render-theory V1 served A/B: held-out
-    Hessian-weighted basins put the per-Linear optimum at damp 0.3-1.0,
-    not 0.01 (docs/unified_render_theory.md §8 V0b/V0c) — but that is
-    local-proxy evidence, so the default stays 0.01 until the served
-    A/B clears. Sweep paths pass explicit candidates and ignore this.
+    Default 0.3 = the V1 served A/B winner (basin-center arm; best PPL
+    and tail across two calibration draws, see gptq_damp_sweep_enabled).
+    ``PRISMAQUANT_GPTQ_DAMP`` overrides (0.01 reproduces vanilla GPTQ).
+    Sweep paths pass explicit candidates and ignore this. Open research:
+    derive the per-Linear optimum from weights/activations alone
+    (leave-column-out GCV, theory doc §9.7).
     """
     raw = os.environ.get("PRISMAQUANT_GPTQ_DAMP", "")
     if not raw:
@@ -3284,9 +3299,10 @@ def _build_target_list(vllm_names: list[str]) -> list[str]:
     Names that aren't per-expert Linears pass through as explicit
     `re:^...$` regexes (same output as before).
 
-    Within a (layer, proj) bucket, if every expert index 0..N-1 is
-    present we emit a `[0-9]+` regex; sparse subsets get an enumerated
-    alternation.
+    Within a (layer, proj) bucket we always emit a `[0-9]+` expert-index
+    wildcard. The exporter relies on the allocator/export coherence gates to
+    keep every expert in a layer on one scheme for a given projection; sparse
+    within-layer expert subsets are not represented as separate alternations.
     """
     from collections import defaultdict
 
@@ -3754,7 +3770,7 @@ def _quantize_2d(
                 # GPTQ wallclock; ~0.02–0.05 PPL gain on Llama-class.
                 # Default ON (validated on Qwen3-0.6B audit: −0.19 PPL
                 # vs single-damp). PRISMAQUANT_GPTQ_DAMP_SWEEP=0 disables.
-                if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+                if gptq_damp_sweep_enabled():
                     w_work = _gptq_obs_rounding_nvfp4_swept(
                         w_work, acts_work, group_size=16,
                         global_real_override=nvfp4_global_real_override,
@@ -3895,7 +3911,7 @@ def _quantize_2d(
             def _mxfp8_gptq_candidate(
                 use_static_act_order: bool,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+                if gptq_damp_sweep_enabled():
                     return _gptq_obs_rounding_fp8_like_swept(
                         w_work,
                         acts_work,
@@ -3990,7 +4006,7 @@ def _quantize_2d(
         acts_work = acts
         if (gptq_enabled and acts_work is not None
                 and acts_work.shape[-1] == w_work.shape[1]):
-            if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+            if gptq_damp_sweep_enabled():
                 w, ws, dq = _gptq_obs_rounding_fp8_like_swept(
                     w_work,
                     acts_work,
@@ -4050,7 +4066,7 @@ def _quantize_2d(
             def _mxfp4_gptq_candidate(
                 use_static_act_order: bool,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+                if gptq_damp_sweep_enabled():
                     return _gptq_obs_rounding_mxfp4_swept(
                         w_work,
                         acts_work,
@@ -4323,7 +4339,7 @@ def _quantize_2d_nvfp4_group_batched(
     if _ACT_AWARE_FLAGS["gptq"]:
         # Default ON (validated on Qwen3-0.6B audit). =0 to disable.
         damp_sweep_on = (
-            os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0")
+            gptq_damp_sweep_enabled())
         if damp_sweep_on:
             damp_candidates = (0.001, 0.005, 0.01, 0.05, 0.1)
             best_w = None
@@ -5055,7 +5071,7 @@ def materialize_tensors_streaming(
             "PRISMAQUANT_DO_NO_HARM": os.environ.get(
                 "PRISMAQUANT_DO_NO_HARM", "1"),
             "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
-                "PRISMAQUANT_GPTQ_DAMP_SWEEP", "1"),
+                "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
             "PRISMAQUANT_GPTQ_DAMP": os.environ.get(
                 "PRISMAQUANT_GPTQ_DAMP", ""),
             "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
@@ -5181,18 +5197,15 @@ def materialize_tensors_streaming(
             tuple[str, tuple[int, int]],
             list[tuple[str, str, str, nn.Linear]]  # (full, emit_full, recipe_key, mod)
         ] = defaultdict(list)
-        # v23 (opt-in): batch NVFP4 same-shape Linears when act-aware
-        # passes (GPTQ / scale_sweep) are on. Activated by env var
-        # PRISMAQUANT_BATCHED_NVFP4_EXPORT=1 — disabled by default while
-        # the path is being validated against the per-Linear baseline.
-        # When inactive, NVFP4 Linears go through the per-Linear
-        # `_quantize_2d` exactly as before.
+        # Batch same-shape NVFP4 Linears when act-aware passes
+        # (GPTQ / scale_sweep) are on. Default ON; set
+        # PRISMAQUANT_BATCHED_NVFP4_EXPORT=0 to force the slower
+        # per-Linear `_quantize_2d` path for bit-exact A/Bs.
         grouped_nvfp4_batched: dict[
             tuple[int, int],
             list[tuple[str, str, str, nn.Linear]]
         ] = defaultdict(list)
-        # v26: default ON. Set PRISMAQUANT_BATCHED_NVFP4_EXPORT=0 to revert
-        # to per-Linear NVFP4 quantization (slower but provably correct).
+        # v26: default ON.
         _raw_batched = os.environ.get("PRISMAQUANT_BATCHED_NVFP4_EXPORT")
         _batched_env_on = (
             True if _raw_batched is None
