@@ -8,4 +8,9 @@ MAJOR-M7 STALE 0bd5d9c
 MAJOR-M8 FIXED c856a6a
 MAJOR-M9 FIXED c856a6a
 MAJOR-M10 SKIPPED-NEEDS-DESIGN proposal: implement the codex-agreed empirical/hybrid packed-expert AURA cost with additivity gate; c856a6a adds fail-fast/explicit-escape so packed experts are no longer silently omitted.
+MAJOR-M11 SKIPPED-NEEDS-DESIGN proposal: pipeline held-out validation wiring overlaps the queue's critical run-pipeline holdout branch; a92eb7f fixed validator/build seed forwarding, and the critical branch should pass a distinct held-out dataset/split/seed into validated-frontier selection.
+MAJOR-M12 FIXED d9457f1
+MAJOR-M13 FIXED d9457f1
+MAJOR-M14 FIXED d9457f1
+MAJOR-M15 FIXED d9457f1
 MAJOR-M34 FIXED a92eb7f
