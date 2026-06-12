@@ -49,7 +49,7 @@ def _build_H_stack(
     activations_list: list[torch.Tensor],
     in_features: int,
     device: torch.device,
-    damp: float = 0.01,
+    damp: float | None = None,
     clip_threshold: float | None = None,
     clip_rescale: str | None = None,
     row_weights_list: list[torch.Tensor | None] | None = None,
@@ -70,6 +70,12 @@ def _build_H_stack(
     `X.T @ X` itself because per-Linear `X` shapes vary in row count
     (routed-token-count differs per expert).
     """
+    if damp is None:
+        from prismaquant.export_native_compressed import (
+            _resolve_gptq_fixed_damp,
+        )
+        damp = _resolve_gptq_fixed_damp()
+
     E = len(activations_list)
     H_stack = torch.zeros(
         (E, in_features, in_features), dtype=torch.float32, device=device,
@@ -108,7 +114,7 @@ def _build_H_stack(
         )
         H = X.t() @ X
         diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
-        H.diagonal().add_(damp * diag_mean)
+        H.diagonal().add_(float(damp) * diag_mean)
         # Dead columns: zero diagonal (can happen if the activation is
         # all zeros on a particular channel).
         dead = torch.diagonal(H) <= 0
@@ -124,7 +130,7 @@ def gptq_obs_rounding_nvfp4_batched(
     activations_list: list[torch.Tensor],
     *,
     group_size: int = 16,
-    damp: float = 0.01,
+    damp: float | None = None,
     global_real_overrides: torch.Tensor | None = None,
     clip_threshold: float | None = None,
     clip_rescale: str | None = None,
@@ -157,6 +163,12 @@ def gptq_obs_rounding_nvfp4_batched(
       ``[E, out, in]`` float32 stack of dequantized error-propagated
       weights, ready for the standard NVFP4 packer.
     """
+    if damp is None:
+        from prismaquant.export_native_compressed import (
+            _resolve_gptq_fixed_damp,
+        )
+        damp = _resolve_gptq_fixed_damp()
+
     if weights.dim() != 3:
         raise ValueError(f"weights must be [E, out, in]; got {weights.shape}")
     E, out_features, in_features = weights.shape

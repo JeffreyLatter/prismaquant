@@ -3414,6 +3414,11 @@ class TestActivationAwarePasses(unittest.TestCase):
         )
 
     def test_quantize_2d_threads_lift_gptq_flags(self):
+        # These tests verify flag threading through the SWEPT
+        # path, which is env-gated (default off since 2026-06-12).
+        __import__('os').environ['PRISMAQUANT_GPTQ_DAMP_SWEEP'] = '1'
+        self.addCleanup(lambda: __import__('os').environ.pop(
+            'PRISMAQUANT_GPTQ_DAMP_SWEEP', None))
         import os
         import torch
         import prismaquant.export_native_compressed as m
@@ -3451,6 +3456,11 @@ class TestActivationAwarePasses(unittest.TestCase):
         self.assertIs(seen.get("joint_scale_opt"), True)
 
     def test_post_nonlinearity_names_do_not_skip_gptq_or_scale_sweep(self):
+        # These tests verify flag threading through the SWEPT
+        # path, which is env-gated (default off since 2026-06-12).
+        __import__('os').environ['PRISMAQUANT_GPTQ_DAMP_SWEEP'] = '1'
+        self.addCleanup(lambda: __import__('os').environ.pop(
+            'PRISMAQUANT_GPTQ_DAMP_SWEEP', None))
         """GPTQ and scale_sweep are still valid on post-nonlinearity
         readers such as down_proj/o_proj."""
         import os

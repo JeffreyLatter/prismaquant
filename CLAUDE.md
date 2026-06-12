@@ -346,8 +346,14 @@ maps to the `joint_mse` scale rule whose per-group levels default to **{6,4}**
 renders; `four_over_six_mse` is a separate, non-JSO rule — don't conflate the
 three.) JSO subsumed the separate clip solvers (*"clipping is just another way of
 asking what the right scale is, and JSO already answers it"*).
-**`gptq` carries an always-on 5-candidate `damp_sweep`** — essential at scale
-(disabling it is +137.5% KL on 4B).
+**The GPTQ `damp_sweep` is OFF by default since 2026-06-12; fixed damp 0.3.**
+The sweep's evaluator was found in-sample (held-out basins invert 31/31);
+the V1 served A/B had fixed-0.3 beating the sweep on every gold-lane readout
+across two calibration draws at ~4.4× less render time, and the old
+"+137.5% if disabled" claim was a tier-5 hook screen that inverted on the
+gold lane. `PRISMAQUANT_GPTQ_DAMP_SWEEP=1` reproduces historical artifacts;
+`PRISMAQUANT_GPTQ_DAMP` overrides the constant. Open research: derive the
+per-Linear optimum from weights alone (docs/unified_render_theory.md).
 
 **Hardware:** NVIDIA **GB10 / DGX Spark** ("sparky"), Blackwell sm_121, **128 GB
 unified memory** (~121 GB usable serving budget — GPU and host share one physical

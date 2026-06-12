@@ -962,6 +962,13 @@ def _fused_sibling_leaf_mapping_from_profile(profile) -> dict[str, tuple[str, ..
     }
 
 
+def _damp_sweep_enabled() -> bool:
+    # lazy import: production_weight_cache <-> export_native_compressed
+    # are mutually lazy to avoid import cycles
+    from prismaquant.export_native_compressed import gptq_damp_sweep_enabled
+    return gptq_damp_sweep_enabled()
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -1331,7 +1338,7 @@ def _render_nvfp4_progressive_candidate(
         if activations_scaled is None or activations_scaled.numel() == 0:
             return current
         if include_gptq:
-            if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+            if _damp_sweep_enabled():
                 current = enc._gptq_obs_rounding_nvfp4_swept(
                     weight_scaled,
                     activations_scaled,
@@ -1882,7 +1889,7 @@ def render_production_weight(
                 ("gptq",)
             )
             use_damp_sweep = (
-                os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0"
+                _damp_sweep_enabled()
             )
 
             def _gptq_candidate(use_static_act_order: bool) -> _RenderedCandidate:
@@ -2080,7 +2087,7 @@ def fill_production_weight_cache(
     levers.setdefault(
         "gptq_damp_sweep",
         bool(levers.get("gptq", True))
-        and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
+        and _damp_sweep_enabled(),
     )
     if not levers["gptq_damp_sweep"]:
         # Provenance: which fixed damp the no-sweep renders used
