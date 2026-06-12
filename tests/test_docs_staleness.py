@@ -41,3 +41,12 @@ def test_root_readme_architecture_status_matches_in_tree_profiles():
     assert "GLM-4" not in text
     assert "waiting on `transformers` class" not in text
     assert "blocked on transformers" not in text
+
+
+def test_audit_notes_are_not_root_level_and_scratch_is_local_only():
+    assert not (ROOT / "audit_findings.md").exists()
+    assert not (ROOT / "audit_questions.md").exists()
+    assert (ROOT / "docs/audit_findings_2026-05-22.md").exists()
+    assert (ROOT / "docs/audit_questions_2026-05-22.md").exists()
+    assert not (ROOT / "scratch/smoke_graph_memory.py").exists()
+    assert (ROOT / "tools/smoke_graph_memory.py").exists()
