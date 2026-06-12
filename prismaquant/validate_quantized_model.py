@@ -419,6 +419,8 @@ def run_validation(
     min_gen_len: int = DEFAULT_MIN_GEN_LEN,
     min_mtp_accept_p0: float = DEFAULT_MIN_MTP_ACCEPT_P0,
     wait_seconds: float = 900.0,
+    bos_token: str | None = None,
+    add_special_tokens: bool = True,
 ) -> ValidationReport:
     rep = ValidationReport(
         artifact=model_name,
@@ -430,6 +432,8 @@ def run_validation(
             "max_p99_nll": max_p99_nll,
             "min_gen_len": min_gen_len,
             "min_mtp_accept_p0": min_mtp_accept_p0,
+            "bos_token": bos_token,
+            "add_special_tokens": add_special_tokens,
         },
     )
 
@@ -448,6 +452,8 @@ def run_validation(
     rep.checks.append(check_perplexity(
         base_url, model_name,
         max_ppl=max_ppl, max_p99_nll=max_p99_nll, max_mean_nll=max_mean_nll,
+        bos_token=bos_token,
+        add_special_tokens=add_special_tokens,
     ))
     rep.checks.append(check_mtp_acceptance(base_url, min_mtp_accept_p0))
     return rep
@@ -499,6 +505,16 @@ def main() -> int:
     ap.add_argument("--min-gen-len", type=int, default=DEFAULT_MIN_GEN_LEN)
     ap.add_argument("--min-mtp-accept-p0", type=float,
                     default=DEFAULT_MIN_MTP_ACCEPT_P0)
+    ap.add_argument("--bos-token", default=None,
+                    help="Optional literal BOS string to prepend before "
+                         "perplexity prompts for BOS-sensitive tokenizers "
+                         "(for example '<bos>'). When set, the server "
+                         "request disables add_special_tokens to avoid a "
+                         "double BOS.")
+    ap.add_argument("--no-add-special-tokens", dest="add_special_tokens",
+                    action="store_false", default=True,
+                    help="Pass add_special_tokens=false on perplexity "
+                         "requests when --bos-token is not used.")
     ap.add_argument("--wait-seconds", type=float, default=900.0,
                     help="Max time to wait for /health 200 before giving up")
     ap.add_argument("--report", default=None,
@@ -513,6 +529,8 @@ def main() -> int:
         min_gen_len=args.min_gen_len,
         min_mtp_accept_p0=args.min_mtp_accept_p0,
         wait_seconds=args.wait_seconds,
+        bos_token=args.bos_token,
+        add_special_tokens=args.add_special_tokens,
     )
     md = format_report_md(rep)
     print(md)

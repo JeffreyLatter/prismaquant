@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+import prismaquant.validate_quantized_model as vqm
 from prismaquant.validate_quantized_model import (
     check_generation_sanity,
     check_perplexity,
@@ -29,6 +31,7 @@ class _FakeVLLMHandler(BaseHTTPRequestHandler):
     # Class-level state so the test can configure per-test.
     mode: str = "healthy"       # "healthy" | "bimodal" | "broken" | "nan"
     metrics_payload: str = ""
+    requests: list[dict] = []
 
     def log_message(self, *a, **kw):
         pass  # silence
@@ -52,6 +55,7 @@ class _FakeVLLMHandler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n)
         req = json.loads(raw)
+        self.requests.append(req)
         prompt = req.get("prompt", "")
 
         if self.path == "/v1/completions":
@@ -98,6 +102,9 @@ class _FakeVLLMHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def fake_server():
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = ""
+    _FakeVLLMHandler.requests = []
     srv = HTTPServer(("127.0.0.1", 0), _FakeVLLMHandler)
     port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -230,6 +237,27 @@ def test_perplexity_runs_normally_without_spec_decode(fake_server):
     assert r.passed, f"healthy+no-spec-decode should pass: {r.detail}"
 
 
+def test_perplexity_bos_token_disables_server_special_tokens(fake_server):
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = ""
+
+    r = check_perplexity(
+        fake_server,
+        "any",
+        max_ppl=25,
+        max_p99_nll=6,
+        max_mean_nll=3,
+        bos_token="<bos>",
+        add_special_tokens=True,
+    )
+
+    assert r.passed
+    echo_reqs = [req for req in _FakeVLLMHandler.requests if req.get("echo")]
+    assert len(echo_reqs) == len(EVAL_PROMPTS)
+    assert all(req["prompt"].startswith("<bos>") for req in echo_reqs)
+    assert {req["add_special_tokens"] for req in echo_reqs} == {False}
+
+
 def test_perplexity_refuses_even_when_metrics_mostly_empty(fake_server):
     """Just the /metrics endpoint containing a single spec_decode
     counter is enough to suspend the check — don't require non-zero
@@ -262,6 +290,52 @@ def test_end_to_end_healthy_report_no_spec_decode(fake_server):
     # Spec-decode check skipped cleanly
     mtp = next(c for c in rep.checks if c.name == "mtp_acceptance")
     assert mtp.passed and "skipping" in mtp.detail.lower()
+
+
+def test_run_validation_forwards_bos_controls(fake_server):
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = (
+        '# healthy serve without spec-decode\n'
+        'vllm:request_success_total 0.0\n'
+    )
+
+    rep = run_validation(
+        fake_server,
+        "any",
+        wait_seconds=5,
+        bos_token="<bos>",
+        add_special_tokens=True,
+    )
+
+    assert rep.passed
+    assert rep.thresholds["bos_token"] == "<bos>"
+    echo_reqs = [req for req in _FakeVLLMHandler.requests if req.get("echo")]
+    assert echo_reqs
+    assert all(req["prompt"].startswith("<bos>") for req in echo_reqs)
+    assert {req["add_special_tokens"] for req in echo_reqs} == {False}
+
+
+def test_cli_exposes_bos_controls(fake_server, monkeypatch, capsys):
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = (
+        '# healthy serve without spec-decode\n'
+        'vllm:request_success_total 0.0\n'
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "validate_quantized_model",
+        "--base-url", fake_server,
+        "--model-name", "any",
+        "--wait-seconds", "5",
+        "--bos-token", "<bos>",
+        "--no-add-special-tokens",
+    ])
+
+    assert vqm.main() == 0
+    capsys.readouterr()
+    echo_reqs = [req for req in _FakeVLLMHandler.requests if req.get("echo")]
+    assert echo_reqs
+    assert all(req["prompt"].startswith("<bos>") for req in echo_reqs)
+    assert {req["add_special_tokens"] for req in echo_reqs} == {False}
 
 
 def test_end_to_end_spec_decode_forces_perplexity_skip(fake_server):
