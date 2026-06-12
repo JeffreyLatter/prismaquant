@@ -20,4 +20,5 @@ MAJOR-M19 SKIPPED-NEEDS-DESIGN proposal: persist production-cache render artifac
 MAJOR-M20 FIXED 5bf80ac
 MAJOR-M21 FIXED 3fd3dce
 MAJOR-M22 FIXED 3fd3dce
+MAJOR-M23 FIXED 718cfa3
 MAJOR-M34 FIXED a92eb7f
