@@ -33,3 +33,15 @@ MAJOR-M32 STALE a92eb7f
 MAJOR-M33 FIXED 46102e8
 MAJOR-M34 FIXED a92eb7f
 MAJOR-M35 FIXED 4b3f525
+MINOR-M1 FIXED bc50a6c
+MINOR-M2 SKIPPED-NEEDS-DESIGN proposal: replace the sparse-expert GPTQ-vs-RTN gate with a measured cross-domain/min-row policy and fit/eval weighting contract; changing the <20-row in-sample fallback would alter production expert-render semantics.
+MINOR-M3 FIXED bc50a6c
+MINOR-M4 FIXED bc50a6c
+MINOR-M5 FIXED bc50a6c
+MINOR-M6 FIXED bc50a6c
+MINOR-M7 FIXED bc50a6c
+MINOR-M8 FIXED bc50a6c
+MINOR-M9 FIXED bc50a6c
+MINOR-M10 FIXED bc50a6c
+MINOR-M11 FIXED bc50a6c
+MINOR-M12 FIXED bc50a6c
