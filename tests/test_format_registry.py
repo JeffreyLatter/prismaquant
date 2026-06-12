@@ -208,7 +208,8 @@ def test_nvfp4_registry_rtn_matches_export_scale_convention(monkeypatch):
         monkeypatch.setattr(enc, "_NVFP4_SCALE_RULE", previous)
 
 
-def test_nvfp4_rank3_activation_matches_export_scale_convention(monkeypatch):
+def test_nvfp4_rank3_weight_matches_export_scale_convention(monkeypatch):
+    # WEIGHTS follow the export codec (one rendering everywhere).
     import prismaquant.export_native_compressed as enc
 
     previous = enc._NVFP4_SCALE_RULE
@@ -216,7 +217,7 @@ def test_nvfp4_rank3_activation_matches_export_scale_convention(monkeypatch):
     try:
         torch.manual_seed(23)
         x = torch.randn(2, 5, 32, dtype=torch.float32) * 2.0
-        registry = fr.get_format("NVFP4").activation_quantize_dequantize(x)
+        registry = fr.get_format("NVFP4").quantize_dequantize(x)
         export = _rtn_dequant_nvfp4(
             x.reshape(-1, x.shape[-1]),
             group_size=16,
@@ -225,6 +226,30 @@ def test_nvfp4_rank3_activation_matches_export_scale_convention(monkeypatch):
         assert torch.allclose(registry, export, atol=0.0, rtol=0.0)
     finally:
         monkeypatch.setattr(enc, "_NVFP4_SCALE_RULE", previous)
+
+
+def test_nvfp4_activation_emulation_is_batch_independent():
+    # ACTIVATIONS deliberately do NOT use the export codec: its per-tensor
+    # global scale would make the emulation depend on what else is in the
+    # batch, while serve-time activation quant uses a STATIC calibration
+    # global. Per-group dynamic RTN keeps each token's quantization a
+    # function of that token alone.
+    torch.manual_seed(23)
+    a = torch.randn(4, 32, dtype=torch.float32)
+    fmt = fr.get_format("NVFP4")
+    alone = fmt.activation_quantize_dequantize(a)
+    with_outlier = fmt.activation_quantize_dequantize(
+        torch.cat([a, 1000.0 * torch.ones(1, 32)], dim=0))[:4]
+    assert torch.allclose(alone, with_outlier, atol=0.0, rtol=0.0)
+
+
+def test_nvfp4_weight_emulation_pads_narrow_tensors():
+    # cols % 16 != 0 must not crash (zero-pad is exact under max-abs
+    # group scaling); regression for the ada08a8 narrow-tensor break.
+    x = torch.randn(8, 4, dtype=torch.float32)
+    out = fr.get_format("NVFP4").quantize_dequantize(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
 
 
 def test_mxfp8_exported_scales_match_compressed_tensors():
