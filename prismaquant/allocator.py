@@ -123,6 +123,10 @@ from .decision_units import block_id_from_qname
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
+_KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES = 1.0
+_KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION = 0.5
+_RD_LOG_LINEAR_R2_THRESHOLD = 0.99
+
 
 # ---------------------------------------------------------------------------
 # Kneedle knee detection
@@ -171,9 +175,9 @@ def _log_error_tail_start(y: list[float]) -> int:
     if len(logs) < 3:
         return 0
     ymin, ymax = min(logs), max(logs)
-    if ymax - ymin < 1.0:
+    if ymax - ymin < _KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES:
         return 0
-    threshold = 0.5 * (ymin + ymax)
+    threshold = ymin + _KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION * (ymax - ymin)
     idx = next((i for i, v in enumerate(logs) if v <= threshold), 0)
     return min(max(idx, 0), max(len(logs) - 3, 0))
 
@@ -246,6 +250,14 @@ def _pareto_knee_summary(curve: list[dict]) -> dict:
     return {
         "enabled": True,
         "primary": "log_error",
+        "diagnostic_thresholds": {
+            "tail_min_log_span_decades": float(
+                _KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES
+            ),
+            "tail_midpoint_fraction": float(
+                _KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION
+            ),
+        },
         "log_error": _record("log_error", log_idx),
         "global_log_error": _record("global_log_error", global_log_idx),
         "raw_linear": _record("raw_linear", raw_idx),
@@ -261,10 +273,10 @@ def _rd_curve_diagnostic(feasible: list[dict]) -> dict:
     On such a curve the kneedle has no fixed answer — its "knee" moves with the
     axis scaling (the 27B knee swung 7.5 -> 12 bpp across raw/log/golden axes),
     so it is a *diagnostic*, not a ship-point. This fits a least-squares line to
-    log10(Δloss) vs achieved bpp and reports R^2; R^2 >= 0.99 => log-linear =>
-    ``intrinsic_knee=False`` => ship by byte budget (--target-disk-gb) or measured
-    saturation instead of curvature. A genuine sensitivity cliff would kink the
-    line (low R^2) and *then* a knee is meaningful.
+    log10(Δloss) vs achieved bpp and reports R^2. The R^2 cutoff is a
+    diagnostic threshold only, reported into the sidecar payload; it is not a
+    shipping selector. A genuine sensitivity cliff would kink the line (low R^2)
+    and *then* a knee is meaningful.
     """
     pts = [r for r in feasible if float(r.get("predicted_dloss", 0.0)) > 0.0]
     if len(pts) < 3:
@@ -284,21 +296,26 @@ def _rd_curve_diagnostic(feasible: list[dict]) -> dict:
     ss_tot = sum((y - ybar) ** 2 for y in ys)
     ss_res = sum((y - (a * x + b)) ** 2 for x, y in zip(xs, ys))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
-    log_linear = r2 >= 0.99
+    log_linear = r2 >= _RD_LOG_LINEAR_R2_THRESHOLD
     return {
         "available": True,
         "model": "log10(predicted_dloss) = a*bpp + b",
         "slope_decades_per_bit": float(a),
         "intercept": float(b),
         "r2": float(r2),
+        "diagnostic_thresholds": {
+            "log_linear_r2": float(_RD_LOG_LINEAR_R2_THRESHOLD),
+        },
         "log_linear": bool(log_linear),
         "intrinsic_knee": bool(not log_linear),
         "note": (
-            "RD curve is log-linear (R^2>=0.99): no intrinsic knee; the kneedle "
+            f"RD curve is log-linear (R^2>={_RD_LOG_LINEAR_R2_THRESHOLD:g}): "
+            "no intrinsic knee; the kneedle "
             "is axis-dependent. Select ship bpp by byte budget (--target-disk-gb) "
             "or measured saturation, not curvature."
             if log_linear else
-            "RD curve deviates from log-linear (R^2<0.99): a curvature knee may be "
+            f"RD curve deviates from log-linear "
+            f"(R^2<{_RD_LOG_LINEAR_R2_THRESHOLD:g}): a curvature knee may be "
             "meaningful here; still prefer a byte budget when shipping to a card."
         ),
     }

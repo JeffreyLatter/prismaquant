@@ -48,6 +48,10 @@ def test_allocator_pareto_knee_summary_reports_both_modes():
     assert summary["global_log_error"]["achieved_bits"] == pytest.approx(4.851)
     assert summary["raw_linear"]["achieved_bits"] == pytest.approx(4.600)
     assert summary["log_error"]["kneedle_error_source"] == "predicted_dloss"
+    assert summary["diagnostic_thresholds"] == {
+        "tail_min_log_span_decades": 1.0,
+        "tail_midpoint_fraction": 0.5,
+    }
 
 
 def test_allocator_pareto_knee_summary_uses_body_loss_with_auxiliary_costs():
@@ -154,6 +158,7 @@ def test_rd_curve_diagnostic_log_linear_has_no_intrinsic_knee():
     assert rd["log_linear"] is True
     assert rd["intrinsic_knee"] is False
     assert rd["slope_decades_per_bit"] == pytest.approx(-0.3, abs=1e-9)
+    assert rd["diagnostic_thresholds"]["log_linear_r2"] == pytest.approx(0.99)
 
 
 def test_rd_curve_diagnostic_flags_curvature():

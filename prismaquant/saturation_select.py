@@ -21,11 +21,12 @@ bpp is therefore not a curvature to find; it is set by one of two real anchors:
     stopping anchor is the measurement noise floor — you cannot ship a quality
     gain you cannot distinguish from sampling scatter. One knob (z, a
     significance level — not a curvature unit), unit-free, anchored to a real
-    quantity. Cost: O(log n) measurements via bisection over a precomputed bpp
-    grid, instead of a dense sweep. NB: the band is z * combined stderr, so the
-    measured frontier must carry a real per-bpp stderr (calib-repeats >= 4, or
-    a per-position bootstrap); a single-rep stderr of 0 collapses the band so
-    that only the asymptote is within-noise of itself, degenerating B* to the
+    quantity. It scans the candidate grid rather than assuming monotonic noisy
+    measurements; when called from validated-frontier selection the grid has
+    already been measured. NB: the band is z * combined stderr, so the measured
+    frontier must carry a real per-bpp stderr (calib-repeats >= 4, or a
+    per-position bootstrap); a single-rep stderr of 0 collapses the band so that
+    only the asymptote is within-noise of itself, degenerating B* to the
     highest-bpp asymptote (the densest / safest allocation, i.e. ship the most
     bits) — not lowest-bpp.
 
@@ -72,7 +73,7 @@ def find_saturation_bpp(
     z: float = 2.0,
 ) -> dict:
     """Find B* = lowest bpp in `grid` whose distortion is within the noise band
-    of the asymptote (highest bpp), via bisection.
+    of the asymptote (highest bpp).
 
     Args:
       grid: sorted-ascending bpp candidates (allocations precomputed at each).
@@ -81,9 +82,9 @@ def find_saturation_bpp(
       z: significance multiplier on the combined stderr (2.0 ~= 95%).
 
     Returns dict with B* ('bpp'), the measured points, and the decision trace.
-    Monotonicity assumption: distortion is (weakly) decreasing in bpp; the
-    bisection is robust to mild non-monotonic noise because it compares each
-    probe to the asymptote, not to its neighbour.
+    Every grid point is checked against the asymptote band, so marginal
+    non-monotone measurement noise cannot make an early bisection decision hide
+    a lower saturated point.
     """
     g = sorted(grid)
     measured: dict[float, tuple[float, float]] = {}
@@ -95,22 +96,19 @@ def find_saturation_bpp(
         return measured[bpp]
 
     kl_hi, se_hi = m(g[-1])
-    lo_i, hi_i = 0, len(g) - 1          # hi_i is saturated by definition
-    best_i = hi_i
-    while lo_i < hi_i:
-        mid_i = (lo_i + hi_i) // 2
-        kl_m, se_m = m(g[mid_i])
+    best_i: int | None = None
+    for idx, bpp in enumerate(g):
+        kl_m, se_m = m(bpp)
         band = z * math.hypot(se_m, se_hi)
         within = (kl_m - kl_hi) <= band
         trace.append({
-            "bpp": g[mid_i], "kl": kl_m, "se": se_m,
+            "bpp": bpp, "kl": kl_m, "se": se_m,
             "kl_asymptote": kl_hi, "band": band, "within_noise": within,
         })
-        if within:
-            best_i = mid_i
-            hi_i = mid_i
-        else:
-            lo_i = mid_i + 1
+        if within and best_i is None:
+            best_i = idx
+    if best_i is None:
+        best_i = len(g) - 1
     # Slope view between adjacent measured points (transparency / sanity).
     pts = sorted(measured.items())
     slopes = []
