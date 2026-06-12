@@ -2224,7 +2224,11 @@ def main():
                 f"picked over a mismatched source dtype. Sample:\n"
                 f"  {head}\n"
                 "The per-Linear filter should have excluded these — "
-                "investigate fused-sibling / MoE-unity promotion."
+                "investigate fused-sibling / MoE-unity promotion. Note: "
+                "fp16/fp32 sources have NO passthrough format by design "
+                "(fp16→bf16 drops 3 mantissa bits — not lossless); allocate "
+                "a quantized format for them or extend "
+                "PASSTHROUGH_SOURCE_REQUIREMENTS deliberately."
             )
 
     layer_cfg = {}
