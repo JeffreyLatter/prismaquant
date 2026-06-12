@@ -391,14 +391,33 @@ def _activation_quant_assignment(
 def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
     repeats = max(int(args.calib_repeats), 1)
     n_samples = int(args.n_calib_samples)
+    skip = max(int(getattr(args, "calib_skip_first", 0) or 0), 0)
+
+    def _load_jsonl(n: int) -> torch.Tensor:
+        # --calib-skip-first K: drop the first K windows of the deterministic
+        # loader so selection KL is measured on windows DISJOINT from the
+        # probe/cost/render calibration (which consumes windows [0, K)).
+        # load_calibration is prefix-stable at a fixed seed, so [K, K+n) is
+        # token-disjoint from [0, K) by construction. House rule: held-out
+        # split is disjoint from cost generation (review criticals C3/C5).
+        all_ids = load_calibration(
+            tokenizer,
+            args.dataset,
+            n + skip,
+            args.calib_seqlen,
+            calib_seed=int(getattr(args, "calib_seed", 42) or 42),
+        )
+        if all_ids.size(0) < n + skip:
+            raise RuntimeError(
+                f"calibration source yielded {all_ids.size(0)} windows; "
+                f"need {n + skip} (n={n} + skip-first={skip}). Use a larger "
+                "corpus or reduce --calib-skip-first."
+            )
+        return all_ids[skip:]
+
     if repeats == 1:
         if args.dataset:
-            return [load_calibration(
-                tokenizer,
-                args.dataset,
-                n_samples,
-                args.calib_seqlen,
-            )]
+            return [_load_jsonl(n_samples)]
         return [load_wikitext_calibration_windowed(
             tokenizer,
             n_samples,
@@ -407,12 +426,7 @@ def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
             seed=args.calib_seed,
         )]
     if args.dataset:
-        all_ids = load_calibration(
-            tokenizer,
-            args.dataset,
-            n_samples * repeats,
-            args.calib_seqlen,
-        )
+        all_ids = _load_jsonl(n_samples * repeats)
         if all_ids.size(0) < n_samples * repeats:
             raise RuntimeError(
                 f"requested {repeats} calibration repeats of {n_samples} samples, "
@@ -593,6 +607,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calib-split", default="train")
     parser.add_argument("--calib-seed", type=int, default=42)
     parser.add_argument(
+        "--calib-skip-first", type=int, default=0,
+        help="Drop the first K windows of the deterministic calibration "
+        "loader before drawing validation windows. Pass the render "
+        "calibration's NSAMPLES here to make selection KL token-disjoint "
+        "from probe/cost/render calibration (review criticals C3/C5).")
+    parser.add_argument(
         "--calib-repeats",
         type=int,
         default=1,
@@ -748,7 +768,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     dtype = _dtype_from_name(args.dtype)
     staged, cleanup = stage_multimodal(args.model)
-    work_root = Path(args.work_dir or tempfile.mkdtemp(prefix="prismaquant_validate_kl_"))
+    if args.work_dir:
+        work_root = Path(args.work_dir)
+    else:
+        # Never default to /tmp: it is cleared under OOM on this host
+        # (2026-04-23 wiped artifacts mid-run) and this stage keeps live
+        # cache/manifest state for multi-hour frontier measurements.
+        # mkdtemp honors TMPDIR when set; otherwise fall back to a dir
+        # next to the first assignment artifact.
+        fallback = os.environ.get("TMPDIR") or str(
+            Path(args.assignment[0].split("=", 1)[-1]).resolve().parent
+        )
+        work_root = Path(tempfile.mkdtemp(
+            prefix="prismaquant_validate_kl_", dir=fallback))
+    if str(work_root.resolve()).startswith("/tmp"):
+        raise RuntimeError(
+            f"validate_assignments_kl work root {work_root} is under /tmp, "
+            "which is cleared on OOM on this host. Pass --work-dir or set "
+            "TMPDIR to a durable path."
+        )
     work_root.mkdir(parents=True, exist_ok=True)
     remove_work_root = args.work_dir is None
     try:

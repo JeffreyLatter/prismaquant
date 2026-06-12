@@ -3,7 +3,7 @@
 % (a) the format MENU, not the sensitivity distribution, creates the knee
 %     (Qwen3-4B, RTN weight-only measured KL-vs-BF16; memory: fp8-missing-rung).
 % (b) the apparent LINEARITY is a log-KL-axis artifact: the same measured 27B
-%     served-vLLM frontier is convex on linear axes, straight in log-KL.
+%     resident-emulation frontier is convex on linear axes, straight in log-KL.
 % Data are verbatim from /home/rob/dq-runs/{aura-sat-validate-4b,aura-27b-flagship}.
 \begin{figure}[t]
 \centering
@@ -32,13 +32,17 @@
 \begin{axis}[
     width=0.49\textwidth, height=5.0cm,
     xlabel={bits per parameter (body)},
-    ylabel={served KL vs.\ BF16 (linear)},
+    ylabel={resident KL vs.\ BF16 (linear)},
     xmin=4.3, xmax=8.2, ymin=0.024, ymax=0.052,
     title={\small (b) ``linear'' is a log-axis artifact},
     grid=both, grid style={lightgray!40},
     tick label style={font=\scriptsize}, label style={font=\small},
 ]
-% Qwen3.6-27B, served vLLM KL, 2-rung NVFP4+BF16 (the flagship menu): convex on linear axes
+% Qwen3.6-27B, resident W4A4 emulation KL (validate_assignments_kl),
+% 2-rung NVFP4+BF16 (the flagship menu): convex on linear axes.
+% NOT served-vLLM: the frontier sweep was never exported+served; the
+% emulation is a served-faithful screen (recovers ~81% of served KL at
+% 27B) and is labeled as such per the serving-metric house rule.
 \addplot[accent, mark=*, thick] coordinates {
   (4.50,0.0495) (4.85,0.0425) (5.00,0.0441) (5.25,0.0418) (5.50,0.0387)
   (5.75,0.0382) (6.00,0.0365) (6.50,0.0306) (7.00,0.0305) (8.00,0.0264) };
@@ -51,7 +55,10 @@ property of the format \emph{menu}, not of the sensitivity distribution.}
 two-rung $\{$NVFP4,\,BF16$\}$ menu yields a near-linear frontier; adding the
 intermediate-efficiency FP8 rung introduces a cost-per-bit discontinuity that
 bends it into a sharp knee near $8$~bpp ($6\!\times$ lower KL at matched bytes).
-\textbf{(b)} The shipped Qwen3.6-27B served-vLLM frontier (two-rung)
+\textbf{(b)} The shipped Qwen3.6-27B frontier (two-rung), measured with
+the resident W4A4 emulation (a served-faithful screen; the emulation
+recovers $\sim$81\% of served KL at this scale --- see the caveat in
+\S\ref{sec:limits}),
 is genuinely convex on linear axes (chord curvature $24.5\%$; the per-Linear
 cost-per-bit has weighted Gini $0.45$, far from democratic); it only \emph{looks}
 linear when plotted as $\log_{10}\kl$ over the narrow $4.5$--$6.0$~bpp window
