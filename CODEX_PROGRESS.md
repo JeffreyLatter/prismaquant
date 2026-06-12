@@ -57,3 +57,13 @@ MINOR-M21 FIXED 767d000
 MINOR-M22 FIXED bc50a6c
 MINOR-M23 FIXED bc50a6c
 MINOR-M24 FIXED f679d2f
+MINOR-M25 FIXED 2259287
+MINOR-M26 FIXED 0ef119c
+MINOR-M27 FIXED a026db4
+MINOR-M28 FIXED 4549a18
+MINOR-M29 FIXED 4549a18
+MINOR-M30 FIXED f3a1241
+MINOR-M31 FIXED f3a1241
+MINOR-M32 FIXED eee0beb
+MINOR-M33 SKIPPED-NEEDS-DESIGN proposal: model shared-KV as an explicit cross-layer gradient path in the Fisher pass-state contract; a local patch would either undercount silently or retain multi-layer KV graphs and break the isolated GPU-bound streaming design.
+MINOR-M34 FIXED 0ef119c
