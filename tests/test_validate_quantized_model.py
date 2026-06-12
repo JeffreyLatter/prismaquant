@@ -1,7 +1,7 @@
 """Tests for the pre-ship quality validator.
 
 Goal: pin the bimodal-failure detection logic. The 27B shipped with
-mean NLL below threshold but p99 (max per-prompt avg NLL) was ~9 —
+mean NLL below threshold but max per-prompt avg NLL was ~9 —
 threshold catches it.
 
 Uses an inline HTTPServer so we can script fake vLLM responses and
@@ -29,7 +29,7 @@ from prismaquant.validate_quantized_model import (
 
 class _FakeVLLMHandler(BaseHTTPRequestHandler):
     # Class-level state so the test can configure per-test.
-    mode: str = "healthy"       # "healthy" | "bimodal" | "broken" | "nan"
+    mode: str = "healthy"       # "healthy" | "bimodal" | "one_outlier" | ...
     metrics_payload: str = ""
     requests: list[dict] = []
 
@@ -73,6 +73,9 @@ class _FakeVLLMHandler(BaseHTTPRequestHandler):
                     # 2 of every 10 prompts get healthy logprobs, rest broken
                     idx = EVAL_PROMPTS.index(prompt) if prompt in EVAL_PROMPTS else 0
                     per_tok = -1.5 if idx in (3, 7) else -9.5
+                elif self.mode == "one_outlier":
+                    idx = EVAL_PROMPTS.index(prompt) if prompt in EVAL_PROMPTS else 0
+                    per_tok = -20.0 if idx == 0 else -1.5
                 elif self.mode == "broken":
                     per_tok = -12.0
                 else:
@@ -134,13 +137,13 @@ def test_perplexity_catches_uniformly_broken(fake_server):
 
 def test_perplexity_catches_bimodal_broken(fake_server):
     """The 27B failure mode: 2/10 prompts normal, rest catastrophic.
-    Mean NLL can fall under threshold but the p99 (max per-prompt avg NLL)
+    Mean NLL can fall under threshold but the max per-prompt avg NLL
     must flag the bimodality."""
     _FakeVLLMHandler.mode = "bimodal"
     r = check_perplexity(fake_server, "any", max_ppl=1000, max_p99_nll=6,
                          max_mean_nll=100)
     assert not r.passed, (
-        f"bimodal failure must trip p99 even when mean / ppl slack: {r.detail}"
+        f"bimodal failure must trip tail NLL even when mean / ppl slack: {r.detail}"
     )
     assert "bimodal" in r.detail or "p99" in r.detail or "max(per-prompt" in r.detail
 
@@ -152,6 +155,17 @@ def test_perplexity_generous_thresholds_passes_bimodal(fake_server):
     r = check_perplexity(fake_server, "any", max_ppl=1e9, max_p99_nll=100,
                          max_mean_nll=100)
     assert r.passed
+
+
+def test_perplexity_reports_true_p99_and_max_tail_nll(fake_server):
+    _FakeVLLMHandler.mode = "one_outlier"
+    r = check_perplexity(fake_server, "any", max_ppl=1e9, max_p99_nll=100,
+                         max_mean_nll=100)
+
+    assert r.passed
+    assert r.metrics["max_nll_per_tok"] == pytest.approx(20.0)
+    assert r.metrics["p99_nll_per_tok"] < r.metrics["max_nll_per_tok"]
+    assert r.metrics["p99_nll_per_tok"] > r.metrics["mean_nll_per_tok"]
 
 
 # ----------------------------------------------------------------
