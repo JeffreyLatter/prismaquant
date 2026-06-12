@@ -512,12 +512,35 @@ V0+V1 → default only after V2–V3 and a second model/shape.
    flag, don't fix preemptively.
 6. **t̂ estimation noise** per role: needs the gate corpus sized so t̂'s
    stderr ≪ its distance from the s* decision boundary.
-7. **Leave-column-out GCV closed form:** full-design GCV-by-rows is
-   degenerate (V0b). The leave-column-out ridge coefficients come free from
-   the full precision matrix (β̂_j = −[H_λ⁻¹]_{j,−j}/[H_λ⁻¹]_{jj} holds for
-   ridge exactly, by partitioned inverse), but the matching row-held-out
-   dof/GCV denominator per column is unworked. Practical priority is low:
-   V0c shows the basin top is flat — a located constant captures ~98%.
+7. **Closed-form damp — adversarially settled (2026-06-11, workflow
+   wf_80103582; scripts `scratch/ridge_claims_check.py` +
+   `scratch/damp_referee_v0d.py`).** The algebra lens confirmed every
+   identity exactly (β̂_j = −P[j,−j]/P[jj] for ridge by Schur complement —
+   the λ on the (j,j) diagonal cancels in the ratio; held-out residual
+   r_Bj = X_B P[:,j]/P[jj]; ‖r_Bj‖² = [P H_B P]_jj/P[jj]². Landmine for
+   implementers: 1/P_jj ≠ RSS at λ>0 — exactly 1/P_jj = ‖r‖²+λ(1+‖β̂‖²)).
+   The statistics lens **refuted the split-half D-W estimator as designed**:
+   (a) the isotropic prior undershoots λ* by 4–9× on top-aligned activation
+   signal — fails the ≤1.05 bar even with oracle inputs; (b) split-half
+   noise estimates the half-fit's excess risk, not transferable σ² (SNR
+   −36–59%), and the fixed point converges to the inflated optimum or
+   diverges outright at low SNR (82→651 monotone); (c) the n_fit/n_build
+   factor-2 "bug" was masking (a) by cancellation; (d) the shrinking-
+   regressor-set slack (~×0.5 in damp) alone exceeds the validation budget.
+   **The successor is strictly better and cheaper: per-column
+   leave-column-out GCV on the full reservoir** — from one P per grid λ:
+   exact RSS_j = [P H P]_jj/P_jj², exact dof_j = (d−1) − λ[(tr P − P_jj) −
+   (‖P[:,j]‖²−P_jj²)/P_jj], GCV_j = (RSS_j/n)/(1−dof_j/n)², minimize Σ_j
+   GCV_j over a 1-D λ grid (one eigh → O(d²) per grid point). No split, no
+   prior, no fixed point; uniformly consistent for ridge predictive risk at
+   arbitrary β in the proportional regime (Patil et al. 2021, Hastie et al.
+   2022); matched the true grid argmin in all 6 referee worlds including
+   both divergence corners. Remaining known gaps: the ~×0.5 shrinking-set
+   correction, ε²-weighted column aggregation, near-iid rows. Real-data
+   gate (V0d′): GCV-damp vs the 31 measured held-out GPTQ basins.
+   Production note: the referee predicts fixed-0.3 ≈ ×1.02 geomean there —
+   the closed form's value is regime portability (experts, other calib
+   budgets), not beating the constant on dense.
 
 ---
 
