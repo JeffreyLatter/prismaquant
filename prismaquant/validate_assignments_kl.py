@@ -748,7 +748,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     dtype = _dtype_from_name(args.dtype)
     staged, cleanup = stage_multimodal(args.model)
-    work_root = Path(args.work_dir or tempfile.mkdtemp(prefix="prismaquant_validate_kl_"))
+    if args.work_dir:
+        work_root = Path(args.work_dir)
+    else:
+        # Never default to /tmp: it is cleared under OOM on this host
+        # (2026-04-23 wiped artifacts mid-run) and this stage keeps live
+        # cache/manifest state for multi-hour frontier measurements.
+        # mkdtemp honors TMPDIR when set; otherwise fall back to a dir
+        # next to the first assignment artifact.
+        fallback = os.environ.get("TMPDIR") or str(
+            Path(args.assignment[0].split("=", 1)[-1]).resolve().parent
+        )
+        work_root = Path(tempfile.mkdtemp(
+            prefix="prismaquant_validate_kl_", dir=fallback))
+    if str(work_root.resolve()).startswith("/tmp"):
+        raise RuntimeError(
+            f"validate_assignments_kl work root {work_root} is under /tmp, "
+            "which is cleared on OOM on this host. Pass --work-dir or set "
+            "TMPDIR to a durable path."
+        )
     work_root.mkdir(parents=True, exist_ok=True)
     remove_work_root = args.work_dir is None
     try:

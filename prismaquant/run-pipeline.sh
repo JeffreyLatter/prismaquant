@@ -784,6 +784,7 @@ PY
       --n-calib-samples "$VALIDATED_FRONTIER_NSAMPLES" \
       --calib-seqlen "$VALIDATED_FRONTIER_SEQLEN" \
       --calib-repeats "$VALIDATED_FRONTIER_CALIB_REPEATS" \
+      --work-dir "${WORK_DIR}/work/validate_kl" \
       --dtype bf16 \
       --device "$DEVICE" \
       --kl-scope "$VALIDATED_FRONTIER_KL_SCOPE" \
