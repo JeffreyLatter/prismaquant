@@ -71,6 +71,7 @@ def find_saturation_bpp(
     measure_fn: Callable[[float], tuple[float, float]],
     *,
     z: float = 2.0,
+    scan: str = "dense",
 ) -> dict:
     """Find B* = lowest bpp in `grid` whose distortion is within the noise band
     of the asymptote (highest bpp).
@@ -96,8 +97,9 @@ def find_saturation_bpp(
         return measured[bpp]
 
     kl_hi, se_hi = m(g[-1])
-    best_i: int | None = None
-    for idx, bpp in enumerate(g):
+
+    def _check(idx):
+        bpp = g[idx]
         kl_m, se_m = m(bpp)
         band = z * math.hypot(se_m, se_hi)
         within = (kl_m - kl_hi) <= band
@@ -105,9 +107,40 @@ def find_saturation_bpp(
             "bpp": bpp, "kl": kl_m, "se": se_m,
             "kl_asymptote": kl_hi, "band": band, "within_noise": within,
         })
-        if within and best_i is None:
-            best_i = idx
-    if best_i is None:
+        return within
+
+    # scan modes (QC on review-batch): the dense scan is robust to
+    # non-monotone noise but turns the documented O(log n) measurement
+    # contract into O(n) — unacceptable when measure_fn is a LIVE
+    # GPU KL measurement. 'auto' bisects first (O(log n) live calls),
+    # then densifies only the already-measured-free region below the
+    # bisection answer when every grid point is memoized externally.
+    # 'dense' preserves the fully-robust behavior for precomputed grids.
+    if scan not in ("auto", "dense", "bisect"):
+        raise ValueError(f"unknown scan mode {scan!r}")
+    best_i: int | None = None
+    if scan == "dense":
+        for idx in range(len(g)):
+            if _check(idx) and best_i is None:
+                best_i = idx
+    else:
+        lo, hi = 0, len(g) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _check(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        best_i = lo
+        if scan == "auto":
+            # noise-robustness pass at zero extra measurement cost:
+            # re-examine any grid point ALREADY measured during bisection
+            # that sits below the bisection answer and is within the band.
+            for idx in range(best_i):
+                if g[idx] in measured and _check(idx):
+                    best_i = idx
+                    break
+    if best_i is None or not _check(best_i):
         best_i = len(g) - 1
     # Slope view between adjacent measured points (transparency / sanity).
     pts = sorted(measured.items())

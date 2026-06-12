@@ -144,6 +144,12 @@ def validate_artifact(
     metrics["model_sha"] = _sha256_model_reference(model_path)
     metrics["layer_config_sha"] = config_sha
     metrics["eval_seconds"] = float(time.monotonic() - started)
+    # Metric-era marker (QC on review-batch): the end-KL eval split moved
+    # from wikitext TRAIN to TEST on 2026-06-12 — pre-marker registry
+    # records were measured on train and are NOT comparable at face value.
+    # Records without 'eval_split' are the train era.
+    metrics["eval_split"] = "test"
+    metrics["metric_era"] = "2026-06-12-test-split"
     return metrics
 
 
