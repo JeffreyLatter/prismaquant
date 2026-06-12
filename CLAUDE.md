@@ -257,8 +257,9 @@ executor. Stages are file-artifact-coupled and skip-if-exists. `WORK_DIR/`:
 incremental_probe ─► probe.pkl            (per-Linear empirical Fisher H_trace; streaming)
    │
 incremental_measure_quant_cost            (per-(Linear,format) error — L1 baseline)
- OR production_render_cost                (default: derive allocator cost from the SAME
-   │                                        rendered weights export will ship)
+ OR production_render_cost                (default: derive allocator cost from a dedicated
+   │                                        render-score cache; export/validated KL use
+   │                                        their selected-assignment production cache)
 allocator + allocator_solver ─► layer_config.json + pareto*    (knapsack DP + log-error kneedle)
    │                                        (fused-sibling & packed-MoE union-find promotion)
 build_production_cache / production_recache ─► ProductionWeightCache
