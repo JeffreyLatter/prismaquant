@@ -4,6 +4,7 @@ projection whose absent sibling carries no scale — e.g. Gemma4 k_eq_v layers
 synthesize v=k and have no v_proj/v_scale, which KeyErrors on a quantized k).
 """
 from prismaquant.decision_units import incomplete_fused_group_members
+from prismaquant.allocator import incomplete_fused_group_dp_exclusions
 
 
 class _FakeProfile:
@@ -63,3 +64,26 @@ def test_mixed_realistic_set():
 
 def test_no_profile_returns_empty():
     assert incomplete_fused_group_members({A.format(5, "q_proj")}, None) == set()
+
+
+def test_allocator_excludes_incomplete_fused_members_from_dp():
+    q = A.format(5, "q_proj")
+    k = A.format(5, "k_proj")
+    o = A.format(5, "o_proj")
+    gate = M.format(0, "gate_proj")
+    up = M.format(0, "up_proj")
+    stats = {q: {}, k: {}, o: {}, gate: {}, up: {}}
+    costs = {q: {}, k: {}, o: {}, gate: {}, up: {}}
+
+    excluded = set(incomplete_fused_group_dp_exclusions(stats, costs, P))
+    mutable_stats = {name: value for name, value in stats.items()
+                     if name not in excluded}
+    mutable_costs = {name: value for name, value in costs.items()
+                     if name not in excluded}
+
+    assert excluded == {q, k}
+    assert q not in mutable_stats
+    assert k not in mutable_costs
+    assert o in mutable_stats
+    assert gate in mutable_stats
+    assert up in mutable_costs

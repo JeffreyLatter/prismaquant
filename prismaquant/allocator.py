@@ -944,6 +944,25 @@ def validate_default_profile_format_menu(
         )
 
 
+def incomplete_fused_group_dp_exclusions(
+    stats: dict,
+    costs: dict,
+    model_profile,
+    allocation_excluded=(),
+) -> list[str]:
+    """Linears to exclude from DP because their fused group is incomplete.
+
+    Excluding them from the mutable body assignment leaves them absent from
+    ``layer_config``; export then keeps those present-but-incomplete fused
+    siblings as BF16 passthrough instead of producing missing scale tensors.
+    """
+    from .decision_units import incomplete_fused_group_members
+
+    incomplete_members = incomplete_fused_group_members(
+        set(stats) | set(costs), model_profile)
+    return sorted(incomplete_members - set(allocation_excluded))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
@@ -1207,10 +1226,8 @@ def main():
     # v_scale) cannot be partially quantized — the present members must ship
     # BF16, else the fused load KeyErrors on a non-existent scale param.
     # Generic + profile-driven (no model-specific code here).
-    from .decision_units import incomplete_fused_group_members
-    incomplete_members = incomplete_fused_group_members(
-        set(stats) | set(costs), model_profile)
-    incomplete_added = sorted(incomplete_members - set(allocation_excluded))
+    incomplete_added = incomplete_fused_group_dp_exclusions(
+        stats, costs, model_profile, allocation_excluded)
     allocation_excluded.extend(incomplete_added)
     if incomplete_added:
         print(
