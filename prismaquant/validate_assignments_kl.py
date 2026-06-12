@@ -940,6 +940,41 @@ def main(argv: Sequence[str] | None = None) -> int:
             for calib_ids in calib_repeats
         ]
 
+        if production_cache is not None and _strict_production_cache_enabled():
+            # Fail-fast BEFORE any measurement: with the strict default
+            # (M6), a cache missing required renders would otherwise abort
+            # mid-KL after minutes-to-hours. Packed-expert misses are the
+            # known M4 design gap (the frontier cache never renders packed
+            # experts), so name it.
+            for _label, _assignment, _path in assignments:
+                _diag = _production_cache_assignment_diagnostics(
+                    production_cache, _assignment)
+                if _diag and _diag.get("cache_miss_count"):
+                    _sample = _diag.get("missing_sample") or []
+                    from prismaquant.production_weight_cache import (
+                        is_uncached_packed_expert_qname,
+                    )
+                    _expert = [m for m in _sample
+                               if is_uncached_packed_expert_qname(str(m[0]))]
+                    _hint = (
+                        " Missing entries include packed-MoE experts: the "
+                        "validated-surrogate frontier cache does not render "
+                        "packed experts (open design item M4) — this "
+                        "model/mode combination is unsupported until that "
+                        "lands. PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 falls "
+                        "back to RTN for research runs only."
+                        if _expert else
+                        " Rebuild the cache to cover the assignment, or set "
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 (research "
+                        "only — RTN fallback)."
+                    )
+                    raise RuntimeError(
+                        f"[validate-kl] assignment '{_label}' requires "
+                        f"{_diag['cache_miss_count']} production-cache "
+                        f"renders the cache lacks (sample={_sample[:4]})."
+                        + _hint
+                    )
+
         results = []
         for label, assignment, path in assignments:
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
