@@ -126,12 +126,24 @@ def test_call_layer_passes_tuple_unchanged_for_single_rope():
     assert layer.received is pe  # untouched for single-rope models
 
 
-def test_call_layer_dict_unknown_type_falls_back():
+def test_call_layer_single_entry_dict_unknown_type_falls_back():
     pe = {"only": ("x", "x")}
     layer = _Layer(layer_type="missing")  # not in dict
     _call_layer(layer, torch.zeros(1), position_embeddings=pe,
                 attention_mask=None, position_ids=None)
     assert layer.received == ("x", "x")  # falls back to an entry, no crash
+
+
+def test_call_layer_rejects_unknown_multi_rope_type():
+    pe = {"sliding_attention": ("s", "s"), "full_attention": ("f", "f")}
+    layer = _Layer(layer_type="missing")
+    try:
+        _call_layer(layer, torch.zeros(1), position_embeddings=pe,
+                    attention_mask=None, position_ids=None)
+    except RuntimeError as exc:
+        assert "per-layer position_embeddings" in str(exc)
+    else:  # pragma: no cover - assert path keeps compatibility without pytest.raises
+        raise AssertionError("unknown layer_type accepted for multi-rope dict")
 
 
 def test_call_layer_selects_attention_mask_by_layer_type():

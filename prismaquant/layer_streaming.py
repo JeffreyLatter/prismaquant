@@ -1162,10 +1162,13 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
         lt = _layer_attention_type(layer)
         pe = pe.get(lt)
         if pe is None:
-            # Unknown/missing layer_type — fall back to any entry rather than
-            # crash (single-type rope, or a layer that doesn't tag its type).
-            # `None` default guards against an empty dict (StopIteration).
-            pe = next(iter(position_embeddings.values()), None)
+            if len(position_embeddings) == 1:
+                pe = next(iter(position_embeddings.values()))
+            else:
+                raise RuntimeError(
+                    "per-layer position_embeddings requires a known "
+                    f"layer_type; got {lt!r} for {layer.__class__.__name__}"
+                )
     am = attention_mask
     if isinstance(am, dict):
         if lt is None:
