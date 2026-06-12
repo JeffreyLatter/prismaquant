@@ -21,6 +21,7 @@ def test_runtime_flags_doc_covers_live_prismaquant_flags():
     assert not missing
     assert "| `PRODUCTION_RENDER_COST_SCORE_FIELD` | `output_mse` |" in doc
     assert "`joint_mse` is the production JSO scale rule" in doc
+    assert "H_DETAIL_DIR" not in doc
 
 
 def test_package_readme_entrypoints_resolve_to_live_modules():

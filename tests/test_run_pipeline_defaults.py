@@ -20,6 +20,9 @@ def test_production_recache_default_enabled_after_smoke_ladder():
     assert ': "${HADAMARD_DUQUANT' not in script
     assert "HADAMARD_DUQUANT:-" in script
     assert "archive/hdq_2026-05-14" in script
+    assert "H_DETAIL_DIR" not in script
+    assert "LEVER_CACHE_TAG" not in script
+    assert "PROD_H_DETAIL_ARGS" not in script
 
 
 def test_multi_shot_passes_is_archived_and_blocked():

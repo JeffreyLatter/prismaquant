@@ -177,7 +177,6 @@ case ",$PRODUCTION_CACHE_LEVERS," in
     ;;
 esac
 export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
-: "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 : "${SELECTION_MODE:=surrogate}"
 : "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
@@ -234,9 +233,6 @@ case "$COST_MODE" in
     ;;
 esac
 
-PROBE_H_DETAIL_ARGS=()
-COST_H_DETAIL_ARGS=()
-PROD_H_DETAIL_ARGS=()
 case "${HADAMARD_DUQUANT:-}" in
   0|false|False|FALSE|no|No|NO|"") ;;
   *)
@@ -303,7 +299,6 @@ fi
 echo "  EXPORT_GPTQ=$EXPORT_GPTQ EXPORT_SCALE_SWEEP=$EXPORT_SCALE_SWEEP"
 echo "  PIPELINE_SPEC_PATH=$PIPELINE_SPEC_PATH"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
-echo "  H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
 echo
@@ -351,7 +346,6 @@ if [[ ! -f "${PROBE_PATH}" ]]; then
     --calibration-modality "$CALIBRATION_MODALITY" \
     --mm-dataset "$MM_DATASET" \
     --mm-nsamples 8 --mm-max-text-len 128 \
-    "${PROBE_H_DETAIL_ARGS[@]}" \
     2>&1 | tee "${WORK_DIR}/logs/probe.log"
 else
   # Reuse guard: make sure the pre-existing probe.pkl matches the
@@ -391,12 +385,6 @@ except Exception as e:
     echo "             Or unset CALIBRATION_MODALITY to match the probe."
     exit 2
   fi
-  if [[ "${#PROBE_H_DETAIL_ARGS[@]}" -gt 0 && ! -d "$H_DETAIL_DIR" ]]; then
-    echo "[pipeline] [1/4] ABORT: Fisher h-detail was requested but"
-    echo "             h-detail dir is missing: $H_DETAIL_DIR"
-    echo "             Delete ${PROBE_PATH} to regenerate probe+h-detail."
-    exit 2
-  fi
   echo "[pipeline] [1/4] probe.pkl exists (modality=${probe_modality}), skipping"
 fi
 
@@ -419,52 +407,8 @@ if [[ ! -f "${BASE_COST_PATH}" ]]; then
     --skip-missing-activations \
     --no-include-lm-head \
     --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-2048}" \
-    "${COST_H_DETAIL_ARGS[@]}" \
     2>&1 | tee "${WORK_DIR}/logs/cost.log"
 else
-  if [[ "${#COST_H_DETAIL_ARGS[@]}" -gt 0 ]]; then
-    cost_h_detail_status=$(python3 - "$BASE_COST_PATH" "$H_DETAIL_DIR" <<'PY'
-import pickle
-import sys
-from pathlib import Path
-
-with open(sys.argv[1], "rb") as f:
-    blob = pickle.load(f)
-meta = blob.get("meta", {}) if isinstance(blob, dict) else {}
-expected = str(Path(sys.argv[2]))
-actual = meta.get("h_detail_dir")
-if actual is None:
-    shards = meta.get("shards") or []
-    vals = {
-        (
-            s.get("h_detail_dir")
-            or (
-                s.get("incremental_shard", {}).get("h_detail_dir")
-                if isinstance(s.get("incremental_shard"), dict)
-                else None
-            )
-        )
-        for s in shards
-        if isinstance(s, dict)
-    }
-    vals.discard(None)
-    if len(vals) == 1:
-        actual = next(iter(vals))
-    elif len(vals) > 1:
-        actual = "__mixed__"
-print("ok" if actual == expected else f"bad:{actual}")
-PY
-)
-    if [[ "$cost_h_detail_status" != "ok" ]]; then
-      echo "[pipeline] [2/4] ABORT: cost.pkl was not measured with requested h-detail dir."
-      echo "             expected: $H_DETAIL_DIR"
-      echo "             actual:   ${cost_h_detail_status#bad:}"
-      echo "             Delete stale cost artifacts to regenerate:"
-      echo "               rm ${BASE_COST_PATH}"
-      echo "               rm -rf ${WORK_DIR}/work/shards"
-      exit 2
-    fi
-  fi
   echo "[pipeline] [2/4] baseline cost exists, skipping"
 fi
 # Fisher output-MSE allocator cost-status check removed; the archive guard
@@ -686,14 +630,9 @@ if [[ "$SELECTION_MODE" == "validated-surrogate" ]] && [[ "$PRODUCTION_CACHE" ==
   exit 2
 fi
 if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTION_CACHE" != "False" ]]; then
-  LEVER_CACHE_TAG=""
-  case "$FISHER_WEIGHTED_GPTQ" in
-    0|false|False|FALSE|no|No|NO|"") ;;
-    *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_fisher" ;;
-  esac
-  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}"
-  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_raw.pkl"
-  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_recached.pkl"
+  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache"
+  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_raw.pkl"
+  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache_recached.pkl"
   CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
   if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
     if [[ -z "$ALLOCATOR_PARETO_DIR" || ! -f "$ALLOCATOR_PARETO_DIR/manifest.json" ]]; then
@@ -723,7 +662,7 @@ PY
       exit 2
     fi
     PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
-    PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_frontier_raw.pkl"
+    PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_frontier_raw.pkl"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       if [[ "${PRODUCTION_CACHE_UNION:-0}" == "1" ]]; then
         # Smart-union render: only render FP8_DYNAMIC fallbacks for Linears
@@ -757,7 +696,6 @@ PY
           --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
           --cache-dir "$PROD_CACHE_DIR" \
           --render-scope format-menu \
-          "${PROD_H_DETAIL_ARGS[@]}" \
           2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
       fi
     else
@@ -862,7 +800,7 @@ import sys
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()[:12])
 PY
 )"
-      PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_frontier_${SELECTED_DIGEST}_recached.pkl"
+      PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache_frontier_${SELECTED_DIGEST}_recached.pkl"
       if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
         echo "[pipeline] [4/4] re-fitting activation scales for selected measured-${VALIDATED_FRONTIER_PICK} assignment ..."
         python3 -m prismaquant.production_recache \
@@ -924,7 +862,6 @@ PY
           --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
-          "${PROD_H_DETAIL_ARGS[@]}" \
           2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
       else
         echo "[pipeline] [4/4] re-fitting production activation scales ..."
@@ -966,7 +903,6 @@ PY
         --cache-dir "$PROD_CACHE_DIR" \
         --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
         --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-        "${PROD_H_DETAIL_ARGS[@]}" \
         2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
     else
       echo "[pipeline] [4/4] production cache exists, skipping"
