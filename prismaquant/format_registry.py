@@ -584,6 +584,17 @@ def _plain_fp8_autoround(elt="fp8_e4m3", act_bits=8):
     )
 
 
+def _nvfp4_export_aligned_rtn(x: torch.Tensor) -> torch.Tensor:
+    """NVFP4 RTN matching the export/compressed-tensors scale convention."""
+    from . import export_native_compressed as enc
+
+    orig_shape = x.shape
+    in_features = int(orig_shape[-1])
+    flat = x.reshape(-1, in_features).to(torch.float32)
+    out = enc._rtn_dequant_nvfp4(flat, group_size=16)
+    return out.reshape(orig_shape).to(x.dtype)
+
+
 # NVFP4 / NVFP4A16  (NVIDIA, group_size=16, FP8 scales)
 register_format(FormatSpec(
     name="NVFP4",
@@ -591,8 +602,8 @@ register_format(FormatSpec(
     weight_element_dtype="fp4_e2m1", act_bits=4, act_dtype_name="fp4_e2m1",
     act_group_size=16, family="nv", min_capability_sm=100,
     autoround_config=lambda: _nv_autoround(4, 16, 4),
-    quantize_dequantize=_make_rtn("fp4_e2m1", 16),
-    activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    quantize_dequantize=_nvfp4_export_aligned_rtn,
+    activation_quantize_dequantize=_nvfp4_export_aligned_rtn,
 ))
 register_format(FormatSpec(
     name="NVFP4A16",
@@ -600,7 +611,7 @@ register_format(FormatSpec(
     weight_element_dtype="fp4_e2m1", act_bits=None,
     family="nv", min_capability_sm=100,
     autoround_config=lambda: _nv_autoround(4, 16, 16),
-    quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    quantize_dequantize=_nvfp4_export_aligned_rtn,
     activation_quantize_dequantize=lambda x: x,
 ))
 
