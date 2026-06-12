@@ -432,14 +432,31 @@ serialization contract.
   the allocator prices — `aura_cost.py` prices rendered dW directly). Local
   proxies have inverted against serving twice this spring (scale_sweep,
   grouped-KL); V1 is served-KL for exactly this reason.
-- **V1 — the bar the old analytical damp failed:** Qwen3-4B end-to-end
-  served KL at matched bpp, ≥3 arms: (i) production in-sample 5-sweep,
-  (ii) fixed-0.01, (iii) held-out-CV damp selection (fit half, score half,
-  refit at winner — same pass count as today's sweep, unbiased evaluator),
-  `--calib-repeats ≥ 4`. This simultaneously resolves §6.4 on the gold
-  metric and tests whether fixing the evaluator bias is worth real KL.
-  (The κ-target predecessor scored +100–161% here; that is the bar any
-  closed form must also clear once its held-out estimator exists.)
+- **V1 — RUN (2026-06-11), first calib draw: the basin direction TRANSFERS
+  end-to-end.** Qwen3-4B, frozen 4.75-bpp allocation, four arms (in-sample
+  sweep / fixed-0.01 / fixed-0.3 / fixed-1.0), deterministic renders,
+  in-process vLLM measurement (all-position top-1024 KL vs shared BF16
+  teacher on WikiText-train windows + WikiText-test PPL + max-chunk NLL).
+  Results (`/home/rob/dq-runs/v1-damp-ab/metrics/`):
+  | arm | KL mean | KL conf | KL p99 | PPL | max-chunk NLL |
+  |---|---|---|---|---|---|
+  | sweep | 0.5927 | 0.5284 | 5.79 | 27.145 | 3.7248 |
+  | 0.01 | 0.5733 | 0.5063 | 5.80 | 27.237 | 3.7425 |
+  | 0.3 | 0.5248 | 0.4479 | 5.04 | **26.757** | **3.6763** |
+  | 1.0 | **0.5033** | **0.4267** | **4.79** | 26.892 | 3.6976 |
+  Both heavy-damp arms beat the production sweep on EVERY readout
+  (−11/−15% KL, −13/−17% p99, −1.4/−0.9% PPL, tail improved) despite the
+  pre-registered headwind (allocation optimized under sweep rendering).
+  C-vs-D is lane-split (KL prefers 1.0, PPL prefers 0.3) and within the
+  predicted flat basin. **§6.4 RESOLVED: fixed-0.01 is KL-better than the
+  sweep** — the +137.5% screen claim inverted on the gold lane; the sweep's
+  5× cost buys a measurable negative. Builds: 11 min/arm fixed vs ~48 min
+  sweep (4.4×). Caveats: single calib draw (seed-43 replication of A/C/D
+  running), single model; promotion ladder still requires the second seed +
+  a 27B confirmation. Mid-run instrument note: the legacy "full-vocab KL"
+  lane scores only the 8 window-final contexts (teacher_shape [8, V]) —
+  paired A-vs-B there was 0.008±0.29, useless; the all-position top-K mode
+  was added (commit abc90a4) and is what the table reports.
 - **V2 — regime audit, no new builds:** compute ν = n_eff/d and adjusted-R²
   for the 35B packed experts and the 27B dense Linears from existing caches;
   the law must place experts in the s*≈0 branch and dense in s*≈1. Pure
