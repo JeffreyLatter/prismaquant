@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
 
@@ -185,6 +187,10 @@ def test_default_profile_common_fused_groups_are_profile_owned():
         "k_proj",
         "v_proj",
     )
+    assert profile.fused_sibling_leaf_mapping()["in_proj_ba"] == (
+        "in_proj_b",
+        "in_proj_a",
+    )
     assert (
         profile.fused_sibling_group("model.layers.0.self_attn.q_proj")
         == "model.layers.0.self_attn.qkv_proj"
@@ -192,6 +198,10 @@ def test_default_profile_common_fused_groups_are_profile_owned():
     assert (
         profile.fused_sibling_group("model.layers.0.mlp.gate_proj")
         == "model.layers.0.mlp.gate_up_proj"
+    )
+    assert (
+        profile.fused_sibling_group("model.layers.0.linear_attn.in_proj_b")
+        == "model.layers.0.linear_attn.in_proj_ba"
     )
 
 
@@ -275,6 +285,9 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
     )
     assert split_group == moe.packed_expert_format_group(
         "model.layers.0.mlp.experts.7.down_proj"
+    )
+    assert split_group == moe.packed_expert_format_group(
+        "model.layers.0.mlp.experts.9.down_proj"
     )
     assert split_group != packed_group
 
@@ -367,6 +380,9 @@ def test_packed_expert_format_group_uses_declared_projection_splits():
     assert split_group == spec.packed_expert_format_group(
         "model.layers.0.mlp.experts.7.w2"
     )
+    assert split_group == spec.packed_expert_format_group(
+        "model.layers.0.mlp.experts.9.w2"
+    )
     assert split_group != packed_group
 
 
@@ -436,6 +452,11 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
     ) == profile.packed_expert_format_group(
         "model.layers.0.experts.3.down_proj"
     )
+    assert profile.packed_expert_format_group(
+        "model.layers.0.experts.3.gate_proj"
+    ) == profile.packed_expert_format_group(
+        "model.layers.0.experts.9.down_proj"
+    )
     assert profile.source_passthrough_prefixes() == (
         "model.vision_tower.",
         "model.audio_tower.",
@@ -457,6 +478,45 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
     assert profile.visual_layer_prefix() == (
         "model.vision_tower.vision_model.encoder.layers"
     )
+
+
+def test_gemma4_shared_kv_pass_state_uses_layer_indexes():
+    profile = Gemma4Profile()
+    key = torch.randn(1, 2, 3, requires_grad=True)
+    value = torch.randn(1, 2, 3, requires_grad=True)
+
+    captured = profile.capture_forward_pass_state({
+        "shared_kv_states": {3: (key, value)},
+    })
+
+    assert set(captured) == {3}
+    assert captured[3][0].device.type == "cpu"
+    assert captured[3][1].device.type == "cpu"
+    assert captured[3][0].requires_grad is False
+    assert captured[3][1].requires_grad is False
+
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            is_kv_shared_layer=True,
+            kv_shared_layer_index=3,
+            layer_type="full_attention",
+        )
+    )
+    pass_state = profile.isolated_layer_pass_state(captured, layer)
+
+    assert set(pass_state["shared_kv_states"]) == {3}
+    assert pass_state["shared_kv_states"][3] == captured[3]
+
+
+def test_gemma4_shared_kv_capture_rejects_malformed_entries():
+    profile = Gemma4Profile()
+
+    try:
+        profile.capture_forward_pass_state({"shared_kv_states": {3: object()}})
+    except RuntimeError as exc:
+        assert "shared_kv_states[3]" in str(exc)
+    else:  # pragma: no cover - assert path keeps compatibility without pytest.raises
+        raise AssertionError("malformed shared_kv_states entry was accepted")
 
 
 def test_gemma_graph_marks_packed_experts_under_recipe_experts():

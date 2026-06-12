@@ -9,10 +9,9 @@ Current live entrypoints:
 - `python -m prismaquant.incremental_measure_quant_cost`
 - `python -m prismaquant.kl_sensitivity_probe`
 - `python -m prismaquant.allocator`
-- `python -m prismaquant.polish_from_assignment`
 - `python -m prismaquant.export_native_compressed`
 - `python -m prismaquant.validation_harness`
 
 Legacy additive, interaction, Block-CLADO, dense-cone, adjoint, and PrismaSCOUT
-iteration tools are archived for artifact replay and comparison under
-`archive/cross_layer_2026-05-09/`.
+iteration/polish tools are archived for artifact replay and comparison under
+the dated `archive/` walls.

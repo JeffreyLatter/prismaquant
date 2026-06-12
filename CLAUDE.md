@@ -72,8 +72,10 @@ publish it.
   retracts his own overstated claims the moment a comparison is found
   non-rigorous (the grouped-KL "−3.52% win", the "4× lower KL" framing, the
   "17 promotions / 0.0056 KL" polish headline — all retracted by him). Negative
-  results are recorded *with the durable lesson*. The paper's "Methods Considered
-  and Rejected" section exists on purpose. **Never sell a screen as a result.**
+  results are recorded *with the durable lesson*. The retired PrismaSCOUT
+  paper's rejected-methods catalog lives in
+  `paper/archive/prismascout_paper_2026-06-05.tex`; the current AURA paper keeps
+  the limits and caveats in its own spine. **Never sell a screen as a result.**
 - **Verify "done."** Agent/wrapper "completed" signals fire before child
   processes exit. Check `git log`, read the log file, confirm the artifact.
 
@@ -94,8 +96,9 @@ is the part he thinks *"could radically change all quantization if done right."*
 
 Everything downstream follows from this. Cheap, biased surrogates *propose*
 candidates; expensive, faithful end-to-end KL on a held-out split *decides* what
-ships. The named system that does this is **PrismaSCOUT** (Surrogate-Cascaded
-Optimization Under Tradeoff; an earlier internal name for the L3-polish piece was
+ships. The current paper's additive production-faithful allocator is **AURA**;
+**PrismaSCOUT** is the retired prior cascade (Surrogate-Cascaded Optimization
+Under Tradeoff; an earlier internal name for the L3-polish piece was
 *PrismaClade*).
 
 ### The cost cascade (cheap→faithful, each level gates the next)
@@ -177,10 +180,12 @@ the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
    `run-pipeline.sh` and `gpu_guard.require_cuda_hot_path` refuse to run on CPU.
 8. **One cache mechanism.** Rendered weights flow *only* through
    `ProductionWeightCache`; activations through `PerturbedActivationCache` / the
-   streaming activation path. No parallel stores. This is structurally enforced
-   (`pipeline.py` `APPROVED_RESOURCE_OWNERS`). **Why it matters:** the surrogate,
-   the KL validation, and the exported bytes must be *identical* — otherwise an
-   A/B has a "rendering confound" (the exact reason the JSO wall-off was reverted).
+   streaming activation path. No parallel stores. `pipeline.py`
+   `APPROVED_RESOURCE_OWNERS` is the declarative contract and validation layer;
+   runtime enforcement lives in the stage code and fail-fast cache/prefetch gates.
+   **Why it matters:** the surrogate, the KL validation, and the exported bytes
+   must be *identical* — otherwise an A/B has a "rendering confound" (the exact
+   reason the JSO wall-off was reverted).
 9. **vLLM/kernel reality gates every format.** Production-eligible only when:
    correctly represented in `compressed-tensors` metadata, accepted by vLLM on
    real shapes, routed to a *performant* kernel (not a slow fallback), passes
@@ -257,8 +262,9 @@ executor. Stages are file-artifact-coupled and skip-if-exists. `WORK_DIR/`:
 incremental_probe ─► probe.pkl            (per-Linear empirical Fisher H_trace; streaming)
    │
 incremental_measure_quant_cost            (per-(Linear,format) error — L1 baseline)
- OR production_render_cost                (default: derive allocator cost from the SAME
-   │                                        rendered weights export will ship)
+ OR production_render_cost                (default: derive allocator cost from a dedicated
+   │                                        render-score cache; export/validated KL use
+   │                                        their selected-assignment production cache)
 allocator + allocator_solver ─► layer_config.json + pareto*    (knapsack DP + log-error kneedle)
    │                                        (fused-sibling & packed-MoE union-find promotion)
 build_production_cache / production_recache ─► ProductionWeightCache
@@ -286,7 +292,7 @@ pointing at their archive.
 
 | Concern | Files |
 |---|---|
-| Orchestrate / contract | `run-pipeline.sh` (exec) · `pipeline.py` (declarative spec + one-cache enforcement) · `__init__.py` (transformers-5.x polyfills) |
+| Orchestrate / contract | `run-pipeline.sh` (exec) · `pipeline.py` (declarative spec + owner validation, not executor) · `__init__.py` (transformers-5.x polyfills) |
 | Allocate | `allocator.py` (CLI, Pareto sweep, log-error kneedle, `--bit-attribution-json/csv`) · `allocator_solver.py` (numpy multi-choice knapsack DP, union-find serving-unit promotion, `predicted_dloss`) · `allocator_candidates.py` (legality gate + cost-source precedence + passthrough integrity) · `decision_units.py` |
 | Probe / cost | `incremental_probe.py` + `sensitivity_probe.py` + `kl_fisher.py` (L1 Fisher) · `incremental_measure_quant_cost.py` + `measure_quant_cost.py` · `perturbed_x_cache.py` (L2) · `kl_measurement.py` + `propagated_sensitivity_costs.py` (L3) · `production_render_cost.py` |
 | Formats | `format_registry.py` (FormatSpec + RTN `quantize_dequantize`/`activation_quantize_dequantize`, codebook bucketize, E8M0 snap, `torch.compile` hot path) · `mx_formats.py` · `fp8_dynamic.py` |
@@ -503,10 +509,12 @@ Read these for *depth*; the prime directive applies.
 - **`docs/progressive_render_pipeline.md`** + **`docs/pluggable_refactor.md`** +
   **`docs/propagated_cost.md`** — render-gate ordering, the plugin contract, the
   L3 propagated-cost spec.
-- **`paper/main.tex`** — the thesis, the monotone-polish proposition (and its
-  scope caveat), the honest downstream-regression tables, and the full
-  rejected-methods catalog. `paper/figures/fig_validated_27b.tex` is the key
-  evidence figure.
+- **`paper/main.tex`** — the current AURA spine: production-faithful KL--Fisher
+  allocation, additivity/cancellation analysis, served KL/PPL evidence, and
+  limitations. `paper/figures/fig_aura_rd_geometry.tex` is the key geometry
+  figure. The retired PrismaSCOUT paper, including monotone-polish and the
+  rejected-methods catalog, is archived at
+  `paper/archive/prismascout_paper_2026-06-05.tex`.
 - **`.claude/prismaquant-handover-*.md`** — session history, newest first. Useful
   for narrative arc; **assume the "open items" are stale** (the 2026-05-28 one
   lists the cancelled JSO A/B). Codex/Gemini deliberations: `.claude/codex-*`,

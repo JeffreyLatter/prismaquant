@@ -103,12 +103,13 @@ _UNCACHED_PACKED_EXPERT_RE = re.compile(
 
 
 def is_uncached_packed_expert_qname(qname: str) -> bool:
-    """Return True for packed-MoE expert tensors not rendered by this cache.
+    """Return True for packed-MoE expert tensor qnames.
 
-    ``ProductionWeightCache`` currently renders production-faithful 2D
-    ``nn.Linear`` weights. Packed 3D MoE expert tensors are quantized by the
-    packed exporter/validation fallback path, so missing cache entries for
-    those names must not fail production-cache residency checks.
+    Legacy residency helpers may skip these names when no concrete packed
+    render is expected. Production build/export gates must be stricter:
+    non-BF16 packed experts are rendered by
+    ``fill_packed_expert_cache_entries`` and missing entries are an early
+    coverage failure unless the explicit RTN research escape hatch is set.
     """
     return bool(_UNCACHED_PACKED_EXPERT_RE.search(str(qname)))
 
@@ -274,12 +275,18 @@ class ProductionWeightCache:
     def assignment_keys(
         self,
         assignment: Mapping[str, str],
+        *,
+        include_packed_experts: bool = False,
     ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         """Return concrete non-BF16 cache keys needed by an assignment.
 
         This centralizes recipe alias handling for recache, polish, KL
         probes, and export: callers should ask the cache which stored key a
-        recipe entry maps to, then feed those keys into ``prefetch``.
+        recipe entry maps to, then feed those keys into ``prefetch``. Legacy
+        residency callers leave ``include_packed_experts`` false because
+        packed experts may be handled out-of-band; production build/export
+        gates set it true once ``fill_packed_expert_cache_entries`` is
+        responsible for those 3-D entries.
         """
         from prismaquant import format_registry as fr
 
@@ -292,7 +299,10 @@ class ProductionWeightCache:
                 continue
             key = self.resolve_key(str(qname), fmt_canon)
             if key is None:
-                if is_uncached_packed_expert_qname(str(qname)):
+                if (
+                    is_uncached_packed_expert_qname(str(qname))
+                    and not include_packed_experts
+                ):
                     continue
                 missing.append((str(qname), fmt_canon))
                 continue
@@ -2894,8 +2904,7 @@ def fill_packed_expert_cache_entries(
     gate_calib_ids: torch.Tensor | None = None,
     gate_token_budget: int | None = None,
 ) -> dict:
-    """Render packed-MoE experts through the SAME shared GPTQ core as 2-D
-    Linears and store the per-expert dequant into ``cache``.
+    """Render packed-MoE experts into ``ProductionWeightCache`` entries.
 
     ``render_mode``:
       * ``"batched"`` (default, production): vectorize the GPTQ column update
@@ -2918,11 +2927,14 @@ def fill_packed_expert_cache_entries(
     the same-domain holdout. Default ``None`` preserves prior behavior.
 
     This closes the packed-expert RTN-by-omission gap: every non-BF16 packed
-    expert tensor is rendered per-expert through ``render_production_weight``
-    (the identical GPTQ + JSO + damp-sweep + do-no-harm stack the dense Linears
-    use), keyed by routed per-expert activations.  Export then reads the cached
-    3-D dequant and re-packs it — exactly the ``_pack_production_cached_2d``
-    contract, lifted to packed experts.
+    expert tensor receives a deliberate cache render keyed by routed
+    per-expert activations. In production's default ``"batched"`` mode that
+    render is fixed-damp batched GPTQ without dense JSO/act-order/damp-sweep,
+    followed by the measured GPTQ-vs-RTN gate below. The non-default
+    ``"per_expert"`` mode is the one that calls ``render_production_weight``
+    and matches the dense GPTQ+damp-sweep+JSO stack. Export then reads the
+    cached 3-D dequant and re-packs it — exactly the
+    ``_pack_production_cached_2d`` contract, lifted to packed experts.
 
     Args:
       cache: the ``ProductionWeightCache`` produced by
@@ -2931,8 +2943,10 @@ def fill_packed_expert_cache_entries(
         disk-streaming is on).
       render_assignment: the concrete export assignment (recipe_key -> fmt).
         Only non-BF16 packed-expert tensors are rendered (BF16 = passthrough).
-      levers: the resolved production lever dict (same object passed to the
-        2-D fill) so experts get identical treatment.
+      levers: the resolved production lever dict. It is consumed by
+        ``render_mode="per_expert"``; the production ``"batched"`` path uses
+        its fixed fast recipe regardless of dense-linears JSO/damp-sweep
+        levers.
       module_token_budget: reservoir size for each experts module's input X.
       max_rows_per_expert: cap on routed rows fed to each expert's GPTQ.
       max_layers: debug/timing cap — render only the first N experts modules.

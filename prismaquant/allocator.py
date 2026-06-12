@@ -123,6 +123,10 @@ from .decision_units import block_id_from_qname
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
+_KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES = 1.0
+_KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION = 0.5
+_RD_LOG_LINEAR_R2_THRESHOLD = 0.99
+
 
 # ---------------------------------------------------------------------------
 # Kneedle knee detection
@@ -171,9 +175,9 @@ def _log_error_tail_start(y: list[float]) -> int:
     if len(logs) < 3:
         return 0
     ymin, ymax = min(logs), max(logs)
-    if ymax - ymin < 1.0:
+    if ymax - ymin < _KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES:
         return 0
-    threshold = 0.5 * (ymin + ymax)
+    threshold = ymin + _KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION * (ymax - ymin)
     idx = next((i for i, v in enumerate(logs) if v <= threshold), 0)
     return min(max(idx, 0), max(len(logs) - 3, 0))
 
@@ -246,6 +250,14 @@ def _pareto_knee_summary(curve: list[dict]) -> dict:
     return {
         "enabled": True,
         "primary": "log_error",
+        "diagnostic_thresholds": {
+            "tail_min_log_span_decades": float(
+                _KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES
+            ),
+            "tail_midpoint_fraction": float(
+                _KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION
+            ),
+        },
         "log_error": _record("log_error", log_idx),
         "global_log_error": _record("global_log_error", global_log_idx),
         "raw_linear": _record("raw_linear", raw_idx),
@@ -261,10 +273,10 @@ def _rd_curve_diagnostic(feasible: list[dict]) -> dict:
     On such a curve the kneedle has no fixed answer — its "knee" moves with the
     axis scaling (the 27B knee swung 7.5 -> 12 bpp across raw/log/golden axes),
     so it is a *diagnostic*, not a ship-point. This fits a least-squares line to
-    log10(Δloss) vs achieved bpp and reports R^2; R^2 >= 0.99 => log-linear =>
-    ``intrinsic_knee=False`` => ship by byte budget (--target-disk-gb) or measured
-    saturation instead of curvature. A genuine sensitivity cliff would kink the
-    line (low R^2) and *then* a knee is meaningful.
+    log10(Δloss) vs achieved bpp and reports R^2. The R^2 cutoff is a
+    diagnostic threshold only, reported into the sidecar payload; it is not a
+    shipping selector. A genuine sensitivity cliff would kink the line (low R^2)
+    and *then* a knee is meaningful.
     """
     pts = [r for r in feasible if float(r.get("predicted_dloss", 0.0)) > 0.0]
     if len(pts) < 3:
@@ -284,21 +296,26 @@ def _rd_curve_diagnostic(feasible: list[dict]) -> dict:
     ss_tot = sum((y - ybar) ** 2 for y in ys)
     ss_res = sum((y - (a * x + b)) ** 2 for x, y in zip(xs, ys))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
-    log_linear = r2 >= 0.99
+    log_linear = r2 >= _RD_LOG_LINEAR_R2_THRESHOLD
     return {
         "available": True,
         "model": "log10(predicted_dloss) = a*bpp + b",
         "slope_decades_per_bit": float(a),
         "intercept": float(b),
         "r2": float(r2),
+        "diagnostic_thresholds": {
+            "log_linear_r2": float(_RD_LOG_LINEAR_R2_THRESHOLD),
+        },
         "log_linear": bool(log_linear),
         "intrinsic_knee": bool(not log_linear),
         "note": (
-            "RD curve is log-linear (R^2>=0.99): no intrinsic knee; the kneedle "
+            f"RD curve is log-linear (R^2>={_RD_LOG_LINEAR_R2_THRESHOLD:g}): "
+            "no intrinsic knee; the kneedle "
             "is axis-dependent. Select ship bpp by byte budget (--target-disk-gb) "
             "or measured saturation, not curvature."
             if log_linear else
-            "RD curve deviates from log-linear (R^2<0.99): a curvature knee may be "
+            f"RD curve deviates from log-linear "
+            f"(R^2<{_RD_LOG_LINEAR_R2_THRESHOLD:g}): a curvature knee may be "
             "meaningful here; still prefer a byte budget when shipping to a card."
         ),
     }
@@ -530,6 +547,42 @@ def _find_candidate_for_format(
         if fr.get_format(cand.fmt).name == canonical:
             return cand
     return None
+
+
+def _validate_assignment_candidate_membership(
+    assignment: dict[str, str],
+    candidates: dict[str, list[Candidate]],
+    *,
+    fixed_chosen_candidates: dict[str, Candidate] | None = None,
+) -> None:
+    """Fail if promotion assigned a format no candidate row allowed."""
+    available = {
+        name: {fr.get_format(cand.fmt).name for cand in per_name}
+        for name, per_name in candidates.items()
+    }
+    for name, cand in (fixed_chosen_candidates or {}).items():
+        available.setdefault(name, set()).add(fr.get_format(cand.fmt).name)
+
+    violations = []
+    for name, fmt in sorted(assignment.items()):
+        if name not in available:
+            continue
+        canonical = fr.get_format(fmt).name
+        if canonical not in available[name]:
+            violations.append((name, canonical, sorted(available[name])))
+    if not violations:
+        return
+
+    sample = "\n  ".join(
+        f"{name}: promoted to {fmt}, available={choices}"
+        for name, fmt, choices in violations[:10]
+    )
+    raise SystemExit(
+        "[alloc] serving-unit promotion assigned a format that was not "
+        "present in the per-Linear candidate set. This would defer legality "
+        "repair to export and can recreate mixed serving units. Sample:\n"
+        f"  {sample}"
+    )
 
 
 # Role tokens used to bucket the bit-attribution report. Best-effort: anything
@@ -877,6 +930,75 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def validate_default_profile_format_menu(
+    model_profile,
+    specs_sorted,
+    *,
+    allow_default_profile: bool = False,
+) -> None:
+    """Reject multi-format menus when only DefaultProfile was resolved."""
+    from .model_profiles import DefaultProfile
+
+    using_default_profile = isinstance(model_profile, DefaultProfile)
+    distinct_fmt_names = sorted({s.name for s in specs_sorted})
+    if (
+        using_default_profile
+        and len(distinct_fmt_names) > 1
+        and not allow_default_profile
+    ):
+        raise SystemExit(
+            "[alloc] ERROR: multi-format menu "
+            f"({distinct_fmt_names}) resolved to DefaultProfile (no probe "
+            "meta['model'] / --model-override, or the model architecture is "
+            "not registered) -> DefaultProfile only enforces its fallback "
+            "fused groups (qkv_proj/gate_up_proj and DeltaNet "
+            "in_proj_ba/in_proj_qkvz). It cannot guarantee unknown "
+            "architecture-specific coherence or packed-MoE expert uniformity, which "
+            "risks an unservable or silently-corrupt artifact. Pass "
+            "--model-override <model> so detect_profile resolves the real "
+            "profile, or --allow-default-profile to proceed anyway."
+        )
+
+
+def incomplete_fused_group_dp_exclusions(
+    stats: dict,
+    costs: dict,
+    model_profile,
+    allocation_excluded=(),
+) -> list[str]:
+    """Linears to exclude from DP because their fused group is incomplete.
+
+    Excluding them from the mutable body assignment leaves them absent from
+    ``layer_config``; export then keeps those present-but-incomplete fused
+    siblings as BF16 passthrough instead of producing missing scale tensors.
+    """
+    from .decision_units import incomplete_fused_group_members
+
+    incomplete_members = incomplete_fused_group_members(
+        set(stats) | set(costs), model_profile)
+    return sorted(incomplete_members - set(allocation_excluded))
+
+
+def validate_final_serving_promotion_noop(
+    before: dict[str, str],
+    after: dict[str, str],
+) -> None:
+    if before == after:
+        return
+    changed = [
+        (name, before.get(name), after.get(name))
+        for name in sorted(set(before) | set(after))
+        if before.get(name) != after.get(name)
+    ]
+    sample = changed[:8]
+    raise SystemExit(
+        "[alloc] ERROR: final serving-unit promotion changed the emitted "
+        "assignment after achieved_bits/Delta-loss were computed; metrics are "
+        f"stale. Changed {len(changed)} entries, sample={sample}. Move this "
+        "coupling before solve_with_promotion or recompute accounting."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
@@ -893,12 +1015,12 @@ def main():
                     help="Permit a multi-format allocation to run on "
                          "DefaultProfile when no model path is available "
                          "(probe meta['model'] unset and no --model-override). "
-                         "DefaultProfile only enforces the universal fused "
-                         "groups (qkv_proj/gate_up_proj), so architecture-"
-                         "specific merged columns (e.g. Qwen3.x DeltaNet "
-                         "in_proj_ba) are NOT coherence-protected and may "
-                         "produce an unservable or silently-corrupt artifact. "
-                         "Only safe for vanilla transformers. Off by default: "
+                         "DefaultProfile enforces only fallback fused groups "
+                         "(qkv_proj/gate_up_proj and DeltaNet "
+                         "in_proj_ba/in_proj_qkvz), so unknown "
+                         "architecture-specific merged columns or packed-MoE "
+                         "expert constraints may produce an unservable or "
+                         "silently-corrupt artifact. Off by default: "
                          "the allocator hard-errors instead and asks for "
                          "--model-override.")
     ap.add_argument("--target-bits", type=float, default=4.75)
@@ -1094,14 +1216,14 @@ def main():
               f"(derived from {probe_model_path})", flush=True)
     else:
         # No model path (probe lacks meta['model'] and no --model-override):
-        # we fall back to DefaultProfile, which only knows the UNIVERSAL fused
-        # groups (qkv_proj, gate_up_proj). Arch-specific merged columns (e.g.
-        # Qwen3.x DeltaNet in_proj_ba / in_proj_qkvz) are invisible, so the
-        # fused-sibling promotion can leave them with mixed formats -> an
-        # unservable / silently-corrupt checkpoint. A SINGLE-format menu is
-        # always safe (every Linear gets the same format, so fused groups are
-        # trivially coherent); a multi-format menu is gated to a hard error
-        # below unless --allow-default-profile is set.
+        # we fall back to DefaultProfile, whose fallback fused map covers only
+        # qkv_proj, gate_up_proj, and the known DeltaNet in_proj_ba/qkvz
+        # groups. Unknown architecture-specific merged columns remain
+        # invisible, so fused-sibling promotion can leave them with mixed
+        # formats -> an unservable / silently-corrupt checkpoint. A
+        # SINGLE-format menu is always safe (every Linear gets the same format,
+        # so fused groups are trivially coherent); a multi-format menu is gated
+        # to a hard error below unless --allow-default-profile is set.
         used_default_fallback = True
         print(
             "[alloc] WARNING: no model path (probe meta['model'] is unset and "
@@ -1140,10 +1262,8 @@ def main():
     # v_scale) cannot be partially quantized — the present members must ship
     # BF16, else the fused load KeyErrors on a non-existent scale param.
     # Generic + profile-driven (no model-specific code here).
-    from .decision_units import incomplete_fused_group_members
-    incomplete_members = incomplete_fused_group_members(
-        set(stats) | set(costs), model_profile)
-    incomplete_added = sorted(incomplete_members - set(allocation_excluded))
+    incomplete_added = incomplete_fused_group_dp_exclusions(
+        stats, costs, model_profile, allocation_excluded)
     allocation_excluded.extend(incomplete_added)
     if incomplete_added:
         print(
@@ -1210,22 +1330,11 @@ def main():
     # Single-format menus are always coherent; --allow-default-profile is the
     # explicit escape for vanilla transformers. The menu is de-duped by format
     # NAME so an alias/duplicate cannot false-trigger.
-    using_default_profile = isinstance(model_profile, DefaultProfile)
-    distinct_fmt_names = sorted({s.name for s in specs_sorted})
-    if (using_default_profile and len(distinct_fmt_names) > 1
-            and not args.allow_default_profile):
-        raise SystemExit(
-            "[alloc] ERROR: multi-format menu "
-            f"({distinct_fmt_names}) resolved to DefaultProfile (no probe "
-            "meta['model'] / --model-override, or the model architecture is "
-            "not registered) -> DefaultProfile cannot enforce architecture-"
-            "specific fused-sibling coherence (e.g. Qwen3.x DeltaNet "
-            "in_proj_ba/in_proj_qkvz) or packed-MoE expert uniformity, which "
-            "risks an unservable or silently-corrupt artifact. Pass "
-            "--model-override <model> so detect_profile resolves the real "
-            "profile, or --allow-default-profile to proceed anyway (only safe "
-            "for vanilla transformers whose only fused groups are "
-            "qkv_proj/gate_up_proj).")
+    validate_default_profile_format_menu(
+        model_profile,
+        specs_sorted,
+        allow_default_profile=args.allow_default_profile,
+    )
 
     # --- Format-family coherence check -----------------------------------
     # A sensible format ladder has at most ONE format per bit tier. Having
@@ -1294,6 +1403,16 @@ def main():
     if probe_model_path:
         source_manifest = _scan_source_dtype_manifest(
             probe_model_path, model_profile)
+        if source_manifest is not None and not source_manifest:
+            # Empty scan = the model dir has no safetensors to classify
+            # (config-only dirs, probe-only flows). No evidence is not
+            # evidence of mismatch: fall back to legacy gating (BF16
+            # passthrough allowed) rather than mapping every name to
+            # "unknown" and silently stripping the BF16 rung.
+            print("[alloc] source-dtype manifest EMPTY (no safetensors "
+                  f"found under {probe_model_path}) — passthrough formats "
+                  "allowed WITHOUT source verification", flush=True)
+            source_manifest = None
         if source_manifest:
             n_fp8 = sum(1 for v in source_manifest.values() if v == "fp8")
             n_bf16 = sum(1 for v in source_manifest.values() if v == "bf16")
@@ -1998,6 +2117,7 @@ def main():
             assignment_expanded, stats)
 
     assignment_expanded.update(fixed_format_assignment)
+    assignment_before_serving_promotion = dict(assignment_expanded)
 
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. This keeps per-Linear assignments serveable without
@@ -2006,6 +2126,10 @@ def main():
         assignment_expanded,
         format_rank,
         profile=model_profile,
+    )
+    validate_final_serving_promotion_noop(
+        assignment_before_serving_promotion,
+        assignment_expanded,
     )
 
     # Visual-encoder Linears are auxiliary to the language-model budget.
@@ -2050,6 +2174,12 @@ def main():
               f"Linears found in source checkpoint — override is a "
               f"no-op", flush=True)
 
+    _validate_assignment_candidate_membership(
+        assignment_expanded,
+        candidates,
+        fixed_chosen_candidates=fixed_chosen_candidates,
+    )
+
     mtp_count = sum(1 for n in assignment_expanded if n.startswith("mtp."))
     if mtp_count:
         mtp_fmts = {
@@ -2085,10 +2215,11 @@ def main():
                 continue
             kind = source_manifest.get(name)
             if kind is None:
-                # Not in manifest — likely a visual Linear stamped via
-                # --visual-format (bypasses the manifest by design) or
-                # a name the profile rewrite didn't map. Skip.
-                continue
+                # Visual and MTP assignments are stamped as auxiliary formats
+                # outside the language-model source manifest by design.
+                if _is_visual_linear(name) or _is_mtp_linear(name):
+                    continue
+                kind = "unknown"
             if not _passthrough_source_ok(fmt, kind):
                 violations.append((name, fmt, kind))
         if violations:
@@ -2103,7 +2234,11 @@ def main():
                 f"picked over a mismatched source dtype. Sample:\n"
                 f"  {head}\n"
                 "The per-Linear filter should have excluded these — "
-                "investigate fused-sibling / MoE-unity promotion."
+                "investigate fused-sibling / MoE-unity promotion. Note: "
+                "fp16/fp32 sources have NO passthrough format by design "
+                "(fp16→bf16 drops 3 mantissa bits — not lossless); allocate "
+                "a quantized format for them or extend "
+                "PASSTHROUGH_SOURCE_REQUIREMENTS deliberately."
             )
 
     layer_cfg = {}

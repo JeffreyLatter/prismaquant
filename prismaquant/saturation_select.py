@@ -21,11 +21,12 @@ bpp is therefore not a curvature to find; it is set by one of two real anchors:
     stopping anchor is the measurement noise floor — you cannot ship a quality
     gain you cannot distinguish from sampling scatter. One knob (z, a
     significance level — not a curvature unit), unit-free, anchored to a real
-    quantity. Cost: O(log n) measurements via bisection over a precomputed bpp
-    grid, instead of a dense sweep. NB: the band is z * combined stderr, so the
-    measured frontier must carry a real per-bpp stderr (calib-repeats >= 4, or
-    a per-position bootstrap); a single-rep stderr of 0 collapses the band so
-    that only the asymptote is within-noise of itself, degenerating B* to the
+    quantity. It scans the candidate grid rather than assuming monotonic noisy
+    measurements; when called from validated-frontier selection the grid has
+    already been measured. NB: the band is z * combined stderr, so the measured
+    frontier must carry a real per-bpp stderr (calib-repeats >= 4, or a
+    per-position bootstrap); a single-rep stderr of 0 collapses the band so that
+    only the asymptote is within-noise of itself, degenerating B* to the
     highest-bpp asymptote (the densest / safest allocation, i.e. ship the most
     bits) — not lowest-bpp.
 
@@ -70,9 +71,10 @@ def find_saturation_bpp(
     measure_fn: Callable[[float], tuple[float, float]],
     *,
     z: float = 2.0,
+    scan: str = "dense",
 ) -> dict:
     """Find B* = lowest bpp in `grid` whose distortion is within the noise band
-    of the asymptote (highest bpp), via bisection.
+    of the asymptote (highest bpp).
 
     Args:
       grid: sorted-ascending bpp candidates (allocations precomputed at each).
@@ -81,9 +83,9 @@ def find_saturation_bpp(
       z: significance multiplier on the combined stderr (2.0 ~= 95%).
 
     Returns dict with B* ('bpp'), the measured points, and the decision trace.
-    Monotonicity assumption: distortion is (weakly) decreasing in bpp; the
-    bisection is robust to mild non-monotonic noise because it compares each
-    probe to the asymptote, not to its neighbour.
+    Every grid point is checked against the asymptote band, so marginal
+    non-monotone measurement noise cannot make an early bisection decision hide
+    a lower saturated point.
     """
     g = sorted(grid)
     measured: dict[float, tuple[float, float]] = {}
@@ -95,22 +97,51 @@ def find_saturation_bpp(
         return measured[bpp]
 
     kl_hi, se_hi = m(g[-1])
-    lo_i, hi_i = 0, len(g) - 1          # hi_i is saturated by definition
-    best_i = hi_i
-    while lo_i < hi_i:
-        mid_i = (lo_i + hi_i) // 2
-        kl_m, se_m = m(g[mid_i])
+
+    def _check(idx):
+        bpp = g[idx]
+        kl_m, se_m = m(bpp)
         band = z * math.hypot(se_m, se_hi)
         within = (kl_m - kl_hi) <= band
         trace.append({
-            "bpp": g[mid_i], "kl": kl_m, "se": se_m,
+            "bpp": bpp, "kl": kl_m, "se": se_m,
             "kl_asymptote": kl_hi, "band": band, "within_noise": within,
         })
-        if within:
-            best_i = mid_i
-            hi_i = mid_i
-        else:
-            lo_i = mid_i + 1
+        return within
+
+    # scan modes (QC on review-batch): the dense scan is robust to
+    # non-monotone noise but turns the documented O(log n) measurement
+    # contract into O(n) — unacceptable when measure_fn is a LIVE
+    # GPU KL measurement. 'auto' bisects first (O(log n) live calls),
+    # then densifies only the already-measured-free region below the
+    # bisection answer when every grid point is memoized externally.
+    # 'dense' preserves the fully-robust behavior for precomputed grids.
+    if scan not in ("auto", "dense", "bisect"):
+        raise ValueError(f"unknown scan mode {scan!r}")
+    best_i: int | None = None
+    if scan == "dense":
+        for idx in range(len(g)):
+            if _check(idx) and best_i is None:
+                best_i = idx
+    else:
+        lo, hi = 0, len(g) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _check(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        best_i = lo
+        if scan == "auto":
+            # noise-robustness pass at zero extra measurement cost:
+            # re-examine any grid point ALREADY measured during bisection
+            # that sits below the bisection answer and is within the band.
+            for idx in range(best_i):
+                if g[idx] in measured and _check(idx):
+                    best_i = idx
+                    break
+    if best_i is None or not _check(best_i):
+        best_i = len(g) - 1
     # Slope view between adjacent measured points (transparency / sanity).
     pts = sorted(measured.items())
     slopes = []

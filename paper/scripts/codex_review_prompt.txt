@@ -13,7 +13,7 @@ Sources you should consult (in priority order)
    - Source:  /home/rob/prismaquant/paper/main.tex
    - Rendered: /home/rob/prismaquant/paper/main.pdf  (open or describe via pdftotext)
    - Figures: /home/rob/prismaquant/paper/figures/*.tex
-   - HTML companion: /home/rob/prismaquant/paper/prismaquant_animation.html
+   - HTML companion: /home/rob/prismaquant/paper/archive/prismaquant_animation_2026-06-05.html
 
 2. The codebase the paper describes
    - Repo root: /home/rob/prismaquant

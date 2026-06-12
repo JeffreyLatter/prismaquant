@@ -276,20 +276,22 @@ class WeightSession:
                 if fr.canonical_format_name(fmt) != "BF16":
                     self._initialize_missing.append(qname)
                 continue
-            self._current[qname] = fr.canonical_format_name(fmt)
-            if self._current[qname] == "BF16":
+            target_canon = fr.canonical_format_name(fmt)
+            if target_canon == "BF16":
+                self._current[qname] = target_canon
                 self._bf16_kept += 1
                 continue  # live weight already holds BF16 source
             # Snapshot BEFORE any overwrite. BF16-kept weights can be
             # snapshotted lazily if a later stage actually changes them.
             self._ensure_bf16_snapshot_recorded(qname)
-            replacement = self._format_weight(qname, self._current[qname])
+            replacement = self._format_weight(qname, target_canon)
             if replacement is None:
                 continue  # cache miss; leave at BF16
             live = self._live_weight(qname)
             if live is None:
                 continue
             live.copy_(replacement.to(device=live.device, dtype=live.dtype))
+            self._current[qname] = target_canon
             self._applied += 1
         if self._initialize_missing:
             sample = self._initialize_missing[:5]

@@ -1042,6 +1042,19 @@ _CODEBOOK_NAMES = {
 
 def _batched_quantize(spec: fr.FormatSpec, stacked_w: torch.Tensor) -> torch.Tensor:
     elt = spec.weight_element_dtype
+    if spec.family == "nv":
+        # NVFP4 registry weights are export-codec-aligned (one rendering
+        # everywhere); the registry fn reshapes (-1, in) internally, so it
+        # is natively batch-shaped. Using the local codebook replica here
+        # would re-introduce the resident-vs-export scale mismatch the
+        # alignment removed (cost values must match the unbatched path,
+        # which calls spec.quantize_dequantize).
+        # Per-slice: the export codec derives a per-TENSOR global scale,
+        # and each stacked Linear must get its own (matching unbatched).
+        return torch.stack([
+            spec.quantize_dequantize(stacked_w[i].clone())
+            for i in range(stacked_w.shape[0])
+        ])
     if elt in _CODEBOOK_NAMES:
         # Reuse the registry's codebook tables. MX-family formats need
         # E8M0 scale snapping to match the OCP MX serving path; NV/FP

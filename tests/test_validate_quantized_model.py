@@ -1,7 +1,7 @@
 """Tests for the pre-ship quality validator.
 
 Goal: pin the bimodal-failure detection logic. The 27B shipped with
-mean NLL below threshold but p99 (max per-prompt avg NLL) was ~9 —
+mean NLL below threshold but max per-prompt avg NLL was ~9 —
 threshold catches it.
 
 Uses an inline HTTPServer so we can script fake vLLM responses and
@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+import prismaquant.validate_quantized_model as vqm
 from prismaquant.validate_quantized_model import (
     check_generation_sanity,
     check_perplexity,
@@ -27,8 +29,9 @@ from prismaquant.validate_quantized_model import (
 
 class _FakeVLLMHandler(BaseHTTPRequestHandler):
     # Class-level state so the test can configure per-test.
-    mode: str = "healthy"       # "healthy" | "bimodal" | "broken" | "nan"
+    mode: str = "healthy"       # "healthy" | "bimodal" | "one_outlier" | ...
     metrics_payload: str = ""
+    requests: list[dict] = []
 
     def log_message(self, *a, **kw):
         pass  # silence
@@ -52,6 +55,7 @@ class _FakeVLLMHandler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n)
         req = json.loads(raw)
+        self.requests.append(req)
         prompt = req.get("prompt", "")
 
         if self.path == "/v1/completions":
@@ -69,6 +73,9 @@ class _FakeVLLMHandler(BaseHTTPRequestHandler):
                     # 2 of every 10 prompts get healthy logprobs, rest broken
                     idx = EVAL_PROMPTS.index(prompt) if prompt in EVAL_PROMPTS else 0
                     per_tok = -1.5 if idx in (3, 7) else -9.5
+                elif self.mode == "one_outlier":
+                    idx = EVAL_PROMPTS.index(prompt) if prompt in EVAL_PROMPTS else 0
+                    per_tok = -20.0 if idx == 0 else -1.5
                 elif self.mode == "broken":
                     per_tok = -12.0
                 else:
@@ -98,6 +105,9 @@ class _FakeVLLMHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def fake_server():
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = ""
+    _FakeVLLMHandler.requests = []
     srv = HTTPServer(("127.0.0.1", 0), _FakeVLLMHandler)
     port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -127,13 +137,13 @@ def test_perplexity_catches_uniformly_broken(fake_server):
 
 def test_perplexity_catches_bimodal_broken(fake_server):
     """The 27B failure mode: 2/10 prompts normal, rest catastrophic.
-    Mean NLL can fall under threshold but the p99 (max per-prompt avg NLL)
+    Mean NLL can fall under threshold but the max per-prompt avg NLL
     must flag the bimodality."""
     _FakeVLLMHandler.mode = "bimodal"
     r = check_perplexity(fake_server, "any", max_ppl=1000, max_p99_nll=6,
                          max_mean_nll=100)
     assert not r.passed, (
-        f"bimodal failure must trip p99 even when mean / ppl slack: {r.detail}"
+        f"bimodal failure must trip tail NLL even when mean / ppl slack: {r.detail}"
     )
     assert "bimodal" in r.detail or "p99" in r.detail or "max(per-prompt" in r.detail
 
@@ -145,6 +155,17 @@ def test_perplexity_generous_thresholds_passes_bimodal(fake_server):
     r = check_perplexity(fake_server, "any", max_ppl=1e9, max_p99_nll=100,
                          max_mean_nll=100)
     assert r.passed
+
+
+def test_perplexity_reports_true_p99_and_max_tail_nll(fake_server):
+    _FakeVLLMHandler.mode = "one_outlier"
+    r = check_perplexity(fake_server, "any", max_ppl=1e9, max_p99_nll=100,
+                         max_mean_nll=100)
+
+    assert r.passed
+    assert r.metrics["max_nll_per_tok"] == pytest.approx(20.0)
+    assert r.metrics["p99_nll_per_tok"] < r.metrics["max_nll_per_tok"]
+    assert r.metrics["p99_nll_per_tok"] > r.metrics["mean_nll_per_tok"]
 
 
 # ----------------------------------------------------------------
@@ -230,6 +251,27 @@ def test_perplexity_runs_normally_without_spec_decode(fake_server):
     assert r.passed, f"healthy+no-spec-decode should pass: {r.detail}"
 
 
+def test_perplexity_bos_token_disables_server_special_tokens(fake_server):
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = ""
+
+    r = check_perplexity(
+        fake_server,
+        "any",
+        max_ppl=25,
+        max_p99_nll=6,
+        max_mean_nll=3,
+        bos_token="<bos>",
+        add_special_tokens=True,
+    )
+
+    assert r.passed
+    echo_reqs = [req for req in _FakeVLLMHandler.requests if req.get("echo")]
+    assert len(echo_reqs) == len(EVAL_PROMPTS)
+    assert all(req["prompt"].startswith("<bos>") for req in echo_reqs)
+    assert {req["add_special_tokens"] for req in echo_reqs} == {False}
+
+
 def test_perplexity_refuses_even_when_metrics_mostly_empty(fake_server):
     """Just the /metrics endpoint containing a single spec_decode
     counter is enough to suspend the check — don't require non-zero
@@ -262,6 +304,52 @@ def test_end_to_end_healthy_report_no_spec_decode(fake_server):
     # Spec-decode check skipped cleanly
     mtp = next(c for c in rep.checks if c.name == "mtp_acceptance")
     assert mtp.passed and "skipping" in mtp.detail.lower()
+
+
+def test_run_validation_forwards_bos_controls(fake_server):
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = (
+        '# healthy serve without spec-decode\n'
+        'vllm:request_success_total 0.0\n'
+    )
+
+    rep = run_validation(
+        fake_server,
+        "any",
+        wait_seconds=5,
+        bos_token="<bos>",
+        add_special_tokens=True,
+    )
+
+    assert rep.passed
+    assert rep.thresholds["bos_token"] == "<bos>"
+    echo_reqs = [req for req in _FakeVLLMHandler.requests if req.get("echo")]
+    assert echo_reqs
+    assert all(req["prompt"].startswith("<bos>") for req in echo_reqs)
+    assert {req["add_special_tokens"] for req in echo_reqs} == {False}
+
+
+def test_cli_exposes_bos_controls(fake_server, monkeypatch, capsys):
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = (
+        '# healthy serve without spec-decode\n'
+        'vllm:request_success_total 0.0\n'
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "validate_quantized_model",
+        "--base-url", fake_server,
+        "--model-name", "any",
+        "--wait-seconds", "5",
+        "--bos-token", "<bos>",
+        "--no-add-special-tokens",
+    ])
+
+    assert vqm.main() == 0
+    capsys.readouterr()
+    echo_reqs = [req for req in _FakeVLLMHandler.requests if req.get("echo")]
+    assert echo_reqs
+    assert all(req["prompt"].startswith("<bos>") for req in echo_reqs)
+    assert {req["add_special_tokens"] for req in echo_reqs} == {False}
 
 
 def test_end_to_end_spec_decode_forces_perplexity_skip(fake_server):

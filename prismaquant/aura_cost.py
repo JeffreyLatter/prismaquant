@@ -233,6 +233,44 @@ def _auto_n_chunks(
     return max(1, min(math.ceil(peak_gib / budget), len(names)))
 
 
+def _packed_expert_targets(model: nn.Module, profile=None) -> list[str]:
+    from prismaquant.build_rtn_cache import iter_quantizable_tensors
+
+    out: list[str] = []
+    for name, mod, attr in iter_quantizable_tensors(model, profile):
+        if isinstance(mod, nn.Linear):
+            continue
+        param = getattr(mod, attr, None)
+        if isinstance(param, nn.Parameter) and param.dim() == 3:
+            out.append(str(name))
+    return sorted(set(out))
+
+
+def _guard_packed_expert_coverage(
+    model: nn.Module,
+    profile=None,
+    *,
+    allow_omission: bool = False,
+) -> list[str]:
+    packed = _packed_expert_targets(model, profile)
+    if packed and not allow_omission:
+        sample = ", ".join(packed[:6])
+        raise RuntimeError(
+            "Aura cost does not yet implement packed-MoE expert costs; "
+            f"found {len(packed)} packed expert tensor(s), sample={sample}. "
+            "Use the empirical packed-expert cost path or pass "
+            "--allow-packed-expert-omission only for an explicit research/debug "
+            "run that accepts experts being omitted from the AURA cost payload."
+        )
+    if packed:
+        print(
+            "[aura-cost] WARNING: omitting packed-MoE experts from Aura cost "
+            f"by explicit request: {len(packed)} tensors, sample={packed[:6]}",
+            flush=True,
+        )
+    return packed
+
+
 def compute_aura_cost(
     model: nn.Module,
     calib_ids: torch.Tensor,
@@ -251,6 +289,7 @@ def compute_aura_cost(
     dw_dtype: str = "bfloat16",
     include_lm_head: bool = False,
     hook_harvest: bool = False,
+    allow_packed_expert_omission: bool = False,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -263,6 +302,8 @@ def compute_aura_cost(
     just computed in G memory-bounded passes. 0 = auto-size from free memory."""
     if n_probes < 1:
         raise ValueError(f"n_probes must be >= 1, got {n_probes!r}")
+    omitted_packed_experts = _guard_packed_expert_coverage(
+        model, allow_omission=allow_packed_expert_omission)
     _dw_torch_dtype = torch.float32 if str(dw_dtype) == "float32" else torch.bfloat16
     device = next(model.parameters()).device
     linears = _target_linears(model, include_lm_head=include_lm_head)
@@ -538,6 +579,7 @@ def compute_aura_cost(
             "calib_sha256": hashlib.sha256(
                 calib_ids.detach().cpu().contiguous().numpy().tobytes()
             ).hexdigest(),
+            "omitted_packed_experts": omitted_packed_experts,
             "dw_rendered_rows": n_rendered,
             "dw_rtn_fallback_rows": n_rtn,
             "git_commit": _git_commit(),
@@ -612,6 +654,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "(~10-15GB) OOM-kills between watchdog checks "
                         "(observed 2026-06-10). ~30% slower; numerically "
                         "identical recompute in fp32.")
+    p.add_argument("--allow-packed-expert-omission", action="store_true",
+                   help="Explicit research/debug escape: allow AURA to omit "
+                        "packed-MoE expert tensors from the cost payload. "
+                        "Default is fail-fast because packed experts need an "
+                        "empirical/hybrid expert-cost path, not silent omission.")
     p.add_argument("--device", default="cuda")
     args = p.parse_args(argv)
 
@@ -690,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dw_dtype=args.dw_dtype,
         include_lm_head=args.include_lm_head,
         hook_harvest=args.hook_harvest,
+        allow_packed_expert_omission=args.allow_packed_expert_omission,
     )
     payload["provenance"].update({
         "model": str(args.model),

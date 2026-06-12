@@ -5,6 +5,7 @@ import torch
 from prismaquant import format_registry as fr
 from prismaquant.export_native_compressed import (
     _mxfp8_dequantize_2d,
+    _rtn_dequant_nvfp4,
     quantize_dequantize_fp8_dynamic,
     quantize_dequantize_mxfp8,
 )
@@ -30,6 +31,27 @@ def test_plain_fp8_rtn_uses_eager_path(monkeypatch):
     assert compile_calls == []
     assert y.shape == x.shape
     assert not torch.equal(y, x)
+
+
+def test_e5m2_codebook_excludes_special_exp31_values():
+    cb = fr._CODEBOOKS["fp8_e5m2"]
+
+    assert float(cb.abs().max()) == 57344.0
+    assert not torch.any(cb.abs() > 57344.0)
+    assert torch.any(cb == torch.tensor(57344.0))
+
+
+def test_fp6_codebooks_include_ocp_subnormals():
+    e3m2 = fr._CODEBOOKS["fp6_e3m2"]
+    e2m3 = fr._CODEBOOKS["fp6_e2m3"]
+
+    for value in (0.0625, 0.125, 0.1875):
+        assert torch.any(e3m2 == torch.tensor(value))
+    assert not torch.any(e3m2 == torch.tensor(0.15625))
+
+    for i in range(1, 8):
+        assert torch.any(e2m3 == torch.tensor(i / 8.0))
+    assert not torch.any(e2m3 == torch.tensor(0.0625))
 
 
 def test_plain_fp8_weight_matches_compressed_tensors_fp8_dynamic():
@@ -162,6 +184,72 @@ def test_mx_e8m0_rtn_matches_export_scale_rounding():
         export = _mxfp8_dequantize_2d(export_q, export_scales)
 
         assert torch.allclose(registry, export, atol=0.0, rtol=0.0)
+
+
+def test_nvfp4_registry_rtn_matches_export_scale_convention(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+
+    previous = enc._NVFP4_SCALE_RULE
+    monkeypatch.setattr(enc, "_NVFP4_SCALE_RULE", enc.NVFP4_SCALE_RULE_STATIC_6)
+    try:
+        cases = [
+            torch.linspace(-3.7, 3.7, steps=64, dtype=torch.float32).reshape(4, 16)
+        ]
+        for seed in range(5):
+            torch.manual_seed(seed)
+            cases.append(torch.randn(16, 64, dtype=torch.float32) * 10 ** (seed - 2))
+
+        for w in cases:
+            registry = fr.get_format("NVFP4").quantize_dequantize(w)
+            export = _rtn_dequant_nvfp4(w, group_size=16)
+
+            assert torch.allclose(registry, export, atol=0.0, rtol=0.0)
+    finally:
+        monkeypatch.setattr(enc, "_NVFP4_SCALE_RULE", previous)
+
+
+def test_nvfp4_rank3_weight_matches_export_scale_convention(monkeypatch):
+    # WEIGHTS follow the export codec (one rendering everywhere).
+    import prismaquant.export_native_compressed as enc
+
+    previous = enc._NVFP4_SCALE_RULE
+    monkeypatch.setattr(enc, "_NVFP4_SCALE_RULE", enc.NVFP4_SCALE_RULE_STATIC_6)
+    try:
+        torch.manual_seed(23)
+        x = torch.randn(2, 5, 32, dtype=torch.float32) * 2.0
+        registry = fr.get_format("NVFP4").quantize_dequantize(x)
+        export = _rtn_dequant_nvfp4(
+            x.reshape(-1, x.shape[-1]),
+            group_size=16,
+        ).reshape_as(x)
+
+        assert torch.allclose(registry, export, atol=0.0, rtol=0.0)
+    finally:
+        monkeypatch.setattr(enc, "_NVFP4_SCALE_RULE", previous)
+
+
+def test_nvfp4_activation_emulation_is_batch_independent():
+    # ACTIVATIONS deliberately do NOT use the export codec: its per-tensor
+    # global scale would make the emulation depend on what else is in the
+    # batch, while serve-time activation quant uses a STATIC calibration
+    # global. Per-group dynamic RTN keeps each token's quantization a
+    # function of that token alone.
+    torch.manual_seed(23)
+    a = torch.randn(4, 32, dtype=torch.float32)
+    fmt = fr.get_format("NVFP4")
+    alone = fmt.activation_quantize_dequantize(a)
+    with_outlier = fmt.activation_quantize_dequantize(
+        torch.cat([a, 1000.0 * torch.ones(1, 32)], dim=0))[:4]
+    assert torch.allclose(alone, with_outlier, atol=0.0, rtol=0.0)
+
+
+def test_nvfp4_weight_emulation_pads_narrow_tensors():
+    # cols % 16 != 0 must not crash (zero-pad is exact under max-abs
+    # group scaling); regression for the ada08a8 narrow-tensor break.
+    x = torch.randn(8, 4, dtype=torch.float32)
+    out = fr.get_format("NVFP4").quantize_dequantize(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
 
 
 def test_mxfp8_exported_scales_match_compressed_tensors():

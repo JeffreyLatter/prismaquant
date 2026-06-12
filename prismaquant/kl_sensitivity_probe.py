@@ -31,7 +31,7 @@ from prismaquant.layer_config import load_assignment as load_layer_assignment
 from prismaquant.layer_state_cache import LayerHiddenStateCache
 from prismaquant.memory_management import phase_boundary_memory_cleanup
 from prismaquant.calibration_data import load_wikitext_calibration_windowed
-from prismaquant.model_profiles import DefaultProfile, detect_profile
+from prismaquant.model_profiles import detect_profile_with_warning
 from prismaquant.perturbed_x_cache import (
     calibration_data_hash,
     stage_text_only_under_work_root,
@@ -2567,6 +2567,7 @@ def run_probe(args: argparse.Namespace) -> dict:
             args.dataset,
             args.n_calib_samples,
             args.calib_seqlen,
+            calib_seed=args.calib_seed,
         )
     else:
         calib_ids = load_wikitext_calibration_windowed(
@@ -2614,10 +2615,10 @@ def run_probe(args: argparse.Namespace) -> dict:
     attn_impl = getattr(getattr(model, "config", None), "_attn_implementation", None)
     print(f"[kl-probe] attention_implementation={attn_impl}", flush=True)
 
-    try:
-        profile = detect_profile(args.model)
-    except Exception:
-        profile = DefaultProfile()
+    profile = detect_profile_with_warning(
+        args.model,
+        entrypoint="kl-probe",
+    )
     args.target_profile = resolve_target_profile(profile, args.target_profile)
     if args.target_profile not in serving_profile_names():
         raise SystemExit(

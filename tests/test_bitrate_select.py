@@ -26,8 +26,8 @@ def _measure_fn(kl_by, se_by):
 
 def test_saturation_strictly_decreasing_picks_asymptote():
     # KL halves every bit, noise tiny: no interior point is within the band of
-    # the asymptote, so B* is the densest (max-bpp) point. Bisection proves it
-    # measures far fewer than all grid points.
+    # the asymptote, so B* is the densest (max-bpp) point. The trace covers the
+    # full grid so non-monotone noisy points cannot be hidden by bisection.
     grid = [4.0, 5.0, 6.0, 7.0, 8.0]
     kl = {4.0: 0.16, 5.0: 0.08, 6.0: 0.04, 7.0: 0.02, 8.0: 0.01}
     se = {b: 1e-4 for b in grid}
@@ -35,7 +35,7 @@ def test_saturation_strictly_decreasing_picks_asymptote():
     assert res["bpp"] == pytest.approx(8.0)
     assert res["asymptote_bpp"] == pytest.approx(8.0)
     assert res["kl_asymptote"] == pytest.approx(0.01)
-    assert res["n_measurements"] < len(grid)  # bisection, not a dense sweep
+    assert res["n_measurements"] == len(grid)
 
 
 def test_saturation_flat_tail_within_noise_picks_early_bstar():
@@ -72,6 +72,22 @@ def test_saturation_z_widens_band_lowers_bstar():
     loose = find_saturation_bpp(grid, _measure_fn(kl, se), z=6.0)
     # a wider significance band admits lower-bpp points as "saturated"
     assert loose["bpp"] <= tight["bpp"]
+
+
+def test_saturation_nonmonotone_not_within_mid_does_not_hide_lower_bstar():
+    # 5.0 is within the asymptote band, 6.0 is a noisy not-within outlier.
+    # The old monotone bisection probed 6.0 first and discarded the lower half,
+    # returning 7.0. A full grid scan returns the actual leftmost within point.
+    grid = [4.0, 5.0, 6.0, 7.0, 8.0]
+    kl = {4.0: 0.10, 5.0: 0.031, 6.0: 0.050, 7.0: 0.030, 8.0: 0.028}
+    se = {b: 2e-3 for b in grid}
+    res = find_saturation_bpp(grid, _measure_fn(kl, se), z=2.0)
+
+    assert res["bpp"] == pytest.approx(5.0)
+    assert res["n_measurements"] == len(grid)
+    within = {t["bpp"]: t["within_noise"] for t in res["trace"]}
+    assert within[5.0] is True
+    assert within[6.0] is False
 
 
 # --------------------------------------------------------------------------

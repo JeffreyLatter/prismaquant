@@ -85,6 +85,8 @@ def validate_artifact(
     n_mmlu_questions: int = 200,
     calib_seqlen: int = 512,
     calib_n_samples: int = 8,
+    calib_split: str = "test",
+    calib_seed: int = 42,
     progress: bool = True,
     _metric_backend: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict:
@@ -108,6 +110,8 @@ def validate_artifact(
             n_mmlu_questions=int(n_mmlu_questions),
             calib_seqlen=int(calib_seqlen),
             calib_n_samples=int(calib_n_samples),
+            calib_split=str(calib_split),
+            calib_seed=int(calib_seed),
             progress=bool(progress),
         )
     )
@@ -140,6 +144,12 @@ def validate_artifact(
     metrics["model_sha"] = _sha256_model_reference(model_path)
     metrics["layer_config_sha"] = config_sha
     metrics["eval_seconds"] = float(time.monotonic() - started)
+    # Metric-era marker (QC on review-batch): the end-KL eval split moved
+    # from wikitext TRAIN to TEST on 2026-06-12 — pre-marker registry
+    # records were measured on train and are NOT comparable at face value.
+    # Records without 'eval_split' are the train era.
+    metrics["eval_split"] = "test"
+    metrics["metric_era"] = "2026-06-12-test-split"
     return metrics
 
 
@@ -175,6 +185,8 @@ def _compute_metrics(
     n_mmlu_questions: int,
     calib_seqlen: int,
     calib_n_samples: int,
+    calib_split: str,
+    calib_seed: int,
     progress: bool,
 ) -> dict:
     try:
@@ -245,6 +257,8 @@ def _compute_metrics(
                 device=torch_device,
                 calib_seqlen=calib_seqlen,
                 calib_n_samples=calib_n_samples,
+                calib_split=calib_split,
+                calib_seed=calib_seed,
                 cal_hash=cal_hash,
                 progress=progress,
             )
@@ -643,6 +657,8 @@ def _end_kl(
     device,
     calib_seqlen: int,
     calib_n_samples: int,
+    calib_split: str,
+    calib_seed: int,
     cal_hash: str,
     progress: bool,
 ) -> float:
@@ -659,6 +675,8 @@ def _end_kl(
         cache_dir=cache_dir,
         n_samples=int(calib_n_samples),
         seqlen=int(calib_seqlen),
+        split=str(calib_split),
+        seed=int(calib_seed),
     )
     ref_log_probs = []
     for i in _progress_iter(range(calib_ids.size(0)), progress, "end-kl-ref"):
@@ -696,6 +714,8 @@ def _fixed_calib_ids(
     cache_dir: Path,
     n_samples: int,
     seqlen: int,
+    split: str = "test",
+    seed: int = 42,
 ):
     import torch
 
@@ -703,14 +723,14 @@ def _fixed_calib_ids(
         tokenizer,
         load_dataset,
         cache_dir=cache_dir,
-        split="train",
+        split=split,
         n_tokens=None,
     )[0]
     if int(ids.numel()) < seqlen + 1:
         repeats = math.ceil((seqlen + 1) / max(int(ids.numel()), 1))
         ids = ids.repeat(repeats)
     max_start = max(int(ids.numel()) - int(seqlen), 0)
-    rng = random.Random(42)
+    rng = random.Random(int(seed))
     if max_start >= n_samples:
         starts = rng.sample(range(max_start), n_samples)
     else:
@@ -881,6 +901,8 @@ def _main_validate(argv: list[str]) -> int:
     ap.add_argument("--n-mmlu-questions", type=int, default=200)
     ap.add_argument("--calib-seqlen", type=int, default=512)
     ap.add_argument("--calib-n-samples", type=int, default=8)
+    ap.add_argument("--calib-split", default="test")
+    ap.add_argument("--calib-seed", type=int, default=42)
     ap.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--register", action="store_true")
     ap.add_argument("--registry", default=str(DEFAULT_REGISTRY_PATH))
@@ -900,6 +922,8 @@ def _main_validate(argv: list[str]) -> int:
         n_mmlu_questions=args.n_mmlu_questions,
         calib_seqlen=args.calib_seqlen,
         calib_n_samples=args.calib_n_samples,
+        calib_split=args.calib_split,
+        calib_seed=args.calib_seed,
         progress=args.progress,
     )
     output = dict(metrics)
@@ -933,6 +957,8 @@ def _main_validate(argv: list[str]) -> int:
                 "n_mmlu_questions": args.n_mmlu_questions,
                 "calib_seqlen": args.calib_seqlen,
                 "calib_n_samples": args.calib_n_samples,
+                "calib_split": args.calib_split,
+                "calib_seed": args.calib_seed,
                 "device": args.device,
                 "dtype": args.dtype,
             },

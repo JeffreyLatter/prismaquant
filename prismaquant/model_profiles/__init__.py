@@ -24,6 +24,7 @@ from .qwen3_5_dense import Qwen3_5DenseProfile
 from .qwen3_moe import Qwen3MoeProfile
 from .registry import (
     detect_profile,
+    detect_profile_with_warning,
     profile_from_config,
     profile_from_model,
     register_profile,
@@ -48,6 +49,7 @@ __all__ = [
     "Gemma4Profile",
     "Lfm2MoeProfile",
     "detect_profile",
+    "detect_profile_with_warning",
     "profile_from_config",
     "profile_from_model",
     "register_profile",

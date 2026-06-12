@@ -555,18 +555,21 @@ something like `tools/build_rtn_baseline.py` (it is a research tool)
 or to add a header comment marking it explicitly as research-only.
 Both live in `prismaquant/` proper, which is misleading.
 
-### 6.3 Packed-MoE exclusion is intentional, not a parallel cache
+### 6.3 Packed-MoE uses the shared production cache
 
-`production_weight_cache.py:97-111` defines
-`_UNCACHED_PACKED_EXPERT_RE` and `is_uncached_packed_expert_qname`,
-and the residency check explicitly skips qnames matching it. The
-docstring justifies this: the cache renders 2D `nn.Linear` weights;
-packed 3D expert tensors are quantized by `_quantize_3d_packed` in
-the exporter. The cost pass now replays routed packed-MoE forwards
-when activation caches are available, so the allocator can price real
-`output_mse` for packed experts. The remaining gap is render-side:
-GPTQ, joint_scale_opt, scale_sweep, and calibrated activation clip are
-still not applied inside `_quantize_3d_packed`.
+Packed expert tensors are no longer allowed to disappear behind an
+uncached exporter-side RTN path. `production_weight_cache.py` renders
+packed experts through `fill_packed_expert_cache_entries`, using the
+shared `ProductionWeightCache` and the batched GPTQ path for same-shape
+experts. The exporter now treats an uncached non-BF16 packed expert as
+a hard production error unless the explicit research-only RTN escape is
+set.
+
+The remaining gap is not cache residency or GPTQ parity for the
+default packed-expert path. The open work is to extend the same measured
+provenance to any future per-expert split-format policy and to justify
+additional mechanisms such as scale-sweep or calibrated activation
+clipping with apples-to-apples validation.
 
 ---
 
@@ -607,18 +610,17 @@ for any future format that joins the menu.
 
 ### 7.2 Dense (2D) vs packed-MoE (3D) paths
 
-`_quantize_2d` (line 3151, 19 format branches) and
-`_quantize_3d_packed` (line 3494, 5 format branches) are the two
-entry points. The divergence is **legitimate** at the codec layer
-(3D vs 2D have different memory layouts) but **lazy** at the
-optimisation-stack layer: packed experts still have no render-side
-GPTQ, no JSO, and no scale_sweep, even though the same math applies
-and `export_batched_gptq.py` already implements batched same-shape
-NVFP4 GPTQ proven to be bit-exact-equivalent to the per-Linear path.
-The measurement half is closed: `measure_quant_cost.py` can replay
-routed packed-MoE forward passes and record measured `output_mse`.
+`_quantize_2d` and `_quantize_3d_packed` remain separate codec entry
+points because dense Linears and packed expert tensors have different
+memory layouts. The production render stack now closes the old packed
+expert GPTQ gap before export: packed experts are rendered into the
+shared cache by the batched GPTQ path, and export hard-fails on missing
+non-BF16 packed-expert cache entries.
 
-Closing this gap is one of two highest-impact follow-ups (§13).
+The remaining distinction is mechanism coverage. Dense Linears have the
+full historical menu of render levers, while packed experts should only
+gain additional mechanisms when the measured production-cache path and
+vLLM-served artifact validation justify them.
 
 ### 7.3 MTP passthrough deduplication
 
@@ -1017,10 +1019,10 @@ is insufficient to remove it from the default recipe:
 3.  Grouped-KL cost was newly introduced in the same session;
     disentangling JSO from grouped cost is a separate experiment.
 
-A queued **27B isolation A/B** (`qwen36_27b_jso_isolation.sh`)
-holds cost surrogate constant and varies only the renderer. The bar
-for removing JSO is reproducibility under matched cost surrogates at
-the actual ship target.
+The previously proposed 27B isolation A/B was cancelled; there is no
+live launcher for it. JSO remains part of the production render default,
+and any future attempt to remove it needs a matched-cost validation run
+at the actual ship target.
 
 ### 11.11 REAP / expert pruning
 
@@ -1061,15 +1063,15 @@ compatibility gates in the same registry.
 
 ### 12.2 Packed-MoE render parity
 
-Packed-MoE experts can now be measured with router-aware
-activation-output MSE, but `_quantize_3d_packed` still lacks the
-full dense render stack: GPTQ, scale-sweep, Fisher row weights,
-calibrated activation clipping, and NVFP4 joint-scale optimization.
+Packed-MoE experts now have production-cache render parity for the
+default GPTQ path: routed expert activations feed the render pass,
+same-shape experts are rendered through the batched path, and export
+refuses uncached non-BF16 packed experts.
 
-The exporter should wire `export_batched_gptq.py` into the 3D path
-and thread the same activation metadata used by dense Linears.
-Format-specific JSO should stay disabled where the measurement does
-not justify it.
+Future packed-MoE work should focus on measured provenance for any
+split-format expert policy and on validation-gated mechanisms beyond
+the current default stack. Format-specific JSO or scale-sweep should
+stay disabled where the measurement does not justify it.
 
 ### 12.3 Cost provenance
 

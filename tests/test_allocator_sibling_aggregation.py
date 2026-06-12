@@ -29,13 +29,17 @@ from prismaquant.allocator_solver import promote_serving_units
 from prismaquant.allocator import (
     Candidate,
     _FUSED_SIBLING_MARKER,
+    _validate_assignment_candidate_membership,
     aggregate_fused_siblings,
     build_candidates,
     compute_achieved,
     expand_fused_sibling_assignment,
     promote_moe_pair,
     solve_with_promotion,
+    validate_default_profile_format_menu,
+    validate_final_serving_promotion_noop,
 )
+from prismaquant.model_profiles import DefaultProfile
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +193,45 @@ def test_super_linear_predicted_dloss_is_sum_of_members():
             f"format {c.fmt}: super Δloss={c.predicted_dloss} "
             f"vs expected sum={expected}"
         )
+
+
+def test_super_linear_uses_format_alias_cost_entries_and_gains():
+    names, stats, costs = _mk_stats_and_costs()
+    qkv_members = [n for n in names if n.endswith((".q_proj", ".k_proj", ".v_proj"))]
+    for name in qkv_members:
+        h = stats[name]["h_trace"]
+        costs[name] = {
+            "FP8_DYNAMIC": {
+                "weight_mse": 0.01,
+                "predicted_dloss": 0.5 * h * 0.01,
+            },
+            "BF16": {"weight_mse": 0.0, "predicted_dloss": 0.0},
+        }
+    specs = [fr.get_format("FP8_E4M3"), fr.REGISTRY["BF16"]]
+    cands = build_candidates(
+        stats,
+        costs,
+        specs,
+        calibrated_gains={"FP8_DYNAMIC": 2.0},
+    )
+
+    stats_ext, costs_ext, cands_ext = aggregate_fused_siblings(
+        stats,
+        costs,
+        specs,
+        cands,
+        _FakeProfile(),
+        calibrated_gains={"FP8_DYNAMIC": 2.0},
+    )
+
+    qkv_super = next(n for n in cands_ext if "qkv_proj" in n)
+    assert "error" not in costs_ext[qkv_super]["FP8_E4M3"]
+    cand = next(c for c in cands_ext[qkv_super] if c.fmt == "FP8_E4M3")
+    expected = sum(
+        costs[name]["FP8_DYNAMIC"]["predicted_dloss"]
+        for name in qkv_members
+    ) * 2.0
+    assert abs(cand.predicted_dloss - expected) < 1e-12
 
 
 def test_asymmetric_sensitivity_sums_contributions():
@@ -353,6 +396,69 @@ def test_serving_unit_promotion_handles_overlapping_groups_order_independently()
         "overlap.mid": "BF16",
         "overlap.right": "BF16",
     }
+
+
+def test_assignment_candidate_membership_rejects_unavailable_promoted_format():
+    candidates = {
+        "expert.gate": [Candidate("NVFP4", 4.5, 9, 0.1)],
+        "expert.down": [Candidate("BF16", 16.0, 32, 0.0)],
+    }
+    assignment = {
+        "expert.gate": "BF16",
+        "expert.down": "BF16",
+        "mtp.proj": "NVFP4",
+    }
+    fixed = {"mtp.proj": Candidate("NVFP4", 4.5, 9, 0.1)}
+
+    try:
+        _validate_assignment_candidate_membership(
+            assignment,
+            candidates,
+            fixed_chosen_candidates=fixed,
+        )
+    except SystemExit as exc:
+        assert "expert.gate" in str(exc)
+        assert "mtp.proj" not in str(exc)
+    else:
+        raise AssertionError("expected promoted unavailable format to fail")
+
+
+def test_default_profile_rejects_multi_format_menu_without_escape():
+    specs = [fr.REGISTRY["NVFP4"], fr.REGISTRY["BF16"]]
+
+    try:
+        validate_default_profile_format_menu(DefaultProfile(), specs)
+    except SystemExit as exc:
+        assert "DefaultProfile only enforces its fallback fused groups" in str(exc)
+    else:
+        raise AssertionError("multi-format DefaultProfile menu should fail")
+
+
+def test_default_profile_allows_single_format_or_explicit_escape():
+    validate_default_profile_format_menu(
+        DefaultProfile(),
+        [fr.REGISTRY["NVFP4"]],
+    )
+    validate_default_profile_format_menu(
+        DefaultProfile(),
+        [fr.REGISTRY["NVFP4"], fr.REGISTRY["BF16"]],
+        allow_default_profile=True,
+    )
+
+
+def test_final_serving_promotion_must_be_noop_for_accounting():
+    validate_final_serving_promotion_noop({"a": "NVFP4"}, {"a": "NVFP4"})
+
+    try:
+        validate_final_serving_promotion_noop(
+            {"a": "NVFP4"},
+            {"a": "BF16"},
+        )
+    except SystemExit as exc:
+        assert "achieved_bits/Delta-loss" in str(exc)
+        assert "a" in str(exc)
+    else:
+        raise AssertionError("changed final promotion should fail")
 
 
 # ---------------------------------------------------------------------------

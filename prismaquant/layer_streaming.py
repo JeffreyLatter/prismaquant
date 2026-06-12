@@ -1128,6 +1128,14 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
     return f"{full_path}.embed_tokens." if full_path else "embed_tokens."
 
 
+def _layer_attention_type(layer: nn.Module):
+    return (
+        getattr(layer, "layer_type", None)
+        or getattr(getattr(layer, "self_attn", None), "layer_type", None)
+        or getattr(getattr(layer, "attention", None), "layer_type", None)
+    )
+
+
 def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
                 position_embeddings, attention_mask, position_ids,
                 past_key_values=None, **extra) -> torch.Tensor:
@@ -1143,21 +1151,37 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     by `_compute_position_embeddings` for multi-layer-type-rope models like
     Gemma3/Gemma4), select this layer's entry via its attention `layer_type`
     so sliding- and full-attention layers each get their own rope.
+
+    When `attention_mask` is a `{layer_type: mask}` dict, select by the same
+    layer type. This mirrors Gemma3/Gemma4 HF forwards, where sliding-window
+    and full-attention layers receive different masks.
     """
+    lt = None
     pe = position_embeddings
     if isinstance(pe, dict):
-        lt = (getattr(layer, "layer_type", None)
-              or getattr(getattr(layer, "self_attn", None), "layer_type", None)
-              or getattr(getattr(layer, "attention", None), "layer_type", None))
+        lt = _layer_attention_type(layer)
         pe = pe.get(lt)
         if pe is None:
-            # Unknown/missing layer_type — fall back to any entry rather than
-            # crash (single-type rope, or a layer that doesn't tag its type).
-            # `None` default guards against an empty dict (StopIteration).
-            pe = next(iter(position_embeddings.values()), None)
+            if len(position_embeddings) == 1:
+                pe = next(iter(position_embeddings.values()))
+            else:
+                raise RuntimeError(
+                    "per-layer position_embeddings requires a known "
+                    f"layer_type; got {lt!r} for {layer.__class__.__name__}"
+                )
+    am = attention_mask
+    if isinstance(am, dict):
+        if lt is None:
+            lt = _layer_attention_type(layer)
+        if lt not in am:
+            raise RuntimeError(
+                "per-layer attention mask requires a known layer_type; "
+                f"got {lt!r} for {layer.__class__.__name__}"
+            )
+        am = am[lt]
     out = layer(
         hidden_states=hidden,
-        attention_mask=attention_mask,
+        attention_mask=am,
         position_ids=position_ids,
         past_key_values=past_key_values,
         use_cache=False,
@@ -1206,6 +1230,68 @@ def _make_causal_mask(seqlen: int, device: torch.device, dtype: torch.dtype):
     mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=dtype)
     mask = torch.triu(mask, diagonal=1)
     return mask.unsqueeze(0).unsqueeze(0)
+
+
+def _compute_attention_mask(
+    base_model: nn.Module,
+    hidden: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    past_key_values=None,
+):
+    """Return the streaming attention mask for a full forward pass.
+
+    Most models use one full causal mask. Gemma3/Gemma4-style hybrid models
+    declare ``config.layer_types`` with both ``full_attention`` and
+    ``sliding_attention``; those must receive the same per-type mask mapping
+    that HuggingFace's model.forward builds.
+    """
+    cfg = getattr(base_model, "config", None)
+    layer_types = tuple(getattr(cfg, "layer_types", ()) or ())
+    if cfg is None or "sliding_attention" not in layer_types:
+        return _make_causal_mask(hidden.size(1), hidden.device, hidden.dtype)
+
+    try:
+        from transformers.masking_utils import (
+            create_causal_mask,
+            create_sliding_window_causal_mask,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "sliding-window layer_types require transformers masking_utils"
+        ) from exc
+
+    mask_kwargs = {
+        "config": cfg,
+        "inputs_embeds": hidden,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    sliding_mask_kwargs = dict(mask_kwargs)
+    if getattr(cfg, "use_bidirectional_attention", False):
+        try:
+            from transformers.models.gemma3.modeling_gemma3 import (
+                _bidirectional_window_overlay,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Gemma3 bidirectional sliding masks require the Gemma3 "
+                "transformers masking helper"
+            ) from exc
+        mask_kwargs["or_mask_function"] = (
+            lambda *args: torch.tensor(True, dtype=torch.bool)
+        )
+        sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(
+            cfg.sliding_window
+        )
+
+    return {
+        "full_attention": create_causal_mask(**mask_kwargs),
+        "sliding_attention": create_sliding_window_causal_mask(
+            **sliding_mask_kwargs
+        ),
+    }
 
 
 def _resolve_base_prefix(root: nn.Module, base: nn.Module) -> str:

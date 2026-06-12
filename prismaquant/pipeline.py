@@ -655,6 +655,22 @@ def production_pipeline_spec_from_config(
         disabled=disabled_render_mechanisms,
     )
     spec = default_production_pipeline_spec(render_mechanisms=mechanisms)
+    omitted_stages: list[str] = []
+    if str(selection_mode or "").strip().lower() == "surrogate":
+        omitted_stages.append("validate.kl")
+    # run-pipeline.sh records the vLLM smoke command for manual execution; it
+    # does not execute that stage as part of the default production run.
+    omitted_stages.append("validate.vllm_smoke")
+    if omitted_stages:
+        omitted = set(omitted_stages)
+        spec = PipelineSpec(
+            id=spec.id,
+            artifacts=spec.artifacts,
+            gates=spec.gates,
+            stages=tuple(stage for stage in spec.stages if stage.name not in omitted),
+            description=spec.description,
+            metadata=dict(spec.metadata),
+        )
     component_specs = tuple(_resolve_pipeline_component(c) for c in (components or ()))
     if component_specs:
         spec = compose_pipeline_spec(spec, component_specs)
@@ -675,6 +691,8 @@ def production_pipeline_spec_from_config(
         "production_cache": production_cache,
         "production_recache": production_recache,
     }
+    if omitted_stages:
+        metadata["omitted_unexecuted_stages"] = list(omitted_stages)
     if component_specs:
         metadata["components"] = list(spec.metadata.get("components", ()))
     return PipelineSpec(

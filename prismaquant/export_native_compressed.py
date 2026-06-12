@@ -127,6 +127,20 @@ _NVFP4_SCALE_RULE_ALIASES = {
     "joint_scale_optimization": NVFP4_SCALE_RULE_JOINT_MSE,
     "codebook_mse": NVFP4_SCALE_RULE_JOINT_MSE,
 }
+_DO_NO_HARM_STATS: Counter = Counter()
+
+
+def _record_do_no_harm_revert(fmt: str) -> None:
+    _DO_NO_HARM_STATS[f"{fmt}_reverts"] += 1
+
+
+def _record_do_no_harm_failure(fmt: str, linear_name: str | None, exc: Exception) -> None:
+    _DO_NO_HARM_STATS[f"{fmt}_failures"] += 1
+    name = linear_name or "<unknown>"
+    print(
+        f"[do-no-harm] WARN {name} {fmt} gate failed: {exc!r}",
+        flush=True,
+    )
 
 # Back-compat exports for unit tests that validate the Qwen3.5 naming
 # and per-expert catch-all contract via the historical helper symbols.
@@ -216,10 +230,20 @@ def _decode_nvfp4_indices_with_eff_scale(
 def _nvfp4_mse_for_group_scale(
     grouped: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    global_real: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if global_real is not None:
+        eff_scale = _nvfp4_effective_scale_from_real(
+            scale,
+            global_real,
+            quantize_fp8=True,
+        ).unsqueeze(-1)
+    else:
+        eff_scale = scale.unsqueeze(-1)
     _idx, dq = _nvfp4_quantize_dequantize_with_eff_scale(
         grouped,
-        scale.unsqueeze(-1),
+        eff_scale,
     )
     return (grouped - dq).pow(2).sum(dim=-1)
 
@@ -227,6 +251,8 @@ def _nvfp4_mse_for_group_scale(
 def _nvfp4_best_max_to_level_scale(
     grouped: torch.Tensor,
     levels: Sequence[float],
+    *,
+    global_real: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pick the best max-to-codebook-level scale for each NVFP4 group.
 
@@ -242,7 +268,11 @@ def _nvfp4_best_max_to_level_scale(
     best_mse: torch.Tensor | None = None
     for level in levels:
         scale = max_abs / float(level)
-        mse = _nvfp4_mse_for_group_scale(grouped, scale)
+        mse = _nvfp4_mse_for_group_scale(
+            grouped,
+            scale,
+            global_real=global_real,
+        )
         if best_mse is None:
             best_mse = mse
             best_scale = scale
@@ -283,6 +313,7 @@ def _select_nvfp4_group_scales(
     grouped: torch.Tensor,
     *,
     scale_rule: str | None = None,
+    global_real: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return per-block real NVFP4 scales for ``grouped[..., group_size]``.
 
@@ -300,10 +331,80 @@ def _select_nvfp4_group_scales(
     if rule == NVFP4_SCALE_RULE_STATIC_6:
         return scale_6
     if rule == NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE:
-        return _nvfp4_best_max_to_level_scale(grouped, (6.0, 4.0))
+        return _nvfp4_best_max_to_level_scale(
+            grouped,
+            (6.0, 4.0),
+            global_real=global_real,
+        )
     if rule == NVFP4_SCALE_RULE_JOINT_MSE:
-        return _nvfp4_best_max_to_level_scale(grouped, _NVFP4_JOINT_SCALE_LEVELS)
+        return _nvfp4_best_max_to_level_scale(
+            grouped,
+            _NVFP4_JOINT_SCALE_LEVELS,
+            global_real=global_real,
+        )
     raise AssertionError(f"unhandled NVFP4 scale rule: {rule!r}")
+
+
+def _nvfp4_snapped_scale_scoring_enabled() -> bool:
+    """Score NVFP4 scale candidates under the FP8-SNAPPED effective scale.
+
+    Research lever (default OFF). Scoring under the snapped scale the
+    served kernel actually uses is more faithful in principle, but it
+    changes the shipped NVFP4 bytes for the joint_mse (JSO, a production
+    default lever) and four_over_six rules and has not cleared a served
+    gold-metric A/B (QC finding on review-batch M21). Promote per the
+    ladder: served KL+PPL at matched bpp on 4B, then a 27B confirmation.
+    """
+    return os.environ.get(
+        "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING", "0") != "0"
+
+
+def _select_nvfp4_pack_scales_and_global(
+    grouped: torch.Tensor,
+    *,
+    global_real_override: torch.Tensor | None = None,
+    scale_rule: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _nvfp4_snapped_scale_scoring_enabled():
+        # Pre-2026-06-12 behavior (byte-stable with shipped artifacts):
+        # scales scored under the RAW real scale; the tensor global is
+        # derived once from the chosen scales (or taken verbatim from the
+        # fused-sibling override) without re-scoring.
+        scale = _select_nvfp4_group_scales(grouped, scale_rule=scale_rule)
+        if global_real_override is not None:
+            global_real = global_real_override.to(
+                grouped.device, dtype=torch.float32).clamp_min(1e-12)
+        else:
+            global_real = (scale.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+        return scale, global_real
+    scale = _select_nvfp4_group_scales(grouped, scale_rule=scale_rule)
+    if global_real_override is not None:
+        global_real = global_real_override.to(
+            grouped.device,
+            dtype=torch.float32,
+        ).clamp_min(1e-12)
+        scale = _select_nvfp4_group_scales(
+            grouped,
+            scale_rule=scale_rule,
+            global_real=global_real,
+        )
+        return scale, global_real
+
+    global_real = (scale.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+    for _ in range(3):
+        snapped_scale = _select_nvfp4_group_scales(
+            grouped,
+            scale_rule=scale_rule,
+            global_real=global_real,
+        )
+        next_global = (
+            snapped_scale.amax() / FP8_E4M3_MAX
+        ).clamp_min(1e-12)
+        scale = snapped_scale
+        if torch.allclose(next_global, global_real, rtol=0.0, atol=1e-12):
+            break
+        global_real = next_global
+    return scale, global_real
 
 
 def _env_int_clamped(name: str, default: int, lo: int, hi: int) -> int:
@@ -387,6 +488,7 @@ def _nvfp4_quantize_grouped_codec(
         scale_real = _select_nvfp4_group_scales(
             grouped_f,
             scale_rule=scale_rule,
+            global_real=global_real,
         )
     scale_fp8 = _nvfp4_fp8_scale_from_real(
         scale_real.to(grouped_f.device, dtype=torch.float32),
@@ -951,7 +1053,10 @@ def _production_cache_expected_keys(
             continue
         key = _production_cache_lookup_key(qname, cache_fmt)
         if key is None:
-            if is_uncached_packed_expert_qname(qname):
+            if (
+                _ALLOW_PACKED_EXPERT_RTN
+                and is_uncached_packed_expert_qname(qname)
+            ):
                 continue
             missing.append((qname, cache_fmt))
         else:
@@ -1019,14 +1124,17 @@ def _production_cache_fingerprint(
     }
 
 
-def _production_cache_scales(cache) -> dict[str, float]:
+def _production_cache_scales(cache, *, profile=None) -> dict[str, float]:
     activation_max_abs = getattr(cache, "activation_max_abs", None) or {}
     scales = {
         name: (6.0 / float(max_abs))
         for name, max_abs in activation_max_abs.items()
         if max_abs and float(max_abs) > 0.0
     }
-    return _unify_input_global_scales_across_fused_siblings(scales)
+    return _unify_input_global_scales_across_fused_siblings(
+        scales,
+        profile=profile,
+    )
 
 
 
@@ -1400,6 +1508,29 @@ _ALLOW_PACKED_EXPERT_RTN = (
 )
 _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
+
+
+def _packed_expert_render_hist_label(
+    fmt: str,
+    *,
+    is_bf16: bool,
+    source_label: str,
+    cached_3d: torch.Tensor | None,
+) -> str:
+    if is_bf16:
+        return source_label
+    return f"{fmt}+cached" if cached_3d is not None else f"{fmt}+rtn"
+
+
+def _packed_expert_export_provenance() -> dict[str, object]:
+    cache = _PRODUCTION_WEIGHT_CACHE
+    metadata = dict(getattr(cache, "metadata", {}) or {}) if cache is not None else {}
+    coverage = metadata.get("packed_expert_coverage")
+    return {
+        "rtn_escape_enabled": bool(_ALLOW_PACKED_EXPERT_RTN),
+        "cache_has_packed_expert_coverage": coverage is not None,
+        "cache_packed_expert_coverage": coverage or {},
+    }
 
 
 def _gptq_column_block_size(cols: int) -> int:
@@ -1979,8 +2110,8 @@ def compute_nvfp4_global_real(weight: torch.Tensor, group_size: int = 16
     `quantize_dequantize_nvfp4(global_real_override=...)`."""
     rows, cols = weight.shape
     grouped = weight.float().reshape(rows, cols // group_size, group_size)
-    s_g_real = _select_nvfp4_group_scales(grouped)
-    return (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+    _s_g_real, global_real = _select_nvfp4_pack_scales_and_global(grouped)
+    return global_real
 
 
 def quantize_dequantize_nvfp4(
@@ -2013,11 +2144,10 @@ def quantize_dequantize_nvfp4(
         raise ValueError(f"NVFP4 group_size={group_size} ∤ {cols}")
     n_groups = cols // group_size
     grouped = weight.float().reshape(rows, n_groups, group_size)
-    s_g_real = _select_nvfp4_group_scales(grouped)                       # the actual per-group scale
-    if global_real_override is not None:
-        global_real = global_real_override.to(weight.device).clamp_min(1e-12)
-    else:
-        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)  # scalar
+    s_g_real, global_real = _select_nvfp4_pack_scales_and_global(
+        grouped,
+        global_real_override=global_real_override,
+    )
     codec = _nvfp4_quantize_grouped_codec(
         grouped,
         global_real=global_real,
@@ -2046,11 +2176,10 @@ def _rtn_dequant_nvfp4(
     n_groups = cols // group_size
     W = weight.float()
     grouped = W.reshape(rows, n_groups, group_size)
-    s_g_real = _select_nvfp4_group_scales(grouped)
-    if global_real_override is not None:
-        global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
-    else:
-        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+    s_g_real, global_real = _select_nvfp4_pack_scales_and_global(
+        grouped,
+        global_real_override=global_real_override,
+    )
     codec = _nvfp4_quantize_grouped_codec(
         grouped,
         global_real=global_real,
@@ -2074,6 +2203,18 @@ def quantize_dequantize_nvfp4_packed(
     grouped = packed.float().reshape(E, M, g, group_size)
     s_g_real = _select_nvfp4_group_scales(grouped)                          # [E, M, g]
     global_real = (s_g_real.reshape(E, -1).amax(dim=-1) / FP8_E4M3_MAX).clamp_min(1e-12)  # [E]
+    for _ in range(3):
+        snapped = _select_nvfp4_group_scales(
+            grouped,
+            global_real=global_real.view(E, 1, 1),
+        )
+        next_global = (
+            snapped.reshape(E, -1).amax(dim=-1) / FP8_E4M3_MAX
+        ).clamp_min(1e-12)
+        s_g_real = snapped
+        if torch.allclose(next_global, global_real, rtol=0.0, atol=1e-12):
+            break
+        global_real = next_global
     codec = _nvfp4_quantize_grouped_codec(
         grouped,
         global_real=global_real.view(E, 1, 1),
@@ -3186,9 +3327,10 @@ def _build_target_list(vllm_names: list[str]) -> list[str]:
     Names that aren't per-expert Linears pass through as explicit
     `re:^...$` regexes (same output as before).
 
-    Within a (layer, proj) bucket, if every expert index 0..N-1 is
-    present we emit a `[0-9]+` regex; sparse subsets get an enumerated
-    alternation.
+    Within a (layer, proj) bucket we always emit a `[0-9]+` expert-index
+    wildcard. The exporter relies on the allocator/export coherence gates to
+    keep every expert in a layer on one scheme for a given projection; sparse
+    within-layer expert subsets are not represented as separate alternations.
     """
     from collections import defaultdict
 
@@ -3723,6 +3865,7 @@ def _quantize_2d(
                 mse_work = float((a2 * (w_orig_f - w_work).pow(2)
                                   .sum(dim=0)).sum())
                 if mse_rtn < mse_work:
+                    _record_do_no_harm_revert("NVFP4")
                     if os.environ.get(
                         "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
                         print(f"[do-no-harm] {linear_name}: "
@@ -3731,7 +3874,7 @@ def _quantize_2d(
                               flush=True)
                     w_work = w_rtn
             except Exception as _e:
-                pass  # never fail the export over the gate
+                _record_do_no_harm_failure("NVFP4", linear_name, _e)
 
         # Step 4: final NVFP4 pack. `w_work` is the post-GPTQ,
         # post-act-round, post-scale-sweep weight.
@@ -3863,6 +4006,7 @@ def _quantize_2d(
                         row_weights=fisher_row_weights,
                     )
                     if err_rtn < err_work:
+                        _record_do_no_harm_revert(fmt)
                         if os.environ.get(
                             "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
                             print(f"[do-no-harm] {linear_name}: "
@@ -3870,8 +4014,8 @@ def _quantize_2d(
                                   f"(mse {err_work:.3e} → {err_rtn:.3e})",
                                   flush=True)
                         w, ws, dq = q_rtn, s_rtn, dq_rtn
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _record_do_no_harm_failure(fmt, linear_name, _e)
         elif scale_sweep_enabled and has_acts and fmt == "MXFP8_E4M3":
             assert acts_work is not None
             w, ws, _ = _mxfp8_scale_sweep_quantize(
@@ -4004,6 +4148,7 @@ def _quantize_2d(
                         row_weights=fisher_row_weights,
                     )
                     if err_rtn < err_work:
+                        _record_do_no_harm_revert("MXFP4")
                         if os.environ.get(
                             "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
                             print(f"[do-no-harm] {linear_name}: "
@@ -4011,8 +4156,8 @@ def _quantize_2d(
                                   f"(mse {err_work:.3e} → {err_rtn:.3e})",
                                   flush=True)
                         wp, ws, dq = q_rtn, s_rtn, dq_rtn
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _record_do_no_harm_failure("MXFP4", linear_name, _e)
         else:
             wp, ws, _ = _mxfp4_rtn()
         return {"weight_packed": wp, "weight_scale": ws}
@@ -4319,12 +4464,14 @@ def _quantize_2d_nvfp4_group_batched(
                 if mse_rtn < mse_pass:
                     weights[i] = w_rtn
                     n_reverted += 1
+            if n_reverted:
+                _DO_NO_HARM_STATS["NVFP4_batched_reverts"] += int(n_reverted)
             if n_reverted and os.environ.get(
                     "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
                 print(f"[do-no-harm batched] reverted {n_reverted}/{n} "
                       f"Linears to RTN", flush=True)
         except Exception as _e:
-            print(f"[do-no-harm batched] WARN failed: {_e}", flush=True)
+            _record_do_no_harm_failure("NVFP4_batched", None, _e)
 
     # Per-Linear final NVFP4 pack (cheap; reuses the existing function).
     out: list[dict] = []
@@ -4539,7 +4686,7 @@ def _passthrough_tensor(
 
 
 def _build_fp8_source_map(
-    model_path: str, *, multimodal: bool = False,
+    model_path: str, *, profile=None, multimodal: bool = False,
 ) -> dict[str, tuple[str, str]]:
     """Scan the source safetensors index for native-FP8 block-scaled
     Linears and return `{live_base_name: (shard_path, ckpt_scale_inv_key)}`.
@@ -4562,6 +4709,16 @@ def _build_fp8_source_map(
     case the FP8_SOURCE format is inert (allocator's passthrough-
     integrity filter drops it from every Linear's candidate set).
     """
+    if profile is not None:
+        pairs_fn = getattr(profile, "fp8_scale_pairs", None)
+        if callable(pairs_fn):
+            explicit = pairs_fn(model_path)
+            if explicit is not None:
+                return {
+                    (key[:-7] if key.endswith(".weight") else key): value
+                    for key, value in explicit.items()
+                }
+
     idx_path = os.path.join(model_path, "model.safetensors.index.json")
     if not os.path.exists(idx_path):
         single = os.path.join(model_path, "model.safetensors")
@@ -4574,7 +4731,26 @@ def _build_fp8_source_map(
         with open(idx_path) as f:
             raw = json.load(f)["weight_map"]
 
-    def _rename(k: str) -> str | None:
+    def _rename_weight(k: str) -> str | None:
+        weight_key = f"{k}.weight"
+        if profile is not None:
+            mapper = getattr(profile, "checkpoint_to_live_name", None)
+            if callable(mapper):
+                try:
+                    live_weight = mapper(weight_key, multimodal=multimodal)
+                except TypeError:
+                    live_weight = mapper(weight_key)
+                except Exception:
+                    live_weight = None
+                if live_weight is None:
+                    return None
+                live_weight = str(live_weight)
+                return (
+                    live_weight[:-7]
+                    if live_weight.endswith(".weight")
+                    else live_weight
+                )
+
         # Mirror `layer_streaming._rename_text_only`, but WITHOUT the
         # `.weight_scale_inv` drop — we need those keys preserved.
         if not multimodal:
@@ -4600,7 +4776,7 @@ def _build_fp8_source_map(
         for suffix in (".weight_scale_inv", ".weight"):
             if ck_key.endswith(suffix):
                 ck_base = ck_key[: -len(suffix)]
-                live_base = _rename(ck_base)
+                live_base = _rename_weight(ck_base)
                 if live_base is None:
                     break
                 bases.setdefault(live_base, {})[suffix[1:]] = (
@@ -4617,6 +4793,85 @@ def _build_fp8_source_map(
             shard, ckpt_scale_inv_key = kinds["weight_scale_inv"]
             out[live_base] = (shard, ckpt_scale_inv_key)
     return out
+
+
+def _recipe_name_for_live_qname(qname: str, profile) -> str:
+    if profile is None:
+        return qname
+    mapper = getattr(profile, "live_to_recipe_name", None)
+    if not callable(mapper):
+        return qname
+    try:
+        return str(mapper(qname))
+    except Exception:
+        return qname
+
+
+def _fp8_source_passthrough_recipe_keys(
+    fp8_source_map: dict[str, tuple[str, str]],
+    source_dtype_by_name: dict[str, torch.dtype],
+    profile,
+) -> set[str]:
+    """Return recipe keys that can be emitted as source-native FP8 bytes."""
+    out: set[str] = set()
+    for live_base in fp8_source_map:
+        source_weight_key = f"{live_base}.weight"
+        source_weight_dtype = source_dtype_by_name.get(source_weight_key)
+        if source_weight_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            continue
+        out.add(_recipe_name_for_live_qname(live_base, profile))
+    return out
+
+
+def _fp8_source_config_overlay(
+    model_path: str,
+    assignment: dict[str, str],
+    bf16_passthrough: set[str],
+    profile,
+) -> tuple[dict[str, str], set[str], set[str]]:
+    """Mirror streaming materialization's FP8_SOURCE passthrough in config.
+
+    Native-FP8 checkpoints load source weights as dequanted BF16 for render
+    work, but BF16/unassigned source-FP8 Linears are emitted by copying the
+    original FP8 bytes and scale sidecars. The compressed-tensors config must
+    describe those emitted bytes as FP8_SOURCE instead of putting the same
+    names in ignore.
+    """
+    fp8_source_map = _build_fp8_source_map(model_path, profile=profile)
+    if not fp8_source_map:
+        return dict(assignment), set(bf16_passthrough), set()
+
+    from .layer_streaming import _build_weight_map
+
+    weight_shard, weight_ckpt = _build_weight_map(model_path)
+    source_dtype_by_name = _build_source_dtype_map(weight_shard, weight_ckpt)
+    source_recipe_keys = _fp8_source_passthrough_recipe_keys(
+        fp8_source_map,
+        source_dtype_by_name,
+        profile,
+    )
+    if not source_recipe_keys:
+        return dict(assignment), set(bf16_passthrough), set()
+
+    config_assignment = dict(assignment)
+    overrides: set[str] = set()
+    for recipe_key in sorted(source_recipe_keys):
+        recipe_fmt = config_assignment.get(recipe_key)
+        fmt = (
+            _canonical_export_format(recipe_fmt)
+            if recipe_fmt is not None
+            else None
+        )
+        if fmt is None or fmt == "BF16" or recipe_key in bf16_passthrough:
+            config_assignment[recipe_key] = "FP8_SOURCE"
+            overrides.add(recipe_key)
+
+    config_bf16_passthrough = set(bf16_passthrough) - overrides
+    return config_assignment, config_bf16_passthrough, overrides
+
+
+def _compressed_tensor_key(base_name: str, suffix: str) -> str:
+    return f"{base_name}.{suffix}"
 
 
 def materialize_tensors_streaming(
@@ -4712,7 +4967,7 @@ def materialize_tensors_streaming(
     # `.weight` suffix), used by the `fmt == 'FP8_SOURCE'` emit branch
     # to copy source fp8 + scale_inv bytes verbatim into the output.
     # Distinct key format from the loader-side dequant map above.
-    fp8_source_map = _build_fp8_source_map(model_path)
+    fp8_source_map = _build_fp8_source_map(model_path, profile=profile)
     if fp8_source_map:
         print(f"[export-stream] fp8 source-emit map: {len(fp8_source_map)} "
               f"Linears available for FP8_SOURCE passthrough", flush=True)
@@ -4787,9 +5042,7 @@ def materialize_tensors_streaming(
                 base_name = (full_qname[:-len(".weight")]
                              if full_qname.endswith(".weight")
                              else full_qname)
-                out_key = (base_name
-                           if suffix == "weight"
-                           else f"{base_name}.{suffix}")
+                out_key = _compressed_tensor_key(base_name, suffix)
                 out[out_key] = t.cpu()
             hist[("head", fmt)] += 1
         else:
@@ -4849,6 +5102,8 @@ def materialize_tensors_streaming(
                 "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
             "PRISMAQUANT_GPTQ_DAMP": os.environ.get(
                 "PRISMAQUANT_GPTQ_DAMP", ""),
+            "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING": os.environ.get(
+                "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING", "0"),
             "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
                 "PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999"),
             "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(
@@ -4972,18 +5227,15 @@ def materialize_tensors_streaming(
             tuple[str, tuple[int, int]],
             list[tuple[str, str, str, nn.Linear]]  # (full, emit_full, recipe_key, mod)
         ] = defaultdict(list)
-        # v23 (opt-in): batch NVFP4 same-shape Linears when act-aware
-        # passes (GPTQ / scale_sweep) are on. Activated by env var
-        # PRISMAQUANT_BATCHED_NVFP4_EXPORT=1 — disabled by default while
-        # the path is being validated against the per-Linear baseline.
-        # When inactive, NVFP4 Linears go through the per-Linear
-        # `_quantize_2d` exactly as before.
+        # Batch same-shape NVFP4 Linears when act-aware passes
+        # (GPTQ / scale_sweep) are on. Default ON; set
+        # PRISMAQUANT_BATCHED_NVFP4_EXPORT=0 to force the slower
+        # per-Linear `_quantize_2d` path for bit-exact A/Bs.
         grouped_nvfp4_batched: dict[
             tuple[int, int],
             list[tuple[str, str, str, nn.Linear]]
         ] = defaultdict(list)
-        # v26: default ON. Set PRISMAQUANT_BATCHED_NVFP4_EXPORT=0 to revert
-        # to per-Linear NVFP4 quantization (slower but provably correct).
+        # v26: default ON.
         _raw_batched = os.environ.get("PRISMAQUANT_BATCHED_NVFP4_EXPORT")
         _batched_env_on = (
             True if _raw_batched is None
@@ -5540,7 +5792,15 @@ def materialize_tensors_streaming(
                             for suffix, t in compressed.items():
                                 out[f"{base}.{suffix}"] = t.cpu()
                 covered.add(full)
-                hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
+                hist[(
+                    "packed_moe_per_expert",
+                    _packed_expert_render_hist_label(
+                        fmt,
+                        is_bf16=is_bf16,
+                        source_label=label if is_bf16 else "",
+                        cached_3d=cached_3d,
+                    ),
+                )] += 1
                 del packed_param, packed_param_src, proj_split
                 if cached_3d is not None:
                     del cached_3d, cached_split
@@ -5660,18 +5920,34 @@ def _materialize_tensors_inmemory(
             hist[("linear", label)] += 1
             continue
         joint = nvfp4_joint_global.get(fmt_key) if fmt == "NVFP4" else None
-        compressed = _quantize_2d(
-            mod.weight.detach().float(), fmt,
+        compressed = _pack_production_cached_2d(
+            fmt_key,
+            fmt,
             nvfp4_global_real_override=joint,
-            linear_name=fmt_key,
+            device=mod.weight.device,
         )
+        if compressed is None and _PRODUCTION_WEIGHT_CACHE is not None:
+            raise RuntimeError(
+                f"[export-inmemory] auxiliary Linear {fmt_key} @ {fmt} has "
+                "no production-cache render. Non-BF16 MTP/sidecar Linears "
+                "must be rendered through ProductionWeightCache before "
+                "export; RTN-by-omission would ship bytes that validation "
+                "did not measure."
+            )
+        cache_hit = compressed is not None
+        if compressed is None:
+            compressed = _quantize_2d(
+                mod.weight.detach().float(), fmt,
+                nvfp4_global_real_override=joint,
+                linear_name=fmt_key,
+            )
         for suffix, tensor in compressed.items():
             out[f"{qname}.{suffix}"] = tensor.cpu()
         if mod.bias is not None:
             out[f"{qname}.bias"], _ = _passthrough_tensor(
                 f"{qname}.bias", mod.bias)
         covered.add(qname)
-        hist[("linear", fmt)] += 1
+        hist[("linear", f"{fmt}_PRODUCTION_CACHE" if cache_hit else fmt)] += 1
 
     for qname, mod in model.named_modules():
         if not _is_packed_experts_module(mod, profile):
@@ -5776,7 +6052,15 @@ def _materialize_tensors_inmemory(
                         for suffix, tensor in compressed.items():
                             out[f"{base}.{suffix}"] = tensor.cpu()
             covered.add(full_name)
-            hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
+            hist[(
+                "packed_moe_per_expert",
+                _packed_expert_render_hist_label(
+                    fmt,
+                    is_bf16=is_bf16,
+                    source_label=label if is_bf16 else "",
+                    cached_3d=cached_3d,
+                ),
+            )] += 1
 
     for name, p in model.named_parameters():
         if any(name.startswith(c + ".") or name == c for c in covered):
@@ -6406,17 +6690,20 @@ def build_quantization_config(
                     # allocator's incomplete-fused-group rule, so a
                     # mixed-and-incomplete group should not reach here.)
                     #
-                    # We deliberately do NOT fail here on a quantized-present +
-                    # absent-sibling mix: at this layer we only see the config
-                    # dict, so we cannot distinguish a GENUINELY absent sibling
-                    # (synthesized/tied, e.g. Gemma4 v=k) from one merely not in
-                    # a PARTIAL assignment (some build_quantization_config call
-                    # sites pass a subset). That genuine-absent + quantized case
-                    # is the allocator's job (incomplete_fused_group_members pins
-                    # present members to BF16, and the allocator now hard-errors
-                    # when it can't resolve the real profile) -- it knows the
-                    # model's true module list; the export does not. The
-                    # all-present mixed case below IS unambiguous and is failed.
+                    # A single present state can still be a partial recipe, so
+                    # leave it alone. Mixed present states are unambiguous:
+                    # adding an absent sibling to a quantized+BF16 or
+                    # multi-quant group cannot produce one coherent fused
+                    # scheme.
+                    if len(set(present)) != 1:
+                        members = {s: leaf_state.get((parent, s), "ABSENT")
+                                   for s in sibs}
+                        quant_states = {s for s in present if s != "IGNORE"}
+                        kind = ("crash@load" if len(quant_states) > 1
+                                else "silent-corruption")
+                        fused_coherence_violations.append(
+                            (fused_vllm_name, kind, members))
+                        continue
                     if set(present) == {"IGNORE"}:
                         fused_emitted.add(fused_vllm_name)
                         for leaf in absent_leaves:
@@ -6535,6 +6822,26 @@ def build_quantization_config(
     }
 
 
+def _preflight_quantization_config(
+    assignment: dict[str, str],
+    bf16_passthrough: set[str],
+    *,
+    profile: "ModelProfile | None",
+) -> None:
+    """Run config-only export gates before GPU render and shard writes."""
+    try:
+        build_quantization_config(
+            assignment,
+            bf16_passthrough,
+            profile=profile,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "[export-stream] quantization-config preflight failed before "
+            f"rendering or shard writes: {exc}"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Recipe canonicalization + Main
 # ---------------------------------------------------------------------------
@@ -6615,6 +6922,7 @@ def main():
     _PRODUCTION_WEIGHT_CACHE = None
     _PRODUCTION_CACHE_FINGERPRINT = None
     _NVFP4_SCALE_RULE = resolve_nvfp4_scale_rule()
+    _DO_NO_HARM_STATS.clear()
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
@@ -6722,12 +7030,12 @@ def main():
     print(f"[export-stream] model profile: {profile.name}", flush=True)
     if isinstance(profile, DefaultProfile):
         # The export's fused-coherence gate keys off this profile's
-        # packed_modules_mapping. Under DefaultProfile only the UNIVERSAL fused
-        # groups (qkv_proj/gate_up_proj) are checked -- architecture-specific
-        # merged columns (e.g. Qwen3.x DeltaNet in_proj_ba) and packed-MoE
-        # experts are INVISIBLE here, so a mixed-format group in those can ship
-        # undetected. This happens when --model's architecture is not
-        # registered. Make the export's blind spot loud.
+        # packed_modules_mapping plus fallback fused groups. DefaultProfile
+        # checks qkv_proj/gate_up_proj and the known DeltaNet
+        # in_proj_ba/in_proj_qkvz groups, but unknown architecture-specific
+        # merged columns and packed-MoE expert constraints are still invisible
+        # when --model's architecture is not registered. Make that blind spot
+        # loud.
         print(
             "[export-stream] WARNING: resolved DefaultProfile for "
             f"{args.model!r} -- architecture not registered. Fused-coherence "
@@ -6780,9 +7088,26 @@ def main():
             _assignment_for_cache
         )
         if missing_keys:
+            mtp_missing = [k for k in missing_keys
+                           if str(k[0]).startswith("mtp.")]
+            mtp_hint = ""
+            if mtp_missing:
+                # No producer renders mtp.* into ProductionWeightCache yet
+                # (build_production_cache/production_recache never see the
+                # MTP sidecar). Fail HERE at attach time with the contract,
+                # not hours later in _materialize_tensors_inmemory.
+                mtp_hint = (
+                    f" {len(mtp_missing)} of these are MTP sidecar entries "
+                    f"(e.g. {mtp_missing[0][0]}): no producer renders mtp.* "
+                    "into the production cache today — non-BF16 MTP with an "
+                    "attached cache is an unsupported configuration. Set "
+                    "MTP_FORMAT=BF16, or add MTP coverage to "
+                    "build_production_cache before exporting."
+                )
             raise RuntimeError(
                 "[export-stream] production-weight-cache missing recipe "
-                f"entries: {len(missing_keys)} sample={missing_keys[:8]}"
+                f"entries: {len(missing_keys)} sample={missing_keys[:8]}."
+                + mtp_hint
             )
         files = production_cache.verify_files(expected_keys)
         if files["missing"]:
@@ -6794,7 +7119,10 @@ def main():
             production_cache,
             expected_keys,
         )
-        _INPUT_GLOBAL_SCALES = _production_cache_scales(production_cache)
+        _INPUT_GLOBAL_SCALES = _production_cache_scales(
+            production_cache,
+            profile=profile,
+        )
         print(
             "[export-stream] production-weight-cache direct path: "
             f"{len(expected_keys)} entries, "
@@ -6949,6 +7277,32 @@ def main():
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
           flush=True)
 
+    bf16_passthrough = set(
+        args.ignore
+        if args.ignore is not None
+        else profile.pinned_names()
+    )
+    config_assignment, config_bf16_passthrough, fp8_source_overrides = (
+        _fp8_source_config_overlay(
+            args.model,
+            assignment,
+            bf16_passthrough,
+            profile,
+        )
+    )
+    if fp8_source_overrides:
+        print(
+            "[export-stream] config FP8_SOURCE passthrough overrides: "
+            f"{len(fp8_source_overrides)} source-FP8 Linears",
+            flush=True,
+        )
+    _preflight_quantization_config(
+        config_assignment,
+        config_bf16_passthrough,
+        profile=profile,
+    )
+    print("[export-stream] quantization-config preflight passed", flush=True)
+
     from prismaquant.gpu_guard import require_cuda_hot_path
 
     dtype = torch.bfloat16
@@ -6959,11 +7313,6 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bf16_passthrough = set(
-        args.ignore
-        if args.ignore is not None
-        else profile.pinned_names()
-    )
     if args.offload_folder is None:
         args.offload_folder = str(out_dir / "_streaming_offload")
 
@@ -7069,12 +7418,16 @@ def main():
                         shape = None
                     yield k, shape
 
-    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment, profile)
+    extra_ignore = compute_extra_ignore(
+        _source_shape_iter(),
+        config_assignment,
+        profile,
+    )
     print(f"[export-stream] extra ignore (unmapped Linears): "
           f"{len(extra_ignore)}", flush=True)
 
     write_config_with_quantization(
-        args.model, out_dir, assignment, bf16_passthrough,
+        args.model, out_dir, config_assignment, config_bf16_passthrough,
         extra_ignore=extra_ignore,
         transform_config=None)
     _copy_tokenizer(args.model, out_dir)
@@ -7084,19 +7437,23 @@ def main():
             "source_model": args.model,
             "source_recipe": args.layer_config,
             "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
-            "n_assignment_entries": len(assignment),
+            "n_assignment_entries": len(config_assignment),
+            "source_assignment_entries": len(assignment),
+            "fp8_source_passthrough_overrides": sorted(fp8_source_overrides),
             "runtime_coercions": [
                 {"name": name, "shape": shape, "from": from_fmt, "to": "BF16"}
                 for name, shape, from_fmt in runtime_coerced
             ],
             "bf16_audit": _bf16_upgrade_audit(
                 args.model,
-                assignment,
-                bf16_passthrough,
+                config_assignment,
+                config_bf16_passthrough,
                 runtime_coerced,
                 profile,
             ),
-            "ignore": sorted(bf16_passthrough),
+            "do_no_harm": dict(_DO_NO_HARM_STATS),
+            "packed_expert_export": _packed_expert_export_provenance(),
+            "ignore": sorted(config_bf16_passthrough),
         }, f, indent=2)
 
     # v25: clear the per-layer cache on successful export. --keep-export-cache
@@ -7509,15 +7866,10 @@ def _apply_visual_recipe_quant(
                 linear_name=base,
             )
         except Exception as e:
-            # Fail-safe: fall back to passthrough on any arithmetic
-            # error. Better to land a BF16 visual Linear than crash
-            # the whole export — the rest of the body/MTP are already
-            # materialized.
-            print(f"[export-stream] WARN visual quant failed for {base} "
-                  f"({fmt}): {e}; falling back to BF16 passthrough",
-                  flush=True)
-            out[key] = tensor
-            continue
+            raise RuntimeError(
+                f"[export-stream] visual quant failed for {base} ({fmt}); "
+                "refusing to emit BF16 bytes under a quantized config"
+            ) from e
         for suffix, t in compressed.items():
             out[f"{base}.{suffix}"] = t.cpu()
         touched += 1

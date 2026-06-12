@@ -307,7 +307,10 @@ def _e3m2_codebook() -> torch.Tensor:
     codes = set([0.0])
     for exp in range(8):
         for m in range(4):
-            val = (1 + m / 4) * (2 ** (exp - 3))
+            if exp == 0:
+                val = (m / 4) * (2 ** -2)
+            else:
+                val = (1 + m / 4) * (2 ** (exp - 3))
             codes.add(+val); codes.add(-val)
     return torch.tensor(sorted(codes), dtype=torch.float32)
 
@@ -317,7 +320,10 @@ def _e2m3_codebook() -> torch.Tensor:
     codes = set([0.0])
     for exp in range(4):
         for m in range(8):
-            val = (1 + m / 8) * (2 ** (exp - 1))
+            if exp == 0:
+                val = (m / 8) * (2 ** 0)
+            else:
+                val = (1 + m / 8) * (2 ** (exp - 1))
             codes.add(+val); codes.add(-val)
     return torch.tensor(sorted(codes), dtype=torch.float32)
 
@@ -341,7 +347,7 @@ def _e4m3_codebook() -> torch.Tensor:
 def _e5m2_codebook() -> torch.Tensor:
     # 8-bit FP e5m2. Wider range, less mantissa precision.
     codes = set([0.0])
-    for exp in range(32):
+    for exp in range(31):
         for m in range(4):
             if exp == 0:
                 val = (m / 4) * (2 ** -14)
@@ -584,6 +590,36 @@ def _plain_fp8_autoround(elt="fp8_e4m3", act_bits=8):
     )
 
 
+def _nvfp4_export_aligned_rtn(x: torch.Tensor) -> torch.Tensor:
+    """NVFP4 WEIGHT RTN matching the export/compressed-tensors convention.
+
+    Routes through the export codec so registry weight emulation and the
+    shipped bytes share one rendering (the resident-vs-served mismatch
+    class). Last dims that are not a multiple of the group size are
+    zero-padded then sliced back — zeros cannot perturb a max-abs group
+    scale, so padding is exact for the real columns.
+
+    WEIGHTS ONLY: the export codec derives a per-tensor global scale from
+    the tensor it is given; for activations that would make the emulation
+    batch-dependent, while serve-time activation quantization uses a
+    STATIC input_global_scale fit at calibration. Activation emulation
+    stays on the per-group dynamic RTN (see the registration below) until
+    a static-scale-aware emulation exists.
+    """
+    from . import export_native_compressed as enc
+
+    orig_shape = x.shape
+    in_features = int(orig_shape[-1])
+    flat = x.reshape(-1, in_features).to(torch.float32)
+    pad = (-in_features) % 16
+    if pad:
+        flat = torch.nn.functional.pad(flat, (0, pad))
+    out = enc._rtn_dequant_nvfp4(flat, group_size=16)
+    if pad:
+        out = out[:, :in_features]
+    return out.reshape(orig_shape).to(x.dtype)
+
+
 # NVFP4 / NVFP4A16  (NVIDIA, group_size=16, FP8 scales)
 register_format(FormatSpec(
     name="NVFP4",
@@ -591,7 +627,9 @@ register_format(FormatSpec(
     weight_element_dtype="fp4_e2m1", act_bits=4, act_dtype_name="fp4_e2m1",
     act_group_size=16, family="nv", min_capability_sm=100,
     autoround_config=lambda: _nv_autoround(4, 16, 4),
-    quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    quantize_dequantize=_nvfp4_export_aligned_rtn,
+    # activations: per-group dynamic RTN, NOT the export codec — see
+    # _nvfp4_export_aligned_rtn docstring (batch-dependence).
     activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
 ))
 register_format(FormatSpec(
@@ -600,7 +638,7 @@ register_format(FormatSpec(
     weight_element_dtype="fp4_e2m1", act_bits=None,
     family="nv", min_capability_sm=100,
     autoround_config=lambda: _nv_autoround(4, 16, 16),
-    quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    quantize_dequantize=_nvfp4_export_aligned_rtn,
     activation_quantize_dequantize=lambda x: x,
 ))
 

@@ -549,7 +549,7 @@ class ModelProfile(ABC):
             leaf = tail[0]
             split_per_expert = False
         elif len(tail) == 2 and tail[0].isdigit():
-            parent = ".".join(parts[:experts_idx + 2])
+            parent = ".".join(parts[:experts_idx + 1])
             leaf = tail[1]
             split_per_expert = True
         else:

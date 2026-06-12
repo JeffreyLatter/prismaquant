@@ -9,6 +9,7 @@ from prismaquant.select_validated_frontier import (
     _saturation_pick,
     leave_one_out_kneedle_diagnostic,
     measured_frontier,
+    measured_rows,
     practical_knee,
     select_frontier_point,
     spearman_rank_correlation,
@@ -73,6 +74,17 @@ def test_measured_frontier_drops_dominated_points():
     frontier = measured_frontier(results)
 
     assert [row["label"] for row in frontier] == ["a", "c", "d"]
+
+
+def test_measured_rows_keep_dominated_points_for_diagnostics():
+    results = [
+        {"label": "a", "path": "a.json", "bpp": 4.5, "last_token_kl": 0.10},
+        {"label": "b", "path": "b.json", "bpp": 4.6, "last_token_kl": 0.30},
+        {"label": "c", "path": "c.json", "bpp": 5.0, "last_token_kl": 0.05},
+    ]
+
+    assert [row["label"] for row in measured_rows(results)] == ["a", "b", "c"]
+    assert [row["label"] for row in measured_frontier(results)] == ["a", "c"]
 
 
 def test_select_frontier_best_kl():
@@ -268,6 +280,62 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
 
     selected = json.loads(summary.read_text())["selected"]
     assert selected["label"] == "candidate"
+
+
+def test_select_validated_frontier_diagnostics_include_dominated_rows(tmp_path):
+    assignment_paths = {}
+    for label in ("a", "b", "c"):
+        path = tmp_path / f"{label}.json"
+        path.write_text(json.dumps({
+            "assignment": {
+                "model.layers.0.self_attn.q_proj": "BF16",
+            },
+        }))
+        assignment_paths[label] = path
+
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [
+            {"label": "a", "path": str(assignment_paths["a"]), "bpp": 4.5,
+             "last_token_kl": 0.10, "mse": {"predicted_dloss_sum": 2.0}},
+            # Dominated by a on both bpp and KL, but surrogate ranks it best.
+            {"label": "b", "path": str(assignment_paths["b"]), "bpp": 4.6,
+             "last_token_kl": 0.30, "mse": {"predicted_dloss_sum": 1.0}},
+            {"label": "c", "path": str(assignment_paths["c"]), "bpp": 5.0,
+             "last_token_kl": 0.05, "mse": {"predicted_dloss_sum": 3.0}},
+        ],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+    summary_path = tmp_path / "selection.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(summary_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    summary = json.loads(summary_path.read_text())
+    assert summary["n_results"] == 3
+    assert summary["n_frontier"] == 2
+    assert summary["surrogate_spearman"] is not None
+    inversion = summary["surrogate_worst_rank_inversion"]
+    assert inversion["predicted_best_label"] == "b"
+    assert inversion["predicted_worse_label"] == "c"
 
 
 def test_load_assignment_canonicalizes_autoround_dicts(tmp_path):

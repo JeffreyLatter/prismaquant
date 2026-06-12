@@ -18,9 +18,9 @@ Checks, in order:
      (NaN/repetition loops/nonsense) before wasting on stats.
   3. **Perplexity / NLL** — logprobs over a diverse held-out
      prompt suite. Hard thresholds: `ppl < MAX_PPL` and
-     `p99 per-prompt NLL < MAX_P99_NLL`. p99 catches the 27B
-     failure mode where 80% of prompts scored NLL~10 while
-     2/10 scored normally — mean alone missed it.
+     worst per-prompt NLL < `MAX_P99_NLL` (legacy flag name).
+     The worst-prompt guard catches the 27B failure mode where
+     80% of prompts scored NLL~10 while 2/10 scored normally.
   4. **MTP acceptance** — if spec-decode is on, per-position
      acceptance > `MIN_MTP_ACCEPT_P0` at position 0.
 
@@ -65,7 +65,8 @@ Design notes:
   - Thresholds are calibrated: MAX_PPL=25 catches catastrophic
     breakage but tolerates normal 4-bit quant degradation
     (BF16 baseline ~3-5, 4-bit ~4-8). MAX_P99_NLL=6 is ~2σ above
-    BF16 average.
+    BF16 average; the implementation also reports the actual p99
+    separately from the max prompt NLL.
 """
 from __future__ import annotations
 
@@ -271,11 +272,12 @@ def check_perplexity(base_url: str, model_name: str,
     on heavily instruction-tuned models (the off-distribution penalty swamps
     the quantization delta); prefer KL-vs-BF16 for quant A/Bs there.
 
-    Hard fails when mean NLL exceeds threshold OR when p99 per-prompt
-    NLL exceeds threshold. p99 catches bimodal-failure where the model
-    has "quality pockets" (see 27B session: 2/10 prompts normal, 8/10
-    catastrophic at NLL~10). Mean alone would have flagged, but p99
-    is the more diagnostic signal.
+    Hard fails when mean NLL exceeds threshold OR when the worst
+    per-prompt average NLL exceeds threshold. The max guard catches
+    bimodal-failure where the model has "quality pockets" (see 27B
+    session: 2/10 prompts normal, 8/10 catastrophic at NLL~10). Mean
+    alone would have flagged, but the tail prompt is the more
+    diagnostic signal.
 
     **Hard-fails with a diagnostic if spec-decode is detected on the
     serve.** vLLM routes /v1/completions echo+logprobs through the
@@ -341,15 +343,24 @@ def check_perplexity(base_url: str, model_name: str,
     mean_nll = total_nll / max(total_tokens, 1)
     ppl = math.exp(mean_nll)
     per_prompt_avg_nll.sort()
-    k = max(0, int(0.99 * len(per_prompt_avg_nll)) - 1)
-    p99 = per_prompt_avg_nll[-1] if len(per_prompt_avg_nll) <= 2 else per_prompt_avg_nll[k]
-    # Actually for small N, "p99" is basically "max" — use max for clarity.
-    p99 = per_prompt_avg_nll[-1]
+    if len(per_prompt_avg_nll) == 1:
+        p99 = per_prompt_avg_nll[0]
+    else:
+        rank = 0.99 * (len(per_prompt_avg_nll) - 1)
+        lo = int(math.floor(rank))
+        hi = int(math.ceil(rank))
+        frac = rank - lo
+        p99 = (
+            per_prompt_avg_nll[lo] * (1.0 - frac)
+            + per_prompt_avg_nll[hi] * frac
+        )
+    max_nll = per_prompt_avg_nll[-1]
 
     metrics = {
         "perplexity": ppl,
         "mean_nll_per_tok": mean_nll,
         "p99_nll_per_tok": p99,
+        "max_nll_per_tok": max_nll,
         "per_prompt_avg_nll": per_prompt_avg_nll,
         "n_tokens": total_tokens,
     }
@@ -359,8 +370,8 @@ def check_perplexity(base_url: str, model_name: str,
         reasons.append(f"ppl={ppl:.2f} > {max_ppl}")
     if mean_nll > max_mean_nll:
         reasons.append(f"mean_nll={mean_nll:.3f} > {max_mean_nll}")
-    if p99 > max_p99_nll:
-        reasons.append(f"max(per-prompt avg NLL)={p99:.3f} > {max_p99_nll} "
+    if max_nll > max_p99_nll:
+        reasons.append(f"max(per-prompt avg NLL)={max_nll:.3f} > {max_p99_nll} "
                        f"(bimodal failure)")
     return CheckResult(
         name="perplexity",
@@ -419,6 +430,8 @@ def run_validation(
     min_gen_len: int = DEFAULT_MIN_GEN_LEN,
     min_mtp_accept_p0: float = DEFAULT_MIN_MTP_ACCEPT_P0,
     wait_seconds: float = 900.0,
+    bos_token: str | None = None,
+    add_special_tokens: bool = True,
 ) -> ValidationReport:
     rep = ValidationReport(
         artifact=model_name,
@@ -430,6 +443,8 @@ def run_validation(
             "max_p99_nll": max_p99_nll,
             "min_gen_len": min_gen_len,
             "min_mtp_accept_p0": min_mtp_accept_p0,
+            "bos_token": bos_token,
+            "add_special_tokens": add_special_tokens,
         },
     )
 
@@ -448,6 +463,8 @@ def run_validation(
     rep.checks.append(check_perplexity(
         base_url, model_name,
         max_ppl=max_ppl, max_p99_nll=max_p99_nll, max_mean_nll=max_mean_nll,
+        bos_token=bos_token,
+        add_special_tokens=add_special_tokens,
     ))
     rep.checks.append(check_mtp_acceptance(base_url, min_mtp_accept_p0))
     return rep
@@ -499,6 +516,16 @@ def main() -> int:
     ap.add_argument("--min-gen-len", type=int, default=DEFAULT_MIN_GEN_LEN)
     ap.add_argument("--min-mtp-accept-p0", type=float,
                     default=DEFAULT_MIN_MTP_ACCEPT_P0)
+    ap.add_argument("--bos-token", default=None,
+                    help="Optional literal BOS string to prepend before "
+                         "perplexity prompts for BOS-sensitive tokenizers "
+                         "(for example '<bos>'). When set, the server "
+                         "request disables add_special_tokens to avoid a "
+                         "double BOS.")
+    ap.add_argument("--no-add-special-tokens", dest="add_special_tokens",
+                    action="store_false", default=True,
+                    help="Pass add_special_tokens=false on perplexity "
+                         "requests when --bos-token is not used.")
     ap.add_argument("--wait-seconds", type=float, default=900.0,
                     help="Max time to wait for /health 200 before giving up")
     ap.add_argument("--report", default=None,
@@ -513,6 +540,8 @@ def main() -> int:
         min_gen_len=args.min_gen_len,
         min_mtp_accept_p0=args.min_mtp_accept_p0,
         wait_seconds=args.wait_seconds,
+        bos_token=args.bos_token,
+        add_special_tokens=args.add_special_tokens,
     )
     md = format_report_md(rep)
     print(md)

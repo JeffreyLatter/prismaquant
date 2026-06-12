@@ -171,6 +171,36 @@ def test_production_pipeline_spec_records_run_config():
     assert spec.metadata["formats"] == "NVFP4,BF16"
 
 
+def test_surrogate_run_spec_omits_unexecuted_validation_stages():
+    spec = production_pipeline_spec_from_config(
+        render_mechanisms="gptq",
+        selection_mode="surrogate",
+    )
+    stage_names = [stage.name for stage in spec.stages]
+
+    assert "validate.kl" not in stage_names
+    assert "validate.vllm_smoke" not in stage_names
+    assert spec.metadata["omitted_unexecuted_stages"] == [
+        "validate.kl",
+        "validate.vllm_smoke",
+    ]
+    assert spec.validate().ok is True
+
+
+def test_validated_surrogate_spec_keeps_kl_validation_stage():
+    spec = production_pipeline_spec_from_config(
+        render_mechanisms="gptq",
+        selection_mode="validated-surrogate",
+    )
+    stage_names = [stage.name for stage in spec.stages]
+
+    assert "validate.kl" in stage_names
+    assert "validate.vllm_smoke" not in stage_names
+    assert spec.metadata["omitted_unexecuted_stages"] == [
+        "validate.vllm_smoke",
+    ]
+
+
 def test_pipeline_cli_writes_validated_default_spec(tmp_path):
     path = tmp_path / "pipeline_spec.json"
 

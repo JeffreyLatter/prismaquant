@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
 import pickle
 import shutil
+import subprocess
 import tempfile
 import time
 from collections import Counter
@@ -29,7 +31,7 @@ from prismaquant.calibration_data import (
 )
 from prismaquant.gpu_guard import require_cuda_hot_path
 from prismaquant.layer_config import canonicalize_format
-from prismaquant.model_profiles import DefaultProfile, detect_profile
+from prismaquant.model_profiles import detect_profile_with_warning
 from prismaquant.kl_measurement import (
     assignment_bit_total,
     assignment_hash,
@@ -89,6 +91,7 @@ def _parse_labeled_path(value: str) -> tuple[str, Path]:
     return path.stem, path
 
 def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
+    del fmt
     if profile is None:
         return False
     is_pinned = getattr(profile, "is_pinned_name", None)
@@ -102,8 +105,6 @@ def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
                 continue
             if name == prefix.rstrip(".") or name.startswith(prefix):
                 return True
-    if fr.canonical_format_name(fmt) != "BF16":
-        return False
     return False
 
 
@@ -266,6 +267,90 @@ def _temporary_env(name: str, value: str):
             os.environ.pop(name, None)
         else:
             os.environ[name] = previous
+
+
+def _git_provenance() -> dict[str, object]:
+    repo = Path(__file__).resolve().parents[1]
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout.strip()
+    except Exception:
+        commit = None
+    try:
+        dirty = bool(subprocess.run(
+            ["git", "status", "--short"],
+            cwd=repo,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout.strip())
+    except Exception:
+        dirty = None
+    return {"commit": commit, "dirty": dirty}
+
+
+def _calibration_provenance(calib_repeats: Sequence[torch.Tensor]) -> dict[str, object]:
+    repeat_hashes = [calibration_data_hash(ids) for ids in calib_repeats]
+    if not repeat_hashes:
+        combined = None
+    elif len(repeat_hashes) == 1:
+        combined = repeat_hashes[0]
+    else:
+        combined = hashlib.sha256(
+            "\n".join(repeat_hashes).encode("utf-8")
+        ).hexdigest()
+    return {
+        "calib_hash": combined,
+        "calib_repeat_hashes": repeat_hashes,
+    }
+
+
+def _strict_production_cache_enabled() -> bool:
+    return os.environ.get(
+        "PRISMAQUANT_STRICT_PRODUCTION_CACHE", "1"
+    ) not in ("", "0", "false", "False")
+
+
+def _production_cache_assignment_diagnostics(
+    production_cache,
+    assignment: Mapping[str, str],
+) -> dict[str, object] | None:
+    if production_cache is None:
+        return None
+    if hasattr(production_cache, "assignment_keys"):
+        keys, missing = production_cache.assignment_keys(assignment)
+    else:
+        keys = []
+        missing = []
+        for name, fmt in assignment.items():
+            fmt_canon = fr.canonical_format_name(str(fmt))
+            if fmt_canon == "BF16":
+                continue
+            tensor = production_cache.get(str(name), fmt_canon)
+            if tensor is None:
+                missing.append((str(name), fmt_canon))
+            else:
+                keys.append((str(name), fmt_canon))
+    strict = _strict_production_cache_enabled()
+    diagnostics: dict[str, object] = {
+        "required_entries": int(len(keys) + len(missing)),
+        "cache_hit_count": int(len(keys)),
+        "cache_miss_count": int(len(missing)),
+        "rtn_fallback_count": int(len(missing) if not strict else 0),
+        "strict": bool(strict),
+    }
+    if missing:
+        diagnostics["missing_sample"] = [
+            [str(name), str(fmt)] for name, fmt in missing[:8]
+        ]
+    return diagnostics
 
 
 def _materialize_assignment_inplace(
@@ -807,6 +892,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             load_kwargs["device_map"] = device_str
         tokenizer = AutoTokenizer.from_pretrained(staged, **tokenizer_kwargs)
         calib_repeats = _load_calibration_repeats(tokenizer, args)
+        calib_provenance = _calibration_provenance(calib_repeats)
         source_prefetch_stats = prefetch_safetensors_checkpoint(
             staged,
             mode=args.source_prefetch,
@@ -876,10 +962,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--production-cache-lru-gb budget"
                 )
 
-        try:
-            profile = detect_profile(args.model)
-        except Exception:
-            profile = DefaultProfile()
+        profile = detect_profile_with_warning(
+            args.model,
+            entrypoint="validate-kl",
+        )
         ref_log_prob_repeats = [
             cache_reference_log_probs(
                 model,
@@ -890,10 +976,49 @@ def main(argv: Sequence[str] | None = None) -> int:
             for calib_ids in calib_repeats
         ]
 
+        if production_cache is not None and _strict_production_cache_enabled():
+            # Fail-fast BEFORE any measurement: with the strict default
+            # (M6), a cache missing required renders would otherwise abort
+            # mid-KL after minutes-to-hours. Packed-expert misses are the
+            # known M4 design gap (the frontier cache never renders packed
+            # experts), so name it.
+            for _label, _assignment, _path in assignments:
+                _diag = _production_cache_assignment_diagnostics(
+                    production_cache, _assignment)
+                if _diag and _diag.get("cache_miss_count"):
+                    _sample = _diag.get("missing_sample") or []
+                    from prismaquant.production_weight_cache import (
+                        is_uncached_packed_expert_qname,
+                    )
+                    _expert = [m for m in _sample
+                               if is_uncached_packed_expert_qname(str(m[0]))]
+                    _hint = (
+                        " Missing entries include packed-MoE experts: the "
+                        "validated-surrogate frontier cache does not render "
+                        "packed experts (open design item M4) — this "
+                        "model/mode combination is unsupported until that "
+                        "lands. PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 falls "
+                        "back to RTN for research runs only."
+                        if _expert else
+                        " Rebuild the cache to cover the assignment, or set "
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 (research "
+                        "only — RTN fallback)."
+                    )
+                    raise RuntimeError(
+                        f"[validate-kl] assignment '{_label}' requires "
+                        f"{_diag['cache_miss_count']} production-cache "
+                        f"renders the cache lacks (sample={_sample[:4]})."
+                        + _hint
+                    )
+
         results = []
         for label, assignment, path in assignments:
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
             prefetch_stats = None
+            cache_diagnostics = _production_cache_assignment_diagnostics(
+                production_cache,
+                assignment,
+            )
             if (
                 production_cache is not None
                 and args.production_cache_prefetch != "off"
@@ -998,12 +1123,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "format_counts": counts,
                 "changed_vs_base": int(changed),
                 "assignment_entries": len(assignment),
+                "assignment_hash": assignment_hash(assignment),
                 "kl_scope": args.kl_scope,
                 "assignment_materialization": materialization_mode,
                 "replay": replay_stats,
             }
             if costs is not None:
                 result["mse"] = _assignment_cost_summary(costs, assignment)
+            if cache_diagnostics is not None:
+                result["production_cache_diagnostics"] = cache_diagnostics
             if prefetch_stats is not None:
                 result["production_cache_prefetch"] = prefetch_stats
             results.append(result)
@@ -1025,11 +1153,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        git = _git_provenance()
         out = {
             "model": args.model,
             "probe": args.probe,
             "costs": args.costs,
             "base_assignment": args.base_assignment,
+            "base_assignment_hash": assignment_hash(base_assignment),
+            "git_commit": git["commit"],
+            "git_dirty": git["dirty"],
             "formats": [spec.name for spec in specs],
             "calibration": {
                 "n_calib_samples": int(args.n_calib_samples),
@@ -1040,6 +1172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "calib_repeat_seed_stride": int(args.calib_repeat_seed_stride),
                 "dataset": args.dataset,
                 "kl_scope": args.kl_scope,
+                **calib_provenance,
             },
             "kl_cuda_graphs": args.kl_cuda_graphs,
             "assignment_materialization": materialization_mode,
