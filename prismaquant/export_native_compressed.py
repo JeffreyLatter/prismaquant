@@ -1471,11 +1471,13 @@ def gptq_damp_sweep_enabled() -> bool:
     return os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0") != "0"
 
 
-def _resolve_gptq_fixed_damp(default: float = 0.3) -> float:
+def _resolve_gptq_fixed_damp(default: float = 1.0) -> float:
     """Fixed GPTQ damp used when the damp sweep is disabled.
 
-    Default 0.3 = the V1 served A/B winner (basin-center arm; best PPL
-    and tail across two calibration draws, see gptq_damp_sweep_enabled).
+    Default 1.0 = the V1 served A/B winner over THREE calibration draws:
+    wins all-position KL and confident KL 3/3 draws vs damp 0.3, PPL 2/3
+    and on average (26.80 vs 27.03); 0.3's only consistent edge was the
+    max-of-16-chunks tail at shrinking margins (+0.3% on the last draw).
     ``PRISMAQUANT_GPTQ_DAMP`` overrides (0.01 reproduces vanilla GPTQ).
     Sweep paths pass explicit candidates and ignore this. Open research:
     derive the per-Linear optimum from weights/activations alone

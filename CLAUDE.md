@@ -340,7 +340,7 @@ maps to the `joint_mse` scale rule whose per-group levels default to **{6,4}**
 renders; `four_over_six_mse` is a separate, non-JSO rule — don't conflate the
 three.) JSO subsumed the separate clip solvers (*"clipping is just another way of
 asking what the right scale is, and JSO already answers it"*).
-**The GPTQ `damp_sweep` is OFF by default since 2026-06-12; fixed damp 0.3.**
+**The GPTQ `damp_sweep` is OFF by default since 2026-06-12; fixed damp 1.0.**
 The sweep's evaluator was found in-sample (held-out basins invert 31/31);
 the V1 served A/B had fixed-0.3 beating the sweep on every gold-lane readout
 across two calibration draws at ~4.4× less render time, and the old
