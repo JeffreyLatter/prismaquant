@@ -91,6 +91,7 @@ def _parse_labeled_path(value: str) -> tuple[str, Path]:
     return path.stem, path
 
 def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
+    del fmt
     if profile is None:
         return False
     is_pinned = getattr(profile, "is_pinned_name", None)
@@ -104,8 +105,6 @@ def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
                 continue
             if name == prefix.rstrip(".") or name.startswith(prefix):
                 return True
-    if fr.canonical_format_name(fmt) != "BF16":
-        return False
     return False
 
 
