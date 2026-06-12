@@ -111,6 +111,43 @@ def _target_linears(
     return out
 
 
+def _packed_expert_targets(model: nn.Module, profile=None) -> list[str]:
+    from prismaquant.build_rtn_cache import iter_quantizable_tensors
+
+    out: list[str] = []
+    for name, mod, attr in iter_quantizable_tensors(model, profile):
+        if isinstance(mod, nn.Linear):
+            continue
+        param = getattr(mod, attr, None)
+        if isinstance(param, nn.Parameter) and param.dim() == 3:
+            out.append(str(name))
+    return sorted(set(out))
+
+
+def _guard_packed_expert_coverage(
+    model: nn.Module,
+    profile=None,
+    *,
+    allow_omission: bool = False,
+) -> list[str]:
+    packed = _packed_expert_targets(model, profile)
+    if packed and not allow_omission:
+        sample = ", ".join(packed[:6])
+        raise RuntimeError(
+            "Aura cost does not yet implement packed-MoE expert costs; "
+            f"found {len(packed)} packed expert tensor(s), sample={sample}. "
+            "Use the empirical packed-expert cost path or pass "
+            "--allow-packed-expert-omission only for an explicit research/debug "
+            "run that accepts experts being omitted from the AURA cost payload."
+        )
+    if packed:
+        _log(
+            "WARNING: omitting packed-MoE experts from Aura cost by explicit "
+            f"request: {len(packed)} tensors, sample={packed[:6]}"
+        )
+    return packed
+
+
 def _delta_w(
     name: str,
     fmt: str,
@@ -220,6 +257,8 @@ def compute_aura_cost(
     require_production_cache: bool = False,
     dw_dtype: str = "bfloat16",
     include_lm_head: bool = False,
+    profile=None,
+    allow_packed_expert_omission: bool = False,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -234,6 +273,11 @@ def compute_aura_cost(
         raise ValueError(f"n_probes must be >= 1, got {n_probes!r}")
     _dw_torch_dtype = torch.float32 if str(dw_dtype) == "float32" else torch.bfloat16
     device = next(model.parameters()).device
+    omitted_packed_experts = _guard_packed_expert_coverage(
+        model,
+        profile,
+        allow_omission=allow_packed_expert_omission,
+    )
     linears = _target_linears(model, include_lm_head=include_lm_head)
     names = list(linears.keys())
     fmts = [fr.canonical_format_name(f) for f in formats]
@@ -400,6 +444,7 @@ def compute_aura_cost(
         "n_probes": n_probes,
         "formats": fmts,
         "token_scope": token_scope,
+        "omitted_packed_experts": omitted_packed_experts,
         "stats": stats,
         "costs": costs,
     }
@@ -457,6 +502,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "allocator can choose its format by budget-value rather "
                         "than a hardcoded pin. dW falls back to RTN if the cache "
                         "lacks a rendered lm_head.")
+    p.add_argument("--allow-packed-expert-omission", action="store_true",
+                   help="Explicit research/debug escape: allow AURA to omit "
+                        "packed-MoE expert tensors from the cost payload. "
+                        "Default is fail-fast because packed experts need an "
+                        "empirical/hybrid expert-cost path, not silent omission.")
     p.add_argument("--device", default="cuda")
     args = p.parse_args(argv)
 
@@ -468,8 +518,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # with tensor names that match the production cache keys. No-op on
     # pure-text checkpoints.
     from prismaquant.build_rtn_cache import stage_multimodal
+    from prismaquant.model_profiles import detect_profile_with_warning
 
     dt = torch.float32 if args.dtype == "float32" else torch.bfloat16
+    profile = detect_profile_with_warning(args.model, entrypoint="aura-cost")
     staged, _cleanup = stage_multimodal(args.model)
     local_only = Path(staged).exists()
     _log(f"loading {args.model} (staged={staged}) dtype={args.dtype}")
@@ -511,6 +563,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_production_cache=args.require_production_cache,
         dw_dtype=args.dw_dtype,
         include_lm_head=args.include_lm_head,
+        profile=profile,
+        allow_packed_expert_omission=args.allow_packed_expert_omission,
     )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:

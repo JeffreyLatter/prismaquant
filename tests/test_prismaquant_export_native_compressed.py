@@ -431,7 +431,66 @@ class TestPackedExpertExport(unittest.TestCase):
         self.assertNotIn(f"{prefix}.0.up_proj", tensors)
         self.assertNotIn(f"{prefix}.0.down_proj", tensors)
         self.assertEqual(
-            hist.get(("packed_moe_per_expert", "MXFP8_E4M3")),
+            hist.get(("packed_moe_per_expert", "MXFP8_E4M3+rtn")),
+            2,
+        )
+
+    def test_packed_expert_hist_label_distinguishes_cached_and_rtn(self):
+        self.assertEqual(
+            enc._packed_expert_render_hist_label(
+                "NVFP4",
+                is_bf16=False,
+                source_label="bf16",
+                cached_3d=torch.ones(1, 1, 1),
+            ),
+            "NVFP4+cached",
+        )
+        self.assertEqual(
+            enc._packed_expert_render_hist_label(
+                "NVFP4",
+                is_bf16=False,
+                source_label="bf16",
+                cached_3d=None,
+            ),
+            "NVFP4+rtn",
+        )
+        self.assertEqual(
+            enc._packed_expert_render_hist_label(
+                "BF16",
+                is_bf16=True,
+                source_label="bf16",
+                cached_3d=None,
+            ),
+            "bf16",
+        )
+
+    def test_packed_expert_export_provenance_records_escape_and_coverage(self):
+        class _Cache:
+            metadata = {
+                "packed_expert_coverage": {
+                    "layer.experts.gate_up_proj": {
+                        "rtn_fallbacks": 2,
+                        "gptq_experts": 0,
+                    }
+                }
+            }
+
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = _Cache()
+            enc._ALLOW_PACKED_EXPERT_RTN = True
+            prov = enc._packed_expert_export_provenance()
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertTrue(prov["rtn_escape_enabled"])
+        self.assertTrue(prov["cache_has_packed_expert_coverage"])
+        self.assertEqual(
+            prov["cache_packed_expert_coverage"][
+                "layer.experts.gate_up_proj"
+            ]["rtn_fallbacks"],
             2,
         )
 

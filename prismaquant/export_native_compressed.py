@@ -1402,6 +1402,29 @@ _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
 
 
+def _packed_expert_render_hist_label(
+    fmt: str,
+    *,
+    is_bf16: bool,
+    source_label: str,
+    cached_3d: torch.Tensor | None,
+) -> str:
+    if is_bf16:
+        return source_label
+    return f"{fmt}+cached" if cached_3d is not None else f"{fmt}+rtn"
+
+
+def _packed_expert_export_provenance() -> dict[str, object]:
+    cache = _PRODUCTION_WEIGHT_CACHE
+    metadata = dict(getattr(cache, "metadata", {}) or {}) if cache is not None else {}
+    coverage = metadata.get("packed_expert_coverage")
+    return {
+        "rtn_escape_enabled": bool(_ALLOW_PACKED_EXPERT_RTN),
+        "cache_has_packed_expert_coverage": coverage is not None,
+        "cache_packed_expert_coverage": coverage or {},
+    }
+
+
 def _gptq_column_block_size(cols: int) -> int:
     raw = os.environ.get(
         "PRISMAQUANT_GPTQ_BLOCK_SIZE",
@@ -5523,7 +5546,15 @@ def materialize_tensors_streaming(
                             for suffix, t in compressed.items():
                                 out[f"{base}.{suffix}"] = t.cpu()
                 covered.add(full)
-                hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
+                hist[(
+                    "packed_moe_per_expert",
+                    _packed_expert_render_hist_label(
+                        fmt,
+                        is_bf16=is_bf16,
+                        source_label=label if is_bf16 else "",
+                        cached_3d=cached_3d,
+                    ),
+                )] += 1
                 del packed_param, packed_param_src, proj_split
                 if cached_3d is not None:
                     del cached_3d, cached_split
@@ -5759,7 +5790,15 @@ def _materialize_tensors_inmemory(
                         for suffix, tensor in compressed.items():
                             out[f"{base}.{suffix}"] = tensor.cpu()
             covered.add(full_name)
-            hist[("packed_moe_per_expert", label if is_bf16 else fmt)] += 1
+            hist[(
+                "packed_moe_per_expert",
+                _packed_expert_render_hist_label(
+                    fmt,
+                    is_bf16=is_bf16,
+                    source_label=label if is_bf16 else "",
+                    cached_3d=cached_3d,
+                ),
+            )] += 1
 
     for name, p in model.named_parameters():
         if any(name.startswith(c + ".") or name == c for c in covered):
@@ -7106,6 +7145,7 @@ def main():
                 runtime_coerced,
                 profile,
             ),
+            "packed_expert_export": _packed_expert_export_provenance(),
             "ignore": sorted(bf16_passthrough),
         }, f, indent=2)
 
