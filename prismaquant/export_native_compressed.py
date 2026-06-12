@@ -7086,9 +7086,26 @@ def main():
             _assignment_for_cache
         )
         if missing_keys:
+            mtp_missing = [k for k in missing_keys
+                           if str(k[0]).startswith("mtp.")]
+            mtp_hint = ""
+            if mtp_missing:
+                # No producer renders mtp.* into ProductionWeightCache yet
+                # (build_production_cache/production_recache never see the
+                # MTP sidecar). Fail HERE at attach time with the contract,
+                # not hours later in _materialize_tensors_inmemory.
+                mtp_hint = (
+                    f" {len(mtp_missing)} of these are MTP sidecar entries "
+                    f"(e.g. {mtp_missing[0][0]}): no producer renders mtp.* "
+                    "into the production cache today — non-BF16 MTP with an "
+                    "attached cache is an unsupported configuration. Set "
+                    "MTP_FORMAT=BF16, or add MTP coverage to "
+                    "build_production_cache before exporting."
+                )
             raise RuntimeError(
                 "[export-stream] production-weight-cache missing recipe "
-                f"entries: {len(missing_keys)} sample={missing_keys[:8]}"
+                f"entries: {len(missing_keys)} sample={missing_keys[:8]}."
+                + mtp_hint
             )
         files = production_cache.verify_files(expected_keys)
         if files["missing"]:

@@ -3510,3 +3510,21 @@ class TestActivationAwarePasses(unittest.TestCase):
                 os.environ["PRISMAQUANT_DO_NO_HARM"] = saved_dnh
 
         self.assertEqual(calls, ["gptq", "scale_sweep"])
+
+
+class TestMtpCacheCoveragePreflight(unittest.TestCase):
+    def test_missing_mtp_entries_diagnosed_at_attach_time(self):
+        # QC M17: non-BF16 mtp.* with an attached cache must fail with the
+        # producer-absence contract named, not a generic missing-keys error
+        # (and never reach the late in-memory materialization gate).
+        from prismaquant import export_native_compressed as enc
+
+        keys, missing = enc._production_cache_expected_keys({
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "mtp.layers.0.mlp.gate_proj": "NVFP4",
+        })
+        mtp_missing = [k for k in missing if str(k[0]).startswith("mtp.")]
+        self.assertTrue(
+            mtp_missing,
+            "mtp.* entries must surface in the attach-time coverage check",
+        )
