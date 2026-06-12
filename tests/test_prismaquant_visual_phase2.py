@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 
 from prismaquant.sensitivity_probe import (
+    _streaming_visual_layer_kwargs,
     _synthetic_multimodal_calibration_samples,
     load_multimodal_calibration,
     stage_multimodal,
@@ -456,6 +457,56 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
             exp._CACHED_ACTIVATIONS = prev
         self.assertEqual(visual["weight_packed"].shape,
                          body["weight_packed"].shape)
+
+
+class TestStreamingMultimodalProfileState(unittest.TestCase):
+    def test_streaming_visual_kwargs_merge_profile_and_pass_state(self):
+        class Profile:
+            def __init__(self):
+                self.extra_input_ids = []
+                self.isolated_calls = []
+
+            def extra_layer_kwargs(self, *, input_ids=None):
+                self.extra_input_ids.append(input_ids)
+                return {"profile_input_ids": input_ids}
+
+            def isolated_layer_pass_state(self, captured, layer):
+                self.isolated_calls.append((captured, layer))
+                return {"shared_kv": captured["shared_kv"]}
+
+        profile = Profile()
+        input_ids = torch.tensor([[1, 2, 3]])
+        layer = object()
+
+        forward = _streaming_visual_layer_kwargs(
+            profile,
+            input_ids=input_ids,
+            pass_state={"live_state": "forward"},
+        )
+        self.assertIs(forward["profile_input_ids"], input_ids)
+        self.assertEqual(forward["live_state"], "forward")
+        self.assertEqual(profile.extra_input_ids, [input_ids])
+
+        replay = _streaming_visual_layer_kwargs(
+            profile,
+            input_ids=input_ids,
+            captured_pass_state={"shared_kv": "captured"},
+            layer=layer,
+        )
+        self.assertIs(replay["profile_input_ids"], input_ids)
+        self.assertEqual(replay["shared_kv"], "captured")
+        self.assertEqual(profile.isolated_calls, [({"shared_kv": "captured"},
+                                                   layer)])
+
+    def test_streaming_probe_threads_profile_pass_state(self):
+        from prismaquant import sensitivity_probe as sp
+
+        src = inspect_source(sp.run_streaming_multimodal_visual_probe_pass)
+        helper_src = inspect_source(sp._streaming_visual_layer_kwargs)
+        self.assertIn("new_forward_pass_state", src)
+        self.assertIn("capture_forward_pass_state", src)
+        self.assertIn("isolated_layer_pass_state", helper_src)
+        self.assertIn("_streaming_visual_layer_kwargs", src)
 
 
 class TestMultimodalProbePassIntegration(unittest.TestCase):

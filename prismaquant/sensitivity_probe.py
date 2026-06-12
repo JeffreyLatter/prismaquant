@@ -947,6 +947,23 @@ def read_top_k(model: nn.Module, default: int = 2) -> int:
     return default
 
 
+def _streaming_visual_layer_kwargs(
+    profile,
+    *,
+    input_ids=None,
+    pass_state: dict | None = None,
+    captured_pass_state=None,
+    layer=None,
+) -> dict:
+    kwargs = dict(profile.extra_layer_kwargs(input_ids=input_ids))
+    if pass_state is not None:
+        kwargs.update(pass_state)
+    if captured_pass_state is not None and layer is not None:
+        kwargs.update(profile.isolated_layer_pass_state(
+            captured_pass_state, layer))
+    return kwargs
+
+
 # ---------------------------------------------------------------------------
 # Router tracker: per-(router, expert) activation probability
 # ---------------------------------------------------------------------------
@@ -2306,6 +2323,7 @@ def run_streaming_multimodal_visual_probe_pass(
         _compute_attention_mask,
         _compute_position_embeddings,
     )
+    from .model_profiles import DefaultProfile, profile_from_model
     from .streaming_model import _build_streaming_context
 
     try:
@@ -2358,6 +2376,10 @@ def run_streaming_multimodal_visual_probe_pass(
     layers_prefix = ctx.layers_prefix
     visual_module = ctx.visual_module
     visual_prefix = ctx.visual_prefix or ""
+    try:
+        model_profile = profile_from_model(model)
+    except Exception:
+        model_profile = DefaultProfile()
 
     # Enumerate tracked Linears: per-regex visual matches + any resident
     # Linears that the regex would pick up (usually none — visual regex
@@ -2508,6 +2530,7 @@ def run_streaming_multimodal_visual_probe_pass(
                 base_model, inputs_embeds, position_ids)
             position_embeddings = _compute_position_embeddings(
                 base_model, inputs_embeds, position_ids)
+            pass_state = model_profile.new_forward_pass_state()
 
             activations_cpu: list[torch.Tensor] = [inputs_embeds.detach().cpu()]
             hidden = inputs_embeds
@@ -2522,10 +2545,17 @@ def run_streaming_multimodal_visual_probe_pass(
                         position_embeddings=position_embeddings,
                         attention_mask=causal_mask,
                         position_ids=position_ids,
+                        **_streaming_visual_layer_kwargs(
+                            model_profile,
+                            input_ids=input_ids,
+                            pass_state=pass_state,
+                        ),
                     )
                 hidden = out
                 activations_cpu.append(hidden.detach().cpu())
                 ctx.unload(L)
+            shared_pass_state = model_profile.capture_forward_pass_state(
+                pass_state)
 
             # ---- Phase 2: final norm + lm_head + CE --------------------
             final_hidden = (activations_cpu[-1].to(device).to(dtype)
@@ -2566,6 +2596,12 @@ def run_streaming_multimodal_visual_probe_pass(
                     position_embeddings=position_embeddings,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
+                    **_streaming_visual_layer_kwargs(
+                        model_profile,
+                        input_ids=input_ids,
+                        captured_pass_state=shared_pass_state,
+                        layer=layers[L],
+                    ),
                 )
                 out.backward(grad_out)
                 grad_out = x_in.grad.detach().clone()
