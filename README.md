@@ -110,7 +110,9 @@ For full method derivations, the `_GradNormCapture` MoE Fisher estimator, the L3
 ```
 incremental_probe ──► probe.pkl     (Fisher H_trace per Linear + router statistics)
         │
-incremental_measure_quant_cost ─► cost.pkl      (per-(Linear, format) MSE — L1)
+production_render_cost ─► cost.pkl      (default production render-score cost)
+        │
+incremental_measure_quant_cost ─► cost.pkl      (legacy/local L1 cost path)
         │
 allocator ─► layer_config.json + Pareto curve
         │
@@ -156,12 +158,9 @@ First-class profiles ship today:
 
 - **Qwen3.5 / Qwen3.6** (dense + packed-3D MoE + MTP heads)
 - **MiniMax M2 / M2.7** (nested per-expert MoE, native FP8 source)
-
-Active integration:
-
-- **DeepSeek-V3 / V3.1**
-- **DeepSeek-V4-Flash** (waiting on `transformers` class)
-- **GLM-4**
+- **DeepSeek-V4-Flash** (vendored transformer + profile)
+- **Gemma4** (multi-layer-type rope, sliding attention, visual/text profiles)
+- **LFM2.5** (per-expert MoE profile)
 
 Adding a new architecture is a `model_profiles/` registration: declare the layer module path, the MoE structure (nested vs packed), the fused-sibling groups, and any pre-staging quirks. Most architectures land in 100–200 LoC.
 
@@ -171,9 +170,8 @@ Adding a new architecture is a `model_profiles/` registration: declare the layer
 
 Active development. The 27B PrismaSCOUT ship is the current public artifact. Active workstreams:
 
-- **Production-faithful polish on 27B** — export of the 5.39 bpp polished artifact in flight at time of writing; downstream task evals (validator perplexity, GSM8K, IFEval, MMLU, tool-eval-bench) and 8×512 KL re-measurement queued.
-- **MiniMax M2.7 at ~90 GB on Spark** — v22 throughput optimizations landed; probe + cost in flight.
-- **DeepSeek-V4-Flash** — blocked on transformers `DeepseekV4ForCausalLM`; mirror flow ready.
+- **AURA production allocation** — production-render-score cost, allocator-selected assignments, validation, and vLLM metadata checks are the active ship path; local polish and Block-CLADO iteration remain archived until they pass the same validation gate.
+- **Large MoE profile coverage** — MiniMax M2/M2.7, DeepSeek-V4-Flash, Gemma4, and LFM2.5 have in-tree profile support; DeepSeek-V4-Flash uses the vendored transformer implementation under `prismaquant/vendored/`.
 - **Per-channel Fisher + per-channel weight MSE** — research; preserves the knapsack's optimal substructure at <10 MB extra storage per 35B model.
 
 The full paper draft is at [`paper/main.pdf`](paper/main.pdf) — includes the methodology section on rejected detours (Lagrangian λ-bisection, sandwich proximal recalibration, block-DP, sparse pairwise QUBO, top-K Hessian covering, surrogate-only knee, probe-only knee predictor) and an honest accounting of downstream regressions on the shipped 27B artifact.
