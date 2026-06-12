@@ -586,6 +586,62 @@ class TestPackedExpertExport(unittest.TestCase):
             2,
         )
 
+    def test_expected_cache_keys_require_packed_experts_by_default(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = ProductionWeightCache(
+                weights={}, levers={"gptq": True})
+            enc._ALLOW_PACKED_EXPERT_RTN = False
+            keys, missing = enc._production_cache_expected_keys(assignment)
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertEqual(keys, [])
+        self.assertIn(
+            ("model.layers.0.mlp.experts.gate_up_proj", "NVFP4"),
+            missing,
+        )
+        self.assertIn(
+            ("model.layers.0.self_attn.q_proj", "NVFP4"),
+            missing,
+        )
+
+    def test_expected_cache_keys_escape_skips_only_packed_experts(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = ProductionWeightCache(
+                weights={}, levers={"gptq": True})
+            enc._ALLOW_PACKED_EXPERT_RTN = True
+            keys, missing = enc._production_cache_expected_keys(assignment)
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertEqual(keys, [])
+        self.assertNotIn(
+            ("model.layers.0.mlp.experts.gate_up_proj", "NVFP4"),
+            missing,
+        )
+        self.assertEqual(
+            missing,
+            [("model.layers.0.self_attn.q_proj", "NVFP4")],
+        )
+
 
 def _nvfp4_dequantize(weight_packed, weight_scale_fp8, weight_global_scale_divisor):
     """Reproduce vLLM's NVFP4 dequant convention to verify round-trip.

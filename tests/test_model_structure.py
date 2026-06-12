@@ -187,6 +187,10 @@ def test_default_profile_common_fused_groups_are_profile_owned():
         "k_proj",
         "v_proj",
     )
+    assert profile.fused_sibling_leaf_mapping()["in_proj_ba"] == (
+        "in_proj_b",
+        "in_proj_a",
+    )
     assert (
         profile.fused_sibling_group("model.layers.0.self_attn.q_proj")
         == "model.layers.0.self_attn.qkv_proj"
@@ -194,6 +198,10 @@ def test_default_profile_common_fused_groups_are_profile_owned():
     assert (
         profile.fused_sibling_group("model.layers.0.mlp.gate_proj")
         == "model.layers.0.mlp.gate_up_proj"
+    )
+    assert (
+        profile.fused_sibling_group("model.layers.0.linear_attn.in_proj_b")
+        == "model.layers.0.linear_attn.in_proj_ba"
     )
 
 
@@ -277,6 +285,9 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
     )
     assert split_group == moe.packed_expert_format_group(
         "model.layers.0.mlp.experts.7.down_proj"
+    )
+    assert split_group == moe.packed_expert_format_group(
+        "model.layers.0.mlp.experts.9.down_proj"
     )
     assert split_group != packed_group
 
@@ -369,6 +380,9 @@ def test_packed_expert_format_group_uses_declared_projection_splits():
     assert split_group == spec.packed_expert_format_group(
         "model.layers.0.mlp.experts.7.w2"
     )
+    assert split_group == spec.packed_expert_format_group(
+        "model.layers.0.mlp.experts.9.w2"
+    )
     assert split_group != packed_group
 
 
@@ -437,6 +451,11 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
         "model.layers.0.experts.3.gate_proj"
     ) == profile.packed_expert_format_group(
         "model.layers.0.experts.3.down_proj"
+    )
+    assert profile.packed_expert_format_group(
+        "model.layers.0.experts.3.gate_proj"
+    ) == profile.packed_expert_format_group(
+        "model.layers.0.experts.9.down_proj"
     )
     assert profile.source_passthrough_prefixes() == (
         "model.vision_tower.",

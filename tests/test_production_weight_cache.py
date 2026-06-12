@@ -12,6 +12,7 @@ from prismaquant.build_production_cache import (
     validate_render_assignment_cache_coverage,
 )
 from prismaquant.production_weight_cache import ProductionWeightCache
+from prismaquant.production_weight_cache import fill_packed_expert_cache_entries
 from prismaquant.production_weight_cache import _format_supports_render_mechanism
 from prismaquant.production_weight_cache import fill_production_weight_cache
 from prismaquant.production_recache import (
@@ -127,6 +128,29 @@ def test_assignment_keys_ignore_uncached_packed_expert_entries(tmp_path):
 
     assert keys == [("dense", "NVFP4")]
     assert missing == [("missing_dense", "NVFP4")]
+
+
+def test_assignment_keys_can_require_packed_expert_entries(tmp_path):
+    cache = ProductionWeightCache(weights={}, levers={}, cache_dir=str(tmp_path))
+
+    keys, missing = cache.assignment_keys(
+        {"model.layers.0.mlp.experts.gate_up_proj": "NVFP4"},
+        include_packed_experts=True,
+    )
+
+    assert keys == []
+    assert missing == [(
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "NVFP4",
+    )]
+
+
+def test_packed_expert_cache_docstring_describes_batched_recipe():
+    doc = fill_packed_expert_cache_entries.__doc__ or ""
+
+    assert "fixed-damp batched GPTQ" in doc
+    assert "without dense JSO/act-order/damp-sweep" in doc
+    assert "identical GPTQ + JSO + damp-sweep" not in doc
 
 
 def test_build_render_assignment_coverage_does_not_skip_packed_experts():

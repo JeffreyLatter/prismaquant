@@ -34,7 +34,9 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
+import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
@@ -91,6 +93,30 @@ def _free_gib() -> float:
         return float("inf")
 
 
+def _tied_lm_head(model: nn.Module) -> bool:
+    get_in = getattr(model, "get_input_embeddings", None)
+    get_out = getattr(model, "get_output_embeddings", None)
+    if not callable(get_in) or not callable(get_out):
+        return False
+    try:
+        inp = get_in()
+        out = get_out()
+    except Exception:
+        return False
+    if inp is None or out is None:
+        return False
+    w_in = getattr(inp, "weight", None)
+    w_out = getattr(out, "weight", None)
+    if w_in is None or w_out is None:
+        return False
+    if w_in is w_out:
+        return True
+    try:
+        return w_in.data_ptr() == w_out.data_ptr()
+    except Exception:
+        return False
+
+
 def _target_linears(
     model: nn.Module, *, include_lm_head: bool = False,
 ) -> dict[str, nn.Linear]:
@@ -100,6 +126,12 @@ def _target_linears(
     decision rather than a hardcoded pin -- the KL probe gradient flows
     directly into lm_head (it produces the logits), so its cost is
     measured the same way as any body Linear."""
+    if include_lm_head and _tied_lm_head(model):
+        raise RuntimeError(
+            "--include-lm-head is not supported for tied input/output "
+            "embeddings: the lm_head gradient includes the embedding-path "
+            "contribution, so it does not price the exported lm_head view."
+        )
     out: dict[str, nn.Linear] = {}
     for name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
@@ -155,6 +187,7 @@ def _delta_w(
     cache: object | None,
     *,
     strict: bool = False,
+    source_counts: Counter | None = None,
 ) -> torch.Tensor | None:
     """Q_f(W)-W: production-rendered error if the cache has it, else RTN.
 
@@ -169,7 +202,11 @@ def _delta_w(
         except Exception:
             rendered = None
         if rendered is not None:
+            if source_counts is not None:
+                source_counts["production_cache"] += 1
             return (rendered.to(weight.device, torch.float32) - weight.float())
+        if source_counts is not None:
+            source_counts["production_cache_miss"] += 1
         if strict:
             raise RuntimeError(
                 f"require_production_cache: production-rendered weight missing "
@@ -178,11 +215,33 @@ def _delta_w(
     spec = fr.get_format(fmt)
     qdq = getattr(spec, "quantize_dequantize", None)
     if qdq is None:
+        if source_counts is not None:
+            source_counts["unavailable"] += 1
         return None
     try:
-        return qdq(weight.float()) - weight.float()
+        out = qdq(weight.float()) - weight.float()
+        if source_counts is not None:
+            source_counts["rtn"] += 1
+        return out
+    except Exception:
+        if source_counts is not None:
+            source_counts["unavailable"] += 1
+        return None
+
+
+def _git_commit() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
     except Exception:
         return None
+    return proc.stdout.strip() or None
 
 
 def _auto_n_chunks(
@@ -192,7 +251,7 @@ def _auto_n_chunks(
     *,
     n_nonzero_fmts: int = 1,
     dw_bytes: int = 2,
-    accurate_chunk_bytes: bool = False,
+    accurate_chunk_bytes: bool = True,
 ) -> int:
     """Pick the number of Linear chunks so peak memory stays under budget.
 
@@ -209,16 +268,12 @@ def _auto_n_chunks(
     only and says nothing about VRAM headroom -- this sizing would be wrong
     there and would have to gate on ``torch.cuda.mem_get_info`` instead.
 
-    Legacy (default) accounting hardcodes 2 bytes/weight and a single ~W/G dW
-    term -- it silently assumes a bf16 model with one nonzero format, and
-    under-counts by ~2x on the default fp32 load (4-byte weights+grads) or with
-    multiple nonzero formats (one bf16 dW each), picking too few chunks and
-    tripping the watchdog mid-run. ``accurate_chunk_bytes`` switches to the real
-    footprint: grad bytes from the model param ``element_size()`` (4 for fp32,
+    Accurate accounting is the default: grad bytes from the model param
+    ``element_size()`` (4 for fp32,
     2 for bf16) plus ``n_nonzero_fmts * dw_bytes`` for the per-format bf16
     deltas. It only changes how many memory-bounded passes are taken; the
-    numerical payload is bit-identical for any G, so it is purely an opt-in
-    safety knob and never perturbs the cost output."""
+    numerical payload is bit-identical for any G. ``accurate_chunk_bytes=False``
+    preserves the old 2-bytes/weight single-dW estimate for reproduction only."""
     free = _free_gib()
     if free == float("inf"):
         return 1
@@ -253,12 +308,13 @@ def compute_aura_cost(
     seed_base: int = 7000,
     n_linear_chunks: int = 0,
     assert_bf16_passthrough: bool = False,
-    accurate_chunk_bytes: bool = False,
+    accurate_chunk_bytes: bool = True,
     require_production_cache: bool = False,
     dw_dtype: str = "bfloat16",
     include_lm_head: bool = False,
     profile=None,
     allow_packed_expert_omission: bool = False,
+    model_path: str | None = None,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -322,6 +378,7 @@ def compute_aura_cost(
     s2: dict[tuple[str, str], float] = {}
     g_trace: dict[str, float] = {}  # KL-Fisher weight-grad energy
     inv = 1.0 / float(n_probes)
+    delta_source_counts: Counter = Counter()
 
     for ci, chunk in enumerate(chunks):
         for n in chunk:
@@ -332,7 +389,8 @@ def compute_aura_cost(
             for f in nonzero_fmts:
                 for n in chunk:
                     d = _delta_w(n, f, linears[n].weight.data, production_cache,
-                                 strict=require_production_cache)
+                                 strict=require_production_cache,
+                                 source_counts=delta_source_counts)
                     if d is not None:
                         dW[(n, f)] = d.to(_dw_torch_dtype)  # dot upcasts to fp32
         for key in dW:
@@ -441,9 +499,15 @@ def compute_aura_cost(
             }
     return {
         "schema": SCHEMA,
+        "model": model_path,
+        "git_commit": _git_commit(),
         "n_probes": n_probes,
+        "seed_base": seed_base,
         "formats": fmts,
         "token_scope": token_scope,
+        "n_linear_chunks": int(n_linear_chunks),
+        "accurate_chunk_bytes": bool(accurate_chunk_bytes),
+        "delta_source_counts": dict(delta_source_counts),
         "omitted_packed_experts": omitted_packed_experts,
         "stats": stats,
         "costs": costs,
@@ -479,15 +543,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "loaded fp32 (BF16 would be a downcast, not a lossless "
                         "passthrough, so its zero-cost would be wrong). Off by "
                         "default; current behavior is unchanged when omitted.")
-    p.add_argument("--accurate-chunk-bytes", action="store_true",
-                   help="Size --n-linear-chunks=0 auto-chunking from the real "
-                        "per-weight footprint: grad bytes from the model param "
-                        "element_size() (4 for fp32, 2 for bf16) + one bf16 dW "
-                        "per nonzero format. The legacy default assumes 2 "
-                        "bytes/weight and a single dW, under-counting ~2x on the "
-                        "default fp32 load and tripping the watchdog. Off by "
-                        "default; only changes the pass count, never the output "
-                        "(bit-identical for any G).")
+    p.add_argument("--accurate-chunk-bytes", dest="accurate_chunk_bytes",
+                   action="store_true", default=True,
+                   help="Use accurate auto-chunk byte accounting (default): "
+                        "grad bytes from the model param element_size() plus "
+                        "one bf16 dW per nonzero format. Only changes pass "
+                        "count, never the output.")
+    p.add_argument("--legacy-chunk-bytes", dest="accurate_chunk_bytes",
+                   action="store_false",
+                   help="Reproduce the old auto-chunk estimate "
+                        "(2 bytes/weight and one dW term).")
     p.add_argument("--require-production-cache", action="store_true",
                    help="Fail fast if the production cache lacks a rendered "
                         "(Linear, format); refuse silent RTN fallback. Off by "
@@ -565,6 +630,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         include_lm_head=args.include_lm_head,
         profile=profile,
         allow_packed_expert_omission=args.allow_packed_expert_omission,
+        model_path=args.model,
     )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:

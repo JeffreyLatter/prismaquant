@@ -965,7 +965,10 @@ def _production_cache_expected_keys(
             continue
         key = _production_cache_lookup_key(qname, cache_fmt)
         if key is None:
-            if is_uncached_packed_expert_qname(qname):
+            if (
+                _ALLOW_PACKED_EXPERT_RTN
+                and is_uncached_packed_expert_qname(qname)
+            ):
                 continue
             missing.append((qname, cache_fmt))
         else:
@@ -6904,12 +6907,12 @@ def main():
     print(f"[export-stream] model profile: {profile.name}", flush=True)
     if isinstance(profile, DefaultProfile):
         # The export's fused-coherence gate keys off this profile's
-        # packed_modules_mapping. Under DefaultProfile only the UNIVERSAL fused
-        # groups (qkv_proj/gate_up_proj) are checked -- architecture-specific
-        # merged columns (e.g. Qwen3.x DeltaNet in_proj_ba) and packed-MoE
-        # experts are INVISIBLE here, so a mixed-format group in those can ship
-        # undetected. This happens when --model's architecture is not
-        # registered. Make the export's blind spot loud.
+        # packed_modules_mapping plus fallback fused groups. DefaultProfile
+        # checks qkv_proj/gate_up_proj and the known DeltaNet
+        # in_proj_ba/in_proj_qkvz groups, but unknown architecture-specific
+        # merged columns and packed-MoE expert constraints are still invisible
+        # when --model's architecture is not registered. Make that blind spot
+        # loud.
         print(
             "[export-stream] WARNING: resolved DefaultProfile for "
             f"{args.model!r} -- architecture not registered. Fused-coherence "

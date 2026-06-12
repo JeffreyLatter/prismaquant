@@ -933,14 +933,13 @@ def validate_default_profile_format_menu(
             "[alloc] ERROR: multi-format menu "
             f"({distinct_fmt_names}) resolved to DefaultProfile (no probe "
             "meta['model'] / --model-override, or the model architecture is "
-            "not registered) -> DefaultProfile cannot enforce architecture-"
-            "specific fused-sibling coherence (e.g. Qwen3.x DeltaNet "
-            "in_proj_ba/in_proj_qkvz) or packed-MoE expert uniformity, which "
+            "not registered) -> DefaultProfile only enforces its fallback "
+            "fused groups (qkv_proj/gate_up_proj and DeltaNet "
+            "in_proj_ba/in_proj_qkvz). It cannot guarantee unknown "
+            "architecture-specific coherence or packed-MoE expert uniformity, which "
             "risks an unservable or silently-corrupt artifact. Pass "
             "--model-override <model> so detect_profile resolves the real "
-            "profile, or --allow-default-profile to proceed anyway (only safe "
-            "for vanilla transformers whose only fused groups are "
-            "qkv_proj/gate_up_proj)."
+            "profile, or --allow-default-profile to proceed anyway."
         )
 
 
@@ -963,6 +962,26 @@ def incomplete_fused_group_dp_exclusions(
     return sorted(incomplete_members - set(allocation_excluded))
 
 
+def validate_final_serving_promotion_noop(
+    before: dict[str, str],
+    after: dict[str, str],
+) -> None:
+    if before == after:
+        return
+    changed = [
+        (name, before.get(name), after.get(name))
+        for name in sorted(set(before) | set(after))
+        if before.get(name) != after.get(name)
+    ]
+    sample = changed[:8]
+    raise SystemExit(
+        "[alloc] ERROR: final serving-unit promotion changed the emitted "
+        "assignment after achieved_bits/Delta-loss were computed; metrics are "
+        f"stale. Changed {len(changed)} entries, sample={sample}. Move this "
+        "coupling before solve_with_promotion or recompute accounting."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
@@ -979,12 +998,12 @@ def main():
                     help="Permit a multi-format allocation to run on "
                          "DefaultProfile when no model path is available "
                          "(probe meta['model'] unset and no --model-override). "
-                         "DefaultProfile only enforces the universal fused "
-                         "groups (qkv_proj/gate_up_proj), so architecture-"
-                         "specific merged columns (e.g. Qwen3.x DeltaNet "
-                         "in_proj_ba) are NOT coherence-protected and may "
-                         "produce an unservable or silently-corrupt artifact. "
-                         "Only safe for vanilla transformers. Off by default: "
+                         "DefaultProfile enforces only fallback fused groups "
+                         "(qkv_proj/gate_up_proj and DeltaNet "
+                         "in_proj_ba/in_proj_qkvz), so unknown "
+                         "architecture-specific merged columns or packed-MoE "
+                         "expert constraints may produce an unservable or "
+                         "silently-corrupt artifact. Off by default: "
                          "the allocator hard-errors instead and asks for "
                          "--model-override.")
     ap.add_argument("--target-bits", type=float, default=4.75)
@@ -1180,14 +1199,14 @@ def main():
               f"(derived from {probe_model_path})", flush=True)
     else:
         # No model path (probe lacks meta['model'] and no --model-override):
-        # we fall back to DefaultProfile, which only knows the UNIVERSAL fused
-        # groups (qkv_proj, gate_up_proj). Arch-specific merged columns (e.g.
-        # Qwen3.x DeltaNet in_proj_ba / in_proj_qkvz) are invisible, so the
-        # fused-sibling promotion can leave them with mixed formats -> an
-        # unservable / silently-corrupt checkpoint. A SINGLE-format menu is
-        # always safe (every Linear gets the same format, so fused groups are
-        # trivially coherent); a multi-format menu is gated to a hard error
-        # below unless --allow-default-profile is set.
+        # we fall back to DefaultProfile, whose fallback fused map covers only
+        # qkv_proj, gate_up_proj, and the known DeltaNet in_proj_ba/qkvz
+        # groups. Unknown architecture-specific merged columns remain
+        # invisible, so fused-sibling promotion can leave them with mixed
+        # formats -> an unservable / silently-corrupt checkpoint. A
+        # SINGLE-format menu is always safe (every Linear gets the same format,
+        # so fused groups are trivially coherent); a multi-format menu is gated
+        # to a hard error below unless --allow-default-profile is set.
         used_default_fallback = True
         print(
             "[alloc] WARNING: no model path (probe meta['model'] is unset and "
@@ -2071,6 +2090,7 @@ def main():
             assignment_expanded, stats)
 
     assignment_expanded.update(fixed_format_assignment)
+    assignment_before_serving_promotion = dict(assignment_expanded)
 
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. This keeps per-Linear assignments serveable without
@@ -2079,6 +2099,10 @@ def main():
         assignment_expanded,
         format_rank,
         profile=model_profile,
+    )
+    validate_final_serving_promotion_noop(
+        assignment_before_serving_promotion,
+        assignment_expanded,
     )
 
     # Visual-encoder Linears are auxiliary to the language-model budget.
@@ -2164,10 +2188,11 @@ def main():
                 continue
             kind = source_manifest.get(name)
             if kind is None:
-                # Not in manifest — likely a visual Linear stamped via
-                # --visual-format (bypasses the manifest by design) or
-                # a name the profile rewrite didn't map. Skip.
-                continue
+                # Visual and MTP assignments are stamped as auxiliary formats
+                # outside the language-model source manifest by design.
+                if _is_visual_linear(name) or _is_mtp_linear(name):
+                    continue
+                kind = "unknown"
             if not _passthrough_source_ok(fmt, kind):
                 violations.append((name, fmt, kind))
         if violations:
