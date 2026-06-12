@@ -26,6 +26,7 @@ from prismaquant.export_native_compressed import (
     NVFP4_MAX,
     PER_EXPERT_MOE_REGEX,
     _bf16_upgrade_audit,
+    _compressed_tensor_key,
     _compute_layer_joint_nvfp4,
     _coerce_runtime_legal_assignment,
     _passthrough_dtype,
@@ -1425,6 +1426,16 @@ class TestVLLMInternalNaming(unittest.TestCase):
         self.assertEqual(
             _to_vllm_internal_name("lm_head"),
             "language_model.lm_head",
+        )
+
+    def test_quantized_head_weight_suffix_keeps_weight_key(self):
+        self.assertEqual(
+            _compressed_tensor_key("lm_head", "weight"),
+            "lm_head.weight",
+        )
+        self.assertEqual(
+            _compressed_tensor_key("lm_head", "weight_scale"),
+            "lm_head.weight_scale",
         )
 
     def test_multimodal_source_naming_remap(self):

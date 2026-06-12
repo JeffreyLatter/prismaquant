@@ -4754,6 +4754,10 @@ def _fp8_source_config_overlay(
     return config_assignment, config_bf16_passthrough, overrides
 
 
+def _compressed_tensor_key(base_name: str, suffix: str) -> str:
+    return f"{base_name}.{suffix}"
+
+
 def materialize_tensors_streaming(
     model_path: str,
     assignment: dict[str, str],
@@ -4922,9 +4926,7 @@ def materialize_tensors_streaming(
                 base_name = (full_qname[:-len(".weight")]
                              if full_qname.endswith(".weight")
                              else full_qname)
-                out_key = (base_name
-                           if suffix == "weight"
-                           else f"{base_name}.{suffix}")
+                out_key = _compressed_tensor_key(base_name, suffix)
                 out[out_key] = t.cpu()
             hist[("head", fmt)] += 1
         else:
