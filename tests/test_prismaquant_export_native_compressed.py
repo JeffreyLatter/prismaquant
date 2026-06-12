@@ -2989,6 +2989,58 @@ class TestActivationAwarePasses(unittest.TestCase):
         torch.testing.assert_close(W_swept, W_rtn)
         self.assertGreater(float((W - W_failed).pow(2).mean().item()), 0.0)
 
+    def test_do_no_harm_gate_failure_warns_and_counts(self):
+        import os
+        import torch
+        from unittest import mock
+        import prismaquant.export_native_compressed as m
+
+        torch.manual_seed(912)
+        W = torch.randn(8, 16) * 0.3
+        X = torch.randn(16, 16)
+        saved_stats = m._DO_NO_HARM_STATS.copy()
+        saved_dnh = os.environ.get("PRISMAQUANT_DO_NO_HARM")
+        saved_sweep = os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP")
+        failure_count = None
+        try:
+            m._DO_NO_HARM_STATS.clear()
+            os.environ["PRISMAQUANT_DO_NO_HARM"] = "1"
+            os.environ["PRISMAQUANT_GPTQ_DAMP_SWEEP"] = "0"
+            with (
+                mock.patch.object(
+                    m,
+                    "_activation_col_importance_for_gptq",
+                    side_effect=RuntimeError("boom"),
+                ),
+                mock.patch("builtins.print") as printed,
+            ):
+                out = m._quantize_2d(
+                    W,
+                    "NVFP4",
+                    gptq_enabled=True,
+                    cached_activations=X,
+                    linear_name="demo.linear",
+                )
+                failure_count = m._DO_NO_HARM_STATS["NVFP4_failures"]
+        finally:
+            m._DO_NO_HARM_STATS.clear()
+            m._DO_NO_HARM_STATS.update(saved_stats)
+            if saved_dnh is None:
+                os.environ.pop("PRISMAQUANT_DO_NO_HARM", None)
+            else:
+                os.environ["PRISMAQUANT_DO_NO_HARM"] = saved_dnh
+            if saved_sweep is None:
+                os.environ.pop("PRISMAQUANT_GPTQ_DAMP_SWEEP", None)
+            else:
+                os.environ["PRISMAQUANT_GPTQ_DAMP_SWEEP"] = saved_sweep
+
+        self.assertIn("weight_packed", out)
+        self.assertTrue(any(
+            "[do-no-harm] WARN demo.linear NVFP4 gate failed" in str(call)
+            for call in printed.call_args_list
+        ))
+        self.assertEqual(failure_count, 1)
+
     def test_composed_passes_reduce_output_space_error_vs_rtn(self):
         """Integration test: synthetic linear + imbalanced activations.
         Running `_quantize_2d` with GPTQ enabled should give no worse

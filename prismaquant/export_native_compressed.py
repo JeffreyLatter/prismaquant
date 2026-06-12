@@ -127,6 +127,20 @@ _NVFP4_SCALE_RULE_ALIASES = {
     "joint_scale_optimization": NVFP4_SCALE_RULE_JOINT_MSE,
     "codebook_mse": NVFP4_SCALE_RULE_JOINT_MSE,
 }
+_DO_NO_HARM_STATS: Counter = Counter()
+
+
+def _record_do_no_harm_revert(fmt: str) -> None:
+    _DO_NO_HARM_STATS[f"{fmt}_reverts"] += 1
+
+
+def _record_do_no_harm_failure(fmt: str, linear_name: str | None, exc: Exception) -> None:
+    _DO_NO_HARM_STATS[f"{fmt}_failures"] += 1
+    name = linear_name or "<unknown>"
+    print(
+        f"[do-no-harm] WARN {name} {fmt} gate failed: {exc!r}",
+        flush=True,
+    )
 
 # Back-compat exports for unit tests that validate the Qwen3.5 naming
 # and per-expert catch-all contract via the historical helper symbols.
@@ -3729,6 +3743,7 @@ def _quantize_2d(
                 mse_work = float((a2 * (w_orig_f - w_work).pow(2)
                                   .sum(dim=0)).sum())
                 if mse_rtn < mse_work:
+                    _record_do_no_harm_revert("NVFP4")
                     if os.environ.get(
                         "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
                         print(f"[do-no-harm] {linear_name}: "
@@ -3737,7 +3752,7 @@ def _quantize_2d(
                               flush=True)
                     w_work = w_rtn
             except Exception as _e:
-                pass  # never fail the export over the gate
+                _record_do_no_harm_failure("NVFP4", linear_name, _e)
 
         # Step 4: final NVFP4 pack. `w_work` is the post-GPTQ,
         # post-act-round, post-scale-sweep weight.
@@ -3869,6 +3884,7 @@ def _quantize_2d(
                         row_weights=fisher_row_weights,
                     )
                     if err_rtn < err_work:
+                        _record_do_no_harm_revert(fmt)
                         if os.environ.get(
                             "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
                             print(f"[do-no-harm] {linear_name}: "
@@ -3876,8 +3892,8 @@ def _quantize_2d(
                                   f"(mse {err_work:.3e} → {err_rtn:.3e})",
                                   flush=True)
                         w, ws, dq = q_rtn, s_rtn, dq_rtn
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _record_do_no_harm_failure(fmt, linear_name, _e)
         elif scale_sweep_enabled and has_acts and fmt == "MXFP8_E4M3":
             assert acts_work is not None
             w, ws, _ = _mxfp8_scale_sweep_quantize(
@@ -4010,6 +4026,7 @@ def _quantize_2d(
                         row_weights=fisher_row_weights,
                     )
                     if err_rtn < err_work:
+                        _record_do_no_harm_revert("MXFP4")
                         if os.environ.get(
                             "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
                             print(f"[do-no-harm] {linear_name}: "
@@ -4017,8 +4034,8 @@ def _quantize_2d(
                                   f"(mse {err_work:.3e} → {err_rtn:.3e})",
                                   flush=True)
                         wp, ws, dq = q_rtn, s_rtn, dq_rtn
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _record_do_no_harm_failure("MXFP4", linear_name, _e)
         else:
             wp, ws, _ = _mxfp4_rtn()
         return {"weight_packed": wp, "weight_scale": ws}
@@ -4325,12 +4342,14 @@ def _quantize_2d_nvfp4_group_batched(
                 if mse_rtn < mse_pass:
                     weights[i] = w_rtn
                     n_reverted += 1
+            if n_reverted:
+                _DO_NO_HARM_STATS["NVFP4_batched_reverts"] += int(n_reverted)
             if n_reverted and os.environ.get(
                     "PRISMAQUANT_DO_NO_HARM_VERBOSE") == "1":
                 print(f"[do-no-harm batched] reverted {n_reverted}/{n} "
                       f"Linears to RTN", flush=True)
         except Exception as _e:
-            print(f"[do-no-harm batched] WARN failed: {_e}", flush=True)
+            _record_do_no_harm_failure("NVFP4_batched", None, _e)
 
     # Per-Linear final NVFP4 pack (cheap; reuses the existing function).
     out: list[dict] = []
@@ -6777,6 +6796,7 @@ def main():
     _PRODUCTION_WEIGHT_CACHE = None
     _PRODUCTION_CACHE_FINGERPRINT = None
     _NVFP4_SCALE_RULE = resolve_nvfp4_scale_rule()
+    _DO_NO_HARM_STATS.clear()
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
@@ -7285,6 +7305,7 @@ def main():
                 runtime_coerced,
                 profile,
             ),
+            "do_no_harm": dict(_DO_NO_HARM_STATS),
             "packed_expert_export": _packed_expert_export_provenance(),
             "ignore": sorted(config_bf16_passthrough),
         }, f, indent=2)
