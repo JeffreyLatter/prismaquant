@@ -6647,17 +6647,20 @@ def build_quantization_config(
                     # allocator's incomplete-fused-group rule, so a
                     # mixed-and-incomplete group should not reach here.)
                     #
-                    # We deliberately do NOT fail here on a quantized-present +
-                    # absent-sibling mix: at this layer we only see the config
-                    # dict, so we cannot distinguish a GENUINELY absent sibling
-                    # (synthesized/tied, e.g. Gemma4 v=k) from one merely not in
-                    # a PARTIAL assignment (some build_quantization_config call
-                    # sites pass a subset). That genuine-absent + quantized case
-                    # is the allocator's job (incomplete_fused_group_members pins
-                    # present members to BF16, and the allocator now hard-errors
-                    # when it can't resolve the real profile) -- it knows the
-                    # model's true module list; the export does not. The
-                    # all-present mixed case below IS unambiguous and is failed.
+                    # A single present state can still be a partial recipe, so
+                    # leave it alone. Mixed present states are unambiguous:
+                    # adding an absent sibling to a quantized+BF16 or
+                    # multi-quant group cannot produce one coherent fused
+                    # scheme.
+                    if len(set(present)) != 1:
+                        members = {s: leaf_state.get((parent, s), "ABSENT")
+                                   for s in sibs}
+                        quant_states = {s for s in present if s != "IGNORE"}
+                        kind = ("crash@load" if len(quant_states) > 1
+                                else "silent-corruption")
+                        fused_coherence_violations.append(
+                            (fused_vllm_name, kind, members))
+                        continue
                     if set(present) == {"IGNORE"}:
                         fused_emitted.add(fused_vllm_name)
                         for leaf in absent_leaves:

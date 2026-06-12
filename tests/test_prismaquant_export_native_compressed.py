@@ -1798,6 +1798,20 @@ class TestBuildQuantizationConfig(unittest.TestCase):
                 assignment, bf16_passthrough=set(), profile=profile,
             )
 
+    def test_incomplete_fused_sibling_mixed_present_states_rejected(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "BF16",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "silent-corruption"):
+            build_quantization_config(
+                assignment,
+                bf16_passthrough=set(),
+                profile=profile,
+            )
+
     def test_quantization_config_preflight_rejects_before_render(self):
         profile = Qwen3_5Profile()
         assignment = {
