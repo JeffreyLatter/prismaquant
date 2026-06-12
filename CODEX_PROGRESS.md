@@ -67,3 +67,4 @@ MINOR-M31 FIXED f3a1241
 MINOR-M32 FIXED eee0beb
 MINOR-M33 SKIPPED-NEEDS-DESIGN proposal: model shared-KV as an explicit cross-layer gradient path in the Fisher pass-state contract; a local patch would either undercount silently or retain multi-layer KV graphs and break the isolated GPU-bound streaming design.
 MINOR-M34 FIXED 0ef119c
+MINOR-M35 FIXED d7cbb09
