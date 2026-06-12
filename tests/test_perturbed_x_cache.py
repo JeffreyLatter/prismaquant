@@ -180,6 +180,47 @@ def test_perturbed_cache_can_skip_activation_quant_for_probe(tmp_path, monkeypat
         without_act.remove()
 
 
+def test_perturbed_cache_production_cache_miss_is_strict_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", raising=False)
+    model = nn.Sequential(nn.Linear(64, 64, bias=False)).eval()
+    cache = PerturbedActivationCache(
+        model,
+        {"0": "NVFP4"},
+        tmp_path,
+        input_rows=0,
+        cal_hash="test",
+        production_weight_cache=ProductionWeightCache({}, levers={}),
+    )
+
+    cache.install()
+    try:
+        with pytest.raises(RuntimeError, match="production_weight_cache miss"):
+            model(torch.randn(1, 64))
+    finally:
+        cache.remove()
+
+
+def test_perturbed_cache_strict_miss_escape_allows_rtn(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", "0")
+    model = nn.Sequential(nn.Linear(64, 64, bias=False)).eval()
+    cache = PerturbedActivationCache(
+        model,
+        {"0": "NVFP4"},
+        tmp_path,
+        input_rows=0,
+        cal_hash="test",
+        production_weight_cache=ProductionWeightCache({}, levers={}),
+    )
+
+    cache.install()
+    try:
+        out = model(torch.randn(1, 64))
+    finally:
+        cache.remove()
+
+    assert out.shape == (1, 64)
+
+
 def test_perturbed_cache_can_disable_capture_for_inplace_replay(tmp_path):
     model = nn.Sequential(nn.Linear(64, 64, bias=False)).eval()
     x = torch.randn(2, 64)

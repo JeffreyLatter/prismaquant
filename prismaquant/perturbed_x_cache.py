@@ -457,7 +457,10 @@ class PerturbedActivationCache:
                 if (
                     self._production_weight_cache is not None
                     and fmt != "BF16"
-                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                    and _env_truthy(
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                        default=True,
+                    )
                 ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
@@ -657,7 +660,10 @@ class PerturbedActivationCache:
                     ).contiguous()
                 elif (
                     fmt_canon != "BF16"
-                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                    and _env_truthy(
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                        default=True,
+                    )
                 ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
@@ -813,7 +819,10 @@ class PerturbedActivationCache:
                     source = w_dq.to(
                         device=param.device, dtype=param.dtype,
                     ).contiguous()
-                elif _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE"):
+                elif _env_truthy(
+                    "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                    default=True,
+                ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
                         f"({param_plan.name!r}, 'NVFP4') on the fused "
