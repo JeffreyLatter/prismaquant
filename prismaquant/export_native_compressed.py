@@ -230,10 +230,20 @@ def _decode_nvfp4_indices_with_eff_scale(
 def _nvfp4_mse_for_group_scale(
     grouped: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    global_real: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if global_real is not None:
+        eff_scale = _nvfp4_effective_scale_from_real(
+            scale,
+            global_real,
+            quantize_fp8=True,
+        ).unsqueeze(-1)
+    else:
+        eff_scale = scale.unsqueeze(-1)
     _idx, dq = _nvfp4_quantize_dequantize_with_eff_scale(
         grouped,
-        scale.unsqueeze(-1),
+        eff_scale,
     )
     return (grouped - dq).pow(2).sum(dim=-1)
 
@@ -241,6 +251,8 @@ def _nvfp4_mse_for_group_scale(
 def _nvfp4_best_max_to_level_scale(
     grouped: torch.Tensor,
     levels: Sequence[float],
+    *,
+    global_real: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pick the best max-to-codebook-level scale for each NVFP4 group.
 
@@ -256,7 +268,11 @@ def _nvfp4_best_max_to_level_scale(
     best_mse: torch.Tensor | None = None
     for level in levels:
         scale = max_abs / float(level)
-        mse = _nvfp4_mse_for_group_scale(grouped, scale)
+        mse = _nvfp4_mse_for_group_scale(
+            grouped,
+            scale,
+            global_real=global_real,
+        )
         if best_mse is None:
             best_mse = mse
             best_scale = scale
@@ -297,6 +313,7 @@ def _select_nvfp4_group_scales(
     grouped: torch.Tensor,
     *,
     scale_rule: str | None = None,
+    global_real: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return per-block real NVFP4 scales for ``grouped[..., group_size]``.
 
@@ -314,10 +331,54 @@ def _select_nvfp4_group_scales(
     if rule == NVFP4_SCALE_RULE_STATIC_6:
         return scale_6
     if rule == NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE:
-        return _nvfp4_best_max_to_level_scale(grouped, (6.0, 4.0))
+        return _nvfp4_best_max_to_level_scale(
+            grouped,
+            (6.0, 4.0),
+            global_real=global_real,
+        )
     if rule == NVFP4_SCALE_RULE_JOINT_MSE:
-        return _nvfp4_best_max_to_level_scale(grouped, _NVFP4_JOINT_SCALE_LEVELS)
+        return _nvfp4_best_max_to_level_scale(
+            grouped,
+            _NVFP4_JOINT_SCALE_LEVELS,
+            global_real=global_real,
+        )
     raise AssertionError(f"unhandled NVFP4 scale rule: {rule!r}")
+
+
+def _select_nvfp4_pack_scales_and_global(
+    grouped: torch.Tensor,
+    *,
+    global_real_override: torch.Tensor | None = None,
+    scale_rule: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = _select_nvfp4_group_scales(grouped, scale_rule=scale_rule)
+    if global_real_override is not None:
+        global_real = global_real_override.to(
+            grouped.device,
+            dtype=torch.float32,
+        ).clamp_min(1e-12)
+        scale = _select_nvfp4_group_scales(
+            grouped,
+            scale_rule=scale_rule,
+            global_real=global_real,
+        )
+        return scale, global_real
+
+    global_real = (scale.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+    for _ in range(3):
+        snapped_scale = _select_nvfp4_group_scales(
+            grouped,
+            scale_rule=scale_rule,
+            global_real=global_real,
+        )
+        next_global = (
+            snapped_scale.amax() / FP8_E4M3_MAX
+        ).clamp_min(1e-12)
+        scale = snapped_scale
+        if torch.allclose(next_global, global_real, rtol=0.0, atol=1e-12):
+            break
+        global_real = next_global
+    return scale, global_real
 
 
 def _env_int_clamped(name: str, default: int, lo: int, hi: int) -> int:
@@ -401,6 +462,7 @@ def _nvfp4_quantize_grouped_codec(
         scale_real = _select_nvfp4_group_scales(
             grouped_f,
             scale_rule=scale_rule,
+            global_real=global_real,
         )
     scale_fp8 = _nvfp4_fp8_scale_from_real(
         scale_real.to(grouped_f.device, dtype=torch.float32),
@@ -2005,8 +2067,8 @@ def compute_nvfp4_global_real(weight: torch.Tensor, group_size: int = 16
     `quantize_dequantize_nvfp4(global_real_override=...)`."""
     rows, cols = weight.shape
     grouped = weight.float().reshape(rows, cols // group_size, group_size)
-    s_g_real = _select_nvfp4_group_scales(grouped)
-    return (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+    _s_g_real, global_real = _select_nvfp4_pack_scales_and_global(grouped)
+    return global_real
 
 
 def quantize_dequantize_nvfp4(
@@ -2039,11 +2101,10 @@ def quantize_dequantize_nvfp4(
         raise ValueError(f"NVFP4 group_size={group_size} ∤ {cols}")
     n_groups = cols // group_size
     grouped = weight.float().reshape(rows, n_groups, group_size)
-    s_g_real = _select_nvfp4_group_scales(grouped)                       # the actual per-group scale
-    if global_real_override is not None:
-        global_real = global_real_override.to(weight.device).clamp_min(1e-12)
-    else:
-        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)  # scalar
+    s_g_real, global_real = _select_nvfp4_pack_scales_and_global(
+        grouped,
+        global_real_override=global_real_override,
+    )
     codec = _nvfp4_quantize_grouped_codec(
         grouped,
         global_real=global_real,
@@ -2072,11 +2133,10 @@ def _rtn_dequant_nvfp4(
     n_groups = cols // group_size
     W = weight.float()
     grouped = W.reshape(rows, n_groups, group_size)
-    s_g_real = _select_nvfp4_group_scales(grouped)
-    if global_real_override is not None:
-        global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
-    else:
-        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+    s_g_real, global_real = _select_nvfp4_pack_scales_and_global(
+        grouped,
+        global_real_override=global_real_override,
+    )
     codec = _nvfp4_quantize_grouped_codec(
         grouped,
         global_real=global_real,
@@ -2100,6 +2160,18 @@ def quantize_dequantize_nvfp4_packed(
     grouped = packed.float().reshape(E, M, g, group_size)
     s_g_real = _select_nvfp4_group_scales(grouped)                          # [E, M, g]
     global_real = (s_g_real.reshape(E, -1).amax(dim=-1) / FP8_E4M3_MAX).clamp_min(1e-12)  # [E]
+    for _ in range(3):
+        snapped = _select_nvfp4_group_scales(
+            grouped,
+            global_real=global_real.view(E, 1, 1),
+        )
+        next_global = (
+            snapped.reshape(E, -1).amax(dim=-1) / FP8_E4M3_MAX
+        ).clamp_min(1e-12)
+        s_g_real = snapped
+        if torch.allclose(next_global, global_real, rtol=0.0, atol=1e-12):
+            break
+        global_real = next_global
     codec = _nvfp4_quantize_grouped_codec(
         grouped,
         global_real=global_real.view(E, 1, 1),

@@ -868,6 +868,53 @@ class TestRoundTrip(unittest.TestCase):
             places=4,
         )
 
+    def test_nvfp4_scale_selection_scores_fp8_snapped_scales(self):
+        grouped = torch.tensor(
+            [[[
+                -0.02800447, 0.20611508, -0.25149462, 0.00026755,
+                0.25256824, -0.12001037, 0.31183860, 0.10744593,
+                -0.07380029, 0.69075495, -0.56450677, -0.01491811,
+                -0.31349361, -0.28695017, 0.01005956, 0.21302599,
+            ]]],
+            dtype=torch.float32,
+        )
+        global_real = torch.tensor(0.0003, dtype=torch.float32)
+        max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
+        scale_6 = max_abs / 6.0
+        scale_4 = max_abs / 4.0
+
+        real_scale = enc._select_nvfp4_group_scales(
+            grouped,
+            scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+        )
+        snapped_scale = enc._select_nvfp4_group_scales(
+            grouped,
+            scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+            global_real=global_real,
+        )
+        mse_6 = enc._nvfp4_mse_for_group_scale(
+            grouped,
+            scale_6,
+            global_real=global_real,
+        )
+        mse_4 = enc._nvfp4_mse_for_group_scale(
+            grouped,
+            scale_4,
+            global_real=global_real,
+        )
+        expected = torch.where(mse_4 < mse_6, scale_4, scale_6)
+
+        self.assertFalse(torch.equal(real_scale, snapped_scale))
+        torch.testing.assert_close(snapped_scale, expected)
+
+        pack_scale, pack_global = enc._select_nvfp4_pack_scales_and_global(
+            grouped,
+            global_real_override=global_real,
+            scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+        )
+        torch.testing.assert_close(pack_global, global_real)
+        torch.testing.assert_close(pack_scale, expected)
+
     def test_nvfp4_four_over_six_global_real_matches_chosen_scales(self):
         W = torch.tensor(
             [
