@@ -35,3 +35,25 @@ def test_claude_paper_map_points_to_aura_and_archive():
     assert "paper/archive/prismascout_paper_2026-06-05.tex" in text
     assert "paper/figures/fig_validated_27b.tex" not in text
     assert "paper's \"Methods Considered and Rejected\" section exists" not in text
+
+
+def test_active_paper_figures_exclude_archived_prismascout_assets():
+    active_figures = sorted(
+        path.name for path in (ROOT / "paper" / "figures").glob("*.tex")
+    )
+
+    assert active_figures == ["fig_aura_rd_geometry.tex"]
+    assert not (ROOT / "paper" / "prismaquant_animation.html").exists()
+    assert not (ROOT / "paper" / "prismaquant_prismascout_paper.pdf").exists()
+    assert (
+        ROOT / "paper" / "archive" / "figures" / "fig_validated_27b.tex"
+    ).is_file()
+    assert (
+        ROOT / "paper" / "archive" / "prismaquant_animation_2026-06-05.html"
+    ).is_file()
+    assert (
+        ROOT
+        / "paper"
+        / "archive"
+        / "prismaquant_prismascout_paper_legacy_2026-05-04.pdf"
+    ).is_file()
