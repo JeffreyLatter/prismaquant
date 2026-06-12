@@ -64,6 +64,34 @@ def _model_has_packed_experts(model: nn.Module, profile) -> bool:
     )
 
 
+def validate_render_assignment_cache_coverage(cache, render_assignment) -> None:
+    """Fail if a production render assignment has any uncached non-BF16 entry.
+
+    ``ProductionWeightCache.assignment_keys`` intentionally exempts packed
+    expert names for downstream prefetch callers that may run without a packed
+    render cache. Build-side validation is stricter: after
+    ``fill_packed_expert_cache_entries`` runs, every concrete non-BF16
+    assignment entry must be present or the export would fall back/raise later.
+    """
+    from prismaquant import format_registry as fr
+
+    missing: list[tuple[str, str]] = []
+    for qname, fmt in (render_assignment or {}).items():
+        fmt_canon = fr.canonical_format_name(str(fmt))
+        if fmt_canon == "BF16":
+            continue
+        if cache.resolve_key(str(qname), fmt_canon) is None:
+            missing.append((str(qname), fmt_canon))
+    failed = list((cache.failed or {}).keys())
+    if missing or failed:
+        samples = missing[:5] + failed[:5]
+        raise RuntimeError(
+            f"ProductionWeightCache assignment coverage failure: "
+            f"{len(missing)} misses, {len(failed)} failed "
+            f"renders; sample={samples}"
+        )
+
+
 def _load_cache_calibration(tokenizer, args) -> torch.Tensor:
     if args.dataset:
         return load_calibration(
@@ -470,15 +498,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # through to RTN at hook time.
         try:
             if render_assignment is not None:
-                _, missing = cache.assignment_keys(render_assignment)
-                failed = list((cache.failed or {}).keys())
-                if missing or failed:
-                    samples = missing[:5] + failed[:5]
-                    raise RuntimeError(
-                        f"ProductionWeightCache assignment coverage failure: "
-                        f"{len(missing)} misses, {len(failed)} failed "
-                        f"renders; sample={samples}"
-                    )
+                validate_render_assignment_cache_coverage(
+                    cache, render_assignment)
             else:
                 cache.validate_coverage(qnames, formats)
             print("[build-prod-cache] coverage check passed", flush=True)

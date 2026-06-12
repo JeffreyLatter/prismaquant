@@ -8,6 +8,9 @@ import torch.nn as nn
 import pytest
 
 from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
+from prismaquant.build_production_cache import (
+    validate_render_assignment_cache_coverage,
+)
 from prismaquant.production_weight_cache import ProductionWeightCache
 from prismaquant.production_weight_cache import _format_supports_render_mechanism
 from prismaquant.production_weight_cache import fill_production_weight_cache
@@ -124,6 +127,27 @@ def test_assignment_keys_ignore_uncached_packed_expert_entries(tmp_path):
 
     assert keys == [("dense", "NVFP4")]
     assert missing == [("missing_dense", "NVFP4")]
+
+
+def test_build_render_assignment_coverage_does_not_skip_packed_experts():
+    cache = ProductionWeightCache(
+        weights={("dense", "NVFP4"): torch.ones((2, 2))},
+        levers={},
+    )
+    assignment = {
+        "dense": "NVFP4",
+        "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+        "bf16": "BF16",
+    }
+
+    with pytest.raises(RuntimeError, match="assignment coverage failure"):
+        validate_render_assignment_cache_coverage(cache, assignment)
+
+    cache.weights[(
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "NVFP4",
+    )] = torch.ones((2, 2, 2))
+    validate_render_assignment_cache_coverage(cache, assignment)
 
 
 def test_production_cache_file_page_prefetch_does_not_load_tensors(tmp_path, monkeypatch):

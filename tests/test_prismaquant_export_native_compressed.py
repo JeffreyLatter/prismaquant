@@ -6,9 +6,11 @@ that has to stay in sync with vLLM's compressed-tensors loader.
 """
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -389,6 +391,17 @@ class _TinyQwenPackedExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.randn(2, 32, 64))
 
 
+def _tiny_qwen_packed_root():
+    root = nn.Module()
+    root.model = nn.Module()
+    root.model.language_model = nn.Module()
+    layer = nn.Module()
+    layer.mlp = nn.Module()
+    layer.mlp.experts = _TinyQwenPackedExperts()
+    root.model.language_model.layers = nn.ModuleList([layer])
+    return root
+
+
 class TestPackedExpertExport(unittest.TestCase):
     def test_mxfp8_split_experts_emit_weight_suffix_for_vllm_loader(self):
         """Qwen3.5's split expert loader matches
@@ -397,13 +410,7 @@ class TestPackedExpertExport(unittest.TestCase):
         skipped with "not found in params_dict" warnings.
         """
 
-        root = nn.Module()
-        root.model = nn.Module()
-        root.model.language_model = nn.Module()
-        layer = nn.Module()
-        layer.mlp = nn.Module()
-        layer.mlp.experts = _TinyQwenPackedExperts()
-        root.model.language_model.layers = nn.ModuleList([layer])
+        root = _tiny_qwen_packed_root()
 
         assignment = {
             "model.layers.0.mlp.experts.gate_up_proj": "MXFP8_E4M3",
@@ -430,6 +437,91 @@ class TestPackedExpertExport(unittest.TestCase):
         self.assertNotIn(f"{prefix}.0.gate_proj", tensors)
         self.assertNotIn(f"{prefix}.0.up_proj", tensors)
         self.assertNotIn(f"{prefix}.0.down_proj", tensors)
+        self.assertEqual(
+            hist.get(("packed_moe_per_expert", "MXFP8_E4M3+rtn")),
+            2,
+        )
+
+    def test_packed_expert_missing_production_cache_raises_by_default(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "NVFP4",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = ProductionWeightCache(
+                weights={}, levers={"gptq": True})
+            enc._ALLOW_PACKED_EXPERT_RTN = False
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "has no production-cache render",
+            ):
+                enc._materialize_tensors_inmemory(
+                    _tiny_qwen_packed_root(),
+                    assignment,
+                    bf16_passthrough=set(),
+                    profile=Qwen3_5Profile(),
+                )
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+    def test_packed_expert_rtn_escape_allows_cache_miss(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "NVFP4",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = ProductionWeightCache(
+                weights={}, levers={"gptq": True})
+            enc._ALLOW_PACKED_EXPERT_RTN = True
+            tensors, hist = enc._materialize_tensors_inmemory(
+                _tiny_qwen_packed_root(),
+                assignment,
+                bf16_passthrough=set(),
+                profile=Qwen3_5Profile(),
+            )
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertTrue(any(k.endswith(".weight_packed") for k in tensors))
+        self.assertEqual(
+            hist.get(("packed_moe_per_expert", "NVFP4+rtn")),
+            2,
+        )
+
+    def test_packed_expert_no_cache_path_warns_before_rtn(self):
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "MXFP8_E4M3",
+            "model.layers.0.mlp.experts.down_proj": "MXFP8_E4M3",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        stdout = io.StringIO()
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = None
+            enc._ALLOW_PACKED_EXPERT_RTN = False
+            with redirect_stdout(stdout):
+                _tensors, hist = enc._materialize_tensors_inmemory(
+                    _tiny_qwen_packed_root(),
+                    assignment,
+                    bf16_passthrough=set(),
+                    profile=Qwen3_5Profile(),
+                )
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertIn("WARNING: RTN-rendering packed expert", stdout.getvalue())
+        self.assertIn("no production cache", stdout.getvalue())
         self.assertEqual(
             hist.get(("packed_moe_per_expert", "MXFP8_E4M3+rtn")),
             2,
