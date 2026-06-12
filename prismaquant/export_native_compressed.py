@@ -5778,18 +5778,34 @@ def _materialize_tensors_inmemory(
             hist[("linear", label)] += 1
             continue
         joint = nvfp4_joint_global.get(fmt_key) if fmt == "NVFP4" else None
-        compressed = _quantize_2d(
-            mod.weight.detach().float(), fmt,
+        compressed = _pack_production_cached_2d(
+            fmt_key,
+            fmt,
             nvfp4_global_real_override=joint,
-            linear_name=fmt_key,
+            device=mod.weight.device,
         )
+        if compressed is None and _PRODUCTION_WEIGHT_CACHE is not None:
+            raise RuntimeError(
+                f"[export-inmemory] auxiliary Linear {fmt_key} @ {fmt} has "
+                "no production-cache render. Non-BF16 MTP/sidecar Linears "
+                "must be rendered through ProductionWeightCache before "
+                "export; RTN-by-omission would ship bytes that validation "
+                "did not measure."
+            )
+        cache_hit = compressed is not None
+        if compressed is None:
+            compressed = _quantize_2d(
+                mod.weight.detach().float(), fmt,
+                nvfp4_global_real_override=joint,
+                linear_name=fmt_key,
+            )
         for suffix, tensor in compressed.items():
             out[f"{qname}.{suffix}"] = tensor.cpu()
         if mod.bias is not None:
             out[f"{qname}.bias"], _ = _passthrough_tensor(
                 f"{qname}.bias", mod.bias)
         covered.add(qname)
-        hist[("linear", fmt)] += 1
+        hist[("linear", f"{fmt}_PRODUCTION_CACHE" if cache_hit else fmt)] += 1
 
     for qname, mod in model.named_modules():
         if not _is_packed_experts_module(mod, profile):

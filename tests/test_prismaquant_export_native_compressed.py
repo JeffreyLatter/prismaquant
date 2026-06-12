@@ -2040,6 +2040,61 @@ class TestProductionCacheExportPath(unittest.TestCase):
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
             m._CACHED_ACTIVATIONS = saved_acts
 
+
+    def test_inmemory_mtp_linear_uses_production_cache(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        wrapper = nn.Module()
+        wrapper.add_module("mtp", nn.Module())
+        wrapper.mtp.add_module("proj", nn.Linear(16, 8, bias=False))
+        W = torch.randn(8, 16) * 0.1
+        cache = ProductionWeightCache(
+            weights={("mtp.proj", "NVFP4"): W},
+            levers={"gptq": True},
+            activation_max_abs={"mtp.proj": 3.0},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_scales = m._INPUT_GLOBAL_SCALES
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._INPUT_GLOBAL_SCALES = m._production_cache_scales(cache)
+            out, hist = m._materialize_tensors_inmemory(
+                wrapper,
+                {"mtp.proj": "NVFP4"},
+                bf16_passthrough=set(),
+                profile=_IdentityProfile(),
+            )
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._INPUT_GLOBAL_SCALES = saved_scales
+
+        self.assertIn("mtp.proj.weight_packed", out)
+        self.assertIn("mtp.proj.input_global_scale", out)
+        self.assertEqual(hist[("linear", "NVFP4_PRODUCTION_CACHE")], 1)
+
+    def test_inmemory_mtp_linear_missing_production_cache_raises(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        wrapper = nn.Module()
+        wrapper.add_module("mtp", nn.Module())
+        wrapper.mtp.add_module("proj", nn.Linear(16, 8, bias=False))
+        cache = ProductionWeightCache(weights={}, levers={"gptq": True})
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            with self.assertRaisesRegex(RuntimeError, "auxiliary Linear mtp.proj"):
+                m._materialize_tensors_inmemory(
+                    wrapper,
+                    {"mtp.proj": "NVFP4"},
+                    bf16_passthrough=set(),
+                    profile=_IdentityProfile(),
+                )
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+
+
 class TestFusedSiblingJointGlobalScale(unittest.TestCase):
     """vLLM warns when q/k/v/gate/up have different weight_global_scale.
     The exporter pre-computes a joint per-tensor scale across each
