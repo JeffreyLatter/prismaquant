@@ -532,6 +532,42 @@ def _find_candidate_for_format(
     return None
 
 
+def _validate_assignment_candidate_membership(
+    assignment: dict[str, str],
+    candidates: dict[str, list[Candidate]],
+    *,
+    fixed_chosen_candidates: dict[str, Candidate] | None = None,
+) -> None:
+    """Fail if promotion assigned a format no candidate row allowed."""
+    available = {
+        name: {fr.get_format(cand.fmt).name for cand in per_name}
+        for name, per_name in candidates.items()
+    }
+    for name, cand in (fixed_chosen_candidates or {}).items():
+        available.setdefault(name, set()).add(fr.get_format(cand.fmt).name)
+
+    violations = []
+    for name, fmt in sorted(assignment.items()):
+        if name not in available:
+            continue
+        canonical = fr.get_format(fmt).name
+        if canonical not in available[name]:
+            violations.append((name, canonical, sorted(available[name])))
+    if not violations:
+        return
+
+    sample = "\n  ".join(
+        f"{name}: promoted to {fmt}, available={choices}"
+        for name, fmt, choices in violations[:10]
+    )
+    raise SystemExit(
+        "[alloc] serving-unit promotion assigned a format that was not "
+        "present in the per-Linear candidate set. This would defer legality "
+        "repair to export and can recreate mixed serving units. Sample:\n"
+        f"  {sample}"
+    )
+
+
 # Role tokens used to bucket the bit-attribution report. Best-effort: anything
 # unrecognized buckets as "unknown" rather than failing, so new architectures
 # degrade gracefully instead of crashing a read-only diagnostic.
@@ -2069,6 +2105,12 @@ def main():
         print(f"[alloc] --visual-format={visual_format}: no visual "
               f"Linears found in source checkpoint — override is a "
               f"no-op", flush=True)
+
+    _validate_assignment_candidate_membership(
+        assignment_expanded,
+        candidates,
+        fixed_chosen_candidates=fixed_chosen_candidates,
+    )
 
     mtp_count = sum(1 for n in assignment_expanded if n.startswith("mtp."))
     if mtp_count:

@@ -29,6 +29,7 @@ from prismaquant.allocator_solver import promote_serving_units
 from prismaquant.allocator import (
     Candidate,
     _FUSED_SIBLING_MARKER,
+    _validate_assignment_candidate_membership,
     aggregate_fused_siblings,
     build_candidates,
     compute_achieved,
@@ -355,6 +356,31 @@ def test_serving_unit_promotion_handles_overlapping_groups_order_independently()
         "overlap.mid": "BF16",
         "overlap.right": "BF16",
     }
+
+
+def test_assignment_candidate_membership_rejects_unavailable_promoted_format():
+    candidates = {
+        "expert.gate": [Candidate("NVFP4", 4.5, 9, 0.1)],
+        "expert.down": [Candidate("BF16", 16.0, 32, 0.0)],
+    }
+    assignment = {
+        "expert.gate": "BF16",
+        "expert.down": "BF16",
+        "mtp.proj": "NVFP4",
+    }
+    fixed = {"mtp.proj": Candidate("NVFP4", 4.5, 9, 0.1)}
+
+    try:
+        _validate_assignment_candidate_membership(
+            assignment,
+            candidates,
+            fixed_chosen_candidates=fixed,
+        )
+    except SystemExit as exc:
+        assert "expert.gate" in str(exc)
+        assert "mtp.proj" not in str(exc)
+    else:
+        raise AssertionError("expected promoted unavailable format to fail")
 
 
 def test_default_profile_rejects_multi_format_menu_without_escape():
