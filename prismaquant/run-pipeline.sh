@@ -328,10 +328,63 @@ case "$PIPELINE_SPEC_VALIDATE" in
 esac
 "${PIPELINE_SPEC_ARGS[@]}"
 
+
+# -----------------------------------------------------------------------
+# Settings-hash guard (review critical C4): skip-if-exists stages must
+# refuse to reuse artifacts built under different quality-affecting
+# settings — silent reuse is the rendering-confound class that has
+# invalidated A/Bs before. Each stage writes <artifact>.settings.json on
+# build; on reuse a mismatch is a hard exit-2 naming the stale file.
+# Legacy artifacts (no manifest) warn loudly but are not invalidated.
+# -----------------------------------------------------------------------
+require_stage_settings() {
+  local artifact="$1" stage="$2"; shift 2
+  python3 - "$artifact" "${artifact}.settings.json" "$stage" "$@" <<'GUARD'
+import json, os, sys
+artifact, manifest, stage, *pairs = sys.argv[1:]
+cur = dict(p.split("=", 1) for p in pairs)
+if os.path.exists(artifact):
+    if not os.path.exists(manifest):
+        print(f"[pipeline] WARNING: {stage}: reusing {artifact} which has no "
+              "settings manifest (predates the settings-hash guard); cannot "
+              "verify it matches the current settings", flush=True)
+        sys.exit(0)
+    prev = json.load(open(manifest))
+    diffs = {k: (prev.get(k), cur.get(k))
+             for k in sorted(set(prev) | set(cur))
+             if prev.get(k) != cur.get(k)}
+    if diffs:
+        print(f"[pipeline] ERROR: {stage}: {artifact} was built under "
+              "DIFFERENT settings; refusing silent reuse:", flush=True)
+        for k, (a, b) in diffs.items():
+            print(f"    {k}: artifact={a!r}  current={b!r}", flush=True)
+        print(f"    -> delete {artifact} (and its .settings.json) to "
+              "rebuild, or restore the original settings", flush=True)
+        sys.exit(2)
+    sys.exit(0)
+os.makedirs(os.path.dirname(manifest) or ".", exist_ok=True)
+json.dump(cur, open(manifest, "w"), indent=1, sort_keys=True)
+GUARD
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then exit "$rc"; fi
+}
+
+RENDER_ENV_SETTINGS=(
+  "PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-}"
+  "PRISMAQUANT_GPTQ_DAMP_SWEEP=${PRISMAQUANT_GPTQ_DAMP_SWEEP:-1}"
+  "PRISMAQUANT_GPTQ_DAMP=${PRISMAQUANT_GPTQ_DAMP:-}"
+  "PRISMAQUANT_ACT_CLIP_QUANTILE=${PRISMAQUANT_ACT_CLIP_QUANTILE:-0.999}"
+  "PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
+  "PRODUCTION_CACHE_DISABLE_LEVERS=${PRODUCTION_CACHE_DISABLE_LEVERS:-}"
+)
+
 # -----------------------------------------------------------------------
 # 1. Sensitivity probe (per-Linear empirical Fisher diagonal trace,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
+require_stage_settings "${PROBE_PATH}" probe \
+  "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
+  "SEQLEN=$SEQLEN" "CALIBRATION_MODALITY=$CALIBRATION_MODALITY"
 if [[ ! -f "${PROBE_PATH}" ]]; then
   echo "[pipeline] [1/4] running sensitivity probe ..."
   python3 -m prismaquant.incremental_probe \
@@ -403,6 +456,9 @@ fi
 # 2. Cost measurement (per-(Linear, format) measured RTN error,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
+require_stage_settings "${BASE_COST_PATH}" base-cost \
+  "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
+  "SEQLEN=$SEQLEN" "FORMATS=$FORMATS"
 if [[ ! -f "${BASE_COST_PATH}" ]]; then
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
   python3 -m prismaquant.incremental_measure_quant_cost \
@@ -470,6 +526,10 @@ fi
 # at the top of this file errors out before reaching here if the var is set.
 
 if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" ]]; then
+  require_stage_settings "$PRODUCTION_RENDER_COST_CACHE_PATH" render-cost-cache \
+    "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "FORMATS=$FORMATS" \
+    "NS=$PRODUCTION_RENDER_COST_NSAMPLES" "SL=$PRODUCTION_RENDER_COST_SEQLEN" \
+    "SEED=$PRODUCTION_RENDER_COST_SEED" "${RENDER_ENV_SETTINGS[@]}"
   if [[ ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
     echo "[pipeline] [2b/4] rendering production weights for allocator cost ..."
     python3 -m prismaquant.build_production_cache \
@@ -906,6 +966,11 @@ PY
   elif [[ -z "$CACHE_FORMATS" ]]; then
     echo "[pipeline] production cache requested but no non-BF16 formats are in FORMATS; skipping cache"
   elif [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
+    LC_DIGEST=$(sha256sum "${WORK_DIR}/artifacts/layer_config.json" | cut -c1-16)
+    require_stage_settings "$PROD_CACHE_RECACHED" production-cache-recached \
+      "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
+      "SEQLEN=$SEQLEN" "FORMATS=$FORMATS" "TARGET_BITS=$TARGET_BITS" \
+      "ASSIGNMENT_DIGEST=$LC_DIGEST" "${RENDER_ENV_SETTINGS[@]}"
     if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
       if [[ ! -f "$PROD_CACHE_RAW" ]]; then
         echo "[pipeline] [4/4] building production cache + re-fitting activation scales ..."
