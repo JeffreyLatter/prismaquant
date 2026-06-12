@@ -50,3 +50,11 @@ def test_audit_notes_are_not_root_level_and_scratch_is_local_only():
     assert (ROOT / "docs/audit_questions_2026-05-22.md").exists()
     assert not (ROOT / "scratch/smoke_graph_memory.py").exists()
     assert (ROOT / "tools/smoke_graph_memory.py").exists()
+
+
+def test_claude_does_not_overstate_pipeline_enforcement():
+    text = _read("CLAUDE.md")
+
+    assert "structurally enforced\n   (`pipeline.py` `APPROVED_RESOURCE_OWNERS`)" not in text
+    assert "declarative spec + owner validation, not executor" in text
+    assert "runtime enforcement lives in the stage code" in text

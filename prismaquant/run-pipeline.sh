@@ -267,6 +267,19 @@ case "$SELECTION_MODE" in
     exit 2
     ;;
 esac
+case "$MSE_PROMOTION" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    if [[ "$SELECTION_MODE" != "validated-surrogate" ]]; then
+      echo "[pipeline] ERROR: MSE_PROMOTION requires SELECTION_MODE=validated-surrogate; it is a post-frontier rewrite and would be inert under SELECTION_MODE=$SELECTION_MODE." >&2
+      exit 2
+    fi
+    if [[ "$PRODUCTION_CACHE" == "0" || "$PRODUCTION_CACHE" == "false" || "$PRODUCTION_CACHE" == "False" ]]; then
+      echo "[pipeline] ERROR: MSE_PROMOTION requires PRODUCTION_CACHE=1 so the selected assignment can be recached and exported from resident production weights." >&2
+      exit 2
+    fi
+    ;;
+esac
 
 echo "[pipeline] config:"
 echo "  MODEL_PATH=$MODEL_PATH"

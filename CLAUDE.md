@@ -180,10 +180,12 @@ the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
    `run-pipeline.sh` and `gpu_guard.require_cuda_hot_path` refuse to run on CPU.
 8. **One cache mechanism.** Rendered weights flow *only* through
    `ProductionWeightCache`; activations through `PerturbedActivationCache` / the
-   streaming activation path. No parallel stores. This is structurally enforced
-   (`pipeline.py` `APPROVED_RESOURCE_OWNERS`). **Why it matters:** the surrogate,
-   the KL validation, and the exported bytes must be *identical* — otherwise an
-   A/B has a "rendering confound" (the exact reason the JSO wall-off was reverted).
+   streaming activation path. No parallel stores. `pipeline.py`
+   `APPROVED_RESOURCE_OWNERS` is the declarative contract and validation layer;
+   runtime enforcement lives in the stage code and fail-fast cache/prefetch gates.
+   **Why it matters:** the surrogate, the KL validation, and the exported bytes
+   must be *identical* — otherwise an A/B has a "rendering confound" (the exact
+   reason the JSO wall-off was reverted).
 9. **vLLM/kernel reality gates every format.** Production-eligible only when:
    correctly represented in `compressed-tensors` metadata, accepted by vLLM on
    real shapes, routed to a *performant* kernel (not a slow fallback), passes
@@ -290,7 +292,7 @@ pointing at their archive.
 
 | Concern | Files |
 |---|---|
-| Orchestrate / contract | `run-pipeline.sh` (exec) · `pipeline.py` (declarative spec + one-cache enforcement) · `__init__.py` (transformers-5.x polyfills) |
+| Orchestrate / contract | `run-pipeline.sh` (exec) · `pipeline.py` (declarative spec + owner validation, not executor) · `__init__.py` (transformers-5.x polyfills) |
 | Allocate | `allocator.py` (CLI, Pareto sweep, log-error kneedle, `--bit-attribution-json/csv`) · `allocator_solver.py` (numpy multi-choice knapsack DP, union-find serving-unit promotion, `predicted_dloss`) · `allocator_candidates.py` (legality gate + cost-source precedence + passthrough integrity) · `decision_units.py` |
 | Probe / cost | `incremental_probe.py` + `sensitivity_probe.py` + `kl_fisher.py` (L1 Fisher) · `incremental_measure_quant_cost.py` + `measure_quant_cost.py` · `perturbed_x_cache.py` (L2) · `kl_measurement.py` + `propagated_sensitivity_costs.py` (L3) · `production_render_cost.py` |
 | Formats | `format_registry.py` (FormatSpec + RTN `quantize_dequantize`/`activation_quantize_dequantize`, codebook bucketize, E8M0 snap, `torch.compile` hot path) · `mx_formats.py` · `fp8_dynamic.py` |

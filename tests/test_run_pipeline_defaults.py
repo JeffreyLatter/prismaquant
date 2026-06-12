@@ -56,3 +56,13 @@ def test_grouped_kl_is_archived_and_blocked():
     assert "GROUPED_KL_MAX_LANES" not in script
     # production-render-score remains the default cost mode.
     assert "COST_MODE:=production-render-score" in script
+
+
+def test_mse_promotion_fails_fast_when_inert():
+    script = (
+        Path(__file__).resolve().parent.parent / "prismaquant" / "run-pipeline.sh"
+    ).read_text()
+
+    assert "MSE_PROMOTION requires SELECTION_MODE=validated-surrogate" in script
+    assert "MSE_PROMOTION requires PRODUCTION_CACHE=1" in script
+    assert "would be inert under SELECTION_MODE=$SELECTION_MODE" in script
