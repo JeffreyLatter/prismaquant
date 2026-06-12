@@ -301,6 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.dataset,
                 args.n_calib_samples,
                 args.calib_seqlen,
+                calib_seed=args.calib_seed,
             )
         else:
             calib_ids = load_wikitext_calibration_windowed(
