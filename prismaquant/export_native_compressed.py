@@ -345,12 +345,38 @@ def _select_nvfp4_group_scales(
     raise AssertionError(f"unhandled NVFP4 scale rule: {rule!r}")
 
 
+def _nvfp4_snapped_scale_scoring_enabled() -> bool:
+    """Score NVFP4 scale candidates under the FP8-SNAPPED effective scale.
+
+    Research lever (default OFF). Scoring under the snapped scale the
+    served kernel actually uses is more faithful in principle, but it
+    changes the shipped NVFP4 bytes for the joint_mse (JSO, a production
+    default lever) and four_over_six rules and has not cleared a served
+    gold-metric A/B (QC finding on review-batch M21). Promote per the
+    ladder: served KL+PPL at matched bpp on 4B, then a 27B confirmation.
+    """
+    return os.environ.get(
+        "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING", "0") != "0"
+
+
 def _select_nvfp4_pack_scales_and_global(
     grouped: torch.Tensor,
     *,
     global_real_override: torch.Tensor | None = None,
     scale_rule: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _nvfp4_snapped_scale_scoring_enabled():
+        # Pre-2026-06-12 behavior (byte-stable with shipped artifacts):
+        # scales scored under the RAW real scale; the tensor global is
+        # derived once from the chosen scales (or taken verbatim from the
+        # fused-sibling override) without re-scoring.
+        scale = _select_nvfp4_group_scales(grouped, scale_rule=scale_rule)
+        if global_real_override is not None:
+            global_real = global_real_override.to(
+                grouped.device, dtype=torch.float32).clamp_min(1e-12)
+        else:
+            global_real = (scale.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+        return scale, global_real
     scale = _select_nvfp4_group_scales(grouped, scale_rule=scale_rule)
     if global_real_override is not None:
         global_real = global_real_override.to(
@@ -5074,6 +5100,8 @@ def materialize_tensors_streaming(
                 "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
             "PRISMAQUANT_GPTQ_DAMP": os.environ.get(
                 "PRISMAQUANT_GPTQ_DAMP", ""),
+            "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING": os.environ.get(
+                "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING", "0"),
             "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
                 "PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999"),
             "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(

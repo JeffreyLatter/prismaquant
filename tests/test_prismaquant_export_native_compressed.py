@@ -869,6 +869,12 @@ class TestRoundTrip(unittest.TestCase):
         )
 
     def test_nvfp4_scale_selection_scores_fp8_snapped_scales(self):
+        # Pins the RESEARCH path (snapped-scale scoring); default-off
+        # pending its served A/B (QC M21).
+        __import__('os').environ[
+            'PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING'] = '1'
+        self.addCleanup(lambda: __import__('os').environ.pop(
+            'PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING', None))
         grouped = torch.tensor(
             [[[
                 -0.02800447, 0.20611508, -0.25149462, 0.00026755,
