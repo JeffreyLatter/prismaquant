@@ -1085,6 +1085,62 @@ def test_production_recache_measures_quantized_upstream_activation_range():
     assert delta["ratio_p50"] == pytest.approx(2.0)
 
 
+def test_production_recache_tempdir_uses_requested_parent(monkeypatch, tmp_path):
+    import prismaquant.production_recache as production_recache
+
+    seen_dirs: list[Path] = []
+
+    class FakeTemporaryDirectory:
+        def __init__(self, *, prefix, dir):
+            del prefix
+            self.path = Path(dir) / "fake_recache"
+            seen_dirs.append(Path(dir))
+
+        def __enter__(self):
+            self.path.mkdir(parents=True, exist_ok=True)
+            return str(self.path)
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeActivationCache:
+        def __init__(self, *args, **kwargs):
+            self.max_abs = {"q": 1.0}
+
+        def install(self):
+            pass
+
+        def remove(self):
+            pass
+
+    monkeypatch.setattr(
+        production_recache.tempfile,
+        "TemporaryDirectory",
+        FakeTemporaryDirectory,
+    )
+    monkeypatch.setattr(
+        production_recache,
+        "PerturbedActivationCache",
+        FakeActivationCache,
+    )
+    monkeypatch.setattr(
+        production_recache,
+        "iter_calibration_forwards",
+        lambda *args, **kwargs: [],
+    )
+
+    production_recache.measure_production_activation_max_abs(
+        nn.Linear(1, 1),
+        torch.ones(1, 1, dtype=torch.long),
+        {"q": "BF16"},
+        ProductionWeightCache(weights={}, levers={}),
+        progress=False,
+        temp_parent=tmp_path,
+    )
+
+    assert seen_dirs == [tmp_path]
+
+
 def test_activation_max_abs_delta_summary_reports_ratio_quantiles():
     summary = activation_max_abs_delta_summary(
         {"a": 1.0, "b": 2.0, "c": 4.0, "missing": 3.0},

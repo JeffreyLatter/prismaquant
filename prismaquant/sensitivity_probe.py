@@ -59,16 +59,50 @@ Model-agnostic:
 from __future__ import annotations
 
 import json
+import atexit
+import os
 import pickle
 import random
 import re
+import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
+import tempfile
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+_STAGED_TEMP_DIRS: list[Path] = []
+
+
+def _prismaquant_temp_parent() -> Path:
+    root = (
+        os.environ.get("PRISMAQUANT_TMPDIR")
+        or os.environ.get("TMPDIR")
+    )
+    parent = Path(root) if root else Path.cwd() / ".prismaquant_tmp"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent
+
+
+def _mk_stage_dir(prefix: str) -> Path:
+    staged = Path(tempfile.mkdtemp(
+        prefix=prefix,
+        dir=str(_prismaquant_temp_parent()),
+    ))
+    _STAGED_TEMP_DIRS.append(staged)
+    return staged
+
+
+def _cleanup_stage_dirs() -> None:
+    for path in reversed(_STAGED_TEMP_DIRS):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_cleanup_stage_dirs)
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +188,7 @@ def stage_text_only(model_path: str) -> str:
             a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
         ]
 
-    staged = Path(tempfile.mkdtemp(prefix="prismaquant_stage_"))
+    staged = _mk_stage_dir("prismaquant_stage_")
     skip = {"config.json", "preprocessor_config.json",
             "video_preprocessor_config.json", "processor_config.json"}
     for p in src.iterdir():
@@ -200,8 +234,7 @@ def stage_multimodal(model_path: str) -> str:
                                   "speech_config")):
         return str(src)
 
-    import tempfile
-    staged = Path(tempfile.mkdtemp(prefix="prismaquant_mm_stage_"))
+    staged = _mk_stage_dir("prismaquant_mm_stage_")
     for p in src.iterdir():
         if p.name == "config.json":
             continue

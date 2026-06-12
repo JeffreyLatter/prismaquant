@@ -113,6 +113,24 @@ class TestStageMultimodalPreservesVisionConfig(unittest.TestCase):
             self.assertIn("vision_config", cfg_mm)
             self.assertNotIn("vision_config", cfg_txt)
 
+    def test_staging_uses_configured_temp_parent(self):
+        with (
+            tempfile.TemporaryDirectory() as src_dir,
+            tempfile.TemporaryDirectory() as tmp_dir,
+        ):
+            src = Path(src_dir)
+            temp_parent = Path(tmp_dir).resolve()
+            self._write_multimodal_config(src)
+            with mock.patch.dict(
+                "os.environ",
+                {"PRISMAQUANT_TMPDIR": str(temp_parent), "TMPDIR": ""},
+            ):
+                mm = Path(stage_multimodal(str(src))).resolve()
+                txt = Path(stage_text_only(str(src))).resolve()
+
+            self.assertTrue(mm.is_relative_to(temp_parent))
+            self.assertTrue(txt.is_relative_to(temp_parent))
+
 
 class TestSyntheticMultimodalCalibration(unittest.TestCase):
     """load_multimodal_calibration synthetic path produces expected

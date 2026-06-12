@@ -29,6 +29,7 @@ from prismaquant.perturbed_x_cache import (
     calibration_data_hash,
     iter_calibration_forwards,
 )
+from prismaquant.sensitivity_probe import _prismaquant_temp_parent
 
 
 def _unify_fused_max_abs(
@@ -182,6 +183,7 @@ def measure_production_activation_max_abs(
     preload_max_workers: int = 4,
     require_preload: bool = False,
     progress: bool = True,
+    temp_parent: str | Path | None = None,
 ) -> dict[str, float]:
     """Measure activation max-abs under quantized upstream weights.
 
@@ -207,7 +209,12 @@ def measure_production_activation_max_abs(
             require=require_preload,
             progress=progress,
         )
-    with tempfile.TemporaryDirectory(prefix="prismaquant_recache_") as tmp:
+    tmp_parent = Path(temp_parent) if temp_parent is not None else _prismaquant_temp_parent()
+    tmp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="prismaquant_recache_",
+        dir=str(tmp_parent),
+    ) as tmp:
         builder = PerturbedActivationCache(
             model,
             assignment,
@@ -337,6 +344,7 @@ def recache_production_weight_cache(
     require_preload: bool = False,
     progress: bool = True,
     write_sidecar: bool = True,
+    temp_parent: str | Path | None = None,
 ) -> dict[str, float]:
     """Measure and apply production-faithful activation max-abs values."""
     max_abs = measure_production_activation_max_abs(
@@ -352,6 +360,7 @@ def recache_production_weight_cache(
         preload_max_workers=preload_max_workers,
         require_preload=require_preload,
         progress=progress,
+        temp_parent=temp_parent,
     )
     apply_activation_max_abs_to_cache(
         production_weight_cache,
@@ -498,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         require_preload=args.production_cache_prefetch == "require",
         progress=True,
         write_sidecar=not args.no_write_sidecar,
+        temp_parent=work_root,
     )
     compacted = (
         cache.compact_for_pickle()
