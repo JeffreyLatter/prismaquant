@@ -1036,14 +1036,17 @@ def _production_cache_fingerprint(
     }
 
 
-def _production_cache_scales(cache) -> dict[str, float]:
+def _production_cache_scales(cache, *, profile=None) -> dict[str, float]:
     activation_max_abs = getattr(cache, "activation_max_abs", None) or {}
     scales = {
         name: (6.0 / float(max_abs))
         for name, max_abs in activation_max_abs.items()
         if max_abs and float(max_abs) > 0.0
     }
-    return _unify_input_global_scales_across_fused_siblings(scales)
+    return _unify_input_global_scales_across_fused_siblings(
+        scales,
+        profile=profile,
+    )
 
 
 
@@ -6979,7 +6982,10 @@ def main():
             production_cache,
             expected_keys,
         )
-        _INPUT_GLOBAL_SCALES = _production_cache_scales(production_cache)
+        _INPUT_GLOBAL_SCALES = _production_cache_scales(
+            production_cache,
+            profile=profile,
+        )
         print(
             "[export-stream] production-weight-cache direct path: "
             f"{len(expected_keys)} entries, "
@@ -7723,15 +7729,10 @@ def _apply_visual_recipe_quant(
                 linear_name=base,
             )
         except Exception as e:
-            # Fail-safe: fall back to passthrough on any arithmetic
-            # error. Better to land a BF16 visual Linear than crash
-            # the whole export — the rest of the body/MTP are already
-            # materialized.
-            print(f"[export-stream] WARN visual quant failed for {base} "
-                  f"({fmt}): {e}; falling back to BF16 passthrough",
-                  flush=True)
-            out[key] = tensor
-            continue
+            raise RuntimeError(
+                f"[export-stream] visual quant failed for {base} ({fmt}); "
+                "refusing to emit BF16 bytes under a quantized config"
+            ) from e
         for suffix, t in compressed.items():
             out[f"{base}.{suffix}"] = t.cpu()
         touched += 1

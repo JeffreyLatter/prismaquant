@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -224,6 +225,20 @@ class TestApplyVisualRecipeQuant(unittest.TestCase):
                                          device=torch.device("cpu"))
         self.assertIn("mtp.fc.weight", out)
         self.assertIs(out["mtp.fc.weight"], src_extra["mtp.fc.weight"])
+
+    def test_quant_failure_raises_instead_of_bf16_passthrough(self):
+        name = "model.visual.blocks.0.attn.qkv"
+        src_extra = {f"{name}.weight": torch.randn(48, 32, dtype=torch.bfloat16)}
+        with patch(
+            "prismaquant.export_native_compressed._quantize_2d",
+            side_effect=ValueError("shape mismatch"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "visual quant failed"):
+                _apply_visual_recipe_quant(
+                    src_extra,
+                    {name: "NVFP4"},
+                    device=torch.device("cpu"),
+                )
 
 
 class TestAllocatorVisualEndToEnd(unittest.TestCase):

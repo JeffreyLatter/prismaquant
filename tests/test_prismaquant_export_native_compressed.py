@@ -2069,6 +2069,30 @@ class TestProductionCacheExportPath(unittest.TestCase):
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
             m._INPUT_GLOBAL_SCALES = saved_scales
 
+    def test_production_cache_scales_use_profile_fused_groups(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        class CustomProfile:
+            def fused_sibling_group(self, qname: str) -> str | None:
+                if qname.endswith(".a_proj") or qname.endswith(".b_proj"):
+                    return qname.rsplit(".", 1)[0] + ".ab_proj"
+                return None
+
+        cache = ProductionWeightCache(
+            weights={},
+            levers={},
+            activation_max_abs={
+                "model.layers.0.a_proj": 12.0,
+                "model.layers.0.b_proj": 24.0,
+            },
+        )
+
+        scales = m._production_cache_scales(cache, profile=CustomProfile())
+
+        self.assertEqual(scales["model.layers.0.a_proj"], 0.25)
+        self.assertEqual(scales["model.layers.0.b_proj"], 0.25)
+
     def test_mxfp8_alias_hits_e4m3_cache_key(self):
         import prismaquant.export_native_compressed as m
         from prismaquant.production_weight_cache import ProductionWeightCache
