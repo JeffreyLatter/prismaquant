@@ -639,6 +639,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--n-calib-samples", type=int, default=4)
     p.add_argument("--calib-seqlen", type=int, default=256)
     p.add_argument("--calib-split", default="train")
+    p.add_argument("--calib-seed", type=int, default=42,
+                   help="Seed for the calibration-window DRAW (which token "
+                        "windows are sampled), distinct from --seed-base "
+                        "(the probe directions). Vary this to measure "
+                        "calibration-resampling variance of the cost.")
     p.add_argument("--token-scope", default="all")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
@@ -766,6 +771,7 @@ def main(argv: Sequence[str] | None = None) -> int:
              "no active dropout/batchnorm)")
     calib = load_wikitext_calibration_windowed(
         tok, args.n_calib_samples, args.calib_seqlen, split=args.calib_split,
+        seed=args.calib_seed,
     ).to(args.device)
 
     cache = None
@@ -794,6 +800,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "calib_source": f"wikitext:{args.calib_split}",
         "n_calib_samples": int(args.n_calib_samples),
         "calib_seqlen": int(args.calib_seqlen),
+        "calib_seed": int(args.calib_seed),
         "production_cache": str(args.production_cache or ""),
     })
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
