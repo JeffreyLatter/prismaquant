@@ -45,7 +45,11 @@ import torch
 import torch.nn as nn
 
 import prismaquant.format_registry as fr
-from prismaquant.kl_fisher import fisher_probe_scalar
+from prismaquant.kl_fisher import (
+    fisher_probe_scalar,
+    select_token_scope,
+    token_count_for_logits,
+)
 
 SCHEMA = "prismaquant.aura_cost.v1"
 
@@ -290,6 +294,7 @@ def compute_aura_cost(
     include_lm_head: bool = False,
     hook_harvest: bool = False,
     allow_packed_expert_omission: bool = False,
+    probe_microbatch: int = 0,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -441,9 +446,22 @@ def compute_aura_cost(
         #    proportionally fewer. Per-(key,probe) values are identical
         #    (same reductions, just earlier).
         hook_handles = []
+        # Probe micro-batching (opt-in): at production calib volume the
+        # vocab-shaped tensors of a monolithic forward dominate memory
+        # (logits 32x1024x152k fp32 ~ 20 GiB, plus probe temps + grad-of-
+        # logits). The probe scalar is a token-sum, so backward over
+        # micro-batches accumulates EXACTLY the same total gradient; the
+        # harvest hooks must fire only once the accumulation is complete.
+        # Probe noise is seeded per (probe, micro-batch), so results are
+        # statistically equivalent to monolithic, not bit-identical —
+        # except probe_microbatch=0/>=B (single batch), which is the
+        # unchanged legacy path.
+        _harvest_gate = {"on": True}
         if hook_harvest:
             def _make_hook(name: str):
                 def _hook(param: torch.Tensor) -> None:
+                    if not _harvest_gate["on"]:
+                        return  # mid-accumulation: keep the partial grad
                     g = param.grad
                     if g is None:
                         return
@@ -470,12 +488,36 @@ def compute_aura_cost(
                     f"free UMA {_free_gib():.1f} < floor {min_free_gib}; abort")
             for n in chunk:
                 linears[n].weight.grad = None
-            logits = model(calib_ids).logits
-            probe = fisher_probe_scalar(
-                logits, seed=seed_base + k, token_scope=token_scope,
-                temperature=temperature, distribution="rademacher",
-            )
-            probe.backward()
+            _B = calib_ids.size(0)
+            _mb = int(probe_microbatch) if int(probe_microbatch) > 0 else _B
+            _starts = list(range(0, _B, _mb))
+            # Global selected-token count for the FULL calibration batch.
+            # Each micro-batch normalizes its probe by this (not its own
+            # slice's count), so the gradient summed across micro-batches
+            # matches the monolithic-scale probe exactly (vs sqrt(M)-inflated
+            # if each slice used its own count). Computed via a meta tensor
+            # so the real scope logic decides the count with no allocation.
+            _global_tc = None
+            if len(_starts) > 1:
+                _shape_probe = torch.zeros(
+                    _B, calib_ids.size(1), 1, device="meta")
+                _global_tc = token_count_for_logits(
+                    select_token_scope(_shape_probe, token_scope))
+            for _mi, _s0 in enumerate(_starts):
+                _harvest_gate["on"] = (_mi == len(_starts) - 1)
+                logits = model(calib_ids[_s0:_s0 + _mb]).logits
+                probe = fisher_probe_scalar(
+                    logits,
+                    seed=(seed_base + k if len(_starts) == 1
+                          else seed_base + k * 1000003 + _mi),
+                    token_scope=token_scope,
+                    temperature=temperature, distribution="rademacher",
+                    token_count_override=_global_tc,
+                )
+                probe.backward()
+                del logits, probe
+            _harvest_gate["on"] = True
+            logits = probe = None
             if not hook_harvest:
                 with torch.no_grad():
                     for n in chunk:
@@ -493,7 +535,6 @@ def compute_aura_cost(
                                 s4[key] += x2 * x2
                                 x2_probe[key].append(x2)
                         linears[n].weight.grad = None
-            del logits, probe
             torch.cuda.empty_cache()
             if (k + 1) % 8 == 0:
                 _log(f"  chunk {ci+1}/{len(chunks)} probe {k+1}/{n_probes}; "
@@ -654,6 +695,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "(~10-15GB) OOM-kills between watchdog checks "
                         "(observed 2026-06-10). ~30% slower; numerically "
                         "identical recompute in fp32.")
+    p.add_argument("--probe-microbatch", type=int, default=0,
+                   help="Forward the calibration in groups of this many "
+                        "samples per probe, accumulating gradients (memory "
+                        "control for production calib volume; the monolithic "
+                        "forward's vocab-shaped tensors are ~20 GiB at "
+                        "32x1024). 0 = single batch (legacy, bit-identical). "
+                        ">0 changes probe-noise draws: statistically "
+                        "equivalent, not bit-identical to monolithic.")
     p.add_argument("--allow-packed-expert-omission", action="store_true",
                    help="Explicit research/debug escape: allow AURA to omit "
                         "packed-MoE expert tensors from the cost payload. "
@@ -738,6 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         include_lm_head=args.include_lm_head,
         hook_harvest=args.hook_harvest,
         allow_packed_expert_omission=args.allow_packed_expert_omission,
+        probe_microbatch=args.probe_microbatch,
     )
     payload["provenance"].update({
         "model": str(args.model),

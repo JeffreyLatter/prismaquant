@@ -70,3 +70,27 @@ def test_fisher_probe_gradient_is_centered_and_respects_last_scope():
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+def test_fisher_probe_token_count_override_rescales():
+    """The token_count_override rescales the probe by sqrt(real/override).
+
+    Guards the micro-batched AURA path: each micro-batch must normalize by
+    the GLOBAL token count, or the gradient summed across M micro-batches is
+    sqrt(M)-inflated (and the squared cost M-inflated). Deterministic, bit-
+    level — same seed gives the same Rademacher draw.
+    """
+    import math
+    import torch
+    from prismaquant.kl_fisher import fisher_probe_scalar
+
+    torch.manual_seed(0)
+    logits = torch.randn(4, 8, 16)  # B=4, T=8, V=16; scope="all" -> N=32
+    kw = dict(seed=5, token_scope="all", distribution="rademacher")
+    base = fisher_probe_scalar(logits, **kw)
+    # override == real count is an exact no-op
+    same = fisher_probe_scalar(logits, token_count_override=32, **kw)
+    assert torch.equal(same, base)
+    # override == 4x real count scales the probe (hence the scalar) by 1/2
+    quad = fisher_probe_scalar(logits, token_count_override=4 * 32, **kw)
+    assert torch.allclose(quad, base * 0.5, rtol=1e-5, atol=0.0)
