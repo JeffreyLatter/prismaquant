@@ -144,6 +144,20 @@ def _mask_cuda_queries_during_meta_init(log_prefix: str):
     except Exception:
         pass
 
+    # Pin fla's OWN module-level device detection too. fla.utils computes
+    # `device`/`device_platform`/`device_torch_lib` from triton's driver target
+    # at import; if that first import lands inside this mask it caches CPU and
+    # the gated-delta-rule autocast wrapper later crashes on `torch.cpu.device`
+    # (the linear-attn fast path on Qwen3.5/3.6). Import it here, CUDA visible,
+    # so the detection caches the real device for the process. Needs a writable
+    # TRITON_CACHE_DIR — /home/rob/.triton/cache can be root-owned from docker
+    # runs, which makes triton's compile cache unwritable and silently rolls fla
+    # back to CPU; point TRITON_CACHE_DIR at a user-owned dir if so.
+    try:
+        import fla.utils  # noqa: F401  (device detection cached at import)
+    except Exception:
+        pass
+
     old_is_available = torch.cuda.is_available
     old_device_count = torch.cuda.device_count
     old_current_device = torch.cuda.current_device
