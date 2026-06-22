@@ -3588,6 +3588,71 @@ class TestPerRoleGptqDamp(unittest.TestCase):
         self.assertEqual(table, {"gate_up": 0.3, "o_proj": 2.0})
 
 
+class TestExportMatchRenderScaleRuleM19(unittest.TestCase):
+    """M19: NVFP4 export re-derive honors the render's recorded scale rule."""
+
+    def setUp(self):
+        import os
+        import prismaquant.export_native_compressed as m
+        self.m = m
+        self._saved = os.environ.get(
+            "PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE")
+        os.environ.pop("PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE", None)
+
+    def tearDown(self):
+        import os
+        if self._saved is None:
+            os.environ.pop("PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE", None)
+        else:
+            os.environ["PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE"] = self._saved
+
+    def test_match_helper_returns_recorded_rule_by_default(self):
+        class _C:
+            levers = {"nvfp4_scale_rule": "joint_mse"}
+        self.assertEqual(
+            self.m._export_match_render_scale_rule(_C()), "joint_mse")
+
+    def test_match_helper_gate_off_is_none(self):
+        import os
+        os.environ["PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE"] = "0"
+
+        class _C:
+            levers = {"nvfp4_scale_rule": "joint_mse"}
+        self.assertIsNone(self.m._export_match_render_scale_rule(_C()))
+
+    def test_match_helper_no_recorded_rule_is_none(self):
+        class _C:
+            levers = {}
+        self.assertIsNone(self.m._export_match_render_scale_rule(_C()))
+        self.assertIsNone(self.m._export_match_render_scale_rule(object()))
+
+    def test_temporary_scale_rule_sets_and_restores(self):
+        m = self.m
+        prev = m._NVFP4_SCALE_RULE
+        with m._temporary_export_nvfp4_scale_rule("joint_mse"):
+            self.assertEqual(
+                m._NVFP4_SCALE_RULE, m.resolve_nvfp4_scale_rule("joint_mse"))
+        self.assertEqual(m._NVFP4_SCALE_RULE, prev)
+        with m._temporary_export_nvfp4_scale_rule(None):  # falsy = no-op
+            self.assertEqual(m._NVFP4_SCALE_RULE, prev)
+
+    def test_rule_actually_changes_packed_scales(self):
+        # joint_mse explores extra per-group scale levels ({6,4,...}) and picks
+        # the min-MSE one, so on a generic Gaussian weight its chosen group
+        # scales differ from static_6's fixed max->6 — proving the rule plumbs
+        # through the export re-derive (not just the helper).
+        m = self.m
+        torch.manual_seed(0)
+        w = torch.randn(8, 16)
+        with m._temporary_export_nvfp4_scale_rule("static_6"):
+            _, s6, _ = m.quantize_dequantize_nvfp4(w, group_size=16)
+        with m._temporary_export_nvfp4_scale_rule("joint_mse"):
+            _, sj, _ = m.quantize_dequantize_nvfp4(w, group_size=16)
+        self.assertFalse(
+            torch.equal(s6, sj),
+            "joint_mse should select different group scales than static_6")
+
+
 class TestMtpCacheCoveragePreflight(unittest.TestCase):
     def test_missing_mtp_entries_diagnosed_at_attach_time(self):
         # QC M17: non-BF16 mtp.* with an attached cache must fail with the

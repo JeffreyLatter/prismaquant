@@ -736,8 +736,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--kl-scope",
         choices=("last_token", "full_sequence"),
         default="last_token",
-        help="Token scope for KL. Default last_token matches production probe "
-        "gates and avoids full-sequence reference tensor residency on 27B.",
+        help="Token scope for KL. last_token is a triage SCREEN (CLAUDE.md "
+        "§5); full_sequence is the gold-metric scope and is what run-pipeline "
+        "passes for final frontier selection (M26). The full-sequence "
+        "reference is streamed (hooks path), so 27B residency is not a blocker. "
+        "This CLI default stays last_token for ad-hoc/probe-gate parity.",
     )
     parser.add_argument(
         "--kl-cuda-graphs",

@@ -1340,6 +1340,43 @@ def _production_cache_prefetch_assignment(
     return int(cache.prefetch(keys, max_workers=_PRODUCTION_CACHE_PREFETCH_WORKERS))
 
 
+@contextmanager
+def _temporary_export_nvfp4_scale_rule(rule_name: str | None):
+    """Temporarily set the active NVFP4 scale rule for an export re-derive.
+
+    No-op when ``rule_name`` is falsy (keeps the export-entry default)."""
+    global _NVFP4_SCALE_RULE
+    if not rule_name:
+        yield
+        return
+    prev = _NVFP4_SCALE_RULE
+    try:
+        _NVFP4_SCALE_RULE = resolve_nvfp4_scale_rule(rule_name)
+        yield
+    finally:
+        _NVFP4_SCALE_RULE = prev
+
+
+def _export_match_render_scale_rule(cache) -> str | None:
+    """M19: the NVFP4 scale rule the render used, for a byte-faithful re-derive.
+
+    The production cache stores the render's fp32 weights as bf16; export then
+    re-quantizes that dequant. Re-deriving under the render's RECORDED scale
+    rule (e.g. ``joint_mse`` when JSO was on) instead of the export-entry
+    default (``static_6``) makes the re-quant near-idempotent — the shipped
+    NVFP4 bytes track the KL-validated render rather than diverging to a
+    different per-group scale choice. Returns ``None`` (legacy behavior, bytes
+    unchanged) when ``PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE`` is ``0`` or
+    the cache carries no recorded rule.
+    """
+    if os.environ.get(
+            "PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE", "1") == "0":
+        return None
+    levers = getattr(cache, "levers", None) or {}
+    rule = levers.get("nvfp4_scale_rule")
+    return str(rule) if rule else None
+
+
 def _pack_production_cached_2d(
     linear_name: str,
     fmt: str,
@@ -1368,11 +1405,13 @@ def _pack_production_cached_2d(
     target_device = device or torch.device("cpu")
     if fmt == "NVFP4":
         w_work = w.to(device=target_device, dtype=torch.float32)
-        wp, ws, wg = quantize_dequantize_nvfp4(
-            w_work,
-            group_size=16,
-            global_real_override=nvfp4_global_real_override,
-        )
+        with _temporary_export_nvfp4_scale_rule(
+                _export_match_render_scale_rule(cache)):
+            wp, ws, wg = quantize_dequantize_nvfp4(
+                w_work,
+                group_size=16,
+                global_real_override=nvfp4_global_real_override,
+            )
         input_scale = (
             _INPUT_GLOBAL_SCALES.get(linear_name) if _INPUT_GLOBAL_SCALES
             else None

@@ -66,6 +66,12 @@ set -euo pipefail
 : "${PREFETCH_MIN_AVAILABLE_GB:=auto}"
 : "${ACTIVATION_ROWS_LIMIT:=256}"
 : "${DATASET:=/home/rob/dq-runs/calibration/diverse-v1.jsonl}"
+# MINOR-M2: packed-MoE experts use a cross-domain held-out corpus for the
+# GPTQ-vs-RTN do-no-harm gate (the served-validated recipe — arm E in
+# moe_expert_gptq_vs_rtn — beat same-corpus/in-sample gating). Must be DISJOINT
+# from DATASET. Ignored for dense models (no packed experts). Set empty to
+# reproduce the historical same-corpus in-sample gate.
+: "${EXPERT_GATE_DATASET:=/home/rob/dq-runs/calibration/xdom-gate-v1.jsonl}"
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_packed_moe}"
@@ -191,7 +197,12 @@ export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
 # Optional fully separate validation corpus (overrides skip-first
 # disjointness with corpus-level disjointness when provided).
 : "${VALIDATED_FRONTIER_DATASET:=$DATASET}"
-: "${VALIDATED_FRONTIER_KL_SCOPE:=last_token}"
+# M26: final selection scores full-sequence KL (the gold-metric scope, §5),
+# not the last_token triage screen. Selection is still re-validated on the
+# served metric before ship, but aligning the selection scope with the gold
+# metric removes a screen/gold mismatch. VALIDATED_FRONTIER_KL_SCOPE=last_token
+# reproduces historical selections (the flagship 27B was picked under it).
+: "${VALIDATED_FRONTIER_KL_SCOPE:=full_sequence}"
 : "${VALIDATED_FRONTIER_PICK:=kneedle}"
 : "${VALIDATED_FRONTIER_SAT_Z:=2.0}"
 # Saturation (B*) needs a real per-bpp noise floor: validate_assignments_kl's
@@ -941,6 +952,7 @@ PY
           --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+          ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
           2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
       else
         echo "[pipeline] [4/4] re-fitting production activation scales ..."
@@ -982,6 +994,7 @@ PY
         --cache-dir "$PROD_CACHE_DIR" \
         --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
         --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+        ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
         2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
     else
       echo "[pipeline] [4/4] production cache exists, skipping"
