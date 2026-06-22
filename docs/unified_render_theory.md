@@ -457,6 +457,29 @@ serialization contract.
   lane scores only the 8 window-final contexts (teacher_shape [8, V]) —
   paired A-vs-B there was 0.008±0.29, useless; the all-position top-K mode
   was added (commit abc90a4) and is what the table reports.
+- **V1b — PER-ROLE served A/B, RUN (2026-06-22): NULL → thread closed.**
+  The V0b/V0c basins are role-structured, and an h_trace join on the 31 logged
+  4B Linears showed the optimal damp is *uncorrelated with sensitivity*
+  (Spearman(h_trace, opt_damp) ≈ −0.12) but the *regret* of a single constant
+  concentrates on the high-h_trace gate/up Linears (Spearman(h_trace,
+  regret@1.0) ≈ +0.61) — so the served-relevant (h_trace-weighted) local-MSE
+  headroom of fixed-1.0 was ~6% (vs ~1.6% unweighted), the strongest case yet
+  for a per-role table. Tested it on the gold lane: arm E = per-role oracle
+  damp (qkv/o_proj=1.0, gate/up=0.3, down=3.0), **JSO ON** (retiring the
+  V0b/V0c JSO-off caveat), vs arm D fixed-1.0, frozen 4.75bpp allocation, 3
+  paired calib seeds (42/43/44), consolidated KL+PPL per seed. Result (means):
+  E KL 0.5196 vs D 0.5182 (ΔKL **+0.0014**, E worse), E PPL 26.885 vs D 26.804
+  (ΔPPL **+0.080**); **0/3 seeds clear the within-arm spread (0.023–0.026)**,
+  PPL regresses 2/3, the mean gap is 17× smaller than the seed noise. The ~6%
+  local h-weighted signal **did not transfer to served KL** — another
+  local→served washout (cf. scale_sweep, grouped-KL). The per-role table is the
+  strongest local-proxy alternative short of full per-Linear, so its served
+  null bounds any per-Linear scheme's payoff at ~0 too. **fixed-1.0 is the
+  final production answer; "derive damp from weights" stays a dormant curiosity,
+  closed by the gold metric, not merely by the failed closed forms.** Lever:
+  `PRISMAQUANT_GPTQ_DAMP_ROLES` (commit 8a9c366, default-off research/closed
+  instrument). Artifacts: `/home/rob/dq-runs/v1-damp-ab/metrics/*armE_s4*`,
+  `damp-collapse-4b/sensitivity_vs_damp.py`.
 - **V2 — regime audit, no new builds:** compute ν = n_eff/d and adjusted-R²
   for the 35B packed experts and the 27B dense Linears from existing caches;
   the law must place experts in the s*≈0 branch and dense in s*≈1. Pure
