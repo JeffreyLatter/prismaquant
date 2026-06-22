@@ -113,3 +113,31 @@ def test_production_cache_assignment_diagnostics_counts_misses(monkeypatch):
     assert permissive["cache_miss_count"] == 1
     assert permissive["rtn_fallback_count"] == 1
     assert permissive["strict"] is False
+
+
+def test_diagnostics_counts_packed_expert_misses_m4():
+    # M4: the diagnostics must ask assignment_keys to INCLUDE packed experts,
+    # otherwise packed-expert cache misses are silently skipped and the
+    # validated-surrogate fail-fast never fires for MoE (it would abort later
+    # in materialization with a less actionable message instead).
+    class _FakeCache:
+        def __init__(self):
+            self.include_flag = None
+
+        def assignment_keys(self, assignment, include_packed_experts=False):
+            self.include_flag = include_packed_experts
+            # the lone non-BF16 entry is a packed expert: counted as missing
+            # only when the diagnostics opt into packed-expert coverage.
+            missing = (
+                [("model.layers.0.mlp.experts.gate_up_proj", "NVFP4")]
+                if include_packed_experts else []
+            )
+            return [], missing
+
+    cache = _FakeCache()
+    diag = _production_cache_assignment_diagnostics(
+        cache, {"model.layers.0.mlp.experts.gate_up_proj": "NVFP4"})
+    assert cache.include_flag is True, \
+        "diagnostics must pass include_packed_experts=True (M4)"
+    assert diag["cache_miss_count"] == 1
+    assert diag["missing_sample"][0][0].endswith("gate_up_proj")

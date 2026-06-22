@@ -1,14 +1,14 @@
 MAJOR-M1 FIXED a92eb7f
 MAJOR-M2 FIXED a92eb7f
 MAJOR-M3 FIXED a92eb7f
-MAJOR-M4 SKIPPED-NEEDS-DESIGN proposal: validated-surrogate on packed-MoE must either render expert entries for each Pareto assignment or fail/route to a selected-assignment production-cache build before KL/export; format-menu has no concrete expert assignment to render today.
-MAJOR-M5 SKIPPED-NEEDS-DESIGN proposal: packed-expert allocator cost needs production render-score records from fill_packed_expert_cache_entries or an explicit hybrid cost contract; current RTN-cost/GPTQ-bytes split is real but changing cost semantics affects the paper-spine allocator.
+MAJOR-M4 FIXED (close-skips 2026-06-22) — danger-half (silent-RTN confound + wasted KL hours) ALREADY-RESOLVED by fail-loud _materialize_assignment_inplace (validate_assignments_kl.py:577,443); the M4-named pre-check now actually fires for packed experts (include_packed_experts=True at _production_cache_assignment_diagnostics) with an actionable hint pointing at SELECTION_MODE=surrogate. Capability gap (validated-surrogate cannot ship a MoE artifact) declared unsupported — flagship is dense, experts ship RTN by policy (moe_expert_gptq_vs_rtn), so per-Pareto expert render (Option B) is wasted. Pinned: test_diagnostics_counts_packed_expert_misses_m4.
+MAJOR-M5 WONTFIX-PRINCIPLED (close-skips 2026-06-22) — RTN-cost/GPTQ-bytes split is the served-VALIDATED production-faithful design, NOT a confound: served 27B KL A/B (memory aura_cost_rtn_vs_gptq_crossover, render held constant, bit-exact probe replay) = fp4 WASH (-0.0031, inside seed std), fp8 RTN-cost +36% BETTER. Forcing GPTQ-byte cost buys nothing at fp4, regresses fp8, and adds the dead-last/70x-slower per-expert GPTQ render into the cost step (Principle 3 + GPU-first). No functional change.
 MAJOR-M6 FIXED 3d2abcd
 MAJOR-M7 STALE 0bd5d9c
 MAJOR-M8 FIXED c856a6a
 MAJOR-M9 FIXED c856a6a
-MAJOR-M10 SKIPPED-NEEDS-DESIGN proposal: implement the codex-agreed empirical/hybrid packed-expert AURA cost with additivity gate; c856a6a adds fail-fast/explicit-escape so packed experts are no longer silently omitted.
-MAJOR-M11 SKIPPED-NEEDS-DESIGN proposal: pipeline held-out validation wiring overlaps the queue's critical run-pipeline holdout branch; a92eb7f fixed validator/build seed forwarding, and the critical branch should pass a distinct held-out dataset/split/seed into validated-frontier selection.
+MAJOR-M10 FIXED+WONTFIX-FOR-NOW (close-skips 2026-06-22) — silent-omission half ALREADY-RESOLVED by c856a6a (_guard_packed_expert_coverage aura_cost.py:253-275,310 raises on any packed expert unless --allow-packed-expert-omission; pinned tests/test_aura_cost.py:296-316). Hybrid empirical-serving-unit expert AURA cost is WONTFIX-FOR-NOW: the codex gate (.claude/codex-aura-moe-gate-2026-06-09) proved AURA's gradient-probe estimator is structurally blind to routed-expert route-flip discontinuities (~10x format-gap error), so adding expert rows would violate Principle 1; AURA is the dense/attn spine, MoE ships via production-render-score; nothing ships via AURA-MoE today (no COST_MODE=aura in run-pipeline). Build only if a MoE-AURA artifact is roadmapped (gated on task #14).
+MAJOR-M11 FIXED 722ec93 (verified close-skips 2026-06-22) — validated-frontier selection KL is held-out BY CONSTRUCTION: VALIDATED_FRONTIER_SKIP_CALIB defaults to NSAMPLES (run-pipeline.sh:190) so validation windows [NSAMPLES, NSAMPLES+VFN) are disjoint from the probe's [0,NSAMPLES); --calib-seed threaded on the --dataset path (validate_assignments_kl.py:493,511); optional VALIDATED_FRONTIER_DATASET for corpus separation. Pinned tests/test_validated_frontier_holdout.py. Ledger lagged; VALIDATED_FRONTIER_SKIP_CALIB=0 reproduces historical in-sample runs.
 MAJOR-M12 FIXED d9457f1
 MAJOR-M13 FIXED d9457f1
 MAJOR-M14 FIXED d9457f1
@@ -16,14 +16,14 @@ MAJOR-M15 FIXED d9457f1
 MAJOR-M16 FIXED 82baaa2
 MAJOR-M17 FIXED 1da086b
 MAJOR-M18 FIXED ada08a8
-MAJOR-M19 SKIPPED-NEEDS-DESIGN proposal: persist production-cache render artifacts at the packed-code/scale or render-metadata level so export can ship exactly the validated bytes; changing the cache payload/selection contract is larger than a queue-batch patch.
+MAJOR-M19 WONTFIX-ON-SERVED-METRIC (close-skips 2026-06-22) — the surrogate==exported invariant is enforced at the SERVING level, not the byte level: every ship is re-validated post-export (validate_quantized_model PPL/p99-NLL + served KL A/B), and the bf16-dequant→static_6 NVFP4 re-derive gap is ~1000x below the already-accepted resident-emulation-vs-CUTLASS gap (memory aura_4b_render_discrepancy). Real but bounded. AVAILABLE UPGRADE (Robert's call, not required): Option B threads scale_rule=joint_mse into the NVFP4 export re-derive (export_native_compressed.py:1369-1389) so the re-quant is near-idempotent — ~15 LoC, NO serialization-format change, but it CHANGES shipped bytes so it needs a served A/B before becoming default.
 MAJOR-M20 FIXED 5bf80ac
 MAJOR-M21 FIXED 3fd3dce
 MAJOR-M22 FIXED 3fd3dce
 MAJOR-M23 FIXED 718cfa3
 MAJOR-M24 FIXED 0283d3f
 MAJOR-M25 FIXED 0283d3f
-MAJOR-M26 SKIPPED-NEEDS-DESIGN proposal: final validated-frontier KL scope/defaults overlap the queue's protected run-pipeline holdout/stage wiring; switch production final selection to a full-sequence held-out evaluator in that critical branch, or require an explicit smoke-only last-token override.
+MAJOR-M26 WONTFIX-SCREEN-THEN-GATE (close-skips 2026-06-22) — last_token frontier-selection KL is a triage SCREEN, and the chosen frontier point is re-validated on the served gold metric (validate_quantized_model + served KL A/B) before any ship, which is the methodological spine ("surrogates generate, real KL selects"); a mis-ranked screen point is caught by the served gate, not shipped. AVAILABLE UPGRADE (Robert's call, not required): Option A flips the run-pipeline default scope to full_sequence (gold-aligned per CLAUDE.md §5) — ~1 LoC + help-text fix, last_token reachable via VALIDATED_FRONTIER_KL_SCOPE for repro — but it changes the flagship-producing selection default and the full_sequence path needs an end-to-end validation run before defaulting.
 MAJOR-M27 FIXED 013b0c2
 MAJOR-M28 FIXED 0b359eb
 MAJOR-M29 FIXED 29f80d3
@@ -34,7 +34,7 @@ MAJOR-M33 FIXED 46102e8
 MAJOR-M34 FIXED a92eb7f
 MAJOR-M35 FIXED 4b3f525
 MINOR-M1 FIXED bc50a6c
-MINOR-M2 SKIPPED-NEEDS-DESIGN proposal: replace the sparse-expert GPTQ-vs-RTN gate with a measured cross-domain/min-row policy and fit/eval weighting contract; changing the <20-row in-sample fallback would alter production expert-render semantics.
+MINOR-M2 WONTFIX-W-EVIDENCE + AVAILABLE-UPGRADE (close-skips 2026-06-22) — fit-weighting half is WONTFIX-with-evidence: the served 6-arm 35B finale chose RTN-static6 (memory moe_expert_gptq_vs_rtn) and arm F (MORE in-sample fit capacity: damp-sweep+act_order) served WORST on thin-Hessian routed experts, so row-weighting the GPTQ fit pushes the contraindicated direction (keep as a research lever, not a default). The cross-domain gate (0bd5d9c) is the served-validated GPTQ-vs-RTN policy and is reachable via --expert-gate-dataset. AVAILABLE UPGRADE (Robert's call): A1 wires a DISJOINT EXPERT_GATE_DATASET default into run-pipeline.sh for packed-MoE so a vanilla MoE run reproduces the proven recipe instead of the same-corpus n<20 in-sample fallback — needs a corpus choice + a served re-A/B (changes default MoE bytes).
 MINOR-M3 FIXED bc50a6c
 MINOR-M4 FIXED bc50a6c
 MINOR-M5 FIXED bc50a6c
@@ -65,7 +65,7 @@ MINOR-M29 FIXED 4549a18
 MINOR-M30 FIXED f3a1241
 MINOR-M31 FIXED f3a1241
 MINOR-M32 FIXED eee0beb
-MINOR-M33 SKIPPED-NEEDS-DESIGN proposal: model shared-KV as an explicit cross-layer gradient path in the Fisher pass-state contract; a local patch would either undercount silently or retain multi-layer KV graphs and break the isolated GPU-bound streaming design.
+MINOR-M33 FIXED-GUARD + measurement-fix DEFERRED (close-skips 2026-06-22) — silent measurement gap eliminated: the probe now FAILS LOUD on KV-sharing models (kv_shared_fisher_block_reason raises when num_kv_shared_layers>0, override PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1) so no silently-biased allocation can ship (Principle 1). Latent today — Gemma4-31B-IT and the Gemma4TextConfig default are num_kv_shared_layers=0, so the guard fires on NO shipped model. Pinned tests/test_incremental_probe_kv_shared_guard.py (6 tests). The principled KV-cotangent measurement fix (~80-150 LoC single-layer-resident accumulation) is DEFERRED until a num_kv_shared_layers>0 model is an actual ship target; magnitude plausibly cosmetic at ship bpp (tiny GQA k/v_proj; cf. uncertainty-is-decision-level). NOTE: the ledger's separate 'MAJOR-M33 FIXED 46102e8' is a DIFFERENT finding (allocator incomplete-fused-group) — correctly fixed, not mislabeled.
 MINOR-M34 FIXED 0ef119c
 MINOR-M35 FIXED d7cbb09
 MINOR-M36 FIXED 6a317f7

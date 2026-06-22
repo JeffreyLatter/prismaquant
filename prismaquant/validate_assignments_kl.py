@@ -325,7 +325,14 @@ def _production_cache_assignment_diagnostics(
     if production_cache is None:
         return None
     if hasattr(production_cache, "assignment_keys"):
-        keys, missing = production_cache.assignment_keys(assignment)
+        # M4: count packed-MoE expert misses too. The default
+        # include_packed_experts=False (a residency-caller convenience) silently
+        # skips uncached packed-expert qnames, which made the packed-expert
+        # fail-fast below a no-op — the generic materialization raise caught it
+        # later with a less actionable message. Counting them here lets the
+        # informative M4 hint fire before any ref-logprob caching.
+        keys, missing = production_cache.assignment_keys(
+            assignment, include_packed_experts=True)
     else:
         keys = []
         missing = []
@@ -996,8 +1003,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         " Missing entries include packed-MoE experts: the "
                         "validated-surrogate frontier cache does not render "
                         "packed experts (open design item M4) — this "
-                        "model/mode combination is unsupported until that "
-                        "lands. PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 falls "
+                        "model/mode combination is unsupported. Use "
+                        "SELECTION_MODE=surrogate, which renders packed experts "
+                        "via --render-scope assignment, to ship a MoE artifact. "
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 falls "
                         "back to RTN for research runs only."
                         if _expert else
                         " Rebuild the cache to cover the assignment, or set "
