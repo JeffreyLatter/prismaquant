@@ -1359,6 +1359,7 @@ def _render_nvfp4_progressive_candidate(
                     weight_scaled,
                     activations_scaled,
                     group_size=16,
+                    damp=enc._resolve_gptq_damp_for_role(qname),
                     global_real_override=joint_global_real,
                     clip_threshold=act_clip_threshold,
                     clip_rescale=act_clip_rescale,

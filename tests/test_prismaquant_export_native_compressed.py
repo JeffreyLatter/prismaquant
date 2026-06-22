@@ -3512,6 +3512,82 @@ class TestActivationAwarePasses(unittest.TestCase):
         self.assertEqual(calls, ["gptq", "scale_sweep"])
 
 
+class TestPerRoleGptqDamp(unittest.TestCase):
+    """Per-role GPTQ damp research lever (PRISMAQUANT_GPTQ_DAMP_ROLES)."""
+
+    def setUp(self):
+        import os
+        import prismaquant.export_native_compressed as m
+        self.m = m
+        self._saved = {
+            k: os.environ.get(k)
+            for k in ("PRISMAQUANT_GPTQ_DAMP_ROLES", "PRISMAQUANT_GPTQ_DAMP")
+        }
+        for k in self._saved:
+            os.environ.pop(k, None)
+        m._GPTQ_DAMP_ROLE_CACHE.clear()
+
+    def tearDown(self):
+        import os
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.m._GPTQ_DAMP_ROLE_CACHE.clear()
+
+    def test_role_of_maps_known_linears(self):
+        role = self.m._gptq_role_of
+        self.assertEqual(role("model.layers.3.mlp.gate_proj"), "gate_up")
+        self.assertEqual(role("model.layers.3.mlp.up_proj"), "gate_up")
+        self.assertEqual(role("model.layers.3.mlp.down_proj"), "down")
+        self.assertEqual(role("model.layers.0.self_attn.o_proj"), "o_proj")
+        self.assertEqual(role("model.layers.0.self_attn.q_proj"), "qkv")
+        self.assertEqual(role("model.layers.0.self_attn.k_proj"), "qkv")
+        self.assertEqual(role("model.layers.0.self_attn.v_proj"), "qkv")
+        self.assertEqual(role("model.embed_tokens"), "other")
+
+    def test_unset_is_exact_noop(self):
+        # No env => per-role resolver == the global fixed default (1.0), so the
+        # production render is preserved bit-for-bit.
+        self.assertEqual(self.m._resolve_gptq_fixed_damp(), 1.0)
+        for q in ("model.layers.1.mlp.gate_proj",
+                  "model.layers.1.mlp.down_proj",
+                  "model.layers.1.self_attn.q_proj"):
+            self.assertEqual(self.m._resolve_gptq_damp_for_role(q), 1.0)
+
+    def test_role_table_applied_with_fallback(self):
+        import os
+        os.environ["PRISMAQUANT_GPTQ_DAMP_ROLES"] = \
+            "qkv=1.0,o_proj=1.0,gate_up=0.3,down=3.0"
+        r = self.m._resolve_gptq_damp_for_role
+        self.assertEqual(r("model.layers.2.mlp.gate_proj"), 0.3)
+        self.assertEqual(r("model.layers.2.mlp.up_proj"), 0.3)
+        self.assertEqual(r("model.layers.2.mlp.down_proj"), 3.0)
+        self.assertEqual(r("model.layers.2.self_attn.o_proj"), 1.0)
+        self.assertEqual(r("model.layers.2.self_attn.q_proj"), 1.0)
+        # 'other' role is unlisted => falls back to the global default (1.0).
+        self.assertEqual(r("model.embed_tokens"), 1.0)
+
+    def test_unlisted_role_falls_back_to_global_override(self):
+        # Listed roles win; unlisted roles take the PRISMAQUANT_GPTQ_DAMP base.
+        import os
+        os.environ["PRISMAQUANT_GPTQ_DAMP"] = "0.5"
+        os.environ["PRISMAQUANT_GPTQ_DAMP_ROLES"] = "gate_up=0.3"
+        r = self.m._resolve_gptq_damp_for_role
+        self.assertEqual(r("model.layers.2.mlp.gate_proj"), 0.3)
+        self.assertEqual(r("model.layers.2.mlp.down_proj"), 0.5)
+        self.assertEqual(r("model.layers.2.self_attn.q_proj"), 0.5)
+
+    def test_malformed_entries_ignored(self):
+        import os
+        os.environ["PRISMAQUANT_GPTQ_DAMP_ROLES"] = \
+            "gate_up=0.3,down=oops,,=1.0,qkv=-2,o_proj=2.0"
+        table = self.m._parse_gptq_damp_roles(
+            os.environ["PRISMAQUANT_GPTQ_DAMP_ROLES"])
+        self.assertEqual(table, {"gate_up": 0.3, "o_proj": 2.0})
+
+
 class TestMtpCacheCoveragePreflight(unittest.TestCase):
     def test_missing_mtp_entries_diagnosed_at_attach_time(self):
         # QC M17: non-BF16 mtp.* with an attached cache must fail with the

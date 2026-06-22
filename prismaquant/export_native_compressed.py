@@ -1624,6 +1624,69 @@ def _resolve_gptq_fixed_damp(default: float = 1.0) -> float:
     return v if v > 0.0 else default
 
 
+# Per-role GPTQ damp override (research lever, default-off). The unified-render
+# V0b/V0c held-out basins are ROLE-structured (attention/o_proj -> 1.0,
+# gate/up -> ~0.3, down_proj -> ~3.0); the optimal damp tracks the activation-
+# conditioning role, NOT downstream sensitivity (measured Spearman(h_trace,
+# opt_damp) ~= 0 on the 31 logged 4B Linears), while the *cost* of one global
+# constant concentrates on the high-h_trace gate/up Linears (Spearman ~= +0.6).
+# This lever lets a served A/B test the per-role table against the fixed-1.0
+# default without reviving the in-sample sweep (docs/unified_render_theory.md
+# §7-8). Spec, comma-separated role=damp pairs:
+#   PRISMAQUANT_GPTQ_DAMP_ROLES="qkv=1.0,o_proj=1.0,gate_up=0.3,down=3.0"
+# Roles: qkv, o_proj, gate_up, down, other. Unmatched roles and unparseable
+# entries fall back to _resolve_gptq_fixed_damp(); unset => exact no-op.
+_GPTQ_DAMP_ROLE_CACHE: "dict[str, dict[str, float]]" = {}
+
+
+def _gptq_role_of(qname: str) -> str:
+    """Map a Linear name to a render role for per-role damp selection."""
+    q = str(qname)
+    if "down_proj" in q:
+        return "down"
+    if "gate_proj" in q or "up_proj" in q:
+        return "gate_up"
+    if "o_proj" in q:
+        return "o_proj"
+    if "q_proj" in q or "k_proj" in q or "v_proj" in q:
+        return "qkv"
+    return "other"
+
+
+def _parse_gptq_damp_roles(spec: str) -> "dict[str, float]":
+    cached = _GPTQ_DAMP_ROLE_CACHE.get(spec)
+    if cached is not None:
+        return cached
+    table: "dict[str, float]" = {}
+    for part in spec.split(","):
+        role, sep, val = part.strip().partition("=")
+        role = role.strip()
+        if not sep or not role:
+            continue
+        try:
+            v = float(val)
+        except ValueError:
+            continue
+        if v > 0.0:
+            table[role] = v
+    _GPTQ_DAMP_ROLE_CACHE[spec] = table
+    return table
+
+
+def _resolve_gptq_damp_for_role(qname: str) -> float:
+    """Per-role GPTQ damp (research lever); falls back to the fixed default.
+
+    Returns ``_resolve_gptq_fixed_damp()`` unchanged when
+    ``PRISMAQUANT_GPTQ_DAMP_ROLES`` is unset or the role is unlisted, so the
+    production default (global fixed 1.0) is preserved bit-for-bit.
+    """
+    base = _resolve_gptq_fixed_damp()
+    spec = os.environ.get("PRISMAQUANT_GPTQ_DAMP_ROLES", "")
+    if not spec:
+        return base
+    return _parse_gptq_damp_roles(spec).get(_gptq_role_of(qname), base)
+
+
 def _gptq_obs_rounding_nvfp4(
     weight: torch.Tensor, activations: torch.Tensor,
     group_size: int = 16, damp: float | None = None,
