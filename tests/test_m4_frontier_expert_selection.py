@@ -348,3 +348,48 @@ def test_module_input_member_name_dense_weight_unchanged():
     plan = _ModulePlan(module=lin, params=[
         _ParamPlan(name="blk.q_proj", attr="weight", spec=spec)])
     assert _module_input_member_name(plan, torch.randn(3, 8)) == "blk.q_proj"
+
+
+def test_pre_hook_call_site_uses_module_input_member(tmp_path, monkeypatch):
+    # Pins the CALL SITE, not just the helper: the replay/KL pre-hook must
+    # derive its act-clip scale via _module_input_member_name (reverting to
+    # the old params[0] logic must fail this test). Weight-quant install is
+    # stubbed out — only the clip member selection is under test.
+    import prismaquant.perturbed_x_cache as pxc
+
+    model = _model().eval()
+    # down_proj FIRST in the assignment dict = the order that broke params[0].
+    assignment = {
+        "mlp.experts.down_proj": "NVFP4",
+        "mlp.experts.gate_up_proj": "NVFP4",
+    }
+    seen: list[str] = []
+    real_clip = pxc._maybe_clip_activations
+
+    def recording_clip(x, scales, member_name):
+        seen.append(member_name)
+        return real_clip(x, scales, member_name)
+
+    monkeypatch.setattr(pxc, "_maybe_clip_activations", recording_clip)
+    monkeypatch.setattr(
+        pxc.PerturbedActivationCache, "_apply_weight_quant",
+        lambda self, plan: None)
+    monkeypatch.setattr(
+        pxc.PerturbedActivationCache, "_try_install_nvfp4_fused_forward",
+        lambda self, plan: False)
+
+    cache = pxc.PerturbedActivationCache(
+        model, assignment, tmp_path, cal_hash="m4-test", profile=None)
+    cache._activation_scales = {
+        "mlp.experts.gate_up_proj": 2.0,
+        "mlp.experts.down_proj": 3.5,
+    }
+    cache.install()
+    try:
+        with torch.no_grad():
+            model(torch.randint(0, 32, (1, 16)))
+    finally:
+        cache.remove() if hasattr(cache, "remove") else None
+    expert_calls = [n for n in seen if n and "experts" in n]
+    assert expert_calls, "pre-hook never reached the experts module clip"
+    assert all(n == "mlp.experts.gate_up_proj" for n in expert_calls), seen
