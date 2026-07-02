@@ -310,7 +310,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ).eval()
     for prm in model.parameters():
         prm.requires_grad_(False)
-    profile = detect_profile_with_warning(model, context="expert_empirical_cost")
+    profile = detect_profile_with_warning(
+        staged, entrypoint="expert-empirical-cost")
 
     if args.dataset:
         from prismaquant.sensitivity_probe import load_calibration
