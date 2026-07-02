@@ -58,9 +58,12 @@ def test_grouped_kl_is_archived_and_blocked():
     assert "archive/grouped_kl_2026-05-28" in script
     # It is no longer advertised as a valid COST_MODE in the catch-all error.
     assert (
-        "COST_MODE must be local, production-render-score, or production-render-staged"
+        "COST_MODE must be local, production-render-score, "
+        "production-render-staged, or aura"
         in script
     )
+    assert "grouped-kl" not in script.split("COST_MODE must be", 1)[1].split(
+        "\n", 1)[0]
     # The grouped-kl measurement invocation and its env knobs are gone.
     assert "prismaquant.grouped_kl_cost" not in script
     assert "GROUPED_KL_NSAMPLES" not in script

@@ -644,6 +644,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "windows are sampled), distinct from --seed-base "
                         "(the probe directions). Vary this to measure "
                         "calibration-resampling variance of the cost.")
+    p.add_argument("--dataset", default=None,
+                   help="Optional calibration source (HF dataset id, .jsonl, "
+                        "or .txt) via sensitivity_probe.load_calibration, so "
+                        "the cost draws from the same corpus as the pipeline "
+                        "probe/render. Default keeps the historical WikiText "
+                        "windowed loader (--calib-split/--calib-seed).")
     p.add_argument("--token-scope", default="all")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
@@ -769,10 +775,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         model.train()
         _log("gradient checkpointing ON (non-reentrant, train-mode armed, "
              "no active dropout/batchnorm)")
-    calib = load_wikitext_calibration_windowed(
-        tok, args.n_calib_samples, args.calib_seqlen, split=args.calib_split,
-        seed=args.calib_seed,
-    ).to(args.device)
+    if args.dataset:
+        from prismaquant.sensitivity_probe import load_calibration
+        calib = load_calibration(
+            tok, args.dataset, args.n_calib_samples, args.calib_seqlen,
+            calib_seed=args.calib_seed,
+        ).to(args.device)
+    else:
+        calib = load_wikitext_calibration_windowed(
+            tok, args.n_calib_samples, args.calib_seqlen,
+            split=args.calib_split, seed=args.calib_seed,
+        ).to(args.device)
 
     cache = None
     if args.production_cache:
@@ -797,7 +810,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     payload["provenance"].update({
         "model": str(args.model),
-        "calib_source": f"wikitext:{args.calib_split}",
+        "calib_source": (
+            str(args.dataset) if args.dataset
+            else f"wikitext:{args.calib_split}"),
         "n_calib_samples": int(args.n_calib_samples),
         "calib_seqlen": int(args.calib_seqlen),
         "calib_seed": int(args.calib_seed),
