@@ -467,10 +467,20 @@ operationally:
   the convention is a per-artifact opt-in behind a served A/B. What the
   audit actually surfaced is a **free post-export knob**: the scale can
   be patched in place (no re-render) and re-measured per artifact —
-  worth ±14–37% served KL on real artifacts. Open follow-up: sweep k in
-  `k·6/amax` per artifact (or derive per-tensor from the activation
-  cache's block-amax distribution) instead of the two extreme points.
-  Metrics/logs: `/home/rob/dq-runs/c1-igs-ab-20260702/`.
+  worth ±14–37% served KL on real artifacts.
+  **Per-artifact sweep (2026-07-02, same day):** k ∈ {0.25, 1, 4, 16, 64,
+  448}·(6/amax), 2 window draws each. 35B frontier: k=448 best (0.0331
+  pooled vs legacy 0.0385; middle points noisy/non-monotone) — the
+  convention patch is the 35B optimum. 27B regen: **legacy k=1 is the
+  optimum and the curve rises on BOTH sides** (k=0.25 → 0.0603, k=4 →
+  0.0366, k=448 → 0.0273 vs k=1 → 0.0199) — the legacy value is locally
+  optimal for this artifact, plausibly because serve-time clipping at
+  exactly the calibration amax matches the act-clipped render
+  optimization (hypothesis, not established). Practical procedure: the
+  sweep costs ~20 min/point per artifact; run it before any re-ship.
+  Remaining open idea: per-TENSOR derivation from the activation cache's
+  block-amax distribution. Metrics/logs:
+  `/home/rob/dq-runs/c1-igs-ab-20260702/`.
   **Re-ship implication (35B only, measured):** the 35B frontier artifact
   recovers −14.1% KL from the in-place ×448 patch + ship gate. Do NOT
   apply to 27B-class dense artifacts without their own A/B.
