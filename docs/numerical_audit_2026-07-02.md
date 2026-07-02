@@ -498,9 +498,21 @@ operationally:
   decision, interacts with C1), and the M6 default-objective change (below).
 
 **Deliberately HELD (need a measured decision, not a silent flip):**
-1. **M6** — the legacy `½·h_trace·output_mse` double-count: changing the
-   default cost objective re-ranks every non-AURA allocation; promotion-ladder
-   A/B required. (AURA, the current default for new work, is unaffected.)
+1. **M6** — the legacy `½·h_trace·output_mse` double-count. **RESOLVED
+   2026-07-02 (same day): promotion-ladder A/B run and the corrected
+   objective PROMOTED to default.** Two-arm pipelines (identical seeds,
+   only `PRODUCTION_RENDER_COST_SCORE_FIELD` differs) at 4.75 bpp; the
+   objectives disagree on 12.3% (4B) / 13.8% (0.6B) of units. Served
+   verdict, 5 window draws + 32k-token PPL per model, BF16 controls 0.0:
+   - Qwen3-4B: pooled KL **−50.8%** (weight_mse wins 31/40 windows,
+     paired t=−2.31; one draw of five inverted — single-draw n=8 KL is
+     confirmed too noisy to decide alone), PPL 21.82→18.52 (**−15.1%**).
+   - Qwen3-0.6B: pooled KL **−58.5%** (35/40, t=−2.39, 5/5 draws), PPL
+     45.20→34.16 (**−24.4%**).
+   Default flipped to `weight_mse` (run-pipeline.sh); `output_mse`
+   reproduces the historical objective. 27B-class target confirmation is
+   ladder debt (damp-1.0 precedent). AURA (COST_MODE=aura) unaffected.
+   Evidence: `/home/rob/dq-runs/m6-cost-ab-20260702/`.
 2. §3.8 RNE tie alignment across RTN paths (byte-changing, measure first).
 3. Registry NVFP4 activation emulation modeling the static global + FP8 snap
    (M18-residual; the C1 fix shrinks the gap this causes, re-evaluate after

@@ -107,7 +107,7 @@ def _logprob_vector(logprobs, *, vocab_size: int) -> torch.Tensor:
     if missing:
         raise RuntimeError(
             f"vLLM returned {vocab_size - missing}/{vocab_size} logprobs; "
-            "full-vocab KL requires logprobs=-1 support"
+            "full-vocab KL requires the engine to return every token logprob"
         )
     return vec
 
@@ -120,10 +120,14 @@ def _measure_logprobs(
 ) -> torch.Tensor:
     from vllm import SamplingParams
 
+    # Explicit vocab-size logprobs, NOT -1: some model/vLLM combinations
+    # (observed: Qwen3-4B on vllm 0.21.1rc1) silently return an EMPTY
+    # logprobs list for logprobs=-1 while an explicit count works. The
+    # _logprob_vector completeness check still guards partial returns.
     params = SamplingParams(
         max_tokens=1,
         temperature=0.0,
-        logprobs=-1,
+        logprobs=int(vocab_size),
         detokenize=False,
     )
     rows = []

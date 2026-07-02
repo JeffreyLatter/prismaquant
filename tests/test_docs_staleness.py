@@ -19,7 +19,7 @@ def test_runtime_flags_doc_covers_live_prismaquant_flags():
     doc = _read("docs/runtime_flags.md")
     missing = sorted(flag for flag in flags if flag not in doc)
     assert not missing
-    assert "| `PRODUCTION_RENDER_COST_SCORE_FIELD` | `output_mse` |" in doc
+    assert "| `PRODUCTION_RENDER_COST_SCORE_FIELD` | `weight_mse` |" in doc
     assert "`joint_mse` is the production JSO scale rule" in doc
     assert "H_DETAIL_DIR" not in doc
 

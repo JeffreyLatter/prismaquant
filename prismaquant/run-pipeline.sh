@@ -133,7 +133,16 @@ PY
 : "${PRODUCTION_RENDER_COST_NSAMPLES:=8}"
 : "${PRODUCTION_RENDER_COST_SEQLEN:=1024}"
 : "${PRODUCTION_RENDER_COST_SEED:=42}"
-: "${PRODUCTION_RENDER_COST_SCORE_FIELD:=output_mse}"
+# weight_mse default since 2026-07-02 (audit M6): the legacy
+# h_trace*output_mse product carries the activation energy E||x||^2 twice
+# (h_trace is the weight-space Fisher trace and already contains it), a
+# per-Linear multiplicative bias ~ in_features*x_rms^2. Served two-arm A/B
+# at matched 4.75 bpp, 5 window draws + 32k-token PPL per model:
+#   Qwen3-4B:   KL -50.8% (31/40 windows), PPL 21.82 -> 18.52 (-15.1%)
+#   Qwen3-0.6B: KL -58.5% (35/40 windows), PPL 45.20 -> 34.16 (-24.4%)
+# output_mse reproduces the historical objective. Target-scale (27B-class)
+# confirmation is ladder debt, mirroring the damp-1.0 promotion.
+: "${PRODUCTION_RENDER_COST_SCORE_FIELD:=weight_mse}"
 : "${PRODUCTION_RENDER_COST_REQUIRE_SCORES:=0}"
 : "${PRODUCTION_RENDER_COST_REQUIRE_OUTPUT:=1}"
 : "${PRODUCTION_RENDER_COST_PROMOTE_FRACTION:=0.30}"
