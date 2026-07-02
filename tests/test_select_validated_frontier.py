@@ -5,7 +5,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import math
+
 from prismaquant.select_validated_frontier import (
+    _frontier_from_rows,
+    _kneedle_convex_decreasing,
+    _log_error_values,
     _saturation_pick,
     leave_one_out_kneedle_diagnostic,
     measured_frontier,
@@ -140,11 +145,20 @@ def test_practical_knee_picks_lowest_bpp_within_tolerance():
 
 
 def test_select_frontier_reports_rank_and_leave_one_out_helpers():
+    # kl_stderr >> any possible LOO shift: the stability tolerance derives
+    # from the knee's measured repeat stderr, so the pick reads stable.
+    # (kl_noise_floor must stay consistent with the eta used to build the
+    # frontier — a floor larger than the KL deltas would collapse the
+    # rebuilt leave-one-out envelopes to a single point.)
     frontier = [
-        {"label": "a", "path": "a.json", "bpp": 4.5, "kl": 0.30, "surrogate_loss": 3.0},
-        {"label": "b", "path": "b.json", "bpp": 5.0, "kl": 0.20, "surrogate_loss": 2.0},
-        {"label": "c", "path": "c.json", "bpp": 5.5, "kl": 0.10, "surrogate_loss": 1.0},
-        {"label": "d", "path": "d.json", "bpp": 6.0, "kl": 0.09, "surrogate_loss": 0.5},
+        {"label": "a", "path": "a.json", "bpp": 4.5, "kl": 0.30,
+         "surrogate_loss": 3.0, "kl_stderr": 10.0},
+        {"label": "b", "path": "b.json", "bpp": 5.0, "kl": 0.20,
+         "surrogate_loss": 2.0, "kl_stderr": 10.0},
+        {"label": "c", "path": "c.json", "bpp": 5.5, "kl": 0.10,
+         "surrogate_loss": 1.0, "kl_stderr": 10.0},
+        {"label": "d", "path": "d.json", "bpp": 6.0, "kl": 0.09,
+         "surrogate_loss": 0.5, "kl_stderr": 10.0},
     ]
 
     assert spearman_rank_correlation(frontier) > 0.9
@@ -152,10 +166,10 @@ def test_select_frontier_reports_rank_and_leave_one_out_helpers():
         frontier,
         frontier[1],
         tolerance_bpp=10.0,
-        kl_noise_floor=10.0,
     )
     assert diagnostic["enabled"]
     assert diagnostic["stable"]
+    assert diagnostic["stability_tolerance_source"] == "repeat_stderr"
 
 
 def test_measured_frontier_extracts_surrogate_from_nested_mse():
@@ -361,6 +375,116 @@ def test_load_assignment_canonicalizes_autoround_dicts(tmp_path):
         "model.layers.0.self_attn.o_proj": "BF16",
         "model.layers.1.self_attn.o_proj": "FP8_SOURCE",
     }
+
+
+def test_log_error_floors_non_positive_at_min_positive():
+    # A measured KL <= 0 is "at the floor of measurement", not a million
+    # times better than the best real point (audit §3.1).
+    values = [0.10, 0.01, 0.0, -1e-9]
+    logs = _log_error_values(values)
+    assert logs[0] == math.log10(0.10)
+    assert logs[1] == math.log10(0.01)
+    # Non-positive values land exactly 0 decades below the smallest real point.
+    assert logs[2] == math.log10(0.01)
+    assert logs[3] == math.log10(0.01)
+
+
+def test_kneedle_zero_kl_point_does_not_flip_knee_to_worst_point():
+    # Audit §3.1 synthetic: a decreasing frontier {4.0/0.10 .. 6.0/0.010} plus
+    # a near-passthrough point measuring KL 0.0. The old 1e-6 floor put that
+    # point 6 fake decades below the curve, compressing the real points into a
+    # flat band and flipping the knee to the lowest-bpp (worst) candidate.
+    base = [
+        {"label": "p40", "bpp": 4.0, "kl": 0.10},
+        {"label": "p45", "bpp": 4.5, "kl": 0.055},
+        {"label": "p50", "bpp": 5.0, "kl": 0.030},
+        {"label": "p55", "bpp": 5.5, "kl": 0.017},
+        {"label": "p60", "bpp": 6.0, "kl": 0.010},
+    ]
+    with_zero = base + [{"label": "p65", "bpp": 6.5, "kl": 0.0}]
+
+    assert base[_kneedle_convex_decreasing(base)]["label"] == "p50"
+    knee = with_zero[_kneedle_convex_decreasing(with_zero)]
+    # The zero point reads as "at the measurement floor" (== 0.010), so the
+    # curve is flat past 6.0 and the knee lands where it reaches the floor —
+    # emphatically not at the curve start.
+    assert knee["label"] != "p40"
+    assert knee["label"] == "p60"
+
+
+def _loo_rows():
+    return [
+        {"label": "a", "path": "a", "bpp": 4.0, "kl": 0.30},
+        {"label": "b", "path": "b", "bpp": 4.5, "kl": 0.12},
+        # Dominated by b; must re-enter the envelope when b is dropped.
+        {"label": "b2", "path": "b2", "bpp": 4.6, "kl": 0.125},
+        {"label": "c", "path": "c", "bpp": 5.0, "kl": 0.10},
+        {"label": "d", "path": "d", "bpp": 5.5, "kl": 0.095},
+        {"label": "e", "path": "e", "bpp": 6.0, "kl": 0.09},
+    ]
+
+
+def test_leave_one_out_rebuilds_envelope_from_all_rows():
+    rows = _loo_rows()
+    frontier = _frontier_from_rows(rows)
+    assert [r["label"] for r in frontier] == ["a", "b", "c", "d", "e"]
+    selected = frontier[_kneedle_convex_decreasing(frontier)]
+    assert selected["label"] == "b"
+
+    rebuilt = leave_one_out_kneedle_diagnostic(
+        frontier, selected, all_rows=rows,
+    )
+    frozen = leave_one_out_kneedle_diagnostic(frontier, selected)
+    rebuilt_picks = {p["dropped_label"]: p["selected_label"] for p in rebuilt["picks"]}
+    frozen_picks = {p["dropped_label"]: p["selected_label"] for p in frozen["picks"]}
+    # Dropping the knee lets the dominated interior point b2 re-enter the
+    # envelope and win the kneedle; the frozen envelope could never see it.
+    assert rebuilt_picks["b"] == "b2"
+    assert frozen_picks["b"] == "c"
+
+
+def test_leave_one_out_stability_tolerance_from_repeat_stderr():
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.0, "kl": 0.400, "kl_stderr": 2e-3},
+        {"label": "b", "path": "b", "bpp": 4.5, "kl": 0.200, "kl_stderr": 2e-3},
+        {"label": "c", "path": "c", "bpp": 5.0, "kl": 0.1000, "kl_stderr": 2e-3},
+        {"label": "d", "path": "d", "bpp": 5.2, "kl": 0.0990, "kl_stderr": 2e-3},
+        {"label": "e", "path": "e", "bpp": 6.0, "kl": 0.0950, "kl_stderr": 2e-3},
+        {"label": "f", "path": "f", "bpp": 6.5, "kl": 0.0930, "kl_stderr": 2e-3},
+    ]
+    frontier = _frontier_from_rows(rows)
+    selected = frontier[_kneedle_convex_decreasing(frontier)]
+    assert selected["label"] == "c"
+
+    diag = leave_one_out_kneedle_diagnostic(
+        frontier, selected, tolerance_bpp=0.6, all_rows=rows,
+    )
+    # LOO shift (c -> d, |dKL| = 0.001) is within the knee's measured repeat
+    # stderr (0.002): indistinguishable from measurement noise -> stable.
+    assert diag["stability_tolerance_source"] == "repeat_stderr"
+    assert diag["kl_stability_tolerance"] == 2e-3
+    assert diag["max_kl_shift"] <= 2e-3
+    assert diag["stable"] is True
+
+    # Without repeat data there is no measured noise scale: strict 0.
+    strict_rows = [
+        {k: v for k, v in row.items() if k != "kl_stderr"} for row in rows
+    ]
+    strict_frontier = _frontier_from_rows(strict_rows)
+    strict_selected = strict_frontier[_kneedle_convex_decreasing(strict_frontier)]
+    strict = leave_one_out_kneedle_diagnostic(
+        strict_frontier, strict_selected, tolerance_bpp=0.6, all_rows=strict_rows,
+    )
+    assert strict["stability_tolerance_source"] == "strict"
+    assert strict["kl_stability_tolerance"] == 0.0
+    assert strict["stable"] is False
+
+    # An explicit noise floor always wins over the stderr.
+    floored = leave_one_out_kneedle_diagnostic(
+        frontier, selected, tolerance_bpp=0.6, kl_noise_floor=0.05, all_rows=rows,
+    )
+    assert floored["stability_tolerance_source"] == "kl_noise_floor"
+    assert floored["kl_stability_tolerance"] == 0.05
 
 
 def test_load_assignment_unwraps_assignment_key(tmp_path):

@@ -11,9 +11,10 @@ import time
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
+
+# vLLM / datasets / transformers are imported lazily inside the functions
+# that need them so the position-KL math stays unit-testable in environments
+# without a serving stack.
 
 
 def _load_wikitext_calibration(
@@ -23,6 +24,8 @@ def _load_wikitext_calibration(
     n_samples: int,
     seqlen: int,
 ) -> tuple[list[list[int]], list[int], int]:
+    from datasets import load_dataset
+
     ds = load_dataset(
         "wikitext",
         "wikitext-2-raw-v1",
@@ -50,7 +53,9 @@ def _load_wikitext_calibration(
     return calib, starts, int(ids.numel())
 
 
-def _load_llm(args, *, max_model_len: int) -> LLM:
+def _load_llm(args, *, max_model_len: int) -> "LLM":
+    from vllm import LLM
+
     kwargs = {
         "model": args.model,
         "trust_remote_code": True,
@@ -102,11 +107,13 @@ def _logprob_vector(logprobs, *, vocab_size: int) -> torch.Tensor:
 
 
 def _measure_logprobs(
-    llm: LLM,
+    llm: "LLM",
     prompts: list[list[int]],
     *,
     vocab_size: int,
 ) -> torch.Tensor:
+    from vllm import SamplingParams
+
     params = SamplingParams(
         max_tokens=1,
         temperature=0.0,
@@ -132,7 +139,7 @@ def _measure_logprobs(
 
 
 def _measure_prompt_topk(
-    llm: LLM,
+    llm: "LLM",
     prompts: list[list[int]],
     *,
     top_k: int,
@@ -145,7 +152,11 @@ def _measure_prompt_topk(
     Python objects per pass), so K bounds the support; the tail is handled
     as a single bucket by the caller. K=1024 covers ~all teacher mass at
     nearly every position and the truncation floor is shared across arms.
+    Positions with fewer than K entries are padded with ``(-1, -inf)``;
+    ``_position_kl`` masks the pads back out.
     """
+    from vllm import SamplingParams
+
     params = SamplingParams(
         max_tokens=1,
         temperature=0.0,
@@ -186,6 +197,8 @@ def _measure_prompt_topk(
 
 
 def _teacher(args) -> int:
+    from transformers import AutoTokenizer
+
     started = time.monotonic()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -216,7 +229,11 @@ def _teacher(args) -> int:
             "score_positions": "all",
             "prompt_top_k": int(args.prompt_top_k),
             "topk_ids": topk_ids,
-            "topk_lps": topk_lps.to(torch.float16),
+            # fp32, matching the student side: fp16 teacher logprobs against
+            # fp32 student logprobs is an asymmetric rounding that biases the
+            # absolute confident-KL (mostly cancels in paired A/Bs, but the
+            # published absolute numbers come through here too).
+            "topk_lps": topk_lps.to(torch.float32),
             "calib_ids": torch.tensor(prompts, dtype=torch.long),
             "starts": starts,
             "model": args.model,
@@ -273,6 +290,48 @@ def _teacher(args) -> int:
     return 0
 
 
+def _position_kl(t_ids_row, t_lps_row, s_ids_row, s_lps_row) -> tuple[float, float]:
+    """KL(teacher || student) over one position's top-K support + tail bucket.
+
+    Returns ``(kl, teacher_top1_prob)``. Pad entries (id ``-1`` / ``-inf``
+    logprob, emitted when a position carries fewer than K entries) are masked
+    out of both the KL sum and the accounted probability mass: an unmasked pad
+    produces ``0 * (-inf) = NaN`` and poisons the whole run's mean, and a pad
+    mapped to the student floor would wrongly consume student mass from the
+    tail bucket. Entries with exactly zero teacher probability contribute
+    zero KL and zero mass, so masking them is exact, not an approximation.
+
+    The student-floor substitution and the 1e-12 tail clamps are the
+    documented relative-compare-only convention (shared across arms); they
+    are deliberately left as-is.
+    """
+    smap = {
+        int(a): float(b)
+        for a, b in zip(s_ids_row.tolist(), s_lps_row.tolist())
+        if int(a) >= 0 and math.isfinite(float(b))
+    }
+    if not smap:
+        raise RuntimeError("student position carries no finite top-K entries")
+    floor = min(smap.values())                        # kl_ab.py convention
+    valid = [
+        (int(t), float(lp))
+        for t, lp in zip(t_ids_row.tolist(), t_lps_row.tolist())
+        if int(t) >= 0 and math.isfinite(float(lp))
+    ]
+    if not valid:
+        raise RuntimeError("teacher position carries no finite top-K entries")
+    tlp = torch.tensor([lp for _t, lp in valid], dtype=torch.float64)
+    q = torch.tensor([smap.get(t, floor) for t, _lp in valid],
+                     dtype=torch.float64)
+    p = tlp.exp()
+    kl = float((p * (tlp - q)).sum())
+    # tail bucket: remaining teacher mass vs remaining student mass
+    pt = max(1.0 - float(p.sum()), 1e-12)
+    qt = max(1.0 - float(q.exp().sum()), 1e-12)
+    kl += pt * (math.log(pt) - math.log(qt))
+    return kl, float(p.max())
+
+
 def _student_all_positions(args, payload) -> int:
     started = time.monotonic()
     prompts = payload["calib_ids"].tolist()
@@ -293,22 +352,11 @@ def _student_all_positions(args, payload) -> int:
     t_top1 = torch.zeros((n, pm1), dtype=torch.float64)
     for i in range(n):
         for j in range(pm1):
-            tid = t_ids[i, j].tolist()
-            tlp = t_lps[i, j].double()
-            smap = {int(a): float(b)
-                    for a, b in zip(s_ids[i, j].tolist(), s_lps[i, j].tolist())
-                    if a >= 0}
-            floor = min(smap.values())                # kl_ab.py convention
-            q = torch.tensor([smap.get(t, floor) for t in tid],
-                             dtype=torch.float64)
-            p = tlp.exp()
-            kl = float((p * (tlp - q)).sum())
-            # tail bucket: remaining teacher mass vs remaining student mass
-            pt = max(1.0 - float(p.sum()), 1e-12)
-            qt = max(1.0 - float(q.exp().sum()), 1e-12)
-            kl += pt * (math.log(pt) - math.log(qt))
+            kl, top1 = _position_kl(
+                t_ids[i, j], t_lps[i, j], s_ids[i, j], s_lps[i, j],
+            )
             kl_pos[i, j] = kl
-            t_top1[i, j] = float(p.max())
+            t_top1[i, j] = top1
     confident = t_top1 > 0.5
     flat = kl_pos.flatten()
     result = {

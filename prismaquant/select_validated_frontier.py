@@ -82,13 +82,26 @@ def _layer_config_from_assignment(assignment: Mapping[str, str]) -> dict:
 
 
 def _log_error_values(values: Sequence[float]) -> list[float]:
+    """Map measured KL values to log10 for the kneedle.
+
+    Non-positive values are floored at the smallest positive measured value
+    itself. A measured KL <= 0 (fp32 round-off on a near-passthrough
+    assignment; realistic on FP8-native sources) is indistinguishable from
+    "at the floor of what this validation run can resolve" — it is *not*
+    evidence the point is orders of magnitude better than every real point.
+    Flooring at min_positive places such points exactly 0 decades below the
+    smallest real point; any lower floor (the old ``min_positive * 1e-6``)
+    fabricates a multi-decade cliff in normalized log-space that compresses
+    the real curve and flips the kneedle to the curve start, i.e. the worst
+    point on the ship path.
+    """
     finite_positive = [
         float(value) for value in values
         if math.isfinite(float(value)) and float(value) > 0.0
     ]
     if not finite_positive:
         return [0.0 for _ in values]
-    floor = max(min(finite_positive) * 1.0e-6, 1.0e-300)
+    floor = min(finite_positive)
     return [math.log10(max(float(value), floor)) for value in values]
 
 
@@ -198,6 +211,26 @@ def measured_rows(
     return rows
 
 
+def _frontier_from_rows(
+    rows: Sequence[Mapping],
+    *,
+    kl_noise_floor: float = 0.0,
+) -> list[dict]:
+    """Return the eta-dominance lower envelope of measured rows.
+
+    ``rows`` must already be sorted by (bpp, kl); a point enters the envelope
+    only when it improves the running best KL by more than the noise floor.
+    """
+    frontier: list[dict] = []
+    best_kl = float("inf")
+    floor = max(float(kl_noise_floor), 0.0)
+    for row in rows:
+        if row["kl"] < best_kl - floor - 1e-12:
+            frontier.append(row)
+            best_kl = row["kl"]
+    return frontier
+
+
 def measured_frontier(
     results: Sequence[Mapping],
     *,
@@ -210,15 +243,10 @@ def measured_frontier(
     lower-or-equal KL. Kneedle should operate on this measured lower envelope,
     not on noisy interior points.
     """
-    rows = measured_rows(results, metric=metric)
-    frontier: list[dict] = []
-    best_kl = float("inf")
-    floor = max(float(kl_noise_floor), 0.0)
-    for row in rows:
-        if row["kl"] < best_kl - floor - 1e-12:
-            frontier.append(row)
-            best_kl = row["kl"]
-    return frontier
+    return _frontier_from_rows(
+        measured_rows(results, metric=metric),
+        kl_noise_floor=kl_noise_floor,
+    )
 
 
 def practical_knee(
@@ -351,25 +379,68 @@ def worst_rank_inversion(rows: Sequence[Mapping]) -> dict | None:
     }
 
 
+def _row_identity(row: Mapping) -> tuple:
+    return (
+        str(row.get("label")),
+        str(row.get("path")),
+        float(row["bpp"]),
+        float(row["kl"]),
+    )
+
+
+def _row_kl_stderr(row: Mapping) -> float | None:
+    stderr = row.get("kl_stderr")
+    try:
+        stderr = float(stderr)
+    except (TypeError, ValueError):
+        return None
+    return stderr if math.isfinite(stderr) and stderr > 0.0 else None
+
+
 def leave_one_out_kneedle_diagnostic(
     frontier: Sequence[Mapping],
     selected: Mapping,
     *,
     tolerance_bpp: float = 0.1,
     kl_noise_floor: float = 0.0,
+    all_rows: Sequence[Mapping] | None = None,
 ) -> dict:
+    """Leave-one-out stability of the kneedle pick.
+
+    For each frontier point, drop it from the *full* measured row set
+    (``all_rows``, when provided), rebuild the eta-dominance envelope, and
+    re-run the kneedle on that rebuilt envelope. Dropping a frontier point can
+    let a previously-dominated interior point re-enter the envelope; freezing
+    the envelope (the old behavior, still the fallback when ``all_rows`` is
+    omitted) understates the instability.
+
+    KL-axis stability tolerance (no arbitrary constants):
+    - an explicit positive ``kl_noise_floor`` wins (source "kl_noise_floor");
+    - otherwise the knee point's measured repeat stderr — ``kl_stderr`` from
+      validate_assignments_kl's ``_kl_repeat_summary`` — is the measured noise
+      scale of the pick: an LOO KL shift within one stderr is
+      indistinguishable from measurement noise (source "repeat_stderr");
+    - with neither, the tolerance is strict 0: single-rep validation carries
+      no measured noise scale, so any shift counts as unstable
+      (source "strict").
+    ``stability_tolerance_source`` in the output labels which one applied.
+    """
     if len(frontier) < 4:
         return {"enabled": False, "reason": "too_few_frontier_points"}
+    rows = list(all_rows) if all_rows else [dict(row) for row in frontier]
+    rows.sort(key=lambda r: (float(r["bpp"]), float(r["kl"]), str(r.get("label"))))
     selected_bpp = float(selected["bpp"])
     selected_kl = float(selected["kl"])
     picks: list[dict] = []
-    for idx in range(len(frontier)):
-        subset = [dict(row) for j, row in enumerate(frontier) if j != idx]
+    for dropped in frontier:
+        dropped_key = _row_identity(dropped)
+        subset_rows = [row for row in rows if _row_identity(row) != dropped_key]
+        subset = _frontier_from_rows(subset_rows, kl_noise_floor=kl_noise_floor)
         if len(subset) < 3:
             continue
         chosen = subset[_kneedle_convex_decreasing(subset)]
         picks.append({
-            "dropped_label": frontier[idx]["label"],
+            "dropped_label": dropped["label"],
             "selected_label": chosen["label"],
             "bpp": float(chosen["bpp"]),
             "kl": float(chosen["kl"]),
@@ -378,9 +449,20 @@ def leave_one_out_kneedle_diagnostic(
         return {"enabled": False, "reason": "no_leave_one_out_picks"}
     max_bpp_shift = max(abs(row["bpp"] - selected_bpp) for row in picks)
     max_kl_shift = max(abs(row["kl"] - selected_kl) for row in picks)
+    if float(kl_noise_floor) > 0.0:
+        kl_tolerance = float(kl_noise_floor)
+        tolerance_source = "kl_noise_floor"
+    else:
+        stderr = _row_kl_stderr(selected)
+        if stderr is not None:
+            kl_tolerance = stderr
+            tolerance_source = "repeat_stderr"
+        else:
+            kl_tolerance = 0.0
+            tolerance_source = "strict"
     stable = (
         max_bpp_shift <= max(float(tolerance_bpp), 0.0) + 1e-12
-        and max_kl_shift <= max(float(kl_noise_floor), 0.0) + 1e-12
+        and max_kl_shift <= kl_tolerance + 1e-12
     )
     return {
         "enabled": True,
@@ -389,6 +471,8 @@ def leave_one_out_kneedle_diagnostic(
         "max_kl_shift": float(max_kl_shift),
         "tolerance_bpp": float(tolerance_bpp),
         "kl_noise_floor": float(kl_noise_floor),
+        "kl_stability_tolerance": float(kl_tolerance),
+        "stability_tolerance_source": tolerance_source,
         "picks": picks,
     }
 
@@ -405,11 +489,8 @@ def select_frontier_point(
     unstable_policy: str = "keep-kneedle",
     sat_z: float = 2.0,
 ) -> tuple[dict, list[dict]]:
-    frontier = measured_frontier(
-        results,
-        metric=metric,
-        kl_noise_floor=kl_noise_floor,
-    )
+    rows = measured_rows(results, metric=metric)
+    frontier = _frontier_from_rows(rows, kl_noise_floor=kl_noise_floor)
     if not frontier:
         raise ValueError("no finite measured KL/bpp points found")
     if mode == "best-kl":
@@ -436,6 +517,7 @@ def select_frontier_point(
             frontier[idx],
             tolerance_bpp=knee_tolerance_bpp,
             kl_noise_floor=kl_noise_floor,
+            all_rows=rows,
         )
         if diagnostic.get("enabled") and not diagnostic.get("stable", True):
             if unstable_policy == "best-kl":
@@ -528,17 +610,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         kl_noise_floor=args.kl_noise_floor,
     )
     knee_cmp = kneedle_comparison(frontier)
+    diagnostic_rows = measured_rows(results, metric=args.metric)
     loo = (
         leave_one_out_kneedle_diagnostic(
             frontier,
             selected,
             tolerance_bpp=args.knee_tolerance_bpp,
             kl_noise_floor=args.kl_noise_floor,
+            all_rows=diagnostic_rows,
         )
         if args.mode == "kneedle"
         else {"enabled": False, "reason": "mode_not_kneedle"}
     )
-    diagnostic_rows = measured_rows(results, metric=args.metric)
     rank_corr = spearman_rank_correlation(diagnostic_rows)
     worst_inversion = worst_rank_inversion(diagnostic_rows)
     assignment = _load_assignment(selected["path"])

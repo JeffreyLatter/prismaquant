@@ -2306,6 +2306,80 @@ def _split_lanes(tensor: torch.Tensor, base_batch: int, lane_count: int):
     return tensor.split(base_batch, dim=0)
 
 
+def _replay_lane_kl_totals(
+    stacked: torch.Tensor,
+    ref_log_probs,
+    *,
+    full_sequence_kl: bool,
+) -> torch.Tensor:
+    """Per-lane KL totals for a lane-replay batch of student logits.
+
+    ``stacked`` is ``[lanes, N, L, V]`` student logits, N = total calibration
+    rows in replay order. ``ref_log_probs`` is the teacher list, possibly
+    regrouped into ``[mb, L, V]`` microbatches by the
+    ``calib_microbatch_size > 1`` regrouping at the top of
+    ``measure_lane_batched_kl_deltas``. That regrouping concatenates refs on
+    dim 0 in calibration order, so consuming exactly each teacher entry's row
+    count of student rows at a running offset restores the exact per-row
+    pairing for any microbatch size — the same regrouping-aware pairing the
+    override-set replay branch uses via a single ``torch.cat`` (kept per-entry
+    here so full-sequence teachers never materialize ``[N, L, V]`` at once).
+    Row-count mismatches raise instead of silently broadcasting teacher group
+    i against student row i and mis-normalizing by N (audit M10).
+
+    Returns fp32 ``[lanes]``: the sum over calibration rows of the
+    mean-over-position KL(teacher || student). The caller divides by the total
+    calibration row count.
+    """
+    lane_count = int(stacked.size(0))
+    n_rows = int(stacked.size(1))
+    kl_totals = torch.zeros(
+        lane_count, device=stacked.device, dtype=torch.float32,
+    )
+    row = 0
+    for entry_idx, teacher in enumerate(ref_log_probs):
+        if not isinstance(teacher, torch.Tensor):
+            raise RuntimeError(
+                "lane-replay KL requires tensor ref_log_probs entries; entry "
+                f"{entry_idx} is {type(teacher).__name__}"
+            )
+        teacher = teacher.to(stacked.device).float()
+        if teacher.dim() == 2:
+            # A single row's distribution stored without the batch dim.
+            teacher = teacher.unsqueeze(0)
+        if not full_sequence_kl:
+            teacher = teacher[:, -1:, :]
+        rows = int(teacher.size(0))
+        if row + rows > n_rows:
+            raise RuntimeError(
+                "lane-replay KL teacher/student row mismatch: teacher entry "
+                f"{entry_idx} carries {rows} rows starting at student row "
+                f"{row}, but the replay produced only {n_rows} student rows "
+                "per lane; the ref_log_probs microbatch regrouping does not "
+                "match the replay cache's calibration rows"
+            )
+        student_log_probs = F.log_softmax(
+            stacked[:, row:row + rows].float(), dim=-1,
+        )
+        teacher_probs = teacher.exp().unsqueeze(0)
+        kl_per_pos = (
+            teacher_probs * (teacher.unsqueeze(0) - student_log_probs)
+        ).sum(dim=-1)
+        # kl_per_pos: [lanes, rows, L] -> mean over positions per row, then
+        # sum the per-row (per calibration sample) KLs into the totals.
+        kl_totals += kl_per_pos.mean(
+            dim=tuple(range(2, kl_per_pos.dim())),
+        ).sum(dim=1)
+        row += rows
+    if row != n_rows:
+        raise RuntimeError(
+            f"lane-replay KL consumed {row} teacher rows but the replay "
+            f"produced {n_rows} student rows per lane; ref_log_probs does "
+            "not cover the calibration set"
+        )
+    return kl_totals
+
+
 def _coord_replay_target_keys(
     replay_cache: LayerHiddenStateCache,
     target_names: set[str],
@@ -3618,22 +3692,17 @@ def measure_lane_batched_kl_deltas(
                     # measured.extend), instead of ``lanes × cal_samples``
                     # times via .item().  Profiling on Qwen3-0.6B showed this
                     # Python-side sync was the dominant cost.
+                    # _replay_lane_kl_totals pairs each (possibly
+                    # microbatch-regrouped) teacher entry against exactly its
+                    # own student rows and hard-fails on row mismatches
+                    # (audit M10: teacher group i used to broadcast against
+                    # student row i when calib_microbatch_size > 1).
                     stacked = torch.stack(chunks, dim=0)
-                    for batch_index, teacher in enumerate(ref_log_probs):
-                        teacher = teacher.to(stacked.device).float()
-                        if teacher.dim() >= 3 and not full_sequence_kl:
-                            teacher = teacher[:, -1:, :]
-                        student_log_probs = torch.nn.functional.log_softmax(
-                            stacked[:, batch_index:batch_index + 1].float(),
-                            dim=-1,
-                        )
-                        teacher_probs = teacher.exp()
-                        kl_per_pos = (
-                            teacher_probs * (teacher - student_log_probs)
-                        ).sum(dim=-1)
-                        kl_totals += kl_per_pos.mean(
-                            dim=tuple(range(1, kl_per_pos.dim()))
-                        )
+                    kl_totals += _replay_lane_kl_totals(
+                        stacked,
+                        ref_log_probs,
+                        full_sequence_kl=full_sequence_kl,
+                    )
                 missing_targets = set(target_hooks.missing if target_hooks else [])
                 if missing_targets:
                     raise RuntimeError(
@@ -5512,6 +5581,28 @@ def measure_assignment_kl(
                         )
                         teacher = ref_log_probs[i] if full_seq else ref_log_probs[i][:, -1:, :]
                         teacher = _move_tensor_tree_to_device(teacher, device)
+                        # Hard gate: kl_divergence broadcasts, so a teacher
+                        # built at a different KL scope than the student (e.g.
+                        # a last-token [1,1,V] reference meeting a
+                        # full-sequence [1,T,V] student because
+                        # PRISMAQUANT_FULL_SEQUENCE_KL resolved the scope)
+                        # would silently produce mean_t KL(p_last || q_t) —
+                        # not a KL of anything (audit M7).
+                        if (
+                            isinstance(teacher, torch.Tensor)
+                            and tuple(teacher.shape) != tuple(logits.shape)
+                        ):
+                            raise RuntimeError(
+                                "assignment-KL teacher/student shape mismatch: "
+                                f"teacher {tuple(teacher.shape)} vs student "
+                                f"{tuple(logits.shape)} at sample {i} "
+                                f"(kl_scope={effective_kl_scope!r}). "
+                                "ref_log_probs must be built at the same KL "
+                                "scope the measurement resolves to; pass "
+                                "kl_scope explicitly at the call site that "
+                                "built the references instead of relying on "
+                                "PRISMAQUANT_FULL_SEQUENCE_KL."
+                            )
                         values.append(float(kl_divergence(logits, teacher).item()))
             finally:
                 if installed_here:

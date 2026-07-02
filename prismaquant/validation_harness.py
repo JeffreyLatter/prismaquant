@@ -383,29 +383,36 @@ def _wikitext_ppl(
     if seq_len < 2:
         raise ValueError("WikiText tokenization produced fewer than two tokens")
 
-    max_stride = 2048
-    raw_stride = os.environ.get("PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE")
-    if raw_stride:
+    # Chunked (non-overlapping-window) PPL: the token stream is split into
+    # disjoint windows and each window is scored independently, so the first
+    # token of every window sees no context from the previous window. This is
+    # deliberately NOT strided/sliding-window evaluation. The env knob keeps
+    # its historical name for compatibility but sets the window (chunk) size.
+    max_window = 2048
+    raw_window = os.environ.get("PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE")
+    if raw_window:
         try:
-            max_stride = max(2, int(raw_stride))
+            max_window = max(2, int(raw_window))
         except ValueError as exc:
             raise ValueError(
                 "PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE must be an integer"
             ) from exc
-    stride = min(_model_context_length(model, tokenizer), max_stride, seq_len)
-    stride = max(int(stride), 2)
+    window_len = min(_model_context_length(model, tokenizer), max_window, seq_len)
+    window_len = max(int(window_len), 2)
     nll_sum = 0.0
     token_count = 0
-    prev_end = 0
-    starts = range(0, seq_len, stride)
+    starts = range(0, seq_len, window_len)
     for begin in _progress_iter(starts, progress, "wikitext-ppl"):
-        end = min(begin + stride, seq_len)
-        trg_len = end - prev_end
+        end = min(begin + window_len, seq_len)
         window = input_ids[:, begin:end].to(device)
         if window.size(1) < 2:
-            break
+            break  # a 1-token remainder window has no prediction targets
         labels = window.clone()
-        labels[:, :-trg_len] = -100
+        # The HF causal-LM loss is the mean NLL over the window's shifted
+        # targets — (L - 1) of them, the first token has no prediction.
+        # Weight each window by that true target count so the remainder
+        # window is not overweighted by L / (L - 1).
+        n_targets = int(window.size(1)) - 1
 
         def _loss_forward(input_ids, target_labels):
             return model(input_ids, labels=target_labels).loss
@@ -419,9 +426,8 @@ def _wikitext_ppl(
             window,
             labels,
         )
-        nll_sum += float(loss.detach().float().item()) * float(trg_len)
-        token_count += int(trg_len)
-        prev_end = end
+        nll_sum += float(loss.detach().float().item()) * float(n_targets)
+        token_count += int(n_targets)
         del loss, labels, window
         if getattr(device, "type", None) == "cuda":
             import gc
@@ -703,6 +709,13 @@ def _end_kl(
             calib_ids,
             ref_log_probs,
             work_root=work_root,
+            # The reference above is built at the last token only
+            # (logits[:, -1:, :]); the KL scope MUST match it. Left
+            # unspecified, the scope resolves from PRISMAQUANT_FULL_SEQUENCE_KL
+            # and a [1,1,V] teacher silently broadcasts against [1,T,V]
+            # student log-probs (audit M7). measure_assignment_kl also
+            # hard-fails on any teacher/student shape mismatch now.
+            kl_scope="last_token",
         )
     )
 
