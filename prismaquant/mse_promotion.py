@@ -35,6 +35,7 @@ class PromotionCandidate:
     bpp_delta: float
     score: float
     missing_cost_count: int = 0
+    non_finite_count: int = 0
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -50,7 +51,11 @@ class PromotionCandidate:
             "predicted_dloss_removed": float(self.predicted_dloss_removed),
             "bits_delta": float(self.bits_delta),
             "bpp_delta": float(self.bpp_delta),
-            "score": float(self.score),
+            # +inf is a valid ordering score (a blown-up measurement ranks
+            # first) but is not valid JSON; emit null + the explicit flag.
+            "score": float(self.score) if math.isfinite(self.score) else None,
+            "non_finite": bool(self.non_finite_count > 0),
+            "non_finite_count": int(self.non_finite_count),
             "missing_cost_count": int(self.missing_cost_count),
         }
 
@@ -224,6 +229,7 @@ def build_promotion_candidates(
         predicted_dloss = 0.0
         bits_delta = 0.0
         missing_cost = 0
+        non_finite_counts: Counter[str] = Counter()
         format_counts: Counter[str] = Counter()
         category_counts: Counter[str] = Counter()
         layer_counts: Counter[str] = Counter()
@@ -236,24 +242,38 @@ def build_promotion_candidates(
             if entry is None:
                 missing_cost += 1
             else:
-                output_mse += _finite_float(entry.get("output_mse"))
+                target_entry = _cost_entry(costs, member, target_format)
+                output_mse += _promotion_gain(
+                    entry, target_entry, "output_mse", non_finite_counts,
+                )
                 weight_mse_param += (
-                    _finite_float(entry.get("weight_mse"))
+                    _promotion_gain(
+                        entry, target_entry, "weight_mse", non_finite_counts,
+                    )
                     * float(_n_params(stats.get(member, {})))
                 )
-                predicted_dloss += _finite_float(entry.get("predicted_dloss"))
+                predicted_dloss += _promotion_gain(
+                    entry, target_entry, "predicted_dloss", non_finite_counts,
+                )
             bits_delta += _bits_delta(stats[member], current_fmt, target_format)
         if bits_delta <= 0.0:
             continue
         bpp_delta = bits_delta / max(float(params), 1.0)
-        score = _candidate_score(
-            metric,
-            output_mse=output_mse,
-            predicted_dloss=predicted_dloss,
-            weight_mse_param=weight_mse_param,
-            bits_delta=bits_delta,
-        )
-        if not math.isfinite(score):
+        if non_finite_counts.get(_METRIC_NUMERATOR_FIELD.get(metric, ""), 0) > 0:
+            # A non-finite measured cost means the measurement blew up on
+            # this group: that is the CATASTROPHIC end of the ranking, not
+            # the free end. Coercing it to 0.0 sorted it dead last
+            # (priority inversion, audit 2026-07-02 §3.4).
+            score = float("inf")
+        else:
+            score = _candidate_score(
+                metric,
+                output_mse=output_mse,
+                predicted_dloss=predicted_dloss,
+                weight_mse_param=weight_mse_param,
+                bits_delta=bits_delta,
+            )
+        if math.isnan(score):
             continue
         candidates.append(
             PromotionCandidate(
@@ -270,6 +290,7 @@ def build_promotion_candidates(
                 bpp_delta=float(bpp_delta),
                 score=float(score),
                 missing_cost_count=int(missing_cost),
+                non_finite_count=int(sum(non_finite_counts.values())),
             )
         )
     candidates.sort(
@@ -382,6 +403,65 @@ def _fused_sibling_group(profile, name: str) -> str | None:
     except Exception:
         return None
     return str(group) if group else None
+
+
+# Which accumulated field feeds each metric's numerator (a non-finite
+# measured value in that field makes the group's score +inf = rank first).
+_METRIC_NUMERATOR_FIELD = {
+    "output_mse_per_bit": "output_mse",
+    "output_mse": "output_mse",
+    "predicted_dloss_per_bit": "predicted_dloss",
+    "weight_mse_per_bit": "weight_mse",
+}
+
+
+def _measured_value(value: object) -> tuple[float, bool, bool]:
+    """Return ``(finite_value, present, non_finite)`` for a measured field.
+
+    ``present`` is False when the field is absent or unparseable. A present
+    but non-finite value (inf/NaN) is a blown-up measurement: callers must
+    rank the group as maximal priority, never coerce it to 0.0.
+    """
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0, False, False
+    if math.isfinite(out):
+        return out, True, False
+    return 0.0, True, True
+
+
+def _promotion_gain(
+    entry: Mapping,
+    target_entry: Mapping | None,
+    field: str,
+    non_finite_counts: Counter,
+) -> float:
+    """Measured error removed by promoting one member for one cost field.
+
+    When the target format's cost entry was measured, the benefit is the
+    ``current - target`` delta, clamped >= 0 (scoring the full current-format
+    error overstates the benefit of lossy targets and can invert the
+    ranking — audit 2026-07-02 §3.4b). Only when the target entry (or the
+    field within it) is genuinely absent — e.g. BF16 rows are typically not
+    in the cost payload because BF16 is lossless passthrough — do we fall
+    back to the historical current-only score. Non-finite current values are
+    flagged (rank-first) and excluded from the finite sum; a non-finite
+    target measurement is treated as absent.
+    """
+    current, present, non_finite = _measured_value(entry.get(field))
+    if non_finite:
+        non_finite_counts[field] += 1
+        return 0.0
+    if not present:
+        return 0.0
+    if target_entry is not None:
+        target, t_present, t_non_finite = _measured_value(
+            target_entry.get(field)
+        )
+        if t_present and not t_non_finite:
+            return max(current - target, 0.0)
+    return current
 
 
 def _candidate_score(

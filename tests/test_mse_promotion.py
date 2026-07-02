@@ -439,3 +439,126 @@ def test_mse_promotion_skips_packed_expert_stats():
     assert [candidate.key for candidate in payload["candidates"]] == [
         "model.layers.0.mlp.shared_expert.down_proj"
     ]
+
+
+# --------------------------------------------------------------------------
+# Audit 2026-07-02 §3.4: (a) non-finite measured MSE is CATASTROPHIC and must
+# rank first (coercing to 0.0 sorted it dead last); (b) for non-BF16 targets
+# the score is the (current - target) delta, not the full current-format MSE.
+# --------------------------------------------------------------------------
+def test_non_finite_measured_mse_ranks_first_under_bounded_budget():
+    import json
+    import math
+
+    from prismaquant.mse_promotion import _bits_delta
+
+    assignment = {
+        "model.layers.0.self_attn.q_proj": "NVFP4",
+        "model.layers.1.self_attn.q_proj": "NVFP4",
+    }
+    stats = {name: _stats((64, 64)) for name in assignment}
+    costs = {
+        # Measurement blew up: this is the group that must be rescued first.
+        "model.layers.0.self_attn.q_proj": {
+            "NVFP4": {"output_mse": float("inf"), "weight_mse": 0.01}
+        },
+        # A large-but-finite group that the old 0.0-coercion sorted ABOVE
+        # the exploded one.
+        "model.layers.1.self_attn.q_proj": {
+            "NVFP4": {"output_mse": 123.0, "weight_mse": 0.01}
+        },
+    }
+    params = sum(entry["n_params"] for entry in stats.values())
+    one_group_bpp = _bits_delta(_stats((64, 64)), "NVFP4", "BF16") / params
+
+    result = build_mse_promotion_assignment(
+        assignment,
+        costs=costs,
+        stats=stats,
+        categories=["self_attn"],
+        target_format="BF16",
+        max_bpp_delta=one_group_bpp * 1.5,  # budget fits exactly one group
+        group_by="layer_category",
+    )
+    promoted = result["assignment"]
+    report = result["report"]
+    assert promoted["model.layers.0.self_attn.q_proj"] == "BF16"
+    assert promoted["model.layers.1.self_attn.q_proj"] == "NVFP4"
+
+    # JSON output is sanitized: no inf leaks, the flag is explicit.
+    top = report["top_candidates"][0]
+    assert top["key"] == "self_attn.layer_0"
+    assert top["score"] is None
+    assert top["non_finite"] is True
+    assert report["top_candidates"][1]["non_finite"] is False
+    payload = json.dumps(report)
+    assert "Infinity" not in payload
+    assert math.isfinite(report["selected_output_mse_removed"])
+
+
+def test_non_bf16_target_scores_current_minus_target_delta():
+    # Audit case: A current 1.0 / target 0.9 (true gain 0.1) vs
+    # B current 0.8 / target 0.1 (true gain 0.7). The old current-only
+    # score ranked A first.
+    assignment = {
+        "model.layers.0.self_attn.q_proj": "NVFP4",
+        "model.layers.1.self_attn.q_proj": "NVFP4",
+    }
+    stats = {name: _stats((64, 64)) for name in assignment}
+    costs = {
+        "model.layers.0.self_attn.q_proj": {
+            "NVFP4": {"output_mse": 1.0},
+            "FP8_E4M3": {"output_mse": 0.9},
+        },
+        "model.layers.1.self_attn.q_proj": {
+            "NVFP4": {"output_mse": 0.8},
+            "FP8_E4M3": {"output_mse": 0.1},
+        },
+    }
+    report = build_promotion_candidate_report(
+        assignment,
+        costs=costs,
+        stats=stats,
+        categories=["self_attn"],
+        target_format="FP8_E4M3",
+        group_by="layer_category",
+    )
+    candidates = report["candidates"]
+    assert [c.key for c in candidates] == [
+        "self_attn.layer_1", "self_attn.layer_0",
+    ]
+    assert candidates[0].output_mse_removed == pytest.approx(0.7)
+    assert candidates[1].output_mse_removed == pytest.approx(0.1)
+    # Target measured worse than current: gain clamps at 0, never negative.
+    costs["model.layers.0.self_attn.q_proj"]["FP8_E4M3"]["output_mse"] = 5.0
+    report = build_promotion_candidate_report(
+        assignment,
+        costs=costs,
+        stats=stats,
+        categories=["self_attn"],
+        target_format="FP8_E4M3",
+        group_by="layer_category",
+    )
+    by_key = {c.key: c for c in report["candidates"]}
+    assert by_key["self_attn.layer_0"].output_mse_removed == 0.0
+
+
+def test_bf16_target_without_target_entry_keeps_current_only_score():
+    # BF16 rows are typically absent from the cost payload (lossless
+    # passthrough): the historical current-only score must be preserved.
+    assignment = {"model.layers.0.self_attn.q_proj": "NVFP4"}
+    stats = {name: _stats((64, 64)) for name in assignment}
+    costs = {
+        "model.layers.0.self_attn.q_proj": {"NVFP4": {"output_mse": 0.4}},
+    }
+    report = build_promotion_candidate_report(
+        assignment,
+        costs=costs,
+        stats=stats,
+        categories=["self_attn"],
+        target_format="BF16",
+        group_by="layer_category",
+    )
+    (candidate,) = report["candidates"]
+    assert candidate.output_mse_removed == pytest.approx(0.4)
+    assert candidate.non_finite_count == 0

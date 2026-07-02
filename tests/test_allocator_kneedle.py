@@ -240,3 +240,75 @@ def test_refine_knee_golden_noop_when_disabled():
         {"enabled": False}, curve,
     )
     assert refined is None and extra == []
+
+
+# --------------------------------------------------------------------------
+# Non-positive dloss values sit AT the measurement floor (audit 2026-07-02
+# §3.1): flooring them decades below the smallest positive point injected a
+# fake cliff that dragged the knee to the curve start.
+# --------------------------------------------------------------------------
+def _piecewise_log_linear_curve(knee: float = 6.0):
+    # log10(dloss): slope -2/bit down to the knee, then -0.2/bit after it.
+    xs = [4.0 + 0.5 * i for i in range(9)]  # 4.0 .. 8.0
+    ys = []
+    for b in xs:
+        if b <= knee:
+            lg = -2.0 * (b - 4.0)
+        else:
+            lg = -2.0 * (knee - 4.0) - 0.2 * (b - knee)
+        ys.append(10.0 ** lg)
+    return xs, ys
+
+
+def test_log_error_values_floor_is_min_positive():
+    from prismaquant.allocator import _log_error_values
+
+    logs = _log_error_values([1.0, 0.1, 0.0])
+    # dloss == 0.0 maps to the smallest positive point (0 decades below it),
+    # not 6 decades below it.
+    assert logs[2] == pytest.approx(logs[1])
+    assert logs[0] == pytest.approx(0.0)
+    assert logs[1] == pytest.approx(-1.0)
+
+
+def test_kneedle_zero_dloss_point_does_not_move_the_knee():
+    xs, ys = _piecewise_log_linear_curve(knee=6.0)
+    assert xs[kneedle(xs, ys)] == pytest.approx(6.0)
+
+    # An all-passthrough rung measuring dloss exactly 0.0 (realistic on
+    # FP8-native sources) must read as "at the measurement floor", not as a
+    # 6-decade cliff that drags the knee off the real curve.
+    xs_z, ys_z = xs + [8.5], ys + [0.0]
+    assert xs_z[kneedle(xs_z, ys_z)] == pytest.approx(6.0)
+
+
+def test_refine_knee_golden_survives_zero_dloss_bracket_endpoint():
+    # True knee at 7.0; beyond it the measured dloss is exactly 0.0, so the
+    # refine bracket's hi endpoint is a zero. The old max(dloss, 1e-300)
+    # floor made the bracket chord ~300 decades deep and dragged the refined
+    # knee to the lo bracket edge.
+    def dloss(t):
+        if t > 7.0:
+            return 0.0
+        return 10.0 ** (-2.0 * (t - 4.0))
+
+    grid = [4.0 + 0.5 * i for i in range(9)]  # 4.0 .. 8.0
+    curve = [
+        {"target_bits": t, "achieved_bits": t, "predicted_dloss": dloss(t),
+         "feasible": True}
+        for t in grid
+    ]
+    summary = _pareto_knee_summary(curve)
+    assert summary["enabled"]
+    assert summary["log_error"]["target_bits"] == pytest.approx(7.0)
+
+    def solve_fn(target):
+        return ({"x": "NVFP4"}, float(target), dloss(float(target)), None)
+
+    refined, _extra = refine_knee_golden(solve_fn, summary, curve, tol=0.03)
+    assert refined is not None
+    lo, hi = refined["bracket_target_bits"]
+    assert (lo, hi) == (6.5, 7.5)
+    # The dip below the (6.5, 7.5) chord in floored-log space peaks exactly
+    # at 7.0; the golden section must find it despite the zero endpoint.
+    assert refined["target_bits"] == pytest.approx(7.0, abs=0.1)

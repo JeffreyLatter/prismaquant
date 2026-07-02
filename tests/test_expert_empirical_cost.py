@@ -113,3 +113,95 @@ def test_merge_and_backfill():
     assert merged["costs"]["lin"]["NVFP4"]["predicted_dloss"] == 0.5
     assert merged["costs"]["mtp.fc"]["NVFP4"]["predicted_dloss"] == 9.0
     assert merged["stats"]["mtp.fc"]["h_trace"] == 2.0
+
+
+# --------------------------------------------------------------------------
+# Audit 2026-07-02 §3.5: NV formats derive one per-TENSOR global scale from
+# the slice they are given, so chunk-batched expert quantization shared one
+# global across the chunk and made the measured unit KL depend on the
+# --expert-chunk knob. Export ships per-expert globals; the measurement must
+# quantize per expert slice.
+# --------------------------------------------------------------------------
+def _spread_expert_model(num_experts: int = 16):
+    """TinyCausal with ``num_experts`` experts and a 4x per-expert magnitude
+    spread (a chunk-shared NVFP4 global visibly distorts the small ones)."""
+    from test_packed_expert_cross_domain_gate import (
+        TinyPackedExperts,
+        TinyRouter,
+    )
+
+    model = TinyCausal().eval()
+    model.inner.mlp.gate = TinyRouter(hidden_size=16, num_experts=num_experts)
+    model.inner.mlp.experts = TinyPackedExperts(num_experts=num_experts)
+    with torch.no_grad():
+        for e in range(num_experts):
+            scale = 1.0 + 3.0 * e / (num_experts - 1)
+            model.inner.mlp.experts.gate_up_proj[e] *= scale
+            model.inner.mlp.experts.down_proj[e] *= scale
+    return model
+
+
+def test_nvfp4_unit_kl_is_expert_chunk_invariant():
+    from prismaquant import format_registry as fr
+    from prismaquant.expert_empirical_cost import (
+        _baseline_logprobs,
+        _unit_kl,
+    )
+
+    torch.manual_seed(3)
+    model = _spread_expert_model(16)
+    mod = model.inner.mlp.experts
+    pnames = ["gate_up_proj", "down_proj"]
+
+    # Premise: on this tensor the chunk-shared global genuinely differs from
+    # per-expert globals (otherwise the test could not discriminate).
+    spec = fr.get_format("NVFP4")
+    w = mod.gate_up_proj.detach().float()
+    per_expert = torch.stack(
+        [spec.quantize_dequantize(w[e].clone()) for e in range(16)])
+    shared = spec.quantize_dequantize(w.clone())
+    assert not torch.equal(per_expert, shared)
+
+    calib = torch.randint(0, 32, (2, 24))
+    baseline = _baseline_logprobs(model, calib)
+    kls = {
+        chunk: _unit_kl(model, calib, baseline, mod, pnames, "NVFP4",
+                        expert_chunk=chunk)
+        for chunk in (1, 4, 16)
+    }
+    # Per-expert quantization: the chunk knob cannot change the measurement.
+    assert kls[4] == kls[1]
+    assert kls[16] == kls[1]
+    assert kls[1] > 0.0
+
+
+def test_fp8_weight_qdq_is_chunk_invariant_on_packed_tensors():
+    """FP8_E4M3 weight qdq reshapes to (-1, in) with an independent scale per
+    output row, so chunk-batching experts is exact — the verified basis for
+    keeping the batched path for non-NV formats in ``_unit_kl``."""
+    from prismaquant import format_registry as fr
+    from prismaquant.expert_empirical_cost import (
+        _baseline_logprobs,
+        _unit_kl,
+    )
+
+    torch.manual_seed(4)
+    spec = fr.get_format("FP8_E4M3")
+    w = torch.randn(16, 8, 16)
+    w *= torch.linspace(1.0, 4.0, 16).view(-1, 1, 1)
+    full = spec.quantize_dequantize(w.clone())
+    per = torch.stack(
+        [spec.quantize_dequantize(w[e].clone()) for e in range(16)])
+    assert torch.equal(full, per)
+
+    model = _spread_expert_model(16)
+    mod = model.inner.mlp.experts
+    calib = torch.randint(0, 32, (2, 24))
+    baseline = _baseline_logprobs(model, calib)
+    kls = {
+        chunk: _unit_kl(model, calib, baseline, mod,
+                        ["gate_up_proj", "down_proj"], "FP8_E4M3",
+                        expert_chunk=chunk)
+        for chunk in (4, 16)
+    }
+    assert kls[4] == kls[16]

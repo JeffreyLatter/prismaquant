@@ -198,6 +198,24 @@ def promote_fused(assignment: dict[str, str],
     return out
 
 
+def _charged_bins(d_avg_bits: float, bit_precision: float) -> int:
+    """Discretize a candidate's average-bit delta into DP bins.
+
+    Conservative by construction: any strictly positive delta is charged at
+    least one bin. ``round()`` alone charged 0 bins for deltas below
+    ``0.5 * bit_precision``, handing sub-half-bin units free one-directional
+    format upgrades the tightening loop could never correct (the achieved
+    bits violate the solver's own overshoot tolerance). The maximum
+    over-charge is one bin = ``bit_precision`` average bits per unit —
+    bounded by the existing precision knob, no new constant. Genuinely-zero
+    deltas still cost 0.
+    """
+    dbins = int(round(d_avg_bits / bit_precision))
+    if dbins == 0 and d_avg_bits > 0.0:
+        return 1
+    return dbins
+
+
 def solve_allocation(stats: dict, candidates: dict[str, list[Candidate]],
                      target_bits: float, bit_precision: float = 0.001
                      ) -> tuple[dict[str, str], dict[str, Candidate]] | None:
@@ -234,7 +252,7 @@ def solve_allocation(stats: dict, candidates: dict[str, list[Candidate]],
         options = []
         for idx, c in enumerate(cs):
             d_avg_bits = (c.bits_per_param - baseline.bits_per_param) * fraction
-            dbins = int(round(d_avg_bits / bit_precision))
+            dbins = _charged_bins(d_avg_bits, bit_precision)
             if dbins < 0 or dbins >= n_bins:
                 continue
             dgain = baseline_loss - c.predicted_dloss
@@ -286,7 +304,9 @@ def solve_allocation(stats: dict, candidates: dict[str, list[Candidate]],
         fraction = params / total_params
         d_avg_bits = (chosen.bits_per_param
                       - baseline.bits_per_param) * fraction
-        cur -= int(round(d_avg_bits / bit_precision))
+        # Must mirror the forward charge exactly, or the backtrack walks the
+        # wrong DP column for the remaining units.
+        cur -= _charged_bins(d_avg_bits, bit_precision)
         if cur < 0:
             cur = 0
     return assignment, chosen_cands

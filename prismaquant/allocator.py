@@ -151,13 +151,24 @@ def _kneedle_convex_decreasing(x: list[float], y: list[float]) -> int:
 
 
 def _log_error_values(y: list[float]) -> list[float]:
+    """Return log10(dloss) with non-positive values floored at the smallest
+    positive point.
+
+    A measured dloss <= 0 means "at the measurement floor" (realistic: an
+    all-passthrough rung on an FP8-native source has total dloss exactly 0),
+    not "10^6x better than the best positive point". The old floor of
+    ``min_positive * 1e-6`` injected a ~6-decade fake cliff below the real
+    curve, compressing it and dragging the Kneedle to the curve start.
+    Flooring at ``min_positive`` itself keeps such points 0 decades below
+    the smallest real point, so the knee stays on the measured curve.
+    """
     finite_positive = [
         float(v) for v in y
         if math.isfinite(float(v)) and float(v) > 0.0
     ]
     if not finite_positive:
         return [0.0 for _ in y]
-    floor = max(min(finite_positive) * 1.0e-6, 1.0e-300)
+    floor = min(finite_positive)
     return [math.log10(max(float(v), floor)) for v in y]
 
 
@@ -367,8 +378,19 @@ def refine_knee_golden(
     if hi_t - lo_t <= tol:
         return None, []
 
+    # Same floor convention as _log_error_values: a dloss <= 0 is "at the
+    # measurement floor", not 300 decades better. Flooring a zero bracket
+    # endpoint at 1e-300 made the chord vertical and dragged the refined
+    # knee to the opposite bracket edge.
+    positive_dloss = [
+        float(r["predicted_dloss"]) for r in feasible
+        if math.isfinite(float(r["predicted_dloss"]))
+        and float(r["predicted_dloss"]) > 0.0
+    ]
+    ylog_floor = min(positive_dloss) if positive_dloss else 1.0e-300
+
     def _ylog(dloss: float) -> float:
-        return math.log10(max(float(dloss), 1.0e-300))
+        return math.log10(max(float(dloss), ylog_floor))
 
     pL, pH = solve_fn(lo_t), solve_fn(hi_t)
     if pL[0] is None or pH[0] is None:

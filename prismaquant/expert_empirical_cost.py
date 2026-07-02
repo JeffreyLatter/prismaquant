@@ -91,14 +91,31 @@ def _unit_kl(
     expert_chunk: int = 16,
 ) -> float:
     """Mean-token KL(BF16 || model-with-this-unit-RTN-quantized)."""
-    qdq = fr.get_format(fmt).quantize_dequantize
+    spec = fr.get_format(fmt)
+    qdq = spec.quantize_dequantize
     originals = {pn: getattr(mod, pn).data.clone() for pn in param_names}
     try:
         for pn in param_names:
             w = getattr(mod, pn).data
-            for e in range(0, w.shape[0], expert_chunk):
-                w[e:e + expert_chunk] = qdq(
-                    w[e:e + expert_chunk].float()).to(w.dtype)
+            if spec.family == "nv":
+                # NV formats derive one per-TENSOR global scale from
+                # whatever slice they are given, while export ships one
+                # global PER EXPERT. Chunk-batching would share a global
+                # across the chunk and make the measured KL depend on the
+                # --expert-chunk knob; quantize per expert slice instead
+                # (mirrors measure_quant_cost._batched_quantize, which does
+                # the per-slice loop for exactly this reason).
+                for e in range(w.shape[0]):
+                    w[e] = qdq(w[e].float()).to(w.dtype)
+            else:
+                # Scale-local formats are chunk-invariant, so batching is
+                # safe: FP8_E4M3/FP8_E5M2 reshape to (-1, in) and scale each
+                # output row independently (fp8_dynamic_weight_qdq), and
+                # group/block-scaled formats (MX) never cross the expert
+                # boundary within a row.
+                for e in range(0, w.shape[0], expert_chunk):
+                    w[e:e + expert_chunk] = qdq(
+                        w[e:e + expert_chunk].float()).to(w.dtype)
         total = 0.0
         n_tok = 0
         for i in range(calib_ids.shape[0]):

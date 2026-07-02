@@ -154,10 +154,12 @@ class ProductionWeightCache:
     before per-group RTN, matching the export's act-clip behavior.
 
     Note: the *exported metadata* convention for this field is
-    ``input_global_scale = 6.0 / max_abs`` (reciprocal — vLLM multiplies
-    activations by it).  We store ``max_abs`` directly here because
-    that's the value the act-clip path needs; consumers can convert if
-    they need the metadata convention.
+    ``input_global_scale = 448 * 6 / max_abs`` (reciprocal — vLLM
+    multiplies activations by it; legacy ``6 / max_abs`` under
+    PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0).  We store ``max_abs``
+    directly here because that's the value the act-clip path needs;
+    consumers convert via
+    ``export_native_compressed._nvfp4_input_global_scale_from_max_abs``.
     """
     weights: dict[tuple[str, str], object]  # tensor OR str(path)
     levers: dict[str, bool]
@@ -1068,6 +1070,13 @@ def _render_score_for_gate(
     Activations should normally be present in production cache renders.  The
     weight-MSE fallback keeps pure RTN/FourOverSix unit tests and non-act-aware
     formats measurable without adding a second scoring abstraction.
+
+    Progressive-gate callers must pass the SAME clipped activation matrix the
+    GPTQ loop optimized under (``_gate_activation_matrix``), not the raw
+    capture: mixing clipped optimization with unclipped gates biases
+    accept-vs-RTN decisions near ties by the outlier rows — the exact
+    mismatch export's shared-matrix contract
+    (``_activation_matrix_for_gptq``) exists to prevent.
     """
     if (
         activations is not None
@@ -1091,6 +1100,38 @@ def _render_score_for_gate(
         )
     )
     return float(diff.pow(2).mean().item()), "weight_mse"
+
+
+def _gate_activation_matrix(
+    acts_for_render: torch.Tensor | None,
+    cols: int,
+    *,
+    device: torch.device,
+    act_clip_threshold: float | None,
+    act_clip_rescale: str | None,
+    fisher_row_weights: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Return the clip-consistent activation matrix for progressive gates.
+
+    Gates must score candidates under the objective GPTQ optimized: export's
+    ``_activation_matrix_for_gptq`` applies the quantile/threshold clip and
+    the Fisher row weighting before the Hessian build ("intentionally shared
+    by the Hessian build, damping sweep evaluator, and do-no-harm gate"), so
+    the cache-fill gate reuses it with identical settings instead of scoring
+    on the raw capture.
+    """
+    if acts_for_render is None:
+        return None
+    from prismaquant import export_native_compressed as enc
+
+    return enc._activation_matrix_for_gptq(
+        acts_for_render,
+        int(cols),
+        device=device,
+        clip_threshold=act_clip_threshold,
+        clip_rescale=act_clip_rescale,
+        row_weights=fisher_row_weights,
+    )
 
 
 def _render_score_record_key(qname: str, fmt: str) -> str:
@@ -1456,6 +1497,18 @@ def _render_nvfp4_progressively(
         if acts is not None and int(acts.shape[-1]) == int(weight.shape[1])
         else None
     )
+    # Score gate candidates on the same clipped/weighted matrix the GPTQ
+    # loop optimizes under (audit 2026-07-02 §3.9): the loop passes
+    # act_clip_threshold/act_clip_rescale/fisher_row_weights into
+    # _activation_matrix_for_gptq, so the gate must too.
+    acts_for_gate = _gate_activation_matrix(
+        acts_for_render,
+        int(weight.shape[1]),
+        device=weight.device,
+        act_clip_threshold=act_clip_threshold,
+        act_clip_rescale=act_clip_rescale,
+        fisher_row_weights=fisher_row_weights,
+    )
     reference_for_render = reference
 
     def candidate(
@@ -1483,7 +1536,7 @@ def _render_nvfp4_progressively(
         score, metric = _render_score_for_gate(
             reference,
             rendered,
-            acts,
+            acts_for_gate,
         )
         return _RenderedCandidate(
             label=label,
@@ -1793,10 +1846,21 @@ def render_production_weight(
             if acts is not None and int(acts.shape[-1]) == int(weight.shape[1])
             else None
         )
+        # Clip-consistent gate matrix — same contract as the NVFP4
+        # progressive path (audit 2026-07-02 §3.9): score under the matrix
+        # the GPTQ/scale-sweep passes optimize on.
+        acts_for_gate = _gate_activation_matrix(
+            acts_for_render,
+            int(weight.shape[1]),
+            device=weight.device,
+            act_clip_threshold=act_clip_threshold,
+            act_clip_rescale=clip_rescale,
+            fisher_row_weights=fisher_row_weights,
+        )
         baseline_score, baseline_metric = _render_score_for_gate(
             reference,
             baseline,
-            acts,
+            acts_for_gate,
         )
         current = _RenderedCandidate(
             label=f"{fmt.lower()}+rtn",
@@ -1877,7 +1941,9 @@ def render_production_weight(
             has_gptq: bool,
         ) -> _RenderedCandidate:
             rendered = weight_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
-            score, metric = _render_score_for_gate(reference, rendered, acts)
+            score, metric = _render_score_for_gate(
+                reference, rendered, acts_for_gate,
+            )
             return _RenderedCandidate(
                 label=label,
                 weight=rendered,
@@ -2569,11 +2635,19 @@ def fill_production_weight_cache(
             else None
         )
         # _quantize_2d's input_global_scale_override expects the export
-        # convention (6.0 / max_abs).  It only affects emitted metadata
-        # in compute_only mode (not the dequantized weight values), but
-        # we pass the correct convention so the metadata is honest in
-        # case future code consumes it.
-        export_scale = (6.0 / max_abs) if (max_abs is not None and max_abs > 0) else None
+        # convention.  It only affects emitted metadata in compute_only
+        # mode (not the dequantized weight values), but we pass the
+        # correct convention so the metadata is honest in case future
+        # code consumes it.  Routed through the export helper so it
+        # tracks PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE (audit C1).
+        from prismaquant.export_native_compressed import (
+            _nvfp4_input_global_scale_from_max_abs,
+        )
+        export_scale = (
+            _nvfp4_input_global_scale_from_max_abs(float(max_abs))
+            if (max_abs is not None and max_abs > 0)
+            else None
+        )
         for fmt in render_formats_by_qname.get(qname, ()):
             fmt_key = str(fmt).upper()
             render_fmt = _render_base_format(fmt_key)
