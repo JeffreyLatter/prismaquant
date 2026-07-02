@@ -204,6 +204,30 @@ def test_source_dtype_manifest_classifies_packed_expert_params(tmp_path):
     assert manifest["model.layers.0.self_attn.k_proj"] == "other"
 
 
+def test_source_dtype_manifest_classifies_mtp_tensors(tmp_path):
+    # MTP tensors are real source tensors stored under the recipe namespace
+    # itself; the historical mtp. skip left them without a source kind, so
+    # BF16 passthrough was dropped and --mtp-format=BF16 hard-failed once
+    # MTP rows carried costs (35B frontier, 2026-07-02).
+    from safetensors.torch import save_file
+    from prismaquant.allocator_candidates import _scan_source_dtype_manifest
+
+    save_file(
+        {
+            "mtp.fc.weight": torch.randn(4, 8, dtype=torch.bfloat16),
+            "mtp.layers.0.self_attn.q_proj.weight":
+                torch.randn(4, 4, dtype=torch.bfloat16),
+            "mtp.layers.0.mlp.experts.gate_up_proj":
+                torch.randn(2, 8, 4, dtype=torch.bfloat16),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    manifest = _scan_source_dtype_manifest(str(tmp_path), profile=None)
+    assert manifest["mtp.fc"] == "bf16"
+    assert manifest["mtp.layers.0.self_attn.q_proj"] == "bf16"
+    assert manifest["mtp.layers.0.mlp.experts.gate_up_proj"] == "bf16"
+
+
 # ---------------------------------------------------------------------------
 # recache preserves packed-expert scales (Fix B)
 # ---------------------------------------------------------------------------

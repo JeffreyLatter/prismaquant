@@ -686,6 +686,15 @@ def _scan_source_dtype_manifest(
         return name[:-7] if name.endswith(".weight") else name
 
     def _to_recipe_name(ck_base: str) -> str:
+        if ck_base.startswith("mtp."):
+            # MTP tensors are REAL source tensors stored under the recipe
+            # namespace itself (transformers v5 drops the module; prismaquant
+            # synthesizes it back under the same names, and probe/cost rows
+            # use them verbatim). The historical skip left MTP names with no
+            # source kind, so the BF16 passthrough was dropped
+            # (source_dtype_mismatch) and --mtp-format=BF16 hard-failed the
+            # moment MTP rows were actually costed (35B frontier, 2026-07-02).
+            return ck_base
         weight_key = f"{ck_base}.weight"
         if profile is not None:
             mapper = getattr(profile, "checkpoint_to_live_name", None)
@@ -710,8 +719,7 @@ def _scan_source_dtype_manifest(
                 or ck_base.startswith("model.audio_tower.")
                 or ck_base.startswith("model.vision_tower.")
                 or ck_base.startswith("model.embed_vision.")
-                or ck_base.startswith("model.embed_audio.")
-                or ck_base.startswith("mtp.")):
+                or ck_base.startswith("model.embed_audio.")):
             return ""
         if ck_base.startswith("model.language_model."):
             return "model." + ck_base[len("model.language_model."):]
