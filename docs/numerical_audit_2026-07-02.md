@@ -447,24 +447,33 @@ operationally:
   (default-ON; `PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0` reproduces legacy
   bytes), oracle-tested against `generate_gparam`. **Changes the bytes of every
   future NVFP4 export.**
-  **Served A/B (2026-07-02, same day): CONFIRMED WIN.** Paired same-session
-  A/B on the production 35B frontier artifact (weights byte-identical, only
-  the 30,720 `input_global_scale` scalars ×448; BF16-vs-BF16 control = KL
-  exactly 0.0): served full-vocab KL-vs-BF16 n=8×512 over two independent
-  window draws — draw 1 (seed 42) 0.0440→0.0374 (−15.0%), draw 2 (seed 43)
-  0.0330→0.0288 (−12.9%), **pooled −14.1%**; WikiText PPL 9.4675→9.4594
-  (−0.09%, no veto). Gains concentrate on the highest-KL windows (the
-  outlier-activation regime the fix targets). Metrics/logs:
-  `/home/rob/dq-runs/c1-igs-ab-20260702/`.
-  **Caveat (measured):** on a thin-calibration artifact (LFM2.5 smoke,
-  8-sample amax) the same patch REGRESSED +5.8% KL — the convention trades
-  the legacy value's 448× serve-amax headroom for bottom-end scale
-  resolution, so an under-sampled calibration amax clips at serve time.
-  Production-calibration regime wins clearly; keep default-ON, and treat
-  thin-calibration runs as the flag's one legitimate `=0` use.
-  **Re-ship implication:** any shipped W4A4 artifact can recover this by
-  re-patching `input_global_scale` ×448 in place (no re-render — the A/B's
-  patch script does exactly this) followed by the normal ship gate.
+  **Served A/Bs (2026-07-02, same day): ARTIFACT-DEPENDENT — default
+  REVERTED to legacy.** Three paired same-session A/Bs, each with weights
+  byte-identical and only the `input_global_scale` scalars ×448, BF16
+  control KL exactly 0.0, canonical n=8×512, two window draws where run:
+  - **Qwen3.6-35B-A3B frontier (MoE, production calib): −15.0% / −12.9%,
+    pooled −14.1% KL; PPL −0.09%. WIN.**
+  - **Qwen3.6-27B regen (dense, production calib): +34.8% / +44.0%,
+    pooled +37.5% KL; PPL +0.05%. LOSS.**
+  - LFM2.5 smoke (MoE, thin 8-sample calib): +5.8% KL. Loss.
+  Mechanism: the convention places serve-time FP8 block scales in (0,448]
+  instead of (0,1] — it rescues blocks ≫64× below calibration amax from
+  subnormals/zeroing but CLIPS any serve block whose amax exceeds the
+  calibration amax; which side dominates is a property of the artifact's
+  activation-outlier structure, not of the convention. Conformance to
+  compressed-tensors/modelopt is therefore NOT a quality claim.
+  **Resolution:** `PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE` default
+  flipped to `0` (legacy bytes, backwards-compatible per principle 6);
+  the convention is a per-artifact opt-in behind a served A/B. What the
+  audit actually surfaced is a **free post-export knob**: the scale can
+  be patched in place (no re-render) and re-measured per artifact —
+  worth ±14–37% served KL on real artifacts. Open follow-up: sweep k in
+  `k·6/amax` per artifact (or derive per-tensor from the activation
+  cache's block-amax distribution) instead of the two extreme points.
+  Metrics/logs: `/home/rob/dq-runs/c1-igs-ab-20260702/`.
+  **Re-ship implication (35B only, measured):** the 35B frontier artifact
+  recovers −14.1% KL from the in-place ×448 patch + ship gate. Do NOT
+  apply to 27B-class dense artifacts without their own A/B.
 - **C2/M1**: fixed; no-prod-cache exports and empty-activation Linears now ship
   RTN-grade bytes instead of garbage/zeros.
 - **M2**: packed-expert re-pack + joint pre-passes now honor the cache-recorded

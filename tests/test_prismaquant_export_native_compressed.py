@@ -2158,9 +2158,9 @@ class TestProductionCacheExportPath(unittest.TestCase):
             self.assertIsNotNone(out)
             self.assertIn("weight_packed", out)
             self.assertIn("input_global_scale", out)
-            # generate_gparam convention: 448 * 6 / max_abs = 448*6/3 = 896.
+            # legacy default convention: 6 / max_abs = 6/3 = 2.0.
             self.assertAlmostEqual(
-                float(out["input_global_scale"].item()), 896.0, places=3)
+                float(out["input_global_scale"].item()), 2.0, places=5)
         finally:
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
             m._INPUT_GLOBAL_SCALES = saved_scales
@@ -2186,10 +2186,10 @@ class TestProductionCacheExportPath(unittest.TestCase):
 
         scales = m._production_cache_scales(cache, profile=CustomProfile())
 
-        # generate_gparam convention: 448*6/max_abs; the fused join takes
-        # min (largest max_abs=24 wins) -> 448*6/24 = 112.
-        self.assertEqual(scales["model.layers.0.a_proj"], 112.0)
-        self.assertEqual(scales["model.layers.0.b_proj"], 112.0)
+        # legacy default: 6/max_abs; the fused join takes min
+        # (largest max_abs=24 wins) -> 6/24 = 0.25.
+        self.assertEqual(scales["model.layers.0.a_proj"], 0.25)
+        self.assertEqual(scales["model.layers.0.b_proj"], 0.25)
 
     def test_mxfp8_alias_hits_e4m3_cache_key(self):
         import prismaquant.export_native_compressed as m
@@ -3000,42 +3000,42 @@ if __name__ == "__main__":
 class TestNvfp4InputGlobalScale(unittest.TestCase):
     """Per-layer input_global_scale calibration from cached activations.
 
-    `compute_nvfp4_input_global_scale(activations)` returns
-    FP8_MAX*FP4_MAX/max_abs — the compressed-tensors `generate_gparam`
-    convention (C1 fix) — so serve-time FP8-stored activation block
-    scales use the whole FP8 range. Zero/negative max-abs falls back to
-    the default; PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0 reproduces
-    the legacy 6/max_abs bytes."""
+    Default: legacy ``6/max_abs`` bytes (backwards-compatible — the
+    generate_gparam convention is strongly artifact-dependent on served
+    KL: 35B MoE -14.1%, 27B dense +37.5%, thin-calib LFM +5.8%; see the
+    2026-07-02 audit C1 addendum). PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=1
+    opts into the compressed-tensors ``448*6/max_abs`` convention behind
+    a per-artifact served A/B."""
 
-    def test_max_abs_uses_fp8_range_convention(self):
-        import torch
-        from prismaquant.export_native_compressed import (
-            compute_nvfp4_input_global_scale, _FP4_E2M1_MAX, _FP8_E4M3_MAX,
-        )
-        acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
-        s = compute_nvfp4_input_global_scale(acts)
-        # max_abs=3.0, scale = 448*6/3 = 896.0 (generate_gparam convention)
-        self.assertAlmostEqual(
-            s, _FP8_E4M3_MAX * _FP4_E2M1_MAX / 3.0, places=3)
-
-    def test_legacy_env_zero_reproduces_6_over_amax(self):
-        import os
+    def test_default_is_legacy_6_over_amax(self):
         import torch
         from prismaquant.export_native_compressed import (
             compute_nvfp4_input_global_scale, _FP4_E2M1_MAX,
         )
         acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
+        s = compute_nvfp4_input_global_scale(acts)
+        self.assertAlmostEqual(s, _FP4_E2M1_MAX / 3.0, places=5)
+
+    def test_env_one_opts_into_fp8_range_convention(self):
+        import os
+        import torch
+        from prismaquant.export_native_compressed import (
+            compute_nvfp4_input_global_scale, _FP4_E2M1_MAX, _FP8_E4M3_MAX,
+        )
+        acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
         key = "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE"
         saved = os.environ.get(key)
         try:
-            os.environ[key] = "0"
+            os.environ[key] = "1"
             s = compute_nvfp4_input_global_scale(acts)
         finally:
             if saved is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = saved
-        self.assertAlmostEqual(s, _FP4_E2M1_MAX / 3.0, places=5)
+        # max_abs=3.0, scale = 448*6/3 = 896.0 (generate_gparam convention)
+        self.assertAlmostEqual(
+            s, _FP8_E4M3_MAX * _FP4_E2M1_MAX / 3.0, places=3)
 
     def test_matches_compressed_tensors_generate_gparam(self):
         """Oracle test: our input_global_scale must equal the installed
@@ -3049,13 +3049,23 @@ class TestNvfp4InputGlobalScale(unittest.TestCase):
         from prismaquant.export_native_compressed import (
             compute_nvfp4_input_global_scale,
         )
+        import os
         torch.manual_seed(0)
         acts = torch.randn(64, 128) * 3.7
         expected = generate_gparam(
             updated_min_val=acts.amin(),
             updated_max_val=acts.amax(),
         )
-        ours = compute_nvfp4_input_global_scale(acts)
+        key = "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE"
+        saved = os.environ.get(key)
+        try:
+            os.environ[key] = "1"
+            ours = compute_nvfp4_input_global_scale(acts)
+        finally:
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
         self.assertAlmostEqual(
             ours, float(expected.item()),
             delta=abs(float(expected.item())) * 1e-6,

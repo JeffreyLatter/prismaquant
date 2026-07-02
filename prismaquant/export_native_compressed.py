@@ -869,17 +869,23 @@ _FP8_E4M3_MAX = FP8_E4M3_MAX
 
 def _nvfp4_input_gscale_fp8_range_enabled() -> bool:
     """Whether input_global_scale uses the compressed-tensors/vLLM
-    convention ``FP8_MAX * FP4_MAX / amax`` (generate_gparam).
+    convention ``FP8_MAX * FP4_MAX / amax`` (generate_gparam) instead of
+    the legacy ``FP4_MAX / amax``.
 
-    Default ON (C1 fix, 2026-07-02 audit). The legacy value was
-    ``FP4_MAX / amax`` — 448x below convention, which pushed serve-time
-    FP8-stored activation block scales into the subnormal range (and to
-    0, zeroing whole blocks, at ~1024x block dynamic range). Set
-    ``PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0`` to reproduce
-    historical artifact bytes.
+    Default OFF (legacy bytes). The convention places serve-time
+    FP8-stored activation block scales in (0, 448] instead of (0, 1] —
+    rescuing blocks >64x below calibration amax from FP8 subnormals at
+    the cost of CLIPPING any serve block whose amax exceeds calibration
+    amax. Served A/Bs 2026-07-02 (weights byte-identical, only
+    input_global_scale x448): Qwen3.6-35B-A3B MoE frontier -14.1% KL
+    (WIN), LFM2.5 thin-calib smoke +5.8% (loss), Qwen3.6-27B regen dense
+    +37.5% (LOSS). Strongly artifact-dependent, so the default stays
+    backwards-compatible; set ``PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=1``
+    only behind a per-artifact served A/B (the scale is a free
+    post-export knob: patch input_global_scale in place, re-measure).
     """
     return os.environ.get(
-        "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE", "1") != "0"
+        "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE", "0") == "1"
 
 
 def _nvfp4_input_global_scale_from_max_abs(max_abs: float) -> float:
