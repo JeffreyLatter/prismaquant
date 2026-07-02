@@ -91,6 +91,61 @@ def test_weight_session_reuses_existing_spilled_snapshot(tmp_path):
     assert second.diagnostics()["n_bf16_snapshots"] == 1
 
 
+def test_stale_spill_file_with_wrong_shape_raises_on_record(tmp_path):
+    """Cross-run snapshot_dir reuse: a pre-existing __bf16src.pt whose
+    shape disagrees with the live param must raise when the recorded
+    path would otherwise trust it blindly."""
+    torch.save(torch.zeros(3, 3), tmp_path / "model_proj__bf16src.pt")
+    model = _ModelWithBody().eval()
+    rendered = torch.full((64, 64), 0.125)
+    cache = ProductionWeightCache(
+        weights={("model.proj", "NVFP4"): rendered},
+        levers={},
+    )
+    session = WeightSession(
+        model, production_weight_cache=cache, snapshot_dir=str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="snapshot_dir"):
+        session.initialize({"model.proj": "NVFP4"}, units=[])
+
+
+def test_stale_spill_file_with_wrong_shape_raises_on_reload(tmp_path):
+    """The _spilled-hit reload path must validate too — a recorded entry
+    whose backing file is stale would otherwise restore wrong-model
+    weights at revert time."""
+    torch.save(torch.zeros(3, 3), tmp_path / "model_proj__bf16src.pt")
+    model = _ModelWithBody().eval()
+    session = WeightSession(model, snapshot_dir=str(tmp_path))
+    # Pin the _spilled-hit branch directly (the record path is covered
+    # above and would already have raised).
+    session._spilled["model.proj"] = "model_proj__bf16src.pt"
+
+    with pytest.raises(RuntimeError, match="stale"):
+        session.format_weight("model.proj", "BF16")
+
+
+def test_matching_spill_file_still_records_and_reloads(tmp_path):
+    model = _ModelWithBody().eval()
+    model.model.proj.weight.data.fill_(1.0)
+    torch.save(
+        model.model.proj.weight.detach().cpu().clone(),
+        tmp_path / "model_proj__bf16src.pt",
+    )
+    rendered = torch.full((64, 64), 0.125)
+    cache = ProductionWeightCache(
+        weights={("model.proj", "NVFP4"): rendered},
+        levers={},
+    )
+    session = WeightSession(
+        model, production_weight_cache=cache, snapshot_dir=str(tmp_path))
+
+    session.initialize({"model.proj": "NVFP4"}, units=[])
+    torch.testing.assert_close(model.model.proj.weight, rendered)
+    session.apply_assignment({"model.proj": "BF16"})
+    torch.testing.assert_close(
+        model.model.proj.weight, torch.ones(64, 64))
+
+
 def test_apply_assignment_records_bf16_before_overwrite(tmp_path):
     model = _ModelWithBody().eval()
     original = model.model.proj.weight.detach().clone()

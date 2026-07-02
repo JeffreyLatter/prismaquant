@@ -243,6 +243,115 @@ def test_perturbed_cache_can_disable_capture_for_inplace_replay(tmp_path):
     assert cache.finalize()["written"] == []
 
 
+class _OneLinear(nn.Module):
+    def __init__(self, width=64):
+        super().__init__()
+        self.fc = nn.Linear(width, width, bias=False)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+def _batches_with_markers(n_batches, rows_per_batch, width):
+    """Calibration batches whose rows carry (batch_idx, row_idx) markers
+    in features 0/1 so a loaded cache row can be attributed."""
+    batches = []
+    for b in range(n_batches):
+        t = torch.randn(rows_per_batch, width)
+        t[:, 0] = float(b)
+        t[:, 1] = torch.arange(rows_per_batch, dtype=torch.float32)
+        batches.append(t)
+    return batches
+
+
+def test_perturbed_cache_samples_uniformly_across_batches(tmp_path):
+    """M8 regression: the capture must NOT keep the first input_rows rows
+    of the stream ({limit, 0, 0, 0} per batch); a seeded priority
+    reservoir keeps ~limit/n_batches rows from every batch."""
+    torch.manual_seed(0)
+    model = _OneLinear().eval()
+    n_batches, rows_per_batch, limit = 4, 256, 128
+    batches = _batches_with_markers(n_batches, rows_per_batch, 64)
+
+    capture_perturbed_activation_cache(
+        model,
+        {"fc": "BF16"},
+        batches,
+        tmp_path,
+        input_rows=limit,
+        cal_hash="fixed-uniformity",
+    )
+
+    rows = _load_cache(tmp_path, "fc")
+    assert rows.shape[0] == limit
+    counts = [int((rows[:, 0] == float(b)).sum()) for b in range(n_batches)]
+    assert sum(counts) == limit
+    # Expected 32/batch; binomial sd ~4.9. ±5 sigma bounds — deterministic
+    # under the fixed cal_hash, and {128, 0, 0, 0} fails loudly.
+    for b, c in enumerate(counts):
+        assert 8 <= c <= 56, f"batch {b} kept {c} rows: {counts}"
+
+
+def test_perturbed_cache_reservoir_is_deterministic_under_cal_hash(tmp_path):
+    model = _OneLinear().eval()
+    batches = _batches_with_markers(4, 64, 64)
+    for run in ("a", "b"):
+        capture_perturbed_activation_cache(
+            model,
+            {"fc": "BF16"},
+            batches,
+            tmp_path / run,
+            input_rows=32,
+            cal_hash="fixed-repro",
+        )
+    torch.testing.assert_close(
+        _load_cache(tmp_path / "a", "fc"),
+        _load_cache(tmp_path / "b", "fc"),
+    )
+
+
+def test_perturbed_cache_siblings_share_rows_across_whole_stream(tmp_path):
+    """Fused siblings must keep IDENTICAL row sets even when the reservoir
+    replaces rows across many batches (not just within one call)."""
+    model = _SiblingInputModel().eval()
+    batches = _batches_with_markers(4, 64, 64)
+
+    capture_perturbed_activation_cache(
+        model,
+        {"self_attn.q_proj": "BF16", "self_attn.k_proj": "BF16"},
+        batches,
+        tmp_path,
+        input_rows=32,
+        cal_hash="fixed-siblings",
+    )
+
+    q_rows = _load_cache(tmp_path, "self_attn.q_proj")
+    k_rows = _load_cache(tmp_path, "self_attn.k_proj")
+    assert q_rows.shape == (32, 64)
+    torch.testing.assert_close(q_rows, k_rows)
+    # And the shared sample must actually span multiple batches.
+    assert len(set(q_rows[:, 0].tolist())) >= 2
+
+
+def test_perturbed_cache_input_rows_zero_still_tracks_max_abs(tmp_path):
+    model = _OneLinear().eval()
+    cache = PerturbedActivationCache(
+        model,
+        {"fc": "BF16"},
+        tmp_path,
+        input_rows=0,
+        cal_hash="test",
+    )
+    cache.install()
+    try:
+        _ = model(torch.full((2, 64), 3.0))
+    finally:
+        cache.remove()
+
+    assert cache.max_abs["fc"] == pytest.approx(3.0)
+    assert cache.finalize()["written"] == []
+
+
 def test_stage_text_only_uses_work_root_for_tempdir(tmp_path):
     src = tmp_path / "model"
     src.mkdir()

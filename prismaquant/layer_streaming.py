@@ -169,21 +169,105 @@ def _build_weight_map(model_path: str, *,
     return model_to_shard, model_to_ckpt
 
 
+class Fp8ScaleInvMap(dict):
+    """`{model_weight_key: (scale_shard_path, scale_ckpt_key)}` plus the
+    checkpoint-declared dequant ``block`` size ``(rows, cols)``.
+
+    Behaves as a plain dict everywhere (truthiness, lookups, iteration),
+    so every existing caller is unchanged; the block size travels with
+    the map so the dequant call sites never have to re-derive it — or
+    worse, assume 128x128 for a checkpoint quantized at a different
+    granularity.  ``block`` is None only for empty maps."""
+
+    def __init__(self, data=None, block: tuple[int, int] | None = None):
+        super().__init__(data or {})
+        self.block = block
+
+
+def _declared_weight_block_size(model_path: str) -> tuple[int, int]:
+    """Read `quantization_config.weight_block_size` from the checkpoint
+    config and validate it.
+
+    Called only when fp8 block-scaled weights were actually found, so a
+    missing/null/malformed declaration is a hard error: the dequant grid
+    must be derived from the checkpoint, never assumed (the historical
+    hardcoded 128x128 silently mis-scales any checkpoint quantized at a
+    different block size, and per-tensor-scale fp8 checkpoints — e.g.
+    Mistral-Medium's scalar `weight_scale_inv` — are not block-dequantable
+    at all)."""
+    cfg_path = os.path.join(model_path, "config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        raise RuntimeError(
+            f"checkpoint at {model_path!r} pairs fp8 weights with scale "
+            f"tensors but its config.json could not be read ({exc!r}); "
+            f"cannot derive the fp8 dequant block size"
+        ) from exc
+    qc = cfg.get("quantization_config") or {}
+    if not qc.get("weight_block_size"):
+        # Multimodal umbrellas may nest the quantization config.
+        nested = (cfg.get("text_config") or {}).get("quantization_config") or {}
+        if nested.get("weight_block_size"):
+            qc = nested
+    wbs = qc.get("weight_block_size")
+    if not wbs:
+        raise RuntimeError(
+            f"checkpoint at {model_path!r} pairs fp8 weights with scale "
+            f"tensors but config.json quantization_config.weight_block_size "
+            f"is {'null/empty' if 'weight_block_size' in qc else 'absent'}; "
+            f"refusing to assume a 128x128 dequant grid. Block-scaled fp8 "
+            f"checkpoints must declare weight_block_size; per-tensor-scale "
+            f"fp8 checkpoints are not supported by the block-dequant "
+            f"streaming path."
+        )
+    try:
+        pair = tuple(int(v) for v in wbs)
+    except (TypeError, ValueError):
+        pair = ()
+    if len(pair) != 2 or pair[0] <= 0 or pair[1] <= 0:
+        raise RuntimeError(
+            f"checkpoint at {model_path!r} declares an unsupported "
+            f"quantization_config.weight_block_size={wbs!r}; expected two "
+            f"positive ints [out_block, in_block]."
+        )
+    return (pair[0], pair[1])
+
+
+def _fp8_dequant_block(
+    fp8_scale_inv_map: dict[str, tuple[str, str]] | None,
+) -> tuple[int, int]:
+    """Dequant block size carried by the scale map.
+
+    Every map built by `_build_fp8_scale_inv_map` is an `Fp8ScaleInvMap`
+    holding the checkpoint-declared block. Plain dicts (hand-built in
+    tests/tools) keep the historical 128x128 default."""
+    block = getattr(fp8_scale_inv_map, "block", None)
+    if block is not None:
+        return (int(block[0]), int(block[1]))
+    return (128, 128)
+
+
 def _build_fp8_scale_inv_map(model_path: str, *,
                              multimodal: bool = False
-                             ) -> dict[str, tuple[str, str]]:
+                             ) -> "Fp8ScaleInvMap":
     """Return `{model_weight_key: (scale_shard_path, scale_ckpt_key)}`
     for every native-FP8 weight tensor (fp8_e4m3fn + paired
-    `.weight_scale_inv` fp32 block scale).
+    `.weight_scale_inv` fp32 block scale), as an `Fp8ScaleInvMap` whose
+    `.block` carries the checkpoint-declared
+    `quantization_config.weight_block_size`.
 
     The key space matches what `_build_weight_map` returns — i.e., the
     live model qname for the weight (`...something.weight`). Callers
     pair it with `_read_layer_to_device(..., fp8_scale_inv_map=...)`
-    to apply the 128x128 block dequant inline at load.
+    to apply the declared block dequant inline at load.
 
-    Returns `{}` for checkpoints that have no `.weight_scale_inv`
-    tensors — load-time dequant is then a no-op and callers behave
-    exactly as they did before this function existed.
+    Returns an empty map (block=None) for checkpoints that have no
+    `.weight_scale_inv` tensors — load-time dequant is then a no-op and
+    callers behave exactly as they did before this function existed.
+    A non-empty map with no readable/declared weight_block_size raises
+    (see `_declared_weight_block_size`).
     """
     # Profile-driven dispatch (refactor #32). Profiles that store FP8
     # scales under a non-standard path (DSv4 uses `.scale` siblings)
@@ -194,7 +278,10 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     profile = detect_profile(model_path)
     explicit = profile.fp8_scale_pairs(model_path)
     if explicit is not None:
-        return explicit
+        return Fp8ScaleInvMap(
+            explicit,
+            _declared_weight_block_size(model_path) if explicit else None,
+        )
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_file):
@@ -203,7 +290,7 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     else:
         single = os.path.join(model_path, "model.safetensors")
         if not os.path.exists(single):
-            return {}
+            return Fp8ScaleInvMap()
         with safe_open(single, framework="pt") as f:
             raw = {k: single for k in f.keys()}
 
@@ -222,15 +309,45 @@ def _build_fp8_scale_inv_map(model_path: str, *,
         if weight_live is None:
             continue
         out[weight_live] = (os.path.join(model_path, shard), ck_key)
-    return out
+    return Fp8ScaleInvMap(
+        out,
+        _declared_weight_block_size(model_path) if out else None,
+    )
+
+
+def _check_fp8_scale_grid(
+    name: str,
+    weight_shape: tuple[int, ...],
+    scale_shape: tuple[int, ...],
+    block: tuple[int, int],
+) -> None:
+    """Hard shape assertion for a block-scale grid vs its weight.
+
+    A transposed `(in_blocks, out_blocks)` grid is numel-compatible with
+    the expected `(out_blocks, in_blocks)` reshape, so without this check
+    it reshapes silently and mis-scales every block."""
+    out_dim, in_dim = int(weight_shape[0]), int(weight_shape[1])
+    block_r, block_c = block
+    expected = (-(-out_dim // block_r), -(-in_dim // block_c))
+    if tuple(scale_shape) != expected:
+        raise ValueError(
+            f"fp8 weight_scale_inv for {name!r} has shape "
+            f"{tuple(scale_shape)}; expected (out_blocks, in_blocks)="
+            f"{expected} for weight {tuple(weight_shape)} at block "
+            f"{tuple(block)}. A transposed (in_blocks, out_blocks) grid is "
+            f"numel-compatible and would reshape silently, mis-scaling "
+            f"every block — check the checkpoint's scale layout and its "
+            f"declared quantization_config.weight_block_size."
+        )
 
 
 def _dequant_fp8_block_weight(
     weight: torch.Tensor,
     scale_inv: torch.Tensor,
     block: tuple[int, int] = (128, 128),
+    name: str = "<weight>",
 ) -> torch.Tensor:
-    """Apply the (ceil(out/128), ceil(in/128)) block scale to a 2D
+    """Apply the (ceil(out/block_r), ceil(in/block_c)) block scale to a 2D
     fp8-sourced weight and return bf16. Used by the fp8-aware streaming
     loader for native-FP8 checkpoints (MiniMax-M2/M2.7, DeepSeek-V3).
 
@@ -251,6 +368,8 @@ def _dequant_fp8_block_weight(
     """
     out_dim, in_dim = weight.shape
     block_r, block_c = block
+    _check_fp8_scale_grid(
+        name, tuple(weight.shape), tuple(scale_inv.shape), block)
     target_dtype = torch.bfloat16
     target_device = (scale_inv.device if scale_inv.device.type != "cpu"
                      else weight.device)
@@ -279,13 +398,64 @@ def _is_fp8_scaled_tensor(
     return fp8_scale_inv_map is not None and model_name in fp8_scale_inv_map
 
 
+_FLOAT8_DTYPES = frozenset(
+    dt for dt in (
+        getattr(torch, name, None)
+        for name in (
+            "float8_e4m3fn",
+            "float8_e4m3fnuz",
+            "float8_e5m2",
+            "float8_e5m2fnuz",
+            "float8_e8m0fnu",
+        )
+    ) if dt is not None
+)
+
+
+def _allow_unscaled_fp8() -> bool:
+    raw = os.environ.get("PRISMAQUANT_ALLOW_UNSCALED_FP8")
+    return raw not in (None, "", "0", "false", "False", "FALSE", "no", "NO")
+
+
+def _require_fp8_scale(
+    model_name: str,
+    t: torch.Tensor,
+    fp8_scale_inv_map: dict[str, tuple[str, str]] | None,
+) -> None:
+    """Fail fast on a float8 source tensor with no dequant scale mapping.
+
+    Casting raw fp8 codes to bf16 installs values in the fp8 *code*
+    range (±448 for e4m3) instead of true dequanted weights — the
+    historical fp8-range bug that silently poisoned probe/cost passes on
+    native-FP8 checkpoints. An unmapped fp8 tensor means the scale-map
+    scan missed it, so raise instead of guessing."""
+    if t.dtype not in _FLOAT8_DTYPES:
+        return
+    if _is_fp8_scaled_tensor(model_name, fp8_scale_inv_map):
+        return
+    if _allow_unscaled_fp8():
+        return
+    raise RuntimeError(
+        f"native-FP8 tensor {model_name!r} (dtype {t.dtype}) has no entry "
+        f"in fp8_scale_inv_map — casting raw fp8 codes to bf16 would "
+        f"install values in the code range (±448) instead of true "
+        f"dequanted weights (the historical fp8-range bug). The scale map "
+        f"is built by _build_fp8_scale_inv_map from `.weight_scale_inv` "
+        f"siblings (or the model profile's fp8_scale_pairs override, e.g. "
+        f"DSv4's `.scale` siblings); check the checkpoint's scale tensor "
+        f"naming against that scan. Set PRISMAQUANT_ALLOW_UNSCALED_FP8=1 "
+        f"only if this tensor is genuinely scale-free."
+    )
+
+
 def _apply_fp8_dequant_inplace(
     out: dict[str, torch.Tensor],
     fp8_scale_inv_map: dict[str, tuple[str, str]],
     device: torch.device,
 ) -> int:
     """For each tensor in `out` whose key matches a `fp8_scale_inv_map`
-    entry, read the scale_inv, apply the 128x128 block dequant, and
+    entry, read the scale_inv, apply the checkpoint-declared block
+    dequant (`fp8_scale_inv_map.block`, see `_fp8_dequant_block`), and
     replace the loaded tensor with the dequanted bf16 weight.
 
     Tensors and scales are both grouped by shape and multiplied in a
@@ -317,9 +487,11 @@ def _apply_fp8_dequant_inplace(
                 loaded_scales[model_name] = f.get_tensor(scale_key)
 
     # Step 2: Group matched weights by (out_dim, in_dim) shape. We only
-    # batch along exact-128-multiple shapes; odd-shaped tensors (rare)
-    # fall back to the per-tensor path.
-    block_r, block_c = 128, 128
+    # batch along exact-block-multiple shapes; odd-shaped tensors (rare)
+    # fall back to the per-tensor path. The block size is the
+    # checkpoint-declared quantization_config.weight_block_size carried
+    # on the map, never assumed.
+    block_r, block_c = _fp8_dequant_block(fp8_scale_inv_map)
     by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
     fallback: list[str] = []
     for name in loaded_scales:
@@ -328,6 +500,12 @@ def _apply_fp8_dequant_inplace(
             fallback.append(name)
             continue
         out_dim, in_dim = w.shape
+        # Hard shape assertion (audit §3.7a): a transposed scale grid is
+        # numel-compatible with the batched reshape below and would
+        # silently mis-scale every block.
+        _check_fp8_scale_grid(
+            name, tuple(w.shape), tuple(loaded_scales[name].shape),
+            (block_r, block_c))
         if out_dim % block_r != 0 or in_dim % block_c != 0:
             fallback.append(name)
             continue
@@ -368,7 +546,8 @@ def _apply_fp8_dequant_inplace(
     for name in fallback:
         w = out[name]
         scale_fp = loaded_scales[name].to(device=device)
-        out[name] = _dequant_fp8_block_weight(w, scale_fp)
+        out[name] = _dequant_fp8_block_weight(
+            w, scale_fp, block=(block_r, block_c), name=name)
         dequanted += 1
 
     return dequanted
@@ -407,6 +586,7 @@ def _materialize(model: nn.Module, prefixes: list[str],
         with f_ctx as f:
             for model_name, ckpt_name in pairs:
                 t = f.get_tensor(ckpt_name)
+                _require_fp8_scale(model_name, t, fp8_scale_inv_map)
                 if (t.is_floating_point()
                         and not _is_fp8_scaled_tensor(
                             model_name, fp8_scale_inv_map)):
@@ -587,6 +767,7 @@ def _read_layer_to_device(prefix: str,
         with f_ctx as f:
             for model_name, ckpt_name in pairs:
                 t = f.get_tensor(ckpt_name)
+                _require_fp8_scale(model_name, t, fp8_scale_inv_map)
                 if (t.is_floating_point()
                         and not _is_fp8_scaled_tensor(
                             model_name, fp8_scale_inv_map)):

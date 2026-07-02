@@ -129,6 +129,28 @@ class WeightSession:
             return None
         return param.data
 
+    def _validate_spill_shape(
+        self,
+        qname: str,
+        snap_shape: tuple[int, ...],
+    ) -> None:
+        """Raise when a spilled snapshot's shape disagrees with the live
+        parameter.  No-op when the live param is unresolvable (meta /
+        missing) — matching the first-discovery path's leniency."""
+        live = self._live_weight(qname)
+        if live is None:
+            return
+        if tuple(snap_shape) != tuple(live.shape):
+            raise RuntimeError(
+                f"spilled BF16 snapshot for {qname!r} has shape "
+                f"{tuple(snap_shape)} but the live parameter is "
+                f"{tuple(live.shape)}.  The snapshot_dir "
+                f"({self._snapshot_dir}) most likely holds stale "
+                f"__bf16src.pt spill files reused across runs against a "
+                f"different model/shape — use a fresh snapshot_dir per "
+                f"run (or delete the stale spill files)."
+            )
+
     def _ensure_bf16_snapshot(self, qname: str) -> torch.Tensor | None:
         """Return the BF16 source weight for ``qname``, snapshotting on
         first call so subsequent reverts can copy from it.
@@ -148,11 +170,17 @@ class WeightSession:
         if qname in self._bf16_originals:
             return self._bf16_originals[qname]
         if qname in self._spilled and self._snapshot_dir is not None:
-            return torch.load(
+            snap = torch.load(
                 self._snapshot_dir / self._spilled[qname],
                 map_location="cpu",
                 weights_only=True,
             )
+            # Spill files can outlive the run that wrote them; a
+            # mismatched reload would silently restore the wrong-model
+            # weights.  Formats never change the weight shape, so the
+            # live param is a valid reference even mid-polish.
+            self._validate_spill_shape(qname, tuple(snap.shape))
+            return snap
         safe = qname.replace("/", "__").replace(".", "_")
         fname = f"{safe}__bf16src.pt"
         if self._snapshot_dir is not None:
@@ -204,7 +232,15 @@ class WeightSession:
         if self._snapshot_dir is not None:
             safe = qname.replace("/", "__").replace(".", "_")
             fname = f"{safe}__bf16src.pt"
-            if (self._snapshot_dir / fname).is_file():
+            existing = self._snapshot_dir / fname
+            if existing.is_file():
+                # Trusting a pre-existing spill without a shape check
+                # would let a stale cross-run file restore the wrong
+                # weights at revert time.  mmap keeps the check cheap —
+                # only metadata pages are touched, preserving this
+                # path's no-full-read startup contract.
+                self._validate_spill_shape(
+                    qname, _spilled_tensor_shape(existing))
                 self._spilled[qname] = fname
                 return True
         return self._ensure_bf16_snapshot(qname) is not None
@@ -458,6 +494,18 @@ class WeightSession:
             "stage_missing_sample": list(self._stage_missing[:5]),
             "strict_production_cache": self._strict_production_cache,
         }
+
+
+def _spilled_tensor_shape(path) -> tuple[int, ...]:
+    """Shape of a spilled `__bf16src.pt` snapshot without pulling its
+    data through the page cache (mmap load touches metadata pages only).
+    Falls back to a regular load if mmap is unsupported for the file."""
+    try:
+        snap = torch.load(path, map_location="cpu", weights_only=True,
+                          mmap=True)
+    except (TypeError, RuntimeError):
+        snap = torch.load(path, map_location="cpu", weights_only=True)
+    return tuple(snap.shape)
 
 
 def _qname_aliases(qname: str) -> set[str]:

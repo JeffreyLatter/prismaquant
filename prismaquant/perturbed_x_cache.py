@@ -165,24 +165,42 @@ def fused_subsample_group(name: str, profile=None) -> str:
 
 
 class SharedRowSubsampler:
+    """Deterministic, sibling-coherent row sampling for activation capture.
+
+    Fused siblings (q/k/v, gate/up) must snapshot the SAME rows so their
+    caches stay row-aligned for joint solvers.  ``batch_priorities``
+    returns the per-row random reservoir priorities for one capture
+    batch, keyed by the fused-sibling *group* and the batch index —
+    every sibling observing the same batch therefore draws identical
+    priorities, and the reservoir's keep/replace decisions match
+    row-for-row across the whole calibration stream (the cross-batch
+    analogue of the historical shared per-call ``randperm``).
+
+    Seeding follows the existing convention: ``_seed_from(cal_hash, key)``
+    so a fixed calibration set reproduces the same sample run-to-run."""
+
     def __init__(self, input_rows: int, cal_hash: str, profile=None):
         self.input_rows = int(input_rows)
         self.cal_hash = cal_hash
         self.profile = profile
-        self._indices: dict[tuple[str, int, int], torch.Tensor] = {}
 
-    def select(self, name: str, flat: torch.Tensor, need: int) -> torch.Tensor:
-        if need <= 0 or flat.size(0) <= need:
-            return flat
+    def batch_priorities(
+        self,
+        name: str,
+        batch_index: int,
+        n_rows: int,
+    ) -> torch.Tensor:
+        """Random priorities for the ``batch_index``-th capture of ``name``.
+
+        Regenerated deterministically per (group, batch) instead of cached:
+        zero retained state, and siblings that consume the same batch at
+        different times still agree exactly."""
         group = fused_subsample_group(name, self.profile)
-        key = (group, int(flat.size(0)), int(need))
-        idx = self._indices.get(key)
-        if idx is None:
-            g = torch.Generator(device="cpu")
-            g.manual_seed(_seed_from(self.cal_hash, group))
-            idx = torch.randperm(flat.size(0), generator=g)[:need]
-            self._indices[key] = idx
-        return flat.index_select(0, idx.to(flat.device))
+        g = torch.Generator(device="cpu")
+        g.manual_seed(
+            _seed_from(self.cal_hash, f"{group}#batch{int(batch_index)}")
+        )
+        return torch.rand(int(n_rows), generator=g, dtype=torch.float32)
 
 
 @dataclass
@@ -375,7 +393,8 @@ class PerturbedActivationCache:
         # clamp activations to ±max_abs before per-group RTN, matching
         # the export's act-clip behavior.  See production_weight_cache.py
         # for the convention note (we store max_abs directly; the export's
-        # vLLM-facing metadata convention is 6.0 / max_abs).
+        # vLLM-facing metadata is derived via
+        # export_native_compressed._nvfp4_input_global_scale_from_max_abs).
         if production_weight_cache is not None and (
             production_weight_cache.activation_max_abs
             or production_weight_cache.activation_scales
@@ -387,8 +406,12 @@ class PerturbedActivationCache:
             self._activation_scales: dict[str, float] = dict(src)
         else:
             self._activation_scales = {}
-        self._snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
-        self._rows_got: dict[str, int] = defaultdict(int)
+        # Bounded uniform row reservoirs (M8): per name, at most
+        # `input_rows` CPU rows + their float32 priorities, plus a batch
+        # counter that keys the shared per-batch priorities.
+        self._snap_rows: dict[str, torch.Tensor] = {}
+        self._snap_priorities: dict[str, torch.Tensor] = {}
+        self._snap_batches: dict[str, int] = defaultdict(int)
         self.max_abs: dict[str, float] = {}
         self._handles = []
         self._frozen_weight_cache: OrderedDict[
@@ -654,12 +677,74 @@ class PerturbedActivationCache:
             mx = float(flat.abs().max().item())
             if mx > self.max_abs.get(name, 0.0):
                 self.max_abs[name] = mx
-            need = self.input_rows - self._rows_got[name]
-            if need <= 0:
+            if self.input_rows <= 0:
                 continue
-            selected = self.subsampler.select(name, flat, need)
-            self._snaps[name].append(selected.to("cpu"))
-            self._rows_got[name] += int(selected.size(0))
+            self._reservoir_update(name, flat)
+
+    def _reservoir_update(self, name: str, flat: torch.Tensor) -> None:
+        """Fold one capture batch into ``name``'s bounded uniform reservoir.
+
+        M8 fix: the old path kept the FIRST ``input_rows`` rows of the
+        calibration stream (``need = input_rows - rows_got``; all later
+        batches skipped), so with default sizes the entire perturbed-X
+        second moment came from calibration document #1.  This is the
+        same priority-reservoir scheme as
+        ``activation_sampling.update_priority_reservoir`` — uniform
+        without replacement over ALL rows seen, storage bounded at
+        ``input_rows`` — with two deltas that matter here:
+
+          * priorities come from ``SharedRowSubsampler.batch_priorities``
+            (keyed by fused-sibling group + batch index), so gate/up and
+            q/k/v siblings keep IDENTICAL row sets across the whole
+            stream, not just within one call;
+          * only surviving rows are copied device→CPU
+            (``update_priority_reservoir`` concatenates the full incoming
+            batch onto the CPU reservoir first, which would move every
+            calibration activation over the bus per module per batch).
+        """
+        limit = self.input_rows
+        batch_index = self._snap_batches[name]
+        self._snap_batches[name] = batch_index + 1
+        new_pri = self.subsampler.batch_priorities(
+            name, batch_index, int(flat.size(0))
+        )
+        cur_rows = self._snap_rows.get(name)
+        cur_pri = self._snap_priorities.get(name)
+        n_cur = 0 if cur_rows is None else int(cur_rows.size(0))
+        merged_pri = (
+            new_pri if n_cur == 0 else torch.cat([cur_pri, new_pri], dim=0)
+        )
+        if int(merged_pri.numel()) <= limit:
+            incoming = flat.to("cpu")
+            if incoming is flat:
+                # `.to("cpu")` is a no-op for CPU inputs; clone so the
+                # reservoir never aliases live activation storage.
+                incoming = incoming.clone()
+            self._snap_rows[name] = (
+                incoming
+                if cur_rows is None
+                else torch.cat([cur_rows, incoming], dim=0)
+            )
+            self._snap_priorities[name] = merged_pri
+            return
+        keep = torch.topk(merged_pri, k=limit, largest=True, sorted=False).indices
+        # Ascending order keeps retained rows in stream order and makes
+        # the old-rows/new-rows concatenation below line up with the
+        # reordered priorities (old indices < n_cur <= new indices).
+        keep = torch.sort(keep).values
+        keep_old = keep[keep < n_cur]
+        keep_new = keep[keep >= n_cur] - n_cur
+        parts: list[torch.Tensor] = []
+        if keep_old.numel():
+            parts.append(cur_rows.index_select(0, keep_old))
+        if keep_new.numel():
+            parts.append(
+                flat.index_select(0, keep_new.to(flat.device)).to("cpu")
+            )
+        self._snap_rows[name] = (
+            parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        )
+        self._snap_priorities[name] = merged_pri.index_select(0, keep)
 
     def _apply_weight_quant(self, plan: _ModulePlan) -> None:
         plan.active_originals.clear()
@@ -1011,11 +1096,10 @@ class PerturbedActivationCache:
     def finalize(self) -> dict:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         written: list[str] = []
-        for name, snaps in self._snaps.items():
-            if not snaps:
+        for name, rows in self._snap_rows.items():
+            if rows is None or rows.size(0) == 0:
                 continue
-            x = torch.cat(snaps, dim=0)[:self.input_rows]
-            x = x.to(torch.bfloat16).contiguous()
+            x = rows[:self.input_rows].to(torch.bfloat16).contiguous()
             torch.save(
                 {"inputs": x, "name": name, "source": "perturbed_x"},
                 self.cache_dir / activation_cache_filename(name),

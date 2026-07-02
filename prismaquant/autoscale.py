@@ -91,18 +91,73 @@ def _act_width(cfg: dict) -> int:
     return max(w for w in widths if w > 0) if any(w > 0 for w in widths) else hidden
 
 
-def _model_weight_bytes_on_disk(model_path: str) -> int:
-    """Sum of all *.safetensors blob sizes. Works on both HF snapshots
-    and staged copies. Falls back to 0 if the dir doesn't exist yet."""
+def _safetensors_source_float_bytes(dtype_name: str) -> int | None:
+    """On-disk bytes/element for a safetensors *floating* dtype name;
+    None for non-float dtypes (kept verbatim by the streaming loader)."""
+    dt = str(dtype_name).upper()
+    if dt.startswith("F8"):
+        return 1
+    if dt in ("F16", "BF16"):
+        return 2
+    if dt == "F32":
+        return 4
+    if dt == "F64":
+        return 8
+    return None
+
+
+def _shard_resident_bytes(path: Path, dtype_bytes: int) -> int:
+    """Resident bytes for one safetensors shard after streaming load.
+
+    `_read_layer_to_device` casts every floating tensor to the execution
+    dtype (native-FP8 weights are block-dequanted to bf16), so resident
+    bytes per float element = ``dtype_bytes`` regardless of on-disk
+    element size — the same rule `streaming_model._estimate_layer_cache_bytes`
+    applies per tensor. fp8-native checkpoints (1 byte/elem on disk)
+    therefore occupy 2x their disk size in the layer cache; sizing from
+    raw file size undercounts them 2x and blows the memory budget.
+
+    Parses the safetensors JSON header directly (stdlib-only; no tensor
+    data is read). Raises on malformed files; the caller falls back to
+    the raw file size."""
+    with open(path, "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        if header_len <= 0 or header_len > 512 * 1024 ** 2:
+            raise ValueError(
+                f"implausible safetensors header length {header_len} in {path}"
+            )
+        header = json.loads(f.read(header_len))
+    total = 0
+    for key, meta in header.items():
+        if key == "__metadata__":
+            continue
+        off = meta["data_offsets"]
+        nbytes = int(off[1]) - int(off[0])
+        src_bytes = _safetensors_source_float_bytes(meta.get("dtype", ""))
+        if src_bytes is None:
+            total += nbytes
+        else:
+            total += (nbytes // src_bytes) * int(dtype_bytes)
+    return total
+
+
+def _model_resident_weight_bytes(model_path: str, dtype_bytes: int) -> int:
+    """Sum of resident (post-cast/dequant) bytes across all *.safetensors
+    blobs — dtype-aware, see `_shard_resident_bytes`. Falls back to the
+    raw blob size per shard when a header can't be parsed, and to 0 if
+    the dir doesn't exist yet."""
     p = Path(model_path)
     if not p.exists():
         return 0
     total = 0
     for f in p.glob("*.safetensors"):
         try:
-            total += f.stat().st_size
-        except OSError:
-            pass
+            total += _shard_resident_bytes(f, dtype_bytes)
+        except Exception:
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
     return total
 
 
@@ -129,7 +184,11 @@ def estimate_per_layer_bytes(
 ) -> tuple[int, int]:
     """Return `(per_layer_weight_bytes, per_layer_active_shard_bytes)`.
 
-    - weight bytes: disk size / num_layers, minus head/embed approximation
+    - weight bytes: *resident* size / num_layers, minus head/embed
+      approximation. Resident is dtype-aware: floating checkpoint tensors
+      cast to the execution dtype at load, so fp8-native sources dequant
+      to bf16 in the layer cache (2 bytes/elem resident, not the 1
+      byte/elem on disk — sizing from disk undercounted those 2x).
     - active_shard bytes: gradients (~weight) + retained activations
       (N·T·act_width·dtype·act_mult)
 
@@ -137,10 +196,10 @@ def estimate_per_layer_bytes(
     `max(hidden, intermediate)` (see `_act_width`). Defaults to `hidden_size`
     for back-compat; pass the FFN-aware width so large-MLP models size right.
     """
-    total_disk = _model_weight_bytes_on_disk(model_path)
-    if total_disk > 0 and num_layers > 0:
+    total_resident = _model_resident_weight_bytes(model_path, dtype_bytes)
+    if total_resident > 0 and num_layers > 0:
         # subtract a conservative 10% for non-layer weights (embed, lm_head, norms)
-        body_bytes = int(total_disk * 0.90)
+        body_bytes = int(total_resident * 0.90)
         per_layer_weight = body_bytes // num_layers
     else:
         per_layer_weight = 1 * 1024 ** 3  # 1 GB fallback
