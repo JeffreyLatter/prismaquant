@@ -179,10 +179,40 @@ class HDetailIndex:
 
     @staticmethod
     def h_diag_from_blob(blob: dict) -> torch.Tensor:
+        """Return the Fisher diagonal from an h-detail blob, in PER-TOKEN
+        units.
+
+        Both writers (`sensitivity_probe.FisherAccumulator.finalize` and
+        `incremental_probe`) now normalize by token count and stamp
+        ``units: "per_token"`` via `sensitivity_probe.h_detail_blob`
+        (audit M9). Legacy blobs without the marker:
+
+          - ``h_diag``: accepted as per-token — that writer always
+            divided by token count. Caveat: pre-v3 sensitivity blobs for
+            UNPACKED expert Linears additionally divided by route_prob
+            (audit M4) and are indistinguishable from the blob alone;
+            regenerate such h-detail dirs if expert rows matter.
+          - raw ``H``: the old incremental writer's token-SUMMED
+            accumulator — ~n_tokens× hot for this consumer. Refuse
+            rather than silently mis-scale predicted_dloss; regenerate
+            the h-detail directory with the current probe.
+        """
+        units = blob.get("units")
+        if units is not None and units != "per_token":
+            raise ValueError(
+                f"h-detail blob {blob.get('name')!r} has unknown units "
+                f"{units!r}; this consumer requires 'per_token'.")
         if "h_diag" in blob:
             return blob["h_diag"]
         if "H" in blob:
-            return blob["H"]
+            if units == "per_token":
+                return blob["H"]
+            raise ValueError(
+                f"h-detail blob {blob.get('name')!r} carries a raw "
+                "token-summed 'H' tensor with no units marker (legacy "
+                "incremental_probe writer). Its scale is ~n_tokens× off "
+                "for predicted_dloss; regenerate the h-detail directory "
+                "with the current probe instead of consuming it.")
         raise KeyError("h-detail blob has neither 'h_diag' nor 'H'")
 
 

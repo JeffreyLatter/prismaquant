@@ -138,6 +138,10 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
                         "H": torch.rand(4, 16),
                         "g2_per_token": torch.linspace(0.25, 2.0, steps=7),
                         "name": name,
+                        # Audit M9: incremental-style blobs must carry the
+                        # per-token unit marker; unmarked raw "H" blobs are
+                        # refused by HDetailIndex.h_diag_from_blob.
+                        "units": "per_token",
                     },
                     h_dir / safe,
                 )

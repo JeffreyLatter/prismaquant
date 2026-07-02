@@ -272,6 +272,119 @@ def test_hook_harvest_matches_legacy_and_frees_grads():
         assert (again["costs"][n]["NVFP4"]["predicted_dloss"]
                 == legacy["costs"][n]["NVFP4"]["predicted_dloss"])
 
+class _RoutedToy(nn.Module):
+    """Data-dependent MoE routing: token id < vocab//2 -> expert_a, else
+    expert_b. With probe_microbatch=1 and sample 0 = low ids only, expert_a
+    is ABSENT from the final micro-batch's autograd graph — the audit
+    2026-07-02 M5 repro shape (scratchpad hook_mb_repro.py)."""
+
+    def __init__(self, vocab: int = 61, hidden: int = 32):
+        super().__init__()
+        self.vocab = vocab
+        self.emb = nn.Embedding(vocab, hidden)
+        self.expert_a = nn.Linear(hidden, hidden, bias=False)
+        self.expert_b = nn.Linear(hidden, hidden, bias=False)
+        self.dense = nn.Linear(hidden, hidden, bias=False)
+        self.head = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, ids):
+        x = self.emb(ids)
+        xf = x.reshape(-1, x.size(-1))
+        lo = ids.reshape(-1) < self.vocab // 2
+        out = torch.zeros_like(xf)
+        if lo.any():
+            out[lo] = self.expert_a(xf[lo])
+        if (~lo).any():
+            out[~lo] = self.expert_b(xf[~lo])
+        xf = xf + out
+        x = xf.reshape(ids.size(0), ids.size(1), -1)
+        x = x + torch.tanh(self.dense(x))
+        return SimpleNamespace(logits=self.head(x))
+
+
+def test_hook_harvest_microbatch_harvests_routed_stragglers():
+    """Audit 2026-07-02 M5: with hook_harvest + probe_microbatch, a param
+    routed only in NON-final micro-batches used to have its accumulated grad
+    discarded -> predicted_dloss 0.0 with 0 probe samples, silently."""
+    torch.manual_seed(11)
+    model = _RoutedToy().eval()
+    g = torch.Generator().manual_seed(7)
+    lo = torch.randint(0, 30, (1, 8), generator=g)   # sample 0: expert_a only
+    hi = torch.randint(30, 61, (1, 8), generator=g)  # sample 1: expert_b only
+    ids = torch.cat([lo, hi], dim=0)
+    K = 256
+    kw = dict(n_probes=K, min_free_gib=0.0, n_linear_chunks=1)
+
+    mono = compute_aura_cost(model, ids, ["NVFP4"], **kw)
+    legacy_mb = compute_aura_cost(
+        model, ids, ["NVFP4"], probe_microbatch=1, **kw)
+    hooked_mb = compute_aura_cost(
+        model, ids, ["NVFP4"], hook_harvest=True, probe_microbatch=1, **kw)
+
+    # The straggler expert gets a full complement of probe samples and a
+    # nonzero cost (the audit repro showed 0 samples / 0.0 for every format).
+    row = hooked_mb["costs"]["expert_a"]["NVFP4"]
+    assert len(row["x2_per_probe"]) == K
+    assert row["predicted_dloss"] > 0.0
+
+    # hook+microbatch == legacy+microbatch bit-for-bit: same probe seeds,
+    # same accumulated grads, shared projection code.
+    for n in legacy_mb["costs"]:
+        a = legacy_mb["costs"][n]["NVFP4"]
+        b = hooked_mb["costs"][n]["NVFP4"]
+        assert a["x2_per_probe"] == b["x2_per_probe"], n
+        assert a["predicted_dloss"] == b["predicted_dloss"], n
+    for n in legacy_mb["stats"]:
+        assert (legacy_mb["stats"][n]["h_trace"]
+                == hooked_mb["stats"][n]["h_trace"]), n
+
+    # vs the monolithic path the match is statistical, not bit-exact (each
+    # micro-batch draws its own Rademacher vector): the grad-accumulation
+    # normalization is factor-1 via token_count_override, so any slip there
+    # would show as a ~2x+ offset; 0.5 rel is flake-proof at K=256.
+    a = mono["costs"]["expert_a"]["NVFP4"]["predicted_dloss"]
+    b = hooked_mb["costs"]["expert_a"]["NVFP4"]["predicted_dloss"]
+    assert a > 0.0
+    assert abs(a - b) <= 0.5 * max(a, b), (a, b)
+
+
+def test_row_stderr_is_sample_variance_over_probes():
+    """Audit 2026-07-02 §3.13: the per-row stderr must use the SAMPLE
+    (1/(K-1)) variance, matching aura_additivity_gate, not population 1/K."""
+    import math
+
+    model = TinyLM().eval()
+    K = 4
+    payload = compute_aura_cost(
+        model, _ids(), ["NVFP4"],
+        n_probes=K, min_free_gib=0.0, n_linear_chunks=1,
+    )
+    checked = 0
+    for n, rows in payload["costs"].items():
+        xs = rows["NVFP4"]["x2_per_probe"]
+        assert len(xs) == K
+        mean = sum(xs) / K
+        var = sum((x - mean) ** 2 for x in xs) / (K - 1)  # by hand, 1/(K-1)
+        expected = 0.5 * math.sqrt(var / K)
+        got = rows["NVFP4"]["predicted_dloss_stderr"]
+        assert got == pytest.approx(expected, rel=1e-6), n
+        if var > 0:
+            # the old population form is strictly smaller -> would fail
+            pop = 0.5 * math.sqrt(
+                max(sum(x * x for x in xs) / K - mean * mean, 0.0) / K)
+            assert got > pop, n
+            checked += 1
+    assert checked > 0  # the population-vs-sample distinction was exercised
+
+    # K=1: sample variance undefined -> stderr 0.0 (previous convention too)
+    p1 = compute_aura_cost(
+        model, _ids(), ["NVFP4"],
+        n_probes=1, min_free_gib=0.0, n_linear_chunks=1,
+    )
+    for n, rows in p1["costs"].items():
+        assert rows["NVFP4"]["predicted_dloss_stderr"] == 0.0
+
+
 # ---- grafted from codex/review-batch (packed-expert guard, auto-chunk, delta_w provenance) ----
 from prismaquant.aura_cost import (
     _guard_packed_expert_coverage,

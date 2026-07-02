@@ -507,37 +507,56 @@ def compute_aura_cost(
         #    is dW only, so chunks are ~3-4x larger and total backwards
         #    proportionally fewer. Per-(key,probe) values are identical
         #    (same reductions, just earlier).
+
+        def _harvest_grad(name: str, g: torch.Tensor) -> None:
+            """Project one fully-accumulated probe gradient into the running
+            sums. Single reduction shared by all three harvest sites (hook,
+            post-backward straggler sweep, legacy loop) so they are
+            arithmetically identical by construction."""
+            with torch.no_grad():
+                gf = g.float()
+                g_trace[name] += float((gf * gf).sum().item())
+                for f in nonzero_fmts:
+                    key = (name, f)
+                    if key in dW:
+                        x2 = float(
+                            (gf * dW[key].float()).sum().item()) ** 2
+                        s2[key] += x2
+                        s4[key] += x2 * x2
+                        x2_probe[key].append(x2)
+
         hook_handles = []
         # Probe micro-batching (opt-in): at production calib volume the
         # vocab-shaped tensors of a monolithic forward dominate memory
         # (logits 32x1024x152k fp32 ~ 20 GiB, plus probe temps + grad-of-
         # logits). The probe scalar is a token-sum, so backward over
         # micro-batches accumulates EXACTLY the same total gradient; the
-        # harvest hooks must fire only once the accumulation is complete.
+        # harvest hooks must fire only once the accumulation is complete,
+        # and params absent from the final micro-batch's graph are picked
+        # up by the post-backward straggler sweep (see below).
         # Probe noise is seeded per (probe, micro-batch), so results are
         # statistically equivalent to monolithic, not bit-identical —
         # except probe_microbatch=0/>=B (single batch), which is the
         # unchanged legacy path.
         _harvest_gate = {"on": True}
+        # Names already harvested for the CURRENT probe. The hook only fires
+        # for params in the FINAL micro-batch's autograd graph; a param that
+        # participated only in earlier micro-batches (data-dependent routing)
+        # still holds its real accumulated grad, which the post-backward
+        # straggler sweep below harvests instead (audit 2026-07-02 M5 —
+        # previously that grad was silently discarded → predicted_dloss 0.0).
+        # This set guards against double-harvest between the two sites.
+        _harvested: set[str] = set()
         if hook_harvest:
             def _make_hook(name: str):
                 def _hook(param: torch.Tensor) -> None:
                     if not _harvest_gate["on"]:
                         return  # mid-accumulation: keep the partial grad
                     g = param.grad
-                    if g is None:
+                    if g is None or name in _harvested:
                         return
-                    with torch.no_grad():
-                        gf = g.float()
-                        g_trace[name] += float((gf * gf).sum().item())
-                        for f in nonzero_fmts:
-                            key = (name, f)
-                            if key in dW:
-                                x2 = float(
-                                    (gf * dW[key].float()).sum().item()) ** 2
-                                s2[key] += x2
-                                s4[key] += x2 * x2
-                                x2_probe[key].append(x2)
+                    _harvest_grad(name, g)
+                    _harvested.add(name)
                     param.grad = None
                 return _hook
             for n in chunk:
@@ -550,6 +569,7 @@ def compute_aura_cost(
                     f"free UMA {_free_gib():.1f} < floor {min_free_gib}; abort")
             for n in chunk:
                 linears[n].weight.grad = None
+            _harvested.clear()
             _B = calib_ids.size(0)
             _mb = int(probe_microbatch) if int(probe_microbatch) > 0 else _B
             _starts = list(range(0, _B, _mb))
@@ -580,23 +600,31 @@ def compute_aura_cost(
                 del logits, probe
             _harvest_gate["on"] = True
             logits = probe = None
-            if not hook_harvest:
-                with torch.no_grad():
-                    for n in chunk:
-                        g = linears[n].weight.grad
-                        if g is None:
-                            continue
-                        gf = g.float()
-                        g_trace[n] += float((gf * gf).sum().item())
-                        for f in nonzero_fmts:
-                            key = (n, f)
-                            if key in dW:
-                                x2 = float(
-                                    (gf * dW[key].float()).sum().item()) ** 2
-                                s2[key] += x2
-                                s4[key] += x2 * x2
-                                x2_probe[key].append(x2)
-                        linears[n].weight.grad = None
+            if hook_harvest:
+                # Straggler sweep (M5): harvest any param the hook did NOT
+                # fire for this probe but that holds a non-None accumulated
+                # grad (i.e. it participated only in non-final micro-batches).
+                # The accumulated .grad IS the monolithic-scale gradient:
+                # every micro-batch's probe is normalized by the GLOBAL
+                # selected-token count (token_count_override=_global_tc), so
+                # backward accumulation across micro-batches is a plain sum
+                # with factor 1 — no renormalization needed here.
+                for n in chunk:
+                    if n in _harvested:
+                        continue
+                    g = linears[n].weight.grad
+                    if g is None:
+                        continue
+                    _harvest_grad(n, g)
+                    _harvested.add(n)
+                    linears[n].weight.grad = None
+            else:
+                for n in chunk:
+                    g = linears[n].weight.grad
+                    if g is None:
+                        continue
+                    _harvest_grad(n, g)
+                    linears[n].weight.grad = None
             torch.cuda.empty_cache()
             if (k + 1) % 8 == 0:
                 _log(f"  chunk {ci+1}/{len(chunks)} probe {k+1}/{n_probes}; "
@@ -645,8 +673,17 @@ def compute_aura_cost(
             # probes is 0.5·std(x²)/√K. This is the row's *risk*, free from the
             # same projections -- it feeds 'are K probes enough' introspection
             # and the additivity-gate threshold without seed-sweeping.
+            # std uses the SAMPLE (1/(K−1)) variance, matching the additivity
+            # gate's per-probe stderr (audit 2026-07-02 §3.13: the earlier
+            # population 1/K form understated it by √(K/(K−1)), ~1.6% at
+            # K=32, feeding the opt-in UCB charge). K<2 → stderr 0.0.
             mean_x2 = inv * s2[key]
-            var_x2 = max(inv * s4[key] - mean_x2 * mean_x2, 0.0)
+            if n_probes >= 2:
+                var_x2 = max(
+                    (s4[key] - n_probes * mean_x2 * mean_x2)
+                    / (n_probes - 1), 0.0)
+            else:
+                var_x2 = 0.0
             costs[n][f] = {
                 "predicted_dloss": 0.5 * mean_x2,
                 "predicted_dloss_stderr": 0.5 * math.sqrt(var_x2 * inv),

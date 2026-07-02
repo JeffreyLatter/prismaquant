@@ -132,6 +132,41 @@ def measure_subset(
             "kl_windows": vals}
 
 
+def pair_interaction_stats(meas: dict, ka: dict, kb: dict) -> dict:
+    """Interaction I = KL({a,b}) − KL(a) − KL(b) with a PAIRED stderr.
+
+    All three KL means are computed over the SAME calibration windows, so
+    per-window difficulty is common-mode and cancels exactly in
+    I_w = KL_ab,w − KL_a,w − KL_b,w. The significance test therefore uses
+    stderr = sample-std(I_w)/√n. The old unpaired √(σ_ab²+σ_a²+σ_b²)
+    triple-counts the shared window-difficulty variance, overstating the
+    stderr and biasing the test toward the additivity null (audit
+    2026-07-02 §3.11 — this fed the "3/1180 pairs significant" result);
+    it is kept under ``interaction_stderr_unpaired`` for comparability
+    with prior runs.
+    """
+    w_ab, w_a, w_b = (meas["kl_windows"], ka["kl_windows"], kb["kl_windows"])
+    if not (len(w_ab) == len(w_a) == len(w_b) and w_ab):
+        raise ValueError(
+            f"paired interaction needs aligned non-empty per-window KLs; got "
+            f"lengths {len(w_ab)}/{len(w_a)}/{len(w_b)}")
+    inter = meas["kl_mean"] - ka["kl_mean"] - kb["kl_mean"]
+    i_w = [ab - a_ - b_ for ab, a_, b_ in zip(w_ab, w_a, w_b)]
+    n = len(i_w)
+    mean_i = sum(i_w) / n
+    var_i = sum((v - mean_i) ** 2 for v in i_w) / max(n - 1, 1)
+    stderr = math.sqrt(var_i / n)
+    stderr_unpaired = math.sqrt(
+        meas["kl_stderr"] ** 2 + ka["kl_stderr"] ** 2 + kb["kl_stderr"] ** 2)
+    return {
+        "kl_joint": meas["kl_mean"],
+        "interaction": inter,
+        "interaction_stderr": stderr,
+        "interaction_stderr_unpaired": stderr_unpaired,
+        "significant": abs(inter) > 2 * stderr,
+    }
+
+
 def relation(a: str, b: str) -> str:
     """Circuit relation between two Linear names (Qwen-style naming)."""
     def parse(n):
@@ -306,15 +341,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             meas = measure_subset(
                 [(a, fmt), (b, fmt)], flipper, teacher, model, windows)
             ka, kb = unary[(a, fmt)], unary[(b, fmt)]
-            inter = meas["kl_mean"] - ka["kl_mean"] - kb["kl_mean"]
-            stderr = math.sqrt(meas["kl_stderr"] ** 2
-                               + ka["kl_stderr"] ** 2
-                               + kb["kl_stderr"] ** 2)
             pairs_out.append({
                 "a": a, "b": b, "relation": relation(a, b),
-                "kl_joint": meas["kl_mean"], "interaction": inter,
-                "interaction_stderr": stderr,
-                "significant": abs(inter) > 2 * stderr,
+                **pair_interaction_stats(meas, ka, kb),
             })
             if (k + 1) % 200 == 0:
                 _log(f"pairs {k + 1}/{len(pair_set)} "

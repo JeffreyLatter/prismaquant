@@ -15,7 +15,13 @@ regex. MTP is a built-in shard kind: after the body forward we synthesize
 a `MtpModule`, load `mtp.*` weights directly from safetensors, and run
 its own forward+backward for Fisher collection. The per-shard pickle
 output format matches `sensitivity_probe.run_probe_pass` / `streaming_probe`
-unchanged — the allocator consumes either.
+unchanged — the allocator consumes either. The two backends also agree on
+the estimator and normalization conventions: per-token-summed empirical
+Fisher (Σ_t ‖∇_t‖², including packed experts via the F.linear
+interception in `install_packed_expert_hooks`), divided by the tokens
+each entry actually saw (routed tokens for MoE experts — the single
+implicit ÷token-fraction; `run_probe_pass` used to apply a second
+÷route_prob, removed per audit M4).
 """
 from __future__ import annotations
 
@@ -69,6 +75,7 @@ from .sensitivity_probe import (
     FisherAccumulator,
     RouterTracker,
     discover_moe_structure,
+    h_detail_blob,
     install_packed_expert_hooks,
     load_calibration,
     per_token_ce,
@@ -2165,12 +2172,16 @@ def _run_body_streaming_shard(
             moe_block_handles.clear()
             moe_linear_to_block.clear()
 
-            packed_grad_acc: dict[str, float] = {}
+            # Scalar per-token-summed Fisher trace per packed param.
+            # Values are device-resident 0-dim fp32 tensors (flushed via
+            # float() below — one sync per packed param per layer).
+            packed_grad_acc: dict[str, torch.Tensor] = {}
             # Per-expert per-channel Fisher [E, M] — enables per-expert
             # h_trace decomposition for the allocator's packed-3D prune
             # cost without re-measuring cost per expert. Always enabled
             # here; the accumulator's memory is ~1 MB per packed param
-            # at 128 experts × 5760 channels, negligible on 121 GB RAM.
+            # at 128 experts × 5760 channels, negligible on 121 GB RAM
+            # (device-resident until the flush below).
             packed_channel_acc: dict[str, torch.Tensor] = {}
             packed_full_acc: dict[str, torch.Tensor] | None = (
                 {} if h_detail_dir is not None else None)
@@ -2343,17 +2354,17 @@ def _run_body_streaming_shard(
                     acc_stats[full_key]["n_tokens_seen"] = \
                         acc_stats[full_key].get("n_tokens_seen", 0) + x_in.size(0) * x_in.size(1)
             # Per-expert Fisher trace decomposition. channel_acc[key] is
-            # [E, M] (grad² summed over the in-feature dim); summing over
-            # M collapses to [E] — per-expert Fisher trace. Stored as a
-            # float list in the stat entry so it survives pickle + merge
-            # without torch-device round-trips, and the allocator's
-            # add_packed_prune_candidates reads it directly.
+            # [E, M] (per-token-summed Σ_t gy_{e,t,m}²·‖x_{e,t}‖²);
+            # summing over M collapses to [E] — per-expert Fisher trace.
+            # Stored as a float list in the stat entry so it survives
+            # pickle + merge without torch-device round-trips, and the
+            # allocator's add_packed_prune_candidates reads it directly.
             for local_key, per_ch in packed_channel_acc.items():
                 full_key = f"{layer_prefix}{local_key}"
                 if full_key not in acc_stats:
                     continue
-                # per_ch is on CPU fp32; summing over the last dim gives
-                # per-expert trace without a device sync.
+                # per_ch is fp32 (device-resident); the .tolist() below is
+                # the single flush sync for this packed param.
                 per_expert_trace = per_ch.sum(dim=-1).to(torch.float64)
                 prev = acc_stats[full_key].get("h_trace_per_expert_raw")
                 if prev is None:
@@ -2405,8 +2416,16 @@ def _run_body_streaming_shard(
                 for local_key, tensor in packed_full_acc.items():
                     full_key = f"{layer_prefix}{local_key}"
                     fname = re.sub(r"[^A-Za-z0-9_-]", "__", full_key) + ".pt"
-                    torch.save({"H": tensor, "name": full_key},
-                               detail_dir / fname)
+                    # Per-token units + explicit marker (audit M9): the
+                    # accumulator is token-summed; normalize by this
+                    # layer's token count so the blob matches the
+                    # sensitivity-probe writer's units.
+                    entry = acc_stats.get(full_key, {})
+                    torch.save(
+                        h_detail_blob(tensor,
+                                      int(entry.get("n_tokens_seen", 0)),
+                                      full_key, kind="packed"),
+                        detail_dir / fname)
                 packed_full_acc.clear()
             # Body layer FQNs are unique within the shard, so activation
             # snapshots can be flushed as soon as that layer has run.
@@ -2477,13 +2496,17 @@ def _run_body_streaming_shard(
                 torch.cat(g2_parts, dim=0).to(torch.float32).cpu()
                 if g2_parts else torch.empty(0, dtype=torch.float32)
             )
+            # Per-token units + explicit marker (audit M9): this writer
+            # used to save the raw token-summed accumulator under "H",
+            # leaving HDetailIndex consumers ~n_tokens× hotter than
+            # blobs from sensitivity_probe. h_detail_blob normalizes by
+            # the tokens this Linear actually saw and stamps
+            # units="per_token"; g2_per_token stays raw (it is already
+            # a per-token vector).
+            tokens = int(merged_stats.get(fqn, {}).get("n_tokens_seen", 0))
             torch.save(
-                {
-                    "H": h,
-                    "name": fqn,
-                    "g2_per_token": g2_per_token,
-                    "h_detail_version": 2,
-                },
+                h_detail_blob(h, tokens, fqn, kind="linear",
+                              g2_per_token=g2_per_token),
                 detail_dir / fname,
             )
 
@@ -2746,7 +2769,11 @@ def _run_mtp_streaming_shard(
         t_fwd += time.time() - t0
 
         t0 = time.time()
-        lp = F.log_softmax(logits.reshape(-1, logits.size(-1)), dim=-1)
+        # .float() before log_softmax: matches the phase-2 chunked CE
+        # sites (which cast lm_head output to fp32 first) — bf16
+        # log_softmax costs ~0.4% rel on the Fisher CE gradient.
+        lp = F.log_softmax(logits.reshape(-1, logits.size(-1)).float(),
+                           dim=-1)
         gather = -lp.gather(1, target_ids.reshape(-1, 1)).squeeze(1)
         if importance_weighting:
             with torch.no_grad():
