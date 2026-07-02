@@ -318,6 +318,18 @@ def _strict_production_cache_enabled() -> bool:
     ) not in ("", "0", "false", "False")
 
 
+def _expert_lazy_fill_enabled() -> bool:
+    """M4: lazily render a frontier point's packed experts (e.g. FP8) into the
+    shared cache just before scoring it. The format-menu build renders NVFP4
+    experts eagerly; non-eager expert formats are gap-filled per-assignment so
+    the validated frontier can SELECT expert format by real KL without an eager
+    all-experts FP8 render. Off => the strict gate hard-fails on expert misses
+    (legacy behavior)."""
+    return os.environ.get(
+        "PRISMAQUANT_EXPERT_LAZY_FILL", "1"
+    ) not in ("", "0", "false", "False")
+
+
 def _production_cache_assignment_diagnostics(
     production_cache,
     assignment: Mapping[str, str],
@@ -539,6 +551,82 @@ def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
         )
         for idx in range(repeats)
     ]
+
+
+def _load_expert_render_calib(tokenizer, args) -> torch.Tensor | None:
+    """Calib draw for the M4 lazy packed-expert (FP8) render — the BUILD/render
+    split, DISJOINT from the selection split that KL is measured on.
+
+    With ``--calib-skip-first K`` the selection calib is windows ``[K, K+n)``
+    (see ``_load_calibration_repeats``); this returns ALL K withheld render
+    windows ``[0, K)`` at the validator's seqlen — token-disjoint from
+    selection by construction (same-seqlen windowing; do NOT draw at a
+    different seqlen or the [0,K)/[K,K+n) split stops being token-disjoint).
+    Known volume caveat: the eager NVFP4 rung was rendered on the BUILD's
+    calib volume, which can exceed this draw under thin-frontier configs — a
+    render-volume asymmetry in the NVFP4-vs-FP8 comparison that the served
+    re-validation gate, not this screen, ultimately arbitrates. Without a
+    disjoint render split (skip==0) or a dataset it returns ``None`` so the
+    caller can fall back to the selection calib WITH a loud in-sample warning
+    (the FP8 rung is then in-sample and a reject-FP8 outcome is
+    conservative-only — never promote an FP8-favorable frontier point off an
+    in-sample render). House rule: held-out split disjoint from cost/render
+    generation."""
+    skip = max(int(getattr(args, "calib_skip_first", 0) or 0), 0)
+    if skip <= 0 or not args.dataset:
+        return None
+    ids = load_calibration(
+        tokenizer, args.dataset, skip, args.calib_seqlen,
+        calib_seed=int(getattr(args, "calib_seed", 42) or 42))
+    return ids[:skip].contiguous() if ids.size(0) >= 1 else None
+
+
+def _persist_lazy_expert_renders(
+    production_cache,
+    cache_path: str,
+    *,
+    pristine_cache_dir: object = "__unset__",
+) -> None:
+    """M4: make lazily-rendered packed-expert entries durable.
+
+    The gap-fill registers new ``(qname, fmt)`` keys only on the in-memory
+    cache object; downstream consumers (production_recache, export) resolve
+    keys via the PICKLED weights dict, so without a re-pickle the shards on
+    disk are invisible and a selected FP8-expert frontier point would be
+    unshippable — export must reuse the exact bytes real KL selected
+    (principle #8). Atomic same-dir replace; never a tempdir on another
+    filesystem.
+
+    Validator-session state must NOT leak into the shared build artifact:
+    ``pristine_cache_dir`` (captured before ``relocate()``) is restored for
+    the dump so ``--production-cache-dir-override`` is not baked in, and any
+    ``enable_lru`` bookkeeping is stripped and restored after.
+    """
+    if hasattr(production_cache, "compact_for_pickle"):
+        production_cache.compact_for_pickle()
+    saved: dict[str, object] = {}
+    lru_defaults = {
+        "_lru_max_bytes": 0,
+        "_lru_order": None,
+        "_lru_paths": None,
+        "_lru_bytes": 0,
+    }
+    for attr, default in lru_defaults.items():
+        if hasattr(production_cache, attr):
+            saved[attr] = getattr(production_cache, attr)
+            setattr(production_cache, attr, default)
+    if pristine_cache_dir != "__unset__":
+        saved["cache_dir"] = production_cache.cache_dir
+        production_cache.cache_dir = pristine_cache_dir
+    try:
+        path = Path(cache_path)
+        tmp = path.with_name(f"{path.name}.m4fill.{os.getpid()}.tmp")
+        with tmp.open("wb") as fh:
+            pickle.dump(production_cache, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+    finally:
+        for attr, value in saved.items():
+            setattr(production_cache, attr, value)
 
 
 def _kl_repeat_summary(values: Sequence[float], *, ucb_z: float) -> dict[str, object]:
@@ -836,8 +924,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.disable_frozen_weight_cache:
-        import os
-
+        # NB: module-level `os` (do NOT `import os` here — a local import would
+        # shadow it as a function-local for all of main(), leaving the
+        # module-level references below unbound when this flag is off).
         os.environ["PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE"] = "0"
 
     stats = _load_probe_stats(args.probe)
@@ -933,12 +1022,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         model.eval()
         model_device = next(model.parameters()).device
         production_cache = None
+        pristine_cache_dir: object = "__unset__"
         if args.production_weight_cache:
             import pickle
 
             with Path(args.production_weight_cache).open("rb") as fh:
                 production_cache = pickle.load(fh)
             if args.production_cache_dir_override:
+                # Remember the as-pickled cache_dir: if the M4 lazy gap-fill
+                # re-pickles this cache, the session's dir override must not
+                # be baked into the shared build artifact.
+                pristine_cache_dir = getattr(production_cache, "cache_dir", None)
                 production_cache.relocate(args.production_cache_dir_override)
             if (
                 args.production_cache_lru_gb
@@ -986,12 +1080,104 @@ def main(argv: Sequence[str] | None = None) -> int:
             for calib_ids in calib_repeats
         ]
 
+        # M4: lazily render each frontier point's packed experts into the
+        # shared cache BEFORE the strict gate. The format-menu build renders
+        # NVFP4 experts eagerly; this gap-fills the rare Pareto point proposing
+        # FP8 (or other non-eager) expert formats, rendering ONLY that point's
+        # packed experts (resume-skip no-ops already-cached NVFP4). Keeps FP8
+        # measurable so real-KL rejects it (route-flip floor) without the eager
+        # ~64 GB / ~1 hr all-experts FP8 render. Disable: PRISMAQUANT_EXPERT_LAZY_FILL=0.
+        if (
+            production_cache is not None
+            and _expert_lazy_fill_enabled()
+            and hasattr(production_cache, "assignment_keys")
+        ):
+            from prismaquant.production_weight_cache import (
+                fill_packed_expert_cache_entries,
+                is_uncached_packed_expert_qname,
+            )
+            # Render the lazy experts on the BUILD/render split (DISJOINT from
+            # the selection calib KL is measured on), matching the eager NVFP4
+            # render — else the FP8 rung is fit in-sample to the split it is
+            # selected on. NOTE: like the eager NVFP4 render this omits the
+            # cross-domain do-no-harm gate the assignment-mode ship recipe uses;
+            # the frontier compares NVFP4 vs FP8 under the same no-gate recipe,
+            # but ship export must REUSE this cache (not re-render assignment-
+            # mode) or the selection rides on different bytes (principle #8).
+            _expert_render_ids = _load_expert_render_calib(tokenizer, args)
+            if _expert_render_ids is None:
+                _expert_render_ids = calib_repeats[0]
+                print(
+                    "[validate-kl/M4] WARNING: lazy expert render uses the "
+                    "SELECTION calib (no --calib-skip-first render split); the "
+                    "FP8 expert rung is IN-SAMPLE — a reject-FP8 outcome is "
+                    "conservative-only; do not promote an FP8-favorable "
+                    "frontier point off this measurement.",
+                    flush=True,
+                )
+            _lazy_filled_total = 0
+            for _label, _assignment, _path in assignments:
+                _keys, _missing = production_cache.assignment_keys(
+                    _assignment, include_packed_experts=True)
+                _expert_miss = {
+                    str(n) for n, _f in _missing
+                    if is_uncached_packed_expert_qname(str(n))
+                }
+                _expert_ra = {
+                    n: f for n, f in _assignment.items()
+                    if str(n) in _expert_miss
+                    and fr.canonical_format_name(str(f)) != "BF16"
+                }
+                if not _expert_ra:
+                    continue
+                print(
+                    f"[validate-kl/M4] '{_label}': lazy-rendering "
+                    f"{len(_expert_ra)} packed-expert tensor(s) at "
+                    f"{sorted(set(_expert_ra.values()))} (gap-fill)",
+                    flush=True,
+                )
+                # Each call re-captures activations for this point's modules
+                # (not shared across points); fine since FP8-expert points are
+                # rare near the knee.
+                _cov = fill_packed_expert_cache_entries(
+                    production_cache, model, _expert_render_ids,
+                    render_assignment=_expert_ra,
+                    levers=production_cache.levers, profile=profile,
+                    cache_dir=getattr(production_cache, "cache_dir", None),
+                    render_mode="batched",
+                )
+                _lazy_filled_total += len(_cov)
+                if len(_cov) < len(_expert_ra):
+                    print(
+                        f"[validate-kl/M4] WARNING: '{_label}': gap-fill "
+                        f"rendered only {len(_cov)}/{len(_expert_ra)} "
+                        "requested packed-expert tensors (unpacked-expert "
+                        "model or live/recipe name mismatch) — the strict "
+                        "gate below will fail on the remainder.",
+                        flush=True,
+                    )
+            if _lazy_filled_total:
+                # Persist BEFORE measurement: shards without pickled keys are
+                # invisible to recache/export (they resolve via the pickled
+                # weights dict), which would make a selected FP8-expert point
+                # unshippable. Failing here aborts pre-KL, not mid-KL.
+                _persist_lazy_expert_renders(
+                    production_cache, args.production_weight_cache,
+                    pristine_cache_dir=pristine_cache_dir)
+                print(
+                    f"[validate-kl/M4] persisted {_lazy_filled_total} "
+                    f"lazy-rendered packed-expert entr"
+                    f"{'y' if _lazy_filled_total == 1 else 'ies'} to "
+                    f"{args.production_weight_cache}",
+                    flush=True,
+                )
+
         if production_cache is not None and _strict_production_cache_enabled():
             # Fail-fast BEFORE any measurement: with the strict default
             # (M6), a cache missing required renders would otherwise abort
-            # mid-KL after minutes-to-hours. Packed-expert misses are the
-            # known M4 design gap (the frontier cache never renders packed
-            # experts), so name it.
+            # mid-KL after minutes-to-hours. After the M4 lazy expert gap-fill
+            # above, any REMAINING miss is a non-expert (or lazy-fill-disabled)
+            # packed-expert gap — the hint distinguishes them.
             for _label, _assignment, _path in assignments:
                 _diag = _production_cache_assignment_diagnostics(
                     production_cache, _assignment)
@@ -1003,13 +1189,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _expert = [m for m in _sample
                                if is_uncached_packed_expert_qname(str(m[0]))]
                     _hint = (
-                        " Missing entries include packed-MoE experts: the "
-                        "validated-surrogate frontier cache does not render "
-                        "packed experts (open design item M4) — this "
-                        "model/mode combination is unsupported. Use "
-                        "SELECTION_MODE=surrogate, which renders packed experts "
-                        "via --render-scope assignment, to ship a MoE artifact. "
-                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 falls "
+                        (
+                            " Missing entries include packed-MoE experts: "
+                            "the lazy gap-fill RAN but could not render them "
+                            "(unpacked-expert model, or the profile's expert "
+                            "live/recipe naming does not round-trip through "
+                            "cache resolve_key). Use SELECTION_MODE=surrogate "
+                            "(--render-scope assignment) for this model, or "
+                            "fix the profile naming. "
+                            if _expert_lazy_fill_enabled() else
+                            " Missing entries include packed-MoE experts: "
+                            "lazy expert gap-fill is OFF "
+                            "(PRISMAQUANT_EXPERT_LAZY_FILL=0), so non-eager "
+                            "expert formats (e.g. FP8) were not rendered. "
+                            "Re-enable it (default 1) to gap-fill each "
+                            "Pareto point's experts just-in-time, or use "
+                            "SELECTION_MODE=surrogate "
+                            "(--render-scope assignment). "
+                        )
+                        + "PRISMAQUANT_STRICT_PRODUCTION_CACHE=0 falls "
                         "back to RTN for research runs only."
                         if _expert else
                         " Rebuild the cache to cover the assignment, or set "

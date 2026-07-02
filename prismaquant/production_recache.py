@@ -258,16 +258,60 @@ def apply_activation_max_abs_to_cache(
     *,
     metadata: Mapping[str, object] | None = None,
 ) -> None:
-    """Update a ProductionWeightCache with re-fitted activation ranges."""
+    """Update a ProductionWeightCache with re-fitted activation ranges.
+
+    PACKED-expert scales (3-D tensors: several projection params on ONE
+    module plan) are PRESERVED from the cache, never replaced: the recache
+    replay's ``_capture`` records max|module INPUT| under every param name of
+    a module plan, so a packed experts module would record the hidden-state
+    max for BOTH ``gate_up_proj`` and ``down_proj`` — but ``down_proj``'s
+    real input is the routed post-SwiGLU intermediate, a different tensor
+    entirely. The render-time per-projection scales calibrated by
+    ``fill_packed_expert_cache_entries`` (routed rows, correct tensor per
+    projection) are the ones the frontier's real KL validated; silently
+    swapping them at recache would ship a served ``down_proj`` W4A4 input
+    scale selection never measured (principle #8: export must ship the
+    bytes/scales selection rode on). Per-expert-INDEXED names
+    (``...experts.5.down_proj`` — plain nn.Linear modules, DSv4/MiniMax
+    layouts) are NOT preserved: each is its own module plan, so the replay
+    capture is the correct per-projection tensor and the re-fit is the whole
+    point of this stage.
+    """
+    from prismaquant.production_weight_cache import (
+        is_packed_expert_param_qname,
+    )
+
     previous = dict(getattr(production_weight_cache, "activation_max_abs", {}) or {})
-    values = {str(k): float(v) for k, v in activation_max_abs.items() if v > 0}
+    values = {
+        str(k): float(v)
+        for k, v in activation_max_abs.items()
+        if v > 0 and not is_packed_expert_param_qname(str(k))
+    }
+    preserved_expert_scales = 0
+    for key, prev in previous.items():
+        if is_packed_expert_param_qname(str(key)):
+            values[str(key)] = float(prev)
+            preserved_expert_scales += 1
     production_weight_cache.activation_max_abs = values or None
     production_weight_cache.activation_scales = production_weight_cache.activation_max_abs
     meta = dict(getattr(production_weight_cache, "metadata", {}) or {})
     recache_meta = dict(metadata or {})
     recache_meta.setdefault("status", "applied")
     recache_meta.setdefault("n_activation_max_abs", len(values))
-    delta = activation_max_abs_delta_summary(previous, values)
+    if preserved_expert_scales:
+        recache_meta.setdefault(
+            "n_packed_expert_scales_preserved", preserved_expert_scales)
+    # Delta over the RE-FITTED subset only — preserved packed-expert keys are
+    # identical by construction and would dilute the summary to ~1.0 ratios.
+    refit_prev = {
+        k: v for k, v in previous.items()
+        if not is_packed_expert_param_qname(str(k))
+    }
+    refit_new = {
+        k: v for k, v in values.items()
+        if not is_packed_expert_param_qname(str(k))
+    }
+    delta = activation_max_abs_delta_summary(refit_prev, refit_new)
     if delta:
         recache_meta.setdefault("activation_max_abs_delta", delta)
     meta["activation_recache"] = recache_meta
@@ -375,7 +419,15 @@ def recache_production_weight_cache(
     cache_dir = getattr(production_weight_cache, "cache_dir", None)
     if write_sidecar and cache_dir:
         sidecar = Path(cache_dir) / "activation_max_abs.json"
-        sidecar.write_text(json.dumps(max_abs, indent=2))
+        # Write the APPLIED scales (post packed-expert preservation), not the
+        # raw replay captures — the raw dict carries the wrong-tensor
+        # module-input max under packed down_proj names, and a later
+        # shard-resume rebuild merges this sidecar back into the cache
+        # wholesale ("sidecar wins"). Persisting the rejected values would
+        # re-open the exact resurrection path the apply step closes.
+        applied = dict(
+            getattr(production_weight_cache, "activation_max_abs", {}) or {})
+        sidecar.write_text(json.dumps(applied, indent=2))
         delta = (
             getattr(production_weight_cache, "metadata", {}) or {}
         ).get("activation_recache", {}).get("activation_max_abs_delta")

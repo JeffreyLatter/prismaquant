@@ -64,6 +64,70 @@ def _model_has_packed_experts(model: nn.Module, profile) -> bool:
     )
 
 
+def render_format_menu_packed_experts(
+    cache,
+    model: nn.Module,
+    calib_ids,
+    formats,
+    *,
+    profile,
+    cache_dir=None,
+    module_token_budget: int = 32768,
+    render_mode: str = "batched",
+) -> dict:
+    """Eagerly render packed-MoE experts for a format-menu frontier cache.
+
+    Format-menu builds have no single assignment, but the validated frontier
+    must be able to SELECT each expert's format by real KL, so render packed
+    experts into the shared cache at the cheap rung real-KL actually picks
+    under the route-flip floor — NVFP4 (batched, fast); BF16 is passthrough
+    (no render). FP8 experts are rendered LAZILY per-Pareto-point in
+    validate_assignments_kl (M4): FP8 is Pareto-dominated on routed experts,
+    so eager-rendering all packed tensors at FP8 (~64 GB / ~1 hr, no batched
+    path) is wasted — keep FP8 on the menu and render only the rare point
+    that proposes it.
+
+    Returns the merged coverage dict (also merged into
+    ``cache.metadata['packed_expert_coverage']``).
+    """
+    from prismaquant.production_weight_cache import (
+        fill_packed_expert_cache_entries,
+    )
+    from prismaquant import format_registry as _fr
+
+    eager_fmts = [
+        f for f in formats
+        if _fr.canonical_format_name(str(f)) == "NVFP4"
+    ]
+    merged: dict = {}
+    if not eager_fmts:
+        print(
+            "[build-prod-cache] WARNING: packed-MoE experts present but "
+            "no NVFP4 in the format menu; experts not pre-rendered — "
+            "frontier real-KL expert selection unavailable.",
+            flush=True,
+        )
+        return merged
+    for ef in eager_fmts:
+        cov = fill_packed_expert_cache_entries(
+            cache, model, calib_ids,
+            force_format=ef,
+            levers=cache.levers,
+            profile=profile,
+            cache_dir=cache_dir,
+            module_token_budget=module_token_budget,
+            render_mode=render_mode,
+        )
+        if cov:
+            merged.update(cov)
+    if merged:
+        if cache.metadata is None:
+            cache.metadata = {}
+        cache.metadata.setdefault(
+            "packed_expert_coverage", {}).update(merged)
+    return merged
+
+
 def validate_render_assignment_cache_coverage(cache, render_assignment) -> None:
     """Fail if a production render assignment has any uncached non-BF16 entry.
 
@@ -187,6 +251,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "runs every expert through render_production_weight — the IDENTICAL "
         "GPTQ+damp_sweep+act_order+JSO stack dense Linears get (production "
         "homogeneity; ~16h/35B).",
+    )
+    p.add_argument(
+        "--render-packed-experts", action="store_true",
+        help="Format-menu builds only: eagerly render packed-MoE experts at "
+        "the NVFP4 rung so the validated frontier can SELECT expert formats "
+        "by real KL (M4). Pass this for the FRONTIER cache build; leave it "
+        "off for render-score cost caches, whose expert renders would have "
+        "no consumer (~60 GB and hours wasted on a 35B). Assignment-scope "
+        "builds render experts from the assignment regardless of this flag.",
     )
     p.add_argument("--dtype", default="bf16")
     p.add_argument(
@@ -482,12 +555,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if cache.metadata is None:
                     cache.metadata = {}
                 cache.metadata["packed_expert_coverage"] = expert_coverage
+        elif args.render_packed_experts and _model_has_packed_experts(
+                model, profile):
+            render_format_menu_packed_experts(
+                cache, model, calib_ids, formats,
+                profile=profile,
+                cache_dir=args.cache_dir,
+                module_token_budget=args.expert_token_budget,
+                render_mode=args.expert_render_mode,
+            )
         elif _model_has_packed_experts(model, profile):
             print(
-                "[build-prod-cache] WARNING: model has packed-MoE experts but "
-                "no concrete assignment (--render-layer-config) was provided; "
-                "experts will RTN at export. Build with --render-scope "
-                "assignment for a production artifact.",
+                "[build-prod-cache] packed-MoE experts present; format-menu "
+                "build without --render-packed-experts leaves them "
+                "unrendered (correct for render-score cost caches; the "
+                "frontier cache build must pass the flag or the validated "
+                "frontier cannot select expert formats).",
                 flush=True,
             )
 

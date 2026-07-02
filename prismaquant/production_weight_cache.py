@@ -114,6 +114,25 @@ def is_uncached_packed_expert_qname(qname: str) -> bool:
     return bool(_UNCACHED_PACKED_EXPERT_RE.search(str(qname)))
 
 
+_PACKED_EXPERT_PARAM_RE = re.compile(
+    r"\.experts\."
+    r"(?:gate_up_proj|down_proj|gate_proj|up_proj|w1|w2|w3)$"
+)
+
+
+def is_packed_expert_param_qname(qname: str) -> bool:
+    """Return True only for PACKED (3-D, un-indexed) expert param qnames.
+
+    Stricter than ``is_uncached_packed_expert_qname``, which also matches
+    per-expert-indexed names (``...experts.5.down_proj``) — those are plain
+    nn.Linear modules (DSv4/MiniMax layouts) whose activation replay capture
+    IS per-projection-correct. Use this predicate when a behavior must apply
+    only to packed tensors, where one module plan carries several projection
+    params and the module-input capture is the wrong tensor for ``down``.
+    """
+    return bool(_PACKED_EXPERT_PARAM_RE.search(str(qname)))
+
+
 @dataclass
 class ProductionWeightCache:
     """Dict-like cache of production-faithful dequantized weights.
@@ -2892,7 +2911,8 @@ def fill_packed_expert_cache_entries(
     model: nn.Module,
     calib_ids: torch.Tensor,
     *,
-    render_assignment: Mapping[str, str],
+    render_assignment: Mapping[str, str] | None = None,
+    force_format: str | None = None,
     levers: Mapping[str, object],
     profile,
     module_token_budget: int = 32768,
@@ -2979,6 +2999,15 @@ def fill_packed_expert_cache_entries(
     def _canon(fmt: str) -> str:
         return fr.canonical_format_name(str(fmt).strip().upper())
 
+    if force_format is None and render_assignment is None:
+        raise ValueError(
+            "fill_packed_expert_cache_entries requires render_assignment or "
+            "force_format")
+    if force_format is not None and render_assignment is not None:
+        raise ValueError(
+            "fill_packed_expert_cache_entries: pass render_assignment OR "
+            "force_format, not both")
+
     # 1. Resolve in-scope packed-expert tensors (non-BF16 in the assignment).
     #    Each entry: (experts_qname, mod, parent, pn, full, fmt).
     in_scope: list[tuple[str, nn.Module, nn.Module, str, str, str]] = []
@@ -2993,16 +3022,22 @@ def fill_packed_expert_cache_entries(
         parent = _packed_experts_parent_module(model, experts_qname)
         for pn in _packed_experts_param_names(mod, profile):
             full = f"{experts_qname}.{pn}" if experts_qname else pn
-            try:
-                recipe_key = profile.live_to_recipe_name(full)
-            except Exception:
-                recipe_key = full
-            fmt = render_assignment.get(recipe_key)
-            if fmt is None and recipe_key != full:
-                fmt = render_assignment.get(full)
-            if fmt is None:
-                continue
-            fmt = _canon(fmt)
+            if force_format is not None:
+                # Force-format mode: render every packed expert at one format,
+                # ignoring render_assignment. Used by the format-menu frontier
+                # build (eager NVFP4) and by per-Pareto-point lazy FP8 gap-fill.
+                fmt = _canon(force_format)
+            else:
+                try:
+                    recipe_key = profile.live_to_recipe_name(full)
+                except Exception:
+                    recipe_key = full
+                fmt = render_assignment.get(recipe_key)
+                if fmt is None and recipe_key != full:
+                    fmt = render_assignment.get(full)
+                if fmt is None:
+                    continue
+                fmt = _canon(fmt)
             if fmt == "BF16":
                 continue
             in_scope.append((experts_qname, mod, parent, pn, full, fmt))
@@ -3047,13 +3082,21 @@ def fill_packed_expert_cache_entries(
     def _persist_expert_sidecar() -> None:
         if expert_sidecar_path is None:
             return
-        only: dict[str, float] = {}
+        # MERGE with the existing sidecar — a subset render (the M4 lazy
+        # per-Pareto-point FP8 gap-fill) must not destroy the eager build's
+        # scale entries for every OTHER expert in the shared cache_dir.
+        merged: dict[str, float] = {}
+        if expert_sidecar_path.is_file():
+            try:
+                merged.update(_json.loads(expert_sidecar_path.read_text()))
+            except Exception:
+                pass
         for full_k, _fmt in in_scope_keys:
             v = cache.activation_max_abs.get(full_k)
             if v is not None:
-                only[full_k] = float(v)
+                merged[full_k] = float(v)
         tmp = expert_sidecar_path.with_suffix(".json.tmp")
-        tmp.write_text(_json.dumps(only, indent=2))
+        tmp.write_text(_json.dumps(merged, indent=2))
         os.replace(tmp, expert_sidecar_path)
     # Only capture activations if some tensor still needs rendering OR is
     # missing its calibrated scale — a fully-resumed build with a complete
@@ -3230,7 +3273,12 @@ def fill_packed_expert_cache_entries(
                         param_max_abs, float(a.detach().abs().max().item()))
         else:
             param_max_abs = float(X.detach().abs().max().item())
-        if param_max_abs > 0:
+        # First calibrated scale wins per qname: activation_max_abs is keyed
+        # per-param (shared across formats), so a later render of ANOTHER
+        # format (M4 lazy FP8 gap-fill) must not clobber the scale the eager
+        # NVFP4 rung calibrated, measured under, and will ship. A fresh build
+        # (no prior scale, no sidecar) always writes.
+        if param_max_abs > 0 and cache.activation_max_abs.get(full) is None:
             cache.activation_max_abs[full] = param_max_abs
             _persist_expert_sidecar()
 
