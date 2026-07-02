@@ -42,6 +42,10 @@ def _load_llm(args) -> LLM:
     }
     if args.quantization:
         kwargs["quantization"] = args.quantization
+    if args.max_num_batched_tokens is not None:
+        # Mamba/DeltaNet hybrids need max_num_batched_tokens >= their
+        # chunk-alignment floor (~2096); seqlen+1 alone can undershoot it.
+        kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     return LLM(**kwargs)
 
 
@@ -77,6 +81,7 @@ def main() -> int:
     parser.add_argument("--quantization")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.84)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     args = parser.parse_args()
 
     started = time.monotonic()

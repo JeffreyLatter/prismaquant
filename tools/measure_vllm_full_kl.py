@@ -23,6 +23,7 @@ def _load_wikitext_calibration(
     cache_dir: str,
     n_samples: int,
     seqlen: int,
+    window_seed: int = 42,
 ) -> tuple[list[list[int]], list[int], int]:
     from datasets import load_dataset
 
@@ -41,7 +42,7 @@ def _load_wikitext_calibration(
     if int(ids.numel()) < seqlen + 1:
         raise RuntimeError(f"not enough calibration tokens: {int(ids.numel())}")
     max_start = int(ids.numel()) - int(seqlen)
-    rng = random.Random(42)
+    rng = random.Random(window_seed)
     if max_start >= n_samples:
         starts = rng.sample(range(max_start), n_samples)
     else:
@@ -70,6 +71,11 @@ def _load_llm(args, *, max_model_len: int) -> "LLM":
     }
     if args.quantization:
         kwargs["quantization"] = args.quantization
+    if args.max_num_batched_tokens is not None:
+        # Mamba/DeltaNet hybrids (e.g. Qwen3.6-35B-A3B) require
+        # max_num_batched_tokens >= their chunk-alignment floor (~2096);
+        # the seqlen+16 max_model_len alone can drive it below that.
+        kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     return LLM(**kwargs)
 
 
@@ -208,6 +214,7 @@ def _teacher(args) -> int:
         cache_dir=args.dataset_cache_dir,
         n_samples=args.n_samples,
         seqlen=args.seqlen,
+        window_seed=args.window_seed,
     )
     print(
         f"[kl] teacher model={args.model} n={args.n_samples} "
@@ -445,6 +452,11 @@ def main() -> int:
         "position (n_positions = n_samples*(seqlen-1)).")
     parser.add_argument("--prompt-top-k", type=int, default=1024)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument(
+        "--window-seed", type=int, default=42,
+        help="RNG seed for the WikiText window draw (teacher mode only; "
+        "students replay the windows stored in the teacher payload)")
     args = parser.parse_args()
     if args.mode == "student" and not args.teacher_payload:
         parser.error("--teacher-payload is required in student mode")

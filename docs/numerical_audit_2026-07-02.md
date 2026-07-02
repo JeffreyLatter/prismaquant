@@ -446,9 +446,25 @@ operationally:
 - **C1**: fixed at all three sites via `_nvfp4_input_global_scale_from_max_abs`
   (default-ON; `PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0` reproduces legacy
   bytes), oracle-tested against `generate_gparam`. **Changes the bytes of every
-  future NVFP4 export.** Serving-metric impact still unmeasured — a paired
-  served A/B at matched bpp is required before claiming any KL recovery or
-  re-shipping (M19 discipline).
+  future NVFP4 export.**
+  **Served A/B (2026-07-02, same day): CONFIRMED WIN.** Paired same-session
+  A/B on the production 35B frontier artifact (weights byte-identical, only
+  the 30,720 `input_global_scale` scalars ×448; BF16-vs-BF16 control = KL
+  exactly 0.0): served full-vocab KL-vs-BF16 n=8×512 over two independent
+  window draws — draw 1 (seed 42) 0.0440→0.0374 (−15.0%), draw 2 (seed 43)
+  0.0330→0.0288 (−12.9%), **pooled −14.1%**; WikiText PPL 9.4675→9.4594
+  (−0.09%, no veto). Gains concentrate on the highest-KL windows (the
+  outlier-activation regime the fix targets). Metrics/logs:
+  `/home/rob/dq-runs/c1-igs-ab-20260702/`.
+  **Caveat (measured):** on a thin-calibration artifact (LFM2.5 smoke,
+  8-sample amax) the same patch REGRESSED +5.8% KL — the convention trades
+  the legacy value's 448× serve-amax headroom for bottom-end scale
+  resolution, so an under-sampled calibration amax clips at serve time.
+  Production-calibration regime wins clearly; keep default-ON, and treat
+  thin-calibration runs as the flag's one legitimate `=0` use.
+  **Re-ship implication:** any shipped W4A4 artifact can recover this by
+  re-patching `input_global_scale` ×448 in place (no re-render — the A/B's
+  patch script does exactly this) followed by the normal ship gate.
 - **C2/M1**: fixed; no-prod-cache exports and empty-activation Linears now ship
   RTN-grade bytes instead of garbage/zeros.
 - **M2**: packed-expert re-pack + joint pre-passes now honor the cache-recorded
