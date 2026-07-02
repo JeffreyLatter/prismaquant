@@ -220,6 +220,53 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             {"model.layers.0.mlp.gate_proj": "fp8"},
         )
 
+    def test_source_dtype_manifest_reads_tensor_dtype_and_scale_sidecars(self):
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as td:
+            save_file(
+                {
+                    "bf.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+                    "fp16.weight": torch.zeros(2, 2, dtype=torch.float16),
+                    "fp32.weight": torch.zeros(2, 2, dtype=torch.float32),
+                    "ct.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+                    "ct.weight_scale": torch.ones(2, 1, dtype=torch.float32),
+                },
+                f"{td}/model.safetensors",
+            )
+
+            manifest = _scan_source_dtype_manifest(td)
+
+        self.assertEqual(manifest["bf"], "bf16")
+        self.assertEqual(manifest["fp16"], "other")
+        self.assertEqual(manifest["fp32"], "other")
+        self.assertEqual(manifest["ct"], "fp8")
+
+    def test_build_candidates_rejects_bf16_when_manifest_entry_missing(self):
+        stats = {
+            "layer": {
+                "h_trace": 2.0,
+                "out_features": 128,
+                "in_features": 128,
+                "n_params": 128 * 128,
+            }
+        }
+        costs = {
+            "layer": {
+                "BF16": {"weight_mse": 0.0, "predicted_dloss": 0.0},
+                "NVFP4": {"weight_mse": 0.01, "predicted_dloss": 0.01},
+            }
+        }
+
+        cands = build_candidates(
+            stats,
+            costs,
+            [fr.get_format("BF16"), fr.get_format("NVFP4")],
+            source_manifest={},
+        )
+
+        self.assertEqual([cand.fmt for cand in cands["layer"]], ["NVFP4"])
+
     def test_source_dtype_manifest_uses_profile_fp8_scale_pairs(self):
         class _ScaleProfile:
             def checkpoint_to_live_name(self, key, *, multimodal=False):

@@ -82,6 +82,43 @@ def detect_profile(model_path: str) -> ModelProfile:
     return _resolve(model_type, archs)
 
 
+def detect_profile_with_warning(
+    model_path: str,
+    *,
+    entrypoint: str,
+) -> ModelProfile:
+    """Detect a model profile and make DefaultProfile fallback observable.
+
+    This preserves the historical fallback behavior for production entrypoints
+    that intentionally keep running on vanilla or not-yet-registered models,
+    but it prevents architecture-specific fused/MoE checks from disappearing
+    without any log signal.
+    """
+    reason = ""
+    try:
+        profile = detect_profile(model_path)
+    except Exception as exc:
+        reason = f"detect_profile raised {type(exc).__name__}: {exc}"
+        profile = DefaultProfile()
+
+    if isinstance(profile, DefaultProfile):
+        cfg_path = Path(model_path) / "config.json"
+        if not reason:
+            if not cfg_path.exists():
+                reason = f"{cfg_path} missing"
+            else:
+                reason = "architecture unregistered or config unreadable"
+        print(
+            f"[{entrypoint}] WARNING: resolved DefaultProfile for "
+            f"{model_path!r} ({reason}). Architecture-specific fused-sibling, "
+            "packed-MoE, pinned-name, and source-passthrough rules are not "
+            "available; pass the correct local model path or register a "
+            "ModelProfile if this is not a vanilla transformer.",
+            flush=True,
+        )
+    return profile
+
+
 def profile_from_config(cfg) -> ModelProfile:
     """Pick a ModelProfile from a (possibly already-loaded) HF config
     object or dict. Useful for consumers that already hold the model

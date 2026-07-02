@@ -477,7 +477,10 @@ class LayerHiddenStateCache:
                     if (
                         self._production_weight_cache is not None
                         and canonical != "BF16"
-                        and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                        and _env_truthy(
+                            "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                            default=True,
+                        )
                     ):
                         raise RuntimeError(
                             f"production_weight_cache miss for "

@@ -4,7 +4,9 @@ import torch.nn as nn
 from prismaquant.production_weight_cache import ProductionWeightCache
 from prismaquant.validate_assignments_kl import (
     _assignment_cost_summary,
+    _calibration_provenance,
     _materialize_assignment_inplace,
+    _production_cache_assignment_diagnostics,
 )
 
 
@@ -73,3 +75,69 @@ def test_assignment_cost_summary_reports_local_mse_and_aliases():
     assert summary["counts"]["predicted_dloss"] == 1
     assert summary["missing_count"] == 1
     assert summary["missing_sample"] == ["missing"]
+
+
+def test_calibration_provenance_hashes_repeats():
+    repeat_a = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    repeat_b = torch.tensor([[4, 5, 6]], dtype=torch.long)
+
+    single = _calibration_provenance([repeat_a])
+    combined = _calibration_provenance([repeat_a, repeat_b])
+
+    assert single["calib_hash"] == single["calib_repeat_hashes"][0]
+    assert len(combined["calib_repeat_hashes"]) == 2
+    assert combined["calib_hash"] != single["calib_hash"]
+
+
+def test_production_cache_assignment_diagnostics_counts_misses(monkeypatch):
+    cache = ProductionWeightCache(
+        weights={("l.weight", "NVFP4"): torch.zeros(1, 1)},
+        levers={},
+    )
+    assignment = {
+        "l.weight": "NVFP4",
+        "missing.weight": "NVFP4",
+        "source.weight": "BF16",
+    }
+
+    strict = _production_cache_assignment_diagnostics(cache, assignment)
+    assert strict["required_entries"] == 2
+    assert strict["cache_hit_count"] == 1
+    assert strict["cache_miss_count"] == 1
+    assert strict["rtn_fallback_count"] == 0
+    assert strict["strict"] is True
+
+    monkeypatch.setenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", "0")
+    permissive = _production_cache_assignment_diagnostics(cache, assignment)
+    assert permissive["cache_hit_count"] == 1
+    assert permissive["cache_miss_count"] == 1
+    assert permissive["rtn_fallback_count"] == 1
+    assert permissive["strict"] is False
+
+
+def test_diagnostics_counts_packed_expert_misses_m4():
+    # M4: the diagnostics must ask assignment_keys to INCLUDE packed experts,
+    # otherwise packed-expert cache misses are silently skipped and the
+    # validated-surrogate fail-fast never fires for MoE (it would abort later
+    # in materialization with a less actionable message instead).
+    class _FakeCache:
+        def __init__(self):
+            self.include_flag = None
+
+        def assignment_keys(self, assignment, include_packed_experts=False):
+            self.include_flag = include_packed_experts
+            # the lone non-BF16 entry is a packed expert: counted as missing
+            # only when the diagnostics opt into packed-expert coverage.
+            missing = (
+                [("model.layers.0.mlp.experts.gate_up_proj", "NVFP4")]
+                if include_packed_experts else []
+            )
+            return [], missing
+
+    cache = _FakeCache()
+    diag = _production_cache_assignment_diagnostics(
+        cache, {"model.layers.0.mlp.experts.gate_up_proj": "NVFP4"})
+    assert cache.include_flag is True, \
+        "diagnostics must pass include_packed_experts=True (M4)"
+    assert diag["cache_miss_count"] == 1
+    assert diag["missing_sample"][0][0].endswith("gate_up_proj")

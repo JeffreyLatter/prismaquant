@@ -48,12 +48,130 @@ from prismaquant.calibration_data import (
     load_wikitext_calibration_windowed,
 )
 from prismaquant.gpu_guard import require_cuda_hot_path
-from prismaquant.model_profiles import DefaultProfile, detect_profile
+from prismaquant.model_profiles import detect_profile_with_warning
 from prismaquant.production_recache import _load_assignment
 from prismaquant.production_weight_cache import (
     fill_production_weight_cache,
 )
 from prismaquant.sensitivity_probe import load_calibration
+
+
+def _model_has_packed_experts(model: nn.Module, profile) -> bool:
+    from prismaquant.sensitivity_probe import _is_packed_experts_module
+    return any(
+        _is_packed_experts_module(m, profile)
+        for _, m in model.named_modules()
+    )
+
+
+def render_format_menu_packed_experts(
+    cache,
+    model: nn.Module,
+    calib_ids,
+    formats,
+    *,
+    profile,
+    cache_dir=None,
+    module_token_budget: int = 32768,
+    render_mode: str = "batched",
+) -> dict:
+    """Eagerly render packed-MoE experts for a format-menu frontier cache.
+
+    Format-menu builds have no single assignment, but the validated frontier
+    must be able to SELECT each expert's format by real KL, so render packed
+    experts into the shared cache at the cheap rung real-KL actually picks
+    under the route-flip floor — NVFP4 (batched, fast); BF16 is passthrough
+    (no render). FP8 experts are rendered LAZILY per-Pareto-point in
+    validate_assignments_kl (M4): FP8 is Pareto-dominated on routed experts,
+    so eager-rendering all packed tensors at FP8 (~64 GB / ~1 hr, no batched
+    path) is wasted — keep FP8 on the menu and render only the rare point
+    that proposes it.
+
+    Returns the merged coverage dict (also merged into
+    ``cache.metadata['packed_expert_coverage']``).
+    """
+    from prismaquant.production_weight_cache import (
+        fill_packed_expert_cache_entries,
+    )
+    from prismaquant import format_registry as _fr
+
+    eager_fmts = [
+        f for f in formats
+        if _fr.canonical_format_name(str(f)) == "NVFP4"
+    ]
+    merged: dict = {}
+    if not eager_fmts:
+        print(
+            "[build-prod-cache] WARNING: packed-MoE experts present but "
+            "no NVFP4 in the format menu; experts not pre-rendered — "
+            "frontier real-KL expert selection unavailable.",
+            flush=True,
+        )
+        return merged
+    for ef in eager_fmts:
+        cov = fill_packed_expert_cache_entries(
+            cache, model, calib_ids,
+            force_format=ef,
+            levers=cache.levers,
+            profile=profile,
+            cache_dir=cache_dir,
+            module_token_budget=module_token_budget,
+            render_mode=render_mode,
+        )
+        if cov:
+            merged.update(cov)
+    if merged:
+        if cache.metadata is None:
+            cache.metadata = {}
+        cache.metadata.setdefault(
+            "packed_expert_coverage", {}).update(merged)
+    return merged
+
+
+def validate_render_assignment_cache_coverage(cache, render_assignment) -> None:
+    """Fail if a production render assignment has any uncached non-BF16 entry.
+
+    ``ProductionWeightCache.assignment_keys`` intentionally exempts packed
+    expert names for downstream prefetch callers that may run without a packed
+    render cache. Build-side validation is stricter: after
+    ``fill_packed_expert_cache_entries`` runs, every concrete non-BF16
+    assignment entry must be present or the export would fall back/raise later.
+    """
+    from prismaquant import format_registry as fr
+
+    missing: list[tuple[str, str]] = []
+    for qname, fmt in (render_assignment or {}).items():
+        fmt_canon = fr.canonical_format_name(str(fmt))
+        if fmt_canon == "BF16":
+            continue
+        if cache.resolve_key(str(qname), fmt_canon) is None:
+            missing.append((str(qname), fmt_canon))
+    failed = list((cache.failed or {}).keys())
+    if missing or failed:
+        samples = missing[:5] + failed[:5]
+        raise RuntimeError(
+            f"ProductionWeightCache assignment coverage failure: "
+            f"{len(missing)} misses, {len(failed)} failed "
+            f"renders; sample={samples}"
+        )
+
+
+def _load_cache_calibration(tokenizer, args) -> torch.Tensor:
+    if args.dataset:
+        return load_calibration(
+            tokenizer,
+            args.dataset,
+            args.n_calib_samples,
+            args.calib_seqlen,
+            calib_seed=args.calib_seed,
+        )
+    return load_wikitext_calibration_windowed(
+        tokenizer,
+        args.n_calib_samples,
+        args.calib_seqlen,
+        split=args.calib_split,
+        seed=args.calib_seed,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -93,6 +211,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional calibration source accepted by sensitivity_probe "
         "(HF dataset id, .jsonl, or .txt). When omitted, preserves the "
         "historical wikitext-2 windowed loader.",
+    )
+    p.add_argument(
+        "--expert-gate-dataset",
+        default=None,
+        help="Optional corpus DISJOINT from --dataset for the packed-expert "
+        "GPTQ-vs-RTN do-no-harm gate. When set, each expert's gate is judged "
+        "on this corpus's routed rows (and GPTQ fits on all fit-corpus rows) "
+        "instead of a same-corpus held-out slice — a same-domain holdout "
+        "cannot catch calibration-domain overfit (the 2026-06-09 35B served "
+        "inversion). Same source formats as --dataset.",
+    )
+    p.add_argument(
+        "--expert-gate-samples", type=int, default=None,
+        help="Sample count for --expert-gate-dataset (default: --n-calib-samples).",
+    )
+    p.add_argument(
+        "--expert-gate-seqlen", type=int, default=None,
+        help="Sequence length for --expert-gate-dataset (default: --calib-seqlen).",
+    )
+    p.add_argument(
+        "--expert-token-budget", type=int, default=32768,
+        help="Per-module reservoir budget (tokens) for packed-expert GPTQ "
+        "fit activations. CPU-resident, but on unified-memory hosts it still "
+        "consumes the shared pool: budget × hidden × 4B × n_modules.",
+    )
+    p.add_argument(
+        "--expert-gate-token-budget", type=int, default=None,
+        help="Per-module reservoir budget for the cross-domain gate corpus "
+        "(default: --expert-token-budget). The gate only judges (needs "
+        "~eval_rows_per_expert routed rows/expert), so this can be much "
+        "smaller than the fit budget.",
+    )
+    p.add_argument(
+        "--expert-render-mode", default="batched",
+        choices=["batched", "per_expert"],
+        help="Packed-expert render path. 'batched' vectorizes GPTQ across "
+        "experts (fixed damp, no JSO/act-order; ~13 min/35B). 'per_expert' "
+        "runs every expert through render_production_weight — the IDENTICAL "
+        "GPTQ+damp_sweep+act_order+JSO stack dense Linears get (production "
+        "homogeneity; ~16h/35B).",
+    )
+    p.add_argument(
+        "--render-packed-experts", action="store_true",
+        help="Format-menu builds only: eagerly render packed-MoE experts at "
+        "the NVFP4 rung so the validated frontier can SELECT expert formats "
+        "by real KL (M4). Pass this for the FRONTIER cache build; leave it "
+        "off for render-score cost caches, whose expert renders would have "
+        "no consumer (~60 GB and hours wasted on a 35B). Assignment-scope "
+        "builds render experts from the assignment regardless of this flag.",
     )
     p.add_argument("--dtype", default="bf16")
     p.add_argument(
@@ -247,21 +414,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokenizer = AutoTokenizer.from_pretrained(
             staged, trust_remote_code=True, local_files_only=local_only,
         )
-        if args.dataset:
-            calib_ids = load_calibration(
-                tokenizer,
-                args.dataset,
-                args.n_calib_samples,
-                args.calib_seqlen,
-            )
-        else:
-            calib_ids = load_wikitext_calibration_windowed(
-                tokenizer,
-                args.n_calib_samples,
-                args.calib_seqlen,
-                split=args.calib_split,
-                seed=args.calib_seed,
-            )
+        calib_ids = _load_cache_calibration(tokenizer, args)
         load_kwargs = {
             "torch_dtype": dtype,
             "trust_remote_code": True,
@@ -280,10 +433,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if device.type != "cuda":
             model.to(device)
         model.eval()
-        try:
-            profile = detect_profile(args.model)
-        except Exception:
-            profile = DefaultProfile()
+        profile = detect_profile_with_warning(
+            args.model,
+            entrypoint="build-prod-cache",
+        )
         skip_tokens = list(
             args.skip_qnames
             if args.skip_qnames is not None
@@ -367,6 +520,60 @@ def main(argv: Sequence[str] | None = None) -> int:
             recache_microbatch_size=args.recache_microbatch_size,
             h_detail_dir=args.h_detail_dir,
         )
+        # Render packed-MoE experts through the SAME deliberate path. They are
+        # 3-D packed tensors, not nn.Linear, so fill_production_weight_cache
+        # skips them; without this they would be RTN'd by omission at export
+        # (a severe NVFP4 quality regression — banned). Requires a concrete
+        # assignment (which format each expert gets).
+        expert_assignment = render_assignment or recache_assignment
+        expert_coverage: dict = {}
+        if expert_assignment is not None:
+            from prismaquant.production_weight_cache import (
+                fill_packed_expert_cache_entries,
+            )
+            gate_calib_ids = None
+            if args.expert_gate_dataset:
+                gate_calib_ids = load_calibration(
+                    tokenizer,
+                    args.expert_gate_dataset,
+                    args.expert_gate_samples or args.n_calib_samples,
+                    args.expert_gate_seqlen or args.calib_seqlen,
+                    calib_seed=args.calib_seed,
+                )
+            expert_coverage = fill_packed_expert_cache_entries(
+                cache, model, calib_ids,
+                render_assignment=expert_assignment,
+                levers=cache.levers,
+                profile=profile,
+                cache_dir=args.cache_dir,
+                module_token_budget=args.expert_token_budget,
+                render_mode=args.expert_render_mode,
+                gate_calib_ids=gate_calib_ids,
+                gate_token_budget=args.expert_gate_token_budget,
+            )
+            if expert_coverage:
+                if cache.metadata is None:
+                    cache.metadata = {}
+                cache.metadata["packed_expert_coverage"] = expert_coverage
+        elif args.render_packed_experts and _model_has_packed_experts(
+                model, profile):
+            render_format_menu_packed_experts(
+                cache, model, calib_ids, formats,
+                profile=profile,
+                cache_dir=args.cache_dir,
+                module_token_budget=args.expert_token_budget,
+                render_mode=args.expert_render_mode,
+            )
+        elif _model_has_packed_experts(model, profile):
+            print(
+                "[build-prod-cache] packed-MoE experts present; format-menu "
+                "build without --render-packed-experts leaves them "
+                "unrendered (correct for render-score cost caches; the "
+                "frontier cache build must pass the flag or the validated "
+                "frontier cannot select expert formats).",
+                flush=True,
+            )
+
         elapsed = time.monotonic() - t0
         # Strict coverage validation: every (qname, NVFP4) must be present
         # before we ship.  Catches naming-alias mismatches, GPTQ Cholesky
@@ -374,15 +581,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # through to RTN at hook time.
         try:
             if render_assignment is not None:
-                _, missing = cache.assignment_keys(render_assignment)
-                failed = list((cache.failed or {}).keys())
-                if missing or failed:
-                    samples = missing[:5] + failed[:5]
-                    raise RuntimeError(
-                        f"ProductionWeightCache assignment coverage failure: "
-                        f"{len(missing)} misses, {len(failed)} failed "
-                        f"renders; sample={samples}"
-                    )
+                validate_render_assignment_cache_coverage(
+                    cache, render_assignment)
             else:
                 cache.validate_coverage(qnames, formats)
             print("[build-prod-cache] coverage check passed", flush=True)

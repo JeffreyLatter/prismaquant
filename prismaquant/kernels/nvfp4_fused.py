@@ -62,17 +62,29 @@ def nvfp4_pack_weight(
     if cols % 2 != 0:
         raise ValueError(f"NVFP4 packed K must be even, got K={cols}")
 
+    # Export-codec-aligned packing (one rendering everywhere): the fused
+    # fast path serves perturbed-X / resident W4A4 evaluation, which must
+    # be byte-faithful to shipped NVFP4 (FP8-snapped group scales under a
+    # per-tensor global). We bake the EFFECTIVE real scale per group into
+    # w_scales and set the global multiplier to 1, so the Triton dequant
+    # codes*scales reproduces the export dequant exactly.
+    from prismaquant import export_native_compressed as enc
+
     w_float = weight.detach().float()
     grouped = w_float.reshape(rows, cols // _NVFP4_GROUP_SIZE, _NVFP4_GROUP_SIZE)
-    scales = grouped.abs().amax(dim=-1).clamp_min(1e-8) / _FP4_E2M1_MAX
-
-    codebook = fr._CODEBOOKS["fp4_e2m1"].to(device=weight.device, dtype=torch.float32)
-    q_ref = fr._rtn_fp_codebook(w_float, codebook, _NVFP4_GROUP_SIZE)
-    q_grid = q_ref.reshape_as(grouped) / scales.unsqueeze(-1)
-    fp4_indices = _indices_from_signed_e2m1_values(q_grid).reshape(rows, cols)
+    scale_real, global_real = enc._select_nvfp4_pack_scales_and_global(grouped)
+    codec = enc._nvfp4_quantize_grouped_codec(
+        grouped,
+        global_real=global_real,
+        scale_real=scale_real,
+    )
+    eff_scale = enc._nvfp4_effective_scale_from_fp8(
+        codec.scale, global_real,
+    )
+    fp4_indices = codec.indices.reshape(rows, cols)
     return (
         _pack_fp4_indices(fp4_indices, cols),
-        scales.contiguous(),
+        eff_scale.to(torch.float32).contiguous(),
         torch.ones((1,), device=weight.device, dtype=torch.float32),
     )
 

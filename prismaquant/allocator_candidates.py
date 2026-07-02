@@ -274,12 +274,32 @@ def cost_entry_predicted_dloss(
             gain=gain,
         )
     if "predicted_dloss" in cost_entry:
-        return float(cost_entry["predicted_dloss"]) * float(gain)
+        base = float(cost_entry["predicted_dloss"])
+        # Uncertainty-aware allocation (opt-in): charge z·stderr on top of the
+        # point estimate. The knapsack optimizes over noisy estimates, so it
+        # systematically harvests lucky draws (winner's curse — the observed
+        # ±0.017-KL between-seed allocation lottery). UCB takes an aggressive
+        # format choice only when it is CONFIDENTLY cheap: a non-regressive
+        # bias whose penalty is derived from the measurement's own sampling
+        # noise, not a tuned constant. z=0 (default) is bit-identical to
+        # prior behavior.
+        z = _cost_ucb_z()
+        if z > 0.0:
+            base += z * float(cost_entry.get("predicted_dloss_stderr", 0.0))
+        return base * float(gain)
     return predicted_dloss(
         stats_entry["h_trace"],
         float(cost_entry.get("weight_mse", 0.0)),
         gain=gain,
     )
+
+
+def _cost_ucb_z() -> float:
+    """PRISMAQUANT_COST_UCB_Z: stderr multiples added to predicted_dloss."""
+    try:
+        return max(0.0, float(os.environ.get("PRISMAQUANT_COST_UCB_Z", "0")))
+    except Exception:
+        return 0.0
 
 
 def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
@@ -304,7 +324,10 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
         shape = _shape_from_stats(s)
         in_features = int(s.get("in_features", 0) or 0)
         out_features = int(s.get("out_features", 0) or 0)
-        source_kind = (source_manifest or {}).get(name)
+        source_kind = (
+            source_manifest.get(name, "unknown")
+            if source_manifest is not None else None
+        )
         cands = []
         for spec in formats:
             entry = None
@@ -497,18 +520,31 @@ def aggregate_fused_siblings(
         }
 
         super_cost = {}
+        super_cost_entry_fmt: dict[str, str] = {}
         for spec in formats:
-            missing = [m for m in members
-                       if spec.name not in costs.get(m, {})
-                       or "error" in costs.get(m, {}).get(spec.name, {})]
+            resolved_entries: list[tuple[str, dict]] = []
+            missing = []
+            for m in members:
+                entry = None
+                entry_fmt = spec.name
+                for candidate_name in fr.aliases_for(spec.name):
+                    if candidate_name in costs.get(m, {}):
+                        entry = costs[m][candidate_name]
+                        entry_fmt = candidate_name
+                        break
+                if entry is None or "error" in entry:
+                    missing.append(m)
+                else:
+                    resolved_entries.append((entry_fmt, entry))
             if missing:
                 super_cost[spec.name] = {"error": "partial"}
                 continue
+            if resolved_entries:
+                super_cost_entry_fmt[spec.name] = resolved_entries[0][0]
             sum_pred = 0.0
-            for m in members:
-                c = costs[m][spec.name]
+            for m, (_entry_fmt, c) in zip(members, resolved_entries):
                 # Mirrors build_candidates, including unmeasured packed
-                # output_mse fallback.
+                # output_mse fallback and format-alias lookup.
                 sum_pred += cost_entry_predicted_dloss(stats[m], c)
             effective_mse = sum_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
             super_cost[spec.name] = {
@@ -539,7 +575,8 @@ def aggregate_fused_siblings(
                 total_bytes += spec.memory_bytes_for_shape(shape)
             bits_per_param = 8.0 * total_bytes / max(n_params, 1)
             stats_ext[super_name]["_memory_bytes_by_format"][spec.name] = total_bytes
-            gain = float(gains.get(spec.name, 1.0))
+            entry_fmt = super_cost_entry_fmt.get(spec.name, spec.name)
+            gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
             predicted = entry["predicted_dloss"] * gain
             cands.append(Candidate(
                 fmt=spec.name,
@@ -571,7 +608,14 @@ def _scan_source_dtype_manifest(
     model_path: str,
     profile=None,
 ) -> dict[str, str]:
-    """Classify source Linear weights as ``fp8`` or ``bf16`` for passthrough gating."""
+    """Classify source Linear weights for passthrough gating.
+
+    Returns ``bf16`` only for actual BF16 source tensors, ``fp8`` for native
+    FP8/scale-sidecar sources, and ``other`` for FP16/FP32/etc. passthroughs
+    that would be synthesized rather than byte-preserving.
+    """
+    from safetensors import safe_open
+
     src = Path(model_path)
     idx_path = src / "model.safetensors.index.json"
     weight_map = {}
@@ -581,13 +625,62 @@ def _scan_source_dtype_manifest(
                 weight_map = json.load(f).get("weight_map", {})
         except Exception:
             weight_map = {}
+    if not weight_map:
+        for shard in sorted(src.glob("*.safetensors")):
+            try:
+                with safe_open(str(shard), framework="pt", device="cpu") as sf:
+                    for key in sf.keys():
+                        weight_map.setdefault(key, shard.name)
+            except Exception:
+                continue
+    # Packed-MoE expert params are checkpoint keys with NO ``.weight``
+    # suffix (LFM2.5 packed, Qwen3.6-35B: ``...experts.gate_up_proj``).
+    # Without classifying them the manifest has no source kind for the
+    # packed recipe names the allocator costs, and the BF16 passthrough is
+    # dropped (source_dtype_mismatch) on a BF16 source — an expert-menu
+    # completeness bug. (Per-expert INDEXED layouts store 2-D ``.weight``
+    # keys and classify their own recipe names via the normal path.)
+    import re as _re
+    _packed_leaf_re = _re.compile(
+        r"\.experts\.(?:gate_up_proj|down_proj|gate_proj|up_proj|w1|w2|w3)$"
+    )
     bases: dict[str, set[str]] = {}
+    packed_bases: set[str] = set()
     for key in weight_map:
-        for suffix in (".weight_scale_inv", ".weight"):
+        matched = False
+        for suffix in (".weight_scale_inv", ".weight_scale", ".weight"):
             if key.endswith(suffix):
                 base = key[: -len(suffix)]
                 bases.setdefault(base, set()).add(suffix[1:])
+                matched = True
                 break
+        if not matched and _packed_leaf_re.search(key):
+            bases.setdefault(key, set()).add("weight")
+            packed_bases.add(key)
+    weight_dtypes: dict[str, str] = {}
+    shard_keys: dict[str, list[str]] = defaultdict(list)
+    for key, shard in weight_map.items():
+        if not (key.endswith(".weight") or key in packed_bases):
+            continue
+        path = src / str(shard)
+        if path.is_file():
+            shard_keys[str(path)].append(key)
+    for path, keys in shard_keys.items():
+        try:
+            with safe_open(path, framework="pt", device="cpu") as sf:
+                for key in keys:
+                    base = (
+                        key[:-len(".weight")]
+                        if key.endswith(".weight") else key
+                    )
+                    try:
+                        weight_dtypes[base] = str(
+                            sf.get_slice(key).get_dtype()
+                        ).upper()
+                    except Exception:
+                        continue
+        except Exception:
+            continue
 
     def _strip_weight_suffix(name: str) -> str:
         return name[:-7] if name.endswith(".weight") else name
@@ -624,12 +717,41 @@ def _scan_source_dtype_manifest(
             return "model." + ck_base[len("model.language_model."):]
         return ck_base
 
+    def _packed_to_recipe_name(ck_key: str) -> str:
+        # Packed expert params have no ``.weight`` to fabricate for
+        # checkpoint_to_live_name; checkpoint name == live name modulo the
+        # language_model prefix, then the profile's live->recipe mapping.
+        name = ck_key
+        if name.startswith("model.language_model."):
+            name = "model." + name[len("model.language_model."):]
+        if profile is not None:
+            recipe_mapper = getattr(profile, "live_to_recipe_name", None)
+            if callable(recipe_mapper):
+                try:
+                    return str(recipe_mapper(name))
+                except Exception:
+                    return name
+        return name
+
     manifest: dict[str, str] = {}
     for base, suffixes in bases.items():
         if "weight" not in suffixes:
             continue
-        source_kind = "fp8" if "weight_scale_inv" in suffixes else "bf16"
-        recipe_name = _to_recipe_name(base)
+        dtype = weight_dtypes.get(base)
+        if "weight_scale_inv" in suffixes or "weight_scale" in suffixes:
+            source_kind = "fp8"
+        elif dtype == "BF16":
+            source_kind = "bf16"
+        elif dtype is not None and dtype.startswith("F8"):
+            source_kind = "fp8"
+        elif dtype is None:
+            source_kind = "bf16"
+        else:
+            source_kind = "other"
+        recipe_name = (
+            _packed_to_recipe_name(base) if base in packed_bases
+            else _to_recipe_name(base)
+        )
         if not recipe_name:
             continue
         manifest[recipe_name] = source_kind

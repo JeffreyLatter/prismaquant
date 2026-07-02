@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -130,6 +131,60 @@ def _measure_logprobs(
     return torch.stack(rows, dim=0).contiguous()
 
 
+def _measure_prompt_topk(
+    llm: LLM,
+    prompts: list[list[int]],
+    *,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-position scoring: per prompt position, the top-K token ids and
+    logprobs of the model's next-token distribution (vLLM prompt_logprobs).
+
+    Returns (ids, lps) shaped [n_prompts, P-1, K] (position 0 has no
+    prediction). Full-vocab dicts at every position are infeasible (~620M
+    Python objects per pass), so K bounds the support; the tail is handled
+    as a single bucket by the caller. K=1024 covers ~all teacher mass at
+    nearly every position and the truncation floor is shared across arms.
+    """
+    params = SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        prompt_logprobs=int(top_k),
+        detokenize=False,
+    )
+    all_ids, all_lps = [], []
+    for index, prompt_ids in enumerate(prompts, 1):
+        start = time.monotonic()
+        output = llm.generate(
+            [{"prompt_token_ids": prompt_ids}],
+            params,
+            use_tqdm=False,
+        )[0]
+        plps = output.prompt_logprobs
+        if plps is None:
+            raise RuntimeError("vLLM did not return prompt_logprobs")
+        ids_rows, lps_rows = [], []
+        for pos in range(1, len(prompt_ids)):
+            d = plps[pos]
+            items = [(int(k), float(getattr(v, "logprob", v)))
+                     for k, v in d.items()]
+            items.sort(key=lambda kv: kv[1], reverse=True)
+            items = items[: int(top_k)]
+            if len(items) < int(top_k):
+                pad = int(top_k) - len(items)
+                items = items + [(-1, float("-inf"))] * pad
+            ids_rows.append([kv[0] for kv in items])
+            lps_rows.append([kv[1] for kv in items])
+        all_ids.append(torch.tensor(ids_rows, dtype=torch.int32))
+        all_lps.append(torch.tensor(lps_rows, dtype=torch.float32))
+        print(
+            f"[kl] sample {index}/{len(prompts)} positions={len(ids_rows)} "
+            f"top_k={top_k} wall={time.monotonic() - start:.2f}s",
+            flush=True,
+        )
+    return torch.stack(all_ids), torch.stack(all_lps)
+
+
 def _teacher(args) -> int:
     started = time.monotonic()
     output = Path(args.output)
@@ -154,6 +209,42 @@ def _teacher(args) -> int:
             f"model vocab_size={vocab_size}; full-vocab KL requires "
             "requesting at least the full vocabulary"
         )
+    if args.score_positions == "all":
+        topk_ids, topk_lps = _measure_prompt_topk(
+            llm, prompts, top_k=args.prompt_top_k)
+        payload = {
+            "score_positions": "all",
+            "prompt_top_k": int(args.prompt_top_k),
+            "topk_ids": topk_ids,
+            "topk_lps": topk_lps.to(torch.float16),
+            "calib_ids": torch.tensor(prompts, dtype=torch.long),
+            "starts": starts,
+            "model": args.model,
+            "n_samples": int(args.n_samples),
+            "seqlen": int(args.seqlen),
+            "vocab_size": int(vocab_size),
+        }
+        torch.save(payload, output)
+        cov = topk_lps.double().exp().sum(dim=-1)
+        meta = {
+            "mode": "teacher",
+            "score_positions": "all",
+            "prompt_top_k": int(args.prompt_top_k),
+            "model": args.model,
+            "output": str(output),
+            "n_samples": int(args.n_samples),
+            "seqlen": int(args.seqlen),
+            "starts": starts,
+            "total_tokens": total_tokens,
+            "vocab_size": int(vocab_size),
+            "teacher_shape": list(topk_lps.shape),
+            "topk_coverage_mean": float(cov.mean()),
+            "topk_coverage_min": float(cov.min()),
+            "elapsed_s": time.monotonic() - started,
+        }
+        Path(args.meta_output).write_text(json.dumps(meta, indent=2))
+        print(json.dumps(meta, indent=2), flush=True)
+        return 0
     logprobs = _measure_logprobs(llm, prompts, vocab_size=vocab_size)
     payload = {
         "teacher_logprobs": logprobs,
@@ -182,9 +273,75 @@ def _teacher(args) -> int:
     return 0
 
 
+def _student_all_positions(args, payload) -> int:
+    started = time.monotonic()
+    prompts = payload["calib_ids"].tolist()
+    vocab_size = int(payload["vocab_size"])
+    top_k = int(payload["prompt_top_k"])
+    t_ids = payload["topk_ids"]                       # [n, P-1, K]
+    t_lps = payload["topk_lps"].float()
+    print(
+        f"[kl] student(all-pos) model={args.model} n={len(prompts)} "
+        f"seqlen={int(payload['seqlen'])} top_k={top_k}",
+        flush=True,
+    )
+    llm = _load_llm(args, max_model_len=int(payload["seqlen"]) + 16)
+    s_ids, s_lps = _measure_prompt_topk(llm, prompts, top_k=top_k)
+
+    n, pm1, k = t_ids.shape
+    kl_pos = torch.zeros((n, pm1), dtype=torch.float64)
+    t_top1 = torch.zeros((n, pm1), dtype=torch.float64)
+    for i in range(n):
+        for j in range(pm1):
+            tid = t_ids[i, j].tolist()
+            tlp = t_lps[i, j].double()
+            smap = {int(a): float(b)
+                    for a, b in zip(s_ids[i, j].tolist(), s_lps[i, j].tolist())
+                    if a >= 0}
+            floor = min(smap.values())                # kl_ab.py convention
+            q = torch.tensor([smap.get(t, floor) for t in tid],
+                             dtype=torch.float64)
+            p = tlp.exp()
+            kl = float((p * (tlp - q)).sum())
+            # tail bucket: remaining teacher mass vs remaining student mass
+            pt = max(1.0 - float(p.sum()), 1e-12)
+            qt = max(1.0 - float(q.exp().sum()), 1e-12)
+            kl += pt * (math.log(pt) - math.log(qt))
+            kl_pos[i, j] = kl
+            t_top1[i, j] = float(p.max())
+    confident = t_top1 > 0.5
+    flat = kl_pos.flatten()
+    result = {
+        "mode": "student",
+        "score_positions": "all",
+        "prompt_top_k": top_k,
+        "model": args.model,
+        "teacher_model": payload.get("model"),
+        "teacher_payload": str(args.teacher_payload),
+        "quantization": args.quantization,
+        "n_samples": len(prompts),
+        "seqlen": int(payload["seqlen"]),
+        "vocab_size": vocab_size,
+        "n_positions": int(flat.numel()),
+        "kl_mean": float(flat.mean()),
+        "kl_p99": float(flat.quantile(0.99)),
+        "kl_max": float(flat.max()),
+        "kl_confident_mean": float(kl_pos[confident].mean())
+        if bool(confident.any()) else None,
+        "n_confident": int(confident.sum()),
+        "kl_per_sample": [float(x) for x in kl_pos.mean(dim=1).tolist()],
+        "elapsed_s": time.monotonic() - started,
+    }
+    Path(args.output).write_text(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2), flush=True)
+    return 0
+
+
 def _student(args) -> int:
     started = time.monotonic()
     payload = torch.load(args.teacher_payload, map_location="cpu")
+    if payload.get("score_positions") == "all":
+        return _student_all_positions(args, payload)
     teacher = payload["teacher_logprobs"].float()
     prompts = payload["calib_ids"].tolist()
     vocab_size = int(payload["vocab_size"])
@@ -233,6 +390,12 @@ def main() -> int:
     parser.add_argument("--quantization")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.84)
     parser.add_argument("--max-logprobs", type=int, default=248320)
+    parser.add_argument(
+        "--score-positions", choices=["final", "all"], default="final",
+        help="final: full-vocab KL at the window-final context only "
+        "(legacy; n_positions = n_samples). all: top-K KL at every prompt "
+        "position (n_positions = n_samples*(seqlen-1)).")
+    parser.add_argument("--prompt-top-k", type=int, default=1024)
     parser.add_argument("--enforce-eager", action="store_true")
     args = parser.parse_args()
     if args.mode == "student" and not args.teacher_payload:

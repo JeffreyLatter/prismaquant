@@ -292,7 +292,7 @@ class ModelStructureSpec:
             parent = ".".join(parts[:experts_idx + 1])
         elif len(tail) == 2 and tail[0].isdigit():
             leaf = tail[1]
-            parent = ".".join(parts[:experts_idx + 2])
+            parent = ".".join(parts[:experts_idx + 1])
             split_per_expert = True
         else:
             return None

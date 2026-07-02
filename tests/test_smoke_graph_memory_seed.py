@@ -3,7 +3,7 @@ import random
 
 import torch
 
-from scratch import smoke_graph_memory
+from tools import smoke_graph_memory
 
 
 def test_pin_rng_sets_expected_streams(monkeypatch):

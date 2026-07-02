@@ -6,13 +6,61 @@ import sys
 from pathlib import Path
 
 from prismaquant.select_validated_frontier import (
+    _saturation_pick,
     leave_one_out_kneedle_diagnostic,
     measured_frontier,
+    measured_rows,
     practical_knee,
     select_frontier_point,
     spearman_rank_correlation,
     worst_rank_inversion,
 )
+
+
+def _sat_results(stderr):
+    # flat tail (6.0..8.0 within noise of asymptote), decreasing before it
+    rows = [(4.5, 0.10), (5.0, 0.06), (6.0, 0.030), (7.0, 0.029), (8.0, 0.028)]
+    out = []
+    for bpp, kl in rows:
+        r = {"label": f"a{bpp}", "path": f"/x/a{bpp}.json", "bpp": bpp,
+             "last_token_kl": kl, "format_counts": {}}
+        if stderr is not None:
+            r["kl_stderr"] = stderr
+        out.append(r)
+    return out
+
+
+def test_saturation_mode_picks_bstar_with_real_stderr():
+    sel, frontier = select_frontier_point(
+        _sat_results(3e-3), mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 6.0   # 6/7/8 indistinguishable within the band -> B*=6
+    idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is False
+    assert frontier[idx]["bpp"] == 6.0
+
+
+def test_saturation_mode_zero_stderr_flags_no_noise_floor():
+    sel, frontier = select_frontier_point(
+        _sat_results(0.0), mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 8.0   # band collapses -> densest asymptote (most bits)
+    _idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is True
+
+
+def test_saturation_mode_missing_stderr_key_is_no_noise_floor():
+    # rows entirely lacking kl_stderr must not KeyError; treated as 0 stderr.
+    sel, frontier = select_frontier_point(
+        _sat_results(None), mode="saturation", sat_z=2.0)
+    _idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is True
+    assert sel["bpp"] == 8.0
+
+
+def test_saturation_single_point_frontier_does_not_crash():
+    res = [{"label": "only", "path": "/x/only.json", "bpp": 6.0,
+            "last_token_kl": 0.03, "kl_stderr": 1e-3}]
+    sel, frontier = select_frontier_point(res, mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 6.0 and len(frontier) == 1
 
 
 def test_measured_frontier_drops_dominated_points():
@@ -26,6 +74,17 @@ def test_measured_frontier_drops_dominated_points():
     frontier = measured_frontier(results)
 
     assert [row["label"] for row in frontier] == ["a", "c", "d"]
+
+
+def test_measured_rows_keep_dominated_points_for_diagnostics():
+    results = [
+        {"label": "a", "path": "a.json", "bpp": 4.5, "last_token_kl": 0.10},
+        {"label": "b", "path": "b.json", "bpp": 4.6, "last_token_kl": 0.30},
+        {"label": "c", "path": "c.json", "bpp": 5.0, "last_token_kl": 0.05},
+    ]
+
+    assert [row["label"] for row in measured_rows(results)] == ["a", "b", "c"]
+    assert [row["label"] for row in measured_frontier(results)] == ["a", "c"]
 
 
 def test_select_frontier_best_kl():
@@ -221,3 +280,95 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
 
     selected = json.loads(summary.read_text())["selected"]
     assert selected["label"] == "candidate"
+
+
+def test_select_validated_frontier_diagnostics_include_dominated_rows(tmp_path):
+    assignment_paths = {}
+    for label in ("a", "b", "c"):
+        path = tmp_path / f"{label}.json"
+        path.write_text(json.dumps({
+            "assignment": {
+                "model.layers.0.self_attn.q_proj": "BF16",
+            },
+        }))
+        assignment_paths[label] = path
+
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [
+            {"label": "a", "path": str(assignment_paths["a"]), "bpp": 4.5,
+             "last_token_kl": 0.10, "mse": {"predicted_dloss_sum": 2.0}},
+            # Dominated by a on both bpp and KL, but surrogate ranks it best.
+            {"label": "b", "path": str(assignment_paths["b"]), "bpp": 4.6,
+             "last_token_kl": 0.30, "mse": {"predicted_dloss_sum": 1.0}},
+            {"label": "c", "path": str(assignment_paths["c"]), "bpp": 5.0,
+             "last_token_kl": 0.05, "mse": {"predicted_dloss_sum": 3.0}},
+        ],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+    summary_path = tmp_path / "selection.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(summary_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    summary = json.loads(summary_path.read_text())
+    assert summary["n_results"] == 3
+    assert summary["n_frontier"] == 2
+    assert summary["surrogate_spearman"] is not None
+    inversion = summary["surrogate_worst_rank_inversion"]
+    assert inversion["predicted_best_label"] == "b"
+    assert inversion["predicted_worse_label"] == "c"
+
+
+def test_load_assignment_canonicalizes_autoround_dicts(tmp_path):
+    # Regression: AutoRound-style dict entries used to be silently
+    # stringified ("{'DATA_TYPE': 'NV_FP', ...}") instead of parsed.
+    from prismaquant.select_validated_frontier import _load_assignment
+
+    path = tmp_path / "assignment.json"
+    path.write_text(json.dumps({
+        "model.layers.0.mlp.experts.gate_up_proj": {
+            "data_type": "nv_fp", "bits": 4, "group_size": 16, "sym": True,
+        },
+        "model.layers.0.self_attn.q_proj": {
+            "data_type": "fp8_e4m3", "bits": 8, "group_size": 0,
+        },
+        "model.layers.0.self_attn.o_proj": "bf16",
+        "model.layers.1.self_attn.o_proj": "FP8_SOURCE",
+    }))
+    assignment = _load_assignment(path)
+    assert assignment == {
+        "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+        "model.layers.0.self_attn.q_proj": "FP8_E4M3",
+        "model.layers.0.self_attn.o_proj": "BF16",
+        "model.layers.1.self_attn.o_proj": "FP8_SOURCE",
+    }
+
+
+def test_load_assignment_unwraps_assignment_key(tmp_path):
+    from prismaquant.select_validated_frontier import _load_assignment
+
+    path = tmp_path / "wrapped.json"
+    path.write_text(json.dumps({
+        "schema": "prismaquant.validated_frontier_assignment.v1",
+        "assignment": {"model.layers.0.mlp.up_proj": "nvfp4"},
+    }))
+    assert _load_assignment(path) == {"model.layers.0.mlp.up_proj": "NVFP4"}

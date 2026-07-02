@@ -90,29 +90,33 @@ class Gemma4Profile(ModelProfile):
         return {"shared_kv_states": {}}
 
     def capture_forward_pass_state(self, pass_state: dict):
-        """After phase-1's sequential forward, `shared_kv_states[type]` holds
-        the (full-length) K/V the shared layers reuse. Snapshot to CPU."""
+        """Snapshot Gemma4's integer-indexed shared K/V states to CPU."""
         skv = (pass_state or {}).get("shared_kv_states") or {}
         out = {}
-        for lt, kv in skv.items():
+        for layer_idx, kv in skv.items():
             try:
-                out[lt] = tuple(t.detach().to("cpu") for t in kv)
-            except Exception:
-                pass
+                key = int(layer_idx)
+                out[key] = tuple(t.detach().to("cpu") for t in kv)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Gemma4 shared_kv_states[{layer_idx!r}] could not be "
+                    "captured as a CPU tensor tuple"
+                ) from exc
         return out
 
     def isolated_layer_pass_state(self, captured, layer) -> dict:
         """For an isolated (phase-3) layer forward: a shared layer needs its
-        type's captured K/V (the attention moves them to the right device
+        source layer's captured K/V (the attention moves them to the right device
         itself); a non-shared layer just needs a writable dict to store into.
         Always returns a `shared_kv_states` dict so the layer never sees
         `None`."""
         attn = getattr(layer, "self_attn", None)
         if getattr(attn, "is_kv_shared_layer", False) and captured:
-            lt = getattr(attn, "layer_type", None)
-            kv = captured.get(lt)
-            if kv is not None:
-                return {"shared_kv_states": {lt: kv}}
+            source_idx = getattr(attn, "kv_shared_layer_index", None)
+            if source_idx is not None:
+                kv = captured.get(int(source_idx))
+                if kv is not None:
+                    return {"shared_kv_states": {int(source_idx): kv}}
         return {"shared_kv_states": {}}
 
     def export_tensor_name(self, model_qname: str) -> str:

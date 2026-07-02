@@ -123,6 +123,10 @@ from .decision_units import block_id_from_qname
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
+_KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES = 1.0
+_KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION = 0.5
+_RD_LOG_LINEAR_R2_THRESHOLD = 0.99
+
 
 # ---------------------------------------------------------------------------
 # Kneedle knee detection
@@ -171,9 +175,9 @@ def _log_error_tail_start(y: list[float]) -> int:
     if len(logs) < 3:
         return 0
     ymin, ymax = min(logs), max(logs)
-    if ymax - ymin < 1.0:
+    if ymax - ymin < _KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES:
         return 0
-    threshold = 0.5 * (ymin + ymax)
+    threshold = ymin + _KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION * (ymax - ymin)
     idx = next((i for i, v in enumerate(logs) if v <= threshold), 0)
     return min(max(idx, 0), max(len(logs) - 3, 0))
 
@@ -246,12 +250,186 @@ def _pareto_knee_summary(curve: list[dict]) -> dict:
     return {
         "enabled": True,
         "primary": "log_error",
+        "diagnostic_thresholds": {
+            "tail_min_log_span_decades": float(
+                _KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES
+            ),
+            "tail_midpoint_fraction": float(
+                _KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION
+            ),
+        },
         "log_error": _record("log_error", log_idx),
         "global_log_error": _record("global_log_error", global_log_idx),
         "raw_linear": _record("raw_linear", raw_idx),
+        "rd_curve": _rd_curve_diagnostic(feasible),
     }
 
 
+def _rd_curve_diagnostic(feasible: list[dict]) -> dict:
+    """Is the rate-distortion curve log-linear (no intrinsic knee)?
+
+    The Aura 27B finding (handover 2026-06-05): the surrogate RD curve is a clean
+    exponential, KL ~ 10^(-a*bpp), i.e. a straight line in (bpp, log10 Δloss).
+    On such a curve the kneedle has no fixed answer — its "knee" moves with the
+    axis scaling (the 27B knee swung 7.5 -> 12 bpp across raw/log/golden axes),
+    so it is a *diagnostic*, not a ship-point. This fits a least-squares line to
+    log10(Δloss) vs achieved bpp and reports R^2. The R^2 cutoff is a
+    diagnostic threshold only, reported into the sidecar payload; it is not a
+    shipping selector. A genuine sensitivity cliff would kink the line (low R^2)
+    and *then* a knee is meaningful.
+    """
+    pts = [r for r in feasible if float(r.get("predicted_dloss", 0.0)) > 0.0]
+    if len(pts) < 3:
+        return {"available": False, "reason": "too_few_positive_points"}
+    xs = [float(r["achieved_bits"]) for r in pts]
+    ys = [math.log10(float(r["predicted_dloss"])) for r in pts]
+    n = len(xs)
+    sx, sy = sum(xs), sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    denom = n * sxx - sx * sx
+    if denom == 0.0:
+        return {"available": False, "reason": "degenerate_bpp_range"}
+    a = (n * sxy - sx * sy) / denom            # decades of Δloss per bit (<0)
+    b = (sy - a * sx) / n
+    ybar = sy / n
+    ss_tot = sum((y - ybar) ** 2 for y in ys)
+    ss_res = sum((y - (a * x + b)) ** 2 for x, y in zip(xs, ys))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
+    log_linear = r2 >= _RD_LOG_LINEAR_R2_THRESHOLD
+    return {
+        "available": True,
+        "model": "log10(predicted_dloss) = a*bpp + b",
+        "slope_decades_per_bit": float(a),
+        "intercept": float(b),
+        "r2": float(r2),
+        "diagnostic_thresholds": {
+            "log_linear_r2": float(_RD_LOG_LINEAR_R2_THRESHOLD),
+        },
+        "log_linear": bool(log_linear),
+        "intrinsic_knee": bool(not log_linear),
+        "note": (
+            f"RD curve is log-linear (R^2>={_RD_LOG_LINEAR_R2_THRESHOLD:g}): "
+            "no intrinsic knee; the kneedle "
+            "is axis-dependent. Select ship bpp by byte budget (--target-disk-gb) "
+            "or measured saturation, not curvature."
+            if log_linear else
+            f"RD curve deviates from log-linear "
+            f"(R^2<{_RD_LOG_LINEAR_R2_THRESHOLD:g}): a curvature knee may be "
+            "meaningful here; still prefer a byte budget when shipping to a card."
+        ),
+    }
+
+
+_GOLDEN_RATIO_INV = (5.0 ** 0.5 - 1.0) / 2.0  # 0.6180339887...
+
+
+def refine_knee_golden(
+    solve_fn,
+    knee_summary: dict,
+    curve: list[dict],
+    *,
+    tol: float = 0.03,
+    max_evals: int = 24,
+):
+    """Golden-section refinement of the coarse log-error knee.
+
+    The Pareto sweep runs over a coarse (linearly spaced) target grid, so the
+    Kneedle can only land *on a grid point*. At large model scale a 0.05-bpp
+    miss is real size/quality left on the table. After the coarse sweep brackets
+    the knee, this golden-section search (a binary-search-family optimizer for
+    the unimodal dip-below-the-chord) re-solves the sub-second DP at interior
+    target budgets and returns the budget that maximizes the perpendicular dip
+    below the bracket chord in (achieved_bits, log10 error) space — the true
+    knee to ~``tol`` bpp. Returns ``(refined_record | None, extra_curve_pts)``.
+
+    ``solve_fn(target_bits) -> (assignment|None, achieved_bits, predicted_dloss, _)``
+    """
+    if not knee_summary.get("enabled"):
+        return None, []
+    feasible = sorted(
+        (r for r in curve if r.get("feasible")),
+        key=lambda r: float(r["achieved_bits"]),
+    )
+    if len(feasible) < 3:
+        return None, []
+    primary = knee_summary.get(knee_summary.get("primary", "log_error"))
+    if not primary:
+        return None, []
+    ki = min(
+        range(len(feasible)),
+        key=lambda i: abs(
+            float(feasible[i]["target_bits"]) - float(primary["target_bits"])
+        ),
+    )
+    lo_t = float(feasible[max(ki - 1, 0)]["target_bits"])
+    hi_t = float(feasible[min(ki + 1, len(feasible) - 1)]["target_bits"])
+    if hi_t - lo_t <= tol:
+        return None, []
+
+    def _ylog(dloss: float) -> float:
+        return math.log10(max(float(dloss), 1.0e-300))
+
+    pL, pH = solve_fn(lo_t), solve_fn(hi_t)
+    if pL[0] is None or pH[0] is None:
+        return None, []
+    xL, yL = float(pL[1]), _ylog(pL[2])
+    xH, yH = float(pH[1]), _ylog(pH[2])
+    if xH == xL:
+        return None, []
+
+    evaluated: list[tuple[float, float, tuple]] = []  # (dip, target, solve_result)
+
+    def _eval(target: float):
+        p = solve_fn(target)
+        if p[0] is None:
+            return -math.inf
+        x, y = float(p[1]), _ylog(p[2])
+        ychord = yL + (yH - yL) * (x - xL) / (xH - xL)
+        dip = ychord - y  # convex-decreasing curve: the knee dips below the chord
+        evaluated.append((dip, float(target), p))
+        return dip
+
+    a, b = lo_t, hi_t
+    c = b - _GOLDEN_RATIO_INV * (b - a)
+    d = a + _GOLDEN_RATIO_INV * (b - a)
+    fc, fd = _eval(c), _eval(d)
+    evals = 2
+    while (b - a) > tol and evals < max_evals:
+        if fc > fd:
+            b, d, fd = d, c, fc
+            c = b - _GOLDEN_RATIO_INV * (b - a)
+            fc = _eval(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + _GOLDEN_RATIO_INV * (b - a)
+            fd = _eval(d)
+        evals += 1
+
+    if not evaluated:
+        return None, []
+    best_dip, best_target, best_p = max(evaluated, key=lambda t: t[0])
+    refined = {
+        "mode": "log_error_golden_refined",
+        "target_bits": float(best_target),
+        "achieved_bits": float(best_p[1]),
+        "predicted_dloss": float(best_p[2]),
+        "kneedle_dloss": float(best_p[2]),
+        "kneedle_error_source": "predicted_dloss",
+        "coarse_target_bits": float(primary["target_bits"]),
+        "coarse_achieved_bits": float(primary["achieved_bits"]),
+        "bracket_target_bits": [lo_t, hi_t],
+        "evals": int(evals),
+        "tol_bits": float(tol),
+    }
+    extra = [
+        {
+            "target_bits": float(t), "achieved_bits": float(p[1]),
+            "predicted_dloss": float(p[2]), "feasible": True, "knee_refine": True,
+        }
+        for (_, t, p) in evaluated if p[0] is not None
+    ]
+    return refined, extra
 
 
 def _allowed_format(target_profile: str, name: str, fmt: str) -> bool:
@@ -369,6 +547,42 @@ def _find_candidate_for_format(
         if fr.get_format(cand.fmt).name == canonical:
             return cand
     return None
+
+
+def _validate_assignment_candidate_membership(
+    assignment: dict[str, str],
+    candidates: dict[str, list[Candidate]],
+    *,
+    fixed_chosen_candidates: dict[str, Candidate] | None = None,
+) -> None:
+    """Fail if promotion assigned a format no candidate row allowed."""
+    available = {
+        name: {fr.get_format(cand.fmt).name for cand in per_name}
+        for name, per_name in candidates.items()
+    }
+    for name, cand in (fixed_chosen_candidates or {}).items():
+        available.setdefault(name, set()).add(fr.get_format(cand.fmt).name)
+
+    violations = []
+    for name, fmt in sorted(assignment.items()):
+        if name not in available:
+            continue
+        canonical = fr.get_format(fmt).name
+        if canonical not in available[name]:
+            violations.append((name, canonical, sorted(available[name])))
+    if not violations:
+        return
+
+    sample = "\n  ".join(
+        f"{name}: promoted to {fmt}, available={choices}"
+        for name, fmt, choices in violations[:10]
+    )
+    raise SystemExit(
+        "[alloc] serving-unit promotion assigned a format that was not "
+        "present in the per-Linear candidate set. This would defer legality "
+        "repair to export and can recreate mixed serving units. Sample:\n"
+        f"  {sample}"
+    )
 
 
 # Role tokens used to bucket the bit-attribution report. Best-effort: anything
@@ -716,6 +930,75 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def validate_default_profile_format_menu(
+    model_profile,
+    specs_sorted,
+    *,
+    allow_default_profile: bool = False,
+) -> None:
+    """Reject multi-format menus when only DefaultProfile was resolved."""
+    from .model_profiles import DefaultProfile
+
+    using_default_profile = isinstance(model_profile, DefaultProfile)
+    distinct_fmt_names = sorted({s.name for s in specs_sorted})
+    if (
+        using_default_profile
+        and len(distinct_fmt_names) > 1
+        and not allow_default_profile
+    ):
+        raise SystemExit(
+            "[alloc] ERROR: multi-format menu "
+            f"({distinct_fmt_names}) resolved to DefaultProfile (no probe "
+            "meta['model'] / --model-override, or the model architecture is "
+            "not registered) -> DefaultProfile only enforces its fallback "
+            "fused groups (qkv_proj/gate_up_proj and DeltaNet "
+            "in_proj_ba/in_proj_qkvz). It cannot guarantee unknown "
+            "architecture-specific coherence or packed-MoE expert uniformity, which "
+            "risks an unservable or silently-corrupt artifact. Pass "
+            "--model-override <model> so detect_profile resolves the real "
+            "profile, or --allow-default-profile to proceed anyway."
+        )
+
+
+def incomplete_fused_group_dp_exclusions(
+    stats: dict,
+    costs: dict,
+    model_profile,
+    allocation_excluded=(),
+) -> list[str]:
+    """Linears to exclude from DP because their fused group is incomplete.
+
+    Excluding them from the mutable body assignment leaves them absent from
+    ``layer_config``; export then keeps those present-but-incomplete fused
+    siblings as BF16 passthrough instead of producing missing scale tensors.
+    """
+    from .decision_units import incomplete_fused_group_members
+
+    incomplete_members = incomplete_fused_group_members(
+        set(stats) | set(costs), model_profile)
+    return sorted(incomplete_members - set(allocation_excluded))
+
+
+def validate_final_serving_promotion_noop(
+    before: dict[str, str],
+    after: dict[str, str],
+) -> None:
+    if before == after:
+        return
+    changed = [
+        (name, before.get(name), after.get(name))
+        for name in sorted(set(before) | set(after))
+        if before.get(name) != after.get(name)
+    ]
+    sample = changed[:8]
+    raise SystemExit(
+        "[alloc] ERROR: final serving-unit promotion changed the emitted "
+        "assignment after achieved_bits/Delta-loss were computed; metrics are "
+        f"stale. Changed {len(changed)} entries, sample={sample}. Move this "
+        "coupling before solve_with_promotion or recompute accounting."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
@@ -728,15 +1011,64 @@ def main():
                          "container run but is now only accessible via a "
                          "different mount). Overrides both profile detection "
                          "and visual-Linear source discovery.")
+    ap.add_argument("--allow-default-profile", action="store_true",
+                    help="Permit a multi-format allocation to run on "
+                         "DefaultProfile when no model path is available "
+                         "(probe meta['model'] unset and no --model-override). "
+                         "DefaultProfile enforces only fallback fused groups "
+                         "(qkv_proj/gate_up_proj and DeltaNet "
+                         "in_proj_ba/in_proj_qkvz), so unknown "
+                         "architecture-specific merged columns or packed-MoE "
+                         "expert constraints may produce an unservable or "
+                         "silently-corrupt artifact. Off by default: "
+                         "the allocator hard-errors instead and asks for "
+                         "--model-override.")
     ap.add_argument("--target-bits", type=float, default=4.75)
+    ap.add_argument("--target-disk-gb", type=float, default=None,
+                    help="Fit-the-card ship selection: instead of --target-bits, "
+                         "pick the highest-bpp allocation whose EXACT exported "
+                         "on-disk footprint (prismaquant.footprint, validated "
+                         "0.00%% vs real index.json total_size) fits this many "
+                         "decimal GB. Bisects the sub-second DP between Pareto "
+                         "grid rungs for an exact fit, overrides --target-bits "
+                         "for the emitted layer_config, and writes selection.json "
+                         "beside --pareto-csv. Needs the source model path (probe "
+                         "meta.model / --model-override) to size the "
+                         "non-quantizable floor (lm_head/embed/norms). Unpin "
+                         "lm_head (--allow-pinned lm_head) to lower the floor.")
     ap.add_argument("--formats", default="",
                     help="Comma-separated format names to consider; empty=all")
+    ap.add_argument("--allow-pinned", default="",
+                    help="Comma-separated qname substrings to UN-pin (e.g. "
+                         "'lm_head') so the allocator chooses their format by "
+                         "budget-value instead of force-excluding them as BF16. "
+                         "Requires the cost file to carry candidates for them "
+                         "(aura_cost --include-lm-head) + the probe their "
+                         "n_params. Empty = current behavior (backwards-compat). "
+                         "Shipping a quantized pinned name also needs cache "
+                         "render + export packing + vLLM serving support "
+                         "(lm_head: yes; embed_tokens: serving unverified).")
     ap.add_argument("--pareto-targets",
                     default="4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25",
                     help="Comma-separated budgets to sweep for Pareto curve")
     ap.add_argument("--layer-config", required=True,
                     help="Output AutoRound layer_config JSON")
     ap.add_argument("--pareto-csv", required=True, help="Output Pareto CSV")
+    ap.add_argument("--knee-refine-tol", type=float, default=0.03,
+                    help="Golden-section knee refinement tolerance in bpp "
+                         "(default 0.03). The coarse Pareto grid only lands the "
+                         "Kneedle on a grid point; refinement re-solves the DP "
+                         "inside the knee bracket to pin it to this resolution.")
+    ap.add_argument("--knee-refine", action="store_true",
+                    help="Opt-in: golden-section refine the (diagnostic) "
+                         "log-error knee, re-solving the DP at interior budgets "
+                         "and folding the samples into the curve + Pareto "
+                         "manifest. Default OFF: the AURA RD curve is log-linear "
+                         "(see the rd_curve diagnostic) so the knee is "
+                         "axis-dependent — ship by --target-disk-gb or measured "
+                         "saturation instead. NB enabling this in "
+                         "validated-surrogate mode adds real-GPU KL passes for "
+                         "the injected interior assignments.")
     ap.add_argument(
         "--applicability-report",
         default=None,
@@ -877,10 +1209,28 @@ def main():
     if args.model_override:
         probe_model_path = args.model_override
         print(f"[alloc] model-override: {probe_model_path}", flush=True)
+    used_default_fallback = False
     if probe_model_path:
         model_profile = detect_profile(probe_model_path)
         print(f"[alloc] model profile: {model_profile.name} "
               f"(derived from {probe_model_path})", flush=True)
+    else:
+        # No model path (probe lacks meta['model'] and no --model-override):
+        # we fall back to DefaultProfile, whose fallback fused map covers only
+        # qkv_proj, gate_up_proj, and the known DeltaNet in_proj_ba/qkvz
+        # groups. Unknown architecture-specific merged columns remain
+        # invisible, so fused-sibling promotion can leave them with mixed
+        # formats -> an unservable / silently-corrupt checkpoint. A
+        # SINGLE-format menu is always safe (every Linear gets the same format,
+        # so fused groups are trivially coherent); a multi-format menu is gated
+        # to a hard error below unless --allow-default-profile is set.
+        used_default_fallback = True
+        print(
+            "[alloc] WARNING: no model path (probe meta['model'] is unset and "
+            "no --model-override) -> using DefaultProfile. Architecture-"
+            "specific fused-sibling groups will NOT be enforced. Pass "
+            "--model-override <model> (or rebuild the probe with meta['model'] "
+            "set) so detect_profile resolves the real profile.", flush=True)
     target_profile = resolve_target_profile(model_profile, args.target_profile)
     if target_profile not in serving_profile_names():
         raise SystemExit(f"[alloc] ERROR: unknown target profile {target_profile!r}")
@@ -896,10 +1246,32 @@ def main():
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
 
+    allow_pinned = [s.strip() for s in (args.allow_pinned or "").split(",") if s.strip()]
     allocation_excluded = []
     for name in sorted(set(stats) | set(costs)):
         if model_profile.is_pinned_name(name):
+            if any(tok in name for tok in allow_pinned):
+                continue  # opt-in: let the allocator choose this name's format
             allocation_excluded.append(name)
+    if allow_pinned:
+        print(f"[alloc] --allow-pinned active for {allow_pinned}: these "
+              "profile-pinned names enter the DP budget (allocator chooses "
+              "their format by cost-per-byte)", flush=True)
+    # vLLM fused-load invariant: a fused-sibling group missing a member (e.g.
+    # Gemma4 k_eq_v full-attention layers synthesize v=k and ship no v_proj /
+    # v_scale) cannot be partially quantized — the present members must ship
+    # BF16, else the fused load KeyErrors on a non-existent scale param.
+    # Generic + profile-driven (no model-specific code here).
+    incomplete_added = incomplete_fused_group_dp_exclusions(
+        stats, costs, model_profile, allocation_excluded)
+    allocation_excluded.extend(incomplete_added)
+    if incomplete_added:
+        print(
+            "[alloc] incomplete fused-sibling groups → BF16 (vLLM fused-load "
+            f"invariant): {len(incomplete_added)} Linears "
+            f"(sample: {incomplete_added[:8]})",
+            flush=True,
+        )
     if allocation_excluded:
         excluded = set(allocation_excluded)
         stats = {name: value for name, value in stats.items() if name not in excluded}
@@ -945,6 +1317,24 @@ def main():
         fmt_names = cost_data["formats"]
     specs = [fr.get_format(n) for n in fmt_names]
     specs_sorted = sorted(specs, key=lambda s: s.effective_bits)
+
+    # Fused-coherence guard: a multi-format menu under DefaultProfile cannot
+    # enforce architecture-specific fused-sibling coherence (e.g. Qwen3.x
+    # DeltaNet in_proj_ba) or packed-MoE expert uniformity, so the allocation
+    # can ship an unservable or silently-corrupt checkpoint. DefaultProfile is
+    # the RESOLVED profile either when no model path was available OR when the
+    # model architecture is not registered -- key off the resolved profile, not
+    # just the no-model fallback, so an unrecognized model with a path is also
+    # caught (and so packed-MoE archs are protected by the same gate). Fail
+    # PROACTIVELY here rather than rely only on the export's last-line hard-fail.
+    # Single-format menus are always coherent; --allow-default-profile is the
+    # explicit escape for vanilla transformers. The menu is de-duped by format
+    # NAME so an alias/duplicate cannot false-trigger.
+    validate_default_profile_format_menu(
+        model_profile,
+        specs_sorted,
+        allow_default_profile=args.allow_default_profile,
+    )
 
     # --- Format-family coherence check -----------------------------------
     # A sensible format ladder has at most ONE format per bit tier. Having
@@ -1013,6 +1403,16 @@ def main():
     if probe_model_path:
         source_manifest = _scan_source_dtype_manifest(
             probe_model_path, model_profile)
+        if source_manifest is not None and not source_manifest:
+            # Empty scan = the model dir has no safetensors to classify
+            # (config-only dirs, probe-only flows). No evidence is not
+            # evidence of mismatch: fall back to legacy gating (BF16
+            # passthrough allowed) rather than mapping every name to
+            # "unknown" and silently stripping the BF16 rung.
+            print("[alloc] source-dtype manifest EMPTY (no safetensors "
+                  f"found under {probe_model_path}) — passthrough formats "
+                  "allowed WITHOUT source verification", flush=True)
+            source_manifest = None
         if source_manifest:
             n_fp8 = sum(1 for v in source_manifest.values() if v == "fp8")
             n_bf16 = sum(1 for v in source_manifest.values() if v == "bf16")
@@ -1392,7 +1792,53 @@ def main():
                 "bits_total_with_aux": _assignment_bits_total(expanded),
             })
 
-    # Output Pareto CSV
+    # Coarse Kneedle, then golden-section refinement inside the knee bracket so
+    # the knee isn't snapped to the coarse target grid (re-solves the sub-second
+    # DP at interior budgets; pins the knee to ~--knee-refine-tol bpp). Additive:
+    # the legacy coarse knees stay under their keys; the refined knee is added as
+    # ``knee_summary["refined"]`` and its samples folded into the curve + seeds.
+    knee_summary = _pareto_knee_summary(curve)
+    if knee_summary.get("enabled") and args.knee_refine:
+        refined, extra_pts = refine_knee_golden(
+            _solve_for_target, knee_summary, curve, tol=args.knee_refine_tol,
+        )
+        if refined is not None:
+            refined["aux_fixed_predicted_dloss"] = float(fixed_total_dloss)
+            refined["fixed_predicted_dloss"] = float(fixed_total_dloss)
+            refined["total_predicted_dloss_with_aux"] = (
+                refined["predicted_dloss"] + float(fixed_total_dloss)
+            )
+            knee_summary["refined"] = refined
+            seen = {round(float(r.get("target_bits", -1)), 6) for r in curve}
+            for pt in extra_pts:
+                if round(float(pt["target_bits"]), 6) not in seen:
+                    curve.append(pt)
+            curve.sort(key=lambda r: float(r.get("target_bits", 0.0)))
+            if args.pareto_output_dir:
+                r_assign, r_ach, r_tot, r_mut = _solve_for_target(refined["target_bits"])
+                if r_assign is not None:
+                    r_exp = _expand_assignment_for_seed_json(r_assign)
+                    r_bud = _expand_assignment_for_seed_json(
+                        r_assign, include_auxiliary=False)
+                    r_counts = defaultdict(int)
+                    for fmt in r_exp.values():
+                        r_counts[fmt] += 1
+                    pareto_seed_records.append({
+                        "target_bits": float(refined["target_bits"]),
+                        "achieved_bits": float(r_ach),
+                        "predicted_dloss": float(r_tot),
+                        "variable_predicted_dloss": float(r_mut),
+                        "aux_fixed_predicted_dloss": float(fixed_total_dloss),
+                        "fixed_predicted_dloss": float(fixed_total_dloss),
+                        "total_predicted_dloss_with_aux": float(r_tot + fixed_total_dloss),
+                        "assignment": r_exp,
+                        "format_counts": dict(sorted(r_counts.items())),
+                        "bits_total": _assignment_bits_total(r_bud),
+                        "bits_total_with_aux": _assignment_bits_total(r_exp),
+                        "knee_refined": True,
+                    })
+
+    # Output Pareto CSV (includes golden-section refinement samples)
     keys = sorted({k for row in curve for k in row.keys()})
     with open(args.pareto_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
@@ -1400,10 +1846,15 @@ def main():
         for row in curve:
             w.writerow(row)
     print(f"[alloc] Pareto curve → {args.pareto_csv}")
-    knee_summary = _pareto_knee_summary(curve)
     knee_path = Path(args.pareto_csv).with_suffix(".knees.json")
     knee_path.write_text(json.dumps(knee_summary, indent=2, sort_keys=True) + "\n")
     print(f"[alloc] Pareto knees → {knee_path}")
+    if knee_summary.get("refined"):
+        _r, _c = knee_summary["refined"], knee_summary["log_error"]
+        print(f"[alloc] knee refined (golden-section): coarse achieved="
+              f"{_c['achieved_bits']:.3f} → refined achieved={_r['achieved_bits']:.3f} "
+              f"(target={_r['target_bits']:.3f}, {_r['evals']} DP evals, "
+              f"±{_r['tol_bits']}b)")
 
     if args.pareto_output_dir:
         out_dir = Path(args.pareto_output_dir)
@@ -1485,6 +1936,15 @@ def main():
               f"achieved={raw['achieved_bits']:.3f}, "
               f"Δloss={raw['kneedle_dloss']:.3e} "
               f"({raw['kneedle_error_source']})")
+        rd = knee_summary.get("rd_curve", {})
+        if rd.get("available"):
+            print(f"[alloc] RD curve: log10(Δloss)≈{rd['slope_decades_per_bit']:.3f}"
+                  f"·bpp+{rd['intercept']:.3f}  R²={rd['r2']:.4f}  "
+                  + ("LOG-LINEAR → no intrinsic knee; ship by --target-disk-gb or "
+                     "measured saturation (kneedle is axis-dependent diagnostic)."
+                     if rd.get("log_linear") else
+                     "has curvature → a knee may be meaningful; still prefer a "
+                     "byte budget when shipping to a card."))
 
     # Print table
     print(f"\n  target  achieved     {'Δloss body':>20}   " + "   ".join(
@@ -1498,6 +1958,144 @@ def main():
         dloss_str = f"{row['predicted_dloss']:.4e}"
         print(f"  {row['target_bits']:>6.3f}  {row['achieved_bits']:>7.3f}  "
               f"{dloss_str:>20}   {fmt_str}")
+
+    # ----- Byte-budget ("fit the card") ship-bpp selection -----
+    # When --target-disk-gb is given, the ship bpp is set by the card, not by
+    # --target-bits: pick the highest-bpp allocation whose EXACT exported
+    # footprint fits the budget (the RD curve is log-linear, so there is no
+    # intrinsic knee to find — see rd_curve diagnostic). This is a selector over
+    # Pareto candidates with an exact, measurement-free byte objective, then a
+    # bisection of the same sub-second DP between grid rungs for an exact fit.
+    if args.target_disk_gb is not None:
+        from . import footprint as _fp
+        from .saturation_select import select_under_byte_budget
+        if not probe_model_path:
+            raise SystemExit(
+                "[alloc] --target-disk-gb needs the source model path (probe "
+                "meta.model or --model-override) to size the non-quantizable "
+                "floor (lm_head/embed/norms).")
+        budget_bytes = float(args.target_disk_gb) * _fp.GB
+        src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
+        regime = _fp.source_regime(src_by_dtype)  # robust bf16/fp8 (not by mass)
+
+        def _artifact_for_target(t: float):
+            assign_t, ach_t, tot_t, _mut = _solve_for_target(t)
+            if assign_t is None:
+                return None
+            expanded_t = _expand_assignment_for_seed_json(assign_t)
+            body_aux = _assignment_bits_total(expanded_t) / 8.0
+            reenc_src = 0
+            for n in expanded_t:
+                e = _stats_entry_for_assignment_name(n)
+                if isinstance(e, dict):
+                    reenc_src += _fp.reencoded_source_bytes_for_shape(
+                        _shape_from_stats(e), regime)
+            floor = float(src_total) - reenc_src
+            return {
+                "target_bits": float(t), "achieved_bits": float(ach_t),
+                "bpp": float(ach_t), "dloss": float(tot_t),
+                "disk_bytes": floor + body_aux, "floor_bytes": floor,
+            }
+
+        grid = []
+        for row in curve:
+            if not row.get("feasible"):
+                continue
+            r = _artifact_for_target(float(row["target_bits"]))
+            if r is not None:
+                grid.append(r)
+        sel = select_under_byte_budget(grid, budget_bytes)
+
+        rd = knee_summary.get("rd_curve") if isinstance(knee_summary, dict) else None
+        selection = {
+            "schema": "prismaquant.allocator.byte_budget_selection.v1",
+            "mode": "byte-budget",
+            "target_disk_gb": float(args.target_disk_gb),
+            "budget_bytes": budget_bytes,
+            "source_total_bytes": float(src_total),
+            "source_regime": regime,
+            "source_bytes_per_param": int(
+                _fp.dominant_source_bytes_per_param(src_by_dtype)),
+            "feasible": bool(sel["feasible"]),
+            "below_floor": bool(sel["below_floor"]),
+            "lm_head_unpinned": bool(allow_pinned),
+            "rd_curve": rd,
+            "grid": [
+                {"target_bits": c["target_bits"],
+                 "achieved_bits": c["achieved_bits"],
+                 "disk_gb": c["disk_bytes"] / _fp.GB, "dloss": c["dloss"],
+                 "fits": c["disk_bytes"] <= budget_bytes}
+                for c in grid
+            ],
+        }
+        sel_path = Path(args.pareto_csv).with_name("selection.json")
+        if not sel["feasible"]:
+            cheapest = sel.get("rejected_next") or (grid[0] if grid else None)
+            cheapest_gb = (cheapest["disk_bytes"] / _fp.GB) if cheapest else float("nan")
+            selection["cheapest_artifact_gb"] = cheapest_gb
+            sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
+            raise SystemExit(
+                f"[alloc] --target-disk-gb={args.target_disk_gb:.3f} is below the "
+                f"floor: the cheapest allocation is {cheapest_gb:.3f}GB. Raise the "
+                f"budget, unpin lm_head (--allow-pinned lm_head), or widen the "
+                f"format menu. Selection written to {sel_path}.")
+
+        # Pick the largest-footprint allocation that fits, by RATCHETING the
+        # sub-second DP from the grid pick up to a near-lossless cap (all the
+        # most-expensive format). The ratchet (accept a probe only when it fits
+        # AND is no smaller than the best fit so far, seeded at the grid pick)
+        # guarantees we never ship below the grid pick the selector already
+        # proved feasible — robust to the DP/serving-unit-promotion making
+        # disk(target) non-monotone — and the cap lets it bisect ABOVE the
+        # densest grid rung to actually fill a roomy card (not just snap to the
+        # grid ceiling). chosen always satisfies disk <= budget by construction.
+        search_hi = float(max(int(s.weight_bits) for s in specs_sorted)) + 1.0
+        top = _artifact_for_target(search_hi)  # densest possible (all-expensive)
+        grid_pick = sel["chosen"]
+        if top is not None and top["disk_bytes"] <= budget_bytes:
+            chosen_info, emit_target, has_slack = top, search_hi, True
+        else:
+            best, emit_target = grid_pick, float(grid_pick["target_bits"])
+            a_t, b_t = float(grid_pick["target_bits"]), search_hi
+            for _ in range(40):
+                if (b_t - a_t) <= 0.005:
+                    break
+                mid = 0.5 * (a_t + b_t)
+                rm = _artifact_for_target(mid)
+                if rm is not None and rm["disk_bytes"] <= budget_bytes:
+                    a_t = mid
+                    if rm["disk_bytes"] >= best["disk_bytes"]:  # ratchet up only
+                        best, emit_target = rm, mid
+                else:
+                    b_t = mid
+            chosen_info, has_slack = best, False
+
+        args.target_bits = float(emit_target)  # override emit target below
+        selection.update({
+            "has_slack": bool(has_slack),
+            "chosen_target_bits": float(emit_target),
+            "chosen_achieved_bits": float(chosen_info["achieved_bits"]),
+            "predicted_artifact_gb": chosen_info["disk_bytes"] / _fp.GB,
+            "predicted_floor_gb": chosen_info["floor_bytes"] / _fp.GB,
+            "predicted_body_gb": (chosen_info["disk_bytes"] - chosen_info["floor_bytes"]) / _fp.GB,
+            "predicted_dloss": float(chosen_info["dloss"]),
+            "headroom_gb": (budget_bytes - chosen_info["disk_bytes"]) / _fp.GB,
+            "grid_pick_target_bits": float(grid_pick["target_bits"]),
+        })
+        sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
+        print(
+            f"[alloc] byte-budget: card={args.target_disk_gb:.2f}GB ({regime} src) "
+            f"-> ship {chosen_info['achieved_bits']:.3f} bpp "
+            f"({chosen_info['disk_bytes'] / _fp.GB:.3f}GB: floor "
+            f"{chosen_info['floor_bytes'] / _fp.GB:.3f} + body "
+            f"{(chosen_info['disk_bytes'] - chosen_info['floor_bytes']) / _fp.GB:.3f}, "
+            f"headroom {(budget_bytes - chosen_info['disk_bytes']) / _fp.GB:.3f}GB)"
+            + ("  [card has slack beyond near-lossless; shipping all-"
+               + max(specs_sorted, key=lambda s: s.weight_bits).name + "]"
+               if has_slack else "")
+            + f" -> {sel_path}",
+            flush=True,
+        )
 
     # Emit chosen layer_config for target_bits.
     assignment, achieved, total, mutable_total = _solve_for_target(args.target_bits)
@@ -1519,6 +2117,7 @@ def main():
             assignment_expanded, stats)
 
     assignment_expanded.update(fixed_format_assignment)
+    assignment_before_serving_promotion = dict(assignment_expanded)
 
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. This keeps per-Linear assignments serveable without
@@ -1527,6 +2126,10 @@ def main():
         assignment_expanded,
         format_rank,
         profile=model_profile,
+    )
+    validate_final_serving_promotion_noop(
+        assignment_before_serving_promotion,
+        assignment_expanded,
     )
 
     # Visual-encoder Linears are auxiliary to the language-model budget.
@@ -1571,6 +2174,12 @@ def main():
               f"Linears found in source checkpoint — override is a "
               f"no-op", flush=True)
 
+    _validate_assignment_candidate_membership(
+        assignment_expanded,
+        candidates,
+        fixed_chosen_candidates=fixed_chosen_candidates,
+    )
+
     mtp_count = sum(1 for n in assignment_expanded if n.startswith("mtp."))
     if mtp_count:
         mtp_fmts = {
@@ -1606,10 +2215,11 @@ def main():
                 continue
             kind = source_manifest.get(name)
             if kind is None:
-                # Not in manifest — likely a visual Linear stamped via
-                # --visual-format (bypasses the manifest by design) or
-                # a name the profile rewrite didn't map. Skip.
-                continue
+                # Visual and MTP assignments are stamped as auxiliary formats
+                # outside the language-model source manifest by design.
+                if _is_visual_linear(name) or _is_mtp_linear(name):
+                    continue
+                kind = "unknown"
             if not _passthrough_source_ok(fmt, kind):
                 violations.append((name, fmt, kind))
         if violations:
@@ -1624,7 +2234,11 @@ def main():
                 f"picked over a mismatched source dtype. Sample:\n"
                 f"  {head}\n"
                 "The per-Linear filter should have excluded these — "
-                "investigate fused-sibling / MoE-unity promotion."
+                "investigate fused-sibling / MoE-unity promotion. Note: "
+                "fp16/fp32 sources have NO passthrough format by design "
+                "(fp16→bf16 drops 3 mantissa bits — not lossless); allocate "
+                "a quantized format for them or extend "
+                "PASSTHROUGH_SOURCE_REQUIREMENTS deliberately."
             )
 
     layer_cfg = {}

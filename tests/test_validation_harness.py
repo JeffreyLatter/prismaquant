@@ -30,6 +30,8 @@ def test_validate_artifact_returns_finite_metrics(tmp_path):
         assert kwargs["layer_config"] == layer_config
         assert kwargs["n_wikitext_tokens"] == 2048
         assert kwargs["n_mmlu_questions"] == 10
+        assert kwargs["calib_split"] == "test"
+        assert kwargs["calib_seed"] == 42
         return {
             "ppl_wikitext": 8.25,
             "ppl_mmlu_acc": 0.40,
@@ -133,6 +135,48 @@ def test_load_wikitext_ids_falls_back_to_legacy_dataset_name(tmp_path):
 
     assert ids.shape == (1, 4)
     assert [call[0] for call in calls] == ["Salesforce/wikitext", "wikitext"]
+
+
+def test_fixed_calib_ids_uses_requested_split_and_seed(tmp_path):
+    calls = []
+
+    def fake_load_dataset(name, config, *, split, cache_dir):
+        calls.append((name, config, split, cache_dir))
+        return [{"text": "abcdefghijklmnopqrstuvwxyz" * 8}]
+
+    tokenizer = _ValidationTokenizer()
+    ids_a = vh._fixed_calib_ids(
+        tokenizer,
+        fake_load_dataset,
+        cache_dir=tmp_path,
+        n_samples=4,
+        seqlen=8,
+        split="validation",
+        seed=7,
+    )
+    ids_b = vh._fixed_calib_ids(
+        tokenizer,
+        fake_load_dataset,
+        cache_dir=tmp_path,
+        n_samples=4,
+        seqlen=8,
+        split="validation",
+        seed=7,
+    )
+    ids_c = vh._fixed_calib_ids(
+        tokenizer,
+        fake_load_dataset,
+        cache_dir=tmp_path,
+        n_samples=4,
+        seqlen=8,
+        split="validation",
+        seed=8,
+    )
+
+    assert ids_a.shape == (4, 8)
+    assert torch.equal(ids_a, ids_b)
+    assert not torch.equal(ids_a, ids_c)
+    assert all(call[2] == "validation" for call in calls)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

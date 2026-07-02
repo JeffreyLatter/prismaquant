@@ -103,14 +103,34 @@ _UNCACHED_PACKED_EXPERT_RE = re.compile(
 
 
 def is_uncached_packed_expert_qname(qname: str) -> bool:
-    """Return True for packed-MoE expert tensors not rendered by this cache.
+    """Return True for packed-MoE expert tensor qnames.
 
-    ``ProductionWeightCache`` currently renders production-faithful 2D
-    ``nn.Linear`` weights. Packed 3D MoE expert tensors are quantized by the
-    packed exporter/validation fallback path, so missing cache entries for
-    those names must not fail production-cache residency checks.
+    Legacy residency helpers may skip these names when no concrete packed
+    render is expected. Production build/export gates must be stricter:
+    non-BF16 packed experts are rendered by
+    ``fill_packed_expert_cache_entries`` and missing entries are an early
+    coverage failure unless the explicit RTN research escape hatch is set.
     """
     return bool(_UNCACHED_PACKED_EXPERT_RE.search(str(qname)))
+
+
+_PACKED_EXPERT_PARAM_RE = re.compile(
+    r"\.experts\."
+    r"(?:gate_up_proj|down_proj|gate_proj|up_proj|w1|w2|w3)$"
+)
+
+
+def is_packed_expert_param_qname(qname: str) -> bool:
+    """Return True only for PACKED (3-D, un-indexed) expert param qnames.
+
+    Stricter than ``is_uncached_packed_expert_qname``, which also matches
+    per-expert-indexed names (``...experts.5.down_proj``) — those are plain
+    nn.Linear modules (DSv4/MiniMax layouts) whose activation replay capture
+    IS per-projection-correct. Use this predicate when a behavior must apply
+    only to packed tensors, where one module plan carries several projection
+    params and the module-input capture is the wrong tensor for ``down``.
+    """
+    return bool(_PACKED_EXPERT_PARAM_RE.search(str(qname)))
 
 
 @dataclass
@@ -274,12 +294,18 @@ class ProductionWeightCache:
     def assignment_keys(
         self,
         assignment: Mapping[str, str],
+        *,
+        include_packed_experts: bool = False,
     ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         """Return concrete non-BF16 cache keys needed by an assignment.
 
         This centralizes recipe alias handling for recache, polish, KL
         probes, and export: callers should ask the cache which stored key a
-        recipe entry maps to, then feed those keys into ``prefetch``.
+        recipe entry maps to, then feed those keys into ``prefetch``. Legacy
+        residency callers leave ``include_packed_experts`` false because
+        packed experts may be handled out-of-band; production build/export
+        gates set it true once ``fill_packed_expert_cache_entries`` is
+        responsible for those 3-D entries.
         """
         from prismaquant import format_registry as fr
 
@@ -292,7 +318,10 @@ class ProductionWeightCache:
                 continue
             key = self.resolve_key(str(qname), fmt_canon)
             if key is None:
-                if is_uncached_packed_expert_qname(str(qname)):
+                if (
+                    is_uncached_packed_expert_qname(str(qname))
+                    and not include_packed_experts
+                ):
                     continue
                 missing.append((str(qname), fmt_canon))
                 continue
@@ -952,6 +981,13 @@ def _fused_sibling_leaf_mapping_from_profile(profile) -> dict[str, tuple[str, ..
     }
 
 
+def _damp_sweep_enabled() -> bool:
+    # lazy import: production_weight_cache <-> export_native_compressed
+    # are mutually lazy to avoid import cycles
+    from prismaquant.export_native_compressed import gptq_damp_sweep_enabled
+    return gptq_damp_sweep_enabled()
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -1321,7 +1357,7 @@ def _render_nvfp4_progressive_candidate(
         if activations_scaled is None or activations_scaled.numel() == 0:
             return current
         if include_gptq:
-            if os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0":
+            if _damp_sweep_enabled():
                 current = enc._gptq_obs_rounding_nvfp4_swept(
                     weight_scaled,
                     activations_scaled,
@@ -1342,6 +1378,7 @@ def _render_nvfp4_progressive_candidate(
                     weight_scaled,
                     activations_scaled,
                     group_size=16,
+                    damp=enc._resolve_gptq_damp_for_role(qname),
                     global_real_override=joint_global_real,
                     clip_threshold=act_clip_threshold,
                     clip_rescale=act_clip_rescale,
@@ -1872,7 +1909,7 @@ def render_production_weight(
                 ("gptq",)
             )
             use_damp_sweep = (
-                os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0"
+                _damp_sweep_enabled()
             )
 
             def _gptq_candidate(use_static_act_order: bool) -> _RenderedCandidate:
@@ -2070,8 +2107,16 @@ def fill_production_weight_cache(
     levers.setdefault(
         "gptq_damp_sweep",
         bool(levers.get("gptq", True))
-        and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
+        and _damp_sweep_enabled(),
     )
+    if not levers["gptq_damp_sweep"]:
+        # Provenance: which fixed damp the no-sweep renders used
+        # (PRISMAQUANT_GPTQ_DAMP, default 0.01) — without this, two
+        # fixed-damp caches are metadata-indistinguishable.
+        from prismaquant.export_native_compressed import (
+            _resolve_gptq_fixed_damp,
+        )
+        levers.setdefault("gptq_fixed_damp", _resolve_gptq_fixed_damp())
     levers.setdefault("scale_sweep", False)
     levers.setdefault(
         "static_act_order",
@@ -2763,3 +2808,708 @@ def fill_production_weight_cache(
                 flush=True,
             )
     return cache
+
+
+class _PackedExpertActivationCollector:
+    """Capture module-level input ``X`` for each packed-experts module.
+
+    Packed 3-D MoE experts are not ``nn.Linear`` and so are invisible to
+    ``_LinearActivationCollector``.  This collector hooks the experts module
+    itself and reservoir-samples its module-level input (the pre-routing token
+    hidden states ``[*, hidden]``).  At render time the captured ``X`` is split
+    into per-expert routed rows by ``derive_per_expert_activations`` — the same
+    routing the live forward used — so each expert's GPTQ Hessian sees exactly
+    the rows that route to it.
+
+    The per-module token budget (``module_token_budget``) is intentionally much
+    larger than the per-Linear ``max_rows`` budget: with top-k routing over E
+    experts each expert only sees ~``top_k/E`` of the tokens, so a stable
+    per-expert Hessian needs ``~max_rows_per_expert * E / top_k`` module tokens.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        experts_qnames: set[str],
+        *,
+        module_token_budget: int,
+        store_device: torch.device | str,
+        store_dtype: torch.dtype = torch.float32,
+        profile=None,
+    ):
+        self.model = model
+        self.profile = profile
+        self.experts_qnames = set(experts_qnames)
+        self.module_token_budget = int(module_token_budget)
+        self.store_device = torch.device(store_device)
+        self.store_dtype = store_dtype
+        self.activations: dict[str, list[torch.Tensor]] = {}
+        self._priorities: dict[str, torch.Tensor] = {}
+        self._gen = torch.Generator(device="cpu")
+        self._gen.manual_seed(1234)
+        self._handles: list = []
+        self._modules_by_qname: dict[str, nn.Module] = {}
+        from prismaquant.sensitivity_probe import _is_packed_experts_module
+        for qname, mod in model.named_modules():
+            if not _is_packed_experts_module(mod, self.profile):
+                continue
+            if qname not in self.experts_qnames:
+                continue
+            self._modules_by_qname[qname] = mod
+            self.activations[qname] = []
+
+    def install(self) -> None:
+        for qname, mod in self._modules_by_qname.items():
+            self._handles.append(
+                mod.register_forward_pre_hook(self._make_hook(qname))
+            )
+
+    def _make_hook(self, qname: str):
+        def hook(module, args):
+            if not args or not isinstance(args[0], torch.Tensor):
+                return
+            x = args[0]
+            flat = x.detach().reshape(-1, x.shape[-1]).to(
+                device=self.store_device,
+                dtype=self.store_dtype,
+                non_blocking=True,
+            )
+            current = (
+                torch.cat(self.activations[qname], dim=0)
+                if self.activations[qname]
+                else None
+            )
+            sampled, priorities = update_priority_reservoir(
+                current,
+                self._priorities.get(qname),
+                flat,
+                max_rows=self.module_token_budget,
+                generator=self._gen,
+            )
+            self.activations[qname] = [] if sampled is None else [sampled]
+            if priorities is None:
+                self._priorities.pop(qname, None)
+            else:
+                self._priorities[qname] = priorities
+        return hook
+
+    def remove(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+    def collected(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        for qname, parts in self.activations.items():
+            if parts:
+                out[qname] = torch.cat(parts, dim=0)
+        return out
+
+
+def fill_packed_expert_cache_entries(
+    cache: ProductionWeightCache,
+    model: nn.Module,
+    calib_ids: torch.Tensor,
+    *,
+    render_assignment: Mapping[str, str] | None = None,
+    force_format: str | None = None,
+    levers: Mapping[str, object],
+    profile,
+    module_token_budget: int = 32768,
+    max_rows_per_expert: int = 2048,
+    eval_rows_per_expert: int = 128,
+    cache_dir: str | Path | None = None,
+    progress: bool = True,
+    max_layers: int | None = None,
+    render_mode: str = "batched",
+    gate_calib_ids: torch.Tensor | None = None,
+    gate_token_budget: int | None = None,
+) -> dict:
+    """Render packed-MoE experts into ``ProductionWeightCache`` entries.
+
+    ``render_mode``:
+      * ``"batched"`` (default, production): vectorize the GPTQ column update
+        across all experts of a layer via ``gptq_obs_rounding_nvfp4_batched``
+        — ~E× fewer Python iterations than per-expert. Fixed damp, no JSO/
+        act-order (those force a per-expert loop that is ~hours on a 35B).
+      * ``"per_expert"``: render each expert through the full
+        ``render_production_weight`` stack (progressive gates + damp-sweep +
+        JSO + do-no-harm). Faithful to the dense path but ~hours on a 35B;
+        used for the fidelity A/B that justifies the production default.
+
+    ``gate_calib_ids``: optional token ids from a corpus DISJOINT from
+    ``calib_ids``. When given, the per-expert GPTQ-vs-RTN do-no-harm gate is
+    judged on this corpus's routed rows instead of a same-corpus held-out
+    slice, and GPTQ fits on ALL fit-corpus rows. Rationale (2026-06-09 served
+    A/B): per-expert Hessians are thin (sparse routing), so GPTQ overfits its
+    calibration *domain* — a same-domain holdout catches in-sample overfit but
+    passed renders that LOST on served cross-domain KL (RTN 0.0302 vs GPTQ
+    0.0334 confident). Experts the gate corpus never routes to fall back to
+    the same-domain holdout. Default ``None`` preserves prior behavior.
+
+    This closes the packed-expert RTN-by-omission gap: every non-BF16 packed
+    expert tensor receives a deliberate cache render keyed by routed
+    per-expert activations. In production's default ``"batched"`` mode that
+    render is fixed-damp batched GPTQ without dense JSO/act-order/damp-sweep,
+    followed by the measured GPTQ-vs-RTN gate below. The non-default
+    ``"per_expert"`` mode is the one that calls ``render_production_weight``
+    and matches the dense GPTQ+damp-sweep+JSO stack. Export then reads the
+    cached 3-D dequant and re-packs it — exactly the
+    ``_pack_production_cached_2d`` contract, lifted to packed experts.
+
+    Args:
+      cache: the ``ProductionWeightCache`` produced by
+        ``fill_production_weight_cache``.  New 3-D ``(experts_qname.pn, fmt)``
+        entries are added in place (and streamed to ``cache_dir`` shards when
+        disk-streaming is on).
+      render_assignment: the concrete export assignment (recipe_key -> fmt).
+        Only non-BF16 packed-expert tensors are rendered (BF16 = passthrough).
+      levers: the resolved production lever dict. It is consumed by
+        ``render_mode="per_expert"``; the production ``"batched"`` path uses
+        its fixed fast recipe regardless of dense-linears JSO/damp-sweep
+        levers.
+      module_token_budget: reservoir size for each experts module's input X.
+      max_rows_per_expert: cap on routed rows fed to each expert's GPTQ.
+      max_layers: debug/timing cap — render only the first N experts modules.
+
+    Returns a coverage dict consumed by the export enforcement gate:
+      ``{experts_qname.pn: {"fmt", "n_experts", "min_rows", "median_rows",
+      "rendered", "had_activations"}}``.
+    """
+    import time as _time
+    from prismaquant.sensitivity_probe import (
+        _is_packed_experts_module,
+        _packed_experts_param_names,
+    )
+    from prismaquant.measure_quant_cost import (
+        derive_per_expert_activations,
+        _packed_experts_parent_module,
+    )
+    from prismaquant.export_native_compressed import (
+        _split_packed_expert_tensor,
+        compute_nvfp4_global_real,
+    )
+    from prismaquant import format_registry as fr
+
+    device = next(model.parameters()).device
+    cache_dir_path = Path(cache_dir) if cache_dir is not None else None
+    if cache_dir_path is not None:
+        cache_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def _canon(fmt: str) -> str:
+        return fr.canonical_format_name(str(fmt).strip().upper())
+
+    if force_format is None and render_assignment is None:
+        raise ValueError(
+            "fill_packed_expert_cache_entries requires render_assignment or "
+            "force_format")
+    if force_format is not None and render_assignment is not None:
+        raise ValueError(
+            "fill_packed_expert_cache_entries: pass render_assignment OR "
+            "force_format, not both")
+
+    # 1. Resolve in-scope packed-expert tensors (non-BF16 in the assignment).
+    #    Each entry: (experts_qname, mod, parent, pn, full, fmt).
+    in_scope: list[tuple[str, nn.Module, nn.Module, str, str, str]] = []
+    experts_qnames: set[str] = set()
+    modules_seen = 0
+    for experts_qname, mod in model.named_modules():
+        if not _is_packed_experts_module(mod, profile):
+            continue
+        if max_layers is not None and modules_seen >= max_layers:
+            break
+        modules_seen += 1
+        parent = _packed_experts_parent_module(model, experts_qname)
+        for pn in _packed_experts_param_names(mod, profile):
+            full = f"{experts_qname}.{pn}" if experts_qname else pn
+            if force_format is not None:
+                # Force-format mode: render every packed expert at one format,
+                # ignoring render_assignment. Used by the format-menu frontier
+                # build (eager NVFP4) and by per-Pareto-point lazy FP8 gap-fill.
+                fmt = _canon(force_format)
+            else:
+                try:
+                    recipe_key = profile.live_to_recipe_name(full)
+                except Exception:
+                    recipe_key = full
+                fmt = render_assignment.get(recipe_key)
+                if fmt is None and recipe_key != full:
+                    fmt = render_assignment.get(full)
+                if fmt is None:
+                    continue
+                fmt = _canon(fmt)
+            if fmt == "BF16":
+                continue
+            in_scope.append((experts_qname, mod, parent, pn, full, fmt))
+            experts_qnames.add(experts_qname)
+
+    coverage: dict[str, dict[str, object]] = {}
+    if not in_scope:
+        if progress:
+            print("[prod-cache/experts] no non-BF16 packed experts in scope",
+                  flush=True)
+        return coverage
+
+    if progress:
+        print(
+            f"[prod-cache/experts] {len(in_scope)} packed-expert tensors across "
+            f"{len(experts_qnames)} modules; capturing module activations "
+            f"(budget={module_token_budget} tokens/module)",
+            flush=True,
+        )
+
+    # RESUME: persist per-param activation max_abs (the export's W4A4 input
+    # scale) to a sidecar so a resumed build — which skips re-rendering existing
+    # shards — still has the calibrated scale. Without this, a resumed build
+    # ships the 1.0 placeholder (Codex blocker). Load it up front; the render
+    # loop writes it as each tensor is (re)computed.
+    import json as _json
+    if cache.activation_max_abs is None:
+        cache.activation_max_abs = {}
+    expert_sidecar_path: Path | None = (
+        cache_dir_path / "packed_expert_max_abs.json"
+        if cache_dir_path is not None else None
+    )
+    if expert_sidecar_path is not None and expert_sidecar_path.is_file():
+        try:
+            cache.activation_max_abs.update(_json.loads(
+                expert_sidecar_path.read_text()))
+        except Exception:
+            pass
+
+    in_scope_keys = [(full, fmt) for (_q, _m, _p, _pn, full, fmt) in in_scope]
+
+    def _persist_expert_sidecar() -> None:
+        if expert_sidecar_path is None:
+            return
+        # MERGE with the existing sidecar — a subset render (the M4 lazy
+        # per-Pareto-point FP8 gap-fill) must not destroy the eager build's
+        # scale entries for every OTHER expert in the shared cache_dir.
+        merged: dict[str, float] = {}
+        if expert_sidecar_path.is_file():
+            try:
+                merged.update(_json.loads(expert_sidecar_path.read_text()))
+            except Exception:
+                pass
+        for full_k, _fmt in in_scope_keys:
+            v = cache.activation_max_abs.get(full_k)
+            if v is not None:
+                merged[full_k] = float(v)
+        tmp = expert_sidecar_path.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(merged, indent=2))
+        os.replace(tmp, expert_sidecar_path)
+    # Only capture activations if some tensor still needs rendering OR is
+    # missing its calibrated scale — a fully-resumed build with a complete
+    # sidecar skips the forward entirely.
+    def _needs_work(full: str, fmt: str) -> bool:
+        if (full, fmt) in cache.weights:
+            return cache.activation_max_abs.get(full) is None
+        if cache_dir_path is not None:
+            shard = cache_dir_path / _cache_weight_filename(full, fmt)
+            if shard.is_file():
+                return cache.activation_max_abs.get(full) is None
+        return True
+
+    work_remaining = any(_needs_work(full, fmt) for full, fmt in in_scope_keys)
+
+    module_acts: dict[str, torch.Tensor] = {}
+    if work_remaining:
+        # 2. Capture module-level X for each experts module (one calib forward).
+        # Store the (large) per-module reservoirs on CPU/host, NOT in the CUDA
+        # allocator pool: on the GB10 unified-memory box the model already
+        # occupies ~67 GB of GPU pool, and 40 modules × budget × hidden × fp32
+        # in the CUDA pool fragments/OOMs the capture (observed). CPU storage
+        # keeps them out of the CUDA segment pool; derive moves one module's X
+        # back to GPU transiently. Pinned for faster H2D at render.
+        collector = _PackedExpertActivationCollector(
+            model,
+            experts_qnames,
+            module_token_budget=module_token_budget,
+            store_device=torch.device("cpu"),
+            store_dtype=torch.float32,
+            profile=profile,
+        )
+        collector.install()
+        t_cap = _time.monotonic()
+        try:
+            with torch.no_grad():
+                for i in range(calib_ids.size(0)):
+                    batch = calib_ids[i:i + 1].to(device)
+                    try:
+                        model(batch, use_cache=False)
+                    except TypeError:
+                        model(batch)
+        finally:
+            collector.remove()
+        module_acts = collector.collected()
+        if progress:
+            print(
+                f"[prod-cache/experts] captured {len(module_acts)} module "
+                f"activations in {_time.monotonic() - t_cap:.1f}s",
+                flush=True,
+            )
+    elif progress:
+        print(
+            "[prod-cache/experts] resume: all packed experts rendered + scales "
+            "in sidecar, skipping activation capture",
+            flush=True,
+        )
+
+    # 2b. Cross-domain gate corpus: capture a SECOND reservoir per module from
+    # the disjoint gate corpus. Same CPU-storage rationale as the fit reservoir.
+    gate_module_acts: dict[str, torch.Tensor] = {}
+    if work_remaining and gate_calib_ids is not None:
+        gate_collector = _PackedExpertActivationCollector(
+            model,
+            experts_qnames,
+            module_token_budget=int(gate_token_budget or module_token_budget),
+            store_device=torch.device("cpu"),
+            store_dtype=torch.float32,
+            profile=profile,
+        )
+        gate_collector.install()
+        t_cap = _time.monotonic()
+        try:
+            with torch.no_grad():
+                for i in range(gate_calib_ids.size(0)):
+                    batch = gate_calib_ids[i:i + 1].to(device)
+                    try:
+                        model(batch, use_cache=False)
+                    except TypeError:
+                        model(batch)
+        finally:
+            gate_collector.remove()
+        gate_module_acts = gate_collector.collected()
+        if progress:
+            print(
+                f"[prod-cache/experts] captured {len(gate_module_acts)} "
+                f"cross-domain gate-module activations in "
+                f"{_time.monotonic() - t_cap:.1f}s",
+                flush=True,
+            )
+
+    # 3. Render each in-scope tensor per-expert through render_production_weight.
+    derived_by_module: dict[str, dict] = {}
+    gate_derived_by_module: dict[str, dict | None] = {}
+    # Index of each module's LAST in-scope param, so we can free its (large,
+    # GPU-resident) derived per-expert activations + captured X as soon as both
+    # its params (gate_up + down) are rendered — otherwise they accumulate
+    # across all 40 modules (~2.5 GB/module on GPU) and OOM the box.
+    last_idx_by_module: dict[str, int] = {}
+    for _i, (_q, _m, _p, _pn, _full, _fmt) in enumerate(in_scope):
+        last_idx_by_module[_q] = _i
+    weights = cache.weights
+    t0 = _time.monotonic()
+    for idx, (experts_qname, mod, parent, pn, full, fmt) in enumerate(in_scope):
+        key = (full, fmt)
+        fname = (
+            _cache_weight_filename(full, fmt)
+            if cache_dir_path is not None else None
+        )
+        shard_exists = (key in weights) or (
+            fname is not None and (cache_dir_path / fname).is_file()
+        )
+        need_scale = cache.activation_max_abs.get(full) is None
+        # Fully done (shard + calibrated scale): just register the path.
+        if shard_exists and not need_scale:
+            if key not in weights and fname is not None:
+                weights[key] = fname
+            continue
+
+        X = module_acts.get(experts_qname)
+        if X is None or X.numel() == 0:
+            raise RuntimeError(
+                f"[prod-cache/experts] no captured activations for "
+                f"{experts_qname}; cannot render {full} through the deliberate "
+                f"path (would silently fall back to RTN). Increase the calib "
+                f"set or module_token_budget."
+            )
+        mod_dtype = getattr(mod, pn).dtype
+        if experts_qname not in derived_by_module:
+            # The router forward inside derive_per_expert_activations runs in
+            # the model's compute dtype (bf16); X was stored as fp32 for the
+            # reservoir, so cast it back to the experts module dtype before
+            # routing. The per-expert activations are re-promoted to fp32 by
+            # render_production_weight's GPTQ path.
+            derived_by_module[experts_qname] = derive_per_expert_activations(
+                mod, X.to(device=device, dtype=mod_dtype), parent,
+                capture_down=True,
+                max_rows_per_expert=max_rows_per_expert,
+            )
+        derived = derived_by_module[experts_qname]
+        if gate_module_acts and experts_qname not in gate_derived_by_module:
+            # Cross-domain gate rows: same routing derivation, capped at the
+            # eval budget — the gate only judges, it never fits.
+            Xg = gate_module_acts.get(experts_qname)
+            gate_derived_by_module[experts_qname] = (
+                derive_per_expert_activations(
+                    mod, Xg.to(device=device, dtype=mod_dtype), parent,
+                    capture_down=True,
+                    max_rows_per_expert=eval_rows_per_expert,
+                )
+                if Xg is not None and Xg.numel() > 0 else None
+            )
+        gate_derived = gate_derived_by_module.get(experts_qname)
+        packed_param = getattr(mod, pn).detach().float()  # [E, out, in]
+        E = packed_param.shape[0]
+        proj_split = _split_packed_expert_tensor(packed_param, pn, profile)
+        is_down = len(proj_split) == 1
+        acts_key = "down" if is_down else "gate_up"
+        per_expert_acts = derived[acts_key]
+        row_counts = derived["row_counts"]
+
+        # Per-param activation max_abs for the export's input_global_scale
+        # (W4A4 needs the calibrated activation clip; without it experts ship
+        # the 1.0 placeholder — Codex blocker). gate/up share the module input
+        # X (measured uncapped over the full captured reservoir); down sees the
+        # post-SwiGLU intermediate. One scale per packed param, applied to all
+        # experts (the fused MoE kernel quantizes the input once).
+        if is_down:
+            param_max_abs = 0.0
+            for e in range(E):
+                a = per_expert_acts[e] if e < len(per_expert_acts) else None
+                if a is not None and a.numel() > 0:
+                    param_max_abs = max(
+                        param_max_abs, float(a.detach().abs().max().item()))
+        else:
+            param_max_abs = float(X.detach().abs().max().item())
+        # First calibrated scale wins per qname: activation_max_abs is keyed
+        # per-param (shared across formats), so a later render of ANOTHER
+        # format (M4 lazy FP8 gap-fill) must not clobber the scale the eager
+        # NVFP4 rung calibrated, measured under, and will ship. A fresh build
+        # (no prior scale, no sidecar) always writes.
+        if param_max_abs > 0 and cache.activation_max_abs.get(full) is None:
+            cache.activation_max_abs[full] = param_max_abs
+            _persist_expert_sidecar()
+
+        # Resume with a missing scale: shard already on disk, we only needed to
+        # recompute + persist the calibrated scale. Don't re-render.
+        if shard_exists:
+            if key not in weights and fname is not None:
+                weights[key] = fname
+            continue
+
+        # Per-expert global: for split gate/up the joint is max over slices so
+        # gate and up share one scale (matches the export packer); for down the
+        # per-expert global stands alone.
+        per_expert_global: list[torch.Tensor | None] = [None] * E
+        for e in range(E):
+            cands = [
+                compute_nvfp4_global_real(sp[e].float(), group_size=16)
+                for _, sp in proj_split
+            ]
+            per_expert_global[e] = (
+                torch.stack(cands).max() if len(cands) > 1 else cands[0]
+            )
+
+        empties = sum(
+            1 for e in range(E)
+            if e >= len(per_expert_acts)
+            or per_expert_acts[e] is None
+            or per_expert_acts[e].numel() == 0
+        )
+
+        rtn_fallbacks = 0
+        heldout_reverts = 0
+        cross_gated = 0
+        use_batched = (render_mode == "batched" and fmt == "NVFP4")
+        if use_batched:
+            from prismaquant.export_batched_gptq import (
+                gptq_obs_rounding_nvfp4_batched,
+            )
+            from prismaquant.export_native_compressed import _rtn_dequant_nvfp4
+            src = packed_param.to(device=device, dtype=torch.float32)
+            hidden_in = packed_param.shape[2]
+            # Split each expert's routed rows into a RENDER set (fit GPTQ) and a
+            # HELD-OUT eval set (decide GPTQ-vs-RTN). The held-out gate makes the
+            # render provably non-regressive vs RTN on data the expert was not
+            # fit to — catching the rank-deficient-Hessian overfit where
+            # in-sample GPTQ always "wins" but generalizes worse than RTN
+            # (observed on down_proj at low row counts). When a cross-domain
+            # gate corpus is available for this expert, the eval set comes from
+            # THAT corpus (and GPTQ fits on all fit-corpus rows) — a same-domain
+            # holdout cannot catch calibration-DOMAIN overfit, which is the
+            # failure the 2026-06-09 served A/B actually exhibited. Empty
+            # experts (no rows) get source RTN, never the batched core's
+            # all-zero dead-column output.
+            per_expert_gw = derived.get("gate_weights")
+            gate_acts_lists = (
+                gate_derived[acts_key] if gate_derived is not None else None
+            )
+            gate_gw_lists = (
+                gate_derived.get("gate_weights")
+                if gate_derived is not None else None
+            )
+            render_acts: list[torch.Tensor] = []
+            eval_acts: list[torch.Tensor | None] = []
+            eval_gw: list[torch.Tensor | None] = []
+            for e in range(E):
+                a = per_expert_acts[e] if e < len(per_expert_acts) else None
+                gw = (
+                    per_expert_gw[e]
+                    if per_expert_gw is not None and e < len(per_expert_gw)
+                    else None
+                )
+                xa = None
+                xw = None
+                if gate_acts_lists is not None and e < len(gate_acts_lists):
+                    cand = gate_acts_lists[e]
+                    if cand is not None and cand.numel() > 0:
+                        xa = cand
+                        if gate_gw_lists is not None and e < len(gate_gw_lists):
+                            xw = gate_gw_lists[e]
+                if a is None or a.numel() == 0:
+                    render_acts.append(
+                        torch.zeros((0, hidden_in), device=device,
+                                    dtype=torch.float32))
+                    eval_acts.append(None)
+                    eval_gw.append(None)
+                    continue
+                a = a.to(device=device, dtype=torch.float32)
+                if xa is not None:
+                    # Cross-domain do-no-harm: fit on ALL fit-corpus rows,
+                    # judge on the disjoint gate corpus's routed rows.
+                    render_acts.append(a)
+                    eval_acts.append(
+                        xa.to(device=device, dtype=torch.float32))
+                    eval_gw.append(
+                        xw.to(device=device, dtype=torch.float32).pow(2)
+                        if xw is not None else None
+                    )
+                    cross_gated += 1
+                    continue
+                n = int(a.shape[0])
+                n_eval = min(eval_rows_per_expert, n // 5) if n >= 20 else 0
+                if n_eval > 0:
+                    render_acts.append(a[:n - n_eval])
+                    eval_acts.append(a[n - n_eval:])
+                    # Router-weight the held-out objective: served MoE scales
+                    # each token's expert output by its top_k gate weight, so
+                    # the row's output error² scales by gate_weight².
+                    eval_gw.append(
+                        gw[n - n_eval:].to(
+                            device=device, dtype=torch.float32).pow(2)
+                        if gw is not None else None
+                    )
+                else:
+                    render_acts.append(a)
+                    eval_acts.append(None)  # too few rows to hold out
+                    eval_gw.append(None)
+            overrides = torch.stack([
+                per_expert_global[e].to(device=device, dtype=torch.float32)
+                for e in range(E)
+            ])
+            rendered = gptq_obs_rounding_nvfp4_batched(
+                src, render_acts, group_size=16,
+                global_real_overrides=overrides,
+                static_act_order=False,
+                joint_scale_opt=False,
+            )  # fp32 [E,out,in]; held-out do-no-harm below, store casts to bf16
+            for e in range(E):
+                w_rtn = _rtn_dequant_nvfp4(
+                    src[e], group_size=16, global_real_override=overrides[e],
+                )
+                src_a = (
+                    per_expert_acts[e] if e < len(per_expert_acts) else None
+                )
+                if src_a is None or src_a.numel() == 0:
+                    # empty expert: no activation evidence -> source RTN
+                    rendered[e] = w_rtn
+                    rtn_fallbacks += 1
+                    continue
+                ev = eval_acts[e]
+                # held-out gate when available, else in-sample render set
+                gate_acts = ev if ev is not None else render_acts[e]
+                row_w = eval_gw[e] if ev is not None else None
+                if gate_acts is None or gate_acts.numel() == 0:
+                    rendered[e] = w_rtn
+                    rtn_fallbacks += 1
+                    continue
+                s_gptq = score_render_error(
+                    src[e], rendered[e], gate_acts, row_weights=row_w)
+                s_rtn = score_render_error(
+                    src[e], w_rtn, gate_acts, row_weights=row_w)
+                if s_rtn <= s_gptq:
+                    rendered[e] = w_rtn
+                    rtn_fallbacks += 1
+                    if ev is not None:
+                        heldout_reverts += 1
+        else:
+            # Per-expert full-stack render (fmt != NVFP4, or the A/B mode).
+            rendered = torch.empty_like(packed_param)
+            for e in range(E):
+                w_e = packed_param[e]  # [out, in]
+                acts_e = (
+                    per_expert_acts[e] if e < len(per_expert_acts) else None
+                )
+                has_acts = acts_e is not None and acts_e.numel() > 0
+                w_dq = render_production_weight(
+                    w_e, fmt,
+                    qname=f"{full}.e{e}",
+                    activations=(
+                        {f"{full}.e{e}": acts_e.to(device)} if has_acts else {}
+                    ),
+                    levers=levers,
+                    joint_global_real=per_expert_global[e],
+                )
+                rendered[e] = w_dq.to(rendered.dtype)
+                del w_dq
+            rendered = rendered.to(getattr(mod, pn).dtype)
+
+        _store_rendered_weight_entry(
+            weights=weights,
+            cache_dir_path=cache_dir_path,
+            qname=full,
+            fmt=fmt,
+            tensor=rendered,
+            weight_dtype=getattr(mod, pn).dtype,
+        )
+        pos_rows = sorted(r for r in row_counts if r > 0)
+        coverage[full] = {
+            "fmt": fmt,
+            "n_experts": int(E),
+            "min_rows": int(pos_rows[0]) if pos_rows else 0,
+            "median_rows": int(pos_rows[len(pos_rows) // 2]) if pos_rows else 0,
+            "empty_experts": int(empties),
+            "rtn_fallbacks": int(rtn_fallbacks),
+            "heldout_reverts": int(heldout_reverts),
+            "gptq_experts": int(E - rtn_fallbacks),
+            "render_mode": render_mode,
+            "gate_mode": (
+                "cross-domain" if (use_batched and gate_derived is not None)
+                else "in-domain-holdout"
+            ),
+            "cross_gated_experts": int(cross_gated),
+            "rendered": True,
+            "had_activations": True,
+        }
+        del rendered, packed_param, proj_split
+        # Free this module's GPU-resident derived activations + captured X once
+        # its last param is rendered (bounds peak to ~one module's working set).
+        if idx == last_idx_by_module.get(experts_qname):
+            derived = None
+            gate_derived = None
+            derived_by_module.pop(experts_qname, None)
+            module_acts.pop(experts_qname, None)
+            gate_derived_by_module.pop(experts_qname, None)
+            gate_module_acts.pop(experts_qname, None)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        if progress:
+            print(
+                f"[prod-cache/experts] {idx + 1}/{len(in_scope)} {full} @ {fmt} "
+                f"E={E} empty={empties} rtn_fallback={rtn_fallbacks} "
+                f"(heldout_reverts={heldout_reverts}, "
+                f"cross_gated={cross_gated}) gptq={E - rtn_fallbacks} "
+                f"min_rows={coverage[full]['min_rows']} "
+                f"({_time.monotonic() - t0:.1f}s elapsed)",
+                flush=True,
+            )
+
+    if progress:
+        print(
+            f"[prod-cache/experts] rendered {len(coverage)} packed-expert "
+            f"tensors in {_time.monotonic() - t0:.1f}s",
+            flush=True,
+        )
+    return coverage

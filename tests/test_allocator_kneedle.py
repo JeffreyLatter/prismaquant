@@ -4,10 +4,12 @@ import pytest
 
 from prismaquant.allocator import (
     _pareto_knee_summary,
+    _rd_curve_diagnostic,
     kneedle,
     kneedle_log_error_global,
     kneedle_log_error,
     kneedle_raw_linear,
+    refine_knee_golden,
 )
 
 
@@ -46,6 +48,10 @@ def test_allocator_pareto_knee_summary_reports_both_modes():
     assert summary["global_log_error"]["achieved_bits"] == pytest.approx(4.851)
     assert summary["raw_linear"]["achieved_bits"] == pytest.approx(4.600)
     assert summary["log_error"]["kneedle_error_source"] == "predicted_dloss"
+    assert summary["diagnostic_thresholds"] == {
+        "tail_min_log_span_decades": 1.0,
+        "tail_midpoint_fraction": 0.5,
+    }
 
 
 def test_allocator_pareto_knee_summary_uses_body_loss_with_auxiliary_costs():
@@ -135,3 +141,102 @@ def test_allocator_log_knee_ignores_catastrophic_prefix():
     assert summary["global_log_error"]["target_bits"] == pytest.approx(4.70)
     assert summary["log_error"]["target_bits"] == pytest.approx(5.00)
     assert summary["log_error"]["achieved_bits"] == pytest.approx(4.965169589384272)
+
+
+# --------------------------------------------------------------------------
+# RD-curve log-linearity diagnostic (kneedle demotion)
+# --------------------------------------------------------------------------
+def test_rd_curve_diagnostic_log_linear_has_no_intrinsic_knee():
+    # dloss = 10^(-0.3*bpp): exactly straight in (bpp, log10 dloss).
+    feasible = [
+        {"achieved_bits": b, "predicted_dloss": 10.0 ** (-0.3 * b), "feasible": True}
+        for b in [4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 8.0]
+    ]
+    rd = _rd_curve_diagnostic(feasible)
+    assert rd["available"] is True
+    assert rd["r2"] == pytest.approx(1.0, abs=1e-9)
+    assert rd["log_linear"] is True
+    assert rd["intrinsic_knee"] is False
+    assert rd["slope_decades_per_bit"] == pytest.approx(-0.3, abs=1e-9)
+    assert rd["diagnostic_thresholds"]["log_linear_r2"] == pytest.approx(0.99)
+
+
+def test_rd_curve_diagnostic_flags_curvature():
+    # Start log-linear, then inject a fat outlier on the middle point so the
+    # least-squares R^2 drops below 0.99 -> a curvature knee may be meaningful.
+    feasible = [
+        {"achieved_bits": b, "predicted_dloss": 10.0 ** (-0.3 * b), "feasible": True}
+        for b in [4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 8.0]
+    ]
+    feasible[3]["predicted_dloss"] *= 5.0  # ~0.7-decade kink at 6.0 bpp
+    rd = _rd_curve_diagnostic(feasible)
+    assert rd["available"] is True
+    assert rd["r2"] < 0.99
+    assert rd["log_linear"] is False
+    assert rd["intrinsic_knee"] is True
+
+
+def test_rd_curve_diagnostic_too_few_points():
+    rd = _rd_curve_diagnostic([
+        {"achieved_bits": 5.0, "predicted_dloss": 0.04, "feasible": True},
+        {"achieved_bits": 6.0, "predicted_dloss": 0.02, "feasible": True},
+    ])
+    assert rd["available"] is False
+
+
+# --------------------------------------------------------------------------
+# Golden-section knee refinement (reuses the sub-second DP between grid rungs)
+# --------------------------------------------------------------------------
+def test_refine_knee_golden_pins_knee_inside_bracket():
+    # A genuine convex knee around 5.0 bpp (steep below, flat above) on a coarse
+    # 0.25-bpp grid; the refiner re-solves the DP at interior budgets.
+    def f(bpp):
+        return 100.0 * (10.0 ** (-1.5 * bpp)) + 0.05 * (10.0 ** (-0.1 * bpp))
+
+    grid_targets = [4.5, 4.75, 5.0, 5.25, 5.5, 5.75, 6.0]
+    curve = [
+        {"target_bits": t, "achieved_bits": t, "predicted_dloss": f(t),
+         "feasible": True}
+        for t in grid_targets
+    ]
+    summary = _pareto_knee_summary(curve)
+    assert summary["enabled"]
+
+    def solve_fn(target):
+        # mimic _solve_for_target's 4-tuple: (assign, achieved, dloss, mutable)
+        return ({"x": "NVFP4"}, float(target), f(float(target)), f(float(target)))
+
+    refined, extra = refine_knee_golden(solve_fn, summary, curve, tol=0.01)
+    assert refined is not None
+    lo, hi = refined["bracket_target_bits"]
+    assert lo <= refined["target_bits"] <= hi          # stays inside the bracket
+    assert refined["evals"] > 0
+    assert refined["mode"] == "log_error_golden_refined"
+    # every refinement sample re-solved a real interior target inside the bracket
+    assert all(lo <= pt["target_bits"] <= hi for pt in extra)
+    assert refined["predicted_dloss"] > 0.0
+
+    # Convergence: the golden section must land on the actual max-dip target, not
+    # just somewhere in the bracket. Brute-force the perpendicular dip below the
+    # bracket chord in (bpp, log10 dloss) space over a fine grid and compare.
+    import math
+    xL, yL = lo, math.log10(f(lo))
+    xH, yH = hi, math.log10(f(hi))
+    def _dip(t):
+        x, y = t, math.log10(f(t))
+        ychord = yL + (yH - yL) * (x - xL) / (xH - xL)
+        return ychord - y
+    brute = max((lo + (hi - lo) * i / 2000.0 for i in range(2001)), key=_dip)
+    assert refined["target_bits"] == pytest.approx(brute, abs=0.02)  # ~2*tol
+
+
+def test_refine_knee_golden_noop_when_disabled():
+    curve = [
+        {"target_bits": t, "achieved_bits": t, "predicted_dloss": 1.0, "feasible": True}
+        for t in [4.5, 5.0, 5.5]
+    ]
+    refined, extra = refine_knee_golden(
+        lambda t: (None, float("nan"), float("inf"), float("inf")),
+        {"enabled": False}, curve,
+    )
+    assert refined is None and extra == []

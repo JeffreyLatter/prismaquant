@@ -66,6 +66,12 @@ set -euo pipefail
 : "${PREFETCH_MIN_AVAILABLE_GB:=auto}"
 : "${ACTIVATION_ROWS_LIMIT:=256}"
 : "${DATASET:=/home/rob/dq-runs/calibration/diverse-v1.jsonl}"
+# MINOR-M2: packed-MoE experts use a cross-domain held-out corpus for the
+# GPTQ-vs-RTN do-no-harm gate (the served-validated recipe — arm E in
+# moe_expert_gptq_vs_rtn — beat same-corpus/in-sample gating). Must be DISJOINT
+# from DATASET. Ignored for dense models (no packed experts). Set empty to
+# reproduce the historical same-corpus in-sample gate.
+: "${EXPERT_GATE_DATASET:=/home/rob/dq-runs/calibration/xdom-gate-v1.jsonl}"
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_packed_moe}"
@@ -177,18 +183,64 @@ case ",$PRODUCTION_CACHE_LEVERS," in
     ;;
 esac
 export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
-: "${H_DETAIL_DIR:=${WORK_DIR}/h_detail}"
 : "${SELECTION_MODE:=surrogate}"
 : "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
-: "${VALIDATED_FRONTIER_KL_SCOPE:=last_token}"
+# Held-out selection (review criticals C3/C5): the frontier-selecting KL
+# must be measured on text disjoint from probe/cost/render calibration
+# (house rule: "held-out split is disjoint from cost generation"). The
+# loader is prefix-stable, so skipping the first NSAMPLES windows makes
+# the validation windows token-disjoint by construction. Default ON —
+# the prior in-sample wiring was a bug, not a behavior. Set
+# VALIDATED_FRONTIER_SKIP_CALIB=0 only to reproduce historical runs.
+: "${VALIDATED_FRONTIER_SKIP_CALIB:=$NSAMPLES}"
+# Optional fully separate validation corpus (overrides skip-first
+# disjointness with corpus-level disjointness when provided).
+: "${VALIDATED_FRONTIER_DATASET:=$DATASET}"
+# M26: final selection scores full-sequence KL (the gold-metric scope, §5),
+# not the last_token triage screen. Selection is still re-validated on the
+# served metric before ship, but aligning the selection scope with the gold
+# metric removes a screen/gold mismatch. VALIDATED_FRONTIER_KL_SCOPE=last_token
+# reproduces historical selections (the flagship 27B was picked under it).
+: "${VALIDATED_FRONTIER_KL_SCOPE:=full_sequence}"
 : "${VALIDATED_FRONTIER_PICK:=kneedle}"
+: "${VALIDATED_FRONTIER_SAT_Z:=2.0}"
+# Saturation (B*) needs a real per-bpp noise floor: validate_assignments_kl's
+# kl_stderr is computed across calib-repeats, so a single repeat -> stderr=0 ->
+# the saturation band collapses and B* degenerates to the asymptote. Auto-bump
+# repeats to 4 when PICK=saturation (CLAUDE.md's --calib-repeats>=4 discipline);
+# other picks keep 1 repeat (backwards-compatible). Override explicitly to pin.
+if [[ "$VALIDATED_FRONTIER_PICK" == "saturation" ]]; then
+  : "${VALIDATED_FRONTIER_CALIB_REPEATS:=4}"
+else
+  : "${VALIDATED_FRONTIER_CALIB_REPEATS:=1}"
+fi
 : "${VALIDATED_SOURCE_PREFETCH:=require}"
 : "${VALIDATED_SOURCE_PREFETCH_MAX_GB:=0}"
 : "${VALIDATED_SOURCE_PREFETCH_HEADROOM_GB:=16}"
 : "${VALIDATED_SOURCE_PREFETCH_WORKERS:=2}"
 : "${VALIDATED_FRONTIER_KL_CUDA_GRAPHS:=auto}"
 : "${VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE:=0}"
+# hooks materializes every assignment via forward hooks in one process
+# (fast, but model + full render set must co-reside: OOMs on 35B-class MoE
+# in the 128 GB unified pool). inplace loops one validate_assignments_kl
+# invocation per Pareto point (weights installed in place, renders paged
+# per point) and merges the per-point JSONs — the run_m4_validate_inplace
+# pattern that fits 35B.
+: "${VALIDATED_FRONTIER_MATERIALIZATION:=hooks}"
+# COST_MODE=aura settings (defaults = the recipes that produced the regen-27b
+# and 35B arm-E wins; see .claude/prismaquant-handover + memory notes).
+: "${AURA_COST_NPROBES:=32}"
+: "${AURA_COST_NSAMPLES:=8}"
+: "${AURA_COST_SEQLEN:=128}"
+: "${AURA_COST_CALIB_SEED:=42}"
+: "${AURA_COST_LINEAR_CHUNKS:=8}"
+: "${AURA_COST_PROBE_MICROBATCH:=8}"
+: "${AURA_COST_MIN_FREE_GIB:=18}"
+# Empirical packed-expert unit-KL stage (MoE hybrid): serving-unit RTN KL
+# measured end-to-end, FP8 kept in the menu (real-KL rejects it, no bans).
+: "${AURA_EXPERT_NSAMPLES:=16}"
+: "${AURA_EXPERT_SEQLEN:=512}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 case "$COST_MODE" in
@@ -217,15 +269,38 @@ case "$COST_MODE" in
     PRODUCTION_RENDER_COST_CACHE_DIR="${WORK_DIR}/artifacts/production_render_score_staged_weight_cache"
     PRODUCTION_RENDER_COST_TAIL_QNAMES="${WORK_DIR}/artifacts/production_render_score_tail_qnames.txt"
     ;;
+  aura)
+    # AURA downstream-KL-adjoint cost (aura_cost.py): predicted_dloss from
+    # KL-Fisher probes x production-rendered dW. Served wins: -38% KL @4B,
+    # -17.9% @27B vs the h_trace x output_mse baseline; regen-27b (#1
+    # artifact) and the 35B arm-E hybrid both ran this recipe. On MoE
+    # models the smooth cost is route-flip-blind for routed experts, so
+    # packed experts get MEASURED empirical unit-KL costs instead
+    # (prismaquant.expert_empirical_cost) merged into one hybrid payload.
+    BASE_COST_PATH="${WORK_DIR}/artifacts/cost_baseline.pkl"
+    COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
+    AURA_COST_RAW="${WORK_DIR}/artifacts/cost_aura.pkl"
+    if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
+      # Principle #8: the cost's rendered dW, the frontier's measured KL,
+      # and the exported bytes all come from ONE format-menu cache — build
+      # the frontier cache early (identical settings to stage [4/4], which
+      # then skip-if-exists) and point aura_cost at it. This is the
+      # regen-27b prodcache_menu.pkl pattern, and it halves the ~60 GB
+      # double-render a separate render-score cache would cost on 35B.
+      PRODUCTION_RENDER_COST_CACHE_PATH="${WORK_DIR}/artifacts/production_weight_cache_frontier_raw.pkl"
+      PRODUCTION_RENDER_COST_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache_frontier"
+    else
+      PRODUCTION_RENDER_COST_CACHE_PATH="${WORK_DIR}/artifacts/production_render_score_cache.pkl"
+      PRODUCTION_RENDER_COST_CACHE_DIR="${WORK_DIR}/artifacts/production_render_score_weight_cache"
+    fi
+    PRODUCTION_RENDER_COST_TAIL_QNAMES=""
+    ;;
   *)
-    echo "[pipeline] ERROR: COST_MODE must be local, production-render-score, or production-render-staged" >&2
+    echo "[pipeline] ERROR: COST_MODE must be local, production-render-score, production-render-staged, or aura" >&2
     exit 2
     ;;
 esac
 
-PROBE_H_DETAIL_ARGS=()
-COST_H_DETAIL_ARGS=()
-PROD_H_DETAIL_ARGS=()
 case "${HADAMARD_DUQUANT:-}" in
   0|false|False|FALSE|no|No|NO|"") ;;
   *)
@@ -256,6 +331,19 @@ case "$SELECTION_MODE" in
     exit 2
     ;;
 esac
+case "$MSE_PROMOTION" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    if [[ "$SELECTION_MODE" != "validated-surrogate" ]]; then
+      echo "[pipeline] ERROR: MSE_PROMOTION requires SELECTION_MODE=validated-surrogate; it is a post-frontier rewrite and would be inert under SELECTION_MODE=$SELECTION_MODE." >&2
+      exit 2
+    fi
+    if [[ "$PRODUCTION_CACHE" == "0" || "$PRODUCTION_CACHE" == "false" || "$PRODUCTION_CACHE" == "False" ]]; then
+      echo "[pipeline] ERROR: MSE_PROMOTION requires PRODUCTION_CACHE=1 so the selected assignment can be recached and exported from resident production weights." >&2
+      exit 2
+    fi
+    ;;
+esac
 
 echo "[pipeline] config:"
 echo "  MODEL_PATH=$MODEL_PATH"
@@ -276,11 +364,15 @@ echo "  COST_MODE=$COST_MODE"
 if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" || "$COST_MODE" == "production-render-staged" || "$COST_MODE" == "production-render-tail" ]]; then
   echo "  PRODUCTION_RENDER_COST_NSAMPLES=$PRODUCTION_RENDER_COST_NSAMPLES PRODUCTION_RENDER_COST_SEQLEN=$PRODUCTION_RENDER_COST_SEQLEN PRODUCTION_RENDER_COST_SEED=$PRODUCTION_RENDER_COST_SEED SCORE_FIELD=$PRODUCTION_RENDER_COST_SCORE_FIELD"
 fi
+if [[ "$COST_MODE" == "aura" ]]; then
+  echo "  AURA_COST_NPROBES=$AURA_COST_NPROBES AURA_COST_NSAMPLES=$AURA_COST_NSAMPLES AURA_COST_SEQLEN=$AURA_COST_SEQLEN AURA_COST_CALIB_SEED=$AURA_COST_CALIB_SEED"
+  echo "  AURA_EXPERT_NSAMPLES=$AURA_EXPERT_NSAMPLES AURA_EXPERT_SEQLEN=$AURA_EXPERT_SEQLEN VALIDATED_FRONTIER_MATERIALIZATION=$VALIDATED_FRONTIER_MATERIALIZATION"
+fi
 echo "  EXPORT_GPTQ=$EXPORT_GPTQ EXPORT_SCALE_SWEEP=$EXPORT_SCALE_SWEEP"
 echo "  PIPELINE_SPEC_PATH=$PIPELINE_SPEC_PATH"
 echo "  PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-static_6}"
-echo "  H_DETAIL_DIR=$H_DETAIL_DIR"
 echo "  PRODUCTION_CACHE_LRU_GB=$PRODUCTION_CACHE_LRU_GB PRODUCTION_CACHE_PREFETCH=$PRODUCTION_CACHE_PREFETCH"
+echo "  VALIDATED_FRONTIER_SKIP_CALIB=$VALIDATED_FRONTIER_SKIP_CALIB VALIDATED_FRONTIER_DATASET=$VALIDATED_FRONTIER_DATASET"
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
 echo
 
@@ -305,10 +397,63 @@ case "$PIPELINE_SPEC_VALIDATE" in
 esac
 "${PIPELINE_SPEC_ARGS[@]}"
 
+
+# -----------------------------------------------------------------------
+# Settings-hash guard (review critical C4): skip-if-exists stages must
+# refuse to reuse artifacts built under different quality-affecting
+# settings — silent reuse is the rendering-confound class that has
+# invalidated A/Bs before. Each stage writes <artifact>.settings.json on
+# build; on reuse a mismatch is a hard exit-2 naming the stale file.
+# Legacy artifacts (no manifest) warn loudly but are not invalidated.
+# -----------------------------------------------------------------------
+require_stage_settings() {
+  local artifact="$1" stage="$2"; shift 2
+  python3 - "$artifact" "${artifact}.settings.json" "$stage" "$@" <<'GUARD'
+import json, os, sys
+artifact, manifest, stage, *pairs = sys.argv[1:]
+cur = dict(p.split("=", 1) for p in pairs)
+if os.path.exists(artifact):
+    if not os.path.exists(manifest):
+        print(f"[pipeline] WARNING: {stage}: reusing {artifact} which has no "
+              "settings manifest (predates the settings-hash guard); cannot "
+              "verify it matches the current settings", flush=True)
+        sys.exit(0)
+    prev = json.load(open(manifest))
+    diffs = {k: (prev.get(k), cur.get(k))
+             for k in sorted(set(prev) | set(cur))
+             if prev.get(k) != cur.get(k)}
+    if diffs:
+        print(f"[pipeline] ERROR: {stage}: {artifact} was built under "
+              "DIFFERENT settings; refusing silent reuse:", flush=True)
+        for k, (a, b) in diffs.items():
+            print(f"    {k}: artifact={a!r}  current={b!r}", flush=True)
+        print(f"    -> delete {artifact} (and its .settings.json) to "
+              "rebuild, or restore the original settings", flush=True)
+        sys.exit(2)
+    sys.exit(0)
+os.makedirs(os.path.dirname(manifest) or ".", exist_ok=True)
+json.dump(cur, open(manifest, "w"), indent=1, sort_keys=True)
+GUARD
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then exit "$rc"; fi
+}
+
+RENDER_ENV_SETTINGS=(
+  "PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-}"
+  "PRISMAQUANT_GPTQ_DAMP_SWEEP=${PRISMAQUANT_GPTQ_DAMP_SWEEP:-1}"
+  "PRISMAQUANT_GPTQ_DAMP=${PRISMAQUANT_GPTQ_DAMP:-}"
+  "PRISMAQUANT_ACT_CLIP_QUANTILE=${PRISMAQUANT_ACT_CLIP_QUANTILE:-0.999}"
+  "PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
+  "PRODUCTION_CACHE_DISABLE_LEVERS=${PRODUCTION_CACHE_DISABLE_LEVERS:-}"
+)
+
 # -----------------------------------------------------------------------
 # 1. Sensitivity probe (per-Linear empirical Fisher diagonal trace,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
+require_stage_settings "${PROBE_PATH}" probe \
+  "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
+  "SEQLEN=$SEQLEN" "CALIBRATION_MODALITY=$CALIBRATION_MODALITY"
 if [[ ! -f "${PROBE_PATH}" ]]; then
   echo "[pipeline] [1/4] running sensitivity probe ..."
   python3 -m prismaquant.incremental_probe \
@@ -327,7 +472,6 @@ if [[ ! -f "${PROBE_PATH}" ]]; then
     --calibration-modality "$CALIBRATION_MODALITY" \
     --mm-dataset "$MM_DATASET" \
     --mm-nsamples 8 --mm-max-text-len 128 \
-    "${PROBE_H_DETAIL_ARGS[@]}" \
     2>&1 | tee "${WORK_DIR}/logs/probe.log"
 else
   # Reuse guard: make sure the pre-existing probe.pkl matches the
@@ -367,12 +511,6 @@ except Exception as e:
     echo "             Or unset CALIBRATION_MODALITY to match the probe."
     exit 2
   fi
-  if [[ "${#PROBE_H_DETAIL_ARGS[@]}" -gt 0 && ! -d "$H_DETAIL_DIR" ]]; then
-    echo "[pipeline] [1/4] ABORT: Fisher h-detail was requested but"
-    echo "             h-detail dir is missing: $H_DETAIL_DIR"
-    echo "             Delete ${PROBE_PATH} to regenerate probe+h-detail."
-    exit 2
-  fi
   echo "[pipeline] [1/4] probe.pkl exists (modality=${probe_modality}), skipping"
 fi
 
@@ -380,6 +518,9 @@ fi
 # 2. Cost measurement (per-(Linear, format) measured RTN error,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
+require_stage_settings "${BASE_COST_PATH}" base-cost \
+  "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
+  "SEQLEN=$SEQLEN" "FORMATS=$FORMATS"
 if [[ ! -f "${BASE_COST_PATH}" ]]; then
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
   python3 -m prismaquant.incremental_measure_quant_cost \
@@ -395,58 +536,18 @@ if [[ ! -f "${BASE_COST_PATH}" ]]; then
     --skip-missing-activations \
     --no-include-lm-head \
     --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-2048}" \
-    "${COST_H_DETAIL_ARGS[@]}" \
     2>&1 | tee "${WORK_DIR}/logs/cost.log"
 else
-  if [[ "${#COST_H_DETAIL_ARGS[@]}" -gt 0 ]]; then
-    cost_h_detail_status=$(python3 - "$BASE_COST_PATH" "$H_DETAIL_DIR" <<'PY'
-import pickle
-import sys
-from pathlib import Path
-
-with open(sys.argv[1], "rb") as f:
-    blob = pickle.load(f)
-meta = blob.get("meta", {}) if isinstance(blob, dict) else {}
-expected = str(Path(sys.argv[2]))
-actual = meta.get("h_detail_dir")
-if actual is None:
-    shards = meta.get("shards") or []
-    vals = {
-        (
-            s.get("h_detail_dir")
-            or (
-                s.get("incremental_shard", {}).get("h_detail_dir")
-                if isinstance(s.get("incremental_shard"), dict)
-                else None
-            )
-        )
-        for s in shards
-        if isinstance(s, dict)
-    }
-    vals.discard(None)
-    if len(vals) == 1:
-        actual = next(iter(vals))
-    elif len(vals) > 1:
-        actual = "__mixed__"
-print("ok" if actual == expected else f"bad:{actual}")
-PY
-)
-    if [[ "$cost_h_detail_status" != "ok" ]]; then
-      echo "[pipeline] [2/4] ABORT: cost.pkl was not measured with requested h-detail dir."
-      echo "             expected: $H_DETAIL_DIR"
-      echo "             actual:   ${cost_h_detail_status#bad:}"
-      echo "             Delete stale cost artifacts to regenerate:"
-      echo "               rm ${BASE_COST_PATH}"
-      echo "               rm -rf ${WORK_DIR}/work/shards"
-      exit 2
-    fi
-  fi
   echo "[pipeline] [2/4] baseline cost exists, skipping"
 fi
 # Fisher output-MSE allocator cost-status check removed; the archive guard
 # at the top of this file errors out before reaching here if the var is set.
 
 if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" ]]; then
+  require_stage_settings "$PRODUCTION_RENDER_COST_CACHE_PATH" render-cost-cache \
+    "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "FORMATS=$FORMATS" \
+    "NS=$PRODUCTION_RENDER_COST_NSAMPLES" "SL=$PRODUCTION_RENDER_COST_SEQLEN" \
+    "SEED=$PRODUCTION_RENDER_COST_SEED" "${RENDER_ENV_SETTINGS[@]}"
   if [[ ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
     echo "[pipeline] [2b/4] rendering production weights for allocator cost ..."
     python3 -m prismaquant.build_production_cache \
@@ -602,6 +703,139 @@ PY
   fi
 fi
 
+if [[ "$COST_MODE" == "aura" ]]; then
+  # [2b] Production-faithful dW cache for the AURA adjoint. Under
+  # SELECTION_MODE=validated-surrogate this IS the frontier cache (identical
+  # path + settings to stage [4/4], which then skip-if-exists): ONE
+  # format-menu cache supplies the cost's rendered dW, the frontier's
+  # measured bytes, and the exported bytes (principle #8) — the regen-27b
+  # prodcache_menu.pkl pattern.
+  AURA_CACHE_FORMATS="$(python3 - "$FORMATS" <<'PY'
+import sys
+from prismaquant import format_registry as fr
+
+seen = []
+for raw in sys.argv[1].split(","):
+    name = raw.strip()
+    if not name:
+        continue
+    canon = fr.canonical_format_name(name)
+    if canon != "BF16" and canon not in seen:
+        seen.append(canon)
+print(",".join(seen))
+PY
+)"
+  if [[ -z "$AURA_CACHE_FORMATS" ]]; then
+    echo "[pipeline] ERROR: COST_MODE=aura has no non-BF16 formats in FORMATS" >&2
+    exit 2
+  fi
+  require_stage_settings "$PRODUCTION_RENDER_COST_CACHE_PATH" aura-dw-cache \
+    "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "FORMATS=$AURA_CACHE_FORMATS" \
+    "NS=$NSAMPLES" "SL=$SEQLEN" "SELECTION_MODE=$SELECTION_MODE" \
+    "${RENDER_ENV_SETTINGS[@]}"
+  if [[ ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
+    echo "[pipeline] [2b/4] building format-menu production cache for AURA dW ..."
+    python3 -m prismaquant.build_production_cache \
+      --model "$MODEL_PATH" \
+      --output "$PRODUCTION_RENDER_COST_CACHE_PATH" \
+      --formats "$AURA_CACHE_FORMATS" \
+      --dataset "$DATASET" \
+      --n-calib-samples "$NSAMPLES" \
+      --calib-seqlen "$SEQLEN" \
+      --dtype bf16 \
+      --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+      --enable "$PRODUCTION_CACHE_LEVERS" \
+      --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+      --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
+      --render-scope format-menu \
+      $(if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then echo "--render-packed-experts"; fi) \
+      2>&1 | tee "${WORK_DIR}/logs/aura_dw_cache.log"
+  else
+    echo "[pipeline] [2b/4] AURA dW production cache exists, skipping"
+  fi
+
+  # [2c] The AURA cost itself: KL-Fisher probes x production-rendered dW.
+  # Packed-MoE experts are deliberately omitted here (the smooth adjoint is
+  # route-flip-blind on them) and costed empirically in [2d].
+  if [[ ! -f "$AURA_COST_RAW" ]]; then
+    echo "[pipeline] [2c/4] measuring AURA downstream-KL-adjoint cost ..."
+    python3 -m prismaquant.aura_cost \
+      --model "$MODEL_PATH" \
+      --output "$AURA_COST_RAW" \
+      --formats "$FORMATS" \
+      --production-cache "$PRODUCTION_RENDER_COST_CACHE_PATH" \
+      --require-production-cache \
+      --n-probes "$AURA_COST_NPROBES" \
+      --n-calib-samples "$AURA_COST_NSAMPLES" \
+      --calib-seqlen "$AURA_COST_SEQLEN" \
+      --calib-seed "$AURA_COST_CALIB_SEED" \
+      --dataset "$DATASET" \
+      --hook-harvest \
+      --gradient-checkpointing \
+      --n-linear-chunks "$AURA_COST_LINEAR_CHUNKS" \
+      --probe-microbatch "$AURA_COST_PROBE_MICROBATCH" \
+      --min-free-gib "$AURA_COST_MIN_FREE_GIB" \
+      --accurate-chunk-bytes \
+      --allow-packed-expert-omission \
+      2>&1 | tee "${WORK_DIR}/logs/aura_cost.log"
+  else
+    echo "[pipeline] [2c/4] AURA cost exists, skipping"
+  fi
+
+  # [2d] Hybrid finalize: measured empirical unit-KL costs for any omitted
+  # packed experts (FP8 kept in the menu — real-KL rejects it, no bans),
+  # plus sidecar (MTP/visual) row backfill from the baseline cost. Backfilled
+  # rows carry the baseline estimator and are recorded in provenance.
+  if [[ ! -f "$COST_PATH" ]]; then
+    OMITTED_EXPERTS="$(python3 - "$AURA_COST_RAW" <<'PY'
+import pickle
+import sys
+
+payload = pickle.load(open(sys.argv[1], "rb"))
+print(len(payload.get("provenance", {}).get("omitted_packed_experts", []) or []))
+PY
+)"
+    if [[ "$OMITTED_EXPERTS" != "0" ]]; then
+      echo "[pipeline] [2d/4] measuring empirical packed-expert unit-KL costs (${OMITTED_EXPERTS} omitted tensors; hybrid merge) ..."
+      python3 -m prismaquant.expert_empirical_cost \
+        --model "$MODEL_PATH" \
+        --output "$COST_PATH" \
+        --formats "$FORMATS" \
+        --dataset "$DATASET" \
+        --n-calib-samples "$AURA_EXPERT_NSAMPLES" \
+        --calib-seqlen "$AURA_EXPERT_SEQLEN" \
+        --merge-base "$AURA_COST_RAW" \
+        --backfill-base "$BASE_COST_PATH" \
+        2>&1 | tee "${WORK_DIR}/logs/expert_empirical_cost.log"
+    else
+      echo "[pipeline] [2d/4] no packed experts omitted; finalizing AURA cost (sidecar backfill) ..."
+      python3 - "$AURA_COST_RAW" "$BASE_COST_PATH" "$COST_PATH" <<'PY'
+import pickle
+import sys
+
+from prismaquant.expert_empirical_cost import backfill_missing_from_base
+
+payload = pickle.load(open(sys.argv[1], "rb"))
+payload.setdefault("stats", {})
+payload.setdefault("costs", {})
+base = pickle.load(open(sys.argv[2], "rb"))
+added = backfill_missing_from_base(payload, base)
+prov = dict(payload.get("provenance", {}) or {})
+if added:
+    prov["backfilled_from_base"] = added
+    prov["backfill_base"] = sys.argv[2]
+payload["provenance"] = prov
+with open(sys.argv[3], "wb") as fh:
+    pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+print(f"[pipeline] aura cost finalized -> {sys.argv[3]} "
+      f"(backfilled {len(added)} sidecar rows: {added})")
+PY
+    fi
+  else
+    echo "[pipeline] [2d/4] AURA allocator cost exists, skipping"
+  fi
+fi
+
 # -----------------------------------------------------------------------
 # 3. Allocator (multi-choice knapsack over per-layer formats)
 # -----------------------------------------------------------------------
@@ -662,14 +896,9 @@ if [[ "$SELECTION_MODE" == "validated-surrogate" ]] && [[ "$PRODUCTION_CACHE" ==
   exit 2
 fi
 if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTION_CACHE" != "False" ]]; then
-  LEVER_CACHE_TAG=""
-  case "$FISHER_WEIGHTED_GPTQ" in
-    0|false|False|FALSE|no|No|NO|"") ;;
-    *) LEVER_CACHE_TAG="${LEVER_CACHE_TAG}_fisher" ;;
-  esac
-  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}"
-  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_raw.pkl"
-  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_recached.pkl"
+  PROD_CACHE_DIR="${WORK_DIR}/artifacts/production_weight_cache"
+  PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_raw.pkl"
+  PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache_recached.pkl"
   CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
   if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
     if [[ -z "$ALLOCATOR_PARETO_DIR" || ! -f "$ALLOCATOR_PARETO_DIR/manifest.json" ]]; then
@@ -699,7 +928,7 @@ PY
       exit 2
     fi
     PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
-    PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_frontier_raw.pkl"
+    PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_frontier_raw.pkl"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       if [[ "${PRODUCTION_CACHE_UNION:-0}" == "1" ]]; then
         # Smart-union render: only render FP8_DYNAMIC fallbacks for Linears
@@ -733,7 +962,7 @@ PY
           --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
           --cache-dir "$PROD_CACHE_DIR" \
           --render-scope format-menu \
-          "${PROD_H_DETAIL_ARGS[@]}" \
+          --render-packed-experts \
           2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
       fi
     else
@@ -760,39 +989,97 @@ PY
 
     VALIDATION_JSON="${WORK_DIR}/artifacts/validated_frontier_kl.json"
     VALIDATED_ASSIGNMENT_COUNT=$(( ${#VALIDATED_ASSIGNMENT_ARGS[@]} / 2 ))
-    echo "[pipeline] [4/4] measuring real KL for ${VALIDATED_ASSIGNMENT_COUNT} Pareto assignments ..."
-    python3 -m prismaquant.validate_assignments_kl \
-      --model "$MODEL_PATH" \
-      --probe "$PROBE_PATH" \
-      --costs "$COST_PATH" \
-      --base-assignment "${WORK_DIR}/artifacts/layer_config.json" \
-      "${VALIDATED_ASSIGNMENT_ARGS[@]}" \
-      --output "$VALIDATION_JSON" \
-      --formats "$FORMATS" \
-      --dataset "$DATASET" \
-      --n-calib-samples "$VALIDATED_FRONTIER_NSAMPLES" \
-      --calib-seqlen "$VALIDATED_FRONTIER_SEQLEN" \
-      --dtype bf16 \
-      --device "$DEVICE" \
-      --kl-scope "$VALIDATED_FRONTIER_KL_SCOPE" \
-      --kl-cuda-graphs "$VALIDATED_FRONTIER_KL_CUDA_GRAPHS" \
-      --assignment-materialization hooks \
-      --source-prefetch "$VALIDATED_SOURCE_PREFETCH" \
-      --source-prefetch-max-gb "$VALIDATED_SOURCE_PREFETCH_MAX_GB" \
-      --source-prefetch-headroom-gb "$VALIDATED_SOURCE_PREFETCH_HEADROOM_GB" \
-      --source-prefetch-workers "$VALIDATED_SOURCE_PREFETCH_WORKERS" \
-      $(if [[ "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "0" && "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "false" && "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "False" ]]; then echo "--disable-frozen-weight-cache"; fi) \
-      --production-weight-cache "$PROD_CACHE_RAW" \
-      --production-cache-dir-override "$PROD_CACHE_DIR" \
-      --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
-      --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
-      --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
-      2>&1 | tee "${WORK_DIR}/logs/validated_frontier_kl.log"
+    VAK_COMMON_ARGS=(
+      --model "$MODEL_PATH"
+      --probe "$PROBE_PATH"
+      --costs "$COST_PATH"
+      --base-assignment "${WORK_DIR}/artifacts/layer_config.json"
+      --formats "$FORMATS"
+      --dataset "$VALIDATED_FRONTIER_DATASET"
+      --calib-skip-first "$(if [[ "$VALIDATED_FRONTIER_DATASET" == "$DATASET" ]]; then echo "$VALIDATED_FRONTIER_SKIP_CALIB"; else echo 0; fi)"
+      --n-calib-samples "$VALIDATED_FRONTIER_NSAMPLES"
+      --calib-seqlen "$VALIDATED_FRONTIER_SEQLEN"
+      --calib-repeats "$VALIDATED_FRONTIER_CALIB_REPEATS"
+      --work-dir "${WORK_DIR}/work/validate_kl"
+      --dtype bf16
+      --device "$DEVICE"
+      --kl-scope "$VALIDATED_FRONTIER_KL_SCOPE"
+      --kl-cuda-graphs "$VALIDATED_FRONTIER_KL_CUDA_GRAPHS"
+      --source-prefetch "$VALIDATED_SOURCE_PREFETCH"
+      --source-prefetch-max-gb "$VALIDATED_SOURCE_PREFETCH_MAX_GB"
+      --source-prefetch-headroom-gb "$VALIDATED_SOURCE_PREFETCH_HEADROOM_GB"
+      --source-prefetch-workers "$VALIDATED_SOURCE_PREFETCH_WORKERS"
+      --production-weight-cache "$PROD_CACHE_RAW"
+      --production-cache-dir-override "$PROD_CACHE_DIR"
+      --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB"
+      --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH"
+      --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
+    )
+    if [[ "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "0" && "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "false" && "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "False" ]]; then
+      VAK_COMMON_ARGS+=(--disable-frozen-weight-cache)
+    fi
+    if [[ "$VALIDATED_FRONTIER_MATERIALIZATION" == "inplace" ]]; then
+      # inplace requires exactly one assignment per process (weights are
+      # installed destructively); loop the Pareto points and merge the
+      # per-point JSONs. This is the memory-fit path for 35B-class MoE —
+      # hooks mode needs model + all renders co-resident and OOMs the
+      # 128 GB unified pool.
+      echo "[pipeline] [4/4] measuring real KL for ${VALIDATED_ASSIGNMENT_COUNT} Pareto assignments (inplace, one process per point) ..."
+      VAK_PART_DIR="${WORK_DIR}/artifacts/validated_frontier_kl_parts"
+      mkdir -p "$VAK_PART_DIR"
+      VAK_PART_FILES=()
+      for ((vi = 0; vi < ${#VALIDATED_ASSIGNMENT_ARGS[@]}; vi += 2)); do
+        VAK_SPEC="${VALIDATED_ASSIGNMENT_ARGS[vi + 1]}"
+        VAK_LABEL="${VAK_SPEC%%=*}"
+        VAK_LABEL_SAFE="${VAK_LABEL//[^A-Za-z0-9._-]/_}"
+        VAK_PART="${VAK_PART_DIR}/vak_${VAK_LABEL_SAFE}.json"
+        VAK_PART_FILES+=("$VAK_PART")
+        if [[ -f "$VAK_PART" ]]; then
+          echo "[pipeline] [4/4] ${VAK_LABEL}: per-point KL exists, skipping"
+          continue
+        fi
+        python3 -m prismaquant.validate_assignments_kl \
+          "${VAK_COMMON_ARGS[@]}" \
+          --assignment "$VAK_SPEC" \
+          --assignment-materialization inplace \
+          --output "$VAK_PART" \
+          2>&1 | tee "${WORK_DIR}/logs/validated_frontier_kl_${VAK_LABEL_SAFE}.log"
+      done
+      python3 - "$VALIDATION_JSON" "${VAK_PART_FILES[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out_path, *parts = sys.argv[1:]
+merged = None
+for part in parts:
+    payload = json.loads(Path(part).read_text())
+    if merged is None:
+        merged = payload
+    else:
+        merged["results"].extend(payload.get("results", []))
+if merged is None:
+    raise SystemExit("[pipeline] ERROR: no per-point validation JSONs to merge")
+merged["assignment_materialization"] = "inplace"
+Path(out_path).write_text(json.dumps(merged, indent=2) + "\n")
+print(f"[pipeline] merged {len(parts)} per-point KL JSONs -> {out_path} "
+      f"({len(merged['results'])} results)")
+PY
+    else
+      echo "[pipeline] [4/4] measuring real KL for ${VALIDATED_ASSIGNMENT_COUNT} Pareto assignments ..."
+      python3 -m prismaquant.validate_assignments_kl \
+        "${VAK_COMMON_ARGS[@]}" \
+        "${VALIDATED_ASSIGNMENT_ARGS[@]}" \
+        --assignment-materialization "$VALIDATED_FRONTIER_MATERIALIZATION" \
+        --output "$VALIDATION_JSON" \
+        2>&1 | tee "${WORK_DIR}/logs/validated_frontier_kl.log"
+    fi
 
     echo "[pipeline] [4/4] selecting measured frontier point ..."
     python3 -m prismaquant.select_validated_frontier \
       --validation-json "$VALIDATION_JSON" \
       --mode "$VALIDATED_FRONTIER_PICK" \
+      --sat-z "$VALIDATED_FRONTIER_SAT_Z" \
       --output-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
       --output-assignment "${WORK_DIR}/artifacts/layer_config_validated_assignment.json" \
       --output-summary "${WORK_DIR}/artifacts/validated_frontier_selection.json" \
@@ -836,7 +1123,7 @@ import sys
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()[:12])
 PY
 )"
-      PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache${LEVER_CACHE_TAG}_frontier_${SELECTED_DIGEST}_recached.pkl"
+      PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache_frontier_${SELECTED_DIGEST}_recached.pkl"
       if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
         echo "[pipeline] [4/4] re-fitting activation scales for selected measured-${VALIDATED_FRONTIER_PICK} assignment ..."
         python3 -m prismaquant.production_recache \
@@ -879,6 +1166,11 @@ PY
   elif [[ -z "$CACHE_FORMATS" ]]; then
     echo "[pipeline] production cache requested but no non-BF16 formats are in FORMATS; skipping cache"
   elif [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
+    LC_DIGEST=$(sha256sum "${WORK_DIR}/artifacts/layer_config.json" | cut -c1-16)
+    require_stage_settings "$PROD_CACHE_RECACHED" production-cache-recached \
+      "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
+      "SEQLEN=$SEQLEN" "FORMATS=$FORMATS" "TARGET_BITS=$TARGET_BITS" \
+      "ASSIGNMENT_DIGEST=$LC_DIGEST" "${RENDER_ENV_SETTINGS[@]}"
     if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
       if [[ ! -f "$PROD_CACHE_RAW" ]]; then
         echo "[pipeline] [4/4] building production cache + re-fitting activation scales ..."
@@ -898,7 +1190,7 @@ PY
           --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
-          "${PROD_H_DETAIL_ARGS[@]}" \
+          ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
           2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
       else
         echo "[pipeline] [4/4] re-fitting production activation scales ..."
@@ -940,7 +1232,7 @@ PY
         --cache-dir "$PROD_CACHE_DIR" \
         --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
         --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-        "${PROD_H_DETAIL_ARGS[@]}" \
+        ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
         2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
     else
       echo "[pipeline] [4/4] production cache exists, skipping"

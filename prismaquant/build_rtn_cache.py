@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from prismaquant.sensitivity_probe import (
+    _mk_stage_dir,
     _is_packed_experts_module,
     _packed_experts_param_names,
 )
@@ -108,7 +109,7 @@ def stage_multimodal(model_path: str):
 
     if "vision_config" not in cfg and "text_config" not in cfg:
         # Just needed to strip quant config — no VL remapping
-        staged = tempfile.mkdtemp(prefix="rtn_staged_")
+        staged = str(_mk_stage_dir("rtn_staged_"))
         for p in Path(model_path).iterdir():
             if p.name == "config.json":
                 continue
@@ -137,7 +138,7 @@ def stage_multimodal(model_path: str):
             a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
         ]
 
-    staged = tempfile.mkdtemp(prefix="rtn_staged_")
+    staged = str(_mk_stage_dir("rtn_staged_"))
 
     # --- Remap safetensors index: strip language_model prefix, drop vision ---
     idx_path = Path(model_path) / "model.safetensors.index.json"

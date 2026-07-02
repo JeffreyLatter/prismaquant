@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from prismaquant.layer_state_cache import LayerHiddenStateCache
+from prismaquant.production_weight_cache import ProductionWeightCache
 
 
 class _LinearBlock(nn.Module):
@@ -164,6 +165,39 @@ def test_layer_state_cache_external_weight_management_skips_baseline_weight_clon
     assert cache._baseline_weight_values == {}
     replay_logits = cache.replay_from(0)
     torch.testing.assert_close(replay_logits, model(calib_ids).logits, rtol=0, atol=0)
+
+
+def test_layer_state_cache_production_cache_miss_is_strict_by_default(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", raising=False)
+    model = _TinyCausalLM(layers=2, use_lm_head=False).eval()
+    calib_ids = _calib_ids(batch=1, seq=3)
+    cache = LayerHiddenStateCache(model)
+
+    with pytest.raises(RuntimeError, match="production_weight_cache miss"):
+        cache.populate(
+            {"model.layers.0.proj": "NVFP4"},
+            calib_ids,
+            device="cpu",
+            dtype=torch.float32,
+            production_weight_cache=ProductionWeightCache({}, levers={}),
+        )
+
+
+def test_layer_state_cache_strict_miss_escape_allows_rtn(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", "0")
+    model = _TinyCausalLM(layers=2, use_lm_head=False).eval()
+    calib_ids = _calib_ids(batch=1, seq=3)
+    cache = LayerHiddenStateCache(model)
+
+    cache.populate(
+        {"model.layers.0.proj": "NVFP4"},
+        calib_ids,
+        device="cpu",
+        dtype=torch.float32,
+        production_weight_cache=ProductionWeightCache({}, levers={}),
+    )
+
+    assert len(cache.layer_inputs) == 2
 
 
 def test_layer_state_cache_invalidate_clears_state():

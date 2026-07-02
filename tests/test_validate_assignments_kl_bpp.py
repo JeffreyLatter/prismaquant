@@ -4,6 +4,7 @@ from prismaquant import format_registry as fr
 from prismaquant.validate_assignments_kl import (
     _assignment_bpp_details,
     _kl_repeat_summary,
+    _profile_excludes_bpp_name,
 )
 
 
@@ -81,6 +82,21 @@ def test_assignment_bpp_excludes_auxiliary_entries_even_when_quantized():
     assert details["bpp"] == expected
     assert details["quantizable_entries"] == 1
     assert details["excluded_entries"] == 1
+
+
+def test_bpp_exclusion_is_profile_driven_not_bf16_default():
+    profile = _Profile()
+
+    assert not _profile_excludes_bpp_name(
+        "model.layers.0.mlp.down_proj", "BF16", profile,
+    )
+    assert not _profile_excludes_bpp_name(
+        "model.layers.0.mlp.down_proj", "NVFP4", profile,
+    )
+    assert _profile_excludes_bpp_name("lm_head", "BF16", profile)
+    assert _profile_excludes_bpp_name(
+        "model.visual.blocks.0.mlp.fc1", "NVFP4", profile,
+    )
 
 
 def test_kl_repeat_summary_reports_stderr_and_ucb():

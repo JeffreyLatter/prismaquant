@@ -64,6 +64,17 @@ def test_weight_session_allows_mxfp8_rtn_fallback_when_not_strict():
     assert diag["n_cache_misses"] == 1
 
 
+def test_initialize_does_not_record_format_when_materialization_fails(monkeypatch):
+    model = _ModelWithBody().eval()
+    session = WeightSession(model, strict_production_cache=False)
+    monkeypatch.setattr(session, "_format_weight", lambda _qname, _fmt: None)
+
+    session.initialize({"model.proj": "NVFP4"}, units=[])
+
+    assert session.current_assignment().get("model.proj", "BF16") == "BF16"
+    assert session.stage_format("model.proj", "NVFP4") is None
+
+
 def test_weight_session_reuses_existing_spilled_snapshot(tmp_path):
     model = _ModelWithBody().eval()
     model.model.proj.weight.data.fill_(1.0)

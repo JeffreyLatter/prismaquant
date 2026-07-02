@@ -9,10 +9,45 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from prismaquant import format_registry as fr
+from prismaquant.layer_config import canonicalize_format
+from prismaquant.saturation_select import find_saturation_bpp
 
 
 def _load_json(path: str | Path):
     return json.loads(Path(path).read_text())
+
+
+def _saturation_pick(frontier: Sequence[Mapping], z: float) -> tuple[int, dict]:
+    """Saturation B* over the measured frontier (the unconstrained selector).
+
+    Builds the bpp grid + a (kl, kl_stderr) lookup from the measured lower
+    envelope and runs ``find_saturation_bpp``: B* is the lowest bpp whose KL is
+    within z * combined stderr of the highest-bpp asymptote. Returns the chosen
+    frontier index and the full saturation result (trace/slopes/measured) for
+    the summary. ``no_noise_floor`` is set when the frontier carries no positive
+    per-bpp stderr (single-rep validation): the band is then 0, so B* collapses
+    to the asymptote (ship the most bits) — a safe but uninformative degenerate
+    that the caller must surface (run validation with --calib-repeats>=4).
+    """
+    grid = [float(r["bpp"]) for r in frontier]
+    kl_by = {float(r["bpp"]): float(r["kl"]) for r in frontier}
+
+    def _se(r):
+        se = r.get("kl_stderr")
+        try:
+            se = float(se)
+        except (TypeError, ValueError):
+            return 0.0
+        return se if math.isfinite(se) and se > 0.0 else 0.0
+
+    se_by = {float(r["bpp"]): _se(r) for r in frontier}
+    result = find_saturation_bpp(
+        grid, lambda b: (kl_by[b], se_by[b]), z=z,
+    )
+    result["no_noise_floor"] = not any(v > 0.0 for v in se_by.values())
+    bstar = result["bpp"]
+    idx = min(range(len(frontier)), key=lambda i: abs(float(frontier[i]["bpp"]) - bstar))
+    return idx, result
 
 
 def _load_assignment(path: str | Path) -> dict[str, str]:
@@ -22,8 +57,18 @@ def _load_assignment(path: str | Path) -> dict[str, str]:
         raw = payload
     if not isinstance(raw, Mapping):
         raise ValueError(f"{path}: expected assignment JSON object")
+    # Entries may be format-name strings ({qname: "NVFP4"}) or AutoRound-style
+    # dicts ({qname: {"data_type": "nv_fp", "bits": 4, ...}}); str().upper() on
+    # a dict silently fabricates a garbage format name. Strings go through the
+    # registry canonicalizer (which keeps FP8_SOURCE & friends); dicts go
+    # through the layer-config parser. Unknown names still fail loudly at
+    # fr.get_format in _layer_config_from_assignment.
     return {
-        str(name): str(fmt).strip().upper()
+        str(name): (
+            fr.canonical_format_name(fmt.strip().upper())
+            if isinstance(fmt, str)
+            else canonicalize_format(fmt)
+        )
         for name, fmt in raw.items()
         if str(name).strip()
     }
@@ -109,18 +154,12 @@ def _row_metric(row: Mapping, metric: str) -> float | None:
     return None
 
 
-def measured_frontier(
+def measured_rows(
     results: Sequence[Mapping],
     *,
     metric: str = "kl",
-    kl_noise_floor: float = 0.0,
 ) -> list[dict]:
-    """Return non-dominated measured KL/bpp points sorted by bpp.
-
-    A point is dominated when a lower-or-equal bpp assignment already has
-    lower-or-equal KL. Kneedle should operate on this measured lower envelope,
-    not on noisy interior points.
-    """
+    """Return finite measured KL/bpp rows sorted by bpp."""
     rows: list[dict] = []
     for row in results:
         kl = _row_metric(row, metric)
@@ -156,6 +195,22 @@ def measured_frontier(
             "kl_ucb": row.get("kl_ucb", row.get("validation_kl_ucb")),
         })
     rows.sort(key=lambda r: (r["bpp"], r["kl"], r["label"]))
+    return rows
+
+
+def measured_frontier(
+    results: Sequence[Mapping],
+    *,
+    metric: str = "kl",
+    kl_noise_floor: float = 0.0,
+) -> list[dict]:
+    """Return non-dominated measured KL/bpp points sorted by bpp.
+
+    A point is dominated when a lower-or-equal bpp assignment already has
+    lower-or-equal KL. Kneedle should operate on this measured lower envelope,
+    not on noisy interior points.
+    """
+    rows = measured_rows(results, metric=metric)
     frontier: list[dict] = []
     best_kl = float("inf")
     floor = max(float(kl_noise_floor), 0.0)
@@ -231,7 +286,7 @@ def spearman_rank_correlation(rows: Sequence[Mapping]) -> float | None:
 
 
 def worst_rank_inversion(rows: Sequence[Mapping]) -> dict | None:
-    """Surface the single most-misranked pair of frontier points.
+    """Surface the single most-misranked pair of measured rows.
 
     Uses the same (surrogate_loss, kl) pairing as ``spearman_rank_correlation``
     so the two agree on which rows count. Returns the pair whose surrogate-rank
@@ -348,6 +403,7 @@ def select_frontier_point(
     practical_abs_eps: float = 0.0,
     knee_tolerance_bpp: float = 0.1,
     unstable_policy: str = "keep-kneedle",
+    sat_z: float = 2.0,
 ) -> tuple[dict, list[dict]]:
     frontier = measured_frontier(
         results,
@@ -358,6 +414,8 @@ def select_frontier_point(
         raise ValueError("no finite measured KL/bpp points found")
     if mode == "best-kl":
         idx = min(range(len(frontier)), key=lambda i: (frontier[i]["kl"], frontier[i]["bpp"]))
+    elif mode == "saturation":
+        idx, _sat = _saturation_pick(frontier, sat_z)
     elif mode == "lowest-bpp":
         idx = 0
     elif mode == "practical-knee":
@@ -405,8 +463,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--validation-json", required=True)
     parser.add_argument(
         "--mode",
-        choices=("kneedle", "best-kl", "lowest-bpp", "practical-knee"),
+        choices=("kneedle", "best-kl", "lowest-bpp", "practical-knee", "saturation"),
         default="kneedle",
+        help="Frontier pick. 'saturation' = unconstrained bit-rate selector: "
+             "lowest bpp whose KL is within --sat-z stderr of the high-bpp "
+             "asymptote (needs a real per-bpp stderr, i.e. validate with "
+             "--calib-repeats>=4). 'kneedle' is axis-dependent and a diagnostic "
+             "on a log-linear RD curve.",
     )
     parser.add_argument(
         "--metric",
@@ -415,6 +478,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Metric used for frontier construction. 'ucb' uses kl_ucb when present.",
     )
     parser.add_argument("--kl-noise-floor", type=float, default=0.0)
+    parser.add_argument("--sat-z", type=float, default=2.0,
+                        help="Significance multiplier on the combined per-bpp "
+                             "stderr for --mode saturation (2.0 ~= 95%).")
     parser.add_argument("--practical-rel-eps", type=float, default=0.005)
     parser.add_argument("--practical-abs-eps", type=float, default=0.0)
     parser.add_argument("--knee-tolerance-bpp", type=float, default=0.1)
@@ -442,7 +508,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         practical_abs_eps=args.practical_abs_eps,
         knee_tolerance_bpp=args.knee_tolerance_bpp,
         unstable_policy=args.unstable_policy,
+        sat_z=args.sat_z,
     )
+    saturation = None
+    if args.mode == "saturation":
+        if args.metric == "ucb":
+            # The band is z * combined stderr; with metric=ucb the frontier 'kl'
+            # is already mean+k*stderr, so the band would double-count the noise.
+            # Saturation wants the raw mean — warn rather than silently inflate.
+            print("[frontier-select] WARNING: --mode saturation with --metric "
+                  "ucb double-counts uncertainty (UCB already folds stderr into "
+                  "kl, and the saturation band re-adds it); use --metric kl.",
+                  flush=True)
+        _sidx, saturation = _saturation_pick(frontier, args.sat_z)
     practical = practical_knee(
         frontier,
         rel_eps=args.practical_rel_eps,
@@ -460,8 +538,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.mode == "kneedle"
         else {"enabled": False, "reason": "mode_not_kneedle"}
     )
-    rank_corr = spearman_rank_correlation(frontier)
-    worst_inversion = worst_rank_inversion(frontier)
+    diagnostic_rows = measured_rows(results, metric=args.metric)
+    rank_corr = spearman_rank_correlation(diagnostic_rows)
+    worst_inversion = worst_rank_inversion(diagnostic_rows)
     assignment = _load_assignment(selected["path"])
     layer_config = _layer_config_from_assignment(assignment)
 
@@ -489,6 +568,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "practical_knee": practical,
         "kneedle_comparison": knee_cmp,
         "leave_one_out": loo,
+        "saturation": saturation,
         "surrogate_spearman": rank_corr,
         "surrogate_worst_rank_inversion": worst_inversion,
         "kl_noise_floor": float(args.kl_noise_floor),
@@ -514,6 +594,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"KL={selected['kl']:.8g}{mse_msg} mode={args.mode}",
         flush=True,
     )
+    if saturation is not None:
+        print(
+            "[frontier-select] saturation B*="
+            f"{saturation['bpp']:.6f} (KL={saturation['kl_at_bstar']:.8g}, "
+            f"asymptote@{saturation['asymptote_bpp']:.4f}="
+            f"{saturation['kl_asymptote']:.8g}, z={saturation['z']}, "
+            f"{saturation['n_measurements']} probes)",
+            flush=True,
+        )
+        if saturation.get("no_noise_floor"):
+            print(
+                "[frontier-select] WARNING: frontier has no positive per-bpp "
+                "stderr -> saturation band is 0 and B* collapsed to the "
+                "asymptote (most bits). Re-run validate_assignments_kl with "
+                "--calib-repeats>=4 for a real noise floor.",
+                flush=True,
+            )
     if knee_cmp.get("enabled"):
         log_k = knee_cmp["log_error"]
         raw_k = knee_cmp["raw_linear"]
@@ -537,7 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print(
             "[frontier-select] surrogate-vs-KL fidelity: unavailable "
-            "(need >=3 frontier points carrying predicted_dloss_sum)",
+            "(need >=3 measured points carrying predicted_dloss_sum)",
             flush=True,
         )
     print(f"[frontier-select] layer_config -> {layer_config_path}", flush=True)

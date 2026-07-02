@@ -81,6 +81,7 @@ def fisher_probe_scalar(
     token_scope: str = "last",
     temperature: float = 1.0,
     distribution: str = "gaussian",
+    token_count_override: int | None = None,
 ) -> torch.Tensor:
     """Return a scalar whose logit gradient is one KL/Fisher probe.
 
@@ -89,6 +90,13 @@ def fisher_probe_scalar(
     normalized by the number of selected token positions.  Backpropagating this
     scalar through a clean model therefore gives an unbiased low-rank probe of
     the single-point forward-KL quadratic surrogate.
+
+    ``token_count_override`` replaces the ``1/sqrt(token_count)`` normalizer's
+    token count with a caller-supplied global value. This is for accumulating
+    a single probe across micro-batched forwards: each micro-batch must
+    normalize by the GLOBAL token count, not its own slice's count, or the
+    summed gradient is inflated by ``sqrt(n_microbatches)``.  Default ``None``
+    preserves the standard per-call normalization exactly.
     """
     temp = float(temperature)
     if not math.isfinite(temp) or temp <= 0.0:
@@ -96,7 +104,10 @@ def fisher_probe_scalar(
 
     selected = select_token_scope(logits, token_scope).float()
     scaled = selected / temp
-    token_count = max(token_count_for_logits(selected), 1)
+    if token_count_override is not None:
+        token_count = max(int(token_count_override), 1)
+    else:
+        token_count = max(token_count_for_logits(selected), 1)
     with torch.no_grad():
         probs = torch.softmax(scaled.detach(), dim=-1)
         root = torch.sqrt(torch.clamp(probs, min=0.0))

@@ -39,8 +39,27 @@ def test_meta_init_mask_primes_fla_availability_before_masking(monkeypatch):
     monkeypatch.setattr(tiu, "is_causal_conv1d_available",
                         make("conv"), raising=False)
 
-    # The mask only activates when CUDA isn't already initialized (true on the
-    # CPU test host), which is exactly the window the bug occurs in.
+    # The mask only activates when CUDA isn't already initialized — the
+    # exact window the bug occurs in. In full-suite order on a GPU host an
+    # earlier test has usually initialized CUDA; re-run this test in a
+    # fresh interpreter so the precondition (and therefore the behavior
+    # under test) is real rather than vacuously skipped. (Test-isolation
+    # fix for the known full-suite failure, 2026-06-09 review.)
+    if torch.cuda.is_initialized():
+        import subprocess
+        import sys
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", __file__ + "::"
+             + "test_meta_init_mask_primes_fla_availability_before_masking",
+             "-q", "-p", "no:cacheprovider"],
+            capture_output=True, text=True,
+            env={**__import__("os").environ,
+                 "CUDA_VISIBLE_DEVICES":
+                     __import__("os").environ.get("CUDA_VISIBLE_DEVICES", "0")},
+        )
+        assert proc.returncode == 0, (
+            "subprocess re-run failed:\n" + proc.stdout + proc.stderr)
+        return
     assert not torch.cuda.is_initialized()
     with _mask_cuda_queries_during_meta_init("[test]"):
         pass

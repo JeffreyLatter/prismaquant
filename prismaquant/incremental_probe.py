@@ -61,9 +61,9 @@ import torch.nn.functional as F
 
 from .layer_streaming import (
     _call_layer,
+    _compute_attention_mask,
     _compute_position_embeddings,
     _get_final_norm,
-    _make_causal_mask,
 )
 from .sensitivity_probe import (
     FisherAccumulator,
@@ -957,6 +957,49 @@ def load_num_hidden_layers(model_path: str) -> int:
     return n
 
 
+def config_num_kv_shared_layers(model_path: str) -> int:
+    """``num_kv_shared_layers`` from the config (text_config or top-level).
+
+    Returns 0 when absent. Used by the MINOR-M33 guard: KV-sharing models
+    (num_kv_shared_layers>0, e.g. some Gemma4 variants) reuse one layer's
+    K/V in later layers, but the streaming Fisher probe captures and
+    ``.detach()``s borrowed K/V per isolated phase-3 forward, severing the
+    Fisher cotangent that should flow back to the *storing* layer's
+    k_proj/v_proj — under-counting their h_trace.
+    """
+    staged = stage_text_only(model_path)
+    cfg_path = Path(staged) / "config.json"
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    text_cfg = cfg.get("text_config", cfg)
+    for src in (text_cfg, cfg):
+        if isinstance(src, dict):
+            v = src.get("num_kv_shared_layers")
+            if isinstance(v, int):
+                return int(v)
+    return 0
+
+
+def kv_shared_fisher_block_reason(model_path: str) -> str | None:
+    """Fail-fast message if the streaming Fisher probe must not run here.
+
+    Returns a message string when the model has ``num_kv_shared_layers>0`` and
+    the ``PRISMAQUANT_ALLOW_KV_SHARED_FISHER`` override is unset, else ``None``
+    (MINOR-M33). Extracted so the guard decision is unit-testable.
+    """
+    kv = config_num_kv_shared_layers(model_path)
+    if kv > 0 and os.environ.get("PRISMAQUANT_ALLOW_KV_SHARED_FISHER", "0") == "0":
+        return (
+            f"[incremental] model has num_kv_shared_layers={kv}: the streaming "
+            "Fisher probe under-counts the storing layer's k_proj/v_proj "
+            "h_trace (shared-consumer cotangent severed by the phase-3 K/V "
+            "detach; review finding MINOR-M33). Set "
+            "PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1 to probe anyway, accepting "
+            "the k/v_proj under-count, until the KV-cotangent path lands."
+        )
+    return None
+
+
 # Streaming infrastructure — `StreamingContext`, `_build_streaming_context`,
 # and `_classify_shard` live in `streaming_model` so both the probe and
 # the cost measurement share one implementation.
@@ -1127,7 +1170,6 @@ def _compute_global_precompute(
     batch_size = calib.size(0)
     ids = calib.to(device)
     position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
-    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
 
     prefetch_depth = prefetch_lookahead
 
@@ -1145,6 +1187,7 @@ def _compute_global_precompute(
         hidden = base_model.embed_tokens(ids).to(dtype)
     position_embeddings = _compute_position_embeddings(
         base_model, hidden, position_ids)
+    causal_mask = _compute_attention_mask(base_model, hidden, position_ids)
 
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
 
@@ -1591,7 +1634,6 @@ def _run_body_streaming_shard(
     batch_size = calib.size(0)
 
     position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
-    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
 
     prefetch_depth = prefetch_lookahead
 
@@ -1606,6 +1648,7 @@ def _run_body_streaming_shard(
         embed0 = activations_cpu[0].to(device).to(dtype)
         position_embeddings = _compute_position_embeddings(
             base_model, embed0, position_ids)
+        causal_mask = _compute_attention_mask(base_model, embed0, position_ids)
         del embed0
     print(f"[incremental] shard reuses global precompute "
           f"N={batch_size} T={tokens_in_sample} "
@@ -2896,6 +2939,16 @@ def main():
     ap.add_argument("--mm-max-text-len", type=int, default=128,
                     help="Max text tokens per multimodal calibration sample.")
     args = ap.parse_args()
+
+    # MINOR-M33: on KV-sharing models the streaming Fisher probe under-counts
+    # the storing layer's k_proj/v_proj h_trace — the phase-3 K/V detach severs
+    # the Fisher cotangent from consumer layers that reuse its K/V. Fail loud
+    # rather than ship a silently-biased allocation (Principle 1: measurement
+    # gap, not a band-aid). No shipped model triggers this (Gemma4-31B-IT and
+    # the Gemma4TextConfig default are num_kv_shared_layers=0).
+    _kv_block = kv_shared_fisher_block_reason(args.model)
+    if _kv_block:
+        raise SystemExit(_kv_block)
 
     n_layers = load_num_hidden_layers(args.model)
     start = max(0, args.start_layer)

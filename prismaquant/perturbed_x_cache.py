@@ -207,6 +207,46 @@ class _ModulePlan:
         return [p.name for p in self.params]
 
 
+def _module_input_member_name(plan: _ModulePlan, x: torch.Tensor) -> str | None:
+    """Pick the plan member whose calibrated scale describes ``x``.
+
+    Dense Linears have one ``weight`` param — trivially it. A packed-MoE
+    experts module carries one plan with SEVERAL per-projection params
+    (``gate_up_proj`` + ``down_proj``); their calibrated ``max_abs`` were
+    measured on DIFFERENT tensors (module input vs routed post-SwiGLU
+    intermediates), and this hook only ever sees the module input, so the
+    clip scale must come from the projection that consumes it. Select
+    structurally: the param whose in-dim (last weight axis, [E, out, in])
+    equals ``x``'s feature dim. Falling back to ``params[0]`` (the old
+    behavior) made the clip depend on assignment-dict ordering.
+    """
+    member_name = next(
+        (p.name for p in plan.params if p.attr == "weight"), None)
+    if member_name is not None or not plan.params:
+        return member_name
+    in_dim = int(x.size(-1))
+    matches = []
+    for p in plan.params:
+        tensor = getattr(plan.module, p.attr, None)
+        shape = getattr(tensor, "shape", None)
+        if shape is not None and len(shape) >= 1 and int(shape[-1]) == in_dim:
+            matches.append(p)
+    if not matches:
+        return plan.params[0].name
+    if len(matches) > 1:
+        # Degenerate square case (intermediate == hidden): the shape test
+        # cannot separate the projections, so break the tie by role — the
+        # down projection (down_proj / w2) consumes the internal
+        # intermediate, never the module input.
+        non_down = [
+            p for p in matches
+            if p.attr.rsplit(".", 1)[-1] not in ("down_proj", "w2")
+        ]
+        if non_down:
+            return non_down[0].name
+    return matches[0].name
+
+
 def build_quantizable_map(
     model: nn.Module,
     profile=None,
@@ -457,7 +497,10 @@ class PerturbedActivationCache:
                 if (
                     self._production_weight_cache is not None
                     and fmt != "BF16"
-                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                    and _env_truthy(
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                        default=True,
+                    )
                 ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
@@ -657,7 +700,10 @@ class PerturbedActivationCache:
                     ).contiguous()
                 elif (
                     fmt_canon != "BF16"
-                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                    and _env_truthy(
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                        default=True,
+                    )
                 ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
@@ -813,7 +859,10 @@ class PerturbedActivationCache:
                     source = w_dq.to(
                         device=param.device, dtype=param.dtype,
                     ).contiguous()
-                elif _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE"):
+                elif _env_truthy(
+                    "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                    default=True,
+                ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
                         f"({param_plan.name!r}, 'NVFP4') on the fused "
@@ -930,10 +979,7 @@ class PerturbedActivationCache:
             where, key, x = _first_tensor_location(args, kwargs)
             if isinstance(x, torch.Tensor):
                 self._capture(plan, x)
-                member_name = next(
-                    (p.name for p in plan.params if p.attr == "weight"),
-                    plan.params[0].name if plan.params else None,
-                )
+                member_name = _module_input_member_name(plan, x)
                 x_runtime = x
                 act_spec = self._active_activation_spec(plan)
                 if act_spec is not None:
