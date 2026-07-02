@@ -87,7 +87,9 @@ def test_assignment_artifact_bytes_residual_floor():
         {"layer.w": "NVFP4"}, stats,
         source_total_bytes=source_total, regime="bf16",
     )
-    body_q = fr.get_format("NVFP4").memory_bytes_for_shape((4, 8))
+    # + 8 B fp32 NVFP4 global sidecars (weight_global_scale +
+    # input_global_scale) the export emits per 2-D Linear (§3.14 fix).
+    body_q = fr.get_format("NVFP4").memory_bytes_for_shape((4, 8)) + 8
     # floor = source_total - reencoded_source = 3264 - 32*2 = 3200 (embed+lm_head)
     assert r["floor_bytes"] == 3200
     assert r["body_quant_bytes"] == body_q
@@ -114,7 +116,8 @@ def test_assignment_artifact_bytes_fp8_source_removes_scale_inv():
     # floor must be exactly the embed; the fp8 weight AND its scale_inv are removed
     assert r["floor_bytes"] == embed
     assert r["reencoded_source_bytes"] == src_weight + src_scale_inv
-    assert r["body_quant_bytes"] == fr.get_format("NVFP4").memory_bytes_for_shape((256, 256))
+    assert r["body_quant_bytes"] == (
+        fr.get_format("NVFP4").memory_bytes_for_shape((256, 256)) + 8)
     assert r["artifact_bytes"] == embed + r["body_quant_bytes"]
     # the old scalar (n_params*1) would have left src_scale_inv in the floor:
     old_floor_bug = source_total - src_weight  # = embed + src_scale_inv
@@ -164,3 +167,36 @@ def test_floor_bytes_for_model(tmp_path):
     assert info["source_bytes_per_param"] == 2
     assert info["reencoded_source_bytes"] == 64
     assert info["floor_bytes"] == 1600
+
+
+def test_nvfp4_global_sidecar_bytes_dense_and_packed():
+    """§3.14 (2026-07-02 audit): the export emits fp32 weight_global_scale +
+    input_global_scale per NVFP4 2-D Linear (8 B, verified against shipped
+    safetensors headers), and per expert × on-disk projection for packed 3-D
+    tensors (gate_up_proj splits into gate_proj + up_proj per expert)."""
+    assert fp.nvfp4_global_sidecar_bytes("model.layers.0.self_attn.q_proj",
+                                         (128, 64)) == 8
+    # down_proj: one projection per expert -> 8·E
+    assert fp.nvfp4_global_sidecar_bytes(
+        "model.layers.0.mlp.experts.down_proj", (256, 32, 64)) == 8 * 256
+    # gate_up_proj: two on-disk projections per expert -> 8·E·2
+    assert fp.nvfp4_global_sidecar_bytes(
+        "model.layers.0.mlp.experts.gate_up_proj", (256, 128, 32)) == 16 * 256
+
+
+def test_assignment_artifact_bytes_packed_nvfp4_counts_per_expert_globals():
+    stats = {
+        "layer.experts.gate_up_proj": {
+            "n_params": 4 * 128 * 32, "in_features": 32,
+            "out_features": 128, "num_experts": 4,
+        },
+    }
+    r = fp.assignment_artifact_bytes(
+        {"layer.experts.gate_up_proj": "NVFP4"}, stats,
+        source_total_bytes=4 * 128 * 32 * 2, regime="bf16",
+    )
+    expected = (
+        fr.get_format("NVFP4").memory_bytes_for_shape((4, 128, 32))
+        + 8 * 4 * 2  # per-expert weight_global + input_global, gate+up
+    )
+    assert r["body_quant_bytes"] == expected

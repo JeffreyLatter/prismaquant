@@ -2158,8 +2158,9 @@ class TestProductionCacheExportPath(unittest.TestCase):
             self.assertIsNotNone(out)
             self.assertIn("weight_packed", out)
             self.assertIn("input_global_scale", out)
+            # generate_gparam convention: 448 * 6 / max_abs = 448*6/3 = 896.
             self.assertAlmostEqual(
-                float(out["input_global_scale"].item()), 2.0, places=5)
+                float(out["input_global_scale"].item()), 896.0, places=3)
         finally:
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
             m._INPUT_GLOBAL_SCALES = saved_scales
@@ -2185,8 +2186,10 @@ class TestProductionCacheExportPath(unittest.TestCase):
 
         scales = m._production_cache_scales(cache, profile=CustomProfile())
 
-        self.assertEqual(scales["model.layers.0.a_proj"], 0.25)
-        self.assertEqual(scales["model.layers.0.b_proj"], 0.25)
+        # generate_gparam convention: 448*6/max_abs; the fused join takes
+        # min (largest max_abs=24 wins) -> 448*6/24 = 112.
+        self.assertEqual(scales["model.layers.0.a_proj"], 112.0)
+        self.assertEqual(scales["model.layers.0.b_proj"], 112.0)
 
     def test_mxfp8_alias_hits_e4m3_cache_key(self):
         import prismaquant.export_native_compressed as m
@@ -2996,20 +2999,67 @@ if __name__ == "__main__":
 
 class TestNvfp4InputGlobalScale(unittest.TestCase):
     """Per-layer input_global_scale calibration from cached activations.
-    
-    `compute_nvfp4_input_global_scale(activations)` returns FP4_MAX/max_abs
-    so scaled activations fit [-6, 6]. Zero/negative max-abs falls back to
-    the default."""
 
-    def test_max_abs_scales_to_fp4_range(self):
+    `compute_nvfp4_input_global_scale(activations)` returns
+    FP8_MAX*FP4_MAX/max_abs — the compressed-tensors `generate_gparam`
+    convention (C1 fix) — so serve-time FP8-stored activation block
+    scales use the whole FP8 range. Zero/negative max-abs falls back to
+    the default; PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0 reproduces
+    the legacy 6/max_abs bytes."""
+
+    def test_max_abs_uses_fp8_range_convention(self):
+        import torch
+        from prismaquant.export_native_compressed import (
+            compute_nvfp4_input_global_scale, _FP4_E2M1_MAX, _FP8_E4M3_MAX,
+        )
+        acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
+        s = compute_nvfp4_input_global_scale(acts)
+        # max_abs=3.0, scale = 448*6/3 = 896.0 (generate_gparam convention)
+        self.assertAlmostEqual(
+            s, _FP8_E4M3_MAX * _FP4_E2M1_MAX / 3.0, places=3)
+
+    def test_legacy_env_zero_reproduces_6_over_amax(self):
+        import os
         import torch
         from prismaquant.export_native_compressed import (
             compute_nvfp4_input_global_scale, _FP4_E2M1_MAX,
         )
         acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
-        s = compute_nvfp4_input_global_scale(acts)
-        # max_abs=3.0, scale=6/3=2.0 → scaled activations in [-6, 6]
+        key = "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE"
+        saved = os.environ.get(key)
+        try:
+            os.environ[key] = "0"
+            s = compute_nvfp4_input_global_scale(acts)
+        finally:
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
         self.assertAlmostEqual(s, _FP4_E2M1_MAX / 3.0, places=5)
+
+    def test_matches_compressed_tensors_generate_gparam(self):
+        """Oracle test: our input_global_scale must equal the installed
+        compressed-tensors `generate_gparam` (the convention vLLM's
+        CompressedTensorsW4A4Fp4 loads) to fp32 tolerance."""
+        import torch
+        try:
+            from compressed_tensors.quantization.utils import generate_gparam
+        except Exception as e:  # pragma: no cover - env without the lib
+            self.skipTest(f"compressed_tensors not importable: {e}")
+        from prismaquant.export_native_compressed import (
+            compute_nvfp4_input_global_scale,
+        )
+        torch.manual_seed(0)
+        acts = torch.randn(64, 128) * 3.7
+        expected = generate_gparam(
+            updated_min_val=acts.amin(),
+            updated_max_val=acts.amax(),
+        )
+        ours = compute_nvfp4_input_global_scale(acts)
+        self.assertAlmostEqual(
+            ours, float(expected.item()),
+            delta=abs(float(expected.item())) * 1e-6,
+        )
 
     def test_degenerate_all_zero_falls_back(self):
         import torch
@@ -3669,3 +3719,163 @@ class TestMtpCacheCoveragePreflight(unittest.TestCase):
             mtp_missing,
             "mtp.* entries must surface in the attach-time coverage check",
         )
+
+
+class TestPackedExpertMatchRenderScaleRule(unittest.TestCase):
+    """M2 (2026-07-02 audit): the packed-expert re-pack honors the render's
+    RECORDED NVFP4 scale rule (the dense M19 wrap, lifted to packed experts).
+
+    Cache levers record joint_mse; the export-entry env default is static_6.
+    The re-derived packed-expert bytes must match a direct joint_mse
+    re-quantization, not static_6."""
+
+    def test_packed_expert_repack_uses_recorded_joint_mse_rule(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        torch.manual_seed(1234)
+        root = _tiny_qwen_packed_root()
+        experts = root.model.language_model.layers[0].mlp.experts
+        live_prefix = "model.language_model.layers.0.mlp.experts"
+
+        # "Cached renders": arbitrary bf16-storable tensors (values don't
+        # need to be grid-valued for the rule pin — the codes just have to
+        # follow the recorded rule on re-derive).
+        cached_gup = (torch.randn_like(experts.gate_up_proj) * 0.2).float()
+        cached_down = (torch.randn_like(experts.down_proj) * 0.2).float()
+
+        cache = ProductionWeightCache(
+            weights={
+                (f"{live_prefix}.gate_up_proj", "NVFP4"): cached_gup,
+                (f"{live_prefix}.down_proj", "NVFP4"): cached_down,
+            },
+            levers={"gptq": True, "nvfp4_scale_rule": "joint_mse"},
+            activation_max_abs={
+                f"{live_prefix}.gate_up_proj": 3.0,
+                f"{live_prefix}.down_proj": 3.0,
+            },
+        )
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "NVFP4",
+        }
+
+        saved_cache = enc._PRODUCTION_WEIGHT_CACHE
+        saved_rule = enc._NVFP4_SCALE_RULE
+        saved_flags = dict(enc._ACT_AWARE_FLAGS)
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = cache
+            # Export-entry default rule: static_6 (the M2 trigger).
+            enc._NVFP4_SCALE_RULE = enc.NVFP4_SCALE_RULE_STATIC_6
+            for k in enc._ACT_AWARE_FLAGS:
+                enc._ACT_AWARE_FLAGS[k] = False
+            tensors, hist = enc._materialize_tensors_inmemory(
+                root,
+                assignment,
+                bf16_passthrough=set(),
+                profile=Qwen3_5Profile(),
+            )
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = saved_cache
+            enc._NVFP4_SCALE_RULE = saved_rule
+            enc._ACT_AWARE_FLAGS.clear()
+            enc._ACT_AWARE_FLAGS.update(saved_flags)
+
+        # down_proj expert 0: single projection -> per-Linear global.
+        got = tensors[f"{live_prefix}.0.down_proj.weight_packed"]
+        with enc._temporary_export_nvfp4_scale_rule("joint_mse"):
+            wp_joint, _ws, _wg = enc.quantize_dequantize_nvfp4(
+                cached_down[0], group_size=16)
+        with enc._temporary_export_nvfp4_scale_rule("static_6"):
+            wp_static, _ws6, _wg6 = enc.quantize_dequantize_nvfp4(
+                cached_down[0], group_size=16)
+        # The pin must be discriminating: the two rules disagree here.
+        self.assertFalse(torch.equal(wp_joint, wp_static))
+        self.assertTrue(torch.equal(got, wp_joint))
+
+        # gate_up expert 0: gate/up halves share a joint global. The
+        # export computes it from the SOURCE packed param (pre-existing
+        # contract) — but now under the SAME recorded rule as the
+        # re-derive of the cached dequant.
+        src_gup = experts.gate_up_proj.detach().float()
+        rows = src_gup.shape[1] // 2
+        with enc._temporary_export_nvfp4_scale_rule("joint_mse"):
+            joint = torch.stack([
+                enc.compute_nvfp4_global_real(
+                    src_gup[0][:rows], group_size=16),
+                enc.compute_nvfp4_global_real(
+                    src_gup[0][rows:], group_size=16),
+            ]).max()
+            wp_gate_joint, _s, _g = enc.quantize_dequantize_nvfp4(
+                cached_gup[0][:rows], group_size=16,
+                global_real_override=joint)
+        got_gate = tensors[f"{live_prefix}.0.gate_proj.weight_packed"]
+        self.assertTrue(torch.equal(got_gate, wp_gate_joint))
+
+
+class TestGptqDeadColumnHandling(unittest.TestCase):
+    """§3.16 (2026-07-02 audit): dead columns (diag(H)<=0) are detected
+    BEFORE damping — the old check ran after damping and never fired —
+    and their weights are NOT zeroed (serving-safe deviation from
+    reference GPTQ)."""
+
+    def test_dead_activation_column_survives_nvfp4_gptq(self):
+        from prismaquant.export_native_compressed import (
+            _gptq_obs_rounding_nvfp4,
+        )
+        torch.manual_seed(21)
+        W = torch.randn(16, 32) * 0.3
+        X = torch.randn(64, 32)
+        dead_col = 7
+        X[:, dead_col] = 0.0
+        out = _gptq_obs_rounding_nvfp4(W, X, group_size=16)
+        # The unexercised column is quantized, not destroyed.
+        self.assertGreater(float(out[:, dead_col].abs().max()), 0.0)
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_dead_activation_column_survives_fp8_and_mxfp4_gptq(self):
+        from prismaquant.export_native_compressed import (
+            _gptq_obs_rounding_fp8_like,
+            _gptq_obs_rounding_mxfp4,
+        )
+        torch.manual_seed(22)
+        W = torch.randn(16, 64) * 0.3
+        X = torch.randn(96, 64)
+        dead_col = 11
+        X[:, dead_col] = 0.0
+        _q, _s, dq_fp8 = _gptq_obs_rounding_fp8_like(
+            W, X, fmt="FP8_E4M3")
+        self.assertGreater(float(dq_fp8[:, dead_col].abs().max()), 0.0)
+        _q4, _s4, dq_mx4 = _gptq_obs_rounding_mxfp4(W, X, group_size=32)
+        self.assertGreater(float(dq_mx4[:, dead_col].abs().max()), 0.0)
+
+
+class TestCholeskyFallbackKeepsJointGlobal(unittest.TestCase):
+    """§3.18 (2026-07-02 audit): when the GPTQ Cholesky fails under
+    joint_scale_opt, the RTN fallback must carry the JSO-optimized
+    tensor global instead of silently recomputing a per-tensor default."""
+
+    def test_fallback_uses_jso_optimized_global(self):
+        from unittest import mock
+        torch.manual_seed(911)
+        W = torch.randn(16, 32) * 0.3
+        X = torch.randn(48, 32)
+
+        # Expected: replicate the pre-Cholesky global computation of
+        # _gptq_obs_rounding_nvfp4 under joint_scale_opt.
+        W32 = W.to(torch.float32)
+        grouped = W32.reshape(16, 32 // 16, 16)
+        s_g = enc._select_nvfp4_group_scales(
+            grouped, scale_rule=enc.NVFP4_SCALE_RULE_JOINT_MSE)
+        base = (s_g.amax() / enc.FP8_E4M3_MAX).clamp_min(1e-12)
+        opt = enc._optimize_nvfp4_joint_global_real(
+            W32, group_size=16, base_global_real=base)
+        expected = enc._rtn_dequant_nvfp4(
+            W, group_size=16, global_real_override=opt)
+
+        with mock.patch(
+                "torch.linalg.cholesky", side_effect=RuntimeError("boom")):
+            got = enc._gptq_obs_rounding_nvfp4(
+                W, X, group_size=16, joint_scale_opt=True)
+
+        torch.testing.assert_close(got, expected)

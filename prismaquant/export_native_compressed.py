@@ -854,29 +854,64 @@ def pack_fp4_indices(fp4_indices: torch.Tensor, last_dim: int) -> torch.Tensor:
     return (pairs[..., 0] | (pairs[..., 1] << 4)).to(torch.uint8)
 
 
-DEFAULT_INPUT_GLOBAL_SCALE = 1.0  # placeholder; overridden by calibration
+DEFAULT_INPUT_GLOBAL_SCALE = 1.0  # uncalibrated fallback; matches
+# compressed-tensors generate_gparam's nan/inf -> 1.0 "no global
+# scaling" fallback for uncalibrated tensors.
 
 # FP4 E2M1 maximum representable value. Used to rescale activations so
 # they fit inside the FP4 grid after the per-tensor scale divide.
 _FP4_E2M1_MAX = 6.0
+# FP8 E4M3 maximum (alias of FP8_E4M3_MAX above, kept next to
+# _FP4_E2M1_MAX because the two together define the compressed-tensors
+# input_global_scale convention below).
+_FP8_E4M3_MAX = FP8_E4M3_MAX
+
+
+def _nvfp4_input_gscale_fp8_range_enabled() -> bool:
+    """Whether input_global_scale uses the compressed-tensors/vLLM
+    convention ``FP8_MAX * FP4_MAX / amax`` (generate_gparam).
+
+    Default ON (C1 fix, 2026-07-02 audit). The legacy value was
+    ``FP4_MAX / amax`` — 448x below convention, which pushed serve-time
+    FP8-stored activation block scales into the subnormal range (and to
+    0, zeroing whole blocks, at ~1024x block dynamic range). Set
+    ``PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0`` to reproduce
+    historical artifact bytes.
+    """
+    return os.environ.get(
+        "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE", "1") != "0"
+
+
+def _nvfp4_input_global_scale_from_max_abs(max_abs: float) -> float:
+    """input_global_scale for a calibrated activation ``max_abs``.
+
+    Convention (compressed_tensors.quantization.utils.generate_gparam):
+    ``G = FP8_E4M3_MAX * FP4_E2M1_MAX / amax``. vLLM computes each
+    16-block's FP8-stored activation scale as ``fp8(block_amax / 6 * G)``
+    and compensates via alpha, so the dequant identity is invariant to
+    ``G`` — its only function is placing the serve-time block scales in
+    FP8's representable range (0, 448].
+    """
+    max_abs = float(max_abs)
+    if max_abs <= 0.0:
+        return float(DEFAULT_INPUT_GLOBAL_SCALE)
+    if _nvfp4_input_gscale_fp8_range_enabled():
+        return float(_FP8_E4M3_MAX * _FP4_E2M1_MAX / max_abs)
+    return float(_FP4_E2M1_MAX / max_abs)
 
 
 def compute_nvfp4_input_global_scale(activations: torch.Tensor) -> float:
     """Per-tensor input_global_scale from cached activations.
 
-    Returns `max(|activations|) / 6.0` so that `a / input_global_scale`
-    lies in [-6, 6] — the representable range of FP4 E2M1 for per-group
-    quant downstream. Activations can be any shape; we flatten for the
-    max.
+    Returns ``FP8_E4M3_MAX * FP4_E2M1_MAX / max(|activations|)`` — the
+    compressed-tensors ``generate_gparam`` convention, so serve-time
+    activation block scales (``fp8(block_amax / 6 * G)``) span the whole
+    FP8 range instead of collapsing into subnormals. Activations can be
+    any shape; we flatten for the max. See
+    ``_nvfp4_input_global_scale_from_max_abs`` for the kill-switch.
     """
     max_abs = float(activations.detach().abs().max().item())
-    if max_abs <= 0.0:
-        return float(DEFAULT_INPUT_GLOBAL_SCALE)
-    # Use reciprocal convention matching vLLM's CompressedTensorsW4A4Nvfp4
-    # which interprets input_global_scale as a *reciprocal* scale factor
-    # applied when computing activation-quant group scales: a_q = a * s.
-    # So s = FP4_MAX / max_abs means scaled_a ∈ [-FP4_MAX, +FP4_MAX].
-    return _FP4_E2M1_MAX / max_abs
+    return _nvfp4_input_global_scale_from_max_abs(max_abs)
 
 
 # Module-level cache populated by main() when --activation-cache-dir is
@@ -1127,7 +1162,7 @@ def _production_cache_fingerprint(
 def _production_cache_scales(cache, *, profile=None) -> dict[str, float]:
     activation_max_abs = getattr(cache, "activation_max_abs", None) or {}
     scales = {
-        name: (6.0 / float(max_abs))
+        name: _nvfp4_input_global_scale_from_max_abs(float(max_abs))
         for name, max_abs in activation_max_abs.items()
         if max_abs and float(max_abs) > 0.0
     }
@@ -1377,6 +1412,28 @@ def _export_match_render_scale_rule(cache) -> str | None:
     return str(rule) if rule else None
 
 
+def _packed_expert_render_scale_rule() -> str | None:
+    """M2 (2026-07-02 audit): render scale rule for packed-expert re-derives.
+
+    The packed-expert re-pack re-derives NVFP4 codes/scales from the cached
+    3-D dequant exactly like the dense ``_pack_production_cached_2d`` path,
+    so it needs the same M19 match-render-scale wrap: without it a
+    joint_mse/four_over_six-rendered expert re-derived under the export-entry
+    default (``static_6``) cannot recover its codes (measured 43% packed-byte
+    flips). The cache's ``nvfp4_scale_rule`` lever is cache-global — the
+    packed-expert render (both ``batched`` and ``per_expert`` modes in
+    ``fill_packed_expert_cache_entries``) runs under the same module-level
+    rule the lever records — so the cache-level lever IS the expert render's
+    rule. Resolution: recorded rule if present, else ``None`` (the current
+    env default; behavior unchanged when nothing is recorded). Residual:
+    ``PRISMAQUANT_NVFP4_JOINT_SCALE_LEVELS`` is not recorded in the lever
+    dict, so non-default joint levels must still match between cache-build
+    and export env. Gated by ``PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE``
+    (the existing M19 flag, default on).
+    """
+    return _export_match_render_scale_rule(_PRODUCTION_WEIGHT_CACHE)
+
+
 def _pack_production_cached_2d(
     linear_name: str,
     fmt: str,
@@ -1509,8 +1566,9 @@ def _read_cached_packed_expert(
 
 
 def _packed_expert_input_global_scale(experts_param_name: str) -> float | None:
-    """Calibrated W4A4 input_global_scale (FP4_MAX/max_abs) for a packed-expert
-    tensor, read from the production cache's per-param activation max_abs.
+    """Calibrated W4A4 input_global_scale (FP8_MAX*FP4_MAX/max_abs, the
+    generate_gparam convention) for a packed-expert tensor, read from the
+    production cache's per-param activation max_abs.
 
     Returns ``None`` when no cache/scale is available, so the caller falls back
     to ``DEFAULT_INPUT_GLOBAL_SCALE`` (only on the no-cache research path).
@@ -1522,7 +1580,7 @@ def _packed_expert_input_global_scale(experts_param_name: str) -> float | None:
     mx = max_abs_map.get(experts_param_name)
     if mx is None or float(mx) <= 0:
         return None
-    return float(_FP4_E2M1_MAX / float(mx))
+    return _nvfp4_input_global_scale_from_max_abs(float(mx))
 
 
 # Module-level flag bundle that controls which activation-aware
@@ -1786,16 +1844,26 @@ def _gptq_obs_rounding_nvfp4(
     )
     # H = X^T X; guard against near-zero diagonal (dead channels).
     H = X.t() @ X                                         # [in, in]
-    diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
-    H.diagonal().add_(damp * diag_mean)
-
-    # Dead-channel handling (standard GPTQ trick): columns with zero
-    # diagonal get set to identity-like so the Cholesky succeeds, and
-    # we zero those weight columns.
-    dead = torch.diagonal(H) <= 0
+    # Dead-channel handling: columns whose H diagonal is non-positive
+    # (all-zero activation channel). Detect BEFORE damping — damping
+    # lifts every diagonal above zero, which made this check
+    # unreachable — and exclude dead entries from the damp reference
+    # mean so a mass of dead channels can't deflate it. Dead diagonals
+    # get an identity entry so the Cholesky succeeds. We do NOT zero
+    # the weights of dead columns (deliberate serving-safe deviation
+    # from reference GPTQ — a column unexercised by calibration must
+    # not be destroyed for serving traffic); with an identity-like
+    # row/col their OBS error propagation is a no-op and they quantize
+    # as plain RTN.
+    diag0 = torch.diagonal(H)
+    dead = diag0 <= 0
+    alive = ~dead
+    diag_mean = (
+        diag0[alive].mean() if bool(alive.any()) else diag0.new_ones(())
+    ).clamp_min(1e-12)
     if dead.any():
         H[dead, dead] = 1.0
-        W[:, dead] = 0.0
+    H.diagonal().add_(damp * diag_mean)
 
     col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
 
@@ -1872,10 +1940,14 @@ def _gptq_obs_rounding_nvfp4(
         # extreme activation degeneracy).  Returning the original weight
         # here is not a valid NVFP4 render in compute_only/cache paths and
         # can make downstream local-MSE gates see an impossible zero error.
+        # Pass `global_real` — the fused-sibling override when supplied,
+        # else the per-tensor global computed above (which is the
+        # JSO-optimized joint global under joint_scale_opt) — so the
+        # fallback doesn't silently discard the joint-global pick.
         return _rtn_dequant_nvfp4(
             weight,
             group_size=group_size,
-            global_real_override=global_real_override,
+            global_real_override=global_real,
         )
 
     def _quantize_nvfp4_col(col: torch.Tensor, col_idx: int) -> torch.Tensor:
@@ -2954,12 +3026,21 @@ def _gptq_obs_rounding_mxfp4(
     if damp is None:
         damp = _resolve_gptq_fixed_damp()
     H = X.t() @ X
-    diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
-    H.diagonal().add_(float(damp) * diag_mean)
-    dead = torch.diagonal(H) <= 0
+    # Dead-channel handling: detect diag(H) <= 0 BEFORE damping (see
+    # _gptq_obs_rounding_nvfp4), exclude dead entries from the damp
+    # reference mean, give dead diagonals an identity entry. We do NOT
+    # zero the weights of dead columns (deliberate serving-safe
+    # deviation from reference GPTQ — a column unexercised by
+    # calibration must not be destroyed for serving traffic).
+    diag0 = torch.diagonal(H)
+    dead = diag0 <= 0
+    alive = ~dead
+    diag_mean = (
+        diag0[alive].mean() if bool(alive.any()) else diag0.new_ones(())
+    ).clamp_min(1e-12)
     if dead.any():
         H[dead, dead] = 1.0
-        W[:, dead] = 0.0
+    H.diagonal().add_(float(damp) * diag_mean)
     col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
 
     scale_out = torch.empty(
@@ -3131,12 +3212,21 @@ def _gptq_obs_rounding_fp8_like(
     if damp is None:
         damp = _resolve_gptq_fixed_damp()
     H = X.t() @ X
-    diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
-    H.diagonal().add_(float(damp) * diag_mean)
-    dead = torch.diagonal(H) <= 0
+    # Dead-channel handling: detect diag(H) <= 0 BEFORE damping (see
+    # _gptq_obs_rounding_nvfp4), exclude dead entries from the damp
+    # reference mean, give dead diagonals an identity entry. We do NOT
+    # zero the weights of dead columns (deliberate serving-safe
+    # deviation from reference GPTQ — a column unexercised by
+    # calibration must not be destroyed for serving traffic).
+    diag0 = torch.diagonal(H)
+    dead = diag0 <= 0
+    alive = ~dead
+    diag_mean = (
+        diag0[alive].mean() if bool(alive.any()) else diag0.new_ones(())
+    ).clamp_min(1e-12)
     if dead.any():
         H[dead, dead] = 1.0
-        W[:, dead] = 0.0
+    H.diagonal().add_(float(damp) * diag_mean)
     col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
 
     if is_plain:
@@ -3692,10 +3782,13 @@ def _unify_input_global_scales_across_fused_siblings(
     `compute_nvfp4_input_global_scale` outputs are theoretically
     identical — but capture + subsampling order introduces float-
     precision drift in practice.  The stored values are reciprocals
-    (s = 6 / max_abs); the conservative join is therefore ``min(vals)``
-    (smallest reciprocal == largest max_abs == loosest clipping), so
-    the fused Linear never truncates any sibling's activations.
-    Siblings that weren't NVFP4-assigned pass through unchanged.
+    (s = FP8_MAX·FP4_MAX / max_abs, or legacy 6 / max_abs under the
+    ``PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0`` kill-switch); the
+    conservative join is therefore ``min(vals)`` under either
+    convention (smallest reciprocal == largest max_abs == loosest
+    clipping), so the fused Linear never truncates any sibling's
+    activations. Siblings that weren't NVFP4-assigned pass through
+    unchanged.
     """
     # Bucket siblings by fused group.
     groups: dict[str, list[str]] = {}
@@ -3713,10 +3806,11 @@ def _unify_input_global_scales_across_fused_siblings(
         if len(members) < 2:
             continue
         vals = [scales[m] for m in members]
-        # input_global_scale stores 6 / max_abs (reciprocal convention,
-        # see compute_nvfp4_input_global_scale).  To pick a JOINT scale
-        # that doesn't over-clip ANY sibling's activations we want the
-        # smallest reciprocal == largest max_abs == loosest clipping.
+        # input_global_scale stores FP8_MAX·FP4_MAX / max_abs (reciprocal
+        # convention, see compute_nvfp4_input_global_scale).  To pick a
+        # JOINT scale that doesn't over-clip ANY sibling's activations we
+        # want the smallest reciprocal == largest max_abs == loosest
+        # clipping.
         # Previously this used max(vals), which under the reciprocal
         # convention yields the TIGHTEST clipping — over-clipping the
         # sibling with the largest activation range.  In practice fused
@@ -3813,8 +3907,9 @@ def _quantize_2d(
     differ and reports degraded accuracy; sharing avoids both.
 
     `input_global_scale_override`: per-Linear activation scale computed
-    from calibration — `max_abs(cached_activations) / 6.0` so scaled
-    activations fit in FP4 E2M1's ±6 range before per-group quant. If
+    from calibration — `FP8_MAX * FP4_MAX / max_abs(cached_activations)`
+    (the compressed-tensors `generate_gparam` convention) so serve-time
+    FP8-stored activation block scales span the whole FP8 range. If
     None, falls back to `DEFAULT_INPUT_GLOBAL_SCALE` (1.0). Calibrated
     values typically improve PPL noticeably on NVFP4 weights because
     otherwise vLLM's runtime activation quant uses an undersized
@@ -5318,9 +5413,14 @@ def materialize_tensors_streaming(
         layer_mod = model.get_submodule(layer_qname)
 
         # 3b. Joint NVFP4 scales across fused siblings in this layer.
-        joint_globals = _compute_layer_joint_nvfp4(
-            layer_mod, layer_qname, assignment, profile,
-        )
+        # M2: computed under the render's recorded scale rule so the
+        # fused joint-global pre-pass is consistent with the
+        # match-render-scale re-derive (_pack_production_cached_2d).
+        with _temporary_export_nvfp4_scale_rule(
+                _export_match_render_scale_rule(_PRODUCTION_WEIGHT_CACHE)):
+            joint_globals = _compute_layer_joint_nvfp4(
+                layer_mod, layer_qname, assignment, profile,
+            )
 
         # 3c. Emit Linears.
         covered: set[str] = set()
@@ -5802,15 +5902,21 @@ def materialize_tensors_streaming(
                     continue
 
                 # Per-expert joint global scale when NVFP4 splits gate+up.
+                # M2: computed under the render's recorded scale rule so
+                # the joint global is consistent with the re-derive below.
+                packed_render_rule = _packed_expert_render_scale_rule()
                 per_expert_joint: list[torch.Tensor | None] = [None] * E
                 if fmt == "NVFP4" and len(proj_split) > 1:
-                    for orig_e, _ in iter_experts:
-                        cands = [
-                            compute_nvfp4_global_real(sp[orig_e].float(),
-                                                      group_size=16)
-                            for _, sp in proj_split
-                        ]
-                        per_expert_joint[orig_e] = torch.stack(cands).max()
+                    with _temporary_export_nvfp4_scale_rule(
+                            packed_render_rule):
+                        for orig_e, _ in iter_experts:
+                            cands = [
+                                compute_nvfp4_global_real(
+                                    sp[orig_e].float(), group_size=16)
+                                for _, sp in proj_split
+                            ]
+                            per_expert_joint[orig_e] = (
+                                torch.stack(cands).max())
 
                 # Pull the GPTQ-rendered dequant from the production cache.
                 # Packed experts go through the SAME deliberate render as 2-D
@@ -5866,33 +5972,45 @@ def materialize_tensors_streaming(
                         f"recomputed, or delete the expert shard to force a "
                         f"full re-render.")
 
-                for pi, (proj_name, sub_packed) in enumerate(proj_split):
-                    cached_sub = (
-                        cached_split[pi][1] if cached_split is not None else None
-                    )
-                    for orig_e, new_e in iter_experts:
-                        base = f"{disk_qname}.{new_e}.{proj_name}"
-                        if is_bf16:
-                            expert_2d = sub_packed[orig_e]
-                            out[f"{base}.weight"], label = _passthrough_tensor(
-                                full, expert_2d, source_dtype_by_name)
-                        else:
-                            # Re-pack the GPTQ-rendered dequant when cached
-                            # (re-derives codes from the dequant, same ~1e-3
-                            # approximation as the 2-D path — not bit-lossless);
-                            # fall back to source only on the no-cache warning.
-                            expert_2d = (
-                                cached_sub[orig_e]
-                                if cached_sub is not None
-                                else sub_packed[orig_e]
-                            )
-                            compressed = _quantize_2d(
-                                expert_2d, fmt,
-                                nvfp4_global_real_override=per_expert_joint[orig_e],
-                                input_global_scale_override=expert_input_scale,
-                            )
-                            for suffix, t in compressed.items():
-                                out[f"{base}.{suffix}"] = t.cpu()
+                # M2: re-derive under the render's RECORDED NVFP4 scale
+                # rule (the dense _pack_production_cached_2d wrap, lifted
+                # to packed experts) — a joint_mse-rendered expert
+                # re-derived under the export-entry default (static_6)
+                # cannot recover its codes.
+                with _temporary_export_nvfp4_scale_rule(packed_render_rule):
+                    for pi, (proj_name, sub_packed) in enumerate(proj_split):
+                        cached_sub = (
+                            cached_split[pi][1]
+                            if cached_split is not None else None
+                        )
+                        for orig_e, new_e in iter_experts:
+                            base = f"{disk_qname}.{new_e}.{proj_name}"
+                            if is_bf16:
+                                expert_2d = sub_packed[orig_e]
+                                out[f"{base}.weight"], label = (
+                                    _passthrough_tensor(
+                                        full, expert_2d,
+                                        source_dtype_by_name))
+                            else:
+                                # Re-pack the GPTQ-rendered dequant when
+                                # cached (re-derives codes from the dequant,
+                                # same ~1e-3 approximation as the 2-D path —
+                                # not bit-lossless); fall back to source only
+                                # on the no-cache warning.
+                                expert_2d = (
+                                    cached_sub[orig_e]
+                                    if cached_sub is not None
+                                    else sub_packed[orig_e]
+                                )
+                                compressed = _quantize_2d(
+                                    expert_2d, fmt,
+                                    nvfp4_global_real_override=(
+                                        per_expert_joint[orig_e]),
+                                    input_global_scale_override=(
+                                        expert_input_scale),
+                                )
+                                for suffix, t in compressed.items():
+                                    out[f"{base}.{suffix}"] = t.cpu()
                 covered.add(full)
                 hist[(
                     "packed_moe_per_expert",
@@ -5997,11 +6115,15 @@ def _materialize_tensors_inmemory(
 
     # Pre-pass: joint NVFP4 global_scale per fused-sibling group so
     # q/k/v (or gate/up, etc.) share one weight_global_scale slot.
-    nvfp4_joint_global = _compute_nvfp4_joint_global(
-        model,
-        assignment,
-        profile=profile,
-    )
+    # M2: under the render's recorded scale rule, consistent with the
+    # _pack_production_cached_2d match-render-scale re-derive below.
+    with _temporary_export_nvfp4_scale_rule(
+            _export_match_render_scale_rule(_PRODUCTION_WEIGHT_CACHE)):
+        nvfp4_joint_global = _compute_nvfp4_joint_global(
+            model,
+            assignment,
+            profile=profile,
+        )
 
     for qname, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
@@ -6082,15 +6204,19 @@ def _materialize_tensors_inmemory(
                 hist[("packed_moe", label if is_bf16 else fmt)] += 1
                 continue
 
+            # M2: joint globals + re-derive below run under the render's
+            # recorded NVFP4 scale rule (see _packed_expert_render_scale_rule).
+            packed_render_rule = _packed_expert_render_scale_rule()
             per_expert_joint: list[torch.Tensor | None] = [None] * E
             if fmt == "NVFP4" and len(proj_split) > 1:
-                for e in range(E):
-                    candidates = [
-                        compute_nvfp4_global_real(sub_packed[e].float(),
-                                                  group_size=16)
-                        for _, sub_packed in proj_split
-                    ]
-                    per_expert_joint[e] = torch.stack(candidates).max()
+                with _temporary_export_nvfp4_scale_rule(packed_render_rule):
+                    for e in range(E):
+                        candidates = [
+                            compute_nvfp4_global_real(sub_packed[e].float(),
+                                                      group_size=16)
+                            for _, sub_packed in proj_split
+                        ]
+                        per_expert_joint[e] = torch.stack(candidates).max()
 
             # Read the GPTQ-rendered dequant from the production cache (same
             # contract as the streaming path); hard-fail on RTN-by-omission
@@ -6131,28 +6257,32 @@ def _materialize_tensors_inmemory(
                     f"build_production_cache to recompute the scale, or delete "
                     f"the expert shard to force a full re-render.")
 
-            for pi, (proj_name, sub_packed) in enumerate(proj_split):
-                cached_sub = (
-                    cached_split[pi][1] if cached_split is not None else None
-                )
-                E_p, Mp, Np = sub_packed.shape
-                for e in range(E_p):
-                    base = f"{disk_qname}.{e}.{proj_name}"
-                    if is_bf16:
-                        out[f"{base}.weight"], label = _passthrough_tensor(
-                            full_name, sub_packed[e])
-                    else:
-                        expert_2d = (
-                            cached_sub[e] if cached_sub is not None
-                            else sub_packed[e]
-                        )
-                        compressed = _quantize_2d(
-                            expert_2d, fmt,
-                            nvfp4_global_real_override=per_expert_joint[e],
-                            input_global_scale_override=expert_input_scale,
-                        )
-                        for suffix, tensor in compressed.items():
-                            out[f"{base}.{suffix}"] = tensor.cpu()
+            # M2: re-derive under the render's RECORDED NVFP4 scale rule
+            # (same wrap as the streaming packed-expert path).
+            with _temporary_export_nvfp4_scale_rule(packed_render_rule):
+                for pi, (proj_name, sub_packed) in enumerate(proj_split):
+                    cached_sub = (
+                        cached_split[pi][1]
+                        if cached_split is not None else None
+                    )
+                    E_p, Mp, Np = sub_packed.shape
+                    for e in range(E_p):
+                        base = f"{disk_qname}.{e}.{proj_name}"
+                        if is_bf16:
+                            out[f"{base}.weight"], label = _passthrough_tensor(
+                                full_name, sub_packed[e])
+                        else:
+                            expert_2d = (
+                                cached_sub[e] if cached_sub is not None
+                                else sub_packed[e]
+                            )
+                            compressed = _quantize_2d(
+                                expert_2d, fmt,
+                                nvfp4_global_real_override=per_expert_joint[e],
+                                input_global_scale_override=expert_input_scale,
+                            )
+                            for suffix, tensor in compressed.items():
+                                out[f"{base}.{suffix}"] = tensor.cpu()
             covered.add(full_name)
             hist[(
                 "packed_moe_per_expert",
@@ -7339,9 +7469,10 @@ def main():
             # fires at vLLM load. q/k/v siblings receive the same
             # upstream activation in principle, but captured per-
             # Linear from different shard subsamples, so the computed
-            # max/6 values can drift by a float-precision tick. Take
-            # the max over the group so vLLM runs on the conservative
-            # (larger) scale for every sibling.
+            # reciprocal (FP8_MAX·FP4_MAX/max_abs) values can drift by
+            # a float-precision tick. Take the MIN over the group —
+            # the smallest reciprocal == the largest max_abs == the
+            # conservative (loosest-clipping) scale for every sibling.
             scales = _unify_input_global_scales_across_fused_siblings(
                 scales,
                 profile=profile,

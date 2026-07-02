@@ -62,8 +62,12 @@ def _build_H_stack(
       - ``H_stack`` of shape ``[E, in, in]`` with damping already added,
         ready for batched Cholesky.
       - ``dead_mask`` of shape ``[E, in]`` flagging columns whose H
-        diagonal was non-positive (so the caller can zero those weight
-        columns).
+        diagonal was non-positive BEFORE damping (all-zero activation
+        channel). Diagnostic only: dead columns get an identity-like
+        H row/col, so GPTQ's OBS error propagation is a no-op there and
+        they quantize as plain RTN — their weights are NOT zeroed (a
+        column unexercised by calibration must not be destroyed for
+        serving traffic).
 
     Computing H per-Linear in a small Python loop is cheap relative to
     the column-update loop further down; we don't try to batch the
@@ -84,12 +88,15 @@ def _build_H_stack(
     for e in range(E):
         a = activations_list[e]
         if a is None or a.numel() == 0:
-            # No activations for this Linear — fall back to identity
-            # so the batched Cholesky doesn't fail. Caller will see all
-            # columns "dead" and weights zero out.
+            # No activations for this Linear — fall back to identity so
+            # the batched Cholesky doesn't fail. dead_mask stays all-
+            # False: identity-Hessian GPTQ degenerates EXACTLY to RTN
+            # (verified property), matching the per-Linear path's RTN
+            # fallback. (Previously this set dead_mask[e]=True and the
+            # caller zeroed the whole Linear — shipping all-zero weights
+            # for any Linear the calibration never exercised.)
             H_stack[e] = torch.eye(
                 in_features, dtype=torch.float32, device=device)
-            dead_mask[e] = True
             continue
         # v23 fix: explicitly move activations to the target device
         # before the matmul. _LazyActivationCache.get() returns CPU
@@ -113,14 +120,21 @@ def _build_H_stack(
             row_weights=row_weights,
         )
         H = X.t() @ X
-        diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
-        H.diagonal().add_(float(damp) * diag_mean)
-        # Dead columns: zero diagonal (can happen if the activation is
-        # all zeros on a particular channel).
-        dead = torch.diagonal(H) <= 0
+        # Dead columns (all-zero activation channel): detect BEFORE
+        # damping (damping lifts every diagonal above zero, which made
+        # this check unreachable), exclude dead entries from the damp
+        # reference mean, and give dead diagonals an identity entry so
+        # the Cholesky succeeds. Mirrors _gptq_obs_rounding_nvfp4.
+        diag0 = torch.diagonal(H)
+        dead = diag0 <= 0
+        alive = ~dead
+        diag_mean = (
+            diag0[alive].mean() if bool(alive.any()) else diag0.new_ones(())
+        ).clamp_min(1e-12)
         if dead.any():
             H[dead, dead] = 1.0
             dead_mask[e] = dead
+        H.diagonal().add_(float(damp) * diag_mean)
         H_stack[e] = H
     return H_stack, dead_mask
 
@@ -146,8 +160,10 @@ def gptq_obs_rounding_nvfp4_batched(
         Linears in the batch must share `(out, in)`.
       activations_list: length-E list of per-Linear activation tensors,
         each shape ``[*, in]`` (T may differ per Linear for routed-MoE
-        experts). Use a zero-numel tensor for Linears that should be
-        treated as "no activations available" (dead columns).
+        experts). Use a zero-numel tensor for Linears with no
+        activations available: they get an identity Hessian, under
+        which GPTQ degenerates exactly to NVFP4 RTN (matching the
+        per-Linear path's no-acts behavior; weights are never zeroed).
       group_size: NVFP4 group size (always 16 in production).
       damp: ridge applied to the activation covariance diagonal for
         Cholesky stability. Default 0.01 matches the per-Linear path.
@@ -230,10 +246,14 @@ def gptq_obs_rounding_nvfp4_batched(
                 if row_weights_list is not None else None
             ),
         )
-        # Zero out dead weight columns up front (matches per-Linear path).
-        W = torch.where(
-            dead_mask.unsqueeze(1).expand_as(W), torch.zeros_like(W), W,
-        )
+        # We do NOT zero the weights of dead columns (deliberate
+        # serving-safe deviation from reference GPTQ — a column
+        # unexercised by calibration must not be destroyed for serving
+        # traffic; matches the per-Linear path). Dead columns carry an
+        # identity-like H row/col, so their OBS error propagation is a
+        # no-op and they quantize as plain RTN. dead_mask stays
+        # diagnostic-only.
+        del dead_mask
 
         # 2. Batched Cholesky + cholesky_inverse + upper Cholesky.
         # Failure handling: any single Linear with a degenerate H aborts

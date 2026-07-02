@@ -113,11 +113,19 @@ def make_attention_block_spec(layer_mod: nn.Module, layer_qname: str,
         lin = getattr(sa, qname)
         # Recover scale by inverse — robust to fp dtype shenanigans.
         ref = saved[qname]
-        # Use a non-zero element to estimate scale.
+        # Use the max-|·| element to estimate scale. Divide by the
+        # SIGNED value: it is the max-magnitude element by construction
+        # (never ~0 for a real weight), and clamping a negative
+        # denominator to 1e-12 would explode the recovered scale to
+        # ~cur·1e12 whenever the max-|·| element is negative.
         idx = ref.abs().argmax()
         flat_ref = ref.reshape(-1)
         flat_cur = lin.weight.data.reshape(-1)
-        s = float(flat_cur[idx] / flat_ref[idx].clamp_min(1e-12))
+        ref_v = flat_ref[idx]
+        if float(ref_v) == 0.0:
+            # All-zero reference weight — no scale is recoverable.
+            return torch.tensor(1.0)
+        s = float(flat_cur[idx] / ref_v)
         return torch.tensor(s)
 
     def fwd(x: torch.Tensor) -> torch.Tensor:
@@ -172,10 +180,16 @@ def make_mlp_block_spec(layer_mod: nn.Module, layer_qname: str
     def getter(qname: str) -> torch.Tensor:
         lin = getattr(mlp, qname)
         ref = saved[qname]
+        # Signed division by the max-|·| element (see the attention
+        # getter): clamp_min on a negative denominator exploded the
+        # recovered scale by ~1e12.
         idx = ref.abs().argmax()
         flat_ref = ref.reshape(-1)
         flat_cur = lin.weight.data.reshape(-1)
-        s = float(flat_cur[idx] / flat_ref[idx].clamp_min(1e-12))
+        ref_v = flat_ref[idx]
+        if float(ref_v) == 0.0:
+            return torch.tensor(1.0)
+        s = float(flat_cur[idx] / ref_v)
         return torch.tensor(s)
 
     def fwd(x: torch.Tensor) -> torch.Tensor:

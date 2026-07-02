@@ -61,20 +61,48 @@ def test_gptq_batched_matches_per_linear(seeded):
         f"max rel diff: {((per_stack - batch_out).abs() / per_stack.abs().clamp_min(1e-12)).max().item():.3e}")
 
 
-def test_gptq_batched_handles_dead_columns(seeded):
-    """A Linear with a zero-column activation should not poison the
-    rest of the batch — its Cholesky gets the identity fallback while
-    the others run normally."""
+def test_gptq_batched_empty_acts_ships_rtn_not_zeros(seeded):
+    """M1 (2026-07-02 audit): a Linear with NO cached activations must
+    ship as NVFP4 RTN (identity-Hessian GPTQ degenerates exactly to
+    RTN, matching the per-Linear path's fallback) — NOT as all-zero
+    weights. Linears with activations in the same batch are untouched."""
     E, out_features, in_features = 3, 16, 32
     weights, activations_list = _make_inputs(E, out_features, in_features, T=64)
-    # Zero out one activation tensor entirely.
+    # Zero-numel activation tensor = "no activations available".
     activations_list[1] = torch.zeros(0, in_features, dtype=torch.float32)
 
     out = gptq_obs_rounding_nvfp4_batched(
         weights, activations_list, group_size=16, expert_chunk=4,
     )
-    # Linear 1 should have all-zero weights (dead-column handling).
-    assert out[1].abs().max() == 0.0
+    # The empty-acts Linear ships the same bytes as plain RTN — nonzero.
+    expected_rtn = _rtn_dequant_nvfp4(weights[1], group_size=16)
+    assert out[1].abs().max() > 0.0
+    torch.testing.assert_close(out[1], expected_rtn)
+    # Sibling Linears with activations still match the per-Linear GPTQ.
+    for e in (0, 2):
+        per = _gptq_obs_rounding_nvfp4(
+            weights[e], activations_list[e], group_size=16)
+        assert torch.allclose(per, out[e], atol=1e-4, rtol=1e-3)
+
+
+def test_gptq_batched_dead_activation_column_not_zeroed(seeded):
+    """§3.16: an all-zero activation CHANNEL (dead column) is detected
+    pre-damping, gets an identity H diagonal, and its weights are NOT
+    zeroed (serving-safe deviation from reference GPTQ)."""
+    E, out_features, in_features = 2, 16, 32
+    weights, activations_list = _make_inputs(E, out_features, in_features, T=64)
+    dead_col = 5
+    activations_list[0][:, dead_col] = 0.0
+
+    out = gptq_obs_rounding_nvfp4_batched(
+        weights, activations_list, group_size=16, expert_chunk=4,
+    )
+    # The dead column survives (quantized, not destroyed).
+    assert out[0][:, dead_col].abs().max() > 0.0
+    # And it stays consistent with the per-Linear path on the same input.
+    per = _gptq_obs_rounding_nvfp4(
+        weights[0], activations_list[0], group_size=16)
+    assert torch.allclose(per, out[0], atol=1e-4, rtol=1e-3)
 
 
 def test_gptq_batched_with_global_real_overrides(seeded):

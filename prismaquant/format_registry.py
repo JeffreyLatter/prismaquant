@@ -406,10 +406,14 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
     The hot path is wrapped in ``torch.compile`` (mode='reduce-overhead',
     dynamic=False) by default — micro-benchmark on Blackwell + cu130 +
     torch 2.11 shows ~10x speedup on per-Linear activation RTN
-    (12 ms eager → 1.2 ms compiled, max numerical diff 5e-7).  This
-    matters most on the polish hot path where the closure is called
-    once per Linear per forward, ~497 calls per measurement on 27B,
-    several hundred measurements per polish pass.
+    (12 ms eager → 1.2 ms compiled).  Compiled-vs-eager is MSE-identical
+    but NOT bit-identical: at exact codebook midpoints Inductor fusion
+    can flip the tie (~0.036% of bf16 elements pick the other equidistant
+    code), so screens that require bit-reproducibility across the
+    compiled/eager boundary must pin one path.  This matters most on the
+    polish hot path where the closure is called once per Linear per
+    forward, ~497 calls per measurement on 27B, several hundred
+    measurements per polish pass.
 
     Set ``PRISMAQUANT_DISABLE_RTN_COMPILE=1`` to fall back to eager —
     only useful if torch.compile fails on a particular tensor shape

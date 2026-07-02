@@ -30,7 +30,11 @@ safetensors header (``data_offsets``), with no weight load and no torch.
 (NVFP4's fp8 block scale per group-of-16, FP8's per-row fp32 scale, FP8_SOURCE's
 128×128 block scale), so the body term is exact per shape rather than via a
 nominal scalar bpp. Packed-MoE experts (3D shape) are handled by feeding the
-``(num_experts, out, in)`` shape through the same primitive.
+``(num_experts, out, in)`` shape through the same primitive. NVFP4 additionally
+ships two fp32 global sidecars per emitted 2-D Linear (``weight_global_scale``
++ ``input_global_scale``, 8 bytes) that ``memory_bytes_for_shape`` does not
+count; :func:`nvfp4_global_sidecar_bytes` adds them (per expert × on-disk
+projection for packed 3-D tensors).
 """
 from __future__ import annotations
 
@@ -146,6 +150,40 @@ def reencoded_source_bytes_for_shape(shape: tuple[int, ...], regime: str) -> int
     return n * 2  # bf16/fp16 source weight, no scale sibling
 
 
+# fp32 weight_global_scale + fp32 input_global_scale per emitted NVFP4
+# 2-D Linear (verified against shipped-artifact safetensors headers:
+# both are F32 scalars, 4 bytes each).
+_NVFP4_GLOBAL_SIDECAR_BYTES_PER_LINEAR = 8
+
+# On-disk projection count for packed 3-D expert tensors, keyed by the
+# assignment key's leaf name. Mirrors the exporter's
+# ``ModelProfile.packed_expert_projection_names`` DefaultProfile fallback
+# (a packed ``gate_up_proj`` splits into gate_proj + up_proj per-expert
+# Linears on disk; every other packed param emits one Linear per expert).
+# footprint deliberately carries no profile/torch dependency, so a
+# profile that *declares* a differently-named multi-projection packed
+# param would under-count 8·E·(P−1) bytes here — no such profile exists
+# in the tree today.
+_PACKED_LEAF_PROJECTIONS = {"gate_up_proj": 2}
+
+
+def nvfp4_global_sidecar_bytes(qname: str, shape: tuple[int, ...]) -> int:
+    """Bytes of the fp32 NVFP4 global sidecars the export emits.
+
+    Every emitted NVFP4 2-D Linear ships ``weight_global_scale`` +
+    ``input_global_scale`` (fp32 scalars, 8 bytes). A packed 3-D expert
+    tensor ``(E, out, in)`` is split into E × P per-expert 2-D Linears on
+    disk (P = on-disk projection count, 2 for ``gate_up_proj``), each with
+    its own pair — 8·E·P bytes. ``memory_bytes_for_shape`` counts weight +
+    group-scale bytes only, so this is additive.
+    """
+    if len(shape) == 3:
+        leaf = qname.rsplit(".", 1)[-1]
+        n_proj = _PACKED_LEAF_PROJECTIONS.get(leaf, 1)
+        return _NVFP4_GLOBAL_SIDECAR_BYTES_PER_LINEAR * int(shape[0]) * n_proj
+    return _NVFP4_GLOBAL_SIDECAR_BYTES_PER_LINEAR
+
+
 def assignment_artifact_bytes(
     assignment: Mapping[str, str],
     stats: Mapping[str, dict],
@@ -188,6 +226,8 @@ def assignment_artifact_bytes(
         shape = _shape_from_stats(entry)
         name = fr.canonical_format_name(fmt) if canonicalize else fmt
         body_quant += fr.get_format(name).memory_bytes_for_shape(shape)
+        if name == "NVFP4":
+            body_quant += nvfp4_global_sidecar_bytes(qname, shape)
         reenc_src += reencoded_source_bytes_for_shape(shape, regime)
         n_reencoded += 1
     floor = int(source_total_bytes) - reenc_src

@@ -194,3 +194,66 @@ def test_refine_handles_no_improvement():
                                     max_passes=2)
     # Final state shouldn't have regressed.
     assert final_mse <= initial_mse + 1e-9
+
+
+def _force_negative_max_element(w: torch.Tensor) -> None:
+    """Make the max-|·| element of `w` negative in place."""
+    flat = w.view(-1)
+    idx = flat.abs().argmax()
+    flat[idx] = -flat[idx].abs()
+
+
+def test_real_getters_recover_scale_with_negative_max_element():
+    """C2 (2026-07-02 audit): the REAL make_attention_block_spec /
+    make_mlp_block_spec getters recover the applied scale when the
+    reference weight's max-|·| element is NEGATIVE. The old getter
+    divided by `flat_ref[idx].clamp_min(1e-12)`, which replaced a
+    negative denominator with 1e-12 and returned s ≈ cur·1e12 —
+    export then multiplied shipped weights by it."""
+    torch.manual_seed(3)
+    d = 16
+
+    class _SelfAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(d, d, bias=False)
+            self.k_proj = nn.Linear(d, d, bias=False)
+            self.v_proj = nn.Linear(d, d, bias=False)
+            self.o_proj = nn.Linear(d, d, bias=False)
+
+    class _Mlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(d, d, bias=False)
+            self.up_proj = nn.Linear(d, d, bias=False)
+            self.down_proj = nn.Linear(d, d, bias=False)
+
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _SelfAttn()
+            self.mlp = _Mlp()
+
+    from prismaquant.block_output_match import (
+        make_attention_block_spec, make_mlp_block_spec)
+
+    layer = _Layer().eval()
+    with torch.no_grad():
+        for _, mod in layer.named_modules():
+            if isinstance(mod, nn.Linear):
+                _force_negative_max_element(mod.weight.data)
+
+    for spec in (
+        make_attention_block_spec(layer, "model.layers.0"),
+        make_mlp_block_spec(layer, "model.layers.0"),
+    ):
+        assert spec is not None
+        for qname in spec.linears:
+            # Identity state recovers 1.0 (not ±1e12).
+            s0 = float(spec.scale_getter(qname))
+            assert abs(s0 - 1.0) < 1e-5, f"{qname}: identity scale {s0}"
+            # setter(1.02) -> getter ≈ 1.02.
+            spec.scale_setter(qname, torch.tensor(1.02))
+            s = float(spec.scale_getter(qname))
+            assert abs(s - 1.02) < 1e-5, f"{qname}: recovered {s}"
+            spec.scale_setter(qname, torch.tensor(1.0))

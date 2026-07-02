@@ -37,9 +37,19 @@ def _pack_fp4_indices(fp4_indices: torch.Tensor, last_dim: int) -> torch.Tensor:
 
 
 def _indices_from_signed_e2m1_values(values: torch.Tensor) -> torch.Tensor:
-    """Map already-rounded signed E2M1 values to packed FP4 code indices."""
+    """Map signed E2M1 values to packed FP4 code indices, nearest-neighbor.
+
+    Bucketizes on the midpoint boundaries between adjacent codes (like the
+    export codec's ``_round_to_codebook``; exact ties round toward zero),
+    so a value ε above a code — e.g. from a bf16 round-trip — maps back to
+    that code instead of jumping to the NEXT one (the old
+    bucketize-on-codes behavior, a full-step error).
+    """
     pos = torch.tensor(_FP4_E2M1_POS, device=values.device, dtype=torch.float32)
-    abs_idx = torch.bucketize(values.abs().float().contiguous(), pos).clamp_max(7)
+    midpoints = (pos[1:] + pos[:-1]) / 2.0
+    abs_idx = torch.bucketize(
+        values.abs().float().contiguous(), midpoints,
+    ).clamp_max(7)
     sign_bit = torch.signbit(values).to(torch.long) << 3
     return (abs_idx.long() | sign_bit).to(torch.long)
 
@@ -137,16 +147,21 @@ def _tl_e2m1_abs_from_index(abs_idx):
 
 @triton.jit
 def _tl_quantize_e2m1_dequant(x):
+    # Nearest E2M1 code by midpoint thresholds; exact ties (|x| equal to a
+    # midpoint) round half-toward-zero for BOTH signs, matching the export
+    # codec's _round_to_codebook. (The old version used >= on the negative
+    # branch — sign-asymmetric ties, negative half-ties rounded away from
+    # zero.)
     ax = tl.abs(x)
     neg = x < 0.0
     idx = tl.full(x.shape, 0, tl.int32)
-    idx = tl.where(tl.where(neg, ax >= 0.25, ax > 0.25), 1, idx)
-    idx = tl.where(tl.where(neg, ax >= 0.75, ax > 0.75), 2, idx)
-    idx = tl.where(tl.where(neg, ax >= 1.25, ax > 1.25), 3, idx)
-    idx = tl.where(tl.where(neg, ax >= 1.75, ax > 1.75), 4, idx)
-    idx = tl.where(tl.where(neg, ax >= 2.5, ax > 2.5), 5, idx)
-    idx = tl.where(tl.where(neg, ax >= 3.5, ax > 3.5), 6, idx)
-    idx = tl.where(tl.where(neg, ax >= 5.0, ax > 5.0), 7, idx)
+    idx = tl.where(ax > 0.25, 1, idx)
+    idx = tl.where(ax > 0.75, 2, idx)
+    idx = tl.where(ax > 1.25, 3, idx)
+    idx = tl.where(ax > 1.75, 4, idx)
+    idx = tl.where(ax > 2.5, 5, idx)
+    idx = tl.where(ax > 3.5, 6, idx)
+    idx = tl.where(ax > 5.0, 7, idx)
     q_abs = _tl_e2m1_abs_from_index(idx)
     return tl.where(neg, -q_abs, q_abs)
 
