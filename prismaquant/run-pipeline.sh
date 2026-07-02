@@ -237,6 +237,10 @@ fi
 : "${AURA_COST_LINEAR_CHUNKS:=8}"
 : "${AURA_COST_PROBE_MICROBATCH:=8}"
 : "${AURA_COST_MIN_FREE_GIB:=18}"
+# auto: fp32 when the fp32-resident model fits with the min-free headroom
+# (27B-class, the regen recipe), else bf16 (35B-class — fp32 is ~140 GiB
+# against the 121 GiB pool and OOM-kills the box).
+: "${AURA_COST_DTYPE:=auto}"
 # Empirical packed-expert unit-KL stage (MoE hybrid): serving-unit RTN KL
 # measured end-to-end, FP8 kept in the menu (real-KL rejects it, no bans).
 : "${AURA_EXPERT_NSAMPLES:=16}"
@@ -365,7 +369,7 @@ if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-r
   echo "  PRODUCTION_RENDER_COST_NSAMPLES=$PRODUCTION_RENDER_COST_NSAMPLES PRODUCTION_RENDER_COST_SEQLEN=$PRODUCTION_RENDER_COST_SEQLEN PRODUCTION_RENDER_COST_SEED=$PRODUCTION_RENDER_COST_SEED SCORE_FIELD=$PRODUCTION_RENDER_COST_SCORE_FIELD"
 fi
 if [[ "$COST_MODE" == "aura" ]]; then
-  echo "  AURA_COST_NPROBES=$AURA_COST_NPROBES AURA_COST_NSAMPLES=$AURA_COST_NSAMPLES AURA_COST_SEQLEN=$AURA_COST_SEQLEN AURA_COST_CALIB_SEED=$AURA_COST_CALIB_SEED"
+  echo "  AURA_COST_NPROBES=$AURA_COST_NPROBES AURA_COST_NSAMPLES=$AURA_COST_NSAMPLES AURA_COST_SEQLEN=$AURA_COST_SEQLEN AURA_COST_CALIB_SEED=$AURA_COST_CALIB_SEED AURA_COST_DTYPE=$AURA_COST_DTYPE"
   echo "  AURA_EXPERT_NSAMPLES=$AURA_EXPERT_NSAMPLES AURA_EXPERT_SEQLEN=$AURA_EXPERT_SEQLEN VALIDATED_FRONTIER_MATERIALIZATION=$VALIDATED_FRONTIER_MATERIALIZATION"
 fi
 echo "  EXPORT_GPTQ=$EXPORT_GPTQ EXPORT_SCALE_SWEEP=$EXPORT_SCALE_SWEEP"
@@ -769,6 +773,7 @@ PY
       --n-calib-samples "$AURA_COST_NSAMPLES" \
       --calib-seqlen "$AURA_COST_SEQLEN" \
       --calib-seed "$AURA_COST_CALIB_SEED" \
+      --dtype "$AURA_COST_DTYPE" \
       --dataset "$DATASET" \
       --hook-harvest \
       --gradient-checkpointing \

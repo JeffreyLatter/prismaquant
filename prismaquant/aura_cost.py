@@ -83,6 +83,68 @@ def _git_commit() -> str | None:
 _ZERO_COST_FORMATS = {"BF16", "FP8_SOURCE"}
 
 
+def _resolve_auto_dtype(
+    staged: str | Path,
+    min_free_gib: float,
+    available_bytes: int | None = None,
+) -> str:
+    """Pick float32 when the fp32-resident model fits, else bfloat16.
+
+    fp32 is the additivity-preferred cost regime (per-Linear KLs add in
+    fp32; cross-terms vanish), but the model loads FULLY RESIDENT here, so
+    on a unified-memory box the choice must be sized, not assumed: a 35B at
+    fp32 is ~140 GiB against a 121 GiB pool — an OOM-kill mid-pipeline.
+    Sizing is from the checkpoint itself: bytes/param inferred from the
+    index (fp8 sources carry weight_scale_inv sidecars and are 1 byte/param;
+    bf16/fp16 are 2), headroom is the caller's --min-free-gib knob.
+    """
+    import json as _json
+
+    src = Path(staged)
+    total_bytes = 0
+    bytes_per_param = 2.0
+    idx = src / "model.safetensors.index.json"
+    if idx.is_file():
+        try:
+            payload = _json.loads(idx.read_text())
+            total_bytes = int(payload.get("metadata", {}).get("total_size", 0))
+            if any(
+                k.endswith(".weight_scale_inv")
+                for k in payload.get("weight_map", {})
+            ):
+                bytes_per_param = 1.0
+        except Exception:
+            total_bytes = 0
+    if not total_bytes:
+        total_bytes = sum(
+            f.stat().st_size for f in src.glob("*.safetensors"))
+    if not total_bytes:
+        _log("--dtype auto: could not size the checkpoint; keeping float32")
+        return "float32"
+    approx_params = total_bytes / bytes_per_param
+    fp32_need = approx_params * 4
+    if available_bytes is None:
+        available_bytes = 0
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        available_bytes = int(line.split()[1]) * 1024
+                        break
+        except Exception:
+            pass
+    fits = (
+        available_bytes > 0
+        and fp32_need + min_free_gib * 1024**3 <= available_bytes
+    )
+    choice = "float32" if fits else "bfloat16"
+    _log(
+        f"--dtype auto: fp32-resident needs ~{fp32_need / 1024**3:.0f} GiB "
+        f"(+{min_free_gib:.0f} GiB headroom) vs "
+        f"{available_bytes / 1024**3:.0f} GiB available -> {choice}")
+    return choice
+
+
 def _log(msg: str) -> None:
     print(f"[aura {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -652,7 +714,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "windowed loader (--calib-split/--calib-seed).")
     p.add_argument("--token-scope", default="all")
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
+    p.add_argument(
+        "--dtype", default="float32",
+        choices=["float32", "bfloat16", "auto"],
+        help="Resident model dtype. float32 (historical default) is the "
+        "additivity-preferred cost regime but needs params x 4 bytes "
+        "resident — ~140 GiB on a 35B, an OOM-kill on the 121 GiB box. "
+        "'auto' sizes the checkpoint and picks float32 only when it fits "
+        "with --min-free-gib headroom, else bfloat16 (the setting the 35B "
+        "arm-E hybrid cost ran under).")
     p.add_argument("--n-linear-chunks", type=int, default=0,
                    help="Partition Linears into G memory-bounded groups "
                         "(peak ~ model + 2*model/G). 0 = auto-size from free "
@@ -731,8 +801,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # pure-text checkpoints.
     from prismaquant.build_rtn_cache import stage_multimodal
 
-    dt = torch.float32 if args.dtype == "float32" else torch.bfloat16
     staged, _cleanup = stage_multimodal(args.model)
+    if args.dtype == "auto":
+        args.dtype = _resolve_auto_dtype(staged, args.min_free_gib)
+    dt = torch.float32 if args.dtype == "float32" else torch.bfloat16
     local_only = Path(staged).exists()
     _log(f"loading {args.model} (staged={staged}) dtype={args.dtype}")
     tok = AutoTokenizer.from_pretrained(
@@ -810,6 +882,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     payload["provenance"].update({
         "model": str(args.model),
+        "dtype": str(args.dtype),
         "calib_source": (
             str(args.dataset) if args.dataset
             else f"wikitext:{args.calib_split}"),
