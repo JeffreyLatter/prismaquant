@@ -120,25 +120,40 @@ def _measure_logprobs(
 ) -> torch.Tensor:
     from vllm import SamplingParams
 
-    # Explicit vocab-size logprobs, NOT -1: some model/vLLM combinations
-    # (observed: Qwen3-4B on vllm 0.21.1rc1) silently return an EMPTY
-    # logprobs list for logprobs=-1 while an explicit count works. The
-    # _logprob_vector completeness check still guards partial returns.
-    params = SamplingParams(
-        max_tokens=1,
-        temperature=0.0,
-        logprobs=int(vocab_size),
-        detokenize=False,
-    )
+    # logprobs=-1 (full vocab) is the primary request, but some
+    # model/vLLM combinations (observed: Qwen3-4B on vllm 0.21.1rc1)
+    # silently return an EMPTY logprobs list for -1 — for those, retry
+    # with an explicit vocab-size count. The reverse also exists: with
+    # an explicit count some engines OMIT -inf (padding) tokens
+    # (observed: Qwen3.6-35B-A3B, 243 entries short), so -1 must stay
+    # the first choice. _logprob_vector's completeness check guards
+    # whichever path produced the row.
+    def _params(logprob_arg: int) -> SamplingParams:
+        return SamplingParams(
+            max_tokens=1,
+            temperature=0.0,
+            logprobs=logprob_arg,
+            detokenize=False,
+        )
+
     rows = []
     for index, prompt_ids in enumerate(prompts, 1):
         start = time.monotonic()
-        output = llm.generate(
-            [{"prompt_token_ids": prompt_ids}],
-            params,
-            use_tqdm=False,
-        )[0]
-        logprobs = output.outputs[0].logprobs[0]
+        logprobs = None
+        for logprob_arg in (-1, int(vocab_size)):
+            output = llm.generate(
+                [{"prompt_token_ids": prompt_ids}],
+                _params(logprob_arg),
+                use_tqdm=False,
+            )[0]
+            got = output.outputs[0].logprobs
+            if got and len(got) and len(got[0]):
+                logprobs = got[0]
+                break
+        if logprobs is None:
+            raise RuntimeError(
+                "vLLM returned no logprobs under either logprobs=-1 or "
+                f"logprobs={vocab_size}")
         rows.append(_logprob_vector(logprobs, vocab_size=vocab_size))
         print(
             f"[kl] sample {index}/{len(prompts)} "

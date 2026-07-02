@@ -1344,6 +1344,30 @@ def prepare_cost_context(probe_path: str,
     stats = probe["stats"]
     print(f"[cost] loaded probe stats for {len(stats)} Linears")
 
+    # Refuse pre-fix packed-expert probes: before the 2026-07-02 M3 fix the
+    # packed h_trace was sum-then-square (5-50x cross-token-covariance
+    # inflation, calibration-length dependent). Version-stamped pickles are
+    # required whenever packed-expert entries are present, so a stale
+    # probe.pkl reused via skip-if-exists cannot silently drive allocations.
+    has_packed = any(
+        isinstance(m, dict) and m.get("_packed_experts_module")
+        for m in stats.values()
+    )
+    estimator = (probe.get("meta") or {}).get("packed_fisher_estimator")
+    if has_packed and estimator != "per_token_v2":
+        if os.environ.get(
+                "PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER", "0") != "1":
+            raise SystemExit(
+                f"probe {probe_path} contains packed-expert entries but no "
+                f"packed_fisher_estimator=per_token_v2 marker (found: "
+                f"{estimator!r}) — it predates the 2026-07-02 per-token "
+                "packed-Fisher fix and its expert h_trace values are "
+                "sum-then-square inflated (5-50x). Regenerate the probe, or "
+                "set PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER=1 to accept the "
+                "biased legacy estimator.")
+        print("[cost] WARNING: accepting pre-fix sum-then-square packed "
+              "Fisher probe (PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER=1)")
+
     cache = Path(activation_cache_dir)
     if not cache.exists():
         raise SystemExit(f"activation cache {cache} does not exist")

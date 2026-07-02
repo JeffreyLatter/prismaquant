@@ -2273,6 +2273,7 @@ def run_probe_pass(model: nn.Module,
             "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
+                "packed_fisher_estimator": "per_token_v2",
                 "model": model_name,
                 "dataset": dataset_name,
                 "nsamples": calib.size(0),
@@ -2486,6 +2487,7 @@ def run_multimodal_visual_probe_pass(
             "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
+                "packed_fisher_estimator": "per_token_v2",
                 "model": model_path,
                 "dataset": dataset_name,
                 "nsamples": len(triples),
@@ -2897,6 +2899,7 @@ def run_streaming_multimodal_visual_probe_pass(
             "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
+                "packed_fisher_estimator": "per_token_v2",
                 "model": model_path,
                 "dataset": dataset_name,
                 "nsamples": successes,

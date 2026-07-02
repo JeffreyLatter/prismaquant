@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -90,6 +91,51 @@ def _maybe_clip_activations(
     if not _env_truthy("PRISMAQUANT_PROD_ACT_SCALES", default=True):
         return x
     return x.clamp(-float(max_abs), float(max_abs))
+
+
+
+def _served_nvfp4_act_qdq_enabled() -> bool:
+    """Opt-in serve-faithful NVFP4 activation emulation (default OFF).
+
+    When on, NVFP4 activation quantization in the emulation hooks models
+    the SERVED two-level semantics (static input_global_scale + FP8 snap
+    of the per-16-group block scale, via
+    format_registry.nvfp4_activation_qdq_served) instead of the dynamic
+    exact-fp32-scale RTN. Closes the M18-residual/C1 measurement gap the
+    2026-07-02 audit flagged; default-off pending a served correlation
+    study (the dynamic path is the long-standing screen baseline)."""
+    return os.environ.get(
+        "PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES", "0") == "1"
+
+
+def _activation_qdq(
+    x: torch.Tensor,
+    act_spec,
+    activation_max_abs: dict,
+    param_name: str | None,
+) -> torch.Tensor:
+    """Shared activation quantize-dequantize for the emulation hooks.
+
+    Default: act-clip to the calibrated max_abs then dynamic per-group
+    RTN (the historical screen semantics). With
+    PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES=1 and an NVFP4 act spec
+    whose calibrated max_abs is known, use the serve-faithful two-level
+    quantizer instead — NO clamp (serving does not clamp; the static
+    scale itself clips blocks above the calibration amax)."""
+    if (
+        _served_nvfp4_act_qdq_enabled()
+        and fr.canonical_format_name(act_spec.name) == "NVFP4"
+        and x.shape[-1] % 16 == 0
+    ):
+        max_abs = _activation_max_abs_lookup(activation_max_abs, param_name)
+        if max_abs is not None and max_abs > 0:
+            from prismaquant.export_native_compressed import (
+                _nvfp4_input_global_scale_from_max_abs,
+            )
+            g = _nvfp4_input_global_scale_from_max_abs(float(max_abs))
+            return fr.nvfp4_activation_qdq_served(x, g)
+    x = _maybe_clip_activations(x, activation_max_abs, param_name)
+    return act_spec.activation_quantize_dequantize(x)
 
 
 def activation_cache_filename(name: str) -> str:
@@ -899,10 +945,9 @@ class PerturbedActivationCache:
             # shipped artifact sees at runtime.  `Q(x/s)*s == Q(x)` for
             # purely dynamic Q, so the previous "pre-scale + post-multiply"
             # formulation was a no-op (codex round-3).
-            x = _maybe_clip_activations(
-                x, self._activation_scales, param_plan.name,
+            x = _activation_qdq(
+                x, act_spec, self._activation_scales, param_plan.name,
             )
-            x = act_spec.activation_quantize_dequantize(x)
         weight = self._weight_for_reference_forward(plan, param_plan)
         return F.linear(x, weight, plan.module.bias)
 
@@ -1073,10 +1118,10 @@ class PerturbedActivationCache:
                     # scales.  See ``_maybe_clip_activations`` for the
                     # math; pre-scale + post-multiply was a no-op (codex
                     # round-3 caught Q(x/s)*s == Q(x)).
-                    x_in = _maybe_clip_activations(
-                        x_runtime, self._activation_scales, member_name,
+                    x_runtime = _activation_qdq(
+                        x_runtime, act_spec, self._activation_scales,
+                        member_name,
                     )
-                    x_runtime = act_spec.activation_quantize_dequantize(x_in)
                 if x_runtime is not x:
                     args, kwargs = _replace_tensor_input(
                         args, kwargs, where, key, x_runtime,

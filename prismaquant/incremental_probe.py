@@ -3598,6 +3598,11 @@ def main():
         _merged = pickle.load(_f)
     _meta = dict(_merged.get("meta", {}))
     _meta["calibration_modality"] = args.calibration_modality
+    # Estimator provenance: packed-expert h_trace is the per-token
+    # estimator since the 2026-07-02 M3 fix (pre-fix pickles carry the
+    # sum-then-square 5-50x inflated values and are refused by
+    # prepare_cost_context unless explicitly allowed).
+    _meta["packed_fisher_estimator"] = "per_token_v2"
     _merged["meta"] = _meta
     with open(args.output, "wb") as _f:
         pickle.dump(_merged, _f)

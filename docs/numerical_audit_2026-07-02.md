@@ -513,10 +513,26 @@ operationally:
    reproduces the historical objective. 27B-class target confirmation is
    ladder debt (damp-1.0 precedent). AURA (COST_MODE=aura) unaffected.
    Evidence: `/home/rob/dq-runs/m6-cost-ab-20260702/`.
-2. §3.8 RNE tie alignment across RTN paths (byte-changing, measure first).
-3. Registry NVFP4 activation emulation modeling the static global + FP8 snap
-   (M18-residual; the C1 fix shrinks the gap this causes, re-evaluate after
-   the C1 served A/B).
+2. §3.8 RNE tie alignment across RTN paths. **CLOSED as WONTFIX
+   (2026-07-02):** exact codebook midpoints are ~0.04% of bf16 elements;
+   every tie carries equal |error| in either direction, so any alignment
+   is per-element MSE-neutral by construction — there is no objective
+   gain to chase, and flipping ties changes shipped bytes for zero
+   expected benefit. Each path is internally self-consistent; the only
+   real cost is compiled-vs-eager bit-reproducibility, which is now
+   documented at the `_make_rtn` docstring. Revisit only if a served
+   effect is ever measured.
+3. Registry NVFP4 activation emulation modeling the static global + FP8
+   snap (M18-residual). **LEVER LANDED (2026-07-02):**
+   `PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES=1` switches the
+   perturbed-X emulation hooks to `nvfp4_activation_qdq_served` — the
+   serve-faithful two-level quantizer (static `input_global_scale` from
+   the calibrated max_abs, honoring the C1 flag, + FP8 snap of the block
+   scale, including block-zeroing and above-amax clipping), verified
+   against an independent reference implementation of vLLM's
+   `ref_nvfp4_quant` math incl. both G conventions. Default OFF pending
+   a served correlation study — the dynamic path is the long-standing
+   screen baseline and all historical screen numbers are on it.
 
 ## 6. Recommended sequencing (original — superseded by §6a)
 
