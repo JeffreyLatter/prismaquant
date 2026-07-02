@@ -18,6 +18,7 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_DIRECT_CUDA_LOAD` | **on** | Pass `device=cuda:N` to `safetensors.safe_open` so layer tensors land on the GPU directly instead of going through a host stage. ~10-30 ms saved per layer load. Falls back transparently if safetensors complains. |
 | `PRISMAQUANT_COST_PREFETCH_ACT` | **on** | `measure_batched_gpu` prefetches chunk N+1's activation files on a thread pool while chunk N runs on the GPU. Hides ~30-40% of the cost step's wall on big models. |
 | `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` | `0` | Probe guard override for KV-sharing architectures (e.g. Gemma4 `k_eq_v` layers): by default the probe fails fast when KV-shared Linears would receive aliased Fisher mass; set `1` to probe anyway, accepting the shared-gradient double-count. |
+| `PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER` | `0` | Probe guard override for packed-MoE experts whose compute is NOT a per-expert `F.linear(x, packed[e])` (e.g. bmm/grouped-mm): the per-token Fisher interception cannot capture them, and by default the probe fails fast rather than fall back to squaring the token-summed weight gradient (the sum-then-square estimator, audit M3: 5-50× cross-token-covariance inflation). Set `1` to accept the biased legacy estimator. |
 | `PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR` | **archived** | Historical Fisher row-weighted allocator objective. The production pipeline rejects it; archive context lives under `archive/fisher_2026-05-15/`. |
 | `PRISMAQUANT_FISHER_OUTPUT_MSE_ROW_WEIGHT_CLIP` | archived companion | Historical cap for Fisher output-MSE allocation; not used by the production pipeline. |
 
@@ -31,8 +32,10 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING` | `0` | Research lever: score NVFP4 scale candidates under the FP8-snapped effective scale with a per-tensor global fixed point. More serve-faithful in principle but changes shipped NVFP4 bytes for `joint_mse`/`four_over_six` — default OFF pending a served gold-metric A/B. Recorded in the export fingerprint. |
 | `PRISMAQUANT_COST_UCB_Z` | `0` | Risk-aware allocation: charge `z·predicted_dloss_stderr` on top of each AURA cost row (upper-confidence-bound). `0` = bit-identical legacy behavior. The 27B A/B found point-KL parity with z=2; UCB's case is allocation stability across probe seeds (−15% seed-Hamming at 4B), pending the production-calib seed-stability decision. |
 | `PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN` | `0` | Research/A-B escape hatch: allows non-BF16 packed-MoE experts to skip the production-cache GPTQ render and export RTN bytes. Never use for a production artifact. |
+| `PRISMAQUANT_ALLOW_UNSCALED_FP8` | `0` | Streaming-load guard override: by default a float8-dtyped checkpoint tensor with no entry in the fp8 scale-inv map fails fast (loading raw FP8 codes as if they were weights is the historical ±448-range corruption). Set `1` to permit the raw cast anyway (debug only). |
 | `PRISMAQUANT_EXPERT_LAZY_FILL` | **on** | M4 frontier expert selection: `validate_assignments_kl` lazily renders a Pareto point's missing packed-expert entries (e.g. FP8) into the shared frontier cache just before scoring, on the BUILD/render calib split, then re-pickles the cache so recache/export ship the same bytes real KL selected. The format-menu build eager-renders only the NVFP4 rung. `0` restores the legacy hard-fail on expert cache misses. |
-| `PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE` | **on** | M19: NVFP4 export re-derives block scales from the cached production render using the SAME scale rule the render chose (`joint_mse` under JSO), instead of re-quantizing the bf16 dequant with `static_6`. Served-validated −6.6% KL / −3.3% PPL on the 4B paired A/B. `0` reproduces pre-M19 artifacts. |
+| `PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE` | **on** | M19: NVFP4 export re-derives block scales from the cached production render using the SAME scale rule the render chose (`joint_mse` under JSO), instead of re-quantizing the bf16 dequant with `static_6`. Served-validated −6.6% KL / −3.3% PPL on the 4B paired A/B. Since the 2026-07-02 audit (M2) this also covers packed-expert re-pack and the fused joint-global pre-passes (rule = the cache's recorded `nvfp4_scale_rule` lever; env default when nothing is recorded). `0` reproduces pre-M19 artifacts. |
+| `PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE` | **on** | C1 (2026-07-02 audit): NVFP4 `input_global_scale` uses the compressed-tensors/vLLM `generate_gparam` convention `448·6/amax` (FP8_E4M3 max × FP4_E2M1 max), so serve-time FP8-stored activation block scales span the whole FP8 range. The legacy `6/amax` value was 448× below convention — activation blocks with amax ≫64× below the calibration amax got subnormal FP8 scales, and ~1024× below rounded to 0 (vLLM zeroes the block). `0` reproduces historical artifact bytes. Serving-metric impact unmeasured pending a paired served A/B (M19 discipline). |
 | `PRISMAQUANT_GPTQ_DAMP_ROLES` | unset | Per-role GPTQ damp override, e.g. `qkv=1.0,o_proj=1.0,gate_up=0.3,down=3.0`. Default-off research lever (the 2026-06-22 per-role served A/B was NULL; fixed damp 1.0 is final). Unlisted roles keep the fixed damp. |
 | `PRISMAQUANT_STRICT_ASSIGNMENT_COVERAGE` | **on** | Export/build coverage guard for assignment-required production-cache entries. Missing non-BF16 renders fail early instead of falling through to RTN or late materialization errors. |
 | `PRISMAQUANT_STRICT_PRODUCTION_CACHE` | **on** | KL/activation-cache residency guard. Missing required production-cache weights fail fast by default; set `0` only for explicit legacy/non-production fallback runs. |
@@ -101,6 +104,7 @@ PRISMAQUANT_ACT_CLIP_QUANTILE
 PRISMAQUANT_ALLOW_KV_SHARED_FISHER
 PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN
 PRISMAQUANT_ALLOW_PYTORCH_FALLBACK
+PRISMAQUANT_ALLOW_UNSCALED_FP8
 PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE
 PRISMAQUANT_BATCHED_NVFP4_EXPORT
 PRISMAQUANT_BLOCK_OUTPUT_MATCH
@@ -168,6 +172,7 @@ PRISMAQUANT_MXFP8_JOINT_SCALE_SHIFTS
 PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS
 PRISMAQUANT_NVFP4_FUSED_JIT_WARMUP
 PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE
+PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE
 PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_GRID
 PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_SPAN_HI
 PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_SPAN_LO
