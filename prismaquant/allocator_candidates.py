@@ -633,17 +633,34 @@ def _scan_source_dtype_manifest(
                         weight_map.setdefault(key, shard.name)
             except Exception:
                 continue
+    # Packed-MoE expert params are checkpoint keys with NO ``.weight``
+    # suffix (LFM2.5 packed, Qwen3.6-35B: ``...experts.gate_up_proj``).
+    # Without classifying them the manifest has no source kind for the
+    # packed recipe names the allocator costs, and the BF16 passthrough is
+    # dropped (source_dtype_mismatch) on a BF16 source — an expert-menu
+    # completeness bug. (Per-expert INDEXED layouts store 2-D ``.weight``
+    # keys and classify their own recipe names via the normal path.)
+    import re as _re
+    _packed_leaf_re = _re.compile(
+        r"\.experts\.(?:gate_up_proj|down_proj|gate_proj|up_proj|w1|w2|w3)$"
+    )
     bases: dict[str, set[str]] = {}
+    packed_bases: set[str] = set()
     for key in weight_map:
+        matched = False
         for suffix in (".weight_scale_inv", ".weight_scale", ".weight"):
             if key.endswith(suffix):
                 base = key[: -len(suffix)]
                 bases.setdefault(base, set()).add(suffix[1:])
+                matched = True
                 break
+        if not matched and _packed_leaf_re.search(key):
+            bases.setdefault(key, set()).add("weight")
+            packed_bases.add(key)
     weight_dtypes: dict[str, str] = {}
     shard_keys: dict[str, list[str]] = defaultdict(list)
     for key, shard in weight_map.items():
-        if not key.endswith(".weight"):
+        if not (key.endswith(".weight") or key in packed_bases):
             continue
         path = src / str(shard)
         if path.is_file():
@@ -652,8 +669,12 @@ def _scan_source_dtype_manifest(
         try:
             with safe_open(path, framework="pt", device="cpu") as sf:
                 for key in keys:
+                    base = (
+                        key[:-len(".weight")]
+                        if key.endswith(".weight") else key
+                    )
                     try:
-                        weight_dtypes[key[:-len(".weight")]] = str(
+                        weight_dtypes[base] = str(
                             sf.get_slice(key).get_dtype()
                         ).upper()
                     except Exception:
@@ -696,6 +717,22 @@ def _scan_source_dtype_manifest(
             return "model." + ck_base[len("model.language_model."):]
         return ck_base
 
+    def _packed_to_recipe_name(ck_key: str) -> str:
+        # Packed expert params have no ``.weight`` to fabricate for
+        # checkpoint_to_live_name; checkpoint name == live name modulo the
+        # language_model prefix, then the profile's live->recipe mapping.
+        name = ck_key
+        if name.startswith("model.language_model."):
+            name = "model." + name[len("model.language_model."):]
+        if profile is not None:
+            recipe_mapper = getattr(profile, "live_to_recipe_name", None)
+            if callable(recipe_mapper):
+                try:
+                    return str(recipe_mapper(name))
+                except Exception:
+                    return name
+        return name
+
     manifest: dict[str, str] = {}
     for base, suffixes in bases.items():
         if "weight" not in suffixes:
@@ -711,7 +748,10 @@ def _scan_source_dtype_manifest(
             source_kind = "bf16"
         else:
             source_kind = "other"
-        recipe_name = _to_recipe_name(base)
+        recipe_name = (
+            _packed_to_recipe_name(base) if base in packed_bases
+            else _to_recipe_name(base)
+        )
         if not recipe_name:
             continue
         manifest[recipe_name] = source_kind

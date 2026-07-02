@@ -174,6 +174,36 @@ def test_lazy_gap_fill_persists_to_cache_pkl(tmp_path):
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_source_dtype_manifest_classifies_packed_expert_params(tmp_path):
+    # Packed expert checkpoint keys carry NO .weight suffix; without direct
+    # classification the allocator drops the BF16 passthrough for every
+    # expert on a BF16 source (menu-completeness bug found in the LFM2.5
+    # smoke: 44 tensors 'source_dtype_mismatch').
+    from safetensors.torch import save_file
+    from prismaquant.allocator_candidates import _scan_source_dtype_manifest
+
+    save_file(
+        {
+            "model.layers.0.feed_forward.experts.gate_up_proj":
+                torch.randn(2, 8, 4, dtype=torch.bfloat16),
+            "model.layers.0.feed_forward.experts.down_proj":
+                torch.randn(2, 4, 4, dtype=torch.bfloat16),
+            "model.layers.0.self_attn.q_proj.weight":
+                torch.randn(4, 4, dtype=torch.bfloat16),
+            "model.layers.0.self_attn.k_proj.weight":
+                torch.randn(4, 4, dtype=torch.float32),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    manifest = _scan_source_dtype_manifest(str(tmp_path), profile=None)
+    assert manifest[
+        "model.layers.0.feed_forward.experts.gate_up_proj"] == "bf16"
+    assert manifest[
+        "model.layers.0.feed_forward.experts.down_proj"] == "bf16"
+    assert manifest["model.layers.0.self_attn.q_proj"] == "bf16"
+    assert manifest["model.layers.0.self_attn.k_proj"] == "other"
+
+
 # ---------------------------------------------------------------------------
 # recache preserves packed-expert scales (Fix B)
 # ---------------------------------------------------------------------------
