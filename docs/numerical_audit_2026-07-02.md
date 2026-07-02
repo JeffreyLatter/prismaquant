@@ -520,9 +520,19 @@ operationally:
    - Qwen3-0.6B: pooled KL **−58.5%** (35/40, t=−2.39, 5/5 draws), PPL
      45.20→34.16 (**−24.4%**).
    Default flipped to `weight_mse` (run-pipeline.sh); `output_mse`
-   reproduces the historical objective. 27B-class target confirmation is
-   ladder debt (damp-1.0 precedent). AURA (COST_MODE=aura) unaffected.
+   reproduces the historical objective. AURA (COST_MODE=aura) unaffected.
    Evidence: `/home/rob/dq-runs/m6-cost-ab-20260702/`.
+   **27B ladder debt DISCHARGED (same day):** staged two-arm Qwen3.6-27B
+   run (shared 8×1024 probe + render-score cache; 12.7% allocation
+   churn), 5 window draws + 32k PPL: pooled KL **−19.2%** for weight_mse
+   but NOT decisive (t=−1.32; 3/5 draws favorable, mean driven by the
+   heaviest windows, median slightly favors legacy, 23/40 paired wins);
+   32k PPL 8.421→8.315 (**−1.25%** better). Verdict: weight_mse
+   PRESERVES-to-slightly-improves at target scale and wins decisively at
+   small scale — promotion stands (damp-1.0 null-A/B precedent). The M6
+   bias magnitude shrinks with scale/quality: cost mis-ranking matters
+   most in the bit-starved high-damage regime.
+   Evidence: `/home/rob/dq-runs/m6-27b-confirm-20260702/`.
 2. §3.8 RNE tie alignment across RTN paths. **CLOSED as WONTFIX
    (2026-07-02):** exact codebook midpoints are ~0.04% of bf16 elements;
    every tie carries equal |error| in either direction, so any alignment
