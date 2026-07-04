@@ -852,6 +852,21 @@ def install_packed_expert_hooks(
         if not param_names:
             continue
 
+        # transformers 5.x dispatches the packed-experts forward through an
+        # MoE interface (`config._experts_implementation`, e.g. batched_mm /
+        # grouped_mm) that consumes the packed weight via an advanced-index
+        # gather + a batched matmul — there is no per-expert `F.linear(x,
+        # packed[e])` boundary, so the per-token Fisher interception below
+        # never sees the weight and the fail-fast guard in
+        # `_PackedWeightGradFallback` trips (audit M3). Force the reference
+        # "eager" per-expert implementation for the probe forward: it is the
+        # same math, just the interceptable kernel, so the captured Fisher is
+        # faithful. No-op on transformers builds without the MoE interface
+        # (older per-expert layouts) — the attribute is simply absent.
+        _cfg = getattr(module, "config", None)
+        if _cfg is not None and hasattr(_cfg, "_experts_implementation"):
+            _cfg._experts_implementation = "eager"
+
         # Idempotent re-bind path. The sentinel holds a reference to the
         # mutable accumulator dict that patched_forward writes to. We
         # rebind it (clear contents and adopt the new dict's identity by

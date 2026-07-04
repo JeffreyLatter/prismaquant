@@ -24,9 +24,14 @@ def _lfm_pat():
 
 
 def _pack(out, prof, pat, live_shapes):
+    # Mirror the production predicate (_build_expert_packer): match the raw
+    # checkpoint key or its remap to vLLM scheme-dispatch naming, so both
+    # checkpoint-named and multimodal specs are handled.
+    def is_per_expert(name):
+        return bool(pat.match(name)) or bool(pat.match(prof.to_vllm_internal_name(name)))
     return _pack_per_expert_into_packed(
         out,
-        per_expert_re=pat,
+        is_per_expert=is_per_expert,
         parent_for_projection=prof.packed_expert_parent_for_projection,
         projection_names_for=prof.packed_expert_projection_names,
         live_param_shape=live_shapes.get,
@@ -132,3 +137,39 @@ def test_missing_expert_fails_loud():
         assert "missing expert" in str(e)
     else:
         raise AssertionError("expected ValueError on missing expert")
+
+
+def test_multimodal_naming_qwen35():
+    """Regression: multimodal specs author `per_expert_regex` in vLLM
+    scheme-dispatch naming (`language_model.model.layers.*`) while the
+    checkpoint/`out` keys are in HF naming (`model.language_model.layers.*`).
+    The bridge must still detect + pack per-expert tensors via the profile's
+    name remap. This is the Ornith-1.0-35B (Qwen3.5-MoE, per-expert on disk)
+    case; Qwen3.6-35B-A3B shipped packed so it never exercised this path."""
+    from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
+    prof = Qwen3_5Profile()
+    regex = prof.per_expert_moe_regex()
+    pat = re.compile(regex[len("re:"):] if regex.startswith("re:") else regex)
+    E, I, H = 3, 4, 8  # experts, moe_intermediate, hidden
+    blk = "model.language_model.layers.0.mlp.experts"  # HF checkpoint naming
+    out, gates, ups, downs = {}, {}, {}, {}
+    for i in range(E):
+        g, u, d = torch.randn(I, H), torch.randn(I, H), torch.randn(H, I)
+        out[f"{blk}.{i}.gate_proj.weight"] = g
+        out[f"{blk}.{i}.up_proj.weight"] = u
+        out[f"{blk}.{i}.down_proj.weight"] = d
+        gates[i], ups[i], downs[i] = g, u, d
+    live = {f"{blk}.gate_up_proj": (E, 2 * I, H), f"{blk}.down_proj": (E, H, I)}
+    n = _pack(out, prof, pat, live)
+    assert n == 2, f"expected 2 packed params, got {n}"
+    # per-expert keys consumed, packed keys inserted
+    assert not any(".experts.0." in k for k in out)
+    gu = out[f"{blk}.gate_up_proj"]
+    dp = out[f"{blk}.down_proj"]
+    assert tuple(gu.shape) == (E, 2 * I, H)
+    assert tuple(dp.shape) == (E, H, I)
+    # gate on top, up on bottom, experts stacked in index order
+    for i in range(E):
+        assert torch.allclose(gu[i, :I], gates[i])
+        assert torch.allclose(gu[i, I:], ups[i])
+        assert torch.allclose(dp[i], downs[i])

@@ -543,6 +543,12 @@ def main(argv: list[str] | None = None) -> int:
         args.model,
         entrypoint="production-recache",
     )
+    # Per-expert-on-disk MoE loaded via a text-only modeling class leaves the
+    # packed experts zero-initialized (from_pretrained can't pack them); restore
+    # from source so the activation max-abs recapture (incl. the down_proj input
+    # scale) reflects the real routed-expert output. No-op if already loaded.
+    from .layer_streaming import fill_packed_experts_from_source
+    fill_packed_experts_from_source(model, args.model, profile, progress=True)
     max_abs = recache_production_weight_cache(
         model,
         calib_ids,

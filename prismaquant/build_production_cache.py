@@ -437,6 +437,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.model,
             entrypoint="build-prod-cache",
         )
+        # Per-expert-on-disk MoE loaded through a text-only modeling class
+        # (e.g. qwen3_5_moe_text) whose WeightsMapper doesn't pack experts:
+        # from_pretrained leaves the packed params zero. Restore them from the
+        # source so activation-scale calibration (esp. the down_proj input
+        # scale, derived from the expert weights) sees the real experts.
+        # No-op when experts already loaded correctly.
+        from .layer_streaming import fill_packed_experts_from_source
+        fill_packed_experts_from_source(model, args.model, profile, progress=True)
         skip_tokens = list(
             args.skip_qnames
             if args.skip_qnames is not None

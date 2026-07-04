@@ -20,6 +20,7 @@ import json
 import os
 import re
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -606,7 +607,7 @@ def _materialize(model: nn.Module, prefixes: list[str],
 def _pack_per_expert_into_packed(
     out: dict[str, torch.Tensor],
     *,
-    per_expert_re: "re.Pattern",
+    is_per_expert,
     parent_for_projection,
     projection_names_for,
     live_param_shape,
@@ -636,7 +637,7 @@ def _pack_per_expert_into_packed(
     consumed: list[str] = []
     for key, t in out.items():
         name = key[:-len(".weight")] if key.endswith(".weight") else key
-        if not per_expert_re.match(name):
+        if not is_per_expert(name):
             continue
         head, proj = name.rsplit(".", 1)           # head = …experts.{idx}
         experts_path, idx_str = head.rsplit(".", 1)
@@ -708,9 +709,23 @@ def _build_expert_packer(model: nn.Module, weight_ckpt: dict[str, str]):
         return None
     pat = re.compile(regex[len("re:"):] if regex.startswith("re:") else regex)
 
+    # `out`/`weight_ckpt` keys are in HF checkpoint naming, but specs author
+    # `per_expert_regex` in whichever convention suits their export
+    # config_groups catch-all: text-only MoE specs use checkpoint naming
+    # (`^model.layers.*`), while multimodal specs use vLLM scheme-dispatch
+    # naming (`^language_model.model.layers.*`, a prefix swap from the on-disk
+    # `model.language_model.layers.*`). Match against the raw key OR its
+    # remap through the profile's own name remapper, so per-expert detection
+    # works under either convention with no architecture names here and no
+    # regression for checkpoint-named specs.
+    def _match_per_expert(name: str) -> bool:
+        if pat.match(name):
+            return True
+        return bool(pat.match(prof.to_vllm_internal_name(name)))
+
     def _is_per_expert(k: str) -> bool:
         name = k[:-len(".weight")] if k.endswith(".weight") else k
-        return bool(pat.match(name))
+        return _match_per_expert(name)
 
     if not any(_is_per_expert(k) for k in weight_ckpt):
         return None  # checkpoint already packed — nothing to do
@@ -724,13 +739,133 @@ def _build_expert_packer(model: nn.Module, weight_ckpt: dict[str, str]):
     def _packer(out):
         _pack_per_expert_into_packed(
             out,
-            per_expert_re=pat,
+            is_per_expert=_match_per_expert,
             parent_for_projection=prof.packed_expert_parent_for_projection,
             projection_names_for=prof.packed_expert_projection_names,
             live_param_shape=live_shapes.get,
         )
 
     return _packer
+
+
+def fill_packed_experts_from_source(
+    model: nn.Module,
+    source_model_path: str,
+    profile=None,
+    *,
+    progress: bool = False,
+) -> int:
+    """Fill zero-initialized packed-expert params from the source per-expert
+    safetensors.
+
+    Some architectures (e.g. Qwen3.5-MoE) have a text-only modeling class
+    (``qwen3_5_moe_text`` / ``…ForCausalLM``) that lacks the per-expert->packed
+    WeightsMapper the multimodal class provides. When a per-expert-on-disk
+    checkpoint is loaded through that text-only class (as the render/recache
+    calibration paths do after ``stage_text_only``), the packed params
+    (``…experts.gate_up_proj`` / ``…experts.down_proj``) load MISSING ->
+    newly-initialized (zero), silently breaking every activation-scale
+    calibration that depends on the routed-expert output.
+
+    This restores them by reading the per-expert source tensors and packing
+    them into the live params via the same tested bridge
+    (``_pack_per_expert_into_packed``). Idempotent and safe:
+
+      * no-op when the checkpoint is already packed, the live module is
+        per-expert, or the packed params already carry non-zero weights
+        (so it never touches a correctly-loaded model);
+      * every structural decision comes from the model profile — no
+        architecture names here.
+
+    Returns the number of packed params filled. Call right after
+    ``from_pretrained`` on the calibration model.
+    """
+    try:
+        from .model_profiles import profile_from_model
+        prof = profile or profile_from_model(model)
+    except Exception:
+        return 0
+    # Local import: sensitivity_probe imports from this module, so import the
+    # packed-experts detector lazily to avoid a circular import at module load.
+    from .sensitivity_probe import _is_packed_experts_module
+    packed_names = prof.packed_expert_param_names()
+    regex = prof.per_expert_moe_regex()
+    if not packed_names or not regex:
+        return 0
+    pat = re.compile(regex[len("re:"):] if regex.startswith("re:") else regex)
+
+    def _is_per_expert(name: str) -> bool:
+        if pat.match(name):
+            return True
+        return bool(pat.match(prof.to_vllm_internal_name(name)))
+
+    src = Path(source_model_path)
+    idx_path = src / "model.safetensors.index.json"
+    if not idx_path.exists():
+        return 0
+    import json as _json
+    weight_map = _json.loads(idx_path.read_text())["weight_map"]
+
+    filled = 0
+    for qname, mod in model.named_modules():
+        if not _is_packed_experts_module(mod, prof):
+            continue
+        # Skip when already populated — never disturb a correct load.
+        live_params = {
+            pn: getattr(mod, pn) for pn in packed_names if hasattr(mod, pn)
+        }
+        if not live_params:
+            continue
+        any_pname = next(iter(live_params))
+        p0 = live_params[any_pname]
+        if p0.is_meta:
+            continue
+        if float(p0.detach().abs().max().item()) > 0.0:
+            continue  # already loaded non-zero
+
+        # Source prefix for this module's per-expert tensors.
+        src_prefix = prof.source_tensor_name(qname)
+        out: dict[str, torch.Tensor] = {}
+        by_shard: dict[str, list[str]] = defaultdict(list)
+        for k in weight_map:
+            if not k.startswith(src_prefix + "."):
+                continue
+            name = k[:-len(".weight")] if k.endswith(".weight") else k
+            if _is_per_expert(name):
+                by_shard[weight_map[k]].append(k)
+        if not by_shard:
+            continue
+        target_dtype = p0.dtype
+        for shard, keys in by_shard.items():
+            with safe_open(str(src / shard), framework="pt") as f:
+                for k in keys:
+                    out[k] = f.get_tensor(k).to(target_dtype)
+        live_shapes = {
+            f"{src_prefix}.{pn}": tuple(p.shape)
+            for pn, p in live_params.items()
+        }
+        n = _pack_per_expert_into_packed(
+            out,
+            is_per_expert=_is_per_expert,
+            parent_for_projection=prof.packed_expert_parent_for_projection,
+            projection_names_for=prof.packed_expert_projection_names,
+            live_param_shape=live_shapes.get,
+        )
+        if n == 0:
+            continue
+        for pn, p in live_params.items():
+            packed_key = f"{src_prefix}.{pn}"
+            t = out.get(packed_key)
+            if t is None:
+                continue
+            with torch.no_grad():
+                p.data.copy_(t.to(device=p.device, dtype=p.dtype))
+            filled += 1
+        del out
+    if progress and filled:
+        print(f"[fill-experts] filled {filled} packed-expert params from source "
+              f"(text-only load left them zero-initialized)", flush=True)
+    return filled
 
 
 def _read_layer_to_device(prefix: str,
