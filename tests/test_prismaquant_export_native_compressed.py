@@ -752,7 +752,15 @@ class TestRoundTrip(unittest.TestCase):
             "INT8_W8A16": "registered allocator research format; no native exporter metadata path",
             "INT4_W4A16_g128": "registered allocator research format; no native exporter metadata path",
         }
-        self.assertEqual(set(fr.REGISTRY), reconciled | set(explicit_gaps))
+        gguf_lane = {
+            # Served via the GGUF container (export_gguf), not
+            # compressed-tensors; rendered==served equivalence is pinned
+            # bit-exact against gguf-py in tests/test_gguf_formats.py.
+            "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0",
+        }
+        self.assertEqual(
+            set(fr.REGISTRY), reconciled | set(explicit_gaps) | gguf_lane
+        )
 
     def test_registry_render_dequant_matches_served_metadata(self):
         W = torch.randn(8, 128) * 1.75
@@ -762,6 +770,10 @@ class TestRoundTrip(unittest.TestCase):
             for fmt in sorted(fr.REGISTRY):
                 with self.subTest(fmt=fmt):
                     if fmt in {"MXFP6_E3M2", "MXFP6_E2M3", "INT8_W8A16", "INT4_W4A16_g128"}:
+                        continue
+                    if fr.get_format(fmt).family == "gguf":
+                        # GGUF-container formats: rendered==served is pinned
+                        # bit-exact in tests/test_gguf_formats.py.
                         continue
 
                     if fmt in {"NVFP4", "NVFP4A16"}:

@@ -29,6 +29,7 @@ dependencies = [
     "datasets>=3.0",
     "accelerate>=0.30",
     "compressed-tensors>=0.15",
+    "gguf>=0.17",
     "tqdm",
 ]
 

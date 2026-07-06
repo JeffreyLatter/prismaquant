@@ -1,0 +1,30 @@
+{
+  "schema": "prismaquant.serving_profile.v1",
+  "id": "gguf",
+  "runtime": "llama_cpp_or_vllm_gguf",
+  "description": "GGUF container lane: llama.cpp-native serving, plus vLLM via the in-tree (<=0.19) or vllm-gguf-plugin (>=0.23) GGUF path. One container, one kernel family: only ggml tensor types are expressible, so the non-GGUF quantized formats are structurally unavailable rather than policy-denied.",
+  "format_rules": [
+    {
+      "id": "gguf_container_formats",
+      "allow_formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "BF16"],
+      "reason": "profile_mismatch",
+      "detail": "GGUF artifacts can only carry ggml tensor types; K-quants Q2_K..Q6_K + Q8_0 have CUDA MMQ/MMVQ/fused-MoE kernels in both llama.cpp and the vLLM GGUF path, BF16 is the unquantized passthrough (written as BF16/F16 tensor). IQ formats stay research-only until their slower prefill path (MMVQ/Triton, no MMQ) passes a serving perf gate."
+    }
+  ],
+  "shape_rules": [
+    {
+      "id": "kquant_superblock_shape",
+      "formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"],
+      "in_features_multiple_of": 256,
+      "reason": "kernel_shape",
+      "detail": "GGUF k-quants pack 256-element superblocks along the input dim"
+    },
+    {
+      "id": "q8_0_block_shape",
+      "formats": ["Q8_0"],
+      "in_features_multiple_of": 32,
+      "reason": "kernel_shape",
+      "detail": "Q8_0 packs 32-element blocks along the input dim"
+    }
+  ]
+}

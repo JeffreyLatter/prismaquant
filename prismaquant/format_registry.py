@@ -32,6 +32,7 @@ from prismaquant.fp8_dynamic import (
     fp8_dynamic_activation_qdq_vllm,
     fp8_dynamic_weight_qdq,
 )
+from prismaquant.gguf_formats import make_gguf_qdq
 from prismaquant.mx_formats import (
     e8m0_to_scale,
     mxfp8_e4m3_activation_qdq_vllm,
@@ -796,6 +797,58 @@ register_format(FormatSpec(
     quantize_dequantize=lambda w: w.clone(),
     activation_quantize_dequantize=lambda x: x.clone(),
 ))
+
+
+# GGUF k-quants (llama.cpp / vLLM-GGUF serving lane) — two-tier superblock
+# formats along the input dim: fp16 super-scale(s) per 256 + quantized
+# per-sub-block scales (and mins for the asymmetric types). The single-tier
+# (weight_bits, group_size, scale_bits) fields below are chosen so
+# effective_bits_for_shape reproduces the exact fixed GGUF bpw:
+# type_size*8/block_size (Q2_K 2.625, Q3_K 3.4375, Q4_K 4.5, Q5_K 5.5,
+# Q6_K 6.5625, Q8_0 8.5) — scale_bits carries ALL non-element bytes of the
+# superblock (sub-scales + mins + fp16 d/dmin), so the accounting is exact
+# for shapes the legality gate admits (in_features % block == 0).
+#
+# quantize_dequantize routes through prismaquant.gguf_formats, whose field
+# quantizers also feed the export byte packers — emulation and shipped
+# bytes share one math path by construction. Activation emulation models
+# the ggml MMQ/MMVQ compute path (activations quantized to Q8_1: per-32
+# symmetric int8); the dequant fallback path is fp16 and strictly better,
+# so the emulation is the conservative bound.
+def _gguf_autoround(name: str, bits: int, gsize: int):
+    return dict(
+        bits=bits, group_size=gsize, sym=True, data_type="gguf",
+        gguf_type=name, act_bits=8, act_group_size=32, act_sym=True,
+        act_data_type="int", act_dynamic=True,
+    )
+
+
+def _make_gguf_spec(name: str, weight_bits: int, group_size: int,
+                    scale_bits: int) -> FormatSpec:
+    return FormatSpec(
+        name=name,
+        weight_bits=weight_bits, group_size=group_size,
+        scale_bits=scale_bits, scale_dtype_name="kquant_two_tier",
+        weight_element_dtype=f"gguf_{name.lower()}",
+        act_bits=8, act_dtype_name="int8_q8_1", act_group_size=32,
+        family="gguf", min_capability_sm=60,
+        autoround_config=(
+            lambda name=name, weight_bits=weight_bits, group_size=group_size:
+            _gguf_autoround(name, weight_bits, group_size)
+        ),
+        quantize_dequantize=make_gguf_qdq(name),
+        activation_quantize_dequantize=(
+            lambda x: _rtn_uniform_int(x, 8, 32, symmetric=True)
+        ),
+    )
+
+
+register_format(_make_gguf_spec("Q2_K", 2, 256, 160))   # 84 B / 256 = 2.625
+register_format(_make_gguf_spec("Q3_K", 3, 256, 112))   # 110 B / 256 = 3.4375
+register_format(_make_gguf_spec("Q4_K", 4, 256, 128))   # 144 B / 256 = 4.5
+register_format(_make_gguf_spec("Q5_K", 5, 256, 128))   # 176 B / 256 = 5.5
+register_format(_make_gguf_spec("Q6_K", 6, 256, 144))   # 210 B / 256 = 6.5625
+register_format(_make_gguf_spec("Q8_0", 8, 32, 16))     # 34 B / 32 = 8.5
 
 
 def list_formats(family: str | None = None) -> list[FormatSpec]:
