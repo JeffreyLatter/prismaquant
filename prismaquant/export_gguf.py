@@ -142,6 +142,21 @@ def _map_assignment_to_gguf(
     return gguf_formats, unmatched
 
 
+def _load_act_inputs(act_dir: str | Path,
+                     hf_qname: str | None) -> torch.Tensor | None:
+    """Full fp32 calibration activations for one Linear, or None."""
+    if hf_qname is None:
+        return None
+    p = Path(act_dir) / (hf_qname.replace(".", "__") + ".pt")
+    if not p.exists():
+        return None
+    blob = torch.load(p, map_location="cpu", weights_only=False)
+    inputs = blob.get("inputs") if isinstance(blob, dict) else None
+    if inputs is None or inputs.ndim != 2:
+        return None
+    return inputs.float()
+
+
 def build_imatrix_from_act_cache(act_dir: str | Path) -> dict[str, torch.Tensor]:
     """Per-input-column importance (mean squared activation) per Linear,
     from the pipeline's activation cache — llama.cpp imatrix semantics,
@@ -169,6 +184,7 @@ def export_gguf(
     imatrix: dict[str, torch.Tensor] | None = None,
     device: str | None = None,
     allow_imatrix_gaps: bool = False,
+    gptq_act_dir: str | Path | None = None,
 ) -> dict[str, int]:
     if device is None:
         # GPU-first: the weighted scale search is the export hot path.
@@ -218,6 +234,14 @@ def export_gguf(
     if output_format is not None:
         gguf_fmt_map.setdefault("output.weight", output_format)
 
+    hf_by_gguf: dict[str, str] = {}
+    if gptq_act_dir is not None:
+        nm = _tensor_name_map(arch_name, n_layers)
+        for hf_qname in assignment:
+            gname = nm.get_name(hf_qname)
+            if gname is not None:
+                hf_by_gguf[gname + ".weight"] = hf_qname
+
     if imatrix is not None and not imatrix:
         raise ValueError(
             "imatrix requested but empty — the act-cache dir is missing, "
@@ -265,7 +289,23 @@ def export_gguf(
                 else:
                     counts["imatrix_fallback"] += 1
                     imatrix_fallback_names.append(tensor.name)
-            packed = gguf_pack(w, fmt, col_weights=qw)
+            acts = None
+            if gptq_act_dir is not None and w.ndim == 2:
+                acts = _load_act_inputs(gptq_act_dir,
+                                        hf_by_gguf.get(tensor.name))
+            if acts is not None:
+                # GPTQ under the frozen two-tier scales: same fields
+                # contract, only q is re-decided with OBS propagation.
+                from prismaquant.gguf_formats import gguf_pack_fields
+                from prismaquant.gguf_gptq import gptq_fields
+
+                fields = gptq_fields(
+                    w, fmt, acts.to(w.device), col_weights=qw,
+                )
+                packed = gguf_pack_fields(fields, fmt, tuple(w.shape))
+                counts["gptq"] += 1
+            else:
+                packed = gguf_pack(w, fmt, col_weights=qw)
             # No raw_shape: for quantized dtypes gguf-py derives the logical
             # shape from the packed byte shape (quant_shape_from_byte_shape).
             writer.add_tensor(tensor.name, packed, raw_dtype=getattr(QT, fmt))
@@ -366,6 +406,8 @@ def export_gguf(
     writer.add_key_value("prismaquant.imatrix_fallback",
                          int(counts.get("imatrix_fallback", 0)),
                          gguf.GGUFValueType.UINT32)
+    writer.add_key_value("prismaquant.gptq", gptq_act_dir is not None,
+                         gguf.GGUFValueType.BOOL)
     writer.add_key_value("prismaquant.token_embedding_format",
                          token_embedding_format or "",
                          gguf.GGUFValueType.STRING)
@@ -400,6 +442,13 @@ def main(argv: list[str] | None = None) -> None:
                     help="permit quantized tensors without an imatrix entry "
                     "(default: hard-fail — mixed weighted/unweighted bytes "
                     "diverge from the measured cost)")
+    ap.add_argument("--gptq", action="store_true",
+                    help="RESEARCH: GPTQ OBS rounding under the frozen "
+                    "two-tier scales (needs --imatrix-from-act-cache for "
+                    "activations). Default OFF: the cost stage does not "
+                    "score GPTQ renders yet, so a GPTQ export diverges "
+                    "from the measured cost — A/B only, hold the "
+                    "allocation fixed.")
     ap.add_argument(
         "--imatrix-from-act-cache", default=None,
         help="activation-cache dir; builds per-column importance "
@@ -411,6 +460,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.imatrix_from_act_cache:
         imatrix = build_imatrix_from_act_cache(args.imatrix_from_act_cache)
         print(f"imatrix: {len(imatrix)} Linears from act cache")
+    if args.gptq and not args.imatrix_from_act_cache:
+        ap.error("--gptq requires --imatrix-from-act-cache (activations)")
     counts = export_gguf(
         args.skeleton, args.layer_config, args.out,
         default_format=args.default_format,
@@ -419,6 +470,7 @@ def main(argv: list[str] | None = None) -> None:
         imatrix=imatrix,
         device=args.device,
         allow_imatrix_gaps=args.allow_imatrix_gaps,
+        gptq_act_dir=(args.imatrix_from_act_cache if args.gptq else None),
     )
     size = Path(args.out).stat().st_size / 1e9
     print(f"wrote {args.out} ({size:.2f} GB)")

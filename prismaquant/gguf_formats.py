@@ -447,16 +447,31 @@ def _pack_scales_q3(sc: torch.Tensor) -> torch.Tensor:
     return out.to(torch.uint8)
 
 
-def _pack_blocks(w: torch.Tensor, fmt: str,
-                 col_weights: torch.Tensor | None = None) -> torch.Tensor:
+def compute_fields(w: torch.Tensor, fmt: str,
+                   col_weights: torch.Tensor | None = None,
+                   ) -> dict[str, torch.Tensor]:
+    """Quantize a (..., in) weight into superblock fields — the single
+    source of quantization state (fp16 super-scales + quantized
+    sub-scales/mins + integer q). The emulation, the byte assembler, and
+    external rounders (GPTQ replaces ``q`` under frozen scales) all
+    consume these."""
     fields_fn, _, block = _FIELDS[fmt]
-    in_f = int(w.shape[-1])
     flat = w.to(torch.float32).reshape(-1, block)
     qw = None
     if col_weights is not None:
         qw = _qw_blocks(col_weights.to(w.device), tuple(w.shape), 0, block)
-    f = fields_fn(flat, qw=qw)
-    n = flat.shape[0]
+    return fields_fn(flat, qw=qw)
+
+
+def reconstruct_fields(fields: dict[str, torch.Tensor],
+                       fmt: str) -> torch.Tensor:
+    """Dequantized values for superblock fields: (n_blocks, block)."""
+    return _FIELDS[fmt][1](fields)
+
+
+def assemble_bytes(f: dict[str, torch.Tensor], fmt: str) -> torch.Tensor:
+    """Bit-pack superblock fields into GGUF block bytes (n_blocks, bytes)."""
+    n = f["q"].shape[0]
     if fmt == "Q2_K":
         scales_b = (f["sc"] | (f["m"] << 4)).to(torch.uint8)
         return torch.cat([scales_b, _pack_2bit(f["q"]),
@@ -504,6 +519,16 @@ def gguf_pack(w: torch.Tensor, fmt: str,
             f"{fmt} requires the input dim to be a multiple of {block}; "
             f"got shape {tuple(w.shape)}"
         )
-    packed = _pack_blocks(w, fmt, col_weights=col_weights)
+    packed = assemble_bytes(compute_fields(w, fmt, col_weights), fmt)
     out_shape = tuple(w.shape[:-1]) + (in_f // block * type_size,)
+    return packed.reshape(out_shape).cpu().numpy()
+
+
+def gguf_pack_fields(fields: dict[str, torch.Tensor], fmt: str,
+                     shape: tuple[int, ...]) -> np.ndarray:
+    """Bit-pack pre-computed fields (e.g. after a GPTQ q-rewrite) into the
+    writer's byte layout for a tensor of logical ``shape``."""
+    block, type_size = GGUF_BLOCK_BYTES[fmt]
+    packed = assemble_bytes(fields, fmt)
+    out_shape = tuple(shape[:-1]) + (int(shape[-1]) // block * type_size,)
     return packed.reshape(out_shape).cpu().numpy()
