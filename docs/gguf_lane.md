@@ -89,14 +89,18 @@ llama-perplexity -m exported.gguf --kl-divergence-base base_logits.bin \
 | **ours: M6 allocation, no imatrix** | **2.327** | **35.0%** |
 | llama.cpp preset + imatrix (same corpus) | 0.913 | 55.6% |
 | ours: M6 allocation + imatrix, fully consistent | 1.061 | 53.5% |
+| **ours: M6 allocation + imatrix + GPTQ** (`--gptq`, research) | **0.890** | **56.9%** |
 
 Measured allocation beats the hand heuristic by −14.7% KL at matched bytes
-(and independently rediscovers its v/o/down-get-more shape). The imatrix arm
-is currently lost by +16%: llama.cpp's imatrix-mode `quantize_row_*_impl`
-paths carry extra refinement beyond the reference path ported here. The
-planned answer is the GPTQ-into-k-quant rounder (full-Hessian error
-propagation strictly subsumes diagonal imatrix), not chasing their refinement
-passes.
+(and independently rediscovers its v/o/down-get-more shape). The imatrix-RTN
+arm loses by +16% (llama.cpp's imatrix-mode `quantize_row_*_impl` paths carry
+extra refinement beyond the reference path ported here) — and the
+**GPTQ-into-k-quant rounder answers it**: full-Hessian OBS propagation under
+the same frozen scales beats their best stack outright on their own harness.
+Caveats before any public claim: this is a single-corpus 0.6B screen; the
+GPTQ export is not yet scored by the cost stage (allocation was optimized on
+imatrix-RTN cost, so a GPTQ-aware cost mode should only widen the margin);
+house promotion rules (repeats, held-out corpora, downstream tasks) apply.
 
 ## Consistency guards (added after the 2026-07-06 review pass)
 
@@ -121,6 +125,33 @@ passes.
 - The skeleton stage writes-then-renames (no truncated-file skip-gate trust)
   and stamps `MODEL_PATH` in its settings manifest; the pipeline ends with a
   llama.cpp load+greedy-generate smoke on the exported artifact.
+
+## 4B scale check (Qwen3-4B, byte-identical 1669.5 MB arms, 64-chunk KL)
+
+| arm | mean KLD | top-1 |
+|---|---|---|
+| llama.cpp Q2_K preset + imatrix | 0.461 | 74.3% |
+| their mix, **our** imatrix+GPTQ render | 0.552 | 72.3% |
+| our M6 allocation, our render (Q6_K embd) | 0.644 | 70.1% |
+
+The 0.6B win did **not** transfer: at 4B the render trails by +20% and the
+allocation by +17%, in roughly equal parts. Two structural causes were
+isolated on the way:
+
+1. **Tied embeddings**: Qwen3-4B ties `token_embd` to the output head, and
+   llama.cpp's preset ships it Q6_K — a Q2_K embedding policy silently gives
+   the artifact a 2.6-bit output head (+2.9pp top-1 recovered by matching
+   Q6_K at equal bytes). Embedding/head policy must become a measured
+   decision, tied-aware; until then, default Q6_K for tied models.
+2. **Rank-starved GPTQ Hessian (suspect, testable)**: the act cache holds
+   256 rows — 25% of a 1024-dim H at 0.6B but 2.6% of a 9728-dim H at 4B, so
+   the damp term dominates and GPTQ degenerates toward RTN exactly where
+   llama.cpp's rank-agnostic sub-block refinement keeps working. Re-test the
+   render cell with a larger `ACTIVATION_ROWS_LIMIT`.
+
+The allocation gap is the classic surrogate-mis-ranking regime —
+validated-frontier real-KL selection (via a llama.cpp evaluator) is the house
+answer. No public quality claim until both land and repeat.
 
 ## Known limitations / open work
 
