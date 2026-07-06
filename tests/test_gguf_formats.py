@@ -173,6 +173,18 @@ def test_dead_imatrix_columns_do_not_erase_weights(name):
     np.testing.assert_array_equal(decoded, out.numpy())
 
 
+def test_tied_embedding_default_policy():
+    """Tied models: token_embd doubles as the output head — default Q6_K
+    (llama.cpp convention); explicit flags always win; untied models keep
+    skeleton precision by default."""
+    from prismaquant.export_gguf import _resolve_token_embedding_format
+
+    assert _resolve_token_embedding_format(None, tied=True) == "Q6_K"
+    assert _resolve_token_embedding_format(None, tied=False) is None
+    assert _resolve_token_embedding_format("Q2_K", tied=True) == "Q2_K"
+    assert _resolve_token_embedding_format("Q4_K", tied=False) == "Q4_K"
+
+
 def test_gguf_serving_profile_gates_formats_and_shapes():
     profile = load_serving_profile("gguf")
 

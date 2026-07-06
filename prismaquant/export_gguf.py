@@ -142,6 +142,29 @@ def _map_assignment_to_gguf(
     return gguf_formats, unmatched
 
 
+def _resolve_token_embedding_format(explicit: str | None,
+                                    tied: bool) -> str | None:
+    """Tied-embedding guard: when the skeleton carries no output tensor,
+    ``token_embd`` IS the output head, and an aggressive embedding format
+    silently ships a low-bit head (measured on Qwen3-4B: Q2_K embd cost
+    ~4pp top-1 agreement at matched bytes). Default to Q6_K for tied
+    models — the llama.cpp preset convention — until the allocator owns
+    this decision; an explicit flag always wins."""
+    if explicit is not None:
+        low = explicit.strip()
+        if tied and low in {"Q2_K", "Q3_K"}:
+            print(f"[export-gguf] WARNING: tied embeddings — "
+                  f"token_embd IS the output head; {low} gives a "
+                  f"~{'2.6' if low == 'Q2_K' else '3.4'}-bit head")
+        return low
+    if tied:
+        print("[export-gguf] tied embeddings: defaulting token_embd to "
+              "Q6_K (it doubles as the output head; override with "
+              "--token-embedding-format)")
+        return "Q6_K"
+    return None
+
+
 def _load_act_inputs(act_dir: str | Path,
                      hf_qname: str | None) -> torch.Tensor | None:
     """Full fp32 calibration activations for one Linear, or None."""
@@ -229,6 +252,11 @@ def export_gguf(
     # Embedding / output-head policy: these sit outside the allocator's
     # body budget (bpp is reported over quantizable Linears only), but the
     # llama.cpp ecosystem quantizes them and size comparisons must match.
+    tensor_names = {t.name for t in reader.tensors}
+    tied = "output.weight" not in tensor_names
+    token_embedding_format = _resolve_token_embedding_format(
+        token_embedding_format, tied,
+    )
     if token_embedding_format is not None:
         gguf_fmt_map.setdefault("token_embd.weight", token_embedding_format)
     if output_format is not None:
