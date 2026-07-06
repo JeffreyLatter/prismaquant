@@ -143,11 +143,15 @@ isolated on the way:
    the artifact a 2.6-bit output head (+2.9pp top-1 recovered by matching
    Q6_K at equal bytes). Embedding/head policy must become a measured
    decision, tied-aware; until then, default Q6_K for tied models.
-2. **Rank-starved GPTQ Hessian (suspect, testable)**: the act cache holds
-   256 rows — 25% of a 1024-dim H at 0.6B but 2.6% of a 9728-dim H at 4B, so
-   the damp term dominates and GPTQ degenerates toward RTN exactly where
-   llama.cpp's rank-agnostic sub-block refinement keeps working. Re-test the
-   render cell with a larger `ACTIVATION_ROWS_LIMIT`.
+2. **Rank-starved GPTQ Hessian — CONFIRMED**: the act cache held 256 rows —
+   25% of a 1024-dim H at 0.6B but 2.6% of a 9728-dim H at 4B, so the damp
+   term dominated and GPTQ degenerated toward RTN exactly where llama.cpp's
+   rank-agnostic sub-block refinement keeps working. Re-probing with
+   `ACTIVATION_ROWS_LIMIT=1024` and re-running the byte-identical render
+   cell: **0.552 → 0.497 KLD, top-1 74.19% = parity with their best stack**
+   (74.27%). The gguf pipeline lane now defaults to 1024 activation rows;
+   the residual +7.7% KLD gap is the next render investigation (more rows —
+   1024 is still 10.5% rank at 4B — and/or their imatrix-mode refinements).
 
 The allocation gap is the classic surrogate-mis-ranking regime —
 validated-frontier real-KL selection (via a llama.cpp evaluator) is the house

@@ -64,7 +64,16 @@ set -euo pipefail
 : "${PREFETCH_LOOKAHEAD:=auto}"
 : "${PREFETCH_WORKERS:=auto}"
 : "${PREFETCH_MIN_AVAILABLE_GB:=auto}"
-: "${ACTIVATION_ROWS_LIMIT:=256}"
+# GGUF lane defaults to 4x the activation rows: the GPTQ-into-k-quant
+# Hessian is rank-starved at 256 rows on wide layers (rank 2.6% of a
+# 9728-dim H) and degenerates toward RTN — measured on Qwen3-4B, 1024
+# rows closed the render gap vs llama.cpp's imatrix quantizer from +20%
+# to +7.7% KLD (top-1 at parity). See docs/gguf_lane.md.
+if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
+  : "${ACTIVATION_ROWS_LIMIT:=1024}"
+else
+  : "${ACTIVATION_ROWS_LIMIT:=256}"
+fi
 : "${DATASET:=/home/rob/dq-runs/calibration/diverse-v1.jsonl}"
 # MINOR-M2: packed-MoE experts use a cross-domain held-out corpus for the
 # GPTQ-vs-RTN do-no-harm gate (the served-validated recipe — arm E in
