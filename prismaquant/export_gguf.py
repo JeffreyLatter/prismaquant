@@ -254,9 +254,19 @@ def export_gguf(
             writer.add_tensor(tensor.name, packed, raw_dtype=getattr(QT, fmt))
             counts[fmt] += 1
             tensor_formats[tensor.name] = fmt
+        elif wants_quant and tensor.name in gguf_fmt_map:
+            # An explicitly assigned tensor that fails a quantize
+            # precondition means the skeleton disagrees with what the
+            # allocator's legality gate checked — never ship it silently at
+            # skeleton precision (the artifact would exceed the allocated
+            # budget and the measured cost would not describe the bytes).
+            raise ValueError(
+                f"{tensor.name}: assigned {fmt} but cannot quantize "
+                f"(source type {tensor.tensor_type.name}, shape "
+                f"{tuple(int(d) for d in tensor.shape)}, block "
+                f"{GGUF_BLOCK_BYTES[fmt][0]})"
+            )
         else:
-            if wants_quant:
-                counts[f"passthrough({fmt}->src)"] += 1
             # Verbatim copy: reader data is already in the writer's expected
             # layout for every tensor type (typed+logical for f32/f16,
             # byte-shaped for bf16/quantized).
