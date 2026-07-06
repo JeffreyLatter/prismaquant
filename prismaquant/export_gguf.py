@@ -125,8 +125,20 @@ def _map_assignment_to_gguf(
         gguf_name = name_map.get_name(hf_qname)
         if gguf_name is None:
             unmatched.add(hf_qname)
-        else:
-            gguf_formats[gguf_name + ".weight"] = fmt
+            continue
+        key = gguf_name + ".weight"
+        prev = gguf_formats.get(key)
+        if prev is not None and prev != fmt:
+            # Many-to-one name mapping (a converter that fuses HF Linears
+            # into one GGUF tensor) with conflicting formats: silent
+            # last-write-wins would ship bytes that do not match the
+            # allocation — the GGUF analog of the fused-coherence bug.
+            raise ValueError(
+                f"{key}: assignment maps multiple HF Linears onto one GGUF "
+                f"tensor with conflicting formats ({prev} vs {fmt} from "
+                f"{hf_qname}); promote the fused group to one format"
+            )
+        gguf_formats[key] = fmt
     return gguf_formats, unmatched
 
 
@@ -156,6 +168,7 @@ def export_gguf(
     output_format: str | None = None,
     imatrix: dict[str, torch.Tensor] | None = None,
     device: str | None = None,
+    allow_imatrix_gaps: bool = False,
 ) -> dict[str, int]:
     if device is None:
         # GPU-first: the weighted scale search is the export hot path.
@@ -195,6 +208,7 @@ def export_gguf(
 
     counts: Counter[str] = Counter()
     tensor_formats: dict[str, str] = {}
+    imatrix_fallback_names: list[str] = []
 
     # Embedding / output-head policy: these sit outside the allocator's
     # body budget (bpp is reported over quantizable Linears only), but the
@@ -246,14 +260,26 @@ def export_gguf(
                     f"not describe this checkpoint"
                 )
             if imatrix:
-                counts["imatrix_weighted" if qw is not None
-                       else "imatrix_fallback"] += 1
+                if qw is not None:
+                    counts["imatrix_weighted"] += 1
+                else:
+                    counts["imatrix_fallback"] += 1
+                    imatrix_fallback_names.append(tensor.name)
             packed = gguf_pack(w, fmt, col_weights=qw)
             # No raw_shape: for quantized dtypes gguf-py derives the logical
             # shape from the packed byte shape (quant_shape_from_byte_shape).
             writer.add_tensor(tensor.name, packed, raw_dtype=getattr(QT, fmt))
             counts[fmt] += 1
             tensor_formats[tensor.name] = fmt
+        elif wants_quant and fmt is not None and tensor.name not in gguf_fmt_map:
+            # --default-format blanket tensor failing a precondition:
+            # soft-skip is the documented semantics, but leave a trace so
+            # a silently-larger artifact is explainable from the printout.
+            counts[f"default_skip({fmt}->{tensor.tensor_type.name})"] += 1
+            data = np.ascontiguousarray(tensor.data)
+            writer.add_tensor(tensor.name, data, raw_dtype=tensor.tensor_type)
+            counts[tensor.tensor_type.name] += 1
+            tensor_formats[tensor.name] = tensor.tensor_type.name
         elif wants_quant and tensor.name in gguf_fmt_map:
             # An explicitly assigned tensor that fails a quantize
             # precondition means the skeleton disagrees with what the
@@ -294,6 +320,21 @@ def export_gguf(
             "naming has drifted from the gguf name map; shipping unweighted "
             "bytes against an imatrix-weighted cost would be a silent "
             "rendering confound"
+        )
+    # Strict coverage: a PARTIALLY drifted act cache (one shard's flush
+    # died, disk-hygiene removed a subset of act/*.pt) must not ship a
+    # mixed weighted/unweighted artifact with exit 0. token_embd has no
+    # activation blob by construction (row lookups, not a matmul input).
+    unexpected_gaps = [
+        n for n in imatrix_fallback_names if n != "token_embd.weight"
+    ]
+    if imatrix and unexpected_gaps and not allow_imatrix_gaps:
+        raise ValueError(
+            f"{len(unexpected_gaps)} quantized tensors have no imatrix "
+            f"entry (e.g. {unexpected_gaps[:5]}) — the act cache is "
+            f"partially missing or misnamed; these tensors would ship "
+            f"unweighted against an imatrix-weighted cost. Pass "
+            f"--allow-imatrix-gaps to override deliberately."
         )
 
     writer.add_file_type(gguf.LlamaFileType.GUESSED)
@@ -355,6 +396,10 @@ def main(argv: list[str] | None = None) -> None:
                     help="quantize output.weight / lm_head (e.g. Q6_K)")
     ap.add_argument("--device", default=None,
                     help="quantization device (default: cuda if available)")
+    ap.add_argument("--allow-imatrix-gaps", action="store_true",
+                    help="permit quantized tensors without an imatrix entry "
+                    "(default: hard-fail — mixed weighted/unweighted bytes "
+                    "diverge from the measured cost)")
     ap.add_argument(
         "--imatrix-from-act-cache", default=None,
         help="activation-cache dir; builds per-column importance "
@@ -373,6 +418,7 @@ def main(argv: list[str] | None = None) -> None:
         output_format=args.output_format,
         imatrix=imatrix,
         device=args.device,
+        allow_imatrix_gaps=args.allow_imatrix_gaps,
     )
     size = Path(args.out).stat().st_size / 1e9
     print(f"wrote {args.out} ({size:.2f} GB)")

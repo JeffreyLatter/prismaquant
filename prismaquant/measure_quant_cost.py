@@ -475,9 +475,24 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                 W.device,
             )
 
+        gguf_qw = None
+        if _gguf_imatrix_enabled() and any(s.family == "gguf" for s in specs):
+            # Same op/data as export_gguf.build_imatrix_from_act_cache and
+            # the batched path: full fp32 rows, mean over dim 0.
+            gguf_qw = X_cpu.float().pow(2).mean(dim=0).to(W.device)
+
         for spec in specs:
             try:
-                W_hat = spec.quantize_dequantize(W.clone())
+                if spec.family == "gguf" and gguf_qw is not None:
+                    from prismaquant.gguf_formats import (
+                        gguf_quantize_dequantize,
+                    )
+
+                    W_hat = gguf_quantize_dequantize(
+                        W.clone(), spec.name, col_weights=gguf_qw,
+                    )
+                else:
+                    W_hat = spec.quantize_dequantize(W.clone())
                 X_hat = spec.activation_quantize_dequantize(X.clone())
                 err = (W - W_hat).float()
                 weight_mse = float(err.pow(2).mean().item())
@@ -1291,9 +1306,16 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
             if _gguf_imatrix_enabled() and any(
                 s.family == "gguf" for s in specs
             ):
-                # Per-item imatrix: mean squared activation per input
-                # column, from the same X the output-MSE bmm uses.
-                gguf_qw = X.float().pow(2).mean(dim=1, keepdim=True)  # (N,1,in)
+                # Per-item imatrix, computed with the IDENTICAL op on the
+                # IDENTICAL data as export_gguf.build_imatrix_from_act_cache
+                # (full fp32 CPU act rows, mean over dim 0) — NOT from the
+                # chunk-truncated compute-dtype X. The k-quant scale search
+                # is a discrete grid: a numerically different importance
+                # vector can flip (sc, m, q) choices, and then the measured
+                # cost no longer describes the shipped bytes.
+                gguf_qw = torch.stack([
+                    a.float().pow(2).mean(dim=0) for a in acts_cpu
+                ]).unsqueeze(1).to(dev)  # (N, 1, in)
 
             for spec in specs:
                 try:
