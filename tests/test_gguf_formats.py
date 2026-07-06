@@ -55,6 +55,15 @@ def test_canonicalize_rejects_unknown_gguf_type():
         canonicalize_format({"data_type": "gguf", "gguf_type": "IQ9_Z", "bits": 2})
 
 
+def test_layer_config_gguf_names_stay_in_sync():
+    """layer_config keeps its own name list (it must stay importable
+    without torch); pin it to the format module's table so adding an IQ
+    rung cannot desynchronize export/recache/KL-validation parsing."""
+    from prismaquant.layer_config import _GGUF_FORMAT_NAMES
+
+    assert _GGUF_FORMAT_NAMES == frozenset(GGUF_BLOCK_BYTES)
+
+
 @pytest.mark.parametrize("name", sorted(GGUF_BPW))
 def test_pack_matches_emulation_bit_exact(name):
     """gguf-py dequantize(pack(w)) must equal our registry emulation exactly:
@@ -144,6 +153,24 @@ def test_imatrix_weighting_changes_bytes_and_stays_bit_exact(name):
     np.testing.assert_array_equal(decoded, emulated)
     unweighted = gguf_quantize_dequantize(w, name).numpy()
     assert not np.array_equal(emulated, unweighted)
+
+
+@pytest.mark.parametrize("name", ["Q3_K", "Q6_K", "Q2_K"])
+def test_dead_imatrix_columns_do_not_erase_weights(name):
+    """Input columns never activated on the calibration slice produce
+    zero imatrix weight; the weighted-LS scale must NOT collapse to zero
+    and erase real weights for those sub-blocks (held-out prompts can
+    still activate them)."""
+    w = _weights(rows=4)
+    qw = torch.rand(1024) + 0.05
+    qw[:256] = 0.0  # a whole superblock of dead columns
+    out = gguf_quantize_dequantize(w, name, col_weights=qw)
+    dead_region = out[:, :256]
+    assert dead_region.abs().sum() > 0
+    # pack==emulation must still hold under the guard
+    packed = gguf_pack(w, name, col_weights=qw)
+    decoded = gguf.quants.dequantize(packed, getattr(gguf.GGMLQuantizationType, name))
+    np.testing.assert_array_equal(decoded, out.numpy())
 
 
 def test_gguf_serving_profile_gates_formats_and_shapes():

@@ -98,6 +98,30 @@ planned answer is the GPTQ-into-k-quant rounder (full-Hessian error
 propagation strictly subsumes diagonal imatrix), not chasing their refinement
 passes.
 
+## Consistency guards (added after the 2026-07-06 review pass)
+
+- `run-pipeline.sh` **fails fast** when `EXPORT_CONTAINER=gguf` is combined
+  with `COST_MODE!=local`, `PRODUCTION_CACHE!=0`, or `TARGET_PROFILE!=gguf` —
+  each combination silently breaks the measured-cost==shipped-bytes contract
+  (render-score scores unweighted registry renders; the production cache is
+  never read by this exporter).
+- `export_native_compressed` **hard-fails** on GGUF formats in an assignment
+  (previously they became newly reachable by the silent BF16-coercion branch).
+- The exporter **hard-fails** when an imatrix is requested but empty, weights
+  zero tensors, or mismatches a tensor's column count; weighted/fallback
+  counts plus the imatrix sha256 (a deterministic digest of the calibration
+  activations) and the embedding/head policy are baked into `prismaquant.*`
+  KV metadata.
+- Dead calibration columns (all-zero imatrix weight for a whole sub-block)
+  fall back to the format's unweighted weighting instead of erasing real
+  weights with a zero scale.
+- The `PRISMAQUANT_GGUF_IMATRIX` truthiness parse is identical in the shell
+  and Python readers (set-but-empty = default on; `0/false/no/off` any case
+  = off).
+- The skeleton stage writes-then-renames (no truncated-file skip-gate trust)
+  and stamps `MODEL_PATH` in its settings manifest; the pipeline ends with a
+  llama.cpp load+greedy-generate smoke on the exported artifact.
+
 ## Known limitations / open work
 
 - **MoE expert stacking**: the name map handles dense models; stacked
@@ -116,3 +140,16 @@ passes.
 - **Gold metric**: the tables above are the llama.cpp KL harness (the serving
   metric *for this lane's runtime*); vLLM-GGUF serving of the same artifacts
   was smoke-verified on the 0.19.2 venv but not KL-measured there.
+- **Ship gate**: the pipeline's llama.cpp smoke proves load+generate only; a
+  `validate_quantized_model` analog (PPL threshold + p99 per-prompt NLL on
+  the llama.cpp runtime) does not exist yet and must before any public ship.
+- **imatrix vector mismatch (minor)**: the cost path derives per-column weights
+  from the chunk-truncated activation rows it bmm's with, the exporter from
+  the full cached rows — same estimator, slightly different sample counts.
+  Unify if allocation ever proves sensitive to it (0.6B was not).
+- **Packed-MoE expert cost path** (`_measure_packed_experts`) quantizes
+  UNWEIGHTED — must be threaded with imatrix weights when MoE expert
+  stacking lands, or expert-vs-dense bit splits will be biased.
+- **Embedding/head formats are an operator policy**, not a measured
+  allocator decision — a principle-2 debt; the flags are recorded in
+  provenance KVs so size-matched claims stay auditable.

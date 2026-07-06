@@ -1227,6 +1227,19 @@ def _coerce_runtime_legal_assignment(
         if fmt_canonical == "BF16":
             continue
         if fmt_canonical not in FORMAT_SCHEME:
+            from prismaquant.gguf_formats import GGUF_BLOCK_BYTES
+
+            if fmt_canonical in GGUF_BLOCK_BYTES:
+                # Wrong container, not a research format: a GGUF assignment
+                # reaching the compressed-tensors exporter means the pipeline
+                # was launched without EXPORT_CONTAINER=gguf. Silently
+                # coercing to BF16 would ship a ~16 bpp artifact unrelated to
+                # the allocated budget.
+                raise ValueError(
+                    f"{qname}: format {fmt_canonical} ships via the GGUF "
+                    f"container (prismaquant.export_gguf / "
+                    f"EXPORT_CONTAINER=gguf), not compressed-tensors"
+                )
             shape = _source_weight_shape_for_recipe(src_model, qname, profile)
             out[qname] = "BF16"
             coerced.append((qname, shape or [], fmt_canonical))

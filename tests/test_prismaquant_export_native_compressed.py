@@ -2737,6 +2737,37 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
             ("model.layers.0.self_attn.o_proj", [128, 5120], "FP8_E5M2")
         ])
 
+    def test_gguf_formats_hard_fail_instead_of_bf16_coercion(self):
+        """A GGUF assignment reaching the compressed-tensors exporter is a
+        wrong-container invocation (EXPORT_CONTAINER=gguf was not set), not
+        a research format: silent BF16 coercion would ship a ~16 bpp
+        artifact unrelated to the allocated budget."""
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard = td / "model-00001-of-00001.safetensors"
+            save_file({
+                "model.language_model.layers.0.self_attn.o_proj.weight": (
+                    torch.zeros(128, 5120, dtype=torch.bfloat16)
+                ),
+            }, str(shard))
+            with open(td / "model.safetensors.index.json", "w") as f:
+                json.dump({
+                    "weight_map": {
+                        "model.language_model.layers.0.self_attn.o_proj.weight": (
+                            shard.name
+                        ),
+                    }
+                }, f)
+
+            with self.assertRaisesRegex(ValueError, "GGUF"):
+                _coerce_runtime_legal_assignment(
+                    str(td),
+                    {"model.layers.0.self_attn.o_proj": "Q2_K"},
+                    Qwen3_5Profile(),
+                )
+
     def test_bf16_audit_classifies_allocator_bf16_candidates(self):
         from safetensors.torch import save_file
 

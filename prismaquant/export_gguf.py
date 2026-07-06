@@ -55,14 +55,9 @@ _VIRTUAL_KEYS = {
 
 
 def _git_commit() -> str:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True,
-            cwd=Path(__file__).resolve().parent,
-        ).stdout.strip()
-    except Exception:
-        return "unknown"
+    from prismaquant.aura_cost import _git_commit as _aura_git_commit
+
+    return _aura_git_commit() or "unknown"
 
 
 def _reader_tensor_to_torch(tensor: "gguf.ReaderTensor") -> torch.Tensor:
@@ -101,16 +96,9 @@ def _copy_metadata(reader: "gguf.GGUFReader", writer: "gguf.GGUFWriter") -> str:
     return arch
 
 
-def _map_assignment_to_gguf(
-    arch_name: str, n_layers: int, assignment: dict[str, str],
-) -> tuple[dict[str, str], set[str]]:
-    """HF-qname assignment -> {gguf tensor name: format}.
-
-    Uses gguf-py's per-arch tensor name map (the same table
-    convert_hf_to_gguf used to write the skeleton), mapping forward from
-    the assignment's HF module qnames. Returns the gguf-name map and the
-    set of assignment entries that did not map (a naming bug upstream).
-    """
+def _tensor_name_map(arch_name: str, n_layers: int):
+    """gguf-py's per-arch tensor name map (the same table
+    convert_hf_to_gguf used to write the skeleton)."""
     arch = None
     for key, value in gguf.MODEL_ARCH_NAMES.items():
         if value == arch_name:
@@ -118,7 +106,19 @@ def _map_assignment_to_gguf(
             break
     if arch is None:
         raise ValueError(f"unknown GGUF architecture: {arch_name}")
-    name_map = gguf.get_tensor_name_map(arch, n_layers)
+    return gguf.get_tensor_name_map(arch, n_layers)
+
+
+def _map_assignment_to_gguf(
+    arch_name: str, n_layers: int, assignment: dict[str, str],
+) -> tuple[dict[str, str], set[str]]:
+    """HF-qname assignment -> {gguf tensor name: format}.
+
+    Maps forward from the assignment's HF module qnames. Returns the
+    gguf-name map and the set of assignment entries that did not map
+    (a naming bug upstream).
+    """
+    name_map = _tensor_name_map(arch_name, n_layers)
     gguf_formats: dict[str, str] = {}
     unmatched: set[str] = set()
     for hf_qname, fmt in assignment.items():
@@ -204,11 +204,16 @@ def export_gguf(
     if output_format is not None:
         gguf_fmt_map.setdefault("output.weight", output_format)
 
+    if imatrix is not None and not imatrix:
+        raise ValueError(
+            "imatrix requested but empty — the act-cache dir is missing, "
+            "cleaned, or has an unexpected blob schema; exporting unweighted "
+            "bytes would silently diverge from the imatrix-weighted cost "
+            "measurement"
+        )
     imatrix_by_gguf: dict[str, torch.Tensor] = {}
     if imatrix:
-        arch = next(k for k, v in gguf.MODEL_ARCH_NAMES.items()
-                    if v == arch_name)
-        nm = gguf.get_tensor_name_map(arch, n_layers)
+        nm = _tensor_name_map(arch_name, n_layers)
         for hf_qname, qw in imatrix.items():
             gname = nm.get_name(hf_qname)
             if gname is not None:
@@ -235,7 +240,14 @@ def export_gguf(
             w = _reader_tensor_to_torch(tensor).to(device)
             qw = imatrix_by_gguf.get(tensor.name)
             if qw is not None and qw.numel() != w.shape[-1]:
-                qw = None  # shape mismatch (stacked/transposed) — unweighted
+                raise ValueError(
+                    f"{tensor.name}: imatrix vector has {qw.numel()} columns "
+                    f"but the tensor has {w.shape[-1]} — the act cache does "
+                    f"not describe this checkpoint"
+                )
+            if imatrix:
+                counts["imatrix_weighted" if qw is not None
+                       else "imatrix_fallback"] += 1
             packed = gguf_pack(w, fmt, col_weights=qw)
             # No raw_shape: for quantized dtypes gguf-py derives the logical
             # shape from the packed byte shape (quant_shape_from_byte_shape).
@@ -266,6 +278,14 @@ def export_gguf(
         json.dumps(dict(sorted(assignment.items())),
                    separators=(",", ":")).encode()
     ).hexdigest()
+    if imatrix and counts.get("imatrix_weighted", 0) == 0:
+        raise ValueError(
+            "imatrix was provided but weighted zero tensors — act-cache "
+            "naming has drifted from the gguf name map; shipping unweighted "
+            "bytes against an imatrix-weighted cost would be a silent "
+            "rendering confound"
+        )
+
     writer.add_file_type(gguf.LlamaFileType.GUESSED)
     writer.add_key_value("prismaquant.git_commit", _git_commit(),
                          gguf.GGUFValueType.STRING)
@@ -273,6 +293,32 @@ def export_gguf(
                          gguf.GGUFValueType.STRING)
     writer.add_key_value("prismaquant.tensor_formats",
                          json.dumps(tensor_formats, sort_keys=True),
+                         gguf.GGUFValueType.STRING)
+    # Calibration provenance: the imatrix is a deterministic function of the
+    # calibration activations, so its digest identifies the calibration; the
+    # weighted/fallback counts make a silent-unweighted export detectable
+    # after the fact (house rule: an irreproducible number is quarantined).
+    imatrix_digest = ""
+    if imatrix:
+        h = hashlib.sha256()
+        for name in sorted(imatrix):
+            h.update(name.encode())
+            h.update(imatrix[name].to(torch.float32).cpu().numpy().tobytes())
+        imatrix_digest = h.hexdigest()
+    writer.add_key_value("prismaquant.imatrix", bool(imatrix),
+                         gguf.GGUFValueType.BOOL)
+    writer.add_key_value("prismaquant.imatrix_sha256", imatrix_digest,
+                         gguf.GGUFValueType.STRING)
+    writer.add_key_value("prismaquant.imatrix_weighted",
+                         int(counts.get("imatrix_weighted", 0)),
+                         gguf.GGUFValueType.UINT32)
+    writer.add_key_value("prismaquant.imatrix_fallback",
+                         int(counts.get("imatrix_fallback", 0)),
+                         gguf.GGUFValueType.UINT32)
+    writer.add_key_value("prismaquant.token_embedding_format",
+                         token_embedding_format or "",
+                         gguf.GGUFValueType.STRING)
+    writer.add_key_value("prismaquant.output_format", output_format or "",
                          gguf.GGUFValueType.STRING)
 
     writer.write_header_to_file()

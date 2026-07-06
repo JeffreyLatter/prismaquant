@@ -76,6 +76,25 @@ set -euo pipefail
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_packed_moe}"
 
+# GGUF lane consistency gates (see docs/gguf_lane.md). The imatrix lockstep
+# contract (measured cost == shipped bytes) only holds under COST_MODE=local
+# today: production-render-score renders gguf formats via the unweighted
+# registry qdq, and the production cache is never read by export_gguf.
+if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
+  if [[ "${COST_MODE:-production-render-score}" != "local" ]]; then
+    echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires COST_MODE=local — production-render-score scores UNWEIGHTED registry renders while the GGUF exporter ships imatrix-weighted bytes (rendering confound). Set COST_MODE=local." >&2
+    exit 2
+  fi
+  if [[ "${PRODUCTION_CACHE:-1}" != "0" ]]; then
+    echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires PRODUCTION_CACHE=0 — export_gguf requantizes the bf16 skeleton and never reads the production cache; building one burns hours rendering bytes that never ship. Set PRODUCTION_CACHE=0 PRODUCTION_RECACHE=0." >&2
+    exit 2
+  fi
+  if [[ "${TARGET_PROFILE:-vllm_packed_moe}" != "gguf" ]]; then
+    echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires TARGET_PROFILE=gguf (the exporter hard-fails on non-GGUF formats in the assignment)." >&2
+    exit 2
+  fi
+fi
+
 if [[ "$DEVICE" != cuda* || "$EXPORT_DEVICE" != cuda* ]]; then
   echo "[pipeline] ERROR: PrismaQuant production pipeline is GPU-or-bust; DEVICE and EXPORT_DEVICE must be cuda*" >&2
   exit 2
@@ -1266,11 +1285,16 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   : "${GGUF_SKELETON:=${WORK_DIR}/artifacts/skeleton.gguf}"
   : "${GGUF_TOKEN_EMBEDDING_FORMAT:=}"
   : "${GGUF_OUTPUT_FORMAT:=}"
+  require_stage_settings "$GGUF_SKELETON" gguf-skeleton \
+    "MODEL_PATH=$MODEL_PATH"
   if [[ ! -f "$GGUF_SKELETON" ]]; then
     echo "[pipeline] [4/4] building GGUF skeleton (convert_hf_to_gguf, bf16) ..."
+    # Write-then-rename: convert_hf_to_gguf writes in place, so a crashed
+    # conversion must not leave a truncated file the skip-gate trusts.
     python3 "$LLAMA_CPP_DIR/convert_hf_to_gguf.py" "$MODEL_PATH" \
-      --outtype bf16 --outfile "$GGUF_SKELETON" \
+      --outtype bf16 --outfile "${GGUF_SKELETON}.tmp" \
       2>&1 | tee "${WORK_DIR}/logs/gguf_skeleton.log"
+    mv "${GGUF_SKELETON}.tmp" "$GGUF_SKELETON"
   else
     echo "[pipeline] [4/4] GGUF skeleton exists, skipping"
   fi
@@ -1284,9 +1308,15 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   )
   # Keep export-side imatrix in lockstep with the cost measurement
   # (PRISMAQUANT_GGUF_IMATRIX, default on): measured cost and shipped
-  # bytes must be the same rendering.
-  case "${PRISMAQUANT_GGUF_IMATRIX:-1}" in
-    0|false|False|FALSE|no|No|NO) ;;
+  # bytes must be the same rendering. The truthiness parse MUST match
+  # measure_quant_cost._gguf_imatrix_enabled (set-but-empty = default on;
+  # 0/false/no/off in any case = off), or the one flag whose job is
+  # lockstep silently splits the two sides.
+  _gguf_imatrix="${PRISMAQUANT_GGUF_IMATRIX:-1}"
+  _gguf_imatrix="$(echo "$_gguf_imatrix" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  [[ -z "$_gguf_imatrix" ]] && _gguf_imatrix=1
+  case "$_gguf_imatrix" in
+    0|false|no|off) ;;
     *) GGUF_EXPORT_ARGS+=(--imatrix-from-act-cache "${WORK_DIR}/act") ;;
   esac
   [[ -n "$GGUF_TOKEN_EMBEDDING_FORMAT" ]] && \
@@ -1294,6 +1324,30 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   [[ -n "$GGUF_OUTPUT_FORMAT" ]] && \
     GGUF_EXPORT_ARGS+=(--output-format "$GGUF_OUTPUT_FORMAT")
   "${GGUF_EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
+
+  # Load + greedy-generate smoke on the actual serving runtime (the
+  # validate_native_export analog for this lane). A PPL/p99-NLL ship gate
+  # (validate_quantized_model analog) is still open work — see
+  # docs/gguf_lane.md; this gate only proves the artifact loads and
+  # produces tokens.
+  LLAMA_COMPLETION="$LLAMA_CPP_DIR/build/bin/llama-completion"
+  if [[ -x "$LLAMA_COMPLETION" ]]; then
+    echo "[pipeline] [4/4] llama.cpp load+generate smoke ..."
+    SMOKE_OUT=$("$LLAMA_COMPLETION" -m "${WORK_DIR}/exported.gguf" \
+      -p "The quick brown fox" -n 16 --temp 0 -ngl 99 --no-display-prompt \
+      < /dev/null 2>"${WORK_DIR}/logs/gguf_smoke.err") || {
+      echo "[pipeline] ERROR: llama.cpp failed to load/generate from the exported artifact; see ${WORK_DIR}/logs/gguf_smoke.err" >&2
+      exit 1
+    }
+    if [[ -z "${SMOKE_OUT//[[:space:]]/}" ]]; then
+      echo "[pipeline] ERROR: llama.cpp generated no tokens from the exported artifact" >&2
+      exit 1
+    fi
+    echo "[pipeline] [4/4] smoke output: ${SMOKE_OUT:0:120}"
+  else
+    echo "[pipeline] WARNING: $LLAMA_COMPLETION not built — skipping load+generate smoke (build with: cmake --build $LLAMA_CPP_DIR/build --target llama-completion)"
+  fi
+
   echo
   echo "[pipeline] done."
   echo "  Artifact: ${WORK_DIR}/exported.gguf"

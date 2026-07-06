@@ -43,14 +43,6 @@ GGUF_BLOCK_BYTES: dict[str, tuple[int, int]] = {
     "Q8_0": (32, 34),
 }
 
-# gguf.GGMLQuantizationType values (stable on-disk enum).
-GGML_TYPE_IDS: dict[str, int] = {
-    "F32": 0, "F16": 1, "Q8_0": 8,
-    "Q2_K": 10, "Q3_K": 11, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14,
-    "BF16": 30,
-}
-
-
 def _fp16r(t: torch.Tensor) -> torch.Tensor:
     """Round through fp16 storage (the super-scales are stored as fp16)."""
     return t.to(torch.float16).to(torch.float32)
@@ -164,6 +156,17 @@ def _search_sym(sb: torch.Tensor, nmax: int,
     return torch.where(degenerate, torch.zeros_like(scale), scale)
 
 
+def _guard_dead_subblocks(weights: torch.Tensor,
+                          fallback: torch.Tensor) -> torch.Tensor:
+    """Sub-blocks whose imatrix weight mass is exactly zero (input columns
+    never activated on the calibration slice) would make the weighted-LS
+    scale collapse to 0 and ERASE real weights. Fall back to the format's
+    unweighted weighting for those sub-blocks — held-out prompts can still
+    activate the columns calibration never did."""
+    dead = weights.sum(dim=-1, keepdim=True) == 0
+    return torch.where(dead, fallback, weights)
+
+
 def _imatrix_weights(blocks: torch.Tensor, qw: torch.Tensor, sub: int,
                      sigma2_factor: float) -> torch.Tensor:
     """llama.cpp imatrix composition: qw * sqrt(sigma2 + x^2), with sigma2
@@ -189,13 +192,17 @@ def _fields_asym(blocks: torch.Tensor, sub: int, qmax: int, scale_max: int,
     """
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // sub, sub)
-    if qw is not None:
-        weights = _imatrix_weights(blocks, qw, sub, sigma2_factor)
-    elif weight_kind == "abs":
-        weights = sb.abs()
+    if weight_kind == "abs":
+        base_weights = sb.abs()
     else:  # "avx_abs": av_x + |x|, the Q4_K/Q5_K reference weighting
         av_x = sb.pow(2).mean(dim=-1, keepdim=True).sqrt()
-        weights = av_x + sb.abs()
+        base_weights = av_x + sb.abs()
+    if qw is not None:
+        weights = _guard_dead_subblocks(
+            _imatrix_weights(blocks, qw, sub, sigma2_factor), base_weights,
+        )
+    else:
+        weights = base_weights
 
     sub_scale, sub_min = _search_asym(
         sb, qmax, weights, rmin=rmin, rdelta=rdelta, nstep=nstep,
@@ -254,7 +261,9 @@ def _fields_q3_k(blocks: torch.Tensor,
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // 16, 16)
     if qw is not None:
-        weights = _imatrix_weights(blocks, qw, 16, sigma2_factor=2.0)
+        weights = _guard_dead_subblocks(
+            _imatrix_weights(blocks, qw, 16, sigma2_factor=2.0), sb * sb,
+        )
     else:
         weights = sb * sb
     sub_scale = _search_sym(sb, nmax=4, weights=weights)
@@ -270,7 +279,8 @@ def _fields_q3_k(blocks: torch.Tensor,
     return {"d": d, "sc": sc, "q": q.reshape(n, QK_K)}
 
 
-def _recon_q3_k(f: dict[str, torch.Tensor]) -> torch.Tensor:
+def _recon_sym(f: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Shared Q3_K/Q6_K reconstruction: w = (d*sc) * q per 16-sub-block."""
     n = f["q"].shape[0]
     dl = (f["d"] * f["sc"].float()).unsqueeze(-1)
     return (dl * f["q"].reshape(n, QK_K // 16, 16).float()).reshape(n, QK_K)
@@ -287,7 +297,9 @@ def _fields_q6_k(blocks: torch.Tensor,
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // 16, 16)
     if qw is not None:
-        weights = qw.reshape(n, QK_K // 16, 16)
+        weights = _guard_dead_subblocks(
+            qw.reshape(n, QK_K // 16, 16), sb * sb,
+        )
     else:
         weights = sb * sb
     sub_scale = _search_sym(sb, nmax=32, weights=weights)
@@ -300,12 +312,6 @@ def _fields_q6_k(blocks: torch.Tensor,
     dl = (d * sc.float()).unsqueeze(-1)
     q = torch.round(sb * _safe_inv(dl)).clamp(-32, 31).to(torch.int8)
     return {"d": d, "sc": sc, "q": q.reshape(n, QK_K)}
-
-
-def _recon_q6_k(f: dict[str, torch.Tensor]) -> torch.Tensor:
-    n = f["q"].shape[0]
-    dl = (f["d"] * f["sc"].float()).unsqueeze(-1)
-    return (dl * f["q"].reshape(n, QK_K // 16, 16).float()).reshape(n, QK_K)
 
 
 def _fields_q8_0(blocks: torch.Tensor,
@@ -331,10 +337,10 @@ def _recon_q8_0(f: dict[str, torch.Tensor]) -> torch.Tensor:
 
 _FIELDS = {
     "Q2_K": (_fields_q2_k, lambda f: _recon_asym(f, 16), QK_K),
-    "Q3_K": (_fields_q3_k, _recon_q3_k, QK_K),
+    "Q3_K": (_fields_q3_k, _recon_sym, QK_K),
     "Q4_K": (_fields_q4_k, lambda f: _recon_asym(f, 32), QK_K),
     "Q5_K": (_fields_q5_k, lambda f: _recon_asym(f, 32), QK_K),
-    "Q6_K": (_fields_q6_k, _recon_q6_k, QK_K),
+    "Q6_K": (_fields_q6_k, _recon_sym, QK_K),
     "Q8_0": (_fields_q8_0, _recon_q8_0, 32),
 }
 
@@ -416,12 +422,6 @@ def _pack_bits(bits: torch.Tensor, nbytes: int) -> torch.Tensor:
     return (v << shifts).sum(dim=1).to(torch.uint8)
 
 
-def _pack_2bit_chunk32(q: torch.Tensor) -> torch.Tensor:
-    """(n, 256) values in [0,3] -> (n, 64) bytes for Q6_K qh:
-    byte (e//128)*32 + e%32, shift 2*((e%128)//32)."""
-    return _pack_2bit(q)
-
-
 def _fp16_bytes(t: torch.Tensor) -> torch.Tensor:
     return t.to(torch.float16).view(torch.uint8)
 
@@ -479,8 +479,9 @@ def _pack_blocks(w: torch.Tensor, fmt: str,
                           _pack_nibbles((q & 0x0F).to(torch.uint8), 32)], dim=1)
     if fmt == "Q6_K":
         q = (f["q"].to(torch.int32) + 32)
+        # Q6_K qh shares the 2-bit stream layout (_pack_2bit).
         return torch.cat([_pack_nibbles((q & 0x0F).to(torch.uint8), 64),
-                          _pack_2bit_chunk32((q >> 4).to(torch.uint8)),
+                          _pack_2bit((q >> 4).to(torch.uint8)),
                           f["sc"].view(torch.uint8), _fp16_bytes(f["d"])], dim=1)
     if fmt == "Q8_0":
         return torch.cat([_fp16_bytes(f["d"]), f["q"].view(torch.uint8)], dim=1)

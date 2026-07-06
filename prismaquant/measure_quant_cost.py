@@ -1077,8 +1077,10 @@ def _gguf_imatrix_enabled() -> bool:
     the cost the allocator optimizes must be measured on the same render
     or the A/B has a rendering confound. Set =0 only together with an
     unweighted export."""
-    value = os.environ.get("PRISMAQUANT_GGUF_IMATRIX", "1")
-    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    # Parse MUST stay in lockstep with run-pipeline.sh's shell parse:
+    # set-but-empty means default (on); 0/false/no/off in any case = off.
+    value = os.environ.get("PRISMAQUANT_GGUF_IMATRIX", "1").strip().lower() or "1"
+    return value not in {"0", "false", "no", "off"}
 
 
 def _batched_quantize(
