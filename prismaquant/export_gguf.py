@@ -155,7 +155,11 @@ def export_gguf(
     token_embedding_format: str | None = None,
     output_format: str | None = None,
     imatrix: dict[str, torch.Tensor] | None = None,
+    device: str | None = None,
 ) -> dict[str, int]:
+    if device is None:
+        # GPU-first: the weighted scale search is the export hot path.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     assignment = load_assignment(layer_config_path)
     reader = gguf.GGUFReader(str(skeleton_path))
 
@@ -217,7 +221,7 @@ def export_gguf(
             and int(tensor.shape[0]) % GGUF_BLOCK_BYTES[fmt][0] == 0
             # GGUF shape order is reversed: shape[0] is the input dim.
         ):
-            w = _reader_tensor_to_torch(tensor)
+            w = _reader_tensor_to_torch(tensor).to(device)
             qw = imatrix_by_gguf.get(tensor.name)
             if qw is not None and qw.numel() != w.shape[-1]:
                 qw = None  # shape mismatch (stacked/transposed) — unweighted
@@ -282,6 +286,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="quantize token_embd.weight (e.g. Q2_K)")
     ap.add_argument("--output-format", default=None,
                     help="quantize output.weight / lm_head (e.g. Q6_K)")
+    ap.add_argument("--device", default=None,
+                    help="quantization device (default: cuda if available)")
     ap.add_argument(
         "--imatrix-from-act-cache", default=None,
         help="activation-cache dir; builds per-column importance "
@@ -299,6 +305,7 @@ def main(argv: list[str] | None = None) -> None:
         token_embedding_format=args.token_embedding_format,
         output_format=args.output_format,
         imatrix=imatrix,
+        device=args.device,
     )
     size = Path(args.out).stat().st_size / 1e9
     print(f"wrote {args.out} ({size:.2f} GB)")
