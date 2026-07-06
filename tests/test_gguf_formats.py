@@ -103,6 +103,23 @@ def test_pack_handles_stacked_expert_tensors():
     assert packed.shape == (4, 8, 512 // block * type_size)
 
 
+@pytest.mark.parametrize("name", sorted(GGUF_BPW))
+def test_batched_cost_path_matches_unbatched(name):
+    """The batched cost measurement (measure_quant_cost._batched_quantize)
+    must produce the same values as the registry qdq — a mismatch would
+    make the allocator's cost diverge from the shipped bytes."""
+    from prismaquant.format_registry import get_format
+    from prismaquant.measure_quant_cost import _batched_quantize
+
+    spec = get_format(name)
+    stacked = torch.randn(3, 8, 512) * torch.rand(3, 1, 1).exp()
+    batched = _batched_quantize(spec, stacked)
+    per_slice = torch.stack(
+        [gguf_quantize_dequantize(stacked[i], name) for i in range(3)]
+    )
+    torch.testing.assert_close(batched, per_slice, rtol=0, atol=0)
+
+
 def test_gguf_serving_profile_gates_formats_and_shapes():
     profile = load_serving_profile("gguf")
 

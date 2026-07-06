@@ -1085,6 +1085,12 @@ def _batched_quantize(spec: fr.FormatSpec, stacked_w: torch.Tensor) -> torch.Ten
             spec.quantize_dequantize(stacked_w[i].clone())
             for i in range(stacked_w.shape[0])
         ])
+    if spec.family == "gguf":
+        # GGUF k-quants: the registry qdq reshapes (..., in) internally and
+        # every scale is local to a 256-superblock (no per-tensor state), so
+        # the stacked (N, out, in) tensor quantizes in one call and matches
+        # the unbatched path bit-for-bit.
+        return spec.quantize_dequantize(stacked_w)
     if elt in _CODEBOOK_NAMES:
         # Reuse the registry's codebook tables. MX-family formats need
         # E8M0 scale snapping to match the OCP MX serving path; NV/FP
