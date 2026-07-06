@@ -120,6 +120,22 @@ def test_batched_cost_path_matches_unbatched(name):
     torch.testing.assert_close(batched, per_slice, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("name", ["Q2_K", "Q3_K", "Q4_K", "Q6_K"])
+def test_imatrix_weighting_changes_bytes_and_stays_bit_exact(name):
+    """col_weights (imatrix) biases scale selection; pack and emulation
+    must agree bit-exactly under the same weights, and weighting must
+    actually change the outcome (else the hook is dead)."""
+    w = _weights()
+    qw = torch.rand(1024) + 0.05
+    packed = gguf_pack(w, name, col_weights=qw)
+    qt = getattr(gguf.GGMLQuantizationType, name)
+    decoded = gguf.quants.dequantize(packed, qt)
+    emulated = gguf_quantize_dequantize(w, name, col_weights=qw).numpy()
+    np.testing.assert_array_equal(decoded, emulated)
+    unweighted = gguf_quantize_dequantize(w, name).numpy()
+    assert not np.array_equal(emulated, unweighted)
+
+
 def test_gguf_serving_profile_gates_formats_and_shapes():
     profile = load_serving_profile("gguf")
 

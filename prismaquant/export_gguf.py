@@ -130,6 +130,23 @@ def _map_assignment_to_gguf(
     return gguf_formats, unmatched
 
 
+def build_imatrix_from_act_cache(act_dir: str | Path) -> dict[str, torch.Tensor]:
+    """Per-input-column importance (mean squared activation) per Linear,
+    from the pipeline's activation cache — llama.cpp imatrix semantics,
+    computed on the same calibration corpus the probe/cost stages used."""
+    out: dict[str, torch.Tensor] = {}
+    for p in sorted(Path(act_dir).glob("*.pt")):
+        blob = torch.load(p, map_location="cpu", weights_only=False)
+        inputs = blob.get("inputs") if isinstance(blob, dict) else None
+        if inputs is None or inputs.ndim != 2:
+            continue
+        name = (blob.get("name") if isinstance(blob, dict) else None) or (
+            p.stem.replace("__", ".")
+        )
+        out[name] = inputs.float().pow(2).mean(dim=0)
+    return out
+
+
 def export_gguf(
     skeleton_path: str | Path,
     layer_config_path: str | Path,
@@ -137,6 +154,7 @@ def export_gguf(
     default_format: str | None = None,
     token_embedding_format: str | None = None,
     output_format: str | None = None,
+    imatrix: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, int]:
     assignment = load_assignment(layer_config_path)
     reader = gguf.GGUFReader(str(skeleton_path))
@@ -171,6 +189,16 @@ def export_gguf(
     if output_format is not None:
         gguf_fmt_map.setdefault("output.weight", output_format)
 
+    imatrix_by_gguf: dict[str, torch.Tensor] = {}
+    if imatrix:
+        arch = next(k for k, v in gguf.MODEL_ARCH_NAMES.items()
+                    if v == arch_name)
+        nm = gguf.get_tensor_name_map(arch, n_layers)
+        for hf_qname, qw in imatrix.items():
+            gname = nm.get_name(hf_qname)
+            if gname is not None:
+                imatrix_by_gguf[gname + ".weight"] = qw
+
     for tensor in reader.tensors:
         fmt = gguf_fmt_map.get(tensor.name)
         if fmt is not None:
@@ -190,7 +218,10 @@ def export_gguf(
             # GGUF shape order is reversed: shape[0] is the input dim.
         ):
             w = _reader_tensor_to_torch(tensor)
-            packed = gguf_pack(w, fmt)
+            qw = imatrix_by_gguf.get(tensor.name)
+            if qw is not None and qw.numel() != w.shape[-1]:
+                qw = None  # shape mismatch (stacked/transposed) — unweighted
+            packed = gguf_pack(w, fmt, col_weights=qw)
             # No raw_shape: for quantized dtypes gguf-py derives the logical
             # shape from the packed byte shape (quant_shape_from_byte_shape).
             writer.add_tensor(tensor.name, packed, raw_dtype=getattr(QT, fmt))
@@ -251,12 +282,23 @@ def main(argv: list[str] | None = None) -> None:
                     help="quantize token_embd.weight (e.g. Q2_K)")
     ap.add_argument("--output-format", default=None,
                     help="quantize output.weight / lm_head (e.g. Q6_K)")
+    ap.add_argument(
+        "--imatrix-from-act-cache", default=None,
+        help="activation-cache dir; builds per-column importance "
+        "(mean squared activation) and biases k-quant scale selection "
+        "with llama.cpp imatrix semantics",
+    )
     args = ap.parse_args(argv)
+    imatrix = None
+    if args.imatrix_from_act_cache:
+        imatrix = build_imatrix_from_act_cache(args.imatrix_from_act_cache)
+        print(f"imatrix: {len(imatrix)} Linears from act cache")
     counts = export_gguf(
         args.skeleton, args.layer_config, args.out,
         default_format=args.default_format,
         token_embedding_format=args.token_embedding_format,
         output_format=args.output_format,
+        imatrix=imatrix,
     )
     size = Path(args.out).stat().st_size / 1e9
     print(f"wrote {args.out} ({size:.2f} GB)")

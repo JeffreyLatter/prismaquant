@@ -164,9 +164,23 @@ def _search_sym(sb: torch.Tensor, nmax: int,
     return torch.where(degenerate, torch.zeros_like(scale), scale)
 
 
+def _imatrix_weights(blocks: torch.Tensor, qw: torch.Tensor, sub: int,
+                     sigma2_factor: float) -> torch.Tensor:
+    """llama.cpp imatrix composition: qw * sqrt(sigma2 + x^2), with sigma2
+    the (factor-scaled) mean square over the whole superblock."""
+    n = blocks.shape[0]
+    sigma2 = sigma2_factor * blocks.pow(2).mean(dim=-1, keepdim=True)
+    sb = blocks.reshape(n, QK_K // sub, sub)
+    return qw.reshape(n, QK_K // sub, sub) * (
+        sigma2.unsqueeze(-1) + sb * sb
+    ).sqrt()
+
+
 def _fields_asym(blocks: torch.Tensor, sub: int, qmax: int, scale_max: int,
                  rmin: float, rdelta: float, nstep: int,
-                 use_mad: bool, weight_kind: str) -> dict[str, torch.Tensor]:
+                 use_mad: bool, weight_kind: str,
+                 qw: torch.Tensor | None = None,
+                 sigma2_factor: float = 2.0) -> dict[str, torch.Tensor]:
     """Shared asymmetric two-tier quantizer (Q2_K sub=16, Q4_K/Q5_K sub=32).
 
     llama.cpp-reference weighted search per sub-block, then sub-scale and
@@ -175,7 +189,9 @@ def _fields_asym(blocks: torch.Tensor, sub: int, qmax: int, scale_max: int,
     """
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // sub, sub)
-    if weight_kind == "abs":
+    if qw is not None:
+        weights = _imatrix_weights(blocks, qw, sub, sigma2_factor)
+    elif weight_kind == "abs":
         weights = sb.abs()
     else:  # "avx_abs": av_x + |x|, the Q4_K/Q5_K reference weighting
         av_x = sb.pow(2).mean(dim=-1, keepdim=True).sqrt()
@@ -205,25 +221,29 @@ def _recon_asym(f: dict[str, torch.Tensor], sub: int) -> torch.Tensor:
     return (dl * q - ml).reshape(n, QK_K)
 
 
-def _fields_q2_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
+def _fields_q2_k(blocks: torch.Tensor,
+                 qw: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     return _fields_asym(blocks, sub=16, qmax=3, scale_max=15,
                         rmin=-0.5, rdelta=0.1, nstep=15, use_mad=True,
-                        weight_kind="abs")
+                        weight_kind="abs", qw=qw, sigma2_factor=1.0)
 
 
-def _fields_q4_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
+def _fields_q4_k(blocks: torch.Tensor,
+                 qw: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     return _fields_asym(blocks, sub=32, qmax=15, scale_max=63,
                         rmin=-1.0, rdelta=0.1, nstep=20, use_mad=False,
-                        weight_kind="avx_abs")
+                        weight_kind="avx_abs", qw=qw, sigma2_factor=2.0)
 
 
-def _fields_q5_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
+def _fields_q5_k(blocks: torch.Tensor,
+                 qw: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     return _fields_asym(blocks, sub=32, qmax=31, scale_max=63,
                         rmin=-0.5, rdelta=0.1, nstep=15, use_mad=False,
-                        weight_kind="avx_abs")
+                        weight_kind="avx_abs", qw=qw, sigma2_factor=2.0)
 
 
-def _fields_q3_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
+def _fields_q3_k(blocks: torch.Tensor,
+                 qw: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """Symmetric 3-bit: q in [-4, 3], 6-bit signed sub-scales, fp16 d.
 
     x^2-weighted LS sub-scales; the 16 float sub-scales are themselves
@@ -233,7 +253,10 @@ def _fields_q3_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
     """
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // 16, 16)
-    weights = sb * sb
+    if qw is not None:
+        weights = _imatrix_weights(blocks, qw, 16, sigma2_factor=2.0)
+    else:
+        weights = sb * sb
     sub_scale = _search_sym(sb, nmax=4, weights=weights)
 
     sw = weights.sum(dim=-1)
@@ -253,16 +276,20 @@ def _recon_q3_k(f: dict[str, torch.Tensor]) -> torch.Tensor:
     return (dl * f["q"].reshape(n, QK_K // 16, 16).float()).reshape(n, QK_K)
 
 
-def _fields_q6_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
+def _fields_q6_k(blocks: torch.Tensor,
+                 qw: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """Symmetric 6-bit: q in [-32, 31], int8 sub-scales, fp16 d.
 
-    x^2-weighted LS sub-scales; the super-scale maps the largest
-    (signed) sub-scale onto -128, using the extra negative int8 level
-    as the reference does.
+    x^2-weighted LS sub-scales (raw qw when an imatrix is given, as the
+    reference does); the super-scale maps the largest (signed) sub-scale
+    onto -128, using the extra negative int8 level as the reference does.
     """
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // 16, 16)
-    weights = sb * sb
+    if qw is not None:
+        weights = qw.reshape(n, QK_K // 16, 16)
+    else:
+        weights = sb * sb
     sub_scale = _search_sym(sb, nmax=32, weights=weights)
 
     amax, idx = sub_scale.abs().max(dim=1, keepdim=True)
@@ -281,9 +308,12 @@ def _recon_q6_k(f: dict[str, torch.Tensor]) -> torch.Tensor:
     return (dl * f["q"].reshape(n, QK_K // 16, 16).float()).reshape(n, QK_K)
 
 
-def _fields_q8_0(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
+def _fields_q8_0(blocks: torch.Tensor,
+                 qw: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """Per-32 symmetric int8 (blocks input is (N, 32)); half-away rounding
-    to stay bit-exact with the ggml/gguf-py reference quantizer."""
+    to stay bit-exact with the ggml/gguf-py reference quantizer. The
+    reference Q8_0 quantizer ignores imatrix weights."""
+    del qw
     d = _fp16r(blocks.abs().amax(dim=1, keepdim=True) / 127.0)
     q = _round_half_away(blocks * _safe_inv(d)).clamp(-128, 127).to(torch.int8)
     return {"d": d, "q": q}
@@ -309,7 +339,21 @@ _FIELDS = {
 }
 
 
-def gguf_quantize_dequantize(w: torch.Tensor, fmt: str) -> torch.Tensor:
+def _qw_blocks(qw: torch.Tensor, flat: torch.Tensor, in_f: int, pad: int,
+               block: int) -> torch.Tensor:
+    """Broadcast per-input-column weights to the flat superblock layout."""
+    qw = qw.reshape(1, in_f).to(torch.float32).to(flat.device)
+    if pad:
+        qw = torch.nn.functional.pad(qw, (0, pad))
+    return qw.expand(flat.shape[0], -1).reshape(-1, block)
+
+
+def gguf_quantize_dequantize(
+    w: torch.Tensor, fmt: str, col_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Emulation QDQ. ``col_weights`` is an optional per-input-column
+    importance vector (llama.cpp imatrix semantics: mean squared
+    activation per column); it biases scale selection, never the grid."""
     fields_fn, recon_fn, block = _FIELDS[fmt]
     orig_shape = w.shape
     in_f = int(orig_shape[-1])
@@ -318,7 +362,10 @@ def gguf_quantize_dequantize(w: torch.Tensor, fmt: str) -> torch.Tensor:
     if pad:
         flat = torch.nn.functional.pad(flat, (0, pad))
     blocks = flat.reshape(-1, block)
-    out = recon_fn(fields_fn(blocks)).reshape(flat.shape)
+    qw = None
+    if col_weights is not None:
+        qw = _qw_blocks(col_weights, flat, in_f, pad, block)
+    out = recon_fn(fields_fn(blocks, qw=qw)).reshape(flat.shape)
     if pad:
         out = out[:, :in_f]
     return out.reshape(orig_shape).to(w.dtype)
@@ -392,10 +439,16 @@ def _pack_scales_q3(sc: torch.Tensor) -> torch.Tensor:
     return out.to(torch.uint8)
 
 
-def _pack_blocks(w: torch.Tensor, fmt: str) -> torch.Tensor:
+def _pack_blocks(w: torch.Tensor, fmt: str,
+                 col_weights: torch.Tensor | None = None) -> torch.Tensor:
     fields_fn, _, block = _FIELDS[fmt]
-    flat = w.to(torch.float32).reshape(-1, block)
-    f = fields_fn(flat)
+    in_f = int(w.shape[-1])
+    flat2d = w.to(torch.float32).reshape(-1, in_f)
+    flat = flat2d.reshape(-1, block)
+    qw = None
+    if col_weights is not None:
+        qw = _qw_blocks(col_weights, flat2d, in_f, 0, block)
+    f = fields_fn(flat, qw=qw)
     n = flat.shape[0]
     if fmt == "Q2_K":
         scales_b = (f["sc"] | (f["m"] << 4)).to(torch.uint8)
@@ -427,11 +480,14 @@ def _pack_blocks(w: torch.Tensor, fmt: str) -> torch.Tensor:
     raise ValueError(f"unsupported GGUF pack format: {fmt}")
 
 
-def gguf_pack(w: torch.Tensor, fmt: str) -> np.ndarray:
+def gguf_pack(w: torch.Tensor, fmt: str,
+              col_weights: torch.Tensor | None = None) -> np.ndarray:
     """Quantize + bit-pack a 2-D (or stacked 3-D) weight into GGUF bytes.
 
     Returns uint8 of shape ``(*w.shape[:-1], row_bytes)`` — the shape the
     GGUF writer needs so tensor metadata records the logical dims.
+    ``col_weights`` (in_features,) biases scale selection exactly as the
+    emulation's ``col_weights`` does — the two stay bit-identical.
     """
     block, type_size = GGUF_BLOCK_BYTES[fmt]
     in_f = int(w.shape[-1])
@@ -440,6 +496,6 @@ def gguf_pack(w: torch.Tensor, fmt: str) -> np.ndarray:
             f"{fmt} requires the input dim to be a multiple of {block}; "
             f"got shape {tuple(w.shape)}"
         )
-    packed = _pack_blocks(w, fmt)
+    packed = _pack_blocks(w, fmt, col_weights=col_weights)
     out_shape = tuple(w.shape[:-1]) + (in_f // block * type_size,)
     return packed.reshape(out_shape).cpu().numpy()
