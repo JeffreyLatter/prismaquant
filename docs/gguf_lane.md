@@ -128,15 +128,21 @@ house promotion rules (repeats, held-out corpora, downstream tasks) apply.
 
 ## 4B scale check (Qwen3-4B, byte-identical 1669.5 MB arms, 64-chunk KL)
 
-| arm | mean KLD | top-1 |
+| arm (byte-matched, r = activation rows feeding imatrix+GPTQ) | mean KLD | top-1 |
 |---|---|---|
 | llama.cpp Q2_K preset + imatrix | 0.461 | 74.3% |
-| their mix, **our** imatrix+GPTQ render | 0.552 | 72.3% |
-| our M6 allocation, our render (Q6_K embd) | 0.644 | 70.1% |
+| their mix, our render, r256 | 0.552 | 72.3% |
+| our allocation (r256 cost), our render, r256 | 0.644 | 70.1% |
+| their mix, our render, **r1024** | 0.497 | 74.2% |
+| **ours fully consistent at r1024 (cost+alloc+render)** | **0.510** | **73.5%** |
 
-The 0.6B win did **not** transfer: at 4B the render trails by +20% and the
-allocation by +17%, in roughly equal parts. Two structural causes were
-isolated on the way:
+The initial +40% loss decomposed into input starvation, not structural
+deficits: with 1024-row activations feeding the Hessian, the imatrix, AND the
+cost measurement, the full stack lands at +10.6% KLD / −0.8pp top-1 vs
+llama.cpp's best — of which ~+7.7% is residual render (1024 rows is still
+10.5% rank at 4B; try more) and ~+2.6% is allocation vs their hand mix
+(validated-frontier selection is the answer there). The M6 objective is
+roughly vindicated at 4B once fed proper inputs. Causes isolated on the way:
 
 1. **Tied embeddings**: Qwen3-4B ties `token_embd` to the output head, and
    llama.cpp's preset ships it Q6_K — a Q2_K embedding policy silently gives
