@@ -135,6 +135,8 @@ def export_gguf(
     layer_config_path: str | Path,
     out_path: str | Path,
     default_format: str | None = None,
+    token_embedding_format: str | None = None,
+    output_format: str | None = None,
 ) -> dict[str, int]:
     assignment = load_assignment(layer_config_path)
     reader = gguf.GGUFReader(str(skeleton_path))
@@ -160,6 +162,14 @@ def export_gguf(
 
     counts: Counter[str] = Counter()
     tensor_formats: dict[str, str] = {}
+
+    # Embedding / output-head policy: these sit outside the allocator's
+    # body budget (bpp is reported over quantizable Linears only), but the
+    # llama.cpp ecosystem quantizes them and size comparisons must match.
+    if token_embedding_format is not None:
+        gguf_fmt_map.setdefault("token_embd.weight", token_embedding_format)
+    if output_format is not None:
+        gguf_fmt_map.setdefault("output.weight", output_format)
 
     for tensor in reader.tensors:
         fmt = gguf_fmt_map.get(tensor.name)
@@ -198,6 +208,8 @@ def export_gguf(
             tensor_formats[tensor.name] = tensor.tensor_type.name
 
     missing = set(gguf_fmt_map) - seen_gguf_names
+    # The tied-embeddings case: a skeleton may carry no output.weight.
+    missing.discard("output.weight")
     if missing:
         raise ValueError(
             f"{len(missing)} assignment entries matched no skeleton "
@@ -235,10 +247,16 @@ def main(argv: list[str] | None = None) -> None:
         help="optional GGUF format for 2-D weights absent from the "
         "assignment (e.g. Q6_K); default: keep skeleton precision",
     )
+    ap.add_argument("--token-embedding-format", default=None,
+                    help="quantize token_embd.weight (e.g. Q2_K)")
+    ap.add_argument("--output-format", default=None,
+                    help="quantize output.weight / lm_head (e.g. Q6_K)")
     args = ap.parse_args(argv)
     counts = export_gguf(
         args.skeleton, args.layer_config, args.out,
         default_format=args.default_format,
+        token_embedding_format=args.token_embedding_format,
+        output_format=args.output_format,
     )
     size = Path(args.out).stat().st_size / 1e9
     print(f"wrote {args.out} ({size:.2f} GB)")

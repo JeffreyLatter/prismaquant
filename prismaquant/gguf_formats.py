@@ -13,10 +13,18 @@ error and shipped bytes cannot diverge. Byte layouts are the exact
 inverses of gguf-py's ``dequantize_blocks`` (validated bit-exact in
 tests/test_gguf_formats.py).
 
-Scale selection here is RTN-grade (min-max / max-abs, like the llama.cpp
-reference quantizers but without their weighted grid search). Activation
-emulation models the ggml MMQ/MMVQ compute path, which quantizes
-activations to Q8_1 (per-32 symmetric int8).
+Scale selection ports llama.cpp's reference quantizers (ggml-quants.c):
+``make_qkx2_quants`` for the asymmetric types (weighted grid search over
+candidate scales + weighted least-squares (scale, min) refit per
+sub-block) and ``make_qx_quants`` for the symmetric types (sign-aware
+search that maps the extremum onto the extra negative level, weighted-LS
+scale refit), vectorized over all sub-blocks in torch. Weight functions
+match the no-imatrix reference: |x| (Q2_K), av_x+|x| (Q4_K/Q5_K), x^2
+(Q3_K/Q6_K); Q3_K additionally LS-quantizes its 16 sub-scales onto the
+6-bit grid with per-sub-block weight mass, as the reference does.
+
+Activation emulation models the ggml MMQ/MMVQ compute path, which
+quantizes activations to Q8_1 (per-32 symmetric int8).
 """
 from __future__ import annotations
 
@@ -64,19 +72,119 @@ def _round_half_away(t: torch.Tensor) -> torch.Tensor:
 # reconstruct values or pack bytes.
 # ---------------------------------------------------------------------------
 
-def _fields_asym(blocks: torch.Tensor, sub: int, qmax: int,
-                 scale_max: int) -> dict[str, torch.Tensor]:
+def _search_asym(sb: torch.Tensor, qmax: int, weights: torch.Tensor,
+                 rmin: float, rdelta: float, nstep: int,
+                 use_mad: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized make_qkx2_quants: weighted (scale, min) search per sub-block.
+
+    sb, weights: (..., sub). Returns float (sub_scale, sub_min), both >= 0.
+    """
+    mn = sb.amin(dim=-1).clamp_max(0.0)
+    mx = sb.amax(dim=-1)
+    span = mx - mn
+    degenerate = span <= 0
+
+    sum_w = weights.sum(dim=-1)
+    sum_x = (weights * sb).sum(dim=-1)
+
+    def _err(scale, minv, L):
+        diff = scale.unsqueeze(-1) * L + minv.unsqueeze(-1) - sb
+        diff = diff.abs() if use_mad else diff * diff
+        return (weights * diff).sum(dim=-1)
+
+    iscale0 = qmax * _safe_inv(span)
+    L = torch.round(iscale0.unsqueeze(-1) * (sb - mn.unsqueeze(-1)))
+    L = L.clamp(0, qmax)
+    best_scale = _safe_inv(iscale0)
+    best_min = mn
+    best_err = _err(best_scale, best_min, L)
+
+    for step in range(nstep + 1):
+        iscale = (rmin + rdelta * step + qmax) * _safe_inv(span)
+        Laux = torch.round(iscale.unsqueeze(-1) * (sb - mn.unsqueeze(-1)))
+        Laux = Laux.clamp(0, qmax)
+        wl = weights * Laux
+        sum_l = wl.sum(dim=-1)
+        sum_l2 = (wl * Laux).sum(dim=-1)
+        sum_xl = (wl * sb).sum(dim=-1)
+        D = sum_w * sum_l2 - sum_l * sum_l
+        this_scale = (sum_w * sum_xl - sum_x * sum_l) * _safe_inv(D)
+        this_min = (sum_l2 * sum_x - sum_l * sum_xl) * _safe_inv(D)
+        # A positive min is illegal (mins are stored >= 0 and subtracted):
+        # clamp to 0 and refit scale alone, as the reference does.
+        pos = this_min > 0
+        this_scale = torch.where(pos, sum_xl * _safe_inv(sum_l2), this_scale)
+        this_min = torch.where(pos, torch.zeros_like(this_min), this_min)
+        cur_err = _err(this_scale, this_min, Laux)
+        better = (D > 0) & (cur_err < best_err)
+        best_err = torch.where(better, cur_err, best_err)
+        best_scale = torch.where(better, this_scale, best_scale)
+        best_min = torch.where(better, this_min, best_min)
+
+    zero = torch.zeros_like(best_scale)
+    best_scale = torch.where(degenerate, zero, best_scale)
+    best_min = torch.where(degenerate, -mn, -best_min)
+    return best_scale, best_min.clamp_min(0.0)
+
+
+def _search_sym(sb: torch.Tensor, nmax: int,
+                weights: torch.Tensor) -> torch.Tensor:
+    """Vectorized make_qx_quants: sign-aware weighted-LS scale per sub-block.
+
+    sb, weights: (..., sub). Quant grid is [-nmax, nmax-1]; the initial
+    candidate maps the (signed) extremum onto -nmax so the asymmetric
+    integer range is fully used. Returns the SIGNED float scale.
+    """
+    amax, idx = sb.abs().max(dim=-1)
+    signed_max = torch.gather(sb, -1, idx.unsqueeze(-1)).squeeze(-1)
+    degenerate = amax < 1e-30
+
+    def _fit(iscale):
+        L = torch.round(iscale.unsqueeze(-1) * sb).clamp(-nmax, nmax - 1)
+        wl = weights * L
+        sumlx = (wl * sb).sum(dim=-1)
+        suml2 = (wl * L).sum(dim=-1)
+        return sumlx, suml2
+
+    iscale0 = -nmax * _safe_inv(signed_max)
+    sumlx, suml2 = _fit(iscale0)
+    scale = sumlx * _safe_inv(suml2)
+    best = scale * sumlx
+
+    for step in range(-9, 10):
+        if step == 0:
+            continue
+        iscale = -(nmax + 0.1 * step) * _safe_inv(signed_max)
+        slx, sl2 = _fit(iscale)
+        better = (sl2 > 0) & (slx * slx > best * sl2)
+        new_scale = slx * _safe_inv(sl2)
+        scale = torch.where(better, new_scale, scale)
+        best = torch.where(better, new_scale * slx, best)
+
+    return torch.where(degenerate, torch.zeros_like(scale), scale)
+
+
+def _fields_asym(blocks: torch.Tensor, sub: int, qmax: int, scale_max: int,
+                 rmin: float, rdelta: float, nstep: int,
+                 use_mad: bool, weight_kind: str) -> dict[str, torch.Tensor]:
     """Shared asymmetric two-tier quantizer (Q2_K sub=16, Q4_K/Q5_K sub=32).
 
-    Per sub-block min-max affine onto q in [0, qmax]; sub-scale and sub-min
-    quantized to [0, scale_max] under fp16 super-scales d, dmin.
+    llama.cpp-reference weighted search per sub-block, then sub-scale and
+    sub-min quantized to [0, scale_max] under fp16 super-scales d, dmin,
+    and q recomputed against the *quantized* (dl, ml).
     """
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // sub, sub)
-    mn = sb.amin(dim=2).clamp_max(0.0)
-    mx = sb.amax(dim=2).clamp_min(0.0)
-    sub_min = -mn
-    sub_scale = (mx - mn) / qmax
+    if weight_kind == "abs":
+        weights = sb.abs()
+    else:  # "avx_abs": av_x + |x|, the Q4_K/Q5_K reference weighting
+        av_x = sb.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        weights = av_x + sb.abs()
+
+    sub_scale, sub_min = _search_asym(
+        sb, qmax, weights, rmin=rmin, rdelta=rdelta, nstep=nstep,
+        use_mad=use_mad,
+    )
 
     d = _fp16r(sub_scale.amax(dim=1, keepdim=True) / scale_max)
     dmin = _fp16r(sub_min.amax(dim=1, keepdim=True) / scale_max)
@@ -98,25 +206,40 @@ def _recon_asym(f: dict[str, torch.Tensor], sub: int) -> torch.Tensor:
 
 
 def _fields_q2_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
-    return _fields_asym(blocks, sub=16, qmax=3, scale_max=15)
+    return _fields_asym(blocks, sub=16, qmax=3, scale_max=15,
+                        rmin=-0.5, rdelta=0.1, nstep=15, use_mad=True,
+                        weight_kind="abs")
 
 
 def _fields_q4_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
-    return _fields_asym(blocks, sub=32, qmax=15, scale_max=63)
+    return _fields_asym(blocks, sub=32, qmax=15, scale_max=63,
+                        rmin=-1.0, rdelta=0.1, nstep=20, use_mad=False,
+                        weight_kind="avx_abs")
 
 
 def _fields_q5_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
-    return _fields_asym(blocks, sub=32, qmax=31, scale_max=63)
+    return _fields_asym(blocks, sub=32, qmax=31, scale_max=63,
+                        rmin=-0.5, rdelta=0.1, nstep=15, use_mad=False,
+                        weight_kind="avx_abs")
 
 
 def _fields_q3_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Symmetric 3-bit: q in [-4, 3], 6-bit signed sub-scales, fp16 d."""
+    """Symmetric 3-bit: q in [-4, 3], 6-bit signed sub-scales, fp16 d.
+
+    x^2-weighted LS sub-scales; the 16 float sub-scales are themselves
+    LS-quantized onto [-32, 31] with per-sub-block weight mass (the
+    reference's second make_qx_quants pass), then q recomputed against
+    the quantized two-tier scale.
+    """
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // 16, 16)
-    amax = sb.abs().amax(dim=2)
-    sub_scale = amax / 4.0
+    weights = sb * sb
+    sub_scale = _search_sym(sb, nmax=4, weights=weights)
 
-    d = _fp16r(sub_scale.amax(dim=1, keepdim=True) / 31.0)
+    sw = weights.sum(dim=-1)
+    d = _fp16r(
+        _search_sym(sub_scale, nmax=32, weights=sw).unsqueeze(-1)
+    )
     sc = torch.round(sub_scale * _safe_inv(d)).clamp(-32, 31).to(torch.int8)
 
     dl = (d * sc.float()).unsqueeze(-1)
@@ -131,13 +254,20 @@ def _recon_q3_k(f: dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 def _fields_q6_k(blocks: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Symmetric 6-bit: q in [-32, 31], int8 sub-scales, fp16 d."""
+    """Symmetric 6-bit: q in [-32, 31], int8 sub-scales, fp16 d.
+
+    x^2-weighted LS sub-scales; the super-scale maps the largest
+    (signed) sub-scale onto -128, using the extra negative int8 level
+    as the reference does.
+    """
     n = blocks.shape[0]
     sb = blocks.reshape(n, QK_K // 16, 16)
-    amax = sb.abs().amax(dim=2)
-    sub_scale = amax / 32.0
+    weights = sb * sb
+    sub_scale = _search_sym(sb, nmax=32, weights=weights)
 
-    d = _fp16r(sub_scale.amax(dim=1, keepdim=True) / 127.0)
+    amax, idx = sub_scale.abs().max(dim=1, keepdim=True)
+    signed_max = torch.gather(sub_scale, 1, idx)
+    d = _fp16r(-signed_max / 128.0)
     sc = torch.round(sub_scale * _safe_inv(d)).clamp(-128, 127).to(torch.int8)
 
     dl = (d * sc.float()).unsqueeze(-1)
