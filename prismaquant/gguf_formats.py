@@ -339,13 +339,19 @@ _FIELDS = {
 }
 
 
-def _qw_blocks(qw: torch.Tensor, flat: torch.Tensor, in_f: int, pad: int,
+def _qw_blocks(qw: torch.Tensor, w_shape: tuple[int, ...], pad: int,
                block: int) -> torch.Tensor:
-    """Broadcast per-input-column weights to the flat superblock layout."""
-    qw = qw.reshape(1, in_f).to(torch.float32).to(flat.device)
+    """Broadcast column weights to the flat superblock layout.
+
+    ``qw`` is either (in_features,) — one importance vector for the whole
+    tensor — or any shape broadcastable to ``w_shape`` (e.g. (N, 1, in)
+    for a stacked batch with per-item vectors).
+    """
+    qw = qw.to(torch.float32)
+    full = torch.broadcast_to(qw, w_shape).reshape(-1, w_shape[-1])
     if pad:
-        qw = torch.nn.functional.pad(qw, (0, pad))
-    return qw.expand(flat.shape[0], -1).reshape(-1, block)
+        full = torch.nn.functional.pad(full, (0, pad))
+    return full.reshape(-1, block)
 
 
 def gguf_quantize_dequantize(
@@ -364,7 +370,9 @@ def gguf_quantize_dequantize(
     blocks = flat.reshape(-1, block)
     qw = None
     if col_weights is not None:
-        qw = _qw_blocks(col_weights, flat, in_f, pad, block)
+        qw = _qw_blocks(
+            col_weights.to(w.device), tuple(orig_shape), pad, block,
+        )
     out = recon_fn(fields_fn(blocks, qw=qw)).reshape(flat.shape)
     if pad:
         out = out[:, :in_f]
@@ -443,11 +451,10 @@ def _pack_blocks(w: torch.Tensor, fmt: str,
                  col_weights: torch.Tensor | None = None) -> torch.Tensor:
     fields_fn, _, block = _FIELDS[fmt]
     in_f = int(w.shape[-1])
-    flat2d = w.to(torch.float32).reshape(-1, in_f)
-    flat = flat2d.reshape(-1, block)
+    flat = w.to(torch.float32).reshape(-1, block)
     qw = None
     if col_weights is not None:
-        qw = _qw_blocks(col_weights, flat2d, in_f, 0, block)
+        qw = _qw_blocks(col_weights.to(w.device), tuple(w.shape), 0, block)
     f = fields_fn(flat, qw=qw)
     n = flat.shape[0]
     if fmt == "Q2_K":

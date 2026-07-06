@@ -119,6 +119,16 @@ def test_batched_cost_path_matches_unbatched(name):
     )
     torch.testing.assert_close(batched, per_slice, rtol=0, atol=0)
 
+    # Per-item imatrix vectors (the cost path's shape): batched must match
+    # per-slice weighted quantization exactly.
+    qw = torch.rand(3, 1, 512) + 0.05
+    batched_w = _batched_quantize(spec, stacked, col_weights=qw)
+    per_slice_w = torch.stack([
+        gguf_quantize_dequantize(stacked[i], name, col_weights=qw[i, 0])
+        for i in range(3)
+    ])
+    torch.testing.assert_close(batched_w, per_slice_w, rtol=0, atol=0)
+
 
 @pytest.mark.parametrize("name", ["Q2_K", "Q3_K", "Q4_K", "Q6_K"])
 def test_imatrix_weighting_changes_bytes_and_stays_bit_exact(name):

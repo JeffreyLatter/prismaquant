@@ -1070,7 +1070,22 @@ _CODEBOOK_NAMES = {
 }
 
 
-def _batched_quantize(spec: fr.FormatSpec, stacked_w: torch.Tensor) -> torch.Tensor:
+def _gguf_imatrix_enabled() -> bool:
+    """PRISMAQUANT_GGUF_IMATRIX: activation-weighted (imatrix) scale
+    selection for GGUF k-quant cost measurement. Default ON — the GGUF
+    exporter ships imatrix-weighted bytes (--imatrix-from-act-cache), so
+    the cost the allocator optimizes must be measured on the same render
+    or the A/B has a rendering confound. Set =0 only together with an
+    unweighted export."""
+    value = os.environ.get("PRISMAQUANT_GGUF_IMATRIX", "1")
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _batched_quantize(
+    spec: fr.FormatSpec,
+    stacked_w: torch.Tensor,
+    col_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     elt = spec.weight_element_dtype
     if spec.family == "nv":
         # NVFP4 registry weights are export-codec-aligned (one rendering
@@ -1089,8 +1104,19 @@ def _batched_quantize(spec: fr.FormatSpec, stacked_w: torch.Tensor) -> torch.Ten
         # GGUF k-quants: the registry qdq reshapes (..., in) internally and
         # every scale is local to a 256-superblock (no per-tensor state), so
         # the stacked (N, out, in) tensor quantizes in one call and matches
-        # the unbatched path bit-for-bit.
-        return spec.quantize_dequantize(stacked_w)
+        # the unbatched path bit-for-bit. col_weights (per-item imatrix
+        # vectors, broadcastable to stacked_w) bias scale selection exactly
+        # as the exporter's --imatrix-from-act-cache does.
+        from prismaquant.gguf_formats import gguf_quantize_dequantize
+
+        return gguf_quantize_dequantize(
+            stacked_w, spec.name, col_weights=col_weights,
+        )
+    if col_weights is not None:
+        raise ValueError(
+            f"col_weights is only supported for gguf-family formats, "
+            f"got {spec.name}"
+        )
     if elt in _CODEBOOK_NAMES:
         # Reuse the registry's codebook tables. MX-family formats need
         # E8M0 scale snapping to match the OCP MX serving path; NV/FP
@@ -1259,9 +1285,22 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     gq_stacked = torch.stack(gq_items, dim=0)  # (N, rows)
                 del h_items, gq_items
 
+            gguf_qw = None
+            if _gguf_imatrix_enabled() and any(
+                s.family == "gguf" for s in specs
+            ):
+                # Per-item imatrix: mean squared activation per input
+                # column, from the same X the output-MSE bmm uses.
+                gguf_qw = X.float().pow(2).mean(dim=1, keepdim=True)  # (N,1,in)
+
             for spec in specs:
                 try:
-                    W_hat = _batched_quantize(spec, W)
+                    W_hat = _batched_quantize(
+                        spec, W,
+                        col_weights=(
+                            gguf_qw if spec.family == "gguf" else None
+                        ),
+                    )
                     X_hat = spec.activation_quantize_dequantize(X.clone())
                     err = (W - W_hat).float()
                     weight_mse = err.pow(2).mean(dim=(1, 2))  # (N,)

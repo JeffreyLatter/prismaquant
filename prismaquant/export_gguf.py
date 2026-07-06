@@ -161,6 +161,17 @@ def export_gguf(
         # GPU-first: the weighted scale search is the export hot path.
         device = "cuda" if torch.cuda.is_available() else "cpu"
     assignment = load_assignment(layer_config_path)
+    illegal = sorted({
+        fmt for fmt in assignment.values()
+        if fmt not in GGUF_BLOCK_BYTES and fmt != "BF16"
+    })
+    if illegal:
+        # Fail fast: silently shipping a non-GGUF assignment at skeleton
+        # precision would be the coerce-to-BF16 landmine all over again.
+        raise ValueError(
+            f"assignment contains formats the GGUF container cannot carry: "
+            f"{illegal} — allocate with --target-profile gguf"
+        )
     reader = gguf.GGUFReader(str(skeleton_path))
 
     arch_field = reader.fields["general.architecture"]

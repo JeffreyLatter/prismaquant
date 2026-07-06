@@ -1257,6 +1257,51 @@ PY
   fi
 fi
 
+if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
+  # GGUF lane: one artifact serves llama.cpp natively and vLLM via the
+  # GGUF path. Requires TARGET_PROFILE=gguf at allocation time (the
+  # exporter hard-fails on non-GGUF formats). The skeleton (metadata +
+  # tokenizer) comes from llama.cpp's own converter; we requantize bytes.
+  : "${LLAMA_CPP_DIR:=/home/rob/dq-runs/llama.cpp}"
+  : "${GGUF_SKELETON:=${WORK_DIR}/artifacts/skeleton.gguf}"
+  : "${GGUF_TOKEN_EMBEDDING_FORMAT:=}"
+  : "${GGUF_OUTPUT_FORMAT:=}"
+  if [[ ! -f "$GGUF_SKELETON" ]]; then
+    echo "[pipeline] [4/4] building GGUF skeleton (convert_hf_to_gguf, bf16) ..."
+    python3 "$LLAMA_CPP_DIR/convert_hf_to_gguf.py" "$MODEL_PATH" \
+      --outtype bf16 --outfile "$GGUF_SKELETON" \
+      2>&1 | tee "${WORK_DIR}/logs/gguf_skeleton.log"
+  else
+    echo "[pipeline] [4/4] GGUF skeleton exists, skipping"
+  fi
+  echo "[pipeline] [4/4] exporting to GGUF ..."
+  GGUF_EXPORT_ARGS=(
+    python3 -m prismaquant.export_gguf
+    --skeleton "$GGUF_SKELETON"
+    --layer-config "${WORK_DIR}/artifacts/layer_config.json"
+    --out "${WORK_DIR}/exported.gguf"
+    --device "$EXPORT_DEVICE"
+  )
+  # Keep export-side imatrix in lockstep with the cost measurement
+  # (PRISMAQUANT_GGUF_IMATRIX, default on): measured cost and shipped
+  # bytes must be the same rendering.
+  case "${PRISMAQUANT_GGUF_IMATRIX:-1}" in
+    0|false|False|FALSE|no|No|NO) ;;
+    *) GGUF_EXPORT_ARGS+=(--imatrix-from-act-cache "${WORK_DIR}/act") ;;
+  esac
+  [[ -n "$GGUF_TOKEN_EMBEDDING_FORMAT" ]] && \
+    GGUF_EXPORT_ARGS+=(--token-embedding-format "$GGUF_TOKEN_EMBEDDING_FORMAT")
+  [[ -n "$GGUF_OUTPUT_FORMAT" ]] && \
+    GGUF_EXPORT_ARGS+=(--output-format "$GGUF_OUTPUT_FORMAT")
+  "${GGUF_EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
+  echo
+  echo "[pipeline] done."
+  echo "  Artifact: ${WORK_DIR}/exported.gguf"
+  echo "  Serve (llama.cpp): $LLAMA_CPP_DIR/build/bin/llama-server -m ${WORK_DIR}/exported.gguf -ngl 99"
+  echo "  KL harness:        llama-perplexity --kl-divergence-base <base_logits> --kl-divergence"
+  exit 0
+fi
+
 echo "[pipeline] [4/4] exporting to compressed-tensors ..."
 EXPORT_ARGS=(
   python3 -m prismaquant.export_native_compressed

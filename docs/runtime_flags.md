@@ -220,3 +220,13 @@ for f in DEFERRED_FISHER_SYNC DEFERRED_FISHER_COMPUTE ACT_CACHE_ASYNC \
     export "PRISMAQUANT_$f=0"
 done
 ```
+
+## GGUF lane (2026-07-06, `docs/gguf_lane.md`)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `EXPORT_CONTAINER` | `compressed-tensors` | `gguf` switches stage 4 to skeleton-build + `export_gguf` (llama.cpp/vLLM-GGUF artifact); requires `TARGET_PROFILE=gguf` at allocation |
+| `PRISMAQUANT_GGUF_IMATRIX` | `1` | activation-weighted (imatrix) k-quant scale selection in BOTH the batched cost path and the pipeline's export call — keep the two in lockstep or the A/B has a rendering confound |
+| `LLAMA_CPP_DIR` | `/home/rob/dq-runs/llama.cpp` | source of `convert_hf_to_gguf.py` for the skeleton |
+| `GGUF_SKELETON` | `WORK_DIR/artifacts/skeleton.gguf` | bf16 skeleton path (built if missing) |
+| `GGUF_TOKEN_EMBEDDING_FORMAT` / `GGUF_OUTPUT_FORMAT` | keep skeleton precision | quantize `token_embd` / `output` (llama.cpp presets use Q2_K / Q6_K) |
