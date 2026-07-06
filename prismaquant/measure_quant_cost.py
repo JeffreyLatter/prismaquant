@@ -1253,6 +1253,21 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 idx[:chunk_min_rows] if isinstance(idx, torch.Tensor) else None
                 for idx in row_indices_cpu
             ]
+            gguf_qw = None
+            if _gguf_imatrix_enabled() and any(
+                s.family == "gguf" for s in specs
+            ):
+                # Per-item imatrix, computed with the IDENTICAL op on the
+                # IDENTICAL data as export_gguf.build_imatrix_from_act_cache
+                # (FULL fp32 CPU act rows, mean over dim 0) — NOT from the
+                # chunk-truncated compute-dtype X. The k-quant scale search
+                # is a discrete grid: a numerically different importance
+                # vector can flip (sc, m, q) choices, and then the measured
+                # cost would not describe the shipped bytes. Must run
+                # before acts_cpu is freed below.
+                gguf_qw = torch.stack([
+                    a.float().pow(2).mean(dim=0) for a in acts_cpu
+                ]).unsqueeze(1).to(dev)  # (N, 1, in)
             del acts_cpu, act_items_cpu
             # Reference output (per-item BMM): shape (N, rows, out)
             y_ref = torch.bmm(X, W.transpose(1, 2))
@@ -1301,21 +1316,6 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 if all_have_gq and len(gq_items) == N:
                     gq_stacked = torch.stack(gq_items, dim=0)  # (N, rows)
                 del h_items, gq_items
-
-            gguf_qw = None
-            if _gguf_imatrix_enabled() and any(
-                s.family == "gguf" for s in specs
-            ):
-                # Per-item imatrix, computed with the IDENTICAL op on the
-                # IDENTICAL data as export_gguf.build_imatrix_from_act_cache
-                # (full fp32 CPU act rows, mean over dim 0) — NOT from the
-                # chunk-truncated compute-dtype X. The k-quant scale search
-                # is a discrete grid: a numerically different importance
-                # vector can flip (sc, m, q) choices, and then the measured
-                # cost no longer describes the shipped bytes.
-                gguf_qw = torch.stack([
-                    a.float().pow(2).mean(dim=0) for a in acts_cpu
-                ]).unsqueeze(1).to(dev)  # (N, 1, in)
 
             for spec in specs:
                 try:
