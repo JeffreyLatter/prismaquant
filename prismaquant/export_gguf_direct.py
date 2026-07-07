@@ -1,0 +1,285 @@
+"""Streaming direct-from-HF GGUF exporter (no llama.cpp skeleton).
+
+For architectures llama.cpp cannot convert (e.g. Tencent Hy3 / hy_v3),
+the artifact targets vLLM's GGUF path (vllm-gguf-plugin + a small
+weights adapter), so tokenizer embedding and llama.cpp arch tables are
+unnecessary. Tensor names in the output are the HF qnames verbatim —
+the vLLM adapter maps 1:1 — with MoE experts stacked into one 3-D
+tensor per (layer, projection) (the GGUF/ggml fused-MoE layout; one
+quant type per stacked tensor = experts uniform per layer).
+
+Streaming discipline (GPU-first, bounded memory):
+  - safetensors shards are opened lazily; tensors are read on demand.
+  - FP8 sources are dequantized per tensor (``w.float() * weight_scale``
+    for the per-tensor-scale scheme Hy3-FP8 ships).
+  - quantization runs on CUDA; packed bytes stream straight into the
+    GGUF via the incremental writer API (add_tensor_info for all, then
+    write_tensor_data one by one) — neither the source nor the artifact
+    is ever memory-resident.
+
+Note on the emulation==bytes contract: it holds PER DEVICE. FP8-dequant
+values are heavily tie-degenerate (256 codes x one scale), and CPU vs
+CUDA reduction order flips ~0.06% of near-tie scale picks. The pipeline
+measures cost and exports on CUDA, so the shipped bytes match the
+measured emulation; do not mix a CPU-measured cost with a GPU export.
+
+Assignment: a layer_config.json in the usual HF-qname space, where the
+stacked expert tensors use the qname
+``model.layers.N.mlp.experts.{gate,up,down}_proj`` (one entry per
+stacked tensor). Anything absent keeps source precision (BF16/F16
+passthrough for norms etc.); an explicit --default-* recipe covers the
+uniform hand-recipe case without an allocator run.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from collections import Counter
+from pathlib import Path
+
+import gguf
+import numpy as np
+import torch
+from gguf import GGMLQuantizationType as QT
+from safetensors import safe_open
+
+from prismaquant.gguf_formats import GGUF_BLOCK_BYTES, gguf_pack
+from prismaquant.layer_config import load_assignment
+
+_EXPERT_RE = re.compile(
+    r"^(model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+class _ShardIndex:
+    def __init__(self, model_dir: str | Path):
+        self.dir = Path(model_dir)
+        idx = json.loads((self.dir / "model.safetensors.index.json").read_text())
+        self.weight_map: dict[str, str] = idx["weight_map"]
+        self._open: dict[str, object] = {}
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.weight_map
+
+    def get(self, name: str) -> torch.Tensor:
+        shard = self.weight_map[name]
+        if shard not in self._open:
+            self._open[shard] = safe_open(
+                self.dir / shard, framework="pt", device="cpu",
+            )
+        return self._open[shard].get_tensor(name)
+
+    def dequant(self, base: str) -> torch.Tensor:
+        """Weight tensor in float32, applying an FP8 per-tensor scale if
+        the checkpoint carries one."""
+        w = self.get(base + ".weight")
+        scale_name = base + ".weight_scale"
+        if w.dtype == torch.float8_e4m3fn and scale_name in self.weight_map:
+            scale = self.get(scale_name).float()
+            if scale.numel() != 1:
+                raise ValueError(
+                    f"{base}: expected a per-tensor weight_scale, got "
+                    f"shape {tuple(scale.shape)} — wire the block-scale "
+                    f"dequant before exporting this checkpoint"
+                )
+            return w.float() * scale
+        return w.float()
+
+
+def _plan_tensors(shards: _ShardIndex) -> list[tuple[str, str, list[str]]]:
+    """Return (output_name, kind, source_names) in a stable order.
+
+    kind: "linear" (2-D weight, maybe FP8), "experts" (stack per-expert
+    weights into 3-D), "raw" (norms, biases, embeddings — passthrough).
+    """
+    experts: dict[tuple[str, str], dict[int, str]] = {}
+    plan: list[tuple[str, str, list[str]]] = []
+    seen_bases: set[str] = set()
+
+    for name in sorted(shards.weight_map):
+        if name.endswith((".weight_scale", ".input_scale")):
+            continue
+        m = _EXPERT_RE.match(name)
+        if m:
+            prefix, idx, proj = m.group(1), int(m.group(2)), m.group(3)
+            experts.setdefault((prefix, proj), {})[idx] = name[: -len(".weight")]
+            continue
+        if name.endswith(".weight"):
+            base = name[: -len(".weight")]
+            seen_bases.add(base)
+            plan.append((name, "linear", [base]))
+        else:
+            plan.append((name, "raw", [name]))
+
+    for (prefix, proj), members in sorted(experts.items()):
+        n = len(members)
+        if sorted(members) != list(range(n)):
+            raise ValueError(f"{prefix}.experts.{proj}: non-contiguous expert ids")
+        plan.append((
+            f"{prefix}.experts.{proj}.weight", "experts",
+            [members[i] for i in range(n)],
+        ))
+    return plan
+
+
+def export_gguf_direct(
+    model_dir: str | Path,
+    out_path: str | Path,
+    layer_config_path: str | Path | None = None,
+    default_expert_format: str | None = None,
+    default_linear_format: str | None = None,
+    token_embedding_format: str | None = None,
+    output_format: str | None = None,
+    device: str | None = None,
+    arch_name: str = "prismaquant-direct",
+    exclude: tuple[str, ...] = (),
+) -> dict[str, int]:
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    shards = _ShardIndex(model_dir)
+    assignment: dict[str, str] = {}
+    if layer_config_path is not None:
+        assignment = load_assignment(layer_config_path)
+
+    def _fmt_for(qname: str, kind: str) -> str | None:
+        if qname in assignment:
+            return assignment[qname]
+        if kind == "experts":
+            return default_expert_format
+        if qname == "model.embed_tokens":
+            return token_embedding_format
+        if qname == "lm_head":
+            return output_format
+        return default_linear_format
+
+    plan = _plan_tensors(shards)
+    cfg = json.loads((Path(model_dir) / "config.json").read_text())
+
+    writer = gguf.GGUFWriter(str(out_path), arch_name)
+    writer.add_block_count(int(cfg.get("num_hidden_layers", 0)))
+    writer.add_key_value("prismaquant.source_model",
+                         str(model_dir), gguf.GGUFValueType.STRING)
+
+    counts: Counter[str] = Counter()
+    tensor_formats: dict[str, str] = {}
+    staged: list[tuple[str, str, list[str], str | None]] = []
+
+    # Pass 1: tensor metadata only (shapes/types), no data in memory.
+    for out_name, kind, sources in plan:
+        if any(re.search(p, out_name) for p in exclude):
+            counts["excluded"] += 1
+            continue
+        qname = out_name[: -len(".weight")] if out_name.endswith(".weight") else out_name
+        qname = qname.removesuffix(".experts") if False else qname
+        fmt = None
+        if kind in ("linear", "experts"):
+            base_q = re.sub(r"\.experts\.(gate_proj|up_proj|down_proj)$",
+                            r".experts.\1", qname)
+            fmt = _fmt_for(base_q, kind)
+        if kind == "experts":
+            first = shards.get(sources[0] + ".weight")
+            shape = (len(sources), *first.shape)
+        else:
+            shape = tuple(shards.get(
+                sources[0] + (".weight" if kind == "linear" else "")
+            ).shape)
+        wants_quant = (
+            fmt is not None and fmt in GGUF_BLOCK_BYTES
+            and len(shape) >= 2 and shape[-1] % GGUF_BLOCK_BYTES[fmt][0] == 0
+        )
+        if fmt is not None and fmt in GGUF_BLOCK_BYTES and not wants_quant:
+            if qname in assignment:
+                # Explicit allocator assignment must never silently ship at
+                # source precision (same contract as export_gguf).
+                raise ValueError(
+                    f"{out_name}: assigned {fmt} but shape {shape} fails "
+                    f"the block constraint"
+                )
+            counts[f"default_skip({fmt})"] += 1
+            fmt = None
+        if wants_quant:
+            block, type_size = GGUF_BLOCK_BYTES[fmt]
+            n_elem = int(np.prod(shape))
+            # add_tensor_info with a quantized raw_dtype expects the BYTE
+            # shape (it derives the logical shape itself).
+            byte_shape = list(shape[:-1]) + [shape[-1] // block * type_size]
+            writer.add_tensor_info(
+                out_name, byte_shape,
+                np.dtype(np.uint8), n_elem // block * type_size,
+                getattr(QT, fmt),
+            )
+            staged.append((out_name, kind, sources, fmt))
+            counts[fmt] += 1
+            tensor_formats[out_name] = fmt
+        else:
+            # Passthrough at F16 (norms/bias/embeddings the recipe skips).
+            n_elem = int(np.prod(shape))
+            writer.add_tensor_info(
+                out_name, list(shape), np.dtype(np.float16),
+                n_elem * 2, QT.F16,
+            )
+            staged.append((out_name, kind, sources, None))
+            counts["F16"] += 1
+            tensor_formats[out_name] = "F16"
+
+    writer.add_key_value("prismaquant.tensor_formats",
+                         json.dumps(tensor_formats, sort_keys=True),
+                         gguf.GGUFValueType.STRING)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_ti_data_to_file()
+
+    # Pass 2: stream data tensor by tensor.
+    for i, (out_name, kind, sources, fmt) in enumerate(staged):
+        if kind == "experts":
+            w = torch.stack([shards.dequant(s) for s in sources]).to(device)
+        elif kind == "linear":
+            w = shards.dequant(sources[0]).to(device)
+        else:
+            w = shards.get(sources[0]).float().to(device)
+        if fmt is not None:
+            data = gguf_pack(w, fmt)
+        else:
+            data = w.to(torch.float16).cpu().numpy()
+        writer.write_tensor_data(data)
+        del w, data
+        if (i + 1) % 50 == 0 or i + 1 == len(staged):
+            print(f"[export-direct] {i + 1}/{len(staged)} tensors", flush=True)
+
+    writer.close()
+    return dict(counts)
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--model", required=True, help="HF snapshot dir")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--layer-config", default=None)
+    ap.add_argument("--default-expert-format", default=None)
+    ap.add_argument("--default-linear-format", default=None)
+    ap.add_argument("--token-embedding-format", default=None)
+    ap.add_argument("--output-format", default=None)
+    ap.add_argument("--device", default=None)
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="regex of output tensor names to drop (e.g. MTP)")
+    args = ap.parse_args(argv)
+    counts = export_gguf_direct(
+        args.model, args.out,
+        layer_config_path=args.layer_config,
+        default_expert_format=args.default_expert_format,
+        default_linear_format=args.default_linear_format,
+        token_embedding_format=args.token_embedding_format,
+        output_format=args.output_format,
+        device=args.device,
+        exclude=tuple(args.exclude),
+    )
+    size = Path(args.out).stat().st_size / 1e9
+    print(f"wrote {args.out} ({size:.2f} GB)")
+    for fmt, n in sorted(counts.items()):
+        print(f"  {fmt}: {n}")
+
+
+if __name__ == "__main__":
+    main()
