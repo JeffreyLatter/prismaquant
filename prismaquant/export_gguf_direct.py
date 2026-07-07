@@ -47,10 +47,56 @@ from safetensors import safe_open
 
 from prismaquant.gguf_formats import GGUF_BLOCK_BYTES, gguf_pack
 from prismaquant.layer_config import load_assignment
+from prismaquant.model_profiles import detect_profile
 
 _EXPERT_RE = re.compile(
     r"^(model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
 )
+
+
+def build_direct_imatrix(act_dir: str | Path) -> dict[str, torch.Tensor]:
+    """Per-column mean squared activation per cached module, from the
+    probe's activation cache. Dense Linears key by their recipe qname;
+    packed-experts module snapshots key by the experts module qname
+    (``…mlp.experts``) — the exact input of gate/up projections. Ops are
+    IDENTICAL to the cost path's derivation (full rows, fp32, mean over
+    dim 0): measured cost and shipped bytes stay in lockstep."""
+    out: dict[str, torch.Tensor] = {}
+    for p in sorted(Path(act_dir).glob("*.pt")):
+        blob = torch.load(p, map_location="cpu", weights_only=False)
+        inputs = blob.get("inputs") if isinstance(blob, dict) else None
+        if inputs is None or inputs.ndim != 2:
+            continue
+        name = (blob.get("name") if isinstance(blob, dict) else None) or (
+            p.stem.replace("__", ".")
+        )
+        out[name] = inputs.float().pow(2).mean(dim=0)
+    return out
+
+
+def _imatrix_vector_for(
+    imatrix: dict[str, torch.Tensor],
+    out_name: str,
+    kind: str,
+    in_features: int,
+    recipe_qname_fn,
+) -> torch.Tensor | None:
+    """Resolve the importance vector for one output tensor, or None.
+
+    Stacked experts use the experts-module snapshot when the column count
+    matches (gate/up: module input = their input; down_proj's input is
+    the uncached per-expert intermediate → stays unweighted, matching
+    the cost path's shape guard)."""
+    base = out_name.removesuffix(".weight")
+    if kind == "experts":
+        module_qname = base.rsplit(".experts.", 1)[0] + ".experts"
+        qw = imatrix.get(module_qname)
+    else:
+        recipe = recipe_qname_fn(base)
+        qw = imatrix.get(recipe) if recipe else None
+    if qw is not None and qw.numel() != in_features:
+        return None
+    return qw
 
 
 class _ShardIndex:
@@ -135,19 +181,44 @@ def export_gguf_direct(
     device: str | None = None,
     arch_name: str = "prismaquant-direct",
     exclude: tuple[str, ...] = (),
+    imatrix: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, int]:
+    if imatrix is not None and not imatrix:
+        raise ValueError(
+            "imatrix requested but empty — act-cache dir missing or "
+            "unexpected blob schema; unweighted bytes would diverge from "
+            "the imatrix-weighted cost measurement"
+        )
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     shards = _ShardIndex(model_dir)
+    profile = detect_profile(str(model_dir))
     assignment: dict[str, str] = {}
     if layer_config_path is not None:
         assignment = load_assignment(layer_config_path)
 
-    def _fmt_for(qname: str, kind: str) -> str | None:
+    def _recipe_qname(checkpoint_base: str) -> str | None:
+        """Checkpoint tensor base -> the recipe/live qname the allocator's
+        layer_config uses (e.g. mlp.shared_mlp -> mlp.shared_experts)."""
+        live = profile.checkpoint_to_live_name(checkpoint_base + ".weight")
+        if live is None:
+            return None
+        return live.removesuffix(".weight")
+
+    def _fmt_for(qname: str, kind: str, proj: str | None = None) -> str | None:
+        if kind == "experts":
+            # The allocator keys stacked experts by the LIVE packed param
+            # (…experts.gate_up_proj / …experts.down_proj); the exporter
+            # plans per source projection. gate/up share the fused packed
+            # entry's format by construction.
+            prefix = qname.rsplit(".experts.", 1)[0] + ".experts"
+            packed = "down_proj" if proj == "down_proj" else "gate_up_proj"
+            hit = assignment.get(f"{prefix}.{packed}")
+            if hit is not None:
+                return hit
+            return default_expert_format
         if qname in assignment:
             return assignment[qname]
-        if kind == "experts":
-            return default_expert_format
         if qname == "model.embed_tokens":
             return token_embedding_format
         if qname == "lm_head":
@@ -171,13 +242,20 @@ def export_gguf_direct(
         if any(re.search(p, out_name) for p in exclude):
             counts["excluded"] += 1
             continue
-        qname = out_name[: -len(".weight")] if out_name.endswith(".weight") else out_name
-        qname = qname.removesuffix(".experts") if False else qname
+        base = out_name.removesuffix(".weight")
         fmt = None
-        if kind in ("linear", "experts"):
-            base_q = re.sub(r"\.experts\.(gate_proj|up_proj|down_proj)$",
-                            r".experts.\1", qname)
-            fmt = _fmt_for(base_q, kind)
+        explicit = False
+        if kind == "experts":
+            proj = base.rsplit(".", 1)[-1]
+            fmt = _fmt_for(base, kind, proj=proj)
+            prefix = base.rsplit(".experts.", 1)[0] + ".experts"
+            packed = "down_proj" if proj == "down_proj" else "gate_up_proj"
+            explicit = f"{prefix}.{packed}" in assignment
+        elif kind == "linear":
+            recipe = _recipe_qname(base)
+            if recipe is not None:
+                fmt = _fmt_for(recipe, kind)
+                explicit = recipe in assignment
         if kind == "experts":
             first = shards.get(sources[0] + ".weight")
             shape = (len(sources), *first.shape)
@@ -190,7 +268,7 @@ def export_gguf_direct(
             and len(shape) >= 2 and shape[-1] % GGUF_BLOCK_BYTES[fmt][0] == 0
         )
         if fmt is not None and fmt in GGUF_BLOCK_BYTES and not wants_quant:
-            if qname in assignment:
+            if explicit:
                 # Explicit allocator assignment must never silently ship at
                 # source precision (same contract as export_gguf).
                 raise ValueError(
@@ -213,8 +291,19 @@ def export_gguf_direct(
             staged.append((out_name, kind, sources, fmt))
             counts[fmt] += 1
             tensor_formats[out_name] = fmt
+        elif len(shape) == 1:
+            # 1-D passthrough at F32 (norms, expert_bias — routing-critical;
+            # matches the GGUF convention and transformers'
+            # _keep_in_fp32_modules_strict for e_score_correction_bias).
+            writer.add_tensor_info(
+                out_name, list(shape), np.dtype(np.float32),
+                int(shape[0]) * 4, QT.F32,
+            )
+            staged.append((out_name, kind, sources, "F32"))
+            counts["F32"] += 1
+            tensor_formats[out_name] = "F32"
         else:
-            # Passthrough at F16 (norms/bias/embeddings the recipe skips).
+            # 2-D+ passthrough at F16 (tensors the recipe skips).
             n_elem = int(np.prod(shape))
             writer.add_tensor_info(
                 out_name, list(shape), np.dtype(np.float16),
@@ -239,8 +328,20 @@ def export_gguf_direct(
             w = shards.dequant(sources[0]).to(device)
         else:
             w = shards.get(sources[0]).float().to(device)
-        if fmt is not None:
-            data = gguf_pack(w, fmt)
+        if fmt == "F32":
+            data = w.to(torch.float32).cpu().numpy()
+        elif fmt is not None:
+            qw = None
+            if imatrix:
+                qw = _imatrix_vector_for(
+                    imatrix, out_name, kind, int(w.shape[-1]),
+                    _recipe_qname,
+                )
+                if qw is not None:
+                    counts["imatrix_weighted"] += 1
+                else:
+                    counts["imatrix_fallback"] += 1
+            data = gguf_pack(w, fmt, col_weights=qw)
         else:
             data = w.to(torch.float16).cpu().numpy()
         writer.write_tensor_data(data)
@@ -264,7 +365,18 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--device", default=None)
     ap.add_argument("--exclude", action="append", default=[],
                     help="regex of output tensor names to drop (e.g. MTP)")
+    ap.add_argument(
+        "--imatrix-from-act-cache", default=None,
+        help="probe activation-cache dir; applies per-column importance "
+        "weighting to k-quant scale selection (dense Linears exact; "
+        "stacked experts pooled from the experts-module snapshot for "
+        "gate/up, down_proj unweighted — matches the cost path)",
+    )
     args = ap.parse_args(argv)
+    imatrix = None
+    if args.imatrix_from_act_cache:
+        imatrix = build_direct_imatrix(args.imatrix_from_act_cache)
+        print(f"imatrix: {len(imatrix)} modules from act cache")
     counts = export_gguf_direct(
         args.model, args.out,
         layer_config_path=args.layer_config,
@@ -274,6 +386,7 @@ def main(argv: list[str] | None = None) -> None:
         output_format=args.output_format,
         device=args.device,
         exclude=tuple(args.exclude),
+        imatrix=imatrix,
     )
     size = Path(args.out).stat().st_size / 1e9
     print(f"wrote {args.out} ({size:.2f} GB)")

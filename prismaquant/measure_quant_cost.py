@@ -912,9 +912,30 @@ def _measure_packed_experts(
             h = h_detail.load(full_name).to(dev).float()
             if h.shape == (w.size(0), w.size(1)):
                 h_em = h
+        packed_gguf_qw = None
+        if _gguf_imatrix_enabled() and any(s.family == "gguf" for s in specs):
+            # Pooled imatrix from the experts-module input snapshot: exact
+            # source for gate_up_proj (its input IS the module input); the
+            # shape guard leaves down_proj unweighted (its input is the
+            # per-expert intermediate, not cached — the v2 replay pass will
+            # weight it). MUST stay op-identical to the exporter's builder
+            # (full rows, fp32, mean over dim 0) — lockstep contract.
+            try:
+                _x = act_cache.load(experts_qname)
+                qw_vec = _x.float().pow(2).mean(dim=0)
+                if qw_vec.numel() == w.shape[-1]:
+                    packed_gguf_qw = qw_vec.reshape(1, 1, -1).to(dev)
+            except Exception:
+                packed_gguf_qw = None
+
         for spec in specs:
             try:
-                w_hat = _batched_quantize(spec, w)
+                w_hat = _batched_quantize(
+                    spec, w,
+                    col_weights=(
+                        packed_gguf_qw if spec.family == "gguf" else None
+                    ),
+                )
                 err = (w - w_hat).float()
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
