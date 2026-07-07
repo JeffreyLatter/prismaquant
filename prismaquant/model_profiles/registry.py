@@ -39,6 +39,7 @@ from .qwen3_moe import Qwen3MoeProfile
 # allocator Pareto runs without uprooting the archive commit.
 from .minimax_m2 import MiniMaxM2Profile
 from .deepseek_v4 import DeepseekV4Profile
+from .hy_v3 import HyV3Profile
 
 
 _REGISTERED: list[type[ModelProfile]] = [
@@ -50,6 +51,7 @@ _REGISTERED: list[type[ModelProfile]] = [
     Lfm2MoeProfile,
     MiniMaxM2Profile,
     DeepseekV4Profile,
+    HyV3Profile,
 ]
 
 

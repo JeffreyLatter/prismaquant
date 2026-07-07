@@ -1,0 +1,82 @@
+"""Tencent Hy3 (HYV3ForCausalLM, model_type=hy_v3) profile.
+
+Hy3-preview: 80 decoder layers + 1 MTP layer, hidden 4096, GQA 64/8 with
+q/k norms, layer 0 dense SwiGLU (intermediate 13312), layers 1..79 sparse
+MoE (192 routed experts top-8, moe_intermediate 1536, + 1 shared expert).
+Source checkpoints (BF16 and FP8) ship experts PER-EXPERT
+(``…mlp.experts.{i}.{gate,up,down}_proj.weight``); the live transformers
+module packs them into 3-D params (``HYV3Experts.gate_up_proj/down_proj``)
+— the streaming loader bridges via this profile's packed-experts spec,
+exactly like Qwen3.5/Ornith.
+
+Checkpoint→live renames mirror transformers' own conversion table
+(conversion_mapping.py, hy_v3 entry):
+
+  | checkpoint (safetensors)        | live transformers module          |
+  |---------------------------------|-----------------------------------|
+  | mlp.router.gate.weight          | mlp.gate.weight                   |
+  | mlp.expert_bias                 | mlp.e_score_correction_bias       |
+  | mlp.shared_mlp.*                | mlp.shared_experts.*              |
+
+The MTP sidecar is ``model.layers.80`` — it shares the body prefix, but
+``config.num_hidden_layers == 80`` means the meta skeleton simply never
+instantiates it; its checkpoint keys are dropped here and the layer is
+excluded at export. ``has_mtp`` is forced False (the GGUF artifact does
+not carry a draft model) despite ``num_nextn_predict_layers: 1``.
+
+vLLM class: HYV3ForCausalLM exists upstream but not in the local serving
+stacks yet; like DeepSeek-V4 this profile returns None and runs entirely
+on spec fallback (fused groups + naming rules from specs/hy_v3.json).
+"""
+from __future__ import annotations
+
+import re
+
+from .base import ModelProfile
+
+_MTP_LAYER_RE = re.compile(r"^model\.layers\.80\.")
+_ROUTER_RE = re.compile(r"^(model\.layers\.\d+\.mlp)\.router\.gate\.weight$")
+_EXPERT_BIAS_RE = re.compile(r"^(model\.layers\.\d+\.mlp)\.expert_bias$")
+_SHARED_RE = re.compile(r"^(model\.layers\.\d+\.mlp)\.shared_mlp\.")
+
+
+class HyV3Profile(ModelProfile):
+    """Tencent Hy3 / hy_v3 family."""
+
+    @classmethod
+    def matches(cls, model_type: str | None,
+                architectures: list[str] | None) -> bool:
+        if model_type == "hy_v3":
+            return True
+        return any(a.startswith("HYV3") for a in architectures or ())
+
+    @property
+    def name(self) -> str:
+        return "hy_v3"
+
+    def vllm_architecture_class(self):
+        # Not present in the local serving stacks; spec fallback covers
+        # fused groups and naming (see module docstring).
+        return None
+
+    def has_mtp(self) -> bool:
+        # model.layers.80 is the MTP layer; this lane ships no draft
+        # model. The skeleton never instantiates it (num_hidden_layers
+        # is 80) and checkpoint_to_live_name drops its keys.
+        return False
+
+    def checkpoint_to_live_name(self, ckpt_key: str, *,
+                                multimodal: bool = False) -> str | None:
+        if _MTP_LAYER_RE.match(ckpt_key):
+            return None
+        m = _ROUTER_RE.match(ckpt_key)
+        if m:
+            return f"{m.group(1)}.gate.weight"
+        m = _EXPERT_BIAS_RE.match(ckpt_key)
+        if m:
+            return f"{m.group(1)}.e_score_correction_bias"
+        m = _SHARED_RE.match(ckpt_key)
+        if m:
+            return _SHARED_RE.sub(r"\1.shared_experts.", ckpt_key)
+        return super().checkpoint_to_live_name(
+            ckpt_key, multimodal=multimodal)
