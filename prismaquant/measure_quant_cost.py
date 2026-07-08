@@ -1145,8 +1145,23 @@ def _batched_quantize(
         # the unbatched path bit-for-bit. col_weights (per-item imatrix
         # vectors, broadcastable to stacked_w) bias scale selection exactly
         # as the exporter's --imatrix-from-act-cache does.
+        # Big stacks (192-expert MoE layers ~2.4G elements) are sliced along
+        # dim 0 — exact by superblock locality — or the search's fp32
+        # temporaries (~20x element count) blow the unified-memory budget.
         from prismaquant.gguf_formats import gguf_quantize_dequantize
 
+        max_elems = 256 * 1024 * 1024
+        if stacked_w.ndim >= 2 and stacked_w.numel() > max_elems:
+            step = max(1, max_elems // max(stacked_w[0].numel(), 1))
+            outs = []
+            for i in range(0, stacked_w.shape[0], step):
+                cw = col_weights
+                if cw is not None and cw.ndim >= 1 and cw.shape[0] == stacked_w.shape[0]:
+                    cw = cw[i:i + step]
+                outs.append(gguf_quantize_dequantize(
+                    stacked_w[i:i + step], spec.name, col_weights=cw,
+                ))
+            return torch.cat(outs, dim=0)
         return gguf_quantize_dequantize(
             stacked_w, spec.name, col_weights=col_weights,
         )

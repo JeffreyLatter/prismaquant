@@ -519,8 +519,23 @@ def gguf_pack(w: torch.Tensor, fmt: str,
             f"{fmt} requires the input dim to be a multiple of {block}; "
             f"got shape {tuple(w.shape)}"
         )
-    packed = assemble_bytes(compute_fields(w, fmt, col_weights), fmt)
     out_shape = tuple(w.shape[:-1]) + (in_f // block * type_size,)
+    # Big stacks (192-expert MoE tensors) pack slice-by-slice along dim 0 —
+    # exact by superblock locality — to bound the search's fp32 temporaries.
+    max_elems = 256 * 1024 * 1024
+    if w.ndim >= 3 and w.numel() > max_elems:
+        step = max(1, max_elems // max(w[0].numel(), 1))
+        parts = []
+        for i in range(0, w.shape[0], step):
+            cw = col_weights
+            if cw is not None and cw.ndim >= 1 and cw.shape[0] == w.shape[0]:
+                cw = cw[i:i + step]
+            parts.append(assemble_bytes(
+                compute_fields(w[i:i + step], fmt, cw), fmt,
+            ).cpu())
+        packed = torch.cat(parts, dim=0)
+        return packed.reshape(out_shape).numpy()
+    packed = assemble_bytes(compute_fields(w, fmt, col_weights), fmt)
     return packed.reshape(out_shape).cpu().numpy()
 
 
