@@ -850,6 +850,19 @@ register_format(_make_gguf_spec("Q5_K", 5, 256, 128))   # 176 B / 256 = 5.5
 register_format(_make_gguf_spec("Q6_K", 6, 256, 144))   # 210 B / 256 = 6.5625
 register_format(_make_gguf_spec("Q8_0", 8, 32, 16))     # 34 B / 32 = 8.5
 
+# GGUF IQ family (sub-Q2_K grid codebooks + non-linear 4-bit). scale_bits
+# again carries all non-element superblock bytes so effective_bits reproduces
+# the exact ggml bpw (type_size*8/block); see prismaquant/gguf_iq_formats.py
+# for the field quantizers / byte layouts. IQ4_NL is the only block-32 rung —
+# the one usable when in_features % 256 != 0.
+register_format(_make_gguf_spec("IQ2_XXS", 2, 256, 16))   # 66 B / 256 = 2.0625
+register_format(_make_gguf_spec("IQ2_XS", 2, 256, 80))    # 74 B / 256 = 2.3125
+register_format(_make_gguf_spec("IQ2_S", 2, 256, 144))    # 82 B / 256 = 2.5625
+register_format(_make_gguf_spec("IQ3_XXS", 3, 256, 16))   # 98 B / 256 = 3.0625
+register_format(_make_gguf_spec("IQ3_S", 3, 256, 112))    # 110 B / 256 = 3.4375
+register_format(_make_gguf_spec("IQ4_XS", 4, 256, 64))    # 136 B / 256 = 4.25
+register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
+
 
 def list_formats(family: str | None = None) -> list[FormatSpec]:
     if family is None:

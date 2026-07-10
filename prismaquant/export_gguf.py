@@ -319,8 +319,10 @@ def export_gguf(
                     imatrix_fallback_names.append(tensor.name)
             acts = None
             if gptq_act_dir is not None and w.ndim == 2:
-                acts = _load_act_inputs(gptq_act_dir,
-                                        hf_by_gguf.get(tensor.name))
+                from prismaquant.gguf_gptq import GPTQ_SUPPORTED
+                if fmt in GPTQ_SUPPORTED:
+                    acts = _load_act_inputs(gptq_act_dir,
+                                            hf_by_gguf.get(tensor.name))
             if acts is not None:
                 # GPTQ under the frozen two-tier scales: same fields
                 # contract, only q is re-decided with OBS propagation.

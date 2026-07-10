@@ -6,25 +6,25 @@
   "format_rules": [
     {
       "id": "gguf_container_formats",
-      "allow_formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "BF16"],
+      "allow_formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL", "BF16"],
       "reason": "profile_mismatch",
-      "detail": "GGUF artifacts can only carry ggml tensor types; K-quants Q2_K..Q6_K + Q8_0 have CUDA MMQ/MMVQ/fused-MoE kernels in both llama.cpp and the vLLM GGUF path, BF16 is the unquantized passthrough (written as BF16/F16 tensor). IQ formats stay research-only until their slower prefill path (MMVQ/Triton, no MMQ) passes a serving perf gate."
+      "detail": "GGUF artifacts can only carry ggml tensor types; K-quants Q2_K..Q6_K + Q8_0 have CUDA MMQ/MMVQ/fused-MoE kernels in both llama.cpp and the vLLM GGUF path, BF16 is the unquantized passthrough (written as BF16/F16 tensor). The IQ family (IQ2_XXS 2.06 .. IQ4_NL 4.5 bpw) is decoded by llama.cpp and the vLLM GGUF path; its prefill uses MMVQ/Triton (no CUDA MMQ), so it stays a research/candidate rung until it clears a serving perf gate, but it is allowed here so the allocator can reach the sub-Q2_K regime."
     }
   ],
   "shape_rules": [
     {
       "id": "kquant_superblock_shape",
-      "formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"],
+      "formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS"],
       "in_features_multiple_of": 256,
       "reason": "kernel_shape",
-      "detail": "GGUF k-quants pack 256-element superblocks along the input dim"
+      "detail": "GGUF k-quants and 256-superblock IQ types pack 256-element superblocks along the input dim"
     },
     {
-      "id": "q8_0_block_shape",
-      "formats": ["Q8_0"],
+      "id": "block32_shape",
+      "formats": ["Q8_0", "IQ4_NL"],
       "in_features_multiple_of": 32,
       "reason": "kernel_shape",
-      "detail": "Q8_0 packs 32-element blocks along the input dim"
+      "detail": "Q8_0 and IQ4_NL pack 32-element blocks along the input dim; IQ4_NL is the only IQ rung usable when in_features % 256 != 0"
     }
   ]
 }

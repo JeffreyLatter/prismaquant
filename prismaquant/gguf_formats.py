@@ -31,9 +31,18 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from prismaquant.gguf_iq_formats import (
+    IQ_BLOCK_BYTES,
+    iq_assemble_bytes,
+    iq_fields,
+    iq_reconstruct,
+)
+
 QK_K = 256
 
-# name -> (block_size, type_size_bytes); mirrors gguf.GGML_QUANT_SIZES.
+# name -> (block_size, type_size_bytes); mirrors gguf.GGML_QUANT_SIZES. The IQ
+# family (IQ2_XXS..IQ4_NL) lives in gguf_iq_formats; merge its table so the
+# k-quant call sites (compute_fields / assemble_bytes / gguf_pack) reach it.
 GGUF_BLOCK_BYTES: dict[str, tuple[int, int]] = {
     "Q2_K": (QK_K, 84),
     "Q3_K": (QK_K, 110),
@@ -41,6 +50,7 @@ GGUF_BLOCK_BYTES: dict[str, tuple[int, int]] = {
     "Q5_K": (QK_K, 176),
     "Q6_K": (QK_K, 210),
     "Q8_0": (32, 34),
+    **IQ_BLOCK_BYTES,
 }
 
 def _fp16r(t: torch.Tensor) -> torch.Tensor:
@@ -335,6 +345,20 @@ def _recon_q8_0(f: dict[str, torch.Tensor]) -> torch.Tensor:
 # zero scales and cannot perturb the real columns.
 # ---------------------------------------------------------------------------
 
+def _iq_fields_entry(name: str):
+    """Adapter so IQ formats plug into the k-quant (fields_fn, recon_fn, block)
+    contract; the IQ math itself lives in gguf_iq_formats."""
+    block = IQ_BLOCK_BYTES[name][0]
+
+    def fields_fn(blocks, qw=None):
+        return iq_fields(blocks, name, qw)
+
+    def recon_fn(f):
+        return iq_reconstruct(f, name)
+
+    return fields_fn, recon_fn, block
+
+
 _FIELDS = {
     "Q2_K": (_fields_q2_k, lambda f: _recon_asym(f, 16), QK_K),
     "Q3_K": (_fields_q3_k, _recon_sym, QK_K),
@@ -342,6 +366,7 @@ _FIELDS = {
     "Q5_K": (_fields_q5_k, lambda f: _recon_asym(f, 32), QK_K),
     "Q6_K": (_fields_q6_k, _recon_sym, QK_K),
     "Q8_0": (_fields_q8_0, _recon_q8_0, 32),
+    **{name: _iq_fields_entry(name) for name in IQ_BLOCK_BYTES},
 }
 
 
@@ -471,6 +496,8 @@ def reconstruct_fields(fields: dict[str, torch.Tensor],
 
 def assemble_bytes(f: dict[str, torch.Tensor], fmt: str) -> torch.Tensor:
     """Bit-pack superblock fields into GGUF block bytes (n_blocks, bytes)."""
+    if fmt in IQ_BLOCK_BYTES:
+        return iq_assemble_bytes(f, fmt)
     n = f["q"].shape[0]
     if fmt == "Q2_K":
         scales_b = (f["sc"] | (f["m"] << 4)).to(torch.uint8)

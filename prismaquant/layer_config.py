@@ -19,9 +19,12 @@ def strip_weight(name: str) -> str:
     return name[:-len(".weight")] if name.endswith(".weight") else name
 
 
-# GGUF k-quant lane (llama.cpp / vLLM-GGUF serving).
+# GGUF k-quant + IQ lane (llama.cpp / vLLM-GGUF serving). Kept as an explicit
+# literal so this module stays torch-free; pinned to gguf_formats.GGUF_BLOCK_BYTES
+# by test_gguf_formats.test_layer_config_gguf_names_stay_in_sync.
 _GGUF_FORMAT_NAMES = frozenset(
-    {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"}
+    {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0",
+     "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL"}
 )
 
 

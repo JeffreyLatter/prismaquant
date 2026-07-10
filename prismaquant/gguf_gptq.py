@@ -37,6 +37,11 @@ _GRID = {
     "Q8_0": (32, -128, 127, False),
 }
 
+# Formats whose fields carry a uniform integer ``q`` that GPTQ can re-round.
+# The IQ family stores grid/codebook indices, not a uniform integer level, so
+# it has no GPTQ rounder here and renders via the imatrix-RTN path instead.
+GPTQ_SUPPORTED = frozenset(_GRID)
+
 
 def _per_element_scales(
     fields: dict[str, torch.Tensor], fmt: str, shape: tuple[int, int],
