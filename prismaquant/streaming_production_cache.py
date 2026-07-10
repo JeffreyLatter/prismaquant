@@ -197,12 +197,15 @@ def _render_dense_layer(
         activations = {qname: X}
         joint = joint_globals.get(qname)
         max_abs = cache.activation_max_abs.get(qname)
-        # Export input_global_scale convention (6.0 / max_abs); metadata-only,
-        # does not affect the rendered weight — kept identical to the resident
-        # render loop.
-        export_scale = (
-            (6.0 / max_abs) if (max_abs is not None and max_abs > 0) else None
-        )
+        # Export input_global_scale: MUST match the resident render loop and
+        # the exporter (the igs convention is a ±14-37% served-KL knob).
+        export_scale = None
+        if max_abs is not None and max_abs > 0:
+            from prismaquant.export_native_compressed import (
+                _nvfp4_input_global_scale_from_max_abs,
+            )
+            export_scale = _nvfp4_input_global_scale_from_max_abs(
+                float(max_abs))
         row_weights = (
             fisher_rows.get(qname)
             if (fisher_rows is not None
