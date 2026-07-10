@@ -174,6 +174,119 @@ def _load_cache_calibration(tokenizer, args) -> torch.Tensor:
     )
 
 
+def _run_streaming(args, formats, levers, dtype) -> int:
+    """Streaming per-layer render path for models too large to load whole.
+
+    No whole-model from_pretrained and no calibration forward: dense + packed
+    activations come from the probe's --activation-cache-dir, and each decoder
+    layer is materialized on demand through the streaming model.
+    """
+    from prismaquant.streaming_production_cache import (
+        fill_production_weight_cache_streaming,
+    )
+
+    if args.render_scope != "assignment":
+        print(
+            "[build-prod-cache] FAIL: --streaming requires "
+            "--render-scope assignment (streaming a full format menu is out "
+            "of scope)",
+            flush=True,
+        )
+        return 2
+    layer_config = args.render_layer_config or args.recache_layer_config
+    if not layer_config:
+        print(
+            "[build-prod-cache] FAIL: --streaming requires "
+            "--render-layer-config",
+            flush=True,
+        )
+        return 2
+    if not args.cache_dir:
+        print(
+            "[build-prod-cache] FAIL: --streaming requires --cache-dir "
+            "(the streamed cache is disk-backed; peak memory is one layer)",
+            flush=True,
+        )
+        return 2
+    if not args.activation_cache_dir:
+        print(
+            "[build-prod-cache] FAIL: --streaming requires "
+            "--activation-cache-dir (the probe's per-Linear activation cache)",
+            flush=True,
+        )
+        return 2
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    device = require_cuda_hot_path("build_production_cache")
+    print(f"[build-prod-cache] streaming device={device}", flush=True)
+
+    render_assignment = _load_assignment(layer_config)
+    non_bf16 = sum(
+        1 for fmt in render_assignment.values()
+        if str(fmt).strip().upper() != "BF16"
+    )
+    print(
+        f"[build-prod-cache] streaming assignment render scope: "
+        f"{non_bf16} non-BF16 entries from {layer_config}",
+        flush=True,
+    )
+
+    skip_tokens = (
+        list(args.skip_qnames) if args.skip_qnames is not None else None
+    )
+    t0 = time.monotonic()
+    cache = fill_production_weight_cache_streaming(
+        args.model,
+        render_assignment=render_assignment,
+        activation_cache_dir=args.activation_cache_dir,
+        formats=formats,
+        levers=levers,
+        cache_dir=args.cache_dir,
+        device=device,
+        dtype=dtype,
+        skip_tokens=skip_tokens,
+        expert_render_mode=args.expert_render_mode,
+        expert_module_token_budget=args.expert_token_budget,
+        h_detail_dir=args.h_detail_dir,
+    )
+    elapsed = time.monotonic() - t0
+
+    try:
+        validate_render_assignment_cache_coverage(cache, render_assignment)
+        print("[build-prod-cache] coverage check passed", flush=True)
+    except RuntimeError as e:
+        if args.allow_incomplete:
+            print(f"[build-prod-cache] WARNING: {e}", flush=True)
+            print(
+                "[build-prod-cache] --allow-incomplete: writing cache anyway.",
+                flush=True,
+            )
+        else:
+            print(f"[build-prod-cache] FAIL: {e}", flush=True)
+            return 2
+
+    compacted = (
+        cache.compact_for_pickle()
+        if hasattr(cache, "compact_for_pickle")
+        else 0
+    )
+    if compacted:
+        print(
+            f"[build-prod-cache] compacted {compacted} resident cache tensors "
+            "back to path references before writing",
+            flush=True,
+        )
+    with open(output_path, "wb") as fh:
+        pickle.dump(cache, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    print(
+        f"[build-prod-cache] wrote {len(cache)} entries to "
+        f"{output_path} ({elapsed:.1f}s)",
+        flush=True,
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Build production δw cache")
     p.add_argument("--model", required=True)
@@ -363,6 +476,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="During re-cache, install production weights but leave activation "
         "quantization disabled in replay hooks.",
     )
+    p.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Render one decoder layer at a time on top of the streaming "
+        "model (no whole-model from_pretrained) so 100B+ / 295B checkpoints "
+        "fit on a 121 GB box. Requires --render-scope assignment, "
+        "--render-layer-config, --cache-dir, and --activation-cache-dir "
+        "(the probe's per-Linear activation cache; no calibration forward "
+        "runs in this mode).",
+    )
+    p.add_argument(
+        "--activation-cache-dir",
+        default=None,
+        help="Probe activation cache directory (streaming mode). Supplies the "
+        "per-Linear and per-experts-module input rows that the render passes "
+        "consume in place of a fresh calibration forward.",
+    )
     args = p.parse_args(argv)
 
     # Opt-in deterministic CUDA path. The default lever ablations on small
@@ -406,6 +536,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             levers[name] = False
 
     dtype = _dtype_from_name(args.dtype)
+
+    if args.streaming:
+        return _run_streaming(args, formats, levers, dtype)
+
     staged, cleanup = stage_multimodal(args.model)
     device = require_cuda_hot_path("build_production_cache")
     print(f"[build-prod-cache] device={device}", flush=True)
