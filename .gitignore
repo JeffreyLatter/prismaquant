@@ -19,6 +19,9 @@ scratch/
 
 # Local sqlite + worktrees + scratch artifacts
 data/
+# but the GGUF IQ codebook tables are a checked-in runtime asset
+!prismaquant/data/
+!prismaquant/data/iq_grids.pt
 propagated-cost
 paper/scripts/gemini_review_stderr.txt
 tmp/
