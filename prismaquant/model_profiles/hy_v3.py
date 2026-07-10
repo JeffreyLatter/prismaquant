@@ -20,9 +20,13 @@ Checkpoint→live renames mirror transformers' own conversion table
 
 The MTP sidecar is ``model.layers.80`` — it shares the body prefix, but
 ``config.num_hidden_layers == 80`` means the meta skeleton simply never
-instantiates it; its checkpoint keys are dropped here and the layer is
-excluded at export. ``has_mtp`` is forced False (the GGUF artifact does
-not carry a draft model) despite ``num_nextn_predict_layers: 1``.
+instantiates it; its checkpoint keys are dropped here so probe/cost/
+allocator never see it. Export handling is per-lane: GGUF exports pass
+``--exclude '^model\\.layers\\.80\\.'`` (no draft model in the GGUF
+artifact); compressed-tensors exports ship it VERBATIM BF16 via
+``passthrough_prefixes`` so vLLM's HYV3MTP spec decode can load it.
+``has_mtp`` stays False because the ``mtp.*``-keyed sidecar machinery
+(mtp_module) does not apply to this body-indexed layout.
 
 vLLM class: HYV3ForCausalLM exists upstream but not in the local serving
 stacks yet; like DeepSeek-V4 this profile returns None and runs entirely
@@ -60,9 +64,12 @@ class HyV3Profile(ModelProfile):
         return None
 
     def has_mtp(self) -> bool:
-        # model.layers.80 is the MTP layer; this lane ships no draft
-        # model. The skeleton never instantiates it (num_hidden_layers
-        # is 80) and checkpoint_to_live_name drops its keys.
+        # model.layers.80 is the MTP layer, body-indexed rather than
+        # mtp.*-keyed, so the mtp_module machinery doesn't apply. The
+        # skeleton never instantiates it and checkpoint_to_live_name
+        # drops its keys; export lanes handle it explicitly (GGUF:
+        # --exclude; compressed-tensors: BF16 passthrough via
+        # passthrough_prefixes for vLLM spec decode).
         return False
 
     def checkpoint_to_live_name(self, ckpt_key: str, *,
