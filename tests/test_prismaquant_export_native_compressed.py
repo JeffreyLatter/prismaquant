@@ -755,8 +755,10 @@ class TestRoundTrip(unittest.TestCase):
         gguf_lane = {
             # Served via the GGUF container (export_gguf), not
             # compressed-tensors; rendered==served equivalence is pinned
-            # bit-exact against gguf-py in tests/test_gguf_formats.py.
+            # bit-exact against gguf-py in tests/test_gguf_formats.py and
+            # tests/test_gguf_iq_formats.py (the IQ family).
             "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0",
+            "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL",
         }
         self.assertEqual(
             set(fr.REGISTRY), reconciled | set(explicit_gaps) | gguf_lane

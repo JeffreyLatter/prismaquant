@@ -20,6 +20,7 @@ the compressed-tensors stack).
 | Concern | File |
 |---|---|
 | Formats: field quantizers, emulation QDQ, byte packers | `prismaquant/gguf_formats.py` |
+| IQ family (IQ2_XXS..IQ4_NL): grid/codebook quantizers, recon, packers | `prismaquant/gguf_iq_formats.py` (+ grid data `prismaquant/data/iq_grids.pt`, generator `scripts/gen_iq_grids.py`) |
 | Registry entries (family `"gguf"`) | `format_registry.py` (GGUF block at the end) |
 | Serving constraints (menu + `%256` shape rules) | `serving_profile_specs/gguf.json` |
 | Exporter (skeleton requantizer) | `prismaquant/export_gguf.py` |
@@ -172,9 +173,19 @@ answer. No public quality claim until both land and repeat.
   JSO-style quantized sub-scale grid inside the GPTQ loop; render-mechanism
   registration (`_format_supports_render_mechanism`) still returns none for
   gguf formats — they render via the registry-RTN fallback.
-- **IQ formats** (IQ2_XXS 2.06 … IQ3_S 3.44): registry/menu candidates below
-  Q2_K, research-only until the slower serving path (MMVQ/Triton, no CUDA
-  MMQ) passes a perf gate.
+- **IQ formats** (IQ2_XXS 2.06 / IQ2_XS 2.31 / IQ2_S 2.56 / IQ3_XXS 3.06 /
+  IQ3_S 3.44 / IQ4_XS 4.25 / IQ4_NL 4.5 bpw): **implemented** end-to-end
+  (`gguf_iq_formats.py`) — registry FormatSpecs, layer_config/serving allow-list
+  (IQ4_NL is the only block-32 rung, usable when `in_features % 256 != 0`),
+  batched imatrix cost path (routes via `family == "gguf"`), and both exporters
+  (`gguf_pack` dispatch). Grid quantizers do an **exhaustive** weighted grid
+  argmin (not llama.cpp's neighbour heuristic): emulation == gguf-py-decoded
+  bytes bit-exactly for all 7 (`tests/test_gguf_iq_formats.py`), and on real
+  Qwen3-0.6B tensors with a matched imatrix the grid types **beat** llama-quantize
+  on weighted-MSE (IQ3_XXS ratio ~0.87, all tensors won) while IQ4_XS matches it
+  (~1.000). Still **research/candidate**: the vLLM/llama.cpp serving path uses
+  MMVQ/Triton (no CUDA MMQ) and has not cleared a perf gate; GPTQ-into-IQ is not
+  implemented (IQ renders via imatrix-RTN, `GPTQ_SUPPORTED` excludes them).
 - **Selection**: `SELECTION_MODE=surrogate` only; the validated-frontier
   real-KL selection has not been wired to a llama.cpp evaluator yet — and the
   ~3 bpw cliff is exactly where measured selection should pay.
