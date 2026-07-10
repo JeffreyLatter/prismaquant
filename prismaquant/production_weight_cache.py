@@ -2044,54 +2044,15 @@ def render_production_weight(
     return w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
 
 
-def fill_production_weight_cache(
-    model: nn.Module,
-    calib_ids: torch.Tensor,
-    qnames: Sequence[str],
-    *,
-    formats: Sequence[str] = ("NVFP4",),
-    render_assignment: Mapping[str, str] | None = None,
-    levers: Mapping[str, bool] | None = None,
-    max_act_rows: int = 256,
-    progress: bool = True,
-    cache_dir: str | Path | None = None,
-    recache_pass: bool = False,
-    recache_assignment: Mapping[str, str] | None = None,
-    recache_profile=None,
-    recache_include_activation_quant: bool = True,
-    recache_microbatch_size: int = 1,
-    h_detail_dir: str | Path | None = None,
-) -> ProductionWeightCache:
-    """End-to-end fill: collect activations, render production δw per
-    (qname, fmt), return a `ProductionWeightCache`.
+def _resolve_production_render_levers(
+    levers: Mapping[str, object] | None,
+) -> dict:
+    """Normalize a caller lever dict to the production render contract.
 
-    Args:
-      model: live HF model on the export device.
-      calib_ids: ``[N, T]`` token id tensor for activation collection.
-      qnames: which Linears are eligible to render (skips MoE packed
-        experts; handle those separately via `_quantize_3d_packed`
-        extensions).
-      formats: which formats to pre-render when `render_assignment` is not
-        supplied.
-      render_assignment: optional concrete export assignment. When supplied,
-        render exactly the non-BF16 `(qname, fmt)` entries used by that
-        assignment instead of the full `qnames x formats` menu.
-      levers: which production levers to enable (default: GPTQ with optional
-        joint NVFP4 scale optimization when requested by the caller).
-      recache_pass: when True, run a second calibration forward with the
-        concrete production assignment installed from this cache and refit
-        ``activation_max_abs`` under quantized upstream weights.
-      recache_assignment: required when ``recache_pass`` is True.  Candidate
-        caches with multiple possible formats per Linear are ambiguous; recache
-        needs the actual export assignment.
-      h_detail_dir: optional probe h-detail directory retained for archived
-        Fisher ablations. V1 production defaults do not require it.
+    Shared by ``fill_production_weight_cache`` (resident) and the streaming
+    driver so both apply IDENTICAL damp/JSO/act-order/scale-rule defaulting —
+    the rendered weights must be byte-identical between the two paths.
     """
-    if recache_pass and not recache_assignment:
-        raise ValueError(
-            "recache_pass=True requires recache_assignment with the concrete "
-            "production assignment"
-        )
     levers = dict(levers) if levers is not None else {}
     default_optional_levers = not bool(levers.pop("none", False))
     if not default_optional_levers:
@@ -2145,6 +2106,11 @@ def fill_production_weight_cache(
     ):
         levers["nvfp4_scale_rule"] = NVFP4_SCALE_RULE_JOINT_MSE
     levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
+    return levers
+
+
+def _resolve_render_mechanism_plan(levers: Mapping[str, object]):
+    """Build the render-mechanism ordering plan from normalized levers."""
     enabled_mechanisms: list[str] = []
     if str(levers.get("nvfp4_scale_rule", "")).strip() == "four_over_six_mse":
         enabled_mechanisms.append("four_over_six")
@@ -2163,6 +2129,59 @@ def fill_production_weight_cache(
         raise ValueError(
             "invalid render mechanism plan: " + "; ".join(mechanism_plan.errors)
         )
+    return mechanism_plan
+
+
+def fill_production_weight_cache(
+    model: nn.Module,
+    calib_ids: torch.Tensor,
+    qnames: Sequence[str],
+    *,
+    formats: Sequence[str] = ("NVFP4",),
+    render_assignment: Mapping[str, str] | None = None,
+    levers: Mapping[str, bool] | None = None,
+    max_act_rows: int = 256,
+    progress: bool = True,
+    cache_dir: str | Path | None = None,
+    recache_pass: bool = False,
+    recache_assignment: Mapping[str, str] | None = None,
+    recache_profile=None,
+    recache_include_activation_quant: bool = True,
+    recache_microbatch_size: int = 1,
+    h_detail_dir: str | Path | None = None,
+) -> ProductionWeightCache:
+    """End-to-end fill: collect activations, render production δw per
+    (qname, fmt), return a `ProductionWeightCache`.
+
+    Args:
+      model: live HF model on the export device.
+      calib_ids: ``[N, T]`` token id tensor for activation collection.
+      qnames: which Linears are eligible to render (skips MoE packed
+        experts; handle those separately via `_quantize_3d_packed`
+        extensions).
+      formats: which formats to pre-render when `render_assignment` is not
+        supplied.
+      render_assignment: optional concrete export assignment. When supplied,
+        render exactly the non-BF16 `(qname, fmt)` entries used by that
+        assignment instead of the full `qnames x formats` menu.
+      levers: which production levers to enable (default: GPTQ with optional
+        joint NVFP4 scale optimization when requested by the caller).
+      recache_pass: when True, run a second calibration forward with the
+        concrete production assignment installed from this cache and refit
+        ``activation_max_abs`` under quantized upstream weights.
+      recache_assignment: required when ``recache_pass`` is True.  Candidate
+        caches with multiple possible formats per Linear are ambiguous; recache
+        needs the actual export assignment.
+      h_detail_dir: optional probe h-detail directory retained for archived
+        Fisher ablations. V1 production defaults do not require it.
+    """
+    if recache_pass and not recache_assignment:
+        raise ValueError(
+            "recache_pass=True requires recache_assignment with the concrete "
+            "production assignment"
+        )
+    levers = _resolve_production_render_levers(levers)
+    mechanism_plan = _resolve_render_mechanism_plan(levers)
     if progress and mechanism_plan.ordered:
         print(
             "[prod-cache] render mechanism order: "
@@ -2909,7 +2928,7 @@ class _PackedExpertActivationCollector:
 def fill_packed_expert_cache_entries(
     cache: ProductionWeightCache,
     model: nn.Module,
-    calib_ids: torch.Tensor,
+    calib_ids: torch.Tensor | None,
     *,
     render_assignment: Mapping[str, str] | None = None,
     force_format: str | None = None,
@@ -2924,6 +2943,7 @@ def fill_packed_expert_cache_entries(
     render_mode: str = "batched",
     gate_calib_ids: torch.Tensor | None = None,
     gate_token_budget: int | None = None,
+    module_acts_override: Mapping[str, torch.Tensor] | None = None,
 ) -> dict:
     """Render packed-MoE experts into ``ProductionWeightCache`` entries.
 
@@ -2971,6 +2991,12 @@ def fill_packed_expert_cache_entries(
       module_token_budget: reservoir size for each experts module's input X.
       max_rows_per_expert: cap on routed rows fed to each expert's GPTQ.
       max_layers: debug/timing cap — render only the first N experts modules.
+      module_acts_override: streaming build. ``{experts_qname: X}`` module-level
+        input snapshots sourced from the probe's activation cache instead of a
+        fresh forward pass. When supplied, no calibration forward runs, in-scope
+        experts are restricted to the supplied modules (the currently-installed
+        decoder layer), ``calib_ids`` may be ``None``, and the cross-domain gate
+        corpus is unsupported.
 
     Returns a coverage dict consumed by the export enforcement gate:
       ``{experts_qname.pn: {"fmt", "n_experts", "min_rows", "median_rows",
@@ -3007,6 +3033,14 @@ def fill_packed_expert_cache_entries(
         raise ValueError(
             "fill_packed_expert_cache_entries: pass render_assignment OR "
             "force_format, not both")
+    if module_acts_override is None and calib_ids is None:
+        raise ValueError(
+            "fill_packed_expert_cache_entries requires calib_ids unless "
+            "module_acts_override supplies the experts-module input snapshot")
+    if module_acts_override is not None and gate_calib_ids is not None:
+        raise ValueError(
+            "fill_packed_expert_cache_entries: module_acts_override (streaming) "
+            "does not support a cross-domain gate corpus")
 
     # 1. Resolve in-scope packed-expert tensors (non-BF16 in the assignment).
     #    Each entry: (experts_qname, mod, parent, pn, full, fmt).
@@ -3015,6 +3049,14 @@ def fill_packed_expert_cache_entries(
     modules_seen = 0
     for experts_qname, mod in model.named_modules():
         if not _is_packed_experts_module(mod, profile):
+            continue
+        # Streaming build: only the currently-installed decoder layer's experts
+        # module is materialized (others are on meta) and only it has an X in
+        # the override. Skip everything else so we never touch a meta param.
+        if (
+            module_acts_override is not None
+            and experts_qname not in module_acts_override
+        ):
             continue
         if max_layers is not None and modules_seen >= max_layers:
             break
@@ -3113,7 +3155,26 @@ def fill_packed_expert_cache_entries(
     work_remaining = any(_needs_work(full, fmt) for full, fmt in in_scope_keys)
 
     module_acts: dict[str, torch.Tensor] = {}
-    if work_remaining:
+    if module_acts_override is not None:
+        # Streaming build: the experts-module input snapshot X comes from the
+        # probe's activation cache (keyed by the experts-module qname), not a
+        # fresh forward pass — the model is only ever one layer resident here.
+        # Store on CPU/fp32 exactly as the collector would so the downstream
+        # derive/render path is byte-identical to the resident build.
+        module_acts = {
+            q: t.detach().reshape(-1, t.size(-1)).to(
+                device="cpu", dtype=torch.float32,
+            )
+            for q, t in module_acts_override.items()
+            if q in experts_qnames
+        }
+        if progress:
+            print(
+                f"[prod-cache/experts] streaming: using {len(module_acts)} "
+                "supplied module activation snapshot(s) (no forward)",
+                flush=True,
+            )
+    elif work_remaining:
         # 2. Capture module-level X for each experts module (one calib forward).
         # Store the (large) per-module reservoirs on CPU/host, NOT in the CUDA
         # allocator pool: on the GB10 unified-memory box the model already
