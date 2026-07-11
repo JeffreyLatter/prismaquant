@@ -72,6 +72,18 @@ class HyV3Profile(ModelProfile):
         # passthrough_prefixes for vLLM spec decode).
         return False
 
+    def to_vllm_internal_name(self, checkpoint_name: str) -> str:
+        # vLLM's HYV3 module tree keeps the CHECKPOINT attribute names
+        # (mlp.shared_mlp.*, mlp.gate), while recipe/live names use the
+        # transformers renames (shared_experts, router.gate). Scheme
+        # dispatch (config_groups targets / ignore) compares against the
+        # vLLM tree — map both namings onto it. 2026-07-11: targets
+        # emitted under shared_experts matched nothing -> vLLM built the
+        # shared MLP unquantized -> KeyError on its shipped weight_scale.
+        name = checkpoint_name.replace(".mlp.shared_experts.",
+                                       ".mlp.shared_mlp.")
+        return name.replace(".mlp.router.gate", ".mlp.gate")
+
     def checkpoint_to_live_name(self, ckpt_key: str, *,
                                 multimodal: bool = False) -> str | None:
         if _MTP_LAYER_RE.match(ckpt_key):
