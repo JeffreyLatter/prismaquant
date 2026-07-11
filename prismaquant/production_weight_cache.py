@@ -786,10 +786,13 @@ class _LinearActivationCollector:
             # the store set.  Memory bound: store_qnames × max_rows × in.
             if key not in self.store_qnames:
                 return
+            # NOT non_blocking: async D2H into pageable memory can read
+            # the tensor before the producing kernel finishes under GPU
+            # contention, deterministically corrupting the snapshot to NaN
+            # (2026-07-11, inline-export agent repro).
             flat = x.detach().reshape(-1, x.shape[-1]).to(
                 device=self.store_device,
                 dtype=self.store_dtype,
-                non_blocking=True,
             )
             current = (
                 torch.cat(self.activations[key], dim=0)
@@ -2962,10 +2965,13 @@ class _PackedExpertActivationCollector:
             if not args or not isinstance(args[0], torch.Tensor):
                 return
             x = args[0]
+            # NOT non_blocking: async D2H into pageable memory can read
+            # the tensor before the producing kernel finishes under GPU
+            # contention, deterministically corrupting the snapshot to NaN
+            # (2026-07-11, inline-export agent repro).
             flat = x.detach().reshape(-1, x.shape[-1]).to(
                 device=self.store_device,
                 dtype=self.store_dtype,
-                non_blocking=True,
             )
             current = (
                 torch.cat(self.activations[qname], dim=0)
