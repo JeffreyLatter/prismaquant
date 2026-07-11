@@ -73,15 +73,19 @@ class HyV3Profile(ModelProfile):
         return False
 
     def to_vllm_internal_name(self, checkpoint_name: str) -> str:
-        # vLLM's HYV3 module tree keeps the CHECKPOINT attribute names
-        # (mlp.shared_mlp.*, mlp.gate), while recipe/live names use the
-        # transformers renames (shared_experts, router.gate). Scheme
-        # dispatch (config_groups targets / ignore) compares against the
-        # vLLM tree — map both namings onto it. 2026-07-11: targets
-        # emitted under shared_experts matched nothing -> vLLM built the
-        # shared MLP unquantized -> KeyError on its shipped weight_scale.
-        name = checkpoint_name.replace(".mlp.shared_experts.",
-                                       ".mlp.shared_mlp.")
+        # Scheme dispatch compares config_groups targets/ignore against
+        # the PREFIX strings vLLM passes at Linear construction. vLLM's
+        # HYV3MoEFused builds the shared MLP with prefix=f"{prefix}" (the
+        # parent mlp prefix, NOT .shared_mlp/.shared_experts), so its
+        # Linears dispatch as `...mlp.gate_up_proj` / `...mlp.down_proj`
+        # even though their params live under `...mlp.shared_mlp.*`.
+        # Map both the live (shared_experts) and checkpoint (shared_mlp)
+        # namings onto those dispatch prefixes. Upstream-version-specific:
+        # revisit if vLLM ever threads the .shared_mlp prefix through.
+        # (2026-07-11: shared_experts targets matched nothing -> shared
+        # MLP built unquantized -> load KeyError on its weight_scale.)
+        name = checkpoint_name.replace(".mlp.shared_experts.", ".mlp.")
+        name = name.replace(".mlp.shared_mlp.", ".mlp.")
         return name.replace(".mlp.router.gate", ".mlp.gate")
 
     def checkpoint_to_live_name(self, ckpt_key: str, *,
