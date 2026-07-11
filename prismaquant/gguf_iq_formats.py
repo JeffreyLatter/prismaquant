@@ -28,6 +28,7 @@ exactly as llama.cpp's ``quant_weights`` do (``qw · sqrt(sigma2 + x²)``).
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -173,16 +174,73 @@ def _sign_fields(x: torch.Tensor, w: torch.Tensor, mode: str,
     return y, codes7
 
 
+# Row-chunk bound for full-grid scoring passes: chunk*ngrid fp32 scratch.
+_SCORE_CHUNK_ELEMS = 1 << 26
+
+_COMPILE_SWEEP = os.environ.get(
+    "PRISMAQUANT_IQ_COMPILE_SWEEP", "1").lower() not in {"0", "false", "no"}
+
+
+def _sweep_errs_eager(ac: torch.Tensor, bc: torch.Tensor,
+                      db: torch.Tensor, fs: torch.Tensor) -> torch.Tensor:
+    """err[r, j] = min_g ((f_j*db_r)^2 A_rg - 2 f_j*db_r B_rg): exact sweep
+    errors for every candidate factor in one pass over (rows, ngrid)."""
+    u = db.unsqueeze(-1) * fs                                  # (rows, nf)
+    d2 = (u * u).unsqueeze(1) * ac.unsqueeze(-1) \
+        - (2.0 * u).unsqueeze(1) * bc.unsqueeze(-1)            # (rows, ngrid, nf)
+    return d2.min(dim=1).values                                # (rows, nf)
+
+
+@lru_cache(maxsize=None)
+def _sweep_errs_compiled():
+    return torch.compile(_sweep_errs_eager, dynamic=True)
+
+
+def _sweep_errs(ac, bc, db, fs):
+    if _COMPILE_SWEEP:
+        try:
+            return _sweep_errs_compiled()(ac, bc, db, fs)
+        except Exception:
+            pass
+    return _sweep_errs_eager(ac, bc, db, fs)
+
+
+def _pick_min_eager(ac: torch.Tensor, bc: torch.Tensor,
+                    db: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact per-entry (min err, argmin) at one scale, single fused pass."""
+    d2 = (db * db).unsqueeze(-1) * ac - (2.0 * db).unsqueeze(-1) * bc
+    e, i = d2.min(dim=-1)
+    return e, i
+
+
+@lru_cache(maxsize=None)
+def _pick_min_compiled():
+    return torch.compile(_pick_min_eager, dynamic=True)
+
+
+def _pick_min(ac, bc, db):
+    if _COMPILE_SWEEP:
+        try:
+            return _pick_min_compiled()(ac, bc, db)
+        except Exception:
+            pass
+    return _pick_min_eager(ac, bc, db)
+
+
 def _grid_fields(blocks: torch.Tensor, fmt: str,
                  qw: torch.Tensor | None) -> dict[str, torch.Tensor]:
     """Exhaustive weighted grid + two-tier scale quantizer for one IQ2/IQ3
     format. Minimizes sum_i w_i (db*grid[g,i] - y_i)^2 per grid entry, with a
     per-scale-group amplitude db shared across its eps entries, swept and
     refined by weighted least squares, then quantized into the fp16 super-scale
-    d + 4-bit sub-scale l and the grid entries re-selected at the quantized db.
+    d + 4-bit sub-scale l and the grid entries re-selected (exact, full grid)
+    at the quantized db.
 
-    A, B, C (the per-entry weighted moments over the grid) are computed once and
-    reused across every scale candidate and the final re-selection.
+    Only two full-grid scoring passes touch (nm, ngrid): the shortlist ranking
+    at db0 and the final selection at db_q; both are row-chunked so the full
+    moment matrices are never materialized. The scale search runs on the
+    (nm, K) shortlist. The additive C = sum(w*y^2) term is constant per entry
+    and cancels in every comparison, so it is dropped.
     """
     m = _META[fmt]
     grid = _tables(str(blocks.device))[m["key"]]
@@ -192,19 +250,35 @@ def _grid_fields(blocks: torch.Tensor, fmt: str,
     y, codes = _sign_fields(blocks, w, m["sign"])
 
     nm = n * n_sg * eps
+    ngrid = grid.shape[0]
     ye = y.reshape(nm, ge)
     we = w.reshape(nm, ge)
-    A = we @ (grid * grid).transpose(0, 1).contiguous()       # (nm, ngrid)
-    B = (we * ye) @ grid.transpose(0, 1).contiguous()         # (nm, ngrid)
-    C = (we * ye * ye).sum(-1)                                 # (nm,)
+    gg_t = (grid * grid).transpose(0, 1).contiguous()          # (ge, ngrid)
+    g_t = grid.transpose(0, 1).contiguous()                    # (ge, ngrid)
 
-    def pick(db_sg: torch.Tensor):
-        """db_sg: (n, n_sg). Returns per-entry argmin idx (nm,) and per-scale-
-        group summed error (n, n_sg)."""
-        db_e = db_sg.reshape(n, n_sg, 1).expand(n, n_sg, eps).reshape(nm, 1)
-        d2 = db_e * db_e * A - 2.0 * db_e * B + C.unsqueeze(-1)
-        idx = d2.argmin(dim=-1)
-        err = d2.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    db0 = y.reshape(n, n_sg, eps * ge).abs().amax(dim=-1) / grid.max()
+
+    chunk = max(1, _SCORE_CHUNK_ELEMS // ngrid)
+
+    def _moments(r0: int, r1: int) -> tuple[torch.Tensor, torch.Tensor]:
+        wc = we[r0:r1]
+        return wc @ gg_t, (wc * ye[r0:r1]) @ g_t               # (rows, ngrid)
+
+    def pick_full(db_sg: torch.Tensor):
+        """Exact full-grid argmin (chunked): global idx (nm,) + summed err.
+
+        The refit loop must use exact picks — it is what makes re-quantizing
+        a reconstructed tensor a fixed point (the WLS refit of the exact
+        codewords recovers the shipped scale with zero residual)."""
+        db_all = db_sg.reshape(n, n_sg, 1).expand(n, n_sg, eps).reshape(nm)
+        idx = torch.empty(nm, dtype=torch.long, device=y.device)
+        err = torch.empty(nm, dtype=torch.float32, device=y.device)
+        for r0 in range(0, nm, chunk):
+            r1 = min(nm, r0 + chunk)
+            ac, bc = _moments(r0, r1)
+            e, i = _pick_min(ac, bc, db_all[r0:r1])
+            idx[r0:r1] = i
+            err[r0:r1] = e
         return idx, err.reshape(n, n_sg, eps).sum(-1)
 
     def refit(idx: torch.Tensor):
@@ -213,28 +287,52 @@ def _grid_fields(blocks: torch.Tensor, fmt: str,
         den = (we * gsel * gsel).reshape(n, n_sg, eps * ge).sum(-1)
         return num * _safe_inv(den)                           # (n, n_sg)
 
-    db0 = y.reshape(n, n_sg, eps * ge).abs().amax(dim=-1) / grid.max()
-    best_db = db0.clone()
-    best_err = torch.full((n, n_sg), float("inf"), device=y.device)
+    # Exact 27-candidate scale sweep, fused: all candidates share one pass
+    # over the (rows, ngrid) moments — err[r, j] accumulated as running
+    # minima inside a single compiled kernel instead of 27 materialized
+    # scoring matrices. Bit-equivalent decisions to the reference sweep.
+    fs = torch.linspace(0.5, 1.8, 27, device=y.device)
+    nf = fs.numel()
+    db0e = db0.reshape(n, n_sg, 1).expand(n, n_sg, eps).reshape(nm)
+    errs = torch.empty(nm, nf, dtype=torch.float32, device=y.device)
+    sweep_chunk = max(1, chunk // nf)
+    for r0 in range(0, nm, sweep_chunk):
+        r1 = min(nm, r0 + sweep_chunk)
+        ac, bc = _moments(r0, r1)
+        errs[r0:r1] = _sweep_errs(ac, bc, db0e[r0:r1], fs)
+    errsg = errs.reshape(n, n_sg, eps, nf).sum(2)              # (n, n_sg, nf)
+    best_j = errsg.argmin(dim=-1)
+    best_err = errsg.gather(-1, best_j.unsqueeze(-1)).squeeze(-1)
+    best_db = db0 * fs[best_j]
 
-    def consider(db_sg: torch.Tensor):
-        nonlocal best_db, best_err
-        _, errsg = pick(db_sg)
-        better = errsg < best_err
-        best_err = torch.where(better, errsg, best_err)
-        best_db = torch.where(better, db_sg, best_db)
-
-    for f in torch.linspace(0.5, 1.8, 27, device=y.device).tolist():
-        consider(db0 * f)
+    # Refit iterations on the full grid (exact — the fixed-point engine).
+    # Each iteration costs ONE full pass: the accepted candidate's exact idx
+    # is carried forward.
+    idx_cur, err_cur = pick_full(best_db)
+    best_err = torch.minimum(best_err, err_cur)
     for _ in range(3):
-        consider(refit(pick(best_db)[0]))
+        db_it = refit(idx_cur)
+        idx_new, err_new = pick_full(db_it)
+        better = err_new < best_err
+        best_err = torch.where(better, err_new, best_err)
+        best_db = torch.where(better, db_it, best_db)
+        better_e = better.reshape(n, n_sg, 1).expand(
+            n, n_sg, eps).reshape(nm)
+        idx_cur = torch.where(better_e, idx_new, idx_cur)
 
     scaleunit = best_db * m["K"]
     d = _fp16r(scaleunit.amax(dim=1, keepdim=True) / 31.0)
     l = _round_half_away(0.5 * (scaleunit * _safe_inv(d) - 1.0))
     l = l.clamp(0, 15).to(torch.int64)
     db_q = d * m["coef"] * (m["base"] + l.float())            # (n, n_sg)
-    idx, _ = pick(db_q)                                        # final selection
+
+    # Final selection: EXACT full-grid argmin at the shipped scale (chunked).
+    dbq_e = db_q.reshape(n, n_sg, 1).expand(n, n_sg, eps).reshape(nm)
+    idx = torch.empty(nm, dtype=torch.long, device=y.device)
+    for r0 in range(0, nm, chunk):
+        r1 = min(nm, r0 + chunk)
+        ac, bc = _moments(r0, r1)
+        idx[r0:r1] = _pick_min(ac, bc, dbq_e[r0:r1])[1]
     return {"d": d, "l": l, "idx": idx.reshape(n, n_sg * eps), "sign": codes}
 
 
