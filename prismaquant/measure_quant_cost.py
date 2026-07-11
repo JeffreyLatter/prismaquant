@@ -928,15 +928,34 @@ def _measure_packed_experts(
             except Exception:
                 packed_gguf_qw = None
 
+        # Optional stratified expert subsample for gguf-family COST entries:
+        # the allocator prices the whole stack as one unit (mean over
+        # experts), so sampling S of E experts estimates that mean at E/S
+        # less quantize work (IQ exhaustive-grid on 3.5G-elem stacks is
+        # ~25 min/layer at full E — 2026-07-11). Export always quantizes
+        # every expert exactly; this only affects the DP's cost estimates.
+        sample_n = int(os.environ.get(
+            "PRISMAQUANT_GGUF_EXPERT_COST_SAMPLE", "0") or 0)
         for spec in specs:
             try:
+                use_sample = (
+                    spec.family == "gguf" and sample_n > 0
+                    and w.ndim >= 3 and int(w.shape[0]) > sample_n
+                )
+                if use_sample:
+                    s_idx = torch.linspace(
+                        0, w.shape[0] - 1, sample_n, device=w.device,
+                    ).round().long().unique()
+                    w_in = w[s_idx]
+                else:
+                    w_in = w
                 w_hat = _batched_quantize(
-                    spec, w,
+                    spec, w_in,
                     col_weights=(
                         packed_gguf_qw if spec.family == "gguf" else None
                     ),
                 )
-                err = (w - w_hat).float()
+                err = (w_in - w_hat).float()
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
                 if h_em is not None:
@@ -955,15 +974,24 @@ def _measure_packed_experts(
                     # (Σ_n g²)(Σ_n err²) and inflate packed-expert Δloss ~N×
                     # relative to dense Linears, over-promoting experts in
                     # the allocator (N = in-features ≈ 1.5k–4k).
-                    per_ch_mse = err.pow(2).mean(dim=-1)   # [E, M]
-                    dloss_val = float(
-                        0.5 * (h_em * per_ch_mse).sum().item()
-                    )
+                    per_ch_mse = err.pow(2).mean(dim=-1)   # [E or S, M]
+                    if use_sample:
+                        # Unbiased estimate of the full-stack sum from the
+                        # stratified sample.
+                        scale = float(w.shape[0]) / float(w_in.shape[0])
+                        dloss_val = float(
+                            0.5 * (h_em[s_idx] * per_ch_mse).sum().item()
+                            * scale
+                        )
+                    else:
+                        dloss_val = float(
+                            0.5 * (h_em * per_ch_mse).sum().item()
+                        )
                     del per_ch_mse
                 output_mse = 0.0
                 rel_mse = 0.0
                 output_mse_measured = False
-                if can_measure_output:
+                if can_measure_output and not use_sample:
                     act_quant = _packed_expert_activation_quantizer(spec)
                     with torch.no_grad():
                         if param_name == "gate_up_proj":
