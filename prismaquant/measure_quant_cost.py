@@ -935,11 +935,16 @@ def _measure_packed_experts(
         # ~25 min/layer at full E — 2026-07-11). Export always quantizes
         # every expert exactly; this only affects the DP's cost estimates.
         sample_n = int(os.environ.get(
-            "PRISMAQUANT_GGUF_EXPERT_COST_SAMPLE", "0") or 0)
+            "PRISMAQUANT_EXPERT_COST_SAMPLE",
+            os.environ.get("PRISMAQUANT_GGUF_EXPERT_COST_SAMPLE", "0"),
+        ) or 0)
         for spec in specs:
             try:
+                # Family-agnostic: NVFP4/FP8 registry quantize on a full
+                # 2.4G-elem stack swap-kills a UMA box just like the gguf
+                # search did (2026-07-11 CT cost abort at layer 1).
                 use_sample = (
-                    spec.family == "gguf" and sample_n > 0
+                    sample_n > 0
                     and w.ndim >= 3 and int(w.shape[0]) > sample_n
                 )
                 if use_sample:
