@@ -1148,9 +1148,12 @@ def _batched_quantize(
         # Big stacks (192-expert MoE layers ~2.4G elements) are sliced along
         # dim 0 — exact by superblock locality — or the search's fp32
         # temporaries (~20x element count) blow the unified-memory budget.
-        from prismaquant.gguf_formats import gguf_quantize_dequantize
+        from prismaquant.gguf_formats import (
+            gguf_quantize_dequantize,
+            gguf_slice_max_elems,
+        )
 
-        max_elems = 256 * 1024 * 1024
+        max_elems = gguf_slice_max_elems(spec.name)
         if stacked_w.ndim >= 2 and stacked_w.numel() > max_elems:
             step = max(1, max_elems // max(stacked_w[0].numel(), 1))
             outs = []

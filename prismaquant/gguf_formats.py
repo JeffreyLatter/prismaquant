@@ -416,6 +416,16 @@ def make_gguf_qdq(fmt: str):
     return f
 
 
+def gguf_slice_max_elems(fmt: str) -> int:
+    """Stacked-tensor slice threshold (elements) for quantize/pack.
+
+    IQ formats keep larger fp32 search temporaries (grid moment matrices,
+    per-candidate errors, codebook distance tensors) than k-quants — slice
+    their stacks 4x finer or a 192-expert layer swap-kills a UMA box
+    (2026-07-11 Hy3 cost watchdog abort at layer 8)."""
+    return (64 if str(fmt).upper().startswith("IQ") else 256) * 1024 * 1024
+
+
 # ---------------------------------------------------------------------------
 # Byte packers (export path).  Layout-exact inverses of gguf-py
 # dequantize_blocks; consume the same fields as the emulation.
@@ -549,7 +559,7 @@ def gguf_pack(w: torch.Tensor, fmt: str,
     out_shape = tuple(w.shape[:-1]) + (in_f // block * type_size,)
     # Big stacks (192-expert MoE tensors) pack slice-by-slice along dim 0 —
     # exact by superblock locality — to bound the search's fp32 temporaries.
-    max_elems = 256 * 1024 * 1024
+    max_elems = gguf_slice_max_elems(fmt)
     if w.ndim >= 3 and w.numel() > max_elems:
         step = max(1, max_elems // max(w[0].numel(), 1))
         parts = []

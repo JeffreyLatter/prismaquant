@@ -294,13 +294,18 @@ def _grid_fields(blocks: torch.Tensor, fmt: str,
     fs = torch.linspace(0.5, 1.8, 27, device=y.device)
     nf = fs.numel()
     db0e = db0.reshape(n, n_sg, 1).expand(n, n_sg, eps).reshape(nm)
-    errs = torch.empty(nm, nf, dtype=torch.float32, device=y.device)
-    sweep_chunk = max(1, chunk // nf)
+    # Accumulate per-scale-group directly (chunks aligned to whole
+    # superblocks) — a per-entry (nm, nf) error matrix is ~gigabytes on a
+    # 192-expert stack slice and swap-kills a UMA box.
+    per_sb = n_sg * eps
+    errsg = torch.empty(n, n_sg, nf, dtype=torch.float32, device=y.device)
+    sweep_chunk = max(per_sb, (chunk // nf) // per_sb * per_sb)
     for r0 in range(0, nm, sweep_chunk):
         r1 = min(nm, r0 + sweep_chunk)
         ac, bc = _moments(r0, r1)
-        errs[r0:r1] = _sweep_errs(ac, bc, db0e[r0:r1], fs)
-    errsg = errs.reshape(n, n_sg, eps, nf).sum(2)              # (n, n_sg, nf)
+        e = _sweep_errs(ac, bc, db0e[r0:r1], fs)               # (rows, nf)
+        errsg[r0 // per_sb:r1 // per_sb] = e.reshape(
+            -1, n_sg, eps, nf).sum(2)
     best_j = errsg.argmin(dim=-1)
     best_err = errsg.gather(-1, best_j.unsqueeze(-1)).squeeze(-1)
     best_db = db0 * fs[best_j]
