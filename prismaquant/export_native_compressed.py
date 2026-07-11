@@ -1431,7 +1431,9 @@ def _export_match_render_scale_rule(cache) -> str | None:
     return str(rule) if rule else None
 
 
-def _packed_expert_render_scale_rule() -> str | None:
+def _packed_expert_render_scale_rule(
+    cache: "ProductionWeightCache | None" = None,
+) -> str | None:
     """M2 (2026-07-02 audit): render scale rule for packed-expert re-derives.
 
     The packed-expert re-pack re-derives NVFP4 codes/scales from the cached
@@ -1449,8 +1451,14 @@ def _packed_expert_render_scale_rule() -> str | None:
     dict, so non-default joint levels must still match between cache-build
     and export env. Gated by ``PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE``
     (the existing M19 flag, default on).
+
+    ``cache`` overrides the module-level production cache: the inline-render
+    export path passes its transient per-layer cache so the re-derive keys off
+    the SAME recorded rule the inline render used.
     """
-    return _export_match_render_scale_rule(_PRODUCTION_WEIGHT_CACHE)
+    if cache is None:
+        cache = _PRODUCTION_WEIGHT_CACHE
+    return _export_match_render_scale_rule(cache)
 
 
 def _pack_production_cached_2d(
@@ -1560,9 +1568,15 @@ def _read_cached_packed_expert(
     fmt: str,
     *,
     device: torch.device | None = None,
+    cache: "ProductionWeightCache | None" = None,
 ) -> torch.Tensor | None:
     """Return the GPTQ-rendered 3-D dequant ``[E, out, in]`` for a packed-MoE
     expert tensor from the production cache, or ``None`` if absent.
+
+    ``cache`` overrides the module-level production cache — the inline-render
+    export path (``PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ``) passes a transient
+    per-layer cache produced by ``fill_packed_expert_cache_entries`` so no
+    588 GB dequant cache has to be materialized to disk first.
 
     Mirrors ``_pack_production_cached_2d`` but for packed experts: the cache
     stores the per-expert GPTQ dequant (in the model dtype, usually bf16).  The
@@ -1574,7 +1588,8 @@ def _read_cached_packed_expert(
     weight error), but it is the established production contract and within
     NVFP4 noise; served KL is the final arbiter.
     """
-    cache = _PRODUCTION_WEIGHT_CACHE
+    if cache is None:
+        cache = _PRODUCTION_WEIGHT_CACHE
     if cache is None:
         return None
     w = cache.get(experts_param_name, str(fmt).upper())
@@ -1584,15 +1599,22 @@ def _read_cached_packed_expert(
     return w.to(device=target_device, dtype=torch.float32)
 
 
-def _packed_expert_input_global_scale(experts_param_name: str) -> float | None:
+def _packed_expert_input_global_scale(
+    experts_param_name: str,
+    *,
+    cache: "ProductionWeightCache | None" = None,
+) -> float | None:
     """Calibrated W4A4 input_global_scale (FP8_MAX*FP4_MAX/max_abs, the
     generate_gparam convention) for a packed-expert tensor, read from the
     production cache's per-param activation max_abs.
 
     Returns ``None`` when no cache/scale is available, so the caller falls back
     to ``DEFAULT_INPUT_GLOBAL_SCALE`` (only on the no-cache research path).
+
+    ``cache`` overrides the module-level production cache (inline-render path).
     """
-    cache = _PRODUCTION_WEIGHT_CACHE
+    if cache is None:
+        cache = _PRODUCTION_WEIGHT_CACHE
     if cache is None:
         return None
     max_abs_map = getattr(cache, "activation_max_abs", None) or {}
@@ -1622,6 +1644,17 @@ _PRODUCTION_WEIGHT_CACHE = None
 _ALLOW_PACKED_EXPERT_RTN = (
     os.environ.get("PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN", "0") == "1"
 )
+# Inline packed-expert GPTQ render at export time. When set, and NO production
+# weight cache is active, packed experts are rendered ON THE FLY during the
+# streaming export — one layer's stack at a time — through the SAME
+# ``fill_packed_expert_cache_entries`` batched-GPTQ path the cache builder uses,
+# sourcing the experts-module input snapshot from the probe's activation cache.
+# This is the 295B-MoE path (Tencent Hy3): a full dequant cache is ~588 GB and
+# cannot coexist with the 557 GiB source on a 1.8 TB disk, so we never write it.
+# Unset (default) preserves the RTN-by-omission hard-fail exactly.
+_INLINE_EXPERT_GPTQ = (
+    os.environ.get("PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ", "0") == "1"
+)
 _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
 
@@ -1644,9 +1677,97 @@ def _packed_expert_export_provenance() -> dict[str, object]:
     coverage = metadata.get("packed_expert_coverage")
     return {
         "rtn_escape_enabled": bool(_ALLOW_PACKED_EXPERT_RTN),
+        "inline_expert_gptq_enabled": bool(_INLINE_EXPERT_GPTQ),
         "cache_has_packed_expert_coverage": coverage is not None,
         "cache_packed_expert_coverage": coverage or {},
     }
+
+
+def _inline_expert_render_levers() -> dict[str, object]:
+    """Render levers for the inline packed-expert path, taken from the export's
+    resolved act-aware flags (the same flags that drive the dense inline
+    ``_quantize_2d`` GPTQ path). The batched NVFP4 render ignores JSO/act-order
+    and uses fixed damp — matching the cache builder's ``"batched"`` mode — but
+    FP8 experts fall to per-expert ``render_production_weight``, which consumes
+    these levers, so we forward the real flags."""
+    return {
+        "gptq": bool(_ACT_AWARE_FLAGS.get("gptq", False)),
+        "scale_sweep": bool(_ACT_AWARE_FLAGS.get("scale_sweep", False)),
+        "static_act_order": bool(_ACT_AWARE_FLAGS.get("static_act_order", False)),
+        "joint_scale_opt": bool(_ACT_AWARE_FLAGS.get("joint_scale_opt", False)),
+    }
+
+
+def _inline_render_packed_expert_module(
+    model: nn.Module,
+    experts_qname: str,
+    assignment: dict[str, str],
+    profile,
+) -> "ProductionWeightCache | None":
+    """Render ONE packed-experts module's stack into a transient in-memory
+    ``ProductionWeightCache`` at export time (no disk, no whole dequant cache).
+
+    Gated by ``PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ`` and only active when no
+    production weight cache is supplied. The experts-module input snapshot X is
+    sourced from the probe's activation cache (``_CACHED_ACTIVATIONS`` keyed by
+    the experts-module qname); routing is recomputed offline from X + the
+    resident gate weight by ``fill_packed_expert_cache_entries`` — the SAME
+    batched GPTQ path (``module_acts_override``) the streaming cache builder
+    uses, so the rendered dequant is identical to what the cache path would have
+    produced for this (stack, format, activations).
+
+    Returns the transient cache (its ``.weights`` hold the ``(full, fmt)`` 3-D
+    dequant and ``.activation_max_abs`` the calibrated W4A4 input scale), or
+    ``None`` when the gate is off, a production cache is active, or no
+    activation snapshot exists for this module (the caller then decides whether
+    to hard-fail or fall through to the RTN research path).
+    """
+    if not _INLINE_EXPERT_GPTQ:
+        return None
+    if _PRODUCTION_WEIGHT_CACHE is not None or _ALLOW_PACKED_EXPERT_RTN:
+        return None
+    if _CACHED_ACTIVATIONS is None:
+        return None
+    # Activation-residency landmine: _LazyActivationCache.get() returns a
+    # CPU-resident fp32 tensor; fill_packed_expert_cache_entries' override path
+    # reshapes + moves it to the compute device itself (derive_per_expert_
+    # activations runs the router on `device`), so no manual .to() here.
+    X = _CACHED_ACTIVATIONS.get(experts_qname)
+    if X is None or X.numel() == 0:
+        return None
+
+    from .production_weight_cache import (
+        ProductionWeightCache,
+        _resolve_production_render_levers,
+        fill_packed_expert_cache_entries,
+    )
+
+    # Resolve through the SAME contract the cache builder uses so the transient
+    # cache records the identical nvfp4_scale_rule / damp provenance — the
+    # export re-derive keys the NVFP4 codes off that recorded rule (M19/M2), so
+    # a mismatch would flip the packed bytes vs the prebuilt-cache path.
+    levers = _resolve_production_render_levers(_inline_expert_render_levers())
+    transient = ProductionWeightCache(
+        weights={},
+        levers=dict(levers),
+        activation_max_abs={},
+        failed={},
+        cache_dir=None,  # in-memory only — never spill the dequant to disk
+        metadata={},
+    )
+    fill_packed_expert_cache_entries(
+        transient,
+        model,
+        None,  # calib_ids unused: module_acts_override supplies X
+        render_assignment=assignment,
+        levers=levers,
+        profile=profile,
+        cache_dir=None,
+        render_mode="batched",
+        module_acts_override={experts_qname: X},
+        progress=False,
+    )
+    return transient
 
 
 def _gptq_column_block_size(cols: int) -> int:
@@ -5870,6 +5991,10 @@ def materialize_tensors_streaming(
 
         # 3d. Emit packed MoE experts, scoped to this layer.
         packed_count = 0
+        # Inline packed-expert renders (PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ):
+        # one transient in-memory cache per experts module in THIS layer, built
+        # on first use and freed at layer end. Peak stays ~one layer's stack.
+        _inline_expert_caches: dict[str, "ProductionWeightCache | None"] = {}
         for sub_name, mod in layer_mod.named_modules():
             if not _is_packed_experts_module(mod, profile):
                 continue
@@ -5920,10 +6045,24 @@ def materialize_tensors_streaming(
                     del packed_param, packed_param_src
                     continue
 
+                # Inline render (no production cache): render this experts
+                # module's stack on the fly into a transient cache, memoized so
+                # gate_up + down share the one fill_packed_expert_cache_entries
+                # call. Falls back to _PRODUCTION_WEIGHT_CACHE reads when the
+                # gate is off (active_cache stays None -> module default). Done
+                # BEFORE the scale-rule + joint-global pre-pass so the re-derive
+                # keys off the inline render's recorded nvfp4_scale_rule.
+                if not is_bf16 and experts_qname not in _inline_expert_caches:
+                    _inline_expert_caches[experts_qname] = (
+                        _inline_render_packed_expert_module(
+                            model, experts_qname, assignment, profile))
+                active_cache = _inline_expert_caches.get(experts_qname)
+
                 # Per-expert joint global scale when NVFP4 splits gate+up.
                 # M2: computed under the render's recorded scale rule so
                 # the joint global is consistent with the re-derive below.
-                packed_render_rule = _packed_expert_render_scale_rule()
+                packed_render_rule = _packed_expert_render_scale_rule(
+                    active_cache)
                 per_expert_joint: list[torch.Tensor | None] = [None] * E
                 if fmt == "NVFP4" and len(proj_split) > 1:
                     with _temporary_export_nvfp4_scale_rule(
@@ -5937,20 +6076,33 @@ def materialize_tensors_streaming(
                             per_expert_joint[orig_e] = (
                                 torch.stack(cands).max())
 
-                # Pull the GPTQ-rendered dequant from the production cache.
-                # Packed experts go through the SAME deliberate render as 2-D
-                # Linears (fill_packed_expert_cache_entries); export re-packs
-                # the cached dequant per expert.  RTN-by-omission on packed
-                # experts is a severe NVFP4 quality regression, so when a
-                # production cache is active we HARD-FAIL rather than silently
-                # RTN a non-BF16 expert that the cache didn't render.
+                # Pull the GPTQ-rendered dequant from the production cache (or
+                # the inline transient cache above). Packed experts go through
+                # the SAME deliberate render as 2-D Linears
+                # (fill_packed_expert_cache_entries); export re-packs the cached
+                # dequant per expert. RTN-by-omission on packed experts is a
+                # severe NVFP4 quality regression, so when a cache is active (or
+                # the inline gate is set) we HARD-FAIL rather than silently RTN.
                 cached_3d = None
                 cached_split = None
                 if not is_bf16:
                     if not _ALLOW_PACKED_EXPERT_RTN:
                         cached_3d = _read_cached_packed_expert(
-                            full, fmt, device=device)
+                            full, fmt, device=device, cache=active_cache)
                     if cached_3d is None:
+                        if _INLINE_EXPERT_GPTQ and not _ALLOW_PACKED_EXPERT_RTN:
+                            raise RuntimeError(
+                                f"[export-stream] packed expert {full} @ {fmt} "
+                                f"could not be rendered inline "
+                                f"(PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ=1) — no "
+                                f"experts-module activation snapshot for "
+                                f"{experts_qname} in the activation cache. RTN "
+                                f"on NVFP4 experts is banned; supply an "
+                                f"--activation-cache-dir whose probe covers "
+                                f"every packed-experts module, set the expert to "
+                                f"BF16, or set "
+                                f"PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN=1 for an "
+                                f"explicit research/A-B RTN export.")
                         if (_PRODUCTION_WEIGHT_CACHE is not None
                                 and not _ALLOW_PACKED_EXPERT_RTN):
                             raise RuntimeError(
@@ -5978,8 +6130,10 @@ def materialize_tensors_streaming(
 
                 # Calibrated input_global_scale (W4A4 activation clip): one
                 # per packed param, calibrated from the routed activations at
-                # cache-build time. Without it experts ship the 1.0 placeholder.
-                expert_input_scale = _packed_expert_input_global_scale(full)
+                # cache-build time (or the inline render). Without it experts
+                # ship the 1.0 placeholder.
+                expert_input_scale = _packed_expert_input_global_scale(
+                    full, cache=active_cache)
                 if (cached_3d is not None and expert_input_scale is None
                         and fmt == "NVFP4"):
                     raise RuntimeError(
@@ -6073,7 +6227,9 @@ def materialize_tensors_streaming(
 
         # 3f. Unload.
         _unload(model, [f"{layers_prefix}{L}."])
-        del tensors, resolver, joint_globals
+        # Free this layer's inline expert renders (the 3-D dequant stacks) so
+        # peak stays ~one layer's stack even across the whole sweep.
+        del tensors, resolver, joint_globals, _inline_expert_caches
         # Aggressive GPU cleanup — we've already `.cpu()`'d every
         # quantized output into `out`, so the per-layer GPU working
         # set (fp32 weight copies, grouped/packed intermediates) can
@@ -6192,6 +6348,9 @@ def _materialize_tensors_inmemory(
         covered.add(qname)
         hist[("linear", f"{fmt}_PRODUCTION_CACHE" if cache_hit else fmt)] += 1
 
+    # Inline packed-expert renders (PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ):
+    # one transient in-memory cache per experts module, built on first use.
+    _inline_expert_caches: dict[str, "ProductionWeightCache | None"] = {}
     for qname, mod in model.named_modules():
         if not _is_packed_experts_module(mod, profile):
             continue
@@ -6223,9 +6382,19 @@ def _materialize_tensors_inmemory(
                 hist[("packed_moe", label if is_bf16 else fmt)] += 1
                 continue
 
+            # Inline render (no production cache): render this experts module's
+            # stack into a transient cache, memoized. Done BEFORE the scale-rule
+            # + joint-global pre-pass so the re-derive keys off the inline
+            # render's recorded nvfp4_scale_rule.
+            if not is_bf16 and qname not in _inline_expert_caches:
+                _inline_expert_caches[qname] = (
+                    _inline_render_packed_expert_module(
+                        model, qname, assignment, profile))
+            active_cache = _inline_expert_caches.get(qname)
+
             # M2: joint globals + re-derive below run under the render's
             # recorded NVFP4 scale rule (see _packed_expert_render_scale_rule).
-            packed_render_rule = _packed_expert_render_scale_rule()
+            packed_render_rule = _packed_expert_render_scale_rule(active_cache)
             per_expert_joint: list[torch.Tensor | None] = [None] * E
             if fmt == "NVFP4" and len(proj_split) > 1:
                 with _temporary_export_nvfp4_scale_rule(packed_render_rule):
@@ -6244,8 +6413,20 @@ def _materialize_tensors_inmemory(
             cached_split = None
             if not is_bf16:
                 if not _ALLOW_PACKED_EXPERT_RTN:
-                    cached_3d = _read_cached_packed_expert(full_name, fmt)
+                    cached_3d = _read_cached_packed_expert(
+                        full_name, fmt, cache=active_cache)
                 if cached_3d is None:
+                    if _INLINE_EXPERT_GPTQ and not _ALLOW_PACKED_EXPERT_RTN:
+                        raise RuntimeError(
+                            f"[export-inmemory] packed expert {full_name} @ "
+                            f"{fmt} could not be rendered inline "
+                            f"(PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ=1) — no "
+                            f"experts-module activation snapshot for {qname} in "
+                            f"the activation cache. RTN on NVFP4 experts is "
+                            f"banned; supply an --activation-cache-dir whose "
+                            f"probe covers this module, set the expert to BF16, "
+                            f"or set PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN=1 for an "
+                            f"explicit research/A-B RTN export.")
                     if (_PRODUCTION_WEIGHT_CACHE is not None
                             and not _ALLOW_PACKED_EXPERT_RTN):
                         raise RuntimeError(
@@ -6266,7 +6447,8 @@ def _materialize_tensors_inmemory(
                     cached_split = _split_packed_expert_tensor(
                         cached_3d, pn, profile)
 
-            expert_input_scale = _packed_expert_input_global_scale(full_name)
+            expert_input_scale = _packed_expert_input_global_scale(
+                full_name, cache=active_cache)
             if (cached_3d is not None and expert_input_scale is None
                     and fmt == "NVFP4"):
                 raise RuntimeError(
