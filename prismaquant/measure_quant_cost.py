@@ -610,9 +610,29 @@ def _packed_experts_router(parent_module: nn.Module | None) -> nn.Module | None:
 def _packed_router_topk(
     router: nn.Module,
     hidden_states: torch.Tensor,
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (top_k_index, top_k_weights) for a Qwen/DeepSeek-style router."""
-    out = router(hidden_states)
+    """Return (top_k_index, top_k_weights) for a Qwen/DeepSeek-style router.
+
+    Some routers (HYV3TopKRouter) take the parent MoE block's
+    e_score_correction_bias buffer as a required positional — callers pass
+    it from ``parent_mod`` so routing matches the model's real forward."""
+    import inspect
+    try:
+        fwd_params = inspect.signature(router.forward).parameters
+    except (TypeError, ValueError):
+        fwd_params = {}
+    if "e_score_correction_bias" in fwd_params:
+        if e_score_correction_bias is None:
+            raise ValueError(
+                f"{type(router).__name__}.forward requires "
+                "e_score_correction_bias; the parent module must supply it")
+        out = router(
+            hidden_states,
+            e_score_correction_bias.to(hidden_states.device),
+        )
+    else:
+        out = router(hidden_states)
     if isinstance(out, (tuple, list)):
         if len(out) >= 3:
             second = out[1]
@@ -763,7 +783,11 @@ def derive_per_expert_activations(
         if callable(route_fn):
             top_k_index, top_k_weights = route_fn(router(Xf))
         else:
-            top_k_index, top_k_weights = _packed_router_topk(router, Xf)
+            top_k_index, top_k_weights = _packed_router_topk(
+                router, Xf,
+                e_score_correction_bias=getattr(
+                    parent_mod, "e_score_correction_bias", None),
+            )
         expert_mask = F.one_hot(
             top_k_index.to(torch.long), num_classes=num_experts).permute(2, 1, 0)
     gate_up_list: list[torch.Tensor] = []
@@ -881,7 +905,11 @@ def _measure_packed_experts(
                     if callable(_route_fn):
                         top_k_index, top_k_weights = _route_fn(router(X))
                     else:
-                        top_k_index, top_k_weights = _packed_router_topk(router, X)
+                        top_k_index, top_k_weights = _packed_router_topk(
+                            router, X,
+                            e_score_correction_bias=getattr(
+                                parent_mod, "e_score_correction_bias", None),
+                        )
                     y_ref = _packed_experts_forward_with_weights(
                         experts_mod,
                         X,

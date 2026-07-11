@@ -1260,9 +1260,15 @@ def _coerce_runtime_legal_assignment(
 
 
 def _allocator_target_profile_for_audit(profile) -> str | None:
-    if profile is None:
+    # PRISMAQUANT_TARGET_PROFILE lets the pipeline audit export legality
+    # under the SAME serving profile the allocator solved with. Without it
+    # a profile whose spec default differs (hy_v3 defaults to gguf) would
+    # coerce every format the default profile doesn't serve — 2026-07-11:
+    # 226 dense FP8 Linears silently -> BF16 on the Hy3 CT export.
+    requested = os.environ.get("PRISMAQUANT_TARGET_PROFILE") or None
+    if profile is None and requested is None:
         return None
-    return resolve_target_profile(profile, None)
+    return resolve_target_profile(profile, requested)
 
 
 def _bf16_upgrade_audit(
