@@ -1519,7 +1519,13 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
         lt = _layer_attention_type(layer)
         pe = pe.get(lt)
         if pe is None:
-            if len(position_embeddings) == 1:
+            if "main" in position_embeddings:
+                # DSv4: rotary.layer_types are rope AXES ("main"/"compress"),
+                # not attention-schedule types — the vendored probe forward
+                # feeds layer_type="main" rope to every decoder layer (the
+                # compress branch is stubbed out in probe mode).
+                pe = position_embeddings["main"]
+            elif len(position_embeddings) == 1:
                 pe = next(iter(position_embeddings.values()))
             else:
                 raise RuntimeError(
