@@ -457,7 +457,11 @@ def _apply_fp8_dequant_inplace(
     """For each tensor in `out` whose key matches a `fp8_scale_inv_map`
     entry, read the scale_inv, apply the checkpoint-declared block
     dequant (`fp8_scale_inv_map.block`, see `_fp8_dequant_block`), and
-    replace the loaded tensor with the dequanted bf16 weight.
+    replace the loaded tensor with the dequanted bf16 weight. MXFP4
+    tensors (OCP MX FP4 E2M1 nibble pairs with per-32-element E8M0
+    scales, e.g. DSv4-Flash routed experts) are detected by signature
+    and dequanted on a dedicated path (step 3b) instead of the
+    block-FP8 broadcast.
 
     Tensors and scales are both grouped by shape and multiplied in a
     single batched 5-D broadcast op per shape-group. On MiniMax-M2.7
@@ -495,8 +499,19 @@ def _apply_fp8_dequant_inplace(
     block_r, block_c = _fp8_dequant_block(fp8_scale_inv_map)
     by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
     fallback: list[str] = []
+    mxfp4_names: list[str] = []
     for name in loaded_scales:
         w = out[name]
+        # DSv4-Flash routed experts are MXFP4, not block-FP8: E2M1 nibble
+        # pairs packed into int8 (low nibble = even element) with per-row
+        # E8M0 scales over 32 logical elements. Signature: int8 weight +
+        # scale grid (out, packed_in/16). Handled in step 3b below.
+        if (w.dim() == 2 and w.dtype == torch.int8
+                and loaded_scales[name].dim() == 2
+                and loaded_scales[name].shape[0] == w.shape[0]
+                and loaded_scales[name].shape[1] * 16 == w.shape[1]):
+            mxfp4_names.append(name)
+            continue
         if w.dim() != 2:
             fallback.append(name)
             continue
@@ -542,6 +557,32 @@ def _apply_fp8_dequant_inplace(
             out[n] = dequanted_stack[i].contiguous()
         dequanted += E
         del w_stack, s_stack, w4, s4, dequanted_stack
+
+    # Step 3b: MXFP4 tensors (DSv4-Flash routed experts). Vectorized
+    # nibble unpack + per-32-element E8M0 scale, per the OCP Microscaling
+    # Formats (MX) v1.0 spec: FP4 E2M1 element grid ({0, 0.5, 1, 1.5, 2,
+    # 3, 4, 6} with a sign bit), one shared E8M0 power-of-two scale per
+    # 32-element group.
+    if mxfp4_names:
+        lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.bfloat16, device=device)
+        for name in mxfp4_names:
+            wp = out[name].to(device=device).view(torch.uint8)
+            rows, packed_in = wp.shape
+            logical_in = packed_in * 2
+            deq = torch.empty(rows, logical_in, dtype=torch.bfloat16,
+                              device=device)
+            deq[:, 0::2] = lut[(wp & 0x0F).to(torch.long)]
+            deq[:, 1::2] = lut[(wp >> 4).to(torch.long)]
+            sb = loaded_scales[name].to(device=device).view(torch.uint8)
+            scale = torch.exp2((sb.to(torch.float32) - 127.0))
+            deq = (deq.reshape(rows, logical_in // 32, 32).to(torch.float32)
+                   * scale.unsqueeze(-1)).to(torch.bfloat16)
+            out[name] = deq.reshape(rows, logical_in).contiguous()
+            dequanted += 1
+            del wp, deq, sb, scale
 
     # Step 4: Fallback path for any shapes we didn't batch.
     for name in fallback:
