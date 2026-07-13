@@ -89,7 +89,7 @@ AURA answers the global question with three commitments:
 
 **What we measured and dropped.** The cross-layer-interaction literature (CLADO's pairwise IQP, HAWQ-V3's second-order ILP, cooperative-game formulations) models the coupling between Linears. We built the full L2 perturbed-activation cascade and ran the head-to-head on the served metric: cross-layer modeling bought **−1.5%**; AURA's better per-Linear cost bought **−38.5%** on the same A/B. Per-Linear cost fidelity was the lever; interaction modeling was not. That experiment — and the rest of the rejected-methods catalog (pairwise QUBO, Lagrangian λ-bisection as a selector, top-K Hessian covering, polish DPs that regress under the real-KL gate) — is documented in the paper. Negative results are recorded with their durable lesson; we don't re-litigate them silently.
 
-Full derivations, the additivity/cancellation analysis, and the served evidence: [`paper/main.tex`](paper/main.tex).
+Full derivations, the additivity/cancellation analysis, and the served evidence: [`paper/main.pdf`](paper/main.pdf).
 
 ---
 
@@ -193,7 +193,7 @@ The rules this project holds itself to, because low-bit quantization results are
 }
 ```
 
-The AURA paper (*AURA: Production-Faithful KL–Fisher Allocation*) is at [`paper/main.tex`](paper/main.tex). Contact: robert.tand@icloud.com.
+The AURA paper (*AURA: Production-Faithful KL–Fisher Allocation*) is at [`paper/main.pdf`](paper/main.pdf) (source: [`paper/main.tex`](paper/main.tex)). Contact: robert.tand@icloud.com.
 
 ## Acknowledgements
 

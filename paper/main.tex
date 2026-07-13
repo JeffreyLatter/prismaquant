@@ -1,5 +1,10 @@
 \documentclass[11pt]{article}
 
+% Scalable Type 1 fonts (Latin Modern): required for microtype's font
+% expansion on TeX installs without cm-super, and keeps the PDF text
+% vector (crisp in browser viewers) rather than bitmap Type 3.
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
 \usepackage[a4paper,margin=1in]{geometry}
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{mathtools}
