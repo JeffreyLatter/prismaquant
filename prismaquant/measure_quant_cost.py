@@ -72,6 +72,117 @@ def canonical_linear_name(name: str, profile=None) -> str:
     return f"{prefix}.{parent}.{expert_id}"
 
 
+def resolve_cost_target_name(name: str, target_names: set[str],
+                             profile=None) -> str:
+    """Cost-row key for a live module name, honoring raw-name probes.
+
+    ``canonical_linear_name`` remaps per-expert live names to packed-style
+    names (``experts.gate_up_proj.E`` / ``experts.down_proj.E``). Models
+    whose probe keys per-expert Linears under the RAW live names
+    (DSv4-Flash) would then miss ``target_names`` and every routed expert
+    would be silently skipped. Fall back to the raw live name when the
+    remapped name misses but the raw name is a target.
+    """
+    canonical = canonical_linear_name(name, profile)
+    if canonical not in target_names and name in target_names:
+        return name
+    return canonical
+
+
+_PER_EXPERT_NAME_RE = re.compile(r"^(.+\.experts)\.(\d+)\.([^.]+)$")
+
+
+def _expert_cost_sample_n() -> int:
+    """PRISMAQUANT_EXPERT_COST_SAMPLE: stratified experts-per-(layer,
+    projection) sample for cost measurement; 0 (default) measures every
+    expert. Shared by the packed-stack path and the per-expert dense path."""
+    return int(os.environ.get(
+        "PRISMAQUANT_EXPERT_COST_SAMPLE",
+        os.environ.get("PRISMAQUANT_GGUF_EXPERT_COST_SAMPLE", "0"),
+    ) or 0)
+
+
+def _expert_cost_sample_split(
+    target_names: set[str],
+) -> tuple[set[str], dict[str, list[str]]]:
+    """Stratified expert subsample for UNPACKED per-expert MoE Linears.
+
+    The dense analog of the packed-stack lever at `_measure_packed_experts`:
+    models whose experts live as per-expert nn.Linears (DSv4-Flash: 256
+    experts x 3 projections x 43 layers) would push every expert tensor
+    through the exhaustive-grid IQ search = days. Measure only a
+    deterministic, evenly spaced sample of expert ids per (experts-prefix,
+    projection) group — the same linspace rule the packed path applies to
+    stack rows — and extrapolate the rest (see _extrapolate_expert_costs).
+    Like the packed path, this only affects the allocator's cost estimates;
+    export always quantizes every expert exactly.
+
+    Returns (names_to_measure, extrapolate) where `extrapolate` maps each
+    skipped per-expert name to the sorted sampled names of its group.
+    """
+    sample_n = _expert_cost_sample_n()
+    measure = set(target_names)
+    if sample_n <= 0:
+        return measure, {}
+    groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
+    for name in target_names:
+        m = _PER_EXPERT_NAME_RE.match(name)
+        if m:
+            groups.setdefault((m.group(1), m.group(3)), []).append(
+                (int(m.group(2)), name))
+    extrapolate: dict[str, list[str]] = {}
+    for members in groups.values():
+        if len(members) <= sample_n:
+            continue
+        members.sort()
+        idx = torch.linspace(
+            0, len(members) - 1, sample_n,
+        ).round().long().unique().tolist()
+        sampled = sorted(members[i][1] for i in idx)
+        sampled_set = set(sampled)
+        for _eid, name in members:
+            if name not in sampled_set:
+                measure.discard(name)
+                extrapolate[name] = sampled
+    return measure, extrapolate
+
+
+def _extrapolate_expert_costs(
+    results: dict, extrapolate: dict[str, list[str]],
+) -> None:
+    """Fill skipped per-expert cost rows with their group's sampled mean.
+
+    Mirrors the packed path, where one sampled measurement prices the whole
+    expert stack: every expert must keep a cost row, because the allocator
+    drops row-less names entirely (build_candidates), which would silently
+    shrink the DP's bit/disk accounting and the serving-unit membership.
+    """
+    for name, sources in extrapolate.items():
+        merged: dict[str, dict] = {}
+        fmt_names: set[str] = set()
+        for src in sources:
+            fmt_names.update(results.get(src, {}))
+        for fmt in fmt_names:
+            entries = [
+                results[src][fmt] for src in sources
+                if fmt in results.get(src, {})
+                and "error" not in results[src][fmt]
+            ]
+            if not entries:
+                continue
+            out: dict[str, object] = {"expert_cost_extrapolated": True}
+            for key in ("weight_mse", "output_mse", "rel_output_mse",
+                        "predicted_dloss", "fisher_output_mse"):
+                vals = [float(e[key]) for e in entries if key in e]
+                if vals:
+                    out[key] = sum(vals) / len(vals)
+            if any(e.get("output_mse_measured") is False for e in entries):
+                out["output_mse_measured"] = False
+            merged[fmt] = out
+        if merged:
+            results[name] = merged
+
+
 def _accumulate_result(bucket: dict, name: str, fmt: str,
                        weight_mse: float, output_mse: float,
                        rel_output_mse: float,
@@ -442,12 +553,12 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
     accum: dict[str, dict[str, dict]] = {}
     processed = 0
     tstart = time.time()
-    target_list = list(target_names)
-    n_total = len(target_list)
+    measure_names, expert_extrapolate = _expert_cost_sample_split(target_names)
+    n_total = len(measure_names)
 
     for name, mod in model.named_modules():
-        canonical_name = canonical_linear_name(name, profile)
-        if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
+        canonical_name = resolve_cost_target_name(name, target_names, profile)
+        if not isinstance(mod, nn.Linear) or canonical_name not in measure_names:
             continue
         if canonical_name not in act_cache:
             continue
@@ -524,7 +635,9 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
             elapsed = time.time() - tstart
             eta = elapsed / processed * (n_total - processed)
             print(f"[cost] {processed}/{n_total} eta={eta:.0f}s", flush=True)
-    return _finalize_results(accum)
+    results = _finalize_results(accum)
+    _extrapolate_expert_costs(results, expert_extrapolate)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +653,7 @@ def _group_by_shape(model: nn.Module, target_names: set[str], profile=None
     """
     groups: dict[tuple[int, int], list[tuple[str, nn.Linear]]] = {}
     for name, mod in model.named_modules():
-        canonical_name = canonical_linear_name(name, profile)
+        canonical_name = resolve_cost_target_name(name, target_names, profile)
         if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
             continue
         key = (mod.in_features, mod.out_features)
@@ -962,10 +1075,7 @@ def _measure_packed_experts(
         # less quantize work (IQ exhaustive-grid on 3.5G-elem stacks is
         # ~25 min/layer at full E — 2026-07-11). Export always quantizes
         # every expert exactly; this only affects the DP's cost estimates.
-        sample_n = int(os.environ.get(
-            "PRISMAQUANT_EXPERT_COST_SAMPLE",
-            os.environ.get("PRISMAQUANT_GGUF_EXPERT_COST_SAMPLE", "0"),
-        ) or 0)
+        sample_n = _expert_cost_sample_n()
         for spec in specs:
             try:
                 # Family-agnostic: NVFP4/FP8 registry quantize on a full
@@ -1274,10 +1384,16 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     `fisher_output_mse` from `g2_per_token` when those tensors are present.
     """
     dev = torch.device(device)
-    groups = _group_by_shape(model, target_names, profile)
+    # Stratified per-expert subsample (PRISMAQUANT_EXPERT_COST_SAMPLE) for
+    # unpacked MoE Linears; skipped experts get their group's sampled mean
+    # after finalize, so downstream coverage matches a full measurement.
+    measure_names, expert_extrapolate = _expert_cost_sample_split(target_names)
+    groups = _group_by_shape(model, measure_names, profile)
     total_linears = sum(len(v) for v in groups.values())
     print(f"[cost] batched: {len(groups)} shape groups, "
-          f"{total_linears} Linears total", flush=True)
+          f"{total_linears} Linears total"
+          + (f" (expert sample: {len(expert_extrapolate)} extrapolated)"
+             if expert_extrapolate else ""), flush=True)
 
     accum: dict[str, dict[str, dict]] = {}
     processed = 0
@@ -1501,7 +1617,9 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                       flush=True)
     if _prefetch_pool is not None:
         _prefetch_pool.shutdown(wait=False)
-    return _finalize_results(accum)
+    results = _finalize_results(accum)
+    _extrapolate_expert_costs(results, expert_extrapolate)
+    return results
 
 
 def prepare_cost_context(probe_path: str,
