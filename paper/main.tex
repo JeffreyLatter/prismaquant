@@ -61,8 +61,13 @@
 % AURA leads as the method; the bf16-floor reframe is a softened, evidence-
 % labelled "measurement-artifact study"; weight-only and bf16-dW limitations
 % owned up front. ALL numbers trace to /home/rob/dq-runs/{xlayer_rung0,
-% aura-27b-flagship,aura-sat-validate-4b} and the auto-memory. Items marked
-% %TODO need Robert/Codex verification before submission.
+% aura-27b-flagship,aura-sat-validate-4b,aura-blocker-runs} and the auto-memory;
+% the 2026-06-12 codex review re-derived them from raw logs (CODEX_QUEUE_
+% FINDINGS.md ~L909). xlayer_rung0/ was deleted in a July disk cleanup AFTER
+% that verification. 2026-07-13 accuracy pass: baseline re-labelled
+% "then-production-default" (M6 flipped the default to h_trace*weight_mse,
+% commit 8588036), ToolEvalBench behavioral corroboration added, MoE
+% route-flip boundary added to limitations, bib TODOs resolved from arXiv.
 % =====================================================================
 
 \title{\bfseries \textsc{Aura}: Production-Faithful KL--Fisher Allocation\\
@@ -72,7 +77,7 @@
         \textit{Independent Researcher}\\
         \texttt{robert.tand@icloud.com}}
 
-\date{June 2026 \quad\textsc{(draft)}}
+\date{July 2026 \quad\textsc{(draft)}}
 
 \begin{document}
 \maketitle
@@ -93,7 +98,7 @@ error the exporter ships (the GPTQ+JSO bytes, not an idealized round; stored in
 bf16 in the current implementation). \textsc{Aura} is additive across Linears,
 solved as a multiple-choice knapsack, and --- critically --- every candidate it
 proposes is gated by a real, end-to-end KL measurement on a held-out split.
-Against the production-default Fisher-trace$\times$output-MSE baseline,
+Against the then-production-default Fisher-trace$\times$output-MSE baseline,
 \textsc{Aura} lowers served vLLM KL-vs-BF16 by $\mathbf{17.9\%}$ at matched
 $5.99$~bpp on Qwen3.6-27B (replicated on two disjoint held-out corpora); against a
 weaker output-MSE baseline the $4.85$~bpp knee on Qwen3-4B improves
@@ -165,9 +170,9 @@ does the rest.} Our contributions:
     KL/Gauss--Newton--Fisher estimate of the downstream KL contribution of the
     production-rendered weight error the exporter ships (stored bf16;
     Section~\ref{sec:limits}). It improves served KL by $17.9\%$ at 27B (matched
-    bpp, two corpora) against the strong production-default Fisher-weighted
-    baseline, and by $38\text{--}40\%$ at the 4B knee against a weaker output-MSE
-    baseline; Section~\ref{sec:experiments}.
+    bpp, two corpora) against the strong Fisher-weighted baseline that was the
+    production default at measurement time, and by $38\text{--}40\%$ at the 4B
+    knee against a weaker output-MSE baseline; Section~\ref{sec:experiments}.
   \item \textbf{A measurement-artifact study} (Section~\ref{sec:additivity})
     that explains why an additive cost suffices: a constant per-measurement
     bf16 floor inflates apparent non-additivity; in fp32 ($\equiv$ fp64) the
@@ -314,7 +319,8 @@ $10\times$ smaller than the bf16 floor.
 \caption{The apparent non-additivity is a bf16 measurement floor. Qwen3-4B,
 W4A16, same 12 Linears / 6 pairs, KL computed in the stated dtype. $\Sigma/J$ is
 sum-of-unary over joint; $\bar I$ is the mean pairwise interaction.
-Repro: \texttt{xlayer\_rung0/fp64\_additivity.py}.}
+Repro: \texttt{xlayer\_rung0/fp64\_additivity.py} (run dir since archived; values
+were re-derived verbatim from its raw logs in the 2026-06-12 external review).}
 \label{tab:precision}
 \begin{tabular}{lccl}
 \toprule
@@ -520,12 +526,19 @@ for both arms, so only the \emph{allocation} differs --- and report exact vLLM
 KL-vs-BF16 on a held-out split disjoint from cost generation (the
 selection/validation split; we return to the absence of a third, untouched test
 split in Section~\ref{sec:limits}). The two scales use \emph{different} baselines,
-which we state plainly: the 27B comparison is against the production-default
-Fisher-trace$\times$output-MSE cost
+which we state plainly: the 27B comparison is against the Fisher-trace$\times$%
+output-MSE cost
 ($u_i=\tfrac12\,\mathrm{Tr}(\hat H_i)\,\mathrm{MSE}^{\mathrm w}_i$), a strong
-Fisher-weighted local surrogate; the 4B comparison is against the weaker raw
-output-MSE cost. The larger 4B gap is therefore partly the weaker baseline ---
-the airtight, fair-baseline result is the 27B one.
+Fisher-weighted local surrogate and the production default at the time of these
+measurements;\footnote{The production default has since moved to
+$\mathrm{Tr}(\hat H_i)\,\mathrm{MSE}_{W_i}$ (weight-MSE): a subsequent served A/B
+found the output-MSE term double-counts activation energy already present in the
+Fisher trace, decisively at small scale ($-51\%$/$-58\%$ pooled KL at 4B/0.6B over
+five calibration draws) and neutral-to-positive at 27B. An \textsc{Aura}-vs-%
+weight-MSE-baseline head-to-head has not been run at 27B; the $17.9\%$ here is
+against the output-MSE variant, stated exactly.} the 4B comparison is against the
+weaker raw output-MSE cost. The larger 4B gap is therefore partly the weaker
+baseline --- the airtight, fair-baseline result is the 27B one.
 
 \paragraph{Qwen3-4B, at the knee.} \textsc{Aura}'s sensitivity is
 \emph{concentrated} (a few MLP gate/up Linears carry the KL; sharp kneedle at
@@ -541,7 +554,8 @@ knee, not above it.
 better), shared NVFP4+BF16 cache, two independent calibrations. Baseline here is
 the \emph{weaker} raw output-MSE cost (cf.\ the strong Fisher-weighted baseline
 used at 27B), so the gap is not directly comparable to Table~\ref{tab:27b}.
-WikiText PPL at the same point. Repro: \texttt{xlayer\_rung0/}.}
+WikiText PPL at the same point. Repro: \texttt{xlayer\_rung0/} (since archived;
+values verified against its raw artifacts in the 2026-06-12 review).}
 \label{tab:4b}
 \begin{tabular}{lccc}
 \toprule
@@ -640,10 +654,27 @@ is better by only $0.38\%$ relative ($0.39$ percentage points less degradation).
 At $6$~bpp perplexity is near-saturated for both arms, while KL is not (Aura still
 improving, baseline plateaued). The 27B result is therefore specifically a
 \textbf{distributional-fidelity} win --- a lower KL-vs-BF16, a proxy for reference
-agreement and tool-call fidelity that we do not separately evaluate here --- not a
+agreement and tool-call fidelity --- not a
 perplexity win. Perplexity does not veto (Aura $\le$ baseline), but we do
 not claim it as a PPL improvement. The $-18\%$ PPL gap at 4B was against a
 \emph{weaker} (no-Fisher) baseline and should not be read as the 27B story.
+
+\paragraph{Behavioral corroboration (tool-call fidelity).} The
+distributional-fidelity framing now has a direct behavioral check. On a
+deterministic tool-use benchmark (ToolEvalBench, hard mode, sequential,
+temperature $0$, one fixed seed, same harness for every row), an
+\textsc{Aura}-allocated 27B artifact at matched $5.5$~bpp scores $88/100$
+against $84/100$ for the prior production allocation at the same bpp; the
+shipped \textsc{Aura} artifact (same $5.5$~bpp point, corrected render/export
+code, full NVFP4/FP8/BF16 menu) scores $91/100$ against $86/100$ for the BF16
+reference itself and $85/100$ for the prior $5.31$-bpp flagship. Two caveats,
+stated plainly: these are \emph{artifact-level} comparisons (menu and code
+version vary alongside the cost, unlike the matched-cache A/Bs above), and a
+quantized model scoring above BF16 on a single deterministic run should be read
+as \emph{parity within run-to-run structure}, not superiority. What the result
+does support is the claim the KL metric is a proxy for: the \textsc{Aura}
+allocations preserve tool-call behavior at least as well as the allocations they
+replaced.
 
 \paragraph{Weight-only cost vs.\ W4A4 served error (attribution).} \textsc{Aura}
 scores weight error only, yet NVFP4 ships as W4A4. On the 27B artifact a
@@ -702,6 +733,23 @@ model (Section~\ref{sec:limits}).
     sketches. We claim the \emph{production-faithful realization} (rendered-%
     error scoring, format knapsack, served-KL selection) and the
     \emph{measurement-artifact correction}, not new sensitivity theory.
+  \item \textbf{MoE routed experts are outside the smooth cost's reach.} The
+    experiments here are dense models, and measurement after this draft shows
+    that boundary is real, not incidental: on a $192$-expert top-$8$ MoE
+    (Qwen3.6-35B-A3B), quantizing a routed expert perturbs the \emph{router},
+    changing which experts execute --- an error mode invisible to any
+    fixed-route weight-error quadratic, \eqref{eq:aura} included. Under the
+    faithful production render the cost's rank correlation with measured
+    per-expert-unit KL drops (Spearman $0.45\!\to\!0.35$), and predicted
+    NVFP4-vs-FP8 cost ratios of $2$--$49\times$ compress to a measured
+    $1.1$--$1.5\times$. The production remedy follows this paper's own spine
+    --- when the surrogate cannot see the cost, measure it: packed routed
+    experts take \emph{empirical} per-unit end-to-end KL costs, merged into the
+    same knapsack \eqref{eq:mckp} alongside \textsc{Aura} costs for the
+    non-expert Linears, with real-KL frontier selection unchanged. The hybrid
+    ships (served confident KL $0.029$--$0.031$ at $4.66$--$4.75$~bpp on the
+    35B), but the paper's additive-cost claim should be read as scoped to
+    Linears that do not gate control flow.
 \end{enumerate}
 
 \paragraph{The experiments that would most harden this paper, in priority order.}
@@ -716,10 +764,12 @@ the $L_3$ polish, and a 27B repeat, each with the wall-clock cost of producing t
 allocation --- the table that lifts the novelty above synthesis.
 (3)~fp32-$\dW$ with a production-cache coverage report, tying the measurement study
 to the allocator. (4)~A full bpp sweep for both arms with confidence intervals, to
-support or retract the ``gap widens with bits'' trend. (5)~A behavioral evaluation
-(tool-call / top-$k$ agreement) to substantiate the distributional-fidelity
-framing beyond KL. All are feasible on the $128$~GB Blackwell box with the models
-already resident.
+support or retract the ``gap widens with bits'' trend. (5)~\emph{partly done} ---
+deterministic tool-call evaluation now corroborates the framing
+(Section~\ref{sec:experiments}: $88$ vs.\ $84$ at matched bpp, $91$ vs.\ BF16's
+$86$ for the shipped artifact); what remains is top-$k$ agreement and multi-seed
+behavioral error bars. All are feasible on the $128$~GB Blackwell box with the
+models already resident.
 
 % =====================================================================
 \section{Conclusion}\label{sec:conclusion}
@@ -729,9 +779,10 @@ allocation does not need explicit cross-layer interaction modeling. A single
 additive per-Linear cost --- the downstream KL--Fisher contribution of the
 production-rendered weight error, estimated in $O(N)$ by randomized probes ---
 ranks allocations well enough that a real-KL selector finishes the job.
-\textsc{Aura} realizes this: it beats the strong production-default Fisher-weighted
-baseline by $17.9\%$ served KL at 27B (two disjoint corpora) and a weaker
-output-MSE baseline by $38\text{--}40\%$ at the 4B knee.
+\textsc{Aura} realizes this: it beats the strong Fisher-weighted baseline that
+was the production default at measurement time by $17.9\%$ served KL at 27B (two
+disjoint corpora) and a weaker output-MSE baseline by $38\text{--}40\%$ at the 4B
+knee.
 The apparent additive ``overshoot'' that motivated the cross-layer apparatus is,
 at these bit-widths, largely a bf16 measurement floor; the genuine residual is
 small and is absorbed by selection. And the frontier's shape is rate--distortion
@@ -778,13 +829,13 @@ W4A4 model --- the accounting a faithful method paper owes its reader.
 \bibitem{orr2025} D.~Orr, L.~Ribar, and C.~Luschi. Optimal Formats for Weight
   Quantisation. \emph{arXiv:2505.12988}, 2025. % closest prior art to Aura's cost
 
-\bibitem{fimaq2025} % TODO verify author list before submission
-  \emph{FIMA-Q: Post-Training Quantization for Vision Transformers via Fisher
-  Information Matrix Approximation.} \emph{CVPR}, 2025. arXiv:2506.11543.
+\bibitem{fimaq2025} Z.~Wu, S.~Wang, J.~Zhang, J.~Chen, and Y.~Wang.
+  FIMA-Q: Post-Training Quantization for Vision Transformers by Fisher
+  Information Matrix Approximation. \emph{CVPR}, 2025. arXiv:2506.11543.
 
-\bibitem{kllens2026} % TODO verify author list (lead author Kong) before submission
-  \emph{A KL Lens on Quantization: per-layer KL sensitivity for mixed-precision.}
-  \emph{arXiv:2604.13440}, 2026.
+\bibitem{kllens2026} J.~Kong, N.~P.~Pandey, F.~Ponzina, and T.~Rosing.
+  A KL Lens on Quantization: Fast, Forward-Only Sensitivity for Mixed-Precision
+  SSM-Transformer Models. \emph{arXiv:2604.13440}, 2026.
 
 \bibitem{kneedle2011} V.~Satopaa, J.~Albrecht, D.~Irwin, and B.~Raghavan.
   Finding a ``Kneedle'' in a Haystack: Detecting Knee Points in System Behavior.
