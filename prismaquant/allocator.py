@@ -115,6 +115,7 @@ from .allocator_candidates import (
     build_candidates,
     expand_fused_sibling_assignment,
     expand_packed_group_assignment,
+    packed_role_split_profile,
     summarize_applicability_masks,
 )
 from .serving_profiles import (
@@ -1130,6 +1131,15 @@ def main():
                          "coherence. Aggregation prices the DP and the "
                          "serving constraint identically; use this flag "
                          "only for back-compat experiments.")
+    ap.add_argument("--packed-role-split", action="store_true",
+                    help="Split each packed-MoE expert serving group into "
+                         "TWO DP units per layer: gate+up projections and "
+                         "down projections (default: one per-layer-uniform "
+                         "unit). Legal when the serving lane supports "
+                         "per-role expert schemes (e.g. GGUF stacks expert "
+                         "tensors per projection). The split threads "
+                         "through the profile view, so serving promotion "
+                         "stays consistent with the DP units.")
     ap.add_argument("--enforce-family-coherence", action="store_true",
                     help="Error (instead of warn) if the format set contains "
                          "multiple candidates for the same bit tier (e.g. "
@@ -1412,6 +1422,17 @@ def main():
         specs_sorted,
         allow_default_profile=args.allow_default_profile,
     )
+
+    if args.packed_role_split:
+        # Split packed expert groups into gate_up / down serving units by
+        # wrapping the profile view: DP aggregation AND serving promotion
+        # both key groups through packed_expert_format_group, so wrapping
+        # keeps them consistent (role units atomic, final promotion still a
+        # validated no-op). Must run after the isinstance-based
+        # DefaultProfile gate above.
+        model_profile = packed_role_split_profile(model_profile)
+        print("[alloc] --packed-role-split: packed expert groups keyed as "
+              "(layer, {gate_up|down}) serving units", flush=True)
 
     # --- Format-family coherence check -----------------------------------
     # A sensible format ladder has at most ONE format per bit tier. Having
