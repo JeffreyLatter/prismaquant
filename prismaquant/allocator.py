@@ -1268,6 +1268,50 @@ def main():
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
 
+    # ---- Fisher renormalization ----
+    # Older incremental probes finalized `h_trace = h_trace_raw /
+    # n_tokens_seen` PER ROW, where per-expert Linears only count their
+    # ROUTED tokens — inflating a rarely-routed expert's Fisher by
+    # (global/routed), up to ~33,000x, i.e. inverted importance weighting.
+    # The raw accumulators are stored, so recompute every derived field here
+    # with the one correct shared denominator: the global calib token count
+    # (probe meta nsamples x seqlen). Dense rows saw exactly that many
+    # tokens, so their values are unchanged; probes written by the fixed
+    # finalize (meta.fisher_norm_tokens) renormalize to identical values —
+    # the recompute is idempotent.
+    _meta = probe.get("meta", {}) or {}
+    _norm_tokens = int(_meta.get("fisher_norm_tokens", 0) or 0)
+    if _norm_tokens <= 0:
+        _norm_tokens = (int(_meta.get("nsamples", 0) or 0)
+                        * int(_meta.get("seqlen", 0) or 0))
+    if _norm_tokens > 0:
+        _renormed = 0
+        for _entry in stats.values():
+            if not isinstance(_entry, dict) or "h_trace_raw" not in _entry:
+                continue
+            _entry["h_trace"] = float(_entry["h_trace_raw"]) / _norm_tokens
+            if "h_w2_sum_raw" in _entry:
+                _entry["h_w2_sum"] = (
+                    float(_entry["h_w2_sum_raw"]) / _norm_tokens)
+            _per_raw = _entry.get("h_trace_per_expert_raw")
+            if _per_raw is not None:
+                _entry["h_trace_per_expert"] = [
+                    float(v) / _norm_tokens for v in _per_raw]
+            _renormed += 1
+        print(f"[alloc] Fisher renormalized: {_renormed}/{len(stats)} rows "
+              f"→ h_trace_raw / {_norm_tokens} global calib tokens "
+              "(per-expert routed-count normalization corrected)", flush=True)
+    else:
+        _needs_fix = sum(
+            1 for _e in stats.values()
+            if isinstance(_e, dict) and "h_trace_raw" in _e
+            and int(_e.get("n_tokens_seen", 0) or 0) > 0)
+        if _needs_fix:
+            print("[alloc] WARNING: probe meta lacks nsamples/seqlen; cannot "
+                  "renormalize h_trace by the global calib token count. "
+                  "Per-expert Fisher may be inflated by routed-token "
+                  "normalization.", flush=True)
+
     allow_pinned = [s.strip() for s in (args.allow_pinned or "").split(",") if s.strip()]
     allocation_excluded = []
     for name in sorted(set(stats) | set(costs)):

@@ -1524,6 +1524,35 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
     )
 
 
+def finalize_fisher_stats(merged_stats: dict, global_tokens: int) -> None:
+    """Normalize raw Fisher accumulators into ``h_trace`` (etc.), in place.
+
+    Fisher normalization must share ONE denominator across every row: the
+    global calibration token count (nsamples x seqlen). Dense trunk Linears
+    accumulate exactly that many tokens in ``n_tokens_seen``, so their
+    values are unchanged by dividing by the global count. Per-expert
+    Linears, however, only see their ROUTED tokens; a per-row
+    ``h_trace_raw / n_tokens_seen`` inflates a rarely-routed expert's
+    Fisher by (global/routed) — exactly inverted importance weighting (the
+    least-used experts look the most sensitive). Tokens never routed to an
+    expert contribute zero gradient, so the empirical Fisher over the
+    calibration set divides by the GLOBAL count for every row.
+    ``n_tokens_seen`` is kept raw (routed count) — the h_detail blob writer
+    still normalizes per-Linear and stamps units="per_token" for its own
+    single-tensor consumers.
+    """
+    for s in merged_stats.values():
+        s["h_trace"] = s.get("h_trace_raw", 0.0) / global_tokens
+        s["h_w2_sum"] = s.get("h_w2_sum_raw", 0.0) / global_tokens
+        # Per-expert Fisher trace (only present on packed-3D stat entries;
+        # dense Linears have no per-expert dimension). Normalize by the
+        # same token count so it shares units with `h_trace`.
+        per = s.get("h_trace_per_expert_raw")
+        if per is not None:
+            s["h_trace_per_expert"] = [float(v) / global_tokens for v in per]
+        s["h_trace_norm_tokens"] = global_tokens
+
+
 # ---------------------------------------------------------------------------
 # Per-shard body runner — phase-3 of streaming_probe, scoped to the
 # Linears matching this shard's regex. Phase-1 + Phase-2 are now global
@@ -2473,16 +2502,11 @@ def _run_body_streaming_shard(
         del grad_at_tail, grad_out
 
     # ---- Finalize ----
-    for s in merged_stats.values():
-        tokens = max(s.get("n_tokens_seen", 1), 1)
-        s["h_trace"] = s.get("h_trace_raw", 0.0) / tokens
-        s["h_w2_sum"] = s.get("h_w2_sum_raw", 0.0) / tokens
-        # Per-expert Fisher trace (only present on packed-3D stat entries;
-        # dense Linears have no per-expert dimension). Normalize by the
-        # same token count so it shares units with `h_trace`.
-        per = s.get("h_trace_per_expert_raw")
-        if per is not None:
-            s["h_trace_per_expert"] = [float(v) / tokens for v in per]
+    # One shared denominator for every row — the global calib token count
+    # (see finalize_fisher_stats for why per-row n_tokens_seen is wrong
+    # for routed-expert Linears).
+    global_tokens = max(int(calib.size(0)) * int(seqlen), 1)
+    finalize_fisher_stats(merged_stats, global_tokens)
 
     detail_dir = Path(h_detail_dir) if h_detail_dir else None
     if detail_dir is not None:
@@ -2587,6 +2611,9 @@ def _run_body_streaming_shard(
                 "activation_rows_limit": int(activation_rows_limit),
                 "linear_include": linear_include,
                 "linear_exclude": linear_exclude,
+                # Marker: h_trace/h_w2_sum/h_trace_per_expert are divided by
+                # the GLOBAL calib token count (not per-row n_tokens_seen).
+                "fisher_norm_tokens": global_tokens,
             },
         }, f)
     print(f"[incremental] wrote {out_path}", flush=True)
