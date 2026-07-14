@@ -200,3 +200,77 @@ def test_assignment_artifact_bytes_packed_nvfp4_counts_per_expert_globals():
         + 8 * 4 * 2  # per-expert weight_global + input_global, gate+up
     )
     assert r["body_quant_bytes"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Per-tensor source-byte manifest (mixed-precision sources)
+# ---------------------------------------------------------------------------
+
+def _mixed_source_checkpoint(tmp_path):
+    """Two re-encoded tensors on a mixed source: an MXFP4-packed expert
+    (I8 nibble weights, 0.5 B/param on disk, + E8M0 group scales) and an
+    fp8 attention Linear (+ fp32 weight_scale_inv), plus a BF16 floor
+    tensor. The fp8 dtype flips the regime detector to "fp8", so the
+    regime path charges the packed expert 1 B/LOGICAL-param — about twice
+    its actual on-disk bytes."""
+    _write_safetensors(tmp_path / "m.safetensors", {
+        # logical (64, 256) packed 2-per-byte -> stored (64, 128) I8 = 8192 B
+        "layers.0.experts.0.down_proj.weight": ("I8", (64, 128)),
+        # E8M0 scale per 32-element group: (64, 8) U8 = 512 B
+        "layers.0.experts.0.down_proj.scale": ("U8", (64, 8)),
+        "layers.0.self_attn.q_proj.weight": ("F8_E4M3", (32, 32)),   # 1024 B
+        "layers.0.self_attn.q_proj.weight_scale_inv": ("F32", (1, 1)),  # 4 B
+        "embed.weight": ("BF16", (100, 8)),                         # 1600 B
+    })
+    stats = {
+        "layers.0.experts.0.down_proj": {
+            "n_params": 64 * 256, "in_features": 256, "out_features": 64},
+        "layers.0.self_attn.q_proj": {
+            "n_params": 32 * 32, "in_features": 32, "out_features": 32},
+    }
+    reencoded = list(stats)
+    return stats, reencoded
+
+
+def test_source_tensor_bytes_manifest_charges_actual_spans(tmp_path):
+    _mixed_source_checkpoint(tmp_path)
+    manifest = fp.source_tensor_bytes_manifest(str(tmp_path))
+    assert manifest["layers.0.experts.0.down_proj"] == 8192 + 512
+    assert manifest["layers.0.self_attn.q_proj"] == 1024 + 4
+    assert manifest["embed"] == 1600
+
+
+def test_manifest_floor_non_negative_where_regime_path_goes_negative(tmp_path):
+    stats, reencoded = _mixed_source_checkpoint(tmp_path)
+    total, by_dtype = fp.source_checkpoint_bytes(str(tmp_path))
+    regime = fp.source_regime(by_dtype)
+    assert regime == "fp8"
+
+    # Regime-wide accounting: the packed expert's LOGICAL params are charged
+    # 1 B each -> more bytes removed than the tensor (or checkpoint) holds.
+    regime_removed = {
+        q: fp.reencoded_source_bytes_for_shape(
+            (stats[q]["out_features"], stats[q]["in_features"]), regime)
+        for q in reencoded
+    }
+    regime_floor = total - sum(regime_removed.values())
+    assert regime_floor < 0
+    with pytest.raises(ValueError, match="negative non-quantizable floor"):
+        fp.check_floor_non_negative(
+            regime_floor, total, regime_removed, context="unit")
+
+    # Manifest accounting: actual header spans can never exceed the total.
+    manifest = fp.source_tensor_bytes_manifest(str(tmp_path))
+    manifest_floor = total - sum(manifest[q] for q in reencoded)
+    assert manifest_floor == 1600  # exactly the BF16 floor tensor
+    fp.check_floor_non_negative(
+        manifest_floor, total, {q: manifest[q] for q in reencoded},
+        context="unit")  # does not raise
+
+
+def test_floor_bytes_for_model_uses_manifest_on_mixed_source(tmp_path):
+    stats, reencoded = _mixed_source_checkpoint(tmp_path)
+    info = fp.floor_bytes_for_model(str(tmp_path), reencoded, stats)
+    assert info["regime"] == "fp8"
+    assert info["reencoded_source_bytes"] == (8192 + 512) + (1024 + 4)
+    assert info["floor_bytes"] == 1600

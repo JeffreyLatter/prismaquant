@@ -131,6 +131,63 @@ def source_regime(by_dtype: Mapping[str, int]) -> str:
     return "bf16"
 
 
+def source_tensor_bytes_manifest(
+    model_path: str,
+    name_map=None,
+) -> dict[str, int]:
+    """Exact on-disk source bytes per weight tensor, keyed by live qname base.
+
+    Walks the safetensors headers and, for every ``<base>.weight`` tensor,
+    sums its byte span with its quantization sidecars (``<base>.scale``,
+    ``<base>.weight_scale_inv``) — exactly the bytes the export removes from
+    the checkpoint when it re-encodes that Linear. ``name_map`` maps a
+    checkpoint key to the live transformers parameter name
+    (``ModelProfile.checkpoint_to_live_name``); identity when None. Keys are
+    stored without the ``.weight`` suffix to match allocator qnames.
+
+    This is the per-tensor replacement for the regime-wide
+    ``reencoded_source_bytes_for_shape`` accounting, which charges EVERY
+    re-encoded Linear at the FP8_SOURCE layout (1 B/param + fp32 block
+    scales) as soon as any F8 dtype is present in the checkpoint. On a
+    mixed-precision source that is wrong per tensor class — e.g. the
+    MXFP4-packed routed experts of a DSv4-Flash checkpoint (I8 nibble
+    weights + E8M0 group scales, ~0.53 B/param) were charged 1 B/param,
+    "removing" 279.9 GB from a 166.9 GB checkpoint and driving the
+    non-quantizable floor to −113 GB. Summing actual header byte spans can
+    never exceed the checkpoint total, so a floor computed from this
+    manifest is >= 0 by construction (a negative floor is always an
+    accounting bug — rejected at the consumers).
+    """
+    spans: dict[str, int] = {}
+    shards = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not shards:
+        raise FileNotFoundError(
+            f"no *.safetensors shards under {model_path!r}; cannot build the "
+            "per-tensor source-byte manifest")
+    for shard in shards:
+        header = _read_safetensors_header(shard)
+        for name, meta in header.items():
+            if name == "__metadata__":
+                continue
+            a, b = meta["data_offsets"]
+            spans[name] = spans.get(name, 0) + (int(b) - int(a))
+    out: dict[str, int] = {}
+    for name, nb in spans.items():
+        if not name.endswith(".weight"):
+            continue
+        base = name[: -len(".weight")]
+        total = (nb
+                 + spans.get(base + ".scale", 0)
+                 + spans.get(base + ".weight_scale_inv", 0))
+        live = name_map(name) if name_map is not None else name
+        if not live:
+            continue  # dropped by the profile (never re-encoded; stays in floor)
+        if live.endswith(".weight"):
+            live = live[: -len(".weight")]
+        out[live] = out.get(live, 0) + total
+    return out
+
+
 def reencoded_source_bytes_for_shape(shape: tuple[int, ...], regime: str) -> int:
     """On-disk source bytes of ONE re-encoded Linear, by source regime.
 
@@ -141,6 +198,12 @@ def reencoded_source_bytes_for_shape(shape: tuple[int, ...], regime: str) -> int
     scale). This is what makes the floor exact for fp8-native sources: every
     re-encoded Linear's *full* source footprint (weight + scale_inv) is removed
     from the floor, not just the weight bytes.
+
+    WARNING: regime-wide accounting is only correct when the body is
+    uniformly bf16 or uniformly fp8. For mixed-precision sources (e.g.
+    MXFP4-packed experts, I8 + E8M0 scales) use
+    :func:`source_tensor_bytes_manifest`, which charges each tensor its
+    actual header byte span. Consumers must reject a negative floor.
     """
     if regime == "fp8":
         return int(fr.get_format("FP8_SOURCE").memory_bytes_for_shape(shape))
@@ -148,6 +211,55 @@ def reencoded_source_bytes_for_shape(shape: tuple[int, ...], regime: str) -> int
     for d in shape:
         n *= int(d)
     return n * 2  # bf16/fp16 source weight, no scale sibling
+
+
+def _tensor_class(qname: str) -> str:
+    """Coarse tensor-class label for floor-accounting diagnostics."""
+    if ".shared_experts." in qname:
+        return "shared_experts"
+    if ".experts." in qname:
+        return "routed_experts"
+    if ".self_attn." in qname or ".attn." in qname:
+        return "attention"
+    if ".mlp." in qname or ".ffn." in qname:
+        return "mlp"
+    return "other"
+
+
+def check_floor_non_negative(
+    floor_bytes: float,
+    source_total_bytes: float,
+    reencoded_by_name: Mapping[str, int],
+    *,
+    context: str,
+) -> None:
+    """A negative non-quantizable floor is ALWAYS an accounting bug.
+
+    It means the source bytes 'removed' for re-encoding exceed the bytes the
+    checkpoint actually holds — e.g. MXFP4-packed experts (~0.53 B/param on
+    disk) charged at the FP8_SOURCE 1 B/param layout can drive the floor
+    negative and let an artifact more than twice the budget 'fit' it. Raises
+    with the per-tensor-class byte breakdown so the offending class is
+    named, never rationalized.
+    """
+    if floor_bytes >= 0:
+        return
+    by_class: dict[str, int] = {}
+    for qname, nb in reencoded_by_name.items():
+        cls = _tensor_class(qname)
+        by_class[cls] = by_class.get(cls, 0) + int(nb)
+    detail = ", ".join(
+        f"{cls}={nb / GB:.2f}GB"
+        for cls, nb in sorted(by_class.items(), key=lambda kv: -kv[1]))
+    raise ValueError(
+        f"[footprint] negative non-quantizable floor in {context}: "
+        f"floor={floor_bytes / GB:.3f}GB (source_total="
+        f"{source_total_bytes / GB:.3f}GB, reencoded_source="
+        f"{(source_total_bytes - floor_bytes) / GB:.3f}GB). Removed source "
+        f"bytes by tensor class: {detail}. The per-class source-byte rate is "
+        "wrong (mixed-precision source charged at a uniform regime?). Use "
+        "source_tensor_bytes_manifest() for per-tensor accounting; do not "
+        "ship a selection computed from this floor.")
 
 
 # fp32 weight_global_scale + fp32 input_global_scale per emitted NVFP4
@@ -213,7 +325,7 @@ def assignment_artifact_bytes(
     ``reencoded_source_bytes``, ``n_reencoded``, ``n_missing_stats``, ``regime``.
     """
     body_quant = 0
-    reenc_src = 0
+    reenc_by_name: dict[str, int] = {}
     n_reencoded = 0
     n_missing = 0
     for qname, fmt in assignment.items():
@@ -228,9 +340,13 @@ def assignment_artifact_bytes(
         body_quant += fr.get_format(name).memory_bytes_for_shape(shape)
         if name == "NVFP4":
             body_quant += nvfp4_global_sidecar_bytes(qname, shape)
-        reenc_src += reencoded_source_bytes_for_shape(shape, regime)
+        reenc_by_name[qname] = reencoded_source_bytes_for_shape(shape, regime)
         n_reencoded += 1
+    reenc_src = sum(reenc_by_name.values())
     floor = int(source_total_bytes) - reenc_src
+    check_floor_non_negative(
+        floor, int(source_total_bytes), reenc_by_name,
+        context="assignment_artifact_bytes")
     return {
         "artifact_bytes": floor + body_quant,
         "floor_bytes": floor,
@@ -272,20 +388,30 @@ def floor_bytes_for_model(
     formats (only the re-encoded *format* varies, not which tensors are
     re-encoded), so callers sweeping many allocations compute this once and pass
     ``source_total_bytes`` + ``regime`` to ``assignment_artifact_bytes`` per
-    candidate. ``regime`` defaults to :func:`source_regime` (robust fp8/bf16
-    detection); each re-encoded Linear's source bytes follow the regime
-    (fp8 removes the weight_scale_inv sibling too).
+    candidate. Each re-encoded Linear is charged its actual header byte
+    span from :func:`source_tensor_bytes_manifest` (this function has the
+    model path, so it never needs the regime-wide per-param rate); names
+    missing from the manifest stay priced in the floor — over-count only.
+    ``regime`` defaults to :func:`source_regime` (robust fp8/bf16
+    detection) and is returned for the per-candidate
+    ``assignment_artifact_bytes`` calls, which have no model path.
+    ``stats`` is retained for call compatibility (shapes are no longer
+    needed to price source bytes).
     """
     total, by_dtype = source_checkpoint_bytes(model_path)
     reg = regime if regime is not None else source_regime(by_dtype)
-    reenc_src = 0
+    manifest = source_tensor_bytes_manifest(model_path)
+    reenc_by_name: dict[str, int] = {}
     for qname in reencoded_names:
-        entry = stats.get(qname)
-        if entry is None and qname.endswith(".weight"):
-            entry = stats.get(qname[: -len(".weight")])
-        if isinstance(entry, dict):
-            reenc_src += reencoded_source_bytes_for_shape(
-                _shape_from_stats(entry), reg)
+        nb = manifest.get(qname)
+        if nb is None and qname.endswith(".weight"):
+            nb = manifest.get(qname[: -len(".weight")])
+        if nb is not None:
+            reenc_by_name[qname] = int(nb)
+    reenc_src = sum(reenc_by_name.values())
+    check_floor_non_negative(
+        int(total) - reenc_src, total, reenc_by_name,
+        context="floor_bytes_for_model")
     return {
         "source_total_bytes": total,
         "regime": reg,
