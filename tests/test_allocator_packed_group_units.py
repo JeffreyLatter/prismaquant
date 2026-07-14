@@ -1,0 +1,352 @@
+"""Packed-MoE serving groups as first-class DP decision units.
+
+A packed expert block (DeepSeek-V4: 768 per-expert Linears, ~6.44B params
+per layer) is
+atomic at serve time — vLLM's FusedMoE loads the whole group under one
+scheme. The DP used to price upgrades PER ROW (a tiny row's upgrade is
+charged one bin, ~0.0001 avg bits) while ``promote_serving_units`` charged
+the WHOLE group (~0.1 avg bits): a ~1000x price mismatch that put mispriced
+expert rows at the top of the per-bin ranking, over-tightened the
+feasibility bisection, and starved attention/shared rows at the format
+floor while headroom sat unused.
+
+``aggregate_packed_serving_groups`` collapses each packed group into ONE
+multi-choice DP item — per-format cost = exact sum of member
+predicted_dloss, per-format bytes = exact sum of member bytes — so the DP
+and the serving constraint price identical moves and MoE promotion becomes
+a validated no-op.
+
+These tests pin:
+  - aggregation groups packed-expert rows and passes everything else through
+  - the unit's per-format predicted_dloss / memory_bytes are exact member sums
+  - expand_packed_group_assignment broadcasts the group decision to members
+  - a group with no common legal format falls back to individual rows
+  - END-TO-END: the per-row mispricing starved the dense row (old path);
+    with groups as DP units the dense row wins the headroom (new path)
+  - the whole group still flips as one unit when the budget affords it
+"""
+from __future__ import annotations
+
+from prismaquant import format_registry as fr
+from prismaquant.allocator_candidates import (
+    _PACKED_GROUP_MARKER,
+    aggregate_fused_siblings,
+    aggregate_packed_serving_groups,
+    expand_packed_group_assignment,
+)
+from prismaquant.allocator_solver import (
+    Candidate,
+    compute_achieved,
+    promote_serving_units,
+    solve_with_promotion,
+)
+
+
+class _PackedProfile:
+    """Groups ``...mlp.experts.<n>.<proj>`` rows per layer (DSv4-style)."""
+
+    def packed_expert_format_group(self, name: str) -> str | None:
+        parts = name.split(".")
+        if "experts" not in parts:
+            return None
+        idx = parts.index("experts")
+        tail = parts[idx + 1:]
+        if len(tail) == 2 and tail[0].isdigit():
+            parent = ".".join(parts[: idx + 1])
+            return f"{parent}::__packed_format__:gate_proj,up_proj,down_proj"
+        return None
+
+    def fused_sibling_group(self, name: str) -> str | None:
+        return None
+
+
+_LOW, _HIGH = "IQ2_XXS", "Q6_K"
+
+
+def _specs():
+    return [fr.REGISTRY[_LOW], fr.REGISTRY[_HIGH]]
+
+
+def _mk_candidates(n_params: int, dloss_low: float, dloss_high: float):
+    """Two-rung candidate list with exact byte math (bpp from the registry)."""
+    cands = []
+    for fmt, dloss in ((_LOW, dloss_low), (_HIGH, dloss_high)):
+        bpp = fr.REGISTRY[fmt].effective_bits
+        cands.append(Candidate(
+            fmt=fmt,
+            bits_per_param=bpp,
+            memory_bytes=int(round(bpp * n_params / 8.0)),
+            predicted_dloss=dloss,
+        ))
+    return cands
+
+
+def _mk_moe_fixture(n_experts: int = 8, expert_params: int = 4096,
+                    dense_params: int = 1 << 20):
+    """One packed expert block + one dense attention row + one shared row."""
+    stats: dict = {}
+    candidates: dict = {}
+    expert_names = []
+    for e in range(n_experts):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            name = f"model.layers.0.mlp.experts.{e}.{proj}"
+            expert_names.append(name)
+            stats[name] = {
+                "h_trace": 0.001,
+                "n_params": expert_params,
+                "in_features": 256,
+                "out_features": expert_params // 256,
+                "n_tokens_seen": 7,
+            }
+            # Tiny per-row gain: experts are cheap to leave at the floor.
+            candidates[name] = _mk_candidates(expert_params, 0.05, 0.04)
+    dense = "model.layers.0.self_attn.o_proj"
+    stats[dense] = {
+        "h_trace": 5.0, "n_params": dense_params,
+        "in_features": 1024, "out_features": dense_params // 1024,
+        "n_tokens_seen": 32768,
+    }
+    # Huge gain: the dense row deserves the headroom.
+    candidates[dense] = _mk_candidates(dense_params, 100.0, 0.0)
+    return stats, candidates, expert_names, dense
+
+
+# ---------------------------------------------------------------------------
+# Aggregation mechanics
+# ---------------------------------------------------------------------------
+
+def test_aggregation_groups_expert_rows_and_passes_dense_through():
+    stats, cands, expert_names, dense = _mk_moe_fixture()
+    costs = {n: {} for n in stats}
+    stats_ext, costs_ext, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+
+    supers = [n for n in cands_ext if _PACKED_GROUP_MARKER in n]
+    assert len(supers) == 1, f"expected 1 packed group, got {supers}"
+    assert dense in cands_ext
+    for m in expert_names:
+        assert m not in cands_ext, f"member row {m} leaked into DP items"
+
+    entry = stats_ext[supers[0]]
+    assert sorted(entry["_packed_group_members"]) == sorted(expert_names)
+    assert entry["n_params"] == sum(
+        stats[m]["n_params"] for m in expert_names)
+
+
+def test_group_unit_prices_are_exact_member_sums():
+    stats, cands, expert_names, _ = _mk_moe_fixture()
+    costs = {n: {} for n in stats}
+    stats_ext, _, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    super_name = next(n for n in cands_ext if _PACKED_GROUP_MARKER in n)
+
+    for cand in cands_ext[super_name]:
+        expected_dloss = sum(
+            next(c for c in cands[m] if c.fmt == cand.fmt).predicted_dloss
+            for m in expert_names
+        )
+        expected_bytes = sum(
+            next(c for c in cands[m] if c.fmt == cand.fmt).memory_bytes
+            for m in expert_names
+        )
+        assert abs(cand.predicted_dloss - expected_dloss) < 1e-9
+        assert cand.memory_bytes == expected_bytes
+        n_params = stats_ext[super_name]["n_params"]
+        assert abs(cand.bits_per_param - 8.0 * expected_bytes / n_params) < 1e-9
+    # compute_achieved must resolve the unit's exact bytes via its candidate.
+    mem_map = stats_ext[super_name]["_memory_bytes_by_format"]
+    assert set(mem_map) == {c.fmt for c in cands_ext[super_name]}
+
+
+def test_expand_broadcasts_group_format_to_all_members():
+    stats, cands, expert_names, dense = _mk_moe_fixture()
+    costs = {n: {} for n in stats}
+    stats_ext, _, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    super_name = next(n for n in cands_ext if _PACKED_GROUP_MARKER in n)
+
+    assignment = {super_name: _HIGH, dense: _LOW}
+    expanded = expand_packed_group_assignment(assignment, stats_ext)
+    assert not any(_PACKED_GROUP_MARKER in n for n in expanded)
+    for m in expert_names:
+        assert expanded[m] == _HIGH
+    assert expanded[dense] == _LOW
+    # Coherent by construction: serving promotion is a no-op.
+    rank = {_LOW: 0, _HIGH: 1}
+    assert promote_serving_units(
+        expanded, rank, profile=_PackedProfile()) == expanded
+
+
+def test_singleton_group_passes_through():
+    stats, cands, expert_names, dense = _mk_moe_fixture(n_experts=1)
+    solo = expert_names[0]
+    keep = {solo: cands[solo], dense: cands[dense]}
+    stats_keep = {solo: stats[solo], dense: stats[dense]}
+
+    class _SoloProfile(_PackedProfile):
+        def packed_expert_format_group(self, name):
+            return "solo.group" if name == solo else None
+
+    stats_ext, _, cands_ext = aggregate_packed_serving_groups(
+        stats_keep, {}, _specs(), keep, _SoloProfile())
+    assert not any(_PACKED_GROUP_MARKER in n for n in cands_ext)
+    assert solo in cands_ext and dense in cands_ext
+
+
+def test_no_common_format_falls_back_to_individual_rows():
+    stats, cands, expert_names, dense = _mk_moe_fixture(n_experts=2)
+    # Cripple one member: only the LOW rung is legal for it.
+    crippled = expert_names[0]
+    cands[crippled] = [c for c in cands[crippled] if c.fmt == _LOW]
+    # And another member only carries the HIGH rung: intersection is empty.
+    cands[expert_names[1]] = [
+        c for c in cands[expert_names[1]] if c.fmt == _HIGH]
+
+    costs = {n: {} for n in stats}
+    stats_ext, _, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    assert not any(_PACKED_GROUP_MARKER in n for n in cands_ext), (
+        "empty-intersection group must not become a DP unit")
+    for m in expert_names:
+        assert m in cands_ext, f"fallback must keep {m} as an individual row"
+
+
+def test_fused_aggregation_skips_packed_units():
+    stats, cands, _, _ = _mk_moe_fixture()
+    costs = {n: {} for n in stats}
+    stats_ext, costs_ext, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    stats2, costs2, cands2 = aggregate_fused_siblings(
+        stats_ext, costs_ext, _specs(), cands_ext, _PackedProfile())
+    assert set(cands2) == set(cands_ext)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: DP and serving constraint price identical moves
+# ---------------------------------------------------------------------------
+
+def _solver_env():
+    specs = {s.name: s for s in _specs()}
+    rank = {_LOW: 0, _HIGH: 1}
+    return specs, rank
+
+
+def test_per_row_pricing_disagrees_with_serving_charge_old_path():
+    """Documents the audit's price mismatch on the UN-aggREGATED path: the
+    raw DP upgrades a strict subset of a packed group (charging only the
+    subset's bins), then whole-group serving promotion charges the rest —
+    the promoted footprint exceeds what the DP believed it paid. That gap
+    is what over-tightened the feasibility loop and starved dense rows at
+    scale. With group units (next test) the gap is identically zero."""
+    from prismaquant.allocator_solver import solve_allocation
+
+    stats, cands, expert_names, dense = _mk_moe_fixture(
+        n_experts=8, expert_params=4096, dense_params=1 << 20)
+    specs, rank = _solver_env()
+    low, high = fr.REGISTRY[_LOW].effective_bits, fr.REGISTRY[_HIGH].effective_bits
+    total = sum(stats[n]["n_params"] for n in stats)
+    dense_cost_bits = (high - low) * stats[dense]["n_params"] / total
+    # Affords the dense upgrade plus a strict subset of expert rows.
+    target = low + dense_cost_bits + 0.05
+
+    result = solve_allocation(stats, cands, target, 0.001)
+    assert result is not None
+    assign, _chosen = result
+    upgraded = [m for m in expert_names if assign[m] == _HIGH]
+    assert upgraded and len(upgraded) < len(expert_names), (
+        "fixture must make the DP upgrade a strict subset of the group — "
+        "if the solver changed, re-derive this fixture")
+
+    ach_dp, _ = compute_achieved(stats, assign, specs, candidates=cands)
+    promoted = promote_serving_units(assign, rank, profile=_PackedProfile())
+    ach_serving, _ = compute_achieved(stats, promoted, specs, candidates=cands)
+    assert ach_serving > ach_dp + 1e-9, (
+        "serving charge must exceed the DP's per-row price (the audit's "
+        "mispricing)")
+
+
+def test_group_units_fund_the_dense_row_and_use_headroom():
+    """The fix: with the packed group as ONE DP unit, the same budget goes
+    to the dominant dloss/GB row (dense), experts stay at the floor, and
+    the emitted per-tensor assignment is serving-coherent without any
+    promotion adjustment."""
+    stats, cands, expert_names, dense = _mk_moe_fixture(
+        n_experts=8, expert_params=4096, dense_params=1 << 20)
+    costs = {n: {} for n in stats}
+    stats_ext, _, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    specs, rank = _solver_env()
+    low, high = fr.REGISTRY[_LOW].effective_bits, fr.REGISTRY[_HIGH].effective_bits
+    total = sum(stats[n]["n_params"] for n in stats)
+    dense_cost_bits = (high - low) * stats[dense]["n_params"] / total
+    target = low + dense_cost_bits + 0.05
+
+    assign, achieved = solve_with_promotion(
+        stats_ext, cands_ext, target, specs, rank,
+        bit_precision=0.001, profile=_PackedProfile())
+    assert assign is not None
+    assert achieved <= target + 0.01
+    assert assign[dense] == _HIGH, "dense row must win the headroom now"
+    super_name = next(n for n in assign if _PACKED_GROUP_MARKER in n)
+    assert assign[super_name] == _LOW
+
+    expanded = expand_packed_group_assignment(assign, stats_ext)
+    promoted = promote_serving_units(expanded, rank, profile=_PackedProfile())
+    assert promoted == expanded, "MoE promotion must be a no-op on group units"
+
+
+def test_whole_group_still_promotes_when_budget_affords_it():
+    stats, cands, expert_names, dense = _mk_moe_fixture(
+        n_experts=8, expert_params=4096, dense_params=1 << 20)
+    costs = {n: {} for n in stats}
+    stats_ext, _, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    specs, rank = _solver_env()
+    high = fr.REGISTRY[_HIGH].effective_bits
+
+    assign, achieved = solve_with_promotion(
+        stats_ext, cands_ext, high, specs, rank,
+        bit_precision=0.001, profile=_PackedProfile())
+    assert assign is not None
+    super_name = next(n for n in assign if _PACKED_GROUP_MARKER in n)
+    assert assign[super_name] == _HIGH, "group must flip as one unit"
+    expanded = expand_packed_group_assignment(assign, stats_ext)
+    for m in expert_names:
+        assert expanded[m] == _HIGH
+
+    ach, _dloss = compute_achieved(stats_ext, assign, specs,
+                                   candidates=cands_ext)
+    assert abs(ach - achieved) < 1e-9
+
+
+def test_packed_super_item_name_keeps_expert_prefix_for_name_scoped_rules():
+    """Packed super-item names keep the member prefix (....mlp.experts....),
+    so a name-conditioned serving-profile rule (when.regex) binds identically
+    at the per-member build_candidates gate and the post-aggregation profile
+    filter — a rule written against member names cannot silently stop
+    matching once the group becomes one DP unit."""
+    from prismaquant.serving_profiles import ServingProfile
+
+    stats, cands, expert_names, dense = _mk_moe_fixture()
+    costs = {n: {} for n in stats}
+    _stats2, _costs2, cands2 = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    super_names = [n for n in cands2 if _PACKED_GROUP_MARKER in n]
+    assert super_names
+
+    profile = ServingProfile.from_dict({
+        "schema": "prismaquant.serving_profile.v1",
+        "id": "unit_expert_regex",
+        "format_rules": [{
+            "id": "expert_menu",
+            "when": {"regex": r"\.mlp\.experts\."},
+            "allow_formats": [_LOW],
+            "reason": "profile_mismatch",
+        }],
+    })
+    for name in expert_names + super_names:
+        assert ".mlp.experts." in name
+        assert profile.check_format(name, _LOW).legal
+        assert not profile.check_format(name, _HIGH).legal, name
+    # Non-expert rows are untouched by the scoped rule.
+    assert profile.check_format(dense, _HIGH).legal
