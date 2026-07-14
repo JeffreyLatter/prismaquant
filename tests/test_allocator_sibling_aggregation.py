@@ -498,10 +498,12 @@ def test_pre_aggregation_respects_budget_without_overshoot():
 # Convergence-based stopping
 # ---------------------------------------------------------------------------
 
-def test_solve_with_promotion_stops_on_stall():
-    """Construct a tiny problem where promotion would overshoot and
-    tightening can't make further progress — loop should bail out early
-    via the stall detector, not waste all max_iters slots."""
+def test_solve_with_promotion_returns_feasible_iterate_on_plateau():
+    """Construct a tiny problem where promotion overshoots and tightening
+    plateaus (serving-group atomicity pins the promoted outcome).
+    Termination contract: the loop returns the best FEASIBLE iterate
+    (achieved <= target + tolerance) or (None, nan) when nothing ever fit —
+    it must never fabricate an over-target 'feasible' result."""
     # Use the un-aggregated path so promote_fused has siblings to coerce.
     names, stats, costs = _mk_stats_and_costs()
     specs = _format_specs()
@@ -523,7 +525,11 @@ def test_solve_with_promotion_stops_on_stall():
         max_iters=40,
         profile=profile,
     )
-    # Assignment must be non-None (solver found SOMETHING), and achieved
-    # is reported even when we bail on stall (the whole point of #2).
+    # The all-NVFP4 floor (~4.5) fits under target=4.6, so a feasible
+    # iterate exists and must be returned — and it must actually be
+    # feasible, not an over-target fabrication.
     assert assignment is not None
     assert isinstance(achieved, float)
+    assert achieved <= target + 0.01, (
+        f"stall exit returned an over-target iterate: target={target}, "
+        f"achieved={achieved}")
