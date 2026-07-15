@@ -135,3 +135,14 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   unmatched-qname gate, FP8_CB footprint family/entry-bytes), fix cycle running.
   Agent-1 formats core still implementing. Fable fixed the 3 pre-existing doc
   tests (README rewrite fallout + 5 unindexed flags) directly.
+- Wave-1 COMPLETE (all accepted): formats 8aeaec0+9e9838a (fix cycle: Lloyd
+  scatter_add — dense onehot was a 51GB trap at 27B scale; n_sub product
+  decomposition — FP8_CB now functional via 4×2-dim sub-codebooks, 9-12-bit
+  tables; agent self-caught the fp8-lattice ±448 data-scale bug), harnesses
+  6b5fca0+6cd057a, fisher 7d63e2e. 68 workstream tests + full suite green
+  (1032 passed).
+- **Wave 2 (running):** exp-1 on Qwen3-0.6B — arms: fixed(product k12/13/14),
+  full k12/14, learned k12/14, IQ2_S/IQ3_XXS refs, smoothing α{0.25,0.5},
+  NVFP4 + FP8_CB_K40 anchors; 4 paired calibration draws; exp-2 entropy
+  piggyback. Driver scripts/exp1_nvfp4_cb_0p6b.py; results to
+  docs/nvfp4-cb-plan/exp1_0p6b_results.md with gate verdicts.
