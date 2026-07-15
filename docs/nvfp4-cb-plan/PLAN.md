@@ -129,3 +129,9 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   AWQ-direction at 2bpw). Rotation (fused activation-side Hadamard) noted as
   roadmap follow-on now that CB layers ship on our kernel anyway — OUT of
   current scope.
+- Wave-1 review status: Agent-3 fisher_col_weights (7d63e2e) ACCEPTED no fixes
+  (clean additive aura_cost harvest, sum==h_trace pinned, compositions correct).
+  Agent-2 harnesses (6b5fca0) — 3 fixes requested (act-hook fail-fast,
+  unmatched-qname gate, FP8_CB footprint family/entry-bytes), fix cycle running.
+  Agent-1 formats core still implementing. Fable fixed the 3 pre-existing doc
+  tests (README rewrite fallout + 5 unindexed flags) directly.
