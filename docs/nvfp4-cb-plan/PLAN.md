@@ -98,3 +98,22 @@ accurate (`nvfp4_activation_qdq_served` fr.py:880, `_grid_fields`
 gguf_iq_formats.py:229, `--target-disk-gb` allocator.py:1049, g_trace scalar
 aura_cost.py:518/650, col_weights gguf_formats.py:389, FORMAT_SCHEME
 export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
+
+## Implementation log (orchestrator state — Fable updates this)
+
+- 2026-07-15: Robert authorized implementation. Topology: Fable orchestrates +
+  reviews diffs, Opus 4.8 agents implement; Opus fixes its own errors on
+  Fable's instruction; Fable takes over only after Opus fails. FP8-grid
+  codebook family (FP8_CB_K36/40/44/48, per-channel fp32 scales, product-VQ)
+  added to scope by Robert.
+- Branch: claude/nvfp4-cb. Disk cleaned 11GB→108GB free (deleted re-downloadable
+  Hy3 bench shards; published on HF).
+- **Wave 1 (running):** Agent-1 nvfp4_cb_formats.py + registry/layer_config/
+  cache-mechanism + tests (grid-generic FP4+FP8 VQ, product default, full≤k14,
+  fixed Gaussian-kmeans lattice → data/nvfp4_cb_lattices.pt); Agent-2
+  emu_forward_kl.py + nvfp4_cb_footprint.py + index_entropy.py + tests
+  (two-pass buffered-logits KL, per-format served-faithful act emulation);
+  Agent-3 fisher_col_weights.py + additive aura_cost per-column harvest
+  (default-off, bit-identical regression pinned) + tests.
+- Wave 2 (queued): review diffs → fix cycles → run exp-1 (fixed vs learned vs
+  IQ, 0.6B then 4B) → exp-2/4/3 per phase0-measurement.md gates.
