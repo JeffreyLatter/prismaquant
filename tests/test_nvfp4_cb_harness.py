@@ -82,6 +82,42 @@ def test_footprint_shared_codebook_charged_once():
     assert fp["sidecar_bytes"] == (1 << k) * 4
 
 
+@pytest.mark.parametrize("k", [36, 40, 44, 48])
+def test_footprint_fp8_cb_bpw_exact(k):
+    out_f, in_f = 128, 256
+    n = out_f * in_f
+    fmt = f"FP8_CB_K{k}"
+    fp = cb_footprint({"w": fmt}, {"w": (out_f, in_f)})
+    # Shipped bytes = k/8 bpw index stream + per-output-channel fp32 scales,
+    # counted exactly once whether the registered spec folds the plane into
+    # its body (group_size=0/scale_bits=32) or the fallback charges it under
+    # channel_scale_bytes.
+    expected_total = n * k // 64 + 4 * out_f
+    assert fp["body_bytes"] + fp["channel_scale_bytes"] == expected_total
+    assert fp["total_bytes"] == expected_total
+    assert fp["global_scale_bytes"] == 0
+    assert fp["sidecar_bytes"] == 0
+    # bpw = k/8 + 32*out/(out*in) exactly.
+    assert fp["total_bpw"] == pytest.approx(
+        k / 8.0 + 32.0 * out_f / n, abs=1e-12)
+    assert fp["per_tensor"]["w"]["cb_family"] == "fp8"
+    assert fp["per_tensor"]["w"]["k"] == k
+
+
+def test_footprint_fp8_cb_learned_sidecar_8_bytes_per_entry():
+    k = 36
+    out_f, in_f = 64, 256
+    fmt = f"FP8_CB_K{k}"
+    base = cb_footprint({"w": fmt}, {"w": (out_f, in_f)})
+    learned = cb_footprint(
+        {"w": fmt}, {"w": (out_f, in_f)}, codebook_sources={"w": "learned"})
+    # FP8_CB learned entry = 8 FP8 codes = 8 bytes/entry (vs 4 for NVFP4_CB).
+    expected_sidecar = (1 << k) * 8
+    assert base["sidecar_bytes"] == 0
+    assert learned["sidecar_bytes"] == expected_sidecar
+    assert learned["total_bytes"] == base["total_bytes"] + expected_sidecar
+
+
 def test_footprint_mixed_registry_format():
     # A stock (non-CB) format still accounts via the registry; no CB sidecar
     # or global scale for it.
@@ -200,3 +236,60 @@ def test_emu_kl_q4k_positive_and_deterministic(tmp_path):
     # Deterministic across runs (greedy forward, fixed seed).
     assert a["kl_all"] == pytest.approx(b["kl_all"], rel=0, abs=0.0)
     assert a["provenance"]["assignment_sha256"] == b["provenance"]["assignment_sha256"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not Path(_MODEL).exists(), reason="Qwen3-0.6B not present")
+def test_emu_kl_missing_target_gate(tmp_path):
+    from prismaquant.emu_forward_kl import measure_emulated_kl
+
+    ds = _tiny_dataset(tmp_path)
+    fmap = {"not.a.layer.q_proj": {"format": "Q4_K", "col_weights": None}}
+    with pytest.raises(ValueError, match="matched no"):
+        measure_emulated_kl(
+            _MODEL, fmap, ds, device="cuda", seqlen=64, max_tokens=64)
+    res = measure_emulated_kl(
+        _MODEL, fmap, ds, device="cuda", seqlen=64, max_tokens=64,
+        allow_missing_targets=True)
+    assert res["n_targets_missing"] == 1
+    assert res["missing_targets"] == ["not.a.layer.q_proj"]
+    # Nothing swapped → identity forward → KL exactly zero.
+    assert res["kl_all"] == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not Path(_MODEL).exists(), reason="Qwen3-0.6B not present")
+def test_emu_kl_act_fallback_gate(tmp_path):
+    from prismaquant import format_registry as fr
+    from prismaquant.emu_forward_kl import measure_emulated_kl
+
+    def _boom(x):
+        raise ValueError("activation emulation unavailable for this shape")
+
+    name = "_TEST_ACT_FAIL"
+    fr.register_format(fr.FormatSpec(
+        name=name,
+        weight_bits=16, group_size=0, scale_bits=0,
+        scale_dtype_name="none", weight_element_dtype="bf16",
+        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=16,
+        family="nv",
+        quantize_dequantize=lambda w: w,
+        activation_quantize_dequantize=_boom,
+    ))
+    try:
+        ds = _tiny_dataset(tmp_path)
+        fmap = {"model.layers.0.self_attn.q_proj": {"format": name,
+                                                    "col_weights": None}}
+        with pytest.raises(RuntimeError, match="activation emulation failed"):
+            measure_emulated_kl(
+                _MODEL, fmap, ds, device="cuda", seqlen=64, max_tokens=64)
+        res = measure_emulated_kl(
+            _MODEL, fmap, ds, device="cuda", seqlen=64, max_tokens=64,
+            allow_act_fallback=True)
+        counts = res["act_fallback_counts"]
+        assert len(counts) == 1
+        (key, n), = counts.items()
+        assert "model.layers.0.self_attn.q_proj" in key
+        assert n > 0
+    finally:
+        fr.REGISTRY.pop(name, None)

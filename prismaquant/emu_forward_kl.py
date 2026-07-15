@@ -60,11 +60,12 @@ def _sha256(data: bytes) -> str:
 # Weight / activation emulation
 # ---------------------------------------------------------------------------
 
-# Families whose served path quantizes activations (W4A4-style). GGUF/IQ serve
-# weight-only (dequant to fp16), so they get NO activation emulation — this
-# asymmetry is deliberate: each format is measured with its served activation
-# behaviour.
-_ACT_EMULATION_FAMILIES = {"nv", "mx", "nvfp4_cb"}
+# Families whose served path quantizes activations (W4A4 / W8A8 style).
+# GGUF/IQ serve weight-only (dequant to fp16), so they get NO activation
+# emulation — this asymmetry is deliberate: each format is measured with its
+# served activation behaviour. fp8_cb decodes to FP8 and serves FP8-dynamic
+# activations (registered spec: act_bits=8, fp8_e4m3).
+_ACT_EMULATION_FAMILIES = {"nv", "mx", "nvfp4_cb", "fp8_cb"}
 
 
 def _qdq_accepts_col_weights(spec: fr.FormatSpec) -> bool:
@@ -96,21 +97,27 @@ class _WeightSwapper:
     """Context manager: swap target Linear weights + hook activations, restore."""
 
     def __init__(self, model, targets, *, act_emulation: bool):
-        # targets: list of (module, spec, col_weights)
+        # targets: list of (qname, module, spec, col_weights)
         self._targets = targets
         self._act_emulation = act_emulation
         self._orig: list[tuple[object, torch.Tensor]] = []
         self._handles: list = []
+        # (qname, format_name) -> number of forwards where activation
+        # emulation failed and the raw input was used instead. NEVER silent:
+        # measure_emulated_kl raises on any nonzero count unless the caller
+        # explicitly allowed the weight-only fallback.
+        self.fallback_counts: dict[tuple[str, str], int] = {}
 
     def __enter__(self):
-        for mod, spec, cw in self._targets:
+        for qname, mod, spec, cw in self._targets:
             w = mod.weight.data
             w_hat = _render_weight(spec, w, cw).to(dtype=w.dtype, device=w.device)
             self._orig.append((mod, w))  # keep original tensor (still resident)
             mod.weight.data = w_hat
             if self._act_emulation and _wants_act_emulation(spec):
                 self._handles.append(
-                    mod.register_forward_pre_hook(_make_act_hook(spec)))
+                    mod.register_forward_pre_hook(
+                        _make_act_hook(spec, qname, self.fallback_counts)))
         return self
 
     def __exit__(self, *exc):
@@ -123,8 +130,13 @@ class _WeightSwapper:
         return False
 
 
-def _make_act_hook(spec: fr.FormatSpec):
+def _make_act_hook(
+    spec: fr.FormatSpec,
+    qname: str,
+    fallback_counts: dict[tuple[str, str], int],
+):
     aqdq = spec.activation_quantize_dequantize
+    key = (qname, spec.name)
 
     def _hook(module, args):
         if not args:
@@ -133,8 +145,11 @@ def _make_act_hook(spec: fr.FormatSpec):
         try:
             x_hat = aqdq(x)
         except Exception:
-            # Activation qdq may require a shape multiple (e.g. last dim % 16);
-            # fall back to the un-emulated input rather than crash the forward.
+            # Activation qdq may require a shape multiple (e.g. last dim
+            # % 16). A silent weight-only fallback would be a measurement
+            # confound (plausible-but-wrong KL), so record it here and let
+            # measure_emulated_kl fail fast unless explicitly allowed.
+            fallback_counts[key] = fallback_counts.get(key, 0) + 1
             return args
         return (x_hat,) + tuple(args[1:])
 
@@ -168,7 +183,7 @@ def _collect_targets(model, format_map: Mapping[str, dict]):
         skip_weight = spec.name in ("BF16", "FP8_SOURCE")
         if skip_weight and not _wants_act_emulation(spec):
             continue
-        targets.append((mod, spec, cw))
+        targets.append((qname, mod, spec, cw))
     return targets, matched
 
 
@@ -253,6 +268,8 @@ def measure_emulated_kl(
     seqlen: int = 512,
     max_tokens: int = 8192,
     act_emulation: bool = True,
+    allow_act_fallback: bool = False,
+    allow_missing_targets: bool = False,
     cache_dir: str | None = None,
 ) -> dict:
     """Whole-model emulated forward KL-vs-BF16.
@@ -262,6 +279,14 @@ def measure_emulated_kl(
       format_map: ``{qname: {"format": str, "col_weights": Tensor|None}}``.
         A plain ``{qname: format_str}`` is also accepted.
       dataset_path: raw-text file (held-out WikiText).
+      allow_act_fallback: a failed activation emulation silently degrades an
+        arm to weight-only — a measurement confound. By default any fallback
+        RAISES; pass True to tolerate it, in which case
+        ``act_fallback_counts`` is reported in the result.
+      allow_missing_targets: format_map entries that match no live Linear
+        (e.g. a qname typo) yield a false-clean KL. By default they RAISE;
+        pass True to tolerate, in which case ``n_targets_missing`` and
+        ``missing_targets`` are reported in the result.
     Returns ``{kl_all, kl_confident, top1_agreement, n_positions, ...,
     provenance{git_commit, assignment_sha256, dataset_sha256}}``.
     """
@@ -283,6 +308,14 @@ def measure_emulated_kl(
         raise ValueError("emu_forward_kl: dataset produced no token chunks")
 
     targets, matched = _collect_targets(model, format_map)
+    missing = sorted(set(format_map) - matched)
+    if missing and not allow_missing_targets:
+        preview = ", ".join(missing[:20])
+        raise ValueError(
+            f"emu_forward_kl: {len(missing)} format_map entries matched no "
+            f"live Linear (qname typo → false-clean KL): {preview}"
+            + (" …" if len(missing) > 20 else "")
+            + ". Pass allow_missing_targets=True to tolerate.")
 
     with torch.no_grad():
         # Pass 1 — bf16 teacher log-probs, buffered fp32 on CPU.
@@ -293,13 +326,33 @@ def measure_emulated_kl(
 
         # Pass 2 — swap weights + emulate activations, KL against the buffer.
         acc = _KLAccumulator()
-        with _WeightSwapper(model, targets, act_emulation=act_emulation):
+        swapper = _WeightSwapper(model, targets, act_emulation=act_emulation)
+        with swapper:
             for ids, t_lp in zip(chunks, teacher_lp):
                 s_lp = torch.log_softmax(
                     _logits(model, ids.to(dev)).float(), dim=-1)[0]
                 acc.add(t_lp.to(dev), s_lp)
 
+    fallbacks = {
+        f"{q} [{fmt}]": n
+        for (q, fmt), n in sorted(swapper.fallback_counts.items())
+    }
+    if fallbacks and not allow_act_fallback:
+        raise RuntimeError(
+            "emu_forward_kl: activation emulation failed and fell back to "
+            "the raw input on "
+            f"{len(fallbacks)} layer(s) — the arm would be measured "
+            "weight-only (measurement confound): "
+            + ", ".join(list(fallbacks)[:20])
+            + (" …" if len(fallbacks) > 20 else "")
+            + ". Pass allow_act_fallback=True to tolerate.")
+
     result = acc.result()
+    if fallbacks:
+        result["act_fallback_counts"] = fallbacks
+    if missing:
+        result["n_targets_missing"] = len(missing)
+        result["missing_targets"] = missing
     assignment = {
         q: (e["format"] if isinstance(e, Mapping) else e)
         for q, e in format_map.items()
@@ -348,6 +401,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seqlen", type=int, default=512)
     ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument("--no-act-emulation", action="store_true")
+    ap.add_argument("--allow-act-fallback", action="store_true",
+                    help="tolerate (and report) failed activation emulation "
+                         "instead of raising")
+    ap.add_argument("--allow-missing-targets", action="store_true",
+                    help="tolerate (and report) format_map entries that "
+                         "match no live Linear instead of raising")
     ap.add_argument("--cache-dir", default=None)
     ap.add_argument("--output", default=None)
     args = ap.parse_args(argv)
@@ -376,7 +435,10 @@ def main(argv: list[str] | None = None) -> int:
     result = measure_emulated_kl(
         args.model, format_map, args.dataset,
         device=args.device, seqlen=args.seqlen, max_tokens=args.max_tokens,
-        act_emulation=not args.no_act_emulation, cache_dir=args.cache_dir,
+        act_emulation=not args.no_act_emulation,
+        allow_act_fallback=args.allow_act_fallback,
+        allow_missing_targets=args.allow_missing_targets,
+        cache_dir=args.cache_dir,
     )
     text = json.dumps(result, indent=2)
     if args.output:

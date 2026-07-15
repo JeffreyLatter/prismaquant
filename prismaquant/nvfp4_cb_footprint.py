@@ -1,20 +1,26 @@
-"""NVFP4-CB sidecar-aware byte accountant (Phase-0 measurement harness).
+"""CB-family sidecar-aware byte accountant (Phase-0 measurement harness).
+
+Covers both concurrently-authored CB families:
+
+  * ``NVFP4_CB_K{k}`` — FP4-grid codewords, group-16 E4M3 scale plane
+    (``k/8 + 0.5`` bpw, docs/nvfp4-cb-plan/format-pipeline.md §1.2);
+  * ``FP8_CB_K{k}`` — FP8/E4M3-grid codewords, NO group scale plane
+    (``k/8`` bpw body) + per-output-channel fp32 scales.
 
 The registry ``FormatSpec.memory_bytes_for_shape`` is byte-exact for the
-**fixed-lattice** NVFP4-CB variant (no sidecar, exactly like GGUF). For the
+**fixed-lattice** variants (no sidecar, exactly like GGUF). For the
 **learned** variant it *understates* true bytes by the per-tensor codebook
-sidecar. This accountant adds the two terms a stock FormatSpec does not model:
+sidecar. This accountant adds the terms a stock FormatSpec does not model:
 
-  * learned-codebook sidecar: ``2^k * 8 * 4 bits = 2^k * 4 bytes`` per tensor
-    (or once per shared group), and
-  * optional per-tensor FP32 global scale: ``4 bytes`` / tensor.
+  * learned-codebook sidecar: ``2^k`` entries × 4 bytes (NVFP4_CB, 8×4-bit
+    codes) or × 8 bytes (FP8_CB, 8×8-bit codes) per tensor, charged once per
+    shared group;
+  * per-tensor FP32 global scale (NVFP4_CB): ``4 bytes`` / tensor;
+  * per-output-channel fp32 scales (FP8_CB): ``4 × out_rows`` bytes / tensor.
 
-so that no arm can hide sidecar cost. See docs/nvfp4-cb-plan/format-pipeline.md
-§1.2 (registry-exact bpw table) and §1.4 (codebook sidecar).
-
-``body_bpw`` (over quantizable params) is registry-exact and reproduces the
-§1.2 ``k/8 + 0.5`` table for the fixed-lattice case; ``total_bytes`` adds the
-sidecar + global-scale terms on top.
+so that no arm can hide sidecar cost. ``body_bpw`` (over quantizable params)
+is registry-exact and reproduces the §1.2 ``k/8 + 0.5`` table for the
+fixed-lattice NVFP4_CB case; ``total_bytes`` adds sidecar + scale terms.
 """
 
 from __future__ import annotations
@@ -26,36 +32,77 @@ from typing import Mapping
 from . import format_registry as fr
 
 # Per-tensor FP32 global scale (NVFP4-style), §1.3 "+ negligible" term.
+# Applies to the NVFP4_CB family only; FP8_CB carries per-output-channel
+# fp32 scales instead (see _CHANNEL_SCALE_BYTES below).
 _GLOBAL_SCALE_BYTES = 4
-# Learned codebook entry = 8 FP4 (E2M1) 4-bit codes = 4 bytes/entry, §1.4.
-_CODEBOOK_ENTRY_BYTES = 4
+# Learned codebook entry bytes are family-dependent:
+#   NVFP4_CB: 8 FP4 (E2M1) 4-bit codes = 4 bytes/entry (§1.4);
+#   FP8_CB:   8 FP8 (E4M3) 8-bit codes = 8 bytes/entry.
+_CODEBOOK_ENTRY_BYTES = {"nvfp4": 4, "fp8": 8}
+# FP8_CB per-output-channel fp32 scale = 4 bytes per output row.
+_CHANNEL_SCALE_BYTES = 4
 
-_CB_NAME_RE = re.compile(r"^NVFP4_CB_K(\d+)$")
+_CB_NAME_RE = re.compile(r"^(NVFP4|FP8)_CB_K(\d+)$")
+
+
+def _cb_info(format_name: str) -> tuple[str | None, int | None]:
+    """Return ``(cb_family, k)`` for a CB format name, else ``(None, None)``.
+
+    ``cb_family`` is ``"nvfp4"`` (NVFP4_CB_K*) or ``"fp8"`` (FP8_CB_K*).
+    """
+    m = _CB_NAME_RE.match(str(format_name).strip().upper())
+    if not m:
+        return None, None
+    return m.group(1).lower(), int(m.group(2))
 
 
 def _cb_k(format_name: str) -> int | None:
-    """Return the CB index width ``k`` for an NVFP4-CB format name, else None."""
-    m = _CB_NAME_RE.match(str(format_name).strip().upper())
-    return int(m.group(1)) if m else None
+    """Return the CB index width ``k`` for a CB format name, else None."""
+    return _cb_info(format_name)[1]
 
 
 def _resolve_spec(format_name: str) -> fr.FormatSpec:
     """Resolve a format to a FormatSpec.
 
-    Uses the registry when available. For NVFP4-CB rungs that the (separately
+    Uses the registry when available. For CB rungs that the (separately
     authored) format module has not registered yet, synthesise the byte-exact
-    spec from the §2 factory parameters (``weight_bits=0``,
-    ``group_size=256``, ``scale_bits=32k+128``) so this accountant is
-    format-agnostic and independent of registration timing. A real registered
-    spec carries identical parameters, so byte accounting is unchanged.
+    spec so this accountant is format-agnostic and independent of
+    registration timing:
+
+      * NVFP4_CB_K{k}: §2 factory parameters (``weight_bits=0``,
+        ``group_size=256``, ``scale_bits=32k+128`` — index stream + the
+        group-16 E4M3 scale plane).
+      * FP8_CB_K{k}: ``weight_bits=0``, ``group_size=256``,
+        ``scale_bits=32k`` — index stream only. FP8_CB has NO group-16 scale
+        plane; its per-output-channel fp32 scales are accounted separately
+        (``channel_scale_bytes``), because ``scale_count_for_shape`` groups
+        along the input dim and cannot express a per-row plane on top of the
+        superblock stream.
+
+    The registered NVFP4_CB spec carries the same body parameters as the
+    fallback. The registered FP8_CB spec instead folds the channel-scale
+    plane into its body bytes (``weight_bits=k/8, group_size=0,
+    scale_bits=32`` → ``k/8 + 32/in`` exactly); ``cb_footprint`` detects that
+    layout and skips the separate ``channel_scale_bytes`` charge so the plane
+    is counted exactly once on either path.
     """
     name = str(format_name).strip()
     try:
         return fr.get_format(name)
     except KeyError:
-        k = _cb_k(name)
+        cb_family, k = _cb_info(name)
         if k is None:
             raise
+        if cb_family == "fp8":
+            return fr.FormatSpec(
+                name=f"FP8_CB_K{k}",
+                weight_bits=0,
+                group_size=256,
+                scale_bits=32 * k,
+                scale_dtype_name="fp8_cb_vq",
+                weight_element_dtype=f"fp8_cb_k{k}",
+                family="fp8_cb",
+            )
         return fr.FormatSpec(
             name=f"NVFP4_CB_K{k}",
             weight_bits=0,
@@ -123,6 +170,7 @@ def cb_footprint(
 
     body_bytes = 0
     global_scale_bytes = 0
+    channel_scale_bytes = 0
     n_params = 0
     per_tensor: dict[str, dict] = {}
     # Charge each shared learned codebook exactly once.
@@ -139,11 +187,22 @@ def cb_footprint(
         body_bytes += tensor_body
         n_params += params
 
-        k = _cb_k(format_name)
+        cb_family, k = _cb_info(format_name)
         kind = _codebook_source_kind(codebook_sources.get(qname))
-        # Per-tensor FP32 global scale applies to CB-family tensors.
-        g_bytes = _GLOBAL_SCALE_BYTES if k is not None else 0
+        # Per-tensor FP32 global scale: NVFP4_CB family only.
+        g_bytes = _GLOBAL_SCALE_BYTES if cb_family == "nvfp4" else 0
         global_scale_bytes += g_bytes
+        # FP8_CB: per-output-channel fp32 scales (4 bytes × output rows).
+        # The REGISTERED FP8_CB spec (group_size=0, scale_bits=32) already
+        # folds this plane into memory_bytes_for_shape — charging it again
+        # would double-count. Only the pre-registration fallback spec
+        # (group_size=256, index stream only) needs the separate charge.
+        c_bytes = 0
+        if cb_family == "fp8" and not (
+                spec.group_size == 0 and spec.scale_bits > 0):
+            out_rows = int(math.prod(shape[:-1])) if len(shape) > 1 else 1
+            c_bytes = _CHANNEL_SCALE_BYTES * out_rows
+        channel_scale_bytes += c_bytes
 
         tensor_sidecar = 0
         if kind == "learned":
@@ -151,7 +210,7 @@ def cb_footprint(
                 raise ValueError(
                     f"cb_footprint: learned codebook_source on non-CB format "
                     f"'{format_name}' for '{qname}'")
-            cb_bytes = (1 << k) * _CODEBOOK_ENTRY_BYTES
+            cb_bytes = (1 << k) * _CODEBOOK_ENTRY_BYTES[cb_family]
             group = _codebook_group(codebook_sources.get(qname))
             if group is None:
                 tensor_sidecar = cb_bytes
@@ -165,25 +224,30 @@ def cb_footprint(
         per_tensor[qname] = {
             "format": str(format_name),
             "k": k,
+            "cb_family": cb_family,
             "params": params,
             "body_bytes": tensor_body,
             "global_scale_bytes": g_bytes,
+            "channel_scale_bytes": c_bytes,
             "sidecar_bytes": tensor_sidecar,
             "codebook_source": kind,
             "body_bpw": 8.0 * tensor_body / max(params, 1),
         }
 
-    total_bytes = body_bytes + global_scale_bytes + sidecar_bytes
+    total_bytes = (body_bytes + global_scale_bytes + channel_scale_bytes
+                   + sidecar_bytes)
     return {
         "total_bytes": int(total_bytes),
         "body_bytes": int(body_bytes),
         "sidecar_bytes": int(sidecar_bytes),
         "global_scale_bytes": int(global_scale_bytes),
+        "channel_scale_bytes": int(channel_scale_bytes),
         "n_params": int(n_params),
         # Registry-exact bpw over quantizable params (excludes sidecar +
-        # global scale) — reproduces the §1.2 k/8+0.5 table for fixed lattice.
+        # global/channel scales) — reproduces the §1.2 k/8+0.5 table for the
+        # fixed-lattice NVFP4_CB case and k/8 for FP8_CB.
         "body_bpw": 8.0 * body_bytes / max(n_params, 1),
-        # True shipped bpw including sidecar + global scale.
+        # True shipped bpw including sidecar + global/channel scales.
         "total_bpw": 8.0 * total_bytes / max(n_params, 1),
         "per_tensor": per_tensor,
     }
