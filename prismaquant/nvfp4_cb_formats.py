@@ -53,9 +53,18 @@ _LATTICE_ITERS = 12
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
-def _grid_split(k: int) -> tuple[int, int]:
-    """Codeword-index bit split for product mode: (ceil, floor)."""
-    return (k + 1) // 2, k // 2
+def _product_n_sub(grid: str) -> int:
+    """Sub-vectors per 8-dim vector in product mode. fp4 splits into two
+    4-dim halves; fp8 into four 2-dim sub-vectors so every FP8_CB rung's
+    sub-table stays flat-searchable (k=36..48 -> 9..12-bit sub-tables)."""
+    return 2 if grid == "fp4" else 4
+
+
+def _bit_split(k: int, n_sub: int) -> tuple[int, ...]:
+    """Split k index bits across n_sub sub-tables as evenly as possible
+    (ceil-first, so n_sub=2 keeps the historical (ceil, floor) split)."""
+    base, extra = divmod(k, n_sub)
+    return tuple(base + (1 if i < extra else 0) for i in range(n_sub))
 
 
 @lru_cache(maxsize=None)
@@ -130,17 +139,22 @@ def _lloyd(samples: torch.Tensor, init: torch.Tensor, grid: str,
     gen = torch.Generator(device="cpu").manual_seed(int(seed))
     for _ in range(int(iters)):
         assign = _vq_assign(samples, cb, weights)
-        onehot = torch.zeros(samples.shape[0], K, device=samples.device)
-        onehot.scatter_(1, assign.unsqueeze(1), 1.0)
+        # Index-based accumulation: a dense (m, K) one-hot is ~51 GB fp32 at
+        # 27B-Linear scale (m~3.1M, K=4096) and swap-kills a UMA box.
+        counts = torch.bincount(assign, minlength=K).to(samples.dtype)
         if weights is None:
-            counts = onehot.sum(dim=0)                       # (K,)
-            summ = onehot.t() @ samples                      # (K, d)
+            summ = torch.zeros(K, d, dtype=samples.dtype,
+                               device=samples.device)
+            summ.index_add_(0, assign, samples)
             new = summ / counts.clamp_min(1.0).unsqueeze(-1)
         else:
-            wsum = onehot.t() @ weights                      # (K, d)
-            summ = onehot.t() @ (weights * samples)          # (K, d)
+            wsum = torch.zeros(K, d, dtype=samples.dtype,
+                               device=samples.device)
+            wsum.index_add_(0, assign, weights)
+            summ = torch.zeros(K, d, dtype=samples.dtype,
+                               device=samples.device)
+            summ.index_add_(0, assign, weights * samples)
             new = summ / wsum.clamp_min(1e-12)
-            counts = onehot.sum(dim=0)
         empty = counts == 0
         if bool(empty.any()):
             n_empty = int(empty.sum())
@@ -176,11 +190,18 @@ def _fixed_lattice_cpu(k: int, grid: str, d: int) -> torch.Tensor:
 
 def _build_lattice(k: int, grid: str, d: int) -> torch.Tensor:
     """Deterministic universal lattice: grid-snapped Lloyd on seeded
-    standard-Gaussian d-dim samples. Regenerated identically on cache miss."""
+    standard-Gaussian d-dim samples. Regenerated identically on cache miss.
+
+    The fp8 family scales rows by amax/448, so scaled vectors live at
+    ~sigma * 448/amax_sigma; train that grid's lattice at the matching
+    scale (amax ~ 4 sigma for typical Linear widths) or the codewords
+    would cluster in ±4 against ±448 data."""
     K = 1 << k
     gen = torch.Generator(device="cpu").manual_seed(_LATTICE_SEED + k * 131 + d)
     m = max(_LATTICE_SAMPLES, K * 16)
     samples = torch.randn(m, d, generator=gen)
+    if grid == "fp8":
+        samples = samples * (FP8_ELEMENT_MAX / 4.0)
     perm = torch.randperm(m, generator=gen)[:K]
     init = samples[perm]
     return _lloyd(samples, init, grid, None, _LATTICE_ITERS, _LATTICE_SEED)
@@ -195,8 +216,10 @@ def learn_codebook(vectors: torch.Tensor, k: int, *, grid: str,
                    col_weights: torch.Tensor | None = None,
                    init: torch.Tensor | None = None, iters: int = 4,
                    seed: int = 0) -> torch.Tensor:
-    """Weighted Lloyd codebook on the element grid, deterministic given
-    ``seed`` + ``init``. Returns a (2^k, d) grid-valued tensor."""
+    """Weighted Lloyd codebook on the element grid. Returns a (2^k, d)
+    grid-valued tensor. Deterministic given ``seed`` + ``init`` on CPU;
+    on CUDA the index_add_ float atomics can flip grid-snap ties across
+    runs, so ship the resulting codebook rather than regenerating it."""
     vectors = vectors.to(torch.float32)
     d = vectors.shape[-1]
     vectors = vectors.reshape(-1, d)
@@ -224,13 +247,18 @@ def _resolve_codebook(k: int, grid: str, mode: str,
             cb = codebook
         return cb.to(device, torch.float32)
     if mode == "product":
-        k_lo, k_hi = _grid_split(k)
         if codebook is None:
-            lo = fixed_lattice(k_lo, grid, VEC_DIM // 2)
-            hi = fixed_lattice(k_hi, grid, VEC_DIM // 2)
+            n_sub = _product_n_sub(grid)
+            sub_dim = VEC_DIM // n_sub
+            tables = tuple(fixed_lattice(bits, grid, sub_dim)
+                           for bits in _bit_split(k, n_sub))
         else:
-            lo, hi = codebook
-        return (lo.to(device, torch.float32), hi.to(device, torch.float32))
+            tables = tuple(codebook)
+            if VEC_DIM % len(tables) != 0:
+                raise ValueError(
+                    f"product codebook count {len(tables)} must divide "
+                    f"{VEC_DIM}")
+        return tuple(t.to(device, torch.float32) for t in tables)
     raise ValueError(f"unknown mode {mode!r} (expected 'full' or 'product')")
 
 
@@ -299,13 +327,15 @@ def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
         idx = _vq_assign(vectors, cb, wq)
         indices = idx.reshape(rows, nvec_per_row)
     else:
-        lo, hi = cb
-        wq_lo = wq[:, :VEC_DIM // 2] if wq is not None else None
-        wq_hi = wq[:, VEC_DIM // 2:] if wq is not None else None
-        idx_lo = _vq_assign(vectors[:, :VEC_DIM // 2], lo, wq_lo)
-        idx_hi = _vq_assign(vectors[:, VEC_DIM // 2:], hi, wq_hi)
-        indices = torch.stack([idx_lo, idx_hi], dim=-1).reshape(
-            rows, nvec_per_row, 2)
+        n_sub = len(cb)
+        sub_dim = VEC_DIM // n_sub
+        idxs = []
+        for i, table in enumerate(cb):
+            xs = vectors[:, i * sub_dim:(i + 1) * sub_dim]
+            ws = wq[:, i * sub_dim:(i + 1) * sub_dim] if wq is not None else None
+            idxs.append(_vq_assign(xs, table, ws))
+        indices = torch.stack(idxs, dim=-1).reshape(
+            rows, nvec_per_row, n_sub)
     return {"indices": indices, "scales": scales}
 
 
@@ -368,10 +398,8 @@ def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",
         vecs = cb[indices]                                   # (rows, nvec, 8)
         recon = vecs.reshape(rows, in_f)
     else:
-        lo, hi = cb
-        vlo = lo[indices[..., 0]]
-        vhi = hi[indices[..., 1]]
-        recon = torch.cat([vlo, vhi], dim=-1).reshape(rows, in_f)
+        parts = [table[indices[..., i]] for i, table in enumerate(cb)]
+        recon = torch.cat(parts, dim=-1).reshape(rows, in_f)
     pes = _per_element_scale(scales.to(recon.dtype), grid, in_f)
     recon = recon * pes
     if shape is not None:

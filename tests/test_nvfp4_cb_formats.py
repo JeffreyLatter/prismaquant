@@ -102,6 +102,59 @@ def test_learned_codebook_beats_fixed():
     assert float(dist.max()) < 1e-5
 
 
+# FP8_CB: every registered rung is functional through the qdq closure —
+# product mode splits into four 2-dim sub-vectors (9..12-bit sub-tables).
+@pytest.mark.parametrize("k", _FP8_KS)
+def test_fp8_cb_qdq_roundtrip_valid(k):
+    torch.manual_seed(6)
+    w = torch.randn(32, 512) * 0.3
+    qdq = cb.make_nvfp4_cb_qdq(k, "fp8", "product")
+    a, b = qdq(w), qdq(w)
+    assert torch.equal(a, b)
+    fields = cb.nvfp4_cb_fields(w, k, grid="fp8", mode="product")
+    assert fields["indices"].shape[-1] == 4
+    for table in fields["codebook"]:
+        assert torch.equal(cb._snap_to_grid(table, "fp8"), table)
+        assert table.shape == (1 << (k // 4), 2)
+    recon = cb.nvfp4_cb_reconstruct(fields, k, grid="fp8", mode="product")
+    # decode validity: recon / per-row scale recovers an E4M3 grid value
+    # (up to the 1-ulp fp32 (c*s)/s roundtrip).
+    pes = cb._per_element_scale(fields["scales"], "fp8", 512)
+    q = recon / pes
+    snap = cb._snap_to_grid(q, "fp8")
+    rel = (q - snap).abs() / snap.abs().clamp_min(1e-12)
+    assert float(rel.max()) < 1e-6
+
+
+def test_product_n_sub4_determinism_pin():
+    torch.manual_seed(7)
+    w = torch.randn(24, 256) * 0.5
+    f1 = cb.nvfp4_cb_fields(w, 40, grid="fp8", mode="product")
+    f2 = cb.nvfp4_cb_fields(w, 40, grid="fp8", mode="product")
+    assert torch.equal(f1["indices"], f2["indices"])
+    assert torch.equal(f1["scales"], f2["scales"])
+
+
+def test_bit_split_even_and_ceil_first():
+    assert cb._bit_split(13, 2) == (7, 6)
+    assert cb._bit_split(12, 2) == (6, 6)
+    assert cb._bit_split(36, 4) == (9, 9, 9, 9)
+    assert cb._bit_split(48, 4) == (12, 12, 12, 12)
+
+
+# Lloyd at scale: the old dense one-hot path materialized (m, K) fp32 —
+# 2M x 4096 = 32 GB — and would OOM here; index_add accumulation must not.
+def test_lloyd_scale_no_dense_onehot():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    gen = torch.Generator(device="cpu").manual_seed(11)
+    vectors = torch.randn(2_000_000, 8, generator=gen).to(device)
+    learned = cb.learn_codebook(vectors, 12, grid="fp4", iters=1)
+    assert learned.shape == (4096, 8)
+    grid = cb._e2m1_grid(device)
+    dist = (learned.unsqueeze(-1) - grid).abs().min(dim=-1).values
+    assert float(dist.max()) < 1e-5
+
+
 # (f) product and full both reconstruct valid values at k=12.
 def test_product_and_full_valid():
     torch.manual_seed(4)
