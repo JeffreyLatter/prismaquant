@@ -357,6 +357,7 @@ def compute_aura_cost(
     hook_harvest: bool = False,
     allow_packed_expert_omission: bool = False,
     probe_microbatch: int = 0,
+    collect_col_energy: bool = False,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -450,6 +451,13 @@ def compute_aura_cost(
     x2_probe: dict[tuple[str, str], list[float]] = {}
     dw_src: dict[tuple[str, str], str] = {}  # "rendered" | "rtn" per row
     g_trace: dict[str, float] = {}  # KL-Fisher weight-grad energy
+    # Opt-in per-column KL-Fisher energy: the SAME grad energy g_trace sums to a
+    # scalar, reduced over output rows to a length-in_features vector instead
+    # (col_energy[n][j] = Σ_probes Σ_out (∂probe/∂W)[:,j]²). Default OFF keeps
+    # the harvest arithmetic and payload bit-identical to today; when ON, its
+    # per-row sum equals g_trace by construction (same summand, coarser
+    # reduction). Feeds fisher_col_weights (exp 4: Fisher vs imatrix weighting).
+    col_energy: dict[str, torch.Tensor] = {}
     inv = 1.0 / float(n_probes)
 
     for ci, chunk in enumerate(chunks):
@@ -516,6 +524,14 @@ def compute_aura_cost(
             with torch.no_grad():
                 gf = g.float()
                 g_trace[name] += float((gf * gf).sum().item())
+                if collect_col_energy:
+                    # Reduce over output rows (dim 0) -> length-in_features
+                    # vector; kept resident (GPU-first) and summed across
+                    # probes/chunks. Targets are 2D nn.Linear ([out, in]);
+                    # packed 3D experts are guarded out of this harvest.
+                    ce = (gf * gf).sum(dim=0)
+                    prev = col_energy.get(name)
+                    col_energy[name] = ce if prev is None else prev + ce
                 for f in nonzero_fmts:
                     key = (name, f)
                     if key in dW:
@@ -653,6 +669,13 @@ def compute_aura_cost(
             "out_features": int(getattr(mod, "out_features", mod.weight.shape[0])),
             "n_probes": int(n_probes),
         }
+        if collect_col_energy and n in col_energy:
+            # Per-column KL-Fisher energy, mean over probes (× inv) so its sum
+            # matches h_trace (= g_trace × inv). fp32 CPU vector, length
+            # in_features. Key present ONLY when collection is enabled, so the
+            # default payload is byte-identical to today's.
+            stats[n]["fisher_col"] = (
+                col_energy[n].float() * inv).detach().cpu()
         costs[n] = {}
         for f in fmts:
             if f in _ZERO_COST_FORMATS:
@@ -826,6 +849,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "packed-MoE expert tensors from the cost payload. "
                         "Default is fail-fast because packed experts need an "
                         "empirical/hybrid expert-cost path, not silent omission.")
+    p.add_argument("--collect-col-energy", action="store_true",
+                   default=os.environ.get("PRISMAQUANT_FISHER_COL_WEIGHTS") == "1",
+                   help="Also emit a per-Linear per-column KL-Fisher energy "
+                        "vector (stats[name]['fisher_col'], length in_features) "
+                        "for Fisher-weighted codeword/scale search (nvfp4-cb "
+                        "exp 4). Additive: the rest of the payload is unchanged. "
+                        "Env: PRISMAQUANT_FISHER_COL_WEIGHTS=1.")
     p.add_argument("--device", default="cuda")
     args = p.parse_args(argv)
 
@@ -916,6 +946,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         hook_harvest=args.hook_harvest,
         allow_packed_expert_omission=args.allow_packed_expert_omission,
         probe_microbatch=args.probe_microbatch,
+        collect_col_energy=args.collect_col_energy,
     )
     payload["provenance"].update({
         "model": str(args.model),
