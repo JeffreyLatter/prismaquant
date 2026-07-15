@@ -117,3 +117,15 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   (default-off, bit-identical regression pinned) + tests.
 - Wave 2 (queued): review diffs → fix cycles → run exp-1 (fixed vs learned vs
   IQ, 0.6B then 4B) → exp-2/4/3 per phase0-measurement.md gates.
+- 2026-07-15 (Robert): exp-1 gains a SMOOTHING SUB-ARM — joint SmoothQuant-style
+  α grid × k∈{12,14} on 0.6B, reusing the existing joint (α,format) machinery
+  (May landing; keep α conservative — its recorded cascade bug at aggressive α
+  stands). Requirements: (a) col_weights recomputed in lockstep under the
+  smoothed distribution (E[x'^2]=E[x^2]/s^2, analytic); (b) gate on whole-model
+  emulated KL, never the per-Linear screen; (c) measure jointly with
+  fixed-vs-learned (smoothing and learned codebooks are partial substitutes —
+  sequential measurement would misattribute the win); (d) expect the optimal α
+  direction to be rate-dependent (helps A4 side at ≥4bpw; may invert toward
+  AWQ-direction at 2bpw). Rotation (fused activation-side Hadamard) noted as
+  roadmap follow-on now that CB layers ship on our kernel anyway — OUT of
+  current scope.
