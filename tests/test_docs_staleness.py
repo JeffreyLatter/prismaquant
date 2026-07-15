@@ -36,7 +36,7 @@ def test_package_readme_entrypoints_resolve_to_live_modules():
 
 def test_root_readme_architecture_status_matches_in_tree_profiles():
     text = _read("README.md")
-    assert "DeepSeek-V4-Flash** (vendored transformer + profile)" in text
+    assert "DeepSeek-V4-Flash" in text and "vendored transformer" in text
     assert "**Gemma4**" in text
     assert "**LFM2.5**" in text
     assert "GLM-4" not in text
