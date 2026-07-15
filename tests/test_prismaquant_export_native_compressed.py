@@ -760,8 +760,17 @@ class TestRoundTrip(unittest.TestCase):
             "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0",
             "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL",
         }
+        nvfp4_cb_lane = {
+            # Served via the custom NVFP4-CB vLLM plugin container, not
+            # compressed-tensors (its scheme vocabulary cannot express
+            # codebooks); rendered==served is pinned in
+            # tests/test_nvfp4_cb_formats.py (docs/nvfp4-cb-plan).
+            s.name for s in fr.REGISTRY.values()
+            if s.family in ("nvfp4_cb", "fp8_cb")
+        }
         self.assertEqual(
-            set(fr.REGISTRY), reconciled | set(explicit_gaps) | gguf_lane
+            set(fr.REGISTRY),
+            reconciled | set(explicit_gaps) | gguf_lane | nvfp4_cb_lane,
         )
 
     def test_registry_render_dequant_matches_served_metadata(self):
@@ -776,6 +785,10 @@ class TestRoundTrip(unittest.TestCase):
                     if fr.get_format(fmt).family == "gguf":
                         # GGUF-container formats: rendered==served is pinned
                         # bit-exact in tests/test_gguf_formats.py.
+                        continue
+                    if fr.get_format(fmt).family in ("nvfp4_cb", "fp8_cb"):
+                        # NVFP4-CB plugin-container formats: rendered==served
+                        # is pinned in tests/test_nvfp4_cb_formats.py.
                         continue
 
                     if fmt in {"NVFP4", "NVFP4A16"}:

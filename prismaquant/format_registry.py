@@ -33,6 +33,7 @@ from prismaquant.fp8_dynamic import (
     fp8_dynamic_weight_qdq,
 )
 from prismaquant.gguf_formats import make_gguf_qdq
+from prismaquant.nvfp4_cb_formats import make_nvfp4_cb_qdq
 from prismaquant.mx_formats import (
     e8m0_to_scale,
     mxfp8_e4m3_activation_qdq_vllm,
@@ -862,6 +863,65 @@ register_format(_make_gguf_spec("IQ3_XXS", 3, 256, 16))   # 98 B / 256 = 3.0625
 register_format(_make_gguf_spec("IQ3_S", 3, 256, 112))    # 110 B / 256 = 3.4375
 register_format(_make_gguf_spec("IQ4_XS", 4, 256, 64))    # 136 B / 256 = 4.25
 register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
+
+
+# NVFP4-CB / FP8-CB vector-quantization codebook family (custom out-of-tree
+# vLLM plugin lane; NOT stock compressed-tensors — see docs/nvfp4-cb-plan).
+# The k-bit VQ index stream lives in scale_bits (fp4 family, weight_bits=0,
+# group_size=256 so effective_bits = k/8 + 0.5 exactly) or in weight_bits as
+# k/8 bits/param (fp8 family, per-output-channel fp32 scale, group_size=0 so
+# effective_bits_for_shape = k/8 + 32/in_features exactly). quantize_dequantize
+# is the weighted-VQ closure that also feeds the (Milestone B) byte packer;
+# activations are byte-identical to NVFP4 (fp4) / FP8 dynamic (fp8).
+def _make_nvfp4_cb_spec(k: int) -> FormatSpec:
+    return FormatSpec(
+        name=f"NVFP4_CB_K{k}",
+        weight_bits=0, group_size=256, scale_bits=32 * k + 128,
+        scale_dtype_name="nvfp4_cb_vq",
+        weight_element_dtype=f"nvfp4_cb_k{k}",
+        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=16,
+        family="nvfp4_cb", min_capability_sm=100,
+        autoround_config=(
+            lambda k=k: dict(bits=0, group_size=256, data_type="nvfp4_cb",
+                             cb_k=k, sym=True, act_bits=4,
+                             act_data_type="nv_fp4_with_static_gs",
+                             act_group_size=16, act_dynamic=True)
+        ),
+        quantize_dequantize=make_nvfp4_cb_qdq(k, "fp4", "product"),
+        activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    )
+
+
+def _make_fp8_cb_spec(k: int) -> FormatSpec:
+    # Index stream in scale_bits (32k bits / 256-superblock, weight_bits=0,
+    # group_size=256) so effective_bits = k/8 exactly, mirroring the GGUF /
+    # NVFP4_CB accounting. FP8_CB has NO group-16 scale plane; its
+    # per-output-channel fp32 scales are accounted by nvfp4_cb_footprint
+    # (the authoritative byte accountant, format-pipeline §1.5), which a
+    # single-scale FormatSpec cannot model on top of the superblock stream.
+    return FormatSpec(
+        name=f"FP8_CB_K{k}",
+        weight_bits=0, group_size=256, scale_bits=32 * k,
+        scale_dtype_name="fp8_cb_vq",
+        weight_element_dtype=f"fp8_cb_k{k}",
+        act_bits=8, act_dtype_name="fp8_e4m3", act_group_size=0,
+        family="fp8_cb", min_capability_sm=100,
+        autoround_config=(
+            lambda k=k: dict(bits=0, group_size=0, data_type="fp8_cb",
+                             cb_k=k, sym=True, act_bits=8,
+                             act_data_type="fp8_e4m3", act_dynamic=True)
+        ),
+        quantize_dequantize=make_nvfp4_cb_qdq(k, "fp8", "product"),
+        activation_quantize_dequantize=_make_plain_fp8_activation_vllm_rtn(
+            torch.float8_e4m3fn, 448.0,
+        ),
+    )
+
+
+for _k in range(12, 25):                    # 2.000 .. 3.500 bpw in 0.125 steps
+    register_format(_make_nvfp4_cb_spec(_k))
+for _k in (36, 40, 44, 48):                 # 4.5 / 5.0 / 5.5 / 6.0 bpw
+    register_format(_make_fp8_cb_spec(_k))
 
 
 def list_formats(family: str | None = None) -> list[FormatSpec]:

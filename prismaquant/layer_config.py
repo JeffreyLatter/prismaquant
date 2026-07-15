@@ -27,6 +27,14 @@ _GGUF_FORMAT_NAMES = frozenset(
      "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL"}
 )
 
+# NVFP4-CB / FP8-CB vector-quantization codebook lane (custom vLLM plugin;
+# pinned to format_registry by test_nvfp4_cb_formats). NVFP4_CB_K12..K24 and
+# FP8_CB_K36/40/44/48.
+_NVFP4_CB_FORMAT_NAMES = frozenset(
+    {f"NVFP4_CB_K{k}" for k in range(12, 25)}
+    | {f"FP8_CB_K{k}" for k in (36, 40, 44, 48)}
+)
+
 
 def canonicalize_format(entry: dict | str | int) -> str:
     """Map a layer-config entry to an export/runtime format name.
@@ -43,6 +51,16 @@ def canonicalize_format(entry: dict | str | int) -> str:
             if gguf_type not in _GGUF_FORMAT_NAMES:
                 raise ValueError(f"unsupported gguf scheme: {entry!r}")
             return gguf_type
+        if dt == "nvfp4_cb":
+            name = f"NVFP4_CB_K{int(entry['cb_k'])}"
+            if name not in _NVFP4_CB_FORMAT_NAMES:
+                raise ValueError(f"unsupported nvfp4_cb scheme: {entry!r}")
+            return name
+        if dt == "fp8_cb":
+            name = f"FP8_CB_K{int(entry['cb_k'])}"
+            if name not in _NVFP4_CB_FORMAT_NAMES:
+                raise ValueError(f"unsupported fp8_cb scheme: {entry!r}")
+            return name
         if dt == "nv_fp" and bits == 4:
             return "NVFP4"
         if dt == "mx_fp" and bits == 4:
@@ -78,6 +96,8 @@ def canonicalize_format(entry: dict | str | int) -> str:
     if isinstance(entry, str):
         value = entry.lower()
         if value.upper() in _GGUF_FORMAT_NAMES:
+            return value.upper()
+        if value.upper() in _NVFP4_CB_FORMAT_NAMES:
             return value.upper()
         if value in ("nvfp4", "fp4", "4"):
             return "NVFP4"

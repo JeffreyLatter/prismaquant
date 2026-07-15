@@ -1,0 +1,156 @@
+"""NVFP4-CB / FP8-CB codebook format tests (Milestone A, emulation)."""
+from __future__ import annotations
+
+import pytest
+import torch
+
+from prismaquant import format_registry as fr
+from prismaquant import layer_config as lc
+from prismaquant import nvfp4_cb_formats as cb
+
+_NVFP4_KS = list(range(12, 25))
+_FP8_KS = [36, 40, 44, 48]
+_DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+def _wmse(w, r, cw=None):
+    e = (w - r).float().pow(2)
+    if cw is not None:
+        e = e * cw
+    return float(e.mean())
+
+
+# (a) effective-bits accounting, exact, for every rung.
+@pytest.mark.parametrize("k", _NVFP4_KS)
+def test_nvfp4_cb_effective_bits_exact(k):
+    spec = fr.get_format(f"NVFP4_CB_K{k}")
+    assert spec.effective_bits == pytest.approx(k / 8 + 0.5, abs=1e-9)
+    assert spec.effective_bits_for_shape((64, 2048)) == pytest.approx(
+        k / 8 + 0.5, abs=1e-9)
+    assert spec.memory_bytes_for_shape((64, 2048)) == 64 * (2048 // 256) * (
+        4 * k + 16)
+
+
+@pytest.mark.parametrize("k", _FP8_KS)
+def test_fp8_cb_effective_bits_exact(k):
+    spec = fr.get_format(f"FP8_CB_K{k}")
+    # Registry body = index stream only, k/8 bpw exact (no group scale plane).
+    # The per-output-channel fp32 scale is the authoritative footprint's
+    # concern (nvfp4_cb_footprint), not the single-scale FormatSpec.
+    assert spec.effective_bits == pytest.approx(k / 8, abs=1e-9)
+    assert spec.effective_bits_for_shape((64, 2048)) == pytest.approx(
+        k / 8, abs=1e-9)
+    assert spec.memory_bytes_for_shape((128, 256)) == 128 * (256 // 256) * (
+        4 * k)
+
+
+# (b) decode validity: every reconstructed value == a grid point * group scale.
+@pytest.mark.parametrize("mode", ["full", "product"])
+def test_decode_on_grid_times_scale(mode):
+    torch.manual_seed(0)
+    w = torch.randn(64, 512)
+    fields = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode=mode)
+    recon = cb.nvfp4_cb_reconstruct(fields, 12, grid="fp4", mode=mode)
+    pes = cb._per_element_scale(fields["scales"], "fp4", 512)
+    q = recon / pes
+    grid = cb._e2m1_grid("cpu")
+    dist = (q.unsqueeze(-1) - grid).abs().min(dim=-1).values
+    assert float(dist.max()) < 1e-5
+
+
+# (c) determinism: bit-identical, eager, per device.
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("mode", ["full", "product"])
+def test_determinism_per_device(device, mode):
+    torch.manual_seed(3)
+    w = torch.randn(48, 512, device=device)
+    qdq = cb.make_nvfp4_cb_qdq(12, "fp4", mode)
+    a, b = qdq(w), qdq(w)
+    assert torch.equal(a, b)
+
+
+# (d) col_weights changes the assignment and reduces weighted MSE.
+def test_col_weights_reduces_weighted_mse():
+    torch.manual_seed(1)
+    w = torch.randn(64, 512)
+    cw = torch.rand(512) + 0.05
+    f0 = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode="full")
+    fw = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode="full", col_weights=cw)
+    assert not torch.equal(f0["indices"], fw["indices"])
+    r0 = cb.nvfp4_cb_reconstruct(f0, 12, grid="fp4", mode="full")
+    rw = cb.nvfp4_cb_reconstruct(fw, 12, grid="fp4", mode="full")
+    assert _wmse(w, rw, cw) <= _wmse(w, r0, cw) + 1e-9
+
+
+# (e) learned codebook (k=12, full) beats-or-ties the fixed lattice.
+def test_learned_codebook_beats_fixed():
+    torch.manual_seed(2)
+    w = torch.randn(96, 512)
+    cw = torch.rand(512) + 0.05
+    vecs, _, _ = cb._scale_and_vectorize(w, "fp4")
+    learned = cb.learn_codebook(vecs, 12, grid="fp4", iters=8)
+    f_fix = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode="full", col_weights=cw)
+    f_lrn = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode="full",
+                              col_weights=cw, codebook=learned)
+    r_fix = cb.nvfp4_cb_reconstruct(f_fix, 12, grid="fp4", mode="full")
+    r_lrn = cb.nvfp4_cb_reconstruct(f_lrn, 12, grid="fp4", mode="full",
+                                    codebook=learned)
+    assert _wmse(w, r_lrn, cw) <= _wmse(w, r_fix, cw) + 1e-9
+    # learned codebook is grid-valued (E2M1) so a decoded tile stays NVFP4.
+    grid = cb._e2m1_grid("cpu")
+    dist = (learned.unsqueeze(-1) - grid).abs().min(dim=-1).values
+    assert float(dist.max()) < 1e-5
+
+
+# (f) product and full both reconstruct valid values at k=12.
+def test_product_and_full_valid():
+    torch.manual_seed(4)
+    w = torch.randn(32, 768)
+    for mode in ("full", "product"):
+        r = cb.make_nvfp4_cb_qdq(12, "fp4", mode)(w)
+        assert r.shape == w.shape
+        assert torch.isfinite(r).all()
+
+
+# (g) 3-D stacked experts round-trip with per-expert col_weights.
+def test_stacked_experts_roundtrip():
+    torch.manual_seed(5)
+    w = torch.randn(3, 64, 256)
+    cw = torch.rand(3, 1, 256) + 0.05
+    fields = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode="product",
+                                col_weights=cw)
+    recon = cb.nvfp4_cb_reconstruct(fields, 12, grid="fp4", mode="product")
+    assert recon.shape == w.shape
+    assert fields["indices"].shape == (3 * 64, 256 // cb.VEC_DIM, 2)
+    # each expert uses its own scale plane -> per-expert reconstruction differs.
+    assert not torch.equal(recon[0], recon[1])
+
+
+# (h) in_features % 256 != 0 raises.
+def test_superblock_constraint():
+    with pytest.raises(ValueError, match="multiple of 256"):
+        cb.nvfp4_cb_fields(torch.randn(8, 300), 12)
+
+
+def test_flat_k_ceiling_raises():
+    with pytest.raises(ValueError, match="infeasible"):
+        cb.fixed_lattice(15, "fp4", 8)
+
+
+# (i) menu: all rungs register, resolve, sort by effective_bits.
+def test_menu_registers_and_resolves():
+    names = [f"NVFP4_CB_K{k}" for k in _NVFP4_KS] + \
+            [f"FP8_CB_K{k}" for k in _FP8_KS]
+    for name in names:
+        spec = fr.get_format(name)
+        assert spec is not None
+        assert lc.canonicalize_format(name.lower()) == name
+    # dict-form canonicalization (custom quant-config JSON shape).
+    assert lc.canonicalize_format(
+        {"data_type": "nvfp4_cb", "cb_k": 20}) == "NVFP4_CB_K20"
+    assert lc.canonicalize_format(
+        {"data_type": "fp8_cb", "cb_k": 44}) == "FP8_CB_K44"
+    fam = [s for s in fr.list_formats() if s.family in ("nvfp4_cb", "fp8_cb")]
+    assert len(fam) == len(names)
+    bpps = [s.effective_bits for s in fam]
+    assert bpps == sorted(bpps)
