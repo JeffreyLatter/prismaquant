@@ -342,3 +342,22 @@ speed). We ALREADY serve IQ via the GGUF plugin (Hy3). So the decision rests
 entirely on: is native-FP4/FP8 prefill worth the premium + the kernel we'd solely
 own? — a strategic fork for Robert. Pending regardless: two-tier-scale mitigation
 study (can it drive premium→0?), 4B emulation check, served confirmation.
+
+## KERNEL PHASE (Robert: "Kernel prototype now", 2026-07-16)
+
+Decision: skip straight to prototype (i) — correct-but-slow Triton serve — to
+get the first SERVED KL + real prefill/decode timings vs the GGUF plugin
+serving IQ on the same 0.6B. Rationale: quality premium is measured (~0.15-0.38
+bpw); the UNmeasured half of the trade is kernel speed, and (i) measures it
+cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
+- **Wave K1 (running):** Milestone-B packers + minimal export_nvfp4_cb.py +
+  LAYOUT.md contract (bit-exact pack==emulation pinned; both grids, all modes).
+- Wave K2 (queued on LAYOUT.md): vllm-prismaquant-plugin — register_quantization
+  _config, per-layer dispatch + CT delegation, Triton expand-in-tile GEMV/GEMM
+  (INV-1: no dense materialization), serve 0.6B FP8_CB_K44 + NVFP4_CB_K16
+  artifacts, served-KL vs emulation cross-check, timing vs GGUF-plugin IQ.
+- Calibration note for the record (answering Robert's "bf16 quality at half
+  cost, no perf hit?"): K44 = KL 0.019 @5.5bpw on 0.6B EMULATION — ship-grade
+  band at ~1/3 BF16 bytes (not half); "no perf hit" is exactly what the
+  prototype must prove; per-byte it MATCHES IQ4_XS (does not beat it); the
+  internal bar = beat AURA-allocated mixed menu at matched bpw (goes into 4B).
