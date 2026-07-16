@@ -361,3 +361,15 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
   band at ~1/3 BF16 bytes (not half); "no perf hit" is exactly what the
   prototype must prove; per-byte it MATCHES IQ4_XS (does not beat it); the
   internal bar = beat AURA-allocated mixed menu at matched bpw (goes into 4B).
+- **K1 LANDED (9fd5d70), ACCEPTED:** packers + export_nvfp4_cb.py + LAYOUT.md;
+  pack==emulation bit-identical pinned for every mode×grid×k, CPU+CUDA, sweep
+  on; suite 1099. Agent's judgment call accepted: fp4 E4M3 scales INLINE in
+  cb_qweight (type_size=4k+16 exact), only fp8 per-channel scales as a
+  separate weight_scale tensor — LAYOUT.md §3 is the plugin contract.
+- **K2 (running):** in-repo plugins/vllm_prismaquant/ — registration + CB
+  linear method + correctness-first Triton expand-in-tile kernels (INV-1
+  enforced, INV-2 explicitly waived for the prototype); exports uniform 0.6B
+  FP8_CB_K44 + NVFP4_CB_K16 artifacts; measures (a) served-KL vs the emulation
+  gate's predictions (0.019 / ~2.21) and (b) the speed table vs vllm-gguf-plugin
+  IQ4_XS and BF16 on the same box. Deliverable:
+  docs/nvfp4-cb-plan/serve_prototype_0p6b.md.
