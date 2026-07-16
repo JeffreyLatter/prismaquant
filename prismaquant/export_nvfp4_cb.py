@@ -165,6 +165,7 @@ def export_nvfp4_cb(
     shared_codebook_spec: dict | None = None,
     device: str | None = None,
     scale_sweep: bool = True,
+    scale_coding: str = cb.SCALE_CODING_V1,
 ) -> dict[str, int]:
     """Export a CB checkpoint. See module docstring / LAYOUT.md for the layout.
 
@@ -178,10 +179,18 @@ def export_nvfp4_cb(
         a shared per-(role) learned codebook trained here on pooled vectors;
       * ``{"source": "learned", "codebooks": {role: cb_obj}}`` — use provided
         per-role codebooks (a missing role for a target hard-fails).
+
+    ``scale_coding``: ``"v1"`` (default; e4m3-direct scale plane) or
+    ``"two_tier"`` (layout v2, fp4 targets only — writes ``layout_version: 2``
+    + a ``scale_coding`` scheme section; two-tier-scale-spec.md). v2 artifacts
+    may only SHIP once the plugin serves them M1-native (spec §4/G4); default
+    stays v1 until those gates clear.
     """
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if scale_coding not in (cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER):
+        raise ValueError(f"unknown scale_coding {scale_coding!r}")
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     spec = shared_codebook_spec or {}
@@ -293,7 +302,9 @@ def export_nvfp4_cb(
             packed, fields = cb.nvfp4_cb_pack(
                 w, k, grid=grid, mode=mode,
                 col_weights=col_weights[qname].to(device),
-                codebook=cbook, scale_sweep=scale_sweep)
+                codebook=cbook, scale_sweep=scale_sweep,
+                scale_coding=(scale_coding if grid == "fp4"
+                              else cb.SCALE_CODING_V1))
             out_tensors[qname + ".cb_qweight"] = packed.to(torch.uint8).cpu(
             ).contiguous()
             if grid == "fp8":
@@ -336,24 +347,37 @@ def export_nvfp4_cb(
         base = f"cb_codebook.{ref}.{fmt}"
         codebook_ref = ([f"{base}.sub{i}" for i in range(n_sub)]
                         if n_sub > 1 else base)
+        group_coding = (scale_coding if grid == "fp4"
+                        else cb.SCALE_CODING_V1)
+        scheme = {
+            "grid": grid,
+            "mode": mode,
+            "k": k,
+            "superblock": cb.SUPERBLOCK,
+            "group_size": cb.FP4_GROUP if grid == "fp4" else 0,
+            "vec_dim": cb.VEC_DIM,
+            "n_sub": n_sub,
+            "type_size": cb.nvfp4_cb_type_size(k, grid, group_coding),
+            "act_bits": 4 if grid == "fp4" else 8,
+            "codebook_source": (
+                "lattice" if ref == "lattice" else "learned"),
+            "codebook_ref": codebook_ref,
+            "codebook_group": None if ref == "lattice" else ref,
+        }
+        if group_coding == cb.SCALE_CODING_TWO_TIER:
+            # Table entries asserted e4m3-exact by _two_tier_tables; ship the
+            # 16 floats so the scheme is self-describing (spec §1.3/§5.1).
+            table, _, _ = cb._two_tier_tables("cpu")
+            scheme["scale_coding"] = {
+                "kind": "two_tier",
+                "sub_bits": 4,
+                "super_bias": cb.TWO_TIER_SUPER_BIAS,
+                "table": [float(t) for t in table.tolist()],
+            }
         config_groups[f"group_{gi}"] = {
             "targets": sorted(qnames),
             "format": fmt,
-            "scheme": {
-                "grid": grid,
-                "mode": mode,
-                "k": k,
-                "superblock": cb.SUPERBLOCK,
-                "group_size": cb.FP4_GROUP if grid == "fp4" else 0,
-                "vec_dim": cb.VEC_DIM,
-                "n_sub": n_sub,
-                "type_size": cb.nvfp4_cb_type_size(k, grid),
-                "act_bits": 4 if grid == "fp4" else 8,
-                "codebook_source": (
-                    "lattice" if ref == "lattice" else "learned"),
-                "codebook_ref": codebook_ref,
-                "codebook_group": None if ref == "lattice" else ref,
-            },
+            "scheme": scheme,
         }
     quant_config = {
         "quant_method": "prismaquant",
@@ -367,10 +391,15 @@ def export_nvfp4_cb(
             "codebook_sha256": codebook_sha,
             "codebook_source": source,
             "scale_sweep": bool(scale_sweep),
+            "scale_coding": scale_coding,
             "cb_targets": len(cb_targets),
             "tensor_formats": {q: assignment[q] for q in sorted(cb_targets)},
         },
     }
+    if scale_coding == cb.SCALE_CODING_TWO_TIER:
+        # Absence of layout_version (and of any scheme scale_coding key)
+        # means v1 — old artifacts parse unchanged, forever (spec §5.1).
+        quant_config["layout_version"] = 2
 
     # --- Write safetensors + configs. ---
     save_file(out_tensors, str(out_dir / "model.safetensors"),
@@ -419,6 +448,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-scale-sweep", action="store_true",
                     help="one-shot amax/grid-max scale (A/B only; default is "
                     "the joint scale sweep, IQ-rendering parity)")
+    ap.add_argument("--scale-coding", default=cb.SCALE_CODING_V1,
+                    choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER],
+                    help="fp4 scale coding: v1 e4m3 plane (default) or the "
+                    "layout-v2 two-tier super+sub coding (writes "
+                    "layout_version 2; serve gates pending — do not ship)")
     ap.add_argument("--device", default=None)
     args = ap.parse_args(argv)
 
@@ -433,6 +467,7 @@ def main(argv: list[str] | None = None) -> None:
         args.model_dir, args.layer_config, args.out, col_weights,
         shared_codebook_spec=spec, device=args.device,
         scale_sweep=not args.no_scale_sweep,
+        scale_coding=args.scale_coding,
     )
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
     print(f"wrote {args.out} ({size:.3f} GB)")

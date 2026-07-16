@@ -42,6 +42,17 @@ always in the candidate set, so the sweep is never worse than one-shot. **The
 Phase-0 exp-1 0.6B results (pre-c3f8c6d) used one-shot scales for CB while the
 IQ arms got their scale sweep — that rendering asymmetry is corrected here;
 re-run before trusting any CB-vs-IQ delta.**
+
+Scale coding (fp4 family): the v1 plane stores each group-16 scale as a bare
+E4M3 byte — on real LLM weights ~90% of group scales sit in e4m3's SUBNORMAL
+band, where the sweep's candidates collapse to ~1-2 distinct values
+(two-tier-scale-spec.md §3). Layout v2 ("two_tier", opt-in until the serving
+gates clear) stores a per-superblock E8M0 super `2^(E-127)` plus 16 4-bit sub
+codes into an e4m3-exact multiplier table; the composition IS an E4M3 scale by
+construction, the encoder explores every reachable value across the ideal-scale
+window (~20+ distinct candidates where v1 had 1-2), and the scale plane shrinks
+16 B -> 9 B per superblock (0.5 -> 0.28125 bpw). Every fp4 exp-1/1b number was
+measured under v1 coding.
 """
 from __future__ import annotations
 
@@ -75,6 +86,23 @@ _E4M3 = torch.float8_e4m3fn
 # Smallest positive fp8_e4m3fn value (subnormal 2^-9), an E4M3-exact floor
 # that keeps a chosen block scale strictly positive (never underflow to 0).
 _E4M3_MIN_POS = 2.0 ** -9
+
+# --- Two-tier scale coding (layout v2, fp4 family only) -----------------
+# docs/nvfp4-cb-plan/two-tier-scale-spec.md: per-256 E8M0 super (2^(E-127))
+# x per-16 4-bit sub code into a fixed table of e4m3-exact multipliers;
+# the composition lands exactly on E4M3 by construction (legality mask, no
+# rounding anywhere). Scale plane 16 B -> 9 B per superblock (0.28125 bpw).
+SCALE_CODING_V1 = "v1"                # bare e4m3 plane, 16 B/superblock
+SCALE_CODING_TWO_TIER = "two_tier"    # E8M0 super + 4-bit sub, 9 B/superblock
+TWO_TIER_SUPER_BIAS = 127
+# T4_2oct8m (spec §1.3): all 8 e4m3 mantissa steps x 2 octaves.
+TWO_TIER_SUB_TABLE = (1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875,
+                      2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75)
+# Window margin around [min_ideal/T_max, 1.5*max_ideal] (spec §1.4 derives the
+# E window from the ideal group scales; the conservatism note says a wider
+# window can only improve, so pad one octave on each side).
+_TWO_TIER_WINDOW_PAD = 1
+_TWO_TIER_MAX_WINDOW = 14
 
 _DATA = Path(__file__).resolve().parent / "data" / "nvfp4_cb_lattices.pt"
 _LATTICE_SEED = 1234
@@ -537,18 +565,187 @@ def _sweep_encode(w2d: torch.Tensor, grid: str, mode: str, cb,
     return best_s, enc
 
 
+# ---------------------------------------------------------------------------
+# Two-tier scale coding (layout v2): compose/legality tables + encoder.
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def _two_tier_tables(device: str):
+    """Return (table (16,), compose (256, 16) fp32, legal (256, 16) bool).
+
+    ``compose[E, c] = T[c] * 2^(E - 127)``; a pair is legal iff the composed
+    value round-trips ``float8_e4m3fn`` bit-exactly and lies in (0, 448]
+    (spec §1.2) — so every emitted scale is exact E4M3 by construction."""
+    dev = torch.device(device)
+    table = torch.tensor(TWO_TIER_SUB_TABLE, dtype=torch.float32, device=dev)
+    snapped = table.to(_E4M3).to(torch.float32)
+    if not torch.equal(snapped, table):
+        raise AssertionError("TWO_TIER_SUB_TABLE entries must be e4m3-exact")
+    exps = torch.arange(256, dtype=torch.float64, device=dev)
+    compose64 = table.to(torch.float64) * torch.pow(
+        2.0, exps - TWO_TIER_SUPER_BIAS).unsqueeze(-1)          # (256, 16)
+    compose = compose64.to(torch.float32)
+    finite = torch.isfinite(compose)
+    rt = torch.where(finite, compose, torch.zeros_like(compose)).to(
+        _E4M3).to(torch.float32)
+    legal = (finite & (compose > 0) & (compose <= FP8_ELEMENT_MAX)
+             & (rt == compose)
+             & (compose.to(torch.float64) == compose64))
+    return table, compose, legal
+
+
+def _two_tier_window(amax: torch.Tensor):
+    """Per-superblock E window (E_lo (rows, n_sb) int64, W int) from the ideal
+    group scales (spec §1.4): E_lo so the table top reaches min_ideal, E_hi so
+    the table bottom reaches 1.5*max_ideal, padded one octave each side."""
+    rows, G = amax.shape
+    n_sb = G * FP4_GROUP // SUPERBLOCK
+    ideal = (amax / NVFP4_GRID_MAX).clamp_min(_E4M3_MIN_POS)
+    ideal_sb = ideal.reshape(rows, n_sb, SUPERBLOCK // FP4_GROUP)
+    min_i = ideal_sb.amin(dim=-1)
+    max_i = ideal_sb.amax(dim=-1)
+    t_max = float(TWO_TIER_SUB_TABLE[-1])
+    e_lo = (torch.ceil(torch.log2(min_i / t_max)) + TWO_TIER_SUPER_BIAS
+            - _TWO_TIER_WINDOW_PAD)
+    e_hi = (torch.floor(torch.log2(max_i * 1.5)) + TWO_TIER_SUPER_BIAS
+            + _TWO_TIER_WINDOW_PAD)
+    _, _, legal = _two_tier_tables(str(amax.device))
+    any_legal = legal.any(dim=-1)
+    e_min = int(torch.nonzero(any_legal)[0])
+    e_max = int(torch.nonzero(any_legal)[-1])
+    e_lo = e_lo.clamp(e_min, e_max).to(torch.int64)
+    e_hi = e_hi.clamp(e_min, e_max).to(torch.int64)
+    e_hi = torch.maximum(e_hi, e_lo)
+    W = min(int((e_hi - e_lo).max()) + 1, _TWO_TIER_MAX_WINDOW)
+    # When the cap truncates an extreme-spread superblock, keep the TOP of
+    # the window: groups below the reachable floor snap UP with error bounded
+    # by their (small) magnitude (spec §1.2 zero/degenerate rules), while
+    # losing the top would cost ~amax^2 on the largest group.
+    e_lo = torch.maximum(e_lo, e_hi - (W - 1))
+    return e_lo, e_hi, W
+
+
+def _sb_to_groups(t_sb: torch.Tensor) -> torch.Tensor:
+    """(rows, n_sb) -> (rows, G): broadcast a per-superblock value to its 16
+    group-16 slots."""
+    rows, n_sb = t_sb.shape
+    reps = SUPERBLOCK // FP4_GROUP
+    return t_sb.unsqueeze(-1).expand(rows, n_sb, reps).reshape(rows, -1)
+
+
+def _two_tier_eval_entry(w2d, wq, comp_sb, legal_sb, mode, cb):
+    """Score one sub-table entry at per-superblock composed scale ``comp_sb``
+    ((rows, n_sb), maybe illegal): weighted original-domain error per group,
+    +inf where the (E, c) pair is illegal."""
+    safe = torch.where(legal_sb, comp_sb, torch.ones_like(comp_sb))
+    err_g, _, _ = _eval_candidate(w2d, wq, _sb_to_groups(safe), "fp4", mode, cb)
+    inf = torch.tensor(float("inf"), device=err_g.device)
+    return torch.where(_sb_to_groups(legal_sb.to(torch.bool)), err_g, inf)
+
+
+def _sweep_encode_two_tier(w2d: torch.Tensor, mode: str, cb,
+                           wq: torch.Tensor | None):
+    """Layout-v2 encoder (spec §1.4): the sweep machinery with the candidate
+    set restricted to the two-tier reachable set.
+
+    1. sweep E per superblock over the ideal-scale window; per (E, group) the
+       best legal sub-table entry via the weighted original-domain eval;
+    2. pick E per superblock by total weighted error;
+    3. per-group entry argmin at the frozen E (strict <, so an all-zero group
+       deterministically takes the FIRST legal entry — spec zero rule);
+    4. WLS refits snapped to the frozen-E reachable set, accepted per group
+       only when strictly better.
+
+    Returns (scales (rows, G) composed e4m3-exact, enc, super_E (rows, n_sb),
+    sub_codes (rows, G))."""
+    rows, in_f = w2d.shape
+    n_sb = in_f // SUPERBLOCK
+    dev = str(w2d.device)
+    _, compose, legal = _two_tier_tables(dev)
+    amax = _group_amax(w2d, "fp4")                              # (rows, G)
+    e_lo, e_hi, W = _two_tier_window(amax)                      # (rows, n_sb)
+
+    inf = torch.tensor(float("inf"), device=w2d.device)
+    best_tot = torch.full((rows, n_sb), float("inf"), device=w2d.device)
+    best_e = e_lo.clone()
+    for i in range(W):
+        E = torch.minimum(e_lo + i, e_hi)
+        valid_i = (e_lo + i) <= e_hi
+        err_best_g = torch.full_like(amax, float("inf"))
+        for c in range(len(TWO_TIER_SUB_TABLE)):
+            err_g = _two_tier_eval_entry(
+                w2d, wq, compose[E, c], legal[E, c], mode, cb)
+            err_best_g = torch.minimum(err_best_g, err_g)
+        tot = err_best_g.reshape(rows, n_sb, -1).sum(-1)
+        tot = torch.where(valid_i, tot, inf)
+        better = tot < best_tot
+        best_tot = torch.where(better, tot, best_tot)
+        best_e = torch.where(better, E, best_e)
+
+    # Per-group entry selection at the frozen per-superblock E. Strict < keeps
+    # the FIRST legal entry on ties (all-zero groups -> deterministic bytes).
+    best_err_g = torch.full_like(amax, float("inf"))
+    best_s = torch.full_like(amax, _E4M3_MIN_POS)
+    best_c = torch.zeros(rows, amax.shape[1], dtype=torch.int64,
+                         device=w2d.device)
+    for c in range(len(TWO_TIER_SUB_TABLE)):
+        err_g = _two_tier_eval_entry(
+            w2d, wq, compose[best_e, c], legal[best_e, c], mode, cb)
+        better = err_g < best_err_g
+        best_err_g = torch.where(better, err_g, best_err_g)
+        best_s = torch.where(better, _sb_to_groups(compose[best_e, c]), best_s)
+        best_c = torch.where(better, torch.full_like(best_c, c), best_c)
+
+    # WLS refit on the frozen-E reachable set (spec §1.4 step 3).
+    reach = compose[best_e]                                     # (rows,n_sb,16)
+    reach_legal = legal[best_e]
+    reps = SUPERBLOCK // FP4_GROUP
+    reach_g = reach.unsqueeze(2).expand(rows, n_sb, reps, -1)
+    legal_g = reach_legal.unsqueeze(2).expand(rows, n_sb, reps, -1)
+    for _ in range(_SCALE_SWEEP_REFIT_ITERS):
+        err_cur, _, g = _eval_candidate(w2d, wq, best_s, "fp4", mode, cb)
+        wcol = wq.reshape(rows, in_f) if wq is not None else torch.ones_like(g)
+        num = _group_reduce(wcol * g * w2d, "fp4")
+        den = _group_reduce(wcol * g * g, "fp4")
+        s_star = torch.where(den > 0, num / den.clamp_min(1e-30), best_s)
+        dist = (s_star.reshape(rows, n_sb, reps, 1) - reach_g).abs()
+        dist = torch.where(legal_g, dist, inf)
+        c_star = dist.argmin(dim=-1)                            # (rows,n_sb,16)
+        s_snap = torch.gather(reach_g, -1, c_star.unsqueeze(-1)).squeeze(-1)
+        s_snap = s_snap.reshape(rows, -1)
+        err_star, _, _ = _eval_candidate(w2d, wq, s_snap, "fp4", mode, cb)
+        better = err_star < err_cur
+        best_s = torch.where(better, s_snap, best_s)
+        best_c = torch.where(better, c_star.reshape(rows, -1), best_c)
+
+    _, enc, _ = _eval_candidate(w2d, wq, best_s, "fp4", mode, cb)
+    return best_s, enc, best_e, best_c
+
+
 def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
-                  cb, cw2d: torch.Tensor | None, scale_sweep: bool) -> dict:
+                  cb, cw2d: torch.Tensor | None, scale_sweep: bool,
+                  scale_coding: str = SCALE_CODING_V1) -> dict:
     rows, in_f = w2d.shape
     nvec_per_row = in_f // VEC_DIM
     wq = _col_weight_vectors(cw2d) if cw2d is not None else None
-    if scale_sweep:
+    if scale_coding == SCALE_CODING_TWO_TIER:
+        if grid != "fp4":
+            raise ValueError("two-tier scale coding is fp4-family only "
+                             "(fp8 has no per-superblock scale plane)")
+        if not scale_sweep:
+            raise ValueError("two-tier scale coding IS the sweep encoder "
+                             "(spec §1.4); scale_sweep=False is undefined")
+        scales, enc, super_e, sub_c = _sweep_encode_two_tier(w2d, mode, cb, wq)
+    elif scale_sweep:
         scales, enc = _sweep_encode(w2d, grid, mode, cb, wq)
     else:
         vectors, scales, _ = _scale_and_vectorize(w2d, grid)
         enc = _mode_encode(vectors, mode, cb, wq)
     out = _enc_to_fields(enc, mode, cb, rows, in_f, nvec_per_row)
     out["scales"] = scales
+    if scale_coding == SCALE_CODING_TWO_TIER:
+        out["scale_super"] = super_e.to(torch.uint8)
+        out["scale_sub"] = sub_c
     return out
 
 
@@ -556,12 +753,18 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
                     mode: str = "product",
                     col_weights: torch.Tensor | None = None,
                     codebook: torch.Tensor | tuple | None = None,
-                    scale_sweep: bool = True) -> dict:
+                    scale_sweep: bool = True,
+                    scale_coding: str = SCALE_CODING_V1) -> dict:
     """Quantize ``w`` (2-D or 3-D stacked experts) into VQ fields.
 
     ``scale_sweep`` (default True) jointly optimizes the per-group scale over
     the E4M3-legal candidate grid (IQ-rendering parity); set False for the
     one-shot amax/grid-max scale (A/B and the pre-c3f8c6d rendering).
+
+    ``scale_coding``: ``"v1"`` (default; bare e4m3 plane) or ``"two_tier"``
+    (layout v2, fp4 only: per-superblock E8M0 super + 4-bit sub codes; the
+    stored plane is still the composed E4M3-exact per-group scale). v2 stays
+    opt-in until the spec's serving gates (G1/G3/G4) clear.
 
     Returns at least {"indices", "scales"}; the resolved codebook is echoed
     back under "codebook" so reconstruct and the packer share one table.
@@ -570,6 +773,8 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
     if in_f % SUPERBLOCK != 0:
         raise ValueError(
             f"in_features={in_f} must be a multiple of {SUPERBLOCK}")
+    if scale_coding not in (SCALE_CODING_V1, SCALE_CODING_TWO_TIER):
+        raise ValueError(f"unknown scale_coding {scale_coding!r}")
     orig_shape = tuple(w.shape)
     w2d = w.reshape(-1, in_f)
     rows = w2d.shape[0]
@@ -583,18 +788,22 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
 
     row_step = max(1, _SLICE_MAX_ELEMS // max(in_f, 1))
     if rows <= row_step:
-        out = _fields_block(w2d, k, grid, mode, cb, cw2d, scale_sweep)
+        out = _fields_block(w2d, k, grid, mode, cb, cw2d, scale_sweep,
+                            scale_coding)
     else:
         parts = []
         for a in range(0, rows, row_step):
             b = min(rows, a + row_step)
             cw = cw2d[a:b] if cw2d is not None else None
             parts.append(
-                _fields_block(w2d[a:b], k, grid, mode, cb, cw, scale_sweep))
+                _fields_block(w2d[a:b], k, grid, mode, cb, cw, scale_sweep,
+                              scale_coding))
         out = {key: torch.cat([p[key] for p in parts], dim=0)
                for key in parts[0]}
     out["shape"] = orig_shape
     out["codebook"] = cb
+    if scale_coding == SCALE_CODING_TWO_TIER:
+        out["scale_coding"] = SCALE_CODING_TWO_TIER
     return out
 
 
@@ -628,15 +837,18 @@ def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",
 
 
 def make_nvfp4_cb_qdq(k: int, grid: str = "fp4", mode: str = "product",
-                      scale_sweep: bool = True):
+                      scale_sweep: bool = True,
+                      scale_coding: str = SCALE_CODING_V1):
     """Single-source emulation closure ``(w, col_weights=None) -> w_hat``
     used by both cost and (Milestone B) the packer. ``scale_sweep`` defaults
-    True (joint scale search, IQ-rendering parity)."""
+    True (joint scale search, IQ-rendering parity); ``scale_coding``
+    selects the v1 e4m3 plane (default) or the layout-v2 two-tier coding."""
     def f(w: torch.Tensor, col_weights: torch.Tensor | None = None
           ) -> torch.Tensor:
         fields = nvfp4_cb_fields(w, k, grid=grid, mode=mode,
                                  col_weights=col_weights,
-                                 scale_sweep=scale_sweep)
+                                 scale_sweep=scale_sweep,
+                                 scale_coding=scale_coding)
         return nvfp4_cb_reconstruct(fields, k, grid=grid, mode=mode).to(w.dtype)
     return f
 
@@ -655,15 +867,31 @@ def make_nvfp4_cb_qdq(k: int, grid: str = "fp4", mode: str = "product",
 # its per-output-channel fp32 scales are a separate ``<name>.weight_scale``.
 # ---------------------------------------------------------------------------
 
-def _type_size(k: int, grid: str) -> int:
-    """Bytes per 256-weight superblock (§1.1): 4k index bytes + 16 E4M3 scale
-    bytes (fp4) / 4k index bytes only (fp8)."""
-    return 4 * int(k) + (16 if grid == "fp4" else 0)
+def _type_size(k: int, grid: str,
+               scale_coding: str = SCALE_CODING_V1) -> int:
+    """Bytes per 256-weight superblock: 4k index bytes + the scale section —
+    16 E4M3 bytes (fp4 v1), 9 bytes (fp4 v2 two-tier: 1 E8M0 super + 8 sub
+    nibble-bytes), none (fp8)."""
+    if grid != "fp4":
+        return 4 * int(k)
+    if scale_coding == SCALE_CODING_TWO_TIER:
+        return 4 * int(k) + 9
+    return 4 * int(k) + 16
 
 
-def nvfp4_cb_type_size(k: int, grid: str = "fp4") -> int:
+def nvfp4_cb_type_size(k: int, grid: str = "fp4",
+                       scale_coding: str = SCALE_CODING_V1) -> int:
     """Public: on-disk bytes per 256-weight superblock for a CB rung."""
-    return _type_size(k, grid)
+    return _type_size(k, grid, scale_coding)
+
+
+def nvfp4_cb_effective_bits(k: int, grid: str = "fp4",
+                            scale_coding: str = SCALE_CODING_V1) -> float:
+    """Version-keyed body bpw (spec §2): fp4 v1 ``k/8 + 0.5``, fp4 v2
+    two-tier ``k/8 + 0.28125``, fp8 ``k/8`` (per-channel scale separate).
+    The REGISTERED FormatSpecs stay on v1 accounting until the spec's
+    serving gates clear (a v2 artifact may only ship served M1-native)."""
+    return _type_size(k, grid, scale_coding) * 8.0 / SUPERBLOCK
 
 
 def _vector_codes(fields: dict, k: int, grid: str, mode: str) -> torch.Tensor:
@@ -728,12 +956,47 @@ def _unpack_bytes_to_codes(idx_bytes: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _scale_plane_bytes(scales: torch.Tensor, n_sb: int) -> torch.Tensor:
-    """fp4 scale plane -> (rows, n_sb, 16) uint8. ``scales`` (rows, in//16) are
-    already E4M3-exact (snapped by the encoder), so the E4M3 byte view is
+    """fp4 v1 scale plane -> (rows, n_sb, 16) uint8. ``scales`` (rows, in//16)
+    are already E4M3-exact (snapped by the encoder), so the E4M3 byte view is
     lossless."""
     rows = scales.shape[0]
     s = scales.reshape(rows, n_sb, FP4_GROUP).to(_E4M3)
     return s.contiguous().view(torch.uint8)
+
+
+def _two_tier_scale_bytes(super_e: torch.Tensor, sub_c: torch.Tensor,
+                          n_sb: int) -> torch.Tensor:
+    """fp4 v2 scale section -> (rows, n_sb, 9) uint8: 1 E8M0 super byte, then
+    8 sub bytes (16 x 4-bit codes; group g in byte g//2, even g = LOW nibble
+    — LSB-first, consistent with the index stream). Spec §5.1."""
+    rows = super_e.shape[0]
+    sup = super_e.reshape(rows, n_sb, 1).to(torch.uint8)
+    c = sub_c.reshape(rows, n_sb, SUPERBLOCK // FP4_GROUP).to(torch.int64)
+    if bool((c < 0).any()) or bool((c > 15).any()):
+        raise ValueError("two-tier sub codes must be 4-bit (0..15)")
+    pairs = c.reshape(rows, n_sb, 8, 2)
+    sub = (pairs[..., 0] | (pairs[..., 1] << 4)).to(torch.uint8)
+    return torch.cat([sup, sub], dim=-1)
+
+
+def _two_tier_scale_unpack(sc_bytes: torch.Tensor):
+    """(rows, n_sb, 9) uint8 -> (super_e (rows, n_sb) int64, sub codes
+    (rows, n_sb*16) int64, composed scales (rows, n_sb*16) fp32 — exact E4M3
+    by construction (table compose, no rounding)."""
+    rows, n_sb, _ = sc_bytes.shape
+    super_e = sc_bytes[..., 0].to(torch.int64)
+    sub = sc_bytes[..., 1:].to(torch.int64)                     # (rows,n_sb,8)
+    lo = sub & 0xF
+    hi = (sub >> 4) & 0xF
+    codes = torch.stack([lo, hi], dim=-1).reshape(rows, n_sb, -1)
+    _, compose, legal = _two_tier_tables(str(sc_bytes.device))
+    e_exp = super_e.unsqueeze(-1).expand_as(codes)
+    if not bool(legal[e_exp, codes].all()):
+        raise ValueError(
+            "two-tier scale bytes contain an illegal (super, sub) pair")
+    scales = compose[e_exp, codes].reshape(rows, n_sb * (SUPERBLOCK
+                                                         // FP4_GROUP))
+    return super_e, codes.reshape(rows, -1), scales
 
 
 def nvfp4_cb_assemble_bytes(fields: dict, k: int, grid: str = "fp4",
@@ -741,9 +1004,12 @@ def nvfp4_cb_assemble_bytes(fields: dict, k: int, grid: str = "fp4",
     """Bit-pack VQ ``fields`` into the §1 on-disk byte layout.
 
     Returns a 2-D uint8 tensor ``(rows, n_superblocks * type_size)`` on the
-    fields' device. ``type_size == 4k + 16`` (fp4) / ``4k`` (fp8), asserted.
+    fields' device. The scale coding is taken from the fields (a two-tier
+    encode carries ``scale_super``/``scale_sub``): ``type_size == 4k + 16``
+    (fp4 v1) / ``4k + 9`` (fp4 v2) / ``4k`` (fp8), asserted.
     """
     k = int(k)
+    scale_coding = fields.get("scale_coding", SCALE_CODING_V1)
     codes = _vector_codes(fields, k, grid, mode)                # (rows, nvec)
     rows, nvec = codes.shape
     if nvec % 32 != 0:
@@ -751,32 +1017,40 @@ def nvfp4_cb_assemble_bytes(fields: dict, k: int, grid: str = "fp4",
             f"in_features={nvec * VEC_DIM} is not a multiple of {SUPERBLOCK}")
     n_sb = nvec // 32
     idx_bytes = _pack_codes_to_bytes(codes, k)                  # (rows,n_sb,4k)
-    if grid == "fp4":
+    if grid == "fp4" and scale_coding == SCALE_CODING_TWO_TIER:
+        sc_bytes = _two_tier_scale_bytes(
+            fields["scale_super"], fields["scale_sub"], n_sb)   # (rows,n_sb,9)
+        block = torch.cat([idx_bytes, sc_bytes], dim=-1)
+    elif grid == "fp4":
         sc_bytes = _scale_plane_bytes(fields["scales"], n_sb)   # (rows,n_sb,16)
         block = torch.cat([idx_bytes, sc_bytes], dim=-1)
     elif grid == "fp8":
         block = idx_bytes
     else:
         raise ValueError(f"unknown grid {grid!r}")
-    ts = _type_size(k, grid)
+    ts = _type_size(k, grid, scale_coding)
     assert block.shape[-1] == ts, (
         f"type_size mismatch: packed {block.shape[-1]} bytes/superblock, "
-        f"expected {ts} for k={k} grid={grid}")
+        f"expected {ts} for k={k} grid={grid} scale_coding={scale_coding}")
     return block.reshape(rows, n_sb * ts).contiguous()
 
 
 def nvfp4_cb_unpack(packed: torch.Tensor, k: int, grid: str, mode: str,
                     shape: tuple[int, ...],
                     codebook: torch.Tensor | tuple | None = None,
-                    scales: torch.Tensor | None = None) -> dict:
+                    scales: torch.Tensor | None = None,
+                    scale_coding: str = SCALE_CODING_V1) -> dict:
     """Inverse of :func:`nvfp4_cb_assemble_bytes`: byte tensor -> VQ ``fields``
     ready for :func:`nvfp4_cb_reconstruct`.
 
-    fp4 scales are recovered from the packed scale plane. fp8 has no scale
-    plane on disk — pass the per-output-channel ``scales`` tensor
-    (``<name>.weight_scale``) explicitly. ``codebook`` (the resolved learned /
-    lattice table) is echoed into the fields so reconstruct uses the exact
-    table the packer encoded against.
+    fp4 scales are recovered from the packed scale section — the v1 e4m3
+    plane by default; pass ``scale_coding="two_tier"`` for layout-v2 bytes
+    (absence of the scheme's ``scale_coding`` key means v1, so old artifacts
+    decode unchanged, forever). fp8 has no scale plane on disk — pass the
+    per-output-channel ``scales`` tensor (``<name>.weight_scale``)
+    explicitly. ``codebook`` (the resolved learned / lattice table) is echoed
+    into the fields so reconstruct uses the exact table the packer encoded
+    against.
     """
     k = int(k)
     in_f = int(shape[-1])
@@ -785,11 +1059,12 @@ def nvfp4_cb_unpack(packed: torch.Tensor, k: int, grid: str, mode: str,
             f"in_features={in_f} must be a multiple of {SUPERBLOCK}")
     rows = int(packed.shape[0])
     n_sb = in_f // SUPERBLOCK
-    ts = _type_size(k, grid)
+    ts = _type_size(k, grid, scale_coding)
     if tuple(packed.shape) != (rows, n_sb * ts):
         raise ValueError(
             f"packed shape {tuple(packed.shape)} != expected "
-            f"{(rows, n_sb * ts)} for k={k} grid={grid} in_features={in_f}")
+            f"{(rows, n_sb * ts)} for k={k} grid={grid} in_features={in_f} "
+            f"scale_coding={scale_coding}")
     block = packed.reshape(rows, n_sb, ts)
     codes = _unpack_bytes_to_codes(block[..., :4 * k], k)
     nvec = in_f // VEC_DIM
@@ -815,7 +1090,14 @@ def nvfp4_cb_unpack(packed: torch.Tensor, k: int, grid: str, mode: str,
     else:
         raise ValueError(f"unknown mode {mode!r}")
 
-    if grid == "fp4":
+    if grid == "fp4" and scale_coding == SCALE_CODING_TWO_TIER:
+        super_e, sub_c, composed = _two_tier_scale_unpack(
+            block[..., 4 * k:4 * k + 9])
+        fields["scales"] = composed
+        fields["scale_super"] = super_e.to(torch.uint8)
+        fields["scale_sub"] = sub_c
+        fields["scale_coding"] = SCALE_CODING_TWO_TIER
+    elif grid == "fp4":
         sc = block[..., 4 * k:4 * k + FP4_GROUP].reshape(rows, n_sb * FP4_GROUP)
         fields["scales"] = sc.contiguous().view(_E4M3).to(torch.float32)
     else:
@@ -834,7 +1116,9 @@ def nvfp4_cb_pack(w: torch.Tensor, k: int, *, grid: str = "fp4",
                   mode: str = "product",
                   col_weights: torch.Tensor | None = None,
                   codebook: torch.Tensor | tuple | None = None,
-                  scale_sweep: bool = True) -> tuple[torch.Tensor, dict]:
+                  scale_sweep: bool = True,
+                  scale_coding: str = SCALE_CODING_V1
+                  ) -> tuple[torch.Tensor, dict]:
     """Quantize + bit-pack a weight in one call (mirrors ``gguf_pack``).
 
     Returns ``(packed uint8 (rows, bytes_per_row), fields)``; ``fields``
@@ -843,6 +1127,7 @@ def nvfp4_cb_pack(w: torch.Tensor, k: int, *, grid: str = "fp4",
     """
     fields = nvfp4_cb_fields(w, k, grid=grid, mode=mode,
                              col_weights=col_weights, codebook=codebook,
-                             scale_sweep=scale_sweep)
+                             scale_sweep=scale_sweep,
+                             scale_coding=scale_coding)
     packed = nvfp4_cb_assemble_bytes(fields, k, grid=grid, mode=mode)
     return packed, fields

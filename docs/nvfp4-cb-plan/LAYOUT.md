@@ -107,29 +107,61 @@ The decoded coordinate `j` = `mag_codebook[mag_idx][j] × (−1 if s_j else +1)`
 (The magnitude codebook is on the non-negative half-grid; sign is separable
 under the weighted-L2 objective, so `s_j = sign(x_j)` is jointly optimal.)
 
-### 1.2 Scale plane (fp4 only)
+### 1.2 Scale section (fp4 only) — two codings
 
-Immediately after the 4k index bytes: **16 E4M3 bytes**, one group-16 block
-scale per 16 consecutive weights (group `g` covers weights `[16g, 16g+16)` of
-the superblock). Byte = the `torch.float8_e4m3fn` value reinterpreted as uint8
-(`scale.to(float8_e4m3fn).view(uint8)`). This is **byte-identical to NVFP4's
-block-scale plane** — hand it to the block-scaled MMA unchanged. Reconstruction:
+**Scale coding v1 (e4m3-direct, 16 B — the default; absence of the scheme's
+`scale_coding` key ⇒ v1):** immediately after the 4k index bytes, **16 E4M3
+bytes**, one group-16 block scale per 16 consecutive weights (group `g` covers
+weights `[16g, 16g+16)` of the superblock). Byte = the `torch.float8_e4m3fn`
+value reinterpreted as uint8 (`scale.to(float8_e4m3fn).view(uint8)`). This is
+**byte-identical to NVFP4's block-scale plane** — hand it to the block-scaled
+MMA unchanged. Reconstruction:
 `weight[i] = codeword_value[i] × e4m3_scale[group(i)]`.
+
+**Scale coding v2 (two-tier, 9 B — `layout_version: 2`,
+`docs/nvfp4-cb-plan/two-tier-scale-spec.md`):** immediately after the 4k index
+bytes:
+
+```
+[ SUPER 1 B (E8M0, bias 127) | SUB 8 B (16 × 4-bit codes) ]
+```
+
+- `SUPER` = uint8 `E`; the superblock's power-of-two super-scale `2^(E-127)`.
+- `SUB` = 16 4-bit codes, group `g` in byte `g/2`, **even `g` = low nibble**
+  (LSB-first, consistent with the index stream). Code `c_g` indexes the fixed
+  16-entry multiplier table `T` shipped in the scheme
+  (`scale_coding.table`; default `T4_2oct8m = {1.0, 1.125, …, 1.875, 2.0,
+  2.25, …, 3.75}` — all 8 e4m3 mantissa steps × 2 octaves).
+- **Reconstruction:** `scale_g = T[c_g] × 2^(E-127)` — exact E4M3 **by
+  construction** (every table entry is `(8+j)/8 × 2^i`; the encoder only emits
+  `(E, c)` pairs whose composition round-trips `float8_e4m3fn` bit-exactly and
+  lies in `(0, 448]`), so the consumer still sees a bona-fide E4M3 plane with
+  a plain fp32 multiply — no cast, no rounding.
+- The packer asserts type_size-vs-version consistency, so a mis-labeled
+  artifact fails loudly at load, not silently.
 
 ### 1.3 type_size table (asserted by the packer)
 
-| grid | k | type_size (B/256) | index bits (32k) | scale bytes |
-|---|---|---|---|---|
-| fp4 | 12 | 64  | 384 | 16 |
-| fp4 | 14 | 72  | 448 | 16 |
-| fp4 | 16 | 80  | 512 | 16 |
-| fp4 | 24 | 112 | 768 | 16 |
-| fp8 | 36 | 144 | 1152 | 0 |
-| fp8 | 40 | 160 | 1280 | 0 |
-| fp8 | 44 | 176 | 1408 | 0 |
+| grid | k | type_size v1 (B/256) | **type_size v2** | index bits (32k) | scale bytes v1 / v2 |
+|---|---|---|---|---|---|
+| fp4 | 12 | 64  | **57**  | 384 | 16 / 9 |
+| fp4 | 13 | 68  | **61**  | 416 | 16 / 9 |
+| fp4 | 14 | 72  | **65**  | 448 | 16 / 9 |
+| fp4 | 16 | 80  | **73**  | 512 | 16 / 9 |
+| fp4 | 18 | 88  | **81**  | 576 | 16 / 9 |
+| fp4 | 20 | 96  | **89**  | 640 | 16 / 9 |
+| fp4 | 24 | 112 | **105** | 768 | 16 / 9 |
+| fp8 | 36 | 144 | —       | 1152 | 0 |
+| fp8 | 40 | 160 | —       | 1280 | 0 |
+| fp8 | 44 | 176 | —       | 1408 | 0 |
 
-`effective_bits(fp4) = (4k+16)·8/256 = k/8 + 0.5`;
+`effective_bits(fp4, v1) = (4k+16)·8/256 = k/8 + 0.5`;
+`effective_bits(fp4, v2) = (4k+9)·8/256 = k/8 + 0.28125` (version-keyed —
+`nvfp4_cb_formats.nvfp4_cb_effective_bits`; the registered FormatSpecs stay on
+v1 accounting until the two-tier serving gates clear, since a v2 artifact may
+only ship served M1-native);
 `effective_bits(fp8 body) = 4k·8/256 = k/8` (+ the per-channel fp32 plane).
+Two-tier is fp4-only (fp8 has no per-superblock scale plane).
 
 ---
 
@@ -214,10 +246,16 @@ codebooks — this is a distinct `quant_method`). Also mirrored into
         "codebook_source": "learned",   // "lattice" | "learned"
         "codebook_ref": ["cb_codebook.gate_proj.NVFP4_CB_K16.sub0",
                          "cb_codebook.gate_proj.NVFP4_CB_K16.sub1"],
-        "codebook_group": "gate_proj"   // null for lattice
+        "codebook_group": "gate_proj",  // null for lattice
+        // v2 (layout_version 2) fp4 groups ONLY — absence ⇒ v1:
+        "scale_coding": {"kind": "two_tier", "sub_bits": 4,
+                         "super_bias": 127,
+                         "table": [1.0, 1.125, /* … 16 e4m3-exact floats */]}
       }
     }
   },
+  // top-level, v2 exports only; absence ⇒ layout v1:
+  "layout_version": 2,
   "ignore": ["model.norm", "lm_head", ...],   // non-CB modules -> unquantized
   "provenance": {
     "git_commit": "...",

@@ -673,3 +673,275 @@ def test_export_native_compressed_hard_fails_on_cb():
             "unused-model",
             {"model.layers.0.mlp.gate_proj": "NVFP4_CB_K16"},
         )
+
+
+# ===========================================================================
+# Layout v2 — two-tier scale coding (docs/nvfp4-cb-plan/two-tier-scale-spec.md).
+# ===========================================================================
+
+def _real_magnitude_w(rows=64, in_f=512, seed=0):
+    """0.6B-magnitude weights: group scales land in e4m3's subnormal band
+    (the regime where the v1 candidate sweep collapses)."""
+    torch.manual_seed(seed)
+    return torch.randn(rows, in_f) * 0.02
+
+
+# T1 — compose exactness, exhaustive over all (E, c) pairs.
+def test_two_tier_compose_exact_exhaustive():
+    table, compose, legal = cb._two_tier_tables("cpu")
+    assert table.shape == (16,) and compose.shape == (256, 16)
+    assert torch.equal(table.to(torch.float8_e4m3fn).to(torch.float32), table)
+    lv = compose[legal]
+    assert int(legal.sum()) > 0
+    # every legal pair round-trips e4m3 bit-exactly and lies in (0, 448].
+    assert torch.equal(lv.to(torch.float8_e4m3fn).to(torch.float32), lv)
+    assert bool((lv > 0).all()) and bool((lv <= 448.0).all())
+    # every ILLEGAL finite positive pair fails the round-trip or the range.
+    ill = ~legal & torch.isfinite(compose) & (compose > 0)
+    iv = compose[ill]
+    rt = iv.to(torch.float8_e4m3fn).to(torch.float32)
+    assert bool(((rt != iv) | (iv > 448.0)).all())
+    # union of legal compositions covers every positive e4m3 value (spec §1.2)
+    e4m3_pos = sorted({float(torch.tensor(b, dtype=torch.uint8).view(
+        torch.float8_e4m3fn).to(torch.float32)) for b in range(256)
+        if 0 < float(torch.tensor(b, dtype=torch.uint8).view(
+            torch.float8_e4m3fn).to(torch.float32)) <= 448.0})
+    reachable = set(lv.tolist())
+    assert set(e4m3_pos) <= reachable
+
+
+# T1b — encoder fuzz: emitted (super, sub) pairs are always legal and the
+# stored plane equals the composition.
+@pytest.mark.parametrize("mode", ["full", "product", "signed"])
+def test_two_tier_encoder_emits_only_legal_pairs(mode):
+    k = 13 if mode == "full" else 14
+    w = _real_magnitude_w(seed=1)
+    fields = cb.nvfp4_cb_fields(w, k, grid="fp4", mode=mode,
+                                scale_coding="two_tier")
+    _, compose, legal = cb._two_tier_tables("cpu")
+    e = fields["scale_super"].to(torch.int64)
+    c = fields["scale_sub"]
+    e_g = e.unsqueeze(-1).expand(*e.shape, 16).reshape(e.shape[0], -1)
+    assert bool(legal[e_g, c].all())
+    assert torch.equal(compose[e_g, c], fields["scales"])
+    s = fields["scales"]
+    assert torch.equal(s.to(torch.float8_e4m3fn).to(torch.float32), s)
+
+
+# T2 — pack -> unpack -> reconstruct == emulation, bit-exact, all modes.
+@pytest.mark.parametrize("mode", ["full", "product", "signed"])
+def test_two_tier_pack_unpack_matches_emulation(mode):
+    k = 13 if mode == "full" else 14
+    w = _real_magnitude_w(seed=2)
+    cw = torch.rand(512) + 0.05
+    packed, fields = cb.nvfp4_cb_pack(w, k, grid="fp4", mode=mode,
+                                      col_weights=cw,
+                                      scale_coding="two_tier")
+    up = cb.nvfp4_cb_unpack(packed, k, "fp4", mode, tuple(w.shape),
+                            codebook=fields["codebook"],
+                            scale_coding="two_tier")
+    rec = cb.nvfp4_cb_reconstruct(up, k, grid="fp4", mode=mode)
+    emu = cb.nvfp4_cb_reconstruct(fields, k, grid="fp4", mode=mode)
+    assert torch.equal(rec, emu)
+    assert torch.equal(up["scales"], fields["scales"])
+    assert torch.equal(up["scale_super"], fields["scale_super"])
+    assert torch.equal(up["scale_sub"], fields["scale_sub"])
+
+
+# T3 — byte accounting: type_size 4k+9, packed nbytes, §2.1 bpw ladder.
+def test_two_tier_type_size_and_effective_bits():
+    for k, bpw in ((12, 1.78125), (13, 1.90625), (14, 2.03125),
+                   (16, 2.28125), (18, 2.53125), (20, 2.78125),
+                   (24, 3.28125)):
+        assert cb.nvfp4_cb_type_size(k, "fp4", "two_tier") == 4 * k + 9
+        assert cb.nvfp4_cb_effective_bits(
+            k, "fp4", "two_tier") == pytest.approx(bpw, abs=1e-12)
+        assert cb.nvfp4_cb_effective_bits(
+            k, "fp4", "v1") == pytest.approx(k / 8 + 0.5, abs=1e-12)
+    w = _real_magnitude_w(seed=3)
+    packed, _ = cb.nvfp4_cb_pack(w, 14, grid="fp4", mode="product",
+                                 scale_coding="two_tier")
+    assert packed.shape == (64, (512 // 256) * (4 * 14 + 9))
+    # registered rungs stay on v1 accounting until the serving gates clear.
+    assert fr.get_format("NVFP4_CB_K14").effective_bits == pytest.approx(
+        2.25, abs=1e-12)
+
+
+# T4 — v1 regression: default decode path is v1 and unchanged.
+def test_two_tier_v1_fixture_still_decodes():
+    w = _real_magnitude_w(seed=4)
+    packed, fields = cb.nvfp4_cb_pack(w, 14, grid="fp4", mode="product")
+    assert packed.shape[-1] == (512 // 256) * (4 * 14 + 16)   # v1 type_size
+    up = cb.nvfp4_cb_unpack(packed, 14, "fp4", "product", tuple(w.shape),
+                            codebook=fields["codebook"])      # no scale_coding
+    rec = cb.nvfp4_cb_reconstruct(up, 14, grid="fp4", mode="product")
+    emu = cb.nvfp4_cb_reconstruct(fields, 14, grid="fp4", mode="product")
+    assert torch.equal(rec, emu)
+    assert "scale_super" not in up
+
+
+# T5 — determinism: encode twice => identical bytes (CPU and CUDA).
+@pytest.mark.parametrize("device", _DEVICES)
+def test_two_tier_determinism(device):
+    w = _real_magnitude_w(seed=5).to(device)
+    cw = (torch.rand(512) + 0.05).to(device)
+    p1, _ = cb.nvfp4_cb_pack(w, 14, grid="fp4", mode="product",
+                             col_weights=cw, scale_coding="two_tier")
+    p2, _ = cb.nvfp4_cb_pack(w, 14, grid="fp4", mode="product",
+                             col_weights=cw, scale_coding="two_tier")
+    assert torch.equal(p1, p2)
+
+
+# T6 — edges: all-zero group / superblock, 448 top, subnormal snap-up.
+def test_two_tier_edges():
+    torch.manual_seed(6)
+    w = torch.randn(4, 512) * 0.02
+    w[0, :16] = 0.0                                  # all-zero group
+    w[1, :256] = 0.0                                 # all-zero superblock
+    w[2, :16] = 448.0 * 6.0                          # amax at the 448 scale top
+    fields = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="product",
+                                scale_coding="two_tier")
+    s = fields["scales"]
+    assert bool((s > 0).all())                       # T has no zero (spec)
+    assert torch.equal(s.to(torch.float8_e4m3fn).to(torch.float32), s)
+    assert float(s[2, 0]) == 448.0                   # top reachable: 1.75*2^8
+    # zero regions: scale is the deterministic first-legal candidate (bytes
+    # pinned below); recon is bounded by grid*scale (the lattice need not
+    # contain an exact zero codeword — same as v1).
+    recon = cb.nvfp4_cb_reconstruct(fields, 14, grid="fp4", mode="product")
+    assert float(recon[0, :16].abs().max()) <= 6.0 * float(s[0, 0])
+    assert float(recon[1, :256].abs().max()) <= 6.0 * float(s[1, :16].max())
+    # determinism of the degenerate bytes
+    p1 = cb.nvfp4_cb_assemble_bytes(fields, 14, "fp4", "product")
+    f2 = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="product",
+                            scale_coding="two_tier")
+    p2 = cb.nvfp4_cb_assemble_bytes(f2, 14, "fp4", "product")
+    assert torch.equal(p1, p2)
+
+
+def test_two_tier_snap_up_no_clip():
+    # One tiny-amax group among 15 big ones: its ideal scale sits below the
+    # superblock's reachable floor at the chosen E -> snaps UP (>= ideal), the
+    # no-clip direction: |w/s| <= 6 everywhere in that group.
+    torch.manual_seed(7)
+    w = torch.randn(1, 256) * 0.05
+    w[0, :16] *= 1e-4                                # tiny group 0
+    fields = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="product",
+                                scale_coding="two_tier")
+    s0 = float(fields["scales"][0, 0])
+    ideal0 = float(w[0, :16].abs().amax() / 6.0)
+    assert s0 >= ideal0
+    assert float((w[0, :16].abs() / s0).max()) <= 6.0 + 1e-6
+
+
+# Candidate diversity: the un-collapse the two-tier coding buys. On a
+# subnormal-band tensor the v1 clip sweep collapses to a handful of distinct
+# e4m3 candidates per group; the two-tier window offers >= 16 distinct legal
+# reachable values per superblock.
+def test_two_tier_candidate_diversity_vs_v1():
+    w = _real_magnitude_w(seed=8)
+    amax = cb._group_amax(w, "fp4")
+    v1 = cb._candidate_scales(amax, "fp4", cb._SCALE_SWEEP_CANDIDATES)
+    v1_distinct = torch.tensor([
+        len(set(v1[:, r, g].tolist()))
+        for r in range(0, 64, 16) for g in range(0, 32, 8)])
+    assert float(v1_distinct.float().mean()) <= 8.0   # the collapse (v1)
+    _, compose, legal = cb._two_tier_tables("cpu")
+    e_lo, e_hi, W = cb._two_tier_window(amax)
+    for r in range(0, 64, 16):
+        for sb in range(2):
+            vals = set()
+            for i in range(W):
+                E = min(int(e_lo[r, sb]) + i, int(e_hi[r, sb]))
+                vals |= set(compose[E][legal[E]].tolist())
+            assert len(vals) >= 16
+
+
+# v2 sweep quality: never worse than the v1 one-shot; empirically also beats
+# the v1 free sweep on subnormal-band tensors (the spec §3 negative tax).
+@pytest.mark.parametrize("mode", ["product", "signed"])
+def test_two_tier_beats_one_shot_and_v1_sweep(mode):
+    w = _real_magnitude_w(seed=9)
+    cw = torch.rand(512) + 0.05
+    cw2d = torch.broadcast_to(cw, w.shape).contiguous()
+    wq = cb._col_weight_vectors(cw2d)
+    C = cb._resolve_codebook(14, "fp4", mode, None, w.device)
+
+    def err_of(scales):
+        e, _, _ = cb._eval_candidate(w, wq, scales, "fp4", mode, C)
+        return float(e.sum())
+
+    one_shot = cb._candidate_scales(cb._group_amax(w, "fp4"), "fp4", 16)[0]
+    f_v1 = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode=mode, col_weights=cw)
+    f_v2 = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode=mode, col_weights=cw,
+                              scale_coding="two_tier")
+    e_one, e_v1, e_v2 = (err_of(one_shot), err_of(f_v1["scales"]),
+                         err_of(f_v2["scales"]))
+    assert e_v2 <= e_one + 1e-6
+    assert e_v2 <= e_v1 + 1e-6
+
+
+def test_two_tier_rejects_fp8_and_no_sweep():
+    w = _real_magnitude_w(seed=10)
+    with pytest.raises(ValueError, match="fp4-family only"):
+        cb.nvfp4_cb_fields(w, 40, grid="fp8", mode="product",
+                           scale_coding="two_tier")
+    with pytest.raises(ValueError, match="IS the sweep"):
+        cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="product",
+                           scale_sweep=False, scale_coding="two_tier")
+    with pytest.raises(ValueError, match="scale_coding"):
+        cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="product",
+                           scale_coding="v3")
+
+
+def test_two_tier_exporter_writes_layout_version(export_dir):
+    from safetensors.torch import load_file
+
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl, out = export_dir / "model", export_dir / "out"
+    tens = _tiny_model(mdl)
+    assign = {
+        "model.layers.0.mlp.gate_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+        "model.layers.1.mlp.gate_proj": {"data_type": "fp8_cb", "cb_k": 40},
+    }
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, assign)
+    cw = {q: torch.rand(256) + 0.05 for q in assign}
+    export_nvfp4_cb(mdl, apath, out, cw, device="cpu",
+                    scale_coding="two_tier")
+    qc = json.loads((out / "quant_config.json").read_text())
+    assert qc["layout_version"] == 2
+    assert qc["provenance"]["scale_coding"] == "two_tier"
+    ot = load_file(str(out / "model.safetensors"))
+    for g in qc["config_groups"].values():
+        s = g["scheme"]
+        if s["grid"] == "fp4":
+            sc = s["scale_coding"]
+            assert sc["kind"] == "two_tier" and sc["sub_bits"] == 4
+            assert sc["super_bias"] == 127 and len(sc["table"]) == 16
+            tb = torch.tensor(sc["table"], dtype=torch.float32)
+            assert torch.equal(
+                tb.to(torch.float8_e4m3fn).to(torch.float32), tb)
+            assert s["type_size"] == 4 * s["k"] + 9
+            # round-trip through the v2 scheme
+            q = g["targets"][0]
+            ref = s["codebook_ref"]
+            codebook = (tuple(ot[r].float() for r in ref)
+                        if isinstance(ref, list) else ot[ref].float())
+            w = tens[q + ".weight"].float()
+            up = cb.nvfp4_cb_unpack(ot[q + ".cb_qweight"], s["k"], "fp4",
+                                    s["mode"], tuple(w.shape),
+                                    codebook=codebook,
+                                    scale_coding="two_tier")
+            emu_f = cb.nvfp4_cb_fields(w, s["k"], grid="fp4", mode=s["mode"],
+                                       col_weights=cw[q], codebook=codebook,
+                                       scale_coding="two_tier")
+            assert torch.equal(
+                cb.nvfp4_cb_reconstruct(up, s["k"], grid="fp4",
+                                        mode=s["mode"]),
+                cb.nvfp4_cb_reconstruct(emu_f, s["k"], grid="fp4",
+                                        mode=s["mode"]))
+        else:
+            assert "scale_coding" not in s          # fp8: no scale plane
+            assert s["type_size"] == 4 * s["k"]
