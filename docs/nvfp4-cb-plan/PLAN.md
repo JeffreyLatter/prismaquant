@@ -148,6 +148,20 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   (kill-flag on ONE model — 4B check pending); smoothing α=0.25 helps
   beyond noise at both k (−7%/−21%), α=0.5 ~neutral; exp-2 CLOSED
   (≤0.03 bpw recoverable); FP8_CB_K40 anchor sane (KL 0.131 @5bpw).
+- 2026-07-15 (exp-1b CORRECTED rerun): after scale_sweep-default + signed
+  mode + SHARED-per-role learned codebooks landed, decision-critical arms
+  re-run at 2.5 bpw near IQ2_S. Driver extended (--exp1b: signed/shared/
+  fixed-full-k16/per-tensor + role-keyed FormatSpecs + sidecar-honest
+  footprint). Timing: signed-S16 0.3 s/Linear vs full-k16 56 s/Linear (187×)
+  for ~8% relerr → signed is the practical champion (4 seeds); full-k16 =
+  1-seed ceiling; per-tensor = footprint-only. Results:
+  exp1b_0p6b_corrected.md. **VERDICT = KILL SIGNAL:** signed-S16-shared at
+  matched TOTAL bytes loses IQ2_S by +73.7% W4A4 AND +47.9% weight-only
+  (both ≫15%, 4 seeds) — the corrections helped (weight-only 2.34 vs exp-1
+  flat-full-k14 weight-only 3.29) but the FP4-grid constraint vs IQ's free
+  grid does not close at 2.5 bpw on 0.6B. Smoothing-on-sweep null (+2.9%,
+  n.s.); per-tensor k16 sidecar +0.93 bpw model-wide (~2 bpw small-N) →
+  shared is mandatory. 4B + the RD-ceiling study cross-check pending.
 - Wave-1 COMPLETE (all accepted): formats 8aeaec0+9e9838a (fix cycle: Lloyd
   scatter_add — dense onehot was a 51GB trap at 27B scale; n_sub product
   decomposition — FP8_CB now functional via 4×2-dim sub-codebooks, 9-12-bit

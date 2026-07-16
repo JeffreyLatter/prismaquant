@@ -39,7 +39,8 @@ from prismaquant.emu_forward_kl import measure_emulated_kl, _git_commit
 from prismaquant.measure_quant_cost import canonical_linear_name
 from prismaquant.nvfp4_cb_formats import (
     make_nvfp4_cb_qdq, learn_codebook, _scale_and_vectorize,
-    _col_weight_vectors, nvfp4_cb_fields,
+    _col_weight_vectors, nvfp4_cb_fields, nvfp4_cb_reconstruct,
+    fixed_lattice, _build_lattice, VEC_DIM,
 )
 from prismaquant.nvfp4_cb_footprint import cb_footprint
 from prismaquant.index_entropy import index_entropy
@@ -704,11 +705,481 @@ def write_report(arms, agg, entropy, targets, n_dim, n_head):
     return doc
 
 
+# ===========================================================================
+# EXP-1b — CORRECTED CB-vs-IQ rerun (scale_sweep default + signed mode +
+# SHARED-per-role learned codebooks). exp-1's CB arms used one-shot scales
+# while IQ swept theirs; that rendering asymmetry is corrected here.
+# ===========================================================================
+
+RESULTS1B = WORK.parent / "exp1b" / "results"
+CB_ENTRY_BYTES = 4          # NVFP4 codebook entry: 8 FP4 codes = 4 bytes
+NVFP4_GLOBAL_SCALE_BYTES = 4
+
+
+def role_of(qname: str) -> str:
+    return qname.split(".")[-1]
+
+
+def _universal_k16():
+    """Build/cache the universal (data-independent) full-mode k16 lattice —
+    a FIXED table (like the IQ grids), so a fixed-full-k16 arm has NO
+    per-artifact sidecar."""
+    path = RESULTS1B / "universal_k16_lattice.pt"
+    if path.exists():
+        return torch.load(path, map_location="cpu", weights_only=True)
+    lat = _build_lattice(16, "fp4", VEC_DIM)
+    RESULTS1B.mkdir(parents=True, exist_ok=True)
+    torch.save(lat, path)
+    return lat
+
+
+def _vecs_and_wq(w: torch.Tensor, cw: torch.Tensor | None):
+    """One-shot scaled 8-dim vectors + per-vector weights for a Linear."""
+    w2d = w.reshape(-1, w.shape[-1])
+    vectors, _, _ = _scale_and_vectorize(w2d, "fp4")
+    wq = None
+    if cw is not None:
+        cw2d = torch.broadcast_to(cw.to(w2d.device, torch.float32),
+                                  w2d.shape).contiguous()
+        wq = _col_weight_vectors(cw2d)
+    return vectors, wq
+
+
+def train_shared_codebooks(model, targets, imatrix, *, mode, k, seed,
+                           train_cap=1 << 20, iters=4):
+    """One codebook per ROLE, learned on that role's pooled scaled vectors.
+    signed → positive magnitude table (2^(k-8), 8); full → (2^k, 8) inited
+    from the universal k16 lattice. Cached per (mode,k,seed)."""
+    tag = f"{mode}_k{k}_seed{seed}"
+    RESULTS1B.mkdir(parents=True, exist_ok=True)
+    path = RESULTS1B / f"shared_cb_{tag}.pt"
+    if path.exists():
+        return torch.load(path, map_location="cpu", weights_only=True)
+    wmap = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            q = canonical_linear_name(name)
+            if q in targets:
+                wmap[q] = mod.weight.data
+    by_role: dict[str, list[str]] = {}
+    for q in targets:
+        by_role.setdefault(role_of(q), []).append(q)
+    uni16 = _universal_k16().cuda() if mode == "full" else None
+    cbs = {}
+    for role, qs in by_role.items():
+        vlist, wlist = [], []
+        for q in qs:
+            v, wq = _vecs_and_wq(wmap[q], imatrix[q]["e_x2"])
+            vlist.append(v)
+            wlist.append(wq if wq is not None else torch.ones_like(v))
+        vec = torch.cat(vlist, 0)
+        wq = torch.cat(wlist, 0)
+        if vec.shape[0] > train_cap:                     # subsample for Lloyd
+            g = torch.Generator(device="cpu").manual_seed(seed)
+            idx = torch.randperm(vec.shape[0], generator=g)[:train_cap].to(vec.device)
+            vec, wq = vec[idx], wq[idx]
+        if mode == "signed":
+            cb = learn_codebook(vec.abs(), k - VEC_DIM, grid="fp4",
+                                col_weights=wq, iters=iters, seed=seed,
+                                positive=True)
+        else:  # full
+            cb = learn_codebook(vec, k, grid="fp4", col_weights=wq,
+                                init=uni16, iters=iters, seed=seed)
+        cbs[role] = cb.cpu()
+    torch.save(cbs, path)
+    return cbs
+
+
+def make_shared_qdq(k, mode, codebook, scale_sweep=True):
+    def f(w, col_weights=None):
+        fields = nvfp4_cb_fields(w, k, grid="fp4", mode=mode,
+                                 col_weights=col_weights, codebook=codebook,
+                                 scale_sweep=scale_sweep)
+        return nvfp4_cb_reconstruct(fields, k, grid="fp4", mode=mode,
+                                    codebook=codebook).to(w.dtype)
+    return f
+
+
+def register_role_specs(role_cbs, *, mode, k, scale_sweep, tag):
+    """Register 7 role-keyed FormatSpecs carrying each role's shared codebook.
+    Returns {role: registered_format_name}."""
+    base = fr.get_format(f"NVFP4_CB_K{k}")
+    names = {}
+    for role, cb in role_cbs.items():
+        name = f"_E1B_{tag}_{role}"
+        cbdev = cb.cuda() if torch.cuda.is_available() else cb
+        fr.REGISTRY.pop(name, None)
+        fr.register_format(dataclasses.replace(
+            base, name=name,
+            quantize_dequantize=make_shared_qdq(k, mode, cbdev, scale_sweep)))
+        names[role] = name
+    return names
+
+
+@dataclasses.dataclass
+class Arm1b:
+    id: str
+    kind: str                # iq / fp8cb / full_fixed / full_shared /
+                             # signed_shared / full_k14 / pertensor
+    k: int = 16
+    mode: str = "full"
+    scale_sweep: bool = True
+    weight_only: bool = False
+    smooth_alpha: float | None = None
+    seeds: tuple[int, ...] = SEEDS
+    fmt: str | None = None            # for iq/fp8cb uniform formats
+    foot_fmt: str = "NVFP4_CB_K16"
+    kl: bool = True                   # pertensor: footprint only
+
+
+def build_arms_1b() -> list[Arm1b]:
+    S4 = (0, 1, 2, 3)
+    return [
+        # --- decision set (cheap-first so the verdict lands early) ---
+        Arm1b("IQ2S", "iq", fmt="IQ2_S", foot_fmt="IQ2_S", seeds=S4),
+        Arm1b("SIG16_shared", "signed_shared", mode="signed", seeds=S4),
+        Arm1b("SIG16_shared_smooth025", "signed_shared", mode="signed",
+              smooth_alpha=0.25, seeds=S4),
+        Arm1b("SIG16_shared_wo", "signed_shared", mode="signed",
+              weight_only=True, seeds=S4),
+        Arm1b("IQ2S_wo", "iq", fmt="IQ2_S", foot_fmt="IQ2_S",
+              weight_only=True, seeds=S4),
+        Arm1b("FULL_k14_sweepoff", "full_k14", k=14, scale_sweep=False,
+              foot_fmt="NVFP4_CB_K14", seeds=S4),
+        # --- lever isolation (heavier) ---
+        Arm1b("FULL_k14_sweepon", "full_k14", k=14, scale_sweep=True,
+              foot_fmt="NVFP4_CB_K14", seeds=S4),
+        # --- context (1 seed) ---
+        Arm1b("IQ3XXS", "iq", fmt="IQ3_XXS", foot_fmt="IQ3_XXS", seeds=(0,)),
+        Arm1b("FP8CB40_sweep", "fp8cb", fmt="FP8_CB_K40",
+              foot_fmt="FP8_CB_K40", seeds=(0,)),
+        # --- full-k16 ceiling refs (56s/Linear → 1 seed) ---
+        Arm1b("FULL_k16_fixed", "full_fixed", mode="full", seeds=(0,)),
+        Arm1b("FULL_k16_shared", "full_shared", mode="full", seeds=(0,)),
+        # --- per-tensor k16: footprint-only (its point is the sidecar bpw) ---
+        Arm1b("LEARN_k16_pertensor", "pertensor", mode="full", seeds=(0,),
+              kl=False),
+    ]
+
+
+def footprint_1b(arm: Arm1b, targets: dict) -> dict:
+    """Body via cb_footprint (registry-exact); sidecar computed here per arm."""
+    foot = cb_footprint({q: arm.foot_fmt for q in targets},
+                        {q: targets[q] for q in targets})
+    n_params = foot["n_params"]
+    body_bytes = foot["body_bytes"]
+    global_scale = foot["global_scale_bytes"]
+    channel_scale = foot["channel_scale_bytes"]
+    n_roles = len({role_of(q) for q in targets})
+    if arm.kind == "signed_shared":
+        entries = 1 << (arm.k - VEC_DIM)               # magnitude table
+        sidecar = n_roles * entries * CB_ENTRY_BYTES
+    elif arm.kind == "full_shared":
+        sidecar = n_roles * (1 << arm.k) * CB_ENTRY_BYTES
+    elif arm.kind == "pertensor":
+        sidecar = len(targets) * (1 << arm.k) * CB_ENTRY_BYTES
+    else:  # iq / fp8cb / full_fixed / full_k14 — fixed or no learned table
+        sidecar = 0
+    total_bytes = body_bytes + global_scale + channel_scale + sidecar
+    return {"body_bpw": foot["body_bpw"], "body_bytes": body_bytes,
+            "sidecar_bytes": sidecar, "total_bytes": total_bytes,
+            "total_bpw": 8.0 * total_bytes / max(n_params, 1),
+            "n_params": n_params}
+
+
+def build_format_map_1b(arm: Arm1b, model, targets, imatrix, seed):
+    """Return format_map for measure_emulated_kl. Registers role specs and
+    shared codebooks as needed."""
+    # smoothing prep
+    wmap = {}
+    if arm.smooth_alpha is not None:
+        for name, mod in model.named_modules():
+            if isinstance(mod, nn.Linear):
+                q = canonical_linear_name(name)
+                if q in targets:
+                    wmap[q] = mod.weight.data
+    # resolve per-role or uniform format name
+    role_names = None
+    uniform = None
+    if arm.kind in ("signed_shared", "full_shared"):
+        cbs = train_shared_codebooks(model, targets, imatrix,
+                                     mode=arm.mode, k=arm.k, seed=seed)
+        role_names = register_role_specs(cbs, mode=arm.mode, k=arm.k,
+                                         scale_sweep=arm.scale_sweep,
+                                         tag=f"{arm.id}_s{seed}")
+    elif arm.kind == "full_fixed":
+        uni = _universal_k16().cuda() if torch.cuda.is_available() \
+            else _universal_k16()
+        name = f"_E1B_{arm.id}"
+        fr.REGISTRY.pop(name, None)
+        fr.register_format(dataclasses.replace(
+            fr.get_format("NVFP4_CB_K16"), name=name,
+            quantize_dequantize=make_shared_qdq(16, "full", uni,
+                                                arm.scale_sweep)))
+        uniform = name
+    elif arm.kind == "full_k14":
+        name = f"_E1B_{arm.id}"
+        fr.REGISTRY.pop(name, None)
+        fr.register_format(dataclasses.replace(
+            fr.get_format("NVFP4_CB_K14"), name=name,
+            quantize_dequantize=make_nvfp4_cb_qdq(14, "fp4", "full",
+                                                  arm.scale_sweep)))
+        uniform = name
+    elif arm.kind == "pertensor":
+        uni = _universal_k16().cuda() if torch.cuda.is_available() \
+            else _universal_k16()
+        name = f"_E1B_{arm.id}"
+
+        def pt_qdq(w, col_weights=None, _uni=uni):
+            v, wq = _vecs_and_wq(w, col_weights)
+            cb = learn_codebook(v, 16, grid="fp4", col_weights=wq,
+                                init=_uni, iters=3, seed=0)
+            fields = nvfp4_cb_fields(w, 16, grid="fp4", mode="full",
+                                     col_weights=col_weights, codebook=cb,
+                                     scale_sweep=arm.scale_sweep)
+            return nvfp4_cb_reconstruct(fields, 16, grid="fp4", mode="full",
+                                        codebook=cb).to(w.dtype)
+        fr.REGISTRY.pop(name, None)
+        fr.register_format(dataclasses.replace(
+            fr.get_format("NVFP4_CB_K16"), name=name, quantize_dequantize=pt_qdq))
+        uniform = name
+    else:  # iq / fp8cb
+        uniform = arm.fmt
+
+    fmap = {}
+    for q in targets:
+        cw = imatrix[q]["e_x2"].clone()
+        entry = {"format": role_names[role_of(q)] if role_names else uniform}
+        if arm.smooth_alpha is not None:
+            s = smooth_scale(wmap[q], imatrix[q]["amax"], arm.smooth_alpha)
+            entry["smooth_scale"] = s
+            cw = cw / (s * s)
+        entry["col_weights"] = cw
+        fmap[q] = entry
+    return fmap
+
+
+def run_arm_seed_1b(arm: Arm1b, seed, model, targets, imatrix, foot):
+    out_path = RESULTS1B / f"{arm.id}__seed{seed}.json"
+    if out_path.exists():
+        return json.loads(out_path.read_text())
+    fmap = build_format_map_1b(arm, model, targets, imatrix, seed)
+    res = measure_emulated_kl(
+        MODEL, fmap, WIKI, device=DEVICE, seqlen=SEQLEN, max_tokens=MAX_TOKENS,
+        act_emulation=not arm.weight_only, allow_act_fallback=False,
+        allow_missing_targets=False)
+    # sanity guards
+    assert res["n_targets_swapped"] == len(targets), (
+        f"{arm.id}: swapped {res['n_targets_swapped']} != {len(targets)}")
+    assert res["kl_confident"] > 1e-6, f"{arm.id}: KL==0 on a quantized arm"
+    rec = {"arm": arm.id, "seed": seed, "kind": arm.kind, "mode": arm.mode,
+           "scale_sweep": arm.scale_sweep, "weight_only": arm.weight_only,
+           "smooth_alpha": arm.smooth_alpha,
+           "kl_confident": res["kl_confident"], "kl_all": res["kl_all"],
+           "top1_agreement": res["top1_agreement"],
+           "n_targets_swapped": res["n_targets_swapped"],
+           "body_bpw": foot["body_bpw"], "total_bpw": foot["total_bpw"],
+           "total_bytes": foot["total_bytes"], "sidecar_bytes": foot["sidecar_bytes"],
+           "provenance": {**res["provenance"], "git_commit": _git_commit()}}
+    out_path.write_text(json.dumps(rec, indent=2))
+    return rec
+
+
+def _ms(xs):
+    xs = list(xs)
+    return statistics.mean(xs), (statistics.pstdev(xs) if len(xs) > 1 else 0.0)
+
+
+def run_exp1b(model, targets, arms_filter=None):
+    RESULTS1B.mkdir(parents=True, exist_ok=True)
+    for seed in SEEDS:
+        get_imatrix(model, targets, seed)
+    arms = build_arms_1b()
+    if arms_filter:
+        arms = [a for a in arms if a.id in arms_filter]
+    foots = {}
+    for arm in arms:
+        foot = footprint_1b(arm, targets)
+        foots[arm.id] = foot
+        if not arm.kl:
+            print(f"[foot] {arm.id}: total_bpw={foot['total_bpw']:.3f} "
+                  f"(sidecar {foot['sidecar_bytes']/1e6:.1f} MB) — KL skipped")
+            continue
+        for seed in arm.seeds:
+            p = RESULTS1B / f"{arm.id}__seed{seed}.json"
+            if p.exists():
+                print(f"[skip] {arm.id} s{seed}")
+                continue
+            print(f"[run ] {arm.id} s{seed} body={foot['body_bpw']:.3f} "
+                  f"total={foot['total_bpw']:.3f} bpw")
+            im = get_imatrix(model, targets, seed)
+            rec = run_arm_seed_1b(arm, seed, model, targets, im, foot)
+            print(f"       KL_conf={rec['kl_confident']:.4f} "
+                  f"top1={rec['top1_agreement']:.3f} nsw={rec['n_targets_swapped']}")
+    return foots
+
+
+def write_report_1b(targets):
+    arms = build_arms_1b()
+    foots = {a.id: footprint_1b(a, targets) for a in arms}
+    agg = {}
+    for a in arms:
+        recs = [json.loads((RESULTS1B / f"{a.id}__seed{s}.json").read_text())
+                for s in a.seeds if (RESULTS1B / f"{a.id}__seed{s}.json").exists()]
+        if recs:
+            klc = _ms(r["kl_confident"] for r in recs)
+            kla = _ms(r["kl_all"] for r in recs)
+            t1 = _ms(r["top1_agreement"] for r in recs)
+            agg[a.id] = {"klc": klc, "kla": kla, "t1": t1, "n": len(recs),
+                         "nsw": recs[0]["n_targets_swapped"]}
+    doc = Path("/home/rob/prismaquant/docs/nvfp4-cb-plan/exp1b_0p6b_corrected.md")
+    L = []
+    L.append("# NVFP4-CB Phase-0 exp-1b — CORRECTED CB-vs-IQ (Qwen3-0.6B)\n")
+    L.append("> **EMULATION GATE, not the served metric.** Whole-model "
+             "emulated forward KL-vs-BF16 (fp32, held-out wiki.test.raw, "
+             "seqlen 512 × 8192 tok). Corrects exp-1's rendering asymmetry: "
+             "CB now uses the SAME E4M3-legal scale sweep the IQ arms always "
+             "had, adds the sign-factored `signed` mode, and byte-matches via "
+             "a SHARED per-role learned codebook. A kernel phase must "
+             "re-confirm on served vLLM/llama.cpp KL before promotion.\n")
+    L.append(f"- git `{_git_commit()}` · {len(targets)} target Linears · "
+             f"7 roles · imatrix E[x²] col_weights (paired per seed).")
+    L.append("- Compute note: full-mode k16 + sweep costs ~56 s/Linear "
+             "(≈3 h/seed) vs signed-S16 ~0.3 s/Linear — so signed S16 is the "
+             "practical champion run at 4 seeds; the full-k16 arms are 1-seed "
+             "CEILING references, and per-tensor-k16 is footprint-only.\n")
+    L.append("## Per-arm results\n")
+    L.append("| Arm | seeds | act | body bpw | TOTAL bpw | KL_conf mean±std | "
+             "KL_all | top1 | n_swap |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
+    order = [a.id for a in arms]
+    for aid in order:
+        f = foots[aid]
+        a = next(x for x in arms if x.id == aid)
+        act = "W-only" if a.weight_only else "W4A4/W8A8"
+        if aid in agg:
+            g = agg[aid]
+            L.append(f"| {aid} | {g['n']} | {act} | {f['body_bpw']:.3f} | "
+                     f"{f['total_bpw']:.3f} | {g['klc'][0]:.4f}±{g['klc'][1]:.4f} "
+                     f"| {g['kla'][0]:.4f} | {g['t1'][0]:.3f} | {g['nsw']} |")
+        else:
+            L.append(f"| {aid} | — | {act} | {f['body_bpw']:.3f} | "
+                     f"{f['total_bpw']:.3f} | (footprint only) | — | — | — |")
+    L.append("")
+
+    def kl(aid):
+        return agg[aid]["klc"] if aid in agg else None
+
+    L.append("## Decision-gate verdicts\n")
+    # (a) champion vs IQ2_S at matched TOTAL bytes, W4A4 and weight-only
+    L.append("### (a) Does corrected-CB close the exp-1 +66% IQ2_S gap?\n")
+    iq, ch = kl("IQ2S"), kl("SIG16_shared")
+    if iq and ch:
+        pct = 100 * (ch[0] - iq[0]) / iq[0]
+        std = max(iq[1], ch[1])
+        tb_iq = foots["IQ2S"]["total_bpw"]
+        tb_ch = foots["SIG16_shared"]["total_bpw"]
+        verd = ("CLOSED — champion within ±1σ of IQ2_S" if ch[0] - iq[0] <= std
+                else (f"still LOSES IQ2_S by {pct:+.1f}%"))
+        L.append(f"- **W4A4 (served-faithful):** signed-S16-shared "
+                 f"{ch[0]:.4f} vs IQ2_S {iq[0]:.4f} ({pct:+.1f}%, σ={std:.4f}) "
+                 f"at matched TOTAL bytes ({tb_ch:.3f} vs {tb_iq:.3f} bpw) → "
+                 f"**{verd}** (exp-1 was +66%).")
+    iqw, chw = kl("IQ2S_wo"), kl("SIG16_shared_wo")
+    if iqw and chw:
+        pct = 100 * (chw[0] - iqw[0]) / iqw[0]
+        std = max(iqw[1], chw[1])
+        verd = ("CLOSED within ±1σ" if chw[0] - iqw[0] <= std
+                else f"LOSES by {pct:+.1f}%")
+        kill = ("" if chw[0] - iqw[0] <= std or pct <= 15 else
+                " — **>15% on BOTH W4A4 and weight-only = KILL signal**"
+                if iq and ch and (ch[0] - iq[0] > max(iq[1], ch[1]))
+                and pct > 15 else "")
+        L.append(f"- **Weight-only (pure codebook-vs-codebook):** "
+                 f"signed-S16-shared {chw[0]:.4f} vs IQ2_S {iqw[0]:.4f} "
+                 f"({pct:+.1f}%, σ={std:.4f}) → **{verd}**{kill}.")
+    fk = kl("FULL_k16_shared")
+    if fk and iq:
+        L.append(f"- **Ceiling (full-k16 shared, 1 seed):** {fk[0]:.4f} vs "
+                 f"IQ2_S {iq[0]:.4f} — the best flat-full CB can do at 2.5 bpw; "
+                 f"if signed≈full-k16 here, the 187× cheaper signed mode is the "
+                 f"right carrier.")
+    L.append("")
+    # (b) scale-sweep lever
+    L.append("### (b) Scale-sweep lever size (fixed-full k14, on vs off)\n")
+    off, on = kl("FULL_k14_sweepoff"), kl("FULL_k14_sweepon")
+    if off and on:
+        pct = 100 * (off[0] - on[0]) / off[0]
+        L.append(f"- sweep OFF {off[0]:.4f} (reproduces exp-1 B_fixed_full_k14 "
+                 f"≈3.76) → sweep ON {on[0]:.4f} = **{pct:+.1f}% KL** from the "
+                 f"scale sweep alone. This is the rendering-asymmetry the exp-1 "
+                 f"CB-vs-IQ comparison suffered.")
+    L.append("")
+    # (c) shared vs per-tensor byte reality
+    L.append("### (c) Shared-vs-per-tensor byte reality\n")
+    L.append(f"- SHARED per-role sidecar (signed): "
+             f"{foots['SIG16_shared']['sidecar_bytes']/1e3:.1f} KB → total "
+             f"{foots['SIG16_shared']['total_bpw']:.3f} bpw (≈0 over body).")
+    L.append(f"- SHARED per-role sidecar (full-k16): "
+             f"{foots['FULL_k16_shared']['sidecar_bytes']/1e6:.2f} MB → total "
+             f"{foots['FULL_k16_shared']['total_bpw']:.3f} bpw.")
+    pt = foots['LEARN_k16_pertensor']
+    small_bpw = (1 << 16) * CB_ENTRY_BYTES * 8 / 1.0e6   # ~1M-param Linear
+    L.append(f"- PER-TENSOR k16 sidecar: {pt['sidecar_bytes']/1e6:.1f} MB → "
+             f"total **{pt['total_bpw']:.3f} bpw** "
+             f"(+{pt['total_bpw'] - pt['body_bpw']:.2f} bpw model-wide; but "
+             f"~+{small_bpw:.1f} bpw on a 1M-param Linear — the small-N tensors "
+             f"the coordinator flagged). NOT byte-competitive; this is why the "
+             f"champion shares codebooks per-role (sidecar → ≈0).")
+    L.append("")
+    # (d) smoothing on top of sweep
+    L.append("### (d) Smoothing on top of the sweep\n")
+    base, sm = kl("SIG16_shared"), kl("SIG16_shared_smooth025")
+    if base and sm:
+        pct = 100 * (base[0] - sm[0]) / base[0]
+        std = max(base[1], sm[1])
+        verd = ("helps beyond noise" if base[0] - sm[0] > std else
+                "within between-seed noise")
+        L.append(f"- signed-S16-shared {base[0]:.4f} → +smooth α=0.25 "
+                 f"{sm[0]:.4f} ({pct:+.1f}%, σ={std:.4f}) → **{verd}**.")
+    L.append("")
+    L.append("## Caveats\n")
+    L.append("- Emulation gate only, 0.6B triage; 4B + served re-confirm "
+             "remain. Uniform ~2.5 bpw on ALL 196 Linears heavily damages a "
+             "0.6B model (top1 well below 1.0 for every 2.5-bpp arm incl. "
+             "IQ2_S) — the CB-vs-IQ DELTA is the signal, not absolute KL.")
+    L.append("- Full-mode k16 is 1-seed only (56 s/Linear); signed S16 (same "
+             "2.5 bpw, 0.3 s/Linear, relerr within ~8% of full-k16) is the "
+             "practical champion carried at 4 seeds.")
+    L.append("- Shared codebooks trained on ≤2^20 pooled per-role vectors "
+             "(subsampled for Lloyd tractability); CUDA Lloyd tie-noise per "
+             "seed as in exp-1.")
+    doc.write_text("\n".join(L) + "\n")
+    return doc
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--report-only", action="store_true")
     ap.add_argument("--arms", default=None, help="comma-list of arm ids")
+    ap.add_argument("--exp1b", action="store_true",
+                    help="run the corrected CB-vs-IQ rerun (scale_sweep + "
+                         "signed + shared-per-role codebooks)")
     args = ap.parse_args()
+
+    if args.exp1b:
+        RESULTS1B.mkdir(parents=True, exist_ok=True)
+        register_variants()
+        model = _load_model()
+        targets, n_dim, n_head = select_targets(model)
+        print(f"[targets] {len(targets)} Linears; excluded dim={n_dim} "
+              f"head={n_head}; roles={sorted({role_of(q) for q in targets})}")
+        if not args.report_only:
+            run_exp1b(model, targets,
+                      set(args.arms.split(",")) if args.arms else None)
+        doc = write_report_1b(targets)
+        print(f"[report] wrote {doc}")
+        return
 
     RESULTS.mkdir(parents=True, exist_ok=True)
     register_variants()
