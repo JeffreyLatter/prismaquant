@@ -373,3 +373,23 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
   gate's predictions (0.019 / ~2.21) and (b) the speed table vs vllm-gguf-plugin
   IQ4_XS and BF16 on the same box. Deliverable:
   docs/nvfp4-cb-plan/serve_prototype_0p6b.md.
+- **K2 LANDED (a4bf317), ACCEPTED (+ hygiene fix: kernel tests importorskip
+  outside serving env; 25/25 re-verified independently):**
+  * **EMULATION GATE VALIDATED ON SERVED METAL: served/emu = 1.09× (FP8_CB_K44:
+    0.0208 vs 0.019) and 1.02× (NVFP4_CB_K16: 2.246 vs 2.21).** Every Phase-0
+    number retroactively hardens. Zero vLLM-core monkeypatching needed.
+  * FP8_CB_K44 SERVED: conf-KL 0.021, top1 99.4%, PPL 34.98 vs BF16 34.32
+    (+1.9%) at 5.5 bpw — ship-band quality on the real stack (0.6B, top-20 KL).
+  * Speed: prototype Triton = 10× TTFT / 0.58× decode — BUT 0.6B cannot expose
+    the prefill tax (IQ4_XS GGUF ≈ 1.1× BF16 TTFT here; the 42 tok/s IQ tax is
+    a 295B-scale phenomenon). Speed verdict at 0.6B = kernel immaturity only;
+    the speed CASE still rests on the measured Hy3-scale evidence.
+- **FABLE DESIGN INSIGHT → next step (prototype ii+): TRANSIENT per-layer
+  expansion + STOCK native GEMM for prefill.** INV-1 forbids RESIDENT dense
+  expansion; a per-layer TRANSIENT expansion at prefill is bounded (one layer's
+  FP8/NVFP4-packed weights) and amortizes over M≥512: FP8_CB → expand tile to
+  FP8 → vLLM's stock W8A8 GEMM; NVFP4_CB → expand to packed NVFP4 nibbles +
+  E4M3 scales → the stock CUTLASS block-scaled GEMM. Near-native prefill for
+  ~days of work, NO CuTe mainloop fork. Decode keeps the (tunable) Triton path.
+  CUTLASS-fused (iii) drops to "only if transient overhead proves material at
+  scale."
