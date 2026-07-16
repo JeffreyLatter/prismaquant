@@ -1,5 +1,11 @@
-"""NVFP4-CB / FP8-CB codebook format tests (Milestone A, emulation)."""
+"""NVFP4-CB / FP8-CB codebook format tests (Milestone A emulation +
+Milestone B byte packers / exporter)."""
 from __future__ import annotations
+
+import json
+import shutil
+import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -401,3 +407,269 @@ def test_menu_registers_and_resolves():
     assert len(fam) == len(names)
     bpps = [s.effective_bits for s in fam]
     assert bpps == sorted(bpps)
+
+
+# ===========================================================================
+# Milestone B — byte packers (format-pipeline.md §1 / LAYOUT.md contract).
+# ===========================================================================
+
+# (grid, mode, k): full/product/signed × both grids, the required matrix.
+_PACK_CASES = [
+    ("fp4", "product", 12), ("fp4", "product", 14), ("fp4", "product", 16),
+    ("fp4", "full", 12), ("fp4", "full", 14), ("fp4", "full", 16),
+    ("fp4", "signed", 16),
+    ("fp8", "product", 36), ("fp8", "product", 44),
+]
+
+
+def _codebook_for(w, grid, mode, k):
+    """Fixed lattice by default; an explicit grid-valued table where the flat
+    lattice is infeasible (full mode, k>MAX_FLAT_K) so k=16-full is still
+    covered. The pack/unpack round-trip is codebook-quality-agnostic, so a
+    cheap snapped random table suffices (no need for a full 2^16 Lloyd)."""
+    if mode == "full" and k > cb.MAX_FLAT_K:
+        g = torch.Generator(device=w.device).manual_seed(k)
+        raw = torch.randn(1 << k, cb.VEC_DIM, generator=g, device=w.device)
+        return cb._snap_to_grid(raw, grid)
+    return None
+
+
+@pytest.mark.parametrize("grid,mode,k", _PACK_CASES)
+def test_nvfp4_cb_type_size_and_packed_shape(grid, mode, k):
+    ts = cb.nvfp4_cb_type_size(k, grid)
+    assert ts == 4 * k + (16 if grid == "fp4" else 0)
+    w = torch.randn(48, 512) * 0.3
+    C = _codebook_for(w, grid, mode, k)
+    fields = cb.nvfp4_cb_fields(w, k, grid=grid, mode=mode, codebook=C)
+    packed = cb.nvfp4_cb_assemble_bytes(fields, k, grid, mode)
+    assert packed.dtype == torch.uint8
+    assert packed.ndim == 2                      # (rows, bytes) — never flat
+    assert packed.shape == (48, (512 // 256) * ts)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("grid,mode,k", _PACK_CASES)
+def test_nvfp4_cb_pack_unpack_matches_emulation(device, grid, mode, k):
+    """THE contract: reconstruct(unpack(assemble(fields))) is BIT-IDENTICAL to
+    the emulation qdq output the cost measurement scored — with scale_sweep on,
+    on CPU and CUDA, for every mode×grid×k."""
+    torch.manual_seed(0)
+    w = torch.randn(48, 512, device=device) * 0.3
+    cw = torch.rand(512, device=device) + 0.05
+    C = _codebook_for(w, grid, mode, k)
+    fields = cb.nvfp4_cb_fields(w, k, grid=grid, mode=mode, col_weights=cw,
+                                codebook=C, scale_sweep=True)
+    packed = cb.nvfp4_cb_assemble_bytes(fields, k, grid, mode)
+    assert packed.device == w.device
+    scales = fields["scales"] if grid == "fp8" else None
+    up = cb.nvfp4_cb_unpack(packed, k, grid, mode, tuple(w.shape),
+                            codebook=fields["codebook"], scales=scales)
+    rec = cb.nvfp4_cb_reconstruct(up, k, grid=grid, mode=mode).to(w.dtype)
+    emu = cb.nvfp4_cb_reconstruct(fields, k, grid=grid, mode=mode).to(w.dtype)
+    assert torch.equal(rec, emu)
+
+
+def test_nvfp4_cb_assemble_asserts_type_size():
+    # A tampered fields dict whose scale plane is the wrong width must trip the
+    # type_size assert rather than silently emit off-layout bytes.
+    w = torch.randn(16, 512) * 0.3
+    fields = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="product")
+    fields["scales"] = fields["scales"][:, :-1]      # drop one group scale
+    with pytest.raises(Exception):
+        cb.nvfp4_cb_assemble_bytes(fields, 14, "fp4", "product")
+
+
+def test_nvfp4_cb_unpack_fp8_requires_scales():
+    w = torch.randn(16, 512) * 0.3
+    fields = cb.nvfp4_cb_fields(w, 40, grid="fp8", mode="product")
+    packed = cb.nvfp4_cb_assemble_bytes(fields, 40, "fp8", "product")
+    with pytest.raises(ValueError, match="no on-disk scale plane"):
+        cb.nvfp4_cb_unpack(packed, 40, "fp8", "product", tuple(w.shape),
+                           codebook=fields["codebook"])
+
+
+def test_nvfp4_cb_pack_stacked_experts():
+    torch.manual_seed(1)
+    w = torch.randn(3, 32, 256) * 0.3
+    cw = torch.rand(3, 1, 256) + 0.05
+    fields = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode="product",
+                                col_weights=cw)
+    packed = cb.nvfp4_cb_assemble_bytes(fields, 12, "fp4", "product")
+    assert packed.shape == (3 * 32, (256 // 256) * cb.nvfp4_cb_type_size(
+        12, "fp4"))
+    up = cb.nvfp4_cb_unpack(packed, 12, "fp4", "product", tuple(w.shape),
+                            codebook=fields["codebook"])
+    rec = cb.nvfp4_cb_reconstruct(up, 12, grid="fp4", mode="product").to(
+        w.dtype)
+    emu = cb.nvfp4_cb_reconstruct(fields, 12, grid="fp4",
+                                  mode="product").to(w.dtype)
+    assert torch.equal(rec, emu)
+
+
+# ===========================================================================
+# Milestone B — exporter (prismaquant.export_nvfp4_cb). CPU-only for
+# bit-exactness (learned Lloyd / VQ argmin ties are device-dependent).
+# ===========================================================================
+
+# Mandated scratch root — never /tmp (CLAUDE.md landmine).
+_EXPORT_ROOT = Path("/home/rob/dq-runs/nvfp4-cb-phase0/export-test/pytest")
+
+
+@pytest.fixture
+def export_dir():
+    _EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    d = Path(tempfile.mkdtemp(dir=_EXPORT_ROOT))
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _tiny_model(mdl: Path, in_f: int = 256):
+    """2-layer synthetic HF dir: two 256-in Linears + a norm sidecar."""
+    from safetensors.torch import save_file
+
+    mdl.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(0)
+    tens = {
+        "model.layers.0.mlp.gate_proj.weight":
+            (torch.randn(128, in_f) * 0.3).to(torch.bfloat16),
+        "model.layers.1.mlp.gate_proj.weight":
+            (torch.randn(128, in_f) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(in_f, dtype=torch.bfloat16),
+    }
+    save_file(tens, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(
+        json.dumps({"architectures": ["Tiny"], "hidden_size": in_f}))
+    return tens
+
+
+def _write_assignment(path: Path, mapping: dict):
+    path.write_text(json.dumps(mapping))
+
+
+@pytest.mark.parametrize("source", ["lattice", "learned"])
+def test_exporter_roundtrip_equals_emulation(export_dir, source):
+    from safetensors.torch import load_file
+
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl, out = export_dir / "model", export_dir / "out"
+    tens = _tiny_model(mdl)
+    assign = {
+        "model.layers.0.mlp.gate_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+        "model.layers.1.mlp.gate_proj": {"data_type": "fp8_cb", "cb_k": 40},
+    }
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, assign)
+    cw = {q: torch.rand(256) + 0.05 for q in assign}
+    spec = ({"source": "learned", "train": True}
+            if source == "learned" else {"source": "lattice"})
+
+    counts = export_nvfp4_cb(mdl, apath, out, cw,
+                             shared_codebook_spec=spec, device="cpu")
+    assert counts["NVFP4_CB_K16"] == 1 and counts["FP8_CB_K40"] == 1
+
+    qc = json.loads((out / "quant_config.json").read_text())
+    assert qc["quant_method"] == "prismaquant"
+    # non-target norm copied verbatim; config.json copied + pointer injected.
+    ot = load_file(str(out / "model.safetensors"))
+    assert "model.norm.weight" in ot
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["quantization_config"]["quant_method"] == "prismaquant"
+
+    for g in qc["config_groups"].values():
+        s = g["scheme"]
+        grid, mode, k = s["grid"], s["mode"], s["k"]
+        ref = s["codebook_ref"]
+        codebook = (tuple(ot[r].float() for r in ref)
+                    if isinstance(ref, list) else ot[ref].float())
+        for q in g["targets"]:
+            w = tens[q + ".weight"].float()
+            packed = ot[q + ".cb_qweight"]
+            assert packed.dtype == torch.uint8
+            scales = ot.get(q + ".weight_scale")
+            if grid == "fp8":
+                assert scales is not None and scales.numel() == 128
+                scales = scales.reshape(-1, 1)
+            else:
+                assert (q + ".weight_scale") not in ot   # fp4: scales in bytes
+            up = cb.nvfp4_cb_unpack(packed, k, grid, mode, tuple(w.shape),
+                                    codebook=codebook, scales=scales)
+            rec = cb.nvfp4_cb_reconstruct(up, k, grid=grid, mode=mode).float()
+            emu_f = cb.nvfp4_cb_fields(w, k, grid=grid, mode=mode,
+                                       col_weights=cw[q], codebook=codebook)
+            emu = cb.nvfp4_cb_reconstruct(emu_f, k, grid=grid,
+                                          mode=mode).float()
+            assert torch.equal(rec, emu)
+
+
+def test_exporter_rejects_unknown_format(export_dir):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl = export_dir / "model"
+    _tiny_model(mdl)
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, {
+        "model.layers.0.mlp.gate_proj": {"data_type": "nv_fp", "bits": 4},
+    })
+    cw = {"model.layers.0.mlp.gate_proj": torch.rand(256) + 0.05}
+    with pytest.raises(ValueError, match="cannot carry"):
+        export_nvfp4_cb(mdl, apath, export_dir / "out", cw, device="cpu")
+
+
+def test_exporter_rejects_non_multiple_of_256(export_dir):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl = export_dir / "model"
+    _tiny_model(mdl, in_f=300)          # 300 % 256 != 0
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, {
+        "model.layers.0.mlp.gate_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+    })
+    cw = {"model.layers.0.mlp.gate_proj": torch.rand(300) + 0.05}
+    with pytest.raises(ValueError, match="multiple of 256"):
+        export_nvfp4_cb(mdl, apath, export_dir / "out", cw, device="cpu")
+
+
+def test_exporter_rejects_missing_col_weights(export_dir):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl = export_dir / "model"
+    _tiny_model(mdl)
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, {
+        "model.layers.0.mlp.gate_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+    })
+    with pytest.raises(ValueError, match="no col_weights"):
+        export_nvfp4_cb(mdl, apath, export_dir / "out", {}, device="cpu")
+
+
+def test_exporter_rejects_missing_learned_sidecar(export_dir):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl = export_dir / "model"
+    _tiny_model(mdl)
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, {
+        "model.layers.0.mlp.gate_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+    })
+    cw = {"model.layers.0.mlp.gate_proj": torch.rand(256) + 0.05}
+    # learned source, no training, no supplied codebooks -> missing sidecar.
+    with pytest.raises(ValueError, match="missing learned sidecar"):
+        export_nvfp4_cb(mdl, apath, export_dir / "out", cw,
+                        shared_codebook_spec={"source": "learned",
+                                              "codebooks": {}}, device="cpu")
+
+
+def test_export_native_compressed_hard_fails_on_cb():
+    """A CB assignment reaching the compressed-tensors exporter must raise,
+    not silently coerce to BF16 (mirrors the GGUF wrong-container guard)."""
+    from prismaquant.export_native_compressed import (
+        _coerce_runtime_legal_assignment,
+    )
+    with pytest.raises(ValueError, match="nvfp4_cb container"):
+        _coerce_runtime_legal_assignment(
+            "unused-model",
+            {"model.layers.0.mlp.gate_proj": "NVFP4_CB_K16"},
+        )

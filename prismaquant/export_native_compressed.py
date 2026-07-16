@@ -1228,7 +1228,19 @@ def _coerce_runtime_legal_assignment(
             continue
         if fmt_canonical not in FORMAT_SCHEME:
             from prismaquant.gguf_formats import GGUF_BLOCK_BYTES
+            from prismaquant.layer_config import _NVFP4_CB_FORMAT_NAMES
 
+            if fmt_canonical in _NVFP4_CB_FORMAT_NAMES:
+                # Wrong container: an NVFP4-CB / FP8-CB assignment reaching the
+                # compressed-tensors exporter means the pipeline was launched
+                # without EXPORT_CONTAINER=nvfp4_cb. Stock compressed-tensors
+                # schemes cannot express codebooks; coercing to BF16 would ship
+                # a ~16 bpp artifact unrelated to the allocated budget.
+                raise ValueError(
+                    f"{qname}: format {fmt_canonical} ships via the nvfp4_cb "
+                    f"container (prismaquant.export_nvfp4_cb / "
+                    f"EXPORT_CONTAINER=nvfp4_cb), not compressed-tensors"
+                )
             if fmt_canonical in GGUF_BLOCK_BYTES:
                 # Wrong container, not a research format: a GGUF assignment
                 # reaching the compressed-tensors exporter means the pipeline
