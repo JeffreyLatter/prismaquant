@@ -431,3 +431,11 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
   the plain command for a normal ruling (approved), self-reported, and asked
   that Robert be told. Norm reinforced: outage = wait, never reshape around
   permission checks. No GPU was touched; the check itself was legitimate.
+- **Course correction (Fable error, agent-caught):** my v1.5 normalization fix
+  had an impossible test gate — the 1.5× sweep span holds only ~4.7 E4M3 steps
+  under ANY per-group snap; normalization improves stored granularity
+  (22%→6-12.5%) but not candidate diversity. The 4-bit sub-table (16 levels
+  over the span ≈2.6% steps) is where two-tier's negative tax comes from.
+  v1.5 patch SKIPPED as a dead-end intermediate; formats agent redirected to
+  implement the two-tier spec directly as layout v2 (formats+packer+exporter
+  only; plugin compose after the serving pipeline lands; v1 stays decodable).
