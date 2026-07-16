@@ -186,3 +186,23 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   Scale-sweep for CB encode dispatched (E4M3-legal candidates spanning the
   JSO 6→4 clip range, weighted original-domain objective, fixed-point,
   default-ON). 0.6B rerun follows, then 4B.
+
+## Session 2 (Opus 4.8 + ultracode; Fable spend limit hit mid-scale-sweep)
+
+- Fable formats agent died on account spend limit mid-scale-sweep (uncommitted,
+  tree clean at c3f8c6d). Session switched to Opus 4.8, ultracode on. Resumed.
+- **Wave 3b (running):** scale-sweep implementation re-dispatched to the
+  (resumed) formats agent — the exp-1 IQ arms rendered with the gguf
+  27-candidate scale sweep + WLS refit while CB arms used one-shot amax/6, a
+  rendering confound INSIDE exp-1. Fixing: default-on E4M3-legal scale sweep
+  for all 3 CB modes.
+- **RD-ceiling study (running, parallel, independent):** the decision-critical
+  orthogonal question — is the +66% IQ gap the FP4-GRID CONSTRAINT (fundamental
+  ceiling, no encoder escapes) or encoder/rendering (fixable)? Pure numerical
+  RD study: unconstrained vs FP4-grid vs FP8-grid Lloyd vs real IQ tables, at
+  matched codebook size, on Gaussian/heavy-tail/REAL-0.6B-weight sources. If
+  FP4-grid tax >30% → format ceiling, kill early before 4B+kernel. If <15% →
+  gap is fixable, push the corrected rerun. → docs/nvfp4-cb-plan/rd_ceiling_study.md
+- NEXT (blocked on both): corrected 0.6B rerun (learned+signed+sweep+α0.25,
+  incl. exact 2.5bpp IQ2_S byte-match + weight-only format-isolation arm),
+  then the formal 4B gate.
