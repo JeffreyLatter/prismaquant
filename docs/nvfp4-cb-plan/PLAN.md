@@ -162,6 +162,20 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   grid does not close at 2.5 bpw on 0.6B. Smoothing-on-sweep null (+2.9%,
   n.s.); per-tensor k16 sidecar +0.93 bpw model-wide (~2 bpw small-N) →
   shared is mandatory. 4B + the RD-ceiling study cross-check pending.
+- 2026-07-16 (exp-1b REFRAMED to the decision number): per rd_ceiling_study.md,
+  matched-bytes loss is the EXPECTED ~0.19 bpw structural scale-packaging tax
+  (mitigable via in-kernel two-tier scales), NOT a kill. Driver --exp1b now
+  computes the DECISION metric — a fast learned-SHARED-per-role break-even
+  sweep (product mode, sweep ON; conservative upper bound) + FP8_CB rungs + IQ
+  ladder — and the native-FP4 bpw premium. **RESULT (exp1b_0p6b_corrected.md):
+  NVFP4_CB reaches IQ2_S KL (1.58) at ~2.71 bpw ⇒ premium ~+0.15 bpw; reaches
+  IQ3_XXS KL (0.41) at ~3.44 bpw ⇒ +0.38 (premium GROWS with bpw); at 3.0 bpw
+  CB BEATS IQ2_S outright (0.74 vs 1.58, top1 0.74 vs 0.57) while decoding
+  native FP4.** FP8_CB mid-range: NO per-byte win over IQ4_XS (0.058@4.53 vs
+  0.060@4.25) — mid-range is IQ/kernel-bound. Verdict: **GO to kernel phase for
+  the sub-3-bpw NVFP4_CB lane** (premium small+structural+mitigable), pending
+  the two-tier-scale kernel cost call; 4B + served re-confirm required.
+  full-k16/sweep-on-k14/k16-fixed arms dropped to footprint-only (redundant).
 - Wave-1 COMPLETE (all accepted): formats 8aeaec0+9e9838a (fix cycle: Lloyd
   scatter_add — dense onehot was a 51GB trap at 27B scale; n_sub product
   decomposition — FP8_CB now functional via 4×2-dim sub-codebooks, 9-12-bit
