@@ -189,22 +189,40 @@ def _fixed_lattice_cpu(k: int, grid: str, d: int) -> torch.Tensor:
 
 
 def _build_lattice(k: int, grid: str, d: int) -> torch.Tensor:
-    """Deterministic universal lattice: grid-snapped Lloyd on seeded
-    standard-Gaussian d-dim samples. Regenerated identically on cache miss.
+    """Deterministic universal lattice: grid-snapped Lloyd on seeded samples
+    drawn from the *post-normalization* distribution each grid's encoder
+    actually produces. Regenerated on cache miss.
 
-    The fp8 family scales rows by amax/448, so scaled vectors live at
-    ~sigma * 448/amax_sigma; train that grid's lattice at the matching
-    scale (amax ~ 4 sigma for typical Linear widths) or the codewords
-    would cluster in ±4 against ±448 data."""
+    Both families must train at the data scale or the codewords cluster far
+    from the data and reconstruction collapses (2026-07-15: the original fp4
+    path trained on standard N(0,1) while NVFP4 group-16 normalization yields
+    normalized weights of std ~2.9 / absmax ~6, giving whole-model emulated
+    KL ~15 / top1 ~0 — a measurement bug that would have falsely killed the
+    family). Fixes:
+      * fp8 — rows scale by amax/448, so scaled vectors live at
+        ~sigma·448/amax_sigma; train at that scale (amax ~ 4 sigma).
+      * fp4 — group-16 amax→6 normalization; train on genuinely NVFP4-
+        normalized Gaussian weights via the encoder's own
+        ``_scale_and_vectorize`` (no hand-tuned scale constant), so the
+        lattice matches the exact distribution the encoder feeds it.
+    """
     K = 1 << k
     gen = torch.Generator(device="cpu").manual_seed(_LATTICE_SEED + k * 131 + d)
     m = max(_LATTICE_SAMPLES, K * 16)
-    samples = torch.randn(m, d, generator=gen)
     if grid == "fp8":
-        samples = samples * (FP8_ELEMENT_MAX / 4.0)
-    perm = torch.randperm(m, generator=gen)[:K]
+        samples = torch.randn(m, d, generator=gen) * (FP8_ELEMENT_MAX / 4.0)
+    else:  # fp4: normalized-weight samples at the true encoder scale.
+        in_f = 512  # multiple of the group-16 scale window
+        n8 = (m * d + VEC_DIM - 1) // VEC_DIM
+        rows = (n8 * VEC_DIM + in_f - 1) // in_f
+        w = torch.randn(rows, in_f, generator=gen)
+        vectors, _, _ = _scale_and_vectorize(w, "fp4")   # (rows*64, 8), std~2.9
+        samples = vectors.reshape(-1, d)[:m].contiguous()
+    if torch.cuda.is_available():
+        samples = samples.cuda()
+    perm = torch.randperm(samples.shape[0], generator=gen).to(samples.device)[:K]
     init = samples[perm]
-    return _lloyd(samples, init, grid, None, _LATTICE_ITERS, _LATTICE_SEED)
+    return _lloyd(samples, init, grid, None, _LATTICE_ITERS, _LATTICE_SEED).cpu()
 
 
 def fixed_lattice(k: int, grid: str, d: int = 8) -> torch.Tensor:

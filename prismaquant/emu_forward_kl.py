@@ -97,7 +97,7 @@ class _WeightSwapper:
     """Context manager: swap target Linear weights + hook activations, restore."""
 
     def __init__(self, model, targets, *, act_emulation: bool):
-        # targets: list of (qname, module, spec, col_weights)
+        # targets: list of (qname, module, spec, col_weights, smooth_scale)
         self._targets = targets
         self._act_emulation = act_emulation
         self._orig: list[tuple[object, torch.Tensor]] = []
@@ -109,15 +109,22 @@ class _WeightSwapper:
         self.fallback_counts: dict[tuple[str, str], int] = {}
 
     def __enter__(self):
-        for qname, mod, spec, cw in self._targets:
+        for qname, mod, spec, cw, smooth in self._targets:
             w = mod.weight.data
-            w_hat = _render_weight(spec, w, cw).to(dtype=w.dtype, device=w.device)
+            # SmoothQuant fold: quantize W' = W·diag(s) (s over the input dim);
+            # the inverse activation scale x→x/s is applied in the act hook so
+            # the effective compute (x/s)@(W diag(s))^T = x@W^T is preserved and
+            # only the *rounded* weight/activation buckets shift. col_weights
+            # (E[x'^2]=E[x^2]/s^2) are recomputed in lockstep by the caller.
+            w_in = w if smooth is None else w * smooth.to(w.device, w.dtype)
+            w_hat = _render_weight(spec, w_in, cw).to(dtype=w.dtype, device=w.device)
             self._orig.append((mod, w))  # keep original tensor (still resident)
             mod.weight.data = w_hat
             if self._act_emulation and _wants_act_emulation(spec):
                 self._handles.append(
                     mod.register_forward_pre_hook(
-                        _make_act_hook(spec, qname, self.fallback_counts)))
+                        _make_act_hook(spec, qname, self.fallback_counts,
+                                       smooth_scale=smooth)))
         return self
 
     def __exit__(self, *exc):
@@ -134,6 +141,7 @@ def _make_act_hook(
     spec: fr.FormatSpec,
     qname: str,
     fallback_counts: dict[tuple[str, str], int],
+    smooth_scale: torch.Tensor | None = None,
 ):
     aqdq = spec.activation_quantize_dequantize
     key = (qname, spec.name)
@@ -142,6 +150,8 @@ def _make_act_hook(
         if not args:
             return args
         x = args[0]
+        if smooth_scale is not None:
+            x = x / smooth_scale.to(x.device, x.dtype)
         try:
             x_hat = aqdq(x)
         except Exception:
@@ -178,12 +188,13 @@ def _collect_targets(model, format_map: Mapping[str, dict]):
         fmt = entry["format"] if isinstance(entry, Mapping) else entry
         spec = fr.get_format(fmt)
         cw = entry.get("col_weights") if isinstance(entry, Mapping) else None
+        smooth = entry.get("smooth_scale") if isinstance(entry, Mapping) else None
         # Only BF16 / FP8_SOURCE are passthrough-only (CLAUDE.md principle 11);
         # every other format — including real FP8_E4M3 — is rendered.
         skip_weight = spec.name in ("BF16", "FP8_SOURCE")
         if skip_weight and not _wants_act_emulation(spec):
             continue
-        targets.append((qname, mod, spec, cw))
+        targets.append((qname, mod, spec, cw, smooth))
     return targets, matched
 
 

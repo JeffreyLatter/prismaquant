@@ -135,6 +135,19 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   unmatched-qname gate, FP8_CB footprint family/entry-bytes), fix cycle running.
   Agent-1 formats core still implementing. Fable fixed the 3 pre-existing doc
   tests (README rewrite fallout + 5 unindexed flags) directly.
+- 2026-07-15 (exp-1 executed, 0.6B): **measurement bug found & fixed** —
+  `_build_lattice` trained the fp4 lattice on N(0,1) samples while NVFP4-
+  normalized weights sit at std≈2.9/amax≈6 (whole-model KL≈15, would have
+  falsely killed the family); fixed by training on `_scale_and_vectorize`
+  output, `data/nvfp4_cb_lattices.pt` regenerated. Harness gained a
+  `smooth_scale` entry (fold W·diag(s), hook applies x/s before act-qdq).
+  Results (54 arm-seeds + entropy + weight-only decomposition):
+  docs/nvfp4-cb-plan/exp1_0p6b_results.md. Headlines: full ≫ product
+  (+33/+40% KL penalty for product); learned > fixed beyond noise at match-k
+  (−19/−30%); CB loses IQ2_S by +66% at near-matched bytes at 0.6B
+  (kill-flag on ONE model — 4B check pending); smoothing α=0.25 helps
+  beyond noise at both k (−7%/−21%), α=0.5 ~neutral; exp-2 CLOSED
+  (≤0.03 bpw recoverable); FP8_CB_K40 anchor sane (KL 0.131 @5bpw).
 - Wave-1 COMPLETE (all accepted): formats 8aeaec0+9e9838a (fix cycle: Lloyd
   scatter_add — dense onehot was a 51GB trap at 27B scale; n_sub product
   decomposition — FP8_CB now functional via 4×2-dim sub-codebooks, 9-12-bit
