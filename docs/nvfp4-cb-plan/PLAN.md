@@ -217,3 +217,28 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
 - Kill signal: corrected-CB champion still >15% behind IQ2_S at matched TOTAL
   bytes on BOTH W4A4 and weight-only. Milestones B (exporter) / C (kernel) stay
   GATED on this verdict — no premature investment.
+- **RD-CEILING STUDY LANDED (7dd560d) — reframes the whole question:**
+  * FP4-grid VALUE constraint is CHEAP: +4.5% full / +10% signed MSE tax. NOT
+    the ceiling. FP8-grid <1%.
+  * IQ has NO codebook-DESIGN moat: FP4-Lloyd within ~5% of IQ2 at matched
+    codebook SIZE; unconstrained float codebook BEATS IQ2 by 4%. Empirical
+    (real Qwen weights) agrees with synthetic.
+  * **The real tax is bpp PACKAGING, not the codebook:** NVFP4 tensor-core
+    compat forces a mandatory 0.5-bpw group-16 E4M3 scale where IQ amortizes a
+    two-tier scale over 256-blocks (~0.15 bpw). Net ~0.35-0.5 bpw penalty →
+    at IQ2_S's 2.56 bpw, signed FP4-CB affords ~4x fewer shapes → predicted
+    ~+44% residual MSE at MATCHED BYTES. Corrected exp-1 will NARROW +66% but
+    NOT close it at matched bytes. Self-caveat: MSE is a proxy; confirm on the
+    empirical rerun's KL.
+  * **Reframe:** the question is no longer "match IQ at matched bytes" (no,
+    ~0.5bpw structural tax) but "is native-FP4 prefill worth ~0.5 bpw?" — the
+    original speed-vs-bytes trade. TEETH: 0.5bpw × 295B ≈ +18GB → may break the
+    single-Spark Hy3 fit (the motivating case). BRIGHT SPOT: FP8_CB (4.5-8bpw)
+    pays the tax at ~10% not ~25%, fills the MXFP6 gap, FP8-grid tax <1%.
+  * MITIGATION noted (not built): ship a two-tier scale (fp16/256 + cheap
+    sub/16), expand to E4M3-per-16 in the kernel prologue (scales are small,
+    no INV-1 issue) → recovers most of the packaging tax while keeping FP4
+    tensor-core weights.
+- Empirical rerun (running) is the ARBITER of the +44% prediction. Synthesize
+  study+rerun → present Robert the product decision (native-speed premium;
+  NVFP4_CB-sub3 vs FP8_CB-mid emphasis) with real numbers.
