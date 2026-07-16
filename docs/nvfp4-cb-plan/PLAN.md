@@ -272,3 +272,17 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   where FP8-grid tax <1% may let CB win). Honest downgrade of the ambition:
   NOT "IQ-class compression AND native speed" — it's "native-FP4 speed at a
   bytes premium." Product decision pending the break-even curve.
+- **BREAK-EVEN CURVE (984cd1b) — NOT a kill, ~0.15 bpw premium:**
+  * product-k16 (2.21) BEATS signed-S16 (2.75) at matched bytes — the kill WAS
+    on the weaker arm (my concern confirmed). Product cuts the matched-bytes
+    gap to +39.6% (from signed's +73.7%). Gap persists weight-only (+47.9%) =
+    structural scale tax, not activation/encoder.
+  * **NATIVE-FP4 PREMIUM ≈ +0.15 bpw** (conservative upper bound): product-CB
+    reaches IQ2_S KL (1.58) at ≈2.71 bpw vs IQ's 2.56. Clean within-product
+    interpolation (2.5→2.21, 3.0→0.74). Cross-VALIDATES the RD study's
+    independent ~0.19 bpw scale-tax. On 295B: ~+7GB for native-FP4 prefill.
+  * Redirected: DROPPED redundant 3h full-k16 anchor; prioritizing FP8_CB
+    K36/40/44 per-byte (MXFP6-gap) + product-k28 (4.0) + IQ3/IQ4 refs → final
+    go/pivot/shelve.
+- Honest correction to my prior "downgrade" message: premium is SMALL (~0.15,
+  mitigable toward 0 via two-tier scales), not a kill. Format concept validated.
