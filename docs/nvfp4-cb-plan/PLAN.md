@@ -316,3 +316,29 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   0.15→0.39 growing premium (viable, fills sub-4.5 CT-menu gap); (2) mid-range
   FP8_CB 4.5-5.5bpw = the STRONGER win, a genuinely better menu rung than
   NVFP4/MXFP6 in the knee region.
+
+## PHASE-0 COMPLETE (0.6B emulation gate) — honest unified verdict + Fable retraction
+
+**RETRACTION of my prior "FP8_CB is the strong win / 3.8× better than NVFP4":**
+that compared FP8_CB (W8A8) to NVFP4 (W4A4) — apples-to-oranges (activation
+precision, not codebook quality). The FAIR comparison vs IQ4_XS:
+FP8CB_K36@4.53=0.059 vs IQ4XS@4.25=0.060 → PARITY at +0.28 bpw. **No FP8_CB rung
+beats its nearest IQ point per-byte.** FP8_CB fills the empty NVFP4→FP8 CT-menu
+gap but is NOT a compression win over IQ.
+
+**Unified finding (both grids):** CB MATCHES IQ quality-per-byte within a small
+STRUCTURAL premium everywhere; it does NOT beat IQ per-byte in any band.
+- sub-3bpw NVFP4_CB: premium ~0.15 bpw (vs IQ2_S) GROWING to ~0.38 (vs IQ3_XXS).
+- mid-range FP8_CB: ~0.28 bpw premium vs IQ4_XS.
+- The premium = NVFP4 scale-packaging tax (0.5 group-16 E4M3 vs IQ ~0.31 two-tier),
+  MITIGABLE toward ~0 via an in-kernel two-tier scale.
+- Format concept validated (grid cheap +4.5%, no codebook moat), encoder not the
+  deficit. Scale-sweep was the big lever (FP8CB_K40 0.131→0.031, 4.2×).
+
+**CB's ENTIRE value proposition = native tensor-core prefill vs IQ's 42 tok/s,
+at a ~0.15-0.38 bpw quality premium, requiring a sole-owned custom fused-expand
+kernel.** Phase-0 (quality) is green-ish but CANNOT measure the value (kernel
+speed). We ALREADY serve IQ via the GGUF plugin (Hy3). So the decision rests
+entirely on: is native-FP4/FP8 prefill worth the premium + the kernel we'd solely
+own? — a strategic fork for Robert. Pending regardless: two-tier-scale mitigation
+study (can it drive premium→0?), 4B emulation check, served confirmation.
