@@ -174,3 +174,15 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   weighted encode, kills the product penalty, tables ≤256 entries. Rungs
   S13..S16 (S16 = 2.5bpw direct IQ2_S competitor). Then: 0.6B signed rerun
   (exp agent), then 4B check with best variant.
+- **Wave 3a landed (c3f8c6d) + Fable prediction FALSIFIED honestly:** signed
+  sign-magnitude mode implemented with in-repo PROOF of encode joint-optimality
+  — and it LOSES to flat-full by ~15% wMSE at equal k on Gaussian (forced sign
+  bits waste rate on near-zero coords). Agent refused to pin the predicted-win
+  test; correct behavior. Signed still uniquely extends the ladder past
+  MAX_FLAT_K with tiny tables (S15/S16); empirical question for the rerun.
+- **Real exp-1 confound identified → Wave 3b (running):** IQ arms rendered
+  with the gguf 27-candidate scale sweep + WLS refit; CB arms used one-shot
+  amax/6 scales — IQ got better RENDERING, not (necessarily) a better format.
+  Scale-sweep for CB encode dispatched (E4M3-legal candidates spanning the
+  JSO 6→4 clip range, weighted original-domain objective, fixed-point,
+  default-ON). 0.6B rerun follows, then 4B.
