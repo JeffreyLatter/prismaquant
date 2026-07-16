@@ -87,3 +87,34 @@ Mean FP4-grid tax (full mode, all sources/m) = **+4.5%**; (signed/magnitude mode
 4. **What does this predict for the corrected exp-1 rerun (signed mode + learned codebook, matched BYTES)?** The grid and codebook-design axes are cheap, but the NVFP4-tile PACKAGING is not free: at matched codebook SIZE, FP4-CB signed mode costs ~0.19-0.44 bpw MORE than its IQ2 twin (8 explicit sign bits so decoded tiles are literally NVFP4, + the mandatory 0.5-bpw group-16 E4M3 scale the FP4 tensor core consumes, vs IQ's amortised per-256 super-scale). To hit IQ2_S's 2.562 bpw a signed FP4-CB can only afford m~8.5 magnitude bits (vs IQ2_S's 10) — ~4x fewer shapes. Extrapolated at matched BYTES, a PERFECT-encoder FP4-CB still trails IQ2_S by **~+44% weighted MSE** (per source: gaussian +50%, t4 +41%, empirical +50%, laplace +36%).
 
 **Bottom line.** exp-1's +66% is NOT an FP4-grid ceiling and NOT a codebook-design deficit: at matched size FP4-grid-Lloyd ~= IQ2 and both ~= the unconstrained optimum. Correcting the encoder (signed mode + learned codebook) will NARROW the gap, but a structural **bpp** ceiling remains — the price of NVFP4-tensor-core-compatible tiles (explicit signs + the 0.5-bpw group-16 scale) is ~0.2-0.45 bpw, which at ~2.5 bpp targets forces a ~4x smaller codebook and leaves ~40-55% residual MSE vs IQ2_S at matched bytes. The format is viable ONLY if free FP4 serving is judged worth ~0.5 bpw; it will not match IQ at matched bytes. Caveat: MSE is the coding-theoretic distortion proxy, not served KL — the per-vector-scale shape metric is symmetric across FP4/IQ but absolute values are optimistic vs the real per-16 scale; re-confirm the matched-bytes prediction on the corrected exp-1 served/emulated KL.
+
+---
+
+## Reviewer correction (Opus main-loop, session 2) — the packaging tax is ~0.19 bpw, not 0.35–0.5, and it is MITIGABLE
+
+The verdict's load-bearing number (the "~0.2–0.45 bpw" NVFP4-tile packaging tax
+driving the ~+44% matched-bytes residual) overstates the scale component.
+Verified from the actual IQ2_S block layout (`block_iq2_s` = 2 B fp16 super-`d`
++ 64 B `qs` + 8 B `qh` + 8 B `scales` = 82 B/256 = 2.5625 bpw):
+
+- **NVFP4-CB scale overhead**: 8-bit E4M3 per 16 = **0.500 bpw** (mandatory for
+  the CUTLASS tensor-core contract).
+- **IQ2_S scale overhead**: fp16 super-`d` (0.0625) + per-32 `scales` (0.250) =
+  **0.3125 bpw**.
+- **Real scale-packaging gap = 0.500 − 0.3125 ≈ 0.19 bpw**, NOT 0.35–0.5. (The
+  sign-bit framing double-counts: IQ *also* stores signs — in `qh`/ksigns — so
+  signs are not a net CB disadvantage; the honest delta is scales only.)
+
+So the matched-bytes residual is materially smaller than +44% (the empirical
+rerun is the arbiter). More important: **the 0.5-bpw group-16 E4M3 scale is the
+SIMPLE choice, not an immutable one.** The mitigation already sketched in
+PLAN.md applies directly here — ship a two-tier scale (fp16 super per 256 + a
+cheap 4-bit sub per 16, IQ's own trick) and reconstruct the E4M3-per-16 plane in
+the kernel prologue/at load. Scales are tiny, so this does NOT hit the INV-1
+weight-expansion trap. With IQ-parity scale packaging + the cheap FP4-grid value
+tax (+4.5%), NVFP4-CB could **match IQ at matched bytes AND serve native FP4** —
+the "viable only if free FP4 serving is worth ~0.5 bpw" conclusion is too
+pessimistic by roughly the mitigation's worth. Net: the format is more viable
+than this study concluded; the decision hinges on the empirical rerun's real-KL
+matched-bytes number and on whether the two-tier scale is worth its kernel cost.
+On 295B, 0.19 bpw ≈ +7 GB (not +18) — much less likely to break single-Spark Hy3.
