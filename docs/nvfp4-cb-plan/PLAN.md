@@ -393,3 +393,22 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
   ~days of work, NO CuTe mainloop fork. Decode keeps the (tunable) Triton path.
   CUTLASS-fused (iii) drops to "only if transient overhead proves material at
   scale."
+- **K2 LANDED (a4bf317), VERIFIED+ACCEPTED:** served prototype works end-to-end.
+  **Emu↔served agreement 1.02–1.09×** — the emulation gate is a faithful
+  predictor of served behavior; ALL Phase-0 numbers retroactively harden.
+  FP8_CB_K44 SERVED: conf-KL 0.0208, PPL 34.98 vs BF16 34.32 (+1.9%) @5.5bpw
+  on 0.6B. Speed: prototype Triton 10× prefill / 0.58× decode — kernel
+  immaturity, not format (IQ4_XS GGUF ~1.1× BF16 TTFT at this tiny scale;
+  the real prefill tax lives at Hy3 scale). Plugin: zero vLLM-core patches;
+  codebook sidecar via non-globbed .pqcb + get_current_vllm_config.
+- **Prototype-ii+ DISPATCHED (running): the transient-expansion insight.**
+  Instead of the 15-25d CUTLASS fused mainloop: M-gated dispatch — decode via
+  tuned Triton GEMV; prefill expands the layer's weight into a TRANSIENT
+  native-format tile (FP8→stock w8a8 GEMM; NVFP4→stock CUTLASS block-scaled
+  GEMM, scales already in-layout) and calls the STOCK kernel. INV-1 honored:
+  one reusable per-layer buffer, never resident. Plus: 4B FP8_CB_K44 export →
+  served KL/PPL (= the 4B QUALITY GATE, with emu cross-check) + speed table
+  vs IQ4_XS GGUF + BF16 at a scale where prefill matters.
+- Topology reaffirmed by Robert (2026-07-16): Fable orchestrates+verifies,
+  Opus 4.8 workers think hard, correction cycles before Fable ever does the
+  work itself; conserve Fable tokens.
