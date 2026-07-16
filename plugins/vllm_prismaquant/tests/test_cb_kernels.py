@@ -21,8 +21,18 @@ from safetensors.torch import load_file
 from prismaquant.nvfp4_cb_formats import (
     _bit_split, nvfp4_cb_reconstruct, nvfp4_cb_unpack,
 )
-from vllm_prismaquant import codec
-from vllm_prismaquant.kernels import cb_decode_linear
+
+# The plugin package sits outside the repo's PYTHONPATH and needs triton (and,
+# transitively for the full plugin, vLLM) — present in the serving container,
+# not necessarily in the build venv. Skip cleanly instead of breaking
+# collection of the main suite.
+codec = pytest.importorskip(
+    "vllm_prismaquant.codec",
+    reason="vllm_prismaquant plugin not importable in this environment "
+           "(run inside the serving container / with plugins on PYTHONPATH)",
+)
+kernels = pytest.importorskip("vllm_prismaquant.kernels")
+cb_decode_linear = kernels.cb_decode_linear
 
 SERVE = Path("/home/rob/dq-runs/nvfp4-cb-phase0/serve")
 ARTIFACTS = ["fp8cb_k44", "nvfp4cb_k16"]
