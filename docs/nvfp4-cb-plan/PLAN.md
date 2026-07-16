@@ -206,3 +206,14 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
 - NEXT (blocked on both): corrected 0.6B rerun (learned+signed+sweep+α0.25,
   incl. exact 2.5bpp IQ2_S byte-match + weight-only format-isolation arm),
   then the formal 4B gate.
+- **Scale-sweep LANDED (b8d12d0):** default-on, 9–70% error reduction across
+  modes — the exp-1 CB-vs-IQ rendering confound was real and large. Suite green
+  (1062). Agent honestly narrowed signed-vs-product to a wash under sweep.
+- **Corrected 0.6B rerun (running):** decision set at IQ2_S's 2.56 bpw budget —
+  fixed-full/signed k16, SHARED-per-role learned k16 (sidecar amortized ~0, the
+  byte-competitive champion; per-tensor k16 is +2bpw at 0.6B), +α0.25 smoothing,
+  and a WEIGHT-ONLY format-isolation arm removing the A4 penalty from both CB
+  and IQ. Lever-isolation: k14 sweep on/off. → exp1b_0p6b_corrected.md
+- Kill signal: corrected-CB champion still >15% behind IQ2_S at matched TOTAL
+  bytes on BOTH W4A4 and weight-only. Milestones B (exporter) / C (kernel) stay
+  GATED on this verdict — no premature investment.
