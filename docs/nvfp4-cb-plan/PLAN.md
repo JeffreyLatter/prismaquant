@@ -439,3 +439,19 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
   v1.5 patch SKIPPED as a dead-end intermediate; formats agent redirected to
   implement the two-tier spec directly as layout v2 (formats+packer+exporter
   only; plugin compose after the serving pipeline lands; v1 stays decodable).
+- **TWO-TIER v2 LANDED (ab1ccc5), VERIFIED+ACCEPTED (122 CB tests green):**
+  E8M0-super × 4-bit-sub → exact-E4M3 by construction (252 legal pairs); scale
+  plane 16B→9B (k16 = 2.28125 bpw); un-collapse pinned in tests (v1 ≤8 distinct
+  candidates on real magnitudes, v2 ≥16); negative tax REPRODUCED (v2 0.828 <
+  v1-sweep 0.860 < v1-one-shot 0.932 wRecon). Exporter opt-in
+  --scale-coding=two_tier, layout_version 2, v1 decode pinned forever; default
+  stays v1 until serving gates G1/G3/G4 clear (v2 needs the plugin's per-tile/
+  transient compose). Agent resolved a spec self-inconsistency (all-zero
+  superblock rule) and noted it — good.
+- **Transient prefill lever CONFIRMED at 0.6B (from the serving doc draft):**
+  FP8_CB TTFT 0.263→0.042s = 7.5×→1.18× BF16 — native-class prefill via
+  expand-to-fp8-tile + stock GEMM, no CUTLASS fork. 4B tables in flight.
+- QUEUED next (after serving pipeline commits): v2 re-measurement of the key
+  arms — product-k16-two-tier @2.28bpw vs IQ2_S @2.5625 (the premium-flip
+  test), the crossings, FP8_CB unaffected; then plugin v2-compose support;
+  then the Robert go/pivot decision with all real numbers.
