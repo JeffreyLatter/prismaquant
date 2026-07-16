@@ -286,3 +286,19 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
     go/pivot/shelve.
 - Honest correction to my prior "downgrade" message: premium is SMALL (~0.15,
   mitigable toward 0 via two-tier scales), not a kill. Format concept validated.
+- **FP8_CB MID-RANGE — the strong win (2 seeds, sweep, shared-learned):**
+  * FP8CB_K36 4.525bpw: KL 0.059 · K40 5.025bpw: 0.031 · K44 5.525bpw: 0.019
+  * vs NVFP4 4.5bpw (W4A4) 0.222 → FP8CB at matched bpw is **3.8× better KL**.
+  * The scale-sweep+shared-learned corrections took FP8CB_K40 from exp-1's
+    0.131 (1-seed, no-sweep) to 0.031 — a **4.2× gain**.
+  * FP8_CB ESCAPES the scale-packaging tax (per-channel fp32 scale, not
+    group-16 E4M3) — RD study's FP8-grid tax <1% confirmed empirically.
+  * This IS the knee/MXFP6-gap rung the user asked about: bends the NVFP4(4.5,
+    0.222)→FP8(8.0) RD curve — 7× lower KL for +0.5bpw over NVFP4. Beats MXFP6
+    by construction (MXFP6 E8M0-handicapped, no vLLM kernel). ANSWER to the
+    MXFP6 question: don't add MXFP6; FP8_CB fills that gap better.
+  * Pending: IQ4_XS (direct codebook-vs-codebook mid-range per-byte ref).
+- TWO-SUBLANE PICTURE for the decision: (1) sub-3bpw NVFP4_CB = native-FP4 at a
+  0.15→0.39 growing premium (viable, fills sub-4.5 CT-menu gap); (2) mid-range
+  FP8_CB 4.5-5.5bpw = the STRONGER win, a genuinely better menu rung than
+  NVFP4/MXFP6 in the knee region.
