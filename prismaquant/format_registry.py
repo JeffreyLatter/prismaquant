@@ -892,6 +892,28 @@ def _make_nvfp4_cb_spec(k: int) -> FormatSpec:
     )
 
 
+def _make_nvfp4_cb_signed_spec(k: int) -> FormatSpec:
+    # Sign-magnitude VQ: 8 explicit sign bits + (k-8)-bit positive-grid
+    # magnitude index per 8-dim vector; the 8 sign bits are INSIDE k, so the
+    # accounting is identical to the flat rungs (32k + 128 bits / 256).
+    return FormatSpec(
+        name=f"NVFP4_CB_S{k}",
+        weight_bits=0, group_size=256, scale_bits=32 * k + 128,
+        scale_dtype_name="nvfp4_cb_vq",
+        weight_element_dtype=f"nvfp4_cb_s{k}",
+        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=16,
+        family="nvfp4_cb", min_capability_sm=100,
+        autoround_config=(
+            lambda k=k: dict(bits=0, group_size=256, data_type="nvfp4_cb",
+                             cb_k=k, cb_mode="signed", sym=True, act_bits=4,
+                             act_data_type="nv_fp4_with_static_gs",
+                             act_group_size=16, act_dynamic=True)
+        ),
+        quantize_dequantize=make_nvfp4_cb_qdq(k, "fp4", "signed"),
+        activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    )
+
+
 def _make_fp8_cb_spec(k: int) -> FormatSpec:
     # Index stream in scale_bits (32k bits / 256-superblock, weight_bits=0,
     # group_size=256) so effective_bits = k/8 exactly, mirroring the GGUF /
@@ -920,6 +942,8 @@ def _make_fp8_cb_spec(k: int) -> FormatSpec:
 
 for _k in range(12, 25):                    # 2.000 .. 3.500 bpw in 0.125 steps
     register_format(_make_nvfp4_cb_spec(_k))
+for _k in (13, 14, 15, 16):                 # signed: 2.125 .. 2.5 bpw
+    register_format(_make_nvfp4_cb_signed_spec(_k))
 for _k in (36, 40, 44, 48):                 # 4.5 / 5.0 / 5.5 / 6.0 bpw
     register_format(_make_fp8_cb_spec(_k))
 

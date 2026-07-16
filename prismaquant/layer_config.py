@@ -28,10 +28,11 @@ _GGUF_FORMAT_NAMES = frozenset(
 )
 
 # NVFP4-CB / FP8-CB vector-quantization codebook lane (custom vLLM plugin;
-# pinned to format_registry by test_nvfp4_cb_formats). NVFP4_CB_K12..K24 and
-# FP8_CB_K36/40/44/48.
+# pinned to format_registry by test_nvfp4_cb_formats). NVFP4_CB_K12..K24
+# (flat), NVFP4_CB_S13..S16 (sign-magnitude), FP8_CB_K36/40/44/48.
 _NVFP4_CB_FORMAT_NAMES = frozenset(
     {f"NVFP4_CB_K{k}" for k in range(12, 25)}
+    | {f"NVFP4_CB_S{k}" for k in (13, 14, 15, 16)}
     | {f"FP8_CB_K{k}" for k in (36, 40, 44, 48)}
 )
 
@@ -52,7 +53,8 @@ def canonicalize_format(entry: dict | str | int) -> str:
                 raise ValueError(f"unsupported gguf scheme: {entry!r}")
             return gguf_type
         if dt == "nvfp4_cb":
-            name = f"NVFP4_CB_K{int(entry['cb_k'])}"
+            rung = "S" if str(entry.get("cb_mode", "")) == "signed" else "K"
+            name = f"NVFP4_CB_{rung}{int(entry['cb_k'])}"
             if name not in _NVFP4_CB_FORMAT_NAMES:
                 raise ValueError(f"unsupported nvfp4_cb scheme: {entry!r}")
             return name

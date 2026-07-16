@@ -1373,7 +1373,7 @@ def _format_supports_render_mechanism(fmt: str, mechanism: str) -> bool:
         return mech in {"gptq", "static_act_order"} or (
             mech == "scale_sweep" and fmt_u == "MXFP8_E4M3"
         )
-    if fmt_u.startswith("NVFP4_CB_K") or fmt_u.startswith("FP8_CB_K"):
+    if fmt_u.startswith(("NVFP4_CB_K", "NVFP4_CB_S", "FP8_CB_K")):
         # VQ codebooks quantize 8-column vectors jointly; the scalar-column
         # mechanisms (gptq/jso/scale_sweep/act_order) do not apply. The
         # imatrix-weighted VQ search IS the deliberate render (col_weights).

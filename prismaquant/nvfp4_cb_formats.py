@@ -11,7 +11,7 @@ This module is Milestone A: emulation only. One weighted-VQ field quantizer
 feeds the emulation ``reconstruct`` (what cost measurement scores); the byte
 packer and exporter land in Milestone B and must share this exact math path.
 
-Two VQ modes:
+Three VQ modes:
 
 * ``full`` — one ``2^k`` codebook over the 8-dim vector, exhaustive weighted
   argmin (chunked). Only feasible for k<=14; raises above without an explicit
@@ -19,6 +19,14 @@ Two VQ modes:
 * ``product`` (default) — the 8-dim vector splits into two 4-dim halves, each
   with its own ``2^(k/2)`` sub-codebook (ceil/floor bit split for odd k). Feasible
   for the whole NVFP4-CB ladder (k=12..24).
+* ``signed`` — sign-magnitude factorization (the IQ-family move): 8 explicit
+  sign bits + an ``m = k-8``-bit index into a MAGNITUDE codebook over the
+  positive half-grid. A flat codebook burns most of its entries covering sign
+  patterns (~2^8 per magnitude shape at d=8, leaving ~2^(k-8) effective
+  magnitude shapes); factoring the signs out spends all 2^m entries on
+  magnitude shapes (exp-1 diagnosis: this is why IQ2_S beat flat CB +66% at
+  matched bytes). Encode is exactly separable under weighted L2 (see
+  ``_fields_block``); tables are tiny (m=5..8 -> 32..256 entries).
 
 The weighted objective is llama.cpp/imatrix style:
 ``sum_j w_j (x_j - c_j)^2`` per codeword, with per-input-column ``col_weights``
@@ -77,8 +85,16 @@ def _e2m1_grid(device: str) -> torch.Tensor:
                         device=torch.device(device))
 
 
-def _snap_to_grid(t: torch.Tensor, grid: str) -> torch.Tensor:
-    """Project every coordinate onto the element grid (nearest)."""
+def _snap_to_grid(t: torch.Tensor, grid: str,
+                  positive: bool = False) -> torch.Tensor:
+    """Project every coordinate onto the element grid (nearest).
+
+    ``positive=True`` restricts to the non-negative half-grid (magnitude
+    codebooks for signed mode): clamp to >=0 first — the nearest full-grid
+    value of a non-negative input is itself non-negative, so a plain snap
+    then lands on the half-grid."""
+    if positive:
+        t = t.clamp_min(0)
     if grid == "fp8":
         return (t.clamp(-FP8_ELEMENT_MAX, FP8_ELEMENT_MAX)
                 .to(torch.float8_e4m3fn).to(torch.float32))
@@ -131,10 +147,12 @@ def _vq_assign(x: torch.Tensor, cb: torch.Tensor,
 # ---------------------------------------------------------------------------
 
 def _lloyd(samples: torch.Tensor, init: torch.Tensor, grid: str,
-           weights: torch.Tensor | None, iters: int, seed: int) -> torch.Tensor:
+           weights: torch.Tensor | None, iters: int, seed: int,
+           positive: bool = False) -> torch.Tensor:
     """Grid-snapped weighted Lloyd. Every centroid coordinate is projected
-    onto the element grid after each update, so codewords stay grid-valued."""
-    cb = _snap_to_grid(init.to(torch.float32), grid)
+    onto the element grid after each update, so codewords stay grid-valued
+    (the positive half-grid for magnitude codebooks)."""
+    cb = _snap_to_grid(init.to(torch.float32), grid, positive=positive)
     K, d = cb.shape
     gen = torch.Generator(device="cpu").manual_seed(int(seed))
     for _ in range(int(iters)):
@@ -161,7 +179,7 @@ def _lloyd(samples: torch.Tensor, init: torch.Tensor, grid: str,
             pick = torch.randint(0, samples.shape[0], (n_empty,),
                                  generator=gen).to(samples.device)
             new[empty] = samples[pick]
-        cb = _snap_to_grid(new, grid)
+        cb = _snap_to_grid(new, grid, positive=positive)
     return cb
 
 
@@ -172,23 +190,25 @@ def _lattice_file() -> dict[str, torch.Tensor]:
     return {}
 
 
-def _lattice_key(k: int, grid: str, d: int) -> str:
-    return f"{grid}_d{d}_k{k}"
+def _lattice_key(k: int, grid: str, d: int, positive: bool = False) -> str:
+    return f"{grid}{'pos' if positive else ''}_d{d}_k{k}"
 
 
 @lru_cache(maxsize=None)
-def _fixed_lattice_cpu(k: int, grid: str, d: int) -> torch.Tensor:
+def _fixed_lattice_cpu(k: int, grid: str, d: int,
+                       positive: bool = False) -> torch.Tensor:
     if k > MAX_FLAT_K:
         raise ValueError(
             f"flat codebook infeasible at k={k} (2^{k} codewords > "
             f"2^{MAX_FLAT_K}); provide an explicit/structured codebook")
-    cached = _lattice_file().get(_lattice_key(k, grid, d))
+    cached = _lattice_file().get(_lattice_key(k, grid, d, positive))
     if cached is not None:
         return cached.to(torch.float32).contiguous()
-    return _build_lattice(k, grid, d)
+    return _build_lattice(k, grid, d, positive=positive)
 
 
-def _build_lattice(k: int, grid: str, d: int) -> torch.Tensor:
+def _build_lattice(k: int, grid: str, d: int,
+                   positive: bool = False) -> torch.Tensor:
     """Deterministic universal lattice: grid-snapped Lloyd on seeded samples
     drawn from the *post-normalization* distribution each grid's encoder
     actually produces. Regenerated on cache miss.
@@ -218,31 +238,40 @@ def _build_lattice(k: int, grid: str, d: int) -> torch.Tensor:
         w = torch.randn(rows, in_f, generator=gen)
         vectors, _, _ = _scale_and_vectorize(w, "fp4")   # (rows*64, 8), std~2.9
         samples = vectors.reshape(-1, d)[:m].contiguous()
+    if positive:
+        # Magnitude lattice: train on |x| of the same post-normalization
+        # distribution (exactly what the signed-mode encoder searches over).
+        samples = samples.abs()
     if torch.cuda.is_available():
         samples = samples.cuda()
     perm = torch.randperm(samples.shape[0], generator=gen).to(samples.device)[:K]
     init = samples[perm]
-    return _lloyd(samples, init, grid, None, _LATTICE_ITERS, _LATTICE_SEED).cpu()
+    return _lloyd(samples, init, grid, None, _LATTICE_ITERS, _LATTICE_SEED,
+                  positive=positive).cpu()
 
 
-def fixed_lattice(k: int, grid: str, d: int = 8) -> torch.Tensor:
-    """Universal (2^k, d) codebook of grid-valued codewords."""
-    return _fixed_lattice_cpu(int(k), str(grid), int(d))
+def fixed_lattice(k: int, grid: str, d: int = 8,
+                  positive: bool = False) -> torch.Tensor:
+    """Universal (2^k, d) codebook of grid-valued codewords (positive
+    half-grid magnitude codewords when ``positive=True``)."""
+    return _fixed_lattice_cpu(int(k), str(grid), int(d), bool(positive))
 
 
 def learn_codebook(vectors: torch.Tensor, k: int, *, grid: str,
                    col_weights: torch.Tensor | None = None,
                    init: torch.Tensor | None = None, iters: int = 4,
-                   seed: int = 0) -> torch.Tensor:
+                   seed: int = 0, positive: bool = False) -> torch.Tensor:
     """Weighted Lloyd codebook on the element grid. Returns a (2^k, d)
-    grid-valued tensor. Deterministic given ``seed`` + ``init`` on CPU;
-    on CUDA the index_add_ float atomics can flip grid-snap ties across
-    runs, so ship the resulting codebook rather than regenerating it."""
+    grid-valued tensor (positive half-grid when ``positive=True`` — pass
+    ``|vectors|`` to learn a signed-mode magnitude codebook). Deterministic
+    given ``seed`` + ``init`` on CPU; on CUDA the index_add_ float atomics
+    can flip grid-snap ties across runs, so ship the resulting codebook
+    rather than regenerating it."""
     vectors = vectors.to(torch.float32)
     d = vectors.shape[-1]
     vectors = vectors.reshape(-1, d)
     if init is None:
-        init = fixed_lattice(k, grid, d).to(vectors.device)
+        init = fixed_lattice(k, grid, d, positive=positive).to(vectors.device)
     else:
         init = init.to(vectors.device, torch.float32)
     if (1 << int(k)) != init.shape[0]:
@@ -252,7 +281,8 @@ def learn_codebook(vectors: torch.Tensor, k: int, *, grid: str,
         weights = torch.broadcast_to(
             col_weights.to(vectors.device, torch.float32), vectors.shape
         ).contiguous()
-    return _lloyd(vectors, init, grid, weights, iters, seed)
+    return _lloyd(vectors, init, grid, weights, iters, seed,
+                  positive=positive)
 
 
 def _resolve_codebook(k: int, grid: str, mode: str,
@@ -277,7 +307,23 @@ def _resolve_codebook(k: int, grid: str, mode: str,
                     f"product codebook count {len(tables)} must divide "
                     f"{VEC_DIM}")
         return tuple(t.to(device, torch.float32) for t in tables)
-    raise ValueError(f"unknown mode {mode!r} (expected 'full' or 'product')")
+    if mode == "signed":
+        m = k - VEC_DIM                       # 8 explicit sign bits inside k
+        if m < 1:
+            raise ValueError(f"signed mode needs k > {VEC_DIM} (got k={k})")
+        if codebook is None:
+            cb = fixed_lattice(m, grid, VEC_DIM, positive=True)
+        else:
+            cb = codebook
+        cb = cb.to(device, torch.float32)
+        if bool((cb < 0).any()):
+            raise ValueError(
+                "signed-mode magnitude codebook must be non-negative "
+                "(sign-optimality requires codewords on the positive "
+                "half-grid)")
+        return cb
+    raise ValueError(
+        f"unknown mode {mode!r} (expected 'full', 'product' or 'signed')")
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +390,19 @@ def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
     if mode == "full":
         idx = _vq_assign(vectors, cb, wq)
         indices = idx.reshape(rows, nvec_per_row)
+    elif mode == "signed":
+        # Exactly separable under weighted L2: for any magnitude codeword
+        # c >= 0, sum_j w_j (x_j - s_j c_j)^2 is minimized over s_j in {+-1}
+        # by s_j = sign(x_j) (the cross-term -2 w_j s_j x_j c_j is largest
+        # when s_j x_j >= 0, independent of which codeword is chosen), and at
+        # that sign the objective equals sum_j w_j (|x_j| - c_j)^2. So the
+        # weighted argmin over |x| plus signs = sign(x) IS the joint optimum
+        # — no sign x magnitude search needed. Zero-safe: sign(0) -> +1.
+        idx = _vq_assign(vectors.abs(), cb, wq)
+        indices = idx.reshape(rows, nvec_per_row)
+        signs = torch.where(vectors < 0, -1.0, 1.0)
+        return {"indices": indices, "scales": scales,
+                "signs": signs.reshape(rows, in_f)}
     else:
         n_sub = len(cb)
         sub_dim = VEC_DIM // n_sub
@@ -390,10 +449,8 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
             b = min(rows, a + row_step)
             cw = cw2d[a:b] if cw2d is not None else None
             parts.append(_fields_block(w2d[a:b], k, grid, mode, cb, cw))
-        out = {
-            "indices": torch.cat([p["indices"] for p in parts], dim=0),
-            "scales": torch.cat([p["scales"] for p in parts], dim=0),
-        }
+        out = {key: torch.cat([p[key] for p in parts], dim=0)
+               for key in parts[0]}
     out["shape"] = orig_shape
     out["codebook"] = cb
     return out
@@ -415,6 +472,9 @@ def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",
     if mode == "full":
         vecs = cb[indices]                                   # (rows, nvec, 8)
         recon = vecs.reshape(rows, in_f)
+    elif mode == "signed":
+        vecs = cb[indices]                                   # (rows, nvec, 8)
+        recon = vecs.reshape(rows, in_f) * fields["signs"]
     else:
         parts = [table[indices[..., i]] for i, table in enumerate(cb)]
         recon = torch.cat(parts, dim=-1).reshape(rows, in_f)

@@ -102,6 +102,113 @@ def test_learned_codebook_beats_fixed():
     assert float(dist.max()) < 1e-5
 
 
+# signed mode: 8 explicit sign bits + (k-8)-bit positive-grid magnitude index.
+_SIGNED_KS = [13, 14, 15, 16]
+
+
+@pytest.mark.parametrize("k", _SIGNED_KS)
+def test_signed_effective_bits_exact(k):
+    spec = fr.get_format(f"NVFP4_CB_S{k}")
+    assert spec.effective_bits == pytest.approx(k / 8 + 0.5, abs=1e-9)
+    assert spec.effective_bits_for_shape((64, 2048)) == pytest.approx(
+        k / 8 + 0.5, abs=1e-9)
+
+
+@pytest.mark.parametrize("k", _SIGNED_KS)
+def test_signed_decode_on_pos_grid_times_scale(k):
+    torch.manual_seed(8)
+    w = torch.randn(48, 512)
+    w[0, :16] = 0.0                       # zero coords: sign must be +1-safe
+    fields = cb.nvfp4_cb_fields(w, k, grid="fp4", mode="signed")
+    assert torch.equal(
+        fields["signs"].abs(), torch.ones_like(fields["signs"]))
+    recon = cb.nvfp4_cb_reconstruct(fields, k, grid="fp4", mode="signed")
+    pes = cb._per_element_scale(fields["scales"], "fp4", 512)
+    q = (recon / pes).abs()               # |value| on the positive half-grid
+    pos = torch.tensor(cb._E2M1_VALUES)
+    dist = (q.unsqueeze(-1) - pos).abs().min(dim=-1).values
+    assert float(dist.max()) < 1e-5
+    # magnitude codebook itself is non-negative and grid-valued
+    mag = fields["codebook"]
+    assert bool((mag >= 0).all())
+    assert torch.equal(cb._snap_to_grid(mag, "fp4"), mag)
+
+
+def test_signed_separable_encode_is_joint_optimum():
+    # For c >= 0 the optimal sign is sign(x) independent of the codeword, so
+    # weighted argmin over |x| + explicit signs must EXACTLY match the
+    # exhaustive joint search over all 2^8 sign patterns x magnitudes.
+    torch.manual_seed(9)
+    w = torch.randn(8, 256)
+    cwq = torch.rand(256) + 0.05
+    fields = cb.nvfp4_cb_fields(w, 13, grid="fp4", mode="signed",
+                                col_weights=cwq)
+    mag = fields["codebook"]
+    vecs, _, _ = cb._scale_and_vectorize(w, "fp4")
+    wq = cb._col_weight_vectors(
+        torch.broadcast_to(cwq, (8, 256)).reshape(8, 256))
+    signs_all = torch.tensor(
+        [[1.0 if (s >> j) & 1 == 0 else -1.0 for j in range(8)]
+         for s in range(256)])
+    joint = (signs_all.unsqueeze(1) * mag.unsqueeze(0)).reshape(-1, 8)
+    idx_joint = cb._vq_assign(vecs, joint, wq)
+    err_joint = (wq * (vecs - joint[idx_joint]).pow(2)).sum()
+    rec_sep = mag[fields["indices"].reshape(-1)] * fields["signs"].reshape(
+        -1, 8)
+    err_sep = (wq * (vecs - rec_sep).pow(2)).sum()
+    assert float(err_sep) <= float(err_joint) + 1e-3
+
+
+def test_signed_extends_ladder_beyond_flat_ceiling():
+    # k=15,16 have no flat-full twin (MAX_FLAT_K=14); signed reaches them
+    # with tiny tables and beats product mode there.
+    torch.manual_seed(10)
+    w = torch.randn(128, 1024)
+    cw = torch.rand(1024) + 0.05
+    for k in (15, 16):
+        rs = cb.make_nvfp4_cb_qdq(k, "fp4", "signed")(w)
+        rp = cb.make_nvfp4_cb_qdq(k, "fp4", "product")(w)
+        assert _wmse(w, rs, cw) <= _wmse(w, rp, cw) + 1e-9
+        with pytest.raises(ValueError, match="infeasible"):
+            cb.fixed_lattice(k, "fp4", 8)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_signed_determinism_per_device(device):
+    torch.manual_seed(11)
+    w = torch.randn(48, 512, device=device)
+    qdq = cb.make_nvfp4_cb_qdq(14, "fp4", "signed")
+    assert torch.equal(qdq(w), qdq(w))
+
+
+def test_signed_learned_magnitude_roundtrip():
+    torch.manual_seed(12)
+    w = torch.randn(96, 512)
+    cw = torch.rand(512) + 0.05
+    vecs, _, _ = cb._scale_and_vectorize(w, "fp4")
+    mag = cb.learn_codebook(vecs.abs(), 6, grid="fp4", positive=True,
+                            iters=6)
+    assert mag.shape == (64, 8)
+    assert bool((mag >= 0).all())
+    f_fix = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="signed",
+                               col_weights=cw)
+    f_lrn = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="signed",
+                               col_weights=cw, codebook=mag)
+    r_fix = cb.nvfp4_cb_reconstruct(f_fix, 14, grid="fp4", mode="signed")
+    r_lrn = cb.nvfp4_cb_reconstruct(f_lrn, 14, grid="fp4", mode="signed",
+                                    codebook=mag)
+    assert _wmse(w, r_lrn, cw) <= _wmse(w, r_fix, cw) + 1e-9
+    # negative-entry codebooks are rejected (breaks sign optimality)
+    with pytest.raises(ValueError, match="non-negative"):
+        cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="signed",
+                           codebook=mag - 1.0)
+
+
+def test_signed_needs_more_than_sign_bits():
+    with pytest.raises(ValueError, match="signed mode needs k"):
+        cb.nvfp4_cb_fields(torch.randn(8, 256), 8, grid="fp4", mode="signed")
+
+
 # FP8_CB: every registered rung is functional through the qdq closure —
 # product mode splits into four 2-dim sub-vectors (9..12-bit sub-tables).
 @pytest.mark.parametrize("k", _FP8_KS)
@@ -193,6 +300,7 @@ def test_flat_k_ceiling_raises():
 # (i) menu: all rungs register, resolve, sort by effective_bits.
 def test_menu_registers_and_resolves():
     names = [f"NVFP4_CB_K{k}" for k in _NVFP4_KS] + \
+            [f"NVFP4_CB_S{k}" for k in _SIGNED_KS] + \
             [f"FP8_CB_K{k}" for k in _FP8_KS]
     for name in names:
         spec = fr.get_format(name)
@@ -201,6 +309,9 @@ def test_menu_registers_and_resolves():
     # dict-form canonicalization (custom quant-config JSON shape).
     assert lc.canonicalize_format(
         {"data_type": "nvfp4_cb", "cb_k": 20}) == "NVFP4_CB_K20"
+    assert lc.canonicalize_format(
+        {"data_type": "nvfp4_cb", "cb_k": 14, "cb_mode": "signed"},
+    ) == "NVFP4_CB_S14"
     assert lc.canonicalize_format(
         {"data_type": "fp8_cb", "cb_k": 44}) == "FP8_CB_K44"
     fam = [s for s in fr.list_formats() if s.family in ("nvfp4_cb", "fp8_cb")]
