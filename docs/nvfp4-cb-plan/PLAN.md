@@ -256,3 +256,19 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
 - Empirical rerun (running) is the ARBITER of the +44% prediction. Synthesize
   study+rerun → present Robert the product decision (native-speed premium;
   NVFP4_CB-sub3 vs FP8_CB-mid emphasis) with real numbers.
+- **CORRECTED RERUN (18f1819) — matched-bytes result is a real LOSS, honestly:**
+  even with scale-sweep + signed + shared-learned + smoothing, CB loses IQ2_S at
+  matched bytes: **+74% W4A4 / +48% weight-only** (signed-S16, 4 seeds). This
+  CONFIRMS the RD study's direction — CB is not a matched-bytes IQ competitor;
+  the scale-packaging tax is real. Smoothing washed out on top of sweep (noise).
+  Shared-per-role codebook worked (sidecar ≈0); per-tensor k16 = +0.93 model bpw
+  (unusable), confirming shared is mandatory.
+- **Two caveats on the kill → reframed, NOT accepted as-is:** (1) the 4-seed arm
+  is SIGNED (known ~10-15% weaker than full); champion full-k16 was footprint-only
+  (56s/Linear) — now finishing at ≥1 seed. (2) "KILL at matched bytes" is the
+  WRONG frame per the RD study: CB was never a matched-bytes competitor. Redirected
+  to the real decision number — the native-FP4 SPEED PREMIUM (bpw at which CB
+  reaches IQ2_S/IQ3_XXS KL) + FP8_CB mid-range per-byte (the MXFP6-gap family,
+  where FP8-grid tax <1% may let CB win). Honest downgrade of the ambition:
+  NOT "IQ-class compression AND native speed" — it's "native-FP4 speed at a
+  bytes premium." Product decision pending the break-even curve.
