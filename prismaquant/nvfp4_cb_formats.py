@@ -31,6 +31,17 @@ Three VQ modes:
 The weighted objective is llama.cpp/imatrix style:
 ``sum_j w_j (x_j - c_j)^2`` per codeword, with per-input-column ``col_weights``
 (the same plumbing as the GGUF lane).
+
+Scale search: CB encode sweeps the per-group (fp4) / per-row (fp8) scale over a
+grid of E4M3-legal candidates and picks the one minimizing weighted
+reconstruction error in the ORIGINAL weight domain, then refines with 2
+WLS-refit fixed-point iterations — rendering parity with the IQ lane's
+27-candidate ``_grid_fields`` sweep. ``scale_sweep=True`` is the default for all
+three modes and both grids. The amax/6 (fp4) / amax/448 (fp8) one-shot scale is
+always in the candidate set, so the sweep is never worse than one-shot. **The
+Phase-0 exp-1 0.6B results (pre-c3f8c6d) used one-shot scales for CB while the
+IQ arms got their scale sweep — that rendering asymmetry is corrected here;
+re-run before trusting any CB-vs-IQ delta.**
 """
 from __future__ import annotations
 
@@ -43,6 +54,7 @@ VEC_DIM = 8
 SUPERBLOCK = 256
 FP4_GROUP = 16
 FP8_ELEMENT_MAX = 448.0
+NVFP4_GRID_MAX = 6.0            # max(|E2M1|); amax/6 == no-clip one-shot scale
 # Flat-table feasibility ceiling (encode-side exhaustive argmin + serve-side
 # LUT). Above this a structured/learned codebook must be supplied explicitly.
 MAX_FLAT_K = 14
@@ -51,6 +63,18 @@ MAX_FLAT_K = 14
 _SLICE_MAX_ELEMS = 64 * 1024 * 1024
 # Row-chunk bound for the (rows*nvec, K) distance sweep.
 _SCORE_CHUNK_ELEMS = 1 << 26
+
+# Scale search (rendering parity with the IQ lane's _grid_fields sweep):
+# number of clipping-level candidates and fixed-point refit iterations. The
+# fp4 grid sweeps amax/L for L spanning [6, 4] (grid max 6; the JSO {6,4}
+# insight as a grid); fp8 spans amax/L for L in [448, 448*4/6]. L=grid-max is
+# candidate 0 == the amax/grid-max one-shot, so the sweep is never worse.
+_SCALE_SWEEP_CANDIDATES = 16
+_SCALE_SWEEP_REFIT_ITERS = 2
+_E4M3 = torch.float8_e4m3fn
+# Smallest positive fp8_e4m3fn value (subnormal 2^-9), an E4M3-exact floor
+# that keeps a chosen block scale strictly positive (never underflow to 0).
+_E4M3_MIN_POS = 2.0 ** -9
 
 _DATA = Path(__file__).resolve().parent / "data" / "nvfp4_cb_lattices.pt"
 _LATTICE_SEED = 1234
@@ -379,18 +403,12 @@ def _col_weight_vectors(cw2d: torch.Tensor) -> torch.Tensor:
     return torch.where(mass == 0, torch.ones_like(wq), wq)
 
 
-def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
-                  cb, cw2d: torch.Tensor | None) -> dict:
-    rows, in_f = w2d.shape
-    vectors, scales, _ = _scale_and_vectorize(w2d, grid)
-    nvec_per_row = in_f // VEC_DIM
-    wq = None
-    if cw2d is not None:
-        wq = _col_weight_vectors(cw2d)
+def _mode_encode(vectors: torch.Tensor, mode: str, cb, wq) -> dict:
+    """VQ-assign scaled ``vectors`` (nvec, 8) under one mode. Returns per-mode
+    index fields ({"idx": (nvec,) or (nvec, n_sub)}, + "signs" for signed)."""
     if mode == "full":
-        idx = _vq_assign(vectors, cb, wq)
-        indices = idx.reshape(rows, nvec_per_row)
-    elif mode == "signed":
+        return {"idx": _vq_assign(vectors, cb, wq)}
+    if mode == "signed":
         # Exactly separable under weighted L2: for any magnitude codeword
         # c >= 0, sum_j w_j (x_j - s_j c_j)^2 is minimized over s_j in {+-1}
         # by s_j = sign(x_j) (the cross-term -2 w_j s_j x_j c_j is largest
@@ -398,29 +416,152 @@ def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
         # that sign the objective equals sum_j w_j (|x_j| - c_j)^2. So the
         # weighted argmin over |x| plus signs = sign(x) IS the joint optimum
         # — no sign x magnitude search needed. Zero-safe: sign(0) -> +1.
-        idx = _vq_assign(vectors.abs(), cb, wq)
-        indices = idx.reshape(rows, nvec_per_row)
-        signs = torch.where(vectors < 0, -1.0, 1.0)
-        return {"indices": indices, "scales": scales,
-                "signs": signs.reshape(rows, in_f)}
+        return {"idx": _vq_assign(vectors.abs(), cb, wq),
+                "signs": torch.where(vectors < 0, -1.0, 1.0)}
+    n_sub = len(cb)
+    sub_dim = VEC_DIM // n_sub
+    idxs = []
+    for i, table in enumerate(cb):
+        xs = vectors[:, i * sub_dim:(i + 1) * sub_dim]
+        ws = wq[:, i * sub_dim:(i + 1) * sub_dim] if wq is not None else None
+        idxs.append(_vq_assign(xs, table, ws))
+    return {"idx": torch.stack(idxs, dim=-1)}
+
+
+def _mode_decode(enc: dict, mode: str, cb) -> torch.Tensor:
+    """Scaled-domain grid reconstruction (nvec, 8) from index fields."""
+    if mode == "full":
+        return cb[enc["idx"]]
+    if mode == "signed":
+        return cb[enc["idx"]] * enc["signs"]
+    parts = [table[enc["idx"][:, i]] for i, table in enumerate(cb)]
+    return torch.cat(parts, dim=-1)
+
+
+def _enc_to_fields(enc: dict, mode: str, cb, rows: int, in_f: int,
+                   nvec_per_row: int) -> dict:
+    if mode == "full":
+        return {"indices": enc["idx"].reshape(rows, nvec_per_row)}
+    if mode == "signed":
+        return {"indices": enc["idx"].reshape(rows, nvec_per_row),
+                "signs": enc["signs"].reshape(rows, in_f)}
+    return {"indices": enc["idx"].reshape(rows, nvec_per_row, len(cb))}
+
+
+def _group_amax(w2d: torch.Tensor, grid: str) -> torch.Tensor:
+    rows, in_f = w2d.shape
+    if grid == "fp4":
+        return w2d.reshape(rows, in_f // FP4_GROUP, FP4_GROUP).abs().amax(-1)
+    return w2d.abs().amax(-1, keepdim=True)
+
+
+def _group_reduce(err: torch.Tensor, grid: str) -> torch.Tensor:
+    rows, in_f = err.shape
+    if grid == "fp4":
+        return err.reshape(rows, in_f // FP4_GROUP, FP4_GROUP).sum(-1)
+    return err.sum(-1, keepdim=True)
+
+
+def _snap_scale(s: torch.Tensor, grid: str) -> torch.Tensor:
+    """Project a per-group scale onto the legal grid: E4M3 (fp4 block scale,
+    exactly like NVFP4) or fp32 (fp8 per-channel). Floored strictly positive."""
+    if grid == "fp4":
+        return _snap_to_grid(s, "fp8").clamp_min(_E4M3_MIN_POS)
+    return s.clamp_min(1e-12)
+
+
+def _candidate_scales(amax: torch.Tensor, grid: str, n: int) -> torch.Tensor:
+    """(n, *amax.shape) legal candidate scales sweeping the clipping level.
+    Candidate 0 is L=grid-max == the one-shot amax/grid-max scale, so an
+    argmin over these is never worse than the one-shot."""
+    if grid == "fp4":
+        levels = torch.linspace(NVFP4_GRID_MAX, 4.0, n, device=amax.device)
     else:
-        n_sub = len(cb)
-        sub_dim = VEC_DIM // n_sub
-        idxs = []
-        for i, table in enumerate(cb):
-            xs = vectors[:, i * sub_dim:(i + 1) * sub_dim]
-            ws = wq[:, i * sub_dim:(i + 1) * sub_dim] if wq is not None else None
-            idxs.append(_vq_assign(xs, table, ws))
-        indices = torch.stack(idxs, dim=-1).reshape(
-            rows, nvec_per_row, n_sub)
-    return {"indices": indices, "scales": scales}
+        levels = torch.linspace(FP8_ELEMENT_MAX, FP8_ELEMENT_MAX * 4.0 / 6.0,
+                                n, device=amax.device)
+    shape = (n,) + (1,) * amax.dim()
+    return _snap_scale(amax.unsqueeze(0) / levels.reshape(shape), grid)
+
+
+def _eval_candidate(w2d: torch.Tensor, wq: torch.Tensor | None,
+                    s: torch.Tensor, grid: str, mode: str, cb):
+    """Encode ``w2d`` at per-group scale ``s`` and score the WEIGHTED
+    reconstruction error in the ORIGINAL weight domain (so the scale choice
+    is judged on real error, not scaled-domain error). Returns
+    (err_group (rows, ngroups), enc, grid_decode (rows, in))."""
+    rows, in_f = w2d.shape
+    pes = _per_element_scale(s, grid, in_f)              # (rows, in)
+    pes_vec = pes.reshape(-1, VEC_DIM)                   # (nvec, 8)
+    wvec = w2d.reshape(-1, VEC_DIM)
+    x = wvec / pes_vec
+    enc = _mode_encode(x, mode, cb, wq)
+    dec = _mode_decode(enc, mode, cb)                    # (nvec, 8) grid
+    recon = dec * pes_vec                                # original domain
+    err = (recon - wvec).pow(2)
+    if wq is not None:
+        err = err * wq
+    err_group = _group_reduce(err.reshape(rows, in_f), grid)
+    return err_group, enc, dec.reshape(rows, in_f)
+
+
+def _sweep_encode(w2d: torch.Tensor, grid: str, mode: str, cb,
+                  wq: torch.Tensor | None):
+    """Joint scale sweep + WLS-refit fixed point (mirrors _grid_fields). Picks
+    the per-group scale minimizing weighted real error over the E4M3-legal
+    candidate grid, then refines with continuous WLS refits accepted per group
+    only when strictly better. Returns (best_scales (rows, ng), enc)."""
+    rows, in_f = w2d.shape
+    amax = _group_amax(w2d, grid)                        # (rows, ng)
+    cands = _candidate_scales(amax, grid, _SCALE_SWEEP_CANDIDATES)
+    best_err, _, _ = _eval_candidate(w2d, wq, cands[0], grid, mode, cb)
+    best_s = cands[0]
+    for si in range(1, cands.shape[0]):
+        err, _, _ = _eval_candidate(w2d, wq, cands[si], grid, mode, cb)
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        best_s = torch.where(better, cands[si], best_s)
+    # WLS refit: optimal continuous scale s* = sum(w g v) / sum(w g^2) per
+    # group at the current (fixed) assignment, snapped legal, accepted per
+    # group only when it strictly lowers real error.
+    for _ in range(_SCALE_SWEEP_REFIT_ITERS):
+        err_cur, _, g = _eval_candidate(w2d, wq, best_s, grid, mode, cb)
+        wcol = wq.reshape(rows, in_f) if wq is not None else torch.ones_like(g)
+        num = _group_reduce(wcol * g * w2d, grid)
+        den = _group_reduce(wcol * g * g, grid)
+        s_star = _snap_scale(torch.where(den > 0, num / den.clamp_min(1e-30),
+                                         best_s), grid)
+        err_star, _, _ = _eval_candidate(w2d, wq, s_star, grid, mode, cb)
+        better = err_star < err_cur
+        best_s = torch.where(better, s_star, best_s)
+    _, enc, _ = _eval_candidate(w2d, wq, best_s, grid, mode, cb)
+    return best_s, enc
+
+
+def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
+                  cb, cw2d: torch.Tensor | None, scale_sweep: bool) -> dict:
+    rows, in_f = w2d.shape
+    nvec_per_row = in_f // VEC_DIM
+    wq = _col_weight_vectors(cw2d) if cw2d is not None else None
+    if scale_sweep:
+        scales, enc = _sweep_encode(w2d, grid, mode, cb, wq)
+    else:
+        vectors, scales, _ = _scale_and_vectorize(w2d, grid)
+        enc = _mode_encode(vectors, mode, cb, wq)
+    out = _enc_to_fields(enc, mode, cb, rows, in_f, nvec_per_row)
+    out["scales"] = scales
+    return out
 
 
 def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
                     mode: str = "product",
                     col_weights: torch.Tensor | None = None,
-                    codebook: torch.Tensor | tuple | None = None) -> dict:
+                    codebook: torch.Tensor | tuple | None = None,
+                    scale_sweep: bool = True) -> dict:
     """Quantize ``w`` (2-D or 3-D stacked experts) into VQ fields.
+
+    ``scale_sweep`` (default True) jointly optimizes the per-group scale over
+    the E4M3-legal candidate grid (IQ-rendering parity); set False for the
+    one-shot amax/grid-max scale (A/B and the pre-c3f8c6d rendering).
 
     Returns at least {"indices", "scales"}; the resolved codebook is echoed
     back under "codebook" so reconstruct and the packer share one table.
@@ -442,13 +583,14 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
 
     row_step = max(1, _SLICE_MAX_ELEMS // max(in_f, 1))
     if rows <= row_step:
-        out = _fields_block(w2d, k, grid, mode, cb, cw2d)
+        out = _fields_block(w2d, k, grid, mode, cb, cw2d, scale_sweep)
     else:
         parts = []
         for a in range(0, rows, row_step):
             b = min(rows, a + row_step)
             cw = cw2d[a:b] if cw2d is not None else None
-            parts.append(_fields_block(w2d[a:b], k, grid, mode, cb, cw))
+            parts.append(
+                _fields_block(w2d[a:b], k, grid, mode, cb, cw, scale_sweep))
         out = {key: torch.cat([p[key] for p in parts], dim=0)
                for key in parts[0]}
     out["shape"] = orig_shape
@@ -485,12 +627,15 @@ def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",
     return recon
 
 
-def make_nvfp4_cb_qdq(k: int, grid: str = "fp4", mode: str = "product"):
+def make_nvfp4_cb_qdq(k: int, grid: str = "fp4", mode: str = "product",
+                      scale_sweep: bool = True):
     """Single-source emulation closure ``(w, col_weights=None) -> w_hat``
-    used by both cost and (Milestone B) the packer."""
+    used by both cost and (Milestone B) the packer. ``scale_sweep`` defaults
+    True (joint scale search, IQ-rendering parity)."""
     def f(w: torch.Tensor, col_weights: torch.Tensor | None = None
           ) -> torch.Tensor:
         fields = nvfp4_cb_fields(w, k, grid=grid, mode=mode,
-                                 col_weights=col_weights)
+                                 col_weights=col_weights,
+                                 scale_sweep=scale_sweep)
         return nvfp4_cb_reconstruct(fields, k, grid=grid, mode=mode).to(w.dtype)
     return f

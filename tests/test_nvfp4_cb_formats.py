@@ -102,6 +102,85 @@ def test_learned_codebook_beats_fixed():
     assert float(dist.max()) < 1e-5
 
 
+# scale sweep: joint per-group scale search (IQ-rendering parity).
+def _sweep_total_err(w, cw, grid, mode, k, scale):
+    cw2d = torch.broadcast_to(cw, w.shape).contiguous()
+    wq = cb._col_weight_vectors(cw2d)
+    C = cb._resolve_codebook(k, grid, mode, None, w.device)
+    err, _, _ = cb._eval_candidate(w, wq, scale, grid, mode, C)
+    return float(err.sum())
+
+
+@pytest.mark.parametrize("grid,mode,k", [
+    ("fp4", "full", 13), ("fp4", "product", 14), ("fp4", "signed", 14),
+    ("fp8", "product", 40),
+])
+def test_scale_sweep_never_worse_than_one_shot(grid, mode, k):
+    torch.manual_seed(0)
+    w = torch.randn(64, 512) * 0.3
+    cw = torch.rand(512) + 0.05
+    C = cb._resolve_codebook(k, grid, mode, None, w.device)
+    amax = cb._group_amax(w, grid)
+    cands = cb._candidate_scales(amax, grid, cb._SCALE_SWEEP_CANDIDATES)
+    # candidate 0 is the amax/grid-max one-shot; it is IN the sweep set.
+    one_shot = _sweep_total_err(w, cw, grid, mode, k, cands[0])
+    fields = cb.nvfp4_cb_fields(w, k, grid=grid, mode=mode, col_weights=cw,
+                                scale_sweep=True)
+    swept = _sweep_total_err(w, cw, grid, mode, k, fields["scales"])
+    assert swept <= one_shot + 1e-4
+
+
+@pytest.mark.parametrize("mode,k", [
+    ("full", 13), ("product", 14), ("signed", 14)])
+def test_scale_sweep_fp4_scales_are_e4m3_legal(mode, k):
+    torch.manual_seed(1)
+    w = torch.randn(48, 512) * 0.3
+    cw = torch.rand(512) + 0.05
+    fields = cb.nvfp4_cb_fields(w, k, grid="fp4", mode=mode, col_weights=cw,
+                                scale_sweep=True)
+    s = fields["scales"]
+    assert torch.equal(s, s.to(torch.float8_e4m3fn).to(torch.float32))
+    assert bool((s > 0).all())
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("mode", ["full", "product", "signed"])
+def test_scale_sweep_determinism(device, mode):
+    torch.manual_seed(2)
+    w = (torch.randn(48, 512, device=device) * 0.3)
+    qdq = cb.make_nvfp4_cb_qdq(14, "fp4", mode, scale_sweep=True)
+    assert torch.equal(qdq(w), qdq(w))
+
+
+def test_scale_sweep_toggle_changes_output_and_default_on():
+    torch.manual_seed(3)
+    w = torch.randn(64, 512) * 0.3
+    swept = cb.make_nvfp4_cb_qdq(14, "fp4", "product", scale_sweep=True)(w)
+    one_shot = cb.make_nvfp4_cb_qdq(14, "fp4", "product", scale_sweep=False)(w)
+    default = cb.make_nvfp4_cb_qdq(14, "fp4", "product")(w)
+    assert torch.equal(default, swept)          # default is scale_sweep=True
+    assert not torch.equal(swept, one_shot)     # the sweep actually moved
+
+
+def test_scale_sweep_decode_validity_holds():
+    # swept scales are still one E4M3 value per group-16, so decode == grid*scale
+    torch.manual_seed(4)
+    w = torch.randn(64, 512) * 0.3
+    fields = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode="product",
+                                scale_sweep=True)
+    recon = cb.nvfp4_cb_reconstruct(fields, 12, grid="fp4", mode="product")
+    pes = cb._per_element_scale(fields["scales"], "fp4", 512)
+    grid = cb._e2m1_grid("cpu")
+    dist = ((recon / pes).unsqueeze(-1) - grid).abs().min(dim=-1).values
+    assert float(dist.max()) < 1e-5
+
+
+def test_scale_sweep_does_not_change_effective_bits():
+    for k in (12, 14):
+        spec = fr.get_format(f"NVFP4_CB_K{k}")
+        assert spec.effective_bits == pytest.approx(k / 8 + 0.5, abs=1e-9)
+
+
 # signed mode: 8 explicit sign bits + (k-8)-bit positive-grid magnitude index.
 _SIGNED_KS = [13, 14, 15, 16]
 
@@ -141,8 +220,10 @@ def test_signed_separable_encode_is_joint_optimum():
     torch.manual_seed(9)
     w = torch.randn(8, 256)
     cwq = torch.rand(256) + 0.05
+    # sign-separability is a property of the fixed-scale encode; pin the
+    # one-shot scale so the joint search below sees the same scaled vectors.
     fields = cb.nvfp4_cb_fields(w, 13, grid="fp4", mode="signed",
-                                col_weights=cwq)
+                                col_weights=cwq, scale_sweep=False)
     mag = fields["codebook"]
     vecs, _, _ = cb._scale_and_vectorize(w, "fp4")
     wq = cb._col_weight_vectors(
@@ -161,13 +242,15 @@ def test_signed_separable_encode_is_joint_optimum():
 
 def test_signed_extends_ladder_beyond_flat_ceiling():
     # k=15,16 have no flat-full twin (MAX_FLAT_K=14); signed reaches them
-    # with tiny tables and beats product mode there.
+    # with tiny tables. At the one-shot scale signed edges product there
+    # (the scale sweep narrows this to a wash — see the module note); the
+    # durable invariant is that signed extends the exhaustive-optimal ladder.
     torch.manual_seed(10)
     w = torch.randn(128, 1024)
     cw = torch.rand(1024) + 0.05
     for k in (15, 16):
-        rs = cb.make_nvfp4_cb_qdq(k, "fp4", "signed")(w)
-        rp = cb.make_nvfp4_cb_qdq(k, "fp4", "product")(w)
+        rs = cb.make_nvfp4_cb_qdq(k, "fp4", "signed", scale_sweep=False)(w)
+        rp = cb.make_nvfp4_cb_qdq(k, "fp4", "product", scale_sweep=False)(w)
         assert _wmse(w, rs, cw) <= _wmse(w, rp, cw) + 1e-9
         with pytest.raises(ValueError, match="infeasible"):
             cb.fixed_lattice(k, "fp4", 8)
