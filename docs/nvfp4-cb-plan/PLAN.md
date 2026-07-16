@@ -159,3 +159,18 @@ export_native_compressed.py:6768, nvfp4_fused.py:250 bf16-MMA anti-pattern).
   NVFP4 + FP8_CB_K40 anchors; 4 paired calibration draws; exp-2 entropy
   piggyback. Driver scripts/exp1_nvfp4_cb_0p6b.py; results to
   docs/nvfp4-cb-plan/exp1_0p6b_results.md with gate verdicts.
+- **Exp-1 0.6B COMPLETE (1e14615):** ranking product < full < learned < IQ2_S
+  < IQ3_XXS << NVFP4 < FP8_CB — monotone, no anomalies. Agent self-caught a
+  lattice-data-scale measurement bug that would have falsely killed the family.
+  Verdicts: learned beats fixed −19/−30%; product penalty +33/+40%; smoothing
+  α=0.25 real (−7/−21%), α=0.5 neutral; exp-2 entropy CLOSED (≤0.03 bpw);
+  FP8_CB_K40 anchor 0.131 vs NVFP4 0.222 (+0.5bpw, single seed) — strong
+  first signal for the 4.5-8 family. **CB loses IQ2_S +66% at near-matched
+  bytes = kill-flag on one model** (formal kill needs 4B per gate).
+- **Fable diagnosis → Wave 3a (running):** the gap is structural — flat
+  codebooks burn entries on sign patterns (64 effective magnitude shapes at
+  k14 vs IQ2_S ~1024). "signed" mode dispatched to formats agent: 8 explicit
+  sign bits + m-bit positive-grid magnitude codebook, exactly-separable
+  weighted encode, kills the product penalty, tables ≤256 entries. Rungs
+  S13..S16 (S16 = 2.5bpw direct IQ2_S competitor). Then: 0.6B signed rerun
+  (exp agent), then 4B check with best variant.
