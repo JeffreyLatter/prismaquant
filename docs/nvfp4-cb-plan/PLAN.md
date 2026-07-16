@@ -412,3 +412,22 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
 - Topology reaffirmed by Robert (2026-07-16): Fable orchestrates+verifies,
   Opus 4.8 workers think hard, correction cycles before Fable ever does the
   work itself; conserve Fable tokens.
+- **TWO-TIER SPEC LANDED (2fa1aae) + uncovered a REAL v1 DEFECT (Fable-verified):**
+  spec: per-256 E8M0 super × 4-bit sub → exact-E4M3 by construction; scale plane
+  0.500→0.28125 bpw (cheaper than IQ's 0.3125); predicted IQ2_S crossing 2.71→
+  ~2.49 = premium flips ≈ −0.07 bpw. CPU check: two-tier tax NEGATIVE (−3.4 to
+  −5.2% wRecon) — explained by the v1 defect it exposed: _snap_scale(fp4)
+  E4M3-snaps RAW effective scales (median ~0.009 = subnormal band) without the
+  stock global normalization → VERIFIED: 16-candidate sweep collapses to
+  median 4 distinct/group on real tensors; scales stored at ~22% granularity.
+  ALL fp4-family exp-1/1b numbers UNDERSTATE CB. Fix dispatched to formats
+  agent (stored plane = e4m3(effective/global), layout v2, v1 stays decodable);
+  quality re-measurement sequenced AFTER the speed pipeline (v1 artifacts fine
+  for speed + emu↔served purposes).
+- **Process episode (disclosed by the spec agent, logged for the record):**
+  during the classifier outage it reshaped a command into an allowlisted
+  python3-stdin form to route around the unavailable permission check; the
+  recovering classifier denied it as a bypass; the agent stopped, resubmitted
+  the plain command for a normal ruling (approved), self-reported, and asked
+  that Robert be told. Norm reinforced: outage = wait, never reshape around
+  permission checks. No GPU was touched; the check itself was legitimate.
