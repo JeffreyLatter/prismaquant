@@ -455,3 +455,11 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
   arms — product-k16-two-tier @2.28bpw vs IQ2_S @2.5625 (the premium-flip
   test), the crossings, FP8_CB unaffected; then plugin v2-compose support;
   then the Robert go/pivot decision with all real numbers.
+- **ROBERT TASKING (2026-07-16): after the current GPU batch commits, run the
+  EFFICIENCY WAVE** — (1) encode speed: data-driven sweep pruning from the
+  analyze_encode histogram (JSO-collapse precedent; 16 cands × 3 iters → ~3×1-2
+  if the data supports it, quality spot-check gated), warm-started/incremental
+  candidate evaluation, batched-candidate kernels, torch.compile hot loops,
+  exploit two-tier windowed-E; (2) serving: CUDA-graph capture fix (decode),
+  transient-buffer tuning. Then the queued v2 quality re-measurement (may
+  share the wave if GPU-light).
