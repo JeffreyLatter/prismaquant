@@ -531,3 +531,38 @@ Roadmap to goal (live):
   constant ≠ fitted regression; the micro-sweep bounds residual formula error.
 - Menu agent: smoke mid-run (probe cleared, cost stage exercising the fresh
   lockstep fix live).
+- **Menu-agent 0.6B pipeline SMOKE — PASS** (EXPORT_CONTAINER=nvfp4_cb,
+  COST_MODE=local, TARGET_PROFILE=nvfp4_cb; export git e11ec76, which contains
+  the lockstep fix c8549c9). probe → local cost → allocate @3.0 bpp mixed menu
+  → harvest imatrix col-weights → export_nvfp4_cb; exit 0, coverage gates silent.
+  * **Allocator composition** (achieved 2.999 bpp, 195 CB targets):
+    NVFP4_CB_K16×150, FP8_CB_K44×36, NVFP4_CB_K20×8, NVFP4_CB_K24×1, BF16×1 — a
+    genuine MIXED container (fp4-CB dominant, FP8-CB carrying the sensitive tail,
+    "FP8 in every recipe"). The 1 BF16 (layers.2.mlp.down_proj) is a DP
+    budget-spend on the most sensitive Linear, NOT a %256 fallback (in=3072 is
+    256-legal) — validates BF16↔CB mixing. Plain NVFP4/FP8_DYNAMIC got 0 (CB
+    Pareto-dominates them sub-4.5 bpw).
+  * **Wall-clock 38.2 min** (probe→export): cost 2065 s / alloc 14 s /
+    export 211 s. The cost stage DOMINATES — CB families render via per-slice
+    weighted VQ + scale sweep (196 Linears × 3 CB rungs). This is exactly the
+    encode-speed target of the queued EFFICIENCY WAVE (sweep pruning /
+    batched-candidate), not a correctness issue.
+  * **The lockstep fix (c8549c9) was load-bearing:** `_batched_quantize` RAISED
+    on CB specs before it ("Unknown weight_element_dtype") — CB cost was BROKEN
+    in batched mode, which run-pipeline uses. The 34-min cost stage completing is
+    the at-scale proof the CB branch works and stays imatrix-weighted (cost ==
+    shipped bytes).
+  * **Artifact:** `/home/rob/dq-runs/smoke-nvfp4-cb-0p6b/exported_nvfp4_cb`
+    (0.804 GB; quant_method=prismaquant, layout v1, 4 config_groups,
+    195 cb_qweight + 36 fp8 weight_scale + 10 lattice codebooks, 3 BF16 ignore,
+    scale_sweep=True). All 6 fp4 codebook tables exactly on the E2M1 grid
+    (decode ⇒ bit-compatible NVFP4).
+  * **Bit-exact spot-unpack** (served-shipped bytes, cuda): NVFP4_CB_K16
+    down_proj `unpack == emulation` TRUE (relerr 0.322) — lockstep proven on a
+    real shipped Linear; FP8_CB_K44 k_proj artifact-decode relerr 0.042 == fresh
+    round-trip 0.042, `pack == unpack` TRUE (valid). Its non-bit-equality vs the
+    CURRENT emulation is the fp8 encode-tier work landed AFTER the export commit
+    (e11ec76→10f121d), not an artifact defect (K2 already served FP8_CB_K44 @
+    KL 0.021).
+  * Verdict: the nvfp4_cb lane is END-TO-END FUNCTIONAL; encode speed is the next
+    lever, not correctness.
