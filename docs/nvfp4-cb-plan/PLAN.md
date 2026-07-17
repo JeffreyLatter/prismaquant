@@ -516,3 +516,18 @@ Roadmap to goal (live):
   IDs — same landmine class as the pkill-self-match incidents. No collateral
   this time (checked). NORM going forward, folded into all container-using
   prompts: track exact container IDs at creation; never pattern-kill.
+- **CLOSED-FORM SCALE CRACK (Fable, hands-on, 2026-07-16):** Robert challenged
+  a closed-form alternative to the exhaustive sweep. Result: the optimal scale
+  is a USAGE-CALIBRATED second-moment match s0=sqrt(Σqw²/(q̄·m2_used·in));
+  naive all-codeword m2 fails (wrong basin, refits trapped — why analytical
+  damp died); m2_used calibrated from ONE pilot encode per (codebook,role)
+  finds the basin (pred ratios 1.28-1.47 vs sweep 1.41-1.46) and hits
+  err 1.14×-sweep with 3 assigns vs 48 (down_proj 1.72× → per-role
+  calibration). Production design: s0 init + micro-sweep ±2 + 1-2 refits ≈
+  ~10× on the dominant encode cost. Handed to formats agent for tier
+  integration + re-validation with real imatrix + fp4/v2. Validated on
+  FP8_CB_K44 product, 3 real 0.6B Linears, harness verified bit-exact vs
+  library. Lesson vs damp graveyard: stationarity-condition-with-measured-
+  constant ≠ fitted regression; the micro-sweep bounds residual formula error.
+- Menu agent: smoke mid-run (probe cleared, cost stage exercising the fresh
+  lockstep fix live).
