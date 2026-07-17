@@ -580,3 +580,15 @@ Roadmap to goal (live):
   **Verdict: GO for the 27B production run** (AURA mixed menu incl. CB rungs
   vs PrismaAURA-5.5 at matched bpw). Emulation gate, 0.6B, single model —
   27B + served vLLM KL remain the promotion bar.
+- **EXP-1C: PREMIUM FLIPPED (48f7d2d) — GO for 27B.** CB18-v2 @2.53bpw beats
+  IQ2_S @2.56 by −25% KL at FEWER bytes (strict domination, native decode);
+  v2 curve reaches IQ2_S quality at ~2.42bpw → native-FP4 premium ≈ −0.15bpw
+  (v1: +0.15). Low rungs (K14/K16) trail their twins (index-rate limit,
+  allocator prices them out). v1 repro within noise; byte cut KL-free.
+- **Disk solved for the roadmap:** hy3-prod cleanup freed ~810GB (published/
+  re-downloadable/regenerable bulk deleted; probe/cost/config/scripts kept)
+  → 900GB free (49%).
+- **27B preflight (running):** exporter stock-rung (NVFP4/FP8) CT-style
+  packing + plugin-delegation smoke on a full-menu 0.6B. Then the 27B run:
+  AURA-era matched-bpp bar — full mixed menu @5.5bpp vs shipped
+  PrismaAURA-5.5, served gold metric.
