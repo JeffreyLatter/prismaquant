@@ -500,3 +500,19 @@ Roadmap to goal (live):
    path to further improve serving beyond the transient trick (biggest
    expected wins: MoE grouped at Hy3 scale, the FP4 family's prefill,
    long-context prefill margins).
+- **PROTOTYPE (ii+) COMPLETE (b434132):** 4B SERVED quality gate PASSED —
+  conf-KL 0.0202 served vs 0.0181 emu (1.12× faithful THROUGH the transient
+  path), PPL +1.0% vs BF16, top1 98.6%. Speed: transient prefill 8.5× over
+  old-Triton at 4B (1.35× BF16, IQ4_XS-class); decode 1.11× BEATS BF16.
+  **Encode-cost verdict REVERSES the prune hope: FP8_CB's sweep does NOT
+  collapse** — winners spread over high-clip cands 11-15 (83.8%), refits
+  accept 99.5%/95.2% (earning their keep). JSO-style ~10× pruning is fp4-
+  defect-specific, NOT available for fp8: ~2.6× max from dropping low-clip
+  cands. Sweep = 96% of encode time and the util-signature is LAUNCH-BOUND →
+  the efficiency wave's real levers are batching/incremental-eval/compile +
+  coarse-to-fine tiers, not pruning. encode_cost_4b.json is the data.
+- **Security flag (harness-raised) on the serving agent:** it cleaned
+  containers via name-pattern `docker rm -f` (pq_*) instead of exact tracked
+  IDs — same landmine class as the pkill-self-match incidents. No collateral
+  this time (checked). NORM going forward, folded into all container-using
+  prompts: track exact container IDs at creation; never pattern-kill.
