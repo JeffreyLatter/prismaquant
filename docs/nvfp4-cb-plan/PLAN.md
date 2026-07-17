@@ -485,3 +485,18 @@ Roadmap to goal (live):
 8. [then] Hy3/DSv4-class ultra-low-bit (encode-cost prunes prerequisite;
    MoE grouped transient path; possibly fused kernel if transient
    insufficient at that scale).
+
+## GOAL AMENDED (Robert, 2026-07-16):
+1. **Quantization-time optimization is HIGHLY PRIORITIZED** — fast quantization
+   is highly prized; weeks-per-300B is unacceptable. Target: 300B-class encode
+   in ~a day at most, ideally hours. The efficiency wave is promoted from
+   "queued housekeeping" to a first-class workstream with an explicit
+   SPEED/ACCURACY TRADEOFF deliverable: tiered encode
+   (fast / balanced / max-quality), each tier's wall-clock AND quality delta
+   measured (JSO-collapse discipline: prune only what the histogram + quality
+   spot-checks justify; report the curve, let the artifact owner pick the tier).
+2. **CUTLASS fused kernels: AFTER validity is proven** (v2 quality
+   re-measurement + the 27B production bar), build the fused-expand CUTLASS
+   path to further improve serving beyond the transient trick (biggest
+   expected wins: MoE grouped at Hy3 scale, the FP4 family's prefill,
+   long-context prefill margins).
