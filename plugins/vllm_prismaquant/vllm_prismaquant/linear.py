@@ -11,6 +11,8 @@ per-output-row offset (``cb_row_offset``) so fusion stays correct.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
@@ -22,6 +24,7 @@ from vllm.model_executor.parameter import (
 )
 
 from . import codec
+from .expand import expand_cb_to_value
 from .ops import cb_gemm
 
 # Fallback fused mapping if the config's packed_modules_mapping is unset.
@@ -29,6 +32,17 @@ _FUSED_FALLBACK = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
 }
+
+# M-gate for the CB dispatch (GGUF's mmvq_safe pattern, quantization/linear.py
+# :34-57): M<=threshold is the decode regime -> keep the bf16-MMA Triton
+# decode-GEMM; M>threshold is prefill -> transiently expand FP8_CB to a native
+# fp8 tile and hit vLLM's stock W8A8 fp8 GEMM (native tensor cores). NVFP4_CB
+# stays on the Triton path either way (transient FP4 needs FP4-MMA, out of
+# scope). 16 mirrors the decode/prefill split the decode kernel already tiles at.
+# Env-overridable so the prefill A/B (old Triton path vs transient native GEMM)
+# is a serve-flag toggle: set PRISMAQUANT_PREFILL_M_THRESHOLD huge to force the
+# Triton decode path at prefill (isolates the transient-expansion lever).
+PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"))
 
 
 @register_weight_loader_v2_supported_method
@@ -117,14 +131,43 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         layer._cb_K = layer._cb_input_size
 
     def apply(self, layer, x, bias=None):
-        if self.is_fp4:
-            xq = codec.fp4_group16_act_qdq(x)
-        else:
-            xq = codec.fp8_dynamic_act_qdq(x)
-        y = cb_gemm(xq, layer._cb_qw_padded, layer._cb_flat,
-                    layer._cb_row_offset, layer._cb_scale,
-                    layer._cb_N, layer._cb_K, self.k, self.n_sub,
-                    self.type_size, self.is_fp4)
-        if bias is not None:
-            y = y + bias
-        return y
+        N, K = layer._cb_N, layer._cb_K
+        M = x.reshape(-1, K).shape[0]
+        # NVFP4_CB (transient FP4 out of scope) and the decode regime (M small)
+        # keep the existing bf16-MMA Triton decode-GEMM path, unchanged.
+        if self.is_fp4 or M <= PREFILL_M_THRESHOLD:
+            if self.is_fp4:
+                xq = codec.fp4_group16_act_qdq(x)
+            else:
+                xq = codec.fp8_dynamic_act_qdq(x)
+            y = cb_gemm(xq, layer._cb_qw_padded, layer._cb_flat,
+                        layer._cb_row_offset, layer._cb_scale,
+                        N, K, self.k, self.n_sub,
+                        self.type_size, self.is_fp4)
+            if bias is not None:
+                y = y + bias
+            return y
+
+        # FP8_CB prefill (M large): transiently expand THIS layer's packed
+        # weight into a native fp8 tile and call vLLM's stock per-channel W8A8
+        # fp8 GEMM (native tensor cores), then free the tile. An expanded
+        # FP8_CB weight IS a standard per-channel fp8 checkpoint (codebook
+        # values on the e4m3 grid; layer.weight_scale per output channel).
+        # INV-1: the [N,K] tile is bounded to one layer (expand -> GEMM ->
+        # free), never resident/model-wide (the NVINT2 OOM trap). `ops` is
+        # imported lazily so the module still imports without vLLM (venv tests).
+        import vllm._custom_ops as ops
+        W_value = expand_cb_to_value(
+            layer._cb_qw_padded, layer._cb_flat, layer._cb_row_offset,
+            N, K, self.k, self.n_sub, self.type_size, self.is_fp4)  # [N,K] bf16
+        # Lossless: every codebook value is already on the e4m3 grid.
+        W_e4m3 = W_value.to(torch.float8_e4m3fn)
+        x2 = x.reshape(-1, K)
+        xq, sa = ops.scaled_fp8_quant(x2, use_per_token_if_dynamic=True)
+        # scale_b is the per-output-channel weight scale as [N, 1] (matches
+        # vLLM's stock per-channel fp8 scheme; verified against a fp32 dequant
+        # reference in tests/test_transient_fp8.py::test_transient_gemm_*).
+        ws = layer._cb_scale.reshape(N, 1)
+        out = ops.cutlass_scaled_mm(xq, W_e4m3.t(), sa, ws, torch.bfloat16, bias)
+        del W_value, W_e4m3
+        return out.reshape(*x.shape[:-1], N)

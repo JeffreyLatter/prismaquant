@@ -57,18 +57,20 @@ def _cb_decode_gemm_kernel(
 
     # --- per-column (within one 256-superblock) decode constants ------------
     kcol = tl.arange(0, 256)
-    v_local = kcol // 8                       # which of the 32 codewords
     coord = kcol % 8                          # coord inside the 8-dim vector
     sub = coord // SUB_DIM                     # which sub-codebook
     local = coord % SUB_DIM                    # coord inside the sub-vector
-    bitpos = v_local * K_BITS
-    byte_base = (bitpos // 8).to(tl.int64)     # first byte of the codeword
-    bit_in_byte = bitpos % 8
+    # Per-CODEWORD byte addressing (32 distinct codewords, one per 8-dim vector):
+    # 8 consecutive columns share codeword v = kcol//8, so the byte window is
+    # loaded once per v (not per column) and broadcast — ~8x fewer byte loads.
+    v = tl.arange(0, 32)
+    byte_base_v = ((v * K_BITS) // 8).to(tl.int64)   # first byte of codeword [32]
+    bit_in_byte_v = (v * K_BITS) % 8                  # [32]
     mask_k = (1 << K_BITS) - 1
     shift_sub = sub * SUB_W
     mask_sub = (1 << SUB_W) - 1
     cb_base = sub * ((1 << SUB_W) * SUB_DIM)   # flat-codebook block base
-    grp16 = kcol // 16                          # group-16 index inside superblock
+    grp16v = tl.arange(0, 16)                   # 16 distinct group-16 scales [16]
 
     # Per-output-row codebook base offset (0 for a single-codebook Linear; for a
     # fused qkv/gate_up module each shard's rows point at that role's block of
@@ -84,26 +86,37 @@ def _cb_decode_gemm_kernel(
         sc_row = tl.load(scale_ptr + offs_n_i, mask=mask_n, other=0.0)  # [BN]
 
     for s in range(0, n_sb):
-        col_byte = s * TYPE_SIZE + byte_base                       # [256] int64
-        # --- expand the codeword for every (row, kcol) IN REGISTERS ---------
-        # 8-byte little-endian window; masked to K_BITS -> the extra bytes
-        # (scale plane / next superblock) fall away. INV-1: no dense weight.
-        code = tl.zeros((BLOCK_N, 256), dtype=tl.int64)
-        base_ptr = offs_n_i[:, None] * stride_qn + col_byte[None, :]
+        col_byte_v = s * TYPE_SIZE + byte_base_v                   # [32] int64
+        # --- decode 32 codewords ONCE, then expand to 256 cols IN REGISTERS -
+        # 8-byte little-endian window per codeword; masked to K_BITS -> the
+        # extra bytes (scale plane / next superblock) fall away. Only 32
+        # distinct codewords per superblock, so load them once (~8x fewer byte
+        # loads) and broadcast each across its 8 columns. INV-1: no dense weight.
+        code32 = tl.zeros((BLOCK_N, 32), dtype=tl.int64)
+        base_ptr = offs_n_i[:, None] * stride_qn + col_byte_v[None, :]
         for i in range(0, 8):
             b = tl.load(qw_ptr + base_ptr + i, mask=mask_n[:, None],
                         other=0).to(tl.int64)
-            code = code | (b << (8 * i))
-        code = (code >> bit_in_byte[None, :]) & mask_k
+            code32 = code32 | (b << (8 * i))
+        code32 = (code32 >> bit_in_byte_v[None, :]) & mask_k       # [BN,32]
+        # reshape [BN,32,8]->[BN,256] maps column kcol -> codeword kcol//8.
+        code = tl.reshape(tl.broadcast_to(code32[:, :, None],
+                                          (BLOCK_N, 32, 8)), (BLOCK_N, 256))
         sub_idx = (code >> shift_sub[None, :]) & mask_sub          # [BN,256]
         gather = (cb_off[:, None] + cb_base[None, :]
                   + sub_idx * SUB_DIM + local[None, :])
         val = tl.load(cb_ptr + gather).to(tl.float32)             # [BN,256]
 
         if IS_FP4:
-            grp = s * 16 + grp16                                    # [256]
-            sc = tl.load(scale_ptr + offs_n_i[:, None] * stride_sn + grp[None, :],
-                         mask=mask_n[:, None], other=0.0)          # [BN,256]
+            # 16 distinct group-16 scales per superblock: load once and
+            # broadcast each across its 16 columns (reshape [BN,16,16]->[BN,256]
+            # maps column kcol -> group kcol//16), ~16x fewer scale loads.
+            grpv = s * 16 + grp16v                                  # [16]
+            sc16 = tl.load(
+                scale_ptr + offs_n_i[:, None] * stride_sn + grpv[None, :],
+                mask=mask_n[:, None], other=0.0)                   # [BN,16]
+            sc = tl.reshape(tl.broadcast_to(sc16[:, :, None],
+                                            (BLOCK_N, 16, 16)), (BLOCK_N, 256))
             w = (val * sc).to(tl.bfloat16)
         else:
             w = (val * sc_row[:, None]).to(tl.bfloat16)            # [BN,256]
