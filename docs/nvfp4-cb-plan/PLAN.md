@@ -628,3 +628,17 @@ Roadmap to goal (live):
     exporter still writes a `config_file` pointer (the "serve export driver"
     step, out of the codebook scope). `scripts/smoke_nvfp4_cb_delegation.sh`
     carries the export + vLLM load/generate, marked blocked on (a)/(b).
+- **DELEGATION LIVE (018f72a):** mixed serve smoke tally 98 CB + 14 stock-CT +
+  1 unquantized = composition-exact; lazy config resolution fixed (pointer-
+  style configs, production-critical); degraded generation differentially
+  attributed to v1-fp4-at-low-bpw, NOT delegation. All 27B gates GREEN.
+- **27B PRODUCTION RUN DISPATCHED** (menu agent, end-to-end): Qwen3.6-27B
+  @5.5bpp, menu = stock NVFP4/FP8/BF16 + FP8_CB_K36-K48 (fp4-CB deliberately
+  excluded: irrelevant at 5.5bpp + needs plugin v2-compose). Gold-metric A/B
+  vs downloaded rdtand/Qwen3.6-27B-PrismaAURA-5.5bit, same BF16 session;
+  + 27B speed table (no-prefill-degradation proof at scale); honesty reqs
+  (matched-bpp accounting, menu+cost bundling caveat) in the dispatch.
+  Research A/B — NO HF publishing.
+- **Plugin v2-compose DISPATCHED in parallel** (serving agent): two-tier fp4
+  serving (in-kernel scale compose per spec §4, both prefill paths, v1/v2
+  dispatch) — the Hy3/DSv4 ultra-low-bpp lane prerequisite.
