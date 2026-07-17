@@ -4,7 +4,7 @@
 
 **The honest frame (per `rd_ceiling_study.md` + its reviewer correction).** Matched-bytes CB-vs-IQ is NOT the decision: the FP4-grid *value* tax is small (+4.5% full / +10% signed), and the residual matched-bytes gap is a STRUCTURAL scale-packaging tax — NVFP4's mandatory group-16 E4M3 scale (0.500 bpw) vs IQ's amortised two-tier scale (~0.3125 bpw) ⇒ **~0.19 bpw**, which is MITIGABLE by reconstructing a two-tier scale in the kernel prologue. So CB losing IQ at matched bytes is EXPECTED. **The decision number is the native-FP4-speed PREMIUM:** the extra bpw at which CB reaches IQ2_S's and IQ3_XXS's KL (the price of tensor-core-native FP4 serving, which the emulation cannot reward).
 
-- git `a5a0d2241c62e341234ffb7c13011786aa07f01f` · 196 target Linears · 7 roles · imatrix E[x²] col_weights (paired per seed).
+- git `a0c0a68040f35de98a4373778dfcbc262371ec94` · 196 target Linears · 7 roles · imatrix E[x²] col_weights (paired per seed).
 - Corrections since exp-1: (a) CB now uses the SAME E4M3-legal scale sweep IQ always had; (b) sign-factored `signed` mode; (c) byte-match via SHARED per-role learned codebooks (per-tensor sidecar is not byte-competitive).
 - Mode/compute: full-k16 + sweep is 56 s/Linear (≈3 h/seed) so it is a 1-seed stronger-mode anchor; the break-even sweep uses learned-shared PRODUCT mode (fast) which slightly UNDER-estimates full-mode CB quality — so the measured premium is a CONSERVATIVE UPPER BOUND (true premium is smaller).
 
@@ -20,8 +20,8 @@
 | IQ4XS | 2 | W4A4/W8A8 | 4.250 | 4.250 | 0.0597±0.0003 | 0.1035 | 0.973 | 196 |
 | PROD_shared_k16 | 2 | W4A4/W8A8 | 2.500 | 2.500 | 2.2102±0.0923 | 2.2393 | 0.445 | 196 |
 | PROD_shared_k20 | 2 | W4A4/W8A8 | 3.000 | 3.001 | 0.7429±0.0237 | 0.9013 | 0.737 | 196 |
-| PROD_shared_k24 | 1 | W4A4/W8A8 | 3.500 | 3.504 | 0.3658±0.0000 | 0.4770 | 0.859 | 196 |
-| PROD_shared_k28 | — | W4A4/W8A8 | 4.000 | 4.017 | (footprint only) | — | — | — |
+| PROD_shared_k24 | 2 | W4A4/W8A8 | 3.500 | 3.504 | 0.3705±0.0046 | 0.4813 | 0.859 | 196 |
+| PROD_shared_k28 | 1 | W4A4/W8A8 | 4.000 | 4.017 | 0.2298±0.0000 | 0.3319 | 0.902 | 196 |
 | FULL_k16_shared | — | W4A4/W8A8 | 2.500 | 2.533 | (footprint only) | — | — | — |
 | SIG16_shared | 4 | W4A4/W8A8 | 2.500 | 2.500 | 2.7504±0.0725 | 2.7177 | 0.405 | 196 |
 | SIG16_shared_smooth025 | 4 | W4A4/W8A8 | 2.500 | 2.500 | 2.6695±0.1733 | 2.6784 | 0.419 | 196 |
@@ -40,13 +40,14 @@ learned-SHARED-per-role PRODUCT-mode NVFP4-CB (fast, conservative upper bound) v
 |---|---|---|---|
 | PROD_shared_k16 | 2.500 | 2.2102±0.0923 | 0.445 |
 | PROD_shared_k20 | 3.001 | 0.7429±0.0237 | 0.737 |
-| PROD_shared_k24 | 3.504 | 0.3658±0.0000 | 0.859 |
+| PROD_shared_k24 | 3.504 | 0.3705±0.0046 | 0.859 |
+| PROD_shared_k28 | 4.017 | 0.2298±0.0000 | 0.902 |
 | IQ2S | 2.562 | 1.5837±0.0751 | 0.568 |
 | IQ3XXS | 3.062 | 0.4139±0.0112 | 0.837 |
 | IQ4XS | 4.250 | 0.0597±0.0003 | 0.973 |
 
 - **Crossing IQ2_S** (KL 1.584 @ 2.562 bpw): product-CB reaches it at ≈**2.71 bpw** ⇒ native-FP4 premium ≈ **+0.15 bpw** (conservative upper bound).
-- **Crossing IQ3_XXS** (KL 0.414 @ 3.062 bpw): product-CB reaches it at ≈**3.44 bpw** ⇒ premium ≈ **+0.38 bpw**.
+- **Crossing IQ3_XXS** (KL 0.414 @ 3.062 bpw): product-CB reaches it at ≈**3.45 bpw** ⇒ premium ≈ **+0.38 bpw**.
 
 ### FP8-CB mid-range — does it WIN per-byte?
 
@@ -86,7 +87,7 @@ At matched TOTAL bytes CB is expected to trail IQ by ~0.19 bpw of scale-packagin
 
 ## BOTTOM LINE — go / pivot / shelve
 
-- (i) **NVFP4_CB native-FP4 premium** to MATCH IQ2_S quality ≈ **+0.15 bpw** (crossing ≈2.71 bpw); to match IQ3_XXS ≈ **+0.38 bpw** (crossing ≈3.44 bpw) — the premium GROWS with bpw. Both are CONSERVATIVE upper bounds (product mode under-estimates full) and both sit at/near the ~0.19 bpw structural scale-tax the RD study predicts — i.e. the price of native-FP4 tiles, mitigable to ~0 with an in-kernel two-tier scale.
+- (i) **NVFP4_CB native-FP4 premium** to MATCH IQ2_S quality ≈ **+0.15 bpw** (crossing ≈2.71 bpw); to match IQ3_XXS ≈ **+0.38 bpw** (crossing ≈3.45 bpw) — the premium GROWS with bpw. Both are CONSERVATIVE upper bounds (product mode under-estimates full) and both sit at/near the ~0.19 bpw structural scale-tax the RD study predicts — i.e. the price of native-FP4 tiles, mitigable to ~0 with an in-kernel two-tier scale.
 - (ii) **FP8_CB mid-range**: NO FP8_CB rung beats its nearest IQ point per-byte (IQ4_XS's 4-dim non-FP4 grid is hard to beat at 4–5.5 bpw). FP8CB_K36@4.53=0.059 vs IQ4XS@4.25=0.060; FP8CB_K40@5.03=0.031 vs IQ4XS@4.25=0.060; FP8CB_K44@5.53=0.019 vs IQ4XS@4.25=0.060.
 - (iii) **Sub-3-bpw NVFP4_CB** is the promising lane: it reaches IQ2_S quality at ~+0.15 bpw and BEATS IQ2_S outright by ~3 bpw (KL 0.74 vs 1.58 at 3.0 bpw) while decoding to native FP4 — the whole point. FP8_CB does not add a per-byte win over IQ4 in this band, so the mid-range is IQ/kernel-bound, not a CB opportunity.
 
