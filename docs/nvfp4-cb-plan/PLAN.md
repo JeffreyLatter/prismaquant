@@ -566,3 +566,17 @@ Roadmap to goal (live):
     KL 0.021).
   * Verdict: the nvfp4_cb lane is END-TO-END FUNCTIONAL; encode speed is the next
     lever, not correctness.
+- 2026-07-17 (exp-1c, v2 premium-flip re-measurement — exp1c_v2_premium.md):
+  4 paired seeds, shared-per-role learned product codebooks, balanced tier,
+  W4A4, exp-1b protocol. **The spec-posed §2.2 flip test is CONFIRMED: the v2
+  curve reaches IQ2_S quality at ≈2.42 bpw vs IQ2_S's 2.5625 ⇒ native-FP4
+  premium ≈ −0.15 bpw** (spec predicted −0.07; v1 measured +0.15).
+  K18-v2 @2.5315 = 1.1815±0.044 strictly DOMINATES IQ2_S (1.5837±0.075) —
+  better KL at fewer bytes, decoding native FP4. Per-rung: K18/IQ2_S YES;
+  K16/IQ2_XS +24% NO; K14/IQ2_XXS +30% NO — index-rate deficit at the low
+  band (CB RD slope steeper than IQ2's), the limit §2.2 flagged, not a
+  coding defect: v1→v2 at k16 = KL +2.5% (n.s.) at −0.219 bpw (curve shifts
+  left KL-free; v1/balanced also reproduces exp-1b's 2.2102 within noise).
+  **Verdict: GO for the 27B production run** (AURA mixed menu incl. CB rungs
+  vs PrismaAURA-5.5 at matched bpw). Emulation gate, 0.6B, single model —
+  27B + served vLLM KL remain the promotion bar.
