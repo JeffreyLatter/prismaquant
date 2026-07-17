@@ -592,3 +592,39 @@ Roadmap to goal (live):
   packing + plugin-delegation smoke on a full-menu 0.6B. Then the 27B run:
   AURA-era matched-bpp bar — full mixed menu @5.5bpp vs shipped
   PrismaAURA-5.5, served gold metric.
+- **Menu-agent MIXED-CONTAINER stock-rung export — DONE (export side).** The
+  gap answer is **(b)**: export_nvfp4_cb's coverage gate hard-rejected any
+  non-CB/non-BF16 format. Now it packs stock **NVFP4 / FP8_DYNAMIC** CT-style,
+  reusing the export_native_compressed codecs verbatim (`_quantize_2d`, RTN
+  default levers = the cost render; M19 scale-fidelity by construction); fused
+  NVFP4 siblings share one `weight_global_scale` (max over the group).
+  * **config_groups dispatch marker:** stock groups carry the exact CT scheme
+    vocabulary (`NVFP4_SCHEME`/`FP8_E4M3_SCHEME`, `nvfp4-pack-quantized` /
+    `float-quantized`) with **no `"scheme"` key**; CB groups keep `"scheme"`.
+    CONFIRMED aligned with the serving agent's concurrent delegation (config.py
+    `_build_ct_config` feeds the non-`scheme` groups to a real
+    CompressedTensorsConfig).
+  * **Codebooks → `cb_codebooks.pqcb` sidecar** (safetensors, non-globbed ext,
+    keyed by `codebook_ref`) + a `codebook_file` pointer in config.json &
+    quant_config.json; **sidecar-only** (dropped the in-safetensors copies) so
+    vLLM's `*.safetensors` globber never sees non-param tensors — the exact
+    plugin `get_codebooks` contract.
+  * **Composition finding:** the FULL menu @3.5 bpp/0.6B allocates **all-CB**
+    (196 Linears across NVFP4_CB_K18..K24 + FP8_CB_K36..K48, **zero stock**) —
+    FP8_CB Pareto-dominates stock NVFP4/FP8_DYNAMIC at this scale (exp1c). A
+    stock-favoring menu (drop FP8_CB) @3.5 bpp gives a real allocation with
+    **FP8_E4M3×36 + NVFP4×1**, which exported CLEAN on the real 0.6B: NVFP4 quad
+    (weight_packed/weight_scale/weight_global_scale/input_global_scale), FP8
+    pair (weight/weight_scale), 8-tensor `.pqcb`, 0 codebooks in model.safetensors.
+  * **Tests:** 10 new (stock round-trips bit-exact vs the CT codec; mixed
+    config_groups schema; fused global-scale share; `.pqcb` sidecar contract);
+    full CB suite green (162). One owner-test line authorized (`nv_fp`→`MXFP4`,
+    now a correctly-accepted NVFP4 alias) + 2 codebook-read lines updated to the
+    `.pqcb` (mechanical consequence of the sidecar move).
+  * **REMAINING serving-agent territory (task-2b vLLM smoke deferred behind
+    both):** (a) plugin stock-CT delegation — was stubbed, now being
+    implemented concurrently (config.py + test_delegation.py); (b) config.json
+    `config_groups` **inlining** — plugin `from_config` needs them inlined, the
+    exporter still writes a `config_file` pointer (the "serve export driver"
+    step, out of the codebook scope). `scripts/smoke_nvfp4_cb_delegation.sh`
+    carries the export + vLLM load/generate, marked blocked on (a)/(b).

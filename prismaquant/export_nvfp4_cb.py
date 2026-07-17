@@ -202,23 +202,46 @@ def export_nvfp4_cb(
     assignment = load_assignment(layer_config_path)
     skeleton = _load_skeleton(model_dir)
 
-    # --- Coverage gate: classify + validate every assigned format. ---
+    # Reuse the compressed-tensors codecs + scheme templates for stock rungs —
+    # NEVER reimplement packing. M19 scale-fidelity: `_quantize_2d` renders and
+    # packs from ONE scale selection, so the shipped scales ARE the render's.
+    from copy import deepcopy as _deepcopy
+    from prismaquant import format_registry as _fr
+    from prismaquant.export_native_compressed import (
+        _quantize_2d as _ct_quantize_2d,
+        compute_nvfp4_global_real as _ct_nvfp4_global_real,
+        _explicit_regex as _ct_explicit_regex,
+        NVFP4_SCHEME as _NVFP4_SCHEME,
+        FP8_E4M3_SCHEME as _FP8_E4M3_SCHEME,
+    )
+    from prismaquant.model_profiles import detect_profile as _detect_profile
+    # Stock rungs the mixed container carries CT-style (plugin delegates them to
+    # vLLM's CompressedTensors path). FP8_DYNAMIC canonicalizes to FP8_E4M3.
+    _STOCK_CT_SCHEMES = {"NVFP4": _NVFP4_SCHEME, "FP8_E4M3": _FP8_E4M3_SCHEME}
+
+    # --- Coverage gate: classify every assigned format into CB / stock-CT /
+    # BF16-passthrough (the mixed container, LAYOUT.md §4; "FP8 in every
+    # recipe"). ---
     cb_targets: dict[str, tuple[str, str, int]] = {}   # qname -> (grid,mode,k)
+    stock_targets: dict[str, str] = {}                 # qname -> "NVFP4"|"FP8_E4M3"
     illegal = []
     for qname, fmt in assignment.items():
         if fmt == "BF16":
             continue
         parsed = _parse_cb_format(fmt)
-        if parsed is None:
-            illegal.append((qname, fmt))
+        if parsed is not None:
+            cb_targets[qname] = parsed
             continue
-        cb_targets[qname] = parsed
+        canon = _fr.canonical_format_name(fmt)
+        if canon in _STOCK_CT_SCHEMES:
+            stock_targets[qname] = canon
+            continue
+        illegal.append((qname, fmt))
     if illegal:
         raise ValueError(
-            f"assignment contains formats the NVFP4-CB container cannot carry: "
-            f"{sorted({f for _, f in illegal})} — allocate with "
-            f"--target-profile nvfp4_cb (BF16 passthrough is the only non-CB "
-            f"format allowed)")
+            f"assignment contains formats the mixed CB container cannot carry: "
+            f"{sorted({f for _, f in illegal})} — it carries the CB families "
+            f"+ stock NVFP4/FP8_DYNAMIC (CT-delegated) + BF16 passthrough only")
 
     for qname, (grid, mode, k) in cb_targets.items():
         wname = qname + ".weight"
@@ -242,6 +265,35 @@ def export_nvfp4_cb(
             raise ValueError(
                 f"{qname}: col_weights has {cwn} columns but the weight has "
                 f"{in_f} — the imatrix does not describe this checkpoint")
+
+    # --- Stock NVFP4 fused-sibling coherence: q/k/v (and gate/up) that all land
+    # on NVFP4 MUST share one weight_global_scale, or vLLM's fused loader sees
+    # inconsistent per-tensor global scales. Take the max over each fused group
+    # and override every sibling's pack (mirrors export_native_compressed). ---
+    for qname in stock_targets:
+        wname = qname + ".weight"
+        if wname not in skeleton:
+            raise ValueError(
+                f"{qname}: assigned {stock_targets[qname]} but no weight tensor "
+                f"'{wname}' in the skeleton")
+    try:
+        _profile = _detect_profile(str(model_dir))
+    except Exception:
+        _profile = None
+    _nvfp4_shared_global: dict[str, torch.Tensor] = {}
+    _nvfp4_groups: dict[str, list[str]] = {}
+    for _q, _f in stock_targets.items():
+        if _f != "NVFP4":
+            continue
+        _gk = (_profile.fused_sibling_group(_q)
+               if _profile is not None else None) or _q
+        _nvfp4_groups.setdefault(_gk, []).append(_q)
+    for _members in _nvfp4_groups.values():
+        _grs = [_ct_nvfp4_global_real(skeleton[_m + ".weight"].to(device), 16)
+                for _m in _members]
+        _shared = torch.stack([g.reshape(()) for g in _grs]).max()
+        for _m in _members:
+            _nvfp4_shared_global[_m] = _shared
 
     # --- Resolve/train codebooks, grouped by (ref, format). ---
     provided = spec.get("codebooks", {}) if source == "learned" else {}
@@ -311,17 +363,35 @@ def export_nvfp4_cb(
                 out_tensors[qname + ".weight_scale"] = fields["scales"].reshape(
                     -1).to(torch.float32).cpu().contiguous()
             counts[fmt] += 1
+        elif qname in stock_targets:
+            # Stock rung: CT-pack via the shared compressed-tensors codec
+            # (RTN default levers = the render the allocator cost measured; the
+            # packed scales are the render's, M19). Emit the CT suffix tensors
+            # verbatim; NOT added to the ignore list (it is quantized).
+            fmt = stock_targets[qname]
+            override = (_nvfp4_shared_global.get(qname)
+                        if fmt == "NVFP4" else None)
+            packed = _ct_quantize_2d(
+                tensor.to(device), fmt, nvfp4_global_real_override=override)
+            for suffix, t in packed.items():
+                out_tensors[f"{qname}.{suffix}"] = t.cpu().contiguous()
+            counts[assignment[qname]] += 1
         else:
             out_tensors[name] = tensor.contiguous()
             if qname is not None and tensor.dim() >= 2:
                 ignore.append(qname)
             counts["copied"] += 1
 
-    # --- Codebook tensors, shipped once per (ref, fmt). ---
+    # --- Codebook tensors: shipped once per (ref, fmt) in a NON-safetensors-
+    # globbed sidecar (cb_codebooks.pqcb) so vLLM's weight loader never sees
+    # these non-parameter tensors. The plugin loads them explicitly via the
+    # config's codebook_file pointer (plugins/vllm_prismaquant config.py
+    # get_codebooks -> load_file(model_dir/cb_codebooks.pqcb)), keyed by each
+    # scheme's codebook_ref. Sidecar-only: NOT written into model.safetensors. ---
     for (ref, fmt), codebook in codebooks.items():
         for tname, blob in _codebook_tensors(ref, fmt, codebook).items():
             cb_tensor_blobs[tname] = blob
-    out_tensors.update(cb_tensor_blobs)
+    codebook_file = "cb_codebooks.pqcb" if cb_tensor_blobs else None
 
     # --- Provenance hashes. ---
     assignment_sha = hashlib.sha256(json.dumps(
@@ -379,11 +449,24 @@ def export_nvfp4_cb(
             "format": fmt,
             "scheme": scheme,
         }
+    # Stock CT config_groups: EXACT compressed-tensors vocabulary (weights/
+    # input_activations/format at the group top, NO "scheme" key) so the plugin
+    # hands them straight to CompressedTensorsConfig.from_config under
+    # delegation. The presence of a "scheme" key is the CB-vs-stock dispatch
+    # marker (LAYOUT.md §4): CB groups have "scheme"; stock CT groups do not.
+    _stock_by_fmt: dict[str, list[str]] = {}
+    for _q, _f in stock_targets.items():
+        _stock_by_fmt.setdefault(_f, []).append(_q)
+    for _f, _qnames in sorted(_stock_by_fmt.items()):
+        _group = _deepcopy(_STOCK_CT_SCHEMES[_f])
+        _group["targets"] = sorted(_ct_explicit_regex(q) for q in _qnames)
+        config_groups[f"group_{len(config_groups)}"] = _group
     quant_config = {
         "quant_method": "prismaquant",
         "format": "nvfp4_cb",
         "config_groups": config_groups,
         "ignore": sorted(set(ignore)),
+        **({"codebook_file": codebook_file} if codebook_file else {}),
         "provenance": {
             "git_commit": _git_commit(),
             "assignment_sha256": assignment_sha,
@@ -393,7 +476,10 @@ def export_nvfp4_cb(
             "scale_sweep": bool(scale_sweep),
             "scale_coding": scale_coding,
             "cb_targets": len(cb_targets),
-            "tensor_formats": {q: assignment[q] for q in sorted(cb_targets)},
+            "stock_ct_targets": len(stock_targets),
+            "tensor_formats": {
+                q: assignment[q]
+                for q in sorted(set(cb_targets) | set(stock_targets))},
         },
     }
     if scale_coding == cb.SCALE_CODING_TWO_TIER:
@@ -401,9 +487,16 @@ def export_nvfp4_cb(
         # means v1 — old artifacts parse unchanged, forever (spec §5.1).
         quant_config["layout_version"] = 2
 
-    # --- Write safetensors + configs. ---
+    # --- Write safetensors (params only) + the codebook sidecar + configs. ---
     save_file(out_tensors, str(out_dir / "model.safetensors"),
               metadata={"format": "pt", "quant_method": "prismaquant"})
+    if codebook_file:
+        # The .pqcb is a plain safetensors blob under a non-globbed extension:
+        # the plugin reads it with safetensors.load_file, vLLM's *.safetensors
+        # weight globber skips it (LAYOUT.md §3 codebook contract).
+        save_file({k: v.contiguous() for k, v in cb_tensor_blobs.items()},
+                  str(out_dir / codebook_file),
+                  metadata={"format": "pt", "quant_method": "prismaquant"})
     (out_dir / "quant_config.json").write_text(
         json.dumps(quant_config, indent=2, sort_keys=True))
     src_config = model_dir / "config.json"
@@ -412,6 +505,7 @@ def export_nvfp4_cb(
         "quant_method": "prismaquant",
         "format": "nvfp4_cb",
         "config_file": "quant_config.json",
+        **({"codebook_file": codebook_file} if codebook_file else {}),
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
     # Copy tokenizer / generation sidecars verbatim (best effort).

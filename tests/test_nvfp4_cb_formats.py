@@ -578,12 +578,15 @@ def test_exporter_roundtrip_equals_emulation(export_dir, source):
     cfg = json.loads((out / "config.json").read_text())
     assert cfg["quantization_config"]["quant_method"] == "prismaquant"
 
+    # Codebooks ship in the non-globbed .pqcb sidecar (sidecar-only), not in
+    # model.safetensors — the plugin reads them there (LAYOUT.md §3).
+    cbf = load_file(str(out / qc["codebook_file"]))
     for g in qc["config_groups"].values():
         s = g["scheme"]
         grid, mode, k = s["grid"], s["mode"], s["k"]
         ref = s["codebook_ref"]
-        codebook = (tuple(ot[r].float() for r in ref)
-                    if isinstance(ref, list) else ot[ref].float())
+        codebook = (tuple(cbf[r].float() for r in ref)
+                    if isinstance(ref, list) else cbf[ref].float())
         for q in g["targets"]:
             w = tens[q + ".weight"].float()
             packed = ot[q + ".cb_qweight"]
@@ -611,7 +614,7 @@ def test_exporter_rejects_unknown_format(export_dir):
     _tiny_model(mdl)
     apath = export_dir / "assign.json"
     _write_assignment(apath, {
-        "model.layers.0.mlp.gate_proj": {"data_type": "nv_fp", "bits": 4},
+        "model.layers.0.mlp.gate_proj": "MXFP4",
     })
     cw = {"model.layers.0.mlp.gate_proj": torch.rand(256) + 0.05}
     with pytest.raises(ValueError, match="cannot carry"):
@@ -924,11 +927,12 @@ def test_two_tier_exporter_writes_layout_version(export_dir):
             assert torch.equal(
                 tb.to(torch.float8_e4m3fn).to(torch.float32), tb)
             assert s["type_size"] == 4 * s["k"] + 9
-            # round-trip through the v2 scheme
+            # round-trip through the v2 scheme (codebooks in the .pqcb sidecar)
             q = g["targets"][0]
             ref = s["codebook_ref"]
-            codebook = (tuple(ot[r].float() for r in ref)
-                        if isinstance(ref, list) else ot[ref].float())
+            cbf = load_file(str(out / qc["codebook_file"]))
+            codebook = (tuple(cbf[r].float() for r in ref)
+                        if isinstance(ref, list) else cbf[ref].float())
             w = tens[q + ".weight"].float()
             up = cb.nvfp4_cb_unpack(ot[q + ".cb_qweight"], s["k"], "fp4",
                                     s["mode"], tuple(w.shape),

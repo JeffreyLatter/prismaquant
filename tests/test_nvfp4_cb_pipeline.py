@@ -417,3 +417,191 @@ def test_batched_quantize_still_rejects_col_weights_for_unsupported_family():
     with pytest.raises(ValueError, match="gguf-family and CB codebook"):
         mqc._batched_quantize(spec, torch.randn(2, 64, 128),
                               col_weights=torch.rand(1, 1, 128))
+
+
+# ---------------------------------------------------------------------------
+# (F) Mixed-container STOCK-RUNG export: export_nvfp4_cb now packs stock NVFP4 /
+#     FP8_DYNAMIC CT-style (reusing the export_native_compressed codecs) so the
+#     plugin can delegate them to vLLM's CompressedTensors path — the 27B
+#     production menu carries them alongside the CB rungs. Before this the
+#     coverage gate hard-rejected any non-CB/non-BF16 format.
+# ---------------------------------------------------------------------------
+import json as _json
+from pathlib import Path as _Path
+
+
+def _make_synth_model(tmp_path, weights: dict) -> dict:
+    from safetensors.torch import save_file
+    tens = {}
+    for q, (o, i) in weights.items():
+        tens[q + ".weight"] = torch.randn(o, i).bfloat16()
+    tens["model.norm.weight"] = torch.randn(64).bfloat16()  # 1D verbatim copy
+    save_file(tens, str(_Path(tmp_path) / "model.safetensors"))
+    (_Path(tmp_path) / "config.json").write_text(
+        _json.dumps({"architectures": ["Qwen3ForCausalLM"]}))
+    return {q: tens[q + ".weight"] for q in weights}
+
+
+def _write_layer_config(tmp_path, assignment: dict) -> str:
+    p = _Path(tmp_path) / "layer_config.json"
+    p.write_text(_json.dumps(assignment))
+    return str(p)
+
+
+def test_stock_nvfp4_export_bitexact_vs_ct_codec(tmp_path):
+    # Round-trip: a stock-NVFP4 Linear must ship EXACTLY the CT codec's own
+    # output (no re-derivation — the M19 scale-fidelity guarantee).
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    from prismaquant import export_native_compressed as enc
+    from safetensors.torch import load_file
+    q = "model.layers.0.self_attn.o_proj"  # not a fused sibling -> singleton
+    src = _make_synth_model(tmp_path, {q: (256, 512)})
+    lc = _write_layer_config(tmp_path, {q: "NVFP4"})
+    out = _Path(tmp_path) / "exp"
+    export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+    st = load_file(str(out / "model.safetensors"))
+    ref = enc._quantize_2d(src[q].to("cpu"), "NVFP4")
+    assert set(ref) == {"weight_packed", "weight_scale",
+                        "weight_global_scale", "input_global_scale"}
+    for suffix, t in ref.items():
+        assert torch.equal(st[f"{q}.{suffix}"], t.cpu()), f"{suffix} not bit-exact"
+
+
+def test_stock_fp8_export_bitexact_vs_ct_codec(tmp_path):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    from prismaquant import export_native_compressed as enc
+    from safetensors.torch import load_file
+    q = "model.layers.0.mlp.down_proj"
+    src = _make_synth_model(tmp_path, {q: (256, 512)})
+    lc = _write_layer_config(tmp_path, {q: "FP8_DYNAMIC"})  # -> FP8_E4M3
+    out = _Path(tmp_path) / "exp"
+    export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+    st = load_file(str(out / "model.safetensors"))
+    ref = enc._quantize_2d(src[q].to("cpu"), "FP8_E4M3")
+    assert set(ref) == {"weight", "weight_scale"}
+    for suffix, t in ref.items():
+        assert torch.equal(st[f"{q}.{suffix}"], t.cpu()), f"{suffix} not bit-exact"
+
+
+def test_mixed_container_config_groups_schema(tmp_path):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    from safetensors.torch import load_file
+    qcb = "model.layers.0.mlp.gate_proj"       # CB   (in=256, 256-legal)
+    qnv = "model.layers.0.self_attn.o_proj"    # NVFP4
+    qfp = "model.layers.0.mlp.up_proj"         # FP8_DYNAMIC
+    qbf = "model.layers.0.self_attn.q_proj"    # BF16
+    _make_synth_model(tmp_path, {qcb: (128, 256), qnv: (256, 512),
+                                 qfp: (256, 512), qbf: (256, 512)})
+    lc = _write_layer_config(tmp_path, {
+        qcb: "NVFP4_CB_K16", qnv: "NVFP4", qfp: "FP8_DYNAMIC", qbf: "BF16"})
+    out = _Path(tmp_path) / "exp"
+    export_nvfp4_cb(str(tmp_path), lc, str(out),
+                    col_weights={qcb: torch.rand(256) + 0.05}, device="cpu")
+    qc = _json.loads((out / "quant_config.json").read_text())
+    groups = qc["config_groups"]
+    # CB groups carry a "scheme" (custom vocab); stock CT groups do NOT (the
+    # dispatch marker) and use the exact CT scheme vocabulary.
+    cb_g = [g for g in groups.values() if "scheme" in g]
+    nv_g = [g for g in groups.values() if g.get("format") == "nvfp4-pack-quantized"]
+    fp_g = [g for g in groups.values() if g.get("format") == "float-quantized"]
+    assert len(cb_g) == 1 and cb_g[0]["scheme"]["k"] == 16 and cb_g[0]["scheme"]["grid"] == "fp4"
+    assert len(nv_g) == 1 and "scheme" not in nv_g[0]
+    assert nv_g[0]["weights"]["num_bits"] == 4 and "input_activations" in nv_g[0]
+    assert len(fp_g) == 1 and "scheme" not in fp_g[0]
+    assert fp_g[0]["weights"]["num_bits"] == 8
+    # stock targets are CT regexes and are NOT ignored; BF16 IS ignored.
+    assert any("o_proj" in t and t.startswith("re:^") for t in nv_g[0]["targets"])
+    assert qbf in qc["ignore"]
+    assert qnv not in qc["ignore"] and qfp not in qc["ignore"]
+    # on-disk tensors: NVFP4 quad, FP8 pair, BF16 verbatim, CB packed.
+    st = load_file(str(out / "model.safetensors"))
+    for suf in ("weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"):
+        assert f"{qnv}.{suf}" in st
+    for suf in ("weight", "weight_scale"):
+        assert f"{qfp}.{suf}" in st
+    assert f"{qbf}.weight" in st and f"{qcb}.cb_qweight" in st
+    assert qc["provenance"]["stock_ct_targets"] == 2
+    assert qc["provenance"]["cb_targets"] == 1
+
+
+def test_stock_rungs_no_longer_rejected_but_junk_still_is(tmp_path):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    q = "model.layers.0.self_attn.o_proj"
+    _make_synth_model(tmp_path, {q: (256, 512)})
+    out = _Path(tmp_path) / "exp"
+    # stock rungs: accepted now.
+    for fmt in ("NVFP4", "FP8_DYNAMIC"):
+        lc = _write_layer_config(tmp_path, {q: fmt})
+        export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+    # a genuinely-unsupported format still hard-fails coverage.
+    lc = _write_layer_config(tmp_path, {q: "MXFP4"})
+    with pytest.raises(ValueError, match="cannot carry"):
+        export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+
+
+def test_fused_nvfp4_siblings_share_weight_global_scale(tmp_path):
+    # q/k/v that all land on NVFP4 must ship ONE shared weight_global_scale
+    # (else vLLM's fused qkv loader sees inconsistent per-tensor globals).
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    from prismaquant import export_native_compressed as enc
+    from prismaquant.model_profiles import detect_profile
+    from safetensors.torch import load_file
+    qs = [f"model.layers.0.self_attn.{p}_proj" for p in "qkv"]
+    src = _make_synth_model(tmp_path, {q: (256, 512) for q in qs})
+    # Only meaningful if the profile actually groups q/k/v; else each is a
+    # singleton and the assertion is vacuously the per-Linear scale.
+    prof = None
+    try:
+        prof = detect_profile(str(tmp_path))
+    except Exception:
+        pass
+    grouped = prof is not None and prof.fused_sibling_group(qs[0]) is not None
+    lc = _write_layer_config(tmp_path, {q: "NVFP4" for q in qs})
+    out = _Path(tmp_path) / "exp"
+    export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+    st = load_file(str(out / "model.safetensors"))
+    globals_ = [st[f"{q}.weight_global_scale"] for q in qs]
+    if grouped:
+        assert all(torch.equal(globals_[0], g) for g in globals_[1:]), \
+            "fused NVFP4 siblings must share one weight_global_scale"
+        expected = torch.stack([
+            enc.compute_nvfp4_global_real(src[q].to("cpu"), 16).reshape(())
+            for q in qs]).max()
+        # stored weight_global_scale is the DIVISOR 1/global_real.
+        assert torch.allclose(globals_[0].reshape(()), 1.0 / expected, rtol=1e-4)
+
+
+def test_codebook_pqcb_sidecar_contract(tmp_path):
+    # Codebooks ship in cb_codebooks.pqcb (safetensors under a non-globbed
+    # extension), named by each scheme's codebook_ref, and are NOT in
+    # model.safetensors — the exact contract plugins/vllm_prismaquant config.py
+    # get_codebooks() -> load_file(model_dir/cb_codebooks.pqcb) consumes, and
+    # linear.py looks up as codebooks[n] for n in codebook_ref. (Format-level
+    # fixture: the plugin's own reader is not importable without vLLM.)
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    from safetensors.torch import load_file
+    qcb = "model.layers.0.mlp.gate_proj"
+    qfp = "model.layers.1.mlp.gate_proj"
+    _make_synth_model(tmp_path, {qcb: (128, 256), qfp: (128, 256)})
+    lc = _write_layer_config(tmp_path, {qcb: "NVFP4_CB_K16", qfp: "FP8_CB_K40"})
+    out = _Path(tmp_path) / "exp"
+    export_nvfp4_cb(str(tmp_path), lc, str(out),
+                    col_weights={qcb: torch.rand(256) + 0.05,
+                                 qfp: torch.rand(256) + 0.05}, device="cpu")
+    qc = _json.loads((out / "quant_config.json").read_text())
+    cfg = _json.loads((out / "config.json").read_text())
+    assert qc["codebook_file"] == "cb_codebooks.pqcb"
+    assert cfg["quantization_config"]["codebook_file"] == "cb_codebooks.pqcb"
+    # The sidecar loads and carries EXACTLY the codebook_ref names (the plugin
+    # indexes codebooks[n] for every n in codebook_ref — all must resolve).
+    pqcb = load_file(str(out / "cb_codebooks.pqcb"))
+    refs = set()
+    for g in qc["config_groups"].values():
+        r = g["scheme"]["codebook_ref"]
+        refs.update(r if isinstance(r, list) else [r])
+    assert refs and set(pqcb) == refs, f"{set(pqcb)} != {refs}"
+    for r in refs:
+        assert pqcb[r].dtype == torch.float16  # grid-exact fp16 tables
+    # Sidecar-only: no cb_codebook.* tensors leak into the globbed weight file.
+    ot = load_file(str(out / "model.safetensors"))
+    assert not any(k.startswith("cb_codebook") for k in ot)
