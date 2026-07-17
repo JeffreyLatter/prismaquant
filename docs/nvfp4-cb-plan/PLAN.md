@@ -642,3 +642,23 @@ Roadmap to goal (live):
 - **Plugin v2-compose DISPATCHED in parallel** (serving agent): two-tier fp4
   serving (in-kernel scale compose per spec §4, both prefill paths, v1/v2
   dispatch) — the Hy3/DSv4 ultra-low-bpp lane prerequisite.
+- **27B PRODUCTION RUN — UNDERWAY (menu agent, overnight).** Qwen3.6-27B
+  (/home/rob/.cache/huggingface/qwen36-27b-bf16, dense hidden=5120 x64 layers +
+  vision encoder → text-only calib) through EXPORT_CONTAINER=nvfp4_cb @5.5 bpp,
+  menu = NVFP4,FP8_DYNAMIC,BF16,FP8_CB_K36..K48 (no fp4-CB). Drivers committed:
+  scripts/run_27b_prod_nvfp4cb.sh (pipeline) + scripts/measure_27b_ab.sh
+  (gold-metric A/B). WORK_DIR=/home/rob/dq-runs/prod-27b-nvfp4cb-5p5;
+  console=/home/rob/dq-runs/prod_27b_console.log (nohup, deadman-monitored).
+  * **OOM finding (deadman-caught):** the dispatch's 32x1024 probe OOM-kills on
+    128 GB unified (per-layer act x64 + 47 GB weight cache spike at the phase-1
+    ->phase-3 transition). Forced to 8x1024 (8192 tok, 2x the shipped 27B's
+    8x512, CACHE_HEADROOM_GB=45) — fits at vmhwm 16.5 GB. Documented as a
+    box-forced deviation for prod_27b_results.md.
+  * codebook-source=lattice (lockstep-exact with the COST_MODE=local registry
+    qdq). PrismaAURA-5.5 downloaded (23G, /home/rob/dq-runs/prod-27b-aura-dl).
+  * NEXT (when export completes): (1) footprint verify (nvfp4_cb_footprint,
+    body bpp ~5.5, incl. .pqcb sidecars); (2) bash scripts/measure_27b_ab.sh
+    (OURS vs PrismaAURA-5.5 vs BF16, same session, conf-KL/all-KL/top1/PPL +
+    3x TTFT/decode); (3) write docs/nvfp4-cb-plan/prod_27b_results.md with the
+    verdict table + honesty caveats (matched-bpp, menu+cost bundling vs the
+    shipped aura-cost/validated recipe, single-seed KL, 8x1024-not-32x1024).
