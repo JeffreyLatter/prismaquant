@@ -26,8 +26,11 @@ import sys
 
 import pytest
 
+import torch
+
 from prismaquant import format_registry as fr
 from prismaquant import layer_config as lcfg
+from prismaquant import measure_quant_cost as mqc
 from prismaquant import serving_profiles as sp
 from prismaquant.allocator import (
     aggregate_fused_siblings,
@@ -338,3 +341,79 @@ def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
     assert chosen <= _canon() | {"BF16"}, f"off-menu format chosen: {chosen}"
     assert any(c.startswith(("NVFP4_CB", "FP8_CB")) for c in chosen), (
         f"mixed menu produced no CB rung: {chosen}")
+
+
+# ---------------------------------------------------------------------------
+# (E) CB local-cost imatrix lockstep: the batched cost render must use the SAME
+#     imatrix-weighted VQ the exporter ships (one-cache/no-confound rule).
+#     measure_quant_cost._batched_quantize now renders the CB families (before
+#     the fix it raised "Unknown weight_element_dtype" outright — CB cost was
+#     broken in batched mode, which run-pipeline.sh uses). Mirrors
+#     test_gguf_formats.test_batched_cost_path_matches_unbatched.
+# ---------------------------------------------------------------------------
+_CB_COST_RUNGS = ["NVFP4_CB_K16", "NVFP4_CB_S16", "FP8_CB_K44"]
+
+
+@pytest.mark.parametrize("rung", _CB_COST_RUNGS)
+def test_cb_batched_cost_matches_direct_qdq(rung):
+    # The batched cost path must equal the per-slice registry qdq the exporter
+    # uses — unweighted AND under a per-item imatrix — or the allocator's cost
+    # diverges from the shipped bytes. (in_features=512 % 256 == 0.)
+    spec = fr.get_format(rung)
+    torch.manual_seed(0)
+    stacked = torch.randn(3, 256, 512) * torch.rand(3, 1, 1).exp()
+    batched = mqc._batched_quantize(spec, stacked)
+    per_slice = torch.stack(
+        [spec.quantize_dequantize(stacked[i]) for i in range(3)])
+    torch.testing.assert_close(batched, per_slice, rtol=0, atol=0)
+    # Per-item imatrix (N,1,in) — the batched cost path's shape.
+    qw = torch.rand(3, 1, 512) + 0.05
+    batched_w = mqc._batched_quantize(spec, stacked, col_weights=qw)
+    per_slice_w = torch.stack([
+        spec.quantize_dequantize(stacked[i], col_weights=qw[i, 0])
+        for i in range(3)])
+    torch.testing.assert_close(batched_w, per_slice_w, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rung", _CB_COST_RUNGS)
+def test_cb_imatrix_changes_cost_and_lowers_weighted_error(rung):
+    # "The CB cost entry changes when the act cache provides imatrix vs not":
+    # the weighted render differs from the unweighted one, and the weighted VQ
+    # search lowers the weighted MSE it optimizes — so the DP sees a different,
+    # exporter-faithful cost.
+    spec = fr.get_format(rung)
+    torch.manual_seed(1)
+    w = torch.randn(128, 512)
+    qw = torch.rand(512) + 0.05
+    unweighted = spec.quantize_dequantize(w.clone())
+    weighted = spec.quantize_dequantize(w.clone(), col_weights=qw)
+    assert not torch.equal(unweighted, weighted), "imatrix did not change render"
+    wmse = lambda r: float(((w - r).pow(2) * qw).mean())
+    assert wmse(weighted) <= wmse(unweighted) * 1.0001 + 1e-9
+
+
+def test_cost_render_uses_imatrix_predicate_and_gguf_toggle(monkeypatch):
+    # CB families are ALWAYS imatrix-weighted (their export always is, no
+    # toggle); gguf tracks PRISMAQUANT_GGUF_IMATRIX; plain nv is never weighted.
+    cb = fr.get_format("NVFP4_CB_K16")
+    fp8cb = fr.get_format("FP8_CB_K44")
+    gguf = fr.get_format("Q4_K")
+    nvfp4 = fr.get_format("NVFP4")
+    monkeypatch.delenv("PRISMAQUANT_GGUF_IMATRIX", raising=False)
+    assert mqc._cost_render_uses_imatrix(cb)
+    assert mqc._cost_render_uses_imatrix(fp8cb)
+    assert mqc._cost_render_uses_imatrix(gguf)          # default on
+    assert not mqc._cost_render_uses_imatrix(nvfp4)
+    monkeypatch.setenv("PRISMAQUANT_GGUF_IMATRIX", "0")
+    assert not mqc._cost_render_uses_imatrix(gguf)      # toggled off
+    assert mqc._cost_render_uses_imatrix(cb)            # CB unaffected
+    assert mqc._cost_render_uses_imatrix(fp8cb)
+
+
+def test_batched_quantize_still_rejects_col_weights_for_unsupported_family():
+    # The guard must remain for genuinely-unsupported families (MXFP4 has no
+    # imatrix render) — only gguf + CB families were opened.
+    spec = fr.get_format("MXFP4")
+    with pytest.raises(ValueError, match="gguf-family and CB codebook"):
+        mqc._batched_quantize(spec, torch.randn(2, 64, 128),
+                              col_weights=torch.rand(1, 1, 128))

@@ -476,20 +476,28 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
             )
 
         gguf_qw = None
-        if _gguf_imatrix_enabled() and any(s.family == "gguf" for s in specs):
-            # Same op/data as export_gguf.build_imatrix_from_act_cache and
-            # the batched path: full fp32 rows, mean over dim 0.
+        if any(_cost_render_uses_imatrix(s) for s in specs):
+            # Shared activation imatrix (per-input-column mean-sq act). Same
+            # op/data as export_gguf.build_imatrix_from_act_cache AND
+            # export_nvfp4_cb's --col-weights: full fp32 rows, mean over dim 0.
             gguf_qw = X_cpu.float().pow(2).mean(dim=0).to(W.device)
 
         for spec in specs:
             try:
-                if spec.family == "gguf" and gguf_qw is not None:
+                if (spec.family == "gguf" and gguf_qw is not None
+                        and _gguf_imatrix_enabled()):
                     from prismaquant.gguf_formats import (
                         gguf_quantize_dequantize,
                     )
 
                     W_hat = gguf_quantize_dequantize(
                         W.clone(), spec.name, col_weights=gguf_qw,
+                    )
+                elif spec.family in _CB_COST_FAMILIES and gguf_qw is not None:
+                    # Lockstep: the CB exporter ships imatrix-weighted VQ bytes,
+                    # so the cost render applies the same col_weights.
+                    W_hat = spec.quantize_dequantize(
+                        W.clone(), col_weights=gguf_qw,
                     )
                 else:
                     W_hat = spec.quantize_dequantize(W.clone())
@@ -941,7 +949,7 @@ def _measure_packed_experts(
             if h.shape == (w.size(0), w.size(1)):
                 h_em = h
         packed_gguf_qw = None
-        if _gguf_imatrix_enabled() and any(s.family == "gguf" for s in specs):
+        if any(_cost_render_uses_imatrix(s) for s in specs):
             # Pooled imatrix from the experts-module input snapshot: exact
             # source for gate_up_proj (its input IS the module input); the
             # shape guard leaves down_proj unweighted (its input is the
@@ -985,7 +993,8 @@ def _measure_packed_experts(
                 w_hat = _batched_quantize(
                     spec, w_in,
                     col_weights=(
-                        packed_gguf_qw if spec.family == "gguf" else None
+                        packed_gguf_qw
+                        if _cost_render_uses_imatrix(spec) else None
                     ),
                 )
                 err = (w_in - w_hat).float()
@@ -1180,6 +1189,40 @@ def _gguf_imatrix_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+# VQ codebook families whose exporter (export_nvfp4_cb) ships imatrix-weighted
+# bytes UNCONDITIONALLY: --col-weights is required, there is no unweighted CB
+# export. So their measured COST render must ALWAYS apply the imatrix to stay in
+# lockstep (cost == shipped-bytes weighting; the one-cache/no-confound rule).
+# Unlike gguf there is deliberately NO toggle — a toggle could only desync the
+# cost from an export that is always weighted.
+_CB_COST_FAMILIES = ("nvfp4_cb", "fp8_cb")
+
+
+def _cost_render_uses_imatrix(spec: fr.FormatSpec) -> bool:
+    """Whether this spec's COST render is activation-imatrix-weighted, matching
+    the family's exporter. gguf tracks the PRISMAQUANT_GGUF_IMATRIX toggle (its
+    export is optionally --imatrix-from-act-cache); CB families are always
+    weighted (their export always is)."""
+    if spec.family == "gguf":
+        return _gguf_imatrix_enabled()
+    return spec.family in _CB_COST_FAMILIES
+
+
+def _item_col_weights(
+    col_weights: torch.Tensor | None, i: int, n: int
+) -> torch.Tensor | None:
+    """Per-input-column imatrix vector for stacked item ``i`` as 1-D
+    ``(in_features,)`` (the registry qdq broadcasts it to ``(out, in)``). A
+    per-item stack ``(N, ..., in)`` is indexed; a single pooled/broadcast
+    vector ``(1, 1, in)`` or ``(in,)`` is shared across all items."""
+    if col_weights is None:
+        return None
+    cw = col_weights
+    if cw.ndim >= 1 and cw.shape[0] == n:
+        cw = cw[i]
+    return cw.reshape(-1)
+
+
 def _batched_quantize(
     spec: fr.FormatSpec,
     stacked_w: torch.Tensor,
@@ -1229,10 +1272,27 @@ def _batched_quantize(
         return gguf_quantize_dequantize(
             stacked_w, spec.name, col_weights=col_weights,
         )
+    if spec.family in _CB_COST_FAMILIES:
+        # VQ codebook families: render per-slice through the SAME registry qdq
+        # closure the unbatched path and the exporter use (fixed lattice + the
+        # default-on scale sweep), so the measured cost is the render export
+        # ships. col_weights (per-input-column imatrix) bias the weighted VQ
+        # search exactly as export_nvfp4_cb's --col-weights does. Per-slice
+        # (like the nv family) keeps each stacked Linear independent and matches
+        # the unbatched path bit-for-bit — no cross-slice coupling exists (fp4
+        # scales are per-group-16, fp8 scales per-output-channel; lattice fixed).
+        n = stacked_w.shape[0]
+        return torch.stack([
+            spec.quantize_dequantize(
+                stacked_w[i].clone(),
+                col_weights=_item_col_weights(col_weights, i, n),
+            )
+            for i in range(n)
+        ])
     if col_weights is not None:
         raise ValueError(
-            f"col_weights is only supported for gguf-family formats, "
-            f"got {spec.name}"
+            f"col_weights is only supported for gguf-family and CB codebook "
+            f"formats, got {spec.name}"
         )
     if elt in _CODEBOOK_NAMES:
         # Reuse the registry's codebook tables. MX-family formats need
@@ -1354,9 +1414,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 for idx in row_indices_cpu
             ]
             gguf_qw = None
-            if _gguf_imatrix_enabled() and any(
-                s.family == "gguf" for s in specs
-            ):
+            if any(_cost_render_uses_imatrix(s) for s in specs):
                 # Per-item imatrix, computed with the IDENTICAL op on the
                 # IDENTICAL data as export_gguf.build_imatrix_from_act_cache
                 # (FULL fp32 CPU act rows, mean over dim 0) — NOT from the
@@ -1422,7 +1480,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     W_hat = _batched_quantize(
                         spec, W,
                         col_weights=(
-                            gguf_qw if spec.family == "gguf" else None
+                            gguf_qw if _cost_render_uses_imatrix(spec) else None
                         ),
                     )
                     X_hat = spec.activation_quantize_dequantize(X.clone())
