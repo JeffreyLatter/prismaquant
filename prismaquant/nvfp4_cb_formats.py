@@ -56,6 +56,7 @@ measured under v1 coding.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -103,6 +104,50 @@ TWO_TIER_SUB_TABLE = (1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875,
 # window can only improve, so pad one octave on each side).
 _TWO_TIER_WINDOW_PAD = 1
 _TWO_TIER_MAX_WINDOW = 14
+
+# --- Tiered encoder (docs/nvfp4-cb-plan/encode_tiers.md) -----------------
+# PRISMAQUANT_CB_ENCODE_TIER in {fast, balanced, max}:
+#   max      — the original exhaustive sweep, bit-identical
+#              (regression-pinned);
+#   balanced — analytic scale init (usage-calibrated second-moment match,
+#              s0 = sqrt(sum q w^2 / (sum q * m2_used)); m2_used measured
+#              from a pilot encode of the tensor's leading rows) + a
+#              log-spaced micro-sweep of +-2 neighbors + the amax/grid-max
+#              guarantee candidate, scored from per-(vector, entry) moments
+#              (err = C - 2sB + s^2A; A, B scale-independent, built once
+#              per chunk — the _grid_fields/_sweep_errs identity), then the
+#              exact 2 WLS refits;
+#   fast     — same, +-1 neighbors + 1 refit.
+# Measured basis (encode_cost_4b.json + encode_tiers.md): the 4B FP8_CB
+# winners spread across high-clip candidates (no JSO-style collapse; pruning
+# alone <= 2.6x) and refits accept at 99.5%/95.2% (>=1 refit everywhere);
+# the naive all-codeword m2 lands the wrong basin (2-3x err) so m2_used is
+# calibrated from actually-USED assignments; a scalar RTN-snap proxy ranking
+# was measured INVALID (+21% recon fp8) and dropped. The micro-sweep span
+# covers the measured s0-vs-sweep ratio error (<=1.15).
+_ENCODE_TIER_ENV = "PRISMAQUANT_CB_ENCODE_TIER"
+_ENCODE_TIERS = ("fast", "balanced", "max")
+_ENCODE_TIER_DEFAULT = "balanced"
+_TIER_REFITS = {"fast": 1, "balanced": _SCALE_SWEEP_REFIT_ITERS,
+                "max": _SCALE_SWEEP_REFIT_ITERS}
+_TIER_MICRO_SPAN = {"fast": 1, "balanced": 2}     # +- steps around s0
+_TIER_MICRO_RATIO = {"fast": 1.1, "balanced": 1.075}
+# Per-group hill-climb extension after the micro-grid (measured: the reach,
+# not granularity, sets quality — q_proj span curve hits max-parity at
+# +-24% and BEATS max at +-34%; down_proj needs per-group adaptive reach).
+_TIER_HILL_ITERS = {"fast": 2, "balanced": 4}
+_PILOT_ROWS = 256
+_ENCODE_COMPILE_ENV = "PRISMAQUANT_CB_ENCODE_COMPILE"
+
+
+def _resolve_encode_tier(tier: str | None) -> str:
+    t = tier if tier is not None else os.environ.get(
+        _ENCODE_TIER_ENV, _ENCODE_TIER_DEFAULT)
+    t = str(t).strip().lower()
+    if t not in _ENCODE_TIERS:
+        raise ValueError(
+            f"unknown encode tier {t!r} (expected one of {_ENCODE_TIERS})")
+    return t
 
 _DATA = Path(__file__).resolve().parent / "data" / "nvfp4_cb_lattices.pt"
 _LATTICE_SEED = 1234
@@ -532,6 +577,302 @@ def _eval_candidate(w2d: torch.Tensor, wq: torch.Tensor | None,
     return err_group, enc, dec.reshape(rows, in_f)
 
 
+# ---------------------------------------------------------------------------
+# Moment-scored sweep (fast/balanced tiers). The candidate error decomposes
+# as err(s) = C - 2s*B + s^2*A with per-(vector, entry) moments A, B that do
+# NOT depend on the scale (the _grid_fields/_sweep_errs identity), so all
+# candidates score from moments built ONCE per chunk instead of recomputing
+# a full VQ distance matrix per candidate. C is constant per vector across
+# candidates and cancels in every argmin, so it is dropped. The selection
+# matches the exact sweep up to fp-rounding ties; refits and the final
+# assignment stay on the exact direct-eval path.
+# ---------------------------------------------------------------------------
+
+def _score_min_eager(A: torch.Tensor, B: torch.Tensor,
+                     s: torch.Tensor) -> torch.Tensor:
+    """min over entries of s^2*A - 2s*B; A (m,K) or (K,), B (m,K), s (m,1)."""
+    return ((s * s) * A - (2.0 * s) * B).min(dim=-1).values
+
+
+def _score_argmin_eager(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor):
+    d = (s * s) * A - (2.0 * s) * B
+    v, i = d.min(dim=-1)
+    return v, i
+
+
+@lru_cache(maxsize=None)
+def _score_min_compiled():
+    return torch.compile(_score_min_eager, dynamic=True)
+
+
+@lru_cache(maxsize=None)
+def _score_argmin_compiled():
+    return torch.compile(_score_argmin_eager, dynamic=True)
+
+
+def _encode_compile_on() -> bool:
+    return os.environ.get(_ENCODE_COMPILE_ENV, "1").lower() not in (
+        "0", "false", "no")
+
+
+def _score_min(A, B, s):
+    if _encode_compile_on():
+        try:
+            return _score_min_compiled()(A, B, s)
+        except Exception:
+            pass
+    return _score_min_eager(A, B, s)
+
+
+def _score_argmin(A, B, s):
+    if _encode_compile_on():
+        try:
+            return _score_argmin_compiled()(A, B, s)
+        except Exception:
+            pass
+    return _score_argmin_eager(A, B, s)
+
+
+def _mode_streams(wvec: torch.Tensor, mode: str, cb, wq):
+    """Per-sub scoring streams [(x, wq_sub, table)] in the ORIGINAL weight
+    domain. signed scores on |w| (err (w - s*sign(w)*t)^2 == (|w| - s*t)^2
+    for t >= 0); product splits sub-vectors (independent argmins)."""
+    if mode == "full":
+        return [(wvec, wq, cb)]
+    if mode == "signed":
+        return [(wvec.abs(), wq, cb)]
+    n_sub = len(cb)
+    sd = VEC_DIM // n_sub
+    return [(wvec[:, i * sd:(i + 1) * sd],
+             wq[:, i * sd:(i + 1) * sd] if wq is not None else None,
+             cb[i]) for i in range(n_sub)]
+
+
+def _stream_moments(x: torch.Tensor, ws: torch.Tensor | None,
+                    table: torch.Tensor):
+    """A = sum_j w_j t_j^2 (per entry), B = sum_j w_j x_j t_j."""
+    t = table.to(x.device, torch.float32)
+    tt = t.t().contiguous()
+    B = ((ws * x) if ws is not None else x) @ tt
+    if ws is not None:
+        A = ws @ (t * t).t().contiguous()
+    else:
+        A = (t * t).sum(dim=-1)
+    return A, B
+
+
+def _moment_rows_step(cb, vec_per_row: int) -> int:
+    tables = cb if isinstance(cb, tuple) else (cb,)
+    k_max = max(int(t.shape[0]) for t in tables)
+    return max(1, (_SCORE_CHUNK_ELEMS // max(k_max, 1)) // max(vec_per_row, 1))
+
+
+def _moment_err_groups(moms, s_g: torch.Tensor, grid: str, in_f: int,
+                       vec_per_group: int) -> torch.Tensor:
+    """Per-group error (minus the constant C term) at per-group scale
+    ``s_g`` (rc, G), scored from cached moments."""
+    rc, G = s_g.shape
+    s_v = s_g.repeat_interleave(vec_per_group, dim=1).reshape(-1, 1)
+    err_v = None
+    for (A, B) in moms:
+        v = _score_min(A, B, s_v)
+        err_v = v if err_v is None else err_v + v
+    return err_v.reshape(rc, G, vec_per_group).sum(dim=-1)
+
+
+def _wls_refit_step(w2d, wq, best_s, grid, mode, cb):
+    """One exact WLS refit iteration (shared by all tiers): returns the
+    snapped candidate scales and the accept mask inputs."""
+    rows, in_f = w2d.shape
+    err_cur, _, g = _eval_candidate(w2d, wq, best_s, grid, mode, cb)
+    wcol = wq.reshape(rows, in_f) if wq is not None else torch.ones_like(g)
+    num = _group_reduce(wcol * g * w2d, grid)
+    den = _group_reduce(wcol * g * g, grid)
+    s_star = _snap_scale(torch.where(den > 0, num / den.clamp_min(1e-30),
+                                     best_s), grid)
+    err_star, _, _ = _eval_candidate(w2d, wq, s_star, grid, mode, cb)
+    return torch.where(err_star < err_cur, s_star, best_s)
+
+
+def _moment_eval(w2d, wq2d, grid, mode, cb, s_g):
+    """Moment-scored equivalent of :func:`_eval_candidate`: per-group err
+    (WITHOUT the constant C = sum q w^2 term — add it when comparing against
+    anything C-inclusive), the encode fields, and the grid decode. Same
+    argmin objective as the direct eval, up to fp-rounding ties."""
+    rows, in_f = w2d.shape
+    vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
+    vec_per_row = in_f // VEC_DIM
+    G = s_g.shape[1]
+    err = torch.empty(rows, G, device=w2d.device)
+    encs: list[dict] = []
+    rows_step = _moment_rows_step(cb, vec_per_row)
+    for r0 in range(0, rows, rows_step):
+        r1 = min(rows, r0 + rows_step)
+        wvec = w2d[r0:r1].reshape(-1, VEC_DIM)
+        wqc = (wq2d[r0:r1].reshape(-1, VEC_DIM)
+               if wq2d is not None else None)
+        streams = _mode_streams(wvec, mode, cb, wqc)
+        s_v = s_g[r0:r1].repeat_interleave(
+            vec_per_group, dim=1).reshape(-1, 1)
+        err_v = None
+        idxs = []
+        for (x, ws, t) in streams:
+            A, B = _stream_moments(x, ws, t)
+            v, i = _score_argmin(A, B, s_v)
+            err_v = v if err_v is None else err_v + v
+            idxs.append(i)
+        if mode == "full":
+            enc = {"idx": idxs[0]}
+        elif mode == "signed":
+            enc = {"idx": idxs[0],
+                   "signs": torch.where(wvec < 0, -1.0, 1.0)}
+        else:
+            enc = {"idx": torch.stack(idxs, dim=-1)}
+        encs.append(enc)
+        err[r0:r1] = err_v.reshape(r1 - r0, G, vec_per_group).sum(-1)
+    enc = {key: torch.cat([e[key] for e in encs], dim=0) for key in encs[0]}
+    dec = _mode_decode(enc, mode, cb).reshape(rows, in_f)
+    return err, enc, dec
+
+
+def _wls_refit_step_moment(w2d, wq2d, grid, mode, cb, best_s, err_cur,
+                           enc_cur, dec_cur):
+    """One WLS refit with moment-scored evaluation; per-group accept iff
+    strictly better (C-free errors on both sides — C cancels). Returns the
+    merged (best_s, err, enc, dec)."""
+    rows, in_f = w2d.shape
+    vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
+    wcol = wq2d if wq2d is not None else torch.ones_like(w2d)
+    num = _group_reduce(wcol * dec_cur * w2d, grid)
+    den = _group_reduce(wcol * dec_cur * dec_cur, grid)
+    s_star = _snap_scale(torch.where(den > 0, num / den.clamp_min(1e-30),
+                                     best_s), grid)
+    err_star, enc_star, dec_star = _moment_eval(
+        w2d, wq2d, grid, mode, cb, s_star)
+    better = err_star < err_cur
+    best_s = torch.where(better, s_star, best_s)
+    err = torch.where(better, err_star, err_cur)
+    bvec = better.repeat_interleave(vec_per_group, dim=1).reshape(-1)
+    enc = {}
+    for key in enc_cur:
+        cur, star = enc_cur[key], enc_star[key]
+        mask = bvec
+        if cur.dim() > 1:
+            view = (-1,) + (1,) * (cur.dim() - 1)
+            mask = bvec.reshape(view).expand_as(cur)
+        enc[key] = torch.where(mask, star, cur)
+    belem = better.repeat_interleave(
+        (FP4_GROUP if grid == "fp4" else in_f), dim=1)
+    dec = torch.where(belem, dec_star, dec_cur)
+    return best_s, err, enc, dec
+
+
+def _score_scales_chunked(w2d, wq2d, grid, mode, cb, eval_scales,
+                          hill_iters: int = 0, hill_ratio: float = 1.075):
+    """Moment-score a list of per-group scale tensors; return per-group
+    running-min (best_err, best_s) in candidate order (strict <).
+
+    ``hill_iters`` > 0 appends a per-group ratio-step hill climb after the
+    grid (score best_s*r and best_s/r, accept where strictly better) — it
+    extends the search reach exactly where a group's optimum sits past the
+    micro-grid edge (the measured down_proj per-row m2 variation), at one
+    cheap moment-scored pass per direction, moments already cached."""
+    rows, in_f = w2d.shape
+    G = eval_scales[0].shape[1]
+    vec_per_row = in_f // VEC_DIM
+    vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
+    best_err = torch.full((rows, G), float("inf"), device=w2d.device)
+    best_s = eval_scales[0].clone()
+    rows_step = _moment_rows_step(cb, vec_per_row)
+    for r0 in range(0, rows, rows_step):
+        r1 = min(rows, r0 + rows_step)
+        wvec = w2d[r0:r1].reshape(-1, VEC_DIM)
+        wqc = (wq2d[r0:r1].reshape(-1, VEC_DIM)
+               if wq2d is not None else None)
+        moms = [_stream_moments(x, ws, t)
+                for (x, ws, t) in _mode_streams(wvec, mode, cb, wqc)]
+
+        def score(s_g):
+            return _moment_err_groups(moms, s_g, grid, in_f, vec_per_group)
+
+        e_c = best_err[r0:r1]
+        s_c = best_s[r0:r1]
+        for s_full in eval_scales:
+            err_g = score(s_full[r0:r1])
+            better = err_g < e_c
+            e_c = torch.where(better, err_g, e_c)
+            s_c = torch.where(better, s_full[r0:r1], s_c)
+        for _ in range(int(hill_iters)):
+            for ratio in (hill_ratio, 1.0 / hill_ratio):
+                s_try = _snap_scale(s_c * ratio, grid)
+                err_g = score(s_try)
+                better = err_g < e_c
+                e_c = torch.where(better, err_g, e_c)
+                s_c = torch.where(better, s_try, s_c)
+        best_err[r0:r1] = e_c
+        best_s[r0:r1] = s_c
+    return best_err, best_s
+
+
+def _calibrate_m2_used(w2d, wq2d, grid, mode, cb) -> float:
+    """Usage-calibrated mean-square codeword coordinate from a pilot encode
+    of the tensor's leading rows: the pilot runs the full 16-candidate
+    moment-scored sweep, then m2_used = sum(q * dec^2) / sum(q) over the
+    pilot's ACTUAL assignments. (The naive all-codeword table m2 lands the
+    wrong basin — 2-3x worse error that refits cannot escape; per-tensor
+    pilots also absorb the measured per-role m2 variation.)"""
+    p1 = min(w2d.shape[0], _PILOT_ROWS)
+    pilot = w2d[:p1]
+    wp2d = wq2d[:p1] if wq2d is not None else None
+    wp = wp2d.reshape(-1, VEC_DIM) if wp2d is not None else None
+    amax = _group_amax(pilot, grid)
+    cands = _candidate_scales(amax, grid, _SCALE_SWEEP_CANDIDATES)
+    _, best_s = _score_scales_chunked(
+        pilot, wp2d, grid, mode, cb,
+        [cands[si] for si in range(cands.shape[0])])
+    _, _, dec = _eval_candidate(pilot, wp, best_s, grid, mode, cb)
+    wcol = wp2d if wp2d is not None else torch.ones_like(dec)
+    m2 = float((wcol * dec * dec).sum() / wcol.sum().clamp_min(1e-30))
+    return max(m2, 1e-30)
+
+
+def _analytic_scales(w2d, wq2d, grid, m2_used: float, span: int,
+                     ratio: float) -> list[torch.Tensor]:
+    """s0 (second-moment match) + log-spaced micro-sweep +-span neighbors +
+    the amax/grid-max guarantee candidate (keeps the never-worse-than-one-shot
+    contract). All snapped legal."""
+    wcol = wq2d if wq2d is not None else torch.ones_like(w2d)
+    num = _group_reduce(wcol * w2d * w2d, grid)
+    den = _group_reduce(wcol, grid) * m2_used
+    s0 = (num / den.clamp_min(1e-30)).sqrt()
+    scales = [_snap_scale(s0 * (ratio ** i), grid)
+              for i in range(-span, span + 1)]
+    amax = _group_amax(w2d, grid)
+    scales.append(_candidate_scales(amax, grid, 1)[0])
+    return scales
+
+
+def _sweep_encode_moment(w2d: torch.Tensor, grid: str, mode: str, cb,
+                         wq: torch.Tensor | None, tier: str):
+    """fast/balanced v1 sweep: analytic s0 + micro-sweep + WLS refits, all
+    moment-scored (no full VQ distance recomputes anywhere)."""
+    rows, in_f = w2d.shape
+    wq2d = wq.reshape(rows, in_f) if wq is not None else None
+    m2 = _calibrate_m2_used(w2d, wq2d, grid, mode, cb)
+    eval_scales = _analytic_scales(w2d, wq2d, grid, m2,
+                                   _TIER_MICRO_SPAN[tier],
+                                   _TIER_MICRO_RATIO[tier])
+    _, best_s = _score_scales_chunked(
+        w2d, wq2d, grid, mode, cb, eval_scales,
+        hill_iters=_TIER_HILL_ITERS[tier],
+        hill_ratio=_TIER_MICRO_RATIO[tier])
+    err, enc, dec = _moment_eval(w2d, wq2d, grid, mode, cb, best_s)
+    for _ in range(_TIER_REFITS[tier]):
+        best_s, err, enc, dec = _wls_refit_step_moment(
+            w2d, wq2d, grid, mode, cb, best_s, err, enc, dec)
+    return best_s, enc
+
+
 def _sweep_encode(w2d: torch.Tensor, grid: str, mode: str, cb,
                   wq: torch.Tensor | None):
     """Joint scale sweep + WLS-refit fixed point (mirrors _grid_fields). Picks
@@ -594,21 +935,26 @@ def _two_tier_tables(device: str):
     return table, compose, legal
 
 
-def _two_tier_window(amax: torch.Tensor):
+def _two_tier_window(amax: torch.Tensor, ideal: torch.Tensor | None = None,
+                     pad: int = _TWO_TIER_WINDOW_PAD):
     """Per-superblock E window (E_lo (rows, n_sb) int64, W int) from the ideal
     group scales (spec §1.4): E_lo so the table top reaches min_ideal, E_hi so
-    the table bottom reaches 1.5*max_ideal, padded one octave each side."""
+    the table bottom reaches 1.5*max_ideal, padded ``pad`` octaves each side.
+    ``ideal`` defaults to amax/6 (the exact path); the analytic tiers pass the
+    s0-calibrated ideals so the window centers where winners actually live."""
     rows, G = amax.shape
     n_sb = G * FP4_GROUP // SUPERBLOCK
-    ideal = (amax / NVFP4_GRID_MAX).clamp_min(_E4M3_MIN_POS)
+    if ideal is None:
+        ideal = amax / NVFP4_GRID_MAX
+    ideal = ideal.clamp_min(_E4M3_MIN_POS)
     ideal_sb = ideal.reshape(rows, n_sb, SUPERBLOCK // FP4_GROUP)
     min_i = ideal_sb.amin(dim=-1)
     max_i = ideal_sb.amax(dim=-1)
     t_max = float(TWO_TIER_SUB_TABLE[-1])
     e_lo = (torch.ceil(torch.log2(min_i / t_max)) + TWO_TIER_SUPER_BIAS
-            - _TWO_TIER_WINDOW_PAD)
+            - pad)
     e_hi = (torch.floor(torch.log2(max_i * 1.5)) + TWO_TIER_SUPER_BIAS
-            + _TWO_TIER_WINDOW_PAD)
+            + pad)
     _, _, legal = _two_tier_tables(str(amax.device))
     any_legal = legal.any(dim=-1)
     e_min = int(torch.nonzero(any_legal)[0])
@@ -722,9 +1068,113 @@ def _sweep_encode_two_tier(w2d: torch.Tensor, mode: str, cb,
     return best_s, enc, best_e, best_c
 
 
+def _sweep_encode_two_tier_moment(w2d: torch.Tensor, mode: str, cb,
+                                  wq: torch.Tensor | None, tier: str):
+    """fast/balanced layout-v2 encoder: the windowed-E x entry search scored
+    from cached moments (the W*16 combos reuse ONE moment build per chunk),
+    with the E window centered on the s0-calibrated ideals (analytic init;
+    pad 1 octave balanced / 0 fast), exact refits snapped to the frozen-E
+    reachable set. Selection order and tie rules mirror the exact path
+    (strict <, first-legal wins)."""
+    rows, in_f = w2d.shape
+    n_sb = in_f // SUPERBLOCK
+    dev = str(w2d.device)
+    _, compose, legal = _two_tier_tables(dev)
+    amax = _group_amax(w2d, "fp4")
+    wq2d_w = wq.reshape(rows, in_f) if wq is not None else None
+    m2 = _calibrate_m2_used(w2d, wq2d_w, "fp4", mode, cb)
+    wcol = wq2d_w if wq2d_w is not None else torch.ones_like(w2d)
+    s0 = (_group_reduce(wcol * w2d * w2d, "fp4")
+          / (_group_reduce(wcol, "fp4") * m2).clamp_min(1e-30)).sqrt()
+    refits = _TIER_REFITS[tier]
+    e_lo, e_hi, W = _two_tier_window(
+        amax, ideal=s0, pad=1 if tier == "balanced" else 0)
+    G = amax.shape[1]
+    gps = SUPERBLOCK // FP4_GROUP
+    vec_per_row = in_f // VEC_DIM
+    vec_per_group = FP4_GROUP // VEC_DIM
+    n_ent = len(TWO_TIER_SUB_TABLE)
+    inf = torch.tensor(float("inf"), device=w2d.device)
+
+    best_e = e_lo.clone()
+    best_s = torch.full((rows, G), _E4M3_MIN_POS, device=w2d.device)
+    best_c = torch.zeros(rows, G, dtype=torch.int64, device=w2d.device)
+    rows_step = _moment_rows_step(cb, vec_per_row)
+    wq2d = wq.reshape(rows, in_f) if wq is not None else None
+    for r0 in range(0, rows, rows_step):
+        r1 = min(rows, r0 + rows_step)
+        rc = r1 - r0
+        wvec = w2d[r0:r1].reshape(-1, VEC_DIM)
+        wqc = (wq2d[r0:r1].reshape(-1, VEC_DIM)
+               if wq2d is not None else None)
+        moms = [_stream_moments(x, ws, t)
+                for (x, ws, t) in _mode_streams(wvec, mode, cb, wqc)]
+
+        def entry_err(E, c):
+            comp = compose[E, c]
+            leg = legal[E, c]
+            s_g = _sb_to_groups(torch.where(leg, comp, torch.ones_like(comp)))
+            err_g = _moment_err_groups(moms, s_g, "fp4", in_f, vec_per_group)
+            return torch.where(_sb_to_groups(leg), err_g, inf), s_g
+
+        # Phase 1 — E per superblock by total error (running strict-min in
+        # window order, matching the exact path).
+        lo, hi = e_lo[r0:r1], e_hi[r0:r1]
+        best_tot = torch.full((rc, n_sb), float("inf"), device=w2d.device)
+        for i in range(W):
+            E = torch.minimum(lo + i, hi)
+            err_best_g = torch.full((rc, G), float("inf"), device=w2d.device)
+            for c in range(n_ent):
+                err_g, _ = entry_err(E, c)
+                err_best_g = torch.minimum(err_best_g, err_g)
+            tot = err_best_g.reshape(rc, n_sb, gps).sum(-1)
+            tot = torch.where((lo + i) <= hi, tot, inf)
+            better = tot < best_tot
+            best_tot = torch.where(better, tot, best_tot)
+            best_e[r0:r1] = torch.where(better, E, best_e[r0:r1])
+
+        # Phase 2 — per-group entry at the frozen E (strict <, first legal).
+        Eb = best_e[r0:r1]
+        best_err_g = torch.full((rc, G), float("inf"), device=w2d.device)
+        for c in range(n_ent):
+            err_g, s_g = entry_err(Eb, c)
+            better = err_g < best_err_g
+            best_err_g = torch.where(better, err_g, best_err_g)
+            best_s[r0:r1] = torch.where(better, s_g, best_s[r0:r1])
+            best_c[r0:r1] = torch.where(
+                better, torch.full((rc, G), c, dtype=torch.int64,
+                                   device=w2d.device), best_c[r0:r1])
+
+    # Phase 3 — exact WLS refits on the frozen-E reachable set.
+    reach = compose[best_e]
+    reach_legal = legal[best_e]
+    reps = SUPERBLOCK // FP4_GROUP
+    reach_g = reach.unsqueeze(2).expand(rows, n_sb, reps, -1)
+    legal_g = reach_legal.unsqueeze(2).expand(rows, n_sb, reps, -1)
+    for _ in range(int(refits)):
+        err_cur, _, g = _eval_candidate(w2d, wq, best_s, "fp4", mode, cb)
+        wcol = wq.reshape(rows, in_f) if wq is not None else torch.ones_like(g)
+        num = _group_reduce(wcol * g * w2d, "fp4")
+        den = _group_reduce(wcol * g * g, "fp4")
+        s_star = torch.where(den > 0, num / den.clamp_min(1e-30), best_s)
+        dist = (s_star.reshape(rows, n_sb, reps, 1) - reach_g).abs()
+        dist = torch.where(legal_g, dist, inf)
+        c_star = dist.argmin(dim=-1)
+        s_snap = torch.gather(reach_g, -1, c_star.unsqueeze(-1)).squeeze(-1)
+        s_snap = s_snap.reshape(rows, -1)
+        err_star, _, _ = _eval_candidate(w2d, wq, s_snap, "fp4", mode, cb)
+        better = err_star < err_cur
+        best_s = torch.where(better, s_snap, best_s)
+        best_c = torch.where(better, c_star.reshape(rows, -1), best_c)
+
+    _, enc, _ = _eval_candidate(w2d, wq, best_s, "fp4", mode, cb)
+    return best_s, enc, best_e, best_c
+
+
 def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
                   cb, cw2d: torch.Tensor | None, scale_sweep: bool,
-                  scale_coding: str = SCALE_CODING_V1) -> dict:
+                  scale_coding: str = SCALE_CODING_V1,
+                  encode_tier: str = "max") -> dict:
     rows, in_f = w2d.shape
     nvec_per_row = in_f // VEC_DIM
     wq = _col_weight_vectors(cw2d) if cw2d is not None else None
@@ -735,9 +1185,18 @@ def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
         if not scale_sweep:
             raise ValueError("two-tier scale coding IS the sweep encoder "
                              "(spec §1.4); scale_sweep=False is undefined")
-        scales, enc, super_e, sub_c = _sweep_encode_two_tier(w2d, mode, cb, wq)
+        if encode_tier == "max":
+            scales, enc, super_e, sub_c = _sweep_encode_two_tier(
+                w2d, mode, cb, wq)
+        else:
+            scales, enc, super_e, sub_c = _sweep_encode_two_tier_moment(
+                w2d, mode, cb, wq, encode_tier)
     elif scale_sweep:
-        scales, enc = _sweep_encode(w2d, grid, mode, cb, wq)
+        if encode_tier == "max":
+            scales, enc = _sweep_encode(w2d, grid, mode, cb, wq)
+        else:
+            scales, enc = _sweep_encode_moment(
+                w2d, grid, mode, cb, wq, encode_tier)
     else:
         vectors, scales, _ = _scale_and_vectorize(w2d, grid)
         enc = _mode_encode(vectors, mode, cb, wq)
@@ -754,12 +1213,17 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
                     col_weights: torch.Tensor | None = None,
                     codebook: torch.Tensor | tuple | None = None,
                     scale_sweep: bool = True,
-                    scale_coding: str = SCALE_CODING_V1) -> dict:
+                    scale_coding: str = SCALE_CODING_V1,
+                    encode_tier: str | None = None) -> dict:
     """Quantize ``w`` (2-D or 3-D stacked experts) into VQ fields.
 
     ``scale_sweep`` (default True) jointly optimizes the per-group scale over
     the E4M3-legal candidate grid (IQ-rendering parity); set False for the
     one-shot amax/grid-max scale (A/B and the pre-c3f8c6d rendering).
+
+    ``encode_tier``: fast / balanced / max speed-accuracy tier (None reads
+    ``PRISMAQUANT_CB_ENCODE_TIER``, default balanced). max reproduces the
+    original sweep bit-identically; see docs/nvfp4-cb-plan/encode_tiers.md.
 
     ``scale_coding``: ``"v1"`` (default; bare e4m3 plane) or ``"two_tier"``
     (layout v2, fp4 only: per-superblock E8M0 super + 4-bit sub codes; the
@@ -775,6 +1239,7 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
             f"in_features={in_f} must be a multiple of {SUPERBLOCK}")
     if scale_coding not in (SCALE_CODING_V1, SCALE_CODING_TWO_TIER):
         raise ValueError(f"unknown scale_coding {scale_coding!r}")
+    tier = _resolve_encode_tier(encode_tier)
     orig_shape = tuple(w.shape)
     w2d = w.reshape(-1, in_f)
     rows = w2d.shape[0]
@@ -789,7 +1254,7 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
     row_step = max(1, _SLICE_MAX_ELEMS // max(in_f, 1))
     if rows <= row_step:
         out = _fields_block(w2d, k, grid, mode, cb, cw2d, scale_sweep,
-                            scale_coding)
+                            scale_coding, tier)
     else:
         parts = []
         for a in range(0, rows, row_step):
@@ -797,7 +1262,7 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
             cw = cw2d[a:b] if cw2d is not None else None
             parts.append(
                 _fields_block(w2d[a:b], k, grid, mode, cb, cw, scale_sweep,
-                              scale_coding))
+                              scale_coding, tier))
         out = {key: torch.cat([p[key] for p in parts], dim=0)
                for key in parts[0]}
     out["shape"] = orig_shape
@@ -838,19 +1303,95 @@ def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",
 
 def make_nvfp4_cb_qdq(k: int, grid: str = "fp4", mode: str = "product",
                       scale_sweep: bool = True,
-                      scale_coding: str = SCALE_CODING_V1):
+                      scale_coding: str = SCALE_CODING_V1,
+                      encode_tier: str | None = None):
     """Single-source emulation closure ``(w, col_weights=None) -> w_hat``
     used by both cost and (Milestone B) the packer. ``scale_sweep`` defaults
     True (joint scale search, IQ-rendering parity); ``scale_coding``
-    selects the v1 e4m3 plane (default) or the layout-v2 two-tier coding."""
+    selects the v1 e4m3 plane (default) or the layout-v2 two-tier coding;
+    ``encode_tier`` the fast/balanced/max speed-accuracy tier (None ->
+    PRISMAQUANT_CB_ENCODE_TIER, resolved per call)."""
     def f(w: torch.Tensor, col_weights: torch.Tensor | None = None
           ) -> torch.Tensor:
         fields = nvfp4_cb_fields(w, k, grid=grid, mode=mode,
                                  col_weights=col_weights,
                                  scale_sweep=scale_sweep,
-                                 scale_coding=scale_coding)
+                                 scale_coding=scale_coding,
+                                 encode_tier=encode_tier)
         return nvfp4_cb_reconstruct(fields, k, grid=grid, mode=mode).to(w.dtype)
     return f
+
+
+# ---------------------------------------------------------------------------
+# RD-law ladder interpolation (cost path, opt-in): encode a few ANCHOR rungs,
+# fit the one-parameter rate-distortion law D(k) = C * 2^(-k/4) per Linear
+# (log2 D linear in k with fixed slope -1/4), predict weighted-recon cost at
+# every other rung, and report a HOLDOUT check so the caller can fall back to
+# full measurement where the fit is not trusted. This is "surrogate proposes,
+# measurement verifies" — the anchors and the holdout ARE measurements; no
+# unverified closed form ships (the analytical-damp graveyard rule).
+# Wiring point: the local-cost path may consult this behind
+# PRISMAQUANT_CB_LADDER_INTERP=1 (default OFF; cost-path wiring belongs to
+# the menu-integration workstream — this module only provides the helper).
+# ---------------------------------------------------------------------------
+
+RD_LAW_SLOPE_BITS = 0.25          # log2 D drop per index bit (D ~ 2^(-k/4))
+
+
+def _weighted_recon_cost(w: torch.Tensor, k: int, *, grid: str, mode: str,
+                         col_weights: torch.Tensor | None,
+                         scale_coding: str, encode_tier: str | None) -> float:
+    qdq = make_nvfp4_cb_qdq(k, grid, mode, scale_coding=scale_coding,
+                            encode_tier=encode_tier)
+    w_hat = qdq(w, col_weights)
+    err = (w.to(torch.float32) - w_hat.to(torch.float32)).pow(2)
+    if col_weights is not None:
+        cw = torch.broadcast_to(
+            col_weights.to(w.device, torch.float32), w.shape)
+        err = err * cw
+    return float(err.sum())
+
+
+def predict_cb_ladder_costs(w: torch.Tensor, ks: tuple[int, ...], *,
+                            grid: str = "fp4", mode: str = "product",
+                            col_weights: torch.Tensor | None = None,
+                            anchors: tuple[int, ...] = (12, 18, 24),
+                            holdout: int | None = None,
+                            scale_coding: str = SCALE_CODING_V1,
+                            encode_tier: str | None = None) -> dict:
+    """Predict per-rung weighted-recon cost from a few measured anchors.
+
+    Encodes ``anchors`` (and ``holdout`` if given) for real, fits
+    ``log2 D(k) = log2 C - k/4`` (one parameter ``C``), and returns::
+
+        {"measured": {k: D}, "predicted": {k: D_hat for k in ks},
+         "log2_C": float, "holdout": {"k", "measured", "predicted",
+                                      "rel_error"} | None}
+
+    The caller trusts the interpolation only where the holdout relative
+    error clears its noise floor (docs/nvfp4-cb-plan/encode_tiers.md §B),
+    falling back to full per-rung measurement elsewhere.
+    """
+    measured: dict[int, float] = {}
+    for ak in anchors:
+        measured[int(ak)] = _weighted_recon_cost(
+            w, int(ak), grid=grid, mode=mode, col_weights=col_weights,
+            scale_coding=scale_coding, encode_tier=encode_tier)
+    logc = sum(
+        (torch.log2(torch.tensor(d)).item() + RD_LAW_SLOPE_BITS * ak)
+        for ak, d in measured.items()) / len(measured)
+    predicted = {int(k): float(2.0 ** (logc - RD_LAW_SLOPE_BITS * int(k)))
+                 for k in ks}
+    hold = None
+    if holdout is not None:
+        h_meas = _weighted_recon_cost(
+            w, int(holdout), grid=grid, mode=mode, col_weights=col_weights,
+            scale_coding=scale_coding, encode_tier=encode_tier)
+        h_pred = float(2.0 ** (logc - RD_LAW_SLOPE_BITS * int(holdout)))
+        hold = {"k": int(holdout), "measured": h_meas, "predicted": h_pred,
+                "rel_error": abs(h_pred - h_meas) / max(h_meas, 1e-30)}
+    return {"measured": measured, "predicted": predicted,
+            "log2_C": float(logc), "holdout": hold}
 
 
 # ---------------------------------------------------------------------------
@@ -1117,7 +1658,8 @@ def nvfp4_cb_pack(w: torch.Tensor, k: int, *, grid: str = "fp4",
                   col_weights: torch.Tensor | None = None,
                   codebook: torch.Tensor | tuple | None = None,
                   scale_sweep: bool = True,
-                  scale_coding: str = SCALE_CODING_V1
+                  scale_coding: str = SCALE_CODING_V1,
+                  encode_tier: str | None = None
                   ) -> tuple[torch.Tensor, dict]:
     """Quantize + bit-pack a weight in one call (mirrors ``gguf_pack``).
 
@@ -1128,6 +1670,7 @@ def nvfp4_cb_pack(w: torch.Tensor, k: int, *, grid: str = "fp4",
     fields = nvfp4_cb_fields(w, k, grid=grid, mode=mode,
                              col_weights=col_weights, codebook=codebook,
                              scale_sweep=scale_sweep,
-                             scale_coding=scale_coding)
+                             scale_coding=scale_coding,
+                             encode_tier=encode_tier)
     packed = nvfp4_cb_assemble_bytes(fields, k, grid=grid, mode=mode)
     return packed, fields

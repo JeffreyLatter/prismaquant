@@ -945,3 +945,121 @@ def test_two_tier_exporter_writes_layout_version(export_dir):
         else:
             assert "scale_coding" not in s          # fp8: no scale plane
             assert s["type_size"] == 4 * s["k"]
+
+
+# ===========================================================================
+# Tiered encoder (docs/nvfp4-cb-plan/encode_tiers.md).
+# ===========================================================================
+
+def test_encode_tier_resolution_env(monkeypatch):
+    assert cb._resolve_encode_tier("max") == "max"
+    assert cb._resolve_encode_tier(None) == cb._ENCODE_TIER_DEFAULT
+    monkeypatch.setenv(cb._ENCODE_TIER_ENV, "fast")
+    assert cb._resolve_encode_tier(None) == "fast"
+    with pytest.raises(ValueError, match="encode tier"):
+        cb._resolve_encode_tier("turbo")
+
+
+# max tier == the pre-tier encoder, bit-identical (CPU checksum pin).
+def test_max_tier_bit_identity_regression():
+    import hashlib
+    torch.manual_seed(42)
+    w = torch.randn(32, 512) * 0.02
+    cw = torch.rand(512) + 0.05
+    digests = {}
+    for coding in ("v1", "two_tier"):
+        packed, _ = cb.nvfp4_cb_pack(w, 14, grid="fp4", mode="product",
+                                     col_weights=cw, scale_coding=coding,
+                                     encode_tier="max")
+        digests[coding] = hashlib.sha256(
+            packed.cpu().numpy().tobytes()).hexdigest()[:16]
+    w8 = torch.randn(32, 512) * 0.3
+    packed, _ = cb.nvfp4_cb_pack(w8, 40, grid="fp8", mode="product",
+                                 col_weights=cw, encode_tier="max")
+    digests["fp8"] = hashlib.sha256(
+        packed.cpu().numpy().tobytes()).hexdigest()[:16]
+    # Pinned from the pre-tier encoder (commit ab1ccc5 behavior). If this
+    # fails, the max tier is no longer bit-identical to the original sweep.
+    assert digests == {
+        "v1": "231729a4bea30e0a",
+        "two_tier": "b51df7ffe4c30f2e",
+        "fp8": "fdabaadd1ed75eee",
+    }
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("tier", ["fast", "balanced"])
+def test_tier_determinism(device, tier):
+    torch.manual_seed(13)
+    w = (torch.randn(64, 512) * 0.02).to(device)
+    cw = (torch.rand(512) + 0.05).to(device)
+    qdq = cb.make_nvfp4_cb_qdq(16, "fp4", "product", encode_tier=tier)
+    assert torch.equal(qdq(w, cw), qdq(w, cw))
+    p1, _ = cb.nvfp4_cb_pack(w, 16, grid="fp4", mode="product",
+                             col_weights=cw, scale_coding="two_tier",
+                             encode_tier=tier)
+    p2, _ = cb.nvfp4_cb_pack(w, 16, grid="fp4", mode="product",
+                             col_weights=cw, scale_coding="two_tier",
+                             encode_tier=tier)
+    assert torch.equal(p1, p2)
+
+
+# fast-tier quality bound, asserted from the measured table with slack:
+# measured fast wrecon deltas vs max were <= +0.9% (fp8) / better than max
+# (fp4 v1) / +0.0% (v2); assert a 5% ceiling so noise cannot flake.
+@pytest.mark.parametrize("grid,k,coding,std", [
+    ("fp8", 44, "v1", 0.3),
+    ("fp4", 16, "v1", 0.02),
+    ("fp4", 16, "two_tier", 0.02),
+])
+def test_fast_tier_quality_bound(grid, k, coding, std):
+    torch.manual_seed(14)
+    w = torch.randn(128, 1024) * std
+    cw = torch.rand(1024) + 0.05
+
+    def wrecon(tier):
+        r = cb.make_nvfp4_cb_qdq(k, grid, "product", scale_coding=coding,
+                                 encode_tier=tier)(w, cw)
+        return float((torch.broadcast_to(cw, w.shape)
+                      * (w - r).pow(2)).sum())
+
+    assert wrecon("fast") <= wrecon("max") * 1.05
+    assert wrecon("balanced") <= wrecon("max") * 1.03
+
+
+# tiers still produce decode-valid, pack-parity bytes (the layout contract
+# is tier-independent).
+@pytest.mark.parametrize("tier", ["fast", "balanced"])
+def test_tier_pack_parity_and_validity(tier):
+    torch.manual_seed(15)
+    w = torch.randn(32, 512) * 0.02
+    cw = torch.rand(512) + 0.05
+    packed, fields = cb.nvfp4_cb_pack(w, 16, grid="fp4", mode="product",
+                                      col_weights=cw,
+                                      scale_coding="two_tier",
+                                      encode_tier=tier)
+    up = cb.nvfp4_cb_unpack(packed, 16, "fp4", "product", tuple(w.shape),
+                            codebook=fields["codebook"],
+                            scale_coding="two_tier")
+    rec = cb.nvfp4_cb_reconstruct(up, 16, grid="fp4", mode="product")
+    emu = cb.nvfp4_cb_reconstruct(fields, 16, grid="fp4", mode="product")
+    assert torch.equal(rec, emu)
+    s = fields["scales"]
+    assert torch.equal(s.to(torch.float8_e4m3fn).to(torch.float32), s)
+
+
+def test_predict_cb_ladder_costs_shape_and_holdout():
+    torch.manual_seed(16)
+    w = torch.randn(64, 512) * 0.02
+    cw = torch.rand(512) + 0.05
+    res = cb.predict_cb_ladder_costs(
+        w, tuple(range(12, 25)), grid="fp4", mode="product",
+        col_weights=cw, anchors=(12, 18, 24), holdout=15,
+        scale_coding="two_tier", encode_tier="fast")
+    assert set(res["measured"]) == {12, 18, 24}
+    assert set(res["predicted"]) == set(range(12, 25))
+    # monotone: more index bits -> lower predicted distortion
+    pv = [res["predicted"][k] for k in range(12, 25)]
+    assert all(a > b for a, b in zip(pv, pv[1:]))
+    hold = res["holdout"]
+    assert hold["k"] == 15 and hold["rel_error"] >= 0.0

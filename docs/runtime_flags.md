@@ -90,6 +90,9 @@ The production pipeline fails fast when archived Fisher levers are requested.
 | `PRISMAQUANT_COORD_LANE_CUDA_GRAPHS` | `auto` | Graphs lane-batched coord flip evaluation only when repeated calls can amortize capture. Replay-cache coord batches are one-shot, so auto leaves them eager. Default thresholds: `8` for replay mode, `16` for full-forward mode; override with `PRISMAQUANT_COORD_LANE_CUDA_GRAPHS_MIN_CALLS`. |
 | `PRISMAQUANT_KL_CUDA_GRAPHS` | `auto` | Graphs assignment-KL validation only for larger calibration batches. Default threshold: `16`, override with `PRISMAQUANT_KL_CUDA_GRAPHS_MIN_CALLS`. |
 | `PRISMAQUANT_COORD_REPLAY_CACHE` | `off` | Opt-in LayerHiddenStateCache for coord descent. It reduces tail layer forwards but currently copies too much baseline model state on large Qwen runs, so the fast default is lane-batched eager evaluation. |
+| `PRISMAQUANT_CB_ENCODE_TIER` | `balanced` | NVFP4-CB/FP8-CB encoder speed-accuracy tier: `fast` / `balanced` / `max`. `max` is the original exhaustive scale sweep, bit-identical (regression-pinned); `balanced`/`fast` use the analytic s0 init + moment-scored micro-sweep + hill climb (measured ×3.9/×5.9 mean, docs/nvfp4-cb-plan/encode_tiers.md). |
+| `PRISMAQUANT_CB_ENCODE_COMPILE` | **on** | torch.compile the CB moment-scoring inner kernels (fast/balanced tiers only; max never compiles). Set `0` to pin eager — the repo's compiled-vs-eager tie-flip caveat applies within a tier. |
+| `PRISMAQUANT_CB_LADDER_INTERP` | reserved | Declared wiring point, NOT read by any code yet: the local cost path may consult `nvfp4_cb_formats.predict_cb_ladder_costs` (RD-law ladder interpolation, holdout-gated — encode_tiers.md §B) behind this flag once the menu-integration workstream wires it. |
 | `PRISMAQUANT_L3_MIN_HOST_MEM_GB` | unset | Optional host-memory floor for L3 pair/scout diagnostics. When set, L3 raises `GPUMemoryBudgetExceeded` between paired-override chunks if `/proc/meminfo` `MemAvailable` drops below this many GiB, giving long runs a chance to stop before system OOM. |
 
 ## Live PRISMAQUANT flag index
@@ -110,6 +113,9 @@ PRISMAQUANT_ALLOW_UNSCALED_FP8
 PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE
 PRISMAQUANT_BATCHED_NVFP4_EXPORT
 PRISMAQUANT_BLOCK_OUTPUT_MATCH
+PRISMAQUANT_CB_ENCODE_COMPILE
+PRISMAQUANT_CB_ENCODE_TIER
+PRISMAQUANT_CB_LADDER_INTERP
 PRISMAQUANT_CHANNEL_SENTINEL
 PRISMAQUANT_COORD_LANE_CUDA_GRAPHS
 PRISMAQUANT_COORD_LANE_CUDA_GRAPH_CACHE_SIZE
