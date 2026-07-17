@@ -463,3 +463,25 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
   exploit two-tier windowed-E; (2) serving: CUDA-graph capture fix (decode),
   transient-buffer tuning. Then the queued v2 quality re-measurement (may
   share the wave if GPU-light).
+
+## GOAL SET (Robert, /goal 2026-07-16): CB formats as first-class PrismaQuant
+menu rungs — fp8/nvfp4-aligned, native Spark serving, NO prefill degradation
+(vs IQ), smaller sizes at highest quality; prove on Qwen3.6-27B dense + 35B
+MoE; scale to ultra-low-bit 200-300B (Hy3, DSv4-Flash).
+
+Roadmap to goal (live):
+1. [in flight] 4B pipeline commit (serving agent) — quality gate PASSED
+   (emu conf-KL 0.0181), speed tables done, histogram closing.
+2. [in flight] Pipeline/menu integration (new worker): serving profile +
+   run-pipeline gates + allocator mixed-menu tests + un-run 0.6B smoke.
+3. [queued on GPU-free] Efficiency wave: sweep pruning from histogram
+   (encode 2.7h/4B → target ~30min), CUDA-graph decode fix.
+4. [queued] v2 quality re-measurement: premium-flip test (two-tier k16
+   @2.28bpw vs IQ2_S) + fp4-family arms on 0.6B.
+5. [queued] Plugin v2 compose + transient-to-NVFP4 prefill.
+6. [next scale] 27B dense Qwen3.6: AURA-allocated mixed menu incl. CB rungs
+   vs the shipped PrismaAURA-5.5 at matched bpw (the production bar).
+7. [then] 35B MoE (expert-uniform CB rungs, hybrid empirical expert costs).
+8. [then] Hy3/DSv4-class ultra-low-bit (encode-cost prunes prerequisite;
+   MoE grouped transient path; possibly fused kernel if transient
+   insufficient at that scale).
