@@ -69,7 +69,12 @@ set -euo pipefail
 # 9728-dim H) and degenerates toward RTN — measured on Qwen3-4B, 1024
 # rows closed the render gap vs llama.cpp's imatrix quantizer from +20%
 # to +7.7% KLD (top-1 at parity). See docs/gguf_lane.md.
-if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
+# The nvfp4_cb lane inherits the same default: the weighted VQ codeword
+# search wants a higher-rank imatrix than 256 rows (format-pipeline.md §6);
+# 1024 is the analogy-to-GGUF starting point pending a CB-specific
+# measurement (docs/nvfp4-cb-plan/format-pipeline.md open-Q 6).
+if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" \
+   || "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
   : "${ACTIVATION_ROWS_LIMIT:=1024}"
 else
   : "${ACTIVATION_ROWS_LIMIT:=256}"
@@ -100,6 +105,28 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   fi
   if [[ "${TARGET_PROFILE:-vllm_packed_moe}" != "gguf" ]]; then
     echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires TARGET_PROFILE=gguf (the exporter hard-fails on non-GGUF formats in the assignment)." >&2
+    exit 2
+  fi
+fi
+
+# NVFP4-CB / FP8-CB codebook lane consistency gates (docs/nvfp4-cb-plan/
+# format-pipeline.md §6, LAYOUT.md). Same rendering-confound contract as the
+# GGUF lane: the CB exporter (export_nvfp4_cb) ships imatrix-weighted VQ bytes
+# and requantizes the bf16 skeleton, so the allocator cost MUST be the
+# skeleton-requantize weighted render (COST_MODE=local), never
+# production-render-score (which scores UNWEIGHTED registry renders and never
+# reads the production cache the CB exporter also ignores).
+if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
+  if [[ "${COST_MODE:-production-render-score}" != "local" ]]; then
+    echo "[pipeline] ERROR: EXPORT_CONTAINER=nvfp4_cb requires COST_MODE=local — production-render-score scores UNWEIGHTED registry renders while the CB exporter ships imatrix-weighted VQ bytes (the identical rendering confound the GGUF gate exists for). Set COST_MODE=local." >&2
+    exit 2
+  fi
+  if [[ "${TARGET_PROFILE:-vllm_packed_moe}" != "nvfp4_cb" ]]; then
+    echo "[pipeline] ERROR: EXPORT_CONTAINER=nvfp4_cb requires TARGET_PROFILE=nvfp4_cb — the allocator must gate every candidate through the nvfp4_cb serving profile (allow_formats = CB rungs + NVFP4/FP8_DYNAMIC/BF16, in_features%256 shape rule) and the exporter hard-fails on non-CB formats in the assignment. Set TARGET_PROFILE=nvfp4_cb." >&2
+    exit 2
+  fi
+  if [[ "${PRODUCTION_CACHE:-1}" != "0" || "${PRODUCTION_RECACHE:-1}" != "0" ]]; then
+    echo "[pipeline] ERROR: EXPORT_CONTAINER=nvfp4_cb requires PRODUCTION_CACHE=0 PRODUCTION_RECACHE=0 — export_nvfp4_cb requantizes the bf16 skeleton and never reads the production cache; building one burns hours rendering bytes that never ship. Set PRODUCTION_CACHE=0 PRODUCTION_RECACHE=0." >&2
     exit 2
   fi
 fi
@@ -1362,6 +1389,102 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   echo "  Artifact: ${WORK_DIR}/exported.gguf"
   echo "  Serve (llama.cpp): $LLAMA_CPP_DIR/build/bin/llama-server -m ${WORK_DIR}/exported.gguf -ngl 99"
   echo "  KL harness:        llama-perplexity --kl-divergence-base <base_logits> --kl-divergence"
+  exit 0
+fi
+
+if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
+  # NVFP4-CB / FP8-CB codebook lane: one custom compressed-tensors-STYLE
+  # artifact served by the out-of-tree vllm_prismaquant_plugin (LAYOUT.md is
+  # the byte contract). Like the GGUF lane, the exporter requantizes the bf16
+  # skeleton with an imatrix-weighted VQ search — it does NOT read a production
+  # cache. Requires TARGET_PROFILE=nvfp4_cb + COST_MODE=local (gated above).
+  : "${CB_OUT:=${WORK_DIR}/exported_nvfp4_cb}"
+  : "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
+  # Codebook source: `lattice` (deterministic fixed FP4/FP8 lattice, no
+  # sidecar) or `learned` (shared per-(role) codebooks trained at export
+  # time, sidecar amortized ~0 bpw — the byte-competitive champion in
+  # Phase 0; per-tensor learned is footprint-prohibitive, never used).
+  : "${CB_CODEBOOK_SOURCE:=lattice}"
+  : "${CB_CODEBOOK_ITERS:=4}"
+  : "${CB_CODEBOOK_SEED:=0}"
+  # Joint E4M3-legal scale sweep is default-ON (IQ-rendering parity; the
+  # exp-1 CB-vs-IQ confound was a scale-rendering artifact). CB_SCALE_SWEEP=0
+  # is the one-shot amax/grid-max A/B ablation only.
+  : "${CB_SCALE_SWEEP:=1}"
+  # fp4 scale coding: `v1` (bare E4M3 plane, default/served) or `two_tier`
+  # (layout-v2 E8M0-super + 4-bit-sub; serve gates pending — do NOT ship).
+  : "${CB_SCALE_CODING:=v1}"
+
+  # Col-weights (per-input-column imatrix) — the CB exporter's weighted-VQ
+  # importance, REQUIRED for every CB target (no silent RTN). Harvested from
+  # the SAME activation cache the local cost stage built, exactly as the GGUF
+  # lane's --imatrix-from-act-cache: measured cost and shipped bytes are the
+  # one weighted render (the one-cache / lockstep contract, format-pipeline
+  # §6). Skip-if-exists; override CB_COL_WEIGHTS to supply a pre-built flat
+  # {qname: (in_features,) tensor} pickle (e.g. Fisher col-weights, exp-4).
+  if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
+    echo "[pipeline] [4/4] harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
+    CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" python3 - <<'PY'
+import os, pickle
+from prismaquant.export_gguf import build_imatrix_from_act_cache
+act_dir = os.environ["CB_ACT_DIR"]
+out = os.environ["CB_COL_WEIGHTS"]
+cw = build_imatrix_from_act_cache(act_dir)
+if not cw:
+    raise SystemExit(
+        f"[pipeline] ERROR: no activation cache under {act_dir!r}; the CB "
+        f"exporter needs a col-weights (imatrix) vector per CB target. Run "
+        f"the probe+cost stages first (they populate {act_dir}).")
+os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+with open(out, "wb") as fh:
+    pickle.dump(cw, fh)
+print(f"[pipeline] [4/4] wrote {out}: {len(cw)} Linears")
+PY
+  else
+    echo "[pipeline] [4/4] CB col-weights exist, skipping"
+  fi
+
+  echo "[pipeline] [4/4] exporting to nvfp4_cb (codebook container) ..."
+  CB_EXPORT_ARGS=(
+    python3 -m prismaquant.export_nvfp4_cb
+    --model-dir "$MODEL_PATH"
+    --layer-config "${WORK_DIR}/artifacts/layer_config.json"
+    --out "$CB_OUT"
+    --col-weights "$CB_COL_WEIGHTS"
+    --codebook-source "$CB_CODEBOOK_SOURCE"
+    --codebook-iters "$CB_CODEBOOK_ITERS"
+    --codebook-seed "$CB_CODEBOOK_SEED"
+    --scale-coding "$CB_SCALE_CODING"
+    --device "$EXPORT_DEVICE"
+  )
+  case "$CB_SCALE_SWEEP" in
+    0|false|False|FALSE|no|No|NO) CB_EXPORT_ARGS+=(--no-scale-sweep) ;;
+    1|true|True|TRUE|yes|Yes|YES|auto|"") ;;
+    *)
+      echo "[pipeline] ERROR: CB_SCALE_SWEEP must be 0 or 1" >&2
+      exit 2
+      ;;
+  esac
+  "${CB_EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
+
+  # TODO(Milestone C / production-cache): the fuller one-cache integration —
+  # teach production-render-score to pass col_weights to the CB render so the
+  # standard ProductionWeightCache identity holds (cost==KL==bytes through the
+  # cache, like NVFP4/FP8) and the COST_MODE=local restriction can lift — is
+  # DEFERRED per format-pipeline.md §6 ("Alternative (larger, better) path —
+  # flag not adopt"). Phase 0 mirrors the GGUF skeleton-requantize model.
+  # There is also NO in-lane serving smoke: CB artifacts serve ONLY via the
+  # out-of-tree vllm_prismaquant_plugin (plugins/vllm_prismaquant/), so the
+  # load+generate / served-KL gate runs in the plugin's serving env, not here
+  # (docs/nvfp4-cb-plan/serve_prototype_0p6b.md). No rung is production-eligible
+  # until it clears the served gold-metric KL/PPL gate AND the prefill perf
+  # gate (INV-2, no Triton masquerade).
+  echo
+  echo "[pipeline] done."
+  echo "  Artifact: ${CB_OUT}  (custom quant_method=prismaquant; LAYOUT.md contract)"
+  echo "  Serve:    vLLM with the vllm_prismaquant_plugin installed"
+  echo "            (plugins/vllm_prismaquant/); NOT stock compressed-tensors."
+  echo "  Gate:     served KL-vs-BF16 + WikiText PPL in the plugin serving env."
   exit 0
 fi
 
