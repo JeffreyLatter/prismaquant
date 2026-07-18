@@ -1375,3 +1375,107 @@ def test_expert_empirical_parser_args():
     assert args.ladder_holdout_tol == 0.05
     d = _build_parser().parse_args(["--model", "m", "--output", "o"])
     assert not d.replace_experts and not d.cb_ladder_interp
+
+
+# ===========================================================================
+# FP8_SOURCE passthrough in the mixed CB container (fp8_source_passthrough).
+# ===========================================================================
+
+def _tiny_fp8_source_model(mdl: Path, in_f: int = 256):
+    """Synthetic native-FP8 dir: one fp8_e4m3fn Linear + 128x128
+    weight_scale_inv (MiniMax/DeepSeek convention) + one bf16 CB-target
+    Linear + a norm sidecar."""
+    from safetensors.torch import save_file
+
+    mdl.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(3)
+    w_fp8 = (torch.randn(128, in_f) * 0.3).to(torch.float8_e4m3fn)
+    # 128x128 block scale_inv, ceil-div blocks along each dim.
+    si = (torch.rand((128 + 127) // 128, (in_f + 127) // 128) + 0.1).float()
+    tens = {
+        "model.layers.0.self_attn.q_proj.weight": w_fp8,
+        "model.layers.0.self_attn.q_proj.weight_scale_inv": si,
+        "model.layers.0.mlp.gate_proj.weight":
+            (torch.randn(128, in_f) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(in_f, dtype=torch.bfloat16),
+    }
+    save_file(tens, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(
+        json.dumps({"architectures": ["TinyFP8"], "hidden_size": in_f}))
+    return tens
+
+
+def test_fp8_source_passthrough_verbatim(export_dir):
+    from safetensors.torch import load_file
+
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl, out = export_dir / "model", export_dir / "out"
+    tens = _tiny_fp8_source_model(mdl)
+    assign = {
+        "model.layers.0.self_attn.q_proj": {
+            "data_type": "fp8_e4m3", "bits": 8, "group_size": 128},  # FP8_SOURCE
+        "model.layers.0.mlp.gate_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+    }
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, assign)
+    cw = {"model.layers.0.mlp.gate_proj": torch.rand(256) + 0.05}
+    counts = export_nvfp4_cb(mdl, apath, out, cw, device="cpu")
+    assert counts["FP8_SOURCE"] == 1 and counts["NVFP4_CB_K16"] == 1
+
+    ot = load_file(str(out / "model.safetensors"))
+    q = "model.layers.0.self_attn.q_proj"
+    # verbatim: fp8 weight bytes identical, scale_inv -> weight_scale (fp32)
+    assert ot[q + ".weight"].dtype == torch.float8_e4m3fn
+    assert torch.equal(
+        ot[q + ".weight"].view(torch.uint8),
+        tens[q + ".weight"].view(torch.uint8))
+    assert torch.equal(ot[q + ".weight_scale"],
+                       tens[q + ".weight_scale_inv"].float())
+    assert (q + ".weight_scale_inv") not in ot   # renamed, not duplicated
+
+    qc = json.loads((out / "quant_config.json").read_text())
+    # FP8_SOURCE is a quantized scheme, NOT ignored.
+    assert q not in qc["ignore"]
+    assert qc["provenance"]["fp8_source_targets"] == 1
+    # its config group is the stock CT block-fp8 scheme (no "scheme" key ->
+    # plugin delegates to compressed-tensors), targeting the fp8 Linear.
+    src_groups = [g for g in qc["config_groups"].values()
+                  if g.get("format") == "float-quantized"
+                  and "scheme" not in g]
+    assert len(src_groups) == 1
+    g = src_groups[0]
+    assert g["weights"]["strategy"] == "block"
+    assert g["weights"]["block_structure"] == [128, 128]
+    # targets are compressed-tensors regex form (re:^...q_proj$)
+    import re as _re
+    assert any(t.startswith("re:") and _re.match(t[3:], q)
+               for t in g["targets"])
+
+
+def test_fp8_source_rejects_non_fp8_source(export_dir):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    # A bf16-source Linear assigned FP8_SOURCE must hard-fail (passthrough-only,
+    # never synthesized) — the exporter guard mirrors the allocator's
+    # passthrough-integrity filter.
+    mdl, out = export_dir / "model", export_dir / "out"
+    _tiny_model(mdl)   # all bf16, no weight_scale_inv anywhere
+    assign = {"model.layers.0.mlp.gate_proj": {
+        "data_type": "fp8_e4m3", "bits": 8, "group_size": 128}}
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, assign)
+    with pytest.raises(ValueError, match="passthrough-only"):
+        export_nvfp4_cb(mdl, apath, out, {}, device="cpu")
+
+
+def test_fp8_source_in_serving_allowlist():
+    import json as _json
+    from pathlib import Path as _P
+
+    spec = _json.loads((_P("prismaquant/serving_profile_specs/nvfp4_cb.json")
+                        ).read_text())
+    allow = spec["format_rules"][0]["allow_formats"]
+    assert "FP8_SOURCE" in allow
+    # FP8_SOURCE is passthrough (no 256-superblock shape rule).
+    assert "FP8_SOURCE" not in spec["shape_rules"][0]["formats"]

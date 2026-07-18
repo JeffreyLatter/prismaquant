@@ -217,10 +217,13 @@ def export_nvfp4_cb(
         _explicit_regex as _ct_explicit_regex,
         NVFP4_SCHEME as _NVFP4_SCHEME,
         FP8_E4M3_SCHEME as _FP8_E4M3_SCHEME,
+        FP8_SOURCE_SCHEME as _FP8_SOURCE_SCHEME,
     )
     from prismaquant.model_profiles import detect_profile as _detect_profile
     # Stock rungs the mixed container carries CT-style (plugin delegates them to
     # vLLM's CompressedTensors path). FP8_DYNAMIC canonicalizes to FP8_E4M3.
+    # FP8_SOURCE is a PASSTHROUGH scheme (verbatim fp8 weight + scale_inv copy),
+    # not a _quantize_2d target — handled separately below.
     _STOCK_CT_SCHEMES = {"NVFP4": _NVFP4_SCHEME, "FP8_E4M3": _FP8_E4M3_SCHEME}
 
     # --- Coverage gate: classify every assigned format into CB / stock-CT /
@@ -228,6 +231,7 @@ def export_nvfp4_cb(
     # recipe"). ---
     cb_targets: dict[str, tuple[str, str, int]] = {}   # qname -> (grid,mode,k)
     stock_targets: dict[str, str] = {}                 # qname -> "NVFP4"|"FP8_E4M3"
+    source_targets: list[str] = []                     # FP8_SOURCE passthrough
     illegal = []
     for qname, fmt in assignment.items():
         if fmt == "BF16":
@@ -237,6 +241,9 @@ def export_nvfp4_cb(
             cb_targets[qname] = parsed
             continue
         canon = _fr.canonical_format_name(fmt)
+        if canon == "FP8_SOURCE":
+            source_targets.append(qname)
+            continue
         if canon in _STOCK_CT_SCHEMES:
             stock_targets[qname] = canon
             continue
@@ -245,7 +252,23 @@ def export_nvfp4_cb(
         raise ValueError(
             f"assignment contains formats the mixed CB container cannot carry: "
             f"{sorted({f for _, f in illegal})} — it carries the CB families "
-            f"+ stock NVFP4/FP8_DYNAMIC (CT-delegated) + BF16 passthrough only")
+            f"+ stock NVFP4/FP8_DYNAMIC (CT-delegated) + FP8_SOURCE "
+            f"(verbatim fp8 passthrough) + BF16 passthrough only")
+
+    # FP8_SOURCE is PASSTHROUGH-ONLY (PASSTHROUGH_SOURCE_REQUIREMENTS): legal
+    # only where the source `.weight` is already fp8_e4m3fn with a
+    # `.weight_scale_inv` sibling. The allocator's passthrough-integrity
+    # filter should drop it otherwise — hard-fail here so a stale manifest
+    # never ships a re-synthesized (8-bpp-wasting) FP8 tensor.
+    for qname in source_targets:
+        wname, sname = qname + ".weight", qname + ".weight_scale_inv"
+        w = skeleton.get(wname)
+        if w is None or w.dtype != torch.float8_e4m3fn or sname not in skeleton:
+            raise ValueError(
+                f"{qname}: assigned FP8_SOURCE but source is not native FP8 "
+                f"(weight dtype={None if w is None else w.dtype}, "
+                f"has scale_inv={sname in skeleton}). FP8_SOURCE is "
+                f"passthrough-only — never synthesize it.")
 
     for qname, (grid, mode, k) in cb_targets.items():
         wname = qname + ".weight"
@@ -350,9 +373,28 @@ def export_nvfp4_cb(
     counts: Counter[str] = Counter()
     ignore: list[str] = []
     packed_qnames = set(cb_targets)
+    source_qnames = set(source_targets)
+    # scale_inv siblings of FP8_SOURCE targets are emitted verbatim in the
+    # source branch below; skip them in the passthrough else-branch so they
+    # are neither double-emitted nor added to the ignore list.
+    _source_scale_keys = {f"{q}.weight_scale_inv" for q in source_qnames}
 
     for name, tensor in skeleton.items():
         qname = name[:-len(".weight")] if name.endswith(".weight") else None
+        if name in _source_scale_keys:
+            continue
+        if qname in source_qnames:
+            # FP8_SOURCE passthrough: copy the native fp8 `.weight` verbatim
+            # and rename `.weight_scale_inv` -> `.weight_scale` (bytes
+            # verbatim, fp32) — EXACTLY as the CT streaming exporter does
+            # (export_native_compressed:5711), so stock compressed-tensors
+            # block-fp8 delegation reads it unchanged. No dequant/requant
+            # round-trip; NOT added to ignore (it is an FP8_SOURCE group).
+            out_tensors[qname + ".weight"] = tensor.contiguous()
+            out_tensors[qname + ".weight_scale"] = skeleton[
+                qname + ".weight_scale_inv"].to(torch.float32).contiguous()
+            counts["FP8_SOURCE"] += 1
+            continue
         if qname in packed_qnames:
             grid, mode, k = cb_targets[qname]
             ref, fmt, codebook, _ = target_cb[qname]
@@ -474,6 +516,15 @@ def export_nvfp4_cb(
         _group = _deepcopy(_STOCK_CT_SCHEMES[_f])
         _group["targets"] = sorted(_ct_explicit_regex(q) for q in _qnames)
         config_groups[f"group_{len(config_groups)}"] = _group
+    # FP8_SOURCE passthrough group: the stock CT `float-quantized` block-fp8
+    # scheme (no "scheme" key -> the plugin delegates it to CompressedTensors,
+    # exactly like the other stock rungs; the emitted `.weight`/`.weight_scale`
+    # names match FP8_SOURCE_SCHEME).
+    if source_targets:
+        _src_group = _deepcopy(_FP8_SOURCE_SCHEME)
+        _src_group["targets"] = sorted(
+            _ct_explicit_regex(q) for q in source_targets)
+        config_groups[f"group_{len(config_groups)}"] = _src_group
     quant_config = {
         "quant_method": "prismaquant",
         "format": "nvfp4_cb",
@@ -490,9 +541,11 @@ def export_nvfp4_cb(
             "scale_coding": scale_coding,
             "cb_targets": len(cb_targets),
             "stock_ct_targets": len(stock_targets),
+            "fp8_source_targets": len(source_targets),
             "tensor_formats": {
                 q: assignment[q]
-                for q in sorted(set(cb_targets) | set(stock_targets))},
+                for q in sorted(set(cb_targets) | set(stock_targets)
+                                | set(source_targets))},
         },
     }
     if scale_coding == cb.SCALE_CODING_TWO_TIER:
