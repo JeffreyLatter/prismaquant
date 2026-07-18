@@ -769,3 +769,10 @@ Roadmap to goal (live):
   idleness — correct sequencing; parallel builds would re-starve the critical
   run (feedback_no_overparallel_during_prod). Each build launches informed by
   the prior verdict.
+- **A/B input de-risked (non-contending catch):** the PrismaAURA-5.5 comparison
+  baseline was NOT on disk (only refs/main 12K — the menu agent's "downloaded"
+  never landed the weights). Would have failed the A/B at serve time.
+  Downloading the real ~23GB now (bg, HF cache; 27B export unaffected at 74W —
+  network IO ≠ GPU starvation). Menu agent told to read-verify DL completion
+  before serving. All other A/B inputs present (wiki.test.raw, BF16 ref,
+  measure_27b_ab.sh, 293GB free). 27B re-export healthy (pid 1452, ~24min in).
