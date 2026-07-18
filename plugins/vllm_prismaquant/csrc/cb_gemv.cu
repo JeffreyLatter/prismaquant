@@ -145,8 +145,8 @@ DEVINL float e4m3_to_f32(uint8_t b) {
       __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3));
 }
 
-template <int MT>
-__global__ __launch_bounds__(kThreads) void cb_gemv_fp8_kernel(
+template <int MT, int WARPS>
+__global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
     const uint16_t* __restrict__ x,        // [M, K] bf16 (as u16), QDQ'd
     const uint8_t* __restrict__ qw,        // [N, qw_stride] packed rows
     const uint16_t* __restrict__ cb16,     // E4M3-byte codebook as u16 pairs
@@ -161,8 +161,8 @@ __global__ __launch_bounds__(kThreads) void cb_gemv_fp8_kernel(
   const int lane = threadIdx.x & 31;
   const int n_sb = (int)(K >> 8);          // K / 256
 
-  __shared__ __align__(16) uint8_t stage[kWarps][kSlotBytes];
-  __shared__ float red[kWarps][MT > 0 ? MT : 1];
+  __shared__ __align__(16) uint8_t stage[WARPS][kSlotBytes];
+  __shared__ float red[WARPS][MT > 0 ? MT : 1];
 
   const uint8_t* row = qw + n * qw_stride;
   const float sc_row = __ldg(scale + n);
@@ -181,12 +181,14 @@ __global__ __launch_bounds__(kThreads) void cb_gemv_fp8_kernel(
   // one superblock in a single coalesced round.
   const int stage_vecs = type_size >> 3;
 
-  for (int s = warp; s < n_sb; s += kWarps) {
+  for (int s = warp; s < n_sb; s += WARPS) {
     // --- coalesced stage of this superblock's bytes into the warp slot ---
+    // __ldcs (evict-first): the packed stream is read exactly once per token;
+    // keep L2 for the codebook / x / the bf16 floor layers instead.
     const uint64_t* gsrc =
         reinterpret_cast<const uint64_t*>(row + (int64_t)s * type_size);
     uint64_t* gdst = reinterpret_cast<uint64_t*>(stage[warp]);
-    if (lane < stage_vecs) gdst[lane] = __ldg(gsrc + lane);
+    if (lane < stage_vecs) gdst[lane] = __ldcs(gsrc + lane);
     __syncwarp();
 
     // --- extract this lane's k-bit codeword (aligned 32-bit smem reads) ---
@@ -259,7 +261,7 @@ __global__ __launch_bounds__(kThreads) void cb_gemv_fp8_kernel(
   if (warp == 0 && lane < MT && lane < M) {
     float total = 0.0f;
 #pragma unroll
-    for (int w = 0; w < kWarps; ++w) total += red[w][lane];
+    for (int w = 0; w < WARPS; ++w) total += red[w][lane];
     y[(int64_t)lane * N + n] = f32_to_bf16_rn(total);
   }
 }
@@ -290,13 +292,26 @@ void launch_gemv(const torch::Tensor& xq, const torch::Tensor& qw,
                  const torch::Tensor& scale, torch::Tensor& y,
                  int M, int64_t N, int64_t K, int k_bits, int sub_w,
                  int type_size, cudaStream_t stream) {
-  cb_gemv_fp8_kernel<MT><<<(unsigned)N, kThreads, 0, stream>>>(
-      reinterpret_cast<const uint16_t*>(xq.data_ptr()),
-      qw.data_ptr<uint8_t>(),
-      reinterpret_cast<const uint16_t*>(cb.data_ptr()),
-      cboff.data_ptr<int32_t>(), scale.data_ptr<float>(),
-      reinterpret_cast<uint16_t*>(y.data_ptr()),
-      M, N, K, qw.stride(0), k_bits, sub_w, type_size);
+  // Warp count: superblocks per row are warp-strided, so a row count that is
+  // a multiple of 4 but not 8 (e.g. K=5120 -> 20 superblocks) leaves a 20%
+  // tail at 8 warps; 4 warps divide it exactly. Large rows amortize the tail
+  // and prefer 8 warps for block-level parallelism.
+  const int n_sb = (int)(K >> 8);
+  const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
+#define PQ_LAUNCH(W)                                                       \
+  cb_gemv_fp8_kernel<MT, W><<<(unsigned)N, (W)*32, 0, stream>>>(           \
+      reinterpret_cast<const uint16_t*>(xq.data_ptr()),                    \
+      qw.data_ptr<uint8_t>(),                                              \
+      reinterpret_cast<const uint16_t*>(cb.data_ptr()),                    \
+      cboff.data_ptr<int32_t>(), scale.data_ptr<float>(),                  \
+      reinterpret_cast<uint16_t*>(y.data_ptr()),                           \
+      M, N, K, qw.stride(0), k_bits, sub_w, type_size)
+  if (use4) {
+    PQ_LAUNCH(4);
+  } else {
+    PQ_LAUNCH(8);
+  }
+#undef PQ_LAUNCH
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
