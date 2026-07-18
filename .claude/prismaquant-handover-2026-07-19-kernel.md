@@ -44,6 +44,16 @@ KL preserved (see §3 — read it, there's a subtle measurement finding).
    sm120 CollectiveBuilder fp8 GEMM (e4m3/e4m3→bf16, 128×128×128, vendored
    CUTLASS 4.3.4 headers `include` + `tools/util/include`) at 0.91–0.99× of
    vLLM `cutlass_scaled_mm` on 27B M=1400 shapes. We can own the mainloop.
+6. **Fork-without-change gate PASSED** (`db2c331`):
+   `csrc/cutlass_fork/sm120_cb_mma_tma.hpp` = the sm120 collective verbatim
+   under a new policy tag `MainloopSm120CbTmaWarpSpecialized`;
+   `csrc/cb_fused_gemm.cu` rebinds the builder's resolved collective onto it
+   (variadic policy-swap metafunction) and runs it through `GemmUniversal` —
+   **bit-identical to the builder version, speed-equal (0.93–1.00×)**. The
+   kernel layer accepts the new policy because its enable_if keys on
+   `DispatchPolicy::Schedule`. Start the decode-injection INSIDE this fork:
+   the `load()` method's B-operand TMA + the smem staging between pipeline
+   arrive and the consumer's `SmemCopyAtomB` reads.
 
 ## 2. The one open speed item — fused FP8_CB prefill (the 0.33 s)
 
