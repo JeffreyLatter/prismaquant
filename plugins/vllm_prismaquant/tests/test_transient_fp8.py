@@ -141,6 +141,24 @@ def test_value_expand_matches_reconstruct(qname):
         f"{qname}: expanded tile not on the e4m3 grid (max |Δ| {cast_err:.3e})")
 
 
+@pytest.mark.parametrize("qname", PICK)
+def test_fp8_direct_expand_bitexact(qname):
+    """The fp8-direct expander (byte-gather, no bf16 intermediate) must produce
+    byte-identical output to the old two-pass path (bf16 expand + lossless
+    e4m3 cast) — same tile, a third of the expand-side traffic."""
+    p = _prep(qname)
+    N, K, k = p["N"], p["K"], p["k"]
+    ref = expand_cb_to_value(p["qwp"], p["cb_flat"], p["row_off"],
+                             N, K, k, p["n_sub"], p["ts"], is_fp4=False
+                             ).to(torch.float8_e4m3fn)
+    cb_fp8 = p["cb_flat"].to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
+    out = _expand.expand_cb_to_fp8(p["qwp"], cb_fp8, p["row_off"],
+                                   N, K, k, p["n_sub"], p["ts"])
+    assert out.dtype == torch.float8_e4m3fn and out.shape == (N, K)
+    assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8)), (
+        f"{qname}: fp8-direct expand bytes != bf16-expand+cast bytes")
+
+
 def test_value_expand_rejects_fp4():
     """NVFP4_CB must stay on the Triton decode path -- the expander refuses it
     rather than silently producing a scale-less fp4 tile."""

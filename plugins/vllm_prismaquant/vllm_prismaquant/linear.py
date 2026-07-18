@@ -24,7 +24,7 @@ from vllm.model_executor.parameter import (
 )
 
 from . import codec
-from .expand import expand_cb_to_value, expand_fp4_v2_to_weight
+from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
 from .ops import cb_gemm
 
 # Fallback fused mapping if the config's packed_modules_mapping is unset.
@@ -219,6 +219,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             layer._cb_scale = layer.weight_scale.data.reshape(-1).to(
                 torch.float32)
             layer._cb_compose = dummy
+            # E4M3-byte codebook for the fp8-direct transient expand (exact:
+            # every codebook value is on the e4m3 grid, so bf16 -> fp8 is a
+            # lossless re-encoding of the same table).
+            layer._cb_flat_fp8 = cb_flat.to(torch.float8_e4m3fn).view(
+                torch.uint8).contiguous()
         layer._cb_N = qw.shape[0]
         layer._cb_K = layer._cb_input_size
 
@@ -260,15 +265,16 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # fp8 GEMM (native tensor cores), then free the tile. An expanded
         # FP8_CB weight IS a standard per-channel fp8 checkpoint (codebook
         # values on the e4m3 grid; layer.weight_scale per output channel).
+        # The expand writes the fp8 bytes directly (no bf16 intermediate, no
+        # cast pass) — byte-identical to the old bf16-expand + cast, at a third
+        # of the expand-side HBM traffic.
         # INV-1: the [N,K] tile is bounded to one layer (expand -> GEMM ->
         # free), never resident/model-wide (the NVINT2 OOM trap). `ops` is
         # imported lazily so the module still imports without vLLM (venv tests).
         import vllm._custom_ops as ops
-        W_value = expand_cb_to_value(
-            layer._cb_qw_padded, layer._cb_flat, layer._cb_row_offset,
-            N, K, self.k, self.n_sub, self.type_size, self.is_fp4)  # [N,K] bf16
-        # Lossless: every codebook value is already on the e4m3 grid.
-        W_e4m3 = W_value.to(torch.float8_e4m3fn)
+        W_e4m3 = expand_cb_to_fp8(
+            layer._cb_qw_padded, layer._cb_flat_fp8, layer._cb_row_offset,
+            N, K, self.k, self.n_sub, self.type_size)  # [N,K] float8_e4m3fn
         x2 = x.reshape(-1, K)
         xq, sa = ops.scaled_fp8_quant(x2, use_per_token_if_dynamic=True)
         # scale_b is the per-output-channel weight scale as [N, 1] (matches
@@ -276,5 +282,5 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # reference in tests/test_transient_fp8.py::test_transient_gemm_*).
         ws = layer._cb_scale.reshape(N, 1)
         out = ops.cutlass_scaled_mm(xq, W_e4m3.t(), sa, ws, torch.bfloat16, bias)
-        del W_value, W_e4m3
+        del W_e4m3
         return out.reshape(*x.shape[:-1], N)

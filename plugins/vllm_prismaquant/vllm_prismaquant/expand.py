@@ -102,6 +102,63 @@ def _cb_expand_value_kernel(
 
 
 @triton.jit
+def _cb_expand_fp8_kernel(
+    qw_ptr, cb_ptr, cboff_ptr, w_ptr,
+    N, K,
+    stride_qn,                 # padded row stride (bytes) of qw
+    stride_wn, stride_wk,      # output [N, K] strides
+    K_BITS: tl.constexpr,
+    SUB_DIM: tl.constexpr,
+    SUB_W: tl.constexpr,
+    TYPE_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """FP8-direct variant of ``_cb_expand_value_kernel`` (same codeword
+    extraction, kept in lockstep): the codebook is pre-converted to E4M3 BYTES
+    (uint8), so the expand is a pure byte gather -> byte store. No bf16
+    intermediate, no cast pass — the [N,K] transient is written once as fp8,
+    halving the expand-side HBM traffic (the cutlass-kernel-notes stopgap)."""
+    pid_n = tl.program_id(0)
+    pid_s = tl.program_id(1)                    # one 256-weight superblock
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    offs_n_i = offs_n.to(tl.int64)
+
+    kcol = tl.arange(0, 256)
+    v_local = kcol // 8
+    coord = kcol % 8
+    sub = coord // SUB_DIM
+    local = coord % SUB_DIM
+    bitpos = v_local * K_BITS
+    byte_base = (bitpos // 8).to(tl.int64)
+    bit_in_byte = bitpos % 8
+    mask_k = (1 << K_BITS) - 1
+    shift_sub = sub * SUB_W
+    mask_sub = (1 << SUB_W) - 1
+    cb_base = sub * ((1 << SUB_W) * SUB_DIM)
+
+    cb_off = tl.load(cboff_ptr + offs_n_i, mask=mask_n, other=0).to(tl.int64)
+
+    s = pid_s
+    col_byte = s * TYPE_SIZE + byte_base
+    code = tl.zeros((BLOCK_N, 256), dtype=tl.int64)
+    base_ptr = offs_n_i[:, None] * stride_qn + col_byte[None, :]
+    for i in range(0, 8):
+        b = tl.load(qw_ptr + base_ptr + i, mask=mask_n[:, None],
+                    other=0).to(tl.int64)
+        code = code | (b << (8 * i))
+    code = (code >> bit_in_byte[None, :]) & mask_k
+    sub_idx = (code >> shift_sub[None, :]) & mask_sub
+    gather = (cb_off[:, None] + cb_base[None, :]
+              + sub_idx * SUB_DIM + local[None, :])
+    val = tl.load(cb_ptr + gather)                             # [BN, 256] uint8
+
+    xcols = (s * 256 + kcol).to(tl.int64)
+    w_out = w_ptr + offs_n_i[:, None] * stride_wn + xcols[None, :] * stride_wk
+    tl.store(w_out, val, mask=mask_n[:, None])
+
+
+@triton.jit
 def _cb_expand_weight_v2_kernel(
     qw_ptr, cb_ptr, cboff_ptr, compose_ptr, w_ptr,
     N, K,
@@ -191,6 +248,48 @@ def expand_fp4_v2_to_weight(cb_qweight_padded, cb_flat, cb_row_offset, compose,
         K_BITS=k_bits, SUB_DIM=sub_dim, SUB_W=sub_w, TYPE_SIZE=type_size,
         BLOCK_N=block_n, num_warps=4)
     return W
+
+
+def expand_cb_to_fp8(
+    cb_qweight_padded: torch.Tensor,   # (N, row_bytes + 8) uint8, 8-byte pad
+    cb_flat_fp8: torch.Tensor,         # (cb_total,) uint8 E4M3-byte codebook(s)
+    cb_row_offset: torch.Tensor,       # (N,) int32 per-row base into cb_flat
+    N: int, K: int,
+    k_bits: int, n_sub: int, type_size: int,
+) -> torch.Tensor:
+    """FP8-direct transient expand: decode the codebook VALUE for every
+    ``(n, j)`` straight into a fresh ``[N, K]`` **float8_e4m3fn** tile.
+
+    Byte-identical to ``expand_cb_to_value(...).to(torch.float8_e4m3fn)`` (the
+    codebook is e4m3-grid-valued, so the byte gather IS the lossless cast) but
+    writes 1 B/elt once instead of a 2 B/elt bf16 tile plus a separate cast
+    pass — the cheap prefill-traffic win from cutlass-kernel-notes.md. INV-1:
+    the returned tile is a bounded per-layer transient the caller frees.
+    """
+    if cb_flat_fp8.dtype != torch.uint8:
+        raise TypeError("expand_cb_to_fp8 wants the E4M3-byte (uint8) codebook")
+    if k_bits % n_sub != 0:
+        raise ValueError("expand supports even bit-splits only "
+                         f"(k={k_bits}, n_sub={n_sub})")
+    if K % 256 != 0:
+        raise ValueError(f"K={K} must be a multiple of the 256-weight superblock")
+    sub_dim = 8 // n_sub
+    sub_w = k_bits // n_sub
+    dev = cb_qweight_padded.device
+    W = torch.empty((N, K), dtype=torch.uint8, device=dev)
+    n_sb = K // 256
+    block_n = 64
+    grid = (triton.cdiv(N, block_n), n_sb)
+    _cb_expand_fp8_kernel[grid](
+        cb_qweight_padded, cb_flat_fp8, cb_row_offset, W,
+        N, K,
+        cb_qweight_padded.stride(0),
+        W.stride(0), W.stride(1),
+        K_BITS=k_bits, SUB_DIM=sub_dim, SUB_W=sub_w, TYPE_SIZE=type_size,
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+    return W.view(torch.float8_e4m3fn)
 
 
 def expand_cb_to_value(
