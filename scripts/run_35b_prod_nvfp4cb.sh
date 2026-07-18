@@ -26,7 +26,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #     -4.75bit, whose base is deepreinforce-ai/Ornith-1.0-35B. The prior AURA run
 #     used that snapshot. Confirm it's on disk (the earlier ornith-35b-aura run
 #     path) or download the base before launch.
-export MODEL_PATH="${MODEL_PATH:-/home/rob/.cache/huggingface/hub/models--deepreinforce-ai--Ornith-1.0-35B/snapshots}"
+export MODEL_PATH="${MODEL_PATH:-/home/rob/dq-runs/ornith-35b-base}"
 export WORK_DIR="${WORK_DIR:-/home/rob/dq-runs/prod-35b-nvfp4cb-4p75}"
 export TMPDIR="${WORK_DIR}/tmp"
 mkdir -p "$WORK_DIR" "$TMPDIR" "$WORK_DIR/logs"
