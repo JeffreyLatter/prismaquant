@@ -754,3 +754,18 @@ Roadmap to goal (live):
   identical-to-in-memory correctness pin. Unblocks Hy3/DSv4 export; GPU build
   waits for the box. 35B build + Hy3/DSv4 builds remain GPU-gated behind the
   27B verdict (imminent) — correct sequencing, not idle.
+- **35B launch-readiness CONFIRMED (CPU check, non-contending):** source
+  Qwen3.5-35B-A3B on disk; detect_profile → Qwen3_5Profile (MoE,
+  Qwen3_5MoeForConditionalGeneration, has_mtp); FP8_CB rungs registered; CB
+  serving profile present. Build GPU-gated behind the 27B verdict (single-box).
+  MoE-specifics for the build (which 35B base to match the shipped
+  PrismaAURA-4.75 comparison, COST_MODE=aura+expert_empirical M4-hybrid for
+  route-flip-correct expert costs, DeltaNet --max-num-batched-tokens≥2096, MTP
+  serve handling) → menu agent finalizes post-27B-verdict.
+- **HONEST GOAL STATE (single-GPU physical constraint):** all CODE prereqs for
+  all 3 model classes DONE. Served proofs are sequential GPU builds (hours each)
+  on ONE box: 27B (verdict imminent) → 35B (ready) → Hy3 (streaming exporter
+  ready, source on disk) → DSv4 (audited, source not on disk, 9 gaps). Not
+  idleness — correct sequencing; parallel builds would re-starve the critical
+  run (feedback_no_overparallel_during_prod). Each build launches informed by
+  the prior verdict.
