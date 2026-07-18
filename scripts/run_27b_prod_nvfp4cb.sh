@@ -49,6 +49,10 @@ export CACHE_HEADROOM_GB=45            # extra activation headroom vs the OOM'd 
 export ACTIVATION_ROWS_LIMIT=1024      # CB lane auto-default; explicit for the record
 export CB_SCALE_CODING=v1              # fp8-CB is v1-only anyway (no fp4-CB in menu)
 export CB_CODEBOOK_SOURCE=lattice      # lockstep-exact (see header)
+export PRISMAQUANT_CB_ENCODE_TIER=balanced  # explicit (it is the default); the
+# at-scale FP8_CB per-slice encode is ~130 min/shard on a QUIET box (7 layers x
+# ~54 Linears x 4 fp8-CB rungs) — the first clean at-scale encode-speed datum.
+# Cost is skip-if-shard-exists: a resumed run picks up at the first missing shard.
 export VISUAL_FORMAT=BF16              # VLM: visual Linears passthrough (-> ignore)
 export CALIBRATION_MODALITY=text-only
 export DEVICE=cuda
