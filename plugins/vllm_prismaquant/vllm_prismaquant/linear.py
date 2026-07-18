@@ -226,11 +226,15 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             layer._cb_scale = layer.weight_scale.data.reshape(-1).to(
                 torch.float32)
             layer._cb_compose = dummy
-            # E4M3-byte codebook for the fp8-direct transient expand (exact:
-            # every codebook value is on the e4m3 grid, so bf16 -> fp8 is a
-            # lossless re-encoding of the same table).
+            # E4M3-byte codebook for the fp8-direct transient expand and the
+            # CUDA GEMV (exact: every codebook value is on the e4m3 grid, so
+            # bf16 -> fp8 is a lossless re-encoding of the same table).
             layer._cb_flat_fp8 = cb_flat.to(torch.float8_e4m3fn).view(
                 torch.uint8).contiguous()
+            # Warm the CUDA-GEMV JIT build at LOAD time — otherwise the ~30 s
+            # in-container build fires on the first decode step and poisons
+            # the first request's latency (seen live: 1.89 tok/s rep 1).
+            self._cuda_gemv_ok()
         layer._cb_N = qw.shape[0]
         layer._cb_K = layer._cb_input_size
 
