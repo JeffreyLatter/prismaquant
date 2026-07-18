@@ -738,3 +738,10 @@ Roadmap to goal (live):
   sub-hour 300B needs a custom Triton reduction kernel OR RD-law ladder-interp
   (predict_cb_ladder_costs, validated ±3%, opt-in) to price fewer rungs. Next
   optimization wave, not blocking the 27B verdict.
+- **27B cost+alloc DONE (~5h clean), EXPORT crashed on a real bug:** exporter
+  skeleton lookup used canonical qname (model.layers.N) but hybrid Qwen3.6
+  skeleton uses NESTED model.language_model.layers.N — every skeleton read
+  misses. Cost.pkl + layer_config + pareto all CACHED/valid (only export redoes).
+  Fix dispatched to menu agent (profile-based nested-prefix name resolver;
+  affects Hy3/DSv4 too) → re-export (~30-45min) → A/B. Sole-owner rule lifted
+  for this final sequential export→A/B (no concurrent process to race).
