@@ -72,9 +72,30 @@ hostile — a production kernel must not branch on a padded batch size.
    batch; obey INV-1 (no full-weight materialize).
 4. **Structured-codebook variant (k≥14)** + **MoE grouped** (iv) later.
 
-## Open design questions to resolve at step 1
-- Does `cutlass_scaled_fp4_mm` expect the flashinfer 8x4 SF swizzle, and does our
-  export write the group-16 E4M3 scale plane in that swizzle or a transposable
-  one? (Determines whether the fused kernel reuses the scale plane verbatim.)
-- Exact FP4 nibble/interleave layout the sm120 MMA smem tile wants (match
-  `_pack_fp4_indices`, `nvfp4_fused.py:32`).
+## Native NVFP4 GEMM contract (RESOLVED 2026-07-18 from vLLM source)
+`vllm._custom_ops.cutlass_scaled_fp4_mm(a, b, block_scale_a, block_scale_b,
+alpha, out_dtype)`:
+- `a`,`b`: fp4-packed (2 codes/byte) activation + weight.
+- `block_scale_a/b`: the group-16 **E4M3** block scales, run through
+  `swizzle_blockscale` (`quantization/utils/nvfp4_utils.py`): pad M→128, K→4,
+  reshape `(B, M/128, 4, 32, K/4, 4)`, permute `(0,1,4,3,2,5)`. This IS the SF
+  interleave the sm120 block-scaled MMA consumes — the fused kernel must emit the
+  decoded scale plane in exactly this layout (or pre-swizzle at load).
+- `alpha`: per-tensor scalar = input_global_scale × weight_global_scale (both
+  stored inverted, `compressed_tensors_w4a4_nvfp4.py`). Our CB per-channel/E4M3
+  scales already live in NVFP4's envelope; the extra per-tensor global is the
+  only new scalar to thread.
+
+### Two kernel routes, now both concrete
+1. **Expand-to-native + native GEMM (easy, no mainloop fork, still ~2× traffic):**
+   a Triton kernel decodes CB indices → fp4-packed tile + swizzled E4M3 scales,
+   then call `cutlass_scaled_fp4_mm`. Reaches FP4 tensor cores (INV-2) for
+   *fp4-CB* artifacts (Hy3 ultra-low-bpp) without touching CUTLASS internals.
+   Does NOT help the 27B (fp8-CB already uses native fp8 `cutlass_scaled_mm`; its
+   gap is the 2× traffic, not the MMA). Good stepping stone + Hy3-relevant.
+2. **Fused decode-in-prologue (the real 1× fix, hard):** fork
+   `sm120_blockscaled_mma_tma.hpp` A-producer; decode in smem, never materialize.
+   Required to beat AURA on prefill for BOTH fp8-CB and fp4-CB.
+
+Remaining open: exact FP4 nibble/interleave the sm120 MMA smem tile wants (match
+`_pack_fp4_indices`, `nvfp4_fused.py:32`) — resolve at baseline-parity step 1.
