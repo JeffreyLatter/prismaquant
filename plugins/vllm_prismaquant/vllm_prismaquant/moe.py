@@ -164,9 +164,24 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             W = (val.float() * ws[:, None]).to(torch.bfloat16)
         return W                                               # (out, in) bf16
 
+    _warned_shared = False
+
     def apply(self, layer: RoutedExperts, x: torch.Tensor,
               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
               shared_experts, shared_experts_input) -> torch.Tensor:
+        # On CUDA the shared-expert FUSION path is ROCm-AITER-gated (off here),
+        # so the model runs its shared expert separately (a Linear our CB linear
+        # method quantizes) and this arg is None. If it is EVER non-None we are
+        # silently dropping a contribution — surface it loudly (once) so the
+        # served KL/smoke has a paper trail instead of a silent regression.
+        if shared_experts is not None and not PrismaQuantCBMoEMethod._warned_shared:
+            PrismaQuantCBMoEMethod._warned_shared = True
+            import sys
+            print(f"[prismaquant-cb-moe] WARNING {self.prefix}: non-None "
+                  "shared_experts passed to apply() but this method computes ONLY "
+                  "routed experts — shared-expert output may be dropped. Verify "
+                  "the served KL; implement shared-expert handling if regressed.",
+                  file=sys.stderr, flush=True)
         del shared_experts, shared_experts_input
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
