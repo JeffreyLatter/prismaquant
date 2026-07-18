@@ -34,8 +34,14 @@ hostile — a production kernel must not branch on a padded batch size.
   tcgen05 — that's datacenter Blackwell). Target the sm_120 block-scaled `mma`.
 - nvcc **13.0**, torch cuda 13.0 → can build a CUDA extension (GGUF-plugin
   `setup.py` CUDAExtension model).
-- **CUTLASS 4.5.2** C++ headers vendored in vLLM:
-  `.../vllm/third_party/fmha_sm100/cutlass/include` (also under `deep_gemm/`).
+- **CUTLASS C++ headers 4.3.4** vendored in vLLM:
+  `.../vllm/third_party/fmha_sm100/cutlass/include` (also under `deep_gemm/`;
+  the `cutlass` python pkg is 4.5.2 — use the vendored C++ headers for building).
+- **Toolchain gate PASSED (2026-07-18):** `csrc/toolchain_probe.cu` compiles with
+  `nvcc -std=c++17 -arch=sm_121a -I<cutlass/include>` and runs on the GB10 —
+  `cutlass::float_e2m1_t(1.5f)` round-trips correctly on-device. So custom
+  CUDA+CUTLASS+FP4 kernels build+run for sm_121; the build path is proven before
+  any mainloop work.
 - Native reference GEMM AURA uses: `vllm._custom_ops.cutlass_scaled_fp4_mm`
   (+ `scaled_fp4_quant`, `cutlass_scaled_mm_supports_fp4`,
   `flashinfer_quant_nvfp4_8x4_sf_layout` for the SF swizzle,
