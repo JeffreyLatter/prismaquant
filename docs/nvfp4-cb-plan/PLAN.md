@@ -662,3 +662,11 @@ Roadmap to goal (live):
     3x TTFT/decode); (3) write docs/nvfp4-cb-plan/prod_27b_results.md with the
     verdict table + honesty caveats (matched-bpp, menu+cost bundling vs the
     shipped aura-cost/validated recipe, single-seed KL, 8x1024-not-32x1024).
+- **All four goal fronts now active simultaneously:** (1) 27B production A/B
+  mid-cost-stage (verdict ~4-7h); (2) 35B MoE prep dispatched (packed-expert
+  CB chain + expert-uniform tests + route-flip/empirical-cost design note);
+  (3) Hy3 source re-download running in background (557GB, front-running the
+  ultra-low-bpp milestone; pid + redownload.log deadman-able); (4) CUTLASS
+  foundations queued to the kernel owner post-v2-compose (sm_121 disassembly
+  recon + buildable CUTLASS skeleton + kernel priority order; full build
+  gated on the 27B verdict per Robert's amendment).
