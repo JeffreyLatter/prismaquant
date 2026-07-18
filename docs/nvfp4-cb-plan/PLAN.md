@@ -776,3 +776,14 @@ Roadmap to goal (live):
   network IO ≠ GPU starvation). Menu agent told to read-verify DL completion
   before serving. All other A/B inputs present (wiki.test.raw, BF16 ref,
   measure_27b_ab.sh, 293GB free). 27B re-export healthy (pid 1452, ~24min in).
+- **35B build FULLY launch-staged (non-contending):** driver committed
+  (run_35b_prod_nvfp4cb.sh; M4-hybrid route-flip wiring verified complete —
+  run-pipeline CB_EXPERT_EMPIRICAL=1 auto-merges empirical expert unit-KL);
+  Ornith-1.0-35B base (~70GB) NOW DOWNLOADING (was absent) so the 35B served
+  proof launches the instant the 27B frees the GPU + verdict reviewed. 27B
+  export verified healthy throughout (R-state, 26GB GPU, materializing output);
+  network IO for the download does NOT starve it (79W sustained).
+- HONEST GOAL STATE: 27B verdict ~2-3h (export ~1-2h encode + ~1h A/B); 35B
+  launch-staged behind it; Hy3 streaming-ready (source on disk); DSv4 audited.
+  Served proofs are physically GPU-sequential — advancing by pre-staging every
+  non-GPU prerequisite, not by parallel builds (which would re-starve the 27B).
