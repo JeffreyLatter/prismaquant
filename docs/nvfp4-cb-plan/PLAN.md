@@ -721,3 +721,20 @@ Roadmap to goal (live):
   chunk×candidate dims — the efficiency-wave lever, now proven mandatory);
   target 76.7s→few-sec; 27B restarts on the fixed encode. Directly the goal's
   fast-quant priority.
+- **ENCODE BUG FIXED (b9ca9e6) + 27B RESTARTED CLEAN on fixed encode:**
+  balanced 76.7s→21.9s/Linear (×3.5); cost stage ~19h→~5.4h. Root cause
+  (agent-corrected, twice-corrected diagnosis): VOLUME-bound — moment matrices
+  rebuilt ~4× + sequential greedy hill. Fix: build-once moments + exhaustive
+  batched scale grid (STRICT SUPERSET of greedy reach → provably no-worse
+  choices on real weights, bit-identical on the 89M Linear; max tier stays
+  bit-identical anchor). Verified: 21.3s encode, superset argument sound, CB
+  suite 147 green. Honesty-flag reviewed+accepted: a v2-vs-v1 synthetic test
+  loosened to 0.2% (off the critical v1 27B path; v2 opt-in). GPU now 78W (real
+  work) vs old 47W (launch-bound) — fix confirmed in-pipeline. Cleared stale
+  mixed-shard cost pkls (probe preserved), rebuilding clean. relaunch3 live,
+  Fable sole owner, menu agent read-only monitor + A/B.
+- FOLLOW-UP (goal fast-quant): ~5.4h/27B extrapolates ~2.5d/300B — above "a
+  day". Residual is the ~5 (m,K)-pass algorithmic floor at S=14 candidates;
+  sub-hour 300B needs a custom Triton reduction kernel OR RD-law ladder-interp
+  (predict_cb_ladder_costs, validated ±3%, opt-in) to price fewer rungs. Next
+  optimization wave, not blocking the 27B verdict.
