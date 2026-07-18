@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# ============================================================================
+# run_hy3_prod_nvfp4cb.sh — Hy3 295B-A21B ULTRA-LOW-BPP driver (research)
+# ============================================================================
+# The goal's THIRD model class (200-300B ultra-low-bpp). Tencent Hy3
+# (295B-A21B MoE, hy_v3 profile, 192 experts) from BF16 source through the
+# STREAMING CB exporter @ ~2.9 bpp — the flagship raison d'être of the CB lane:
+# a native-tensor-core-servable ultra-low-bit artifact on a single DGX Spark,
+# WITHOUT IQ's prefill tax.
+#
+# GATED (launch only after): (a) 27B + 35B verdicts clear the approach; (b) the
+# GPU is free; (c) v2-compose fp4-CB SERVING is validated end-to-end (serving
+# agent built it — commit for the plugin v2-compose; the first-served-v2 smoke
+# must pass before an fp4-CB-dominated artifact can be SERVED, not just exported);
+# (d) hy_v3 vLLM adapter present (from the earlier GGUF Hy3 serving work).
+#
+# NO QUALITY CLAIMS (Robert's standing instruction: no one can KL-validate a
+# 295B against its BF16 teacher on this hardware). Validation = loads + coherent
+# generation + bit-exact packing, per the shipped GGUF Hy3.
+# ============================================================================
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+export MODEL_PATH="${MODEL_PATH:-/home/rob/dq-runs/hy3-prod/source}"   # bf16, 557GB, on disk
+export WORK_DIR="${WORK_DIR:-/home/rob/dq-runs/prod-hy3-nvfp4cb-2p9}"
+export TMPDIR="${WORK_DIR}/tmp"
+mkdir -p "$WORK_DIR" "$TMPDIR" "$WORK_DIR/logs"
+
+# --- CB lane + STREAMING (Hy3 never fits resident: 557GB >> 121GB pool) ---
+export EXPORT_CONTAINER=nvfp4_cb
+export TARGET_PROFILE=nvfp4_cb
+export COST_MODE=local
+export PRODUCTION_CACHE=0
+export PRODUCTION_RECACHE=0
+export CB_EXPERT_EMPIRICAL=1            # 192-expert MoE route-flip fix (M4-hybrid)
+export EXPORT_STREAMING=auto            # >=80GB source auto-streams (export_nvfp4_cb_streaming, 1ff7185)
+
+# --- ultra-low-bpp menu: fp4-CB v2 (two-tier, 2.0-3.5bpp) dominant + fp8-CB for
+#     the sensitive tail + BF16 sidecars. TWO-TIER v2 for the byte win at this
+#     band (0.28 vs 0.5 bpw scale). fp4-CB SERVING needs v2-compose (gate c). ---
+export FORMATS="NVFP4_CB_K14,NVFP4_CB_K16,NVFP4_CB_K18,NVFP4_CB_K20,FP8_CB_K36,FP8_CB_K44,BF16"
+export CB_SCALE_CODING=two_tier        # v2 (premium-flip; exp-1c GO)
+export TARGET_BITS=2.9                 # single-Spark fit (matches shipped GGUF Hy3 2.8bpp)
+export PARETO_TARGETS="2.7,2.9,3.1"
+
+# --- streaming probe/cost (bounded residency); conservative calibration ---
+export NSAMPLES=8
+export SEQLEN=1024
+export CACHE_HEADROOM_GB=30
+export ACTIVATION_ROWS_LIMIT=1024
+export CB_CODEBOOK_SOURCE=lattice
+export PRISMAQUANT_CB_ENCODE_TIER=balanced
+export CALIBRATION_MODALITY=text-only
+export DEVICE=cuda
+export EXPORT_DEVICE=cuda
+export PRISMAQUANT_PROBE_PREFETCH_LOOKAHEAD=3   # Hy3 probe OOM guard (2026-07 lesson)
+export PRISMAQUANT_PROBE_MIN_AVAILABLE_GB=30
+
+echo "============================================================================"
+echo "Hy3 295B-A21B ULTRA-LOW-BPP — nvfp4_cb STREAMING @${TARGET_BITS} bpp (v2 two-tier)"
+echo "  MODEL=$MODEL_PATH  (bf16 source, streaming export)"
+echo "  FORMATS=$FORMATS"
+echo "  NO QUALITY CLAIMS. Validation = load + coherent-gen + bit-exact packing."
+echo "  PRE-LAUNCH GATES: 27B+35B verdicts clear; GPU free; v2-compose fp4-CB"
+echo "    SERVING validated; hy_v3 vLLM adapter present. exclude layers.80 (MTP)."
+echo "  start: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "============================================================================"
+
+PATH="/home/rob/dq-runs/venvs/prismaquant-cu130/bin:$PATH" \
+  bash "${REPO}/prismaquant/run-pipeline.sh"
+
+echo
+echo "##  Hy3 EXPORT DONE — REVIEW: ${WORK_DIR}/exported_nvfp4_cb"
+echo "##  Next: footprint (single-Spark fit?), load+coherent-gen smoke, TTFT/decode vs the"
+echo "##  shipped GGUF Hy3 2.8bpp (the native-vs-IQ-prefill comparison — the whole thesis)."
+echo "  end: $(date '+%Y-%m-%d %H:%M:%S')"
