@@ -685,3 +685,15 @@ Roadmap to goal (live):
   blocks both 35B and DSv4); FP8_SOURCE menu fix queued to formats agent after
   M4-hybrid. DSv4 source download deferred (disk: Hy3 has priority; no
   co-download under the 10% rule).
+- **27B COST STALL ROOT-CAUSED (2026-07-17): CONTENTION, not a code bug.**
+  Shard 4 "wedged" 112min = CPU/IO starvation from 5+ concurrent heavy agents
+  (MoE/DSv4/M4/FP8_SOURCE) + 557GB Hy3 download hammering the 20-core box during
+  the launch-bound CB cost loop. Verified: shard_000.pkl has REAL FP8_CB costs
+  (all 4 rungs × 55 Linears) — path works; shards 0-3 finished while box quiet.
+  GPU healthy (fresh matmul 0.24s, kill didn't wedge it). Killed the stalled run
+  (exact PID), resumable from cost_shard_003.pkl. Hybrid model note: Qwen3.6-27B
+  is DeltaNet-hybrid (linear_attn in_proj_qkv/a/b/z + mlp; prefix
+  model.language_model.layers.N). LESSON → memory feedback_no_overparallel.
+  RECOVERY: resume cost from shard 4 as SOLE heavy job (fleet paused); if it
+  flies quiet, contention confirmed; deadman needs fixing (didn't fire @112min).
+- FP8_SOURCE menu (026e1a0) + M4-hybrid (6b0a2f6) landed green (1170).
