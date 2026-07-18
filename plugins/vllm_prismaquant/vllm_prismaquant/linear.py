@@ -25,7 +25,7 @@ from vllm.model_executor.parameter import (
 
 from . import codec
 from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
-from .ops import cb_gemm
+from .ops import cb_gemm, cb_gemv_fp8
 
 # Fallback fused mapping if the config's packed_modules_mapping is unset.
 _FUSED_FALLBACK = {
@@ -43,6 +43,13 @@ _FUSED_FALLBACK = {
 # is a serve-flag toggle: set PRISMAQUANT_PREFILL_M_THRESHOLD huge to force the
 # Triton decode path at prefill (isolates the transient-expansion lever).
 PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"))
+
+# Within the decode regime, the CUDA GEMV handles M<=this and the Triton
+# decode-GEMM the rest. 8 is measured on GB10 (bench_cuda_gemv.py): the
+# weight-stationary GEMV re-reads x per row-block, so it wins 3.2x at M=1-2,
+# 2.7x at M=4, 1.2x at M=8, and LOSES (0.66x) at M=16 where Triton's tl.dot
+# amortizes x across the row tile.
+CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
 
 
 @register_weight_loader_v2_supported_method
@@ -227,12 +234,34 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         layer._cb_N = qw.shape[0]
         layer._cb_K = layer._cb_input_size
 
+    def _cuda_gemv_ok(self) -> bool:
+        """CUDA decode-GEMV eligibility (fp8 n_sub=4 rungs; env-gated; ext
+        built). Cached — the answer never changes within a process."""
+        ok = getattr(self, "_cuda_gemv_cached", None)
+        if ok is None:
+            ok = (not self.is_fp4 and self.n_sub == 4
+                  and os.environ.get("PRISMAQUANT_CB_DECODE", "cuda") == "cuda")
+            if ok:
+                from .cuda_ext import get_ext
+                ok = get_ext() is not None
+            self._cuda_gemv_cached = ok
+        return ok
+
     def apply(self, layer, x, bias=None):
         N, K = layer._cb_N, layer._cb_K
         M = x.reshape(-1, K).shape[0]
         # Decode regime (M small), plus fp4-v1 which has no transient path yet
         # (its v1 e4m3 plane is not composed during expansion) — Triton decode.
         if M <= PREFILL_M_THRESHOLD or (self.is_fp4 and not self.is_v2):
+            if M <= CUDA_GEMV_M_MAX and self._cuda_gemv_ok():
+                # CUDA bandwidth-bound GEMV, act-QDQ fused (raw x in); gathers
+                # the E4M3-byte codebook (same values as _cb_flat, 4x smaller).
+                y = cb_gemv_fp8(x, layer._cb_qw_padded, layer._cb_flat_fp8,
+                                layer._cb_row_offset, layer._cb_scale,
+                                N, K, self.k, self.n_sub, self.type_size)
+                if bias is not None:
+                    y = y + bias
+                return y
             xq = (codec.fp4_group16_act_qdq(x) if self.is_fp4
                   else codec.fp8_dynamic_act_qdq(x))
             y = cb_gemm(xq, layer._cb_qw_padded, layer._cb_flat,
