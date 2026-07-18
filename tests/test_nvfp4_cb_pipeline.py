@@ -571,6 +571,62 @@ def test_fused_nvfp4_siblings_share_weight_global_scale(tmp_path):
         assert torch.allclose(globals_[0].reshape(()), 1.0 / expected, rtol=1e-4)
 
 
+class _NestedVLMProfile:
+    """Hybrid VLM name mapping: the LM nests under a `model.language_model.`
+    infix that the allocator's recipe names strip (Qwen3.6-27B / Hy3 / DSv4)."""
+    def source_tensor_name(self, qname):
+        if qname.startswith("model.layers."):
+            return "model.language_model.layers." + qname[len("model.layers."):]
+        return qname
+    def checkpoint_to_live_name(self, ckpt_key, *, multimodal=False):
+        if ckpt_key.endswith(".weight_scale_inv"):
+            return None
+        if ckpt_key.startswith(("model.visual.", "model.vision_tower.")):
+            return None
+        if not multimodal and ckpt_key.startswith("model.language_model.layers."):
+            return "model.layers." + ckpt_key[len("model.language_model.layers."):]
+        return ckpt_key
+    def fused_sibling_group(self, qname):
+        return None
+
+
+def test_exporter_resolves_nested_prefix_skeleton(tmp_path, monkeypatch):
+    # Hybrid Qwen3.6-27B/Hy3/DSv4: the assignment uses recipe names
+    # (model.layers.N.*) but the checkpoint nests the LM under
+    # model.language_model.*. The exporter must resolve BOTH directions via the
+    # profile and emit tensors + config targets under the CHECKPOINT convention.
+    from prismaquant import model_profiles
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    from safetensors.torch import save_file, load_file
+    canon = "model.layers.0.mlp.gate_proj"
+    nested = "model.language_model.layers.0.mlp.gate_proj"
+    tens = {
+        nested + ".weight": torch.randn(128, 256).bfloat16(),        # CB target
+        "model.language_model.norm.weight": torch.randn(64).bfloat16(),   # 1-D verbatim
+        "model.visual.patch_embed.weight": torch.randn(32, 64).bfloat16(),  # visual verbatim
+    }
+    save_file(tens, str(_Path(tmp_path) / "model.safetensors"))
+    (_Path(tmp_path) / "config.json").write_text(
+        _json.dumps({"architectures": ["Qwen3_5ForConditionalGeneration"]}))
+    lc = _write_layer_config(tmp_path, {canon: "NVFP4_CB_K16"})
+    monkeypatch.setattr(model_profiles, "detect_profile",
+                        lambda *a, **k: _NestedVLMProfile())
+    out = _Path(tmp_path) / "exp"
+    export_nvfp4_cb(str(tmp_path), lc, str(out),
+                    col_weights={canon: torch.rand(256) + 0.05}, device="cpu")
+    st = load_file(str(out / "model.safetensors"))
+    # Packed tensor carries the NESTED (checkpoint/vLLM) name, not the recipe one.
+    assert f"{nested}.cb_qweight" in st, sorted(st)
+    assert f"{canon}.cb_qweight" not in st
+    # config_groups target is the nested name so the plugin matches served modules.
+    qc = _json.loads((out / "quant_config.json").read_text())
+    cb_g = next(g for g in qc["config_groups"].values() if "scheme" in g)
+    assert nested in cb_g["targets"] and canon not in cb_g["targets"]
+    # Non-target tensors copied verbatim under their checkpoint names.
+    assert "model.language_model.norm.weight" in st
+    assert "model.visual.patch_embed.weight" in st
+
+
 def test_codebook_pqcb_sidecar_contract(tmp_path):
     # Codebooks ship in cb_codebooks.pqcb (safetensors under a non-globbed
     # extension), named by each scheme's codebook_ref, and are NOT in

@@ -93,6 +93,54 @@ def _load_skeleton(model_dir: Path) -> dict[str, torch.Tensor]:
     return load_file(str(single))
 
 
+# --- Nested-prefix skeleton name resolution (hybrid Qwen3.6-27B / Hy3 / DSv4).
+# The allocator's recipe qnames are the text-only-staged names
+# (`model.layers.N.*`); the on-disk checkpoint nests the LM under an infix
+# (`model.language_model.layers.N.*`). The profile knows the structure and maps
+# both directions — never hard-code the infix. ---
+
+def _try_resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
+    """Recipe qname -> actual skeleton key, or None if neither the direct name
+    nor the profile-mapped (checkpoint-convention) name is present."""
+    direct = qname + suffix
+    if direct in skeleton:
+        return direct
+    if profile is not None:
+        mapped = profile.source_tensor_name(qname) + suffix
+        if mapped in skeleton:
+            return mapped
+    return None
+
+
+def _resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
+    """Strict `_try_resolve_skeleton`: raise listing both names tried."""
+    key = _try_resolve_skeleton(qname, skeleton, profile, suffix)
+    if key is not None:
+        return key
+    tried = [qname + suffix]
+    if profile is not None:
+        tried.append(profile.source_tensor_name(qname) + suffix)
+    raise KeyError(
+        f"{qname}: no skeleton tensor for {suffix!r} (tried {tried})")
+
+
+def _export_base_name(qname, profile):
+    """Recipe qname -> the base name the EXPORTED tensor + its config_groups
+    target must carry (checkpoint/vLLM convention, incl. the language_model
+    infix) so vLLM's loader / the plugin match the served module names."""
+    return profile.source_tensor_name(qname) if profile is not None else qname
+
+
+def _canonical_qname(ckpt_qname, profile):
+    """Skeleton (checkpoint) module qname -> canonical recipe qname, or None if
+    the profile drops the key (visual/audio/`.weight_scale_inv`)."""
+    if profile is None:
+        return ckpt_qname
+    live = profile.checkpoint_to_live_name(ckpt_qname + ".weight",
+                                           multimodal=False)
+    return live[:-len(".weight")] if live else None
+
+
 def _vecs_and_wq(w: torch.Tensor, cw: torch.Tensor | None, grid: str):
     """One-shot scaled 8-dim vectors + per-vector weights for one Linear (the
     same scaling the encoder feeds the VQ search) — mirrors the exp1b driver's
@@ -225,6 +273,12 @@ def export_nvfp4_cb(
     # FP8_SOURCE is a PASSTHROUGH scheme (verbatim fp8 weight + scale_inv copy),
     # not a _quantize_2d target — handled separately below.
     _STOCK_CT_SCHEMES = {"NVFP4": _NVFP4_SCHEME, "FP8_E4M3": _FP8_E4M3_SCHEME}
+    # Profile drives nested-prefix skeleton name resolution (hybrid VLMs); None
+    # for a flat checkpoint (recipe names == checkpoint names, resolver no-ops).
+    try:
+        _profile = _detect_profile(str(model_dir))
+    except Exception:
+        _profile = None
 
     # --- Coverage gate: classify every assigned format into CB / stock-CT /
     # BF16-passthrough (the mixed container, LAYOUT.md §4; "FP8 in every
@@ -261,21 +315,24 @@ def export_nvfp4_cb(
     # filter should drop it otherwise — hard-fail here so a stale manifest
     # never ships a re-synthesized (8-bpp-wasting) FP8 tensor.
     for qname in source_targets:
-        wname, sname = qname + ".weight", qname + ".weight_scale_inv"
-        w = skeleton.get(wname)
-        if w is None or w.dtype != torch.float8_e4m3fn or sname not in skeleton:
+        wname = _try_resolve_skeleton(qname, skeleton, _profile)
+        sname = _try_resolve_skeleton(qname, skeleton, _profile,
+                                      ".weight_scale_inv")
+        w = skeleton.get(wname) if wname else None
+        if w is None or w.dtype != torch.float8_e4m3fn or sname is None:
             raise ValueError(
                 f"{qname}: assigned FP8_SOURCE but source is not native FP8 "
                 f"(weight dtype={None if w is None else w.dtype}, "
-                f"has scale_inv={sname in skeleton}). FP8_SOURCE is "
+                f"has scale_inv={sname is not None}). FP8_SOURCE is "
                 f"passthrough-only — never synthesize it.")
 
     for qname, (grid, mode, k) in cb_targets.items():
-        wname = qname + ".weight"
-        if wname not in skeleton:
+        wname = _try_resolve_skeleton(qname, skeleton, _profile)
+        if wname is None:
             raise ValueError(
-                f"{qname}: assigned {grid}/{mode} k{k} but no weight tensor "
-                f"'{wname}' in the skeleton")
+                f"{qname}: assigned {grid}/{mode} k{k} but no weight tensor for "
+                f"it in the skeleton (tried {qname}.weight + the "
+                f"profile-mapped checkpoint name)")
         in_f = int(skeleton[wname].shape[-1])
         if in_f % cb.SUPERBLOCK != 0:
             raise ValueError(
@@ -301,15 +358,11 @@ def export_nvfp4_cb(
     # inconsistent per-tensor global scales. Take the max over each fused group
     # and override every sibling's pack (mirrors export_native_compressed). ---
     for qname in stock_targets:
-        wname = qname + ".weight"
-        if wname not in skeleton:
+        if _try_resolve_skeleton(qname, skeleton, _profile) is None:
             raise ValueError(
                 f"{qname}: assigned {stock_targets[qname]} but no weight tensor "
-                f"'{wname}' in the skeleton")
-    try:
-        _profile = _detect_profile(str(model_dir))
-    except Exception:
-        _profile = None
+                f"for it in the skeleton (tried {qname}.weight + the "
+                f"profile-mapped checkpoint name)")
     _nvfp4_shared_global: dict[str, torch.Tensor] = {}
     _nvfp4_groups: dict[str, list[str]] = {}
     for _q, _f in stock_targets.items():
@@ -319,7 +372,9 @@ def export_nvfp4_cb(
                if _profile is not None else None) or _q
         _nvfp4_groups.setdefault(_gk, []).append(_q)
     for _members in _nvfp4_groups.values():
-        _grs = [_ct_nvfp4_global_real(skeleton[_m + ".weight"].to(device), 16)
+        _grs = [_ct_nvfp4_global_real(
+                    skeleton[_resolve_skeleton(_m, skeleton, _profile)].to(device),
+                    16)
                 for _m in _members]
         _shared = torch.stack([g.reshape(()) for g in _grs]).max()
         for _m in _members:
@@ -351,7 +406,8 @@ def export_nvfp4_cb(
         else:
             role = ref
             if train:
-                weights = [skeleton[q + ".weight"].to(device) for q in qnames]
+                weights = [skeleton[_resolve_skeleton(q, skeleton, _profile)]
+                           .to(device) for q in qnames]
                 cws = [col_weights[q].to(device) for q in qnames]
                 codebooks[(ref, fmt)] = _train_shared_codebook(
                     weights, cws, grid=grid, mode=mode, k=k, seed=seed,
@@ -377,32 +433,42 @@ def export_nvfp4_cb(
     # scale_inv siblings of FP8_SOURCE targets are emitted verbatim in the
     # source branch below; skip them in the passthrough else-branch so they
     # are neither double-emitted nor added to the ignore list.
-    _source_scale_keys = {f"{q}.weight_scale_inv" for q in source_qnames}
+    _source_scale_keys = {
+        _try_resolve_skeleton(q, skeleton, _profile, ".weight_scale_inv")
+        for q in source_qnames}
+    _source_scale_keys.discard(None)
 
     for name, tensor in skeleton.items():
-        qname = name[:-len(".weight")] if name.endswith(".weight") else None
+        # `name` is the CHECKPOINT key; `ckpt_qname` its module base (drives the
+        # EXPORTED tensor names — vLLM's convention, incl. the language_model
+        # infix); `canon` is the canonical recipe qname that assignment /
+        # col_weights / cb_targets are keyed by (nested -> canonical).
+        ckpt_qname = name[:-len(".weight")] if name.endswith(".weight") else None
+        canon = _canonical_qname(ckpt_qname, _profile) if ckpt_qname else None
         if name in _source_scale_keys:
             continue
-        if qname in source_qnames:
+        if canon in source_qnames:
             # FP8_SOURCE passthrough: copy the native fp8 `.weight` verbatim
             # and rename `.weight_scale_inv` -> `.weight_scale` (bytes
             # verbatim, fp32) — EXACTLY as the CT streaming exporter does
             # (export_native_compressed:5711), so stock compressed-tensors
             # block-fp8 delegation reads it unchanged. No dequant/requant
             # round-trip; NOT added to ignore (it is an FP8_SOURCE group).
-            out_tensors[qname + ".weight"] = tensor.contiguous()
-            out_tensors[qname + ".weight_scale"] = skeleton[
-                qname + ".weight_scale_inv"].to(torch.float32).contiguous()
+            out_tensors[ckpt_qname + ".weight"] = tensor.contiguous()
+            sname = _resolve_skeleton(canon, skeleton, _profile,
+                                      ".weight_scale_inv")
+            out_tensors[ckpt_qname + ".weight_scale"] = skeleton[sname].to(
+                torch.float32).contiguous()
             counts["FP8_SOURCE"] += 1
             continue
-        if qname in packed_qnames:
-            grid, mode, k = cb_targets[qname]
-            ref, fmt, codebook, _ = target_cb[qname]
+        if canon in packed_qnames:
+            grid, mode, k = cb_targets[canon]
+            ref, fmt, codebook, _ = target_cb[canon]
             cbook = _to_device(codebook, device)
             w = tensor.to(device)
             packed, fields = cb.nvfp4_cb_pack(
                 w, k, grid=grid, mode=mode,
-                col_weights=col_weights[qname].to(device),
+                col_weights=col_weights[canon].to(device),
                 codebook=cbook, scale_sweep=scale_sweep,
                 scale_coding=(scale_coding if grid == "fp4"
                               else cb.SCALE_CODING_V1))
@@ -411,30 +477,33 @@ def export_nvfp4_cb(
                 # uint8 (E, out, bytes_per_row); fp8 per-channel scales
                 # (E, out). LAYOUT.md §3 (stacked experts).
                 packed = packed.reshape(w.shape[0], w.shape[1], -1)
-            out_tensors[qname + ".cb_qweight"] = packed.to(torch.uint8).cpu(
-            ).contiguous()
+            out_tensors[ckpt_qname + ".cb_qweight"] = packed.to(
+                torch.uint8).cpu().contiguous()
             if grid == "fp8":
                 ws = fields["scales"].reshape(
                     *w.shape[:-1]).to(torch.float32)
-                out_tensors[qname + ".weight_scale"] = ws.cpu().contiguous()
+                out_tensors[ckpt_qname + ".weight_scale"] = ws.cpu().contiguous()
             counts[fmt] += 1
-        elif qname in stock_targets:
+        elif canon in stock_targets:
             # Stock rung: CT-pack via the shared compressed-tensors codec
             # (RTN default levers = the render the allocator cost measured; the
             # packed scales are the render's, M19). Emit the CT suffix tensors
             # verbatim; NOT added to the ignore list (it is quantized).
-            fmt = stock_targets[qname]
-            override = (_nvfp4_shared_global.get(qname)
+            fmt = stock_targets[canon]
+            override = (_nvfp4_shared_global.get(canon)
                         if fmt == "NVFP4" else None)
             packed = _ct_quantize_2d(
                 tensor.to(device), fmt, nvfp4_global_real_override=override)
             for suffix, t in packed.items():
-                out_tensors[f"{qname}.{suffix}"] = t.cpu().contiguous()
-            counts[assignment[qname]] += 1
+                out_tensors[f"{ckpt_qname}.{suffix}"] = t.cpu().contiguous()
+            counts[assignment[canon]] += 1
         else:
+            # Verbatim (BF16 passthrough, norms, embeddings, visual encoder,
+            # lm_head) under the checkpoint name; 2-D unquantized Linears go to
+            # the ignore list by their checkpoint/vLLM name.
             out_tensors[name] = tensor.contiguous()
-            if qname is not None and tensor.dim() >= 2:
-                ignore.append(qname)
+            if ckpt_qname is not None and tensor.dim() >= 2:
+                ignore.append(ckpt_qname)
             counts["copied"] += 1
 
     # --- Codebook tensors: shipped once per (ref, fmt) in a NON-safetensors-
@@ -500,7 +569,9 @@ def export_nvfp4_cb(
                 "table": [float(t) for t in table.tolist()],
             }
         config_groups[f"group_{gi}"] = {
-            "targets": sorted(qnames),
+            # Targets carry the checkpoint/vLLM name (language_model infix on
+            # hybrids) so the plugin matches the served module prefixes.
+            "targets": sorted(_export_base_name(q, _profile) for q in qnames),
             "format": fmt,
             "scheme": scheme,
         }
@@ -514,7 +585,8 @@ def export_nvfp4_cb(
         _stock_by_fmt.setdefault(_f, []).append(_q)
     for _f, _qnames in sorted(_stock_by_fmt.items()):
         _group = _deepcopy(_STOCK_CT_SCHEMES[_f])
-        _group["targets"] = sorted(_ct_explicit_regex(q) for q in _qnames)
+        _group["targets"] = sorted(
+            _ct_explicit_regex(_export_base_name(q, _profile)) for q in _qnames)
         config_groups[f"group_{len(config_groups)}"] = _group
     # FP8_SOURCE passthrough group: the stock CT `float-quantized` block-fp8
     # scheme (no "scheme" key -> the plugin delegates it to CompressedTensors,
@@ -523,7 +595,8 @@ def export_nvfp4_cb(
     if source_targets:
         _src_group = _deepcopy(_FP8_SOURCE_SCHEME)
         _src_group["targets"] = sorted(
-            _ct_explicit_regex(q) for q in source_targets)
+            _ct_explicit_regex(_export_base_name(q, _profile))
+            for q in source_targets)
         config_groups[f"group_{len(config_groups)}"] = _src_group
     quant_config = {
         "quant_method": "prismaquant",
