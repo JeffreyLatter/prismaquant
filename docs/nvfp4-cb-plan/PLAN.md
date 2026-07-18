@@ -707,3 +707,17 @@ Roadmap to goal (live):
   Pipeline running (relaunch2). LESSON extended: in multi-agent orchestration,
   exactly ONE owner may kill/launch a shared long-running process; monitors are
   read-only. Folded into feedback_no_overparallel_during_prod semantics.
+- **CONTENTION DIAGNOSIS RETRACTED — it's a REAL ENCODE PERF BUG (2026-07-17):**
+  shard-write timestamps 14:09/16:19/18:29/20:39 = gaps 7796/7797/7790s =
+  **130min ± 3s dead-constant across varying fleet load** → deterministic
+  single-threaded/launch-bound, NOT contention (contention = variable gaps).
+  Profiled: one 89M-elem 27B MLP encode (weighted, balanced tier) = **76.7s**,
+  dominated by _stream_moments (5616 calls, 79.9s cum) — the moment scale-score
+  launches ~5600 tiny GPU kernels, launch-bound. Fast on 0.6B (small chunk×cand
+  count → why encode_tiers.md looked fine), catastrophic on 27B's big MLPs =
+  SCALING bug. ~19h cost stage. My earlier "contention/my over-parallel fault"
+  was WRONG (over-parallel was still bad practice but not the cause). Doomed
+  27B run STOPPED. Fix dispatched to formats agent (batch moment scoring across
+  chunk×candidate dims — the efficiency-wave lever, now proven mandatory);
+  target 76.7s→few-sec; 27B restarts on the fixed encode. Directly the goal's
+  fast-quant priority.
