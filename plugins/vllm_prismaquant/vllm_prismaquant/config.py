@@ -239,10 +239,19 @@ class PrismaQuantConfig(QuantizationConfig):
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
         self._ensure_resolved()
-        # Our CB target_scheme stays keyed by ORIGINAL per-role HF names (the
-        # q_proj->qkv_proj fusion is a stacked mapping resolved by
-        # _scheme_for_prefix); we only remap ignore. The delegated CT config
-        # DOES remap its own targets/ignore through vLLM's standard CT path.
+        # vLLM hands us the UNSTACKED mapper (get_unstacked_mapper()), so the
+        # q_proj->qkv_proj fusion is NOT rewritten (per-role leaf names survive
+        # for _scheme_for_prefix to re-fuse) — but genuine renames/prefixes ARE
+        # applied. For hybrid/VLM checkpoints that means the module-nesting
+        # prefix (e.g. Qwen3-VL: ``model.language_model.`` -> ``language_model.
+        # model.``) must be applied to the CB target keys too: _scheme_for_prefix
+        # matches serve-time prefixes EXACTLY (unlike the substring ignore test),
+        # so an un-remapped key silently falls through to unquantized and the
+        # cb_qweight load then fails ("no parameter named …cb_qweight"). Mirror
+        # exactly what the delegated stock-CT config does for its own targets.
         self.ignore = hf_to_vllm_mapper.apply_list(self.ignore)
+        self.target_scheme = hf_to_vllm_mapper.apply_dict(self.target_scheme)
+        self._cb_targets = set(
+            hf_to_vllm_mapper.apply_list(sorted(self._cb_targets)))
         if self.ct_config is not None:
             self.ct_config.apply_vllm_mapper(hf_to_vllm_mapper)

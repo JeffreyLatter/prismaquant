@@ -18,15 +18,12 @@ OUT="$WORK/ab"; mkdir -p "$OUT"
 TOK="$HFCACHE/qwen36-27b-bf16"                 # host tokenizer path for measure.py
 PY=/home/rob/dq-runs/venvs/prismaquant-cu130/bin/python
 
-# --- artifact placement under the /hf mount (serve_one.sh mounts $HFCACHE:/hf) ---
-# OURS: copy the exported checkpoint (incl. cb_codebooks.pqcb) into the mount.
-rm -rf "$HFCACHE/prod-27b-ours"; cp -r "$WORK/exported_nvfp4_cb" "$HFCACHE/prod-27b-ours"
-# AURA: move the download into the mount (once).
-[ -d "$HFCACHE/prod-27b-aura" ] || cp -r /home/rob/dq-runs/prod-27b-aura-dl "$HFCACHE/prod-27b-aura"
-
+# --- artifact placement: serve the EXISTING dirs via the /dqruns mount (no
+#     23GB x2 copies — that breaches the 10% disk floor; serve_one.sh now mounts
+#     /home/rob/dq-runs:/dqruns). The export dir already holds cb_codebooks.pqcb. ---
 BF16_CT=/hf/qwen36-27b-bf16
-OURS_CT=/hf/prod-27b-ours
-AURA_CT=/hf/prod-27b-aura
+OURS_CT=/dqruns/prod-27b-nvfp4cb-5p5/exported_nvfp4_cb
+AURA_CT=/dqruns/prod-27b-aura-dl
 
 # serve -> coherent smoke -> dump top20 -> speed -> stop (exact container name).
 serve_dump_speed () {

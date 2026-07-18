@@ -103,35 +103,105 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # Keep only shards that are actual CB targets (all, for uniform arts).
         return [p for p in prefixes if p in self.quant_config.target_scheme]
 
+    def _ckpt_cb_rows(self) -> dict[str, int]:
+        """Row count of every ``*.cb_qweight`` tensor in the on-disk checkpoint
+        (header-only read, cached once on the shared quant_config). Used to
+        recover the per-ROLE row split of a vLLM-merged linear whose roles have
+        separate codebooks (e.g. GDN ``in_proj_qkvz`` = ``in_proj_qkv`` +
+        ``in_proj_z``); ``logical_widths`` does not expose that boundary."""
+        qc = self.quant_config
+        cache = getattr(qc, "_ckpt_cb_row_cache", None)
+        if cache is not None:
+            return cache
+        import glob
+        import json
+        import struct
+        from vllm.config import get_current_vllm_config
+        model_dir = get_current_vllm_config().model_config.model
+        files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+        cache = {}
+        for st in files:
+            with open(st, "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                hdr = json.loads(fh.read(n))
+            for name, meta in hdr.items():
+                if name != "__metadata__" and name.endswith(".cb_qweight"):
+                    cache[name] = int(meta["shape"][0])
+        qc._ckpt_cb_row_cache = cache
+        return cache
+
+    def _lookup_ckpt_rows(self, shard_prefix: str, ckpt_rows: dict) -> int:
+        """Rows of ``<shard_prefix>.cb_qweight`` in the checkpoint. shard_prefix
+        is a vLLM-mapped name; the on-disk tensor keeps the export name, which
+        differs only by the model-nesting prefix (Qwen3-VL: ``model.language_
+        model.`` vs ``language_model.model.``). Match on the module-local tail
+        (from ``.layers.`` on, which is nesting-invariant), requiring a unique
+        hit so a mis-mapped name fails loudly rather than silently truncating."""
+        want = shard_prefix + ".cb_qweight"
+        if want in ckpt_rows:
+            return ckpt_rows[want]
+        cut = shard_prefix.rfind(".layers.")
+        tail = (shard_prefix[cut:] if cut >= 0
+                else "." + shard_prefix.split(".")[-1]) + ".cb_qweight"
+        hits = [r for name, r in ckpt_rows.items() if name.endswith(tail)]
+        assert len(hits) == 1, (
+            f"{shard_prefix}: expected exactly one checkpoint cb_qweight ending "
+            f"'{tail}', found {len(hits)} — cannot resolve merged-role row split")
+        return hits[0]
+
     def process_weights_after_loading(self, layer):
         dev = layer.cb_qweight.device
         codebooks = self.quant_config.get_codebooks()
 
-        # Build the concatenated flat codebook + per-row base offset.
+        # Build the concatenated flat codebook + per-row base offset. The
+        # per-row offset MUST cover every output row (its length == N), else the
+        # decode/expand kernels read cb_row_offset out of bounds.
         shard_prefixes = self._shard_roles()
-        widths = layer.logical_widths
-        if len(shard_prefixes) != len(widths):
-            # Non-fused / single-role Linear.
-            shard_prefixes = [self.prefix] if self.prefix in \
-                self.quant_config.target_scheme else shard_prefixes
-        blocks, row_offsets, cb_total = [], [], None
-        offset_rows = 0
+        widths = list(layer.logical_widths)
+        if len(shard_prefixes) == len(widths):
+            # One CB role per logical shard: a genuinely fused module (qkv_proj /
+            # gate_up_proj) with a per-role codebook, or a plain single Linear.
+            # logical_widths is the authoritative per-shard row count.
+            shard_widths = widths
+        else:
+            # vLLM merged MORE logical shards than we have CB roles: e.g. a
+            # Gated-DeltaNet ``in_proj_qkvz`` (logical_widths=[q,k,v,z], 4 chunks)
+            # that the export packed as TWO targets ``in_proj_qkv``(=q+k+v) +
+            # ``in_proj_z``(=z), each with its own codebook. logical_widths does
+            # NOT expose the per-ROLE boundary, so derive each role's row count
+            # from the checkpoint's separate ``<role>.cb_qweight`` tensor (vLLM
+            # merges them on load, but they are distinct on disk). The old code
+            # used widths[0] for the single role -> cb_row_offset was short ->
+            # illegal memory access in the decode/expand kernels.
+            ckpt_rows = self._ckpt_cb_rows()
+            shard_widths = [self._lookup_ckpt_rows(sp, ckpt_rows)
+                            for sp in shard_prefixes]
+            assert sum(shard_widths) == sum(widths), (
+                f"{self.prefix}: checkpoint role rows {shard_widths} "
+                f"(sum {sum(shard_widths)}) != logical width sum {sum(widths)}")
+        blocks, row_offsets = [], []
+        cb_cumoffset = 0
         for i, sp in enumerate(shard_prefixes):
             ref = self.quant_config.target_scheme[sp]["codebook_ref"]
             names = ref if isinstance(ref, list) else [ref]
             subs = [codebooks[n].to(dev) for n in names]
             flat = codec.build_flat_codebook(subs)
-            if cb_total is None:
-                cb_total = flat.numel()
             blocks.append(flat)
-            w = widths[i]
-            row_offsets.append(torch.full((w,), i * cb_total,
+            w = shard_widths[i]
+            # cumulative base (not i*cb_total): correct even if per-shard
+            # codebooks differ in size. All rows of shard i point at that
+            # shard's block within the concatenated cb_flat.
+            row_offsets.append(torch.full((w,), cb_cumoffset,
                                           dtype=torch.int32, device=dev))
-            offset_rows += w
+            cb_cumoffset += flat.numel()
         cb_flat = torch.cat(blocks).contiguous()
         cb_row_offset = torch.cat(row_offsets).contiguous()
 
         qw = layer.cb_qweight.data
+        assert cb_row_offset.numel() == qw.shape[0], (
+            f"{self.prefix}: cb_row_offset has {cb_row_offset.numel()} rows but "
+            f"the packed weight has {qw.shape[0]} — per-row offset must cover "
+            "every output row (kernels index it by row).")
         layer._cb_qw_padded = codec.pad_qweight(qw)
         layer._cb_flat = cb_flat
         layer._cb_row_offset = cb_row_offset
