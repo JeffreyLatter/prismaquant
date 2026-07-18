@@ -95,3 +95,23 @@ serving a hybrid VLM + GDN on metal surfaced all three:
 - Coherent greedy generation confirmed ("The capital of France is" → " Paris.";
   "2+2 equals" → " 4.").
 - Next model classes per the goal: 35B MoE, then Hy3/DSv4 ultra-low-bpp.
+
+## Addendum — CUDA-graph decode experiment (2026-07-18)
+Tested serving OURS WITHOUT `--enforce-eager` (let vLLM capture decode graphs):
+
+| | TTFT(1400) | decode tok/s |
+|---|---|---|
+| OURS eager | 1.622 | **4.20** |
+| OURS cudagraph | 1.372 | 1.21 |
+| AURA (native) | 0.746 | 10.26 |
+
+**CUDA graphs HURT decode (4.20→1.21).** Root cause: vLLM pads captured decode
+batches above `PREFILL_M_THRESHOLD=16`, so every graphed decode step takes the
+**expand path** (full [N,K] materialize + GEMM per token) instead of the cheap
+`cb_gemm`. Launch-overhead is NOT the decode bottleneck — the `cb_gemm` decode
+kernel's own throughput is (it's below even BF16). Conclusions: (a) keep
+`--enforce-eager` for the current plugin; (b) the decode fix is a faster
+bandwidth-bound dequant-GEMV (plan §1b / prototype ii), NOT cudagraph; (c) the
+M-gated dispatch is cudagraph-hostile — a production decode kernel must key off
+the real token count, not the padded batch. Prefill still needs the CUTLASS
+fused-expand kernel (§1a / iii).
