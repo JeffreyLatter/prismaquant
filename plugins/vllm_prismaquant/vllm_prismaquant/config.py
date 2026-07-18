@@ -33,6 +33,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
+try:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+except Exception:  # pragma: no cover - older vLLM
+    RoutedExperts = None
+
+_MOE_LEAVES = ("gate_up_proj", "down_proj", "gate_proj", "up_proj")
+
 # vLLM fuses these siblings into one module; packed_modules_mapping is populated
 # by dispatch time, but we keep the standard mapping as a fallback.
 _FUSED_FALLBACK = {
@@ -207,6 +214,27 @@ class PrismaQuantConfig(QuantizationConfig):
                 if method is not None:
                     return method
             return UnquantizedEmbeddingMethod()
+
+        # FusedMoE expert stacks (RoutedExperts): a CB expert group -> our MoE
+        # method; else delegate to the stock CT MoE path.
+        if RoutedExperts is not None and isinstance(layer, RoutedExperts):
+            scheme = self._moe_scheme_for_prefix(prefix)
+            if scheme is not None:
+                from .moe import PrismaQuantCBMoEMethod
+                return PrismaQuantCBMoEMethod(
+                    self, layer.moe_config, scheme, prefix)
+            if self.ct_config is not None:
+                return self.ct_config.get_quant_method(layer, prefix)
+            return None
+        return None
+
+    def _moe_scheme_for_prefix(self, prefix: str) -> dict | None:
+        """A CB expert stack (targets like ``…experts.gate_up_proj`` /
+        ``…experts.down_proj``) under this FusedMoE prefix — return its scheme
+        (uniform per layer, so any matching target's scheme is the layer's)."""
+        for name, sch in self.target_scheme.items():
+            if name.startswith(prefix) and name.split(".")[-1] in _MOE_LEAVES:
+                return sch
         return None
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
