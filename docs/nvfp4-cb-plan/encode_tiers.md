@@ -7,10 +7,28 @@
 | tier | scale search | refits | notes |
 |---|---|---|---|
 | max | exhaustive 16-candidate sweep (v1) / full windowed-E (v2), direct evals | 2 | bit-identical to the pre-tier encoder (regression-pinned) |
-| balanced | analytic s0 (usage-calibrated second-moment match, pilot-encoded m2_used) + ±2 log-spaced micro-sweep (ratio 1.075) + amax/grid-max guarantee + 4 per-group hill-climb steps; moment-scored | 2 | s0-centered E window ±1 (v2) |
-| fast | s0 + ±1 micro-sweep (ratio 1.1) + guarantee + 2 hill-climb steps; moment-scored | 1 | E window ±0 (v2) |
+| balanced | analytic s0 (usage-calibrated second-moment match, pilot-encoded m2_used) + EXHAUSTIVE per-group scale grid (s0·ratio^i, i∈[-6,6] at ratio 1.075, + amax/grid-max guarantee); moment-scored | 2 | s0-centered E window ±1 (v2) |
+| fast | s0 + exhaustive grid i∈[-3,3] (ratio 1.1) + guarantee; moment-scored | 1 | E window ±0 (v2) |
 
-Span-curve finding (q_proj, fp8 K44): quality is set by REACH, not granularity — ±24% reach hits max-parity, ±34% BEATS max by 2.1% (the s0-centered search finds basins the fixed [amax/6, amax/4] clip window never visits). down_proj's per-row m2 variation defeats any fixed span → the per-group hill climb extends reach only where a group's winner sits on the grid edge (one cheap moment-scored pass per step).
+Span-curve finding (q_proj, fp8 K44): quality is set by REACH, not granularity — ±24% reach hits max-parity, ±34% BEATS max by 2.1% (the s0-centered search finds basins the fixed [amax/6, amax/4] clip window never visits).
+
+## 27B-scale launch/volume fix (2026-07-17)
+
+The balanced/fast v1 encoders originally did the scale search as a SEQUENTIAL greedy hill-climb (micro-sweep + accept-if-better steps), and `_moment_eval`/refits REBUILT the (m, K) moment matrices every call. On 0.6B tensors (small chunk×candidate counts) this measured fast, but on a real 27B MLP Linear (5120×17408 = 89M elem, fp8 K44) it took **76.7s** — a super-linear blowup that made the cost stage a ~19-hour job. Fix (`_sweep_encode_moment`):
+
+- **Build-once:** the (m, K) moments are built ONCE per row-chunk and reused across the scale scan, the argmin, and both WLS refits (the old split rebuilt them ~4×). This is the dominant, choice-preserving win.
+- **Exhaustive batched grid replaces the greedy hill:** one global argmin over a per-group scale grid that is a strict SUPERSET of every scale the greedy hill could reach → **provably ≥ greedy quality** (a global min over greedy's whole reachable set). On the real 89M Linear the resulting wRecon is **bit-identical** to the pre-fix greedy path; only pathological small synthetic tensors with non-unimodal per-group error differ (≤0.1%, and only ever BETTER).
+- min+argmin folded into the scan (assignment free with the min); dynamo recompile_limit raised so the compiled moment kernels don't silently drop to eager.
+
+Result (balanced, 89M fp8 K44 MLP, wRecon 2.5739e+01 unchanged, peak 5.2 GB):
+
+| tier | before | after | speedup |
+|---|---|---|---|
+| balanced | 76.7 s | **21.9 s** | **×3.5** |
+| fast | (n/a) | 14.3 s | — |
+| max | 276 s | 276 s | ×1.0 (bit-identical, the regression anchor) |
+
+fp4 v1 (K16, small K) is already 5.4 s; two-tier v2 (opt-in, not the pipeline default — `CB_SCALE_CODING=v1` ships) keeps its original bit-preserving W×16 windowed-entry path (25 s; its search does not batch cleanly and it is off the critical 27B/35B path). Cost-stage extrapolation: the ~19 h uniform-FP8 cost stage → **~5.4 h** at ×3.5 on the MLP-dominated wall.
 
 ## Per-Linear timings (0.6B layer-6 + stacked), min-of-2
 

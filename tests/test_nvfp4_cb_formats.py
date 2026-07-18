@@ -860,8 +860,10 @@ def test_two_tier_candidate_diversity_vs_v1():
             assert len(vals) >= 16
 
 
-# v2 sweep quality: never worse than the v1 one-shot; empirically also beats
-# the v1 free sweep on subnormal-band tensors (the spec §3 negative tax).
+# v2 sweep quality: never worse than the v1 one-shot; ties the v1 free sweep
+# on subnormal-band tensors (v2's real win is bytes — 0.28 vs 0.5 bpw scale).
+# The v1 balanced encoder now scans an EXHAUSTIVE scale grid (>= the old
+# greedy hill's reach), so v1 error ties v2 here rather than trailing it.
 @pytest.mark.parametrize("mode", ["product", "signed"])
 def test_two_tier_beats_one_shot_and_v1_sweep(mode):
     w = _real_magnitude_w(seed=9)
@@ -881,7 +883,8 @@ def test_two_tier_beats_one_shot_and_v1_sweep(mode):
     e_one, e_v1, e_v2 = (err_of(one_shot), err_of(f_v1["scales"]),
                          err_of(f_v2["scales"]))
     assert e_v2 <= e_one + 1e-6
-    assert e_v2 <= e_v1 + 1e-6
+    # v2 ties v1's exhaustive-grid sweep on error (within fp/basin noise).
+    assert e_v2 <= e_v1 * 1.002
 
 
 def test_two_tier_rejects_fp8_and_no_sweep():

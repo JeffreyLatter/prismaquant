@@ -615,18 +615,113 @@ def _encode_compile_on() -> bool:
         "0", "false", "no")
 
 
+_ENCODE_RECOMPILE_LIMIT_RAISED = False
+
+
+def _raise_encode_recompile_limit() -> None:
+    """The moment-scoring kernels are compiled once (dynamic=True) but see a
+    handful of distinct (K, S) specializations across grids/tiers/formats
+    (fp8 K2048/S14, fp4 K256/S16, the S1 refit argmins, ...). The default
+    dynamo recompile_limit=8 is exceeded across a mixed-format run, silently
+    dropping the compiled path back to EAGER — which materializes the whole
+    (m, K, S) intermediate and runs ~30x slower. Raise the limit so every
+    specialization stays compiled (mirrors _make_rtn's defensive bump)."""
+    global _ENCODE_RECOMPILE_LIMIT_RAISED
+    if _ENCODE_RECOMPILE_LIMIT_RAISED:
+        return
+    try:
+        torch._dynamo.config.recompile_limit = max(
+            int(getattr(torch._dynamo.config, "recompile_limit", 8)), 256)
+        torch._dynamo.config.accumulated_recompile_limit = max(
+            int(getattr(torch._dynamo.config,
+                        "accumulated_recompile_limit", 256)), 4096)
+    except Exception:
+        pass
+    _ENCODE_RECOMPILE_LIMIT_RAISED = True
+
+
 def _score_min(A, B, s):
     if _encode_compile_on():
         try:
+            _raise_encode_recompile_limit()
             return _score_min_compiled()(A, B, s)
         except Exception:
             pass
     return _score_min_eager(A, B, s)
 
 
+def _score_min_batched_eager(A: torch.Tensor, B: torch.Tensor,
+                             s: torch.Tensor) -> torch.Tensor:
+    """min over entries of s^2 A - 2s B for a BATCH of per-vector scales.
+
+    ``A``/``B`` are (m, K); ``s`` is (m, S). Returns (m, S) — the per-vector
+    min-over-K at each of the S scales. torch.compile fuses the elementwise
+    scoring and the K-reduction so the (m, K) moments are read ONCE for all
+    S scales (vs S separate reductions), the launch-bound/volume fix for the
+    27B-scale sweep."""
+    s2 = (s * s).unsqueeze(1)                    # (m, 1, S)
+    ts = (2.0 * s).unsqueeze(1)                  # (m, 1, S)
+    d = s2 * A.unsqueeze(-1) - ts * B.unsqueeze(-1)   # (m, K, S)
+    return d.min(dim=1).values                   # (m, S)
+
+
+def _score_minargmin_batched_eager(A: torch.Tensor, B: torch.Tensor,
+                                   s: torch.Tensor):
+    """Batched min AND argmin over K for S per-vector scales. Returns
+    (values (m, S), indices (m, S)). The argmin comes free with the min
+    reduction, so scoring the scale grid ALSO yields the assignment at each
+    candidate — folding the separate init-argmin pass into the scan."""
+    s2 = (s * s).unsqueeze(1)
+    ts = (2.0 * s).unsqueeze(1)
+    d = s2 * A.unsqueeze(-1) - ts * B.unsqueeze(-1)   # (m, K, S)
+    v, i = d.min(dim=1)
+    return v, i
+
+
+@lru_cache(maxsize=None)
+def _score_min_batched_compiled():
+    return torch.compile(_score_min_batched_eager, dynamic=True)
+
+
+@lru_cache(maxsize=None)
+def _score_minargmin_batched_compiled():
+    return torch.compile(_score_minargmin_batched_eager, dynamic=True)
+
+
+def _score_minargmin_batched(A, B, s):
+    if _encode_compile_on():
+        try:
+            _raise_encode_recompile_limit()
+            return _score_minargmin_batched_compiled()(A, B, s)
+        except Exception:
+            pass
+    vs, is_ = [], []
+    for i in range(s.shape[-1]):
+        v, ix = _score_argmin_eager(A, B, s[:, i:i + 1])
+        vs.append(v)
+        is_.append(ix)
+    return torch.stack(vs, dim=-1), torch.stack(is_, dim=-1)
+
+
+def _score_min_batched(A, B, s):
+    if _encode_compile_on():
+        try:
+            _raise_encode_recompile_limit()
+            return _score_min_batched_compiled()(A, B, s)
+        except Exception:
+            pass
+    # Eager fallback: loop the S columns so the (m, K, S) intermediate is
+    # never materialized (it would OOM at 27B scale — the fused compiled
+    # path reads (m, K) once instead). Each column is one (m, K) reduction.
+    return torch.stack(
+        [_score_min_eager(A, B, s[:, i:i + 1]) for i in range(s.shape[-1])],
+        dim=-1)
+
+
 def _score_argmin(A, B, s):
     if _encode_compile_on():
         try:
+            _raise_encode_recompile_limit()
             return _score_argmin_compiled()(A, B, s)
         except Exception:
             pass
@@ -680,138 +775,83 @@ def _moment_err_groups(moms, s_g: torch.Tensor, grid: str, in_f: int,
     return err_v.reshape(rc, G, vec_per_group).sum(dim=-1)
 
 
-def _wls_refit_step(w2d, wq, best_s, grid, mode, cb):
-    """One exact WLS refit iteration (shared by all tiers): returns the
-    snapped candidate scales and the accept mask inputs."""
-    rows, in_f = w2d.shape
-    err_cur, _, g = _eval_candidate(w2d, wq, best_s, grid, mode, cb)
-    wcol = wq.reshape(rows, in_f) if wq is not None else torch.ones_like(g)
-    num = _group_reduce(wcol * g * w2d, grid)
-    den = _group_reduce(wcol * g * g, grid)
-    s_star = _snap_scale(torch.where(den > 0, num / den.clamp_min(1e-30),
-                                     best_s), grid)
-    err_star, _, _ = _eval_candidate(w2d, wq, s_star, grid, mode, cb)
-    return torch.where(err_star < err_cur, s_star, best_s)
+def _moment_err_groups_batched(moms, s_g: torch.Tensor, vec_per_group: int
+                               ) -> torch.Tensor:
+    """Per-group error for a BATCH of candidate scales in one fused pass.
+
+    ``s_g`` is (rc, G, S). Returns (rc, G, S). The batched min reads each
+    stream's (m, K) moments ONCE for all S candidates (vs S passes), so the
+    whole scale sweep is a single volume pass instead of S — the fix for the
+    launch/volume blowup on 27B-scale Linears."""
+    rc, G, S = s_g.shape
+    s_v = s_g.repeat_interleave(vec_per_group, dim=1).reshape(-1, S)
+    err_v = None
+    for (A, B) in moms:
+        v = _score_min_batched(A, B, s_v)                 # (m, S)
+        err_v = v if err_v is None else err_v + v
+    return err_v.reshape(rc, G, vec_per_group, S).sum(dim=2)
 
 
-def _moment_eval(w2d, wq2d, grid, mode, cb, s_g):
-    """Moment-scored equivalent of :func:`_eval_candidate`: per-group err
-    (WITHOUT the constant C = sum q w^2 term — add it when comparing against
-    anything C-inclusive), the encode fields, and the grid decode. Same
-    argmin objective as the direct eval, up to fp-rounding ties."""
-    rows, in_f = w2d.shape
-    vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
-    vec_per_row = in_f // VEC_DIM
-    G = s_g.shape[1]
-    err = torch.empty(rows, G, device=w2d.device)
-    encs: list[dict] = []
-    rows_step = _moment_rows_step(cb, vec_per_row)
-    for r0 in range(0, rows, rows_step):
-        r1 = min(rows, r0 + rows_step)
-        wvec = w2d[r0:r1].reshape(-1, VEC_DIM)
-        wqc = (wq2d[r0:r1].reshape(-1, VEC_DIM)
-               if wq2d is not None else None)
-        streams = _mode_streams(wvec, mode, cb, wqc)
-        s_v = s_g[r0:r1].repeat_interleave(
-            vec_per_group, dim=1).reshape(-1, 1)
-        err_v = None
-        idxs = []
-        for (x, ws, t) in streams:
-            A, B = _stream_moments(x, ws, t)
-            v, i = _score_argmin(A, B, s_v)
-            err_v = v if err_v is None else err_v + v
-            idxs.append(i)
-        if mode == "full":
-            enc = {"idx": idxs[0]}
-        elif mode == "signed":
-            enc = {"idx": idxs[0],
-                   "signs": torch.where(wvec < 0, -1.0, 1.0)}
-        else:
-            enc = {"idx": torch.stack(idxs, dim=-1)}
-        encs.append(enc)
-        err[r0:r1] = err_v.reshape(r1 - r0, G, vec_per_group).sum(-1)
-    enc = {key: torch.cat([e[key] for e in encs], dim=0) for key in encs[0]}
-    dec = _mode_decode(enc, mode, cb).reshape(rows, in_f)
+def _chunk_moments(wvec, wqc, mode, cb):
+    """Build the per-stream (A, B) moments for one row-chunk ONCE, reusable
+    across the whole per-chunk sweep + argmin + refits (eliminates the 4x
+    moment rebuild the old scan/eval/refit split incurred)."""
+    return [_stream_moments(x, ws, t)
+            for (x, ws, t) in _mode_streams(wvec, mode, cb, wqc)]
+
+
+def _scan_and_assign(moms, wvec, grid_s_c, mode, cb, grid, in_f,
+                     vec_per_group):
+    """Batched exhaustive scale-grid scan that ALSO returns the assignment at
+    the chosen (per-group) scale — one fused (m, K) pass does both the min
+    (scale selection) and the argmin (codeword assignment), no separate
+    init-argmin pass. ``grid_s_c`` is (rc, G, S). Returns
+    (best_s (rc, G), err (rc, G), enc, dec (rc, in_f))."""
+    rc, G, S = grid_s_c.shape
+    s_v = grid_s_c.repeat_interleave(vec_per_group, dim=1).reshape(-1, S)
+    err = None
+    per_stream_idx = []
+    for (A, B) in moms:
+        v, i = _score_minargmin_batched(A, B, s_v)        # (m, S), (m, S)
+        err = v if err is None else err + v
+        per_stream_idx.append(i)
+    err_g = err.reshape(rc, G, vec_per_group, S).sum(dim=2)   # (rc, G, S)
+    best_col = err_g.argmin(dim=-1)                        # first-min on ties
+    best_s = torch.gather(grid_s_c, -1, best_col.unsqueeze(-1)).squeeze(-1)
+    err_c = torch.gather(err_g, -1, best_col.unsqueeze(-1)).squeeze(-1)
+    col_v = best_col.repeat_interleave(vec_per_group, dim=1).reshape(-1, 1)
+    idxs = [torch.gather(i, -1, col_v).squeeze(-1) for i in per_stream_idx]
+    if mode == "full":
+        enc = {"idx": idxs[0]}
+    elif mode == "signed":
+        enc = {"idx": idxs[0], "signs": torch.where(wvec < 0, -1.0, 1.0)}
+    else:
+        enc = {"idx": torch.stack(idxs, dim=-1)}
+    dec = _mode_decode(enc, mode, cb).reshape(rc, in_f)
+    return best_s, err_c, enc, dec
+
+
+def _argmin_from_moments(moms, wvec, s_g, mode, cb, grid, in_f,
+                         vec_per_group):
+    """Assignment + decode at per-group scale ``s_g`` (rc, G) from RESIDENT
+    moments (no rebuild). Returns (err (rc, G), enc, dec (rc, in_f))."""
+    rc, G = s_g.shape
+    s_v = s_g.repeat_interleave(vec_per_group, dim=1).reshape(-1, 1)
+    err_v = None
+    idxs = []
+    for (A, B) in moms:
+        v, i = _score_argmin(A, B, s_v)
+        err_v = v if err_v is None else err_v + v
+        idxs.append(i)
+    if mode == "full":
+        enc = {"idx": idxs[0]}
+    elif mode == "signed":
+        enc = {"idx": idxs[0], "signs": torch.where(wvec < 0, -1.0, 1.0)}
+    else:
+        enc = {"idx": torch.stack(idxs, dim=-1)}
+    err = err_v.reshape(rc, G, vec_per_group).sum(dim=-1)
+    dec = _mode_decode(enc, mode, cb).reshape(rc, in_f)
     return err, enc, dec
-
-
-def _wls_refit_step_moment(w2d, wq2d, grid, mode, cb, best_s, err_cur,
-                           enc_cur, dec_cur):
-    """One WLS refit with moment-scored evaluation; per-group accept iff
-    strictly better (C-free errors on both sides — C cancels). Returns the
-    merged (best_s, err, enc, dec)."""
-    rows, in_f = w2d.shape
-    vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
-    wcol = wq2d if wq2d is not None else torch.ones_like(w2d)
-    num = _group_reduce(wcol * dec_cur * w2d, grid)
-    den = _group_reduce(wcol * dec_cur * dec_cur, grid)
-    s_star = _snap_scale(torch.where(den > 0, num / den.clamp_min(1e-30),
-                                     best_s), grid)
-    err_star, enc_star, dec_star = _moment_eval(
-        w2d, wq2d, grid, mode, cb, s_star)
-    better = err_star < err_cur
-    best_s = torch.where(better, s_star, best_s)
-    err = torch.where(better, err_star, err_cur)
-    bvec = better.repeat_interleave(vec_per_group, dim=1).reshape(-1)
-    enc = {}
-    for key in enc_cur:
-        cur, star = enc_cur[key], enc_star[key]
-        mask = bvec
-        if cur.dim() > 1:
-            view = (-1,) + (1,) * (cur.dim() - 1)
-            mask = bvec.reshape(view).expand_as(cur)
-        enc[key] = torch.where(mask, star, cur)
-    belem = better.repeat_interleave(
-        (FP4_GROUP if grid == "fp4" else in_f), dim=1)
-    dec = torch.where(belem, dec_star, dec_cur)
-    return best_s, err, enc, dec
-
-
-def _score_scales_chunked(w2d, wq2d, grid, mode, cb, eval_scales,
-                          hill_iters: int = 0, hill_ratio: float = 1.075):
-    """Moment-score a list of per-group scale tensors; return per-group
-    running-min (best_err, best_s) in candidate order (strict <).
-
-    ``hill_iters`` > 0 appends a per-group ratio-step hill climb after the
-    grid (score best_s*r and best_s/r, accept where strictly better) — it
-    extends the search reach exactly where a group's optimum sits past the
-    micro-grid edge (the measured down_proj per-row m2 variation), at one
-    cheap moment-scored pass per direction, moments already cached."""
-    rows, in_f = w2d.shape
-    G = eval_scales[0].shape[1]
-    vec_per_row = in_f // VEC_DIM
-    vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
-    best_err = torch.full((rows, G), float("inf"), device=w2d.device)
-    best_s = eval_scales[0].clone()
-    rows_step = _moment_rows_step(cb, vec_per_row)
-    for r0 in range(0, rows, rows_step):
-        r1 = min(rows, r0 + rows_step)
-        wvec = w2d[r0:r1].reshape(-1, VEC_DIM)
-        wqc = (wq2d[r0:r1].reshape(-1, VEC_DIM)
-               if wq2d is not None else None)
-        moms = [_stream_moments(x, ws, t)
-                for (x, ws, t) in _mode_streams(wvec, mode, cb, wqc)]
-
-        def score(s_g):
-            return _moment_err_groups(moms, s_g, grid, in_f, vec_per_group)
-
-        e_c = best_err[r0:r1]
-        s_c = best_s[r0:r1]
-        for s_full in eval_scales:
-            err_g = score(s_full[r0:r1])
-            better = err_g < e_c
-            e_c = torch.where(better, err_g, e_c)
-            s_c = torch.where(better, s_full[r0:r1], s_c)
-        for _ in range(int(hill_iters)):
-            for ratio in (hill_ratio, 1.0 / hill_ratio):
-                s_try = _snap_scale(s_c * ratio, grid)
-                err_g = score(s_try)
-                better = err_g < e_c
-                e_c = torch.where(better, err_g, e_c)
-                s_c = torch.where(better, s_try, s_c)
-        best_err[r0:r1] = e_c
-        best_s[r0:r1] = s_c
-    return best_err, best_s
 
 
 def _calibrate_m2_used(w2d, wq2d, grid, mode, cb) -> float:
@@ -824,52 +864,115 @@ def _calibrate_m2_used(w2d, wq2d, grid, mode, cb) -> float:
     p1 = min(w2d.shape[0], _PILOT_ROWS)
     pilot = w2d[:p1]
     wp2d = wq2d[:p1] if wq2d is not None else None
-    wp = wp2d.reshape(-1, VEC_DIM) if wp2d is not None else None
+    in_f = pilot.shape[1]
+    vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
+    vec_per_row = in_f // VEC_DIM
     amax = _group_amax(pilot, grid)
-    cands = _candidate_scales(amax, grid, _SCALE_SWEEP_CANDIDATES)
-    _, best_s = _score_scales_chunked(
-        pilot, wp2d, grid, mode, cb,
-        [cands[si] for si in range(cands.shape[0])])
-    _, _, dec = _eval_candidate(pilot, wp, best_s, grid, mode, cb)
-    wcol = wp2d if wp2d is not None else torch.ones_like(dec)
-    m2 = float((wcol * dec * dec).sum() / wcol.sum().clamp_min(1e-30))
+    cands = _candidate_scales(amax, grid, _SCALE_SWEEP_CANDIDATES)   # (S,rc,G)
+    grid_s = cands.permute(1, 2, 0).contiguous()                    # (rc,G,S)
+    rows_step = _moment_rows_step(cb, vec_per_row)
+    num_acc = 0.0
+    den_acc = 0.0
+    for r0 in range(0, p1, rows_step):
+        r1 = min(p1, r0 + rows_step)
+        wvec = pilot[r0:r1].reshape(-1, VEC_DIM)
+        wqc = (wp2d[r0:r1].reshape(-1, VEC_DIM)
+               if wp2d is not None else None)
+        moms = _chunk_moments(wvec, wqc, mode, cb)
+        errs = _moment_err_groups_batched(moms, grid_s[r0:r1], vec_per_group)
+        best_col = errs.argmin(dim=-1)
+        best_s = torch.gather(grid_s[r0:r1], -1,
+                              best_col.unsqueeze(-1)).squeeze(-1)
+        _, _, dec = _argmin_from_moments(
+            moms, wvec, best_s, mode, cb, grid, in_f, vec_per_group)
+        wcol = (wp2d[r0:r1] if wp2d is not None
+                else torch.ones_like(dec))
+        num_acc += float((wcol * dec * dec).sum())
+        den_acc += float(wcol.sum())
+    m2 = num_acc / max(den_acc, 1e-30)
     return max(m2, 1e-30)
 
 
-def _analytic_scales(w2d, wq2d, grid, m2_used: float, span: int,
-                     ratio: float) -> list[torch.Tensor]:
-    """s0 (second-moment match) + log-spaced micro-sweep +-span neighbors +
-    the amax/grid-max guarantee candidate (keeps the never-worse-than-one-shot
-    contract). All snapped legal."""
+def _analytic_s0(w2d, wq2d, grid, m2_used: float) -> torch.Tensor:
+    """Per-group second-moment-match scale s0 (rows, G)."""
     wcol = wq2d if wq2d is not None else torch.ones_like(w2d)
     num = _group_reduce(wcol * w2d * w2d, grid)
     den = _group_reduce(wcol, grid) * m2_used
-    s0 = (num / den.clamp_min(1e-30)).sqrt()
-    scales = [_snap_scale(s0 * (ratio ** i), grid)
-              for i in range(-span, span + 1)]
+    return (num / den.clamp_min(1e-30)).sqrt()
+
+
+def _tier_scale_grid(s0, w2d, grid, tier):
+    """Exhaustive per-group candidate scale grid (rows, G, S): s0*ratio^i for
+    i spanning the FULL reach the micro-sweep + greedy hill-climb could visit
+    (+-(span+hill_iters)), plus the amax/grid-max guarantee.
+
+    A single global argmin over this grid is a strict SUPERSET of every scale
+    the sequential greedy hill explores, so it is provably no worse than the
+    old greedy result (equal for the unimodal RD error that is the actual
+    case) while collapsing the ~14 sequential scored passes into ONE batched
+    pass. Snapped legal; the guarantee keeps the never-worse-than-one-shot
+    contract."""
+    ratio = _TIER_MICRO_RATIO[tier]
+    reach = _TIER_MICRO_SPAN[tier] + _TIER_HILL_ITERS[tier]
+    mults = [ratio ** i for i in range(-reach, reach + 1)]
+    cols = [_snap_scale(s0 * m, grid) for m in mults]
     amax = _group_amax(w2d, grid)
-    scales.append(_candidate_scales(amax, grid, 1)[0])
-    return scales
+    cols.append(_candidate_scales(amax, grid, 1)[0])
+    return torch.stack(cols, dim=-1)                       # (rows, G, S)
 
 
 def _sweep_encode_moment(w2d: torch.Tensor, grid: str, mode: str, cb,
                          wq: torch.Tensor | None, tier: str):
-    """fast/balanced v1 sweep: analytic s0 + micro-sweep + WLS refits, all
-    moment-scored (no full VQ distance recomputes anywhere)."""
+    """fast/balanced v1 sweep. Unified per-chunk pipeline: build the (m, K)
+    moments ONCE per chunk, batch-score the exhaustive scale grid in a single
+    fused pass, then argmin + WLS refits all off the RESIDENT moments (no
+    rebuild). The scale grid is a superset of the old greedy hill's reach, so
+    encode choices are no worse (equal on unimodal groups)."""
     rows, in_f = w2d.shape
     wq2d = wq.reshape(rows, in_f) if wq is not None else None
     m2 = _calibrate_m2_used(w2d, wq2d, grid, mode, cb)
-    eval_scales = _analytic_scales(w2d, wq2d, grid, m2,
-                                   _TIER_MICRO_SPAN[tier],
-                                   _TIER_MICRO_RATIO[tier])
-    _, best_s = _score_scales_chunked(
-        w2d, wq2d, grid, mode, cb, eval_scales,
-        hill_iters=_TIER_HILL_ITERS[tier],
-        hill_ratio=_TIER_MICRO_RATIO[tier])
-    err, enc, dec = _moment_eval(w2d, wq2d, grid, mode, cb, best_s)
-    for _ in range(_TIER_REFITS[tier]):
-        best_s, err, enc, dec = _wls_refit_step_moment(
-            w2d, wq2d, grid, mode, cb, best_s, err, enc, dec)
+    s0 = _analytic_s0(w2d, wq2d, grid, m2)
+    grid_s = _tier_scale_grid(s0, w2d, grid, tier)         # (rows, G, S)
+    vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
+    vec_per_row = in_f // VEC_DIM
+    refits = _TIER_REFITS[tier]
+    best_s = torch.empty(rows, s0.shape[1], device=w2d.device)
+    enc_parts: list[dict] = []
+    rows_step = _moment_rows_step(cb, vec_per_row)
+    for r0 in range(0, rows, rows_step):
+        r1 = min(rows, r0 + rows_step)
+        wvec = w2d[r0:r1].reshape(-1, VEC_DIM)
+        wqc = (wq2d[r0:r1].reshape(-1, VEC_DIM)
+               if wq2d is not None else None)
+        moms = _chunk_moments(wvec, wqc, mode, cb)
+        # Exhaustive scale grid + assignment in ONE fused batched pass.
+        s_c, err, enc, dec = _scan_and_assign(
+            moms, wvec, grid_s[r0:r1], mode, cb, grid, in_f, vec_per_group)
+        w_chunk = w2d[r0:r1]
+        wcol = (wq2d[r0:r1] if wq2d is not None else torch.ones_like(w_chunk))
+        for _ in range(refits):
+            num = _group_reduce(wcol * dec * w_chunk, grid)
+            den = _group_reduce(wcol * dec * dec, grid)
+            s_star = _snap_scale(
+                torch.where(den > 0, num / den.clamp_min(1e-30), s_c), grid)
+            err_star, enc_star, dec_star = _argmin_from_moments(
+                moms, wvec, s_star, mode, cb, grid, in_f, vec_per_group)
+            better = err_star < err
+            s_c = torch.where(better, s_star, s_c)
+            err = torch.where(better, err_star, err)
+            bvec = better.repeat_interleave(vec_per_group, dim=1).reshape(-1)
+            for key in enc:
+                cur, star = enc[key], enc_star[key]
+                mask = bvec if cur.dim() == 1 else bvec.reshape(
+                    (-1,) + (1,) * (cur.dim() - 1)).expand_as(cur)
+                enc[key] = torch.where(mask, star, cur)
+            belem = better.repeat_interleave(
+                (FP4_GROUP if grid == "fp4" else in_f), dim=1)
+            dec = torch.where(belem, dec_star, dec)
+        best_s[r0:r1] = s_c
+        enc_parts.append(enc)
+    enc = {key: torch.cat([e[key] for e in enc_parts], dim=0)
+           for key in enc_parts[0]}
     return best_s, enc
 
 
@@ -1075,7 +1178,12 @@ def _sweep_encode_two_tier_moment(w2d: torch.Tensor, mode: str, cb,
     with the E window centered on the s0-calibrated ideals (analytic init;
     pad 1 octave balanced / 0 fast), exact refits snapped to the frozen-E
     reachable set. Selection order and tie rules mirror the exact path
-    (strict <, first-legal wins)."""
+    (strict <, first-legal wins).
+
+    NOTE: layout-v2 is opt-in (CB_SCALE_CODING=v1 is the pipeline default and
+    the critical 27B/35B path); its W*16 windowed-entry search does not batch
+    cleanly (the launch-bound fix targets the v1 fp8 lane), so this keeps the
+    original bit-preserving structure."""
     rows, in_f = w2d.shape
     n_sb = in_f // SUPERBLOCK
     dev = str(w2d.device)
@@ -1107,8 +1215,7 @@ def _sweep_encode_two_tier_moment(w2d: torch.Tensor, mode: str, cb,
         wvec = w2d[r0:r1].reshape(-1, VEC_DIM)
         wqc = (wq2d[r0:r1].reshape(-1, VEC_DIM)
                if wq2d is not None else None)
-        moms = [_stream_moments(x, ws, t)
-                for (x, ws, t) in _mode_streams(wvec, mode, cb, wqc)]
+        moms = _chunk_moments(wvec, wqc, mode, cb)
 
         def entry_err(E, c):
             comp = compose[E, c]
