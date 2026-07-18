@@ -670,3 +670,9 @@ Roadmap to goal (live):
   foundations queued to the kernel owner post-v2-compose (sm_121 disassembly
   recon + buildable CUTLASS skeleton + kernel priority order; full build
   gated on the 27B verdict per Robert's amendment).
+- **Fifth + sixth fronts opened (goal-hook driven):** M4-hybrid empirical
+  expert cost implementation dispatched (formats agent, per its own
+  moe_cb_design spec — the last 35B critical-path code); DSv4-Flash CB-lane
+  readiness audit dispatched (new worker: fp8-source ingestion, 671B streaming,
+  profile/serving gaps, ultra-low-bpp menu design → dsv4_readiness.md).
+  35B MoE prep VERIFIED (167 tests green on HEAD).
