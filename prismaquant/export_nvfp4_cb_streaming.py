@@ -534,7 +534,9 @@ def export_nvfp4_cb_streaming(
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
     for aux in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
                 "special_tokens_map.json", "generation_config.json",
-                "vocab.json", "merges.txt", "chat_template.jinja"):
+                "vocab.json", "merges.txt", "chat_template.jinja",
+                "chat_template.json", "preprocessor_config.json",
+                "video_preprocessor_config.json", "processor_config.json"):
         p = model_dir / aux
         if p.exists():
             (out_dir / aux).write_bytes(p.read_bytes())

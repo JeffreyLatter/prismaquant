@@ -647,10 +647,18 @@ def export_nvfp4_cb(
         **({"codebook_file": codebook_file} if codebook_file else {}),
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
-    # Copy tokenizer / generation sidecars verbatim (best effort).
+    # Copy tokenizer / generation / multimodal sidecars verbatim (best effort).
+    # The multimodal preprocessor configs are REQUIRED for VLM checkpoints
+    # (e.g. Qwen3-VL): vLLM's input processor calls
+    # `image_processor.from_pretrained(model_dir)` at load and hard-fails
+    # without preprocessor_config.json — the artifact will not serve. Copy the
+    # chat template too so chat/tool serving matches the source.
     for aux in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
                 "special_tokens_map.json", "generation_config.json",
-                "vocab.json", "merges.txt"):
+                "vocab.json", "merges.txt",
+                "preprocessor_config.json", "video_preprocessor_config.json",
+                "processor_config.json", "chat_template.jinja",
+                "chat_template.json"):
         p = model_dir / aux
         if p.exists():
             (out_dir / aux).write_bytes(p.read_bytes())
