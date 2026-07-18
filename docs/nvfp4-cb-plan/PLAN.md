@@ -676,3 +676,12 @@ Roadmap to goal (live):
   readiness audit dispatched (new worker: fp8-source ingestion, 671B streaming,
   profile/serving gaps, ultra-low-bpp menu design → dsv4_readiness.md).
   35B MoE prep VERIFIED (167 tests green on HEAD).
+- **DSv4 AUDIT LANDED (c9a2c1b): NOT attemptable today — 9 gaps, ~900-1500 LoC,
+  dependency-ordered** (fp8-source ingestion invisible to the exporter; export
+  loads 295GB resident = OOM; no per-expert stacking/remap in the CB exporter;
+  plugin dense-only; TP-sharding of packed superblocks unproven; FP8_SOURCE
+  MISSING from the CB menu — real hole for fp8-native models). Queue effects:
+  serving agent reordered (plugin MoE method BEFORE CUTLASS foundations — it
+  blocks both 35B and DSv4); FP8_SOURCE menu fix queued to formats agent after
+  M4-hybrid. DSv4 source download deferred (disk: Hy3 has priority; no
+  co-download under the 10% rule).
