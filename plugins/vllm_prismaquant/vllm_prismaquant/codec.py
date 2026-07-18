@@ -23,6 +23,13 @@ FP8_ELEMENT_MAX = 448.0
 # E2M1 element grid (sorted ascending), for the fp4 activation RTN.
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
+# Two-tier v2 scale coding (docs/nvfp4-cb-plan/two-tier-scale-spec.md §1). Kept
+# in sync with prismaquant.nvfp4_cb_formats (the reference the kernel matches).
+SCALE_CODING_TWO_TIER = "two_tier"
+TWO_TIER_SUPER_BIAS = 127
+TWO_TIER_SUB_TABLE = (1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875,
+                      2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75)
+
 
 def type_size(k: int, is_fp4: bool) -> int:
     return 4 * int(k) + (16 if is_fp4 else 0)
@@ -34,6 +41,19 @@ def build_flat_codebook(sub_tables: list[torch.Tensor]) -> torch.Tensor:
     major, so entry (idx, local) sits at idx*sub_dim + local)."""
     return torch.cat([t.reshape(-1).to(torch.bfloat16).contiguous()
                       for t in sub_tables]).contiguous()
+
+
+def build_compose_table(sub_table) -> torch.Tensor:
+    """Two-tier v2 (docs/nvfp4-cb-plan/two-tier-scale-spec.md §1): the (256,16)
+    compose table ``T[c]·2^(E-127)`` flattened to (4096,) fp32, bit-exact to
+    ``nvfp4_cb_formats._two_tier_tables`` (float64 product -> fp32). The kernel
+    gathers ``compose[super_e*16 + code]`` per group — no resident fp32 plane
+    (spec §4/G4), just this 16 KiB constant table."""
+    T = torch.tensor(list(sub_table), dtype=torch.float64)
+    exps = torch.arange(256, dtype=torch.float64)
+    compose = (T[None, :] * torch.pow(2.0, exps[:, None] - 127.0)).to(
+        torch.float32)                                # (256, 16)
+    return compose.reshape(-1).contiguous()           # (4096,)
 
 
 def decode_fp4_scale_plane(qw: torch.Tensor, k: int) -> torch.Tensor:

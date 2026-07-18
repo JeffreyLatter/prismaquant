@@ -24,7 +24,7 @@ from vllm.model_executor.parameter import (
 )
 
 from . import codec
-from .expand import expand_cb_to_value
+from .expand import expand_cb_to_value, expand_fp4_v2_to_weight
 from .ops import cb_gemm
 
 # Fallback fused mapping if the config's packed_modules_mapping is unset.
@@ -55,6 +55,19 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         self.k = int(scheme["k"])
         self.n_sub = int(scheme["n_sub"])
         self.type_size = int(scheme["type_size"])
+        # Two-tier v2 scale coding (fp4 only) — absence of scale_coding ⇒ v1.
+        sc = scheme.get("scale_coding")
+        if isinstance(sc, dict):
+            self.is_v2 = sc.get("kind") == codec.SCALE_CODING_TWO_TIER
+            self._sub_table = sc.get("table") or codec.TWO_TIER_SUB_TABLE
+        elif isinstance(sc, str):
+            self.is_v2 = sc == codec.SCALE_CODING_TWO_TIER
+            self._sub_table = codec.TWO_TIER_SUB_TABLE
+        else:
+            self.is_v2 = False
+            self._sub_table = None
+        if self.is_v2 and not self.is_fp4:
+            raise ValueError(f"{prefix}: two-tier scale coding is fp4-only")
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
@@ -122,28 +135,52 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         layer._cb_qw_padded = codec.pad_qweight(qw)
         layer._cb_flat = cb_flat
         layer._cb_row_offset = cb_row_offset
-        if self.is_fp4:
+        dummy = torch.zeros(1, dtype=torch.float32, device=dev)
+        if self.is_fp4 and self.is_v2:
+            # v2: NO resident fp32 plane (spec §4/G4). The kernel composes the
+            # E4M3 scales in-register from the packed 9 bytes via this (256,16)
+            # table; the 9-byte plane stays inside cb_qweight.
+            layer._cb_compose = codec.build_compose_table(self._sub_table).to(dev)
+            layer._cb_scale = dummy
+        elif self.is_fp4:
             layer._cb_scale = codec.decode_fp4_scale_plane(qw, self.k).to(dev)
+            layer._cb_compose = dummy
         else:
             layer._cb_scale = layer.weight_scale.data.reshape(-1).to(
                 torch.float32)
+            layer._cb_compose = dummy
         layer._cb_N = qw.shape[0]
         layer._cb_K = layer._cb_input_size
 
     def apply(self, layer, x, bias=None):
         N, K = layer._cb_N, layer._cb_K
         M = x.reshape(-1, K).shape[0]
-        # NVFP4_CB (transient FP4 out of scope) and the decode regime (M small)
-        # keep the existing bf16-MMA Triton decode-GEMM path, unchanged.
-        if self.is_fp4 or M <= PREFILL_M_THRESHOLD:
-            if self.is_fp4:
-                xq = codec.fp4_group16_act_qdq(x)
-            else:
-                xq = codec.fp8_dynamic_act_qdq(x)
+        # Decode regime (M small), plus fp4-v1 which has no transient path yet
+        # (its v1 e4m3 plane is not composed during expansion) — Triton decode.
+        if M <= PREFILL_M_THRESHOLD or (self.is_fp4 and not self.is_v2):
+            xq = (codec.fp4_group16_act_qdq(x) if self.is_fp4
+                  else codec.fp8_dynamic_act_qdq(x))
             y = cb_gemm(xq, layer._cb_qw_padded, layer._cb_flat,
                         layer._cb_row_offset, layer._cb_scale,
-                        N, K, self.k, self.n_sub,
-                        self.type_size, self.is_fp4)
+                        layer._cb_compose, N, K, self.k, self.n_sub,
+                        self.type_size, self.is_fp4, self.is_v2)
+            if bias is not None:
+                y = y + bias
+            return y
+
+        if self.is_fp4:
+            # fp4 v2 prefill: transiently expand to a bf16 weight (value ×
+            # composed E4M3 v2 scale) and run one cuBLAS GEMM, amortising the
+            # decode over M — the fp4 counterpart of the fp8 transient. INV-1:
+            # the [N,K] tile is bounded to one layer, freed per forward. (bf16
+            # MMA — INV-2 waived; the FP4-MMA CUTLASS prefill is prototype iii.)
+            import torch.nn.functional as F
+            xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            W = expand_fp4_v2_to_weight(
+                layer._cb_qw_padded, layer._cb_flat, layer._cb_row_offset,
+                layer._cb_compose, N, K, self.k, self.n_sub, self.type_size)
+            y = F.linear(xq, W)
+            del W
             if bias is not None:
                 y = y + bias
             return y

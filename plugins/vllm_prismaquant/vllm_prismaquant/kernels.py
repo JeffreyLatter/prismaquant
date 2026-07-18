@@ -32,18 +32,19 @@ import triton.language as tl
 
 @triton.jit
 def _cb_decode_gemm_kernel(
-    x_ptr, qw_ptr, cb_ptr, cboff_ptr, scale_ptr, y_ptr,
+    x_ptr, qw_ptr, cb_ptr, cboff_ptr, scale_ptr, compose_ptr, y_ptr,
     M, N, K,
     stride_xm, stride_xk,
     stride_qn,                 # padded row stride (bytes) of qw
     stride_ym, stride_yn,
-    stride_sn,                 # scale-row stride (fp4 only; ignored for fp8)
+    stride_sn,                 # scale-row stride (fp4 v1 only; ignored otherwise)
     K_BITS: tl.constexpr,
     N_SUB: tl.constexpr,
     SUB_DIM: tl.constexpr,
     SUB_W: tl.constexpr,
     TYPE_SIZE: tl.constexpr,
     IS_FP4: tl.constexpr,
+    LAYOUT_V2: tl.constexpr,   # fp4 two-tier scale plane (9 B, in-kernel compose)
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -108,13 +109,30 @@ def _cb_decode_gemm_kernel(
         val = tl.load(cb_ptr + gather).to(tl.float32)             # [BN,256]
 
         if IS_FP4:
-            # 16 distinct group-16 scales per superblock: load once and
-            # broadcast each across its 16 columns (reshape [BN,16,16]->[BN,256]
-            # maps column kcol -> group kcol//16), ~16x fewer scale loads.
-            grpv = s * 16 + grp16v                                  # [16]
-            sc16 = tl.load(
-                scale_ptr + offs_n_i[:, None] * stride_sn + grpv[None, :],
-                mask=mask_n[:, None], other=0.0)                   # [BN,16]
+            # 16 distinct group-16 scales per superblock, broadcast across their
+            # 16 columns (reshape [BN,16,16]->[BN,256] maps column kcol ->
+            # group kcol//16).
+            if LAYOUT_V2:
+                # Two-tier v2 (two-tier-scale-spec.md §4a): compose the plane
+                # IN-KERNEL from the packed 9 bytes (1 E8M0 super + 8 sub nibble
+                # bytes) — NO resident fp32 plane (G4). scale_g = compose[E, c_g]
+                # via the (256,16) table; bit-exact to nvfp4_cb_reconstruct.
+                super_off = s * TYPE_SIZE + 4 * K_BITS
+                super_e = tl.load(qw_ptr + offs_n_i * stride_qn + super_off,
+                                  mask=mask_n, other=0).to(tl.int64)   # [BN]
+                sub_off = s * TYPE_SIZE + 4 * K_BITS + 1 + (grp16v // 2)  # [16]
+                nib = (grp16v % 2) * 4                                 # [16]
+                sub_byte = tl.load(
+                    qw_ptr + offs_n_i[:, None] * stride_qn + sub_off[None, :],
+                    mask=mask_n[:, None], other=0).to(tl.int64)       # [BN,16]
+                code16 = (sub_byte >> nib[None, :]) & 0xF             # [BN,16]
+                sc16 = tl.load(
+                    compose_ptr + super_e[:, None] * 16 + code16)     # [BN,16]
+            else:
+                grpv = s * 16 + grp16v                                # [16]
+                sc16 = tl.load(
+                    scale_ptr + offs_n_i[:, None] * stride_sn + grpv[None, :],
+                    mask=mask_n[:, None], other=0.0)                 # [BN,16]
             sc = tl.reshape(tl.broadcast_to(sc16[:, :, None],
                                             (BLOCK_N, 16, 16)), (BLOCK_N, 256))
             w = (val * sc).to(tl.bfloat16)
@@ -138,9 +156,11 @@ def cb_decode_linear(
     qw_padded: torch.Tensor,     # (N, row_bytes+8) uint8, +8 pad for the window
     cb_flat: torch.Tensor,       # (cb_total,) bf16 flat codebook(s), concatenated
     cb_row_offset: torch.Tensor,  # (N,) int32 per-row base into cb_flat
-    scale: torch.Tensor,         # fp4: (N, n_sb*16) fp32 ; fp8: (N,) fp32
+    scale: torch.Tensor,         # fp4 v1: (N, n_sb*16) fp32 ; fp8: (N,) fp32 ;
+                                 # fp4 v2: unused dummy
+    compose: torch.Tensor,       # fp4 v2: (4096,) fp32 compose table ; else dummy
     *, N: int, K: int,
-    k_bits: int, n_sub: int, type_size: int, is_fp4: bool,
+    k_bits: int, n_sub: int, type_size: int, is_fp4: bool, is_v2: bool = False,
 ) -> torch.Tensor:
     """Launch the decode-GEMM. Returns (..., N). M-gated: a small BLOCK_M for
     the decode regime (M<=16), a larger tile for prefill — mirrors GGUF's
@@ -157,16 +177,16 @@ def cb_decode_linear(
     block_m = 16 if M <= 16 else 64
     block_n = 64
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
-    stride_sn = scale.stride(0) if is_fp4 else 0
+    stride_sn = scale.stride(0) if (is_fp4 and not is_v2) else 0
     _cb_decode_gemm_kernel[grid](
-        x2, qw_padded, cb_flat, cb_row_offset, scale, y,
+        x2, qw_padded, cb_flat, cb_row_offset, scale, compose, y,
         M, N, K,
         x2.stride(0), x2.stride(1),
         qw_padded.stride(0),
         y.stride(0), y.stride(1),
         stride_sn,
         K_BITS=k_bits, N_SUB=n_sub, SUB_DIM=sub_dim, SUB_W=sub_w,
-        TYPE_SIZE=type_size, IS_FP4=is_fp4,
+        TYPE_SIZE=type_size, IS_FP4=is_fp4, LAYOUT_V2=is_v2,
         BLOCK_M=block_m, BLOCK_N=block_n,
         num_warps=4, num_stages=2,
     )

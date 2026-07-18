@@ -14,15 +14,16 @@ from .kernels import cb_decode_linear
 
 @torch.library.custom_op("prismaquant::cb_gemm", mutates_args=())
 def cb_gemm(x: torch.Tensor, qw_padded: torch.Tensor, cb_flat: torch.Tensor,
-            cb_row_offset: torch.Tensor, scale: torch.Tensor, N: int, K: int,
+            cb_row_offset: torch.Tensor, scale: torch.Tensor,
+            compose: torch.Tensor, N: int, K: int,
             k_bits: int, n_sub: int, type_size: int,
-            is_fp4: bool) -> torch.Tensor:
+            is_fp4: bool, is_v2: bool) -> torch.Tensor:
     return cb_decode_linear(x, qw_padded, cb_flat, cb_row_offset, scale,
-                            N=N, K=K, k_bits=k_bits, n_sub=n_sub,
-                            type_size=type_size, is_fp4=is_fp4)
+                            compose, N=N, K=K, k_bits=k_bits, n_sub=n_sub,
+                            type_size=type_size, is_fp4=is_fp4, is_v2=is_v2)
 
 
 @cb_gemm.register_fake
-def _cb_gemm_fake(x, qw_padded, cb_flat, cb_row_offset, scale, N, K, k_bits,
-                  n_sub, type_size, is_fp4):
+def _cb_gemm_fake(x, qw_padded, cb_flat, cb_row_offset, scale, compose, N, K,
+                  k_bits, n_sub, type_size, is_fp4, is_v2):
     return torch.empty((*x.shape[:-1], N), dtype=x.dtype, device=x.device)

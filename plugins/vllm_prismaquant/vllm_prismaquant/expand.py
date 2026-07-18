@@ -101,6 +101,98 @@ def _cb_expand_value_kernel(
     tl.store(w_out, val, mask=mask_n[:, None])
 
 
+@triton.jit
+def _cb_expand_weight_v2_kernel(
+    qw_ptr, cb_ptr, cboff_ptr, compose_ptr, w_ptr,
+    N, K,
+    stride_qn, stride_wn, stride_wk,
+    K_BITS: tl.constexpr, SUB_DIM: tl.constexpr, SUB_W: tl.constexpr,
+    TYPE_SIZE: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """fp4 two-tier v2 weight expander (spec §4b): decode the codebook value AND
+    compose the E4M3 group scale in-register from the packed 9-byte plane, write
+    the full ``value × scale`` bf16 weight tile into the transient ``[N,K]``
+    buffer. Same in-kernel compose as the decode kernel (bit-exact); the plane
+    is composed during expansion so the transient carries a ready E4M3-scaled
+    weight (a future CUTLASS block-scaled prefill would instead stage the
+    swizzled SF plane here — zero CUTLASS surgery). INV-1: bounded per layer."""
+    pid_n = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    offs_n_i = offs_n.to(tl.int64)
+
+    kcol = tl.arange(0, 256)
+    v_local = kcol // 8
+    coord = kcol % 8
+    sub = coord // SUB_DIM
+    local = coord % SUB_DIM
+    bitpos = v_local * K_BITS
+    byte_base = (bitpos // 8).to(tl.int64)
+    bit_in_byte = bitpos % 8
+    mask_k = (1 << K_BITS) - 1
+    shift_sub = sub * SUB_W
+    mask_sub = (1 << SUB_W) - 1
+    cb_base = sub * ((1 << SUB_W) * SUB_DIM)
+    grp16v = tl.arange(0, 16)
+    cb_off = tl.load(cboff_ptr + offs_n_i, mask=mask_n, other=0).to(tl.int64)
+
+    s = pid_s
+    col_byte = s * TYPE_SIZE + byte_base
+    code = tl.zeros((BLOCK_N, 256), dtype=tl.int64)
+    base_ptr = offs_n_i[:, None] * stride_qn + col_byte[None, :]
+    for i in range(0, 8):
+        b = tl.load(qw_ptr + base_ptr + i, mask=mask_n[:, None],
+                    other=0).to(tl.int64)
+        code = code | (b << (8 * i))
+    code = (code >> bit_in_byte[None, :]) & mask_k
+    sub_idx = (code >> shift_sub[None, :]) & mask_sub
+    gather = (cb_off[:, None] + cb_base[None, :] + sub_idx * SUB_DIM
+              + local[None, :])
+    val = tl.load(cb_ptr + gather).to(tl.float32)                 # [BN,256]
+
+    # v2 compose (bit-exact to the decode kernel / reconstruct).
+    super_off = s * TYPE_SIZE + 4 * K_BITS
+    super_e = tl.load(qw_ptr + offs_n_i * stride_qn + super_off,
+                      mask=mask_n, other=0).to(tl.int64)
+    sub_off = s * TYPE_SIZE + 4 * K_BITS + 1 + (grp16v // 2)
+    nib = (grp16v % 2) * 4
+    sub_byte = tl.load(
+        qw_ptr + offs_n_i[:, None] * stride_qn + sub_off[None, :],
+        mask=mask_n[:, None], other=0).to(tl.int64)
+    code16 = (sub_byte >> nib[None, :]) & 0xF
+    sc16 = tl.load(compose_ptr + super_e[:, None] * 16 + code16)   # [BN,16]
+    sc = tl.reshape(tl.broadcast_to(sc16[:, :, None], (BLOCK_N, 16, 16)),
+                    (BLOCK_N, 256))
+    w = (val * sc).to(tl.bfloat16)
+
+    xcols = (s * 256 + kcol).to(tl.int64)
+    tl.store(w_ptr + offs_n_i[:, None] * stride_wn + xcols[None, :] * stride_wk,
+             w, mask=mask_n[:, None])
+
+
+def expand_fp4_v2_to_weight(cb_qweight_padded, cb_flat, cb_row_offset, compose,
+                            N, K, k_bits, n_sub, type_size):
+    """Transient [N,K] bf16 weight (value × composed E4M3 scale) for a fp4 v2
+    layer — the prefill counterpart of the decode kernel, amortising the decode
+    over M via one cuBLAS bf16 GEMM. Bounded per-layer transient (INV-1)."""
+    if k_bits % n_sub != 0:
+        raise ValueError("expand supports even bit-splits only")
+    sub_dim = 8 // n_sub
+    sub_w = k_bits // n_sub
+    dev = cb_qweight_padded.device
+    W = torch.empty((N, K), dtype=torch.bfloat16, device=dev)
+    n_sb = K // 256
+    block_n = 64
+    grid = (triton.cdiv(N, block_n), n_sb)
+    _cb_expand_weight_v2_kernel[grid](
+        cb_qweight_padded, cb_flat, cb_row_offset, compose, W, N, K,
+        cb_qweight_padded.stride(0), W.stride(0), W.stride(1),
+        K_BITS=k_bits, SUB_DIM=sub_dim, SUB_W=sub_w, TYPE_SIZE=type_size,
+        BLOCK_N=block_n, num_warps=4)
+    return W
+
+
 def expand_cb_to_value(
     cb_qweight_padded: torch.Tensor,   # (N, row_bytes + 8) uint8, 8-byte pad
     cb_flat: torch.Tensor,             # (cb_total,) bf16 flat codebook(s)

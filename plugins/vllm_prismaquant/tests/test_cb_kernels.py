@@ -150,7 +150,8 @@ def test_gemm_matches_reconstruct(art, qname, M):
     qwp = codec.pad_qweight(packed)
     scale = (codec.decode_fp4_scale_plane(packed, k) if is_fp4
              else ws.reshape(-1))
-    y = cb_decode_linear(x, qwp, cb_flat, cb_row_offset, scale, N=N, K=K,
+    y = cb_decode_linear(x, qwp, cb_flat, cb_row_offset, scale,
+                         torch.zeros(1, device=DEV), N=N, K=K,
                          k_bits=k, n_sub=n_sub, type_size=ts, is_fp4=is_fp4)
 
     rel = (y.float() - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
@@ -193,7 +194,8 @@ def test_fused_row_offset():
     scale = codec.decode_fp4_scale_plane(packed, k)
     torch.manual_seed(1)
     x = torch.randn(8, K, dtype=torch.bfloat16, device=DEV)
-    y = cb_decode_linear(x, qwp, cb_flat, off, scale, N=Na + Nb, K=K,
+    y = cb_decode_linear(x, qwp, cb_flat, off, scale,
+                         torch.zeros(1, device=DEV), N=Na + Nb, K=K,
                          k_bits=k, n_sub=n_sub, type_size=ts, is_fp4=is_fp4)
     y_ref = x.float() @ w_ref.float().t()
     rel = (y.float() - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
