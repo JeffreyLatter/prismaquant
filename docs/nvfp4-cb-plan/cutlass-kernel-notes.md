@@ -1,5 +1,30 @@
 # CUTLASS serving-kernel — grounding map (2026-07-18)
 
+> **STATUS UPDATE (2026-07-19 kernel session).** Build steps 1 and 3 of the
+> sequence below are DONE and served; step 2 (fused prefill) is the open
+> piece.
+> - **Decode: SOLVED at native parity.** CUDA dequant-GEMV
+>   (`csrc/cb_gemv.cu`, fused act-QDQ, E4M3-byte LUT, warp-per-superblock):
+>   served 27B decode 4.20 → **10.28 tok/s** (AURA 10.26), 250–355 GB/s
+>   effective. M-gated: CUDA for M≤8, Triton 9–16, transient expand above.
+> - **Prefill: 1.622 → 1.075 s** (fp8-direct expand + CUDA expander at 2× the
+>   Triton one). Remaining 0.33 s vs AURA's 0.746 is the transient
+>   write+read traffic — the fused prologue below is the only remover.
+>   N-chunked overlap REJECTED (0.46×, not bit-exact: `cutlass_scaled_mm`
+>   reconfigures on narrow N).
+> - **Baseline-parity gate PASSED** (`csrc/sm120_fp8_gemm.cu`): sm120
+>   CollectiveBuilder fp8 GEMM from the vendored headers at 0.91–0.99× of
+>   vLLM's `cutlass_scaled_mm` on 27B shapes. Fork target for FP8_CB =
+>   `sm120_mma_tma.hpp` (copied to `csrc/cutlass_fork/sm120_mma_tma_orig.hpp`);
+>   B-tile packed bytes are a CONTIGUOUS per-row slice for 128/256-wide
+>   K-tiles (codewords are ordered LSB-first), so the packed tile is
+>   TMA-loadable; decode goes producer-side into the SmemLayoutB staging.
+> - **Measurement landmine found:** loading ANY extra CUDA extension into the
+>   serving process shifts allocator addresses → alignment-sensitive dispatch
+>   drift elsewhere → conf-KL evaluation sensitivity ±17% on the 27B (both
+>   readings −45%+ vs AURA). This is the mechanism of the documented
+>   cross-session KL drift. Compare arms with identical extension residency.
+
 Concrete starting map for the CB serving kernels, after the 27B served verdict
 proved quality (−58% KL at matched bpp) but exposed the speed gap (2.2× prefill,
 2.4× decode vs native AURA). This is the working brief for the multi-session

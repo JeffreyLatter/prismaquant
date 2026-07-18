@@ -96,6 +96,43 @@ serving a hybrid VLM + GDN on metal surfaced all three:
   "2+2 equals" → " 4.").
 - Next model classes per the goal: 35B MoE, then Hy3/DSv4 ultra-low-bpp.
 
+## Addendum — CUDA kernel session (2026-07-18/19): decode at native parity
+
+The kernel workstream (CUDA decode-GEMV + fused act-QDQ + CUDA transient
+expander + fp8-direct expand; commits c5741ad..) closed the decode gap and
+~40% of the prefill gap. Same artifact, same harness, `--enforce-eager`:
+
+| | TTFT(1400) | decode tok/s |
+|---|---|---|
+| AURA-5.5 (native) | **0.746 s** | 10.26 |
+| OURS Triton prototype-i (the old row) | 1.622 s | 4.20 |
+| OURS + fp8-direct expand | 1.222 s | 4.23 |
+| **OURS + CUDA GEMV + CUDA expander (now)** | **1.075 s** | **10.27–10.30** |
+
+- **Decode 4.20 → 10.28 (2.45×): AT/ABOVE native AURA** (10.26). The GEMV is
+  bandwidth-bound (250–355 GB/s effective per layer); at matched body bytes
+  (16.71 GB both) parity IS the ceiling — reached.
+- **Prefill 1.622 → 1.075 s**: fp8-direct expand (−25%) + CUDA expander 2×
+  (61–86 → 123–132 GB/s; expand now ~34% of serial prefill). The remaining
+  0.33 s vs AURA is the transient's write+read traffic — only the fused
+  decode-in-prologue CUTLASS kernel removes it (baseline-parity gate for that
+  fork PASSED: sm120 CollectiveBuilder fp8 GEMM from vendored headers runs at
+  0.91–0.99× of vLLM's `cutlass_scaled_mm`).
+- N-chunked expand+GEMM overlap was tried and REJECTED: 0.46× and not
+  bit-exact (`cutlass_scaled_mm` changes config on narrow N).
+
+**KL preserved — with a measurement-arithmetic caveat worth recording.** The
+dump reproduces conf-KL 0.01134 / ALL 0.0134 / PPL 9.166 bit-for-bit across
+sessions when the serving process matches the original arithmetic state, and
+reads 0.01328 / 0.0142 / 9.189 when the CUDA extension is resident during the
+dump. The cause is NOT the CB kernels (both prefill paths are bit-identical
+offline, pinned by tests): loading the extension shifts allocator addresses →
+alignment-sensitive dispatch elsewhere in the model → global reassociation-
+level drift. This is the concrete mechanism of the known cross-session KL
+drift; conf-KL on this artifact has ±17% evaluation sensitivity. Under either
+reading the verdict is unchanged: −45% to −53% conf-KL vs AURA (0.02407),
+ALL-KL −56 to −58%, PPL gap to BF16 2–3× smaller.
+
 ## Addendum — CUDA-graph decode experiment (2026-07-18)
 Tested serving OURS WITHOUT `--enforce-eager` (let vLLM capture decode graphs):
 
