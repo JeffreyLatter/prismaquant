@@ -745,3 +745,12 @@ Roadmap to goal (live):
   Fix dispatched to menu agent (profile-based nested-prefix name resolver;
   affects Hy3/DSv4 too) → re-export (~30-45min) → A/B. Sole-owner rule lifted
   for this final sequential export→A/B (no concurrent process to race).
+- **Goal-progress while 27B re-exports (fleet-discipline respected — 1 low-
+  contention CODE task, no GPU/full-suite):** streaming CB exporter dispatched
+  (formats agent) — the 200-300B milestone's #1 prerequisite (DSv4 audit gap 2:
+  in-memory export OOMs at 295-557GB). New sibling export_nvfp4_cb_streaming.py
+  mirroring export_gguf_direct's _ShardIndex lazy-load; bf16-source (Hy3, on
+  disk) first, fp8-source (DSv4) branch flagged; MoE expert streaming; byte-
+  identical-to-in-memory correctness pin. Unblocks Hy3/DSv4 export; GPU build
+  waits for the box. 35B build + Hy3/DSv4 builds remain GPU-gated behind the
+  27B verdict (imminent) — correct sequencing, not idle.
