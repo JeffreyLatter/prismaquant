@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
+import os
 import pickle
+import re
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
@@ -41,9 +44,20 @@ import torch
 import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
+from prismaquant.emu_forward_kl import _qdq_accepts_col_weights
 
 SCHEMA = "prismaquant.expert_empirical_cost.v1"
 PASSTHROUGH_FORMATS = {"BF16", "FP8_SOURCE"}
+# CB families render the WHOLE stack in one qdq call (the export convention:
+# fp4 derives one per-stack global; fp8 per-row scales) — measured render ==
+# shipped bytes, never chunked (moe_cb_design.md §3).
+_CB_FAMILIES = {"nvfp4_cb", "fp8_cb"}
+_CB_K_RE = re.compile(r"^NVFP4_CB_K(\d+)$")
+# RD-law ladder interpolation (moe_cb_design.md §3.4): D(k) = C * 2^(-k/4),
+# validated +-3% on weighted-recon at 0.6B but UNPROVEN on unit-KL — so it is
+# opt-in and holdout-gated PER UNIT (a failed holdout falls back to full
+# measurement for that unit).
+_LADDER_SLOPE_BITS = 0.25
 
 
 def _log(msg: str) -> None:
@@ -80,6 +94,61 @@ def _baseline_logprobs(model, calib_ids: torch.Tensor) -> list[torch.Tensor]:
 
 
 @torch.no_grad()
+def _quantize_unit_inplace(
+    mod,
+    param_names: Sequence[str],
+    fmt: str,
+    *,
+    expert_chunk: int = 16,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    unit_qname: str = "",
+) -> None:
+    """Render every member of one expert serving unit in-place in ``fmt``.
+
+    CB families use the imatrix-WEIGHTED VQ render on the whole stack (the
+    exporter convention — measuring an unweighted render while the exporter
+    ships weighted bytes is the rendering-confound class, so a CB format
+    with no col_weights entry for a member hard-fails; the encode tier is
+    inherited from PRISMAQUANT_CB_ENCODE_TIER via the registry closure).
+    """
+    spec = fr.get_format(fmt)
+    qdq = spec.quantize_dequantize
+    weighted = _qdq_accepts_col_weights(spec)
+    for pn in param_names:
+        w = getattr(mod, pn).data
+        full = f"{unit_qname}.{pn}" if unit_qname else pn
+        if spec.family in _CB_FAMILIES:
+            cw = (col_weights or {}).get(full)
+            if weighted and cw is None:
+                raise ValueError(
+                    f"{full}: CB format {fmt} needs a col_weights entry — "
+                    f"the deliberate CB render is imatrix-weighted; an "
+                    f"unweighted unit-KL would measure bytes the exporter "
+                    f"never ships (pass --col-weights)")
+            w.copy_(qdq(
+                w.float(), col_weights=cw.to(w.device)).to(w.dtype))
+        elif spec.family == "nv":
+            # NV formats derive one per-TENSOR global scale from
+            # whatever slice they are given, while export ships one
+            # global PER EXPERT. Chunk-batching would share a global
+            # across the chunk and make the measured KL depend on the
+            # --expert-chunk knob; quantize per expert slice instead
+            # (mirrors measure_quant_cost._batched_quantize, which does
+            # the per-slice loop for exactly this reason).
+            for e in range(w.shape[0]):
+                w[e] = qdq(w[e].float()).to(w.dtype)
+        else:
+            # Scale-local formats are chunk-invariant, so batching is
+            # safe: FP8_E4M3/FP8_E5M2 reshape to (-1, in) and scale each
+            # output row independently (fp8_dynamic_weight_qdq), and
+            # group/block-scaled formats (MX) never cross the expert
+            # boundary within a row.
+            for e in range(0, w.shape[0], expert_chunk):
+                w[e:e + expert_chunk] = qdq(
+                    w[e:e + expert_chunk].float()).to(w.dtype)
+
+
+@torch.no_grad()
 def _unit_kl(
     model,
     calib_ids: torch.Tensor,
@@ -89,33 +158,15 @@ def _unit_kl(
     fmt: str,
     *,
     expert_chunk: int = 16,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    unit_qname: str = "",
 ) -> float:
-    """Mean-token KL(BF16 || model-with-this-unit-RTN-quantized)."""
-    spec = fr.get_format(fmt)
-    qdq = spec.quantize_dequantize
+    """Mean-token KL(BF16 || model-with-this-unit-quantized)."""
     originals = {pn: getattr(mod, pn).data.clone() for pn in param_names}
     try:
-        for pn in param_names:
-            w = getattr(mod, pn).data
-            if spec.family == "nv":
-                # NV formats derive one per-TENSOR global scale from
-                # whatever slice they are given, while export ships one
-                # global PER EXPERT. Chunk-batching would share a global
-                # across the chunk and make the measured KL depend on the
-                # --expert-chunk knob; quantize per expert slice instead
-                # (mirrors measure_quant_cost._batched_quantize, which does
-                # the per-slice loop for exactly this reason).
-                for e in range(w.shape[0]):
-                    w[e] = qdq(w[e].float()).to(w.dtype)
-            else:
-                # Scale-local formats are chunk-invariant, so batching is
-                # safe: FP8_E4M3/FP8_E5M2 reshape to (-1, in) and scale each
-                # output row independently (fp8_dynamic_weight_qdq), and
-                # group/block-scaled formats (MX) never cross the expert
-                # boundary within a row.
-                for e in range(0, w.shape[0], expert_chunk):
-                    w[e:e + expert_chunk] = qdq(
-                        w[e:e + expert_chunk].float()).to(w.dtype)
+        _quantize_unit_inplace(
+            mod, param_names, fmt, expert_chunk=expert_chunk,
+            col_weights=col_weights, unit_qname=unit_qname)
         total = 0.0
         n_tok = 0
         for i in range(calib_ids.shape[0]):
@@ -130,6 +181,40 @@ def _unit_kl(
             getattr(mod, pn).data.copy_(originals[pn])
 
 
+def _cb_ladder_split(measured_fmts: Sequence[str]):
+    """Split the menu's NVFP4_CB_K ladder into (anchors, holdout, predicted)
+    for RD-law interpolation. Returns None when the ladder is too short to
+    pay (< 5 K-rungs: anchors+holdout would measure everything anyway)."""
+    kmap = {f: int(m.group(1)) for f in measured_fmts
+            if (m := _CB_K_RE.match(f))}
+    if len(kmap) < 5:
+        return None
+    by_k = sorted(kmap, key=kmap.get)
+    anchors = [by_k[0], by_k[len(by_k) // 2], by_k[-1]]
+    rest = [f for f in by_k if f not in anchors]
+    holdout = rest[len(rest) // 2]
+    predicted = [f for f in rest if f != holdout]
+    return kmap, anchors, holdout, predicted
+
+
+def _cb_ladder_fit(kls: Mapping[str, float], kmap: Mapping[str, int],
+                   anchors: Sequence[str], holdout: str,
+                   predicted: Sequence[str], tol: float):
+    """Fit log2 D = log2 C - k/4 on the anchors; accept iff the holdout's
+    relative error <= tol. Returns (predicted_kls | None, holdout_rel_err)."""
+    logc = sum(
+        math.log2(max(kls[f], 1e-12)) + _LADDER_SLOPE_BITS * kmap[f]
+        for f in anchors) / len(anchors)
+
+    def pred(f):
+        return float(2.0 ** (logc - _LADDER_SLOPE_BITS * kmap[f]))
+
+    rel = abs(pred(holdout) - kls[holdout]) / max(kls[holdout], 1e-12)
+    if rel > tol:
+        return None, rel
+    return {f: pred(f) for f in predicted}, rel
+
+
 def measure_expert_unit_costs(
     model,
     profile,
@@ -138,6 +223,9 @@ def measure_expert_unit_costs(
     *,
     expert_chunk: int = 16,
     progress: bool = True,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    ladder_interp: bool = False,
+    ladder_tol: float = 0.10,
 ) -> tuple[dict, dict, dict]:
     """Measure per-serving-unit empirical KL costs for packed-MoE experts.
 
@@ -166,17 +254,46 @@ def measure_expert_unit_costs(
         return stats, costs, unit_kls
 
     baseline = _baseline_logprobs(model, calib_ids)
+    ladder = _cb_ladder_split(measured_fmts) if ladder_interp else None
     for qn, mod in units:
         pnames = list(_packed_experts_param_names(mod, profile))
         n_params_unit = sum(int(getattr(mod, pn).numel()) for pn in pnames)
         num_experts = int(getattr(mod, pnames[0]).shape[0])
-        kls = {
-            fmt: _unit_kl(
+
+        def kl_of(fmt):
+            return _unit_kl(
                 model, calib_ids, baseline, mod, pnames, fmt,
-                expert_chunk=expert_chunk)
-            for fmt in measured_fmts
-        }
-        unit_kls[qn] = kls
+                expert_chunk=expert_chunk, col_weights=col_weights,
+                unit_qname=qn)
+
+        if ladder is None:
+            kls = {fmt: kl_of(fmt) for fmt in measured_fmts}
+        else:
+            kmap, anchors, holdout, predicted = ladder
+            kls = {fmt: kl_of(fmt) for fmt in measured_fmts
+                   if fmt not in predicted}
+            pred_kls, rel = _cb_ladder_fit(
+                kls, kmap, anchors, holdout, predicted, ladder_tol)
+            if pred_kls is None:
+                # Holdout gate FAILED for this unit: fall back to full
+                # measurement (the law is recon-validated, KL-unproven).
+                if progress:
+                    _log(f"  {qn}: ladder holdout rel_err {rel:.1%} > "
+                         f"{ladder_tol:.0%} — measuring all rungs")
+                kls.update({fmt: kl_of(fmt) for fmt in predicted})
+                kls["_ladder"] = {"accepted": False,
+                                  "holdout_rel_err": round(rel, 4)}
+            else:
+                kls.update(pred_kls)
+                kls["_ladder"] = {
+                    "accepted": True, "holdout_rel_err": round(rel, 4),
+                    "anchors": anchors, "holdout": holdout,
+                    "predicted": predicted,
+                }
+        ladder_meta = kls.pop("_ladder", None)
+        unit_kls[qn] = dict(kls)
+        if ladder_meta is not None:
+            unit_kls[qn]["_ladder"] = ladder_meta
         for pn in pnames:
             tensor = getattr(mod, pn)
             npm = int(tensor.numel())
@@ -226,22 +343,37 @@ def merge_cost_payloads(
     expert_costs: Mapping[str, object],
     *,
     formats: Sequence[str],
+    replace_experts: bool = False,
 ) -> dict:
-    """Union AURA non-expert rows with empirical expert rows.
+    """Union base non-expert rows with empirical expert rows.
 
-    Collisions are an error: aura_cost must have been run with
-    ``--allow-packed-expert-omission`` (its guard fail-fasts otherwise), so
-    no name may be costed by both estimators.
+    AURA lane (``replace_experts=False``): collisions are an error —
+    aura_cost must have been run with ``--allow-packed-expert-omission``
+    (its guard fail-fasts otherwise), so no name may be costed by both
+    estimators.
+
+    CB lane (``replace_experts=True``): the COST_MODE=local payload DOES
+    cost the expert stacks (smoothly — route-flip-blind); those rows are
+    REPLACED by the empirical ones and recorded in provenance, non-expert
+    rows stay untouched (moe_cb_design.md §3).
     """
     merged = dict(base)
     base_stats = dict(base.get("stats", {}) or {})
     base_costs = dict(base.get("costs", {}) or {})
     overlap = set(base_costs) & set(expert_costs)
-    if overlap:
+    if overlap and not replace_experts:
         raise RuntimeError(
             f"hybrid merge collision: {len(overlap)} names costed by BOTH "
             f"the base payload and the expert empirical pass (e.g. "
-            f"{sorted(overlap)[:3]}). The base run must omit packed experts.")
+            f"{sorted(overlap)[:3]}). The base run must omit packed experts "
+            f"(or pass replace_experts for the CB-lane replace semantics).")
+    if overlap:
+        for name in overlap:
+            base_costs.pop(name)
+            base_stats.pop(name, None)
+        prov = dict(merged.get("provenance", {}) or {})
+        prov["replaced_smooth_expert_rows"] = sorted(overlap)
+        merged["provenance"] = prov
     base_stats.update(expert_stats)
     base_costs.update(expert_costs)
     merged["stats"] = base_stats
@@ -275,7 +407,7 @@ def backfill_missing_from_base(
     return sorted(added)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Empirical packed-MoE expert cost (+ hybrid merge)")
     p.add_argument("--model", required=True)
@@ -303,8 +435,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--backfill-base", default=None,
         help="Baseline incremental cost pkl; rows for names still missing "
         "after the merge (MTP/visual sidecars) are copied from it.")
+    p.add_argument(
+        "--replace-experts", action="store_true",
+        help="CB-lane merge semantics: the COST_MODE=local base payload "
+        "costs expert stacks smoothly (route-flip-blind); REPLACE those "
+        "rows with the empirical ones (recorded in provenance) instead of "
+        "treating the collision as an error.")
+    p.add_argument(
+        "--col-weights", default=None,
+        help="Pickle {qname: per-input-column importance} (the CB "
+        "exporter's imatrix). REQUIRED when the menu contains CB formats: "
+        "their deliberate render is imatrix-weighted, and the measured "
+        "unit-KL must be of the bytes the exporter ships.")
+    p.add_argument(
+        "--cb-ladder-interp", action="store_true",
+        help="RD-law ladder interpolation for NVFP4_CB_K rungs (measure "
+        "anchors + holdout, predict the rest; holdout-gated PER UNIT). "
+        "Also enabled by PRISMAQUANT_CB_LADDER_INTERP=1. Default OFF — "
+        "the law is recon-validated but KL-unproven (encode_tiers.md §B).")
+    p.add_argument("--ladder-holdout-tol", type=float, default=0.10,
+                   help="Max holdout relative error to accept a unit's "
+                   "ladder fit; above it the unit measures every rung.")
     p.add_argument("--device", default="cuda")
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
 
     from prismaquant.gpu_guard import require_cuda_hot_path
     require_cuda_hot_path("expert_empirical_cost", args.device)
@@ -346,8 +503,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     formats = _canon_formats(
         [f for f in args.formats.split(",") if f.strip()])
+    col_weights = None
+    if args.col_weights:
+        with open(args.col_weights, "rb") as fh:
+            col_weights = {k: torch.as_tensor(v)
+                           for k, v in pickle.load(fh).items()}
+    ladder_interp = bool(args.cb_ladder_interp) or (
+        os.environ.get("PRISMAQUANT_CB_LADDER_INTERP", "0") == "1")
     stats, costs, unit_kls = measure_expert_unit_costs(
-        model, profile, calib, formats, expert_chunk=args.expert_chunk)
+        model, profile, calib, formats, expert_chunk=args.expert_chunk,
+        col_weights=col_weights, ladder_interp=ladder_interp,
+        ladder_tol=args.ladder_holdout_tol)
 
     provenance = {
         "schema": SCHEMA,
@@ -363,13 +529,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "unit_kls": unit_kls,
         "formats_measured": [
             f for f in formats if f not in PASSTHROUGH_FORMATS],
+        "col_weights": args.col_weights,
+        "cb_ladder_interp": ladder_interp,
+        "encode_tier": os.environ.get("PRISMAQUANT_CB_ENCODE_TIER"),
     }
 
     if args.merge_base:
         with open(args.merge_base, "rb") as fh:
             base = pickle.load(fh)
         payload = merge_cost_payloads(
-            base, stats, costs, formats=formats)
+            base, stats, costs, formats=formats,
+            replace_experts=bool(args.replace_experts))
         prov = dict(payload.get("provenance", {}) or {})
         prov["expert_empirical_cost"] = provenance
         prov["merge_base"] = args.merge_base

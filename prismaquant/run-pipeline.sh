@@ -907,6 +907,75 @@ PY
   fi
 fi
 
+# [2d-CB] CB-lane hybrid: COST_MODE=local's weighted-recon cost is
+# route-flip-blind on routed experts exactly like AURA's smooth cost
+# (moe_cb_design.md §2) — REPLACE the expert-stack rows with measured
+# empirical unit-KL, non-experts keep the local CB costs. No-op (beyond a
+# model load) on dense models: zero packed-expert units -> the merged
+# payload is the base unchanged. CB_EXPERT_EMPIRICAL=0 opts out.
+if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" \
+   && "${CB_EXPERT_EMPIRICAL:-1}" == "1" ]]; then
+  CB_LOCAL_RAW="${WORK_DIR}/artifacts/cost_local_raw.pkl"
+  : "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
+  : "${CB_EXPERT_NSAMPLES:=16}"
+  : "${CB_EXPERT_SEQLEN:=512}"
+  CB_MERGED="$(python3 - "$COST_PATH" <<'PY'
+import pickle, sys
+try:
+    payload = pickle.load(open(sys.argv[1], "rb"))
+    print(1 if "expert_empirical_cost" in (
+        payload.get("provenance", {}) or {}) else 0)
+except Exception:
+    print(0)
+PY
+)"
+  if [[ "$CB_MERGED" != "1" ]]; then
+    # The empirical pass renders CB candidates imatrix-WEIGHTED — harvest
+    # the col-weights now (same skip-if-exists block as the [4/4] exporter;
+    # measured cost and shipped bytes stay the one weighted render).
+    if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
+      echo "[pipeline] [2d-CB] harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
+      CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" python3 - <<'PY'
+import os, pickle
+from prismaquant.export_gguf import build_imatrix_from_act_cache
+act_dir = os.environ["CB_ACT_DIR"]
+out = os.environ["CB_COL_WEIGHTS"]
+cw = build_imatrix_from_act_cache(act_dir)
+if not cw:
+    raise SystemExit(
+        f"[pipeline] ERROR: no activation cache under {act_dir!r}; the "
+        f"empirical expert pass needs a col-weights vector per CB target.")
+os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+with open(out, "wb") as fh:
+    pickle.dump(cw, fh)
+print(f"[pipeline] [2d-CB] wrote {out}: {len(cw)} Linears")
+PY
+    fi
+    if [[ ! -f "$CB_LOCAL_RAW" ]]; then
+      mv "$COST_PATH" "$CB_LOCAL_RAW"
+    fi
+    echo "[pipeline] [2d-CB] measuring empirical packed-expert unit-KL (CB hybrid; replace semantics) ..."
+    CB_LADDER_ARGS=()
+    if [[ "${CB_LADDER_INTERP:-0}" == "1" ]]; then
+      CB_LADDER_ARGS+=(--cb-ladder-interp)
+    fi
+    python3 -m prismaquant.expert_empirical_cost \
+      --model "$MODEL_PATH" \
+      --output "$COST_PATH" \
+      --formats "$FORMATS" \
+      --dataset "$DATASET" \
+      --n-calib-samples "$CB_EXPERT_NSAMPLES" \
+      --calib-seqlen "$CB_EXPERT_SEQLEN" \
+      --merge-base "$CB_LOCAL_RAW" \
+      --replace-experts \
+      --col-weights "$CB_COL_WEIGHTS" \
+      "${CB_LADDER_ARGS[@]}" \
+      2>&1 | tee "${WORK_DIR}/logs/expert_empirical_cost_cb.log"
+  else
+    echo "[pipeline] [2d-CB] CB hybrid cost already merged, skipping"
+  fi
+fi
+
 # -----------------------------------------------------------------------
 # 3. Allocator (multi-choice knapsack over per-layer formats)
 # -----------------------------------------------------------------------

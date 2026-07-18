@@ -1231,3 +1231,147 @@ def test_exporter_rejects_wrong_expert_col_weights(export_dir):
     cw = {"model.layers.0.mlp.experts.down_proj": torch.rand(2, 1, 256)}
     with pytest.raises(ValueError, match="col_weights"):
         export_nvfp4_cb(mdl, apath, out, cw, device="cpu")
+
+
+# ===========================================================================
+# M4-hybrid empirical expert cost for the CB lane (moe_cb_design.md §3).
+# ===========================================================================
+
+def _mk_cost_row(fmt_costs):
+    return {f: {"predicted_dloss": v, "cost_source": "local"}
+            for f, v in fmt_costs.items()}
+
+
+def test_expert_empirical_merge_replaces_expert_rows():
+    from prismaquant.expert_empirical_cost import merge_cost_payloads
+
+    exp_name = "model.layers.0.mlp.experts.gate_up_proj"
+    dense_name = "model.layers.0.self_attn.q_proj"
+    base = {
+        "stats": {exp_name: {"h_trace": 1.0}, dense_name: {"h_trace": 2.0}},
+        "costs": {exp_name: _mk_cost_row({"NVFP4_CB_K16": 9.9}),
+                  dense_name: _mk_cost_row({"NVFP4_CB_K16": 0.5})},
+        "provenance": {"origin": "local"},
+    }
+    e_stats = {exp_name: {"h_trace": 0.0, "n_params": 10}}
+    e_costs = {exp_name: {"NVFP4_CB_K16": {
+        "predicted_dloss": 0.123, "cost_source": "empirical_unit_kl"}}}
+
+    # CB lane: replace semantics — expert row swapped, dense untouched,
+    # provenance records the replacement, allocator payload keys intact.
+    merged = merge_cost_payloads(base, e_stats, e_costs,
+                                 formats=["NVFP4_CB_K16", "BF16"],
+                                 replace_experts=True)
+    assert merged["costs"][exp_name]["NVFP4_CB_K16"][
+        "cost_source"] == "empirical_unit_kl"
+    assert merged["costs"][dense_name]["NVFP4_CB_K16"][
+        "predicted_dloss"] == 0.5
+    assert merged["stats"][exp_name]["h_trace"] == 0.0
+    assert merged["provenance"]["replaced_smooth_expert_rows"] == [exp_name]
+    assert merged["provenance"]["origin"] == "local"
+    assert merged["formats"] == ["NVFP4_CB_K16", "BF16"]
+    # AURA lane: the same collision is an error without the flag.
+    with pytest.raises(RuntimeError, match="collision"):
+        merge_cost_payloads(base, e_stats, e_costs,
+                            formats=["NVFP4_CB_K16"])
+
+
+class _UnitHolder(torch.nn.Module):
+    def __init__(self, w):
+        super().__init__()
+        self.gate_up_proj = torch.nn.Parameter(w, requires_grad=False)
+
+
+def test_expert_empirical_cb_weighted_render_inplace():
+    from prismaquant.expert_empirical_cost import _quantize_unit_inplace
+
+    torch.manual_seed(20)
+    w = (torch.randn(3, 16, 256) * 0.02).to(torch.bfloat16)
+    cw = torch.rand(3, 1, 256) + 0.05
+    qn = "model.layers.0.mlp.experts"
+    full = f"{qn}.gate_up_proj"
+
+    mod = _UnitHolder(w.clone())
+    _quantize_unit_inplace(mod, ["gate_up_proj"], "NVFP4_CB_K16",
+                           col_weights={full: cw}, unit_qname=qn)
+    direct = cb.make_nvfp4_cb_qdq(16, "fp4", "product")(
+        w.float(), cw).to(torch.bfloat16)
+    assert torch.equal(mod.gate_up_proj.data, direct)
+
+    # missing col_weights for a CB format is the rendering confound: raise.
+    with pytest.raises(ValueError, match="col_weights"):
+        _quantize_unit_inplace(_UnitHolder(w.clone()), ["gate_up_proj"],
+                               "NVFP4_CB_K16", col_weights={},
+                               unit_qname=qn)
+    # scalar-family formats keep the chunked unweighted path.
+    mod2 = _UnitHolder(w.clone())
+    _quantize_unit_inplace(mod2, ["gate_up_proj"], "FP8_E4M3",
+                           col_weights=None, unit_qname=qn)
+    assert not torch.equal(mod2.gate_up_proj.data, w)
+
+
+def test_expert_empirical_tier_inheritance(monkeypatch):
+    from prismaquant.expert_empirical_cost import _quantize_unit_inplace
+
+    torch.manual_seed(21)
+    w = (torch.randn(2, 16, 256) * 0.02).to(torch.bfloat16)
+    cw = torch.rand(256) + 0.05
+    qn = "u"
+    outs = {}
+    for tier in ("max", "fast"):
+        monkeypatch.setenv(cb._ENCODE_TIER_ENV, tier)
+        mod = _UnitHolder(w.clone())
+        _quantize_unit_inplace(mod, ["gate_up_proj"], "NVFP4_CB_K16",
+                               col_weights={f"{qn}.gate_up_proj": cw},
+                               unit_qname=qn)
+        outs[tier] = mod.gate_up_proj.data.clone()
+    # the registry closure resolves the env per call: tiers render
+    # differently (fast's analytic search vs max's exhaustive sweep).
+    assert not torch.equal(outs["max"], outs["fast"])
+
+
+def test_cb_ladder_split_and_fit():
+    from prismaquant.expert_empirical_cost import (
+        _cb_ladder_fit,
+        _cb_ladder_split,
+    )
+
+    fmts = [f"NVFP4_CB_K{k}" for k in (12, 14, 16, 20, 24)] + ["FP8_CB_K44"]
+    kmap, anchors, holdout, predicted = _cb_ladder_split(fmts)
+    assert set(anchors) == {"NVFP4_CB_K12", "NVFP4_CB_K16", "NVFP4_CB_K24"}
+    assert holdout in predicted or holdout not in anchors
+    assert "FP8_CB_K44" not in kmap          # non-K-ladder formats excluded
+    # exact RD law -> holdout accepted, predictions exact.
+    kls = {f: 2.0 ** (3.0 - kmap[f] / 4.0) for f in kmap}
+    pred, rel = _cb_ladder_fit(kls, kmap, anchors, holdout, predicted, 0.10)
+    assert rel < 1e-9
+    for f, v in pred.items():
+        assert v == pytest.approx(kls[f], rel=1e-9)
+    # corrupted holdout -> gate FAILS -> caller measures everything.
+    bad = dict(kls)
+    bad[holdout] *= 1.5
+    pred2, rel2 = _cb_ladder_fit(bad, kmap, anchors, holdout, predicted, 0.10)
+    assert pred2 is None and rel2 > 0.10
+    # short ladders never interpolate
+    assert cb_ladder_none() is None
+
+
+def cb_ladder_none():
+    from prismaquant.expert_empirical_cost import _cb_ladder_split
+    return _cb_ladder_split(["NVFP4_CB_K12", "NVFP4_CB_K16", "BF16"])
+
+
+def test_expert_empirical_parser_args():
+    from prismaquant.expert_empirical_cost import _build_parser
+
+    args = _build_parser().parse_args([
+        "--model", "m", "--output", "o", "--formats",
+        "NVFP4_CB_K12,NVFP4_CB_K16,BF16", "--merge-base", "b.pkl",
+        "--replace-experts", "--col-weights", "cw.pkl",
+        "--cb-ladder-interp", "--ladder-holdout-tol", "0.05",
+    ])
+    assert args.replace_experts and args.cb_ladder_interp
+    assert args.col_weights == "cw.pkl"
+    assert args.ladder_holdout_tol == 0.05
+    d = _build_parser().parse_args(["--model", "m", "--output", "o"])
+    assert not d.replace_experts and not d.cb_ladder_interp
