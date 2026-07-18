@@ -1513,9 +1513,33 @@ PY
     echo "[pipeline] [4/4] CB col-weights exist, skipping"
   fi
 
-  echo "[pipeline] [4/4] exporting to nvfp4_cb (codebook container) ..."
+  # Streaming exporter for 200-300B-class sources (Hy3 ~557GB, DSv4 ~295GB):
+  # export_nvfp4_cb loads EVERY shard resident + accumulates EVERY output tensor
+  # -> OOM on the 121GB box (dsv4_readiness.md gap 2). export_nvfp4_cb_streaming
+  # holds ~one source tensor (one MoE layer's expert stack) + the codebooks.
+  # EXPORT_STREAMING: auto (default; stream when the source exceeds
+  # EXPORT_STREAMING_THRESHOLD_GB, default 80) / 1 / 0. Same CLI both ways.
+  : "${EXPORT_STREAMING:=auto}"
+  : "${EXPORT_STREAMING_THRESHOLD_GB:=80}"
+  CB_EXPORT_MODULE="prismaquant.export_nvfp4_cb"
+  _src_gb="$(du -sBG "$MODEL_PATH" 2>/dev/null | awk '{gsub(/G/,"",$1); print int($1)}')"
+  case "$EXPORT_STREAMING" in
+    1|true|True|TRUE|yes|Yes|YES) CB_EXPORT_MODULE="prismaquant.export_nvfp4_cb_streaming" ;;
+    0|false|False|FALSE|no|No|NO) ;;
+    auto|"")
+      if [[ -n "$_src_gb" && "$_src_gb" -ge "$EXPORT_STREAMING_THRESHOLD_GB" ]]; then
+        CB_EXPORT_MODULE="prismaquant.export_nvfp4_cb_streaming"
+        echo "[pipeline] [4/4] source ~${_src_gb}GB >= ${EXPORT_STREAMING_THRESHOLD_GB}GB -> streaming exporter"
+      fi
+      ;;
+    *)
+      echo "[pipeline] ERROR: EXPORT_STREAMING must be auto/1/0" >&2
+      exit 2
+      ;;
+  esac
+  echo "[pipeline] [4/4] exporting to nvfp4_cb (codebook container; ${CB_EXPORT_MODULE}) ..."
   CB_EXPORT_ARGS=(
-    python3 -m prismaquant.export_nvfp4_cb
+    python3 -m "$CB_EXPORT_MODULE"
     --model-dir "$MODEL_PATH"
     --layer-config "${WORK_DIR}/artifacts/layer_config.json"
     --out "$CB_OUT"
