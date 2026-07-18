@@ -101,8 +101,12 @@ def _vecs_and_wq(w: torch.Tensor, cw: torch.Tensor | None, grid: str):
     vectors, _, _ = cb._scale_and_vectorize(w2d, grid)
     wq = None
     if cw is not None:
-        cw2d = torch.broadcast_to(cw.to(w2d.device, torch.float32),
-                                  w2d.shape).contiguous()
+        # Broadcast against the ORIGINAL shape first so stacked-expert
+        # per-expert weights ((E, 1, in) — the gguf _qw_blocks precedent)
+        # slice correctly before the row flatten.
+        cw2d = torch.broadcast_to(
+            cw.to(w2d.device, torch.float32), tuple(w.shape)
+        ).reshape(w2d.shape).contiguous()
         wq = cb._col_weight_vectors(cw2d)
     return vectors, wq
 
@@ -261,10 +265,13 @@ def export_nvfp4_cb(
                 f"unweighted bytes would silently diverge from the "
                 f"imatrix-weighted cost measurement (no silent RTN)")
         cwn = col_weights[qname].numel()
-        if cwn != in_f:
+        n_exp = (int(skeleton[wname].shape[0])
+                 if skeleton[wname].dim() == 3 else 1)
+        if cwn not in (in_f, n_exp * in_f):
             raise ValueError(
-                f"{qname}: col_weights has {cwn} columns but the weight has "
-                f"{in_f} — the imatrix does not describe this checkpoint")
+                f"{qname}: col_weights has {cwn} elements but the weight "
+                f"wants {in_f} (shared) or {n_exp}x{in_f} (per-expert, "
+                f"(E,1,in)) — the imatrix does not describe this checkpoint")
 
     # --- Stock NVFP4 fused-sibling coherence: q/k/v (and gate/up) that all land
     # on NVFP4 MUST share one weight_global_scale, or vLLM's fused loader sees
@@ -357,11 +364,17 @@ def export_nvfp4_cb(
                 codebook=cbook, scale_sweep=scale_sweep,
                 scale_coding=(scale_coding if grid == "fp4"
                               else cb.SCALE_CODING_V1))
+            if w.dim() == 3:
+                # Stacked packed experts: keep the expert axis explicit —
+                # uint8 (E, out, bytes_per_row); fp8 per-channel scales
+                # (E, out). LAYOUT.md §3 (stacked experts).
+                packed = packed.reshape(w.shape[0], w.shape[1], -1)
             out_tensors[qname + ".cb_qweight"] = packed.to(torch.uint8).cpu(
             ).contiguous()
             if grid == "fp8":
-                out_tensors[qname + ".weight_scale"] = fields["scales"].reshape(
-                    -1).to(torch.float32).cpu().contiguous()
+                ws = fields["scales"].reshape(
+                    *w.shape[:-1]).to(torch.float32)
+                out_tensors[qname + ".weight_scale"] = ws.cpu().contiguous()
             counts[fmt] += 1
         elif qname in stock_targets:
             # Stock rung: CT-pack via the shared compressed-tensors codec

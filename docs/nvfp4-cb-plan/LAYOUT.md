@@ -199,6 +199,18 @@ For each **CB target Linear** `<q>` (e.g. `model.layers.0.mlp.gate_proj`):
 | `<q>.cb_qweight` | uint8 `(rows, (in/256)·type_size)` | all | §1 superblock byte stream |
 | `<q>.weight_scale` | fp32 `(rows,)` | **fp8 only** | per-output-channel scale (fp4 scales live inside `cb_qweight`) |
 
+**Stacked packed experts** (a 3-D source weight `(E, out, in)`, e.g. Qwen3-MoE
+`experts.gate_up_proj` / `experts.down_proj`): the expert axis stays explicit —
+`<q>.cb_qweight` is uint8 `(E, out, (in/256)·type_size)` (each expert's rows
+laid out exactly as the 2-D case; expert `e` = `cb_qweight[e]`), and the fp8
+`<q>.weight_scale` is fp32 `(E, out)`. Encoding uses per-expert `col_weights`
+`(E, 1, in)` when provided (a single `(in,)` vector is broadcast to all
+experts); all experts of a stack share one format + one codebook (the
+allocator's serving-unit promotion guarantees it). **Plugin gap:** the serving
+plugin has no CB MoE method yet (`plugins/vllm_prismaquant/` serves dense
+Linears only) — see `moe_cb_design.md` §plugin-gap for the precise contract a
+`FusedMoE`-analog method must implement before a CB MoE artifact can serve.
+
 **Codebooks — shipped once per `(ref, format)`, never per tensor:**
 
 | tensor | dtype / shape | meaning |

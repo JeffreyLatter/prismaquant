@@ -1067,3 +1067,167 @@ def test_predict_cb_ladder_costs_shape_and_holdout():
     assert all(a > b for a, b in zip(pv, pv[1:]))
     hold = res["holdout"]
     assert hold["k"] == 15 and hold["rel_error"] >= 0.0
+
+
+# ===========================================================================
+# MoE readiness: packed-expert export chain + serving-unit uniformity.
+# ===========================================================================
+
+class _CBMoEProfile:
+    """Per-layer packed-expert serving unit (the vLLM FusedMoE constraint:
+    experts uniform per layer; mix across layers, never within)."""
+
+    def fused_sibling_group(self, name: str) -> str | None:
+        return None
+
+    def packed_expert_format_group(self, name: str) -> str | None:
+        parts = name.split(".")
+        if "experts" in parts:
+            layer = ".".join(parts[:parts.index("mlp")])
+            return f"{layer}.mlp.experts"
+        return None
+
+
+def test_moe_expert_uniformity_across_cb_rungs():
+    from prismaquant.allocator_solver import promote_serving_units
+
+    names_l0 = [f"model.layers.0.mlp.experts.{p}"
+                for p in ("gate_up_proj", "down_proj")]
+    names_l1 = [f"model.layers.1.mlp.experts.{p}"
+                for p in ("gate_up_proj", "down_proj")]
+    assignment = {
+        names_l0[0]: "NVFP4_CB_K14",       # mixed WITHIN layer 0's unit
+        names_l0[1]: "NVFP4_CB_S16",
+        names_l1[0]: "NVFP4_CB_K12",       # uniform in layer 1
+        names_l1[1]: "NVFP4_CB_K12",
+        "model.layers.0.self_attn.q_proj": "NVFP4_CB_K20",   # non-expert
+    }
+    fam = [s for s in fr.list_formats()
+           if s.family in ("nvfp4_cb", "fp8_cb")] + [fr.get_format("BF16")]
+    rank = {s.name: i for i, s in enumerate(
+        sorted(fam, key=lambda s: s.effective_bits))}
+    promoted = promote_serving_units(assignment, rank,
+                                     profile=_CBMoEProfile())
+    # layer 0: promoted to ONE rung = the max-rank member (S16 = 2.5 bpw)
+    assert promoted[names_l0[0]] == promoted[names_l0[1]] == "NVFP4_CB_S16"
+    # layer 1: untouched (mix across layers is legal)
+    assert promoted[names_l1[0]] == promoted[names_l1[1]] == "NVFP4_CB_K12"
+    # non-expert Linear not dragged into the unit
+    assert promoted["model.layers.0.self_attn.q_proj"] == "NVFP4_CB_K20"
+
+
+def test_cb_legality_rejects_odd_shapes_falls_back():
+    from prismaquant.allocator_candidates import check_format_applicability
+
+    # in_features % 256 != 0: every CB rung is illegal (the 256-superblock
+    # legality doubles as the vector-tiling gate); BF16 stays legal.
+    for fmt in ("NVFP4_CB_K14", "NVFP4_CB_S16", "FP8_CB_K44"):
+        v = check_format_applicability((64, 320), fmt)
+        assert not v.legal and v.reason == "group_divisibility"
+        assert check_format_applicability((64, 512), fmt).legal
+    assert check_format_applicability((64, 320), "BF16").legal
+
+
+def _tiny_moe_model(mdl: Path, n_exp: int = 3, in_f: int = 256):
+    from safetensors.torch import save_file
+
+    mdl.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(0)
+    tens = {
+        "model.layers.0.mlp.experts.gate_up_proj.weight":
+            (torch.randn(n_exp, 96, in_f) * 0.3).to(torch.bfloat16),
+        "model.layers.0.mlp.experts.down_proj.weight":
+            (torch.randn(n_exp, 48, in_f) * 0.3).to(torch.bfloat16),
+        "model.layers.0.self_attn.q_proj.weight":
+            (torch.randn(128, in_f) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(in_f, dtype=torch.bfloat16),
+    }
+    save_file(tens, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(
+        json.dumps({"architectures": ["TinyMoE"], "hidden_size": in_f}))
+    return tens
+
+
+@pytest.mark.parametrize("source", ["lattice", "learned"])
+def test_exporter_packed_experts_roundtrip(export_dir, source):
+    from safetensors.torch import load_file
+
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl, out = export_dir / "model", export_dir / "out"
+    tens = _tiny_moe_model(mdl)
+    assign = {
+        "model.layers.0.mlp.experts.gate_up_proj":
+            {"data_type": "fp8_cb", "cb_k": 40},
+        "model.layers.0.mlp.experts.down_proj":
+            {"data_type": "nvfp4_cb", "cb_k": 16},
+        "model.layers.0.self_attn.q_proj":
+            {"data_type": "nvfp4_cb", "cb_k": 16},
+    }
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, assign)
+    torch.manual_seed(1)
+    cw = {
+        # per-expert (E, 1, in) — the gguf _qw_blocks convention
+        "model.layers.0.mlp.experts.gate_up_proj": torch.rand(3, 1, 256) + .05,
+        "model.layers.0.mlp.experts.down_proj": torch.rand(3, 1, 256) + 0.05,
+        "model.layers.0.self_attn.q_proj": torch.rand(256) + 0.05,
+    }
+    spec = ({"source": "learned", "train": True}
+            if source == "learned" else {"source": "lattice"})
+    counts = export_nvfp4_cb(mdl, apath, out, cw,
+                             shared_codebook_spec=spec, device="cpu")
+    assert counts["FP8_CB_K40"] == 1 and counts["NVFP4_CB_K16"] == 2
+
+    ot = load_file(str(out / "model.safetensors"))
+    qc = json.loads((out / "quant_config.json").read_text())
+    cbf = load_file(str(out / qc["codebook_file"]))
+    # stacked layout: (E, out, bytes); fp8 scales (E, out)
+    gu = ot["model.layers.0.mlp.experts.gate_up_proj.cb_qweight"]
+    assert gu.shape == (3, 96, (256 // 256) * cb.nvfp4_cb_type_size(40, "fp8"))
+    ws = ot["model.layers.0.mlp.experts.gate_up_proj.weight_scale"]
+    assert ws.shape == (3, 96)
+    dn = ot["model.layers.0.mlp.experts.down_proj.cb_qweight"]
+    assert dn.shape == (3, 48, cb.nvfp4_cb_type_size(16, "fp4"))
+    assert ("model.layers.0.mlp.experts.down_proj.weight_scale") not in ot
+
+    # per-expert round-trip == whole-stack emulation with per-expert weights
+    for g in qc["config_groups"].values():
+        s = g["scheme"]
+        for q in g["targets"]:
+            if "experts" not in q:
+                continue
+            w = tens[q + ".weight"].float()
+            ref = s["codebook_ref"]
+            codebook = (tuple(cbf[r].float() for r in ref)
+                        if isinstance(ref, list) else cbf[ref].float())
+            packed = ot[q + ".cb_qweight"]
+            scales = ot.get(q + ".weight_scale")
+            E = w.shape[0]
+            up = cb.nvfp4_cb_unpack(
+                packed.reshape(E * w.shape[1], -1), s["k"], s["grid"],
+                s["mode"], (E * w.shape[1], w.shape[2]), codebook=codebook,
+                scales=(scales.reshape(-1, 1) if scales is not None
+                        else None))
+            rec = cb.nvfp4_cb_reconstruct(
+                up, s["k"], grid=s["grid"], mode=s["mode"]).reshape(w.shape)
+            emu_f = cb.nvfp4_cb_fields(
+                w, s["k"], grid=s["grid"], mode=s["mode"],
+                col_weights=cw[q], codebook=codebook)
+            emu = cb.nvfp4_cb_reconstruct(
+                emu_f, s["k"], grid=s["grid"], mode=s["mode"])
+            assert torch.equal(rec, emu.reshape(w.shape))
+
+
+def test_exporter_rejects_wrong_expert_col_weights(export_dir):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl, out = export_dir / "model", export_dir / "out"
+    _tiny_moe_model(mdl)
+    assign = {"model.layers.0.mlp.experts.down_proj":
+              {"data_type": "nvfp4_cb", "cb_k": 16}}
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, assign)
+    cw = {"model.layers.0.mlp.experts.down_proj": torch.rand(2, 1, 256)}
+    with pytest.raises(ValueError, match="col_weights"):
+        export_nvfp4_cb(mdl, apath, out, cw, device="cpu")
