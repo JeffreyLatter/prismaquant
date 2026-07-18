@@ -697,3 +697,13 @@ Roadmap to goal (live):
   RECOVERY: resume cost from shard 4 as SOLE heavy job (fleet paused); if it
   flies quiet, contention confirmed; deadman needs fixing (didn't fire @112min).
 - FP8_SOURCE menu (026e1a0) + M4-hybrid (6b0a2f6) landed green (1170).
+- **27B stall FULLY DIAGNOSED + relaunched clean (2026-07-17 late):** confirmed
+  contention (~12× slowdown; 130min/7-layer-shard contended vs a few min/shard
+  quiet; full quiet re-walk ~1-2h). Two coordination RACES occurred (Fable
+  launched → menu agent killed it mid-investigation → relaunch). RESOLVED:
+  Fable is SOLE process-lifecycle owner; menu agent stripped of ALL kill
+  authority (read-only monitor + report-to-Fable + downstream A/B only). Bad
+  LAYERS_PER_SHARD=7 edit reverted (auto 2-layer re-walk is correct/fast).
+  Pipeline running (relaunch2). LESSON extended: in multi-agent orchestration,
+  exactly ONE owner may kill/launch a shared long-running process; monitors are
+  read-only. Folded into feedback_no_overparallel_during_prod semantics.
