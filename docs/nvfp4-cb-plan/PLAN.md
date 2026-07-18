@@ -787,3 +787,10 @@ Roadmap to goal (live):
   launch-staged behind it; Hy3 streaming-ready (source on disk); DSv4 audited.
   Served proofs are physically GPU-sequential — advancing by pre-staging every
   non-GPU prerequisite, not by parallel builds (which would re-starve the 27B).
+- **AUTONOMOUS BUILD CHAIN armed (overnight throughput):** menu agent = sequential-
+  build orchestrator: 27B A/B+verdict → auto-launch 35B (run_35b_prod_nvfp4cb.sh,
+  base at ornith-35b-base) with EARLY sanity-gate (probe+first-cost-shard read-check;
+  stop+report if OOM/crash/empty-costs/expert-empirical-error, don't grind 6h broken)
+  → 35B A/B+verdict → report both. Hy3 GATED (fp4-CB serving needs v2-compose
+  validation). Gets 2 of 3 classes served overnight autonomously; each verdict
+  reported for my review. One heavy job at a time (fleet-discipline holds).
