@@ -373,6 +373,109 @@ torch::Tensor cb_gemv_fp8(torch::Tensor x, torch::Tensor qw_padded,
 }
 
 // ---------------------------------------------------------------------------
+// FP8-direct transient expand (prefill): decode the whole packed weight into
+// a [N, K] e4m3-byte tile. Same stage/extract/LUT structure as the GEMV with
+// the FMA replaced by one coalesced 8-byte store per codeword — the Triton
+// byte-gather expander ran at 61-86 GB/s and serialized ~half the prefill;
+// this one is stream-bandwidth-bound.
+// ---------------------------------------------------------------------------
+template <int WARPS>
+__global__ __launch_bounds__(WARPS * 32) void cb_expand_fp8_kernel(
+    const uint8_t* __restrict__ qw,        // [N, qw_stride] packed rows
+    const uint16_t* __restrict__ cb16,     // E4M3-byte codebook as u16 pairs
+    const int32_t* __restrict__ cboff,     // [N] element base into cb_flat
+    uint8_t* __restrict__ w,               // [N, K] e4m3 bytes out
+    const int64_t N, const int64_t K, const int64_t qw_stride,
+    const int k_bits, const int sub_w, const int type_size) {
+  const int64_t n = blockIdx.x;
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x & 31;
+  const int n_sb = (int)(K >> 8);
+
+  __shared__ __align__(16) uint8_t stage[WARPS][kSlotBytes];
+
+  const uint8_t* row = qw + n * qw_stride;
+  const int64_t cb_base = (int64_t)__ldg(cboff + n);
+  const uint32_t sub_mask = (1u << sub_w) - 1u;
+  const int sub_entries2 = 2 << sub_w;
+  const uint64_t code_mask =
+      (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
+  const int stage_vecs = type_size >> 3;
+
+  for (int s = warp; s < n_sb; s += WARPS) {
+    const uint64_t* gsrc =
+        reinterpret_cast<const uint64_t*>(row + (int64_t)s * type_size);
+    uint64_t* gdst = reinterpret_cast<uint64_t*>(stage[warp]);
+    if (lane < stage_vecs) gdst[lane] = __ldcs(gsrc + lane);
+    __syncwarp();
+
+    const int bitpos = lane * k_bits;
+    const int b0 = bitpos >> 3;
+    const int rem = ((b0 & 3) << 3) + (bitpos & 7);
+    const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp]);
+    const int widx = b0 >> 2;
+    const uint32_t w0_ = s32[widx];
+    const uint32_t w1_ = s32[widx + 1];
+    const uint32_t w2_ = s32[widx + 2];
+    __syncwarp();
+    const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
+    uint64_t code = lo >> rem;
+    if (rem + k_bits > 64) {
+      code |= (uint64_t)w2_ << (64 - rem);
+    }
+    code &= code_mask;
+
+    uint64_t out8 = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const uint32_t idx = (uint32_t)(code >> (i * sub_w)) & sub_mask;
+      const int64_t elt = cb_base + (int64_t)i * sub_entries2 + (int64_t)idx * 2;
+      const uint64_t pair = (uint64_t)__ldg(cb16 + (elt >> 1));
+      out8 |= pair << (16 * i);
+    }
+    // One coalesced 8-byte store per codeword: 256 B per warp-superblock.
+    *reinterpret_cast<uint64_t*>(
+        w + n * K + ((int64_t)s << 8) + (lane << 3)) = out8;
+  }
+}
+
+torch::Tensor cb_expand_fp8(torch::Tensor qw_padded, torch::Tensor cb_flat_fp8,
+                            torch::Tensor cb_row_offset, int64_t N, int64_t K,
+                            int64_t k_bits, int64_t n_sub, int64_t type_size) {
+  TORCH_CHECK(qw_padded.is_cuda() && qw_padded.scalar_type() == torch::kUInt8);
+  TORCH_CHECK(cb_flat_fp8.scalar_type() == torch::kUInt8,
+              "cb_expand_fp8 wants the E4M3-byte (uint8) codebook");
+  TORCH_CHECK(cb_row_offset.scalar_type() == torch::kInt32 &&
+              cb_row_offset.numel() == N);
+  TORCH_CHECK(n_sub == 4 && k_bits % 4 == 0);
+  TORCH_CHECK(K % 256 == 0 && type_size == 4 * k_bits && type_size % 16 == 0 &&
+              type_size <= 192);
+  TORCH_CHECK(qw_padded.dim() == 2 && qw_padded.size(0) == N &&
+              qw_padded.stride(1) == 1);
+  const c10::cuda::OptionalCUDAGuard guard(qw_padded.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto w = torch::empty({N, K}, qw_padded.options());
+  const int sub_w = (int)(k_bits / n_sub);
+  const int n_sb = (int)(K >> 8);
+  const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
+  if (use4) {
+    cb_expand_fp8_kernel<4><<<(unsigned)N, 128, 0, stream>>>(
+        qw_padded.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint16_t*>(cb_flat_fp8.data_ptr()),
+        cb_row_offset.data_ptr<int32_t>(), w.data_ptr<uint8_t>(),
+        N, K, qw_padded.stride(0), (int)k_bits, sub_w, (int)type_size);
+  } else {
+    cb_expand_fp8_kernel<8><<<(unsigned)N, 256, 0, stream>>>(
+        qw_padded.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint16_t*>(cb_flat_fp8.data_ptr()),
+        cb_row_offset.data_ptr<int32_t>(), w.data_ptr<uint8_t>(),
+        N, K, qw_padded.stride(0), (int)k_bits, sub_w, (int)type_size);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return w.view(torch::kFloat8_e4m3fn);
+}
+
+// ---------------------------------------------------------------------------
 // Debug probes (test-only): isolate the conversion and the scale reduction.
 // ---------------------------------------------------------------------------
 __global__ void e4m3_probe_kernel(const float* __restrict__ q,
@@ -438,6 +541,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Fused per-token fp8 dynamic QDQ (bit-exact to codec.fp8_dynamic_act_qdq)");
   m.def("cb_gemv_fp8", &cb_gemv_fp8,
         "FP8_CB product-mode decode GEMV (bandwidth-bound, INV-1)");
+  m.def("cb_expand_fp8", &cb_expand_fp8,
+        "FP8-direct transient expand (prefill; bounded per-layer tile)");
   m.def("e4m3_probe", &e4m3_probe, "debug: f32 -> e4m3 codes via the c10 port");
   m.def("qdq_scale_probe", &qdq_scale_probe,
         "debug: per-token scale exactly as the QDQ kernel computes it");

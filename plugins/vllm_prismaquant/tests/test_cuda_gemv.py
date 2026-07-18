@@ -240,6 +240,32 @@ def test_fused_row_offset_two_roles():
     _assert_triton_close(_cuda_y(p, xq), _triton_y(p, xq), "fused row-offset")
 
 
+@pytest.mark.parametrize("k", [36, 40, 44, 48])
+def test_cuda_expand_bitexact_vs_triton(k):
+    """The CUDA transient expander must produce byte-identical tiles to the
+    Triton expand_cb_to_fp8 (which is itself pinned to the bf16-expand+cast
+    reference)."""
+    from vllm_prismaquant.expand import expand_cb_to_fp8
+    p = _synth(k, N=96, K=768, seed=100 + k)
+    ref = expand_cb_to_fp8(p["qwp"], p["cb8"], p["row_off"],
+                           p["N"], p["K"], p["k"], 4, p["ts"])
+    got = ext.cb_expand_fp8(p["qwp"], p["cb8"], p["row_off"],
+                            p["N"], p["K"], p["k"], 4, p["ts"])
+    assert got.dtype == torch.float8_e4m3fn
+    assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8)), (
+        f"k={k}: CUDA expand bytes != Triton expand bytes")
+
+
+def test_cuda_expand_bitexact_real_artifact():
+    from vllm_prismaquant.expand import expand_cb_to_fp8
+    p = _prep(PICK[0])
+    ref = expand_cb_to_fp8(p["qwp"], p["cb8"], p["row_off"],
+                           p["N"], p["K"], p["k"], 4, p["ts"])
+    got = ext.cb_expand_fp8(p["qwp"], p["cb8"], p["row_off"],
+                            p["N"], p["K"], p["k"], 4, p["ts"])
+    assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+
+
 def test_full_op_raw_x_matches_triton_path():
     """The registered custom op (raw x in, QDQ fused) equals the Triton path
     (torch QDQ then decode-GEMM) — the exact serving-dispatch equivalence."""

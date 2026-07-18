@@ -51,6 +51,13 @@ PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"
 # amortizes x across the row tile.
 CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
 
+# NOTE on a rejected variant (2026-07-18): N-chunking the transient expand +
+# GEMM with side-stream overlap measured 0.46x (small-N GEMMs lose more than
+# the overlap hides) AND is not bit-exact — cutlass_scaled_mm picks different
+# configs per shape (split-K on narrow N), which breaks the served-KL
+# contract. Prefill overlap needs cross-layer prefetch or the fused
+# decode-in-prologue kernel, not N-chunking.
+
 
 @register_weight_loader_v2_supported_method
 class PrismaQuantCBLinearMethod(LinearMethodBase):
@@ -305,15 +312,25 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # free), never resident/model-wide (the NVINT2 OOM trap). `ops` is
         # imported lazily so the module still imports without vLLM (venv tests).
         import vllm._custom_ops as ops
-        W_e4m3 = expand_cb_to_fp8(
-            layer._cb_qw_padded, layer._cb_flat_fp8, layer._cb_row_offset,
-            N, K, self.k, self.n_sub, self.type_size)  # [N,K] float8_e4m3fn
         x2 = x.reshape(-1, K)
         xq, sa = ops.scaled_fp8_quant(x2, use_per_token_if_dynamic=True)
         # scale_b is the per-output-channel weight scale as [N, 1] (matches
         # vLLM's stock per-channel fp8 scheme; verified against a fp32 dequant
         # reference in tests/test_transient_fp8.py::test_transient_gemm_*).
         ws = layer._cb_scale.reshape(N, 1)
+
+        if self._cuda_gemv_ok():
+            # CUDA expander (stream-bandwidth-bound; the Triton byte-gather
+            # ran at 61-86 GB/s and serialized ~half the prefill).
+            from .cuda_ext import get_ext
+            W_e4m3 = get_ext().cb_expand_fp8(
+                layer._cb_qw_padded, layer._cb_flat_fp8,
+                layer._cb_row_offset, N, K, self.k, self.n_sub,
+                self.type_size)
+        else:
+            W_e4m3 = expand_cb_to_fp8(
+                layer._cb_qw_padded, layer._cb_flat_fp8, layer._cb_row_offset,
+                N, K, self.k, self.n_sub, self.type_size)  # [N,K] e4m3
         out = ops.cutlass_scaled_mm(xq, W_e4m3.t(), sa, ws, torch.bfloat16, bias)
         del W_e4m3
         return out.reshape(*x.shape[:-1], N)
