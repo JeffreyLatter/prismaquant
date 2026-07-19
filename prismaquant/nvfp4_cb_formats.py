@@ -1352,24 +1352,31 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
     rows = w2d.shape[0]
     cb = _resolve_codebook(k, grid, mode, codebook, w2d.device)
 
-    cw2d = None
+    # col_weights stays a broadcast VIEW; blocks materialize only their rows
+    # (a full-shape fp32 copy is another ~10GB on a Hy3 expert stack).
+    cw_view = None
     if col_weights is not None:
-        cw2d = torch.broadcast_to(
-            col_weights.to(w2d.device, torch.float32), orig_shape
-        ).reshape(rows, in_f)
+        cw_view = torch.broadcast_to(
+            col_weights.to(w2d.device, torch.float32), orig_shape)
+
+    def _cw_rows(a: int, b: int) -> torch.Tensor | None:
+        if cw_view is None:
+            return None
+        idx = torch.unravel_index(
+            torch.arange(a, b, device=w2d.device), orig_shape[:-1])
+        return cw_view[idx]                                  # (b-a, in_f)
 
     row_step = max(1, _SLICE_MAX_ELEMS // max(in_f, 1))
     if rows <= row_step:
-        out = _fields_block(w2d, k, grid, mode, cb, cw2d, scale_sweep,
-                            scale_coding, tier)
+        out = _fields_block(w2d, k, grid, mode, cb, _cw_rows(0, rows),
+                            scale_sweep, scale_coding, tier)
     else:
         parts = []
         for a in range(0, rows, row_step):
             b = min(rows, a + row_step)
-            cw = cw2d[a:b] if cw2d is not None else None
             parts.append(
-                _fields_block(w2d[a:b], k, grid, mode, cb, cw, scale_sweep,
-                              scale_coding, tier))
+                _fields_block(w2d[a:b], k, grid, mode, cb, _cw_rows(a, b),
+                              scale_sweep, scale_coding, tier))
         out = {key: torch.cat([p[key] for p in parts], dim=0)
                for key in parts[0]}
     out["shape"] = orig_shape
@@ -1585,10 +1592,20 @@ def _pack_codes_to_bytes(codes: torch.Tensor, k: int) -> torch.Tensor:
     rows, nvec = codes.shape
     n_sb = nvec // 32
     shifts = torch.arange(k, device=codes.device)
-    bitstream = (codes.unsqueeze(-1) >> shifts) & 1              # (rows, nvec,k)
-    bitstream = bitstream.reshape(rows, n_sb, 4 * k, 8).to(torch.int64)
     wt = 1 << torch.arange(8, device=codes.device)
-    return (bitstream * wt).sum(dim=-1).to(torch.uint8)         # (rows,n_sb,4k)
+    # Chunk over rows: the (chunk, nvec, k) int64 bitstream transient is
+    # ~16x the packed bytes — unchunked it is ~155GB on a Hy3 192-expert
+    # stack (three box-wide OOMs, 2026-07-19). Rows are independent, so
+    # chunking is bit-identical.
+    step = max(1, _SLICE_MAX_ELEMS // max(nvec * k, 1))
+    out = torch.empty(rows, n_sb, 4 * k, dtype=torch.uint8,
+                      device=codes.device)
+    for a in range(0, rows, step):
+        b = min(rows, a + step)
+        bits = (codes[a:b].unsqueeze(-1) >> shifts) & 1      # (chunk, nvec, k)
+        bits = bits.reshape(b - a, n_sb, 4 * k, 8)
+        out[a:b] = (bits * wt).sum(dim=-1).to(torch.uint8)
+    return out                                               # (rows,n_sb,4k)
 
 
 def _unpack_bytes_to_codes(idx_bytes: torch.Tensor, k: int) -> torch.Tensor:

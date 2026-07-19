@@ -720,6 +720,11 @@ def main(argv=None) -> None:
                     choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER])
     ap.add_argument("--device", default=None)
     args = ap.parse_args(argv)
+    if torch.cuda.is_available():
+        # Box-safety net on the unified pool: a runaway allocation must raise
+        # a clean torch OOM (with the offending tensor in the traceback), not
+        # drive the whole box to a kernel global OOM (3x on 2026-07-19).
+        torch.cuda.set_per_process_memory_fraction(0.75)
     with open(args.col_weights, "rb") as fh:
         col_weights = {k: torch.as_tensor(v) for k, v in pickle.load(fh).items()}
     spec = {"source": args.codebook_source}
