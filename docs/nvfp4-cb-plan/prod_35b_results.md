@@ -45,7 +45,17 @@ bytes, spent on codebook rungs, buy materially more quality.
 |---|---|---|
 | BF16 (A3B) | 0.484 s | 28.43 |
 | AURA-4.75 (native) | 0.325 s | ~35.9 (steady reps) |
-| OURS (CB, per-expert transient MoE path) | 3.53 s | 3.52 |
+| OURS (CB, per-expert transient loop) | 3.53 s | 3.52 |
+| **OURS (CB, grouped decode kernels 2026-07-19)** | 3.46 s | **~33 (32.6–33.3 steady)** |
+
+**Decode SOLVED: 9.4× via the grouped (token, expert)-pair GEMV — one
+launch per projection replaces ~10k host syncs/launches per token. The CB
+artifact now decodes FASTER than BF16 (33 vs 28.4) at 3× smaller, −43%
+ALL-KL vs AURA at matched bpp; 8% shy of AURA's decode.** KL re-verified
+with the fast path live (ALL 0.0278 identical, conf 0.01673, PPL 9.501 —
+arithmetic-drift class). TTFT unmoved (3.46 s): the prefill wall is the
+per-expert launch storm (~71k launches / 1400-tok prefill), not syncs —
+batched-expert expand + grouped GEMM is the remaining piece.
 
 The CB MoE method still runs the correctness-first per-expert transient
 decode (moe.py) — no grouped CUDA kernels yet. This is the 27B story
