@@ -334,6 +334,17 @@ def export_nvfp4_cb_streaming(
         if m:
             prefix, packed_proj = m.group(1), m.group(2)
             grp = expert_groups.get(prefix)
+            if grp is None and profile is not None:
+                # Nested-prefix checkpoints (Qwen3.5-VLM: recipe
+                # `model.layers.*` vs on-disk `model.language_model.layers.*`)
+                # — the groups are keyed by CHECKPOINT prefixes; map the
+                # recipe prefix through the profile (same resolution the
+                # dense `_try_resolve_skeleton` path uses).
+                try:
+                    grp = expert_groups.get(
+                        profile.source_tensor_name(prefix))
+                except Exception:
+                    grp = None
             if grp is not None:
                 return "experts", (prefix, packed_proj, grp)
         return None, None
