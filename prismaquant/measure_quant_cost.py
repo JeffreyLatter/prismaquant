@@ -24,6 +24,7 @@ rel_output_mse}. When h-detail is supplied, entries may also include
 from __future__ import annotations
 
 import json
+import math
 import os
 import pickle
 import re
@@ -1324,6 +1325,65 @@ def _batched_quantize(
                          f"batched RTN")
 
 
+# Holdout gate tolerance for the dense-path ladder (matches the expert
+# stage's --ladder-holdout-tol default).
+_CB_LADDER_TOL = float(os.environ.get("PRISMAQUANT_CB_LADDER_TOL", "0.10"))
+
+
+def _cb_ladder_plan(specs: list[fr.FormatSpec]):
+    """Dense-path RD-ladder plan (PRISMAQUANT_CB_LADDER_INTERP=1, default
+    OFF): per-(family,mode) CB rung ladders from the shared splitter. Returns
+    ``(ladders, predicted_names)`` or None. Anchors+holdout are measured
+    normally; predicted rungs are fitted per TENSOR and holdout-gated, with a
+    measured fallback — so a tensor that defies the law never receives an
+    interpolated cost (encode_tiers.md §B/§C)."""
+    if os.environ.get("PRISMAQUANT_CB_LADDER_INTERP", "0") != "1":
+        return None
+    # Lazy import: expert_empirical_cost lazily imports helpers from this
+    # module, so a top-level import would be a cycle.
+    from prismaquant.expert_empirical_cost import _cb_ladder_split
+    split = _cb_ladder_split([s.name for s in specs])
+    if not split:
+        return None
+    predicted_names = {f for (_, _, _, pred) in split for f in pred}
+    print(f"[cost] CB ladder interp ON: predicting {sorted(predicted_names)} "
+          f"per tensor from anchors (holdout-gated)", flush=True)
+    return split, predicted_names
+
+
+def _ladder_metric_fit(kmap, anchors, fmt_values, target_fmt):
+    """LS fit log2(v) = a - b*k on the anchors for ONE metric; returns the
+    predicted value at target_fmt (None if any anchor value is unusable)."""
+    try:
+        xs = [float(kmap[f]) for f in anchors]
+        ys = [math.log2(max(float(fmt_values[f]), 1e-20)) for f in anchors]
+    except (KeyError, TypeError):
+        return None
+    n = float(len(xs))
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    b = (-sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+         if denom > 0 else 0.25)
+    a = my + b * mx
+    return float(2.0 ** (a - b * kmap[target_fmt]))
+
+
+def _chunk_metric(accum, name, fmt, key, count_key="_count"):
+    row = accum.get(name, {}).get(fmt)
+    if not row or "_count" not in row or row["_count"] <= 0:
+        return None
+    if key == "predicted_dloss":
+        if row.get("_predicted_dloss_count", 0) <= 0:
+            return None
+        return row["_predicted_dloss_sum"] / row["_predicted_dloss_count"]
+    if key == "fisher_output_mse":
+        if row.get("_fisher_output_mse_count", 0) <= 0:
+            return None
+        return row["_fisher_output_mse_sum"] / row["_fisher_output_mse_count"]
+    return row.get(f"_{key}_sum", 0.0) / row["_count"]
+
+
 def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                        target_names: set[str], specs: list[fr.FormatSpec],
                        device: str, dtype: torch.dtype,
@@ -1351,6 +1411,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     total_linears = sum(len(v) for v in groups.values())
     print(f"[cost] batched: {len(groups)} shape groups, "
           f"{total_linears} Linears total", flush=True)
+    ladder_plan = _cb_ladder_plan(specs)
 
     accum: dict[str, dict[str, dict]] = {}
     processed = 0
@@ -1488,45 +1549,64 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     gq_stacked = torch.stack(gq_items, dim=0)  # (N, rows)
                 del h_items, gq_items
 
-            for spec in specs:
+            def _measure_spec_into_accum(spec, idx=None):
+                """One spec's batched measure for the whole chunk (idx=None)
+                or an index-subset (the ladder's per-tensor measured
+                fallback). Identical math either way."""
+                sub_names = (names if idx is None
+                             else [names[i] for i in idx])
                 try:
+                    Ws = W if idx is None else W[idx]
+                    Xs = X if idx is None else X[idx]
+                    y_refs = y_ref if idx is None else y_ref[idx]
+                    ref_e = ref_energy if idx is None else ref_energy[idx]
+                    gqw = gguf_qw if (gguf_qw is None or idx is None) \
+                        else gguf_qw[idx]
+                    hs = h_stacked if (h_stacked is None or idx is None) \
+                        else h_stacked[idx]
+                    gqs = gq_stacked if (gq_stacked is None or idx is None) \
+                        else gq_stacked[idx]
+                    n_sub = Ws.size(0)
                     W_hat = _batched_quantize(
-                        spec, W,
+                        spec, Ws,
                         col_weights=(
-                            gguf_qw if _cost_render_uses_imatrix(spec) else None
+                            gqw if _cost_render_uses_imatrix(spec) else None
                         ),
                     )
-                    X_hat = spec.activation_quantize_dequantize(X.clone())
-                    err = (W - W_hat).float()
-                    weight_mse = err.pow(2).mean(dim=(1, 2))  # (N,)
+                    X_hat = spec.activation_quantize_dequantize(Xs.clone())
+                    err = (Ws - W_hat).float()
+                    weight_mse = err.pow(2).mean(dim=(1, 2))  # (n_sub,)
                     y_q = torch.bmm(X_hat, W_hat.transpose(1, 2))
-                    y_err_sq = (y_ref - y_q).float().pow(2)
-                    output_mse = y_err_sq.mean(dim=(1, 2))  # (N,)
-                    rel_mse = output_mse / ref_energy.clamp_min(1e-12)
+                    y_err_sq = (y_refs - y_q).float().pow(2)
+                    output_mse = y_err_sq.mean(dim=(1, 2))  # (n_sub,)
+                    rel_mse = output_mse / ref_e.clamp_min(1e-12)
                     fisher_output_mse = None
-                    if gq_stacked is not None:
+                    if gqs is not None:
                         fisher_output_mse = (
-                            y_err_sq * gq_stacked.unsqueeze(2)
+                            y_err_sq * gqs.unsqueeze(2)
                         ).mean(dim=(1, 2))
                     # Per-item predicted Δloss from full per-weight
-                    # Fisher. shape (N,).
+                    # Fisher. shape (n_sub,).
                     dloss_per = None
-                    if h_stacked is not None:
-                        dloss_per = 0.5 * (h_stacked * err.pow(2)).sum(dim=(1, 2))
+                    if hs is not None:
+                        dloss_per = 0.5 * (hs * err.pow(2)).sum(dim=(1, 2))
                     # Move all scalar metrics back to the host in one shot.
-                    # Calling `.item()` per Linear forces a CUDA sync for each
-                    # row and turns the batched path back into serialized work.
+                    # Calling `.item()` per Linear forces a CUDA sync for
+                    # each row and turns the batched path back into
+                    # serialized work.
                     metric_cols = [weight_mse, output_mse, rel_mse]
                     if fisher_output_mse is not None:
                         metric_cols.append(fisher_output_mse)
-                    metrics = torch.stack(metric_cols, dim=1).detach().cpu().tolist()
+                    metrics = torch.stack(
+                        metric_cols, dim=1).detach().cpu().tolist()
                     if dloss_per is not None:
                         dloss_values = dloss_per.detach().cpu().tolist()
                     else:
-                        dloss_values = [None] * N
+                        dloss_values = [None] * n_sub
 
                     # Unpack per-item into results dict after the single sync.
-                    for name, row, dloss_val in zip(names, metrics, dloss_values):
+                    for name, row, dloss_val in zip(sub_names, metrics,
+                                                    dloss_values):
                         w_mse, out_mse, rel = row[:3]
                         fisher_val = row[3] if len(row) > 3 else None
                         _accumulate_result(
@@ -1550,13 +1630,72 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     del W_hat, X_hat, err, y_q, y_err_sq
                     del weight_mse, output_mse, rel_mse
                     del metrics, dloss_values
-                    if dloss_per is not None:
-                        del dloss_per
-                    if fisher_output_mse is not None:
-                        del fisher_output_mse
                 except Exception as e:
-                    for name in names:
-                        accum.setdefault(name, {})[spec.name] = {"error": str(e)}
+                    for name in sub_names:
+                        accum.setdefault(name, {})[spec.name] = {
+                            "error": str(e)}
+
+            measured_specs = (
+                specs if ladder_plan is None
+                else [s for s in specs if s.name not in ladder_plan[1]])
+            for spec in measured_specs:
+                _measure_spec_into_accum(spec)
+
+            if ladder_plan is not None:
+                # Per-tensor fit + holdout gate; fill accepted predictions,
+                # batch-measure the rejects (exact same math via the closure).
+                specs_by_name = {s.name: s for s in specs}
+                for kmap, anchors, holdout, predicted in ladder_plan[0]:
+                    if not all(f in specs_by_name for f in
+                               list(anchors) + [holdout] + list(predicted)):
+                        continue
+                    primary = ("predicted_dloss" if h_stacked is not None
+                               else "output_mse")
+                    fail_idx = []
+                    for i, name in enumerate(names):
+                        vals = {f: _chunk_metric(accum, name, f, primary)
+                                for f in list(anchors) + [holdout]}
+                        if any(v is None or v <= 0 for v in vals.values()):
+                            fail_idx.append(i)
+                            continue
+                        pred_h = _ladder_metric_fit(
+                            kmap, anchors, vals, holdout)
+                        rel_err = (abs(pred_h - vals[holdout])
+                                   / max(vals[holdout], 1e-20))
+                        if pred_h is None or rel_err > _CB_LADDER_TOL:
+                            fail_idx.append(i)
+                            continue
+                        for fmt in predicted:
+                            fills = {}
+                            for key in ("weight_mse", "output_mse",
+                                        "rel_output_mse", "predicted_dloss",
+                                        "fisher_output_mse"):
+                                mvals = {f: _chunk_metric(accum, name, f,
+                                                          key)
+                                         for f in anchors}
+                                if any(v is None or v <= 0
+                                       for v in mvals.values()):
+                                    fills[key] = None
+                                else:
+                                    fills[key] = _ladder_metric_fit(
+                                        kmap, anchors, mvals, fmt)
+                            _accumulate_result(
+                                accum, name, fmt,
+                                float(fills["weight_mse"] or 0.0),
+                                float(fills["output_mse"] or 0.0),
+                                float(fills["rel_output_mse"] or 0.0),
+                                predicted_dloss=fills["predicted_dloss"],
+                                fisher_output_mse=fills["fisher_output_mse"],
+                                output_mse_measured=False,
+                            )
+                    if fail_idx:
+                        print(f"[cost] ladder holdout rejected "
+                              f"{len(fail_idx)}/{N} tensors in chunk — "
+                              f"measuring {sorted(predicted)} for them",
+                              flush=True)
+                        for fmt in predicted:
+                            _measure_spec_into_accum(
+                                specs_by_name[fmt], idx=fail_idx)
 
             del W, X, y_ref, ref_energy
             if h_stacked is not None:

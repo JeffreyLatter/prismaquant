@@ -318,6 +318,11 @@ case "$COST_MODE" in
     PRODUCTION_RENDER_COST_CACHE_PATH=""
     PRODUCTION_RENDER_COST_CACHE_DIR=""
     PRODUCTION_RENDER_COST_TAIL_QNAMES=""
+    # One user knob drives BOTH ladder wirings (dense local cost + the
+    # empirical expert stage): CB_LADDER_INTERP=1.
+    if [[ "${CB_LADDER_INTERP:-0}" == "1" ]]; then
+      export PRISMAQUANT_CB_LADDER_INTERP=1
+    fi
     # CB M4-hybrid: stage [2d-CB] REPLACES every packed-expert row with the
     # empirical unit-KL (merge --replace-experts pops the local rows), so the
     # local stage's expert measurements — full-stack imatrix-weighted CB

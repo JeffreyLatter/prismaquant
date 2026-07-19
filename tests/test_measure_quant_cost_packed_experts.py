@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -326,3 +327,45 @@ def test_skip_packed_expert_cost_env(monkeypatch):
         act_cache=None, h_detail=None,
     )
     assert set(accum) == target_names
+
+
+def test_dense_ladder_helpers(monkeypatch):
+    """Dense-path ladder plumbing: env gate, exact-law fit, chunk-metric
+    readback from the sum-based accumulator."""
+    from prismaquant.measure_quant_cost import (
+        _accumulate_result,
+        _cb_ladder_plan,
+        _chunk_metric,
+        _ladder_metric_fit,
+    )
+    import prismaquant.format_registry as fr
+
+    specs = [fr.get_format(f"FP8_CB_K{k}") for k in (28, 32, 36, 40, 44, 48)]
+    monkeypatch.delenv("PRISMAQUANT_CB_LADDER_INTERP", raising=False)
+    assert _cb_ladder_plan(specs) is None          # default OFF
+    monkeypatch.setenv("PRISMAQUANT_CB_LADDER_INTERP", "1")
+    plan = _cb_ladder_plan(specs)
+    assert plan is not None
+    ladders, predicted = plan
+    assert len(ladders) == 1 and len(predicted) >= 2
+    kmap, anchors, holdout, pred = ladders[0]
+    # 6-rung family -> 3 anchors, 1 holdout, 2 predicted.
+    assert len(anchors) == 3 and len(pred) == 2
+
+    # Exact exponential law -> exact prediction.
+    vals = {f: 2.0 ** (5.0 - 0.3 * kmap[f]) for f in kmap}
+    for f in pred + [holdout]:
+        got = _ladder_metric_fit(kmap, anchors, vals, f)
+        assert got == pytest.approx(vals[f], rel=1e-9)
+
+    # Accumulator readback (sum-based, count=1).
+    accum: dict = {}
+    _accumulate_result(accum, "t", "FP8_CB_K36", 0.5, 0.25, 0.1,
+                       predicted_dloss=0.02)
+    assert _chunk_metric(accum, "t", "FP8_CB_K36", "weight_mse") == 0.5
+    assert _chunk_metric(accum, "t", "FP8_CB_K36", "output_mse") == 0.25
+    assert _chunk_metric(
+        accum, "t", "FP8_CB_K36", "predicted_dloss") == 0.02
+    assert _chunk_metric(
+        accum, "t", "FP8_CB_K36", "fisher_output_mse") is None
+    assert _chunk_metric(accum, "missing", "FP8_CB_K36", "output_mse") is None
