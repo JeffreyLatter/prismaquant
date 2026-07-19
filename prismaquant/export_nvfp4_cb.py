@@ -31,7 +31,8 @@ import argparse
 import hashlib
 import json
 import pickle
-from collections import Counter
+import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import torch
@@ -98,6 +99,81 @@ def _load_skeleton(model_dir: Path) -> dict[str, torch.Tensor]:
 # (`model.layers.N.*`); the on-disk checkpoint nests the LM under an infix
 # (`model.language_model.layers.N.*`). The profile knows the structure and maps
 # both directions — never hard-code the infix. ---
+
+def _pack_skeleton_experts(skeleton: dict, profile) -> int:
+    """Per-expert-on-disk MoE checkpoints (Qwen3.5-MoE / Ornith): assemble
+    the packed ``<experts>.gate_up_proj/.down_proj`` skeleton tensors the CB
+    targets name, via layer_streaming's tested bridge. No-op for dense or
+    already-packed checkpoints.
+
+    Memory discipline: the bridge is invoked once PER packed group (the
+    ``live_param_shape`` gate restricts each call), so the transient is one
+    expert stack (~1 GB at 35B), not the whole model's expert bytes doubled.
+    """
+    if profile is None:
+        return 0
+    regex = getattr(profile, "per_expert_moe_regex", lambda: None)()
+    pnames = getattr(profile, "packed_expert_param_names",
+                     lambda: frozenset())()
+    if not regex or not pnames:
+        return 0
+    from prismaquant.layer_streaming import _pack_per_expert_into_packed
+    pat = re.compile(regex[len("re:"):] if regex.startswith("re:") else regex)
+
+    def is_per_expert(name: str) -> bool:
+        if pat.match(name):
+            return True
+        try:
+            return bool(pat.match(profile.to_vllm_internal_name(name)))
+        except Exception:
+            return False
+
+    # Pre-derive each packed group's expected shape from its per-expert
+    # members (E, sum of fused projection out-dims, in).
+    members: dict[str, dict[int, dict[str, tuple]]] = defaultdict(
+        lambda: defaultdict(dict))
+    for key, t in skeleton.items():
+        name = key[:-len(".weight")] if key.endswith(".weight") else key
+        if not is_per_expert(name):
+            continue
+        head, proj = name.rsplit(".", 1)
+        experts_path, idx = head.rsplit(".", 1)
+        if not idx.isdigit():
+            continue
+        parent = profile.packed_expert_parent_for_projection(proj)
+        if parent is None:
+            continue
+        members[f"{experts_path}.{parent}"][int(idx)][proj] = tuple(t.shape)
+    expected: dict[str, tuple] = {}
+    for packed_full, by_e in members.items():
+        parent = packed_full.rsplit(".", 1)[1]
+        order = tuple(profile.packed_expert_projection_names(parent))
+        shapes0 = by_e[min(by_e)]
+        if any(p not in shapes0 for p in order):
+            continue
+        out_rows = sum(shapes0[p][0] for p in order)
+        in_f = shapes0[order[0]][1]
+        expected[packed_full] = (max(by_e) + 1, out_rows, in_f)
+
+    produced = 0
+    for packed_full, shape in expected.items():
+        n = _pack_per_expert_into_packed(
+            skeleton,
+            is_per_expert=is_per_expert,
+            parent_for_projection=profile.packed_expert_parent_for_projection,
+            projection_names_for=profile.packed_expert_projection_names,
+            live_param_shape=(
+                lambda name, _t=packed_full, _s=shape:
+                _s if name == _t else None),
+        )
+        if packed_full in skeleton:
+            skeleton[packed_full + ".weight"] = skeleton.pop(packed_full)
+        produced += n
+    if produced:
+        print(f"[export-cb] packed {produced} per-expert MoE groups into "
+              f"stacked skeleton tensors")
+    return produced
+
 
 def _try_resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
     """Recipe qname -> actual skeleton key, or None if neither the direct name
@@ -253,6 +329,7 @@ def export_nvfp4_cb(
 
     assignment = load_assignment(layer_config_path)
     skeleton = _load_skeleton(model_dir)
+    _pack_skeleton_experts(skeleton, _profile)
 
     # Reuse the compressed-tensors codecs + scheme templates for stock rungs —
     # NEVER reimplement packing. M19 scale-fidelity: `_quantize_2d` renders and
