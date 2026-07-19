@@ -28,21 +28,23 @@ Served 2026-07-19 (`scripts/measure_35b_ab.sh`, `--enforce-eager`,
 | | conf-KL | ALL-KL | conf top1 | ALL top1 | PPL |
 |---|---|---|---|---|---|
 | BF16 (ref) | — | — | — | — | 9.437 |
-| **OURS (CB @4.75)** | **0.01706** | **0.0278** | 99.05% | 92.6% | **9.542 (+1.1%)** |
+| AURA-4.75 (shipped, native serve) | 0.03625 | 0.0492 | 98.44% | 89.9% | 9.587 |
+| **OURS (CB @4.75)** | **0.01706** | **0.0278** | **99.05%** | **92.6%** | **9.542 (+1.1%)** |
 
-- Beats the arm-E-era served CB result (ALL-KL 0.0292) on a fully-automated
-  recipe with the corrected cost stage.
-- **AURA-4.75 baseline: NOT MEASURED** — the artifact is not on disk; the
-  A/B arm skipped. The remembered "served KL 0.0143" for the shipped
-  PrismaAURA-4.75 is a DIFFERENT protocol (kl_tool full-vocab vs this
-  harness's top-20) and must not be compared. Same-harness AURA measurement
-  is queued before any cross-claim.
+**CB wins decisively at matched bpp on MoE: conf-KL −53%, ALL-KL −43%,
+top-1 better on both slices, PPL gap to BF16 −30%** (AURA arm measured
+2026-07-19 against the SAME BF16 dump, same harness — the earlier
+"0.0143" memory figure was a different protocol and is not comparable).
+Also beats the arm-E-era served CB result (ALL-KL 0.0292) on a fully-
+automated recipe. The 27B thesis reproduces on a 256-expert MoE: the same
+bytes, spent on codebook rungs, buy materially more quality.
 
 ## Speed — correctness-tier serving (the known kernel gap)
 
 | | TTFT(1400) | decode tok/s |
 |---|---|---|
 | BF16 (A3B) | 0.484 s | 28.43 |
+| AURA-4.75 (native) | 0.325 s | ~35.9 (steady reps) |
 | OURS (CB, per-expert transient MoE path) | 3.53 s | 3.52 |
 
 The CB MoE method still runs the correctness-first per-expert transient
