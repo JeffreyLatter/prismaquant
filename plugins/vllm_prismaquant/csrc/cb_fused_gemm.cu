@@ -1,5 +1,26 @@
 // Fused-prefill workstream (Task 7).
 //
+// MEASURED VERDICT (2026-07-19, GB10, 27B shapes; bench under bench-lock):
+//   * v1 decode-in-prologue at M=1400: 0.22x of the serial transient
+//     (36.0 vs 8.1 ms/layer-set). NOT a bug — structural: every M-tile CTA
+//     re-decodes the same B tiles, so decode work = ceil(M/128) x the
+//     transient's one-shot expand (11 x 2.7 ms + 5.5 ms GEMM ~= the
+//     measured 36 ms exactly). Overlapping decode with MMA cannot fix a
+//     ~10x compute redundancy.
+//   * chunked expand + fork-GEMM overlap (bit-safe with OUR fixed-config
+//     kernel, unlike cutlass_scaled_mm): 0.74-0.79x of serial — on the
+//     ~273 GB/s unified-memory part the M=1400 GEMM is already partially
+//     memory-bound, so the expander has no spare bandwidth to hide in, and
+//     narrow-N chunks lose GEMM efficiency.
+//   * fused at M<=128 (ONE M-tile -> no redundancy): WINS — 1.04x / 1.26x /
+//     1.45x vs serial at M=32/64/128. This is the fused kernel's honest
+//     serving niche today: the mid-M band (17..128) between the decode GEMV
+//     and the transient path. Serving dispatch not yet wired (default path
+//     unchanged); see tests/test_fused_prefill.py for the bit-exact gates.
+//   * The large-M endgame requires a weight-stationary/persistent-N
+//     schedule (decode each B tile ONCE, loop M inside the CTA) — a
+//     kernel-layer restructure, not a collective fork.
+//
 // Entry points:
 //  - sm120_fp8_mm_fork:  128x128x128 passthrough through the UNCHANGED forked
 //    collective (fork-without-change gate, kept as regression).
