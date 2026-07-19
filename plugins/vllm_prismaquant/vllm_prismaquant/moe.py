@@ -21,6 +21,8 @@ the buffer shapes, w13/w2 split, and per-layer uniformity.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import (
@@ -224,13 +226,27 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 "apply_router_weight_on_input unsupported for CB MoE")
         act = MoEActivation.from_str(layer.activation.value)
         num_tokens = x.shape[0]
+
+        # Decode regime: the grouped CUDA path — ONE kernel launch per
+        # projection covers every routed (token, expert) pair (the per-expert
+        # loop below costs ~10k host syncs/launches per token: 3.52 tok/s
+        # served vs BF16's 28.4 on the 35B A3B).
+        if (num_tokens <= 16 and not self.is_fp4
+                and self._cuda_moe_ok(layer)):
+            return self._apply_grouped_decode(
+                layer, x, topk_weights, topk_ids, act)
+
         out = torch.zeros_like(x)
-        # Grouped by expert: decode each routed expert once (transient), matmul
-        # the tokens routed to it, combine with the router weight. bf16 MMA.
-        for e in range(layer._cb_E):
+        # Prefill / fallback: grouped by expert — decode each routed expert
+        # once (transient), matmul its tokens, combine with the router
+        # weight. bf16 MMA. The hit-expert list is computed with ONE host
+        # sync (the old per-expert `bool(sel.any())` cost E syncs per layer
+        # per forward — the dominant share of the 3.5 s TTFT).
+        hit = torch.bincount(
+            topk_ids.reshape(-1), minlength=layer._cb_E) > 0
+        hit_experts = hit.nonzero(as_tuple=True)[0].tolist()   # one sync
+        for e in hit_experts:
             sel = (topk_ids == e)
-            if not bool(sel.any()):
-                continue
             tok_idx, slot = torch.where(sel)                   # tokens -> expert e
             xe = codec.fp4_group16_act_qdq(x[tok_idx]) if self.is_fp4 \
                 else codec.fp8_dynamic_act_qdq(x[tok_idx])
@@ -250,3 +266,59 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             oe = oe * topk_weights[tok_idx, slot][:, None].to(oe.dtype)
             out.index_add_(0, tok_idx, oe.to(out.dtype))
         return out
+
+    # -- grouped CUDA decode path -------------------------------------------
+    def _cuda_moe_ok(self, layer) -> bool:
+        ok = getattr(layer, "_cb_moe_cuda_ok", None)
+        if ok is None:
+            ok = (self.n_sub == 4 and os.environ.get(
+                "PRISMAQUANT_CB_DECODE", "cuda") == "cuda")
+            if ok:
+                from .cuda_ext import get_ext
+                ok = get_ext() is not None
+            if ok and not hasattr(layer, "_cb_flat_fp8"):
+                layer._cb_flat_fp8 = layer._cb_flat.to(
+                    torch.float8_e4m3fn).view(torch.uint8).contiguous()
+            layer._cb_moe_cuda_ok = ok
+        return ok
+
+    def _apply_grouped_decode(self, layer, x, topk_weights, topk_ids, act):
+        """One grouped GEMV launch per projection over all routed
+        (token, expert) pairs, numerics-matched to the per-expert loop:
+        per-token fp8 QDQ on the module input AND the intermediate, weights
+        bf16(val*scale), fp32-accum GEMVs, per-add bf16 combine in the
+        loop's expert-ascending order."""
+        from .cuda_ext import get_ext
+        ext = get_ext()
+        T, K_hidden = x.shape
+        topk = topk_ids.shape[-1]
+        # Pairs sorted (token-major, expert-ascending) — the loop's
+        # index_add_ order per token. All GPU, no host syncs.
+        ids_sorted, order = torch.sort(topk_ids.to(torch.int32), dim=-1)
+        w_sorted = torch.gather(topk_weights, -1, order.to(torch.int64))
+        pair_expert = ids_sorted.reshape(-1).contiguous()
+        pair_xrow = (torch.arange(T, device=x.device, dtype=torch.int32)
+                     .repeat_interleave(topk))
+        # Match the loop's bf16-rounded router weight before the multiply.
+        pair_w = (w_sorted.reshape(-1).to(torch.bfloat16)
+                  .to(torch.float32).contiguous())
+        tok_start = (torch.arange(T + 1, device=x.device, dtype=torch.int32)
+                     * topk)
+
+        xq = ext.fp8_act_qdq(x.to(torch.bfloat16))
+        gate_up = ext.cb_moe_gemv_fp8(
+            xq, layer.w13_cb_qweight.data, layer._cb_flat_fp8,
+            layer.w13_weight_scale.data, pair_expert, pair_xrow,
+            self.k, self.n_sub, self.type_size)          # (P, 2*inter)
+        d = gate_up.shape[-1] // 2
+        a = torch.empty(gate_up.shape[:-1] + (d,), dtype=gate_up.dtype,
+                        device=gate_up.device)
+        apply_moe_activation(act, a, gate_up)
+        aq = ext.fp8_act_qdq(a)
+        pair_self = torch.arange(pair_expert.numel(), device=x.device,
+                                 dtype=torch.int32)
+        y_down = ext.cb_moe_gemv_fp8(
+            aq, layer.w2_cb_qweight.data, layer._cb_flat_fp8,
+            layer.w2_weight_scale.data, pair_expert, pair_self,
+            self.k, self.n_sub, self.type_size)          # (P, hidden)
+        return ext.cb_moe_combine(y_down, pair_w, tok_start, T)

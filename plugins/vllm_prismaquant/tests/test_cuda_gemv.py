@@ -277,3 +277,86 @@ def test_full_op_raw_x_matches_triton_path():
               p["N"], p["K"], p["k"], p["n_sub"], p["ts"])
     y_t = _triton_y(p, codec.fp8_dynamic_act_qdq(x))
     _assert_triton_close(y_op, y_t, "full-op raw-x")
+
+
+def test_moe_grouped_gemv_matches_loop_numerics():
+    """The grouped MoE decode path (one launch over routed pairs) must match
+    the per-expert loop's numerics chain: per-token fp8 QDQ of input AND
+    intermediate, W = bf16(val*scale), bf16 GEMMs (fp32 accum), bf16-rounded
+    router weight, expert-ascending per-add bf16 combine."""
+    torch.manual_seed(21)
+    E, out13, hidden, inter, k = 8, 64, 512, 32, 44
+    ts = 4 * k
+    assert out13 == 2 * inter
+    g = torch.Generator(device="cpu").manual_seed(21)
+    w13 = torch.randint(0, 256, (E, out13, (hidden // 256) * ts),
+                        generator=g, dtype=torch.uint8).to(DEV)
+    # down: in=inter=32 < 256 superblock -> use in=256 for the test
+    inter2 = 256
+    w2 = torch.randint(0, 256, (E, hidden, (inter2 // 256) * ts),
+                       generator=g, dtype=torch.uint8).to(DEV)
+    subs = [(torch.randn(1 << (k // 4), 2, generator=g) * 4.0)
+            .to(torch.float8_e4m3fn).float().to(DEV) for _ in range(4)]
+    cb = codec.build_flat_codebook(subs)
+    cb8 = cb.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
+    s13 = ((torch.rand(E, out13, generator=g) + 0.5) * 0.02).float().to(DEV)
+    s2 = ((torch.rand(E, hidden, generator=g) + 0.5) * 0.02).float().to(DEV)
+
+    T, topk = 2, 3
+    x = torch.randn(T, hidden, dtype=torch.bfloat16, device=DEV)
+    topk_ids = torch.stack([torch.randperm(E, generator=g)[:topk]
+                            for _ in range(T)]).to(DEV)
+    topk_w = torch.rand(T, topk, generator=g).float().to(DEV)
+
+    def expand_expert(stack, scales, e, in_f):
+        qwp = codec.pad_qweight(stack[e].contiguous())
+        off = torch.zeros(stack.shape[1], dtype=torch.int32, device=DEV)
+        val = ext.cb_expand_fp8(qwp, cb8, off, stack.shape[1], in_f,
+                                k, 4, ts).float()
+        return (val * scales[e][:, None]).to(torch.bfloat16)
+
+    # ---- reference: the per-expert loop chain, expert-ascending ----
+    out_ref = torch.zeros(T, hidden, dtype=torch.bfloat16, device=DEV)
+    for e in range(E):
+        sel = (topk_ids == e)
+        if not bool(sel.any()):
+            continue
+        tok_idx, slot = torch.where(sel)
+        xe = codec.fp8_dynamic_act_qdq(x[tok_idx]).to(torch.bfloat16)
+        W13 = expand_expert(w13, s13, e, hidden)
+        gu = torch.nn.functional.linear(xe, W13)
+        gate, up = gu.chunk(2, dim=-1)
+        a = (torch.nn.functional.silu(gate) * up)
+        # widen intermediate to the 256-superblock width for down
+        a256 = torch.zeros(a.shape[0], inter2, dtype=a.dtype, device=DEV)
+        a256[:, :inter] = a
+        aq = codec.fp8_dynamic_act_qdq(a256).to(torch.bfloat16)
+        W2 = expand_expert(w2, s2, e, inter2)
+        oe = torch.nn.functional.linear(aq, W2)
+        oe = oe * topk_w[tok_idx, slot][:, None].to(oe.dtype)
+        out_ref.index_add_(0, tok_idx, oe)
+
+    # ---- grouped kernels (mirrors moe._apply_grouped_decode) ----
+    ids_sorted, order = torch.sort(topk_ids.to(torch.int32), dim=-1)
+    w_sorted = torch.gather(topk_w, -1, order.to(torch.int64))
+    pair_expert = ids_sorted.reshape(-1).contiguous()
+    pair_xrow = torch.arange(T, device=DEV,
+                             dtype=torch.int32).repeat_interleave(topk)
+    pair_w = (w_sorted.reshape(-1).to(torch.bfloat16)
+              .to(torch.float32).contiguous())
+    tok_start = torch.arange(T + 1, device=DEV, dtype=torch.int32) * topk
+    xq = ext.fp8_act_qdq(x)
+    gu = ext.cb_moe_gemv_fp8(xq, w13, cb8, s13, pair_expert, pair_xrow,
+                             k, 4, ts)
+    gate, up = gu.chunk(2, dim=-1)
+    a = torch.nn.functional.silu(gate) * up
+    a256 = torch.zeros(a.shape[0], inter2, dtype=a.dtype, device=DEV)
+    a256[:, :inter] = a
+    aq = ext.fp8_act_qdq(a256)
+    pair_self = torch.arange(pair_expert.numel(), device=DEV,
+                             dtype=torch.int32)
+    y_down = ext.cb_moe_gemv_fp8(aq, w2, cb8, s2, pair_expert, pair_self,
+                                 k, 4, ts)
+    out_got = ext.cb_moe_combine(y_down, pair_w, tok_start, T)
+
+    _assert_triton_close(out_got, out_ref, "moe grouped vs loop")
