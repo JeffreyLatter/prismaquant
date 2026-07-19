@@ -76,41 +76,77 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
         del params_dtype
-        weight_loader = extra_weight_attrs.get("weight_loader")
         E = num_experts
         inter = intermediate_size_per_partition
         layer._cb_hidden = hidden_size
         layer._cb_inter = inter
+        # extra_weight_attrs already carries the weight_loader; ONE
+        # set_weight_attrs per param (a second call trips vLLM's
+        # "Overwriting existing tensor attribute" assert — 35B first serve).
+        attrs = dict(extra_weight_attrs)
         # w13 = gate_up: out=2*inter, in=hidden.  w2 = down: out=hidden, in=inter.
         w13 = torch.nn.Parameter(torch.empty(
             E, 2 * inter, _row_bytes(hidden_size, self.type_size),
             dtype=torch.uint8), requires_grad=False)
-        set_weight_attrs(w13, {"weight_loader": weight_loader,
-                               "is_transposed": False})
-        set_weight_attrs(w13, extra_weight_attrs)
+        set_weight_attrs(w13, {**attrs, "is_transposed": False})
         layer.register_parameter("w13_cb_qweight", w13)
 
         w2 = torch.nn.Parameter(torch.empty(
             E, hidden_size, _row_bytes(inter, self.type_size),
             dtype=torch.uint8), requires_grad=False)
-        set_weight_attrs(w2, {"weight_loader": weight_loader,
-                              "is_transposed": False})
-        set_weight_attrs(w2, extra_weight_attrs)
+        set_weight_attrs(w2, {**attrs, "is_transposed": False})
         layer.register_parameter("w2_cb_qweight", w2)
 
         if not self.is_fp4:                       # fp8: per-(expert, out) scale
             w13s = torch.nn.Parameter(
                 torch.empty(E, 2 * inter, dtype=torch.float32),
                 requires_grad=False)
-            set_weight_attrs(w13s, {"weight_loader": weight_loader})
-            set_weight_attrs(w13s, extra_weight_attrs)
+            set_weight_attrs(w13s, dict(attrs))
             layer.register_parameter("w13_weight_scale", w13s)
             w2s = torch.nn.Parameter(
                 torch.empty(E, hidden_size, dtype=torch.float32),
                 requires_grad=False)
-            set_weight_attrs(w2s, {"weight_loader": weight_loader})
-            set_weight_attrs(w2s, extra_weight_attrs)
+            set_weight_attrs(w2s, dict(attrs))
             layer.register_parameter("w2_weight_scale", w2s)
+
+        # Instance-level load hook (GGUF-plugin pattern, zero core patches):
+        # vLLM's RoutedExperts.load_weights maps checkpoint names by
+        # substring-replacing the projection name, which (a) derives DOTTED
+        # attribute names for our `<proj>.cb_qweight` suffix (getattr fails)
+        # and (b) applies a bf16-orientation transpose heuristic that would
+        # corrupt byte tensors (last dim = row_bytes, never hidden). CB
+        # tensors therefore load DIRECTLY into our stacked params; every
+        # other tensor delegates to the original loader untouched.
+        if not getattr(layer, "_cb_load_wrapped", False):
+            orig_load = layer.load_weights
+            prefix = self.prefix
+            cb_map = {
+                "gate_up_proj.cb_qweight": "w13_cb_qweight",
+                "down_proj.cb_qweight": "w2_cb_qweight",
+                "gate_up_proj.weight_scale": "w13_weight_scale",
+                "down_proj.weight_scale": "w2_weight_scale",
+            }
+
+            def _cb_load_weights(weights):
+                deferred = []
+                for name, w in weights:
+                    pname = cb_map.get(name)
+                    if pname is not None and hasattr(layer, pname):
+                        p = getattr(layer, pname)
+                        if tuple(p.shape) != tuple(w.shape):
+                            raise ValueError(
+                                f"{prefix}.{name}: checkpoint shape "
+                                f"{tuple(w.shape)} != param {tuple(p.shape)}"
+                                f" — stacked (E, out, bytes) contract violated")
+                        p.data.copy_(w.to(p.dtype))
+                        yield pname
+                    else:
+                        deferred.append((name, w))
+                if deferred:
+                    yield from orig_load(deferred)
+
+            layer.load_weights = _cb_load_weights
+            layer._cb_load_wrapped = True
 
     def get_fused_moe_quant_config(self, layer) -> FusedMoEQuantConfig | None:
         return None
