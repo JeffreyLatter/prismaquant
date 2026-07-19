@@ -1,5 +1,25 @@
 # CUTLASS serving-kernel — grounding map (2026-07-18)
 
+> **FUSED-PREFILL VERDICT (2026-07-19, commits 80e6414/8936a01).** The
+> decode-in-prologue collective EXISTS and is **bit-exact**
+> (`csrc/cutlass_fork/sm120_cb_fused_mma.hpp`, KBits-templated, packed-B TMA +
+> consumer-side smem decode, 128×64×128 Stages=2, 74.7–76.8 KB smem;
+> pinned by `tests/test_fused_prefill.py` incl. the real 0.6B layer). But at
+> M=1400 it measures **0.22×** vs the serial transient — structural, not
+> implementation: every M-tile CTA re-decodes the same B tiles, so decode work
+> scales ×ceil(M/128) while the transient expands once (predicted 35 ms ≈
+> measured 36 ms). Chunked expand+GEMM overlap with our fixed-config fork GEMM
+> (bit-safe, unlike `cutlass_scaled_mm`) is also dead: 0.74–0.79× — the
+> M=1400 GEMM is already partially memory-bound on GB10's ~273 GB/s, no spare
+> bandwidth to hide the expander. **The fused kernel's honest niche is
+> M∈(16,128]: 1.04×/1.26×/1.45× at M=32/64/128** (dispatch intentionally not
+> wired; spec in prismaquant-handover). Large-M parity (the remaining 0.33 s
+> TTFT) requires a **weight-stationary / persistent-N schedule** — decode each
+> B tile once, loop M inside the CTA — a kernel-layer restructure beyond the
+> collective fork. Until then the serial transient (1.075 s TTFT) is default.
+> Incidental: side-stream drivers must `es.wait_stream(main)` before consuming
+> main-enqueued tensors (IMA repro otherwise).
+
 > **STATUS UPDATE (2026-07-19 kernel session).** Build steps 1 and 3 of the
 > sequence below are DONE and served; step 2 (fused prefill) is the open
 > piece.
