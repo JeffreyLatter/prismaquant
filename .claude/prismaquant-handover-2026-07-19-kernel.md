@@ -110,6 +110,28 @@ mechanism behind CLAUDE.md's "KL drifts across sessions". Consequences:
   `/artifacts` = nvfp4-cb-phase0/serve mount and nvcc). Bench:
   `tests/bench_cuda_gemv.py`. Profile: scratchpad scripts (not committed).
 
+## 4b. Second half of the session (encode track + fused verdict)
+
+- **Fused prefill verdict** (commits 80e6414/8936a01/108d6b6): decode-in-
+  prologue collective is DONE and bit-exact; **0.22× at M=1400 (structural:
+  per-M-tile re-decode)**, wins only M∈(16,128] (1.04–1.45×); chunked overlap
+  also dead (GEMM already memory-bound at M=1400). Large-M parity = the
+  persistent-N/decode-once schedule (task; cutlass-kernel-notes has the full
+  verdict + wiring spec for the mid-M band). TTFT stays 1.075 s by default.
+- **Encode track** (75eb95d/fbd666d/924ce74): local-stage expert-measure skip
+  under the hybrid; expert KL-sampling implemented then **REFUTED by
+  measurement** — and the refutation surfaced the real finding: **the bf16
+  expert unit-KL at CB fidelity is a perturbation floor** (S=1 of 256 ≈
+  full-stack KL ≈ 0.016–0.019; memory `cb_expert_unitkl_floor`). Recommended
+  35B-resume recipe (pending Robert): `CB_EXPERT_EMPIRICAL=0` +
+  `PRISMAQUANT_EXPERT_COST_SAMPLE=16` (MSE sampling is unbiased) + ladder →
+  cost stage ~14 h → ~1 h. Three latent 35B blockers fixed en route:
+  zero-expert fill missing from the empirical CLI (+ loud all-zero guard),
+  fill no-op against staged dirs (pass the ORIGINAL model dir), missing
+  down_proj imatrix (replay synthesis, persisted for exporter lockstep).
+  Ladder generalized (FP8 rungs, fitted slope, pays at 4 rungs);
+  `PRISMAQUANT_EXPERT_CALIB_BATCH` for the forward wall.
+
 ## 5. Still open beyond the fused kernel (unchanged from prior handover)
 
 - Encode-time speed (the 35B cost stage; JSO-style candidate-collapse prune).
