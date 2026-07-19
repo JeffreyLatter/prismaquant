@@ -32,13 +32,24 @@ export TARGET_PROFILE=nvfp4_cb
 export COST_MODE=local
 export PRODUCTION_CACHE=0
 export PRODUCTION_RECACHE=0
-export CB_EXPERT_EMPIRICAL=1            # 192-expert MoE route-flip fix (M4-hybrid)
+# 2026-07-19 recipe (per the 35B-proven corrections): the empirical unit-KL
+# is a perturbation floor at CB fidelity (memory cb_expert_unitkl_floor) and
+# cannot rank CB rungs — and at 295B it would run for days. Expert stacks use
+# the LOCAL weighted-MSE cost (per-expert imatrix incl the down_proj routed
+# replay) with MSE-unbiased sampling (192 experts -> ÷12) + the per-family
+# floor-law rung ladder.
+export CB_EXPERT_EMPIRICAL=0
+export PRISMAQUANT_EXPERT_COST_SAMPLE=16
+export CB_LADDER_INTERP=1
 export EXPORT_STREAMING=auto            # >=80GB source auto-streams (export_nvfp4_cb_streaming, 1ff7185)
 
 # --- ultra-low-bpp menu: fp4-CB v2 (two-tier, 2.0-3.5bpp) dominant + fp8-CB for
 #     the sensitive tail + BF16 sidecars. TWO-TIER v2 for the byte win at this
-#     band (0.28 vs 0.5 bpw scale). fp4-CB SERVING needs v2-compose (gate c). ---
-export FORMATS="NVFP4_CB_K14,NVFP4_CB_K16,NVFP4_CB_K18,NVFP4_CB_K20,FP8_CB_K36,FP8_CB_K44,BF16"
+#     band (0.28 vs 0.5 bpw scale). fp4-CB SERVING needs v2-compose (gate c).
+#     fp8 tail widened to the 4-rung K28..K44 ladder (K28/K32 added 2026-07-19;
+#     3.5/4.0 bpw steps for the sensitive tail, and 4 rungs make the fp8
+#     family ladder-interpolable). ---
+export FORMATS="NVFP4_CB_K14,NVFP4_CB_K16,NVFP4_CB_K18,NVFP4_CB_K20,FP8_CB_K28,FP8_CB_K32,FP8_CB_K36,FP8_CB_K44,BF16"
 export CB_SCALE_CODING=two_tier        # v2 (premium-flip; exp-1c GO)
 export TARGET_BITS=2.9                 # single-Spark fit (matches shipped GGUF Hy3 2.8bpp)
 export PARETO_TARGETS="2.7,2.9,3.1"
