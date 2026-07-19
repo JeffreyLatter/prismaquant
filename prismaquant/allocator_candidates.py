@@ -47,8 +47,10 @@ def _profile_allows_format(
     target_profile: str | None,
     name: str | None,
     fmt: str,
+    packed_expert: bool | None = None,
 ) -> FormatApplicability:
-    decision = check_serving_format(target_profile, name, fmt)
+    decision = check_serving_format(target_profile, name, fmt,
+                                    packed_expert=packed_expert)
     return FormatApplicability(
         decision.legal,
         decision.reason,
@@ -112,7 +114,10 @@ def check_format_applicability(
             f"{fmt} requires source_kind={required!r}, got {source_kind!r}",
         )
 
-    profile_verdict = _profile_allows_format(target_profile, qname, fmt)
+    # Rank-3 shapes ARE packed expert stacks — the profile can scope rules
+    # to them (containers whose stock-CT delegation is dense-only).
+    profile_verdict = _profile_allows_format(
+        target_profile, qname, fmt, packed_expert=len(shape) >= 3)
     if not profile_verdict.legal:
         return profile_verdict
 

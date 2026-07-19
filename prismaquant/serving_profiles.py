@@ -68,9 +68,19 @@ class ServingFormatRule:
     deny_formats: tuple[str, ...] = ()
     reason: str = "profile_mismatch"
     detail: str = ""
+    # Target-class scoping: "all" (default), "packed_experts" (rank-3 stacked
+    # MoE tensors only), or "dense" (everything else). Lets a container
+    # declare capabilities that differ between dense Linears and packed
+    # expert stacks (e.g. nvfp4_cb carries no stock-CT packed-MoE emission).
+    scope: str = "all"
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ServingFormatRule":
+        scope = str(payload.get("scope", "all"))
+        if scope not in ("all", "packed_experts", "dense"):
+            raise ValueError(
+                f"format rule {payload.get('id')!r}: unknown scope {scope!r} "
+                f"(expected all|packed_experts|dense)")
         return cls(
             id=str(payload["id"]),
             when=NameCondition.from_dict(payload.get("when") or {}),
@@ -78,9 +88,15 @@ class ServingFormatRule:
             deny_formats=tuple(str(v) for v in payload.get("deny_formats", ())),
             reason=str(payload.get("reason", "profile_mismatch")),
             detail=str(payload.get("detail", "")),
+            scope=scope,
         )
 
-    def check(self, qname: str, fmt: str) -> ServingFormatDecision | None:
+    def check(self, qname: str, fmt: str,
+              packed_expert: bool | None = None) -> ServingFormatDecision | None:
+        if self.scope == "packed_experts" and packed_expert is not True:
+            return None
+        if self.scope == "dense" and packed_expert is True:
+            return None
         if not self.when.matches(qname):
             return None
         if self.allow_formats and not _format_in(fmt, self.allow_formats):
@@ -298,10 +314,12 @@ class ServingProfile:
             description=str(payload.get("description", "")),
         )
 
-    def check_format(self, qname: str | None, fmt: str) -> ServingFormatDecision:
+    def check_format(self, qname: str | None, fmt: str,
+                     packed_expert: bool | None = None
+                     ) -> ServingFormatDecision:
         name = qname or ""
         for rule in self.format_rules:
-            decision = rule.check(name, fmt)
+            decision = rule.check(name, fmt, packed_expert=packed_expert)
             if decision is not None and not decision.legal:
                 return decision
         return ServingFormatDecision(True)
@@ -422,6 +440,7 @@ def check_serving_format(
     profile_id: str | None,
     qname: str | None,
     fmt: str,
+    packed_expert: bool | None = None,
 ) -> ServingFormatDecision:
     try:
         profile = load_serving_profile(profile_id)
@@ -431,7 +450,7 @@ def check_serving_format(
             "profile_mismatch",
             f"unknown target profile {profile_id!r}",
         )
-    return profile.check_format(qname, fmt)
+    return profile.check_format(qname, fmt, packed_expert=packed_expert)
 
 
 def check_serving_shape(

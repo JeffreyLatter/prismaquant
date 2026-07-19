@@ -145,3 +145,21 @@ def test_export_skeleton_expert_packing():
     # Dense-only skeleton: no-op.
     dense = {"model.layers.0.mlp.up_proj.weight": torch.randn(4, 4)}
     assert _pack_skeleton_experts(dense, _Prof()) == 0
+
+
+def test_nvfp4_cb_profile_denies_stock_formats_on_packed_experts():
+    """The nvfp4_cb container's stock-CT delegation is dense-only: the
+    profile must deny stock NVFP4/FP8 on rank-3 packed expert stacks while
+    allowing them on dense Linears, and allow CB rungs on both."""
+    from prismaquant.allocator_candidates import check_format_applicability
+
+    dense = (2048, 2048)
+    stack = (256, 1024, 2048)
+    kw = dict(target_profile="nvfp4_cb")
+    assert check_format_applicability(dense, "NVFP4", **kw).legal
+    v = check_format_applicability(stack, "NVFP4", **kw)
+    assert not v.legal and v.reason == "runtime_unsupported"
+    assert not check_format_applicability(stack, "FP8_E4M3", **kw).legal
+    assert check_format_applicability(stack, "FP8_CB_K36", **kw).legal
+    assert check_format_applicability(stack, "FP8_CB_K28", **kw).legal
+    assert check_format_applicability(dense, "FP8_CB_K44", **kw).legal
