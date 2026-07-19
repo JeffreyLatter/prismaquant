@@ -57,15 +57,15 @@ export PARETO_TARGETS="2.7,2.9,3.1"
 # --- streaming probe/cost (bounded residency); conservative calibration ---
 export NSAMPLES=8
 export SEQLEN=1024
-export CACHE_HEADROOM_GB=30
+export CACHE_HEADROOM_GB=45   # shard-1 OOM 2026-07-19: 84.9GB cache budget + bwd workspace overran the pool
 export ACTIVATION_ROWS_LIMIT=1024
 export CB_CODEBOOK_SOURCE=lattice
 export PRISMAQUANT_CB_ENCODE_TIER=balanced
 export CALIBRATION_MODALITY=text-only
 export DEVICE=cuda
 export EXPORT_DEVICE=cuda
-export PRISMAQUANT_PROBE_PREFETCH_LOOKAHEAD=3   # Hy3 probe OOM guard (2026-07 lesson)
-export PRISMAQUANT_PROBE_MIN_AVAILABLE_GB=30
+export PRISMAQUANT_PROBE_PREFETCH_LOOKAHEAD=2   # Hy3 probe OOM guard (2026-07 lesson)
+export PRISMAQUANT_PROBE_MIN_AVAILABLE_GB=40
 
 echo "============================================================================"
 echo "Hy3 295B-A21B ULTRA-LOW-BPP — nvfp4_cb STREAMING @${TARGET_BITS} bpp (v2 two-tier)"
