@@ -1004,10 +1004,19 @@ def _measure_packed_experts(
                     w_in = w[s_idx]
                 else:
                     w_in = w
+                cw_use = packed_gguf_qw
+                if _cost_render_uses_imatrix(spec):
+                    ext_cw = _cb_col_weights_lookup(full_name)
+                    if ext_cw is not None:
+                        cw_use = ext_cw.to(device=w.device,
+                                           dtype=torch.float32)
+                        if (use_sample and cw_use.ndim >= 3
+                                and cw_use.shape[0] == w.shape[0]):
+                            cw_use = cw_use[s_idx]
                 w_hat = _batched_quantize(
                     spec, w_in,
                     col_weights=(
-                        packed_gguf_qw
+                        cw_use
                         if _cost_render_uses_imatrix(spec) else None
                     ),
                 )
@@ -1328,6 +1337,26 @@ def _batched_quantize(
 # Holdout gate tolerance for the dense-path ladder (matches the expert
 # stage's --ladder-holdout-tol default).
 _CB_LADDER_TOL = float(os.environ.get("PRISMAQUANT_CB_LADDER_TOL", "0.10"))
+
+_CB_CW_CACHE: dict | None = None
+
+
+def _cb_col_weights_lookup(name: str):
+    """Shared CB col-weights pickle (PRISMAQUANT_CB_COL_WEIGHTS, set by the
+    pipeline when local packed-expert costs must match the exporter's
+    weighting — incl. the synthesized per-expert down_proj replay entries the
+    inline module-input pool can never provide)."""
+    global _CB_CW_CACHE
+    path = os.environ.get("PRISMAQUANT_CB_COL_WEIGHTS")
+    if not path:
+        return None
+    if _CB_CW_CACHE is None:
+        with open(path, "rb") as fh:
+            _CB_CW_CACHE = {k: torch.as_tensor(v)
+                            for k, v in pickle.load(fh).items()}
+        print(f"[cost] packed-expert col-weights from {path} "
+              f"({len(_CB_CW_CACHE)} entries)", flush=True)
+    return _CB_CW_CACHE.get(name)
 
 
 def _cb_ladder_plan(specs: list[fr.FormatSpec]):

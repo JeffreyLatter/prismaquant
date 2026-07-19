@@ -607,6 +607,40 @@ require_stage_settings "${BASE_COST_PATH}" base-cost \
   "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
   "SEQLEN=$SEQLEN" "FORMATS=$FORMATS"
 if [[ ! -f "${BASE_COST_PATH}" ]]; then
+  # CB lane + LOCAL expert costs (CB_EXPERT_EMPIRICAL=0): the packed-expert
+  # measurement must use the SAME imatrix the exporter ships — incl. the
+  # synthesized per-expert down_proj replay entries the raw harvest can never
+  # contain. Harvest now (act cache exists post-probe; skip-if-exists) and
+  # point the cost stage at the pickle. Without this, down_proj stacks would
+  # be COSTED unweighted while the export ships weighted bytes (the
+  # rendering-confound class).
+  if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" \
+     && "${CB_EXPERT_EMPIRICAL:-1}" != "1" ]]; then
+    : "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
+    if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
+      echo "[pipeline] [2/4] pre-cost CB col-weights harvest (local expert costs) ..."
+      CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
+import os, pickle
+from prismaquant.export_gguf import build_imatrix_from_act_cache
+from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
+act_dir = os.environ["CB_ACT_DIR"]
+out = os.environ["CB_COL_WEIGHTS"]
+cw = build_imatrix_from_act_cache(act_dir)
+if not cw:
+    raise SystemExit(f"[pipeline] ERROR: no activation cache under {act_dir!r}")
+added = synthesize_packed_expert_col_weights(
+    os.environ["MODEL_PATH"], act_dir, cw)
+if added:
+    print(f"[pipeline] [2/4] synthesized {len(added)} packed-expert "
+          f"imatrix entries (gate_up pool / down_proj routed replay)")
+os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+with open(out, "wb") as fh:
+    pickle.dump(cw, fh)
+print(f"[pipeline] [2/4] wrote {out}: {len(cw)} entries")
+PY
+    fi
+    export PRISMAQUANT_CB_COL_WEIGHTS="$CB_COL_WEIGHTS"
+  fi
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
   python3 -m prismaquant.incremental_measure_quant_cost \
     --model "$MODEL_PATH" \
@@ -950,9 +984,10 @@ PY
     # measured cost and shipped bytes stay the one weighted render).
     if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
       echo "[pipeline] [2d-CB] harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
-      CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" python3 - <<'PY'
+      CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
 import os, pickle
 from prismaquant.export_gguf import build_imatrix_from_act_cache
+from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
 act_dir = os.environ["CB_ACT_DIR"]
 out = os.environ["CB_COL_WEIGHTS"]
 cw = build_imatrix_from_act_cache(act_dir)
@@ -960,6 +995,11 @@ if not cw:
     raise SystemExit(
         f"[pipeline] ERROR: no activation cache under {act_dir!r}; the "
         f"empirical expert pass needs a col-weights vector per CB target.")
+added = synthesize_packed_expert_col_weights(
+    os.environ["MODEL_PATH"], act_dir, cw)
+if added:
+    print(f"[pipeline] [2d-CB] synthesized {len(added)} packed-expert "
+          f"imatrix entries (gate_up pool / down_proj routed replay)")
 os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 with open(out, "wb") as fh:
     pickle.dump(cw, fh)
@@ -1515,9 +1555,10 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
   # {qname: (in_features,) tensor} pickle (e.g. Fisher col-weights, exp-4).
   if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
     echo "[pipeline] [4/4] harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
-    CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" python3 - <<'PY'
+    CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
 import os, pickle
 from prismaquant.export_gguf import build_imatrix_from_act_cache
+from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
 act_dir = os.environ["CB_ACT_DIR"]
 out = os.environ["CB_COL_WEIGHTS"]
 cw = build_imatrix_from_act_cache(act_dir)
@@ -1526,6 +1567,11 @@ if not cw:
         f"[pipeline] ERROR: no activation cache under {act_dir!r}; the CB "
         f"exporter needs a col-weights (imatrix) vector per CB target. Run "
         f"the probe+cost stages first (they populate {act_dir}).")
+added = synthesize_packed_expert_col_weights(
+    os.environ["MODEL_PATH"], act_dir, cw)
+if added:
+    print(f"[pipeline] [4/4] synthesized {len(added)} packed-expert "
+          f"imatrix entries (gate_up pool / down_proj routed replay)")
 os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 with open(out, "wb") as fh:
     pickle.dump(cw, fh)
