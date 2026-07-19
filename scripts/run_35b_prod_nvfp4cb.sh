@@ -71,6 +71,11 @@ export VISUAL_FORMAT=BF16
 export CALIBRATION_MODALITY=text-only
 export DEVICE=cuda
 export EXPORT_DEVICE=cuda
+# Resident export OOM-killed at 35B (66 GB source + accumulated outputs +
+# GPU encode workspace share the 121 GB unified pool — the auto threshold's
+# 80 GB source-size heuristic under-counts on MoE). The streaming exporter
+# carries its own per-expert->stacked bridge (one expert resident at a time).
+export EXPORT_STREAMING=1
 
 echo "============================================================================"
 echo "35B MoE PRODUCTION A/B — nvfp4_cb @${TARGET_BITS} bpp (M4-hybrid expert cost)"
