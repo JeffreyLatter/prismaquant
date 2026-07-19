@@ -342,3 +342,34 @@ def test_imatrix_synthesis_for_cb_units():
     added2 = ensure_unit_col_weights(model, units, cw, unit_x)
     assert added2 == [] and torch.equal(cw["inner.mlp.experts.down_proj"],
                                         before)
+
+
+def test_floor_law_fit_exact_and_degenerate():
+    """The 3-anchor floor law D = F + C*2^(-b*k): exact recovery on
+    floor-law data (where pure log-linear would miss), None on non-monotone
+    anchors (caller falls back to log-linear, holdout still gates)."""
+    from prismaquant.expert_empirical_cost import (
+        _cb_ladder_fit,
+        _fit_floor_law,
+    )
+    F0, C0, b0 = 0.004, 3.0, 0.35
+    ks = [28.0, 40.0, 48.0]
+    ds = [F0 + C0 * 2.0 ** (-b0 * k) for k in ks]
+    fl = _fit_floor_law(ks, ds)
+    assert fl is not None
+    F, C, b = fl
+    assert F == pytest.approx(F0, rel=1e-6)
+    assert C == pytest.approx(C0, rel=1e-6)
+    assert b == pytest.approx(b0, rel=1e-6)
+    # Non-monotone -> None.
+    assert _fit_floor_law(ks, [1.0, 2.0, 0.5]) is None
+    # End-to-end through _cb_ladder_fit: floor-law data, 3 anchors, exact
+    # holdout acceptance + exact prediction (log-linear would reject here).
+    fmts = {f"FP8_CB_K{k}": k for k in (28, 32, 36, 40, 44, 48)}
+    kls = {f: F0 + C0 * 2.0 ** (-b0 * kk) for f, kk in fmts.items()}
+    anchors = ["FP8_CB_K28", "FP8_CB_K40", "FP8_CB_K48"]
+    pred, rel = _cb_ladder_fit(kls, fmts, anchors, "FP8_CB_K36",
+                               ["FP8_CB_K32", "FP8_CB_K44"], 0.10)
+    assert pred is not None and rel < 1e-9
+    for f, v in pred.items():
+        assert v == pytest.approx(kls[f], rel=1e-9)

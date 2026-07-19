@@ -393,25 +393,84 @@ def _cb_ladder_split(measured_fmts: Sequence[str]):
     return ladders or None
 
 
+def _fit_floor_law(ks: Sequence[float], ds: Sequence[float]):
+    """Solve D(k) = F + C * 2^(-b*k) exactly through three (k, D) anchors
+    (unequal spacing; bisection on b). The floor term matters for the FP8_CB
+    family, whose error flattens toward the E4M3 grid's own floor at high k —
+    a pure log-linear law systematically misses there (0.6B smoke: 60-90%
+    holdout rejection). Returns (F, C, b) with F >= 0, or None when the
+    anchors are non-monotone/degenerate (caller falls back to log-linear;
+    the holdout gate rules either way)."""
+    pts = sorted(zip(ks, ds))
+    (k1, d1), (k2, d2), (k3, d3) = pts
+    if not (d1 > d2 > d3 > 0.0):
+        return None
+    target = (d1 - d2) / (d2 - d3)
+
+    def ratio(b):
+        r1, r2, r3 = (2.0 ** (-b * k) for k in (k1, k2, k3))
+        den = r2 - r3
+        if den <= 0.0:
+            return float("inf")
+        return (r1 - r2) / den
+
+    lo, hi = 1e-6, 4.0
+    if ratio(lo) > target:            # decays faster than pure exponential
+        return None
+    while ratio(hi) < target and hi < 64.0:
+        hi *= 2.0
+    if ratio(hi) < target:
+        return None
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if ratio(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    b = 0.5 * (lo + hi)
+    r1 = 2.0 ** (-b * k1)
+    r2 = 2.0 ** (-b * k2)
+    if r1 - r2 <= 0.0:
+        return None
+    C = (d1 - d2) / (r1 - r2)
+    F = d1 - C * r1
+    if F < 0.0 or C <= 0.0:
+        return None
+    return F, C, b
+
+
 def _cb_ladder_fit(kls: Mapping[str, float], kmap: Mapping[str, int],
                    anchors: Sequence[str], holdout: str,
                    predicted: Sequence[str], tol: float):
-    """Fit log2 D = a - b*k on the anchors (least squares; with 2 anchors the
-    line is exact — the slope is fitted, not assumed, so the fp8 ladder does
-    not inherit the fp4-calibrated 1/4-per-k decay). Accept iff the holdout's
-    relative error <= tol. Returns (predicted_kls | None, holdout_rel_err)."""
-    xs = [float(kmap[f]) for f in anchors]
-    ys = [math.log2(max(kls[f], 1e-12)) for f in anchors]
-    n = float(len(xs))
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    denom = sum((x - mx) ** 2 for x in xs)
-    b = (-sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
-         if denom > 0 else _LADDER_SLOPE_BITS)
-    a = my + b * mx
+    """Fit the anchors and predict. With 3 anchors, first try the FLOOR law
+    D = F + C*2^(-b*k) (exact through 3 points; the fp8 family flattens
+    toward the E4M3 grid floor at high k); fall back to log-linear
+    (least squares; with 2 anchors the line is exact — the slope is fitted,
+    not assumed). Accept iff the holdout's relative error <= tol. Returns
+    (predicted_kls | None, holdout_rel_err)."""
+    pred = None
+    if len(anchors) == 3:
+        fl = _fit_floor_law([float(kmap[f]) for f in anchors],
+                            [float(kls[f]) for f in anchors])
+        if fl is not None:
+            F, C, b = fl
 
-    def pred(f):
-        return float(2.0 ** (a - b * kmap[f]))
+            def pred(f, _F=F, _C=C, _b=b):
+                return float(_F + _C * 2.0 ** (-_b * kmap[f]))
+
+    if pred is None:
+        xs = [float(kmap[f]) for f in anchors]
+        ys = [math.log2(max(kls[f], 1e-12)) for f in anchors]
+        n = float(len(xs))
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        denom = sum((x - mx) ** 2 for x in xs)
+        b = (-sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+             if denom > 0 else _LADDER_SLOPE_BITS)
+        a = my + b * mx
+
+        def pred(f, _a=a, _b=b):
+            return float(2.0 ** (_a - _b * kmap[f]))
 
     rel = abs(pred(holdout) - kls[holdout]) / max(kls[holdout], 1e-12)
     if rel > tol:

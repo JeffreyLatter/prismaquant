@@ -1381,13 +1381,23 @@ def _cb_ladder_plan(specs: list[fr.FormatSpec]):
 
 
 def _ladder_metric_fit(kmap, anchors, fmt_values, target_fmt):
-    """LS fit log2(v) = a - b*k on the anchors for ONE metric; returns the
-    predicted value at target_fmt (None if any anchor value is unusable)."""
+    """Fit ONE metric on the anchors and predict target_fmt. With 3 anchors
+    the FLOOR law D = F + C*2^(-b*k) is tried first (the fp8 family flattens
+    toward the E4M3 grid floor at high k — pure log-linear rejected 60-90% of
+    holdouts on the 0.6B smoke); log-linear LS is the fallback. Returns None
+    if any anchor value is unusable."""
     try:
         xs = [float(kmap[f]) for f in anchors]
-        ys = [math.log2(max(float(fmt_values[f]), 1e-20)) for f in anchors]
+        vs = [float(fmt_values[f]) for f in anchors]
     except (KeyError, TypeError):
         return None
+    if len(anchors) == 3:
+        from prismaquant.expert_empirical_cost import _fit_floor_law
+        fl = _fit_floor_law(xs, vs)
+        if fl is not None:
+            F, C, b = fl
+            return float(F + C * 2.0 ** (-b * kmap[target_fmt]))
+    ys = [math.log2(max(v, 1e-20)) for v in vs]
     n = float(len(xs))
     mx = sum(xs) / n
     my = sum(ys) / n
