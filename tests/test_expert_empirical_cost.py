@@ -205,3 +205,105 @@ def test_fp8_weight_qdq_is_chunk_invariant_on_packed_tensors():
         for chunk in (4, 16)
     }
     assert kls[4] == kls[16]
+
+
+# --------------------------------------------------------------------------- #
+# Expert sampling + ladder generalization (encode-speed workstream 2026-07-19)
+# --------------------------------------------------------------------------- #
+def _wide_moe(num_experts: int = 8, seed: int = 11) -> "TinyCausal":
+    from test_packed_expert_cross_domain_gate import (
+        TinyPackedExperts,
+        TinyRouter,
+    )
+    torch.manual_seed(seed)
+    model = TinyCausal().eval()
+    model.inner.mlp.gate = TinyRouter(hidden_size=16, num_experts=num_experts)
+    model.inner.mlp.experts = TinyPackedExperts(num_experts=num_experts)
+    return model
+
+
+def test_expert_sampling_restores_and_annotates():
+    model = _wide_moe()
+    calib = torch.randint(0, 32, (2, 24))
+    before = {
+        n: getattr(model.inner.mlp.experts, a).detach().clone()
+        for n, a in (("gate_up", "gate_up_proj"), ("down", "down_proj"))
+    }
+    stats, costs, unit_kls = measure_expert_unit_costs(
+        model, None, calib, ["NVFP4", "FP8_DYNAMIC", "BF16"],
+        expert_chunk=1, progress=False, expert_sample=3)
+    (unit,) = unit_kls.values()
+    samp = unit["_sampling"]
+    assert samp["num_experts"] == 8 and samp["sampled"] == 3
+    assert samp["scale"] == pytest.approx(8.0 / 3.0, rel=1e-3)
+    assert unit["NVFP4"] > 0.0
+    # Restoration exact even under slice-wise clone/restore.
+    assert torch.equal(
+        model.inner.mlp.experts.gate_up_proj.detach(), before["gate_up"])
+    assert torch.equal(
+        model.inner.mlp.experts.down_proj.detach(), before["down"])
+    # Member shares still re-assemble the (scaled) unit KL.
+    total = sum(costs[n]["NVFP4"]["predicted_dloss"] for n in EXPERT_NAMES)
+    assert total == pytest.approx(unit["NVFP4"], rel=1e-6)
+
+
+def test_expert_sampling_estimates_full_unit_kl():
+    """Sampling all-but-none vs full: at S == E the sample path must equal the
+    full path exactly (scale 1, same experts); at S < E the estimate should
+    land within a loose factor of the full measurement on the tiny fixture
+    (cross-expert additivity is exact only in fp32; this is a sanity band,
+    the real gate is the 35B validation)."""
+    model = _wide_moe(seed=13)
+    calib = torch.randint(0, 32, (2, 24))
+    _, _, full = measure_expert_unit_costs(
+        model, None, calib, ["NVFP4", "BF16"], expert_chunk=1,
+        progress=False)
+    _, _, samp = measure_expert_unit_costs(
+        model, None, calib, ["NVFP4", "BF16"], expert_chunk=1,
+        progress=False, expert_sample=4)
+    (kf,) = full.values()
+    (ks,) = samp.values()
+    assert 0.2 * kf["NVFP4"] < ks["NVFP4"] < 5.0 * kf["NVFP4"]
+
+
+def test_max_units_and_filter():
+    model = _wide_moe()
+    calib = torch.randint(0, 32, (2, 24))
+    _, _, unit_kls = measure_expert_unit_costs(
+        model, None, calib, ["NVFP4", "BF16"], expert_chunk=1,
+        progress=False, unit_filter="no-such-unit")
+    assert unit_kls == {}
+    _, _, unit_kls = measure_expert_unit_costs(
+        model, None, calib, ["NVFP4", "BF16"], expert_chunk=1,
+        progress=False, max_units=1)
+    assert len(unit_kls) == 1
+
+
+def test_ladder_split_pays_at_four_fp8_rungs():
+    from prismaquant.expert_empirical_cost import (
+        _cb_ladder_fit,
+        _cb_ladder_split,
+    )
+    fmts = ["FP8_CB_K36", "FP8_CB_K40", "FP8_CB_K44", "FP8_CB_K48"]
+    split = _cb_ladder_split(fmts)
+    assert split is not None
+    kmap, anchors, holdout, predicted = split
+    assert set(anchors) == {"FP8_CB_K36", "FP8_CB_K48"}
+    assert len(predicted) == 1 and holdout not in predicted
+    # Exact exponential law -> fit accepts and predicts near-exactly.
+    kls = {f: 2.0 ** (3.0 - 0.4 * kmap[f]) for f in fmts}
+    pred, rel = _cb_ladder_fit(kls, kmap, anchors, holdout, predicted, 0.10)
+    assert pred is not None and rel < 1e-6
+    (pf,) = predicted
+    assert pred[pf] == pytest.approx(kls[pf], rel=1e-6)
+    # Broken law -> holdout rejects.
+    kls_bad = dict(kls)
+    kls_bad[holdout] *= 3.0
+    pred_bad, rel_bad = _cb_ladder_fit(
+        kls_bad, kmap, anchors, holdout, predicted, 0.10)
+    assert pred_bad is None and rel_bad > 0.10
+
+
+def test_ladder_split_too_short():
+    from prismaquant.expert_empirical_cost import _cb_ladder_split
+    assert _cb_ladder_split(["FP8_CB_K36", "FP8_CB_K44", "NVFP4"]) is None

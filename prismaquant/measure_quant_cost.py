@@ -872,6 +872,19 @@ def _measure_packed_experts(
     entries = _enumerate_packed_experts(model, target_names, profile)
     if not entries:
         return
+    if os.environ.get("PRISMAQUANT_SKIP_PACKED_EXPERT_COST", "0") == "1":
+        # CB M4-hybrid: the expert_empirical_cost stage REPLACES every
+        # packed-expert row wholesale (merge_cost_payloads
+        # replace_experts=True pops them), so measuring them here — the
+        # single most expensive part of the local cost stage (full-stack
+        # imatrix-weighted CB encodes per rung) — is discarded work. The
+        # pipeline sets this env only when that replacement is guaranteed
+        # to run; if the empirical stage then fails, the pipeline dies
+        # there, before the allocator ever sees the row-less payload.
+        print(f"[cost] SKIPPING {len(entries)} packed-expert tensors "
+              f"(PRISMAQUANT_SKIP_PACKED_EXPERT_COST=1: the CB empirical "
+              f"expert stage replaces these rows)", flush=True)
+        return
     measured = 0
     fallback = 0
     for full_name, packed_param, experts_qname, experts_mod in entries:

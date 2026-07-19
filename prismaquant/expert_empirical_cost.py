@@ -52,7 +52,10 @@ PASSTHROUGH_FORMATS = {"BF16", "FP8_SOURCE"}
 # fp4 derives one per-stack global; fp8 per-row scales) — measured render ==
 # shipped bytes, never chunked (moe_cb_design.md §3).
 _CB_FAMILIES = {"nvfp4_cb", "fp8_cb"}
-_CB_K_RE = re.compile(r"^NVFP4_CB_K(\d+)$")
+# Both CB families carry a k-rung ladder (k index bits per 8-weight vector);
+# the RD-law fit is holdout-gated per unit, so admitting FP8_CB costs nothing
+# when the law fails there (falls back to full measurement).
+_CB_K_RE = re.compile(r"^(?:NVFP4|FP8)_CB_[KS](\d+)$")
 # RD-law ladder interpolation (moe_cb_design.md §3.4): D(k) = C * 2^(-k/4),
 # validated +-3% on weighted-recon at 0.6B but UNPROVEN on unit-KL — so it is
 # opt-in and holdout-gated PER UNIT (a failed holdout falls back to full
@@ -94,6 +97,14 @@ def _baseline_logprobs(model, calib_ids: torch.Tensor) -> list[torch.Tensor]:
 
 
 @torch.no_grad()
+def _expert_sample_idx(num_experts: int, sample: int) -> torch.Tensor | None:
+    """Deterministic stratified expert subsample (the local cost path's
+    linspace pattern — even coverage of the expert index range)."""
+    if sample <= 0 or num_experts <= sample:
+        return None
+    return torch.linspace(0, num_experts - 1, sample).round().long().unique()
+
+
 def _quantize_unit_inplace(
     mod,
     param_names: Sequence[str],
@@ -102,6 +113,7 @@ def _quantize_unit_inplace(
     expert_chunk: int = 16,
     col_weights: Mapping[str, torch.Tensor] | None = None,
     unit_qname: str = "",
+    sample_idx: torch.Tensor | None = None,
 ) -> None:
     """Render every member of one expert serving unit in-place in ``fmt``.
 
@@ -110,6 +122,13 @@ def _quantize_unit_inplace(
     ships weighted bytes is the rendering-confound class, so a CB format
     with no col_weights entry for a member hard-fails; the encode tier is
     inherited from PRISMAQUANT_CB_ENCODE_TIER via the registry closure).
+
+    ``sample_idx`` (expert subsampling): quantize ONLY those expert slices,
+    leaving the rest BF16 — the caller extrapolates the partial unit KL.
+    Each sampled expert's render is identical to its full-stack render (the
+    CB encode is per-expert-row independent; per-expert col_weights slices
+    keep the weighted-render contract), so sampling changes COVERAGE, never
+    the bytes measured for a covered expert.
     """
     spec = fr.get_format(fmt)
     qdq = spec.quantize_dequantize
@@ -125,8 +144,16 @@ def _quantize_unit_inplace(
                     f"the deliberate CB render is imatrix-weighted; an "
                     f"unweighted unit-KL would measure bytes the exporter "
                     f"never ships (pass --col-weights)")
-            w.copy_(qdq(
-                w.float(), col_weights=cw.to(w.device)).to(w.dtype))
+            cw_dev = cw.to(w.device)
+            if sample_idx is not None:
+                idx = sample_idx.to(w.device)
+                cw_s = (cw_dev[idx] if cw_dev.ndim >= 3
+                        and cw_dev.shape[0] == w.shape[0] else cw_dev)
+                w[idx] = qdq(
+                    w[idx].float(), col_weights=cw_s).to(w.dtype)
+            else:
+                w.copy_(qdq(
+                    w.float(), col_weights=cw_dev).to(w.dtype))
         elif spec.family == "nv":
             # NV formats derive one per-TENSOR global scale from
             # whatever slice they are given, while export ships one
@@ -135,7 +162,9 @@ def _quantize_unit_inplace(
             # --expert-chunk knob; quantize per expert slice instead
             # (mirrors measure_quant_cost._batched_quantize, which does
             # the per-slice loop for exactly this reason).
-            for e in range(w.shape[0]):
+            experts = (sample_idx.tolist() if sample_idx is not None
+                       else range(w.shape[0]))
+            for e in experts:
                 w[e] = qdq(w[e].float()).to(w.dtype)
         else:
             # Scale-local formats are chunk-invariant, so batching is
@@ -143,9 +172,13 @@ def _quantize_unit_inplace(
             # output row independently (fp8_dynamic_weight_qdq), and
             # group/block-scaled formats (MX) never cross the expert
             # boundary within a row.
-            for e in range(0, w.shape[0], expert_chunk):
-                w[e:e + expert_chunk] = qdq(
-                    w[e:e + expert_chunk].float()).to(w.dtype)
+            if sample_idx is not None:
+                idx = sample_idx.to(w.device)
+                w[idx] = qdq(w[idx].float()).to(w.dtype)
+            else:
+                for e in range(0, w.shape[0], expert_chunk):
+                    w[e:e + expert_chunk] = qdq(
+                        w[e:e + expert_chunk].float()).to(w.dtype)
 
 
 @torch.no_grad()
@@ -160,13 +193,23 @@ def _unit_kl(
     expert_chunk: int = 16,
     col_weights: Mapping[str, torch.Tensor] | None = None,
     unit_qname: str = "",
+    sample_idx: torch.Tensor | None = None,
 ) -> float:
-    """Mean-token KL(BF16 || model-with-this-unit-quantized)."""
-    originals = {pn: getattr(mod, pn).data.clone() for pn in param_names}
+    """Mean-token KL(BF16 || model-with-this-unit-quantized).
+
+    With ``sample_idx``, only those expert slices are quantized (and cloned
+    for restore) — the caller owns the extrapolation to the full unit."""
+    if sample_idx is None:
+        originals = {pn: getattr(mod, pn).data.clone() for pn in param_names}
+    else:
+        originals = {pn: getattr(mod, pn).data[
+            sample_idx.to(getattr(mod, pn).device)].clone()
+            for pn in param_names}
     try:
         _quantize_unit_inplace(
             mod, param_names, fmt, expert_chunk=expert_chunk,
-            col_weights=col_weights, unit_qname=unit_qname)
+            col_weights=col_weights, unit_qname=unit_qname,
+            sample_idx=sample_idx)
         total = 0.0
         n_tok = 0
         for i in range(calib_ids.shape[0]):
@@ -178,36 +221,56 @@ def _unit_kl(
         return total / max(n_tok, 1)
     finally:
         for pn in param_names:
-            getattr(mod, pn).data.copy_(originals[pn])
+            w = getattr(mod, pn).data
+            if sample_idx is None:
+                w.copy_(originals[pn])
+            else:
+                w[sample_idx.to(w.device)] = originals[pn]
 
 
 def _cb_ladder_split(measured_fmts: Sequence[str]):
-    """Split the menu's NVFP4_CB_K ladder into (anchors, holdout, predicted)
-    for RD-law interpolation. Returns None when the ladder is too short to
-    pay (< 5 K-rungs: anchors+holdout would measure everything anyway)."""
+    """Split a CB k-rung ladder into (anchors, holdout, predicted) for RD-law
+    interpolation. Returns None when the ladder is too short to pay
+    (< 4 rungs: anchors+holdout would measure everything anyway). At exactly
+    4 rungs (the shipped FP8 menu) the two extremes anchor the line and one
+    middle rung is the holdout, predicting the other (25% fewer encodes);
+    at >= 5 rungs three anchors give a least-squares fit."""
     kmap = {f: int(m.group(1)) for f in measured_fmts
             if (m := _CB_K_RE.match(f))}
-    if len(kmap) < 5:
+    if len(kmap) < 4:
         return None
     by_k = sorted(kmap, key=kmap.get)
-    anchors = [by_k[0], by_k[len(by_k) // 2], by_k[-1]]
+    if len(by_k) == 4:
+        anchors = [by_k[0], by_k[-1]]
+    else:
+        anchors = [by_k[0], by_k[len(by_k) // 2], by_k[-1]]
     rest = [f for f in by_k if f not in anchors]
     holdout = rest[len(rest) // 2]
     predicted = [f for f in rest if f != holdout]
+    if not predicted:
+        return None
     return kmap, anchors, holdout, predicted
 
 
 def _cb_ladder_fit(kls: Mapping[str, float], kmap: Mapping[str, int],
                    anchors: Sequence[str], holdout: str,
                    predicted: Sequence[str], tol: float):
-    """Fit log2 D = log2 C - k/4 on the anchors; accept iff the holdout's
+    """Fit log2 D = a - b*k on the anchors (least squares; with 2 anchors the
+    line is exact — the slope is fitted, not assumed, so the fp8 ladder does
+    not inherit the fp4-calibrated 1/4-per-k decay). Accept iff the holdout's
     relative error <= tol. Returns (predicted_kls | None, holdout_rel_err)."""
-    logc = sum(
-        math.log2(max(kls[f], 1e-12)) + _LADDER_SLOPE_BITS * kmap[f]
-        for f in anchors) / len(anchors)
+    xs = [float(kmap[f]) for f in anchors]
+    ys = [math.log2(max(kls[f], 1e-12)) for f in anchors]
+    n = float(len(xs))
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    b = (-sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+         if denom > 0 else _LADDER_SLOPE_BITS)
+    a = my + b * mx
 
     def pred(f):
-        return float(2.0 ** (logc - _LADDER_SLOPE_BITS * kmap[f]))
+        return float(2.0 ** (a - b * kmap[f]))
 
     rel = abs(pred(holdout) - kls[holdout]) / max(kls[holdout], 1e-12)
     if rel > tol:
@@ -226,6 +289,9 @@ def measure_expert_unit_costs(
     col_weights: Mapping[str, torch.Tensor] | None = None,
     ladder_interp: bool = False,
     ladder_tol: float = 0.10,
+    expert_sample: int = 0,
+    max_units: int = 0,
+    unit_filter: str | None = None,
 ) -> tuple[dict, dict, dict]:
     """Measure per-serving-unit empirical KL costs for packed-MoE experts.
 
@@ -244,9 +310,15 @@ def measure_expert_unit_costs(
         (qn, m) for qn, m in model.named_modules()
         if _is_packed_experts_module(m, profile)
     ]
+    if unit_filter:
+        pat = re.compile(unit_filter)
+        units = [(qn, m) for qn, m in units if pat.search(qn)]
+    if max_units > 0:
+        units = units[:max_units]
     if progress:
         _log(f"{len(units)} expert serving units; measured formats: "
-             f"{measured_fmts} (menu {menu})")
+             f"{measured_fmts} (menu {menu})"
+             + (f"; expert_sample={expert_sample}" if expert_sample else ""))
     stats: dict = {}
     costs: dict = {}
     unit_kls: dict = {}
@@ -259,12 +331,20 @@ def measure_expert_unit_costs(
         pnames = list(_packed_experts_param_names(mod, profile))
         n_params_unit = sum(int(getattr(mod, pn).numel()) for pn in pnames)
         num_experts = int(getattr(mod, pnames[0]).shape[0])
+        # One stratified subsample SHARED across every format of the unit, so
+        # inter-format comparability (what the allocator consumes) is exact
+        # even under sampling; the extrapolation to the full unit rides on
+        # cross-expert additivity (validated fp32-additive in this repo) and
+        # is scaled by expert count (uniform stacks).
+        sample_idx = _expert_sample_idx(num_experts, expert_sample)
+        kl_scale = (float(num_experts) / float(sample_idx.numel())
+                    if sample_idx is not None else 1.0)
 
         def kl_of(fmt):
-            return _unit_kl(
+            return kl_scale * _unit_kl(
                 model, calib_ids, baseline, mod, pnames, fmt,
                 expert_chunk=expert_chunk, col_weights=col_weights,
-                unit_qname=qn)
+                unit_qname=qn, sample_idx=sample_idx)
 
         if ladder is None:
             kls = {fmt: kl_of(fmt) for fmt in measured_fmts}
@@ -294,6 +374,12 @@ def measure_expert_unit_costs(
         unit_kls[qn] = dict(kls)
         if ladder_meta is not None:
             unit_kls[qn]["_ladder"] = ladder_meta
+        if sample_idx is not None:
+            unit_kls[qn]["_sampling"] = {
+                "num_experts": num_experts,
+                "sampled": int(sample_idx.numel()),
+                "scale": round(kl_scale, 4),
+            }
         for pn in pnames:
             tensor = getattr(mod, pn)
             npm = int(tensor.numel())
@@ -456,6 +542,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ladder-holdout-tol", type=float, default=0.10,
                    help="Max holdout relative error to accept a unit's "
                    "ladder fit; above it the unit measures every rung.")
+    p.add_argument(
+        "--expert-sample", type=int, default=0,
+        help="Quantize only a stratified subsample of N experts per unit "
+        "and extrapolate the unit KL by expert count (cross-expert "
+        "additivity). One shared subsample across all formats of a unit "
+        "keeps inter-format comparability exact. 0 = full stack "
+        "(default). Cuts the encode volume ~E/N (the 35B/300B cost-stage "
+        "wall); export still encodes every expert exactly.")
+    p.add_argument(
+        "--max-units", type=int, default=0,
+        help="Measure only the first N units (0 = all). Validation/"
+        "sharding aid.")
+    p.add_argument(
+        "--unit-filter", default=None,
+        help="Regex on the experts qname; only matching units are "
+        "measured. Validation/sharding aid.")
     p.add_argument("--device", default="cuda")
     return p
 
@@ -513,7 +615,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     stats, costs, unit_kls = measure_expert_unit_costs(
         model, profile, calib, formats, expert_chunk=args.expert_chunk,
         col_weights=col_weights, ladder_interp=ladder_interp,
-        ladder_tol=args.ladder_holdout_tol)
+        ladder_tol=args.ladder_holdout_tol,
+        expert_sample=args.expert_sample, max_units=args.max_units,
+        unit_filter=args.unit_filter)
 
     provenance = {
         "schema": SCHEMA,
@@ -532,6 +636,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "col_weights": args.col_weights,
         "cb_ladder_interp": ladder_interp,
         "encode_tier": os.environ.get("PRISMAQUANT_CB_ENCODE_TIER"),
+        "expert_sample": int(args.expert_sample),
+        "max_units": int(args.max_units),
+        "unit_filter": args.unit_filter,
     }
 
     if args.merge_base:

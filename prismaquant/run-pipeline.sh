@@ -318,6 +318,16 @@ case "$COST_MODE" in
     PRODUCTION_RENDER_COST_CACHE_PATH=""
     PRODUCTION_RENDER_COST_CACHE_DIR=""
     PRODUCTION_RENDER_COST_TAIL_QNAMES=""
+    # CB M4-hybrid: stage [2d-CB] REPLACES every packed-expert row with the
+    # empirical unit-KL (merge --replace-experts pops the local rows), so the
+    # local stage's expert measurements — full-stack imatrix-weighted CB
+    # encodes per rung, the dominant cost-stage wall on MoE (35B: ~1h45/shard)
+    # — are discarded work. Skip them whenever the replacement is guaranteed.
+    if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" \
+       && "${CB_EXPERT_EMPIRICAL:-1}" == "1" ]]; then
+      export PRISMAQUANT_SKIP_PACKED_EXPERT_COST=1
+      echo "[pipeline] [2/4] packed-expert local cost SKIPPED (CB hybrid replaces those rows)"
+    fi
     ;;
   grouped-kl)
     echo "[pipeline] ERROR: COST_MODE=grouped-kl — the grouped-KL (fusion-matched) cost surrogate is archived under archive/grouped_kl_2026-05-28. It fixed a local allocator non-monotonicity but LOST the shipped vLLM A/B on Qwen3.6-27B (worse exact vLLM KL and direct WikiText PPL than the shipped 5.5 artifact); see archive/grouped_kl_2026-05-28/README.md. Use production-render-score (default), production-render-staged, or local." >&2
@@ -958,6 +968,13 @@ PY
     CB_LADDER_ARGS=()
     if [[ "${CB_LADDER_INTERP:-0}" == "1" ]]; then
       CB_LADDER_ARGS+=(--cb-ladder-interp)
+    fi
+    # CB_EXPERT_SAMPLE=N: stratified expert subsample per unit (shared across
+    # formats), unit KL extrapolated by expert count. 0 (default) = full
+    # stacks. Cuts the empirical stage's encode volume ~E/N; export always
+    # encodes every expert exactly.
+    if [[ "${CB_EXPERT_SAMPLE:-0}" != "0" ]]; then
+      CB_LADDER_ARGS+=(--expert-sample "$CB_EXPERT_SAMPLE")
     fi
     python3 -m prismaquant.expert_empirical_cost \
       --model "$MODEL_PATH" \
