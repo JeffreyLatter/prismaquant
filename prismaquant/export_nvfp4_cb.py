@@ -329,7 +329,6 @@ def export_nvfp4_cb(
 
     assignment = load_assignment(layer_config_path)
     skeleton = _load_skeleton(model_dir)
-    _pack_skeleton_experts(skeleton, _profile)
 
     # Reuse the compressed-tensors codecs + scheme templates for stock rungs —
     # NEVER reimplement packing. M19 scale-fidelity: `_quantize_2d` renders and
@@ -356,6 +355,9 @@ def export_nvfp4_cb(
         _profile = _detect_profile(str(model_dir))
     except Exception:
         _profile = None
+    # Per-expert-on-disk MoE checkpoints: assemble the packed expert stacks
+    # the CB targets name BEFORE any skeleton resolution below.
+    _pack_skeleton_experts(skeleton, _profile)
 
     # --- Coverage gate: classify every assigned format into CB / stock-CT /
     # BF16-passthrough (the mixed container, LAYOUT.md §4; "FP8 in every
