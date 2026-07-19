@@ -57,10 +57,9 @@ arithmetic-drift class). TTFT unmoved (3.46 s): the prefill wall is the
 per-expert launch storm (~71k launches / 1400-tok prefill), not syncs —
 batched-expert expand + grouped GEMM is the remaining piece.
 
-The CB MoE method still runs the correctness-first per-expert transient
-decode (moe.py) — no grouped CUDA kernels yet. This is the 27B story
-repeating in order: quality first, then kernels. Follow-up: grouped CB MoE
-decode GEMV + expert-batched expand (the dense cb_gemv.cu structure ports).
+(The correctness-first per-expert loop remains as the prefill/fallback
+path; parity between the two is pinned by
+`test_moe_grouped_gemv_matches_loop_numerics`.)
 
 ## First-contact bug ledger (all fixed + committed this session)
 1. Packed-expert down_proj imatrix unobtainable from the act cache → routed
