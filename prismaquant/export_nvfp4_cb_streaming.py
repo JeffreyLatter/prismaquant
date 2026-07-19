@@ -102,11 +102,22 @@ class _LazySkeleton:
     def keys(self):
         return self.weight_map.keys()
 
+    # Bound concurrently-open shard mmaps. Unbounded handles grew total_vm
+    # to ~1TB on the 233-shard Hy3 source and the box global-OOMed with the
+    # exporter's CPU RSS ~0 and torch CUDA alloc 0 — the consumer was
+    # driver-side pinning tied to live source mappings (2026-07-19).
+    _MAX_OPEN_SHARDS = 4
+
     def _handle(self, name: str):
         shard = self.weight_map[name]
         if shard not in self._open:
+            while len(self._open) >= self._MAX_OPEN_SHARDS:
+                old = next(iter(self._open))
+                del self._open[old]
             self._open[shard] = safe_open(
                 self.dir / shard, framework="pt", device="cpu")
+        else:
+            self._open[shard] = self._open.pop(shard)   # LRU refresh
         return self._open[shard]
 
     def get_shape(self, name: str) -> tuple[int, ...]:
