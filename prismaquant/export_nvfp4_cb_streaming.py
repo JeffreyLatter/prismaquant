@@ -487,14 +487,19 @@ def export_nvfp4_cb_streaming(
 
     # Passthrough: every remaining checkpoint tensor verbatim (BF16/norms/etc).
     # Per-expert tensors consumed by a stacked CB target are NOT passthrough.
-    # NOTE: expert groups are keyed by the on-disk (checkpoint) prefix; for a
-    # non-nested source (Hy3) that equals the assignment's live packed qname.
-    # A nested-infix MoE source (DSv4 `model.language_model.…`) needs the group
-    # keyed by the canonical prefix — a bounded follow-up (see module scope).
+    # Expert groups are keyed by the on-disk (checkpoint) prefix; a nested
+    # source (Qwen3.5-VLM `model.language_model.*`, DSv4) needs the CANONICAL
+    # prefix for the membership test against the recipe-named CB targets —
+    # without it every per-expert bf16 source ships verbatim NEXT TO its
+    # packed CB stack (35B first-contact: 31511 copied tensors, 82 GB
+    # artifact at a 4.75 bpp target).
     consumed_expert_bases = set()
     for prefix, projs in expert_groups.items():
-        packed_names = {f"{prefix}.gate_up_proj", f"{prefix}.down_proj",
-                        f"{prefix}.gate_proj", f"{prefix}.up_proj"}
+        canon_prefix = _canonical_qname(prefix, profile) or prefix
+        packed_names = set()
+        for p in {prefix, canon_prefix}:
+            packed_names |= {f"{p}.gate_up_proj", f"{p}.down_proj",
+                             f"{p}.gate_proj", f"{p}.up_proj"}
         if packed_names & cb_targets_set:
             for proj, ids in projs.items():
                 for e, base in ids.items():
