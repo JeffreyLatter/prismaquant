@@ -37,17 +37,23 @@ export TARGET_PROFILE=nvfp4_cb
 export COST_MODE=local
 export PRODUCTION_CACHE=0
 export PRODUCTION_RECACHE=0
-export CB_EXPERT_EMPIRICAL=1        # M4-hybrid MoE expert cost (route-flip fix); ON
-# ^ 2026-07-19 RECOMMENDATION pending Robert's sign-off (encode_tiers.md §C +
-#   memory cb_expert_unitkl_floor): for the CB menu, the empirical unit-KL is
-#   a perturbation floor (S=1 of 256 experts ≈ full-stack KL) and cannot rank
-#   CB rungs; flip to CB_EXPERT_EMPIRICAL=0 and use the local weighted-MSE
-#   expert cost with PRISMAQUANT_EXPERT_COST_SAMPLE=16 (MSE-unbiased, ÷16 on
-#   the expert encode wall — the 1h45/shard fix). Keep =1 only for menus with
-#   coarse formats whose unit KLs sit far above the floor.
+# 2026-07-19 recipe (Robert-authorized): for the CB menu the empirical
+# unit-KL is a perturbation floor (S=1 of 256 experts ≈ full-stack KL, memory
+# cb_expert_unitkl_floor) and cannot rank CB rungs — expert stacks use the
+# LOCAL weighted-MSE cost (per-expert imatrix incl. the down_proj replay
+# synthesis) with MSE-unbiased stratified sampling (÷16 on the 1h45/shard
+# encode wall) + the per-family floor-law rung ladder. Set
+# CB_EXPERT_EMPIRICAL=1 only for menus of coarse formats whose unit KLs sit
+# far above the floor (the original M4 regime).
+export CB_EXPERT_EMPIRICAL=0
+export PRISMAQUANT_EXPERT_COST_SAMPLE=16
+export CB_LADDER_INTERP=1
 
 # --- menu + budget (matched to the shipped PrismaAURA-4.75) ---
-export FORMATS="NVFP4,FP8_DYNAMIC,BF16,FP8_CB_K36,FP8_CB_K40,FP8_CB_K44,FP8_CB_K48"
+# Widened 6-rung FP8_CB ladder (K28/K32 added 2026-07-19: 3.5/4.0 bpw,
+# served by the existing plugin kernels; the 0.6B smoke allocated across all
+# six rungs at 4.5 bpp).
+export FORMATS="NVFP4,FP8_DYNAMIC,BF16,FP8_CB_K28,FP8_CB_K32,FP8_CB_K36,FP8_CB_K40,FP8_CB_K44,FP8_CB_K48"
 export TARGET_BITS=4.75
 export PARETO_TARGETS="4.5,4.75,5.0"
 
