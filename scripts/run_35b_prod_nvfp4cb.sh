@@ -38,6 +38,13 @@ export COST_MODE=local
 export PRODUCTION_CACHE=0
 export PRODUCTION_RECACHE=0
 export CB_EXPERT_EMPIRICAL=1        # M4-hybrid MoE expert cost (route-flip fix); ON
+# ^ 2026-07-19 RECOMMENDATION pending Robert's sign-off (encode_tiers.md §C +
+#   memory cb_expert_unitkl_floor): for the CB menu, the empirical unit-KL is
+#   a perturbation floor (S=1 of 256 experts ≈ full-stack KL) and cannot rank
+#   CB rungs; flip to CB_EXPERT_EMPIRICAL=0 and use the local weighted-MSE
+#   expert cost with PRISMAQUANT_EXPERT_COST_SAMPLE=16 (MSE-unbiased, ÷16 on
+#   the expert encode wall — the 1h45/shard fix). Keep =1 only for menus with
+#   coarse formats whose unit KLs sit far above the floor.
 
 # --- menu + budget (matched to the shipped PrismaAURA-4.75) ---
 export FORMATS="NVFP4,FP8_DYNAMIC,BF16,FP8_CB_K36,FP8_CB_K40,FP8_CB_K44,FP8_CB_K48"

@@ -307,3 +307,38 @@ def test_ladder_split_pays_at_four_fp8_rungs():
 def test_ladder_split_too_short():
     from prismaquant.expert_empirical_cost import _cb_ladder_split
     assert _cb_ladder_split(["FP8_CB_K36", "FP8_CB_K44", "NVFP4"]) is None
+
+
+def test_imatrix_synthesis_for_cb_units():
+    """CB menus self-synthesize missing packed-expert imatrix entries:
+    gate_up = pooled module-input second moment; down_proj = the routed
+    per-expert intermediate REPLAY (its input is never activation-cached —
+    the latent 35B blocker found 2026-07-19). Shapes and coverage pinned."""
+    from prismaquant.expert_empirical_cost import (
+        _baseline_logprobs,
+        ensure_unit_col_weights,
+    )
+    model = _wide_moe(seed=17)
+    calib = torch.randint(0, 32, (2, 24))
+    units = [("inner.mlp.experts", model.inner.mlp.experts)]
+    _, unit_x = _baseline_logprobs(model, calib, capture_units=units)
+    assert "inner.mlp.experts" in unit_x
+    cw: dict = {}
+    added = ensure_unit_col_weights(model, units, cw, unit_x)
+    assert set(added) == {"inner.mlp.experts.gate_up_proj",
+                          "inner.mlp.experts.down_proj"}
+    gu = cw["inner.mlp.experts.gate_up_proj"]
+    dn = cw["inner.mlp.experts.down_proj"]
+    E = model.inner.mlp.experts.num_experts
+    inter = model.inner.mlp.experts.down_proj.shape[-1]
+    hidden = model.inner.mlp.experts.gate_up_proj.shape[-1]
+    assert gu.shape == (1, 1, hidden) and bool((gu > 0).all())
+    assert dn.shape == (E, 1, inter)
+    # Every expert row is positive (routed rows measured; unrouted rows get
+    # the routed mean — never zero, which would zero the VQ objective).
+    assert bool((dn > 0).all())
+    # Existing entries are respected, not recomputed.
+    before = dn.clone()
+    added2 = ensure_unit_col_weights(model, units, cw, unit_x)
+    assert added2 == [] and torch.equal(cw["inner.mlp.experts.down_proj"],
+                                        before)
