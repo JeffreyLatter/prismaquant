@@ -65,6 +65,10 @@ export CALIBRATION_MODALITY=text-only
 export DEVICE=cuda
 export EXPORT_DEVICE=cuda
 export PRISMAQUANT_PROBE_PREFETCH_LOOKAHEAD=2   # Hy3 probe OOM guard (2026-07 lesson)
+# Streaming export OOM 2026-07-19 (global OOM 2GB into the write, tiny CPU
+# RSS): 10GB-class per-target pack transients fragment the caching allocator
+# on the 121GB unified pool. Expandable segments + per-tensor empty_cache.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PRISMAQUANT_PROBE_MIN_AVAILABLE_GB=40
 # auto picked 1 layer/shard at 295B -> 80 shards x ~12 min reverse sweeps
 # (~16 h). The sweep cost is per SHARD (all-layer reload), so 8 layers/shard

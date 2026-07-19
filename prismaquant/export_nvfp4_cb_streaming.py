@@ -194,10 +194,11 @@ class _StreamWriter:
             off += nb
         header["__metadata__"] = {"format": "pt", "quant_method": "prismaquant"}
         hjson = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        cuda = torch.cuda.is_available()
         with open(path, "wb") as f:
             f.write(struct.pack("<Q", len(hjson)))
             f.write(hjson)
-            for name, dtype, shape, producer in self._entries:
+            for i, (name, dtype, shape, producer) in enumerate(self._entries):
                 t = producer()
                 if t.dtype != dtype or tuple(t.shape) != shape:
                     raise AssertionError(
@@ -208,6 +209,19 @@ class _StreamWriter:
                     raise AssertionError(f"{name}: byte count mismatch")
                 f.write(b)
                 del t, b
+                if cuda:
+                    # Unified-memory hygiene: differently-shaped 10GB-class
+                    # pack transients must not accumulate as cached segments
+                    # (Hy3 2026-07-19 global OOM 2GB into the write).
+                    torch.cuda.empty_cache()
+                    if i % 20 == 0 or _nbytes(dtype, shape) > (1 << 30):
+                        print(f"[export-cb-stream] {i + 1}/"
+                              f"{len(self._entries)} {name} "
+                              f"cuda alloc "
+                              f"{torch.cuda.memory_allocated() / 2**30:.1f}G "
+                              f"reserved "
+                              f"{torch.cuda.memory_reserved() / 2**30:.1f}G",
+                              flush=True)
 
 
 # ---------------------------------------------------------------------------
