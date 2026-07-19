@@ -116,12 +116,20 @@ def synthesize_packed_expert_col_weights(
                 X.pow(2).mean(dim=0).reshape(1, 1, -1).cpu())
             added.append(gu_name)
         if dn_name not in col_weights:
-            # Router: <parent>.gate.weight in SOURCE naming.
+            # Router weight naming varies per family (Qwen3.5-MoE:
+            # <parent>.gate.weight; hy_v3: <parent>.router.gate.weight).
             src_parent = src.rsplit(".", 1)[0]
-            gate_key = f"{src_parent}.gate.weight"
-            if gate_key not in wm:
+            gate_key = None
+            for cand in (f"{src_parent}.gate.weight",
+                         f"{src_parent}.router.gate.weight",
+                         f"{src_parent}.router.weight"):
+                if cand in wm:
+                    gate_key = cand
+                    break
+            if gate_key is None:
                 raise ValueError(
-                    f"{qn}: router weight {gate_key!r} not in checkpoint — "
+                    f"{qn}: router weight not in checkpoint (tried "
+                    f"{src_parent} .gate/.router.gate/.router .weight) — "
                     f"cannot replay routing for the down_proj imatrix")
             E = 0
             while f"{src}.{E}.gate_proj.weight" in wm:
@@ -135,12 +143,22 @@ def synthesize_packed_expert_col_weights(
             t = _load_tensors(model_path, wm, keys)
             Wg = t[gate_key].to(dev)
             logits = X @ Wg.t()
-            bias_key = f"{src_parent}.gate.e_score_correction_bias"
-            if bias_key in wm:
-                logits = logits + _load_tensors(
-                    model_path, wm, [bias_key])[bias_key].to(dev)
+            # Selection bias (DeepSeek/hy_v3-style expert_bias): applied to
+            # the TOP-K SELECTION scores. For imatrix weighting purposes a
+            # modest routing approximation is acceptable — the weighting is a
+            # second moment, and any residual mismatch is bounded by the
+            # encode itself, not the serving path.
+            bias = None
+            for cand in (f"{src_parent}.gate.e_score_correction_bias",
+                         f"{src_parent}.expert_bias",
+                         f"{src_parent}.router.e_score_correction_bias"):
+                if cand in wm:
+                    bias = _load_tensors(model_path, wm, [cand])[cand].to(dev)
+                    break
             scores = torch.softmax(logits, dim=-1)
-            topv, topi = torch.topk(scores, top_k, dim=-1)
+            sel = scores if bias is None else scores + bias
+            _, topi = torch.topk(sel, top_k, dim=-1)
+            topv = torch.gather(scores, -1, topi)
             if norm_topk:
                 topv = topv / topv.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             inter = int(t[f"{src}.0.gate_proj.weight"].shape[0])
