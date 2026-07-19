@@ -286,8 +286,8 @@ def test_ladder_split_pays_at_four_fp8_rungs():
     )
     fmts = ["FP8_CB_K36", "FP8_CB_K40", "FP8_CB_K44", "FP8_CB_K48"]
     split = _cb_ladder_split(fmts)
-    assert split is not None
-    kmap, anchors, holdout, predicted = split
+    assert split is not None and len(split) == 1
+    kmap, anchors, holdout, predicted = split[0]
     assert set(anchors) == {"FP8_CB_K36", "FP8_CB_K48"}
     assert len(predicted) == 1 and holdout not in predicted
     # Exact exponential law -> fit accepts and predicts near-exactly.

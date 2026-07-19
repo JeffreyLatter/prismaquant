@@ -31,7 +31,7 @@ def main() -> None:
         wanted.append((k, "fp4", cb.VEC_DIM, False))
     for k_half in range(6, 13):
         wanted.append((k_half, "fp4", cb.VEC_DIM // 2, False))
-    for k_quarter in range(9, 13):
+    for k_quarter in range(7, 13):      # 7/8 added 2026-07-19 for FP8_CB_K28/K32
         wanted.append((k_quarter, "fp8", 2, False))
     for m in (5, 6, 7, 8):
         wanted.append((m, "fp4", cb.VEC_DIM, True))

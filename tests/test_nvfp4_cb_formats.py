@@ -15,7 +15,7 @@ from prismaquant import layer_config as lc
 from prismaquant import nvfp4_cb_formats as cb
 
 _NVFP4_KS = list(range(12, 25))
-_FP8_KS = [36, 40, 44, 48]
+_FP8_KS = [28, 32, 36, 40, 44, 48]
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
@@ -1340,10 +1340,14 @@ def test_cb_ladder_split_and_fit():
     )
 
     fmts = [f"NVFP4_CB_K{k}" for k in (12, 14, 16, 20, 24)] + ["FP8_CB_K44"]
-    kmap, anchors, holdout, predicted = _cb_ladder_split(fmts)
+    ladders = _cb_ladder_split(fmts)
+    # Per-family ladders: the lone FP8 rung can never join the NVFP4 fit
+    # (different grid/law); with <4 FP8 rungs only the NVFP4 ladder pays.
+    assert ladders is not None and len(ladders) == 1
+    kmap, anchors, holdout, predicted = ladders[0]
     assert set(anchors) == {"NVFP4_CB_K12", "NVFP4_CB_K16", "NVFP4_CB_K24"}
     assert holdout in predicted or holdout not in anchors
-    assert "FP8_CB_K44" not in kmap          # non-K-ladder formats excluded
+    assert "FP8_CB_K44" not in kmap          # different family, separate map
     # exact RD law -> holdout accepted, predictions exact.
     kls = {f: 2.0 ** (3.0 - kmap[f] / 4.0) for f in kmap}
     pred, rel = _cb_ladder_fit(kls, kmap, anchors, holdout, predicted, 0.10)

@@ -33,7 +33,7 @@ _GGUF_FORMAT_NAMES = frozenset(
 _NVFP4_CB_FORMAT_NAMES = frozenset(
     {f"NVFP4_CB_K{k}" for k in range(12, 25)}
     | {f"NVFP4_CB_S{k}" for k in (13, 14, 15, 16)}
-    | {f"FP8_CB_K{k}" for k in (36, 40, 44, 48)}
+    | {f"FP8_CB_K{k}" for k in (28, 32, 36, 40, 44, 48)}
 )
 
 

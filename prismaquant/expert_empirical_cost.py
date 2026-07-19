@@ -52,10 +52,12 @@ PASSTHROUGH_FORMATS = {"BF16", "FP8_SOURCE"}
 # fp4 derives one per-stack global; fp8 per-row scales) — measured render ==
 # shipped bytes, never chunked (moe_cb_design.md §3).
 _CB_FAMILIES = {"nvfp4_cb", "fp8_cb"}
-# Both CB families carry a k-rung ladder (k index bits per 8-weight vector);
-# the RD-law fit is holdout-gated per unit, so admitting FP8_CB costs nothing
-# when the law fails there (falls back to full measurement).
-_CB_K_RE = re.compile(r"^(?:NVFP4|FP8)_CB_[KS](\d+)$")
+# Both CB families carry k-rung ladders (k index bits per 8-weight vector).
+# Ladders are PER (family, mode) — NVFP4_CB_K, NVFP4_CB_S, FP8_CB_K are
+# different grids/codings and never share one log-linear fit. The RD-law fit
+# is holdout-gated per unit, so admitting a family costs nothing when the law
+# fails there (falls back to full measurement).
+_CB_K_RE = re.compile(r"^((?:NVFP4|FP8)_CB_[KS])(\d+)$")
 # RD-law ladder interpolation (moe_cb_design.md §3.4): D(k) = C * 2^(-k/4),
 # validated +-3% on weighted-recon at 0.6B but UNPROVEN on unit-KL — so it is
 # opt-in and holdout-gated PER UNIT (a failed holdout falls back to full
@@ -362,27 +364,33 @@ def _unit_kl(
 
 
 def _cb_ladder_split(measured_fmts: Sequence[str]):
-    """Split a CB k-rung ladder into (anchors, holdout, predicted) for RD-law
-    interpolation. Returns None when the ladder is too short to pay
-    (< 4 rungs: anchors+holdout would measure everything anyway). At exactly
-    4 rungs (the shipped FP8 menu) the two extremes anchor the line and one
-    middle rung is the holdout, predicting the other (25% fewer encodes);
-    at >= 5 rungs three anchors give a least-squares fit."""
-    kmap = {f: int(m.group(1)) for f in measured_fmts
-            if (m := _CB_K_RE.match(f))}
-    if len(kmap) < 4:
-        return None
-    by_k = sorted(kmap, key=kmap.get)
-    if len(by_k) == 4:
-        anchors = [by_k[0], by_k[-1]]
-    else:
-        anchors = [by_k[0], by_k[len(by_k) // 2], by_k[-1]]
-    rest = [f for f in by_k if f not in anchors]
-    holdout = rest[len(rest) // 2]
-    predicted = [f for f in rest if f != holdout]
-    if not predicted:
-        return None
-    return kmap, anchors, holdout, predicted
+    """Split the menu's CB rungs into PER-(family, mode) ladders, each
+    (kmap, anchors, holdout, predicted) for RD-law interpolation. A family
+    with < 4 rungs is skipped (anchors+holdout would measure everything
+    anyway). At exactly 4 rungs the two extremes anchor the line and one
+    middle rung is the holdout, predicting the other (25% fewer encodes); at
+    >= 5 rungs three anchors give a least-squares fit. Returns a list of
+    ladders, or None when no family pays."""
+    fams: dict[str, dict[str, int]] = {}
+    for f in measured_fmts:
+        m = _CB_K_RE.match(f)
+        if m:
+            fams.setdefault(m.group(1), {})[f] = int(m.group(2))
+    ladders = []
+    for _fam, kmap in sorted(fams.items()):
+        if len(kmap) < 4:
+            continue
+        by_k = sorted(kmap, key=kmap.get)
+        if len(by_k) == 4:
+            anchors = [by_k[0], by_k[-1]]
+        else:
+            anchors = [by_k[0], by_k[len(by_k) // 2], by_k[-1]]
+        rest = [f for f in by_k if f not in anchors]
+        holdout = rest[len(rest) // 2]
+        predicted = [f for f in rest if f != holdout]
+        if predicted:
+            ladders.append((kmap, anchors, holdout, predicted))
+    return ladders or None
 
 
 def _cb_ladder_fit(kls: Mapping[str, float], kmap: Mapping[str, int],
@@ -512,27 +520,31 @@ def measure_expert_unit_costs(
         if ladder is None:
             kls = {fmt: kl_of(fmt) for fmt in measured_fmts}
         else:
-            kmap, anchors, holdout, predicted = ladder
+            predicted_all = {f for (_, _, _, pred) in ladder for f in pred}
             kls = {fmt: kl_of(fmt) for fmt in measured_fmts
-                   if fmt not in predicted}
-            pred_kls, rel = _cb_ladder_fit(
-                kls, kmap, anchors, holdout, predicted, ladder_tol)
-            if pred_kls is None:
-                # Holdout gate FAILED for this unit: fall back to full
-                # measurement (the law is recon-validated, KL-unproven).
-                if progress:
-                    _log(f"  {qn}: ladder holdout rel_err {rel:.1%} > "
-                         f"{ladder_tol:.0%} — measuring all rungs")
-                kls.update({fmt: kl_of(fmt) for fmt in predicted})
-                kls["_ladder"] = {"accepted": False,
-                                  "holdout_rel_err": round(rel, 4)}
-            else:
-                kls.update(pred_kls)
-                kls["_ladder"] = {
-                    "accepted": True, "holdout_rel_err": round(rel, 4),
-                    "anchors": anchors, "holdout": holdout,
-                    "predicted": predicted,
-                }
+                   if fmt not in predicted_all}
+            ladder_meta_all = []
+            for kmap, anchors, holdout, predicted in ladder:
+                pred_kls, rel = _cb_ladder_fit(
+                    kls, kmap, anchors, holdout, predicted, ladder_tol)
+                if pred_kls is None:
+                    # Holdout gate FAILED for this unit/family: fall back to
+                    # full measurement (recon-validated, KL-unproven law).
+                    if progress:
+                        _log(f"  {qn}: ladder holdout rel_err {rel:.1%} > "
+                             f"{ladder_tol:.0%} — measuring {predicted}")
+                    kls.update({fmt: kl_of(fmt) for fmt in predicted})
+                    ladder_meta_all.append(
+                        {"accepted": False, "holdout_rel_err": round(rel, 4),
+                         "anchors": anchors})
+                else:
+                    kls.update(pred_kls)
+                    ladder_meta_all.append({
+                        "accepted": True, "holdout_rel_err": round(rel, 4),
+                        "anchors": anchors, "holdout": holdout,
+                        "predicted": predicted,
+                    })
+            kls["_ladder"] = ladder_meta_all
         ladder_meta = kls.pop("_ladder", None)
         unit_kls[qn] = dict(kls)
         if ladder_meta is not None:

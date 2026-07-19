@@ -12,11 +12,12 @@
         "NVFP4_CB_K20", "NVFP4_CB_K21", "NVFP4_CB_K22", "NVFP4_CB_K23",
         "NVFP4_CB_K24",
         "NVFP4_CB_S13", "NVFP4_CB_S14", "NVFP4_CB_S15", "NVFP4_CB_S16",
+        "FP8_CB_K28", "FP8_CB_K32",
         "FP8_CB_K36", "FP8_CB_K40", "FP8_CB_K44", "FP8_CB_K48",
         "NVFP4", "FP8_DYNAMIC", "FP8_SOURCE", "BF16"
       ],
       "reason": "profile_mismatch",
-      "detail": "The nvfp4_cb container carries the two codebook families plus their native carriers. NVFP4_CB_K12..K24 (fp4/E2M1 grid, product VQ, 2.000..3.500 bpw in 0.125 steps) and NVFP4_CB_S13..S16 (fp4 sign-magnitude VQ, 2.125..2.500 bpw) decode to bit-compatible NVFP4 tiles (E2M1 codes + group-16 E4M3 scale) and feed the CUTLASS FP4 path. FP8_CB_K36/40/44/48 (fp8/E4M3 grid, product VQ, 4.5/5.0/5.5/6.0 bpw, per-output-channel fp32 scales) fill the NVFP4->FP8 CT-menu gap and feed the stock W8A8 GEMM. Plain NVFP4 (W4A4 group-16) and FP8_DYNAMIC (W8A8) are delegated to stock compressed-tensors by the plugin; FP8_SOURCE (verbatim native-fp8 weight + 128x128 block weight_scale copy, emitted as the stock float-quantized block-fp8 CT scheme) is likewise plugin-delegated and passthrough-only (never synthesized); BF16 is the unquantized passthrough. Every rung is served only by the out-of-tree vllm_prismaquant_plugin and stays research/candidate until it clears the served gold-metric gate (exact full-vocab vLLM KL-vs-BF16 + WikiText PPL) AND the prefill perf gate (INV-2, no Triton masquerade)."
+      "detail": "The nvfp4_cb container carries the two codebook families plus their native carriers. NVFP4_CB_K12..K24 (fp4/E2M1 grid, product VQ, 2.000..3.500 bpw in 0.125 steps) and NVFP4_CB_S13..S16 (fp4 sign-magnitude VQ, 2.125..2.500 bpw) decode to bit-compatible NVFP4 tiles (E2M1 codes + group-16 E4M3 scale) and feed the CUTLASS FP4 path. FP8_CB_K28..K48 (fp8/E4M3 grid, product VQ, 3.5..6.0 bpw in 0.5 steps, per-output-channel fp32 scales) fill the NVFP4->FP8 CT-menu gap and feed the stock W8A8 GEMM; K28/K32 (added 2026-07-19) are served by the SAME plugin kernels (sub-widths 7/8 <= the GEMV's 12 ceiling, type_size 112/128 both 16-aligned). Plain NVFP4 (W4A4 group-16) and FP8_DYNAMIC (W8A8) are delegated to stock compressed-tensors by the plugin; FP8_SOURCE (verbatim native-fp8 weight + 128x128 block weight_scale copy, emitted as the stock float-quantized block-fp8 CT scheme) is likewise plugin-delegated and passthrough-only (never synthesized); BF16 is the unquantized passthrough. Every rung is served only by the out-of-tree vllm_prismaquant_plugin and stays research/candidate until it clears the served gold-metric gate (exact full-vocab vLLM KL-vs-BF16 + WikiText PPL) AND the prefill perf gate (INV-2, no Triton masquerade)."
     }
   ],
   "shape_rules": [
@@ -28,6 +29,7 @@
         "NVFP4_CB_K20", "NVFP4_CB_K21", "NVFP4_CB_K22", "NVFP4_CB_K23",
         "NVFP4_CB_K24",
         "NVFP4_CB_S13", "NVFP4_CB_S14", "NVFP4_CB_S15", "NVFP4_CB_S16",
+        "FP8_CB_K28", "FP8_CB_K32",
         "FP8_CB_K36", "FP8_CB_K40", "FP8_CB_K44", "FP8_CB_K48"
       ],
       "in_features_multiple_of": 256,
