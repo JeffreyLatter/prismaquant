@@ -1217,40 +1217,47 @@ def _sweep_encode_two_tier_moment(w2d: torch.Tensor, mode: str, cb,
                if wq2d is not None else None)
         moms = _chunk_moments(wvec, wqc, mode, cb)
 
-        def entry_err(E, c):
-            comp = compose[E, c]
-            leg = legal[E, c]
-            s_g = _sb_to_groups(torch.where(leg, comp, torch.ones_like(comp)))
-            err_g = _moment_err_groups(moms, s_g, "fp4", in_f, vec_per_group)
-            return torch.where(_sb_to_groups(leg), err_g, inf), s_g
+        def entry_err_all(E):
+            """All n_ent entries in ONE batched moment pass. Returns
+            (err (rc, G, n_ent) inf-masked, s_g (rc, G, n_ent)). Values are
+            the same per-(element, entry) arithmetic as the scalar path; the
+            16-entry python loop was 2ms-kernel launch-bound (33.6s of a
+            46.8s E=24 encode, 2026-07-19)."""
+            comp = compose[E]                              # (rc, n_sb, n_ent)
+            leg = legal[E]
+            s_sb = torch.where(leg, comp, torch.ones_like(comp))
+            s_g = (s_sb.unsqueeze(2).expand(rc, n_sb, gps, n_ent)
+                   .reshape(rc, G, n_ent))
+            err_g = _moment_err_groups_batched(moms, s_g, vec_per_group)
+            leg_g = (leg.unsqueeze(2).expand(rc, n_sb, gps, n_ent)
+                     .reshape(rc, G, n_ent))
+            return torch.where(leg_g, err_g, inf), s_g
 
         # Phase 1 — E per superblock by total error (running strict-min in
-        # window order, matching the exact path).
+        # window order, matching the exact path; min over entries is
+        # order-free so the batched min is value-identical).
         lo, hi = e_lo[r0:r1], e_hi[r0:r1]
         best_tot = torch.full((rc, n_sb), float("inf"), device=w2d.device)
         for i in range(W):
             E = torch.minimum(lo + i, hi)
-            err_best_g = torch.full((rc, G), float("inf"), device=w2d.device)
-            for c in range(n_ent):
-                err_g, _ = entry_err(E, c)
-                err_best_g = torch.minimum(err_best_g, err_g)
+            err_best_g = entry_err_all(E)[0].min(dim=-1).values
             tot = err_best_g.reshape(rc, n_sb, gps).sum(-1)
             tot = torch.where((lo + i) <= hi, tot, inf)
             better = tot < best_tot
             best_tot = torch.where(better, tot, best_tot)
             best_e[r0:r1] = torch.where(better, E, best_e[r0:r1])
 
-        # Phase 2 — per-group entry at the frozen E (strict <, first legal).
+        # Phase 2 — per-group entry at the frozen E. torch.min's documented
+        # first-occurrence tie rule IS the sequential strict-<, first-legal
+        # rule (candidates scanned in c order from an inf init).
         Eb = best_e[r0:r1]
-        best_err_g = torch.full((rc, G), float("inf"), device=w2d.device)
-        for c in range(n_ent):
-            err_g, s_g = entry_err(Eb, c)
-            better = err_g < best_err_g
-            best_err_g = torch.where(better, err_g, best_err_g)
-            best_s[r0:r1] = torch.where(better, s_g, best_s[r0:r1])
-            best_c[r0:r1] = torch.where(
-                better, torch.full((rc, G), c, dtype=torch.int64,
-                                   device=w2d.device), best_c[r0:r1])
+        err_all, s_all = entry_err_all(Eb)
+        vals, idx = err_all.min(dim=-1)
+        finite = vals < inf
+        best_s[r0:r1] = torch.where(
+            finite, torch.gather(s_all, -1, idx.unsqueeze(-1)).squeeze(-1),
+            best_s[r0:r1])
+        best_c[r0:r1] = torch.where(finite, idx, best_c[r0:r1])
 
     # Phase 3 — exact WLS refits on the frozen-E reachable set.
     reach = compose[best_e]

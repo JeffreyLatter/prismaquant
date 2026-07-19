@@ -205,11 +205,53 @@ class _StreamWriter:
             off += nb
         header["__metadata__"] = {"format": "pt", "quant_method": "prismaquant"}
         hjson = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        data0 = 8 + len(hjson)
+
+        # RESUME: offsets are analytic and producers deterministic, so a
+        # partial file identifies exactly which entries are already complete.
+        # Only resume a file whose header matches this plan bit-for-bit
+        # (same assignment/codebooks); otherwise start over.
+        skip = 0
+        if path.exists():
+            size = path.stat().st_size
+            ok = False
+            if size >= data0:
+                with open(path, "rb") as f:
+                    (hlen,) = struct.unpack("<Q", f.read(8))
+                    ok = hlen == len(hjson) and f.read(hlen) == hjson
+            if ok:
+                while skip < len(self._entries):
+                    name = self._entries[skip][0]
+                    if data0 + header[name]["data_offsets"][1] > size:
+                        break
+                    skip += 1
+                # Sibling producers share state (fp8 weight_scale reads the
+                # scale its cb_qweight pack produced) — back the boundary up
+                # to the start of the export-base group. Re-produced entries
+                # rewrite identical bytes (producers are deterministic).
+                base = lambda i: self._entries[i][0].rsplit(".", 1)[0]
+                while 0 < skip < len(self._entries) and \
+                        base(skip) == base(skip - 1):
+                    skip -= 1
+                print(f"[export-cb-stream] resuming {path.name}: "
+                      f"{skip}/{len(self._entries)} entries already written",
+                      flush=True)
+            else:
+                path.unlink()
+
         cuda = torch.cuda.is_available()
-        with open(path, "wb") as f:
-            f.write(struct.pack("<Q", len(hjson)))
-            f.write(hjson)
-            for i, (name, dtype, shape, producer) in enumerate(self._entries):
+        with open(path, "r+b" if skip else "wb") as f:
+            if skip:
+                first = self._entries[skip][0] if skip < len(self._entries) \
+                    else None
+                f.truncate(data0 + (header[first]["data_offsets"][0]
+                                    if first else off))
+                f.seek(0, 2)
+            else:
+                f.write(struct.pack("<Q", len(hjson)))
+                f.write(hjson)
+            for i, (name, dtype, shape, producer) in enumerate(
+                    self._entries[skip:], start=skip):
                 t = producer()
                 if t.dtype != dtype or tuple(t.shape) != shape:
                     raise AssertionError(
