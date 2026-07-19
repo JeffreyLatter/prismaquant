@@ -66,6 +66,11 @@ export DEVICE=cuda
 export EXPORT_DEVICE=cuda
 export PRISMAQUANT_PROBE_PREFETCH_LOOKAHEAD=2   # Hy3 probe OOM guard (2026-07 lesson)
 export PRISMAQUANT_PROBE_MIN_AVAILABLE_GB=40
+# auto picked 1 layer/shard at 295B -> 80 shards x ~12 min reverse sweeps
+# (~16 h). The sweep cost is per SHARD (all-layer reload), so 8 layers/shard
+# = 10 sweeps (~2.5 h) at unchanged residency (the pressure is the layer
+# cache, not tracked-Linear state; 35B ran 14/shard).
+export LAYERS_PER_SHARD=8
 
 echo "============================================================================"
 echo "Hy3 295B-A21B ULTRA-LOW-BPP — nvfp4_cb STREAMING @${TARGET_BITS} bpp (v2 two-tier)"
