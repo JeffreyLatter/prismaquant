@@ -87,13 +87,144 @@ def _canon_formats(formats: Sequence[str]) -> list[str]:
     return seen
 
 
+_CALIB_BATCH_ENV = "PRISMAQUANT_EXPERT_CALIB_BATCH"
+
+
+def _calib_batch() -> int:
+    """Calibration sequences per forward. Default 1 preserves the historical
+    per-sequence numerics exactly; >1 batches independent windows (semantics
+    identical, per-position arithmetic may differ at reassociation level —
+    baseline and quantized arms always use the SAME batching, so the KL
+    comparison stays internally consistent). Becomes the dominant-wall knob
+    once expert sampling shrinks the encode side."""
+    return max(1, int(os.environ.get(_CALIB_BATCH_ENV, "1") or 1))
+
+
 @torch.no_grad()
-def _baseline_logprobs(model, calib_ids: torch.Tensor) -> list[torch.Tensor]:
-    out = []
-    for i in range(calib_ids.shape[0]):
-        logits = model(calib_ids[i:i + 1]).logits.float()
-        out.append(F.log_softmax(logits, dim=-1).cpu())
-    return out
+def _baseline_logprobs(
+    model, calib_ids: torch.Tensor,
+    capture_units: Sequence[tuple[str, object]] | None = None,
+    capture_rows: int = 4096,
+) -> list[torch.Tensor] | tuple[list[torch.Tensor], dict]:
+    """Baseline log-probs; optionally capture each expert module's INPUT rows
+    during the same forwards (bounded to ``capture_rows`` per unit) for the
+    imatrix replay — no separate pass, no activation-cache dependency."""
+    captured: dict[str, list[torch.Tensor]] = {}
+    handles = []
+    if capture_units:
+        def _mk_hook(qn):
+            def _hook(_mod, args, _kwargs, _out):
+                xs = captured.setdefault(qn, [])
+                have = sum(t.shape[0] for t in xs)
+                if have >= capture_rows:
+                    return
+                x = args[0].detach()
+                x = x.reshape(-1, x.shape[-1])
+                xs.append(x[: capture_rows - have].cpu())
+            return _hook
+        for qn, mod in capture_units:
+            handles.append(mod.register_forward_hook(
+                _mk_hook(qn), with_kwargs=True))
+    try:
+        out = []
+        bs = _calib_batch()
+        for i in range(0, calib_ids.shape[0], bs):
+            logits = model(calib_ids[i:i + bs]).logits.float()
+            out.append(F.log_softmax(logits, dim=-1).cpu())
+    finally:
+        for h in handles:
+            h.remove()
+    if capture_units is None:
+        return out
+    unit_x = {qn: torch.cat(xs, dim=0) for qn, xs in captured.items() if xs}
+    return out, unit_x
+
+
+@torch.no_grad()
+def _replay_down_proj_col_weights(
+    mod, parent_mod, router, X: torch.Tensor,
+) -> torch.Tensor:
+    """Per-expert down_proj imatrix ``(E, 1, inter)`` by replaying the routed
+    forward on captured module inputs X: route -> per-expert gate_up ->
+    activation -> intermediate; pool mean-square over that expert's routed
+    tokens. down_proj's input (the per-expert intermediate) is never
+    activation-cached — the packed-expert hook sees only the MODULE input —
+    so this replay is the only faithful source (the same reason
+    measure_quant_cost leaves down_proj unweighted in its pooled path).
+    Experts with no routed tokens in the capture get the mean of the routed
+    experts' vectors (a neutral prior, recorded by the caller)."""
+    from prismaquant.measure_quant_cost import _packed_router_topk
+
+    gate_up = mod.gate_up_proj
+    E = int(gate_up.shape[0])
+    inter = int(gate_up.shape[1]) // 2
+    dev = gate_up.device
+    Xd = X.to(device=dev, dtype=gate_up.dtype)
+    act_fn = getattr(mod, "act_fn", F.silu)
+    route_fn = getattr(parent_mod, "route_tokens_to_experts", None)
+    if callable(route_fn):
+        top_k_index, _tw = route_fn(router(Xd))
+    else:
+        top_k_index, _tw = _packed_router_topk(
+            router, Xd, e_score_correction_bias=getattr(
+                parent_mod, "e_score_correction_bias", None))
+    out = torch.zeros(E, inter, dtype=torch.float32, device=dev)
+    hit = torch.zeros(E, dtype=torch.bool)
+    for e in range(E):
+        tok = (top_k_index == e).any(dim=-1).nonzero(as_tuple=True)[0]
+        if tok.numel() == 0:
+            continue
+        g, u = F.linear(Xd[tok], gate_up[e]).chunk(2, dim=-1)
+        inter_act = (act_fn(g) * u).float()
+        out[e] = inter_act.pow(2).mean(dim=0)
+        hit[e] = True
+    if bool(hit.any()) and not bool(hit.all()):
+        out[~hit] = out[hit].mean(dim=0)
+    elif not bool(hit.any()):
+        out[:] = 1.0
+    return out.reshape(E, 1, inter).cpu()
+
+
+@torch.no_grad()
+def ensure_unit_col_weights(
+    model, units, col_weights: dict, unit_x: Mapping[str, torch.Tensor],
+) -> list[str]:
+    """Fill missing packed-expert col_weights entries in place.
+
+    gate_up_proj: pooled module-input second moment (identical op to the
+    exporter's builder — full rows, fp32, mean over dim 0).
+    down_proj: the per-expert intermediate replay above.
+    Returns the names added (caller persists them back to the shared
+    col-weights pickle so the EXPORTER ships the same weighting — the
+    lockstep contract)."""
+    from prismaquant.measure_quant_cost import (
+        _packed_experts_parent_module,
+        _packed_experts_router,
+    )
+    added: list[str] = []
+    for qn, mod in units:
+        X = unit_x.get(qn)
+        gu_name, dn_name = f"{qn}.gate_up_proj", f"{qn}.down_proj"
+        if gu_name not in col_weights:
+            if X is None:
+                raise ValueError(f"{qn}: no captured input rows for the "
+                                 f"gate_up imatrix (unit never routed?)")
+            col_weights[gu_name] = (
+                X.float().pow(2).mean(dim=0).reshape(1, 1, -1))
+            added.append(gu_name)
+        if dn_name not in col_weights and hasattr(mod, "down_proj"):
+            if X is None:
+                raise ValueError(f"{qn}: no captured input rows for the "
+                                 f"down_proj imatrix replay")
+            parent = _packed_experts_parent_module(model, qn)
+            router = _packed_experts_router(parent)
+            if router is None:
+                raise ValueError(f"{qn}: no router found for the down_proj "
+                                 f"imatrix replay")
+            col_weights[dn_name] = _replay_down_proj_col_weights(
+                mod, parent, router, X)
+            added.append(dn_name)
+    return added
 
 
 @torch.no_grad()
@@ -212,9 +343,11 @@ def _unit_kl(
             sample_idx=sample_idx)
         total = 0.0
         n_tok = 0
-        for i in range(calib_ids.shape[0]):
-            lp = F.log_softmax(model(calib_ids[i:i + 1]).logits.float(), -1)
-            bl = baseline[i].to(lp.device)
+        bs = _calib_batch()
+        for bi, i in enumerate(range(0, calib_ids.shape[0], bs)):
+            lp = F.log_softmax(
+                model(calib_ids[i:i + bs]).logits.float(), -1)
+            bl = baseline[bi].to(lp.device)
             kl = (bl.exp() * (bl - lp)).sum(-1)
             total += float(kl.sum().item())
             n_tok += kl.numel()
@@ -325,12 +458,42 @@ def measure_expert_unit_costs(
     if not units or not measured_fmts:
         return stats, costs, unit_kls
 
-    baseline = _baseline_logprobs(model, calib_ids)
+    has_cb = any(fr.get_format(f).family in _CB_FAMILIES
+                 for f in measured_fmts)
+    if has_cb:
+        # Capture module inputs during the baseline forwards and synthesize
+        # any missing packed-expert imatrix entries (down_proj is NEVER in
+        # the harvested cache — its input is the per-expert intermediate).
+        if col_weights is None:
+            col_weights = {}
+        baseline, unit_x = _baseline_logprobs(
+            model, calib_ids, capture_units=units)
+        added = ensure_unit_col_weights(model, units, col_weights, unit_x)
+        if added and progress:
+            _log(f"synthesized {len(added)} packed-expert imatrix entries "
+                 f"(module-input pool / down_proj replay): "
+                 f"{added[:4]}{'...' if len(added) > 4 else ''}")
+        measure_expert_unit_costs.last_added_col_weights = added
+        del unit_x
+    else:
+        baseline = _baseline_logprobs(model, calib_ids)
+        measure_expert_unit_costs.last_added_col_weights = []
     ladder = _cb_ladder_split(measured_fmts) if ladder_interp else None
     for qn, mod in units:
         pnames = list(_packed_experts_param_names(mod, profile))
         n_params_unit = sum(int(getattr(mod, pn).numel()) for pn in pnames)
         num_experts = int(getattr(mod, pnames[0]).shape[0])
+        for pn in pnames:
+            t = getattr(mod, pn)
+            if not bool((t != 0).any()):
+                raise RuntimeError(
+                    f"{qn}.{pn}: packed-expert stack is ALL ZERO — the "
+                    f"checkpoint's per-expert weights were never mapped "
+                    f"into the packed class param (the zero-expert "
+                    f"calibration bug). A unit KL measured now would read "
+                    f"exactly 0 for every format. Fill via "
+                    f"layer_streaming.fill_packed_experts_from_source "
+                    f"before measuring.")
         # One stratified subsample SHARED across every format of the unit, so
         # inter-format comparability (what the allocator consumes) is exact
         # even under sampling; the extrapolation to the full unit rides on
@@ -544,12 +707,15 @@ def _build_parser() -> argparse.ArgumentParser:
                    "ladder fit; above it the unit measures every rung.")
     p.add_argument(
         "--expert-sample", type=int, default=0,
-        help="Quantize only a stratified subsample of N experts per unit "
-        "and extrapolate the unit KL by expert count (cross-expert "
-        "additivity). One shared subsample across all formats of a unit "
-        "keeps inter-format comparability exact. 0 = full stack "
-        "(default). Cuts the encode volume ~E/N (the 35B/300B cost-stage "
-        "wall); export still encodes every expert exactly.")
+        help="Quantize only a stratified subsample of N experts per unit and "
+        "extrapolate the unit KL by expert count. REFUTED for CB-fidelity "
+        "menus (encode_tiers.md §C: the bf16 unit KL is a perturbation "
+        "floor — S=1 of 256 already reads ~90%% of the full-stack KL, so "
+        "count-scaling over-predicts ~10x and rung ranks drown in floor "
+        "noise). Kept for floor-regime probing and for coarse-format menus "
+        "where unit KLs sit far above the floor. 0 = full stack (default). "
+        "For CB rungs use the LOCAL cost's PRISMAQUANT_EXPERT_COST_SAMPLE "
+        "instead (MSE sampling is unbiased; KL sampling is not).")
     p.add_argument(
         "--max-units", type=int, default=0,
         help="Measure only the first N units (0 = all). Validation/"
@@ -588,6 +754,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         prm.requires_grad_(False)
     profile = detect_profile_with_warning(
         staged, entrypoint="expert-empirical-cost")
+    # Per-expert-on-disk -> packed-in-class checkpoints (Qwen3.5-MoE /
+    # Ornith): the text class lacks the per-expert->packed mapper, so the
+    # packed params load ZERO-INITIALIZED — the zero-expert calibration bug
+    # (quantizing zeros is a no-op; every unit KL reads exactly 0). Fill from
+    # the source shards; measure_expert_unit_costs also hard-fails on
+    # all-zero stacks so this class of silent garbage can never recur.
+    from prismaquant.layer_streaming import fill_packed_experts_from_source
+    # NOTE: pass the ORIGINAL model dir, not the staged text-only view — the
+    # staging rewrites index keys to `model.layers.*` while the profile's
+    # source_tensor_name keeps the checkpoint's own nesting
+    # (`model.language_model.*`), so against the staged index the fill's
+    # prefix filter silently matches nothing (how production_recache calls it).
+    fill_src = args.model if Path(args.model).exists() else staged
+    filled = fill_packed_experts_from_source(
+        model, fill_src, profile, progress=True)
+    if filled:
+        _log(f"filled {filled} packed-expert params from source shards")
 
     if args.dataset:
         from prismaquant.sensitivity_probe import load_calibration
@@ -612,12 +795,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                            for k, v in pickle.load(fh).items()}
     ladder_interp = bool(args.cb_ladder_interp) or (
         os.environ.get("PRISMAQUANT_CB_LADDER_INTERP", "0") == "1")
+    if col_weights is None:
+        col_weights = {}
     stats, costs, unit_kls = measure_expert_unit_costs(
         model, profile, calib, formats, expert_chunk=args.expert_chunk,
         col_weights=col_weights, ladder_interp=ladder_interp,
         ladder_tol=args.ladder_holdout_tol,
         expert_sample=args.expert_sample, max_units=args.max_units,
         unit_filter=args.unit_filter)
+    added_cw = getattr(
+        measure_expert_unit_costs, "last_added_col_weights", [])
+    if added_cw and args.col_weights:
+        # Persist the synthesized packed-expert imatrix entries back to the
+        # SHARED col-weights pickle: the exporter must ship the identical
+        # weighting the cost measured (lockstep contract). Atomic replace.
+        tmp = args.col_weights + ".tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump({k: v.cpu() if hasattr(v, "cpu") else v
+                         for k, v in col_weights.items()}, fh)
+        os.replace(tmp, args.col_weights)
+        _log(f"persisted {len(added_cw)} synthesized imatrix entries into "
+             f"{args.col_weights}")
 
     provenance = {
         "schema": SCHEMA,

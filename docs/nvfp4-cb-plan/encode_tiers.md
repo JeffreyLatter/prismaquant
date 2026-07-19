@@ -95,3 +95,58 @@ Helper: `nvfp4_cb_formats.predict_cb_ladder_costs` (measured anchors + holdout g
 ## Recommendation
 
 **Default = balanced.** Measured across configs it is ×3.9 vs max with recon deltas within noise of max (and BETTER than max on fp4-v1, whose exhaustive clip sweep is candidate-starved in the subnormal band), and the whole-model emu-KL spot checks hold. fast is the 300B-class bulk-encode tier; max is the regression anchor and the final-artifact belt-and-braces option.
+
+## C. MoE cost-stage levers (2026-07-19, commit 75eb95d)
+
+The 35B cost stage (killed 07-18 at ~1h45/shard WITH balanced) exposed that the
+encoder tier alone doesn't fix MoE: the wall is encode VOLUME (E=256 experts ×
+rungs × stacks), twice over. Three measurement-preserving levers:
+
+1. **Local-stage expert skip** (`PRISMAQUANT_SKIP_PACKED_EXPERT_COST`, pipeline
+   sets it under the M4 hybrid): the empirical stage REPLACES every packed-
+   expert row (`--replace-experts` pops them), so the local stage's full-stack
+   CB encodes per rung were 100% discarded work. Ornith 35B: experts ≈ 85% of
+   shard params → shard ≈ 1h45 → ~20 min (projection; measure on resume).
+2. **Empirical-stage expert sampling** (`CB_EXPERT_SAMPLE` / `--expert-sample`):
+   stratified subsample per unit, SHARED across formats, unit KL extrapolated
+   by expert count. **VALIDATION VERDICT (Ornith 35B, 2 units, K36/K48,
+   8×512): count-scaling REFUTED — and it exposed a deeper measurement fact.**
+   Raw (unscaled) subset KLs: S=1 → 0.0161, S=16 → 0.0170, S=32 → 0.0179,
+   full 256 → 0.0179–0.0191. The response is FLAT in expert count: quantizing
+   ONE expert at 6 bpw already produces ~90% of the full-stack unit KL. The
+   bf16 end-to-end unit KL at CB fidelity is a **perturbation/chaos floor**
+   (~0.016 on this calib — the same magnitude class as the extension-residency
+   arithmetic drift), with the actual rung contrast (K36 vs K48: ~6%) riding
+   on top; rank inversions appear inside the floor noise. Consequences:
+   - count-scaled KL extrapolation is invalid (kept implemented, default OFF,
+     for floor-regime probing only);
+   - the empirical unit-KL leg is a DEGENERATE cost for CB-rung ranking
+     (all rungs pay ≈ the same floor). It remains meaningful for coarse
+     formats (NVFP4/FP8 RTN unit KLs sit far above floor — why the M4/arm-E
+     35B runs worked);
+   - the sound cheap path for CB expert rungs is the LOCAL weighted-MSE ×
+     h_em cost — additive by construction, floor-free, rung-monotone — WITH
+     the local path's existing stratified expert sampling
+     (`PRISMAQUANT_EXPERT_COST_SAMPLE`, unbiased for MSE where it is invalid
+     for KL) and the rung ladder. Recommended 35B-resume recipe:
+     `CB_EXPERT_EMPIRICAL=0` + `PRISMAQUANT_EXPERT_COST_SAMPLE=16` (÷16 on
+     the expert encode wall) — pending Robert's sign-off since it departs
+     from the M4 precedent for the CB menu specifically. The 27B served
+     evidence (all-CB body allocated on pure local cost, −58% KL) is the
+     precedent that local CB costs ship winning artifacts.
+3. **Ladder generalization**: FP8_CB rungs admitted, slope FITTED from anchors
+   (2-anchor exact line at 4 rungs, LS at ≥5), holdout-gated per unit as
+   before. The shipped 4-rung FP8 menu now saves 1 of 4 rung measurements.
+
+Found en route (latent 35B blocker, fixed): packed-expert **down_proj has no
+harvestable imatrix** — its input is the per-expert intermediate, never in the
+act cache; the export and empirical stages both hard-fail on it. The empirical
+stage now captures module inputs during its baseline forwards and REPLAYS the
+routed forward (route → per-expert gate_up → act → intermediate, mean-square
+pooled per expert) to synthesize `(E, 1, inter)` down_proj col-weights +
+pooled gate_up entries, and persists them into the shared col-weights pickle
+so the exporter ships the identical weighting (lockstep contract).
+
+Once sampling shrinks the encode side, calib FORWARDS dominate the empirical
+stage; `PRISMAQUANT_EXPERT_CALIB_BATCH` batches the windows (default 1 =
+historical numerics; baseline and quantized arms always batch identically).
