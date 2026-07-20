@@ -70,9 +70,36 @@ TARGET_BITS=2.9, streaming export.
   this box). **Serve with --max-model-len 8192–16384.** If practice shows
   the headroom too thin, 2.7 bpp is the PARETO_TARGETS fallback rung.
 
-## Pending (when export lands)
-- Tensor-count / no-double-ship: header already confirms 2271 tensors,
-  U8+BF16+F32 only. Re-confirm on disk at completion.
+## Serve first-contact (2026-07-20)
+- Artifact integrity: safetensors COMPLETE (110.3 GB, header end ==
+  file size), config HYV3ForCausalLM + layout_version 2 + two_tier,
+  cb_codebooks.pqcb loads via safetensors (24 shared lattice codebooks,
+  sub-structure correct per rung). Codebooks are NOT torch.load/pickle —
+  they are a safetensors file with a .pqcb extension (probe trap).
+- hy_v3 serving arch: HYV3ForCausalLM + HYV3MTPModel are NATIVE in
+  `vllm-node:latest` (vLLM 0.23.1-dev, tf 5.13) — the run-script's
+  pre-launch gate (d) wrongly credited the GGUF work (that was
+  llama.cpp, no vLLM adapter); the image covers it regardless.
+- **Bug 9 (serving loader, hy_v3): stacked CB expert tensors KeyError at
+  load.** `HYV3ForCausalLM.load_weights` loads experts at the TOP-LEVEL
+  model via `expert_params_mapping` (per-expert names) and never calls the
+  per-layer `FusedMoE.load_weights` the plugin wraps — so that wrap is dead
+  code here (it works for Qwen3.5-MoE/35B, which delegates per-layer). Our
+  stacked `experts.{gate_up_proj,down_proj}.cb_qweight` match no per-expert
+  mapping → final `params_dict[name]` KeyError vs registered
+  `experts.w13/w2_cb_qweight`. Fix: plugin-installed model-level
+  load_weights wrap mapping stacked CB expert names → fused params (plain
+  copy), delegating everything else. This is the top-level-loader analog of
+  moe.py's per-layer wrap; generalizes to DSv4 (same convention). Serve
+  memory params for the smoke: --enforce-eager --max-model-len 8192
+  --gpu-memory-utilization 0.95 (110 GB weights leave ~5 GB for KV).
+
+## Pending
+- Tensor-count / no-double-ship: header confirms 2271 tensors,
+  U8+BF16+F32 only. Re-confirm on disk at completion. [DONE: 110.3 GB]
+- Serve smoke (load + coherent gen) after bug-9 fix; then prefill vs the
+  GGUF 42 tok/s (the thesis number) + decode with the fp4-v2 grouped
+  kernel (committed fa7cc90).
 - Serve smoke: hy_v3 adapter in the serving image, v2-compose fp4-CB
   dense at scale, fp4-CB MoE via v2 (grouped decode kernel is fp8-only —
   the known extension for decode parity).
