@@ -188,21 +188,89 @@ bandwidth (the wall), dense fp8 GEMV 20.0 @ ~55%, cuBLAS (lm_head + router)
   memory-profiling peak on the unified pool (~5 GiB system floor). Do NOT
   retry at these sizes. v2 roadmap: quantize the MTP module to CB (~2 GB) —
   then spec decode fits. The artifact still carries MTP for bigger boxes.
-- fp4-v2 grouped MoE kernel bandwidth pass: IN FLIGHT (28% → 55%+ target,
-  bit-identity + capture-safety gated).
+- **fp4-v2 grouped MoE kernel pass: HONEST NEGATIVE on the bandwidth
+  premise.** Bit-identical 1.06–1.19× per (proj, rung) landed (160/160
+  outputs EXACT vs the pre-edit kernel, 58 suite tests): codebook gather
+  8→2 aligned u64 loads, wide 8-aligned staging with off8 carry,
+  predicated third extraction word. But ncu shows the kernel is
+  COMPUTE/LATENCY-bound (SM 71% vs Mem 44%, L1TEX scoreboard stalls) —
+  the fp4 unpack + two-tier compose + per-weight bf16-round chain is
+  frozen by the bit-identity contract, so ≥55% of bandwidth is not
+  reachable without changing the decode numerics. Rejected variants
+  (decode+FMA fusion, packed bf16x2 — bit-identical but slower) recorded
+  in /home/rob/dq-runs/cb-bench-scratch/. Base-decode ceiling at these
+  rungs ≈ 13–14 tok/s.
+
+## MTP ships (2026-07-20, Robert: "always include MTP when it's available")
+- **CB-quantized MTP module**: layers.80 encoded to the body's modal rungs
+  (experts NVFP4_CB_K18, shared+attn FP8_CB_K32, glue BF16; uniform
+  col-weights — a draft cannot change outputs, only acceptance), 1.19 GB vs
+  7.5 GB BF16 (which OOM'd the box next to 102 GiB of weights — do NOT
+  retry bf16-MTP on one Spark). Same lattice codebooks (bit-compared at
+  merge). Exporter gained opt-in --subset-prefix; the toplevel loader
+  gained spec-layer rename support (HYV3MTP renames layers.80.* →
+  .mtp_block.*; param targets resolve on renamed names, schemes on
+  original names).
+- **Ship artifact = ship_mtp/**: 104.06 GB, 5 HF shards + index (dropped
+  7.44 GB bf16 MTP, added 1.19 GB CB MTP; net −6.2 GB vs the single-file
+  body artifact).
+- **Serving findings (all measured):**
+  - vLLM auto-wires hy_v3 → hy_v3_mtp draft from num_nextn_predict_layers.
+  - **Spec decode + CUDA graphs needs TRITON_ATTN on BOTH models**
+    (--attention-backend + attention_backend inside --speculative-config):
+    FlashInfer is UNIFORM_SINGLE_TOKEN_DECODE-only → vLLM silently sets
+    cudagraph_mode=NONE and the whole serve runs eager (spec decode then
+    LOSES: 9-10 tok/s vs 13.1 base).
+  - **Acceptance at the K18 draft rung: 78–93% per-position on natural
+    text** (~55% on random-word benches). Draft fidelity is NOT the
+    binding constraint.
+  - **k-sweep (prose tok/s): k=1 13.1 · k=2 10.7 · k=3 8.8** — the drafter
+    runs UNCAPTURED (no drafter cudagraph support in vLLM 0.23 for this
+    method), costing ~50 ms/draft-token of eager host overhead that scales
+    with k. **k=1 is the throughput optimum today**: neutral on prose
+    (13.1 = 13.1 vs spec-off), positive on structured/code, negative on
+    adversarial text. The MTP throughput question ("how much to quantize
+    the draft") is answered structurally: d is dominated by the SHARED
+    bf16 lm_head + eager overhead, so the block's rung barely moves speed —
+    acceptance is king, quantize only as memory forces, and the rung sweep
+    only matters once vLLM captures drafter graphs (upstream).
+
+## FINAL SPEED (ship config: graphs FULL_DECODE_ONLY, TRITON_ATTN, spec k=1)
+- **Prefill 109–115 tok/s** (1.46k-token prompt) — **2.6× GGUF IQ's 42**.
+- **Decode (batch 1, prose) 13.1 tok/s** vs GGUF IQ 17.8 / k-quant 18.7 —
+  base decode TRAILS the GGUF CUDA-core MMVQ path at these bytes; bounded
+  by (a) the compute-bound fp4-CB decode chain (bit-identity-frozen) and
+  (b) the eager drafter. Decode arc this session: 9.9 → 13.1 (+32%):
+  shared-CB-direct + dense fp4-v2 CUDA GEMV + CUDA graphs + kernel pass.
+- Weights resident ~100 GiB + CB MTP; KV 12.7 GiB at 12288/fp8.
+
+## SHIP LEDGER (2026-07-20, final)
+- **Artifact PUBLIC on HF:** rdtand/Hy3-295B-A21B-PrismaQuant-2.9bit-nvfp4cb-
+  vllm — 104.06 GB, 5 shards, CB MTP included, serving kit (plugin snapshot +
+  serve.sh), allocation provenance, per-format allocation table on the card,
+  Apache 2.0, NO quality claims. Standalone formats repo:
+  github.com/RobTand/cbq (PRIVATE, working title — Robert's rename/public
+  call pending).
+- **TEB ledger (same bytes, three serving configs, seed 1234, hardmode):**
+  interim eager/bf16-shared/no-MTP config = **87** (129/148); ship config
+  (CB-direct shared, graphs, TRITON_ATTN, MTP spec k=1) = **85** (126/148).
+  Per-scenario diff: only 4/74 flipped (1 up, 3 down; TC-68 "called tools
+  when none were needed" = a restraint decision-point flip). Fewer flips
+  than the GGUF IQ-vs-k churn (12/74) — serving-numerics churn at the
+  plateau, net −3 within binomial noise (P≈0.31). **Honest read: this
+  artifact's TEB band is 85–87, GGUF's is 86–87 — same capability plateau,
+  NO directional quality claim either way at matched bytes.** The "exceeds
+  the shipped GGUF" goal is met on capabilities (MTP) and prefill (2.6×),
+  NOT on TEB quality (parity band) and NOT on batch-1 decode (13.1 vs
+  17.8).
 
 ## Remaining (perf, not correctness)
-- Decode ~10 tok/s: dense fp4-v2 uses the Triton `_cb_decode_gemm_kernel`
-  (CUDA GEMV is fp8-only for DENSE); a dense fp4-v2 CUDA decode kernel is
-  the lever (routed-expert MoE decode already uses the fp4-v2 grouped CUDA
-  kernel fa7cc90).
-- MoE prefill still per-expert-loop for the 89 tok/s (batched-expert
-  expand + grouped GEMM = task 15) — even so it already beats GGUF 2.1×.
-- Clean re-export: hy_v3 serving profile → force shared_mlp BF16 (drops the
-  decode-at-load; bf16 on disk).
-- Larger context: 8k-16k fits (footprint §); 4k used for the smoke.
-- Serve smoke: hy_v3 adapter in the serving image, v2-compose fp4-CB
-  dense at scale, fp4-CB MoE via v2 (grouped decode kernel is fp8-only —
-  the known extension for decode parity).
-- Speed vs GGUF Hy3 2.8bpp: prefill is the thesis number; decode target
-  parity after the grouped fp4-v2 extension.
+- MoE prefill still per-expert-loop (batched-expert expand + grouped GEMM =
+  task 15) — prefill already 2.6× GGUF without it.
+- Drafter CUDA-graph capture (upstream vLLM) — unlocks spec decode as a
+  true multiplier (measured acceptance already 78–93%).
+- fp4-CB decode chain cost is a FORMAT-level insight: at GEMV shapes the
+  unpack+compose+round work, not bandwidth, is the wall. A future rung or
+  decode-contract revision (e.g. fp32-accum without the intermediate
+  bf16 round) trades bit-compat for speed — research, not a patch.
+- Larger context: 8k–16k fits (footprint §).
