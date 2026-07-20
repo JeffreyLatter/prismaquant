@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import struct
 import weakref
 from pathlib import Path
 
@@ -24,6 +25,47 @@ from prismaquant.export_nvfp4_cb_streaming import (  # noqa: E402
     _LazySkeleton,
     export_nvfp4_cb_streaming,
 )
+from prismaquant.export_native_compressed import (  # noqa: E402
+    _quantize_2d,
+    build_quantization_config,
+    compute_nvfp4_global_real,
+)
+from prismaquant.model_profiles import detect_profile  # noqa: E402
+
+
+def _st_header(path: Path) -> tuple[dict, int]:
+    """Parse a safetensors file's header dict and data-start offset."""
+    raw = path.read_bytes()
+    hlen = struct.unpack("<Q", raw[:8])[0]
+    return json.loads(raw[8:8 + hlen]), 8 + hlen
+
+
+def _assert_offsets_consistent(path: Path) -> dict:
+    """The streaming header must lay tensors out gap-free, in order, with
+    data_offsets matching dtype x shape (requirement a)."""
+    header, _ = _st_header(path)
+    _bytes = {"U8": 1, "I8": 1, "BOOL": 1, "F8_E4M3": 1, "F16": 2, "BF16": 2,
+              "I32": 4, "F32": 4, "I64": 8}
+    off = 0
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        lo, hi = meta["data_offsets"]
+        n = 1
+        for d in meta["shape"]:
+            n *= int(d)
+        assert lo == off, f"{name}: gap/overlap at {lo} != {off}"
+        assert hi - lo == n * _bytes[meta["dtype"]], f"{name}: nbytes mismatch"
+        off = hi
+    return header
+
+
+def _stock_by_scheme(quant_config: dict) -> dict:
+    """Config groups WITHOUT a 'scheme' key (stock CT / FP8_SOURCE), normalized
+    by target-set so group-key ordering doesn't matter."""
+    return {tuple(sorted(g["targets"])):
+            {k: v for k, v in g.items() if k != "targets"}
+            for g in quant_config["config_groups"].values() if "scheme" not in g}
 
 _ROOT = Path("/home/rob/dq-runs/nvfp4-cb-phase0/stream-test/pytest")
 
@@ -202,21 +244,205 @@ def test_streaming_fp8_source_dequant_on_read(workdir):
     assert torch.equal(got, ref)
 
 
-# --- stock-CT scope gate ---------------------------------------------------
+# --- mixed-menu: CB + stock NVFP4 + stock FP8_DYNAMIC + BF16 ----------------
 
-def test_streaming_rejects_stock_ct(workdir):
-    torch.manual_seed(4)
-    mdl = workdir / "model"
-    _write_model(mdl, {
+def _mixed_menu_model(mdl: Path):
+    """q/k on stock NVFP4 (fused siblings — shared global), gate on stock
+    FP8_DYNAMIC, down on CB (nvfp4_cb), up on BF16 passthrough."""
+    torch.manual_seed(7)
+    tens = {
         "model.layers.0.self_attn.q_proj.weight":
             (torch.randn(128, 256) * 0.3).to(torch.bfloat16),
+        "model.layers.0.self_attn.k_proj.weight":
+            (torch.randn(128, 256) * 0.3).to(torch.bfloat16),
+        "model.layers.0.mlp.gate_proj.weight":
+            (torch.randn(64, 256) * 0.3).to(torch.bfloat16),
+        "model.layers.0.mlp.down_proj.weight":
+            (torch.randn(256, 256) * 0.3).to(torch.bfloat16),
+        "model.layers.0.mlp.up_proj.weight":
+            (torch.randn(64, 256) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(256, dtype=torch.bfloat16),
+    }
+    _write_model(mdl, tens)
+    return tens
+
+
+_MIXED_ASSIGN = {
+    "model.layers.0.self_attn.q_proj": {"data_type": "nv_fp", "bits": 4},
+    "model.layers.0.self_attn.k_proj": {"data_type": "nv_fp", "bits": 4},
+    "model.layers.0.mlp.gate_proj": {"data_type": "fp8_e4m3", "bits": 8,
+                                     "group_size": 0},               # FP8_DYNAMIC
+    "model.layers.0.mlp.down_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+    "model.layers.0.mlp.up_proj": {"data_type": "bfloat16", "bits": 16},
+}
+
+
+def test_streaming_mixed_menu_byte_identical(workdir):
+    mdl = workdir / "model"
+    tens = _mixed_menu_model(mdl)
+    ap = workdir / "a.json"
+    _assign(ap, _MIXED_ASSIGN)
+    cw = {"model.layers.0.mlp.down_proj": torch.rand(256) + 0.05}
+
+    cm = export_nvfp4_cb(mdl, ap, workdir / "m", cw, device="cpu")
+    cs = export_nvfp4_cb_streaming(mdl, ap, workdir / "s", cw, device="cpu")
+    assert dict(cm) == dict(cs)
+    assert cs["NVFP4"] == 2 and cs["FP8_E4M3"] == 1 and cs["NVFP4_CB_K16"] == 1
+
+    # (a) header/offsets consistency of the streamed file.
+    _assert_offsets_consistent(workdir / "s" / "model.safetensors")
+
+    # (b) every tensor byte-identical to the in-memory exporter (which itself
+    #     calls the export_native_compressed packers).
+    tm = load_file(str(workdir / "m" / "model.safetensors"))
+    ts = load_file(str(workdir / "s" / "model.safetensors"))
+    assert _tensors_equal(tm, ts)
+
+    # (b) stock tensor BYTES identical to the packers called directly. q/k are
+    #     fused NVFP4 siblings -> they share the max global_real.
+    gq = compute_nvfp4_global_real(
+        tens["model.layers.0.self_attn.q_proj.weight"].float(), 16).reshape(())
+    gk = compute_nvfp4_global_real(
+        tens["model.layers.0.self_attn.k_proj.weight"].float(), 16).reshape(())
+    shared = torch.stack([gq, gk]).max()
+    for leaf in ("q_proj", "k_proj"):
+        direct = _quantize_2d(
+            tens[f"model.layers.0.self_attn.{leaf}.weight"].float(), "NVFP4",
+            nvfp4_global_real_override=shared)
+        for suffix, t in direct.items():
+            assert torch.equal(
+                ts[f"model.layers.0.self_attn.{leaf}.{suffix}"], t), \
+                f"{leaf}.{suffix}"
+    fp8 = _quantize_2d(
+        tens["model.layers.0.mlp.gate_proj.weight"].float(), "FP8_E4M3")
+    for suffix, t in fp8.items():
+        assert torch.equal(ts[f"model.layers.0.mlp.gate_proj.{suffix}"], t), \
+            suffix
+
+    # stock groups have NO "scheme" key; CB groups DO (the dispatch marker).
+    qs = json.loads((workdir / "s" / "quant_config.json").read_text())
+    stock = _stock_by_scheme(qs)
+    assert len(stock) == 2                       # one NVFP4 group, one FP8 group
+    assert any(g["format"] == "nvfp4-pack-quantized" for g in stock.values())
+    assert any(g["format"] == "float-quantized" for g in stock.values())
+    assert "model.layers.0.mlp.up_proj" in qs["ignore"]      # BF16 passthrough
+
+    # (c) stock config vocabulary equals build_quantization_config's (flat model
+    #     -> DefaultProfile -> no greedy per-expert catch-all regex, so exact).
+    qm = json.loads((workdir / "m" / "quant_config.json").read_text())
+    assert qm["config_groups"] == qs["config_groups"]
+    prof = detect_profile(str(mdl))
+    bqc = build_quantization_config(
+        {"model.layers.0.self_attn.q_proj": "NVFP4",
+         "model.layers.0.self_attn.k_proj": "NVFP4",
+         "model.layers.0.mlp.gate_proj": "FP8_E4M3"}, set(), profile=prof)
+    assert _stock_by_scheme(qs) == _stock_by_scheme(
+        {"config_groups": bqc["config_groups"]})
+
+
+def test_streaming_stock_resume_across_boundary(workdir):
+    # (d) resume across a stock tensor boundary reproduces the clean-run bytes.
+    mdl = workdir / "model"
+    _mixed_menu_model(mdl)
+    ap = workdir / "a.json"
+    _assign(ap, _MIXED_ASSIGN)
+    cw = {"model.layers.0.mlp.down_proj": torch.rand(256) + 0.05}
+    out = workdir / "s"
+    export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu")
+    ref = (out / "model.safetensors").read_bytes()
+
+    header, data0 = _st_header(out / "model.safetensors")
+    # cut mid-weight_scale of the stock NVFP4 q_proj group (after weight_packed,
+    # before the group ends) so RESUME must re-enter the stock group.
+    wp = header["model.layers.0.self_attn.q_proj.weight_packed"]["data_offsets"]
+    ws = header["model.layers.0.self_attn.q_proj.weight_scale"]["data_offsets"]
+    cut = data0 + (ws[0] + ws[1]) // 2
+    assert wp[1] <= ws[0] <= (cut - data0) < ws[1]
+    (out / "model.safetensors").write_bytes(ref[:cut])   # truncate mid-group
+
+    export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu")   # resume
+    assert (out / "model.safetensors").read_bytes() == ref
+
+
+# --- stock rungs on MoE expert stacks are gated off ------------------------
+
+def test_streaming_rejects_stock_expert_stack(workdir):
+    # Per-expert on-disk MoE, packed parent assigned a stock format -> gated.
+    E, inter, hid = 3, 256, 256
+    _per_expert_model(workdir / "pe", E, inter, hid)
+    ap = workdir / "a.json"
+    _assign(ap, {"model.layers.1.mlp.experts.gate_up_proj":
+                 {"data_type": "nv_fp", "bits": 4}})     # NVFP4 on an expert stack
+    cw = {"model.layers.1.mlp.experts.gate_up_proj":
+          torch.rand(E, 1, hid) + 0.05}
+    with pytest.raises(ValueError, match="expert-stack"):
+        export_nvfp4_cb_streaming(workdir / "pe", ap, workdir / "s", cw,
+                                  device="cpu")
+
+
+def test_streaming_rejects_stock_stacked_3d_tensor(workdir):
+    # Already-stacked 3-D expert tensor assigned a stock format -> gated too.
+    torch.manual_seed(8)
+    mdl = workdir / "model"
+    _write_model(mdl, {
+        "model.layers.0.mlp.experts.gate_up_proj.weight":
+            (torch.randn(3, 64, 256) * 0.3).to(torch.bfloat16),
         "model.norm.weight": torch.ones(256, dtype=torch.bfloat16)})
     ap = workdir / "a.json"
-    _assign(ap, {"model.layers.0.self_attn.q_proj":
-                 {"data_type": "nv_fp", "bits": 4}})     # -> NVFP4 (stock CT)
-    cw = {"model.layers.0.self_attn.q_proj": torch.rand(256) + 0.05}
-    with pytest.raises(ValueError, match="stock-CT"):
-        export_nvfp4_cb_streaming(mdl, ap, workdir / "s", cw, device="cpu")
+    _assign(ap, {"model.layers.0.mlp.experts.gate_up_proj":
+                 {"data_type": "fp8_e4m3", "bits": 8, "group_size": 0}})
+    with pytest.raises(ValueError, match="expert-stack"):
+        export_nvfp4_cb_streaming(mdl, ap, workdir / "s", {}, device="cpu")
+
+
+# --- hy_v3 shared_mlp: stock config target collapses via to_vllm_internal_name
+
+def test_streaming_stock_shared_mlp_vllm_target(workdir):
+    torch.manual_seed(9)
+    mdl = workdir / "hy"
+    mdl.mkdir(parents=True, exist_ok=True)
+    save_file({
+        "model.layers.5.mlp.shared_mlp.gate_up_proj.weight":
+            (torch.randn(128, 256) * 0.3).to(torch.bfloat16),
+        "model.layers.5.mlp.shared_mlp.down_proj.weight":
+            (torch.randn(256, 64) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(256, dtype=torch.bfloat16),
+    }, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(
+        json.dumps({"model_type": "hy_v3", "hidden_size": 256}))
+    ap = workdir / "a.json"
+    # recipe (live) names use `shared_experts`; checkpoint uses `shared_mlp`.
+    _assign(ap, {
+        "model.layers.5.mlp.shared_experts.gate_up_proj":
+            {"data_type": "fp8_e4m3", "bits": 8, "group_size": 0},
+        "model.layers.5.mlp.shared_experts.down_proj":
+            {"data_type": "nv_fp", "bits": 4}})
+    export_nvfp4_cb_streaming(mdl, ap, workdir / "s", {}, device="cpu")
+
+    ts = load_file(str(workdir / "s" / "model.safetensors"))
+    # tensors keep the CHECKPOINT name (params live under .shared_mlp.*).
+    assert "model.layers.5.mlp.shared_mlp.gate_up_proj.weight" in ts
+    assert "model.layers.5.mlp.shared_mlp.down_proj.weight_packed" in ts
+
+    qs = json.loads((workdir / "s" / "quant_config.json").read_text())
+    stock_targets = {t for g in qs["config_groups"].values()
+                     if "scheme" not in g for t in g["targets"]}
+    # config targets COLLAPSE .shared_mlp. -> .mlp. (to_vllm_internal_name),
+    # matching vLLM's dispatch prefix and build_quantization_config (28b6862).
+    assert "re:^model[.]layers[.]5[.]mlp[.]gate_up_proj$" in stock_targets
+    assert "re:^model[.]layers[.]5[.]mlp[.]down_proj$" in stock_targets
+    assert not any(".shared_mlp." in t or ".shared_experts." in t
+                   for t in stock_targets)
+    prof = detect_profile(str(mdl))
+    bqc = build_quantization_config(
+        {"model.layers.5.mlp.shared_experts.gate_up_proj": "FP8_E4M3",
+         "model.layers.5.mlp.shared_experts.down_proj": "NVFP4"},
+        set(), profile=prof)
+    bqc_targets = {t for g in bqc["config_groups"].values()
+                   for t in g["targets"]}
+    # the collapsed explicit targets we emit are exactly the ones vLLM's own
+    # config builder emits (modulo its greedy per-expert catch-all regex).
+    assert stock_targets <= bqc_targets
 
 
 # --- lazy skeleton: single-file + sharded, metadata without data load ------

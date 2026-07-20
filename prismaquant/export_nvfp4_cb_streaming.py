@@ -24,11 +24,26 @@ one expert alone equals packing it inside the stack) — pinned byte-for-byte
 in tests/test_nvfp4_cb_streaming.py. Container/config/sidecar mirror
 export_nvfp4_cb + LAYOUT.md exactly.
 
-Scope (this milestone): bf16 source + fp8-source READ + CB families + BF16
-passthrough + FP8_SOURCE passthrough. Stock-CT mixed rungs (NVFP4 /
-FP8_DYNAMIC quantised in-container) are NOT streamed yet — they hard-fail with
-a pointer to the in-memory exporter (their codec output sizes need a pack to
-know; a bounded extension). See the module TODOs.
+Scope: bf16 source + fp8-source READ + CB families + BF16 passthrough +
+FP8_SOURCE passthrough + stock-CT **DENSE** rungs (vanilla NVFP4 / FP8_DYNAMIC
+quantised in-container). Stock rungs are packed RTN via the authoritative
+``export_native_compressed`` codecs (byte-identical to the in-memory
+export_nvfp4_cb and to those packers called directly; no GPTQ/act-order in this
+lane — the CB cost stage measures stock rungs RTN-grade). Their on-disk sizes
+are ANALYTIC so the streaming header needs no pack:
+
+  * NVFP4  -> ``weight_packed`` uint8 [N, K/2] + ``weight_scale`` fp8_e4m3
+    [N, K/16] + ``weight_global_scale`` fp32 [1] + ``input_global_scale`` fp32 [1]
+  * FP8_DYNAMIC -> ``weight`` fp8_e4m3 [N, K] + ``weight_scale`` fp32 [N, 1]
+
+Stock rungs on MoE **expert stacks** are NOT streamed: the CB container's stock
+config emits a packed-name regex that vLLM's MoE dispatch cannot match to its
+per-expert probes, and the CT codec is 2-D — an expert stack assigned a stock
+format hard-fails with a pointer to constrain the allocator (put experts on a
+CB rung / FP8_SOURCE / BF16; the dense tier is where vanilla formats win). The
+config_groups for stock rungs use the EXACT compressed-tensors vocabulary (no
+``"scheme"`` key) under the vLLM-internal target name so the plugin delegates
+them to CompressedTensorsConfig.
 """
 from __future__ import annotations
 
@@ -177,6 +192,34 @@ def _nbytes(dtype: torch.dtype, shape) -> int:
     for d in shape:
         n *= int(d)
     return n * torch.empty((), dtype=dtype).element_size()
+
+
+def _stock_output_specs(fmt: str, shape) -> list[tuple[str, torch.dtype, tuple]]:
+    """Analytic on-disk ``(suffix, dtype, out_shape)`` list for a DENSE stock
+    target whose source weight is ``shape`` (out=N, in=K). Mirrors
+    ``export_native_compressed._quantize_2d`` output EXACTLY (verified against
+    the packers) so the streaming header is sized without a pack:
+
+      * NVFP4 (W4A4): ``weight_packed`` uint8 [N, K/2], ``weight_scale``
+        fp8_e4m3 [N, K/16], ``weight_global_scale`` fp32 [1],
+        ``input_global_scale`` fp32 [1].
+      * FP8_E4M3 (W8A8 per-channel): ``weight`` fp8_e4m3 [N, K],
+        ``weight_scale`` fp32 [N, 1].
+    """
+    n, k = int(shape[-2]), int(shape[-1])
+    if fmt == "NVFP4":
+        return [
+            ("weight_packed", torch.uint8, (n, k // 2)),
+            ("weight_scale", torch.float8_e4m3fn, (n, k // 16)),
+            ("weight_global_scale", torch.float32, (1,)),
+            ("input_global_scale", torch.float32, (1,)),
+        ]
+    if fmt == "FP8_E4M3":
+        return [
+            ("weight", torch.float8_e4m3fn, (n, k)),
+            ("weight_scale", torch.float32, (n, 1)),
+        ]
+    raise ValueError(f"no stock streaming spec for {fmt!r}")
 
 
 class _StreamWriter:
@@ -374,10 +417,22 @@ def export_nvfp4_cb_streaming(
         profile = None
     expert_groups = _plan_expert_stacks(skeleton)
 
-    # --- Classify every assignment target (CB / FP8_SOURCE / stock-CT). ---
+    # --- Stock-CT codecs (mixed container: the plugin delegates non-"scheme"
+    # groups to vLLM's CompressedTensors path). REUSE the authoritative
+    # export_native_compressed packers — never reimplement packing; RTN only
+    # (no GPTQ/act-order), matching how the CB cost stage measures stock rungs. ---
+    from prismaquant.format_registry import canonical_format_name
+    from prismaquant.export_native_compressed import (
+        _quantize_2d as _ct_quantize_2d,
+        compute_nvfp4_global_real as _ct_nvfp4_global_real,
+    )
+    _STOCK_CT_FORMATS = ("NVFP4", "FP8_E4M3")   # FP8_DYNAMIC canonicalizes here
+
+    # --- Classify every target (CB / FP8_SOURCE / stock-CT dense / BF16). ---
     cb_targets: dict[str, tuple[str, str, int]] = {}
     source_targets: list[str] = []
-    stock_illegal = []
+    stock_targets: dict[str, str] = {}          # qname -> "NVFP4" | "FP8_E4M3"
+    illegal = []
     for qname, fmt in assignment.items():
         if fmt == "BF16":
             continue
@@ -385,18 +440,20 @@ def export_nvfp4_cb_streaming(
         if parsed is not None:
             cb_targets[qname] = parsed
             continue
-        from prismaquant.format_registry import canonical_format_name
-        if canonical_format_name(fmt) == "FP8_SOURCE":
+        canon = canonical_format_name(fmt)
+        if canon == "FP8_SOURCE":
             source_targets.append(qname)
             continue
-        stock_illegal.append((qname, fmt))
-    if stock_illegal:
+        if canon in _STOCK_CT_FORMATS:
+            stock_targets[qname] = canon
+            continue
+        illegal.append((qname, fmt))
+    if illegal:
         raise ValueError(
-            "streaming CB export supports CB families + FP8_SOURCE + BF16 "
-            "only; stock-CT rungs "
-            f"{sorted({f for _, f in stock_illegal})} need the in-memory "
-            "export_nvfp4_cb (their codec output sizes need a pack to size "
-            "the streaming header — bounded TODO).")
+            "streaming CB export carries CB families + stock NVFP4/FP8_DYNAMIC "
+            "(CT-delegated) + FP8_SOURCE + BF16 only; unsupported rung(s) "
+            f"{sorted({f for _, f in illegal})} — assign a legal format or use "
+            "the in-memory export_nvfp4_cb.")
 
     # Subset gate: every quantised target's export base must live under a
     # declared prefix, else the allocation reaches outside the subset the caller
@@ -405,6 +462,7 @@ def export_nvfp4_cb_streaming(
     if subset_prefixes is not None:
         outside = sorted(
             q for q in list(cb_targets) + list(source_targets)
+            + list(stock_targets)
             if not any(_export_base_name(q, profile).startswith(p)
                        for p in subset_prefixes))
         if outside:
@@ -475,6 +533,65 @@ def export_nvfp4_cb_streaming(
                 f"{qname}: col_weights has {cwn} elements but the weight "
                 f"wants {in_f} or {n_exp}x{in_f}")
 
+    # --- Stock-CT coverage + expert-stack gate. Stock rungs stream for DENSE
+    # (2-D) Linears only; a MoE expert stack assigned a stock format has no
+    # safe streaming pack here (the CB container's stock config emits a
+    # packed-name regex vLLM's MoE dispatch cannot match to its per-expert
+    # probes, and the CT codec is 2-D), so fail fast pointing at the fix. ---
+    stock_expert: list[str] = []
+    for qname in stock_targets:
+        kind, _h = _resolve_target(qname)
+        if kind is None:
+            raise KeyError(
+                f"{qname}: assigned {stock_targets[qname]} but no streaming "
+                "source (tried the .weight key + the profile-mapped checkpoint "
+                "name)")
+        shape = _target_shape(qname)
+        if kind == "experts" or len(shape) == 3:
+            stock_expert.append(qname)
+            continue
+        if stock_targets[qname] == "NVFP4" and int(shape[-1]) % 16 != 0:
+            raise ValueError(
+                f"{qname}: stock NVFP4 needs in_features % 16 == 0 (group 16), "
+                f"got in_features={int(shape[-1])}")
+    if stock_expert:
+        raise ValueError(
+            "streaming CB export carries stock NVFP4/FP8_DYNAMIC on DENSE "
+            "Linears only; these MoE expert-stack target(s) were assigned a "
+            f"stock format: {sorted(stock_expert)[:5]}"
+            f"{' ...' if len(stock_expert) > 5 else ''} "
+            f"({len(stock_expert)} total). Assign expert stacks a CB rung "
+            "(nvfp4_cb / fp8_cb), FP8_SOURCE, or BF16 — or use the in-memory "
+            "export_nvfp4_cb on a model small enough to materialise. The dense "
+            "tier is where vanilla NVFP4/FP8_DYNAMIC won the A/B; constrain the "
+            "allocator to keep experts on CB/passthrough.")
+
+    # --- Stock NVFP4 fused-sibling coherence (mirrors export_nvfp4_cb /
+    # export_native_compressed): q/k/v and gate/up landing on NVFP4 MUST share
+    # ONE weight_global_scale or vLLM's fused loader sees inconsistent
+    # per-tensor globals. Take the max over each fused group's natural
+    # global_real (streamed — one weight resident at a time) and override every
+    # sibling's pack. Singleton groups get their own global, exactly like the
+    # in-memory exporter (so the streamed bytes are byte-identical). ---
+    _nvfp4_shared_global: dict[str, torch.Tensor] = {}
+    _nvfp4_groups: dict[str, list[str]] = {}
+    for _q, _f in stock_targets.items():
+        if _f != "NVFP4":
+            continue
+        _gk = (profile.fused_sibling_group(_q)
+               if profile is not None else None) or _q
+        _nvfp4_groups.setdefault(_gk, []).append(_q)
+    for _members in _nvfp4_groups.values():
+        _grs = []
+        for _m in _members:
+            _k, _h = _resolve_target(_m)
+            _w = skeleton.dequant_weight(_h).to(device)
+            _grs.append(_ct_nvfp4_global_real(_w, 16).reshape(()))
+            del _w
+        _shared = torch.stack(_grs).max()
+        for _m in _members:
+            _nvfp4_shared_global[_m] = _shared
+
     # --- Resolve/train codebooks (bounded pooling for learned). ---
     provided = spec.get("codebooks", {}) if source == "learned" else {}
     train = bool(spec.get("train", False))
@@ -515,6 +632,7 @@ def export_nvfp4_cb_streaming(
     ignore: list[str] = []
     cb_targets_set = set(cb_targets)
     source_set = set(source_targets)
+    stock_set = set(stock_targets)
     emitted_bases: set[str] = set()   # checkpoint tensor keys we consume
 
     # CB + FP8_SOURCE targets (keyed by canonical/recipe qname).
@@ -577,6 +695,37 @@ def export_nvfp4_cb_streaming(
             writer.add(export_base + ".weight_scale", torch.float32,
                        scale_shape, _scale)
 
+    # Stock-CT DENSE targets: analytic on-disk tensors packed RTN via the
+    # export_native_compressed codec (byte-identical to export_nvfp4_cb). ONE
+    # producer packs the weight once and caches every suffix tensor; the writer
+    # streams them one at a time. RTN is deterministic, so RESUME re-runs the
+    # group from its base boundary and rewrites identical bytes.
+    for qname in sorted(stock_targets):
+        canon_fmt = stock_targets[qname]
+        export_base = _export_base_name(qname, profile)
+        kind, h = _resolve_target(qname)              # dense: kind == "tensor"
+        shape = _target_shape(qname)
+        override = (_nvfp4_shared_global.get(qname)
+                    if canon_fmt == "NVFP4" else None)
+        emitted_bases.add(h)
+        state: dict = {}
+
+        def _render(h=h, canon_fmt=canon_fmt, override=override, state=state):
+            if "out" not in state:
+                w = skeleton.dequant_weight(h).to(device)
+                packed = _ct_quantize_2d(
+                    w, canon_fmt, nvfp4_global_real_override=override)
+                state["out"] = {s: t.cpu().contiguous()
+                                for s, t in packed.items()}
+                del w
+            return state["out"]
+
+        for suffix, dtype, out_shape in _stock_output_specs(canon_fmt, shape):
+            def _prod(suffix=suffix, _render=_render):
+                return _render()[suffix]
+            writer.add(export_base + "." + suffix, dtype, out_shape, _prod)
+        counts[canon_fmt] += 1
+
     # Passthrough: every remaining checkpoint tensor verbatim (BF16/norms/etc).
     # Per-expert tensors consumed by a stacked CB target are NOT passthrough.
     # Expert groups are keyed by the on-disk (checkpoint) prefix; a nested
@@ -607,7 +756,8 @@ def export_nvfp4_cb_streaming(
         ckpt_qname = (name[:-len(".weight")] if name.endswith(".weight")
                       else None)
         canon = _canonical_qname(ckpt_qname, profile) if ckpt_qname else None
-        if canon in cb_targets_set or canon in source_set:
+        if canon in cb_targets_set or canon in source_set \
+                or canon in stock_set:
             continue
         shape = skeleton.get_shape(name)
         dtype = skeleton.get_dtype(name)
@@ -624,9 +774,9 @@ def export_nvfp4_cb_streaming(
             cb_tensor_blobs[tname] = blob
     codebook_file = "cb_codebooks.pqcb" if cb_tensor_blobs else None
     quant_config = _build_config(
-        assignment, cb_targets, source_targets, by_group, codebooks,
-        col_weights, cb_tensor_blobs, ignore, codebook_file, scale_coding,
-        source, profile)
+        assignment, cb_targets, source_targets, stock_targets, by_group,
+        codebooks, col_weights, cb_tensor_blobs, ignore, codebook_file,
+        scale_coding, source, profile)
 
     print(f"[export-cb-stream] streaming {len(writer.names())} tensors ...",
           flush=True)
@@ -713,11 +863,12 @@ def _train_shared_codebook_streaming(skeleton, profile, expert_groups,
         train_cap=train_cap)
 
 
-def _build_config(assignment, cb_targets, source_targets, by_group, codebooks,
-                  col_weights, cb_tensor_blobs, ignore, codebook_file,
-                  scale_coding, source, profile):
+def _build_config(assignment, cb_targets, source_targets, stock_targets,
+                  by_group, codebooks, col_weights, cb_tensor_blobs, ignore,
+                  codebook_file, scale_coding, source, profile):
     """quant_config.json — mirrors export_nvfp4_cb's config emitter exactly
-    (config_groups keyed by scheme signature + provenance)."""
+    (CB config_groups keyed by scheme signature + stock-CT / FP8_SOURCE groups
+    in the exact compressed-tensors vocabulary + provenance)."""
     assignment_sha = hashlib.sha256(json.dumps(
         dict(sorted(assignment.items())), separators=(",", ":")).encode()
     ).hexdigest()
@@ -757,6 +908,41 @@ def _build_config(assignment, cb_targets, source_targets, by_group, codebooks,
                 "table": [float(t) for t in table.tolist()]}
         config_groups[f"group_{gi}"] = {
             "targets": targets, "format": fmt, "scheme": scheme}
+    # Stock-CT + FP8_SOURCE config_groups: EXACT compressed-tensors vocabulary
+    # (weights/input_activations/format at the group top, NO "scheme" key) so
+    # the plugin hands them to CompressedTensorsConfig under delegation (the
+    # "scheme" key is the CB-vs-stock dispatch marker, LAYOUT.md §4). Targets
+    # carry the vLLM-INTERNAL name (to_vllm_internal_name): the delegated CT
+    # path matches vLLM's module tree, NOT the checkpoint tensor names, so a
+    # hy_v3 shared_mlp Linear (params under .shared_mlp.*, dispatch prefix
+    # collapsed to .mlp.*) is matched only via the vLLM name (28b6862 /
+    # export_native_compressed.build_quantization_config). CB groups instead
+    # keep the checkpoint name and are runtime-aliased inside the plugin.
+    from copy import deepcopy as _deepcopy
+    from prismaquant.export_native_compressed import (
+        _explicit_regex as _ct_explicit_regex,
+        NVFP4_SCHEME as _NVFP4_SCHEME,
+        FP8_E4M3_SCHEME as _FP8_E4M3_SCHEME,
+        FP8_SOURCE_SCHEME as _FP8_SOURCE_SCHEME,
+    )
+    _STOCK_CT_SCHEMES = {"NVFP4": _NVFP4_SCHEME, "FP8_E4M3": _FP8_E4M3_SCHEME}
+
+    def _vllm_target(q):
+        return profile.to_vllm_internal_name(q) if profile is not None else q
+
+    _stock_by_fmt: dict[str, list[str]] = {}
+    for _q, _f in stock_targets.items():
+        _stock_by_fmt.setdefault(_f, []).append(_q)
+    for _f, _qnames in sorted(_stock_by_fmt.items()):
+        _group = _deepcopy(_STOCK_CT_SCHEMES[_f])
+        _group["targets"] = sorted(
+            _ct_explicit_regex(_vllm_target(q)) for q in _qnames)
+        config_groups[f"group_{len(config_groups)}"] = _group
+    if source_targets:
+        _src_group = _deepcopy(_FP8_SOURCE_SCHEME)
+        _src_group["targets"] = sorted(
+            _ct_explicit_regex(_vllm_target(q)) for q in source_targets)
+        config_groups[f"group_{len(config_groups)}"] = _src_group
     quant_config = {
         "quant_method": "prismaquant", "format": "nvfp4_cb",
         "config_groups": config_groups, "ignore": sorted(set(ignore)),
@@ -766,6 +952,7 @@ def _build_config(assignment, cb_targets, source_targets, by_group, codebooks,
             "imatrix_sha256": imatrix_sha, "codebook_sha256": codebook_sha,
             "codebook_source": source, "scale_coding": scale_coding,
             "streaming": True, "cb_targets": len(cb_targets),
+            "stock_ct_targets": len(stock_targets),
             "fp8_source_targets": len(source_targets),
         },
     }
