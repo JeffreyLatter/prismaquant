@@ -202,24 +202,20 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             W = (val.float() * ws[:, None]).to(torch.bfloat16)
         return W                                               # (out, in) bf16
 
-    _warned_shared = False
-
     def apply(self, layer: RoutedExperts, x: torch.Tensor,
               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
               shared_experts, shared_experts_input) -> torch.Tensor:
-        # On CUDA the shared-expert FUSION path is ROCm-AITER-gated (off here),
-        # so the model runs its shared expert separately (a Linear our CB linear
-        # method quantizes) and this arg is None. If it is EVER non-None we are
-        # silently dropping a contribution — surface it loudly (once) so the
-        # served KL/smoke has a paper trail instead of a silent regression.
-        if shared_experts is not None and not PrismaQuantCBMoEMethod._warned_shared:
-            PrismaQuantCBMoEMethod._warned_shared = True
-            import sys
-            print(f"[prismaquant-cb-moe] WARNING {self.prefix}: non-None "
-                  "shared_experts passed to apply() but this method computes ONLY "
-                  "routed experts — shared-expert output may be dropped. Verify "
-                  "the served KL; implement shared-expert handling if regressed.",
-                  file=sys.stderr, flush=True)
+        # Shared expert (e.g. hy_v3): apply() correctly returns ROUTED-ONLY.
+        # vLLM's MoERunner._apply_quant_method runs the SharedExperts wrapper
+        # SEPARATELY (`_maybe_apply_shared_experts` -> `SharedExperts._layer(
+        # shared_experts_input)`), producing shared_output, and _maybe_combine
+        # adds it to our routed output — verified against the vLLM v0.23 runner
+        # (moe_runner.py). The wrapper's `_layer` IS the shared_mlp module,
+        # whose CB weights we decoded to bf16 at load (moe_toplevel_loader), so
+        # the shared contribution is computed and included; a routed-only return
+        # here is the contract, NOT a dropped component. (The `_unpack` path also
+        # accepts a `(shared, routed)` tuple for methods that fuse the shared
+        # expert into their kernel — we don't, so single-tensor is correct.)
         del shared_experts, shared_experts_input
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
