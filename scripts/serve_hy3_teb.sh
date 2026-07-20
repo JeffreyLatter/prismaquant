@@ -35,6 +35,7 @@ docker run -d --rm --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e PQ_MODEL="$MODEL" -e PQ_MAXLEN="$MAXLEN" -e PQ_UTIL="$UTIL" \
   -e PQ_EXTRA="$EXTRA_ARGS" \
   -e VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}" \
+  -e PRISMAQUANT_CB_W2_SCHED="${PRISMAQUANT_CB_W2_SCHED:-}" \
   --entrypoint bash vllm-node:latest -c '
     pip install -e /repo/plugins/vllm_prismaquant --no-deps -q 2>/dev/null
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
