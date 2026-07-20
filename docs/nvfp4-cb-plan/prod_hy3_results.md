@@ -147,6 +147,50 @@ vllm-node (vLLM 0.23), plugin, --enforce-eager --max-model-len 4096
   lane's raison d'être proven at 300B class: native-format serving removes
   IQ's prefill tax on a single Spark.
 
+## Ship sprint (2026-07-20) — quality gate + native-decode arc
+Goal: exceed the shipped GGUF Hy3 in quality, native perf in prefill AND decode.
+
+**TEB quality gate (exact GGUF protocol: 12288 ctx, kv fp8, hy_v3 parsers,
+seed 1234, --no-think --hardmode --parallel 1): 87/100 (129/148) — an exact
+TIE with the shipped GGUF IQ 2.8bpp (87, 129/148); beats k-quant (86).**
+Zero errors, 74/74 scenarios. Failures are the known cross-artifact family
+fails (TC-34/42/43/60) + TC-58; scenario churn at the plateau, same as the
+IQ-vs-k comparison. Honest verdict: at matched body bytes, tool-use quality
+is base-model-dominated — PARITY, not exceed, on the TEB axis. The
+exceeds-the-ship case = quality parity + the 7.5 GB BF16 MTP head the GGUF
+cannot carry + native-kernel speed. Report:
+tooleval/2026/07/2026-07-20T13-28-37Z_994c74.md.
+
+**Decode time budget (torch profiler, eager, per step):** wall 158 ms =
+GPU-busy 85.5 + host/launch gap 72.7 (4,400+ launches/step — norms, rotary,
+MoE sort/gather). GPU-busy split: cb_moe_gemv_fp4_v2 37.6 ms at ~25-30% of
+bandwidth (the wall), dense fp8 GEMV 20.0 @ ~55%, cuBLAS (lm_head + router)
+10.9, MoE fp8 8.7, norms 6.2, attention 0.7.
+
+**Perf levers landed (decode 9.9 → 13.1 tok/s so far, prefill 98 → 115):**
+- **shared_mlp CB-direct (config-only fix).** vLLM builds hy_v3's shared MLP
+  with the PARENT ``…mlp`` prefix (prefix=f"{prefix}" in HYV3MoEFused) — the
+  real reason bug-9c's instrumented print never fired. Collapsed-dispatch
+  aliases in PrismaQuantConfig let the CB linear method own the shared expert
+  natively; the decode-at-load path goes dead automatically (structural
+  detection); module paths / checkpoint names unchanged. −1.9 GiB resident
+  (KV 13.6→14.4 GiB at eager), −1.8 GB active bytes/token (ceiling 24→28
+  tok/s). Every quantized Linear now runs through CB kernels.
+- **Dense fp4-v2 CUDA GEMV** (was Triton): 13/13 bit-match tests vs Triton +
+  expand reference; covers 27 dense + 33 shared fp4 units.
+- **CUDA graphs, FULL_DECODE_ONLY + mode NONE** (no torch.compile over the
+  plugin): 2 decode graphs, 0.18 GiB, +24% decode. Flushed out a REAL bug:
+  codec.fp4_group16_act_qdq built its E2M1 grid on CPU and H2D-copied it
+  EVERY call (hidden sync in eager, hard error under capture) — now cached
+  per-device. Prefill stays eager (the per-expert loop's one host sync).
+- **MTP spec decode: REJECTED on one Spark (box OOM 2026-07-20).** The bf16
+  draft (+7.5 GB) on top of ~102 GiB weights leaves no margin for vLLM's
+  memory-profiling peak on the unified pool (~5 GiB system floor). Do NOT
+  retry at these sizes. v2 roadmap: quantize the MTP module to CB (~2 GB) —
+  then spec decode fits. The artifact still carries MTP for bigger boxes.
+- fp4-v2 grouped MoE kernel bandwidth pass: IN FLIGHT (28% → 55%+ target,
+  bit-identity + capture-safety gated).
+
 ## Remaining (perf, not correctness)
 - Decode ~10 tok/s: dense fp4-v2 uses the Triton `_cb_decode_gemm_kernel`
   (CUDA GEMV is fp8-only for DENSE); a dense fp4-v2 CUDA decode kernel is
