@@ -12,7 +12,7 @@
 # ============================================================================
 set -u
 NAME=pq_hy3_cb
-MODEL=/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb
+MODEL="${MODEL:-/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb}"
 MAXLEN="${MAXLEN:-12288}"
 UTIL="${UTIL:-0.95}"
 EXTRA_ARGS="${EXTRA_ARGS:---enforce-eager}"
@@ -34,6 +34,7 @@ docker run -d --rm --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e VLLM_SERVER_DEV_MODE=1 \
   -e PQ_MODEL="$MODEL" -e PQ_MAXLEN="$MAXLEN" -e PQ_UTIL="$UTIL" \
   -e PQ_EXTRA="$EXTRA_ARGS" \
+  -e VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}" \
   --entrypoint bash vllm-node:latest -c '
     pip install -e /repo/plugins/vllm_prismaquant --no-deps -q 2>/dev/null
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \

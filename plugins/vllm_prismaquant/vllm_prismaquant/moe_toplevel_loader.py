@@ -509,7 +509,12 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                 # original's own filter drops). Delegate to the original loader.
                 yield name, w
 
-        loaded |= orig_load_weights(self, _passthrough())
+        # Some loaders return the loaded-name set (HYV3ForCausalLM), others
+        # return None (HYV3MTP's drafter loader) — tolerate both; our own
+        # `loaded` set still reports the tensors WE placed.
+        ret = orig_load_weights(self, _passthrough())
+        if ret:
+            loaded |= set(ret)
         if shared_cb_buf:
             quant_config = _find_prismaquant_config(self)
             loaded |= _load_shared_cb(self, shared_cb_buf, params_dict,
