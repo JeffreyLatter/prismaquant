@@ -25,7 +25,7 @@ from collections import defaultdict
 import torch
 
 sys.path.insert(0, "/home/rob/prismaquant")
-from prismaquant.format_registry import get_format_spec  # noqa: E402
+from prismaquant.format_registry import REGISTRY, canonical_format_name  # noqa: E402
 from prismaquant import nvfp4_cb_formats as cb           # noqa: E402
 
 
@@ -83,13 +83,16 @@ def main():
     with open(f"{args.work}/artifacts/cb_col_weights.pkl", "rb") as f:
         colw = pickle.load(f)
 
-    spec_nvfp4 = get_format_spec("NVFP4")
-    spec_k36 = get_format_spec("FP8_CB_K36")
+    spec_nvfp4 = REGISTRY[canonical_format_name("NVFP4")]
+    spec_k36 = REGISTRY[canonical_format_name("FP8_CB_K36")]
     hdrs = load_st_headers(args.source)
 
     def cost(W, spec, cw):
-        q = spec.quantize_dequantize(W)
-        d2 = (q.float() - W.float()) ** 2
+        # fp32 in for BOTH formats: the CB qdq path expects fp32, and cost is
+        # measured in fp32 per the cross-layer-additivity finding.
+        Wf = W.float()
+        q = spec.quantize_dequantize(Wf)
+        d2 = (q.float() - Wf) ** 2
         um = d2.mean().item()                       # unweighted weight-MSE
         wm = um
         if cw is not None:
