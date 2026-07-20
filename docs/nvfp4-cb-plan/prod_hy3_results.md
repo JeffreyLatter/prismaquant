@@ -94,12 +94,40 @@ TARGET_BITS=2.9, streaming export.
   memory params for the smoke: --enforce-eager --max-model-len 8192
   --gpu-memory-utilization 0.95 (110 GB weights leave ~5 GB for KV).
 
+## Serve-bringup bug chain (2026-07-20, first serve of a top-level-loader MoE)
+Each is a distinct hy_v3-specific first-contact bug; the artifact bytes are
+correct (proven on disk), these are all serving-adapter gaps.
+- **Bug 9a — top-level expert loader (FIXED, committed f202841 then
+  refined).** hy_v3 loads experts at the top model via expert_params_mapping,
+  bypassing the per-layer FusedMoE.load_weights the plugin wraps. Plugin-
+  installed model-level load_weights wrap. The wrap install runs in the
+  EngineCore process (verified via marker).
+- **Bug 9b — routed_experts nesting (FIXED).** hy_v3's SharedFusedMoE nests
+  the routed FusedMoE one level deeper: params are at
+  `…mlp.experts.routed_experts.w13/w2_cb_qweight`, not `…mlp.experts.w13…`.
+  A fixed-string suffix rewrite missed. Fix: `resolve_cb_expert_param`
+  resolves the target by (`…mlp.experts.` prefix, leaf suffix) against the
+  ACTUAL named_parameters — robust to this nesting and any future one.
+  Confirmed working: both routed_experts params load.
+- **Bug 9c — shared expert built unquantized (FIX IN FLIGHT).** hy_v3 passes
+  `shared_experts=self.shared_mlp` into FusedMoE; vLLM builds the shared-MLP
+  Linears as PLAIN BF16 `.weight` and NEVER calls the quant config's
+  get_quant_method for them (proven: instrumented print never fired). But the
+  export quantized shared_mlp to CB (190 tensors, 0.58 GB packed) → KeyError.
+  Fix: decode the CB shared_mlp tensors to bf16 at load and populate the
+  `.weight` params (the plugin already decodes CB at prefill; ~+1.7 GB
+  resident). Unfused checkpoint gate/up → cat into vLLM's fused
+  gate_up_proj.weight. NOTE for the clean re-export path: a hy_v3 serving
+  profile should force shared_mlp→BF16 (like Gemma incomplete-fused groups),
+  making this decode-at-load unnecessary — but that needs a re-export; the
+  decode serves the existing artifact now.
+
 ## Pending
-- Tensor-count / no-double-ship: header confirms 2271 tensors,
-  U8+BF16+F32 only. Re-confirm on disk at completion. [DONE: 110.3 GB]
-- Serve smoke (load + coherent gen) after bug-9 fix; then prefill vs the
-  GGUF 42 tok/s (the thesis number) + decode with the fp4-v2 grouped
-  kernel (committed fa7cc90).
+- After bug 9c: KV profiling at util 0.95 (tight — 110→112 GB resident,
+  serve --max-model-len 4096-8192), first forward (attn + fp4-v2 grouped
+  routed MoE + decoded shared expert), possible further first-contact bugs.
+- Then: prefill vs GGUF 42 tok/s (the thesis number) + decode with the
+  fp4-v2 grouped kernel (fa7cc90).
 - Serve smoke: hy_v3 adapter in the serving image, v2-compose fp4-CB
   dense at scale, fp4-CB MoE via v2 (grouped decode kernel is fp8-only —
   the known extension for decode parity).
