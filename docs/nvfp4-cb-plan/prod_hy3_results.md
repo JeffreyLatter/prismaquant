@@ -122,12 +122,41 @@ correct (proven on disk), these are all serving-adapter gaps.
   making this decode-at-load unnecessary — but that needs a re-export; the
   decode serves the existing artifact now.
 
-## Pending
-- After bug 9c: KV profiling at util 0.95 (tight — 110→112 GB resident,
-  serve --max-model-len 4096-8192), first forward (attn + fp4-v2 grouped
-  routed MoE + decoded shared expert), possible further first-contact bugs.
-- Then: prefill vs GGUF 42 tok/s (the thesis number) + decode with the
-  fp4-v2 grouped kernel (fa7cc90).
+- **Bug 9d — the shared-expert NON-bug (investigated + reverted).** A
+  defensive warning claimed apply() might drop the shared expert. A fix to
+  compute it inside apply() CRASHED (vLLM's `shared_experts` is a
+  `SharedExperts` stream-overlap wrapper: `forward(hidden_states, order)`,
+  not a plain module). Reading vLLM v0.23 `moe_runner.py` settled it:
+  `_apply_quant_method` runs the SharedExperts wrapper SEPARATELY
+  (`_maybe_apply_shared_experts` → `SharedExperts._layer(input)` = the
+  shared_mlp with our bf16-decoded weights) and `_maybe_combine` adds it;
+  apply() returning routed-only IS the contract. Reverted; corrected the
+  comment. The shared expert was computed correctly all along.
+
+## SERVE VERDICT — 295B on ONE Spark (2026-07-20)
+**Loads, serves, generates coherently and correctly.** Single DGX Spark,
+vllm-node (vLLM 0.23), plugin, --enforce-eager --max-model-len 4096
+--gpu-memory-utilization 0.95. Load 77 s (100.7 GiB), KV 44,272 tokens
+(10.8× concurrency @4k). Validation bar (NO QUALITY CLAIMS on 295B) MET:
+- Coherent + factually correct: Tokyo/Paris/Berlin chain; correct recursive
+  fibonacci; **arithmetic correct** (17×24=408, 60mi/1.5h=40mph,
+  60mi/2gal=30mpg); RGB primaries.
+- **Speed — the thesis: prefill 89 tok/s vs the shipped GGUF Hy3 2.8bpp's
+  42 tok/s IQ tax = 2.1× faster prefill on native tensor-core CB.** Decode
+  ~9-10 tok/s (fp4-v2 grouped kernel + Triton dense fp4). This is the CB
+  lane's raison d'être proven at 300B class: native-format serving removes
+  IQ's prefill tax on a single Spark.
+
+## Remaining (perf, not correctness)
+- Decode ~10 tok/s: dense fp4-v2 uses the Triton `_cb_decode_gemm_kernel`
+  (CUDA GEMV is fp8-only for DENSE); a dense fp4-v2 CUDA decode kernel is
+  the lever (routed-expert MoE decode already uses the fp4-v2 grouped CUDA
+  kernel fa7cc90).
+- MoE prefill still per-expert-loop for the 89 tok/s (batched-expert
+  expand + grouped GEMM = task 15) — even so it already beats GGUF 2.1×.
+- Clean re-export: hy_v3 serving profile → force shared_mlp BF16 (drops the
+  decode-at-load; bf16 on disk).
+- Larger context: 8k-16k fits (footprint §); 4k used for the smoke.
 - Serve smoke: hy_v3 adapter in the serving image, v2-compose fp4-CB
   dense at scale, fp4-CB MoE via v2 (grouped decode kernel is fp8-only —
   the known extension for decode parity).
