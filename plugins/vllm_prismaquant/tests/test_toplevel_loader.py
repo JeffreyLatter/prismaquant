@@ -15,9 +15,13 @@ validate_hy3_cb_loader.py oracle (create_weights + real quant_config schemes).
 import pytest
 import torch
 
+from vllm_prismaquant import moe_toplevel_loader
 from vllm_prismaquant.moe_toplevel_loader import (
+    _build_reverse_fusion,
+    _load_shared_cb,
     install_toplevel_cb_expert_loader,
     map_cb_expert_name,
+    resolve_shared_cb_target,
 )
 
 
@@ -181,3 +185,189 @@ def test_install_is_idempotent():
     install_toplevel_cb_expert_loader(_FakeCausalLM)     # second call: no-op
     assert _FakeCausalLM.load_weights is wrapped
     assert _FakeCausalLM._pq_cb_wrapped is True
+
+
+# ---------------------------------------------------------------------------
+# Shared-expert (shared_mlp) CB interception. The Hy3 shared MLP is built as
+# PLAIN bf16 Linears (fused gate_up_proj + down_proj), so the checkpoint's
+# …shared_mlp.{gate_proj,up_proj,down_proj}.cb_qweight have no cb_qweight param
+# to load into. The wrapper decodes them to bf16 and injects into the .weight.
+# ---------------------------------------------------------------------------
+
+_REV = _build_reverse_fusion({"gate_up_proj": ["gate_proj", "up_proj"],
+                              "qkv_proj": ["q_proj", "k_proj", "v_proj"]})
+
+
+def test_resolve_shared_cb_fused_gate_up():
+    # vLLM built a merged bf16 gate_up_proj.weight (no cb_qweight) -> intercept,
+    # routing gate to shard 0 and up to shard 1.
+    P = "model.layers.1.mlp.shared_mlp"
+    params = {P + ".gate_up_proj.weight", P + ".down_proj.weight"}
+    assert resolve_shared_cb_target(P + ".gate_proj.cb_qweight", params, _REV) \
+        == (P + ".gate_up_proj.weight", 0)
+    assert resolve_shared_cb_target(P + ".up_proj.cb_qweight", params, _REV) \
+        == (P + ".gate_up_proj.weight", 1)
+    # fp8 weight_scale routes exactly like its cb_qweight sibling.
+    assert resolve_shared_cb_target(P + ".gate_proj.weight_scale", params, _REV) \
+        == (P + ".gate_up_proj.weight", 0)
+
+
+def test_resolve_shared_cb_direct_down():
+    P = "model.layers.1.mlp.shared_mlp"
+    params = {P + ".gate_up_proj.weight", P + ".down_proj.weight"}
+    assert resolve_shared_cb_target(P + ".down_proj.cb_qweight", params, _REV) \
+        == (P + ".down_proj.weight", 0)
+    assert resolve_shared_cb_target(P + ".down_proj.weight_scale", params, _REV) \
+        == (P + ".down_proj.weight", 0)
+
+
+def test_resolve_shared_cb_defers_dense_and_fused_cb():
+    # A genuine dense-CB Linear and a fused-attention shard both have a
+    # REGISTERED cb_qweight param -> defer to the original loader (return None).
+    params = {
+        "model.layers.1.self_attn.qkv_proj.cb_qweight",   # fused attn (q/k/v)
+        "model.layers.1.self_attn.o_proj.cb_qweight",      # dense o_proj
+        "model.layers.0.mlp.down_proj.cb_qweight",         # dense L0 MLP (CB)
+    }
+    for n in [
+        "model.layers.1.self_attn.q_proj.cb_qweight",       # -> qkv_proj (CB)
+        "model.layers.1.self_attn.v_proj.weight_scale",
+        "model.layers.1.self_attn.o_proj.cb_qweight",
+        "model.layers.1.self_attn.o_proj.weight_scale",
+        "model.layers.0.mlp.down_proj.cb_qweight",
+    ]:
+        assert resolve_shared_cb_target(n, params, _REV) is None, n
+
+
+def test_resolve_shared_cb_defers_absent_and_non_cb():
+    params = {"model.layers.1.mlp.shared_mlp.gate_up_proj.weight"}
+    # target entirely absent on this rank -> defer
+    assert resolve_shared_cb_target(
+        "model.layers.9.mlp.shared_mlp.down_proj.cb_qweight", params, _REV) is None
+    # not a CB tensor at all -> not ours
+    assert resolve_shared_cb_target("model.embed_tokens.weight", params, _REV) is None
+    assert resolve_shared_cb_target(
+        "model.layers.1.mlp.gate.expert_bias", params, _REV) is None
+
+
+def _stub_decode(scheme, cb_qweight, weight_scale, codebooks, dev):
+    """CPU stand-in for the CUDA expander: returns an [out, in] bf16 tile filled
+    with the source's marker byte so tests can trace placement/fusion order.
+    in_features is recovered exactly as the real decode does."""
+    out = int(cb_qweight.shape[0])
+    in_f = (int(cb_qweight.shape[1]) // int(scheme["type_size"])) * 256
+    marker = float(cb_qweight.reshape(-1)[0].item())
+    return torch.full((out, in_f), marker, dtype=torch.bfloat16)
+
+
+class _StubQuantConfig:
+    def __init__(self, target_scheme):
+        self.target_scheme = target_scheme
+
+    def get_codebooks(self):
+        return {}
+
+
+def test_load_shared_cb_fuses_and_injects(monkeypatch):
+    monkeypatch.setattr(moe_toplevel_loader, "_decode_cb_linear_to_bf16",
+                        _stub_decode)
+    HID, INTER, TS = 512, 256, 128            # hidden, shared inter, fp8 type_size
+    P = "model.layers.1.mlp.shared_mlp"
+    # gate/up cb_qweight: (inter, (hidden/256)*TS) -> in_f == hidden after decode.
+    gu_bytes = (HID // 256) * TS
+    dn_bytes = (INTER // 256) * TS
+    params_dict = {
+        P + ".gate_up_proj.weight": torch.zeros(2 * INTER, HID, dtype=torch.bfloat16),
+        P + ".down_proj.weight": torch.zeros(HID, INTER, dtype=torch.bfloat16),
+    }
+    scheme = {"grid": "fp8", "k": 32, "n_sub": 4, "type_size": TS,
+              "codebook_ref": ["cb"]}
+    quant_config = _StubQuantConfig({
+        P + ".gate_proj": scheme, P + ".up_proj": scheme, P + ".down_proj": scheme,
+    })
+    buf = {
+        P + ".gate_proj.cb_qweight": torch.full((INTER, gu_bytes), 1, dtype=torch.uint8),
+        P + ".gate_proj.weight_scale": torch.ones(INTER, dtype=torch.float32),
+        P + ".up_proj.cb_qweight": torch.full((INTER, gu_bytes), 2, dtype=torch.uint8),
+        P + ".up_proj.weight_scale": torch.ones(INTER, dtype=torch.float32),
+        P + ".down_proj.cb_qweight": torch.full((HID, dn_bytes), 3, dtype=torch.uint8),
+        P + ".down_proj.weight_scale": torch.ones(HID, dtype=torch.float32),
+    }
+    loaded = _load_shared_cb(None, buf, params_dict, _REV, quant_config)
+    assert loaded == {P + ".gate_up_proj.weight", P + ".down_proj.weight"}
+    gu = params_dict[P + ".gate_up_proj.weight"]
+    assert torch.all(gu[:INTER] == 1), "gate rows (shard 0) go first"
+    assert torch.all(gu[INTER:] == 2), "up rows (shard 1) go second"
+    assert tuple(gu.shape) == (2 * INTER, HID)
+    assert torch.all(params_dict[P + ".down_proj.weight"] == 3)
+
+
+def test_wrapper_end_to_end_shared_mlp(monkeypatch):
+    monkeypatch.setattr(moe_toplevel_loader, "_decode_cb_linear_to_bf16",
+                        _stub_decode)
+    HID, INTER, TS = 512, 256, 128
+    P = "model.layers.1.mlp.shared_mlp"
+    gu_bytes = (HID // 256) * TS
+    scheme = {"grid": "fp8", "k": 32, "n_sub": 4, "type_size": TS,
+              "codebook_ref": ["cb"]}
+
+    class _FakeCausalLM:
+        packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
+        def __init__(self):
+            self._params = {
+                P + ".gate_up_proj.weight": torch.zeros(2 * INTER, HID, dtype=torch.bfloat16),
+                P + ".down_proj.weight": torch.zeros(HID, INTER, dtype=torch.bfloat16),
+                "model.embed_tokens.weight": torch.zeros(4, HID),
+            }
+            # a CB quant_method somewhere on the model so _find_prismaquant_config
+            # locates the config (mirrors a real dense-CB Linear).
+            qc = _StubQuantConfig({P + ".gate_proj": scheme, P + ".up_proj": scheme,
+                                   P + ".down_proj": scheme})
+
+            class _M:
+                class quant_method:
+                    quant_config = qc
+            self._marker_mod = _M()
+            self.delegated = []
+
+        def modules(self):
+            return [self._marker_mod]
+
+        def named_parameters(self):
+            return list(self._params.items())
+
+        def load_weights(self, weights):
+            loaded = set()
+            for name, w in weights:
+                self.delegated.append(name)
+                if name in self._params:
+                    self._params[name].copy_(w)
+                    loaded.add(name)
+            return loaded
+
+    install_toplevel_cb_expert_loader(_FakeCausalLM)
+    m = _FakeCausalLM()
+    dn_bytes = (INTER // 256) * TS
+    ckpt = [
+        (P + ".gate_proj.cb_qweight", torch.full((INTER, gu_bytes), 1, dtype=torch.uint8)),
+        (P + ".gate_proj.weight_scale", torch.ones(INTER)),
+        (P + ".up_proj.cb_qweight", torch.full((INTER, gu_bytes), 2, dtype=torch.uint8)),
+        (P + ".up_proj.weight_scale", torch.ones(INTER)),
+        (P + ".down_proj.cb_qweight", torch.full((HID, dn_bytes), 3, dtype=torch.uint8)),
+        (P + ".down_proj.weight_scale", torch.ones(HID)),
+        ("model.embed_tokens.weight", torch.full((4, HID), 5.0)),
+    ]
+    loaded = m.load_weights(iter(ckpt))
+    # shared_mlp CB tensors were intercepted (never delegated to the original)
+    assert not any("shared_mlp" in n for n in m.delegated), m.delegated
+    # decoded + injected
+    assert torch.all(m._params[P + ".gate_up_proj.weight"][:INTER] == 1)
+    assert torch.all(m._params[P + ".gate_up_proj.weight"][INTER:] == 2)
+    assert torch.all(m._params[P + ".down_proj.weight"] == 3)
+    # embedding still delegated + loaded
+    assert "model.embed_tokens.weight" in m.delegated
+    assert torch.allclose(m._params["model.embed_tokens.weight"], torch.tensor(5.0))
+    assert P + ".gate_up_proj.weight" in loaded
+    assert P + ".down_proj.weight" in loaded
+    assert "model.embed_tokens.weight" in loaded
