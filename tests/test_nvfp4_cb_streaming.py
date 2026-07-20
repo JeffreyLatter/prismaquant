@@ -24,6 +24,7 @@ from prismaquant.export_nvfp4_cb import export_nvfp4_cb  # noqa: E402
 from prismaquant.export_nvfp4_cb_streaming import (  # noqa: E402
     _LazySkeleton,
     export_nvfp4_cb_streaming,
+    main as _cb_stream_main,
 )
 from prismaquant.export_native_compressed import (  # noqa: E402
     _quantize_2d,
@@ -459,3 +460,241 @@ def test_lazy_skeleton_metadata(workdir):
     assert sk.get_dtype("b.weight") == torch.bfloat16
     assert torch.equal(sk.load("a.weight"), load_file(
         str(mdl / "model.safetensors"))["a.weight"])
+
+
+# --- DELTA-EXPORT reuse (PRISMAQUANT_EXPORT_REUSE_PRIOR) --------------------
+#
+# Two dense CB Linears + a BF16 passthrough norm. On a re-allocation most CB
+# targets keep their (format, scheme, codebook), so a re-encode reproduces the
+# exact bytes — the reuse path byte-copies them from a prior artifact instead.
+
+_REUSE_ASSIGN_A = {
+    "model.layers.0.self_attn.q_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+    "model.layers.0.mlp.down_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+}
+# down_proj alone moves K16 -> K20 (a different CB format string) in B.
+_REUSE_ASSIGN_B = {
+    "model.layers.0.self_attn.q_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+    "model.layers.0.mlp.down_proj": {"data_type": "nvfp4_cb", "cb_k": 20},
+}
+
+
+def _reuse_model(mdl: Path, seed: int = 11) -> dict:
+    torch.manual_seed(seed)
+    tens = {
+        "model.layers.0.self_attn.q_proj.weight":
+            (torch.randn(128, 256) * 0.3).to(torch.bfloat16),
+        "model.layers.0.mlp.down_proj.weight":
+            (torch.randn(256, 256) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(256, dtype=torch.bfloat16),
+    }
+    _write_model(mdl, tens)
+    return tens
+
+
+def _reuse_cw() -> dict:
+    torch.manual_seed(99)
+    return {"model.layers.0.self_attn.q_proj": torch.rand(256) + 0.05,
+            "model.layers.0.mlp.down_proj": torch.rand(256) + 0.05}
+
+
+def _reshard(src: Path, dst: Path):
+    """Re-serialize a single-file artifact as a 2-shard artifact + index."""
+    dst.mkdir(parents=True, exist_ok=True)
+    tens = load_file(str(src / "model.safetensors"))
+    keys = list(tens)
+    half = max(1, len(keys) // 2)
+    g1 = {k: tens[k] for k in keys[:half]}
+    g2 = {k: tens[k] for k in keys[half:]}
+    save_file(g1, str(dst / "model-00001-of-00002.safetensors"),
+              metadata={"format": "pt"})
+    save_file(g2, str(dst / "model-00002-of-00002.safetensors"),
+              metadata={"format": "pt"})
+    wm = {**{k: "model-00001-of-00002.safetensors" for k in g1},
+          **{k: "model-00002-of-00002.safetensors" for k in g2}}
+    (dst / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 0}, "weight_map": wm}))
+    shutil.copy(src / "quant_config.json", dst / "quant_config.json")
+    qp = json.loads((src / "quant_config.json").read_text())
+    if qp.get("codebook_file"):
+        shutil.copy(src / qp["codebook_file"], dst / qp["codebook_file"])
+    if (src / "config.json").exists():
+        shutil.copy(src / "config.json", dst / "config.json")
+
+
+# (1) reuse disabled == today: byte-identical + no reuse_* keys leak.
+def test_reuse_disabled_is_noop(workdir):
+    mdl = workdir / "model"
+    _reuse_model(mdl)
+    ap = workdir / "a.json"
+    _assign(ap, _REUSE_ASSIGN_A)
+    cw = _reuse_cw()
+    c0 = export_nvfp4_cb_streaming(mdl, ap, workdir / "s0", cw, device="cpu")
+    c1 = export_nvfp4_cb_streaming(mdl, ap, workdir / "s1", cw, device="cpu",
+                                   reuse_prior=None)
+    assert (workdir / "s0" / "model.safetensors").read_bytes() == \
+        (workdir / "s1" / "model.safetensors").read_bytes()
+    assert dict(c0) == dict(c1)
+    assert not any(str(k).startswith("reuse_") for k in c0)
+    assert not any(str(k).startswith("reuse_") for k in c1)
+
+
+# (2) full reuse: every eligible CB target copied, output == fresh byte-for-byte.
+def test_reuse_full_copy_byte_identical(workdir):
+    mdl = workdir / "model"
+    _reuse_model(mdl)
+    ap = workdir / "a.json"
+    _assign(ap, _REUSE_ASSIGN_A)
+    cw = _reuse_cw()
+    prior = workdir / "prior"
+    export_nvfp4_cb_streaming(mdl, ap, prior, cw, device="cpu")   # fresh
+    out = workdir / "delta"
+    counts = export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
+                                       reuse_prior=prior, reuse_verify=2)
+    assert counts["reuse_copied"] == 2
+    assert counts["reuse_encoded"] == 0
+    assert counts["reuse_verified"] == 2
+    assert (out / "model.safetensors").read_bytes() == \
+        (prior / "model.safetensors").read_bytes()
+    assert json.loads((out / "quant_config.json").read_text())[
+        "config_groups"] == json.loads(
+        (prior / "quant_config.json").read_text())["config_groups"]
+
+
+# (3) changed-format target re-encodes; unchanged one still copies.
+def test_reuse_changed_format_reencodes(workdir):
+    mdl = workdir / "model"
+    _reuse_model(mdl)
+    cw = _reuse_cw()
+    apA = workdir / "a.json"
+    _assign(apA, _REUSE_ASSIGN_A)
+    prior = workdir / "prior"
+    export_nvfp4_cb_streaming(mdl, apA, prior, cw, device="cpu")
+    apB = workdir / "b.json"
+    _assign(apB, _REUSE_ASSIGN_B)
+    fresh_b = workdir / "freshB"
+    export_nvfp4_cb_streaming(mdl, apB, fresh_b, cw, device="cpu")   # reference
+    out = workdir / "delta"
+    counts = export_nvfp4_cb_streaming(mdl, apB, out, cw, device="cpu",
+                                       reuse_prior=prior, reuse_verify=5)
+    assert counts["reuse_copied"] == 1          # q_proj unchanged
+    assert counts["reuse_encoded"] == 1         # down_proj K16 -> K20
+    assert counts.get("reuse_ineligible_format_changed") == 1
+    # delta reproduces a from-scratch export of allocation B exactly.
+    assert (out / "model.safetensors").read_bytes() == \
+        (fresh_b / "model.safetensors").read_bytes()
+
+
+# (4) codebook byte-mismatch makes every CB target on that group ineligible.
+def test_reuse_codebook_mismatch_reencodes(workdir):
+    mdl = workdir / "model"
+    _reuse_model(mdl)
+    cw = _reuse_cw()
+    ap = workdir / "a.json"
+    _assign(ap, _REUSE_ASSIGN_A)
+    prior = workdir / "prior"
+    export_nvfp4_cb_streaming(mdl, ap, prior, cw, device="cpu")
+    qp = json.loads((prior / "quant_config.json").read_text())
+    cbf = prior / qp["codebook_file"]
+    cbt = load_file(str(cbf))
+    cbt = {k: (v + 1.0).to(v.dtype).contiguous() for k, v in cbt.items()}
+    save_file(cbt, str(cbf), metadata={"format": "pt"})   # perturb codebook
+    out = workdir / "delta"
+    counts = export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
+                                       reuse_prior=prior)
+    assert counts["reuse_copied"] == 0
+    assert counts["reuse_encoded"] == 2
+    assert counts.get("reuse_ineligible_codebook_mismatch") == 2
+    fresh = workdir / "fresh"
+    export_nvfp4_cb_streaming(mdl, ap, fresh, cw, device="cpu")
+    assert (out / "model.safetensors").read_bytes() == \
+        (fresh / "model.safetensors").read_bytes()
+
+
+# (5) verification sampling catches a corrupted prior tensor -> loud abort.
+def test_reuse_verification_catches_corruption(workdir):
+    torch.manual_seed(13)
+    mdl = workdir / "model"
+    _write_model(mdl, {
+        "model.layers.0.self_attn.q_proj.weight":
+            (torch.randn(128, 256) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(256, dtype=torch.bfloat16)})
+    cw = {"model.layers.0.self_attn.q_proj": torch.rand(256) + 0.05}
+    ap = workdir / "a.json"
+    _assign(ap, {"model.layers.0.self_attn.q_proj":
+                 {"data_type": "nvfp4_cb", "cb_k": 16}})
+    prior = workdir / "prior"
+    export_nvfp4_cb_streaming(mdl, ap, prior, cw, device="cpu")
+    header, data0 = _st_header(prior / "model.safetensors")
+    off = header["model.layers.0.self_attn.q_proj.cb_qweight"]["data_offsets"]
+    raw = bytearray((prior / "model.safetensors").read_bytes())
+    raw[data0 + off[0]] ^= 0xFF                   # flip one packed-code byte
+    (prior / "model.safetensors").write_bytes(bytes(raw))
+    out = workdir / "delta"
+    with pytest.raises(RuntimeError, match="VERIFICATION FAILED"):
+        export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
+                                  reuse_prior=prior, reuse_verify=1)
+    assert not (out / "model.safetensors").exists()   # nothing shipped
+
+
+# (6) sharded prior artifact (index.json + model-XXXXX-of-XXXXX) read path.
+def test_reuse_sharded_prior(workdir):
+    mdl = workdir / "model"
+    _reuse_model(mdl)
+    cw = _reuse_cw()
+    ap = workdir / "a.json"
+    _assign(ap, _REUSE_ASSIGN_A)
+    single = workdir / "prior_single"
+    export_nvfp4_cb_streaming(mdl, ap, single, cw, device="cpu")
+    sharded = workdir / "prior_sharded"
+    _reshard(single, sharded)
+    out = workdir / "delta"
+    counts = export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
+                                       reuse_prior=sharded, reuse_verify=2)
+    assert counts["reuse_copied"] == 2 and counts["reuse_encoded"] == 0
+    assert (out / "model.safetensors").read_bytes() == \
+        (single / "model.safetensors").read_bytes()
+
+
+# (7) main()/CLI env fallback (PRISMAQUANT_EXPORT_REUSE_PRIOR) — the exact path
+# run-pipeline.sh drives tonight.
+def test_reuse_main_env_fallback(workdir, monkeypatch):
+    import pickle
+    mdl = workdir / "model"
+    _reuse_model(mdl)
+    cwp = workdir / "cw.pkl"
+    with open(cwp, "wb") as f:
+        pickle.dump(_reuse_cw(), f)
+    ap = workdir / "a.json"
+    _assign(ap, _REUSE_ASSIGN_A)
+    base = ["--model-dir", str(mdl), "--layer-config", str(ap),
+            "--col-weights", str(cwp), "--device", "cpu"]
+    prior = workdir / "prior"
+    monkeypatch.delenv("PRISMAQUANT_EXPORT_REUSE_PRIOR", raising=False)
+    _cb_stream_main(base + ["--out", str(prior)])                  # fresh
+    out = workdir / "delta"
+    monkeypatch.setenv("PRISMAQUANT_EXPORT_REUSE_PRIOR", str(prior))
+    monkeypatch.setenv("PRISMAQUANT_EXPORT_REUSE_VERIFY", "2")
+    _cb_stream_main(base + ["--out", str(out)])                    # reuse via env
+    assert (out / "model.safetensors").read_bytes() == \
+        (prior / "model.safetensors").read_bytes()
+
+
+# (8) RESUME + reuse: a resumed reuse run reproduces the non-resumed bytes
+# (copy-producers are trivially deterministic).
+def test_reuse_resume_matches_nonresumed(workdir):
+    mdl = workdir / "model"
+    _reuse_model(mdl)
+    cw = _reuse_cw()
+    ap = workdir / "a.json"
+    _assign(ap, _REUSE_ASSIGN_A)
+    prior = workdir / "prior"
+    export_nvfp4_cb_streaming(mdl, ap, prior, cw, device="cpu")
+    out = workdir / "delta"
+    export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
+                              reuse_prior=prior, reuse_verify=1)
+    ref = (out / "model.safetensors").read_bytes()
+    (out / "model.safetensors").write_bytes(ref[:len(ref) // 2])   # truncate
+    export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
+                              reuse_prior=prior, reuse_verify=1)    # resume
+    assert (out / "model.safetensors").read_bytes() == ref

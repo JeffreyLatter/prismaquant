@@ -1626,6 +1626,18 @@ PY
       exit 2
       ;;
   esac
+  # Opt-in DELTA-EXPORT (default OFF): byte-copy CB/stock targets whose
+  # (format, scheme, codebook) are unchanged from a PRIOR artifact instead of
+  # re-encoding — a re-allocation of the same source reproduces byte-identical
+  # tensors for kept targets (the deterministic RESUME contract). Unset ->
+  # every target encodes fresh (byte-identical to before). EXPORT_REUSE_VERIFY
+  # (default 3) freshly re-encodes N random copies and aborts on any mismatch.
+  if [[ -n "${EXPORT_REUSE_PRIOR:-}" ]]; then
+    CB_EXPORT_ARGS+=(--reuse-prior "$EXPORT_REUSE_PRIOR")
+    [[ -n "${EXPORT_REUSE_VERIFY:-}" ]] && \
+      CB_EXPORT_ARGS+=(--reuse-verify "$EXPORT_REUSE_VERIFY")
+    echo "[pipeline] [4/4] DELTA-EXPORT reuse enabled: prior=${EXPORT_REUSE_PRIOR} verify=${EXPORT_REUSE_VERIFY:-3}"
+  fi
   "${CB_EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
 
   # TODO(Milestone C / production-cache): the fuller one-cache integration —

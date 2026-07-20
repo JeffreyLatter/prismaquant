@@ -80,6 +80,9 @@ _ST_DTYPE = {
     torch.int64: "I64", torch.int32: "I32", torch.int8: "I8",
     torch.bool: "BOOL",
 }
+# Inverse (safetensors dtype string -> torch dtype), used by the DELTA-EXPORT
+# reuse path to read a prior artifact's per-tensor dtype from its header.
+_ST_DTYPE_INV = {v: k for k, v in _ST_DTYPE.items()}
 _EXPERT_RE = re.compile(
     r"^(.*\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
@@ -229,11 +232,15 @@ class _StreamWriter:
     bytes in order — one output tensor resident at a time."""
 
     def __init__(self):
-        self._entries: list[tuple[str, torch.dtype, tuple, object]] = []
+        self._entries: list[tuple[str, torch.dtype, tuple, object, object]] = []
 
-    def add(self, name, dtype, shape, producer):
+    def add(self, name, dtype, shape, producer, copy_src=None):
+        """Record an output tensor. ``producer`` yields it at write time; when
+        ``copy_src=(path, file_offset, nbytes)`` is given (DELTA-EXPORT reuse)
+        those raw bytes are streamed straight from a prior artifact's shard file
+        instead — ``producer`` is then unused (may be None)."""
         self._entries.append((name, dtype, tuple(int(d) for d in shape),
-                              producer))
+                              producer, copy_src))
 
     def names(self) -> list[str]:
         return [e[0] for e in self._entries]
@@ -241,7 +248,7 @@ class _StreamWriter:
     def write(self, path: Path) -> None:
         header: dict[str, dict] = {}
         off = 0
-        for name, dtype, shape, _ in self._entries:
+        for name, dtype, shape, _, _ in self._entries:
             nb = _nbytes(dtype, shape)
             header[name] = {"dtype": _ST_DTYPE[dtype], "shape": list(shape),
                             "data_offsets": [off, off + nb]}
@@ -293,8 +300,34 @@ class _StreamWriter:
             else:
                 f.write(struct.pack("<Q", len(hjson)))
                 f.write(hjson)
-            for i, (name, dtype, shape, producer) in enumerate(
+            for i, (name, dtype, shape, producer, copy_src) in enumerate(
                     self._entries[skip:], start=skip):
+                if copy_src is not None:
+                    # DELTA-EXPORT: stream the tensor's raw bytes straight from
+                    # a prior artifact's shard at the recorded offset (no torch
+                    # round-trip; dtype/shape/layout are pinned identical by the
+                    # eligibility gate). Chunked so peak residency stays tiny.
+                    src_path, foff, nb = copy_src
+                    if nb != _nbytes(dtype, shape):
+                        raise AssertionError(
+                            f"{name}: copy_src {nb}B != declared "
+                            f"{_nbytes(dtype, shape)}B")
+                    with open(src_path, "rb") as sf:
+                        sf.seek(foff)
+                        remaining = nb
+                        while remaining:
+                            chunk = sf.read(min(remaining, 1 << 24))
+                            if not chunk:
+                                raise AssertionError(
+                                    f"{name}: prior artifact truncated at "
+                                    f"offset {foff} (needed {nb}B)")
+                            f.write(chunk)
+                            remaining -= len(chunk)
+                    if i % 50 == 0 or nb > (1 << 30):
+                        print(f"[export-cb-stream] {i + 1}/"
+                              f"{len(self._entries)} {name} copied "
+                              f"{nb / 2**30:.2f}G from prior", flush=True)
+                    continue
                 t = producer()
                 if t.dtype != dtype or tuple(t.shape) != shape:
                     raise AssertionError(
@@ -370,6 +403,221 @@ def _expert_weight(skeleton, prefix, packed_proj, members, e) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# DELTA-EXPORT reuse: read a PRIOR artifact + decide byte-copy eligibility
+# ---------------------------------------------------------------------------
+
+class _PriorArtifact:
+    """Read-only view of a PRIOR CB export for DELTA-EXPORT reuse.
+
+    Exposes, for any tensor by name: presence, dtype, shape, and the exact
+    ``(shard_path, file_offset, nbytes)`` byte slice (sharded via index.json or
+    single-file). Also parses ``quant_config.json`` into the per-export-base CB
+    ``(format, scheme)`` and loads the codebook sidecar — everything the
+    eligibility gate needs to prove a re-encode would reproduce these bytes."""
+
+    def __init__(self, prior_dir: str | Path):
+        self.dir = Path(prior_dir)
+        index = self.dir / "model.safetensors.index.json"
+        self._single: Path | None = None
+        if index.exists():
+            self.weight_map = json.loads(index.read_text())["weight_map"]
+        else:
+            single = self.dir / "model.safetensors"
+            if not single.exists():
+                raise FileNotFoundError(
+                    "reuse-prior: no model.safetensors[.index.json] under "
+                    f"{self.dir}")
+            self.weight_map = None
+            self._single = single
+        self._shard_hdr: dict[str, tuple[dict, int]] = {}
+        qc_path = self.dir / "quant_config.json"
+        if not qc_path.exists():
+            raise FileNotFoundError(
+                f"reuse-prior: no quant_config.json under {self.dir}")
+        qc = json.loads(qc_path.read_text())
+        # CB targets carry a "scheme"; stock/FP8_SOURCE groups do not.
+        self.cb_by_base: dict[str, tuple[str, dict]] = {}
+        self.stock_fmt_by_target: dict[str, str] = {}
+        for g in qc.get("config_groups", {}).values():
+            fmt = g.get("format")
+            if "scheme" in g:
+                for t in g.get("targets", []):
+                    self.cb_by_base[t] = (fmt, g["scheme"])
+            else:
+                for t in g.get("targets", []):
+                    self.stock_fmt_by_target[t] = fmt
+        self.provenance = qc.get("provenance", {}) or {}
+        self.scale_coding = qc.get("provenance", {}).get(
+            "scale_coding") or "v1"
+        self.codebooks: dict[str, torch.Tensor] = {}
+        cbf = qc.get("codebook_file")
+        if cbf and (self.dir / cbf).exists():
+            from safetensors.torch import load_file as _lf
+            self.codebooks = _lf(str(self.dir / cbf))
+
+    def _shard_of(self, name: str) -> Path:
+        if self._single is not None:
+            return self._single
+        return self.dir / self.weight_map[name]
+
+    def _hdr(self, shard: Path) -> tuple[dict, int]:
+        key = str(shard)
+        if key not in self._shard_hdr:
+            with open(shard, "rb") as f:
+                (hlen,) = struct.unpack("<Q", f.read(8))
+                hdr = json.loads(f.read(hlen))
+            self._shard_hdr[key] = (hdr, 8 + hlen)
+        return self._shard_hdr[key]
+
+    def has(self, name: str) -> bool:
+        if self.weight_map is not None:
+            return name in self.weight_map
+        hdr, _ = self._hdr(self._single)
+        return name in hdr
+
+    def _meta(self, name: str):
+        shard = self._shard_of(name)
+        hdr, data0 = self._hdr(shard)
+        return hdr[name], data0, shard
+
+    def dtype(self, name: str):
+        meta, _, _ = self._meta(name)
+        return _ST_DTYPE_INV.get(meta["dtype"])
+
+    def shape(self, name: str) -> tuple[int, ...]:
+        meta, _, _ = self._meta(name)
+        return tuple(int(d) for d in meta["shape"])
+
+    def raw_slice(self, name: str) -> tuple[Path, int, int]:
+        """(shard_path, absolute file offset, nbytes) for a raw byte copy."""
+        meta, data0, shard = self._meta(name)
+        lo, hi = meta["data_offsets"]
+        return shard, data0 + int(lo), int(hi) - int(lo)
+
+    def read_bytes(self, name: str) -> bytes:
+        shard, foff, nb = self.raw_slice(name)
+        with open(shard, "rb") as f:
+            f.seek(foff)
+            return f.read(nb)
+
+    def codebook_tensor(self, name: str) -> torch.Tensor | None:
+        return self.codebooks.get(name)
+
+    def matches_dtype_shape(self, name, dtype, shape) -> bool:
+        return (self.has(name) and self.dtype(name) == dtype
+                and self.shape(name) == tuple(int(d) for d in shape))
+
+
+def _prior_scale_coding_norm(scheme: dict) -> str:
+    sc = scheme.get("scale_coding")
+    if isinstance(sc, dict) and sc.get("kind") == "two_tier":
+        return "two_tier"
+    return "v1"
+
+
+def _cb_reuse_reason(prior: _PriorArtifact, export_base: str, fmt: str,
+                     cur_subset: dict, expected_outputs, group_cb_ok: bool):
+    """Return None if this CB target is byte-copy eligible from ``prior``, else
+    a short reason string. Eligible iff the prior assigns the SAME format +
+    scheme signature, its codebook is byte-identical, and every planned output
+    tensor already exists in the prior at EXACTLY the planned dtype+shape."""
+    entry = prior.cb_by_base.get(export_base)
+    if entry is None:
+        return "not_in_prior"
+    pfmt, pscheme = entry
+    if pfmt != fmt:
+        return "format_changed"
+    pscheme_norm = {
+        "grid": pscheme.get("grid"), "mode": pscheme.get("mode"),
+        "k": pscheme.get("k"), "n_sub": pscheme.get("n_sub"),
+        "type_size": pscheme.get("type_size"),
+        "codebook_ref": pscheme.get("codebook_ref"),
+        "scale_coding": _prior_scale_coding_norm(pscheme),
+    }
+    if pscheme_norm != cur_subset:
+        return "scheme_changed"
+    if not group_cb_ok:
+        return "codebook_mismatch"
+    for name, dtype, shape in expected_outputs:
+        if not prior.has(name):
+            return "tensor_missing"
+        if not prior.matches_dtype_shape(name, dtype, shape):
+            return "dtype_shape_mismatch"
+    return None
+
+
+def _current_imatrix_sha(col_weights: dict[str, torch.Tensor]) -> str:
+    """The imatrix hash exactly as ``_build_config`` computes it — used to
+    diagnose whether the reuse prior shares this run's calibration."""
+    ih = hashlib.sha256()
+    for q in sorted(col_weights):
+        ih.update(q.encode())
+        ih.update(col_weights[q].to(torch.float32).cpu().numpy().tobytes())
+    return ih.hexdigest()
+
+
+def _reuse_verify_and_report(prior, reuse, reuse_verify, reuse_prior,
+                             col_weights, scale_coding, counts):
+    """MANDATORY reuse safety gate (runs BEFORE any bytes are written): fresh
+    re-encode ``reuse_verify`` random copy-eligible CB targets and byte-compare
+    against what would be copied from the prior; ANY mismatch means the
+    determinism contract broke and aborts the export. Also logs the copied/
+    encoded/ineligible summary and folds ``reuse_*`` counters into ``counts``."""
+    import random
+
+    cur_sha = _current_imatrix_sha(col_weights)
+    prior_sha = prior.provenance.get("imatrix_sha256")
+    imatrix_match = (prior_sha is not None and prior_sha == cur_sha)
+    if prior_sha is not None and not imatrix_match:
+        print("[export-cb-stream] WARNING reuse-prior imatrix_sha256 differs "
+              f"(prior {prior_sha[:12]} vs current {cur_sha[:12]}) — encoding "
+              "inputs may have changed; copied bytes rest on the verification "
+              "sample below. Double-check --reuse-prior points at the SAME "
+              "source+calibration.", flush=True)
+
+    pool = reuse["verify_pool"]
+    n = min(int(reuse_verify), len(pool))
+    if n > 0:
+        # Deterministic sample (reproducibility gate): seed from the stable set
+        # of eligible bases so a resumed run verifies the same targets.
+        key = "|".join(sorted(c["base"] for c in pool))
+        rng = random.Random(int(hashlib.sha256(key.encode()).hexdigest()[:16],
+                                16))
+        for cand in rng.sample(pool, n):
+            fresh = cand["fresh"]()
+            for name, dtype, shape in cand["specs"]:
+                fb = _raw_bytes(fresh[name])
+                pb = prior.read_bytes(name)
+                if fb != pb:
+                    raise RuntimeError(
+                        "[export-cb-stream] REUSE VERIFICATION FAILED: fresh "
+                        f"re-encode of {name} does NOT byte-match the prior "
+                        f"artifact ({len(fb)}B vs {len(pb)}B copied). The "
+                        "determinism/RESUME contract is broken for this "
+                        "(source, imatrix, codebook, scheme) — refusing to "
+                        "ship reused bytes. Re-run WITHOUT --reuse-prior, or "
+                        "point it at the artifact this allocation derives from.")
+            reuse["verified"] += 1
+        print(f"[export-cb-stream] reuse verify OK: {reuse['verified']} "
+              f"sampled copy target(s) byte-match the prior", flush=True)
+
+    print(f"[export-cb-stream] reuse-prior {reuse_prior}: "
+          f"copied {reuse['copied']} / encoded {reuse['encoded']} targets; "
+          f"imatrix {'MATCH' if imatrix_match else 'differ/absent'}; "
+          f"scale_coding prior={prior.scale_coding} current={scale_coding}",
+          flush=True)
+    if reuse["reasons"]:
+        print("[export-cb-stream] reuse re-encode reasons: "
+              f"{dict(sorted(reuse['reasons'].items()))}", flush=True)
+
+    counts["reuse_copied"] = reuse["copied"]
+    counts["reuse_encoded"] = reuse["encoded"]
+    counts["reuse_verified"] = reuse["verified"]
+    for reason, c in reuse["reasons"].items():
+        counts[f"reuse_ineligible_{reason}"] = c
+
+
+# ---------------------------------------------------------------------------
 # Streaming export
 # ---------------------------------------------------------------------------
 
@@ -384,6 +632,8 @@ def export_nvfp4_cb_streaming(
     scale_sweep: bool = True,
     scale_coding: str = cb.SCALE_CODING_V1,
     subset_prefixes: list[str] | None = None,
+    reuse_prior: str | Path | None = None,
+    reuse_verify: int = 3,
 ) -> dict[str, int]:
     """Streaming counterpart of :func:`export_nvfp4_cb.export_nvfp4_cb`. Same
     signature + container; peak residency ~= one source tensor + codebooks.
@@ -395,13 +645,30 @@ def export_nvfp4_cb_streaming(
     within them (else the allocation and the declared subset disagree — fail
     fast). Default ``None`` = whole-model passthrough, byte-identical to before.
     Used to export just the MTP sidecar (``model.layers.80.``) without dragging
-    the ~550 GB body through as bf16 passthrough."""
+    the ~550 GB body through as bf16 passthrough.
+
+    ``reuse_prior`` (opt-in DELTA-EXPORT; default ``None`` == byte-identical to
+    today) points at a PRIOR artifact dir. On a re-allocation of the same source
+    most CB/stock targets keep their exact ``(format, scheme, codebook)``, so
+    their re-encode would reproduce byte-identical tensors (the producers are
+    deterministic — the RESUME contract). Such targets are byte-copied straight
+    from the prior's shard file(s) instead of re-encoded; ineligible/changed
+    targets encode fresh, silently. ``reuse_verify`` (default 3, env
+    ``PRISMAQUANT_EXPORT_REUSE_VERIFY``) freshly re-encodes N random copy-eligible
+    CB targets and byte-compares them against the copied bytes — any mismatch
+    means the determinism contract broke and ABORTS the export (nothing is
+    written). FP8_SOURCE + BF16 passthrough deliberately stay on the source path
+    (verbatim/raw already, and a cross-artifact copy has no IO win but adds a
+    wrong-prior footgun the CB-only verification would not catch)."""
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if scale_coding not in (cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER):
         raise ValueError(f"unknown scale_coding {scale_coding!r}")
     subset_prefixes = list(subset_prefixes) if subset_prefixes else None
+    prior = _PriorArtifact(reuse_prior) if reuse_prior else None
+    reuse = {"copied": 0, "encoded": 0, "verified": 0,
+             "reasons": Counter(), "verify_pool": []}
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     spec = shared_codebook_spec or {}
@@ -626,6 +893,22 @@ def export_nvfp4_cb_streaming(
         for q in qnames:
             target_cb[q] = (ref, fmt, codebooks[(ref, fmt)], kind)
 
+    # DELTA-EXPORT: a CB group's codebook is a byte-copy input, so compare this
+    # run's serialized codebook against the prior sidecar ONCE per (ref, fmt).
+    # A group whose codebook differs makes every target on it re-encode.
+    group_cb_ok: dict[tuple[str, str], bool] = {}
+    if prior is not None:
+        for (ref, fmt), codebook in codebooks.items():
+            cur_t = _codebook_tensors(ref, fmt, codebook)
+            ok = True
+            for tname, t in cur_t.items():
+                pt = prior.codebook_tensor(tname)
+                if pt is None or tuple(pt.shape) != tuple(t.shape) \
+                        or not torch.equal(pt, t):
+                    ok = False
+                    break
+            group_cb_ok[(ref, fmt)] = ok
+
     # --- Build the streaming plan + config in one metadata pass. ---
     writer = _StreamWriter()
     counts: Counter[str] = Counter()
@@ -683,17 +966,66 @@ def export_nvfp4_cb_streaming(
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
-        writer.add(export_base + ".cb_qweight", torch.uint8, packed_shape,
-                   _pack)
-        counts[fmt] += 1
+        qw_name = export_base + ".cb_qweight"
+        scale_shape = tuple(int(d) for d in shape[:-1])
+        scale_name = export_base + ".weight_scale"
+        # Planned output tensors (name, dtype, shape) — the eligibility gate.
+        expected = [(qw_name, torch.uint8, packed_shape)]
         if grid == "fp8":
-            scale_shape = tuple(int(d) for d in shape[:-1])
+            expected.append((scale_name, torch.float32, scale_shape))
 
-            def _scale(state=state, scale_shape=scale_shape):
-                return state["scale"].reshape(scale_shape).to(
-                    torch.float32).contiguous()
-            writer.add(export_base + ".weight_scale", torch.float32,
-                       scale_shape, _scale)
+        # DELTA-EXPORT eligibility: same format + scheme signature + byte-equal
+        # codebook + every planned output already present in the prior at the
+        # planned dtype+shape => byte-copy instead of re-encode.
+        reason = "disabled"
+        if prior is not None:
+            n_sub = (len(codebook) if isinstance(codebook, (tuple, list))
+                     else 1)
+            base_ref = f"cb_codebook.{ref}.{fmt}"
+            cb_ref = ([f"{base_ref}.sub{i}" for i in range(n_sub)]
+                      if n_sub > 1 else base_ref)
+            cur_subset = {
+                "grid": grid, "mode": mode, "k": k, "n_sub": n_sub,
+                "type_size": ts, "codebook_ref": cb_ref,
+                "scale_coding": ("two_tier"
+                                 if coding == cb.SCALE_CODING_TWO_TIER
+                                 else "v1"),
+            }
+            reason = _cb_reuse_reason(
+                prior, export_base, fmt, cur_subset, expected,
+                group_cb_ok.get((ref, fmt), False))
+
+        if prior is not None and reason is None:
+            for name, dtype, _sh in expected:
+                writer.add(name, dtype, prior.shape(name), None,
+                           copy_src=prior.raw_slice(name))
+            reuse["copied"] += 1
+
+            def _fresh(qname=qname, h=(kind, h), grid=grid, mode=mode, k=k,
+                       codebook=codebook, coding=coding, shape=shape,
+                       packed_shape=packed_shape, scale_shape=scale_shape,
+                       qw_name=qw_name, scale_name=scale_name):
+                packed, scale = _stream_pack_target(
+                    skeleton, profile, h, qname, grid, mode, k, codebook,
+                    col_weights[qname], scale_sweep, coding, shape, device)
+                out = {qw_name: packed.reshape(packed_shape)}
+                if scale is not None:
+                    out[scale_name] = scale.reshape(scale_shape).to(
+                        torch.float32).contiguous()
+                return out
+            reuse["verify_pool"].append(
+                {"base": export_base, "specs": expected, "fresh": _fresh})
+        else:
+            writer.add(qw_name, torch.uint8, packed_shape, _pack)
+            if grid == "fp8":
+                def _scale(state=state, scale_shape=scale_shape):
+                    return state["scale"].reshape(scale_shape).to(
+                        torch.float32).contiguous()
+                writer.add(scale_name, torch.float32, scale_shape, _scale)
+            if prior is not None:
+                reuse["encoded"] += 1
+                reuse["reasons"][reason] += 1
+        counts[fmt] += 1
 
     # Stock-CT DENSE targets: analytic on-disk tensors packed RTN via the
     # export_native_compressed codec (byte-identical to export_nvfp4_cb). ONE
@@ -720,10 +1052,33 @@ def export_nvfp4_cb_streaming(
                 del w
             return state["out"]
 
-        for suffix, dtype, out_shape in _stock_output_specs(canon_fmt, shape):
-            def _prod(suffix=suffix, _render=_render):
-                return _render()[suffix]
-            writer.add(export_base + "." + suffix, dtype, out_shape, _prod)
+        specs = _stock_output_specs(canon_fmt, shape)
+        expected = [(export_base + "." + s, d, o) for s, d, o in specs]
+        # DELTA-EXPORT: RTN stock rungs are deterministic from the (unchanged)
+        # source weight. FP8_E4M3 is per-channel (no cross-tensor coupling);
+        # NVFP4's only cross-tensor input is the fused-group shared global,
+        # which the union-find coherence invariant pins identical whenever this
+        # target is on NVFP4 in both allocations (q/k/v, gate/up move as a unit,
+        # weights unchanged). So the prior having every planned output at the
+        # exact dtype+shape is a sound copy gate.
+        stock_ok = prior is not None and all(
+            prior.matches_dtype_shape(n, d, o) for n, d, o in expected)
+        if stock_ok:
+            for name, dtype, _sh in expected:
+                writer.add(name, dtype, prior.shape(name), None,
+                           copy_src=prior.raw_slice(name))
+            reuse["copied"] += 1
+        else:
+            for (name, dtype, out_shape), (suffix, _d, _o) in zip(
+                    expected, specs):
+                def _prod(suffix=suffix, _render=_render):
+                    return _render()[suffix]
+                writer.add(name, dtype, out_shape, _prod)
+            if prior is not None:
+                reuse["encoded"] += 1
+                reuse["reasons"][
+                    "stock_not_in_prior" if not prior.has(expected[0][0])
+                    else "stock_dtype_shape_mismatch"] += 1
         counts[canon_fmt] += 1
 
     # Passthrough: every remaining checkpoint tensor verbatim (BF16/norms/etc).
@@ -777,6 +1132,13 @@ def export_nvfp4_cb_streaming(
         assignment, cb_targets, source_targets, stock_targets, by_group,
         codebooks, col_weights, cb_tensor_blobs, ignore, codebook_file,
         scale_coding, source, profile)
+
+    # DELTA-EXPORT: verify sampled copies + log the summary BEFORE writing (an
+    # abort here leaves no partial artifact). No-op when reuse is disabled.
+    if prior is not None:
+        _reuse_verify_and_report(
+            prior, reuse, reuse_verify, reuse_prior, col_weights,
+            scale_coding, counts)
 
     print(f"[export-cb-stream] streaming {len(writer.names())} tensors ...",
           flush=True)
@@ -982,7 +1344,23 @@ def main(argv=None) -> None:
                          "prefix (repeatable), e.g. 'model.layers.80.' for the "
                          "MTP sidecar; every allocation target must fall within "
                          "it. Default: whole-model passthrough.")
+    ap.add_argument("--reuse-prior", default=None, metavar="DIR",
+                    help="opt-in DELTA-EXPORT: byte-copy CB/stock targets whose "
+                         "(format, scheme, codebook) are unchanged from this "
+                         "PRIOR artifact dir instead of re-encoding; the delta "
+                         "encodes fresh. Env PRISMAQUANT_EXPORT_REUSE_PRIOR is "
+                         "the fallback. Default: encode everything.")
+    ap.add_argument("--reuse-verify", type=int, default=None, metavar="N",
+                    help="reuse safety: fresh re-encode N random copy-eligible "
+                         "CB targets and byte-check them (default 3, env "
+                         "PRISMAQUANT_EXPORT_REUSE_VERIFY); a mismatch aborts.")
     args = ap.parse_args(argv)
+    import os
+    reuse_prior = args.reuse_prior or os.environ.get(
+        "PRISMAQUANT_EXPORT_REUSE_PRIOR") or None
+    reuse_verify = (args.reuse_verify if args.reuse_verify is not None
+                    else int(os.environ.get(
+                        "PRISMAQUANT_EXPORT_REUSE_VERIFY", "3")))
     if torch.cuda.is_available():
         # Box-safety net on the unified pool: a runaway allocation must raise
         # a clean torch OOM (with the offending tensor in the traceback), not
@@ -998,7 +1376,8 @@ def main(argv=None) -> None:
         args.model_dir, args.layer_config, args.out, col_weights,
         shared_codebook_spec=spec, device=args.device,
         scale_sweep=not args.no_scale_sweep, scale_coding=args.scale_coding,
-        subset_prefixes=args.subset_prefix)
+        subset_prefixes=args.subset_prefix, reuse_prior=reuse_prior,
+        reuse_verify=reuse_verify)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
     print(f"wrote {args.out} ({size:.3f} GB)")
     for fmt, n in sorted(counts.items()):
