@@ -73,12 +73,27 @@ def pad_qweight(qw: torch.Tensor) -> torch.Tensor:
     return F.pad(qw.contiguous(), (0, 8), value=0).contiguous()
 
 
+# Signed E2M1 grid, cached per device: building it per call allocated a CPU
+# tensor and H2D-copied it on EVERY fp4 activation QDQ — a hidden sync in the
+# eager decode hot path, and a hard error under CUDA-graph capture (unpinned
+# CPU->CUDA copy). Warmup forwards populate the cache before any capture.
+_FP4_QDQ_GRID: dict = {}
+
+
+def _fp4_qdq_grid(device: torch.device) -> torch.Tensor:
+    grid = _FP4_QDQ_GRID.get(device)
+    if grid is None:
+        grid = torch.tensor(sorted({v for a in _E2M1 for v in (a, -a)}),
+                            dtype=torch.float32, device=device)
+        _FP4_QDQ_GRID[device] = grid
+    return grid
+
+
 def fp4_group16_act_qdq(x: torch.Tensor) -> torch.Tensor:
     """W4A4 activation bucket: RTN to E2M1 at group-16 amax/6 scale (mirrors
     format_registry `_make_rtn('fp4_e2m1', 16)`)."""
     in_f = x.shape[-1]
-    grid = torch.tensor(sorted({v for a in _E2M1 for v in (a, -a)}),
-                        dtype=torch.float32, device=x.device)
+    grid = _fp4_qdq_grid(x.device)
     w = x.reshape(-1, in_f).float().reshape(-1, in_f // FP4_GROUP, FP4_GROUP)
     scale = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / NVFP4_GRID_MAX
     xg = w / scale
