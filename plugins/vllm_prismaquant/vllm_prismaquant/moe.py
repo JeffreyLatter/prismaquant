@@ -230,9 +230,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # Decode regime: the grouped CUDA path — ONE kernel launch per
         # projection covers every routed (token, expert) pair (the per-expert
         # loop below costs ~10k host syncs/launches per token: 3.52 tok/s
-        # served vs BF16's 28.4 on the 35B A3B).
-        if (num_tokens <= 16 and not self.is_fp4
-                and self._cuda_moe_ok(layer)):
+        # served vs BF16's 28.4 on the 35B A3B). Covers fp8-CB v1 and fp4-CB
+        # two-tier v2; _cuda_moe_ok gates the format (fp4-v1 has no grouped
+        # path yet and falls through to the loop below).
+        if num_tokens <= 16 and self._cuda_moe_ok(layer):
             return self._apply_grouped_decode(
                 layer, x, topk_weights, topk_ids, act)
 
@@ -271,12 +272,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     def _cuda_moe_ok(self, layer) -> bool:
         ok = getattr(layer, "_cb_moe_cuda_ok", None)
         if ok is None:
-            ok = (self.n_sub == 4 and os.environ.get(
+            # Grouped CUDA GEMV support: fp8-CB v1 (n_sub=4, per-(expert,out)
+            # fp32 scale) and fp4-CB two-tier v2 (n_sub=2, scale composed
+            # in-kernel from the packed 9-byte section). fp4-v1 (bare e4m3
+            # plane) has no grouped path yet.
+            fmt_ok = ((self.n_sub == 4 and not self.is_fp4)
+                      or (self.n_sub == 2 and self.is_fp4 and self.is_v2))
+            ok = (fmt_ok and os.environ.get(
                 "PRISMAQUANT_CB_DECODE", "cuda") == "cuda")
             if ok:
                 from .cuda_ext import get_ext
                 ok = get_ext() is not None
-            if ok and not hasattr(layer, "_cb_flat_fp8"):
+            if ok and not self.is_fp4 and not hasattr(layer, "_cb_flat_fp8"):
                 layer._cb_flat_fp8 = layer._cb_flat.to(
                     torch.float8_e4m3fn).view(torch.uint8).contiguous()
             layer._cb_moe_cuda_ok = ok
@@ -285,9 +292,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     def _apply_grouped_decode(self, layer, x, topk_weights, topk_ids, act):
         """One grouped GEMV launch per projection over all routed
         (token, expert) pairs, numerics-matched to the per-expert loop:
-        per-token fp8 QDQ on the module input AND the intermediate, weights
-        bf16(val*scale), fp32-accum GEMVs, per-add bf16 combine in the
-        loop's expert-ascending order."""
+        per-token activation QDQ on the module input AND the intermediate
+        (fp8 dynamic for fp8-CB v1, fp4 group-16 RTN for fp4-CB v2), weights
+        bf16(val*scale), fp32-accum GEMVs, per-add bf16 combine in the loop's
+        expert-ascending order."""
         from .cuda_ext import get_ext
         ext = get_ext()
         T, K_hidden = x.shape
@@ -304,21 +312,41 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                   .to(torch.float32).contiguous())
         tok_start = (torch.arange(T + 1, device=x.device, dtype=torch.int32)
                      * topk)
+        pair_self = torch.arange(pair_expert.numel(), device=x.device,
+                                 dtype=torch.int32)
 
-        xq = ext.fp8_act_qdq(x.to(torch.bfloat16))
-        gate_up = ext.cb_moe_gemv_fp8(
-            xq, layer.w13_cb_qweight.data, layer._cb_flat_fp8,
-            layer.w13_weight_scale.data, pair_expert, pair_xrow,
-            self.k, self.n_sub, self.type_size)          # (P, 2*inter)
+        if self.is_fp4:                                  # fp4-CB two-tier v2
+            # Activation QDQ (fp4 group-16 RTN) stays OUTSIDE the kernel,
+            # bit-identical to the loop's codec.fp4_group16_act_qdq; the kernel
+            # composes the two-tier weight scale in-register from the packed
+            # 9-byte section + the resident (256,16) compose table.
+            xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            gate_up = ext.cb_moe_gemv_fp4_v2(
+                xq, layer.w13_cb_qweight.data, layer._cb_flat,
+                layer._cb_compose, pair_expert, pair_xrow,
+                self.k, self.n_sub, self.type_size)      # (P, 2*inter)
+        else:                                            # fp8-CB v1
+            xq = ext.fp8_act_qdq(x.to(torch.bfloat16))
+            gate_up = ext.cb_moe_gemv_fp8(
+                xq, layer.w13_cb_qweight.data, layer._cb_flat_fp8,
+                layer.w13_weight_scale.data, pair_expert, pair_xrow,
+                self.k, self.n_sub, self.type_size)      # (P, 2*inter)
+
         d = gate_up.shape[-1] // 2
         a = torch.empty(gate_up.shape[:-1] + (d,), dtype=gate_up.dtype,
                         device=gate_up.device)
         apply_moe_activation(act, a, gate_up)
-        aq = ext.fp8_act_qdq(a)
-        pair_self = torch.arange(pair_expert.numel(), device=x.device,
-                                 dtype=torch.int32)
-        y_down = ext.cb_moe_gemv_fp8(
-            aq, layer.w2_cb_qweight.data, layer._cb_flat_fp8,
-            layer.w2_weight_scale.data, pair_expert, pair_self,
-            self.k, self.n_sub, self.type_size)          # (P, hidden)
+
+        if self.is_fp4:
+            aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
+            y_down = ext.cb_moe_gemv_fp4_v2(
+                aq, layer.w2_cb_qweight.data, layer._cb_flat,
+                layer._cb_compose, pair_expert, pair_self,
+                self.k, self.n_sub, self.type_size)      # (P, hidden)
+        else:
+            aq = ext.fp8_act_qdq(a)
+            y_down = ext.cb_moe_gemv_fp8(
+                aq, layer.w2_cb_qweight.data, layer._cb_flat_fp8,
+                layer.w2_weight_scale.data, pair_expert, pair_self,
+                self.k, self.n_sub, self.type_size)      # (P, hidden)
         return ext.cb_moe_combine(y_down, pair_w, tok_start, T)

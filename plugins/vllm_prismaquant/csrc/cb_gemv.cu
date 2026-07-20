@@ -475,6 +475,135 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp8_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Grouped MoE decode GEMV for the fp4 two-tier (v2) codebook format
+// (docs/nvfp4-cb-plan/two-tier-scale-spec.md §4/§5, moe_cb_design.md). Same
+// grouped design as cb_moe_gemv_fp8_kernel (one block per routed (pair, out);
+// warps stride the 256-weight superblocks; lane v owns codeword v, 32 per
+// superblock). Two structural differences from the fp8 path:
+//   * decode is n_sub=2 sub-codebooks of sub_dim=4, gathered from the BF16 flat
+//     codebook (_cb_flat), not the e4m3-byte LUT — the fp4 grid values live in
+//     bf16 and are scaled by the composed group scale;
+//   * the per-group-16 scale is a TWO-TIER code composed in-register from the
+//     packed 9-byte scale section per superblock (1 E8M0 super byte at offset
+//     4k, then 8 bytes holding 16 4-bit sub codes; group g in byte g//2, even
+//     g = LOW nibble, LSB-first) via the (256,16) fp32 compose table:
+//     scale_g = compose[super_e*16 + code16_g].
+// Weight rounding matches expand_fp4_v2_to_weight (== the per-expert loop's
+// _decode_expert) bit-for-bit: w = bf16(f32(codebook_value) * f32(scale)); the
+// FMA is f32-accumulate exactly like the fp8 kernel, so grouped-vs-loop differs
+// only by reassociation (the loop's bf16 F.linear). type_size = 4k+9 is ODD and
+// the row/superblock base is not 8-byte aligned, so the superblock is staged to
+// smem BYTE-granular (vs the fp8 u64 stage); the aligned u32 extraction then
+// reads from smem unchanged. Activation QDQ (fp4 group-16 RTN) stays OUTSIDE
+// the kernel (python codec.fp4_group16_act_qdq), bit-identical to the loop.
+template <int WARPS>
+__global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
+    const uint16_t* __restrict__ x,        // [Xrows, K] bf16 (as u16), QDQ'd
+    const uint8_t* __restrict__ qw,        // [E, out, row_bytes] packed
+    const uint16_t* __restrict__ cb_bf16,  // BF16 flat codebook as u16
+    const float* __restrict__ compose,     // [256*16] fp32 two-tier compose
+    const int32_t* __restrict__ pair_expert,  // [P]
+    const int32_t* __restrict__ pair_xrow,    // [P] row of x per pair
+    uint16_t* __restrict__ y,              // [P, out] bf16 (as u16)
+    const int64_t P, const int64_t Nout, const int64_t K,
+    const int k_bits, const int sub_w, const int type_size) {
+  const int64_t gb = blockIdx.x;
+  const int64_t p = gb / Nout;
+  const int64_t n = gb % Nout;
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x & 31;
+  const int n_sb = (int)(K >> 8);
+  const int64_t row_bytes = (int64_t)n_sb * type_size;
+
+  __shared__ __align__(16) uint8_t stage[WARPS][kSlotBytes];
+  __shared__ float red[WARPS];
+
+  const int64_t e = (int64_t)pair_expert[p];
+  const uint8_t* row = qw + (e * Nout + n) * row_bytes;
+  const uint16_t* xr = x + (int64_t)pair_xrow[p] * K;
+  const uint32_t sub_mask = (1u << sub_w) - 1u;
+  const int sub_entries4 = 4 << sub_w;          // (1<<sub_w) * sub_dim(=4)
+  const uint64_t code_mask =
+      (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
+  const int scale_off = 4 * k_bits;             // base of the 9-byte scale sec.
+
+  float acc = 0.0f;
+  for (int s = warp; s < n_sb; s += WARPS) {
+    // Byte-granular coalesced stage (type_size = 4k+9 is odd/unaligned, so no
+    // u64/u32 vector load): each lane copies bytes lane, lane+32, ...; the
+    // superblock is read exactly once (__ldcs, evict-first) and no lane reads
+    // past type_size.
+    const uint8_t* gsrc = row + (int64_t)s * type_size;
+    for (int b = lane; b < type_size; b += 32) stage[warp][b] = __ldcs(gsrc + b);
+    __syncwarp();
+
+    // --- extract this lane's k-bit codeword (aligned 32-bit smem reads) ----
+    const int bitpos = lane * k_bits;
+    const int b0 = bitpos >> 3;
+    const int rem = ((b0 & 3) << 3) + (bitpos & 7);
+    const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp]);
+    const int widx = b0 >> 2;
+    const uint32_t w0_ = s32[widx];
+    const uint32_t w1_ = s32[widx + 1];
+    const uint32_t w2_ = s32[widx + 2];
+    // --- two-tier scale bytes for this lane's group (read before release) ---
+    const int grp = lane >> 1;                    // group-16 index = codeword/2
+    const uint8_t super_e = stage[warp][scale_off];
+    const uint8_t sub_byte = stage[warp][scale_off + 1 + (grp >> 1)];
+    __syncwarp();
+    const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
+    uint64_t code = lo >> rem;
+    if (rem + k_bits > 64) {
+      code |= (uint64_t)w2_ << (64 - rem);
+    }
+    code &= code_mask;
+
+    // --- compose the group-16 scale (bit-exact to expand_fp4_v2_to_weight) --
+    const uint32_t code16 = (uint32_t)((sub_byte >> ((grp & 1) * 4)) & 0xFu);
+    const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
+
+    // --- decode 2 sub-indices -> 8 weights (BF16 codebook, composed scale) --
+    float wv[8];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const uint32_t idx = (uint32_t)(code >> (i * sub_w)) & sub_mask;
+      const int64_t elt = (int64_t)i * sub_entries4 + (int64_t)idx * 4;
+#pragma unroll
+      for (int local = 0; local < 4; ++local) {
+        // Match the loop bit-for-bit: w = bf16_rn(f32(cb_value) * f32(scale)).
+        const float val = bf16_to_f32(__ldg(cb_bf16 + elt + local));
+        wv[i * 4 + local] = bf16_to_f32(f32_to_bf16_rn(val * sc));
+      }
+    }
+
+    // --- FMA against x: one 16-byte load per lane -------------------------
+    const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
+    const uint4 xv = __ldg(reinterpret_cast<const uint4*>(xr + xbase));
+    const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      acc = fmaf(wv[2 * i],
+                 bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc);
+      acc = fmaf(wv[2 * i + 1],
+                 bf16_to_f32((uint16_t)(xw[i] >> 16)), acc);
+    }
+  }
+
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) red[warp] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int w = 0; w < WARPS; ++w) total += red[w];
+    y[p * Nout + n] = f32_to_bf16_rn(total);
+  }
+}
+
 // Deterministic per-token combine: out[t] = sum over its pairs (pre-sorted
 // ascending-expert, matching the python loop's index_add_ order) of
 // weight[p] * y[p], accumulated in bf16 exactly like the loop's bf16
@@ -541,6 +670,64 @@ torch::Tensor cb_moe_gemv_fp8(torch::Tensor xq, torch::Tensor qw_stack,
         qw_stack.data_ptr<uint8_t>(),
         reinterpret_cast<const uint16_t*>(cb_flat_fp8.data_ptr()),
         scale.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),
+        pair_xrow.data_ptr<int32_t>(),
+        reinterpret_cast<uint16_t*>(y.data_ptr()),
+        P, Nout, K, (int)k_bits, sub_w, (int)type_size);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
+                                 torch::Tensor cb_flat, torch::Tensor compose,
+                                 torch::Tensor pair_expert,
+                                 torch::Tensor pair_xrow, int64_t k_bits,
+                                 int64_t n_sub, int64_t type_size) {
+  TORCH_CHECK(xq.is_cuda() && xq.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(qw_stack.dim() == 3 && qw_stack.scalar_type() == torch::kUInt8);
+  TORCH_CHECK(qw_stack.is_contiguous(), "stacked qw must be contiguous");
+  TORCH_CHECK(cb_flat.scalar_type() == torch::kBFloat16,
+              "cb_moe_gemv_fp4_v2 wants the BF16 flat codebook");
+  TORCH_CHECK(compose.scalar_type() == torch::kFloat32 &&
+                  compose.numel() == 256 * 16,
+              "compose must be the (256*16,) fp32 two-tier table");
+  TORCH_CHECK(pair_expert.scalar_type() == torch::kInt32);
+  TORCH_CHECK(pair_xrow.scalar_type() == torch::kInt32);
+  TORCH_CHECK(n_sub == 2 && k_bits % 2 == 0,
+              "fp4-v2 GEMV supports n_sub=2 even-k rungs only");
+  const int sub_w = (int)(k_bits / n_sub);
+  TORCH_CHECK(type_size == 4 * k_bits + 9,
+              "fp4-v2 type_size must be 4k+9 (E8M0 super + 8 sub-nibble bytes)");
+  TORCH_CHECK(type_size <= kSlotBytes, "type_size exceeds the smem stage slot");
+  const int64_t Nout = qw_stack.size(1);
+  const int64_t row_bytes = qw_stack.size(2);
+  TORCH_CHECK(row_bytes % type_size == 0,
+              "row_bytes must be a multiple of type_size");
+  const int64_t K = (row_bytes / type_size) << 8;
+  TORCH_CHECK(xq.size(-1) == K, "x width != decoded row width");
+  const int64_t P = pair_expert.numel();
+  const c10::cuda::OptionalCUDAGuard guard(xq.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto y = torch::empty({P, Nout}, xq.options());
+  if (P == 0) return y;
+  const int n_sb = (int)(K >> 8);
+  const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
+  const int64_t grid = P * Nout;
+  if (use4) {
+    cb_moe_gemv_fp4_v2_kernel<4><<<(unsigned)grid, 128, 0, stream>>>(
+        reinterpret_cast<const uint16_t*>(xq.data_ptr()),
+        qw_stack.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),
+        compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),
+        pair_xrow.data_ptr<int32_t>(),
+        reinterpret_cast<uint16_t*>(y.data_ptr()),
+        P, Nout, K, (int)k_bits, sub_w, (int)type_size);
+  } else {
+    cb_moe_gemv_fp4_v2_kernel<8><<<(unsigned)grid, 256, 0, stream>>>(
+        reinterpret_cast<const uint16_t*>(xq.data_ptr()),
+        qw_stack.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),
+        compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),
         pair_xrow.data_ptr<int32_t>(),
         reinterpret_cast<uint16_t*>(y.data_ptr()),
         P, Nout, K, (int)k_bits, sub_w, (int)type_size);
@@ -742,6 +929,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "FP8-direct transient expand (prefill; bounded per-layer tile)");
   m.def("cb_moe_gemv_fp8", &cb_moe_gemv_fp8,
         "grouped MoE decode GEMV over routed (token, expert) pairs");
+  m.def("cb_moe_gemv_fp4_v2", &cb_moe_gemv_fp4_v2,
+        "grouped MoE decode GEMV for the fp4 two-tier (v2) codebook format");
   m.def("cb_moe_combine", &cb_moe_combine,
         "deterministic per-token weighted combine (loop-order bf16 adds)");
   m.def("e4m3_probe", &e4m3_probe, "debug: f32 -> e4m3 codes via the c10 port");

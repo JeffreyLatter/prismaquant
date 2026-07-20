@@ -360,3 +360,112 @@ def test_moe_grouped_gemv_matches_loop_numerics():
     out_got = ext.cb_moe_combine(y_down, pair_w, tok_start, T)
 
     _assert_triton_close(out_got, out_ref, "moe grouped vs loop")
+
+
+# --------------------------------------------------------------------------- #
+# fp4-CB two-tier (v2) grouped MoE decode: n_sub=2 sub_dim=4, per-group-16
+# two-tier scale composed in-kernel from the packed 9-byte section. The bytes
+# MUST be real (legal (super,sub) pairs), so they come from the prismaquant
+# encoder (scale_coding="two_tier"), never fabricated. The reference is the
+# per-expert loop chain (moe._decode_expert -> expand_fp4_v2_to_weight).
+# --------------------------------------------------------------------------- #
+def _fp4v2_encode_stack(pq, k, E, out, in_f, cb, seed):
+    """Encode a random (E, out, in_f) weight stack to fp4 two-tier v2 on-disk
+    bytes (E, out, n_sb*type_size) via the REAL encoder — every (super, sub)
+    scale pair is legal (E4M3-exact) by construction."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    w = (torch.randn(E, out, in_f, generator=g) * 0.02).to(DEV)
+    fields = pq.nvfp4_cb_fields(w, k, grid="fp4", mode="product", codebook=cb,
+                               scale_coding="two_tier", encode_tier="fast")
+    b = pq.nvfp4_cb_assemble_bytes(fields, k, grid="fp4", mode="product")
+    ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")            # 4k + 9
+    n_sb = in_f // codec.SUPERBLOCK
+    return b.reshape(E, out, n_sb * ts).contiguous().to(DEV), ts
+
+
+def _run_fp4v2_moe_parity(pq, k, E, hidden, inter, T, topk, seed, tag):
+    """Grouped fp4-v2 MoE decode vs the per-expert loop; both decode the SAME
+    real two-tier bytes with the SAME bf16 codebook + compose table, so they
+    agree to reassociation (the loop's bf16 F.linear vs the kernel's warp-sum,
+    both f32-accum)."""
+    from vllm_prismaquant.expand import expand_fp4_v2_to_weight
+    out13 = 2 * inter
+    ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")
+    cb = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
+    cb_flat = codec.build_flat_codebook(list(cb))              # bf16 flat cb
+    compose = codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV)
+    w13, _ = _fp4v2_encode_stack(pq, k, E, out13, hidden, cb, seed)
+    w2, _ = _fp4v2_encode_stack(pq, k, E, hidden, inter, cb, seed + 100)
+
+    def decode_expert(stack, e, in_f):                        # loop _decode_expert
+        out = stack.shape[1]
+        qwp = codec.pad_qweight(stack[e].contiguous())
+        row0 = torch.zeros(out, dtype=torch.int32, device=DEV)
+        return expand_fp4_v2_to_weight(qwp, cb_flat, row0, compose,
+                                       out, in_f, k, 2, ts)
+
+    g = torch.Generator(device="cpu").manual_seed(seed + 7)
+    x = torch.randn(T, hidden, dtype=torch.bfloat16, device=DEV)
+    topk_ids = torch.stack([torch.randperm(E, generator=g)[:topk]
+                            for _ in range(T)]).to(DEV)
+    topk_w = torch.rand(T, topk, generator=g).float().to(DEV)
+
+    # ---- reference: the per-expert loop chain, expert-ascending ----
+    out_ref = torch.zeros(T, hidden, dtype=torch.bfloat16, device=DEV)
+    for e in range(E):
+        sel = (topk_ids == e)
+        if not bool(sel.any()):
+            continue
+        tok_idx, slot = torch.where(sel)
+        xe = codec.fp4_group16_act_qdq(x[tok_idx]).to(torch.bfloat16)
+        W13 = decode_expert(w13, e, hidden)                   # (2*inter, hidden)
+        gu = torch.nn.functional.linear(xe, W13)
+        gate, up = gu.chunk(2, dim=-1)
+        a = torch.nn.functional.silu(gate) * up
+        aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
+        W2 = decode_expert(w2, e, inter)                      # (hidden, inter)
+        oe = torch.nn.functional.linear(aq, W2)
+        oe = oe * topk_w[tok_idx, slot][:, None].to(oe.dtype)
+        out_ref.index_add_(0, tok_idx, oe)
+
+    # ---- grouped kernels (mirrors moe._apply_grouped_decode fp4 branch) ----
+    ids_sorted, order = torch.sort(topk_ids.to(torch.int32), dim=-1)
+    w_sorted = torch.gather(topk_w, -1, order.to(torch.int64))
+    pair_expert = ids_sorted.reshape(-1).contiguous()
+    pair_xrow = torch.arange(T, device=DEV,
+                             dtype=torch.int32).repeat_interleave(topk)
+    pair_w = (w_sorted.reshape(-1).to(torch.bfloat16)
+              .to(torch.float32).contiguous())
+    tok_start = torch.arange(T + 1, device=DEV, dtype=torch.int32) * topk
+    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+    gu = ext.cb_moe_gemv_fp4_v2(xq, w13, cb_flat, compose,
+                                pair_expert, pair_xrow, k, 2, ts)
+    gate, up = gu.chunk(2, dim=-1)
+    a = torch.nn.functional.silu(gate) * up
+    aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
+    pair_self = torch.arange(pair_expert.numel(), device=DEV,
+                             dtype=torch.int32)
+    y_down = ext.cb_moe_gemv_fp4_v2(aq, w2, cb_flat, compose,
+                                    pair_expert, pair_self, k, 2, ts)
+    out_got = ext.cb_moe_combine(y_down, pair_w, tok_start, T)
+    _assert_triton_close(out_got, out_ref, tag)
+
+
+def test_moe_grouped_gemv_fp4_v2_matches_loop():
+    """fp4-CB two-tier (v2) grouped MoE decode == the per-expert loop numerics
+    (the reference), on real legal two-tier planes. Exercises a 2-superblock
+    w13 (hidden=512) and a 1-superblock w2 (inter=256)."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    torch.manual_seed(31)
+    _run_fp4v2_moe_parity(pq, k=16, E=4, hidden=512, inter=256,
+                          T=2, topk=3, seed=31, tag="fp4-v2 moe k=16")
+
+
+@pytest.mark.parametrize("k", [14, 16, 18, 20])
+def test_moe_grouped_gemv_fp4_v2_all_rungs(k):
+    """K-rung sweep (k in {14,16,18,20} -> sub_w in {7,8,9,10}); smaller dims
+    keep the two-tier sweep-encode fast."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    torch.manual_seed(k)
+    _run_fp4v2_moe_parity(pq, k=k, E=4, hidden=256, inter=256,
+                          T=2, topk=2, seed=k, tag=f"fp4-v2 moe k={k}")
