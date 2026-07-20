@@ -207,30 +207,25 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     def apply(self, layer: RoutedExperts, x: torch.Tensor,
               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
               shared_experts, shared_experts_input) -> torch.Tensor:
-        # Shared expert (e.g. hy_v3): vLLM's SharedFusedMoE hands the shared
-        # module + its input to apply() and the model's forward returns ONLY
-        # this method's output (HYV3MoEFused.forward = `return self.experts(...)`,
-        # no separate shared add). So the shared contribution — which runs for
-        # EVERY token — is ours to compute and add; dropping it silently serves
-        # an unfaithful model. The shared module is a plain (CB-decoded-to-bf16)
-        # HYV3FeedForward; call it on its input and add to the routed output.
-        shared_out = None
-        if shared_experts is not None:
-            inp = shared_experts_input if shared_experts_input is not None else x
-            shared_out = shared_experts(inp)
-            if isinstance(shared_out, tuple):     # vLLM Linear-based modules
-                shared_out = shared_out[0]        # return (out, bias)
+        # On CUDA the shared-expert FUSION path is ROCm-AITER-gated (off here),
+        # so the model runs its shared expert separately (a Linear our CB linear
+        # method quantizes) and this arg is None. If it is EVER non-None we are
+        # silently dropping a contribution — surface it loudly (once) so the
+        # served KL/smoke has a paper trail instead of a silent regression.
+        if shared_experts is not None and not PrismaQuantCBMoEMethod._warned_shared:
+            PrismaQuantCBMoEMethod._warned_shared = True
+            import sys
+            print(f"[prismaquant-cb-moe] WARNING {self.prefix}: non-None "
+                  "shared_experts passed to apply() but this method computes ONLY "
+                  "routed experts — shared-expert output may be dropped. Verify "
+                  "the served KL; implement shared-expert handling if regressed.",
+                  file=sys.stderr, flush=True)
         del shared_experts, shared_experts_input
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
                 "apply_router_weight_on_input unsupported for CB MoE")
         act = MoEActivation.from_str(layer.activation.value)
         num_tokens = x.shape[0]
-
-        def _add_shared(routed: torch.Tensor) -> torch.Tensor:
-            if shared_out is None:
-                return routed
-            return routed + shared_out.reshape(routed.shape).to(routed.dtype)
 
         # Decode regime: the grouped CUDA path — ONE kernel launch per
         # projection covers every routed (token, expert) pair (the per-expert
@@ -239,8 +234,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # two-tier v2; _cuda_moe_ok gates the format (fp4-v1 has no grouped
         # path yet and falls through to the loop below).
         if num_tokens <= 16 and self._cuda_moe_ok(layer):
-            return _add_shared(self._apply_grouped_decode(
-                layer, x, topk_weights, topk_ids, act))
+            return self._apply_grouped_decode(
+                layer, x, topk_weights, topk_ids, act)
 
         out = torch.zeros_like(x)
         # Prefill / fallback: grouped by expert — decode each routed expert
@@ -271,7 +266,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             del W2
             oe = oe * topk_weights[tok_idx, slot][:, None].to(oe.dtype)
             out.index_add_(0, tok_idx, oe.to(out.dtype))
-        return _add_shared(out)
+        return out
 
     # -- grouped CUDA decode path -------------------------------------------
     def _cuda_moe_ok(self, layer) -> bool:
