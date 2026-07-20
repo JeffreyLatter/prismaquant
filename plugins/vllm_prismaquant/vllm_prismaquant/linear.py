@@ -25,7 +25,7 @@ from vllm.model_executor.parameter import (
 
 from . import codec
 from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
-from .ops import cb_gemm, cb_gemv_fp8
+from .ops import cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8
 
 # Fallback fused mapping if the config's packed_modules_mapping is unset.
 _FUSED_FALLBACK = {
@@ -226,6 +226,10 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # table; the 9-byte plane stays inside cb_qweight.
             layer._cb_compose = codec.build_compose_table(self._sub_table).to(dev)
             layer._cb_scale = dummy
+            # Warm the CUDA-GEMV JIT build at LOAD time — otherwise the ~30 s
+            # in-container build fires on the first decode step and poisons the
+            # first request's latency (same reason as the fp8 branch below).
+            self._cuda_gemv_ok()
         elif self.is_fp4:
             layer._cb_scale = codec.decode_fp4_scale_plane(qw, self.k).to(dev)
             layer._cb_compose = dummy
@@ -246,12 +250,15 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         layer._cb_K = layer._cb_input_size
 
     def _cuda_gemv_ok(self) -> bool:
-        """CUDA decode-GEMV eligibility (fp8 n_sub=4 rungs; env-gated; ext
-        built). Cached — the answer never changes within a process."""
+        """CUDA decode-GEMV eligibility (fp8 n_sub=4 rungs, or fp4 two-tier v2
+        n_sub=2 rungs; env-gated; ext built). Cached — the answer never changes
+        within a process."""
         ok = getattr(self, "_cuda_gemv_cached", None)
         if ok is None:
-            ok = (not self.is_fp4 and self.n_sub == 4
-                  and os.environ.get("PRISMAQUANT_CB_DECODE", "cuda") == "cuda")
+            gate = os.environ.get("PRISMAQUANT_CB_DECODE", "cuda") == "cuda"
+            fp8_ok = not self.is_fp4 and self.n_sub == 4
+            fp4v2_ok = self.is_fp4 and self.is_v2 and self.n_sub == 2
+            ok = gate and (fp8_ok or fp4v2_ok)
             if ok:
                 from .cuda_ext import get_ext
                 ok = get_ext() is not None
@@ -265,11 +272,23 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # (its v1 e4m3 plane is not composed during expansion) — Triton decode.
         if M <= PREFILL_M_THRESHOLD or (self.is_fp4 and not self.is_v2):
             if M <= CUDA_GEMV_M_MAX and self._cuda_gemv_ok():
-                # CUDA bandwidth-bound GEMV, act-QDQ fused (raw x in); gathers
-                # the E4M3-byte codebook (same values as _cb_flat, 4x smaller).
-                y = cb_gemv_fp8(x, layer._cb_qw_padded, layer._cb_flat_fp8,
-                                layer._cb_row_offset, layer._cb_scale,
-                                N, K, self.k, self.n_sub, self.type_size)
+                if self.is_fp4:
+                    # fp4-v2 CUDA GEMV: act-QDQ (fp4 group-16 RTN) runs OUTSIDE
+                    # the kernel via codec — exactly as the Triton fp4 path — so
+                    # CUDA-vs-Triton numerics stay aligned. The kernel gathers
+                    # the bf16 codebook and composes the two-tier scale
+                    # in-register from the packed 9-byte plane.
+                    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+                    y = cb_gemv_fp4_v2(xq, layer._cb_qw_padded, layer._cb_flat,
+                                       layer._cb_row_offset, layer._cb_compose,
+                                       N, K, self.k, self.n_sub, self.type_size)
+                else:
+                    # CUDA bandwidth-bound GEMV, act-QDQ fused (raw x in);
+                    # gathers the E4M3-byte codebook (same values as _cb_flat,
+                    # 4x smaller).
+                    y = cb_gemv_fp8(x, layer._cb_qw_padded, layer._cb_flat_fp8,
+                                    layer._cb_row_offset, layer._cb_scale,
+                                    N, K, self.k, self.n_sub, self.type_size)
                 if bias is not None:
                     y = y + bias
                 return y

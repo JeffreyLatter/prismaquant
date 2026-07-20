@@ -469,3 +469,156 @@ def test_moe_grouped_gemv_fp4_v2_all_rungs(k):
     torch.manual_seed(k)
     _run_fp4v2_moe_parity(pq, k=k, E=4, hidden=256, inter=256,
                           T=2, topk=2, seed=k, tag=f"fp4-v2 moe k={k}")
+
+
+# --------------------------------------------------------------------------- #
+# DENSE fp4-CB two-tier (v2) decode-GEMV (ext.cb_gemv_fp4_v2): the dense sibling
+# of the grouped MoE kernel above. Per-output-row codebook base (cb_row_offset,
+# the qkv/gate_up fusion mechanism) + the multi-M accumulator, with the two-tier
+# scale composed in-register. Same real-encoder contract: the (super,sub) plane
+# must be legal, so the bytes come from the prismaquant encoder, never
+# fabricated. Parity is checked against BOTH the Triton fp4-v2 decode path AND an
+# explicit expand_fp4_v2_to_weight + F.linear reference on the SAME QDQ'd xq.
+# --------------------------------------------------------------------------- #
+def _fp4v2_dense_bytes(pq, k, N, K, cb, seed):
+    """Dense (N, K) weight -> fp4 two-tier v2 on-disk bytes (N, n_sb*type_size)
+    via the REAL encoder (reusing the stack encoder with E=1)."""
+    stack, ts = _fp4v2_encode_stack(pq, k, 1, N, K, cb, seed)
+    return stack[0].contiguous(), ts
+
+
+def _fp4v2_dense_prep(pq, k, N, K, seed, cb=None):
+    """Single-role dense fp4-v2 layer tensors (uniform cb_row_offset=0)."""
+    if cb is None:
+        cb = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
+    packed, ts = _fp4v2_dense_bytes(pq, k, N, K, cb, seed)
+    return dict(qwp=codec.pad_qweight(packed),
+                cb_flat=codec.build_flat_codebook(list(cb)),
+                compose=codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV),
+                row_off=torch.zeros(N, dtype=torch.int32, device=DEV),
+                N=N, K=K, k=k, n_sub=2, ts=ts)
+
+
+def _cuda_fp4v2_dense_y(p, xq):
+    return ext.cb_gemv_fp4_v2(xq, p["qwp"], p["cb_flat"], p["row_off"],
+                              p["compose"], p["N"], p["K"], p["k"],
+                              p["n_sub"], p["ts"])
+
+
+def _triton_fp4v2_dense_y(p, xq):
+    # scale is the fp4-v2 dummy (Triton reads compose, not scale, for v2).
+    return cb_decode_linear(
+        xq, p["qwp"], p["cb_flat"], p["row_off"],
+        torch.zeros(1, device=DEV), p["compose"], N=p["N"], K=p["K"],
+        k_bits=p["k"], n_sub=p["n_sub"], type_size=p["ts"], is_fp4=True,
+        is_v2=True)
+
+
+def _ref_fp4v2_dense_y(p, xq):
+    """expand_fp4_v2_to_weight (value × composed scale) + F.linear on the SAME
+    xq — the explicit reconstruct reference (bf16 W, f32-accum GEMM)."""
+    from vllm_prismaquant.expand import expand_fp4_v2_to_weight
+    W = expand_fp4_v2_to_weight(p["qwp"], p["cb_flat"], p["row_off"],
+                                p["compose"], p["N"], p["K"], p["k"],
+                                p["n_sub"], p["ts"])
+    return torch.nn.functional.linear(xq, W)
+
+
+@pytest.mark.parametrize("k", [14, 16])
+@pytest.mark.parametrize("M", [1, 2, 8, 16])
+def test_dense_fp4v2_gemv_matches_triton_and_ref(k, M):
+    """Dense fp4-v2 CUDA GEMV == the Triton fp4-v2 decode AND == the explicit
+    expand+F.linear reference, across M in {1,2,8,16} and the k=14/k=16 rungs,
+    for a single superblock (K=256) and two superblocks (K=512)."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    for K in (256, 512):
+        p = _fp4v2_dense_prep(pq, k, N=96, K=K, seed=1000 + k + K)
+        torch.manual_seed(k + K + M)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+        xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+        y = _cuda_fp4v2_dense_y(p, xq)
+        _assert_triton_close(y, _triton_fp4v2_dense_y(p, xq),
+                             f"dense fp4-v2 k={k} K={K} M={M} vs triton")
+        _assert_triton_close(y, _ref_fp4v2_dense_y(p, xq),
+                             f"dense fp4-v2 k={k} K={K} M={M} vs ref")
+
+
+def test_dense_fp4v2_four_warp_path():
+    """K=1024 -> n_sb=4 hits the 4-warp launch branch (n_sb%4==0, %8!=0), the
+    warp-count heuristic the fp8 dense kernel shares."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    p = _fp4v2_dense_prep(pq, k=16, N=64, K=1024, seed=404)
+    torch.manual_seed(404)
+    x = torch.randn(8, 1024, dtype=torch.bfloat16, device=DEV)
+    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+    y = _cuda_fp4v2_dense_y(p, xq)
+    _assert_triton_close(y, _triton_fp4v2_dense_y(p, xq),
+                         "dense fp4-v2 4-warp vs triton")
+    _assert_triton_close(y, _ref_fp4v2_dense_y(p, xq),
+                         "dense fp4-v2 4-warp vs ref")
+
+
+@pytest.mark.parametrize("N", [40, 100])
+def test_dense_fp4v2_non_warp_multiple_N(N):
+    """N not a multiple of 32 (grid is one block per output row, so any N is
+    valid; guards the per-row reduce/output-write and the M-row FMA)."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    p = _fp4v2_dense_prep(pq, k=16, N=N, K=512, seed=7 * N)
+    torch.manual_seed(N)
+    x = torch.randn(3, 512, dtype=torch.bfloat16, device=DEV)
+    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+    y = _cuda_fp4v2_dense_y(p, xq)
+    _assert_triton_close(y, _triton_fp4v2_dense_y(p, xq),
+                         f"dense fp4-v2 N={N} vs triton")
+    _assert_triton_close(y, _ref_fp4v2_dense_y(p, xq),
+                         f"dense fp4-v2 N={N} vs ref")
+
+
+def test_dense_fp4v2_fused_row_offset_two_roles():
+    """Two roles with DIFFERENT codebooks concatenated (the qkv/gate_up fusion
+    mechanism), nonuniform cb_row_offset — the CUDA kernel must add each row's
+    codebook base, else role B decodes against role A's block. The codebooks
+    must genuinely differ (role B = a scaled copy, still bf16-exact), or a
+    cb_base-ignoring bug would read identical values and slip through."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    k, K = 16, 256
+    cb_a = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
+    cb_b = tuple(t * 1.5 for t in cb_a)          # distinct; 1.5x stays bf16-exact
+    Na, Nb = 64, 32
+    pa, ts = _fp4v2_dense_bytes(pq, k, Na, K, cb_a, seed=11)
+    pb, _ = _fp4v2_dense_bytes(pq, k, Nb, K, cb_b, seed=22)
+    flat_a = codec.build_flat_codebook(list(cb_a))
+    flat_b = codec.build_flat_codebook(list(cb_b))
+    cb_flat = torch.cat([flat_a, flat_b]).contiguous()
+    row_off = torch.cat([
+        torch.zeros(Na, dtype=torch.int32, device=DEV),
+        torch.full((Nb,), flat_a.numel(), dtype=torch.int32, device=DEV)])
+    packed = torch.cat([pa, pb], dim=0).contiguous()
+    p = dict(qwp=codec.pad_qweight(packed), cb_flat=cb_flat,
+             compose=codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV),
+             row_off=row_off, N=Na + Nb, K=K, k=k, n_sub=2, ts=ts)
+    torch.manual_seed(3)
+    x = torch.randn(4, K, dtype=torch.bfloat16, device=DEV)
+    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+    y = _cuda_fp4v2_dense_y(p, xq)
+    _assert_triton_close(y, _triton_fp4v2_dense_y(p, xq),
+                         "dense fp4-v2 fused row-offset vs triton")
+    _assert_triton_close(y, _ref_fp4v2_dense_y(p, xq),
+                         "dense fp4-v2 fused row-offset vs ref")
+
+
+def test_dense_fp4v2_registered_op_matches_ext():
+    """The registered custom op (prismaquant::cb_gemv_fp4_v2) equals the raw ext
+    call bit-for-bit — the serving dispatch goes through the op, whose
+    register_fake makes it CUDA-graph / torch.compile safe."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    from vllm_prismaquant.ops import cb_gemv_fp4_v2 as op
+    p = _fp4v2_dense_prep(pq, k=16, N=64, K=512, seed=55)
+    torch.manual_seed(5)
+    x = torch.randn(2, 512, dtype=torch.bfloat16, device=DEV)
+    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+    y_op = op(xq, p["qwp"], p["cb_flat"], p["row_off"], p["compose"],
+              p["N"], p["K"], p["k"], p["n_sub"], p["ts"])
+    y_ext = _cuda_fp4v2_dense_y(p, xq)
+    assert torch.equal(y_op.view(torch.uint16), y_ext.view(torch.uint16)), (
+        "registered op != raw ext (should be identical)")

@@ -47,3 +47,25 @@ def cb_gemv_fp8(x: torch.Tensor, qw_padded: torch.Tensor,
 def _cb_gemv_fp8_fake(x, qw_padded, cb_flat, cb_row_offset, scale, N, K,
                       k_bits, n_sub, type_size):
     return torch.empty((*x.shape[:-1], N), dtype=x.dtype, device=x.device)
+
+
+@torch.library.custom_op("prismaquant::cb_gemv_fp4_v2", mutates_args=())
+def cb_gemv_fp4_v2(xq: torch.Tensor, qw_padded: torch.Tensor,
+                   cb_flat: torch.Tensor, cb_row_offset: torch.Tensor,
+                   compose: torch.Tensor, N: int, K: int, k_bits: int,
+                   n_sub: int, type_size: int) -> torch.Tensor:
+    """Dense CUDA decode-GEMV for fp4-CB two-tier (v2): takes ALREADY act-QDQ'd
+    bf16 activations (fp4 group-16 RTN runs in ``codec``, OUTSIDE the kernel —
+    same as the Triton fp4 path — so CUDA-vs-Triton numerics stay aligned) and
+    runs the bandwidth-bound dequant-GEMV, composing the two-tier weight scale
+    in-register from the packed 9-byte plane. Caller must check
+    ``cuda_ext.get_ext()`` first."""
+    from .cuda_ext import get_ext
+    return get_ext().cb_gemv_fp4_v2(xq, qw_padded, cb_flat, cb_row_offset,
+                                    compose, N, K, k_bits, n_sub, type_size)
+
+
+@cb_gemv_fp4_v2.register_fake
+def _cb_gemv_fp4_v2_fake(xq, qw_padded, cb_flat, cb_row_offset, compose, N, K,
+                         k_bits, n_sub, type_size):
+    return torch.empty((*xq.shape[:-1], N), dtype=xq.dtype, device=xq.device)
