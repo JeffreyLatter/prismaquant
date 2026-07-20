@@ -89,9 +89,32 @@ class PrismaQuantConfig(QuantizationConfig):
                     self._cb_targets.add(t)
             else:                                    # stock CT vocabulary
                 stock_groups[name] = g
+        self._alias_collapsed_shared_prefixes()
         self.ct_config = (self._build_ct_config(stock_groups)
                           if stock_groups else None)
         self._resolved = True
+
+    def _alias_collapsed_shared_prefixes(self) -> None:
+        """HunYuan-V3-style shared-expert dispatch collapse. HYV3MoEFused builds
+        its shared MLP with ``prefix=f"{prefix}"`` — the ``.shared_mlp`` segment
+        never reaches ``get_quant_method``, which instead sees the PARENT-prefix
+        names ``…mlp.gate_up_proj`` / ``…mlp.down_proj``. Module paths (params,
+        checkpoint tensors) DO keep ``.shared_mlp.``, so only the dispatch key
+        collapses. Alias every ``….shared_mlp.<leaf>`` CB target and ignore
+        entry to its collapsed form so the CB method owns the shared expert
+        natively (packed decode in-kernel) instead of vLLM building plain bf16
+        Linears that the loader must fill by decode-at-load. Collision-safe: a
+        layer is either dense-MLP (real ``…mlp.<leaf>`` keys, no shared_mlp) or
+        MoE-with-shared (no real collapsed keys), and ``setdefault`` keeps any
+        real key authoritative. Archs that thread correct shared prefixes are
+        unaffected (their aliases match no module prefix). Runs before the
+        delegated-CT build so CT's ignore covers the aliases too."""
+        for t in [k for k in self.target_scheme if ".shared_mlp." in k]:
+            alias = t.replace(".shared_mlp.", ".")
+            self.target_scheme.setdefault(alias, self.target_scheme[t])
+            self._cb_targets.add(alias)
+        self.ignore.extend(ig.replace(".shared_mlp.", ".")
+                           for ig in list(self.ignore) if ".shared_mlp." in ig)
 
     def _build_ct_config(self, stock_groups: dict):
         """A stock CompressedTensorsConfig over the non-CB groups. They are

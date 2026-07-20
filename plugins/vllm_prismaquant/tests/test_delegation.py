@@ -84,3 +84,42 @@ def test_uniform_cb_has_no_ct():
     c = PrismaQuantConfig.from_config(cfg)
     c._ensure_resolved()
     assert c.ct_config is None
+
+
+def _shared_mlp_config():
+    """hy_v3-shaped: CB shared_mlp targets (layer 1) + an ignored (BF16)
+    shared_mlp Linear (layer 2) + a genuine dense-MLP CB target (layer 0)."""
+    cfg = _mixed_config()
+    del cfg["config_groups"]["group_nvfp4"]
+    cb = cfg["config_groups"]["group_cb"]
+    cb["targets"] = [
+        "model.layers.0.mlp.down_proj",              # dense layer, real key
+        "model.layers.1.mlp.shared_mlp.gate_proj",
+        "model.layers.1.mlp.shared_mlp.up_proj",
+        "model.layers.1.mlp.shared_mlp.down_proj",
+    ]
+    cfg["ignore"].append("model.layers.2.mlp.shared_mlp.down_proj")
+    return cfg
+
+
+def test_shared_mlp_collapsed_dispatch_aliases():
+    """HunYuan V3 builds the shared MLP with the PARENT ``…mlp`` prefix, so
+    get_quant_method sees ``…mlp.gate_up_proj``/``…mlp.down_proj`` — the CB
+    schemes must resolve under those collapsed names (and collapsed ignores
+    must match), while the original ``.shared_mlp.`` keys survive for the
+    checkpoint-name-keyed loading paths."""
+    c = PrismaQuantConfig.from_config(_shared_mlp_config())
+    c.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"],
+                                "qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    c._ensure_resolved()
+    # Collapsed direct + fused dispatch (what hy_v3 hands get_quant_method).
+    assert c._scheme_for_prefix("model.layers.1.mlp.down_proj") is not None
+    assert c._scheme_for_prefix("model.layers.1.mlp.gate_up_proj") is not None
+    # BF16 shared layer: the collapsed ignore entry matches its serve prefix.
+    assert c._is_ignored("model.layers.2.mlp.down_proj")
+    # Original keys survive (loader/scale paths are checkpoint-name-keyed) and
+    # the genuine dense-layer key is untouched by aliasing.
+    assert "model.layers.1.mlp.shared_mlp.gate_proj" in c.target_scheme
+    assert c._scheme_for_prefix("model.layers.0.mlp.down_proj") is not None
+    # A layer with no shared_mlp gained no phantom fused resolution.
+    assert c._scheme_for_prefix("model.layers.2.mlp.gate_up_proj") is None
