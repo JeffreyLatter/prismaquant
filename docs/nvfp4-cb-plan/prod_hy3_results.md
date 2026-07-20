@@ -52,9 +52,27 @@ TARGET_BITS=2.9, streaming export.
    expert stacks); pgrep patterns bracket-escaped (`pro[d]`) against
    self-match.
 
+## Footprint (exact, read from the pre-written streaming header mid-export)
+- **model.safetensors = 110.3 GB** (102.7 GiB): U8 cb_qweight 99.68 GB +
+  BF16 sidecars 10.52 GB (57 BF16 layers) + F32 scales 0.10 GB. 2271
+  tensors, no double-ship. Codebook sidecar (lattice, shared per role)
+  negligible. This is **above the ~105 GB estimate** — 2.902 bpp over
+  quantizable params understates the on-disk total because the BF16 floor
+  is bpp-excluded but disk-resident.
+- **Single-Spark fit: YES, context-capped.** 110.3 GB weights + ~2 GB
+  framework on the ~121 GB usable pool. CB decode is transient (no load
+  expansion), so resident weight footprint == disk. KV headroom (GQA 8
+  kv-heads × 128 × 80 layers × fp16 = 0.328 MB/token):
+  - 8k ctx: 113.0 GB resident (~8 GB spare) — comfortable
+  - 16k ctx: 115.7 GB resident (~5 GB spare) — OK
+  - 32k ctx: 121.0 GB — at the ceiling, no room for activations
+  Native 262k context does NOT fit (true of any ~110 GB weight class on
+  this box). **Serve with --max-model-len 8192–16384.** If practice shows
+  the headroom too thin, 2.7 bpp is the PARETO_TARGETS fallback rung.
+
 ## Pending (when export lands)
-- Footprint: single-Spark fit expected ~105 GB @2.902; tensor counts +
-  no double-ship check.
+- Tensor-count / no-double-ship: header already confirms 2271 tensors,
+  U8+BF16+F32 only. Re-confirm on disk at completion.
 - Serve smoke: hy_v3 adapter in the serving image, v2-compose fp4-CB
   dense at scale, fp4-CB MoE via v2 (grouped decode kernel is fp8-only —
   the known extension for decode parity).
