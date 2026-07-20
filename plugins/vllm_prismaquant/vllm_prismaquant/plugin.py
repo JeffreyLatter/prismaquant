@@ -42,6 +42,18 @@ def _install_toplevel_cb_expert_loaders() -> None:
     else:
         install_toplevel_cb_expert_loader(HYV3ForCausalLM)
 
+    # HunYuan V3 MTP drafter (spec decode) — the same top-level stacked-CB
+    # experts, nested one level under ``.mtp_block.`` (its ``_rewrite_spec_
+    # layer_name`` renames ``model.layers.{N}.X`` -> ``…mtp_block.X``). The
+    # wrap's spec-layer rename (moe_toplevel_loader) applies that offset before
+    # resolving, so a CB-quantized MTP module loads exactly like the body.
+    try:
+        from vllm.model_executor.models.hy_v3_mtp import HYV3MTP
+    except ImportError:
+        pass
+    else:
+        install_toplevel_cb_expert_loader(HYV3MTP)
+
     # DSv4-class and any future top-level-expert-mapping MoE arch: add a guarded
     # import + install_toplevel_cb_expert_loader(<cls>) line here.
 

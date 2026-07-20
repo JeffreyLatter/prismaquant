@@ -15,10 +15,13 @@ validate_hy3_cb_loader.py oracle (create_weights + real quant_config schemes).
 import pytest
 import torch
 
+import types
+
 from vllm_prismaquant import moe_toplevel_loader
 from vllm_prismaquant.moe_toplevel_loader import (
     _build_reverse_fusion,
     _load_shared_cb,
+    _spec_layer_rename,
     install_toplevel_cb_expert_loader,
     map_cb_expert_name,
     resolve_shared_cb_target,
@@ -371,3 +374,203 @@ def test_wrapper_end_to_end_shared_mlp(monkeypatch):
     assert P + ".gate_up_proj.weight" in loaded
     assert P + ".down_proj.weight" in loaded
     assert "model.embed_tokens.weight" in loaded
+
+
+# ---------------------------------------------------------------------------
+# Spec-layer (MTP drafter) support. vLLM's HYV3MTP is fed the WHOLE checkpoint
+# stream but keeps only its spec layer (model.layers.{num_hidden_layers}.*),
+# renaming that layer's block tensors into a `.mtp_block.` nesting via
+# `_rewrite_spec_layer_name`. Our stacked-CB expert tensors arrive WITHOUT the
+# `.mtp_block.` infix while the registered params carry it, so the wrapper must
+# apply the same rename before resolving. torch-only fakes mirror that rename +
+# the routed_experts param nesting; no vLLM.
+# ---------------------------------------------------------------------------
+
+_MTP_SPEC_LAYER = 80
+
+
+def _mtp_rewrite(spec_layer: int, name: str) -> str:
+    """Faithful copy of HYV3MTP._rewrite_spec_layer_name (hy_v3_mtp.py)."""
+    if f"model.layers.{spec_layer}.embed_tokens" in name:
+        return "__skip__"
+    if f"model.layers.{spec_layer}.shared_head" in name:
+        return "__skip__"
+    if not any(w in name for w in
+               ("enorm", "hnorm", "eh_proj", "final_layernorm")):
+        name = name.replace(f"model.layers.{spec_layer}.",
+                            f"model.layers.{spec_layer}.mtp_block.")
+    return name
+
+
+def _make_fake_mtp_cls():
+    """A minimal HYV3MTP-shaped drafter class: exposes the spec rename +
+    a config, and an ORIGINAL load_weights that (like the real one) filters to
+    the spec layer, applies the rename, and drops `__skip__`."""
+
+    class _FakeMTP:
+        def __init__(self, params):
+            self._params = dict(params)
+            self.delegated = []
+            self.config = types.SimpleNamespace(
+                num_hidden_layers=_MTP_SPEC_LAYER, num_nextn_predict_layers=1)
+
+        def _rewrite_spec_layer_name(self, spec_layer, name):
+            return _mtp_rewrite(spec_layer, name)
+
+        def named_parameters(self):
+            return list(self._params.items())
+
+        def modules(self):
+            return []
+
+        def load_weights(self, weights):     # ORIGINAL (stub stock loader)
+            loaded = set()
+            for name, w in weights:
+                if name.startswith(f"model.layers.{_MTP_SPEC_LAYER}."):
+                    name = self._rewrite_spec_layer_name(_MTP_SPEC_LAYER, name)
+                    if name == "__skip__":
+                        continue
+                elif name.startswith("model.layers."):
+                    # A body (non-spec) layer the drafter never instantiates:
+                    # the real loader's `spec_layer is None` filter drops it.
+                    continue
+                self.delegated.append(name)
+                if name in self._params:
+                    self._params[name].copy_(w)
+                    loaded.add(name)
+            return loaded
+
+    return _FakeMTP
+
+
+def test_spec_layer_rename_helper():
+    class _M:
+        config = types.SimpleNamespace(num_hidden_layers=80,
+                                       num_nextn_predict_layers=1)
+
+        def _rewrite_spec_layer_name(self, s, name):
+            return _mtp_rewrite(s, name)
+
+    r = _spec_layer_rename(_M())
+    # spec-layer block tensor -> .mtp_block. nesting
+    assert r("model.layers.80.mlp.experts.gate_up_proj.cb_qweight") == \
+        "model.layers.80.mtp_block.mlp.experts.gate_up_proj.cb_qweight"
+    assert r("model.layers.80.self_attn.q_proj.cb_qweight") == \
+        "model.layers.80.mtp_block.self_attn.q_proj.cb_qweight"
+    # glue stays at the layer level (no .mtp_block.)
+    assert r("model.layers.80.enorm.weight") == "model.layers.80.enorm.weight"
+    assert r("model.layers.80.eh_proj.weight") == "model.layers.80.eh_proj.weight"
+    # embed/shared_head -> skip (main embed/lm_head reused)
+    assert r("model.layers.80.embed_tokens.weight") == "__skip__"
+    assert r("model.layers.80.shared_head.head.weight") == "__skip__"
+    # body layer name unchanged (defers)
+    assert r("model.layers.5.mlp.experts.gate_up_proj.cb_qweight") == \
+        "model.layers.5.mlp.experts.gate_up_proj.cb_qweight"
+
+
+def test_spec_layer_rename_none_for_body_model():
+    # A model without _rewrite_spec_layer_name / config -> identity (None).
+    assert _spec_layer_rename(object()) is None
+
+    class _NoSpec:
+        config = types.SimpleNamespace(num_hidden_layers=80,
+                                       num_nextn_predict_layers=0)
+
+        def _rewrite_spec_layer_name(self, s, name):  # present but n_spec == 0
+            return name
+
+    assert _spec_layer_rename(_NoSpec()) is None
+
+
+def test_spec_layer_routes_mtp_experts_and_defers_body():
+    E, HID, INTER, BYTES = 4, 16, 8, 3
+    RE = f"model.layers.{_MTP_SPEC_LAYER}.mtp_block.mlp.experts.routed_experts"
+    params = {
+        RE + ".w13_cb_qweight": torch.zeros(E, 2 * INTER, BYTES, dtype=torch.uint8),
+        RE + ".w2_cb_qweight": torch.zeros(E, HID, BYTES, dtype=torch.uint8),
+        f"model.layers.{_MTP_SPEC_LAYER}.enorm.weight": torch.zeros(HID),
+    }
+    cls = _make_fake_mtp_cls()
+    install_toplevel_cb_expert_loader(cls)
+    m = cls(params)
+    ckpt = [
+        (f"model.layers.{_MTP_SPEC_LAYER}.mlp.experts.gate_up_proj.cb_qweight",
+         torch.full((E, 2 * INTER, BYTES), 7, dtype=torch.uint8)),
+        (f"model.layers.{_MTP_SPEC_LAYER}.mlp.experts.down_proj.cb_qweight",
+         torch.full((E, HID, BYTES), 9, dtype=torch.uint8)),
+        (f"model.layers.{_MTP_SPEC_LAYER}.enorm.weight",
+         torch.full((HID,), 2.0)),
+        # a BODY expert tensor: the drafter has no param for it -> defer + drop
+        ("model.layers.5.mlp.experts.gate_up_proj.cb_qweight",
+         torch.zeros(E, 2 * INTER, BYTES, dtype=torch.uint8)),
+    ]
+    loaded = m.load_weights(iter(ckpt))
+
+    # spec-layer expert stacks copied into the .mtp_block. routed_experts params
+    assert torch.all(m._params[RE + ".w13_cb_qweight"] == 7)
+    assert torch.all(m._params[RE + ".w2_cb_qweight"] == 9)
+    # glue (enorm) stays at the layer level and is delegated + loaded
+    assert torch.allclose(m._params[f"model.layers.{_MTP_SPEC_LAYER}.enorm.weight"],
+                          torch.tensor(2.0))
+    # NO expert tensor leaked to the original loader (no double-load)
+    assert not any(".experts." in n for n in m.delegated), m.delegated
+    assert loaded == {RE + ".w13_cb_qweight", RE + ".w2_cb_qweight",
+                      f"model.layers.{_MTP_SPEC_LAYER}.enorm.weight"}
+
+
+def test_spec_layer_skips_embed_and_shared_head():
+    cls = _make_fake_mtp_cls()
+    install_toplevel_cb_expert_loader(cls)
+    m = cls({f"model.layers.{_MTP_SPEC_LAYER}.enorm.weight": torch.zeros(4)})
+    loaded = m.load_weights(iter([
+        (f"model.layers.{_MTP_SPEC_LAYER}.embed_tokens.weight",
+         torch.zeros(4, 4)),
+        (f"model.layers.{_MTP_SPEC_LAYER}.shared_head.head.weight",
+         torch.zeros(4, 4)),
+    ]))
+    # both -> "__skip__" -> delegated, the original drops them (never loaded)
+    assert loaded == set()
+    assert not any("embed_tokens" in n or "shared_head" in n
+                   for n in m.delegated), m.delegated
+
+
+def test_load_shared_cb_with_spec_rename(monkeypatch):
+    # Decode-at-load path under a spec rename: buffer keyed on the ORIGINAL
+    # (no-mtp_block) name so the scheme lookup matches the config target, while
+    # the bf16 target PARAM carries the .mtp_block. infix.
+    monkeypatch.setattr(moe_toplevel_loader, "_decode_cb_linear_to_bf16",
+                        _stub_decode)
+    HID, INTER, TS = 512, 256, 128
+    cfg = f"model.layers.{_MTP_SPEC_LAYER}.mlp.shared_mlp"          # config key
+    par = f"model.layers.{_MTP_SPEC_LAYER}.mtp_block.mlp.shared_mlp"  # param key
+    scheme = {"grid": "fp8", "k": 32, "n_sub": 4, "type_size": TS,
+              "codebook_ref": ["cb"]}
+    quant_config = _StubQuantConfig({
+        cfg + ".gate_proj": scheme, cfg + ".up_proj": scheme,
+        cfg + ".down_proj": scheme})
+    params_dict = {
+        par + ".gate_up_proj.weight": torch.zeros(2 * INTER, HID, dtype=torch.bfloat16),
+        par + ".down_proj.weight": torch.zeros(HID, INTER, dtype=torch.bfloat16),
+    }
+
+    def rename(n):     # spec rename: model.layers.80. -> ...mtp_block.
+        return n.replace(f"model.layers.{_MTP_SPEC_LAYER}.",
+                         f"model.layers.{_MTP_SPEC_LAYER}.mtp_block.")
+
+    gu_bytes = (HID // 256) * TS
+    dn_bytes = (INTER // 256) * TS
+    buf = {
+        cfg + ".gate_proj.cb_qweight": torch.full((INTER, gu_bytes), 1, dtype=torch.uint8),
+        cfg + ".gate_proj.weight_scale": torch.ones(INTER, dtype=torch.float32),
+        cfg + ".up_proj.cb_qweight": torch.full((INTER, gu_bytes), 2, dtype=torch.uint8),
+        cfg + ".up_proj.weight_scale": torch.ones(INTER, dtype=torch.float32),
+        cfg + ".down_proj.cb_qweight": torch.full((HID, dn_bytes), 3, dtype=torch.uint8),
+        cfg + ".down_proj.weight_scale": torch.ones(HID, dtype=torch.float32),
+    }
+    loaded = _load_shared_cb(None, buf, params_dict, _REV, quant_config,
+                             rename=rename)
+    assert loaded == {par + ".gate_up_proj.weight", par + ".down_proj.weight"}
+    gu = params_dict[par + ".gate_up_proj.weight"]
+    assert torch.all(gu[:INTER] == 1), "gate rows (shard 0) first"
+    assert torch.all(gu[INTER:] == 2), "up rows (shard 1) second"
+    assert torch.all(params_dict[par + ".down_proj.weight"] == 3)

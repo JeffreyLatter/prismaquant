@@ -69,6 +69,25 @@ self-consistent: both the incoming name and the mapped param name carry
 ``model.``. The mapping is a pure suffix rewrite, so it is prefix-agnostic
 regardless; the ``params_dict`` membership check keeps it robust if a future
 vLLM changes prefix handling (an unmapped name simply defers to the original).
+
+**Spec-layer (MTP drafter) support.** A speculative-decode drafter such as
+vLLM's ``HYV3MTP`` is fed the WHOLE checkpoint stream but keeps only its spec
+layer(s) — ``model.layers.{num_hidden_layers + i}.*`` — renaming each layer's
+transformer-block tensors into a ``.mtp_block.`` sub-module nesting via the
+model's own ``_rewrite_spec_layer_name`` (``enorm``/``hnorm``/``eh_proj``/
+``final_layernorm`` stay at the layer level; ``embed_tokens``/``shared_head`` are
+``"__skip__"``-ped, vLLM reusing the main model's embedding + lm_head). Our
+stacked-CB expert tensors arrive WITHOUT the ``.mtp_block.`` infix (checkpoint
+convention) while the registered params carry it (``…mtp_block.mlp.experts.
+routed_experts.w13_cb_qweight``), so the ``.experts.`` anchor here — and the
+fused-target lookup in ``resolve_shared_cb_target`` — miss unless we apply the
+SAME rename to the incoming name first. When the wrapped class exposes
+``_rewrite_spec_layer_name`` (+ a ``config`` with ``num_hidden_layers``) we build
+that rename once and apply it before resolution; a ``"__skip__"`` is delegated
+so the original drops it exactly as it would, and body tensors (index <
+num_hidden_layers) pass through unchanged and defer. Classes without the method
+(the body ``HYV3ForCausalLM``) get an identity rename — bit-identical to the
+prior behaviour.
 """
 from __future__ import annotations
 
@@ -309,12 +328,21 @@ def _find_prismaquant_config(model):
 
 
 def _load_shared_cb(model, buf: dict, params_dict, reverse_fusion,
-                    quant_config) -> set:
+                    quant_config, rename=None) -> set:
     """Decode buffered shared-expert CB tensors to bf16 and copy them into the
     plain bf16 ``.weight`` params vLLM built. Grouped by target so a merged
     ``gate_up_proj.weight`` is filled in one ``copy_`` (gate rows then up rows);
     decode is per-tensor with the packed source freed immediately (INV-1: one
-    ``[out, in]`` transient live at a time). Returns the set of filled params."""
+    ``[out, in]`` transient live at a time). Returns the set of filled params.
+
+    ``buf`` is keyed by the ORIGINAL (checkpoint-convention) tensor name so the
+    per-module CB scheme lookup matches the config's ``target_scheme`` keys. For
+    a spec-layer (MTP) drafter the bf16 target PARAM carries a ``.mtp_block.``
+    infix the checkpoint name lacks, so ``rename`` (the spec-layer rewrite, or
+    identity for a body model) is applied when resolving the target param but NOT
+    when resolving the scheme — decoupling the two namings."""
+    if rename is None:
+        rename = lambda n: n                       # noqa: E731 — identity
     # Group the two per-module tensors (cb_qweight + fp8 weight_scale) by base.
     bases: dict[str, dict] = {}
     for nm, w in buf.items():
@@ -325,10 +353,12 @@ def _load_shared_cb(model, buf: dict, params_dict, reverse_fusion,
         bases.setdefault(b, {})[key] = w
 
     # Group bases by the bf16 target param they fill (merged gate_up -> 2 bases).
+    # The target is resolved on the RENAMED base (matches the built param);
+    # the scheme (below) stays on the original base ``b``.
     groups: dict[str, list] = {}
     for b, parts in bases.items():
-        tgt = resolve_shared_cb_target(b + _CB_QWEIGHT_SUFFIX, params_dict,
-                                       reverse_fusion)
+        tgt = resolve_shared_cb_target(rename(b) + _CB_QWEIGHT_SUFFIX,
+                                       params_dict, reverse_fusion)
         if tgt is None:
             raise ValueError(
                 f"prismaquant shared-CB '{b}': buffered but no bf16 target "
@@ -362,6 +392,50 @@ def _load_shared_cb(model, buf: dict, params_dict, reverse_fusion,
     return loaded
 
 
+# ---------------------------------------------------------------------------
+# Spec-layer (MTP drafter) name rewrite — see the module docstring.
+# ---------------------------------------------------------------------------
+
+def _spec_layer_of(name: str, spec_layers) -> int | None:
+    """The spec-layer index owning *name* (``model.layers.{idx}.…``), or None.
+    Mirrors vLLM ``get_spec_layer_idx_from_weight_name`` (a ``startswith``
+    test against ``model.layers.{idx}.``)."""
+    for s in spec_layers:
+        if name.startswith(f"model.layers.{s}."):
+            return s
+    return None
+
+
+def _spec_layer_rename(model):
+    """A ``name -> resolution_name`` callable for a spec-layer (MTP) drafter, or
+    ``None`` when *model* is not one.
+
+    Detection is structural: the model must expose ``_rewrite_spec_layer_name``
+    (the arch's own rewrite) and a ``config`` with ``num_hidden_layers``. The
+    spec layers are ``range(num_hidden_layers, num_hidden_layers + n)`` with
+    ``n = num_nextn_predict_layers`` — exactly how ``HYV3MTP`` derives them. The
+    returned callable applies the model's rewrite to a spec-layer name (which may
+    yield ``"__skip__"``) and returns any other name unchanged, so body tensors
+    pass through untouched and defer to the original loader."""
+    rewrite = getattr(model, "_rewrite_spec_layer_name", None)
+    config = getattr(model, "config", None)
+    if rewrite is None or config is None:
+        return None
+    n_layers = getattr(config, "num_hidden_layers", None)
+    if n_layers is None:
+        return None
+    n_spec = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+    if n_spec <= 0:
+        return None
+    spec_layers = tuple(range(int(n_layers), int(n_layers) + n_spec))
+
+    def rename(name: str) -> str:
+        s = _spec_layer_of(name, spec_layers)
+        return rewrite(s, name) if s is not None else name
+
+    return rename
+
+
 def install_toplevel_cb_expert_loader(model_cls: type) -> None:
     """Idempotently wrap ``model_cls.load_weights`` so stacked-CB expert tensors
     load directly into the registered FusedMoE params, and everything else
@@ -382,6 +456,10 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         param_names = tuple(params_dict)
         reverse_fusion = _build_reverse_fusion(
             getattr(self, "packed_modules_mapping", None))
+        # Spec-layer (MTP) drafters nest a spec layer's block tensors under
+        # ``.mtp_block.``; ``rename`` maps an incoming checkpoint name to the
+        # served param naming before resolution (identity for a body model).
+        rename = _spec_layer_rename(self)
         loaded: set[str] = set()
         # Shared-expert CB tensors (…shared_mlp.*.cb_qweight / .weight_scale):
         # vLLM built bf16 Linears for these (no cb_qweight param). Buffer them
@@ -397,7 +475,14 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
             # are copied inline as a side effect and recorded in ``loaded``;
             # every other tensor is yielded on to the original loader.
             for name, w in weights:
-                mapped = resolve_cb_expert_param(name, param_names)
+                # Resolve against the served param naming (spec-layer rename or
+                # identity). A ``"__skip__"`` — the spec drafter reusing the main
+                # model's embed/lm_head — is delegated so the original drops it.
+                res_name = rename(name) if rename is not None else name
+                if res_name == "__skip__":
+                    yield name, w
+                    continue
+                mapped = resolve_cb_expert_param(res_name, param_names)
                 if mapped is not None:
                     param = params_dict[mapped]
                     if tuple(param.shape) != tuple(w.shape):
@@ -413,8 +498,10 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                 # (no cb_qweight param): buffer for post-decode, don't leak it to
                 # the original loader. Genuine dense-CB / fused-attention tensors
                 # (registered cb_qweight) resolve to None here and pass through.
+                # Buffer under the ORIGINAL name (scheme lookup keys on it);
+                # ``_load_shared_cb`` re-applies ``rename`` for the target param.
                 if resolve_shared_cb_target(
-                        name, params_dict, reverse_fusion) is not None:
+                        res_name, params_dict, reverse_fusion) is not None:
                     shared_cb_buf[name] = w
                     continue
                 # Not a stacked-CB expert tensor (or the target param is absent
@@ -426,7 +513,8 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         if shared_cb_buf:
             quant_config = _find_prismaquant_config(self)
             loaded |= _load_shared_cb(self, shared_cb_buf, params_dict,
-                                      reverse_fusion, quant_config)
+                                      reverse_fusion, quant_config,
+                                      rename=rename)
         return loaded
 
     model_cls.load_weights = load_weights

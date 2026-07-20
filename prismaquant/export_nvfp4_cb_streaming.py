@@ -340,15 +340,25 @@ def export_nvfp4_cb_streaming(
     device: str | None = None,
     scale_sweep: bool = True,
     scale_coding: str = cb.SCALE_CODING_V1,
+    subset_prefixes: list[str] | None = None,
 ) -> dict[str, int]:
     """Streaming counterpart of :func:`export_nvfp4_cb.export_nvfp4_cb`. Same
     signature + container; peak residency ~= one source tensor + codebooks.
-    See the module docstring for the scope of this milestone."""
+    See the module docstring for the scope of this milestone.
+
+    ``subset_prefixes`` (opt-in) scopes the export to a subset of the model:
+    the passthrough copies ONLY checkpoint tensors whose name starts with one of
+    the prefixes, and every allocation target must resolve to an export base
+    within them (else the allocation and the declared subset disagree — fail
+    fast). Default ``None`` = whole-model passthrough, byte-identical to before.
+    Used to export just the MTP sidecar (``model.layers.80.``) without dragging
+    the ~550 GB body through as bf16 passthrough."""
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if scale_coding not in (cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER):
         raise ValueError(f"unknown scale_coding {scale_coding!r}")
+    subset_prefixes = list(subset_prefixes) if subset_prefixes else None
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     spec = shared_codebook_spec or {}
@@ -387,6 +397,21 @@ def export_nvfp4_cb_streaming(
             f"{sorted({f for _, f in stock_illegal})} need the in-memory "
             "export_nvfp4_cb (their codec output sizes need a pack to size "
             "the streaming header — bounded TODO).")
+
+    # Subset gate: every quantised target's export base must live under a
+    # declared prefix, else the allocation reaches outside the subset the caller
+    # asked to export (a mistake worth failing on, not silently over/under
+    # covering). Passthrough is filtered by the same prefixes below.
+    if subset_prefixes is not None:
+        outside = sorted(
+            q for q in list(cb_targets) + list(source_targets)
+            if not any(_export_base_name(q, profile).startswith(p)
+                       for p in subset_prefixes))
+        if outside:
+            raise ValueError(
+                f"--subset-prefix {subset_prefixes}: {len(outside)} allocation "
+                f"target(s) resolve outside the subset, e.g. {outside[:5]} — "
+                "the layer_config and the declared subset disagree")
 
     def _resolve_target(qname, suffix=".weight"):
         """Locate a target's source: a stacked skeleton tensor, an expert
@@ -572,6 +597,9 @@ def export_nvfp4_cb_streaming(
                 for e, base in ids.items():
                     consumed_expert_bases.add(base + ".weight")
     for name in skeleton.keys():
+        if subset_prefixes is not None and \
+                not any(name.startswith(p) for p in subset_prefixes):
+            continue   # outside the declared subset (e.g. non-MTP body layers)
         if name in emitted_bases or name in consumed_expert_bases:
             continue
         if name.endswith(".weight_scale_inv"):
@@ -761,6 +789,12 @@ def main(argv=None) -> None:
     ap.add_argument("--scale-coding", default=cb.SCALE_CODING_V1,
                     choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER])
     ap.add_argument("--device", default=None)
+    ap.add_argument("--subset-prefix", action="append", default=None,
+                    metavar="PREFIX",
+                    help="opt-in: export ONLY tensors under this checkpoint "
+                         "prefix (repeatable), e.g. 'model.layers.80.' for the "
+                         "MTP sidecar; every allocation target must fall within "
+                         "it. Default: whole-model passthrough.")
     args = ap.parse_args(argv)
     if torch.cuda.is_available():
         # Box-safety net on the unified pool: a runaway allocation must raise
@@ -776,7 +810,8 @@ def main(argv=None) -> None:
     counts = export_nvfp4_cb_streaming(
         args.model_dir, args.layer_config, args.out, col_weights,
         shared_codebook_spec=spec, device=args.device,
-        scale_sweep=not args.no_scale_sweep, scale_coding=args.scale_coding)
+        scale_sweep=not args.no_scale_sweep, scale_coding=args.scale_coding,
+        subset_prefixes=args.subset_prefix)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
     print(f"wrote {args.out} ({size:.3f} GB)")
     for fmt, n in sorted(counts.items()):
