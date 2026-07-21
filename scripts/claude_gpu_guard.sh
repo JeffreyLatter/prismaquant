@@ -17,9 +17,10 @@ case "$cmd" in
   *) exit 0 ;;
 esac
 
-# The serve's own relaunch names a pq_ container; it self-replaces safely.
+# The serve's own relaunch (exact known serve container names only — a
+# prefix match let a pq_ctrl side container slip through on 2026-07-21).
 case "$cmd" in
-  *"--name pq_"*|*'--name "pq_'*) exit 0 ;;
+  *"--name pq_hy3_cb"*|*'--name "pq_hy3_cb"'*) exit 0 ;;
 esac
 
 serving=$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null \
