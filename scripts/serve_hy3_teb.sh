@@ -37,6 +37,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}" \
   -e PRISMAQUANT_CB_W2_SCHED="${PRISMAQUANT_CB_W2_SCHED:-}" \
   -e PRISMAQUANT_CB_PREFILL="${PRISMAQUANT_CB_PREFILL:-}" \
+  -e PRISMAQUANT_CB_DISPATCH="${PRISMAQUANT_CB_DISPATCH:-}" \
   --entrypoint bash vllm-node:latest -c '
     pip install -e /repo/plugins/gridbook --no-deps -q 2>/dev/null
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
