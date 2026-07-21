@@ -302,8 +302,16 @@ turned spec decode positive — acceptance 68% mixed). ship_gridbook =
 mtp_rung_selection.json. Kernel finalization: w2 rowpack = measured
 negative (round-2 default stands); persistent-N = GO-as-roadmap
 (expand_frac 0.23–0.38, ceiling 1.3–1.6×, reference kernel 6/6);
-batched-prefill 27/27 small-scale, at-scale gate pending. Final TEB +
-re-upload: see ship ledger below when landed.
+batched-prefill 27/27 small-scale, at-scale gate pending.
+
+**FINAL SHIP TEB (2026-07-21, ship config, seed 1234): 88/100 (130/148)** —
+the highest Hy3 score on this box (GGUF IQ 87/129, k-quant 86/128, prior
+body band 85–87). Strictly above the shipped GGUF on the same protocol;
+recorded at the top of the plateau band, NOT as a directional quality
+claim (single-seed churn ±2–3 established) — though the joint artifact
+genuinely carries more fidelity in sensitive places. UPLOADED PUBLIC:
+huggingface.co/rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm (gridbook-branded
+id for the public post; card = no quality claims + kit + provenance).
 
 ## Remaining (perf, not correctness)
 - MoE prefill still per-expert-loop (batched-expert expand + grouped GEMM =
