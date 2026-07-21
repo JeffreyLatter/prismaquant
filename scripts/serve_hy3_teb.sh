@@ -14,7 +14,7 @@ set -u
 NAME=pq_hy3_cb
 MODEL="${MODEL:-/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb}"
 MAXLEN="${MAXLEN:-12288}"
-UTIL="${UTIL:-0.95}"
+UTIL="${UTIL:-0.90}"
 EXTRA_ARGS="${EXTRA_ARGS:---enforce-eager}"
 LOG=/home/rob/dq-runs/prod-hy3-nvfp4cb-2p9/logs/serve_teb.log
 PROF=/home/rob/dq-runs/prod-hy3-nvfp4cb-2p9/profiles
@@ -26,7 +26,7 @@ echo "[serve] launching $NAME (TEB protocol: len $MAXLEN, util $UTIL, extra: $EX
 # container shell expands it with word-splitting but WITHOUT quote removal, so
 # embedded JSON (--compilation-config '{"…"}') survives intact. Host-side
 # interpolation into a double-quoted -c string strips the JSON's quotes.
-docker run -d --rm --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
+docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -v /home/rob/prismaquant:/repo \
   -v /home/rob/dq-runs:/dqruns \
   -e VLLM_LOGGING_LEVEL=INFO \
@@ -36,6 +36,7 @@ docker run -d --rm --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e PQ_EXTRA="$EXTRA_ARGS" \
   -e VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}" \
   -e PRISMAQUANT_CB_W2_SCHED="${PRISMAQUANT_CB_W2_SCHED:-}" \
+  -e PRISMAQUANT_CB_PREFILL="${PRISMAQUANT_CB_PREFILL:-}" \
   --entrypoint bash vllm-node:latest -c '
     pip install -e /repo/plugins/gridbook --no-deps -q 2>/dev/null
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
