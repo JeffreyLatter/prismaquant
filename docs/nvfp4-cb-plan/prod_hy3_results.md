@@ -264,6 +264,47 @@ bandwidth (the wall), dense fp8 GEMV 20.0 @ ~55%, cuBLAS (lm_head + router)
   NOT on TEB quality (parity band) and NOT on batch-1 decode (13.1 vs
   17.8).
 
+## JOINT-MENU REGENERATION + gridbook ship (2026-07-20/21)
+Robert's orders executed in sequence: pull the HF artifact down; regenerate
+with vanilla NVFP4 + FP8_DYNAMIC on the menu; finish the kernel backlog;
+canonize MTP rung selection; rename everything **gridbook** (repo
+github.com/RobTand/gridbook; python package + registry key "gridbook",
+legacy "prismaquant" key still accepted).
+
+**Chain (2.7 h total, was ~10 h):** probe/act reused; cost fresh across the
+11-format joint menu; allocation; **delta-export copied 633 targets and
+re-encoded 38** (sampled byte-verification gated every copy). Joint
+allocation verdict: **36 dense/shared Linears -> vanilla FP8_DYNAMIC; 0 ->
+vanilla NVFP4** (offered and never chosen — the A/B's dominance held in the
+full solve; the outlier-row units preferred full fp8); layer-21 experts
+reflowed fp4-K20 -> fp8-K28. MTP re-encoded at **FP8-CB K44** (2.56 GB) per
+the canon selector's degenerate branch.
+
+**First-contact bugs (both fixed + committed):**
+- Merge config-groups rebuild emitted stock groups as scheme:null CB — the
+  36 vanilla units served UNQUANTIZED bf16. Merge now carries group dicts
+  verbatim; shipped config hot-patched; loader also taught that a
+  weight_scale with its own param is stock-CT, never an orphaned CB scale.
+- Batched-prefill path crashed the serve at 1.4k-token prefill (chunk
+  transients ~1.6 GB vs the loop's ~56 MB) — default reverted to loop,
+  batched opt-in pending a memory-bounded scale gate.
+
+**Two box OOMs (exit 137) closed by POLICY, not another shave: serve at
+util 0.90 on this box** (0.94/0.95 die under long-prefill activation spikes
+with the drafter resident; ~6.5 GiB unclaimed pool is the required spike
+buffer). serve script default updated; ship serve.sh documents it.
+
+**Ship config verified (util 0.90, graphs, TRITON_ATTN, spec k=1 K44):**
+loads, correct, prefill 108.7 tok/s, decode base 14.6 / **prose 16.1 tok/s
+with the K44 draft** (K18 draft was throughput-neutral; the selector's pick
+turned spec decode positive — acceptance 68% mixed). ship_gridbook =
+105.73 GB, 5 shards, serving kit + allocation provenance incl.
+mtp_rung_selection.json. Kernel finalization: w2 rowpack = measured
+negative (round-2 default stands); persistent-N = GO-as-roadmap
+(expand_frac 0.23–0.38, ceiling 1.3–1.6×, reference kernel 6/6);
+batched-prefill 27/27 small-scale, at-scale gate pending. Final TEB +
+re-upload: see ship ledger below when landed.
+
 ## Remaining (perf, not correctness)
 - MoE prefill still per-expert-loop (batched-expert expand + grouped GEMM =
   task 15) — prefill already 2.6× GGUF without it.
