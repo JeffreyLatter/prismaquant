@@ -12,7 +12,7 @@
 #   *** PART 2 (vLLM serve) IS BLOCKED — DO NOT EXPECT IT TO PASS YET. ***
 #   The plugin's stock-CT delegation is stubbed: get_quant_method raises
 #   NotImplementedError on a non-CB quantized Linear
-#   (plugins/vllm_prismaquant/vllm_prismaquant/config.py, "stock
+#   (plugins/gridbook/gridbook/config.py, "stock
 #   compressed-tensors delegation is intentionally unimplemented"). The EXPORT
 #   step (Part 1) is fully functional and produces the correct mixed
 #   config_groups (stock groups carry the exact CT scheme vocabulary, NO
@@ -66,8 +66,8 @@ echo "[deleg-smoke] launching vLLM ($SERVE_IMAGE) with the plugin ..."
 CID=$(docker run -d --gpus all -p "${PORT}:${PORT}" \
   -v "${REPO}:/repo" -v "${ARTIFACT}:/model" \
   --entrypoint bash "${SERVE_IMAGE}" -c \
-  "pip install -e /repo/plugins/vllm_prismaquant --no-deps -q && \
-   PYTHONPATH=/repo:/repo/plugins/vllm_prismaquant \
+  "pip install -e /repo/plugins/gridbook --no-deps -q && \
+   PYTHONPATH=/repo:/repo/plugins/gridbook \
    vllm serve /model --host 0.0.0.0 --port ${PORT} --trust-remote-code \
      --quantization prismaquant --enforce-eager")
 echo "[deleg-smoke] container CID=${CID} — stop by this EXACT id, never pattern-kill"

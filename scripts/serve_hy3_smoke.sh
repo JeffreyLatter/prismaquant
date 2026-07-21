@@ -26,7 +26,7 @@ docker run -d --rm --gpus all -p 8000:8000 --name "$NAME" \
   -v /home/rob/.cache/huggingface:/hf \
   -e VLLM_LOGGING_LEVEL=INFO \
   --entrypoint bash vllm-node:latest -c "
-    pip install -e /repo/plugins/vllm_prismaquant --no-deps -q 2>/dev/null
+    pip install -e /repo/plugins/gridbook --no-deps -q 2>/dev/null
     exec vllm serve $MODEL --host 0.0.0.0 --port 8000 --enforce-eager \
       --max-model-len $MAXLEN --served-model-name m \
       --gpu-memory-utilization $UTIL" > "$LOG" 2>&1

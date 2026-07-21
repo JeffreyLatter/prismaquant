@@ -5,8 +5,8 @@ Container-only (JIT-builds an isolated extension; needs nvcc):
 
   docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
     --entrypoint bash vllm-node:latest -c \\
-    'pip install -q pytest; PYTHONPATH=/repo:/repo/plugins/vllm_prismaquant \\
-     python3 -m pytest /repo/plugins/vllm_prismaquant/tests/test_persistent_prefill.py -v'
+    'pip install -q pytest; PYTHONPATH=/repo:/repo/plugins/gridbook \\
+     python3 -m pytest /repo/plugins/gridbook/tests/test_persistent_prefill.py -v'
 
 Contract: cb_prefill_persistent_n_fp8 decodes B bit-exactly to cb_expand_fp8 and
 accumulates the GEMM in f32, so its UNSCALED bf16 output matches
@@ -20,8 +20,8 @@ import os
 import pytest
 import torch
 
-codec = pytest.importorskip("vllm_prismaquant.codec")
-from vllm_prismaquant.cuda_ext import get_ext  # noqa: E402
+codec = pytest.importorskip("gridbook.codec")
+from gridbook.cuda_ext import get_ext  # noqa: E402
 
 gemv_ext = get_ext()
 if gemv_ext is None:

@@ -37,7 +37,7 @@ docker run -d --rm --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}" \
   -e PRISMAQUANT_CB_W2_SCHED="${PRISMAQUANT_CB_W2_SCHED:-}" \
   --entrypoint bash vllm-node:latest -c '
-    pip install -e /repo/plugins/vllm_prismaquant --no-deps -q 2>/dev/null
+    pip install -e /repo/plugins/gridbook --no-deps -q 2>/dev/null
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
       --served-model-name hy3 \
       --max-model-len "$PQ_MAXLEN" --max-num-seqs 2 \

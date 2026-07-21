@@ -1525,7 +1525,7 @@ fi
 
 if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
   # NVFP4-CB / FP8-CB codebook lane: one custom compressed-tensors-STYLE
-  # artifact served by the out-of-tree vllm_prismaquant_plugin (LAYOUT.md is
+  # artifact served by the out-of-tree gridbook_plugin (LAYOUT.md is
   # the byte contract). Like the GGUF lane, the exporter requantizes the bf16
   # skeleton with an imatrix-weighted VQ search — it does NOT read a production
   # cache. Requires TARGET_PROFILE=nvfp4_cb + COST_MODE=local (gated above).
@@ -1647,7 +1647,7 @@ PY
   # DEFERRED per format-pipeline.md §6 ("Alternative (larger, better) path —
   # flag not adopt"). Phase 0 mirrors the GGUF skeleton-requantize model.
   # There is also NO in-lane serving smoke: CB artifacts serve ONLY via the
-  # out-of-tree vllm_prismaquant_plugin (plugins/vllm_prismaquant/), so the
+  # out-of-tree gridbook_plugin (plugins/gridbook/), so the
   # load+generate / served-KL gate runs in the plugin's serving env, not here
   # (docs/nvfp4-cb-plan/serve_prototype_0p6b.md). No rung is production-eligible
   # until it clears the served gold-metric KL/PPL gate AND the prefill perf
@@ -1655,8 +1655,8 @@ PY
   echo
   echo "[pipeline] done."
   echo "  Artifact: ${CB_OUT}  (custom quant_method=prismaquant; LAYOUT.md contract)"
-  echo "  Serve:    vLLM with the vllm_prismaquant_plugin installed"
-  echo "            (plugins/vllm_prismaquant/); NOT stock compressed-tensors."
+  echo "  Serve:    vLLM with the gridbook_plugin installed"
+  echo "            (plugins/gridbook/); NOT stock compressed-tensors."
   echo "  Gate:     served KL-vs-BF16 + WikiText PPL in the plugin serving env."
   exit 0
 fi

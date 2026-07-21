@@ -18,15 +18,15 @@ must match the loop within the suite's tolerance class:
 Two run scopes:
 
 * ``-k qdq_once`` (build venv, NO vLLM, CPU ok): the per-row QDQ property.
-    PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/vllm_prismaquant \\
+    PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \\
       /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -m pytest \\
-      plugins/vllm_prismaquant/tests/test_moe_batched_prefill.py -q -k qdq_once
+      plugins/gridbook/tests/test_moe_batched_prefill.py -q -k qdq_once
 
 * everything else (serving container: vLLM + triton + prismaquant + CUDA):
     docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
       --entrypoint bash vllm-node-tf5-cu132-lfm:latest -c 'pip install -q pytest; \\
-      PYTHONPATH=/repo:/repo/plugins/vllm_prismaquant python3 -m pytest \\
-      /repo/plugins/vllm_prismaquant/tests/test_moe_batched_prefill.py -v'
+      PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
+      /repo/plugins/gridbook/tests/test_moe_batched_prefill.py -v'
 """
 import types
 
@@ -35,7 +35,7 @@ import torch
 
 # codec is torch-only (no triton / no vLLM) so the QDQ property test runs
 # anywhere; expand/moe/fmt are imported lazily inside the GPU tests.
-codec = pytest.importorskip("vllm_prismaquant.codec")
+codec = pytest.importorskip("gridbook.codec")
 
 
 # --------------------------------------------------------------------------- #
@@ -91,7 +91,7 @@ def _build(cfg_name, E=8, hidden=512, inter=768, seed=0):
     """Construct a PrismaQuantCBMoEMethod (init bypassed, like test_moe_stacked)
     + a namespace layer carrying synthetic stacked CB expert weights on CUDA."""
     fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
-    from vllm_prismaquant.moe import PrismaQuantCBMoEMethod
+    from gridbook.moe import PrismaQuantCBMoEMethod
 
     cfg = _CONFIGS[cfg_name]
     grid, k, n_sub = cfg["grid"], cfg["k"], cfg["n_sub"]

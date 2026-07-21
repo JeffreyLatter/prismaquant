@@ -253,7 +253,7 @@ class _StreamWriter:
             header[name] = {"dtype": _ST_DTYPE[dtype], "shape": list(shape),
                             "data_offsets": [off, off + nb]}
             off += nb
-        header["__metadata__"] = {"format": "pt", "quant_method": "prismaquant"}
+        header["__metadata__"] = {"format": "pt", "quant_method": "gridbook"}
         hjson = json.dumps(header, separators=(",", ":")).encode("utf-8")
         data0 = 8 + len(hjson)
 
@@ -1152,7 +1152,7 @@ def export_nvfp4_cb_streaming(
     src_config = model_dir / "config.json"
     config = json.loads(src_config.read_text()) if src_config.exists() else {}
     config["quantization_config"] = {
-        "quant_method": "prismaquant", "format": "nvfp4_cb",
+        "quant_method": "gridbook", "format": "nvfp4_cb",
         "config_file": "quant_config.json"}
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
     for aux in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
@@ -1306,7 +1306,7 @@ def _build_config(assignment, cb_targets, source_targets, stock_targets,
             _ct_explicit_regex(_vllm_target(q)) for q in source_targets)
         config_groups[f"group_{len(config_groups)}"] = _src_group
     quant_config = {
-        "quant_method": "prismaquant", "format": "nvfp4_cb",
+        "quant_method": "gridbook", "format": "nvfp4_cb",
         "config_groups": config_groups, "ignore": sorted(set(ignore)),
         **({"codebook_file": codebook_file} if codebook_file else {}),
         "provenance": {

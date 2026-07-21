@@ -126,7 +126,7 @@ def test_nvfp4_cb_profile_discoverable_and_metadata():
     assert "nvfp4_cb" in sp.serving_profile_names()
     prof = sp.load_serving_profile("nvfp4_cb")
     assert prof.id == "nvfp4_cb"
-    assert prof.runtime == "vllm_prismaquant_plugin"
+    assert prof.runtime == "gridbook_plugin"
 
 
 def test_nvfp4_cb_profile_allows_all_cb_rungs_and_carriers():
@@ -630,7 +630,7 @@ def test_exporter_resolves_nested_prefix_skeleton(tmp_path, monkeypatch):
 def test_codebook_pqcb_sidecar_contract(tmp_path):
     # Codebooks ship in cb_codebooks.pqcb (safetensors under a non-globbed
     # extension), named by each scheme's codebook_ref, and are NOT in
-    # model.safetensors — the exact contract plugins/vllm_prismaquant config.py
+    # model.safetensors — the exact contract plugins/gridbook config.py
     # get_codebooks() -> load_file(model_dir/cb_codebooks.pqcb) consumes, and
     # linear.py looks up as codebooks[n] for n in codebook_ref. (Format-level
     # fixture: the plugin's own reader is not importable without vLLM.)

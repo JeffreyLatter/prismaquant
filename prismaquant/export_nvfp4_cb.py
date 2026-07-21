@@ -588,7 +588,7 @@ def export_nvfp4_cb(
     # --- Codebook tensors: shipped once per (ref, fmt) in a NON-safetensors-
     # globbed sidecar (cb_codebooks.pqcb) so vLLM's weight loader never sees
     # these non-parameter tensors. The plugin loads them explicitly via the
-    # config's codebook_file pointer (plugins/vllm_prismaquant config.py
+    # config's codebook_file pointer (plugins/gridbook config.py
     # get_codebooks -> load_file(model_dir/cb_codebooks.pqcb)), keyed by each
     # scheme's codebook_ref. Sidecar-only: NOT written into model.safetensors. ---
     for (ref, fmt), codebook in codebooks.items():
@@ -678,7 +678,7 @@ def export_nvfp4_cb(
             for q in source_targets)
         config_groups[f"group_{len(config_groups)}"] = _src_group
     quant_config = {
-        "quant_method": "prismaquant",
+        "quant_method": "gridbook",
         "format": "nvfp4_cb",
         "config_groups": config_groups,
         "ignore": sorted(set(ignore)),
@@ -707,20 +707,20 @@ def export_nvfp4_cb(
 
     # --- Write safetensors (params only) + the codebook sidecar + configs. ---
     save_file(out_tensors, str(out_dir / "model.safetensors"),
-              metadata={"format": "pt", "quant_method": "prismaquant"})
+              metadata={"format": "pt", "quant_method": "gridbook"})
     if codebook_file:
         # The .pqcb is a plain safetensors blob under a non-globbed extension:
         # the plugin reads it with safetensors.load_file, vLLM's *.safetensors
         # weight globber skips it (LAYOUT.md §3 codebook contract).
         save_file({k: v.contiguous() for k, v in cb_tensor_blobs.items()},
                   str(out_dir / codebook_file),
-                  metadata={"format": "pt", "quant_method": "prismaquant"})
+                  metadata={"format": "pt", "quant_method": "gridbook"})
     (out_dir / "quant_config.json").write_text(
         json.dumps(quant_config, indent=2, sort_keys=True))
     src_config = model_dir / "config.json"
     config = json.loads(src_config.read_text()) if src_config.exists() else {}
     config["quantization_config"] = {
-        "quant_method": "prismaquant",
+        "quant_method": "gridbook",
         "format": "nvfp4_cb",
         "config_file": "quant_config.json",
         **({"codebook_file": codebook_file} if codebook_file else {}),
