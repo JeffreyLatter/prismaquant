@@ -131,9 +131,15 @@ def _merge_quant_config(main_qc: dict, mtp_qc: dict, mtp_layer: int,
     if main_qc.get("codebook_file") != mtp_qc.get("codebook_file"):
         raise SystemExit("FATAL: quant_config codebook_file differs")
 
-    # Merge config_groups by (format, canonical scheme) signature; union targets.
+    # Merge config_groups by their FULL non-target signature; union targets.
+    # The signature (and the carried dict) is the whole group minus "targets":
+    # CB groups keep format+scheme, stock compressed-tensors groups keep their
+    # CT vocabulary (weights/input_activations/format) — an earlier version
+    # rebuilt groups as {targets, format, scheme} and silently emitted stock
+    # groups with "scheme": null, which the plugin then treated as a broken CB
+    # group and served UNQUANTIZED (first joint-menu merge, 2026-07-20).
     def sig(g):
-        return json.dumps({"format": g.get("format"), "scheme": g.get("scheme")},
+        return json.dumps({k: v for k, v in g.items() if k != "targets"},
                           sort_keys=True, separators=(",", ":"))
     by_sig: dict[str, dict] = {}
     target_owner: dict[str, str] = {}
@@ -141,12 +147,12 @@ def _merge_quant_config(main_qc: dict, mtp_qc: dict, mtp_layer: int,
         for g in qc.get("config_groups", {}).values():
             s = sig(g)
             grp = by_sig.setdefault(
-                s, {"format": g.get("format"), "scheme": g.get("scheme"),
+                s, {"body": {k: v for k, v in g.items() if k != "targets"},
                     "targets": set()})
             for t in g.get("targets", []):
                 if t in target_owner and target_owner[t] != s:
                     raise SystemExit(
-                        f"FATAL: target '{t}' assigned to two different CB "
+                        f"FATAL: target '{t}' assigned to two different "
                         "schemes across main/MTP configs")
                 target_owner[t] = s
                 grp["targets"].add(t)
@@ -154,8 +160,7 @@ def _merge_quant_config(main_qc: dict, mtp_qc: dict, mtp_layer: int,
     for i, s in enumerate(sorted(by_sig)):
         grp = by_sig[s]
         config_groups[f"group_{i}"] = {
-            "targets": sorted(grp["targets"]), "format": grp["format"],
-            "scheme": grp["scheme"]}
+            "targets": sorted(grp["targets"]), **grp["body"]}
 
     # ignore: main's minus any layer-80 entries (those roles are CB now), plus
     # the MTP's ignore (its bf16-glue Linears: eh_proj, router gate).
