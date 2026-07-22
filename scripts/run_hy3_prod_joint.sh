@@ -39,13 +39,20 @@ export EXPORT_STREAMING=auto
 
 # --- JOINT menu: the CB ladder + vanilla NVFP4 (4.5) + FP8_DYNAMIC (8) ---
 # FULL rung range (Robert 2026-07-21: "support all possible bit widths —
-# marginal bits go to the best recipients"). Every even fp4 rung K12-K24 and
-# every fp8 rung K28-K48 — all CUDA-served by the existing k-parameterized
-# kernels (kSlotBytes=208 covers K48's type_size 192; ladder-interp anchors
-# (12,18,24) span the fp4 family). Odd-k and signed S-rungs are registered
-# and Triton-servable but stay OUT of production menus until their CUDA
-# fast paths land (promotion rule: performant kernel or no menu entry).
-export FORMATS="NVFP4_CB_K12,NVFP4_CB_K14,NVFP4_CB_K16,NVFP4_CB_K18,NVFP4_CB_K20,NVFP4_CB_K22,NVFP4_CB_K24,FP8_CB_K28,FP8_CB_K32,FP8_CB_K36,FP8_CB_K40,FP8_CB_K44,FP8_CB_K48,NVFP4,FP8_DYNAMIC,BF16"
+# marginal bits go to the best recipients"): EVERY integer fp4 rung K12-K24
+# (0.125-bpw steps) and EVERY integer fp8 rung K28-K48 (also 0.125), all
+# CUDA-served — odd/uneven k uses the ceil-first per-sub split (SubSplit in
+# cb_gemv.cu, encoder-anchored by test_fp8_uneven_split_* and the widened
+# two-tier/moe rung sweeps; 116-test gate 2026-07-21). Ladder-interp anchors
+# keep the cost pass O(anchors), so menu width is ~free. Signed S-rungs
+# remain OUT: no CUDA decode path yet (promotion rule: performant kernel or
+# no menu entry).
+export FORMATS="$(python3 - <<'PYF'
+fp4 = ",".join(f"NVFP4_CB_K{k}" for k in range(12, 25))
+fp8 = ",".join(f"FP8_CB_K{k}" for k in range(28, 49))
+print(f"{fp4},{fp8},NVFP4,FP8_DYNAMIC,BF16")
+PYF
+)"
 export CB_SCALE_CODING=two_tier
 export TARGET_BITS=2.9
 export PARETO_TARGETS="2.7,2.9,3.1"

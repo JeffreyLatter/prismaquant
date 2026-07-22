@@ -944,7 +944,7 @@ for _k in range(12, 25):                    # 2.000 .. 3.500 bpw in 0.125 steps
     register_format(_make_nvfp4_cb_spec(_k))
 for _k in (13, 14, 15, 16):                 # signed: 2.125 .. 2.5 bpw
     register_format(_make_nvfp4_cb_signed_spec(_k))
-for _k in (28, 32, 36, 40, 44, 48):         # 3.5 .. 6.0 bpw in 0.5 steps
+for _k in range(28, 49):                    # 3.5 .. 6.0 bpw in 0.125 steps
     register_format(_make_fp8_cb_spec(_k))
 
 

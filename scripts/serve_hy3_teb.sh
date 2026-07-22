@@ -39,7 +39,12 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e PRISMAQUANT_CB_PREFILL="${PRISMAQUANT_CB_PREFILL:-}" \
   -e PRISMAQUANT_CB_DISPATCH="${PRISMAQUANT_CB_DISPATCH:-}" \
   --entrypoint bash vllm-node:latest -c '
-    pip install -e /repo/plugins/gridbook --no-deps -q 2>/dev/null
+    # Snapshot the plugin INSIDE the container before installing: the serve
+    # JIT-builds kernels from the package dir, and building from the live
+    # /repo mount races host-side edits (a mid-edit .cu broke a launch on
+    # 2026-07-21). The copy dies with the container.
+    cp -r /repo/plugins/gridbook /gb_snap
+    pip install -e /gb_snap --no-deps -q 2>/dev/null
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
       --served-model-name hy3 \
       --max-model-len "$PQ_MAXLEN" --max-num-seqs 2 \
