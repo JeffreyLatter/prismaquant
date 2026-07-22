@@ -6,14 +6,19 @@
 # the new kernels; target 20 GB so it runs on a 24 GB 4090 or 5090."
 #
 # MENU: the full all-integer CB ladder (fp4 K12-K24 two-tier + fp8 K28-K48,
-# 0.125-bpw steps — landed 2026-07-21, 116-test gate) + FP8_DYNAMIC + BF16.
-# NO vanilla NVFP4, deliberately: an RTX 4090 (sm_89, Ada) has no NVFP4
-# hardware, while every CB rung serves via bf16-decode GEMV / fp8-expand
-# GEMMs and FP8_DYNAMIC has native sm_89 tensor cores — this one artifact can
-# serve on both 4090 (sm_89) and 5090 (sm_120). gridbook's min capability is
-# 80 and its JIT build targets the local arch. (Blackwell-only NVFP4 units
-# won ZERO units on the Hy3 joint menu; at this bpp the CB rungs dominate it
-# on error/byte anyway.)
+# 0.125-bpw steps — landed 2026-07-21, 116-test gate) + vanilla NVFP4 +
+# FP8_DYNAMIC + BF16. Robert 2026-07-21: "Blackwell only is fine" + "Put
+# nvfp4 in the menu for completeness sake" — the allocator decides per-Linear
+# (35B dense-tier A/B: 42 outlier-row attention units favored NVFP4's
+# act-weighted group-16 scales; on Hy3's MoE-dominated joint menu it won
+# zero — measurement decides here). Target cards: RTX 5090 (sm_120) / GB10
+# (sm_121).
+#
+# VISION TOWER: NVFP4 (Robert: "Make the vision tower nvfp4") — was BF16
+# passthrough in the prior run. VISUAL_FORMAT accepts any registry name the
+# target profile allows; text-only calibration means visual Linears render
+# RTN (no visual activations), which is the standard vision-tower treatment.
+# The serve smoke must include an IMAGE request (vision path load+generate).
 #
 # SIZE: 20 GB total artifact. Prior 5.5-bpp CB export = 23 GB with ~5.1 GB
 # BF16 embed+lm_head (248k vocab, untied) => body ~25B params. 20 GB total
@@ -60,7 +65,7 @@ export EXPORT_STREAMING=auto
 export FORMATS="$(python3 - <<'PYF'
 fp4 = ",".join(f"NVFP4_CB_K{k}" for k in range(12, 25))
 fp8 = ",".join(f"FP8_CB_K{k}" for k in range(28, 49))
-print(f"{fp4},{fp8},FP8_DYNAMIC,BF16")
+print(f"{fp4},{fp8},NVFP4,FP8_DYNAMIC,BF16")
 PYF
 )"
 export CB_SCALE_CODING=two_tier
@@ -74,7 +79,7 @@ export CACHE_HEADROOM_GB=45
 export ACTIVATION_ROWS_LIMIT=1024
 export CB_CODEBOOK_SOURCE=lattice
 export PRISMAQUANT_CB_ENCODE_TIER=balanced
-export VISUAL_FORMAT=BF16
+export VISUAL_FORMAT=NVFP4
 export CALIBRATION_MODALITY=text-only
 export DEVICE=cuda
 export EXPORT_DEVICE=cuda
@@ -85,7 +90,7 @@ echo "==========================================================================
 echo "Qwen3.6-27B FULL-LADDER CB @ ${TARGET_BITS} bpp (ship pick: footprint <= 19.3 GB)"
 echo "  WORK_DIR=$WORK_DIR (probe/col-weights reused from prod-27b-nvfp4cb-5p5)"
 echo "  FORMATS=$FORMATS"
-echo "  4090/5090-portable: NO vanilla NVFP4; CB + FP8_DYNAMIC + BF16 only."
+echo "  Blackwell target (5090/GB10): CB ladder + NVFP4 + FP8_DYNAMIC + BF16; vision tower NVFP4."
 echo "  start: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================================"
 
