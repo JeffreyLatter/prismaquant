@@ -1072,6 +1072,16 @@ class LayerCache:
         #   3. Implicit at chunk teardown via clear_done().
         self._done_layers: set[int] = set()
         self.refused_puts = 0
+        # Prefetched-but-not-yet-read entries. These are the highest-
+        # value entries in the cache (known future use within the
+        # lookahead window), yet under plain LRU they are the OLDEST
+        # untouched items — so every new insert evicted exactly the
+        # layer the consumer needed next, and the prefetcher's reads
+        # were thrown away moments before use (measured: 40/48 cold
+        # loads per phase-3 sweep on Laguna-117B). Eviction skips them
+        # until first get(); evicting one is a last resort and counted.
+        self._pinned_until_read: set[int] = set()
+        self.evicted_pinned = 0
         # Dynamic budget reserve (v20 step 3+4): when > 0, put()
         # recomputes the effective max as
         #   min(max_bytes, MemAvailable + total_bytes - reserve)
@@ -1094,6 +1104,9 @@ class LayerCache:
     def get(self, layer_idx: int):
         if layer_idx in self._cache:
             self._cache.move_to_end(layer_idx)
+            # First read consumes the prefetch pin — from here on the
+            # entry competes in plain LRU order like any other.
+            self._pinned_until_read.discard(layer_idx)
             self.hits += 1
             return self._cache[layer_idx]
         self.misses += 1
@@ -1105,7 +1118,7 @@ class LayerCache:
         return layer_idx in self._cache
 
     def put(self, layer_idx: int, tensors: dict[str, torch.Tensor],
-            force: bool = True) -> bool:
+            force: bool = True, pinned_until_read: bool = False) -> bool:
         """Insert tensors into the cache. Returns True on success.
 
         force=True (default): always insert, even if the layer is
@@ -1162,6 +1175,8 @@ class LayerCache:
         self._cache[layer_idx] = tensors
         self._bytes[layer_idx] = size
         self.total_bytes += size
+        if pinned_until_read:
+            self._pinned_until_read.add(layer_idx)
         # On UMA the cuda caching allocator won't return freed blocks to
         # the OS on its own, so every eviction would otherwise leak into
         # the shared LPDDR5X pool. Force a release after each eviction.
@@ -1170,14 +1185,20 @@ class LayerCache:
         return True
 
     def _pick_evict_candidate(self) -> int | None:
-        """Return the layer_idx of the LRU non-priority entry, or the
-        LRU priority entry if no non-priority ones exist, or None if
-        the cache is empty."""
+        """Return the eviction victim: LRU entry that is neither
+        priority nor pinned-until-read; then LRU pinned non-priority
+        (last resort, counted); then LRU priority; None if empty."""
         if not self._cache:
             return None
         # OrderedDict iteration is in insertion order; LRU is at front.
         for idx in self._cache:
+            if (idx not in self._priority_layers
+                    and idx not in self._pinned_until_read):
+                return idx
+        for idx in self._cache:
             if idx not in self._priority_layers:
+                self.evicted_pinned += 1
+                self._pinned_until_read.discard(idx)
                 return idx
         # All entries are priority — fall back to LRU
         return next(iter(self._cache))
@@ -1341,6 +1362,7 @@ class LayerCache:
         layer as MRU and evicting the next layer that prefetch prepared.
         """
         tensors = self._cache.pop(layer_idx, None)
+        self._pinned_until_read.discard(layer_idx)
         if tensors is None:
             return
         self.total_bytes -= self._bytes.pop(layer_idx, 0)
@@ -1389,7 +1411,10 @@ class LayerCache:
                 f"{self.max_bytes / (1024**3):.1f} GB, "
                 f"residency={self.residency_summary()} "
                 f"hits={self.hits} misses={self.misses} "
-                f"hit_rate={(self.hits/tot*100 if tot else 0):.0f}%")
+                f"hit_rate={(self.hits/tot*100 if tot else 0):.0f}% "
+                f"refused={self.refused_puts} "
+                f"pinned={len(self._pinned_until_read)} "
+                f"evicted_pinned={self.evicted_pinned}")
 
 
 def _get_layer_list(model: nn.Module):

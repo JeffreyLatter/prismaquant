@@ -1811,16 +1811,24 @@ def _run_body_streaming_shard(
         in_scope_layers = {L for L in range(num_layers) if layer_linear_names[L]}
         ctx.layer_cache.set_priority_layers(in_scope_layers)
         ctx.configure_runtime_pressure_floor()
+        # The reverse sweep exists to deliver gradients to the tracked
+        # layers; backward below the LOWEST tracked layer computes VJPs
+        # nobody consumes (weight-Fisher for layer a needs only the
+        # cached boundary input at a and the grad at a's output). Stop
+        # there — for high shards this removes most of the sweep's
+        # layer loads.
+        stop_L = min(in_scope_layers)
         # Reverse-prefetch (Task #5): prefetcher should now look BACKWARD
-        # in layer index since reverse sweep walks num_layers-1 → 0.
+        # in layer index since reverse sweep walks num_layers-1 → stop_L.
         # Schedule lookahead in the direction we're actually going.
         for d in range(prefetch_depth):
             ctx.schedule_prefetch(num_layers - 1 - d)
 
-        for L in reversed(range(num_layers)):
+        for L in reversed(range(stop_L, num_layers)):
             load_t0 = time.time()
             src = ctx.install(L)
-            ctx.schedule_prefetch(L - prefetch_depth)
+            if L - prefetch_depth >= stop_L:
+                ctx.schedule_prefetch(L - prefetch_depth)
             load_s = time.time() - load_t0
             phase_load_s += load_s
             load_by_src[src] += load_s
@@ -2461,7 +2469,8 @@ def _run_body_streaming_shard(
             f"{k}:{load_by_src[k]:.1f}s/{count_by_src[k]}"
             for k in sorted(load_by_src)
         )
-        print(f"[incremental] phase-3 reverse sweep: {time.time()-t_phase:.1f}s  "
+        print(f"[incremental] phase-3 reverse sweep "
+              f"[{num_layers-1}->{stop_L}]: {time.time()-t_phase:.1f}s  "
               f"load={phase_load_s:.1f}s bwd={phase_bwd_s:.1f}s "
               f"pressure_trim={phase_pressure_trim_bytes/(1024**3):.1f}GB "
               f"load_by_src=[{load_parts}]  "

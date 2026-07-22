@@ -37,6 +37,10 @@ DEFAULT_SAFETY_GB = 20.0     # slack above the committed estimate. NEVER rely on
                              # Linux configs.
 DEFAULT_ACT_MULT = 12        # multiplier in (N*T*hidden*dtype*K) per tracked
                              # layer. Captures backward transient scratch.
+# Prefetch-window size for the streaming tier of pick_layers_per_shard:
+# 4 concurrent prefetch reads + a completed-ahead margin of 4.
+STREAMING_CACHE_WINDOW_LAYERS = 8
+
 DEFAULT_DTYPE_BYTES = 2      # bf16
 # Observed on Qwen3.6-27B dense: gradient checkpointing retains activations
 # at ~sqrt(n_layers) boundaries, so the full autograd graph adds a
@@ -254,7 +258,17 @@ def pick_layers_per_shard(
     if hold_all_layers_in_cache:
         cache_reserve = n_layers * per_layer_weight
     else:
-        cache_reserve = (n_layers // 2) * per_layer_weight
+        # Streaming tier. LRU under a cyclic layer sweep yields ZERO
+        # reuse whenever the cache cannot hold the full cycle — a
+        # half-model reserve buys ~nothing (measured 9-11% hit rate on
+        # Laguna-117B) while starving shard width down to lps=1, which
+        # multiplies the number of full-model sweeps. Reserve only a
+        # prefetch window deep enough to overlap reads with compute
+        # (workers in flight + completed-ahead margin) and spend the
+        # rest of RAM on layers-per-shard: each extra layer per shard
+        # removes an entire model sweep from the phase-3 schedule.
+        cache_reserve = (
+            min(n_layers, STREAMING_CACHE_WINDOW_LAYERS) * per_layer_weight)
 
     # Full-graph checkpointed activations: autograd retains activations
     # at ~sqrt(n_layers) boundaries across ALL layers, not just tracked

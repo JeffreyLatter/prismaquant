@@ -434,7 +434,7 @@ class StreamingContext:
         # exceeds effective budget, the put returns False and the
         # tensors fall out of scope here — ensure_loaded will re-load
         # synchronously when actually needed.
-        self.layer_cache.put(L, tensors, force=False)
+        self.layer_cache.put(L, tensors, force=False, pinned_until_read=True)
         with self._inflight_lock:
             self._inflight.pop(L, None)
         return tensors
