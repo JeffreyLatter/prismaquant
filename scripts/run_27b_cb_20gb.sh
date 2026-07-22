@@ -69,8 +69,11 @@ print(f"{fp4},{fp8},NVFP4,FP8_DYNAMIC,BF16")
 PYF
 )"
 export CB_SCALE_CODING=two_tier
-export TARGET_BITS=4.5
-export PARETO_TARGETS="4.25,4.5,4.75"
+# Overridable for additional SKUs from the SAME probe/cost (allocation +
+# export only). 16 GB SKU (5080/5070-Ti): TARGET_BITS=2.4 MTP_FORMAT=CB.
+export TARGET_BITS="${TARGET_BITS:-4.5}"
+export PARETO_TARGETS="${PARETO_TARGETS:-4.25,4.5,4.75}"
+export MTP_FORMAT="${MTP_FORMAT:-BF16}"
 
 # --- calibration (box-forced 8x1024, same as the prior 27B CB run) ---
 export NSAMPLES=8
