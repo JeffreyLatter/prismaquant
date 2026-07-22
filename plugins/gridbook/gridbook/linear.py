@@ -259,7 +259,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         if ok is None:
             gate = os.environ.get("PRISMAQUANT_CB_DECODE", "cuda") == "cuda"
             fp8_ok = not self.is_fp4 and self.n_sub == 4
-            fp4v2_ok = self.is_fp4 and self.is_v2 and self.n_sub == 2
+            # n_sub==2 product, n_sub==1 signed (S-rungs) — both CUDA-served
+            fp4v2_ok = self.is_fp4 and self.is_v2 and self.n_sub in (1, 2)
             ok = gate and (fp8_ok or fp4v2_ok)
             if ok:
                 from .cuda_ext import get_ext
