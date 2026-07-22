@@ -66,10 +66,15 @@ against. Changes to it require a served A/B, not a preference.
 
 ## Cost standard
 
-- CB rung costs: measured anchors + the **floor-anchored RD law**
-  `D(k) = F + C·2^(−α·k)` per (Linear, family) — F is the measured
-  infinite-k grid floor (fp8: per-channel-fp8 RTN render; fp4: two-tier
-  E2M1 RTN render), (C, α) least-squares in log space over the anchors —
+- CB rung costs: measured anchors + the **split-aware floored RD law**
+  `D(k) = F + C·R(k)` per (Linear, family) — F is the measured infinite-k
+  grid floor (fp8: per-channel-fp8 RTN render; fp4: two-tier E2M1 RTN
+  render), and `R(k) = Σᵢ 2^(−2·bᵢ/dᵢ)` is the EXACT rate factor over the
+  rung's ceil-first sub-splits (bᵢ bits over dᵢ dims), so the k%n_sub
+  sawtooth lives in the regressor instead of the residual; C by linear
+  least squares over the anchors. Fit chain on rejection: split-aware →
+  smooth floor law `F + C·2^(−α·k)` → legacy log-linear — each proposal
   **holdout-gated**: any tensor whose holdout error misses the bar falls
-  back to full per-rung measurement. The gate is the contract; the law is
-  only ever a proposal under it.
+  back to full per-rung measurement. The gate is the contract; the laws
+  are only ever proposals under it. (Measured on the 27B full-menu run:
+  3.2% of tensors fall back.)
