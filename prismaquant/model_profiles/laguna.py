@@ -50,3 +50,43 @@ class LagunaProfile(ModelProfile):
         # The DFlash drafter is a SEPARATE checkpoint (…-DFlash), not an
         # in-body/mtp.* sidecar; the mtp_module machinery does not apply.
         return False
+
+    def register_vendored_modeling(self) -> None:
+        # Laguna ships PER-LAYER-TYPE rope_parameters ({"full_attention":
+        # {..., rope_type: yarn, original_max_position_embeddings: 8192},
+        # "sliding_attention": {...}}) — the venv transformers' rope
+        # validator indexes the TOP level flat and KeyErrors on the yarn
+        # fields that live one level down. Patch the yarn validator to skip
+        # dicts whose values are themselves per-layer-type sub-dicts; the
+        # sub-dicts carry complete yarn params, so nothing real is skipped.
+        # (DSv4-precedent config monkey-patch; drop when the venv
+        # transformers understands the per-layer-type format.)
+        try:
+            import transformers.modeling_rope_utils as mru
+        except Exception:
+            return
+        if getattr(mru, "_pq_laguna_rope_patch", False):
+            return
+        # The validators are METHODS dispatched via
+        # getattr(self, f"_validate_{rope_type}_rope_parameters") — patch the
+        # yarn method on whichever class carries it.
+        cls = None
+        for name in dir(mru):
+            obj = getattr(mru, name)
+            if isinstance(obj, type) and hasattr(
+                    obj, "_validate_yarn_rope_parameters"):
+                cls = obj
+                break
+        if cls is None:
+            return
+        orig = cls._validate_yarn_rope_parameters
+
+        def _tolerant_yarn_validate(self, rope_parameters, *a, **kw):
+            if ("original_max_position_embeddings" not in rope_parameters
+                    and any(isinstance(v, dict)
+                            for v in rope_parameters.values())):
+                return  # per-layer-type shape: sub-dicts validated by use
+            return orig(self, rope_parameters, *a, **kw)
+
+        cls._validate_yarn_rope_parameters = _tolerant_yarn_validate
+        mru._pq_laguna_rope_patch = True
