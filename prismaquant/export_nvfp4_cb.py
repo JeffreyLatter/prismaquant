@@ -678,9 +678,13 @@ def export_nvfp4_cb(
                 "table": [float(t) for t in table.tolist()],
             }
         config_groups[f"group_{gi}"] = {
-            # Targets carry the checkpoint/vLLM name (language_model infix on
-            # hybrids) so the plugin matches the served module prefixes.
-            "targets": sorted(_export_base_name(q, _profile, skeleton) for q in qnames),
+            # Targets are the CANONICAL qnames: vLLM's class mapper serves the
+            # LM at model.layers.* regardless of the checkpoint's infix
+            # convention (the 0.8B ships model.language_model.* on disk yet
+            # serves at model.layers.* — checkpoint-namespace targets matched
+            # nothing and every layer loaded unquantized, 2026-07-22).
+            # Checkpoint names remain the TENSOR convention only.
+            "targets": sorted(qnames),
             "format": fmt,
             "scheme": scheme,
         }
@@ -712,11 +716,9 @@ def export_nvfp4_cb(
             # weight-only (W4A16/W8A16): no activation contract for sidecar
             # towers; CT vocabulary = input_activations null.
             _group["input_activations"] = None
-            _group["targets"] = sorted(_ct_explicit_regex(q) for q in _names)
-        else:
-            _group["targets"] = sorted(
-                _ct_explicit_regex(_export_base_name(q, _profile, skeleton))
-                for q in _names)
+        # Serving-namespace targets: canonical qnames (sidecars strip the
+        # model. prefix per the class mapper) — see the CB-group note above.
+        _group["targets"] = sorted(_ct_explicit_regex(q) for q in _names)
         config_groups[f"group_{len(config_groups)}"] = _group
     # FP8_SOURCE passthrough group: the stock CT `float-quantized` block-fp8
     # scheme (no "scheme" key -> the plugin delegates it to CompressedTensors,
@@ -725,8 +727,7 @@ def export_nvfp4_cb(
     if source_targets:
         _src_group = _deepcopy(_FP8_SOURCE_SCHEME)
         _src_group["targets"] = sorted(
-            _ct_explicit_regex(_export_base_name(q, _profile, skeleton))
-            for q in source_targets)
+            _ct_explicit_regex(q) for q in source_targets)
         config_groups[f"group_{len(config_groups)}"] = _src_group
     quant_config = {
         "quant_method": "gridbook",
