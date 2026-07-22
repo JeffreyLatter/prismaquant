@@ -1800,6 +1800,18 @@ def prepare_cost_context(probe_path: str,
     act_cache = ActivationIndex(cache, stats)
     print(f"[cost] activation cache (lazy index): "
           f"{len(act_cache)} Linears mapped", flush=True)
+    if len(act_cache) == 0 and stats:
+        # Fail LOUD, not empty: an unpopulated act dir (e.g. probe.pkl copied
+        # from a prior run without its act cache — the probe stage is what
+        # writes activations) would otherwise produce a 0-row cost.pkl and a
+        # blanket-INFEASIBLE allocator (27B 2026-07-21). Measurement gap ->
+        # error, never silent garbage.
+        raise SystemExit(
+            f"activation cache {cache} maps 0 Linears while {len(stats)} "
+            "targets expect activations. The act cache is written by the "
+            "PROBE stage: if probe.pkl was reused from another run, copy its "
+            "act/ directory too, or delete probe.pkl so the probe re-runs "
+            "and repopulates activations.")
 
     target_names = set(stats.keys())
     def _has_activation_for_target(name: str) -> bool:
