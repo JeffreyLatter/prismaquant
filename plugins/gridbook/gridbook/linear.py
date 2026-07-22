@@ -355,6 +355,28 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # reference in tests/test_transient_fp8.py::test_transient_gemm_*).
         ws = layer._cb_scale.reshape(N, 1)
 
+        # Mid-M fused decode-in-prologue (task 7's measured WIN niche): at
+        # M in (16, 128] ONE M-tile covers the batch, so decoding B inside
+        # the CUTLASS prologue has no redundancy and beats expand+GEMM by
+        # 1.04-1.45x (M=32/64/128, GB10). OPT-IN (PRISMAQUANT_CB_FUSED_MIDM=1)
+        # until its served logprob A/B lands: the fused epilogue rounds the
+        # UNSCALED accumulation to bf16 and scales OUTSIDE, while
+        # cutlass_scaled_mm scales in the f32 epilogue then rounds — a
+        # rounding-ORDER numerics change vs the shipping path. Step-4 rungs
+        # only (the kernel's KBits template dispatch).
+        if (bias is None and 16 < x2.shape[0] <= 128
+                and self.k in (36, 40, 44, 48)
+                and os.environ.get("PRISMAQUANT_CB_FUSED_MIDM") == "1"):
+            from .cuda_ext import get_fused_ext
+            fext = get_fused_ext()
+            if fext is not None:
+                acc = fext.cb_fused_prefill_mm(
+                    xq, layer.cb_qweight.data, layer._cb_flat_fp8, N, K,
+                    self.k)
+                y = (acc.float() * sa.reshape(-1, 1)
+                     * layer._cb_scale.reshape(1, -1).float()).to(x.dtype)
+                return y.reshape(*x.shape[:-1], N)
+
         if self._cuda_gemv_ok():
             # CUDA expander (stream-bandwidth-bound; the Triton byte-gather
             # ran at 61-86 GB/s and serialized ~half the prefill).
