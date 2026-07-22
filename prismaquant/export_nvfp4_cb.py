@@ -200,11 +200,22 @@ def _resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
         f"{qname}: no skeleton tensor for {suffix!r} (tried {tried})")
 
 
-def _export_base_name(qname, profile):
+def _export_base_name(qname, profile, skeleton=None):
     """Recipe qname -> the base name the EXPORTED tensor + its config_groups
-    target must carry (checkpoint/vLLM convention, incl. the language_model
-    infix) so vLLM's loader / the plugin match the served module names."""
-    return profile.source_tensor_name(qname) if profile is not None else qname
+    target must carry. The profile's checkpoint mapping is only TRUSTED when
+    the mapped name actually resolves in the skeleton — a text-only snapshot
+    inside a multimodal config shell (qwen35-0.8B: Qwen3_5ForConditional-
+    Generation + text_config but model.layers.* keys) otherwise gets every
+    config target mis-namespaced under model.language_model.* while the
+    tensor writer's fallback uses the real names (2026-07-22 S-rung run:
+    nothing resolved at serve, all layers loaded unquantized, crash)."""
+    if profile is None:
+        return qname
+    mapped = profile.source_tensor_name(qname)
+    if skeleton is not None and mapped != qname:
+        if (mapped + ".weight") not in skeleton and mapped not in skeleton:
+            return qname
+    return mapped
 
 
 def _canonical_qname(ckpt_qname, profile):
@@ -669,7 +680,7 @@ def export_nvfp4_cb(
         config_groups[f"group_{gi}"] = {
             # Targets carry the checkpoint/vLLM name (language_model infix on
             # hybrids) so the plugin matches the served module prefixes.
-            "targets": sorted(_export_base_name(q, _profile) for q in qnames),
+            "targets": sorted(_export_base_name(q, _profile, skeleton) for q in qnames),
             "format": fmt,
             "scheme": scheme,
         }
@@ -704,7 +715,7 @@ def export_nvfp4_cb(
             _group["targets"] = sorted(_ct_explicit_regex(q) for q in _names)
         else:
             _group["targets"] = sorted(
-                _ct_explicit_regex(_export_base_name(q, _profile))
+                _ct_explicit_regex(_export_base_name(q, _profile, skeleton))
                 for q in _names)
         config_groups[f"group_{len(config_groups)}"] = _group
     # FP8_SOURCE passthrough group: the stock CT `float-quantized` block-fp8
@@ -714,7 +725,7 @@ def export_nvfp4_cb(
     if source_targets:
         _src_group = _deepcopy(_FP8_SOURCE_SCHEME)
         _src_group["targets"] = sorted(
-            _ct_explicit_regex(_export_base_name(q, _profile))
+            _ct_explicit_regex(_export_base_name(q, _profile, skeleton))
             for q in source_targets)
         config_groups[f"group_{len(config_groups)}"] = _src_group
     quant_config = {
