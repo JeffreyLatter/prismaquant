@@ -1,0 +1,40 @@
+{
+  "schema": "prismaquant.model_structure.v1",
+  "id": "laguna",
+  "default_serving_profile": "nvfp4_cb",
+  "match": {
+    "model_type": ["laguna"],
+    "architectures": ["Laguna*"]
+  },
+  "staging": {
+    "promote_inner_model_type": false
+  },
+  "naming": {
+    "live_to_recipe": [],
+    "recipe_to_source": [],
+    "recipe_to_vllm": []
+  },
+  "fused_groups": [
+    {
+      "target": "self_attn.qkv_proj",
+      "members": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    }
+  ],
+  "packed_experts": {
+    "param_names": ["gate_up_proj", "down_proj"],
+    "module_class_names": ["LagunaExperts"],
+    "split_for_formats": ["*"],
+    "projection_splits": {
+      "gate_up_proj": ["gate_proj", "up_proj"]
+    },
+    "format_groups": [
+      ["gate_up_proj", "down_proj"],
+      ["gate_proj", "up_proj", "down_proj"],
+      ["w1", "w2", "w3"]
+    ]
+  },
+  "moe": {
+    "per_expert_regex": "re:^model[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$"
+  },
+  "pinned_names": ["lm_head"]
+}

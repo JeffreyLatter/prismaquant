@@ -73,7 +73,9 @@ echo "  FORMATS=$FORMATS"
 echo "  start: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================================"
 
+cd "${REPO}"
 PATH="/home/rob/dq-runs/venvs/prismaquant-cu130/bin:$PATH" \
+  PYTHONPATH="${REPO}" \
   bash "${REPO}/prismaquant/run-pipeline.sh"
 echo "## LAGUNA EXPORT DONE — next: DFlash drafter (canon selector), serve smoke"
 echo "## at 256k ctx (util per slack gate), speed, uniform-quant A/B."
