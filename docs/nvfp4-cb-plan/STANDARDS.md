@@ -21,11 +21,16 @@ against. Changes to it require a served A/B, not a preference.
   Encoder-anchored tests pin this; it is frozen.
 - fp4 scale coding v1 (bare E4M3 plane) is legacy-compat only: readable,
   never produced by new exports.
-- **Signed S-rungs (S13–S16): spec-legal, NOT production-standard.** Kernels
-  exist (CUDA + Triton, GPU battery pending); they enter the production set
-  only if the K-vs-S head-to-head shows a real win at matched bpp. They
-  duplicate rate points K13–K16 already serve — value unproven, so they stay
-  research. Full mode: spec-reserved, unimplemented.
+- **Signed S-rungs (S13–S16): CLOSED as research-only (measured,
+  2026-07-22).** The K-vs-S head-to-head on Qwen3.5-0.8B (matched-rate menu,
+  776 per-(Linear,k) direct cost comparisons): K wins 79%, median S penalty
+  +0.5–2.2%, allocator placed 6 S-units vs 147 K-units (only linear-attn
+  in_proj_a/b/qkv/z ever preferred S). Serving propriety PROVEN: the signed
+  chain (encoder → export → vLLM load → decode) is bit-exact on the real
+  artifact (max |serve − reconstruct| = 0) plus the 18-test GPU battery.
+  S-rungs stay OFF production menus — correct but not worth menu space; the
+  spec keeps them for exotic weight geometries. Full mode: spec-reserved,
+  unimplemented.
 - MTP sidecars: CB-quantized, rung by the canon throughput selector
   (`mtp_rung_selection.py`). Vision towers (VLMs): vanilla NVFP4.
 - Standard production menu = both CB ladders (all integers) + NVFP4 +
