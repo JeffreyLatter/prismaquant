@@ -21,6 +21,20 @@ PROF=/home/rob/dq-runs/prod-hy3-nvfp4cb-2p9/profiles
 mkdir -p "$PROF"
 
 docker rm -f "$NAME" >/dev/null 2>&1
+# Drop the checkpoint's page cache from any PREVIOUS boot (unprivileged:
+# posix_fadvise DONTNEED). Stale file cache from a dead serve shrinks the
+# free unified pool vLLM's memory profiler sees at the next boot — measured
+# 12.7 -> 1.07 GiB KV across three relaunches of the same model (2026-07-21).
+HOST_MODEL="${MODEL/\/dqruns/\/home\/rob\/dq-runs}"
+python3 - "$HOST_MODEL" <<'PYFLUSH' 2>/dev/null || true
+import os, sys, glob
+for f in glob.glob(os.path.join(sys.argv[1], "*.safetensors")):
+    fd = os.open(f, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+PYFLUSH
 echo "[serve] launching $NAME (TEB protocol: len $MAXLEN, util $UTIL, extra: $EXTRA_ARGS) $(date '+%H:%M:%S')"
 # EXTRA_ARGS reaches the container via env + a SINGLE-quoted -c script: the
 # container shell expands it with word-splitting but WITHOUT quote removal, so
@@ -30,6 +44,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -v /home/rob/prismaquant:/repo \
   -v /home/rob/dq-runs:/dqruns \
   -e VLLM_LOGGING_LEVEL=INFO \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_TORCH_PROFILER_DIR=/dqruns/prod-hy3-nvfp4cb-2p9/profiles \
   -e VLLM_SERVER_DEV_MODE=1 \
   -e PQ_MODEL="$MODEL" -e PQ_MAXLEN="$MAXLEN" -e PQ_UTIL="$UTIL" \
