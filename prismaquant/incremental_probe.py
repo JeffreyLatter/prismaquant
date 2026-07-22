@@ -1818,6 +1818,16 @@ def _run_body_streaming_shard(
         # there — for high shards this removes most of the sweep's
         # layer loads.
         stop_L = min(in_scope_layers)
+        # Cap lookahead so protected demand (priority in-scope layers +
+        # pinned prefetches + the layer being consumed) fits the cache.
+        # Oversubscription forces last-resort eviction of pinned entries,
+        # and every such eviction is a full re-read of a multi-GB layer
+        # (measured: evicted_pinned=37/sweep = ~152 GB of doubled disk
+        # traffic on Laguna-117B at depth 12 with 7 in-scope layers).
+        cache_slots = max(1, int(ctx.layer_cache.max_bytes
+                                 // max(1, ctx.estimated_layer_bytes)))
+        prefetch_depth = max(2, min(
+            prefetch_depth, cache_slots - len(in_scope_layers) - 4))
         # Reverse-prefetch (Task #5): prefetcher should now look BACKWARD
         # in layer index since reverse sweep walks num_layers-1 → stop_L.
         # Schedule lookahead in the direction we're actually going.
