@@ -1380,18 +1380,65 @@ def _cb_ladder_plan(specs: list[fr.FormatSpec]):
     return split, predicted_names
 
 
+def _ladder_rate_factor(fmt_name: str, k: int) -> float:
+    """Exact per-sub rate factor R(k) = sum_i 2^(-2*b_i/d_i) under the
+    ceil-first bit split — the theory-faithful rate variable for the CB
+    ladder. The smooth 2^(-alpha*k) law treats k as evenly divisible, but at
+    k % n_sub != 0 the ceil-first split gives some sub-tables one bit more:
+    the true error carries a +4-6% SAWTOOTH by split phase that a smooth law
+    cannot represent — and the (28, 38, 48) anchors + k=39 holdout sit on
+    DIFFERENT phases, which is exactly where the 8-12% holdout rejections
+    came from (2026-07-21 27B cost run). R is exact per phase and reduces to
+    the old law at even splits (R(4m) = 4*2^(-m) for fp8)."""
+    n_sub = 4 if fmt_name.startswith("FP8_CB") else 2
+    sub_dim = 8 // n_sub
+    base, extra = divmod(int(k), n_sub)
+    r = 0.0
+    for i in range(n_sub):
+        b = base + (1 if i < extra else 0)
+        r += 2.0 ** (-2.0 * b / sub_dim)
+    return r
+
+
 def _ladder_metric_fit(kmap, anchors, fmt_values, target_fmt):
-    """Fit ONE metric on the anchors and predict target_fmt. With 3 anchors
-    the FLOOR law D = F + C*2^(-b*k) is tried first (the fp8 family flattens
-    toward the E4M3 grid floor at high k — pure log-linear rejected 60-90% of
-    holdouts on the 0.6B smoke); log-linear LS is the fallback. Returns None
-    if any anchor value is unusable."""
+    """Fit ONE metric on the anchors and predict target_fmt.
+
+    Chain (holdout gates every variant, so each is a proposal only):
+      1. Split-aware FLOORED LINEAR law D = F + C*R(k), with R the exact
+         ceil-first per-sub rate factor — plain linear least squares in
+         (1, R); kills both the high-k floor miss AND the k%n_sub sawtooth.
+      2. The smooth floor law D = F + C*2^(-b*k) (exact 3-anchor solve).
+      3. Log-linear LS (the original law).
+    Returns None if any anchor value is unusable."""
     try:
         xs = [float(kmap[f]) for f in anchors]
         vs = [float(fmt_values[f]) for f in anchors]
     except (KeyError, TypeError):
         return None
+    if len(anchors) >= 2:
+        # -- 1. split-aware floored linear LS ------------------------------
+        rs = [_ladder_rate_factor(f, kmap[f]) for f in anchors]
+        n = float(len(rs))
+        mr = sum(rs) / n
+        mv = sum(vs) / n
+        den = sum((r - mr) ** 2 for r in rs)
+        if den > 0.0:
+            C = sum((r - mr) * (v - mv) for r, v in zip(rs, vs)) / den
+            F = mv - C * mr
+            if C > 0.0 and F >= 0.0:
+                r_t = _ladder_rate_factor(target_fmt, kmap[target_fmt])
+                return float(F + C * r_t)
+            if C > 0.0 and F < 0.0:
+                # floor clamped to 0: refit C through the origin
+                den0 = sum(r * r for r in rs)
+                if den0 > 0.0:
+                    C0 = sum(r * v for r, v in zip(rs, vs)) / den0
+                    if C0 > 0.0:
+                        r_t = _ladder_rate_factor(target_fmt,
+                                                  kmap[target_fmt])
+                        return float(C0 * r_t)
     if len(anchors) == 3:
+        # -- 2. smooth floor law (exact solve) -----------------------------
         from prismaquant.expert_empirical_cost import _fit_floor_law
         fl = _fit_floor_law(xs, vs)
         if fl is not None:
