@@ -48,7 +48,10 @@ PYF
 )"
 export CB_SCALE_CODING=two_tier
 export TARGET_BITS="${TARGET_BITS:-6.0}"
-export PARETO_TARGETS="${PARETO_TARGETS:-5.75,6.0,6.25}"
+export PARETO_TARGETS="${PARETO_TARGETS:-3.0,3.25,3.5,3.75,4.0,4.25,4.5,4.75,5.0,5.25,5.5,5.75,6.0,6.25}"
+# Robert 2026-07-22: see the size/quality/speed CURVE before the final
+# size decision — dense Pareto ladder; the export that follows runs at
+# TARGET_BITS as a default and is cheap to interrupt/re-point.
 
 export NSAMPLES=8
 export SEQLEN=1024
