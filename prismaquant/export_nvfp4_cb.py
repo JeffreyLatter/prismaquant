@@ -524,6 +524,15 @@ def export_nvfp4_cb(
         # col_weights / cb_targets are keyed by (nested -> canonical).
         ckpt_qname = name[:-len(".weight")] if name.endswith(".weight") else None
         canon = _canonical_qname(ckpt_qname, _profile) if ckpt_qname else None
+        if canon is None and ckpt_qname is not None and (
+                ckpt_qname in stock_targets or ckpt_qname in cb_targets):
+            # Sidecar modules the profile's LM mapping drops (visual/audio)
+            # but the recipe DOES assign (e.g. VISUAL_FORMAT=NVFP4): their
+            # recipe qnames are already checkpoint-form, so classify by the
+            # raw name. Without this the config pass promised a stock group
+            # for 110 visual Linears while the write pass copied raw BF16 —
+            # a split-brain artifact vLLM cannot load (2026-07-22 27B).
+            canon = ckpt_qname
         if name in _source_scale_keys:
             continue
         if canon in source_qnames:
