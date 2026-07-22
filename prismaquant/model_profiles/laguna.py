@@ -1,0 +1,52 @@
+"""poolside Laguna (LagunaForCausalLM, model_type=laguna) profile.
+
+Laguna-S-2.1: 48 decoder layers, hidden 3072, GQA 48/8 head_dim 128,
+sparse MoE every layer — 256 routed experts top-10 (moe_intermediate 1024,
+sigmoid routing with norm_topk) + 1 shared expert (intermediate 1024).
+~117B params, 235 GB bf16, text-only, untied embeddings (vocab 100352).
+
+On-disk layout is the Qwen3.5-MoE/Ornith per-expert convention
+(``…mlp.experts.{i}.{gate,up,down}_proj.weight``) — the streaming loader's
+per-expert→packed bridge applies unchanged. Router ships as
+``mlp.gate.weight`` (already the live/vLLM name; no rename). The shared
+expert ships AND dispatches as ``mlp.shared_expert.*`` — unlike Hy3, vLLM's
+Laguna class threads the ``.shared_expert`` prefix through to its Linears
+(laguna.py: ``prefix=f"{prefix}.shared_expert"``), so no dispatch aliasing
+is needed.
+
+vLLM serves the class natively (registry: LagunaForCausalLM → laguna.py),
+and the spec-decode drafter has its own first-class class
+(DFlashLagunaForCausalLM / laguna_dflash.py) — the DFlash drafter is this
+family's MTP-analog; its rung goes through the canon throughput selector
+at export time. ``has_mtp`` is False here because the drafter is a separate
+checkpoint (poolside/Laguna-S-2.1-DFlash), not an in-body sidecar.
+
+All quantizable in-dims are 256-superblock-aligned (attn in 3072/6144,
+expert gate_up in 3072, expert down in 1024) — CB-clean without ignores.
+"""
+from __future__ import annotations
+
+from .base import ModelProfile
+
+
+class LagunaProfile(ModelProfile):
+    """poolside Laguna family (Laguna-S/XS 2.x)."""
+
+    @classmethod
+    def matches(cls, model_type: str | None,
+                architectures: list[str] | None) -> bool:
+        if model_type == "laguna":
+            return True
+        return any(a.startswith("Laguna") for a in architectures or ())
+
+    @property
+    def name(self) -> str:
+        return "laguna"
+
+    def vllm_architecture_class(self) -> str | None:
+        return "LagunaForCausalLM"
+
+    def has_mtp(self) -> bool:
+        # The DFlash drafter is a SEPARATE checkpoint (…-DFlash), not an
+        # in-body/mtp.* sidecar; the mtp_module machinery does not apply.
+        return False

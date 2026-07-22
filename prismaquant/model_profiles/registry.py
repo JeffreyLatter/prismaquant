@@ -40,6 +40,7 @@ from .qwen3_moe import Qwen3MoeProfile
 from .minimax_m2 import MiniMaxM2Profile
 from .deepseek_v4 import DeepseekV4Profile
 from .hy_v3 import HyV3Profile
+from .laguna import LagunaProfile
 
 
 _REGISTERED: list[type[ModelProfile]] = [
@@ -52,6 +53,7 @@ _REGISTERED: list[type[ModelProfile]] = [
     MiniMaxM2Profile,
     DeepseekV4Profile,
     HyV3Profile,
+    LagunaProfile,
 ]
 
 
