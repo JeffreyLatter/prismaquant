@@ -388,6 +388,14 @@ def export_nvfp4_cb(
             f"+ stock NVFP4/FP8_DYNAMIC (CT-delegated) + FP8_SOURCE "
             f"(verbatim fp8 passthrough) + BF16 passthrough only")
 
+    # Sidecar stock targets (visual/audio — modules the profile's LM mapping
+    # drops): ship WEIGHT-ONLY (W4A16). Text-only calibration has no visual
+    # activations to derive a static input scale from, and vLLM's vision
+    # tower builds the weight-only CT variant (no input_global_scale param —
+    # the W4A4 tensor set failed to load, 2026-07-22).
+    sidecar_stock = {q for q in stock_targets
+                     if _canonical_qname(q, _profile) is None}
+
     # FP8_SOURCE is PASSTHROUGH-ONLY (PASSTHROUGH_SOURCE_REQUIREMENTS): legal
     # only where the source `.weight` is already fp8_e4m3fn with a
     # `.weight_scale_inv` sibling. The allocator's passthrough-integrity
@@ -583,6 +591,8 @@ def export_nvfp4_cb(
             packed = _ct_quantize_2d(
                 tensor.to(device), fmt, nvfp4_global_real_override=override)
             for suffix, t in packed.items():
+                if canon in sidecar_stock and "input" in suffix:
+                    continue        # weight-only sidecar group (see above)
                 out_tensors[f"{ckpt_qname}.{suffix}"] = t.cpu().contiguous()
             counts[assignment[canon]] += 1
         else:
@@ -670,9 +680,15 @@ def export_nvfp4_cb(
     # marker (LAYOUT.md §4): CB groups have "scheme"; stock CT groups do not.
     _stock_by_fmt: dict[str, list[str]] = {}
     for _q, _f in stock_targets.items():
-        _stock_by_fmt.setdefault(_f, []).append(_q)
-    for _f, _qnames in sorted(_stock_by_fmt.items()):
+        _key = f"{_f}//sidecar" if _q in sidecar_stock else _f
+        _stock_by_fmt.setdefault(_key, []).append(_q)
+    for _key, _qnames in sorted(_stock_by_fmt.items()):
+        _f = _key.split("//")[0]
         _group = _deepcopy(_STOCK_CT_SCHEMES[_f])
+        if _key.endswith("//sidecar"):
+            # weight-only (W4A16/W8A16): no activation contract for sidecar
+            # towers; CT vocabulary = input_activations null.
+            _group["input_activations"] = None
         _group["targets"] = sorted(
             _ct_explicit_regex(_export_base_name(q, _profile)) for q in _qnames)
         config_groups[f"group_{len(config_groups)}"] = _group
