@@ -682,15 +682,30 @@ def export_nvfp4_cb(
     for _q, _f in stock_targets.items():
         _key = f"{_f}//sidecar" if _q in sidecar_stock else _f
         _stock_by_fmt.setdefault(_key, []).append(_q)
+    def _sidecar_serving_name(q: str) -> str:
+        # Config-group targets must match vLLM's SERVING prefixes. The LM
+        # keeps the checkpoint's `model.` prefix at serve time, but sidecar
+        # towers do not: the Qwen VL mapper serves checkpoint
+        # `model.visual.*` as module `visual.*` (demonstrated by the loader
+        # itself — 'blocks.0.attn.proj ... in Qwen3_VisionTransformer').
+        # Tensor NAMES stay checkpoint-form; only group targets strip the
+        # leading `model.`.
+        return q[len("model."):] if q.startswith("model.") else q
+
     for _key, _qnames in sorted(_stock_by_fmt.items()):
         _f = _key.split("//")[0]
         _group = _deepcopy(_STOCK_CT_SCHEMES[_f])
+        _names = (_qnames if not _key.endswith("//sidecar")
+                  else [_sidecar_serving_name(q) for q in _qnames])
         if _key.endswith("//sidecar"):
             # weight-only (W4A16/W8A16): no activation contract for sidecar
             # towers; CT vocabulary = input_activations null.
             _group["input_activations"] = None
-        _group["targets"] = sorted(
-            _ct_explicit_regex(_export_base_name(q, _profile)) for q in _qnames)
+            _group["targets"] = sorted(_ct_explicit_regex(q) for q in _names)
+        else:
+            _group["targets"] = sorted(
+                _ct_explicit_regex(_export_base_name(q, _profile))
+                for q in _names)
         config_groups[f"group_{len(config_groups)}"] = _group
     # FP8_SOURCE passthrough group: the stock CT `float-quantized` block-fp8
     # scheme (no "scheme" key -> the plugin delegates it to CompressedTensors,
