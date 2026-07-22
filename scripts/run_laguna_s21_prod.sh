@@ -4,10 +4,12 @@
 # ============================================================================
 # Robert 2026-07-22: "go forward with Laguna. Leave enough room for 256k
 # cache." The KV budget SETS the artifact size: GQA 8 kv-heads x 128 dim x
-# 48 layers = ~96 KiB/token at fp8 KV -> 256k ctx ~= 24 GiB. Spark serving
-# pool ~110 GiB (util ~0.88 + slack-gate discipline) - 24 KV - ~3 act/graphs
-# - ~1-2 DFlash drafter => ~83 GB weight ceiling. Body ~116.7B params =>
-# ~5.5 bpp — a near-lossless-class budget (fp8-CB K40-K48 band expected).
+# 48 layers = ~96 KiB/token at fp8 KV -> 256k ctx ~= 24 GiB. Pool per Robert
+# (2026-07-22: "128 GB, leave 3-4 for the OS; 110 is too conservative"):
+# 121 GiB reported - 3.5 OS = 117.5 GiB; - 24 KV - ~9 (activations/graphs/
+# host engine/DFlash) => ~84.5 GiB ~= 90 GB weight ceiling. Body ~116.7B
+# params => ~6.0 bpp — the TOP of the CB ladder (K47/K48 band + FP8/BF16
+# escapes); serve at util ~0.93 under the slack-gate + watchdog discipline.
 #
 # Menu: the full all-integer standard (STANDARDS.md) — 34 CB rungs + NVFP4 +
 # FP8_DYNAMIC + BF16. 256-expert top-10 MoE, per-expert on disk (the
@@ -45,8 +47,8 @@ print(f"{fp4},{fp8},NVFP4,FP8_DYNAMIC,BF16")
 PYF
 )"
 export CB_SCALE_CODING=two_tier
-export TARGET_BITS="${TARGET_BITS:-5.5}"
-export PARETO_TARGETS="${PARETO_TARGETS:-5.25,5.5,5.75}"
+export TARGET_BITS="${TARGET_BITS:-6.0}"
+export PARETO_TARGETS="${PARETO_TARGETS:-5.75,6.0,6.25}"
 
 export NSAMPLES=8
 export SEQLEN=1024
@@ -62,7 +64,7 @@ export PRISMAQUANT_PROBE_MIN_AVAILABLE_GB=40
 export LAYERS_PER_SHARD="${LAYERS_PER_SHARD:-auto}"
 
 echo "============================================================================"
-echo "Laguna-S-2.1 FULL-STANDARD CB @ ${TARGET_BITS} bpp (ship pick: footprint <= 83 GB"
+echo "Laguna-S-2.1 FULL-STANDARD CB @ ${TARGET_BITS} bpp (ship pick: footprint <= 90 GB"
 echo "  so 256k fp8 KV [~24 GiB] + DFlash drafter fit the Spark pool)"
 echo "  FORMATS=$FORMATS"
 echo "  start: $(date '+%Y-%m-%d %H:%M:%S')"
