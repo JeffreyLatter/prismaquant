@@ -51,6 +51,19 @@ class LagunaProfile(ModelProfile):
         # in-body/mtp.* sidecar; the mtp_module machinery does not apply.
         return False
 
+    def checkpoint_to_live_name(self, ckpt_key: str, *,
+                                multimodal: bool = False) -> str | None:
+        # vLLM-trained Laguna checkpoints store the aux-loss-free routing
+        # bias on the experts module (`mlp.experts.e_score_correction_bias`);
+        # poolside's HF class remaps it onto the router via
+        # `_checkpoint_conversion_mapping`. Mirror that mapping — the live
+        # LagunaTopKRouter declares the parameter, LagunaExperts does not.
+        suffix = ".mlp.experts.e_score_correction_bias"
+        if ckpt_key.endswith(suffix):
+            return ckpt_key[: -len(suffix)] + ".mlp.gate.e_score_correction_bias"
+        return super().checkpoint_to_live_name(
+            ckpt_key, multimodal=multimodal)
+
     def register_vendored_modeling(self) -> None:
         # Laguna ships PER-LAYER-TYPE rope_parameters ({"full_attention":
         # {..., rope_type: yarn, original_max_position_embeddings: 8192},
