@@ -28,12 +28,14 @@ _GGUF_FORMAT_NAMES = frozenset(
 )
 
 # NVFP4-CB / FP8-CB vector-quantization codebook lane (custom vLLM plugin;
-# pinned to format_registry by test_nvfp4_cb_formats). NVFP4_CB_K12..K24
-# (flat), NVFP4_CB_S13..S16 (sign-magnitude), FP8_CB_K36/40/44/48.
+# pinned to format_registry by test_nvfp4_cb_formats). ALL integer rungs per
+# STANDARDS.md: NVFP4_CB_K12..K24, NVFP4_CB_S13..S16 (sign-magnitude),
+# FP8_CB_K28..K48 (the 2026-07-21 all-integer ladder — a stale step-4 set
+# here crashed the first full-ladder 27B export on cb_k=47).
 _NVFP4_CB_FORMAT_NAMES = frozenset(
     {f"NVFP4_CB_K{k}" for k in range(12, 25)}
     | {f"NVFP4_CB_S{k}" for k in (13, 14, 15, 16)}
-    | {f"FP8_CB_K{k}" for k in (28, 32, 36, 40, 44, 48)}
+    | {f"FP8_CB_K{k}" for k in range(28, 49)}
 )
 
 
