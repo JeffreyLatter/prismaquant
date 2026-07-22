@@ -146,3 +146,38 @@ perf claim.
    correct).
 3. `bench_persistent_n.py` → reference kernel decode-amortization sanity.
 4. **If `f` says go:** implement §4b in a GPU-enabled session and A/B vs `t_serial`.
+
+## 7. §4b concrete implementation plan (2026-07-21 — the remaining kernel)
+
+Status: §5's opportunity bench said **GO** (recorded 2026-07-20,
+prod_hy3_results.md "persistent-N = GO-as-roadmap"); §4a's reference kernel
+is parity-green. What remains is the tensor-core §4b build, a bounded
+CUTLASS project for the next dedicated GPU window:
+
+1. **Scheduler**: CUTLASS 3.x persistent tile scheduler, specialized to
+   N-MAJOR visit order — each persistent CTA takes a fixed N-tile and
+   iterates ALL M-tiles before advancing (the opposite of the default
+   M-major raster). Decode-in-prologue then fires once per N-tile visit:
+   the existing sm120_cb_fused_mma.hpp prologue is reused verbatim; only
+   the "is this the first M-tile of my N-tile" predicate gates it, and the
+   decoded B smem allocation persists across the CTA's M-loop (no
+   per-tile re-stage).
+2. **Bit-exactness gates** (all exist): fork64 passthrough parity per
+   N-panel; test_fused_prefill's synth/ragged/real-artifact equality; the
+   served logprob A/B before any default flip.
+3. **Dispatch**: extends the mid-M fused path (PRISMAQUANT_CB_FUSED_MIDM)
+   upward — M > 128 routes to the persistent variant, mid-M keeps the
+   single-tile kernel, M <= 16 stays on the GEMV. Same rung coverage
+   (KBits template list) as the mid-M kernel; widen both together if the
+   allocator ever picks non-step-4 fp8 rungs hot.
+4. **Estimate**: 2-4 focused GPU days (TMA descriptors, warp-specialized
+   pipeline, NamedBarrier ordering across the persistent M-loop). The
+   ceiling is bounded by §5's f (expander write + GEMM B-read removal);
+   re-run bench_prefill_opportunity.py at the CURRENT serve shapes first
+   — if f moved below ~15%, record the clean negative instead.
+
+Everything else in the kernel surface is DONE as of 2026-07-21: all-integer
+product rungs (ceil-first uneven splits, encoder-anchored), signed S-rung
+decode (CUDA + Triton, GPU battery chained), the M-branch-hoist dispatch
+ops, the mid-M fused niche (opt-in), w2 round-2 schedule (rowpack measured
+negative), and the capture-safe stock-MoE prefill (opt-in).
