@@ -51,7 +51,40 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
 
 for i in $(seq 1 240); do   # up to 20 min (110 GB load + plugin JIT)
   if curl -s http://localhost:8000/v1/models >/dev/null 2>&1; then
-    echo "[serve] READY after $((i*5))s $(date '+%H:%M:%S')"; exit 0; fi
+    echo "[serve] READY after $((i*5))s $(date '+%H:%M:%S')"
+    # --- OOM guards (2026-07-21 box-kill postmortem) ---------------------
+    # The spec+compile serve at util 0.90 left the unified pool with no
+    # evictable slack; ~1.75h of IDLE later, a trivial kernel allocation
+    # tripped a global OOM cascade (EngineCore 143.5 GiB rss incl. mmap'd
+    # weight pages + CUDA pool) and the box needed a power cycle. Guard 1:
+    # fail-fast — if true slack is under MIN_FREE_GIB right after READY,
+    # this config does not fit; stop the serve and say so (a dead serve
+    # beats a dead box). Guard 2: a detached watchdog stops the container
+    # if MemAvailable ever dips below WATCHDOG_GIB while it runs.
+    MIN_FREE_GIB="${MIN_FREE_GIB:-8}"
+    WATCHDOG_GIB="${WATCHDOG_GIB:-4}"
+    sleep 10   # let allocator settle post-READY before judging slack
+    avail_gib=$(awk '/MemAvailable/{printf "%d", $2/1048576}' /proc/meminfo)
+    if [ "$avail_gib" -lt "$MIN_FREE_GIB" ]; then
+      echo "[serve] SLACK GATE FAILED: MemAvailable ${avail_gib} GiB < ${MIN_FREE_GIB} GiB — this config does not fit the box at UTIL=$UTIL. Stopping the serve (lower UTIL or trim the config)."
+      docker rm -f "$NAME" >/dev/null 2>&1
+      exit 3
+    fi
+    echo "[serve] slack gate OK: MemAvailable ${avail_gib} GiB (floor ${MIN_FREE_GIB})"
+    nohup bash -c '
+      while docker ps --format "{{.Names}}" | grep -q "^'"$NAME"'$"; do
+        a=$(awk "/MemAvailable/{printf \"%d\", \$2/1048576}" /proc/meminfo)
+        if [ "$a" -lt '"$WATCHDOG_GIB"' ]; then
+          echo "$(date "+%F %T") WATCHDOG: MemAvailable ${a} GiB < '"$WATCHDOG_GIB"' — stopping '"$NAME"' to save the box" >> '"$LOG"'
+          docker rm -f '"$NAME"' >/dev/null 2>&1
+          exit 0
+        fi
+        sleep 20
+      done' >/dev/null 2>&1 &
+    disown
+    echo "[serve] memory watchdog armed (stop below ${WATCHDOG_GIB} GiB free)"
+    exit 0
+  fi
   if ! docker ps --format '{{.Names}}' | grep -q "^${NAME}$"; then
     echo "[serve] FAILED (container exited)"; docker logs "$NAME" 2>&1 | tail -40; exit 1; fi
   sleep 5
