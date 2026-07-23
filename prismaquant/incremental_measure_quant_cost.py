@@ -1228,6 +1228,30 @@ def main():
             mm_ctx.shutdown()
 
     merge_cost_pickles(shard_paths, Path(args.output))
+    # Coverage gate: every body layer the probe measured must appear in
+    # the merged cost table. A silent hole here flows straight into the
+    # allocation (the allocator only allocates what has costs) and the
+    # export passes the hole through as passthrough bytes.
+    import pickle as _pkl
+    import re as _re
+    with open(args.probe, "rb") as _pf:
+        _probe_stats = _pkl.load(_pf).get("stats", {})
+    with open(args.output, "rb") as _cf:
+        _cost_names = set(_pkl.load(_cf).get("costs", {}))
+    _lay = _re.compile(r"\blayers\.(\d+)\.")
+    def _layers_of(names):
+        out = set()
+        for n in names:
+            m = _lay.search(str(n))
+            if m:
+                out.add(int(m.group(1)))
+        return out
+    _missing = sorted(_layers_of(_probe_stats) - _layers_of(_cost_names))
+    if _missing:
+        print(f"[incremental-cost] FATAL: merged cost table has no entries "
+              f"for probed body layers {_missing} — refusing to hand the "
+              f"allocator a cost table with silent holes.", flush=True)
+        raise SystemExit(2)
     print(f"[incremental-cost] wrote merged cost to {args.output}", flush=True)
 
 

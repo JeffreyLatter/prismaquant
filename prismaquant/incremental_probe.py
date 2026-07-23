@@ -851,6 +851,8 @@ def synthesize_shard_from_linear_cache(
     cache: dict[str, dict[str, Any]],
     expected_meta: dict[str, Any],
     output_path: Path,
+    expected_layers: "frozenset[int] | set[int] | None" = None,
+    layer_prefix: str | None = None,
 ) -> bool:
     """Produce `output_path` by filtering `cache` through the shard's
     include / exclude regexes. Returns True iff any Linear matches
@@ -879,6 +881,24 @@ def synthesize_shard_from_linear_cache(
         selected[name] = stats
     if not selected:
         return False
+    # Layer-completeness gate. "Any Linear matches" is NOT shard
+    # coverage: after a mid-run LAYERS_PER_SHARD change, the pooled
+    # cache can cover a strict subset of this shard's layers (Laguna
+    # 2026-07-23: cache held layers 0-4 of shard [0-6]; the shard was
+    # declared complete and layers 5-6 silently fell out of the probe,
+    # the cost table, and the allocation). A shard may only be
+    # synthesized when EVERY expected layer contributes stats.
+    if expected_layers and layer_prefix:
+        covered = {
+            i for i in expected_layers
+            if any(f"{layer_prefix}{i}." in n for n in selected)
+        }
+        missing = sorted(set(expected_layers) - covered)
+        if missing:
+            print(f"[incremental] synthesize refused: cached stats miss "
+                  f"layers {missing} of this shard — running fresh compute",
+                  flush=True)
+            return False
 
     payload = {
         "stats": selected,
@@ -3365,6 +3385,8 @@ def main():
                     cache=linear_cache,
                     expected_meta=expected_meta,
                     output_path=shard_path,
+                    expected_layers=schedule[shard_idx].layer_indices,
+                    layer_prefix=schedule[shard_idx].layer_prefix,
                 ):
                     annotate_probe_shard(shard_path, expected_meta)
                     print(f"[incremental] synthesize shard {shard_idx} "
@@ -3607,6 +3629,31 @@ def main():
     if visual_probe_path is not None and visual_probe_path.exists():
         all_pickles.append(visual_probe_path)
     merge_probe_pickles(all_pickles, Path(args.output))
+    # Body-coverage gate: a merged probe missing whole layers poisons
+    # every downstream stage silently (cost skips them, the allocator
+    # allocates around them, the export passes them through). Fail
+    # fast here instead.
+    with open(args.output, "rb") as _cf:
+        _cov = pickle.load(_cf)
+    _body_prefix = schedule[0].layer_prefix if len(schedule) else None
+    if _body_prefix:
+        _expected_cov = set()
+        for _e in schedule:
+            if _e.kind == "body":
+                _expected_cov |= set(_e.layer_indices)
+        _covered = set()
+        _pat = re.compile(re.escape(_body_prefix) + r"(\d+)\.")
+        for _n in _cov.get("stats", {}):
+            _m = _pat.search(str(_n))
+            if _m:
+                _covered.add(int(_m.group(1)))
+        _missing_cov = sorted(_expected_cov - _covered)
+        if _missing_cov:
+            print(f"[incremental] FATAL: merged probe has NO stats for "
+                  f"body layers {_missing_cov} — refusing to write a "
+                  f"probe that would silently drop them downstream.",
+                  flush=True)
+            raise SystemExit(2)
     # Annotate the merged pickle with the calibration modality so
     # run-pipeline.sh's reuse guard (and any downstream tooling) can
     # reject a stale probe whose activations don't match the currently
