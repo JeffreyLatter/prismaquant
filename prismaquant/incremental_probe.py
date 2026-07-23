@@ -889,9 +889,13 @@ def synthesize_shard_from_linear_cache(
     # the cost table, and the allocation). A shard may only be
     # synthesized when EVERY expected layer contributes stats.
     if expected_layers and layer_prefix:
+        # Profiles return the prefix both with and without the trailing
+        # dot ('model.layers' vs 'model.layers.') — normalize before
+        # building name probes or every membership test silently fails.
+        _lp = layer_prefix.rstrip(".") + "."
         covered = {
             i for i in expected_layers
-            if any(f"{layer_prefix}{i}." in n for n in selected)
+            if any(f"{_lp}{i}." in n for n in selected)
         }
         missing = sorted(set(expected_layers) - covered)
         if missing:
@@ -3642,7 +3646,8 @@ def main():
             if _e.kind == "body":
                 _expected_cov |= set(_e.layer_indices)
         _covered = set()
-        _pat = re.compile(re.escape(_body_prefix) + r"(\d+)\.")
+        _pat = re.compile(
+            re.escape(_body_prefix.rstrip(".") + ".") + r"(\d+)\.")
         for _n in _cov.get("stats", {}):
             _m = _pat.search(str(_n))
             if _m:
