@@ -47,7 +47,8 @@ against. Changes to it require a served A/B, not a preference.
 | Decode M≤16, MoE | grouped CUDA GEMVs + deterministic combine | DEFAULT |
 | Prefill dense fp8-CB | `cb_expand_fp8` (direct e4m3 bytes) → stock cutlass W8A8 | DEFAULT |
 | Prefill dense fp4-CB | Triton v2 expand (bf16, composed scales) → cuBLAS | DEFAULT |
-| Prefill MoE | per-expert loop (one host sync) | DEFAULT |
+| Prefill MoE fp8-CB | 'stock': CUDA-expand chunks (raw views, no pad) → vLLM fused-MoE grouped kernel; chunk 256 | DEFAULT (2026-07-23, 5.5–8.8× the loop on Laguna-256E; serve with `--max-num-batched-tokens 16384` + slack-gated util) |
+| Prefill MoE fp4-CB | per-expert loop (one host sync) | DEFAULT until stock's bf16-expand variant is measured |
 | Dispatch | M-branch-hoist opaque custom ops (layer registry) | DEFAULT |
 | Mid-M 17–128 fp8-CB | CUTLASS fused decode-in-prologue | OPT-IN until served logprob A/B |
 | Large-M fused | persistent-N §4b (CUTLASS restructure) | ROADMAP (GO recorded; 2–4 GPU days) |
