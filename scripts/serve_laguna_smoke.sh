@@ -34,11 +34,16 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -v /home/rob/prismaquant:/repo \
   -v /home/rob/dq-runs:/dqruns \
   -e VLLM_LOGGING_LEVEL=INFO \
+  -e VLLM_TORCH_PROFILER_DIR=/dqruns/laguna-s21/profiles \
+  -e VLLM_SERVER_DEV_MODE=1 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e PQ_MODEL="$MODEL" -e PQ_MAXLEN="$MAXLEN" -e PQ_UTIL="$UTIL" \
   -e PQ_EXTRA="$EXTRA_ARGS" \
   -e PRISMAQUANT_CB_DISPATCH="${PRISMAQUANT_CB_DISPATCH:-}" \
   -e PRISMAQUANT_CB_DECODE_CONTRACT="${PRISMAQUANT_CB_DECODE_CONTRACT:-}" \
+  -e PRISMAQUANT_CB_PREFILL="${PRISMAQUANT_CB_PREFILL:-}" \
+  -e PRISMAQUANT_CB_PREFILL_TIMING="${PRISMAQUANT_CB_PREFILL_TIMING:-}" \
+  -e PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK="${PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK:-}" \
   --entrypoint bash vllm-node:latest -c '
     cp -r /repo/plugins/gridbook /gb_snap
     pip install -e /gb_snap --no-deps -q 2>/dev/null
