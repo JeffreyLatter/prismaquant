@@ -263,6 +263,9 @@ __global__ __launch_bounds__(kThreads) void cb_persistent_tc_kernel(
       }
       __syncthreads();
     }
+    // Teardown hygiene: no cp.async group may be outstanding when the CTA
+    // retires (the final empty commit group otherwise stays in flight).
+    __pipeline_wait_prior(0);
     __syncthreads();
   }
 }
@@ -281,6 +284,15 @@ torch::Tensor cb_prefill_persistent_tc(
   TORCH_CHECK(type_size == 4 * k_bits && type_size <= 192);
   TORCH_CHECK(packed.dim() == 2 && packed.size(0) == N &&
               packed.stride(1) == 1);
+  // The LUT must cover all four sub-tables: 4 * 2^(k/4) u16 pairs for the
+  // even splits this kernel serves. An undersized table turns into silent
+  // out-of-bounds __ldg on unified memory — a UVM fault-state hazard (the
+  // suspected wedge mechanism from the 2026-07-23 undersized-test runs).
+  TORCH_CHECK(k_bits % 4 == 0, "persistent-TC v1 serves even splits only");
+  const int64_t need_bytes = 4 * (int64_t(1) << (k_bits / 4)) * 2;
+  TORCH_CHECK(cb_flat_fp8.numel() >= need_bytes,
+              "codebook too small: need ", need_bytes, " bytes for K",
+              k_bits, ", got ", cb_flat_fp8.numel());
   const int64_t M = a.size(0);
   const c10::cuda::OptionalCUDAGuard guard(a.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -300,7 +312,8 @@ torch::Tensor cb_prefill_persistent_tc(
   const int grid = std::min(n_tiles, sm_count);
 
   pq_ptc::cb_persistent_tc_kernel<<<grid, pq_ptc::kThreads, smem, stream>>>(
-      a.data_ptr<uint8_t>(), packed.data_ptr<uint8_t>(),
+      reinterpret_cast<const uint8_t*>(a.data_ptr()),
+      packed.data_ptr<uint8_t>(),
       reinterpret_cast<const uint16_t*>(cb_flat_fp8.data_ptr()),
       reinterpret_cast<uint16_t*>(d.data_ptr()),
       M, N, K, packed.stride(0), (int)k_bits, (int)type_size);

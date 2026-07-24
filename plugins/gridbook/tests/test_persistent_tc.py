@@ -28,8 +28,12 @@ def _mk(N, K, kbits, M, seed=0):
     rb = K // 256 * tsize
     packed = torch.randint(0, 255, (N, rb), dtype=torch.uint8,
                            device="cuda", generator=g)
-    cb = torch.randint(0, 255, (1 << 14,), dtype=torch.uint8,
-                       device="cuda", generator=g)
+    # valid e4m3 values only — random BYTES would include NaN codes
+    # (0x7f/0xff) and poison both the kernel and the reference equally.
+    # Size by rung: 4 sub-tables x 2^(k/4) entries x 2 bytes (even splits).
+    cb_bytes = 4 * (1 << (kbits // 4)) * 2
+    cb = (torch.randn((cb_bytes,), device="cuda", generator=g) * 0.1).to(
+        torch.float8_e4m3fn).view(torch.uint8)
     a = (torch.randn(M, K, device="cuda", generator=g) * 0.05).to(
         torch.float8_e4m3fn)
     return a, packed, cb, tsize

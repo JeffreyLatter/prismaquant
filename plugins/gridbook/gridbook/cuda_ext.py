@@ -82,6 +82,12 @@ def get_persistent_ext():
     if _ptc_tried:
         return _ptc
     _ptc_tried = True
+    # QUARANTINE (2026-07-23): a boot wedged minutes after this kernel's
+    # bench container exited; until the canary ladder clears it, the ext
+    # builds only on explicit opt-in.
+    if os.environ.get("PRISMAQUANT_ENABLE_PTC") != "1":
+        _ptc = None
+        return None
     try:
         import torch  # noqa: F401
         from torch.utils.cpp_extension import load
