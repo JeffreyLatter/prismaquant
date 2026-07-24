@@ -102,6 +102,7 @@ DEVINL void decode_resident_b(
 //   [0, kTileN*K)                       resident decoded B
 //   [bOff, bOff + 2*kTileM*kKChunk)     A double-buffer stages
 // --------------------------------------------------------------------------
+template <bool kLdsmA>
 __global__ __launch_bounds__(kThreads) void cb_persistent_tc_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ packed,
     const uint16_t* __restrict__ lut16, uint16_t* __restrict__ D,
@@ -227,9 +228,23 @@ __global__ __launch_bounds__(kThreads) void cb_persistent_tc_kernel(
           auto sB_k1 = local_tile(sB_t, Shape<_8, _32>{},
                                   make_coord(1, kt * (kKChunk / 32) + ks));
 
-          auto tCsA = thr_mma.partition_A(sA_k);
-          auto tCrA = thr_mma.make_fragment_A(tCsA);
-          copy(tCsA, tCrA);
+          auto tCrA = thr_mma.partition_fragment_A(sA_k);
+          if constexpr (kLdsmA) {
+            // v2: ldmatrix.x4 A loads — one 128-bit LDSM per thread per
+            // 8x16B matrix quad instead of scalar LDS.8 per element. The
+            // plain row-major stage keeps every lane's 16 B segment
+            // 16-aligned (kKChunk=64 rows, 32 B k-steps); bank conflicts
+            // without a swizzle are accepted for v2 (measured next).
+            auto ldsm_copy = make_tiled_copy_A(
+                Copy_Atom<SM75_U32x4_LDSM_N, float_e4m3_t>{}, tiled_mma);
+            auto thr_ldsm = ldsm_copy.get_thread_slice(threadIdx.x);
+            auto tXsA = thr_ldsm.partition_S(sA_k);
+            auto tXrA = thr_ldsm.retile_D(tCrA);
+            copy(ldsm_copy, tXsA, tXrA);
+          } else {
+            auto tCsA = thr_mma.partition_A(sA_k);
+            copy(tCsA, tCrA);
+          }
 
           auto tCsB0 = thr_mma.partition_B(sB_k0);
           auto tCrB0 = thr_mma.make_fragment_B(tCsB0);
@@ -275,7 +290,8 @@ __global__ __launch_bounds__(kThreads) void cb_persistent_tc_kernel(
 // ---------------------------------------------------------------------------
 torch::Tensor cb_prefill_persistent_tc(
     torch::Tensor a, torch::Tensor packed, torch::Tensor cb_flat_fp8,
-    int64_t N, int64_t K, int64_t k_bits, int64_t type_size) {
+    int64_t N, int64_t K, int64_t k_bits, int64_t type_size,
+    int64_t variant) {
   TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(packed.is_cuda() && packed.scalar_type() == torch::kUInt8);
   TORCH_CHECK(cb_flat_fp8.scalar_type() == torch::kUInt8);
@@ -301,9 +317,11 @@ torch::Tensor cb_prefill_persistent_tc(
   const size_t bBytes = ((size_t)pq_ptc::kTileN * (size_t)K + 15) & ~size_t(15);
   const size_t smem = bBytes + 2 * (size_t)pq_ptc::kTileM * pq_ptc::kKChunk;
   TORCH_CHECK(smem <= 99 * 1024, "smem plan exceeds sm120 budget: K too large");
+  const auto* kfn = (variant == 2)
+      ? (const void*)pq_ptc::cb_persistent_tc_kernel<true>
+      : (const void*)pq_ptc::cb_persistent_tc_kernel<false>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
-      (const void*)pq_ptc::cb_persistent_tc_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+      kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
 
   int sm_count = 0;
   C10_CUDA_CHECK(cudaDeviceGetAttribute(
@@ -311,7 +329,10 @@ torch::Tensor cb_prefill_persistent_tc(
   const int n_tiles = (int)((N + pq_ptc::kTileN - 1) / pq_ptc::kTileN);
   const int grid = std::min(n_tiles, sm_count);
 
-  pq_ptc::cb_persistent_tc_kernel<<<grid, pq_ptc::kThreads, smem, stream>>>(
+  const auto launch = (variant == 2)
+      ? &pq_ptc::cb_persistent_tc_kernel<true>
+      : &pq_ptc::cb_persistent_tc_kernel<false>;
+  launch<<<grid, pq_ptc::kThreads, smem, stream>>>(
       reinterpret_cast<const uint8_t*>(a.data_ptr()),
       packed.data_ptr<uint8_t>(),
       reinterpret_cast<const uint16_t*>(cb_flat_fp8.data_ptr()),
@@ -323,5 +344,10 @@ torch::Tensor cb_prefill_persistent_tc(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cb_prefill_persistent_tc", &cb_prefill_persistent_tc,
-        "Persistent-N FP8_CB prefill, tensor-core phase-2 (D unscaled bf16)");
+        "Persistent-N FP8_CB prefill, tensor-core phase-2 (D unscaled bf16); "
+        "variant: 1=scalar-copy v1, 2=ldmatrix-A v2",
+        pybind11::arg("a"), pybind11::arg("packed"),
+        pybind11::arg("cb_flat_fp8"), pybind11::arg("N"), pybind11::arg("K"),
+        pybind11::arg("k_bits"), pybind11::arg("type_size"),
+        pybind11::arg("variant") = 1);
 }

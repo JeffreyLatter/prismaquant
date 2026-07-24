@@ -40,10 +40,11 @@ def _mk(N, K, kbits, M, seed=0):
 
 
 @pytest.mark.skipif(not cuda_ok, reason="needs CUDA")
+@pytest.mark.parametrize("variant", [1, 2])
 @pytest.mark.parametrize("kbits", [36, 40, 44, 48])
 @pytest.mark.parametrize("shape", [(256, 1024, 512), (2048, 3072, 1400),
                                    (192, 3072, 300)])
-def test_persistent_tc_parity(kbits, shape):
+def test_persistent_tc_parity(kbits, shape, variant):
     N, K, M = shape
     ext, ptc = get_ext(), get_persistent_ext()
     if ext is None or ptc is None:
@@ -51,7 +52,8 @@ def test_persistent_tc_parity(kbits, shape):
     a, packed, cb, tsize = _mk(N, K, kbits, M)
     offs = torch.zeros(N, dtype=torch.int32, device="cuda")
 
-    d = ptc.cb_prefill_persistent_tc(a, packed, cb, N, K, kbits, tsize)
+    d = ptc.cb_prefill_persistent_tc(a, packed, cb, N, K, kbits, tsize,
+                                     variant=variant)
     w = ext.cb_expand_fp8(packed, cb, offs, N, K, kbits, 4, tsize)
     ref = a.float() @ w.float().t()
 
@@ -79,6 +81,10 @@ def bench():  # pragma: no cover
             torch.cuda.synchronize()
             return (time.time() - t0) / rep
 
+        for variant in (1, 2):
+            t_v = t(lambda: ptc.cb_prefill_persistent_tc(
+                a, packed, cb, N, K, kbits, tsize, variant=variant))
+            print(f"  v{variant}: {t_v*1e3:6.1f} ms")
         t_ptc = t(lambda: ptc.cb_prefill_persistent_tc(
             a, packed, cb, N, K, kbits, tsize))
         def serial():
