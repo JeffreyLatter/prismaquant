@@ -55,6 +55,7 @@ against. Changes to it require a served A/B, not a preference.
 | Large-M fused dense | persistent-N self-contained TC kernel | MEASURED NEGATIVE (2026-07-26): parity-green but 2–5.7× slower than expand+fork at 27B shapes; the CUDA expander shrank the dense expand tax to ~10%, killing the original opportunity. Kernel kept quarantined (PRISMAQUANT_ENABLE_PTC=1) as the schedule reference. |
 | Large-M fused MoE | persistent/grouped decode-in-mainloop | ROADMAP — the fat target (expand ≈ 35% of Laguna MoE layer time; f ≈ 50%) |
 | MoE prefill alts | stock-kernel (capture-safe) / batched | OPT-IN |
+| l2_pipeline (per-expert L2-pinned scratch) | wedged live serving 3× (stream/capture context + device-wide sync on hot path; serial variant still wedges) | DIAGNOSTIC-ONLY — L2-residency hypothesis unmeasured; excluded from auto candidates |
 | w2 rowpack, damp sweep, … | measured negative | ARCHIVED behind env switches |
 
 - Decode contract v2 (scale-epilogue hoist): MEASURED NULL on served 27B
