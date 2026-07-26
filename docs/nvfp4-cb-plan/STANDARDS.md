@@ -50,7 +50,7 @@ against. Changes to it require a served A/B, not a preference.
 | Prefill MoE fp8-CB | 'stock': CUDA-expand chunks (raw views, no pad) → vLLM fused-MoE grouped kernel; chunk 256 | DEFAULT (2026-07-23, 5.5–8.8× the loop on Laguna-256E; serve with `--max-num-batched-tokens 16384` + slack-gated util) |
 | Prefill MoE fp4-CB | per-expert loop (one host sync) | DEFAULT until stock's bf16-expand variant is measured |
 | Dispatch | M-branch-hoist opaque custom ops (layer registry) | DEFAULT |
-| Mid-M 17–128 fp8-CB | CUTLASS fused decode-in-prologue | OPT-IN until served logprob A/B |
+| Mid-M 17–128 fp8-CB | CUTLASS fused decode-in-prologue, fp32 EVT scale epilogue | DEFAULT (promoted 2026-07-26: 1.40× in-niche; conf-KL-vs-teacher gate 0.00305/99.83% ON vs 0.00324/99.88% OFF at forced-96 microbatching — preserved; 4-ulp cutlass_scaled_mm agreement) |
 | Large-M fused dense | persistent-N self-contained TC kernel | MEASURED NEGATIVE (2026-07-26): parity-green but 2–5.7× slower than expand+fork at 27B shapes; the CUDA expander shrank the dense expand tax to ~10%, killing the original opportunity. Kernel kept quarantined (PRISMAQUANT_ENABLE_PTC=1) as the schedule reference. |
 | Large-M fused MoE | persistent/grouped decode-in-mainloop | ROADMAP — the fat target (expand ≈ 35% of Laguna MoE layer time; f ≈ 50%) |
 | MoE prefill alts | stock-kernel (capture-safe) / batched | OPT-IN |
