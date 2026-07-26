@@ -367,8 +367,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     and cache the argmin. No shape heuristic, no model table — the
         #     regression above is exactly the kind of model-dependent crossover
         #     that a static default cannot express.
+        # fp8-CB default: 'auto' — measured per-layer selection over stock +
+        # grouped_fused at every rung-feasible TileM (cuda-event timing on
+        # the first qualifying prefill, cached; deterministic stock output
+        # on the tuning call). Two-model gate 2026-07-26: 35B 4,405 vs best
+        # fixed 4,285; Laguna-class 2,063 vs best fixed 1,821 — auto >= best
+        # fixed mode on both. Composed paths are individually KL-gated.
         mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
-            "stock" if not self.is_fp4 else "loop")
+            "auto" if not self.is_fp4 else "loop")
         if mode == "auto":
             return self._apply_prefill_auto(
                 layer, x, topk_weights, topk_ids, act)
@@ -790,6 +796,362 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         out = torch.zeros((T + 1, Kh), dtype=x.dtype, device=dev)
         out.index_add_(0, dest, y.to(out.dtype))
         return out[:T]
+
+    # -- prefill: L2-resident rotating scratch (round 4) --------------------
+    def _l2_ok(self, layer) -> bool:
+        """Eligibility for the L2 pipeline (cached per layer; the answer never
+        changes after load). Requirements, each a silent fall-through:
+
+          * fp8-CB — the path decodes to native e4m3 bytes and feeds
+            ``cutlass_scaled_mm``, the same W8A8 GEMM class the dense path
+            trusts; fp4-CB has no faithful packed-NVFP4 transient (see
+            ``_apply_prefill_stock``).
+          * per-(expert,out) weight scales present (the GEMM's b_scales).
+          * K % SUPERBLOCK on both projections (the expander's own constraint).
+          * 3-D stacked qweights whose ``[c0:c1]`` slice is a CONTIGUOUS view,
+            so the decode reads a raw slice with no pad and no copy — the same
+            property ``_expand_stack_slice`` relies on.
+          * an extension build carrying ``cb_expand_fp8_into``: the allocating
+            expander cannot be used here (a fresh allocation lands outside the
+            pinned address range), and an older build must degrade to stock.
+        """
+        ok = getattr(layer, "_cb_l2_ok", None)
+        if ok is not None:
+            return ok
+        ok = (not self.is_fp4
+              and self.n_sub == 4
+              and hasattr(layer, "w13_weight_scale")
+              and layer._cb_hidden % codec.SUPERBLOCK == 0
+              and layer._cb_inter % codec.SUPERBLOCK == 0)
+        if ok:
+            for which, in_f in (("w13", layer._cb_hidden),
+                                ("w2", layer._cb_inter)):
+                qw = getattr(layer, f"{which}_cb_qweight")
+                rb = _row_bytes(in_f, self.type_size)
+                ok = ok and (qw.dim() == 3 and qw.stride(2) == 1
+                             and qw.stride(1) == rb and qw.shape[2] == rb
+                             and qw.stride(0) == qw.shape[1] * rb)
+        if ok:
+            from . import ops as pq_ops
+            ok = pq_ops.cb_expand_fp8_into_available()
+        if ok:
+            try:
+                from vllm import _custom_ops as vllm_ops  # noqa: F401
+                ok = hasattr(vllm_ops, "cutlass_scaled_mm")
+            except Exception:  # noqa: BLE001 — treat as "not offered"
+                ok = False
+        layer._cb_l2_ok = bool(ok)
+        return layer._cb_l2_ok
+
+    @staticmethod
+    def _l2_ext_call(name, *args, default=None):
+        """Call an OPTIONAL L2 binding. The window API ships independently of
+        the expander, so every one of these is getattr+try guarded: an older
+        extension must mean 'no L2 lever', never a crashed serve."""
+        try:
+            from .cuda_ext import get_ext
+            ext = get_ext()
+            fn = getattr(ext, name, None) if ext is not None else None
+            if fn is None:
+                return default
+            return fn(*args)
+        except Exception:  # noqa: BLE001 — an absent/failing knob is not fatal
+            return default
+
+    def _l2_plan(self, layer):
+        """The rotating-pair plan for this layer, cached on it.
+
+        The cap is DERIVED (``moe_l2.cb_l2_cap_bytes``) from what the device
+        reports for persisting L2, halved because the pinned window must cover
+        BOTH halves of the arena; ``torch.cuda``'s L2 size is the fallback when
+        the extension predates the query. ``PRISMAQUANT_CB_L2_WINDOW_MB``
+        overrides the per-half cap for bisection only. The expert tile is sized
+        on the LARGER projection (w13's ``2*inter*hidden``), because one arena
+        serves both stages.
+        """
+        plan = getattr(layer, "_cb_l2_plan", "unset")
+        if plan != "unset":
+            return plan
+        persist = self._l2_ext_call("l2_persisting_max_bytes", default=None)
+        if not persist:
+            try:
+                props = torch.cuda.get_device_properties(
+                    layer.w13_cb_qweight.device)
+                persist = int(getattr(props, "L2_cache_size", 0) or 0)
+            except Exception:  # noqa: BLE001
+                persist = 0
+        cap = cb_l2_cap_bytes(
+            persist,
+            env_mb=os.environ.get("PRISMAQUANT_CB_L2_WINDOW_MB"),
+            max_window_bytes=self._l2_ext_call("l2_max_window_bytes",
+                                               default=None))
+        force = os.environ.get("PRISMAQUANT_CB_L2_GROUP")
+        expert_bytes = max(2 * layer._cb_inter * layer._cb_hidden,
+                           layer._cb_hidden * layer._cb_inter)   # e4m3 = 1 B
+        plan = cb_l2_plan(layer._cb_E, expert_bytes, cap,
+                          force_group=int(force) if force else None)
+        layer._cb_l2_plan = plan
+        return plan
+
+    def _l2_arena(self, layer, plan):
+        """Allocate the arena ONCE per layer and cache it on the layer.
+
+        ONE contiguous e4m3 block; the two halves are slices of it, so a SINGLE
+        pinning window covers both (a persisting window is one address range per
+        stream — two separate allocations could not both be covered). It is
+        never freed: re-allocating per forward would move the address out from
+        under the pinned window and would also churn the caching allocator
+        across streams.
+        """
+        buf = getattr(layer, "_cb_l2_scratch", None)
+        if buf is None or buf.numel() < plan.arena_bytes:
+            buf = torch.empty(plan.arena_bytes, dtype=torch.float8_e4m3fn,
+                              device=layer.w13_cb_qweight.device)
+            layer._cb_l2_scratch = buf
+        return buf
+
+    def _l2_stream(self):
+        if not hasattr(self, "_l2_side_stream"):
+            self._l2_side_stream = torch.cuda.Stream()
+        return self._l2_side_stream
+
+    def _l2_pin(self, arena, nbytes, streams) -> bool:
+        """Pin the arena as a persisting-access window on EVERY stream that
+        touches it. The window is a per-STREAM attribute, so pinning only the
+        main stream would leave the side stream's decode writes streaming past
+        L2 — exactly the traffic this round exists to keep resident."""
+        ok = True
+        for s in streams:
+            with torch.cuda.stream(s):
+                ok = bool(self._l2_ext_call(
+                    "l2_pin_region", arena, int(nbytes), default=False)) and ok
+        return ok
+
+    def _l2_unpin(self, streams) -> None:
+        """Release the window on both streams. Per-layer pin/unpin rather than
+        pin-once: the attribute is global to the stream, so a layer that left
+        its arena pinned would deny the window to the next layer's (different)
+        arena for the rest of the forward."""
+        for s in streams:
+            with torch.cuda.stream(s):
+                self._l2_ext_call("l2_unpin")
+
+    def _apply_prefill_l2_pipeline(self, layer, x, topk_weights, topk_ids,
+                                   act):
+        """ROUND 4: decode into an L2-PINNED rotating scratch pair
+        (``PRISMAQUANT_CB_PREFILL=l2_pipeline``). Returns ``None`` on any
+        constraint miss so the caller falls through to 'stock'.
+
+        WHAT IT REMOVES. Rounds 1-3 attacked launch count and tile redundancy.
+        What is left on a large-expert MoE is the decoded-weight ROUND TRIP: the
+        stock path writes each expert's ``N_e x K`` e4m3 tile to HBM and the very
+        next kernel reads it back (~17 ms of ~42 ms/layer). Here the decode
+        writes into one half of a small, address-stable arena held in L2 by a
+        persisting-access window, and the GEMM reads that half back — ideally
+        out of L2. The bytes are the SAME bytes (same expander), so this is a
+        placement change, not a numerics change.
+
+        UNIT SEQUENCE. The work is a flat list of DECODE UNITS, two per live
+        expert group: ``[(g0,w13), (g0,w2), (g1,w13), (g1,w2), ...]``. Unit ``u``
+        decodes into ``arena[u % 2]``, so the alternation is uniform across the
+        stage boundary and the event proof below does not have to special-case
+        it. Groups no token routed to are dropped from the list using only the
+        E+1 offsets the routing already fetched (``cb_l2_live_groups``), so an
+        empty group costs neither a launch nor window residency.
+
+        EVENT STRUCTURE (a missed dependency here is a silent WRONG ANSWER, not
+        a crash, so it is spelled out). Two event pairs, indexed by buffer:
+
+          * ``dec_done[i]`` recorded on the SIDE stream after the decode that
+            fills buffer ``i``; the MAIN stream waits on it before any GEMM that
+            reads buffer ``i``  — RAW (produce-then-consume).
+          * ``gemm_done[i]`` recorded on the MAIN stream after the LAST GEMM
+            that reads buffer ``i``; the SIDE stream waits on it before the next
+            decode that overwrites buffer ``i`` — WAR (the reuse hazard, and the
+            one a naive double-buffer forgets).
+
+        The loop issues the decode of unit ``u+1`` (into buffer ``j=(u+1)%2``)
+        BEFORE the GEMMs of unit ``u`` (buffer ``i=u%2``) — that is the whole
+        overlap. Buffer ``j`` was last read by unit ``u-1``, so the side stream
+        first waits ``gemm_done[j]`` (skipped at ``u==0``, where nothing has read
+        it yet). ``side.wait_stream(main)`` at entry orders the first decode
+        after the routing/QDQ prologue AND after any prior layer's use of this
+        arena; ``main.wait_stream(side)`` at exit leaves no side-stream work
+        outstanding when the arena's next user arrives.
+
+        NUMERICS. Weight bytes are bit-identical to stock (same expander kernel,
+        same packed rows, only the destination differs). Activations use the
+        stock path's own per-token fp8 dynamic QDQ on the input AND the
+        intermediate (a per-row op, so gather-after-quant == quant-after-gather
+        bit-exactly). ``cutlass_scaled_mm`` applies per-token a_scales and
+        per-channel b_scales in its fp32 EVT epilogue and rounds ONCE to bf16 —
+        the promoted rounding order, the same one the dense fp8 path ships. Only
+        the GEMM accumulation and the cross-expert combine reassociate
+        (REASSOCIATION-CLASS, the suite's 2e-2 contract).
+
+        FALL-THROUGH. ``None`` (-> stock) when the format/build gate misses, or
+        when the LARGEST expert tile exceeds the derived per-half cap: no
+        rotation of that pair could keep a tile resident, so paying the
+        pipeline's bookkeeping would be dishonest. If ``l2_pin_region`` reports
+        the window unavailable we still RUN (rather than fall through): the
+        rotating pair is a real structural change on its own — bounded transient,
+        decode/GEMM overlap — and the R3 tuner is what decides whether it wins.
+        Falling through there would hide a candidate the tuner exists to judge.
+        """
+        if not self._l2_ok(layer):
+            return None
+        plan = self._l2_plan(layer)
+        if plan is None:                     # tile > window cap, or no window
+            return None
+
+        from vllm import _custom_ops as vllm_ops
+        from vllm.platforms import current_platform
+        from vllm.model_executor.layers.fused_moe.utils import (
+            moe_kernel_quantize_input,
+        )
+        from . import ops as pq_ops
+
+        E = layer._cb_E
+        T = x.shape[0]
+        top_k = topk_ids.shape[-1]
+        dev = x.device
+        Kh = layer._cb_hidden
+        inter = layer._cb_inter
+        N1 = 2 * inter
+        d = N1 // 2
+        lut = self._stock_cb_flat_fp8(layer)
+        fp8_dtype = current_platform.fp8_dtype()
+
+        # ---- routing: R1's construction verbatim (ONE host sync) -----------
+        pair_expert = topk_ids.reshape(-1).to(torch.long)
+        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
+            .repeat_interleave(top_k)
+        order = torch.argsort(pair_expert, stable=True)          # STABLE
+        ptok_sorted = pair_token[order]
+        pw_sorted = topk_weights.reshape(-1)[order]
+        counts = torch.bincount(pair_expert, minlength=E)
+        bounds = torch.cat([counts.new_zeros(1),
+                            torch.cumsum(counts, 0)]).tolist()   # THE one sync
+
+        live = cb_l2_live_groups(plan.groups, bounds)
+        out = torch.zeros_like(x)
+        if not live:
+            return out
+
+        # ---- input activation QDQ, ONCE over all token rows ----------------
+        a1, a1s = moe_kernel_quantize_input(
+            x, None, fp8_dtype, per_act_token_quant=True)
+        a1s = a1s.reshape(-1, 1).to(torch.float32)
+
+        arena = self._l2_arena(layer, plan)
+        halves = [arena[:plan.buffer_bytes],
+                  arena[plan.buffer_bytes:2 * plan.buffer_bytes]]
+        main = torch.cuda.current_stream()
+        side = self._l2_stream()
+        streams = (main, side)
+        # Row-offset vector for the expander: zeros, one per decoded row, sized
+        # once for the worst unit and sliced — allocating it per unit would put
+        # a fresh H2D-shaped allocation on the hot path for a constant.
+        row0 = getattr(layer, "_cb_l2_row0", None)
+        max_rows = plan.group_size * max(N1, Kh)
+        if row0 is None or row0.numel() < max_rows:
+            row0 = torch.zeros(max_rows, dtype=torch.int32, device=dev)
+            layer._cb_l2_row0 = row0
+
+        units = []
+        for e0, e1, p0, p1 in live:
+            units.append(("w13", e0, e1, p0, p1))
+            units.append(("w2", e0, e1, p0, p1))
+
+        def _decode(unit, buf_idx):
+            which, e0, e1, _p0, _p1 = unit
+            n_e = e1 - e0
+            out_f = N1 if which == "w13" else Kh
+            in_f = Kh if which == "w13" else inter
+            rows = n_e * out_f
+            packed = getattr(layer, f"{which}_cb_qweight")[e0:e1]
+            pq_ops.cb_expand_fp8_into(
+                halves[buf_idx], packed.reshape(rows, -1), lut,
+                row0[:rows], rows, in_f, self.k, self.n_sub, self.type_size)
+
+        def _weights(unit, buf_idx):
+            which, e0, e1, _p0, _p1 = unit
+            n_e = e1 - e0
+            out_f = N1 if which == "w13" else Kh
+            in_f = Kh if which == "w13" else inter
+            return halves[buf_idx][:n_e * out_f * in_f].view(n_e, out_f, in_f)
+
+        dec_done = [torch.cuda.Event() for _ in range(2)]
+        gemm_done = [torch.cuda.Event() for _ in range(2)]
+        pinned = False
+        try:
+            pinned = self._l2_pin(arena, plan.arena_bytes, streams)
+            side.wait_stream(main)               # arena free; prologue visible
+
+            def _decode_on(u, b):
+                with torch.cuda.stream(side):
+                    _decode(units[u], b)
+                dec_done[b].record(side)
+
+            _decode_on(0, 0)
+            group_a2 = None
+            for u, unit in enumerate(units):
+                i = u % 2
+                main.wait_event(dec_done[i])     # RAW: decode -> GEMM
+                if u + 1 < len(units):
+                    j = (u + 1) % 2
+                    if u >= 1:
+                        # WAR: buffer j was last READ by unit u-1.
+                        side.wait_event(gemm_done[j])
+                    _decode_on(u + 1, j)
+
+                which, e0, e1, _p0, _p1 = unit
+                W = _weights(unit, i)
+                if which == "w13":
+                    group_a2 = []
+                    for e in range(e0, e1):
+                        q0, q1 = bounds[e], bounds[e + 1]
+                        if q1 == q0:
+                            group_a2.append(None)
+                            continue
+                        rows = ptok_sorted[q0:q1]
+                        ae = a1.index_select(0, rows).contiguous()
+                        ase = a1s.index_select(0, rows).contiguous()
+                        gate_up = vllm_ops.cutlass_scaled_mm(
+                            ae, W[e - e0].t(), ase,
+                            layer.w13_weight_scale[e].reshape(1, N1).to(
+                                torch.float32),
+                            torch.bfloat16)
+                        a = torch.empty((gate_up.shape[0], d),
+                                        dtype=gate_up.dtype, device=dev)
+                        apply_moe_activation(act, a, gate_up)
+                        del gate_up
+                        a2, a2s = moe_kernel_quantize_input(
+                            a, None, fp8_dtype, per_act_token_quant=True)
+                        group_a2.append((a2.contiguous(),
+                                         a2s.reshape(-1, 1).to(torch.float32)))
+                else:
+                    for e in range(e0, e1):
+                        q0, q1 = bounds[e], bounds[e + 1]
+                        got = group_a2[e - e0]
+                        if got is None:
+                            continue
+                        a2, a2s = got
+                        y = vllm_ops.cutlass_scaled_mm(
+                            a2, W[e - e0].t(), a2s,
+                            layer.w2_weight_scale[e].reshape(1, Kh).to(
+                                torch.float32),
+                            torch.bfloat16)
+                        rows = ptok_sorted[q0:q1]
+                        y = y * pw_sorted[q0:q1, None].to(y.dtype)
+                        out.index_add_(0, rows, y.to(out.dtype))
+                    group_a2 = None
+                gemm_done[i].record(main)        # WAR release for buffer i
+            main.wait_stream(side)               # nothing outstanding on side
+        finally:
+            if pinned:
+                self._l2_unpin(streams)
+        return out
 
     # -- prefill: MEASURED per-layer path selection -------------------------
     def _prefill_candidates(self, layer, x, topk_weights, topk_ids, act):

@@ -47,7 +47,7 @@ against. Changes to it require a served A/B, not a preference.
 | Decode M≤16, MoE | grouped CUDA GEMVs + deterministic combine | DEFAULT |
 | Prefill dense fp8-CB | `cb_expand_fp8` (direct e4m3 bytes) → stock cutlass W8A8 | DEFAULT |
 | Prefill dense fp4-CB | Triton v2 expand (bf16, composed scales) → cuBLAS | DEFAULT |
-| Prefill MoE fp8-CB | 'stock': CUDA-expand chunks → vLLM fused-MoE Triton kernel | DEFAULT (grouped_fused promotion REVERTED same day: won 35B +9% w/ KL gate, regressed Laguna 1,503 vs 1,821 — per-M-tile decode redundancy scales with expert size; two-model ladder rule enforced) |
+| Prefill MoE fp8-CB | 'auto': measured per-layer selection over stock + grouped_fused × rung-feasible TileM (first-prefill cuda-event timing, cached; deterministic tuning-call output) | DEFAULT (2026-07-26 two-model gate: 35B 4,405 vs best-fixed 4,285; Laguna-class 2,063 vs best-fixed 1,821 — auto ≥ best fixed on both; composed paths individually KL-gated) |
 | Prefill MoE fp8-CB alt | 'grouped_fused': tile-indexed grouped decode-in-prologue (no weight expansion) | OPT-IN — wins small-expert MoE (35B-class); loses large-expert (Laguna-class). End state: measured per-layer auto-select |
 | Prefill MoE fp4-CB | per-expert loop (one host sync) | DEFAULT until stock's bf16-expand variant is measured |
 | Dispatch | M-branch-hoist opaque custom ops (layer registry) | DEFAULT |
