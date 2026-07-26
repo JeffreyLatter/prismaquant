@@ -39,6 +39,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e PQ_MODEL="$MODEL" -e PQ_MAXLEN="$MAXLEN" -e PQ_UTIL="$UTIL" \
   -e PQ_EXTRA="$EXTRA_ARGS" \
+  -e PQ_SPEC="${SPEC_CONFIG:-}" \
   -e PRISMAQUANT_CB_DISPATCH="${PRISMAQUANT_CB_DISPATCH:-}" \
   -e PRISMAQUANT_CB_DECODE_CONTRACT="${PRISMAQUANT_CB_DECODE_CONTRACT:-}" \
   -e PRISMAQUANT_CB_PREFILL="${PRISMAQUANT_CB_PREFILL:-}" \
@@ -52,6 +53,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
       --max-model-len "$PQ_MAXLEN" --max-num-seqs 2 \
       --kv-cache-dtype fp8 \
       --gpu-memory-utilization "$PQ_UTIL" \
+      ${PQ_SPEC:+--speculative-config "$PQ_SPEC"} \
       $PQ_EXTRA' > "$LOG" 2>&1
 
 for i in $(seq 1 240); do
