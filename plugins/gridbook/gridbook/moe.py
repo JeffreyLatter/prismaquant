@@ -22,6 +22,7 @@ the buffer shapes, w13/w2 split, and per-layer uniformity.
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -44,6 +45,7 @@ from .expand import (
     expand_cb_to_value,
     expand_fp4_v2_to_weight,
 )
+from .moe_autotune import STOCK as _AUTO_STOCK, cb_prefill_auto
 from .moe_routing import cb_grouped_pad_routing
 from .ops import dispatch_via_op
 
@@ -357,10 +359,19 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # (ceil(m_e/TileM) x) and pads to tile multiples — decode redundancy
         # scales with expert SIZE, and Laguna's experts are ~6x the 35B's.
         # Promotion reverted per the two-model ladder rule; grouped_fused
-        # stays opt-in. The principled end state is measured per-layer
-        # auto-selection, not a shape heuristic.
+        # stays opt-in.
+        #
+        #   'auto' — _apply_prefill_auto (OPT-IN until a two-model gate clears
+        #     it). The principled end state: MEASURE stock and grouped_fused (at
+        #     each compiled TileM) once per layer on the layer's own real inputs
+        #     and cache the argmin. No shape heuristic, no model table — the
+        #     regression above is exactly the kind of model-dependent crossover
+        #     that a static default cannot express.
         mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
             "stock" if not self.is_fp4 else "loop")
+        if mode == "auto":
+            return self._apply_prefill_auto(
+                layer, x, topk_weights, topk_ids, act)
         if mode in ("grouped_fused", "grouped_fused_r1"):
             out = None
             if mode == "grouped_fused":
@@ -573,8 +584,58 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         layer._cb_gf2_ok = bool(ok)
         return layer._cb_gf2_ok
 
+    def _gf2_tile_sizes(self, layer) -> list[int]:
+        """The TileM values the grouped kernel is actually COMPILED for on this
+        build, ascending. Always enumerated from the extension — a (TileM,
+        k_bits) pair can be uncompilable (shared-memory limit), so a hardcoded
+        list would hand the kernel a tile it cannot serve.
+
+        Precedence: the per-rung query (the only one that knows this layer's
+        k_bits), then the general one, then the back-compat single default. An
+        extension build predating the newer symbols therefore degrades to
+        exactly the one tile it has always supported. Cached per layer (the
+        answer is a property of the build + the layer's rung)."""
+        sizes = getattr(layer, "_cb_gf2_tiles", None)
+        if sizes is not None:
+            return sizes
+        from .cuda_ext import get_fused_ext
+        fext = get_fused_ext()
+        sizes = []
+        if fext is not None:
+            for getter, args in (
+                    ("cb_fused_moe_tile_sizes_for_kbits", (self.k,)),
+                    ("cb_fused_moe_tile_sizes", ()),
+                    ("cb_fused_moe_tile_m", ())):
+                fn = getattr(fext, getter, None)
+                if fn is None:
+                    continue
+                try:
+                    got = fn(*args)
+                except Exception:  # noqa: BLE001 — treat as "not offered"
+                    continue
+                got = [got] if isinstance(got, int) else list(got)
+                sizes = sorted({int(s) for s in got if int(s) > 0})
+                if sizes:
+                    break
+        layer._cb_gf2_tiles = sizes
+        return sizes
+
+    def _grouped_call(self, fext, args, tile_m: int):
+        """``cb_fused_moe_grouped`` with an explicit TileM, tolerating an
+        extension build whose binding predates the ``tile_m`` parameter: that
+        build only ever has ONE tile, so dropping the argument is correct when
+        it equals the default and a fall-through (``None``) otherwise."""
+        if getattr(self, "_cb_grouped_tile_arg", True):
+            try:
+                return fext.cb_fused_moe_grouped(*args, tile_m)
+            except TypeError:
+                self._cb_grouped_tile_arg = False
+        if tile_m != int(fext.cb_fused_moe_tile_m()):
+            return None
+        return fext.cb_fused_moe_grouped(*args)
+
     def _apply_prefill_grouped_fused_v2(self, layer, x, topk_weights, topk_ids,
-                                        act):
+                                        act, *, tile_m=None):
         """ROUND 2 of the MoE grouped fused prefill (selected by
         ``PRISMAQUANT_CB_PREFILL=grouped_fused`` when the grouped binding
         exists). Returns ``None`` on any constraint miss so the caller falls
@@ -621,6 +682,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         the intermediate (a per-row op, so gather-after-quant ==
         quant-after-gather bit-exactly), bit-exact prologue weight decode, and
         the same fp32 EVT ``bf16_rn(b_scale * (a_scale * acc))`` rounding order.
+
+        TILE M. ``tile_m`` selects among the tile sizes the kernel was compiled
+        for (``_gf2_tile_sizes``); ``None`` means the kernel's own default. It is
+        a PERFORMANCE knob with a real tradeoff — a larger tile amortises the
+        per-tile B decode over more rows but wastes more padded rows on short
+        experts — which is why 'auto' measures it rather than fixing it. Nothing
+        else in this method is tile-specific: the capacity bound ``P//tile_m + E``
+        is proved for arbitrary tile_m (see ``cb_grouped_pad_routing``), and the
+        combine is indexed by ``dest``/``row_src``, whose length is
+        ``cap_blocks*tile_m`` by construction — so both generalise unchanged.
         """
         if not self._gf2_ok(layer):
             return None
@@ -642,8 +713,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         lut = self._stock_cb_flat_fp8(layer)
         kb = self.k
         fp8_dtype = current_platform.fp8_dtype()
-        tile_m = int(fext.cb_fused_moe_tile_m())     # never hardcode: the
-        if tile_m <= 0:                              # kernel owns its TileM
+        # Never hardcode a tile: the kernel owns which TileM it compiled.
+        tile_m = int(fext.cb_fused_moe_tile_m() if tile_m is None else tile_m)
+        if tile_m <= 0:
             return None
 
         # ---- routing (device-side; static shapes) --------------------------
@@ -687,10 +759,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             torch.float32).contiguous()
 
         # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
-        gate_up = fext.cb_fused_moe_grouped(
-            a_pad, layer.w13_cb_qweight.data, lut, as_pad, w13s,
-            expert_ids, N1, Kh, kb)                                # [Mp, N1]
+        gate_up = self._grouped_call(
+            fext, (a_pad, layer.w13_cb_qweight.data, lut, as_pad, w13s,
+                   expert_ids, N1, Kh, kb), tile_m)                # [Mp, N1]
         del a_pad, as_pad
+        if gate_up is None:                          # binding has no TileM knob
+            return None
         a = torch.empty((gate_up.shape[0], d), dtype=gate_up.dtype, device=dev)
         apply_moe_activation(act, a, gate_up)                      # silu(g)*u
         del gate_up
@@ -701,11 +775,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         # stage 2: y = a2 @ W2[expert_of_tile]^T — SAME expert_ids, the row
         # layout is a property of the routing, not of the projection.
-        y = fext.cb_fused_moe_grouped(
-            a2.contiguous(), layer.w2_cb_qweight.data, lut,
-            a2s.reshape(-1).to(torch.float32).contiguous(), w2s,
-            expert_ids, Kh, inter, kb)                             # [Mp, Kh]
+        y = self._grouped_call(
+            fext, (a2.contiguous(), layer.w2_cb_qweight.data, lut,
+                   a2s.reshape(-1).to(torch.float32).contiguous(), w2s,
+                   expert_ids, Kh, inter, kb), tile_m)             # [Mp, Kh]
         del a2, a2s
+        if y is None:
+            return None
 
         # Padding rows carry pair 0's router weight; harmless, because they are
         # scattered into throwaway row T, which is sliced off.
@@ -714,6 +790,52 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         out = torch.zeros((T + 1, Kh), dtype=x.dtype, device=dev)
         out.index_add_(0, dest, y.to(out.dtype))
         return out[:T]
+
+    # -- prefill: MEASURED per-layer path selection -------------------------
+    def _prefill_candidates(self, layer, x, topk_weights, topk_ids, act):
+        """The prefill paths worth measuring for THIS layer, as
+        ``[(name, thunk)]`` with 'stock' first. grouped_fused appears once per
+        TileM the build actually compiled for this layer's rung; if the grouped
+        binding or the rung constraints are unmet the list is just 'stock', and
+        auto degenerates to the default with one wasted timing call."""
+        cands = [(_AUTO_STOCK, lambda: self._apply_prefill_stock(
+            layer, x, topk_weights, topk_ids, act))]
+        if self._gf2_ok(layer):
+            for tm in self._gf2_tile_sizes(layer):
+                cands.append((
+                    f"grouped_fused:tile_m={tm}",
+                    # Bind tm per iteration — a bare closure would capture the
+                    # loop variable and time the last tile N times.
+                    (lambda t: lambda: self._apply_prefill_grouped_fused_v2(
+                        layer, x, topk_weights, topk_ids, act, tile_m=t))(tm)))
+        return cands
+
+    def _apply_prefill_auto(self, layer, x, topk_weights, topk_ids, act):
+        """MEASURED per-layer prefill selection (``PRISMAQUANT_CB_PREFILL=auto``,
+        opt-in until a two-model gate clears it). Thin adapter: the policy —
+        threshold, per-layer caching, determinism, forcing — lives in
+        ``moe_autotune.cb_prefill_auto``, which is torch-only so it is testable
+        without vLLM/CUDA. This method only supplies the candidates."""
+        return cb_prefill_auto(
+            layer, x.shape[0],
+            lambda: self._prefill_candidates(
+                layer, x, topk_weights, topk_ids, act),
+            lambda: self._apply_prefill_stock(
+                layer, x, topk_weights, topk_ids, act),
+            min_m=int(os.environ.get("PRISMAQUANT_CB_AUTOTUNE_MIN_M")
+                      or "1024"),
+            forced=os.environ.get("PRISMAQUANT_CB_PREFILL_AUTO_FORCE") or None,
+            log=self._log_prefill_choice)
+
+    def _log_prefill_choice(self, best, timings, forced=False):
+        """One line per layer, to stderr like every other gate on this path.
+        This is the evidence trail: a serving run must be able to show WHY it
+        picked what it picked, with the measurements that decided it."""
+        detail = " ".join(f"{n}={timings[n]:.3f}ms" for n in sorted(timings))
+        print(f"[prismaquant-cb] prefill auto {self.prefix}: "
+              f"{'forced' if forced else 'chose'} {best}"
+              + (f" | {detail}" if detail else ""),
+              file=sys.stderr, flush=True)
 
     # -- prefill: per-expert loop (bisection reference) ---------------------
     def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
