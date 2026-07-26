@@ -687,8 +687,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # slack gate is the sizing authority. Prefill is eager
             # (FULL_DECODE_ONLY graphs), so side-stream use is capture-safe.
             # PRISMAQUANT_CB_PREFILL_OVERLAP=0 restores serial (bisection).
+            # Measured NULL on 35B-A3B (17 ms/layer, both arms identical,
+            # 2026-07-26); stays opt-in until a positive exists at any scale.
             _ovl = (is_fp8 and os.environ.get(
-                "PRISMAQUANT_CB_PREFILL_OVERLAP", "1") != "0")
+                "PRISMAQUANT_CB_PREFILL_OVERLAP") == "1")
             W2 = None
             if _ovl:
                 if not hasattr(self, "_ovl_stream"):
