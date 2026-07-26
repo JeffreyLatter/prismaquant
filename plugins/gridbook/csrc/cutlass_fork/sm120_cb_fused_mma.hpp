@@ -140,8 +140,9 @@ struct CollectiveMma<
   static constexpr int TileN = size<1>(TileShape{});
   static constexpr int TileK = size<2>(TileShape{});
   static_assert(TileK == 128, "CB fused mainloop assumes TileK = 128 (half a 256-weight superblock)");
-  static_assert(KBits == 36 || KBits == 40 || KBits == 44 || KBits == 48,
-                "shipped FP8_CB rungs only");
+  static_assert(KBits == 28 || KBits == 32 || KBits == 36 ||
+                KBits == 40 || KBits == 44 || KBits == 48,
+                "even fp8-CB rungs only (4*KBits must be a 16-byte multiple)");
   static_assert(CbTypeSize % 16 == 0, "type_size must be a 16-byte multiple (TMA box)");
 
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");

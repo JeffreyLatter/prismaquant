@@ -28,7 +28,7 @@
 //    REFERENCE for the fused kernel (identical TiledMma/layout config).
 //  - cb_fused_prefill_mm: the decode-in-prologue FP8_CB GEMM — B is the
 //    PACKED byte stream + a global e4m3-byte LUT; the dense tile never
-//    exists in HBM. KBits in {36,40,44,48} template-dispatched.
+//    exists in HBM. KBits in {28,32,36,40,44,48} template-dispatched (full even fp8 ladder).
 //  - smem_report: per-config SharedStorage sizes (budget sanity).
 //
 // Scale convention:
@@ -289,7 +289,8 @@ void check_fused_inputs(torch::Tensor a, torch::Tensor packed,
   TORCH_CHECK(packed.stride(0) >= (K / 256) * 4 * k_bits);
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
   TORCH_CHECK(K % 256 == 0);
-  TORCH_CHECK(k_bits == 36 || k_bits == 40 || k_bits == 44 || k_bits == 48,
+  TORCH_CHECK(k_bits == 28 || k_bits == 32 || k_bits == 36 ||
+              k_bits == 40 || k_bits == 44 || k_bits == 48,
               "unsupported k_bits ", k_bits);
 }
 
@@ -298,6 +299,8 @@ torch::Tensor cb_fused_prefill_mm(torch::Tensor a, torch::Tensor packed,
                                   int64_t k_bits) {
   check_fused_inputs(a, packed, lut, N, K, k_bits);
   switch (k_bits) {
+    case 28: return run_fused<28>(a, packed, lut, N, K);
+    case 32: return run_fused<32>(a, packed, lut, N, K);
     case 36: return run_fused<36>(a, packed, lut, N, K);
     case 40: return run_fused<40>(a, packed, lut, N, K);
     case 44: return run_fused<44>(a, packed, lut, N, K);
@@ -369,6 +372,8 @@ torch::Tensor cb_fused_prefill_mm_scaled(torch::Tensor a, torch::Tensor packed,
                   b_scales.numel() == N && b_scales.is_contiguous(),
               "b_scales must be contiguous fp32 [N] (per-output-channel)");
   switch (k_bits) {
+    case 28: return run_fused_scaled<28>(a, packed, lut, a_scales, b_scales, N, K);
+    case 32: return run_fused_scaled<32>(a, packed, lut, a_scales, b_scales, N, K);
     case 36: return run_fused_scaled<36>(a, packed, lut, a_scales, b_scales, N, K);
     case 40: return run_fused_scaled<40>(a, packed, lut, a_scales, b_scales, N, K);
     case 44: return run_fused_scaled<44>(a, packed, lut, a_scales, b_scales, N, K);
