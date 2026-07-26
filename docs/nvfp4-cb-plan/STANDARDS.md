@@ -51,10 +51,15 @@ against. Changes to it require a served A/B, not a preference.
 | Prefill MoE fp4-CB | per-expert loop (one host sync) | DEFAULT until stock's bf16-expand variant is measured |
 | Dispatch | M-branch-hoist opaque custom ops (layer registry) | DEFAULT |
 | Mid-M 17–128 fp8-CB | CUTLASS fused decode-in-prologue | OPT-IN until served logprob A/B |
-| Large-M fused | persistent-N §4b (CUTLASS restructure) | ROADMAP (GO recorded; 2–4 GPU days) |
+| Large-M fused dense | persistent-N self-contained TC kernel | MEASURED NEGATIVE (2026-07-26): parity-green but 2–5.7× slower than expand+fork at 27B shapes; the CUDA expander shrank the dense expand tax to ~10%, killing the original opportunity. Kernel kept quarantined (PRISMAQUANT_ENABLE_PTC=1) as the schedule reference. |
+| Large-M fused MoE | persistent/grouped decode-in-mainloop | ROADMAP — the fat target (expand ≈ 35% of Laguna MoE layer time; f ≈ 50%) |
 | MoE prefill alts | stock-kernel (capture-safe) / batched | OPT-IN |
 | w2 rowpack, damp sweep, … | measured negative | ARCHIVED behind env switches |
 
+- Decode contract v2 (scale-epilogue hoist): MEASURED NULL on served 27B
+  (10.10 vs 10.13 tok/s, quality-neutral) — decode is bandwidth-bound at
+  per-byte parity, nothing for the hoist to recover. Default stays v1;
+  v2 remains supported via PRISMAQUANT_CB_DECODE_CONTRACT=v2.
 - Serving graph standard for ship configs: **mode-0 + FULL_DECODE_ONLY**.
   The compile lane (mode-3, any cudagraph flavor) is correctness-clean since
   the M-branch hoist and measured at decode parity (13.5–14.0 band on Hy3,
