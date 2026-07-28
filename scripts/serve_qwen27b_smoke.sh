@@ -15,6 +15,11 @@ MAXLEN="${MAXLEN:-32768}"
 [ "${SHORTLEN:-0}" = "1" ] && MAXLEN=16384
 UTIL="${UTIL:-0.80}"
 EXTRA_ARGS="${EXTRA_ARGS:---enforce-eager}"
+# Which plugin tree to install (container-side path). Defaults to the in-tree
+# working copy; point it at a snapshot to serve a FIXED revision — an A/B whose
+# arms differ only by plugin code needs the baseline arm pinned against edits
+# landing in the working tree mid-run.
+PLUGIN_DIR="${PLUGIN_DIR:-/repo/plugins/gridbook}"
 LOG=/home/rob/dq-runs/qwen27b-gb/logs/serve_smoke.log
 mkdir -p /home/rob/dq-runs/qwen27b-gb/logs
 
@@ -38,6 +43,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e VLLM_SERVER_DEV_MODE=1 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e PQ_MODEL="$MODEL" -e PQ_MAXLEN="$MAXLEN" -e PQ_UTIL="$UTIL" \
+  -e PQ_PLUGIN="$PLUGIN_DIR" \
   -e PQ_EXTRA="$EXTRA_ARGS" \
   -e PQ_SPEC="${SPEC_CONFIG:-}" \
   -e PRISMAQUANT_CB_DISPATCH="${PRISMAQUANT_CB_DISPATCH:-}" \
@@ -54,7 +60,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e PRISMAQUANT_ENABLE_PTC="${PRISMAQUANT_ENABLE_PTC:-}" \
   -e PRISMAQUANT_CB_PREFILL_DENSE="${PRISMAQUANT_CB_PREFILL_DENSE:-}" \
   --entrypoint bash vllm-node:latest -c '
-    cp -r /repo/plugins/gridbook /gb_snap
+    cp -r "$PQ_PLUGIN" /gb_snap
     pip install -e /gb_snap --no-deps -q 2>/dev/null
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
       --served-model-name qwen \

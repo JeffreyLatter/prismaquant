@@ -4,7 +4,7 @@ Out-of-tree vLLM quantization plugin for PrismaQuant's **NVFP4-CB / FP8-CB**
 codebook formats (docs/nvfp4-cb-plan/). The **Triton** path (`kernels.py`) was
 **prototype (i)** — a correctness-first reference used to obtain the first served
 KL-vs-BF16 and speed reading. The **current served path is the CUDA kernel set**
-(`csrc/cb_gemv.cu`, JIT-built via `cuda_ext.get_ext()`), which honours INV-1
+(`gridbook/csrc/cb_gemv.cu`, JIT-built via `cuda_ext.get_ext()`), which honours INV-1
 (decode in registers/smem, never a materialized `[N,K]` in HBM) at
 bandwidth-bound decode speeds; the Triton path remains the bit-exact fallback
 when nvcc is unavailable. See the CUDA kernel-set section below.
@@ -48,7 +48,7 @@ result differs from the reference only by summation **reassociation**, held to
 `≤1 bf16 output ULP + a norm backstop` (the `_assert_triton_close` contract in
 `tests/test_cuda_gemv.py`).
 
-**`csrc/cb_gemv.cu`** (`cuda_ext.get_ext()`) — the decode path (M ≤ 16) + a
+**`gridbook/csrc/cb_gemv.cu`** (`cuda_ext.get_ext()`) — the decode path (M ≤ 16) + a
 prefill expander:
 
 - **Dense decode-GEMV** `cb_gemv_fp8` / `cb_gemv_fp4_v2`: one block per output
@@ -87,7 +87,7 @@ prefill expander:
 - `fp8_act_qdq`, `cb_moe_combine` — fused per-token fp8 QDQ and the deterministic
   expert-ascending bf16 combine.
 
-**`csrc/cb_fused_gemm.cu`** (CUTLASS, separate JIT ext) — prefill:
+**`gridbook/csrc/cb_fused_gemm.cu`** (CUTLASS, separate JIT ext) — prefill:
 
 - **`cb_fused_prefill_mm`** — decode-in-prologue fused GEMM (CUTLASS sm120
   collective: decode each B superblock into smem, then the FP8/FP4 tensor-core
@@ -95,7 +95,7 @@ prefill expander:
   **mid-M niche (17–128)** (1.04–1.45× vs serial); at large M every M-tile CTA
   re-decodes B, so transient-expand is preferred there.
 
-**`csrc/cb_persistent_prefill.cu`** (experimental, off by default) — the
+**`gridbook/csrc/cb_persistent_prefill.cu`** (experimental, off by default) — the
 large-M endgame reference: a **persistent-N** kernel that decodes each B N-tile
 **once** into smem and streams M through it (no `[N,K]` in HBM, INV-1). This is
 an f32-FMA **schedule/correctness reference**, not the tensor-core perf path; the
