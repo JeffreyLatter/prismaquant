@@ -9,15 +9,23 @@ FIX 1 (audit M3): packed-MoE expert Fisher uses the per-token-summed
     packed compute (e.g. bmm) fail-fasts unless
     PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER=1.
 
-FIX 2 (audit M4): `FisherAccumulator.finalize` applies the single
-    per-routed-token normalization for unpacked MoE expert Linears — no
-    second ÷route_prob — so the `run_probe_pass` backend agrees with the
-    incremental (production) backend's convention.
+FIX 2 (audit M4, denominator superseded by PR #14):
+    `FisherAccumulator.finalize` applies a SINGLE normalization — no
+    second ÷route_prob (route_prob is metadata only) — so the
+    `run_probe_pass` backend agrees with the incremental (production)
+    backend's convention. M4 originally made that single division
+    per-ROUTED-token; PR #14 deliberately reversed the denominator to
+    the GLOBAL calib token count for every row (tokens never routed to
+    an expert contribute zero gradient, so per-routed-token inflated
+    sparse-expert rows by global/routed). The no-double-division
+    property M4 pinned still holds and is still pinned here.
 
 FIX 3 (audit M9): every h-detail writer goes through
     `sensitivity_probe.h_detail_blob` (per-token units + explicit
     ``units: "per_token"`` marker); `HDetailIndex.h_diag_from_blob`
-    refuses legacy raw token-summed ``H`` blobs.
+    refuses legacy raw token-summed ``H`` blobs. Since PR #14 the blob
+    denominator is the GLOBAL calib token count (v4), matching the
+    scalar `h_trace`.
 """
 import os
 import tempfile
@@ -318,12 +326,14 @@ class _StubTracker:
 
 
 class TestBackendNormalizationAgreement(unittest.TestCase):
-    """FIX 2 (audit M4): the run_probe_pass backend's expert h_trace is
-    the per-routed-token mean — the same single-division convention the
-    incremental (production) backend implements — with route_prob kept
-    as metadata only, never applied as a second division."""
+    """FIX 2 (audit M4) + the PR #14 denominator reversal: the
+    run_probe_pass backend's expert h_trace is the routed-token gradient
+    mass divided ONCE, by the GLOBAL calib token count — the same
+    single-division convention the incremental (production) backend
+    implements — with route_prob kept as metadata only, never applied
+    as a second division."""
 
-    def test_expert_h_trace_is_per_routed_token_mean(self):
+    def test_expert_h_trace_is_global_token_mean(self):
         torch.manual_seed(0)
         E, hidden, inter, T = 3, 6, 4, 24
         model = _UnpackedMoE(E, hidden, inter).to(DEV)
@@ -332,9 +342,9 @@ class TestBackendNormalizationAgreement(unittest.TestCase):
         with torch.no_grad():
             top = model.router(x).argmax(dim=-1)
 
-        # Reference: the incremental backend's convention, computed
-        # brute-force — Σ_t ‖∇_t W_e‖² over ROUTED tokens t, divided by
-        # the routed-token count.
+        # Reference: Σ_t ‖∇_t W_e‖² over ROUTED tokens t (tokens never
+        # routed to e contribute zero gradient), divided by the GLOBAL
+        # calib token count T — finalize_fisher_stats' convention.
         ref = {}
         for e, expert in enumerate(model.experts):
             sel = (top == e).nonzero(as_tuple=True)[0]
@@ -345,8 +355,7 @@ class TestBackendNormalizationAgreement(unittest.TestCase):
                     expert.w1.weight)
                 total += float(g.pow(2).sum())
             if sel.numel():
-                ref[f"experts.{e}.w1"] = (total / int(sel.numel()),
-                                          int(sel.numel()))
+                ref[f"experts.{e}.w1"] = (total / T, int(sel.numel()))
 
         tracked = [f"experts.{e}.w1" for e in range(E)]
         expert_info = {f"experts.{e}.w1": ("router", str(e))
@@ -356,17 +365,25 @@ class TestBackendNormalizationAgreement(unittest.TestCase):
         acc = FisherAccumulator(model, tracked, expert_info)
         xg = x.detach().requires_grad_(True)
         (model(xg) * v).sum().backward()
-        # A route_prob well below 1 — the pre-fix code would divide by it
-        # and report 4× the per-routed-token mean.
-        acc.finalize(_StubTracker(0.25))
+        # A route_prob well below 1 — the pre-M4 code would divide by it
+        # as a SECOND division; still pinned as metadata-only.
+        acc.finalize(_StubTracker(0.25), global_tokens=T)
 
         for name, (ref_mean, n_routed) in ref.items():
             with self.subTest(linear=name):
                 s = acc.stats[name]
+                # n_tokens_seen stays raw (routed count, metadata) —
+                # the denominator is the global count.
                 self.assertEqual(s["n_tokens_seen"], n_routed)
+                self.assertEqual(s["h_trace_norm_tokens"], T)
                 self.assertEqual(s["route_prob"], 0.25)  # metadata only
                 self.assertLess(abs(s["h_trace"] - ref_mean),
                                 5e-3 * abs(ref_mean))
+                # Pin the reversal: for a sparsely routed expert the old
+                # per-routed-token convention was (T/n_routed)× hotter.
+                if n_routed < T:
+                    self.assertGreater(
+                        (s["h_trace_raw"] / n_routed) / s["h_trace"], 1.0)
 
 
 class TestHDetailUnits(unittest.TestCase):
@@ -377,7 +394,10 @@ class TestHDetailUnits(unittest.TestCase):
         raw = torch.full((2, 3), 12.0)
         blob = h_detail_blob(raw, 4, "toy.fc")
         self.assertEqual(blob["units"], "per_token")
-        self.assertEqual(blob["h_detail_version"], 3)
+        # v4: denominator is the GLOBAL calib token count (PR #14), and
+        # the blob records it.
+        self.assertEqual(blob["h_detail_version"], 4)
+        self.assertEqual(blob["norm_tokens"], 4)
         self.assertEqual(blob["kind"], "linear")
         self.assertTrue(torch.equal(blob["h_diag"],
                                     torch.full((2, 3), 3.0)))
@@ -428,7 +448,7 @@ class TestHDetailUnits(unittest.TestCase):
             acc = FisherAccumulator(model, ["fc"], {}, h_detail_dir=h_dir)
             xg2 = x.detach().requires_grad_(True)
             (model.fc(xg2) * v).sum().backward()
-            acc.finalize(None)
+            acc.finalize(None, global_tokens=T)
 
             index = HDetailIndex(h_dir, ["fc"])
             self.assertIn("fc", index)

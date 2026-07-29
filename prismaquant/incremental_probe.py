@@ -75,6 +75,7 @@ from .sensitivity_probe import (
     FisherAccumulator,
     RouterTracker,
     discover_moe_structure,
+    finalize_fisher_stats,
     h_detail_blob,
     install_packed_expert_hooks,
     load_calibration,
@@ -1524,33 +1525,11 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
     )
 
 
-def finalize_fisher_stats(merged_stats: dict, global_tokens: int) -> None:
-    """Normalize raw Fisher accumulators into ``h_trace`` (etc.), in place.
-
-    Fisher normalization must share ONE denominator across every row: the
-    global calibration token count (nsamples x seqlen). Dense trunk Linears
-    accumulate exactly that many tokens in ``n_tokens_seen``, so their
-    values are unchanged by dividing by the global count. Per-expert
-    Linears, however, only see their ROUTED tokens; a per-row
-    ``h_trace_raw / n_tokens_seen`` inflates a rarely-routed expert's
-    Fisher by (global/routed) — exactly inverted importance weighting (the
-    least-used experts look the most sensitive). Tokens never routed to an
-    expert contribute zero gradient, so the empirical Fisher over the
-    calibration set divides by the GLOBAL count for every row.
-    ``n_tokens_seen`` is kept raw (routed count) — the h_detail blob writer
-    still normalizes per-Linear and stamps units="per_token" for its own
-    single-tensor consumers.
-    """
-    for s in merged_stats.values():
-        s["h_trace"] = s.get("h_trace_raw", 0.0) / global_tokens
-        s["h_w2_sum"] = s.get("h_w2_sum_raw", 0.0) / global_tokens
-        # Per-expert Fisher trace (only present on packed-3D stat entries;
-        # dense Linears have no per-expert dimension). Normalize by the
-        # same token count so it shares units with `h_trace`.
-        per = s.get("h_trace_per_expert_raw")
-        if per is not None:
-            s["h_trace_per_expert"] = [float(v) / global_tokens for v in per]
-        s["h_trace_norm_tokens"] = global_tokens
+# `finalize_fisher_stats` lives in sensitivity_probe (next to
+# h_detail_blob, so both probe backends and every h-detail writer share
+# the single global-token normalization convention); it is re-exported
+# here because this module is the production backend consumers import
+# it from.
 
 
 # ---------------------------------------------------------------------------
@@ -1657,6 +1636,11 @@ def _run_body_streaming_shard(
           f"across {sum(1 for x in layer_linear_names if x)} layers "
           f"+ {len(resident_linears)} resident Linears "
           f"(include={linear_include!r})", flush=True)
+
+    # One shared Fisher denominator for every row AND every h-detail blob
+    # — the global calib token count (see finalize_fisher_stats for why
+    # per-row n_tokens_seen is wrong for routed-expert Linears).
+    global_tokens = max(int(calib.size(0)) * int(seqlen), 1)
 
     top_k = read_top_k(model, default=2)
 
@@ -2444,13 +2428,15 @@ def _run_body_streaming_shard(
                     full_key = f"{layer_prefix}{local_key}"
                     fname = re.sub(r"[^A-Za-z0-9_-]", "__", full_key) + ".pt"
                     # Per-token units + explicit marker (audit M9): the
-                    # accumulator is token-summed; normalize by this
-                    # layer's token count so the blob matches the
-                    # sensitivity-probe writer's units.
-                    entry = acc_stats.get(full_key, {})
+                    # accumulator is token-summed; normalize by the
+                    # GLOBAL calib token count — the same denominator the
+                    # scalar h_trace gets in finalize_fisher_stats.
+                    # (Packed-3D rows count the full batch in
+                    # n_tokens_seen, so this is numerically identical to
+                    # the previous per-row count; global is used for
+                    # uniformity with the per-expert-Linear writers.)
                     torch.save(
-                        h_detail_blob(tensor,
-                                      int(entry.get("n_tokens_seen", 0)),
+                        h_detail_blob(tensor, global_tokens,
                                       full_key, kind="packed"),
                         detail_dir / fname)
                 packed_full_acc.clear()
@@ -2503,9 +2489,8 @@ def _run_body_streaming_shard(
 
     # ---- Finalize ----
     # One shared denominator for every row — the global calib token count
-    # (see finalize_fisher_stats for why per-row n_tokens_seen is wrong
-    # for routed-expert Linears).
-    global_tokens = max(int(calib.size(0)) * int(seqlen), 1)
+    # (hoisted above; see finalize_fisher_stats for why per-row
+    # n_tokens_seen is wrong for routed-expert Linears).
     finalize_fisher_stats(merged_stats, global_tokens)
 
     detail_dir = Path(h_detail_dir) if h_detail_dir else None
@@ -2522,12 +2507,15 @@ def _run_body_streaming_shard(
             # used to save the raw token-summed accumulator under "H",
             # leaving HDetailIndex consumers ~n_tokens× hotter than
             # blobs from sensitivity_probe. h_detail_blob normalizes by
-            # the tokens this Linear actually saw and stamps
-            # units="per_token"; g2_per_token stays raw (it is already
-            # a per-token vector).
-            tokens = int(merged_stats.get(fqn, {}).get("n_tokens_seen", 0))
+            # the GLOBAL calib token count — the same denominator the
+            # scalar h_trace gets in finalize_fisher_stats above, so
+            # predicted_dloss fallback rows built from these blobs stay
+            # on the scalar's scale (per-expert nn.Linear rows only see
+            # their ROUTED tokens; dividing by that per-row count left
+            # the detail (global/routed)× hotter than the scalar).
+            # g2_per_token stays raw (it is already a per-token vector).
             torch.save(
-                h_detail_blob(h, tokens, fqn, kind="linear",
+                h_detail_blob(h, global_tokens, fqn, kind="linear",
                               g2_per_token=g2_per_token),
                 detail_dir / fname,
             )
@@ -2821,7 +2809,11 @@ def _run_mtp_streaming_shard(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    acc.finalize(tracker=None)
+    # Global calib token count, matching the meta nsamples×seqlen product
+    # below (the MTP shift trims 2 tokens/sample — a uniform constant, and
+    # keeping the meta product keeps the allocator renorm idempotent).
+    fisher_norm_tokens = max(int(calib.size(0)) * int(seqlen), 1)
+    acc.finalize(tracker=None, global_tokens=fisher_norm_tokens)
     acc.remove_hooks()
 
     renamed = dict(acc.stats)
@@ -2841,6 +2833,7 @@ def _run_mtp_streaming_shard(
                 "dataset": dataset_name,
                 "nsamples": int(calib.size(0)),
                 "seqlen": seqlen,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": dtype_name,
                 "device_map": "streaming-layerwise",
                 "execution_device": str(device),
