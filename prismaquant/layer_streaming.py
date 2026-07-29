@@ -24,6 +24,9 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+from .autoscale import _EXPERT_TENSOR_RE, declared_fp4_expert_dtype
+
 try:
     from accelerate.utils.modeling import set_module_tensor_to_device
 except ModuleNotFoundError:
@@ -178,11 +181,20 @@ class Fp8ScaleInvMap(dict):
     so every existing caller is unchanged; the block size travels with
     the map so the dequant call sites never have to re-derive it — or
     worse, assume 128x128 for a checkpoint quantized at a different
-    granularity.  ``block`` is None only for empty maps."""
+    granularity.  ``block`` is None only for empty maps.
 
-    def __init__(self, data=None, block: tuple[int, int] | None = None):
+    ``mxfp4_names`` is the set of mapped weights the checkpoint config
+    *explicitly declares* as packed-FP4 routed experts (DSv4-Flash
+    `expert_dtype: "fp4"`, see `declared_fp4_expert_dtype`). Those decode
+    on the MXFP4 nibble path (step 3b of `_apply_fp8_dequant_inplace`)
+    instead of the block-FP8 broadcast. Empty unless declared — never
+    inferred from tensor shapes."""
+
+    def __init__(self, data=None, block: tuple[int, int] | None = None,
+                 mxfp4_names: frozenset[str] = frozenset()):
         super().__init__(data or {})
         self.block = block
+        self.mxfp4_names = mxfp4_names
 
 
 def _declared_weight_block_size(model_path: str) -> tuple[int, int]:
@@ -282,6 +294,7 @@ def _build_fp8_scale_inv_map(model_path: str, *,
         return Fp8ScaleInvMap(
             explicit,
             _declared_weight_block_size(model_path) if explicit else None,
+            mxfp4_names=_declared_mxfp4_names(model_path, explicit),
         )
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
@@ -313,7 +326,20 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     return Fp8ScaleInvMap(
         out,
         _declared_weight_block_size(model_path) if out else None,
+        mxfp4_names=_declared_mxfp4_names(model_path, out),
     )
+
+
+def _declared_mxfp4_names(model_path: str, mapping: dict) -> frozenset[str]:
+    """Mapped weight names the checkpoint explicitly declares MXFP4.
+
+    Non-empty only when config.json declares packed-FP4 routed experts
+    (`declared_fp4_expert_dtype`); membership is the per-expert routed
+    tensors (`...experts.<id>....`) that declaration covers. Everything
+    else in the map stays on the block-FP8 dequant path."""
+    if not mapping or not declared_fp4_expert_dtype(model_path):
+        return frozenset()
+    return frozenset(n for n in mapping if _EXPERT_TENSOR_RE.search(n))
 
 
 def _check_fp8_scale_grid(
@@ -339,6 +365,38 @@ def _check_fp8_scale_grid(
             f"numel-compatible and would reshape silently, mis-scaling "
             f"every block — check the checkpoint's scale layout and its "
             f"declared quantization_config.weight_block_size."
+        )
+
+
+def _check_mxfp4_packed_grid(
+    name: str,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    """Hard shape/dtype assertion for a *declared* MXFP4 packed tensor.
+
+    The checkpoint config declared this tensor packed-FP4 (see
+    `_declared_mxfp4_names`), so it must be a 2-D int8 nibble-pack with a
+    per-row E8M0 scale grid of one scale per 32 logical (= 16 packed)
+    elements. Anything else means the declaration and the tensor disagree
+    — decode nothing, raise loudly (the shape-heuristic alternative would
+    silently decode mismatched tensors as garbage nibbles)."""
+    ok = (
+        weight.dim() == 2
+        and weight.dtype in (torch.int8, torch.uint8)
+        and scale.dim() == 2
+        and scale.shape[0] == weight.shape[0]
+        and scale.shape[1] * 16 == weight.shape[1]
+    )
+    if not ok:
+        raise ValueError(
+            f"tensor {name!r} is declared MXFP4 (config expert_dtype) but "
+            f"does not match the packed layout: weight "
+            f"{tuple(weight.shape)} dtype={weight.dtype}, scale grid "
+            f"{tuple(scale.shape)}; expected 2-D int8 nibble-pack with "
+            f"scale shape (rows, packed_cols/16) = "
+            f"(rows, logical_cols/32). Check the checkpoint's expert "
+            f"tensors against its expert_dtype declaration."
         )
 
 
@@ -459,9 +517,11 @@ def _apply_fp8_dequant_inplace(
     dequant (`fp8_scale_inv_map.block`, see `_fp8_dequant_block`), and
     replace the loaded tensor with the dequanted bf16 weight. MXFP4
     tensors (OCP MX FP4 E2M1 nibble pairs with per-32-element E8M0
-    scales, e.g. DSv4-Flash routed experts) are detected by signature
-    and dequanted on a dedicated path (step 3b) instead of the
-    block-FP8 broadcast.
+    scales, e.g. DSv4-Flash routed experts) are the map's declared
+    ``mxfp4_names`` — populated only from the checkpoint config's
+    explicit `expert_dtype` declaration, never inferred from shapes —
+    and dequant on a dedicated path (step 3b) instead of the block-FP8
+    broadcast, after a hard packed-grid assertion.
 
     Tensors and scales are both grouped by shape and multiplied in a
     single batched 5-D broadcast op per shape-group. On MiniMax-M2.7
@@ -500,16 +560,19 @@ def _apply_fp8_dequant_inplace(
     by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
     fallback: list[str] = []
     mxfp4_names: list[str] = []
+    declared_mxfp4 = getattr(fp8_scale_inv_map, "mxfp4_names", frozenset())
     for name in loaded_scales:
         w = out[name]
-        # DSv4-Flash routed experts are MXFP4, not block-FP8: E2M1 nibble
-        # pairs packed into int8 (low nibble = even element) with per-row
-        # E8M0 scales over 32 logical elements. Signature: int8 weight +
-        # scale grid (out, packed_in/16). Handled in step 3b below.
-        if (w.dim() == 2 and w.dtype == torch.int8
-                and loaded_scales[name].dim() == 2
-                and loaded_scales[name].shape[0] == w.shape[0]
-                and loaded_scales[name].shape[1] * 16 == w.shape[1]):
+        # MXFP4 routed experts (DSv4-Flash): E2M1 nibble pairs packed
+        # into int8 (low nibble = even element) with per-row E8M0 scales
+        # over 32 logical elements. Membership is the checkpoint's
+        # explicit declaration (config `expert_dtype`, carried on the
+        # map as `mxfp4_names`), NOT a shape heuristic — an INT8
+        # checkpoint with group-16 scales must never be silently decoded
+        # as nibble pairs. The packed-grid shape is asserted, not used
+        # as the trigger. Handled in step 3b below.
+        if name in declared_mxfp4:
+            _check_mxfp4_packed_grid(name, w, loaded_scales[name])
             mxfp4_names.append(name)
             continue
         if w.dim() != 2:

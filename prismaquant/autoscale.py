@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -89,6 +90,31 @@ def _act_width(cfg: dict) -> int:
             except (TypeError, ValueError):
                 pass
     return max(w for w in widths if w > 0) if any(w > 0 for w in widths) else hidden
+
+
+# Per-expert routed-expert tensor qnames (`...experts.<id>....`). Matches
+# both live (`model.layers.N.mlp.experts.7.gate_proj.weight`) and DSv4
+# checkpoint (`layers.N.ffn.experts.7.w1.weight`) naming.
+_EXPERT_TENSOR_RE = re.compile(r"\.experts\.\d+\.")
+
+
+def declared_fp4_expert_dtype(model_path: str) -> bool:
+    """True when the checkpoint config *explicitly* declares packed-FP4
+    routed experts (DSv4-Flash: top-level `expert_dtype: "fp4"` alongside a
+    block-FP8 `quantization_config`; the MXFP4 scale siblings are E8M0).
+
+    This declaration — never a tensor-shape heuristic — is what gates the
+    streaming loader's MXFP4 decode (`layer_streaming` step 3b) and what
+    the resident-size estimators key on: a nibble-packed I8 expert byte
+    dequants to 2 logical elements of the execution dtype."""
+    try:
+        with open(os.path.join(model_path, "config.json")) as f:
+            cfg = json.load(f)
+    except Exception:
+        return False
+    tc = cfg.get("text_config") or {}
+    val = cfg.get("expert_dtype") or tc.get("expert_dtype") or ""
+    return str(val).lower() in {"fp4", "mxfp4", "mx_fp4"}
 
 
 def _safetensors_source_float_bytes(dtype_name: str) -> int | None:
