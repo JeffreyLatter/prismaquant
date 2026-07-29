@@ -274,3 +274,150 @@ def test_floor_bytes_for_model_uses_manifest_on_mixed_source(tmp_path):
     assert info["regime"] == "fp8"
     assert info["reencoded_source_bytes"] == (8192 + 512) + (1024 + 4)
     assert info["floor_bytes"] == 1600
+
+
+def test_assignment_artifact_bytes_manifest_agrees_with_floor_model(tmp_path):
+    # PR-15 review: assignment_artifact_bytes must use the SAME manifest
+    # accounting as floor_bytes_for_model (the regime path merely raised on
+    # this mixed source instead of pricing it).
+    stats, reencoded = _mixed_source_checkpoint(tmp_path)
+    info = fp.floor_bytes_for_model(str(tmp_path), reencoded, stats)
+    r = fp.assignment_artifact_bytes(
+        {q: "NVFP4" for q in reencoded}, stats,
+        source_total_bytes=info["source_total_bytes"],
+        regime=info["regime"],
+        source_manifest=info["source_manifest"],
+    )
+    assert r["source_accounting"] == "per_tensor_manifest"
+    assert r["floor_bytes"] == info["floor_bytes"] == 1600
+    assert r["reencoded_source_bytes"] == info["reencoded_source_bytes"]
+    # The regime path on the same mixed source cannot agree — it goes
+    # negative and is rejected, never silently shipped.
+    with pytest.raises(ValueError, match="negative non-quantizable floor"):
+        fp.assignment_artifact_bytes(
+            {q: "NVFP4" for q in reencoded}, stats,
+            source_total_bytes=info["source_total_bytes"], regime="fp8",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Packed-MoE expert name resolution (PR-15 review: the manifest must price
+# packed allocator names on BOTH on-disk layouts)
+# ---------------------------------------------------------------------------
+
+# hidden=32, intermediate=16, 2 experts. Per-expert projections on disk:
+# gate/up (16, 32) each, down (32, 16). The allocator names the PACKED live
+# params: gate_up_proj = output-axis gate+up fusion -> (2, 32, 32), and
+# down_proj -> (2, 32, 16).
+_PACKED_STATS = {
+    "layers.0.mlp.experts.gate_up_proj": {
+        "n_params": 2 * 32 * 32, "in_features": 32, "out_features": 32,
+        "num_experts": 2},
+    "layers.0.mlp.experts.down_proj": {
+        "n_params": 2 * 32 * 16, "in_features": 16, "out_features": 32,
+        "num_experts": 2},
+}
+_PACKED_NAMES = list(_PACKED_STATS)
+
+
+def _case_a_per_expert_disk(tmp_path):
+    """CASE A: per-expert 2-D tensors on disk; allocator names are packed."""
+    _write_safetensors(tmp_path / "m.safetensors", {
+        "layers.0.mlp.experts.0.gate_proj.weight": ("BF16", (16, 32)),  # 1024
+        "layers.0.mlp.experts.0.up_proj.weight": ("BF16", (16, 32)),    # 1024
+        "layers.0.mlp.experts.0.down_proj.weight": ("BF16", (32, 16)),  # 1024
+        "layers.0.mlp.experts.1.gate_proj.weight": ("BF16", (16, 32)),
+        "layers.0.mlp.experts.1.up_proj.weight": ("BF16", (16, 32)),
+        "layers.0.mlp.experts.1.down_proj.weight": ("BF16", (32, 16)),
+        "embed.weight": ("BF16", (100, 8)),                             # 1600
+    })
+
+
+def test_packed_expert_alias():
+    assert fp.packed_expert_alias("layers.0.mlp.experts.7.gate_proj") == \
+        "layers.0.mlp.experts.gate_up_proj"
+    assert fp.packed_expert_alias("layers.0.mlp.experts.7.up_proj") == \
+        "layers.0.mlp.experts.gate_up_proj"
+    assert fp.packed_expert_alias("layers.0.mlp.experts.7.down_proj") == \
+        "layers.0.mlp.experts.down_proj"
+    # not per-expert / unknown projection / non-expert container -> None
+    assert fp.packed_expert_alias("layers.0.mlp.experts.gate_up_proj") is None
+    assert fp.packed_expert_alias("layers.0.mlp.experts.7.w1") is None
+    assert fp.packed_expert_alias("layers.0.self_attn.q_proj") is None
+    # profile callable wins over the fallback
+    assert fp.packed_expert_alias(
+        "layers.0.mlp.experts.3.w1",
+        lambda p: "w1_w3" if p in ("w1", "w3") else None,
+    ) == "layers.0.mlp.experts.w1_w3"
+
+
+def test_manifest_case_a_per_expert_disk_aggregates_to_packed(tmp_path):
+    _case_a_per_expert_disk(tmp_path)
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+    # gate+up fuse into gate_up across both experts; down aggregates 1:1.
+    assert m["layers.0.mlp.experts.gate_up_proj"] == 4 * 1024
+    assert m["layers.0.mlp.experts.down_proj"] == 2 * 1024
+    # per-expert entries are kept for per-expert-named allocations
+    assert m["layers.0.mlp.experts.0.gate_proj"] == 1024
+    assert m["layers.0.mlp.experts.1.down_proj"] == 1024
+
+    info = fp.floor_bytes_for_model(str(tmp_path), _PACKED_NAMES, _PACKED_STATS)
+    assert info["reencoded_source_bytes"] == 6 * 1024
+    assert info["floor_bytes"] == 1600  # exactly the embed
+
+    # end-to-end: artifact = floor + quantized expert bodies, floor exact
+    r = fp.assignment_artifact_bytes(
+        {q: "NVFP4" for q in _PACKED_NAMES}, _PACKED_STATS,
+        source_total_bytes=info["source_total_bytes"],
+        regime=info["regime"], source_manifest=info["source_manifest"],
+    )
+    body = (fr.get_format("NVFP4").memory_bytes_for_shape((2, 32, 32))
+            + 8 * 2 * 2   # gate_up: per-expert globals x 2 projections
+            + fr.get_format("NVFP4").memory_bytes_for_shape((2, 32, 16))
+            + 8 * 2)      # down: per-expert globals x 1 projection
+    assert r["floor_bytes"] == 1600
+    assert r["artifact_bytes"] == 1600 + body
+
+
+def test_manifest_case_b_packed_3d_without_weight_suffix(tmp_path):
+    """CASE B: packed 3-D checkpoint keys carry NO '.weight' suffix (the
+    transformers packed-experts convention: the param IS the key). They must
+    not be skipped, and sidecars still attach to the suffix-less base."""
+    _write_safetensors(tmp_path / "m.safetensors", {
+        "layers.0.mlp.experts.gate_up_proj": ("F8_E4M3", (2, 32, 32)),   # 2048
+        "layers.0.mlp.experts.gate_up_proj.scale": ("U8", (2, 32, 1)),   # 64
+        "layers.0.mlp.experts.down_proj": ("F8_E4M3", (2, 32, 16)),      # 1024
+        "embed.weight": ("BF16", (100, 8)),                              # 1600
+    })
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+    assert m["layers.0.mlp.experts.gate_up_proj"] == 2048 + 64
+    assert m["layers.0.mlp.experts.down_proj"] == 1024
+    # standalone sidecar keys never become their own manifest entries
+    assert "layers.0.mlp.experts.gate_up_proj.scale" not in m
+
+    info = fp.floor_bytes_for_model(str(tmp_path), _PACKED_NAMES, _PACKED_STATS)
+    assert info["reencoded_source_bytes"] == 2048 + 64 + 1024
+    assert info["floor_bytes"] == 1600
+
+
+def test_unresolved_reencoded_name_is_a_hard_error(tmp_path):
+    # PR-15 review: a re-encoded Linear the manifest cannot resolve must be
+    # a hard error NAMING the tensor, raised before the numbers are consumed
+    # — not a post-hoc warning after a fatal "below the floor" exit.
+    with pytest.raises(ValueError, match=r"ghost\.proj"):
+        fp.resolve_reencoded_source_bytes(
+            {"layer.w": 64}, ["layer.w", "ghost.proj"], context="unit")
+
+    _case_a_per_expert_disk(tmp_path)
+    with pytest.raises(ValueError, match=r"not\.in\.checkpoint"):
+        fp.floor_bytes_for_model(
+            str(tmp_path), _PACKED_NAMES + ["not.in.checkpoint"], _PACKED_STATS)
+
+    stats = dict(_PACKED_STATS)
+    stats["not.in.checkpoint"] = {
+        "n_params": 32, "in_features": 32, "out_features": 1}
+    with pytest.raises(ValueError, match=r"not\.in\.checkpoint"):
+        fp.assignment_artifact_bytes(
+            {"not.in.checkpoint": "NVFP4"}, stats,
+            source_total_bytes=10_000, regime="bf16",
+            source_manifest={"layer.w": 64})

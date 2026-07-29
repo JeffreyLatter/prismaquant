@@ -131,19 +131,87 @@ def source_regime(by_dtype: Mapping[str, int]) -> str:
     return "bf16"
 
 
+# Quantization sidecar suffixes summed into their base tensor's manifest
+# entry: the export removes these together with the weight when it
+# re-encodes a Linear (DSv4 ``.scale`` MXFP4/E8M0 group scales, DeepSeek /
+# MiniMax fp8 ``.weight_scale_inv`` 128x128 block scales, compressed-tensors
+# ``.weight_scale``). A standalone sidecar with no base tensor is never
+# re-encoded and stays priced in the floor.
+_SIDECAR_SUFFIXES = (".scale", ".weight_scale_inv", ".weight_scale")
+
+
+def _default_expert_parent_for_projection(projection_name: str) -> str | None:
+    """No-profile fallback for the per-expert -> packed projection mapping.
+
+    Mirrors ``ModelProfile.packed_expert_parent_for_projection``'s legacy
+    fallback: per-expert ``gate_proj``/``up_proj`` fuse into the packed
+    ``gate_up_proj`` (output-axis cat, the transformers packed-FusedMoE
+    convention); ``down_proj`` packs 1:1. Anything else (e.g. MiniMax's
+    per-expert ``w1``/``w2``/``w3`` modules, which stay per-expert live)
+    has no packed parent here — callers with a profile should pass its
+    ``packed_expert_parent_for_projection`` instead.
+    """
+    if projection_name in ("gate_proj", "up_proj"):
+        return "gate_up_proj"
+    if projection_name == "down_proj":
+        return "down_proj"
+    return None
+
+
+def packed_expert_alias(qname: str, parent_for_projection=None) -> str | None:
+    """Packed live qname a per-expert Linear aggregates into, or None.
+
+    ``...experts.{i}.{proj}`` -> ``...experts.{parent}`` when
+    ``parent_for_projection(proj)`` names a packed parent
+    (``ModelProfile.packed_expert_parent_for_projection``; the legacy
+    gate/up/down fallback when None). Non-expert names and unrecognized
+    projections return None. This is the same structural
+    ``experts.{idx}.{leaf}`` detection the profile layer uses for
+    packed-format grouping (``packed_expert_format_group``).
+    """
+    parts = str(qname).split(".")
+    if len(parts) < 3 or parts[-3] != "experts" or not parts[-2].isdigit():
+        return None
+    fn = (parent_for_projection if parent_for_projection is not None
+          else _default_expert_parent_for_projection)
+    parent = fn(parts[-1])
+    if not parent:
+        return None
+    return ".".join(parts[:-2] + [str(parent)])
+
+
 def source_tensor_bytes_manifest(
     model_path: str,
     name_map=None,
+    expert_parent_for_projection=None,
 ) -> dict[str, int]:
     """Exact on-disk source bytes per weight tensor, keyed by live qname base.
 
-    Walks the safetensors headers and, for every ``<base>.weight`` tensor,
-    sums its byte span with its quantization sidecars (``<base>.scale``,
-    ``<base>.weight_scale_inv``) — exactly the bytes the export removes from
-    the checkpoint when it re-encodes that Linear. ``name_map`` maps a
-    checkpoint key to the live transformers parameter name
-    (``ModelProfile.checkpoint_to_live_name``); identity when None. Keys are
-    stored without the ``.weight`` suffix to match allocator qnames.
+    Walks the safetensors headers and, for every weight tensor, sums its
+    byte span with its quantization sidecars (``<base>.scale``,
+    ``<base>.weight_scale_inv``, ``<base>.weight_scale``) — exactly the
+    bytes the export removes from the checkpoint when it re-encodes that
+    Linear. ``name_map`` maps a checkpoint key to the live transformers
+    parameter name (``ModelProfile.checkpoint_to_live_name``); identity
+    when None. Keys are stored without the ``.weight`` suffix to match
+    allocator qnames.
+
+    Both packed-MoE on-disk layouts resolve to the packed allocator names
+    (``...experts.gate_up_proj`` / ``...experts.down_proj``):
+
+    - **Packed 3-D on disk** (LFM2.5, Qwen3.6-35B): the expert param is a
+      checkpoint key with NO ``.weight`` suffix. Suffix-less keys are kept
+      (only sidecar keys are folded into their base), so the packed tensor
+      lands in the manifest under its own name.
+    - **Per-expert 2-D on disk** (``...experts.{i}.{proj}.weight``): each
+      per-expert span is ALSO accumulated into the packed parent name via
+      :func:`packed_expert_alias` (gate+up fuse into gate_up), driven by
+      ``expert_parent_for_projection``
+      (``ModelProfile.packed_expert_parent_for_projection``; legacy
+      gate/up/down fallback when None). The per-expert entries are kept
+      alongside the packed aggregate so per-expert-named allocations
+      resolve too — a ``reencoded_names`` list must use ONE naming scheme
+      per tensor (any consistent probe does), never both.
 
     This is the per-tensor replacement for the regime-wide
     ``reencoded_source_bytes_for_shape`` accounting, which charges EVERY
@@ -172,19 +240,70 @@ def source_tensor_bytes_manifest(
             a, b = meta["data_offsets"]
             spans[name] = spans.get(name, 0) + (int(b) - int(a))
     out: dict[str, int] = {}
+
+    def _add(live: str, nb: int) -> None:
+        out[live] = out.get(live, 0) + nb
+
     for name, nb in spans.items():
-        if not name.endswith(".weight"):
-            continue
-        base = name[: -len(".weight")]
-        total = (nb
-                 + spans.get(base + ".scale", 0)
-                 + spans.get(base + ".weight_scale_inv", 0))
+        if any(name.endswith(s) for s in _SIDECAR_SUFFIXES):
+            continue  # folded into its base tensor's entry below
+        # Packed 3-D expert params have no ".weight" suffix; the key IS the
+        # base (and its sidecars still hang off `<base>.scale` etc.).
+        base = name[: -len(".weight")] if name.endswith(".weight") else name
+        total = nb + sum(spans.get(base + s, 0) for s in _SIDECAR_SUFFIXES)
         live = name_map(name) if name_map is not None else name
         if not live:
             continue  # dropped by the profile (never re-encoded; stays in floor)
         if live.endswith(".weight"):
             live = live[: -len(".weight")]
-        out[live] = out.get(live, 0) + total
+        _add(live, total)
+        packed = packed_expert_alias(live, expert_parent_for_projection)
+        if packed is not None:
+            _add(packed, total)
+    return out
+
+
+def resolve_reencoded_source_bytes(
+    manifest: Mapping[str, int],
+    reencoded_names: Iterable[str],
+    *,
+    context: str,
+) -> dict[str, int]:
+    """Look up each re-encoded Linear's actual source bytes in the manifest.
+
+    A name the manifest cannot resolve is a HARD ERROR, not a warning: an
+    unresolved Linear's source bytes stay in the floor while its quantized
+    body bytes are still added, silently inflating the artifact estimate —
+    on a packed-MoE model by the full expert mass, at which point every
+    rung reads "below the floor". Raising here, before any selection
+    numbers are computed, puts the offending tensor names in front of the
+    operator instead of a fatal below-the-floor exit with a trailing
+    warning.
+    """
+    out: dict[str, int] = {}
+    missing: list[str] = []
+    for qname in reencoded_names:
+        nb = manifest.get(qname)
+        if nb is None and qname.endswith(".weight"):
+            nb = manifest.get(qname[: -len(".weight")])
+        if nb is None:
+            missing.append(qname)
+        else:
+            out[qname] = int(nb)
+    if missing:
+        shown = sorted(missing)[:10]
+        raise ValueError(
+            f"[footprint] {len(missing)} re-encoded Linear(s) not resolvable "
+            f"in the source checkpoint manifest ({context}): "
+            + ", ".join(shown)
+            + (", …" if len(missing) > len(shown) else "")
+            + ". Their source bytes would stay in the floor while their "
+            "quantized bytes are still added (artifact over-count; on a "
+            "packed-MoE model the entire expert mass is double-counted and "
+            "every rung reads 'below the floor'). Fix the profile's name "
+            "resolution (checkpoint_to_live_name / "
+            "packed_expert_parent_for_projection) so every re-encoded "
+            "tensor resolves; do not consume these numbers.")
     return out
 
 
@@ -303,6 +422,7 @@ def assignment_artifact_bytes(
     source_total_bytes: int,
     regime: str = "bf16",
     canonicalize: bool = True,
+    source_manifest: Mapping[str, int] | None = None,
 ) -> dict:
     """Exact on-disk bytes of the exported artifact for ``assignment``.
 
@@ -315,18 +435,31 @@ def assignment_artifact_bytes(
     is correct for any tensor that ships verbatim (and explains why a handful of
     fused super-names / pins can be missing yet the total stays exact).
 
-    ``regime`` ('bf16' | 'fp8', from source_regime) sets each re-encoded Linear's
-    *source* byte size removed from the floor: bf16 -> 2 bytes/param; fp8 -> the
-    full FP8_SOURCE layout (fp8 weight + fp32 128x128 weight_scale_inv), so the
-    source scale sibling is removed too (else it is double-counted: left in the
-    floor and re-added by the export).
+    ``source_manifest`` (from :func:`source_tensor_bytes_manifest`) is the
+    preferred source-byte accounting and the one
+    :func:`floor_bytes_for_model` and the allocator's byte-budget selector
+    use: each re-encoded Linear is charged its ACTUAL header byte span
+    (weight + scale siblings), so the two paths agree exactly. A priced
+    Linear the manifest cannot resolve is a hard error
+    (:func:`resolve_reencoded_source_bytes`).
+
+    Without a manifest, ``regime`` ('bf16' | 'fp8', from source_regime) sets
+    each re-encoded Linear's *source* byte size removed from the floor:
+    bf16 -> 2 bytes/param; fp8 -> the full FP8_SOURCE layout (fp8 weight +
+    fp32 128x128 weight_scale_inv), so the source scale sibling is removed
+    too (else it is double-counted: left in the floor and re-added by the
+    export). This is exact ONLY for a uniformly-bf16 or uniformly-fp8
+    (128x128-block-scaled) body; on any other source pass a manifest — a
+    mixed source drives the floor negative and is rejected
+    (``check_floor_non_negative``), never silently shipped.
 
     Returns a dict: ``artifact_bytes``, ``floor_bytes``, ``body_quant_bytes``,
-    ``reencoded_source_bytes``, ``n_reencoded``, ``n_missing_stats``, ``regime``.
+    ``reencoded_source_bytes``, ``n_reencoded``, ``n_missing_stats``,
+    ``regime``, ``source_accounting``.
     """
     body_quant = 0
     reenc_by_name: dict[str, int] = {}
-    n_reencoded = 0
+    priced: list[str] = []
     n_missing = 0
     for qname, fmt in assignment.items():
         entry = stats.get(qname)
@@ -340,8 +473,13 @@ def assignment_artifact_bytes(
         body_quant += fr.get_format(name).memory_bytes_for_shape(shape)
         if name == "NVFP4":
             body_quant += nvfp4_global_sidecar_bytes(qname, shape)
-        reenc_by_name[qname] = reencoded_source_bytes_for_shape(shape, regime)
-        n_reencoded += 1
+        if source_manifest is None:
+            reenc_by_name[qname] = reencoded_source_bytes_for_shape(
+                shape, regime)
+        priced.append(qname)
+    if source_manifest is not None:
+        reenc_by_name = resolve_reencoded_source_bytes(
+            source_manifest, priced, context="assignment_artifact_bytes")
     reenc_src = sum(reenc_by_name.values())
     floor = int(source_total_bytes) - reenc_src
     check_floor_non_negative(
@@ -352,9 +490,11 @@ def assignment_artifact_bytes(
         "floor_bytes": floor,
         "body_quant_bytes": body_quant,
         "reencoded_source_bytes": reenc_src,
-        "n_reencoded": n_reencoded,
+        "n_reencoded": len(priced),
         "n_missing_stats": n_missing,
         "regime": regime,
+        "source_accounting": (
+            "per_tensor_manifest" if source_manifest is not None else "regime"),
     }
 
 
@@ -364,12 +504,14 @@ def assignment_artifact_gb(
     *,
     source_total_bytes: int,
     regime: str = "bf16",
+    source_manifest: Mapping[str, int] | None = None,
 ) -> float:
     """Convenience: just the artifact size in GB (decimal, matches index.json)."""
     return assignment_artifact_bytes(
         assignment, stats,
         source_total_bytes=source_total_bytes,
         regime=regime,
+        source_manifest=source_manifest,
     )["artifact_bytes"] / GB
 
 
@@ -379,35 +521,38 @@ def floor_bytes_for_model(
     stats: Mapping[str, dict],
     *,
     regime: str | None = None,
+    name_map=None,
+    expert_parent_for_projection=None,
 ) -> dict:
     """Compute the non-quantizable floor (and the scalars to reuse) from a model.
 
     Convenience wrapper that reads the checkpoint headers once and returns
     ``{source_total_bytes, regime, source_bytes_per_param, floor_bytes,
-    reencoded_source_bytes, source_dtype_bytes}``. The floor is constant across
-    formats (only the re-encoded *format* varies, not which tensors are
-    re-encoded), so callers sweeping many allocations compute this once and pass
-    ``source_total_bytes`` + ``regime`` to ``assignment_artifact_bytes`` per
-    candidate. Each re-encoded Linear is charged its actual header byte
-    span from :func:`source_tensor_bytes_manifest` (this function has the
-    model path, so it never needs the regime-wide per-param rate); names
-    missing from the manifest stay priced in the floor — over-count only.
-    ``regime`` defaults to :func:`source_regime` (robust fp8/bf16
-    detection) and is returned for the per-candidate
-    ``assignment_artifact_bytes`` calls, which have no model path.
-    ``stats`` is retained for call compatibility (shapes are no longer
-    needed to price source bytes).
+    reencoded_source_bytes, source_manifest, source_dtype_bytes}``. The floor
+    is constant across formats (only the re-encoded *format* varies, not which
+    tensors are re-encoded), so callers sweeping many allocations compute this
+    once and pass ``source_total_bytes`` + ``source_manifest`` to
+    ``assignment_artifact_bytes`` per candidate. Each re-encoded Linear is
+    charged its actual header byte span from
+    :func:`source_tensor_bytes_manifest` (this function has the model path,
+    so it never needs the regime-wide per-param rate); a name the manifest
+    cannot resolve is a hard error (:func:`resolve_reencoded_source_bytes`) —
+    an unresolved name would silently over-count the artifact.
+    ``name_map`` / ``expert_parent_for_projection`` are the profile's
+    ``checkpoint_to_live_name`` / ``packed_expert_parent_for_projection``
+    (pass them for any packed-MoE architecture; defaults handle the
+    identity naming and the legacy gate/up/down packing). ``regime``
+    defaults to :func:`source_regime` (robust fp8/bf16 detection) and is
+    returned for reporting. ``stats`` is retained for call compatibility
+    (shapes are no longer needed to price source bytes).
     """
     total, by_dtype = source_checkpoint_bytes(model_path)
     reg = regime if regime is not None else source_regime(by_dtype)
-    manifest = source_tensor_bytes_manifest(model_path)
-    reenc_by_name: dict[str, int] = {}
-    for qname in reencoded_names:
-        nb = manifest.get(qname)
-        if nb is None and qname.endswith(".weight"):
-            nb = manifest.get(qname[: -len(".weight")])
-        if nb is not None:
-            reenc_by_name[qname] = int(nb)
+    manifest = source_tensor_bytes_manifest(
+        model_path, name_map=name_map,
+        expert_parent_for_projection=expert_parent_for_projection)
+    reenc_by_name = resolve_reencoded_source_bytes(
+        manifest, reencoded_names, context="floor_bytes_for_model")
     reenc_src = sum(reenc_by_name.values())
     check_floor_non_negative(
         int(total) - reenc_src, total, reenc_by_name,
@@ -418,5 +563,6 @@ def floor_bytes_for_model(
         "source_bytes_per_param": dominant_source_bytes_per_param(by_dtype),
         "floor_bytes": int(total) - reenc_src,
         "reencoded_source_bytes": reenc_src,
+        "source_manifest": manifest,
         "source_dtype_bytes": by_dtype,
     }
