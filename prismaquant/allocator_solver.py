@@ -403,14 +403,19 @@ def solve_with_promotion(
     group into a denser-but-worse format. When no
     iterate is feasible within ``max_iters`` the rung is INFEASIBLE and
     ``(None, nan)`` is returned so callers exclude it from the Pareto curve
-    and byte-budget bisection. The three silent fallbacks this replaces all
-    fabricated ``feasible=True`` rows:
+    and byte-budget bisection. Three silent fallbacks are replaced:
 
       - ``solve_allocation`` returning None (tightened below the format
         floor) used to return the previous, massively over-target iterate;
       - any undershoot, however deep, used to be accepted immediately
         (rung 6.0 returning achieved 4.95 with 25x worse loss);
       - the stall exit used to return an iterate still far above target.
+
+    Honest scope: only the ``--target-bits`` emit path shipped those
+    over-target iterates silently. The byte-budget selector priced them
+    at their true (larger) disk size, so its feasibility calls were
+    correct — the rung label was just wrong, skewing the Pareto curve's
+    x-axis rather than fabricating feasibility.
 
     The search runs in two phases on the *tightened* DP target:
 
