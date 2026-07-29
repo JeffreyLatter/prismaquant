@@ -497,3 +497,47 @@ def test_group_ucb_stderr_aggregates_in_quadrature(monkeypatch):
         assert abs(cand.predicted_dloss - n_members * base[fmt]) < 1e-12
         agg = (n_members * stderr[fmt] ** 2) ** 0.5
         assert abs(costs0[super0][fmt]["predicted_dloss_stderr"] - agg) < 1e-12
+
+
+def test_role_split_requires_profile_capability():
+    """--packed-role-split is only legal when the resolved serving profile
+    DECLARES per-role expert schemes: a role-split checkpoint carries
+    different expert formats for gate_up vs down projections of one MoE
+    layer, which vLLM's compressed-tensors packed-MoE path cannot load
+    (one scheme per FusedMoE layer) but the GGUF lane can (expert tensors
+    stack per projection)."""
+    import pytest
+
+    from prismaquant.serving_profiles import (
+        load_serving_profile,
+        require_per_role_expert_scheme_support,
+    )
+
+    # Capability declarations: only the GGUF lane opts in.
+    assert load_serving_profile("gguf").supports_per_role_expert_schemes
+    for profile_id in ("research", "vllm_packed_moe",
+                       "vllm_qwen3_5_packed_moe"):
+        assert not load_serving_profile(
+            profile_id).supports_per_role_expert_schemes, profile_id
+
+    # Supporting profile: accepted, resolved profile returned.
+    prof = require_per_role_expert_scheme_support(
+        "gguf", flag="--packed-role-split")
+    assert prof.id == "gguf"
+
+    # Non-supporting profile: hard error naming the flag, the profile,
+    # and why (one scheme per FusedMoE layer).
+    with pytest.raises(SystemExit) as exc:
+        require_per_role_expert_scheme_support(
+            "vllm_packed_moe", flag="--packed-role-split")
+    msg = str(exc.value)
+    assert "--packed-role-split" in msg
+    assert "vllm_packed_moe" in msg
+    assert "FusedMoE" in msg
+
+    # Default (research) and unknown profiles: hard error, never a
+    # silent pass.
+    with pytest.raises(SystemExit):
+        require_per_role_expert_scheme_support(None)
+    with pytest.raises(SystemExit):
+        require_per_role_expert_scheme_support("no_such_profile")

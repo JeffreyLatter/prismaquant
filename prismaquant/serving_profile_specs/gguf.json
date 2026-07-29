@@ -2,6 +2,7 @@
   "schema": "prismaquant.serving_profile.v1",
   "id": "gguf",
   "runtime": "llama_cpp_or_vllm_gguf",
+  "supports_per_role_expert_schemes": true,
   "description": "GGUF container lane: llama.cpp-native serving, plus vLLM via the in-tree (<=0.19) or vllm-gguf-plugin (>=0.23) GGUF path. One container, one kernel family: only ggml tensor types are expressible, so the non-GGUF quantized formats are structurally unavailable rather than policy-denied.",
   "format_rules": [
     {
