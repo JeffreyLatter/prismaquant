@@ -1762,11 +1762,16 @@ def main():
         """
         cache_key = round(float(target_bits), 9)
         cached = _solve_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        result = _solve_for_target_uncached(target_bits)
-        _solve_cache[cache_key] = result
-        return result
+        if cached is None:
+            cached = _solve_for_target_uncached(target_bits)
+            _solve_cache[cache_key] = cached
+        # Hand out a copy of the assignment dict: callers may mutate it
+        # (fused-sibling expansion, fixed-format update) and must never
+        # poison the cached solve.
+        assign, achieved_r, total, mutable_total = cached
+        if assign is not None:
+            assign = dict(assign)
+        return assign, achieved_r, total, mutable_total
 
     def _solve_for_target_uncached(target_bits: float):
         mutable_target_bits = float(target_bits)
@@ -2167,9 +2172,11 @@ def main():
         # Bound the ratchet by the cheapest grid rung that does NOT fit:
         # bisecting toward the near-lossless cap on a card that only fits
         # the low rungs wastes dozens of expensive DP solves at high-bin
-        # targets. disk(target) is only locally non-monotone, and the
-        # ratchet never accepts a probe below the proven grid pick, so
-        # tightening the ceiling to the first non-fitting rung is safe.
+        # targets. HEURISTIC: this assumes disk(target) is only LOCALLY
+        # non-monotone — if a fitting allocation existed above the first
+        # non-fitting rung, the tightened ceiling would forgo it. The
+        # ratchet never accepts a probe below the proven grid pick, so the
+        # downside is bounded at shipping the grid pick, never worse.
         over_budget = [c for c in grid if c["disk_bytes"] > budget_bytes]
         if over_budget:
             search_hi = min(
