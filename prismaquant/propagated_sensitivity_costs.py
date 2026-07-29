@@ -134,11 +134,13 @@ def apply_propagated_sensitivity_penalty(
                 penalty = propagated * scale_f * member_share * format_ratio
                 if penalty <= 0.0:
                     continue
-                base_predicted = cost_entry_predicted_dloss(dict(stat), dict(entry))
+                base_predicted = cost_entry_predicted_dloss(
+                    dict(stat), dict(entry), format_name=fmt_c)
                 new_entry = copy.deepcopy(dict(entry))
                 uses_output_mse = cost_entry_uses_measured_output_mse(
                     dict(stat),
                     dict(entry),
+                    format_name=fmt_c,
                 )
                 new_entry[f"{metadata_prefix}_uses_output_mse"] = bool(uses_output_mse)
                 if uses_output_mse:
