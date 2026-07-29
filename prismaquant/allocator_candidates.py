@@ -219,46 +219,11 @@ def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
     return True
 
 
-def cost_entry_is_bit_exact(cost_entry: dict) -> bool:
-    """Whether a measured ``weight_mse`` of exactly 0.0 proves a lossless
-    re-encode.
-
-    ``weight_mse`` is a mean of squared per-element deltas: it is exactly
-    zero only when the format stores the source weights verbatim (W' == W)
-    — e.g. MXFP8 over an FP8 128-block source, or MXFP4/MXFP6/MXFP8 over
-    an MXFP4-packed QAT source. A bit-identical weight tensor cannot
-    perturb the layer output, so an accompanying positive ``output_mse``
-    is measurement-pipeline noise (kernel dequant dtype, activation
-    sampling), not signal. Pricing a bit-exact format from that noise
-    inverts dominance: a menu-union solve can price MXFP4 (weight_mse 0,
-    output_mse of pure noise) ABOVE lossy Q4_K on every expert row and
-    never select an MX format at all. Measured zero is a valid,
-    indeed optimal, cost (see ``_log_error_values`` in allocator.py):
-    bit-exact entries short-circuit to predicted dloss 0.0.
-
-    Entries that declare an explicit ``cost_source`` (e.g. the
-    production-render score pipeline) carry their own authoritative
-    pricing and default ``weight_mse`` to 0.0 as a placeholder, not a
-    measurement — they are never treated as bit-exact, matching the
-    precedence ``cost_entry_source`` already gives the explicit source.
-    """
-    explicit = cost_entry.get("cost_source")
-    if isinstance(explicit, str) and explicit:
-        return False
-    weight_mse = cost_entry.get("weight_mse")
-    try:
-        return weight_mse is not None and float(weight_mse) == 0.0
-    except (TypeError, ValueError):
-        return False
-
-
 def cost_entry_uses_measured_output_mse(
     stats_entry: dict,
     cost_entry: dict,
 ) -> bool:
     """Whether ``cost_entry_predicted_dloss`` will read ``output_mse``."""
-    if cost_entry_is_bit_exact(cost_entry):
-        return False
     return _has_measured_output_mse(stats_entry, cost_entry)
 
 
@@ -267,8 +232,6 @@ def cost_entry_source(stats_entry: dict, cost_entry: dict) -> str:
     explicit = cost_entry.get("cost_source")
     if isinstance(explicit, str) and explicit:
         return explicit
-    if cost_entry_is_bit_exact(cost_entry):
-        return "bit_exact"
     if _has_measured_output_mse(stats_entry, cost_entry):
         if (
             _fisher_output_mse_allocator_enabled()
@@ -295,10 +258,6 @@ def cost_entry_predicted_dloss(
     gain: float = 1.0,
 ) -> float:
     """Return the allocator's authoritative Δloss for one cost entry."""
-    if cost_entry_is_bit_exact(cost_entry):
-        # Lossless re-encode: zero cost by construction, regardless of any
-        # noisy output_mse measurement (see cost_entry_is_bit_exact).
-        return 0.0
     if _has_measured_output_mse(stats_entry, cost_entry):
         if (
             _fisher_output_mse_allocator_enabled()
