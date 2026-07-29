@@ -27,6 +27,7 @@ import pytest
 import torch
 from torch import nn
 
+from prismaquant.allocator import renormalize_probe_fisher
 from prismaquant.incremental_probe import finalize_fisher_stats
 from prismaquant.measure_quant_cost import HDetailIndex
 from prismaquant.sensitivity_probe import FisherAccumulator, h_detail_blob
@@ -166,3 +167,50 @@ def test_sensitivity_backend_scalar_and_blob_agree_end_to_end():
             assert blob["norm_tokens"] == global_tokens
             assert float(blob["h_diag"].sum()) == pytest.approx(
                 s["h_trace"], rel=1e-4)
+
+def _legacy_probe_stats():
+    """A legacy-finalized probe: expert row divided by its routed count."""
+    return {
+        "dense": {"h_trace_raw": 64.0, "h_w2_sum_raw": 8.0,
+                  "h_trace": 2.0, "h_w2_sum": 0.25, "n_tokens_seen": 32},
+        "expert": {"h_trace_raw": 64.0, "h_w2_sum_raw": 8.0,
+                   "h_trace": 16.0, "h_w2_sum": 2.0, "n_tokens_seen": 4},
+    }
+
+
+def test_allocator_renormalizes_from_meta_and_is_idempotent():
+    stats = _legacy_probe_stats()
+    assert renormalize_probe_fisher(
+        stats, {"nsamples": 4, "seqlen": 8}) == 32
+    assert stats["expert"]["h_trace"] == pytest.approx(2.0)
+    assert stats["expert"]["h_w2_sum"] == pytest.approx(0.25)
+    assert stats["dense"]["h_trace"] == pytest.approx(2.0)
+    assert stats["expert"]["h_trace_norm_tokens"] == 32
+    # fisher_norm_tokens (stamped by the fixed finalize) wins over
+    # nsamples x seqlen, and re-running changes nothing.
+    assert renormalize_probe_fisher(
+        stats, {"fisher_norm_tokens": 32, "nsamples": 999, "seqlen": 999}) == 32
+    assert stats["expert"]["h_trace"] == pytest.approx(2.0)
+
+
+def test_allocator_hard_fails_on_probe_without_token_meta():
+    stats = _legacy_probe_stats()
+    with pytest.raises(SystemExit, match="allow-legacy-fisher-norm"):
+        renormalize_probe_fisher(stats, {})
+    # Values untouched by the failed attempt.
+    assert stats["expert"]["h_trace"] == pytest.approx(16.0)
+
+
+def test_allocator_legacy_escape_hatch_keeps_stored_values():
+    stats = _legacy_probe_stats()
+    assert renormalize_probe_fisher(stats, {}, allow_legacy=True) is None
+    assert stats["expert"]["h_trace"] == pytest.approx(16.0)
+    assert stats["dense"]["h_trace"] == pytest.approx(2.0)
+
+
+def test_allocator_no_raw_rows_is_silent_no_op():
+    """Probes without raw accumulators (nothing to renormalize, nothing to
+    detect) must not trip the hard fail."""
+    stats = {"dense": {"h_trace": 2.0, "n_tokens_seen": 32}}
+    assert renormalize_probe_fisher(stats, {}) is None
+    assert stats["dense"]["h_trace"] == pytest.approx(2.0)
