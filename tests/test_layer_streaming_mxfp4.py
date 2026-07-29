@@ -199,6 +199,32 @@ def test_mxfp4_decode_bit_exact_vs_scalar_reference(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# resident-size estimators price declared-MXFP4 I8 as 2 elements/byte
+# ---------------------------------------------------------------------------
+
+def test_layer_cache_estimate_prices_declared_fp4_experts_4x(tmp_path):
+    """`_estimate_layer_cache_bytes` must price declared-MXFP4 I8 experts
+    at 2 logical elements x target dtype per packed byte (4x at bf16);
+    an undeclared checkpoint keeps the verbatim 1 byte/elem. The 4x
+    undercount made prepare_for_load() under-evict and prefetch refuse
+    layers that actually fit."""
+    from prismaquant.streaming_model import _estimate_layer_cache_bytes
+    key_e = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    key_d = "model.layers.0.self_attn.q_proj.weight"
+    shard = str(tmp_path / "model.safetensors")
+    save_file({key_e: torch.zeros(64, 32, dtype=torch.int8),
+               key_d: torch.zeros(16, 16, dtype=torch.bfloat16)}, shard)
+    kw = dict(weight_shard={key_e: shard, key_d: shard},
+              weight_ckpt={key_e: key_e, key_d: key_d},
+              layers_prefix="model.layers.", num_layers=1,
+              target_dtype=torch.bfloat16)
+    est_fp4, sizes_fp4 = _estimate_layer_cache_bytes(fp4_experts=True, **kw)
+    assert sizes_fp4[0] == 64 * 32 * 2 * 2 + 16 * 16 * 2
+    est_i8, sizes_i8 = _estimate_layer_cache_bytes(fp4_experts=False, **kw)
+    assert sizes_i8[0] == 64 * 32 * 1 + 16 * 16 * 2
+
+
+# ---------------------------------------------------------------------------
 # d) batched shape-group decode matches the reference across chunk
 #    boundaries
 # ---------------------------------------------------------------------------
