@@ -641,6 +641,12 @@ def _apply_fp8_dequant_inplace(
             deq[:, 1::2] = lut[(wp >> 4).to(torch.long)]
             sb = loaded_scales[name].to(device=device).view(torch.uint8)
             scale = torch.exp2((sb.to(torch.float32) - 127.0))
+            # E8M0 0xFF is NaN per the OCP MX v1.0 spec, not 2^128:
+            # exp2(128) yields +inf, which turned a 0xFF block into a mix
+            # of ±inf (nonzero elements) and NaN (zero elements, 0*inf)
+            # instead of 32 NaNs.
+            scale = torch.where(
+                sb == 0xFF, torch.full_like(scale, float("nan")), scale)
             deq = (deq.reshape(rows, logical_in // 32, 32).to(torch.float32)
                    * scale.unsqueeze(-1)).to(torch.bfloat16)
             out[name] = deq.reshape(rows, logical_in).contiguous()

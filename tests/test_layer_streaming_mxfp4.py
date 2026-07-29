@@ -165,6 +165,24 @@ def _assert_bitwise_equal_bf16(got: torch.Tensor, ref: torch.Tensor):
                        ref[finite].view(torch.int16))
 
 
+def test_e8m0_ff_scale_yields_all_nan_block(tmp_path):
+    """E8M0 0xFF is NaN per the OCP MX v1.0 spec. exp2(0xFF - 127) =
+    +inf turned a 0xFF block into 29 ±inf (nonzero elements) + 3 NaN
+    (zero elements, 0*inf) instead of 32 NaNs."""
+    packed, scale = _rand_expert(rows=2, packed_in=32, seed=3)
+    scale[0, 0] = 0xFF  # first 32-element group of row 0
+    _write_dsv4_checkpoint(tmp_path, {0: (packed, scale)})
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    out = {_live(0): packed.clone()}
+    _apply_fp8_dequant_inplace(out, fp8_map, CPU)
+    got = out[_live(0)]
+    assert torch.isnan(got[0, :32]).all()
+    assert not torch.isinf(got).any()
+    # Other groups decode normally.
+    assert torch.isfinite(got[0, 32:]).all() and torch.isfinite(got[1]).all()
+    _assert_bitwise_equal_bf16(got, _scalar_reference_decode(packed, scale))
+
+
 def test_mxfp4_decode_bit_exact_vs_scalar_reference(tmp_path):
     packed, scale = _rand_expert(rows=8, packed_in=64, seed=7)
     # Exercise every FP4 code at least once.
