@@ -80,6 +80,12 @@ The production pipeline fails fast when archived Fisher levers are requested.
 | `PRODUCTION_CACHE_PREFETCH` | `require` | Standalone recache prefetch policy. `require` fails fast when assignment-required weights cannot fit resident, preventing silent NVMe-bound replay. |
 | `PRODUCTION_CACHE_PREFETCH_WORKERS` | `4` | Thread count for eager production-cache prefetch. |
 
+## Allocator / solver flags
+
+| Flag | Default | What it does |
+|---|---|---|
+| `PRISMAQUANT_SOLVER_TRACE` | `0` (off) | Per-evaluation trace for `solve_with_promotion`: prints each tightened-target DP eval with achieved bits, predicted Δloss, and wall time, plus DP-infeasible probes. Read once at module import (no per-call getenv on the solve path) — set it before launching the allocator. Observability only; does not change the solve. |
+
 ## CUDA / system flags
 
 | env var | recommended | what it does |
@@ -189,6 +195,7 @@ PRISMAQUANT_PROD_ACT_SCALES
 PRISMAQUANT_RENDER_GATE_MIN_GAIN
 PRISMAQUANT_RENDER_PROGRESSIVE_GATES
 PRISMAQUANT_SHARED_WEIGHT_FORMAT_CACHE
+PRISMAQUANT_SOLVER_TRACE
 PRISMAQUANT_STRICT_ASSIGNMENT_COVERAGE
 PRISMAQUANT_STRICT_PRODUCTION_CACHE
 PRISMAQUANT_TMPDIR
