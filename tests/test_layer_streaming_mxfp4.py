@@ -196,3 +196,25 @@ def test_mxfp4_decode_bit_exact_vs_scalar_reference(tmp_path):
     got = out[_live(0)]
     assert got.shape == (8, 128)
     _assert_bitwise_equal_bf16(got, _scalar_reference_decode(packed, scale))
+
+
+# ---------------------------------------------------------------------------
+# d) batched shape-group decode matches the reference across chunk
+#    boundaries
+# ---------------------------------------------------------------------------
+
+def test_batched_decode_matches_reference_across_chunks(tmp_path, monkeypatch):
+    from prismaquant import layer_streaming as LS
+    monkeypatch.setattr(LS, "_MXFP4_DECODE_CHUNK", 2)
+    # 5 experts of one shape (splits 2+2+1) — exercises chunk boundaries
+    # and the shape-group stacking.
+    experts = {eid: _rand_expert(rows=4, packed_in=32, seed=10 + eid)
+               for eid in range(5)}
+    _write_dsv4_checkpoint(tmp_path, experts)
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    assert fp8_map.mxfp4_names == {_live(e) for e in experts}
+    out = {_live(e): p.clone() for e, (p, _s) in experts.items()}
+    assert _apply_fp8_dequant_inplace(out, fp8_map, CPU) == 5
+    for eid, (packed, scale) in experts.items():
+        _assert_bitwise_equal_bf16(
+            out[_live(eid)], _scalar_reference_decode(packed, scale))

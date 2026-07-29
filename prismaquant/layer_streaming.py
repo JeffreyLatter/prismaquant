@@ -507,6 +507,14 @@ def _require_fp8_scale(
     )
 
 
+# Tensors per batched MXFP4 decode launch (step 3b below). Bounds the
+# long-dtype LUT-gather transient (8 B/packed byte + the fp32 scale
+# multiply) to roughly the same order as step 3's whole-group bf16
+# stacks, while still collapsing DSv4's ~768 per-layer expert tensors
+# into ~24 launches.
+_MXFP4_DECODE_CHUNK = 32
+
+
 def _apply_fp8_dequant_inplace(
     out: dict[str, torch.Tensor],
     fp8_scale_inv_map: dict[str, tuple[str, str]],
@@ -625,33 +633,53 @@ def _apply_fp8_dequant_inplace(
     # nibble unpack + per-32-element E8M0 scale, per the OCP Microscaling
     # Formats (MX) v1.0 spec: FP4 E2M1 element grid ({0, 0.5, 1, 1.5, 2,
     # 3, 4, 6} with a sign bit), one shared E8M0 power-of-two scale per
-    # 32-element group.
+    # 32-element group. Batched like step 3 — same-shape tensors stack
+    # and decode together (DSv4 loads ~768 expert tensors per layer;
+    # per-tensor kernel launches are exactly what this function's batched
+    # design exists to avoid) — but in chunks of _MXFP4_DECODE_CHUNK:
+    # the byte->pair LUT gather needs long indices, an 8 B/packed-byte
+    # transient that would cost ~8x the decoded output if the whole
+    # expert stack were gathered at once.
     if mxfp4_names:
         lut = torch.tensor(
             [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
              0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
             dtype=torch.bfloat16, device=device)
+        # (256, 2) byte LUT: byte -> (low-nibble, high-nibble) element
+        # pair; low nibble is the even logical element, so flattening the
+        # trailing pair dim lands elements in logical order.
+        codes = torch.arange(256, device=device)
+        pair_lut = torch.stack([lut[codes & 0x0F], lut[codes >> 4]], dim=-1)
+        mx_by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
         for name in mxfp4_names:
-            wp = out[name].to(device=device).view(torch.uint8)
-            rows, packed_in = wp.shape
+            mx_by_shape[tuple(out[name].shape)].append(name)
+        for (rows, packed_in), names in mx_by_shape.items():
             logical_in = packed_in * 2
-            deq = torch.empty(rows, logical_in, dtype=torch.bfloat16,
-                              device=device)
-            deq[:, 0::2] = lut[(wp & 0x0F).to(torch.long)]
-            deq[:, 1::2] = lut[(wp >> 4).to(torch.long)]
-            sb = loaded_scales[name].to(device=device).view(torch.uint8)
-            scale = torch.exp2((sb.to(torch.float32) - 127.0))
-            # E8M0 0xFF is NaN per the OCP MX v1.0 spec, not 2^128:
-            # exp2(128) yields +inf, which turned a 0xFF block into a mix
-            # of ±inf (nonzero elements) and NaN (zero elements, 0*inf)
-            # instead of 32 NaNs.
-            scale = torch.where(
-                sb == 0xFF, torch.full_like(scale, float("nan")), scale)
-            deq = (deq.reshape(rows, logical_in // 32, 32).to(torch.float32)
-                   * scale.unsqueeze(-1)).to(torch.bfloat16)
-            out[name] = deq.reshape(rows, logical_in).contiguous()
-            dequanted += 1
-            del wp, deq, sb, scale
+            for i0 in range(0, len(names), _MXFP4_DECODE_CHUNK):
+                chunk = names[i0:i0 + _MXFP4_DECODE_CHUNK]
+                E = len(chunk)
+                wp = torch.stack([out[n] for n in chunk], dim=0).to(
+                    device=device).view(torch.uint8)
+                deq = pair_lut[wp.to(torch.long)].reshape(
+                    E, rows, logical_in)
+                sb = torch.stack(
+                    [loaded_scales[n] for n in chunk], dim=0
+                ).to(device=device).view(torch.uint8)
+                scale = torch.exp2((sb.to(torch.float32) - 127.0))
+                # E8M0 0xFF is NaN per the OCP MX v1.0 spec, not 2^128:
+                # exp2(128) yields +inf, which turned a 0xFF block into a
+                # mix of ±inf (nonzero elements) and NaN (zero elements,
+                # 0*inf) instead of 32 NaNs.
+                scale = torch.where(
+                    sb == 0xFF, torch.full_like(scale, float("nan")), scale)
+                deq = (deq.reshape(E, rows, logical_in // 32, 32)
+                       .to(torch.float32)
+                       * scale.unsqueeze(-1)).to(torch.bfloat16)
+                deq = deq.reshape(E, rows, logical_in)
+                for i, n in enumerate(chunk):
+                    out[n] = deq[i].contiguous()
+                dequanted += E
+                del wp, deq, sb, scale
 
     # Step 4: Fallback path for any shapes we didn't batch.
     for name in fallback:
