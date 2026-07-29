@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -613,6 +614,7 @@ def aggregate_packed_serving_groups(
     formats: list[fr.FormatSpec],
     candidates: dict[str, list[Candidate]],
     profile,
+    calibrated_gains: dict[str, float] | None = None,
 ) -> tuple[dict, dict, dict]:
     """Aggregate packed-MoE serving groups into single DP decision units.
 
@@ -646,6 +648,8 @@ def aggregate_packed_serving_groups(
     if not callable(group_fn):
         return stats, costs, candidates
 
+    gains = calibrated_gains or {}
+    ucb_z = _cost_ucb_z()
     grouped: dict[str, list[str]] = {}
     ungrouped: list[str] = []
     for name in candidates:
@@ -698,13 +702,62 @@ def aggregate_packed_serving_groups(
                 float(member_cands[m][spec.name].predicted_dloss)
                 for m in members
             )
+            # UCB hedge (PRISMAQUANT_COST_UCB_Z > 0): each member candidate
+            # was priced independently, so the sum above carries a LINEAR
+            # z·Σ(stderr·gain) hedge. The members' dloss estimates are
+            # independent measurements, so the stderr of the group SUM is
+            # sqrt(Σ stderr²): replace the linear per-member hedge with the
+            # independence aggregate, and store the aggregated stderr on the
+            # super cost entry so consumers of the aggregated cost table
+            # (aura additivity gate, repricing) keep the hedge instead of
+            # silently reading stderr 0. At z == 0 this is a no-op and the
+            # per-format dloss stays the exact sum of member candidates.
+            stderr_eff_sq = 0.0
+            hedge_linear = 0.0
+            for m in members:
+                if float(member_cands[m][spec.name].predicted_dloss) <= 0.0:
+                    # Clamped-at-zero member: contributed no dloss (and no
+                    # hedge) to the sum; skip it symmetrically.
+                    continue
+                entry = None
+                entry_fmt = spec.name
+                for candidate_name in fr.aliases_for(spec.name):
+                    if candidate_name in costs.get(m, {}):
+                        entry = costs[m][candidate_name]
+                        entry_fmt = candidate_name
+                        break
+                if entry is None or "error" in entry:
+                    continue
+                # Mirror cost_entry_predicted_dloss: the stderr hedge only
+                # applies on the explicit predicted_dloss branch.
+                if _has_measured_output_mse(stats[m], entry):
+                    continue
+                if "predicted_dloss" not in entry:
+                    continue
+                try:
+                    stderr = float(
+                        entry.get("predicted_dloss_stderr", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    stderr = 0.0
+                if stderr <= 0.0:
+                    continue
+                gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
+                stderr_eff_sq += (stderr * gain) ** 2
+                hedge_linear += ucb_z * stderr * gain
+            stderr_agg = math.sqrt(stderr_eff_sq)
+            base_pred = sum_pred - hedge_linear
+            hedged_pred = base_pred + ucb_z * stderr_agg
             memory_by_fmt[spec.name] = total_bytes
-            super_cost[spec.name] = {"predicted_dloss": sum_pred}
+            super_cost[spec.name] = {
+                "predicted_dloss": base_pred,
+                "predicted_dloss_stderr": stderr_agg,
+            }
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=8.0 * total_bytes / max(n_params, 1),
                 memory_bytes=total_bytes,
-                predicted_dloss=max(sum_pred, 0.0),
+                predicted_dloss=max(hedged_pred, 0.0),
             ))
         if not cands:
             # No format is legal for every member; aggregating would drop
@@ -715,13 +768,19 @@ def aggregate_packed_serving_groups(
                 costs_ext[m] = costs.get(m, {})
                 candidates_ext[m] = candidates[m]
             continue
+        # NOTE: deliberately NO in_features/out_features here. A packed
+        # group mixes member shapes (gate/up vs down projections), so no
+        # single (out, in) pair describes it — copying members[0]'s shape
+        # would make _shape_from_stats compute ONE member's bytes for the
+        # whole group. Without them _shape_from_stats falls back to the
+        # rank-1 (n_params,) legacy shape, which is at least
+        # total-parameter-consistent; exact byte paths must (and do)
+        # prefer the candidate / _memory_bytes_by_format.
         stats_ext[super_name] = {
             "h_trace": sum(
                 float(stats[m].get("h_trace", 0.0) or 0.0) for m in members
             ),
             "n_params": n_params,
-            "in_features": int(stats[members[0]].get("in_features", 0) or 0),
-            "out_features": int(stats[members[0]].get("out_features", 0) or 0),
             "n_tokens_seen": sum(
                 int(stats[m].get("n_tokens_seen", 0) or 0) for m in members
             ),

@@ -350,3 +350,84 @@ def test_packed_super_item_name_keeps_expert_prefix_for_name_scoped_rules():
         assert not profile.check_format(name, _HIGH).legal, name
     # Non-expert rows are untouched by the scoped rule.
     assert profile.check_format(dense, _HIGH).legal
+
+
+# ---------------------------------------------------------------------------
+# Super-item stat self-consistency + UCB stderr aggregation
+# ---------------------------------------------------------------------------
+
+def test_super_item_stats_do_not_impersonate_one_member_shape():
+    """The super item's n_params is the group SUM, so carrying members[0]'s
+    (in_features, out_features) would make ``_shape_from_stats`` hand every
+    byte fallback ONE member's shape for the whole group. The entry must not
+    lie about its shape: without per-member features it falls back to the
+    rank-1 (n_params,) view, and exact bytes stay available per format via
+    ``_memory_bytes_by_format`` / the candidate."""
+    from prismaquant.allocator_solver import _shape_from_stats
+
+    stats, cands, expert_names, _ = _mk_moe_fixture()
+    costs = {n: {} for n in stats}
+    stats_ext, _, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    super_name = next(n for n in cands_ext if _PACKED_GROUP_MARKER in n)
+    entry = stats_ext[super_name]
+    n_params = sum(stats[m]["n_params"] for m in expert_names)
+    assert entry["n_params"] == n_params
+    assert _shape_from_stats(entry) == (n_params,), (
+        "super-item shape must be total-parameter-consistent, not one "
+        "member's (out, in)")
+    for cand in cands_ext[super_name]:
+        assert entry["_memory_bytes_by_format"][cand.fmt] == cand.memory_bytes
+
+
+def test_group_ucb_stderr_aggregates_in_quadrature(monkeypatch):
+    """PRISMAQUANT_COST_UCB_Z hedging on a packed group: member dloss
+    estimates are independent measurements, so the stderr of the group SUM
+    is sqrt(sum stderr^2). Summing per-member UCB'd candidates would charge
+    the linear z*sum(stderr) (a sqrt(N)-factor over-hedge on an N-member
+    group), and dropping the field would silently zero the hedge for any
+    consumer of the aggregated cost table. Pin both: the group candidate
+    carries the quadrature hedge, and the super cost entry keeps the
+    (base sum, aggregated stderr) pair."""
+    from prismaquant.allocator_candidates import build_candidates
+
+    z = 2.0
+    monkeypatch.setenv("PRISMAQUANT_COST_UCB_Z", str(z))
+    base = {_LOW: 0.05, _HIGH: 0.01}
+    stderr = {_LOW: 0.004, _HIGH: 0.002}
+    n_members = 4
+    stats, costs = {}, {}
+    for e in range(n_members):
+        name = f"model.layers.0.mlp.experts.{e}.gate_proj"
+        stats[name] = {"h_trace": 0.5, "n_params": 65536,
+                       "in_features": 256, "out_features": 256,
+                       "n_tokens_seen": 7}
+        costs[name] = {
+            f: {"predicted_dloss": base[f],
+                "predicted_dloss_stderr": stderr[f]}
+            for f in base
+        }
+    cands = build_candidates(stats, costs, _specs())
+    _stats2, costs2, cands2 = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    super_name = next(n for n in cands2 if _PACKED_GROUP_MARKER in n)
+    for fmt in base:
+        agg = (n_members * stderr[fmt] ** 2) ** 0.5
+        cand = next(c for c in cands2[super_name] if c.fmt == fmt)
+        assert abs(cand.predicted_dloss
+                   - (n_members * base[fmt] + z * agg)) < 1e-12
+        entry = costs2[super_name][fmt]
+        assert abs(entry["predicted_dloss"] - n_members * base[fmt]) < 1e-12
+        assert abs(entry["predicted_dloss_stderr"] - agg) < 1e-12
+
+    # z == 0 (default): bit-identical to the exact member-candidate sum.
+    monkeypatch.setenv("PRISMAQUANT_COST_UCB_Z", "0")
+    cands0 = build_candidates(stats, costs, _specs())
+    _stats0, costs0, cands0x = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands0, _PackedProfile())
+    super0 = next(n for n in cands0x if _PACKED_GROUP_MARKER in n)
+    for fmt in base:
+        cand = next(c for c in cands0x[super0] if c.fmt == fmt)
+        assert abs(cand.predicted_dloss - n_members * base[fmt]) < 1e-12
+        agg = (n_members * stderr[fmt] ** 2) ** 0.5
+        assert abs(costs0[super0][fmt]["predicted_dloss_stderr"] - agg) < 1e-12
