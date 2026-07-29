@@ -396,7 +396,11 @@ def solve_with_promotion(
     Termination contract: the returned
     assignment is always FEASIBLE — ``achieved <= target_bits +
     overshoot_tolerance`` — and, among the feasible iterates seen, the
-    densest one (largest achieved bits, i.e. least undershoot). When no
+    one with MINIMUM total predicted Δloss (ties broken toward larger
+    achieved bits). Δloss is the solver's actual objective; density is
+    not a proxy for it — more bits is not monotonically better (5.5 bpp
+    has beaten 6.0 bpp on served PPL), and promotion can flip a serving
+    group into a denser-but-worse format. When no
     iterate is feasible within ``max_iters`` the rung is INFEASIBLE and
     ``(None, nan)`` is returned so callers exclude it from the Pareto curve
     and byte-budget bisection. The three silent fallbacks this replaces all
@@ -415,7 +419,8 @@ def solve_with_promotion(
        smaller bin table): tighten by ``overshoot/2`` until an iterate is
        feasible or the DP floor is reached.
     2. Bracket bisection between the first feasible tightened value and the
-       last infeasible one, ratcheting the densest feasible assignment.
+       last infeasible one, ratcheting the minimum-Δloss feasible
+       assignment.
        Promotion is a coarse step function (one packed-MoE serving group
        flipping format moves the average by tenths of a bit), so
        achieved(tightened) is locally non-monotone; the ratchet keeps
@@ -444,13 +449,16 @@ def solve_with_promotion(
 
     best_assign: dict[str, str] | None = None
     best_achieved = float("nan")
+    best_dloss = float("inf")
 
     def _evaluate(t: float) -> float | None:
         """Solve+promote at tightened ``t``; ratchet if feasible.
 
         Returns achieved bits, or None when the DP is infeasible at ``t``.
+        The ratchet keeps the feasible iterate with minimum total predicted
+        Δloss (the solve objective), tie-broken toward higher achieved bits.
         """
-        nonlocal best_assign, best_achieved
+        nonlocal best_assign, best_achieved, best_dloss
         t0 = time.time() if _SOLVER_TRACE else 0.0
         result = solve_allocation(stats, candidates, t, bit_precision)
         if result is None:
@@ -467,18 +475,22 @@ def solve_with_promotion(
             include_fused=not no_fused_promote,
             include_moe=True,
         )
-        achieved, _ = compute_achieved(
+        achieved, predicted = compute_achieved(
             stats, assign, format_specs,
             candidates=candidates,
         )
         if _SOLVER_TRACE:
             print(f"[solver] target={target:.4f} eval t={t:.4f} -> "
-                  f"achieved={achieved:.4f} ({time.time() - t0:.1f}s)",
+                  f"achieved={achieved:.4f} dloss={predicted:.3e} "
+                  f"({time.time() - t0:.1f}s)",
                   flush=True)
         if achieved - target <= overshoot_tolerance and (
-                best_assign is None or achieved > best_achieved):
+                best_assign is None
+                or predicted < best_dloss
+                or (predicted == best_dloss and achieved > best_achieved)):
             best_assign = assign
             best_achieved = achieved
+            best_dloss = predicted
         return achieved
 
     # Phase 1: damped descent until the first feasible iterate. Promotion
@@ -507,7 +519,8 @@ def solve_with_promotion(
             continue
         if achieved - target <= overshoot_tolerance:
             if achieved >= target - overshoot_tolerance:
-                # Within the band on both sides — cannot improve.
+                # Within the band on both sides — no denser feasible
+                # iterate exists; return the ratcheted min-Δloss one.
                 return best_assign, best_achieved
             lo = tightened
             break
@@ -533,7 +546,9 @@ def solve_with_promotion(
         if tightened <= min_bits:
             tightened = min_bits
 
-    # Phase 2: bisect (lo, hi) for the densest feasible iterate.
+    # Phase 2: bisect (lo, hi) toward the target. The bisection PROPOSES
+    # progressively denser feasible iterates; the ratchet in _evaluate
+    # KEEPS whichever feasible iterate has the minimum predicted Δloss.
     if lo is not None:
         while evals < max_iters and hi - lo > max(bit_precision, 1e-9):
             evals += 1
@@ -541,6 +556,7 @@ def solve_with_promotion(
             achieved = _evaluate(mid)
             if achieved is not None and achieved - target <= overshoot_tolerance:
                 if achieved >= target - overshoot_tolerance:
+                    # In-band: densest possible; keep the min-Δloss ratchet.
                     return best_assign, best_achieved
                 lo = mid
             else:
