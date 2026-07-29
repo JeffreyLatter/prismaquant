@@ -2049,11 +2049,16 @@ def main():
         # DSv4-Flash checkpoint: I8 nibble experts + E8M0 scales, F8
         # attention, BF16 floor) the old regime accounting removed more
         # bytes than the checkpoint holds, driving the floor negative.
+        # `expert_parent_for_projection` bridges the per-expert-on-disk /
+        # packed-live MoE layouts (…experts.{i}.gate_proj -> the packed
+        # …experts.gate_up_proj the allocator names), same mapping the
+        # layer-streaming pack bridge uses.
         src_manifest = _fp.source_tensor_bytes_manifest(
             probe_model_path,
             name_map=getattr(model_profile, "checkpoint_to_live_name", None),
+            expert_parent_for_projection=getattr(
+                model_profile, "packed_expert_parent_for_projection", None),
         )
-        manifest_missing: set[str] = set()
 
         def _artifact_for_target(t: float):
             assign_t, ach_t, tot_t, _mut = _solve_for_target(t)
@@ -2061,19 +2066,14 @@ def main():
                 return None
             expanded_t = _expand_assignment_for_seed_json(assign_t)
             body_aux = _assignment_bits_total(expanded_t) / 8.0
-            reenc_by_name: dict[str, int] = {}
-            for n in expanded_t:
-                nb = src_manifest.get(n)
-                if nb is None and n.endswith(".weight"):
-                    nb = src_manifest.get(n[: -len(".weight")])
-                if nb is None:
-                    # Not resolvable in the checkpoint headers: leave the
-                    # tensor priced in the floor (conservative — the artifact
-                    # estimate can only over-count, never under-count) and
-                    # report it loudly after the grid pass.
-                    manifest_missing.add(n)
-                    continue
-                reenc_by_name[n] = int(nb)
+            # A re-encoded name the manifest cannot resolve is a hard error
+            # (raised BEFORE any selection numbers are consumed): it would
+            # stay priced in the floor while its quantized body bytes are
+            # still added, and on a packed-MoE model that double-counts the
+            # entire expert mass — every rung then reads "below the floor".
+            reenc_by_name = _fp.resolve_reencoded_source_bytes(
+                src_manifest, expanded_t,
+                context=f"byte-budget selector (target_bits={t:.3f})")
             floor = float(src_total) - sum(reenc_by_name.values())
             _fp.check_floor_non_negative(
                 floor, float(src_total), reenc_by_name,
@@ -2091,15 +2091,6 @@ def main():
             r = _artifact_for_target(float(row["target_bits"]))
             if r is not None:
                 grid.append(r)
-        if manifest_missing:
-            print(
-                "[alloc] WARNING: "
-                f"{len(manifest_missing)} re-encoded Linears not found in the "
-                "source checkpoint manifest; their source bytes stay in the "
-                "floor (artifact size over-counted, never under-counted). "
-                f"Sample: {sorted(manifest_missing)[:8]}",
-                flush=True,
-            )
         sel = select_under_byte_budget(grid, budget_bytes)
 
         rd = knee_summary.get("rd_curve") if isinstance(knee_summary, dict) else None
@@ -2111,7 +2102,6 @@ def main():
             "source_total_bytes": float(src_total),
             "source_regime": regime,
             "source_accounting": "per_tensor_manifest_v2",
-            "manifest_missing_linears": len(manifest_missing),
             "source_bytes_per_param": int(
                 _fp.dominant_source_bytes_per_param(src_by_dtype)),
             "feasible": bool(sel["feasible"]),
