@@ -1208,12 +1208,34 @@ def _compute_global_precompute(
 
     for d in range(prefetch_depth):
         ctx.schedule_prefetch(d)
-    # v22 Fix E1: keep activations on device through phase-1 to avoid
-    # the per-layer .cpu() sync that stalls the forward pipeline. We
-    # batch the device→host transfer at the END of phase-1 in a single
-    # call. The pickled precompute cache (and downstream phase-3) want
-    # CPU tensors, which we produce after the loop.
-    device_acts: list[torch.Tensor] = [hidden.detach()]
+    # Phase-1 activation capture. Default: stream each layer's activation
+    # to host inside the loop — stacking all L+1 activations
+    # device-resident and doing one batched .cpu() at the end (v22 Fix
+    # E1) doubles the peak device memory of the activation working set at
+    # the exact phase-1/2 transition where the probe's high-water mark
+    # already sits, which DSv4's multi-stream hidden (hc_mult x wider)
+    # can't afford. Honest accounting: the memory saving is real; the
+    # relative *transfer-time* cost of per-layer vs batched copies is
+    # unmeasured — PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER=1 restores the
+    # v22 batched single-transfer behavior for an A/B. Read once per
+    # probe run (per-layer probe path, not a per-token hot path); both
+    # variants report their true copy time as `host transfer` below.
+    batched_act_transfer = os.environ.get(
+        "PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER", ""
+    ).lower() in {"1", "true", "yes"}
+    t_h2h_total = 0.0
+    acts: list[torch.Tensor] = []
+
+    def _capture_act(t: torch.Tensor) -> None:
+        nonlocal t_h2h_total
+        if batched_act_transfer:
+            acts.append(t.detach())
+            return
+        t0 = time.time()
+        acts.append(t.detach().to("cpu"))
+        t_h2h_total += time.time() - t0
+
+    _capture_act(hidden)
     for L in range(num_layers):
         load_t0 = time.time()
         src = ctx.install(L)
@@ -1234,7 +1256,7 @@ def _compute_global_precompute(
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
-        device_acts.append(hidden.detach())
+        _capture_act(hidden)
         ctx.unload(L)
         if L % 8 == 0 or L == num_layers - 1:
             print(f"[incremental/global] fwd L{L:02d}  src={src}  "
@@ -1245,20 +1267,23 @@ def _compute_global_precompute(
     # phase-3's isolated forwards can reconstruct it.
     shared_pass_state = _profile.capture_forward_pass_state(pass_state)
 
-    # v22 Fix E1: batched device→host transfer for the activations
-    # captured during phase-1. All have the same (B, T, H) shape so we
-    # stack into one (L+1, B, T, H) tensor and do a single .cpu() —
-    # 62 individual transfers collapsed into one. After the copy lands,
-    # we split back into a list of CPU tensors so the rest of the code
-    # (precompute cache pickle, phase-3 reads) sees the original layout.
-    t_h2h = time.time()
-    stacked = torch.stack(device_acts, dim=0).cpu()
-    activations_cpu: list[torch.Tensor] = [
-        stacked[i].clone() for i in range(stacked.size(0))
-    ]
-    del device_acts, stacked
+    if batched_act_transfer:
+        # v22 Fix E1: all captures share one (B, T, ..., H) shape — stack
+        # into a single (L+1, ...) tensor, one device→host copy, then
+        # split back into the list layout the precompute pickle and
+        # phase-3 expect.
+        t0 = time.time()
+        stacked = torch.stack(acts, dim=0).cpu()
+        activations_cpu: list[torch.Tensor] = [
+            stacked[i].clone() for i in range(stacked.size(0))
+        ]
+        del stacked
+        t_h2h_total = time.time() - t0
+    else:
+        activations_cpu = acts
+    acts = []
     print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
-          f"(host transfer {time.time()-t_h2h:.1f}s)  "
+          f"(host transfer {t_h2h_total:.1f}s)  "
           f"{ctx.layer_cache.summary()}", flush=True)
 
     phase1_router_counts = {}

@@ -56,6 +56,7 @@ except ModuleNotFoundError:
         del recurse
         return module
 
+from .autoscale import _EXPERT_TENSOR_RE, declared_fp4_expert_dtype
 from .layer_streaming import (
     _build_fp8_scale_inv_map,
     LayerCache,
@@ -223,14 +224,24 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
 
 
 def _safetensors_cache_dtype_bytes(dtype_name: str,
-                                   target_dtype: torch.dtype) -> int:
-    """Bytes a safetensors tensor will occupy in the layer cache."""
+                                   target_dtype: torch.dtype,
+                                   *, fp4_packed: bool = False) -> int:
+    """Bytes a safetensors tensor will occupy in the layer cache,
+    per *on-disk* element (safetensors counts packed bytes as elements)."""
     dtype_name = str(dtype_name).upper()
     # Floating checkpoint tensors are cast to the requested execution
     # dtype by `_read_layer_to_device` before caching. Native FP8 source
     # weights therefore cache as bf16/fp16/fp32 after block dequant.
     if dtype_name.startswith("F") or dtype_name == "BF16":
         return torch.empty((), dtype=target_dtype).element_size()
+    if dtype_name == "I8" and fp4_packed:
+        # Declared MXFP4 nibble-pack (DSv4-Flash routed experts): one
+        # packed I8 byte dequants to TWO logical elements of the
+        # execution dtype (4 bytes/disk-byte at bf16). Sizing it as the
+        # verbatim 1 byte undercounts the resident tensor 4x, so
+        # prepare_for_load() under-evicts and prefetch refuses layers
+        # that would actually fit.
+        return 2 * torch.empty((), dtype=target_dtype).element_size()
     return {
         "BOOL": 1,
         "U8": 1, "I8": 1,
@@ -247,10 +258,16 @@ def _estimate_layer_cache_bytes(
     layers_prefix: str,
     num_layers: int,
     target_dtype: torch.dtype,
+    fp4_experts: bool = False,
 ) -> tuple[int, list[int]]:
-    """Estimate dequanted cache bytes per decoder layer without loading data."""
+    """Estimate dequanted cache bytes per decoder layer without loading data.
+
+    `fp4_experts` is the checkpoint's explicit packed-FP4 expert
+    declaration (`declared_fp4_expert_dtype`): per-expert I8 tensors then
+    price as MXFP4 nibble-packs (2 logical elements/byte at the execution
+    dtype) instead of verbatim int8."""
     pat = re.compile(rf"^{re.escape(layers_prefix)}(?P<idx>\d+)\.")
-    by_shard: dict[str, list[tuple[int, str]]] = {}
+    by_shard: dict[str, list[tuple[int, str, bool]]] = {}
     for model_name, shard in weight_shard.items():
         m = pat.match(model_name)
         if m is None:
@@ -258,19 +275,23 @@ def _estimate_layer_cache_bytes(
         idx = int(m.group("idx"))
         if idx < 0 or idx >= num_layers:
             continue
-        by_shard.setdefault(shard, []).append((idx, weight_ckpt[model_name]))
+        by_shard.setdefault(shard, []).append((
+            idx, weight_ckpt[model_name],
+            bool(fp4_experts and _EXPERT_TENSOR_RE.search(model_name)),
+        ))
 
     sizes = [0 for _ in range(num_layers)]
     try:
         for shard, pairs in by_shard.items():
             with safe_open(shard, framework="pt") as f:
-                for idx, ckpt_name in pairs:
+                for idx, ckpt_name, fp4_packed in pairs:
                     sl = f.get_slice(ckpt_name)
                     n = 1
                     for dim in sl.get_shape():
                         n *= int(dim)
                     sizes[idx] += n * _safetensors_cache_dtype_bytes(
-                        sl.get_dtype(), target_dtype)
+                        sl.get_dtype(), target_dtype,
+                        fp4_packed=fp4_packed)
     except Exception:
         return 0, sizes
     nonzero = [s for s in sizes if s > 0]
@@ -909,6 +930,7 @@ def _build_streaming_context(model_path: str, *,
         layers_prefix=layers_prefix,
         num_layers=num_layers,
         target_dtype=dtype,
+        fp4_experts=declared_fp4_expert_dtype(model_path),
     )
     worker_count, worker_src = _auto_prefetch_workers(
         cache_bytes, estimated_layer_bytes, requested=prefetch_workers)
