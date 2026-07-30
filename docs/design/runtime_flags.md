@@ -34,7 +34,10 @@ and never sees a build flag.
 | `PRISMAQUANT_PROBE_DOMAIN` | unset | `incremental_probe.py:970` | Calibration-domain tag stamped into probe provenance. |
 | `PRISMAQUANT_PROBE_CTX_CACHE` | unset | `incremental_probe.py:3126` | Reuse the cross-chunk probe context cache. |
 | `PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK` | unset | `incremental_probe.py:3143` | Retain cross-chunk probe state instead of dropping it between chunks. |
-| `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` | `0` | `incremental_probe.py:1022` | Probe guard override for KV-sharing architectures (e.g. Gemma4 `k_eq_v` layers): by default the probe fails fast when KV-shared Linears would receive aliased Fisher mass; set `1` to probe anyway, accepting the shared-gradient double-count. |
+| `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` | `0` | `incremental_probe.py:1022` | Probe guard override for KV-sharing architectures (MINOR-M33). Only reachable with `PRISMAQUANT_KV_COTANGENT=0`: severing the shared-consumer cotangent *under*-counts the storing layer's `k_proj`/`v_proj` `h_trace`, so the probe fails fast; set `1` to probe anyway, accepting the under-count. (Earlier revisions called this an aliased-Fisher *double*-count — wrong direction; the missing edge only ever removes gradient.) |
+| `PRISMAQUANT_KV_COTANGENT` | on | `sensitivity_probe.py:1254` | The KV-cotangent path. On cross-layer KV-sharing architectures (Gemma4 `num_kv_shared_layers>0`) the phase-3 reverse sweep grafts grad-enabled leaves over borrowed K/V, sums each consumer's `leaf.grad` per source, and drives the storing layer's backward with that sum alongside its own output cotangent. Without it a sharing layer's backward stops at the detached capture and the storing layer's `h_trace` is under-counted. `0` restores the pre-fix severed cotangent for an A/B and re-arms `PRISMAQUANT_ALLOW_KV_SHARED_FISHER`. Verified against an end-to-end backward in `tests/test_kv_cotangent_path.py`. |
+| `PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER` | `0` (off) | `incremental_probe.py` | Restores the v22 "Fix E1" phase-1 activation transfer: hold all L+1 layer activations device-resident, then stack for a single device→host copy. Default (off) streams each layer's activation to host inside the forward loop, bounding device residency to one activation — a doubling DSv4's multi-stream hidden can't afford. Exists to A/B the unmeasured transfer-time cost; both paths report true copy time as `host transfer`. Batched mode requires uniform activation shapes. |
+| `PRISMAQUANT_SOLVER_TRACE` | `0` (off) | `allocator_solver.py` | Per-evaluation trace for `solve_with_promotion`: each tightened-target DP eval with achieved bits, predicted Δloss, wall time, plus DP-infeasible probes. Read once at module import — set before launching the allocator. Observability only. |
 | `PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER` | `0` | `sensitivity_probe.py:673` (const `:451`), `measure_quant_cost.py:1824` | Probe guard override for packed-MoE experts whose compute is NOT a per-expert `F.linear(x, packed[e])` (e.g. bmm/grouped-mm): the per-token Fisher interception cannot capture them, and by default the probe fails fast rather than fall back to squaring the token-summed weight gradient (the sum-then-square estimator, audit M3: 5-50× cross-token-covariance inflation). Set `1` to accept the biased legacy estimator. Also accepted by `prepare_cost_context` to reuse a PRE-FIX probe.pkl whose packed-expert entries lack the `packed_fisher_estimator=per_token_v2` meta stamp (stale pickles are otherwise refused). |
 | `PRISMAQUANT_COST_UCB_Z` | `0` | `allocator_candidates.py:305` | Risk-aware allocation: charge `z·predicted_dloss_stderr` on top of each AURA cost row (upper-confidence-bound). `0` = bit-identical legacy behavior. The 27B A/B found point-KL parity with z=2; UCB's case is allocation stability across probe seeds (−15% seed-Hamming at 4B). Production-calib decision: keep at `0`. |
 | `PRISMAQUANT_FISHER_COL_WEIGHTS` | `0` | `aura_cost.py:853` | Opt-in: `aura_cost` also emits a per-Linear per-column KL-Fisher energy vector (`stats[name]['fisher_col']`, length `in_features`, sums to `h_trace`) alongside the scalar cost. Strictly additive — the rest of the cost payload is bit-identical when off. Feeds `fisher_col_weights.py`. Equivalent to `aura_cost --collect-col-energy`. |
@@ -395,6 +398,7 @@ PRISMAQUANT_KL_CUDA_GRAPHS
 PRISMAQUANT_KL_CUDA_GRAPHS_MIN_CALLS
 PRISMAQUANT_KL_CUDA_GRAPHS_VERBOSE
 PRISMAQUANT_KL_CUDA_GRAPH_CACHE_SIZE
+PRISMAQUANT_KV_COTANGENT
 PRISMAQUANT_L3_CUDA_GRAPHS
 PRISMAQUANT_L3_CUDA_GRAPHS_MIN_CALLS
 PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE
@@ -423,6 +427,7 @@ PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING
 PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE
 PRISMAQUANT_PREFILL_M_THRESHOLD
 PRISMAQUANT_PRELOAD_FUSED
+PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER
 PRISMAQUANT_PROBE_CTX_CACHE
 PRISMAQUANT_PROBE_DOMAIN
 PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK
@@ -437,6 +442,7 @@ PRISMAQUANT_SMOKE_MODEL
 PRISMAQUANT_SMOKE_SAMPLES
 PRISMAQUANT_SMOKE_SEED
 PRISMAQUANT_SMOKE_SEQLEN
+PRISMAQUANT_SOLVER_TRACE
 PRISMAQUANT_STRICT_ASSIGNMENT_COVERAGE
 PRISMAQUANT_STRICT_PRODUCTION_CACHE
 PRISMAQUANT_TARGET_PROFILE

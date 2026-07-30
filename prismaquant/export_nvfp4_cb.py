@@ -44,6 +44,18 @@ from prismaquant.layer_config import (
     load_assignment,
 )
 
+# This exporter's own declaration of what the mixed CB container can carry —
+# exactly the coverage gate in `export_cb` below: the CB rung families, the two
+# stock-CT schemes the plugin delegates to vLLM's CompressedTensors path
+# (NVFP4, FP8_E4M3 <- FP8_DYNAMIC), the verbatim FP8_SOURCE passthrough and the
+# BF16 container passthrough. The `nvfp4_cb` serving profile's export lane
+# derives its format menu from this constant
+# (serving_profile_specs/nvfp4_cb.json), so the allocator can never spend budget
+# on a rung this exporter would hard-fail on.
+EXPORTABLE_FORMATS = frozenset(_NVFP4_CB_FORMAT_NAMES) | frozenset(
+    {"NVFP4", "FP8_E4M3", "FP8_SOURCE", "BF16"}
+)
+
 # Codebook entry bytes for the sidecar-honest footprint (footprint.py owns the
 # real accounting; recorded here in provenance for cross-checking).
 _CB_FAMILY_ENTRY_BYTES = {"fp4": 4, "fp8": 8}

@@ -11,7 +11,7 @@ Exports:
   - register_profile(cls): register a custom profile at runtime
   - ModelGraph / ModelStructureSpec: typed model decomposition artifacts
 
-MiniMaxM2Profile was archived 2026-04-24; see archive/minimax_m2p7/README.md.
+MiniMaxM2Profile was archived 2026-04-24; see archive/minimax_m2p7_2026-04-24/README.md.
 """
 from .base import ModelProfile
 from .default import DefaultProfile

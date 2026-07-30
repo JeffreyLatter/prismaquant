@@ -9,6 +9,7 @@ dist/
 .env
 *.pkl
 *.log
+.coverage
 
 # Local reference materials (third-party papers / code; copyrighted, not to publish)
 references/

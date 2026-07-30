@@ -7,6 +7,10 @@ import torch
 import torch.nn as nn
 import pytest
 
+from prismaquant.export_native_compressed import (
+    _resolve_gptq_fixed_damp,
+    gptq_damp_sweep_enabled,
+)
 from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
 from prismaquant.build_production_cache import (
     validate_render_assignment_cache_coverage,
@@ -227,14 +231,24 @@ def test_production_cache_records_damp_sweep_lever(monkeypatch):
     )
 
     assert cache.levers["gptq_damp_sweep"] is False
-    assert _normalized_production_cache_levers(
-        "gptq,scale_sweep"
-    )["gptq_damp_sweep"] is False
+    off = _normalized_production_cache_levers("gptq,scale_sweep")
+    assert off["gptq_damp_sweep"] is False
+    # Sweep-off renders must record WHICH fixed damp they used, or two
+    # fixed-damp caches are metadata-indistinguishable.
+    assert off["gptq_fixed_damp"] == _resolve_gptq_fixed_damp()
 
     monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1")
+    on = _normalized_production_cache_levers("gptq,scale_sweep")
+    assert on["gptq_damp_sweep"] is True
+    assert "gptq_fixed_damp" not in on
+
+    # The probe's provenance must follow the production policy default
+    # (sweep OFF since 2026-06-12, f2363e2) — it kept a stale sweep-ON
+    # fork of this defaulting until 2026-07-30.
+    monkeypatch.delenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", raising=False)
     assert _normalized_production_cache_levers(
         "gptq,scale_sweep"
-    )["gptq_damp_sweep"] is True
+    )["gptq_damp_sweep"] is gptq_damp_sweep_enabled() is False
 
 
 def test_production_cache_none_lever_disables_defaults(monkeypatch):

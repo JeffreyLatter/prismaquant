@@ -333,10 +333,12 @@ def test_dense_ladder_helpers(monkeypatch):
     """Dense-path ladder plumbing: env gate, exact-law fit, chunk-metric
     readback from the sum-based accumulator."""
     from prismaquant.measure_quant_cost import (
+        _CB_LADDER_TOL,
         _accumulate_result,
         _cb_ladder_plan,
         _chunk_metric,
         _ladder_metric_fit,
+        _ladder_rate_factor,
     )
     import prismaquant.format_registry as fr
 
@@ -352,11 +354,33 @@ def test_dense_ladder_helpers(monkeypatch):
     # 6-rung family -> 3 anchors, 1 holdout, 2 predicted.
     assert len(anchors) == 3 and len(pred) == 2
 
-    # Exact exponential law -> exact prediction.
-    vals = {f: 2.0 ** (5.0 - 0.3 * kmap[f]) for f in kmap}
+    # Exact recovery of the law's OWN model. Commit 5184892 replaced the
+    # log-linear 2^(a - b*k) fit with a split-aware FLOORED LINEAR law
+    # D = F + C*R(k), where R(k) = sum_i 2^(-2*b_i/d_i) is the exact
+    # ceil-first per-sub rate factor (_ladder_rate_factor) — that is what
+    # kills the k % n_sub sawtooth a smooth-in-k law cannot represent. It
+    # pins the decay rate to the theory-exact R and fits only (floor,
+    # amplitude), so it is exact on split-model data.
+    vals = {f: 0.002 + 1.5 * _ladder_rate_factor(f, kmap[f]) for f in kmap}
     for f in pred + [holdout]:
         got = _ladder_metric_fit(kmap, anchors, vals, f)
         assert got == pytest.approx(vals[f], rel=1e-9)
+
+    # F < 0 -> the floor clamps to 0 and C is refit through the origin;
+    # still exact.
+    vals0 = {f: 1.5 * _ladder_rate_factor(f, kmap[f]) for f in kmap}
+    for f in pred + [holdout]:
+        got = _ladder_metric_fit(kmap, anchors, vals0, f)
+        assert got == pytest.approx(vals0[f], rel=1e-9)
+
+    # A FREE-rate exponential (2^(5 - 0.3k); decay != R's) is deliberately
+    # NOT exact — the fit reads +14.2% high at k=32. The holdout gate is what
+    # makes that safe: rel_err at the holdout is 31%, far over _CB_LADDER_TOL,
+    # so measure_batched_gpu (measure_quant_cost.py:1975) rejects the fit and
+    # measures the predicted rungs instead. Never let this land silently.
+    expo = {f: 2.0 ** (5.0 - 0.3 * kmap[f]) for f in kmap}
+    pred_h = _ladder_metric_fit(kmap, anchors, expo, holdout)
+    assert abs(pred_h - expo[holdout]) / expo[holdout] > _CB_LADDER_TOL
 
     # Accumulator readback (sum-based, count=1).
     accum: dict = {}

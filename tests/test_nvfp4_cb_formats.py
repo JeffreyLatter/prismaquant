@@ -387,10 +387,21 @@ def test_flat_k_ceiling_raises():
 
 
 # (i) menu: all rungs register, resolve, sort by effective_bits.
+#
+# The FULL ladder is all-integer in every family (c52d04c, "every integer bit
+# width"): a step-4 FP8 set here is exactly the staleness that crashed the
+# first full-ladder 27B export on cb_k=47. _FP8_KS above stays a sampled
+# subset for the expensive per-rung parametrizations; the menu test pins the
+# whole set, per family, structurally.
+_MENU_LADDERS = (
+    ("NVFP4_CB_K", tuple(range(12, 25)), lambda k: k / 8 + 0.5),
+    ("NVFP4_CB_S", (13, 14, 15, 16), lambda k: k / 8 + 0.5),
+    ("FP8_CB_K", tuple(range(28, 49)), lambda k: k / 8),
+)
+
+
 def test_menu_registers_and_resolves():
-    names = [f"NVFP4_CB_K{k}" for k in _NVFP4_KS] + \
-            [f"NVFP4_CB_S{k}" for k in _SIGNED_KS] + \
-            [f"FP8_CB_K{k}" for k in _FP8_KS]
+    names = [f"{prefix}{k}" for prefix, ks, _ in _MENU_LADDERS for k in ks]
     for name in names:
         spec = fr.get_format(name)
         assert spec is not None
@@ -403,8 +414,19 @@ def test_menu_registers_and_resolves():
     ) == "NVFP4_CB_S14"
     assert lc.canonicalize_format(
         {"data_type": "fp8_cb", "cb_k": 44}) == "FP8_CB_K44"
+    # The registered menu is EXACTLY the ladder the layer-config parser
+    # accepts — the two sources may not drift apart.
     fam = [s for s in fr.list_formats() if s.family in ("nvfp4_cb", "fp8_cb")]
-    assert len(fam) == len(names)
+    assert {s.name for s in fam} == set(names)
+    assert set(lc._NVFP4_CB_FORMAT_NAMES) == set(names)
+    # Per family: bpw strictly increasing in k, and exactly the accounting
+    # formula (index stream + the fp4 family's group-16 scale plane).
+    for prefix, ks, bpw in _MENU_LADDERS:
+        got = [fr.get_format(f"{prefix}{k}").effective_bits for k in ks]
+        assert got == sorted(got) and len(set(got)) == len(got)
+        for k, g in zip(ks, got):
+            assert g == pytest.approx(bpw(k), abs=1e-9), f"{prefix}{k}"
+    # list_formats() orders the whole menu by effective_bits.
     bpps = [s.effective_bits for s in fam]
     assert bpps == sorted(bpps)
 
@@ -571,12 +593,17 @@ def test_exporter_roundtrip_equals_emulation(export_dir, source):
     assert counts["NVFP4_CB_K16"] == 1 and counts["FP8_CB_K40"] == 1
 
     qc = json.loads((out / "quant_config.json").read_text())
-    assert qc["quant_method"] == "prismaquant"
+    # "gridbook" is the registry key the plugin registers under (32a02e7);
+    # "prismaquant" survives only as a READ alias for artifacts exported
+    # before the rename (plugins/gridbook/gridbook/plugin.py:133-139 and
+    # config.py override_quantization_method), so the exporter stamps the
+    # canonical name and never the legacy one.
+    assert qc["quant_method"] == "gridbook"
     # non-target norm copied verbatim; config.json copied + pointer injected.
     ot = load_file(str(out / "model.safetensors"))
     assert "model.norm.weight" in ot
     cfg = json.loads((out / "config.json").read_text())
-    assert cfg["quantization_config"]["quant_method"] == "prismaquant"
+    assert cfg["quantization_config"]["quant_method"] == "gridbook"
 
     # Codebooks ship in the non-globbed .pqcb sidecar (sidecar-only), not in
     # model.safetensors — the plugin reads them there (LAYOUT.md §3).

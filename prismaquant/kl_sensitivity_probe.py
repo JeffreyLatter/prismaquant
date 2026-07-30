@@ -45,7 +45,10 @@ from prismaquant.kl_measurement import (
     measure_lane_batched_kl_deltas,
     measure_override_set_kl,
 )
-from prismaquant.production_weight_cache import fill_production_weight_cache
+from prismaquant.production_weight_cache import (
+    _resolve_production_render_levers,
+    fill_production_weight_cache,
+)
 from prismaquant.serving_profiles import (
     resolve_target_profile,
     serving_profile_names,
@@ -267,55 +270,19 @@ def _parse_levers(value: str | None) -> dict[str, bool]:
 
 
 def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
-    levers = _parse_levers(value)
-    default_optional_levers = not bool(levers.pop("none", False))
-    if not default_optional_levers:
-        for name in (
-            "gptq",
-            "scale_sweep",
-            "fisher_gptq",
-            "static_act_order",
-            "joint_scale_opt",
-        ):
-            levers.setdefault(name, False)
-    levers.setdefault("gptq", True)
-    levers.setdefault(
-        "gptq_damp_sweep",
-        bool(levers.get("gptq", True))
-        and os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0",
-    )
-    levers.setdefault("scale_sweep", False)
-    levers.setdefault(
-        "static_act_order",
-        os.environ.get("PRISMAQUANT_GPTQ_STATIC_ACT_ORDER", "0").strip().lower()
-        not in {"", "0", "false", "no", "off"},
-    )
-    levers.setdefault(
-        "joint_scale_opt",
-        os.environ.get("PRISMAQUANT_NVFP4_JOINT_SCALE_OPT", "0").strip().lower()
-        not in {"", "0", "false", "no", "off"},
-    )
-    if not bool(levers.get("gptq", True)):
-        levers["static_act_order"] = False
-        levers["joint_scale_opt"] = False
-    levers.setdefault(
-        "fisher_gptq",
-        os.environ.get("PRISMAQUANT_FISHER_WEIGHTED_GPTQ", "0").strip().lower()
-        not in {"", "0", "false", "no", "off"},
-    )
-    from prismaquant.export_native_compressed import (
-        NVFP4_SCALE_RULE_ENV,
-        NVFP4_SCALE_RULE_JOINT_MSE,
-        resolve_nvfp4_scale_rule,
-    )
-    if (
-        bool(levers.get("joint_scale_opt", False))
-        and "nvfp4_scale_rule" not in levers
-        and NVFP4_SCALE_RULE_ENV not in os.environ
-    ):
-        levers["nvfp4_scale_rule"] = NVFP4_SCALE_RULE_JOINT_MSE
-    levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
-    return dict(sorted(levers.items()))
+    """Normalize the ``--production-cache-levers`` string for provenance.
+
+    Delegates to the single production render contract
+    (``production_weight_cache._resolve_production_render_levers``) so the
+    metadata this probe stamps can never disagree with the levers the render
+    actually used. A forked copy of that defaulting lived here until
+    2026-07-30 and had drifted on ``PRISMAQUANT_GPTQ_DAMP_SWEEP`` (stale
+    sweep-ON default from 9c91d62, missed by the sweep-OFF policy in f2363e2)
+    and on the ``gptq_fixed_damp`` provenance key.
+    """
+    return dict(sorted(
+        _resolve_production_render_levers(_parse_levers(value)).items()
+    ))
 
 
 def _production_cache_entries_digest(cache: object) -> str:

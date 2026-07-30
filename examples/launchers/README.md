@@ -4,7 +4,6 @@ This directory keeps only launchers that are still useful as current examples:
 
 - `launch-qwen3p6-35b-a3b-prismascout-probe-cost.sh`
 - `launch-qwen3p6-35b-a3b-prismascout-knee.sh`
-- `polish-4p9-prodfaithful-4b.sh`
 - `launch-minimax.sh`
 - `launch-minimax-allocate-export.sh`
 - `launch-dsv4.sh`
@@ -13,4 +12,7 @@ This directory keeps only launchers that are still useful as current examples:
 - `bench-throughput.py`
 
 Older research and smoke launchers were moved to
-`archive/legacy_frontiers_2026-05-06/launchers/`.
+`archive/legacy_frontiers_2026-05-06/launchers/`; the 14 launchers whose every
+python invocation names a since-removed module (block-CLADO / adjoint-L3 /
+coord-polish) were walled off on 2026-07-30 under
+`archive/launchers_2026-07-30/`.

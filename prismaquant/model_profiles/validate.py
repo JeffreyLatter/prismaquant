@@ -38,10 +38,12 @@ Checks performed:
      config; the module loads the source's `mtp.*` weights without
      missing keys.
 
-  6. **Packed-expert parameter names.** The architecture's weights
-     contain 3D parameters under modules whose class name matches
-     `_is_packed_experts_module`, and every such parameter's name
-     is in `profile.packed_expert_param_names()`.
+  6. **Packed-expert parameter names.** Every expert weight on disk
+     resolves to one of `profile.packed_expert_param_names()`, in
+     either legal source layout — packed 3D (`experts.gate_up_proj`)
+     or per-expert 2D (`experts.7.gate_proj.weight`, which is what a
+     stock HF MoE checkpoint ships) — and no 3D expert tensor carries
+     a parameter name the profile does not declare.
 
   7. **Source passthrough sanity.** Every prefix in
      `profile.source_passthrough_prefixes()` matches at least one
@@ -296,41 +298,165 @@ def _check_source_passthrough(profile, model_path: str) -> CheckResult:
         "source_passthrough_prefixes() cover real tensors", True, detail)
 
 
+def _safetensors_header(path: Path) -> dict:
+    """Read a safetensors file's JSON header (8-byte little-endian length
+    prefix, then the header itself). Nothing else in the file is touched, so
+    this is a few-hundred-KB read even for a 20 GB shard."""
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        return json.loads(f.read(n))
+
+
+def _source_weight_map(model_path: str) -> tuple[dict[str, str], str]:
+    """Map tensor key -> containing file for a checkpoint, plus a note.
+
+    Prefers `model.safetensors.index.json`; falls back to the header of a
+    single-file `model.safetensors`, because a single-shard checkpoint
+    legitimately has no index and treating that as "cannot verify" passes a
+    check that verified nothing."""
+    root = Path(model_path)
+    idx_path = root / "model.safetensors.index.json"
+    if idx_path.is_file():
+        with open(idx_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+        return {str(k): str(v) for k, v in weight_map.items()}, "index"
+    single = root / "model.safetensors"
+    if single.is_file():
+        header = _safetensors_header(single)
+        return (
+            {k: single.name for k in header if k != "__metadata__"},
+            "single-file header",
+        )
+    return {}, f"{idx_path} and {single} both missing — cannot verify"
+
+
+def _tensor_shapes(model_path: str, files: set[str]) -> dict[str, tuple[int, ...]]:
+    """Best-effort key -> shape over the named shards. Shards that are absent
+    (metadata-only HF cache entries hold the index but no weights) are simply
+    skipped, so rank checks degrade to name checks instead of failing."""
+    shapes: dict[str, tuple[int, ...]] = {}
+    for fname in sorted(files):
+        path = Path(model_path) / fname
+        if not path.is_file():
+            continue
+        try:
+            header = _safetensors_header(path)
+        except Exception:
+            continue
+        for k, meta in header.items():
+            if k == "__metadata__" or not isinstance(meta, dict):
+                continue
+            shape = meta.get("shape")
+            if isinstance(shape, list):
+                shapes[str(k)] = tuple(int(d) for d in shape)
+    return shapes
+
+
 def _check_packed_experts(profile, model_path: str) -> CheckResult:
-    """Cross-check: do the expert parameter names the profile declares
-    actually appear in the safetensors under an experts container?
-    A name like `gate_up_proj` is valid if some safetensors key ends
-    with `.experts.gate_up_proj` (or similar packed-expert location)."""
-    idx_path = Path(model_path) / "model.safetensors.index.json"
-    if not idx_path.is_file():
+    """Cross-check: does every expert weight on disk resolve to one of the
+    profile's declared packed-expert parameter names?
+
+    Two source layouts are legal and both must validate:
+
+      * packed:     `<...>.experts.gate_up_proj`        (3D, [E, 2I, H])
+      * per-expert: `<...>.experts.7.gate_proj.weight`  (2D — what a stock HF
+                    MoE checkpoint ships; packing happens at load/export)
+
+    The previous implementation tested `k.endswith(f"experts.{n}")`, which
+    only ever matches the packed layout, so every un-packed HF source
+    (Laguna, ornith-35B, DSv4) failed a check it should pass. Classification
+    is delegated to the profile's own accessors (`packed_expert_role_group`,
+    the shared expert-qname splitter) so expert naming stays owned by the
+    profile rather than re-parsed here. When the shards are readable, ranks
+    are verified too: a 3D expert tensor whose parameter name the profile
+    does NOT declare is a hard fail — the pipeline would silently skip it."""
+    weight_map, source = _source_weight_map(model_path)
+    if not weight_map:
         return CheckResult(
-            "packed_expert_param_names() cover actual 3D params",
-            True, f"{idx_path} missing — cannot verify")
-    with open(idx_path) as f:
-        keys = list(json.load(f).get("weight_map", {}).keys())
+            "packed_expert_param_names() cover actual expert tensors",
+            True, source)
     names = profile.packed_expert_param_names()
     if not names:
         return CheckResult(
-            "packed_expert_param_names() cover actual 3D params",
+            "packed_expert_param_names() cover actual expert tensors",
             True, "profile declares no packed-expert names")
+
+    # Only the shards that actually hold expert tensors need a header read.
+    expert_files = {
+        f for k, f in weight_map.items()
+        if ".experts." in k or k.endswith(".experts")
+    }
+    shapes = _tensor_shapes(model_path, expert_files)
+
+    split_qname = type(profile)._packed_expert_projection_leaf
     found: dict[str, int] = {n: 0 for n in names}
-    for k in keys:
-        for n in names:
-            if k.endswith(f"experts.{n}"):
-                found[n] += 1
+    unmapped: dict[str, int] = {}
+    undeclared_3d: dict[str, int] = {}
+    layouts: set[str] = set()
+    n_expert_keys = 0
+    for key in weight_map:
+        # A key is `<parent>.experts.<...>` optionally followed by a
+        # parameter suffix (`.weight`, `.weight_scale`, ...). Try the key
+        # itself first (packed recipe form carries no suffix), then the key
+        # with its last component dropped.
+        parsed = None
+        for cand in (key, key.rsplit(".", 1)[0]):
+            parsed = split_qname(cand)
+            if parsed is not None:
                 break
+        if parsed is None:
+            continue
+        _parent, leaf, split_per_expert = parsed
+        n_expert_keys += 1
+        role = profile.packed_expert_role_group(cand)
+        rank = len(shapes[key]) if key in shapes else None
+        is_primary_weight = cand == key or key.endswith(".weight")
+        if role is None:
+            # Not an expert weight this profile can name a role for. A router
+            # sidecar (`experts.e_score_correction_bias`) is 1D and fine; a 3D
+            # tensor here is an undeclared packed-expert parameter.
+            if rank == 3 and is_primary_weight:
+                undeclared_3d[leaf] = undeclared_3d.get(leaf, 0) + 1
+            continue
+        layouts.add("per-expert" if split_per_expert else "packed")
+        if role in found:
+            found[role] += 1
+        else:
+            unmapped[leaf] = unmapped.get(leaf, 0) + 1
+
+    if undeclared_3d:
+        return CheckResult(
+            "packed_expert_param_names() cover actual expert tensors", False,
+            f"3D expert tensors on disk that the profile does not declare: "
+            f"{undeclared_3d} — add them to packed_expert_param_names() or "
+            f"the spec's packed_experts.param_names")
+    if n_expert_keys == 0:
+        # Same leniency as check 7: one profile covers a family, and a dense
+        # member of that family (Gemma 4 31B-IT vs 26B-A4B) legitimately has
+        # no expert tensors at all. Declaring packed names it never uses is
+        # not a profile bug; declaring names that don't match the experts
+        # that ARE there is, and that is the branch below.
+        return CheckResult(
+            "packed_expert_param_names() cover actual expert tensors", True,
+            f"checkpoint has no expert tensors (dense variant; "
+            f"{len(weight_map)} keys via {source})")
     covered = [n for n, c in found.items() if c > 0]
     missing = [n for n, c in found.items() if c == 0]
     if not covered:
         return CheckResult(
-            "packed_expert_param_names() cover actual 3D params", False,
-            f"none of {set(names)} appear as packed experts on disk "
-            f"(checked {len(keys)} safetensors keys)")
-    detail = f"{len(covered)}/{len(names)} declared names found"
+            "packed_expert_param_names() cover actual expert tensors", False,
+            f"none of {set(names)} are reachable from the {n_expert_keys} "
+            f"expert tensors on disk (of {len(weight_map)} keys, via "
+            f"{source})")
+    detail = (f"{len(covered)}/{len(names)} declared names found over "
+              f"{n_expert_keys} expert tensors "
+              f"({'+'.join(sorted(layouts))} layout, via {source})")
     if missing:
         detail += f" — unused: {missing}"
+    if unmapped:
+        detail += f" — projections with no declared parent: {unmapped}"
     return CheckResult(
-        "packed_expert_param_names() cover actual 3D params", True, detail)
+        "packed_expert_param_names() cover actual expert tensors", True, detail)
 
 
 def _check_serving_profile(profile) -> CheckResult:

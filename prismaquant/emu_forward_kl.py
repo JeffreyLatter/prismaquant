@@ -90,7 +90,12 @@ def _render_weight(
 
 
 def _wants_act_emulation(spec: fr.FormatSpec) -> bool:
-    return spec.act_bits is not None and spec.family in _ACT_EMULATION_FAMILIES
+    # "Does serving quantize the input activations?" has exactly one
+    # definition (FormatSpec.act_quant_changes_input); never re-derive it from
+    # act_bits here, or an A16 rung declared as act_bits=16 would be emulated
+    # as a W-and-A format while the allocator prices it as passthrough.
+    return (spec.act_quant_changes_input
+            and spec.family in _ACT_EMULATION_FAMILIES)
 
 
 class _WeightSwapper:

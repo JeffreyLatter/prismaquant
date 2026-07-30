@@ -594,7 +594,11 @@ def test_exporter_resolves_nested_prefix_skeleton(tmp_path, monkeypatch):
     # Hybrid Qwen3.6-27B/Hy3/DSv4: the assignment uses recipe names
     # (model.layers.N.*) but the checkpoint nests the LM under
     # model.language_model.*. The exporter must resolve BOTH directions via the
-    # profile and emit tensors + config targets under the CHECKPOINT convention.
+    # profile: TENSORS ship under the CHECKPOINT convention, config_groups
+    # targets under the SERVING-canonical one (3be09e4 — vLLM's class mapper
+    # serves the LM at model.layers.* whatever the on-disk infix, so
+    # checkpoint-namespace targets matched nothing and every layer loaded
+    # unquantized, 2026-07-22).
     from prismaquant import model_profiles
     from prismaquant.export_nvfp4_cb import export_nvfp4_cb
     from safetensors.torch import save_file, load_file
@@ -618,10 +622,13 @@ def test_exporter_resolves_nested_prefix_skeleton(tmp_path, monkeypatch):
     # Packed tensor carries the NESTED (checkpoint/vLLM) name, not the recipe one.
     assert f"{nested}.cb_qweight" in st, sorted(st)
     assert f"{canon}.cb_qweight" not in st
-    # config_groups target is the nested name so the plugin matches served modules.
+    # config_groups target is the CANONICAL name so the plugin matches the
+    # modules vLLM actually instantiates. (Artifacts exported before 3be09e4
+    # carry checkpoint-namespace targets; the plugin canonicalizes those at
+    # parse time — e765301 — so back-compat lives there, not here.)
     qc = _json.loads((out / "quant_config.json").read_text())
     cb_g = next(g for g in qc["config_groups"].values() if "scheme" in g)
-    assert nested in cb_g["targets"] and canon not in cb_g["targets"]
+    assert canon in cb_g["targets"] and nested not in cb_g["targets"]
     # Non-target tensors copied verbatim under their checkpoint names.
     assert "model.language_model.norm.weight" in st
     assert "model.visual.patch_embed.weight" in st

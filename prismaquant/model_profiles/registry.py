@@ -35,7 +35,7 @@ from .qwen3_moe import Qwen3MoeProfile
 
 # MiniMaxM2Profile: re-imported from its live mirror after the 2026-04-24
 # session's Phase-3 archive move. The profile is still tracked under
-# archive/minimax_m2p7/ as its canonical home; this live import enables
+# archive/minimax_m2p7_2026-04-24/ as its canonical home; this live import enables
 # allocator Pareto runs without uprooting the archive commit.
 from .minimax_m2 import MiniMaxM2Profile
 from .deepseek_v4 import DeepseekV4Profile

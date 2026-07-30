@@ -1,8 +1,15 @@
 {
   "schema": "prismaquant.serving_profile.v1",
   "id": "nvfp4_cb",
-  "runtime": "vllm_prismaquant_plugin",
-  "description": "NVFP4-CB / FP8-CB codebook container lane: a custom out-of-tree vLLM plugin (vllm_prismaquant_plugin, plugins/vllm_prismaquant/) decodes the codebook schemes into NVFP4/FP8 buffers and delegates plain NVFP4/FP8/BF16 layers to stock compressed-tensors. Deliberately a MIXED container (PLAN.md decision #1, 'FP8 in every recipe'): CB rungs coexist with plain NVFP4, FP8_DYNAMIC and BF16 in one artifact. The scheme vocabulary is prismaquant-custom (NOT stock compressed-tensors, whose schemes cannot express codebooks); ships via prismaquant.export_nvfp4_cb, docs/lanes/nvfp4-cb/LAYOUT.md is the byte contract.",
+  "runtime": "gridbook_plugin",
+  "description": "NVFP4-CB / FP8-CB codebook container lane: a custom out-of-tree vLLM plugin (gridbook_plugin, plugins/gridbook/; registered under quant_method 'gridbook', with the pre-rename 'prismaquant' key kept as a read alias for already-shipped artifacts) decodes the codebook schemes into NVFP4/FP8 buffers and delegates plain NVFP4/FP8/BF16 layers to stock compressed-tensors. Deliberately a MIXED container (PLAN.md decision #1, 'FP8 in every recipe'): CB rungs coexist with plain NVFP4, FP8_DYNAMIC and BF16 in one artifact. The scheme vocabulary is prismaquant-custom (NOT stock compressed-tensors, whose schemes cannot express codebooks); ships via prismaquant.export_nvfp4_cb, docs/lanes/nvfp4-cb/LAYOUT.md is the byte contract.",
+  "export_lane": {
+    "id": "nvfp4_cb",
+    "exporter": "prismaquant.export_nvfp4_cb",
+    "codec_formats_from": ["prismaquant.export_nvfp4_cb:EXPORTABLE_FORMATS"],
+    "reason": "exporter_cannot_emit",
+    "detail": "The lane's menu IS the CB exporter's own EXPORTABLE_FORMATS declaration -- the same set its coverage gate accepts: the CB rung families (NVFP4_CB_K12..K24 / NVFP4_CB_S13..S16 / FP8_CB_K28..K48, pinned to format_registry by test_nvfp4_cb_formats), the two stock compressed-tensors schemes the gridbook plugin delegates to vLLM (NVFP4, and FP8_E4M3 <- FP8_DYNAMIC), the verbatim FP8_SOURCE passthrough and the BF16 container passthrough. Passthroughs need no separate entry -- the exporter folds them into the constant it declares, so there is exactly one source of truth. Anything else (MXFP4/MXFP8, the weight-only A16 family, the ggml types) has neither a CB scheme nor a CT delegation, so export_cb raises `assignment contains formats the mixed CB container cannot carry` rather than silently BF16-coercing the Linear and blowing the allocated bit budget."
+  },
   "format_rules": [
     {
       "id": "nvfp4_cb_container_formats",
@@ -51,7 +58,7 @@
         "BF16"
       ],
       "reason": "profile_mismatch",
-      "detail": "The nvfp4_cb container carries the two codebook families plus their native carriers. NVFP4_CB_K12..K24 (fp4/E2M1 grid, product VQ, 2.000..3.500 bpw in 0.125 steps) and NVFP4_CB_S13..S16 (fp4 sign-magnitude VQ, 2.125..2.500 bpw) decode to bit-compatible NVFP4 tiles (E2M1 codes + group-16 E4M3 scale) and feed the CUTLASS FP4 path. FP8_CB_K28..K48 (fp8/E4M3 grid, product VQ, 3.5..6.0 bpw in 0.5 steps, per-output-channel fp32 scales) fill the NVFP4->FP8 CT-menu gap and feed the stock W8A8 GEMM; K28/K32 (added 2026-07-19) are served by the SAME plugin kernels (sub-widths 7/8 <= the GEMV's 12 ceiling, type_size 112/128 both 16-aligned). Plain NVFP4 (W4A4 group-16) and FP8_DYNAMIC (W8A8) are delegated to stock compressed-tensors by the plugin; FP8_SOURCE (verbatim native-fp8 weight + 128x128 block weight_scale copy, emitted as the stock float-quantized block-fp8 CT scheme) is likewise plugin-delegated and passthrough-only (never synthesized); BF16 is the unquantized passthrough. Every rung is served only by the out-of-tree vllm_prismaquant_plugin and stays research/candidate until it clears the served gold-metric gate (exact full-vocab vLLM KL-vs-BF16 + WikiText PPL) AND the prefill perf gate (INV-2, no Triton masquerade)."
+      "detail": "The nvfp4_cb container carries the two codebook families plus their native carriers. NVFP4_CB_K12..K24 (fp4/E2M1 grid, product VQ, 2.000..3.500 bpw in 0.125 steps) and NVFP4_CB_S13..S16 (fp4 sign-magnitude VQ, 2.125..2.500 bpw) decode to bit-compatible NVFP4 tiles (E2M1 codes + group-16 E4M3 scale) and feed the CUTLASS FP4 path. FP8_CB_K28..K48 (fp8/E4M3 grid, product VQ, 3.5..6.0 bpw in 0.125 steps -- every integer k, c52d04c, per-output-channel fp32 scales) fill the NVFP4->FP8 CT-menu gap and feed the stock W8A8 GEMM; K28/K32 (added 2026-07-19) are served by the SAME plugin kernels (sub-widths 7/8 <= the GEMV's 12 ceiling, type_size 112/128 both 16-aligned). Plain NVFP4 (W4A4 group-16) and FP8_DYNAMIC (W8A8) are delegated to stock compressed-tensors by the plugin; FP8_SOURCE (verbatim native-fp8 weight + 128x128 block weight_scale copy, emitted as the stock float-quantized block-fp8 CT scheme) is likewise plugin-delegated and passthrough-only (never synthesized); BF16 is the unquantized passthrough. Every rung is served only by the out-of-tree gridbook_plugin and stays research/candidate until it clears the served gold-metric gate (exact full-vocab vLLM KL-vs-BF16 + WikiText PPL) AND the prefill perf gate (INV-2, no Triton masquerade)."
     },
     {
       "id": "cb_packed_expert_stock_ct_unsupported",

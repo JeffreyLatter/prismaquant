@@ -62,6 +62,12 @@ against. Changes to it require a served A/B, not a preference.
   (10.10 vs 10.13 tok/s, quality-neutral) — decode is bandwidth-bound at
   per-byte parity, nothing for the hoist to recover. Default stays v1;
   v2 remains supported via PRISMAQUANT_CB_DECODE_CONTRACT=v2.
+- R6 smem-resident codebook LUT (2026-07-26, commit `1ede688`): k48's 32 KB LUT
+  thrashed the ~50 KB post-carve-out L1 (decode ALU ran 7.5× k44's for 9% more
+  bits). Staging the table into smem per (TileM, KBits) cut the **ALU term 9.1×**
+  in the R2 term decomposition, **bit-exact 38/38**; kernel-level −61.5% on k48
+  fused, and served Laguna auto went 2,063 → 2,186 tok/s. Mechanism +
+  `AssertSmemFits` gating: `plugins/gridbook/README.md:136`.
 - Serving graph standard for ship configs: **mode-0 + FULL_DECODE_ONLY**.
   The compile lane (mode-3, any cudagraph flavor) is correctness-clean since
   the M-branch hoist and measured at decode parity (13.5–14.0 band on Hy3,
