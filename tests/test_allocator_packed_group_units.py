@@ -295,6 +295,72 @@ def test_group_units_fund_the_dense_row_and_use_headroom():
     assert promoted == expanded, "MoE promotion must be a no-op on group units"
 
 
+def test_role_split_profile_yields_gate_up_and_down_units():
+    """--packed-role-split granularity: per layer, gate+up projections form
+    one DP/serving unit and down projections another; promotion through the
+    SAME wrapped profile treats role-mixed layer formats as coherent."""
+    from prismaquant.allocator_candidates import (
+        packed_projection_role_group,
+        packed_role_split_profile,
+    )
+
+    assert packed_projection_role_group(
+        "model.layers.3.mlp.experts.7.gate_proj") == "gate_up"
+    assert packed_projection_role_group(
+        "model.layers.3.mlp.experts.7.up_proj") == "gate_up"
+    assert packed_projection_role_group(
+        "model.layers.3.mlp.experts.7.down_proj") == "down"
+    assert packed_projection_role_group(
+        "model.layers.3.mlp.experts.gate_up_proj") == "gate_up"
+    assert packed_projection_role_group(
+        "model.layers.3.mlp.experts.0.w2") == "down"
+    assert packed_projection_role_group(
+        "model.layers.3.self_attn.o_proj") is None
+
+    stats, cands, expert_names, dense = _mk_moe_fixture()
+    costs = {n: {} for n in stats}
+    prof = packed_role_split_profile(_PackedProfile())
+    stats_ext, _, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, prof)
+
+    supers = [n for n in cands_ext if _PACKED_GROUP_MARKER in n]
+    assert len(supers) == 2, f"expected gate_up + down units, got {supers}"
+    gate_up = frozenset(
+        m for m in expert_names if m.endswith((".gate_proj", ".up_proj")))
+    down = frozenset(m for m in expert_names if m.endswith(".down_proj"))
+    got = {frozenset(stats_ext[s]["_packed_group_members"]) for s in supers}
+    assert got == {gate_up, down}
+
+    # A role-mixed layer (gate/up LOW, down HIGH) must be serving-coherent
+    # under the same wrapped profile: promotion is a no-op.
+    assignment = {dense: _LOW}
+    for s in supers:
+        role_is_down = stats_ext[s]["_packed_group_key"].endswith(
+            "::role:down")
+        assignment[s] = _HIGH if role_is_down else _LOW
+    expanded = expand_packed_group_assignment(assignment, stats_ext)
+    rank = {_LOW: 0, _HIGH: 1}
+    assert promote_serving_units(expanded, rank, profile=prof) == expanded
+    for m in expert_names:
+        assert expanded[m] == (_HIGH if m in down else _LOW)
+
+
+def test_role_split_default_off_keeps_layer_uniform_units():
+    from prismaquant.allocator_candidates import packed_role_split_profile
+
+    stats, cands, expert_names, _ = _mk_moe_fixture()
+    costs = {n: {} for n in stats}
+    _stats2, _costs2, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    assert sum(1 for n in cands_ext if _PACKED_GROUP_MARKER in n) == 1
+
+    class _NoPacked:  # pass-through for profiles without packed groups
+        pass
+
+    p = _NoPacked()
+    assert packed_role_split_profile(p) is p
+
+
 def test_whole_group_still_promotes_when_budget_affords_it():
     stats, cands, expert_names, dense = _mk_moe_fixture(
         n_experts=8, expert_params=4096, dense_params=1 << 20)
@@ -431,3 +497,47 @@ def test_group_ucb_stderr_aggregates_in_quadrature(monkeypatch):
         assert abs(cand.predicted_dloss - n_members * base[fmt]) < 1e-12
         agg = (n_members * stderr[fmt] ** 2) ** 0.5
         assert abs(costs0[super0][fmt]["predicted_dloss_stderr"] - agg) < 1e-12
+
+
+def test_role_split_requires_profile_capability():
+    """--packed-role-split is only legal when the resolved serving profile
+    DECLARES per-role expert schemes: a role-split checkpoint carries
+    different expert formats for gate_up vs down projections of one MoE
+    layer, which vLLM's compressed-tensors packed-MoE path cannot load
+    (one scheme per FusedMoE layer) but the GGUF lane can (expert tensors
+    stack per projection)."""
+    import pytest
+
+    from prismaquant.serving_profiles import (
+        load_serving_profile,
+        require_per_role_expert_scheme_support,
+    )
+
+    # Capability declarations: only the GGUF lane opts in.
+    assert load_serving_profile("gguf").supports_per_role_expert_schemes
+    for profile_id in ("research", "vllm_packed_moe",
+                       "vllm_qwen3_5_packed_moe"):
+        assert not load_serving_profile(
+            profile_id).supports_per_role_expert_schemes, profile_id
+
+    # Supporting profile: accepted, resolved profile returned.
+    prof = require_per_role_expert_scheme_support(
+        "gguf", flag="--packed-role-split")
+    assert prof.id == "gguf"
+
+    # Non-supporting profile: hard error naming the flag, the profile,
+    # and why (one scheme per FusedMoE layer).
+    with pytest.raises(SystemExit) as exc:
+        require_per_role_expert_scheme_support(
+            "vllm_packed_moe", flag="--packed-role-split")
+    msg = str(exc.value)
+    assert "--packed-role-split" in msg
+    assert "vllm_packed_moe" in msg
+    assert "FusedMoE" in msg
+
+    # Default (research) and unknown profiles: hard error, never a
+    # silent pass.
+    with pytest.raises(SystemExit):
+        require_per_role_expert_scheme_support(None)
+    with pytest.raises(SystemExit):
+        require_per_role_expert_scheme_support("no_such_profile")

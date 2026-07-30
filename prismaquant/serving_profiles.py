@@ -269,6 +269,13 @@ class ServingProfile:
     runtime_shape_validators: tuple[RuntimeShapeValidatorRule, ...] = ()
     runtime_packages: tuple[RuntimePackageSpec, ...] = ()
     description: str = ""
+    # Capability: the serving lane can load DIFFERENT expert schemes for
+    # different projection roles of one MoE layer (gate/up vs down). True
+    # for GGUF (expert tensors are stacked PER projection, so each stacked
+    # tensor carries its own ggml type); false for vLLM compressed-tensors
+    # packed MoE, where CompressedTensorsMoEMethod selects ONE scheme per
+    # FusedMoE layer. Gates --packed-role-split.
+    supports_per_role_expert_schemes: bool = False
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ServingProfile":
@@ -296,6 +303,9 @@ class ServingProfile:
                 for entry in payload.get("runtime_packages", ())
             ),
             description=str(payload.get("description", "")),
+            supports_per_role_expert_schemes=bool(
+                payload.get("supports_per_role_expert_schemes", False)
+            ),
         )
 
     def check_format(self, qname: str | None, fmt: str) -> ServingFormatDecision:
@@ -388,6 +398,12 @@ def load_serving_profile(profile_id: str | None) -> ServingProfile:
                 for package in base.runtime_packages
             ) + profile.runtime_packages,
             description=profile.description,
+            supports_per_role_expert_schemes=(
+                profile.supports_per_role_expert_schemes
+                or any(
+                    base.supports_per_role_expert_schemes for base in bases
+                )
+            ),
         )
     _CACHE[profile_name] = profile
     return profile
@@ -416,6 +432,47 @@ def resolve_target_profile(
         except Exception:
             pass
     return str(default)
+
+
+def require_per_role_expert_scheme_support(
+    profile_id: str | None,
+    *,
+    flag: str = "--packed-role-split",
+) -> ServingProfile:
+    """Hard gate: the resolved serving profile must DECLARE per-role
+    expert scheme support before a per-role expert split is legal.
+
+    A gate_up/down role split emits different formats for different
+    projections of the SAME MoE layer. That is only loadable when the
+    serving lane keys expert schemes per projection — GGUF does (expert
+    tensors are stacked per projection, each stacked tensor carries its
+    own ggml type). vLLM's compressed-tensors packed-MoE path does not:
+    CompressedTensorsMoEMethod selects ONE scheme per FusedMoE layer, so
+    a role-split checkpoint (e.g. gate_up=NVFP4 with down=FP8) cannot be
+    loaded. Profiles opt in with ``supports_per_role_expert_schemes``.
+    """
+    resolved = str(profile_id or "research")
+    try:
+        profile = load_serving_profile(resolved)
+    except FileNotFoundError:
+        raise SystemExit(
+            f"[alloc] ERROR: {flag} was requested, but the target profile "
+            f"{resolved!r} is unknown."
+        )
+    if not profile.supports_per_role_expert_schemes:
+        raise SystemExit(
+            f"[alloc] ERROR: {flag} was requested, but the resolved "
+            f"serving profile {resolved!r} does not declare "
+            "supports_per_role_expert_schemes. A per-role split emits "
+            "different expert formats for gate_up vs down projections of "
+            "the SAME MoE layer; this profile's serving lane loads every "
+            "projection of a layer's experts under ONE scheme (vLLM's "
+            "CompressedTensorsMoEMethod selects one scheme per FusedMoE "
+            "layer), so the checkpoint would be unservable. Use a profile "
+            "whose lane keys expert schemes per projection (e.g. "
+            "--target-profile gguf), or drop the flag."
+        )
+    return profile
 
 
 def check_serving_format(

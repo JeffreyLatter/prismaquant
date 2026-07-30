@@ -115,10 +115,12 @@ from .allocator_candidates import (
     build_candidates,
     expand_fused_sibling_assignment,
     expand_packed_group_assignment,
+    packed_role_split_profile,
     summarize_applicability_masks,
 )
 from .serving_profiles import (
     check_serving_format,
+    require_per_role_expert_scheme_support,
     resolve_target_profile,
     serving_profile_names,
 )
@@ -1211,6 +1213,18 @@ def main():
                          "coherence. Aggregation prices the DP and the "
                          "serving constraint identically; use this flag "
                          "only for back-compat experiments.")
+    ap.add_argument("--packed-role-split", action="store_true",
+                    help="Split each packed-MoE expert serving group into "
+                         "TWO DP units per layer: gate+up projections and "
+                         "down projections (default: one per-layer-uniform "
+                         "unit). Hard-errors unless the resolved serving "
+                         "profile declares supports_per_role_expert_schemes "
+                         "(e.g. gguf: GGUF stacks expert tensors per "
+                         "projection, so each role can carry its own type; "
+                         "vLLM packed-MoE loads one scheme per FusedMoE "
+                         "layer). The split threads through the profile "
+                         "view, so serving promotion stays consistent with "
+                         "the DP units.")
     ap.add_argument("--enforce-family-coherence", action="store_true",
                     help="Error (instead of warn) if the format set contains "
                          "multiple candidates for the same bit tier (e.g. "
@@ -1457,6 +1471,26 @@ def main():
         specs_sorted,
         allow_default_profile=args.allow_default_profile,
     )
+
+    if args.packed_role_split:
+        # A role split emits different expert formats for gate_up vs down
+        # projections of the SAME MoE layer — only loadable when the
+        # serving lane keys expert schemes per projection. Hard-error
+        # unless the resolved serving profile declares the capability
+        # (SystemExit inside on unsupported/unknown profiles).
+        require_per_role_expert_scheme_support(
+            target_profile, flag="--packed-role-split")
+        # Split packed expert groups into gate_up / down serving units by
+        # wrapping the profile view: DP aggregation AND serving promotion
+        # both key groups through packed_expert_format_group, so wrapping
+        # keeps them consistent (role units atomic, final promotion still a
+        # validated no-op). Must run after the isinstance-based
+        # DefaultProfile gate above.
+        model_profile = packed_role_split_profile(model_profile)
+        print("[alloc] --packed-role-split: packed expert groups keyed as "
+              "(layer, {gate_up|down}) serving units "
+              f"(profile {target_profile!r} declares per-role expert "
+              "schemes)", flush=True)
 
     # --- Format-family coherence check -----------------------------------
     # A sensible format ladder has at most ONE format per bit tier. Having
