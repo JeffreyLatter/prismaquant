@@ -1,6 +1,23 @@
 # v20: memory policy + scheduling instrumentation
 
-Status: design, pre-implementation.
+Status (2026-07-30): **steps 1–5 shipped; steps 6 and 9 dropped.** The
+implementation order in "Implementation order" below is the plan as written,
+not the outcome. Outcome:
+
+| Step | State | Where |
+|---|---|---|
+| 1 predeclared shard schedule | shipped | `incremental_probe.py:493-501` |
+| 2 `mark_done` on LayerCache + scheduler calls | shipped | `layer_streaming.py:1206`; drivers `incremental_probe.py:3335-3356`, `streaming_model.py:566` |
+| 3 value-aware install retention | shipped | `streaming_model.py:490` |
+| 4 dynamic budget | shipped | `layer_streaming.py:1150,1291`; `streaming_model.py:891-895` |
+| 5 pressure shrink → priority signal | shipped | `layer_streaming.py:1206` (`_maybe_pressure_shrink`, incl. fix #4-B) |
+| 6 Gantt instrumentation | **dropped** — never landed; no `gantt` symbol in the tree | — |
+| 7 BF16 accumulators / 8 pinned staging | not tracked here | — |
+| 9 per-channel Fisher summaries | **dropped** — no `h_per_in_channel`/`h_per_out_channel` anywhere; cost keeps the scalar `h_trace` (`sensitivity_probe.py`, `h_detail_version 3`) | — |
+
+Steps 6 and 9 are recorded as dropped, not pending: nothing downstream waits
+on them and the cost-step contract was never opened.
+
 Target: replaces v19 multipass run on MiniMax-M2.7 / 121 GB Spark / 1.8 TB disk.
 
 ## Why v20 exists

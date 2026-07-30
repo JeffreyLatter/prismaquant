@@ -1,6 +1,6 @@
 """Throughput-optimal draft-rung selector for MTP / spec-decode modules — canon.
 
-Normative spec: ``docs/mtp_rung_selection.md`` (Robert, 2026-07-20). A draft can
+Normative spec: ``docs/design/mtp_rung_selection.md`` (Robert, 2026-07-20). A draft can
 NEVER change outputs (rejection sampling reproduces the target distribution
 exactly), so this selector optimises **throughput only** — there is no quality
 gate on the draft. The reference integration is

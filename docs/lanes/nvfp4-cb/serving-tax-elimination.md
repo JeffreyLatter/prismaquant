@@ -79,3 +79,18 @@ understates the format.
    the measurement that sizes how much of §4b consumer cards even need.
 4. Re-run the matched-size perf table after (1); update cards with both
    iso-size and iso-quality rows.
+
+> **OUTCOME 2026-07-26 — items 1 and 2 were run and both came back non-positive;
+> the tax fell to different levers.**
+>
+> | Item | Verdict |
+> |---|---|
+> | 1. Decode contract v2 (scale-epilogue hoist) | **MEASURED NULL** on the served 27B: 10.10 vs 10.13 tok/s, quality-neutral. Decode is bandwidth-bound at per-byte parity, so there is nothing for the hoist to recover. Default stays v1; v2 supported via `PRISMAQUANT_CB_DECODE_CONTRACT=v2` (`STANDARDS.md:61-64`, commit `d924d76`). |
+> | 2. Persistent-N §4b | **MEASURED NEGATIVE** for dense: 2–5.7× slower than expand+fork at 27B shapes once the CUDA expander had shrunk the dense expand tax to ~10%. Quarantined behind `PRISMAQUANT_ENABLE_PTC=1` (`STANDARDS.md:55`; see `persistent-n-prefill.md` §7 OUTCOME). |
+> | 3. Stream-overlap expand | Previously rejected on the dense path: N-chunked expand+GEMM overlap measured 0.46× and is **not** bit-exact (`cutlass_scaled_mm` reconfigures on narrow N) — `linear.py:53-59`. |
+>
+> What actually removed the tax was elsewhere: the mid-M CUTLASS fused
+> decode-in-prologue (default since 2026-07-26, 1.40× in-niche), the measured
+> per-layer MoE prefill selector (`auto`), and the R6 smem-resident codebook LUT.
+> Laguna-class MoE prefill went 293 → 2,186 tok/s over that campaign. Item 4's
+> iso-size/iso-quality framing (§3) still stands and is the right one for cards.

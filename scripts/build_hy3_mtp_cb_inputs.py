@@ -13,7 +13,7 @@ Two rung-selection policies (``--rung-select``):
   * ``modal`` (default; reproduces the shipped sidecar byte-for-byte):
       - routed experts -> the body's **modal fp4 expert rung**;
       - shared expert + attention -> **FP8_CB_K32** (the sensitive-tail default).
-  * ``auto`` (the canon selector, ``docs/mtp_rung_selection.md``): build the
+  * ``auto`` (the canon selector, ``docs/design/mtp_rung_selection.md``): build the
     per-role CB menu, fit served acceptance to ``a(b)=a_inf−β·sqrt(E(b))``,
     and pick the throughput-optimal rung with ``mtp_rung_selection.select_rung``.
     Emits ``mtp_rung_selection.json`` (the full selection provenance) next to
@@ -473,7 +473,7 @@ def main(argv=None) -> None:
     ap.add_argument("--rung-select", choices=("modal", "auto"), default="modal",
                     help="modal = mirror the body's dominant rung (reproduces "
                          "the shipped sidecar); auto = the canon throughput "
-                         "selector (docs/mtp_rung_selection.md)")
+                         "selector (docs/design/mtp_rung_selection.md)")
     # modal knobs (also the auto defaults for the modal-equivalent build call)
     ap.add_argument("--expert-fp4-k", type=int, default=None,
                     help="modal: override the routed-expert fp4 rung (default modal)")

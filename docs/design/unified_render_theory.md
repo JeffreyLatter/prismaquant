@@ -337,10 +337,17 @@ predictability → optimum farthest from any fixed constant). So the "sweep is
 essential" claim is screen-grade evidence of *something real centered on
 o_proj*, not a gold-metric fact. The 31-row local regrets (median +2%, tail
 +85% on o_proj) summing to far less than +137% under fp32 additivity is
-consistent with the screen overstating it. **Still unresolved and still
-blocks any production change** — V1 measures sweep vs fixed vs CV-selected
-on the gold metric. Until then the sweep stays the default (defaults stay
-backwards-compatible; everything here ships as opt-in levers).
+consistent with the screen overstating it.
+
+**RESOLVED 2026-06-12 (§8 V0b/V0c/V1).** The V1 gold-lane A/B ran and the
+tension closed against the sweep: the sweep is **OFF by default**
+(`export_native_compressed.py:1857`, `PRISMAQUANT_GPTQ_DAMP_SWEEP=1`
+reproduces historical sweep-rendered artifacts) and damp is a fixed
+constant **1.0** (`export_native_compressed.py:1860`,
+`PRISMAQUANT_GPTQ_DAMP` overrides). The +137.5% figure is dead as evidence
+— see §8 for the held-out basins (31/31 in-sample winners under-damped) and
+the served readouts. Read this section as the record of the tension, not as
+a statement of the current default.
 
 ---
 

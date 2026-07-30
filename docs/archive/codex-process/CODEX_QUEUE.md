@@ -1,3 +1,17 @@
+> **CLOSED PROCESS (archived 2026-07-30).** All 82 findings of the 2026-06-09
+> review were dispositioned by 2026-06-22 (`CODEX_PROGRESS.md`, same
+> directory). This file is a **record of a dispatch, not active instruction** —
+> do not follow its ground rules or protocol as current policy; the live rules
+> are `AGENTS.md` and `docs/design/design_guidelines.md`.
+>
+> One ledger line is now inverted on HEAD: MAJOR-M10's rationale
+> (`CODEX_PROGRESS.md:10`) closes the hybrid expert-AURA cost as
+> WONTFIX-FOR-NOW on the grounds that "nothing ships via AURA-MoE today (no
+> COST_MODE=aura in run-pipeline)". `COST_MODE=aura` is now fully wired
+> (`run-pipeline.sh:187` accepts it; sub-stages at `:314-336` and `:825-956`),
+> with empirical expert costs for the MoE rungs — opt-in, not the default,
+> which stays `production-render-score`.
+
 # Codex review-batch dispatch — 2026-06-11
 
 You are working through the non-critical findings (35 MAJOR, 42 MINOR,

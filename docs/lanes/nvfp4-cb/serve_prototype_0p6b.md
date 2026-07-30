@@ -1,6 +1,6 @@
 # NVFP4-CB / FP8-CB — served prototype (i), Qwen3-0.6B
 
-> **Prototype (i) of `docs/nvfp4-cb-plan/serving-kernel.md`: a CORRECT-but-slow
+> **Prototype (i) of `docs/lanes/nvfp4-cb/serving-kernel.md`: a CORRECT-but-slow
 > Triton vLLM plugin.** First served KL-vs-BF16 and first speed reading for the
 > CB codebook formats. **INV-1 honored** (no dense `[N,K]` in HBM — per-tile
 > decode in registers); **INV-2 WAIVED** (bf16 `tl.dot`, not the Blackwell FP4

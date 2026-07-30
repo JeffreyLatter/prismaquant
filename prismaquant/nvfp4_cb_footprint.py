@@ -3,7 +3,7 @@
 Covers both concurrently-authored CB families:
 
   * ``NVFP4_CB_K{k}`` — FP4-grid codewords, group-16 E4M3 scale plane
-    (``k/8 + 0.5`` bpw, docs/nvfp4-cb-plan/format-pipeline.md §1.2);
+    (``k/8 + 0.5`` bpw, docs/lanes/nvfp4-cb/format-pipeline.md §1.2);
   * ``FP8_CB_K{k}`` — FP8/E4M3-grid codewords, NO group scale plane
     (``k/8`` bpw body) + per-output-channel fp32 scales.
 

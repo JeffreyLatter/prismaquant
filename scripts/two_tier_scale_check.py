@@ -1,5 +1,5 @@
 """CPU-only empirical check for the two-tier scale spec
-(docs/nvfp4-cb-plan/two-tier-scale-spec.md §3).
+(docs/lanes/nvfp4-cb/two-tier-scale-spec.md §3).
 
 Question: constraining the NVFP4-CB per-group-16 scale sweep to the two-tier
 REACHABLE set {T[c] x 2^E_sb : legality mask} (per-256 E8M0 super + 4/5-bit

@@ -353,7 +353,7 @@ across two calibration draws at ~4.4× less render time, and the old
 "+137.5% if disabled" claim was a tier-5 hook screen that inverted on the
 gold lane. `PRISMAQUANT_GPTQ_DAMP_SWEEP=1` reproduces historical artifacts;
 `PRISMAQUANT_GPTQ_DAMP` overrides the constant. Open research: derive the
-per-Linear optimum from weights alone (docs/unified_render_theory.md).
+per-Linear optimum from weights alone (docs/design/unified_render_theory.md).
 
 **Hardware:** NVIDIA **GB10 / DGX Spark** ("sparky"), Blackwell sm_121, **128 GB
 unified memory** (~121 GB usable serving budget — GPU and host share one physical
@@ -496,18 +496,18 @@ lever ones (grouped-KL, Fisher, HDQ, multi-shot) **fail-fast with `exit 2`** fro
 
 Read these for *depth*; the prime directive applies.
 
-- **`docs/prismaquant_design.md`** — the master design doc (57 KB): the *why*
+- **`docs/archive/prismaquant_design.md`** — the master design doc (57 KB): the *why*
   behind the cascade, the knapsack DP + log-error kneedle, the render pipeline,
   the export codecs, the validation chain, the plugin architecture, and §11
   "Alternatives Considered and Rejected". **Most authoritative narrative**, and
   its archive banners are kept current. Still: a doc, not the code.
-- **`AGENTS.md`** + **`docs/design_guidelines.md`** — the terse normative rules
+- **`AGENTS.md`** + **`docs/design/design_guidelines.md`** — the terse normative rules
   (the 9 core principles, promotion gates, progressive render-gate contract,
   rotation-transform rule, exception rule). Mandatory pre-read for new work.
-- **`docs/runtime_flags.md`** — the env-flag vocabulary (`PRISMAQUANT_*`,
+- **`docs/design/runtime_flags.md`** — the env-flag vocabulary (`PRISMAQUANT_*`,
   `COST_MODE`, `SELECTION_MODE`, `PRODUCTION_CACHE_LEVERS`, CUDA-graph autos).
-- **`docs/progressive_render_pipeline.md`** + **`docs/pluggable_refactor.md`** +
-  **`docs/propagated_cost.md`** — render-gate ordering, the plugin contract, the
+- **`docs/design/progressive_render_pipeline.md`** + **`docs/design/pluggable_refactor.md`** +
+  **`docs/archive/propagated_cost.md`** — render-gate ordering, the plugin contract, the
   L3 propagated-cost spec.
 - **`paper/main.tex`** — the current AURA spine: production-faithful KL--Fisher
   allocation, additivity/cancellation analysis, served KL/PPL evidence, and

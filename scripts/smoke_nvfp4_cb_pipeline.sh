@@ -13,7 +13,7 @@
 # It is a CORRECTNESS smoke (does the lane run, allocate a mixed CB assignment,
 # and produce a loadable custom-quant-config checkpoint), NOT a quality gate.
 # The served gold-metric KL/PPL gate runs separately, in the out-of-tree
-# gridbook_plugin serving env (docs/nvfp4-cb-plan/serve_prototype_0p6b.md).
+# gridbook_plugin serving env (docs/lanes/nvfp4-cb/serve_prototype_0p6b.md).
 #
 # GPU-or-bust: run-pipeline.sh + gpu_guard refuse to run on CPU. The
 # orchestrator schedules this when the GPU frees. Do NOT launch it while
@@ -104,7 +104,7 @@ echo "##"
 echo "##  NEXT (separate, plugin serving env — NOT this script):"
 echo "##   1. Load + generate in vLLM with gridbook_plugin installed."
 echo "##   2. Served KL-vs-BF16 + WikiText PPL vs the emulation-gate predictions"
-echo "##      (docs/nvfp4-cb-plan/serve_prototype_0p6b.md). No rung is production-"
+echo "##      (docs/lanes/nvfp4-cb/serve_prototype_0p6b.md). No rung is production-"
 echo "##      eligible until it clears that gold-metric gate AND the prefill perf"
 echo "##      gate (INV-2, no Triton masquerade)."
 echo "############################################################################"

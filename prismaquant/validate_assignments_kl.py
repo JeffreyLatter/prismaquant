@@ -1,4 +1,12 @@
-"""Measure real last-token KL for one or more assignment JSON files."""
+"""Measure real KL for one or more assignment JSON files.
+
+Scope is ``--kl-scope``. The CLI default is ``last_token`` (a triage SCREEN,
+CLAUDE.md §5) for ad-hoc/probe-gate parity, but the pipeline passes
+``full_sequence`` — the gold-metric scope — for frontier selection
+(M26; ``run-pipeline.sh:269,1208``, default ``VALIDATED_FRONTIER_KL_SCOPE=
+full_sequence``). Note the summary key stays ``last_token_kl`` under both
+scopes for backwards compatibility (:645).
+"""
 from __future__ import annotations
 
 import argparse

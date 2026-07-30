@@ -1,5 +1,5 @@
 """``PrismaQuantCBMoEMethod`` — FusedMoE serving for stacked CB expert weights
-(docs/nvfp4-cb-plan/moe_cb_design.md §4, LAYOUT.md §3 stacked layout).
+(docs/lanes/nvfp4-cb/moe_cb_design.md §4, LAYOUT.md §3 stacked layout).
 
 Each expert stack ships as ONE tensor per role: ``<q>.cb_qweight`` uint8
 ``(E, out, (in/256)·type_size)`` (+ fp8 ``<q>.weight_scale`` ``(E, out)``), where
@@ -294,9 +294,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 layer, x, topk_weights, topk_ids, act)
 
         # Prefill / fallback (num_tokens > 16, or no grouped-CUDA decode path).
-        # Two implementations, env-selected via PRISMAQUANT_CB_PREFILL:
+        # Implementations, env-selected via PRISMAQUANT_CB_PREFILL. THE DEFAULT
+        # IS RESOLVED AT THE BOTTOM OF THIS BLOCK: 'auto' for fp8-CB, 'loop' for
+        # fp4-CB (see the `mode = os.environ.get(...) or (...)` line). Each entry
+        # below documents one candidate; none of them is the default by virtue of
+        # being listed first.
         #
-        #   'batched' (DEFAULT) — _apply_prefill_batched. Round-1 cost model of
+        #   'batched' (opt-in) — _apply_prefill_batched. Round-1 cost model of
         #     the loop it replaces: on Hy3 (192 experts, ~all hit at prefill) the
         #     per-expert loop pays, PER HIT EXPERT, one act-QDQ + TWO Triton
         #     transient expands (w13/w2, ~192×2 launches/layer) + two F.linear +
@@ -319,10 +323,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # tolerance contract by tests/test_moe_batched_prefill.py and gated by
         # the served logprob A/B before adoption. Prefill is eager/uncaptured
         # (FULL_DECODE_ONLY), so this path needs no CUDA-graph capture-safety.
-        # Default LOOP until the batched path passes its at-scale served gate:
-        # the first 1.4k-token prefill on Hy3 crashed the serve (transient
-        # chunk tiles ~1.6 GB vs the loop's ~56 MB against thin post-KV
-        # slack, 2026-07-20). Batched stays opt-in: PRISMAQUANT_CB_PREFILL=batched.
+        # Batched never became a default and is not one now: the first
+        # 1.4k-token prefill on Hy3 crashed the serve (transient chunk tiles
+        # ~1.6 GB vs the loop's ~56 MB against thin post-KV slack, 2026-07-20),
+        # so it stays opt-in (PRISMAQUANT_CB_PREFILL=batched) pending an
+        # at-scale served gate, and it is not an 'auto' candidate.
         #
         #   'stock' — _apply_prefill_stock. The CAPTURE-SAFE successor to
         #     'batched' (task 15): transiently expand each expert-CHUNK into a
@@ -338,11 +343,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec),
         #     fp4-v2 runs codec.fp4_group16_act_qdq explicitly on the module input
         #     AND the intermediate. Opt-in: PRISMAQUANT_CB_PREFILL=stock.
-        # Default: fp8-CB rides 'stock' (vLLM's own fused-MoE grouped kernel
-        # over CUDA-expanded e4m3 chunks — measured 5.5x the loop on
-        # Laguna-256E, 2026-07-23, with the slack-gate discipline bounding
-        # the ~1.6 GB chunk transient). fp4-CB keeps 'loop' until its stock
-        # variant (bf16 expand) gets the same at-scale measurement.
+        #     'stock' was the fp8-CB default from 2026-07-23 (vLLM's own
+        #     fused-MoE grouped kernel over CUDA-expanded e4m3 chunks — 5.5x the
+        #     loop on Laguna-256E, with the slack-gate discipline bounding the
+        #     ~1.6 GB chunk transient) until 'auto' superseded it on 2026-07-26;
+        #     it remains a candidate of 'auto' and the deterministic keep-path.
+        #     fp4-CB still defaults to 'loop' — its stock variant (bf16 expand)
+        #     has not had the same at-scale measurement.
         #
         #   'grouped_fused' — _apply_prefill_grouped_fused (round 1 of the MoE
         #     fused campaign, OPT-IN). Drops the stock path's HBM e4m3 expand
@@ -361,8 +368,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     launch overhead once R1 had removed the expand round-trip).
         #     'grouped_fused_r1' forces R1 — the bisection reference R2 is
         #     validated against.
-        # fp8-CB default: stock. grouped_fused won on the 35B (+9%, KL gate
-        # passed) but REGRESSED on Laguna-class (1,503 vs 1,821 tok/s @8k,
+        #     grouped_fused is NOT a fixed default (it is an 'auto' candidate):
+        # it won on the 35B (+9%, KL gate passed) but REGRESSED on
+        # Laguna-class (1,503 vs 1,821 tok/s @8k,
         # 2026-07-26): R2 re-decodes each expert's B per M-tile
         # (ceil(m_e/TileM) x) and pads to tile multiples — decode redundancy
         # scales with expert SIZE, and Laguna's experts are ~6x the 35B's.

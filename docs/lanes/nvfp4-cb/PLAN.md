@@ -1,7 +1,36 @@
-# NVFP4-CB — Master Implementation Plan (synthesis)
+# NVFP4-CB — Master Implementation Plan (synthesis) + running log
 
-**Status: DRAFT awaiting Robert's review. Nothing implemented.**
-Drafted 2026-07-15 by three Opus 4.8 planning agents (sections below), reviewed
+## Status 2026-07-30 — LANE SHIPPED
+
+The plan below was drafted 2026-07-15 and executed; the format, the encoder,
+the exporter, the allocator menu, the plugin and the CUDA/CUTLASS kernel set
+are all in production. **Current normative pages, in this order:**
+
+| Read | For |
+|---|---|
+| `STANDARDS.md` | the format + kernel + cost contract production builds against (supersedes any roadmap text below) |
+| `LAYOUT.md` | on-disk byte layout / container contract |
+| `plugins/gridbook/README.md` | what the serving plugin does today, defaults, per-arch wiring |
+| `two-tier-scale-spec.md` | fp4 layout-v2 scale coding (implemented) |
+| `prod_27b_results.md`, `prod_35b_results.md`, `prod_hy3_results.md` | the served verdicts + bug ledgers |
+
+Proven artifacts (four, three of them MoE):
+
+| Model | Rate / size | Evidence |
+|---|---|---|
+| Qwen3.6-27B (dense VLM + GDN) | 5.5 bpp, 22.98 GB — SHIPPED `rdtand/Qwen3.6-27B-prismaquant-cb-5.5bit-vllm`; also a 4.5 bpp 19.95 GB build | conf-KL 0.00296 on ship bytes; −58% ALL-KL vs matched-bpp PrismaAURA-5.5; validator PASS; TEB 87 |
+| Ornith-1.0-35B (E=256 MoE) | 4.758 bpp, 22 GB | served conf-KL 0.01706 / ALL 0.0278 — −53% conf-KL vs AURA-4.75 at matched bpp |
+| Hy3 295B-A21B (192-expert MoE) | 2.9 bpp, 105.7 GB — SHIPPED `rdtand/Hy3-295B-A21B-prismaquant-cb-2.9bit-vllm` | serves on ONE Spark; prefill ~109 tok/s vs the GGUF IQ lane's 42 (the thesis); TEB 88; no quality claims (no on-box BF16 teacher) |
+| Laguna-S-2.1 117B (256-expert MoE) | 6.0 bpp, 84 GB | serves 256k ctx at util 0.87; decode 15.2 tok/s; MoE prefill 293 → 2,186 tok/s over the kernel campaign; no quality claims |
+
+Kernel campaign state, open items and the honest negatives live in
+`STANDARDS.md` (kernel table) and the R6 entry in `plugins/gridbook/README.md`.
+
+---
+
+## Original plan (historical, 2026-07-15 — retained for the reasoning, NOT current)
+
+Drafted by three Opus 4.8 planning agents (sections below), reviewed
 and corrected by Fable (orchestrator). Read the three sections for depth:
 
 - `phase0-measurement.md` — the four gating experiments (emulation-only)

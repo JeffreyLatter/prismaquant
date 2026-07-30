@@ -23,9 +23,9 @@ some have not. Your job is to assess each in the current code:
    Files: prismaquant/coord_descent_polish.py:295, 305, 566.
 
 2. HIGH: README/overview overclaim relative to handover. Handover
-   (docs/prismascout_handover_2026-05-03.md:130) said the 0.0151 27B
+   (docs/archive/prismascout_handover_2026-05-03.md:130) said the 0.0151 27B
    result was on tiny calibration and "do not claim final model quality";
-   README.md:226 and docs/prismascout_overview.md:34 call it held-out
+   README.md:226 and docs/archive/prismascout_overview.md:34 call it held-out
    shipping-grade. Provenance needs to match.
 
 3. MEDIUM: "production-faithful" claim is close but not literally exact.

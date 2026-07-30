@@ -1,3 +1,9 @@
+> **ARCHIVED 2026-07-30.** Superseded by `docs/ARCHITECTURE.md`. The claims
+> below are historical; several are known-stale (PrismaSCOUT itself was retired
+> 2026-06-08 in favour of the AURA spine). The per-claim census is
+> `scratch/doc-consolidation-2026-07-30/census_design_docs.md` (local, not
+> committed). Body unedited.
+
 # PrismaSCOUT Overview
 
 PrismaSCOUT is the current selection layer in PrismaQuant. It uses cheap

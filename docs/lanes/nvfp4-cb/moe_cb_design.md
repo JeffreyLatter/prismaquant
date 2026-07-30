@@ -1,9 +1,12 @@
-# MoE in the CB lane — route-flip cost design + plugin gap (DESIGN ONLY)
+# MoE in the CB lane — route-flip cost design + serving (§4 SHIPPED)
 
-Target: Qwen3.6-35B-A3B (packed 3-D expert stacks, `experts.gate_up_proj` /
-`experts.down_proj` per layer). Status: encode/export/allocator are MoE-ready
-and tested (this wave); the expert COST design below is specced, not
-implemented; the serving plugin has a precisely-scoped gap (§4).
+Target at drafting: Qwen3.6-35B-A3B (packed 3-D expert stacks,
+`experts.gate_up_proj` / `experts.down_proj` per layer). Status: encode /
+export / allocator MoE-ready and tested; the expert COST design in §3 is the
+part that was specced here. **§4's plugin gap is CLOSED** — `PrismaQuantCBMoEMethod`
+(`plugins/gridbook/gridbook/moe.py`) serves CB expert stacks, and three of the
+four proven CB artifacts are MoE (35B Ornith, Hy3 295B, Laguna-S-2.1). Read §4
+for what shipped; the rest is the original design record.
 
 ## 1. What already holds (implemented + tested this wave)
 
@@ -72,24 +75,33 @@ changes rather than a new tool:
    per call, so the empirical pass inherits the tier for free; `fast` is the
    right tier for a 96-unit × menu screen (encode_tiers.md).
 
-## 4. Plugin gap (for the serving agent — precise contract)
+## 4. Serving — SHIPPED (was "plugin gap"; closed 2026-07-19)
 
-`plugins/vllm_prismaquant/` serves DENSE Linears only (`linear.py`; no
-FusedMoE method, no `experts` handling anywhere in the package). A CB MoE
-artifact exports today but cannot serve. The missing method must:
+The contract drafted here is implemented in
+`plugins/gridbook/gridbook/moe.py` (`PrismaQuantCBMoEMethod`), against each
+clause:
 
-- dispatch when a FusedMoE module's prefix matches a CB config group
-  (targets are the packed names, e.g. `model.layers.N.mlp.experts.gate_up_proj`);
-- load `cb_qweight` uint8 `(E, out, bytes)` (+ fp8 `weight_scale` `(E, out)`)
-  into its w13/w2 expert buffers, decoding per expert with the existing codec
-  (each `cb_qweight[e]` is exactly the dense §1 layout);
-- split the fused `gate_up_proj` stack into vLLM's w1/w3 halves using the
-  canonical `gate_proj/up_proj/down_proj` scheme names in config_groups (the
-  compressed-tensors packed-MoE lesson — vLLM canonical names even when
-  on-disk leaves differ);
-- keep experts uniform per layer (guaranteed at export by union-find; the
-  method may assert it) and stay CUDA-graph-safe / INV-1-clean (no resident
-  expansion beyond the transient pattern).
+- **dispatch** on a `RoutedExperts` prefix whose expert targets carry a CB
+  scheme — `config.py:366-371` via `_moe_scheme_for_prefix` (`:377-406`), which
+  canonicalises BOTH sides through `_candidate_bases` (the dense path already
+  did; that asymmetry was the 35B boot bug). Non-CB expert stacks delegate to
+  stock compressed-tensors (`config.py:372-373`);
+- **load** stacked `cb_qweight` `(E, out, bytes)` (+ fp8 `weight_scale`
+  `(E, out)`) into w13/w2 buffers registered at the SAME shapes, so loading is
+  a plain `copy_` — no per-expert split, no transpose (`moe.py` `create_weights`,
+  and `moe_toplevel_loader.py` for archs that map experts at the top level);
+- **fused gate_up split** by vLLM canonical scheme names — enforced upstream at
+  export, consumed here as w13 = `(E, 2·inter, hidden)` / w2 = `(E, hidden, inter)`;
+- **per-layer uniformity** asserted at load; **INV-1** held by transient
+  per-expert (loop) or per-expert-chunk (stock/batched) decode, and by
+  decode-in-prologue on `grouped_fused`, which materialises nothing;
+  CUDA-graph safety comes from the M-branch hoist into opaque custom ops
+  (`moe.py:277-281`).
+
+Kernel/prefill-path defaults are not restated here — see
+`plugins/gridbook/README.md` and `STANDARDS.md`. Live constraint worth
+carrying: fp4 experts require two-tier v2 scale coding; fp4-v1 stacks raise
+(`moe.py:112-117`).
 
 ## 5. Open questions
 

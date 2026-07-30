@@ -1,8 +1,8 @@
 # PrismaQuant Agent Rules
 
 These rules are mandatory for coding agents working in this repository.
-Before implementing new functionality, read this file and
-`docs/design_guidelines.md`.
+Before implementing new functionality, read this file,
+`docs/design/design_guidelines.md`, and `docs/ARCHITECTURE.md`.
 
 ## Core Principles
 
@@ -20,10 +20,20 @@ Before implementing new functionality, read this file and
    contract: per-Linear empirical selection with measured quality/cost
    tradeoffs. Avoid model-wide defaults unless they are only a fallback or
    have been validated against the per-Linear path.
-4. **Only ship performant vLLM-supported formats.** A format can appear in
-   research menus before it is production-ready, but it must not become a
-   production default until vLLM loads it, generates correctly, and uses a
-   performant kernel on representative shapes.
+4. **Only ship formats the target engine serves performantly.** A format can
+   appear in research menus before it is production-ready, but it must not
+   become a production default until the engine for its container loads it,
+   generates correctly, and uses a performant kernel on representative shapes.
+   Three containers, three gates: `compressed-tensors` on vanilla vLLM (no
+   PrismaQuant kernels); GGUF on llama.cpp and the vLLM GGUF plugin, gated
+   additionally on bit-exactness against `gguf-py`; codebook (NVFP4-CB /
+   FP8-CB) on the out-of-tree `gridbook` plugin (`plugins/gridbook`), which
+   ships its own CUDA kernels and is gated on an unforked vLLM (no core
+   patches), a wired per-arch expert loader for MoE
+   (`plugins/gridbook/gridbook/plugin.py:133-139` — a missing loader line makes
+   CB expert tensors silently not load), and served speed at least at parity
+   with the container it displaces. The non-vLLM-native lanes are sanctioned,
+   not exceptions; what is forbidden is a forked runtime.
 5. **Measure on the same calibration contract.** New levers need apples-to-
    apples KL, bpp, and runtime measurements. Compare against the relevant
    shipped or current baseline using the same calibration set, sequence
@@ -31,9 +41,10 @@ Before implementing new functionality, read this file and
 6. **Report bpp over quantizable parameters only.** Bits-per-parameter
    accounting must exclude immutable BF16 regions that the allocator is not
    allowed to quantize, including `lm_head` and any profile-pinned model
-   components. Published NVFP4/MXFP8 comparisons do not average in
-   unquantizable parameters; PrismaQuant reports should follow the same
-   convention.
+   components. Published uniform-NVFP4 and GGUF k-quant comparisons do not
+   average in unquantizable parameters; PrismaQuant reports should follow the
+   same convention. (MXFP8 is de-menued — exact-scale FP8 dominates it — so it
+   is not the comparison to reach for.)
 7. **Reuse local abstractions.** Prefer the existing format registry,
    allocator, production cache, recache, validation harness, and pipeline
    flags. If an abstraction is missing, add it at the shared layer rather
@@ -66,4 +77,4 @@ Before finishing:
 - Record measured results, commands, and log paths in docs when a claim is
   based on a run.
 - Leave experimental methods opt-in until the validation gate in
-  `docs/design_guidelines.md` is satisfied.
+  `docs/design/design_guidelines.md` is satisfied.

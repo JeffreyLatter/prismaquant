@@ -1,8 +1,11 @@
 # GGUF lane — llama.cpp / vLLM-GGUF serving
 
-*Added 2026-07-06 (branch `claude/gguf-lane-a`). Status: enabled end-to-end;
-GPTQ-into-k-quant rounder and MoE expert stacking are open work. Trust the
-code and the measured tables over this prose (prime directive applies).*
+*Added 2026-07-06 (branch `claude/gguf-lane-a`); updated 2026-07-30. Status:
+enabled end-to-end. The two items this header used to call open work — the
+GPTQ-into-k-quant rounder and MoE expert stacking — have both landed
+(`prismaquant/gguf_gptq.py`, `prismaquant/export_gguf_direct.py`); see
+"Known limitations / open work" for what is left. Trust the code and the
+measured tables over this prose (prime directive applies).*
 
 ## What it is
 
@@ -166,13 +169,25 @@ answer. No public quality claim until both land and repeat.
 
 ## Known limitations / open work
 
-- **MoE expert stacking**: the name map handles dense models; stacked
-  `ffn_*_exps` tensors (one GGUF tensor per layer/projection, one format for
-  all experts) are not yet wired into cost/export.
-- **GPTQ-into-k-quant rounder**: freeze fp16 super-scales per 256-superblock,
-  JSO-style quantized sub-scale grid inside the GPTQ loop; render-mechanism
-  registration (`_format_supports_render_mechanism`) still returns none for
-  gguf formats — they render via the registry-RTN fallback.
+- ✅ **MoE expert stacking** — SHIPPED in `prismaquant/export_gguf_direct.py`
+  (streaming direct-from-HF exporter; experts stacked into one 3-D tensor per
+  (layer, projection), one quant type per stacked tensor = experts uniform per
+  layer; allocator lookups keyed by the LIVE packed param name,
+  `export_gguf_direct.py:210-216,252-253`). Standalone CLI
+  (`export_gguf_direct.py:173,380`), not a `run-pipeline.sh` stage.
+- ✅ **GPTQ-into-k-quant rounder** — SHIPPED in `prismaquant/gguf_gptq.py`:
+  the two-tier scales (fp16 super-scale + quantized sub-scales/mins) are frozen
+  from the imatrix-weighted reference search and GPTQ re-decides only the
+  integer `q` under them, reusing the NVFP4 lane's Hessian prep and the
+  promoted fixed damp 1.0. Covers the six uniform k-quants
+  (`gguf_gptq.py:30-43`, `GPTQ_SUPPORTED`); wired at
+  `export_gguf.py:322-334` via `--gptq-act-dir`. Still true: the IQ family has
+  no GPTQ rounder (grid/codebook indices, not a uniform level), and
+  `_format_supports_render_mechanism` (`production_weight_cache.py:1349-1380`)
+  still returns false for gguf formats — the GGUF GPTQ path lives in the
+  exporter, not in `ProductionWeightCache`, so cost measurement still scores
+  the registry-RTN render. That is a rendering-confound risk if allocation
+  ever proves sensitive to it.
 - **IQ formats** (IQ2_XXS 2.06 / IQ2_XS 2.31 / IQ2_S 2.56 / IQ3_XXS 3.06 /
   IQ3_S 3.44 / IQ4_XS 4.25 / IQ4_NL 4.5 bpw): **implemented** end-to-end
   (`gguf_iq_formats.py`) — registry FormatSpecs, layer_config/serving allow-list
@@ -199,9 +214,12 @@ answer. No public quality claim until both land and repeat.
   from the chunk-truncated activation rows it bmm's with, the exporter from
   the full cached rows — same estimator, slightly different sample counts.
   Unify if allocation ever proves sensitive to it (0.6B was not).
-- **Packed-MoE expert cost path** (`_measure_packed_experts`) quantizes
-  UNWEIGHTED — must be threaded with imatrix weights when MoE expert
-  stacking lands, or expert-vs-dense bit splits will be biased.
+- ✅ **Packed-MoE expert imatrix** — SHIPPED in `prismaquant/moe_imatrix.py`:
+  `synthesize_packed_expert_col_weights` replays the routed forward from the
+  CHECKPOINT tensors (no model load) to produce the two entries the activation
+  cache structurally cannot hold (`<qn>.gate_up_proj`, `<qn>.down_proj`), from
+  ONE shared source for both the exporter and the packed-expert cost — closing
+  the rendering confound. Wired at `run-pipeline.sh:625,990,1561`.
 - **Embedding/head formats are an operator policy**, not a measured
   allocator decision — a principle-2 debt; the flags are recorded in
   provenance KVs so size-matched claims stay auditable.

@@ -11,8 +11,8 @@ exhaustive toy knapsacks, analytic Fisher/KL, compressed-tensors and the vLLM
 serving image as byte oracles). Third-party libraries were not audited; only
 our conformance to their documented semantics.
 
-Dedupe baseline: all numerical findings from docs/codebase_audit_2026-05-10.md,
-docs/audit_findings_2026-05-22.md, scratch/review-2026-06-09/REVIEW.md, and the
+Dedupe baseline: all numerical findings from docs/audits/codebase_audit_2026-05-10.md,
+docs/audits/audit_findings_2026-05-22.md, scratch/review-2026-06-09/REVIEW.md, and the
 codex 2026-06-11 closure batch were mapped to HEAD first (all closed with
 commits/tests except the residuals listed in §5). Nothing below re-reports a
 closed finding.

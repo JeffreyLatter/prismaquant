@@ -1,6 +1,22 @@
-# NVFP4-CB two-tier scale — DESIGN SPEC (layout v2 scale coding)
+# NVFP4-CB two-tier scale — layout v2 scale coding (IMPLEMENTED, SHIPPED)
 
-> **Spec only — nothing here is implemented.** Mitigation for the structural
+> **STATUS 2026-07-30: implemented and shipped; this page is the normative
+> spec of the format, not a proposal.** Encoder + tables:
+> `prismaquant/nvfp4_cb_formats.py` (`SCALE_CODING_TWO_TIER`,
+> `TWO_TIER_SUB_TABLE`, `TWO_TIER_SUPER_BIAS`, `_two_tier_tables`). Export:
+> `prismaquant/export_nvfp4_cb.py:670-676,755` (`layout_version: 2`, scheme
+> carries `scale_coding.kind = "two_tier"` + the table). Serving: composition
+> table `plugins/gridbook/gridbook/codec.py:46-56`, in-kernel compose in the
+> fp4-v2 dense/grouped GEMVs and `expand_fp4_v2_to_weight`. Shipped in the Hy3
+> 295B and Laguna-S-2.1 artifacts (`CB_SCALE_CODING=two_tier`,
+> `scripts/run_hy3_prod_nvfp4cb.sh:53`, `scripts/run_hy3_prod_joint.sh:56`,
+> `scripts/run_laguna_s21_prod.sh:49`). Per `STANDARDS.md:13,22-23` v2 is the
+> production fp4 scale coding and **v1 is legacy read-compat only** — note
+> `run-pipeline.sh:1547` still defaults `CB_SCALE_CODING=v1` per-run, so
+> production drivers set it explicitly. §6's implementation gates are
+> historical; §1–§5 remain the contract.
+>
+> **Original motivation (as drafted).** Mitigation for the structural
 > scale-packaging tax identified in `rd_ceiling_study.md` (+ its reviewer
 > correction) and priced by exp-1b: NVFP4-CB's mandatory group-16 E4M3 scale
 > costs **0.500 bpw** where IQ amortises a two-tier scale at **0.3125 bpw** —
@@ -9,7 +25,7 @@
 > ships a two-tier scale (per-256 E8M0 super + per-16 4-bit sub) whose
 > composition lands **exactly on E4M3 by construction**, so the tensor-core
 > path still consumes a bona-fide E4M3 plane. CPU-only empirical risk check:
-> `scripts/two_tier_scale_check.py` (§3). Implementation is gated on §6.
+> `scripts/two_tier_scale_check.py` (§3).
 
 ---
 

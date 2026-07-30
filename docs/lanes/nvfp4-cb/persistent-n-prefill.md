@@ -181,3 +181,18 @@ product rungs (ceil-first uneven splits, encoder-anchored), signed S-rung
 decode (CUDA + Triton, GPU battery chained), the M-branch-hoist dispatch
 ops, the mid-M fused niche (opt-in), w2 round-2 schedule (rowpack measured
 negative), and the capture-safe stock-MoE prefill (opt-in).
+
+> **OUTCOME 2026-07-26 — §4b was built and MEASURED NEGATIVE for the dense
+> lane.** `csrc/cb_persistent_tc.cu` is parity-green but **2–5.7× slower** than
+> expand+fork at 27B shapes: the CUDA expander (landed after this plan was
+> written) had already cut the dense expand tax to ~10%, so the `f` this section
+> tells you to re-check had collapsed — exactly the "record the clean negative"
+> branch of step 4. Recorded in `STANDARDS.md:55`, commit `d924d76`. The kernel
+> is **quarantined, not deleted**: `PRISMAQUANT_ENABLE_PTC=1` +
+> `PRISMAQUANT_CB_PREFILL_DENSE=persistent` (`linear.py:450-476`,
+> `cuda_ext.py:165`), kept as the schedule reference. Item 3's dispatch note is
+> also stale — mid-M fused is ON by default (`linear.py:439`).
+>
+> The **MoE** persistent/grouped decode-in-mainloop target is untouched by this
+> negative and remains the fat one (`STANDARDS.md:56`: expand ≈ 35% of a Laguna
+> MoE layer). Do not re-derive the dense case from this page's `f`.

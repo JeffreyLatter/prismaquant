@@ -89,7 +89,7 @@ _E4M3 = torch.float8_e4m3fn
 _E4M3_MIN_POS = 2.0 ** -9
 
 # --- Two-tier scale coding (layout v2, fp4 family only) -----------------
-# docs/nvfp4-cb-plan/two-tier-scale-spec.md: per-256 E8M0 super (2^(E-127))
+# docs/lanes/nvfp4-cb/two-tier-scale-spec.md: per-256 E8M0 super (2^(E-127))
 # x per-16 4-bit sub code into a fixed table of e4m3-exact multipliers;
 # the composition lands exactly on E4M3 by construction (legality mask, no
 # rounding anywhere). Scale plane 16 B -> 9 B per superblock (0.28125 bpw).
@@ -105,7 +105,7 @@ TWO_TIER_SUB_TABLE = (1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875,
 _TWO_TIER_WINDOW_PAD = 1
 _TWO_TIER_MAX_WINDOW = 14
 
-# --- Tiered encoder (docs/nvfp4-cb-plan/encode_tiers.md) -----------------
+# --- Tiered encoder (docs/lanes/nvfp4-cb/encode_tiers.md) -----------------
 # PRISMAQUANT_CB_ENCODE_TIER in {fast, balanced, max}:
 #   max      — the original exhaustive sweep, bit-identical
 #              (regression-pinned);
@@ -1337,7 +1337,7 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
 
     ``encode_tier``: fast / balanced / max speed-accuracy tier (None reads
     ``PRISMAQUANT_CB_ENCODE_TIER``, default balanced). max reproduces the
-    original sweep bit-identically; see docs/nvfp4-cb-plan/encode_tiers.md.
+    original sweep bit-identically; see docs/lanes/nvfp4-cb/encode_tiers.md.
 
     ``scale_coding``: ``"v1"`` (default; bare e4m3 plane) or ``"two_tier"``
     (layout v2, fp4 only: per-superblock E8M0 super + 4-bit sub codes; the
@@ -1490,7 +1490,7 @@ def predict_cb_ladder_costs(w: torch.Tensor, ks: tuple[int, ...], *,
                                       "rel_error"} | None}
 
     The caller trusts the interpolation only where the holdout relative
-    error clears its noise floor (docs/nvfp4-cb-plan/encode_tiers.md §B),
+    error clears its noise floor (docs/lanes/nvfp4-cb/encode_tiers.md §B),
     falling back to full per-rung measurement elsewhere.
     """
     measured: dict[int, float] = {}
@@ -1517,7 +1517,7 @@ def predict_cb_ladder_costs(w: torch.Tensor, ks: tuple[int, ...], *,
 
 # ---------------------------------------------------------------------------
 # Milestone B — byte packers (export path). Bit-exact on-disk layout:
-# docs/nvfp4-cb-plan/format-pipeline.md §1 / docs/nvfp4-cb-plan/LAYOUT.md.
+# docs/lanes/nvfp4-cb/format-pipeline.md §1 / docs/lanes/nvfp4-cb/LAYOUT.md.
 #
 # Per 256-weight superblock along the input dim:
 #   * 4k index bytes — 32 k-bit codewords (one per 8-dim vector), LSB-first;

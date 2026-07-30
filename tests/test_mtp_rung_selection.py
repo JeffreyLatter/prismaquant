@@ -1,6 +1,6 @@
 """Unit tests for prismaquant.mtp_rung_selection (CPU, no torch).
 
-Validates the canon selector (docs/mtp_rung_selection.md) against hand-derived
+Validates the canon selector (docs/design/mtp_rung_selection.md) against hand-derived
 synthetic constants: the degenerate branch picks the highest-fidelity rung under
 the memory gate; the memory gate excludes rungs; the interior argmax matches an
 independent brute force; the acceptance fit degrades correctly with 0/1/2+

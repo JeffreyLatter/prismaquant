@@ -764,7 +764,7 @@ class TestRoundTrip(unittest.TestCase):
             # Served via the custom NVFP4-CB vLLM plugin container, not
             # compressed-tensors (its scheme vocabulary cannot express
             # codebooks); rendered==served is pinned in
-            # tests/test_nvfp4_cb_formats.py (docs/nvfp4-cb-plan).
+            # tests/test_nvfp4_cb_formats.py (docs/lanes/nvfp4-cb).
             s.name for s in fr.REGISTRY.values()
             if s.family in ("nvfp4_cb", "fp8_cb")
         }

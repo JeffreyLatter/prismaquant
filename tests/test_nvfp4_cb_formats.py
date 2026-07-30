@@ -679,7 +679,7 @@ def test_export_native_compressed_hard_fails_on_cb():
 
 
 # ===========================================================================
-# Layout v2 — two-tier scale coding (docs/nvfp4-cb-plan/two-tier-scale-spec.md).
+# Layout v2 — two-tier scale coding (docs/lanes/nvfp4-cb/two-tier-scale-spec.md).
 # ===========================================================================
 
 def _real_magnitude_w(rows=64, in_f=512, seed=0):
@@ -955,7 +955,7 @@ def test_two_tier_exporter_writes_layout_version(export_dir):
 
 
 # ===========================================================================
-# Tiered encoder (docs/nvfp4-cb-plan/encode_tiers.md).
+# Tiered encoder (docs/lanes/nvfp4-cb/encode_tiers.md).
 # ===========================================================================
 
 def test_encode_tier_resolution_env(monkeypatch):

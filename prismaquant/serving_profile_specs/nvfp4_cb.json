@@ -2,7 +2,7 @@
   "schema": "prismaquant.serving_profile.v1",
   "id": "nvfp4_cb",
   "runtime": "vllm_prismaquant_plugin",
-  "description": "NVFP4-CB / FP8-CB codebook container lane: a custom out-of-tree vLLM plugin (vllm_prismaquant_plugin, plugins/vllm_prismaquant/) decodes the codebook schemes into NVFP4/FP8 buffers and delegates plain NVFP4/FP8/BF16 layers to stock compressed-tensors. Deliberately a MIXED container (PLAN.md decision #1, 'FP8 in every recipe'): CB rungs coexist with plain NVFP4, FP8_DYNAMIC and BF16 in one artifact. The scheme vocabulary is prismaquant-custom (NOT stock compressed-tensors, whose schemes cannot express codebooks); ships via prismaquant.export_nvfp4_cb, docs/nvfp4-cb-plan/LAYOUT.md is the byte contract.",
+  "description": "NVFP4-CB / FP8-CB codebook container lane: a custom out-of-tree vLLM plugin (vllm_prismaquant_plugin, plugins/vllm_prismaquant/) decodes the codebook schemes into NVFP4/FP8 buffers and delegates plain NVFP4/FP8/BF16 layers to stock compressed-tensors. Deliberately a MIXED container (PLAN.md decision #1, 'FP8 in every recipe'): CB rungs coexist with plain NVFP4, FP8_DYNAMIC and BF16 in one artifact. The scheme vocabulary is prismaquant-custom (NOT stock compressed-tensors, whose schemes cannot express codebooks); ships via prismaquant.export_nvfp4_cb, docs/lanes/nvfp4-cb/LAYOUT.md is the byte contract.",
   "format_rules": [
     {
       "id": "nvfp4_cb_container_formats",

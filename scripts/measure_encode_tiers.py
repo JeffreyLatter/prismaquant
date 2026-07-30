@@ -1,6 +1,6 @@
 """Measure the CB encoder tiers: speed / weighted-recon / whole-model emu-KL.
 
-Produces docs/nvfp4-cb-plan/encode_tiers.md (+ a JSON next to the other
+Produces docs/lanes/nvfp4-cb/encode_tiers.md (+ a JSON next to the other
 phase-0 outputs). GPU is shared during the efficiency wave — every timing is
 min-of-2 CUDA-synced reps (coarse is fine per dispatch; re-run anomalies).
 
@@ -26,7 +26,7 @@ WIKI = Path("/home/rob/dq-runs/gguf-smoke/wiki.test.raw")
 IMATRIX = Path(
     "/home/rob/dq-runs/nvfp4-cb-phase0/serve/col_weights_seed0.pkl")
 OUT_DIR = Path("/home/rob/dq-runs/nvfp4-cb-phase0/encode_tiers")
-DOC = Path(__file__).resolve().parents[1] / "docs/nvfp4-cb-plan/encode_tiers.md"
+DOC = Path(__file__).resolve().parents[1] / "docs/lanes/nvfp4-cb/encode_tiers.md"
 
 TIERS = ("max", "balanced", "fast")
 # (label, grid, k, scale_coding); mode=product throughout (the shipping lane).

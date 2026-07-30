@@ -866,7 +866,7 @@ register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
 
 
 # NVFP4-CB / FP8-CB vector-quantization codebook family (custom out-of-tree
-# vLLM plugin lane; NOT stock compressed-tensors — see docs/nvfp4-cb-plan).
+# vLLM plugin lane; NOT stock compressed-tensors — see docs/lanes/nvfp4-cb).
 # The k-bit VQ index stream lives in scale_bits (fp4 family, weight_bits=0,
 # group_size=256 so effective_bits = k/8 + 0.5 exactly) or in weight_bits as
 # k/8 bits/param (fp8 family, per-output-channel fp32 scale, group_size=0 so

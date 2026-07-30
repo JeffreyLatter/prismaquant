@@ -255,7 +255,7 @@ cleanly encodable — so the *usable* fine ladder may be short.
   selection (`--target-disk-gb`, l.1049) for exact matched-bytes.
 - Per-(Linear,format) cost from `measure_quant_cost` batched path
   (emulated NVFP4-CB qdq registered as `FormatSpec`s — see below), M6 objective
-  (`h_trace × weight_mse`) which won the GGUF lane (docs/gguf_lane.md:66).
+  (`h_trace × weight_mse`) which won the GGUF lane (docs/lanes/gguf.md:66).
 - Gold check: `emu_forward_kl.py` on the two chosen assignments.
 
 **Write (new).**
@@ -297,7 +297,7 @@ codebook/scale search?
 
 **Dual purpose.** This is *also* the upgrade A/B for the existing GGUF lane,
 where our imatrix-RTN arm currently **loses llama.cpp's imatrix arm by ~16% KL
-at 0.6B** (docs/gguf_lane.md:97; memory: gguf-lowbit-serving-lane). Fisher
+at 0.6B** (docs/lanes/gguf.md:97; memory: gguf-lowbit-serving-lane). Fisher
 weighting is a lever llama.cpp cannot match — a credible way to reclaim and
 pass that gap on our own harness.
 

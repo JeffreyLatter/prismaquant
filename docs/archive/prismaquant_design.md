@@ -1,3 +1,8 @@
+> **ARCHIVED 2026-07-30.** Superseded by `docs/ARCHITECTURE.md`. The claims
+> below are historical; several are known-stale. The per-claim census is
+> `scratch/doc-consolidation-2026-07-30/census_design_docs.md` (local, not
+> committed). Body unedited.
+
 # PrismaQuant Design Document
 
 > *Mixed-precision LLM quantization, selected on real end-to-end KL.*

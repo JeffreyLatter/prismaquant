@@ -24,7 +24,11 @@ selects it. Two grids, three index-encoding modes:
 | `NVFP4_CB_S{k}` | fp4 / E2M1 | positive half-grid + explicit signs | W4A4 | group-16 E4M3, **in the weight bytes** | `k/8 + 0.5` |
 | `FP8_CB_K{k}`   | fp8 / E4M3 | E4M3 grid (‖·‖ ≤ 448) | W8A8 | **none in weight bytes** — per-output-channel fp32, separate tensor | `k/8` |
 
-`k` rungs: `NVFP4_CB_K12..K24`, `NVFP4_CB_S13..S16`, `FP8_CB_K36/40/44/48`.
+`k` rungs (**all-integer ladders**, `prismaquant/format_registry.py:943,947`,
+`prismaquant/layer_config.py:34-39`): `NVFP4_CB_K12..K24`,
+`NVFP4_CB_S13..S16` (research-only, menu-excluded — `STANDARDS.md:24-33`),
+`FP8_CB_K28..K48`. The old step-4 `FP8_CB_K36/40/44/48` enumeration is stale;
+a stale copy of it crashed the first full-ladder 27B export on `cb_k=47`.
 A decoded fp4 tile is bit-compatible NVFP4 (E2M1 codes + NVFP4 group-16 E4M3
 scale) and feeds the existing CUTLASS FP4 path unchanged.
 
@@ -119,7 +123,7 @@ MMA unchanged. Reconstruction:
 `weight[i] = codeword_value[i] × e4m3_scale[group(i)]`.
 
 **Scale coding v2 (two-tier, 9 B — `layout_version: 2`,
-`docs/nvfp4-cb-plan/two-tier-scale-spec.md`):** immediately after the 4k index
+`docs/lanes/nvfp4-cb/two-tier-scale-spec.md`):** immediately after the 4k index
 bytes:
 
 ```
@@ -206,10 +210,11 @@ laid out exactly as the 2-D case; expert `e` = `cb_qweight[e]`), and the fp8
 `<q>.weight_scale` is fp32 `(E, out)`. Encoding uses per-expert `col_weights`
 `(E, 1, in)` when provided (a single `(in,)` vector is broadcast to all
 experts); all experts of a stack share one format + one codebook (the
-allocator's serving-unit promotion guarantees it). **Plugin gap:** the serving
-plugin has no CB MoE method yet (`plugins/vllm_prismaquant/` serves dense
-Linears only) — see `moe_cb_design.md` §plugin-gap for the precise contract a
-`FusedMoE`-analog method must implement before a CB MoE artifact can serve.
+allocator's serving-unit promotion guarantees it). **Served** by
+`PrismaQuantCBMoEMethod` (`plugins/gridbook/gridbook/moe.py`), which registers
+w13/w2 buffers at these exact shapes so loading is a plain `copy_`; archs that
+map experts at the top level additionally need a loader line in
+`plugins/gridbook/gridbook/plugin.py` (see `moe_cb_design.md` §4).
 
 **Codebooks — shipped once per `(ref, format)`, never per tensor:**
 

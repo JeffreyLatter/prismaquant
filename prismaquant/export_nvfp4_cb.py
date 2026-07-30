@@ -3,7 +3,7 @@
 Sibling of :mod:`prismaquant.export_gguf` — the same skeleton-requantize
 strategy, but the container is safetensors + a custom compressed-tensors-**style**
 ``quant_config.json`` whose scheme vocabulary (``nvfp4_cb`` / ``fp8_cb``) only
-the out-of-tree vLLM plugin understands (docs/nvfp4-cb-plan/serving-kernel.md
+the out-of-tree vLLM plugin understands (docs/lanes/nvfp4-cb/serving-kernel.md
 §2). It is explicitly **not** stock compressed-tensors (whose schemes cannot
 express codebooks) — do not route a CB assignment through
 :mod:`prismaquant.export_native_compressed`; that exporter hard-fails on CB.
@@ -23,7 +23,7 @@ tensor verbatim (bf16 passthrough), and emit:
   * ``config.json`` (verbatim + a ``quantization_config`` pointer) and
     ``quant_config.json`` (the custom scheme + provenance).
 
-Bit-layout + tensor-naming + config-schema contract: docs/nvfp4-cb-plan/LAYOUT.md.
+Bit-layout + tensor-naming + config-schema contract: docs/lanes/nvfp4-cb/LAYOUT.md.
 """
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 """Correctness gate for the FP8_CB TRANSIENT-EXPANSION prefill path
-(docs/nvfp4-cb-plan/serving-kernel.md §1a, prototype ii+).
+(docs/lanes/nvfp4-cb/serving-kernel.md §1a, prototype ii+).
 
 Two parts, split by the ``-k`` selector so each runs where it can:
 

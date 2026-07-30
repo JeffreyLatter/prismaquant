@@ -1,6 +1,6 @@
 # NVFP4-CB / FP8-CB — served prototype (ii+): transient-expansion prefill + 4B scale
 
-> **Prototype (ii+) of `docs/nvfp4-cb-plan/serving-kernel.md`.** Builds on the
+> **Prototype (ii+) of `docs/lanes/nvfp4-cb/serving-kernel.md`.** Builds on the
 > prototype-(i) correctness serve (`serve_prototype_0p6b.md`): adds a **tuned
 > decode kernel** and a **transient-expansion prefill path** that reaches vLLM's
 > **stock native fp8 W8A8 GEMM**, and takes the whole thing to **Qwen3-4B** — the

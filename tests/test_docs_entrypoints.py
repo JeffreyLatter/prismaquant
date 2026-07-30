@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def test_deleted_prismascout_l3_entrypoint_is_not_live_documented():
     live_paths = [
-        ROOT / "docs" / "propagated_cost.md",
+        ROOT / "docs" / "archive" / "propagated_cost.md",
         ROOT / "examples" / "launchers" / "run-perturbed-x-smoke.sh",
         ROOT
         / "examples"

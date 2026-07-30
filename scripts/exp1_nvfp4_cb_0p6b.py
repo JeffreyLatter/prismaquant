@@ -4,7 +4,7 @@
 Fixed-lattice vs learned-per-tensor codebook vs IQ references, plus a
 product-vs-full penalty probe, a SmoothQuant sub-arm, and baseline anchors, all
 scored on the whole-model emulated forward KL-vs-BF16 gold metric
-(docs/nvfp4-cb-plan/phase0-measurement.md). Exp-2 (index entropy) piggybacks on
+(docs/lanes/nvfp4-cb/phase0-measurement.md). Exp-2 (index entropy) piggybacks on
 the exp-1 encodings.
 
 This is the EMULATION gate, not the served metric. A kernel phase must
@@ -459,7 +459,7 @@ def sidecar_curve(k):
 
 
 def write_report(arms, agg, entropy, targets, n_dim, n_head):
-    doc = Path("/home/rob/prismaquant/docs/nvfp4-cb-plan/exp1_0p6b_results.md")
+    doc = Path("/home/rob/prismaquant/docs/lanes/nvfp4-cb/exp1_0p6b_results.md")
     L = []
     L.append("# NVFP4-CB Phase-0 Experiment 1 (+2) — Qwen3-0.6B results\n")
     L.append("> **This is the EMULATION gate, not the served metric.** "
@@ -1091,7 +1091,7 @@ def write_report_1b(targets):
             t1 = _ms(r["top1_agreement"] for r in recs)
             agg[a.id] = {"klc": klc, "kla": kla, "t1": t1, "n": len(recs),
                          "nsw": recs[0]["n_targets_swapped"]}
-    doc = Path("/home/rob/prismaquant/docs/nvfp4-cb-plan/exp1b_0p6b_corrected.md")
+    doc = Path("/home/rob/prismaquant/docs/lanes/nvfp4-cb/exp1b_0p6b_corrected.md")
     L = []
     L.append("# NVFP4-CB Phase-0 exp-1b — CORRECTED CB-vs-IQ + native-FP4 "
              "premium (Qwen3-0.6B)\n")
@@ -1516,7 +1516,7 @@ def write_report_1c(targets):
     agg = {a.id: _agg_1c(a.id, a.seeds, RESULTS1C) for a in arms}
     # IQ2_S reused from exp-1b (paired seeds/imatrix, identical harness).
     iq2s = _agg_1c("IQ2S", SEEDS, RESULTS1B)
-    doc = Path("/home/rob/prismaquant/docs/nvfp4-cb-plan/exp1c_v2_premium.md")
+    doc = Path("/home/rob/prismaquant/docs/lanes/nvfp4-cb/exp1c_v2_premium.md")
     L = []
     L.append("# NVFP4-CB exp-1c — v2 premium-flip re-measurement "
              "(Qwen3-0.6B)\n")

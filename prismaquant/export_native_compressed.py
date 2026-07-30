@@ -4150,9 +4150,15 @@ def _quantize_2d(
                 # Env-gated per-Linear damping sweep (#46). When set,
                 # try multiple λ values for the Hessian regularizer and
                 # pick the one with smallest output-space error. ~5×
-                # GPTQ wallclock; ~0.02–0.05 PPL gain on Llama-class.
-                # Default ON (validated on Qwen3-0.6B audit: −0.19 PPL
-                # vs single-damp). PRISMAQUANT_GPTQ_DAMP_SWEEP=0 disables.
+                # GPTQ wallclock.
+                # Default OFF since 2026-06-12 (see
+                # gptq_damp_sweep_enabled(), :1845-1857): its evaluator
+                # is in-sample, so its "winners" invert on held-out
+                # basins (31/31) and it lost the V1 served A/B to a
+                # fixed damp. Production uses the fixed damp from
+                # _resolve_gptq_fixed_damp() (1.0, :1860).
+                # PRISMAQUANT_GPTQ_DAMP_SWEEP=1 reproduces historical
+                # sweep-rendered artifacts.
                 if gptq_damp_sweep_enabled():
                     w_work = _gptq_obs_rounding_nvfp4_swept(
                         w_work, acts_work, group_size=16,

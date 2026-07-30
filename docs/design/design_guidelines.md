@@ -135,7 +135,7 @@ neutral standalone initializer can still be accepted when the composed package
 improves the active score.
 
 Mechanism ordering is declared by operation type, not by ad hoc flag order.
-See `docs/progressive_render_pipeline.md` for the current order and extension
+See `docs/design/progressive_render_pipeline.md` for the current order and extension
 contract. Global basis transforms are full-recipe arms, not local progressive
 steps.
 

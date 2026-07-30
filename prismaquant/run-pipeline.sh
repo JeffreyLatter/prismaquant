@@ -68,11 +68,11 @@ set -euo pipefail
 # Hessian is rank-starved at 256 rows on wide layers (rank 2.6% of a
 # 9728-dim H) and degenerates toward RTN — measured on Qwen3-4B, 1024
 # rows closed the render gap vs llama.cpp's imatrix quantizer from +20%
-# to +7.7% KLD (top-1 at parity). See docs/gguf_lane.md.
+# to +7.7% KLD (top-1 at parity). See docs/lanes/gguf.md.
 # The nvfp4_cb lane inherits the same default: the weighted VQ codeword
 # search wants a higher-rank imatrix than 256 rows (format-pipeline.md §6);
 # 1024 is the analogy-to-GGUF starting point pending a CB-specific
-# measurement (docs/nvfp4-cb-plan/format-pipeline.md open-Q 6).
+# measurement (docs/lanes/nvfp4-cb/format-pipeline.md open-Q 6).
 if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" \
    || "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
   : "${ACTIVATION_ROWS_LIMIT:=1024}"
@@ -90,7 +90,7 @@ fi
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_packed_moe}"
 
-# GGUF lane consistency gates (see docs/gguf_lane.md). The imatrix lockstep
+# GGUF lane consistency gates (see docs/lanes/gguf.md). The imatrix lockstep
 # contract (measured cost == shipped bytes) only holds under COST_MODE=local
 # today: production-render-score renders gguf formats via the unweighted
 # registry qdq, and the production cache is never read by export_gguf.
@@ -109,7 +109,7 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   fi
 fi
 
-# NVFP4-CB / FP8-CB codebook lane consistency gates (docs/nvfp4-cb-plan/
+# NVFP4-CB / FP8-CB codebook lane consistency gates (docs/lanes/nvfp4-cb/
 # format-pipeline.md §6, LAYOUT.md). Same rendering-confound contract as the
 # GGUF lane: the CB exporter (export_nvfp4_cb) ships imatrix-weighted VQ bytes
 # and requantizes the bf16 skeleton, so the allocator cost MUST be the
@@ -1495,7 +1495,7 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   # Load + greedy-generate smoke on the actual serving runtime (the
   # validate_native_export analog for this lane). A PPL/p99-NLL ship gate
   # (validate_quantized_model analog) is still open work — see
-  # docs/gguf_lane.md; this gate only proves the artifact loads and
+  # docs/lanes/gguf.md; this gate only proves the artifact loads and
   # produces tokens.
   LLAMA_COMPLETION="$LLAMA_CPP_DIR/build/bin/llama-completion"
   if [[ -x "$LLAMA_COMPLETION" ]]; then
@@ -1649,7 +1649,7 @@ PY
   # There is also NO in-lane serving smoke: CB artifacts serve ONLY via the
   # out-of-tree gridbook_plugin (plugins/gridbook/), so the
   # load+generate / served-KL gate runs in the plugin's serving env, not here
-  # (docs/nvfp4-cb-plan/serve_prototype_0p6b.md). No rung is production-eligible
+  # (docs/lanes/nvfp4-cb/serve_prototype_0p6b.md). No rung is production-eligible
   # until it clears the served gold-metric KL/PPL gate AND the prefill perf
   # gate (INV-2, no Triton masquerade).
   echo

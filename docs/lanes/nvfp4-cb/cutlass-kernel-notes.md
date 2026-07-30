@@ -12,8 +12,13 @@
 > (bit-safe, unlike `cutlass_scaled_mm`) is also dead: 0.74–0.79× — the
 > M=1400 GEMM is already partially memory-bound on GB10's ~273 GB/s, no spare
 > bandwidth to hide the expander. **The fused kernel's honest niche is
-> M∈(16,128]: 1.04×/1.26×/1.45× at M=32/64/128** (dispatch intentionally not
-> wired; spec in prismaquant-handover). Large-M parity (the remaining 0.33 s
+> M∈(16,128]: 1.04×/1.26×/1.45× at M=32/64/128.** *(Correction 2026-07-30: the
+> "dispatch intentionally not wired" note is stale — mid-M dispatch is WIRED
+> and ON BY DEFAULT since the 2026-07-26 promotion:
+> `plugins/gridbook/gridbook/linear.py:437-448`, gated only by
+> `PRISMAQUANT_CB_FUSED_MIDM` defaulting to `"1"` at `:439`, over rungs
+> k ∈ {28,32,36,40,44,48}. Promotion evidence in `STANDARDS.md:54` — 1.40×
+> in-niche, conf-KL-vs-teacher gate preserved.)* Large-M parity (the remaining 0.33 s
 > TTFT) requires a **weight-stationary / persistent-N schedule** — decode each
 > B tile once, loop M inside the CTA — a kernel-layer restructure beyond the
 > collective fork. Until then the serial transient (1.075 s TTFT) is default.

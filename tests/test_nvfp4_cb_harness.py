@@ -26,7 +26,7 @@ from prismaquant.index_entropy import index_entropy
 # Footprint — reproduces the docs §1.2 bpw table exactly (fixed lattice)
 # ---------------------------------------------------------------------------
 
-# From docs/nvfp4-cb-plan/format-pipeline.md §1.2: (k, bpw, type_size B/256).
+# From docs/lanes/nvfp4-cb/format-pipeline.md §1.2: (k, bpw, type_size B/256).
 _SEC_1_2 = [
     (12, 2.000, 64), (13, 2.125, 68), (14, 2.250, 72), (15, 2.375, 76),
     (16, 2.500, 80), (17, 2.625, 84), (18, 2.750, 88), (19, 2.875, 92),

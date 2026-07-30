@@ -16,7 +16,7 @@ def test_runtime_flags_doc_covers_live_prismaquant_flags():
     for path in (ROOT / "prismaquant").rglob("*.py"):
         flags.update(pattern.findall(path.read_text(encoding="utf-8")))
 
-    doc = _read("docs/runtime_flags.md")
+    doc = _read("docs/design/runtime_flags.md")
     missing = sorted(flag for flag in flags if flag not in doc)
     assert not missing
     assert "| `PRODUCTION_RENDER_COST_SCORE_FIELD` | `weight_mse` |" in doc
@@ -26,7 +26,12 @@ def test_runtime_flags_doc_covers_live_prismaquant_flags():
 
 def test_package_readme_entrypoints_resolve_to_live_modules():
     text = _read("prismaquant/README.md")
-    modules = re.findall(r"`python -m (prismaquant\.[A-Za-z0-9_]+)`", text)
+    start = text.index("## CLI entrypoints")
+    end = text.index("## Archive")
+    modules = [
+        f"prismaquant.{name}"
+        for name in re.findall(r"`([a-z][a-z0-9_]+)`", text[start:end])
+    ]
     assert modules
     assert "prismaquant.polish_from_assignment" not in modules
     missing = [module for module in modules if importlib.util.find_spec(module) is None]
@@ -47,8 +52,8 @@ def test_root_readme_architecture_status_matches_in_tree_profiles():
 def test_audit_notes_are_not_root_level_and_scratch_is_local_only():
     assert not (ROOT / "audit_findings.md").exists()
     assert not (ROOT / "audit_questions.md").exists()
-    assert (ROOT / "docs/audit_findings_2026-05-22.md").exists()
-    assert (ROOT / "docs/audit_questions_2026-05-22.md").exists()
+    assert (ROOT / "docs/audits/audit_findings_2026-05-22.md").exists()
+    assert (ROOT / "docs/audits/audit_questions_2026-05-22.md").exists()
     assert not (ROOT / "scratch/smoke_graph_memory.py").exists()
     assert (ROOT / "tools/smoke_graph_memory.py").exists()
 
