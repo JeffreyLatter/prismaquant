@@ -1,5 +1,118 @@
 # Changelog
 
+## 0.4.0 — 2026-07-30
+
+Closes #29 and lands the KV-cotangent path, which removes the default-off guard
+that was blocking KV-sharing architectures. Minor rather than patch because the
+Fisher measurement for KV-sharing models changes (it was wrong), and because an
+export that previously succeeded by silently demoting FP8_SOURCE now behaves
+differently. Shipped allocations are unchanged (35B: 0 of 500).
+
+### Fisher: the KV-cotangent path (part of #9, closes MINOR-M33)
+
+Gemma4-style architectures share K/V across layers: a "storing" layer computes
+K/V and later "sharing" layers consume them. Phase-3 forwards each layer in
+isolation and handed the consumer a **detached** K/V, so its backward stopped
+at that boundary and the storing layer's `k_proj`/`v_proj` Fisher never saw any
+consumer's contribution — an under-count on precisely the layers that feed other
+layers. That is why `num_kv_shared_layers > 0` was blocked behind
+`PRISMAQUANT_ALLOW_KV_SHARED_FISHER`.
+
+Consumers are now handed grad-enabled leaf clones; their `.grad` is the cotangent
+each contributes, accumulated per storing layer and used to seed that layer's
+backward alongside its own output cotangent. Phase-3 sweeps in reverse and
+`kv_shared_layer_index` is derived from layers strictly below the sharing point,
+so every consumer is harvested before its producer is forwarded — one pass, no
+disk state. Both facts are pinned against the installed modeling source.
+
+**Verified by exact equivalence, not plausibility:** on an fp64 synthetic model,
+`h_trace` through the isolated protocol is bit-identical to a single end-to-end
+autograd backward (relative error 0.00e+00), while the pre-fix protocol
+under-counts `k_proj` by 85.1% and `v_proj` by 38.5%.
+
+Three things the equivalence surfaced that the design did not predict:
+
+- **The under-count was never confined to k/v_proj.** Phase-3 chains each layer's
+  input gradient downward, so the producer's truncated input gradient was
+  inherited by every layer *below* it — all of `layers.0.*` moves without the fix.
+- **The Fisher hook must fire exactly once.** These hooks pop their saved forward
+  input, so a backward hook firing once per root would silently drop half the
+  Fisher; both roots go through one `torch.autograd.backward` so autograd
+  accumulates at the shared node first. Pinned by counting hook invocations.
+- **A borrowed leaf must never be seeded as a root.** In reverse order a consumer
+  is handed a container keyed identically to the entry the previous consumer just
+  filled; seeding it would inject one consumer's cotangent into another's harvest.
+
+The guard is inverted rather than deleted: it now fires only when the cotangent
+path is unavailable (`PRISMAQUANT_KV_COTANGENT=0`), and
+`PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1` still reproduces a pre-fix probe. Models
+without KV sharing are bit-for-bit unaffected with the accumulator on or off.
+
+**Honest limit:** no real `num_kv_shared_layers > 0` checkpoint has been probed.
+The percentages above are a correctness demonstration on a toy; the real-model
+magnitude is unmeasured. Three conditions would still make such a probe unsafe
+and are documented in code: non-differentiable shared state (no cotangent
+exists), cotangent left unclaimed at sweep end, and an architecture whose
+consumer sits below its producer — the last two surface as diagnostics rather
+than wrong-but-silent numbers.
+
+### Export: passthrough source integrity (#29)
+
+The runtime coercion never passed `source_kind`, so passthrough-integrity judged
+**every** `FP8_SOURCE` Linear illegal and rewrote it to BF16. The bytes were fine
+(the config overlay restored it, materialization copied verbatim) but every
+FP8-source artifact's `runtime_coercions` was full of demotions that never
+happened — making a real coercion invisible — and it forced a passthrough
+exemption in 0.3.1's serving-group escalation.
+
+The source dtype now comes from `_scan_source_dtype_manifest`, the same
+recipe-keyed map `allocator.main` feeds `build_candidates` to gate passthrough
+candidates, so the exporter judges legality against exactly the vocabulary the
+gate that admitted the allocation used. It is scanned lazily, so a BF16-source
+export does no extra header IO. Bogus rows went from 4-of-4 to 0 on a synthetic
+fp8 checkpoint, and the exemption is gone, so a genuine passthrough mismatch
+inside a serving unit now escalates like any other illegality.
+
+No bespoke raise was added, on a measurement: a genuinely non-fp8 `FP8_SOURCE`
+assignment is repaired by the coercion rather than the overlay, so it already
+ships as BF16 today and a hard raise would be the only change turning a
+succeeding export into a failure. The 0.3.1 policy decides instead — refuse
+inside a serving unit (naming the legal rungs and the byte cost), coerce alone
+when dense, now with a true `delta_bytes` and a passthrough-specific banner.
+
+One required side-fix: with `FP8_SOURCE` surviving the guard it reached
+`_production_cache_expected_keys` for the first time, and since its emit branch
+returns before the packer, that check would have demanded a render entry nothing
+reads — newly failing a valid FP8-source export. All passthrough formats are now
+skipped there, not just BF16.
+
+### Streaming: text-only skeletons for vision-language wrapper configs
+
+`CALIBRATION_MODALITY=text-only` decided *what to calibrate on*, but it also
+silently decided *how the skeleton is built*: the multimodal path instantiates
+via the declared architecture specifically to bypass `AutoModelForCausalLM`'s
+text-only downgrade, while the text-only path passed the top-level config
+straight to `AutoModelForCausalLM` — which fails on any model whose wrapper
+config is not in that mapping (reported on MiniMax-M3 in #12, where the error's
+own accepted-class list contains only the model's *text* config).
+
+The text-only path now falls back to the text sub-config **class** rebuilt from
+the staged top-level keys. That distinction matters: `stage_text_only` pops the
+nested `text_config` and lifts its keys up, so the sub-config object still
+hanging off the wrapper is default-constructed and reading dimensions from it
+would silently build a wrong-sized skeleton. Detection asks the same two
+questions `from_config` asks itself (remote-code `auto_map`, then membership in
+the mapping the call consults), so it is config-only and contains no model-type
+or class name; a config the auto class can resolve returns the identical object
+and takes the original path unchanged.
+
+**This makes no architecture supported.** MiniMax-M3 still needs a
+model-structure profile and a serving profile, and the mechanism was validated
+against two unrelated real wrapper families since no M3 checkpoint exists here.
+The next wall for any VL checkpoint is tensor-name matching (a text skeleton
+expects `model.layers.*` where a VL checkpoint often ships
+`model.language_model.layers.*`), which is per-architecture profile work.
+
 ## 0.3.1 — 2026-07-30
 
 Closes #28: a serving-atomic group could end up with a quantized + BF16 mix

@@ -74,10 +74,12 @@ from .layer_streaming import (
 from .sensitivity_probe import (
     FisherAccumulator,
     RouterTracker,
+    SharedStateCotangents,
     discover_moe_structure,
     finalize_fisher_stats,
     h_detail_blob,
     install_packed_expert_hooks,
+    kv_cotangent_path_enabled,
     load_calibration,
     per_token_ce,
     read_top_k,
@@ -968,12 +970,13 @@ def load_num_hidden_layers(model_path: str) -> int:
 def config_num_kv_shared_layers(model_path: str) -> int:
     """``num_kv_shared_layers`` from the config (text_config or top-level).
 
-    Returns 0 when absent. Used by the MINOR-M33 guard: KV-sharing models
-    (num_kv_shared_layers>0, e.g. some Gemma4 variants) reuse one layer's
-    K/V in later layers, but the streaming Fisher probe captures and
-    ``.detach()``s borrowed K/V per isolated phase-3 forward, severing the
-    Fisher cotangent that should flow back to the *storing* layer's
-    k_proj/v_proj — under-counting their h_trace.
+    Returns 0 when absent. KV-sharing models (num_kv_shared_layers>0, e.g. some
+    Gemma4 variants) reuse one layer's K/V in later layers. The phase-3 sweep
+    forwards each layer in isolation from a ``.detach()``ed capture of that K/V,
+    and that borrowed tensor severed the Fisher cotangent belonging to the
+    *storing* layer's k_proj/v_proj — under-counting their h_trace (review
+    finding MINOR-M33). ``SharedStateCotangents`` reconnects it, so this lookup
+    now only feeds the guard that fires if that path is switched off.
     """
     staged = stage_text_only(model_path)
     cfg_path = Path(staged) / "config.json"
@@ -991,21 +994,31 @@ def config_num_kv_shared_layers(model_path: str) -> int:
 def kv_shared_fisher_block_reason(model_path: str) -> str | None:
     """Fail-fast message if the streaming Fisher probe must not run here.
 
-    Returns a message string when the model has ``num_kv_shared_layers>0`` and
-    the ``PRISMAQUANT_ALLOW_KV_SHARED_FISHER`` override is unset, else ``None``
-    (MINOR-M33). Extracted so the guard decision is unit-testable.
+    INVERTED (MINOR-M33 closed): KV-sharing models are now probed normally,
+    because the reverse sweep routes each consumer's cotangent back to the
+    layer that produced the borrowed K/V (``SharedStateCotangents``, verified
+    against an end-to-end backward in
+    ``tests/test_kv_cotangent_path.py``). The guard therefore fires only when
+    that path is UNAVAILABLE — today the single way to get there is switching
+    it off with ``PRISMAQUANT_KV_COTANGENT=0``, which restores the severed
+    cotangent and its k/v_proj under-count. ``PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1``
+    still overrides, for anyone deliberately reproducing a pre-fix probe.
     """
     kv = config_num_kv_shared_layers(model_path)
-    if kv > 0 and os.environ.get("PRISMAQUANT_ALLOW_KV_SHARED_FISHER", "0") == "0":
-        return (
-            f"[incremental] model has num_kv_shared_layers={kv}: the streaming "
-            "Fisher probe under-counts the storing layer's k_proj/v_proj "
-            "h_trace (shared-consumer cotangent severed by the phase-3 K/V "
-            "detach; review finding MINOR-M33). Set "
-            "PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1 to probe anyway, accepting "
-            "the k/v_proj under-count, until the KV-cotangent path lands."
-        )
-    return None
+    if kv <= 0 or kv_cotangent_path_enabled():
+        return None
+    if os.environ.get("PRISMAQUANT_ALLOW_KV_SHARED_FISHER", "0") != "0":
+        return None
+    return (
+        f"[incremental] model has num_kv_shared_layers={kv} and "
+        "PRISMAQUANT_KV_COTANGENT=0 disables the KV-cotangent path: the "
+        "streaming Fisher probe would under-count the storing layer's "
+        "k_proj/v_proj h_trace (shared-consumer cotangent severed by the "
+        "phase-3 K/V detach; review finding MINOR-M33). Unset "
+        "PRISMAQUANT_KV_COTANGENT to probe correctly, or set "
+        "PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1 to probe anyway, accepting the "
+        "k/v_proj under-count."
+    )
 
 
 # Streaming infrastructure — `StreamingContext`, `_build_streaming_context`,
@@ -1863,6 +1876,13 @@ def _run_body_streaming_shard(
         in_scope_layers = {L for L in range(num_layers) if layer_linear_names[L]}
         ctx.layer_cache.set_priority_layers(in_scope_layers)
         ctx.configure_runtime_pressure_floor()
+        # KV-cotangent path: a fresh accumulator per SWEEP. The sweep visits
+        # every layer regardless of shard scope (the chain rule needs them
+        # all), and a consumer of shared state always sits above its producer,
+        # so one reverse pass collects every consumer's cotangent before the
+        # producing layer is forwarded — no cross-shard or cross-sweep state.
+        kv_cotangents = SharedStateCotangents(
+            enabled=kv_cotangent_path_enabled())
         # Reverse-prefetch (Task #5): prefetcher should now look BACKWARD
         # in layer index since reverse sweep walks num_layers-1 → 0.
         # Schedule lookahead in the direction we're actually going.
@@ -2311,10 +2331,30 @@ def _run_body_streaming_shard(
                 # reconstruct that per-layer slice for this isolated forward.
                 # One-layer scope, so the "once per pass" rule is trivially
                 # satisfied: a fresh container per isolated forward.
-                pass_state=_shard_profile.isolated_layer_pass_state(
-                    precomputed.shared_pass_state, layers[L]),
+                # `graft` swaps the borrowed tensors for grad-enabled leaves so
+                # this layer's cotangent on them can be read back below; it
+                # returns the caller's own object untouched when the profile
+                # declares no shared state.
+                pass_state=kv_cotangents.graft(
+                    _shard_profile.isolated_layer_pass_state(
+                        precomputed.shared_pass_state, layers[L])),
             )
-            out.backward(grad_out.to(device))
+            # Drive the backward with this layer's output cotangent AND the
+            # cotangent its consumers accumulated on the shared state it
+            # produced (empty for every architecture without cross-layer
+            # sharing — then this is exactly `out.backward(grad_out)`). One
+            # backward call, so autograd sums both contributions at the shared
+            # tensor before its grad_fn runs and each Linear's full-backward
+            # hook still fires ONCE, with the total gy.
+            kv_roots, kv_grads = kv_cotangents.produced_roots()
+            if kv_roots:
+                torch.autograd.backward([out, *kv_roots],
+                                        [grad_out.to(device), *kv_grads])
+            else:
+                out.backward(grad_out.to(device))
+            # Fold this layer's borrowed-state gradients into the accumulator
+            # (and end the layer) while the graph is still alive.
+            kv_cotangents.harvest()
             bwd_s = time.time() - bwd_t0
             phase_bwd_s += bwd_s
 
@@ -2523,6 +2563,12 @@ def _run_body_streaming_shard(
               f"load_by_src=[{load_parts}]  "
               f"{ctx.layer_cache.summary()}  {ctx.prefetch_summary()}",
               flush=True)
+        # Report the KV-cotangent path only when it did something, plus any
+        # cotangent no producer claimed (which would mean a residual
+        # under-count on that producer's k/v_proj — worth seeing, never
+        # silently swallowed).
+        if kv_cotangents.n_grafted or kv_cotangents.pending_keys():
+            print(f"[incremental] {kv_cotangents.summary()}", flush=True)
         _print_mem_snapshot("phase-3 done")
 
         # `activations_cpu` is a shared reference into the global
@@ -3028,12 +3074,12 @@ def main():
                     help="Max text tokens per multimodal calibration sample.")
     args = ap.parse_args()
 
-    # MINOR-M33: on KV-sharing models the streaming Fisher probe under-counts
-    # the storing layer's k_proj/v_proj h_trace — the phase-3 K/V detach severs
-    # the Fisher cotangent from consumer layers that reuse its K/V. Fail loud
-    # rather than ship a silently-biased allocation (Principle 1: measurement
-    # gap, not a band-aid). No shipped model triggers this (Gemma4-31B-IT and
-    # the Gemma4TextConfig default are num_kv_shared_layers=0).
+    # MINOR-M33 (closed): KV-sharing models are probed normally now — the
+    # reverse sweep seeds each producing layer's backward with the cotangent its
+    # consumers accumulated on the borrowed K/V, so k_proj/v_proj h_trace is the
+    # same quantity an end-to-end backward measures. The measurement gap was
+    # closed rather than papered over (Principle 1). This guard only still
+    # fires when PRISMAQUANT_KV_COTANGENT=0 takes that path away.
     _kv_block = kv_shared_fisher_block_reason(args.model)
     if _kv_block:
         raise SystemExit(_kv_block)

@@ -1248,6 +1248,245 @@ def read_top_k(model: nn.Module, default: int = 2) -> int:
     return default
 
 
+# ---------------------------------------------------------------------------
+# The KV-cotangent path: Fisher cotangents for cross-layer SHARED state
+# ---------------------------------------------------------------------------
+def kv_cotangent_path_enabled() -> bool:
+    """Whether the reverse sweep routes shared-state cotangents back to the
+    producing layer (default: yes).
+
+    `PRISMAQUANT_KV_COTANGENT=0` restores the pre-fix severed-cotangent
+    behavior for an A/B — and, because that reintroduces the under-count, it
+    also re-arms `incremental_probe.kv_shared_fisher_block_reason`. One
+    definition, read by both the probe sweeps and that guard, so the flag can
+    never mean two different things."""
+    raw = os.environ.get("PRISMAQUANT_KV_COTANGENT")
+    if raw is None:
+        return True
+    return raw not in ("0", "", "false", "False", "FALSE", "no", "NO")
+
+
+class SharedStateCotangents:
+    """Route the Fisher cotangent of cross-layer SHARED forward state back to
+    the layer that PRODUCED it.
+
+    **The measurement gap.** Some architectures share activations across layers
+    within one forward pass: Gemma4's KV-sharing layers reuse the K/V computed
+    by an earlier *storing* layer, threaded through the ``shared_kv_states``
+    dict that ``ModelProfile.new_forward_pass_state`` declares. The Fisher
+    probe's phase-3 forwards each layer in ISOLATION and hands a sharing layer
+    the phase-1 *capture* of that K/V, which is necessarily detached (it is a
+    CPU snapshot taken from a ``torch.no_grad()`` pass). A sharing layer's
+    backward therefore stops dead at the borrowed K/V, and ``h_trace`` for the
+    storing layer's ``k_proj``/``v_proj`` counts only its OWN layer's gradient
+    — it misses the gradient flowing through every layer that consumes its
+    K/V. The under-count lands precisely on the layers that feed other layers,
+    i.e. exactly the ones the allocator should be most careful with. It also
+    truncates the chained ``grad_out`` handed to every layer BELOW the storing
+    layer, since that input gradient is missing the same paths.
+
+    **The fix, in one reverse pass.** ``graft`` replaces each borrowed tensor
+    with a grad-enabled LEAF clone. After that consumer's backward, ``harvest``
+    reads ``leaf.grad`` — exactly the cotangent this consumer contributes to
+    the producer's shared tensor — and sums it per (kwarg, source key,
+    position); gradients from several consumers of one source add, which is
+    what the sum is. When the sweep later reaches the producing layer,
+    ``produced_roots`` returns the tensors that layer wrote into the container
+    paired with those accumulated gradients, so the caller can drive one
+    ``torch.autograd.backward([out, *roots], [grad_out, *grads])``. Autograd
+    accumulates both contributions at the producer's K/V node before its
+    ``grad_fn`` runs, so each Linear's full-backward hook still fires ONCE,
+    with the total — the same gy an end-to-end backward would have delivered.
+
+    **Why one pass suffices.** A consumer always comes AFTER its producer in
+    the forward order (Gemma4 derives ``kv_shared_layer_index`` from the layers
+    strictly BEFORE the sharing point), and phase-3 sweeps in REVERSE, so every
+    consumer has been harvested by the time its producer is forwarded.
+
+    Bookkeeping rules that keep this honest:
+
+    - A borrowed leaf is never seeded as a root. It has no ``grad_fn`` (and its
+      identity is tracked), so a source whose cotangent is still accumulating
+      cannot be fed back into a later consumer and double-counted.
+    - A seeded key is POPPED. Two layers writing one key would otherwise each
+      collect the same consumers' cotangent; the sweep-end ``pending_keys``
+      diagnostic reports anything never consumed.
+    - Accumulation is promoted to at least fp32, so many bf16 consumer
+      cotangents don't lose the small ones; the seed is cast back to the
+      producer tensor's dtype.
+    - ``graft`` of an empty/absent pass state returns the caller's own object
+      and records nothing, so architectures that declare no shared state take
+      byte-for-byte the same path they did before this class existed.
+    """
+
+    def __init__(self, *, enabled: bool = True):
+        self.enabled = bool(enabled)
+        # (kwarg, source key, position) -> summed cotangent (>= fp32).
+        self._acc: dict[tuple, torch.Tensor] = {}
+        # Per-layer: grafted leaves awaiting harvest, and the containers this
+        # layer may have written into.
+        self._live: list[tuple[tuple, torch.Tensor]] = []
+        self._live_ids: set[int] = set()
+        self._containers: list[tuple[str, dict]] = []
+        # Diagnostics (reported at sweep end; never used to make a decision).
+        self.n_grafted = 0
+        self.n_harvested = 0
+        self.n_seeded = 0
+        self.n_no_grad = 0
+        self.nondifferentiable: list[str] = []
+
+    # -- consumer side ----------------------------------------------------
+    def graft(self, pass_state):
+        """Return `pass_state` with every borrowed tensor replaced by a
+        grad-enabled leaf clone, recording the leaves for `harvest` and the
+        containers for `produced_roots`. Hand the RESULT to the layer call."""
+        if not self.enabled or not pass_state:
+            return pass_state
+        grafted: dict = {}
+        tracked = False
+        for kwarg, container in pass_state.items():
+            if not isinstance(container, dict):
+                # Not a keyed shared-state container; pass through untouched
+                # rather than guess at its structure.
+                grafted[kwarg] = container
+                continue
+            fresh = {
+                key: self._graft_value(kwarg, key, value)
+                for key, value in container.items()
+            }
+            grafted[kwarg] = fresh
+            self._containers.append((kwarg, fresh))
+            tracked = True
+        return grafted if tracked else pass_state
+
+    def _graft_value(self, kwarg, key, value):
+        if isinstance(value, torch.Tensor):
+            return self._leaf(kwarg, key, None, value)
+        if isinstance(value, (tuple, list)):
+            out = [
+                self._leaf(kwarg, key, pos, item)
+                if isinstance(item, torch.Tensor) else item
+                for pos, item in enumerate(value)
+            ]
+            return tuple(out) if isinstance(value, tuple) else out
+        return value
+
+    def _leaf(self, kwarg, key, pos, tensor: torch.Tensor) -> torch.Tensor:
+        if not (tensor.is_floating_point() or tensor.is_complex()):
+            # Integer/bool shared state carries no cotangent at all — the
+            # producer's Fisher genuinely cannot be recovered through it.
+            self.nondifferentiable.append(f"{kwarg}[{key!r}][{pos}]:{tensor.dtype}")
+            return tensor
+        try:
+            slot = (kwarg, key, pos)
+            hash(slot)
+        except TypeError:
+            self.nondifferentiable.append(f"{kwarg}[{key!r}]:unhashable-key")
+            return tensor
+        leaf = tensor.detach().clone().requires_grad_(True)
+        self._live.append((slot, leaf))
+        self._live_ids.add(id(leaf))
+        self.n_grafted += 1
+        return leaf
+
+    def harvest(self) -> int:
+        """Fold this layer's leaf gradients into the per-source accumulator and
+        end the layer. Call AFTER the backward; returns the number folded."""
+        folded = 0
+        for slot, leaf in self._live:
+            grad = leaf.grad
+            if grad is None:
+                # The layer never used the borrowed tensor on a path that
+                # reaches its output (or the cotangent was structurally zero).
+                self.n_no_grad += 1
+                continue
+            acc_dtype = torch.promote_types(grad.dtype, torch.float32)
+            contrib = grad.detach().to(acc_dtype)
+            prev = self._acc.get(slot)
+            if prev is None:
+                self._acc[slot] = contrib.clone()
+            else:
+                prev.add_(contrib)
+            leaf.grad = None
+            folded += 1
+        self.n_harvested += folded
+        self._live.clear()
+        self._live_ids.clear()
+        self._containers.clear()
+        return folded
+
+    # -- producer side ----------------------------------------------------
+    def produced_roots(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """`(tensors, grads)` — extra backward roots for the layer just
+        forwarded: the shared tensors IT produced, paired with the cotangent
+        its consumers accumulated. Call after the forward, before the
+        backward. Empty when this layer produced nothing consumers wanted."""
+        if not self.enabled or not self._acc:
+            return [], []
+        order: list[int] = []
+        by_id: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for kwarg, container in self._containers:
+            for key, value in list(container.items()):
+                for pos, tensor in self._iter_positions(value):
+                    slot = (kwarg, key, pos)
+                    grad = self._acc.get(slot)
+                    if grad is None:
+                        continue
+                    if id(tensor) in self._live_ids or tensor.grad_fn is None:
+                        # A tensor this layer BORROWED, not produced: it is a
+                        # leaf clone with no graph. Seeding it would inject
+                        # other consumers' cotangent into this layer's harvest.
+                        continue
+                    self._acc.pop(slot)
+                    seed = grad.to(device=tensor.device, dtype=tensor.dtype)
+                    if id(tensor) in by_id:
+                        # Same object written at two positions (Gemma4's
+                        # `value_states = key_states` k_eq_v layers): one root,
+                        # summed grad — duplicate roots would be legal but this
+                        # is unambiguous.
+                        prev_t, prev_g = by_id[id(tensor)]
+                        by_id[id(tensor)] = (prev_t, prev_g + seed)
+                    else:
+                        by_id[id(tensor)] = (tensor, seed)
+                        order.append(id(tensor))
+                    self.n_seeded += 1
+        roots = [by_id[i][0] for i in order]
+        grads = [by_id[i][1] for i in order]
+        return roots, grads
+
+    @staticmethod
+    def _iter_positions(value):
+        if isinstance(value, torch.Tensor):
+            yield None, value
+        elif isinstance(value, (tuple, list)):
+            for pos, item in enumerate(value):
+                if isinstance(item, torch.Tensor):
+                    yield pos, item
+
+    # -- diagnostics ------------------------------------------------------
+    def pending_keys(self) -> list[tuple]:
+        """Accumulated cotangents no producer ever claimed. Non-empty means the
+        sweep never forwarded the producing layer (or it stopped writing the
+        key), so that producer's Fisher is still under-counted."""
+        return sorted(self._acc, key=repr)
+
+    def summary(self) -> str:
+        pending = self.pending_keys()
+        parts = [
+            f"enabled={self.enabled}",
+            f"grafted={self.n_grafted}",
+            f"harvested={self.n_harvested}",
+            f"seeded={self.n_seeded}",
+        ]
+        if self.n_no_grad:
+            parts.append(f"no_grad={self.n_no_grad}")
+        if self.nondifferentiable:
+            parts.append(f"nondifferentiable={len(self.nondifferentiable)}")
+        if pending:
+            parts.append(f"UNCLAIMED={[repr(k) for k in pending]}")
+        return "kv_cotangent[" + " ".join(parts) + "]"
+
+
 def _streaming_visual_layer_kwargs(
     profile,
     *,
@@ -1255,6 +1494,7 @@ def _streaming_visual_layer_kwargs(
     pass_state: dict | None = None,
     captured_pass_state=None,
     layer=None,
+    cotangents: "SharedStateCotangents | None" = None,
 ) -> dict:
     """Resolve the profile kwargs for one layer call in the streaming visual
     probe: per-layer `extra_layer_kwargs` plus the per-pass SHARED state —
@@ -1264,18 +1504,22 @@ def _streaming_visual_layer_kwargs(
 
     Merging goes through `merge_pass_state_kwargs` so the shallow-merge /
     no-op-when-empty / raise-on-collision rule has one definition shared with
-    `_call_layer`."""
+    `_call_layer`.
+
+    `cotangents` (reverse sweep only) grafts grad-enabled leaves over the
+    borrowed tensors so the producing layer's Fisher gets its consumers'
+    cotangent — see `SharedStateCotangents`. Grafting happens on the isolated
+    slice, before the merge, so only declared shared containers are touched."""
     from .layer_streaming import merge_pass_state_kwargs
 
     ctx = type(layer).__name__ if layer is not None else "streaming layer"
     kwargs = dict(profile.extra_layer_kwargs(input_ids=input_ids))
     kwargs = merge_pass_state_kwargs(kwargs, pass_state, context=ctx)
     if captured_pass_state is not None and layer is not None:
-        kwargs = merge_pass_state_kwargs(
-            kwargs,
-            profile.isolated_layer_pass_state(captured_pass_state, layer),
-            context=ctx,
-        )
+        isolated = profile.isolated_layer_pass_state(captured_pass_state, layer)
+        if cotangents is not None:
+            isolated = cotangents.graft(isolated)
+        kwargs = merge_pass_state_kwargs(kwargs, isolated, context=ctx)
     return kwargs
 
 
@@ -2819,6 +3063,11 @@ def run_streaming_multimodal_visual_probe_pass(
     prefetch_depth = 3
     total_fwd = total_bwd = 0.0
     successes = 0
+    # KV-cotangent path (on by default): route the Fisher cotangent of borrowed
+    # cross-layer state back to the layer that produced it. `=0` restores the
+    # severed-cotangent behavior for an A/B, and makes the KV-sharing Fisher
+    # guard fail loud again (`incremental_probe.kv_shared_fisher_block_reason`).
+    kv_cotangent_path = kv_cotangent_path_enabled()
 
     for i, sample in enumerate(triples):
         # Move inputs to device, casting pixel_values to dtype.
@@ -2930,6 +3179,10 @@ def run_streaming_multimodal_visual_probe_pass(
 
             # ---- Phase 3: streaming reverse sweep ----------------------
             grad_out = grad_at_tail
+            # KV-cotangent path, scoped to THIS sample's sweep: a fresh
+            # accumulator per pass, exactly like the shared state it mirrors,
+            # so sample N never seeds sample N-1's cotangent.
+            kv_cotangents = SharedStateCotangents(enabled=kv_cotangent_path)
             for d in range(prefetch_depth):
                 ctx.schedule_prefetch(num_layers - 1 - d)
             for L in reversed(range(num_layers)):
@@ -2947,12 +3200,26 @@ def run_streaming_multimodal_visual_probe_pass(
                         input_ids=input_ids,
                         captured_pass_state=shared_pass_state,
                         layer=layers[L],
+                        cotangents=kv_cotangents,
                     ),
                 )
-                out.backward(grad_out)
+                # Drive the backward with this layer's output cotangent AND
+                # the cotangent its consumers accumulated on the shared state
+                # it produced. One backward, so each Linear's hook still fires
+                # once with the summed gy.
+                kv_roots, kv_grads = kv_cotangents.produced_roots()
+                if kv_roots:
+                    torch.autograd.backward([out, *kv_roots],
+                                            [grad_out, *kv_grads])
+                else:
+                    out.backward(grad_out)
+                kv_cotangents.harvest()
                 grad_out = x_in.grad.detach().clone()
                 ctx.unload(L)
                 del x_in, out
+            if kv_cotangents.pending_keys():
+                print(f"[probe/mm-stream] sample {i}: "
+                      f"{kv_cotangents.summary()}", flush=True)
 
             total_fwd += (time.time() - t0)
 

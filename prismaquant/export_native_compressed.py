@@ -81,6 +81,7 @@ from safetensors.torch import save_file
 
 from .allocator_candidates import (
     PASSTHROUGH_SOURCE_REQUIREMENTS,
+    _scan_source_dtype_manifest,
     check_format_applicability,
 )
 from .fp8_dynamic import fp8_dynamic_weight_qdq
@@ -1087,13 +1088,26 @@ def _production_cache_lookup_key(name: str, fmt: str):
 def _production_cache_expected_keys(
     assignment: dict[str, str],
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Cache keys export will actually READ, and which of them are absent.
+
+    Passthrough formats are excluded, not just BF16: their emit paths copy
+    source bytes and never call `_pack_production_cached_2d` (the
+    FP8_SOURCE branch in the streaming Linear loop returns before the
+    cache lookup). `build_production_cache --render-scope assignment` does
+    render them — FP8_SOURCE's `quantize_dequantize` is identity — so the
+    keys usually exist, but demanding a render this export cannot consume
+    would fail an otherwise-valid FP8-source export over an unused entry.
+    Before issue #29 the question never arose: the runtime-legality guard
+    rewrote every FP8_SOURCE entry to BF16 before this check saw it.
+    """
     from prismaquant.production_weight_cache import is_uncached_packed_expert_qname
 
     keys: list[tuple[str, str]] = []
     missing: list[tuple[str, str]] = []
     for qname, fmt in assignment.items():
         cache_fmt = str(fmt).upper()
-        if _canonical_export_format(cache_fmt) == "BF16":
+        canonical = _canonical_export_format(cache_fmt)
+        if canonical in PASSTHROUGH_SOURCE_REQUIREMENTS:
             continue
         key = _production_cache_lookup_key(qname, cache_fmt)
         if key is None:
@@ -1393,9 +1407,13 @@ def _group_legal_quantized_formats(
     """Emittable QUANTIZED formats legal for every checkable member.
 
     "Checkable" is the same bar the coercion itself uses: a member with a
-    known 2-D source shape. Passthrough formats are excluded — BF16 is
-    the fallback under discussion, and export cannot verify FP8_SOURCE's
-    source-dtype precondition here (it never learns `source_kind`).
+    known 2-D source shape. Passthrough formats are excluded: BF16 is the
+    fallback under discussion, and FP8_SOURCE is a *source-dependent*
+    rung (legal only where every member's source is already fp8), so
+    offering it as a substitute would flip refuse-vs-coerce on FP8-source
+    models — a unit that must fall back to BF16 today would instead be
+    refused. That rung is already in the allocator's menu, which is where
+    picking it belongs; export names alternatives, it does not choose.
 
     A non-empty answer is the decisive fact for refuse-vs-coerce: it says
     the allocation is repairable upstream at a quantized bit rate, so
@@ -1481,6 +1499,24 @@ def _coerce_runtime_legal_assignment(
         rows (and from there in `runtime_coercions` +
         `bf16_audit.serving_group`).
 
+    **Passthrough source integrity (issue #29).**
+    `PASSTHROUGH_SOURCE_REQUIREMENTS` makes FP8_SOURCE legal only where the
+    source tensor is ALREADY fp8, which `check_format_applicability` can
+    only judge with a `source_kind`. That argument used to be omitted, so
+    every FP8_SOURCE Linear came back `source_dtype_mismatch` and was
+    rewritten to BF16 —
+    inert in the bytes (materialization copies the source fp8 verbatim and
+    `_fp8_source_config_overlay` restores the config), but it filled every
+    DSv4 / Hy3 / MiniMax manifest's `runtime_coercions` with rows for
+    demotions that never happened, hiding any real one. The `source_kind`
+    now comes from `_scan_source_dtype_manifest` — the SAME recipe-keyed
+    map `build_candidates` gates the allocator's passthrough candidates
+    on — so export's verdict and the gate that admitted the allocation
+    cannot disagree, and a passthrough row now means the source really is
+    not fp8 (i.e. an upstream `PASSTHROUGH_SOURCE_REQUIREMENTS` failure)
+    and the bytes really do change. Such a verdict is therefore treated
+    like any other illegality, group escalation included.
+
     Upstream is the real fix: the allocator's candidate mask intersects
     shape legality per member, so a promoted format is legal for every
     member by construction and this path is unreachable in normal
@@ -1490,6 +1526,18 @@ def _coerce_runtime_legal_assignment(
     out = dict(assignment)
     target_profile = _allocator_target_profile_for_audit(profile) or "research"
     shapes: dict[str, list[int] | None] = {}
+    # Recipe-keyed source dtypes, read lazily: only passthrough formats
+    # consult `source_kind` inside `check_format_applicability`, and the
+    # scan is safetensors-header IO that a BF16-source export never needs
+    # (CLAUDE.md §4.7 — no disk work on a path that cannot use it).
+    source_kinds: dict[str, str] | None = None
+
+    def _source_kind_for(qname: str) -> str | None:
+        nonlocal source_kinds
+        if source_kinds is None:
+            source_kinds = _scan_source_dtype_manifest(src_model, profile)
+        return source_kinds.get(qname)
+
     # qname -> (shape, from_fmt, reason, detail)
     illegal: dict[str, tuple[list[int], str, str, str]] = {}
     for qname, fmt in assignment.items():
@@ -1536,6 +1584,11 @@ def _coerce_runtime_legal_assignment(
             tuple(shape),
             fmt,
             qname=qname,
+            source_kind=(
+                _source_kind_for(qname)
+                if fmt_canonical in PASSTHROUGH_SOURCE_REQUIREMENTS
+                else None
+            ),
             target_profile=target_profile,
         )
         if not verdict.legal:
@@ -1552,31 +1605,14 @@ def _coerce_runtime_legal_assignment(
     coerced: list[_RuntimeCoercion] = []
     handled: set[str] = set()
 
-    # Passthrough formats first, and per-Linear as before. `FP8_SOURCE`
-    # is always judged illegal here because this call site cannot supply
-    # `source_kind` (see `PASSTHROUGH_SOURCE_REQUIREMENTS`), so its
-    # verdict says nothing about serving atomicity — and the rewrite is
-    # inert: `_fp8_source_config_overlay` restores FP8_SOURCE for every
-    # source-FP8 Linear in the emitted config, and streaming
-    # materialization copies the source FP8 bytes verbatim for a
-    # BF16-assigned source-FP8 Linear. Escalating THAT to a whole
-    # serving unit (or to a refusal) would break every FP8-source export
-    # for a verdict that is an artifact of the missing argument. These
-    # rows carry no `delta_bytes` for the same reason: the emitted bytes
-    # do not change.
-    for qname in sorted(illegal):
-        shape, from_fmt, reason, detail = illegal[qname]
-        if from_fmt not in PASSTHROUGH_SOURCE_REQUIREMENTS:
-            continue
-        handled.add(qname)
-        out[qname] = "BF16"
-        coerced.append(
-            _RuntimeCoercion(qname, shape, from_fmt, reason, detail)
-        )
-
-    if len(handled) == len(illegal):
-        return out, coerced
-
+    # No passthrough exemption (issue #29). It existed only because the
+    # FP8_SOURCE verdict was an artifact of the missing `source_kind` —
+    # escalating a bogus demotion would have coerced whole packed-expert
+    # units to BF16 on every FP8-source model. Now that the verdict is
+    # source-aware, a passthrough mismatch is a real illegality with a
+    # real byte cost, and gets the same serving-atomic treatment as a
+    # shape or policy one: refused when the unit has a legal quantized
+    # rung, coerced as a whole unit when it does not.
     members_by_name, units_by_name, grouping_failures = (
         _serving_atomic_components(out.keys(), profile)
     )
@@ -1735,9 +1771,11 @@ def _describe_serving_group_refusal(
         + (f"; also illegal in this unit: {others}" if others else ""),
         f"but these emittable formats ARE legal for every member of the "
         f"unit: {alt_text}. Coercing the unit to BF16 instead would add "
-        f"{_human_bytes(would_cost)} for nothing, and the dimension that "
-        f"made {trigger.rsplit('.', 1)[-1]} illegal is model-wide, so it "
-        f"is that much per unit across every layer",
+        f"{_human_bytes(would_cost)} for nothing, and the "
+        + ("source precision"
+           if reason == "source_dtype_mismatch" else "dimension")
+        + f" that made {trigger.rsplit('.', 1)[-1]} illegal is model-wide, "
+        f"so it is that much per unit across every layer",
     ]
     parts.append(
         f"members={sorted(members)[:8]}"
@@ -1745,8 +1783,9 @@ def _describe_serving_group_refusal(
     )
     parts.append(
         f"FIX: re-solve the allocation for target_profile={target_profile!r} "
-        f"so this unit's promoted format is legal for every member -- shape "
-        f"legality has to be intersected ACROSS a serving unit, because that "
+        f"so this unit's promoted format is legal for every member -- "
+        f"legality (shape, serving policy, and passthrough source precision) "
+        f"has to be intersected ACROSS a serving unit, because that "
         f"unit is one scheme at serve time (issue #28); or, when "
         f"re-exporting an allocation that predates that, set every member of "
         f"the unit to one of the legal formats above in layer_config.json. "
@@ -1781,6 +1820,28 @@ def _runtime_coercion_report(coerced: Sequence[_RuntimeCoercion]) -> str:
             if deltas else ""
         ),
     ]
+    # A passthrough verdict is not a runtime-support fact but a broken
+    # allocator contract: FP8_SOURCE was assigned to a Linear whose source
+    # is not fp8, which `PASSTHROUGH_SOURCE_REQUIREMENTS` is supposed to
+    # make unreachable (issue #29). Since #29 this can no longer be the
+    # missing-`source_kind` false positive, so say so in those words.
+    passthrough = [
+        row for row in coerced
+        if getattr(row, "reason", "") == "source_dtype_mismatch"
+    ]
+    if passthrough:
+        lines.append(
+            f"[export-stream] WARNING: {len(passthrough)} PASSTHROUGH "
+            f"SOURCE MISMATCH(ES): a passthrough format was allocated to a "
+            f"Linear whose source is not that precision, so the source bytes "
+            f"cannot be copied and BF16 is the only representable answer. "
+            f"PASSTHROUGH_SOURCE_REQUIREMENTS is supposed to make this "
+            f"unreachable -- re-solve the allocation against this checkpoint "
+            f"(the allocator's source manifest disagrees with the source "
+            f"safetensors). "
+            + str([(row.name, row.from_fmt, row.detail)
+                   for row in passthrough[:6]])
+        )
     groups: dict[str, list[_RuntimeCoercion]] = {}
     singles: list[_RuntimeCoercion] = []
     for row in coerced:

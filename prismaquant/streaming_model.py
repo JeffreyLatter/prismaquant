@@ -658,6 +658,192 @@ def _resolve_declared_model_cls(config, default_cls):
     return default_cls
 
 
+def _auto_causal_lm_can_resolve(config) -> bool:
+    """Would `AutoModelForCausalLM.from_config(config)` find a class?
+
+    Asks the same two questions `_BaseAutoModelClass.from_config` asks
+    itself (transformers 5.6, `auto_factory.py`): is there remote code
+    (`config.auto_map["AutoModelForCausalLM"]`), or is `type(config)` a
+    key of `AutoModelForCausalLM._model_mapping`? Deriving the answer
+    from the mapping the call itself consults — rather than from a list
+    of known-wrapper class names — means anything PrismaQuant registered
+    (`prismaquant/vendored`) or any config class transformers gains later
+    is handled without an edit here.
+
+    Config-only: resolves nothing and instantiates nothing.
+    """
+    from transformers import AutoModelForCausalLM
+
+    auto_map = getattr(config, "auto_map", None) or {}
+    if "AutoModelForCausalLM" in auto_map:
+        # from_config takes its dynamic-module branch; the static mapping
+        # is irrelevant there.
+        return True
+    try:
+        # `_model_mapping` is `MODEL_FOR_CAUSAL_LM_MAPPING`; going through
+        # the class attribute is what `from_config` does, so the answer
+        # cannot drift from the call.
+        return type(config) in AutoModelForCausalLM._model_mapping
+    except Exception:
+        return False
+
+
+def _config_rebuilt_as(config_cls, config):
+    """Rebuild `config_cls` from the TOP-LEVEL keys of a staged config.
+
+    `stage_text_only` lifts every `text_config` key to the top level,
+    drops the nested multimodal sub-configs, and rewrites
+    `architectures`; after it runs, the top level *is* the text model's
+    authoritative schema (that lift is exactly why `Gemma4TextConfig`
+    loads correctly for the families whose profile promotes the inner
+    `model_type`). The nested sub-config object still hanging off a
+    wrapper config at that point is *default-constructed* and must not be
+    used as a value source — verified on an Ovis2-shaped staged config,
+    where `config.text_config.hidden_size` reads 4096 (the class default)
+    while the checkpoint's real 64 sits at the top level.
+
+    Sub-config keys and `model_type` are dropped (the target class owns
+    its own `model_type`); derived fields such as `layer_types` are left
+    out of the input so the target class recomputes them from the real
+    `num_hidden_layers` instead of inheriting a default-length list.
+    """
+    raw = config.to_dict()
+    for sub_key in set(getattr(type(config), "sub_configs", None) or {}):
+        raw.pop(sub_key, None)
+    raw.pop("model_type", None)
+    return config_cls.from_dict(raw)
+
+
+def _resolve_text_only_skeleton(config, *, log_prefix: str = "[streaming]"):
+    """Return `(config, model_cls)` for a top-level config that
+    `AutoModelForCausalLM` cannot resolve — i.e. a vision-language
+    *wrapper* config on the TEXT-ONLY path (issue #12: MiniMax-M3's
+    `MiniMaxM3VLConfig` is rejected while the accepted list in the very
+    same error names `MiniMaxM3VLTextConfig`).
+
+    Preference order, and why:
+
+    1. **The config's own text sub-config class.** Text-only means we
+       want the body and nothing else: only the `multimodal=True` branch
+       of `_build_streaming_context` reads tower tensors onto the device
+       (`_find_visual_module` → `_read_layer_to_device` →
+       `visual_module.to(device)`), so building the declared VL
+       architecture here would wire a tower of never-materialized meta
+       tensors into the module tree — which the "head buffers left on
+       meta" sweep in `_build_streaming_context` is right to reject —
+       and would cost tower memory the moment anything did materialize
+       it. The text sub-config produces exactly the module tree the
+       plain-text path produces.
+    2. **The declared architecture** (`config.architectures[0]`, the
+       mechanism the multimodal branch already trusts), built against
+       *its own* `config_class` rather than the wrapper config. This is
+       the answer when staging's `ForConditionalGeneration →
+       ForCausalLM` rewrite lands on a real text-only class that simply
+       is not registered under the wrapper config class. Note it is
+       frequently a dead end for VL wrappers, because the rewritten name
+       does not exist (`Ovis2ForCausalLM`, verified absent from
+       transformers 5.6) — which is the second reason it is not first.
+
+    A registered `ModelProfile` can pre-empt all of this at staging time
+    by promoting the inner `model_type`
+    (`stage_text_only_promote_inner_model_type`, as Gemma 4 does), in
+    which case `AutoConfig` hands back the text config class directly and
+    this function is never reached.
+
+    Raises `RuntimeError` naming every attempt when nothing resolves.
+    """
+    from transformers import AutoModelForCausalLM
+
+    wrapper = type(config).__name__
+    tried: list[str] = []
+
+    # 1. text sub-config class
+    text_cfg_cls = None
+    try:
+        sub = config.get_text_config()
+        if sub is not None and sub is not config:
+            text_cfg_cls = type(sub)
+    except Exception as e:  # get_text_config() raises on ambiguity
+        tried.append(f"{wrapper}.get_text_config() raised {e!r}")
+    if text_cfg_cls is None:
+        text_cfg_cls = (getattr(type(config), "sub_configs", None)
+                        or {}).get("text_config")
+    if text_cfg_cls is None:
+        tried.append(f"{wrapper} exposes no text sub-config")
+    else:
+        try:
+            text_cfg = _config_rebuilt_as(text_cfg_cls, config)
+        except Exception as e:
+            tried.append(f"rebuilding {text_cfg_cls.__name__} from the "
+                         f"staged top-level config raised {e!r}")
+        else:
+            if _auto_causal_lm_can_resolve(text_cfg):
+                print(f"{log_prefix} {wrapper} is not a CausalLM config; "
+                      f"building the text-only skeleton from its text "
+                      f"sub-config {text_cfg_cls.__name__} "
+                      f"(no visual tower on the text-only path)",
+                      flush=True)
+                return text_cfg, AutoModelForCausalLM
+            tried.append(f"text sub-config {text_cfg_cls.__name__} is also "
+                         "absent from AutoModelForCausalLM's mapping")
+
+    # 2. declared architecture, built against its own config class
+    declared = _resolve_declared_model_cls(config, None)
+    if declared is None:
+        tried.append("declared architectures "
+                     f"{list(getattr(config, 'architectures', None) or [])} "
+                     "are not importable from transformers")
+    else:
+        decl_cfg_cls = getattr(declared, "config_class", None)
+        if decl_cfg_cls is None or isinstance(config, decl_cfg_cls):
+            decl_cfg = config
+        else:
+            try:
+                decl_cfg = _config_rebuilt_as(decl_cfg_cls, config)
+            except Exception as e:
+                tried.append(f"rebuilding {decl_cfg_cls.__name__} for "
+                             f"declared {declared.__name__} raised {e!r}")
+                decl_cfg = None
+        if decl_cfg is not None:
+            print(f"{log_prefix} {wrapper} is not a CausalLM config; "
+                  f"building the text-only skeleton from declared "
+                  f"architecture {declared.__name__} "
+                  f"(config {type(decl_cfg).__name__})", flush=True)
+            return decl_cfg, declared
+
+    raise RuntimeError(
+        f"{log_prefix} cannot build a text-only skeleton: "
+        f"AutoModelForCausalLM has no model class for {wrapper} "
+        f"(model_type={getattr(config, 'model_type', None)!r}), and no "
+        "fallback resolved either. Tried: " + "; ".join(tried) + ". "
+        "Fix by registering a ModelProfile whose "
+        "stage_text_only_promote_inner_model_type()/"
+        "stage_text_only_strip_keys() stage a config this transformers "
+        "build can load as a text CausalLM.")
+
+
+def _skeleton_config_and_class(config, *, multimodal: bool,
+                               log_prefix: str = "[streaming]"):
+    """Pick the `(config, model_cls)` pair `_build_streaming_context`
+    instantiates the empty skeleton from.
+
+    `model_cls is AutoModelForCausalLM` means "let the auto class
+    resolve it" — the historical path, returned unchanged (same config
+    object) for every config the auto class can resolve, which is every
+    plain text model.
+    """
+    from transformers import AutoModelForCausalLM
+
+    if multimodal:
+        # Declared arch so the visual tower materializes — unchanged.
+        return config, _resolve_declared_model_cls(config,
+                                                   AutoModelForCausalLM)
+    if _auto_causal_lm_can_resolve(config):
+        return config, AutoModelForCausalLM
+    # Text-only path, wrapper (e.g. vision-language) top-level config.
+    return _resolve_text_only_skeleton(config, log_prefix=log_prefix)
+
+
 def _find_visual_module(model) -> tuple[Any | None, str]:
     """Return (visual_module, dotted_prefix) if the model has a visual
     tower; (None, '') otherwise. Handles the v5 multimodal umbrella
@@ -712,7 +898,14 @@ def _build_streaming_context(model_path: str, *,
         every visual Linear's weight so Fisher backward hooks fire when
         `run_multimodal_visual_probe_pass` drives the combined forward
         (pixel_values → visual_tower → merged inputs_embeds → streamed
-        body → lm_head → CE)."""
+        body → lm_head → CE).
+
+    When `multimodal=False` (the default) the skeleton comes from
+    `AutoModelForCausalLM.from_config` exactly as before, except that a
+    top-level config the auto class cannot resolve at all — a
+    vision-language *wrapper* config — falls back to
+    `_resolve_text_only_skeleton` instead of raising. No visual tower is
+    materialized on this path either way."""
     import psutil
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -730,10 +923,8 @@ def _build_streaming_context(model_path: str, *,
                   "during layer loads", flush=True)
     config = AutoConfig.from_pretrained(staged, trust_remote_code=True)
 
-    if multimodal:
-        model_cls = _resolve_declared_model_cls(config, AutoModelForCausalLM)
-    else:
-        model_cls = AutoModelForCausalLM
+    config, model_cls = _skeleton_config_and_class(
+        config, multimodal=multimodal, log_prefix=log_prefix)
 
     with _mask_cuda_queries_during_meta_init(log_prefix):
         with init_empty_weights():
