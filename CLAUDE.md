@@ -213,6 +213,14 @@ the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
     uniform NVFP4 must use the same convention. (Beware: bpp labels are *not*
     comparable across accounting eras — the public "5.31" artifact's body bpp is
     ~4.76 under current accounting.)
+13. **`docs/ARCHITECTURE.md` stays current — same commit, not later.** Any
+    change to pipeline defaults, the stage graph, the format menu, the plugin
+    contract, serving-lane defaults, or ship gates updates `docs/ARCHITECTURE.md`
+    (and its diagrams if topology changed) in the same commit, and re-stamps its
+    provenance block. Handovers and results docs are append-only history and
+    never substitute for this. `tests/test_docs_staleness.py` +
+    `tests/test_architecture_doc.py` enforce the mechanical half; the
+    judgment half is on you.
 
 ---
 
@@ -259,7 +267,8 @@ the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
 
 ## 6. Architecture & code map (validated against the tree)
 
-**`run-pipeline.sh` is the real orchestrator.** `pipeline.py` is a *declarative
+**`run-pipeline.sh` (at `prismaquant/run-pipeline.sh`, not the repo root) is
+the real orchestrator.** `pipeline.py` is a *declarative
 contract* layer (typed stages/gates/`APPROVED_RESOURCE_OWNERS`), **not** the
 executor. Stages are file-artifact-coupled and skip-if-exists. `WORK_DIR/`:
 `artifacts/` (probe.pkl, cost*.pkl, layer_config.json, pareto*, production cache),
@@ -380,9 +389,12 @@ broken) + `causal-conv1d`, installed `--no-deps` so torch is never touched.
 
 ## 8. Current state (snapshot — verify against `git`/memory before relying)
 
-Branch at last edit: **`claude/fix-issues-4-6`** (Gemma4 multi-layer-type rope +
-KV-sharing, LFM2.5 enablement, incomplete-fused-group BF16 forcing, Gemma BOS PPL
-fix). `main` is the integration branch.
+Branch at last edit: **`claude/docs-consolidation`** (2026-07-30: docs
+centralization + `docs/ARCHITECTURE.md` + cleanup; = NVFP4-CB lane +
+origin/main merged, i.e. the allocator PR stack #13–#21, closures #27–#29, and
+the v0.4.1 release stack). **`origin/main` is the integration branch — the
+local `main` checkout had drifted 54 commits behind it; check
+`git fetch && git log main..origin/main` before trusting local `main`.**
 
 **Shipped public artifacts (`rdtand/`):**
 - **Qwen3.6-27B PrismaSCOUT** — 5.31 bpp / held-out KL 0.0151, 20.17 GB; 11%
@@ -503,11 +515,17 @@ lever ones (grouped-KL, Fisher, HDQ, multi-shot) **fail-fast with `exit 2`** fro
 
 Read these for *depth*; the prime directive applies.
 
-- **`docs/archive/prismaquant_design.md`** — the master design doc (57 KB): the *why*
-  behind the cascade, the knapsack DP + log-error kneedle, the render pipeline,
-  the export codecs, the validation chain, the plugin architecture, and §11
-  "Alternatives Considered and Rejected". **Most authoritative narrative**, and
-  its archive banners are kept current. Still: a doc, not the code.
+- **`docs/ARCHITECTURE.md`** — **the master document. Start here.** Single
+  current system map: pipeline stages + defaults, cost models, formats, export,
+  validation, plugin architecture, the three serving lanes, hardware, history,
+  and an honest debt register — every normative claim code-cited, three mermaid
+  diagrams, provenance-stamped. Carries the maintenance contract (§0): any
+  change to defaults, stages, formats, plugin contract, lanes, or ship gates
+  updates it in the same commit. `docs/README.md` is the index of everything
+  else, with per-doc status labels.
+- **`docs/archive/prismaquant_design.md`** — the retired 2026-06 master design
+  doc; superseded by `docs/ARCHITECTURE.md` (banner on the file). Historical
+  depth on the cascade era only; several claims known-stale.
 - **`AGENTS.md`** + **`docs/design/design_guidelines.md`** — the terse normative rules
   (the 9 core principles, promotion gates, progressive render-gate contract,
   rotation-transform rule, exception rule). Mandatory pre-read for new work.
@@ -522,7 +540,8 @@ Read these for *depth*; the prime directive applies.
   figure. The retired PrismaSCOUT paper, including monotone-polish and the
   rejected-methods catalog, is archived at
   `paper/archive/prismascout_paper_2026-06-05.tex`.
-- **`.claude/prismaquant-handover-*.md`** — session history, newest first. Useful
+- **`docs/handovers/prismaquant-handover-*.md`** (moved from `.claude/`
+  2026-07-30; gitignored, local-only) — session history, newest first. Useful
   for narrative arc; **assume the "open items" are stale** (the 2026-05-28 one
   lists the cancelled JSO A/B). Codex/Gemini deliberations: `.claude/codex-*`,
   `scratch/deliberation/`.

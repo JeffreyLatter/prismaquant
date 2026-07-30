@@ -58,6 +58,13 @@ Before implementing new functionality, read this file,
    dependencies already installed. For GPU runs, validation, export, and
    large-model experiments, use those working containers first instead of
    assuming the host Python environment is sufficient or rebuilding ad hoc.
+10. **Keep `docs/ARCHITECTURE.md` current in the same commit.** A change to
+    pipeline defaults, the stage graph, the format menu, the plugin contract,
+    serving-lane defaults, or ship gates is incomplete until
+    `docs/ARCHITECTURE.md` (and its diagrams, if topology changed) reflects it
+    and its provenance block is re-stamped. `tests/test_docs_staleness.py` and
+    `tests/test_architecture_doc.py` enforce the mechanical subset. Dated
+    results docs and handovers are append-only history, never a substitute.
 
 ## Implementation Checklist
 
