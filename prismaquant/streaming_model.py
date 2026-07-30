@@ -77,6 +77,7 @@ from .layer_streaming import (
     _unload,
     set_module_tensor_to_device,
 )
+from .tied_embeddings import resolve_tied_output_embedding
 
 
 def _minimax_native_fp8_checkpoint(model_path: str) -> bool:
@@ -985,6 +986,15 @@ def _build_streaming_context(model_path: str, *,
         dtype,
         fp8_scale_inv_map=fp8_scale_inv_map,
     )
+    # Weight tying: a `tie_word_embeddings` checkpoint ships no
+    # `lm_head.weight`, so `_materialize` above has nothing to install and
+    # the head stays on meta — the first `model.lm_head(...)` (probe
+    # Phase-2 CE) or `m.weight.to(device)` (cost stage) then dies with
+    # "Cannot copy out of meta tensor". Resolve the alias through
+    # transformers' own embedding accessors (no name hardcoded: the VL
+    # wrapper's `model.language_model.embed_tokens` resolves like the
+    # plain `model.embed_tokens`).
+    resolve_tied_output_embedding(model, log_prefix=log_prefix)
     _init_rotary_inplace(base_model, device, dtype)
     print(f"{log_prefix} head materialized ({loaded_head} tensors, "
           f"rotary re-init) in {time.time()-t0:.1f}s", flush=True)

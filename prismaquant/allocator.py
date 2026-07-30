@@ -1007,6 +1007,42 @@ def incomplete_fused_group_dp_exclusions(
     return sorted(incomplete_members - set(allocation_excluded))
 
 
+def tied_lm_head_dp_exclusions(
+    stats: dict,
+    costs: dict,
+    model_profile,
+    model_path: str | None,
+    allocation_excluded=(),
+) -> list[str]:
+    """Linears to exclude from DP because they are a tied LM head.
+
+    When the checkpoint declares `tie_word_embeddings` and ships no head
+    tensor, `lm_head.weight` IS the input embedding — one storage, one set
+    of source bytes. Quantizing it would quantize every token embedding
+    (which the pipeline prices in the non-quantizable floor and no probe /
+    cost measurement observes), and there is no `lm_head.weight` in the
+    source manifest to move out of that floor. So the tie makes the head
+    structurally passthrough-only, independent of the serving profile's
+    pins: this exclusion deliberately ignores `--allow-pinned lm_head`,
+    which exists to trade an *independent* head's bytes for quality.
+
+    Post-fix probes emit no tied-head row at all (the shard schedule skips
+    it); this also covers probes built before that fix.
+    """
+    if not model_path:
+        return []
+    from .tied_embeddings import lm_head_is_tied_alias
+
+    if not lm_head_is_tied_alias(model_path, profile=model_profile):
+        return []
+    head = model_profile.lm_head_name()
+    excluded = {
+        name for name in (set(stats) | set(costs))
+        if name == head or name.endswith("." + head)
+    }
+    return sorted(excluded - set(allocation_excluded))
+
+
 def validate_final_serving_promotion_noop(
     before: dict[str, str],
     after: dict[str, str],
@@ -1426,6 +1462,14 @@ def main():
             if any(tok in name for tok in allow_pinned):
                 continue  # opt-in: let the allocator choose this name's format
             allocation_excluded.append(name)
+    tied_head_added = tied_lm_head_dp_exclusions(
+        stats, costs, model_profile, probe_model_path, allocation_excluded)
+    allocation_excluded.extend(tied_head_added)
+    if tied_head_added:
+        print(
+            "[alloc] tied LM head (shares storage with the non-quantizable "
+            f"input embedding) excluded from DP budget: {tied_head_added} "
+            "— not overridable by --allow-pinned", flush=True)
     if allow_pinned:
         print(f"[alloc] --allow-pinned active for {allow_pinned}: these "
               "profile-pinned names enter the DP budget (allocator chooses "

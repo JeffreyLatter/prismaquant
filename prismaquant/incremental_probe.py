@@ -686,14 +686,29 @@ def build_shard_schedule(
             sidx += len(vis_entries)
 
     if include_lm_head:
-        extras.append(ShardEntry(
-            shard_idx=sidx,
-            linear_include=rf"^{re.escape(lm_head_name)}$",
-            kind="lm_head",
-            layer_indices=frozenset(),
-            layer_prefix=None,
-        ))
-        sidx += 1
+        # A tied head (`tie_word_embeddings` declared AND no head tensor
+        # in the index) is an alias of the input embedding: same storage,
+        # no source bytes of its own. It is structurally passthrough-only
+        # — re-encoding it would re-encode the non-quantizable embedding
+        # — so it gets no Fisher row and no cost row. Same shape as the
+        # MTP skip above: config declares it, the index does not have it.
+        from .tied_embeddings import lm_head_is_tied_alias
+        if lm_head_is_tied_alias(model_path, profile=profile):
+            print(f"[shard-schedule] `{lm_head_name}` is a tied alias of the "
+                  "input embedding (config declares tie_word_embeddings and "
+                  "the safetensors index has no head tensor); skipping the "
+                  "lm_head shard — a tied head shares storage with the "
+                  "non-quantizable embedding and is never quantized",
+                  flush=True)
+        else:
+            extras.append(ShardEntry(
+                shard_idx=sidx,
+                linear_include=rf"^{re.escape(lm_head_name)}$",
+                kind="lm_head",
+                layer_indices=frozenset(),
+                layer_prefix=None,
+            ))
+            sidx += 1
 
     return ShardSchedule(entries=tuple(body_entries + extras))
 
@@ -3317,37 +3332,11 @@ def main():
             precomputed = cached
             return precomputed
         _ensure_ready()
-        # Tied-embedding repair: when `tie_word_embeddings=True` (Qwen
-        # 3.5/3.6 small variants, Llama-3.2-1B/3B, etc.), the streaming
-        # pipeline materializes embed_tokens but leaves lm_head on meta
-        # because the source has no separate lm_head shard. Manually
-        # alias lm_head.weight to the materialized embedding before
-        # the precompute, otherwise model.lm_head(...) returns a meta
-        # tensor and `.item()` fails.
-        try:
-            _model = ctx.model
-            _cfg = getattr(_model, "config", None)
-            if _cfg is not None and getattr(_cfg, "tie_word_embeddings", False):
-                _embed = None
-                for _path in ("model.embed_tokens",
-                              "model.language_model.embed_tokens",
-                              "transformer.wte"):
-                    try:
-                        _m = _model.get_submodule(_path)
-                        if hasattr(_m, "weight") and not _m.weight.is_meta:
-                            _embed = _m
-                            break
-                    except (AttributeError, KeyError):
-                        continue
-                if _embed is not None and hasattr(_model, "lm_head"):
-                    if _model.lm_head.weight.is_meta:
-                        _model.lm_head.weight = _embed.weight
-                        print(f"[incremental] tied lm_head.weight ← "
-                              f"embed_tokens.weight (meta repair)", flush=True)
-        except Exception as _e:
-            print(f"[incremental] WARN tied-embedding repair: {_e}",
-                  flush=True)
-
+        # (Tied-embedding repair used to live here, with a hardcoded list
+        # of embedding paths and a swallowed exception. It now happens
+        # once, for every consumer of a streaming context, inside
+        # `_build_streaming_context` via
+        # `tied_embeddings.resolve_tied_output_embedding`.)
         precomputed = _compute_global_precompute(
             ctx,
             calib=calib,

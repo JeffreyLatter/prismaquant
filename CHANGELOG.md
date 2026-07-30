@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.4.1 — 2026-07-30
+
+Tied-embedding models could not be quantized at all. Found by running the
+pipeline on a real checkpoint rather than by reading code.
+
+### A tied `lm_head` is structurally non-quantizable
+
+On `google/gemma-4-31b-it` the cost stage cleared all 60 body layers, skipped the
+vision-tower shards, then died on the `lm_head` shard with
+`NotImplementedError: Cannot copy out of meta tensor`. Cause: the config declares
+`tie_word_embeddings: True` and the checkpoint ships **no `lm_head` tensor at
+all** — only `model.language_model.embed_tokens.weight` — so `lm_head.weight` is
+a tied alias that nothing materialized. `tie_word_embeddings` appeared nowhere in
+the streaming or cost path; there was no weight-tying support. Every
+tied-embedding model hit this, which is most of the Gemma family; it went
+unnoticed because every shipped artifact (Qwen3.6-27B, Qwen3.5-35B-A3B, Hy3) is
+untied.
+
+The head is now **materialized** (phase-2's CE backward runs through it, so meta
+is never acceptable) via transformers' own `get_output_embeddings()` /
+`get_input_embeddings()` accessors, so no embedding path is hardcoded and the
+VL-prefixed name resolves like the plain one. Detection is from the config
+declaration plus the index's absence of a head tensor — never a name guess. A
+meta head with **no** declared tie now raises immediately instead of surfacing
+thousands of lines later.
+
+And a tied head is **excluded from probe, cost and the DP**, rather than
+measured. Tying means one `Parameter`: quantizing the head would quantize the
+embedding, and the surrogate cannot see that cost — probe and cost measure only
+the head's output MSE, while the identical perturbation enters every token
+embedding and thus layer 0's input for the whole forward, which no surrogate and
+not even the L2 perturbed-X fixed point observes. There is also nothing to
+re-encode: a tied source has no `lm_head.weight` bytes, so the footprint would
+either fail to resolve the name or subtract the embedding from the floor while it
+still ships verbatim. The codebase had already reached this conclusion in one
+place — `aura_cost.py` hard-raises on a tied head with the same argument — so
+this makes automatic what was an operator instruction, and extends it to the
+L1/L2 path AURA does not cover. The exclusion deliberately ignores
+`--allow-pinned lm_head`, because the tie is a property of the checkpoint rather
+than of the serving profile.
+
+Also removed: an ad-hoc repair in the probe that hardcoded three embedding names
+inside a `try/except Exception` that only warned.
+
+### Measured end to end
+
+With this fix, Gemma4-31B completes **probe → cost → allocate → export** for the
+first time. The probe was already passing (411 rows, all nonzero `h_trace`, 60
+layers); cost now completes with zero errors; the allocator hits
+`achieved_bits=6.000` with a genuinely heterogeneous 244 NVFP4 / 119 FP8 / 27
+BF16 assignment; and the export writes a 27.18 GB compressed-tensors artifact
+whose `config_groups` carry 4-bit `tensor_group` and 8-bit `channel` schemes,
+with `tie_word_embeddings` preserved and **no `lm_head` tensor** — the embedding
+ships once, so the tie is not silently materialized into duplicated bytes.
+
+That run used a deliberately tiny calibration (2 samples, seqlen 512) to reach
+failures fast. **It is an enablement result, not a quality claim** — the artifact
+has not been served and no KL/PPL has been measured.
+
 ## 0.4.0 — 2026-07-30
 
 Closes #29 and lands the KV-cotangent path, which removes the default-off guard
