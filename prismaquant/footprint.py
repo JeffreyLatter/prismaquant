@@ -35,6 +35,18 @@ ships two fp32 global sidecars per emitted 2-D Linear (``weight_global_scale``
 + ``input_global_scale``, 8 bytes) that ``memory_bytes_for_shape`` does not
 count; :func:`nvfp4_global_sidecar_bytes` adds them (per expert × on-disk
 projection for packed 3-D tensors).
+
+There is exactly ONE way to run that identity: :func:`assignment_artifact_bytes`
+(and :func:`floor_bytes_for_model` for the model-path convenience form, which
+shares the same resolve/check helpers). Every consumer — the byte-budget ship
+selector included — goes through it, so no second copy of the accounting can
+drift from the one the tests pin. The ``Σ_reencoded`` term is priced from the
+per-tensor :class:`SourceByteManifest`, and both ways of getting it wrong are
+hard errors, never warnings: a re-encoded name the manifest cannot resolve
+(source bytes left in the floor -> artifact over-count) and two re-encoded names
+resolving to the SAME source span (bytes removed twice -> artifact under-count,
+so an over-budget artifact "fits"). Both are caught in
+:func:`resolve_reencoded_source_bytes` before any number is consumed.
 """
 from __future__ import annotations
 
@@ -180,11 +192,45 @@ def packed_expert_alias(qname: str, parent_for_projection=None) -> str | None:
     return ".".join(parts[:-2] + [str(parent)])
 
 
+class SourceByteManifest(dict):
+    """``{live_qname: source_bytes}`` that remembers WHICH spans it summed.
+
+    :func:`source_tensor_bytes_manifest` deliberately stores a per-expert
+    Linear's bytes twice — once under its own name, once accumulated into
+    the packed-parent aggregate — so that either naming scheme resolves.
+    The two entries therefore OVERLAP: charging both
+    ``…experts.0.gate_proj`` and ``…experts.gate_up_proj`` subtracts the
+    same on-disk bytes from the floor twice, under-counting the artifact by
+    the whole expert mass (an over-budget artifact then "fits", and
+    :func:`check_floor_non_negative` only notices when the over-subtraction
+    exceeds the entire floor).
+
+    ``spans[live_qname]`` is the frozenset of *checkpoint base keys* whose
+    byte spans that entry's total was summed from — the underlying source
+    identity, not the allocator's naming of it. Two requested names whose
+    span sets intersect are double-charging the intersection, which
+    :func:`resolve_reencoded_source_bytes` can then detect structurally
+    instead of trusting a docstring convention.
+
+    It is a plain ``dict`` subclass so every existing consumer (and every
+    hand-built test manifest) keeps working; ``spans`` is simply absent on a
+    plain dict, in which case the overlap check is skipped and the resolver
+    says so. NB ``dict.copy()`` / ``{**m}`` drop the provenance — pass the
+    manifest object through rather than re-wrapping it.
+    """
+
+    __slots__ = ("spans",)
+
+    def __init__(self, *args, spans=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spans: dict[str, frozenset[str]] = dict(spans or {})
+
+
 def source_tensor_bytes_manifest(
     model_path: str,
     name_map=None,
     expert_parent_for_projection=None,
-) -> dict[str, int]:
+) -> SourceByteManifest:
     """Exact on-disk source bytes per weight tensor, keyed by live qname base.
 
     Walks the safetensors headers and, for every weight tensor, sums its
@@ -211,7 +257,11 @@ def source_tensor_bytes_manifest(
       gate/up/down fallback when None). The per-expert entries are kept
       alongside the packed aggregate so per-expert-named allocations
       resolve too — a ``reencoded_names`` list must use ONE naming scheme
-      per tensor (any consistent probe does), never both.
+      per tensor (any consistent probe does), never both. That is no
+      longer a convention: the returned :class:`SourceByteManifest` carries
+      the checkpoint keys behind every entry in ``.spans``, and
+      :func:`resolve_reencoded_source_bytes` rejects a request whose names
+      resolve to overlapping source spans.
 
     This is the per-tensor replacement for the regime-wide
     ``reencoded_source_bytes_for_shape`` accounting, which charges EVERY
@@ -239,10 +289,12 @@ def source_tensor_bytes_manifest(
                 continue
             a, b = meta["data_offsets"]
             spans[name] = spans.get(name, 0) + (int(b) - int(a))
-    out: dict[str, int] = {}
+    out = SourceByteManifest()
+    provenance: dict[str, set[str]] = {}
 
-    def _add(live: str, nb: int) -> None:
+    def _add(live: str, nb: int, span_key: str) -> None:
         out[live] = out.get(live, 0) + nb
+        provenance.setdefault(live, set()).add(span_key)
 
     for name, nb in spans.items():
         if any(name.endswith(s) for s in _SIDECAR_SUFFIXES):
@@ -264,10 +316,15 @@ def source_tensor_bytes_manifest(
         live = (name_map(name) if name_map is not None else name) or name
         if live.endswith(".weight"):
             live = live[: -len(".weight")]
-        _add(live, total)
+        # `base` (the checkpoint key without .weight) is the SOURCE identity:
+        # unique per checkpoint tensor, and shared by the per-expert entry and
+        # the packed aggregate that both cover it. That shared key is what
+        # makes the double-charge structurally detectable.
+        _add(live, total, base)
         packed = packed_expert_alias(live, expert_parent_for_projection)
         if packed is not None:
-            _add(packed, total)
+            _add(packed, total, base)
+    out.spans = {k: frozenset(v) for k, v in provenance.items()}
     return out
 
 
@@ -276,6 +333,7 @@ def resolve_reencoded_source_bytes(
     reencoded_names: Iterable[str],
     *,
     context: str,
+    spans: Mapping[str, Iterable[str]] | None = None,
 ) -> dict[str, int]:
     """Look up each re-encoded Linear's actual source bytes in the manifest.
 
@@ -287,17 +345,46 @@ def resolve_reencoded_source_bytes(
     numbers are computed, puts the offending tensor names in front of the
     operator instead of a fatal below-the-floor exit with a trailing
     warning.
+
+    Two names resolving to the SAME underlying source span is the opposite
+    error and is rejected too. The manifest stores a per-expert Linear both
+    under its own name and inside its packed-parent aggregate (so either
+    naming scheme resolves); summing both subtracts those bytes from the
+    floor twice, under-counting the artifact by the whole expert mass so an
+    over-budget allocation "fits" — and ``check_floor_non_negative`` only
+    catches it once the over-subtraction exceeds the entire floor. The
+    per-span provenance (``SourceByteManifest.spans``, or an explicit
+    ``spans`` argument for a hand-built manifest) makes it structurally
+    detectable: every legitimate request charges each checkpoint span at
+    most once. A bare ``dict`` manifest carries no provenance, so the check
+    is unavailable and skipped — every production manifest comes from
+    :func:`source_tensor_bytes_manifest` and therefore carries it.
     """
+    span_map = spans if spans is not None else getattr(manifest, "spans", None)
     out: dict[str, int] = {}
     missing: list[str] = []
+    # checkpoint span key -> the first requested name that charged it.
+    claimed: dict[str, str] = {}
+    overlaps: list[tuple[str, str, str]] = []
     for qname in reencoded_names:
-        nb = manifest.get(qname)
+        key = qname
+        nb = manifest.get(key)
         if nb is None and qname.endswith(".weight"):
-            nb = manifest.get(qname[: -len(".weight")])
+            key = qname[: -len(".weight")]
+            nb = manifest.get(key)
         if nb is None:
             missing.append(qname)
-        else:
-            out[qname] = int(nb)
+            continue
+        out[qname] = int(nb)
+        if span_map is None:
+            continue
+        for span_key in span_map.get(key, ()):
+            first = claimed.setdefault(span_key, qname)
+            # Same name requested twice is idempotent (``out`` is keyed by
+            # name, so it is summed once); only DISTINCT names sharing a
+            # span are a double charge.
+            if first != qname:
+                overlaps.append((first, qname, span_key))
     if missing:
         shown = sorted(missing)[:10]
         raise ValueError(
@@ -312,6 +399,25 @@ def resolve_reencoded_source_bytes(
             "resolution (checkpoint_to_live_name / "
             "packed_expert_parent_for_projection) so every re-encoded "
             "tensor resolves; do not consume these numbers.")
+    if overlaps:
+        shown = sorted(overlaps)[:10]
+        detail = "; ".join(
+            f"{a!r} + {b!r} both cover {span!r}" for a, b, span in shown)
+        double_charged = sum(
+            int(manifest.get(b, 0)) for b in {b for _a, b, _s in overlaps})
+        raise ValueError(
+            f"[footprint] {len(overlaps)} re-encoded source span(s) charged "
+            f"twice ({context}): {detail}"
+            + (", …" if len(overlaps) > len(shown) else "")
+            + f". Roughly {double_charged / GB:.3f}GB of source bytes would be "
+            "subtracted from the non-quantizable floor twice, under-counting "
+            "the artifact by that much — an over-budget artifact then reads as "
+            "fitting the byte budget, and the negative-floor guard only fires "
+            "if the over-subtraction exceeds the ENTIRE floor. The manifest "
+            "stores a per-expert Linear both under its own name and inside its "
+            "packed-parent aggregate so that either naming scheme resolves; a "
+            "re-encoded-name list must therefore use ONE naming scheme per "
+            "tensor (all per-expert, or all packed), never both.")
     return out
 
 
@@ -428,9 +534,10 @@ def assignment_artifact_bytes(
     stats: Mapping[str, dict],
     *,
     source_total_bytes: int,
+    source_manifest: Mapping[str, int] | None,
     regime: str = "bf16",
     canonicalize: bool = True,
-    source_manifest: Mapping[str, int] | None = None,
+    context: str = "assignment_artifact_bytes",
 ) -> dict:
     """Exact on-disk bytes of the exported artifact for ``assignment``.
 
@@ -438,43 +545,60 @@ def assignment_artifact_bytes(
     post-promotion per-Linear assignment, so fused-sibling / packed-MoE coupling
     is already reflected). ``stats`` is the probe's per-Linear stats (carries
     ``n_params`` and the ``in/out_features`` / ``num_experts`` the byte formula
-    needs). Names absent from ``stats`` are *not* a problem: they are simply not
-    subtracted from the floor, so they remain counted at source precision — which
-    is correct for any tensor that ships verbatim (and explains why a handful of
-    fused super-names / pins can be missing yet the total stays exact).
+    needs). Names absent from ``stats`` are *not* a problem here: they are simply
+    not subtracted from the floor, so they remain counted at source precision —
+    which is correct for any tensor that ships verbatim (and explains why a
+    handful of fused super-names / pins can be missing yet the total stays
+    exact). They ARE a problem for a caller pricing an assignment it believes it
+    allocated in full, so they are named in ``missing_stats_names`` for such a
+    caller to refuse on (the byte-budget selector does).
 
     ``source_manifest`` (from :func:`source_tensor_bytes_manifest`) is the
-    preferred source-byte accounting and the one
-    :func:`floor_bytes_for_model` and the allocator's byte-budget selector
-    use: each re-encoded Linear is charged its ACTUAL header byte span
-    (weight + scale siblings), so the two paths agree exactly. A priced
-    Linear the manifest cannot resolve is a hard error
+    exact source-byte accounting and the one :func:`floor_bytes_for_model`
+    and the allocator's byte-budget selector use: each re-encoded Linear is
+    charged its ACTUAL header byte span (weight + scale siblings), so the
+    two paths agree exactly. A priced Linear the manifest cannot resolve —
+    or two priced names resolving to the same source span — is a hard error
     (:func:`resolve_reencoded_source_bytes`).
 
-    Without a manifest, ``regime`` ('bf16' | 'fp8', from source_regime) sets
-    each re-encoded Linear's *source* byte size removed from the floor:
-    bf16 -> 2 bytes/param; fp8 -> the full FP8_SOURCE layout (fp8 weight +
-    fp32 128x128 weight_scale_inv), so the source scale sibling is removed
-    too (else it is double-counted: left in the floor and re-added by the
-    export). This is exact ONLY for a uniformly-bf16 or uniformly-fp8
-    (128x128-block-scaled) body; on any other source pass a manifest — a
-    mixed source drives the floor negative and is rejected
-    (``check_floor_non_negative``), never silently shipped.
+    It is a REQUIRED keyword with no default. The regime-wide fallback below
+    is a legacy approximation that is exact only on a uniform source, and a
+    caller cannot be allowed to reach it by *omission* — a forgotten kwarg
+    is invisible in review, whereas an explicit ``source_manifest=None`` is
+    greppable and states the intent. (The old default was ``None``, i.e.
+    every caller that forgot the manifest silently got the approximation
+    while the docstring restricted it to uniform sources.)
+
+    With ``source_manifest=None``, ``regime`` ('bf16' | 'fp8', from
+    source_regime) sets each re-encoded Linear's *source* byte size removed
+    from the floor: bf16 -> 2 bytes/param; fp8 -> the full FP8_SOURCE layout
+    (fp8 weight + fp32 128x128 weight_scale_inv), so the source scale
+    sibling is removed too (else it is double-counted: left in the floor and
+    re-added by the export). This is exact ONLY for a uniformly-bf16 or
+    uniformly-fp8 (128x128-block-scaled) body, and is for callers that hold
+    ``source_total_bytes`` without the checkpoint on disk; on any other
+    source pass a manifest — a mixed source drives the floor negative and is
+    rejected (``check_floor_non_negative``), never silently shipped. The
+    returned ``source_accounting`` field always says which path ran.
+
+    ``context`` labels this call in the hard-error messages
+    (``resolve_reencoded_source_bytes`` / ``check_floor_non_negative``) so a
+    sweeping caller can name the rung it was pricing.
 
     Returns a dict: ``artifact_bytes``, ``floor_bytes``, ``body_quant_bytes``,
     ``reencoded_source_bytes``, ``n_reencoded``, ``n_missing_stats``,
-    ``regime``, ``source_accounting``.
+    ``missing_stats_names``, ``regime``, ``source_accounting``.
     """
     body_quant = 0
     reenc_by_name: dict[str, int] = {}
     priced: list[str] = []
-    n_missing = 0
+    missing_stats: list[str] = []
     for qname, fmt in assignment.items():
         entry = stats.get(qname)
         if entry is None and qname.endswith(".weight"):
             entry = stats.get(qname[: -len(".weight")])
         if not isinstance(entry, dict):
-            n_missing += 1
+            missing_stats.append(qname)
             continue
         shape = _shape_from_stats(entry)
         name = fr.canonical_format_name(fmt) if canonicalize else fmt
@@ -487,19 +611,19 @@ def assignment_artifact_bytes(
         priced.append(qname)
     if source_manifest is not None:
         reenc_by_name = resolve_reencoded_source_bytes(
-            source_manifest, priced, context="assignment_artifact_bytes")
+            source_manifest, priced, context=context)
     reenc_src = sum(reenc_by_name.values())
     floor = int(source_total_bytes) - reenc_src
     check_floor_non_negative(
-        floor, int(source_total_bytes), reenc_by_name,
-        context="assignment_artifact_bytes")
+        floor, int(source_total_bytes), reenc_by_name, context=context)
     return {
         "artifact_bytes": floor + body_quant,
         "floor_bytes": floor,
         "body_quant_bytes": body_quant,
         "reencoded_source_bytes": reenc_src,
         "n_reencoded": len(priced),
-        "n_missing_stats": n_missing,
+        "n_missing_stats": len(missing_stats),
+        "missing_stats_names": sorted(missing_stats),
         "regime": regime,
         "source_accounting": (
             "per_tensor_manifest" if source_manifest is not None else "regime"),
@@ -511,10 +635,15 @@ def assignment_artifact_gb(
     stats: Mapping[str, dict],
     *,
     source_total_bytes: int,
+    source_manifest: Mapping[str, int] | None,
     regime: str = "bf16",
-    source_manifest: Mapping[str, int] | None = None,
 ) -> float:
-    """Convenience: just the artifact size in GB (decimal, matches index.json)."""
+    """Convenience: just the artifact size in GB (decimal, matches index.json).
+
+    ``source_manifest`` is required for the same reason as in
+    :func:`assignment_artifact_bytes`; pass ``None`` to opt into the
+    regime-wide approximation explicitly.
+    """
     return assignment_artifact_bytes(
         assignment, stats,
         source_total_bytes=source_total_bytes,

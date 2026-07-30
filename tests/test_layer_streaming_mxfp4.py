@@ -1,4 +1,4 @@
-"""MXFP4 streaming dequant (DSv4-Flash routed experts) — CPU-only.
+"""MXFP4 streaming dequant (DSv4-Flash routed + shared experts) — CPU-only.
 
 Covers the 2026-07 review of the DSv4 probe-enablement PR:
 
@@ -14,6 +14,11 @@ c) E8M0 `0xFF` decodes every element of its block to NaN (per the OCP
    spec), not `+inf`.
 d) The batched shape-group decode matches the reference across chunk
    boundaries.
+e) The declaration's SCOPE is every expert tensor it speaks for — routed
+   (per-expert index) and shared (no index, `mlp.shared_experts.*`).
+   Widening the scope did not widen the trigger: no declaration still
+   means no nibble decode, the packed grid is still an assertion, and
+   non-expert tensors still flow through `_check_fp8_scale_grid`.
 """
 import json
 import math
@@ -58,13 +63,18 @@ def _scalar_reference_decode(packed: torch.Tensor,
 def _write_dsv4_checkpoint(tmp_path, experts: dict[int, tuple],
                            attn_fp8: tuple | None = None,
                            declare_fp4: bool = True,
-                           scale_fmt: str | None = "ue8m0"):
+                           scale_fmt: str | None = "ue8m0",
+                           shared_expert: tuple | None = None):
     """Minimal DSv4-style checkpoint: `.scale` siblings, flat naming,
     `expert_dtype` declared at config top level (as DeepSeek-V4-Flash
     ships it) next to a block-FP8 quantization_config.
 
     `scale_fmt=None` omits the scale-format declaration (real DSv4-Flash
-    ships `expert_dtype` without one)."""
+    ships `expert_dtype` without one).
+
+    `shared_expert=(packed, scale)` adds the layer's SHARED expert
+    (`layers.0.ffn.shared_experts.w1`) — one MLP per layer, so unlike a
+    routed expert its name carries no per-expert index."""
     cfg = {
         "model_type": "deepseek_v4",
         "architectures": ["DeepseekV4ForCausalLM"],
@@ -83,6 +93,10 @@ def _write_dsv4_checkpoint(tmp_path, experts: dict[int, tuple],
     for eid, (packed, scale) in experts.items():
         tensors[f"layers.0.ffn.experts.{eid}.w1.weight"] = packed
         tensors[f"layers.0.ffn.experts.{eid}.w1.scale"] = scale
+    if shared_expert is not None:
+        packed, scale = shared_expert
+        tensors["layers.0.ffn.shared_experts.w1.weight"] = packed
+        tensors["layers.0.ffn.shared_experts.w1.scale"] = scale
     if attn_fp8 is not None:
         w, s = attn_fp8
         tensors["layers.0.attn.q_proj.weight"] = w
@@ -102,6 +116,11 @@ def _rand_expert(rows=4, packed_in=32, seed=0, scale_range=(100, 200)):
 
 def _live(eid):
     return f"model.layers.0.mlp.experts.{eid}.gate_proj.weight"
+
+
+# Shared-expert live qname (checkpoint `ffn.shared_experts.w1` -> live
+# `mlp.shared_experts.gate_proj`, per DeepseekV4Profile).
+_LIVE_SHARED = "model.layers.0.mlp.shared_experts.gate_proj.weight"
 
 
 # ---------------------------------------------------------------------------
@@ -330,3 +349,139 @@ def test_batched_decode_matches_reference_across_chunks(tmp_path, monkeypatch):
     for eid, (packed, scale) in experts.items():
         _assert_bitwise_equal_bf16(
             out[_live(eid)], _scalar_reference_decode(packed, scale))
+
+
+# ---------------------------------------------------------------------------
+# e) the declaration covers SHARED experts too (issue #26)
+#
+# DSv4's shared experts are `mlp.shared_experts.*` — one MLP per layer, so
+# no per-expert index — and the routed-only `\.experts\.\d+\.` pattern
+# excluded them structurally. A declared-MXFP4 shared expert therefore fell
+# through to the block-FP8 broadcast and died on its scale-grid assertion.
+# The trigger is still only the config declaration; the packed grid is still
+# only an assertion.
+# ---------------------------------------------------------------------------
+
+def test_declared_shared_expert_is_covered_by_the_declaration(tmp_path):
+    routed, routed_s = _rand_expert(seed=21)
+    # A shared expert is sized by moe_intermediate_size, so it is a
+    # DIFFERENT shape from a routed expert here on purpose: step 3b groups
+    # by shape, and the shared tensor must simply form its own group.
+    shared, shared_s = _rand_expert(rows=6, packed_in=48, seed=22)
+    attn = (torch.randn(128, 128).to(torch.float8_e4m3fn),
+            torch.ones(1, 1, dtype=torch.float32))
+    _write_dsv4_checkpoint(tmp_path, {0: (routed, routed_s)},
+                           attn_fp8=attn,
+                           shared_expert=(shared, shared_s))
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    assert fp8_map.mxfp4_names == {_live(0), _LIVE_SHARED}
+    # The non-expert fp8 tensor is untouched by the widening.
+    assert "model.layers.0.self_attn.q_proj.weight" in fp8_map
+    assert ("model.layers.0.self_attn.q_proj.weight"
+            not in fp8_map.mxfp4_names)
+
+
+def test_declared_shared_expert_decodes_bit_exactly(tmp_path):
+    """The whole point of the fix: a declared-MXFP4 shared expert decodes
+    on the nibble path, bit-exact against the independent scalar
+    reference, instead of raising out of the block-FP8 guard."""
+    routed, routed_s = _rand_expert(seed=31)
+    shared, shared_s = _rand_expert(rows=6, packed_in=48, seed=32)
+    _write_dsv4_checkpoint(tmp_path, {0: (routed, routed_s)},
+                           shared_expert=(shared, shared_s))
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    out = {_live(0): routed.clone(), _LIVE_SHARED: shared.clone()}
+    assert _apply_fp8_dequant_inplace(out, fp8_map, CPU) == 2
+    assert out[_LIVE_SHARED].shape == (6, 96)
+    _assert_bitwise_equal_bf16(
+        out[_LIVE_SHARED], _scalar_reference_decode(shared, shared_s))
+    _assert_bitwise_equal_bf16(
+        out[_live(0)], _scalar_reference_decode(routed, routed_s))
+
+
+def test_undeclared_shared_expert_is_not_decoded_as_nibbles(tmp_path):
+    """No declaration, no MXFP4 decode — the widening moved the
+    declaration's *scope*, not the trigger."""
+    shared, shared_s = _rand_expert(rows=6, packed_in=48, seed=41)
+    _write_dsv4_checkpoint(tmp_path, {}, declare_fp4=False,
+                           shared_expert=(shared, shared_s))
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    assert _LIVE_SHARED in fp8_map
+    assert fp8_map.mxfp4_names == frozenset()
+
+
+def test_declared_shared_expert_with_wrong_layout_raises_loudly(tmp_path):
+    """If a real declared-fp4 checkpoint turns out to ship block-FP8 shared
+    experts, the packed-grid ASSERTION fires with the exact mismatch — it
+    is never a trigger, so nothing is silently reinterpreted."""
+    shared = torch.randn(128, 128).to(torch.float8_e4m3fn)
+    shared_s = torch.ones(1, 1, dtype=torch.float32)
+    _write_dsv4_checkpoint(tmp_path, {}, shared_expert=(shared, shared_s))
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    assert fp8_map.mxfp4_names == {_LIVE_SHARED}
+    out = {_LIVE_SHARED: shared.clone()}
+    with pytest.raises(ValueError, match="declared MXFP4"):
+        _apply_fp8_dequant_inplace(out, fp8_map, CPU)
+
+
+def test_non_expert_tensor_still_flows_through_check_fp8_scale_grid(tmp_path):
+    """The widened set must not swallow non-expert tensors: a transposed
+    block-scale grid on an attention projection still fails loudly through
+    `_check_fp8_scale_grid`, in a checkpoint that DOES declare fp4
+    experts."""
+    routed, routed_s = _rand_expert(seed=51)
+    # 256x128 weight at block 128x128 expects a (2, 1) scale grid; ship the
+    # numel-compatible transpose (1, 2), which reshapes silently without
+    # the assertion.
+    attn_w = torch.randn(256, 128).to(torch.float8_e4m3fn)
+    attn_s = torch.ones(1, 2, dtype=torch.float32)
+    _write_dsv4_checkpoint(tmp_path, {0: (routed, routed_s)},
+                           attn_fp8=(attn_w, attn_s))
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    attn_live = "model.layers.0.self_attn.q_proj.weight"
+    assert attn_live not in fp8_map.mxfp4_names
+    out = {attn_live: attn_w.clone()}
+    with pytest.raises(ValueError, match="transposed"):
+        _apply_fp8_dequant_inplace(out, fp8_map, CPU)
+
+
+def test_declared_expert_dtype_covers_scope():
+    """Name-shape scope of the declaration, spelled out: routed (indexed),
+    shared (unindexed, both spellings), and nothing else — in particular
+    not the router's `shared_expert_gate`."""
+    from prismaquant.autoscale import declared_expert_dtype_covers
+
+    for name in (
+        "model.layers.0.mlp.experts.7.gate_proj.weight",   # routed, live
+        "layers.0.ffn.experts.7.w1.weight",                # routed, DSv4 ckpt
+        "model.layers.0.mlp.shared_experts.gate_proj.weight",
+        "layers.0.ffn.shared_experts.w1.weight",           # shared, DSv4 ckpt
+        "model.layers.0.mlp.shared_expert.up_proj.weight",  # Qwen spelling
+    ):
+        assert declared_expert_dtype_covers(name), name
+    for name in (
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.mlp.gate.weight",                  # router
+        "model.layers.0.mlp.shared_expert_gate.weight",    # router gate
+        "model.layers.0.input_layernorm.weight",
+        "model.embed_tokens.weight",
+    ):
+        assert not declared_expert_dtype_covers(name), name
+
+
+def test_layer_cache_estimate_prices_declared_fp4_shared_expert(tmp_path):
+    """The resident-size estimators key on the same declaration scope, so a
+    declared-MXFP4 shared expert is not left with the 4x undercount that
+    makes prefetch refuse layers that actually fit."""
+    from prismaquant.streaming_model import _estimate_layer_cache_bytes
+    shard = str(tmp_path / "model.safetensors")
+    save_file({_LIVE_SHARED: torch.zeros(6, 48, dtype=torch.int8)}, shard)
+    kw = dict(weight_shard={_LIVE_SHARED: shard},
+              weight_ckpt={_LIVE_SHARED: _LIVE_SHARED},
+              layers_prefix="model.layers.", num_layers=1,
+              target_dtype=torch.bfloat16)
+    _est, sizes = _estimate_layer_cache_bytes(fp4_experts=True, **kw)
+    assert sizes[0] == 6 * 48 * 2 * 2
+    _est_u, sizes_undeclared = _estimate_layer_cache_bytes(
+        fp4_experts=False, **kw)
+    assert sizes_undeclared[0] == 6 * 48 * 1

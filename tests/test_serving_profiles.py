@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+import dataclasses
+
+import pytest
+
+import prismaquant.format_registry as fr
 from prismaquant.serving_profiles import (
+    ExportLaneSpec,
     ServingProfile,
     check_serving_format,
     check_serving_shape,
+    lane_emittable_formats,
     load_serving_profile,
     serving_profile_names,
 )
 
 
 VLLM_PROFILE = "vllm_packed_moe"
+
+# Representative qnames for the two format-rule scopes every packed-MoE
+# profile keys on.
+DENSE_QNAME = "model.layers.0.self_attn.q_proj"
+EXPERT_QNAME = "model.layers.0.mlp.experts.gate_up_proj"
+
+ALL_FORMAT_NAMES = tuple(sorted(set(fr.REGISTRY) | set(fr.FORMAT_ALIASES)))
 
 
 def test_serving_profile_names_are_config_discovered():
@@ -273,3 +287,197 @@ def test_runtime_shape_validators_can_be_name_scoped(monkeypatch):
     assert not expert.legal
     assert expert.rule == "expert_runtime"
     assert calls == [("MXFP8_E4M3", 256, 256)]
+
+
+# ---------------------------------------------------------------------------
+# Export-lane bound: a serving profile must not be able to admit a format
+# its lane's exporter cannot emit (issue #22 part 2).
+#
+# The bound is derived from each exporter's OWN declaration
+# (export_native_compressed.FORMAT_SCHEME for the compressed-tensors lane,
+# gguf_formats.GGUF_BLOCK_BYTES for the GGUF lane), so these tests pin the
+# derivation against the exporters' real accept/reject behaviour rather than
+# re-listing formats.
+# ---------------------------------------------------------------------------
+
+
+def _shipped_profiles() -> list[ServingProfile]:
+    return [load_serving_profile(name) for name in serving_profile_names()]
+
+
+def test_every_shipped_profile_is_lane_bound_or_declared_emulation_only():
+    """Fail-closed authoring gate. A new serving profile either names the
+    exporter that bounds its menu or declares itself emulation-only; it
+    cannot silently ship an unbounded production menu."""
+    for profile in _shipped_profiles():
+        assert profile.emulation_only or profile.export_lane is not None, (
+            f"serving profile {profile.id!r} declares neither an "
+            f"export_lane nor emulation_only: its format menu is not bounded "
+            f"by any exporter, so the allocator could spend budget on a rung "
+            f"that hard-fails (or silently BF16-coerces) at export."
+        )
+        # Not both: a lane-bound profile that also claimed emulation-only
+        # would read as exempt while carrying an exporter.
+        assert not (profile.emulation_only and profile.export_lane is not None)
+
+
+def test_research_profile_is_the_declared_emulation_only_exemption():
+    """`research` is deliberately unbounded: it exists so rungs with no
+    served path stay measurable in the emulation harness. Nothing ships
+    under it — export stages resolve a real serving profile."""
+    research = load_serving_profile("research")
+    assert research.emulation_only is True
+    assert research.export_lane is None
+    assert lane_emittable_formats("research") is None
+    for fmt in ("MXFP6_E3M2", "INT4_W4A16_g128", "NVFP4A16", "MXFP8A16",
+                "INT8_W8A16", "Q4_K"):
+        assert check_serving_format("research", DENSE_QNAME, fmt).legal, fmt
+
+
+@pytest.mark.parametrize("profile_id", ["vllm_packed_moe", "gguf"])
+def test_production_profile_never_admits_an_unexportable_format(profile_id):
+    """The invariant: effective-legal ⊆ exporter-emittable, for every
+    registered format and both rule scopes."""
+    emittable = lane_emittable_formats(profile_id)
+    assert emittable
+    for qname in (DENSE_QNAME, EXPERT_QNAME, "model.layers.0.mlp.down_proj"):
+        for fmt in ALL_FORMAT_NAMES:
+            if not check_serving_format(profile_id, qname, fmt).legal:
+                continue
+            assert fr.canonical_format_name(fmt) in emittable, (
+                f"{profile_id} admits {fmt} at {qname} but its exporter "
+                f"cannot emit it (emittable={sorted(emittable)})"
+            )
+
+
+@pytest.mark.parametrize("profile_id", ["vllm_packed_moe", "gguf"])
+def test_lane_bound_survives_a_widened_policy_rule(profile_id):
+    """Root-cause check, not a snapshot of today's deny lists: even with
+    every policy rule stripped away, the lane still refuses formats the
+    exporter cannot emit. Widening an allow/deny list can therefore never
+    re-admit an unexportable rung."""
+    profile = load_serving_profile(profile_id)
+    unpoliced = dataclasses.replace(profile, format_rules=())
+    emittable = profile.export_lane.emittable_formats()
+    for fmt in ALL_FORMAT_NAMES:
+        decision = unpoliced.check_format(DENSE_QNAME, fmt)
+        expected = fr.canonical_format_name(fmt) in emittable
+        assert decision.legal is expected, fmt
+        if not expected:
+            assert decision.reason == "exporter_cannot_emit"
+            assert decision.rule == profile.export_lane.id
+
+
+def test_vllm_lane_denies_the_a16_rungs_with_a_structural_reason():
+    """The concrete regression: A16 rungs were legal for dense Linears on
+    the vLLM lane (the dense rule denies only MXFP4/MXFP8_E5M2/FP8_E5M2)
+    while `_quantize_2d` has no branch for them — and the bit-exact
+    re-encode short-circuit prices a weight-lossless A16 rung at dloss
+    0.0, the unbeatable global minimum."""
+    for fmt in ("NVFP4A16", "MXFP8A16", "INT8_W8A16", "INT4_W4A16_g128",
+                "MXFP6_E3M2", "MXFP6_E2M3", "Q4_K", "IQ4_XS"):
+        decision = check_serving_format(VLLM_PROFILE, DENSE_QNAME, fmt)
+        assert not decision.legal, fmt
+        assert decision.reason == "exporter_cannot_emit", fmt
+
+
+def test_vllm_lane_still_admits_the_whole_production_menu():
+    """Backwards compatibility: the bound must not narrow any format the
+    shipped recipes actually use (run-pipeline's FORMATS default is
+    NVFP4,FP8_DYNAMIC,BF16; FP8_SOURCE and MXFP8_E4M3 are in the menu)."""
+    for fmt in ("NVFP4", "FP8_E4M3", "FP8_DYNAMIC", "FP8", "MXFP8_E4M3",
+                "MXFP8", "BF16", "FP8_SOURCE"):
+        assert check_serving_format(VLLM_PROFILE, DENSE_QNAME, fmt).legal, fmt
+    for fmt in ("NVFP4", "FP8_E4M3", "MXFP8_E4M3", "MXFP4", "BF16"):
+        assert check_serving_format(VLLM_PROFILE, EXPERT_QNAME, fmt).legal, fmt
+
+
+def test_gguf_lane_admits_every_ggml_type_and_nothing_else():
+    """The GGUF lane's legitimate formats must be untouched — the bound is
+    per-lane, derived from the GGUF codec table, not from the
+    compressed-tensors exporter."""
+    from prismaquant.gguf_formats import GGUF_BLOCK_BYTES
+
+    q = "model.layers.0.mlp.down_proj"
+    for fmt in GGUF_BLOCK_BYTES:
+        assert check_serving_format("gguf", q, fmt).legal, fmt
+    assert check_serving_format("gguf", q, "BF16").legal
+    assert lane_emittable_formats("gguf") == frozenset(
+        set(GGUF_BLOCK_BYTES) | {"BF16"})
+
+
+def test_compressed_tensors_lane_declaration_matches_exporter_behaviour():
+    """Anti-drift pin. Adding a `_quantize_2d` branch without a
+    FORMAT_SCHEME entry (or vice versa) breaks this, so the derived menu
+    can never silently diverge from what the exporter really does."""
+    import torch
+
+    from prismaquant.allocator_candidates import (
+        PASSTHROUGH_SOURCE_REQUIREMENTS,
+    )
+    import prismaquant.export_native_compressed as enc
+
+    emittable = lane_emittable_formats(VLLM_PROFILE)
+    # Every scheme the exporter can describe is either a codec format or a
+    # declared passthrough; nothing else is in the menu.
+    assert emittable == frozenset(
+        {fr.canonical_format_name(f) for f in enc.FORMAT_SCHEME} | {"BF16"})
+
+    # Canonical names only: `layer_config.canonicalize_format` resolves the
+    # FP8/FP8_DYNAMIC/MXFP8 aliases before an assignment reaches the
+    # exporter, so `_quantize_2d` is only ever handed a canonical name.
+    w = torch.randn(64, 256, dtype=torch.bfloat16)
+    for fmt in sorted(fr.REGISTRY):
+        if fmt in PASSTHROUGH_SOURCE_REQUIREMENTS:
+            # BF16 / FP8_SOURCE ship through the container's passthrough
+            # branches (plain bf16 tensor / verbatim fp8 + scale copy), not
+            # through the weight codec.
+            assert fmt in emittable, fmt
+            continue
+        if fmt in emittable:
+            assert enc._quantize_2d(w, fmt), fmt
+        else:
+            with pytest.raises(ValueError):
+                enc._quantize_2d(w, fmt)
+
+
+def test_gguf_lane_declaration_matches_the_exporters_own_gate():
+    """Both GGUF exporters gate emission on `fmt in GGUF_BLOCK_BYTES`; the
+    lane derives its menu from that same object, and every entry has a
+    field codec behind it."""
+    import prismaquant.export_gguf as export_gguf
+    import prismaquant.export_gguf_direct as export_gguf_direct
+    from prismaquant import gguf_formats
+
+    assert (export_gguf_direct.GGUF_BLOCK_BYTES
+            is gguf_formats.GGUF_BLOCK_BYTES)
+    assert export_gguf.GGUF_BLOCK_BYTES is gguf_formats.GGUF_BLOCK_BYTES
+    assert set(gguf_formats.GGUF_BLOCK_BYTES) == set(gguf_formats._FIELDS)
+
+
+def test_every_format_named_in_a_shipped_profile_resolves_in_the_registry():
+    """Typo guard: a misspelled allow entry silently narrows a menu and a
+    misspelled deny entry silently widens one."""
+    for profile in _shipped_profiles():
+        for rule in profile.format_rules:
+            for fmt in (*rule.allow_formats, *rule.deny_formats):
+                fr.get_format(fmt)  # raises KeyError on an unknown name
+
+
+def test_export_lane_with_a_stale_declaration_fails_loudly():
+    """The declaration is a dotted path into the exporter. If the exporter
+    renames its table, the profile must fail loudly rather than fall back
+    to an empty (deny-everything) or unbounded menu."""
+    lane = ExportLaneSpec(
+        id="unit_lane",
+        exporter="prismaquant.export_native_compressed",
+        codec_formats_from=(
+            "prismaquant.export_native_compressed:FORMAT_SCHEME_RENAMED",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="has no attribute"):
+        lane.emittable_formats()
+
+    empty = ExportLaneSpec(id="unit_empty_lane")
+    with pytest.raises(RuntimeError, match="no emittable formats"):
+        empty.emittable_formats()

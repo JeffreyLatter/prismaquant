@@ -508,6 +508,91 @@ class ModelProfile(ABC):
             ("w1", "w2", "w3"),
         )
 
+    def _fallback_packed_expert_role_parents(self) -> dict[str, str]:
+        """Legacy per-expert projection leaf -> packed 3D parent parameter.
+
+        Same role (and same caveat) as
+        :meth:`_fallback_packed_expert_format_groups`: it keeps profiles that
+        declare only the coupled *group* (``w1,w2,w3``) — or no spec at all —
+        answering role questions without moving expert-naming knowledge back
+        into the solver. The map is the standard MoE convention: ``w1`` = gate,
+        ``w3`` = up (both halves of the packed ``gate_up_proj``), ``w2`` = down.
+        New model families should declare ``packed_experts.projection_splits``
+        in the JSON structure spec, which is consulted first.
+        """
+        return {
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+            "w1": "gate_up_proj",
+            "w3": "gate_up_proj",
+            "down_proj": "down_proj",
+            "w2": "down_proj",
+        }
+
+    @staticmethod
+    def _packed_expert_projection_leaf(
+        qname: str,
+    ) -> tuple[str, str, bool] | None:
+        """Split a packed-expert qname into ``(parent, leaf, per_expert)``.
+
+        Accepts both representations the pipeline uses: the packed recipe form
+        ``<parent>.experts.gate_up_proj`` and the split per-expert export form
+        ``<parent>.experts.7.gate_proj``. Returns None for anything that is not
+        an expert projection. Kept identical to the spec-side matcher in
+        ``structure.ModelStructureSpec.packed_expert_format_group`` so a name
+        the spec groups is a name this profile can also name a role for.
+        """
+        parts = str(qname).split(".")
+        try:
+            experts_idx = len(parts) - 1 - list(reversed(parts)).index("experts")
+        except ValueError:
+            return None
+        tail = parts[experts_idx + 1:]
+        parent = ".".join(parts[:experts_idx + 1])
+        if len(tail) == 1:
+            return parent, tail[0], False
+        if len(tail) == 2 and tail[0].isdigit():
+            return parent, tail[1], True
+        return None
+
+    def packed_expert_role_group(self, qname: str) -> str | None:
+        """Serving-ROLE bucket for one packed-expert projection.
+
+        The bucket is the name of the packed 3D parameter the projection is a
+        part of — ``gate_up_proj`` for gate/up (``w1``/``w3``) leaves,
+        ``down_proj`` for down (``w2``) leaves. It is the profile-side answer
+        to "which projections of this MoE layer share a stacked tensor", which
+        is what a serving lane with per-projection expert schemes (GGUF) can
+        give distinct formats. The allocator asks for this instead of parsing
+        expert leaf names itself (see
+        :meth:`_fallback_packed_expert_format_groups` on that boundary).
+
+        Returns None when ``qname`` is not an expert projection at all, and
+        also when it is one whose parent this profile cannot name — a new
+        architecture with unfamiliar expert leaf names. Those two Nones are
+        distinguishable at the only call site that matters: it asks
+        :meth:`packed_expert_format_group` first, so a None here on a name that
+        HAS a packed group key means "role undeclared", which the caller turns
+        into a hard error rather than silently dropping the role split.
+        """
+        parsed = self._packed_expert_projection_leaf(qname)
+        if parsed is None:
+            return None
+        leaf = parsed[1]
+        spec = self.structure_spec()
+        if spec is not None and spec.packed_experts.declared:
+            parent = spec.packed_expert_parent_for_projection(leaf)
+            if parent is not None:
+                return parent
+        fallback = self._fallback_packed_expert_role_parents().get(leaf)
+        if fallback is not None:
+            return fallback
+        if leaf in self.packed_expert_param_names():
+            # A leaf that IS a packed parameter (unsplit recipe form) is its
+            # own role.
+            return leaf
+        return None
+
     def _packed_expert_group_matches_representation(
         self,
         group: tuple[str, ...],
@@ -538,22 +623,10 @@ class ModelProfile(ABC):
         spec = self.structure_spec()
         if spec is not None:
             return spec.packed_expert_format_group(qname)
-        parts = str(qname).split(".")
-        try:
-            experts_idx = len(parts) - 1 - list(reversed(parts)).index("experts")
-        except ValueError:
+        parsed = self._packed_expert_projection_leaf(qname)
+        if parsed is None:
             return None
-        tail = parts[experts_idx + 1:]
-        if len(tail) == 1:
-            parent = ".".join(parts[:experts_idx + 1])
-            leaf = tail[0]
-            split_per_expert = False
-        elif len(tail) == 2 and tail[0].isdigit():
-            parent = ".".join(parts[:experts_idx + 1])
-            leaf = tail[1]
-            split_per_expert = True
-        else:
-            return None
+        parent, leaf, split_per_expert = parsed
 
         for group in self._fallback_packed_expert_format_groups():
             if leaf not in group:

@@ -57,8 +57,8 @@ except ModuleNotFoundError:
         return module
 
 from .autoscale import (
-    _EXPERT_TENSOR_RE,
     _PACKED_BYTE_DTYPES,
+    declared_expert_dtype_covers,
     declared_fp4_expert_dtype,
 )
 from .layer_streaming import (
@@ -267,9 +267,10 @@ def _estimate_layer_cache_bytes(
     """Estimate dequanted cache bytes per decoder layer without loading data.
 
     `fp4_experts` is the checkpoint's explicit packed-FP4 expert
-    declaration (`declared_fp4_expert_dtype`): per-expert I8/U8 tensors
-    then price as MXFP4 nibble-packs (2 logical elements/byte at the
-    execution dtype) instead of verbatim int8."""
+    declaration (`declared_fp4_expert_dtype`): expert I8/U8 tensors —
+    routed and shared alike, see `declared_expert_dtype_covers` — then
+    price as MXFP4 nibble-packs (2 logical elements/byte at the execution
+    dtype) instead of verbatim int8."""
     pat = re.compile(rf"^{re.escape(layers_prefix)}(?P<idx>\d+)\.")
     by_shard: dict[str, list[tuple[int, str, bool]]] = {}
     for model_name, shard in weight_shard.items():
@@ -281,7 +282,7 @@ def _estimate_layer_cache_bytes(
             continue
         by_shard.setdefault(shard, []).append((
             idx, weight_ckpt[model_name],
-            bool(fp4_experts and _EXPERT_TENSOR_RE.search(model_name)),
+            bool(fp4_experts and declared_expert_dtype_covers(model_name)),
         ))
 
     sizes = [0 for _ in range(num_layers)]

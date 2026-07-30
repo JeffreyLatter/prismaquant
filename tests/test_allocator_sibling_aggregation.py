@@ -331,6 +331,57 @@ def test_singleton_groups_pass_through_unchanged():
     assert "model.layers.0.self_attn.q_proj" in cands_ext
 
 
+def test_fused_group_with_disjoint_member_menus_hard_errors():
+    """A fused group whose members share NO legal format must raise, not
+    vanish. Pre-fix, ``cands`` came out empty, ``stats_ext``/``costs_ext``
+    still got the super item and ``candidates_ext`` did not — so the whole
+    q/k/v group silently disappeared from the DP and was never assigned a
+    format.
+
+    Fused siblings must load under ONE format, so this state is not
+    allocatable at all (any promoted format is illegal for some member, and
+    ``compute_achieved`` refuses to price that) — the fallback-to-individual-
+    rows treatment ``aggregate_packed_serving_groups`` gives packed groups
+    would only defer the same failure past the solve. The disjointness here is
+    built through the REAL legality gate, from the two upstream causes the
+    message names: a passthrough-source mismatch on one sibling and an
+    applicability mask on the other."""
+    import pytest
+
+    layer = "model.layers.0.self_attn"
+    q, k = f"{layer}.q_proj", f"{layer}.k_proj"
+    stats = {
+        # q_proj: fp16 source -> BF16 passthrough illegal (never synthesize).
+        q: {"h_trace": 0.5, "n_params": 4096 * 4096,
+            "in_features": 4096, "out_features": 4096},
+        # k_proj: in_features not divisible by the NVFP4 group -> masked.
+        k: {"h_trace": 0.3, "n_params": 1024 * 4098,
+            "in_features": 4098, "out_features": 1024},
+    }
+    costs = {
+        n: {"NVFP4": {"weight_mse": 0.02, "predicted_dloss": 0.01},
+            "BF16": {"weight_mse": 0.0, "predicted_dloss": 0.0}}
+        for n in stats
+    }
+    specs = _format_specs()
+    cands = build_candidates(
+        stats, costs, specs,
+        source_manifest={q: "other", k: "bf16"},
+    )
+    assert [c.fmt for c in cands[q]] == ["NVFP4"]
+    assert [c.fmt for c in cands[k]] == ["BF16"]
+
+    with pytest.raises(AssertionError) as exc:
+        aggregate_fused_siblings(stats, costs, specs, cands, _FakeProfile())
+    msg = str(exc.value)
+    assert "qkv_proj" in msg                      # the group
+    assert q in msg and k in msg                  # its members
+    assert "['NVFP4']" in msg and "['BF16']" in msg   # each member's menu
+    assert "common formats: []" in msg
+    for cause in ("cost row", "applicability mask", "passthrough-source"):
+        assert cause in msg, cause
+
+
 def test_aggregation_is_no_op_without_profile():
     names, stats, costs = _mk_stats_and_costs()
     specs = _format_specs()

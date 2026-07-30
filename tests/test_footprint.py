@@ -86,6 +86,7 @@ def test_assignment_artifact_bytes_residual_floor():
     r = fp.assignment_artifact_bytes(
         {"layer.w": "NVFP4"}, stats,
         source_total_bytes=source_total, regime="bf16",
+        source_manifest=None,   # explicit: regime-wide approximation
     )
     # + 8 B fp32 NVFP4 global sidecars (weight_global_scale +
     # input_global_scale) the export emits per 2-D Linear (§3.14 fix).
@@ -112,6 +113,7 @@ def test_assignment_artifact_bytes_fp8_source_removes_scale_inv():
     r = fp.assignment_artifact_bytes(
         {"layer.w": "NVFP4"}, stats,
         source_total_bytes=source_total, regime="fp8",
+        source_manifest=None,   # explicit: regime-wide approximation
     )
     # floor must be exactly the embed; the fp8 weight AND its scale_inv are removed
     assert r["floor_bytes"] == embed
@@ -130,7 +132,7 @@ def test_assignment_artifact_bytes_bf16_passthrough_is_floor_equivalent():
     stats = {"layer.w": {"n_params": 32, "in_features": 8, "out_features": 4}}
     r = fp.assignment_artifact_bytes(
         {"layer.w": "BF16"}, stats,
-        source_total_bytes=3264, regime="bf16",
+        source_total_bytes=3264, regime="bf16", source_manifest=None,
     )
     assert r["artifact_bytes"] == 3264
 
@@ -141,7 +143,7 @@ def test_assignment_artifact_bytes_missing_stats_stay_in_floor():
     stats = {"layer.w": {"n_params": 32, "in_features": 8, "out_features": 4}}
     r = fp.assignment_artifact_bytes(
         {"layer.w": "NVFP4", "ghost.w": "NVFP4"}, stats,
-        source_total_bytes=3264, regime="bf16",
+        source_total_bytes=3264, regime="bf16", source_manifest=None,
     )
     assert r["n_missing_stats"] == 1
     assert r["n_reencoded"] == 1
@@ -149,7 +151,7 @@ def test_assignment_artifact_bytes_missing_stats_stay_in_floor():
 
 def test_assignment_artifact_gb_matches_bytes():
     stats = {"layer.w": {"n_params": 32, "in_features": 8, "out_features": 4}}
-    kw = dict(source_total_bytes=3264, regime="bf16")
+    kw = dict(source_total_bytes=3264, regime="bf16", source_manifest=None)
     gb = fp.assignment_artifact_gb({"layer.w": "NVFP4"}, stats, **kw)
     b = fp.assignment_artifact_bytes({"layer.w": "NVFP4"}, stats, **kw)["artifact_bytes"]
     assert gb == pytest.approx(b / fp.GB)
@@ -194,6 +196,7 @@ def test_assignment_artifact_bytes_packed_nvfp4_counts_per_expert_globals():
     r = fp.assignment_artifact_bytes(
         {"layer.experts.gate_up_proj": "NVFP4"}, stats,
         source_total_bytes=4 * 128 * 32 * 2, regime="bf16",
+        source_manifest=None,
     )
     expected = (
         fr.get_format("NVFP4").memory_bytes_for_shape((4, 128, 32))
@@ -297,6 +300,7 @@ def test_assignment_artifact_bytes_manifest_agrees_with_floor_model(tmp_path):
         fp.assignment_artifact_bytes(
             {q: "NVFP4" for q in reencoded}, stats,
             source_total_bytes=info["source_total_bytes"], regime="fp8",
+            source_manifest=None,
         )
 
 
@@ -468,3 +472,158 @@ def test_unresolved_reencoded_name_is_a_hard_error(tmp_path):
             {"not.in.checkpoint": "NVFP4"}, stats,
             source_total_bytes=10_000, regime="bf16",
             source_manifest={"layer.w": 64})
+
+
+# ---------------------------------------------------------------------------
+# Double-charged source spans (issue #23): the manifest stores a per-expert
+# Linear BOTH under its own name and inside its packed-parent aggregate, so
+# either naming scheme resolves. Charging both subtracts the same on-disk
+# bytes twice — the floor is under-counted by the whole expert mass and an
+# over-budget artifact "fits". That was guarded only by a docstring
+# convention; the manifest now carries per-entry span provenance so the
+# resolver can reject it structurally.
+# ---------------------------------------------------------------------------
+
+def test_manifest_carries_span_provenance(tmp_path):
+    _case_a_per_expert_disk(tmp_path)
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+    assert isinstance(m, fp.SourceByteManifest)
+    # A per-expert entry covers exactly its own checkpoint tensor...
+    assert m.spans["layers.0.mlp.experts.0.gate_proj"] == frozenset(
+        {"layers.0.mlp.experts.0.gate_proj"})
+    # ...and the packed aggregate covers every per-expert tensor it summed,
+    # which is exactly why the two overlap.
+    assert m.spans["layers.0.mlp.experts.gate_up_proj"] == frozenset({
+        "layers.0.mlp.experts.0.gate_proj", "layers.0.mlp.experts.0.up_proj",
+        "layers.0.mlp.experts.1.gate_proj", "layers.0.mlp.experts.1.up_proj",
+    })
+    assert m.spans["embed"] == frozenset({"embed"})
+    # Byte totals are untouched by provenance bookkeeping.
+    assert m["layers.0.mlp.experts.gate_up_proj"] == 4 * 1024
+    assert m["layers.0.mlp.experts.0.gate_proj"] == 1024
+
+
+def test_both_naming_schemes_resolve_on_their_own(tmp_path):
+    """The legitimate cases must keep working: a re-encoded-name list may be
+    ALL packed names or ALL per-expert names. Only mixing them is the bug."""
+    _case_a_per_expert_disk(tmp_path)
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+
+    packed = fp.resolve_reencoded_source_bytes(
+        m, _PACKED_NAMES, context="unit")
+    assert sum(packed.values()) == 6 * 1024
+
+    per_expert_names = [
+        f"layers.0.mlp.experts.{i}.{proj}"
+        for i in (0, 1) for proj in ("gate_proj", "up_proj", "down_proj")
+    ]
+    per_expert = fp.resolve_reencoded_source_bytes(
+        m, per_expert_names, context="unit")
+    # Same underlying source mass, reached through the other naming scheme.
+    assert sum(per_expert.values()) == 6 * 1024
+
+    # Requesting the SAME name twice is idempotent, not a double charge: the
+    # result is keyed by name, so those bytes are only summed once.
+    dup = fp.resolve_reencoded_source_bytes(
+        m, _PACKED_NAMES + _PACKED_NAMES, context="unit")
+    assert dup == packed
+
+    # ...and the floor is identical whichever scheme names the tensors.
+    info_packed = fp.floor_bytes_for_model(
+        str(tmp_path), _PACKED_NAMES, _PACKED_STATS)
+    info_per_expert = fp.floor_bytes_for_model(
+        str(tmp_path), per_expert_names, _PACKED_STATS)
+    assert info_packed["floor_bytes"] == info_per_expert["floor_bytes"] == 1600
+
+
+def test_double_charged_span_is_rejected(tmp_path):
+    _case_a_per_expert_disk(tmp_path)
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+
+    # Mixing schemes for the SAME underlying tensor: the packed aggregate and
+    # one of the per-expert Linears it already contains.
+    with pytest.raises(ValueError, match="charged twice") as exc:
+        fp.resolve_reencoded_source_bytes(
+            m,
+            ["layers.0.mlp.experts.gate_up_proj",
+             "layers.0.mlp.experts.0.gate_proj"],
+            context="unit")
+    msg = str(exc.value)
+    assert "layers.0.mlp.experts.gate_up_proj" in msg
+    assert "layers.0.mlp.experts.0.gate_proj" in msg
+
+    # ...through both public consumers, not just the helper.
+    with pytest.raises(ValueError, match="charged twice"):
+        fp.floor_bytes_for_model(
+            str(tmp_path),
+            _PACKED_NAMES + ["layers.0.mlp.experts.1.down_proj"],
+            _PACKED_STATS)
+
+    stats = dict(_PACKED_STATS)
+    stats["layers.0.mlp.experts.1.down_proj"] = {
+        "n_params": 32 * 16, "in_features": 16, "out_features": 32}
+    with pytest.raises(ValueError, match="charged twice"):
+        fp.assignment_artifact_bytes(
+            {q: "NVFP4" for q in
+             _PACKED_NAMES + ["layers.0.mlp.experts.1.down_proj"]},
+            stats,
+            source_total_bytes=m["embed"] + 6 * 1024,
+            source_manifest=m)
+
+
+def test_double_charge_would_have_under_counted_the_floor(tmp_path):
+    """Why it matters: the double charge is silent under the old guard.
+
+    check_floor_non_negative only fires when the over-subtraction exceeds the
+    ENTIRE floor. Here it does not — the floor merely shrinks by the expert
+    mass, so the artifact reads ~2 KB smaller than it is and an over-budget
+    allocation would 'fit' a byte budget."""
+    _case_a_per_expert_disk(tmp_path)
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+    total, _by_dtype = fp.source_checkpoint_bytes(str(tmp_path))
+    honest = total - 6 * 1024
+    assert honest == 1600
+
+    doubled_names = _PACKED_NAMES + ["layers.0.mlp.experts.1.down_proj"]
+    doubled = total - sum(m[q] for q in doubled_names)
+    assert doubled == honest - 1024 < honest
+    # Still non-negative, so the pre-existing guard says nothing at all.
+    fp.check_floor_non_negative(
+        doubled, total, {q: m[q] for q in doubled_names}, context="unit")
+    # The provenance check is what catches it.
+    with pytest.raises(ValueError, match="charged twice"):
+        fp.resolve_reencoded_source_bytes(m, doubled_names, context="unit")
+
+
+def test_plain_dict_manifest_skips_the_overlap_check_but_still_resolves(tmp_path):
+    """A hand-built manifest carries no provenance: the byte lookup still
+    works, the overlap check is simply not available (and an explicit `spans`
+    argument re-enables it)."""
+    plain = {"a.w": 64, "b.w": 64}
+    assert fp.resolve_reencoded_source_bytes(
+        plain, ["a.w", "b.w"], context="unit") == {"a.w": 64, "b.w": 64}
+    with pytest.raises(ValueError, match="charged twice"):
+        fp.resolve_reencoded_source_bytes(
+            plain, ["a.w", "b.w"], context="unit",
+            spans={"a.w": ["shard0.t0"], "b.w": ["shard0.t0"]})
+
+
+def test_source_manifest_is_a_required_keyword():
+    """Issue #23: the regime-wide accounting is a legacy approximation exact
+    only on a uniform source. It must be reachable only by an explicit
+    `source_manifest=None`, never by forgetting the kwarg."""
+    stats = {"layer.w": {"n_params": 32, "in_features": 8, "out_features": 4}}
+    with pytest.raises(TypeError, match="source_manifest"):
+        fp.assignment_artifact_bytes(
+            {"layer.w": "NVFP4"}, stats, source_total_bytes=3264)
+    with pytest.raises(TypeError, match="source_manifest"):
+        fp.assignment_artifact_gb(
+            {"layer.w": "NVFP4"}, stats, source_total_bytes=3264)
+    # ...and the explicit form reports which accounting actually ran.
+    assert fp.assignment_artifact_bytes(
+        {"layer.w": "NVFP4"}, stats, source_total_bytes=3264,
+        source_manifest=None)["source_accounting"] == "regime"
+    assert fp.assignment_artifact_bytes(
+        {"layer.w": "NVFP4"}, stats, source_total_bytes=3264,
+        source_manifest={"layer.w": 64},
+    )["source_accounting"] == "per_tensor_manifest"

@@ -25,7 +25,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from .autoscale import _EXPERT_TENSOR_RE, declared_fp4_expert_dtype
+from .autoscale import declared_expert_dtype_covers, declared_fp4_expert_dtype
 
 try:
     from accelerate.utils.modeling import set_module_tensor_to_device
@@ -184,11 +184,12 @@ class Fp8ScaleInvMap(dict):
     granularity.  ``block`` is None only for empty maps.
 
     ``mxfp4_names`` is the set of mapped weights the checkpoint config
-    *explicitly declares* as packed-FP4 routed experts (DSv4-Flash
-    `expert_dtype: "fp4"`, see `declared_fp4_expert_dtype`). Those decode
-    on the MXFP4 nibble path (step 3b of `_apply_fp8_dequant_inplace`)
-    instead of the block-FP8 broadcast. Empty unless declared — never
-    inferred from tensor shapes."""
+    *explicitly declares* as packed-FP4 experts — routed and shared alike
+    (DSv4-Flash `expert_dtype: "fp4"`, see `declared_fp4_expert_dtype` and
+    `declared_expert_dtype_covers`). Those decode on the MXFP4 nibble path
+    (step 3b of `_apply_fp8_dequant_inplace`) instead of the block-FP8
+    broadcast. Empty unless declared — never inferred from tensor
+    shapes."""
 
     def __init__(self, data=None, block: tuple[int, int] | None = None,
                  mxfp4_names: frozenset[str] = frozenset()):
@@ -333,14 +334,24 @@ def _build_fp8_scale_inv_map(model_path: str, *,
 def _declared_mxfp4_names(model_path: str, mapping: dict) -> frozenset[str]:
     """Mapped weight names the checkpoint explicitly declares MXFP4.
 
-    Non-empty only when config.json declares packed-FP4 routed experts
-    (`declared_fp4_expert_dtype`); membership is the per-expert routed
-    tensors (`...experts.<id>....`) that declaration covers. Everything
-    else in the map stays on the block-FP8 dequant path."""
+    Non-empty only when config.json declares packed-FP4 experts
+    (`declared_fp4_expert_dtype`); membership is every expert weight that
+    declaration covers — routed (`...experts.<id>....`) *and* shared
+    (`...shared_experts....`), see `declared_expert_dtype_covers`. Shared
+    experts carry no per-expert index, so the routed-only pattern used to
+    exclude them structurally and a declared-MXFP4 shared expert took the
+    block-FP8 path and died on its `_check_fp8_scale_grid` assertion
+    (issue #26).
+
+    The trigger is still only the declaration; the packed layout is
+    asserted per tensor by `_check_mxfp4_packed_grid` at decode time, so a
+    checkpoint whose shared experts are NOT packed-FP4 fails loudly with
+    the exact mismatch rather than being silently reinterpreted.
+    Non-expert tensors stay on the block-FP8 dequant path."""
     if not mapping or not declared_fp4_expert_dtype(model_path):
         return frozenset()
     _check_declared_mxfp4_scale_fmt(model_path)
-    return frozenset(n for n in mapping if _EXPERT_TENSOR_RE.search(n))
+    return frozenset(n for n in mapping if declared_expert_dtype_covers(n))
 
 
 # Checkpoint `quantization_config.scale_fmt` spellings that mean an E8M0
@@ -590,8 +601,8 @@ def _apply_fp8_dequant_inplace(
     dequant (`fp8_scale_inv_map.block`, see `_fp8_dequant_block`), and
     replace the loaded tensor with the dequanted bf16 weight. MXFP4
     tensors (OCP MX FP4 E2M1 nibble pairs with per-32-element E8M0
-    scales, e.g. DSv4-Flash routed experts) are the map's declared
-    ``mxfp4_names`` — populated only from the checkpoint config's
+    scales, e.g. DSv4-Flash's routed and shared experts) are the map's
+    declared ``mxfp4_names`` — populated only from the checkpoint config's
     explicit `expert_dtype` declaration, never inferred from shapes —
     and dequant on a dedicated path (step 3b) instead of the block-FP8
     broadcast, after a hard packed-grid assertion.
@@ -636,9 +647,9 @@ def _apply_fp8_dequant_inplace(
     declared_mxfp4 = getattr(fp8_scale_inv_map, "mxfp4_names", frozenset())
     for name in loaded_scales:
         w = out[name]
-        # MXFP4 routed experts (DSv4-Flash): E2M1 nibble pairs packed
-        # into int8 (low nibble = even element) with per-row E8M0 scales
-        # over 32 logical elements. Membership is the checkpoint's
+        # MXFP4 experts (DSv4-Flash routed + shared): E2M1 nibble pairs
+        # packed into int8 (low nibble = even element) with per-row E8M0
+        # scales over 32 logical elements. Membership is the checkpoint's
         # explicit declaration (config `expert_dtype`, carried on the
         # map as `mxfp4_names`), NOT a shape heuristic — an INT8
         # checkpoint with group-16 scales must never be silently decoded
@@ -694,11 +705,14 @@ def _apply_fp8_dequant_inplace(
         dequanted += E
         del w_stack, s_stack, w4, s4, dequanted_stack
 
-    # Step 3b: MXFP4 tensors (DSv4-Flash routed experts). Vectorized
-    # nibble unpack + per-32-element E8M0 scale, per the OCP Microscaling
-    # Formats (MX) v1.0 spec: FP4 E2M1 element grid ({0, 0.5, 1, 1.5, 2,
-    # 3, 4, 6} with a sign bit), one shared E8M0 power-of-two scale per
-    # 32-element group. Batched like step 3 — same-shape tensors stack
+    # Step 3b: MXFP4 tensors (DSv4-Flash routed + shared experts).
+    # Shape-grouped, so a shared expert's distinct (rows, packed_in) simply
+    # forms its own group — no per-expert index is needed anywhere here.
+    # Vectorized nibble unpack + per-32-element E8M0 scale, per the OCP
+    # Microscaling Formats (MX) v1.0 spec: FP4 E2M1 element grid
+    # ({0, 0.5, 1, 1.5, 2, 3, 4, 6} with a sign bit), one shared E8M0
+    # power-of-two scale per 32-element group.
+    # Batched like step 3 — same-shape tensors stack
     # and decode together (DSv4 loads ~768 expert tensors per layer;
     # per-tensor kernel launches are exactly what this function's batched
     # design exists to avoid) — but in chunks of _MXFP4_DECODE_CHUNK, since

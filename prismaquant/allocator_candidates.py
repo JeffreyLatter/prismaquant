@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import format_registry as fr
-from .allocator_solver import Candidate, _shape_from_stats, predicted_dloss
+from .allocator_solver import (
+    Candidate,
+    PackedExpertRoleUnknown,
+    _shape_from_stats,
+    predicted_dloss,
+)
 from .serving_profiles import (
     check_serving_format,
     check_serving_shape,
@@ -365,6 +370,77 @@ def cost_entry_predicted_dloss(
     )
 
 
+ACTIVATION_COST_UNMEASURED_REASON = "activation_cost_unmeasured"
+
+
+def cost_entry_prices_unmeasured_activation_at_zero(
+    stats_entry: dict,
+    cost_entry: dict,
+    priced_dloss: float,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this row prices a W-and-A format's UNKNOWN cost at the global
+    optimum (Δloss exactly 0.0).
+
+    ``cost_entry_is_bit_exact`` closed this for the ``output_mse`` branch: a
+    weight-lossless entry on an activation-quantizing format keeps its measured
+    A-side output_mse instead of short-circuiting to 0.0. But that branch is
+    only taken when output_mse is a real measurement. Packed-expert rows whose
+    routed forward could not be reconstructed (``can_measure_output`` false),
+    and EVERY row in a run with ``PRISMAQUANT_EXPERT_COST_SAMPLE`` set, are
+    written with ``output_mse_measured=False`` (measure_quant_cost), so pricing
+    falls through to ``predicted_dloss``/``weight_mse`` — both of which are
+    exactly 0.0 for a weight-lossless re-encode (the source is already in that
+    format: MXFP4 over an MXFP4-packed source, NVFP4 over an NVFP4-CB source).
+    Nothing in that row ever looked at the activation path, yet the DP reads a
+    cost of 0.0: the unbeatable global minimum at any budget, for an assignment
+    whose served activations are 4-bit.
+
+    This is not a mis-estimate to be corrected — a positive weight-side
+    surrogate is the accepted L1 design, biased but tradeable — it is a cost the
+    optimizer CANNOT trade off: zero is the argmin, so the format is selected at
+    every target, unconditionally. The unknown must therefore be excluded from
+    the menu (``build_candidates``, counted and logged like any other
+    inapplicable format) rather than priced.
+
+    The predicate is exact, not thresholded:
+
+      * the format's activation path is provably non-identity
+        (``FormatSpec.act_quant_changes_input`` — a dtype-level fact);
+      * no measured output-side evidence exists for this row
+        (``_has_measured_output_mse``), so the A-side error is unknown
+        whatever produced the number;
+      * the resulting price is exactly 0.0 — the DP's global optimum;
+      * the row's measured sensitivity is POSITIVE. ``h_trace == 0`` prices
+        every format at 0.0 including the passthrough ones, which is a measured
+        statement that no perturbation of this Linear's output moves the loss —
+        W-side or A-side, since the same Fisher expansion multiplies both. A
+        zero-token expert at thin calibration is exactly that row, and it must
+        stay free to take the cheapest format instead of being forced onto
+        BF16.
+    """
+    if format_name is None:
+        return False
+    try:
+        spec = fr.get_format(str(format_name))
+    except KeyError:
+        return False
+    if not spec.act_quant_changes_input:
+        return False
+    if _has_measured_output_mse(stats_entry, cost_entry):
+        return False
+    try:
+        if float(priced_dloss) != 0.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        h_trace = float(stats_entry.get("h_trace", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return h_trace > 0.0
+
+
 def _cost_ucb_z() -> float:
     """PRISMAQUANT_COST_UCB_Z: stderr multiples added to predicted_dloss."""
     try:
@@ -447,6 +523,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
     out: dict[str, list[Candidate]] = {}
     masked: dict[tuple[str, str], list[str]] = {}
     source_counts: Counter[str] = Counter()
+    unpriceable: dict[str, list[str]] = {}
     for name, s in stats.items():
         if name not in costs:
             continue
@@ -499,12 +576,52 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             # weight_mse for those entries.
             predicted = cost_entry_predicted_dloss(
                 s, entry, gain=gain, format_name=spec.name)
+            priced = max(predicted, 0.0)
+            if cost_entry_prices_unmeasured_activation_at_zero(
+                    s, entry, priced, spec.name):
+                # The A-side cost of this W-and-A format was never measured for
+                # this row, and the W side is lossless, so the only price the
+                # cost table can offer is 0.0 — the DP's global optimum. An
+                # unknown priced at the optimum is always selected: exclude the
+                # candidate (counted + logged, exactly like an inapplicable
+                # format) instead of letting the optimizer read a cost that no
+                # measurement supports. See
+                # cost_entry_prices_unmeasured_activation_at_zero.
+                h_trace = float(s.get("h_trace", 0.0) or 0.0)
+                detail = (
+                    f"{spec.name} quantizes activations (act_bits="
+                    f"{spec.act_bits}) but this row has no measured "
+                    "output_mse, and its weight-side error is exactly 0.0 "
+                    "(lossless re-encode of an already-"
+                    f"{spec.name}-shaped source), so the only available "
+                    f"price is dloss 0.0 with h_trace={h_trace:.6g} > 0: an "
+                    "unmeasured activation cost at the DP's global minimum "
+                    f"(cost_source="
+                    f"{cost_entry_source(s, entry, spec.name)})"
+                )
+                if mask_records is not None:
+                    mask_records.append({
+                        "qname": name,
+                        "format": spec.name,
+                        "reason": ACTIVATION_COST_UNMEASURED_REASON,
+                        "detail": detail,
+                        "shape": [out_features, in_features],
+                        "out_features": out_features,
+                        "in_features": in_features,
+                        "source_kind": source_kind,
+                    })
+                masked.setdefault(
+                    (spec.name, ACTIVATION_COST_UNMEASURED_REASON),
+                    [],
+                ).append(name)
+                unpriceable.setdefault(name, []).append(spec.name)
+                continue
             source_counts[cost_entry_source(s, entry, spec.name)] += 1
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=spec.effective_bits_for_shape(shape),
                 memory_bytes=spec.memory_bytes_for_shape(shape),
-                predicted_dloss=max(predicted, 0.0),
+                predicted_dloss=priced,
             ))
         if cands:
             out[name] = cands
@@ -520,6 +637,35 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             f"{source}={count}" for source, count in sorted(source_counts.items())
         )
         print(f"[alloc] cost-source usage: {summary}", flush=True)
+    starved = sorted(n for n in unpriceable if n not in out)
+    if starved:
+        # Excluding the unmeasured-activation candidates left these Linears
+        # with NO candidate at all. Dropping them is worse than the bug we just
+        # fixed: a name absent from `out` never reaches the DP, so its bits and
+        # bytes vanish from the bpp/footprint accounting and from serving-unit
+        # membership — silently, with the export still emitting the tensor.
+        # The allocator cannot price these rows, so it must not pretend to.
+        detail = "\n".join(
+            f"    {n}: unpriceable={sorted(unpriceable[n])} (other cost rows: "
+            f"{sorted(set(costs.get(n, {})) - set(unpriceable[n]))})"
+            for n in starved[:8]
+        )
+        raise AssertionError(
+            f"{len(starved)} Linear(s) have no priceable format left after "
+            "excluding activation-quantizing formats whose activation-side "
+            "cost was never measured and whose weight-side error is exactly "
+            f"0.0:\n{detail}\n"
+            "Every legal format for these rows would have been priced at "
+            "dloss 0.0 (the DP's global minimum) on no activation-path "
+            "evidence, and omitting the rows would silently shrink the "
+            "allocator's bit/disk accounting and serving-unit membership. "
+            "Close the measurement gap instead: unset "
+            "PRISMAQUANT_EXPERT_COST_SAMPLE (and make the expert activation "
+            "cache available) so measure_quant_cost records output_mse with "
+            "activation_quantize_dequantize applied, or include a rung whose "
+            "activation path is the identity (BF16, FP8_SOURCE, NVFP4A16, "
+            "MXFP8A16) in the format menu."
+        )
     return out
 
 
@@ -594,7 +740,21 @@ def aggregate_fused_siblings(
     profile,
     calibrated_gains: dict[str, float] | None = None,
 ) -> tuple[dict, dict, dict]:
-    """Aggregate fused siblings into single DP items."""
+    """Aggregate fused siblings into single DP items.
+
+    A group whose members share NO legal format is a HARD ERROR, not a
+    fallback to individual rows. Fused siblings (q/k/v, gate/up) must load
+    under ONE format — that is a serving invariant, not a preference — so
+    members with disjoint menus cannot be coherently promoted at all: whatever
+    format whole-group promotion lands on is illegal for at least one member,
+    and ``compute_achieved`` now refuses to price that state (AssertionError,
+    at every target) rather than scoring the unpriced member at zero Δloss.
+    Individual rows would therefore only defer the same failure past the solve,
+    while a silently missing ``candidates_ext`` entry (the pre-fix behavior:
+    ``stats_ext``/``costs_ext`` assigned, ``candidates_ext`` not) drops the
+    whole group from the DP with no error at all. The same argument is written
+    out at length in ``aggregate_packed_serving_groups``.
+    """
     if profile is None:
         return stats, costs, candidates
 
@@ -706,6 +866,18 @@ def aggregate_fused_siblings(
             member_format_intersection = set.intersection(*member_format_sets)
         else:
             member_format_intersection = set()
+        if not member_format_intersection:
+            raise AssertionError(
+                _fused_group_menu_error(
+                    super_name,
+                    key,
+                    members,
+                    candidates,
+                    member_format_intersection,
+                    formats,
+                    "share no legal format",
+                )
+            )
 
         cands = []
         for spec in formats:
@@ -736,10 +908,64 @@ def aggregate_fused_siblings(
                 memory_bytes=total_bytes,
                 predicted_dloss=max(predicted, 0.0),
             ))
-        if cands:
-            candidates_ext[super_name] = cands
+        if not cands:
+            # Unreachable via the intersection (a common candidate format
+            # implies a non-error cost row for every member), so this catches
+            # the residual case: an aggregation menu that does not contain the
+            # formats the member candidates were built from. Same verdict —
+            # stats_ext/costs_ext are already written, so returning here would
+            # drop the group from the DP silently.
+            raise AssertionError(
+                _fused_group_menu_error(
+                    super_name,
+                    key,
+                    members,
+                    candidates,
+                    member_format_intersection,
+                    formats,
+                    "share legal formats that this aggregation menu does not "
+                    "price",
+                )
+            )
+        candidates_ext[super_name] = cands
 
     return stats_ext, costs_ext, candidates_ext
+
+
+def _fused_group_menu_error(
+    super_name: str,
+    key: str,
+    members: list[str],
+    candidates: dict[str, list[Candidate]],
+    intersection: set[str],
+    formats: list[fr.FormatSpec],
+    what: str,
+) -> str:
+    """Diagnostic for a fused-sibling group that cannot be given one format."""
+    member_lines = "\n".join(
+        f"    {m}: legal={sorted(c.fmt for c in candidates.get(m, []))}"
+        for m in members
+    )
+    return (
+        f"fused-sibling group {key!r} (DP unit {super_name!r}) has "
+        f"{len(members)} members that {what}:\n"
+        f"{member_lines}\n"
+        f"    common formats: {sorted(intersection)}\n"
+        f"    aggregation menu: {[s.name for s in formats]}\n"
+        "Fused siblings (q/k/v, gate/up) MUST load under one format, so an "
+        "empty intersection is not an allocatable state: any format whole-"
+        "group promotion picks is illegal for at least one member, and "
+        "compute_achieved refuses to price that (it would otherwise score the "
+        "unpriced member at zero Δloss and bias the min-Δloss ratchet toward "
+        "exactly this state). Falling back to individual rows would only defer "
+        "the same failure past the solve. This is an upstream cost/legality "
+        "bug to fix, not a state to allocate around: a missing cost row for "
+        "one sibling, an over-tight applicability mask (see the "
+        "[alloc] format-applicability log lines and the mask summary JSON), or "
+        "a passthrough-source mismatch (BF16/FP8_SOURCE are legal only where "
+        "the source tensor already has that precision, so a group whose "
+        "members have different source dtypes loses them)."
+    )
 
 
 def expand_fused_sibling_assignment(assignment: dict[str, str],
@@ -820,6 +1046,11 @@ def aggregate_packed_serving_groups(
             continue
         try:
             key = group_fn(name)
+        except PackedExpertRoleUnknown:
+            # An explicit "the profile cannot describe this unit" verdict must
+            # not be swallowed into "this row has no group" (see
+            # PackedExpertRoleUnknown).
+            raise
         except Exception:
             key = None
         if key is None:
@@ -951,33 +1182,6 @@ def expand_packed_group_assignment(assignment: dict[str, str],
     return out
 
 
-# Expert projection roles that may carry distinct formats when the serving
-# lane supports per-role expert schemes (e.g. GGUF: the stacked-tensor
-# constraint is per projection, so gate/up and down may differ).
-_PACKED_ROLE_GROUPS = {
-    "gate_proj": "gate_up", "up_proj": "gate_up",
-    "gate_up_proj": "gate_up", "w1": "gate_up", "w3": "gate_up",
-    "down_proj": "down", "w2": "down",
-}
-
-
-def packed_projection_role_group(qname: str) -> str | None:
-    """Role bucket ("gate_up" / "down") for a packed-expert projection."""
-    parts = str(qname).split(".")
-    try:
-        experts_idx = len(parts) - 1 - list(reversed(parts)).index("experts")
-    except ValueError:
-        return None
-    tail = parts[experts_idx + 1:]
-    if len(tail) == 1:
-        leaf = tail[0]
-    elif len(tail) == 2 and tail[0].isdigit():
-        leaf = tail[1]
-    else:
-        return None
-    return _PACKED_ROLE_GROUPS.get(leaf)
-
-
 class _RoleSplitProfile:
     """Profile view that splits packed serving groups by projection role.
 
@@ -988,6 +1192,12 @@ class _RoleSplitProfile:
     the profile, wrapping keeps them consistent: role units stay atomic,
     and the final serving promotion remains a validated no-op. Everything
     else delegates to the wrapped profile.
+
+    The role itself comes from ``profile.packed_expert_role_group``: expert
+    leaf naming (``gate_proj``/``up_proj`` vs LFM2.5's ``w1``/``w3``, and which
+    packed 3D parent each belongs to) is profile knowledge, and the allocator
+    does not parse model names — the same boundary
+    ``packed_expert_format_group`` already respects.
     """
 
     def __init__(self, inner):
@@ -1000,9 +1210,28 @@ class _RoleSplitProfile:
         key = self._inner.packed_expert_format_group(qname)
         if key is None:
             return None
-        role = packed_projection_role_group(qname)
+        role_fn = getattr(self._inner, "packed_expert_role_group", None)
+        if not callable(role_fn):
+            raise PackedExpertRoleUnknown(
+                f"profile {type(self._inner).__name__} groups {qname!r} as a "
+                "packed-expert serving unit but has no "
+                "packed_expert_role_group accessor, so the requested "
+                "gate_up/down role split cannot be keyed. Implement it (or "
+                "inherit ModelProfile, which derives it from the profile's "
+                "packed_experts spec)."
+            )
+        role = role_fn(qname)
         if role is None:
-            return key
+            raise PackedExpertRoleUnknown(
+                f"profile {type(self._inner).__name__} groups {qname!r} as a "
+                f"packed-expert serving unit (key {key!r}) but declares no "
+                "role for its projection leaf, so the requested gate_up/down "
+                "split would silently degrade to one layer-uniform unit. "
+                "Declare the leaf in the profile's structure spec "
+                "(packed_experts.projection_splits maps each per-expert leaf "
+                "to its packed 3D parent, e.g. "
+                '{"gate_up_proj": ["w1", "w3"], "down_proj": ["w2"]}).'
+            )
         return f"{key}::role:{role}"
 
 

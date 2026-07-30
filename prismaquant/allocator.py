@@ -1164,13 +1164,19 @@ def main():
     ap.add_argument("--target-bits", type=float, default=4.75)
     ap.add_argument("--target-disk-gb", type=float, default=None,
                     help="Fit-the-card ship selection: instead of --target-bits, "
-                         "pick the highest-bpp allocation whose EXACT exported "
+                         "the card sets the CONSTRAINT and predicted Δloss the "
+                         "OBJECTIVE — among the allocations whose EXACT exported "
                          "on-disk footprint (prismaquant.footprint, validated "
                          "0.00%% vs real index.json total_size) fits this many "
-                         "decimal GB. Bisects the sub-second DP between Pareto "
-                         "grid rungs for an exact fit, overrides --target-bits "
-                         "for the emitted layer_config, and writes selection.json "
-                         "beside --pareto-csv. Needs the source model path (probe "
+                         "decimal GB, ship the one with the LOWEST predicted "
+                         "Δloss (ties -> larger footprint; more bits is not "
+                         "monotonically better, so filling the card is a proxy, "
+                         "not the objective). Bisects the sub-second DP between "
+                         "Pareto grid rungs to search denser fitting "
+                         "allocations, overrides --target-bits for the emitted "
+                         "layer_config, and writes selection.json (objective, "
+                         "search ceiling, full ratchet trace) beside "
+                         "--pareto-csv. Needs the source model path (probe "
                          "meta.model / --model-override) to size the "
                          "non-quantizable floor (lm_head/embed/norms). Unpin "
                          "lm_head (--allow-pinned lm_head) to lower the floor.")
@@ -2208,11 +2214,13 @@ def main():
 
     # ----- Byte-budget ("fit the card") ship-bpp selection -----
     # When --target-disk-gb is given, the ship bpp is set by the card, not by
-    # --target-bits: pick the highest-bpp allocation whose EXACT exported
-    # footprint fits the budget (the RD curve is log-linear, so there is no
-    # intrinsic knee to find — see rd_curve diagnostic). This is a selector over
-    # Pareto candidates with an exact, measurement-free byte objective, then a
-    # bisection of the same sub-second DP between grid rungs for an exact fit.
+    # --target-bits: the card supplies the CONSTRAINT (exact exported footprint
+    # <= budget; the RD curve is log-linear, so there is no intrinsic knee to
+    # find — see rd_curve diagnostic) and predicted Δloss supplies the
+    # OBJECTIVE (minimize it among the allocations that fit). This is a
+    # selector over Pareto candidates whose feasibility test needs no
+    # measurement, then a bisection of the same sub-second DP between grid
+    # rungs to search denser fitting allocations.
     if args.target_disk_gb is not None:
         from . import footprint as _fp
         from .saturation_select import select_under_byte_budget
@@ -2221,6 +2229,10 @@ def main():
                 "[alloc] --target-disk-gb needs the source model path (probe "
                 "meta.model or --model-override) to size the non-quantizable "
                 "floor (lm_head/embed/norms).")
+        # What the ratchet optimizes, recorded in selection.json: the shipped
+        # objective must be recoverable from the artifact, not inferred from
+        # the code version that produced it.
+        _RATCHET_OBJECTIVE = "min_predicted_dloss__ties_to_larger_footprint"
         budget_bytes = float(args.target_disk_gb) * _fp.GB
         src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
         regime = _fp.source_regime(src_by_dtype)  # recorded for reporting only
@@ -2241,28 +2253,69 @@ def main():
                 model_profile, "packed_expert_parent_for_projection", None),
         )
 
+        # Stats view for the footprint accounting: the same three-map
+        # precedence `_stats_entry_for_assignment_name` uses (aggregated DP
+        # stats > fixed MTP/visual > pre-aggregation accounting stats), so
+        # every name in an EXPANDED assignment resolves and the shared
+        # function prices exactly the tensors the inlined copy did.
+        _footprint_stats = {**accounting_stats, **fixed_stats, **stats}
+
         def _artifact_for_target(t: float):
             assign_t, ach_t, tot_t, _mut = _solve_for_target(t)
             if assign_t is None:
                 return None
             expanded_t = _expand_assignment_for_seed_json(assign_t)
-            body_aux = _assignment_bits_total(expanded_t) / 8.0
-            # A re-encoded name the manifest cannot resolve is a hard error
-            # (raised BEFORE any selection numbers are consumed): it would
-            # stay priced in the floor while its quantized body bytes are
-            # still added, and on a packed-MoE model that double-counts the
-            # entire expert mass — every rung then reads "below the floor".
-            reenc_by_name = _fp.resolve_reencoded_source_bytes(
-                src_manifest, expanded_t,
-                context=f"byte-budget selector (target_bits={t:.3f})")
-            floor = float(src_total) - sum(reenc_by_name.values())
-            _fp.check_floor_non_negative(
-                floor, float(src_total), reenc_by_name,
-                context=f"byte-budget selector (target_bits={t:.3f})")
+            ctx = f"byte-budget selector (target_bits={t:.3f})"
+            # ONE accounting path: footprint.assignment_artifact_bytes owns
+            # the manifest -> resolve -> check-non-negative -> floor sequence
+            # (shared with floor_bytes_for_model, whose exact agreement the
+            # footprint tests pin) plus the body-byte sum. Inlining a third
+            # copy here meant the shipped selector was the one path that
+            # agreement was never tested against.
+            #
+            # Both failure modes are hard errors raised BEFORE any selection
+            # number is consumed: a re-encoded name the manifest cannot
+            # resolve (its source bytes stay in the floor while its quantized
+            # bytes are still added — on a packed-MoE model the whole expert
+            # mass, after which every rung reads "below the floor"), and two
+            # names resolving to the same source span (bytes removed twice, so
+            # an over-budget artifact reads as fitting).
+            try:
+                info = _fp.assignment_artifact_bytes(
+                    expanded_t, _footprint_stats,
+                    source_total_bytes=int(src_total),
+                    source_manifest=src_manifest,
+                    regime=regime,
+                    context=ctx,
+                )
+            except ValueError as exc:
+                # House idiom for an operator-facing fatal in main(): a
+                # SystemExit line, not a raw traceback. The footprint
+                # messages already name the offending tensors.
+                raise SystemExit(f"[alloc] ERROR: {exc}") from None
+            # A name with no stats entry is priced at source precision by
+            # assignment_artifact_bytes (left in the floor, no body bytes) —
+            # correct for a verbatim tensor, but for a name the DP actually
+            # allocated it silently under-counts the body. It also breaks the
+            # provable byte-for-byte identity with the inlined accounting this
+            # replaced (which subtracted every expanded name from the floor).
+            # Any such name is an allocator/probe bug, so refuse rather than
+            # ship a number that no longer means what the label says.
+            if info["n_missing_stats"]:
+                sample = ", ".join(info["missing_stats_names"][:10])
+                raise SystemExit(
+                    f"[alloc] ERROR: {info['n_missing_stats']} allocated "
+                    f"Linear(s) have no probe stats entry, so their exported "
+                    f"bytes cannot be priced ({ctx}): {sample}"
+                    + (", …" if info["n_missing_stats"] > 10 else "")
+                    + ". The byte-budget selector would price them at source "
+                    "precision and under-count the artifact. Fix the probe / "
+                    "expansion so every allocated name carries stats.")
             return {
                 "target_bits": float(t), "achieved_bits": float(ach_t),
                 "bpp": float(ach_t), "dloss": float(tot_t),
-                "disk_bytes": floor + body_aux, "floor_bytes": floor,
+                "disk_bytes": float(info["artifact_bytes"]),
+                "floor_bytes": float(info["floor_bytes"]),
             }
 
         grid = []
@@ -2272,19 +2325,31 @@ def main():
             r = _artifact_for_target(float(row["target_bits"]))
             if r is not None:
                 grid.append(r)
+        # select_under_byte_budget is used here as the FEASIBILITY gate
+        # (feasible / below_floor / rejected_next). Its own `chosen` is the
+        # largest-footprint fitting candidate, which is deliberately NOT the
+        # ship pick — see the objective note below; it is recorded as
+        # `max_bytes_pick_*` so the two objectives stay comparable in the
+        # artifact.
         sel = select_under_byte_budget(grid, budget_bytes)
 
         rd = knee_summary.get("rd_curve") if isinstance(knee_summary, dict) else None
         selection = {
-            "schema": "prismaquant.allocator.byte_budget_selection.v1",
+            # v2: the ratchet objective changed from MAX disk bytes to MIN
+            # predicted Δloss among the fitting rungs, so `chosen_*` means
+            # something different than it did in v1. Every v1 key is kept.
+            "schema": "prismaquant.allocator.byte_budget_selection.v2",
             "mode": "byte-budget",
             "target_disk_gb": float(args.target_disk_gb),
             "budget_bytes": budget_bytes,
             "source_total_bytes": float(src_total),
             "source_regime": regime,
             "source_accounting": "per_tensor_manifest_v2",
+            "footprint_path": "footprint.assignment_artifact_bytes",
             "source_bytes_per_param": int(
                 _fp.dominant_source_bytes_per_param(src_by_dtype)),
+            "feasibility_test": "exact_artifact_bytes <= budget_bytes",
+            "ratchet_objective": _RATCHET_OBJECTIVE,
             "feasible": bool(sel["feasible"]),
             "below_floor": bool(sel["below_floor"]),
             "lm_head_unpinned": bool(allow_pinned),
@@ -2309,50 +2374,119 @@ def main():
                 f"budget, unpin lm_head (--allow-pinned lm_head), or widen the "
                 f"format menu. Selection written to {sel_path}.")
 
-        # Pick the largest-footprint allocation that fits, by RATCHETING the
-        # sub-second DP from the grid pick up to a near-lossless cap (all the
-        # most-expensive format). The ratchet (accept a probe only when it fits
-        # AND is no smaller than the best fit so far, seeded at the grid pick)
-        # guarantees we never ship below the grid pick the selector already
-        # proved feasible — robust to the DP/serving-unit-promotion making
-        # disk(target) non-monotone — and the cap lets it bisect ABOVE the
-        # densest grid rung to actually fill a roomy card (not just snap to the
-        # grid ceiling). chosen always satisfies disk <= budget by construction.
-        search_hi = float(max(int(s.weight_bits) for s in specs_sorted)) + 1.0
+        # Among the allocations whose EXACT footprint fits the card, ship the
+        # one with the LOWEST predicted Δloss — ties broken toward the larger
+        # footprint (spend the budget only when it costs nothing in predicted
+        # quality). "Fill the card" was a proxy for that, valid only while
+        # more bytes implied lower Δloss; it does not (5.5 bpp has beaten 6.0
+        # bpp on served PPL, and serving-unit promotion can flip a group into
+        # a denser-but-worse format), so ratcheting on MAX bytes could
+        # actively select a denser artifact with WORSE predicted Δloss than a
+        # sparser one that also fits. Same objective and same tie-break the
+        # solver's own feasible-iterate ratchet uses (solve_with_promotion).
+        #
+        # Δloss is comparable across rungs: every rung's value is
+        # compute_assignment_predicted_dloss over the SAME DP item set (the
+        # multi-choice knapsack assigns every item exactly one candidate at
+        # every target), in the same ½·h_trace·MSE units, and the fixed
+        # auxiliary (MTP/visual) Δloss excluded from all of them is a
+        # rung-invariant constant, so it cannot reorder them.
+        #
+        # Feasibility is unchanged: exact footprint <= budget, and the ratchet
+        # is seeded at the grid pick the shared selector already proved
+        # feasible, so the shipped artifact is never worse in predicted Δloss
+        # than that proven point.
+        def _fits(cand) -> bool:
+            return cand is not None and cand["disk_bytes"] <= budget_bytes
+
+        def _beats(cand, best) -> bool:
+            """The ratchet objective: min Δloss, ties -> larger footprint."""
+            if best is None:
+                return True
+            if cand["dloss"] != best["dloss"]:
+                return cand["dloss"] < best["dloss"]
+            return cand["disk_bytes"] > best["disk_bytes"]
+
+        best = None
+        emit_target = None
+        ratchet_trace: list[dict] = []
+
+        def _consider(cand, target: float, stage: str) -> bool:
+            """Ratchet ``cand`` in; record the probe. Returns whether it fits."""
+            nonlocal best, emit_target
+            fits = _fits(cand)
+            accepted = bool(fits and _beats(cand, best))
+            ratchet_trace.append({
+                "stage": stage,
+                "target_bits": float(target),
+                "achieved_bits": (
+                    float(cand["achieved_bits"]) if cand is not None else None),
+                "disk_gb": (
+                    cand["disk_bytes"] / _fp.GB if cand is not None else None),
+                "dloss": float(cand["dloss"]) if cand is not None else None,
+                "fits": fits,
+                "accepted": accepted,
+            })
+            if accepted:
+                best, emit_target = cand, float(target)
+            return fits
+
+        fitting = [c for c in grid if _fits(c)]
+        grid_pick = None
+        for cand in fitting:
+            if _beats(cand, grid_pick):
+                grid_pick = cand
+
+        # Near-lossless cap: all of the most expensive format, +1 bit of slack
+        # so the DP can actually reach it.
+        search_hi_cap = float(max(int(s.weight_bits) for s in specs_sorted)) + 1.0
         # Bound the ratchet by the cheapest grid rung that does NOT fit:
         # bisecting toward the near-lossless cap on a card that only fits
         # the low rungs wastes dozens of expensive DP solves at high-bin
         # targets. HEURISTIC: this assumes disk(target) is only LOCALLY
         # non-monotone — if a fitting allocation existed above the first
-        # non-fitting rung, the tightened ceiling would forgo it. The
-        # ratchet never accepts a probe below the proven grid pick, so the
-        # downside is bounded at shipping the grid pick, never worse.
+        # non-fitting rung, the tightened ceiling would forgo it, and the
+        # min-Δloss objective makes that premise weaker, not stronger. The
+        # ratchet never accepts a probe worse than the proven grid pick, so
+        # the downside is bounded at shipping the grid pick, never worse —
+        # but it IS a forgone option, so both the cap and the tightening are
+        # recorded in selection.json rather than left invisible.
         over_budget = [c for c in grid if c["disk_bytes"] > budget_bytes]
-        if over_budget:
-            search_hi = min(
-                search_hi,
-                min(float(c["target_bits"]) for c in over_budget),
-            )
+        tightening_rung = (
+            min(float(c["target_bits"]) for c in over_budget)
+            if over_budget else None)
+        search_hi = (search_hi_cap if tightening_rung is None
+                     else min(search_hi_cap, tightening_rung))
+
+        _consider(grid_pick, float(grid_pick["target_bits"]), "grid_pick")
         top = _artifact_for_target(search_hi)  # densest possible (all-expensive)
-        grid_pick = sel["chosen"]
-        if top is not None and top["disk_bytes"] <= budget_bytes:
-            chosen_info, emit_target, has_slack = top, search_hi, True
+        has_slack = _consider(top, search_hi, "search_hi_cap")
+        bisection_skipped_reason = None
+        if has_slack:
+            # The cap itself fits the card: nothing denser exists to bisect
+            # toward. NB the cap is only *considered*, not forced — if the
+            # grid pick has strictly lower predicted Δloss it still ships.
+            bisection_skipped_reason = "search_hi_fits_budget"
+        elif search_hi <= float(grid_pick["target_bits"]) + 0.005:
+            # The tightened ceiling landed at/below the grid pick's target, so
+            # the bracket is empty and the bisection below would break on
+            # iteration 0 — it ships the grid pick with no exploration. That
+            # used to be silent; name it.
+            bisection_skipped_reason = (
+                "tightened_search_hi_at_or_below_grid_pick_target")
         else:
-            best, emit_target = grid_pick, float(grid_pick["target_bits"])
             a_t, b_t = float(grid_pick["target_bits"]), search_hi
             for _ in range(40):
                 if (b_t - a_t) <= 0.005:
                     break
                 mid = 0.5 * (a_t + b_t)
-                rm = _artifact_for_target(mid)
-                if rm is not None and rm["disk_bytes"] <= budget_bytes:
+                if _consider(_artifact_for_target(mid), mid, "bisect"):
                     a_t = mid
-                    if rm["disk_bytes"] >= best["disk_bytes"]:  # ratchet up only
-                        best, emit_target = rm, mid
                 else:
                     b_t = mid
-            chosen_info, has_slack = best, False
+        chosen_info = best
 
+        max_bytes_pick = sel["chosen"]  # what "fill the card" would have shipped
         args.target_bits = float(emit_target)  # override emit target below
         selection.update({
             "has_slack": bool(has_slack),
@@ -2362,8 +2496,33 @@ def main():
             "predicted_floor_gb": chosen_info["floor_bytes"] / _fp.GB,
             "predicted_body_gb": (chosen_info["disk_bytes"] - chosen_info["floor_bytes"]) / _fp.GB,
             "predicted_dloss": float(chosen_info["dloss"]),
+            "predicted_dloss_scope": (
+                "dp_body_items_only__excludes_fixed_auxiliary_mtp_visual"),
             "headroom_gb": (budget_bytes - chosen_info["disk_bytes"]) / _fp.GB,
             "grid_pick_target_bits": float(grid_pick["target_bits"]),
+            "grid_pick_dloss": float(grid_pick["dloss"]),
+            # The tightened ceiling the ratchet actually searched under, the
+            # untightened near-lossless cap, and what tightened it: a denser
+            # allocation forgone by the tightening leaves a trace here.
+            "search_hi_target_bits": float(search_hi),
+            "search_hi_cap_target_bits": float(search_hi_cap),
+            "search_hi_tightened_by_rung": (
+                float(tightening_rung) if tightening_rung is not None else None),
+            "search_hi_tightened": bool(search_hi < search_hi_cap),
+            "bisection_ran": bool(bisection_skipped_reason is None),
+            "bisection_skipped_reason": bisection_skipped_reason,
+            "ratchet_trace": ratchet_trace,
+            # The retired MAX-bytes objective, kept for auditability: when
+            # these agree the objective change was a no-op on this run.
+            "max_bytes_pick_target_bits": (
+                float(max_bytes_pick["target_bits"])
+                if max_bytes_pick is not None else None),
+            "max_bytes_pick_dloss": (
+                float(max_bytes_pick["dloss"])
+                if max_bytes_pick is not None else None),
+            "max_bytes_grid_pick_agrees": bool(
+                max_bytes_pick is not None
+                and max_bytes_pick["target_bits"] == grid_pick["target_bits"]),
         })
         sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
         print(
@@ -2372,10 +2531,15 @@ def main():
             f"({chosen_info['disk_bytes'] / _fp.GB:.3f}GB: floor "
             f"{chosen_info['floor_bytes'] / _fp.GB:.3f} + body "
             f"{(chosen_info['disk_bytes'] - chosen_info['floor_bytes']) / _fp.GB:.3f}, "
-            f"headroom {(budget_bytes - chosen_info['disk_bytes']) / _fp.GB:.3f}GB)"
-            + ("  [card has slack beyond near-lossless; shipping all-"
-               + max(specs_sorted, key=lambda s: s.weight_bits).name + "]"
-               if has_slack else "")
+            f"headroom {(budget_bytes - chosen_info['disk_bytes']) / _fp.GB:.3f}GB, "
+            f"Δloss={chosen_info['dloss']:.4e} = min over "
+            f"{sum(1 for r in ratchet_trace if r['fits'])} fitting probes)"
+            + ("  [card has slack beyond near-lossless]" if has_slack else "")
+            + (f"  [search_hi tightened {search_hi_cap:.3f}->{search_hi:.3f} by "
+               f"the cheapest non-fitting rung; denser allocations above it "
+               f"were not explored]" if search_hi < search_hi_cap else "")
+            + (f"  [bisection skipped: {bisection_skipped_reason}]"
+               if bisection_skipped_reason else "")
             + f" -> {sel_path}",
             flush=True,
         )

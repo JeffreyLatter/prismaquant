@@ -4,6 +4,14 @@
   "runtime": "llama_cpp_or_vllm_gguf",
   "supports_per_role_expert_schemes": true,
   "description": "GGUF container lane: llama.cpp-native serving, plus vLLM via the in-tree (<=0.19) or vllm-gguf-plugin (>=0.23) GGUF path. One container, one kernel family: only ggml tensor types are expressible, so the non-GGUF quantized formats are structurally unavailable rather than policy-denied.",
+  "export_lane": {
+    "id": "gguf",
+    "exporter": "prismaquant.export_gguf_direct",
+    "codec_formats_from": ["prismaquant.gguf_formats:GGUF_BLOCK_BYTES"],
+    "passthrough_formats": ["BF16"],
+    "reason": "exporter_cannot_emit",
+    "detail": "GGUF tensors carry a ggml quantization type; both GGUF exporters gate emission on membership in gguf_formats.GGUF_BLOCK_BYTES (the block/type_size table that also drives the byte packers). BF16 is the container passthrough (written as an F16/F32 tensor). Nothing else -- NVFP4, the MX family, FP8_E4M3/FP8_SOURCE -- has a ggml type, so it cannot be expressed in this container at all."
+  },
   "format_rules": [
     {
       "id": "gguf_container_formats",

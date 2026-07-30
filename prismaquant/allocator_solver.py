@@ -12,6 +12,27 @@ from dataclasses import dataclass
 
 from . import format_registry as fr
 
+
+class PackedExpertRoleUnknown(RuntimeError):
+    """A role split was requested for an expert projection the profile cannot
+    name a role for (see ``allocator_candidates._RoleSplitProfile``).
+
+    Raised (not returned as None) because the split is opt-in and already
+    hard-gated on a serving profile that declares per-role expert schemes: the
+    operator asked for gate_up/down units, so quietly falling back to
+    layer-uniform units for the leaves the profile does not recognize would
+    ship a DIFFERENT allocation than the one requested, with no signal — and a
+    partial fallback is worse than none (some layers split, some not). The
+    remedy is one line of declarative spec, so failing loud costs one run and
+    fixes the architecture permanently.
+
+    Defined here rather than beside its raiser because both the aggregation
+    path (``allocator_candidates``) and the promotion path (this module) must
+    catch-and-re-raise it, and ``allocator_candidates`` imports from this
+    module — so this is the only home that does not close an import cycle.
+    ``allocator_candidates`` re-exports it.
+    """
+
 # Read once at import (coarse offline path; no per-call getenv).
 _SOLVER_TRACE = os.environ.get("PRISMAQUANT_SOLVER_TRACE", "") not in ("", "0")
 
@@ -62,6 +83,15 @@ def _packed_groups_by_profile(names, profile) -> dict[str, list[str]]:
     for name in names:
         try:
             key = group_fn(name)
+        except PackedExpertRoleUnknown:
+            # A profile that cannot name a packed expert's role under
+            # --packed-role-split is a declaration gap, not a "this row has no
+            # group" answer: swallowing it here would silently promote the two
+            # roles as one unit, i.e. ship a DIFFERENT allocation than the
+            # operator asked for. Aggregation raises this first today, so this
+            # is defence in depth for any future path that promotes without
+            # aggregating.
+            raise
         except Exception:
             key = None
         if key is None:

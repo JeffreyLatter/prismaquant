@@ -97,6 +97,35 @@ def _act_width(cfg: dict) -> int:
 # checkpoint (`layers.N.ffn.experts.7.w1.weight`) naming.
 _EXPERT_TENSOR_RE = re.compile(r"\.experts\.\d+\.")
 
+# Shared-expert tensor qnames. A shared expert is ONE MLP per layer, so
+# unlike a routed expert its name carries no per-expert index:
+# `model.layers.N.mlp.shared_experts.gate_proj.weight` live, DSv4
+# checkpoint `layers.N.ffn.shared_experts.w1.weight`; Qwen-family specs
+# spell it singular (`mlp.shared_expert.gate_proj`). The trailing dot is
+# what keeps the router's `mlp.shared_expert_gate` out.
+_SHARED_EXPERT_TENSOR_RE = re.compile(r"\.shared_experts?\.")
+
+
+def declared_expert_dtype_covers(name: str) -> bool:
+    """Whether the checkpoint's `expert_dtype` declaration covers `name`.
+
+    `expert_dtype` is a statement about a layer's EXPERTS, and a MoE
+    layer's experts are its routed experts *plus* its shared expert(s) —
+    DSv4-Flash ships 256 routed + 1 shared per MoE block. The two name
+    shapes differ only in the per-expert index (routed has one, shared
+    does not), which is the sole reason this needs two patterns.
+
+    Nothing here inspects a tensor's shape or dtype: the trigger stays the
+    config declaration (`declared_fp4_expert_dtype`) and the packed layout
+    stays a hard assertion after the fact
+    (`layer_streaming._check_mxfp4_packed_grid`). Non-expert tensors
+    (attention projections, the router gate, norms) are excluded and keep
+    the block-FP8 dequant path and its `_check_fp8_scale_grid` assertion.
+    """
+    return bool(_EXPERT_TENSOR_RE.search(name)
+                or _SHARED_EXPERT_TENSOR_RE.search(name))
+
+
 # safetensors dtype names for a 1-byte integer plane — what a nibble-packed
 # MXFP4 expert weight ships as. Both spellings must be priced the same way
 # the decode treats them: `layer_streaming._check_mxfp4_packed_grid` accepts
@@ -158,10 +187,11 @@ def _shard_resident_bytes(path: Path, dtype_bytes: int,
     raw file size undercounts them 2x and blows the memory budget.
 
     ``fp4_experts`` is the checkpoint's explicit packed-FP4 expert
-    declaration (`declared_fp4_expert_dtype`): per-expert I8/U8 tensors are
-    then MXFP4 nibble-packs that dequant to TWO logical elements of the
-    execution dtype per on-disk byte (a 4x undercount at bf16 if sized
-    verbatim). Other non-float dtypes stay verbatim.
+    declaration (`declared_fp4_expert_dtype`): expert I8/U8 tensors (routed
+    and shared alike, see `declared_expert_dtype_covers`) are then MXFP4
+    nibble-packs that dequant to TWO logical elements of the execution
+    dtype per on-disk byte (a 4x undercount at bf16 if sized verbatim).
+    Other non-float dtypes stay verbatim.
 
     Parses the safetensors JSON header directly (stdlib-only; no tensor
     data is read). Raises on malformed files; the caller falls back to
@@ -181,7 +211,7 @@ def _shard_resident_bytes(path: Path, dtype_bytes: int,
         nbytes = int(off[1]) - int(off[0])
         dtype_name = str(meta.get("dtype", "")).upper()
         if (fp4_experts and dtype_name in _PACKED_BYTE_DTYPES
-                and _EXPERT_TENSOR_RE.search(key)):
+                and declared_expert_dtype_covers(key)):
             total += nbytes * 2 * int(dtype_bytes)
             continue
         src_bytes = _safetensors_source_float_bytes(dtype_name)

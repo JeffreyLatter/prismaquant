@@ -27,9 +27,15 @@ These tests pin:
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import pytest
+
 from prismaquant import format_registry as fr
 from prismaquant.allocator_candidates import (
     _PACKED_GROUP_MARKER,
+    PackedExpertRoleUnknown,
     aggregate_fused_siblings,
     aggregate_packed_serving_groups,
     expand_packed_group_assignment,
@@ -40,6 +46,7 @@ from prismaquant.allocator_solver import (
     promote_serving_units,
     solve_with_promotion,
 )
+from prismaquant.model_profiles import DefaultProfile
 
 
 class _PackedProfile:
@@ -55,6 +62,12 @@ class _PackedProfile:
             parent = ".".join(parts[: idx + 1])
             return f"{parent}::__packed_format__:gate_proj,up_proj,down_proj"
         return None
+
+    def packed_expert_role_group(self, name: str) -> str | None:
+        # Expert leaf naming is PROFILE knowledge (the allocator does not parse
+        # model names), so delegate to the real base-profile derivation rather
+        # than restating a projection table in the test fixture.
+        return DefaultProfile().packed_expert_role_group(name)
 
     def fused_sibling_group(self, name: str) -> str | None:
         return None
@@ -295,27 +308,156 @@ def test_group_units_fund_the_dense_row_and_use_headroom():
     assert promoted == expanded, "MoE promotion must be a no-op on group units"
 
 
+def test_role_group_comes_from_the_profile_not_the_allocator():
+    """The role bucket is the packed 3D PARENT the projection belongs to, and
+    the profile derives it — the allocator no longer carries its own projection
+    table (``base.py``: "the solver asks the profile for groups; it does not
+    parse model names itself"). Behaviour for today's leaf names is unchanged:
+    gate/up (``w1``/``w3``) on one unit, down (``w2``) on the other."""
+    prof = DefaultProfile()
+    assert prof.packed_expert_role_group(
+        "model.layers.3.mlp.experts.7.gate_proj") == "gate_up_proj"
+    assert prof.packed_expert_role_group(
+        "model.layers.3.mlp.experts.7.up_proj") == "gate_up_proj"
+    assert prof.packed_expert_role_group(
+        "model.layers.3.mlp.experts.7.down_proj") == "down_proj"
+    assert prof.packed_expert_role_group(
+        "model.layers.3.mlp.experts.gate_up_proj") == "gate_up_proj"
+    assert prof.packed_expert_role_group(
+        "model.layers.3.mlp.experts.0.w1") == "gate_up_proj"
+    assert prof.packed_expert_role_group(
+        "model.layers.3.mlp.experts.0.w3") == "gate_up_proj"
+    assert prof.packed_expert_role_group(
+        "model.layers.3.mlp.experts.0.w2") == "down_proj"
+    # Not an expert projection at all.
+    assert prof.packed_expert_role_group(
+        "model.layers.3.self_attn.o_proj") is None
+    # No projection table left in the allocator.
+    import prismaquant.allocator_candidates as ac
+    assert not hasattr(ac, "packed_projection_role_group")
+    assert not hasattr(ac, "_PACKED_ROLE_GROUPS")
+
+
+def test_packed_expert_role_group_covers_every_spec_leaf_name():
+    """Every expert leaf name any shipped structure spec declares must get a
+    role from its own profile, and the gate_up/down partition must match the
+    convention the allocator used to hardcode. Proven over
+    ``model_profiles/specs/*.json`` so a spec cannot introduce a leaf the role
+    split silently cannot key."""
+    from prismaquant.model_profiles import registry as prof_registry
+
+    profiles = {p().name: p() for p in prof_registry._REGISTERED}
+    profiles["default"] = DefaultProfile()
+    expected = {
+        "gate_proj": "gate_up_proj", "up_proj": "gate_up_proj",
+        "gate_up_proj": "gate_up_proj", "w1": "gate_up_proj",
+        "w3": "gate_up_proj",
+        "down_proj": "down_proj", "w2": "down_proj",
+    }
+
+    spec_dir = Path(prof_registry.__file__).resolve().parent / "specs"
+    spec_files = sorted(spec_dir.glob("*.json"))
+    assert spec_files, f"no structure specs found under {spec_dir}"
+    checked = 0
+    for path in spec_files:
+        payload = json.loads(path.read_text())
+        packed = payload.get("packed_experts") or {}
+        leaves = set(packed.get("param_names") or ())
+        splits = packed.get("projection_splits") or {}
+        for parent, projections in splits.items():
+            leaves.add(parent)
+            leaves.update(projections)
+        for group in packed.get("format_groups") or ():
+            leaves.update(group)
+        if not leaves:
+            continue
+        profile = profiles.get(path.stem)
+        assert profile is not None, (
+            f"spec {path.name} has no registered profile named {path.stem!r}")
+        for leaf in sorted(leaves):
+            assert leaf in expected, (
+                f"{path.name} declares expert leaf {leaf!r} with no expected "
+                "role in this test — extend the profile's projection_splits "
+                "and this table together")
+            for qname in (
+                f"model.layers.0.mlp.experts.{leaf}",
+                f"model.layers.0.mlp.experts.3.{leaf}",
+            ):
+                got = profile.packed_expert_role_group(qname)
+                assert got == expected[leaf], (
+                    f"{path.stem}: {qname} -> {got!r}, want "
+                    f"{expected[leaf]!r}")
+                checked += 1
+    assert checked >= 2 * len(expected), checked
+
+
+def test_role_split_hard_errors_on_a_leaf_the_profile_cannot_name():
+    """A new architecture whose expert leaves the profile does not declare must
+    FAIL, not silently fall back to one layer-uniform unit: the split is opt-in
+    and hard-gated, so the operator asked for role units and would otherwise
+    ship a different allocation with no signal. The error names the qname and
+    points at the declarative fix."""
+    from prismaquant.allocator_candidates import packed_role_split_profile
+
+    class _NewArch:
+        """Groups an unfamiliar expert leaf, and cannot name its role."""
+
+        def packed_expert_format_group(self, name: str) -> str | None:
+            return "layer0::experts" if ".experts." in name else None
+
+        def packed_expert_role_group(self, name: str) -> str | None:
+            return DefaultProfile().packed_expert_role_group(name)
+
+    prof = packed_role_split_profile(_NewArch())
+    with pytest.raises(PackedExpertRoleUnknown) as exc:
+        prof.packed_expert_format_group("model.layers.0.mlp.experts.0.wi_0")
+    msg = str(exc.value)
+    assert "wi_0" in msg and "projection_splits" in msg
+    # A profile with no role accessor at all is the same explicit failure.
+    class _NoRoles:
+        def packed_expert_format_group(self, name: str) -> str | None:
+            return "layer0::experts" if ".experts." in name else None
+
+    with pytest.raises(PackedExpertRoleUnknown):
+        packed_role_split_profile(_NoRoles()).packed_expert_format_group(
+            "model.layers.0.mlp.experts.0.gate_proj")
+    # Non-expert names still pass through untouched (no group, no role).
+    assert prof.packed_expert_format_group(
+        "model.layers.0.self_attn.o_proj") is None
+
+
+def test_role_split_error_is_not_swallowed_into_ungrouped():
+    """The aggregation loop guards ``group_fn`` with a broad except (profiles
+    without the method), which would turn the explicit "cannot name this role"
+    verdict into "this row has no group" — the silent degradation the hard
+    error exists to prevent. It must escape."""
+    from prismaquant.allocator_candidates import packed_role_split_profile
+
+    class _NewArch:
+        def packed_expert_format_group(self, name: str) -> str | None:
+            return "layer0::experts" if ".experts." in name else None
+
+        def packed_expert_role_group(self, name: str) -> str | None:
+            return None
+
+        def fused_sibling_group(self, name: str) -> str | None:
+            return None
+
+    name = "model.layers.0.mlp.experts.0.wi_0"
+    stats = {name: {"h_trace": 1.0, "n_params": 4096,
+                    "in_features": 64, "out_features": 64}}
+    cands = {name: _mk_candidates(4096, 0.05, 0.04)}
+    prof = packed_role_split_profile(_NewArch())
+    with pytest.raises(PackedExpertRoleUnknown):
+        aggregate_packed_serving_groups(stats, {name: {}}, _specs(),
+                                        cands, prof)
+
+
 def test_role_split_profile_yields_gate_up_and_down_units():
     """--packed-role-split granularity: per layer, gate+up projections form
     one DP/serving unit and down projections another; promotion through the
     SAME wrapped profile treats role-mixed layer formats as coherent."""
-    from prismaquant.allocator_candidates import (
-        packed_projection_role_group,
-        packed_role_split_profile,
-    )
-
-    assert packed_projection_role_group(
-        "model.layers.3.mlp.experts.7.gate_proj") == "gate_up"
-    assert packed_projection_role_group(
-        "model.layers.3.mlp.experts.7.up_proj") == "gate_up"
-    assert packed_projection_role_group(
-        "model.layers.3.mlp.experts.7.down_proj") == "down"
-    assert packed_projection_role_group(
-        "model.layers.3.mlp.experts.gate_up_proj") == "gate_up"
-    assert packed_projection_role_group(
-        "model.layers.3.mlp.experts.0.w2") == "down"
-    assert packed_projection_role_group(
-        "model.layers.3.self_attn.o_proj") is None
+    from prismaquant.allocator_candidates import packed_role_split_profile
 
     stats, cands, expert_names, dense = _mk_moe_fixture()
     costs = {n: {} for n in stats}
@@ -336,7 +478,7 @@ def test_role_split_profile_yields_gate_up_and_down_units():
     assignment = {dense: _LOW}
     for s in supers:
         role_is_down = stats_ext[s]["_packed_group_key"].endswith(
-            "::role:down")
+            "::role:down_proj")
         assignment[s] = _HIGH if role_is_down else _LOW
     expanded = expand_packed_group_assignment(assignment, stats_ext)
     rank = {_LOW: 0, _HIGH: 1}
