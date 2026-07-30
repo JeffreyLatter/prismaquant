@@ -291,18 +291,21 @@ class HDetailIndex:
     @staticmethod
     def h_diag_from_blob(blob: dict) -> torch.Tensor:
         """Return the Fisher diagonal from an h-detail blob, in PER-TOKEN
-        units.
+        units (v4: per GLOBAL calibration token).
 
         Both writers (`sensitivity_probe.FisherAccumulator.finalize` and
-        `incremental_probe`) now normalize by token count and stamp
+        `incremental_probe`) normalize by the GLOBAL calib token count —
+        the same denominator as the scalar ``h_trace`` — and stamp
         ``units: "per_token"`` via `sensitivity_probe.h_detail_blob`
-        (audit M9). Legacy blobs without the marker:
+        (audits M9 + the PR #14 global-denominator fix). Legacy blobs:
 
-          - ``h_diag``: accepted as per-token — that writer always
-            divided by token count. Caveat: pre-v3 sensitivity blobs for
-            UNPACKED expert Linears additionally divided by route_prob
-            (audit M4) and are indistinguishable from the blob alone;
-            regenerate such h-detail dirs if expert rows matter.
+          - v3 ``h_diag`` (or unmarked): accepted as per-token. Caveats,
+            both undetectable from the blob alone — regenerate the
+            h-detail dir if expert rows matter: (a) v3 blobs for
+            UNPACKED per-expert Linears divided by the row's ROUTED
+            token count, (global/routed)× hotter than the v4/scalar
+            scale; (b) pre-v3 sensitivity blobs for those rows
+            additionally divided by route_prob (audit M4).
           - raw ``H``: the old incremental writer's token-SUMMED
             accumulator — ~n_tokens× hot for this consumer. Refuse
             rather than silently mis-scale predicted_dloss; regenerate

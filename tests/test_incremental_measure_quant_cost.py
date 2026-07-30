@@ -329,7 +329,7 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
                 )
                 loss = model(x).pow(2).sum()
                 loss.backward()
-                acc.finalize(tracker=None)
+                acc.finalize(tracker=None, global_tokens=3)
             finally:
                 acc.remove_hooks()
 

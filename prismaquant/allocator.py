@@ -1021,6 +1021,77 @@ def validate_final_serving_promotion_noop(
     )
 
 
+def renormalize_probe_fisher(stats: dict, meta: dict, *,
+                             allow_legacy: bool = False) -> int | None:
+    """Recompute h_trace/h_w2_sum/h_trace_per_expert from the stored RAW
+    accumulators with the one correct shared denominator: the global calib
+    token count.
+
+    Older incremental probes finalized `h_trace = h_trace_raw /
+    n_tokens_seen` PER ROW, where per-expert Linears only count their
+    ROUTED tokens — inflating a rarely-routed expert's Fisher by
+    (global/routed), i.e. inverted importance weighting. The typical
+    inflation is ~n_experts/top_k (≈32x on a 256-expert top-8 model);
+    the degenerate 1-routed-token case reaches ~33,000x at a 32k-token
+    calibration. Dense rows saw exactly the global count, so their values
+    are unchanged; probes written by the fixed finalize
+    (meta.fisher_norm_tokens) renormalize to identical values — the
+    recompute is idempotent.
+
+    Returns the token count used, or None when the probe carries raw
+    accumulators but no usable token count. In that case the default is a
+    HARD ERROR (SystemExit) — silently allocating on routed-token-
+    normalized Fisher mis-spends the bit budget; `allow_legacy=True`
+    (--allow-legacy-fisher-norm) downgrades it to a warning and keeps the
+    probe's stored h_trace values.
+    """
+    meta = meta or {}
+    norm_tokens = int(meta.get("fisher_norm_tokens", 0) or 0)
+    if norm_tokens <= 0:
+        norm_tokens = (int(meta.get("nsamples", 0) or 0)
+                       * int(meta.get("seqlen", 0) or 0))
+    if norm_tokens > 0:
+        renormed = 0
+        for entry in stats.values():
+            if not isinstance(entry, dict) or "h_trace_raw" not in entry:
+                continue
+            entry["h_trace"] = float(entry["h_trace_raw"]) / norm_tokens
+            if "h_w2_sum_raw" in entry:
+                entry["h_w2_sum"] = (
+                    float(entry["h_w2_sum_raw"]) / norm_tokens)
+            per_raw = entry.get("h_trace_per_expert_raw")
+            if per_raw is not None:
+                entry["h_trace_per_expert"] = [
+                    float(v) / norm_tokens for v in per_raw]
+            # Keep the probe-side stamp truthful on legacy pickles.
+            entry["h_trace_norm_tokens"] = norm_tokens
+            renormed += 1
+        print(f"[alloc] Fisher renormalized: {renormed}/{len(stats)} rows "
+              f"→ h_trace_raw / {norm_tokens} global calib tokens "
+              "(per-expert routed-count normalization corrected)", flush=True)
+        return norm_tokens
+
+    raw_rows = sum(
+        1 for e in stats.values()
+        if isinstance(e, dict) and "h_trace_raw" in e)
+    if raw_rows:
+        msg = (
+            "probe meta lacks fisher_norm_tokens and nsamples/seqlen, so "
+            f"h_trace cannot be renormalized by the global calib token "
+            f"count ({raw_rows} rows carry raw Fisher accumulators). "
+            "Legacy per-row normalization inflates routed-expert rows by "
+            "(global/routed) — typically ~n_experts/top_k — and the "
+            "allocator would mis-spend the bit budget on rarely-routed "
+            "experts. Re-run the probe with current code (it stamps "
+            "meta.fisher_norm_tokens), or pass --allow-legacy-fisher-norm "
+            "to proceed with the stored legacy values anyway.")
+        if not allow_legacy:
+            raise SystemExit(f"[alloc] ERROR: {msg}")
+        print(f"[alloc] WARNING (--allow-legacy-fisher-norm): {msg}",
+              flush=True)
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
@@ -1045,6 +1116,16 @@ def main():
                          "silently-corrupt artifact. Off by default: "
                          "the allocator hard-errors instead and asks for "
                          "--model-override.")
+    ap.add_argument("--allow-legacy-fisher-norm", action="store_true",
+                    help="Permit allocation from a probe whose meta lacks "
+                         "fisher_norm_tokens / nsamples+seqlen, i.e. whose "
+                         "h_trace cannot be renormalized by the global calib "
+                         "token count. Such probes carry the legacy per-row "
+                         "normalization that inflates routed-expert Fisher "
+                         "by (global/routed) — typically ~n_experts/top_k. "
+                         "Off by default: the allocator hard-errors and asks "
+                         "for a re-probe. Use only to reproduce historical "
+                         "allocations.")
     ap.add_argument("--target-bits", type=float, default=4.75)
     ap.add_argument("--target-disk-gb", type=float, default=None,
                     help="Fit-the-card ship selection: instead of --target-bits, "
@@ -1267,6 +1348,14 @@ def main():
     stats = probe["stats"]
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
+
+    # ---- Fisher renormalization ----
+    # One shared denominator (the global calib token count) recomputed
+    # from the stored raw accumulators; hard error on probes that cannot
+    # be renormalized unless --allow-legacy-fisher-norm. See
+    # renormalize_probe_fisher for the full story.
+    renormalize_probe_fisher(stats, probe.get("meta", {}),
+                             allow_legacy=args.allow_legacy_fisher_norm)
 
     allow_pinned = [s.strip() for s in (args.allow_pinned or "").split(",") if s.strip()]
     allocation_excluded = []

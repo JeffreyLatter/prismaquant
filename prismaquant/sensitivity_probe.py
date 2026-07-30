@@ -451,11 +451,19 @@ def load_multimodal_calibration(
 _ALLOW_SUMSQ_PACKED_FISHER_ENV = "PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER"
 
 
-def h_detail_blob(h_raw: torch.Tensor, n_tokens: int, name: str, *,
+def h_detail_blob(h_raw: torch.Tensor, global_tokens: int, name: str, *,
                   kind: str = "linear",
                   g2_per_token: torch.Tensor | None = None) -> dict:
     """Normalize a token-SUMMED Fisher diagonal accumulator to per-token
     units and wrap it in the canonical h-detail blob schema.
+
+    ``global_tokens`` must be the GLOBAL calibration token count — the
+    same denominator `finalize_fisher_stats` applies to the scalar
+    ``h_trace`` — never a per-row routed-token count. v4 pins this:
+    passing an unpacked expert Linear's own ``n_tokens_seen`` here left
+    the detail blob (global/routed)× hotter than the scalar it must
+    agree with, so `predicted_dloss` fallback rows priced expert rows on
+    a different scale than the rest of the knapsack.
 
     Every h-detail writer (this module's `FisherAccumulator.finalize` and
     `incremental_probe`'s two writer sites) goes through this helper so
@@ -466,7 +474,7 @@ def h_detail_blob(h_raw: torch.Tensor, n_tokens: int, name: str, *,
     probe produced the directory). ``g2_per_token`` is already a
     per-token vector and is stored as-is.
     """
-    tokens = max(int(n_tokens), 1)
+    tokens = max(int(global_tokens), 1)
     h = h_raw.detach().to("cpu", torch.float32) / tokens
     blob = {
         "h_diag": h,
@@ -474,11 +482,56 @@ def h_detail_blob(h_raw: torch.Tensor, n_tokens: int, name: str, *,
         "kind": kind,
         "shape": list(h.shape),
         "units": "per_token",
-        "h_detail_version": 3,   # v3: unit marker; no route_prob term (M4)
+        # v3: unit marker; no route_prob term (M4).
+        # v4: denominator is the GLOBAL calib token count for every row
+        #     (v3 unpacked-expert blobs were per-ROUTED-token).
+        "h_detail_version": 4,
+        "norm_tokens": tokens,
     }
     if g2_per_token is not None:
         blob["g2_per_token"] = g2_per_token
     return blob
+
+
+def finalize_fisher_stats(merged_stats: dict, global_tokens: int) -> None:
+    """Normalize raw Fisher accumulators into ``h_trace`` (etc.), in place.
+
+    Fisher normalization must share ONE denominator across every row: the
+    global calibration token count (nsamples x seqlen). Dense trunk Linears
+    accumulate exactly that many tokens in ``n_tokens_seen``, so their
+    values are unchanged by dividing by the global count. Per-expert
+    Linears, however, only see their ROUTED tokens; a per-row
+    ``h_trace_raw / n_tokens_seen`` inflates a rarely-routed expert's
+    Fisher by (global/routed) — exactly inverted importance weighting (the
+    least-used experts look the most sensitive). Tokens never routed to an
+    expert contribute zero gradient, so the empirical Fisher over the
+    calibration set divides by the GLOBAL count for every row.
+
+    HISTORY — this deliberately REVERSES a documented convention. Audit M4
+    removed an explicit ÷route_prob on the grounds that dividing by the
+    routed-token count was "the one implicit ÷token-fraction the MoE
+    convention prescribes", and both backends then shipped per-routed-token
+    as the single normalization (pinned by the original
+    tests/test_packed_expert_per_token_fisher.py). M4's *agreement* goal
+    stands — one division, both backends, route_prob as metadata only —
+    but per-routed-token was the wrong denominator for the mean-Δloss
+    objective the allocator optimizes: it is the same 1/p_e inflation M4
+    removed, merely implicit. CLAUDE.md §3 records the same reversal.
+
+    ``n_tokens_seen`` stays raw (routed count, metadata). Every h-detail
+    blob is normalized by the SAME global count (`h_detail_blob` v4) so
+    scalar and per-weight detail Fisher share one denominator.
+    """
+    for s in merged_stats.values():
+        s["h_trace"] = s.get("h_trace_raw", 0.0) / global_tokens
+        s["h_w2_sum"] = s.get("h_w2_sum_raw", 0.0) / global_tokens
+        # Per-expert Fisher trace (only present on packed-3D stat entries;
+        # dense Linears have no per-expert dimension). Normalize by the
+        # same token count so it shares units with `h_trace`.
+        per = s.get("h_trace_per_expert_raw")
+        if per is not None:
+            s["h_trace_per_expert"] = [float(v) / global_tokens for v in per]
+        s["h_trace_norm_tokens"] = global_tokens
 
 
 def _scalar_acc_add(acc: dict, name: str, value: torch.Tensor) -> None:
@@ -1806,7 +1859,7 @@ class FisherAccumulator:
             self.stats[name]["n_tokens_seen"] += T
         return hook
 
-    def finalize(self, tracker: RouterTracker | None):
+    def finalize(self, tracker: RouterTracker | None, global_tokens: int):
         # Flush GPU-resident scalar accumulators (h_trace, h_w2_sum) into
         # the stats dict. Single sync per Linear here costs one CUDA stall
         # per name, vs. thousands during the backward sweep without it.
@@ -1832,18 +1885,22 @@ class FisherAccumulator:
                         s["router_path"], s["expert_id"])
 
         # Single normalization convention (matches incremental_probe, the
-        # production backend): divide by the tokens this entry actually
-        # saw. For unpacked expert Linears `n_tokens_seen` counts ROUTED
-        # tokens, so this is already the per-routed-token mean — i.e. the
-        # one implicit ÷token-fraction the MoE convention prescribes.
-        # A second explicit ÷route_prob (removed here; audit M4) made
-        # this backend disagree with incremental_probe by ~1/p_e and
-        # overweighted sparse-expert rows in the same knapsack.
+        # production backend): ONE shared denominator for every row — the
+        # GLOBAL calibration token count.
+        #
+        # HISTORY: this deliberately reverses the per-`n_tokens_seen`
+        # division that audit M4 documented as "the one implicit
+        # ÷token-fraction the MoE convention prescribes" (the explicit
+        # ÷route_prob was removed then precisely because the implicit
+        # per-routed-token division already applied it). That reading was
+        # wrong for the mean-Δloss objective: tokens never routed to an
+        # expert contribute zero gradient, so dividing an unpacked expert
+        # row by its ROUTED count inflates it by (global/routed) — the
+        # very 1/p_e overweighting M4 set out to remove, merely implicit.
+        # See finalize_fisher_stats for the full derivation + history.
         # `route_prob` stays in the stats as metadata only.
-        for s in self.stats.values():
-            tokens = max(s["n_tokens_seen"], 1)
-            s["h_trace"] = s["h_trace_raw"] / tokens
-            s["h_w2_sum"] = s["h_w2_sum_raw"] / tokens
+        global_tokens = max(int(global_tokens), 1)
+        finalize_fisher_stats(self.stats, global_tokens)
 
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1884,11 +1941,14 @@ class FisherAccumulator:
             for name, acc in self._h_full.items():
                 if name not in self.stats:
                     continue
-                tokens = max(self.stats[name]["n_tokens_seen"], 1)
-                # Same normalization as the scalar trace: per (routed)
-                # token only. (A pre-v3 revision additionally divided
-                # expert entries by route_prob — audit M4; such h-detail
-                # dirs are in different units and must be regenerated.)
+                # Same denominator as the scalar trace: the GLOBAL calib
+                # token count (v4). A v3-era revision divided by this
+                # row's own n_tokens_seen — per-ROUTED-token for unpacked
+                # expert Linears, (global/routed)× hotter than the scalar
+                # — and a pre-v3 revision additionally divided expert
+                # entries by route_prob (audit M4). h-detail dirs from
+                # either era are in different units on expert rows and
+                # must be regenerated.
                 #
                 # Per-token gradient² (g²_t) — concatenate the chunk vectors
                 # collected during the hook. This is the per-token Fisher
@@ -1899,21 +1959,22 @@ class FisherAccumulator:
                                 else torch.empty(0, dtype=torch.float32))
                 fname = sub.sub("__", name) + ".pt"
                 torch.save(
-                    h_detail_blob(acc, tokens, name, kind="linear",
+                    h_detail_blob(acc, global_tokens, name, kind="linear",
                                   g2_per_token=g2_per_token),
                     self.h_detail_dir / fname)
                 self.stats[name]["h_detail_path"] = fname
             for full_name, ch in self._h_packed_channel.items():
                 if full_name not in self.stats:
                     continue
-                tokens = max(self.stats[full_name]["n_tokens_seen"], 1)
                 # Packed experts don't carry a router_path — routing is
                 # baked into the Fisher signal via how often each expert
-                # was selected. Normalize by token count only. (The
-                # channel accumulator may be device-resident; h_detail_blob
-                # lands it on CPU for the saved blob.)
+                # was selected. Normalize by the global token count, same
+                # as the scalar. (The channel accumulator may be
+                # device-resident; h_detail_blob lands it on CPU for the
+                # saved blob.)
                 fname = sub.sub("__", full_name) + ".pt"
-                torch.save(h_detail_blob(ch, tokens, full_name, kind="packed"),
+                torch.save(h_detail_blob(ch, global_tokens, full_name,
+                                         kind="packed"),
                            self.h_detail_dir / fname)
                 self.stats[full_name]["h_detail_path"] = fname
 
@@ -2272,7 +2333,11 @@ def run_probe_pass(model: nn.Module,
         del out, loss, ids, embed, logits
         acc._saved_inputs.clear()
 
-    acc.finalize(tracker)
+    # Global calib token count — must equal the meta nsamples×seqlen
+    # product below so the allocator's load-time renormalization is
+    # idempotent on probes written by this finalize.
+    fisher_norm_tokens = int(calib.size(0)) * int(seqlen)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2293,6 +2358,7 @@ def run_probe_pass(model: nn.Module,
                 "dataset": dataset_name,
                 "nsamples": calib.size(0),
                 "seqlen": seqlen,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": dtype_name,
                 "device_map": str(load_device_map),
                 "execution_device": str(exec_device),
@@ -2486,7 +2552,13 @@ def run_multimodal_visual_probe_pass(
         del out, loss, logits
         acc._saved_inputs.clear()
 
-    acc.finalize(tracker)
+    # Global calib token budget. Multimodal samples vary in real token
+    # count, so nsamples×max_text_len is an upper bound — but it is ONE
+    # shared constant across every row (relative Fisher is what the
+    # knapsack prices) and it matches the meta nsamples×seqlen product
+    # the allocator renormalizes by, keeping that recompute idempotent.
+    fisher_norm_tokens = max(int(len(triples)) * int(max_text_len), 1)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2507,6 +2579,7 @@ def run_multimodal_visual_probe_pass(
                 "dataset": dataset_name,
                 "nsamples": len(triples),
                 "seqlen": max_text_len,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": str(dtype),
                 "device_map": requested_device,
                 "execution_device": str(exec_device),
@@ -2898,7 +2971,11 @@ def run_streaming_multimodal_visual_probe_pass(
                   f"fwd_avg={total_fwd / max(successes, 1):.2f}s "
                   f"bwd_avg={total_bwd / max(successes, 1):.2f}s", flush=True)
 
-    acc.finalize(tracker)
+    # Same convention as the non-streaming multimodal pass: an upper-bound
+    # but SHARED global token constant, equal to the meta nsamples×seqlen
+    # product so the allocator's renormalization is idempotent.
+    fisher_norm_tokens = max(int(successes) * int(max_text_len), 1)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2919,6 +2996,7 @@ def run_streaming_multimodal_visual_probe_pass(
                 "dataset": dataset_name,
                 "nsamples": successes,
                 "seqlen": max_text_len,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": str(dtype),
                 "device_map": requested_device,
                 "execution_device": str(device),
