@@ -42,11 +42,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import cache_reference_log_probs
-from prismaquant.kl_measurement import (
-    L3NeighborhoodEntry,
-    measure_assignment_kl,
-    measure_propagated_costs,
-)
+from prismaquant.kl_measurement import measure_assignment_kl
 from prismaquant.measure_quant_cost import ActivationIndex, run_cost_pass
 from prismaquant.memory_management import report_graph_memory
 from prismaquant.perturbed_x_cache import capture_perturbed_activation_cache
@@ -264,7 +260,7 @@ def main() -> int:
                 str(work_root / "costs_iter_01.pkl"),
             ),
         )
-        current_kl = _phase(
+        _phase(
             records,
             "assignment-kl-graph",
             lambda: measure_assignment_kl(
@@ -275,33 +271,11 @@ def main() -> int:
                 work_root=work_root,
             ),
         )
-        neighborhood = [
-            L3NeighborhoodEntry(
-                name=target_name,
-                current_format="NVFP4",
-                formats=("MXFP8", "NVFP4", "BF16"),
-                margin=0.0,
-                l2_current_cost=0.0,
-            )
-        ]
-        l3_costs = _phase(
-            records,
-            "l3-propagated-graph",
-            lambda: measure_propagated_costs(
-                model,
-                assignment,
-                neighborhood,
-                calib_ids,
-                specs,
-                work_root=work_root,
-                max_lanes_per_batch=2,
-                tail_only=True,
-                output_mse_names=[],
-            ),
-        )
-        # The old L3 coordinate-descent graph smoke belonged to the archived
-        # cross-layer stack. The live graph smoke keeps assignment KL and
-        # lane-batched propagated KL coverage.
+        # The L3 propagated-KL phase was removed 2026-07-30 with the cascade
+        # (archive/l3_propagated_2026-07-30/, re-vet R4); the earlier L3
+        # coordinate-descent phase went with the archived cross-layer stack.
+        # The live graph smoke covers the cost pass and whole-assignment KL —
+        # the two graph-capturing paths the shipping pipeline actually runs.
 
         print(f"model={model_id} target={target_name}")
         print("phase,before_gb,peak_gb,after_gb,delta_peak_gb,elapsed_s")

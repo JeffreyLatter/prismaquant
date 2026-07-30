@@ -118,9 +118,15 @@ the bit-widths that ship (3/1180 pairs significant; pair-term ρ = −0.10), and
 non-additivity is largely a bf16 KL-differencing floor — in fp32 the per-Linear unary KLs are
 near-additive (`paper/main.tex` §additivity; §11).
 
-The retired three-level cascade (L1 Fisher → L2 perturbed-X fixed point → L3 propagated
-end-KL) is history, not architecture: L2 is **not** a live cost mode and L3 is opt-in and off
-by default. Status and citations: §4.4.
+**There is one cost level, not three.** The three-level cascade (L1 additive Fisher → L2
+perturbed-X fixed point → L3 propagated end-KL) was **retired from the spine on 2026-07-30**
+and its code walled at `archive/l3_propagated_2026-07-30/` (re-vet R4). What ships is *one
+faithful unary cost* — `production-render-score` by default, AURA where it is opted into,
+plus measured empirical unit-KL for packed experts — and *real held-out KL* to select among
+the candidates that cost proposes. The retiring evidence is measured, not argued: the L2
+fixed point beat additive L1 by **−1.5%** while AURA beat L1 by **−38.5%** on the same
+baseline (`aura_cascade_headtohead`); a better single cost was worth 25× more than another
+level. Status, citations and what survives: §4.4; wall and lesson: §11.
 
 ### 2.3 Metric authority
 
@@ -198,16 +204,14 @@ flowchart TD
   PROBE --> BASE
   ACT --> BASE
 
-  subgraph COST["cost stage -- one of four COST_MODEs, dispatched at :314-385"]
+  subgraph COST["cost stage -- one of three COST_MODEs, dispatched in the COST_MODE case"]
     PRS["production-render-score -- DEFAULT (:187)<br/>build_production_cache --render-scope format-menu<br/>then production_render_cost -> cost.pkl"]
-    STG["production-render-staged<br/>NVFP4 cache -> tail select -> promotion cache -> cost.pkl"]
     LOC["local<br/>the RTN base cost IS the allocator cost<br/>required by the GGUF and CB lanes"]
     AUR["aura -- OPT-IN (:825-957)<br/>aura_cost -> cost_aura.pkl<br/>then expert_empirical_cost --merge-base -> cost.pkl"]
     CBH["CB sub-stage (:966-1035)<br/>cb_col_weights.pkl imatrix harvest, then<br/>expert_empirical_cost --replace-experts"]
   end
 
   BASE --> PRS
-  BASE --> STG
   BASE --> LOC
   BASE --> AUR
   LOC --> CBH
@@ -215,7 +219,6 @@ flowchart TD
   ALLOC["[3/4] allocator + allocator_solver -- :1076-1090<br/>multi-choice knapsack DP over Linear x format<br/>union-find serving-unit promotion<br/>artifacts/layer_config.json + pareto.csv"]
 
   PRS --> ALLOC
-  STG --> ALLOC
   LOC --> ALLOC
   AUR --> ALLOC
   CBH --> ALLOC
@@ -300,16 +303,14 @@ Line refs are `run-pipeline.sh` unless stated. Artifact paths are relative to `$
 | **2a-CB** | imatrix column-weight harvest | inline → `export_gguf.build_imatrix_from_act_cache` + `moe_imatrix.synthesize_packed_expert_col_weights` (`617-643`) | `artifacts/cb_col_weights.pkl` | bare skip (`620`) | CB lane, `CB_EXPERT_EMPIRICAL≠1` |
 | **2b/4** | Format-menu production render for allocator cost | `build_production_cache --render-scope format-menu` (`672-686`) | `artifacts/production_render_score_cache.pkl` + `…_weight_cache/` | settings-hash (`666`) | `production-render-score` |
 | **2c/4** | Synthesize allocator cost from render scores | `prismaquant.production_render_cost` (`704-711`) | `artifacts/cost.pkl` | **bare skip** (`690`) | `production-render-score` |
-| **2b–2e** | NVFP4 cache → tail selection → promotion-format cache → staged cost | `build_production_cache` (`722-736`, `778-793`), `production_render_cost` (`749-757`, `809-819`) | `…staged_nvfp4_cache.pkl`, `…tail_qnames.txt`, `…tail_summary.json`, `…staged_cache.pkl`, `cost.pkl` | **bare skip** (`720`, `740`, `776`, `800`) | `production-render-staged` |
 | **2b/4** | Format-menu cache for AURA dW | `build_production_cache … --render-scope format-menu` (`857-871`) | frontier cache under validated-surrogate, else `production_render_score_cache.pkl` (`366-378`) | settings-hash (`851`) | `aura`; `exit 2` if the menu is BF16-only (`847-850`) |
 | **2c/4** | AURA downstream-KL-adjoint cost | `prismaquant.aura_cost` (`881-900`) | `artifacts/cost_aura.pkl` | **bare skip** (`879`) | `aura` |
 | **2d/4** | Hybrid finalize: empirical packed-expert unit-KL + sidecar backfill | `prismaquant.expert_empirical_cost --merge-base --backfill-base` (`920-929`) or inline backfill (`932-952`) | `artifacts/cost.pkl` | **bare skip** (`909`) | `aura` |
 | **2d-CB** | CB hybrid: replace packed-expert rows with empirical unit-KL | col-weight harvest (`985-1008`) → `expert_empirical_cost --replace-experts --col-weights` (`1024-1035`) | `artifacts/cost_local_raw.pkl`, `artifacts/cost.pkl`, `cb_col_weights.pkl` | provenance probe on `cost.pkl` (`971-981`); col-weights bare skip (`985`) | CB lane, `CB_EXPERT_EMPIRICAL=1` (default) |
 | **3/4** | Allocator — multi-choice knapsack over per-Linear formats (§4) | `prismaquant.allocator` (`1076-1090`) | `artifacts/layer_config.json`, `artifacts/pareto.csv`, `artifacts/pareto_assignments/` (validated-surrogate only, `1056-1061`); `logs/allocator.log` | **none — always runs** | — |
-| **4/4 A** | Frontier format-menu cache | `build_production_cache … --render-packed-experts` (`1154-1168`) or `tools.build_union_cache` (`1140-1151`, `PRODUCTION_CACHE_UNION=1`) | `artifacts/production_weight_cache_frontier_raw.pkl` + `…_frontier/` | **bare skip** (`1134`) | validated-surrogate; `exit 2` if `PRODUCTION_CACHE=0` (`1096-1099`) |
+| **4/4 A** | Frontier format-menu cache | `build_production_cache … --render-scope format-menu --render-packed-experts` | `artifacts/production_weight_cache_frontier_raw.pkl` + `…_frontier/` | **bare skip** | validated-surrogate; `exit 2` if `PRODUCTION_CACHE=0` |
 | **4/4 B** | Measured held-out KL per Pareto point | `prismaquant.validate_assignments_kl` (`1243-1248` per-point, `1272-1277` batched) | `artifacts/validated_frontier_kl.json` + `…_parts/*.json` (merged `1250-1269`) | **bare skip** per point (`1239`) | validated-surrogate |
 | **4/4 C** | Frontier point selection | `prismaquant.select_validated_frontier` (`1281-1288`) | overwrites `artifacts/layer_config.json`; `layer_config_validated_assignment.json`; `validated_frontier_selection.json` | none | validated-surrogate |
-| **4/4 C′** | MSE-promotion rewrite | `tools/build_mse_promotion_assignment.py` (`1301-1313`) | `layer_config_before_mse_promotion.json`, rewritten `layer_config.json`, `mse_promotion_report.json` | none | `MSE_PROMOTION=1`; `exit 2` unless a target/delta is set (`1292-1299`) |
 | **4/4 D** | Production cache build / recache for the selected assignment | `production_recache` (`1331-1346`, `1399-1414`) or `build_production_cache --recache-layer-config` (`1379-1396`, `1423-1438`) | `production_weight_cache_frontier_<digest>_recached.pkl` (`1328`), `production_weight_cache_recached.pkl` / `…_raw.pkl` (`1102-1103`) | settings-hash on the recached path (`1372`); **bare skip** on the frontier recache (`1329`) and the non-recache raw (`1421`) | `PRODUCTION_CACHE=1` |
 | **4/4 E-gguf** | GGUF skeleton + export + llama.cpp smoke | `convert_hf_to_gguf.py` (`1461-1464`), `prismaquant.export_gguf` (`1469-1493`), `llama-completion` (`1500-1516`) | `artifacts/skeleton.gguf`, `exported.gguf` | settings-hash on the skeleton (`1455`); export always runs | GGUF lane; **exits 0 at `1523`** |
 | **4/4 E-cb** | CB col-weights + codebook export | col-weights (`1556-1582`), `export_nvfp4_cb[_streaming]` (`1592-1641`) | `exported_nvfp4_cb/` | **bare skip** on col-weights (`1556`); export always runs | CB lane; no in-lane serving smoke (`1649-1654`); **exits 0 at `1661`** |
@@ -368,21 +369,32 @@ non-recache raw cache are all **silently reused across setting changes**. Re-run
 cost table built under the old settings without a word — the exact failure the guard exists to
 close, currently covering under half the artifacts. §12 D6.
 
-### 3.5 Archived modes — the seven `exit 2` gates
+### 3.5 Archived modes — the eleven `exit 2` gates
 
 | Trigger | Lines | Archive |
 |---|---|---|
-| `COST_MODE=grouped-kl` | `337-340` | `archive/grouped_kl_2026-05-28` |
-| `FISHER_WEIGHTED_GPTQ` truthy | `233-241` | `archive/fisher_2026-05-15` |
-| `FISHER_OUTPUT_MSE_ALLOCATOR` truthy | `233-241` | `archive/fisher_2026-05-15` |
-| `PRODUCTION_CACHE_LEVERS` ∋ `fisher_gptq` | `243-248` | `archive/fisher_2026-05-15` |
-| `HADAMARD_DUQUANT` truthy | `387-393` | `archive/hdq_2026-05-14` |
-| `PRODUCTION_CACHE_LEVERS` ∋ `hadamard_duquant` | `394-399` | same |
-| `MULTI_SHOT_PASSES` ∉ {unset, 1} | `400-406` | `archive/multi_shot_2026-05-19` |
+| `COST_MODE=grouped-kl` | `308-312` | `archive/grouped_kl_2026-05-28` |
+| `COST_MODE=production-render-staged` \| `-tail` | `318-322` | `archive/production_render_staged_2026-07-30` |
+| `FISHER_WEIGHTED_GPTQ` truthy | `205-213` | `archive/fisher_2026-05-15` |
+| `FISHER_OUTPUT_MSE_ALLOCATOR` truthy | `205-213` | `archive/fisher_2026-05-15` |
+| `PRODUCTION_CACHE_LEVERS` ∋ `fisher_gptq` | `215-220` | `archive/fisher_2026-05-15` |
+| `HADAMARD_DUQUANT` truthy | `354-360` | `archive/hdq_2026-05-14` |
+| `PRODUCTION_CACHE_LEVERS` ∋ `hadamard_duquant` | `361-366` | same |
+| `MULTI_SHOT_PASSES` ∉ {unset, 1} | `367-373` | `archive/multi_shot_2026-05-19` |
+| `ALLOC_PROPAGATED_SENSITIVITY_REPORT` non-empty | `374-380` | `archive/l3_propagated_2026-07-30` |
+| `PRODUCTION_CACHE_UNION` truthy | `381-387` | `archive/union_cache_2026-07-30` |
+| `MSE_PROMOTION` truthy | `388-394` | `archive/mse_promotion_2026-07-30` |
 
-Each error string carries the measurement that killed the lever. These four archive
-directories are load-bearing for the orchestrator: moving or renaming them breaks the gates.
-Lessons: §11.
+Four of these landed with the 2026-07-30 re-vet (R17, R4, R18 ×2). Each error string carries
+**the measurement that killed the lever**, so the refusal teaches rather than merely blocks.
+The archive directory names are load-bearing for the orchestrator: moving or renaming one
+breaks its gate. Lessons: §11.
+
+A twelfth refusal lives outside `run-pipeline.sh`: `export_native_compressed.main()` calls
+`_refuse_archived_block_output_match()`, which `SystemExit`s if
+`PRISMAQUANT_BLOCK_OUTPUT_MATCH` is set truthy (`archive/block_output_match_2026-07-30`,
+re-vet R25). It is a `SystemExit` rather than a shell gate because the lever was an exporter
+env var no pipeline stage ever set.
 
 ### 3.6 `pipeline.py` — what the contract layer actually is
 
@@ -405,7 +417,7 @@ and GPU-boundness (warn). Three load-bearing caveats:
    tree; the real streaming owner is `layer_streaming.LayerCache` (`layer_streaming.py:1253`).
 3. **Coverage is partial in both directions.** Executed-but-unmodelled:
    `production_render_cost`, `aura_cost`, `expert_empirical_cost`, `select_validated_frontier`,
-   `production_recache`, `build_union_cache`, both alternate lanes, both validators.
+   `production_recache`, both alternate lanes, both validators.
    Modelled-but-never-executed: `validate.vllm_smoke` is always stripped
    (`pipeline.py:662-663`) and `validate.kl` is stripped whenever `SELECTION_MODE=surrogate`
    (`659-660`), i.e. by default.
@@ -537,17 +549,42 @@ by `select_validated_frontier --metric ucb`. Both are **research-only** as of R2
 AURA A/B) is a thin-calibration result, and at production calibration the hedge moves 6/252
 rows to served parity — hence default-off, no driver, and the standing decision to keep `z=0`.
 
-### 4.4 L2 and L3 — status
+### 4.4 L2 and L3 — retired 2026-07-30 (`archive/l3_propagated_2026-07-30/`)
 
-**L2 perturbed-X is not a cost stage.** No `COST_MODE` runs a re-measure/re-solve loop; the
-accepted set is `local | production-render-score | production-render-staged | aura`
-(`run-pipeline.sh:314-385`). `perturbed_x_cache.py` survives only as an
-activation-cache/model-loading utility (`validate_assignments_kl.py:48-52`,
-`kl_measurement.py:50`, `production_recache.py:27`).
+Both levels of the old cascade are **walled**, not merely off. Re-vet **R4**; the wall's
+README carries the full lesson.
 
-**L3 propagated is opt-in and OFF.** The penalty applies only when
-`--propagated-sensitivity-report` is passed (`allocator.py:1325-1337`) and the pipeline leaves
-it empty (`run-pipeline.sh:218`).
+**L2 perturbed-X was never a cost stage.** No `COST_MODE` ever ran a re-measure/re-solve
+loop; the accepted set is `local | production-render-score | aura` (`run-pipeline.sh`
+`COST_MODE` case). `perturbed_x_cache.py` **stays live** — it is the activation-cache /
+model-loading utility that `validate_assignments_kl`, `kl_measurement` and
+`production_recache` depend on, and it always was.
+
+**L3 propagated end-KL is walled.** `kl_sensitivity_probe.py` (3,678 L),
+`propagated_sensitivity_costs.py`, `sensitivity_response.py`, the five
+`--propagated-sensitivity-*` allocator arguments and the L3 half of `kl_measurement.py`
+(97 top-level symbols, ~4.3k lines, now
+`archive/l3_propagated_2026-07-30/prismaquant/kl_measurement_l3.py` — still importable
+against the live tree) all moved. Setting `ALLOC_PROPAGATED_SENSITIVITY_REPORT` is `exit 2`
+(§3.5).
+
+**Why, in three measurements** — none of them an argument:
+
+| Evidence | Result |
+|---|---|
+| `aura_cascade_headtohead` | L2 fixed point beats additive L1 by **−1.5%**; AURA beats L1 by **−38.5%** |
+| `xlayer_sensitivity_2026_06_09` + `cross_layer_additivity_fp32` | pairwise residual **+5–12% and diffuse**, **3/1180** pairs significant; the apparent non-additivity is a **bf16 differencing artifact** — per-Linear KLs add in fp32 |
+| §11 / `prismaclade_l3_non_additivity` | L3 costs measured under an L2 context do **not** sum when many flip at once, so L3's expensive measurement could not be composed anyway |
+
+L3's only consumer (DP/coordinate-descent polish) was already archived
+(`archive/polish_2026-05-15/`), and `kl_sensitivity_probe` had zero references in
+`run-pipeline.sh` at wall time.
+
+**What survives in `kl_measurement.py`** (1,206 lines, down from 5,731): whole-assignment
+`measure_assignment_kl`, the per-sequence tail machinery (`sequence_token_nll`,
+`summarize_per_sequence_kl`, `return_per_sequence`), `assignment_bit_total` /
+`assignment_hash`, `l2_cost_value`, and the `CUDAGraphRegistry`. `validate_assignments_kl`
+and `validation_harness` are unchanged.
 
 ### 4.5 Solver
 
@@ -1760,7 +1797,12 @@ walls live under `docs/archive/`; code walls under repo-root `archive/`.
 | Surrogate-only knee | On 27B the surrogate knee picks 5.857/0.056, validated picks 5.31/0.015. Outside the additive trust region, bpp order ≠ KL order. | superseded by `SELECTION_MODE=validated-surrogate` |
 | Kneedle as the ship rule | Axis-dependent and LOO-unstable (fp32 4B: elbow at 5.00 in 454/1000 bootstraps). Byte budget + saturation B* replaced it; `allocator.py:1247-1252` says so in the CLI itself. | demoted, not removed |
 | Lagrangian λ-bisection (as selector) | The discrete frontier has non-convex pockets no λ selects. Kept as a candidate *generator*. | demoted |
-| L2 perturbed-X cascade (as a cost mode) | Beat L1 by −1.5%; AURA beat L1 by −38.5%. Cross-layer modelling bought ~nothing. Not an accepted `COST_MODE` today (§4.4). | demoted |
+| The three-level cost cascade (L1→L2→L3) | **Retired from the spine 2026-07-30 (R4).** L2 beat additive L1 by −1.5% while AURA beat L1 by −38.5%; pairwise residuals are +5–12% diffuse with 3/1180 pairs significant and the apparent non-additivity is a bf16 artifact; L3-polish-of-many does not compose. One faithful cost + real-KL selection replaced all three (§2.2, §4.4). | `archive/l3_propagated_2026-07-30/` |
+| `COST_MODE=production-render-staged` | Rendered NVFP4 first, promoted only the top-30% error tail — so every Linear outside the tail carried an `unavailable` cost the DP could not consider. On 27B its last-token-KL screen improved (0.0232 vs 0.0280) while **direct WikiText PPL regressed 10.83 vs 8.33**; the result doc says "Do not ship". The canonical screen-vs-gold inversion. | `archive/production_render_staged_2026-07-30/` |
+| `MSE_PROMOTION` post-frontier rewrite | Re-ranked the *already measured-KL-selected* point by local `output_mse_per_bit`. On 35B it beat the strategic baseline but lost to both the shipped 4.75 and the 5.16 kneedle. A post-allocator rewrite cannot beat a better cost inside the DP (AURA). No shipped run carries `layer_config_before_mse_promotion.json`. | `archive/mse_promotion_2026-07-30/` |
+| `PRODUCTION_CACHE_UNION` smart-union cache | Saved ~40% of the frontier render by offering an FP8 rung only above a percentile of the NVFP4 `output_mse` surrogate — a render-budget heuristic deciding the allocator's candidate set (principle 1). Never used by a shipped artifact. | `archive/union_cache_2026-07-30/` |
+| Block-output match (quality lever #12) | **Unreachable, not unmeasured.** The production-cache pack `continue`s first, so on the shipping recipe no dense NVFP4 Linear ever reached the branch (0 hits in two real export logs). Had it run it would have re-derived NVFP4 scales outside `_export_match_render_scale_rule` and discarded the render's `joint_mse` scales (the −6.6% M19 defect). Its `{0.95,1.0,1.05}` gain search is subsumed by JSO; its "~0.05–0.10 PPL" was a pre-JSO expectation. | `archive/block_output_match_2026-07-30/` |
+| Orphan modules and tools (4 + 6) | Zero references tree-wide; three belong to threads with recorded verdicts (damp-sweep OFF-final, xlayer null, export-config collapse subsumed). `_fast_kernel_guard` is the exception — an orphan that is a **missing caller**, booked as debt in §12 rather than declared dead. | `archive/orphans_2026-07-30/` |
 | MXFP8 in the default menu | E8M0 pow2 scale wastes ~√2 of a binade (+13.8% output MSE over 410 Gemma Linears); exact-scale FP8 Pareto-dominates. Registry entry retained. | de-menued (§5.1) |
 | NVINT2 / NVINT3 Triton kernels | Standalone vector kernels are memory-latency-bound (~6 ms/call floor on GB10); never vLLM-served. Removed from the tree. | git history only |
 | CB persistent-N dense prefill; decode contract v2; w2 `rowpack`; chunked expand/GEMM overlap | Parity-green, 0.74–5.7× slower. Quarantined behind flags, kept as measured negatives. | `docs/lanes/nvfp4-cb/STANDARDS.md` |
@@ -1786,7 +1828,7 @@ returning with a stale copy sees the resolution rather than silence.
 | D2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile — §8.5 L2. All three import sites now call `profile.build_mtp_module()` / `read_mtp_source_state_dict()` / `load_mtp_state_dict()`, keyed on the new `mtp_source_prefix()` accessor; `prismaquant/mtp_module.py` is deleted and DSv4 declares `has_mtp → False` + `"mtp."` passthrough. | §8.5 L2 | ~~HIGH~~ CLOSED | — |
 | D3 | **FIXED 2026-07-30 (R10)** — was: gridbook per-arch CB expert opt-in as a hand-maintained code list, a missing line failing silently as coherent garbage generation. Now a module-path tuple (`plugin.py:91-118`) plus an unbypassable serve-time fill assertion (`cb_fill_guard.py`, raised from `process_weights_after_loading`). §8.5 L3 has the mechanism. | §8.5 L3 | ~~HIGH~~ closed | — |
 | D4 | **`spec.default_serving_profile` is dead** — §8.5 L1, and it has a measured cost (226 Hy3 FP8 Linears silently → BF16, 2026-07-11). The `PRISMAQUANT_TARGET_PROFILE` escape hatch exists but `run-pipeline.sh` never exports it, so the production export still audits and coerces under whatever profile the *spec* declares. | §8.5 L1; `export_native_compressed.py:1953-1962`; `grep PRISMAQUANT_TARGET_PROFILE prismaquant/run-pipeline.sh` → 0 | HIGH | Unset the shell default; keep the env var as an override; have the export stage pass the allocator's resolved profile through so the two can never disagree silently. |
-| D5 | **RESOLVED 2026-07-30.** `PRISMAQUANT_GPTQ_DAMP_SWEEP` had two readers with opposite defaults — `"0"` in the exporter, `"1"` in a forked lever-defaulting copy inside the KL sensitivity probe (stale from `9c91d62`, missed by the sweep-OFF policy in `f2363e2`), so any A/B touching both compared different renders. `_normalized_production_cache_levers` now delegates to `production_weight_cache._resolve_production_render_levers` — one contract, and the probe's stamped provenance can no longer disagree with the render that produced it. | `kl_sensitivity_probe.py:272-285` | — | Done. Follow-up: a test pinning the two readers together (the delegation makes the split unrepresentable, but nothing asserts it). |
+| D5 | **RESOLVED 2026-07-30.** `PRISMAQUANT_GPTQ_DAMP_SWEEP` had two readers with opposite defaults — `"0"` in the exporter, `"1"` in a forked lever-defaulting copy inside the KL sensitivity probe (stale from `9c91d62`, missed by the sweep-OFF policy in `f2363e2`), so any A/B touching both compared different renders. `_normalized_production_cache_levers` now delegates to `production_weight_cache._resolve_production_render_levers` — one contract, and the probe's stamped provenance can no longer disagree with the render that produced it. | `archive/l3_propagated_2026-07-30/prismaquant/kl_sensitivity_probe.py:272-285`; `tests/test_production_weight_cache.py` | — | Done, and fully closed later the same day: R4 walled the probe itself, so the forked reader no longer exists in the live tree. The follow-up landed too — the delegation contract is pinned by `tests/test_production_weight_cache.py`, which carries it as a local shim and keeps every assertion (sweep OFF by default; sweep-off renders must record their fixed damp). |
 | D6 | **Only 6 of ~16 executed stages are settings-hash guarded** (§3.4). Silent stale-reuse across recipe changes. | guard `run-pipeline.sh:492-522`, applied at `:539,606,666,851,1372,1455`; unguarded at `:620,690,800,879,909,981,1009,1134,1239,1329,1421,1556` | HIGH | Extend `require_stage_settings` to the cost and frontier-cache artifacts. |
 | D7 | **RESOLVED 2026-07-30 — and the original diagnosis was wrong.** The register previously read "`pyproject.toml` on `main` is `0.1.0` while PyPI serves `0.4.1` from a tag that is not an ancestor of `main`", implying the release had been cut off-trunk. It had not: `origin/main` *was* the release source all along (`v0.2.0` `4745887` → `v0.2.1` → `v0.3.x` → `v0.4.1` `d058267`, each an ancestor of `origin/main`), and the **local** `main` ref was simply 54 commits behind. Merging `origin/main` into this branch (`8f14400`) brings the whole release stack: `pyproject.toml:7` is `0.4.1`, `requires-python = ">=3.11"` (`:14`), plus the tag-driven PyPI pipeline, packaging gates and `docs/RELEASING.md`. `git merge-base --is-ancestor v0.4.1 HEAD` → true. Lesson: verify a divergence claim against the **remote** ref before filing it as debt. | `pyproject.toml:6-14`; `.github/workflows/release.yml`; `git merge-base --is-ancestor v0.4.1 HEAD` | — | Done. Follow-up: fast-forward the local `main` ref so the next reader's `git log main` is not 54 commits stale. |
 | D8 | **Export never enforces production-cache residency.** The exporter has no `--production-cache-prefetch` argument and its prefetch helper has no `require` mode; a cache miss silently yields 0 prefetched keys (NVMe-bound export). | `run-pipeline.sh:1691-1698`; `export_native_compressed.py` `_production_cache_prefetch_assignment` `:2090-2110`, sole caller `:6237` | MED | Add a `require` mode mirroring `production_weight_cache.py:461-478`. |
@@ -1797,7 +1839,7 @@ returning with a stale copy sees the resolution rather than silence.
 | D13 | **FIXED 2026-07-30 (R22 + R27).** The two hardcoded MiniMax arch tests now route through `profile.bypass_hf_fp8_module_rewrite()` and `profile.packed_expert_module_class_names()`; `specs/minimax_m2.json` exists and declares all eight of that profile's overrides; `deepseek_v4.json` declares `default_serving_profile: vllm_packed_moe`. Core-stack arch literals in control flow: **0**. Residual (not debt, sequencing): the MiniMax Python overrides stay until the equivalence gate `tests/test_minimax_m2_spec.py` has held for a release. | §8.4, §8.5 L4 | closed | — |
 | D14 | **`plugins/gridbook/README.md` — the lane's most-read file — is materially wrong**: claims uniform-CB-only (delegation is implemented), claims mixed containers raise `NotImplementedError`, omits MoE entirely, calls even-split product mode the only supported shape, and calls `--enforce-eager` a requirement. | `gb/config.py:346-374`, `gb/tests/test_delegation.py`, `gb/moe.py`, `gb/linear.py:439` | MED | Rewrite Scope + add an MoE section; link `docs/lanes/nvfp4-cb/STANDARDS.md` rather than restate status. |
 | D15 | **CB defaults do not match shipping practice.** `CB_SCALE_CODING` defaults to `v1` (warned "serve gates pending — do NOT ship") though every shipped fp4 artifact overrides to `two_tier`; `CB_EXPERT_EMPIRICAL` defaults to `1` though every shipped MoE driver sets `0`. | `run-pipeline.sh:1547`, `:332` | MED | Flip the defaults to the shipped values, or record why the default is deliberately the conservative one. |
-| D16 | **Block-output match ships ON with a pre-JSO justification.** `PRISMAQUANT_BLOCK_OUTPUT_MATCH` defaults `"1"`; its ~0.05–0.10 PPL estimate predates JSO and has never been re-measured on the gold lane (§6.1). | `export_native_compressed.py:6168-6169`, `:6321`, `:6467` | MED | Gold-lane A/B on one 27B-class artifact, then keep or flip. |
+| D16 | **RESOLVED 2026-07-30 (R25) — as *unreachable*, not unmeasured, and the A/B was never needed.** The register asked for a gold-lane A/B on a 27B-class artifact; reading the emit-loop dispatch order answered it for free: the production-cache pack fires first and `continue`s, so with `PRODUCTION_CACHE=1` (the shipping default) **no dense NVFP4 Linear ever reached the branch** — confirmed by `grep -c "block-output-match"` → 0 on two real production export logs. Two further findings made keeping it indefensible: had it run, `_finalize_compute_only` would have re-derived per-group scales **outside** `_export_match_render_scale_rule`, discarding the render's `joint_mse` scales (the −6.6% KL defect M19 fixed everywhere else); and its `{0.95, 1.0, 1.05}` per-tensor gain re-search is subsumed by JSO, wrapped in `except Exception → WARN` so failure was invisible. Walled with `_finalize_compute_only` and the three export branches; `main()` now hard-`SystemExit`s if the flag is set truthy (§3.5). **Lesson: before funding a measurement, check the code under test executes on the recipe you ship.** | `archive/block_output_match_2026-07-30/README.md`; `export_native_compressed.py::_refuse_archived_block_output_match` | ~~MED~~ closed | — |
 | D17 | **Registry and export metadata are unreconciled sources of truth** for bits/group per format — `FormatSpec` vs the `*_SCHEME` constants, with no test comparing them (§6.4, last row). | `format_registry.py:44-168`; `export_native_compressed.py:7247-7336` | MED | Add a parametrized test asserting scheme ↔ spec agreement per production format. |
 | D18 | **PARTIALLY FIXED 2026-07-30.** `PRISMAQUANT_L2_CUDA_GRAPHS` and `PRISMAQUANT_DO_NO_HARM_MIN_GAIN` are no longer *documented as live* — `runtime_flags.md:285-286` now labels both **DEAD** with the evidence (sole occurrence a comment at `perturbed_x_cache.py:1225`; no occurrence at all, respectively) and points at the live analogue `PRISMAQUANT_RENDER_GATE_MIN_GAIN`. The entries themselves are still present rather than deleted, and the ~25 undocumented gridbook serving flags are still undocumented. | `docs/design/runtime_flags.md:285-286` | LOW | Delete the dead entries once no reader is chasing them; add the gridbook serving flags. |
 | D19 | **FIXED 2026-07-30.** The count was low: **14** launchers under `examples/launchers/`, not 8, invoke `python -m prismaquant.<module>` for a module that no longer exists (`iterate_block_clado`, `measure_block_clado`, `block_clado`, `validate_block_clado`, `measure_output_fisher`, `dense_cone`, `polish_from_assignment`, `coord_descent_polish`, `measure_adjoint_l3`, `adjoint_l3_frontier`). Walled at `archive/launchers_2026-07-30/` with a banner README enumerating each file and its dead invocation, per the dated-wall convention of §11. | `archive/launchers_2026-07-30/README.md`; `examples/launchers/README.md` | — | Done. |
@@ -1813,6 +1855,7 @@ New with the 2026-07-30 merge:
 | D25 | **Gemma4-31B tied-embeddings result is enablement, not quality.** The first end-to-end probe → cost → allocate → export on a tied model (244 NVFP4 / 119 FP8 / 27 BF16 at achieved 6.000 bpp, 27.18 GB, `tie_word_embeddings` preserved and no duplicated `lm_head` bytes) ran at **2 samples × seqlen 512** to reach failures fast. The artifact has not been served and no KL/PPL exists for it. Nothing in §1.2 should cite it. | §7.5; commit `d058267` | MED | Re-run at production calibration and take it through the §7 gates before the family table gains a row. |
 | D26 | **`--packed-role-split` is reachable only by the lane that cannot validate it.** The role split hard-gates on `supports_per_role_expert_schemes`, which today only `gguf` declares — and the GGUF lane has no validated-frontier evaluator wired to a llama.cpp runtime (§9.3), so `SELECTION_MODE=surrogate` is all it has. There is also no `PACKED_ROLE_SPLIT` plumbing in `run-pipeline.sh`, so every use is a manual `allocator.py` invocation. The lever is correct and correctly gated; it is just unmeasurable on the only lane that accepts it. | `allocator.py:1289-1300`; `serving_profiles.py:636-674`; `grep -c PACKED_ROLE_SPLIT prismaquant/run-pipeline.sh` → 0 | LOW | Either wire a llama.cpp evaluator for validated-frontier selection, or A/B the split on the CB lane once `nvfp4_cb` can declare per-role schemes. |
 | D27 | **RESOLVED 2026-07-30 (R10).** The skew was real but benign: releases are cut from the standalone `/home/rob/gridbook` repo (PyPI 0.1.1), never from this tree, and the in-tree copy is *ahead* of the release in kernel work while its label was *behind*. Fixed by labelling it as what it is — `__version__ = "0.2.0.dev0"` (`plugins/gridbook/gridbook/__init__.py:16`, still `pyproject.toml:73`'s single source of truth), a dev suffix reading "unreleased, post-0.1.1"; `plugins/gridbook/README.md` now states the release source and that the in-tree copy is the development head. | `plugins/gridbook/gridbook/__init__.py:16`; `plugins/gridbook/README.md` | ~~LOW~~ closed | — |
+| D28 | **Serve-time fast-kernel enforcement has no caller.** `require_fast_kernels(model)` — which reads the model profile's kernel requirements and hard-fails at startup when a required fast kernel (`causal-conv1d`, `flash-linear-attention`, …) is not importable — lost its only caller when `polish_from_assignment` was archived on **2026-05-15**, and was itself walled 2026-07-30 (R19) as an orphan. It is the only mechanized piece of **core principle 9's** "routed to a *performant* kernel (not a slow fallback)" gate, so that gate is **manual today**: nothing in the build or serve path refuses a checkpoint whose arch would silently fall back to the slow PyTorch implementation. The mechanism is written and tested — only the call site is missing. | `archive/orphans_2026-07-30/prismaquant/_fast_kernel_guard.py` + `tests/test_fast_kernel_guard.py`; sole historical caller `archive/polish_2026-05-15/prismaquant/polish_from_assignment.py:202` | LOW | Move the guard back and call it from `validate_native_export` / the serve launcher, keyed on the resolved profile — or, if serve-time enforcement belongs to the lane scripts, say so in §7 and delete the row. |
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, five were re-verified as still-open and are folded in above:

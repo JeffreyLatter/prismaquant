@@ -93,7 +93,9 @@ name in JSON. The shard scheduler resolves the model profile from
 
 Architecture-specific fast-kernel requirements are profile data too. The
 Qwen3.5/3.6 specs declare the `causal_conv1d` and `fla` imports required to
-avoid the slow linear-attention fallback; `_fast_kernel_guard` asks the profile
+avoid the slow linear-attention fallback; `_fast_kernel_guard` **(walled
+2026-07-30, `archive/orphans_2026-07-30/` — it has had no caller since
+2026-05-15; see ARCHITECTURE §12 D28)** asked the profile
 instead of parsing model path substrings, with a string fallback only for
 remote IDs that do not have a local `config.json`.
 

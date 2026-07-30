@@ -177,13 +177,6 @@ PY
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
 : "${PRODUCTION_CACHE_LEVERS:=gptq,static_act_order,joint_scale_opt}"
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
-# PRODUCTION_CACHE_UNION=1 switches the validated-surrogate frontier path
-# from full format-menu rendering (every Linear × every quantized format)
-# to a smart-union render that only adds FP8_DYNAMIC fallback entries for
-# Linears whose NVFP4 output_mse exceeds the band threshold. It deliberately
-# does not render MXFP8 or E5M2 fallbacks in the production path.
-: "${PRODUCTION_CACHE_UNION:=0}"
-: "${PRODUCTION_CACHE_UNION_P_FP8:=0.75}"
 : "${COST_MODE:=production-render-score}"
 : "${PRODUCTION_RENDER_COST_NSAMPLES:=8}"
 : "${PRODUCTION_RENDER_COST_SEQLEN:=1024}"
@@ -200,26 +193,6 @@ PY
 : "${PRODUCTION_RENDER_COST_SCORE_FIELD:=weight_mse}"
 : "${PRODUCTION_RENDER_COST_REQUIRE_SCORES:=0}"
 : "${PRODUCTION_RENDER_COST_REQUIRE_OUTPUT:=1}"
-: "${PRODUCTION_RENDER_COST_PROMOTE_FRACTION:=0.30}"
-: "${PRODUCTION_RENDER_COST_MIN_PROMOTE_SCORE:=}"
-: "${PRODUCTION_RENDER_COST_MAX_PROMOTIONS:=}"
-# Optional post-frontier MSE promotion rewrite. This is disabled by default
-# and only promotes existing quantized assignments to a higher target format
-# (BF16 by default), so it does not require additional production-cache
-# renders. It is intended as an explicit recipe arm for testing whether local
-# output-MSE can protect structurally sensitive regions without KL replay.
-: "${MSE_PROMOTION:=0}"
-: "${MSE_PROMOTION_CATEGORIES:=linear_attn,self_attn}"
-: "${MSE_PROMOTION_TARGET_FORMAT:=BF16}"
-: "${MSE_PROMOTION_MAX_BPP_DELTA:=}"
-: "${MSE_PROMOTION_TARGET_BPP:=}"
-: "${MSE_PROMOTION_GROUP_BY:=serving_unit}"
-: "${MSE_PROMOTION_METRIC:=output_mse_per_bit}"
-: "${ALLOC_PROPAGATED_SENSITIVITY_REPORT:=}"
-: "${ALLOC_PROPAGATED_SENSITIVITY_SCALE:=1.0}"
-: "${ALLOC_PROPAGATED_SENSITIVITY_SCORE_FIELD:=propagated_kl}"
-: "${ALLOC_PROPAGATED_SENSITIVITY_FORMAT_EXTRAPOLATION:=local_mse_ratio}"
-: "${ALLOC_PROPAGATED_SENSITIVITY_TARGET_FORMAT:=}"
 : "${EXPORT_GPTQ:=auto}"
 : "${EXPORT_SCALE_SWEEP:=auto}"
 : "${PIPELINE_SPEC_PATH:=${WORK_DIR}/artifacts/pipeline_spec.json}"
@@ -317,7 +290,6 @@ case "$COST_MODE" in
     COST_PATH="${BASE_COST_PATH}"
     PRODUCTION_RENDER_COST_CACHE_PATH=""
     PRODUCTION_RENDER_COST_CACHE_DIR=""
-    PRODUCTION_RENDER_COST_TAIL_QNAMES=""
     # One user knob drives BOTH ladder wirings (dense local cost + the
     # empirical expert stage): CB_LADDER_INTERP=1.
     if [[ "${CB_LADDER_INTERP:-0}" == "1" ]]; then
@@ -335,7 +307,7 @@ case "$COST_MODE" in
     fi
     ;;
   grouped-kl)
-    echo "[pipeline] ERROR: COST_MODE=grouped-kl — the grouped-KL (fusion-matched) cost surrogate is archived under archive/grouped_kl_2026-05-28. It fixed a local allocator non-monotonicity but LOST the shipped vLLM A/B on Qwen3.6-27B (worse exact vLLM KL and direct WikiText PPL than the shipped 5.5 artifact); see archive/grouped_kl_2026-05-28/README.md. Use production-render-score (default), production-render-staged, or local." >&2
+    echo "[pipeline] ERROR: COST_MODE=grouped-kl — the grouped-KL (fusion-matched) cost surrogate is archived under archive/grouped_kl_2026-05-28. It fixed a local allocator non-monotonicity but LOST the shipped vLLM A/B on Qwen3.6-27B (worse exact vLLM KL and direct WikiText PPL than the shipped 5.5 artifact); see archive/grouped_kl_2026-05-28/README.md. Use production-render-score (default), aura, or local." >&2
     exit 2
     ;;
   production-render-score|production-render)
@@ -343,14 +315,10 @@ case "$COST_MODE" in
     COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
     PRODUCTION_RENDER_COST_CACHE_PATH="${WORK_DIR}/artifacts/production_render_score_cache.pkl"
     PRODUCTION_RENDER_COST_CACHE_DIR="${WORK_DIR}/artifacts/production_render_score_weight_cache"
-    PRODUCTION_RENDER_COST_TAIL_QNAMES=""
     ;;
   production-render-staged|production-render-tail)
-    BASE_COST_PATH="${WORK_DIR}/artifacts/cost_baseline.pkl"
-    COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
-    PRODUCTION_RENDER_COST_CACHE_PATH="${WORK_DIR}/artifacts/production_render_score_staged_cache.pkl"
-    PRODUCTION_RENDER_COST_CACHE_DIR="${WORK_DIR}/artifacts/production_render_score_staged_weight_cache"
-    PRODUCTION_RENDER_COST_TAIL_QNAMES="${WORK_DIR}/artifacts/production_render_score_tail_qnames.txt"
+    echo "[pipeline] ERROR: COST_MODE=$COST_MODE — the staged (NVFP4-first, promote-the-tail) production-render cost is archived under archive/production_render_staged_2026-07-30. Its own 27B result doc is a refusal: the last-token-KL screen IMPROVED (0.0232 vs 0.0280) while direct WikiText PPL REGRESSED (10.83 vs 8.33) — \"Do not ship\" (docs/results/production_render_staged_27b_results_2026-05-21.md). Promote on the serving metric, not the screen. Use production-render-score (default), aura, or local." >&2
+    exit 2
     ;;
   aura)
     # AURA downstream-KL-adjoint cost (aura_cost.py): predicted_dloss from
@@ -376,10 +344,9 @@ case "$COST_MODE" in
       PRODUCTION_RENDER_COST_CACHE_PATH="${WORK_DIR}/artifacts/production_render_score_cache.pkl"
       PRODUCTION_RENDER_COST_CACHE_DIR="${WORK_DIR}/artifacts/production_render_score_weight_cache"
     fi
-    PRODUCTION_RENDER_COST_TAIL_QNAMES=""
     ;;
   *)
-    echo "[pipeline] ERROR: COST_MODE must be local, production-render-score, production-render-staged, or aura" >&2
+    echo "[pipeline] ERROR: COST_MODE must be local, production-render-score, or aura" >&2
     exit 2
     ;;
 esac
@@ -404,6 +371,27 @@ case "${MULTI_SHOT_PASSES:-1}" in
     exit 2
     ;;
 esac
+case "${ALLOC_PROPAGATED_SENSITIVITY_REPORT:-}" in
+  "") ;;
+  *)
+    echo "[pipeline] ERROR: ALLOC_PROPAGATED_SENSITIVITY_REPORT=${ALLOC_PROPAGATED_SENSITIVITY_REPORT} — L3 propagated sensitivity is archived under archive/l3_propagated_2026-07-30. The cascade it belonged to is retired: the L2 fixed point beat additive L1 by only -1.5% while AURA beat L1 by -38.5%, cross-layer residuals were +5-12% diffuse with 3 of 1180 pairs significant, and L3-polish-of-many is in the graveyard for non-additivity. One faithful cost + real-KL selection replaced it; see docs/ARCHITECTURE.md §11." >&2
+    exit 2
+    ;;
+esac
+case "${PRODUCTION_CACHE_UNION:-0}" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    echo "[pipeline] ERROR: PRODUCTION_CACHE_UNION=${PRODUCTION_CACHE_UNION} — the smart-union frontier cache is archived under archive/union_cache_2026-07-30. It pre-decided which Linears deserved an FP8 rung from a percentile of the NVFP4 output_mse surrogate, denying the real-KL frontier candidates it never got to measure (principle 1). Default 0 since it landed; no shipped artifact used it. The frontier renders the full format menu." >&2
+    exit 2
+    ;;
+esac
+case "${MSE_PROMOTION:-0}" in
+  0|false|False|FALSE|no|No|NO|"") ;;
+  *)
+    echo "[pipeline] ERROR: MSE_PROMOTION=${MSE_PROMOTION} — post-frontier MSE promotion is archived under archive/mse_promotion_2026-07-30. It rewrote the measured-KL frontier point by a local output_mse_per_bit ranking AFTER selection; on Qwen3.6-35B (Phase 1) it removed 86% of stored local MSE and landed KL 0.0898 / PPL 9.81 — beating the strategic baseline but LOSING to both the shipped 4.75 artifact and the 5.16 kneedle. Superseded by the AURA cost, which places those bits inside the DP. No shipped run carries layer_config_before_mse_promotion.json." >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "${WORK_DIR}"/{artifacts,act,work,logs,exported}
 
@@ -412,19 +400,6 @@ case "$SELECTION_MODE" in
   *)
     echo "[pipeline] ERROR: SELECTION_MODE must be surrogate or validated-surrogate" >&2
     exit 2
-    ;;
-esac
-case "$MSE_PROMOTION" in
-  0|false|False|FALSE|no|No|NO|"") ;;
-  *)
-    if [[ "$SELECTION_MODE" != "validated-surrogate" ]]; then
-      echo "[pipeline] ERROR: MSE_PROMOTION requires SELECTION_MODE=validated-surrogate; it is a post-frontier rewrite and would be inert under SELECTION_MODE=$SELECTION_MODE." >&2
-      exit 2
-    fi
-    if [[ "$PRODUCTION_CACHE" == "0" || "$PRODUCTION_CACHE" == "false" || "$PRODUCTION_CACHE" == "False" ]]; then
-      echo "[pipeline] ERROR: MSE_PROMOTION requires PRODUCTION_CACHE=1 so the selected assignment can be recached and exported from resident production weights." >&2
-      exit 2
-    fi
     ;;
 esac
 
@@ -444,7 +419,7 @@ echo "  PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
 echo "  PRODUCTION_CACHE_LEVERS=$PRODUCTION_CACHE_LEVERS"
 echo "  PRODUCTION_CACHE_DISABLE_LEVERS=$PRODUCTION_CACHE_DISABLE_LEVERS"
 echo "  COST_MODE=$COST_MODE"
-if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" || "$COST_MODE" == "production-render-staged" || "$COST_MODE" == "production-render-tail" ]]; then
+if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" ]]; then
   echo "  PRODUCTION_RENDER_COST_NSAMPLES=$PRODUCTION_RENDER_COST_NSAMPLES PRODUCTION_RENDER_COST_SEQLEN=$PRODUCTION_RENDER_COST_SEQLEN PRODUCTION_RENDER_COST_SEED=$PRODUCTION_RENDER_COST_SEED SCORE_FIELD=$PRODUCTION_RENDER_COST_SCORE_FIELD"
 fi
 if [[ "$COST_MODE" == "aura" ]]; then
@@ -714,114 +689,6 @@ if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-r
   fi
 fi
 
-if [[ "$COST_MODE" == "production-render-staged" || "$COST_MODE" == "production-render-tail" ]]; then
-  PRODUCTION_RENDER_COST_NVFP4_CACHE="${WORK_DIR}/artifacts/production_render_score_staged_nvfp4_cache.pkl"
-  PRODUCTION_RENDER_COST_TAIL_SUMMARY="${WORK_DIR}/artifacts/production_render_score_tail_summary.json"
-  if [[ ! -f "$PRODUCTION_RENDER_COST_NVFP4_CACHE" ]]; then
-    echo "[pipeline] [2b/4] rendering NVFP4 production weights for staged allocator cost ..."
-    python3 -m prismaquant.build_production_cache \
-      --model "$MODEL_PATH" \
-      --output "$PRODUCTION_RENDER_COST_NVFP4_CACHE" \
-      --formats NVFP4 \
-      --render-scope format-menu \
-      --n-calib-samples "$PRODUCTION_RENDER_COST_NSAMPLES" \
-      --calib-seqlen "$PRODUCTION_RENDER_COST_SEQLEN" \
-      --calib-seed "$PRODUCTION_RENDER_COST_SEED" \
-      --dataset "$DATASET" \
-      --dtype bf16 \
-      --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
-      --enable "$PRODUCTION_CACHE_LEVERS" \
-      --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
-      --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
-      2>&1 | tee "${WORK_DIR}/logs/production_render_score_nvfp4_cache.log"
-  else
-    echo "[pipeline] [2b/4] staged NVFP4 production-render cache exists, skipping"
-  fi
-  if [[ ! -f "$PRODUCTION_RENDER_COST_TAIL_QNAMES" ]]; then
-    echo "[pipeline] [2c/4] selecting high-error NVFP4 tail for staged promotions ..."
-    SELECT_TAIL_ARGS=()
-    if [[ -n "$PRODUCTION_RENDER_COST_MIN_PROMOTE_SCORE" ]]; then
-      SELECT_TAIL_ARGS+=(--select-tail-min-score "$PRODUCTION_RENDER_COST_MIN_PROMOTE_SCORE")
-    fi
-    if [[ -n "$PRODUCTION_RENDER_COST_MAX_PROMOTIONS" ]]; then
-      SELECT_TAIL_ARGS+=(--select-tail-max-count "$PRODUCTION_RENDER_COST_MAX_PROMOTIONS")
-    fi
-    python3 -m prismaquant.production_render_cost \
-      --production-cache "$PRODUCTION_RENDER_COST_NVFP4_CACHE" \
-      --score-field "$PRODUCTION_RENDER_COST_SCORE_FIELD" \
-      --select-tail-output "$PRODUCTION_RENDER_COST_TAIL_QNAMES" \
-      --select-tail-summary "$PRODUCTION_RENDER_COST_TAIL_SUMMARY" \
-      --select-tail-format NVFP4 \
-      --select-tail-top-fraction "$PRODUCTION_RENDER_COST_PROMOTE_FRACTION" \
-      "${SELECT_TAIL_ARGS[@]}" \
-      2>&1 | tee "${WORK_DIR}/logs/production_render_tail.log"
-  else
-    echo "[pipeline] [2c/4] staged promotion tail exists, skipping"
-  fi
-  PRODUCTION_RENDER_COST_HIGH_FORMATS="$(python3 - "$FORMATS" <<'PY'
-import sys
-from prismaquant import format_registry as fr
-
-seen = []
-for raw in sys.argv[1].split(","):
-    name = raw.strip()
-    if not name:
-        continue
-    canon = fr.canonical_format_name(name)
-    if canon not in {"BF16", "NVFP4"} and canon not in seen:
-        seen.append(canon)
-print(",".join(seen))
-PY
-)"
-  if [[ -n "$PRODUCTION_RENDER_COST_HIGH_FORMATS" && ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
-    echo "[pipeline] [2d/4] rendering staged promotion formats (${PRODUCTION_RENDER_COST_HIGH_FORMATS}) for high-error tail ..."
-    python3 -m prismaquant.build_production_cache \
-      --model "$MODEL_PATH" \
-      --output "$PRODUCTION_RENDER_COST_CACHE_PATH" \
-      --formats "$PRODUCTION_RENDER_COST_HIGH_FORMATS" \
-      --render-scope format-menu \
-      --include-qnames-file "$PRODUCTION_RENDER_COST_TAIL_QNAMES" \
-      --n-calib-samples "$PRODUCTION_RENDER_COST_NSAMPLES" \
-      --calib-seqlen "$PRODUCTION_RENDER_COST_SEQLEN" \
-      --calib-seed "$PRODUCTION_RENDER_COST_SEED" \
-      --dataset "$DATASET" \
-      --dtype bf16 \
-      --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
-      --enable "$PRODUCTION_CACHE_LEVERS" \
-      --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
-      --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
-      2>&1 | tee "${WORK_DIR}/logs/production_render_score_tail_cache.log"
-  elif [[ -z "$PRODUCTION_RENDER_COST_HIGH_FORMATS" ]]; then
-    PRODUCTION_RENDER_COST_CACHE_PATH="$PRODUCTION_RENDER_COST_NVFP4_CACHE"
-    echo "[pipeline] [2d/4] no staged high formats requested"
-  else
-    echo "[pipeline] [2d/4] staged promotion-format cache exists, skipping"
-  fi
-  if [[ ! -f "$COST_PATH" ]]; then
-    echo "[pipeline] [2e/4] synthesizing staged production-render allocator cost ..."
-    PROD_RENDER_COST_ARGS=()
-    case "$PRODUCTION_RENDER_COST_REQUIRE_OUTPUT" in
-      0|false|False|FALSE|no|No|NO|off|Off|OFF|"") ;;
-      *)
-        PROD_RENDER_COST_ARGS+=(--require-output-metric)
-        ;;
-    esac
-    python3 -m prismaquant.production_render_cost \
-      --production-cache "$PRODUCTION_RENDER_COST_CACHE_PATH" \
-      --baseline-cost "$BASE_COST_PATH" \
-      --output "$COST_PATH" \
-      --formats "$FORMATS" \
-      --score-field "$PRODUCTION_RENDER_COST_SCORE_FIELD" \
-      --missing-render-score-policy unavailable \
-      --promotion-qnames-file "$PRODUCTION_RENDER_COST_TAIL_QNAMES" \
-      --bf16-policy promotion-set \
-      "${PROD_RENDER_COST_ARGS[@]}" \
-      2>&1 | tee "${WORK_DIR}/logs/production_render_cost.log"
-  else
-    echo "[pipeline] [2e/4] staged production-render allocator cost exists, skipping"
-  fi
-fi
-
 if [[ "$COST_MODE" == "aura" ]]; then
   # [2b] Production-faithful dW cache for the AURA adjoint. Under
   # SELECTION_MODE=validated-surrogate this IS the frontier cache (identical
@@ -1059,20 +926,6 @@ if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
 else
   ALLOCATOR_PARETO_DIR=""
 fi
-ALLOCATOR_PROPAGATED_ARGS=()
-if [[ -n "$ALLOC_PROPAGATED_SENSITIVITY_REPORT" ]]; then
-  ALLOCATOR_PROPAGATED_ARGS+=(
-    --propagated-sensitivity-report "$ALLOC_PROPAGATED_SENSITIVITY_REPORT"
-    --propagated-sensitivity-scale "$ALLOC_PROPAGATED_SENSITIVITY_SCALE"
-    --propagated-sensitivity-score-field "$ALLOC_PROPAGATED_SENSITIVITY_SCORE_FIELD"
-    --propagated-sensitivity-format-extrapolation "$ALLOC_PROPAGATED_SENSITIVITY_FORMAT_EXTRAPOLATION"
-  )
-  if [[ -n "$ALLOC_PROPAGATED_SENSITIVITY_TARGET_FORMAT" ]]; then
-    ALLOCATOR_PROPAGATED_ARGS+=(
-      --propagated-sensitivity-target-format "$ALLOC_PROPAGATED_SENSITIVITY_TARGET_FORMAT"
-    )
-  fi
-fi
 python3 -m prismaquant.allocator \
   --probe "${PROBE_PATH}" \
   --costs "${COST_PATH}" \
@@ -1086,7 +939,6 @@ python3 -m prismaquant.allocator \
   --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
   --pareto-csv "${WORK_DIR}/artifacts/pareto.csv" \
   "${ALLOCATOR_PARETO_ARGS[@]}" \
-  "${ALLOCATOR_PROPAGATED_ARGS[@]}" \
   2>&1 | tee "${WORK_DIR}/logs/allocator.log"
 
 # -----------------------------------------------------------------------
@@ -1132,41 +984,22 @@ PY
     PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
     PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_frontier_raw.pkl"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
-      if [[ "${PRODUCTION_CACHE_UNION:-0}" == "1" ]]; then
-        # Smart-union render: only render FP8_DYNAMIC fallbacks for Linears
-        # whose NVFP4 output_mse is above the threshold percentile. Same
-        # cache layout as format-menu, just fewer entries.
-        echo "[pipeline] [4/4] building smart-union production cache for validated frontier ..."
-        python3 -m tools.build_union_cache \
-          --model "$MODEL_PATH" \
-          --cost-pkl "$COST_PATH" \
-          --input-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-          --output-cache-dir "$PROD_CACHE_DIR" \
-          --output-pkl "$PROD_CACHE_RAW" \
-          --dataset "$DATASET" \
-          --n-calib-samples "$NSAMPLES" \
-          --calib-seqlen "$SEQLEN" \
-          --levers "$PRODUCTION_CACHE_LEVERS" \
-          --p-fp8 "${PRODUCTION_CACHE_UNION_P_FP8:-0.75}" \
-          2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
-      else
-        echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
-        python3 -m prismaquant.build_production_cache \
-          --model "$MODEL_PATH" \
-          --output "$PROD_CACHE_RAW" \
-          --formats "$CACHE_FORMATS" \
-          --dataset "$DATASET" \
-          --n-calib-samples "$NSAMPLES" \
-          --calib-seqlen "$SEQLEN" \
-          --dtype bf16 \
-          --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
-          --enable "$PRODUCTION_CACHE_LEVERS" \
-          --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
-          --cache-dir "$PROD_CACHE_DIR" \
-          --render-scope format-menu \
-          --render-packed-experts \
-          2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
-      fi
+      echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
+      python3 -m prismaquant.build_production_cache \
+        --model "$MODEL_PATH" \
+        --output "$PROD_CACHE_RAW" \
+        --formats "$CACHE_FORMATS" \
+        --dataset "$DATASET" \
+        --n-calib-samples "$NSAMPLES" \
+        --calib-seqlen "$SEQLEN" \
+        --dtype bf16 \
+        --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+        --enable "$PRODUCTION_CACHE_LEVERS" \
+        --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+        --cache-dir "$PROD_CACHE_DIR" \
+        --render-scope format-menu \
+        --render-packed-experts \
+        2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
     else
       echo "[pipeline] [4/4] frontier production cache exists, skipping"
     fi
@@ -1286,36 +1119,6 @@ PY
       --output-assignment "${WORK_DIR}/artifacts/layer_config_validated_assignment.json" \
       --output-summary "${WORK_DIR}/artifacts/validated_frontier_selection.json" \
       2>&1 | tee "${WORK_DIR}/logs/validated_frontier_select.log"
-
-    if [[ "$MSE_PROMOTION" != "0" && "$MSE_PROMOTION" != "false" && "$MSE_PROMOTION" != "False" ]]; then
-      MSE_PROMOTION_ARGS=()
-      if [[ -n "$MSE_PROMOTION_TARGET_BPP" ]]; then
-        MSE_PROMOTION_ARGS+=(--target-bpp "$MSE_PROMOTION_TARGET_BPP")
-      elif [[ -n "$MSE_PROMOTION_MAX_BPP_DELTA" ]]; then
-        MSE_PROMOTION_ARGS+=(--max-bpp-delta "$MSE_PROMOTION_MAX_BPP_DELTA")
-      else
-        echo "[pipeline] ERROR: MSE_PROMOTION requires MSE_PROMOTION_TARGET_BPP or MSE_PROMOTION_MAX_BPP_DELTA" >&2
-        exit 2
-      fi
-      echo "[pipeline] applying MSE-driven promotion rewrite ..."
-      python3 tools/build_mse_promotion_assignment.py \
-        --base-assignment "${WORK_DIR}/artifacts/layer_config.json" \
-        --model "$MODEL_PATH" \
-        --costs "$COST_PATH" \
-        --probe "$PROBE_PATH" \
-        --output-layer-config "${WORK_DIR}/artifacts/layer_config_mse_promoted.json" \
-        --output-report "${WORK_DIR}/artifacts/mse_promotion_report.json" \
-        --categories "$MSE_PROMOTION_CATEGORIES" \
-        --target-format "$MSE_PROMOTION_TARGET_FORMAT" \
-        --group-by "$MSE_PROMOTION_GROUP_BY" \
-        --metric "$MSE_PROMOTION_METRIC" \
-        "${MSE_PROMOTION_ARGS[@]}" \
-        2>&1 | tee "${WORK_DIR}/logs/mse_promotion.log"
-      cp "${WORK_DIR}/artifacts/layer_config.json" \
-         "${WORK_DIR}/artifacts/layer_config_before_mse_promotion.json"
-      mv "${WORK_DIR}/artifacts/layer_config_mse_promoted.json" \
-         "${WORK_DIR}/artifacts/layer_config.json"
-    fi
 
     if [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
       SELECTED_DIGEST="$(python3 - "${WORK_DIR}/artifacts/layer_config.json" <<'PY'

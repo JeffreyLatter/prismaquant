@@ -25,7 +25,7 @@ def test_production_recache_default_enabled_after_smoke_ladder():
     assert "COST_MODE:=production-render-score" in script
     assert "PRODUCTION_CACHE_LEVERS:=gptq,static_act_order,joint_scale_opt" in script
     assert "includes static_act_order" not in script
-    assert "production-render-staged|production-render-tail" in script
+    assert "production-render-staged|production-render-tail" in script  # exit-2 gate arm
     assert "python3 -m prismaquant.pipeline" in script
     assert "--write-default-production" in script
     assert "--target-profile \"$TARGET_PROFILE\"" in script
@@ -35,6 +35,26 @@ def test_production_recache_default_enabled_after_smoke_ladder():
     assert "H_DETAIL_DIR" not in script
     assert "LEVER_CACHE_TAG" not in script
     assert "PROD_H_DETAIL_ARGS" not in script
+
+
+def test_production_render_staged_is_archived_and_blocked():
+    """COST_MODE=production-render-staged fails fast (re-vet R17): its own 27B
+    result doc improved the last-token-KL screen (0.0232 vs 0.0280) while
+    direct WikiText PPL regressed (10.83 vs 8.33) — "Do not ship". See
+    archive/production_render_staged_2026-07-30/README.md."""
+    script = _run_pipeline_script()
+
+    assert "archive/production_render_staged_2026-07-30" in script
+    assert "10.83 vs 8.33" in script
+    assert (
+        "COST_MODE must be local, production-render-score, or aura" in script
+    )
+    # The staged execution stages and their knobs are gone.
+    assert "--select-tail-output" not in script
+    assert "--promotion-qnames-file" not in script
+    assert "--bf16-policy" not in script
+    assert "PRODUCTION_RENDER_COST_PROMOTE_FRACTION" not in script
+    assert "PRODUCTION_RENDER_COST_TAIL_QNAMES" not in script
 
 
 def test_multi_shot_passes_is_archived_and_blocked():
@@ -58,8 +78,7 @@ def test_grouped_kl_is_archived_and_blocked():
     assert "archive/grouped_kl_2026-05-28" in script
     # It is no longer advertised as a valid COST_MODE in the catch-all error.
     assert (
-        "COST_MODE must be local, production-render-score, "
-        "production-render-staged, or aura"
+        "COST_MODE must be local, production-render-score, or aura"
         in script
     )
     assert "grouped-kl" not in script.split("COST_MODE must be", 1)[1].split(
@@ -72,12 +91,30 @@ def test_grouped_kl_is_archived_and_blocked():
     assert "COST_MODE:=production-render-score" in script
 
 
-def test_mse_promotion_fails_fast_when_inert():
+def test_mse_promotion_is_archived_and_blocked():
+    """MSE_PROMOTION fails fast with a pointer to the archive (re-vet R18).
+    The post-frontier local-MSE rewrite lost to both the shipped 4.75 artifact
+    and the 5.16 kneedle on 35B and is superseded by the AURA cost. See
+    archive/mse_promotion_2026-07-30/README.md."""
     script = _run_pipeline_script()
 
-    assert "MSE_PROMOTION requires SELECTION_MODE=validated-surrogate" in script
-    assert "MSE_PROMOTION requires PRODUCTION_CACHE=1" in script
-    assert "would be inert under SELECTION_MODE=$SELECTION_MODE" in script
+    assert "archive/mse_promotion_2026-07-30" in script
+    assert ': "${MSE_PROMOTION' not in script  # no opt-in default survives
+    assert "build_mse_promotion_assignment" not in script
+    assert "layer_config_before_mse_promotion" in script  # cited in the gate text
+    assert "MSE_PROMOTION_TARGET_BPP" not in script
+
+
+def test_production_cache_union_is_archived_and_blocked():
+    """PRODUCTION_CACHE_UNION fails fast with a pointer to the archive
+    (re-vet R18): the smart-union render pre-decided which Linears deserved an
+    FP8 rung from a surrogate percentile. See
+    archive/union_cache_2026-07-30/README.md."""
+    script = _run_pipeline_script()
+
+    assert "archive/union_cache_2026-07-30" in script
+    assert ': "${PRODUCTION_CACHE_UNION' not in script
+    assert "tools.build_union_cache" not in script
 
 
 def test_core_recipe_defaults_are_pinned():

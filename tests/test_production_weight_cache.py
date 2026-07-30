@@ -11,7 +11,7 @@ from prismaquant.export_native_compressed import (
     _resolve_gptq_fixed_damp,
     gptq_damp_sweep_enabled,
 )
-from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
+from prismaquant.production_weight_cache import _resolve_production_render_levers
 from prismaquant.build_production_cache import (
     validate_render_assignment_cache_coverage,
 )
@@ -27,6 +27,28 @@ from prismaquant.production_recache import (
     production_cache_keys_for_assignment,
     recache_production_weight_cache,
 )
+
+
+def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
+    """The `--production-cache-levers` string -> provenance dict contract.
+
+    Lived on `kl_sensitivity_probe` until 2026-07-30, when the L3 probe was
+    walled (`archive/l3_propagated_2026-07-30/`, re-vet R4). The probe's copy
+    was a one-line delegation to `_resolve_production_render_levers` after D5
+    was fixed earlier that day, so this shim is that delegation verbatim — the
+    assertions below still pin the ONE production render-lever contract
+    (notably: sweep OFF by default since 2026-06-12, and sweep-off renders must
+    record which fixed damp they used).
+    """
+    enabled = {
+        part.strip()
+        for part in str(value or "").split(",")
+        if part.strip()
+    }
+    return dict(sorted(
+        _resolve_production_render_levers({name: True for name in enabled}).items()
+    ))
+
 
 
 def test_prefetch_loads_disk_entries_and_respects_lru(tmp_path):

@@ -17,7 +17,7 @@ Ranked by leverage-per-risk, fundamentals first. "Lens" credits the arguing revi
 | **R1** | Byte budget becomes the *constraint*, measured KL the *objective*; kneedle → diagnostic (D12) | FUNDAMENTAL | M | none while opt-in | L1 |
 | **R2** | Flip `COST_MODE=aura` to default, gated on a cost-provenance stamp + wiring the additivity gate | FUNDAMENTAL | S+S+S | loud fail on stale WORK_DIR | L1 |
 | **R3** | Split `COST_MODE` into (render source)×(cost objective); `col_weights` on the CB render closes Milestone C and lifts the CB gates | FUNDAMENTAL | M–L | med — shared render path | L2 + L4 |
-| **R4** | Retire L2/L3 from the spine; archive-wall the L3 probe (~4.4k lines) | FUNDAMENTAL | M | near-zero | L6 |
+| **R4** | Retire L2/L3 from the spine; archive-wall the L3 probe — **IMPLEMENTED 2026-07-30** (measured: 97 symbols / ~4.3k lines out of `kl_measurement.py`, not the ~15 functions estimated) | FUNDAMENTAL | M | near-zero | L6 |
 | **R5** | **DISAGREEMENT** — `pipeline.py`: promote to settings-hash authority (L2) *vs* demote to linter / delete (L6) | FUNDAMENTAL | M / S | low either way | L2 vs L6 |
 | **R6** | Lane eligibility becomes model configuration (`supported_lanes`/`preferred_lane`), not an operator env var | FUNDAMENTAL | M | low, additive | L4 |
 | **R7** | Strix Halo enters **serving-only**, GGUF-first; no ROCm build stack in scope | FUNDAMENTAL | S | none | L4 |
@@ -30,15 +30,15 @@ Ranked by leverage-per-risk, fundamentals first. "Lens" credits the arguing revi
 | **R14** | Mechanize held-out disjointness by `calib_hash` intersection, hard-error; fix the wikitext `--calib-skip-first` no-op | STRUCTURAL | S | none | L5 |
 | **R15** | Serve fingerprint from the **server's** `/proc/<pid>/maps`; `kl_ab.py` refuses cross-fingerprint deltas — **IMPLEMENTED 2026-07-30** | STRUCTURAL | M | none | L5 |
 | **R16** | `LaneSpec`: one lane-uniform ship gate across native/CB/GGUF (closes D26's measurement half) | STRUCTURAL | M–L | low, additive | L4 |
-| **R17** | `COST_MODE=production-render-staged` → the eighth `exit 2` gate | STRUCTURAL | S | none | L6 |
-| **R18** | Archive-wall `PRODUCTION_CACHE_UNION` + `MSE_PROMOTION` (~1.7k lines, default-off, superseded) | STRUCTURAL | S | low | L6 |
-| **R19** | Wall 4 orphan modules + 8 orphan tools — **conflicts with R2** on `aura_additivity_gate.py` | STRUCTURAL | S | low | L6 vs L1 |
+| **R17** | `COST_MODE=production-render-staged` → the eighth `exit 2` gate — **IMPLEMENTED 2026-07-30** | STRUCTURAL | S | none | L6 |
+| **R18** | Archive-wall `PRODUCTION_CACHE_UNION` + `MSE_PROMOTION` — **IMPLEMENTED 2026-07-30**; the MSE-promotion ledger check came back CLEAR | STRUCTURAL | S | low | L6 |
+| **R19** | Wall the orphan modules + tools — **IMPLEMENTED 2026-07-30**; `aura_additivity_gate.py` kept live (R2 wins), `_fast_kernel_guard` walled + booked as §12 **D28** | STRUCTURAL | S | low | L6 vs L1 |
 | **R20** | CB ladder law: unify dense/expert chains, derive `_CB_LADDER_TOL` from anchor noise; **no served A/B** | STRUCTURAL | S–M | none (default OFF) | L1 |
 | **R21** | Persist the MoE auto-tuner's timings; **defer λ** until two boxes' cost tables disagree in ranking | STRUCTURAL | S | none | L4 |
 | **R22** | Author the `minimax_m2` structure spec + `deepseek_v4` `default_serving_profile` (D13) | STRUCTURAL | M+S | low | L3 |
 | **R23** | **Decision only:** do *not* port `run-pipeline.sh` to a `pipeline.py` executor | STRUCTURAL | free | none | L2 |
 | **R24** | Hardening pass: D8 export prefetch `require` + D9 `require_cuda_hot_path` on 7 stages | HYGIENE | S | D8 can newly fail | L2 |
-| **R25** | Archive-wall block-output-match; close D16 as *unreachable*, not *unmeasured* — do not A/B it | HYGIENE | S | none on shipping recipe | L5 |
+| **R25** | Archive-wall block-output-match; close D16 as *unreachable*, not *unmeasured* — do not A/B it — **IMPLEMENTED 2026-07-30**, D16 closed as *unreachable* | HYGIENE | S | none on shipping recipe | L5 |
 | **R26** | Conformance test: every declared spec field has a reader (the pattern behind 4 of 5 plugin leaks) | HYGIENE | S | none | L3 |
 | **R27** | Two accessor moves: `streaming_model.py:98-104` arch predicate → spec bool; probe's `MiniMaxM2Experts` → accessor | HYGIENE | S | ~zero | L3 |
 | **R28** | Phantom flags (`PRISMAQUANT_FISHER_CAP_MULTIPLIER` has zero readers), S13–S16 label inversion, `last_token_kl` rename — **D27 (gridbook version skew) resolved 2026-07-30 under R10**, the rest open | HYGIENE | S | none | L6+L5+L1 |
@@ -342,6 +342,15 @@ Quantization stays on the Spark in all three options; Strix is a serving box. Th
 
 **L5 hygiene (→ R28).** *(The `kl_mean` rename shipped with R9 on 2026-07-30: `kl_mean` is canonical, `last_token_kl` is emitted as a deprecated alias for one cycle, and `select_validated_frontier._row_metric` resolves either.)* `_kl_repeat_summary` emits the mean under the key `last_token_kl` even when the pipeline ran `--kl-scope full_sequence` (`:653`, acknowledged in the docstring) — rename to `kl_mean` with the old key aliased one cycle; the current name has already misled at least one doc. `validation_harness.validate_artifact:77-153` raises only on non-finite metrics (`:156`) and otherwise records everything — that is correct, it is a *measurement* registry, not a gate; keep it that way and add one line to §7.1 so the next reader stops reading "no thresholds at all" as a defect. Add the `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` / D24 caveat to the shipcard schema as a build-lane flag echo, so an allocation that rode an unvalidated correction is visible on the record rather than only in a probe log.
 
+
+> **OUTCOME — ACCEPTED and IMPLEMENTED 2026-07-30** (wave 2). Archive-walled outright, per the lens recommendation; the "flip the default to `0` for one cycle" option was declined because a path that silently bypasses M19 is the band-aid.
+> - `block_output_match.py` + `tests/test_block_output_match.py` → `archive/block_output_match_2026-07-30/`, with `export_branches.py` holding the three excised export sites and `_finalize_compute_only` verbatim.
+> - **The refusal is loud, not silent.** `export_native_compressed.main()` now calls `_refuse_archived_block_output_match()`, a `SystemExit` when `PRISMAQUANT_BLOCK_OUTPUT_MATCH` is set truthy — an old launcher fails with the reason rather than exporting differently in silence. `=0` and unset both pass (they already asked for what now always happens).
+> - `_quantize_2d(..., compute_only=True)` is **kept**: it is a no-pack introspection hook the export lever-threading tests use. Its production consumer is gone and the call site says so.
+> - `_render_lever_provenance()` records the constant `"archived_2026-07-30"` rather than echoing the dead env var. **This moves the export-cache fingerprint once** — deliberate, and safe: no production export was in flight.
+> - Docs: `runtime_flags.md` row rewritten as archived; `docs/README.md`'s "default-ON with no table row" drift note removed; **D16 closed as *unreachable*, not unmeasured** (§12), with the lesson recorded — *before funding a measurement, check the code under test executes on the recipe you ship*.
+> - Suite: 172 export tests green.
+
 ---
 
 ## Lens 6 — the de-scoper
@@ -358,17 +367,46 @@ Quantization stays on the Spark in all three options; Strix is a serving box. Th
 
 **Verdict-request.** Let docs+code say the cascade framing is retired? Or is L3 deliberately held for the cross-layer redesign you called "could radically change all quantization"? If held, the honest fix is to **relabel it research**, not to keep calling it level 3 of the spine.
 
+
+> **OUTCOME — ACCEPTED and IMPLEMENTED 2026-07-30** (wave 2). Robert's ruling on the verdict-request: **retire the framing**, do not hold L3 as "level 3 of the spine". The cross-layer redesign remains a live ambition; the wall's banner is where it must start, and it opens with the three measurements that closed the question.
+> - **Walled** → `archive/l3_propagated_2026-07-30/`: `kl_sensitivity_probe.py` (3,678 L), `propagated_sensitivity_costs.py`, `sensitivity_response.py`, three L3 tools, four L3 test files, and `examples/launchers/proto-production-prismascout.sh` (the launcher wall's "pending a per-stage decision" item — this is that decision).
+> - **`kl_measurement.py` split: 5,731 → 1,206 lines.** The split was computed by AST reachability from the live entrypoints, not by eye: 97 top-level symbols reachable *only* from the L3 roots moved to `kl_measurement_l3.py`; the 22 shared with `measure_assignment_kl` stayed and are re-imported by the archived module, which **was verified importable against the live tree**. The per-sequence tail machinery wave 1 added (`sequence_token_nll`, `summarize_per_sequence_kl`, `return_per_sequence`) is live and untouched. `QuantWeightCache` proved L3-only and went to the wall.
+> - **Allocator + orchestrator**: the five `--propagated-sensitivity-*` arguments, the cost-folding body and the two `propagated_sensitivity_costs` metadata keys removed (verbatim record in `allocator_propagated_surface.py`); `ALLOC_PROPAGATED_SENSITIVITY_REPORT` non-empty is now `exit 2`.
+> - **Live tests repointed rather than deleted**, because both assertions still pin live contracts: `test_production_weight_cache.py` carries the D5 damp-provenance delegation as a local shim (sweep OFF by default; sweep-off renders must record their fixed damp), and `test_format_menu_expansion.py` keeps the non-BF16 format-menu rule as a local helper — that rule is still what `run-pipeline.sh` computes for `CACHE_FORMATS`. `tools/smoke_graph_memory.py` stays live with only its L3 phase removed.
+> - **Spine rewritten**: `CLAUDE.md` §3 is now one faithful cost + real-KL selection, with a "History: the retired cascade" subsection carrying the three measurements and pointing at the wall; the governing sentence is unchanged. `ARCHITECTURE.md` §2.2 aligned, §4.4 rewritten as the wall record, §11 gains the row, §3.5's gate table renumbered.
+> - **One correction to this proposal's own accounting:** it estimated "~15 of 164 functions" of `kl_measurement.py` as L3. The measured answer is **97 of 164** and ~4.3k of 5.7k lines — the L3 half was much larger than the lens could see from the entrypoint names, because the lane-batched / override-set / paired KL engines and the whole tail-CUDA-graph cache hang off it.
+
 ### R17 (L6 P3) — `COST_MODE=production-render-staged` → the eighth `exit 2` gate · STRUCTURAL
 
 **What.** Wall the staged path (`run-pipeline.sh:717-822`, ~109 shell lines; `select_tail_from_render_scores` + 8 CLI args, `production_render_cost.py:347-505`) and fail fast like the other seven, message carrying its own measurement. **Why now.** Its own result doc is a refusal: last-token-KL screen improved (0.0232 vs 0.0280), direct WikiText PPL **regressed 10.83 vs 8.33 — "Do not ship"** (`docs/results/production_render_staged_27b_results_2026-05-21.md`; HISTORICAL at `docs/README.md:86`). Untouched since `8e071bf`. The canonical instance of the failure the graveyard records, yet still a live, selectable, bare-skip-unguarded (§3.4) cost mode with a `PROMOTE_FRACTION` knob — inconsistent with grouped-kl being `exit 2` for the same class. **Cost** S. **Risk** none — no shipped artifact used it. **Verdict-request.** Does the graveyard convention apply to a mode that lost on PPL as much as one that lost a vLLM A/B?
+
+
+> **OUTCOME — ACCEPTED and IMPLEMENTED 2026-07-30** (wave 2). Verdict on the request — **yes, the graveyard convention applies**: losing a direct PPL comparison in your own result doc is the same class as losing a vLLM A/B, and the gate text carries the numbers (0.0232 vs 0.0280 screen, 10.83 vs 8.33 PPL, "Do not ship").
+> - `COST_MODE=production-render-staged|production-render-tail` is now the **eighth** `exit 2` gate; the catch-all reads *"COST_MODE must be local, production-render-score, or aura"*.
+> - The 108-line `[2b/4]`…`[2e/4]` block, the three `PRODUCTION_RENDER_COST_*PROMOT*` knobs and `PRODUCTION_RENDER_COST_TAIL_QNAMES` are gone → `archive/production_render_staged_2026-07-30/run-pipeline-staged-block.sh`.
+> - `production_render_cost.py`: **the default path is behaviourally byte-identical.** Removed only the staged-only surface — `select_tail_from_render_scores`, `load_qnames_file`, the three staged keyword parameters (`missing_render_score_policy`, `promotion_qnames`, `bf16_policy`) with their branches and `meta` keys, and **ten** CLI arguments (the proposal said 8; the exact list is in the wall README). `--require-render-scores` already covered the strict behaviour `--missing-render-score-policy=error` duplicated.
+> - Two tests lifted to the wall as records; `docs/README.md`'s row now names the gate it feeds.
 
 ### R18 (L6 P4) — Delete `PRODUCTION_CACHE_UNION` and `MSE_PROMOTION` · STRUCTURAL
 
 **What.** Wall `tools/build_union_cache.py` (282 L) + `tools/patch_union_from_pareto.py` (97 L, zero refs) + `run-pipeline.sh:180-186,1135-1150`; and `mse_promotion.py` (633 L) + `tools/build_mse_promotion_assignment.py` (144 L) + `tests/test_mse_promotion.py` (564 L) + `run-pipeline.sh:211-217,417-430,1292-1313`. **Why now.** Union cache: default 0, untouched since `7ac2d98` (2026-05-28), smoke doc filed HISTORICAL. MSE promotion: default 0, superseded by AURA-on-MoE (`docs/README.md:89`), gated behind three conditions with a documented silent-no-op outside them (CODEX M31), and backed by **564 lines of test** — the largest test file behind a default-off superseded lever. Together ~1.7k lines and two guard branches in the orchestrator's most delicate arm. **Cost** S each. **Risk** low; both stay reachable post-wall. **Verdict-request.** Approve both — or hold MSE promotion if any shipped run's artifacts carry a `layer_config_before_mse_promotion.json`. That ledger check is the one thing the lens could not close from the tree.
 
+
+> **OUTCOME — BOTH ACCEPTED and IMPLEMENTED 2026-07-30** (wave 2). **The ledger check the lens could not close is CLEAR**: no shipped run directory carries a `layer_config_before_mse_promotion.json`, so no artifact rode MSE promotion. Both walled.
+> - `archive/union_cache_2026-07-30/` — `tools/build_union_cache.py` + `tools/patch_union_from_pareto.py`. `PRODUCTION_CACHE_UNION` truthy is `exit 2`; the two defaults and the frontier-cache dispatch branch are gone. Lesson recorded: a render-budget percentile that pre-decides which Linears may be *offered* an FP8 rung is a constraint on the allocator (principle 1), not an optimization.
+> - `archive/mse_promotion_2026-07-30/` — `prismaquant/mse_promotion.py`, `tools/build_mse_promotion_assignment.py`, `tests/test_mse_promotion.py`. `MSE_PROMOTION` truthy is `exit 2`; the seven shell defaults, the two-condition precondition gate and the stage-4/4-C′ rewrite are gone. Lesson recorded: a post-allocator rewrite ranked by a local surrogate cannot beat the allocator that already solved the global problem against a faithful cost — AURA put those bits inside the DP.
+> - `tests/test_run_pipeline_defaults.py` gains `test_mse_promotion_is_archived_and_blocked` and `test_production_cache_union_is_archived_and_blocked` in place of the old inertness test.
+> - Note: `mse_promotion.build_promotion_candidate_report` had one live consumer, `tools/sensitivity_propagated_group_report.py` — itself walled the same day under R4, so no live import edge was broken.
+
 ### R19 (L6 P5) — Wall 4 orphan modules + 8 orphan tools · STRUCTURAL
 
 `cross_layer_residual.py` (360 L), `aura_additivity_gate.py` (138 L), `collapse_config_groups.py` (83 L, last touched 2026-04-22), `_fast_kernel_guard.py` (92 L — verify no dynamic import first); `tools/{analyze_damp_sweep_log, collect_col_importance, lift_gptq_ablation, measure_vllm_ppl_from_ids, patch_union_from_pareto, remeasure_cost_post_lever, sensitivity_coverage_summary, summarize_kl_sensitivity_response}.py` (~1.2k L). All have **zero** references across `prismaquant/ tools/ scripts/ examples/ tests/ docs/`; three belong to closed threads (damp-sweep OFF-final, xlayer null, AURA additivity cleared). **Cost** S, **risk** low. **Verdict-request.** Blanket orphan-walling, or file-by-file? — **and see the R2 disagreement: Lens 1 wants `aura_additivity_gate.py` wired, not walled.**
+
+> **OUTCOME — ACCEPTED and IMPLEMENTED 2026-07-30** (wave 2), blanket-walled to `archive/orphans_2026-07-30/` **with one carve-out and one resolved disagreement**.
+> - **`aura_additivity_gate.py` is NOT walled.** The R2-vs-R19 disagreement is settled in R2's favour: it stays live, to be wired as AURA's standing per-artifact trust-region readout in a later wave.
+> - **`_fast_kernel_guard.py` — R19 said wall, the orphan report said REWIRE; resolved by doing both.** Walled (with `tests/test_fast_kernel_guard.py`) after verifying **no dynamic import** resolves it anywhere in the tree — its own `importlib.import_module` is the kernel *probe*, not an import of the guard, and its sole caller (`polish_from_assignment`) has been archived since 2026-05-15. The gap is **booked, not buried**: new `ARCHITECTURE.md` §12 row **D28** (LOW) records that serve-time fast-kernel enforcement has had no caller since 2026-05-15 and that **core principle 9's kernel-performance gate is manual today**. Whoever funds it should start by moving the file back — the mechanism is written and tested; only the call site is missing.
+> - Also walled: `cross_layer_residual.py` (+ its test), `collapse_config_groups.py`, and the six remaining orphan tools (`analyze_damp_sweep_log`, `collect_col_importance`, `lift_gptq_ablation`, `measure_vllm_ppl_from_ids`, `remeasure_cost_post_lever`, `sensitivity_coverage_summary`). `patch_union_from_pareto.py` went to the R18 union wall instead, next to the tool it patches.
+> - The banner groups them by closed thread with each thread's verdict, and carries the durable lesson: **a tool outlives the question it was built to answer, and there is no signal when that happens** — reachability is the only honest liveness signal, and it must be checked.
 
 **L6 hygiene (→ R28).** **Phantom flags:** `PRISMAQUANT_FISHER_CAP_MULTIPLIER` is named in **CLAUDE.md:423** as the robust-Fisher-clip lever *pending promotion* — accurately labelled as unbuilt, but pending since 2026-05-19 with **zero code readers**; promote it or strike the entry. Same for `PRISMAQUANT_CB_SCALE_RECOMPOSE` (`two-tier-scale-spec.md:261`) + the two D18 entries. Implement or strike. (~15 other "zero-reader" flags are false positives — they live in `csrc/cb_gemv.cu` or are composed as `f"{name}_MIN_CALLS"`.) **S13–S16: the label is inverted, not the code.** §9.2 calls the signed CB rungs "research-only", but they are allow-listed in the **served** profile (`nvfp4_cb.json:30-33,93-96`), emitted (`export_nvfp4_cb.py:77,278`) and CUDA-served (`gb/linear.py:301`). **KEEP** — the only 2.125–2.5 bpw fp4 ladder — and fix the label. If they really are research-only they must come out of the served allow-list: the allocator can pick them today.
 
@@ -380,6 +418,7 @@ Quantization stays on the Spark in all three options; Strix is a serving box. Th
 > - **D21 resolved.** Canonical id is `rdtand/Hy3-295B-A21B-prismaquant-gridbook-2.9bit-vllm`; **both** older ids 307-redirect to it, so the register's premise ("at most one is live") was wrong — they are renames, not rivals. `prod_hy3_results.md:248-251,313-320` annotated in place (history preserved), `ARCHITECTURE.md` §9.2 + §12 D21 flipped to RESOLVED. `scratch/gridbook-launch-post.md` still carries a third variant; left alone as out-of-scope.
 >
 > Suite: 99 passed across `test_fisher_normalization` / `test_architecture_doc` / `test_docs_staleness` / three allocator files / `test_aura_cost`.
+
 
 ---
 

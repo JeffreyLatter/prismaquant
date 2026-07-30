@@ -16,7 +16,6 @@ again.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import pickle
 from collections.abc import Mapping, Sequence
@@ -122,16 +121,6 @@ def _score_value(record: Mapping, field: str) -> float | None:
     return out
 
 
-def load_qnames_file(path: str | Path | None) -> set[str] | None:
-    if path is None:
-        return None
-    return {
-        canonical_cost_name(line.strip())
-        for line in Path(path).read_text().splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
-
-
 def _production_cost_entry(
     record: Mapping,
     *,
@@ -225,9 +214,6 @@ def synthesize_production_render_cost_payload(
     source_label: str | None = None,
     require_render_scores: bool = False,
     require_output_metric: bool = False,
-    missing_render_score_policy: str = "fallback",
-    promotion_qnames: set[str] | None = None,
-    bf16_policy: str = "all",
 ) -> dict:
     records = _cache_render_score_records(production_cache)
     baseline_costs = dict(baseline_cost_payload["costs"])
@@ -254,16 +240,6 @@ def synthesize_production_render_cost_payload(
         for fmt in output_formats:
             fmt_c = fr.canonical_format_name(fmt)
             if fmt_c == "BF16":
-                if (
-                    bf16_policy == "promotion-set"
-                    and promotion_qnames is not None
-                    and cname not in promotion_qnames
-                ):
-                    synthesized[fmt_c] = {
-                        "error": "bf16_not_in_staged_promotion_set",
-                        "cost_source": "unavailable_staged_bf16",
-                    }
-                    continue
                 synthesized[fmt_c] = {
                     "predicted_dloss": 0.0,
                     "weight_mse": 0.0,
@@ -297,13 +273,6 @@ def synthesize_production_render_cost_payload(
                         continue
 
             missing.append({"qname": str(qname), "format": fmt_c})
-            if missing_render_score_policy == "unavailable":
-                synthesized[fmt_c] = {
-                    "error": "missing production render score",
-                    "cost_source": "unavailable_missing_render_score",
-                }
-                fallback_entries += 1
-                continue
             fallback = None
             for alias in fr.aliases_for(fmt_c):
                 if alias in per_name:
@@ -322,7 +291,7 @@ def synthesize_production_render_cost_payload(
             fallback_entries += 1
         output_costs[str(qname)] = synthesized
 
-    if (require_render_scores or missing_render_score_policy == "error") and missing:
+    if require_render_scores and missing:
         sample = ", ".join(
             f"{row['qname']}@{row['format']}" for row in missing[:8]
         )
@@ -356,12 +325,6 @@ def synthesize_production_render_cost_payload(
             "baseline_schema": baseline_cost_payload.get("schema"),
             "baseline_meta": baseline_cost_payload.get("meta"),
             "score_field": score_field,
-            "missing_render_score_policy": missing_render_score_policy,
-            "bf16_policy": bf16_policy,
-            "promotion_qnames": (
-                int(len(promotion_qnames))
-                if promotion_qnames is not None else None
-            ),
             "render_score_entries": int(render_entries),
             "fallback_entries": int(fallback_entries),
             "available_render_scores": int(len(records)),
@@ -373,70 +336,6 @@ def synthesize_production_render_cost_payload(
             ),
         },
     }
-
-
-def select_tail_from_render_scores(
-    production_cache: object,
-    *,
-    fmt: str = "NVFP4",
-    score_field: str = "score_sum",
-    top_fraction: float = 0.30,
-    min_score: float | None = None,
-    min_count: int = 1,
-    max_count: int | None = None,
-) -> tuple[list[str], dict[str, object]]:
-    records = _cache_render_score_records(production_cache)
-    fmt_c = fr.canonical_format_name(fmt)
-    rows: list[tuple[str, float]] = []
-    skipped = 0
-    for (qname, record_fmt), record in records.items():
-        if fr.canonical_format_name(record_fmt) != fmt_c:
-            continue
-        score = _score_value(record, score_field)
-        if score is None:
-            skipped += 1
-            continue
-        rows.append((qname, score))
-    rows.sort(key=lambda item: item[1], reverse=True)
-    if not rows:
-        return [], {
-            "format": fmt_c,
-            "score_field": score_field,
-            "available": 0,
-            "selected": 0,
-            "skipped": int(skipped),
-        }
-
-    frac = max(0.0, min(1.0, float(top_fraction)))
-    target = max(int(math.ceil(len(rows) * frac)), int(min_count))
-    if max_count is not None and max_count > 0:
-        target = min(target, int(max_count))
-    selected_rows = rows[:target]
-    if min_score is not None:
-        selected_rows = [
-            row for row in selected_rows
-            if float(row[1]) >= float(min_score)
-        ]
-    selected = [qname for qname, _score in selected_rows]
-    scores = [score for _qname, score in rows]
-    summary = {
-        "format": fmt_c,
-        "score_field": score_field,
-        "available": int(len(rows)),
-        "selected": int(len(selected)),
-        "skipped": int(skipped),
-        "top_fraction": float(frac),
-        "min_score": min_score,
-        "min_count": int(min_count),
-        "max_count": max_count,
-        "threshold_score": (
-            float(selected_rows[-1][1]) if selected_rows else None
-        ),
-        "max_score": float(scores[0]),
-        "min_score_available": float(scores[-1]),
-        "selected_qnames_sample": selected[:8],
-    }
-    return selected, summary
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -476,71 +375,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Fail if any consumed render score is a weight_mse fallback "
         "instead of output_mse/fisher_output_mse.",
     )
-    parser.add_argument(
-        "--missing-render-score-policy",
-        choices=("fallback", "unavailable", "error"),
-        default="fallback",
-        help="How to handle non-BF16 formats without production render "
-        "scores. staged mode should use unavailable so unmeasured promotions "
-        "do not fall back to proxy costs.",
-    )
-    parser.add_argument(
-        "--promotion-qnames-file",
-        default=None,
-        help="Optional qname allowlist for staged promotions. Used with "
-        "--bf16-policy=promotion-set.",
-    )
-    parser.add_argument(
-        "--bf16-policy",
-        choices=("all", "promotion-set"),
-        default="all",
-        help="Whether BF16 is available for every qname or only qnames listed "
-        "in --promotion-qnames-file.",
-    )
-    parser.add_argument(
-        "--select-tail-output",
-        default=None,
-        help="Write a newline-delimited high-error qname tail selected from "
-        "the input production cache.",
-    )
-    parser.add_argument("--select-tail-summary", default=None)
-    parser.add_argument("--select-tail-format", default="NVFP4")
-    parser.add_argument("--select-tail-top-fraction", type=float, default=0.30)
-    parser.add_argument("--select-tail-min-score", type=float, default=None)
-    parser.add_argument("--select-tail-min-count", type=int, default=1)
-    parser.add_argument("--select-tail-max-count", type=int, default=None)
     args = parser.parse_args(argv)
 
+    # The staged (two-pass NVFP4-then-promote) surface — --select-tail-*,
+    # --promotion-qnames-file, --bf16-policy, --missing-render-score-policy —
+    # was walled 2026-07-30 with COST_MODE=production-render-staged
+    # (re-vet R17). See archive/production_render_staged_2026-07-30/.
     cache = _load_pickle(args.production_cache)
-    if args.select_tail_output:
-        selected, summary = select_tail_from_render_scores(
-            cache,
-            fmt=args.select_tail_format,
-            score_field=args.score_field,
-            top_fraction=args.select_tail_top_fraction,
-            min_score=args.select_tail_min_score,
-            min_count=args.select_tail_min_count,
-            max_count=args.select_tail_max_count,
-        )
-        tail_path = Path(args.select_tail_output)
-        tail_path.parent.mkdir(parents=True, exist_ok=True)
-        tail_path.write_text("".join(f"{qname}\n" for qname in selected))
-        print(
-            f"[production-render-cost] selected {len(selected)} "
-            f"{args.select_tail_format} high-error qnames -> {tail_path}",
-            flush=True,
-        )
-        if args.select_tail_summary:
-            summary_path = Path(args.select_tail_summary)
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
-            summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
-        if not args.output:
-            return 0
-
     if not args.baseline_cost:
-        raise SystemExit("--baseline-cost is required when writing --output")
+        raise SystemExit("--baseline-cost is required")
     if not args.output:
-        raise SystemExit("--output is required unless only selecting a tail")
+        raise SystemExit("--output is required")
     baseline = _load_pickle(args.baseline_cost)
     formats = (
         [fmt.strip() for fmt in args.formats.split(",") if fmt.strip()]
@@ -554,9 +399,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_label=str(args.production_cache),
         require_render_scores=bool(args.require_render_scores),
         require_output_metric=bool(args.require_output_metric),
-        missing_render_score_policy=str(args.missing_render_score_policy),
-        promotion_qnames=load_qnames_file(args.promotion_qnames_file),
-        bf16_policy=str(args.bf16_policy),
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

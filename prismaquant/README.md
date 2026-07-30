@@ -12,7 +12,7 @@ declarative contract layer, not the executor.
 
 | Stage | Modules |
 |---|---|
-| Probe | `incremental_probe`, `kl_sensitivity_probe` |
+| Probe | `incremental_probe` |
 | Cost | `incremental_measure_quant_cost`, `production_render_cost`, `aura_cost` (`COST_MODE=aura`), `expert_empirical_cost` (MoE hybrid), `aura_additivity_gate` (trust-region check) |
 | Allocate | `allocator` |
 | Cache | `build_production_cache`, `production_recache` |
@@ -35,3 +35,11 @@ declarative contract layer, not the executor.
 Legacy additive, interaction, Block-CLADO, dense-cone, adjoint, and PrismaSCOUT
 iteration/polish tools are archived for artifact replay and comparison under the
 dated `archive/` walls.
+
+The 2026-07-30 architecture re-vet added five: `l3_propagated_2026-07-30`
+(the L2/L3 cascade — `kl_sensitivity_probe`, `propagated_sensitivity_costs`,
+`sensitivity_response`, and the L3 half of `kl_measurement`),
+`production_render_staged_2026-07-30`, `mse_promotion_2026-07-30`,
+`union_cache_2026-07-30`, `block_output_match_2026-07-30`, plus
+`orphans_2026-07-30`. Each wall's README carries the killing measurement and the
+durable lesson; `docs/ARCHITECTURE.md` §11 indexes them.
