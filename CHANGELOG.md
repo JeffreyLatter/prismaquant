@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.1 — 2026-07-30
+
+Corrects one thing that shipped in 0.2.0 on an unverified assumption, settled by
+pulling the real `deepseek-ai/DeepSeek-V4-Flash` config and safetensors headers
+(a few hundred KB — no weights) plus the authors' `inference/convert.py`.
+
+- **Declared-MXFP4 expert scope is routed-only again.** 0.2.0 widened it to
+  `shared_experts.*` on the reasoning that `expert_dtype` describes all of a
+  layer's experts. The headers refute that: routed-expert weights are `I8`
+  nibble-packs (2304/2304 sampled) while shared-expert weights are `F8_E4M3`
+  block-FP8 (9/9), and the authors' converter gates its fp4 path on
+  `"experts" in name and dtype == torch.int8`. With the widening in place a real
+  DSv4 load would have pushed block-FP8 into the nibble decode and hard-failed
+  the packed-grid assertion. No other model is affected — the widening only ever
+  applied to a checkpoint declaring `expert_dtype: fp4`.
+- `F8_E8M0` added to the safetensors dtype table (it fell to the unknown-dtype
+  default of 2 bytes in `dominant_source_bytes_per_param`; span-based accounting
+  was already exact).
+- The verified DSv4 source layout is recorded in
+  `model_profiles/specs/deepseek_v4.json`, including the accounting trap that
+  its scales are 1-byte E8M0 planes named `.scale` rather than fp32
+  `.weight_scale_inv`, so DSv4 byte accounting must use the per-tensor manifest.
+
+Everything else confirmed as the code already assumed: the `expert_dtype` key
+and value, `scale_fmt: ue8m0`, the E8M0 exponent bias, the packed grid, and — the
+question that previously could only be guessed — the nibble order and E2M1 table,
+which match the authors' reference decode value-for-value.
+
 ## 0.2.0 — 2026-07-30
 
 First published release. 0.1.0 existed only as a version string in
