@@ -6,9 +6,14 @@ re-exports these symbols for backwards compatibility.
 """
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 
 from . import format_registry as fr
+
+# Read once at import (coarse offline path; no per-call getenv).
+_SOLVER_TRACE = os.environ.get("PRISMAQUANT_SOLVER_TRACE", "") not in ("", "0")
 
 
 @dataclass
@@ -386,16 +391,86 @@ def solve_with_promotion(
     stall_grace: int = 3,
     profile=None,
 ) -> tuple[dict[str, str] | None, float]:
-    """Solve, promote coupled tensors, and retry if promotion exceeds budget."""
-    tightened = float(target_bits)
-    last_assign: dict[str, str] | None = None
-    last_achieved = float("nan")
-    prev_overshoot = float("inf")
-    stall_count = 0
-    for _iteration in range(max_iters):
-        result = solve_allocation(stats, candidates, tightened, bit_precision)
+    """Solve, promote coupled tensors, and retry if promotion exceeds budget.
+
+    Termination contract: the returned
+    assignment is always FEASIBLE — ``achieved <= target_bits +
+    overshoot_tolerance`` — and, among the feasible iterates seen, the
+    one with MINIMUM total predicted Δloss (ties broken toward larger
+    achieved bits). Δloss is the solver's actual objective; density is
+    not a proxy for it — more bits is not monotonically better (5.5 bpp
+    has beaten 6.0 bpp on served PPL), and promotion can flip a serving
+    group into a denser-but-worse format. When no
+    iterate is feasible within ``max_iters`` the rung is INFEASIBLE and
+    ``(None, nan)`` is returned so callers exclude it from the Pareto curve
+    and byte-budget bisection. Three silent fallbacks are replaced:
+
+      - ``solve_allocation`` returning None (tightened below the format
+        floor) used to return the previous, massively over-target iterate;
+      - any undershoot, however deep, used to be accepted immediately
+        (rung 6.0 returning achieved 4.95 with 25x worse loss);
+      - the stall exit used to return an iterate still far above target.
+
+    Honest scope: only the ``--target-bits`` emit path shipped those
+    over-target iterates silently. The byte-budget selector priced them
+    at their true (larger) disk size, so its feasibility calls were
+    correct — the rung label was just wrong, skewing the Pareto curve's
+    x-axis rather than fabricating feasibility.
+
+    The search runs in two phases on the *tightened* DP target:
+
+    1. Damped descent (the old loop's cost profile — the first eval at the
+       full target is the only expensive DP; every subsequent eval has a
+       smaller bin table): tighten by ``overshoot/2`` until an iterate is
+       feasible or the DP floor is reached.
+    2. Bracket bisection between the first feasible tightened value and the
+       last infeasible one, ratcheting the minimum-Δloss feasible
+       assignment.
+       Promotion is a coarse step function (one packed-MoE serving group
+       flipping format moves the average by tenths of a bit), so
+       achieved(tightened) is locally non-monotone; the ratchet keeps
+       correctness anyway, and infeasibility is only declared when the
+       whole bracket is exhausted with no feasible iterate.
+
+    ``stall_threshold`` is reused as the plateau epsilon for the descent
+    acceleration; ``stall_grace`` is retained for call compatibility but
+    unused (both phases shrink their search state every evaluation, so
+    they cannot stall).
+    """
+    del stall_grace  # legacy fixed-point knob; see docstring
+    stall_eps = float(stall_threshold)
+    target = float(target_bits)
+    names = list(candidates.keys())
+    total_params = sum(stats[n]["n_params"] for n in names)
+    if total_params <= 0:
+        return None, float("nan")
+    min_bits = sum(
+        min(cs, key=lambda c: c.bits_per_param).bits_per_param
+        * stats[n]["n_params"]
+        for n, cs in candidates.items()
+    ) / total_params
+    if target < min_bits - 1e-6:
+        return None, float("nan")
+
+    best_assign: dict[str, str] | None = None
+    best_achieved = float("nan")
+    best_dloss = float("inf")
+
+    def _evaluate(t: float) -> float | None:
+        """Solve+promote at tightened ``t``; ratchet if feasible.
+
+        Returns achieved bits, or None when the DP is infeasible at ``t``.
+        The ratchet keeps the feasible iterate with minimum total predicted
+        Δloss (the solve objective), tie-broken toward higher achieved bits.
+        """
+        nonlocal best_assign, best_achieved, best_dloss
+        t0 = time.time() if _SOLVER_TRACE else 0.0
+        result = solve_allocation(stats, candidates, t, bit_precision)
         if result is None:
-            return last_assign, last_achieved
+            if _SOLVER_TRACE:
+                print(f"[solver] target={target:.4f} eval t={t:.4f} -> "
+                      f"DP infeasible ({time.time() - t0:.1f}s)", flush=True)
+            return None
         assign, chosen_cands = result
         del chosen_cands
         assign = promote_serving_units(
@@ -405,25 +480,93 @@ def solve_with_promotion(
             include_fused=not no_fused_promote,
             include_moe=True,
         )
-        achieved, _ = compute_achieved(
+        achieved, predicted = compute_achieved(
             stats, assign, format_specs,
             candidates=candidates,
         )
-        last_assign = assign
-        last_achieved = achieved
-        overshoot = achieved - target_bits
-        if overshoot <= overshoot_tolerance:
-            return assign, achieved
+        if _SOLVER_TRACE:
+            print(f"[solver] target={target:.4f} eval t={t:.4f} -> "
+                  f"achieved={achieved:.4f} dloss={predicted:.3e} "
+                  f"({time.time() - t0:.1f}s)",
+                  flush=True)
+        if achieved - target <= overshoot_tolerance and (
+                best_assign is None
+                or predicted < best_dloss
+                or (predicted == best_dloss and achieved > best_achieved)):
+            best_assign = assign
+            best_achieved = achieved
+            best_dloss = predicted
+        return achieved
 
-        if abs(prev_overshoot - overshoot) < stall_threshold:
-            stall_count += 1
-            if stall_count >= stall_grace:
-                return assign, achieved
-        else:
-            stall_count = 0
-        prev_overshoot = overshoot
-
-        tightened -= overshoot / 2.0
-        if tightened <= 0:
+    # Phase 1: damped descent until the first feasible iterate. Promotion
+    # makes achieved(tightened) a plateau-and-cliff staircase (a packed-MoE
+    # layer only leaves a format when EVERY one of its rows does), so a pure
+    # overshoot/2 step can crawl across a plateau for dozens of expensive
+    # DP evals. Accelerate: whenever an eval fails to reduce the overshoot
+    # meaningfully, double the step.
+    evals = 0
+    tightened = target
+    hi = target  # lowest tightened known to promote OVER the target
+    lo = None    # highest tightened known to promote under it (feasible)
+    step = None
+    prev_overshoot = float("inf")
+    while evals < max_iters:
+        evals += 1
+        achieved = _evaluate(tightened)
+        if achieved is None:
+            # Below the DP floor: all-baseline promotes to itself, which is
+            # feasible for any target >= min_bits, so probe the floor next
+            # unless we already did.
+            if tightened <= min_bits + 1e-9:
+                break
+            hi = min(hi, tightened)
+            tightened = min_bits
+            continue
+        if achieved - target <= overshoot_tolerance:
+            if achieved >= target - overshoot_tolerance:
+                # Within the band on both sides — no denser feasible
+                # iterate exists; return the ratcheted min-Δloss one.
+                return best_assign, best_achieved
+            lo = tightened
             break
-    return last_assign, last_achieved
+        hi = tightened
+        if tightened <= min_bits + 1e-9:
+            # The floor solve itself promotes over the target: no tighter
+            # DP exists, so re-running the identical solve until max_iters
+            # cannot help. The rung is infeasible unless a feasible iterate
+            # was already ratcheted.
+            break
+        overshoot = achieved - target
+        if step is None:
+            step = overshoot / 2.0
+        elif prev_overshoot - overshoot < max(step / 4.0, stall_eps):
+            # Plateau: tightening by `step` bought back less than a quarter
+            # of it — the promoted outcome is pinned by serving-group
+            # atomicity. Jump exponentially further instead of crawling.
+            step *= 2.0
+        else:
+            step = overshoot / 2.0
+        prev_overshoot = overshoot
+        tightened -= step
+        if tightened <= min_bits:
+            tightened = min_bits
+
+    # Phase 2: bisect (lo, hi) toward the target. The bisection PROPOSES
+    # progressively denser feasible iterates; the ratchet in _evaluate
+    # KEEPS whichever feasible iterate has the minimum predicted Δloss.
+    if lo is not None:
+        while evals < max_iters and hi - lo > max(bit_precision, 1e-9):
+            evals += 1
+            mid = 0.5 * (lo + hi)
+            achieved = _evaluate(mid)
+            if achieved is not None and achieved - target <= overshoot_tolerance:
+                if achieved >= target - overshoot_tolerance:
+                    # In-band: densest possible; keep the min-Δloss ratchet.
+                    return best_assign, best_achieved
+                lo = mid
+            else:
+                hi = mid
+
+    if best_assign is None:
+        return None, float("nan")
+    return best_assign, best_achieved

@@ -498,10 +498,12 @@ def test_pre_aggregation_respects_budget_without_overshoot():
 # Convergence-based stopping
 # ---------------------------------------------------------------------------
 
-def test_solve_with_promotion_stops_on_stall():
-    """Construct a tiny problem where promotion would overshoot and
-    tightening can't make further progress — loop should bail out early
-    via the stall detector, not waste all max_iters slots."""
+def test_solve_with_promotion_returns_feasible_iterate_on_plateau():
+    """Construct a tiny problem where promotion overshoots and tightening
+    plateaus (serving-group atomicity pins the promoted outcome).
+    Termination contract: the loop returns the best FEASIBLE iterate
+    (achieved <= target + tolerance) or (None, nan) when nothing ever fit —
+    it must never fabricate an over-target 'feasible' result."""
     # Use the un-aggregated path so promote_fused has siblings to coerce.
     names, stats, costs = _mk_stats_and_costs()
     specs = _format_specs()
@@ -523,7 +525,108 @@ def test_solve_with_promotion_stops_on_stall():
         max_iters=40,
         profile=profile,
     )
-    # Assignment must be non-None (solver found SOMETHING), and achieved
-    # is reported even when we bail on stall (the whole point of #2).
+    # The all-NVFP4 floor (~4.5) fits under target=4.6, so a feasible
+    # iterate exists and must be returned — and it must actually be
+    # feasible, not an over-target fabrication.
     assert assignment is not None
     assert isinstance(achieved, float)
+    assert achieved <= target + 0.01, (
+        f"stall exit returned an over-target iterate: target={target}, "
+        f"achieved={achieved}")
+
+
+# ---------------------------------------------------------------------------
+# Ratchet objective: min predicted Δloss among feasible iterates
+# ---------------------------------------------------------------------------
+
+def _mk_single_tensor_ratchet_fixture(dloss_by_fmt: dict[str, float]):
+    """One 1000-param tensor with candidates at 4/5/6/7 bpp.
+
+    predicted_dloss per format comes from ``dloss_by_fmt`` so tests can
+    make Δloss(bits) deliberately non-monotone (more bits is NOT always
+    better — the CLAUDE.md §5 5.5-vs-6.0 bpp lesson).
+    """
+    stats = {"w": {"n_params": 1000}}
+    bpp = {"F4": 4.0, "F5": 5.0, "F6": 6.0, "F7": 7.0}
+    cands = {
+        "w": [
+            Candidate(fmt=f, bits_per_param=b,
+                      memory_bytes=int(b * 1000 / 8),
+                      predicted_dloss=dloss_by_fmt[f])
+            for f, b in bpp.items()
+        ]
+    }
+    return stats, cands
+
+
+def _scripted_solve_allocation(fmt_for_t):
+    """Stand-in for solve_allocation: pick a format purely from the
+    tightened target, emulating promotion-driven non-monotonicity
+    without needing a real coupled model."""
+    def fake(stats, candidates, t, bit_precision):
+        return {"w": fmt_for_t(t)}, None
+    return fake
+
+
+def test_ratchet_keeps_min_dloss_feasible_iterate_over_denser(monkeypatch):
+    """A feasible lower-Δloss iterate must beat a denser higher-Δloss one.
+
+    Script: t=6.0 -> F7 (7.0 bits, overshoots); tightened t=5.5 -> F5
+    (5.0 bits, Δloss 1.0, feasible); bisection mid t=5.75 -> F6
+    (6.0 bits, Δloss 3.0, feasible and denser but WORSE). The old
+    max-achieved ratchet shipped F6; the min-Δloss ratchet must ship F5.
+    """
+    from prismaquant import allocator_solver as als
+
+    stats, cands = _mk_single_tensor_ratchet_fixture(
+        {"F4": 5.0, "F5": 1.0, "F6": 3.0, "F7": 0.5})
+
+    def fmt_for_t(t):
+        if t >= 5.9:
+            return "F7"
+        if t >= 5.6:
+            return "F6"
+        return "F5"
+
+    monkeypatch.setattr(als, "solve_allocation",
+                        _scripted_solve_allocation(fmt_for_t))
+
+    assignment, achieved = solve_with_promotion(
+        stats, cands, 6.0, {}, {},
+        bit_precision=0.001,
+        profile=None,
+    )
+    assert assignment == {"w": "F5"}, (
+        f"ratchet must keep the min-Δloss feasible iterate (F5, Δloss 1.0) "
+        f"over the denser F6 (Δloss 3.0); got {assignment}")
+    assert abs(achieved - 5.0) < 1e-9
+    # Feasibility contract is unchanged.
+    assert achieved <= 6.0 + 0.01
+
+
+def test_ratchet_tie_breaks_toward_denser_iterate(monkeypatch):
+    """Equal Δloss: keep the denser (higher achieved bits) iterate."""
+    from prismaquant import allocator_solver as als
+
+    stats, cands = _mk_single_tensor_ratchet_fixture(
+        {"F4": 5.0, "F5": 1.0, "F6": 1.0, "F7": 0.5})
+
+    def fmt_for_t(t):
+        if t >= 5.9:
+            return "F7"
+        if t >= 5.6:
+            return "F6"
+        return "F5"
+
+    monkeypatch.setattr(als, "solve_allocation",
+                        _scripted_solve_allocation(fmt_for_t))
+
+    assignment, achieved = solve_with_promotion(
+        stats, cands, 6.0, {}, {},
+        bit_precision=0.001,
+        profile=None,
+    )
+    assert assignment == {"w": "F6"}, (
+        f"on a Δloss tie the denser feasible iterate wins; got {assignment}")
+    assert abs(achieved - 6.0) < 1e-9
+    assert achieved <= 6.0 + 0.01

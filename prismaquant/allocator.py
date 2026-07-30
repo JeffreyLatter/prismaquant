@@ -1796,8 +1796,29 @@ def main():
             return original_entry
         return None
 
+    _solve_cache: dict[float, tuple] = {}
+
     def _solve_for_target(target_bits: float):
-        """Solve the body-budget DP at one target bit budget."""
+        """Solve the body-budget DP at one target bit budget.
+
+        Memoized: the solve is a pure function of the target given fixed
+        stats/candidates, and the byte-budget grid + ratchet bisection
+        re-visit targets the Pareto sweep already solved.
+        """
+        cache_key = round(float(target_bits), 9)
+        cached = _solve_cache.get(cache_key)
+        if cached is None:
+            cached = _solve_for_target_uncached(target_bits)
+            _solve_cache[cache_key] = cached
+        # Hand out a copy of the assignment dict: callers may mutate it
+        # (fused-sibling expansion, fixed-format update) and must never
+        # poison the cached solve.
+        assign, achieved_r, total, mutable_total = cached
+        if assign is not None:
+            assign = dict(assign)
+        return assign, achieved_r, total, mutable_total
+
+    def _solve_for_target_uncached(target_bits: float):
         mutable_target_bits = float(target_bits)
         if mutable_total_params <= 0:
             if fixed_total_params > 0 and mutable_target_bits >= 0.0:
@@ -2183,6 +2204,20 @@ def main():
         # densest grid rung to actually fill a roomy card (not just snap to the
         # grid ceiling). chosen always satisfies disk <= budget by construction.
         search_hi = float(max(int(s.weight_bits) for s in specs_sorted)) + 1.0
+        # Bound the ratchet by the cheapest grid rung that does NOT fit:
+        # bisecting toward the near-lossless cap on a card that only fits
+        # the low rungs wastes dozens of expensive DP solves at high-bin
+        # targets. HEURISTIC: this assumes disk(target) is only LOCALLY
+        # non-monotone — if a fitting allocation existed above the first
+        # non-fitting rung, the tightened ceiling would forgo it. The
+        # ratchet never accepts a probe below the proven grid pick, so the
+        # downside is bounded at shipping the grid pick, never worse.
+        over_budget = [c for c in grid if c["disk_bytes"] > budget_bytes]
+        if over_budget:
+            search_hi = min(
+                search_hi,
+                min(float(c["target_bits"]) for c in over_budget),
+            )
         top = _artifact_for_target(search_hi)  # densest possible (all-expensive)
         grid_pick = sel["chosen"]
         if top is not None and top["disk_bytes"] <= budget_bytes:
