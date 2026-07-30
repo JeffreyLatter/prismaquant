@@ -97,6 +97,7 @@ from .allocator_solver import (
     _shape_from_stats,
     compute_achieved,
     compute_assignment_predicted_dloss,
+    legal_formats_from_candidates,
     promote_fused,
     promote_moe_pair,
     promote_serving_units,
@@ -1798,6 +1799,16 @@ def main():
     )
     applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Per-Linear legal-format sets for serving-unit promotion, snapshotted
+    # BEFORE aggregation: both promotion call sites below run on the EXPANDED
+    # per-Linear assignment, where an aggregated super-item's candidate list no
+    # longer describes its individual members. Auxiliary MTP/visual names were
+    # already removed from `candidates` and stay absent here on purpose — they
+    # are format-PINNED, not legality-restricted (their candidates were built
+    # from a one-format menu), and promotion treats an absent name as
+    # unconstrained.
+    per_linear_legal_formats = legal_formats_from_candidates(candidates)
+
     # Pre-aggregate packed-MoE serving groups (e.g. DeepSeek-V4's 768
     # per-expert Linears per layer) into single multi-choice DP units.
     # The serving runtime loads each group under ONE format, so the DP
@@ -1971,7 +1982,12 @@ def main():
             expanded = expand_fused_sibling_assignment(expanded, stats)
         if include_auxiliary:
             expanded.update(fixed_format_assignment)
-        return promote_serving_units(expanded, format_rank, profile=model_profile)
+        return promote_serving_units(
+            expanded,
+            format_rank,
+            profile=model_profile,
+            legal_formats=per_linear_legal_formats,
+        )
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
         total = 0.0
@@ -2593,12 +2609,18 @@ def main():
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. Packed groups are first-class DP units, so this promotion
     # is a validated no-op (validate_final_serving_promotion_noop below);
-    # it stays as the serve-time coherence backstop for groups that fell
-    # back to individual rows (no common legal format).
+    # it stays as the serve-time coherence backstop for the un-aggregated
+    # paths (--no-packed-aggregation / --no-fused-aggregation). It is handed
+    # per-Linear legality so the shared format it lands on is runnable for
+    # every member, and it is still a no-op here by construction: an
+    # aggregated unit's format came from the intersection of its members'
+    # candidate sets, and the un-aggregated paths were already promoted
+    # against the same sets inside solve_with_promotion.
     assignment_expanded = promote_serving_units(
         assignment_expanded,
         format_rank,
         profile=model_profile,
+        legal_formats=per_linear_legal_formats,
     )
     validate_final_serving_promotion_noop(
         assignment_before_serving_promotion,

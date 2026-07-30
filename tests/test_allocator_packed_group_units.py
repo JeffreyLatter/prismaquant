@@ -726,7 +726,12 @@ def test_empty_intersection_fallback_is_not_allocatable():
     it is NOT a repair: members draw from disjoint candidate lists, so
     whole-group promotion always lands on a format illegal for someone, and
     the solve refuses to price it at any target. Pins the corrected docstring
-    (the old one claimed promotion would repair coherence)."""
+    (the old one claimed promotion would repair coherence).
+
+    The verdict now comes from PROMOTION rather than from pricing: promotion is
+    handed the per-row legal-format sets (issue #28), so it reports the empty
+    intersection with the members and their sets instead of writing an illegal
+    format and letting compute_achieved complain that it cannot be priced."""
     import pytest
 
     stats, cands, expert_names, _dense = _mk_moe_fixture(n_experts=2)
@@ -745,7 +750,12 @@ def test_empty_intersection_fallback_is_not_allocatable():
     low = fr.REGISTRY[_LOW].effective_bits
     high = fr.REGISTRY[_HIGH].effective_bits
     for target in (low + 0.05, high):
-        with pytest.raises(AssertionError, match="no candidate exists to price"):
+        with pytest.raises(AssertionError,
+                           match="shares no format that is legal for every "
+                                 "member") as exc:
             solve_with_promotion(
                 stats_ext, cands_ext, target, specs, rank,
                 bit_precision=0.001, profile=_PackedProfile())
+        msg = str(exc.value)
+        assert expert_names[0] in msg and expert_names[1] in msg
+        assert "common legal formats: []" in msg

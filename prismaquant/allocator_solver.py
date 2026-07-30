@@ -100,12 +100,156 @@ def _packed_groups_by_profile(names, profile) -> dict[str, list[str]]:
     return groups
 
 
+def legal_formats_from_candidates(
+    candidates: dict[str, list[Candidate]],
+) -> dict[str, set[str]]:
+    """Per-row legal-format sets for serving-unit promotion.
+
+    A row's candidate list IS its legality verdict: ``build_candidates``
+    admits a ``(row, format)`` pair only after
+    ``check_stats_format_applicability`` clears source-passthrough integrity,
+    the serving profile, group / scale-block divisibility and the runtime
+    kernel shape rules. Handing those sets to promotion is what lets it pick
+    a format the WHOLE serving unit can run, instead of one that happens to
+    top the rank order for some member.
+    """
+    return {name: {c.fmt for c in cands} for name, cands in candidates.items()}
+
+
+def _member_allows(
+    fmt: str,
+    member: str,
+    legal_formats: dict[str, set[str]] | None,
+) -> bool:
+    """Whether ``fmt`` is legal for ``member``.
+
+    A member with no entry is UNCONSTRAINED, not illegal: callers that cannot
+    supply legality for a name (auxiliary MTP/visual pins, hand-built test
+    assignments) must keep today's behaviour rather than acquire a new failure.
+    """
+    if not legal_formats:
+        return True
+    allowed = legal_formats.get(member)
+    return allowed is None or fmt in allowed
+
+
+def _serving_group_common_formats(
+    members: list[str],
+    legal_formats: dict[str, set[str]] | None,
+) -> set[str] | None:
+    """Formats legal for EVERY member, or None when nothing is known."""
+    if not legal_formats:
+        return None
+    known = [legal_formats[m] for m in members if m in legal_formats]
+    if not known:
+        return None
+    common = set(known[0])
+    for allowed in known[1:]:
+        common &= allowed
+    return common
+
+
+def _serving_group_menu_error(
+    members: list[str],
+    assigned: dict[str, str],
+    legal_formats: dict[str, set[str]],
+    format_rank: dict[str, int],
+    common: set[str] | None,
+) -> str:
+    """Diagnostic for a serving unit with no format legal for every member."""
+    member_lines = "\n".join(
+        f"    {m}: assigned={assigned.get(m)!r} legal="
+        + (
+            f"{sorted(legal_formats[m])}"
+            if m in legal_formats
+            else "<unknown: not a priced row, treated as unconstrained>"
+        )
+        for m in sorted(members)
+    )
+    menu = sorted(format_rank, key=lambda name: (format_rank[name], name))
+    return (
+        f"serving-unit component of {len(members)} members (representative "
+        f"{min(members)!r}) shares no format that is legal for every member:\n"
+        f"{member_lines}\n"
+        f"    common legal formats: {sorted(common or ())}\n"
+        f"    promotion menu (low->high rank): {menu}\n"
+        "Packed-MoE experts and fused siblings (q/k/v, gate/up) load under ONE "
+        "format at serve time (vLLM selects one scheme per FusedMoE layer, one "
+        "scheme per fused module), so an empty intersection is not an "
+        "allocatable state: EVERY format whole-unit promotion could pick is "
+        "illegal for at least one member, export then coerces that one member "
+        "to BF16, and the resulting quantized+BF16 mix inside a single serving "
+        "unit is caught only by the fused-coherence gate at the END of export. "
+        "This is an upstream cost/legality bug to fix, not a state to promote "
+        "around: a missing cost row for one member, an over-tight applicability "
+        "mask (see the [alloc] format-applicability log lines and the mask "
+        "summary JSON), or a passthrough-source mismatch (BF16/FP8_SOURCE are "
+        "legal only where the source tensor already has that precision, so a "
+        "unit whose members have different source dtypes loses them)."
+    )
+
+
+def _choose_group_format(
+    members: list[str],
+    assigned: dict[str, str],
+    format_rank: dict[str, int],
+    legal_formats: dict[str, set[str]],
+    best_fmt: str,
+) -> str:
+    """Pick one format for a unit whose max-rank assignment is illegal for it.
+
+    Only reached when ``best_fmt`` (the highest-rank format assigned to any
+    member, i.e. what unconstrained promotion would write) is illegal for at
+    least one member. Preference order, from the promotion contract this
+    function repairs rather than reinvents:
+
+    1. the CHEAPEST legal-for-all format at or above ``best_fmt``'s rank —
+       promotion has always been non-degrading (no member ends below the
+       format the DP picked for it), and ``solve_with_promotion``'s
+       tightening loop is built to absorb the extra bits promotion charges;
+    2. otherwise the HIGHEST-rank legal-for-all format, which is necessarily
+       below some member's assignment. That downgrade is correct: the unit
+       must be uniform, so a member cannot keep a format the unit cannot
+       serve. It is the same downgrade export was applying per member (issue
+       #28) — done once for the whole unit, before any render work, and
+       priced by ``compute_achieved`` instead of discovered at export.
+    """
+    common = _serving_group_common_formats(members, legal_formats)
+    ranked = sorted(
+        (fmt for fmt in (common or ()) if fmt in format_rank),
+        key=lambda fmt: (format_rank[fmt], fmt),
+    )
+    if not ranked:
+        raise AssertionError(
+            _serving_group_menu_error(
+                members, assigned, legal_formats, format_rank, common)
+        )
+    best_rank = format_rank[best_fmt]
+    for fmt in ranked:
+        if format_rank[fmt] >= best_rank:
+            return fmt
+    return ranked[-1]
+
+
 def _promote_group_components(
     assignment: dict[str, str],
     format_rank: dict[str, int],
     groups: list[list[str]],
+    legal_formats: dict[str, set[str]] | None = None,
 ) -> dict[str, str]:
-    """Promote connected serving-unit components to one shared format."""
+    """Promote connected serving-unit components to one shared format.
+
+    ``legal_formats`` (see ``legal_formats_from_candidates``) maps a row to the
+    formats that are legal FOR THAT ROW. Without it, promotion writes the
+    highest-rank format any member was assigned to every member — with no
+    check that the format is runnable for the rest of them. Members of one
+    unit do not share a shape (gate_up vs down differ on the reduce dim; an
+    odd ``moe_intermediate_size`` makes one projection's group / scale-block
+    divisibility fail while the other's passes), so that format can be
+    illegal for a subset, and export's per-Linear shape coercion then breaks
+    the unit's coherence (issue #28). Omit the argument and the legacy
+    max-rank behaviour is reproduced exactly.
+    """
     out = dict(assignment)
     parent = {name: name for name in out}
 
@@ -137,10 +281,21 @@ def _promote_group_components(
         if len(members) < 2:
             continue
         best_fmt = max((out[member] for member in members), key=lambda fmt: format_rank[fmt])
-        best_rank = format_rank[best_fmt]
+        if all(_member_allows(best_fmt, member, legal_formats)
+               for member in members):
+            best_rank = format_rank[best_fmt]
+            for member in members:
+                if format_rank[out[member]] < best_rank:
+                    out[member] = best_fmt
+            continue
+        # The max-rank assignment cannot run on every member of an atomic
+        # serving unit. Move the WHOLE unit to a format that can, and write it
+        # unconditionally: a member sitting on an equal-rank-but-different
+        # format would otherwise survive the promotion and keep the unit mixed.
+        chosen = _choose_group_format(
+            members, out, format_rank, legal_formats, best_fmt)
         for member in members:
-            if format_rank[out[member]] < best_rank:
-                out[member] = best_fmt
+            out[member] = chosen
     return out
 
 
@@ -151,8 +306,15 @@ def promote_serving_units(
     profile=None,
     include_fused: bool = True,
     include_moe: bool = True,
+    legal_formats: dict[str, set[str]] | None = None,
 ) -> dict[str, str]:
-    """Promote all serving-coupled units in one order-independent pass."""
+    """Promote all serving-coupled units in one order-independent pass.
+
+    Pass ``legal_formats`` (``legal_formats_from_candidates(candidates)``)
+    wherever per-row legality is known, so the shared format a unit lands on
+    is one every member can actually run. Omitted, promotion keeps its legacy
+    max-rank behaviour.
+    """
     if profile is None:
         from .model_profiles import DefaultProfile
         profile = DefaultProfile()
@@ -161,7 +323,8 @@ def promote_serving_units(
         groups.extend(_group_by_profile(assignment.keys(), profile).values())
     if include_moe:
         groups.extend(_packed_groups_by_profile(assignment.keys(), profile).values())
-    return _promote_group_components(assignment, format_rank, groups)
+    return _promote_group_components(
+        assignment, format_rank, groups, legal_formats)
 
 
 def fused_siblings(name: str, profile=None) -> tuple[tuple[str, ...], str] | None:
@@ -180,6 +343,7 @@ def promote_moe_pair(
     format_rank: dict[str, int],
     *,
     profile=None,
+    legal_formats: dict[str, set[str]] | None = None,
 ) -> dict[str, str]:
     """Promote packed MoE projections that must share one serving format."""
     if profile is None:
@@ -191,12 +355,15 @@ def promote_moe_pair(
         profile=profile,
         include_fused=False,
         include_moe=True,
+        legal_formats=legal_formats,
     )
 
 
 def promote_fused(assignment: dict[str, str],
                   format_rank: dict[str, int],
-                  profile=None) -> dict[str, str]:
+                  profile=None,
+                  legal_formats: dict[str, set[str]] | None = None,
+                  ) -> dict[str, str]:
     """Promote each fused-sibling group to one shared serving format."""
     if profile is None:
         from .model_profiles import DefaultProfile
@@ -207,8 +374,14 @@ def promote_fused(assignment: dict[str, str],
         profile=profile,
         include_fused=True,
         include_moe=False,
+        legal_formats=legal_formats,
     )
     groups = _group_by_profile(assignment.keys(), profile)
+    # Legacy per-group repass, kept for its post-check below. It cannot write:
+    # a connected component is a superset of each group it contains, so every
+    # group is already uniform here and no member's rank is below the group max.
+    # (It is also legality-blind, so writing here would be able to undo the
+    # component pass's legal-for-all choice.)
     for members_present in groups.values():
         if len(members_present) < 2:
             continue
@@ -537,6 +710,13 @@ def solve_with_promotion(
     best_assign: dict[str, str] | None = None
     best_achieved = float("nan")
     best_dloss = float("inf")
+    # Per-row legality for the promotion below. On the aggregated path this is
+    # a no-op (a super-item is one row and has no serving siblings), but with
+    # --no-packed-aggregation / --no-fused-aggregation — or a group that fell
+    # back to individual rows — promotion is the ONLY coherence mechanism, and
+    # the format it picks has to be runnable for every member. Built once: the
+    # search re-promotes on every DP evaluation.
+    legal_formats = legal_formats_from_candidates(candidates)
 
     def _evaluate(t: float) -> float | None:
         """Solve+promote at tightened ``t``; ratchet if feasible.
@@ -562,6 +742,7 @@ def solve_with_promotion(
             profile=profile,
             include_fused=not no_fused_promote,
             include_moe=True,
+            legal_formats=legal_formats,
         )
         achieved, predicted = compute_achieved(
             stats, assign, format_specs,

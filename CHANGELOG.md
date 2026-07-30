@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.3.1 — 2026-07-30
+
+Closes #28: a serving-atomic group could end up with a quantized + BF16 mix
+inside it, reported only by the fused-coherence gate at the very end of export.
+Fixed at both the cause and the safety net. Allocations on the shipped
+Qwen3.6-27B and Qwen3.5-35B-A3B are unchanged (0 of 614 and 0 of 500).
+
+### Cause: promotion now picks a format the whole unit can run
+
+`_promote_group_components` took the highest-**rank** format assigned to any
+member of a serving-atomic component and wrote it to all of them, with no check
+that the format was legal for the rest — it only received `assignment`,
+`format_rank` and `groups`, so it had no way to know. Members of one unit do not
+share a shape (gate_up vs down differ on the reduce dim; an odd
+`moe_intermediate_size` makes one projection's group/scale-block divisibility
+fail while the other's passes), so the promoted format could be illegal for a
+subset.
+
+Promotion now takes per-row legal-format sets (`legal_formats_from_candidates`)
+derived from the candidate lists, which already encode source-passthrough
+integrity, serving-profile rules, group/scale-block divisibility and kernel
+shape rules. It picks the cheapest legal-for-all format at or above the max
+rank — preserving promotion's non-degrading contract, which
+`solve_with_promotion`'s tightening loop is built around — and only downgrades
+to the highest legal-for-all when nothing above is common. In the illegal case
+every member is written unconditionally, since a member on an equal-rank but
+different format would otherwise survive and leave the unit mixed. No common
+legal format raises, naming every member with its legal set and the three
+upstream causes.
+
+The argument is optional: omit it and the legacy max-rank path runs verbatim, so
+callers that cannot supply legality (auxiliary MTP/visual pins, hand-built
+assignments) keep today's behaviour rather than acquiring a new failure.
+
+Two paths were genuinely reachable and are now covered: the un-aggregated
+(`--no-packed-aggregation` / `--no-fused-aggregation`) solve path, where
+promotion is the only coherence mechanism — there the pre-fix symptom was
+actually an aborted run, since `compute_achieved` refuses to price an
+unpriceable member — and the Pareto seed-JSON promotion, which is **not** priced
+by `compute_achieved` and so could let an illegal member format escape silently.
+The aggregated path already intersected member candidate sets and needed nothing;
+that is now pinned by a test rather than assumed.
+
+### Safety net: export coercion is group-aware
+
+The per-Linear shape/policy coercion (deliberately preserved in 0.3.0) could
+rewrite a single member of a unit to BF16. It now resolves whole serving-atomic
+components, unioning overlapping units — on the split per-expert representation
+a Linear can be both a fused sibling and a packed-expert member — using the same
+profile accessors the fused-coherence gate uses, never by parsing names.
+
+The resolution is deliberately asymmetric. If some emittable quantized format is
+legal for every member, export **raises** and names it: coercing would ship the
+whole unit at 16 bpp (for a packed-expert unit, `num_experts ×` the per-Linear
+cost), the dimension that made one member illegal is model-wide so it recurs in
+every layer, and a re-solve lands the unit on that legal format for free.
+Export must not substitute a format itself — the format the allocator picked is
+the one the production weight cache holds a deliberate render for, so a
+substitute is a cache miss at best and an RTN render at worst. Only when no
+quantized format is legal for every member is BF16 the sole representable
+answer; then the whole unit is coerced, loudly, with every member and the byte
+delta recorded in `runtime_coercions` and the BF16 audit.
+
+Since the cause is fixed upstream, this path should be unreachable in normal
+operation, and the report is written to make any firing look like the upstream
+regression it would be. One case it must keep catching regardless: rank-1 legacy
+probe stats carry no shape, so `check_stats_format_applicability` admits a
+shape-illegal format legitimately and the exporter is the only gate.
+
 ## 0.3.0 — 2026-07-30
 
 Closes the three open issues that were ours (#27, #19, #9 item 1). Minor rather

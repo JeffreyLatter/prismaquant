@@ -2742,9 +2742,15 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
             assignment["model.layers.0.self_attn.o_proj"],
             "MXFP8_E4M3",
         )
-        self.assertEqual(coerced, [
-            ("model.layers.0.linear_attn.in_proj_a", [48, 5120], "MXFP8_E4M3")
-        ])
+        # Rows stay positionally `(name, shape, from_fmt)` for the manifest
+        # and `_bf16_upgrade_audit`; a lone Linear carries no serving group.
+        self.assertEqual(len(coerced), 1)
+        self.assertEqual(
+            tuple(coerced[0][:3]),
+            ("model.layers.0.linear_attn.in_proj_a", [48, 5120], "MXFP8_E4M3"),
+        )
+        self.assertIsNone(coerced[0].serving_group)
+        self.assertEqual(coerced[0].serving_group_members, ())
 
     def test_coerces_profile_illegal_dense_format_to_bf16(self):
         from safetensors.torch import save_file
@@ -2773,9 +2779,12 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
             )
 
         self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "BF16")
-        self.assertEqual(coerced, [
-            ("model.layers.0.self_attn.o_proj", [128, 5120], "MXFP4")
-        ])
+        self.assertEqual(len(coerced), 1)
+        self.assertEqual(
+            tuple(coerced[0][:3]),
+            ("model.layers.0.self_attn.o_proj", [128, 5120], "MXFP4"),
+        )
+        self.assertIsNone(coerced[0].serving_group)
 
     def _single_linear_source(self, td: Path) -> None:
         from safetensors.torch import save_file
@@ -2916,6 +2925,400 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
             reasons["model.layers.0.self_attn.o_proj"],
             "allocator_selected_bf16_mxfp8_legal",
         )
+
+
+class TestServingGroupRuntimeCoercion(unittest.TestCase):
+    """Issue #28: the shape/policy branch of the runtime-legality guard is
+    serving-group aware.
+
+    Packed-MoE expert projections and fused siblings (q/k/v, gate/up) are
+    ATOMIC at serve time -- vLLM's `CompressedTensorsMoEMethod` selects one
+    scheme per FusedMoE layer, and merged-column Linears carry one scheme
+    for the whole packed weight. Their members do NOT share a shape, so a
+    format legal for one member can be illegal for another; rewriting only
+    the offending member produces a quantized + BF16 mix inside one serving
+    unit, which is either a crash at load or (worse) a silent corruption.
+
+    The guard therefore resolves the whole unit: it refuses when a
+    quantized format legal for EVERY member exists (the allocation is
+    repairable upstream at a quantized bit rate, so a 16 bpp rewrite of the
+    unit is not what a shape-aware allocator would produce), and coerces
+    the whole unit to BF16 when nothing else is representable.
+    """
+
+    def _source(self, td: Path, tensors: dict[str, tuple[int, int]]) -> str:
+        from safetensors.torch import save_file
+
+        shard = td / "model-00001-of-00001.safetensors"
+        save_file(
+            {
+                f"{name}.weight": torch.zeros(*shape, dtype=torch.bfloat16)
+                for name, shape in tensors.items()
+            },
+            str(shard),
+        )
+        with open(td / "model.safetensors.index.json", "w") as f:
+            json.dump(
+                {"weight_map": {f"{n}.weight": shard.name for n in tensors}}, f
+            )
+        return str(td)
+
+    # `moe_intermediate_size = 40` is the trap the issue names: it divides
+    # nothing, so NVFP4's group of 16 is illegal on `down_proj` (reduce dim
+    # = intermediate) while `gate_proj`/`up_proj` (reduce dim = hidden) are
+    # perfectly legal. One FusedMoE, two verdicts.
+    _EXPERT_SHAPES = {"gate_proj": (40, 2048), "up_proj": (40, 2048),
+                      "down_proj": (2048, 40)}
+    _QKV_SHAPES = {"q_proj": (128, 5120), "k_proj": (48, 5120),
+                   "v_proj": (48, 5120)}
+
+    def _packed_moe_source(self, td: Path, n_experts: int = 2,
+                           dense_neighbour: bool = False):
+        tensors, assignment = {}, {}
+        for expert in range(n_experts):
+            for proj, shape in self._EXPERT_SHAPES.items():
+                name = f"model.layers.0.mlp.experts.{expert}.{proj}"
+                tensors[name] = shape
+                assignment[name] = "NVFP4"
+        if dense_neighbour:
+            tensors["model.layers.0.self_attn.o_proj"] = (128, 5120)
+            assignment["model.layers.0.self_attn.o_proj"] = "NVFP4"
+        return self._source(td, tensors), assignment
+
+    def _qkv_source(self, td: Path, fmt: str = "MXFP8_E4M3"):
+        tensors = {
+            f"model.layers.0.self_attn.{proj}": shape
+            for proj, shape in self._QKV_SHAPES.items()
+        }
+        tensors["model.layers.0.self_attn.o_proj"] = (128, 5120)
+        assignment = {name: fmt for name in tensors}
+        return self._source(td, tensors), assignment
+
+    def test_packed_moe_group_refuses_rather_than_ship_16bpp_experts(self):
+        """A packed-expert unit whose `down_proj` is NVFP4-illegal is NOT
+        rewritten: FP8_E4M3 is legal for every member, so a re-solve lands
+        the unit on ~8 bpp, while coercing it here would ship the whole
+        FusedMoE at 16 bpp -- num_experts x the per-Linear cost this branch
+        is justified by, on every layer, because the dimension that made
+        one member illegal is model-wide."""
+        with tempfile.TemporaryDirectory() as td:
+            src, assignment = self._packed_moe_source(Path(td))
+            with patch.dict(
+                enc.os.environ,
+                {"PRISMAQUANT_TARGET_PROFILE": "vllm_packed_moe"},
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    _coerce_runtime_legal_assignment(
+                        src, assignment, Qwen3_5Profile()
+                    )
+        msg = str(ctx.exception)
+        self.assertIn("packed_moe_experts", msg)
+        self.assertIn("model.layers.0.mlp.experts", msg)
+        self.assertIn("model.layers.0.mlp.experts.0.down_proj", msg)
+        self.assertIn("group_divisibility", msg)
+        # names the rung a re-solve can use, and what BF16 would have cost
+        self.assertIn("FP8_E4M3", msg)
+        self.assertIn("KiB", msg)
+        self.assertIn("layer_config.json", msg)
+
+    def test_fused_sibling_group_refuses_rather_than_ship_16bpp_qkv(self):
+        """Same rule for merged columns: `k_proj`/`v_proj` at out_features
+        48 are rejected by the MXFP8 kernel validator while `q_proj` at 128
+        is fine. NVFP4 and FP8_E4M3 are legal for all three."""
+        with tempfile.TemporaryDirectory() as td:
+            src, assignment = self._qkv_source(Path(td))
+            with patch.dict(
+                enc.os.environ,
+                {"PRISMAQUANT_TARGET_PROFILE": "vllm_packed_moe"},
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    _coerce_runtime_legal_assignment(
+                        src, assignment, Qwen3_5Profile()
+                    )
+        msg = str(ctx.exception)
+        self.assertIn("fused_siblings", msg)
+        self.assertIn("model.layers.0.self_attn.qkv_proj", msg)
+        self.assertIn("model.layers.0.self_attn.k_proj", msg)
+        self.assertIn("kernel_shape", msg)
+        self.assertIn("NVFP4", msg)
+
+    def _only_bf16_is_legal(self, illegal_for: set[str]):
+        """Applicability stub: every emittable format is illegal on
+        `illegal_for`, so BF16 is the only thing left for that unit and the
+        guard has to coerce rather than refuse. Everything else stays
+        legal, so the surrounding Linears keep their allocated format and
+        `build_quantization_config` gets a REAL mixed config to gate."""
+        real = enc.check_format_applicability
+
+        def stub(shape, fmt, *, qname=None, target_profile=None, **kw):
+            if qname in illegal_for:
+                return type(real(shape, "BF16", qname=qname))(
+                    False, "kernel_shape", f"stub: {fmt} illegal on {qname}"
+                )
+            return real(
+                shape, fmt, qname=qname, target_profile=target_profile, **kw
+            )
+
+        return patch.object(enc, "check_format_applicability", stub)
+
+    def test_whole_fused_group_coerced_when_bf16_is_the_only_option(self):
+        with tempfile.TemporaryDirectory() as td:
+            src, assignment = self._qkv_source(Path(td), fmt="NVFP4")
+            with self._only_bf16_is_legal({"model.layers.0.self_attn.k_proj"}):
+                out, coerced = _coerce_runtime_legal_assignment(
+                    src, assignment, Qwen3_5Profile()
+                )
+
+        # ONE format across the whole merged-column group, and the
+        # untouched Linear keeps what the allocator picked.
+        for proj in self._QKV_SHAPES:
+            self.assertEqual(out[f"model.layers.0.self_attn.{proj}"], "BF16")
+        self.assertEqual(out["model.layers.0.self_attn.o_proj"], "NVFP4")
+
+        rows = {row.name: row for row in coerced}
+        self.assertEqual(
+            set(rows),
+            {f"model.layers.0.self_attn.{p}" for p in self._QKV_SHAPES},
+        )
+        for name, row in rows.items():
+            self.assertEqual(row.serving_group,
+                             "model.layers.0.self_attn.qkv_proj")
+            self.assertEqual(row.serving_group_kind, "fused_siblings")
+            self.assertEqual(
+                set(row.serving_group_members),
+                {f"model.layers.0.self_attn.{p}" for p in self._QKV_SHAPES},
+            )
+            self.assertEqual(row.trigger, "model.layers.0.self_attn.k_proj")
+            self.assertGreater(row.delta_bytes, 0)
+        # the trigger keeps its own verdict; the siblings say why they moved
+        self.assertEqual(rows["model.layers.0.self_attn.k_proj"].reason,
+                         "kernel_shape")
+        self.assertEqual(rows["model.layers.0.self_attn.q_proj"].reason,
+                         "serving_group_coherence")
+        self.assertIn("k_proj",
+                      rows["model.layers.0.self_attn.q_proj"].detail)
+
+        # The invariant this exists to protect: the coerced assignment
+        # passes the fused-coherence gate, and the fused module lands in
+        # `ignore` as one unquantized unit.
+        profile = Qwen3_5Profile()
+        config = build_quantization_config(out, set(), profile=profile)
+        vllm = profile.to_vllm_internal_name
+        self.assertIn(
+            vllm("model.layers.0.self_attn.qkv_proj"), config["ignore"]
+        )
+        # targets are anchored regexes; the quantized neighbour is still
+        # nominated, and no member of the coerced unit is.
+        targets = " ".join(
+            target
+            for group in config["config_groups"].values()
+            for target in group["targets"]
+        )
+        for proj in self._QKV_SHAPES:
+            self.assertNotIn(
+                vllm(f"model.layers.0.self_attn.{proj}").replace(".", "[.]"),
+                targets,
+            )
+        self.assertIn(
+            vllm("model.layers.0.self_attn.o_proj").replace(".", "[.]"),
+            targets,
+        )
+
+    def test_whole_packed_moe_group_coerced_when_bf16_is_the_only_option(self):
+        with tempfile.TemporaryDirectory() as td:
+            src, assignment = self._packed_moe_source(
+                Path(td), dense_neighbour=True
+            )
+            experts = [n for n in assignment if ".experts." in n]
+            trigger = "model.layers.0.mlp.experts.0.down_proj"
+            with self._only_bf16_is_legal({trigger}):
+                out, coerced = _coerce_runtime_legal_assignment(
+                    src, assignment, Qwen3_5Profile()
+                )
+            # every projection of every expert in the unit, not just the
+            # offending one -- vLLM picks one scheme for the whole FusedMoE
+            self.assertEqual({out[name] for name in experts}, {"BF16"})
+            self.assertEqual(out["model.layers.0.self_attn.o_proj"], "NVFP4")
+            self.assertEqual({row.name for row in coerced}, set(experts))
+            kinds = {row.serving_group_kind for row in coerced}
+            self.assertEqual(kinds, {"fused_siblings+packed_moe_experts"})
+            for row in coerced:
+                self.assertIn("__packed_format__", row.serving_group)
+                self.assertEqual(len(row.serving_group_members), len(experts))
+                self.assertEqual(row.trigger, trigger)
+
+            # the packed-MoE coherence gate ("FusedMoE ... has mixed states
+            # across packed expert projections") is satisfied: one state for
+            # the whole layer, ignored as a per-expert regex.
+            config = build_quantization_config(
+                out, set(), profile=Qwen3_5Profile()
+            )
+            self.assertTrue(
+                any(
+                    entry.startswith("re:")
+                    and "mlp[.]experts" in entry
+                    for entry in config["ignore"]
+                ),
+                config["ignore"],
+            )
+
+            # audit says group-level coercion, not per-Linear
+            audit = _bf16_upgrade_audit(
+                src, out, set(), coerced, Qwen3_5Profile()
+            )
+        self.assertEqual(
+            audit["counts"],
+            {"runtime_coerced_serving_group_from_nvfp4": len(experts)},
+        )
+        group_entry = audit["entries"][0]["serving_group"]
+        self.assertEqual(group_entry["kind"], "fused_siblings+packed_moe_experts")
+        self.assertEqual(group_entry["trigger"], trigger)
+        self.assertEqual(len(group_entry["members"]), len(experts))
+
+    def test_manifest_records_the_group_coercion(self):
+        with tempfile.TemporaryDirectory() as td:
+            src, assignment = self._qkv_source(Path(td), fmt="NVFP4")
+            with self._only_bf16_is_legal({"model.layers.0.self_attn.k_proj"}):
+                _out, coerced = _coerce_runtime_legal_assignment(
+                    src, assignment, Qwen3_5Profile()
+                )
+        rows = {row["name"]: row for row in
+                enc._runtime_coercion_manifest_rows(coerced)}
+        self.assertEqual(len(rows), 3)
+        row = rows["model.layers.0.self_attn.q_proj"]
+        self.assertEqual(row["from"], "NVFP4")
+        self.assertEqual(row["to"], "BF16")
+        self.assertEqual(row["reason"], "serving_group_coherence")
+        self.assertEqual(
+            row["serving_group"]["key"], "model.layers.0.self_attn.qkv_proj"
+        )
+        self.assertEqual(
+            row["serving_group"]["trigger"], "model.layers.0.self_attn.k_proj"
+        )
+        self.assertEqual(len(row["serving_group"]["members"]), 3)
+        self.assertGreater(row["delta_bytes"], 0)
+        # and the operator-facing report is impossible to miss
+        report = enc._runtime_coercion_report(coerced)
+        self.assertIn("SERVING-ATOMIC UNIT(S) COERCED TO BF16 IN FULL", report)
+        self.assertIn("UPSTREAM REGRESSION", report)
+        self.assertIn("model.layers.0.self_attn.qkv_proj", report)
+
+    def test_single_member_coercion_is_what_the_gate_rejects(self):
+        """The counterfactual, pinned: the per-Linear rewrite this change
+        replaced produces exactly the mix `build_quantization_config`
+        refuses. Without the group expansion the export dies here (with a
+        wrong-model-profile diagnosis), which is why the coercion has to be
+        group-aware rather than trust the gate to catch it."""
+        mixed = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "BF16",
+            "model.layers.0.self_attn.v_proj": "NVFP4",
+        }
+        with self.assertRaisesRegex(
+            RuntimeError, "fused-sibling coherence violation"
+        ):
+            build_quantization_config(mixed, set(), profile=Qwen3_5Profile())
+
+    def test_ungrouped_linear_still_coerces_alone(self):
+        """No-op for the dense case: a Linear that is in no serving unit
+        coerces exactly as before, and its neighbours are untouched."""
+        with tempfile.TemporaryDirectory() as td:
+            src = self._source(Path(td), {
+                "model.layers.0.self_attn.o_proj": (128, 5120),
+                "model.layers.1.self_attn.o_proj": (128, 5120),
+            })
+            with patch.dict(
+                enc.os.environ,
+                {"PRISMAQUANT_TARGET_PROFILE": "vllm_packed_moe"},
+            ):
+                out, coerced = _coerce_runtime_legal_assignment(
+                    src,
+                    {
+                        "model.layers.0.self_attn.o_proj": "MXFP4",
+                        "model.layers.1.self_attn.o_proj": "NVFP4",
+                    },
+                    Qwen3_5Profile(),
+                )
+            self.assertEqual(out, {
+                "model.layers.0.self_attn.o_proj": "BF16",
+                "model.layers.1.self_attn.o_proj": "NVFP4",
+            })
+            self.assertEqual(len(coerced), 1)
+            self.assertEqual(
+                tuple(coerced[0][:3]),
+                ("model.layers.0.self_attn.o_proj", [128, 5120], "MXFP4"),
+            )
+            self.assertIsNone(coerced[0].serving_group)
+            audit = _bf16_upgrade_audit(
+                src, out, set(), coerced, Qwen3_5Profile()
+            )
+        self.assertEqual(audit["counts"], {"runtime_coerced_from_mxfp4": 1})
+        self.assertNotIn("serving_group", audit["entries"][0])
+
+    def test_unemittable_format_still_hard_fails_inside_a_serving_group(self):
+        """Issue #27's hard error is not weakened by the group logic: a
+        format with no `config_groups` scheme raises before any legality or
+        grouping work, whether or not the Linear is serving-atomic."""
+        with tempfile.TemporaryDirectory() as td:
+            src, _ = self._qkv_source(Path(td))
+            assignment = {
+                "model.layers.0.self_attn.q_proj": "NVFP4",
+                "model.layers.0.self_attn.k_proj": "NVFP4A16",
+                "model.layers.0.self_attn.v_proj": "NVFP4",
+            }
+            with self.assertRaisesRegex(ValueError, "no compressed-tensors"):
+                _coerce_runtime_legal_assignment(
+                    src, assignment, Qwen3_5Profile()
+                )
+
+    def test_undeclared_packed_expert_role_is_fail_closed(self):
+        """A profile that cannot name a packed expert's serving unit is a
+        declaration gap. The raising name is absent from every unit, so
+        "coerce the whole unit" would silently leave it behind and ship a
+        mixed FusedMoE -- so the guard refuses instead of guessing."""
+        class _RaisingProfile(Qwen3_5Profile):
+            def packed_expert_format_group(self, qname):
+                if qname.endswith("down_proj"):
+                    raise KeyError("no role declared for down_proj")
+                return super().packed_expert_format_group(qname)
+
+        with tempfile.TemporaryDirectory() as td:
+            src, assignment = self._packed_moe_source(Path(td))
+            with self._only_bf16_is_legal(
+                {"model.layers.0.mlp.experts.0.gate_proj"}
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    _coerce_runtime_legal_assignment(
+                        src, assignment, _RaisingProfile()
+                    )
+        msg = str(ctx.exception)
+        self.assertIn("cannot verify serving-atomic coherence", msg)
+        self.assertIn("could not name the serving unit", msg)
+        self.assertIn("down_proj", msg)
+        self.assertIn("projection_splits", msg)
+
+    def test_fp8_source_verdict_does_not_escalate_to_the_group(self):
+        """`FP8_SOURCE` is judged illegal here only because this call site
+        cannot supply `source_kind`; the rewrite is inert (the FP8_SOURCE
+        config overlay restores it and materialization copies the source
+        bytes verbatim). Escalating that verdict to a whole serving unit --
+        or to a refusal -- would break every FP8-source export, so
+        passthrough formats stay per-Linear."""
+        with tempfile.TemporaryDirectory() as td:
+            src, _ = self._qkv_source(Path(td))
+            assignment = {
+                "model.layers.0.self_attn.q_proj": "FP8_SOURCE",
+                "model.layers.0.self_attn.k_proj": "FP8_SOURCE",
+                "model.layers.0.self_attn.v_proj": "FP8_SOURCE",
+            }
+            out, coerced = _coerce_runtime_legal_assignment(
+                src, assignment, Qwen3_5Profile()
+            )
+        self.assertEqual(set(out.values()), {"BF16"})
+        self.assertEqual(len(coerced), 3)
+        self.assertEqual({row.serving_group for row in coerced}, {None})
+        self.assertEqual({row.reason for row in coerced},
+                         {"source_dtype_mismatch"})
 
 
 class TestDeltaNetFusedSiblingJointScale(unittest.TestCase):

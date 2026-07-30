@@ -65,7 +65,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, NamedTuple, Sequence
 
 import torch
 import torch.nn as nn
@@ -79,7 +79,10 @@ except ModuleNotFoundError:
             yield
 from safetensors.torch import save_file
 
-from .allocator_candidates import check_format_applicability
+from .allocator_candidates import (
+    PASSTHROUGH_SOURCE_REQUIREMENTS,
+    check_format_applicability,
+)
 from .fp8_dynamic import fp8_dynamic_weight_qdq
 from .mx_formats import e8m0_to_scale, mxfp8_e4m3_qdq
 from .serving_profiles import resolve_target_profile
@@ -1208,11 +1211,231 @@ def _source_weight_shape_for_recipe(
     return None
 
 
+class _RuntimeCoercion(NamedTuple):
+    """One Linear the runtime-legality guard rewrote to BF16.
+
+    Positionally tuple-compatible with the legacy ``(name, shape,
+    from_fmt)`` row this function used to return: `_bf16_upgrade_audit`
+    and the manifest read the first three fields, so old readers keep
+    working while the serving-group fields carry WHY a Linear the
+    allocator chose a quantized format for is shipping unquantized.
+    """
+    name: str
+    shape: list[int] | None
+    from_fmt: str
+    reason: str = ""
+    detail: str = ""
+    # Set only when the coercion was forced by serving-atomicity rather
+    # than by this Linear's own legality verdict.
+    serving_group: str | None = None
+    serving_group_kind: str | None = None
+    serving_group_members: tuple[str, ...] = ()
+    trigger: str | None = None
+    delta_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class _ServingUnit:
+    """A set of Linears that must carry ONE format to be servable.
+
+    ``kind`` is ``fused_siblings`` (vLLM merges q/k/v, gate/up into one
+    packed Linear with one scheme) or ``packed_moe_experts`` (vLLM's
+    ``CompressedTensorsMoEMethod`` selects one scheme per FusedMoE
+    layer). Both are the hard serving invariants of CLAUDE.md §6.
+    """
+    kind: str
+    key: str
+    members: tuple[str, ...]
+
+
+def _serving_atomic_units(
+    names: Iterable[str],
+    profile,
+) -> tuple[tuple[_ServingUnit, ...], dict[str, str]]:
+    """Serving-atomic units among ``names``, from the profile accessors.
+
+    Grouping is asked of the model profile — `_fused_group_key_for_name`
+    (the exporter's own fused-sibling key, the same
+    `fused_sibling_group` / `fused_sibling_leaf_mapping` chain the
+    fused-coherence gate in `build_quantization_config` derives its
+    sibling sets from) and `profile.packed_expert_format_group` (what
+    that gate's `_packed_format_group_members` uses). Nothing here
+    parses Linear names: a new architecture declares its couplings once,
+    in its profile/structure spec, and every consumer sees them.
+
+    Returns the units with >= 2 members present (a lone present member
+    cannot disagree with anything) plus, for fail-closed handling, the
+    names whose packed-expert grouping accessor RAISED — a profile that
+    cannot answer "which unit is this expert projection in" must not be
+    silently treated as "no unit".
+    """
+    grouped: dict[tuple[str, str], list[str]] = {}
+    failures: dict[str, str] = {}
+    packed_getter = (
+        getattr(profile, "packed_expert_format_group", None)
+        if profile is not None
+        else None
+    )
+    for name in names:
+        fused_key = _fused_group_key_for_name(name, profile)
+        if fused_key:
+            grouped.setdefault(("fused_siblings", str(fused_key)), []).append(name)
+        if not callable(packed_getter):
+            continue
+        try:
+            packed_key = packed_getter(name)
+        except Exception as exc:  # PackedExpertRoleUnknown and friends
+            failures[name] = f"{type(exc).__name__}: {exc}"
+            continue
+        if packed_key:
+            grouped.setdefault(
+                ("packed_moe_experts", str(packed_key)), []
+            ).append(name)
+    units = tuple(
+        _ServingUnit(kind, key, tuple(sorted(members)))
+        for (kind, key), members in sorted(grouped.items())
+        if len(members) >= 2
+    )
+    return units, failures
+
+
+def _serving_atomic_components(
+    names: Iterable[str],
+    profile,
+) -> tuple[dict[str, list[str]], dict[str, tuple[_ServingUnit, ...]], dict[str, str]]:
+    """Connected components of the serving-atomic units over ``names``.
+
+    Units are unioned rather than handled one at a time because they can
+    overlap: on the split per-expert representation
+    ``...experts.7.gate_proj`` is both a fused sibling of
+    ``...experts.7.up_proj`` and a member of the layer's packed-expert
+    unit. Coercing one unit at a time could then still leave the other
+    mixed. This mirrors the allocator's own union-find serving-unit
+    promotion (`allocator_solver._promote_group_components`).
+
+    Returns ``(members_by_name, units_by_name, grouping_failures)`` where
+    the first two are keyed by EVERY name in its component (so a lookup
+    needs no root bookkeeping at the call site).
+    """
+    all_names = list(names)
+    units, failures = _serving_atomic_units(all_names, profile)
+    parent = {name: name for name in all_names}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for unit in units:
+        members = [m for m in unit.members if m in parent]
+        for member in members[1:]:
+            ra, rb = find(members[0]), find(member)
+            if ra != rb:
+                parent[rb] = ra
+
+    members_by_root: dict[str, list[str]] = {}
+    for name in all_names:
+        members_by_root.setdefault(find(name), []).append(name)
+    units_by_root: dict[str, list[_ServingUnit]] = {}
+    for unit in units:
+        present = [m for m in unit.members if m in parent]
+        if present:
+            units_by_root.setdefault(find(present[0]), []).append(unit)
+
+    members_by_name: dict[str, list[str]] = {}
+    units_by_name: dict[str, tuple[_ServingUnit, ...]] = {}
+    for root, members in members_by_root.items():
+        component = sorted(members)
+        component_units = tuple(units_by_root.get(root, ()))
+        for name in members:
+            members_by_name[name] = component
+            units_by_name[name] = component_units
+    return members_by_name, units_by_name, failures
+
+
+def _bf16_coercion_delta_bytes(
+    shape: Sequence[int] | None,
+    from_fmt: str,
+) -> int | None:
+    """Bytes a Linear GAINS by shipping BF16 instead of ``from_fmt``."""
+    if not shape:
+        return None
+    from .format_registry import get_format
+
+    try:
+        src = get_format(from_fmt)
+        bf16 = get_format("BF16")
+    except KeyError:
+        return None
+    shape_t = tuple(int(dim) for dim in shape)
+    return int(
+        bf16.memory_bytes_for_shape(shape_t) - src.memory_bytes_for_shape(shape_t)
+    )
+
+
+def _human_bytes(n_bytes: int | None) -> str:
+    if n_bytes is None:
+        return "unknown"
+    value = float(n_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024.0 or unit == "GiB":
+            return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{value:.2f} GiB"
+
+
+def _group_legal_quantized_formats(
+    shapes: dict[str, list[int] | None],
+    members: Sequence[str],
+    target_profile: str,
+) -> list[tuple[str, float]]:
+    """Emittable QUANTIZED formats legal for every checkable member.
+
+    "Checkable" is the same bar the coercion itself uses: a member with a
+    known 2-D source shape. Passthrough formats are excluded — BF16 is
+    the fallback under discussion, and export cannot verify FP8_SOURCE's
+    source-dtype precondition here (it never learns `source_kind`).
+
+    A non-empty answer is the decisive fact for refuse-vs-coerce: it says
+    the allocation is repairable upstream at a quantized bit rate, so
+    rewriting the whole serving unit to 16 bpp is NOT what a
+    shape-aware allocator would have produced.
+    """
+    from .format_registry import get_format
+
+    checkable = [
+        (name, tuple(int(d) for d in shapes[name]))
+        for name in members
+        if shapes.get(name) is not None and len(shapes[name] or ()) == 2
+    ]
+    if not checkable:
+        return []
+    legal: list[tuple[str, float]] = []
+    for fmt in sorted(EXPORTABLE_FORMATS - set(PASSTHROUGH_SOURCE_REQUIREMENTS)):
+        if not all(
+            check_format_applicability(
+                shape,
+                fmt,
+                qname=name,
+                target_profile=target_profile,
+            ).legal
+            for name, shape in checkable
+        ):
+            continue
+        try:
+            bits = get_format(fmt).effective_bits_for_shape(checkable[0][1])
+        except KeyError:
+            bits = float("nan")
+        legal.append((fmt, float(bits)))
+    return sorted(legal, key=lambda row: (row[1], row[0]))
+
+
 def _coerce_runtime_legal_assignment(
     src_model: str,
     assignment: dict[str, str],
     profile=None,
-) -> tuple[dict[str, str], list[tuple[str, list[int], str]]]:
+) -> tuple[dict[str, str], list[_RuntimeCoercion]]:
     """Adjust assignments that the target runtime cannot execute.
 
     Shape and format legality comes from serving-profile config. BF16 is the
@@ -1228,10 +1451,47 @@ def _coerce_runtime_legal_assignment(
     the allocator's menu by this exporter's declaration, so reaching here
     means that bound regressed; masking it with a rewrite is the
     post-allocator band-aid CLAUDE.md §4.1 vetoes.
+
+    **Serving-atomic groups (issue #28).** The coercion is group-aware. A
+    packed-MoE expert unit and a fused-sibling set must carry ONE format
+    (vLLM selects one scheme per FusedMoE layer / per merged-column
+    Linear), and their members do NOT share a shape — an odd
+    `moe_intermediate_size` can make `down_proj` indivisible while
+    `gate_up_proj` is fine. Rewriting only the offending member would
+    produce a quantized + BF16 mix inside one serving unit: a
+    hard-serving-invariant violation that `build_quantization_config`'s
+    fused-coherence gate then reports as a wrong-model-profile problem it
+    is not. So when a member of a serving unit is illegal, this function
+    resolves the WHOLE unit, and never leaves a unit mixed:
+
+      * if some emittable QUANTIZED format is legal for every member, it
+        **raises**. Coercing would ship the whole unit at 16 bpp — for a
+        packed-expert unit that is `num_experts x` the per-Linear cost
+        this branch is justified by, and the model-wide dimension that
+        made one member illegal makes it every layer's unit — when a
+        re-solve lands the unit on that legal format for free. Export
+        must not pick the substitute itself: the format it picked is the
+        one the production weight cache holds a deliberate render for
+        (a substitute is a cache miss at best, an RTN render at worst),
+        so naming the legal rung and refusing is the honest move.
+      * if NO quantized format is legal for every member, BF16 is not a
+        band-aid but the only representable answer — exactly what a
+        shape-aware allocator would have had to pick — so the whole unit
+        is coerced, loudly, and every member is recorded in the returned
+        rows (and from there in `runtime_coercions` +
+        `bf16_audit.serving_group`).
+
+    Upstream is the real fix: the allocator's candidate mask intersects
+    shape legality per member, so a promoted format is legal for every
+    member by construction and this path is unreachable in normal
+    operation. Treat any firing as an upstream regression worth reporting
+    — `_runtime_coercion_report` is written to be impossible to miss.
     """
     out = dict(assignment)
-    coerced: list[tuple[str, list[int], str]] = []
     target_profile = _allocator_target_profile_for_audit(profile) or "research"
+    shapes: dict[str, list[int] | None] = {}
+    # qname -> (shape, from_fmt, reason, detail)
+    illegal: dict[str, tuple[list[int], str, str, str]] = {}
     for qname, fmt in assignment.items():
         fmt_canonical = _canonical_export_format(fmt)
         out[qname] = fmt_canonical
@@ -1269,6 +1529,7 @@ def _coerce_runtime_legal_assignment(
                 f"for rather than letting export rewrite it."
             )
         shape = _source_weight_shape_for_recipe(src_model, qname, profile)
+        shapes[qname] = shape
         if shape is None or len(shape) != 2:
             continue
         verdict = check_format_applicability(
@@ -1278,9 +1539,342 @@ def _coerce_runtime_legal_assignment(
             target_profile=target_profile,
         )
         if not verdict.legal:
+            illegal[qname] = (
+                shape,
+                fmt_canonical,
+                verdict.reason or "illegal",
+                verdict.detail or "",
+            )
+
+    if not illegal:
+        return out, []
+
+    coerced: list[_RuntimeCoercion] = []
+    handled: set[str] = set()
+
+    # Passthrough formats first, and per-Linear as before. `FP8_SOURCE`
+    # is always judged illegal here because this call site cannot supply
+    # `source_kind` (see `PASSTHROUGH_SOURCE_REQUIREMENTS`), so its
+    # verdict says nothing about serving atomicity — and the rewrite is
+    # inert: `_fp8_source_config_overlay` restores FP8_SOURCE for every
+    # source-FP8 Linear in the emitted config, and streaming
+    # materialization copies the source FP8 bytes verbatim for a
+    # BF16-assigned source-FP8 Linear. Escalating THAT to a whole
+    # serving unit (or to a refusal) would break every FP8-source export
+    # for a verdict that is an artifact of the missing argument. These
+    # rows carry no `delta_bytes` for the same reason: the emitted bytes
+    # do not change.
+    for qname in sorted(illegal):
+        shape, from_fmt, reason, detail = illegal[qname]
+        if from_fmt not in PASSTHROUGH_SOURCE_REQUIREMENTS:
+            continue
+        handled.add(qname)
+        out[qname] = "BF16"
+        coerced.append(
+            _RuntimeCoercion(qname, shape, from_fmt, reason, detail)
+        )
+
+    if len(handled) == len(illegal):
+        return out, coerced
+
+    members_by_name, units_by_name, grouping_failures = (
+        _serving_atomic_components(out.keys(), profile)
+    )
+    if grouping_failures:
+        # Fail closed. A name whose serving-unit accessor raised is absent
+        # from every unit, so "coerce the whole unit" would silently leave
+        # it behind -- i.e. produce exactly the mixed FusedMoE this branch
+        # exists to prevent. An undeclared packed-expert role is a profile
+        # declaration gap; guessing it is how you ship an allocation nobody
+        # selected.
+        raise ValueError(
+            f"cannot verify serving-atomic coherence: the model profile "
+            f"could not name the serving unit for "
+            f"{len(grouping_failures)} Linear(s), and "
+            f"{len(illegal) - len(handled)} Linear(s) need a runtime-legality "
+            f"coercion that must be applied to a whole unit or not at all. "
+            + "; ".join(
+                f"{name} ({err})"
+                for name, err in sorted(grouping_failures.items())[:8]
+            )
+            + ". Declare the packed-expert projection roles for this "
+            "architecture (model_profiles/specs/*.json "
+            "`packed_experts.projection_splits`) rather than letting export "
+            "guess which projections share a FusedMoE scheme."
+        )
+    refusals: list[str] = []
+    for qname in sorted(illegal):
+        if qname in handled:
+            continue
+        shape, from_fmt, reason, detail = illegal[qname]
+        units = units_by_name.get(qname, ())
+        if not units:
+            # Not serving-atomic: coerce this Linear alone, as before.
+            handled.add(qname)
             out[qname] = "BF16"
-            coerced.append((qname, shape, fmt_canonical))
+            coerced.append(
+                _RuntimeCoercion(
+                    qname, shape, from_fmt, reason, detail,
+                    delta_bytes=_bf16_coercion_delta_bytes(shape, from_fmt),
+                )
+            )
+            continue
+        members = members_by_name.get(qname, [qname])
+        co_triggers = sorted(m for m in members if m in illegal)
+        handled.update(co_triggers)
+        alternatives = _group_legal_quantized_formats(
+            shapes, members, target_profile
+        )
+        # Name the component by its WIDEST unit — the FusedMoE / merged
+        # column that actually constrains it. Concatenating every unit key
+        # would put a 128-expert layer's whole key list on every row of
+        # the manifest for no extra information: `serving_group_members`
+        # already carries the exact membership.
+        widest = max(units, key=lambda unit: (len(unit.members), unit.key))
+        group_key = widest.key
+        group_kind = "+".join(sorted({unit.kind for unit in units}))
+        would_cost = sum(
+            delta
+            for delta in (
+                _bf16_coercion_delta_bytes(
+                    shapes.get(member), _canonical_export_format(out[member])
+                )
+                for member in members
+                if _canonical_export_format(out[member]) != "BF16"
+            )
+            if delta is not None
+        )
+        if alternatives:
+            refusals.append(
+                _describe_serving_group_refusal(
+                    trigger=qname,
+                    shape=shape,
+                    from_fmt=from_fmt,
+                    reason=reason,
+                    detail=detail,
+                    group_key=group_key,
+                    group_kind=group_kind,
+                    members=members,
+                    co_triggers=co_triggers,
+                    alternatives=alternatives,
+                    would_cost=would_cost,
+                    target_profile=target_profile,
+                )
+            )
+            continue
+        # BF16 is the only representable format left for this unit: it is
+        # what a shape-aware allocator must pick, so take it for the WHOLE
+        # unit. Never one member — that is the mixed-scheme artifact.
+        for member in members:
+            member_fmt = _canonical_export_format(out[member])
+            if member_fmt == "BF16":
+                continue
+            member_shape = shapes.get(member)
+            out[member] = "BF16"
+            if member in illegal:
+                member_reason, member_detail = illegal[member][2], illegal[member][3]
+            else:
+                member_reason = "serving_group_coherence"
+                member_detail = (
+                    f"coerced with its serving-atomic unit; {qname} is "
+                    f"illegal for {from_fmt} ({reason})"
+                )
+            coerced.append(
+                _RuntimeCoercion(
+                    member,
+                    member_shape,
+                    member_fmt,
+                    member_reason,
+                    member_detail,
+                    group_key,
+                    group_kind,
+                    tuple(members),
+                    qname,
+                    _bf16_coercion_delta_bytes(member_shape, member_fmt),
+                )
+            )
+
+    if refusals:
+        raise ValueError(
+            f"serving-atomic group is not runtime-legal for its allocated "
+            f"format in {len(refusals)} unit(s). vLLM selects ONE scheme per "
+            f"FusedMoE layer and one per merged-column Linear, so every "
+            f"member of these units must carry ONE format; export refuses to "
+            f"rewrite them rather than ship a mixed (unservable) unit or a "
+            f"whole unit at 16 bpp when a quantized format legal for every "
+            f"member exists. "
+            + " || ".join(refusals)
+        )
     return out, coerced
+
+
+def _describe_serving_group_refusal(
+    *,
+    trigger: str,
+    shape: Sequence[int] | None,
+    from_fmt: str,
+    reason: str,
+    detail: str,
+    group_key: str,
+    group_kind: str,
+    members: Sequence[str],
+    co_triggers: Sequence[str],
+    alternatives: Sequence[tuple[str, float]],
+    would_cost: int,
+    target_profile: str,
+) -> str:
+    """One refusal clause: what is illegal, and what to do about it."""
+    alt_text = ", ".join(f"{fmt} (~{bits:.3f} bpp)" for fmt, bits in alternatives)
+    others = [name for name in co_triggers if name != trigger]
+    parts = [
+        f"unit {group_key!r} [{group_kind}] allocated {from_fmt} with "
+        f"{len(members)} member(s): {trigger} is ILLEGAL at shape "
+        f"{list(shape) if shape else None} "
+        f"(reason={reason}; {detail or 'no detail'}) under "
+        f"target_profile={target_profile!r}"
+        + (f"; also illegal in this unit: {others}" if others else ""),
+        f"but these emittable formats ARE legal for every member of the "
+        f"unit: {alt_text}. Coercing the unit to BF16 instead would add "
+        f"{_human_bytes(would_cost)} for nothing, and the dimension that "
+        f"made {trigger.rsplit('.', 1)[-1]} illegal is model-wide, so it "
+        f"is that much per unit across every layer",
+    ]
+    parts.append(
+        f"members={sorted(members)[:8]}"
+        + (f" (+{len(members) - 8} more)" if len(members) > 8 else "")
+    )
+    parts.append(
+        f"FIX: re-solve the allocation for target_profile={target_profile!r} "
+        f"so this unit's promoted format is legal for every member -- shape "
+        f"legality has to be intersected ACROSS a serving unit, because that "
+        f"unit is one scheme at serve time (issue #28); or, when "
+        f"re-exporting an allocation that predates that, set every member of "
+        f"the unit to one of the legal formats above in layer_config.json. "
+        f"Export deliberately does not substitute the format itself: the "
+        f"production weight cache holds a deliberate render for the format "
+        f"that was ALLOCATED, so a substitution is a cache miss (or an RTN "
+        f"render), and picking formats is the allocator's job"
+    )
+    return " -- ".join(parts)
+
+
+def _runtime_coercion_report(coerced: Sequence[_RuntimeCoercion]) -> str:
+    """Operator-facing report for runtime coercions, group-aware.
+
+    A whole-serving-unit coercion means an allocation reached export with
+    a format that is illegal for a member of a unit that must be uniform.
+    Upstream is supposed to make that unrepresentable, so this is loud on
+    purpose: it is a safety net firing, i.e. evidence of an upstream
+    regression (or a pre-#28 `layer_config.json`), not routine hygiene.
+    """
+    if not coerced:
+        return ""
+    deltas = [
+        row.delta_bytes for row in coerced
+        if getattr(row, "delta_bytes", None) is not None
+    ]
+    lines = [
+        f"[export-stream] runtime format coercions: {len(coerced)} Linears "
+        f"-> BF16 (target runtime does not support those format/shape pairs)"
+        + (
+            f"; +{_human_bytes(sum(deltas))} over the allocated formats"
+            if deltas else ""
+        ),
+    ]
+    groups: dict[str, list[_RuntimeCoercion]] = {}
+    singles: list[_RuntimeCoercion] = []
+    for row in coerced:
+        key = getattr(row, "serving_group", None)
+        if key:
+            groups.setdefault(str(key), []).append(row)
+        else:
+            singles.append(row)
+    if groups:
+        lines.append(
+            "[export-stream] " + "=" * 62
+        )
+        lines.append(
+            f"[export-stream] WARNING: {len(groups)} SERVING-ATOMIC UNIT(S) "
+            f"COERCED TO BF16 IN FULL."
+        )
+        lines.append(
+            "[export-stream]   vLLM needs ONE format per FusedMoE layer / "
+            "merged-column Linear, and no"
+        )
+        lines.append(
+            "[export-stream]   emittable quantized format was legal for "
+            "every member, so the whole unit"
+        )
+        lines.append(
+            "[export-stream]   ships unquantized. The allocator is supposed "
+            "to make this unreachable, so"
+        )
+        lines.append(
+            "[export-stream]   treat it as an UPSTREAM REGRESSION (or a "
+            "pre-#28 layer_config.json) and"
+        )
+        lines.append(
+            "[export-stream]   report it: this artifact's real bpp EXCEEDS "
+            "its own layer_config.json."
+        )
+        for key, rows in sorted(groups.items()):
+            first = rows[0]
+            delta = sum(
+                row.delta_bytes for row in rows
+                if row.delta_bytes is not None
+            )
+            lines.append(
+                f"[export-stream]   unit {key} [{first.serving_group_kind}]: "
+                f"{len(rows)} Linears -> BF16, +{_human_bytes(delta)}"
+            )
+            lines.append(
+                f"[export-stream]     trigger={first.trigger} "
+                f"from={first.from_fmt} reason={first.reason} "
+                f"detail={first.detail}"
+            )
+            lines.append(
+                "[export-stream]     members="
+                + str(list(first.serving_group_members)[:8])
+                + (
+                    f" (+{len(first.serving_group_members) - 8} more)"
+                    if len(first.serving_group_members) > 8
+                    else ""
+                )
+            )
+        lines.append("[export-stream] " + "=" * 62)
+    if singles:
+        lines.append(
+            "[export-stream]   ungrouped: "
+            + str([(row.name, row.shape, row.from_fmt) for row in singles[:6]])
+        )
+    return "\n".join(lines)
+
+
+def _runtime_coercion_manifest_rows(
+    coerced: Sequence[_RuntimeCoercion],
+) -> list[dict[str, object]]:
+    """`runtime_coercions` records for `mixed_native_manifest.json`."""
+    rows: list[dict[str, object]] = []
+    for row in coerced:
+        entry: dict[str, object] = {
+            "name": row[0],
+            "shape": row[1],
+            "from": row[2],
+            "to": "BF16",
+            "reason": getattr(row, "reason", "") or None,
+            "detail": getattr(row, "detail", "") or None,
+            "delta_bytes": getattr(row, "delta_bytes", None),
+        }
+        group = getattr(row, "serving_group", None)
+        if group:
+            entry["serving_group"] = {
+                "key": group,
+                "kind": row.serving_group_kind,
+                "members": list(row.serving_group_members),
+                "trigger": row.trigger,
+            }
+        rows.append(entry)
+    return rows
 
 
 def _allocator_target_profile_for_audit(profile) -> str | None:
@@ -1310,6 +1904,10 @@ def _bf16_upgrade_audit(
     MXFP8_E4M3/MXFP8_E5M2/FP8 may be worth trying next.
     """
     coerced: dict[str, tuple[list[int], str]] = {}
+    # Serving-unit coercions (issue #28) are reported as such: a whole
+    # FusedMoE / merged-column unit shipping unquantized is a different
+    # (and louder) fact than one Linear whose own shape was illegal.
+    coerced_groups: dict[str, dict[str, object]] = {}
     for row in runtime_coerced:
         if len(row) >= 3:
             name, shape, from_fmt = row[:3]
@@ -1317,6 +1915,16 @@ def _bf16_upgrade_audit(
             name, shape = row[:2]
             from_fmt = "MXFP8_E4M3"
         coerced[str(name)] = (shape, str(from_fmt))
+        group_key = getattr(row, "serving_group", None)
+        if group_key:
+            coerced_groups[str(name)] = {
+                "key": str(group_key),
+                "kind": row.serving_group_kind,
+                "members": list(row.serving_group_members),
+                "trigger": row.trigger,
+                "reason": getattr(row, "reason", "") or None,
+                "detail": getattr(row, "detail", "") or None,
+            }
     target_profile = _allocator_target_profile_for_audit(profile)
     candidate_formats = ("MXFP8_E4M3", "MXFP8_E5M2", "FP8_E4M3", "FP8_E5M2")
     entries: list[dict[str, object]] = []
@@ -1336,7 +1944,9 @@ def _bf16_upgrade_audit(
             reason = "passthrough_or_immutable"
         elif coerced_entry is not None:
             reason = (
-                "runtime_coerced_from_"
+                "runtime_coerced_"
+                + ("serving_group_" if qname in coerced_groups else "")
+                + "from_"
                 + coerced_entry[1].lower().replace("-", "_")
             )
         else:
@@ -1392,6 +2002,9 @@ def _bf16_upgrade_audit(
                         "detail": verdict.detail,
                     }
             entry["eight_bit_candidates"] = verdicts
+        group_entry = coerced_groups.get(qname)
+        if group_entry is not None:
+            entry["serving_group"] = group_entry
         entries.append(entry)
 
     return {
@@ -7757,13 +8370,7 @@ def main():
         profile,
     )
     if runtime_coerced:
-        print(
-            "[export-stream] runtime format coercions: "
-            f"{len(runtime_coerced)} Linears -> BF16 "
-            "(target runtime does not support those format/shape pairs). "
-            f"sample={runtime_coerced[:6]}",
-            flush=True,
-        )
+        print(_runtime_coercion_report(runtime_coerced), flush=True)
     validate_mtp_assignment_coverage(args.model, assignment, profile)
     fmts = Counter(assignment.values())
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
@@ -7932,10 +8539,7 @@ def main():
             "n_assignment_entries": len(config_assignment),
             "source_assignment_entries": len(assignment),
             "fp8_source_passthrough_overrides": sorted(fp8_source_overrides),
-            "runtime_coercions": [
-                {"name": name, "shape": shape, "from": from_fmt, "to": "BF16"}
-                for name, shape, from_fmt in runtime_coerced
-            ],
+            "runtime_coercions": _runtime_coercion_manifest_rows(runtime_coerced),
             "bf16_audit": _bf16_upgrade_audit(
                 args.model,
                 config_assignment,
