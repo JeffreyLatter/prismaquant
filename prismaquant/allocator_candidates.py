@@ -220,19 +220,82 @@ def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
     return True
 
 
+def cost_entry_is_bit_exact(
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this entry proves a LOSSLESS re-encode end to end: measured
+    ``weight_mse`` of exactly 0.0 AND a format whose activation path is the
+    identity.
+
+    ``weight_mse`` is a mean of squared per-element deltas: it is exactly
+    zero only when the format stores the source weights verbatim (W' == W)
+    — e.g. MXFP8 over an FP8 128-block source, or MXFP4/MXFP6/MXFP8 over
+    an MXFP4-packed QAT source. But W' == W only silences the WEIGHT side.
+    For W·A· formats (``FormatSpec.act_quant_changes_input`` — NVFP4,
+    FP8 dynamic, the MX family, GGUF Q8_1 compute) the cost pipeline
+    applies ``activation_quantize_dequantize(X)`` before measuring
+    ``output_mse`` (measure_quant_cost), so a weight-lossless entry's
+    output_mse is REAL A-side error, not noise — on an MXFP4-packed
+    source, an MXFP4 re-encode priced from weight_mse alone would cost
+    dloss 0.0, the unbeatable global minimum at any budget, while its
+    served activations are still 4-bit. The short-circuit therefore
+    requires the format's activation quantization to be the identity — a
+    dtype-level fact (``act_bits is None``: BF16, FP8_SOURCE, NVFP4A16,
+    MXFP8A16, INT-W·A16), not a heuristic. Formats we cannot identify
+    (``format_name`` None or unregistered) never short-circuit.
+
+    For qualifying passthrough-activation formats, measured zero is a
+    valid, indeed optimal, cost (see ``_log_error_values`` in
+    allocator.py): the entry short-circuits to predicted dloss 0.0 ahead
+    of any noisy output_mse measurement.
+
+    Entries that declare an explicit ``cost_source`` (e.g. the
+    production-render score pipeline) carry their own authoritative
+    pricing and default ``weight_mse`` to 0.0 as a placeholder, not a
+    measurement — they are never treated as bit-exact, matching the
+    precedence ``cost_entry_source`` already gives the explicit source.
+    """
+    explicit = cost_entry.get("cost_source")
+    if isinstance(explicit, str) and explicit:
+        return False
+    if format_name is None:
+        return False
+    try:
+        spec = fr.get_format(str(format_name))
+    except KeyError:
+        return False
+    if spec.act_quant_changes_input:
+        return False
+    weight_mse = cost_entry.get("weight_mse")
+    try:
+        return weight_mse is not None and float(weight_mse) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def cost_entry_uses_measured_output_mse(
     stats_entry: dict,
     cost_entry: dict,
+    format_name: str | None = None,
 ) -> bool:
     """Whether ``cost_entry_predicted_dloss`` will read ``output_mse``."""
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        return False
     return _has_measured_output_mse(stats_entry, cost_entry)
 
 
-def cost_entry_source(stats_entry: dict, cost_entry: dict) -> str:
+def cost_entry_source(
+    stats_entry: dict,
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> str:
     """Return the named cost source the allocator will use for one row."""
     explicit = cost_entry.get("cost_source")
     if isinstance(explicit, str) and explicit:
         return explicit
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        return "bit_exact"
     if _has_measured_output_mse(stats_entry, cost_entry):
         if (
             _fisher_output_mse_allocator_enabled()
@@ -257,8 +320,14 @@ def cost_entry_predicted_dloss(
     cost_entry: dict,
     *,
     gain: float = 1.0,
+    format_name: str | None = None,
 ) -> float:
     """Return the allocator's authoritative Δloss for one cost entry."""
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        # Lossless re-encode END TO END (weights verbatim AND identity
+        # activation path): zero cost by construction, regardless of any
+        # noisy output_mse measurement (see cost_entry_is_bit_exact).
+        return 0.0
     if _has_measured_output_mse(stats_entry, cost_entry):
         if (
             _fisher_output_mse_allocator_enabled()
@@ -369,8 +438,9 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             # Packed experts can carry an unmeasured output_mse placeholder;
             # cost_entry_predicted_dloss falls back to predicted_dloss or
             # weight_mse for those entries.
-            predicted = cost_entry_predicted_dloss(s, entry, gain=gain)
-            source_counts[cost_entry_source(s, entry)] += 1
+            predicted = cost_entry_predicted_dloss(
+                s, entry, gain=gain, format_name=spec.name)
+            source_counts[cost_entry_source(s, entry, spec.name)] += 1
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=spec.effective_bits_for_shape(shape),
@@ -545,8 +615,10 @@ def aggregate_fused_siblings(
             sum_pred = 0.0
             for m, (_entry_fmt, c) in zip(members, resolved_entries):
                 # Mirrors build_candidates, including unmeasured packed
-                # output_mse fallback and format-alias lookup.
-                sum_pred += cost_entry_predicted_dloss(stats[m], c)
+                # output_mse fallback, bit-exact short-circuit, and
+                # format-alias lookup.
+                sum_pred += cost_entry_predicted_dloss(
+                    stats[m], c, format_name=spec.name)
             effective_mse = sum_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
             super_cost[spec.name] = {
                 "weight_mse": effective_mse,

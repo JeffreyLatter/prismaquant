@@ -67,6 +67,21 @@ class FormatSpec:
     )
 
     @property
+    def act_quant_changes_input(self) -> bool:
+        """Dtype-level fact: serving quantizes the INPUT activations.
+
+        ``act_bits is None`` declares a weight-only (A16 / passthrough)
+        format whose ``activation_quantize_dequantize`` is the identity.
+        Any other value means the serving kernel consumes quantized
+        activations (W·A· formats: NVFP4, FP8 dynamic, MX, GGUF Q8_1
+        compute), so even a bit-identical weight tensor changes the layer
+        output through the A side. Registry consistency between this
+        declaration and the actual activation callable is pinned by
+        tests/test_bit_exact_cost_pricing.py.
+        """
+        return self.act_bits is not None
+
+    @property
     def effective_bits(self) -> float:
         """Average bits per parameter accounting for scales."""
         # Backward-compatible fallback when no layer shape is available.
