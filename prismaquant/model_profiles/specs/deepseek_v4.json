@@ -2,8 +2,14 @@
   "schema": "prismaquant.model_structure.v1",
   "id": "deepseek_v4",
   "match": {
-    "model_type": ["deepseek_v4", "deepseek-v4"],
-    "architectures": ["DeepseekV4*", "DeepSeek-V4*"]
+    "model_type": [
+      "deepseek_v4",
+      "deepseek-v4"
+    ],
+    "architectures": [
+      "DeepseekV4*",
+      "DeepSeek-V4*"
+    ]
   },
   "shard_regexes": {
     "body_layer_prefix": "layers",
@@ -63,15 +69,34 @@
   },
   "fused_groups": [],
   "packed_experts": {
-    "param_names": ["gate_up_proj", "down_proj"],
-    "split_for_formats": ["*"],
+    "param_names": [
+      "gate_up_proj",
+      "down_proj"
+    ],
+    "split_for_formats": [
+      "*"
+    ],
     "projection_splits": {
-      "gate_up_proj": ["gate_proj", "up_proj"]
+      "gate_up_proj": [
+        "gate_proj",
+        "up_proj"
+      ]
     },
     "format_groups": [
-      ["gate_up_proj", "down_proj"],
-      ["gate_proj", "up_proj", "down_proj"],
-      ["w1", "w2", "w3"]
+      [
+        "gate_up_proj",
+        "down_proj"
+      ],
+      [
+        "gate_proj",
+        "up_proj",
+        "down_proj"
+      ],
+      [
+        "w1",
+        "w2",
+        "w3"
+      ]
     ]
   },
   "moe": {
@@ -79,7 +104,9 @@
     "per_expert_mtp_regex": "re:^model[.]mtp[.][0-9]+[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$"
   },
   "probe": {
-    "skip_module_class_names": ["DeepseekV4GroupedLinear"]
+    "skip_module_class_names": [
+      "DeepseekV4GroupedLinear"
+    ]
   },
   "passthrough_prefixes": [
     "attn_sink",
@@ -90,5 +117,32 @@
     "q_norm",
     "norm."
   ],
-  "pinned_names": ["lm_head", "head"]
+  "pinned_names": [
+    "lm_head",
+    "head"
+  ],
+  "_verified_source_layout": {
+    "verified": "2026-07-30, against deepseek-ai/DeepSeek-V4-Flash safetensors headers (4 shards) + the authors' inference/convert.py",
+    "config": {
+      "expert_dtype": "fp4 on DeepSeek-V4-Flash, fp8 on DeepSeek-V4-Flash-Base (top level, not under text_config)",
+      "quantization_config.scale_fmt": "ue8m0",
+      "quantization_config.weight_block_size": [
+        128,
+        128
+      ]
+    },
+    "tensor_dtypes": {
+      "routed_expert_weight": "I8 nibble-pack, e.g. layers.N.ffn.experts.{i}.w1.weight [2048, 2048] = logical [2048, 4096]",
+      "routed_expert_scale": "F8_E8M0, [2048, 128] = one scale per 32 logical elements along the reduce dim",
+      "shared_expert_weight": "F8_E4M3 block-FP8 (NOT a nibble-pack) \u2014 layers.N.ffn.shared_experts.w1.weight",
+      "shared_expert_scale": "F8_E8M0 over 128x128 blocks",
+      "attention_weight": "F8_E4M3 + F8_E8M0 scale; norms/router BF16/F32"
+    },
+    "notes": [
+      "Scales are 1-byte E8M0 planes named `.scale`, NOT fp32 `.weight_scale_inv` \u2014 the regime-wide fp8 source-byte rate assumes fp32 128x128 scales and over-counts here, so byte accounting for this checkpoint MUST use the per-tensor manifest.",
+      "Checkpoint keys have no `model.` prefix: they start at `layers.N.`.",
+      "E2M1 code table and low-nibble-first packing confirmed against inference/convert.py FP4_TABLE.",
+      "expert_dtype covers ROUTED experts only; the shared expert is block-FP8."
+    ]
+  }
 }

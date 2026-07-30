@@ -97,33 +97,40 @@ def _act_width(cfg: dict) -> int:
 # checkpoint (`layers.N.ffn.experts.7.w1.weight`) naming.
 _EXPERT_TENSOR_RE = re.compile(r"\.experts\.\d+\.")
 
-# Shared-expert tensor qnames. A shared expert is ONE MLP per layer, so
-# unlike a routed expert its name carries no per-expert index:
-# `model.layers.N.mlp.shared_experts.gate_proj.weight` live, DSv4
-# checkpoint `layers.N.ffn.shared_experts.w1.weight`; Qwen-family specs
-# spell it singular (`mlp.shared_expert.gate_proj`). The trailing dot is
-# what keeps the router's `mlp.shared_expert_gate` out.
-_SHARED_EXPERT_TENSOR_RE = re.compile(r"\.shared_experts?\.")
-
 
 def declared_expert_dtype_covers(name: str) -> bool:
     """Whether the checkpoint's `expert_dtype` declaration covers `name`.
 
-    `expert_dtype` is a statement about a layer's EXPERTS, and a MoE
-    layer's experts are its routed experts *plus* its shared expert(s) —
-    DSv4-Flash ships 256 routed + 1 shared per MoE block. The two name
-    shapes differ only in the per-expert index (routed has one, shared
-    does not), which is the sole reason this needs two patterns.
+    **ROUTED experts only — verified against the real checkpoint.** The
+    declaration reads like a statement about all of a layer's experts, and
+    this predicate used to widen to `mlp.shared_experts.*` on that
+    reasoning. The real `deepseek-ai/DeepSeek-V4-Flash` headers say
+    otherwise (safetensors metadata, four shards spanning the model):
+
+        layers.N.ffn.experts.{i}.w{1,2,3}.weight   I8        <- nibble-packed
+        layers.N.ffn.experts.{i}.w{1,2,3}.scale    F8_E8M0
+        layers.N.ffn.shared_experts.w{1,2,3}.weight  F8_E4M3 <- block-FP8
+        layers.N.ffn.shared_experts.w{1,2,3}.scale   F8_E8M0
+
+    i.e. the shared expert is ordinary block-FP8, 2304/2304 routed-expert
+    weights are I8 and 9/9 shared-expert weights are F8_E4M3. The authors'
+    own converter agrees and is the tie-breaker: `inference/convert.py`
+    gates the fp4 path on ``"experts" in name and dtype == torch.int8``, so
+    an F8_E4M3 shared expert never enters it.
+
+    Widening to shared experts would therefore send a block-FP8 tensor into
+    the MXFP4 decode, where `_check_mxfp4_packed_grid` refuses a non-int8
+    weight — a hard DSv4 load failure. Keep this routed-only.
 
     Nothing here inspects a tensor's shape or dtype: the trigger stays the
     config declaration (`declared_fp4_expert_dtype`) and the packed layout
     stays a hard assertion after the fact
     (`layer_streaming._check_mxfp4_packed_grid`). Non-expert tensors
-    (attention projections, the router gate, norms) are excluded and keep
-    the block-FP8 dequant path and its `_check_fp8_scale_grid` assertion.
+    (attention projections, the router gate, norms) and the shared expert
+    keep the block-FP8 dequant path and its `_check_fp8_scale_grid`
+    assertion.
     """
-    return bool(_EXPERT_TENSOR_RE.search(name)
-                or _SHARED_EXPERT_TENSOR_RE.search(name))
+    return bool(_EXPERT_TENSOR_RE.search(name))
 
 
 # safetensors dtype names for a 1-byte integer plane — what a nibble-packed

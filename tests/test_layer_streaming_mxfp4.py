@@ -362,66 +362,93 @@ def test_batched_decode_matches_reference_across_chunks(tmp_path, monkeypatch):
 # only an assertion.
 # ---------------------------------------------------------------------------
 
-def test_declared_shared_expert_is_covered_by_the_declaration(tmp_path):
+def test_shared_expert_is_not_covered_by_the_declaration(tmp_path):
+    """VERIFIED against deepseek-ai/DeepSeek-V4-Flash, not assumed.
+
+    `expert_dtype: "fp4"` reads like a statement about all of a layer's
+    experts, and this predicate briefly widened to `shared_experts.*` on
+    that reasoning. The real safetensors headers refute it — across four
+    shards spanning the model, 2304/2304 routed-expert weights are `I8`
+    nibble-packs while 9/9 shared-expert weights are `F8_E4M3` block-FP8:
+
+        layers.N.ffn.experts.{i}.w{1,2,3}.weight     I8       + F8_E8M0 scale
+        layers.N.ffn.shared_experts.w{1,2,3}.weight  F8_E4M3  + F8_E8M0 scale
+
+    The authors' converter is the tie-breaker: `inference/convert.py` gates
+    its fp4 path on ``"experts" in name and dtype == torch.int8``, so an
+    F8_E4M3 shared expert never enters it. Covering shared experts would
+    send block-FP8 into the nibble decode and hard-fail the load.
+    """
     routed, routed_s = _rand_expert(seed=21)
-    # A shared expert is sized by moe_intermediate_size, so it is a
-    # DIFFERENT shape from a routed expert here on purpose: step 3b groups
-    # by shape, and the shared tensor must simply form its own group.
-    shared, shared_s = _rand_expert(rows=6, packed_in=48, seed=22)
-    attn = (torch.randn(128, 128).to(torch.float8_e4m3fn),
-            torch.ones(1, 1, dtype=torch.float32))
+    shared = torch.randn(128, 256).to(torch.float8_e4m3fn)   # real layout
+    shared_s = torch.ones(1, 2, dtype=torch.float32)         # 128-blocks
     _write_dsv4_checkpoint(tmp_path, {0: (routed, routed_s)},
-                           attn_fp8=attn,
                            shared_expert=(shared, shared_s))
     fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
-    assert fp8_map.mxfp4_names == {_live(0), _LIVE_SHARED}
-    # The non-expert fp8 tensor is untouched by the widening.
-    assert "model.layers.0.self_attn.q_proj.weight" in fp8_map
-    assert ("model.layers.0.self_attn.q_proj.weight"
-            not in fp8_map.mxfp4_names)
+    assert fp8_map.mxfp4_names == {_live(0)}, "routed experts only"
+    # The shared expert is still known to the fp8 map — it just dequants on
+    # the block-FP8 path, which is what the real checkpoint requires.
+    assert _LIVE_SHARED in fp8_map
 
 
-def test_declared_shared_expert_decodes_bit_exactly(tmp_path):
-    """The whole point of the fix: a declared-MXFP4 shared expert decodes
-    on the nibble path, bit-exact against the independent scalar
-    reference, instead of raising out of the block-FP8 guard."""
+def test_real_dsv4_layout_routed_nibbles_and_shared_block_fp8(tmp_path):
+    """One checkpoint, both real expert layouts, each on its own path."""
     routed, routed_s = _rand_expert(seed=31)
-    shared, shared_s = _rand_expert(rows=6, packed_in=48, seed=32)
+    shared = torch.randn(128, 256).to(torch.float8_e4m3fn)
+    shared_s = torch.full((1, 2), 2.0, dtype=torch.float32)
     _write_dsv4_checkpoint(tmp_path, {0: (routed, routed_s)},
                            shared_expert=(shared, shared_s))
     fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
     out = {_live(0): routed.clone(), _LIVE_SHARED: shared.clone()}
     assert _apply_fp8_dequant_inplace(out, fp8_map, CPU) == 2
-    assert out[_LIVE_SHARED].shape == (6, 96)
-    _assert_bitwise_equal_bf16(
-        out[_LIVE_SHARED], _scalar_reference_decode(shared, shared_s))
+    # Routed: nibble-decoded, bit-exact vs the independent scalar reference.
     _assert_bitwise_equal_bf16(
         out[_live(0)], _scalar_reference_decode(routed, routed_s))
+    # Shared: block-FP8 dequant, so it keeps its logical width (NOT doubled).
+    assert out[_LIVE_SHARED].shape == (128, 256)
+    assert out[_LIVE_SHARED].dtype == torch.bfloat16
+    assert torch.equal(out[_LIVE_SHARED].float(), shared.float() * 2.0)
 
 
-def test_undeclared_shared_expert_is_not_decoded_as_nibbles(tmp_path):
-    """No declaration, no MXFP4 decode — the widening moved the
-    declaration's *scope*, not the trigger."""
-    shared, shared_s = _rand_expert(rows=6, packed_in=48, seed=41)
-    _write_dsv4_checkpoint(tmp_path, {}, declare_fp4=False,
-                           shared_expert=(shared, shared_s))
-    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
-    assert _LIVE_SHARED in fp8_map
-    assert fp8_map.mxfp4_names == frozenset()
+def test_real_routed_expert_grid_passes_the_packed_assertion():
+    """The real routed shapes satisfy `_check_mxfp4_packed_grid` as shipped.
 
-
-def test_declared_shared_expert_with_wrong_layout_raises_loudly(tmp_path):
-    """If a real declared-fp4 checkpoint turns out to ship block-FP8 shared
-    experts, the packed-grid ASSERTION fires with the exact mismatch — it
-    is never a trigger, so nothing is silently reinterpreted."""
-    shared = torch.randn(128, 128).to(torch.float8_e4m3fn)
-    shared_s = torch.ones(1, 1, dtype=torch.float32)
-    _write_dsv4_checkpoint(tmp_path, {}, shared_expert=(shared, shared_s))
-    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
-    assert fp8_map.mxfp4_names == {_LIVE_SHARED}
-    out = {_LIVE_SHARED: shared.clone()}
+    From the checkpoint header: w1 weight I8 [2048, 2048] with scale
+    F8_E8M0 [2048, 128] (2048 packed cols = 4096 logical, one scale per 32
+    logical = 16 packed), and w2 weight [4096, 1024] with scale [4096, 64].
+    Shapes only — no tensor data is needed to check the grid.
+    """
+    for (rows, packed), (srows, scols) in (((2048, 2048), (2048, 128)),
+                                           ((4096, 1024), (4096, 64))):
+        _check_mxfp4_packed_grid(
+            "layers.1.ffn.experts.0.w1.weight",
+            torch.zeros(rows, packed, dtype=torch.int8),
+            torch.zeros(srows, scols, dtype=torch.uint8))
+    # An F8_E4M3 weight (the real shared-expert dtype) is refused outright,
+    # which is why the declaration must not cover shared experts.
     with pytest.raises(ValueError, match="declared MXFP4"):
-        _apply_fp8_dequant_inplace(out, fp8_map, CPU)
+        _check_mxfp4_packed_grid(
+            "layers.1.ffn.shared_experts.w1.weight",
+            torch.zeros(128, 256, dtype=torch.float8_e4m3fn),
+            torch.zeros(1, 16, dtype=torch.uint8))
+
+
+def test_e2m1_table_matches_the_reference_converter():
+    """Our E2M1 code table is the authors' `FP4_TABLE`, in their order.
+
+    From `inference/convert.py` in the model repo, which decodes
+    ``stack([FP4_TABLE[x & 0x0F], FP4_TABLE[(x >> 4) & 0x0F]], -1)`` — low
+    nibble first, i.e. the even logical element. That settles the nibble
+    order the vectorized path assumes.
+    """
+    assert _E2M1 == [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                     0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+    # Low-nibble-first, end to end on one byte: low=0x1 (0.5), high=0x2
+    # (1.0) must decode to [0.5, 1.0] in that order.
+    packed = torch.tensor([[0x21]], dtype=torch.int8)
+    scale = torch.full((1, 1), 127, dtype=torch.uint8)   # exp2(0) == 1.0
+    decoded = _scalar_reference_decode(packed, scale)
+    assert [float(v) for v in decoded.flatten()[:2]] == [0.5, 1.0]
 
 
 def test_non_expert_tensor_still_flows_through_check_fp8_scale_grid(tmp_path):
@@ -446,20 +473,24 @@ def test_non_expert_tensor_still_flows_through_check_fp8_scale_grid(tmp_path):
 
 
 def test_declared_expert_dtype_covers_scope():
-    """Name-shape scope of the declaration, spelled out: routed (indexed),
-    shared (unindexed, both spellings), and nothing else — in particular
-    not the router's `shared_expert_gate`."""
+    """Name-shape scope of the declaration, spelled out: ROUTED experts
+    (which carry a per-expert index) and nothing else.
+
+    Shared experts are excluded because the real DeepSeek-V4-Flash ships
+    them as F8_E4M3 block-FP8, not nibble-packs — see
+    `test_shared_expert_is_not_covered_by_the_declaration` for the header
+    evidence and the authors' converter gate."""
     from prismaquant.autoscale import declared_expert_dtype_covers
 
     for name in (
         "model.layers.0.mlp.experts.7.gate_proj.weight",   # routed, live
         "layers.0.ffn.experts.7.w1.weight",                # routed, DSv4 ckpt
-        "model.layers.0.mlp.shared_experts.gate_proj.weight",
-        "layers.0.ffn.shared_experts.w1.weight",           # shared, DSv4 ckpt
-        "model.layers.0.mlp.shared_expert.up_proj.weight",  # Qwen spelling
     ):
         assert declared_expert_dtype_covers(name), name
     for name in (
+        "layers.0.ffn.shared_experts.w1.weight",           # shared, DSv4 ckpt
+        "model.layers.0.mlp.shared_experts.gate_proj.weight",
+        "model.layers.0.mlp.shared_expert.up_proj.weight",  # Qwen spelling
         "model.layers.0.self_attn.q_proj.weight",
         "model.layers.0.mlp.gate.weight",                  # router
         "model.layers.0.mlp.shared_expert_gate.weight",    # router gate
@@ -469,19 +500,23 @@ def test_declared_expert_dtype_covers_scope():
         assert not declared_expert_dtype_covers(name), name
 
 
-def test_layer_cache_estimate_prices_declared_fp4_shared_expert(tmp_path):
-    """The resident-size estimators key on the same declaration scope, so a
-    declared-MXFP4 shared expert is not left with the 4x undercount that
-    makes prefetch refuse layers that actually fit."""
+def test_layer_cache_estimate_leaves_the_shared_expert_on_the_f8_path(tmp_path):
+    """The estimators use the same routed-only scope as the decode.
+
+    A real DSv4 shared expert is F8_E4M3, so it is priced by the ordinary
+    fp8 rule (1 disk byte -> one bf16 element = 2 B), NOT at the 2x
+    logical-element rate a nibble-pack gets. Sizing a routed I8 pack as
+    verbatim instead under-reserves 4x and makes prefetch refuse layers
+    that actually fit.
+    """
     from prismaquant.streaming_model import _estimate_layer_cache_bytes
     shard = str(tmp_path / "model.safetensors")
-    save_file({_LIVE_SHARED: torch.zeros(6, 48, dtype=torch.int8)}, shard)
-    kw = dict(weight_shard={_LIVE_SHARED: shard},
-              weight_ckpt={_LIVE_SHARED: _LIVE_SHARED},
+    save_file({_LIVE_SHARED: torch.zeros(6, 48).to(torch.float8_e4m3fn),
+               _live(0): torch.zeros(6, 48, dtype=torch.int8)}, shard)
+    kw = dict(weight_shard={_LIVE_SHARED: shard, _live(0): shard},
+              weight_ckpt={_LIVE_SHARED: _LIVE_SHARED, _live(0): _live(0)},
               layers_prefix="model.layers.", num_layers=1,
               target_dtype=torch.bfloat16)
     _est, sizes = _estimate_layer_cache_bytes(fp4_experts=True, **kw)
-    assert sizes[0] == 6 * 48 * 2 * 2
-    _est_u, sizes_undeclared = _estimate_layer_cache_bytes(
-        fp4_experts=False, **kw)
-    assert sizes_undeclared[0] == 6 * 48 * 1
+    # shared (F8: 1 elem/byte -> bf16) + routed (nibble pack: 2 elem/byte)
+    assert sizes[0] == 6 * 48 * 2 + 6 * 48 * 2 * 2
