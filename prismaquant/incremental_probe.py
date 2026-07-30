@@ -1253,7 +1253,7 @@ def _compute_global_precompute(
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 **_profile.extra_layer_kwargs(input_ids=ids),
-                **pass_state,
+                pass_state=pass_state,
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
@@ -1513,6 +1513,14 @@ def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
         "router_totals": pre.router_totals,
         "router_active_counts": pre.router_active_counts,
         "expert_route_stats": pre.expert_route_stats,
+        # Per-pass cross-layer shared state captured at the end of phase-1
+        # (Gemma4 `shared_kv_states`). MUST be persisted: phase-3's isolated
+        # forwards rebuild each KV-sharing layer's borrowed K/V from it, and
+        # the shard runners routinely read the precompute back from this
+        # cache (resume, or one shard process per body shard). Without it a
+        # resumed run hands KV-sharing layers an empty dict and the layer
+        # raises `KeyError: <source layer idx>` inside attention.
+        "shared_pass_state": pre.shared_pass_state,
         "meta": meta,
     }, str(path))
 
@@ -1549,6 +1557,12 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
         router_totals={},
         router_active_counts={},
         expert_route_stats={},
+        # Restore the phase-1 cross-layer shared state (Gemma4
+        # `shared_kv_states`); `None` for every architecture that declares no
+        # per-pass shared kwargs, and for caches written before this key
+        # existed — on a KV-sharing model those hit the profile's loud
+        # "delete the precompute cache" error instead of a bare KeyError.
+        shared_pass_state=data.get("shared_pass_state"),
     )
 
 
@@ -2295,7 +2309,9 @@ def _run_body_streaming_shard(
                     input_ids=calib.to(device) if calib is not None else None),
                 # KV-sharing layers (Gemma4) reuse K/V captured in phase-1;
                 # reconstruct that per-layer slice for this isolated forward.
-                **_shard_profile.isolated_layer_pass_state(
+                # One-layer scope, so the "once per pass" rule is trivially
+                # satisfied: a fresh container per isolated forward.
+                pass_state=_shard_profile.isolated_layer_pass_state(
                     precomputed.shared_pass_state, layers[L]),
             )
             out.backward(grad_out.to(device))

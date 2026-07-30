@@ -2640,6 +2640,75 @@ class TestMtpCoverageValidation(unittest.TestCase):
             )
 
 
+class TestExportableFormats(unittest.TestCase):
+    """`EXPORTABLE_FORMATS` is what the serving profile's export lane
+    bounds the allocator's menu by (issue #27), so it has to agree with
+    what the export path really does -- not with a hand-maintained list.
+    """
+
+    def test_declared_set_matches_what_the_export_path_accepts(self):
+        """Behavioural cross-check. For every registered format: if the
+        exporter declares it emittable, some emit path takes it; if not,
+        `_quantize_2d` refuses it.
+
+        The two passthroughs are the reason this cannot be derived from the
+        packer branches, so they are checked against their real emit path
+        instead: BF16 through the plain-bf16 branch, FP8_SOURCE through the
+        verbatim source copy (which has no `_quantize_2d` branch at all).
+        """
+        w = torch.randn(64, 256, dtype=torch.bfloat16)
+        for fmt in sorted(fr.REGISTRY):
+            emittable = fmt in enc.EXPORTABLE_FORMATS
+            with self.subTest(fmt=fmt, emittable=emittable):
+                if fmt == "FP8_SOURCE":
+                    # Scheme + verbatim copy, no weight codec: the packer
+                    # refuses it while the exporter still ships it.
+                    self.assertTrue(emittable)
+                    with self.assertRaises(ValueError):
+                        _quantize_2d(w, fmt)
+                    continue
+                if fmt == "BF16":
+                    self.assertTrue(emittable)
+                    self.assertEqual(
+                        _quantize_2d(w, fmt)["weight"].dtype, torch.bfloat16)
+                    continue
+                if emittable:
+                    self.assertTrue(_quantize_2d(w, fmt))
+                else:
+                    with self.assertRaises(ValueError):
+                        _quantize_2d(w, fmt)
+
+    def test_every_declared_format_has_config_groups_metadata(self):
+        """Gate #9's first clause: emittable means vLLM can dispatch it, so
+        every non-passthrough entry must resolve to a `config_groups`
+        scheme. BF16 is the sole exception -- it is named on `ignore`."""
+        for fmt in sorted(enc.EXPORTABLE_FORMATS):
+            if fmt in enc.CONTAINER_PASSTHROUGH_FORMATS:
+                self.assertNotIn(fmt, enc.FORMAT_SCHEME, fmt)
+                continue
+            self.assertIn("config_groups", build_quantization_config(
+                {"model.layers.0.self_attn.o_proj": fmt}, set()), fmt)
+
+    def test_declaration_is_derived_and_canonical(self):
+        """Derived, not hand-listed: FORMAT_SCHEME's legacy `MXFP8` alias
+        must not leak into the declaration as a distinct rung, and adding a
+        scheme must not need a second edit here. Canonicalized here through
+        the registry (what the profile side uses), not the exporter's own
+        alias map, so the two cannot drift apart."""
+        self.assertEqual(
+            enc.EXPORTABLE_FORMATS,
+            frozenset(
+                {fr.canonical_format_name(f) for f in enc.FORMAT_SCHEME}
+                | set(enc.CONTAINER_PASSTHROUGH_FORMATS)
+            ),
+        )
+        self.assertNotIn("MXFP8", enc.EXPORTABLE_FORMATS)
+        self.assertIn("MXFP8_E4M3", enc.EXPORTABLE_FORMATS)
+        # The asymmetry the constant exists to record.
+        self.assertIn("FP8_SOURCE", enc.EXPORTABLE_FORMATS)
+        self.assertNotIn("FP8_E5M2", enc.EXPORTABLE_FORMATS)
+
+
 class TestRuntimeLegalAssignment(unittest.TestCase):
     def test_coerces_runtime_illegal_mxfp8_shape_to_bf16(self):
         from safetensors.torch import save_file
@@ -2708,36 +2777,71 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
             ("model.layers.0.self_attn.o_proj", [128, 5120], "MXFP4")
         ])
 
-    def test_coerces_parsed_research_format_without_export_scheme_to_bf16(self):
+    def _single_linear_source(self, td: Path) -> None:
         from safetensors.torch import save_file
 
+        shard = td / "model-00001-of-00001.safetensors"
+        save_file({
+            "model.language_model.layers.0.self_attn.o_proj.weight": (
+                torch.zeros(128, 5120, dtype=torch.bfloat16)
+            ),
+        }, str(shard))
+        with open(td / "model.safetensors.index.json", "w") as f:
+            json.dump({
+                "weight_map": {
+                    "model.language_model.layers.0.self_attn.o_proj.weight": (
+                        shard.name
+                    ),
+                }
+            }, f)
+
+    def test_unexportable_format_hard_fails_instead_of_bf16_coercion(self):
+        """Issue #27. A format with no `config_groups` scheme cannot be
+        emitted at all, so rewriting it to BF16 would ship that Linear at
+        16 bpp -- blowing the byte budget the allocation was selected under
+        and leaving the artifact's real bpp disagreeing with its own
+        layer_config.json, with nothing recorded in the selection. The
+        serving profile's export lane bounds the allocator's menu by
+        EXPORTABLE_FORMATS, so reaching here is a regression in that bound
+        and must be loud (CLAUDE.md §4.1: no post-allocator rewrites).
+
+        FP8_E5M2 is the sharp case: it HAS a `_quantize_2d` byte-packer
+        branch, so "has a packer" is not the same question as "is
+        emittable"."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
-            shard = td / "model-00001-of-00001.safetensors"
-            save_file({
-                "model.language_model.layers.0.self_attn.o_proj.weight": (
-                    torch.zeros(128, 5120, dtype=torch.bfloat16)
-                ),
-            }, str(shard))
-            with open(td / "model.safetensors.index.json", "w") as f:
-                json.dump({
-                    "weight_map": {
-                        "model.language_model.layers.0.self_attn.o_proj.weight": (
-                            shard.name
-                        ),
-                    }
-                }, f)
+            self._single_linear_source(td)
 
-            assignment, coerced = _coerce_runtime_legal_assignment(
-                str(td),
-                {"model.layers.0.self_attn.o_proj": "FP8_E5M2"},
-                Qwen3_5Profile(),
-            )
+            for fmt in ("FP8_E5M2", "NVFP4A16", "MXFP6_E3M2", "INT8_W8A16"):
+                with self.subTest(fmt=fmt):
+                    with self.assertRaises(ValueError) as ctx:
+                        _coerce_runtime_legal_assignment(
+                            str(td),
+                            {"model.layers.0.self_attn.o_proj": fmt},
+                            Qwen3_5Profile(),
+                        )
+                    msg = str(ctx.exception)
+                    # Names the Linear, the format, and the profile that
+                    # admitted it -- an operator has to be able to act on it.
+                    self.assertIn("model.layers.0.self_attn.o_proj", msg)
+                    self.assertIn(fmt, msg)
+                    self.assertIn("vllm_packed_moe", msg)
+                    self.assertIn("EXPORTABLE_FORMATS", msg)
 
-        self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "BF16")
-        self.assertEqual(coerced, [
-            ("model.layers.0.self_attn.o_proj", [128, 5120], "FP8_E5M2")
-        ])
+    def test_unexportable_format_hard_fails_without_a_profile(self):
+        """The `profile=None` path (target_profile falls back to
+        `research`, which is deliberately unbounded) must fail the same
+        way: an unemittable format is a container fact, not a policy one."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._single_linear_source(td)
+
+            with self.assertRaisesRegex(ValueError, "no compressed-tensors"):
+                _coerce_runtime_legal_assignment(
+                    str(td),
+                    {"model.layers.0.self_attn.o_proj": "NVFP4A16"},
+                    None,
+                )
 
     def test_gguf_formats_hard_fail_instead_of_bf16_coercion(self):
         """A GGUF assignment reaching the compressed-tensors exporter is a

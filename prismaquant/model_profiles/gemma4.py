@@ -87,6 +87,15 @@ class Gemma4Profile(ModelProfile):
     # `shared_kv_states` dict the model forward threads through every layer.
     # ------------------------------------------------------------
     def new_forward_pass_state(self) -> dict:
+        """A FRESH `shared_kv_states` dict per forward pass.
+
+        `Gemma4TextModel.forward` creates `shared_kv_states = {}` once per
+        pass and threads the same object through every decoder layer
+        (`transformers/models/gemma4/modeling_gemma4.py:1669`); storing
+        layers write `shared_kv_states[layer_idx] = (k, v)` and KV-sharing
+        layers read `shared_kv_states[kv_shared_layer_index]`. A new dict per
+        call is the contract — reusing one across passes would feed batch
+        N-1's K/V (and its sequence length) to batch N."""
         return {"shared_kv_states": {}}
 
     def capture_forward_pass_state(self, pass_state: dict):
@@ -109,15 +118,31 @@ class Gemma4Profile(ModelProfile):
         source layer's captured K/V (the attention moves them to the right device
         itself); a non-shared layer just needs a writable dict to store into.
         Always returns a `shared_kv_states` dict so the layer never sees
-        `None`."""
+        `None`.
+
+        A KV-sharing layer with no captured source K/V cannot be forwarded at
+        all — its attention does an unconditional
+        `shared_kv_states[kv_shared_layer_index]` lookup. Fail loud here
+        instead of letting that surface as a bare `KeyError` from inside
+        attention: the only way to get here is a phase-1 capture that never
+        ran or a precompute cache written before the capture was persisted."""
         attn = getattr(layer, "self_attn", None)
-        if getattr(attn, "is_kv_shared_layer", False) and captured:
-            source_idx = getattr(attn, "kv_shared_layer_index", None)
-            if source_idx is not None:
-                kv = captured.get(int(source_idx))
-                if kv is not None:
-                    return {"shared_kv_states": {int(source_idx): kv}}
-        return {"shared_kv_states": {}}
+        if not getattr(attn, "is_kv_shared_layer", False):
+            return {"shared_kv_states": {}}
+        source_idx = getattr(attn, "kv_shared_layer_index", None)
+        kv = None
+        if source_idx is not None and captured:
+            kv = captured.get(int(source_idx))
+        if kv is None:
+            raise RuntimeError(
+                "Gemma4 KV-sharing layer "
+                f"{getattr(attn, 'layer_idx', '?')} needs shared_kv_states"
+                f"[{source_idx!r}] from the phase-1 capture, but the captured "
+                f"state has {sorted(captured) if captured else 'no'} entries. "
+                "Delete the probe precompute cache (WORK_DIR/work/"
+                "precomputed.pt) so phase-1 re-runs and re-captures it."
+            )
+        return {"shared_kv_states": {int(source_idx): kv}}
 
     def export_tensor_name(self, model_qname: str) -> str:
         """Keep body/expert export keys in recipe form.

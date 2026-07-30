@@ -294,10 +294,10 @@ def test_runtime_shape_validators_can_be_name_scoped(monkeypatch):
 # its lane's exporter cannot emit (issue #22 part 2).
 #
 # The bound is derived from each exporter's OWN declaration
-# (export_native_compressed.FORMAT_SCHEME for the compressed-tensors lane,
-# gguf_formats.GGUF_BLOCK_BYTES for the GGUF lane), so these tests pin the
-# derivation against the exporters' real accept/reject behaviour rather than
-# re-listing formats.
+# (export_native_compressed.EXPORTABLE_FORMATS for the compressed-tensors
+# lane, gguf_formats.GGUF_BLOCK_BYTES for the GGUF lane), so these tests pin
+# the derivation against the exporters' real accept/reject behaviour rather
+# than re-listing formats.
 # ---------------------------------------------------------------------------
 
 
@@ -419,9 +419,14 @@ def test_compressed_tensors_lane_declaration_matches_exporter_behaviour():
 
     emittable = lane_emittable_formats(VLLM_PROFILE)
     # Every scheme the exporter can describe is either a codec format or a
-    # declared passthrough; nothing else is in the menu.
+    # declared passthrough; nothing else is in the menu. Spelled out rather
+    # than compared to EXPORTABLE_FORMATS so that moving the source of truth
+    # into the exporter (issue #27) is pinned as a no-op for the menu.
     assert emittable == frozenset(
         {fr.canonical_format_name(f) for f in enc.FORMAT_SCHEME} | {"BF16"})
+    # ...and the lane now reads exactly that constant, so the exporter owns
+    # its own bound instead of the profile spec restating it.
+    assert emittable == frozenset(enc.EXPORTABLE_FORMATS)
 
     # Canonical names only: `layer_config.canonicalize_format` resolves the
     # FP8/FP8_DYNAMIC/MXFP8 aliases before an assignment reaches the
@@ -481,3 +486,62 @@ def test_export_lane_with_a_stale_declaration_fails_loudly():
     empty = ExportLaneSpec(id="unit_empty_lane")
     with pytest.raises(RuntimeError, match="no emittable formats"):
         empty.emittable_formats()
+
+    not_iterable = ExportLaneSpec(
+        id="unit_scalar_lane",
+        codec_formats_from=(
+            "prismaquant.export_native_compressed:FP8_E4M3_MAX",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not iterable"):
+        not_iterable.emittable_formats()
+
+
+def test_export_lane_reads_a_set_declaration_as_well_as_a_dict():
+    """The compressed-tensors lane declares a `frozenset`
+    (EXPORTABLE_FORMATS) where the GGUF lane declares a dict
+    (GGUF_BLOCK_BYTES). Both are just iterables of format names, and both
+    get canonicalized, so neither container shape is privileged."""
+    as_set = ExportLaneSpec(
+        id="unit_set_lane",
+        codec_formats_from=("prismaquant.serving_profiles:_UNIT_SET_DECL",),
+    )
+    as_dict = ExportLaneSpec(
+        id="unit_dict_lane",
+        codec_formats_from=("prismaquant.serving_profiles:_UNIT_DICT_DECL",),
+    )
+    import prismaquant.serving_profiles as sp
+
+    sp._UNIT_SET_DECL = frozenset({"NVFP4", "MXFP8"})
+    sp._UNIT_DICT_DECL = {"NVFP4": object(), "MXFP8": object()}
+    try:
+        # `MXFP8` canonicalizes to `MXFP8_E4M3` from either container.
+        expected = frozenset({"NVFP4", "MXFP8_E4M3"})
+        assert as_set.emittable_formats() == expected
+        assert as_dict.emittable_formats() == expected
+    finally:
+        del sp._UNIT_SET_DECL
+        del sp._UNIT_DICT_DECL
+
+
+def test_vllm_lane_needs_no_passthrough_entry_of_its_own():
+    """Issue #27: the exporter's declaration already includes its container
+    passthroughs, so the spec must not restate them -- one source of truth.
+    BF16 staying in the menu is the check that removing the entry did not
+    narrow anything."""
+    import prismaquant.export_native_compressed as enc
+
+    lane = load_serving_profile(VLLM_PROFILE).export_lane
+    assert lane.passthrough_formats == ()
+    assert lane.codec_formats_from == (
+        "prismaquant.export_native_compressed:EXPORTABLE_FORMATS",
+    )
+    assert "BF16" in lane.emittable_formats()
+    assert "BF16" in enc.EXPORTABLE_FORMATS
+    assert check_serving_format(VLLM_PROFILE, DENSE_QNAME, "BF16").legal
+
+    # The GGUF lane's exporter declares a bare ggml-type table, so it still
+    # needs its own passthrough entry; the field is not dead.
+    assert load_serving_profile("gguf").export_lane.passthrough_formats == (
+        "BF16",
+    )

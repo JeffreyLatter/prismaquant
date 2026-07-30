@@ -924,7 +924,20 @@ class ModelProfile(ABC):
     def new_forward_pass_state(self) -> dict:
         """Mutable kwargs created ONCE per sequential forward pass and
         threaded into every layer call (so later layers see earlier layers'
-        contributions). Default: none."""
+        contributions). Default: none.
+
+        Two contracts an override must keep, because the streaming loops
+        rely on them (`_call_layer(..., pass_state=...)`):
+
+        - Return a FRESH container on every call. The loops call this once
+          per pass; a memoised or class-level dict would leak one
+          calibration batch's state into the next pass.
+        - The mutable containers are the VALUES (e.g. `{"shared_kv_states":
+          {}}`), so `_call_layer`'s shallow kwargs merge keeps them shared
+          by reference across the layers of one pass.
+
+        Default `{}` means no kwarg is added to the layer call at all, so
+        every architecture that doesn't override this is unaffected."""
         return {}
 
     def capture_forward_pass_state(self, pass_state: dict):

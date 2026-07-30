@@ -1677,9 +1677,35 @@ def _layer_attention_type(layer: nn.Module):
     )
 
 
+def merge_pass_state_kwargs(extra: dict, pass_state: dict | None, *,
+                            context: str) -> dict:
+    """Merge per-pass SHARED layer kwargs into per-layer `extra` kwargs.
+
+    The one place the merge rule lives, for every manual layer loop:
+
+    - shallow, so the mutable containers inside `pass_state` (Gemma4's
+      `shared_kv_states` dict) stay shared BY REFERENCE across the layers of
+      one pass — layer N's writes must be visible to layer N+1;
+    - an empty/None `pass_state` adds no kwarg at all, so architectures that
+      declare no shared state produce byte-for-byte the same layer call;
+    - a key present in both is a profile bug (a per-layer kwarg silently
+      overriding per-pass state, or vice versa) — raise, don't pick a winner.
+    """
+    if not pass_state:
+        return extra
+    collide = sorted(set(pass_state) & set(extra))
+    if collide:
+        raise RuntimeError(
+            "per-pass shared kwargs collide with per-layer "
+            f"extra_layer_kwargs on {collide} for {context}"
+        )
+    return {**extra, **pass_state}
+
+
 def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
                 position_embeddings, attention_mask, position_ids,
-                past_key_values=None, **extra) -> torch.Tensor:
+                past_key_values=None, pass_state: dict | None = None,
+                **extra) -> torch.Tensor:
     """Call a decoder layer with the common transformers v5 signature.
     Returns hidden output tensor.
 
@@ -1687,6 +1713,24 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     profile's `extra_layer_kwargs(...)` (e.g. DSv4-Flash hash-routing
     layers consume `input_ids` for the `tid2eid` lookup). Layers that
     don't consume those kwargs ignore them via `**kwargs` absorption.
+
+    `pass_state` carries the profile's PER-FORWARD-PASS shared kwargs
+    (`ModelProfile.new_forward_pass_state()`), e.g. Gemma4's
+    `shared_kv_states` dict: the model's own forward creates it once per
+    pass and threads the SAME object through every layer, so the layer
+    that stores K/V is visible to the layers that borrow it. Semantics
+    the caller must honour (differs from `extra_layer_kwargs`, which is
+    re-evaluated per layer):
+
+    - construct it ONCE at the outermost scope of a pass over the layer
+      stack, and
+    - never reuse it across passes — a fresh dict per pass, or one
+      calibration batch's K/V contaminates the next.
+
+    The merge itself is `merge_pass_state_kwargs` (shallow, no-op for an
+    empty state, raises on a key collision with `extra`) — shared with the
+    loops that resolve their profile kwargs through a local helper, so the
+    rule has exactly one definition.
 
     When `position_embeddings` is a `{layer_type: (cos, sin)}` dict (produced
     by `_compute_position_embeddings` for multi-layer-type-rope models like
@@ -1697,6 +1741,8 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     layer type. This mirrors Gemma3/Gemma4 HF forwards, where sliding-window
     and full-attention layers receive different masks.
     """
+    extra = merge_pass_state_kwargs(extra, pass_state,
+                                    context=layer.__class__.__name__)
     lt = None
     pe = position_embeddings
     if isinstance(pe, dict):

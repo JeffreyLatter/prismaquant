@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.3.0 — 2026-07-30
+
+Closes the three open issues that were ours (#27, #19, #9 item 1). Minor rather
+than patch because an export that previously "succeeded" can now raise, and
+because a vendored-modelling override that cannot take effect now stops the run
+instead of silently continuing on the wrong code.
+
+### Export refuses what it cannot emit (#27)
+
+`export_native_compressed` now declares `EXPORTABLE_FORMATS`, derived from
+`FORMAT_SCHEME` plus the container passthrough rather than hand-listed, and the
+vLLM serving lane reads its menu from that one place. A format with no
+compressed-tensors emit path is a **hard error** naming the Linear, the format
+and the resolved profile — it used to be silently rewritten to BF16 with only a
+`print`, so a Linear allocated at ~4.25 bpp would ship at 16, blowing the byte
+budget and leaving the artifact's real bpp disagreeing with its own
+`layer_config.json`.
+
+The *legitimate* coercion is unchanged: a format the exporter can emit but which
+is shape-illegal or profile-denied still falls back to BF16 and is still audited
+into `mixed_native_manifest.json`. Two facts corrected by reading the exporter:
+`FP8_SOURCE` **is** emittable (verbatim-copy path, no packer branch) and
+`FP8_E5M2` is **not** (packer branch, no scheme entry) — so the set cannot be
+derived from the packer branches. Menu unchanged for every lane.
+
+Consequence worth knowing: allocating under the `research` profile and then
+exporting compressed-tensors now fails loudly instead of shipping ~16 bpp.
+
+### Vendored modelling overrides verify or die (#19)
+
+`register_qwen3()` returned cleanly, set its "registered" flag, and on
+transformers ≥ 5.13.0 did nothing — after which a probe ran **upstream** Qwen3
+modelling code, on the architecture family behind most shipped artifacts, with
+no exception anywhere. Root cause is upstream: `_LazyAutoMapping.register`
+returns early whenever the config key's `__module__` starts with
+`transformers.`, so no override of a natively-supported `model_type` can land
+through that call.
+
+- The override now genuinely applies, via public API only: a PrismaQuant-owned
+  subclass of the native config (same `__name__`, non-`transformers.`
+  `__module__`, picklable) registered through `AutoConfig.register`, which
+  applies no such filter. No transformers internals are patched, and the
+  fallback engages only when the direct route is verified dead.
+- Every registration is **verified** by resolving it config-only, and a failure
+  raises with the transformers version, the resolved class, the upstream
+  file/function and the remedy. The "registered" flag is set only after
+  verification, so a failure stays retryable rather than caching as done.
+- `register_deepseek_v4` had a second silent no-op of its own and was resolving
+  correctly only by module-path hijack; it now gets the same verification plus a
+  guard against a foreign module occupying its path.
+- `detect_profile` no longer loses that verdict: it consults the recorded
+  override failures and refuses to hand back a profile whose vendored path is
+  known dead. The surrounding `except Exception: pass` is correct for keeping
+  detection alive, but it cannot be allowed to re-hide a silent no-op.
+- The version boundary is now measured, not guessed: healthy through 5.12.1,
+  broken from 5.13.0. The old `xfail` threshold of 5.7 was six minor versions
+  pessimistic, and the `xfail` is gone — the suite goes red on the wrong
+  modelling path.
+
+### Gemma4 KV-sharing pass state (#9, item 1)
+
+The per-forward-pass state hook had already landed; what was missing is that
+`_save_precompute_cache` never persisted it and the load path omitted the field
+entirely. Since the precompute cache is the normal path for a sharded or
+resumed probe, the first checkpoint with `num_kv_shared_layers > 0` would
+capture the shared K/V in phase 1, silently drop it on save, and `KeyError`
+inside attention for every sharing layer in phase 3 — after hours of phase-1
+work, untested in either direction. Fixed both ways, an old cache now hits a
+loud error rather than a `KeyError` deep in attention, and a sharing layer with
+no captured source K/V raises naming the layer and the remedy instead of
+handing back an empty dict. The merge of pass state into per-layer kwargs is now
+one shallow-by-design function that raises on key collision instead of silently
+overriding.
+
+Item 2 of that issue is unchanged and still needs a GPU run. Two caveats worth
+carrying: `google/gemma-4-31b-it` has `num_kv_shared_layers = 0`, so the sharing
+path is covered only synthetically until a genuinely KV-sharing checkpoint is
+probed; and KV-sharing probes remain default-off because phase-3's isolated
+forward detaches the borrowed K/V, under-counting the storing layers'
+`k_proj`/`v_proj` Fisher — a cost-model gap, not a flag.
+
+### Also
+
+`F8_E8M0` reporting, the verified DSv4 source layout, and the routed-only
+expert-declaration scope all shipped in 0.2.1 and are unchanged here.
+
 ## 0.2.1 — 2026-07-30
 
 Corrects one thing that shipped in 0.2.0 on an unverified assumption, settled by

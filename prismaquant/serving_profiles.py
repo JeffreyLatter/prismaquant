@@ -247,21 +247,25 @@ class ExportLaneSpec:
 
     ``codec_formats_from`` is a tuple of ``module:ATTR`` paths whose
     attribute is an *iterable of format names the exporter itself
-    declares it can emit* (a dict's keys count).  Nothing is duplicated
-    here: the vLLM lane points at
-    ``export_native_compressed.FORMAT_SCHEME`` (the compressed-tensors
-    scheme table — CLAUDE.md gate #9's "correctly represented in
-    compressed-tensors metadata"), and the GGUF lane points at
+    declares it can emit* (a dict's keys or a set both count).  Nothing is
+    duplicated here: the vLLM lane points at
+    ``export_native_compressed.EXPORTABLE_FORMATS`` (that exporter's own
+    declaration — its ``FORMAT_SCHEME`` metadata table, CLAUDE.md gate
+    #9's "correctly represented in compressed-tensors metadata", already
+    unioned with its container passthroughs), and the GGUF lane points at
     ``gguf_formats.GGUF_BLOCK_BYTES`` (the ggml type table
     ``export_gguf``/``export_gguf_direct`` gate on directly).
 
-    ``passthrough_formats`` are the formats a container emits *without* a
-    codec entry, so they cannot appear in a codec table by construction:
-    BF16 is written as plain container floats (safetensors bf16 /
-    GGUF F16-F32) and goes on the checkpoint's ``ignore`` list rather
-    than into ``config_groups``.  Per-lane, because passthrough is a
-    container fact: FP8_SOURCE is a verbatim-copy passthrough on the
-    compressed-tensors lane but has no ggml type at all.
+    ``passthrough_formats`` covers formats a container emits *without* a
+    codec entry, for lanes whose declaration is a bare codec table that
+    cannot contain them: BF16 is written as plain container floats
+    (safetensors bf16 / GGUF F16-F32) and goes on the checkpoint's
+    ``ignore`` list rather than into ``config_groups``.  It stays per-lane
+    because passthrough is a container fact — FP8_SOURCE is a
+    verbatim-copy passthrough on the compressed-tensors lane but has no
+    ggml type at all — and it is empty for a lane like
+    ``compressed_tensors`` whose exporter folds its own passthroughs into
+    the constant it declares.
     """
 
     id: str

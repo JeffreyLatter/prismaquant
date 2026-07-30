@@ -1256,12 +1256,26 @@ def _streaming_visual_layer_kwargs(
     captured_pass_state=None,
     layer=None,
 ) -> dict:
+    """Resolve the profile kwargs for one layer call in the streaming visual
+    probe: per-layer `extra_layer_kwargs` plus the per-pass SHARED state —
+    either the live dict threaded through the forward pass (`pass_state`, one
+    object for the whole pass) or, for the isolated reverse-sweep forwards,
+    the slice rebuilt from what that pass captured (`captured_pass_state`).
+
+    Merging goes through `merge_pass_state_kwargs` so the shallow-merge /
+    no-op-when-empty / raise-on-collision rule has one definition shared with
+    `_call_layer`."""
+    from .layer_streaming import merge_pass_state_kwargs
+
+    ctx = type(layer).__name__ if layer is not None else "streaming layer"
     kwargs = dict(profile.extra_layer_kwargs(input_ids=input_ids))
-    if pass_state is not None:
-        kwargs.update(pass_state)
+    kwargs = merge_pass_state_kwargs(kwargs, pass_state, context=ctx)
     if captured_pass_state is not None and layer is not None:
-        kwargs.update(profile.isolated_layer_pass_state(
-            captured_pass_state, layer))
+        kwargs = merge_pass_state_kwargs(
+            kwargs,
+            profile.isolated_layer_pass_state(captured_pass_state, layer),
+            context=ctx,
+        )
     return kwargs
 
 

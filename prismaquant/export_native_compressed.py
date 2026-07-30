@@ -1216,7 +1216,18 @@ def _coerce_runtime_legal_assignment(
     """Adjust assignments that the target runtime cannot execute.
 
     Shape and format legality comes from serving-profile config. BF16 is the
-    conservative runtime fallback when an assigned format is not executable.
+    conservative runtime fallback when a format this exporter CAN emit turns
+    out to be illegal on this Linear's shape or denied by the resolved
+    serving profile.
+
+    A format the exporter cannot emit at all (not in `EXPORTABLE_FORMATS`)
+    is NOT coerced — it raises. Rewriting it to BF16 would ship that Linear
+    at 16 bpp, blowing the byte budget the allocation was selected under and
+    producing an artifact whose real bpp disagrees with its own
+    `layer_config.json`. The serving profile's export lane already bounds
+    the allocator's menu by this exporter's declaration, so reaching here
+    means that bound regressed; masking it with a rewrite is the
+    post-allocator band-aid CLAUDE.md §4.1 vetoes.
     """
     out = dict(assignment)
     coerced: list[tuple[str, list[int], str]] = []
@@ -1226,7 +1237,7 @@ def _coerce_runtime_legal_assignment(
         out[qname] = fmt_canonical
         if fmt_canonical == "BF16":
             continue
-        if fmt_canonical not in FORMAT_SCHEME:
+        if fmt_canonical not in EXPORTABLE_FORMATS:
             from prismaquant.gguf_formats import GGUF_BLOCK_BYTES
 
             if fmt_canonical in GGUF_BLOCK_BYTES:
@@ -1240,10 +1251,23 @@ def _coerce_runtime_legal_assignment(
                     f"container (prismaquant.export_gguf / "
                     f"EXPORT_CONTAINER=gguf), not compressed-tensors"
                 )
-            shape = _source_weight_shape_for_recipe(src_model, qname, profile)
-            out[qname] = "BF16"
-            coerced.append((qname, shape or [], fmt_canonical))
-            continue
+            raise ValueError(
+                f"{qname}: format {fmt_canonical} has no compressed-tensors "
+                f"emit path -- it is absent from FORMAT_SCHEME, so there is "
+                f"no `config_groups` scheme for vLLM to dispatch on "
+                f"(emittable={sorted(EXPORTABLE_FORMATS)}). Rewriting it to "
+                f"BF16 here would ship this Linear at 16 bpp and silently "
+                f"blow the byte budget the allocation was selected under, "
+                f"leaving the artifact's real bpp disagreeing with its own "
+                f"layer_config.json. The serving profile that admitted it "
+                f"(target_profile={target_profile!r}) is supposed to bound "
+                f"its menu by this exporter's EXPORTABLE_FORMATS via its "
+                f"export lane, so this is a regression in that bound (or an "
+                f"allocation solved under a different profile than "
+                f"PRISMAQUANT_TARGET_PROFILE resolves to here) -- re-solve "
+                f"the allocation under the serving profile you are exporting "
+                f"for rather than letting export rewrite it."
+            )
         shape = _source_weight_shape_for_recipe(src_model, qname, profile)
         if shape is None or len(shape) != 2:
             continue
@@ -6774,6 +6798,34 @@ FORMAT_SCHEME = {
     "FP8_E4M3": FP8_E4M3_SCHEME,
     "FP8_SOURCE": FP8_SOURCE_SCHEME,
 }
+
+# Formats this container emits *without* a `config_groups` scheme, so they
+# cannot appear in `FORMAT_SCHEME` by construction. BF16 is written as a
+# plain safetensors bf16 tensor and named on the checkpoint's `ignore`
+# list. (FP8_SOURCE is *also* a verbatim-copy passthrough — no
+# `_quantize_2d` pass runs for it — but it still describes itself to vLLM
+# through `FP8_SOURCE_SCHEME`, so `FORMAT_SCHEME` already covers it.)
+CONTAINER_PASSTHROUGH_FORMATS = frozenset({"BF16"})
+
+# The authoritative set of formats THIS exporter can emit: everything it
+# can describe in `config_groups` metadata plus the container
+# passthroughs. Derived, never hand-listed, so a new scheme becomes
+# exportable in the same commit that adds it.
+#
+# It is deliberately NOT derived from the `_quantize_2d` byte-packer
+# branches, which do not agree with what is shippable: `FP8_E5M2` has a
+# packer branch but no scheme (it raises "research-only", and bytes with
+# no metadata are bytes vLLM cannot dispatch — CLAUDE.md gate #9), while
+# `FP8_SOURCE` has a scheme and no packer branch at all.
+#
+# `serving_profile_specs/vllm_packed_moe.json` reads this constant as its
+# export-lane bound, which is what keeps the allocator's menu from ever
+# containing a rung export would have to rewrite (issue #22 part 2).
+# `_coerce_runtime_legal_assignment` hard-fails on anything outside it.
+EXPORTABLE_FORMATS = frozenset(
+    {_canonical_export_format(name) for name in FORMAT_SCHEME}
+    | CONTAINER_PASSTHROUGH_FORMATS
+)
 
 
 def _fused_modules_mapping_for_profile(profile) -> dict[str, tuple[str, ...]]:
