@@ -104,8 +104,15 @@ Under Tradeoff; an earlier internal name for the L3-polish piece was
 ### The cost cascade (cheap→faithful, each level gates the next)
 - **L1 — additive Fisher.** `predicted_dloss = ½·H_trace·MSE` per `(Linear,
   format)`, from the diagonal-Fisher 2nd-order loss expansion. `H_trace` is the
-  empirical Fisher diagonal trace (one calibration backward pass; MoE experts
-  divided by routing probability). Solve the multi-choice knapsack DP. Seconds.
+  empirical Fisher diagonal trace (one calibration backward pass; **every row —
+  dense or MoE expert — is normalized by the same global calib token count**,
+  since tokens never routed to an expert contribute zero gradient to the
+  mean-Δloss objective). Superseded conventions, both reversed on purpose: an
+  explicit ÷route_prob (removed in audit M4) and the per-routed-token division
+  that M4 kept as "the implicit ÷token-fraction" (removed in PR #14 — it
+  inflated rarely-routed unpacked-expert rows by global/routed, i.e. inverted
+  importance weighting; see `finalize_fisher_stats`). Solve the multi-choice
+  knapsack DP. Seconds.
 - **L2 — perturbed-X fixed point.** Re-measure each Linear's *output* MSE under
   the activation distribution induced by the current assignment (upstream quant
   noise shifts downstream inputs), re-solve, iterate to weighted-Hamming

@@ -24,6 +24,9 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+from .autoscale import declared_expert_dtype_covers, declared_fp4_expert_dtype
+
 try:
     from accelerate.utils.modeling import set_module_tensor_to_device
 except ModuleNotFoundError:
@@ -178,11 +181,21 @@ class Fp8ScaleInvMap(dict):
     so every existing caller is unchanged; the block size travels with
     the map so the dequant call sites never have to re-derive it — or
     worse, assume 128x128 for a checkpoint quantized at a different
-    granularity.  ``block`` is None only for empty maps."""
+    granularity.  ``block`` is None only for empty maps.
 
-    def __init__(self, data=None, block: tuple[int, int] | None = None):
+    ``mxfp4_names`` is the set of mapped weights the checkpoint config
+    *explicitly declares* as packed-FP4 experts — routed and shared alike
+    (DSv4-Flash `expert_dtype: "fp4"`, see `declared_fp4_expert_dtype` and
+    `declared_expert_dtype_covers`). Those decode on the MXFP4 nibble path
+    (step 3b of `_apply_fp8_dequant_inplace`) instead of the block-FP8
+    broadcast. Empty unless declared — never inferred from tensor
+    shapes."""
+
+    def __init__(self, data=None, block: tuple[int, int] | None = None,
+                 mxfp4_names: frozenset[str] = frozenset()):
         super().__init__(data or {})
         self.block = block
+        self.mxfp4_names = mxfp4_names
 
 
 def _declared_weight_block_size(model_path: str) -> tuple[int, int]:
@@ -282,6 +295,7 @@ def _build_fp8_scale_inv_map(model_path: str, *,
         return Fp8ScaleInvMap(
             explicit,
             _declared_weight_block_size(model_path) if explicit else None,
+            mxfp4_names=_declared_mxfp4_names(model_path, explicit),
         )
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
@@ -313,7 +327,73 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     return Fp8ScaleInvMap(
         out,
         _declared_weight_block_size(model_path) if out else None,
+        mxfp4_names=_declared_mxfp4_names(model_path, out),
     )
+
+
+def _declared_mxfp4_names(model_path: str, mapping: dict) -> frozenset[str]:
+    """Mapped weight names the checkpoint explicitly declares MXFP4.
+
+    Non-empty only when config.json declares packed-FP4 experts
+    (`declared_fp4_expert_dtype`); membership is every expert weight that
+    declaration covers — routed (`...experts.<id>....`) *and* shared
+    (`...shared_experts....`), see `declared_expert_dtype_covers`. Shared
+    experts carry no per-expert index, so the routed-only pattern used to
+    exclude them structurally and a declared-MXFP4 shared expert took the
+    block-FP8 path and died on its `_check_fp8_scale_grid` assertion
+    (issue #26).
+
+    The trigger is still only the declaration; the packed layout is
+    asserted per tensor by `_check_mxfp4_packed_grid` at decode time, so a
+    checkpoint whose shared experts are NOT packed-FP4 fails loudly with
+    the exact mismatch rather than being silently reinterpreted.
+    Non-expert tensors stay on the block-FP8 dequant path."""
+    if not mapping or not declared_fp4_expert_dtype(model_path):
+        return frozenset()
+    _check_declared_mxfp4_scale_fmt(model_path)
+    return frozenset(n for n in mapping if declared_expert_dtype_covers(n))
+
+
+# Checkpoint `quantization_config.scale_fmt` spellings that mean an E8M0
+# power-of-two exponent plane — the only scale encoding step 3b decodes.
+_E8M0_SCALE_FMTS = frozenset({"ue8m0", "e8m0"})
+
+
+def _check_declared_mxfp4_scale_fmt(model_path: str) -> None:
+    """Validate a declared-MXFP4 checkpoint's declared scale format.
+
+    Step 3b reads the scale sibling as a raw E8M0 exponent plane
+    (`exp2(byte - 127)`), so a checkpoint that declares a *different*
+    scale encoding must fail loudly instead of having its bytes silently
+    reinterpreted.
+
+    A missing declaration is deliberately NOT fatal: real DSv4-Flash
+    checkpoints ship `expert_dtype` with no per-expert scale-format field,
+    and the per-tensor dtype allow-list in `_check_mxfp4_packed_grid`
+    still guards the byte-plane reinterpretation."""
+    try:
+        with open(os.path.join(model_path, "config.json")) as f:
+            cfg = json.load(f)
+    except Exception:
+        return
+    if not isinstance(cfg, dict):
+        return
+    qc = cfg.get("quantization_config") or {}
+    fmt = qc.get("scale_fmt") or (
+        (cfg.get("text_config") or {}).get("quantization_config") or {}
+    ).get("scale_fmt")
+    if not fmt:
+        return
+    normalized = str(fmt).lower().replace("_", "").replace("-", "")
+    if normalized not in _E8M0_SCALE_FMTS:
+        raise ValueError(
+            f"checkpoint at {model_path!r} declares packed-FP4 routed "
+            f"experts (config expert_dtype) with "
+            f"quantization_config.scale_fmt={fmt!r}; the MXFP4 decode reads "
+            f"the scale sibling as an E8M0 exponent plane "
+            f"(exp2(byte - 127)) and would silently reinterpret any other "
+            f"encoding. Supported: {sorted(_E8M0_SCALE_FMTS)}."
+        )
 
 
 def _check_fp8_scale_grid(
@@ -339,6 +419,57 @@ def _check_fp8_scale_grid(
             f"numel-compatible and would reshape silently, mis-scaling "
             f"every block — check the checkpoint's scale layout and its "
             f"declared quantization_config.weight_block_size."
+        )
+
+
+# 1-byte scale planes step 3b may reinterpret as E8M0 exponents
+# (`view(torch.uint8)` + `exp2(byte - 127)`). An allow-list, not a width
+# check: float8_e4m3fn is also 1 byte, so a width check would let an e4m3
+# scale plane through and silently decode every block at a wrong
+# power-of-two scale.
+_E8M0_SCALE_DTYPES = frozenset(
+    dt for dt in (
+        torch.uint8, torch.int8, getattr(torch, "float8_e8m0fnu", None),
+    ) if dt is not None
+)
+_E8M0_SCALE_DTYPE_NAMES = "/".join(
+    sorted(str(dt).split(".")[-1] for dt in _E8M0_SCALE_DTYPES))
+
+
+def _check_mxfp4_packed_grid(
+    name: str,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    """Hard shape/dtype assertion for a *declared* MXFP4 packed tensor.
+
+    The checkpoint config declared this tensor packed-FP4 (see
+    `_declared_mxfp4_names`), so it must be a 2-D int8/uint8 nibble-pack
+    with an E8M0 scale *plane* (`_E8M0_SCALE_DTYPES`) of one scale per 32
+    logical (= 16 packed) elements per row. Anything else means the
+    declaration and the tensor disagree — decode nothing, raise loudly
+    (the shape-heuristic alternative would silently decode mismatched
+    tensors as garbage nibbles, and a same-width non-E8M0 scale dtype
+    would silently decode at wrong power-of-two scales)."""
+    ok = (
+        weight.dim() == 2
+        and weight.dtype in (torch.int8, torch.uint8)
+        and scale.dim() == 2
+        and scale.dtype in _E8M0_SCALE_DTYPES
+        and scale.shape[0] == weight.shape[0]
+        and scale.shape[1] * 16 == weight.shape[1]
+    )
+    if not ok:
+        raise ValueError(
+            f"tensor {name!r} is declared MXFP4 (config expert_dtype) but "
+            f"does not match the packed layout: weight "
+            f"{tuple(weight.shape)} dtype={weight.dtype}, scale grid "
+            f"{tuple(scale.shape)} dtype={scale.dtype}; expected 2-D "
+            f"int8/uint8 nibble-pack with an E8M0 scale plane "
+            f"({_E8M0_SCALE_DTYPE_NAMES}) of shape "
+            f"(rows, packed_cols/16) = (rows, logical_cols/32). Check the "
+            f"checkpoint's expert tensors against its expert_dtype "
+            f"declaration."
         )
 
 
@@ -449,6 +580,17 @@ def _require_fp8_scale(
     )
 
 
+# Tensors per batched MXFP4 decode launch (step 3b below). The decode's
+# live set peaks at ~13 B per packed byte of the chunk (1 packed + 4 int32
+# gather index + 8 fp32 element plane, then 1 + 8 + 4 for the bf16
+# downcast), which this bounds while still collapsing DSv4's ~768
+# per-layer expert tensors into ~24 launches. NOTE: that peak is *not*
+# visible to `LayerCache.prepare_for_load`, which reserves only the
+# resident layer size — raise this only with the load-time high water in
+# mind.
+_MXFP4_DECODE_CHUNK = 32
+
+
 def _apply_fp8_dequant_inplace(
     out: dict[str, torch.Tensor],
     fp8_scale_inv_map: dict[str, tuple[str, str]],
@@ -457,7 +599,13 @@ def _apply_fp8_dequant_inplace(
     """For each tensor in `out` whose key matches a `fp8_scale_inv_map`
     entry, read the scale_inv, apply the checkpoint-declared block
     dequant (`fp8_scale_inv_map.block`, see `_fp8_dequant_block`), and
-    replace the loaded tensor with the dequanted bf16 weight.
+    replace the loaded tensor with the dequanted bf16 weight. MXFP4
+    tensors (OCP MX FP4 E2M1 nibble pairs with per-32-element E8M0
+    scales, e.g. DSv4-Flash's routed and shared experts) are the map's
+    declared ``mxfp4_names`` — populated only from the checkpoint config's
+    explicit `expert_dtype` declaration, never inferred from shapes —
+    and dequant on a dedicated path (step 3b) instead of the block-FP8
+    broadcast, after a hard packed-grid assertion.
 
     Tensors and scales are both grouped by shape and multiplied in a
     single batched 5-D broadcast op per shape-group. On MiniMax-M2.7
@@ -495,8 +643,22 @@ def _apply_fp8_dequant_inplace(
     block_r, block_c = _fp8_dequant_block(fp8_scale_inv_map)
     by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
     fallback: list[str] = []
+    mxfp4_names: list[str] = []
+    declared_mxfp4 = getattr(fp8_scale_inv_map, "mxfp4_names", frozenset())
     for name in loaded_scales:
         w = out[name]
+        # MXFP4 experts (DSv4-Flash routed + shared): E2M1 nibble pairs
+        # packed into int8 (low nibble = even element) with per-row E8M0
+        # scales over 32 logical elements. Membership is the checkpoint's
+        # explicit declaration (config `expert_dtype`, carried on the
+        # map as `mxfp4_names`), NOT a shape heuristic — an INT8
+        # checkpoint with group-16 scales must never be silently decoded
+        # as nibble pairs. The packed-grid shape is asserted, not used
+        # as the trigger. Handled in step 3b below.
+        if name in declared_mxfp4:
+            _check_mxfp4_packed_grid(name, w, loaded_scales[name])
+            mxfp4_names.append(name)
+            continue
         if w.dim() != 2:
             fallback.append(name)
             continue
@@ -542,6 +704,69 @@ def _apply_fp8_dequant_inplace(
             out[n] = dequanted_stack[i].contiguous()
         dequanted += E
         del w_stack, s_stack, w4, s4, dequanted_stack
+
+    # Step 3b: MXFP4 tensors (DSv4-Flash routed + shared experts).
+    # Shape-grouped, so a shared expert's distinct (rows, packed_in) simply
+    # forms its own group — no per-expert index is needed anywhere here.
+    # Vectorized nibble unpack + per-32-element E8M0 scale, per the OCP
+    # Microscaling Formats (MX) v1.0 spec: FP4 E2M1 element grid
+    # ({0, 0.5, 1, 1.5, 2, 3, 4, 6} with a sign bit), one shared E8M0
+    # power-of-two scale per 32-element group.
+    # Batched like step 3 — same-shape tensors stack
+    # and decode together (DSv4 loads ~768 expert tensors per layer;
+    # per-tensor kernel launches are exactly what this function's batched
+    # design exists to avoid) — but in chunks of _MXFP4_DECODE_CHUNK, since
+    # the byte->pair LUT gather materializes an index plane plus an fp32
+    # element plane (~13 B per packed byte, see below) that would dwarf the
+    # decoded output if the whole expert stack were gathered at once.
+    if mxfp4_names:
+        lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.float32, device=device)
+        # (256, 2) byte LUT: byte -> (low-nibble, high-nibble) element
+        # pair; low nibble is the even logical element, so flattening the
+        # trailing pair dim lands elements in logical order. Built in fp32
+        # — the scale multiply dtype — so the gather lands straight in it:
+        # every E2M1 code is exact in bf16 *and* fp32, so this is
+        # bit-identical to gathering bf16 then widening, minus one
+        # full-size intermediate.
+        codes = torch.arange(256, device=device)
+        pair_lut = torch.stack([lut[codes & 0x0F], lut[codes >> 4]], dim=-1)
+        mx_by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
+        for name in mxfp4_names:
+            mx_by_shape[tuple(out[name].shape)].append(name)
+        for (rows, packed_in), names in mx_by_shape.items():
+            logical_in = packed_in * 2
+            for i0 in range(0, len(names), _MXFP4_DECODE_CHUNK):
+                chunk = names[i0:i0 + _MXFP4_DECODE_CHUNK]
+                E = len(chunk)
+                wp = torch.stack([out[n] for n in chunk], dim=0).to(
+                    device=device).view(torch.uint8)
+                # int32 gather indices: the index *values* are byte codes
+                # (0..255), so int32 is exact here and halves the index
+                # transient vs long (8 -> 4 B per packed byte).
+                deq = pair_lut[wp.to(torch.int32)].reshape(
+                    E, rows, logical_in // 32, 32)
+                sb = torch.stack(
+                    [loaded_scales[n] for n in chunk], dim=0
+                ).to(device=device).view(torch.uint8)
+                scale = torch.exp2((sb.to(torch.float32) - 127.0))
+                # E8M0 0xFF is NaN per the OCP MX v1.0 spec, not 2^128:
+                # exp2(128) yields +inf, which turned a 0xFF block into a
+                # mix of ±inf (nonzero elements) and NaN (zero elements,
+                # 0*inf) instead of 32 NaNs.
+                scale = torch.where(
+                    sb == 0xFF, torch.full_like(scale, float("nan")), scale)
+                # Scale in place: `deq` is already fp32, so this needs no
+                # widened copy and no separate product buffer (chunk peak
+                # 21 -> 13 B per packed byte).
+                deq.mul_(scale.unsqueeze(-1))
+                deq = deq.to(torch.bfloat16).reshape(E, rows, logical_in)
+                for i, n in enumerate(chunk):
+                    out[n] = deq[i].contiguous()
+                dequanted += E
+                del wp, deq, sb, scale
 
     # Step 4: Fallback path for any shapes we didn't batch.
     for name in fallback:
@@ -1499,9 +1724,35 @@ def _layer_attention_type(layer: nn.Module):
     return None
 
 
+def merge_pass_state_kwargs(extra: dict, pass_state: dict | None, *,
+                            context: str) -> dict:
+    """Merge per-pass SHARED layer kwargs into per-layer `extra` kwargs.
+
+    The one place the merge rule lives, for every manual layer loop:
+
+    - shallow, so the mutable containers inside `pass_state` (Gemma4's
+      `shared_kv_states` dict) stay shared BY REFERENCE across the layers of
+      one pass — layer N's writes must be visible to layer N+1;
+    - an empty/None `pass_state` adds no kwarg at all, so architectures that
+      declare no shared state produce byte-for-byte the same layer call;
+    - a key present in both is a profile bug (a per-layer kwarg silently
+      overriding per-pass state, or vice versa) — raise, don't pick a winner.
+    """
+    if not pass_state:
+        return extra
+    collide = sorted(set(pass_state) & set(extra))
+    if collide:
+        raise RuntimeError(
+            "per-pass shared kwargs collide with per-layer "
+            f"extra_layer_kwargs on {collide} for {context}"
+        )
+    return {**extra, **pass_state}
+
+
 def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
                 position_embeddings, attention_mask, position_ids,
-                past_key_values=None, **extra) -> torch.Tensor:
+                past_key_values=None, pass_state: dict | None = None,
+                **extra) -> torch.Tensor:
     """Call a decoder layer with the common transformers v5 signature.
     Returns hidden output tensor.
 
@@ -1509,6 +1760,24 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     profile's `extra_layer_kwargs(...)` (e.g. DSv4-Flash hash-routing
     layers consume `input_ids` for the `tid2eid` lookup). Layers that
     don't consume those kwargs ignore them via `**kwargs` absorption.
+
+    `pass_state` carries the profile's PER-FORWARD-PASS shared kwargs
+    (`ModelProfile.new_forward_pass_state()`), e.g. Gemma4's
+    `shared_kv_states` dict: the model's own forward creates it once per
+    pass and threads the SAME object through every layer, so the layer
+    that stores K/V is visible to the layers that borrow it. Semantics
+    the caller must honour (differs from `extra_layer_kwargs`, which is
+    re-evaluated per layer):
+
+    - construct it ONCE at the outermost scope of a pass over the layer
+      stack, and
+    - never reuse it across passes — a fresh dict per pass, or one
+      calibration batch's K/V contaminates the next.
+
+    The merge itself is `merge_pass_state_kwargs` (shallow, no-op for an
+    empty state, raises on a key collision with `extra`) — shared with the
+    loops that resolve their profile kwargs through a local helper, so the
+    rule has exactly one definition.
 
     When `position_embeddings` is a `{layer_type: (cos, sin)}` dict (produced
     by `_compute_position_embeddings` for multi-layer-type-rope models like
@@ -1519,13 +1788,21 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     layer type. This mirrors Gemma3/Gemma4 HF forwards, where sliding-window
     and full-attention layers receive different masks.
     """
+    extra = merge_pass_state_kwargs(extra, pass_state,
+                                    context=layer.__class__.__name__)
     lt = None
     pe = position_embeddings
     if isinstance(pe, dict):
         lt = _layer_attention_type(layer)
         pe = pe.get(lt)
         if pe is None:
-            if len(position_embeddings) == 1:
+            if "main" in position_embeddings:
+                # DSv4: rotary.layer_types are rope AXES ("main"/"compress"),
+                # not attention-schedule types — the vendored probe forward
+                # feeds layer_type="main" rope to every decoder layer (the
+                # compress branch is stubbed out in probe mode).
+                pe = position_embeddings["main"]
+            elif len(position_embeddings) == 1:
                 pe = next(iter(position_embeddings.values()))
             else:
                 raise RuntimeError(
@@ -1649,12 +1926,24 @@ def _compute_attention_mask(
             cfg.sliding_window
         )
 
-    return {
+    masks = {
         "full_attention": create_causal_mask(**mask_kwargs),
         "sliding_attention": create_sliding_window_causal_mask(
             **sliding_mask_kwargs
         ),
     }
+    # DSv4-Flash: the compress-ratio ladder yields layer types beyond the
+    # Gemma pair — compressed_sparse_attention (ratio 4) and
+    # heavily_compressed_attention (ratio 128). In probe mode every
+    # compressed variant degrades to sliding-window-only attention (the
+    # vendored layer stubs out the compressor and skips the long-range
+    # branch), and the vendored root feeds one sliding-window mask to all
+    # layers. Alias exactly those two types to the sliding mask; any
+    # other unknown layer type still fails loudly downstream.
+    for lt in ("compressed_sparse_attention", "heavily_compressed_attention"):
+        if lt in layer_types and lt not in masks:
+            masks[lt] = masks["sliding_attention"]
+    return masks
 
 
 def _resolve_base_prefix(root: nn.Module, base: nn.Module) -> str:

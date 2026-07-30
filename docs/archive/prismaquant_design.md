@@ -147,15 +147,19 @@ and (optionally) a per-row/per-output-channel diagonal `h_full`.
 
 For MoE packed experts, the same principle applies — squared
 gradient per weight — but the storage layout is `[E, M, N]` instead
-of `[out, in]`. The implementation in
-`sensitivity_probe._GradNormCapture` (line 413) chunks along the
-expert dimension to bound peak memory and uses the
-`RouterTracker` (line 920+) to **divide each expert's Fisher by its
-observed routing probability**. Without that scaling, sparse experts
-look artificially less sensitive than densely routed ones. With it,
-expert Fisher values are calibrated as "loss change *per actually
-used token*" and become comparable across the expert bank and across
-dense Linears.
+of `[out, in]`. Every accumulator — dense trunk, packed expert, or
+per-expert `nn.Linear` — is normalized by the **same global
+calibration token count** (`finalize_fisher_stats`): tokens never
+routed to an expert contribute zero gradient, so under the mean-Δloss
+objective the empirical Fisher divides by the global count for every
+row, and expert values are directly comparable across the expert bank
+and against dense Linears. Two earlier conventions were deliberately
+reversed: an explicit ÷route_prob via the `RouterTracker` (removed in
+audit M4; `route_prob` is metadata only now), and the per-routed-token
+division M4 retained as the "implicit ÷token-fraction" (removed in
+PR #14 — it is the same 1/p_e scaling, and it *inflated* rarely-routed
+unpacked-expert rows by (global/routed), inverting importance
+weighting in the knapsack).
 
 ### 2.3 Why empirical Fisher and not true Hessian
 

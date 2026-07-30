@@ -7,6 +7,7 @@ from collections.abc import Mapping
 
 from prismaquant import format_registry as fr
 from prismaquant.allocator_candidates import (
+    cost_entry_is_bit_exact,
     cost_entry_predicted_dloss,
     cost_entry_uses_measured_output_mse,
 )
@@ -40,6 +41,15 @@ def apply_propagated_sensitivity_penalty(
     - ``local_mse_ratio``: local output-MSE ratio to the current format.
     - ``current_only``: apply the measured penalty only to the current format.
     - ``bits_interp``: linearly scale by remaining added bits to target.
+
+    Every penalized entry is written into the field the allocator will
+    actually read: rows priced from ``output_mse`` take the penalty there
+    (converted through ½·h_trace), rows priced from ``predicted_dloss`` take
+    it there, and a row whose base cost was the bit-exact zero short-circuit
+    additionally gets an explicit ``cost_source`` + ``output_mse_measured =
+    False`` so the short-circuit cannot discard it. The returned
+    ``total_scaled_member_penalty`` therefore accounts only penalties the DP
+    really charges.
     """
     target_fmt = fr.canonical_format_name(target_format or report.get("target_format", "BF16"))
     extrapolation = str(format_extrapolation)
@@ -134,11 +144,13 @@ def apply_propagated_sensitivity_penalty(
                 penalty = propagated * scale_f * member_share * format_ratio
                 if penalty <= 0.0:
                     continue
-                base_predicted = cost_entry_predicted_dloss(dict(stat), dict(entry))
+                base_predicted = cost_entry_predicted_dloss(
+                    dict(stat), dict(entry), format_name=fmt_c)
                 new_entry = copy.deepcopy(dict(entry))
                 uses_output_mse = cost_entry_uses_measured_output_mse(
                     dict(stat),
                     dict(entry),
+                    format_name=fmt_c,
                 )
                 new_entry[f"{metadata_prefix}_uses_output_mse"] = bool(uses_output_mse)
                 if uses_output_mse:
@@ -149,6 +161,30 @@ def apply_propagated_sensitivity_penalty(
                     base_cost = max(output_mse, 1e-30)
                 else:
                     new_entry["predicted_dloss"] = float(base_predicted + penalty)
+                    if cost_entry_is_bit_exact(dict(entry), fmt_c):
+                        # Bit-exact row (measured weight_mse == 0.0 AND an
+                        # identity activation path): the allocator prices it at
+                        # 0.0 BY CONSTRUCTION and reads neither output_mse nor
+                        # predicted_dloss, so without this stamp the penalty we
+                        # just charged is silently discarded while this
+                        # function's summary still reports it as applied.
+                        #
+                        # Declare predicted_dloss authoritative using the same
+                        # two-part contract the aura / production-render /
+                        # empirical-unit-KL producers use:
+                        #   * an explicit ``cost_source`` — the precedence
+                        #     cost_entry_is_bit_exact / cost_entry_source
+                        #     already give an explicit source, which exempts the
+                        #     row from the bit-exact short-circuit; and
+                        #   * ``output_mse_measured = False`` — required, not
+                        #     belt-and-braces: cost_source alone only defeats
+                        #     the short-circuit, after which the (noise-level,
+                        #     for a passthrough format) measured output_mse
+                        #     would outrank predicted_dloss.
+                        # A bit-exact row carries no cost_source by definition,
+                        # so nothing's provenance is overwritten here.
+                        new_entry["cost_source"] = f"{metadata_prefix}_penalty"
+                        new_entry["output_mse_measured"] = False
                     shifted_cost = new_entry["predicted_dloss"]
                     base_cost = max(base_predicted, 1e-30)
                 new_entry[f"base_predicted_dloss_before_{metadata_prefix}_penalty"] = base_predicted

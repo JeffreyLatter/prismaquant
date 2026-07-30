@@ -97,6 +97,7 @@ from .allocator_solver import (
     _shape_from_stats,
     compute_achieved,
     compute_assignment_predicted_dloss,
+    legal_formats_from_candidates,
     promote_fused,
     promote_moe_pair,
     promote_serving_units,
@@ -105,17 +106,22 @@ from .allocator_solver import (
 from .allocator_candidates import (
     PASSTHROUGH_SOURCE_REQUIREMENTS,
     _FUSED_SIBLING_MARKER,
+    _PACKED_GROUP_MARKER,
     _format_kernel_supports_shape,
     _is_passthrough_format,
     _passthrough_source_ok,
     _scan_source_dtype_manifest,
     aggregate_fused_siblings,
+    aggregate_packed_serving_groups,
     build_candidates,
     expand_fused_sibling_assignment,
+    expand_packed_group_assignment,
+    packed_role_split_profile,
     summarize_applicability_masks,
 )
 from .serving_profiles import (
     check_serving_format,
+    require_per_role_expert_scheme_support,
     resolve_target_profile,
     serving_profile_names,
 )
@@ -1001,6 +1007,42 @@ def incomplete_fused_group_dp_exclusions(
     return sorted(incomplete_members - set(allocation_excluded))
 
 
+def tied_lm_head_dp_exclusions(
+    stats: dict,
+    costs: dict,
+    model_profile,
+    model_path: str | None,
+    allocation_excluded=(),
+) -> list[str]:
+    """Linears to exclude from DP because they are a tied LM head.
+
+    When the checkpoint declares `tie_word_embeddings` and ships no head
+    tensor, `lm_head.weight` IS the input embedding — one storage, one set
+    of source bytes. Quantizing it would quantize every token embedding
+    (which the pipeline prices in the non-quantizable floor and no probe /
+    cost measurement observes), and there is no `lm_head.weight` in the
+    source manifest to move out of that floor. So the tie makes the head
+    structurally passthrough-only, independent of the serving profile's
+    pins: this exclusion deliberately ignores `--allow-pinned lm_head`,
+    which exists to trade an *independent* head's bytes for quality.
+
+    Post-fix probes emit no tied-head row at all (the shard schedule skips
+    it); this also covers probes built before that fix.
+    """
+    if not model_path:
+        return []
+    from .tied_embeddings import lm_head_is_tied_alias
+
+    if not lm_head_is_tied_alias(model_path, profile=model_profile):
+        return []
+    head = model_profile.lm_head_name()
+    excluded = {
+        name for name in (set(stats) | set(costs))
+        if name == head or name.endswith("." + head)
+    }
+    return sorted(excluded - set(allocation_excluded))
+
+
 def validate_final_serving_promotion_noop(
     before: dict[str, str],
     after: dict[str, str],
@@ -1019,6 +1061,106 @@ def validate_final_serving_promotion_noop(
         f"stale. Changed {len(changed)} entries, sample={sample}. Move this "
         "coupling before solve_with_promotion or recompute accounting."
     )
+
+
+def renormalize_probe_fisher(stats: dict, meta: dict, *,
+                             allow_legacy: bool = False) -> int | None:
+    """Recompute h_trace/h_w2_sum/h_trace_per_expert from the stored RAW
+    accumulators with the one correct shared denominator: the global calib
+    token count.
+
+    Older incremental probes finalized `h_trace = h_trace_raw /
+    n_tokens_seen` PER ROW, where per-expert Linears only count their
+    ROUTED tokens — inflating a rarely-routed expert's Fisher by
+    (global/routed), i.e. inverted importance weighting. The typical
+    inflation is ~n_experts/top_k (≈32x on a 256-expert top-8 model);
+    the degenerate 1-routed-token case reaches ~33,000x at a 32k-token
+    calibration. Dense rows saw exactly the global count, so their values
+    are unchanged; probes written by the fixed finalize renormalize to
+    identical values — the recompute is idempotent (see PER-ROW STAMPS).
+
+    PER-ROW STAMPS WIN. A row that already carries ``h_trace_norm_tokens``
+    was written by a fixed finalize (the field was introduced with it) and
+    is already divided by the global count of the pass that PRODUCED it —
+    which is not always this probe's meta count. `incremental_probe` merges
+    the multimodal visual pass (finalized at ``n_samples x max_text_len``,
+    e.g. 8x128) into the body probe, and `merge_probe_pickles` keeps the
+    FIRST shard's meta (the body's, e.g. 32x1024), so recomputing every row
+    from the meta count would rescale the visual rows by ~32x away from
+    what their writer computed — and would not be idempotent. Honouring the
+    row stamp keeps each row on its own writer's denominator and makes the
+    recompute a true no-op for any probe written by the fixed finalize.
+
+    Returns the probe-wide token count (the meta fallback used for
+    unstamped rows), or None when nothing could be renormalized. A row
+    with raw accumulators, no stamp, and no usable meta count is a HARD
+    ERROR (SystemExit) — silently allocating on routed-token-normalized
+    Fisher mis-spends the bit budget; `allow_legacy=True`
+    (--allow-legacy-fisher-norm) downgrades it to a warning and keeps the
+    probe's stored h_trace values.
+    """
+    meta = meta or {}
+    meta_tokens = int(meta.get("fisher_norm_tokens", 0) or 0)
+    if meta_tokens <= 0:
+        meta_tokens = (int(meta.get("nsamples", 0) or 0)
+                       * int(meta.get("seqlen", 0) or 0))
+
+    renormed = 0
+    unresolvable = 0
+    denominators: dict[int, int] = {}
+    for entry in stats.values():
+        if not isinstance(entry, dict) or "h_trace_raw" not in entry:
+            continue
+        # The row's own writer-stamped denominator, else the probe-wide one.
+        row_tokens = int(entry.get("h_trace_norm_tokens", 0) or 0)
+        if row_tokens <= 0:
+            row_tokens = meta_tokens
+        if row_tokens <= 0:
+            unresolvable += 1
+            continue
+        entry["h_trace"] = float(entry["h_trace_raw"]) / row_tokens
+        if "h_w2_sum_raw" in entry:
+            entry["h_w2_sum"] = (
+                float(entry["h_w2_sum_raw"]) / row_tokens)
+        per_raw = entry.get("h_trace_per_expert_raw")
+        if per_raw is not None:
+            entry["h_trace_per_expert"] = [
+                float(v) / row_tokens for v in per_raw]
+        # Keep the probe-side stamp truthful on legacy pickles.
+        entry["h_trace_norm_tokens"] = row_tokens
+        denominators[row_tokens] = denominators.get(row_tokens, 0) + 1
+        renormed += 1
+
+    if unresolvable:
+        msg = (
+            "probe rows carry raw Fisher accumulators but no usable token "
+            "count: neither a per-row h_trace_norm_tokens stamp nor "
+            f"meta.fisher_norm_tokens / nsamples+seqlen ({unresolvable} of "
+            f"{len(stats)} rows). h_trace cannot be renormalized by the "
+            "global calib token count; legacy per-row normalization inflates "
+            "routed-expert rows by (global/routed) — typically "
+            "~n_experts/top_k — and the allocator would mis-spend the bit "
+            "budget on rarely-routed experts. Re-run the probe with current "
+            "code (it stamps meta.fisher_norm_tokens), or pass "
+            "--allow-legacy-fisher-norm to proceed with the stored legacy "
+            "values anyway.")
+        if not allow_legacy:
+            raise SystemExit(f"[alloc] ERROR: {msg}")
+        print(f"[alloc] WARNING (--allow-legacy-fisher-norm): {msg}",
+              flush=True)
+
+    if renormed:
+        mix = ", ".join(f"{n}x{cnt} rows"
+                        for n, cnt in sorted(denominators.items()))
+        print(f"[alloc] Fisher renormalized: {renormed}/{len(stats)} rows "
+              f"→ h_trace_raw / global calib tokens [{mix}] "
+              "(per-expert routed-count normalization corrected)", flush=True)
+        if meta_tokens > 0:
+            return meta_tokens
+        # Meta-less probe carried entirely by row stamps: report the
+        # denominator the most rows share (the body pass').
+        return max(denominators.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    return None
 
 
 def main():
@@ -1045,16 +1187,33 @@ def main():
                          "silently-corrupt artifact. Off by default: "
                          "the allocator hard-errors instead and asks for "
                          "--model-override.")
+    ap.add_argument("--allow-legacy-fisher-norm", action="store_true",
+                    help="Permit allocation from a probe whose rows carry "
+                         "neither a per-row h_trace_norm_tokens stamp nor "
+                         "meta fisher_norm_tokens / nsamples+seqlen, i.e. whose "
+                         "h_trace cannot be renormalized by the global calib "
+                         "token count. Such probes carry the legacy per-row "
+                         "normalization that inflates routed-expert Fisher "
+                         "by (global/routed) — typically ~n_experts/top_k. "
+                         "Off by default: the allocator hard-errors and asks "
+                         "for a re-probe. Use only to reproduce historical "
+                         "allocations.")
     ap.add_argument("--target-bits", type=float, default=4.75)
     ap.add_argument("--target-disk-gb", type=float, default=None,
                     help="Fit-the-card ship selection: instead of --target-bits, "
-                         "pick the highest-bpp allocation whose EXACT exported "
+                         "the card sets the CONSTRAINT and predicted Δloss the "
+                         "OBJECTIVE — among the allocations whose EXACT exported "
                          "on-disk footprint (prismaquant.footprint, validated "
                          "0.00%% vs real index.json total_size) fits this many "
-                         "decimal GB. Bisects the sub-second DP between Pareto "
-                         "grid rungs for an exact fit, overrides --target-bits "
-                         "for the emitted layer_config, and writes selection.json "
-                         "beside --pareto-csv. Needs the source model path (probe "
+                         "decimal GB, ship the one with the LOWEST predicted "
+                         "Δloss (ties -> larger footprint; more bits is not "
+                         "monotonically better, so filling the card is a proxy, "
+                         "not the objective). Bisects the sub-second DP between "
+                         "Pareto grid rungs to search denser fitting "
+                         "allocations, overrides --target-bits for the emitted "
+                         "layer_config, and writes selection.json (objective, "
+                         "search ceiling, full ratchet trace) beside "
+                         "--pareto-csv. Needs the source model path (probe "
                          "meta.model / --model-override) to size the "
                          "non-quantizable floor (lm_head/embed/norms). Unpin "
                          "lm_head (--allow-pinned lm_head) to lower the floor.")
@@ -1119,6 +1278,26 @@ def main():
                          "for hitting the target bit budget exactly on "
                          "dense models; use this flag only for "
                          "back-compat experiments.")
+    ap.add_argument("--no-packed-aggregation", action="store_true",
+                    help="Disable pre-DP aggregation of packed-MoE expert "
+                         "serving groups into whole-group DP units. Falls "
+                         "back to per-row DP pricing with the "
+                         "promote_serving_units post-pass repairing group "
+                         "coherence. Aggregation prices the DP and the "
+                         "serving constraint identically; use this flag "
+                         "only for back-compat experiments.")
+    ap.add_argument("--packed-role-split", action="store_true",
+                    help="Split each packed-MoE expert serving group into "
+                         "TWO DP units per layer: gate+up projections and "
+                         "down projections (default: one per-layer-uniform "
+                         "unit). Hard-errors unless the resolved serving "
+                         "profile declares supports_per_role_expert_schemes "
+                         "(e.g. gguf: GGUF stacks expert tensors per "
+                         "projection, so each role can carry its own type; "
+                         "vLLM packed-MoE loads one scheme per FusedMoE "
+                         "layer). The split threads through the profile "
+                         "view, so serving promotion stays consistent with "
+                         "the DP units.")
     ap.add_argument("--enforce-family-coherence", action="store_true",
                     help="Error (instead of warn) if the format set contains "
                          "multiple candidates for the same bit tier (e.g. "
@@ -1268,6 +1447,14 @@ def main():
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
 
+    # ---- Fisher renormalization ----
+    # One shared denominator (the global calib token count) recomputed
+    # from the stored raw accumulators; hard error on probes that cannot
+    # be renormalized unless --allow-legacy-fisher-norm. See
+    # renormalize_probe_fisher for the full story.
+    renormalize_probe_fisher(stats, probe.get("meta", {}),
+                             allow_legacy=args.allow_legacy_fisher_norm)
+
     allow_pinned = [s.strip() for s in (args.allow_pinned or "").split(",") if s.strip()]
     allocation_excluded = []
     for name in sorted(set(stats) | set(costs)):
@@ -1275,6 +1462,14 @@ def main():
             if any(tok in name for tok in allow_pinned):
                 continue  # opt-in: let the allocator choose this name's format
             allocation_excluded.append(name)
+    tied_head_added = tied_lm_head_dp_exclusions(
+        stats, costs, model_profile, probe_model_path, allocation_excluded)
+    allocation_excluded.extend(tied_head_added)
+    if tied_head_added:
+        print(
+            "[alloc] tied LM head (shares storage with the non-quantizable "
+            f"input embedding) excluded from DP budget: {tied_head_added} "
+            "— not overridable by --allow-pinned", flush=True)
     if allow_pinned:
         print(f"[alloc] --allow-pinned active for {allow_pinned}: these "
               "profile-pinned names enter the DP budget (allocator chooses "
@@ -1357,6 +1552,26 @@ def main():
         specs_sorted,
         allow_default_profile=args.allow_default_profile,
     )
+
+    if args.packed_role_split:
+        # A role split emits different expert formats for gate_up vs down
+        # projections of the SAME MoE layer — only loadable when the
+        # serving lane keys expert schemes per projection. Hard-error
+        # unless the resolved serving profile declares the capability
+        # (SystemExit inside on unsupported/unknown profiles).
+        require_per_role_expert_scheme_support(
+            target_profile, flag="--packed-role-split")
+        # Split packed expert groups into gate_up / down serving units by
+        # wrapping the profile view: DP aggregation AND serving promotion
+        # both key groups through packed_expert_format_group, so wrapping
+        # keeps them consistent (role units atomic, final promotion still a
+        # validated no-op). Must run after the isinstance-based
+        # DefaultProfile gate above.
+        model_profile = packed_role_split_profile(model_profile)
+        print("[alloc] --packed-role-split: packed expert groups keyed as "
+              "(layer, {gate_up|down}) serving units "
+              f"(profile {target_profile!r} declares per-role expert "
+              "schemes)", flush=True)
 
     # --- Format-family coherence check -----------------------------------
     # A sensible format ladder has at most ONE format per bit tier. Having
@@ -1628,12 +1843,46 @@ def main():
     )
     applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Per-Linear legal-format sets for serving-unit promotion, snapshotted
+    # BEFORE aggregation: both promotion call sites below run on the EXPANDED
+    # per-Linear assignment, where an aggregated super-item's candidate list no
+    # longer describes its individual members. Auxiliary MTP/visual names were
+    # already removed from `candidates` and stay absent here on purpose — they
+    # are format-PINNED, not legality-restricted (their candidates were built
+    # from a one-format menu), and promotion treats an absent name as
+    # unconstrained.
+    per_linear_legal_formats = legal_formats_from_candidates(candidates)
+
+    # Pre-aggregate packed-MoE serving groups (e.g. DeepSeek-V4's 768
+    # per-expert Linears per layer) into single multi-choice DP units.
+    # The serving runtime loads each group under ONE format, so the DP
+    # must price the whole-group move — pricing per row while
+    # promote_serving_units charges the group is a ~1000x mismatch:
+    # expert rows top the per-bin ranking, the feasibility tightening
+    # over-corrects, and attention/shared rows starve while headroom goes
+    # unused. With groups as first-class DP units, post-DP MoE promotion
+    # is a validated no-op.
+    if not args.no_packed_aggregation:
+        stats, costs, candidates = aggregate_packed_serving_groups(
+            stats, costs, specs_sorted, candidates, profile=model_profile,
+            calibrated_gains=calibrated_gains)
+        packed_groups = sum(
+            1 for n in candidates if _PACKED_GROUP_MARKER in n)
+        packed_member_rows = sum(
+            len(stats[n].get("_packed_group_members", ()))
+            for n in candidates if _PACKED_GROUP_MARKER in n
+        )
+        print(f"[alloc] packed-serving-group aggregation: {packed_groups} "
+              f"groups ({packed_member_rows} member Linears priced as "
+              "whole-group DP units)")
+
     # Pre-aggregate fused siblings (qkv_proj, gate_up_proj, ...) into
     # single DP items. The DP can't pick mixed-sibling solutions because
     # there's only one item per group — so promote_fused becomes a no-op
     # on aggregated items and the overshoot-tightening loop collapses to
     # a single pass on well-behaved models. Must run AFTER the MoE
-    # aggregation (it skips `.__fused__.` entries explicitly).
+    # aggregation (it skips `.__fused__.` and packed-group entries
+    # explicitly).
     if not args.no_fused_aggregation:
         stats, costs, candidates = aggregate_fused_siblings(
             stats, costs, specs_sorted, candidates, profile=model_profile,
@@ -1707,8 +1956,33 @@ def main():
             return original_entry
         return None
 
+    _solve_cache: dict[float, tuple] = {}
+    # Solver diagnostics per target, kept beside the memo so a cache hit never
+    # loses them: an INFEASIBLE rung's only explanation lives here (the solver
+    # sees the format floor and every over-target iterate, then discards both).
+    _solve_diagnostics: dict[float, dict] = {}
+
     def _solve_for_target(target_bits: float):
-        """Solve the body-budget DP at one target bit budget."""
+        """Solve the body-budget DP at one target bit budget.
+
+        Memoized: the solve is a pure function of the target given fixed
+        stats/candidates, and the byte-budget grid + ratchet bisection
+        re-visit targets the Pareto sweep already solved.
+        """
+        cache_key = round(float(target_bits), 9)
+        cached = _solve_cache.get(cache_key)
+        if cached is None:
+            cached = _solve_for_target_uncached(target_bits)
+            _solve_cache[cache_key] = cached
+        # Hand out a copy of the assignment dict: callers may mutate it
+        # (fused-sibling expansion, fixed-format update) and must never
+        # poison the cached solve.
+        assign, achieved_r, total, mutable_total = cached
+        if assign is not None:
+            assign = dict(assign)
+        return assign, achieved_r, total, mutable_total
+
+    def _solve_for_target_uncached(target_bits: float):
         mutable_target_bits = float(target_bits)
         if mutable_total_params <= 0:
             if fixed_total_params > 0 and mutable_target_bits >= 0.0:
@@ -1716,12 +1990,15 @@ def main():
             return None, float("nan"), float("inf"), float("inf")
         if mutable_target_bits < 0.0:
             return None, float("nan"), float("inf"), float("inf")
+        diag: dict = {}
+        _solve_diagnostics[round(float(target_bits), 9)] = diag
         assign, achieved_r = solve_with_promotion(
             stats, candidates, mutable_target_bits, format_specs, format_rank,
             args.bit_precision,
             no_fused_promote=args.no_fused_promote,
             overshoot_tolerance=args.overshoot_tolerance,
             profile=model_profile,
+            diagnostics=diag,
         )
         if assign is None:
             return None, float("nan"), float("inf"), float("inf")
@@ -1736,24 +2013,38 @@ def main():
     ) -> dict[str, str]:
         """Expand DP super-items into the per-Linear seed-assignment shape.
 
-        The allocator can solve over fused-sibling super-items.
-        The KL probe's seed path wants ordinary module qnames; it already
-        handles legality, pinning, and fused coherence, but giving it expanded
-        names preserves the intended frontier point instead of making the
-        super-item markers look like unknown entries.
+        The allocator can solve over packed-serving-group and fused-sibling
+        super-items. The KL probe's seed path wants ordinary module qnames;
+        it already handles legality, pinning, and fused coherence, but giving
+        it expanded names preserves the intended frontier point instead of
+        making the super-item markers look like unknown entries.
         """
         expanded = dict(assignment)
+        if not args.no_packed_aggregation:
+            expanded = expand_packed_group_assignment(expanded, stats)
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
         if include_auxiliary:
             expanded.update(fixed_format_assignment)
-        return promote_serving_units(expanded, format_rank, profile=model_profile)
+        return promote_serving_units(
+            expanded,
+            format_rank,
+            profile=model_profile,
+            legal_formats=per_linear_legal_formats,
+        )
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
         total = 0.0
         for name, fmt in assignment.items():
             entry = _stats_entry_for_assignment_name(name)
             if not isinstance(entry, dict):
+                continue
+            # Super-items (packed groups, fused siblings) carry exact
+            # per-format byte sums; their stats entries have no single
+            # (out, in) shape, so the shape fallback is only for plain rows.
+            memory_map = entry.get("_memory_bytes_by_format")
+            if isinstance(memory_map, dict) and fmt in memory_map:
+                total += 8.0 * memory_map[fmt]
                 continue
             shape = _shape_from_stats(entry)
             total += 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
@@ -1983,11 +2274,13 @@ def main():
 
     # ----- Byte-budget ("fit the card") ship-bpp selection -----
     # When --target-disk-gb is given, the ship bpp is set by the card, not by
-    # --target-bits: pick the highest-bpp allocation whose EXACT exported
-    # footprint fits the budget (the RD curve is log-linear, so there is no
-    # intrinsic knee to find — see rd_curve diagnostic). This is a selector over
-    # Pareto candidates with an exact, measurement-free byte objective, then a
-    # bisection of the same sub-second DP between grid rungs for an exact fit.
+    # --target-bits: the card supplies the CONSTRAINT (exact exported footprint
+    # <= budget; the RD curve is log-linear, so there is no intrinsic knee to
+    # find — see rd_curve diagnostic) and predicted Δloss supplies the
+    # OBJECTIVE (minimize it among the allocations that fit). This is a
+    # selector over Pareto candidates whose feasibility test needs no
+    # measurement, then a bisection of the same sub-second DP between grid
+    # rungs to search denser fitting allocations.
     if args.target_disk_gb is not None:
         from . import footprint as _fp
         from .saturation_select import select_under_byte_budget
@@ -1996,27 +2289,93 @@ def main():
                 "[alloc] --target-disk-gb needs the source model path (probe "
                 "meta.model or --model-override) to size the non-quantizable "
                 "floor (lm_head/embed/norms).")
+        # What the ratchet optimizes, recorded in selection.json: the shipped
+        # objective must be recoverable from the artifact, not inferred from
+        # the code version that produced it.
+        _RATCHET_OBJECTIVE = "min_predicted_dloss__ties_to_larger_footprint"
         budget_bytes = float(args.target_disk_gb) * _fp.GB
         src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
-        regime = _fp.source_regime(src_by_dtype)  # robust bf16/fp8 (not by mass)
+        regime = _fp.source_regime(src_by_dtype)  # recorded for reporting only
+        # Per-tensor source-byte manifest: each re-encoded Linear is charged
+        # its ACTUAL header byte span (weight + scale siblings), never a
+        # regime-wide per-param rate. On mixed sources (an MXFP4-packed
+        # DSv4-Flash checkpoint: I8 nibble experts + E8M0 scales, F8
+        # attention, BF16 floor) the old regime accounting removed more
+        # bytes than the checkpoint holds, driving the floor negative.
+        # `expert_parent_for_projection` bridges the per-expert-on-disk /
+        # packed-live MoE layouts (…experts.{i}.gate_proj -> the packed
+        # …experts.gate_up_proj the allocator names), same mapping the
+        # layer-streaming pack bridge uses.
+        src_manifest = _fp.source_tensor_bytes_manifest(
+            probe_model_path,
+            name_map=getattr(model_profile, "checkpoint_to_live_name", None),
+            expert_parent_for_projection=getattr(
+                model_profile, "packed_expert_parent_for_projection", None),
+        )
+
+        # Stats view for the footprint accounting: the same three-map
+        # precedence `_stats_entry_for_assignment_name` uses (aggregated DP
+        # stats > fixed MTP/visual > pre-aggregation accounting stats), so
+        # every name in an EXPANDED assignment resolves and the shared
+        # function prices exactly the tensors the inlined copy did.
+        _footprint_stats = {**accounting_stats, **fixed_stats, **stats}
 
         def _artifact_for_target(t: float):
             assign_t, ach_t, tot_t, _mut = _solve_for_target(t)
             if assign_t is None:
                 return None
             expanded_t = _expand_assignment_for_seed_json(assign_t)
-            body_aux = _assignment_bits_total(expanded_t) / 8.0
-            reenc_src = 0
-            for n in expanded_t:
-                e = _stats_entry_for_assignment_name(n)
-                if isinstance(e, dict):
-                    reenc_src += _fp.reencoded_source_bytes_for_shape(
-                        _shape_from_stats(e), regime)
-            floor = float(src_total) - reenc_src
+            ctx = f"byte-budget selector (target_bits={t:.3f})"
+            # ONE accounting path: footprint.assignment_artifact_bytes owns
+            # the manifest -> resolve -> check-non-negative -> floor sequence
+            # (shared with floor_bytes_for_model, whose exact agreement the
+            # footprint tests pin) plus the body-byte sum. Inlining a third
+            # copy here meant the shipped selector was the one path that
+            # agreement was never tested against.
+            #
+            # Both failure modes are hard errors raised BEFORE any selection
+            # number is consumed: a re-encoded name the manifest cannot
+            # resolve (its source bytes stay in the floor while its quantized
+            # bytes are still added — on a packed-MoE model the whole expert
+            # mass, after which every rung reads "below the floor"), and two
+            # names resolving to the same source span (bytes removed twice, so
+            # an over-budget artifact reads as fitting).
+            try:
+                info = _fp.assignment_artifact_bytes(
+                    expanded_t, _footprint_stats,
+                    source_total_bytes=int(src_total),
+                    source_manifest=src_manifest,
+                    regime=regime,
+                    context=ctx,
+                )
+            except ValueError as exc:
+                # House idiom for an operator-facing fatal in main(): a
+                # SystemExit line, not a raw traceback. The footprint
+                # messages already name the offending tensors.
+                raise SystemExit(f"[alloc] ERROR: {exc}") from None
+            # A name with no stats entry is priced at source precision by
+            # assignment_artifact_bytes (left in the floor, no body bytes) —
+            # correct for a verbatim tensor, but for a name the DP actually
+            # allocated it silently under-counts the body. It also breaks the
+            # provable byte-for-byte identity with the inlined accounting this
+            # replaced (which subtracted every expanded name from the floor).
+            # Any such name is an allocator/probe bug, so refuse rather than
+            # ship a number that no longer means what the label says.
+            if info["n_missing_stats"]:
+                sample = ", ".join(info["missing_stats_names"][:10])
+                raise SystemExit(
+                    f"[alloc] ERROR: {info['n_missing_stats']} allocated "
+                    f"Linear(s) have no probe stats entry, so their exported "
+                    f"bytes cannot be priced ({ctx}): {sample}"
+                    + (", …" if info["n_missing_stats"] > 10 else "")
+                    + ". The byte-budget selector would price them at source "
+                    "precision and under-count the artifact. Fix the probe / "
+                    "expansion so every allocated name carries stats.")
             return {
                 "target_bits": float(t), "achieved_bits": float(ach_t),
                 "bpp": float(ach_t), "dloss": float(tot_t),
-                "disk_bytes": floor + body_aux, "floor_bytes": floor,
+                "disk_bytes": float(info["artifact_bytes"]),
+                "floor_bytes": float(info["floor_bytes"]),
             }
 
         grid = []
@@ -2026,18 +2385,31 @@ def main():
             r = _artifact_for_target(float(row["target_bits"]))
             if r is not None:
                 grid.append(r)
+        # select_under_byte_budget is used here as the FEASIBILITY gate
+        # (feasible / below_floor / rejected_next). Its own `chosen` is the
+        # largest-footprint fitting candidate, which is deliberately NOT the
+        # ship pick — see the objective note below; it is recorded as
+        # `max_bytes_pick_*` so the two objectives stay comparable in the
+        # artifact.
         sel = select_under_byte_budget(grid, budget_bytes)
 
         rd = knee_summary.get("rd_curve") if isinstance(knee_summary, dict) else None
         selection = {
-            "schema": "prismaquant.allocator.byte_budget_selection.v1",
+            # v2: the ratchet objective changed from MAX disk bytes to MIN
+            # predicted Δloss among the fitting rungs, so `chosen_*` means
+            # something different than it did in v1. Every v1 key is kept.
+            "schema": "prismaquant.allocator.byte_budget_selection.v2",
             "mode": "byte-budget",
             "target_disk_gb": float(args.target_disk_gb),
             "budget_bytes": budget_bytes,
             "source_total_bytes": float(src_total),
             "source_regime": regime,
+            "source_accounting": "per_tensor_manifest_v2",
+            "footprint_path": "footprint.assignment_artifact_bytes",
             "source_bytes_per_param": int(
                 _fp.dominant_source_bytes_per_param(src_by_dtype)),
+            "feasibility_test": "exact_artifact_bytes <= budget_bytes",
+            "ratchet_objective": _RATCHET_OBJECTIVE,
             "feasible": bool(sel["feasible"]),
             "below_floor": bool(sel["below_floor"]),
             "lm_head_unpinned": bool(allow_pinned),
@@ -2062,36 +2434,119 @@ def main():
                 f"budget, unpin lm_head (--allow-pinned lm_head), or widen the "
                 f"format menu. Selection written to {sel_path}.")
 
-        # Pick the largest-footprint allocation that fits, by RATCHETING the
-        # sub-second DP from the grid pick up to a near-lossless cap (all the
-        # most-expensive format). The ratchet (accept a probe only when it fits
-        # AND is no smaller than the best fit so far, seeded at the grid pick)
-        # guarantees we never ship below the grid pick the selector already
-        # proved feasible — robust to the DP/serving-unit-promotion making
-        # disk(target) non-monotone — and the cap lets it bisect ABOVE the
-        # densest grid rung to actually fill a roomy card (not just snap to the
-        # grid ceiling). chosen always satisfies disk <= budget by construction.
-        search_hi = float(max(int(s.weight_bits) for s in specs_sorted)) + 1.0
+        # Among the allocations whose EXACT footprint fits the card, ship the
+        # one with the LOWEST predicted Δloss — ties broken toward the larger
+        # footprint (spend the budget only when it costs nothing in predicted
+        # quality). "Fill the card" was a proxy for that, valid only while
+        # more bytes implied lower Δloss; it does not (5.5 bpp has beaten 6.0
+        # bpp on served PPL, and serving-unit promotion can flip a group into
+        # a denser-but-worse format), so ratcheting on MAX bytes could
+        # actively select a denser artifact with WORSE predicted Δloss than a
+        # sparser one that also fits. Same objective and same tie-break the
+        # solver's own feasible-iterate ratchet uses (solve_with_promotion).
+        #
+        # Δloss is comparable across rungs: every rung's value is
+        # compute_assignment_predicted_dloss over the SAME DP item set (the
+        # multi-choice knapsack assigns every item exactly one candidate at
+        # every target), in the same ½·h_trace·MSE units, and the fixed
+        # auxiliary (MTP/visual) Δloss excluded from all of them is a
+        # rung-invariant constant, so it cannot reorder them.
+        #
+        # Feasibility is unchanged: exact footprint <= budget, and the ratchet
+        # is seeded at the grid pick the shared selector already proved
+        # feasible, so the shipped artifact is never worse in predicted Δloss
+        # than that proven point.
+        def _fits(cand) -> bool:
+            return cand is not None and cand["disk_bytes"] <= budget_bytes
+
+        def _beats(cand, best) -> bool:
+            """The ratchet objective: min Δloss, ties -> larger footprint."""
+            if best is None:
+                return True
+            if cand["dloss"] != best["dloss"]:
+                return cand["dloss"] < best["dloss"]
+            return cand["disk_bytes"] > best["disk_bytes"]
+
+        best = None
+        emit_target = None
+        ratchet_trace: list[dict] = []
+
+        def _consider(cand, target: float, stage: str) -> bool:
+            """Ratchet ``cand`` in; record the probe. Returns whether it fits."""
+            nonlocal best, emit_target
+            fits = _fits(cand)
+            accepted = bool(fits and _beats(cand, best))
+            ratchet_trace.append({
+                "stage": stage,
+                "target_bits": float(target),
+                "achieved_bits": (
+                    float(cand["achieved_bits"]) if cand is not None else None),
+                "disk_gb": (
+                    cand["disk_bytes"] / _fp.GB if cand is not None else None),
+                "dloss": float(cand["dloss"]) if cand is not None else None,
+                "fits": fits,
+                "accepted": accepted,
+            })
+            if accepted:
+                best, emit_target = cand, float(target)
+            return fits
+
+        fitting = [c for c in grid if _fits(c)]
+        grid_pick = None
+        for cand in fitting:
+            if _beats(cand, grid_pick):
+                grid_pick = cand
+
+        # Near-lossless cap: all of the most expensive format, +1 bit of slack
+        # so the DP can actually reach it.
+        search_hi_cap = float(max(int(s.weight_bits) for s in specs_sorted)) + 1.0
+        # Bound the ratchet by the cheapest grid rung that does NOT fit:
+        # bisecting toward the near-lossless cap on a card that only fits
+        # the low rungs wastes dozens of expensive DP solves at high-bin
+        # targets. HEURISTIC: this assumes disk(target) is only LOCALLY
+        # non-monotone — if a fitting allocation existed above the first
+        # non-fitting rung, the tightened ceiling would forgo it, and the
+        # min-Δloss objective makes that premise weaker, not stronger. The
+        # ratchet never accepts a probe worse than the proven grid pick, so
+        # the downside is bounded at shipping the grid pick, never worse —
+        # but it IS a forgone option, so both the cap and the tightening are
+        # recorded in selection.json rather than left invisible.
+        over_budget = [c for c in grid if c["disk_bytes"] > budget_bytes]
+        tightening_rung = (
+            min(float(c["target_bits"]) for c in over_budget)
+            if over_budget else None)
+        search_hi = (search_hi_cap if tightening_rung is None
+                     else min(search_hi_cap, tightening_rung))
+
+        _consider(grid_pick, float(grid_pick["target_bits"]), "grid_pick")
         top = _artifact_for_target(search_hi)  # densest possible (all-expensive)
-        grid_pick = sel["chosen"]
-        if top is not None and top["disk_bytes"] <= budget_bytes:
-            chosen_info, emit_target, has_slack = top, search_hi, True
+        has_slack = _consider(top, search_hi, "search_hi_cap")
+        bisection_skipped_reason = None
+        if has_slack:
+            # The cap itself fits the card: nothing denser exists to bisect
+            # toward. NB the cap is only *considered*, not forced — if the
+            # grid pick has strictly lower predicted Δloss it still ships.
+            bisection_skipped_reason = "search_hi_fits_budget"
+        elif search_hi <= float(grid_pick["target_bits"]) + 0.005:
+            # The tightened ceiling landed at/below the grid pick's target, so
+            # the bracket is empty and the bisection below would break on
+            # iteration 0 — it ships the grid pick with no exploration. That
+            # used to be silent; name it.
+            bisection_skipped_reason = (
+                "tightened_search_hi_at_or_below_grid_pick_target")
         else:
-            best, emit_target = grid_pick, float(grid_pick["target_bits"])
             a_t, b_t = float(grid_pick["target_bits"]), search_hi
             for _ in range(40):
                 if (b_t - a_t) <= 0.005:
                     break
                 mid = 0.5 * (a_t + b_t)
-                rm = _artifact_for_target(mid)
-                if rm is not None and rm["disk_bytes"] <= budget_bytes:
+                if _consider(_artifact_for_target(mid), mid, "bisect"):
                     a_t = mid
-                    if rm["disk_bytes"] >= best["disk_bytes"]:  # ratchet up only
-                        best, emit_target = rm, mid
                 else:
                     b_t = mid
-            chosen_info, has_slack = best, False
+        chosen_info = best
 
+        max_bytes_pick = sel["chosen"]  # what "fill the card" would have shipped
         args.target_bits = float(emit_target)  # override emit target below
         selection.update({
             "has_slack": bool(has_slack),
@@ -2101,8 +2556,33 @@ def main():
             "predicted_floor_gb": chosen_info["floor_bytes"] / _fp.GB,
             "predicted_body_gb": (chosen_info["disk_bytes"] - chosen_info["floor_bytes"]) / _fp.GB,
             "predicted_dloss": float(chosen_info["dloss"]),
+            "predicted_dloss_scope": (
+                "dp_body_items_only__excludes_fixed_auxiliary_mtp_visual"),
             "headroom_gb": (budget_bytes - chosen_info["disk_bytes"]) / _fp.GB,
             "grid_pick_target_bits": float(grid_pick["target_bits"]),
+            "grid_pick_dloss": float(grid_pick["dloss"]),
+            # The tightened ceiling the ratchet actually searched under, the
+            # untightened near-lossless cap, and what tightened it: a denser
+            # allocation forgone by the tightening leaves a trace here.
+            "search_hi_target_bits": float(search_hi),
+            "search_hi_cap_target_bits": float(search_hi_cap),
+            "search_hi_tightened_by_rung": (
+                float(tightening_rung) if tightening_rung is not None else None),
+            "search_hi_tightened": bool(search_hi < search_hi_cap),
+            "bisection_ran": bool(bisection_skipped_reason is None),
+            "bisection_skipped_reason": bisection_skipped_reason,
+            "ratchet_trace": ratchet_trace,
+            # The retired MAX-bytes objective, kept for auditability: when
+            # these agree the objective change was a no-op on this run.
+            "max_bytes_pick_target_bits": (
+                float(max_bytes_pick["target_bits"])
+                if max_bytes_pick is not None else None),
+            "max_bytes_pick_dloss": (
+                float(max_bytes_pick["dloss"])
+                if max_bytes_pick is not None else None),
+            "max_bytes_grid_pick_agrees": bool(
+                max_bytes_pick is not None
+                and max_bytes_pick["target_bits"] == grid_pick["target_bits"]),
         })
         sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
         print(
@@ -2111,10 +2591,15 @@ def main():
             f"({chosen_info['disk_bytes'] / _fp.GB:.3f}GB: floor "
             f"{chosen_info['floor_bytes'] / _fp.GB:.3f} + body "
             f"{(chosen_info['disk_bytes'] - chosen_info['floor_bytes']) / _fp.GB:.3f}, "
-            f"headroom {(budget_bytes - chosen_info['disk_bytes']) / _fp.GB:.3f}GB)"
-            + ("  [card has slack beyond near-lossless; shipping all-"
-               + max(specs_sorted, key=lambda s: s.weight_bits).name + "]"
-               if has_slack else "")
+            f"headroom {(budget_bytes - chosen_info['disk_bytes']) / _fp.GB:.3f}GB, "
+            f"Δloss={chosen_info['dloss']:.4e} = min over "
+            f"{sum(1 for r in ratchet_trace if r['fits'])} fitting probes)"
+            + ("  [card has slack beyond near-lossless]" if has_slack else "")
+            + (f"  [search_hi tightened {search_hi_cap:.3f}->{search_hi:.3f} by "
+               f"the cheapest non-fitting rung; denser allocations above it "
+               f"were not explored]" if search_hi < search_hi_cap else "")
+            + (f"  [bisection skipped: {bisection_skipped_reason}]"
+               if bisection_skipped_reason else "")
             + f" -> {sel_path}",
             flush=True,
         )
@@ -2122,9 +2607,28 @@ def main():
     # Emit chosen layer_config for target_bits.
     assignment, achieved, total, mutable_total = _solve_for_target(args.target_bits)
     if assignment is None:
+        # An infeasibility exit must say WHICH wall was hit: a target under the
+        # format floor needs a different --formats menu, while a target the
+        # floor clears but serving-group promotion overshoots needs a slightly
+        # looser target. The solver recorded both; report them.
+        d = _solve_diagnostics.get(round(float(args.target_bits), 9), {})
+        floor = d.get("min_bits")
         raise SystemExit(
-            f"Infeasible at target_bits={args.target_bits}. "
-            "Consider raising the target or widening the format set.")
+            f"Infeasible at target_bits={args.target_bits}."
+            + (f" The format floor (cheapest legal format everywhere) is "
+               f"{floor:.3f} bpp" if isinstance(floor, (int, float)) else "")
+            + (f", and that floor solve itself promotes to "
+               f"{d['floor_achieved_bits']:.3f} bpp"
+               if isinstance(d.get("floor_achieved_bits"), (int, float)) else "")
+            + (f". Closest of {d.get('evals', 0)} DP solves: "
+               f"{d['closest_achieved_bits']:.3f} bpp"
+               if isinstance(d.get("closest_achieved_bits"), (int, float))
+               else "")
+            + (f" against an overshoot tolerance of "
+               f"{d['overshoot_tolerance']}" if "overshoot_tolerance" in d
+               else "")
+            + ". Raise --target-bits above the achievable value above, or "
+              "widen --formats so the floor drops.")
     print(
         f"[alloc] target_bits={args.target_bits}: "
         f"achieved_bits={achieved:.3f}, Δloss={total:.3e}",
@@ -2132,6 +2636,11 @@ def main():
     )
 
     assignment_expanded = dict(assignment)
+
+    # Expand packed-serving-group super-items back to per-tensor entries.
+    if not args.no_packed_aggregation:
+        assignment_expanded = expand_packed_group_assignment(
+            assignment_expanded, stats)
 
     # Expand fused-sibling super-Linears (qkv_proj / gate_up_proj).
     if not args.no_fused_aggregation:
@@ -2142,12 +2651,20 @@ def main():
     assignment_before_serving_promotion = dict(assignment_expanded)
 
     # vLLM's FusedMoE requires all projections of the same expert to share
-    # one scheme. This keeps per-Linear assignments serveable without
-    # collapsing experts into allocator super-items.
+    # one scheme. Packed groups are first-class DP units, so this promotion
+    # is a validated no-op (validate_final_serving_promotion_noop below);
+    # it stays as the serve-time coherence backstop for the un-aggregated
+    # paths (--no-packed-aggregation / --no-fused-aggregation). It is handed
+    # per-Linear legality so the shared format it lands on is runnable for
+    # every member, and it is still a no-op here by construction: an
+    # aggregated unit's format came from the intersection of its members'
+    # candidate sets, and the un-aggregated paths were already promoted
+    # against the same sets inside solve_with_promotion.
     assignment_expanded = promote_serving_units(
         assignment_expanded,
         format_rank,
         profile=model_profile,
+        legal_formats=per_linear_legal_formats,
     )
     validate_final_serving_promotion_noop(
         assignment_before_serving_promotion,

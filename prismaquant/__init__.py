@@ -14,6 +14,18 @@ for artifact replay and comparison.
 """
 from .format_registry import FormatSpec, REGISTRY, register_format
 
+# Resolved from installed metadata rather than duplicated here, so
+# pyproject.toml stays the single source of truth (the release pipeline asserts
+# the git tag matches the built version). A source checkout that was never
+# installed has no metadata; report that honestly instead of guessing a number.
+try:  # pragma: no cover - trivial metadata lookup
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("prismaquant")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.0.0+unknown"
+del _pkg_version, PackageNotFoundError
+
 
 def _ensure_triton_cache_writable() -> None:
     """Keep Triton-backed model code from falling back to CPU.

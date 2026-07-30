@@ -66,6 +66,32 @@ def register_profile(cls: type[ModelProfile]) -> None:
         _REGISTERED.insert(0, cls)
 
 
+def _refuse_dead_vendored_override(model_type: str) -> None:
+    """Fail if this model_type's vendored-modeling override is known dead.
+
+    `register_vendored_modeling()` is called inside a `try/except: pass` above,
+    because a vendoring failure must not break profile *detection*. But the
+    failure mode that swallow hides is not an exception — it is a registration
+    that silently no-ops (issue #19), after which the load succeeds against
+    UPSTREAM modelling code and nothing ever raises. `prismaquant.vendored`
+    verifies its own overrides and records the dead ones, so consult that
+    rather than trusting the absence of an exception: running a probe on the
+    wrong modelling path is exactly the silent-wrong-answer this project
+    refuses to ship.
+    """
+    try:
+        from prismaquant.vendored import OVERRIDE_ERRORS
+    except Exception:  # noqa: BLE001 - vendored package absent entirely
+        return
+    detail = OVERRIDE_ERRORS.get(str(model_type))
+    if detail:
+        raise RuntimeError(
+            f"vendored modelling override for model_type={model_type!r} did "
+            f"not take effect, so a load here would silently run UPSTREAM "
+            f"modelling code instead of the vendored copy:\n{detail}"
+        )
+
+
 def detect_profile(model_path: str) -> ModelProfile:
     """Pick the right ModelProfile for a checkpoint directory.
 
@@ -158,9 +184,19 @@ def _resolve(model_type: str, archs: list[str]) -> ModelProfile:
                     inst.register_vendored_modeling()
                 except Exception:
                     # Don't let a vendoring failure block profile
-                    # detection — surface via the eventual model load
-                    # error instead.
+                    # DETECTION — but do not lose it either. The old
+                    # comment here assumed "the eventual model load
+                    # error" would surface it; that reasoning only holds
+                    # for a failure that raises at load time. The failure
+                    # mode this swallow actually hides is the opposite
+                    # one (issue #19): a registration that silently
+                    # no-ops, after which the load succeeds against the
+                    # WRONG modelling code and nothing ever raises.
+                    # `prismaquant.vendored` records those in
+                    # OVERRIDE_ERRORS; the gate below refuses to hand
+                    # back a profile whose vendored path is known dead.
                     pass
+                _refuse_dead_vendored_override(model_type)
                 return inst
         except Exception:
             continue

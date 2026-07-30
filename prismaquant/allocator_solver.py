@@ -6,9 +6,35 @@ re-exports these symbols for backwards compatibility.
 """
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 
 from . import format_registry as fr
+
+
+class PackedExpertRoleUnknown(RuntimeError):
+    """A role split was requested for an expert projection the profile cannot
+    name a role for (see ``allocator_candidates._RoleSplitProfile``).
+
+    Raised (not returned as None) because the split is opt-in and already
+    hard-gated on a serving profile that declares per-role expert schemes: the
+    operator asked for gate_up/down units, so quietly falling back to
+    layer-uniform units for the leaves the profile does not recognize would
+    ship a DIFFERENT allocation than the one requested, with no signal — and a
+    partial fallback is worse than none (some layers split, some not). The
+    remedy is one line of declarative spec, so failing loud costs one run and
+    fixes the architecture permanently.
+
+    Defined here rather than beside its raiser because both the aggregation
+    path (``allocator_candidates``) and the promotion path (this module) must
+    catch-and-re-raise it, and ``allocator_candidates`` imports from this
+    module — so this is the only home that does not close an import cycle.
+    ``allocator_candidates`` re-exports it.
+    """
+
+# Read once at import (coarse offline path; no per-call getenv).
+_SOLVER_TRACE = os.environ.get("PRISMAQUANT_SOLVER_TRACE", "") not in ("", "0")
 
 
 @dataclass
@@ -57,6 +83,15 @@ def _packed_groups_by_profile(names, profile) -> dict[str, list[str]]:
     for name in names:
         try:
             key = group_fn(name)
+        except PackedExpertRoleUnknown:
+            # A profile that cannot name a packed expert's role under
+            # --packed-role-split is a declaration gap, not a "this row has no
+            # group" answer: swallowing it here would silently promote the two
+            # roles as one unit, i.e. ship a DIFFERENT allocation than the
+            # operator asked for. Aggregation raises this first today, so this
+            # is defence in depth for any future path that promotes without
+            # aggregating.
+            raise
         except Exception:
             key = None
         if key is None:
@@ -65,12 +100,156 @@ def _packed_groups_by_profile(names, profile) -> dict[str, list[str]]:
     return groups
 
 
+def legal_formats_from_candidates(
+    candidates: dict[str, list[Candidate]],
+) -> dict[str, set[str]]:
+    """Per-row legal-format sets for serving-unit promotion.
+
+    A row's candidate list IS its legality verdict: ``build_candidates``
+    admits a ``(row, format)`` pair only after
+    ``check_stats_format_applicability`` clears source-passthrough integrity,
+    the serving profile, group / scale-block divisibility and the runtime
+    kernel shape rules. Handing those sets to promotion is what lets it pick
+    a format the WHOLE serving unit can run, instead of one that happens to
+    top the rank order for some member.
+    """
+    return {name: {c.fmt for c in cands} for name, cands in candidates.items()}
+
+
+def _member_allows(
+    fmt: str,
+    member: str,
+    legal_formats: dict[str, set[str]] | None,
+) -> bool:
+    """Whether ``fmt`` is legal for ``member``.
+
+    A member with no entry is UNCONSTRAINED, not illegal: callers that cannot
+    supply legality for a name (auxiliary MTP/visual pins, hand-built test
+    assignments) must keep today's behaviour rather than acquire a new failure.
+    """
+    if not legal_formats:
+        return True
+    allowed = legal_formats.get(member)
+    return allowed is None or fmt in allowed
+
+
+def _serving_group_common_formats(
+    members: list[str],
+    legal_formats: dict[str, set[str]] | None,
+) -> set[str] | None:
+    """Formats legal for EVERY member, or None when nothing is known."""
+    if not legal_formats:
+        return None
+    known = [legal_formats[m] for m in members if m in legal_formats]
+    if not known:
+        return None
+    common = set(known[0])
+    for allowed in known[1:]:
+        common &= allowed
+    return common
+
+
+def _serving_group_menu_error(
+    members: list[str],
+    assigned: dict[str, str],
+    legal_formats: dict[str, set[str]],
+    format_rank: dict[str, int],
+    common: set[str] | None,
+) -> str:
+    """Diagnostic for a serving unit with no format legal for every member."""
+    member_lines = "\n".join(
+        f"    {m}: assigned={assigned.get(m)!r} legal="
+        + (
+            f"{sorted(legal_formats[m])}"
+            if m in legal_formats
+            else "<unknown: not a priced row, treated as unconstrained>"
+        )
+        for m in sorted(members)
+    )
+    menu = sorted(format_rank, key=lambda name: (format_rank[name], name))
+    return (
+        f"serving-unit component of {len(members)} members (representative "
+        f"{min(members)!r}) shares no format that is legal for every member:\n"
+        f"{member_lines}\n"
+        f"    common legal formats: {sorted(common or ())}\n"
+        f"    promotion menu (low->high rank): {menu}\n"
+        "Packed-MoE experts and fused siblings (q/k/v, gate/up) load under ONE "
+        "format at serve time (vLLM selects one scheme per FusedMoE layer, one "
+        "scheme per fused module), so an empty intersection is not an "
+        "allocatable state: EVERY format whole-unit promotion could pick is "
+        "illegal for at least one member, export then coerces that one member "
+        "to BF16, and the resulting quantized+BF16 mix inside a single serving "
+        "unit is caught only by the fused-coherence gate at the END of export. "
+        "This is an upstream cost/legality bug to fix, not a state to promote "
+        "around: a missing cost row for one member, an over-tight applicability "
+        "mask (see the [alloc] format-applicability log lines and the mask "
+        "summary JSON), or a passthrough-source mismatch (BF16/FP8_SOURCE are "
+        "legal only where the source tensor already has that precision, so a "
+        "unit whose members have different source dtypes loses them)."
+    )
+
+
+def _choose_group_format(
+    members: list[str],
+    assigned: dict[str, str],
+    format_rank: dict[str, int],
+    legal_formats: dict[str, set[str]],
+    best_fmt: str,
+) -> str:
+    """Pick one format for a unit whose max-rank assignment is illegal for it.
+
+    Only reached when ``best_fmt`` (the highest-rank format assigned to any
+    member, i.e. what unconstrained promotion would write) is illegal for at
+    least one member. Preference order, from the promotion contract this
+    function repairs rather than reinvents:
+
+    1. the CHEAPEST legal-for-all format at or above ``best_fmt``'s rank —
+       promotion has always been non-degrading (no member ends below the
+       format the DP picked for it), and ``solve_with_promotion``'s
+       tightening loop is built to absorb the extra bits promotion charges;
+    2. otherwise the HIGHEST-rank legal-for-all format, which is necessarily
+       below some member's assignment. That downgrade is correct: the unit
+       must be uniform, so a member cannot keep a format the unit cannot
+       serve. It is the same downgrade export was applying per member (issue
+       #28) — done once for the whole unit, before any render work, and
+       priced by ``compute_achieved`` instead of discovered at export.
+    """
+    common = _serving_group_common_formats(members, legal_formats)
+    ranked = sorted(
+        (fmt for fmt in (common or ()) if fmt in format_rank),
+        key=lambda fmt: (format_rank[fmt], fmt),
+    )
+    if not ranked:
+        raise AssertionError(
+            _serving_group_menu_error(
+                members, assigned, legal_formats, format_rank, common)
+        )
+    best_rank = format_rank[best_fmt]
+    for fmt in ranked:
+        if format_rank[fmt] >= best_rank:
+            return fmt
+    return ranked[-1]
+
+
 def _promote_group_components(
     assignment: dict[str, str],
     format_rank: dict[str, int],
     groups: list[list[str]],
+    legal_formats: dict[str, set[str]] | None = None,
 ) -> dict[str, str]:
-    """Promote connected serving-unit components to one shared format."""
+    """Promote connected serving-unit components to one shared format.
+
+    ``legal_formats`` (see ``legal_formats_from_candidates``) maps a row to the
+    formats that are legal FOR THAT ROW. Without it, promotion writes the
+    highest-rank format any member was assigned to every member — with no
+    check that the format is runnable for the rest of them. Members of one
+    unit do not share a shape (gate_up vs down differ on the reduce dim; an
+    odd ``moe_intermediate_size`` makes one projection's group / scale-block
+    divisibility fail while the other's passes), so that format can be
+    illegal for a subset, and export's per-Linear shape coercion then breaks
+    the unit's coherence (issue #28). Omit the argument and the legacy
+    max-rank behaviour is reproduced exactly.
+    """
     out = dict(assignment)
     parent = {name: name for name in out}
 
@@ -102,10 +281,21 @@ def _promote_group_components(
         if len(members) < 2:
             continue
         best_fmt = max((out[member] for member in members), key=lambda fmt: format_rank[fmt])
-        best_rank = format_rank[best_fmt]
+        if all(_member_allows(best_fmt, member, legal_formats)
+               for member in members):
+            best_rank = format_rank[best_fmt]
+            for member in members:
+                if format_rank[out[member]] < best_rank:
+                    out[member] = best_fmt
+            continue
+        # The max-rank assignment cannot run on every member of an atomic
+        # serving unit. Move the WHOLE unit to a format that can, and write it
+        # unconditionally: a member sitting on an equal-rank-but-different
+        # format would otherwise survive the promotion and keep the unit mixed.
+        chosen = _choose_group_format(
+            members, out, format_rank, legal_formats, best_fmt)
         for member in members:
-            if format_rank[out[member]] < best_rank:
-                out[member] = best_fmt
+            out[member] = chosen
     return out
 
 
@@ -116,8 +306,15 @@ def promote_serving_units(
     profile=None,
     include_fused: bool = True,
     include_moe: bool = True,
+    legal_formats: dict[str, set[str]] | None = None,
 ) -> dict[str, str]:
-    """Promote all serving-coupled units in one order-independent pass."""
+    """Promote all serving-coupled units in one order-independent pass.
+
+    Pass ``legal_formats`` (``legal_formats_from_candidates(candidates)``)
+    wherever per-row legality is known, so the shared format a unit lands on
+    is one every member can actually run. Omitted, promotion keeps its legacy
+    max-rank behaviour.
+    """
     if profile is None:
         from .model_profiles import DefaultProfile
         profile = DefaultProfile()
@@ -126,7 +323,8 @@ def promote_serving_units(
         groups.extend(_group_by_profile(assignment.keys(), profile).values())
     if include_moe:
         groups.extend(_packed_groups_by_profile(assignment.keys(), profile).values())
-    return _promote_group_components(assignment, format_rank, groups)
+    return _promote_group_components(
+        assignment, format_rank, groups, legal_formats)
 
 
 def fused_siblings(name: str, profile=None) -> tuple[tuple[str, ...], str] | None:
@@ -145,6 +343,7 @@ def promote_moe_pair(
     format_rank: dict[str, int],
     *,
     profile=None,
+    legal_formats: dict[str, set[str]] | None = None,
 ) -> dict[str, str]:
     """Promote packed MoE projections that must share one serving format."""
     if profile is None:
@@ -156,12 +355,15 @@ def promote_moe_pair(
         profile=profile,
         include_fused=False,
         include_moe=True,
+        legal_formats=legal_formats,
     )
 
 
 def promote_fused(assignment: dict[str, str],
                   format_rank: dict[str, int],
-                  profile=None) -> dict[str, str]:
+                  profile=None,
+                  legal_formats: dict[str, set[str]] | None = None,
+                  ) -> dict[str, str]:
     """Promote each fused-sibling group to one shared serving format."""
     if profile is None:
         from .model_profiles import DefaultProfile
@@ -172,8 +374,14 @@ def promote_fused(assignment: dict[str, str],
         profile=profile,
         include_fused=True,
         include_moe=False,
+        legal_formats=legal_formats,
     )
     groups = _group_by_profile(assignment.keys(), profile)
+    # Legacy per-group repass, kept for its post-check below. It cannot write:
+    # a connected component is a superset of each group it contains, so every
+    # group is already uniform here and no member's rank is below the group max.
+    # (It is also legality-blind, so writing here would be able to undo the
+    # component pass's legal-for-all choice.)
     for members_present in groups.values():
         if len(members_present) < 2:
             continue
@@ -329,7 +537,22 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
                      format_specs: dict[str, fr.FormatSpec],
                      candidates: dict[str, list[Candidate]] | None = None,
                      ) -> tuple[float, float]:
-    """Return ``(avg_bits, total_predicted_dloss)`` for an assignment."""
+    """Return ``(avg_bits, total_predicted_dloss)`` for an assignment.
+
+    A priced row (a name present in ``candidates``) whose assigned format has
+    no candidate is a HARD ERROR, not a zero-cost row. It means promotion put
+    that Linear on a format its own candidate set never offered — the format
+    is illegal for it, and pricing the move at 0 Δloss made the unpriced row
+    look free. That mattered the moment ``solve_with_promotion`` started
+    ratcheting on this Δloss: the contaminated (too-low) sum is exactly what
+    the min-Δloss ratchet would prefer. ``compute_assignment_predicted_dloss``
+    already refuses the same input, so failing here only moves the same error
+    to where the miscosting happens.
+
+    Names ABSENT from ``candidates`` (and the ``candidates=None`` byte-only
+    call form) stay on the unpriced byte path: they are not DP rows, so they
+    contribute bytes and no Δloss.
+    """
     total_params = sum(stats[n]["n_params"] for n in assignment)
     total_bits = 0.0
     total_predicted_dloss = 0.0
@@ -342,6 +565,15 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
             total_predicted_dloss += float(
                 getattr(chosen_cand, "predicted_dloss", 0.0))
             continue
+        if n in cs:
+            raise AssertionError(
+                f"assignment {n!r} picked fmt={fmt!r}, but no candidate "
+                "exists to price its predicted loss (available: "
+                f"{sorted(c.fmt for c in cs[n])}). Serving-unit promotion "
+                "moved a priced Linear onto a format its candidate set never "
+                "offered; scoring it at zero Δloss would bias the solver's "
+                "min-Δloss ratchet toward exactly this unpriced state."
+            )
         memory_map = stats[n].get("_memory_bytes_by_format")
         if memory_map is not None and fmt in memory_map:
             total_bits += 8.0 * memory_map[fmt]
@@ -385,17 +617,123 @@ def solve_with_promotion(
     stall_threshold: float = 1e-4,
     stall_grace: int = 3,
     profile=None,
+    diagnostics: dict | None = None,
 ) -> tuple[dict[str, str] | None, float]:
-    """Solve, promote coupled tensors, and retry if promotion exceeds budget."""
-    tightened = float(target_bits)
-    last_assign: dict[str, str] | None = None
-    last_achieved = float("nan")
-    prev_overshoot = float("inf")
-    stall_count = 0
-    for _iteration in range(max_iters):
-        result = solve_allocation(stats, candidates, tightened, bit_precision)
+    """Solve, promote coupled tensors, and retry if promotion exceeds budget.
+
+    Termination contract: the returned
+    assignment is always FEASIBLE — ``achieved <= target_bits +
+    overshoot_tolerance`` — and, among the feasible iterates seen, the
+    one with MINIMUM total predicted Δloss (ties broken toward larger
+    achieved bits). Δloss is the solver's actual objective; density is
+    not a proxy for it — more bits is not monotonically better (5.5 bpp
+    has beaten 6.0 bpp on served PPL), and promotion can flip a serving
+    group into a denser-but-worse format. When no
+    iterate is feasible within ``max_iters`` the rung is INFEASIBLE and
+    ``(None, nan)`` is returned so callers exclude it from the Pareto curve
+    and byte-budget bisection. Three silent fallbacks are replaced:
+
+      - ``solve_allocation`` returning None (tightened below the format
+        floor) used to return the previous, massively over-target iterate;
+      - any undershoot, however deep, used to be accepted immediately
+        (rung 6.0 returning achieved 4.95 with 25x worse loss);
+      - the stall exit used to return an iterate still far above target.
+
+    Honest scope: only the ``--target-bits`` emit path shipped those
+    over-target iterates silently. The byte-budget selector priced them
+    at their true (larger) disk size, so its feasibility calls were
+    correct — the rung label was just wrong, skewing the Pareto curve's
+    x-axis rather than fabricating feasibility.
+
+    The search runs in two phases on the *tightened* DP target:
+
+    1. Damped descent (the old loop's cost profile — the first eval at the
+       full target is the only expensive DP; every subsequent eval has a
+       smaller bin table): tighten by ``overshoot/2`` until an iterate is
+       feasible or the DP floor is reached.
+    2. Bracket bisection between the first feasible tightened value and the
+       last infeasible one, ratcheting the minimum-Δloss feasible
+       assignment.
+       Promotion is a coarse step function (one packed-MoE serving group
+       flipping format moves the average by tenths of a bit), so
+       achieved(tightened) is locally non-monotone; the ratchet keeps
+       correctness anyway, and infeasibility is only declared when the
+       whole bracket is exhausted with no feasible iterate.
+
+    ``stall_threshold`` is reused as the plateau epsilon for the descent
+    acceleration; ``stall_grace`` is retained for call compatibility but
+    unused (both phases shrink their search state every evaluation, so
+    they cannot stall).
+
+    Pass ``diagnostics`` (an empty dict) to receive the numbers an INFEASIBLE
+    verdict needs to be actionable — they are otherwise computed and thrown
+    away. The dict is filled IN PLACE, on every return path:
+
+      ``target_bits``, ``min_bits`` (the DP baseline: cheapest-candidate
+      average bits, i.e. the format floor), ``overshoot_tolerance``,
+      ``evals``, ``feasible``, ``achieved_bits`` / ``predicted_dloss`` (the
+      returned iterate, ``None`` when INFEASIBLE), ``closest_achieved_bits``
+      / ``closest_tightened_target`` (the least-overshooting iterate seen —
+      "how close did it get"), and ``floor_achieved_bits`` (what the DP floor
+      itself promoted to, the number that distinguishes "target below the
+      format floor" from "serving-group promotion overshoots").
+    """
+    del stall_grace  # legacy fixed-point knob; see docstring
+    stall_eps = float(stall_threshold)
+    target = float(target_bits)
+    diag = diagnostics if diagnostics is not None else {}
+    diag.update({
+        "target_bits": target,
+        "min_bits": None,
+        "overshoot_tolerance": float(overshoot_tolerance),
+        "evals": 0,
+        "feasible": False,
+        "achieved_bits": None,
+        "predicted_dloss": None,
+        "closest_achieved_bits": None,
+        "closest_tightened_target": None,
+        "floor_achieved_bits": None,
+    })
+    names = list(candidates.keys())
+    total_params = sum(stats[n]["n_params"] for n in names)
+    if total_params <= 0:
+        return None, float("nan")
+    min_bits = sum(
+        min(cs, key=lambda c: c.bits_per_param).bits_per_param
+        * stats[n]["n_params"]
+        for n, cs in candidates.items()
+    ) / total_params
+    diag["min_bits"] = float(min_bits)
+    if target < min_bits - 1e-6:
+        return None, float("nan")
+
+    best_assign: dict[str, str] | None = None
+    best_achieved = float("nan")
+    best_dloss = float("inf")
+    # Per-row legality for the promotion below. On the aggregated path this is
+    # a no-op (a super-item is one row and has no serving siblings), but with
+    # --no-packed-aggregation / --no-fused-aggregation — or a group that fell
+    # back to individual rows — promotion is the ONLY coherence mechanism, and
+    # the format it picks has to be runnable for every member. Built once: the
+    # search re-promotes on every DP evaluation.
+    legal_formats = legal_formats_from_candidates(candidates)
+
+    def _evaluate(t: float) -> float | None:
+        """Solve+promote at tightened ``t``; ratchet if feasible.
+
+        Returns achieved bits, or None when the DP is infeasible at ``t``.
+        The ratchet keeps the feasible iterate with minimum total predicted
+        Δloss (the solve objective), tie-broken toward higher achieved bits.
+        """
+        nonlocal best_assign, best_achieved, best_dloss
+        t0 = time.time() if _SOLVER_TRACE else 0.0
+        diag["evals"] += 1
+        result = solve_allocation(stats, candidates, t, bit_precision)
         if result is None:
-            return last_assign, last_achieved
+            if _SOLVER_TRACE:
+                print(f"[solver] target={target:.4f} eval t={t:.4f} -> "
+                      f"DP infeasible ({time.time() - t0:.1f}s)", flush=True)
+            return None
         assign, chosen_cands = result
         del chosen_cands
         assign = promote_serving_units(
@@ -404,26 +742,110 @@ def solve_with_promotion(
             profile=profile,
             include_fused=not no_fused_promote,
             include_moe=True,
+            legal_formats=legal_formats,
         )
-        achieved, _ = compute_achieved(
+        achieved, predicted = compute_achieved(
             stats, assign, format_specs,
             candidates=candidates,
         )
-        last_assign = assign
-        last_achieved = achieved
-        overshoot = achieved - target_bits
-        if overshoot <= overshoot_tolerance:
-            return assign, achieved
+        if _SOLVER_TRACE:
+            print(f"[solver] target={target:.4f} eval t={t:.4f} -> "
+                  f"achieved={achieved:.4f} dloss={predicted:.3e} "
+                  f"({time.time() - t0:.1f}s)",
+                  flush=True)
+        if abs(t - min_bits) <= 1e-9:
+            diag["floor_achieved_bits"] = float(achieved)
+        if achieved - target > overshoot_tolerance:
+            closest = diag["closest_achieved_bits"]
+            if closest is None or achieved < closest:
+                diag["closest_achieved_bits"] = float(achieved)
+                diag["closest_tightened_target"] = float(t)
+        if achieved - target <= overshoot_tolerance and (
+                best_assign is None
+                or predicted < best_dloss
+                or (predicted == best_dloss and achieved > best_achieved)):
+            best_assign = assign
+            best_achieved = achieved
+            best_dloss = predicted
+            diag["feasible"] = True
+            diag["achieved_bits"] = float(achieved)
+            diag["predicted_dloss"] = float(predicted)
+        return achieved
 
-        if abs(prev_overshoot - overshoot) < stall_threshold:
-            stall_count += 1
-            if stall_count >= stall_grace:
-                return assign, achieved
-        else:
-            stall_count = 0
-        prev_overshoot = overshoot
-
-        tightened -= overshoot / 2.0
-        if tightened <= 0:
+    # Phase 1: damped descent until the first feasible iterate. Promotion
+    # makes achieved(tightened) a plateau-and-cliff staircase (a packed-MoE
+    # layer only leaves a format when EVERY one of its rows does), so a pure
+    # overshoot/2 step can crawl across a plateau for dozens of expensive
+    # DP evals. Accelerate: whenever an eval fails to reduce the overshoot
+    # meaningfully, double the step.
+    evals = 0
+    tightened = target
+    hi = target  # lowest tightened known to promote OVER the target
+    lo = None    # highest tightened known to promote under it (feasible)
+    step = None
+    prev_overshoot = float("inf")
+    while evals < max_iters:
+        evals += 1
+        achieved = _evaluate(tightened)
+        if achieved is None:
+            # Below the DP floor: all-baseline promotes to itself, which is
+            # feasible for any target >= min_bits, so probe the floor next
+            # unless we already did.
+            if tightened <= min_bits + 1e-9:
+                break
+            hi = min(hi, tightened)
+            tightened = min_bits
+            continue
+        if achieved - target <= overshoot_tolerance:
+            if achieved >= target - overshoot_tolerance:
+                # Within the band on both sides — no denser feasible
+                # iterate exists; return the ratcheted min-Δloss one.
+                return best_assign, best_achieved
+            lo = tightened
             break
-    return last_assign, last_achieved
+        hi = tightened
+        if tightened <= min_bits + 1e-9:
+            # The floor solve itself promotes over the target: no tighter
+            # DP exists, so re-running the identical solve until max_iters
+            # cannot help. The rung is infeasible unless a feasible iterate
+            # was already ratcheted.
+            break
+        overshoot = achieved - target
+        if step is None:
+            step = overshoot / 2.0
+        elif prev_overshoot - overshoot < max(step / 4.0, stall_eps):
+            # Plateau: tightening by `step` bought back less than a quarter
+            # of it — the promoted outcome is pinned by serving-group
+            # atomicity. Jump exponentially further instead of crawling.
+            step *= 2.0
+        else:
+            step = overshoot / 2.0
+        prev_overshoot = overshoot
+        tightened -= step
+        if tightened <= min_bits:
+            tightened = min_bits
+
+    # Phase 2: bisect (lo, hi) toward the target. The bisection PROPOSES
+    # progressively denser feasible iterates; the ratchet in _evaluate
+    # KEEPS whichever feasible iterate has the minimum predicted Δloss.
+    if lo is not None:
+        while evals < max_iters and hi - lo > max(bit_precision, 1e-9):
+            evals += 1
+            mid = 0.5 * (lo + hi)
+            achieved = _evaluate(mid)
+            if achieved is not None and achieved - target <= overshoot_tolerance:
+                if achieved >= target - overshoot_tolerance:
+                    # In-band: densest possible; keep the min-Δloss ratchet.
+                    return best_assign, best_achieved
+                lo = mid
+            else:
+                hi = mid
+
+    if best_assign is None:
+        if _SOLVER_TRACE:
+            print(f"[solver] target={target:.4f} INFEASIBLE after "
+                  f"{diag['evals']} evals: floor={min_bits:.4f} "
+                  f"floor_achieved={diag['floor_achieved_bits']} "
+                  f"closest={diag['closest_achieved_bits']}", flush=True)
+        return None, float("nan")
+    return best_assign, best_achieved

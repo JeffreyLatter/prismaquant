@@ -460,7 +460,9 @@ def l2_cost_value(stats: Mapping, costs: Mapping, name: str, fmt: str) -> float 
     entry = _cost_entry(costs, name, fmt)
     if entry is None or name not in stats:
         return None
-    return float(cost_entry_predicted_dloss(stats[name], entry))
+    return float(
+        cost_entry_predicted_dloss(stats[name], entry, format_name=fmt)
+    )
 
 
 def _memory_bytes_for_format(

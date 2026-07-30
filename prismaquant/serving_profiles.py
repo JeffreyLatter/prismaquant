@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass, field
 from importlib import import_module
 from importlib import resources
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 from . import format_registry as fr
 
@@ -249,6 +249,105 @@ class RuntimeShapeValidatorRule:
 
 
 @dataclass(frozen=True)
+class ExportLaneSpec:
+    """The artifact container a serving lane ships through, plus the
+    *exporter's own declaration* of what it can emit.
+
+    A serving profile's format menu and its lane's exporter must not be
+    able to disagree: a rung the exporter cannot emit is not "denied by
+    policy", it is structurally unavailable, and the allocator must never
+    be able to spend a bit budget on it (a recent bit-exact re-encode
+    short-circuit prices weight-lossless A16 rungs at dloss 0.0 — the
+    unbeatable global minimum — so an unexportable-but-legal rung is
+    actively attractive to the DP).
+
+    ``codec_formats_from`` is a tuple of ``module:ATTR`` paths whose
+    attribute is an *iterable of format names the exporter itself
+    declares it can emit* (a dict's keys or a set both count).  Nothing is
+    duplicated here: the vLLM lane points at
+    ``export_native_compressed.EXPORTABLE_FORMATS`` (that exporter's own
+    declaration — its ``FORMAT_SCHEME`` metadata table, CLAUDE.md gate
+    #9's "correctly represented in compressed-tensors metadata", already
+    unioned with its container passthroughs), and the GGUF lane points at
+    ``gguf_formats.GGUF_BLOCK_BYTES`` (the ggml type table
+    ``export_gguf``/``export_gguf_direct`` gate on directly).
+
+    ``passthrough_formats`` covers formats a container emits *without* a
+    codec entry, for lanes whose declaration is a bare codec table that
+    cannot contain them: BF16 is written as plain container floats
+    (safetensors bf16 / GGUF F16-F32) and goes on the checkpoint's
+    ``ignore`` list rather than into ``config_groups``.  It stays per-lane
+    because passthrough is a container fact — FP8_SOURCE is a
+    verbatim-copy passthrough on the compressed-tensors lane but has no
+    ggml type at all — and it is empty for a lane like
+    ``compressed_tensors`` whose exporter folds its own passthroughs into
+    the constant it declares.
+    """
+
+    id: str
+    exporter: str = ""
+    codec_formats_from: tuple[str, ...] = ()
+    passthrough_formats: tuple[str, ...] = ()
+    reason: str = "exporter_cannot_emit"
+    detail: str = ""
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ExportLaneSpec":
+        return cls(
+            id=str(payload["id"]),
+            exporter=str(payload.get("exporter", "")),
+            codec_formats_from=tuple(
+                str(v) for v in payload.get("codec_formats_from", ())
+            ),
+            passthrough_formats=tuple(
+                str(v) for v in payload.get("passthrough_formats", ())
+            ),
+            reason=str(payload.get("reason", "exporter_cannot_emit")),
+            detail=str(payload.get("detail", "")),
+        )
+
+    def emittable_formats(self) -> frozenset[str]:
+        """Canonical format names this lane's exporter can emit."""
+        cached = _EMITTABLE_CACHE.get(self)
+        if cached is None:
+            names: set[str] = set()
+            for path in self.codec_formats_from:
+                names |= _declared_exporter_formats(path, self.id)
+            if not names:
+                raise RuntimeError(
+                    f"serving profile export lane {self.id!r} declares no "
+                    f"emittable formats (codec_formats_from="
+                    f"{list(self.codec_formats_from)!r}). A lane with an "
+                    f"empty menu would deny every format; declare the "
+                    f"exporter's own format table instead."
+                )
+            names |= {
+                fr.canonical_format_name(name)
+                for name in self.passthrough_formats
+            }
+            cached = frozenset(names)
+            _EMITTABLE_CACHE[self] = cached
+        return cached
+
+    def check(self, fmt: str) -> ServingFormatDecision:
+        emittable = self.emittable_formats()
+        if _format_in(fmt, emittable):
+            return ServingFormatDecision(True, rule=self.id)
+        detail = self.detail or (
+            f"{fr.canonical_format_name(fmt)} has no emit path in this "
+            f"lane's exporter"
+        )
+        return ServingFormatDecision(
+            False,
+            self.reason,
+            f"{detail} (lane={self.id}"
+            + (f", exporter={self.exporter}" if self.exporter else "")
+            + f", emittable={sorted(emittable)})",
+            self.id,
+        )
+
+
+@dataclass(frozen=True)
 class RuntimePackageSpec:
     id: str
     module: str | None = None
@@ -285,6 +384,25 @@ class ServingProfile:
     runtime_shape_validators: tuple[RuntimeShapeValidatorRule, ...] = ()
     runtime_packages: tuple[RuntimePackageSpec, ...] = ()
     description: str = ""
+    # The artifact container this profile ships through. Bounds the format
+    # menu by what the lane's exporter declares it can emit (see
+    # ExportLaneSpec). Inherited from `extends` when not declared locally.
+    export_lane: ExportLaneSpec | None = None
+    # Declared exemption from the export-lane bound: this profile
+    # constrains *emulation / kernel* legality only and does not
+    # correspond to an artifact container, so no exporter bounds its
+    # menu. Deliberately true for `research`, which exists so research
+    # rungs with no served path (MXFP6, INT4_W4A16_g128, the A16 family)
+    # stay measurable. False is the fail-closed default: a new serving
+    # profile must name its export lane or declare itself emulation-only.
+    emulation_only: bool = False
+    # Capability: the serving lane can load DIFFERENT expert schemes for
+    # different projection roles of one MoE layer (gate/up vs down). True
+    # for GGUF (expert tensors are stacked PER projection, so each stacked
+    # tensor carries its own ggml type); false for vLLM compressed-tensors
+    # packed MoE, where CompressedTensorsMoEMethod selects ONE scheme per
+    # FusedMoE layer. Gates --packed-role-split.
+    supports_per_role_expert_schemes: bool = False
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ServingProfile":
@@ -312,6 +430,15 @@ class ServingProfile:
                 for entry in payload.get("runtime_packages", ())
             ),
             description=str(payload.get("description", "")),
+            export_lane=(
+                ExportLaneSpec.from_dict(payload["export_lane"])
+                if payload.get("export_lane")
+                else None
+            ),
+            emulation_only=bool(payload.get("emulation_only", False)),
+            supports_per_role_expert_schemes=bool(
+                payload.get("supports_per_role_expert_schemes", False)
+            ),
         )
 
     def check_format(self, qname: str | None, fmt: str,
@@ -321,6 +448,16 @@ class ServingProfile:
         for rule in self.format_rules:
             decision = rule.check(name, fmt, packed_expert=packed_expert)
             if decision is not None and not decision.legal:
+                return decision
+        # Structural bound, applied after the profile's own policy rules so
+        # an explicitly-denied format keeps its policy attribution: the
+        # lane's exporter has no emit path for this format, so no allow/deny
+        # list may admit it. Fixing the menu disagreement at the root means
+        # the profile *cannot* widen past the exporter, rather than a
+        # hand-maintained deny list mirroring the exporter's branches.
+        if self.export_lane is not None:
+            decision = self.export_lane.check(fmt)
+            if not decision.legal:
                 return decision
         return ServingFormatDecision(True)
 
@@ -360,6 +497,49 @@ class ServingProfile:
 
 
 _CACHE: dict[str, ServingProfile] = {}
+_EMITTABLE_CACHE: dict["ExportLaneSpec", frozenset[str]] = {}
+
+
+def _declared_exporter_formats(path: str, lane_id: str) -> set[str]:
+    """Read an exporter's own format declaration at ``module:ATTR``.
+
+    Imported lazily and cached by the caller: the compressed-tensors
+    exporter imports this module, so a module-scope import would be
+    circular, and the GGUF codec tables pull torch.
+    """
+    if ":" in path:
+        module_name, attr_name = path.split(":", 1)
+    else:
+        module_name, attr_name = path.rsplit(".", 1)
+    try:
+        module = import_module(module_name)
+    except ImportError as exc:  # pragma: no cover - environment breakage
+        raise RuntimeError(
+            f"serving profile export lane {lane_id!r} declares "
+            f"{path!r} but {module_name!r} could not be imported "
+            f"({exc!r}); the lane's format menu cannot be bounded by its "
+            f"exporter."
+        ) from exc
+    try:
+        declared = getattr(module, attr_name)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"serving profile export lane {lane_id!r} declares "
+            f"{path!r} but {module_name!r} has no attribute "
+            f"{attr_name!r}. The lane's emittable-format menu is derived "
+            f"from the exporter's own declaration — update the profile "
+            f"spec to the declaration's new name rather than hand-listing "
+            f"formats here."
+        ) from exc
+    try:
+        names = [str(name) for name in declared]
+    except TypeError as exc:
+        raise RuntimeError(
+            f"serving profile export lane {lane_id!r}: {path!r} is not "
+            f"iterable ({type(declared).__name__}); expected a container of "
+            f"format names (a dict keyed by format name counts)."
+        ) from exc
+    return {fr.canonical_format_name(name) for name in names}
 
 
 def serving_profile_names() -> tuple[str, ...]:
@@ -406,6 +586,23 @@ def load_serving_profile(profile_id: str | None) -> ServingProfile:
                 for package in base.runtime_packages
             ) + profile.runtime_packages,
             description=profile.description,
+            export_lane=(
+                profile.export_lane
+                or next(
+                    (base.export_lane for base in bases if base.export_lane),
+                    None,
+                )
+            ),
+            # Emulation-only is NOT inherited: a lane that extends the
+            # research profile's kernel-shape rules is still a shipping
+            # lane and must declare its exporter.
+            emulation_only=profile.emulation_only,
+            supports_per_role_expert_schemes=(
+                profile.supports_per_role_expert_schemes
+                or any(
+                    base.supports_per_role_expert_schemes for base in bases
+                )
+            ),
         )
     _CACHE[profile_name] = profile
     return profile
@@ -436,6 +633,47 @@ def resolve_target_profile(
     return str(default)
 
 
+def require_per_role_expert_scheme_support(
+    profile_id: str | None,
+    *,
+    flag: str = "--packed-role-split",
+) -> ServingProfile:
+    """Hard gate: the resolved serving profile must DECLARE per-role
+    expert scheme support before a per-role expert split is legal.
+
+    A gate_up/down role split emits different formats for different
+    projections of the SAME MoE layer. That is only loadable when the
+    serving lane keys expert schemes per projection — GGUF does (expert
+    tensors are stacked per projection, each stacked tensor carries its
+    own ggml type). vLLM's compressed-tensors packed-MoE path does not:
+    CompressedTensorsMoEMethod selects ONE scheme per FusedMoE layer, so
+    a role-split checkpoint (e.g. gate_up=NVFP4 with down=FP8) cannot be
+    loaded. Profiles opt in with ``supports_per_role_expert_schemes``.
+    """
+    resolved = str(profile_id or "research")
+    try:
+        profile = load_serving_profile(resolved)
+    except FileNotFoundError:
+        raise SystemExit(
+            f"[alloc] ERROR: {flag} was requested, but the target profile "
+            f"{resolved!r} is unknown."
+        )
+    if not profile.supports_per_role_expert_schemes:
+        raise SystemExit(
+            f"[alloc] ERROR: {flag} was requested, but the resolved "
+            f"serving profile {resolved!r} does not declare "
+            "supports_per_role_expert_schemes. A per-role split emits "
+            "different expert formats for gate_up vs down projections of "
+            "the SAME MoE layer; this profile's serving lane loads every "
+            "projection of a layer's experts under ONE scheme (vLLM's "
+            "CompressedTensorsMoEMethod selects one scheme per FusedMoE "
+            "layer), so the checkpoint would be unservable. Use a profile "
+            "whose lane keys expert schemes per projection (e.g. "
+            "--target-profile gguf), or drop the flag."
+        )
+    return profile
+
+
 def check_serving_format(
     profile_id: str | None,
     qname: str | None,
@@ -451,6 +689,15 @@ def check_serving_format(
             f"unknown target profile {profile_id!r}",
         )
     return profile.check_format(qname, fmt, packed_expert=packed_expert)
+
+
+def lane_emittable_formats(profile_id: str | None) -> frozenset[str] | None:
+    """Formats the profile's export lane can emit, or None when the
+    profile declares no lane (emulation-only, e.g. ``research``)."""
+    profile = load_serving_profile(profile_id)
+    if profile.export_lane is None:
+        return None
+    return profile.export_lane.emittable_formats()
 
 
 def check_serving_shape(
@@ -481,7 +728,7 @@ def _load_serving_profile_uncached(profile_id: str) -> ServingProfile:
     return ServingProfile.from_dict(json.loads(text))
 
 
-def _format_in(fmt: str, names: tuple[str, ...]) -> bool:
+def _format_in(fmt: str, names: Collection[str]) -> bool:
     candidates = {fmt, fr.canonical_format_name(fmt), *fr.aliases_for(fmt)}
     return bool(candidates.intersection(names))
 

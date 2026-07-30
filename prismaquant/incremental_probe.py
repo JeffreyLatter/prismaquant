@@ -74,9 +74,12 @@ from .layer_streaming import (
 from .sensitivity_probe import (
     FisherAccumulator,
     RouterTracker,
+    SharedStateCotangents,
     discover_moe_structure,
+    finalize_fisher_stats,
     h_detail_blob,
     install_packed_expert_hooks,
+    kv_cotangent_path_enabled,
     load_calibration,
     per_token_ce,
     read_top_k,
@@ -683,14 +686,29 @@ def build_shard_schedule(
             sidx += len(vis_entries)
 
     if include_lm_head:
-        extras.append(ShardEntry(
-            shard_idx=sidx,
-            linear_include=rf"^{re.escape(lm_head_name)}$",
-            kind="lm_head",
-            layer_indices=frozenset(),
-            layer_prefix=None,
-        ))
-        sidx += 1
+        # A tied head (`tie_word_embeddings` declared AND no head tensor
+        # in the index) is an alias of the input embedding: same storage,
+        # no source bytes of its own. It is structurally passthrough-only
+        # — re-encoding it would re-encode the non-quantizable embedding
+        # — so it gets no Fisher row and no cost row. Same shape as the
+        # MTP skip above: config declares it, the index does not have it.
+        from .tied_embeddings import lm_head_is_tied_alias
+        if lm_head_is_tied_alias(model_path, profile=profile):
+            print(f"[shard-schedule] `{lm_head_name}` is a tied alias of the "
+                  "input embedding (config declares tie_word_embeddings and "
+                  "the safetensors index has no head tensor); skipping the "
+                  "lm_head shard — a tied head shares storage with the "
+                  "non-quantizable embedding and is never quantized",
+                  flush=True)
+        else:
+            extras.append(ShardEntry(
+                shard_idx=sidx,
+                linear_include=rf"^{re.escape(lm_head_name)}$",
+                kind="lm_head",
+                layer_indices=frozenset(),
+                layer_prefix=None,
+            ))
+            sidx += 1
 
     return ShardSchedule(entries=tuple(body_entries + extras))
 
@@ -991,12 +1009,13 @@ def load_num_hidden_layers(model_path: str) -> int:
 def config_num_kv_shared_layers(model_path: str) -> int:
     """``num_kv_shared_layers`` from the config (text_config or top-level).
 
-    Returns 0 when absent. Used by the MINOR-M33 guard: KV-sharing models
-    (num_kv_shared_layers>0, e.g. some Gemma4 variants) reuse one layer's
-    K/V in later layers, but the streaming Fisher probe captures and
-    ``.detach()``s borrowed K/V per isolated phase-3 forward, severing the
-    Fisher cotangent that should flow back to the *storing* layer's
-    k_proj/v_proj — under-counting their h_trace.
+    Returns 0 when absent. KV-sharing models (num_kv_shared_layers>0, e.g. some
+    Gemma4 variants) reuse one layer's K/V in later layers. The phase-3 sweep
+    forwards each layer in isolation from a ``.detach()``ed capture of that K/V,
+    and that borrowed tensor severed the Fisher cotangent belonging to the
+    *storing* layer's k_proj/v_proj — under-counting their h_trace (review
+    finding MINOR-M33). ``SharedStateCotangents`` reconnects it, so this lookup
+    now only feeds the guard that fires if that path is switched off.
     """
     staged = stage_text_only(model_path)
     cfg_path = Path(staged) / "config.json"
@@ -1014,21 +1033,31 @@ def config_num_kv_shared_layers(model_path: str) -> int:
 def kv_shared_fisher_block_reason(model_path: str) -> str | None:
     """Fail-fast message if the streaming Fisher probe must not run here.
 
-    Returns a message string when the model has ``num_kv_shared_layers>0`` and
-    the ``PRISMAQUANT_ALLOW_KV_SHARED_FISHER`` override is unset, else ``None``
-    (MINOR-M33). Extracted so the guard decision is unit-testable.
+    INVERTED (MINOR-M33 closed): KV-sharing models are now probed normally,
+    because the reverse sweep routes each consumer's cotangent back to the
+    layer that produced the borrowed K/V (``SharedStateCotangents``, verified
+    against an end-to-end backward in
+    ``tests/test_kv_cotangent_path.py``). The guard therefore fires only when
+    that path is UNAVAILABLE — today the single way to get there is switching
+    it off with ``PRISMAQUANT_KV_COTANGENT=0``, which restores the severed
+    cotangent and its k/v_proj under-count. ``PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1``
+    still overrides, for anyone deliberately reproducing a pre-fix probe.
     """
     kv = config_num_kv_shared_layers(model_path)
-    if kv > 0 and os.environ.get("PRISMAQUANT_ALLOW_KV_SHARED_FISHER", "0") == "0":
-        return (
-            f"[incremental] model has num_kv_shared_layers={kv}: the streaming "
-            "Fisher probe under-counts the storing layer's k_proj/v_proj "
-            "h_trace (shared-consumer cotangent severed by the phase-3 K/V "
-            "detach; review finding MINOR-M33). Set "
-            "PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1 to probe anyway, accepting "
-            "the k/v_proj under-count, until the KV-cotangent path lands."
-        )
-    return None
+    if kv <= 0 or kv_cotangent_path_enabled():
+        return None
+    if os.environ.get("PRISMAQUANT_ALLOW_KV_SHARED_FISHER", "0") != "0":
+        return None
+    return (
+        f"[incremental] model has num_kv_shared_layers={kv} and "
+        "PRISMAQUANT_KV_COTANGENT=0 disables the KV-cotangent path: the "
+        "streaming Fisher probe would under-count the storing layer's "
+        "k_proj/v_proj h_trace (shared-consumer cotangent severed by the "
+        "phase-3 K/V detach; review finding MINOR-M33). Unset "
+        "PRISMAQUANT_KV_COTANGENT to probe correctly, or set "
+        "PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1 to probe anyway, accepting the "
+        "k/v_proj under-count."
+    )
 
 
 # Streaming infrastructure — `StreamingContext`, `_build_streaming_context`,
@@ -1232,12 +1261,34 @@ def _compute_global_precompute(
 
     for d in range(prefetch_depth):
         ctx.schedule_prefetch(d)
-    # v22 Fix E1: keep activations on device through phase-1 to avoid
-    # the per-layer .cpu() sync that stalls the forward pipeline. We
-    # batch the device→host transfer at the END of phase-1 in a single
-    # call. The pickled precompute cache (and downstream phase-3) want
-    # CPU tensors, which we produce after the loop.
-    device_acts: list[torch.Tensor] = [hidden.detach()]
+    # Phase-1 activation capture. Default: stream each layer's activation
+    # to host inside the loop — stacking all L+1 activations
+    # device-resident and doing one batched .cpu() at the end (v22 Fix
+    # E1) doubles the peak device memory of the activation working set at
+    # the exact phase-1/2 transition where the probe's high-water mark
+    # already sits, which DSv4's multi-stream hidden (hc_mult x wider)
+    # can't afford. Honest accounting: the memory saving is real; the
+    # relative *transfer-time* cost of per-layer vs batched copies is
+    # unmeasured — PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER=1 restores the
+    # v22 batched single-transfer behavior for an A/B. Read once per
+    # probe run (per-layer probe path, not a per-token hot path); both
+    # variants report their true copy time as `host transfer` below.
+    batched_act_transfer = os.environ.get(
+        "PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER", ""
+    ).lower() in {"1", "true", "yes"}
+    t_h2h_total = 0.0
+    acts: list[torch.Tensor] = []
+
+    def _capture_act(t: torch.Tensor) -> None:
+        nonlocal t_h2h_total
+        if batched_act_transfer:
+            acts.append(t.detach())
+            return
+        t0 = time.time()
+        acts.append(t.detach().to("cpu"))
+        t_h2h_total += time.time() - t0
+
+    _capture_act(hidden)
     for L in range(num_layers):
         load_t0 = time.time()
         src = ctx.install(L)
@@ -1254,11 +1305,11 @@ def _compute_global_precompute(
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 **_profile.extra_layer_kwargs(input_ids=ids),
-                **pass_state,
+                pass_state=pass_state,
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
-        device_acts.append(hidden.detach())
+        _capture_act(hidden)
         ctx.unload(L)
         if L % 8 == 0 or L == num_layers - 1:
             print(f"[incremental/global] fwd L{L:02d}  src={src}  "
@@ -1269,20 +1320,23 @@ def _compute_global_precompute(
     # phase-3's isolated forwards can reconstruct it.
     shared_pass_state = _profile.capture_forward_pass_state(pass_state)
 
-    # v22 Fix E1: batched device→host transfer for the activations
-    # captured during phase-1. All have the same (B, T, H) shape so we
-    # stack into one (L+1, B, T, H) tensor and do a single .cpu() —
-    # 62 individual transfers collapsed into one. After the copy lands,
-    # we split back into a list of CPU tensors so the rest of the code
-    # (precompute cache pickle, phase-3 reads) sees the original layout.
-    t_h2h = time.time()
-    stacked = torch.stack(device_acts, dim=0).cpu()
-    activations_cpu: list[torch.Tensor] = [
-        stacked[i].clone() for i in range(stacked.size(0))
-    ]
-    del device_acts, stacked
+    if batched_act_transfer:
+        # v22 Fix E1: all captures share one (B, T, ..., H) shape — stack
+        # into a single (L+1, ...) tensor, one device→host copy, then
+        # split back into the list layout the precompute pickle and
+        # phase-3 expect.
+        t0 = time.time()
+        stacked = torch.stack(acts, dim=0).cpu()
+        activations_cpu: list[torch.Tensor] = [
+            stacked[i].clone() for i in range(stacked.size(0))
+        ]
+        del stacked
+        t_h2h_total = time.time() - t0
+    else:
+        activations_cpu = acts
+    acts = []
     print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
-          f"(host transfer {time.time()-t_h2h:.1f}s)  "
+          f"(host transfer {t_h2h_total:.1f}s)  "
           f"{ctx.layer_cache.summary()}", flush=True)
 
     phase1_router_counts = {}
@@ -1511,6 +1565,14 @@ def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
         "router_totals": pre.router_totals,
         "router_active_counts": pre.router_active_counts,
         "expert_route_stats": pre.expert_route_stats,
+        # Per-pass cross-layer shared state captured at the end of phase-1
+        # (Gemma4 `shared_kv_states`). MUST be persisted: phase-3's isolated
+        # forwards rebuild each KV-sharing layer's borrowed K/V from it, and
+        # the shard runners routinely read the precompute back from this
+        # cache (resume, or one shard process per body shard). Without it a
+        # resumed run hands KV-sharing layers an empty dict and the layer
+        # raises `KeyError: <source layer idx>` inside attention.
+        "shared_pass_state": pre.shared_pass_state,
         "meta": meta,
     }, str(path))
 
@@ -1547,7 +1609,20 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
         router_totals={},
         router_active_counts={},
         expert_route_stats={},
+        # Restore the phase-1 cross-layer shared state (Gemma4
+        # `shared_kv_states`); `None` for every architecture that declares no
+        # per-pass shared kwargs, and for caches written before this key
+        # existed — on a KV-sharing model those hit the profile's loud
+        # "delete the precompute cache" error instead of a bare KeyError.
+        shared_pass_state=data.get("shared_pass_state"),
     )
+
+
+# `finalize_fisher_stats` lives in sensitivity_probe (next to
+# h_detail_blob, so both probe backends and every h-detail writer share
+# the single global-token normalization convention); it is re-exported
+# here because this module is the production backend consumers import
+# it from.
 
 
 # ---------------------------------------------------------------------------
@@ -1654,6 +1729,11 @@ def _run_body_streaming_shard(
           f"across {sum(1 for x in layer_linear_names if x)} layers "
           f"+ {len(resident_linears)} resident Linears "
           f"(include={linear_include!r})", flush=True)
+
+    # One shared Fisher denominator for every row AND every h-detail blob
+    # — the global calib token count (see finalize_fisher_stats for why
+    # per-row n_tokens_seen is wrong for routed-expert Linears).
+    global_tokens = max(int(calib.size(0)) * int(seqlen), 1)
 
     top_k = read_top_k(model, default=2)
 
@@ -1852,6 +1932,16 @@ def _run_body_streaming_shard(
                                  // max(1, ctx.estimated_layer_bytes)))
         prefetch_depth = max(2, min(
             prefetch_depth, cache_slots - len(in_scope_layers) - 4))
+        # KV-cotangent path: a fresh accumulator per SWEEP. A consumer of
+        # shared state always sits above its producer, so the reverse walk
+        # collects every consumer's cotangent before a producer at or above
+        # stop_L is forwarded — no cross-shard or cross-sweep state. A
+        # producer BELOW stop_L is untracked in this shard (its h_trace is
+        # measured by the shard that tracks it, whose stop_L sits at or
+        # below it); its never-delivered cotangents are discarded at sweep
+        # end and surface in the pending_keys diagnostic.
+        kv_cotangents = SharedStateCotangents(
+            enabled=kv_cotangent_path_enabled())
         # Reverse-prefetch (Task #5): prefetcher should now look BACKWARD
         # in layer index since reverse sweep walks num_layers-1 → stop_L.
         # Schedule lookahead in the direction we're actually going.
@@ -2299,10 +2389,32 @@ def _run_body_streaming_shard(
                     input_ids=calib.to(device) if calib is not None else None),
                 # KV-sharing layers (Gemma4) reuse K/V captured in phase-1;
                 # reconstruct that per-layer slice for this isolated forward.
-                **_shard_profile.isolated_layer_pass_state(
-                    precomputed.shared_pass_state, layers[L]),
+                # One-layer scope, so the "once per pass" rule is trivially
+                # satisfied: a fresh container per isolated forward.
+                # `graft` swaps the borrowed tensors for grad-enabled leaves so
+                # this layer's cotangent on them can be read back below; it
+                # returns the caller's own object untouched when the profile
+                # declares no shared state.
+                pass_state=kv_cotangents.graft(
+                    _shard_profile.isolated_layer_pass_state(
+                        precomputed.shared_pass_state, layers[L])),
             )
-            out.backward(grad_out.to(device))
+            # Drive the backward with this layer's output cotangent AND the
+            # cotangent its consumers accumulated on the shared state it
+            # produced (empty for every architecture without cross-layer
+            # sharing — then this is exactly `out.backward(grad_out)`). One
+            # backward call, so autograd sums both contributions at the shared
+            # tensor before its grad_fn runs and each Linear's full-backward
+            # hook still fires ONCE, with the total gy.
+            kv_roots, kv_grads = kv_cotangents.produced_roots()
+            if kv_roots:
+                torch.autograd.backward([out, *kv_roots],
+                                        [grad_out.to(device), *kv_grads])
+            else:
+                out.backward(grad_out.to(device))
+            # Fold this layer's borrowed-state gradients into the accumulator
+            # (and end the layer) while the graph is still alive.
+            kv_cotangents.harvest()
             bwd_s = time.time() - bwd_t0
             phase_bwd_s += bwd_s
 
@@ -2459,13 +2571,15 @@ def _run_body_streaming_shard(
                     full_key = f"{layer_prefix}{local_key}"
                     fname = re.sub(r"[^A-Za-z0-9_-]", "__", full_key) + ".pt"
                     # Per-token units + explicit marker (audit M9): the
-                    # accumulator is token-summed; normalize by this
-                    # layer's token count so the blob matches the
-                    # sensitivity-probe writer's units.
-                    entry = acc_stats.get(full_key, {})
+                    # accumulator is token-summed; normalize by the
+                    # GLOBAL calib token count — the same denominator the
+                    # scalar h_trace gets in finalize_fisher_stats.
+                    # (Packed-3D rows count the full batch in
+                    # n_tokens_seen, so this is numerically identical to
+                    # the previous per-row count; global is used for
+                    # uniformity with the per-expert-Linear writers.)
                     torch.save(
-                        h_detail_blob(tensor,
-                                      int(entry.get("n_tokens_seen", 0)),
+                        h_detail_blob(tensor, global_tokens,
                                       full_key, kind="packed"),
                         detail_dir / fname)
                 packed_full_acc.clear()
@@ -2510,6 +2624,12 @@ def _run_body_streaming_shard(
               f"load_by_src=[{load_parts}]  "
               f"{ctx.layer_cache.summary()}  {ctx.prefetch_summary()}",
               flush=True)
+        # Report the KV-cotangent path only when it did something, plus any
+        # cotangent no producer claimed (which would mean a residual
+        # under-count on that producer's k/v_proj — worth seeing, never
+        # silently swallowed).
+        if kv_cotangents.n_grafted or kv_cotangents.pending_keys():
+            print(f"[incremental] {kv_cotangents.summary()}", flush=True)
         _print_mem_snapshot("phase-3 done")
 
         # `activations_cpu` is a shared reference into the global
@@ -2518,16 +2638,10 @@ def _run_body_streaming_shard(
         del grad_at_tail, grad_out
 
     # ---- Finalize ----
-    for s in merged_stats.values():
-        tokens = max(s.get("n_tokens_seen", 1), 1)
-        s["h_trace"] = s.get("h_trace_raw", 0.0) / tokens
-        s["h_w2_sum"] = s.get("h_w2_sum_raw", 0.0) / tokens
-        # Per-expert Fisher trace (only present on packed-3D stat entries;
-        # dense Linears have no per-expert dimension). Normalize by the
-        # same token count so it shares units with `h_trace`.
-        per = s.get("h_trace_per_expert_raw")
-        if per is not None:
-            s["h_trace_per_expert"] = [float(v) / tokens for v in per]
+    # One shared denominator for every row — the global calib token count
+    # (hoisted above; see finalize_fisher_stats for why per-row
+    # n_tokens_seen is wrong for routed-expert Linears).
+    finalize_fisher_stats(merged_stats, global_tokens)
 
     detail_dir = Path(h_detail_dir) if h_detail_dir else None
     if detail_dir is not None:
@@ -2543,12 +2657,15 @@ def _run_body_streaming_shard(
             # used to save the raw token-summed accumulator under "H",
             # leaving HDetailIndex consumers ~n_tokens× hotter than
             # blobs from sensitivity_probe. h_detail_blob normalizes by
-            # the tokens this Linear actually saw and stamps
-            # units="per_token"; g2_per_token stays raw (it is already
-            # a per-token vector).
-            tokens = int(merged_stats.get(fqn, {}).get("n_tokens_seen", 0))
+            # the GLOBAL calib token count — the same denominator the
+            # scalar h_trace gets in finalize_fisher_stats above, so
+            # predicted_dloss fallback rows built from these blobs stay
+            # on the scalar's scale (per-expert nn.Linear rows only see
+            # their ROUTED tokens; dividing by that per-row count left
+            # the detail (global/routed)× hotter than the scalar).
+            # g2_per_token stays raw (it is already a per-token vector).
             torch.save(
-                h_detail_blob(h, tokens, fqn, kind="linear",
+                h_detail_blob(h, global_tokens, fqn, kind="linear",
                               g2_per_token=g2_per_token),
                 detail_dir / fname,
             )
@@ -2632,6 +2749,9 @@ def _run_body_streaming_shard(
                 "activation_rows_limit": int(activation_rows_limit),
                 "linear_include": linear_include,
                 "linear_exclude": linear_exclude,
+                # Marker: h_trace/h_w2_sum/h_trace_per_expert are divided by
+                # the GLOBAL calib token count (not per-row n_tokens_seen).
+                "fisher_norm_tokens": global_tokens,
             },
         }, f)
     print(f"[incremental] wrote {out_path}", flush=True)
@@ -2839,7 +2959,11 @@ def _run_mtp_streaming_shard(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    acc.finalize(tracker=None)
+    # Global calib token count, matching the meta nsamples×seqlen product
+    # below (the MTP shift trims 2 tokens/sample — a uniform constant, and
+    # keeping the meta product keeps the allocator renorm idempotent).
+    fisher_norm_tokens = max(int(calib.size(0)) * int(seqlen), 1)
+    acc.finalize(tracker=None, global_tokens=fisher_norm_tokens)
     acc.remove_hooks()
 
     renamed = dict(acc.stats)
@@ -2859,6 +2983,7 @@ def _run_mtp_streaming_shard(
                 "dataset": dataset_name,
                 "nsamples": int(calib.size(0)),
                 "seqlen": seqlen,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": dtype_name,
                 "device_map": "streaming-layerwise",
                 "execution_device": str(device),
@@ -3010,12 +3135,12 @@ def main():
                     help="Max text tokens per multimodal calibration sample.")
     args = ap.parse_args()
 
-    # MINOR-M33: on KV-sharing models the streaming Fisher probe under-counts
-    # the storing layer's k_proj/v_proj h_trace — the phase-3 K/V detach severs
-    # the Fisher cotangent from consumer layers that reuse its K/V. Fail loud
-    # rather than ship a silently-biased allocation (Principle 1: measurement
-    # gap, not a band-aid). No shipped model triggers this (Gemma4-31B-IT and
-    # the Gemma4TextConfig default are num_kv_shared_layers=0).
+    # MINOR-M33 (closed): KV-sharing models are probed normally now — the
+    # reverse sweep seeds each producing layer's backward with the cotangent its
+    # consumers accumulated on the borrowed K/V, so k_proj/v_proj h_trace is the
+    # same quantity an end-to-end backward measures. The measurement gap was
+    # closed rather than papered over (Principle 1). This guard only still
+    # fires when PRISMAQUANT_KV_COTANGENT=0 takes that path away.
     _kv_block = kv_shared_fisher_block_reason(args.model)
     if _kv_block:
         raise SystemExit(_kv_block)
@@ -3253,37 +3378,11 @@ def main():
             precomputed = cached
             return precomputed
         _ensure_ready()
-        # Tied-embedding repair: when `tie_word_embeddings=True` (Qwen
-        # 3.5/3.6 small variants, Llama-3.2-1B/3B, etc.), the streaming
-        # pipeline materializes embed_tokens but leaves lm_head on meta
-        # because the source has no separate lm_head shard. Manually
-        # alias lm_head.weight to the materialized embedding before
-        # the precompute, otherwise model.lm_head(...) returns a meta
-        # tensor and `.item()` fails.
-        try:
-            _model = ctx.model
-            _cfg = getattr(_model, "config", None)
-            if _cfg is not None and getattr(_cfg, "tie_word_embeddings", False):
-                _embed = None
-                for _path in ("model.embed_tokens",
-                              "model.language_model.embed_tokens",
-                              "transformer.wte"):
-                    try:
-                        _m = _model.get_submodule(_path)
-                        if hasattr(_m, "weight") and not _m.weight.is_meta:
-                            _embed = _m
-                            break
-                    except (AttributeError, KeyError):
-                        continue
-                if _embed is not None and hasattr(_model, "lm_head"):
-                    if _model.lm_head.weight.is_meta:
-                        _model.lm_head.weight = _embed.weight
-                        print(f"[incremental] tied lm_head.weight ← "
-                              f"embed_tokens.weight (meta repair)", flush=True)
-        except Exception as _e:
-            print(f"[incremental] WARN tied-embedding repair: {_e}",
-                  flush=True)
-
+        # (Tied-embedding repair used to live here, with a hardcoded list
+        # of embedding paths and a swallowed exception. It now happens
+        # once, for every consumer of a streaming context, inside
+        # `_build_streaming_context` via
+        # `tied_embeddings.resolve_tied_output_embedding`.)
         precomputed = _compute_global_precompute(
             ctx,
             calib=calib,

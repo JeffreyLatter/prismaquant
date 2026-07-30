@@ -58,13 +58,16 @@ from .measure_quant_cost import (
     ActivationIndex,
     HDetailIndex,
     _accumulate_result,
+    _expert_cost_sample_split,
+    _extrapolate_expert_costs,
     _finalize_results,
     _measure_packed_experts,
     _normalize_fisher_output_mse_row_weights,
-    canonical_linear_name,
+    h_detail_expected_norm_tokens,
     measure_batched_gpu,
     measure_unbatched,
     prepare_cost_context,
+    resolve_cost_target_name,
     start_mem_watchdog,
 )
 from .streaming_model import (
@@ -278,7 +281,19 @@ def _measure_production_render_dense(
     render_gate_meta: dict[tuple[str, str], dict[str, object]] = {}
     processed = 0
     tstart = time.time()
-    n_total = len(target_names)
+    # Stratified per-expert subsample (PRISMAQUANT_EXPERT_COST_SAMPLE) —
+    # the same lever measure_unbatched / measure_batched_gpu apply. Under
+    # the default COST_MODE=production-render-score this is the path
+    # DSv4's per-expert Linears (256 experts x 3 projections x 43 layers)
+    # actually take, so without wiring it here the lever silently does
+    # nothing. Skipped experts get their group's sampled mean after
+    # finalize; export still quantizes every expert exactly.
+    measure_names, expert_extrapolate = _expert_cost_sample_split(target_names)
+    n_total = len(measure_names)
+    if expert_extrapolate:
+        print(f"{log_prefix} production-render expert sample: "
+              f"{n_total} measured, {len(expert_extrapolate)} extrapolated",
+              flush=True)
     levers: dict[str, object] = {
         "gptq": True,
         "joint_scale_opt": True,
@@ -291,8 +306,8 @@ def _measure_production_render_dense(
     }
 
     for name, mod in module.named_modules():
-        canonical_name = canonical_linear_name(name, profile)
-        if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
+        canonical_name = resolve_cost_target_name(name, target_names, profile)
+        if not isinstance(mod, nn.Linear) or canonical_name not in measure_names:
             continue
         if canonical_name not in act_cache:
             continue
@@ -401,6 +416,9 @@ def _measure_production_render_dense(
                   f"eta={eta:.0f}s", flush=True)
 
     out = _finalize_results(accum)
+    # Fill skipped experts before the render_path stamp so extrapolated
+    # rows carry the same provenance as their sampled sources.
+    _extrapolate_expert_costs(out, expert_extrapolate)
     for per_name in out.values():
         for entry in per_name.values():
             if isinstance(entry, dict):
@@ -1022,7 +1040,7 @@ def main():
     # regions such as MTP and visual tower rows. Incremental runs can
     # deliberately exclude those regions, so scope missing-activation
     # validation to the actual shard schedule below.
-    _, stats, act_cache, _, missing_act_all, _, specs = prepare_cost_context(
+    probe, stats, act_cache, _, missing_act_all, _, specs = prepare_cost_context(
         probe_path=args.probe,
         activation_cache_dir=args.activation_cache_dir,
         formats_csv=args.formats,
@@ -1052,7 +1070,13 @@ def main():
     if args.h_detail_dir:
         detail_path = Path(args.h_detail_dir)
         if detail_path.exists():
-            h_detail = HDetailIndex(detail_path, set(stats.keys()))
+            # Gated on the probe's per-row Fisher denominators: a stale
+            # h-detail dir (v3 blobs = per-ROUTED-token on expert rows, or
+            # a dir from a different calibration size) is refused here
+            # rather than silently mis-scaling predicted_dloss.
+            h_detail = HDetailIndex(
+                detail_path, set(stats.keys()),
+                expected_norm_tokens=h_detail_expected_norm_tokens(probe))
             print(f"[incremental-cost] h-detail cache: {len(h_detail)} Linears "
                   "→ per-weight Δloss + Fisher row-weighted output MSE",
                   flush=True)

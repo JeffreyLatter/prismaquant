@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import format_registry as fr
-from .allocator_solver import Candidate, _shape_from_stats, predicted_dloss
+from .allocator_solver import (
+    Candidate,
+    PackedExpertRoleUnknown,
+    _shape_from_stats,
+    predicted_dloss,
+)
 from .serving_profiles import (
     check_serving_format,
     check_serving_shape,
@@ -224,19 +230,83 @@ def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
     return True
 
 
+def cost_entry_is_bit_exact(
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this entry proves a LOSSLESS re-encode end to end: measured
+    ``weight_mse`` of exactly 0.0 AND a format whose activation path is the
+    identity.
+
+    ``weight_mse`` is a mean of squared per-element deltas: it is exactly
+    zero only when the format stores the source weights verbatim (W' == W)
+    — e.g. MXFP8 over an FP8 128-block source, or MXFP4/MXFP6/MXFP8 over
+    an MXFP4-packed QAT source. But W' == W only silences the WEIGHT side.
+    For W·A· formats (``FormatSpec.act_quant_changes_input`` — NVFP4,
+    FP8 dynamic, the MX family, GGUF Q8_1 compute) the cost pipeline
+    applies ``activation_quantize_dequantize(X)`` before measuring
+    ``output_mse`` (measure_quant_cost), so a weight-lossless entry's
+    output_mse is REAL A-side error, not noise — on an MXFP4-packed
+    source, an MXFP4 re-encode priced from weight_mse alone would cost
+    dloss 0.0, the unbeatable global minimum at any budget, while its
+    served activations are still 4-bit. The short-circuit therefore
+    requires the format's activation quantization to be the identity — a
+    dtype-level fact (``FormatSpec.act_quant_changes_input``, i.e. ``act_bits``
+    absent or >= 16: BF16, FP8_SOURCE, NVFP4A16, MXFP8A16, INT-W·A16), not a
+    heuristic. Formats we cannot identify
+    (``format_name`` None or unregistered) never short-circuit.
+
+    For qualifying passthrough-activation formats, measured zero is a
+    valid, indeed optimal, cost (see ``_log_error_values`` in
+    allocator.py): the entry short-circuits to predicted dloss 0.0 ahead
+    of any noisy output_mse measurement.
+
+    Entries that declare an explicit ``cost_source`` (e.g. the
+    production-render score pipeline) carry their own authoritative
+    pricing and default ``weight_mse`` to 0.0 as a placeholder, not a
+    measurement — they are never treated as bit-exact, matching the
+    precedence ``cost_entry_source`` already gives the explicit source.
+    """
+    explicit = cost_entry.get("cost_source")
+    if isinstance(explicit, str) and explicit:
+        return False
+    if format_name is None:
+        return False
+    try:
+        spec = fr.get_format(str(format_name))
+    except KeyError:
+        return False
+    if spec.act_quant_changes_input:
+        return False
+    weight_mse = cost_entry.get("weight_mse")
+    try:
+        return weight_mse is not None and float(weight_mse) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def cost_entry_uses_measured_output_mse(
     stats_entry: dict,
     cost_entry: dict,
+    format_name: str | None = None,
 ) -> bool:
     """Whether ``cost_entry_predicted_dloss`` will read ``output_mse``."""
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        return False
     return _has_measured_output_mse(stats_entry, cost_entry)
 
 
-def cost_entry_source(stats_entry: dict, cost_entry: dict) -> str:
+def cost_entry_source(
+    stats_entry: dict,
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> str:
     """Return the named cost source the allocator will use for one row."""
     explicit = cost_entry.get("cost_source")
     if isinstance(explicit, str) and explicit:
         return explicit
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        return "bit_exact"
     if _has_measured_output_mse(stats_entry, cost_entry):
         if (
             _fisher_output_mse_allocator_enabled()
@@ -261,8 +331,14 @@ def cost_entry_predicted_dloss(
     cost_entry: dict,
     *,
     gain: float = 1.0,
+    format_name: str | None = None,
 ) -> float:
     """Return the allocator's authoritative Δloss for one cost entry."""
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        # Lossless re-encode END TO END (weights verbatim AND identity
+        # activation path): zero cost by construction, regardless of any
+        # noisy output_mse measurement (see cost_entry_is_bit_exact).
+        return 0.0
     if _has_measured_output_mse(stats_entry, cost_entry):
         if (
             _fisher_output_mse_allocator_enabled()
@@ -299,12 +375,141 @@ def cost_entry_predicted_dloss(
     )
 
 
+ACTIVATION_COST_UNMEASURED_REASON = "activation_cost_unmeasured"
+
+
+def cost_entry_prices_unmeasured_activation_at_zero(
+    stats_entry: dict,
+    cost_entry: dict,
+    priced_dloss: float,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this row prices a W-and-A format's UNKNOWN cost at the global
+    optimum (Δloss exactly 0.0).
+
+    ``cost_entry_is_bit_exact`` closed this for the ``output_mse`` branch: a
+    weight-lossless entry on an activation-quantizing format keeps its measured
+    A-side output_mse instead of short-circuiting to 0.0. But that branch is
+    only taken when output_mse is a real measurement. Packed-expert rows whose
+    routed forward could not be reconstructed (``can_measure_output`` false),
+    and EVERY row in a run with ``PRISMAQUANT_EXPERT_COST_SAMPLE`` set, are
+    written with ``output_mse_measured=False`` (measure_quant_cost), so pricing
+    falls through to ``predicted_dloss``/``weight_mse`` — both of which are
+    exactly 0.0 for a weight-lossless re-encode (the source is already in that
+    format: MXFP4 over an MXFP4-packed source, NVFP4 over an NVFP4-CB source).
+    Nothing in that row ever looked at the activation path, yet the DP reads a
+    cost of 0.0: the unbeatable global minimum at any budget, for an assignment
+    whose served activations are 4-bit.
+
+    This is not a mis-estimate to be corrected — a positive weight-side
+    surrogate is the accepted L1 design, biased but tradeable — it is a cost the
+    optimizer CANNOT trade off: zero is the argmin, so the format is selected at
+    every target, unconditionally. The unknown must therefore be excluded from
+    the menu (``build_candidates``, counted and logged like any other
+    inapplicable format) rather than priced.
+
+    The predicate is exact, not thresholded:
+
+      * the format's activation path is provably non-identity
+        (``FormatSpec.act_quant_changes_input`` — a dtype-level fact);
+      * no measured output-side evidence exists for this row
+        (``_has_measured_output_mse``), so the A-side error is unknown
+        whatever produced the number;
+      * the resulting price is exactly 0.0 — the DP's global optimum;
+      * the row's measured sensitivity is POSITIVE. ``h_trace == 0`` prices
+        every format at 0.0 including the passthrough ones, which is a measured
+        statement that no perturbation of this Linear's output moves the loss —
+        W-side or A-side, since the same Fisher expansion multiplies both. A
+        zero-token expert at thin calibration is exactly that row, and it must
+        stay free to take the cheapest format instead of being forced onto
+        BF16.
+    """
+    if format_name is None:
+        return False
+    try:
+        spec = fr.get_format(str(format_name))
+    except KeyError:
+        return False
+    if not spec.act_quant_changes_input:
+        return False
+    if _has_measured_output_mse(stats_entry, cost_entry):
+        return False
+    try:
+        if float(priced_dloss) != 0.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        h_trace = float(stats_entry.get("h_trace", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return h_trace > 0.0
+
+
 def _cost_ucb_z() -> float:
     """PRISMAQUANT_COST_UCB_Z: stderr multiples added to predicted_dloss."""
     try:
         return max(0.0, float(os.environ.get("PRISMAQUANT_COST_UCB_Z", "0")))
     except Exception:
         return 0.0
+
+
+def _resolve_cost_entry(cost_rows: dict, fmt_name: str) -> tuple[dict | None, str]:
+    """Resolve one Linear's cost row for ``fmt_name``, alias-aware.
+
+    Returns ``(entry, entry_fmt)`` where ``entry_fmt`` is the alias actually
+    present in the cost table (what ``calibrated_gains`` may be keyed by), or
+    ``(None, fmt_name)`` when the format was never measured.
+    """
+    for candidate_name in fr.aliases_for(fmt_name):
+        if candidate_name in cost_rows:
+            return cost_rows[candidate_name], candidate_name
+    return None, fmt_name
+
+
+def _super_item_ucb_hedge(member_terms, ucb_z: float) -> tuple[float, float]:
+    """Convert a super item's per-member UCB hedge into the independence one.
+
+    A super item (fused-sibling group, packed serving group) prices one
+    format as the SUM of its members' ``cost_entry_predicted_dloss``. With
+    ``PRISMAQUANT_COST_UCB_Z > 0`` every member term already carries its own
+    ``z·stderr·gain``, so the sum carries a LINEAR ``z·Σ(stderr·gain)``
+    hedge — up to a √N OVER-hedge on an N-member group. The member dloss
+    estimates are independent measurements, so the stderr of the group SUM is
+    ``sqrt(Σ (stderr·gain)²)``.
+
+    ``member_terms`` yields ``(stats_entry, cost_entry, member_dloss, gain)``.
+    Returns ``(hedge_linear, stderr_agg)``: subtract ``hedge_linear`` from the
+    member sum and add ``ucb_z * stderr_agg`` to get the independence
+    aggregate. At ``ucb_z == 0`` ``hedge_linear`` is exactly 0.0, so the
+    conversion is a bit-for-bit identity on the sum.
+
+    Both aggregation paths call this so the two constructions cannot drift.
+    """
+    stderr_eff_sq = 0.0
+    hedge_linear = 0.0
+    for stats_entry, cost_entry, member_dloss, gain in member_terms:
+        if float(member_dloss) <= 0.0:
+            # Bit-exact re-encode / clamped-at-zero member: contributed no
+            # dloss (and no hedge) to the sum; skip it symmetrically.
+            continue
+        if cost_entry is None or "error" in cost_entry:
+            continue
+        # Mirror cost_entry_predicted_dloss: the stderr hedge is only applied
+        # on the explicit predicted_dloss branch.
+        if _has_measured_output_mse(stats_entry, cost_entry):
+            continue
+        if "predicted_dloss" not in cost_entry:
+            continue
+        try:
+            stderr = float(cost_entry.get("predicted_dloss_stderr", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            stderr = 0.0
+        if stderr <= 0.0:
+            continue
+        stderr_eff_sq += (stderr * float(gain)) ** 2
+        hedge_linear += ucb_z * stderr * float(gain)
+    return hedge_linear, math.sqrt(stderr_eff_sq)
 
 
 def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
@@ -323,6 +528,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
     out: dict[str, list[Candidate]] = {}
     masked: dict[tuple[str, str], list[str]] = {}
     source_counts: Counter[str] = Counter()
+    unpriceable: dict[str, list[str]] = {}
     for name, s in stats.items():
         if name not in costs:
             continue
@@ -373,13 +579,54 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             # Packed experts can carry an unmeasured output_mse placeholder;
             # cost_entry_predicted_dloss falls back to predicted_dloss or
             # weight_mse for those entries.
-            predicted = cost_entry_predicted_dloss(s, entry, gain=gain)
-            source_counts[cost_entry_source(s, entry)] += 1
+            predicted = cost_entry_predicted_dloss(
+                s, entry, gain=gain, format_name=spec.name)
+            priced = max(predicted, 0.0)
+            if cost_entry_prices_unmeasured_activation_at_zero(
+                    s, entry, priced, spec.name):
+                # The A-side cost of this W-and-A format was never measured for
+                # this row, and the W side is lossless, so the only price the
+                # cost table can offer is 0.0 — the DP's global optimum. An
+                # unknown priced at the optimum is always selected: exclude the
+                # candidate (counted + logged, exactly like an inapplicable
+                # format) instead of letting the optimizer read a cost that no
+                # measurement supports. See
+                # cost_entry_prices_unmeasured_activation_at_zero.
+                h_trace = float(s.get("h_trace", 0.0) or 0.0)
+                detail = (
+                    f"{spec.name} quantizes activations (act_bits="
+                    f"{spec.act_bits}) but this row has no measured "
+                    "output_mse, and its weight-side error is exactly 0.0 "
+                    "(lossless re-encode of an already-"
+                    f"{spec.name}-shaped source), so the only available "
+                    f"price is dloss 0.0 with h_trace={h_trace:.6g} > 0: an "
+                    "unmeasured activation cost at the DP's global minimum "
+                    f"(cost_source="
+                    f"{cost_entry_source(s, entry, spec.name)})"
+                )
+                if mask_records is not None:
+                    mask_records.append({
+                        "qname": name,
+                        "format": spec.name,
+                        "reason": ACTIVATION_COST_UNMEASURED_REASON,
+                        "detail": detail,
+                        "shape": [out_features, in_features],
+                        "out_features": out_features,
+                        "in_features": in_features,
+                        "source_kind": source_kind,
+                    })
+                masked.setdefault(
+                    (spec.name, ACTIVATION_COST_UNMEASURED_REASON),
+                    [],
+                ).append(name)
+                unpriceable.setdefault(name, []).append(spec.name)
+                continue
+            source_counts[cost_entry_source(s, entry, spec.name)] += 1
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=spec.effective_bits_for_shape(shape),
                 memory_bytes=spec.memory_bytes_for_shape(shape),
-                predicted_dloss=max(predicted, 0.0),
+                predicted_dloss=priced,
             ))
         if cands:
             out[name] = cands
@@ -395,6 +642,35 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             f"{source}={count}" for source, count in sorted(source_counts.items())
         )
         print(f"[alloc] cost-source usage: {summary}", flush=True)
+    starved = sorted(n for n in unpriceable if n not in out)
+    if starved:
+        # Excluding the unmeasured-activation candidates left these Linears
+        # with NO candidate at all. Dropping them is worse than the bug we just
+        # fixed: a name absent from `out` never reaches the DP, so its bits and
+        # bytes vanish from the bpp/footprint accounting and from serving-unit
+        # membership — silently, with the export still emitting the tensor.
+        # The allocator cannot price these rows, so it must not pretend to.
+        detail = "\n".join(
+            f"    {n}: unpriceable={sorted(unpriceable[n])} (other cost rows: "
+            f"{sorted(set(costs.get(n, {})) - set(unpriceable[n]))})"
+            for n in starved[:8]
+        )
+        raise AssertionError(
+            f"{len(starved)} Linear(s) have no priceable format left after "
+            "excluding activation-quantizing formats whose activation-side "
+            "cost was never measured and whose weight-side error is exactly "
+            f"0.0:\n{detail}\n"
+            "Every legal format for these rows would have been priced at "
+            "dloss 0.0 (the DP's global minimum) on no activation-path "
+            "evidence, and omitting the rows would silently shrink the "
+            "allocator's bit/disk accounting and serving-unit membership. "
+            "Close the measurement gap instead: unset "
+            "PRISMAQUANT_EXPERT_COST_SAMPLE (and make the expert activation "
+            "cache available) so measure_quant_cost records output_mse with "
+            "activation_quantize_dequantize applied, or include a rung whose "
+            "activation path is the identity (BF16, FP8_SOURCE, NVFP4A16, "
+            "MXFP8A16) in the format menu."
+        )
     return out
 
 
@@ -469,15 +745,30 @@ def aggregate_fused_siblings(
     profile,
     calibrated_gains: dict[str, float] | None = None,
 ) -> tuple[dict, dict, dict]:
-    """Aggregate fused siblings into single DP items."""
+    """Aggregate fused siblings into single DP items.
+
+    A group whose members share NO legal format is a HARD ERROR, not a
+    fallback to individual rows. Fused siblings (q/k/v, gate/up) must load
+    under ONE format — that is a serving invariant, not a preference — so
+    members with disjoint menus cannot be coherently promoted at all: whatever
+    format whole-group promotion lands on is illegal for at least one member,
+    and ``compute_achieved`` now refuses to price that state (AssertionError,
+    at every target) rather than scoring the unpriced member at zero Δloss.
+    Individual rows would therefore only defer the same failure past the solve,
+    while a silently missing ``candidates_ext`` entry (the pre-fix behavior:
+    ``stats_ext``/``costs_ext`` assigned, ``candidates_ext`` not) drops the
+    whole group from the DP with no error at all. The same argument is written
+    out at length in ``aggregate_packed_serving_groups``.
+    """
     if profile is None:
         return stats, costs, candidates
 
     gains = calibrated_gains or {}
+    ucb_z = _cost_ucb_z()
     grouped: dict[str, list[str]] = {}
     ungrouped: list[str] = []
     for name in candidates:
-        if ".__fused__." in name:
+        if _FUSED_SIBLING_MARKER in name or _PACKED_GROUP_MARKER in name:
             ungrouped.append(name)
             continue
         try:
@@ -530,13 +821,8 @@ def aggregate_fused_siblings(
             resolved_entries: list[tuple[str, dict]] = []
             missing = []
             for m in members:
-                entry = None
-                entry_fmt = spec.name
-                for candidate_name in fr.aliases_for(spec.name):
-                    if candidate_name in costs.get(m, {}):
-                        entry = costs[m][candidate_name]
-                        entry_fmt = candidate_name
-                        break
+                entry, entry_fmt = _resolve_cost_entry(
+                    costs.get(m, {}), spec.name)
                 if entry is None or "error" in entry:
                     missing.append(m)
                 else:
@@ -547,14 +833,33 @@ def aggregate_fused_siblings(
             if resolved_entries:
                 super_cost_entry_fmt[spec.name] = resolved_entries[0][0]
             sum_pred = 0.0
+            member_terms = []
             for m, (_entry_fmt, c) in zip(members, resolved_entries):
                 # Mirrors build_candidates, including unmeasured packed
-                # output_mse fallback and format-alias lookup.
-                sum_pred += cost_entry_predicted_dloss(stats[m], c)
-            effective_mse = sum_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
+                # output_mse fallback, bit-exact short-circuit, and
+                # format-alias lookup. The calibrated gain is applied ONCE to
+                # the summed super-item dloss (below, at candidate build), so
+                # the per-member terms here — and the hedge conversion — are
+                # un-gained.
+                member_pred = cost_entry_predicted_dloss(
+                    stats[m], c, format_name=spec.name)
+                sum_pred += member_pred
+                member_terms.append((stats[m], c, member_pred, 1.0))
+            # Same UCB conversion as aggregate_packed_serving_groups: the
+            # LINEAR z·Σ(stderr) baked into sum_pred becomes the independence
+            # z·sqrt(Σ stderr²) (a qkv triple over-hedged at 3x linear now
+            # hedges at √3), and the aggregated stderr is stored so consumers
+            # of the aggregated cost table keep the hedge instead of silently
+            # reading stderr 0. weight_mse is derived from the UN-hedged sum
+            # so the super entry's mse is not z-contaminated.
+            hedge_linear, stderr_agg = _super_item_ucb_hedge(
+                member_terms, ucb_z)
+            base_pred = sum_pred - hedge_linear
+            effective_mse = base_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
             super_cost[spec.name] = {
                 "weight_mse": effective_mse,
-                "predicted_dloss": sum_pred,
+                "predicted_dloss": base_pred,
+                "predicted_dloss_stderr": stderr_agg,
             }
         costs_ext[super_name] = super_cost
 
@@ -566,6 +871,18 @@ def aggregate_fused_siblings(
             member_format_intersection = set.intersection(*member_format_sets)
         else:
             member_format_intersection = set()
+        if not member_format_intersection:
+            raise AssertionError(
+                _fused_group_menu_error(
+                    super_name,
+                    key,
+                    members,
+                    candidates,
+                    member_format_intersection,
+                    formats,
+                    "share no legal format",
+                )
+            )
 
         cands = []
         for spec in formats:
@@ -582,17 +899,78 @@ def aggregate_fused_siblings(
             stats_ext[super_name]["_memory_bytes_by_format"][spec.name] = total_bytes
             entry_fmt = super_cost_entry_fmt.get(spec.name, spec.name)
             gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
-            predicted = entry["predicted_dloss"] * gain
+            # gain·(base + z·stderr_agg) == gain·base + z·sqrt(Σ (stderr·gain)²)
+            # for the single group-wide gain this path applies, i.e. exactly the
+            # packed path's construction. At z == 0 this is gain·sum_pred,
+            # bit-for-bit what this path produced before the hedge fix.
+            predicted = (
+                entry["predicted_dloss"]
+                + ucb_z * float(entry.get("predicted_dloss_stderr", 0.0))
+            ) * gain
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=bits_per_param,
                 memory_bytes=total_bytes,
                 predicted_dloss=max(predicted, 0.0),
             ))
-        if cands:
-            candidates_ext[super_name] = cands
+        if not cands:
+            # Unreachable via the intersection (a common candidate format
+            # implies a non-error cost row for every member), so this catches
+            # the residual case: an aggregation menu that does not contain the
+            # formats the member candidates were built from. Same verdict —
+            # stats_ext/costs_ext are already written, so returning here would
+            # drop the group from the DP silently.
+            raise AssertionError(
+                _fused_group_menu_error(
+                    super_name,
+                    key,
+                    members,
+                    candidates,
+                    member_format_intersection,
+                    formats,
+                    "share legal formats that this aggregation menu does not "
+                    "price",
+                )
+            )
+        candidates_ext[super_name] = cands
 
     return stats_ext, costs_ext, candidates_ext
+
+
+def _fused_group_menu_error(
+    super_name: str,
+    key: str,
+    members: list[str],
+    candidates: dict[str, list[Candidate]],
+    intersection: set[str],
+    formats: list[fr.FormatSpec],
+    what: str,
+) -> str:
+    """Diagnostic for a fused-sibling group that cannot be given one format."""
+    member_lines = "\n".join(
+        f"    {m}: legal={sorted(c.fmt for c in candidates.get(m, []))}"
+        for m in members
+    )
+    return (
+        f"fused-sibling group {key!r} (DP unit {super_name!r}) has "
+        f"{len(members)} members that {what}:\n"
+        f"{member_lines}\n"
+        f"    common formats: {sorted(intersection)}\n"
+        f"    aggregation menu: {[s.name for s in formats]}\n"
+        "Fused siblings (q/k/v, gate/up) MUST load under one format, so an "
+        "empty intersection is not an allocatable state: any format whole-"
+        "group promotion picks is illegal for at least one member, and "
+        "compute_achieved refuses to price that (it would otherwise score the "
+        "unpriced member at zero Δloss and bias the min-Δloss ratchet toward "
+        "exactly this state). Falling back to individual rows would only defer "
+        "the same failure past the solve. This is an upstream cost/legality "
+        "bug to fix, not a state to allocate around: a missing cost row for "
+        "one sibling, an over-tight applicability mask (see the "
+        "[alloc] format-applicability log lines and the mask summary JSON), or "
+        "a passthrough-source mismatch (BF16/FP8_SOURCE are legal only where "
+        "the source tensor already has that precision, so a group whose "
+        "members have different source dtypes loses them)."
+    )
 
 
 def expand_fused_sibling_assignment(assignment: dict[str, str],
@@ -607,6 +985,268 @@ def expand_fused_sibling_assignment(assignment: dict[str, str],
         else:
             out[name] = fmt
     return out
+
+
+_PACKED_GROUP_MARKER = ".__packed_serving__."
+
+
+def aggregate_packed_serving_groups(
+    stats: dict,
+    costs: dict,
+    formats: list[fr.FormatSpec],
+    candidates: dict[str, list[Candidate]],
+    profile,
+    calibrated_gains: dict[str, float] | None = None,
+) -> tuple[dict, dict, dict]:
+    """Aggregate packed-MoE serving groups into single DP decision units.
+
+    A packed serving group (``profile.packed_expert_format_group``) is
+    atomic at serve time: vLLM's FusedMoE loads every projection of every
+    routed expert in a layer under ONE quantization scheme, so a "one row
+    upgraded" DP decision is not a real option — the serving constraint
+    charges the whole group. Pricing upgrades per row inside the DP while
+    ``promote_serving_units`` charges the whole group is a ~1000x price
+    mismatch: mispriced expert rows
+    top the per-bin ranking, the feasibility tightening over-corrects, and
+    cheap-to-upgrade dense rows starve while headroom goes unused.
+
+    This pre-pass makes each packed group ONE multi-choice DP item whose
+    per-format cost is the exact sum of member predicted_dloss and whose
+    byte cost is the exact sum of member bytes at that format — so the DP
+    and the serving constraint price identical moves and post-DP MoE
+    promotion becomes a validated no-op. Only formats legal for EVERY
+    member are offered (member candidate sets already encode source /
+    profile / kernel-shape applicability).
+
+    A group with NO common legal format falls back to individual rows, which
+    keeps it visible and attributable instead of silently vanishing from the
+    DP — but that state is NOT allocatable and the fallback does NOT "repair
+    coherence". Members can only be assigned from their own (by definition
+    disjoint) candidate lists, so whole-group promotion necessarily lands on a
+    format that is illegal for at least one member, and ``compute_achieved``
+    refuses to price it (AssertionError, at every target) rather than scoring
+    the unpriced member at zero Δloss — which would make the illegal state
+    look CHEAPEST to the min-Δloss ratchet. An empty intersection is an
+    upstream cost/legality bug to fix (a missing cost row, an over-tight
+    applicability mask, a passthrough-source mismatch), not a state to
+    allocate around.
+
+    Non-grouped rows (attention, shared/dense MLP) pass through untouched.
+    Extrapolated expert cost rows are ordinary members. Use
+    ``expand_packed_group_assignment`` to broadcast a group decision back
+    to per-tensor entries for emission.
+    """
+    group_fn = getattr(profile, "packed_expert_format_group", None) \
+        if profile is not None else None
+    if not callable(group_fn):
+        return stats, costs, candidates
+
+    gains = calibrated_gains or {}
+    ucb_z = _cost_ucb_z()
+    grouped: dict[str, list[str]] = {}
+    ungrouped: list[str] = []
+    for name in candidates:
+        if _FUSED_SIBLING_MARKER in name or _PACKED_GROUP_MARKER in name:
+            ungrouped.append(name)
+            continue
+        try:
+            key = group_fn(name)
+        except PackedExpertRoleUnknown:
+            # An explicit "the profile cannot describe this unit" verdict must
+            # not be swallowed into "this row has no group" (see
+            # PackedExpertRoleUnknown).
+            raise
+        except Exception:
+            key = None
+        if key is None:
+            ungrouped.append(name)
+            continue
+        grouped.setdefault(key, []).append(name)
+
+    for key in list(grouped.keys()):
+        if len(grouped[key]) < 2:
+            ungrouped.extend(grouped.pop(key))
+
+    if not grouped:
+        return stats, costs, candidates
+
+    stats_ext = {n: stats[n] for n in ungrouped}
+    costs_ext = {n: costs.get(n, {}) for n in ungrouped}
+    candidates_ext = {n: candidates[n] for n in ungrouped}
+
+    for key, members in sorted(grouped.items()):
+        members = sorted(members)
+        safe_key = key.replace(".", "__")
+        super_name = (
+            f"{members[0].rsplit('.', 1)[0]}{_PACKED_GROUP_MARKER}{safe_key}"
+        )
+        member_cands = {
+            m: {c.fmt: c for c in candidates[m]} for m in members
+        }
+        common_fmts = set.intersection(
+            *(set(per_member) for per_member in member_cands.values())
+        )
+        n_params = sum(int(stats[m]["n_params"]) for m in members)
+        memory_by_fmt: dict[str, int] = {}
+        super_cost: dict[str, dict] = {}
+        cands: list[Candidate] = []
+        for spec in formats:
+            if spec.name not in common_fmts:
+                continue
+            total_bytes = sum(
+                int(member_cands[m][spec.name].memory_bytes) for m in members
+            )
+            sum_pred = sum(
+                float(member_cands[m][spec.name].predicted_dloss)
+                for m in members
+            )
+            # UCB hedge (PRISMAQUANT_COST_UCB_Z > 0): each member candidate
+            # was priced independently, so the sum above carries a LINEAR
+            # z·Σ(stderr·gain) hedge. Convert it to the independence
+            # aggregate and store the aggregated stderr on the super cost
+            # entry so consumers of the aggregated cost table keep the hedge
+            # instead of silently reading stderr 0. At z == 0 this is a no-op
+            # and the per-format dloss stays the exact sum of member
+            # candidates. Shared with aggregate_fused_siblings.
+            member_terms = []
+            for m in members:
+                entry, entry_fmt = _resolve_cost_entry(
+                    costs.get(m, {}), spec.name)
+                member_terms.append((
+                    stats[m],
+                    entry,
+                    float(member_cands[m][spec.name].predicted_dloss),
+                    float(gains.get(spec.name, gains.get(entry_fmt, 1.0))),
+                ))
+            hedge_linear, stderr_agg = _super_item_ucb_hedge(
+                member_terms, ucb_z)
+            base_pred = sum_pred - hedge_linear
+            hedged_pred = base_pred + ucb_z * stderr_agg
+            memory_by_fmt[spec.name] = total_bytes
+            super_cost[spec.name] = {
+                "predicted_dloss": base_pred,
+                "predicted_dloss_stderr": stderr_agg,
+            }
+            cands.append(Candidate(
+                fmt=spec.name,
+                bits_per_param=8.0 * total_bytes / max(n_params, 1),
+                memory_bytes=total_bytes,
+                predicted_dloss=max(hedged_pred, 0.0),
+            ))
+        if not cands:
+            # No format is legal for every member; aggregating would drop the
+            # whole group from the DP. Keep the members as individual rows
+            # (pre-refactor behavior) so the group stays visible and the
+            # failure is attributable — NOT because promotion can repair it.
+            # It cannot: the members' candidate lists are disjoint here, so
+            # promotion always lands on a format illegal for some member and
+            # every solve at every target ends in a compute_achieved pricing
+            # error. See this function's docstring.
+            for m in members:
+                stats_ext[m] = stats[m]
+                costs_ext[m] = costs.get(m, {})
+                candidates_ext[m] = candidates[m]
+            continue
+        # NOTE: deliberately NO in_features/out_features here. A packed
+        # group mixes member shapes (gate/up vs down projections), so no
+        # single (out, in) pair describes it — copying members[0]'s shape
+        # would make _shape_from_stats compute ONE member's bytes for the
+        # whole group. Without them _shape_from_stats falls back to the
+        # rank-1 (n_params,) legacy shape, which is at least
+        # total-parameter-consistent; exact byte paths must (and do)
+        # prefer the candidate / _memory_bytes_by_format.
+        stats_ext[super_name] = {
+            "h_trace": sum(
+                float(stats[m].get("h_trace", 0.0) or 0.0) for m in members
+            ),
+            "n_params": n_params,
+            "n_tokens_seen": sum(
+                int(stats[m].get("n_tokens_seen", 0) or 0) for m in members
+            ),
+            "_packed_group_members": members,
+            "_packed_group_key": key,
+            "_memory_bytes_by_format": memory_by_fmt,
+        }
+        costs_ext[super_name] = super_cost
+        candidates_ext[super_name] = cands
+
+    return stats_ext, costs_ext, candidates_ext
+
+
+def expand_packed_group_assignment(assignment: dict[str, str],
+                                   stats_ext: dict) -> dict[str, str]:
+    """Broadcast a packed-serving-group decision back to member tensors."""
+    out = {}
+    for name, fmt in assignment.items():
+        if _PACKED_GROUP_MARKER in name:
+            members = stats_ext[name].get("_packed_group_members", [])
+            for m in members:
+                out[m] = fmt
+        else:
+            out[name] = fmt
+    return out
+
+
+class _RoleSplitProfile:
+    """Profile view that splits packed serving groups by projection role.
+
+    Wraps a model profile so ``packed_expert_format_group`` returns a
+    (layer, role-group) key — gate+up projections form one serving unit and
+    down projections another (2 units per MoE layer instead of 1). Because
+    BOTH the DP aggregation and ``promote_serving_units`` key groups through
+    the profile, wrapping keeps them consistent: role units stay atomic,
+    and the final serving promotion remains a validated no-op. Everything
+    else delegates to the wrapped profile.
+
+    The role itself comes from ``profile.packed_expert_role_group``: expert
+    leaf naming (``gate_proj``/``up_proj`` vs LFM2.5's ``w1``/``w3``, and which
+    packed 3D parent each belongs to) is profile knowledge, and the allocator
+    does not parse model names — the same boundary
+    ``packed_expert_format_group`` already respects.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def packed_expert_format_group(self, qname: str) -> str | None:
+        key = self._inner.packed_expert_format_group(qname)
+        if key is None:
+            return None
+        role_fn = getattr(self._inner, "packed_expert_role_group", None)
+        if not callable(role_fn):
+            raise PackedExpertRoleUnknown(
+                f"profile {type(self._inner).__name__} groups {qname!r} as a "
+                "packed-expert serving unit but has no "
+                "packed_expert_role_group accessor, so the requested "
+                "gate_up/down role split cannot be keyed. Implement it (or "
+                "inherit ModelProfile, which derives it from the profile's "
+                "packed_experts spec)."
+            )
+        role = role_fn(qname)
+        if role is None:
+            raise PackedExpertRoleUnknown(
+                f"profile {type(self._inner).__name__} groups {qname!r} as a "
+                f"packed-expert serving unit (key {key!r}) but declares no "
+                "role for its projection leaf, so the requested gate_up/down "
+                "split would silently degrade to one layer-uniform unit. "
+                "Declare the leaf in the profile's structure spec "
+                "(packed_experts.projection_splits maps each per-expert leaf "
+                "to its packed 3D parent, e.g. "
+                '{"gate_up_proj": ["w1", "w3"], "down_proj": ["w2"]}).'
+            )
+        return f"{key}::role:{role}"
+
+
+def packed_role_split_profile(profile):
+    """Wrap ``profile`` so packed expert groups split into gate_up / down
+    serving units. Pass-through when the profile has no packed groups."""
+    if profile is None or not callable(
+            getattr(profile, "packed_expert_format_group", None)):
+        return profile
+    return _RoleSplitProfile(profile)
 
 
 def _scan_source_dtype_manifest(

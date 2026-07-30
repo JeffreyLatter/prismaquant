@@ -8,11 +8,13 @@ bpp vs bytes — the 27B knee moved 7.5 -> 12 bpp across axis choices). The ship
 bpp is therefore not a curvature to find; it is set by one of two real anchors:
 
   * CONSTRAINED ("fit the card") — ``select_under_byte_budget``: you target a
-    GPU SKU (24/32 GB). Pick the highest-bpp allocation whose *exact* exported
-    footprint (``prismaquant.footprint``) fits the budget. Deterministic — needs
-    no KL measurement (bytes don't depend on quality), and robust to surrogate
-    mis-ranking (you always want the most bits you can afford). This is the real
-    ship selector.
+    GPU SKU (24/32 GB). Feasibility is exact and needs no KL measurement: an
+    allocation ships only if its *exact* exported footprint
+    (``prismaquant.footprint``) fits the budget. Among the rungs that fit,
+    ``allocator.main`` ships the one with minimum predicted Δloss (ties to the
+    larger footprint) — NOT simply the densest, because the RD curve is not
+    monotone in bytes (§5: 5.5 bpp beat 6.0 bpp on measured 4B PPL). This is
+    the real ship selector.
 
   * UNCONSTRAINED ("where do bits stop paying") — ``find_saturation_bpp``: with
     no byte budget, pick the *saturation* point on the **measured** distortion:
@@ -175,10 +177,22 @@ def select_under_byte_budget(
     exported on-disk size (``bytes_key``); ``bpp_key`` / ``loss_key`` are used
     only for tie-breaking and reporting (a missing loss is treated as +inf).
     The chosen point is the one with the **largest footprint that still fits**
-    the budget — equivalently the most bits you can afford — because the RD curve
-    is monotone (more bytes = more bits = lower distortion), so "fill the card"
-    is the quality-optimal feasible point and is robust to surrogate mis-ranking.
-    Ties on bytes break to lower loss, then higher bpp.
+    the budget — the most bits you can afford. Ties on bytes break to lower
+    loss, then higher bpp.
+
+    IMPORTANT — this function is the FEASIBILITY GATE, not the ship objective.
+    "Fill the card" would be the quality-optimal feasible point only if the RD
+    curve were monotone in bytes, and it is not: CLAUDE.md §5 records 5.5 bpp
+    beating 6.0 bpp on measured Qwen3-4B PPL, and since the solver began
+    ratcheting on minimum predicted Δloss among feasible iterates, a denser
+    rung can carry a strictly worse Δloss than a sparser one that also fits.
+    The shipping selector in ``allocator.main`` therefore uses this function's
+    ``feasible`` / ``below_floor`` verdict and its candidate set, but picks by
+    **minimum predicted Δloss among the rungs that fit** (ties to the larger
+    footprint) and records that objective in ``selection.json``
+    (``ratchet_objective``). ``chosen`` is still returned, and the allocator
+    records it as ``max_bytes_pick_*`` so the two objectives stay auditable
+    side by side.
 
     Returns a dict with the decision and full context:
       ``chosen``           selected candidate (None if none fit),

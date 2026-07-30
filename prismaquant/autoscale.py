@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -95,6 +96,80 @@ def _act_width(cfg: dict) -> int:
     return max(w for w in widths if w > 0) if any(w > 0 for w in widths) else hidden
 
 
+# Per-expert routed-expert tensor qnames (`...experts.<id>....`). Matches
+# both live (`model.layers.N.mlp.experts.7.gate_proj.weight`) and DSv4
+# checkpoint (`layers.N.ffn.experts.7.w1.weight`) naming.
+_EXPERT_TENSOR_RE = re.compile(r"\.experts\.\d+\.")
+
+
+def declared_expert_dtype_covers(name: str) -> bool:
+    """Whether the checkpoint's `expert_dtype` declaration covers `name`.
+
+    **ROUTED experts only — verified against the real checkpoint.** The
+    declaration reads like a statement about all of a layer's experts, and
+    this predicate used to widen to `mlp.shared_experts.*` on that
+    reasoning. The real `deepseek-ai/DeepSeek-V4-Flash` headers say
+    otherwise (safetensors metadata, four shards spanning the model):
+
+        layers.N.ffn.experts.{i}.w{1,2,3}.weight   I8        <- nibble-packed
+        layers.N.ffn.experts.{i}.w{1,2,3}.scale    F8_E8M0
+        layers.N.ffn.shared_experts.w{1,2,3}.weight  F8_E4M3 <- block-FP8
+        layers.N.ffn.shared_experts.w{1,2,3}.scale   F8_E8M0
+
+    i.e. the shared expert is ordinary block-FP8, 2304/2304 routed-expert
+    weights are I8 and 9/9 shared-expert weights are F8_E4M3. The authors'
+    own converter agrees and is the tie-breaker: `inference/convert.py`
+    gates the fp4 path on ``"experts" in name and dtype == torch.int8``, so
+    an F8_E4M3 shared expert never enters it.
+
+    Widening to shared experts would therefore send a block-FP8 tensor into
+    the MXFP4 decode, where `_check_mxfp4_packed_grid` refuses a non-int8
+    weight — a hard DSv4 load failure. Keep this routed-only.
+
+    Nothing here inspects a tensor's shape or dtype: the trigger stays the
+    config declaration (`declared_fp4_expert_dtype`) and the packed layout
+    stays a hard assertion after the fact
+    (`layer_streaming._check_mxfp4_packed_grid`). Non-expert tensors
+    (attention projections, the router gate, norms) and the shared expert
+    keep the block-FP8 dequant path and its `_check_fp8_scale_grid`
+    assertion.
+    """
+    return bool(_EXPERT_TENSOR_RE.search(name))
+
+
+# safetensors dtype names for a 1-byte integer plane — what a nibble-packed
+# MXFP4 expert weight ships as. Both spellings must be priced the same way
+# the decode treats them: `layer_streaming._check_mxfp4_packed_grid` accepts
+# int8 *and* uint8 nibble-packs, so sizing only "I8" would leave a U8
+# checkpoint undercounted 4x.
+_PACKED_BYTE_DTYPES = frozenset({"I8", "U8"})
+
+
+def declared_fp4_expert_dtype(model_path: str) -> bool:
+    """True when the checkpoint config *explicitly* declares packed-FP4
+    routed experts (DSv4-Flash: top-level `expert_dtype: "fp4"` alongside a
+    block-FP8 `quantization_config`; the MXFP4 scale siblings are E8M0).
+
+    This declaration — never a tensor-shape heuristic — is what gates the
+    streaming loader's MXFP4 decode (`layer_streaming` step 3b) and what
+    the resident-size estimators key on: a nibble-packed I8 expert byte
+    dequants to 2 logical elements of the execution dtype."""
+    try:
+        with open(os.path.join(model_path, "config.json")) as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return False
+        tc = cfg.get("text_config")
+        tc = tc if isinstance(tc, dict) else {}
+        val = cfg.get("expert_dtype") or tc.get("expert_dtype") or ""
+    except Exception:
+        # Absent, unreadable, or unexpectedly-shaped config: not declared.
+        # Sizing wrongly here silently mis-budgets the streaming cache, so
+        # every failure mode resolves to "verbatim" rather than to a guess.
+        return False
+    return str(val).lower() in {"fp4", "mxfp4", "mx_fp4"}
+
+
 def _safetensors_source_float_bytes(dtype_name: str) -> int | None:
     """On-disk bytes/element for a safetensors *floating* dtype name;
     None for non-float dtypes (kept verbatim by the streaming loader)."""
@@ -110,7 +185,8 @@ def _safetensors_source_float_bytes(dtype_name: str) -> int | None:
     return None
 
 
-def _shard_resident_bytes(path: Path, dtype_bytes: int) -> int:
+def _shard_resident_bytes(path: Path, dtype_bytes: int,
+                          fp4_experts: bool = False) -> int:
     """Resident bytes for one safetensors shard after streaming load.
 
     `_read_layer_to_device` casts every floating tensor to the execution
@@ -120,6 +196,13 @@ def _shard_resident_bytes(path: Path, dtype_bytes: int) -> int:
     applies per tensor. fp8-native checkpoints (1 byte/elem on disk)
     therefore occupy 2x their disk size in the layer cache; sizing from
     raw file size undercounts them 2x and blows the memory budget.
+
+    ``fp4_experts`` is the checkpoint's explicit packed-FP4 expert
+    declaration (`declared_fp4_expert_dtype`): expert I8/U8 tensors (routed
+    and shared alike, see `declared_expert_dtype_covers`) are then MXFP4
+    nibble-packs that dequant to TWO logical elements of the execution
+    dtype per on-disk byte (a 4x undercount at bf16 if sized verbatim).
+    Other non-float dtypes stay verbatim.
 
     Parses the safetensors JSON header directly (stdlib-only; no tensor
     data is read). Raises on malformed files; the caller falls back to
@@ -137,7 +220,12 @@ def _shard_resident_bytes(path: Path, dtype_bytes: int) -> int:
             continue
         off = meta["data_offsets"]
         nbytes = int(off[1]) - int(off[0])
-        src_bytes = _safetensors_source_float_bytes(meta.get("dtype", ""))
+        dtype_name = str(meta.get("dtype", "")).upper()
+        if (fp4_experts and dtype_name in _PACKED_BYTE_DTYPES
+                and declared_expert_dtype_covers(key)):
+            total += nbytes * 2 * int(dtype_bytes)
+            continue
+        src_bytes = _safetensors_source_float_bytes(dtype_name)
         if src_bytes is None:
             total += nbytes
         else:
@@ -153,10 +241,11 @@ def _model_resident_weight_bytes(model_path: str, dtype_bytes: int) -> int:
     p = Path(model_path)
     if not p.exists():
         return 0
+    fp4_experts = declared_fp4_expert_dtype(model_path)
     total = 0
     for f in p.glob("*.safetensors"):
         try:
-            total += _shard_resident_bytes(f, dtype_bytes)
+            total += _shard_resident_bytes(f, dtype_bytes, fp4_experts)
         except Exception:
             try:
                 total += f.stat().st_size

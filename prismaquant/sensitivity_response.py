@@ -146,7 +146,10 @@ def _member_cost_totals(
             if isinstance(stat, Mapping):
                 try:
                     predicted_dloss_sum += float(
-                        cost_entry_predicted_dloss(dict(stat), dict(entry))
+                        cost_entry_predicted_dloss(
+                            dict(stat), dict(entry),
+                            format_name=baseline_fmt,
+                        )
                     )
                 except Exception:
                     pass

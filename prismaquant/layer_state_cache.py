@@ -495,11 +495,7 @@ class LayerHiddenStateCache:
                         dtype=param.dtype,
                     ).contiguous()
                 self._baseline_weight_values[key] = (target, quantized)
-            if (
-                self.include_activation_quant
-                and spec.act_bits is not None
-                and spec.act_bits < 16
-            ):
+            if self.include_activation_quant and spec.act_quant_changes_input:
                 if id(target.module) in activation_conflicts:
                     continue
                 entry = activation_specs.get(id(target.module))

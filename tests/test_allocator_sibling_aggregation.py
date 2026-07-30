@@ -331,6 +331,57 @@ def test_singleton_groups_pass_through_unchanged():
     assert "model.layers.0.self_attn.q_proj" in cands_ext
 
 
+def test_fused_group_with_disjoint_member_menus_hard_errors():
+    """A fused group whose members share NO legal format must raise, not
+    vanish. Pre-fix, ``cands`` came out empty, ``stats_ext``/``costs_ext``
+    still got the super item and ``candidates_ext`` did not — so the whole
+    q/k/v group silently disappeared from the DP and was never assigned a
+    format.
+
+    Fused siblings must load under ONE format, so this state is not
+    allocatable at all (any promoted format is illegal for some member, and
+    ``compute_achieved`` refuses to price that) — the fallback-to-individual-
+    rows treatment ``aggregate_packed_serving_groups`` gives packed groups
+    would only defer the same failure past the solve. The disjointness here is
+    built through the REAL legality gate, from the two upstream causes the
+    message names: a passthrough-source mismatch on one sibling and an
+    applicability mask on the other."""
+    import pytest
+
+    layer = "model.layers.0.self_attn"
+    q, k = f"{layer}.q_proj", f"{layer}.k_proj"
+    stats = {
+        # q_proj: fp16 source -> BF16 passthrough illegal (never synthesize).
+        q: {"h_trace": 0.5, "n_params": 4096 * 4096,
+            "in_features": 4096, "out_features": 4096},
+        # k_proj: in_features not divisible by the NVFP4 group -> masked.
+        k: {"h_trace": 0.3, "n_params": 1024 * 4098,
+            "in_features": 4098, "out_features": 1024},
+    }
+    costs = {
+        n: {"NVFP4": {"weight_mse": 0.02, "predicted_dloss": 0.01},
+            "BF16": {"weight_mse": 0.0, "predicted_dloss": 0.0}}
+        for n in stats
+    }
+    specs = _format_specs()
+    cands = build_candidates(
+        stats, costs, specs,
+        source_manifest={q: "other", k: "bf16"},
+    )
+    assert [c.fmt for c in cands[q]] == ["NVFP4"]
+    assert [c.fmt for c in cands[k]] == ["BF16"]
+
+    with pytest.raises(AssertionError) as exc:
+        aggregate_fused_siblings(stats, costs, specs, cands, _FakeProfile())
+    msg = str(exc.value)
+    assert "qkv_proj" in msg                      # the group
+    assert q in msg and k in msg                  # its members
+    assert "['NVFP4']" in msg and "['BF16']" in msg   # each member's menu
+    assert "common formats: []" in msg
+    for cause in ("cost row", "applicability mask", "passthrough-source"):
+        assert cause in msg, cause
+
+
 def test_aggregation_is_no_op_without_profile():
     names, stats, costs = _mk_stats_and_costs()
     specs = _format_specs()
@@ -498,10 +549,12 @@ def test_pre_aggregation_respects_budget_without_overshoot():
 # Convergence-based stopping
 # ---------------------------------------------------------------------------
 
-def test_solve_with_promotion_stops_on_stall():
-    """Construct a tiny problem where promotion would overshoot and
-    tightening can't make further progress — loop should bail out early
-    via the stall detector, not waste all max_iters slots."""
+def test_solve_with_promotion_returns_feasible_iterate_on_plateau():
+    """Construct a tiny problem where promotion overshoots and tightening
+    plateaus (serving-group atomicity pins the promoted outcome).
+    Termination contract: the loop returns the best FEASIBLE iterate
+    (achieved <= target + tolerance) or (None, nan) when nothing ever fit —
+    it must never fabricate an over-target 'feasible' result."""
     # Use the un-aggregated path so promote_fused has siblings to coerce.
     names, stats, costs = _mk_stats_and_costs()
     specs = _format_specs()
@@ -523,7 +576,290 @@ def test_solve_with_promotion_stops_on_stall():
         max_iters=40,
         profile=profile,
     )
-    # Assignment must be non-None (solver found SOMETHING), and achieved
-    # is reported even when we bail on stall (the whole point of #2).
+    # The all-NVFP4 floor (~4.5) fits under target=4.6, so a feasible
+    # iterate exists and must be returned — and it must actually be
+    # feasible, not an over-target fabrication.
     assert assignment is not None
     assert isinstance(achieved, float)
+    assert achieved <= target + 0.01, (
+        f"stall exit returned an over-target iterate: target={target}, "
+        f"achieved={achieved}")
+
+
+# ---------------------------------------------------------------------------
+# Ratchet objective: min predicted Δloss among feasible iterates
+# ---------------------------------------------------------------------------
+
+def _mk_single_tensor_ratchet_fixture(dloss_by_fmt: dict[str, float]):
+    """One 1000-param tensor with candidates at 4/5/6/7 bpp.
+
+    predicted_dloss per format comes from ``dloss_by_fmt`` so tests can
+    make Δloss(bits) deliberately non-monotone (more bits is NOT always
+    better — the CLAUDE.md §5 5.5-vs-6.0 bpp lesson).
+    """
+    stats = {"w": {"n_params": 1000}}
+    bpp = {"F4": 4.0, "F5": 5.0, "F6": 6.0, "F7": 7.0}
+    cands = {
+        "w": [
+            Candidate(fmt=f, bits_per_param=b,
+                      memory_bytes=int(b * 1000 / 8),
+                      predicted_dloss=dloss_by_fmt[f])
+            for f, b in bpp.items()
+        ]
+    }
+    return stats, cands
+
+
+def _scripted_solve_allocation(fmt_for_t):
+    """Stand-in for solve_allocation: pick a format purely from the
+    tightened target, emulating promotion-driven non-monotonicity
+    without needing a real coupled model."""
+    def fake(stats, candidates, t, bit_precision):
+        return {"w": fmt_for_t(t)}, None
+    return fake
+
+
+def test_ratchet_keeps_min_dloss_feasible_iterate_over_denser(monkeypatch):
+    """A feasible lower-Δloss iterate must beat a denser higher-Δloss one.
+
+    Script: t=6.0 -> F7 (7.0 bits, overshoots); tightened t=5.5 -> F5
+    (5.0 bits, Δloss 1.0, feasible); bisection mid t=5.75 -> F6
+    (6.0 bits, Δloss 3.0, feasible and denser but WORSE). The old
+    max-achieved ratchet shipped F6; the min-Δloss ratchet must ship F5.
+    """
+    from prismaquant import allocator_solver as als
+
+    stats, cands = _mk_single_tensor_ratchet_fixture(
+        {"F4": 5.0, "F5": 1.0, "F6": 3.0, "F7": 0.5})
+
+    def fmt_for_t(t):
+        if t >= 5.9:
+            return "F7"
+        if t >= 5.6:
+            return "F6"
+        return "F5"
+
+    monkeypatch.setattr(als, "solve_allocation",
+                        _scripted_solve_allocation(fmt_for_t))
+
+    assignment, achieved = solve_with_promotion(
+        stats, cands, 6.0, {}, {},
+        bit_precision=0.001,
+        profile=None,
+    )
+    assert assignment == {"w": "F5"}, (
+        f"ratchet must keep the min-Δloss feasible iterate (F5, Δloss 1.0) "
+        f"over the denser F6 (Δloss 3.0); got {assignment}")
+    assert abs(achieved - 5.0) < 1e-9
+    # Feasibility contract is unchanged.
+    assert achieved <= 6.0 + 0.01
+
+
+def test_ratchet_tie_breaks_toward_denser_iterate(monkeypatch):
+    """Equal Δloss: keep the denser (higher achieved bits) iterate."""
+    from prismaquant import allocator_solver as als
+
+    stats, cands = _mk_single_tensor_ratchet_fixture(
+        {"F4": 5.0, "F5": 1.0, "F6": 1.0, "F7": 0.5})
+
+    def fmt_for_t(t):
+        if t >= 5.9:
+            return "F7"
+        if t >= 5.6:
+            return "F6"
+        return "F5"
+
+    monkeypatch.setattr(als, "solve_allocation",
+                        _scripted_solve_allocation(fmt_for_t))
+
+    assignment, achieved = solve_with_promotion(
+        stats, cands, 6.0, {}, {},
+        bit_precision=0.001,
+        profile=None,
+    )
+    assert assignment == {"w": "F6"}, (
+        f"on a Δloss tie the denser feasible iterate wins; got {assignment}")
+    assert abs(achieved - 6.0) < 1e-9
+    assert achieved <= 6.0 + 0.01
+
+
+# ---------------------------------------------------------------------------
+# Termination contract: FEASIBLE iterate or INFEASIBLE — never a silent
+# over-target return
+# ---------------------------------------------------------------------------
+
+def test_infeasible_rung_returns_none_and_nan(monkeypatch):
+    """A rung where NO iterate ever fits must report INFEASIBLE.
+
+    Regression guard for the three silent fallbacks: returning the previous
+    over-target iterate, accepting an arbitrarily deep undershoot, and the
+    stall exit handing back an iterate still far above target. Callers
+    (Pareto curve, byte-budget bisection) key off `assignment is None`, so a
+    restored silent over-target return must fail here.
+    """
+    import math
+
+    from prismaquant import allocator_solver as als
+
+    stats, cands = _mk_single_tensor_ratchet_fixture(
+        {"F4": 5.0, "F5": 1.0, "F6": 3.0, "F7": 0.5})
+    # Every tightened target promotes to the 7.0-bit format: nothing fits
+    # under target=6.0 + 0.01, at any tightening, all the way to the floor.
+    monkeypatch.setattr(als, "solve_allocation",
+                        _scripted_solve_allocation(lambda t: "F7"))
+
+    diag = {}
+    assignment, achieved = solve_with_promotion(
+        stats, cands, 6.0, {}, {},
+        bit_precision=0.001,
+        profile=None,
+        diagnostics=diag,
+    )
+    assert assignment is None, (
+        f"infeasible rung must not fabricate an assignment; got {assignment}")
+    assert math.isnan(achieved), (
+        f"infeasible rung must report nan achieved bits; got {achieved}")
+    # The diagnostics the caller needs to write an actionable message.
+    assert diag["feasible"] is False
+    assert diag["achieved_bits"] is None
+    assert abs(diag["min_bits"] - 4.0) < 1e-9
+    assert abs(diag["closest_achieved_bits"] - 7.0) < 1e-9
+    assert abs(diag["floor_achieved_bits"] - 7.0) < 1e-9
+    assert diag["evals"] >= 1
+
+
+def test_below_format_floor_target_is_infeasible():
+    """A target under the cheapest legal assignment is INFEASIBLE, and the
+    floor is reported so the caller can say what target WOULD work."""
+    import math
+
+    stats, cands = _mk_single_tensor_ratchet_fixture(
+        {"F4": 5.0, "F5": 1.0, "F6": 3.0, "F7": 0.5})
+    diag = {}
+    assignment, achieved = solve_with_promotion(
+        stats, cands, 3.0, {}, {},
+        bit_precision=0.001,
+        profile=None,
+        diagnostics=diag,
+    )
+    assert assignment is None
+    assert math.isnan(achieved)
+    assert abs(diag["min_bits"] - 4.0) < 1e-9
+    assert diag["feasible"] is False
+
+
+def test_feasible_rung_satisfies_the_tolerance_contract(monkeypatch):
+    """The other half of the contract: whenever an assignment IS returned it
+    is feasible, and the diagnostics describe that returned iterate."""
+    from prismaquant import allocator_solver as als
+
+    stats, cands = _mk_single_tensor_ratchet_fixture(
+        {"F4": 5.0, "F5": 1.0, "F6": 3.0, "F7": 0.5})
+
+    def fmt_for_t(t):
+        return "F7" if t >= 5.9 else "F5"
+
+    monkeypatch.setattr(als, "solve_allocation",
+                        _scripted_solve_allocation(fmt_for_t))
+
+    target, tol = 6.0, 0.01
+    diag = {}
+    assignment, achieved = solve_with_promotion(
+        stats, cands, target, {}, {},
+        bit_precision=0.001,
+        overshoot_tolerance=tol,
+        profile=None,
+        diagnostics=diag,
+    )
+    assert assignment is not None
+    assert achieved <= target + tol
+    assert diag["feasible"] is True
+    assert abs(diag["achieved_bits"] - achieved) < 1e-12
+    assert abs(diag["predicted_dloss"] - 1.0) < 1e-12  # F5
+    # The over-target iterate that was seen and rejected is still reported.
+    assert abs(diag["closest_achieved_bits"] - 7.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# UCB hedge on fused super-items: independence aggregate, not linear sum
+# ---------------------------------------------------------------------------
+
+def _mk_qkv_ucb_fixture(base: dict, stderr: dict):
+    layer = "model.layers.0.self_attn"
+    members = sorted(f"{layer}.{p}" for p in ("q_proj", "k_proj", "v_proj"))
+    stats, costs = {}, {}
+    for name in members:
+        stats[name] = {"h_trace": 0.5, "n_params": 65536,
+                       "in_features": 256, "out_features": 256,
+                       "n_tokens_seen": 7}
+        costs[name] = {
+            f: {"predicted_dloss": base[f], "predicted_dloss_stderr": stderr[f]}
+            for f in base
+        }
+    return members, stats, costs
+
+
+def test_fused_group_ucb_stderr_aggregates_in_quadrature(monkeypatch):
+    """A qkv triple must hedge at √3-independence, not 3x linear.
+
+    Members' dloss estimates are independent measurements, so the stderr of
+    the group SUM is sqrt(Σ stderr²). Summing per-member UCB'd terms charged
+    the LINEAR z·Σ(stderr) — a √N over-hedge — and the super cost entry
+    dropped predicted_dloss_stderr entirely, zeroing the hedge for consumers
+    of the aggregated table. Same contract the packed path already pins.
+    """
+    z = 2.0
+    monkeypatch.setenv("PRISMAQUANT_COST_UCB_Z", str(z))
+    base = {"NVFP4": 0.05, "BF16": 0.01}
+    stderr = {"NVFP4": 0.004, "BF16": 0.002}
+    members, stats, costs = _mk_qkv_ucb_fixture(base, stderr)
+    specs = _format_specs()
+
+    cands = build_candidates(stats, costs, specs)
+    _s, costs_ext, cands_ext = aggregate_fused_siblings(
+        stats, costs, specs, cands, _FakeProfile())
+    super_name = next(n for n in cands_ext if _FUSED_SIBLING_MARKER in n)
+    n_members = len(members)
+    sum_h = sum(stats[m]["h_trace"] for m in members)
+
+    checked = 0
+    for cand in cands_ext[super_name]:
+        fmt = cand.fmt
+        assert fmt in base, f"unexpected format {fmt} in fixture"
+        agg = (n_members * stderr[fmt] ** 2) ** 0.5
+        exact_sum = 0.0
+        for _ in members:
+            exact_sum += base[fmt]
+        assert abs(cand.predicted_dloss - (exact_sum + z * agg)) < 1e-12
+        entry = costs_ext[super_name][fmt]
+        assert abs(entry["predicted_dloss"] - exact_sum) < 1e-12
+        assert abs(entry["predicted_dloss_stderr"] - agg) < 1e-12
+        # weight_mse is derived from the UN-hedged sum (no z contamination).
+        assert abs(entry["weight_mse"] - exact_sum / (0.5 * sum_h)) < 1e-12
+        # Strictly cheaper than the linear hedge it replaces.
+        assert z * agg < z * n_members * stderr[fmt] - 1e-12
+        checked += 1
+    assert checked >= 1
+
+
+def test_fused_group_hedge_is_identity_at_z_zero(monkeypatch):
+    """At the default z == 0 the fused super-item price stays bit-for-bit the
+    exact accumulated member sum — the pre-fix formula."""
+    monkeypatch.setenv("PRISMAQUANT_COST_UCB_Z", "0")
+    base = {"NVFP4": 0.05, "BF16": 0.01}
+    stderr = {"NVFP4": 0.004, "BF16": 0.002}
+    members, stats, costs = _mk_qkv_ucb_fixture(base, stderr)
+    specs = _format_specs()
+
+    cands = build_candidates(stats, costs, specs)
+    _s, costs_ext, cands_ext = aggregate_fused_siblings(
+        stats, costs, specs, cands, _FakeProfile())
+    super_name = next(n for n in cands_ext if _FUSED_SIBLING_MARKER in n)
+
+    for cand in cands_ext[super_name]:
+        exact_sum = 0.0
+        for _ in members:
+            exact_sum += base[cand.fmt]
+        assert cand.predicted_dloss == exact_sum, (
+            "z == 0 must be a bit-for-bit identity on the member sum")
+        assert costs_ext[super_name][cand.fmt]["predicted_dloss"] == exact_sum

@@ -13,6 +13,14 @@ from pathlib import Path
 import pytest
 import torch
 
+# These tests exercise repo-root `tools/` scripts, which are not part of the
+# installed package, so they can only run from a checkout. The release
+# pipeline runs the suite against a non-editable install from outside the
+# checkout (docs/RELEASING.md); skip there instead of failing collection.
+if not (Path(__file__).resolve().parents[1] / "tools").is_dir():
+    pytest.skip("requires a repo checkout (tools/ scripts)",
+                allow_module_level=True)
+
 _TOOL_PATH = (
     Path(__file__).resolve().parents[1] / "tools" / "measure_vllm_full_kl.py"
 )
