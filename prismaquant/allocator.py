@@ -2087,7 +2087,23 @@ def main():
                 "floor (lm_head/embed/norms).")
         budget_bytes = float(args.target_disk_gb) * _fp.GB
         src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
-        regime = _fp.source_regime(src_by_dtype)  # robust bf16/fp8 (not by mass)
+        regime = _fp.source_regime(src_by_dtype)  # recorded for reporting only
+        # Per-tensor source-byte manifest: each re-encoded Linear is charged
+        # its ACTUAL header byte span (weight + scale siblings), never a
+        # regime-wide per-param rate. On mixed sources (an MXFP4-packed
+        # DSv4-Flash checkpoint: I8 nibble experts + E8M0 scales, F8
+        # attention, BF16 floor) the old regime accounting removed more
+        # bytes than the checkpoint holds, driving the floor negative.
+        # `expert_parent_for_projection` bridges the per-expert-on-disk /
+        # packed-live MoE layouts (…experts.{i}.gate_proj -> the packed
+        # …experts.gate_up_proj the allocator names), same mapping the
+        # layer-streaming pack bridge uses.
+        src_manifest = _fp.source_tensor_bytes_manifest(
+            probe_model_path,
+            name_map=getattr(model_profile, "checkpoint_to_live_name", None),
+            expert_parent_for_projection=getattr(
+                model_profile, "packed_expert_parent_for_projection", None),
+        )
 
         def _artifact_for_target(t: float):
             assign_t, ach_t, tot_t, _mut = _solve_for_target(t)
@@ -2095,13 +2111,18 @@ def main():
                 return None
             expanded_t = _expand_assignment_for_seed_json(assign_t)
             body_aux = _assignment_bits_total(expanded_t) / 8.0
-            reenc_src = 0
-            for n in expanded_t:
-                e = _stats_entry_for_assignment_name(n)
-                if isinstance(e, dict):
-                    reenc_src += _fp.reencoded_source_bytes_for_shape(
-                        _shape_from_stats(e), regime)
-            floor = float(src_total) - reenc_src
+            # A re-encoded name the manifest cannot resolve is a hard error
+            # (raised BEFORE any selection numbers are consumed): it would
+            # stay priced in the floor while its quantized body bytes are
+            # still added, and on a packed-MoE model that double-counts the
+            # entire expert mass — every rung then reads "below the floor".
+            reenc_by_name = _fp.resolve_reencoded_source_bytes(
+                src_manifest, expanded_t,
+                context=f"byte-budget selector (target_bits={t:.3f})")
+            floor = float(src_total) - sum(reenc_by_name.values())
+            _fp.check_floor_non_negative(
+                floor, float(src_total), reenc_by_name,
+                context=f"byte-budget selector (target_bits={t:.3f})")
             return {
                 "target_bits": float(t), "achieved_bits": float(ach_t),
                 "bpp": float(ach_t), "dloss": float(tot_t),
@@ -2125,6 +2146,7 @@ def main():
             "budget_bytes": budget_bytes,
             "source_total_bytes": float(src_total),
             "source_regime": regime,
+            "source_accounting": "per_tensor_manifest_v2",
             "source_bytes_per_param": int(
                 _fp.dominant_source_bytes_per_param(src_by_dtype)),
             "feasible": bool(sel["feasible"]),
