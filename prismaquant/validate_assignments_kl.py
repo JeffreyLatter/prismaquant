@@ -487,7 +487,7 @@ def _activation_quant_assignment(
     out: dict[str, str] = {}
     for name, fmt in assignment.items():
         spec = fr.get_format(fmt)
-        if spec.act_bits is not None and int(spec.act_bits) < 16:
+        if spec.act_quant_changes_input:
             out[str(name)] = spec.name
     return out
 

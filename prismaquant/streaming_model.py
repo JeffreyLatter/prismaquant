@@ -56,7 +56,11 @@ except ModuleNotFoundError:
         del recurse
         return module
 
-from .autoscale import _EXPERT_TENSOR_RE, declared_fp4_expert_dtype
+from .autoscale import (
+    _EXPERT_TENSOR_RE,
+    _PACKED_BYTE_DTYPES,
+    declared_fp4_expert_dtype,
+)
 from .layer_streaming import (
     _build_fp8_scale_inv_map,
     LayerCache,
@@ -234,9 +238,9 @@ def _safetensors_cache_dtype_bytes(dtype_name: str,
     # weights therefore cache as bf16/fp16/fp32 after block dequant.
     if dtype_name.startswith("F") or dtype_name == "BF16":
         return torch.empty((), dtype=target_dtype).element_size()
-    if dtype_name == "I8" and fp4_packed:
+    if fp4_packed and dtype_name in _PACKED_BYTE_DTYPES:
         # Declared MXFP4 nibble-pack (DSv4-Flash routed experts): one
-        # packed I8 byte dequants to TWO logical elements of the
+        # packed I8/U8 byte dequants to TWO logical elements of the
         # execution dtype (4 bytes/disk-byte at bf16). Sizing it as the
         # verbatim 1 byte undercounts the resident tensor 4x, so
         # prepare_for_load() under-evicts and prefetch refuses layers
@@ -263,9 +267,9 @@ def _estimate_layer_cache_bytes(
     """Estimate dequanted cache bytes per decoder layer without loading data.
 
     `fp4_experts` is the checkpoint's explicit packed-FP4 expert
-    declaration (`declared_fp4_expert_dtype`): per-expert I8 tensors then
-    price as MXFP4 nibble-packs (2 logical elements/byte at the execution
-    dtype) instead of verbatim int8."""
+    declaration (`declared_fp4_expert_dtype`): per-expert I8/U8 tensors
+    then price as MXFP4 nibble-packs (2 logical elements/byte at the
+    execution dtype) instead of verbatim int8."""
     pat = re.compile(rf"^{re.escape(layers_prefix)}(?P<idx>\d+)\.")
     by_shard: dict[str, list[tuple[int, str, bool]]] = {}
     for model_name, shard in weight_shard.items():

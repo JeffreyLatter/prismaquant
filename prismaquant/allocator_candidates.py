@@ -241,8 +241,9 @@ def cost_entry_is_bit_exact(
     dloss 0.0, the unbeatable global minimum at any budget, while its
     served activations are still 4-bit. The short-circuit therefore
     requires the format's activation quantization to be the identity — a
-    dtype-level fact (``act_bits is None``: BF16, FP8_SOURCE, NVFP4A16,
-    MXFP8A16, INT-W·A16), not a heuristic. Formats we cannot identify
+    dtype-level fact (``FormatSpec.act_quant_changes_input``, i.e. ``act_bits``
+    absent or >= 16: BF16, FP8_SOURCE, NVFP4A16, MXFP8A16, INT-W·A16), not a
+    heuristic. Formats we cannot identify
     (``format_name`` None or unregistered) never short-circuit.
 
     For qualifying passthrough-activation formats, measured zero is a
@@ -370,6 +371,64 @@ def _cost_ucb_z() -> float:
         return max(0.0, float(os.environ.get("PRISMAQUANT_COST_UCB_Z", "0")))
     except Exception:
         return 0.0
+
+
+def _resolve_cost_entry(cost_rows: dict, fmt_name: str) -> tuple[dict | None, str]:
+    """Resolve one Linear's cost row for ``fmt_name``, alias-aware.
+
+    Returns ``(entry, entry_fmt)`` where ``entry_fmt`` is the alias actually
+    present in the cost table (what ``calibrated_gains`` may be keyed by), or
+    ``(None, fmt_name)`` when the format was never measured.
+    """
+    for candidate_name in fr.aliases_for(fmt_name):
+        if candidate_name in cost_rows:
+            return cost_rows[candidate_name], candidate_name
+    return None, fmt_name
+
+
+def _super_item_ucb_hedge(member_terms, ucb_z: float) -> tuple[float, float]:
+    """Convert a super item's per-member UCB hedge into the independence one.
+
+    A super item (fused-sibling group, packed serving group) prices one
+    format as the SUM of its members' ``cost_entry_predicted_dloss``. With
+    ``PRISMAQUANT_COST_UCB_Z > 0`` every member term already carries its own
+    ``z·stderr·gain``, so the sum carries a LINEAR ``z·Σ(stderr·gain)``
+    hedge — up to a √N OVER-hedge on an N-member group. The member dloss
+    estimates are independent measurements, so the stderr of the group SUM is
+    ``sqrt(Σ (stderr·gain)²)``.
+
+    ``member_terms`` yields ``(stats_entry, cost_entry, member_dloss, gain)``.
+    Returns ``(hedge_linear, stderr_agg)``: subtract ``hedge_linear`` from the
+    member sum and add ``ucb_z * stderr_agg`` to get the independence
+    aggregate. At ``ucb_z == 0`` ``hedge_linear`` is exactly 0.0, so the
+    conversion is a bit-for-bit identity on the sum.
+
+    Both aggregation paths call this so the two constructions cannot drift.
+    """
+    stderr_eff_sq = 0.0
+    hedge_linear = 0.0
+    for stats_entry, cost_entry, member_dloss, gain in member_terms:
+        if float(member_dloss) <= 0.0:
+            # Bit-exact re-encode / clamped-at-zero member: contributed no
+            # dloss (and no hedge) to the sum; skip it symmetrically.
+            continue
+        if cost_entry is None or "error" in cost_entry:
+            continue
+        # Mirror cost_entry_predicted_dloss: the stderr hedge is only applied
+        # on the explicit predicted_dloss branch.
+        if _has_measured_output_mse(stats_entry, cost_entry):
+            continue
+        if "predicted_dloss" not in cost_entry:
+            continue
+        try:
+            stderr = float(cost_entry.get("predicted_dloss_stderr", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            stderr = 0.0
+        if stderr <= 0.0:
+            continue
+        stderr_eff_sq += (stderr * float(gain)) ** 2
+        hedge_linear += ucb_z * stderr * float(gain)
+    return hedge_linear, math.sqrt(stderr_eff_sq)
 
 
 def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
@@ -540,10 +599,11 @@ def aggregate_fused_siblings(
         return stats, costs, candidates
 
     gains = calibrated_gains or {}
+    ucb_z = _cost_ucb_z()
     grouped: dict[str, list[str]] = {}
     ungrouped: list[str] = []
     for name in candidates:
-        if ".__fused__." in name or _PACKED_GROUP_MARKER in name:
+        if _FUSED_SIBLING_MARKER in name or _PACKED_GROUP_MARKER in name:
             ungrouped.append(name)
             continue
         try:
@@ -596,13 +656,8 @@ def aggregate_fused_siblings(
             resolved_entries: list[tuple[str, dict]] = []
             missing = []
             for m in members:
-                entry = None
-                entry_fmt = spec.name
-                for candidate_name in fr.aliases_for(spec.name):
-                    if candidate_name in costs.get(m, {}):
-                        entry = costs[m][candidate_name]
-                        entry_fmt = candidate_name
-                        break
+                entry, entry_fmt = _resolve_cost_entry(
+                    costs.get(m, {}), spec.name)
                 if entry is None or "error" in entry:
                     missing.append(m)
                 else:
@@ -613,16 +668,33 @@ def aggregate_fused_siblings(
             if resolved_entries:
                 super_cost_entry_fmt[spec.name] = resolved_entries[0][0]
             sum_pred = 0.0
+            member_terms = []
             for m, (_entry_fmt, c) in zip(members, resolved_entries):
                 # Mirrors build_candidates, including unmeasured packed
                 # output_mse fallback, bit-exact short-circuit, and
-                # format-alias lookup.
-                sum_pred += cost_entry_predicted_dloss(
+                # format-alias lookup. The calibrated gain is applied ONCE to
+                # the summed super-item dloss (below, at candidate build), so
+                # the per-member terms here — and the hedge conversion — are
+                # un-gained.
+                member_pred = cost_entry_predicted_dloss(
                     stats[m], c, format_name=spec.name)
-            effective_mse = sum_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
+                sum_pred += member_pred
+                member_terms.append((stats[m], c, member_pred, 1.0))
+            # Same UCB conversion as aggregate_packed_serving_groups: the
+            # LINEAR z·Σ(stderr) baked into sum_pred becomes the independence
+            # z·sqrt(Σ stderr²) (a qkv triple over-hedged at 3x linear now
+            # hedges at √3), and the aggregated stderr is stored so consumers
+            # of the aggregated cost table keep the hedge instead of silently
+            # reading stderr 0. weight_mse is derived from the UN-hedged sum
+            # so the super entry's mse is not z-contaminated.
+            hedge_linear, stderr_agg = _super_item_ucb_hedge(
+                member_terms, ucb_z)
+            base_pred = sum_pred - hedge_linear
+            effective_mse = base_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
             super_cost[spec.name] = {
                 "weight_mse": effective_mse,
-                "predicted_dloss": sum_pred,
+                "predicted_dloss": base_pred,
+                "predicted_dloss_stderr": stderr_agg,
             }
         costs_ext[super_name] = super_cost
 
@@ -650,7 +722,14 @@ def aggregate_fused_siblings(
             stats_ext[super_name]["_memory_bytes_by_format"][spec.name] = total_bytes
             entry_fmt = super_cost_entry_fmt.get(spec.name, spec.name)
             gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
-            predicted = entry["predicted_dloss"] * gain
+            # gain·(base + z·stderr_agg) == gain·base + z·sqrt(Σ (stderr·gain)²)
+            # for the single group-wide gain this path applies, i.e. exactly the
+            # packed path's construction. At z == 0 this is gain·sum_pred,
+            # bit-for-bit what this path produced before the hedge fix.
+            predicted = (
+                entry["predicted_dloss"]
+                + ucb_z * float(entry.get("predicted_dloss_stderr", 0.0))
+            ) * gain
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=bits_per_param,
@@ -706,9 +785,20 @@ def aggregate_packed_serving_groups(
     and the serving constraint price identical moves and post-DP MoE
     promotion becomes a validated no-op. Only formats legal for EVERY
     member are offered (member candidate sets already encode source /
-    profile / kernel-shape applicability). A group with no common legal
-    format falls back to individual rows so downstream promotion can
-    repair coherence rather than the group silently vanishing from the DP.
+    profile / kernel-shape applicability).
+
+    A group with NO common legal format falls back to individual rows, which
+    keeps it visible and attributable instead of silently vanishing from the
+    DP — but that state is NOT allocatable and the fallback does NOT "repair
+    coherence". Members can only be assigned from their own (by definition
+    disjoint) candidate lists, so whole-group promotion necessarily lands on a
+    format that is illegal for at least one member, and ``compute_achieved``
+    refuses to price it (AssertionError, at every target) rather than scoring
+    the unpriced member at zero Δloss — which would make the illegal state
+    look CHEAPEST to the min-Δloss ratchet. An empty intersection is an
+    upstream cost/legality bug to fix (a missing cost row, an over-tight
+    applicability mask, a passthrough-source mismatch), not a state to
+    allocate around.
 
     Non-grouped rows (attention, shared/dense MLP) pass through untouched.
     Extrapolated expert cost rows are ordinary members. Use
@@ -776,48 +866,24 @@ def aggregate_packed_serving_groups(
             )
             # UCB hedge (PRISMAQUANT_COST_UCB_Z > 0): each member candidate
             # was priced independently, so the sum above carries a LINEAR
-            # z·Σ(stderr·gain) hedge. The members' dloss estimates are
-            # independent measurements, so the stderr of the group SUM is
-            # sqrt(Σ stderr²): replace the linear per-member hedge with the
-            # independence aggregate, and store the aggregated stderr on the
-            # super cost entry so consumers of the aggregated cost table
-            # (aura additivity gate, repricing) keep the hedge instead of
-            # silently reading stderr 0. At z == 0 this is a no-op and the
-            # per-format dloss stays the exact sum of member candidates.
-            stderr_eff_sq = 0.0
-            hedge_linear = 0.0
+            # z·Σ(stderr·gain) hedge. Convert it to the independence
+            # aggregate and store the aggregated stderr on the super cost
+            # entry so consumers of the aggregated cost table keep the hedge
+            # instead of silently reading stderr 0. At z == 0 this is a no-op
+            # and the per-format dloss stays the exact sum of member
+            # candidates. Shared with aggregate_fused_siblings.
+            member_terms = []
             for m in members:
-                if float(member_cands[m][spec.name].predicted_dloss) <= 0.0:
-                    # Clamped-at-zero member: contributed no dloss (and no
-                    # hedge) to the sum; skip it symmetrically.
-                    continue
-                entry = None
-                entry_fmt = spec.name
-                for candidate_name in fr.aliases_for(spec.name):
-                    if candidate_name in costs.get(m, {}):
-                        entry = costs[m][candidate_name]
-                        entry_fmt = candidate_name
-                        break
-                if entry is None or "error" in entry:
-                    continue
-                # Mirror cost_entry_predicted_dloss: the stderr hedge only
-                # applies on the explicit predicted_dloss branch.
-                if _has_measured_output_mse(stats[m], entry):
-                    continue
-                if "predicted_dloss" not in entry:
-                    continue
-                try:
-                    stderr = float(
-                        entry.get("predicted_dloss_stderr", 0.0) or 0.0
-                    )
-                except (TypeError, ValueError):
-                    stderr = 0.0
-                if stderr <= 0.0:
-                    continue
-                gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
-                stderr_eff_sq += (stderr * gain) ** 2
-                hedge_linear += ucb_z * stderr * gain
-            stderr_agg = math.sqrt(stderr_eff_sq)
+                entry, entry_fmt = _resolve_cost_entry(
+                    costs.get(m, {}), spec.name)
+                member_terms.append((
+                    stats[m],
+                    entry,
+                    float(member_cands[m][spec.name].predicted_dloss),
+                    float(gains.get(spec.name, gains.get(entry_fmt, 1.0))),
+                ))
+            hedge_linear, stderr_agg = _super_item_ucb_hedge(
+                member_terms, ucb_z)
             base_pred = sum_pred - hedge_linear
             hedged_pred = base_pred + ucb_z * stderr_agg
             memory_by_fmt[spec.name] = total_bytes
@@ -832,9 +898,14 @@ def aggregate_packed_serving_groups(
                 predicted_dloss=max(hedged_pred, 0.0),
             ))
         if not cands:
-            # No format is legal for every member; aggregating would drop
-            # the whole group from the DP. Keep the members as individual
-            # rows (pre-refactor behavior: promotion repairs coherence).
+            # No format is legal for every member; aggregating would drop the
+            # whole group from the DP. Keep the members as individual rows
+            # (pre-refactor behavior) so the group stays visible and the
+            # failure is attributable — NOT because promotion can repair it.
+            # It cannot: the members' candidate lists are disjoint here, so
+            # promotion always lands on a format illegal for some member and
+            # every solve at every target ends in a compute_achieved pricing
+            # error. See this function's docstring.
             for m in members:
                 stats_ext[m] = stats[m]
                 costs_ext[m] = costs.get(m, {})

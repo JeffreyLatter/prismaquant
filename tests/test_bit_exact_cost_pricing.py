@@ -17,17 +17,19 @@ them the unbeatable global minimum at any budget while the served
 activations are still quantized.
 
 Contract pinned here:
-  - weight-bit-exact + PASSTHROUGH-activation format (act_bits is None)
+  - weight-bit-exact + PASSTHROUGH-activation format (act_bits None or >= 16)
     short-circuits to dloss 0.0 ("bit_exact" source);
   - weight-bit-exact + ACTIVATION-QUANTIZING format keeps its measured
     output_mse pricing — at entry, build_candidates, and packed-group
     aggregation level;
   - unknown formats and explicit-cost_source entries never short-circuit;
-  - the dtype-level fact used for the gate (FormatSpec.act_bits is None
-    <=> activation_quantize_dequantize is the identity) holds for every
+  - the dtype-level fact used for the gate (FormatSpec.act_quant_changes_input
+    <=> a non-identity activation_quantize_dequantize) holds for every
     registered format.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import torch
 
@@ -64,26 +66,127 @@ def _lossy_entry():
             "rel_output_mse": 1.9e-3}
 
 
-def test_registry_act_bits_declaration_matches_activation_callable():
-    """act_bits is None <=> activation_quantize_dequantize is the identity.
-
-    This is the dtype-level fact the bit-exact short-circuit relies on;
-    pin it against the actual callables so the registry cannot drift.
-    """
+def _random_activations():
     torch.manual_seed(1234)
-    x = torch.randn(4, 512, dtype=torch.float32) * 3.1
+    return torch.randn(4, 512, dtype=torch.float32) * 3.1
+
+
+def test_registry_act_bits_declaration_matches_activation_callable():
+    """act_quant_changes_input <=> activation_quantize_dequantize is NOT the
+    identity, for every registered format.
+
+    This is the dtype-level fact the bit-exact short-circuit relies on; pin it
+    against the actual callables so the registry cannot drift. Note the
+    equivalence is stated over the PROPERTY, not over ``act_bits is None``
+    directly: a weight-only format may declare either ``None`` or ``>= 16``
+    (see FormatSpec.act_quant_changes_input), and both are passthrough.
+    """
+    x = _random_activations()
     for name, spec in sorted(fr.REGISTRY.items()):
         out = spec.activation_quantize_dequantize(x.clone())
-        if spec.act_bits is None:
-            assert not spec.act_quant_changes_input
+        if not spec.act_quant_changes_input:
             assert torch.equal(out, x), (
-                f"{name}: act_bits=None declares a passthrough activation "
-                "path, but the callable changed the input")
+                f"{name}: act_bits={spec.act_bits} declares a passthrough "
+                "activation path, but the callable changed the input")
         else:
-            assert spec.act_quant_changes_input
             assert not torch.equal(out, x), (
                 f"{name}: act_bits={spec.act_bits} declares activation "
                 "quantization, but the callable is the identity")
+
+
+def test_act_bits_16_is_a_passthrough_declaration(monkeypatch):
+    """An A16 rung declared the NATURAL way (``act_bits=16`` — the spelling
+    every autoround_config dict in format_registry already uses for BF16 /
+    FP8_SOURCE / the W*A16 variants) means "activations are 16-bit", i.e. not
+    quantized away from the execution dtype. It must be classified as
+    passthrough, keep the bit-exact short-circuit, and satisfy the
+    registry-wide equivalence above — not be mispriced as a W-and-A format
+    and not turn that test red."""
+    spec = fr.FormatSpec(
+        name="_TEST_W4A16_EXPLICIT16",
+        weight_bits=4, group_size=16, scale_bits=8,
+        scale_dtype_name="fp8_e4m3", weight_element_dtype="fp4_e2m1",
+        act_bits=16, act_dtype_name="bfloat16",
+        activation_quantize_dequantize=lambda t: t,
+    )
+    assert not spec.act_quant_changes_input, (
+        "act_bits=16 means 16-bit (unquantized) activations")
+    # Satisfies the registry-wide equivalence rule.
+    x = _random_activations()
+    assert torch.equal(spec.activation_quantize_dequantize(x.clone()), x)
+
+    monkeypatch.setitem(fr.REGISTRY, spec.name, spec)
+    entry = _bit_exact_entry()
+    assert cost_entry_is_bit_exact(entry, spec.name)
+    assert cost_entry_predicted_dloss(
+        _STATS, entry, format_name=spec.name) == 0.0
+    assert cost_entry_source(_STATS, entry, spec.name) == "bit_exact"
+
+    # The same weight-lossless entry at the W-and-A spelling of the same
+    # nominal format keeps its measured A-side cost.
+    wa = fr.FormatSpec(
+        name="_TEST_W4A4_EXPLICIT4",
+        weight_bits=4, group_size=16, scale_bits=8,
+        scale_dtype_name="fp8_e4m3", weight_element_dtype="fp4_e2m1",
+        act_bits=4, act_dtype_name="fp4_e2m1",
+        activation_quantize_dequantize=lambda t: t * 0.5,
+    )
+    assert wa.act_quant_changes_input
+    monkeypatch.setitem(fr.REGISTRY, wa.name, wa)
+    assert not cost_entry_is_bit_exact(entry, wa.name)
+
+
+def test_activation_quant_predicate_has_one_definition():
+    """One predicate, one place: no module may re-derive "does this format
+    quantize the activations?" from ``act_bits``. Consumers that re-derived it
+    as ``act_bits is not None and act_bits < 16`` disagreed with the
+    allocator's gate, so a format's activation semantics could differ between
+    pricing and emulation."""
+    root = Path(fr.__file__).resolve().parent
+    allowed = {
+        # The definition itself.
+        "format_registry.py",
+        # Parses compressed-tensors CONFIG dicts (act_bits as serialized
+        # metadata), not FormatSpec objects.
+        "validation_harness.py",
+    }
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name in allowed:
+            continue
+        for lineno, line in enumerate(
+                path.read_text().splitlines(), start=1):
+            if "act_bits" not in line:
+                continue
+            if "is not None" in line or "< 16" in line:
+                offenders.append(
+                    f"{path.relative_to(root)}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "use FormatSpec.act_quant_changes_input instead of re-deriving the "
+        "predicate from act_bits:\n" + "\n".join(offenders))
+
+
+def test_activation_quant_assignment_uses_the_shared_predicate():
+    """The KL validator's activation-quant set is one of the four consumers
+    unified onto the property: passthrough formats (including the A16
+    variants) must not be emulated as activation-quantizing."""
+    from prismaquant.validate_assignments_kl import (
+        _activation_quant_assignment,
+    )
+
+    got = _activation_quant_assignment({
+        "wa_nvfp4": "NVFP4",
+        "wa_gguf": "Q4_K",
+        "wa_fp8": "FP8_DYNAMIC",
+        "a16_bf16": "BF16",
+        "a16_fp8_source": "FP8_SOURCE",
+        "a16_mxfp8": "MXFP8A16",
+        "a16_nvfp4": "NVFP4A16",
+        "a16_int8": "INT8_W8A16",
+    })
+    assert set(got) == {"wa_nvfp4", "wa_gguf", "wa_fp8"}
+    for qname, fmt in got.items():
+        assert fr.get_format(fmt).act_quant_changes_input, (qname, fmt)
 
 
 def test_passthrough_activation_bit_exact_prices_at_zero_dloss():

@@ -541,3 +541,69 @@ def test_role_split_requires_profile_capability():
         require_per_role_expert_scheme_support(None)
     with pytest.raises(SystemExit):
         require_per_role_expert_scheme_support("no_such_profile")
+
+
+# ---------------------------------------------------------------------------
+# A promoted-onto-illegal-format row must not be priced at zero Δloss
+# ---------------------------------------------------------------------------
+
+def test_compute_achieved_refuses_to_price_a_promoted_illegal_format():
+    """A PRICED row whose assigned format has no candidate is a hard error.
+
+    Serving-unit promotion can move a Linear onto a format its own candidate
+    set never offered (only possible when a group's member menus are
+    disjoint). Scoring that row at 0 Δloss made the unpriced state look
+    CHEAPEST — precisely what ``solve_with_promotion``'s min-Δloss ratchet
+    now selects on — and the error only surfaced later, in
+    ``compute_assignment_predicted_dloss``. Fail at the miscosting instead.
+    """
+    import pytest
+
+    stats, cands, expert_names, _dense = _mk_moe_fixture(n_experts=2)
+    specs, _rank = _solver_env()
+    crippled = expert_names[0]
+    cands[crippled] = [c for c in cands[crippled] if c.fmt == _LOW]
+
+    legal = {n: _LOW for n in cands}
+    ach, dloss = compute_achieved(stats, legal, specs, candidates=cands)
+    assert ach > 0.0 and dloss > 0.0
+
+    promoted = dict(legal)
+    promoted[crippled] = _HIGH  # what whole-group promotion would do
+    with pytest.raises(AssertionError, match="no candidate exists to price"):
+        compute_achieved(stats, promoted, specs, candidates=cands)
+
+    # Names that are NOT DP rows keep the unpriced byte-only path (aux /
+    # fixed-format rows, and the legacy candidates=None call form).
+    ach_nc, dloss_nc = compute_achieved(stats, legal, specs)
+    assert ach_nc > 0.0 and dloss_nc == 0.0
+
+
+def test_empty_intersection_fallback_is_not_allocatable():
+    """The empty-intersection fallback keeps the group visible in the DP, but
+    it is NOT a repair: members draw from disjoint candidate lists, so
+    whole-group promotion always lands on a format illegal for someone, and
+    the solve refuses to price it at any target. Pins the corrected docstring
+    (the old one claimed promotion would repair coherence)."""
+    import pytest
+
+    stats, cands, expert_names, _dense = _mk_moe_fixture(n_experts=2)
+    cands[expert_names[0]] = [
+        c for c in cands[expert_names[0]] if c.fmt == _LOW]
+    cands[expert_names[1]] = [
+        c for c in cands[expert_names[1]] if c.fmt == _HIGH]
+
+    costs = {n: {} for n in stats}
+    stats_ext, _costs_ext, cands_ext = aggregate_packed_serving_groups(
+        stats, costs, _specs(), cands, _PackedProfile())
+    assert not any(_PACKED_GROUP_MARKER in n for n in cands_ext), (
+        "empty-intersection group must not become a DP unit")
+
+    specs, rank = _solver_env()
+    low = fr.REGISTRY[_LOW].effective_bits
+    high = fr.REGISTRY[_HIGH].effective_bits
+    for target in (low + 0.05, high):
+        with pytest.raises(AssertionError, match="no candidate exists to price"):
+            solve_with_promotion(
+                stats_ext, cands_ext, target, specs, rank,
+                bit_precision=0.001, profile=_PackedProfile())

@@ -49,7 +49,9 @@ class FormatSpec:
     scale_dtype_name: str    # "fp8_e4m3", "uint8_e8m0", "fp32", ...
     weight_element_dtype: str   # "fp4_e2m1", "fp8_e4m3", "fp6_e3m2", "int4", ...
     scale_block_shape: tuple[int, int] | None = None
-    act_bits: int | None = None   # None = no activation quant (W8A16)
+    # None or >=16 = no activation quant (W8A16); see act_quant_changes_input,
+    # the single predicate every consumer must use for that question.
+    act_bits: int | None = None
     act_dtype_name: str | None = None
     act_group_size: int | None = None
     family: str = "generic"       # "nv", "mx", "int", "fp"
@@ -70,16 +72,36 @@ class FormatSpec:
     def act_quant_changes_input(self) -> bool:
         """Dtype-level fact: serving quantizes the INPUT activations.
 
-        ``act_bits is None`` declares a weight-only (A16 / passthrough)
-        format whose ``activation_quantize_dequantize`` is the identity.
-        Any other value means the serving kernel consumes quantized
+        A weight-only (A16 / passthrough) format declares its activation
+        path two equivalent ways, and BOTH mean "the kernel consumes the
+        activations at the execution dtype":
+
+          * ``act_bits is None`` — the field is simply not applicable
+            (BF16, FP8_SOURCE, NVFP4A16, MXFP8A16, INT8_W8A16, ...);
+          * ``act_bits >= 16`` — "activations are 16-bit", i.e. not
+            quantized away from bf16/fp16. This is the spelling the
+            ``autoround_config`` dicts in this module already use for the
+            same formats (``act_bits=16, act_data_type="float"``), so a
+            future A16 rung declared that way must not be mistaken for a
+            W·A· format.
+
+        Anything below 16 bits means the serving kernel consumes quantized
         activations (W·A· formats: NVFP4, FP8 dynamic, MX, GGUF Q8_1
         compute), so even a bit-identical weight tensor changes the layer
-        output through the A side. Registry consistency between this
-        declaration and the actual activation callable is pinned by
+        output through the A side.
+
+        This is the single predicate for that question. Consumers must use
+        it rather than re-deriving it from ``act_bits``: the allocator's
+        bit-exact cost short-circuit
+        (``allocator_candidates.cost_entry_is_bit_exact``), the KL
+        validator's activation-quant assignment, ``layer_state_cache`` and
+        ``perturbed_x_cache`` all key off this one property, so a format's
+        activation semantics cannot drift between pricing and emulation.
+        Registry consistency between this declaration and the actual
+        activation callable is pinned by
         tests/test_bit_exact_cost_pricing.py.
         """
-        return self.act_bits is not None
+        return self.act_bits is not None and int(self.act_bits) < 16
 
     @property
     def effective_bits(self) -> float:

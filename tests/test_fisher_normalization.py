@@ -16,7 +16,15 @@ Also pins:
     same convention end-to-end, scalar and blob;
   - the allocator's load-time renormalization: recompute from raw
     accumulators when meta carries the token count, hard-fail when it
-    does not (escape hatch: --allow-legacy-fisher-norm).
+    does not (escape hatch: --allow-legacy-fisher-norm);
+  - per-row denominator stamps win over the probe-wide meta count, so a
+    MERGED body+visual probe keeps each pass on its own writer's
+    denominator (the visual pass is finalized at its own calibration
+    size, and merge_probe_pickles keeps the BODY's meta);
+  - the h-detail units GATE: a blob whose recorded norm_tokens does not
+    match its row's scalar denominator (a v3 per-routed-token blob, or a
+    dir written at a different calibration size) is refused, not
+    silently mixed into the same knapsack.
 """
 from __future__ import annotations
 
@@ -29,7 +37,10 @@ from torch import nn
 
 from prismaquant.allocator import renormalize_probe_fisher
 from prismaquant.incremental_probe import finalize_fisher_stats
-from prismaquant.measure_quant_cost import HDetailIndex
+from prismaquant.measure_quant_cost import (
+    HDetailIndex,
+    h_detail_expected_norm_tokens,
+)
 from prismaquant.sensitivity_probe import FisherAccumulator, h_detail_blob
 
 
@@ -214,3 +225,209 @@ def test_allocator_no_raw_rows_is_silent_no_op():
     stats = {"dense": {"h_trace": 2.0, "n_tokens_seen": 32}}
     assert renormalize_probe_fisher(stats, {}) is None
     assert stats["dense"]["h_trace"] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Merged body+visual probe: the visual pass is finalized at its OWN global
+# token count, and merge_probe_pickles keeps the FIRST (body) shard's meta.
+# Renormalizing every row from the body's count would rescale visual rows by
+# body_tokens/visual_tokens (32x under pipeline defaults: 32x1024 vs 8x128).
+# ---------------------------------------------------------------------------
+_BODY_TOKENS = 32 * 1024
+_VISUAL_TOKENS = 8 * 128
+
+
+def _merged_body_visual_probe():
+    """What incremental_probe writes: body rows finalized at the body's
+    global count, visual rows at the visual pass', merged into one stats
+    dict under the BODY's meta."""
+    body = {"model.layers.0.self_attn.q_proj": {
+        "h_trace_raw": 64.0, "h_w2_sum_raw": 8.0,
+        "n_tokens_seen": _BODY_TOKENS}}
+    visual = {"visual.blocks.0.attn.qkv": {
+        "h_trace_raw": 64.0, "h_w2_sum_raw": 8.0,
+        "n_tokens_seen": _VISUAL_TOKENS}}
+    finalize_fisher_stats(body, _BODY_TOKENS)
+    finalize_fisher_stats(visual, _VISUAL_TOKENS)
+    return {**body, **visual}, {"fisher_norm_tokens": _BODY_TOKENS,
+                                "nsamples": 32, "seqlen": 1024}
+
+
+def test_merged_visual_rows_keep_their_own_writer_denominator():
+    stats, meta = _merged_body_visual_probe()
+    body_written = stats["model.layers.0.self_attn.q_proj"]["h_trace"]
+    visual_written = stats["visual.blocks.0.attn.qkv"]["h_trace"]
+    # The writer's values: same raw mass, different denominators.
+    assert visual_written == pytest.approx(64.0 / _VISUAL_TOKENS)
+    assert visual_written == pytest.approx(
+        body_written * _BODY_TOKENS / _VISUAL_TOKENS)
+
+    assert renormalize_probe_fisher(stats, meta) == _BODY_TOKENS
+    # Both rows come out exactly as their writer computed them.
+    assert stats["model.layers.0.self_attn.q_proj"]["h_trace"] == \
+        pytest.approx(body_written)
+    assert stats["visual.blocks.0.attn.qkv"]["h_trace"] == \
+        pytest.approx(visual_written)
+    assert stats["visual.blocks.0.attn.qkv"]["h_trace_norm_tokens"] == \
+        _VISUAL_TOKENS
+    assert stats["visual.blocks.0.attn.qkv"]["h_w2_sum"] == \
+        pytest.approx(8.0 / _VISUAL_TOKENS)
+
+
+def test_merged_probe_renormalization_is_idempotent():
+    stats, meta = _merged_body_visual_probe()
+    renormalize_probe_fisher(stats, meta)
+    once = {n: (s["h_trace"], s["h_w2_sum"]) for n, s in stats.items()}
+    renormalize_probe_fisher(stats, meta)
+    renormalize_probe_fisher(stats, meta)
+    assert {n: (s["h_trace"], s["h_w2_sum"])
+            for n, s in stats.items()} == once
+
+
+def test_row_stamp_carries_a_probe_whose_meta_lost_the_token_count():
+    """Row stamps alone are enough — no hard fail, no rescale."""
+    stats, _ = _merged_body_visual_probe()
+    before = {n: s["h_trace"] for n, s in stats.items()}
+    # The body denominator is the one most rows share, so it is reported.
+    assert renormalize_probe_fisher(stats, {}) == _BODY_TOKENS
+    assert {n: s["h_trace"] for n, s in stats.items()} == before
+
+
+def test_unstamped_rows_still_hard_fail_when_meta_is_empty():
+    """The gate must survive the per-row stamp path: a row with raw
+    accumulators, no stamp and no meta count is still fatal."""
+    stats, _ = _merged_body_visual_probe()
+    stats["legacy.row"] = {"h_trace_raw": 64.0, "h_trace": 16.0,
+                           "n_tokens_seen": 4}
+    with pytest.raises(SystemExit, match="allow-legacy-fisher-norm"):
+        renormalize_probe_fisher(stats, {})
+    assert stats["legacy.row"]["h_trace"] == pytest.approx(16.0)
+
+
+# ---------------------------------------------------------------------------
+# h-detail units gate (HDetailIndex): a blob must be on its row's scalar
+# denominator. Same hard-refusal idiom as prepare_cost_context's
+# packed_fisher_estimator gate.
+# ---------------------------------------------------------------------------
+def _write_blob(h_dir: Path, name: str, norm_tokens: int, *,
+                version: int = 4) -> None:
+    h_dir.mkdir(parents=True, exist_ok=True)
+    blob = h_detail_blob(torch.ones(2, 3), norm_tokens, name, kind="linear")
+    if version < 4:                      # emulate the pre-v4 writer
+        blob.pop("norm_tokens")
+        blob["h_detail_version"] = version
+    torch.save(blob, h_dir / (HDetailIndex._FNAME_SUB.sub("__", name) + ".pt"))
+
+
+def _probe_for(stats: dict, meta: dict) -> dict:
+    return {"stats": stats, "meta": meta}
+
+
+def test_h_detail_expected_norm_tokens_prefers_row_stamps():
+    stats, meta = _merged_body_visual_probe()
+    exp = h_detail_expected_norm_tokens(_probe_for(stats, meta))
+    assert exp["model.layers.0.self_attn.q_proj"] == _BODY_TOKENS
+    assert exp["visual.blocks.0.attn.qkv"] == _VISUAL_TOKENS
+    # Unstamped rows fall back to the probe-wide meta count.
+    exp2 = h_detail_expected_norm_tokens(
+        _probe_for({"a": {"h_trace_raw": 1.0}}, {"nsamples": 4, "seqlen": 8}))
+    assert exp2["a"] == 32
+    # No probe / no token info -> no expectations -> gate inert.
+    assert h_detail_expected_norm_tokens(None) == {}
+    assert h_detail_expected_norm_tokens(_probe_for({"a": {}}, {})) == {}
+
+
+def test_h_detail_index_accepts_matching_norm_tokens(tmp_path):
+    stats, meta = _merged_body_visual_probe()
+    names = list(stats)
+    for n in names:
+        _write_blob(tmp_path, n, stats[n]["h_trace_norm_tokens"])
+    index = HDetailIndex(
+        tmp_path, names,
+        expected_norm_tokens=h_detail_expected_norm_tokens(
+            _probe_for(stats, meta)))
+    assert len(index) == 2
+    for n in names:
+        assert index.load(n).shape == (2, 3)
+        assert index.load_blob(n)["norm_tokens"] == \
+            stats[n]["h_trace_norm_tokens"]
+
+
+def test_h_detail_index_refuses_v3_blob(tmp_path):
+    """A v3 blob has no norm_tokens: it was divided by the row's OWN token
+    count, per-ROUTED-token on unpacked expert rows."""
+    stats, meta = _merged_body_visual_probe()
+    name = "model.layers.0.self_attn.q_proj"
+    _write_blob(tmp_path, name, _BODY_TOKENS, version=3)
+    with pytest.raises(SystemExit) as ei:
+        HDetailIndex(tmp_path, [name],
+                     expected_norm_tokens=h_detail_expected_norm_tokens(
+                         _probe_for(stats, meta)))
+    msg = str(ei.value)
+    assert str(tmp_path) in msg          # names the blob dir
+    assert "no norm_tokens stamp" in msg
+    assert "per-ROUTED-token" in msg     # says why the units are wrong
+    assert "Regenerate" in msg           # tells the operator what to do
+
+
+def test_h_detail_index_refuses_wrong_calibration_size(tmp_path):
+    """A v4 blob written at a different calibration size is caught too —
+    the reason to compare norm_tokens rather than the version integer."""
+    stats, meta = _merged_body_visual_probe()
+    name = "model.layers.0.self_attn.q_proj"
+    _write_blob(tmp_path, name, _BODY_TOKENS // 2)
+    with pytest.raises(SystemExit, match="different calibration size"):
+        HDetailIndex(tmp_path, [name],
+                     expected_norm_tokens=h_detail_expected_norm_tokens(
+                         _probe_for(stats, meta)))
+
+
+def test_h_detail_index_refuses_visual_blob_on_the_body_denominator(tmp_path):
+    """The merged-probe case the gate must get right in BOTH directions: a
+    visual blob stamped with the BODY's count disagrees with its row's
+    scalar and is refused, while the correctly-stamped one is accepted."""
+    stats, meta = _merged_body_visual_probe()
+    name = "visual.blocks.0.attn.qkv"
+    expected = h_detail_expected_norm_tokens(_probe_for(stats, meta))
+    _write_blob(tmp_path, name, _BODY_TOKENS)
+    with pytest.raises(SystemExit, match="different calibration size"):
+        HDetailIndex(tmp_path, [name], expected_norm_tokens=expected)
+    _write_blob(tmp_path, name, _VISUAL_TOKENS)
+    assert len(HDetailIndex(tmp_path, [name],
+                            expected_norm_tokens=expected)) == 1
+
+
+def test_h_detail_gate_is_off_without_expectations(tmp_path):
+    """Archived/diagnostic readers that pass no probe keep working."""
+    name = "model.layers.0.self_attn.q_proj"
+    _write_blob(tmp_path, name, _BODY_TOKENS, version=3)
+    index = HDetailIndex(tmp_path, [name])
+    assert index.load(name).shape == (2, 3)
+
+
+def test_h_detail_gate_has_no_env_override_and_names_the_safe_escape():
+    """Unlike the packed_fisher_estimator gate there is deliberately no env
+    override: h-detail is optional, so the safe escape is to drop
+    --h-detail-dir (scalar-proxy fallback), not to admit wrong units."""
+    src = Path(HDetailIndex.__module__.replace(".", "/") + ".py")
+    text = (Path(__file__).resolve().parents[1] / src).read_text()
+    assert "ALLOW_STALE_H_DETAIL" not in text
+    assert "drop --h-detail-dir to fall back to the scalar proxy" in text
+
+
+def test_h_detail_gate_fires_on_every_read_not_just_construction(tmp_path):
+    """Construction checks one blob; a dir that goes stale per-row must
+    still be caught when that row is read."""
+    stats, meta = _merged_body_visual_probe()
+    names = list(stats)
+    expected = h_detail_expected_norm_tokens(_probe_for(stats, meta))
+    for n in names:
+        _write_blob(tmp_path, n, stats[n]["h_trace_norm_tokens"])
+    index = HDetailIndex(tmp_path, names, expected_norm_tokens=expected)
+    # Corrupt the second row's blob after the index was built.
+    _write_blob(tmp_path, names[1], 7)
+    with pytest.raises(SystemExit, match="different calibration size"):
+        index.load(names[1])
+    with pytest.raises(SystemExit, match="different calibration size"):
+        index.load_blob(names[1])
+    assert index.load(names[0]).shape == (2, 3)   # untouched row still fine

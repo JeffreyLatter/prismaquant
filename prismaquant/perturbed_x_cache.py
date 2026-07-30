@@ -366,7 +366,7 @@ def _build_module_plans(
         low_act = {
             p.spec.name: p.spec
             for p in plan.params
-            if p.spec.act_bits is not None and p.spec.act_bits < 16
+            if p.spec.act_quant_changes_input
         }
         if len(low_act) == 1:
             plan.act_spec = next(iter(low_act.values()))
@@ -855,7 +855,7 @@ class PerturbedActivationCache:
         low_act = {
             p.spec.name: p.spec
             for p in plan.params
-            if p.spec.act_bits is not None and p.spec.act_bits < 16
+            if p.spec.act_quant_changes_input
         }
         if len(low_act) == 1:
             return next(iter(low_act.values()))

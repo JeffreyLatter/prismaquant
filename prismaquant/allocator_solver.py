@@ -334,7 +334,22 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
                      format_specs: dict[str, fr.FormatSpec],
                      candidates: dict[str, list[Candidate]] | None = None,
                      ) -> tuple[float, float]:
-    """Return ``(avg_bits, total_predicted_dloss)`` for an assignment."""
+    """Return ``(avg_bits, total_predicted_dloss)`` for an assignment.
+
+    A priced row (a name present in ``candidates``) whose assigned format has
+    no candidate is a HARD ERROR, not a zero-cost row. It means promotion put
+    that Linear on a format its own candidate set never offered — the format
+    is illegal for it, and pricing the move at 0 Δloss made the unpriced row
+    look free. That mattered the moment ``solve_with_promotion`` started
+    ratcheting on this Δloss: the contaminated (too-low) sum is exactly what
+    the min-Δloss ratchet would prefer. ``compute_assignment_predicted_dloss``
+    already refuses the same input, so failing here only moves the same error
+    to where the miscosting happens.
+
+    Names ABSENT from ``candidates`` (and the ``candidates=None`` byte-only
+    call form) stay on the unpriced byte path: they are not DP rows, so they
+    contribute bytes and no Δloss.
+    """
     total_params = sum(stats[n]["n_params"] for n in assignment)
     total_bits = 0.0
     total_predicted_dloss = 0.0
@@ -347,6 +362,15 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
             total_predicted_dloss += float(
                 getattr(chosen_cand, "predicted_dloss", 0.0))
             continue
+        if n in cs:
+            raise AssertionError(
+                f"assignment {n!r} picked fmt={fmt!r}, but no candidate "
+                "exists to price its predicted loss (available: "
+                f"{sorted(c.fmt for c in cs[n])}). Serving-unit promotion "
+                "moved a priced Linear onto a format its candidate set never "
+                "offered; scoring it at zero Δloss would bias the solver's "
+                "min-Δloss ratchet toward exactly this unpriced state."
+            )
         memory_map = stats[n].get("_memory_bytes_by_format")
         if memory_map is not None and fmt in memory_map:
             total_bits += 8.0 * memory_map[fmt]
@@ -390,6 +414,7 @@ def solve_with_promotion(
     stall_threshold: float = 1e-4,
     stall_grace: int = 3,
     profile=None,
+    diagnostics: dict | None = None,
 ) -> tuple[dict[str, str] | None, float]:
     """Solve, promote coupled tensors, and retry if promotion exceeds budget.
 
@@ -436,10 +461,36 @@ def solve_with_promotion(
     acceleration; ``stall_grace`` is retained for call compatibility but
     unused (both phases shrink their search state every evaluation, so
     they cannot stall).
+
+    Pass ``diagnostics`` (an empty dict) to receive the numbers an INFEASIBLE
+    verdict needs to be actionable — they are otherwise computed and thrown
+    away. The dict is filled IN PLACE, on every return path:
+
+      ``target_bits``, ``min_bits`` (the DP baseline: cheapest-candidate
+      average bits, i.e. the format floor), ``overshoot_tolerance``,
+      ``evals``, ``feasible``, ``achieved_bits`` / ``predicted_dloss`` (the
+      returned iterate, ``None`` when INFEASIBLE), ``closest_achieved_bits``
+      / ``closest_tightened_target`` (the least-overshooting iterate seen —
+      "how close did it get"), and ``floor_achieved_bits`` (what the DP floor
+      itself promoted to, the number that distinguishes "target below the
+      format floor" from "serving-group promotion overshoots").
     """
     del stall_grace  # legacy fixed-point knob; see docstring
     stall_eps = float(stall_threshold)
     target = float(target_bits)
+    diag = diagnostics if diagnostics is not None else {}
+    diag.update({
+        "target_bits": target,
+        "min_bits": None,
+        "overshoot_tolerance": float(overshoot_tolerance),
+        "evals": 0,
+        "feasible": False,
+        "achieved_bits": None,
+        "predicted_dloss": None,
+        "closest_achieved_bits": None,
+        "closest_tightened_target": None,
+        "floor_achieved_bits": None,
+    })
     names = list(candidates.keys())
     total_params = sum(stats[n]["n_params"] for n in names)
     if total_params <= 0:
@@ -449,6 +500,7 @@ def solve_with_promotion(
         * stats[n]["n_params"]
         for n, cs in candidates.items()
     ) / total_params
+    diag["min_bits"] = float(min_bits)
     if target < min_bits - 1e-6:
         return None, float("nan")
 
@@ -465,6 +517,7 @@ def solve_with_promotion(
         """
         nonlocal best_assign, best_achieved, best_dloss
         t0 = time.time() if _SOLVER_TRACE else 0.0
+        diag["evals"] += 1
         result = solve_allocation(stats, candidates, t, bit_precision)
         if result is None:
             if _SOLVER_TRACE:
@@ -489,6 +542,13 @@ def solve_with_promotion(
                   f"achieved={achieved:.4f} dloss={predicted:.3e} "
                   f"({time.time() - t0:.1f}s)",
                   flush=True)
+        if abs(t - min_bits) <= 1e-9:
+            diag["floor_achieved_bits"] = float(achieved)
+        if achieved - target > overshoot_tolerance:
+            closest = diag["closest_achieved_bits"]
+            if closest is None or achieved < closest:
+                diag["closest_achieved_bits"] = float(achieved)
+                diag["closest_tightened_target"] = float(t)
         if achieved - target <= overshoot_tolerance and (
                 best_assign is None
                 or predicted < best_dloss
@@ -496,6 +556,9 @@ def solve_with_promotion(
             best_assign = assign
             best_achieved = achieved
             best_dloss = predicted
+            diag["feasible"] = True
+            diag["achieved_bits"] = float(achieved)
+            diag["predicted_dloss"] = float(predicted)
         return achieved
 
     # Phase 1: damped descent until the first feasible iterate. Promotion
@@ -568,5 +631,10 @@ def solve_with_promotion(
                 hi = mid
 
     if best_assign is None:
+        if _SOLVER_TRACE:
+            print(f"[solver] target={target:.4f} INFEASIBLE after "
+                  f"{diag['evals']} evals: floor={min_bits:.4f} "
+                  f"floor_achieved={diag['floor_achieved_bits']} "
+                  f"closest={diag['closest_achieved_bits']}", flush=True)
         return None, float("nan")
     return best_assign, best_achieved

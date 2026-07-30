@@ -63,6 +63,7 @@ from .measure_quant_cost import (
     _finalize_results,
     _measure_packed_experts,
     _normalize_fisher_output_mse_row_weights,
+    h_detail_expected_norm_tokens,
     measure_batched_gpu,
     measure_unbatched,
     prepare_cost_context,
@@ -1039,7 +1040,7 @@ def main():
     # regions such as MTP and visual tower rows. Incremental runs can
     # deliberately exclude those regions, so scope missing-activation
     # validation to the actual shard schedule below.
-    _, stats, act_cache, _, missing_act_all, _, specs = prepare_cost_context(
+    probe, stats, act_cache, _, missing_act_all, _, specs = prepare_cost_context(
         probe_path=args.probe,
         activation_cache_dir=args.activation_cache_dir,
         formats_csv=args.formats,
@@ -1069,7 +1070,13 @@ def main():
     if args.h_detail_dir:
         detail_path = Path(args.h_detail_dir)
         if detail_path.exists():
-            h_detail = HDetailIndex(detail_path, set(stats.keys()))
+            # Gated on the probe's per-row Fisher denominators: a stale
+            # h-detail dir (v3 blobs = per-ROUTED-token on expert rows, or
+            # a dir from a different calibration size) is refused here
+            # rather than silently mis-scaling predicted_dloss.
+            h_detail = HDetailIndex(
+                detail_path, set(stats.keys()),
+                expected_norm_tokens=h_detail_expected_norm_tokens(probe))
             print(f"[incremental-cost] h-detail cache: {len(h_detail)} Linears "
                   "→ per-weight Δloss + Fisher row-weighted output MSE",
                   flush=True)

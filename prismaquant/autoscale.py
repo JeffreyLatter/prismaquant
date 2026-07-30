@@ -97,6 +97,13 @@ def _act_width(cfg: dict) -> int:
 # checkpoint (`layers.N.ffn.experts.7.w1.weight`) naming.
 _EXPERT_TENSOR_RE = re.compile(r"\.experts\.\d+\.")
 
+# safetensors dtype names for a 1-byte integer plane — what a nibble-packed
+# MXFP4 expert weight ships as. Both spellings must be priced the same way
+# the decode treats them: `layer_streaming._check_mxfp4_packed_grid` accepts
+# int8 *and* uint8 nibble-packs, so sizing only "I8" would leave a U8
+# checkpoint undercounted 4x.
+_PACKED_BYTE_DTYPES = frozenset({"I8", "U8"})
+
 
 def declared_fp4_expert_dtype(model_path: str) -> bool:
     """True when the checkpoint config *explicitly* declares packed-FP4
@@ -110,10 +117,16 @@ def declared_fp4_expert_dtype(model_path: str) -> bool:
     try:
         with open(os.path.join(model_path, "config.json")) as f:
             cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return False
+        tc = cfg.get("text_config")
+        tc = tc if isinstance(tc, dict) else {}
+        val = cfg.get("expert_dtype") or tc.get("expert_dtype") or ""
     except Exception:
+        # Absent, unreadable, or unexpectedly-shaped config: not declared.
+        # Sizing wrongly here silently mis-budgets the streaming cache, so
+        # every failure mode resolves to "verbatim" rather than to a guess.
         return False
-    tc = cfg.get("text_config") or {}
-    val = cfg.get("expert_dtype") or tc.get("expert_dtype") or ""
     return str(val).lower() in {"fp4", "mxfp4", "mx_fp4"}
 
 
@@ -145,7 +158,7 @@ def _shard_resident_bytes(path: Path, dtype_bytes: int,
     raw file size undercounts them 2x and blows the memory budget.
 
     ``fp4_experts`` is the checkpoint's explicit packed-FP4 expert
-    declaration (`declared_fp4_expert_dtype`): per-expert I8 tensors are
+    declaration (`declared_fp4_expert_dtype`): per-expert I8/U8 tensors are
     then MXFP4 nibble-packs that dequant to TWO logical elements of the
     execution dtype per on-disk byte (a 4x undercount at bf16 if sized
     verbatim). Other non-float dtypes stay verbatim.
@@ -167,7 +180,7 @@ def _shard_resident_bytes(path: Path, dtype_bytes: int,
         off = meta["data_offsets"]
         nbytes = int(off[1]) - int(off[0])
         dtype_name = str(meta.get("dtype", "")).upper()
-        if (fp4_experts and dtype_name == "I8"
+        if (fp4_experts and dtype_name in _PACKED_BYTE_DTYPES
                 and _EXPERT_TENSOR_RE.search(key)):
             total += nbytes * 2 * int(dtype_bytes)
             continue

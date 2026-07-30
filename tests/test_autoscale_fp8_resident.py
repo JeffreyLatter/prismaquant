@@ -7,6 +7,7 @@ memory budget. The estimate must be dtype-aware the way
 """
 import json
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -87,15 +88,38 @@ def test_declared_fp4_expert_estimate_quadruples_disk_bytes(tmp_path):
     assert per_layer_weight == int(packed_bytes * 2 * 2 * 0.90)
 
 
-def test_undeclared_int8_expert_stays_verbatim(tmp_path):
-    """No expert_dtype declaration -> I8 is genuine int8, kept 1 byte/elem
-    (the explicit config declaration, never a shape/name heuristic alone,
-    is what flips the MXFP4 pricing)."""
+def test_declared_fp4_expert_estimate_covers_uint8_packs(tmp_path):
+    """`layer_streaming._check_mxfp4_packed_grid` accepts int8 AND uint8
+    nibble-packs, so both must price at 2 logical elements x execution
+    dtype per packed byte. Sizing only I8 left a U8-packed checkpoint with
+    the 4x undercount that under-evicts before every load."""
+    packed_bytes = 256 * 128
+    d = tmp_path / "fp4u8"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(
+        json.dumps({"model_type": "toy", "expert_dtype": "fp4"}))
+    save_file(
+        {"model.layers.0.mlp.experts.0.gate_proj.weight":
+         torch.zeros(256, 128, dtype=torch.uint8)},
+        str(d / "model.safetensors"),
+    )
+    per_layer_weight, _ = A.estimate_per_layer_bytes(
+        str(d), num_layers=1, hidden_size=64, nsamples=1, seqlen=1,
+        dtype_bytes=2,
+    )
+    assert per_layer_weight == int(packed_bytes * 2 * 2 * 0.90)
+
+
+@pytest.mark.parametrize("packed_dtype", [torch.int8, torch.uint8])
+def test_undeclared_byte_expert_stays_verbatim(tmp_path, packed_dtype):
+    """No expert_dtype declaration -> a 1-byte integer expert tensor is
+    genuine int8/uint8, kept 1 byte/elem (the explicit config declaration,
+    never a shape/name heuristic alone, is what flips MXFP4 pricing)."""
     packed_bytes = 256 * 128
     path = _write_model(
-        tmp_path / "i8",
+        tmp_path / f"raw-{packed_dtype}".replace(".", "-"),
         {"model.layers.0.mlp.experts.0.gate_proj.weight":
-         torch.zeros(256, 128, dtype=torch.int8)},
+         torch.zeros(256, 128, dtype=packed_dtype)},
     )
     per_layer_weight, _ = A.estimate_per_layer_bytes(
         path, num_layers=1, hidden_size=64, nsamples=1, seqlen=1,

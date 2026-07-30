@@ -1039,61 +1039,90 @@ def renormalize_probe_fisher(stats: dict, meta: dict, *,
     inflation is ~n_experts/top_k (≈32x on a 256-expert top-8 model);
     the degenerate 1-routed-token case reaches ~33,000x at a 32k-token
     calibration. Dense rows saw exactly the global count, so their values
-    are unchanged; probes written by the fixed finalize
-    (meta.fisher_norm_tokens) renormalize to identical values — the
-    recompute is idempotent.
+    are unchanged; probes written by the fixed finalize renormalize to
+    identical values — the recompute is idempotent (see PER-ROW STAMPS).
 
-    Returns the token count used, or None when the probe carries raw
-    accumulators but no usable token count. In that case the default is a
-    HARD ERROR (SystemExit) — silently allocating on routed-token-
-    normalized Fisher mis-spends the bit budget; `allow_legacy=True`
+    PER-ROW STAMPS WIN. A row that already carries ``h_trace_norm_tokens``
+    was written by a fixed finalize (the field was introduced with it) and
+    is already divided by the global count of the pass that PRODUCED it —
+    which is not always this probe's meta count. `incremental_probe` merges
+    the multimodal visual pass (finalized at ``n_samples x max_text_len``,
+    e.g. 8x128) into the body probe, and `merge_probe_pickles` keeps the
+    FIRST shard's meta (the body's, e.g. 32x1024), so recomputing every row
+    from the meta count would rescale the visual rows by ~32x away from
+    what their writer computed — and would not be idempotent. Honouring the
+    row stamp keeps each row on its own writer's denominator and makes the
+    recompute a true no-op for any probe written by the fixed finalize.
+
+    Returns the probe-wide token count (the meta fallback used for
+    unstamped rows), or None when nothing could be renormalized. A row
+    with raw accumulators, no stamp, and no usable meta count is a HARD
+    ERROR (SystemExit) — silently allocating on routed-token-normalized
+    Fisher mis-spends the bit budget; `allow_legacy=True`
     (--allow-legacy-fisher-norm) downgrades it to a warning and keeps the
     probe's stored h_trace values.
     """
     meta = meta or {}
-    norm_tokens = int(meta.get("fisher_norm_tokens", 0) or 0)
-    if norm_tokens <= 0:
-        norm_tokens = (int(meta.get("nsamples", 0) or 0)
+    meta_tokens = int(meta.get("fisher_norm_tokens", 0) or 0)
+    if meta_tokens <= 0:
+        meta_tokens = (int(meta.get("nsamples", 0) or 0)
                        * int(meta.get("seqlen", 0) or 0))
-    if norm_tokens > 0:
-        renormed = 0
-        for entry in stats.values():
-            if not isinstance(entry, dict) or "h_trace_raw" not in entry:
-                continue
-            entry["h_trace"] = float(entry["h_trace_raw"]) / norm_tokens
-            if "h_w2_sum_raw" in entry:
-                entry["h_w2_sum"] = (
-                    float(entry["h_w2_sum_raw"]) / norm_tokens)
-            per_raw = entry.get("h_trace_per_expert_raw")
-            if per_raw is not None:
-                entry["h_trace_per_expert"] = [
-                    float(v) / norm_tokens for v in per_raw]
-            # Keep the probe-side stamp truthful on legacy pickles.
-            entry["h_trace_norm_tokens"] = norm_tokens
-            renormed += 1
-        print(f"[alloc] Fisher renormalized: {renormed}/{len(stats)} rows "
-              f"→ h_trace_raw / {norm_tokens} global calib tokens "
-              "(per-expert routed-count normalization corrected)", flush=True)
-        return norm_tokens
 
-    raw_rows = sum(
-        1 for e in stats.values()
-        if isinstance(e, dict) and "h_trace_raw" in e)
-    if raw_rows:
+    renormed = 0
+    unresolvable = 0
+    denominators: dict[int, int] = {}
+    for entry in stats.values():
+        if not isinstance(entry, dict) or "h_trace_raw" not in entry:
+            continue
+        # The row's own writer-stamped denominator, else the probe-wide one.
+        row_tokens = int(entry.get("h_trace_norm_tokens", 0) or 0)
+        if row_tokens <= 0:
+            row_tokens = meta_tokens
+        if row_tokens <= 0:
+            unresolvable += 1
+            continue
+        entry["h_trace"] = float(entry["h_trace_raw"]) / row_tokens
+        if "h_w2_sum_raw" in entry:
+            entry["h_w2_sum"] = (
+                float(entry["h_w2_sum_raw"]) / row_tokens)
+        per_raw = entry.get("h_trace_per_expert_raw")
+        if per_raw is not None:
+            entry["h_trace_per_expert"] = [
+                float(v) / row_tokens for v in per_raw]
+        # Keep the probe-side stamp truthful on legacy pickles.
+        entry["h_trace_norm_tokens"] = row_tokens
+        denominators[row_tokens] = denominators.get(row_tokens, 0) + 1
+        renormed += 1
+
+    if unresolvable:
         msg = (
-            "probe meta lacks fisher_norm_tokens and nsamples/seqlen, so "
-            f"h_trace cannot be renormalized by the global calib token "
-            f"count ({raw_rows} rows carry raw Fisher accumulators). "
-            "Legacy per-row normalization inflates routed-expert rows by "
-            "(global/routed) — typically ~n_experts/top_k — and the "
-            "allocator would mis-spend the bit budget on rarely-routed "
-            "experts. Re-run the probe with current code (it stamps "
-            "meta.fisher_norm_tokens), or pass --allow-legacy-fisher-norm "
-            "to proceed with the stored legacy values anyway.")
+            "probe rows carry raw Fisher accumulators but no usable token "
+            "count: neither a per-row h_trace_norm_tokens stamp nor "
+            f"meta.fisher_norm_tokens / nsamples+seqlen ({unresolvable} of "
+            f"{len(stats)} rows). h_trace cannot be renormalized by the "
+            "global calib token count; legacy per-row normalization inflates "
+            "routed-expert rows by (global/routed) — typically "
+            "~n_experts/top_k — and the allocator would mis-spend the bit "
+            "budget on rarely-routed experts. Re-run the probe with current "
+            "code (it stamps meta.fisher_norm_tokens), or pass "
+            "--allow-legacy-fisher-norm to proceed with the stored legacy "
+            "values anyway.")
         if not allow_legacy:
             raise SystemExit(f"[alloc] ERROR: {msg}")
         print(f"[alloc] WARNING (--allow-legacy-fisher-norm): {msg}",
               flush=True)
+
+    if renormed:
+        mix = ", ".join(f"{n}x{cnt} rows"
+                        for n, cnt in sorted(denominators.items()))
+        print(f"[alloc] Fisher renormalized: {renormed}/{len(stats)} rows "
+              f"→ h_trace_raw / global calib tokens [{mix}] "
+              "(per-expert routed-count normalization corrected)", flush=True)
+        if meta_tokens > 0:
+            return meta_tokens
+        # Meta-less probe carried entirely by row stamps: report the
+        # denominator the most rows share (the body pass').
+        return max(denominators.items(), key=lambda kv: (kv[1], kv[0]))[0]
     return None
 
 
@@ -1122,8 +1151,9 @@ def main():
                          "the allocator hard-errors instead and asks for "
                          "--model-override.")
     ap.add_argument("--allow-legacy-fisher-norm", action="store_true",
-                    help="Permit allocation from a probe whose meta lacks "
-                         "fisher_norm_tokens / nsamples+seqlen, i.e. whose "
+                    help="Permit allocation from a probe whose rows carry "
+                         "neither a per-row h_trace_norm_tokens stamp nor "
+                         "meta fisher_norm_tokens / nsamples+seqlen, i.e. whose "
                          "h_trace cannot be renormalized by the global calib "
                          "token count. Such probes carry the legacy per-row "
                          "normalization that inflates routed-expert Fisher "
@@ -1866,6 +1896,10 @@ def main():
         return None
 
     _solve_cache: dict[float, tuple] = {}
+    # Solver diagnostics per target, kept beside the memo so a cache hit never
+    # loses them: an INFEASIBLE rung's only explanation lives here (the solver
+    # sees the format floor and every over-target iterate, then discards both).
+    _solve_diagnostics: dict[float, dict] = {}
 
     def _solve_for_target(target_bits: float):
         """Solve the body-budget DP at one target bit budget.
@@ -1895,12 +1929,15 @@ def main():
             return None, float("nan"), float("inf"), float("inf")
         if mutable_target_bits < 0.0:
             return None, float("nan"), float("inf"), float("inf")
+        diag: dict = {}
+        _solve_diagnostics[round(float(target_bits), 9)] = diag
         assign, achieved_r = solve_with_promotion(
             stats, candidates, mutable_target_bits, format_specs, format_rank,
             args.bit_precision,
             no_fused_promote=args.no_fused_promote,
             overshoot_tolerance=args.overshoot_tolerance,
             profile=model_profile,
+            diagnostics=diag,
         )
         if assign is None:
             return None, float("nan"), float("inf"), float("inf")
@@ -2346,9 +2383,28 @@ def main():
     # Emit chosen layer_config for target_bits.
     assignment, achieved, total, mutable_total = _solve_for_target(args.target_bits)
     if assignment is None:
+        # An infeasibility exit must say WHICH wall was hit: a target under the
+        # format floor needs a different --formats menu, while a target the
+        # floor clears but serving-group promotion overshoots needs a slightly
+        # looser target. The solver recorded both; report them.
+        d = _solve_diagnostics.get(round(float(args.target_bits), 9), {})
+        floor = d.get("min_bits")
         raise SystemExit(
-            f"Infeasible at target_bits={args.target_bits}. "
-            "Consider raising the target or widening the format set.")
+            f"Infeasible at target_bits={args.target_bits}."
+            + (f" The format floor (cheapest legal format everywhere) is "
+               f"{floor:.3f} bpp" if isinstance(floor, (int, float)) else "")
+            + (f", and that floor solve itself promotes to "
+               f"{d['floor_achieved_bits']:.3f} bpp"
+               if isinstance(d.get("floor_achieved_bits"), (int, float)) else "")
+            + (f". Closest of {d.get('evals', 0)} DP solves: "
+               f"{d['closest_achieved_bits']:.3f} bpp"
+               if isinstance(d.get("closest_achieved_bits"), (int, float))
+               else "")
+            + (f" against an overshoot tolerance of "
+               f"{d['overshoot_tolerance']}" if "overshoot_tolerance" in d
+               else "")
+            + ". Raise --target-bits above the achievable value above, or "
+              "widen --formats so the floor drops.")
     print(
         f"[alloc] target_bits={args.target_bits}: "
         f"achieved_bits={achieved:.3f}, Δloss={total:.3e}",

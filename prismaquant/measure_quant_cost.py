@@ -251,6 +251,40 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
     return out
 
 
+def h_detail_expected_norm_tokens(probe: dict | None) -> dict[str, int]:
+    """Per-row Fisher denominator each h-detail blob is required to carry.
+
+    An h-detail blob and the scalar ``h_trace`` for the SAME row must be
+    divided by the SAME token count, or `predicted_dloss` prices that row
+    on a different scale than the rest of the knapsack. The blob records
+    its denominator as ``norm_tokens`` (schema v4) and the probe stat
+    records the scalar's as ``h_trace_norm_tokens``; this builds the
+    row -> expected map so `HDetailIndex` can refuse a mismatch.
+
+    Row stamps win over the probe-wide ``meta.fisher_norm_tokens`` so a
+    MERGED probe validates per row: the multimodal visual pass is
+    finalized at its own (smaller) calibration size, and its blobs are
+    stamped to match, so comparing them against the body's count would
+    reject correct blobs. Rows with neither a stamp nor a usable meta
+    count get no expectation and are left unchecked (nothing to compare).
+    """
+    if not isinstance(probe, dict):
+        return {}
+    meta = probe.get("meta") or {}
+    fallback = int(meta.get("fisher_norm_tokens", 0) or 0)
+    if fallback <= 0:
+        fallback = (int(meta.get("nsamples", 0) or 0)
+                    * int(meta.get("seqlen", 0) or 0))
+    out: dict[str, int] = {}
+    for name, entry in (probe.get("stats") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        n = int(entry.get("h_trace_norm_tokens", 0) or 0) or fallback
+        if n > 0:
+            out[str(name)] = n
+    return out
+
+
 class HDetailIndex:
     """Disk-backed Fisher H-diagonal cache — the per-weight equivalent
     of `ActivationIndex`.
@@ -258,18 +292,36 @@ class HDetailIndex:
     Points at a directory where `sensitivity_probe.FisherAccumulator`
     dumped per-Linear `[out, in]` tensors (and per-packed-expert
     `[E, M]` tensors). `load(name)` returns the H diagonal tensor for
-    that Linear on demand."""
+    that Linear on demand.
+
+    ``expected_norm_tokens`` (from `h_detail_expected_norm_tokens`) turns
+    on the Fisher-denominator gate: every blob read must carry a
+    ``norm_tokens`` stamp equal to its row's scalar denominator
+    (`_check_blob_norm_tokens`). Omit it (default) for archived/diagnostic
+    readers that have no probe at hand."""
 
     _FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
 
-    def __init__(self, detail_dir: "Path", candidate_names):
+    def __init__(self, detail_dir: "Path", candidate_names,
+                 *, expected_norm_tokens: "dict[str, int] | None" = None):
         self.detail_dir = detail_dir
+        self.expected_norm_tokens = dict(expected_norm_tokens or {})
         self._paths: dict[str, Path] = {}
         for name in candidate_names:
             fname = self._FNAME_SUB.sub("__", name) + ".pt"
             fp = detail_dir / fname
             if fp.is_file():
                 self._paths[name] = fp
+        # Fail fast on one blob at construction rather than after hours of
+        # cost measurement: a stale h-detail dir is uniform, so the first
+        # checkable blob is representative. Sorted so the blob named in the
+        # error is the same on every run (candidate_names is often a set).
+        for name in sorted(self._paths):
+            if name in self.expected_norm_tokens:
+                self._check_blob_norm_tokens(name, torch.load(
+                    self._paths[name], map_location="cpu",
+                    weights_only=False))
+                break
 
     def __contains__(self, name: str) -> bool:
         return name in self._paths
@@ -277,16 +329,65 @@ class HDetailIndex:
     def __len__(self) -> int:
         return len(self._paths)
 
+    def _check_blob_norm_tokens(self, name: str, blob: dict) -> None:
+        """Refuse an h-detail blob not on its row's Fisher denominator.
+
+        A v3 (or unmarked) blob has no ``norm_tokens``: those writers
+        divided each row by its OWN token count, which for an unpacked
+        per-expert Linear is its ROUTED-token count rather than the
+        global calibration token count the scalar `h_trace` uses — so
+        such a blob is (global/routed)x hot, typically ~n_experts/top_k
+        (~32x on a 256-expert top-8 model). A v4 blob whose stamp simply
+        disagrees is an h-detail dir written at a different calibration
+        size. Either way the units are wrong for `predicted_dloss` and
+        the directory must be regenerated; this is the same hard-refusal
+        idiom as the packed_fisher_estimator gate in prepare_cost_context.
+
+        Deliberately NO env override, unlike that gate: h-detail is
+        optional, so dropping ``--h-detail-dir`` already gives a safe
+        escape (the cost step falls back to the scalar proxy) instead of
+        admitting known-mis-scaled units into the knapsack.
+        """
+        expected = self.expected_norm_tokens.get(name)
+        if not expected:
+            return
+        found = int(blob.get("norm_tokens", 0) or 0)
+        if found == int(expected):
+            return
+        version = int(blob.get("h_detail_version", 0) or 0)
+        if found > 0:
+            why = (f"blob norm_tokens={found} != this row's Fisher "
+                   f"denominator {expected} (h-detail directory written at "
+                   "a different calibration size than the probe)")
+        else:
+            why = (f"blob carries no norm_tokens stamp (h_detail_version="
+                   f"{version or 'unmarked'}, pre-v4): that writer divided "
+                   "each row by its OWN token count — per-ROUTED-token for "
+                   "unpacked per-expert Linears, not the global calibration "
+                   f"token count ({expected}) the scalar h_trace uses, so "
+                   "expert rows are (global/routed)x hot (typically "
+                   "~n_experts/top_k)")
+        raise SystemExit(
+            f"h-detail blob for {name!r} in {self.detail_dir}: {why}. "
+            "predicted_dloss built from it would price this row on a "
+            "different scale than the rest of the knapsack. Regenerate the "
+            f"h-detail directory with the current probe (delete "
+            f"{self.detail_dir} and re-run the probe with --h-detail-dir), "
+            "or drop --h-detail-dir to fall back to the scalar proxy.")
+
     def load(self, name: str) -> torch.Tensor:
         blob = torch.load(self._paths[name], map_location="cpu",
                           weights_only=False)
+        self._check_blob_norm_tokens(name, blob)
         return self.h_diag_from_blob(blob)
 
     def load_blob(self, name: str) -> dict:
         """Return the full saved dict (for callers that want g2_per_token,
         kind, version, etc., not just h_diag)."""
-        return torch.load(self._paths[name], map_location="cpu",
+        blob = torch.load(self._paths[name], map_location="cpu",
                           weights_only=False)
+        self._check_blob_norm_tokens(name, blob)
+        return blob
 
     @staticmethod
     def h_diag_from_blob(blob: dict) -> torch.Tensor:
@@ -299,13 +400,17 @@ class HDetailIndex:
         ``units: "per_token"`` via `sensitivity_probe.h_detail_blob`
         (audits M9 + the PR #14 global-denominator fix). Legacy blobs:
 
-          - v3 ``h_diag`` (or unmarked): accepted as per-token. Caveats,
-            both undetectable from the blob alone — regenerate the
-            h-detail dir if expert rows matter: (a) v3 blobs for
-            UNPACKED per-expert Linears divided by the row's ROUTED
-            token count, (global/routed)× hotter than the v4/scalar
-            scale; (b) pre-v3 sensitivity blobs for those rows
-            additionally divided by route_prob (audit M4).
+          - v3 ``h_diag`` (or unmarked): still converted here — this
+            staticmethod is a pure units-tagged reader with no probe to
+            compare against. The DENOMINATOR gate lives in
+            `HDetailIndex._check_blob_norm_tokens`, which refuses any
+            blob lacking a ``norm_tokens`` stamp matching its row's
+            scalar denominator (v3 blobs for UNPACKED per-expert Linears
+            divided by the row's ROUTED token count, (global/routed)×
+            hotter than the v4/scalar scale; pre-v3 sensitivity blobs for
+            those rows additionally divided by route_prob, audit M4).
+            Reads that go through `HDetailIndex.load`/`load_blob` are
+            therefore gated; a bare `h_diag_from_blob(blob)` call is not.
           - raw ``H``: the old incremental writer's token-SUMMED
             accumulator — ~n_tokens× hot for this consumer. Refuse
             rather than silently mis-scale predicted_dloss; regenerate
@@ -1704,7 +1809,8 @@ def run_cost_pass(model: nn.Module,
                   mode: str,
                   chunk_size: int,
                   output_path: str,
-                  h_detail_dir: str | None = None):
+                  h_detail_dir: str | None = None,
+                  probe: dict | None = None):
     chosen_mode = mode
     if chosen_mode == "auto":
         chosen_mode = "batched" if device.startswith("cuda") else "unbatched"
@@ -1719,7 +1825,9 @@ def run_cost_pass(model: nn.Module,
     if h_detail_dir:
         detail_path = Path(h_detail_dir)
         if detail_path.exists():
-            h_detail = HDetailIndex(detail_path, target_names)
+            h_detail = HDetailIndex(
+                detail_path, target_names,
+                expected_norm_tokens=h_detail_expected_norm_tokens(probe))
             print(f"[cost] h-detail cache: {len(h_detail)} / {len(target_names)} "
                   "Linears have h-detail → using per-weight Δloss and "
                   "Fisher row-weighted output MSE when available",

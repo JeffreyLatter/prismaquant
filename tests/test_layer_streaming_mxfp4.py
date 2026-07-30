@@ -57,20 +57,25 @@ def _scalar_reference_decode(packed: torch.Tensor,
 
 def _write_dsv4_checkpoint(tmp_path, experts: dict[int, tuple],
                            attn_fp8: tuple | None = None,
-                           declare_fp4: bool = True):
+                           declare_fp4: bool = True,
+                           scale_fmt: str | None = "ue8m0"):
     """Minimal DSv4-style checkpoint: `.scale` siblings, flat naming,
     `expert_dtype` declared at config top level (as DeepSeek-V4-Flash
-    ships it) next to a block-FP8 quantization_config."""
+    ships it) next to a block-FP8 quantization_config.
+
+    `scale_fmt=None` omits the scale-format declaration (real DSv4-Flash
+    ships `expert_dtype` without one)."""
     cfg = {
         "model_type": "deepseek_v4",
         "architectures": ["DeepseekV4ForCausalLM"],
         "quantization_config": {
             "quant_method": "fp8",
             "fmt": "e4m3",
-            "scale_fmt": "ue8m0",
             "weight_block_size": [128, 128],
         },
     }
+    if scale_fmt is not None:
+        cfg["quantization_config"]["scale_fmt"] = scale_fmt
     if declare_fp4:
         cfg["expert_dtype"] = "fp4"
     (tmp_path / "config.json").write_text(json.dumps(cfg))
@@ -144,12 +149,51 @@ def test_declared_tensor_with_wrong_layout_raises():
     # Declared MXFP4 but the scale grid is not (rows, packed/16).
     w = torch.zeros(4, 32, dtype=torch.int8)
     with pytest.raises(ValueError, match="declared MXFP4"):
-        _check_mxfp4_packed_grid("t", w, torch.zeros(4, 4))
+        _check_mxfp4_packed_grid("t", w, torch.zeros(4, 4, dtype=torch.uint8))
     # Declared MXFP4 but the weight is not an int8 nibble-pack.
     with pytest.raises(ValueError, match="declared MXFP4"):
         _check_mxfp4_packed_grid(
             "t", torch.zeros(4, 32, dtype=torch.bfloat16),
-            torch.zeros(4, 2))
+            torch.zeros(4, 2, dtype=torch.uint8))
+
+
+def test_declared_scale_plane_must_be_e8m0_dtype():
+    """Step 3b reinterprets the scale sibling as a raw E8M0 byte plane
+    (`view(torch.uint8)` + `exp2(b - 127)`). float8_e4m3fn is the same
+    width, so a width check would let it through and decode every block at
+    a wrong power-of-two scale. uint8 / int8 / float8_e8m0fnu pass."""
+    w = torch.zeros(4, 32, dtype=torch.int8)
+    with pytest.raises(ValueError, match="declared MXFP4"):
+        _check_mxfp4_packed_grid(
+            "t", w, torch.zeros(4, 2).to(torch.float8_e4m3fn))
+    # fp32 scale planes are rejected too (they are not a byte plane).
+    with pytest.raises(ValueError, match="declared MXFP4"):
+        _check_mxfp4_packed_grid("t", w, torch.zeros(4, 2))
+    for dt in (torch.uint8, torch.int8, torch.float8_e8m0fnu):
+        _check_mxfp4_packed_grid("t", w, torch.zeros(4, 2).to(dt))
+
+
+def test_declared_non_e8m0_scale_fmt_raises(tmp_path):
+    """The decode hardcodes the E8M0 exponent interpretation, so a
+    checkpoint that declares a different scale encoding must fail loudly
+    at map-build time rather than have its bytes reinterpreted."""
+    packed, scale = _rand_expert()
+    _write_dsv4_checkpoint(tmp_path, {0: (packed, scale)}, scale_fmt="e4m3")
+    with pytest.raises(ValueError, match="scale_fmt"):
+        _build_fp8_scale_inv_map(str(tmp_path))
+
+
+def test_missing_scale_fmt_is_not_fatal(tmp_path):
+    """Real DSv4-Flash declares `expert_dtype` with no scale-format field;
+    the per-tensor dtype allow-list is what guards the reinterpretation."""
+    packed, scale = _rand_expert()
+    _write_dsv4_checkpoint(tmp_path, {0: (packed, scale)}, scale_fmt=None)
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    assert fp8_map.mxfp4_names == {_live(0)}
+    out = {_live(0): packed.clone()}
+    assert _apply_fp8_dequant_inplace(out, fp8_map, CPU) == 1
+    _assert_bitwise_equal_bf16(
+        out[_live(0)], _scalar_reference_decode(packed, scale))
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +266,48 @@ def test_layer_cache_estimate_prices_declared_fp4_experts_4x(tmp_path):
     assert sizes_fp4[0] == 64 * 32 * 2 * 2 + 16 * 16 * 2
     est_i8, sizes_i8 = _estimate_layer_cache_bytes(fp4_experts=False, **kw)
     assert sizes_i8[0] == 64 * 32 * 1 + 16 * 16 * 2
+
+
+@pytest.mark.parametrize("packed_dtype", [torch.int8, torch.uint8])
+def test_layer_cache_estimate_matches_real_resident_bytes(tmp_path,
+                                                          packed_dtype):
+    """The pre-load estimate must equal what `LayerCache` actually accounts
+    for the decoded tensor. `_check_mxfp4_packed_grid` accepts int8 AND
+    uint8 nibble-packs, so both spellings must price at 2 logical elements
+    x execution dtype per packed byte — sizing only I8 left a U8 checkpoint
+    with the original 4x undercount that under-evicts and makes prefetch
+    refuse layers."""
+    from prismaquant.layer_streaming import LayerCache
+    from prismaquant.streaming_model import _estimate_layer_cache_bytes
+
+    rows, packed_in = 4, 32
+    g = torch.Generator().manual_seed(11)
+    packed = torch.randint(0, 256, (rows, packed_in), dtype=torch.uint8,
+                           generator=g)
+    if packed_dtype is torch.int8:
+        packed = packed.view(torch.int8)
+    scale = torch.full((rows, packed_in // 16), 127, dtype=torch.uint8)
+    _write_dsv4_checkpoint(tmp_path, {0: (packed, scale)})
+
+    # Real decode -> real LayerCache accounting.
+    fp8_map = _build_fp8_scale_inv_map(str(tmp_path))
+    assert fp8_map.mxfp4_names == {_live(0)}
+    out = {_live(0): packed.clone()}
+    assert _apply_fp8_dequant_inplace(out, fp8_map, CPU) == 1
+    resident = LayerCache(max_bytes=1 << 30)._sizeof(out)
+
+    shard = str(tmp_path / "model.safetensors")
+    ckpt = "layers.0.ffn.experts.0.w1.weight"
+    kw = dict(weight_shard={_live(0): shard},
+              weight_ckpt={_live(0): ckpt},
+              layers_prefix="model.layers.", num_layers=1,
+              target_dtype=torch.bfloat16)
+    _est, sizes = _estimate_layer_cache_bytes(fp4_experts=True, **kw)
+    assert sizes[0] == resident == rows * packed_in * 2 * 2
+    # No declaration -> genuine 1-byte integer tensor, sized verbatim.
+    _est_u, sizes_undeclared = _estimate_layer_cache_bytes(
+        fp4_experts=False, **kw)
+    assert sizes_undeclared[0] == rows * packed_in * 1
 
 
 # ---------------------------------------------------------------------------
