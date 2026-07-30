@@ -251,9 +251,17 @@ def source_tensor_bytes_manifest(
         # base (and its sidecars still hang off `<base>.scale` etc.).
         base = name[: -len(".weight")] if name.endswith(".weight") else name
         total = nb + sum(spans.get(base + s, 0) for s in _SIDECAR_SUFFIXES)
-        live = name_map(name) if name_map is not None else name
-        if not live:
-            continue  # dropped by the profile (never re-encoded; stays in floor)
+        # A live-graph mapper declining a key does NOT mean the tensor has no
+        # source bytes, so it must not drop out of the manifest: MTP sidecars
+        # are the live case (transformers v5 removed the module, so
+        # `checkpoint_to_live_name("mtp.fc.weight")` is None on the Qwen
+        # profiles) while the exporter still re-encodes `mtp.*` from exactly
+        # these bytes, and the allocator assigns them under their raw names.
+        # Fall back to the checkpoint key so such a name resolves. This is
+        # inert for tensors nothing re-encodes: the floor is
+        # `checkpoint_total - sum(resolved re-encoded spans)`, so a manifest
+        # entry no `reencoded_names` member references never moves it.
+        live = (name_map(name) if name_map is not None else name) or name
         if live.endswith(".weight"):
             live = live[: -len(".weight")]
         _add(live, total)

@@ -400,6 +400,53 @@ def test_manifest_case_b_packed_3d_without_weight_suffix(tmp_path):
     assert info["floor_bytes"] == 1600
 
 
+def test_manifest_keeps_tensors_the_live_name_map_declines(tmp_path):
+    """A live-graph mapper returning None must not delete source bytes.
+
+    Measured regression (round-2 review, real Qwen3.6-27B checkpoint): the MTP
+    sidecar ships as `mtp.*` tensors on disk, but transformers v5 dropped the
+    module, so `Qwen3_5DenseProfile.checkpoint_to_live_name("mtp.fc.weight")`
+    is None. The exporter still re-encodes `mtp.*` from exactly those bytes and
+    the allocator assigns them under their raw names, so dropping them from the
+    manifest made every `--target-disk-gb` run on an MTP-carrying model die in
+    `resolve_reencoded_source_bytes`. Raw-key fallback resolves them, and stays
+    inert for tensors nothing re-encodes (the floor subtracts only resolved
+    re-encoded spans).
+    """
+    _write_safetensors(tmp_path / "m.safetensors", {
+        "model.layers.0.mlp.gate_proj.weight": ("BF16", (16, 8)),  # 256
+        "mtp.fc.weight": ("BF16", (8, 8)),                         # 128
+        "mtp.norm.weight": ("BF16", (8,)),                         # 16
+        "model.visual.blocks.0.attn.qkv.weight": ("BF16", (8, 8)),  # 128
+        "embed.weight": ("BF16", (100, 8)),                        # 1600
+    })
+    # Both live classes the Qwen profiles decline: the MTP sidecar and, on a
+    # multimodal probe, the visual tower.
+    declines = lambda k: (  # noqa: E731
+        None if k.startswith(("mtp.", "model.visual.")) else k)
+
+    m = fp.source_tensor_bytes_manifest(str(tmp_path), name_map=declines)
+    assert m["mtp.fc"] == 128, "declined key must survive under its raw name"
+    assert m["model.visual.blocks.0.attn.qkv"] == 128
+    assert m["model.layers.0.mlp.gate_proj"] == 256
+
+    stats = {n: {"n_params": 64, "in_features": 8, "out_features": 8}
+             for n in ("model.layers.0.mlp.gate_proj", "mtp.fc")}
+    # Re-encoding the MTP Linear removes its span from the floor...
+    info = fp.floor_bytes_for_model(
+        str(tmp_path), ["model.layers.0.mlp.gate_proj", "mtp.fc"], stats,
+        name_map=declines)
+    assert info["reencoded_source_bytes"] == 256 + 128
+    # embed 1600 + mtp.norm 16 + the un-re-encoded visual tensor 128
+    assert info["floor_bytes"] == 1600 + 16 + 128
+    # ...and a declined tensor NOT re-encoded stays in the floor untouched:
+    # the extra manifest entries cannot move it.
+    body_only = fp.floor_bytes_for_model(
+        str(tmp_path), ["model.layers.0.mlp.gate_proj"], stats,
+        name_map=declines)
+    assert body_only["floor_bytes"] == 1600 + 16 + 128 + 128
+
+
 def test_unresolved_reencoded_name_is_a_hard_error(tmp_path):
     # PR-15 review: a re-encoded Linear the manifest cannot resolve must be
     # a hard error NAMING the tensor, raised before the numbers are consumed
