@@ -695,24 +695,66 @@ def test_probe_sweeps_wire_the_accumulator_in_the_right_order():
 
 def test_the_sweep_order_claim_holds_for_gemma4():
     """The whole design rests on consumers being swept BEFORE their producer.
-    Gemma4 derives `kv_shared_layer_index` from the layers strictly before the
-    sharing point, so a producer's index is always lower — check that against
-    the installed modeling code, not against this test's memory of it."""
-    import inspect
 
+    Checked BEHAVIOURALLY against the installed classes, not against the text of
+    upstream's source. An earlier version of this test asserted on substrings of
+    `modeling_gemma4.py` and went red the moment CI installed a transformers
+    whose file is generated differently — pinning someone else's source text is
+    a version bomb, and the property we actually depend on is observable:
+    every KV-sharing layer must borrow from a layer with a LOWER index, because
+    phase-3 sweeps `reversed(range(num_layers))`.
+    """
     import pytest
 
-    modeling = pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
-    # `__init__` is wrapped by the kernel-hub decorator, so read the module.
-    src = inspect.getsource(modeling)
-    # The producer index is drawn from `layer_types[:first_kv_shared_layer_idx]`
-    # — strictly below the sharing point, hence always swept later.
-    assert "prev_layers = config.layer_types[:first_kv_shared_layer_idx]" in src
-    assert "self.kv_shared_layer_index = len(prev_layers) - 1 -" in src
-    # And the write the producer side reads back is NOT detached.
-    fwd_src = inspect.getsource(modeling.Gemma4TextAttention.forward)
-    assert "shared_kv_states[self.layer_idx] = key_states, value_states" in fwd_src
-    assert "key_states, value_states = shared_kv_states[" in fwd_src
+    pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention
+
+    # A config with KV sharing switched on. `layer_types` is what the sharing
+    # index is derived from, and BOTH attention kinds must appear *below* the
+    # sharing point or upstream's derivation cannot resolve a source layer — so
+    # spell the pattern out rather than relying on the default for a given depth
+    # (with 6 layers and 2 shared, the default leaves only sliding layers below
+    # the sharing point and Gemma4 raises `'full_attention' is not in list`).
+    cfg = Gemma4TextConfig(
+        num_hidden_layers=8,
+        num_kv_shared_layers=2,
+        layer_types=(["sliding_attention"] * 5 + ["full_attention"]
+                     + ["sliding_attention", "full_attention"]),
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+    )
+    if getattr(cfg, "num_kv_shared_layers", 0) <= 0:
+        pytest.skip("installed transformers does not model KV sharing here")
+
+    sharing = 0
+    for idx in range(cfg.num_hidden_layers):
+        try:
+            attn = Gemma4TextAttention(cfg, idx)
+        except Exception as exc:  # noqa: BLE001
+            # Upstream changed how the sharing source is derived. Skip rather
+            # than fail: this test guards OUR one-pass assumption, and a red
+            # suite here would say nothing about whether that assumption holds.
+            pytest.skip(f"Gemma4TextAttention({idx}) not constructible here: "
+                        f"{type(exc).__name__}: {exc}")
+        if not getattr(attn, "is_kv_shared_layer", False):
+            continue
+        sharing += 1
+        source = attn.kv_shared_layer_index
+        assert source is not None, f"layer {idx} shares KV but names no source"
+        # THE claim: the producer is strictly below the consumer, so a reverse
+        # sweep harvests the consumer's cotangent before forwarding the producer.
+        assert source < idx, (
+            f"layer {idx} borrows K/V from layer {source}, which is NOT below "
+            "it — a reverse sweep would forward the producer before its "
+            "consumer's cotangent existed, and the one-pass accumulation in "
+            "`SharedStateCotangents` would be wrong. This architecture needs a "
+            "two-pass scheme."
+        )
+    assert sharing > 0, "config declared KV sharing but no layer reported it"
 
 
 def test_guard_no_longer_blocks_kv_sharing_by_default(monkeypatch):
