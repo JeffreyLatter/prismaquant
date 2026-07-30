@@ -1163,6 +1163,122 @@ def renormalize_probe_fisher(stats: dict, meta: dict, *,
     return None
 
 
+_FISHER_CAP_ROLE_RE = re.compile(r"layers\.(\d+)\.[a-z_]+\.([a-z_]+)$")
+
+
+def _fisher_cap_role(qname: str) -> str | None:
+    """Role bucket for the robust-Fisher clip, or ``None`` to skip the row.
+
+    Deliberately the REFERENCE TOOL's grouping
+    (``/home/rob/dq-runs/robust_fisher_clip.py``), not the wider
+    ``_parse_role_from_qname`` used for bit attribution: it requires exactly
+    one container segment between ``layers.<N>.`` and the leaf, so dense
+    attention/MLP projections bucket by their leaf role
+    (``q_proj``/``k_proj``/``v_proj``/``o_proj``/``gate_proj``/``up_proj``/
+    ``down_proj``) and everything else — packed and unpacked MoE experts,
+    shared experts, MTP/visual sidecars, non-``layers`` names — is skipped.
+    That is the grouping the 4B research result was measured under; widening
+    it would change the medians and is a separate, unmeasured lever.
+    """
+    m = _FISHER_CAP_ROLE_RE.search(qname)
+    return m.group(2) if m else None
+
+
+def clip_probe_fisher_outliers(stats: dict, meta: dict | None = None, *,
+                               cap_multiplier: float | None = None
+                               ) -> dict | None:
+    """OPT-IN robust-Fisher clip: cap each row's ``h_trace`` at
+    ``K x median(h_trace)`` over its role bucket.
+
+    Off unless ``PRISMAQUANT_FISHER_CAP_MULTIPLIER`` is set (or
+    ``cap_multiplier`` is passed explicitly); when off this is a byte-identical
+    no-op and returns ``None``. Research lever — a per-role h_trace clip at
+    K=3 measured ~5% better WikiText PPL at 6.0 bpp on Qwen3-4B (2026-05-19),
+    never promoted to a default because it has no served A/B.
+
+    Rationale: ``predicted_dloss = 1/2 h_trace MSE`` is linear in ``h_trace``,
+    so a handful of heavy-tailed Fisher rows can capture the DP's whole bit
+    budget. Clipping the tail bounds that leverage without touching the rest
+    of the distribution (values below the cap are unchanged).
+
+    ``h_w2_sum`` is rescaled by the same ratio so the derived cost math stays
+    consistent with the clipped scalar, exactly as the reference tool does.
+    The raw accumulators (``h_trace_raw`` / ``h_w2_sum_raw``) are NOT touched
+    — they remain the source of truth for renormalization, so this must run
+    AFTER :func:`renormalize_probe_fisher`, never before.
+
+    Returns a summary dict (``cap_multiplier``, ``role_median``, ``role_cap``,
+    ``n_clipped``, ``n_considered``) when active, else ``None``.
+    """
+    import os
+    import statistics
+
+    if cap_multiplier is None:
+        raw = os.environ.get("PRISMAQUANT_FISHER_CAP_MULTIPLIER")
+        if raw is None or not str(raw).strip():
+            return None
+        try:
+            cap_multiplier = float(raw)
+        except (TypeError, ValueError):
+            raise SystemExit(
+                "[alloc] ERROR: PRISMAQUANT_FISHER_CAP_MULTIPLIER must be a "
+                f"float multiple of the per-role median, got {raw!r}.")
+    K = float(cap_multiplier)
+    if not (K > 0.0) or not math.isfinite(K):
+        raise SystemExit(
+            "[alloc] ERROR: PRISMAQUANT_FISHER_CAP_MULTIPLIER must be a "
+            f"finite value > 0 (it is a multiple of the role median), got {K}.")
+
+    by_role: dict[str, list[float]] = defaultdict(list)
+    for qname, entry in stats.items():
+        if not isinstance(entry, dict):
+            continue
+        role = _fisher_cap_role(qname)
+        if role is None:
+            continue
+        by_role[role].append(float(entry.get("h_trace", 0.0) or 0.0))
+
+    role_median = {r: statistics.median(v) for r, v in by_role.items() if v}
+    role_cap = {r: K * m for r, m in role_median.items()}
+
+    n_clipped = 0
+    n_considered = 0
+    for qname, entry in stats.items():
+        if not isinstance(entry, dict):
+            continue
+        role = _fisher_cap_role(qname)
+        if role is None:
+            continue
+        cap = role_cap.get(role)
+        if cap is None:
+            continue
+        n_considered += 1
+        old = float(entry.get("h_trace", 0.0) or 0.0)
+        if old <= cap:
+            continue
+        entry["h_trace"] = cap
+        old_w2 = entry.get("h_w2_sum")
+        if old_w2 is not None and old > 0:
+            entry["h_w2_sum"] = float(old_w2) * (cap / old)
+        n_clipped += 1
+
+    summary = {
+        "schema": "prismaquant.robust_fisher_clip.v1",
+        "cap_multiplier": K,
+        "role_median": role_median,
+        "role_cap": role_cap,
+        "n_clipped": n_clipped,
+        "n_considered": n_considered,
+    }
+    if isinstance(meta, dict):
+        meta.setdefault("clip_history", []).append(summary)
+    print(f"[alloc] robust Fisher clip ACTIVE (research lever, "
+          f"PRISMAQUANT_FISHER_CAP_MULTIPLIER={K:g}): clipped {n_clipped} of "
+          f"{n_considered} role-bucketed rows at K x per-role median "
+          f"({len(role_median)} roles)", flush=True)
+    return summary
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
@@ -1454,6 +1570,13 @@ def main():
     # renormalize_probe_fisher for the full story.
     renormalize_probe_fisher(stats, probe.get("meta", {}),
                              allow_legacy=args.allow_legacy_fisher_norm)
+
+    # ---- Robust Fisher clip (opt-in research lever) ----
+    # PRISMAQUANT_FISHER_CAP_MULTIPLIER=K caps each dense row's h_trace at
+    # K x its role's median. Unset => byte-identical no-op. Must run AFTER
+    # the renormalization above (it clips the finalized scalar, not the raw
+    # accumulator). See clip_probe_fisher_outliers.
+    clip_probe_fisher_outliers(stats, probe.get("meta", {}))
 
     allow_pinned = [s.strip() for s in (args.allow_pinned or "").split(",") if s.strip()]
     allocation_excluded = []

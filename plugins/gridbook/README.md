@@ -9,8 +9,14 @@ GEMM. Zero vLLM-core patches.
 This file is the **developer** view for people working inside `prismaquant`.
 The user-facing docs (INSTALL / TROUBLESHOOTING / BENCHMARKS / SPEC / cards)
 live in the separate public repo `github.com/RobTand/gridbook`, whose package
-tree mirrors this one (that tree is at `__version__` 0.1.1; this copy declares
-0.1.0 — `gridbook/__init__.py:13`; the rest of the drift is doc-path strings).
+tree mirrors this one; the rest of the drift is doc-path strings.
+
+**Versions.** PyPI serves **0.1.1**, and the standalone `/home/rob/gridbook`
+repo is the **release source** — releases are cut there, never from this tree.
+This in-tree copy is the **development head**: `__version__ = "0.2.0.dev0"`
+(`gridbook/__init__.py:16`), a dev suffix that says truthfully "unreleased,
+post-0.1.1" — it is ahead of the released package in kernel work (R6 smem LUT,
+single-storage dense weights) and must never be read as a published version.
 
 Format and kernel contracts: `docs/lanes/nvfp4-cb/STANDARDS.md` (authoritative),
 byte layout `docs/lanes/nvfp4-cb/LAYOUT.md`.
@@ -19,7 +25,7 @@ byte layout `docs/lanes/nvfp4-cb/LAYOUT.md`.
 
 | Route | Command |
 |---|---|
-| Published | `pip install gridbook` (PyPI **0.1.1**, released tokenlessly by the tag pipeline 2026-07-28) |
+| Published | `pip install gridbook` (PyPI **0.1.1**, released tokenlessly by the tag pipeline 2026-07-28 from `/home/rob/gridbook`) |
 | In-tree, editable | `pip install -e plugins/gridbook --no-deps` |
 | Serve container | the serve scripts copy the tree in and `pip install -e` it (`scripts/serve_laguna_smoke.sh:54-55`) |
 
@@ -31,7 +37,7 @@ fallbacks — a correctness path, not a speed path. `tp=1` only.
 
 ## Registration and dispatch
 
-`register()` (`gridbook/plugin.py:121-143`) registers `PrismaQuantConfig` under
+`register()` (`gridbook/plugin.py:129-151`) registers `PrismaQuantConfig` under
 registry key **`gridbook`**, plus the legacy alias **`prismaquant`** that older
 shipped artifacts carry in their `config.json`. Both dispatch to the same config
 (`config.py:223`, `:242-250`). Registration is via the
@@ -82,25 +88,43 @@ match neither their stacked nor their per-expert mapping. For those archs
 (`install_toplevel_cb_expert_loader`, `moe_toplevel_loader.py`) that fills the
 registered fused params and delegates everything else unchanged.
 
-Wired today (`plugin.py:66-118`):
+The opt-in is **data**: one vLLM *module path* per arch in
+`_CB_TOPLEVEL_MODULE_PATHS` (`plugin.py:91-118`), fed to
+`_install_on_module_classes` (`:38-63`), which discovers the entrypoint classes
+each module *defines*. Module paths rather than class imports because class names
+drift across vLLM versions (Qwen3.5 alone has ForCausalLM / MoeForCausalLM /
+(Moe)ForConditionalGeneration), a missing module degrades to a no-op, and
+over-installing is harmless. Adding an arch is **one line** — promote the tuple
+to a JSON sidecar only if third parties need to extend it without patching.
 
-| Arch | Class | Line |
-|---|---|---|
-| HunYuan V3 | `HYV3ForCausalLM` | `:73-77` |
-| HunYuan V3 MTP drafter | `HYV3MTP` | `:85-89` |
-| poolside Laguna S/XS 2.x | `LagunaForCausalLM` | `:97-101` |
-| Qwen3.5-MoE (+ MTP, + VL wrapper classes) | discovered from the module, not name-pinned | `:114-115` |
-| **DSv4-class** | **not wired — TODO** | `:117-118` |
+Wired today:
 
-**An unwired arch fails silently.** The engine boots, no warning is emitted
-(vLLM does not warn on never-matched checkpoint tensors), the FusedMoE params
-keep their initialization memory, and generation is garbage ("D D D…"). Cost on
-Laguna: one wasted boot plus an hour of dispatch theory when the answer was one
-registry line. **Garbage generation on a new MoE arch ⇒ check this list first.**
-The wrap is inert for non-CB checkpoints (it only fires on
+| Arch | Module path |
+|---|---|
+| HunYuan V3 | `vllm.model_executor.models.hy_v3` |
+| HunYuan V3 MTP drafter | `…models.hy_v3_mtp` |
+| poolside Laguna S/XS 2.x | `…models.laguna` |
+| Qwen3.5-MoE (+ MTP, + VL wrapper classes) | `…models.qwen3_5`, `…models.qwen3_5_mtp` |
+| **DSv4-class** | **commented candidate** — `…models.deepseek_v4`, uncomment once the module exists in the target build (`:114-117`) |
+
+**An unwired arch used to fail silently.** The engine booted, no warning was
+emitted (vLLM does not warn on never-matched checkpoint tensors), the FusedMoE
+params kept their initialization memory, and generation was garbage ("D D D…").
+Cost on Laguna: one wasted boot plus an hour of dispatch theory when the answer
+was one registry line. It is now a **hard serve-time failure**: `create_weights`
+stamps `_pq_cb_filled = False` on `w13/w2_cb_qweight`, both fill paths (the
+per-layer instance hook in `moe.py`, `moe_toplevel_loader.load_weights`) stamp
+`True`, and `process_weights_after_loading` raises — naming the model class and
+the module path to add — if a registered, non-empty stack was never filled
+(`cb_fill_guard.py`). No env bypass; scoped to the params the local rank
+registered, so an EP/PP-absent or zero-expert shard is skipped. A
+`--load-format dummy` boot is not a supported CB path and will trip it.
+
+The wrap itself is inert for non-CB checkpoints (it only fires on
 `…experts.<proj>.cb_qweight`), so over-installing is harmless. Tests:
 `tests/test_toplevel_loader.py` (routing, deferral, shared-MLP fuse, MTP spec-layer
-rename, HF-mapper prefixes, idempotence).
+rename, HF-mapper prefixes, idempotence) and `tests/test_cb_fill_guard.py`
+(loader-not-installed ⇒ raises; installed ⇒ passes).
 
 Bringing up a new arch also needs the pipeline-side profile + structure spec; see
 the `gridbook-new-MoE-arch` checklist in auto-memory.

@@ -47,6 +47,9 @@ _EXPERT_LEAF_RE = re.compile(
 
 class MiniMaxM2Profile(ModelProfile):
 
+    # Detection priority (lower = consulted first): disjoint.
+    priority = 160
+
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
         if model_type in {"minimax_m2", "minimax-m2", "minimax_m2.7"}:

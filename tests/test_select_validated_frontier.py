@@ -496,3 +496,145 @@ def test_load_assignment_unwraps_assignment_key(tmp_path):
         "assignment": {"model.layers.0.mlp.up_proj": "nvfp4"},
     }))
     assert _load_assignment(path) == {"model.layers.0.mlp.up_proj": "NVFP4"}
+
+
+# --------------------------------------------------------------------------
+# R9 / D1 tail veto
+# --------------------------------------------------------------------------
+
+def _tail_rows():
+    """A frontier where mean KL falls monotonically but the tail does not.
+
+    ``c`` is the D1 shape: the best mean KL on the curve, bought with a p99
+    that is 3x the incumbent's. Selecting on the mean alone ships it.
+    """
+    return [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30,
+         "kl_p99": 0.90, "kl_max": 1.10, "nll_p99": 3.0},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20,
+         "kl_p99": 0.60, "kl_max": 0.70, "nll_p99": 2.8},
+        {"label": "c", "path": "c", "bpp": 5.5, "kl": 0.10,
+         "kl_p99": 1.80, "kl_max": 2.40, "nll_p99": 4.5},
+        {"label": "d", "path": "d", "bpp": 6.0, "kl": 0.05,
+         "kl_p99": 0.40, "kl_max": 0.50, "nll_p99": 2.5},
+    ]
+
+
+def test_tail_veto_off_is_frontier_identity():
+    """Default (veto off) must reproduce the historical envelope exactly."""
+    rows = _tail_rows()
+    baseline = _frontier_from_rows(rows)
+    assert [r["label"] for r in baseline] == ["a", "b", "c", "d"]
+    for explicit_off in (None, "none"):
+        vetoed = []
+        again = _frontier_from_rows(rows, tail_veto=explicit_off, vetoed=vetoed)
+        assert again == baseline
+        assert vetoed == []
+
+
+def test_tail_veto_refuses_a_mean_win_that_regresses_the_tail():
+    rows = _tail_rows()
+    vetoed = []
+    frontier = _frontier_from_rows(rows, tail_veto="kl_p99", vetoed=vetoed)
+    # c wins on the mean and loses on p99 -> refused; d still enters, because
+    # its tail improves on the last ADMITTED point (b), not on the vetoed c.
+    assert [r["label"] for r in frontier] == ["a", "b", "d"]
+    assert [r["label"] for r in vetoed] == ["c"]
+    assert vetoed[0]["veto_reason"] == "tail_regression"
+    assert vetoed[0]["veto_column"] == "kl_p99"
+    assert vetoed[0]["veto_value"] == 1.80
+    assert vetoed[0]["veto_incumbent"] == 0.60
+
+
+def test_tail_veto_eta_admits_within_slack():
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30, "kl_p99": 1.00},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20, "kl_p99": 1.05},
+    ]
+    assert [r["label"] for r in _frontier_from_rows(rows, tail_veto="kl_p99")] == ["a"]
+    admitted = _frontier_from_rows(rows, tail_veto="kl_p99", tail_eta=0.10)
+    assert [r["label"] for r in admitted] == ["a", "b"]
+
+
+def test_tail_veto_reports_missing_column_rather_than_admitting():
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30, "nll_p99": 3.0},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20},
+    ]
+    vetoed = []
+    frontier = _frontier_from_rows(rows, tail_veto="nll_p99", vetoed=vetoed)
+    assert [r["label"] for r in frontier] == ["a"]
+    assert vetoed[0]["veto_reason"] == "tail_missing"
+
+
+def test_measured_rows_pass_through_tail_columns():
+    results = [{
+        "label": "a", "path": "a.json", "bpp": 5.0, "kl_mean": 0.10,
+        "kl_p95": 0.3, "kl_p99": 0.5, "kl_max": 0.9,
+        "nll_mean": 2.0, "nll_p99": 3.0,
+    }]
+    row = measured_rows(results)[0]
+    assert row["kl"] == 0.10  # kl_mean resolves as the mean metric
+    assert row["kl_p95"] == 0.3
+    assert row["kl_p99"] == 0.5
+    assert row["kl_max"] == 0.9
+    assert row["nll_mean"] == 2.0
+    assert row["nll_p99"] == 3.0
+
+
+def test_select_frontier_point_threads_the_veto():
+    results = [
+        {"label": r["label"], "path": f"{r['label']}.json", "bpp": r["bpp"],
+         "last_token_kl": r["kl"], "kl_p99": r["kl_p99"]}
+        for r in _tail_rows()
+    ]
+    vetoed = []
+    selected, frontier = select_frontier_point(
+        results, mode="best-kl", tail_veto="kl_p99", vetoed=vetoed)
+    assert selected["label"] == "d"
+    assert [r["label"] for r in frontier] == ["a", "b", "d"]
+    assert [r["label"] for r in vetoed] == ["c"]
+
+    # Off, the mean-only frontier keeps c and best-kl still lands on d.
+    _sel_off, frontier_off = select_frontier_point(results, mode="best-kl")
+    assert [r["label"] for r in frontier_off] == ["a", "b", "c", "d"]
+
+
+def test_tail_veto_cli_records_vetoed_rows(tmp_path):
+    rows = _tail_rows()
+    results = []
+    for row in rows:
+        path = tmp_path / f"{row['label']}.json"
+        path.write_text(json.dumps({
+            "schema": "prismaquant.allocator.pareto_assignment.v1",
+            "assignment": {"model.layers.0.mlp.down_proj": "NVFP4"},
+        }))
+        results.append({
+            "label": row["label"], "path": str(path), "bpp": row["bpp"],
+            "last_token_kl": row["kl"], "kl_p99": row["kl_p99"],
+        })
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({"results": results}))
+
+    def _run(extra):
+        summary = tmp_path / f"selection{'-'.join(extra) or '-off'}.json"
+        subprocess.run(
+            [sys.executable, "-m", "prismaquant.select_validated_frontier",
+             "--validation-json", str(validation_path),
+             "--mode", "best-kl",
+             "--output-layer-config", str(tmp_path / "lc.json"),
+             "--output-assignment", str(tmp_path / "sa.json"),
+             "--output-summary", str(summary), *extra],
+            cwd=Path(__file__).resolve().parents[1], check=True,
+        )
+        return json.loads(summary.read_text())
+
+    off = _run([])
+    assert off["tail_veto"]["column"] is None
+    assert off["vetoed_rows"] == []
+    assert [r["label"] for r in off["frontier"]] == ["a", "b", "c", "d"]
+
+    on = _run(["--tail-veto", "kl_p99"])
+    assert on["tail_veto"] == {"column": "kl_p99", "eta": 0.0, "n_vetoed": 1}
+    assert [r["label"] for r in on["vetoed_rows"]] == ["c"]
+    assert [r["label"] for r in on["frontier"]] == ["a", "b", "d"]

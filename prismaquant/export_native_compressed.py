@@ -6154,26 +6154,7 @@ def materialize_tensors_streaming(
         # were quantized under a different recipe. Write/check a
         # manifest.json; mismatch invalidates the cache wholesale.
         import json as _json
-        fp_state = {
-            "PRISMAQUANT_DO_NO_HARM": os.environ.get(
-                "PRISMAQUANT_DO_NO_HARM", "1"),
-            "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
-                "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
-            "PRISMAQUANT_GPTQ_DAMP": os.environ.get(
-                "PRISMAQUANT_GPTQ_DAMP", ""),
-            "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING": os.environ.get(
-                "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING", "0"),
-            "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
-                "PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999"),
-            "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(
-                "PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1"),
-            "PRISMAQUANT_BATCHED_NVFP4_EXPORT": os.environ.get(
-                "PRISMAQUANT_BATCHED_NVFP4_EXPORT", "1"),
-            NVFP4_SCALE_RULE_ENV: _nvfp4_scale_rule_from_env(),
-            "ACT_AWARE_FLAGS": dict(sorted(_ACT_AWARE_FLAGS.items())),
-            "activation_cache_fingerprint": _ACTIVATION_CACHE_FINGERPRINT,
-            "production_cache_fingerprint": _PRODUCTION_CACHE_FINGERPRINT,
-        }
+        fp_state = _render_lever_provenance()
         # Hash the assignment dict (layer_config recipe) too — recipe
         # changes invalidate per-Linear quantization output.
         try:
@@ -8095,6 +8076,92 @@ def compute_extra_ignore(
     return extra_ignore
 
 
+def _render_lever_provenance() -> dict:
+    """The quality-affecting render state of this export run.
+
+    Two consumers, one definition: the per-layer export cache binds its
+    `manifest.json` to this dict (a change means the cached layer tensors were
+    quantized under a different recipe and the cache is silently wrong), and the
+    shipcard echoes it so an artifact carries the levers it was rendered under.
+    Keep the key set stable — changing it invalidates every in-flight export
+    cache.
+    """
+    return {
+        "PRISMAQUANT_DO_NO_HARM": os.environ.get(
+            "PRISMAQUANT_DO_NO_HARM", "1"),
+        "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
+            "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
+        "PRISMAQUANT_GPTQ_DAMP": os.environ.get(
+            "PRISMAQUANT_GPTQ_DAMP", ""),
+        "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING": os.environ.get(
+            "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING", "0"),
+        "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
+            "PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999"),
+        "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(
+            "PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1"),
+        "PRISMAQUANT_BATCHED_NVFP4_EXPORT": os.environ.get(
+            "PRISMAQUANT_BATCHED_NVFP4_EXPORT", "1"),
+        NVFP4_SCALE_RULE_ENV: _nvfp4_scale_rule_from_env(),
+        "ACT_AWARE_FLAGS": dict(sorted(_ACT_AWARE_FLAGS.items())),
+        "activation_cache_fingerprint": _ACTIVATION_CACHE_FINGERPRINT,
+        "production_cache_fingerprint": _PRODUCTION_CACHE_FINGERPRINT,
+    }
+
+
+def _write_shipcard(
+    out_dir: Path,
+    *,
+    source_model: str,
+    layer_config_path: str | None,
+    assignment: dict,
+    config_assignment: dict,
+    hist: dict,
+) -> None:
+    """Open the ship record (R13): build-lane facts + empty serve-lane slots.
+
+    The build lane cannot run a quality gate — `vllm` is not importable in the
+    build venv, and embedding a docker serve here would make the exporter own
+    the serving stack. What it can do is state, on the artifact, exactly which
+    serve-lane verdicts are still missing, so "we never ran the ship gate"
+    becomes a refusal (`tools/shipcard.py verify`) instead of an omission.
+    """
+    import hashlib
+
+    from . import shipcard as _shipcard
+
+    def _hash(payload) -> str | None:
+        try:
+            return hashlib.sha256(
+                json.dumps(payload, sort_keys=True).encode()
+            ).hexdigest()[:16]
+        except Exception:
+            return None
+
+    build = {
+        "git": _shipcard.git_provenance(),
+        "source_model": source_model,
+        "layer_config": layer_config_path,
+        "layer_config_sha": (
+            _shipcard.file_sha256(layer_config_path)
+            if layer_config_path else None),
+        "assignment_hash": _hash(assignment),
+        "config_assignment_hash": _hash(config_assignment),
+        "n_assignment_entries": len(config_assignment),
+        "achieved_bpp": _shipcard.allocator_achieved_bpp(layer_config_path),
+        "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
+        "render_levers": _render_lever_provenance(),
+        "kv_shared_fisher": _shipcard.kv_shared_fisher_echo(),
+    }
+    card = _shipcard.build_shipcard(out_dir, build=build)
+    path = _shipcard.write_shipcard(
+        out_dir / _shipcard.SHIPCARD_FILENAME, card)
+    print(f"[export-stream] shipcard opened: {path}", flush=True)
+    print(f"[export-stream]   serve-lane slots still UNFILLED: "
+          f"{', '.join(_shipcard.unfilled_slots(card))}", flush=True)
+    print(f"[export-stream]   close them, then: python3 tools/shipcard.py "
+          f"verify {path}", flush=True)
+
+
 def main():
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
     global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
@@ -8528,7 +8595,7 @@ def main():
     if profile.has_mtp():
         print("[export-stream] materializing MTP tensors ...", flush=True)
         mtp_tensors = _materialize_mtp_tensors(
-            args.model, assignment,
+            args.model, assignment, profile=profile,
             bf16_passthrough=bf16_passthrough, hist=hist,
             device=device)
         print(f"[export-stream] MTP: {len(mtp_tensors)} tensors", flush=True)
@@ -8630,6 +8697,21 @@ def main():
             "packed_expert_export": _packed_expert_export_provenance(),
             "ignore": sorted(config_bf16_passthrough),
         }, f, indent=2)
+
+    # R13: open the ship record. Build-lane facts are final here; the
+    # serve-lane slots stay empty until the validators and the gold lane fill
+    # them (docs/ARCHITECTURE.md §7.1).
+    try:
+        _write_shipcard(
+            out_dir,
+            source_model=args.model,
+            layer_config_path=args.layer_config,
+            assignment=assignment,
+            config_assignment=config_assignment,
+            hist=hist,
+        )
+    except Exception as e:
+        print(f"[export-stream] WARN shipcard not written: {e!r}", flush=True)
 
     # v25: clear the per-layer cache on successful export. --keep-export-cache
     # leaves it intact (debugging / comparison). On a failed run the cache
@@ -8857,6 +8939,7 @@ def write_config_with_quantization(
 def _materialize_mtp_tensors(src_model: str,
                              assignment: dict[str, str],
                              *,
+                             profile,
                              bf16_passthrough: set[str],
                              hist: dict,
                              device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
@@ -8865,27 +8948,35 @@ def _materialize_mtp_tensors(src_model: str,
     Transformers v5 does not instantiate MTP modules when loading
     Qwen3.5/3.6 MoE checkpoints (see `_keys_to_ignore_on_load_unexpected`),
     so the streaming decoder-layer sweep never sees any `mtp.*` entry in
-    `assignment`. We build a standalone MTP module, load the source
-    `mtp.*` weights into it, wrap it in a parent module named `mtp` (so
-    qualified names come out as `mtp.fc`, `mtp.layers.0.self_attn.q_proj`,
-    ...), and run the in-memory materialize helper.
+    `assignment`. We ask the model profile to build a standalone MTP
+    module, load the source MTP weights into it (the source prefix is
+    the profile's `mtp_source_prefix()`), wrap it in a parent module
+    named `mtp` (so qualified names come out as `mtp.fc`,
+    `mtp.layers.0.self_attn.q_proj`, ... per `build_mtp_module`'s
+    naming contract), and run the in-memory materialize helper.
 
     Output tensor names match the checkpoint convention (`mtp.fc.*`,
     `mtp.layers.0.<rest>`). vLLM's `qwen3_5_mtp.load_weights` remaps
     `mtp.→model.` at load time.
     """
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
     from transformers import AutoConfig
 
     # Build an MTP wrapper with source weights.
     cfg = AutoConfig.from_pretrained(src_model, trust_remote_code=True)
     text_config = getattr(cfg, "text_config", cfg)
-    inner = MtpModule(text_config)
+    inner = profile.build_mtp_module(text_config)
+    if inner is None:
+        raise RuntimeError(
+            f"profile '{profile.name}' declares has_mtp() but "
+            f"build_mtp_module() returned None — MTP tensors cannot be "
+            f"rendered. Either implement build_mtp_module() or take the "
+            f"passthrough route (has_mtp() -> False + "
+            f"source_passthrough_prefixes()).")
     wrapper = nn.Module()
     wrapper.add_module("mtp", inner)
     wrapper.to(dtype=torch.bfloat16)
-    raw = _load_mtp_state_dict(src_model)
-    _load_into_mtp(inner, raw)
+    raw = profile.read_mtp_source_state_dict(src_model)
+    profile.load_mtp_state_dict(inner, raw)
     # Move the whole MTP module to the export device so
     # _materialize_tensors_inmemory's per-linear quant runs on GPU when
     # EXPORT_DEVICE=cuda. Previously defaulted to CPU, costing ~10× on
@@ -8895,7 +8986,8 @@ def _materialize_mtp_tensors(src_model: str,
     for p in wrapper.parameters():
         p.requires_grad_(False)
 
-    # Filter assignment to just `mtp.*` entries.
+    # Filter assignment to just `mtp.*` entries. Recipe-name prefix, not
+    # the source prefix: `build_mtp_module`'s contract fixes it at `mtp.`.
     mtp_assignment = {k: v for k, v in assignment.items() if k.startswith("mtp.")}
     if not mtp_assignment:
         return {}
@@ -9114,8 +9206,12 @@ def validate_mtp_assignment_coverage(src_model: str,
     """
     if not profile.has_mtp():
         return
-    if not _source_has_prefixed_weights(src_model, "mtp."):
+    src_prefix = profile.mtp_source_prefix()
+    if not src_prefix or not _source_has_prefixed_weights(src_model, src_prefix):
         return
+    # Recipe names are always `mtp.*` — `build_mtp_module`'s contract
+    # wraps the module in a parent named `mtp` regardless of what prefix
+    # the source checkpoint used.
     if any(k.startswith("mtp.") for k in assignment):
         return
     raise RuntimeError(

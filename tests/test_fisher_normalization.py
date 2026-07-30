@@ -28,6 +28,7 @@ Also pins:
 """
 from __future__ import annotations
 
+import copy
 import tempfile
 from pathlib import Path
 
@@ -35,7 +36,10 @@ import pytest
 import torch
 from torch import nn
 
-from prismaquant.allocator import renormalize_probe_fisher
+from prismaquant.allocator import (
+    clip_probe_fisher_outliers,
+    renormalize_probe_fisher,
+)
 from prismaquant.incremental_probe import finalize_fisher_stats
 from prismaquant.measure_quant_cost import (
     HDetailIndex,
@@ -431,3 +435,110 @@ def test_h_detail_gate_fires_on_every_read_not_just_construction(tmp_path):
     with pytest.raises(SystemExit, match="different calibration size"):
         index.load_blob(names[1])
     assert index.load(names[0]).shape == (2, 3)   # untouched row still fine
+
+
+# ---------------------------------------------------------------------------
+# Robust Fisher clip (opt-in research lever, PRISMAQUANT_FISHER_CAP_MULTIPLIER).
+# Default OFF must be a byte-identical no-op; ON must apply the reference
+# tool's K x per-role-median cap with the reference tool's role grouping
+# (dense `layers.<N>.<container>.<role>` only — experts are NOT bucketed).
+# ---------------------------------------------------------------------------
+
+def _clip_probe_stats():
+    """Three q_proj rows (median 1.0) with one 10x outlier, three down_proj
+    rows (median 100.0) with one 10x outlier, plus rows the tool's role
+    regex deliberately does not match."""
+    def row(h):
+        return {"h_trace": h, "h_w2_sum": h * 2.0, "h_trace_raw": h * 32.0}
+    return {
+        "model.layers.0.self_attn.q_proj": row(0.5),
+        "model.layers.1.self_attn.q_proj": row(1.0),
+        "model.layers.2.self_attn.q_proj": row(10.0),
+        "model.layers.0.mlp.down_proj": row(50.0),
+        "model.layers.1.mlp.down_proj": row(100.0),
+        "model.layers.2.mlp.down_proj": row(1000.0),
+        # Not matched by the reference role regex (extra container segment):
+        "model.layers.0.mlp.experts.gate_proj": row(9999.0),
+        "model.layers.0.mlp.experts.3.up_proj": row(9999.0),
+        "lm_head": row(9999.0),
+    }
+
+
+def test_fisher_clip_unset_is_byte_identical_no_op(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_FISHER_CAP_MULTIPLIER", raising=False)
+    stats = _clip_probe_stats()
+    before = copy.deepcopy(stats)
+    meta = {}
+    assert clip_probe_fisher_outliers(stats, meta) is None
+    assert stats == before
+    assert meta == {}          # no provenance stamp when inactive
+
+
+def test_fisher_clip_empty_env_value_is_also_off(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_FISHER_CAP_MULTIPLIER", "  ")
+    stats = _clip_probe_stats()
+    before = copy.deepcopy(stats)
+    assert clip_probe_fisher_outliers(stats, {}) is None
+    assert stats == before
+
+
+def test_fisher_clip_applies_per_role_k_times_median(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_FISHER_CAP_MULTIPLIER", "3")
+    stats = _clip_probe_stats()
+    meta = {}
+    info = clip_probe_fisher_outliers(stats, meta)
+
+    # Per-role medians, computed independently per bucket.
+    assert info["role_median"]["q_proj"] == pytest.approx(1.0)
+    assert info["role_median"]["down_proj"] == pytest.approx(100.0)
+    assert info["role_cap"]["q_proj"] == pytest.approx(3.0)
+    assert info["role_cap"]["down_proj"] == pytest.approx(300.0)
+    assert info["cap_multiplier"] == pytest.approx(3.0)
+
+    # Only the outliers move; sub-cap rows are untouched.
+    assert stats["model.layers.2.self_attn.q_proj"]["h_trace"] == pytest.approx(3.0)
+    assert stats["model.layers.2.mlp.down_proj"]["h_trace"] == pytest.approx(300.0)
+    assert stats["model.layers.0.self_attn.q_proj"]["h_trace"] == pytest.approx(0.5)
+    assert stats["model.layers.1.self_attn.q_proj"]["h_trace"] == pytest.approx(1.0)
+    assert stats["model.layers.0.mlp.down_proj"]["h_trace"] == pytest.approx(50.0)
+    assert stats["model.layers.1.mlp.down_proj"]["h_trace"] == pytest.approx(100.0)
+
+    # A high down_proj row is NOT clipped against the q_proj median: the
+    # buckets are what make this robust rather than a global truncation.
+    assert stats["model.layers.0.mlp.down_proj"]["h_trace"] > info["role_cap"]["q_proj"]
+
+    # h_w2_sum rescales by the same ratio; the raw accumulator does not move.
+    assert stats["model.layers.2.self_attn.q_proj"]["h_w2_sum"] == pytest.approx(
+        20.0 * (3.0 / 10.0))
+    assert stats["model.layers.2.self_attn.q_proj"]["h_trace_raw"] == pytest.approx(320.0)
+
+    assert info["n_clipped"] == 2
+    assert info["n_considered"] == 6
+    assert meta["clip_history"][-1]["schema"] == "prismaquant.robust_fisher_clip.v1"
+
+
+def test_fisher_clip_skips_rows_outside_the_tool_role_grouping(monkeypatch):
+    """Experts / sidecars / bare names are not bucketed at all — the 4B
+    result was measured on the dense grouping only."""
+    monkeypatch.setenv("PRISMAQUANT_FISHER_CAP_MULTIPLIER", "1.0")
+    stats = _clip_probe_stats()
+    info = clip_probe_fisher_outliers(stats, {})
+    for name in ("model.layers.0.mlp.experts.gate_proj",
+                 "model.layers.0.mlp.experts.3.up_proj",
+                 "lm_head"):
+        assert stats[name]["h_trace"] == pytest.approx(9999.0)
+    assert set(info["role_median"]) == {"q_proj", "down_proj"}
+
+
+def test_fisher_clip_rejects_nonsense_multipliers(monkeypatch):
+    for bad in ("0", "-2", "nope", "nan"):
+        monkeypatch.setenv("PRISMAQUANT_FISHER_CAP_MULTIPLIER", bad)
+        with pytest.raises(SystemExit, match="FISHER_CAP_MULTIPLIER"):
+            clip_probe_fisher_outliers(_clip_probe_stats(), {})
+
+
+def test_fisher_clip_explicit_argument_overrides_unset_env(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_FISHER_CAP_MULTIPLIER", raising=False)
+    stats = _clip_probe_stats()
+    info = clip_probe_fisher_outliers(stats, {}, cap_multiplier=3.0)
+    assert info["n_clipped"] == 2

@@ -60,7 +60,7 @@ by measurement, not by the cost model (§2).
 | Lane | Container | Runtime | Formats | Status |
 |---|---|---|---|---|
 | Native | `compressed-tensors` | vanilla vLLM, Blackwell CUTLASS | NVFP4, FP8_DYNAMIC/E4M3, FP8_SOURCE, BF16 | production default |
-| CB ("gridbook") | `nvfp4_cb` codebook checkpoint | vLLM + `gridbook` plugin (`plugins/gridbook`, PyPI `gridbook`, custom CUDA/CUTLASS) | FP4-CB / FP8-CB rungs plus the native menu | production for 4 wired archs; DSv4 unwired (`plugins/gridbook/gridbook/plugin.py:117-118`) |
+| CB ("gridbook") | `nvfp4_cb` codebook checkpoint | vLLM + `gridbook` plugin (`plugins/gridbook`, PyPI `gridbook`, custom CUDA/CUTLASS) | FP4-CB / FP8-CB rungs plus the native menu | production for 4 wired archs; DSv4 a commented candidate path (`plugins/gridbook/gridbook/plugin.py:114-117`) |
 | GGUF | single `.gguf` | llama.cpp; vLLM via `vllm-gguf-plugin` | Q2_K…Q8_0 k-quants + IQ family + BF16 | enabled end-to-end; the only 2–3 bpw path |
 
 Lane detail, defaults and proven results: §9. Export codecs: §6. Pipeline defaults: §3.3.
@@ -532,7 +532,10 @@ holdout-gated RD-law ladder interpolation `D(k)=C·2^(−k/4)` (`:57-66`).
 `z=0` is bit-identical to no-UCB and it only bites on the `predicted_dloss` branch (AURA /
 expert-empirical), not `output_mse`/`weight_mse`. Selection-side `--kl-ucb-z` yields
 `kl_ucb = mean + z·stderr` over calib repeats (`validate_assignments_kl.py:640-660`), consumed
-by `select_validated_frontier --metric ucb`.
+by `select_validated_frontier --metric ucb`. Both are **research-only** as of R28
+(`docs/design/runtime_flags.md` §1): the one measured win (`z=2`, −8.0% on the 27B old-vs-new
+AURA A/B) is a thin-calibration result, and at production calibration the hedge moves 6/252
+rows to served parity — hence default-off, no driver, and the standing decision to keep `z=0`.
 
 ### 4.4 L2 and L3 — status
 
@@ -647,10 +650,25 @@ mechanism; `--kl-scope full_sequence` since M26) → `select_validated_frontier`
 assignment.
 
 `select_validated_frontier.py` builds an **η-dominance** envelope: rows sorted by (bpp, kl), a
-point enters only if it beats the running best by more than `--kl-noise-floor` (`:214-231`).
-Picks: `kneedle` (default), `best-kl`, `lowest-bpp`, `practical-knee`, `saturation`
-(`:480-540`). Diagnostics emitted with the pick: surrogate-vs-KL Spearman,
-`worst_rank_inversion`, leave-one-out kneedle stability (`:294-479`).
+point enters only if it beats the running best by more than `--kl-noise-floor`
+(`_frontier_from_rows`). Picks: `kneedle` (default), `best-kl`, `lowest-bpp`,
+`practical-knee`, `saturation`. Diagnostics emitted with the pick: surrogate-vs-KL Spearman,
+`worst_rank_inversion`, leave-one-out kneedle stability.
+
+**Tail veto** (D1, 2026-07-30). §2.3 rule: KL is a *screening* metric and a lower mean can hide
+a heavier tail — the shipped 27B PrismaSCOUT has a worse max-prompt NLL than the artifact it
+beat on mean KL. `--tail-veto {none,kl_p99,kl_max,nll_p99}` adds a second admission condition to
+the same single pass: a row that improves mean KL enters only when
+`row[tail] <= incumbent[tail] * (1 + --tail-eta)`, the incumbent being the last *admitted*
+frontier point. Columns come from `validate_assignments_kl`'s per-sequence emission (§7.1) and
+carry the gold lane's key names, so a selection row and a served row read the same. **Default
+`none` is byte-identical to no veto** — no column is read, nothing is refused; `--tail-eta`
+defaults to `0.0` (strictly non-increasing tail). Refusals are never silent: vetoed rows are
+printed and kept in the summary under `vetoed_rows` with a `veto_reason`
+(`tail_regression`, or `tail_missing` when the row predates the emission). The veto also
+applies inside the leave-one-out rebuild, so the stability diagnostic reflects the same
+envelope the pick came from. There is **no second eval pass** — the tail was already being
+computed and discarded.
 
 **Byte-budget "fit the card"** is a third path, CLI-only and **not wired into
 `run-pipeline.sh`**: `allocator.py --target-disk-gb` (`:1202`, impl `:2276-2605`) takes the
@@ -892,11 +910,16 @@ passthrough candidates, scanned lazily so a BF16-source export does no extra hea
 so a genuine passthrough mismatch inside a serving unit escalates like any other illegality.
 
 transformers v5 does not instantiate MTP for Qwen3.5/3.6 MoE, so `_materialize_mtp_tensors`
-`:8857-8909` rebuilds a standalone `MtpModule` (`prismaquant/mtp_module.py`) under a parent
-named `mtp` and materialises it in memory, keeping checkpoint-convention names.
-`validate_mtp_assignment_coverage` `:9103-9126` **hard-fails** when the source has `mtp.*`, the
-profile `has_mtp()`, and the recipe has no `mtp.*` entries. (MTP construction bypasses the
-profile — §8.5 L2.)
+`:8939-9002` rebuilds a standalone MTP module under a parent named `mtp` and materialises it in
+memory, keeping checkpoint-convention names. **Since 2026-07-30 (R12) it goes through the
+profile**: `profile.build_mtp_module(text_config)` builds it, `profile.read_mtp_source_state_dict()`
+pulls the source tensors keyed on `profile.mtp_source_prefix()` (default `"mtp."`), and
+`profile.load_mtp_state_dict()` loads them, folding per-expert checkpoint keys into the packed
+3D expert Parameters. `build_mtp_module`'s contract is that the returned module's names, once
+wrapped in that `mtp` parent, equal the allocator's recipe names (`mtp.fc.*`, `mtp.layers.0.*`) —
+which is why the recipe filter here stays `mtp.` regardless of the source prefix.
+`validate_mtp_assignment_coverage` `:9195-9222` **hard-fails** when the source has tensors under
+`mtp_source_prefix()`, the profile `has_mtp()`, and the recipe has no `mtp.*` entries.
 
 `_bf16_upgrade_audit` `:1965-2087` (emitted `:8622`) classifies each BF16 Linear as
 passthrough/immutable, runtime-coerced, or a genuine budget choice — a manifest, not a policy;
@@ -938,16 +961,64 @@ silently corrupts.
 | vLLM load + greedy smoke | `validate_native_export.py` | **echoed only** (`run-pipeline.sh:1704-1705`) | binary |
 | Numeric ship gate | `validate_quantized_model.py` | **never run, never echoed** | yes, exit 0/1 |
 | Gold lane | `tools/measure_vllm_full_kl.py`, `tools/measure_vllm_wikitext_ppl.py` | never | manual, authoritative |
+| Ship record | `exported/shipcard.json` (opened by the exporter) → `tools/shipcard.py verify` | opened by every export | **refuses** until every serve-lane slot is closed |
 
-Nothing in the pipeline blocks on a quality number.
+Nothing in the pipeline blocks on a quality number — and it should not: `vllm` is not
+importable in the build venv, so embedding a serve inside `run-pipeline.sh` would make the
+build tool own the serving stack. The boundary is physical, so the contract is a **record**,
+not CI.
+
+**The ship record (`exported/shipcard.json`).** `export_native_compressed._write_shipcard`
+(`:8111`, called after `mixed_native_manifest.json`) opens a card carrying the build-lane
+facts it already holds — git commit, `assignment_hash`, `layer_config_sha`, achieved bpp *with
+its provenance named* (read from the allocator's `pareto.knees.json`, never recomputed under a
+different accounting convention), exact `artifact_bytes`, format histogram, the render-lever
+echo (`_render_lever_provenance()`, shared with the export cache's fingerprint so the two
+cannot drift), and the `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` / `PRISMAQUANT_KV_COTANGENT` state
+so an allocation that rode an unvalidated Fisher correction is visible on the artifact rather
+than only in a probe log (D24) — plus five **empty, required** serve-lane slots:
+`native_export.eager`, `native_export.graph`, `ship_gate`, `gold.kl`, `gold.ppl`.
+
+`tools/shipcard.py verify <card> --model-dir <dir>` exits non-zero unless every slot holds a
+*passing* record whose `model_sha` matches the artifact on disk (config sha + per-shard byte
+sizes — cheap enough to run on a 90 GB artifact), and unless both `gold.*` records report
+`spec_decode_detected: false`. `show` prints the remaining unfilled slots. The validators fill
+their own slots via `--shipcard`; `fill --slot gold.kl --record <json>` closes the gold slots
+from the measurement JSON. This turns "the numeric ship gate was never run" (the row above)
+from a silent omission into an explicit refusal. `verify` is not yet wired into
+`run-pipeline.sh`'s closing echo — that is a follow-up wave.
 
 **`validate_assignments_kl.py`** — the pipeline passes `--kl-scope full_sequence`
 (`run-pipeline.sh:269`, `:1208`; option `:832`), `--n-calib-samples 32`, `--calib-seqlen 1024`,
 and `--calib-skip-first $NSAMPLES` for held-out disjointness (`:1194-1219`); the CLI's own
-defaults (2 × 128, `:767-925`) are not what ships. `_kl_repeat_summary` `:640-660` emits
-`kl_mean/std/stderr/kl_ucb`. GPU-only via `gpu_guard.require_cuda_hot_path`. One legacy wart,
-documented in its docstring: the summary key stays `last_token_kl` under both scopes for
-backwards compatibility, even when the pipeline's `full_sequence` scope (M26) produced it.
+defaults (2 × 128, `:767-925`) are not what ships. `_kl_repeat_summary` emits
+`kl_mean/kl_std/kl_stderr/kl_ucb`. GPU-only via `gpu_guard.require_cuda_hot_path`.
+
+*Key rename, 2026-07-30 (R28):* the mean is now `kl_mean` — it was `last_token_kl` under **both**
+scopes, which had already misled a doc. `last_token_kl` is still emitted as a **deprecated alias
+for one cycle**, and `select_validated_frontier._row_metric` resolves either, so pre-rename
+result JSONs select identically.
+
+*Per-sequence tail, 2026-07-30 (R9):* both measurement paths — `_measure_inplace_assignment_kl`
+and `measure_assignment_kl(..., return_per_sequence=True)` — return `(mean, per_seq, stats)`
+instead of discarding the per-sequence values they already accumulate. Each row therefore also
+carries `kl_per_sample`, `kl_p95`, `kl_p99`, `kl_max` (**the same key names
+`tools/measure_vllm_full_kl.py` emits**, so a selection row and a served row are comparable for
+the first time; `kl_tail_domain: "sequence"` records the one honest difference — the sample unit
+is a sequence, not a position) and the rung-2 term `nll_mean`/`nll_p99`, from one `gather` +
+`logsumexp` over student logits already in hand (`kl_measurement.sequence_token_nll`, chunked so
+the fp32 upcast stays bounded; `None` under the last-token scope, which has no next-token
+label). **Zero extra forwards.** §4.6 is the consumer.
+
+*Held-out disjointness is mechanized, 2026-07-30 (R14):* cost/probe artifacts stamp the
+canonical `perturbed_x_cache.calibration_data_hash` into their output meta
+(`incremental_probe` per shard, unioned as `calib_hashes` at merge; `aura_cost.provenance`;
+`build_production_cache` onto `cache.metadata`, inherited by `production_render_cost`), and
+`validate_assignments_kl` **hard-errors** when its own `calib_repeat_hashes` intersect the
+probe's or the cost table's. Pre-R14 artifacts stamp nothing and the check stays inert on them
+rather than guessing. Relatedly, `--calib-skip-first` on the wikitext branch was a **silent
+no-op** (computed, never applied) and now raises — the mechanism that guarantees the held-out
+split cannot quietly do nothing.
 
 **`validation_harness.py`** — `validate_artifact` `:77-153` records `{ppl_wikitext, end_kl,
 ppl_mmlu_acc, model_sha, layer_config_sha, eval_split, metric_era}` into `artifact_registry`
@@ -957,11 +1028,14 @@ provenance, not a gate. `metric_era` matters — records lacking `eval_split` we
 wikitext **train** and are not face-value comparable (`:147-152`).
 
 **`validate_native_export.py`** — does vLLM accept the checkpoint and emit tokens. Defaults
-`--max-new-tokens 16`, `--gpu-memory-utilization 0.55`, `--max-model-len 2048` (`:116-138`);
-eager by default, `--no-enforce-eager` `:138` is the graph-mode arm; the run-both-arms rule
-is protocol only — it lives in the CLI help text (`:139-140`), nothing in code enforces the
-second arm. Flashinfer pinned from the profile's `runtime_package("flashinfer")` (`:30-71`);
-`--speculative-config` exercises MTP.
+`--max-new-tokens 16`, `--gpu-memory-utilization 0.55`, `--max-model-len 2048` (`:206-209`);
+eager by default, `--no-enforce-eager` `:226` is the graph-mode arm, and **`--both-arms`
+`:229` runs both in one invocation** — the run-both-arms rule used to live only in the CLI
+help text with nothing in code enforcing the second arm; it is now two named shipcard slots
+(`_run_arm` `:112`, `_record_arm` `:174`, `--shipcard` `:234`), and each arm tears its engine
+down before the next loads. A failed arm exits 1 instead of raising. Flashinfer pinned from
+the profile's `runtime_package("flashinfer")` (`:30-71`); `--speculative-config` exercises MTP
+(and marks the record `spec_decode_detected`).
 
 ### 7.2 `validate_quantized_model.py` — the numeric ship gate
 
@@ -981,17 +1055,38 @@ CLI-overridable `:513-518`:
 `vllm:spec_decode`; if present the perplexity check **refuses a verdict** rather than return
 draft-model NLL (`:292-302`). MTP artifacts need the two-serve workflow (`:37-54`): serve
 without `--speculative-config` for the PPL verdict, re-serve with it for MTP acceptance;
-ship-ready requires both.
+ship-ready requires both. The same refusal now also guards the gold lane (§7.3) — it used to
+exist only here.
+
+`--shipcard` (`:594`) appends this run's whole verdict block (per-check pass/fail, metrics,
+thresholds, `base_url`, served model name, detected spec-decode state) to the `ship_gate` slot;
+`--artifact-dir` (`:598`) names the local directory the `model_sha` is computed from, since the
+validator drives an HTTP endpoint and cannot otherwise know what the server loaded
+(`_fill_shipcard` `:516`, `_resolve_artifact_dir` `:502`).
 
 ### 7.3 The gold lane (manual)
 
 **Exact full-vocab vLLM KL-vs-BF16** — `tools/measure_vllm_full_kl.py`: `--n-samples 8`
-(`:461`), `--seqlen 512` (`:462`), teacher/student two-pass, `--max-logprobs 248320` (`:466`),
-`--score-positions final|all` (`:468`), `--prompt-top-k 1024` (`:472`). **The "n=8 × 512"
+(`:504`), `--seqlen 512` (`:505`), teacher/student two-pass, `--max-logprobs 248320` (`:509`),
+`--score-positions final|all` (`:511`), `--prompt-top-k 1024` (`:515`). **The "n=8 × 512"
 contract lives here** — not in the pipeline, not in `CLAUDE.md`.
-**Direct WikiText PPL** — `tools/measure_vllm_wikitext_ppl.py`: `--split test` (`:77`),
-`--n-tokens 8192` (`:78`), `--seqlen 512` (`:79`). Promotion authority is §2.4; these two are
+**Direct WikiText PPL** — `tools/measure_vllm_wikitext_ppl.py`: `--split test` (`:118`),
+`--n-tokens 8192` (`:119`), `--seqlen 512` (`:120`). Promotion authority is §2.4; these two are
 its instruments.
+
+Both tools build their own in-process `LLM`, so the measuring process **is** the server. Two
+guards ride on that:
+
+* **Spec-decode refusal** (`tools/spec_decode_guard.py`). Rung-1 authority had no spec-decode
+  guard at all until R13 — the refusal existed only in §7.2. `_load_llm` now inspects the live
+  engine's `speculative_config` and raises with the draft-NLL diagnostic (`--allow-spec-decode`
+  overrides, and the shipcard then refuses the record). Every result dict carries
+  `spec_decode_detected`; `None` means "could not inspect" and is refused too — an unverified
+  negative is what the original trap looked like.
+* **Serve fingerprint + `git_commit`** (§7.4). Neither tool recorded any provenance before —
+  gold-lane numbers were *less* provenanced than the surrogate KL JSONs. Each result dict now
+  carries `git_commit`, `serve_fingerprint` and the full `serve_manifest`
+  (`_provenance`, `measure_vllm_full_kl.py:35` / `measure_vllm_wikitext_ppl.py:30`).
 
 ### 7.4 Reproducibility contract
 
@@ -1012,6 +1107,33 @@ drift uniformly, so it is global, not path-local.
 pre-measurement traffic. conf-KL deltas below ~±20% across differing serving stacks are not
 evidence either way and should be quoted as a range.
 
+**Mechanized (R15).** The rule is no longer prose an author has to remember.
+
+* **`serve_manifest.json`, written server-side.** Each `scripts/serve_*.sh`, once READY, calls
+  `write_serve_manifest` (`scripts/lib/serve_manifest.sh`), which `docker exec`s
+  `tools/serve_fingerprint.py write` **inside the container**: launch argv, image tag,
+  `vllm`/`torch`/driver versions (`importlib.metadata` + NVML only — the writer never imports
+  torch or touches CUDA, so it cannot add a context to a 121 GiB pool), GPU name,
+  `enforce_eager`, `--quantization`, `PRISMAQUANT_*` env, and the resident-extension basenames
+  read from the **server's** `/proc/<pid>/maps` (`gridbook|prismaquant|flashinfer|causal_conv1d|fla`,
+  unioned over the API-server *and* EngineCore processes — it is the engine that holds the
+  kernels). Client-side is not an option: the measuring client cannot see the server's address
+  space — reading a root-owned container process's maps from the host is *denied*, and the
+  denial is indistinguishable from "nothing is resident", which is exactly why the ±17% stayed
+  invisible. The manifest therefore records `residency_readable` and folds it into the
+  fingerprint, so an unverified scan can never match a verified empty one. Never fatal — a
+  serve that came up is not torn down over a JSON.
+* **`serve_fingerprint` = sha256(canonical JSON of the manifest minus argv paths).** Path
+  elision is load-bearing: arm A and arm B name different artifact directories and must still
+  share a fingerprint, while a changed image, extension set, `enforce_eager`, quantization,
+  version or GPU must not. In-process gold-lane runs fingerprint themselves from
+  `/proc/self/maps` (`self_manifest`).
+* **`tools/kl_ab.py A.json B.json` refuses to cross one.** Same fingerprint → a delta. Different
+  → exit 3 with **no delta quoted** and the differing manifest keys named;
+  `--allow-cross-fingerprint` downgrades the output to a **range** that prints the ±20% band and
+  says plainly whether the difference clears it. Legacy JSONs with no fingerprint compare as
+  before, with a printed warning.
+
 ### 7.5 Validation landmines
 
 | Landmine | Symptom | Handling |
@@ -1030,10 +1152,12 @@ Adding an architecture is a registration exercise, not a fork. Three registries 
 a model needs; the allocator, solver, caches, exporter and `pipeline.py` contain zero
 architecture conditionals. Re-verified 2026-07-30 by AST scan: string literals naming an
 architecture that reach **control flow** (a comparison, `startswith`/`endswith`, a dict lookup)
-anywhere under `prismaquant/` outside `model_profiles/` and `vendored/` number exactly **three**,
-and all three are the MiniMax hardcodes of §8.5 L4 — `incremental_probe.py:120` and
-`streaming_model.py:102-103`. `plugins/gridbook/` has **none**; its per-arch binding is guarded
-class imports and module-path strings (`plugin.py:66-118`), which the scan does not and should
+anywhere under `prismaquant/` outside `model_profiles/` and `vendored/` numbered exactly
+**three** — the MiniMax hardcodes of §8.5 L4 — and are now **zero**: R27 routed both through
+profile accessors (`bypass_hf_fp8_module_rewrite()`,
+`packed_expert_module_class_names()`), declared in `specs/minimax_m2.json`.
+`plugins/gridbook/` has **none**; its per-arch binding is guarded
+module-path strings in a data registry (`plugin.py:91-118`), which the scan does not and should
 not count. An earlier, laxer count ("5 and 2") could not be reproduced and is withdrawn; the
 remaining arch-named literals in the core stack are argparse help, log/error text, and
 `vendored/`'s registration machinery, which is arch-specific by design — the cosmetic list at
@@ -1048,14 +1172,15 @@ flowchart TD
   subgraph R1["registry 1 -- model structure"]
     VLLMCLS["vLLM model class<br/>packed_modules_mapping, hf_to_vllm_mapper"]
     DERIVE["auto-derivation -- model_profiles/vllm_registry.py:25-195<br/>fused_sibling_group, fused_sibling_leaf_mapping,<br/>to_vllm_internal_name (prefix mappers only)"]
-    SPEC["structure spec JSON<br/>model_profiles/specs/ARCH.json<br/>schema prismaquant.model_structure.v1<br/>naming, fused_groups, packed_experts, pinned_names,<br/>passthrough_prefixes, default_serving_profile"]
+    SPEC["structure spec JSON<br/>model_profiles/specs/ARCH.json<br/>schema prismaquant.model_structure.v1<br/>match, priority, naming, fused_groups, packed_experts,<br/>pinned_names, passthrough_prefixes, default_serving_profile,<br/>supported_lanes / preferred_lane"]
     PROF["ModelProfile subclass -- model_profiles/ARCH.py<br/>only matches() and name are abstract (base.py:57-66)<br/>Python-only: MTP, streaming adapters, forward state"]
-    REGY["model_profiles/registry.py:46-57 _REGISTERED<br/>order load-bearing; DefaultProfile fallback at :203"]
+    REGY["model_profiles/registry.py _REGISTERED + detection_order()<br/>ordered by ModelProfile.priority (lower first, ties keep list order);<br/>SpecMatchProfile per unclaimed spec; DefaultProfile terminal fallback"]
   end
 
   VLLMCLS --> DERIVE
   DERIVE -->|"tier 1"| PROF
   SPEC -->|"tier 2"| PROF
+  SPEC -->|"match + priority"| REGY
   PROF --> REGY
 
   CONSUMERS["consumers -- ~30 detect_profile call sites across 22 modules<br/>probe, cost, cache, allocator, exporters, validators"]
@@ -1076,7 +1201,7 @@ flowchart TD
   CONSUMERS --> PIPE
 
   subgraph GB["gridbook per-arch loader chain -- serving side, cannot import prismaquant"]
-    GBPLUG["plugin.py:66-118 -- hand-maintained opt-in list<br/>HYV3, HYV3MTP, Laguna: guarded class import<br/>qwen3_5 / qwen3_5_mtp: module scan<br/>DSv4 and future archs: TODO comment at :117-118"]
+    GBPLUG["plugin.py:91-118 -- _CB_TOPLEVEL_MODULE_PATHS, data<br/>hy_v3, hy_v3_mtp, laguna, qwen3_5, qwen3_5_mtp: module paths<br/>each fed to _install_on_module_classes (class-name agnostic)<br/>DSv4: commented candidate path at :114-117<br/>a missing entry now RAISES at serve (cb_fill_guard)"]
     GBSCAN["_install_on_module_classes -- plugin.py:38-63<br/>version-robust, inert for non-CB checkpoints"]
     GBINST["install_toplevel_cb_expert_loader<br/>moe_toplevel_loader.py:497-516, idempotent sentinel"]
     GBCFG["PrismaQuantConfig.get_quant_method -- config.py:326-375<br/>CB group / ignore / stock CT / embedding / RoutedExperts"]
@@ -1088,33 +1213,44 @@ flowchart TD
   GBINST --> GBCFG
 
   L1["LEAK 1 -- run-pipeline.sh:91<br/>TARGET_PROFILE hardcoded to vllm_packed_moe and passed<br/>unconditionally (:471, :1081); spec.default_serving_profile<br/>can never win. hy_v3 declares gguf, laguna declares nvfp4_cb.<br/>MEASURED 2026-07-11: 226 dense FP8 Linears silently -> BF16<br/>on the Hy3 CT export. PRISMAQUANT_TARGET_PROFILE is the audit<br/>escape hatch and run-pipeline.sh does not set it."]
-  L2["LEAK 2 -- mtp_module.MtpModule imported directly<br/>incremental_probe.py:2786, incremental_measure_quant_cost.py:604,<br/>export_native_compressed.py:8877. profile.build_mtp_module has<br/>one caller: model_profiles/validate.py:258. DSv4 gets a Qwen3.5 MTP."]
+  L2["LEAK 2 -- FIXED 2026-07-30 (R12)<br/>MTP now routed through profile.build_mtp_module /<br/>read_mtp_source_state_dict / load_mtp_state_dict at all three sites.<br/>mtp_module.py deleted; DSv4 takes the hy_v3 passthrough route."]
   L3["LEAK 3 -- gridbook opt-in is code, not data<br/>a missing line means stacked CB expert tensors never load and the<br/>FusedMoE serves init memory. Symptom is garbage generation, not a<br/>crash (commit 9a79963). No automated detection, no test."]
-  L4["LEAK 4 -- hardcoded arch tests in the core stack<br/>streaming_model.py:98-104 (minimax_m2 FP8 rewrite bypass) and<br/>incremental_probe.py:113-122 (MiniMaxM2Experts class name)"]
+  L4["LEAK 4 -- FIXED 2026-07-30 (R27)<br/>streaming_model FP8-rewrite bypass -> profile.bypass_hf_fp8_module_rewrite()<br/>(spec staging.bypass_hf_fp8_module_rewrite); incremental_probe expert<br/>container -> profile.packed_expert_module_class_names().<br/>Zero arch literals in core-stack control flow."]
 
   L1 -.->|"leak"| RESOLVE
   L2 -.->|"leak"| PROF
   L3 -.->|"leak"| GBPLUG
-  L4 -.->|"leak"| CONSUMERS
+  L4 -.->|"was leak"| CONSUMERS
 
   classDef leak stroke:#c0392b,stroke-width:2px
-  class L1,L2,L3,L4 leak
+  class L1,L3 leak
 ```
 
 ### 8.1 The three registries
 
 | Registry | Where | Holds |
 |---|---|---|
-| Model structure | `model_profiles/<arch>.py` (`ModelProfile` subclass) + `model_profiles/specs/<name>.json` (`ModelStructureSpec`, schema `prismaquant.model_structure.v1`, `structure.py:20`) | naming across five name spaces, fused groups, packed-expert layout, pinned/passthrough names, staging, shard regexes, probe skips, `default_serving_profile` |
+| Model structure | `model_profiles/<arch>.py` (`ModelProfile` subclass) + `model_profiles/specs/<name>.json` (`ModelStructureSpec`, schema `prismaquant.model_structure.v1`, `structure.py:20`) | detection (`match`, `priority`), naming across five name spaces, fused groups, packed-expert layout, pinned/passthrough names, staging, shard regexes, probe skips, `default_serving_profile`, `supported_lanes`/`preferred_lane` |
 | Serving constraints | `serving_profiles.py` + `serving_profile_specs/<id>.json` (schema `prismaquant.serving_profile.v1`) | per-format allow/deny rules with name conditions, shape rules, runtime shape validators, runtime package requirements; `extends` composition (`serving_profiles.py:557-609`) |
 | Pipeline contract | `pipeline.py` | almost nothing — `target_profile` as a kwarg (`:644`), run metadata (`:688`), CLI passthrough (`:1115`, `:1151`), one `model.structure_graph` stage spec (`:877-884`). Zero architecture names, which is correct: the contract layer should not know models (§3.6) |
 
-Detection: `registry._REGISTERED` (`registry.py:46-57`) is an **ordered** list — subset
-profiles must precede supersets (`Qwen3_5DenseProfile` before `Qwen3_5Profile`;
-`Qwen3MoeProfile` before `Qwen3Profile`, commented as such). `detect_profile` (`:95-112`) keys
-on `config.json` `model_type` + `architectures` and dispatches through `_resolve` (`:173-203`);
-unmatched models fall to `DefaultProfile(architectures=archs)` (`:203`). `register_profile`
-(`:60-66`) inserts at index 0 so third-party profiles win.
+Detection is **priority-ordered, not list-ordered** (R8, 2026-07-30). Subset profiles must
+still precede supersets — `Qwen3_5DenseProfile` before `Qwen3_5Profile`, `Qwen3MoeProfile`
+before `Qwen3Profile` — but that used to be encoded in `_REGISTERED`'s literal order plus two
+comments. It is now a `priority` int on each profile (**lower is consulted first**, like a sort
+rank), declared both on the Python class and in its spec, so the ordering survives the Python
+body being deleted. Built-ins take 100–190 in the historical order; `ModelProfile.priority`
+defaults to **0**, which is what keeps `register_profile`'s documented insert-at-front override
+true for third parties. `detect_profile` keys on `config.json` `model_type` + `architectures`
+and dispatches through `_resolve`, which walks `detection_order()`; unmatched models fall to
+`DefaultProfile(architectures=archs)`. `tests/test_spec_match_profile.py` asserts that priority
+order still reproduces the list literal exactly.
+
+`detection_order()` folds in a second kind of candidate: a **`SpecMatchProfile`**
+(`model_profiles/spec_profile.py`) per `specs/<id>.json` whose `id` no registered Python
+profile claims, matched by its declarative `match` block. All ten shipped specs are claimed by
+a Python profile, so today the live order contains none — landing the reader changed detection
+for exactly zero shipped models, which is the point (see §8.3 Tier A).
 
 `_resolve` also **refuses to hand back a profile whose vendored-modelling override is known
 dead** (`_refuse_dead_vendored_override`, added by #19 / `29f3cff`). Its `except Exception:
@@ -1143,9 +1279,27 @@ Every `ModelProfile` accessor resolves in one fixed order:
 vLLM class metadata  →  declarative JSON spec  →  generic hardcoded default
 ```
 
-Only `matches()` (`base.py:57-61`) and `name` (`:63-66`) are abstract. What `base.py` reads off
-the vLLM class named by `vllm_architecture_class()` (`:68-74`, resolved lazily at `:76-84`,
-`None` permitted):
+Only `matches()` (`base.py:57-61`) and `name` (`:63-66`) are abstract — and `matches()` is now
+also spec-expressible, via `SpecMatchProfile` (§8.1). The `match` vocabulary is deliberately
+tiny, because nine of the ten in-tree predicates were already pure `(model_type ∈ set, arch
+startswith prefix)` tests:
+
+| key | form | why it exists |
+|---|---|---|
+| `model_type` | exact strings | the common case |
+| `architectures` | `fnmatch` globs (a bare class name is a valid exact glob) | `Qwen3Moe*` prefixes, and `qwen3.json`'s exact `Qwen3ForCausalLM` — the one predicate that is *not* a prefix |
+| `architectures_exclude` | globs; any hit **vetoes** the whole match | `qwen3_5_dense`'s `not any("Moe" in arch)` |
+| `priority` (top level) | int, lower first | replaces the comment-encoded `_REGISTERED` order |
+
+Unknown keys raise at parse time. That matters: `match` was declared in all nine spec files and
+parsed since day one with **no reader**, and `qwen3_5_dense.json` had silently drifted out of
+agreement with its Python (it was missing the Moe exclusion) — dead config decays.
+`tests/test_spec_match_profile.py` is the standing gate: for every registered profile, on every
+representative config in the family, the spec verdict must equal the Python verdict. Only after
+that is green for a release does a `matches()` body get deleted, one architecture at a time.
+
+What `base.py` reads off the vLLM class named by `vllm_architecture_class()` (`:68-74`, resolved
+lazily at `:76-84`, `None` permitted):
 
 | Derived | vLLM attribute | base.py | Spec fallback |
 |---|---|---|---|
@@ -1162,7 +1316,8 @@ can now express those; `lfm2_moe.json` already does.
 
 Roughly 25 further accessors are pure spec reads (packed-expert names/classes, pinned names,
 per-expert regexes, source/recipe/live name mapping, format groups, passthrough prefixes,
-staging, layer prefixes, lm_head, probe skips), `base.py:169-820`. Deliberately Python-only,
+staging, layer prefixes, lm_head, probe skips, export-lane eligibility,
+`bypass_hf_fp8_module_rewrite`), `base.py:169-820`. Deliberately Python-only,
 because they are forward-pass *behaviour* rather than naming: MTP (`:248-272`),
 streaming-probe adapters (`:823-947` — `checkpoint_to_live_name`, `fp8_scale_pairs`,
 `head_resident_extra_prefixes`, `init_rotaries`, `expand_hidden_for_layers`,
@@ -1177,8 +1332,14 @@ production reads the accessors.
 
 ### 8.3 Adding a model, end-to-end, as it stands today
 
-**Tier A — pure JSON.** Theoretically possible; **has never happened.** Every registered
-profile carries at least a Python `matches()`. The thinnest is `qwen3_moe.py` at 34 LoC.
+**Tier A — pure JSON.** Now *possible*, still never done. The obstacle was `matches()` being
+abstract; `SpecMatchProfile` (§8.1–§8.2) removes it, so a spec file with a `match` block, a
+`priority`, and declared `fused_groups`/`naming` resolves on its own with no Python. Tier A does
+**not** get vLLM tier-1 auto-derivation — that is keyed on a Python
+`vllm_architecture_class()` — so a spec-only architecture must declare its fused groups
+outright. Every one of the ten shipped specs is still claimed by a Python profile, which is
+deliberate: the R8 mitigation lands the reader alongside the Python and deletes `matches()`
+bodies one architecture at a time, only after a release of green equivalence.
 
 **Tier B — the realistic minimum (5 items).** (1) `model_profiles/<arch>.py` — subclass with
 `matches()`, `name`, `vllm_architecture_class()` (may return `None`); 34–172 LoC in practice.
@@ -1195,41 +1356,61 @@ multi-layer-type rope, `head_resident_extra_prefixes`); cross-layer forward stat
 modeling. Then run the conformance validator (§8.6), which nothing else does.
 
 **Tier D — the gridbook CB lane (§9.2) adds per-arch work.** (6) `default_serving_profile:
-"nvfp4_cb"` in the spec **and** `TARGET_PROFILE=nvfp4_cb` (gated `run-pipeline.sh:124-125`).
+"nvfp4_cb"` in the spec **and** `TARGET_PROFILE=nvfp4_cb` (gated `run-pipeline.sh:124-125`),
+plus `"nvfp4_cb"` in the spec's `supported_lanes` — the lane declaration is what
+`require_lane_supported` (`serving_profiles.py`) checks, and it must be added *with* the loader
+wiring of (7), never ahead of it.
 (7) **Read the arch's vLLM `load_weights`** and decide whether experts are mapped at the top
-level or delegated to per-layer `FusedMoE.load_weights`. Top-level archs need a line in
-`plugins/gridbook/gridbook/plugin.py:66-118`; the preferred form is
-`_install_on_module_classes("<vllm module path>")` (`plugin.py:38-63`), which is version- and
-name-robust and inert for non-CB checkpoints (`:44-46`). Per-layer archs need nothing
-(`plugin.py:7-21`). (8) A CB-quantized MTP/drafter needs its own opt-in (`plugin.py:85-89` for
-`HYV3MTP`; Laguna's DFlash drafter is recorded as missing at `:94-95`).
+level or delegated to per-layer `FusedMoE.load_weights`. Top-level archs need **one line** — the
+vLLM module path in `_CB_TOPLEVEL_MODULE_PATHS` (`plugins/gridbook/gridbook/plugin.py:91-118`),
+which `_install_on_module_classes` (`:38-63`) consumes; version- and name-robust, inert for
+non-CB checkpoints (`:44-46`). Per-layer archs need nothing (`plugin.py:7-21`). Get it wrong and
+the serve now *raises* instead of generating garbage (`cb_fill_guard.py`, §8.5 L3). (8) A
+CB-quantized MTP/drafter needs its own module-path entry (`hy_v3_mtp` is one; Laguna's DFlash
+drafter is still missing, `plugin.py:100-104`).
 
-Serving-side registry keys: `"gridbook"` with legacy alias `"prismaquant"` (`plugin.py:133`,
-`:139`) for artifacts exported before the rename.
+Serving-side registry keys: `"gridbook"` with legacy alias `"prismaquant"` (`plugin.py:141`,
+`:147`) for artifacts exported before the rename.
 
 ### 8.4 Conformance matrix
 
-| Arch | profile | structure spec | `default_serving_profile` | gridbook opt-in | MTP |
-|---|---|---|---|---|---|
-| qwen3 (dense) | `qwen3.py:25` | ✅ | `vllm_packed_moe` | n/a | none |
-| qwen3_moe | `qwen3_moe.py:16` | ✅ | `vllm_packed_moe` | ⚠ none | none |
-| qwen3_5 / 3.6 MoE | `qwen3_5.py:31` | ✅ | `vllm_packed_moe` | ✅ module scan `plugin.py:114-115` | `build_mtp_module` `:78-126` (dead, L2) |
-| qwen3_5_dense | `qwen3_5_dense.py:23` | ✅ | `vllm_packed_moe` | ✅ same scan | `:55-106` (dead, L2) |
-| gemma4 | `gemma4.py:25` | ✅ | `vllm_packed_moe` | ⚠ none | none |
-| lfm2_moe (LFM2.5) | `lfm2_moe.py:85` | ✅ | `vllm_packed_moe` | ⚠ none | `has_mtp → False` `:171` |
-| minimax_m2 | `minimax_m2.py:48` | ❌ **none** — 8 hand-coded overrides `:69-152` (`:69,:86,:91,:101,:104,:110,:133,:137`) | — → `research` | ⚠ none | `has_mtp → False` `:101` |
-| deepseek_v4 | `deepseek_v4.py` | ✅ | ❌ **null** → `research` | ❌ TODO `plugin.py:117-118` | `has_mtp → True` `:83`, `build_mtp_module → None` `:86-90` ⚠ |
-| hy_v3 | `hy_v3.py:47` | ✅ | `gguf` (overridden, L1) | ✅ `:73-77`, MTP `:85-89` | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
-| laguna (poolside S/XS 2.x) | `laguna.py:32` | ✅ | `nvfp4_cb` (overridden, L1) | ✅ `:97-101`; drafter missing `:94-95` | `has_mtp → False` `:49` |
-| default | `default.py:24` | n/a by design | — | n/a | none |
+| Arch | profile | prio | structure spec | `default_serving_profile` | `supported_lanes` (preferred) | gridbook opt-in | MTP |
+|---|---|---|---|---|---|---|---|
+| qwen3 (dense) | `qwen3.py` | 130 | ✅ | `vllm_packed_moe` | CT | n/a | none |
+| qwen3_moe | `qwen3_moe.py` | 120 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
+| qwen3_5 / 3.6 MoE | `qwen3_5.py` | 110 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | ✅ module paths `plugin.py:112-113` | `build_mtp_module` → `MtpModule` (live; R12) |
+| qwen3_5_dense | `qwen3_5_dense.py` | 100 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | ✅ same paths | inherits `Qwen3_5Profile.build_mtp_module` (dead copy removed, R12) |
+| gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
+| lfm2_moe (LFM2.5) | `lfm2_moe.py` | 150 | ✅ | `vllm_packed_moe` | CT | ⚠ none | `has_mtp → False` |
+| minimax_m2 | `minimax_m2.py` | 160 | ✅ **added R22** — all 8 overrides declared | `vllm_packed_moe` **(added R22)** | CT | ⚠ none | `has_mtp → False` |
+| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT | ❌ commented candidate `plugin.py:114-117` | `has_mtp → False` + `mtp.` passthrough (hy_v3 route, R12) |
+| hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | ✅ `:93`, MTP `:99` | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
+| laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | ✅ `:104`; drafter missing `:100-104` | `has_mtp → False` |
+| default | `default.py` | — (terminal) | n/a by design | — | CT (default) | n/a | none |
 
-Gaps beyond the four leaks. **minimax_m2 has no spec** — the standing counter-example to "the
-spec is the contract"; all six overrides are expressible in `prismaquant.model_structure.v1`
-today, and it also gets `serving_profile_id() → None`, so it allocates against `research`,
-which carries no format allow-list (medium; unshipped since M2.7). **`deepseek_v4.json` still has no
-`default_serving_profile`** (key dump re-taken 2026-07-30: `schema, id, match, shard_regexes,
-naming, fused_groups, packed_experts, moe, probe, passthrough_prefixes, pinned_names,
-_verified_source_layout`) → `research` → any menu format passes the serving gate (medium). The
+`prio` = detection priority, lower first (§8.1); the same number is declared on the Python class
+and in the spec, and a test asserts they agree. **CT** = `compressed-tensors`. The lane column is
+the *declared* set (R6, spec `supported_lanes`/`preferred_lane`), and it is deliberately equal to
+the gridbook loader list — four architectures for CB, one for GGUF. Over-declaring is the exact
+failure the field exists to prevent: an undeclared lane does not fail loudly, it serves
+uninitialised expert memory. `require_lane_supported(profile, EXPORT_CONTAINER)`
+(`serving_profiles.py`) is the preflight; **the `run-pipeline.sh` call site is wave 3 and is not
+wired yet**, so today the declaration is read only by tests and by callers that opt in.
+
+Gaps beyond the four leaks. **minimax_m2's missing spec is closed** (R22, 2026-07-30): all
+eight overrides (`:69,:86,:91,:101,:104,:110,:133,:137`) are now declared in
+`specs/minimax_m2.json` — `fused_groups`, `packed_experts` (+`projection_splits`,
+`format_groups`), `moe.per_expert_regex`, and three `naming.recipe_to_vllm` regex rules for the
+`block_sparse_moe.experts.N.w{1,2,3}` → `mlp.experts.N.{gate,down,up}_proj` rename. The Python
+overrides stay for now; `tests/test_minimax_m2_spec.py` compares a spec-only profile against
+the pre-spec Python behaviour accessor by accessor, and that gate must hold for a release
+before the Python comes out. It closed a latent bug on the way: without a spec,
+`packed_expert_format_group` fell through to the legacy fallback, whose first group is
+`(gate_up_proj, down_proj)`, so MiniMax's `down_proj` got a *different* coupling key than its
+`gate_proj`/`up_proj` — one expert bank in two format groups, which violates §6.4 and would
+have been unservable. **`deepseek_v4.json` now declares `default_serving_profile:
+vllm_packed_moe`** (R22) — the conservative, provably-tighter choice while its lane is
+undecided; `research` carries no format allow-list at all. The
 spec did gain `_verified_source_layout` (`2b5b937`, closing #26): the real
 DeepSeek-V4-Flash-Base headers say routed experts are I8 nibble-packed MXFP4 with F8_E8M0
 scales while **shared experts are block-FP8 E4M3, not fp4** — settled against the checkpoint
@@ -1241,22 +1422,23 @@ checking shipped artifact metadata first.
 **Mistral-Medium-3.5-128B is in the shipped family table (§1.2) with no profile** — no Mistral
 profile class or spec exists (the sole textual mention is a comment at
 `model_profiles/default.py:6`), so it ran under
-`DefaultProfile`; the `allocator.py:1550-1554` gate would refuse that menu today. Finally, **no spec
-declares `unpacked_expert_projection_names`** although `base.py:470-495` documents it as
-spec-overridable and `incremental_probe.py:1984` consumes it — every arch rides the
-`('w1','w2','w3')` default; a silent probe-speed no-op for a future arch, not a correctness
-risk.
+`DefaultProfile`; the `allocator.py:1550-1554` gate would refuse that menu today. Finally, the
+never-declared `unpacked_expert_projection_names` (`base.py:470-495`) **is now declared** — by
+`specs/minimax_m2.json` (R27), which also required adding it as a real
+`ModelStructureSpec` field; `base.py` had been reading it off the spec with `getattr`, so no
+declaration could ever have taken effect. Other architectures still ride the `('w1','w2','w3')`
+default, which is correct for them.
 
 ### 8.5 Known contract leaks
 
-These four are the canonical statement; §12 references them rather than restating them.
+These four are the canonical statement; §12 references them rather than restating them. L2 (R12) and L4 (R27) closed on 2026-07-30 and are kept in the table with their fix, so the leak and its resolution stay in one place.
 
 | # | Leak | Severity |
 |---|---|---|
 | L1 | `run-pipeline.sh:91` hardcodes `TARGET_PROFILE:=vllm_packed_moe` and passes it unconditionally (`:471`, `:1081`); `resolve_target_profile` gives the explicit request precedence (`serving_profiles.py:611-633`), so `spec.default_serving_profile` is **never consulted through the production orchestrator**. `hy_v3.json` (`gguf`) and `laguna.json` (`nvfp4_cb`) are silently overridden. Mitigated only by the export-container gates (`run-pipeline.sh:106`, `:124`), which turn the mismatch into a hard error the operator must already know to avoid. **This leak has a measured cost, not a hypothetical one.** The exporter resolves the profile it judges legality under the same way, so when the spec default differs from the profile the allocation was solved with, export coerces every format the *spec-default* profile does not serve: on 2026-07-11, **226 dense FP8 Linears were silently demoted to BF16** on the Hy3 compressed-tensors export, because `hy_v3.json` declares `gguf`. `PRISMAQUANT_TARGET_PROFILE` now exists precisely so the audit and coercion run under the *allocator's* profile (`_allocator_target_profile_for_audit`, `export_native_compressed.py:1953-1962`, consumed by `_coerce_runtime_legal_assignment :1527` and `_bf16_upgrade_audit :2001`) — but **`run-pipeline.sh` never exports it**, so the production path still relies on the operator setting it by hand. Fix: unset the shell default *and* have the export stage pass the allocator's resolved profile through. | **high** |
-| L2 | MTP construction bypasses the profile. `prismaquant/mtp_module.py` is Qwen3.5-specific (imports `Qwen3_5MoeDecoderLayer`/`Qwen3_5DecoderLayer`, `:80-85`) and is imported **directly** by `incremental_probe.py:2786`, `incremental_measure_quant_cost.py:604`, `export_native_compressed.py:8877`, gated only on the arch-agnostic `profile.has_mtp()`. The declared extension points `build_mtp_module` / `load_mtp_state_dict` (`base.py:248-272`) have exactly **one caller in the tree** — `model_profiles/validate.py:258`, the offline validator. Consequence: `deepseek_v4` (`has_mtp → True` `:83`, `build_mtp_module → None` `:86`) would today be handed a Qwen3.5 MTP module. Latent export bug; blocks DSv4 ship. Unchanged by the merge. | **high** |
-| L3 | `plugins/gridbook/gridbook/plugin.py:66-118` is a hand-maintained `try/except ImportError` opt-in chain — three hardcoded class imports plus one module scan, no declarative registry, no detection of which loader shape an arch uses, and no test. The observed failure mode for a missing line is **coherent-looking garbage generation** at serve time. The machinery underneath is generic and well-behaved (`moe_toplevel_loader.py:497-516` idempotent; `resolve_cb_expert_param` `:108-140` raises on ambiguity), so the fix is to make the registry data. | **high** |
-| L4 | Two MiniMax hardcodes in the core stack. `streaming_model.py:98-104` (`model_type.startswith("minimax_m2")` / `MiniMaxM2`) decides whether to bypass transformers-5.x's FP8 pre-load module rewrite — an architecture property, and `ModelProfile` already owns the neighbouring `fp8_scale_pairs` (`base.py:856-866`). `incremental_probe.py:113-122` (`type(module).__name__ == "MiniMaxM2Experts"`) gates a probe-speed batched-expert replay; `packed_expert_module_class_names()` (`base.py:182-192`) is the spec-driven accessor for exactly that lookup. Failure modes: wrong load path (medium) and silent loss of a speed optimization, not a correctness bug (low). | medium / low |
+| L2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile: `prismaquant/mtp_module.py` was Qwen3.5-specific yet imported **directly** by `incremental_probe.py`, `incremental_measure_quant_cost.py` and `export_native_compressed.py`, gated only on the arch-agnostic `profile.has_mtp()`, so `deepseek_v4` (`has_mtp → True`, `build_mtp_module → None`) would have been handed a Qwen3.5 decoder layer. **Mechanism of the fix:** a fourth accessor `ModelProfile.mtp_source_prefix()` (`base.py:255-272`, spec-expressible as `shard_regexes.mtp_source_prefix`, default `"mtp."`) plus a generic `read_mtp_source_state_dict()` (`:290-326`) and a packed-expert-aware `load_mtp_state_dict()` (`:329-396`, absorbed from the deleted `_load_into_mtp`); `build_mtp_module`'s docstring now states the naming contract (names under an `mtp` parent must equal the recipe names). The Qwen body moved verbatim into `model_profiles/qwen3_5.py:124` (`MtpModule`) and the dead near-copies in `qwen3_5.py` and `qwen3_5_dense.py` were reconciled into it; all three call sites now go through the profile and hard-fail with a named error if `has_mtp()` and `build_mtp_module()` disagree. `prismaquant/mtp_module.py` is **deleted**. DSv4 takes the hy_v3 route (`has_mtp → False` + `"mtp."` in `passthrough_prefixes`) until its nextn block is actually quantized. Gates: `tests/test_mtp_module_arch.py` pins parameter-name-set equality against the pre-move layout for both the dense and MoE profile; `tests/test_model_profile_conformance.py::test_has_mtp_implies_a_buildable_mtp_module` is the standing ratchet. | ~~high~~ FIXED |
+| L3 | **FIXED 2026-07-30 (R10).** Was: a hand-maintained `try/except ImportError` opt-in chain (three hardcoded class imports plus one module scan), whose missing-line failure mode is **coherent-looking garbage generation** at serve time, with no test. Now: (i) the opt-in is data — a module-path tuple `_CB_TOPLEVEL_MODULE_PATHS` (`plugins/gridbook/gridbook/plugin.py:91-118`) fed to the version- and name-robust `_install_on_module_classes` (`:38-63`); a new arch is one line, and DSv4 is a commented candidate naming the vLLM module path to check (`:114-117`) rather than a bare TODO. A JSON sidecar remains the upgrade if third parties need to extend it. (ii) The silence is gone: `create_weights` stamps `_pq_cb_filled = False` on `w13/w2_cb_qweight`, both fill paths stamp `True` (the instance hook `moe.py:199`, `moe_toplevel_loader.py:583`), and `process_weights_after_loading` (`moe.py:213-217`) raises via `cb_fill_guard.assert_cb_experts_filled` (`:114`), naming the model class and the module path to add. **No env bypass**; scoped to the params the local rank registered, so EP/PP-absent and zero-expert shards are skipped (`cb_fill_guard.py:57-77`). Tests: `plugins/gridbook/tests/test_cb_fill_guard.py` (7). | ~~high~~ closed |
+| L4 | **FIXED 2026-07-30 (R27).** Both MiniMax hardcodes now go through profile accessors. `streaming_model.py`'s FP8-rewrite bypass was already half config-derived (`quant_method == "fp8"` and `weight_block_size`); the architecture half is a static property, so it became `staging.bypass_hf_fp8_module_rewrite` in the spec behind `profile.bypass_hf_fp8_module_rewrite()` (`base.py`), leaving the per-checkpoint half a config read where it belongs. `incremental_probe.py`'s `type(module).__name__ == "MiniMaxM2Experts"` became `profile.packed_expert_module_class_names()` (`base.py:182-192`) — the accessor that already existed for exactly this lookup — plus the structural shape test; the declared class stays **required**, because the replacement forward implements one specific expert-loop signature and applying it to a lookalike container would silently change a forward pass. `specs/minimax_m2.json` declares both, and `unpacked_expert_projection_names` with them. | closed |
 
 Cosmetic, listed so they are not re-discovered as leaks:
 `export_native_compressed.py:94,151-152` imports `Qwen3_5Profile` for `_COMPAT_QWEN_PROFILE`
@@ -1281,8 +1463,10 @@ and 8, plus four structural invariants (spec presence, fused-sibling source, reg
 name uniqueness); the vLLM-registry checks 2/3/4 sit behind an `integration` marker (their
 answer is vLLM-version-dependent) and the real-checkpoint index checks 6/7 behind `slow`.
 Check 5 (MTP) is deliberately absent: `build_mtp_module()` materialises a full decoder layer,
-a multi-GB CPU allocation — use the manual CLI for it, which is why **L2 remains uncaught by
-automation**. Known gaps (`minimax_m2` has no spec; `deepseek_v4` returns `None` from
+a multi-GB CPU allocation — use the manual CLI for it. Its cheap declarative half IS automated
+since 2026-07-30 (R12): `test_has_mtp_implies_a_buildable_mtp_module` fails any profile that
+answers `has_mtp()` without a real `build_mtp_module` override or `mtp_source_prefix()`, which
+is the L2/D2 defect class. Known gaps (`minimax_m2` has no spec; `deepseek_v4` returns `None` from
 `vllm_architecture_class()`) are encoded as *ratchets*: each asserts the gap is still real and
 only then xfails, so closing one turns the test red with an instruction to shrink the list.
 And there is CI to run it — `.github/workflows/ci.yml` (#18, `1cc7b90`) executes the suite on
@@ -1350,17 +1534,18 @@ it; §7 owns its gates. Validation runs in-process (`validate_native_export.py:1
 
 **Package and registration.** `plugins/gridbook/` is an independently installable package
 (`gridbook`, `pyproject.toml:8`), registered through vLLM's general-plugin entry point
-(`pyproject.toml:69-70`). In-tree version is **`0.1.0`** — verified on the merged tree at
-`gb/__init__.py:13`, which `pyproject.toml:73` declares as the single source of truth. PyPI is
-reported at 0.1.1 (auto-memory `gridbook_pypi_release`); that is **not verified against the
-index here** and the tree carries no bump, so treat the skew as real until someone checks the
-Hub. (Unlike the `prismaquant` package, whose 0.4.1 release commit is now merged — §12 D7.)
-`register()` (`gb/plugin.py:121-143`) does three things: optional force-preload of the fused
+(`pyproject.toml:69-70`). In-tree version is **`0.2.0.dev0`** (`gb/__init__.py:16`, which
+`pyproject.toml:73` declares as the single source of truth) — a *development head*, not a
+release: releases are cut from the standalone `/home/rob/gridbook` repo, which published PyPI
+0.1.1. The dev suffix is the honest label for a tree that is ahead of the release in kernel work
+(R6 smem LUT, single-storage dense weights) and must never be read as published — §12 D27,
+resolved 2026-07-30. (Unlike the `prismaquant` package, whose 0.4.1 release commit is now
+merged — §12 D7.) `register()` (`gb/plugin.py:129-151`) does three things: optional force-preload of the fused
 extension under `PRISMAQUANT_PRELOAD_FUSED` (residency-matched A/B, §7.4),
 `register_quantization_config("gridbook")` plus the legacy alias `"prismaquant"` for pre-rename
-artifacts (`:133-139`), and the per-arch loader installs below. **No vLLM-core monkeypatches**
+artifacts (`:141-147`), and the per-arch loader installs below. **No vLLM-core monkeypatches**
 — only the model classes' own `load_weights` (`:16-21`) and one instance-level wrap on FusedMoE
-(`gb/moe.py:165-194`). It is a *mixed* container: CB targets get CB methods, ignored prefixes
+(`gb/moe.py:177-207`). It is a *mixed* container: CB targets get CB methods, ignored prefixes
 BF16, and plain NVFP4/FP8_DYNAMIC groups are re-keyed into a real `CompressedTensorsConfig` and
 delegated (`gb/config.py:326-375`). Single-GPU only — no TP handling in `gb/*.py`.
 
@@ -1370,8 +1555,18 @@ is a gather rather than arithmetic. A weight vector is d=8 wide; a k-bit index s
 codeword; 32 codewords plus scales form a 256-weight superblock (`gb/codec.py:16-18`). Two
 ladders, every integer rung: `NVFP4_CB_K12–K24` (E2M1 grid, 2.0–3.28 bpw) and `FP8_CB_K28–K48`
 (E4M3 grid, 3.5–6.0 bpw) — `prismaquant/layer_config.py:35-38`, allow-listed in
-`serving_profile_specs/nvfp4_cb.json` (signed S13–S16 exist, bit-exact and served, but are
-research-only). Storage rate and compute precision are independent dials: `FP8_CB_K32` *stores*
+`serving_profile_specs/nvfp4_cb.json`. A third, signed-codebook ladder `NVFP4_CB_S13–S16`
+(2.125–2.5 bpw) is **production, not research** — earlier revisions of this section called it
+"research-only", which was an inverted label, not a description of the code: the rungs are
+allow-listed in the *served* profile (`serving_profile_specs/nvfp4_cb.json:30-33,93-96`, both
+the format allow-list and the per-role menu), emitted by the exporter
+(`export_nvfp4_cb.py:77,278`) and CUDA-served as the `n_sub == 1` decode path
+(`plugins/gridbook/gridbook/linear.py:295-305`). The allocator can pick them today, so
+"research-only" and the served allow-list cannot both be true; the R28 ruling (2026-07-30) is
+**keep the rungs, fix the label** — they are the lane's sign-magnitude fp4 family in the
+2.125–2.5 bpw band, learned on `|v|` with an explicit sign
+(`format_registry.py:932-983`, `export_nvfp4_cb.py:277-281`). Storage rate and compute
+precision are independent dials: `FP8_CB_K32` *stores*
 4.0 bpw and *computes* in fp8 — why CB beats native NVFP4 at matched bpw (fp8 rungs run A8
 activations where NVFP4 runs A4). Codebooks live in a `.pqcb` safetensors sidecar pointed at
 from `config.json` (`gb/config.py:4-10`, `export_nvfp4_cb.py:630-639`); the non-globbed extension
@@ -1396,15 +1591,21 @@ keeps vLLM's weight loader off it.
 fp4-CB MoE prefill is still the per-expert loop (`gb/moe.py:404-405`); persistent/grouped
 decode-in-mainloop for MoE prefill is the roadmap's fat target.
 
-**Per-arch wiring — the silent-no-load trap.** Archs whose vLLM loader maps experts at the top
-level never call the per-layer `FusedMoE.load_weights`, so
-`_install_toplevel_cb_expert_loaders()` wraps them (`gb/plugin.py:66-118`): HunYuan-V3
-`HYV3ForCausalLM` (`:72-77`), its MTP drafter (`:84-89`), poolside `LagunaForCausalLM`
-(`:96-101`), Qwen3.5-MoE via a module scan (`:114-115`). DSv4-class is an explicit TODO
-(`:117-118`). Every install is a guarded one-liner and every failure mode is silent: an unwired
-arch loads no stacked-CB expert tensors at all and the FusedMoE serves initialised memory —
-garbage generation, not a crash (confirmed, `9a79963`: Laguna, 93% of params). Over-installing
-is harmless (`:44-46`). New-arch checklist: §8.3 Tier D; leak: §8.5 L3.
+**Per-arch wiring — the no-longer-silent no-load trap** (R10, 2026-07-30). Archs whose vLLM
+loader maps experts at the top level never call the per-layer `FusedMoE.load_weights`, so
+`_install_toplevel_cb_expert_loaders()` wraps them — now by iterating a **data** registry,
+`_CB_TOPLEVEL_MODULE_PATHS` (`gb/plugin.py:91-118`): `hy_v3`, `hy_v3_mtp`, `laguna`, `qwen3_5`,
+`qwen3_5_mtp`, each fed to `_install_on_module_classes` (`:38-63`), which discovers the
+entrypoint classes a module *defines* and is therefore immune to the class renames that made the
+old hardcoded imports fragile. DSv4-class is a commented candidate module path (`:114-117`),
+one uncomment away. Over-installing is harmless (`:44-46`), and a missing module is a no-op.
+An unwired arch used to load no stacked-CB expert tensors at all while the FusedMoE served
+uninitialised memory — garbage generation, not a crash (confirmed, `9a79963`: Laguna, 93% of
+params). That is now a hard serve-time failure: `create_weights` stamps `_pq_cb_filled = False`,
+both fill paths stamp `True`, and `process_weights_after_loading` raises through
+`cb_fill_guard.assert_cb_experts_filled` naming the model class and the module path to add —
+no env bypass, scoped to the params the local rank registered (EP/PP-absent and zero-expert
+shards skipped). New-arch checklist: §8.3 Tier D; leak record: §8.5 L3 (closed).
 
 **Serving.** Four scripts under `scripts/`, all `vllm-node:latest`, all binding `-p 8000:8000`;
 three carry `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: `serve_qwen27b_smoke.sh` (util 0.80),
@@ -1434,11 +1635,14 @@ practice (§12 D15).
 | Hy3-295B-A21B @2.9 bpp, **one Spark** | 105.73 GB resident; prefill 89 → 108.7–115 tok/s across the kernel campaign vs the shipped GGUF-IQ's 42 (2.1× → 2.6×) — the lane's thesis (tensor-core CB removes the IQ dequant tax) proven at 300B class; decode 13.1 base / 16.1 prose with the K44 MTP draft; TEB 88 vs GGUF-IQ 87 / k-quant 86. **No quality claims** — a 295B cannot be KL-validated on this box |
 | Laguna-S-2.1 @6.0 bpp / 84 GB | MoE prefill 293 → 1,821 → 2,063 → 2,186 tok/s under `auto`; native grouped-CUTLASS 3,603 — remaining gap 1.65× |
 
-`prod_hy3_results.md` records **two** public repo ids for the same Hy3 CB artifact —
+**RESOLVED (2026-07-30, R28 / §12 D21).** The canonical public repo id for the Hy3 CB
+artifact is **`rdtand/Hy3-295B-A21B-prismaquant-gridbook-2.9bit-vllm`** — cite that one.
+`prod_hy3_results.md` records two older ids from the ship sequence,
 `rdtand/Hy3-295B-A21B-PrismaQuant-2.9bit-nvfp4cb-vllm` (2026-07-20 ship ledger, `:248`) and
-`rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm` (2026-07-21 joint-menu re-ship, `:313`). Whether
-the first was deleted, redirected, or is still live is recorded nowhere in the tree.
-Unresolved; check the Hub before citing either (§12 D21).
+`rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm` (2026-07-21 joint-menu re-ship, `:313`); both were
+renamed rather than deleted, so both **307-redirect** to the canonical id (verified against the
+Hub 2026-07-30). The two historical citations are annotated in place rather than rewritten —
+they are the ship ledger, and the ledger records what was posted on the day.
 
 **Standing format-speed policy** (`docs/lanes/nvfp4-cb/format-speed-policy.md`, `dec4891`): at
 matched bpw fp8-CB beats native NVFP4 on 503/503 dense units (geomean −40% cost-model error),
@@ -1578,9 +1782,9 @@ returning with a stale copy sees the resolution rather than silence.
 
 | # | Item | Evidence | Sev | Suggested action |
 |---|---|---|---|---|
-| D1 | **Tail-veto is unimplemented.** §2.3 states KL is a screening metric and that a p99-NLL or task regression must veto a mean-KL win; the selector has no such term (`grep p99\|tail` → 0 hits). Raised 2026-06-05, never built. | `select_validated_frontier.py` (whole file; `practical_knee` `:252`, `measured_frontier` `:234`) | HIGH | Add a per-point p99-NLL column to `validate_assignments_kl` output and an η-dominance veto in `_frontier_from_rows`. |
-| D2 | **MTP construction bypasses the profile** — §8.5 L2. DSv4 declares `has_mtp → True` with `build_mtp_module → None` and would be handed a Qwen3.5 MTP module. | §8.5 L2 | HIGH | Route the 3 import sites through `profile.build_mtp_module()`. |
-| D3 | **Gridbook per-arch CB expert opt-in is a hand-maintained code list** — §8.5 L3. A missing line fails silently as coherent garbage generation; DSv4 is an explicit unwired TODO. | §8.5 L3 | HIGH | Declarative module-path list + a serve-time assertion that every CB expert tensor was consumed. |
+| D1 | **FIXED 2026-07-30 (R9).** Tail-veto was unimplemented since 2026-06-05 — and it had stalled on an assumed cost (a second eval pass) that does not exist. **Mechanism:** every KL site already accumulated per-sequence values and discarded them at the return; both selection paths now return `(mean, per_seq, stats)`, so `kl_p95/kl_p99/kl_max` and the rung-2 `nll_mean/nll_p99` (one `gather` + `logsumexp` on logits already in hand) cost **zero extra forwards**. `_frontier_from_rows` gained a second admission condition — `row[tail] <= incumbent[tail] * (1 + tail_eta)` — behind `--tail-veto {none,kl_p99,kl_max,nll_p99}` / `--tail-eta`, with vetoed rows retained under `vetoed_rows` + `veto_reason` so a refusal is visible. **Default `--tail-veto none` is byte-identical to the old selector** (pinned by a frontier-identity regression test); promotion to default-on wants a 27B run showing the two picks agree. §4.6, §7.1. | `select_validated_frontier.py` `_frontier_from_rows`, `measured_rows`, `TAIL_VETO_COLUMNS`; `kl_measurement.sequence_token_nll` / `summarize_per_sequence_kl`; `tests/test_select_validated_frontier.py`, `tests/test_kl_per_sequence_tail.py` | — | Done, default-off. Follow-up: pick the contract statistic (`kl_max` is the one that would have caught the broken 27B that passed on mean while 80% of prompts were bad) and flip the default after a 27B agreement check. |
+| D2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile — §8.5 L2. All three import sites now call `profile.build_mtp_module()` / `read_mtp_source_state_dict()` / `load_mtp_state_dict()`, keyed on the new `mtp_source_prefix()` accessor; `prismaquant/mtp_module.py` is deleted and DSv4 declares `has_mtp → False` + `"mtp."` passthrough. | §8.5 L2 | ~~HIGH~~ CLOSED | — |
+| D3 | **FIXED 2026-07-30 (R10)** — was: gridbook per-arch CB expert opt-in as a hand-maintained code list, a missing line failing silently as coherent garbage generation. Now a module-path tuple (`plugin.py:91-118`) plus an unbypassable serve-time fill assertion (`cb_fill_guard.py`, raised from `process_weights_after_loading`). §8.5 L3 has the mechanism. | §8.5 L3 | ~~HIGH~~ closed | — |
 | D4 | **`spec.default_serving_profile` is dead** — §8.5 L1, and it has a measured cost (226 Hy3 FP8 Linears silently → BF16, 2026-07-11). The `PRISMAQUANT_TARGET_PROFILE` escape hatch exists but `run-pipeline.sh` never exports it, so the production export still audits and coerces under whatever profile the *spec* declares. | §8.5 L1; `export_native_compressed.py:1953-1962`; `grep PRISMAQUANT_TARGET_PROFILE prismaquant/run-pipeline.sh` → 0 | HIGH | Unset the shell default; keep the env var as an override; have the export stage pass the allocator's resolved profile through so the two can never disagree silently. |
 | D5 | **RESOLVED 2026-07-30.** `PRISMAQUANT_GPTQ_DAMP_SWEEP` had two readers with opposite defaults — `"0"` in the exporter, `"1"` in a forked lever-defaulting copy inside the KL sensitivity probe (stale from `9c91d62`, missed by the sweep-OFF policy in `f2363e2`), so any A/B touching both compared different renders. `_normalized_production_cache_levers` now delegates to `production_weight_cache._resolve_production_render_levers` — one contract, and the probe's stamped provenance can no longer disagree with the render that produced it. | `kl_sensitivity_probe.py:272-285` | — | Done. Follow-up: a test pinning the two readers together (the delegation makes the split unrepresentable, but nothing asserts it). |
 | D6 | **Only 6 of ~16 executed stages are settings-hash guarded** (§3.4). Silent stale-reuse across recipe changes. | guard `run-pipeline.sh:492-522`, applied at `:539,606,666,851,1372,1455`; unguarded at `:620,690,800,879,909,981,1009,1134,1239,1329,1421,1556` | HIGH | Extend `require_stage_settings` to the cost and frontier-cache artifacts. |
@@ -1588,9 +1792,9 @@ returning with a stale copy sees the resolution rather than silence.
 | D8 | **Export never enforces production-cache residency.** The exporter has no `--production-cache-prefetch` argument and its prefetch helper has no `require` mode; a cache miss silently yields 0 prefetched keys (NVMe-bound export). | `run-pipeline.sh:1691-1698`; `export_native_compressed.py` `_production_cache_prefetch_assignment` `:2090-2110`, sole caller `:6237` | MED | Add a `require` mode mirroring `production_weight_cache.py:461-478`. |
 | D9 | **`require_cuda_hot_path` is not called by 7 stages** — `incremental_probe`, `incremental_measure_quant_cost`, `aura_cost`, `production_render_cost`, `export_nvfp4_cb[_streaming]`, `export_gguf`, `select_validated_frontier`. They are protected only by the shell preflight, which the CB/GGUF ladder work routinely bypasses by invoking modules directly. | `gpu_guard.py:7-15`; shell gate `run-pipeline.sh:134-145` | MED | Add the one-line guard to each stage's `main()`. |
 | D10 | **`pipeline.py`'s contract layer is partly fictional** (§3.6): tautological validation, 2 of 3 `APPROVED_RESOURCE_OWNERS` unimplemented, 10+ executed stages unmodelled, `_register_builtin_components` a deliberate no-op. | `pipeline.py:23,25,501-563,890-980,1059-1063`; `run-pipeline.sh:462-481` | MED | Either model the real owners (`layer_streaming.LayerCache`, `QuantWeightCache`) and the missing stages, or demote the file to a documented linter and stop citing it as enforcement. |
-| D11 | **MOSTLY FIXED 2026-07-30.** `model_profiles/validate.py`'s 8 conformance checks had zero callers and there were no workflow files in the tree. Both halves closed: `.github/workflows/ci.yml` (#18, `1cc7b90`) runs the suite on every push and PR (py3.11/3.12, CPU torch), and `tests/test_model_profile_conformance.py` drives the CPU-safe checks (1, 6, 8 + four structural invariants) over every registered profile, with 2/3/4 behind `integration` and 6/7 behind `slow`, and known gaps encoded as ratchets rather than bare xfails. **Residual:** check 5 (MTP construction) is still uncovered — it materialises a full decoder layer — which is exactly the check that would catch L2/D2; and nothing invokes the validator as a `run-pipeline.sh` preflight for the actual `MODEL_PATH`. | `.github/workflows/ci.yml`; `tests/test_model_profile_conformance.py:9-28` | LOW (was MED) | Add a cheap check-5 surrogate (assert `build_mtp_module` is not `None` whenever `has_mtp()`), and a preflight invocation for `MODEL_PATH`. |
+| D11 | **MOSTLY FIXED 2026-07-30.** `model_profiles/validate.py`'s 8 conformance checks had zero callers and there were no workflow files in the tree. Both halves closed: `.github/workflows/ci.yml` (#18, `1cc7b90`) runs the suite on every push and PR (py3.11/3.12, CPU torch), and `tests/test_model_profile_conformance.py` drives the CPU-safe checks (1, 6, 8 + four structural invariants) over every registered profile, with 2/3/4 behind `integration` and 6/7 behind `slow`, and known gaps encoded as ratchets rather than bare xfails. **Residual (2026-07-30, R12): the check-5 half is now covered** — `test_has_mtp_implies_a_buildable_mtp_module` asserts `build_mtp_module` is a real override (and `mtp_source_prefix()` non-empty) whenever `has_mtp()`, which is the declarative part of the check that would catch L2/D2; check 5 proper still materialises a decoder layer and stays out of CI. Remaining: nothing invokes the validator as a `run-pipeline.sh` preflight for the actual `MODEL_PATH`. | `.github/workflows/ci.yml`; `tests/test_model_profile_conformance.py:9-31,223-249` | LOW (was MED) | Add a preflight invocation for `MODEL_PATH`. |
 | D12 | **`TARGET_DISK_GB` byte-budget selection is CLI-only.** §4.6 names the byte budget as the ship rule that replaced kneedle, but `run-pipeline.sh` has no hits — every byte-budget ship is a manual `allocator.py` invocation. | `allocator.py:1202` `--target-disk-gb`; `grep TARGET_DISK_GB prismaquant/run-pipeline.sh` → 0 | MED | Plumb `TARGET_DISK_GB` through the allocator stage. |
-| D13 | **Two hardcoded MiniMax arch tests in the core stack** (§8.5 L4); plus `minimax_m2` has no structure spec and `deepseek_v4.json` declares no `default_serving_profile` (falls to `research`, which has no format allow-list) — §8.4. | §8.4, §8.5 L4 | MED | Route both through the profile accessors; author the two missing spec fields. |
+| D13 | **FIXED 2026-07-30 (R22 + R27).** The two hardcoded MiniMax arch tests now route through `profile.bypass_hf_fp8_module_rewrite()` and `profile.packed_expert_module_class_names()`; `specs/minimax_m2.json` exists and declares all eight of that profile's overrides; `deepseek_v4.json` declares `default_serving_profile: vllm_packed_moe`. Core-stack arch literals in control flow: **0**. Residual (not debt, sequencing): the MiniMax Python overrides stay until the equivalence gate `tests/test_minimax_m2_spec.py` has held for a release. | §8.4, §8.5 L4 | closed | — |
 | D14 | **`plugins/gridbook/README.md` — the lane's most-read file — is materially wrong**: claims uniform-CB-only (delegation is implemented), claims mixed containers raise `NotImplementedError`, omits MoE entirely, calls even-split product mode the only supported shape, and calls `--enforce-eager` a requirement. | `gb/config.py:346-374`, `gb/tests/test_delegation.py`, `gb/moe.py`, `gb/linear.py:439` | MED | Rewrite Scope + add an MoE section; link `docs/lanes/nvfp4-cb/STANDARDS.md` rather than restate status. |
 | D15 | **CB defaults do not match shipping practice.** `CB_SCALE_CODING` defaults to `v1` (warned "serve gates pending — do NOT ship") though every shipped fp4 artifact overrides to `two_tier`; `CB_EXPERT_EMPIRICAL` defaults to `1` though every shipped MoE driver sets `0`. | `run-pipeline.sh:1547`, `:332` | MED | Flip the defaults to the shipped values, or record why the default is deliberately the conservative one. |
 | D16 | **Block-output match ships ON with a pre-JSO justification.** `PRISMAQUANT_BLOCK_OUTPUT_MATCH` defaults `"1"`; its ~0.05–0.10 PPL estimate predates JSO and has never been re-measured on the gold lane (§6.1). | `export_native_compressed.py:6168-6169`, `:6321`, `:6467` | MED | Gold-lane A/B on one 27B-class artifact, then keep or flip. |
@@ -1598,7 +1802,7 @@ returning with a stale copy sees the resolution rather than silence.
 | D18 | **PARTIALLY FIXED 2026-07-30.** `PRISMAQUANT_L2_CUDA_GRAPHS` and `PRISMAQUANT_DO_NO_HARM_MIN_GAIN` are no longer *documented as live* — `runtime_flags.md:285-286` now labels both **DEAD** with the evidence (sole occurrence a comment at `perturbed_x_cache.py:1225`; no occurrence at all, respectively) and points at the live analogue `PRISMAQUANT_RENDER_GATE_MIN_GAIN`. The entries themselves are still present rather than deleted, and the ~25 undocumented gridbook serving flags are still undocumented. | `docs/design/runtime_flags.md:285-286` | LOW | Delete the dead entries once no reader is chasing them; add the gridbook serving flags. |
 | D19 | **FIXED 2026-07-30.** The count was low: **14** launchers under `examples/launchers/`, not 8, invoke `python -m prismaquant.<module>` for a module that no longer exists (`iterate_block_clado`, `measure_block_clado`, `block_clado`, `validate_block_clado`, `measure_output_fisher`, `dense_cone`, `polish_from_assignment`, `coord_descent_polish`, `measure_adjoint_l3`, `adjoint_l3_frontier`). Walled at `archive/launchers_2026-07-30/` with a banner README enumerating each file and its dead invocation, per the dated-wall convention of §11. | `archive/launchers_2026-07-30/README.md`; `examples/launchers/README.md` | — | Done. |
 | D20 | **RESOLVED 2026-07-30.** Two archive walls had no banner README (`archive/prismaclip_2026-05-14/`, `archive/reap_2026-05-15/`) — the latter walls off live-adjacent code (`expert_prune.py`, `allocator_prune.py`, `observers/`, 5 tests) and encodes a policy the code still enforces. Two more walls violated the dated-directory convention. Banners written; `archive/entmoot/` → `archive/entmoot_2026-05-03/` (date from `193f313`) and `archive/minimax_m2p7/` → `archive/minimax_m2p7_2026-04-24/` (date from its own banner). Neither renamed wall is cited by a `run-pipeline.sh` `exit 2` message. | `ls archive/*/README.md` | — | Done. Follow-up: a test asserting every `archive/*/` carries a `README.md`. |
-| D21 | **Hy3 artifact repo id is inconsistent across three docs** — `…-prismaquant-codebook-2.9bit-vllm`, `…-PrismaQuant-2.9bit-nvfp4cb-…`, `…-gridbook-2.9bit-vllm`. At most one is the live HF repo. | `scratch/gridbook-launch-post.md:24,179`; `docs/lanes/nvfp4-cb/prod_hy3_results.md:248,313` | LOW | Resolve against HF and fix the two wrong ones. |
+| D21 | **RESOLVED 2026-07-30 (R28).** Three ids appeared across the docs for one Hy3 artifact; the premise "at most one is live" was wrong — they are *renames*, not rivals, so the older ids **307-redirect** rather than 404. Canonical id (verified against the Hub 2026-07-30): **`rdtand/Hy3-295B-A21B-prismaquant-gridbook-2.9bit-vllm`** — the one to cite in all new material. The two `prod_hy3_results.md` citations are the dated ship ledger and were **annotated in place** ("now redirects to …"), not rewritten: a ledger records what was posted on the day. §9.2's unresolved paragraph now carries the resolution. | `docs/lanes/nvfp4-cb/prod_hy3_results.md:248-251,313-320`; §9.2 | ~~LOW~~ closed | Done. Follow-up: `scratch/gridbook-launch-post.md:24,179` still carries a third variant (`…-prismaquant-codebook-2.9bit-vllm`) — `scratch/` is out of the doc contract's scope, so it is left as-is; do not cite from it. |
 | D23 | **bpp labels are not comparable across accounting eras.** The public "5.31" artifact's body bpp is ~4.76 under current accounting (§1.2); nothing in the tree records which era an artifact's label came from. | §1.2 | LOW | Stamp an accounting-era field into exported artifact metadata. |
 
 New with the 2026-07-30 merge:
@@ -1608,7 +1812,7 @@ New with the 2026-07-30 merge:
 | D24 | **The KV-cotangent path has never touched a real KV-sharing checkpoint.** Its correctness is established by exact fp64 equivalence on a synthetic model (rel err 0.00e+00 vs one end-to-end autograd backward; the pre-fix protocol under-counts `k_proj` 85.1% / `v_proj` 38.5%) — a demonstration, not a measurement. No `num_kv_shared_layers > 0` model has been probed, so the magnitude of the correction on a shipping architecture is unknown, and the guard it replaced (`PRISMAQUANT_ALLOW_KV_SHARED_FISHER`) was the only thing previously stopping such a probe. | §7.5; `tests/test_kv_cotangent_path.py`; commit `b6ec9cb` | MED | Probe one real KV-sharing checkpoint (Gemma4-class) with the path on and off, and record the h_trace delta before any allocation claim rides on it. |
 | D25 | **Gemma4-31B tied-embeddings result is enablement, not quality.** The first end-to-end probe → cost → allocate → export on a tied model (244 NVFP4 / 119 FP8 / 27 BF16 at achieved 6.000 bpp, 27.18 GB, `tie_word_embeddings` preserved and no duplicated `lm_head` bytes) ran at **2 samples × seqlen 512** to reach failures fast. The artifact has not been served and no KL/PPL exists for it. Nothing in §1.2 should cite it. | §7.5; commit `d058267` | MED | Re-run at production calibration and take it through the §7 gates before the family table gains a row. |
 | D26 | **`--packed-role-split` is reachable only by the lane that cannot validate it.** The role split hard-gates on `supports_per_role_expert_schemes`, which today only `gguf` declares — and the GGUF lane has no validated-frontier evaluator wired to a llama.cpp runtime (§9.3), so `SELECTION_MODE=surrogate` is all it has. There is also no `PACKED_ROLE_SPLIT` plumbing in `run-pipeline.sh`, so every use is a manual `allocator.py` invocation. The lever is correct and correctly gated; it is just unmeasurable on the only lane that accepts it. | `allocator.py:1289-1300`; `serving_profiles.py:636-674`; `grep -c PACKED_ROLE_SPLIT prismaquant/run-pipeline.sh` → 0 | LOW | Either wire a llama.cpp evaluator for validated-frontier selection, or A/B the split on the CB lane once `nvfp4_cb` can declare per-role schemes. |
-| D27 | **`plugins/gridbook` version skew is asserted, not verified.** In-tree `gb/__init__.py:13` is `0.1.0`; PyPI is *reported* at 0.1.1 by auto-memory alone. If PyPI really is ahead, the released sdist was built from a tree state that no longer exists here, which is the same class of confusion D7 turned out to be. | `plugins/gridbook/gridbook/__init__.py:13`; `plugins/gridbook/pyproject.toml:73` | LOW | Check the index, then either bump the in-tree version or correct the memory note. |
+| D27 | **RESOLVED 2026-07-30 (R10).** The skew was real but benign: releases are cut from the standalone `/home/rob/gridbook` repo (PyPI 0.1.1), never from this tree, and the in-tree copy is *ahead* of the release in kernel work while its label was *behind*. Fixed by labelling it as what it is — `__version__ = "0.2.0.dev0"` (`plugins/gridbook/gridbook/__init__.py:16`, still `pyproject.toml:73`'s single source of truth), a dev suffix reading "unreleased, post-0.1.1"; `plugins/gridbook/README.md` now states the release source and that the in-tree copy is the development head. | `plugins/gridbook/gridbook/__init__.py:16`; `plugins/gridbook/README.md` | ~~LOW~~ closed | — |
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, five were re-verified as still-open and are folded in above:

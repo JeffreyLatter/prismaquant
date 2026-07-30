@@ -37,8 +37,9 @@ import pickle
 import re
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -327,11 +328,18 @@ def _unit_kl(
     col_weights: Mapping[str, torch.Tensor] | None = None,
     unit_qname: str = "",
     sample_idx: torch.Tensor | None = None,
-) -> float:
+    per_window: bool = False,
+) -> float | tuple[float, list[float]]:
     """Mean-token KL(BF16 || model-with-this-unit-quantized).
 
     With ``sample_idx``, only those expert slices are quantized (and cloned
-    for restore) — the caller owns the extrapolation to the full unit."""
+    for restore) — the caller owns the extrapolation to the full unit.
+
+    With ``per_window`` also returns the per-calibration-window mean KLs the
+    aggregate is built from — free (the loop already runs window by window)
+    and the only between-draw noise datum either cost chain has. The CB
+    ladder's holdout gate derives its tolerance from it rather than from a
+    bare constant (``_cb_ladder_holdout_tol``)."""
     if sample_idx is None:
         originals = {pn: getattr(mod, pn).data.clone() for pn in param_names}
     else:
@@ -345,15 +353,20 @@ def _unit_kl(
             sample_idx=sample_idx)
         total = 0.0
         n_tok = 0
+        windows: list[float] = []
         bs = _calib_batch()
         for bi, i in enumerate(range(0, calib_ids.shape[0], bs)):
             lp = F.log_softmax(
                 model(calib_ids[i:i + bs]).logits.float(), -1)
             bl = baseline[bi].to(lp.device)
             kl = (bl.exp() * (bl - lp)).sum(-1)
-            total += float(kl.sum().item())
+            wsum = float(kl.sum().item())
+            total += wsum
             n_tok += kl.numel()
-        return total / max(n_tok, 1)
+            if per_window:
+                windows.append(wsum / max(kl.numel(), 1))
+        mean = total / max(n_tok, 1)
+        return (mean, windows) if per_window else mean
     finally:
         for pn in param_names:
             w = getattr(mod, pn).data
@@ -439,43 +452,221 @@ def _fit_floor_law(ks: Sequence[float], ds: Sequence[float]):
     return F, C, b
 
 
-def _cb_ladder_fit(kls: Mapping[str, float], kmap: Mapping[str, int],
-                   anchors: Sequence[str], holdout: str,
-                   predicted: Sequence[str], tol: float):
-    """Fit the anchors and predict. With 3 anchors, first try the FLOOR law
-    D = F + C*2^(-b*k) (exact through 3 points; the fp8 family flattens
-    toward the E4M3 grid floor at high k); fall back to log-linear
-    (least squares; with 2 anchors the line is exact — the slope is fitted,
-    not assumed). Accept iff the holdout's relative error <= tol. Returns
-    (predicted_kls | None, holdout_rel_err)."""
-    pred = None
+def _cb_ladder_rate_factor(fmt_name: str, k: int) -> float:
+    """Exact per-sub rate factor R(k) = sum_i 2^(-2*b_i/d_i) under the
+    ceil-first bit split — the theory-faithful rate variable for the CB
+    ladder. The smooth 2^(-alpha*k) law treats k as evenly divisible, but at
+    k % n_sub != 0 the ceil-first split gives some sub-tables one bit more:
+    the true error carries a +4-6% SAWTOOTH by split phase that a smooth law
+    cannot represent — and the (28, 38, 48) anchors + k=39 holdout sit on
+    DIFFERENT phases, which is exactly where the 8-12% holdout rejections
+    came from (2026-07-21 27B cost run). R is exact per phase and reduces to
+    the old law at even splits (R(4m) = 4*2^(-m) for fp8)."""
+    n_sub = 4 if fmt_name.startswith("FP8_CB") else 2
+    sub_dim = 8 // n_sub
+    base, extra = divmod(int(k), n_sub)
+    r = 0.0
+    for i in range(n_sub):
+        b = base + (1 if i < extra else 0)
+        r += 2.0 ** (-2.0 * b / sub_dim)
+    return r
+
+
+class _LadderLaw(NamedTuple):
+    """A fitted CB-ladder law: the prediction closure plus the branch name
+    that produced it (for provenance in the gate's log)."""
+    predict: Callable[[str], float]
+    name: str
+
+
+def _cb_ladder_law(kmap: Mapping[str, int], anchors: Sequence[str],
+                   values: Mapping[str, float]) -> _LadderLaw | None:
+    """Fit ONE metric on the anchors. THE shared CB-ladder law.
+
+    Chain (the holdout gate arbitrates accept/reject of the whole chain, so
+    every branch is a proposal only):
+      1. Split-aware FLOORED LINEAR law D = F + C*R(k), with R the exact
+         ceil-first per-sub rate factor — plain linear least squares in
+         (1, R); kills both the high-k floor miss AND the k%n_sub sawtooth.
+         (F clamped to 0 -> C is refit through the origin.)
+      2. The smooth floor law D = F + C*2^(-b*k) (exact 3-anchor solve; the
+         fp8 family flattens toward the E4M3 grid floor at high k).
+      3. Log-linear LS (the original law).
+
+    Both cost chains call this: the dense per-tensor path
+    (``measure_quant_cost._ladder_metric_fit``) and the expert unit-KL path
+    (``_cb_ladder_fit``). They were separate implementations until R20
+    (2026-07-30) and the expert side carried NO R(k) term at all, so the
+    ceil-first sawtooth that motivated the dense change (commit 5184892 —
+    the (28,38,48)+k=39 phase mismatch behind 8-12% holdout rejections on
+    the 2026-07-21 27B run) was still costing the expert ladder its
+    holdouts.
+
+    Returns None if any anchor value is unusable."""
+    try:
+        xs = [float(kmap[f]) for f in anchors]
+        vs = [float(values[f]) for f in anchors]
+    except (KeyError, TypeError):
+        return None
+    if len(anchors) >= 2:
+        # -- 1. split-aware floored linear LS ------------------------------
+        rs = [_cb_ladder_rate_factor(f, kmap[f]) for f in anchors]
+        n = float(len(rs))
+        mr = sum(rs) / n
+        mv = sum(vs) / n
+        den = sum((r - mr) ** 2 for r in rs)
+        if den > 0.0:
+            C = sum((r - mr) * (v - mv) for r, v in zip(rs, vs)) / den
+            F = mv - C * mr
+            if C > 0.0 and F >= 0.0:
+                return _LadderLaw(
+                    lambda f, _F=F, _C=C, _km=kmap: float(
+                        _F + _C * _cb_ladder_rate_factor(f, _km[f])),
+                    "floored_linear_R")
+            if C > 0.0 and F < 0.0:
+                # floor clamped to 0: refit C through the origin
+                den0 = sum(r * r for r in rs)
+                if den0 > 0.0:
+                    C0 = sum(r * v for r, v in zip(rs, vs)) / den0
+                    if C0 > 0.0:
+                        return _LadderLaw(
+                            lambda f, _C=C0, _km=kmap: float(
+                                _C * _cb_ladder_rate_factor(f, _km[f])),
+                            "linear_R_origin")
     if len(anchors) == 3:
-        fl = _fit_floor_law([float(kmap[f]) for f in anchors],
-                            [float(kls[f]) for f in anchors])
+        # -- 2. smooth floor law (exact solve) -----------------------------
+        fl = _fit_floor_law(xs, vs)
         if fl is not None:
             F, C, b = fl
+            return _LadderLaw(
+                lambda f, _F=F, _C=C, _b=b, _km=kmap:
+                    float(_F + _C * 2.0 ** (-_b * _km[f])),
+                "floor_law")
+    # -- 3. log-linear LS --------------------------------------------------
+    ys = [math.log2(max(v, 1e-20)) for v in vs]
+    n = float(len(xs))
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    b = (-sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+         if denom > 0 else _LADDER_SLOPE_BITS)
+    a = my + b * mx
+    return _LadderLaw(
+        lambda f, _a=a, _b=b, _km=kmap: float(2.0 ** (_a - _b * _km[f])),
+        "log_linear")
 
-            def pred(f, _F=F, _C=C, _b=b):
-                return float(_F + _C * 2.0 ** (-_b * kmap[f]))
 
-    if pred is None:
-        xs = [float(kmap[f]) for f in anchors]
-        ys = [math.log2(max(kls[f], 1e-12)) for f in anchors]
-        n = float(len(xs))
-        mx = sum(xs) / n
-        my = sum(ys) / n
-        denom = sum((x - mx) ** 2 for x in xs)
-        b = (-sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
-             if denom > 0 else _LADDER_SLOPE_BITS)
-        a = my + b * mx
+def _cb_ladder_holdout_tol(kmap: Mapping[str, int], anchors: Sequence[str],
+                           values: Mapping[str, float], holdout: str,
+                           floor: float,
+                           windows: Mapping[str, Sequence[float]] | None
+                           ) -> float:
+    """Derive the holdout-gate tolerance from the rungs' MEASUREMENT noise.
 
-        def pred(f, _a=a, _b=b):
-            return float(2.0 ** (_a - _b * kmap[f]))
+    ``encode_tiers.md`` §B states the rule — *"trust the fit only where the
+    holdout error clears the between-seed cost noise"* — so the threshold is
+    that noise, not a taste constant (house rule 2). ``windows`` carries each
+    measured rung's per-calibration-window values; the expert stage gets them
+    for free because every unit KL is already a mean over independent
+    calibration windows (``_unit_kl(per_window=True)``).
 
-    rel = abs(pred(holdout) - kls[holdout]) / max(kls[holdout], 1e-12)
+    The estimate is PAIRED: for each window w the law is refitted on that
+    window's anchors and the holdout residual ``r_w`` recomputed. Anchors and
+    holdout are measured on the SAME windows, so their errors are strongly
+    common-mode; the spread of ``r_w`` isolates exactly the noise that
+    survives the pairing, and its systematic part (the law's misfit) drops
+    out of a standard deviation. The tolerance is the standard error of that
+    mean residual, relative to the holdout::
+
+        tol = stdev(r_w) / sqrt(n_windows) / |v_holdout|
+
+    Returns ``floor`` when the datum is ABSENT or degenerate:
+
+    * the dense per-tensor path measures each ``(tensor, format)`` exactly
+      once — the accumulator's ``_count`` is 1 — so it has no between-draw
+      spread to offer. (A FIT RESIDUAL is not a substitute: it cannot
+      separate measurement noise from law misfit, so a systematically wrong
+      law would inflate its own tolerance and open the gate exactly where it
+      must close. Measured: on free-rate exponential anchors that estimator
+      returns tol 252% against a 127% miss.)
+    * fewer than 2 windows, ragged window counts, or an exactly-zero spread
+      (a synthetic/degenerate estimator with no resolution).
+
+    ``floor`` defaults to the historical bare 0.10 and is the value the
+    shipped runs used; where the datum IS present the derived tolerance
+    REPLACES it, which is the literal §B rule and can tighten as well as
+    loosen. The accept/reject rate is logged so a ladder that the derived
+    tolerance has closed is visible rather than silent."""
+    if not windows:
+        return floor
+    need = list(anchors) + [holdout]
+    if any(f not in windows for f in need):
+        return floor
+    n = len(windows[holdout])
+    if n < 2 or any(len(windows[f]) != n for f in need):
+        return floor
+    resid = []
+    for w in range(n):
+        vw = {f: float(windows[f][w]) for f in need}
+        law_w = _cb_ladder_law(kmap, anchors, vw)
+        if law_w is None:
+            return floor
+        resid.append(law_w.predict(holdout) - vw[holdout])
+    mr = sum(resid) / n
+    var = sum((r - mr) ** 2 for r in resid) / (n - 1)
+    se = math.sqrt(var / n)
+    try:
+        vh = abs(float(values[holdout]))
+    except (KeyError, TypeError):
+        return floor
+    if se <= 0.0 or vh <= 0.0:
+        return floor
+    return se / vh
+
+
+def _cb_ladder_gate(kmap: Mapping[str, int], anchors: Sequence[str],
+                    values: Mapping[str, float], holdout: str,
+                    tol_floor: float,
+                    windows: Mapping[str, Sequence[float]] | None = None):
+    """Fit + holdout-gate ONE metric. THE shared gate for both cost chains.
+
+    Returns ``(law | None, holdout_rel_err, tol)``. ``law`` is None when the
+    anchors are unusable (rel_err inf) or when the holdout misses by more
+    than the tolerance; the caller then MEASURES the predicted rungs
+    (encode_tiers.md §B/§C — a tensor/unit that defies the law never
+    receives an interpolated cost)."""
+    law = _cb_ladder_law(kmap, anchors, values)
+    tol = _cb_ladder_holdout_tol(kmap, anchors, values, holdout, tol_floor,
+                                 windows)
+    if law is None:
+        return None, float("inf"), tol
+    try:
+        meas = float(values[holdout])
+    except (KeyError, TypeError):
+        return None, float("inf"), tol
+    rel = abs(law.predict(holdout) - meas) / max(abs(meas), 1e-20)
     if rel > tol:
-        return None, rel
-    return {f: pred(f) for f in predicted}, rel
+        return None, rel, tol
+    return law, rel, tol
+
+
+def _cb_ladder_fit(kls: Mapping[str, float], kmap: Mapping[str, int],
+                   anchors: Sequence[str], holdout: str,
+                   predicted: Sequence[str], tol: float,
+                   windows: Mapping[str, Sequence[float]] | None = None):
+    """Fit the anchors and predict, through the SHARED law + gate.
+
+    ``tol`` is the tolerance used when no measurement-noise datum is
+    available; when ``windows`` (per-rung per-calibration-window values) is
+    supplied the gate derives the tolerance from it instead
+    (``_cb_ladder_holdout_tol``).
+
+    Returns ``(predicted_kls | None, holdout_rel_err, tol_used)``."""
+    law, rel, tol_used = _cb_ladder_gate(kmap, anchors, kls, holdout, tol,
+                                         windows)
+    if law is None:
+        return None, rel, tol_used
+    return {f: law.predict(f) for f in predicted}, rel, tol_used
 
 
 def measure_expert_unit_costs(
@@ -546,6 +737,11 @@ def measure_expert_unit_costs(
         baseline = _baseline_logprobs(model, calib_ids)
         measure_expert_unit_costs.last_added_col_weights = []
     ladder = _cb_ladder_split(measured_fmts) if ladder_interp else None
+    # Visible accept/reject rate for the holdout gate (R20): a ladder that
+    # is silently rejecting most units is paying full measurement cost PLUS
+    # the anchors, and the operator must be able to see that from the log.
+    ladder_accept = 0
+    ladder_reject = 0
     for qn, mod in units:
         pnames = list(_packed_experts_param_names(mod, profile))
         n_params_unit = sum(int(getattr(mod, pn).numel()) for pn in pnames)
@@ -570,11 +766,22 @@ def measure_expert_unit_costs(
         kl_scale = (float(num_experts) / float(sample_idx.numel())
                     if sample_idx is not None else 1.0)
 
+        # Per-window unit KLs of every MEASURED rung: the between-draw noise
+        # datum the ladder's holdout gate derives its tolerance from. Free —
+        # _unit_kl already loops window by window.
+        kl_windows: dict[str, list[float]] = {}
+
         def kl_of(fmt):
-            return kl_scale * _unit_kl(
+            out = _unit_kl(
                 model, calib_ids, baseline, mod, pnames, fmt,
                 expert_chunk=expert_chunk, col_weights=col_weights,
-                unit_qname=qn, sample_idx=sample_idx)
+                unit_qname=qn, sample_idx=sample_idx,
+                per_window=ladder is not None)
+            if ladder is None:
+                return kl_scale * out
+            mean, windows = out
+            kl_windows[fmt] = [kl_scale * w for w in windows]
+            return kl_scale * mean
 
         if ladder is None:
             kls = {fmt: kl_of(fmt) for fmt in measured_fmts}
@@ -584,25 +791,30 @@ def measure_expert_unit_costs(
                    if fmt not in predicted_all}
             ladder_meta_all = []
             for kmap, anchors, holdout, predicted in ladder:
-                pred_kls, rel = _cb_ladder_fit(
-                    kls, kmap, anchors, holdout, predicted, ladder_tol)
+                pred_kls, rel, tol_used = _cb_ladder_fit(
+                    kls, kmap, anchors, holdout, predicted, ladder_tol,
+                    kl_windows)
                 if pred_kls is None:
                     # Holdout gate FAILED for this unit/family: fall back to
                     # full measurement (recon-validated, KL-unproven law).
+                    ladder_reject += 1
                     if progress:
                         _log(f"  {qn}: ladder holdout rel_err {rel:.1%} > "
-                             f"{ladder_tol:.0%} — measuring {predicted}")
+                             f"{tol_used:.1%} — measuring {predicted}")
                     kls.update({fmt: kl_of(fmt) for fmt in predicted})
                     ladder_meta_all.append(
                         {"accepted": False, "holdout_rel_err": round(rel, 4),
+                         "holdout_tol": round(tol_used, 4),
                          "anchors": anchors})
                 else:
-                    kls.update(pred_kls)
+                    ladder_accept += 1
                     ladder_meta_all.append({
                         "accepted": True, "holdout_rel_err": round(rel, 4),
+                        "holdout_tol": round(tol_used, 4),
                         "anchors": anchors, "holdout": holdout,
                         "predicted": predicted,
                     })
+                    kls.update(pred_kls)
             kls["_ladder"] = ladder_meta_all
         ladder_meta = kls.pop("_ladder", None)
         unit_kls[qn] = dict(kls)
@@ -654,6 +866,13 @@ def measure_expert_unit_costs(
                 f"{fmt} unit KL = {kls[fmt]:.4e}" for fmt in measured_fmts)
                 + f"  (n_params={n_params_unit / 1e6:.0f}M, "
                   f"experts={num_experts})")
+    if ladder is not None:
+        n_gate = ladder_accept + ladder_reject
+        _log(f"CB ladder holdout gate: {ladder_accept}/{n_gate} accepted "
+             f"({ladder_accept / max(n_gate, 1):.0%}), {ladder_reject} "
+             f"rejected -> measured (tolerance derived per unit from the "
+             f"between-window noise of the measured rungs; "
+             f"{ladder_tol:.0%} where that datum is degenerate)")
     return stats, costs, unit_kls
 
 
@@ -774,8 +993,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "Also enabled by PRISMAQUANT_CB_LADDER_INTERP=1. Default OFF — "
         "the law is recon-validated but KL-unproven (encode_tiers.md §B).")
     p.add_argument("--ladder-holdout-tol", type=float, default=0.10,
-                   help="Max holdout relative error to accept a unit's "
-                   "ladder fit; above it the unit measures every rung.")
+                   help="FLOOR on the max holdout relative error that "
+                   "accepts a unit's ladder fit; the gate derives its own "
+                   "tolerance from the anchors' residual noise "
+                   "(encode_tiers.md B) and uses the larger. Above it the "
+                   "unit measures every rung.")
     p.add_argument(
         "--expert-sample", type=int, default=0,
         help="Quantize only a stratified subsample of N experts per unit and "

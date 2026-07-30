@@ -50,6 +50,7 @@ from prismaquant.kl_fisher import (
     select_token_scope,
     token_count_for_logits,
 )
+from prismaquant.perturbed_x_cache import calibration_data_hash
 
 SCHEMA = "prismaquant.aura_cost.v1"
 
@@ -742,6 +743,14 @@ def compute_aura_cost(
             "calib_sha256": hashlib.sha256(
                 calib_ids.detach().cpu().contiguous().numpy().tobytes()
             ).hexdigest(),
+            # R14: the canonical cross-stage calibration identity
+            # (perturbed_x_cache.calibration_data_hash). validate_assignments_kl
+            # intersects its own calib_repeat_hashes against these and refuses
+            # to select on text the cost stage already saw. calib_sha256 above
+            # is a different construction and is kept for continuity with
+            # existing artifacts.
+            "calib_hash": calibration_data_hash(calib_ids),
+            "calib_hashes": [calibration_data_hash(calib_ids)],
             "omitted_packed_experts": omitted_packed_experts,
             "dw_rendered_rows": n_rendered,
             "dw_rtn_fallback_rows": n_rtn,

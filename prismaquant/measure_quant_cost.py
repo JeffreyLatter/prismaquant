@@ -1552,8 +1552,14 @@ def _batched_quantize(
                          f"batched RTN")
 
 
-# Holdout gate tolerance for the dense-path ladder (matches the expert
-# stage's --ladder-holdout-tol default).
+# Holdout-gate tolerance FLOOR for the dense-path ladder (matches the expert
+# stage's --ladder-holdout-tol default). This is NOT the gate threshold: the
+# shared gate derives its tolerance per fit from the anchors' own residual
+# noise (encode_tiers.md B — "trust the fit only where the holdout error
+# clears the between-seed cost noise") and takes the larger of the two. The
+# constant survives only as an explicit floor for the cases where that datum
+# is absent at call time (2 anchors, or the exact 3-point floor-law solve:
+# residual dof 0). See expert_empirical_cost._cb_ladder_holdout_tol.
 _CB_LADDER_TOL = float(os.environ.get("PRISMAQUANT_CB_LADDER_TOL", "0.10"))
 
 _CB_CW_CACHE: dict | None = None
@@ -1599,78 +1605,30 @@ def _cb_ladder_plan(specs: list[fr.FormatSpec]):
 
 
 def _ladder_rate_factor(fmt_name: str, k: int) -> float:
-    """Exact per-sub rate factor R(k) = sum_i 2^(-2*b_i/d_i) under the
-    ceil-first bit split — the theory-faithful rate variable for the CB
-    ladder. The smooth 2^(-alpha*k) law treats k as evenly divisible, but at
-    k % n_sub != 0 the ceil-first split gives some sub-tables one bit more:
-    the true error carries a +4-6% SAWTOOTH by split phase that a smooth law
-    cannot represent — and the (28, 38, 48) anchors + k=39 holdout sit on
-    DIFFERENT phases, which is exactly where the 8-12% holdout rejections
-    came from (2026-07-21 27B cost run). R is exact per phase and reduces to
-    the old law at even splits (R(4m) = 4*2^(-m) for fp8)."""
-    n_sub = 4 if fmt_name.startswith("FP8_CB") else 2
-    sub_dim = 8 // n_sub
-    base, extra = divmod(int(k), n_sub)
-    r = 0.0
-    for i in range(n_sub):
-        b = base + (1 if i < extra else 0)
-        r += 2.0 ** (-2.0 * b / sub_dim)
-    return r
+    """Exact per-sub rate factor R(k) under the ceil-first bit split.
+
+    Thin re-export of the canonical implementation
+    (``expert_empirical_cost._cb_ladder_rate_factor``) — kept as a name here
+    because the dense path and its tests have always reached for it under
+    this name."""
+    from prismaquant.expert_empirical_cost import _cb_ladder_rate_factor
+    return _cb_ladder_rate_factor(fmt_name, k)
 
 
 def _ladder_metric_fit(kmap, anchors, fmt_values, target_fmt):
     """Fit ONE metric on the anchors and predict target_fmt.
 
-    Chain (holdout gates every variant, so each is a proposal only):
-      1. Split-aware FLOORED LINEAR law D = F + C*R(k), with R the exact
-         ceil-first per-sub rate factor — plain linear least squares in
-         (1, R); kills both the high-k floor miss AND the k%n_sub sawtooth.
-      2. The smooth floor law D = F + C*2^(-b*k) (exact 3-anchor solve).
-      3. Log-linear LS (the original law).
+    Delegates to the SHARED law ``expert_empirical_cost._cb_ladder_law``
+    (floored-linear-in-R(k) -> smooth floor law -> log-linear). Before R20
+    (2026-07-30) this was a second, drifting copy of the chain and the
+    expert path's copy carried no R(k) term at all.
+
     Returns None if any anchor value is unusable."""
-    try:
-        xs = [float(kmap[f]) for f in anchors]
-        vs = [float(fmt_values[f]) for f in anchors]
-    except (KeyError, TypeError):
+    from prismaquant.expert_empirical_cost import _cb_ladder_law
+    law = _cb_ladder_law(kmap, anchors, fmt_values)
+    if law is None:
         return None
-    if len(anchors) >= 2:
-        # -- 1. split-aware floored linear LS ------------------------------
-        rs = [_ladder_rate_factor(f, kmap[f]) for f in anchors]
-        n = float(len(rs))
-        mr = sum(rs) / n
-        mv = sum(vs) / n
-        den = sum((r - mr) ** 2 for r in rs)
-        if den > 0.0:
-            C = sum((r - mr) * (v - mv) for r, v in zip(rs, vs)) / den
-            F = mv - C * mr
-            if C > 0.0 and F >= 0.0:
-                r_t = _ladder_rate_factor(target_fmt, kmap[target_fmt])
-                return float(F + C * r_t)
-            if C > 0.0 and F < 0.0:
-                # floor clamped to 0: refit C through the origin
-                den0 = sum(r * r for r in rs)
-                if den0 > 0.0:
-                    C0 = sum(r * v for r, v in zip(rs, vs)) / den0
-                    if C0 > 0.0:
-                        r_t = _ladder_rate_factor(target_fmt,
-                                                  kmap[target_fmt])
-                        return float(C0 * r_t)
-    if len(anchors) == 3:
-        # -- 2. smooth floor law (exact solve) -----------------------------
-        from prismaquant.expert_empirical_cost import _fit_floor_law
-        fl = _fit_floor_law(xs, vs)
-        if fl is not None:
-            F, C, b = fl
-            return float(F + C * 2.0 ** (-b * kmap[target_fmt]))
-    ys = [math.log2(max(v, 1e-20)) for v in vs]
-    n = float(len(xs))
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    denom = sum((x - mx) ** 2 for x in xs)
-    b = (-sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
-         if denom > 0 else 0.25)
-    a = my + b * mx
-    return float(2.0 ** (a - b * kmap[target_fmt]))
+    return law.predict(target_fmt)
 
 
 def _chunk_metric(accum, name, fmt, key, count_key="_count"):
@@ -1722,6 +1680,11 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
           + (f" (expert sample: {len(expert_extrapolate)} extrapolated)"
              if expert_extrapolate else ""), flush=True)
     ladder_plan = _cb_ladder_plan(specs)
+    # Visible accept/reject rate for the holdout gate (R20): a ladder that is
+    # mostly rejecting pays full measurement PLUS the anchors, and the
+    # operator must be able to read that off the log.
+    ladder_accept = 0
+    ladder_reject = 0
 
     accum: dict[str, dict[str, dict]] = {}
     processed = 0
@@ -1954,6 +1917,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
             if ladder_plan is not None:
                 # Per-tensor fit + holdout gate; fill accepted predictions,
                 # batch-measure the rejects (exact same math via the closure).
+                from prismaquant.expert_empirical_cost import _cb_ladder_gate
                 specs_by_name = {s.name: s for s in specs}
                 for kmap, anchors, holdout, predicted in ladder_plan[0]:
                     if not all(f in specs_by_name for f in
@@ -1968,13 +1932,17 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                         if any(v is None or v <= 0 for v in vals.values()):
                             fail_idx.append(i)
                             continue
-                        pred_h = _ladder_metric_fit(
-                            kmap, anchors, vals, holdout)
-                        rel_err = (abs(pred_h - vals[holdout])
-                                   / max(vals[holdout], 1e-20))
-                        if pred_h is None or rel_err > _CB_LADDER_TOL:
+                        # Shared fit + gate. No `windows` datum here: this
+                        # path measures each (tensor, format) exactly once
+                        # (accumulator _count == 1), so there is no
+                        # between-draw spread to derive a tolerance from and
+                        # _CB_LADDER_TOL stands (encode_tiers.md B).
+                        law, _rel, _tol = _cb_ladder_gate(
+                            kmap, anchors, vals, holdout, _CB_LADDER_TOL)
+                        if law is None:
                             fail_idx.append(i)
                             continue
+                        ladder_accept += 1
                         for fmt in predicted:
                             fills = {}
                             for key in ("weight_mse", "output_mse",
@@ -1999,9 +1967,13 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                                 output_mse_measured=False,
                             )
                     if fail_idx:
+                        ladder_reject += len(fail_idx)
                         print(f"[cost] ladder holdout rejected "
                               f"{len(fail_idx)}/{N} tensors in chunk — "
-                              f"measuring {sorted(predicted)} for them",
+                              f"measuring {sorted(predicted)} for them "
+                              f"(running accept rate "
+                              f"{ladder_accept}/{ladder_accept + ladder_reject}"
+                              f" = {ladder_accept / max(ladder_accept + ladder_reject, 1):.0%})",
                               flush=True)
                         for fmt in predicted:
                             _measure_spec_into_accum(
@@ -2021,6 +1993,14 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                       flush=True)
     if _prefetch_pool is not None:
         _prefetch_pool.shutdown(wait=False)
+    if ladder_plan is not None:
+        n_gate = ladder_accept + ladder_reject
+        print(f"[cost] CB ladder holdout gate: {ladder_accept}/{n_gate} "
+              f"tensor-fits accepted "
+              f"({ladder_accept / max(n_gate, 1):.0%}), {ladder_reject} "
+              f"rejected -> measured (tol {_CB_LADDER_TOL:.0%}: the dense "
+              f"path measures each (tensor, format) once, so it has no "
+              f"between-draw noise datum to derive from)", flush=True)
     results = _finalize_results(accum)
     _extrapolate_expert_costs(results, expert_extrapolate)
     return results

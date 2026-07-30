@@ -1,6 +1,7 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "lfm2_moe",
+  "priority": 150,
   "default_serving_profile": "vllm_packed_moe",
   "runtime_requirements": {
     "fast_kernel_packages": [

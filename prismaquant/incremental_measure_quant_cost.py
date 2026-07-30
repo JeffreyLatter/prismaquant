@@ -11,9 +11,10 @@ Each shard installs its decoder layers on demand, runs
 on the matching Linears, writes a per-shard pickle, then unloads.
 
 MTP is folded in as a built-in shard kind: when `--include-mtp` (default
-True), a shard's regex like `^mtp\\.layers\\.0\\.` triggers synthesis
-of an `MtpModule` (via `mtp_module.MtpModule`), loading of `mtp.*`
-safetensors (via `_load_into_mtp`), enumeration of MTP Linears + packed
+True), a shard's regex like `^mtp\\.layers\\.0\\.` triggers synthesis of
+the profile's MTP module (`profile.build_mtp_module`), loading of the
+source MTP safetensors (`profile.read_mtp_source_state_dict` /
+`profile.load_mtp_state_dict`), enumeration of MTP Linears + packed
 experts, then the same measurement pipeline against the MTP activation
 cache (the probe writes those activations to the same
 `--activation-cache-dir` when its own `--include-mtp` was set).
@@ -601,14 +602,14 @@ def _run_mtp_cost_shard(
     probe_path: str,
     render_path: str = "registry",
 ):
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
-
     inc = re.compile(linear_include)
-    try:
-        from .model_profiles import profile_from_model
-        profile = profile_from_model(ctx.model)
-    except Exception:
-        profile = None
+    from .model_profiles import profile_from_model
+    # The MTP module layout + its checkpoint prefix are profile
+    # decisions, so this lookup is no longer best-effort: without a
+    # profile there is nothing to build. (The `profile` local is also
+    # passed to the packed-expert helpers further down, which do
+    # tolerate None — but reaching this shard at all means has_mtp().)
+    profile = profile_from_model(ctx.model)
     # Prune the probe stats to this MTP shard's regex before building
     # anything — if there's nothing to measure, emit an empty pickle.
     shard_targets: set[str] = {n for n in probe_stats if inc.search(n)}
@@ -633,14 +634,20 @@ def _run_mtp_cost_shard(
 
     device_t = torch.device(device)
     text_config = ctx.model.config
-    inner_mtp = MtpModule(text_config)
+    inner_mtp = profile.build_mtp_module(text_config)
+    if inner_mtp is None:
+        raise RuntimeError(
+            f"profile '{profile.name}' declares has_mtp() but "
+            f"build_mtp_module() returned None — the MTP cost shard "
+            f"cannot be measured. Either implement build_mtp_module() or "
+            f"set has_mtp() -> False.")
     mtp_wrapper = nn.Module()
     mtp_wrapper.add_module("mtp", inner_mtp)
     mtp_wrapper.to(device=device_t, dtype=dtype)
     mtp_wrapper.eval()
 
-    raw = _load_mtp_state_dict(model_path)
-    missing, extra = _load_into_mtp(inner_mtp, raw)
+    raw = profile.read_mtp_source_state_dict(model_path)
+    missing, extra = profile.load_mtp_state_dict(inner_mtp, raw)
     loaded = len(raw) - len(missing)
     print(f"[incremental-cost/mtp] loaded {loaded}/{len(raw)} mtp weights "
           f"(missing={len(missing)}, module_params_unset={len(extra)})",

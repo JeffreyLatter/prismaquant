@@ -246,7 +246,9 @@ bandwidth (the wall), dense fp8 GEMV 20.0 @ ~55%, cuBLAS (lm_head + router)
 
 ## SHIP LEDGER (2026-07-20, final)
 - **Artifact PUBLIC on HF:** rdtand/Hy3-295B-A21B-PrismaQuant-2.9bit-nvfp4cb-
-  vllm — 104.06 GB, 5 shards, CB MTP included, serving kit (plugin snapshot +
+  vllm *(historical id as shipped on 2026-07-20; now 307-redirects to the
+  canonical `rdtand/Hy3-295B-A21B-prismaquant-gridbook-2.9bit-vllm` — verified
+  against the Hub 2026-07-30, R28/D21)* — 104.06 GB, 5 shards, CB MTP included, serving kit (plugin snapshot +
   serve.sh), allocation provenance, per-format allocation table on the card,
   Apache 2.0, NO quality claims. Standalone formats repo:
   github.com/RobTand/cbq (PRIVATE, working title — Robert's rename/public
@@ -312,6 +314,9 @@ claim (single-seed churn ±2–3 established) — though the joint artifact
 genuinely carries more fidelity in sensitive places. UPLOADED PUBLIC:
 huggingface.co/rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm (gridbook-branded
 id for the public post; card = no quality claims + kit + provenance).
+*(Historical id as posted; now 307-redirects to the canonical
+`rdtand/Hy3-295B-A21B-prismaquant-gridbook-2.9bit-vllm` — verified against
+the Hub 2026-07-30, R28/D21. Cite the canonical id in new material.)*
 
 ## Remaining (perf, not correctness)
 - MoE prefill still per-expert-loop (batched-expert expand + grouped GEMM =

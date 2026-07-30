@@ -1,6 +1,9 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "laguna",
+  "priority": 190,
+  "supported_lanes": ["compressed-tensors", "nvfp4_cb"],
+  "preferred_lane": "nvfp4_cb",
   "default_serving_profile": "nvfp4_cb",
   "match": {
     "model_type": ["laguna"],

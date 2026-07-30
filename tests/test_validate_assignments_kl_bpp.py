@@ -107,3 +107,36 @@ def test_kl_repeat_summary_reports_stderr_and_ucb():
     assert summary["kl_std"] > 0
     assert summary["kl_stderr"] > 0
     assert summary["kl_ucb"] > summary["last_token_kl"]
+
+def test_kl_repeat_summary_emits_kl_mean_and_keeps_the_alias():
+    """R28: kl_mean is canonical; last_token_kl stays an alias for one cycle."""
+    summary = _kl_repeat_summary([0.10, 0.20, 0.30], ucb_z=2.0)
+
+    assert abs(summary["kl_mean"] - 0.20) < 1e-12
+    assert summary["last_token_kl"] == summary["kl_mean"]
+
+
+def test_kl_repeat_summary_emits_gold_lane_tail_keys():
+    """R9: per-sequence tail at zero extra forward cost, gold-lane key names."""
+    summary = _kl_repeat_summary(
+        [0.20],
+        ucb_z=0.0,
+        kl_per_sample=[0.10, 0.12, 0.14, 0.90],
+        nll_per_sample=[2.0, 2.1, 2.2, 5.0],
+    )
+
+    assert summary["kl_per_sample"] == [0.10, 0.12, 0.14, 0.90]
+    assert summary["kl_max"] == 0.90
+    assert summary["kl_p99"] > summary["kl_p95"] > 0.14
+    assert summary["kl_tail_domain"] == "sequence"
+    assert abs(summary["nll_mean"] - 2.825) < 1e-12
+    assert summary["nll_p99"] > 4.0
+    # The repeat mean stays authoritative: pooling per-sequence values would
+    # silently reweight repeats of unequal size.
+    assert abs(summary["kl_mean"] - 0.20) < 1e-12
+
+
+def test_kl_repeat_summary_without_per_sequence_data_omits_tail():
+    summary = _kl_repeat_summary([0.10, 0.20], ucb_z=0.0)
+    for key in ("kl_p95", "kl_p99", "kl_max", "kl_per_sample", "nll_p99"):
+        assert key not in summary

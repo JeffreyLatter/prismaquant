@@ -1,6 +1,9 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "hy_v3",
+  "priority": 180,
+  "supported_lanes": ["compressed-tensors", "nvfp4_cb", "gguf"],
+  "preferred_lane": "gguf",
   "default_serving_profile": "gguf",
   "match": {
     "model_type": ["hy_v3"],

@@ -40,12 +40,13 @@ from __future__ import annotations
 
 import re
 
-import torch.nn as nn
-
 from .base import ModelProfile
 
 
 class DeepseekV4Profile(ModelProfile):
+
+    # Detection priority (lower = consulted first): disjoint.
+    priority = 170
 
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
@@ -78,17 +79,24 @@ class DeepseekV4Profile(ModelProfile):
         )
 
     # ------------------------------------------------------------
-    # MTP — DSv4-Flash has 1 nextn-predict block
+    # MTP — DSv4-Flash has 1 nextn-predict block, NOT quantized (yet)
     # ------------------------------------------------------------
     def has_mtp(self) -> bool:
-        return True
-
-    def build_mtp_module(self, text_config) -> nn.Module | None:
-        # Defer MTP module standup until first need. The transformers
-        # vendored class includes MTP wiring inside the main model;
-        # we'll subclass and isolate it when the export pipeline
-        # actually needs to hook it.
-        return None
+        # The hy_v3 route (audit R12, 2026-07-30). Until DSv4's nextn
+        # block is actually quantized, PrismaQuant does not probe, cost
+        # or render it: `checkpoint_to_live_name` already drops `mtp.*`
+        # so probe/cost/allocator never see it, and the export ships it
+        # VERBATIM via `passthrough_prefixes` (`"mtp."`, declared in
+        # specs/deepseek_v4.json) so vLLM's nextn spec decode still
+        # loads.
+        #
+        # This replaces a latent contradiction: `has_mtp -> True` with
+        # `build_mtp_module -> None` meant the three production MTP
+        # sites, which imported the Qwen3.5-specific module directly,
+        # would have handed DSv4 a Qwen3.5 decoder layer. Standing up a
+        # real DSv4 MTP module is a `build_mtp_module()` override plus
+        # flipping this back to True — nothing else has to change.
+        return False
 
     # ------------------------------------------------------------
     # Streaming-probe adapters (refactor #32)

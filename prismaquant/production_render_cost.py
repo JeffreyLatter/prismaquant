@@ -75,6 +75,29 @@ def _cache_render_score_records(cache: object) -> dict[tuple[str, str], dict]:
     return out
 
 
+def _calibration_hashes(*sources: object) -> list[str]:
+    """Union of R14 calibration identities carried by upstream artifacts.
+
+    This module never sees calibration text — its cost comes from render
+    scores the production cache already recorded — so the hash it stamps is
+    inherited from the cache metadata (stamped by ``build_production_cache``)
+    and from the baseline cost payload's meta/provenance. Returns ``[]`` when
+    no upstream stamped one, which keeps the downstream disjointness check
+    inert on pre-R14 artifacts rather than guessing.
+    """
+    found: set[str] = set()
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        single = source.get("calib_hash")
+        if isinstance(single, str) and single:
+            found.add(single)
+        many = source.get("calib_hashes")
+        if isinstance(many, Sequence) and not isinstance(many, (str, bytes)):
+            found.update(str(item) for item in many if item)
+    return sorted(found)
+
+
 def _lookup_record(
     records: Mapping[tuple[str, str], Mapping],
     qname: str,
@@ -316,11 +339,19 @@ def synthesize_production_render_cost_payload(
             f"{len(non_output_metric)} entries; sample={sample}"
         )
 
+    calib_hashes = _calibration_hashes(
+        getattr(production_cache, "metadata", None),
+        baseline_cost_payload.get("meta"),
+        baseline_cost_payload.get("provenance"),
+    )
     return {
         "schema": SCHEMA,
         "costs": output_costs,
         "formats": output_formats,
         "meta": {
+            # R14: inherited calibration identity — see _calibration_hashes.
+            "calib_hashes": calib_hashes,
+            "calib_hash": calib_hashes[0] if len(calib_hashes) == 1 else None,
             "production_cache_source": source_label,
             "baseline_schema": baseline_cost_payload.get("schema"),
             "baseline_meta": baseline_cost_payload.get("meta"),

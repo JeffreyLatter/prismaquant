@@ -5438,6 +5438,100 @@ def _prepare_ref_log_probs_for_kl(ref_log_probs, device: torch.device):
 
 
 @torch.no_grad()
+def sequence_token_nll(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    *,
+    chunk: int = 128,
+) -> float | None:
+    """Mean next-token NLL (nats) for one sequence, from logits already in hand.
+
+    R9's "free rung-2 term": the student logits and the calibration ids are both
+    live at every KL site, so a PPL-family statistic costs one ``gather`` and a
+    ``logsumexp`` — no extra forward.  Returns ``None`` when there is no
+    next-token label to score, which is the last-token KL scope (the model only
+    emitted position ``T-1``, whose label lies outside the window).
+
+    Chunked over positions so the fp32 upcast stays bounded: a full
+    ``[T, V]`` fp32 copy on a 150k vocab is ~300 MB at T=512.
+    """
+    if logits.dim() != 3 or logits.size(0) != 1:
+        return None
+    if logits.size(1) < 2:
+        return None
+    pred = logits[0, :-1, :]
+    targets = token_ids.reshape(-1)[1:1 + pred.size(0)].to(pred.device)
+    if targets.numel() != pred.size(0):
+        return None
+    targets = targets.to(torch.int64)
+    total = 0.0
+    count = 0
+    step = max(int(chunk), 1)
+    for start in range(0, pred.size(0), step):
+        block = pred[start:start + step].float()
+        lse = torch.logsumexp(block, dim=-1)
+        picked = block.gather(
+            1, targets[start:start + step].unsqueeze(1)).squeeze(1)
+        total += float((lse - picked).sum().item())
+        count += block.size(0)
+    if count == 0:
+        return None
+    return total / count
+
+
+def _quantile(values: Sequence[float], q: float) -> float:
+    """Linear-interpolated quantile, matching ``torch.Tensor.quantile``.
+
+    Kept identical to the gold lane's reduction (``tools/measure_vllm_full_kl``
+    uses ``tensor.quantile``) so a selection row and a served row are read the
+    same way.
+    """
+    ordered = sorted(float(v) for v in values)
+    if not ordered:
+        raise ValueError("quantile of an empty sequence")
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = float(q) * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return ordered[lo]
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+
+def summarize_per_sequence_kl(
+    kl_values: Sequence[float],
+    *,
+    nll_values: Sequence[float] | None = None,
+) -> dict[str, object]:
+    """Tail statistics over per-sequence KL (and, when available, token NLL).
+
+    Key names are deliberately the gold lane's (`tools/measure_vllm_full_kl.py`
+    emits ``kl_mean``/``kl_p99``/``kl_max``/``kl_per_sample``) so a selection row
+    and a served row are directly comparable.  ``kl_tail_domain`` records the
+    honest difference: here the sample unit is a **sequence** (each value is
+    already a position-mean from ``kl_divergence``), not a position, so
+    ``kl_p99`` is a p99 over sequences.
+    """
+    vals = [float(v) for v in kl_values]
+    if not vals:
+        raise ValueError("per-sequence KL summary received no values")
+    out: dict[str, object] = {
+        "kl_per_sample": vals,
+        "kl_p95": _quantile(vals, 0.95),
+        "kl_p99": _quantile(vals, 0.99),
+        "kl_max": max(vals),
+        "kl_tail_domain": "sequence",
+    }
+    nlls = [float(v) for v in (nll_values or []) if v is not None and math.isfinite(float(v))]
+    if nlls:
+        out["nll_per_sample"] = nlls
+        out["nll_mean"] = sum(nlls) / len(nlls)
+        out["nll_p99"] = _quantile(nlls, 0.99)
+    return out
+
+
+@torch.no_grad()
 def measure_assignment_kl(
     model,
     assignment: Mapping[str, str],
@@ -5454,8 +5548,17 @@ def measure_assignment_kl(
     include_activation_quant: bool = True,
     stream_ref_log_probs: bool = False,
     use_cuda_graphs: bool | None = None,
-) -> float:
-    """Measure assignment KL on the production perturbed-weight path."""
+    return_per_sequence: bool = False,
+) -> float | tuple[float, list[float], dict[str, object]]:
+    """Measure assignment KL on the production perturbed-weight path.
+
+    ``return_per_sequence`` (R9) switches the return to
+    ``(mean, per_sequence_kl, stats)`` and additionally computes the free
+    rung-2 token NLL from the student logits already in hand — ``stats``
+    carries ``nll_per_sample`` (``None`` under the last-token scope, which has
+    no next-token label).  Default ``False`` keeps the historical scalar return
+    and does no extra work, so every existing caller is byte-identical.
+    """
     device = next(model.parameters()).device
     calib_ids = _prepare_kl_tensor_inputs(calib_ids, device)
     if not stream_ref_log_probs:
@@ -5513,6 +5616,7 @@ def measure_assignment_kl(
                     f"{hooks.skipped[:3]}"
                 )
     values = []
+    nll_values: list[float] = []
     if use_cuda_graphs is None:
         use_cuda_graphs = _env_cuda_graphs_enabled_for_call_count(
             "PRISMAQUANT_KL_CUDA_GRAPHS",
@@ -5606,7 +5710,21 @@ def measure_assignment_kl(
                                 "PRISMAQUANT_FULL_SEQUENCE_KL."
                             )
                         values.append(float(kl_divergence(logits, teacher).item()))
+                        if return_per_sequence and full_seq:
+                            nll = sequence_token_nll(logits, batch)
+                            if nll is not None:
+                                nll_values.append(nll)
             finally:
                 if installed_here:
                     hooks.remove()
-    return sum(values) / max(len(values), 1)
+    mean = sum(values) / max(len(values), 1)
+    if not return_per_sequence:
+        return mean
+    stats: dict[str, object] = {
+        "mode": "hooks",
+        "cuda_graphs": bool(use_cuda_graphs),
+        "kl_scope": effective_kl_scope,
+        "n_sequences": len(values),
+        "nll_per_sample": nll_values or None,
+    }
+    return mean, list(values), stats

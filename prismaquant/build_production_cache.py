@@ -49,6 +49,7 @@ from prismaquant.calibration_data import (
 )
 from prismaquant.gpu_guard import require_cuda_hot_path
 from prismaquant.model_profiles import detect_profile_with_warning
+from prismaquant.perturbed_x_cache import calibration_data_hash
 from prismaquant.production_recache import _load_assignment
 from prismaquant.production_weight_cache import (
     fill_production_weight_cache,
@@ -662,6 +663,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             recache_microbatch_size=args.recache_microbatch_size,
             h_detail_dir=args.h_detail_dir,
         )
+        # R14: stamp the calibration identity onto the cache so every artifact
+        # derived from it (production_render_cost's cost table) can be checked
+        # for disjointness against the selection split, instead of that
+        # guarantee resting on the driver passing the right flag.
+        if cache.metadata is None:
+            cache.metadata = {}
+        cache.metadata["calib_hash"] = calibration_data_hash(calib_ids)
         # Render packed-MoE experts through the SAME deliberate path. They are
         # 3-D packed tensors, not nn.Linear, so fill_production_weight_cache
         # skips them; without this they would be RTN'd by omission at export

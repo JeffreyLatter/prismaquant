@@ -30,6 +30,9 @@ from .base import ModelProfile
 
 
 class LagunaProfile(ModelProfile):
+
+    # Detection priority (lower = consulted first): disjoint.
+    priority = 190
     """poolside Laguna family (Laguna-S/XS 2.x)."""
 
     @classmethod
@@ -48,7 +51,8 @@ class LagunaProfile(ModelProfile):
 
     def has_mtp(self) -> bool:
         # The DFlash drafter is a SEPARATE checkpoint (…-DFlash), not an
-        # in-body/mtp.* sidecar; the mtp_module machinery does not apply.
+        # in-body/mtp.* sidecar; the mtp_source_prefix/build_mtp_module
+        # machinery does not apply.
         return False
 
     def checkpoint_to_live_name(self, ckpt_key: str, *,

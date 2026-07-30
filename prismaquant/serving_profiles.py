@@ -633,6 +633,63 @@ def resolve_target_profile(
     return str(default)
 
 
+def require_lane_supported(
+    profile,
+    export_container: str | None,
+    *,
+    flag: str = "EXPORT_CONTAINER",
+):
+    """Preflight: refuse an export lane the *architecture* has not declared.
+
+    Lane eligibility is a model-profile property (`supported_export_lanes()`),
+    not an operator preference. The CB lane needs a gridbook loader keyed to
+    the architecture's expert layout and the GGUF lane needs a llama.cpp-side
+    arch; where that wiring is missing, nothing fails. The run completes, the
+    exporter writes bytes, and the server loads uninitialised expert memory —
+    the observed failure mode is *coherent-looking garbage generation*, not a
+    crash (commit `9a79963`, Laguna, 93% of parameters). One quantization
+    cycle on a 100 GB-class model is the cost of finding that out downstream,
+    so it is refused up front against the declared set.
+
+    Undeclared architectures support the native compressed-tensors lane only,
+    which is what all of them have ever shipped through — so this is strictly
+    additive: no run that is legal today becomes illegal.
+
+    Returns the canonical lane id.
+    """
+    from .model_profiles.structure import (
+        DEFAULT_EXPORT_LANE,
+        canonical_export_lane,
+    )
+
+    requested = str(export_container or DEFAULT_EXPORT_LANE)
+    try:
+        lane = canonical_export_lane(requested)
+    except ValueError as exc:
+        raise SystemExit(f"[preflight] ERROR: {flag}: {exc}") from None
+
+    getter = getattr(profile, "supported_export_lanes", None)
+    if not callable(getter):
+        return lane
+    supported = tuple(getter())
+    if lane in supported:
+        return lane
+
+    name = getattr(profile, "name", None) or type(profile).__name__
+    preferred = getattr(profile, "preferred_export_lane", None)
+    preferred_lane = preferred() if callable(preferred) else DEFAULT_EXPORT_LANE
+    raise SystemExit(
+        f"[preflight] ERROR: {flag}={lane!r} is not a declared lane for "
+        f"architecture {name!r}. Declared: {list(supported)} "
+        f"(preferred: {preferred_lane!r}). An undeclared lane does not fail "
+        "loudly at serve time — the missing per-architecture loader means the "
+        "runtime serves uninitialised weights and generates coherent-looking "
+        "garbage. If this architecture really is wired for this lane, declare "
+        f"it in model_profiles/specs/{name}.json (`supported_lanes`) together "
+        "with the loader wiring that makes it true."
+    )
+
+
 def require_per_role_expert_scheme_support(
     profile_id: str | None,
     *,

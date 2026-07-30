@@ -11,9 +11,11 @@ layer resident; large models drain the cache to disk as needed.
 Each shard (body layer range, MTP, lm_head) runs one streaming pass: the
 exact phase-1 / phase-2 / phase-3 flow from `streaming_probe.run_streaming_probe`,
 specialized to Fisher-instrument only the Linears matching that shard's
-regex. MTP is a built-in shard kind: after the body forward we synthesize
-a `MtpModule`, load `mtp.*` weights directly from safetensors, and run
-its own forward+backward for Fisher collection. The per-shard pickle
+regex. MTP is a built-in shard kind: after the body forward we ask the
+model profile to build its MTP module (`profile.build_mtp_module`), load
+the source MTP weights straight from safetensors
+(`profile.read_mtp_source_state_dict` / `profile.load_mtp_state_dict`),
+and run its own forward+backward for Fisher collection. The per-shard pickle
 output format matches `sensitivity_probe.run_probe_pass` / `streaming_probe`
 unchanged — the allocator consumes either. The two backends also agree on
 the estimator and normalization conventions: per-token-summed empirical
@@ -71,6 +73,7 @@ from .layer_streaming import (
     _compute_position_embeddings,
     _get_final_norm,
 )
+from .perturbed_x_cache import calibration_data_hash
 from .sensitivity_probe import (
     FisherAccumulator,
     RouterTracker,
@@ -96,7 +99,7 @@ from .streaming_model import (
 
 
 # ---------------------------------------------------------------------------
-# MiniMax-M2 fast MoE replay
+# ModuleList-of-experts fast MoE replay (MiniMax-M2 is the motivating arch)
 # ---------------------------------------------------------------------------
 # HF MiniMax-M2 represents the 256 experts as a ModuleList and its
 # `MiniMaxM2Experts.forward` loops over every hit expert in Python:
@@ -113,16 +116,46 @@ from .streaming_model import (
 # ---------------------------------------------------------------------------
 
 
-def _is_minimax_m2_experts_module(
-    module: nn.Module, proj_names: tuple[str, ...] = ("w1", "w2", "w3")
+def _is_unpacked_experts_module(
+    module: nn.Module,
+    proj_names: tuple[str, ...] = ("w1", "w2", "w3"),
+    class_names: frozenset[str] | tuple[str, ...] = (),
 ) -> bool:
-    return (
-        type(module).__name__ == "MiniMaxM2Experts"
-        and hasattr(module, "num_experts")
-        and hasattr(module, "top_k")
-        and len(module) > 0
-        and all(hasattr(module[0], n) for n in (*proj_names, "act_fn"))
-    )
+    """Recognize a ModuleList-style expert container the fast replay can swap.
+
+    Two conditions, both required:
+
+      - the container class is one the *profile* declares
+        (`packed_expert_module_class_names()` -> the spec's
+        `packed_experts.module_class_names`, `base.py:182-192`). This used to
+        be the literal string `"MiniMaxM2Experts"` in this file. It cannot be
+        dropped in favour of pure structure: the replacement forward
+        (`_minimax_fast_experts_forward`) implements one specific expert-loop
+        signature, so applying it to a container that merely *looks* similar
+        would silently change a forward pass. Declaring the class is the
+        architecture opting in.
+      - the container really has the ModuleList-of-experts shape the replay
+        needs: `num_experts`/`top_k`, indexable, and a first expert carrying
+        the profile's per-expert projection attributes plus `act_fn`. Packed
+        (3D-parameter) expert containers declare a class name too and fail
+        here, which is correct — they are not what this path replays.
+
+    A profile that declares no container class keeps today's behaviour: no
+    swap, per-Linear hooks only. That is a probe-speed loss, not a
+    correctness one.
+    """
+    if not class_names or type(module).__name__ not in set(class_names):
+        return False
+    try:
+        return (
+            hasattr(module, "num_experts")
+            and hasattr(module, "top_k")
+            and len(module) > 0
+            and all(hasattr(module[0], n) for n in (*proj_names, "act_fn"))
+        )
+    except (TypeError, KeyError, IndexError):
+        # Not indexable / not list-like: the swap does not apply.
+        return False
 
 
 def _minimax_fast_experts_forward(
@@ -289,18 +322,21 @@ def _set_minimax_fast_moe(
     *,
     chunk_size: int = 32,
     proj_names: tuple[str, ...] = ("w1", "w2", "w3"),
+    class_names: frozenset[str] | tuple[str, ...] = (),
 ) -> int:
-    """Enable/disable chunked batched MiniMax-M2 expert replay on a layer.
+    """Enable/disable chunked batched unpacked-expert replay on a layer.
 
-    Returns the number of MiniMax expert containers patched under `layer`.
-    The patch is instance-local and falls back to the original forward
-    whenever `_pq_fast_moe_enabled` is False. ``proj_names`` are the per-expert
-    projection attribute names (from the model profile; default Qwen/MiniMax
-    ``('w1','w2','w3')``).
+    Returns the number of expert containers patched under `layer`. The patch
+    is instance-local and falls back to the original forward whenever
+    `_pq_fast_moe_enabled` is False. ``proj_names`` are the per-expert
+    projection attribute names and ``class_names`` the declared container
+    classes — both from the model profile
+    (`unpacked_expert_projection_names()` / `packed_expert_module_class_names()`),
+    defaulting to the Qwen/MiniMax ``('w1','w2','w3')`` and "no class filter".
     """
     patched = 0
     for module in layer.modules():
-        if not _is_minimax_m2_experts_module(module, proj_names):
+        if not _is_unpacked_experts_module(module, proj_names, class_names):
             continue
         if not hasattr(module, "_pq_original_forward"):
             module._pq_original_forward = module.forward
@@ -984,6 +1020,23 @@ def merge_probe_pickles(paths: list[Path], output_path: Path):
         "n_shards": len(paths),
         "shards": shard_metas,
     }
+    # R14: union of the per-shard calibration identities. Multi-chunk runs give
+    # each shard its own calib draw, so the merged pickle must carry the SET —
+    # a single combined digest could not be intersected against a validator's
+    # per-repeat hashes. Keep `calib_hash` as the single-draw convenience only
+    # when the run really had one draw.
+    shard_calib_hashes = sorted({
+        str(meta["calib_hash"])
+        for meta in shard_metas
+        if isinstance(meta, dict) and meta.get("calib_hash")
+    })
+    if shard_calib_hashes:
+        merged_meta["calib_hashes"] = shard_calib_hashes
+        merged_meta["calib_hash"] = (
+            shard_calib_hashes[0] if len(shard_calib_hashes) == 1 else None
+        )
+    else:
+        merged_meta.pop("calib_hash", None)
     # Propagate the calibration-chunk domain label into the merged pickle meta.
     domain_env = os.environ.get("PRISMAQUANT_PROBE_DOMAIN")
     if domain_env:
@@ -1296,7 +1349,11 @@ def _compute_global_precompute(
         load_s = time.time() - load_t0
         if minimax_fast_moe:
             _set_minimax_fast_moe(
-                layers[L], True, chunk_size=minimax_fast_moe_chunk_size)
+                layers[L], True,
+                chunk_size=minimax_fast_moe_chunk_size,
+                proj_names=tuple(_profile.unpacked_expert_projection_names()),
+                class_names=tuple(_profile.packed_expert_module_class_names()),
+            )
         fwd_t0 = time.time()
         with torch.no_grad():
             out = _call_layer(
@@ -1711,6 +1768,10 @@ def _run_body_streaming_shard(
                     "model": model_path,
                     "dataset": dataset_name,
                     "nsamples": int(calib.size(0)),
+                    # R14: calibration identity, so held-out disjointness is
+                    # verifiable from the artifact instead of resting on the
+                    # driver passing the right --calib-skip-first.
+                    "calib_hash": calibration_data_hash(calib),
                     "seqlen": seqlen,
                     "dtype": dtype_name,
                     "device_map": "streaming-layerwise",
@@ -2330,11 +2391,14 @@ def _run_body_streaming_shard(
             if minimax_fast_moe:
                 _mmx_proj = getattr(
                     _shard_profile, "unpacked_expert_projection_names", None)
+                _mmx_cls = getattr(
+                    _shard_profile, "packed_expert_module_class_names", None)
                 _set_minimax_fast_moe(
                     layers[L],
                     enabled=not layer_in_scope,
                     chunk_size=minimax_fast_moe_chunk_size,
                     proj_names=tuple(_mmx_proj()) if callable(_mmx_proj) else ("w1", "w2", "w3"),
+                    class_names=tuple(_mmx_cls()) if callable(_mmx_cls) else (),
                 )
             packed_meta = install_packed_expert_hooks(
                 layers[L], accumulator=packed_grad_acc,
@@ -2738,6 +2802,10 @@ def _run_body_streaming_shard(
                 "model": model_path,
                 "dataset": dataset_name,
                 "nsamples": int(calib.size(0)),
+                # R14: calibration identity, so held-out disjointness is
+                # verifiable from the artifact instead of resting on the
+                # driver passing the right --calib-skip-first.
+                "calib_hash": calibration_data_hash(calib),
                 "seqlen": seqlen,
                 "dtype": dtype_name,
                 "device_map": "streaming-layerwise",
@@ -2783,7 +2851,7 @@ def _run_mtp_streaming_shard(
     precomputed: GlobalPrecompute | None = None,
 ):
     # Lazy import to avoid depending on transformers subpath at module load.
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
+    from .model_profiles import profile_from_model as _profile_from_model
 
     if precomputed is None:
         raise ValueError(
@@ -2816,14 +2884,25 @@ def _run_mtp_streaming_shard(
         torch.cuda.empty_cache()
 
     # --- Synthesize MTP module, load its weights from safetensors ---
+    # Both the module layout and the checkpoint prefix come from the
+    # model profile (`build_mtp_module` / `mtp_source_prefix`); wrapping
+    # in a parent named `mtp` is what makes the qualified names equal
+    # the allocator's recipe names.
+    mtp_profile = _profile_from_model(model)
     text_config = model.config
-    inner_mtp = MtpModule(text_config)
+    inner_mtp = mtp_profile.build_mtp_module(text_config)
+    if inner_mtp is None:
+        raise RuntimeError(
+            f"profile '{mtp_profile.name}' declares has_mtp() but "
+            f"build_mtp_module() returned None — the MTP shard cannot be "
+            f"probed. Either implement build_mtp_module() or set "
+            f"has_mtp() -> False.")
     mtp_wrapper = nn.Module()
     mtp_wrapper.add_module("mtp", inner_mtp)
     mtp_wrapper.to(device=device, dtype=dtype)
     mtp_wrapper.eval()
 
-    raw = _load_mtp_state_dict(model_path)
+    raw = mtp_profile.read_mtp_source_state_dict(model_path)
     if not raw:
         # No MTP weights in source — write empty pickle to satisfy the
         # schedule and return. Mirrors the text-only visual fallback.
@@ -2838,6 +2917,10 @@ def _run_mtp_streaming_shard(
                     "model": model_path,
                     "dataset": dataset_name,
                     "nsamples": int(calib.size(0)),
+                    # R14: calibration identity, so held-out disjointness is
+                    # verifiable from the artifact instead of resting on the
+                    # driver passing the right --calib-skip-first.
+                    "calib_hash": calibration_data_hash(calib),
                     "seqlen": seqlen,
                     "dtype": dtype_name,
                     "execution_device": str(device),
@@ -2851,7 +2934,7 @@ def _run_mtp_streaming_shard(
         print(f"[incremental/mtp] no MTP weights; wrote empty shard "
               f"pickle to {output_path}", flush=True)
         return
-    missing, extra = _load_into_mtp(inner_mtp, raw)
+    missing, extra = mtp_profile.load_mtp_state_dict(inner_mtp, raw)
     loaded = len(raw) - len(missing)
     print(f"[incremental/mtp] loaded {loaded}/{len(raw)} mtp weights "
           f"(missing={len(missing)}, module_params_unset={len(extra)})",
@@ -2869,8 +2952,6 @@ def _run_mtp_streaming_shard(
                if isinstance(m, nn.Linear) and not re.search(r"mlp\.gate$", n)]
     print(f"[incremental/mtp] tracking {len(tracked)} MTP Linears", flush=True)
 
-    from .model_profiles import profile_from_model as _profile_from_model
-    mtp_profile = _profile_from_model(model)
     expert_info_all = discover_moe_structure(mtp_wrapper, profile=mtp_profile)
     expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
     top_k = read_top_k(mtp_wrapper, default=2)
@@ -2982,6 +3063,10 @@ def _run_mtp_streaming_shard(
                 "model": model_path,
                 "dataset": dataset_name,
                 "nsamples": int(calib.size(0)),
+                # R14: calibration identity, so held-out disjointness is
+                # verifiable from the artifact instead of resting on the
+                # driver passing the right --calib-skip-first.
+                "calib_hash": calibration_data_hash(calib),
                 "seqlen": seqlen,
                 "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": dtype_name,

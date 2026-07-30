@@ -393,3 +393,101 @@ def test_dense_ladder_helpers(monkeypatch):
     assert _chunk_metric(
         accum, "t", "FP8_CB_K36", "fisher_output_mse") is None
     assert _chunk_metric(accum, "missing", "FP8_CB_K36", "output_mse") is None
+
+
+def test_cb_ladder_chain_is_shared_with_the_expert_path():
+    """R20 (2026-07-30): ONE law behind both cost chains.
+
+    The dense path fitted the split-aware floored-linear law in R(k) while
+    the expert path ran a separate floor-law -> log-linear chain with NO
+    R(k) term, so the ceil-first sawtooth that motivated the dense change
+    (5184892) was still costing the expert ladder its holdouts. Both entry
+    points now delegate to `expert_empirical_cost._cb_ladder_law`.
+    """
+    import math
+
+    from prismaquant.expert_empirical_cost import (
+        _cb_ladder_law,
+        _cb_ladder_rate_factor,
+    )
+    from prismaquant.measure_quant_cost import (
+        _ladder_metric_fit,
+        _ladder_rate_factor,
+    )
+
+    # The dense name is a re-export of the canonical rate factor.
+    assert _ladder_rate_factor("FP8_CB_K39", 39) == _cb_ladder_rate_factor(
+        "FP8_CB_K39", 39)
+
+    # THE sawtooth case from the 2026-07-21 27B cost run: even-split anchors
+    # (28, 38, 48) and an odd-phase target k=39. The shared law is exact on
+    # its own model at every phase; a log-linear fit through the SAME
+    # anchors — what the expert chain used to run — misses k=39 by 14.9%,
+    # which is where the 8-12% holdout rejections came from.
+    kmap = {f"FP8_CB_K{k}": k for k in (28, 38, 39, 48)}
+    anchors = ["FP8_CB_K28", "FP8_CB_K38", "FP8_CB_K48"]
+    vals = {f: 0.002 + 1.5 * _cb_ladder_rate_factor(f, k)
+            for f, k in kmap.items()}
+    law = _cb_ladder_law(kmap, anchors, vals)
+    assert law.name == "floored_linear_R"
+    assert law.predict("FP8_CB_K39") == pytest.approx(
+        vals["FP8_CB_K39"], rel=1e-9)
+    # dense entry point == shared law
+    assert _ladder_metric_fit(kmap, anchors, vals, "FP8_CB_K39") == (
+        pytest.approx(law.predict("FP8_CB_K39")))
+    xs = [float(kmap[f]) for f in anchors]
+    ys = [math.log2(vals[f]) for f in anchors]
+    mx, my = sum(xs) / 3.0, sum(ys) / 3.0
+    b = -sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sum(
+        (x - mx) ** 2 for x in xs)
+    log_linear = 2.0 ** ((my + b * mx) - b * 39)
+    assert abs(log_linear - vals["FP8_CB_K39"]) / vals["FP8_CB_K39"] > 0.10
+
+
+def test_cb_ladder_tolerance_is_derived_from_measured_noise():
+    """R20: the holdout gate's threshold comes from the rungs' own
+    between-window noise (encode_tiers.md B), not the bare 0.10.
+
+    The 0.10 stays only where that datum is absent or degenerate — which is
+    every dense-path fit, since it measures each (tensor, format) exactly
+    once.
+    """
+    from prismaquant.expert_empirical_cost import (
+        _cb_ladder_gate,
+        _cb_ladder_rate_factor,
+    )
+
+    kmap = {f"FP8_CB_K{k}": k for k in (28, 32, 36, 40, 44, 48)}
+    anchors = ["FP8_CB_K28", "FP8_CB_K40", "FP8_CB_K48"]
+    holdout = "FP8_CB_K36"
+    vals = {f: 0.002 + 1.5 * _cb_ladder_rate_factor(f, k)
+            for f, k in kmap.items()}
+
+    # No windows at all (the dense path) -> the floor stands.
+    law, rel, tol = _cb_ladder_gate(kmap, anchors, vals, holdout, 0.10, None)
+    assert law is not None and rel < 1e-9 and tol == 0.10
+    # Zero-spread windows carry no resolution -> treated as absent.
+    flat = {f: [v] * 4 for f, v in vals.items()}
+    assert _cb_ladder_gate(
+        kmap, anchors, vals, holdout, 0.10, flat)[2] == 0.10
+
+    # A real per-window spread on the holdout: the paired residual's
+    # standard error is 1.29%, so the gate TIGHTENS from 10% to 1.29%.
+    jitter = [1.03, 0.97, 1.01, 0.99]
+    win = {f: [v] * 4 for f, v in vals.items()}
+    win[holdout] = [vals[holdout] * j for j in jitter]
+    law, rel, tol = _cb_ladder_gate(kmap, anchors, vals, holdout, 0.10, win)
+    assert tol == pytest.approx(0.0129, abs=2e-4)
+    assert law is not None and rel < 1e-9          # exact fit still passes
+
+    # ... and it BITES: a 2.9% holdout miss that the bare 0.10 would have
+    # waved through is rejected, so the rungs get measured instead.
+    off = dict(vals)
+    off[holdout] = vals[holdout] * 1.03
+    win_off = dict(win)
+    win_off[holdout] = [off[holdout] * j for j in jitter]
+    law_off, rel_off, tol_off = _cb_ladder_gate(
+        kmap, anchors, off, holdout, 0.10, win_off)
+    assert rel_off == pytest.approx(0.0291, abs=5e-4)
+    assert rel_off < 0.10 and rel_off > tol_off
+    assert law_off is None

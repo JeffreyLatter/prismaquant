@@ -1,6 +1,8 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "qwen3_5",
+  "priority": 110,
+  "supported_lanes": ["compressed-tensors", "nvfp4_cb"],
   "default_serving_profile": "vllm_packed_moe",
   "runtime_requirements": {
     "fast_kernel_packages": [

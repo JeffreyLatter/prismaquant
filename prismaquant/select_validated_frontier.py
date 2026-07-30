@@ -154,12 +154,22 @@ def kneedle_comparison(points: Sequence[Mapping[str, float]]) -> dict:
     }
 
 
+TAIL_VETO_COLUMNS: tuple[str, ...] = ("kl_p95", "kl_p99", "kl_max", "nll_mean", "nll_p99")
+TAIL_VETO_CHOICES: tuple[str, ...] = ("none", "kl_p99", "kl_max", "nll_p99")
+
+
 def _row_metric(row: Mapping, metric: str) -> float | None:
     candidates: tuple[str, ...]
+    # ``kl_mean`` is the canonical mean key (R28); ``last_token_kl`` is the
+    # deprecated alias kept one cycle, and stays first so rows written by both
+    # the old and new writer resolve identically.
     if metric == "ucb":
-        candidates = ("kl_ucb", "validation_kl_ucb", "last_token_kl_ucb", "last_token_kl", "kl")
+        candidates = (
+            "kl_ucb", "validation_kl_ucb", "last_token_kl_ucb",
+            "last_token_kl", "kl_mean", "kl",
+        )
     else:
-        candidates = ("last_token_kl", "validation_kl", "kl")
+        candidates = ("last_token_kl", "kl_mean", "validation_kl", "kl")
     for key in candidates:
         value = row.get(key)
         if value is not None:
@@ -206,6 +216,14 @@ def measured_rows(
             "kl_std": row.get("kl_std"),
             "kl_stderr": row.get("kl_stderr"),
             "kl_ucb": row.get("kl_ucb", row.get("validation_kl_ucb")),
+            # R9 tail columns, passed through when validate_assignments_kl
+            # emitted them. Absent on pre-R9 rows -> the veto reports
+            # 'tail_missing' rather than silently admitting.
+            **{
+                column: row[column]
+                for column in TAIL_VETO_COLUMNS
+                if row.get(column) is not None
+            },
         })
     rows.sort(key=lambda r: (r["bpp"], r["kl"], r["label"]))
     return rows
@@ -215,19 +233,66 @@ def _frontier_from_rows(
     rows: Sequence[Mapping],
     *,
     kl_noise_floor: float = 0.0,
+    tail_veto: str | None = None,
+    tail_eta: float = 0.0,
+    vetoed: list | None = None,
 ) -> list[dict]:
     """Return the eta-dominance lower envelope of measured rows.
 
     ``rows`` must already be sorted by (bpp, kl); a point enters the envelope
     only when it improves the running best KL by more than the noise floor.
+
+    **Tail veto (D1/R9).** CLAUDE.md §5 rule 4: KL is a *screening* metric, and
+    a lower mean can hide a heavier tail — the shipped 27B PrismaSCOUT has a
+    worse max-prompt NLL than the artifact it beat on mean KL. With
+    ``tail_veto`` naming a column (``kl_p99``/``kl_max``/``nll_p99``), a row
+    that improves mean KL is admitted only if its tail also holds:
+    ``row[tail] <= incumbent[tail] * (1 + tail_eta)``. The incumbent is the
+    last admitted frontier point, so the tail is required to be non-increasing
+    along the envelope exactly as the mean is.
+
+    ``tail_veto=None`` (the default, and ``--tail-veto none``) is byte-identical
+    to the historical behavior — no column is read and no row is vetoed.
+    Vetoed rows are appended to ``vetoed`` with a ``veto_reason`` so a rejection
+    is visible in the summary rather than silent.
     """
     frontier: list[dict] = []
     best_kl = float("inf")
     floor = max(float(kl_noise_floor), 0.0)
+    column = str(tail_veto) if tail_veto and tail_veto != "none" else None
+    eta = float(tail_eta)
+    incumbent_tail: float | None = None
     for row in rows:
-        if row["kl"] < best_kl - floor - 1e-12:
-            frontier.append(row)
-            best_kl = row["kl"]
+        if not (row["kl"] < best_kl - floor - 1e-12):
+            continue
+        if column is not None:
+            value = row.get(column)
+            value = float(value) if value is not None else None
+            if value is None or not math.isfinite(value):
+                if vetoed is not None:
+                    vetoed.append({
+                        **dict(row),
+                        "veto_reason": "tail_missing",
+                        "veto_column": column,
+                    })
+                continue
+            if (
+                incumbent_tail is not None
+                and value > incumbent_tail * (1.0 + eta) + 1e-12
+            ):
+                if vetoed is not None:
+                    vetoed.append({
+                        **dict(row),
+                        "veto_reason": "tail_regression",
+                        "veto_column": column,
+                        "veto_value": value,
+                        "veto_incumbent": incumbent_tail,
+                        "veto_limit": incumbent_tail * (1.0 + eta),
+                    })
+                continue
+            incumbent_tail = value
+        frontier.append(row)
+        best_kl = row["kl"]
     return frontier
 
 
@@ -236,16 +301,22 @@ def measured_frontier(
     *,
     metric: str = "kl",
     kl_noise_floor: float = 0.0,
+    tail_veto: str | None = None,
+    tail_eta: float = 0.0,
+    vetoed: list | None = None,
 ) -> list[dict]:
     """Return non-dominated measured KL/bpp points sorted by bpp.
 
     A point is dominated when a lower-or-equal bpp assignment already has
     lower-or-equal KL. Kneedle should operate on this measured lower envelope,
-    not on noisy interior points.
+    not on noisy interior points. See ``_frontier_from_rows`` for ``tail_veto``.
     """
     return _frontier_from_rows(
         measured_rows(results, metric=metric),
         kl_noise_floor=kl_noise_floor,
+        tail_veto=tail_veto,
+        tail_eta=tail_eta,
+        vetoed=vetoed,
     )
 
 
@@ -404,6 +475,8 @@ def leave_one_out_kneedle_diagnostic(
     tolerance_bpp: float = 0.1,
     kl_noise_floor: float = 0.0,
     all_rows: Sequence[Mapping] | None = None,
+    tail_veto: str | None = None,
+    tail_eta: float = 0.0,
 ) -> dict:
     """Leave-one-out stability of the kneedle pick.
 
@@ -435,7 +508,12 @@ def leave_one_out_kneedle_diagnostic(
     for dropped in frontier:
         dropped_key = _row_identity(dropped)
         subset_rows = [row for row in rows if _row_identity(row) != dropped_key]
-        subset = _frontier_from_rows(subset_rows, kl_noise_floor=kl_noise_floor)
+        subset = _frontier_from_rows(
+            subset_rows,
+            kl_noise_floor=kl_noise_floor,
+            tail_veto=tail_veto,
+            tail_eta=tail_eta,
+        )
         if len(subset) < 3:
             continue
         chosen = subset[_kneedle_convex_decreasing(subset)]
@@ -488,9 +566,18 @@ def select_frontier_point(
     knee_tolerance_bpp: float = 0.1,
     unstable_policy: str = "keep-kneedle",
     sat_z: float = 2.0,
+    tail_veto: str | None = None,
+    tail_eta: float = 0.0,
+    vetoed: list | None = None,
 ) -> tuple[dict, list[dict]]:
     rows = measured_rows(results, metric=metric)
-    frontier = _frontier_from_rows(rows, kl_noise_floor=kl_noise_floor)
+    frontier = _frontier_from_rows(
+        rows,
+        kl_noise_floor=kl_noise_floor,
+        tail_veto=tail_veto,
+        tail_eta=tail_eta,
+        vetoed=vetoed,
+    )
     if not frontier:
         raise ValueError("no finite measured KL/bpp points found")
     if mode == "best-kl":
@@ -518,6 +605,8 @@ def select_frontier_point(
             tolerance_bpp=knee_tolerance_bpp,
             kl_noise_floor=kl_noise_floor,
             all_rows=rows,
+            tail_veto=tail_veto,
+            tail_eta=tail_eta,
         )
         if diagnostic.get("enabled") and not diagnostic.get("stable", True):
             if unstable_policy == "best-kl":
@@ -560,6 +649,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Metric used for frontier construction. 'ucb' uses kl_ucb when present.",
     )
     parser.add_argument("--kl-noise-floor", type=float, default=0.0)
+    parser.add_argument(
+        "--tail-veto",
+        choices=TAIL_VETO_CHOICES,
+        default="none",
+        help="D1 tail veto: additionally require the named tail column to be "
+             "non-increasing along the frontier, so a mean-KL win that "
+             "regresses the tail is not admitted (CLAUDE.md §5 rule 4). "
+             "Columns come from validate_assignments_kl's per-sequence "
+             "emission and share the gold lane's key names. Default 'none' is "
+             "byte-identical to no veto.",
+    )
+    parser.add_argument(
+        "--tail-eta", type=float, default=0.0,
+        help="Slack on the tail veto: a row is admitted when "
+             "row[tail] <= incumbent[tail] * (1 + tail_eta). Default 0.0 "
+             "requires a strictly non-increasing tail.",
+    )
     parser.add_argument("--sat-z", type=float, default=2.0,
                         help="Significance multiplier on the combined per-bpp "
                              "stderr for --mode saturation (2.0 ~= 95%).")
@@ -581,6 +687,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not isinstance(results, list):
         raise ValueError("--validation-json must contain a results list")
 
+    tail_veto = None if args.tail_veto == "none" else args.tail_veto
+    vetoed_rows: list[dict] = []
     selected, frontier = select_frontier_point(
         results,
         mode=args.mode,
@@ -591,6 +699,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         knee_tolerance_bpp=args.knee_tolerance_bpp,
         unstable_policy=args.unstable_policy,
         sat_z=args.sat_z,
+        tail_veto=tail_veto,
+        tail_eta=args.tail_eta,
+        vetoed=vetoed_rows,
     )
     saturation = None
     if args.mode == "saturation":
@@ -618,6 +729,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             tolerance_bpp=args.knee_tolerance_bpp,
             kl_noise_floor=args.kl_noise_floor,
             all_rows=diagnostic_rows,
+            tail_veto=tail_veto,
+            tail_eta=args.tail_eta,
         )
         if args.mode == "kneedle"
         else {"enabled": False, "reason": "mode_not_kneedle"}
@@ -655,6 +768,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "surrogate_spearman": rank_corr,
         "surrogate_worst_rank_inversion": worst_inversion,
         "kl_noise_floor": float(args.kl_noise_floor),
+        "tail_veto": {
+            "column": tail_veto,
+            "eta": float(args.tail_eta),
+            "n_vetoed": len(vetoed_rows),
+        },
+        "vetoed_rows": vetoed_rows,
         "practical_rel_eps": float(args.practical_rel_eps),
         "practical_abs_eps": float(args.practical_abs_eps),
         "unstable_policy": args.unstable_policy,
@@ -677,6 +796,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"KL={selected['kl']:.8g}{mse_msg} mode={args.mode}",
         flush=True,
     )
+    if tail_veto is not None:
+        print(
+            f"[frontier-select] tail-veto={tail_veto} eta={args.tail_eta:g}: "
+            f"{len(vetoed_rows)} row(s) refused entry to the frontier",
+            flush=True,
+        )
+        for row in vetoed_rows:
+            print(
+                f"[frontier-select]   vetoed {row['label']} "
+                f"bpp={float(row['bpp']):.6f} KL={float(row['kl']):.8g} "
+                f"reason={row['veto_reason']}"
+                + (
+                    f" {tail_veto}={float(row['veto_value']):.8g} > "
+                    f"limit={float(row['veto_limit']):.8g}"
+                    if row.get("veto_value") is not None else ""
+                ),
+                flush=True,
+            )
     if saturation is not None:
         print(
             "[frontier-select] saturation B*="

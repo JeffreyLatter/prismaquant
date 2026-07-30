@@ -4,8 +4,11 @@ Scope is ``--kl-scope``. The CLI default is ``last_token`` (a triage SCREEN,
 CLAUDE.md §5) for ad-hoc/probe-gate parity, but the pipeline passes
 ``full_sequence`` — the gold-metric scope — for frontier selection
 (M26; ``run-pipeline.sh:269,1208``, default ``VALIDATED_FRONTIER_KL_SCOPE=
-full_sequence``). Note the summary key stays ``last_token_kl`` under both
-scopes for backwards compatibility (:645).
+full_sequence``). The canonical summary mean key is ``kl_mean`` (it is a mean
+under whichever scope ran); ``last_token_kl`` is still emitted as a deprecated
+alias for one cycle. Each row also carries the per-sequence tail —
+``kl_p95``/``kl_p99``/``kl_max`` plus ``nll_mean``/``nll_p99`` — under the same
+key names the gold lane uses, at zero extra forward cost (R9).
 """
 from __future__ import annotations
 
@@ -44,6 +47,8 @@ from prismaquant.kl_measurement import (
     assignment_bit_total,
     assignment_hash,
     measure_assignment_kl,
+    sequence_token_nll,
+    summarize_per_sequence_kl,
 )
 from prismaquant.perturbed_x_cache import (
     PerturbedActivationCache,
@@ -59,9 +64,11 @@ def _load_json(path: str | Path):
     return json.loads(Path(path).read_text())
 
 
-def _load_probe_stats(path: str | Path) -> dict:
+def _load_probe_stats(path: str | Path, *, calib_hashes_out: set | None = None) -> dict:
     with Path(path).open("rb") as fh:
         payload = pickle.load(fh)
+    if calib_hashes_out is not None:
+        calib_hashes_out.update(_upstream_calibration_hashes(payload))
     if isinstance(payload, Mapping) and isinstance(payload.get("stats"), Mapping):
         return dict(payload["stats"])
     if isinstance(payload, Mapping):
@@ -69,10 +76,12 @@ def _load_probe_stats(path: str | Path) -> dict:
     raise ValueError(f"probe file {path} does not contain a stats mapping")
 
 
-def _load_costs(path: str | Path) -> dict:
+def _load_costs(path: str | Path, *, calib_hashes_out: set | None = None) -> dict:
     with Path(path).open("rb") as fh:
         payload = pickle.load(fh)
     validate_cost_payload(payload, str(path))
+    if calib_hashes_out is not None:
+        calib_hashes_out.update(_upstream_calibration_hashes(payload))
     return dict(payload["costs"])
 
 
@@ -320,6 +329,63 @@ def _calibration_provenance(calib_repeats: Sequence[torch.Tensor]) -> dict[str, 
     }
 
 
+def _upstream_calibration_hashes(payload: object) -> set[str]:
+    """Calibration identities stamped by an upstream probe/cost artifact (R14).
+
+    Producers stamp ``calib_hash`` (single draw) and/or ``calib_hashes`` (the
+    per-shard set) under ``meta`` or ``provenance``. Pre-R14 artifacts stamp
+    neither and yield the empty set, which makes the disjointness check inert
+    on them rather than a guess.
+    """
+    found: set[str] = set()
+    if not isinstance(payload, Mapping):
+        return found
+    for section in ("meta", "provenance"):
+        block = payload.get(section)
+        if not isinstance(block, Mapping):
+            continue
+        single = block.get("calib_hash")
+        if isinstance(single, str) and single:
+            found.add(single)
+        many = block.get("calib_hashes")
+        if isinstance(many, Sequence) and not isinstance(many, (str, bytes)):
+            found.update(str(item) for item in many if item)
+    return found
+
+
+def _assert_calibration_disjoint(
+    calib_repeat_hashes: Sequence[str],
+    upstream: Mapping[str, set[str]],
+) -> dict[str, object]:
+    """Refuse to select on text an upstream cost/probe stage already consumed.
+
+    R14: held-out disjointness was a *convention* enforced only by the driver
+    passing ``--calib-skip-first``; a hash intersection makes it an explicit.
+    This is a hard error, not a warning — the in-sample-"validation" class of
+    bug has already regressed here once, and it is invisible in the output.
+    """
+    selection = set(str(h) for h in calib_repeat_hashes)
+    checked: dict[str, object] = {}
+    for source, hashes in upstream.items():
+        overlap = sorted(selection & set(hashes))
+        checked[source] = {
+            "upstream_hashes": len(hashes),
+            "overlap": overlap,
+        }
+        if overlap:
+            raise ValueError(
+                f"held-out violation: the selection calibration shares "
+                f"{len(overlap)} calibration draw(s) with the {source} "
+                f"artifact this run is selecting against "
+                f"(calib_hash={overlap[0]}). Selection KL would be measured "
+                "in-sample and the frontier pick would be meaningless. Pass "
+                "--calib-skip-first (with --dataset) so the selection windows "
+                "are disjoint from the cost/probe windows, or point --costs / "
+                "--probe at artifacts built on a different draw."
+            )
+    return checked
+
+
 def _strict_production_cache_enabled() -> bool:
     return os.environ.get(
         "PRISMAQUANT_STRICT_PRODUCTION_CACHE", "1"
@@ -504,6 +570,24 @@ def _load_calibration_repeats(tokenizer, args) -> list[torch.Tensor]:
     repeats = max(int(args.calib_repeats), 1)
     n_samples = int(args.n_calib_samples)
     skip = max(int(getattr(args, "calib_skip_first", 0) or 0), 0)
+    if skip and not args.dataset:
+        # R14(iii): --calib-skip-first is the held-out mechanism, and it is
+        # only implemented on the --dataset branch below. The wikitext branch
+        # used to compute `skip` and then never apply it, so a manual
+        # `--calib-skip-first 32` on wikitext silently measured selection KL on
+        # the SAME windows the cost stage consumed. In-sample "validation" has
+        # already regressed once here; refuse rather than pretend.
+        raise ValueError(
+            "--calib-skip-first is only implemented for --dataset calibration; "
+            f"got --calib-skip-first {skip} with no --dataset (wikitext "
+            f"split={args.calib_split!r}). The wikitext loader is seeded per "
+            "repeat, not window-sliced, so the skip cannot be honored and the "
+            "selection split would silently overlap the cost split. Pass a "
+            "--dataset, or use a distinct --calib-seed / --calib-split for the "
+            "held-out draw. From run-pipeline.sh: set a jsonl DATASET (the "
+            "default), or VALIDATED_FRONTIER_SKIP_CALIB=0 with a distinct "
+            "VALIDATED_FRONTIER_DATASET."
+        )
 
     def _load_jsonl(n: int) -> torch.Tensor:
         # --calib-skip-first K: drop the first K windows of the deterministic
@@ -637,7 +721,24 @@ def _persist_lazy_expert_renders(
             setattr(production_cache, attr, value)
 
 
-def _kl_repeat_summary(values: Sequence[float], *, ucb_z: float) -> dict[str, object]:
+def _kl_repeat_summary(
+    values: Sequence[float],
+    *,
+    ucb_z: float,
+    kl_per_sample: Sequence[float] | None = None,
+    nll_per_sample: Sequence[float] | None = None,
+) -> dict[str, object]:
+    """Summarize per-repeat KL, plus (R9) the tail over per-sequence values.
+
+    ``kl_per_sample`` / ``nll_per_sample`` are concatenated across repeats by
+    the caller; when supplied, the gold lane's tail keys
+    (``kl_p95``/``kl_p99``/``kl_max``, ``nll_mean``/``nll_p99``) are emitted
+    alongside the mean at zero extra forward cost.
+
+    ``kl_mean`` is the canonical mean key (R28); ``last_token_kl`` is kept as an
+    alias for one cycle because it names a scope that has not been the shipping
+    one since M26 (the pipeline runs ``--kl-scope full_sequence``).
+    """
     vals = [float(value) for value in values]
     if not vals:
         raise ValueError("KL repeat summary received no values")
@@ -649,7 +750,9 @@ def _kl_repeat_summary(values: Sequence[float], *, ucb_z: float) -> dict[str, ob
         var = sum((value - mean) ** 2 for value in vals) / (len(vals) - 1)
         std = math.sqrt(max(var, 0.0))
         stderr = std / math.sqrt(len(vals))
-    return {
+    summary: dict[str, object] = {
+        "kl_mean": float(mean),
+        # Deprecated alias, one cycle. Readers should move to kl_mean.
         "last_token_kl": float(mean),
         "kl_repeats": vals,
         "kl_repeat_count": len(vals),
@@ -658,6 +761,15 @@ def _kl_repeat_summary(values: Sequence[float], *, ucb_z: float) -> dict[str, ob
         "kl_ucb": float(mean + float(ucb_z) * stderr),
         "kl_ucb_z": float(ucb_z),
     }
+    if kl_per_sample:
+        tail = summarize_per_sequence_kl(
+            kl_per_sample, nll_values=nll_per_sample)
+        # The repeat mean stays authoritative for kl_mean: it is the mean of
+        # per-repeat means, which equals the pooled per-sequence mean only when
+        # every repeat drew the same number of sequences.
+        tail.pop("kl_mean", None)
+        summary.update(tail)
+    return summary
 
 
 @torch.no_grad()
@@ -672,7 +784,14 @@ def _measure_inplace_assignment_kl(
     production_cache,
     kl_scope: str,
     use_cuda_graphs: bool | None,
-) -> tuple[float, dict[str, object]]:
+) -> tuple[float, list[float], dict[str, object]]:
+    """Measure assignment KL in place; return ``(mean, per_sequence, stats)``.
+
+    R9: the per-sequence values were already being accumulated and thrown away
+    at the return. They are now returned, and ``stats['nll_per_sample']`` carries
+    the free rung-2 token NLL computed from the same student logits (``None``
+    under the last-token scope, which has no next-token label in the window).
+    """
     device = next(model.parameters()).device
     cal_hash = calibration_data_hash(calib_ids)
     calib_ids = calib_ids.to(device)
@@ -714,6 +833,7 @@ def _measure_inplace_assignment_kl(
         # capture on 27B can exceed the GPU budget. Keep auto conservative.
         use_cuda_graphs = False
     values: list[float] = []
+    nll_values: list[float] = []
     graph_key = (
         id(model),
         "inplace",
@@ -756,6 +876,10 @@ def _measure_inplace_assignment_kl(
                     teacher = teacher[:, -1:, :]
                 teacher = teacher.to(device, non_blocking=True)
                 values.append(float(kl_divergence(logits, teacher).item()))
+                if full_sequence:
+                    nll = sequence_token_nll(logits, batch)
+                    if nll is not None:
+                        nll_values.append(nll)
         finally:
             hooks.remove()
     stats = {
@@ -766,8 +890,10 @@ def _measure_inplace_assignment_kl(
             "external_weight_management": True,
         },
         "cuda_graphs": bool(use_cuda_graphs),
+        "n_sequences": len(values),
+        "nll_per_sample": nll_values or None,
     }
-    return sum(values) / max(len(values), 1), stats
+    return sum(values) / max(len(values), 1), list(values), stats
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -937,8 +1063,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         # module-level references below unbound when this flag is off).
         os.environ["PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE"] = "0"
 
-    stats = _load_probe_stats(args.probe)
-    costs = _load_costs(args.costs) if args.costs else None
+    # R14: collect the calibration identities the upstream artifacts were built
+    # on, so the held-out split can be *verified* disjoint rather than assumed.
+    probe_calib_hashes: set[str] = set()
+    cost_calib_hashes: set[str] = set()
+    stats = _load_probe_stats(args.probe, calib_hashes_out=probe_calib_hashes)
+    costs = (
+        _load_costs(args.costs, calib_hashes_out=cost_calib_hashes)
+        if args.costs else None
+    )
     specs = [fr.get_format(part.strip()) for part in args.formats.split(",") if part.strip()]
     specs_by_name = {spec.name: spec for spec in specs}
     specs_by_name.update({fr.canonical_format_name(spec.name): spec for spec in specs})
@@ -1000,6 +1133,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokenizer = AutoTokenizer.from_pretrained(staged, **tokenizer_kwargs)
         calib_repeats = _load_calibration_repeats(tokenizer, args)
         calib_provenance = _calibration_provenance(calib_repeats)
+        calib_provenance["held_out_check"] = _assert_calibration_disjoint(
+            calib_provenance["calib_repeat_hashes"],
+            {"probe": probe_calib_hashes, "cost": cost_calib_hashes},
+        )
         source_prefetch_stats = prefetch_safetensors_checkpoint(
             staged,
             mode=args.source_prefetch,
@@ -1270,12 +1407,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         log_prefix="[validate-kl]",
                     )
             kl_values: list[float] = []
+            # R9: per-sequence KL / token NLL concatenated across repeats. Both
+            # fall out of the same forwards the mean already paid for.
+            kl_per_sample: list[float] = []
+            nll_per_sample: list[float] = []
             replay_runs: list[dict[str, object]] = []
             for repeat_idx, (calib_ids, ref_log_probs) in enumerate(
                 zip(calib_repeats, ref_log_prob_repeats, strict=True)
             ):
                 if materialization_mode == "inplace":
-                    kl_value, replay_stats = _measure_inplace_assignment_kl(
+                    kl_value, kl_seq, replay_stats = _measure_inplace_assignment_kl(
                         model,
                         assignment,
                         calib_ids,
@@ -1290,7 +1431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ),
                     )
                 else:
-                    kl_value = measure_assignment_kl(
+                    kl_value, kl_seq, replay_stats = measure_assignment_kl(
                         model,
                         assignment,
                         calib_ids,
@@ -1305,15 +1446,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ),
                         kl_scope=args.kl_scope,
                         stream_ref_log_probs=args.kl_scope == "full_sequence",
+                        return_per_sequence=True,
                     )
-                    replay_stats = {"mode": "hooks"}
                 kl_values.append(float(kl_value))
+                kl_per_sample.extend(float(v) for v in kl_seq)
+                replay_stats = dict(replay_stats)
+                nll_per_sample.extend(
+                    float(v) for v in (replay_stats.pop("nll_per_sample", None) or [])
+                )
                 replay_runs.append({
                     "repeat": int(repeat_idx),
-                    **dict(replay_stats),
+                    **replay_stats,
                 })
-            kl_summary = _kl_repeat_summary(kl_values, ucb_z=float(args.kl_ucb_z))
-            kl = float(kl_summary["last_token_kl"])
+            kl_summary = _kl_repeat_summary(
+                kl_values,
+                ucb_z=float(args.kl_ucb_z),
+                kl_per_sample=kl_per_sample,
+                nll_per_sample=nll_per_sample,
+            )
+            kl = float(kl_summary["kl_mean"])
             replay_stats = {
                 "mode": materialization_mode,
                 "repeats": replay_runs,

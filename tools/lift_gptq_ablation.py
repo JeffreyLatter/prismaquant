@@ -258,7 +258,9 @@ def main(argv=None) -> int:
             d = json.loads(kl_json.read_text())
             for r in d["results"]:
                 if r["label"] == arm:
-                    kl = float(r["last_token_kl"])
+                    # kl_mean is the canonical key; last_token_kl is the
+                    # deprecated alias kept for pre-rename result JSONs.
+                    kl = float(r.get("kl_mean", r.get("last_token_kl")))
                     if not (kl != kl):  # exclude NaN
                         kls.append(kl)
                     break

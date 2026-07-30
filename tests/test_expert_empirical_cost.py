@@ -282,6 +282,7 @@ def test_max_units_and_filter():
 def test_ladder_split_pays_at_four_fp8_rungs():
     from prismaquant.expert_empirical_cost import (
         _cb_ladder_fit,
+        _cb_ladder_rate_factor,
         _cb_ladder_split,
     )
     fmts = ["FP8_CB_K36", "FP8_CB_K40", "FP8_CB_K44", "FP8_CB_K48"]
@@ -290,16 +291,30 @@ def test_ladder_split_pays_at_four_fp8_rungs():
     kmap, anchors, holdout, predicted = split[0]
     assert set(anchors) == {"FP8_CB_K36", "FP8_CB_K48"}
     assert len(predicted) == 1 and holdout not in predicted
-    # Exact exponential law -> fit accepts and predicts near-exactly.
-    kls = {f: 2.0 ** (3.0 - 0.4 * kmap[f]) for f in fmts}
-    pred, rel = _cb_ladder_fit(kls, kmap, anchors, holdout, predicted, 0.10)
-    assert pred is not None and rel < 1e-6
+    # R20 (2026-07-30): the expert chain runs the SAME law as the dense
+    # chain, whose leading branch is the split-aware floored linear law
+    # D = F + C*R(k) in the exact ceil-first rate factor. Exact on its own
+    # model -> holdout accepts, prediction exact.
+    kls = {f: 0.002 + 1.5 * _cb_ladder_rate_factor(f, kmap[f]) for f in fmts}
+    pred, rel, tol = _cb_ladder_fit(
+        kls, kmap, anchors, holdout, predicted, 0.10)
+    assert pred is not None and rel < 1e-9
+    assert tol == 0.10          # no window datum supplied -> the floor
     (pf,) = predicted
-    assert pred[pf] == pytest.approx(kls[pf], rel=1e-6)
+    assert pred[pf] == pytest.approx(kls[pf], rel=1e-9)
+    # A FREE-rate exponential (decay != R's) is NOT the law's model. Before
+    # R20 the expert chain was log-linear with no R(k) term and fitted this
+    # exactly, shipping an interpolated cost; now the holdout gate rejects
+    # and the caller measures — the same guarantee the dense chain has had
+    # since 5184892.
+    expo = {f: 2.0 ** (3.0 - 0.4 * kmap[f]) for f in fmts}
+    pred_e, rel_e, _ = _cb_ladder_fit(
+        expo, kmap, anchors, holdout, predicted, 0.10)
+    assert pred_e is None and rel_e > 0.10
     # Broken law -> holdout rejects.
     kls_bad = dict(kls)
     kls_bad[holdout] *= 3.0
-    pred_bad, rel_bad = _cb_ladder_fit(
+    pred_bad, rel_bad, _ = _cb_ladder_fit(
         kls_bad, kmap, anchors, holdout, predicted, 0.10)
     assert pred_bad is None and rel_bad > 0.10
 
@@ -363,13 +378,18 @@ def test_floor_law_fit_exact_and_degenerate():
     assert b == pytest.approx(b0, rel=1e-6)
     # Non-monotone -> None.
     assert _fit_floor_law(ks, [1.0, 2.0, 0.5]) is None
-    # End-to-end through _cb_ladder_fit: floor-law data, 3 anchors, exact
-    # holdout acceptance + exact prediction (log-linear would reject here).
+    # End-to-end through _cb_ladder_fit. Since R20 the shared chain LEADS
+    # with the floored-linear-in-R(k) branch, so this floor law is reached
+    # only when that branch declines (C <= 0 / degenerate anchors). On
+    # floor-law data the R branch is a good but not exact fit: it misses the
+    # holdout by 5.2%, inside the 10% gate, and lands the predictions within
+    # ~7%. The gate — not the branch order — is what makes either safe.
     fmts = {f"FP8_CB_K{k}": k for k in (28, 32, 36, 40, 44, 48)}
     kls = {f: F0 + C0 * 2.0 ** (-b0 * kk) for f, kk in fmts.items()}
     anchors = ["FP8_CB_K28", "FP8_CB_K40", "FP8_CB_K48"]
-    pred, rel = _cb_ladder_fit(kls, fmts, anchors, "FP8_CB_K36",
-                               ["FP8_CB_K32", "FP8_CB_K44"], 0.10)
-    assert pred is not None and rel < 1e-9
+    pred, rel, tol = _cb_ladder_fit(kls, fmts, anchors, "FP8_CB_K36",
+                                    ["FP8_CB_K32", "FP8_CB_K44"], 0.10)
+    assert pred is not None and rel == pytest.approx(0.0516, abs=5e-4)
+    assert tol == 0.10
     for f, v in pred.items():
-        assert v == pytest.approx(kls[f], rel=1e-9)
+        assert v == pytest.approx(kls[f], rel=0.07)

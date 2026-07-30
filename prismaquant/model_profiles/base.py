@@ -12,8 +12,8 @@ Each profile captures three kinds of knowledge:
      whether the architecture has MTP heads.
 
   3. **MTP construction**: how to stand up an HF-module replica of the
-     architecture's MTP forward (for Fisher probing), and how to load
-     `mtp.*` safetensors into it.
+     architecture's MTP forward (for Fisher probing), which checkpoint
+     prefix its tensors live under, and how to load them into it.
 
 Profiles are picked per-run by `registry.detect_profile(model_path)`
 from HF config + architectures. Unknown architectures fall back to
@@ -40,6 +40,13 @@ class ModelProfile(ABC):
     and an optional `build_mtp_module()` — the rest comes from vLLM's
     `packed_modules_mapping` and `hf_to_vllm_mapper` class attributes.
     """
+
+    #: Detection order — **lower is consulted first**, like a sort rank.
+    #: Built-in profiles declare 100..199 in `registry.py` (the list order that
+    #: used to live in a comment: subsets before supersets). The default 0
+    #: keeps a third-party `register_profile()` ahead of every built-in,
+    #: preserving that function's documented insert-at-front contract.
+    priority: int = 0
 
     def __init__(self) -> None:
         # Lazy-compiled derivations from the vLLM class. Computed on
@@ -245,30 +252,153 @@ class ModelProfile(ABC):
         and quantize."""
         return False
 
+    def mtp_source_prefix(self) -> str | None:
+        """Prefix of this architecture's MTP tensors **as keyed in the
+        source checkpoint**, including the trailing dot.
+
+        This is deliberately distinct from `mtp_layer_prefix()` (which
+        keys shard regexes over *recipe* names) because the two can
+        disagree: Qwen3.5/3.6 store the sidecar under `mtp.`, while
+        body-indexed layouts (hy_v3's `model.layers.80.`, DSv4's nextn
+        block) have no `mtp.*` namespace at all. Return None when the
+        architecture has no prefix-keyed MTP sidecar — those families
+        set `has_mtp() -> False` and ship the block through
+        `source_passthrough_prefixes()` instead.
+
+        Spec-expressible as `shard_regexes.mtp_source_prefix`."""
+        spec = self.structure_spec()
+        if spec is not None and spec.mtp_source_prefix is not None:
+            return spec.mtp_source_prefix
+        return "mtp."
+
     def build_mtp_module(self, text_config) -> nn.Module | None:
         """Construct an HF-module replica of the MTP forward (mirrors
         what vLLM's MTP class does at inference time). Return None if
         `has_mtp()` is False.
 
-        The returned module must be wrappable — after `load_state_dict`
-        with the stripped-prefix MTP weights it should forward a hidden
-        state + next-token embed into the MTP block exactly as vLLM does."""
+        **Naming contract.** The returned module's `named_modules()` /
+        `named_parameters()` names, once the module is wrapped in a
+        parent module named `mtp`, must equal the recipe names the
+        allocator assigned — i.e. `mtp.fc.weight`,
+        `mtp.layers.0.self_attn.q_proj.weight`, ... Probe, cost and
+        export all wrap it exactly that way and then key straight into
+        `assignment` / probe stats by the resulting qualified name, so a
+        layout that does not satisfy this silently measures and exports
+        nothing. Two corollaries: the top-level attribute holding the
+        decoder blocks must be `layers` (an `nn.ModuleList`), and the
+        checkpoint keys with `mtp_source_prefix()` stripped must load
+        into it via `load_mtp_state_dict()` below.
+
+        The returned module must also be forwardable — after loading it
+        should take a hidden state + next-token embed and run the MTP
+        block exactly as vLLM does, so Fisher hooks see real gradients."""
         return None
+
+    def read_mtp_source_state_dict(self, model_path: str) -> dict:
+        """Return every source tensor under `mtp_source_prefix()`, with
+        that prefix stripped so keys match `build_mtp_module()`'s layout.
+
+        Generic across architectures: only the shards that actually hold
+        MTP keys are opened, so this stays cheap on a 100-shard
+        checkpoint. Returns `{}` (rather than raising) when the
+        architecture declares MTP but the checkpoint carries no such
+        tensors — some Qwen3.5/3.6 finetunes inherit
+        `num_nextn_predict_layers` from the base config while stripping
+        the weights, and callers detect the empty dict and emit an empty
+        shard artifact. See PR #1."""
+        import torch  # local: keep profile import cost off the CLI path
+
+        prefix = self.mtp_source_prefix()
+        if not prefix:
+            return {}
+        src = Path(model_path)
+        idx_path = src / "model.safetensors.index.json"
+        if not idx_path.exists():
+            raise RuntimeError(f"no safetensors index at {idx_path}")
+        with open(idx_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        mtp_files = sorted({v for k, v in weight_map.items()
+                            if k.startswith(prefix)})
+        if not mtp_files:
+            print(f"[mtp] no {prefix}* weights in safetensors index; "
+                  "returning empty state dict", flush=True)
+            return {}
+        from safetensors.torch import safe_open
+        out: dict[str, torch.Tensor] = {}
+        for fn in mtp_files:
+            with safe_open(str(src / fn), framework="pt") as sf:
+                for key in sf.keys():
+                    if not key.startswith(prefix):
+                        continue
+                    out[key[len(prefix):]] = sf.get_tensor(key)
+        return out
 
     def load_mtp_state_dict(self, mtp_module: nn.Module,
                             raw: dict) -> tuple[list[str], list[str]]:
-        """Load raw `mtp.*` tensors (with `mtp.` stripped) into
+        """Load MTP tensors (source prefix already stripped) into
         `mtp_module`. Return `(unmatched_keys, module_params_without_weight)`.
 
-        Default implementation uses `mtp_module.load_state_dict(raw, strict=False)`."""
-        mapped: dict = {}
-        for k, v in raw.items():
-            mapped[k] = v
+        Exact-name keys go through `load_state_dict(..., strict=False)`.
+        Per-expert checkpoint keys are additionally folded into the
+        module's packed 3D expert Parameters, which is how HF stores a
+        MoE decoder layer and how the checkpoint does not:
+
+            layers.N.mlp.experts.{e}.gate_proj.weight -> ...experts.gate_up_proj[e, :I]
+            layers.N.mlp.experts.{e}.up_proj.weight   -> ...experts.gate_up_proj[e, I:]
+            layers.N.mlp.experts.{e}.down_proj.weight -> ...experts.down_proj[e]
+
+        Dense MTP blocks simply never match that pattern and fall
+        through to the exact-name path."""
         sd = mtp_module.state_dict()
-        mapped_filtered = {k: v for k, v in mapped.items() if k in sd}
-        missing = [k for k in mapped if k not in sd]
-        extra = [k for k in sd if k not in mapped_filtered]
-        mtp_module.load_state_dict(mapped_filtered, strict=False)
+        params = dict(mtp_module.named_parameters())
+        mapped: dict = {}
+        missing: list[str] = []
+        loaded_module_keys: set[str] = set()
+        packed_pat = re.compile(
+            r"^(layers\.\d+\.mlp\.experts)\.(\d+)\."
+            r"(gate_proj|up_proj|down_proj)\.weight$"
+        )
+
+        for k, v in raw.items():
+            if k in sd:
+                mapped[k] = v
+                loaded_module_keys.add(k)
+                continue
+
+            m = packed_pat.match(k)
+            if m is None:
+                missing.append(k)
+                continue
+
+            prefix, expert_id_s, proj = m.groups()
+            expert_id = int(expert_id_s)
+            if proj == "down_proj":
+                packed_name = f"{prefix}.down_proj"
+                packed = params.get(packed_name)
+                if packed is None:
+                    missing.append(k)
+                    continue
+                packed.data[expert_id].copy_(
+                    v.to(device=packed.device, dtype=packed.dtype))
+                loaded_module_keys.add(packed_name)
+                continue
+
+            packed_name = f"{prefix}.gate_up_proj"
+            packed = params.get(packed_name)
+            if packed is None:
+                missing.append(k)
+                continue
+            rows = v.shape[0]
+            start = 0 if proj == "gate_proj" else rows
+            packed.data[expert_id, start:start + rows].copy_(
+                v.to(device=packed.device, dtype=packed.dtype)
+            )
+            loaded_module_keys.add(packed_name)
+
+        # Load exact-name tensors through state_dict for everything that
+        # isn't a packed expert tensor filled manually above.
+        mtp_module.load_state_dict(mapped, strict=False)
+        extra = [k for k in sd if k not in loaded_module_keys]
         return missing, extra
 
     def mtp_objective_example(self) -> str:
@@ -584,6 +714,15 @@ class ModelProfile(ABC):
             parent = spec.packed_expert_parent_for_projection(leaf)
             if parent is not None:
                 return parent
+        if spec is not None and spec.packed_experts.declared:
+            # A leaf that is itself a declared role bucket is its own role.
+            # This is not the same as the packed-parameter case below: an
+            # architecture whose on-disk experts are the unfused leaves
+            # (MiniMax) declares `gate_up_proj` as a role parent in
+            # `projection_splits` without it ever being a real tensor.
+            for parent, _projections in spec.packed_experts.projection_splits:
+                if leaf == parent:
+                    return parent
         fallback = self._fallback_packed_expert_role_parents().get(leaf)
         if fallback is not None:
             return fallback
@@ -657,6 +796,70 @@ class ModelProfile(ABC):
         if spec is not None:
             return spec.default_serving_profile
         return None
+
+    # ------------------------------------------------------------
+    # Export-lane eligibility
+    # ------------------------------------------------------------
+    def supported_export_lanes(self) -> tuple[str, ...]:
+        """`EXPORT_CONTAINER` lanes this architecture is actually wired for.
+
+        Lane eligibility is a per-architecture fact, not an operator
+        preference: the CB lane needs a gridbook loader for the arch's expert
+        layout (`plugins/gridbook/gridbook/plugin.py`) and the GGUF lane needs
+        a llama.cpp-side arch. Where that wiring is missing the run still
+        *completes* and the artifact serves uninitialised memory — coherent
+        garbage, not a crash (commit `9a79963`, Laguna). So the honest lane
+        set has to be declared where the rest of the architecture's facts
+        live, and this is the reader for it.
+
+        Undeclared architectures get the native compressed-tensors lane only,
+        which is what every one of them has ever shipped through.
+        """
+        from .structure import DEFAULT_EXPORT_LANE
+
+        spec = self.structure_spec()
+        if spec is not None and spec.supported_lanes:
+            return spec.supported_lanes
+        return (DEFAULT_EXPORT_LANE,)
+
+    def preferred_export_lane(self) -> str:
+        """The lane this architecture ships through by default.
+
+        Resolution: the spec's `preferred_lane` if declared; else the native
+        lane when it is supported; else the first declared lane.
+        """
+        from .structure import DEFAULT_EXPORT_LANE
+
+        spec = self.structure_spec()
+        if spec is not None and spec.preferred_lane:
+            return spec.preferred_lane
+        lanes = self.supported_export_lanes()
+        if DEFAULT_EXPORT_LANE in lanes:
+            return DEFAULT_EXPORT_LANE
+        return lanes[0] if lanes else DEFAULT_EXPORT_LANE
+
+    def bypass_hf_fp8_module_rewrite(self) -> bool:
+        """Skip transformers' FP8 pre-load module rewrite for this arch.
+
+        transformers 5.x rewrites a native-FP8 checkpoint's modules before
+        loading. For a `ModuleList`-of-experts MoE (MiniMax-M2/M2.7) that
+        replaces the list with an `FP8Experts` container and then tries to set
+        `experts.0.w1`, which the container does not support. PrismaQuant's
+        streaming loader does not need the rewrite at all: it reads the source
+        FP8 bytes and applies each `weight_scale_inv` block itself in
+        `_read_layer_to_device`, so the live Linear still sees true dequanted
+        bf16 for Fisher/cost math.
+
+        Whether that rewrite breaks is a static property of the architecture's
+        expert container, so it is declared (`staging.bypass_hf_fp8_module_rewrite`)
+        rather than pattern-matched on the model name. The *checkpoint* half of
+        the condition — native FP8 with block scales — stays a config read at
+        the call site (`streaming_model.py`), because it varies per checkpoint.
+        """
+        spec = self.structure_spec()
+        if spec is not None:
+            return bool(spec.bypass_hf_fp8_module_rewrite)
+        return False
 
     def stage_text_only_strip_keys(self) -> tuple[str, ...]:
         """HF config keys to drop when creating a text-only staged

@@ -1376,15 +1376,22 @@ def test_cb_ladder_split_and_fit():
     assert holdout in predicted or holdout not in anchors
     assert "FP8_CB_K44" not in kmap          # different family, separate map
     # exact RD law -> holdout accepted, predictions exact.
+    # (R20: _cb_ladder_fit returns (pred, rel, tol_used) — the gate derives
+    # its own tolerance where a noise datum exists, so the tolerance it
+    # actually applied is part of the answer. Every k here is even, so the
+    # ceil-first split is even and R(k) is exactly proportional to
+    # 2^(-k/4): this exact RD law IS the shared law's own model.)
     kls = {f: 2.0 ** (3.0 - kmap[f] / 4.0) for f in kmap}
-    pred, rel = _cb_ladder_fit(kls, kmap, anchors, holdout, predicted, 0.10)
-    assert rel < 1e-9
+    pred, rel, tol = _cb_ladder_fit(
+        kls, kmap, anchors, holdout, predicted, 0.10)
+    assert rel < 1e-9 and tol == 0.10
     for f, v in pred.items():
         assert v == pytest.approx(kls[f], rel=1e-9)
     # corrupted holdout -> gate FAILS -> caller measures everything.
     bad = dict(kls)
     bad[holdout] *= 1.5
-    pred2, rel2 = _cb_ladder_fit(bad, kmap, anchors, holdout, predicted, 0.10)
+    pred2, rel2, _ = _cb_ladder_fit(
+        bad, kmap, anchors, holdout, predicted, 0.10)
     assert pred2 is None and rel2 > 0.10
     # short ladders never interpolate
     assert cb_ladder_none() is None

@@ -1,6 +1,7 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "qwen3",
+  "priority": 130,
   "default_serving_profile": "vllm_packed_moe",
   "match": {
     "model_type": ["qwen3"],

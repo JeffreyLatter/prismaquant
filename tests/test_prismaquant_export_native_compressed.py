@@ -2652,6 +2652,13 @@ class TestMtpCoverageValidation(unittest.TestCase):
         def has_mtp(self):
             return True
 
+        def mtp_source_prefix(self):
+            # Where the MTP tensors live in the SOURCE checkpoint. Recipe
+            # names are always `mtp.*` regardless (see R12's
+            # `build_mtp_module` naming contract), which is why the two
+            # halves of the coverage check read different prefixes.
+            return "mtp."
+
     def test_validate_mtp_assignment_coverage_raises_when_recipe_omits_mtp(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

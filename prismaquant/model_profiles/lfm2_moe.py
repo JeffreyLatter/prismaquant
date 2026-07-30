@@ -84,6 +84,9 @@ from .base import ModelProfile
 
 class Lfm2MoeProfile(ModelProfile):
 
+    # Detection priority (lower = consulted first): disjoint.
+    priority = 150
+
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
         if model_type in {"lfm2_moe", "lfm2-moe"}:

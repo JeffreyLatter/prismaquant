@@ -12,6 +12,9 @@
 # Exact container name; never pattern-kill.
 # ============================================================================
 set -u
+# R15 serve fingerprint (docs/ARCHITECTURE.md §7.4): write_serve_manifest.
+PQ_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$PQ_SCRIPT_DIR/lib/serve_manifest.sh" ] && . "$PQ_SCRIPT_DIR/lib/serve_manifest.sh"
 NAME=pq_hy3_cb
 MODEL=/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb
 MAXLEN="${MAXLEN:-8192}"
@@ -34,7 +37,9 @@ docker run -d --rm --gpus all -p 8000:8000 --name "$NAME" \
 # Long load window: 110 GB weight read + plugin JIT build + KV profile.
 for i in $(seq 1 240); do   # up to 20 min
   if curl -s http://localhost:8000/v1/models >/dev/null 2>&1; then
-    echo "[serve] READY after $((i*5))s $(date '+%H:%M:%S')"; exit 0; fi
+    echo "[serve] READY after $((i*5))s $(date '+%H:%M:%S')"
+    write_serve_manifest "$NAME" "$MODEL"
+    exit 0; fi
   if ! docker ps --format '{{.Names}}' | grep -q "^${NAME}$"; then
     echo "[serve] FAILED (container exited)"; docker logs "$NAME" 2>&1 | tail -40; exit 1; fi
   sleep 5

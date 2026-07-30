@@ -174,3 +174,37 @@ def test_select_tail_from_nvfp4_render_scores():
     assert selected == ["layers.0.q_proj"]
     assert summary["available"] == 1
     assert summary["selected"] == 1
+
+
+# --------------------------------------------------------------------------
+# R14 — calibration identity propagation
+# --------------------------------------------------------------------------
+
+def test_render_cost_inherits_calib_hash_from_the_cache():
+    cache = _cache_with_scores()
+    cache.metadata["calib_hash"] = "cachehash"
+    payload = synthesize_production_render_cost_payload(
+        cache, {"costs": {}, "formats": ["NVFP4"]})
+    assert payload["meta"]["calib_hashes"] == ["cachehash"]
+    assert payload["meta"]["calib_hash"] == "cachehash"
+
+
+def test_render_cost_unions_cache_and_baseline_hashes():
+    cache = _cache_with_scores()
+    cache.metadata["calib_hash"] = "cachehash"
+    payload = synthesize_production_render_cost_payload(
+        cache,
+        {"costs": {}, "formats": ["NVFP4"],
+         "meta": {"calib_hashes": ["baselinehash"]}},
+    )
+    assert payload["meta"]["calib_hashes"] == ["baselinehash", "cachehash"]
+    # Ambiguous single-draw identity -> None, so a downstream reader cannot
+    # mistake a two-draw cost table for one draw.
+    assert payload["meta"]["calib_hash"] is None
+
+
+def test_render_cost_stays_inert_on_pre_r14_artifacts():
+    payload = synthesize_production_render_cost_payload(
+        _cache_with_scores(), {"costs": {}, "formats": ["NVFP4"]})
+    assert payload["meta"]["calib_hashes"] == []
+    assert payload["meta"]["calib_hash"] is None

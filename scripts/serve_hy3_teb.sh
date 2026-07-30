@@ -11,6 +11,9 @@
 # EXTRA_ARGS lets perf experiments (cudagraph configs) reuse this script.
 # ============================================================================
 set -u
+# R15 serve fingerprint (docs/ARCHITECTURE.md §7.4): write_serve_manifest.
+PQ_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$PQ_SCRIPT_DIR/lib/serve_manifest.sh" ] && . "$PQ_SCRIPT_DIR/lib/serve_manifest.sh"
 NAME=pq_hy3_cb
 MODEL="${MODEL:-/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb}"
 MAXLEN="${MAXLEN:-12288}"
@@ -103,6 +106,7 @@ for i in $(seq 1 240); do   # up to 20 min (110 GB load + plugin JIT)
       done' >/dev/null 2>&1 &
     disown
     echo "[serve] memory watchdog armed (stop below ${WATCHDOG_GIB} GiB free)"
+    write_serve_manifest "$NAME" "$MODEL"
     exit 0
   fi
   if ! docker ps --format '{{.Names}}' | grep -q "^${NAME}$"; then

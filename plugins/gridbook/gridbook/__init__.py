@@ -10,7 +10,10 @@ falls back to a correct-but-slow Triton path.
 (the format and correctness tests) work without vLLM installed.
 """
 
-__version__ = "0.1.0"
+# Development head. PyPI serves 0.1.1 (built from the standalone /home/rob/gridbook
+# release repo); this in-tree copy is AHEAD of it in kernel work and is released
+# only through that repo, so it carries a dev suffix rather than a release number.
+__version__ = "0.2.0.dev0"
 
 
 def register() -> None:

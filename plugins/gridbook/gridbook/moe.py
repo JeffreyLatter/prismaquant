@@ -40,6 +40,11 @@ from vllm.model_executor.layers.fused_moe.activation import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from . import codec
+from .cb_fill_guard import (
+    assert_cb_experts_filled,
+    mark_filled,
+    mark_unfilled,
+)
 from .expand import (
     expand_cb_to_fp8,
     expand_cb_to_value,
@@ -134,12 +139,19 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             E, 2 * inter, _row_bytes(hidden_size, self.type_size),
             dtype=torch.uint8), requires_grad=False)
         set_weight_attrs(w13, {**attrs, "is_transposed": False})
+        # Fill sentinel (cb_fill_guard): False until a fill path copies
+        # checkpoint bytes in; checked in process_weights_after_loading so a
+        # missing per-arch loader opt-in fails loudly instead of serving
+        # uninitialised memory. Set AFTER set_weight_attrs — that helper asserts
+        # on overwriting an existing attribute.
+        mark_unfilled(w13)
         layer.register_parameter("w13_cb_qweight", w13)
 
         w2 = torch.nn.Parameter(torch.empty(
             E, hidden_size, _row_bytes(inter, self.type_size),
             dtype=torch.uint8), requires_grad=False)
         set_weight_attrs(w2, {**attrs, "is_transposed": False})
+        mark_unfilled(w2)
         layer.register_parameter("w2_cb_qweight", w2)
 
         if not self.is_fp4:                       # fp8: per-(expert, out) scale
@@ -184,6 +196,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                                 f"{tuple(w.shape)} != param {tuple(p.shape)}"
                                 f" — stacked (E, out, bytes) contract violated")
                         p.data.copy_(w.to(p.dtype))
+                        mark_filled(p)          # fill path 1 of 2 (per-layer)
                         yield pname
                     else:
                         deferred.append((name, w))
@@ -198,6 +211,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
     # -- per-stack codebook / compose + uniformity assert --------------------
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        # The one place a never-installed per-arch loader is detectable: vLLM
+        # calls this for every CB MoE layer on every load path, and neither fill
+        # path ran if the stacks are still unfilled. No env bypass (R10/D3).
+        assert_cb_experts_filled(layer, self.prefix)
         dev = layer.w13_cb_qweight.device
         E = layer.w13_cb_qweight.shape[0]
         codebooks = self.quant_config.get_codebooks()

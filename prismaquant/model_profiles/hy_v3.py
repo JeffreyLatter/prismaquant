@@ -26,7 +26,8 @@ allocator never see it. Export handling is per-lane: GGUF exports pass
 artifact); compressed-tensors exports ship it VERBATIM BF16 via
 ``passthrough_prefixes`` so vLLM's HYV3MTP spec decode can load it.
 ``has_mtp`` stays False because the ``mtp.*``-keyed sidecar machinery
-(mtp_module) does not apply to this body-indexed layout.
+(``mtp_source_prefix`` / ``build_mtp_module``) does not apply to this
+body-indexed layout.
 
 vLLM class: HYV3ForCausalLM exists upstream but not in the local serving
 stacks yet; like DeepSeek-V4 this profile returns None and runs entirely
@@ -45,6 +46,9 @@ _SHARED_RE = re.compile(r"^(model\.layers\.\d+\.mlp)\.shared_mlp\.")
 
 
 class HyV3Profile(ModelProfile):
+
+    # Detection priority (lower = consulted first): disjoint.
+    priority = 180
     """Tencent Hy3 / hy_v3 family."""
 
     @classmethod
@@ -65,7 +69,8 @@ class HyV3Profile(ModelProfile):
 
     def has_mtp(self) -> bool:
         # model.layers.80 is the MTP layer, body-indexed rather than
-        # mtp.*-keyed, so the mtp_module machinery doesn't apply. The
+        # mtp.*-keyed, so the mtp_source_prefix/build_mtp_module
+        # machinery doesn't apply. The
         # skeleton never instantiates it and checkpoint_to_live_name
         # drops its keys; export lanes handle it explicitly (GGUF:
         # --exclude; compressed-tensors: BF16 passthrough via

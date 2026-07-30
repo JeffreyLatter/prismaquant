@@ -317,7 +317,7 @@ pointing at their archive.
 | Export | `export_native_compressed.py` (~7300 lines: NVFP4/MX/FP8 packing, unified codecs, `build_quantization_config` config_groups+ignore, packed-MoE split, FP8_SOURCE verbatim copy, BF16-upgrade audit) · `export_batched_gptq.py` · `block_output_match.py` |
 | Validate / select | `validate_assignments_kl.py` · `select_validated_frontier.py` (kneedle + surrogate-vs-KL Spearman + worst-rank-inversion) · `validation_harness.py` · `validate_native_export.py` · `validate_quantized_model.py` |
 | Profiles (plug-in) | `model_profiles/`: `base.py` (auto-derives fused/packed/naming from the vLLM class), `structure.py` (declarative `ModelStructureSpec` JSON + `build_model_graph`), `registry.py` (`detect_profile`/`register_profile`), `vllm_registry.py`, + per-arch (`qwen3*`, `gemma4`, `lfm2_moe`, `minimax_m2`, `deepseek_v4`). Serving constraints live in the top-level `serving_profiles.py` + `serving_profile_specs/*.json` |
-| Misc | `mtp_module.py` (synthesize MTP since transformers v5 drops it) · `mse_promotion.py` · `layer_config.py` (single canonical recipe parser) · `schemas.py` |
+| Misc | MTP synthesis (transformers v5 drops it) now lives on the profile: `model_profiles/base.py` `mtp_source_prefix`/`read_mtp_source_state_dict`/`load_mtp_state_dict` + `model_profiles/qwen3_5.py::MtpModule` (top-level `mtp_module.py` deleted 2026-07-30) · `mse_promotion.py` · `layer_config.py` (single canonical recipe parser) · `schemas.py` |
 
 **Plug-in a new architecture = three registries, ~30–200 LoC:** model structure
 (`model_profiles/specs/*.json` + a `ModelProfile`), serving constraints
@@ -419,8 +419,10 @@ validated-surrogate for real-KL frontier selection.
   misrouting cost). ~88 GB at 2.5 bpp. v2 SVD expert-factorization design deferred
   (prefer no new vLLM kernel).
 - **Robust Fisher clip** (K×median per-role h_trace clip): a research **WIN**
-  (~5% better at 6.0 on 4B) pending promotion to an opt-in lever
-  (`PRISMAQUANT_FISHER_CAP_MULTIPLIER`); tool at `/home/rob/dq-runs/robust_fisher_clip.py`.
+  (~5% better at 6.0 on 4B). **Wired as an opt-in lever 2026-07-30 (R28)**:
+  `PRISMAQUANT_FISHER_CAP_MULTIPLIER=K` → `allocator.clip_probe_fisher_outliers`,
+  unset = byte-identical no-op. Still **research** — no served A/B; do not
+  default it on. Reference tool: `/home/rob/dq-runs/robust_fisher_clip.py`.
 - **Production-faithful polish** (5.39 bpp / polish-time KL 0.0054): **provisional**
   — that number is a polish-time signal on a 2×128 calibration, **not** a held-out
   8×512 claim. Do not cite −2.8× as a result until the 8×512 re-measurement lands.

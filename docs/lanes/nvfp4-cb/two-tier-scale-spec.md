@@ -257,8 +257,12 @@ Serving modes, specced:
   footprint only** (−8.75% artifact at K16). `effective_bits` and every
   allocator/footprint/bpw claim MUST stay at v1 numbers in this mode — no
   2.28-bpw label on a 2.5-bpw-resident serve. Verdict: **not worth shipping
-  alone**; exists only as an env-gated bring-up fallback
-  (`PRISMAQUANT_CB_SCALE_RECOMPOSE=1`), never a ship config. (Building the
+  alone**; specced as an env-gated bring-up fallback
+  (`PRISMAQUANT_CB_SCALE_RECOMPOSE=1`), never a ship config.
+  **NOT IMPLEMENTED (verified 2026-07-30, R28): `PRISMAQUANT_CB_SCALE_RECOMPOSE`
+  has zero readers anywhere in the tree — this bullet is a spec for unbuilt
+  work, not a description of a live flag. Nothing sets it and nothing reads it;
+  it is deliberately absent from `docs/design/runtime_flags.md`.** (Building the
   packer/layout is still sequenced first — it is required infrastructure for
   M1 — but v2 artifacts do not ship until M1 serves them.)
 - **M1 — kernel-native (the actual win, required for v2 artifacts).**
