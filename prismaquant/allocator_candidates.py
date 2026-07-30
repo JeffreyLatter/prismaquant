@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -472,7 +473,7 @@ def aggregate_fused_siblings(
     grouped: dict[str, list[str]] = {}
     ungrouped: list[str] = []
     for name in candidates:
-        if ".__fused__." in name:
+        if ".__fused__." in name or _PACKED_GROUP_MARKER in name:
             ungrouped.append(name)
             continue
         try:
@@ -597,6 +598,209 @@ def expand_fused_sibling_assignment(assignment: dict[str, str],
     for name, fmt in assignment.items():
         if _FUSED_SIBLING_MARKER in name:
             members = stats_ext[name].get("_fused_siblings", [])
+            for m in members:
+                out[m] = fmt
+        else:
+            out[name] = fmt
+    return out
+
+
+_PACKED_GROUP_MARKER = ".__packed_serving__."
+
+
+def aggregate_packed_serving_groups(
+    stats: dict,
+    costs: dict,
+    formats: list[fr.FormatSpec],
+    candidates: dict[str, list[Candidate]],
+    profile,
+    calibrated_gains: dict[str, float] | None = None,
+) -> tuple[dict, dict, dict]:
+    """Aggregate packed-MoE serving groups into single DP decision units.
+
+    A packed serving group (``profile.packed_expert_format_group``) is
+    atomic at serve time: vLLM's FusedMoE loads every projection of every
+    routed expert in a layer under ONE quantization scheme, so a "one row
+    upgraded" DP decision is not a real option — the serving constraint
+    charges the whole group. Pricing upgrades per row inside the DP while
+    ``promote_serving_units`` charges the whole group is a ~1000x price
+    mismatch: mispriced expert rows
+    top the per-bin ranking, the feasibility tightening over-corrects, and
+    cheap-to-upgrade dense rows starve while headroom goes unused.
+
+    This pre-pass makes each packed group ONE multi-choice DP item whose
+    per-format cost is the exact sum of member predicted_dloss and whose
+    byte cost is the exact sum of member bytes at that format — so the DP
+    and the serving constraint price identical moves and post-DP MoE
+    promotion becomes a validated no-op. Only formats legal for EVERY
+    member are offered (member candidate sets already encode source /
+    profile / kernel-shape applicability). A group with no common legal
+    format falls back to individual rows so downstream promotion can
+    repair coherence rather than the group silently vanishing from the DP.
+
+    Non-grouped rows (attention, shared/dense MLP) pass through untouched.
+    Extrapolated expert cost rows are ordinary members. Use
+    ``expand_packed_group_assignment`` to broadcast a group decision back
+    to per-tensor entries for emission.
+    """
+    group_fn = getattr(profile, "packed_expert_format_group", None) \
+        if profile is not None else None
+    if not callable(group_fn):
+        return stats, costs, candidates
+
+    gains = calibrated_gains or {}
+    ucb_z = _cost_ucb_z()
+    grouped: dict[str, list[str]] = {}
+    ungrouped: list[str] = []
+    for name in candidates:
+        if _FUSED_SIBLING_MARKER in name or _PACKED_GROUP_MARKER in name:
+            ungrouped.append(name)
+            continue
+        try:
+            key = group_fn(name)
+        except Exception:
+            key = None
+        if key is None:
+            ungrouped.append(name)
+            continue
+        grouped.setdefault(key, []).append(name)
+
+    for key in list(grouped.keys()):
+        if len(grouped[key]) < 2:
+            ungrouped.extend(grouped.pop(key))
+
+    if not grouped:
+        return stats, costs, candidates
+
+    stats_ext = {n: stats[n] for n in ungrouped}
+    costs_ext = {n: costs.get(n, {}) for n in ungrouped}
+    candidates_ext = {n: candidates[n] for n in ungrouped}
+
+    for key, members in sorted(grouped.items()):
+        members = sorted(members)
+        safe_key = key.replace(".", "__")
+        super_name = (
+            f"{members[0].rsplit('.', 1)[0]}{_PACKED_GROUP_MARKER}{safe_key}"
+        )
+        member_cands = {
+            m: {c.fmt: c for c in candidates[m]} for m in members
+        }
+        common_fmts = set.intersection(
+            *(set(per_member) for per_member in member_cands.values())
+        )
+        n_params = sum(int(stats[m]["n_params"]) for m in members)
+        memory_by_fmt: dict[str, int] = {}
+        super_cost: dict[str, dict] = {}
+        cands: list[Candidate] = []
+        for spec in formats:
+            if spec.name not in common_fmts:
+                continue
+            total_bytes = sum(
+                int(member_cands[m][spec.name].memory_bytes) for m in members
+            )
+            sum_pred = sum(
+                float(member_cands[m][spec.name].predicted_dloss)
+                for m in members
+            )
+            # UCB hedge (PRISMAQUANT_COST_UCB_Z > 0): each member candidate
+            # was priced independently, so the sum above carries a LINEAR
+            # z·Σ(stderr·gain) hedge. The members' dloss estimates are
+            # independent measurements, so the stderr of the group SUM is
+            # sqrt(Σ stderr²): replace the linear per-member hedge with the
+            # independence aggregate, and store the aggregated stderr on the
+            # super cost entry so consumers of the aggregated cost table
+            # (aura additivity gate, repricing) keep the hedge instead of
+            # silently reading stderr 0. At z == 0 this is a no-op and the
+            # per-format dloss stays the exact sum of member candidates.
+            stderr_eff_sq = 0.0
+            hedge_linear = 0.0
+            for m in members:
+                if float(member_cands[m][spec.name].predicted_dloss) <= 0.0:
+                    # Clamped-at-zero member: contributed no dloss (and no
+                    # hedge) to the sum; skip it symmetrically.
+                    continue
+                entry = None
+                entry_fmt = spec.name
+                for candidate_name in fr.aliases_for(spec.name):
+                    if candidate_name in costs.get(m, {}):
+                        entry = costs[m][candidate_name]
+                        entry_fmt = candidate_name
+                        break
+                if entry is None or "error" in entry:
+                    continue
+                # Mirror cost_entry_predicted_dloss: the stderr hedge only
+                # applies on the explicit predicted_dloss branch.
+                if _has_measured_output_mse(stats[m], entry):
+                    continue
+                if "predicted_dloss" not in entry:
+                    continue
+                try:
+                    stderr = float(
+                        entry.get("predicted_dloss_stderr", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    stderr = 0.0
+                if stderr <= 0.0:
+                    continue
+                gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
+                stderr_eff_sq += (stderr * gain) ** 2
+                hedge_linear += ucb_z * stderr * gain
+            stderr_agg = math.sqrt(stderr_eff_sq)
+            base_pred = sum_pred - hedge_linear
+            hedged_pred = base_pred + ucb_z * stderr_agg
+            memory_by_fmt[spec.name] = total_bytes
+            super_cost[spec.name] = {
+                "predicted_dloss": base_pred,
+                "predicted_dloss_stderr": stderr_agg,
+            }
+            cands.append(Candidate(
+                fmt=spec.name,
+                bits_per_param=8.0 * total_bytes / max(n_params, 1),
+                memory_bytes=total_bytes,
+                predicted_dloss=max(hedged_pred, 0.0),
+            ))
+        if not cands:
+            # No format is legal for every member; aggregating would drop
+            # the whole group from the DP. Keep the members as individual
+            # rows (pre-refactor behavior: promotion repairs coherence).
+            for m in members:
+                stats_ext[m] = stats[m]
+                costs_ext[m] = costs.get(m, {})
+                candidates_ext[m] = candidates[m]
+            continue
+        # NOTE: deliberately NO in_features/out_features here. A packed
+        # group mixes member shapes (gate/up vs down projections), so no
+        # single (out, in) pair describes it — copying members[0]'s shape
+        # would make _shape_from_stats compute ONE member's bytes for the
+        # whole group. Without them _shape_from_stats falls back to the
+        # rank-1 (n_params,) legacy shape, which is at least
+        # total-parameter-consistent; exact byte paths must (and do)
+        # prefer the candidate / _memory_bytes_by_format.
+        stats_ext[super_name] = {
+            "h_trace": sum(
+                float(stats[m].get("h_trace", 0.0) or 0.0) for m in members
+            ),
+            "n_params": n_params,
+            "n_tokens_seen": sum(
+                int(stats[m].get("n_tokens_seen", 0) or 0) for m in members
+            ),
+            "_packed_group_members": members,
+            "_packed_group_key": key,
+            "_memory_bytes_by_format": memory_by_fmt,
+        }
+        costs_ext[super_name] = super_cost
+        candidates_ext[super_name] = cands
+
+    return stats_ext, costs_ext, candidates_ext
+
+
+def expand_packed_group_assignment(assignment: dict[str, str],
+                                   stats_ext: dict) -> dict[str, str]:
+    """Broadcast a packed-serving-group decision back to member tensors."""
+    out = {}
+    for name, fmt in assignment.items():
+        if _PACKED_GROUP_MARKER in name:
+            members = stats_ext[name].get("_packed_group_members", [])
             for m in members:
                 out[m] = fmt
         else:
