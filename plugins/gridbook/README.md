@@ -75,7 +75,10 @@ The CUDA sources live **inside** the package (`gridbook/csrc`, shipped via
 `[tool.setuptools.package-data]` in `pyproject.toml`) and JIT-build on first
 model load; a repo-root-relative `csrc` broke every non-editable install before
 `bf1ada0`. Without `nvcc` the plugin still serves correctly through Triton
-fallbacks — a correctness path, not a speed path. `tp=1` only.
+fallbacks — a correctness path, not a speed path. The shipping CUDA contract
+accepts BF16 activations only. A live tensor-parallel size above one is rejected
+during model construction, as is an FP8-CB target on a device below `sm_89`;
+FP4-CB retains the broader BF16 fallback.
 
 ## Registration and dispatch
 
@@ -221,7 +224,7 @@ The serve scripts pass them through explicitly (`scripts/serve_laguna_smoke.sh:4
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PRISMAQUANT_CB_PREFILL` | `auto` (fp8) / `loop` (fp4) | `stock` · `batched` · `grouped_fused[_r1]` · `l2_pipeline` · `loop` |
+| `PRISMAQUANT_CB_PREFILL` | `auto` (fp8) / `loop` (fp4) | `auto` · `stock` · `batched` · `grouped_fused[_r1]` · `l2_pipeline` · `loop`; unknown spellings fail, and changing it mid-process requires a restart |
 | `PRISMAQUANT_CB_PREFILL_AUTO_FORCE` | unset | pin an `auto` winner without timing (bisection) |
 | `PRISMAQUANT_CB_AUTOTUNE_MIN_M` | 1024 | token floor below which `auto` runs stock and caches nothing |
 | `PRISMAQUANT_CB_FUSED_MIDM` | `1` | `0` disables the mid-M fused prefill |
