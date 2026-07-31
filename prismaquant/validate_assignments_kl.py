@@ -129,6 +129,36 @@ def _assignment_cb_metadata(
     return cb_serialization_metadata_from_assignment_payload(payload)
 
 
+def _merge_cb_identities_for_assignment(
+    assignment: Mapping[str, str],
+    base_identities: Mapping[str, str],
+    candidate_identities: Mapping[str, str],
+) -> dict[str, str]:
+    """Merge base metadata without carrying identities for promoted layers.
+
+    Pareto candidates may be deltas over a CB base assignment.  A candidate
+    that promotes a base layer to a non-CB format must not inherit that
+    layer's old CB identity.  Candidate-owned identities are intentionally
+    *not* filtered: an extra identity written by the candidate itself is stale
+    candidate metadata and the exact stamp validator must reject it.
+    """
+    selected_cb_names = {
+        str(name)
+        for name, fmt in assignment.items()
+        if is_cb_format(fmt)
+    }
+    merged = {
+        str(name): str(value)
+        for name, value in base_identities.items()
+        if str(name) in selected_cb_names
+    }
+    merged.update({
+        str(name): str(value)
+        for name, value in candidate_identities.items()
+    })
+    return merged
+
+
 def _parse_labeled_path(value: str) -> tuple[str, Path]:
     if "=" in value:
         label, path = value.split("=", 1)
@@ -1200,8 +1230,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                     where=f"assignment {label!r}",
                 )
-        identities = dict(base_cb_identities)
-        identities.update(candidate_identities)
+        identities = _merge_cb_identities_for_assignment(
+            assignment,
+            base_cb_identities,
+            candidate_identities,
+        )
         assignment_cb_metadata[(label, path)] = (context, identities)
         # Validate context, every per-layer identity, and once-only sidecars
         # before loading a multi-billion-parameter model.
