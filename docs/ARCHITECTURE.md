@@ -1908,9 +1908,12 @@ keeps vLLM's weight loader off it.
 | §4b persistent-N TC dense prefill | **QUARANTINED** + measured negative (2–5.7× slower) | wired `708d4ff`, verdict `d924d76` | ext builds only under `PRISMAQUANT_ENABLE_PTC=1` (`gb/cuda_ext.py:163-168`, quarantined 2026-07-23 after a boot wedge) |
 | decode contract v2 | measured NULL, opt-in | `d924d76` | — |
 | w2 side-stream overlap; w2 rowpack | **UNMEASURED** — wired but not benched ("not for public sync until benched"); rowpack pending its own served-KL check | `08263af` | — |
+| fp4-CB dense fused prefill: block-scaled decode-in-prologue on the native NVF4 MMA (SASS-gated `OMMA.SF.16864` k=64, zero QMMA — the `f8f6f4` k=32 trap), gmem-direct consumer decode | **OPT-IN, default OFF** (`PRISMAQUANT_CB_FUSED_FP4`) — bit-exact vs the stock NVF4 collective across K12–K24/S13–S16/v1+v2; MEASURED 2026-07-31 (warm, 2.2–2.5 GHz): wins EVERY (rung, M) vs both shipping fp4 paths — 5.2–6.1× vs the transient at M≤128, 1.3–1.5× at M=2048, 2.5–12.4× vs Triton; native ratio 1.65–3.6. Served A/B pending (activation bucket changes) | — | `gb/csrc/cb_fused_fp4_gemm.cu`, `gb/csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp`, `gb/linear.py`; record: `docs/lanes/nvfp4-cb/fp4-fused-prefill.md` |
+| fp4-CB MoE grouped fused prefill (tile-indexed, TileM ∈ {128, 256}) | **OPT-IN, default OFF** (`PRISMAQUANT_CB_FUSED_FP4_MOE`) — bit-exact vs per-expert dense fused at both tiles; MEASURED: 5.2–5.6× the shipping loop kernel-side (tile 128), native-ceiling ratio 1.5–2.1; served A/B pending | — | `gb/csrc/cb_fused_fp4_gemm.cu`, `gb/moe.py` |
 
-fp4-CB MoE prefill is still the per-expert loop (`gb/moe.py:404-405`); persistent/grouped
-decode-in-mainloop for MoE prefill is the roadmap's fat target.
+fp4-CB MoE prefill DEFAULTS to the per-expert loop (`gb/moe.py:404-405`); the grouped
+decode-in-mainloop fp4 kernel above now exists but stays opt-in until the served A/B —
+persistent/grouped large-M remains the roadmap's fat target on the fp8 side too.
 
 **Per-arch wiring — the no-longer-silent no-load trap** (R10, 2026-07-30). Archs whose vLLM
 loader maps experts at the top level never call the per-layer `FusedMoE.load_weights`, so
