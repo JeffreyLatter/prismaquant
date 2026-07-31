@@ -30,6 +30,13 @@ that would go stale the moment the next kernel lands.  The summary prints what
 it skipped for that reason so the exclusion is visible, not silent.
 
 RELEASE POLICY: TWO TIERS (set by Robert, 2026-07-30)
+
+    VERSION IS MANAGED UPSTREAM. `gridbook/__init__.py` carries `__version__`
+    and is a SYNCED file, so bumping the version in the release repo is futile
+    — the next sync reverts it and the tag-vs-build check then fails with
+    "tag vX means version X, but the build produced Y". Bump the version HERE
+    (plugins/gridbook/gridbook/__init__.py), commit, sync, then tag. Learned
+    the hard way on v0.2.0.
 =====================================================
     "nvfp4 kernels are to be made part of gridbook immediately once completed.
      we can hold back amd specific kernels until later once they are validated."
