@@ -37,7 +37,7 @@ def serialized_candidate_payload(
     *,
     qname: str,
     cb_serialization_context: CBSerializationContext | None,
-) -> tuple[int, str | None]:
+) -> tuple[int, str | None, str | None]:
     """Return producer payload bytes + identity for one candidate tensor.
 
     A CB FormatSpec intentionally describes only the historical nominal body;
@@ -47,7 +47,7 @@ def serialized_candidate_payload(
     back into a production-v2 allocation.
     """
     if not is_cb_format(spec.name):
-        return int(spec.memory_bytes_for_shape(shape)), None
+        return int(spec.memory_bytes_for_shape(shape)), None, None
     if cb_serialization_context is None:
         raise ValueError(
             f"{qname}: exact bytes for {spec.name} require an explicit "
@@ -60,7 +60,13 @@ def serialized_candidate_payload(
         qname=qname,
         context=cb_serialization_context,
     )
-    return int(item["tensor_payload_bytes"]), str(item["identity_key"])
+    return (
+        int(item["tensor_payload_bytes"]),
+        (str(item["identity_key"])
+         if item.get("identity_key") is not None else None),
+        (str(item["sidecar_identity_key"])
+         if item.get("sidecar_identity_key") is not None else None),
+    )
 
 
 def _is_passthrough_format(format_name: str) -> bool:
@@ -660,7 +666,11 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 unpriceable.setdefault(name, []).append(spec.name)
                 continue
             source_counts[cost_entry_source(s, entry, spec.name)] += 1
-            memory_bytes, serialized_identity = serialized_candidate_payload(
+            (
+                memory_bytes,
+                serialized_identity,
+                serialized_sidecar_identity,
+            ) = serialized_candidate_payload(
                 spec,
                 shape,
                 qname=name,
@@ -671,12 +681,16 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 s.setdefault("_serialized_identity_by_format", {})[
                     spec.name
                 ] = serialized_identity
+                s.setdefault("_serialized_sidecar_identity_by_format", {})[
+                    spec.name
+                ] = serialized_sidecar_identity
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=8.0 * memory_bytes / max(int(math.prod(shape)), 1),
                 memory_bytes=memory_bytes,
                 predicted_dloss=priced,
                 serialized_identity=serialized_identity,
+                serialized_sidecar_identity=serialized_sidecar_identity,
             ))
         if cands:
             out[name] = cands
@@ -956,6 +970,14 @@ def aggregate_fused_siblings(
                 for identity in (member_by_name[m][spec.name].serialized_identity,)
                 if identity is not None
             })
+            serialized_sidecar_identities = sorted({
+                identity
+                for m in members
+                for identity in (
+                    member_by_name[m][spec.name].serialized_sidecar_identity,
+                )
+                if identity is not None
+            })
             bits_per_param = 8.0 * total_bytes / max(n_params, 1)
             stats_ext[super_name]["_memory_bytes_by_format"][spec.name] = total_bytes
             entry_fmt = super_cost_entry_fmt.get(spec.name, spec.name)
@@ -976,6 +998,13 @@ def aggregate_fused_siblings(
                 serialized_identity=(
                     json.dumps(serialized_identities, separators=(",", ":"))
                     if serialized_identities else None
+                ),
+                serialized_sidecar_identity=(
+                    json.dumps(
+                        serialized_sidecar_identities,
+                        separators=(",", ":"),
+                    )
+                    if serialized_sidecar_identities else None
                 ),
             ))
         if not cands:
@@ -1208,6 +1237,22 @@ def aggregate_packed_serving_groups(
                     }), separators=(",", ":"))
                     if any(
                         member_cands[m][spec.name].serialized_identity is not None
+                        for m in members
+                    ) else None
+                ),
+                serialized_sidecar_identity=(
+                    json.dumps(sorted({
+                        identity
+                        for m in members
+                        for identity in (
+                            member_cands[m][spec.name]
+                            .serialized_sidecar_identity,
+                        )
+                        if identity is not None
+                    }), separators=(",", ":"))
+                    if any(
+                        member_cands[m][spec.name]
+                        .serialized_sidecar_identity is not None
                         for m in members
                     ) else None
                 ),

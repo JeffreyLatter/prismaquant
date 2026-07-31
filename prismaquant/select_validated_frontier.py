@@ -16,6 +16,11 @@ from prismaquant.layer_config import (
     read_layer_config_metadata,
 )
 from prismaquant.saturation_select import find_saturation_bpp
+from prismaquant.nvfp4_cb_footprint import (
+    CB_ASSIGNMENT_IDENTITIES_FIELD,
+    CB_TENSOR_IDENTITY_FIELD,
+    cb_serialization_metadata_from_assignment_payload,
+)
 
 
 def _load_json(path: str | Path):
@@ -79,10 +84,18 @@ def _load_assignment(path: str | Path) -> dict[str, str]:
     }
 
 
-def _layer_config_from_assignment(assignment: Mapping[str, str]) -> dict:
+def _layer_config_from_assignment(
+    assignment: Mapping[str, str],
+    *,
+    cb_serialization_stamps: Mapping[str, object] | None = None,
+) -> dict:
     out = {}
     for name, fmt in sorted(assignment.items()):
         out[str(name)] = fr.get_format(str(fmt).strip().upper()).autoround_config()
+        if cb_serialization_stamps is not None and name in cb_serialization_stamps:
+            out[str(name)][CB_TENSOR_IDENTITY_FIELD] = str(
+                cb_serialization_stamps[name]
+            )
     return out
 
 
@@ -946,20 +959,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "eta": float(eta_value),
                 "source": eta_source,
             })
+    selected_payload = _load_json(selected["path"])
+    selected_cb_context, selected_cb_stamps = (
+        cb_serialization_metadata_from_assignment_payload(selected_payload)
+        if isinstance(selected_payload, Mapping)
+        else (None, {})
+    )
+    selected_cb_stamps = selected_cb_stamps or None
     assignment = _load_assignment(selected["path"])
-    layer_config = _layer_config_from_assignment(assignment)
+    layer_config = _layer_config_from_assignment(
+        assignment,
+        cb_serialization_stamps=selected_cb_stamps,
+    )
 
     layer_config_path = Path(args.output_layer_config)
     # This stage OVERWRITES the allocator's layer_config.json, so it must carry
     # the allocator's reserved metadata forward — the exporter reads the
     # resolved serving profile from there (re-vet R11), and dropping it would
     # re-open the allocator/export profile split this run just closed.
-    carried = read_layer_config_metadata(layer_config_path)
-    if carried:
-        carried = dict(carried)
+    carried = dict(read_layer_config_metadata(layer_config_path))
+    if carried or selected_cb_context is not None:
         carried["selected_by"] = f"validated_frontier:{args.mode}"
         carried["selected_label"] = selected.get("label")
         carried["selected_achieved_bits"] = selected.get("bpp")
+        if selected_cb_context is not None:
+            carried["cb_serialized_payload"] = dict(selected_cb_context)
         layer_config[LAYER_CONFIG_META_KEY] = carried
     layer_config_path.parent.mkdir(parents=True, exist_ok=True)
     layer_config_path.write_text(json.dumps(layer_config, indent=2, sort_keys=True) + "\n")
@@ -969,6 +993,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "selection_mode": args.mode,
         "selected": selected,
         "assignment": dict(sorted(assignment.items())),
+        **({
+            "cb_serialized_payload": dict(selected_cb_context),
+        } if selected_cb_context is not None else {}),
+        **({
+            CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
+                (str(name), str(value))
+                for name, value in selected_cb_stamps.items()
+            )),
+        } if selected_cb_stamps is not None else {}),
     }
     assignment_path = Path(args.output_assignment)
     assignment_path.parent.mkdir(parents=True, exist_ok=True)

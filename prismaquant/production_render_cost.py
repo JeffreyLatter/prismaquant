@@ -313,10 +313,21 @@ def synthesize_production_render_cost_payload(
         baseline_cost_payload.get("meta"),
         baseline_cost_payload.get("provenance"),
     )
+    baseline_provenance = baseline_cost_payload.get("provenance")
+    inherited_provenance = (
+        dict(baseline_provenance)
+        if isinstance(baseline_provenance, Mapping)
+        else {}
+    )
     return {
         "schema": SCHEMA,
         "costs": output_costs,
         "formats": output_formats,
+        # The synthesized table consumes the baseline render for every
+        # fallback and the production cache was built under the same guarded
+        # stage settings. Preserve the CB serialization identity so the
+        # allocator can reject an unknown/stale v1-v2 cache.
+        "provenance": inherited_provenance,
         "meta": {
             # R14: inherited calibration identity — see _calibration_hashes.
             "calib_hashes": calib_hashes,

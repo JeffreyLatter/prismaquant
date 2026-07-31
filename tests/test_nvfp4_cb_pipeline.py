@@ -321,7 +321,19 @@ def _write_alloc_fixture(tmp_path, menu):
     specs = _menu_specs(menu)
     stats, costs = _dense_model(specs)
     probe = {"stats": stats, "meta": {"model": None}}
-    cost_blob = {"costs": costs, "meta": {"formats": list(menu)}}
+    cost_blob = {
+        "costs": costs,
+        "formats": list(menu),
+        "meta": {"formats": list(menu)},
+        "provenance": {
+            "cb_serialized_payload": {
+                "schema": "prismaquant.cb_serialized_payload.v1",
+                "scale_coding": "two_tier",
+                "layout_version": 2,
+                "codebook_source": "lattice",
+            },
+        },
+    }
     p = tmp_path / "probe.pkl"
     c = tmp_path / "cost.pkl"
     p.write_bytes(pickle.dumps(probe))

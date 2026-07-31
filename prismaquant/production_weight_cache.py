@@ -1908,19 +1908,20 @@ def render_production_weight(
 
     if fmt != "NVFP4":
         spec = fr.get_format(fmt)
-        if col_weights is None:
-            baseline = spec.quantize_dequantize(weight.detach().clone()).to(
-                device=weight.device, dtype=weight.dtype,
-            )
-        else:
-            # R3 / Milestone C: the weighted families' one render definition,
-            # shared with the inline cost render and the emulation path.
-            from prismaquant.emu_forward_kl import weighted_quantize_dequantize
+        # R3 / Milestone C: the weighted families' one render definition,
+        # shared with the inline cost render and the emulation path. Calling
+        # it for the unweighted case as well is important for CB: it binds the
+        # v1/v2 reachable scale set to the same serialization context the
+        # cost payload and exporter stamp, while remaining the registry QDQ
+        # for every non-CB format.
+        from prismaquant.emu_forward_kl import weighted_quantize_dequantize
 
-            baseline = weighted_quantize_dequantize(
-                spec, weight.detach(),
-                col_weights.reshape(-1).to(weight.device),
-            ).to(device=weight.device, dtype=weight.dtype)
+        baseline = weighted_quantize_dequantize(
+            spec,
+            weight.detach(),
+            None if col_weights is None
+            else col_weights.reshape(-1).to(weight.device),
+        ).to(device=weight.device, dtype=weight.dtype)
         reference = weight.detach().to(torch.float32)
         acts = activations.get(qname)
         acts_for_render = (

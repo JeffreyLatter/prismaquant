@@ -64,6 +64,7 @@ from .measure_quant_cost import (
     _finalize_results,
     _measure_packed_experts,
     _normalize_fisher_output_mse_row_weights,
+    cost_payload_provenance,
     h_detail_expected_norm_tokens,
     measure_batched_gpu,
     measure_unbatched,
@@ -76,6 +77,10 @@ from .streaming_model import (
     _build_streaming_context,
     _classify_shard,
 )
+from .nvfp4_cb_footprint import (
+    cb_serialization_context_from_env,
+    validate_cb_cost_provenance,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +92,13 @@ from .streaming_model import (
 _PIPELINE_COST_MODE = ""
 
 
-def _cost_mode_provenance() -> dict:
-    return {"cost_mode": _PIPELINE_COST_MODE} if _PIPELINE_COST_MODE else {}
+def _cost_mode_provenance(
+    specs: list[fr.FormatSpec] | None = None,
+) -> dict:
+    out = {"cost_mode": _PIPELINE_COST_MODE} if _PIPELINE_COST_MODE else {}
+    if specs:
+        out.update(cost_payload_provenance(specs))
+    return out
 
 
 def merge_cost_pickles(paths: list[Path], output_path: Path):
@@ -105,6 +115,17 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
         merged_costs.update(costs)
         if merged_formats is None:
             merged_formats = data.get("formats", [])
+        elif list(data.get("formats", [])) != list(merged_formats):
+            raise ValueError(
+                f"cost shard {path} format menu differs from the first "
+                f"shard: {data.get('formats', [])!r} != {merged_formats!r}"
+            )
+        validate_cb_cost_provenance(
+            data,
+            data.get("formats", []),
+            context=cb_serialization_context_from_env(),
+            where=f"incremental cost shard {path}",
+        )
         shard_metas.append(data.get("meta", {}))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +144,9 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
         pickle.dump({
             "costs": merged_costs,
             "formats": merged_formats or [],
-            "provenance": _cost_mode_provenance(),
+            "provenance": _cost_mode_provenance(
+                [fr.get_format(name) for name in (merged_formats or [])]
+            ),
             "meta": {
                 "incremental": True,
                 "n_shards": len(paths),
@@ -160,6 +183,10 @@ def _expected_cost_shard_meta(*,
         "shard_idx": shard_idx,
         "formats": list(formats),
         "n_linears_expected": int(n_linears_expected),
+        # Persisted in each shard's annotated metadata, so changing the FP4
+        # layout or codebook-sharing policy invalidates shard reuse before a
+        # merged cost table can be stamped with a different identity.
+        **cost_payload_provenance([fr.get_format(name) for name in formats]),
     }
     if render_path != "registry":
         meta["render_path"] = render_path
@@ -512,6 +539,7 @@ def _run_body_cost_shard(
             pickle.dump({
                 "costs": {},
                 "formats": [s.name for s in specs],
+                "provenance": _cost_mode_provenance(specs),
                 "meta": {
                     "model": model_name,
                     "probe": probe_path,
@@ -575,7 +603,7 @@ def _run_body_cost_shard(
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
-            "provenance": _cost_mode_provenance(),
+            "provenance": _cost_mode_provenance(specs),
             "meta": {
                 "model": model_name,
                 "probe": probe_path,
@@ -634,6 +662,7 @@ def _run_mtp_cost_shard(
             pickle.dump({
                 "costs": {},
                 "formats": [s.name for s in specs],
+                "provenance": _cost_mode_provenance(specs),
                 "meta": {
                     "model": model_name,
                     "probe": probe_path,
@@ -695,6 +724,7 @@ def _run_mtp_cost_shard(
             pickle.dump({
                 "costs": {},
                 "formats": [s.name for s in specs],
+                "provenance": _cost_mode_provenance(specs),
                 "meta": {
                     "model": model_name,
                     "probe": probe_path,
@@ -736,6 +766,7 @@ def _run_mtp_cost_shard(
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": _cost_mode_provenance(specs),
             "meta": {
                 "model": model_name,
                 "probe": probe_path,
@@ -764,6 +795,7 @@ def _write_empty_cost_shard(
         pickle.dump({
             "costs": {},
             "formats": [s.name for s in specs],
+            "provenance": _cost_mode_provenance(specs),
             "meta": {
                 "model": model_name,
                 "probe": probe_path,
@@ -923,6 +955,7 @@ def _run_visual_cost_shard(
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": _cost_mode_provenance(specs),
             "meta": {
                 "model": model_name,
                 "probe": probe_path,

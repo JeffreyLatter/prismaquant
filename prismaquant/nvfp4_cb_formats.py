@@ -1180,10 +1180,10 @@ def _sweep_encode_two_tier_moment(w2d: torch.Tensor, mode: str, cb,
     reachable set. Selection order and tie rules mirror the exact path
     (strict <, first-legal wins).
 
-    NOTE: layout-v2 is opt-in (CB_SCALE_CODING=v1 is the pipeline default and
-    the critical 27B/35B path); its W*16 windowed-entry search does not batch
-    cleanly (the launch-bound fix targets the v1 fp8 lane), so this keeps the
-    original bit-preserving structure."""
+    NOTE: layout-v2 is the production writer default. Its W*16
+    windowed-entry search does not batch cleanly (the launch-bound fix targets
+    the v1/fp8-shaped search), so this keeps the original bit-preserving
+    structure. Legacy-v1 remains an explicit read/reproduction mode."""
     rows, in_f = w2d.shape
     n_sb = in_f // SUPERBLOCK
     dev = str(w2d.device)
@@ -1341,8 +1341,9 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
 
     ``scale_coding``: ``"v1"`` (default; bare e4m3 plane) or ``"two_tier"``
     (layout v2, fp4 only: per-superblock E8M0 super + 4-bit sub codes; the
-    stored plane is still the composed E4M3-exact per-group scale). v2 stays
-    opt-in until the spec's serving gates (G1/G3/G4) clear.
+    stored plane is still the composed E4M3-exact per-group scale). The low-
+    level codec defaults to v1 for read compatibility; production callers bind
+    an explicit serialization context and select v2.
 
     Returns at least {"indices", "scales"}; the resolved codebook is echoed
     back under "codebook" so reconstruct and the packer share one table.

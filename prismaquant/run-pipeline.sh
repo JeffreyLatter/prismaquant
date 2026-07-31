@@ -91,6 +91,10 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # final export must describe the same layout and shared sidecars.
   : "${CB_CODEBOOK_SOURCE:=lattice}"
   : "${CB_SCALE_CODING:=two_tier}"
+  # Cost renderers resolve CBSerializationContext from the environment. These
+  # must be exported (not merely shell locals) or a legacy-v1/default split can
+  # recur between the Python cost process and the exporter CLI.
+  export CB_CODEBOOK_SOURCE CB_SCALE_CODING
 fi
 if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   : "${ACTIVATION_ROWS_LIMIT:=1024}"
@@ -741,6 +745,8 @@ STAGE_SETTINGS_ENV=(
   "CB_EXPERT_SEQLEN=$CB_EXPERT_SEQLEN"
   "CB_EXPERT_SAMPLE=$CB_EXPERT_SAMPLE"
   "CB_LADDER_INTERP=$CB_LADDER_INTERP"
+  "CB_SCALE_CODING=${CB_SCALE_CODING:-}"
+  "CB_CODEBOOK_SOURCE=${CB_CODEBOOK_SOURCE:-}"
   "VALIDATED_FRONTIER_DATASET=$VALIDATED_FRONTIER_DATASET"
   "VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES"
   "VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN"

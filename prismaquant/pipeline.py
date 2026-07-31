@@ -64,6 +64,14 @@ _RENDER_SETTINGS: tuple[str, ...] = (
     "PRODUCTION_CACHE_DISABLE_LEVERS",
 )
 
+# CB scale coding changes the reachable FP4 reconstruction as well as bytes;
+# codebook source changes the shared sidecar/render identity.  Every persisted
+# cost/render artifact must invalidate on either change.
+_CB_SERIALIZATION_SETTINGS: tuple[str, ...] = (
+    "CB_SCALE_CODING",
+    "CB_CODEBOOK_SOURCE",
+)
+
 
 def _key_pairs(*specs: str) -> tuple[tuple[str, str], ...]:
     """``"NS<-PRODUCTION_RENDER_COST_NSAMPLES"`` -> ``("NS", "PRODUCTION_…")``."""
@@ -89,6 +97,7 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
     # probe guard already pins).
     "base-cost": _key_pairs(
         "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "FORMATS",
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     # production-render-score: the rendered format-menu cache the score reads.
     "render-cost-cache": _key_pairs(
@@ -97,6 +106,7 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
         "SL<-PRODUCTION_RENDER_COST_SEQLEN",
         "SEED<-PRODUCTION_RENDER_COST_SEED",
         *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     # …and the allocator cost table synthesized from it. Cheap to rebuild, so
     # it carries the score field and the require-flags too.
@@ -105,6 +115,7 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
         "SCORE_FIELD<-PRODUCTION_RENDER_COST_SCORE_FIELD",
         "REQUIRE_SCORES<-PRODUCTION_RENDER_COST_REQUIRE_SCORES",
         "REQUIRE_OUTPUT<-PRODUCTION_RENDER_COST_REQUIRE_OUTPUT",
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     # AURA dW cache. FORMATS is the derived non-BF16 menu (AURA_CACHE_FORMATS);
     # SELECTION_MODE is keyed because validated-surrogate redirects this cache
@@ -114,6 +125,7 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
         "FORMATS<-AURA_CACHE_FORMATS",
         "NS<-NSAMPLES", "SL<-SEQLEN", "SELECTION_MODE",
         *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     "aura-cost": _key_pairs(
         "MODEL_PATH", "DATASET", "FORMATS", "COST_MODE",
@@ -122,11 +134,13 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
         "SL<-AURA_COST_SEQLEN",
         "SEED<-AURA_COST_CALIB_SEED",
         "DTYPE<-AURA_COST_DTYPE",
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     "aura-hybrid-cost": _key_pairs(
         "MODEL_PATH", "DATASET", "FORMATS", "COST_MODE",
         "EXPERT_NS<-AURA_EXPERT_NSAMPLES",
         "EXPERT_SL<-AURA_EXPERT_SEQLEN",
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     # --- CB lane -----------------------------------------------------------
     # The imatrix harvest reads the probe's activation cache; key it on what
@@ -140,27 +154,32 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
         "EXPERT_SL<-CB_EXPERT_SEQLEN",
         "EXPERT_SAMPLE<-CB_EXPERT_SAMPLE",
         "LADDER_INTERP<-CB_LADDER_INTERP",
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     # --- production caches -------------------------------------------------
     "frontier-cache": _key_pairs(
         "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
         "FORMATS<-CACHE_FORMATS",
         *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     "frontier-recache": _key_pairs(
         "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
         *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     "production-cache-recached": _key_pairs(
         "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "FORMATS", "TARGET_BITS",
         "ASSIGNMENT_DIGEST",
         *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     "production-cache-raw": _key_pairs(
         "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
         "FORMATS<-CACHE_FORMATS", "ASSIGNMENT_DIGEST",
         "RENDER_SCOPE<-PRODUCTION_CACHE_RENDER_SCOPE",
         *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     # --- validated frontier ------------------------------------------------
     # One JSON per Pareto point; the point's identity is in the filename, so
@@ -175,6 +194,7 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
         "SKIP_CALIB<-VALIDATED_FRONTIER_CALIB_SKIP_FIRST",
         "KL_SCOPE<-VALIDATED_FRONTIER_KL_SCOPE",
         *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
     ),
     # --- GGUF lane ---------------------------------------------------------
     # llama.cpp's converter reads only the checkpoint.

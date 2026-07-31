@@ -300,6 +300,73 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
     assert selected["label"] == "candidate"
 
 
+def test_selector_preserves_cb_global_and_per_layer_serialization_identity(
+    tmp_path,
+):
+    context = {
+        "schema": "prismaquant.cb_serialized_payload.v1",
+        "scale_coding": "two_tier",
+        "layout_version": 2,
+        "codebook_source": "lattice",
+    }
+    identity = "exact-tensor-identity"
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "schema": "prismaquant.allocator.pareto_assignment.v1",
+        "cb_serialized_payload": context,
+        "cb_serialized_identities": {
+            "model.layers.0.self_attn.q_proj": identity,
+        },
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4_CB_K16",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+            "format_counts": {"NVFP4_CB_K16": 1},
+        }],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+    summary = tmp_path / "selection.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(summary),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    emitted_layer = json.loads(layer_config.read_text())
+    assert emitted_layer["__prismaquant__"]["cb_serialized_payload"] == context
+    assert emitted_layer["model.layers.0.self_attn.q_proj"][
+        "cb_serialized_identity"
+    ] == identity
+    emitted_assignment = json.loads(assignment_out.read_text())
+    assert emitted_assignment["cb_serialized_payload"] == context
+    assert emitted_assignment["cb_serialized_identities"] == {
+        "model.layers.0.self_attn.q_proj": identity,
+    }
+
+
 def test_select_validated_frontier_diagnostics_include_dominated_rows(tmp_path):
     assignment_paths = {}
     for label in ("a", "b", "c"):

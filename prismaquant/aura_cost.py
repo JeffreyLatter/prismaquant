@@ -51,6 +51,12 @@ from prismaquant.kl_fisher import (
     token_count_for_logits,
 )
 from prismaquant.perturbed_x_cache import calibration_data_hash
+from prismaquant.nvfp4_cb_footprint import (
+    cb_cost_provenance,
+    cb_quantize_dequantize_for_context,
+    cb_serialization_context_from_env,
+    is_cb_format,
+)
 
 SCHEMA = "prismaquant.aura_cost.v1"
 
@@ -230,7 +236,16 @@ def _delta_w(
     if qdq is None:
         return None
     try:
-        return qdq(weight.float()) - weight.float(), "rtn"
+        rendered = (
+            cb_quantize_dequantize_for_context(
+                spec,
+                weight.float(),
+                context=cb_serialization_context_from_env(),
+            )
+            if is_cb_format(spec.name)
+            else qdq(weight.float())
+        )
+        return rendered - weight.float(), "rtn"
     except Exception:
         return None
 
@@ -755,6 +770,7 @@ def compute_aura_cost(
             "dw_rendered_rows": n_rendered,
             "dw_rtn_fallback_rows": n_rtn,
             "git_commit": _git_commit(),
+            **cb_cost_provenance(fmts),
         },
     }
 

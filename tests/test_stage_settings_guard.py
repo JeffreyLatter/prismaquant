@@ -160,7 +160,8 @@ def test_late_override_resolves_a_missing_key(tmp_path):
                     FORMATS="NVFP4", TARGET_BITS="4.75",
                     PRISMAQUANT_NVFP4_SCALE_RULE="", PRISMAQUANT_GPTQ_DAMP_SWEEP="0",
                     PRISMAQUANT_GPTQ_DAMP="", PRISMAQUANT_ACT_CLIP_QUANTILE="0.999",
-                    PRODUCTION_CACHE_LEVERS="gptq", PRODUCTION_CACHE_DISABLE_LEVERS="")
+                    PRODUCTION_CACHE_LEVERS="gptq", PRODUCTION_CACHE_DISABLE_LEVERS="",
+                    CB_SCALE_CODING="", CB_CODEBOOK_SOURCE="")
     artifact = tmp_path / "recached.pkl"
     assert doc["unresolved"]["production-cache-recached"] == ["ASSIGNMENT_DIGEST"]
     code, _ = pipeline.check_stage_settings(

@@ -38,6 +38,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import format_registry as fr
+from .nvfp4_cb_footprint import (
+    cb_cost_provenance,
+    cb_quantize_dequantize_for_context,
+    cb_serialization_context_from_env,
+)
+
+
+def _cb_cost_quantize_dequantize(
+    spec: fr.FormatSpec,
+    weight: torch.Tensor,
+    *,
+    col_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Render CB weights under the producer context stamped on cost.pkl."""
+    return cb_quantize_dequantize_for_context(
+        spec,
+        weight,
+        context=cb_serialization_context_from_env(),
+        col_weights=col_weights,
+    )
+
+
+def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
+    """Identity fields shared by monolithic and incremental cost writers."""
+    return cb_cost_provenance(specs)
 
 
 def _packed_expert_parent_for_projection(profile, projection_name: str) -> str | None:
@@ -713,11 +738,15 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                     W_hat = gguf_quantize_dequantize(
                         W.clone(), spec.name, col_weights=gguf_qw,
                     )
-                elif spec.family in _CB_COST_FAMILIES and gguf_qw is not None:
-                    # Lockstep: the CB exporter ships imatrix-weighted VQ bytes,
-                    # so the cost render applies the same col_weights.
-                    W_hat = spec.quantize_dequantize(
-                        W.clone(), col_weights=gguf_qw,
+                elif spec.family in _CB_COST_FAMILIES:
+                    # Lockstep: layout-v1/v2 changes the reachable FP4 scale
+                    # set, not just its byte count. Render under the same
+                    # CBSerializationContext the cost payload records and the
+                    # exporter later validates.
+                    W_hat = _cb_cost_quantize_dequantize(
+                        spec,
+                        W.clone(),
+                        col_weights=gguf_qw,
                     )
                 else:
                     W_hat = spec.quantize_dequantize(W.clone())
@@ -1524,7 +1553,8 @@ def _batched_quantize(
         # scales are per-group-16, fp8 scales per-output-channel; lattice fixed).
         n = stacked_w.shape[0]
         return torch.stack([
-            spec.quantize_dequantize(
+            _cb_cost_quantize_dequantize(
+                spec,
                 stacked_w[i].clone(),
                 col_weights=_item_col_weights(col_weights, i, n),
             )
@@ -2160,6 +2190,7 @@ def run_cost_pass(model: nn.Module,
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": cost_payload_provenance(specs),
             "meta": {
                 "model": model_name,
                 "probe": probe_path,

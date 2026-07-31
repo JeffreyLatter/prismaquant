@@ -46,6 +46,14 @@ from prismaquant.layer_config import (
     is_layer_config_meta_key,
 )
 from prismaquant.model_profiles import detect_profile_with_warning
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_serialization_metadata_from_assignment_payload,
+    cb_serialization_context_from_stamp,
+    is_cb_format,
+    validate_cb_cost_provenance,
+    validate_cb_serialization_context_stamp,
+)
 from prismaquant.kl_measurement import (
     assignment_bit_total,
     assignment_hash,
@@ -111,6 +119,16 @@ def load_assignment_json(path: str | Path, base: Mapping[str, str] | None = None
     return assignment
 
 
+def _assignment_cb_metadata(
+    path: str | Path,
+) -> tuple[Mapping[str, object] | None, dict[str, str]]:
+    """Read global + per-tensor CB identity without changing assignment API."""
+    payload = _load_json(path)
+    if not isinstance(payload, Mapping):
+        return None, {}
+    return cb_serialization_metadata_from_assignment_payload(payload)
+
+
 def _parse_labeled_path(value: str) -> tuple[str, Path]:
     if "=" in value:
         label, path = value.split("=", 1)
@@ -142,6 +160,9 @@ def _assignment_bpp_details(
     specs_by_name: Mapping[str, fr.FormatSpec],
     *,
     profile=None,
+    cb_serialization_context: CBSerializationContext | None = None,
+    cb_serialization_stamps: Mapping[str, object] | None = None,
+    where: str = "assignment bpp",
 ) -> dict[str, float | int]:
     names = [
         name for name, fmt in assignment.items()
@@ -156,8 +177,25 @@ def _assignment_bpp_details(
             "quantizable_params": 0,
         }
     filtered_assignment = {name: assignment[name] for name in names}
+    filtered_cb_stamps = (
+        {
+            name: cb_serialization_stamps[name]
+            for name in names
+            if cb_serialization_stamps is not None
+            and name in cb_serialization_stamps
+        }
+        if cb_serialization_stamps is not None
+        else None
+    )
     return {
-        "bpp": assignment_bit_total(stats, filtered_assignment, specs_by_name) / float(total_params),
+        "bpp": assignment_bit_total(
+            stats,
+            filtered_assignment,
+            specs_by_name,
+            cb_serialization_context=cb_serialization_context,
+            cb_serialization_stamps=filtered_cb_stamps,
+            where=where,
+        ) / float(total_params),
         "quantizable_entries": len(names),
         "excluded_entries": sum(
             1 for name, fmt in assignment.items()
@@ -173,6 +211,8 @@ def _assignment_bpp(
     specs_by_name: Mapping[str, fr.FormatSpec],
     *,
     profile=None,
+    cb_serialization_context: CBSerializationContext | None = None,
+    cb_serialization_stamps: Mapping[str, object] | None = None,
 ) -> float:
     return float(
         _assignment_bpp_details(
@@ -180,6 +220,8 @@ def _assignment_bpp(
             assignment,
             specs_by_name,
             profile=profile,
+            cb_serialization_context=cb_serialization_context,
+            cb_serialization_stamps=cb_serialization_stamps,
         )["bpp"]
     )
 
@@ -1117,16 +1159,67 @@ def main(argv: Sequence[str] | None = None) -> int:
         _load_costs(args.costs, calib_hashes_out=cost_calib_hashes)
         if args.costs else None
     )
+    cost_payload_for_identity = None
+    if args.costs:
+        with Path(args.costs).open("rb") as fh:
+            cost_payload_for_identity = pickle.load(fh)
     specs = [fr.get_format(part.strip()) for part in args.formats.split(",") if part.strip()]
     specs_by_name = {spec.name: spec for spec in specs}
     specs_by_name.update({fr.canonical_format_name(spec.name): spec for spec in specs})
 
     base_assignment = load_assignment_json(args.base_assignment)
+    base_cb_stamp, base_cb_identities = _assignment_cb_metadata(
+        args.base_assignment
+    )
     labeled_paths = [_parse_labeled_path(value) for value in args.assignment]
     assignments = [
         (label, load_assignment_json(path, base=base_assignment), str(path))
         for label, path in labeled_paths
     ]
+    assignment_cb_metadata: dict[
+        tuple[str, str], tuple[CBSerializationContext | None, dict[str, str]]
+    ] = {}
+    for (label, assignment, path), (_path_label, raw_path) in zip(
+        assignments, labeled_paths
+    ):
+        candidate_stamp, candidate_identities = _assignment_cb_metadata(raw_path)
+        has_cb = any(is_cb_format(fmt) for fmt in assignment.values())
+        context = None
+        if has_cb:
+            resolved_stamp = candidate_stamp or base_cb_stamp
+            context = cb_serialization_context_from_stamp(
+                resolved_stamp,
+                where=f"assignment {label!r}",
+            )
+            if base_cb_stamp is not None and candidate_stamp is not None:
+                validate_cb_serialization_context_stamp(
+                    candidate_stamp,
+                    cb_serialization_context_from_stamp(
+                        base_cb_stamp,
+                        where=f"base assignment {args.base_assignment}",
+                    ),
+                    where=f"assignment {label!r}",
+                )
+        identities = dict(base_cb_identities)
+        identities.update(candidate_identities)
+        assignment_cb_metadata[(label, path)] = (context, identities)
+        # Validate context, every per-layer identity, and once-only sidecars
+        # before loading a multi-billion-parameter model.
+        assignment_bit_total(
+            stats,
+            assignment,
+            specs_by_name,
+            cb_serialization_context=context,
+            cb_serialization_stamps=identities,
+            where=f"assignment {label!r} ({path})",
+        )
+        if has_cb and cost_payload_for_identity is not None:
+            validate_cb_cost_provenance(
+                cost_payload_for_identity,
+                list(assignment.values()),
+                context=context,
+                where=f"validate-kl cost cache {args.costs}",
+            )
 
     device_str = _device_arg(args.device)
     device = require_cuda_hot_path("validate_assignments_kl", device_str)
@@ -1536,6 +1629,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 assignment,
                 specs_by_name,
                 profile=profile,
+                cb_serialization_context=assignment_cb_metadata[
+                    (label, path)
+                ][0],
+                cb_serialization_stamps=assignment_cb_metadata[
+                    (label, path)
+                ][1],
+                where=f"assignment {label!r} ({path})",
             )
             result = {
                 "label": label,

@@ -95,6 +95,20 @@ def weighted_quantize_dequantize(
         from .gguf_formats import gguf_quantize_dequantize
         cw = None if col_weights is None else col_weights.to(w.device)
         return gguf_quantize_dequantize(w.clone(), spec.name, col_weights=cw)
+    if spec.family in {"nvfp4_cb", "fp8_cb"}:
+        from .nvfp4_cb_footprint import (
+            cb_quantize_dequantize_for_context,
+            cb_serialization_context_from_env,
+        )
+
+        return cb_quantize_dequantize_for_context(
+            spec,
+            w.clone(),
+            context=cb_serialization_context_from_env(),
+            col_weights=(
+                None if col_weights is None else col_weights.to(w.device)
+            ),
+        )
     if col_weights is not None and _qdq_accepts_col_weights(spec):
         return spec.quantize_dequantize(w.clone(), col_weights=col_weights.to(w.device))
     return spec.quantize_dequantize(w.clone())

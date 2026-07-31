@@ -36,6 +36,8 @@ CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v1"
 CB_EXPORT_ARTIFACT_INVENTORY_SCHEMA = (
     "prismaquant.cb_export_artifact_inventory.v1"
 )
+CB_TENSOR_IDENTITY_FIELD = "cb_serialized_identity"
+CB_ASSIGNMENT_IDENTITIES_FIELD = "cb_serialized_identities"
 PRODUCTION_FP4_SCALE_CODING = "two_tier"
 LEGACY_FP4_SCALE_CODING = "v1"
 _SCALE_CODINGS = {PRODUCTION_FP4_SCALE_CODING, LEGACY_FP4_SCALE_CODING}
@@ -47,6 +49,27 @@ _FP16_BYTES = 2
 _FP32_BYTES = 4
 _SUPERBLOCK = 256
 _VEC_DIM = 8
+
+_SAFETENSORS_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "F8_E4M3FNUZ": 1,
+    "F8_E5M2": 1,
+    "F8_E5M2FNUZ": 1,
+    "U16": 2,
+    "I16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "U32": 4,
+    "I32": 4,
+    "F32": 4,
+    "U64": 8,
+    "I64": 8,
+    "F64": 8,
+}
 
 _CB_NAME_RE = re.compile(r"^(NVFP4|FP8)_CB_([KS])(\d+)$")
 
@@ -145,6 +168,79 @@ def cb_serialization_context_stamp(context: CBSerializationContext) -> dict:
     }
 
 
+def cb_serialization_context_from_stamp(
+    stamp: Mapping[str, object] | None,
+    *,
+    where: str,
+) -> CBSerializationContext:
+    """Rehydrate a context stamp, rejecting partial or stale identities.
+
+    A CB assignment cannot be priced from a format label alone: FP4 layout
+    version and codebook sharing both affect serialized bytes.  Consumers of
+    persisted assignments therefore use this strict inverse instead of
+    filling absent fields with whichever defaults happen to be current.
+    """
+    if not isinstance(stamp, Mapping):
+        raise ValueError(
+            f"{where}: CB assignment is missing its serialized-payload "
+            "context stamp"
+        )
+    if stamp.get("schema") != CB_SERIALIZED_PAYLOAD_SCHEMA:
+        raise ValueError(
+            f"{where}: unsupported CB serialized-payload schema "
+            f"{stamp.get('schema')!r}"
+        )
+    missing = [
+        key for key in ("scale_coding", "layout_version", "codebook_source")
+        if stamp.get(key) is None
+    ]
+    if missing:
+        raise ValueError(
+            f"{where}: CB serialized-payload context is missing {missing}"
+        )
+    return CBSerializationContext(
+        scale_coding=str(stamp["scale_coding"]),
+        layout_version=int(stamp["layout_version"]),
+        codebook_source=str(stamp["codebook_source"]),
+    )
+
+
+def cb_serialization_context_from_env(
+    environ: Mapping[str, str] | None = None,
+    *,
+    require_explicit: bool = False,
+    where: str = "CB cost render",
+) -> CBSerializationContext:
+    """Resolve the producer identity used by a CB render.
+
+    Production defaults are v2/lattice.  Pipeline stages pass both variables
+    explicitly and stamp them into their cache provenance; the defaults keep
+    direct library calls aligned with the production writer.  Callers that
+    consume an existing artifact use ``require_explicit=True`` so absence is
+    never mistaken for proof that a cache used today's defaults.
+    """
+    if environ is None:
+        import os
+
+        environ = os.environ
+    scale = environ.get("CB_SCALE_CODING")
+    source = environ.get("CB_CODEBOOK_SOURCE")
+    if require_explicit and (not scale or not source):
+        missing = [
+            name for name, value in (
+                ("CB_SCALE_CODING", scale),
+                ("CB_CODEBOOK_SOURCE", source),
+            ) if not value
+        ]
+        raise ValueError(
+            f"{where}: missing explicit CB producer setting(s) {missing}"
+        )
+    return CBSerializationContext(
+        scale_coding=scale or PRODUCTION_FP4_SCALE_CODING,
+        codebook_source=source or "lattice",
+    )
+
+
 def validate_cb_serialization_context_stamp(
     stamp: Mapping[str, object] | None,
     context: CBSerializationContext,
@@ -170,6 +266,46 @@ def validate_cb_serialization_context_stamp(
         )
 
 
+def cb_cost_provenance(
+    formats: Sequence[str | fr.FormatSpec],
+    *,
+    context: CBSerializationContext | None = None,
+) -> dict:
+    """Return the CB identity fragment for a measured-cost payload."""
+    names = [item.name if isinstance(item, fr.FormatSpec) else str(item)
+             for item in formats]
+    if not any(is_cb_format(name) for name in names):
+        return {}
+    ctx = context or cb_serialization_context_from_env()
+    return {"cb_serialized_payload": cb_serialization_context_stamp(ctx)}
+
+
+def validate_cb_cost_provenance(
+    payload: Mapping[str, object],
+    formats: Sequence[str | fr.FormatSpec],
+    *,
+    context: CBSerializationContext,
+    where: str,
+) -> None:
+    """Fail closed when a CB cost table lacks or mismatches render identity."""
+    names = [item.name if isinstance(item, fr.FormatSpec) else str(item)
+             for item in formats]
+    if not any(is_cb_format(name) for name in names):
+        return
+    provenance = payload.get("provenance")
+    stamp = (
+        provenance.get("cb_serialized_payload")
+        if isinstance(provenance, Mapping)
+        else None
+    )
+    if stamp is None:
+        raise ValueError(
+            f"{where}: CB cost payload has no serialized-payload identity; "
+            "refusing a cache whose scale layout/codebook source is unknown"
+        )
+    validate_cb_serialization_context_stamp(stamp, context, where=where)
+
+
 def _cb_info(format_name: str) -> tuple[str, str, int] | None:
     """Return ``(grid, mode, k)`` for a registered CB format."""
     canonical = str(format_name).strip().upper()
@@ -192,6 +328,161 @@ def _cb_info(format_name: str) -> tuple[str, str, int] | None:
 
 def is_cb_format(format_name: str) -> bool:
     return _cb_info(format_name) is not None
+
+
+def cb_quantize_dequantize_for_context(
+    spec: fr.FormatSpec,
+    weight,
+    *,
+    context: CBSerializationContext,
+    col_weights=None,
+    codebook=None,
+):
+    """Render a CB weight under the exact artifact serialization context.
+
+    The v1 and v2 FP4 layouts have different reachable scale sets, so this is
+    a correctness contract, not merely a byte-pricing option.  FP8-CB has no
+    FP4 scale plane; it still requires the context so the measured result is
+    stamped with the same codebook-sharing identity as allocation/export.
+    """
+    info = _cb_info(spec.name)
+    if info is None:
+        raise ValueError(f"{spec.name!r} is not a CB format")
+    grid, mode, k = info
+    from .nvfp4_cb_formats import (
+        SCALE_CODING_V1,
+        nvfp4_cb_fields,
+        nvfp4_cb_reconstruct,
+    )
+
+    if context.codebook_source == "learned" and codebook is None:
+        raise ValueError(
+            f"{spec.name}: learned-codebook cost render requires the exact "
+            "materialized codebook; refusing to render the lattice and stamp "
+            "it as learned"
+        )
+    coding = context.scale_coding if grid == "fp4" else SCALE_CODING_V1
+    fields = nvfp4_cb_fields(
+        weight,
+        k,
+        grid=grid,
+        mode=mode,
+        col_weights=col_weights,
+        codebook=codebook,
+        scale_coding=coding,
+    )
+    return nvfp4_cb_reconstruct(
+        fields,
+        k,
+        grid=grid,
+        mode=mode,
+    ).to(weight.dtype)
+
+
+def cb_tensor_serialization_stamp(
+    format_name: str,
+    shape: tuple[int, ...] | Sequence[int],
+    *,
+    qname: str,
+    context: CBSerializationContext,
+) -> str:
+    """Canonical per-tensor identity persisted beside an assignment."""
+    return str(cb_tensor_payload_breakdown(
+        format_name,
+        shape,
+        qname=qname,
+        context=context,
+    )["identity_key"])
+
+
+def cb_assignment_serialization_stamps(
+    assignment: Mapping[str, str],
+    shapes: Mapping[str, tuple[int, ...] | Sequence[int]],
+    *,
+    context: CBSerializationContext,
+) -> dict[str, str]:
+    """Return exact per-CB-tensor identities for a concrete assignment."""
+    return {
+        str(qname): cb_tensor_serialization_stamp(
+            format_name,
+            shapes[qname],
+            qname=str(qname),
+            context=context,
+        )
+        for qname, format_name in assignment.items()
+        if is_cb_format(format_name)
+    }
+
+
+def validate_cb_assignment_serialization_stamps(
+    assignment: Mapping[str, str],
+    shapes: Mapping[str, tuple[int, ...] | Sequence[int]],
+    *,
+    context: CBSerializationContext,
+    stamps: Mapping[str, object] | None,
+    where: str,
+) -> dict[str, str]:
+    """Require exact per-layer identities before consuming CB byte totals."""
+    expected = cb_assignment_serialization_stamps(
+        assignment, shapes, context=context
+    )
+    if not expected:
+        return {}
+    if not isinstance(stamps, Mapping):
+        raise ValueError(
+            f"{where}: CB assignment is missing per-layer serialization "
+            "stamps"
+        )
+    observed = {
+        str(name): str(value)
+        for name, value in stamps.items()
+        if str(name) in expected
+    }
+    missing = sorted(set(expected) - set(observed))
+    extra = sorted(
+        name for name in stamps
+        if str(name) not in expected and is_cb_format(assignment.get(str(name), ""))
+    )
+    mismatched = sorted(
+        name for name in expected
+        if name in observed and observed[name] != expected[name]
+    )
+    if missing or extra or mismatched:
+        raise ValueError(
+            f"{where}: CB per-layer serialization identity mismatch: "
+            f"missing={missing[:8]}, extra={extra[:8]}, "
+            f"mismatched={mismatched[:8]}"
+        )
+    return expected
+
+
+def cb_serialization_metadata_from_assignment_payload(
+    payload: Mapping[str, object],
+) -> tuple[Mapping[str, object] | None, dict[str, str]]:
+    """Extract global/per-tensor CB stamps from layer or Pareto JSON."""
+    raw_assignment = payload.get("assignment")
+    if not isinstance(raw_assignment, Mapping):
+        raw_assignment = payload
+    meta = payload.get("__prismaquant__")
+    context_stamp = (
+        meta.get("cb_serialized_payload")
+        if isinstance(meta, Mapping)
+        else None
+    )
+    if context_stamp is None:
+        context_stamp = payload.get("cb_serialized_payload")
+    identities: dict[str, str] = {}
+    top_level = payload.get(CB_ASSIGNMENT_IDENTITIES_FIELD)
+    if isinstance(top_level, Mapping):
+        identities.update({str(name): str(value)
+                           for name, value in top_level.items()})
+    for name, entry in raw_assignment.items():
+        if isinstance(entry, Mapping) and entry.get(CB_TENSOR_IDENTITY_FIELD):
+            identities[str(name)] = str(entry[CB_TENSOR_IDENTITY_FIELD])
+    return (
+        context_stamp if isinstance(context_stamp, Mapping) else None,
+        identities,
+    )
 
 
 def _bit_split(k: int, n_sub: int) -> tuple[int, ...]:
@@ -411,7 +702,7 @@ def cb_assignment_payload_breakdown(
         "codebook_sidecar_bytes": int(sidecar_bytes),
         "total_bytes": int(total_bytes),
         "per_tensor": per_tensor,
-        "sidecars": list(sidecars.values()),
+        "sidecars": [sidecars[key] for key in sorted(sidecars)],
     }
 
 
@@ -484,19 +775,45 @@ def _safetensors_data_spans(path: Path) -> dict[str, int]:
         offsets = entry.get("data_offsets")
         if not isinstance(offsets, list) or len(offsets) != 2:
             raise AssertionError(f"{path}: tensor {name!r} has invalid offsets")
-        start, end = (int(offsets[0]), int(offsets[1]))
+        if any(isinstance(value, bool) or not isinstance(value, int)
+               for value in offsets):
+            raise AssertionError(
+                f"{path}: tensor {name!r} offsets must be integers"
+            )
+        start, end = offsets
         if start < 0 or end < start:
             raise AssertionError(
                 f"{path}: tensor {name!r} has invalid span [{start}, {end})"
+            )
+        dtype = entry.get("dtype")
+        shape = entry.get("shape")
+        if dtype not in _SAFETENSORS_DTYPE_BYTES:
+            raise AssertionError(
+                f"{path}: tensor {name!r} has unsupported dtype {dtype!r}"
+            )
+        if not isinstance(shape, list) or any(
+            isinstance(dim, bool) or not isinstance(dim, int) or dim < 0
+            for dim in shape
+        ):
+            raise AssertionError(
+                f"{path}: tensor {name!r} has invalid shape {shape!r}"
+            )
+        expected_span = int(math.prod(shape)) * _SAFETENSORS_DTYPE_BYTES[dtype]
+        if end - start != expected_span:
+            raise AssertionError(
+                f"{path}: tensor {name!r} span is {end - start}B but "
+                f"{dtype}{tuple(shape)} requires {expected_span}B"
             )
         spans[str(name)] = end - start
         ranges.append((start, end, str(name)))
 
     previous_end = 0
     for start, end, name in sorted(ranges):
-        if start < previous_end:
+        if start != previous_end:
+            relation = "overlaps" if start < previous_end else "leaves a gap after"
             raise AssertionError(
-                f"{path}: tensor {name!r} overlaps a preceding data span"
+                f"{path}: tensor {name!r} {relation} the preceding data span "
+                f"(expected offset {previous_end}, got {start})"
             )
         previous_end = end
     data_start = 8 + int(header_length)

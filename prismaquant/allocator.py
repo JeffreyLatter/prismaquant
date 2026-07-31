@@ -89,6 +89,7 @@ import math
 import pickle
 import re
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 
 from . import format_registry as fr
@@ -121,9 +122,14 @@ from .allocator_candidates import (
     summarize_applicability_masks,
 )
 from .nvfp4_cb_footprint import (
+    CB_ASSIGNMENT_IDENTITIES_FIELD,
+    CB_TENSOR_IDENTITY_FIELD,
     CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    cb_assignment_serialization_stamps,
     cb_serialization_context_stamp,
     is_cb_format,
+    validate_cb_cost_provenance,
 )
 from .serving_profiles import (
     check_serving_format,
@@ -138,6 +144,79 @@ from .schemas import validate_cost_payload, validate_probe_payload
 
 _KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES = 1.0
 _KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION = 0.5
+
+
+def _serialized_format_rates(
+    specs: list[fr.FormatSpec],
+    stats: Mapping[str, Mapping],
+    cb_serialization_context: CBSerializationContext | None,
+) -> dict[str, float]:
+    """Artifact-faithful menu ordering, independent of input menu order.
+
+    CB FormatSpec rates are deliberately incomplete.  Rank each format by the
+    exact payload it would use across the available Linear shapes; for CB this
+    includes FP8 row scales and once-only codebook sidecars. Shapes a format
+    cannot serialize are omitted (the applicability gate will remove them
+    later). A name tie-break makes the result deterministic.
+    """
+    rates: dict[str, float] = {}
+    for spec in specs:
+        shapes: dict[str, tuple[int, ...]] = {}
+        total_params = 0
+        for name, entry in stats.items():
+            if not isinstance(entry, Mapping):
+                continue
+            shape = _shape_from_stats(dict(entry))
+            if len(shape) < 2 or any(int(dim) <= 0 for dim in shape):
+                continue
+            try:
+                if is_cb_format(spec.name):
+                    if cb_serialization_context is None:
+                        continue
+                    # The exact accountant owns the divisibility/shape gate.
+                    from .nvfp4_cb_footprint import cb_tensor_payload_breakdown
+
+                    cb_tensor_payload_breakdown(
+                        spec.name,
+                        shape,
+                        qname=str(name),
+                        context=cb_serialization_context,
+                    )
+                else:
+                    spec.memory_bytes_for_shape(shape)
+            except (ValueError, AssertionError):
+                continue
+            shapes[str(name)] = shape
+            total_params += int(math.prod(shape))
+        if total_params <= 0:
+            rates[spec.name] = float(spec.effective_bits)
+            continue
+        if is_cb_format(spec.name):
+            payload = cb_assignment_payload_breakdown(
+                {name: spec.name for name in shapes},
+                shapes,
+                context=cb_serialization_context,
+            )
+            total_bytes = int(payload["total_bytes"])
+        else:
+            total_bytes = sum(
+                int(spec.memory_bytes_for_shape(shape))
+                for shape in shapes.values()
+            )
+        rates[spec.name] = 8.0 * total_bytes / float(total_params)
+    return rates
+
+
+def _sort_specs_by_serialized_rate(
+    specs: list[fr.FormatSpec],
+    stats: Mapping[str, Mapping],
+    cb_serialization_context: CBSerializationContext | None,
+) -> tuple[list[fr.FormatSpec], dict[str, float]]:
+    rates = _serialized_format_rates(specs, stats, cb_serialization_context)
+    return (
+        sorted(specs, key=lambda spec: (rates[spec.name], spec.name)),
+        rates,
+    )
 _RD_LOG_LINEAR_R2_THRESHOLD = 0.99
 
 
@@ -1643,9 +1722,8 @@ def main():
     else:
         fmt_names = cost_data["formats"]
     specs = [fr.get_format(n) for n in fmt_names]
-    specs_sorted = sorted(specs, key=lambda s: s.effective_bits)
     cb_serialization_context = None
-    cb_requested_names = [spec.name for spec in specs_sorted]
+    cb_requested_names = [spec.name for spec in specs]
     cb_requested_names.extend((
         fr.get_format(args.mtp_format).name,
         fr.get_format(args.visual_format).name,
@@ -1670,6 +1748,20 @@ def main():
             f"codebook_source={cb_serialization_context.codebook_source}",
             flush=True,
         )
+        try:
+            validate_cb_cost_provenance(
+                cost_data,
+                [spec.name for spec in specs],
+                context=cb_serialization_context,
+                where=f"allocator cost cache {args.costs}",
+            )
+        except ValueError as exc:
+            raise SystemExit(f"[alloc] ERROR: {exc}") from None
+    specs_sorted, serialized_rates = _sort_specs_by_serialized_rate(
+        specs,
+        accounting_stats,
+        cb_serialization_context,
+    )
 
     # Fused-coherence guard: a multi-format menu under DefaultProfile cannot
     # enforce architecture-specific fused-sibling coherence (e.g. Qwen3.x
@@ -1715,13 +1807,13 @@ def main():
     # picks between them based on tiny measurement noise per-layer, which
     # produces a serving mess: two separate kernel paths for the same tier.
     #
-    # We bucket formats by effective_bits rounded to 0.25 and warn when a
+    # We bucket formats by exact serialized rate rounded to 0.25 and warn when a
     # bucket has more than one member. If --enforce-family-coherence is
     # set we error instead.
     from collections import Counter as _Counter
     buckets: dict[float, list[str]] = {}
     for s in specs_sorted:
-        key = round(s.effective_bits * 4) / 4
+        key = round(serialized_rates[s.name] * 4) / 4
         buckets.setdefault(key, []).append(s.name)
     collisions = {k: v for k, v in buckets.items() if len(v) > 1}
     if collisions:
@@ -1743,11 +1835,15 @@ def main():
     rank_specs = {s.name: s for s in specs_sorted}
     rank_specs.setdefault(mtp_format_canonical, fr.get_format(mtp_format_canonical))
     rank_specs.setdefault(visual_format_canonical, fr.get_format(visual_format_canonical))
-    rank_specs_sorted = sorted(rank_specs.values(), key=lambda s: s.effective_bits)
+    rank_specs_sorted, _rank_serialized_rates = _sort_specs_by_serialized_rate(
+        list(rank_specs.values()),
+        accounting_stats,
+        cb_serialization_context,
+    )
     format_rank = {s.name: i for i, s in enumerate(rank_specs_sorted)}
     format_specs = {s.name: s for s in rank_specs_sorted}
     print(f"[alloc] formats (low→high bits): "
-          f"{[f'{s.name}({s.effective_bits:.2f}b)' for s in specs_sorted]}")
+          f"{[f'{s.name}({serialized_rates[s.name]:.4f}b)' for s in specs_sorted]}")
 
     # Optional empirical calibration: per-format scalar gain α_f. When
     # absent, all gains default to 1.0.
@@ -1963,7 +2059,7 @@ def main():
 
     def _bits_for_stats_entry(entry: dict, fmt: str, qname: str) -> float:
         shape = _shape_from_stats(entry)
-        payload_bytes, _identity = serialized_candidate_payload(
+        payload_bytes, _identity, _sidecar_identity = serialized_candidate_payload(
             fr.get_format(fmt),
             shape,
             qname=qname,
@@ -2179,9 +2275,15 @@ def main():
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
         total = 0.0
+        cb_assignment: dict[str, str] = {}
+        cb_shapes: dict[str, tuple[int, ...]] = {}
         for name, fmt in assignment.items():
             entry = _stats_entry_for_assignment_name(name)
             if not isinstance(entry, dict):
+                continue
+            if is_cb_format(fmt):
+                cb_assignment[name] = fmt
+                cb_shapes[name] = _shape_from_stats(entry)
                 continue
             # Super-items (packed groups, fused siblings) carry exact
             # per-format byte sums; their stats entries have no single
@@ -2191,14 +2293,72 @@ def main():
                 total += 8.0 * memory_map[fmt]
                 continue
             shape = _shape_from_stats(entry)
-            payload_bytes, _identity = serialized_candidate_payload(
+            payload_bytes, _identity, _sidecar_identity = serialized_candidate_payload(
                 fr.get_format(fmt),
                 shape,
                 qname=name,
                 cb_serialization_context=cb_serialization_context,
             )
             total += 8.0 * payload_bytes
+        if cb_assignment:
+            if cb_serialization_context is None:
+                raise AssertionError(
+                    "CB assignment reached exact bit reporting without a "
+                    "CBSerializationContext"
+                )
+            payload = cb_assignment_payload_breakdown(
+                cb_assignment,
+                cb_shapes,
+                context=cb_serialization_context,
+            )
+            total += 8.0 * int(payload["total_bytes"])
         return float(total)
+
+    def _cb_stamps_for_assignment(
+        assignment: Mapping[str, str],
+    ) -> dict[str, str]:
+        cb_names = {
+            name: fmt for name, fmt in assignment.items()
+            if is_cb_format(fmt)
+        }
+        if not cb_names:
+            return {}
+        if cb_serialization_context is None:
+            raise AssertionError(
+                "CB assignment reached stamp emission without a "
+                "CBSerializationContext"
+            )
+        shapes: dict[str, tuple[int, ...]] = {}
+        for name in cb_names:
+            entry = _stats_entry_for_assignment_name(name)
+            if not isinstance(entry, dict):
+                raise AssertionError(
+                    f"{name}: cannot stamp CB serialization identity without "
+                    "probe stats"
+                )
+            shapes[name] = _shape_from_stats(entry)
+        stamps = cb_assignment_serialization_stamps(
+            cb_names,
+            shapes,
+            context=cb_serialization_context,
+        )
+        # Candidate construction persisted the identity it priced. Assert the
+        # expanded assignment still agrees before a Pareto/KL/export consumer
+        # can mistake a promotion or stale aggregation record for exact bytes.
+        for name, fmt in cb_names.items():
+            entry = _stats_entry_for_assignment_name(name)
+            identities = (
+                entry.get("_serialized_identity_by_format")
+                if isinstance(entry, dict)
+                else None
+            )
+            if isinstance(identities, Mapping) and fmt in identities:
+                if str(identities[fmt]) != stamps[name]:
+                    raise AssertionError(
+                        f"{name}: selected {fmt} serialization identity "
+                        "differs from the candidate priced by the allocator"
+                    )
+        return stamps
 
     pareto_seed_records: list[dict] = []
 
@@ -2253,6 +2413,9 @@ def main():
                 "format_counts": dict(sorted(expanded_counts.items())),
                 "bits_total": _assignment_bits_total(budget_expanded),
                 "bits_total_with_aux": _assignment_bits_total(expanded),
+                CB_ASSIGNMENT_IDENTITIES_FIELD: _cb_stamps_for_assignment(
+                    expanded
+                ),
             })
 
     # Coarse Kneedle, then golden-section refinement inside the knee bracket so
@@ -2298,6 +2461,9 @@ def main():
                         "format_counts": dict(sorted(r_counts.items())),
                         "bits_total": _assignment_bits_total(r_bud),
                         "bits_total_with_aux": _assignment_bits_total(r_exp),
+                        CB_ASSIGNMENT_IDENTITIES_FIELD: _cb_stamps_for_assignment(
+                            r_exp
+                        ),
                         "knee_refined": True,
                     })
 
@@ -2448,6 +2614,14 @@ def main():
                 "artifact_bytes": record.get("artifact_bytes"),
                 "target_profile": target_profile,
                 "assignment": dict(sorted(assignment.items())),
+                **({
+                    "cb_serialized_payload": cb_serialization_context_stamp(
+                        cb_serialization_context
+                    ),
+                    CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
+                        record.get(CB_ASSIGNMENT_IDENTITIES_FIELD, {}).items()
+                    )),
+                } if record.get(CB_ASSIGNMENT_IDENTITIES_FIELD) else {}),
             }
             path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
             manifest_rows.append({
@@ -3032,6 +3206,9 @@ def main():
                 "PASSTHROUGH_SOURCE_REQUIREMENTS deliberately."
             )
 
+    final_cb_serialization_stamps = _cb_stamps_for_assignment(
+        assignment_expanded
+    )
     layer_cfg = {}
     for name, fmt in assignment_expanded.items():
         if fmt in format_specs:
@@ -3041,6 +3218,10 @@ def main():
             # passed --formats NVFP4,BF16 plus --visual-format MXFP8_E4M3).
             # Resolve from the global registry.
             layer_cfg[name] = fr.get_format(fmt).autoround_config()
+        if name in final_cb_serialization_stamps:
+            layer_cfg[name][CB_TENSOR_IDENTITY_FIELD] = (
+                final_cb_serialization_stamps[name]
+            )
 
     # The resolved serving profile travels WITH the assignment (re-vet R11 /
     # debt D4). Before this, it landed only in the side report

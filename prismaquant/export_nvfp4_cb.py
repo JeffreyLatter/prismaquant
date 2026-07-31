@@ -43,15 +43,16 @@ from prismaquant import nvfp4_cb_formats as cb
 from prismaquant.layer_config import (
     _NVFP4_CB_FORMAT_NAMES,
     load_assignment,
-    read_layer_config_metadata,
 )
 from prismaquant.nvfp4_cb_footprint import (
     CBSerializationContext,
     cb_assignment_payload_breakdown,
     cb_payload_summary,
+    cb_serialization_metadata_from_assignment_payload,
     cb_tensor_payload_breakdown,
     finalize_cb_export_artifact_inventory,
     validate_cb_sidecar_tensors,
+    validate_cb_assignment_serialization_stamps,
     validate_cb_serialization_context_stamp,
 )
 
@@ -369,6 +370,10 @@ def export_nvfp4_cb(
                          f" got {source!r}")
 
     assignment = load_assignment(layer_config_path)
+    _recipe_payload = json.loads(Path(layer_config_path).read_text())
+    _recipe_cb_context_stamp, _recipe_cb_tensor_stamps = (
+        cb_serialization_metadata_from_assignment_payload(_recipe_payload)
+    )
     skeleton = _load_skeleton(model_dir)
 
     # Reuse the compressed-tensors codecs + scheme templates for stock rungs —
@@ -562,9 +567,8 @@ def export_nvfp4_cb(
             for qname, (ref, fmt, codebook, _kind) in target_cb.items()
         },
     )
-    recipe_meta = read_layer_config_metadata(layer_config_path)
     validate_cb_serialization_context_stamp(
-        recipe_meta.get("cb_serialized_payload"),
+        _recipe_cb_context_stamp,
         serialization_context,
         where="export_nvfp4_cb",
     )
@@ -725,6 +729,14 @@ def export_nvfp4_cb(
         cb_serialized_shapes,
         context=serialization_context,
     )
+    if _recipe_cb_tensor_stamps:
+        validate_cb_assignment_serialization_stamps(
+            {qname: assignment[qname] for qname in cb_targets},
+            cb_serialized_shapes,
+            context=serialization_context,
+            stamps=_recipe_cb_tensor_stamps,
+            where="export_nvfp4_cb",
+        )
     if actual_cb_tensor_bytes != serialized_payload["tensor_payload_bytes"]:
         raise AssertionError(
             f"emitted CB tensor payload is {actual_cb_tensor_bytes}B, "

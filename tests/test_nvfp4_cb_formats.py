@@ -1363,7 +1363,15 @@ def test_expert_empirical_merge_replaces_expert_rows():
         "stats": {exp_name: {"h_trace": 1.0}, dense_name: {"h_trace": 2.0}},
         "costs": {exp_name: _mk_cost_row({"NVFP4_CB_K16": 9.9}),
                   dense_name: _mk_cost_row({"NVFP4_CB_K16": 0.5})},
-        "provenance": {"origin": "local"},
+        "provenance": {
+            "origin": "local",
+            "cb_serialized_payload": {
+                "schema": "prismaquant.cb_serialized_payload.v1",
+                "scale_coding": "two_tier",
+                "layout_version": 2,
+                "codebook_source": "lattice",
+            },
+        },
     }
     e_stats = {exp_name: {"h_trace": 0.0, "n_params": 10}}
     e_costs = {exp_name: {"NVFP4_CB_K16": {
@@ -1406,7 +1414,9 @@ def test_expert_empirical_cb_weighted_render_inplace():
     mod = _UnitHolder(w.clone())
     _quantize_unit_inplace(mod, ["gate_up_proj"], "NVFP4_CB_K16",
                            col_weights={full: cw}, unit_qname=qn)
-    direct = cb.make_nvfp4_cb_qdq(16, "fp4", "product")(
+    direct = cb.make_nvfp4_cb_qdq(
+        16, "fp4", "product", scale_coding="two_tier"
+    )(
         w.float(), cw).to(torch.bfloat16)
     assert torch.equal(mod.gate_up_proj.data, direct)
 
@@ -1429,17 +1439,26 @@ def test_expert_empirical_tier_inheritance(monkeypatch):
     w = (torch.randn(2, 16, 256) * 0.02).to(torch.bfloat16)
     cw = torch.rand(256) + 0.05
     qn = "u"
-    outs = {}
+    resolved = []
+    original_resolve = cb._resolve_encode_tier
+
+    def recording_resolve(tier):
+        value = original_resolve(tier)
+        resolved.append(value)
+        return value
+
+    monkeypatch.setattr(cb, "_resolve_encode_tier", recording_resolve)
     for tier in ("max", "fast"):
         monkeypatch.setenv(cb._ENCODE_TIER_ENV, tier)
         mod = _UnitHolder(w.clone())
         _quantize_unit_inplace(mod, ["gate_up_proj"], "NVFP4_CB_K16",
                                col_weights={f"{qn}.gate_up_proj": cw},
                                unit_qname=qn)
-        outs[tier] = mod.gate_up_proj.data.clone()
-    # the registry closure resolves the env per call: tiers render
-    # differently (fast's analytic search vs max's exhaustive sweep).
-    assert not torch.equal(outs["max"], outs["fast"])
+    # The production-context closure resolves the env per call. Layout-v2's
+    # reachable scale set can make these tiers bit-identical on a small input,
+    # so environment inheritance—not a forced output difference—is the
+    # contract this test needs to pin.
+    assert resolved == ["max", "fast"]
 
 
 def test_cb_ladder_split_and_fit():
