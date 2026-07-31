@@ -4,6 +4,10 @@ Dated 2026-07-21 (Robert: "make a definitive determination about final kernel
 and format standards"). This page is the contract production runs build
 against. Changes to it require a served A/B, not a preference.
 
+The vendored Gridbook runtime follows this contract: dense and MoE fused-FP4
+prefill are disabled unless their respective opt-in environment variables are
+set. Kernel-only speedups do not promote a path across activation buckets.
+
 ## Format standard (what an artifact may contain)
 
 **Production formats** — the complete set:

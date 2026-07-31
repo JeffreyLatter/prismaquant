@@ -55,10 +55,8 @@ _FP4_FUSED_MODE: list = []
 
 
 def _fp4_fused_mode() -> str:
-    # DEFAULT-ON since 2026-07-31 (Robert's call). Set
-    # PRISMAQUANT_CB_FUSED_FP4=0 to restore the Triton decode path.
-    #
-    # What this changes for a served artifact: the fp4 activation bucket moves
+    # Explicit opt-in: what this changes for a served artifact is the fp4
+    # activation bucket moving
     # from the Triton path's fp32 emulation scales to the format's native
     # ue4m3 scale factors — measured ~7.5e-2 relative against Triton. The fused
     # kernel is bit-exact against the stock NVF4 collective, so this is
@@ -68,7 +66,7 @@ def _fp4_fused_mode() -> str:
     # docs/lanes/nvfp4-cb/fp4-fused-prefill.md.
     if not _FP4_FUSED_MODE:
         _FP4_FUSED_MODE.append(
-            os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "1").strip())
+            os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip())
     return _FP4_FUSED_MODE[0]
 
 
