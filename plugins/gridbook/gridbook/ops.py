@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 
 import os
+import sys
 
 from .kernels import cb_decode_linear
 
@@ -193,6 +194,83 @@ def _fp8_act_qdq_fake(x):
     return torch.empty_like(x)
 
 
+@torch.library.custom_op("prismaquant::fp4_act_qdq", mutates_args=(), tags=_PQ_UNSAFE)
+def fp4_act_qdq(x: torch.Tensor) -> torch.Tensor:
+    """Fused group-16 fp4 (E2M1) activation QDQ (bit-exact to
+    codec.fp4_group16_act_qdq) as a custom op for the compile path."""
+    from .cuda_ext import get_ext
+    return get_ext().fp4_act_qdq(x)
+
+
+@fp4_act_qdq.register_fake
+def _fp4_act_qdq_fake(x):
+    if not x.is_cuda or x.dtype is not torch.bfloat16:
+        raise RuntimeError("fp4_act_qdq wants a CUDA bf16 tensor")
+    if x.dim() < 1:
+        raise RuntimeError("fp4_act_qdq needs at least one dimension")
+    torch._check(x.shape[-1] > 0,
+                 lambda: "fp4_act_qdq needs a positive last dimension")
+    torch._check(
+        x.shape[-1] % 16 == 0,
+        lambda: "fp4_act_qdq needs a last dim that is a multiple of the fp4 "
+                "group (16)")
+    # Native calls x.contiguous() before allocating its output. FakeTensor
+    # stride metadata must describe that same contiguous result.
+    return torch.empty_like(x, memory_format=torch.contiguous_format)
+
+
+# One-shot resolution of the fp4 act-QDQ implementation.
+#
+# The fp8 CB lane has always fused its activation QDQ into ONE CUDA launch
+# (fp8_act_qdq above); the fp4 lane ran codec.fp4_group16_act_qdq, roughly two
+# dozen eager torch dispatches plus the matching allocator round-trips per
+# module call. The grouped MoE decode path pays that twice per layer per token
+# (moe.py, the module input and the intermediate), which is milliseconds of pure
+# host dispatch on a many-layer MoE.
+#
+# The fallback is bit-identical, only slow, so correctness never depends on the
+# ext being present. But a SILENT fallback would make a decode benchmark measure
+# the wrong throughput class while looking valid. So the resolution prints its
+# verdict once, loudly, on BOTH branches -- the same discipline as
+# cb_expand_fp8_into_available()'s degrade-never-crash contract, with the
+# addition that the degraded branch says so out loud.
+_FP4_ACT_QDQ_OK = None
+
+
+def fp4_act_qdq_ok() -> bool:
+    """True when the CUDA fp4 act-QDQ is available (resolved once, cached)."""
+    global _FP4_ACT_QDQ_OK
+    if _FP4_ACT_QDQ_OK is None:
+        from .cuda_ext import get_ext
+        ext = get_ext()
+        _FP4_ACT_QDQ_OK = ext is not None and hasattr(ext, "fp4_act_qdq")
+        if _FP4_ACT_QDQ_OK:
+            print("[prismaquant-cb] act-qdq fp4=cuda "
+                  "(prismaquant::fp4_act_qdq, 1 launch/call)", flush=True)
+        else:
+            print("[prismaquant-cb] WARNING: act-qdq fp4=EAGER-CODEC -- the "
+                  "CUDA fp4_act_qdq symbol is missing from the ext, so every "
+                  "fp4-CB projection pays ~two dozen torch dispatches instead "
+                  "of one kernel launch. Numerics are unchanged; DECODE "
+                  "THROUGHPUT IS NOT REPRESENTATIVE -- do not bench.",
+                  file=sys.stderr, flush=True)
+    return _FP4_ACT_QDQ_OK
+
+
+def fp4_act_qdq_or_codec(x: torch.Tensor) -> torch.Tensor:
+    """fp4 group-16 activation QDQ: CUDA op when available, eager codec else.
+
+    Bit-identical either way (tests/test_fp4_act_qdq.py asserts torch.equal,
+    never a tolerance) -- linear.py and moe.py both document that this QDQ runs
+    OUTSIDE the kernel precisely so CUDA-vs-Triton numerics stay aligned, so a
+    tolerance here would silently break that contract.
+    """
+    if x.is_cuda and x.dtype is torch.bfloat16 and fp4_act_qdq_ok():
+        return fp4_act_qdq(x)
+    from . import codec
+    return codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+
+
 @torch.library.custom_op("prismaquant::cb_moe_gemv_fp4_v2", mutates_args=(), tags=_PQ_UNSAFE)
 def cb_moe_gemv_fp4_v2(xq: torch.Tensor, qw: torch.Tensor,
                        cb_flat: torch.Tensor, compose: torch.Tensor,
@@ -207,6 +285,45 @@ def cb_moe_gemv_fp4_v2(xq: torch.Tensor, qw: torch.Tensor,
 @cb_moe_gemv_fp4_v2.register_fake
 def _cb_moe_gemv_fp4_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
                              k_bits, n_sub, type_size):
+    return torch.empty((pair_expert.shape[0], qw.shape[1]), dtype=xq.dtype,
+                       device=xq.device)
+
+
+# CB-GEMV-v2. Same job, same inputs and same output contract as
+# ``cb_moe_gemv_fp4_v2`` above — it is the smem-resident-dictionary
+# reimplementation, and ``moe_gemv_select.cb_gemv_choice`` picks between the
+# two per (layer, stack). Differences in the SIGNATURE only: no ``n_sub`` (v2 is
+# product-mode only), plus ``rpb`` / ``dict_mode`` (rpb<=0 and dict_mode==0
+# select the kernel's measured auto policies). The C++ launcher reads the
+# decode contract from the environment per call, like the inherited kernel.
+#
+# It MUST carry the same ``_PQ_UNSAFE`` tagging as every op above — see the
+# module header: tagging these ops ``cudagraph_unsafe`` under
+# ``use_inductor_graph_partition=True`` + PIECEWISE cudagraphs makes each a
+# graph-PARTITION BOUNDARY and this build mishandles the hand-off, giving
+# DETERMINISTIC output corruption. An op that disagreed with its neighbours on
+# this tag would partition the decode path in exactly the wrong place.
+#
+# Separate JIT module (``get_ext_v2`` -> ``prismaquant_cb_v2_ext``), not a
+# second source of the inherited one: both .cu files define
+# ``PYBIND11_MODULE(TORCH_EXTENSION_NAME, ...)`` and would collide at link.
+@torch.library.custom_op("prismaquant::cb_moe_gemv_v2", mutates_args=(), tags=_PQ_UNSAFE)
+def cb_moe_gemv_v2(xq: torch.Tensor, qw: torch.Tensor,
+                   cb_flat: torch.Tensor, compose: torch.Tensor,
+                   pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
+                   k_bits: int, type_size: int, rpb: int,
+                   dict_mode: int) -> torch.Tensor:
+    """Grouped MoE decode GEMV, fp4-CB two-tier v2, smem-resident-dictionary
+    kernel (act-QDQ outside)."""
+    from .cuda_ext import get_ext_v2
+    return get_ext_v2().cb_gemv_v2(xq, qw, cb_flat, compose, pair_expert,
+                                   pair_xrow, k_bits, type_size, rpb,
+                                   dict_mode)
+
+
+@cb_moe_gemv_v2.register_fake
+def _cb_moe_gemv_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
+                         k_bits, type_size, rpb, dict_mode):
     return torch.empty((pair_expert.shape[0], qw.shape[1]), dtype=xq.dtype,
                        device=xq.device)
 
