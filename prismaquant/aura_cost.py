@@ -53,8 +53,6 @@ from prismaquant.kl_fisher import (
 from prismaquant.perturbed_x_cache import calibration_data_hash
 from prismaquant.nvfp4_cb_footprint import (
     cb_cost_provenance,
-    cb_quantize_dequantize_for_context,
-    cb_serialization_context_from_env,
     is_cb_format,
 )
 
@@ -232,19 +230,17 @@ def _delta_w(
                 f"for ({name!r}, {fmt!r}); refusing silent RTN fallback. Build the "
                 f"cache for this (Linear, format) or drop --require-production-cache.")
     spec = fr.get_format(fmt)
+    if is_cb_format(spec.name):
+        raise RuntimeError(
+            f"{name}={spec.name}: AURA CB delta requires a production-cache "
+            "render with the production col_weights/codebook contract; "
+            "refusing the unweighted direct fallback"
+        )
     qdq = getattr(spec, "quantize_dequantize", None)
     if qdq is None:
         return None
     try:
-        rendered = (
-            cb_quantize_dequantize_for_context(
-                spec,
-                weight.float(),
-                context=cb_serialization_context_from_env(),
-            )
-            if is_cb_format(spec.name)
-            else qdq(weight.float())
-        )
+        rendered = qdq(weight.float())
         return rendered - weight.float(), "rtn"
     except Exception:
         return None

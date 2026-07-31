@@ -144,6 +144,13 @@ class _WeightSwapper:
 
     def __enter__(self):
         for qname, mod, spec, cw, smooth in self._targets:
+            if spec.family in {"nvfp4_cb", "fp8_cb"} and cw is None:
+                raise RuntimeError(
+                    f"{qname}={spec.name}: direct CB KL render has no "
+                    "production col_weights. CB export is imatrix-weighted; "
+                    "use a production cache/materialized render instead of "
+                    "validating an unweighted fallback."
+                )
             w = mod.weight.data
             # SmoothQuant fold: quantize W' = W·diag(s) (s over the input dim);
             # the inverse activation scale x→x/s is applied in the act hook so

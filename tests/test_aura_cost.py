@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from prismaquant.aura_cost import compute_aura_cost
+from prismaquant.aura_cost import _delta_w, compute_aura_cost
 from prismaquant.kl_fisher import fisher_quadratic_form
 
 
@@ -55,6 +55,16 @@ class _FakeCache:
 def _ids(batch=2, seqlen=8, vocab=64, seed=0):
     g = torch.Generator().manual_seed(seed)
     return torch.randint(0, vocab, (batch, seqlen), generator=g)
+
+
+def test_aura_cb_delta_refuses_unweighted_direct_fallback():
+    with pytest.raises(RuntimeError, match="requires a production-cache render"):
+        _delta_w(
+            "layer.q_proj",
+            "NVFP4_CB_K16",
+            torch.randn(2, 256),
+            cache=None,
+        )
 
 
 def test_estimator_matches_exact_fisher_quadratic():
@@ -427,5 +437,3 @@ def test_aura_guard_allows_dense_only_models():
     model = nn.Sequential(nn.Linear(16, 16, bias=False))
 
     assert _guard_packed_expert_coverage(model) == []
-
-

@@ -155,3 +155,22 @@ def test_build_cache_col_weights_refuses_the_confounding_combinations():
         _load_col_weights(None, ["NVFP4_CB_K16", "BF16"])
     with pytest.raises(SystemExit, match="no weighted-render family"):
         _load_col_weights("unused.pkl", ["NVFP4", "BF16"])
+
+
+def test_direct_cb_kl_swapper_requires_production_col_weights():
+    import torch.nn as nn
+
+    from prismaquant import format_registry as fr
+    from prismaquant.emu_forward_kl import _WeightSwapper
+
+    module = nn.Linear(256, 2, bias=False)
+    targets = [(
+        "layer.q_proj",
+        module,
+        fr.get_format("NVFP4_CB_K16"),
+        None,
+        None,
+    )]
+    with pytest.raises(RuntimeError, match="no production col_weights"):
+        with _WeightSwapper(module, targets, act_emulation=False):
+            pass
