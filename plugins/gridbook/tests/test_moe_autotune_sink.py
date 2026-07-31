@@ -151,8 +151,17 @@ def test_lambda_term_is_still_unimplemented():
     """R21's ruling: the time term stays specified-not-implemented until two
     boxes' tables disagree in ranking. Nothing in the allocator's candidate
     carries a time field, and this pins that so 'persist the timings' is not
-    mistaken for 'the allocator now optimizes latency'."""
-    from prismaquant.allocator_solver import Candidate
+    mistaken for 'the allocator now optimizes latency'.
+
+    Monorepo-only: the allocator is not part of the released gridbook package,
+    and this file is synced verbatim into the standalone release repo
+    (prismaquant scripts/sync_gridbook.py), where the import cannot resolve.
+    importorskip, not a bare import, so that run reports "cannot check" rather
+    than a red suite."""
+    Candidate = pytest.importorskip(
+        "prismaquant.allocator_solver",
+        reason="allocator lives in the prismaquant monorepo, not in the "
+               "released gridbook package").Candidate
 
     fields = set(getattr(Candidate, "__dataclass_fields__", {}))
     assert not (fields & {"latency_ms", "time_cost", "lambda_time", "ms"})
