@@ -76,9 +76,11 @@ Measured at *other* budgets:
   joint menu → "36 dense/shared Linears → vanilla FP8_DYNAMIC; **0 → vanilla
   NVFP4** (offered and never chosen)" (`prod_hy3_results.md:277-282`). **None at
   4.5.**
-- **Speed at matched bpw:** decode **per-byte neutral** (measured twice); the
-  entire tax is prefill — dense ~10%, MoE 0–40%, *regime*- not format-dependent
-  (`format-speed-policy.md:16-29`). The "12% decode / 30% prefill" framing in
+- **Speed at matched bpw:** decode **per-byte neutral at plain low-M decode**
+  (measured twice — but never with a draft active; §4(d) scopes this claim: in
+  the shipped spec-decode/batched regime the fp8:fp4 tensor-core ratio predicts
+  ~2:1 against CB, unmeasured); prefill tax dense ~10%, MoE 0–40%, *regime*- not
+  format-dependent (`format-speed-policy.md:16-29`). The "12% decode / 30% prefill" framing in
   `serving-tax-elimination.md:1-5` is **superseded** (pre-dates the CUDA expander
   and mid-M fused promotion) — cite the 07-27 policy / ARCHITECTURE §9.2.
 - **CB's deployment cost:** out-of-tree plugin, per-arch top-level expert-loader
@@ -209,11 +211,27 @@ A "pure NVFP4 at 4.5" artifact is not a candidate in either branch; a CB artifac
 that allocates zero NVFP4 units is an *outcome of measurement*, not a container
 property.
 
-### (d) The systematic balance — a prefill-tax budget, not a λ blend, not a menu
+### (d) The systematic balance — a serving-time budget, not a λ blend, not a menu
 
 *Added 2026-07-30 after Robert's framing: "systematically, I'm looking for how we
 balance performance of NVFP4 vs accuracy of codebook fp8 at the same bit rate —
-and even lower bit rates use fp8 when NVFP4 could be used."*
+and even lower bit rates use fp8 when NVFP4 could be used." Widened same day per
+his correction: "it's more than just prefill; it's a decode tax as well — FP8 CB
+is going to be 50% the speed of NVFP4."*
+
+**The decode tax, reconciled with the measured record.** "Decode per-byte-neutral
+at matched bytes (measured twice)" and "FP8-CB at ~50% of NVFP4 decode" are both
+true — in different regimes. The neutral measurements are low-M decode:
+bandwidth-bound, matched bytes ⇒ matched time. The 50% is the compute regime:
+whenever decode is not M≈1 — **spec-decode drafts (the shipped configuration:
+MTP acceptance is a §7.2 ship gate), batched serving, wide drafts** — the GEMM
+enters the tensor-core-rate regime where Blackwell fp8 throughput is half of fp4.
+`[PREDICTION — the 2:1 architectural ratio; not yet measured on this box at
+matched bytes with a draft active]`. The existing record contains **no**
+decode-with-draft NVFP4-vs-CB pairing, so the per-byte-neutral claim is scoped to
+plain low-M decode and must not be cited beyond it (this supersedes the narrower
+phrasing in §2.1 and `format-speed-policy.md` — like prefill, decode is
+**regime-dependent**, and the shipped regime is not M=1).
 
 **The revealed preference in §2.1 is circular, and Robert's second sentence is the
 proof.** The allocator's objective is accuracy-only, so at matched bytes fp8-CB
@@ -230,18 +248,26 @@ budget = constraint, measured KL = objective):
 
 ```
 minimize   quality cost (per-unit, measured)
-subject to bytes(assignment)        ≤ TARGET_DISK_GB          (landed)
-           prefill_ms(assignment)   ≤ (1 + T) · prefill_floor  (proposed)
+subject to bytes(assignment)      ≤ TARGET_DISK_GB              (landed)
+           serve_ms(assignment)   ≤ (1 + T) · serve_floor        (proposed)
 
-prefill_ms(assignment) = Σ_units ms(format_u, shape_regime_u)
-prefill_floor          = Σ_units min over the unit's menu of ms(·)
-T                      = TARGET_PREFILL_TAX — the operator's ONE deployment input
+serve_ms(assignment) = Σ_phases w_phase · Σ_units ms(format_u, shape_u, phase)
+                       phases = {prefill, decode@shipped-M}      (decode at the
+                       draft/batch M the artifact actually serves, not M=1)
+serve_floor          = same double sum over each unit's menu-minimum
+w_phase              = the deployment's phase mix — with T, the operator's
+                       ONE deployment input (TARGET_SERVE_TAX + a phase weight)
 ```
 
-Prefill time is additive across sequential layers the way bytes are additive
-across tensors — an assumption to *check*, not assume: sum the per-layer table for
-an existing artifact pair and compare against its measured end-to-end prefill
-(§2.1's 27B/35B numbers are the check pairs).
+Per-phase time is additive across sequential layers the way bytes are additive
+across tensors — an assumption to *check per phase*, not assume: sum the
+per-layer table for an existing artifact pair and compare against its measured
+end-to-end prefill *and* decode (§2.1's 27B/35B numbers are the check pairs; the
+decode check needs the draft active). If Robert's 2:1 decode prediction holds,
+the decode term — not prefill — dominates the frontier for chat/agent
+deployments, and the balance tips materially toward NVFP4 units on
+decode-critical paths at every bit rate, which is exactly his low-bit
+observation made quantitative.
 
 **Sweep T; do not pick it.** Solve the same byte budget at
 `T ∈ {∞, 0.20, 0.10, 0}` and measure real KL at each point: the deliverable is a
@@ -308,12 +334,14 @@ unmatched arms yield a **range against the ±20% band**, not a delta.
   rerun is the **follow-up, not a substitute**.
 - **Readouts per arm** (fresh `--enforce-eager` container, same BF16 dump): exact
   vLLM top-20 KL-vs-BF16 (conf + ALL) · WikiText PPL + mean NLL · ToolEvalBench
-  (`--no-think --hardmode --parallel 1`) · TTFT(1400) and prefill tok/s · decode
-  tok/s · shipcard + `serve_manifest.json`.
+  (`--no-think --hardmode --parallel 1`) · TTFT(1400) and prefill tok/s ·
+  **decode tok/s BOTH plain (M=1) and with the arm's draft active + at
+  max-num-seqs ∈ {1, 4} — the decode-tax measurement the record lacks; draft
+  configs matched in draft length across arms** · shipcard + `serve_manifest.json`.
 
 | verdict | condition |
 |---|---|
-| **CB-FP8 becomes the 4.5 default** | arm C beats arm N on **both** conf-KL and ALL-KL by **more than the ±20% residency band**, **and** direct PPL does not regress (authority #2 can veto a KL win), **and** TEB is within the established ±2–3 single-seed churn band or better, **and** decode tok/s ≥ arm N − 5% |
+| **CB-FP8 becomes the 4.5 default** | arm C beats arm N on **both** conf-KL and ALL-KL by **more than the ±20% residency band**, **and** direct PPL does not regress (authority #2 can veto a KL win), **and** TEB is within the established ±2–3 single-seed churn band or better, **and** decode tok/s ≥ arm N − 5% **in the shipped regime (draft active, max-num-seqs 4) — not only plain M=1**; a CB arm that wins KL but decodes near Robert's predicted 2:1 in the shipped regime routes to the Mixed verdict, not to CB-default |
 | **NVFP4 becomes the 4.5 default** | arm C's KL win **fails to clear the ±20% band** (a null — then the prefill tax and the plugin/TP/per-arch cost buy nothing), **or** arm C regresses PPL or TEB at any KL |
 | **Mixed** | arm C wins KL outside the band **but** its prefill deficit on this model class exceeds ~20%; re-solve arm C on the joint menu and check whether the allocator now spends NVFP4 units. All three prior joint solves chose **zero** vanilla NVFP4 — a mixed outcome at 4.5 would itself be the new information |
 
