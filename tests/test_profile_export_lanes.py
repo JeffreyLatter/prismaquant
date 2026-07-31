@@ -28,9 +28,18 @@ from prismaquant.model_profiles.structure import (
 )
 from prismaquant.serving_profiles import require_lane_supported
 
-# The four architectures with a gridbook CB loader
+# The architectures with a gridbook CB loader
 # (`plugins/gridbook/gridbook/plugin.py`), and nothing else.
-CB_WIRED = {"qwen3_5", "qwen3_5_dense", "hy_v3", "laguna"}
+#
+# `qwen3` (dense Qwen3ForCausalLM) added 2026-07-30 for the format_choice_4p5
+# Stage 1 endpoint screen. It needs NO per-arch wiring: `_CB_TOPLEVEL_MODULE_PATHS`
+# exists only for top-level *packed MoE expert* loaders (hy_v3, laguna,
+# qwen3_5), and a dense model's CB Linears dispatch through `config.py`'s
+# name-based `_scheme_for_prefix` + vLLM's own `packed_modules_mapping` — the
+# same situation as `qwen3_5_dense`, which is already declared. Qwen3-0.6B has
+# also been served through the CB lane before, uniform, 196 CB Linears
+# (docs/lanes/nvfp4-cb/serve_prototype_0p6b.md).
+CB_WIRED = {"qwen3", "qwen3_5", "qwen3_5_dense", "hy_v3", "laguna"}
 GGUF_WIRED = {"hy_v3"}
 
 PROFILE_CLASSES = list(_registry._REGISTERED)

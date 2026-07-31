@@ -3,6 +3,7 @@
   "id": "qwen3",
   "priority": 130,
   "default_serving_profile": "vllm_packed_moe",
+  "supported_lanes": ["compressed-tensors", "nvfp4_cb"],
   "match": {
     "model_type": ["qwen3"],
     "architectures": ["Qwen3ForCausalLM"]
