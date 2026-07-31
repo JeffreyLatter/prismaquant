@@ -33,6 +33,33 @@ when `GRIDBOOK_REPO` (default `/home/rob/gridbook`) is not present. After a sync
 commit in the release repo by hand; `__version__` moves with the sync, so both
 trees always report the same version.
 
+**What flows and what is held — two tiers.** Robert's rule, 2026-07-30: *"nvfp4
+kernels are to be made part of gridbook immediately once completed. we can hold
+back amd specific kernels until later once they are validated."*
+
+- **NVFP4/CUDA kernels ship on completion, and there is no release step for
+  them.** The sync reads committed content, so committing a finished kernel here
+  *is* the release action: `commit here → run the sync → commit in the release
+  repo`, nothing to edit. The fp4 fused-prefill work in flight
+  (`csrc/cb_fused_fp4_gemm.cu`, `cutlass_fork/sm120_cb_fused_fp4_mma.hpp`, the
+  `codec.py` helpers) flows the moment it lands, by that path alone.
+- **AMD/HIP kernels are held until they have a serving metric.** The lane
+  compiles and passes a 1-bf16-ULP parity gate on gfx1151, but has never run in
+  a serve (no vLLM-ROCm on that box), so there is no KL, no PPL and no
+  throughput against a real artifact — correct-in-a-microbenchmark is not
+  shipped. The hold is policy in the tool, not a step to remember:
+  `sync_gridbook.HELD_PATHS` names `gridbook/csrc_hip`, `gridbook/hip_ext.py`
+  and `gridbook/linear_hip.py` with the reason and the release condition on
+  each; they are filtered out of the sync and deleted if found in the release
+  repo, and `--check` uses the same list, so "here but not there" is the
+  expected state rather than drift. Deleting those entries releases the lane.
+
+The hold is on **paths, never on content**: `gridbook/linear.py` keeps its one
+guarded `from . import linear_hip` and syncs verbatim — with the module held the
+import raises and `_HIP = None`, the state every CUDA install was already in.
+Forking the dispatch core between the two trees would cost the drift gate its
+meaning for the file that changes most.
+
 Format and kernel contracts: `docs/lanes/nvfp4-cb/STANDARDS.md` (authoritative),
 byte layout `docs/lanes/nvfp4-cb/LAYOUT.md`.
 

@@ -55,6 +55,17 @@ CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
 # ROCm/HIP kernels (gridbook/csrc_hip). Imported only when torch is a ROCm
 # build, so a CUDA install neither imports nor builds anything HIP; `_HIP` stays
 # None and `_apply_inline` keeps its previous behaviour exactly.
+#
+# RELEASE HOLD, and why this file is still synced verbatim. The HIP lane is
+# held out of the public gridbook project until it has a serving metric
+# (scripts/sync_gridbook.py HELD_PATHS: csrc_hip/, hip_ext.py, linear_hip.py),
+# so in the RELEASE tree `linear_hip` does not exist and this import raises
+# ImportError -> the except arm below sets `_HIP = None` -> the dispatch is
+# byte-identical to the pre-ROCm one. That degradation is what lets the hold be
+# on PATHS only. Holding these lines too would fork linear.py -- the package's
+# most-edited file, the dispatch core -- between the two trees, and the drift
+# gate would then have to carry a *content* exception it cannot check the way
+# it checks a path exception. Path hold: policy. Content fork: band-aid.
 try:                                                # pragma: no cover - env
     if getattr(torch.version, "hip", None):
         from . import linear_hip as _HIP

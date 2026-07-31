@@ -1849,6 +1849,27 @@ definition of ready this repo has. It never writes outside those two subtrees.
 clone is absent; its location is `GRIDBOOK_REPO`. Nothing in the path commits, tags or
 publishes — releasing stays a human action.
 
+**What flows, and what is held: two tiers (Robert, 2026-07-30).** *"nvfp4 kernels are to be
+made part of gridbook immediately once completed. we can hold back amd specific kernels until
+later once they are validated."* **Tier 1, NVFP4/CUDA: ships on completion** — and there is no
+step for it, which is the design. Committing the kernel under `plugins/gridbook/` *is* the
+release action, because the sync reads committed content; the sequence afterwards is "commit
+here, run the script, commit in the release repo", with nothing to edit. **Tier 2, AMD/HIP:
+held until a serving metric exists.** The lane compiled and passed a 1-bf16-ULP parity gate on
+gfx1151, but has never run inside a serve (no vLLM-ROCm on that box) — correct in a
+microbenchmark is not shipped, and §7's promotion ladder does not know a rung for it. The hold
+is policy in the tool, not a step to remember: `sync_gridbook.HELD_PATHS` (`gridbook/csrc_hip`,
+`gridbook/hip_ext.py`, `gridbook/linear_hip.py`, each carrying its reason and its release
+condition) is filtered out of the source listing and *deleted* if found in the release repo,
+and the drift gate reads the same list — so "present here, absent there" is the intended steady
+state. The hold is on **paths, never on content**: `gb/linear.py:57-77` keeps its one guarded
+`from . import linear_hip` and syncs verbatim, since with the module held the import raises and
+`_HIP = None` — the state every CUDA box was always in. Forking the dispatch core instead would
+put a content exception in the gate, which is not checkable the way a path exception is.
+Packaging is the one place the hold cannot be enforced by mirroring (the release repo owns
+`pyproject.toml`/`MANIFEST.in`), so `packaging_leaks()` reports a held lane's package-data
+globs as drift rather than silently allowing a half-released lane.
+
 **Storage format.** Product vector quantization onto a codebook whose every entry lies exactly
 on a hardware grid, so a decoded tile *is* a bit-standard NVFP4/FP8 tensor and dequantization
 is a gather rather than arithmetic. A weight vector is d=8 wide; a k-bit index selects a
