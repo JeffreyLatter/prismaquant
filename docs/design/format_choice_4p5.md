@@ -320,7 +320,43 @@ mechanism — the native arm sets `PRISMAQUANT_PRELOAD_FUSED=1`
 `tools/kl_ab.py` refuses a delta across mismatched `serve_fingerprint`s (§7.4 R15);
 unmatched arms yield a **range against the ±20% band**, not a delta.
 
-### Stage 2 — the decider: two matched-byte 4.5 artifacts, 27B-class
+### Stage 2 — the decider: the substitution ladder (revised 2026-07-30)
+
+*Robert's correction: two independently-solved artifacts are "the same target
+bit rate, yes, but not apples to apples" — different allocations put different
+bits in different places, confounding format with allocation. The controlled
+form: take the CB artifact and replace specific Linears with NVFP4, measuring
+the impact of the substitution directly.*
+
+**Protocol.** Base = the existing 27B CB artifact (`prod-27b-nvfp4cb-5p5`; its
+work dir already prices BOTH formats for every unit — the joint solve offered
+vanilla NVFP4 everywhere and chose it nowhere, so the per-unit predicted costs
+exist without any new measurement). Rank units by **predicted accuracy cost of
+the CB→NVFP4 flip per decode-ms saved** (the 42 outlier units that favour NVFP4
+on accuracy alone substitute first — they are free). Build a ladder of variants
+substituting the top ~{10, 25, 50, 100}% by that ratio; per-substitution bytes
+stay matched to ~0.006 bpw (both rungs 4.5 + scale-plane deltas — report bytes
+per variant regardless). Serve each variant through the SAME gridbook container
+(mixed-container delegation routes stock-NVFP4 units onto the native CUTLASS
+path — the speed gain must be real in-container, verified before the ladder
+runs) against the same BF16 teacher, residency-matched.
+
+**Readouts per rung:** ΔKL (conf + ALL) vs base · decode tok/s plain, with the
+draft active, and at max-num-seqs {1,4} · prefill tok/s · bytes. The deliverable
+is the **measured KL-vs-serving-time exchange curve within one allocation** —
+apples to apples by construction, and the validation data the §4(d) DP's
+solutions must track before that machinery is trusted.
+
+**Variant cost:** with export-reuse (only flipped units re-encode), each variant
+is a partial re-export + one serve window, not a rebuild. The 4.5-bpp question
+inherits this protocol on a 4.5 CB base when a build window exists; the 5.5 base
+answers the exchange-rate question first because it is already on disk.
+
+*(The prior two-artifact design is retained below as the eventual cross-check —
+an allocation-level comparison answers "which MENU at 4.5", the ladder answers
+"what does each substitution buy" — but the ladder now leads.)*
+
+### Stage 2-alt — the menu-level cross-check: two matched-byte 4.5 artifacts, 27B-class
 
 - **Arm N** — native container, `FORMATS=NVFP4,FP8_DYNAMIC,BF16`, `COST_MODE=aura`
   (default), `TARGET_BITS=4.5`.
