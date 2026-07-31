@@ -328,18 +328,30 @@ bits in different places, confounding format with allocation. The controlled
 form: take the CB artifact and replace specific Linears with NVFP4, measuring
 the impact of the substitution directly.*
 
-**Protocol.** Base = the existing 27B CB artifact (`prod-27b-nvfp4cb-5p5`; its
-work dir already prices BOTH formats for every unit — the joint solve offered
-vanilla NVFP4 everywhere and chose it nowhere, so the per-unit predicted costs
-exist without any new measurement). Rank units by **predicted accuracy cost of
-the CB→NVFP4 flip per decode-ms saved** (the 42 outlier units that favour NVFP4
-on accuracy alone substitute first — they are free). Build a ladder of variants
-substituting the top ~{10, 25, 50, 100}% by that ratio; per-substitution bytes
-stay matched to ~0.006 bpw (both rungs 4.5 + scale-plane deltas — report bytes
-per variant regardless). Serve each variant through the SAME gridbook container
-(mixed-container delegation routes stock-NVFP4 units onto the native CUTLASS
-path — the speed gain must be real in-container, verified before the ladder
-runs) against the same BF16 teacher, residency-matched.
+**Endpoints first (Robert, same day: "or better yet, a pure nvfp4 build vs a
+pure fp8 cb build").** The pure builds ARE the ladder's endpoints — pure
+`FP8_CB_K36` is the base at 0% substitution, pure `NVFP4` is the 100% rung —
+and they run FIRST: total format effect on quality and both-phase serving time
+with **zero allocation confound**, and the cleanest test of the 2:1 decode
+prediction. Pure single-format menus are the sanctioned isolation pattern
+(`[MEMORY: FP8 in every recipe]` — "2-rung menus only for cost-model A/B
+isolation, never shippable"; neither endpoint ships). Neither endpoint needs
+the allocator: a uniform assignment over the profile's quantizable set
+(BF16-pinned and incomplete-fused exceptions as in any build); the existing 27B
+work dir's act cache reuses for the imatrix harvest; pure-CB pays the known
+~5.4 h `balanced` encode wall (`encode_tiers.md:31`), pure-NVFP4 is a fast
+native-path export.
+
+**Interior rungs (Robert's substitution design) only if the endpoint gap
+justifies mapping the exchange curve.** Base = the pure-CB endpoint. Rank units
+by **predicted accuracy cost of the CB→NVFP4 flip per decode-ms saved** (the
+joint solve already priced both formats for every unit; the 42 outlier units
+that favour NVFP4 on accuracy substitute first — they are free). Substitute the
+top ~{25, 50, 75}% by that ratio; per-substitution bytes stay matched to
+~0.006 bpw (report bytes per rung regardless). Serve every rung — endpoints
+included — through the SAME gridbook container (mixed-container delegation
+routes stock-NVFP4 units onto the native CUTLASS path; verified in-container
+before the ladder runs) against the same BF16 teacher, residency-matched.
 
 **Readouts per rung:** ΔKL (conf + ALL) vs base · decode tok/s plain, with the
 draft active, and at max-num-seqs {1,4} · prefill tok/s · bytes. The deliverable
