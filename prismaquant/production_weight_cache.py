@@ -1875,6 +1875,17 @@ def render_production_weight(
     from prismaquant import format_registry as fr
 
     fmt = fr.canonical_format_name(str(fmt).strip().upper())
+    is_cb = fr.get_format(fmt).family in {"nvfp4_cb", "fp8_cb"}
+    if is_cb and col_weights is None:
+        raise RuntimeError(
+            f"{qname}={fmt}: production CB render has no col_weights; "
+            "refusing an unweighted cache entry that export cannot reproduce"
+        )
+    if is_cb and not bool(levers.get("weighted_vq", True)):
+        raise RuntimeError(
+            f"{qname}={fmt}: weighted_vq cannot be disabled for a production "
+            "CB render because export is always imatrix-weighted"
+        )
     if col_weights is not None and not (
         _format_supports_render_mechanism(fmt, "weighted_vq")
         and bool(levers.get("weighted_vq", True))

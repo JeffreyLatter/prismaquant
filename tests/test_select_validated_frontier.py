@@ -7,6 +7,8 @@ from pathlib import Path
 
 import math
 
+import pytest
+
 from prismaquant.select_validated_frontier import (
     DEFAULT_TAIL_ETA,
     DEFAULT_TAIL_VETO,
@@ -483,6 +485,137 @@ def test_selector_rejects_global_cb_stamp_without_per_layer_identities(tmp_path)
     assert "global serialized-payload context but no per-layer identities" in (
         result.stderr + result.stdout
     )
+
+
+def test_selector_rejects_cb_assignment_with_no_serialization_metadata(tmp_path):
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4_CB_K16",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "missing its global serialized-payload context" in (
+        result.stderr + result.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    "case,stamp_budget,stamp_upper,expected_error",
+    [
+        (
+            "missing_stamp",
+            None,
+            None,
+            "has no whole_artifact_budget stamp",
+        ),
+        (
+            "wrong_budget",
+            11_000,
+            9_000,
+            "budget differs from --target-disk-gb",
+        ),
+        (
+            "wrong_upper",
+            10_000,
+            8_000,
+            "upper bound does not reconcile",
+        ),
+    ],
+)
+def test_budget_selector_requires_reconciled_export_gate(
+    tmp_path, case, stamp_budget, stamp_upper, expected_error,
+):
+    assignment_payload = {
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        },
+    }
+    if stamp_budget is not None:
+        reserve = 1_000
+        assignment_payload["whole_artifact_budget"] = {
+            "schema": "prismaquant.whole_artifact_budget.v1",
+            "scope": "all_regular_files_recursive",
+            "budget_bytes": stamp_budget,
+            "selection_tensor_payload_bytes": stamp_upper - reserve,
+            "selection_non_tensor_reserve_bytes": reserve,
+            "selection_whole_artifact_upper_bound_bytes": stamp_upper,
+            "selection_contract": (
+                "tensor_payload_plus_operator_supplied_non_tensor_reserve"
+            ),
+            "final_contract": (
+                "stat_all_regular_files_recursive_fail_closed"
+            ),
+        }
+    assignment_path = tmp_path / f"{case}.json"
+    assignment_path.write_text(json.dumps(assignment_payload))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": case,
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+            "whole_artifact_upper_bound_bytes": 9_000,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "budget",
+            "--target-disk-gb",
+            "0.00001",  # floor(1e-5 * 1e9) = 10,000 bytes
+            "--tail-veto",
+            "none",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert expected_error in (result.stderr + result.stdout)
 
 
 def test_selector_rejects_stale_cb_stamp_on_non_cb_assignment(tmp_path):

@@ -115,6 +115,7 @@ from .allocator_candidates import (
     aggregate_fused_siblings,
     aggregate_packed_serving_groups,
     build_candidates,
+    check_stats_format_applicability,
     expand_fused_sibling_assignment,
     expand_packed_group_assignment,
     packed_role_split_profile,
@@ -130,7 +131,6 @@ from .nvfp4_cb_footprint import (
     cb_serialization_context_stamp,
     cb_tensor_payload_breakdown,
     is_cb_format,
-    load_cb_codebook_digest_manifest,
     validate_cb_cost_provenance,
     whole_artifact_budget_stamp,
 )
@@ -1529,17 +1529,19 @@ def main():
         default=None,
         help=(
             "Exact CB sidecar sharing policy. Required when any body/auxiliary "
-            "format is CB so codebook identity/bytes cannot be guessed."
+            "format is CB so codebook identity/bytes cannot be guessed. The "
+            "production CLI currently accepts lattice only; learned is "
+            "rejected until every stage consumes one immutable value-bearing "
+            "bundle."
         ),
     )
     ap.add_argument(
         "--cb-codebook-digests",
         default=None,
         help=(
-            "JSON file (or inline JSON object) mapping each physical learned-"
-            "codebook tensor ref to its lowercase SHA-256 digest. Required when "
-            "--cb-codebook-source=learned so allocation/KL/export bind the "
-            "same materialized sidecar bytes."
+            "Reserved learned-CB digest manifest. The production CLI rejects "
+            "this digest-only contract because it does not supply codebook "
+            "values; direct research accounting APIs still accept digests."
         ),
     )
     ap.add_argument("--formats", default="",
@@ -1697,6 +1699,16 @@ def main():
                          "attribution table (qname, block, role, format, "
                          "bits, bpp, n_params, h_trace, predicted_dloss).")
     args = ap.parse_args()
+
+    if args.cb_codebook_source == "learned":
+        raise SystemExit(
+            "[alloc] ERROR: learned CB is blocked in the production allocator "
+            "until an immutable value-bearing codebook bundle is loaded by "
+            "cost, cache, KL, allocator, and export. A digest manifest proves "
+            "identity but does not supply the codebook values, and export-time "
+            "retraining is assignment-dependent. The direct learned exporter/"
+            "accounting APIs remain research-only."
+        )
 
     if args.target_disk_gb is not None:
         if not math.isfinite(args.target_disk_gb) or args.target_disk_gb <= 0:
@@ -1862,36 +1874,15 @@ def main():
                 "[alloc] ERROR: a CB format is present in the body or fixed "
                 "auxiliary assignment but exact serialized "
                 "context is missing. Pass --cb-scale-coding {two_tier,v1} and "
-                "--cb-codebook-source {lattice,learned}; refusing to silently "
+                "--cb-codebook-source lattice; refusing to silently "
                 "price the registry's legacy-v1 approximation."
             )
         codebook_digests = None
-        if args.cb_codebook_source == "learned":
-            if args.cb_codebook_digests is None:
-                raise SystemExit(
-                    "[alloc] ERROR: learned CB allocation requires "
-                    "--cb-codebook-digests for the already-materialized "
-                    "sidecar. A role name identifies sharing/bytes but not "
-                    "the codebook values whose render is being scored."
-                )
-            try:
-                raw_digests = load_cb_codebook_digest_manifest(
-                    args.cb_codebook_digests,
-                    where="allocator learned CB context",
-                )
-            except (OSError, ValueError, AssertionError) as exc:
-                raise SystemExit(
-                    f"[alloc] ERROR: cannot read learned CB digest manifest "
-                    f"{args.cb_codebook_digests}: {exc}"
-                ) from None
-            codebook_digests = {
-                str(name): str(value)
-                for name, value in raw_digests.items()
-            }
-        elif args.cb_codebook_digests is not None:
+        if args.cb_codebook_digests is not None:
             raise SystemExit(
-                "[alloc] ERROR: --cb-codebook-digests is only valid with "
-                "--cb-codebook-source=learned"
+                "[alloc] ERROR: --cb-codebook-digests cannot be consumed by "
+                "the production allocator until learned CB has immutable "
+                "value-bearing codebook input"
             )
         try:
             cb_serialization_context = CBSerializationContext(
@@ -1911,7 +1902,7 @@ def main():
         try:
             validate_cb_cost_provenance(
                 cost_data,
-                [spec.name for spec in specs],
+                cb_requested_names,
                 context=cb_serialization_context,
                 where=f"allocator cost cache {args.costs}",
             )
@@ -2048,6 +2039,75 @@ def main():
             print(f"[alloc] source-dtype manifest: {n_fp8} fp8, "
                   f"{n_bf16} bf16 (gates FP8_SOURCE/BF16 per source)",
                   flush=True)
+
+    # A requested production CB rung needs a measured row everywhere it is
+    # otherwise legal. `build_candidates` historically skipped absent/error
+    # rows, which could silently prune the entire CB menu after an imatrix or
+    # learned-codebook render failure and let the run select stock/BF16.
+    body_cb_specs = [spec for spec in specs_sorted if is_cb_format(spec.name)]
+    mtp_cb_spec = (
+        fr.get_format(mtp_format_canonical)
+        if is_cb_format(mtp_format_canonical)
+        else None
+    )
+    visual_cb_spec = (
+        fr.get_format(visual_format_canonical)
+        if is_cb_format(visual_format_canonical)
+        else None
+    )
+    incomplete_cb_costs: list[tuple[str, str, str]] = []
+    for name, stats_entry in stats.items():
+        if _is_mtp_linear(name):
+            required_specs = [mtp_cb_spec] if mtp_cb_spec is not None else []
+        elif _is_visual_linear(name):
+            required_specs = (
+                [visual_cb_spec] if visual_cb_spec is not None else []
+            )
+        else:
+            required_specs = body_cb_specs
+        source_kind = (
+            source_manifest.get(name, "unknown")
+            if source_manifest is not None
+            else None
+        )
+        per_name_costs = costs.get(name)
+        for spec in required_specs:
+            verdict = check_stats_format_applicability(
+                stats_entry,
+                spec,
+                qname=name,
+                source_kind=source_kind,
+                target_profile=target_profile,
+            )
+            if not verdict.legal:
+                continue
+            row = None
+            if isinstance(per_name_costs, Mapping):
+                for candidate_name in dict.fromkeys(
+                    (spec.name, *fr.aliases_for(spec.name))
+                ):
+                    if candidate_name in per_name_costs:
+                        row = per_name_costs[candidate_name]
+                        break
+            reason = None
+            if not isinstance(row, Mapping):
+                reason = "missing"
+            elif row.get("error") is not None:
+                reason = f"error={row.get('error')}"
+            if reason is not None:
+                incomplete_cb_costs.append((str(name), spec.name, reason))
+    if incomplete_cb_costs:
+        sample = "; ".join(
+            f"{name}={fmt} ({reason})"
+            for name, fmt, reason in incomplete_cb_costs[:8]
+        )
+        raise SystemExit(
+            "[alloc] ERROR: production CB cost coverage is incomplete for "
+            f"{len(incomplete_cb_costs)} legal (tensor, format) pair(s): "
+            f"{sample}. CB export is imatrix-weighted, so missing/error rows "
+            "cannot be silently pruned from the menu. Rebuild the cost/cache "
+            "with complete production col_weights or remove the CB rung."
+        )
 
     candidate_mask_records: list[dict] = []
     candidates = build_candidates(

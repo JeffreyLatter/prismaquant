@@ -8707,6 +8707,44 @@ class IncrementalSafetensorsWriter:
         self.current_size = 0
         gc.collect()
 
+    @staticmethod
+    def _is_model_artifact_name(name: str) -> bool:
+        """Files this writer owns and may replace across export attempts."""
+        return (
+            name in {"model.safetensors", "model.safetensors.index.json"}
+            or re.fullmatch(
+                r"model-[0-9]{5}-of-[0-9]{5}\.safetensors", name
+            ) is not None
+        )
+
+    def _remove_stale_model_artifacts(self, planned_names: set[str]) -> None:
+        """Remove only obsolete model containers from an earlier export.
+
+        Tokenizer/config/processor files are intentionally outside this
+        writer's ownership. A directory at a reserved model filename is an
+        error rather than a recursive-delete target.
+        """
+        removed: list[str] = []
+        for path in self.out_dir.iterdir():
+            if (
+                not self._is_model_artifact_name(path.name)
+                or path.name in planned_names
+            ):
+                continue
+            if path.is_dir() and not path.is_symlink():
+                raise RuntimeError(
+                    f"cannot replace stale model artifact {path}: expected a "
+                    "file, found a directory"
+                )
+            path.unlink()
+            removed.append(path.name)
+        if removed:
+            print(
+                "[export-stream] removed stale model artifact(s): "
+                f"{sorted(removed)}",
+                flush=True,
+            )
+
     def finalize(self) -> None:
         self._flush_current()
         if not self.tmp_shards:
@@ -8718,6 +8756,7 @@ class IncrementalSafetensorsWriter:
             os.replace(tmp_path, self.out_dir / final_name)
             for key in keys:
                 self.weight_map[key] = final_name
+            self._remove_stale_model_artifacts({final_name})
             print("[export-stream] finalized single safetensors shard",
                   flush=True)
             return
@@ -8734,6 +8773,9 @@ class IncrementalSafetensorsWriter:
                 "metadata": {"total_size": self.total_size},
                 "weight_map": self.weight_map,
             }, f, indent=2)
+        self._remove_stale_model_artifacts(
+            {"model.safetensors.index.json", *set(self.weight_map.values())}
+        )
         print(f"[export-stream] finalized {n} safetensors shards",
               flush=True)
 

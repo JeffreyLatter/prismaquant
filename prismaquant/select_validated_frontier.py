@@ -826,8 +826,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                  "saturation", "budget"),
         default="kneedle",
         help="Frontier pick. 'budget' = min measured KL among the rows whose "
-             "EXACT exported footprint fits --target-disk-gb (re-vet R1: the "
-             "card is the constraint, measured KL is the objective). "
+             "tensor payload plus operator-supplied non-tensor reserve fits "
+             "--target-disk-gb; export then enforces exact recursive file "
+             "bytes (re-vet R1: the card is the constraint, measured KL is "
+             "the objective). "
              "'saturation' = unconstrained bit-rate selector: "
              "lowest bpp whose KL is within --sat-z stderr of the high-bpp "
              "asymptote (needs a real per-bpp stderr, i.e. validate with "
@@ -888,6 +890,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-assignment", required=True)
     parser.add_argument("--output-summary", required=True)
     args = parser.parse_args(argv)
+    requested_budget_bytes = None
+    if args.mode == "budget":
+        if (
+            args.target_disk_gb is None
+            or not math.isfinite(args.target_disk_gb)
+            or args.target_disk_gb <= 0
+        ):
+            parser.error(
+                "--mode budget requires a positive finite --target-disk-gb"
+            )
+        requested_budget_bytes = int(math.floor(args.target_disk_gb * 1e9))
     # This stage is pure JSON/frontier post-processing. GPU-or-bust applies to
     # tensor hot paths (probe, render, export, validation), not this selector.
     payload = _load_json(args.validation_json)
@@ -920,8 +933,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tail_veto=tail_veto,
         tail_eta=tail_eta_arg,
         vetoed=vetoed_rows,
-        budget_bytes=(None if args.target_disk_gb is None
-                      else float(args.target_disk_gb) * 1e9),
+        budget_bytes=requested_budget_bytes,
     )
     saturation = None
     if args.mode == "saturation":
@@ -981,11 +993,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     selected_cb_names = {
         str(name) for name, fmt in assignment.items() if is_cb_format(fmt)
     }
+    if selected_cb_names and selected_cb_context is None:
+        raise ValueError(
+            "selected CB assignment is missing its global serialized-payload "
+            "context"
+        )
     if selected_cb_context is not None and not selected_cb_stamps:
         raise ValueError(
             "selected CB assignment carries a global serialized-payload "
             "context but no per-layer identities; refusing to carry a stale "
             "global stamp onto unverifiable tensors"
+        )
+    if selected_cb_names and not selected_cb_stamps:
+        raise ValueError(
+            "selected CB assignment is missing its per-layer serialization "
+            "identities"
         )
     if selected_cb_stamps and selected_cb_context is None:
         raise ValueError(
@@ -1005,6 +1027,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         selected_payload,
         where=f"selected frontier assignment {selected['path']}",
     )
+    if args.mode == "budget":
+        if selected_budget is None:
+            raise ValueError(
+                "selected budget-mode assignment has no whole_artifact_budget "
+                "stamp; refusing to emit an assignment without the exporter's "
+                "hard recursive-byte gate"
+            )
+        stamped_budget = int(selected_budget["budget_bytes"])
+        if stamped_budget != requested_budget_bytes:
+            raise ValueError(
+                "selected assignment whole-artifact budget differs from "
+                f"--target-disk-gb: stamp={stamped_budget}B, "
+                f"requested={requested_budget_bytes}B"
+            )
+        selected_upper = selected.get("artifact_bytes")
+        stamped_upper = int(
+            selected_budget["selection_whole_artifact_upper_bound_bytes"]
+        )
+        if selected_upper is None or int(selected_upper) != stamped_upper:
+            raise ValueError(
+                "selected row whole-artifact upper bound does not reconcile "
+                f"with its assignment stamp: row={selected_upper!r}, "
+                f"stamp={stamped_upper}B"
+            )
     selected_cb_stamps_arg = selected_cb_stamps or None
     layer_config = _layer_config_from_assignment(
         assignment,

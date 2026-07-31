@@ -52,6 +52,12 @@ def _cb_cost_quantize_dequantize(
     col_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Render CB weights under the producer context stamped on cost.pkl."""
+    if col_weights is None:
+        raise RuntimeError(
+            f"{spec.name}: production CB cost render has no col_weights; "
+            "export is imatrix-weighted, so an unweighted cost row would "
+            "describe different bytes"
+        )
     return cb_quantize_dequantize_for_context(
         spec,
         weight,

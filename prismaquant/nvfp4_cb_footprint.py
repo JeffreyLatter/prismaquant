@@ -544,10 +544,10 @@ def validate_cb_assignment_serialization_stamps(
         if str(name) in expected
     }
     missing = sorted(set(expected) - set(observed))
-    extra = sorted(
-        name for name in stamps
-        if str(name) not in expected and is_cb_format(assignment.get(str(name), ""))
-    )
+    # This mapping is dedicated to CB tensor identities. Any key outside the
+    # exact CB assignment is stale metadata (including a tensor since changed
+    # to a non-CB format), not an innocuous annotation to preserve.
+    extra = sorted(str(name) for name in stamps if str(name) not in expected)
     mismatched = sorted(
         name for name in expected
         if name in observed and observed[name] != expected[name]

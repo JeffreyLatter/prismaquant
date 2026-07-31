@@ -296,6 +296,11 @@ class TestIncrementalSafetensorsWriter(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             out_dir = Path(td)
+            (out_dir / "model.safetensors").write_bytes(b"stale-single")
+            (out_dir / "model-99999-of-99999.safetensors").write_bytes(
+                b"stale-shard"
+            )
+            (out_dir / "tokenizer.json").write_text("keep")
             writer = IncrementalSafetensorsWriter(out_dir, shard_bytes=32)
             writer.add_tensors({
                 "b.weight": torch.ones(4, dtype=torch.float32),
@@ -316,6 +321,11 @@ class TestIncrementalSafetensorsWriter(unittest.TestCase):
                 {"a.weight", "b.weight", "c.weight"},
             )
             self.assertEqual(index["metadata"]["total_size"], 64)
+            self.assertFalse((out_dir / "model.safetensors").exists())
+            self.assertFalse(
+                (out_dir / "model-99999-of-99999.safetensors").exists()
+            )
+            self.assertEqual((out_dir / "tokenizer.json").read_text(), "keep")
 
             loaded = {}
             for shard_name in set(index["weight_map"].values()):
@@ -329,6 +339,31 @@ class TestIncrementalSafetensorsWriter(unittest.TestCase):
             self.assertTrue(torch.equal(
                 loaded["c.weight"], torch.arange(16, dtype=torch.int8)
             ))
+
+    def test_single_shard_replaces_stale_shards_and_index_only(self):
+        from prismaquant.export_native_compressed import (
+            IncrementalSafetensorsWriter,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            (out_dir / "model-00001-of-00002.safetensors").write_bytes(b"old")
+            (out_dir / "model-00002-of-00002.safetensors").write_bytes(b"old")
+            (out_dir / "model.safetensors.index.json").write_text("{}")
+            (out_dir / "config.json").write_text('{"keep": true}')
+
+            writer = IncrementalSafetensorsWriter(out_dir, shard_bytes=1024)
+            writer.add_tensors({"a.weight": torch.ones(4)})
+            writer.finalize()
+
+            self.assertTrue((out_dir / "model.safetensors").exists())
+            self.assertFalse(
+                (out_dir / "model.safetensors.index.json").exists()
+            )
+            self.assertFalse(list(out_dir.glob("model-*-of-*.safetensors")))
+            self.assertEqual(
+                (out_dir / "config.json").read_text(), '{"keep": true}'
+            )
 
 
 class TestGroupedExportQuantization(unittest.TestCase):

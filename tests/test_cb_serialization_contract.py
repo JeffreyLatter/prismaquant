@@ -24,6 +24,7 @@ from prismaquant.incremental_measure_quant_cost import merge_cost_pickles
 from prismaquant.nvfp4_cb_footprint import (
     CBSerializationContext,
     _safetensors_data_spans,
+    _safetensors_tensor_payload_sha256,
     cb_assignment_payload_breakdown,
     cb_assignment_serialization_stamps,
     cb_tensor_serialization_stamp,
@@ -356,6 +357,31 @@ def test_assignment_bits_requires_every_matching_per_layer_stamp():
         )
 
 
+def test_assignment_stamp_validation_rejects_every_extra_identity():
+    from prismaquant.nvfp4_cb_footprint import (
+        validate_cb_assignment_serialization_stamps,
+    )
+
+    fmt = "NVFP4_CB_K16"
+    name = "model.layers.0.q_proj"
+    shape = (4, 256)
+    assignment = {name: fmt}
+    shapes = {name: shape}
+    context = CBSerializationContext.production()
+    stamps = cb_assignment_serialization_stamps(
+        assignment, shapes, context=context
+    )
+    stamps["model.layers.9.stale_proj"] = stamps[name]
+    with pytest.raises(ValueError, match="extra=.*stale_proj"):
+        validate_cb_assignment_serialization_stamps(
+            assignment,
+            shapes,
+            context=context,
+            stamps=stamps,
+            where="exact stamp regression",
+        )
+
+
 def test_tensor_stamp_binds_shape_and_every_byte_component():
     context = CBSerializationContext.production()
     a = cb_tensor_serialization_stamp(
@@ -609,6 +635,20 @@ def test_inventory_verifies_learned_codebook_content_digest(tmp_path):
             codebook_file="cb_codebooks.pqcb",
             expected_model_files=["model.safetensors"],
         )
+
+
+def test_nonzero_fp16_digest_matches_exact_safetensors_payload(tmp_path):
+    from safetensors.torch import save_file
+
+    tensor = (torch.arange(48, dtype=torch.float16) - 17).reshape(6, 8)
+    path = tmp_path / "learned.pqcb"
+    save_file({"cb_codebook.role.fmt": tensor}, str(path))
+    expected = hashlib.sha256(
+        tensor.cpu().contiguous().numpy().tobytes()
+    ).hexdigest()
+    assert _safetensors_tensor_payload_sha256(
+        path, ["cb_codebook.role.fmt"]
+    ) == {"cb_codebook.role.fmt": expected}
 
 
 def test_inventory_rejects_stale_model_shards(tmp_path):

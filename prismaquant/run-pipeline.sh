@@ -93,11 +93,14 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # final export must describe the same layout and shared sidecars.
   : "${CB_CODEBOOK_SOURCE:=lattice}"
   : "${CB_SCALE_CODING:=two_tier}"
-  : "${CB_CODEBOOK_DIGESTS:=}"
+  if [[ "$CB_CODEBOOK_SOURCE" == "learned" ]]; then
+    echo "[pipeline] ERROR: learned CB is research-only until one immutable value-bearing codebook bundle is loaded verbatim by cost/cache/KL/export. Digests alone do not supply those values, and export-time retraining depends on the selected assignment. Use CB_CODEBOOK_SOURCE=lattice." >&2
+    exit 2
+  fi
   # Cost renderers resolve CBSerializationContext from the environment. These
   # must be exported (not merely shell locals) or a legacy-v1/default split can
   # recur between the Python cost process and the exporter CLI.
-  export CB_CODEBOOK_SOURCE CB_SCALE_CODING CB_CODEBOOK_DIGESTS
+  export CB_CODEBOOK_SOURCE CB_SCALE_CODING
 fi
 if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   : "${ACTIVATION_ROWS_LIMIT:=1024}"
@@ -1293,13 +1296,6 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     --cb-scale-coding "$CB_SCALE_CODING"
     --cb-codebook-source "$CB_CODEBOOK_SOURCE"
   )
-  if [[ "$CB_CODEBOOK_SOURCE" == "learned" ]]; then
-    if [[ -z "$CB_CODEBOOK_DIGESTS" ]]; then
-      echo "[pipeline] ERROR: learned CB production requires CB_CODEBOOK_DIGESTS for an already-materialized sidecar; logical role refs do not identify render/export bytes" >&2
-      exit 2
-    fi
-    ALLOCATOR_CB_ARGS+=(--cb-codebook-digests "$CB_CODEBOOK_DIGESTS")
-  fi
 fi
 python3 -m prismaquant.allocator \
   --probe "${PROBE_PATH}" \
@@ -1909,13 +1905,10 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # cache. Requires the nvfp4_cb serving profile (gated above); the cost render
   # only has to be imatrix-weighted, which the R3 assertion enforces.
   : "${CB_OUT:=${WORK_DIR}/exported_nvfp4_cb}"
-  # Codebook source: `lattice` (deterministic fixed FP4/FP8 tables, one FP16
-  # sidecar set per format) or `learned` (shared per-(role) FP16 codebooks
-  # trained deterministically at export time). Learned production is accepted
-  # only when CB_CODEBOOK_DIGESTS binds the pre-materialized expected tensors;
-  # export recomputes and checks those hashes through the layer-config stamp.
-  # Both are real serialized sidecars and allocator pricing charges each
-  # physical identity once; per-tensor learned is never used.
+  # Production uses deterministic fixed-lattice FP4/FP8 tables, serialized as
+  # one FP16 sidecar set per format. The direct exporter retains learned
+  # codebooks for research/back-compat, but the pipeline blocks them above
+  # until a value-bearing immutable bundle is shared by every render stage.
   : "${CB_CODEBOOK_SOURCE:=lattice}"
   : "${CB_CODEBOOK_ITERS:=4}"
   : "${CB_CODEBOOK_SEED:=0}"

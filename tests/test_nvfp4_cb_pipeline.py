@@ -366,6 +366,101 @@ def _run_main(tmp_path, monkeypatch, menu, *, enforce, target="3.0"):
     return lc
 
 
+def test_allocator_blocks_digest_only_learned_cb_before_reading_inputs(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(sys, "argv", [
+        "allocator",
+        "--probe", str(tmp_path / "not-read-probe.pkl"),
+        "--costs", str(tmp_path / "not-read-cost.pkl"),
+        "--layer-config", str(tmp_path / "layer_config.json"),
+        "--pareto-csv", str(tmp_path / "pareto.csv"),
+        "--cb-codebook-source", "learned",
+    ])
+    with pytest.raises(SystemExit, match="immutable value-bearing codebook"):
+        alloc.main()
+
+
+@pytest.mark.parametrize(
+    "aux_flag,aux_name",
+    [
+        ("--mtp-format", "mtp.layers.0.mlp.up_proj"),
+        ("--visual-format", "model.visual.blocks.0.mlp.up_proj"),
+    ],
+)
+def test_auxiliary_cb_format_requires_cost_serialization_provenance(
+    tmp_path, monkeypatch, aux_flag, aux_name,
+):
+    """A non-CB body must not hide a CB MTP/visual cost contract."""
+    probe_p, cost_p = _write_alloc_fixture(tmp_path, ["BF16"])
+    probe = pickle.loads(probe_p.read_bytes())
+    costs = pickle.loads(cost_p.read_bytes())
+    probe["stats"][aux_name] = {
+        "h_trace": 1.0,
+        "n_params": 256 * 256,
+        "in_features": 256,
+        "out_features": 256,
+    }
+    costs["costs"][aux_name] = {
+        "NVFP4_CB_K16": _cost_entry(0.1),
+    }
+    # This is the stale pre-contract payload under test: the auxiliary CB row
+    # exists, but no v1/v2/codebook identity says which bytes it measured.
+    costs["provenance"] = {}
+    probe_p.write_bytes(pickle.dumps(probe))
+    cost_p.write_bytes(pickle.dumps(costs))
+    monkeypatch.setattr(sys, "argv", [
+        "allocator",
+        "--probe", str(probe_p),
+        "--costs", str(cost_p),
+        "--formats", "BF16",
+        aux_flag, "NVFP4_CB_K16",
+        "--target-bits", "16",
+        "--pareto-targets", "16",
+        "--layer-config", str(tmp_path / "layer_config.json"),
+        "--pareto-csv", str(tmp_path / "pareto.csv"),
+        "--target-profile", "nvfp4_cb",
+        "--allow-default-profile",
+        "--cb-scale-coding", "two_tier",
+        "--cb-codebook-source", "lattice",
+    ])
+    with pytest.raises(SystemExit, match="no serialized-payload identity"):
+        alloc.main()
+
+
+@pytest.mark.parametrize("failure", ["missing", "error"])
+def test_allocator_rejects_incomplete_legal_cb_cost_rows(
+    tmp_path, monkeypatch, failure,
+):
+    menu = ["NVFP4_CB_K16", "BF16"]
+    probe_p, cost_p = _write_alloc_fixture(tmp_path, menu)
+    costs = pickle.loads(cost_p.read_bytes())
+    first_name = sorted(costs["costs"])[0]
+    if failure == "missing":
+        costs["costs"][first_name].pop("NVFP4_CB_K16")
+    else:
+        costs["costs"][first_name]["NVFP4_CB_K16"] = {
+            "error": "production col_weights unavailable",
+        }
+    cost_p.write_bytes(pickle.dumps(costs))
+    monkeypatch.setattr(sys, "argv", [
+        "allocator",
+        "--probe", str(probe_p),
+        "--costs", str(cost_p),
+        "--formats", ",".join(menu),
+        "--target-bits", "3.0",
+        "--pareto-targets", "3.0",
+        "--layer-config", str(tmp_path / "layer_config.json"),
+        "--pareto-csv", str(tmp_path / "pareto.csv"),
+        "--target-profile", "nvfp4_cb",
+        "--allow-default-profile",
+        "--cb-scale-coding", "two_tier",
+        "--cb-codebook-source", "lattice",
+    ])
+    with pytest.raises(SystemExit, match="CB cost coverage is incomplete"):
+        alloc.main()
+
+
 # NVFP4_CB_K15 (2.375) and K16 (2.5) both bucket to the 2.5 bit-tier -> the
 # family-coherence gate collides on an intentional intra-family CB ladder.
 _ADJACENT_LADDER = ["NVFP4_CB_K15", "NVFP4_CB_K16", "BF16"]
@@ -456,17 +551,16 @@ _CB_COST_RUNGS = ["NVFP4_CB_K16", "NVFP4_CB_S16", "FP8_CB_K44"]
 @pytest.mark.parametrize("rung", _CB_COST_RUNGS)
 def test_cb_batched_cost_matches_direct_qdq(rung):
     # The batched cost path must equal the per-slice producer-context QDQ —
-    # unweighted AND under a per-item imatrix — or the allocator's cost
-    # diverges from the shipped bytes. The registry closure remains legacy-v1;
-    # production cost binds v1/v2 explicitly. (in_features=512 % 256 == 0.)
+    # under a per-item imatrix — or the allocator's cost diverges from the
+    # shipped bytes. An absent imatrix is an explicit error because CB export
+    # never emits that unweighted render. (in_features=512 % 256 == 0.)
     spec = fr.get_format(rung)
     torch.manual_seed(0)
     stacked = torch.randn(3, 256, 512) * torch.rand(3, 1, 1).exp()
-    batched = mqc._batched_quantize(spec, stacked)
-    per_slice = torch.stack(
-        [mqc._cb_cost_quantize_dequantize(spec, stacked[i])
-         for i in range(3)])
-    torch.testing.assert_close(batched, per_slice, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="no col_weights"):
+        mqc._batched_quantize(spec, stacked)
+    with pytest.raises(RuntimeError, match="no col_weights"):
+        mqc._cb_cost_quantize_dequantize(spec, stacked[0])
     # Per-item imatrix (N,1,in) — the batched cost path's shape.
     qw = torch.rand(3, 1, 512) + 0.05
     batched_w = mqc._batched_quantize(spec, stacked, col_weights=qw)
@@ -480,21 +574,21 @@ def test_cb_batched_cost_matches_direct_qdq(rung):
 
 @pytest.mark.parametrize("rung", _CB_COST_RUNGS)
 def test_cb_imatrix_changes_cost_and_lowers_weighted_error(rung):
-    # "The CB cost entry changes when the act cache provides imatrix vs not":
-    # the weighted render differs from the unweighted one, and the weighted VQ
-    # search lowers the weighted MSE it optimizes — so the DP sees a different,
-    # exporter-faithful cost.
+    # A non-uniform production imatrix changes the render relative to a
+    # supplied uniform vector, and lowers the weighted MSE it optimizes.
     spec = fr.get_format(rung)
     torch.manual_seed(1)
     w = torch.randn(128, 512)
     qw = torch.rand(512) + 0.05
-    unweighted = mqc._cb_cost_quantize_dequantize(spec, w.clone())
+    uniform = mqc._cb_cost_quantize_dequantize(
+        spec, w.clone(), col_weights=torch.ones_like(qw)
+    )
     weighted = mqc._cb_cost_quantize_dequantize(
         spec, w.clone(), col_weights=qw
     )
-    assert not torch.equal(unweighted, weighted), "imatrix did not change render"
+    assert not torch.equal(uniform, weighted), "imatrix did not change render"
     wmse = lambda r: float(((w - r).pow(2) * qw).mean())
-    assert wmse(weighted) <= wmse(unweighted) * 1.0001 + 1e-9
+    assert wmse(weighted) <= wmse(uniform) * 1.0001 + 1e-9
 
 
 def test_cost_render_uses_imatrix_predicate_and_gguf_toggle(monkeypatch):

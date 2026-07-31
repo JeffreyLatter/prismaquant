@@ -85,9 +85,9 @@ def test_weighted_families_actually_use_the_vector(fmt):
     # and the encoders legitimately reproduce the unweighted result.)
     cw = torch.rand(256) * 10.0 + 0.01
 
-    unweighted = _render(fmt, weight, acts, None)
+    uniform = _render(fmt, weight, acts, torch.ones_like(cw))
     weighted = _render(fmt, weight, acts, cw)
-    assert not torch.equal(unweighted, weighted)
+    assert not torch.equal(uniform, weighted)
 
 
 def test_only_weighted_vq_is_offered_to_the_weighted_families():
@@ -118,16 +118,21 @@ def test_weighted_vq_is_a_declared_render_mechanism():
     assert plan.names() == ("weighted_vq",)
 
 
-def test_weighted_vq_lever_can_be_disabled():
+def test_weighted_vq_lever_cannot_disable_required_cb_imatrix():
     torch.manual_seed(3)
     weight = torch.randn(8, 256) * 0.2
     acts = torch.randn(32, 256) * 0.3
     cw = torch.rand(256) * 10.0 + 0.01
 
-    off = _render("NVFP4_CB_K16", weight, acts, cw,
-                  levers={"gptq": True, "weighted_vq": False})
-    unweighted = _render("NVFP4_CB_K16", weight, acts, None)
-    assert torch.equal(off, unweighted)
+    with pytest.raises(RuntimeError, match="weighted_vq cannot be disabled"):
+        _render("NVFP4_CB_K16", weight, acts, cw,
+                levers={"gptq": True, "weighted_vq": False})
+
+
+@pytest.mark.parametrize("fmt", ["NVFP4_CB_K16", "FP8_CB_K32"])
+def test_production_cb_render_requires_col_weights(fmt):
+    with pytest.raises(RuntimeError, match="no col_weights"):
+        _render(fmt, torch.randn(8, 256), torch.randn(32, 256), None)
 
 
 def test_packed_expert_col_weight_slicing_matches_the_cost_convention():

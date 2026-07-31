@@ -910,9 +910,10 @@ register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
 # price/render production layout-v2 as 4k+9.  FP8's FormatSpec likewise omits
 # its shape-dependent FP32 row-scale plane.  Consequently neither
 # ``effective_bits`` nor ``effective_bits_for_shape`` is authoritative for CB.
-# The FP8 index body lives in weight_bits as
-# k/8 bits/param (fp8 family, per-output-channel fp32 scale, group_size=0 so
-# effective_bits_for_shape = k/8 + 32/in_features exactly). quantize_dequantize
+# The FP8 index body is represented by the same group_size=256 superblock
+# stream as FP4-CB. Its per-output-channel FP32 scale cannot be represented by
+# that single-plane FormatSpec, so only the context-bound accountant adds the
+# shape-dependent 32/in_features term. quantize_dequantize
 # is the weighted-VQ closure that also feeds the (Milestone B) byte packer;
 # activations are byte-identical to NVFP4 (fp4) / FP8 dynamic (fp8).
 def _make_nvfp4_cb_spec(k: int) -> FormatSpec:
