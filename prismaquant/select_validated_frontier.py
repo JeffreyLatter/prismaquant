@@ -161,6 +161,86 @@ def kneedle_comparison(points: Sequence[Mapping[str, float]]) -> dict:
 
 TAIL_VETO_COLUMNS: tuple[str, ...] = ("kl_p95", "kl_p99", "kl_max", "nll_mean", "nll_p99")
 TAIL_VETO_CHOICES: tuple[str, ...] = ("none", "kl_p99", "kl_max", "nll_p99")
+#: Per-repeat values of each tail statistic, emitted by
+#: `validate_assignments_kl._kl_repeat_summary` at zero extra forward cost.
+TAIL_REPEAT_COLUMNS: tuple[str, ...] = tuple(f"{c}_repeats" for c in TAIL_VETO_COLUMNS)
+#: The contract statistic (R9/D1, ruled 2026-07-30). `kl_max` — the worst
+#: sequence — is the statistic that would have caught the broken 27B that passed
+#: on the mean while 80% of its prompts were bad (§7.2's ship gate already
+#: guards the p99 per-prompt NLL for the same reason).
+DEFAULT_TAIL_VETO: str = "kl_max"
+#: `--tail-eta auto`: derive the slack instead of picking one (house rule 2).
+DEFAULT_TAIL_ETA: str = "auto"
+
+
+def tail_eta_auto(row: Mapping, column: str) -> tuple[float, str]:
+    """Derived tail-veto slack for one incumbent row: `stderr(tail)/mean(tail)`.
+
+    **The derivation.** The veto asks whether a candidate's tail is *really*
+    worse than the incumbent's, and the only scale on which "really" means
+    anything is the noise of the statistic itself. `--calib-repeats` already
+    re-measures every row on independent calibration draws, so each tail
+    statistic arrives as a small sample (`<column>_repeats`); its relative
+    standard error — `std/sqrt(n)` over `mean` — is exactly "how much this tail
+    moves when nothing about the assignment changes". A candidate inside that
+    band is not distinguishable from the incumbent and is admitted; one outside
+    it is a real tail regression and is refused. Floored at 0 (a negative or
+    non-finite spread means no slack, not negative slack).
+
+    This is deliberately *not* a constant: §5's single-seed history (+10% that
+    flipped to −5.2% across repeats; between-seed std ~0.02) is the reason a
+    hand-set eta would be either vacuous or arbitrary at different scales.
+
+    Returns `(eta, source)` where `source` is one of `derived`,
+    `single_repeat` (n<2 — no spread exists, so the slack degrades to a strict
+    0 and the caller must say so out loud), `absent` (pre-R9 row that carries no
+    per-repeat tails) or `degenerate` (non-positive/non-finite mean).
+    """
+    repeats = row.get(f"{column}_repeats")
+    if repeats is None:
+        return 0.0, "absent"
+    try:
+        vals = [float(v) for v in repeats]
+    except (TypeError, ValueError):
+        return 0.0, "absent"
+    vals = [v for v in vals if math.isfinite(v)]
+    if len(vals) < 2:
+        return 0.0, "single_repeat"
+    mean = sum(vals) / len(vals)
+    if not math.isfinite(mean) or mean <= 0.0:
+        return 0.0, "degenerate"
+    var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+    stderr = math.sqrt(max(var, 0.0)) / math.sqrt(len(vals))
+    eta = stderr / mean
+    if not math.isfinite(eta):
+        return 0.0, "degenerate"
+    return max(eta, 0.0), "derived"
+
+
+def _tail_value(row: Mapping, column: str) -> float | None:
+    value = row.get(column)
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def tail_veto_inert_reason(rows: Sequence[Mapping], column: str | None) -> str | None:
+    """Why the veto cannot bind on these rows, or None when it can.
+
+    With the veto DEFAULT-ON, a validation JSON written before R9 carries no
+    tail column at all: vetoing every row would empty the frontier and turn a
+    stale input into a crash. The veto goes inert instead — loudly, never
+    silently — and the run behaves exactly as it did before R9.
+    """
+    if column is None:
+        return None
+    if not any(_tail_value(row, column) is not None for row in rows):
+        return "tail_column_absent_on_every_row"
+    return None
 
 
 def _row_metric(row: Mapping, metric: str) -> float | None:
@@ -261,7 +341,7 @@ def measured_rows(
             # 'tail_missing' rather than silently admitting.
             **{
                 column: row[column]
-                for column in TAIL_VETO_COLUMNS
+                for column in TAIL_VETO_COLUMNS + TAIL_REPEAT_COLUMNS
                 if row.get(column) is not None
             },
         })
@@ -274,7 +354,7 @@ def _frontier_from_rows(
     *,
     kl_noise_floor: float = 0.0,
     tail_veto: str | None = None,
-    tail_eta: float = 0.0,
+    tail_eta: float | str = 0.0,
     vetoed: list | None = None,
 ) -> list[dict]:
     """Return the eta-dominance lower envelope of measured rows.
@@ -291,24 +371,35 @@ def _frontier_from_rows(
     last admitted frontier point, so the tail is required to be non-increasing
     along the envelope exactly as the mean is.
 
-    ``tail_veto=None`` (the default, and ``--tail-veto none``) is byte-identical
-    to the historical behavior — no column is read and no row is vetoed.
-    Vetoed rows are appended to ``vetoed`` with a ``veto_reason`` so a rejection
-    is visible in the summary rather than silent.
+    ``tail_eta`` is a number, or ``"auto"`` — the derived slack, recomputed
+    against each incumbent as that row's between-repeat relative stderr (see
+    ``tail_eta_auto``). ``"auto"`` on a row with a single calibration repeat is
+    a strict 0; the CLI says so out loud.
+
+    ``tail_veto=None`` (and ``--tail-veto none``) is byte-identical to the
+    pre-R9 behavior — no column is read and no row is vetoed. The CLI default
+    is ``kl_max`` (ruled 2026-07-30); vetoed rows are appended to ``vetoed``
+    with a ``veto_reason`` so a rejection is visible in the summary rather than
+    silent.
     """
     frontier: list[dict] = []
     best_kl = float("inf")
     floor = max(float(kl_noise_floor), 0.0)
     column = str(tail_veto) if tail_veto and tail_veto != "none" else None
-    eta = float(tail_eta)
+    # Pre-R9 input: nothing to veto on. Go inert rather than veto every row and
+    # hand back an empty frontier (the caller reports the reason).
+    if tail_veto_inert_reason(rows, column) is not None:
+        column = None
+    auto_eta = isinstance(tail_eta, str) and tail_eta.strip().lower() == "auto"
+    eta = 0.0 if auto_eta else float(tail_eta)
     incumbent_tail: float | None = None
+    incumbent_row: Mapping | None = None
     for row in rows:
         if not (row["kl"] < best_kl - floor - 1e-12):
             continue
         if column is not None:
-            value = row.get(column)
-            value = float(value) if value is not None else None
-            if value is None or not math.isfinite(value):
+            value = _tail_value(row, column)
+            if value is None:
                 if vetoed is not None:
                     vetoed.append({
                         **dict(row),
@@ -316,6 +407,9 @@ def _frontier_from_rows(
                         "veto_column": column,
                     })
                 continue
+            eta_source = "explicit"
+            if auto_eta and incumbent_row is not None:
+                eta, eta_source = tail_eta_auto(incumbent_row, column)
             if (
                 incumbent_tail is not None
                 and value > incumbent_tail * (1.0 + eta) + 1e-12
@@ -328,9 +422,12 @@ def _frontier_from_rows(
                         "veto_value": value,
                         "veto_incumbent": incumbent_tail,
                         "veto_limit": incumbent_tail * (1.0 + eta),
+                        "veto_eta": float(eta),
+                        "veto_eta_source": eta_source,
                     })
                 continue
             incumbent_tail = value
+            incumbent_row = row
         frontier.append(row)
         best_kl = row["kl"]
     return frontier
@@ -342,7 +439,7 @@ def measured_frontier(
     metric: str = "kl",
     kl_noise_floor: float = 0.0,
     tail_veto: str | None = None,
-    tail_eta: float = 0.0,
+    tail_eta: float | str = 0.0,
     vetoed: list | None = None,
 ) -> list[dict]:
     """Return non-dominated measured KL/bpp points sorted by bpp.
@@ -516,7 +613,7 @@ def leave_one_out_kneedle_diagnostic(
     kl_noise_floor: float = 0.0,
     all_rows: Sequence[Mapping] | None = None,
     tail_veto: str | None = None,
-    tail_eta: float = 0.0,
+    tail_eta: float | str = 0.0,
 ) -> dict:
     """Leave-one-out stability of the kneedle pick.
 
@@ -607,7 +704,7 @@ def select_frontier_point(
     unstable_policy: str = "keep-kneedle",
     sat_z: float = 2.0,
     tail_veto: str | None = None,
-    tail_eta: float = 0.0,
+    tail_eta: float | str = 0.0,
     vetoed: list | None = None,
     budget_bytes: float | None = None,
 ) -> tuple[dict, list[dict]]:
@@ -722,19 +819,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--tail-veto",
         choices=TAIL_VETO_CHOICES,
-        default="none",
+        default=DEFAULT_TAIL_VETO,
         help="D1 tail veto: additionally require the named tail column to be "
              "non-increasing along the frontier, so a mean-KL win that "
              "regresses the tail is not admitted (CLAUDE.md §5 rule 4). "
              "Columns come from validate_assignments_kl's per-sequence "
-             "emission and share the gold lane's key names. Default 'none' is "
-             "byte-identical to no veto.",
+             "emission and share the gold lane's key names. DEFAULT "
+             f"'{DEFAULT_TAIL_VETO}' (ruled 2026-07-30): the worst sequence is "
+             "the statistic that would have caught the broken 27B that passed "
+             "on the mean while 80%% of its prompts were bad. The asymmetry is "
+             "the reason it is safe on by default — a spurious veto only makes "
+             "the pick MORE conservative (a higher-bpp, lower-tail point), and "
+             "it is never silent: every refusal is retained in the summary's "
+             "vetoed_rows with its veto_reason. 'none' restores the pre-R9 "
+             "envelope byte-for-byte.",
     )
     parser.add_argument(
-        "--tail-eta", type=float, default=0.0,
+        "--tail-eta", type=str, default=DEFAULT_TAIL_ETA,
         help="Slack on the tail veto: a row is admitted when "
-             "row[tail] <= incumbent[tail] * (1 + tail_eta). Default 0.0 "
-             "requires a strictly non-increasing tail.",
+             "row[tail] <= incumbent[tail] * (1 + tail_eta). DEFAULT 'auto' "
+             "DERIVES it (house rule 2) as the incumbent's between-repeat "
+             "relative stderr of the tail statistic, i.e. how much that tail "
+             "moves when nothing about the assignment changes; a single "
+             "calibration repeat has no spread, so auto degrades to a strict "
+             "0.0 and says so. An explicit number wins.",
     )
     parser.add_argument("--sat-z", type=float, default=2.0,
                         help="Significance multiplier on the combined per-bpp "
@@ -764,6 +872,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--validation-json must contain a results list")
 
     tail_veto = None if args.tail_veto == "none" else args.tail_veto
+    tail_eta_raw = str(args.tail_eta).strip()
+    tail_eta_auto_mode = tail_eta_raw.lower() == "auto"
+    if tail_eta_auto_mode:
+        tail_eta_arg: float | str = "auto"
+    else:
+        try:
+            tail_eta_arg = float(tail_eta_raw)
+        except ValueError:
+            parser.error(
+                f"--tail-eta must be a number or 'auto', got {args.tail_eta!r}")
     vetoed_rows: list[dict] = []
     selected, frontier = select_frontier_point(
         results,
@@ -776,7 +894,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         unstable_policy=args.unstable_policy,
         sat_z=args.sat_z,
         tail_veto=tail_veto,
-        tail_eta=args.tail_eta,
+        tail_eta=tail_eta_arg,
         vetoed=vetoed_rows,
         budget_bytes=(None if args.target_disk_gb is None
                       else float(args.target_disk_gb) * 1e9),
@@ -808,13 +926,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             kl_noise_floor=args.kl_noise_floor,
             all_rows=diagnostic_rows,
             tail_veto=tail_veto,
-            tail_eta=args.tail_eta,
+            tail_eta=tail_eta_arg,
         )
         if args.mode == "kneedle"
         else {"enabled": False, "reason": "mode_not_kneedle"}
     )
     rank_corr = spearman_rank_correlation(diagnostic_rows)
     worst_inversion = worst_rank_inversion(diagnostic_rows)
+    # What the veto actually did, recorded rather than inferred: whether it
+    # could bind at all on this input, and — under 'auto' — the slack each
+    # admitted incumbent contributed.
+    tail_inert_reason = tail_veto_inert_reason(diagnostic_rows, tail_veto)
+    eta_resolved: list[dict] | None = None
+    if tail_veto is not None and tail_inert_reason is None and tail_eta_auto_mode:
+        eta_resolved = []
+        for row in frontier:
+            eta_value, eta_source = tail_eta_auto(row, tail_veto)
+            eta_resolved.append({
+                "label": row.get("label"),
+                "eta": float(eta_value),
+                "source": eta_source,
+            })
     assignment = _load_assignment(selected["path"])
     layer_config = _layer_config_from_assignment(assignment)
 
@@ -861,7 +993,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "kl_noise_floor": float(args.kl_noise_floor),
         "tail_veto": {
             "column": tail_veto,
-            "eta": float(args.tail_eta),
+            "eta": tail_eta_arg,
+            "eta_mode": "auto" if tail_eta_auto_mode else "explicit",
+            "eta_resolved": eta_resolved,
+            "inert_reason": tail_inert_reason,
             "n_vetoed": len(vetoed_rows),
         },
         "vetoed_rows": vetoed_rows,
@@ -887,12 +1022,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"KL={selected['kl']:.8g}{mse_msg} mode={args.mode}",
         flush=True,
     )
-    if tail_veto is not None:
+    if tail_veto is not None and tail_inert_reason is not None:
         print(
-            f"[frontier-select] tail-veto={tail_veto} eta={args.tail_eta:g}: "
+            f"[frontier-select] WARNING: tail-veto={tail_veto} is INERT on this "
+            f"input ({tail_inert_reason}) — no row carries the column, so the "
+            "frontier is the pre-R9 mean-only envelope. Re-run "
+            "validate_assignments_kl at this commit to get the tail columns.",
+            flush=True,
+        )
+    elif tail_veto is not None:
+        eta_desc = (
+            "auto" if tail_eta_auto_mode
+            else f"{float(tail_eta_arg):g}"
+        )
+        print(
+            f"[frontier-select] tail-veto={tail_veto} eta={eta_desc}: "
             f"{len(vetoed_rows)} row(s) refused entry to the frontier",
             flush=True,
         )
+        if tail_eta_auto_mode:
+            for entry in (eta_resolved or []):
+                print(
+                    f"[frontier-select]   eta[{entry['label']}]="
+                    f"{entry['eta']:.6g} ({entry['source']})",
+                    flush=True,
+                )
+            degraded = sorted({
+                e["source"] for e in (eta_resolved or [])
+                if e["source"] != "derived"
+            })
+            if degraded:
+                print(
+                    "[frontier-select] WARNING: --tail-eta auto fell back to a "
+                    f"STRICT 0 on at least one incumbent ({', '.join(degraded)}): "
+                    "there is no between-seed spread to derive a slack from, so "
+                    "the veto is exact-comparison — and single-seed tails are "
+                    "noisy (§5: a +10% reading has flipped to -5.2% across "
+                    "repeats). Run validate_assignments_kl with "
+                    "--calib-repeats>=4 to derive a real slack.",
+                    flush=True,
+                )
         for row in vetoed_rows:
             print(
                 f"[frontier-select]   vetoed {row['label']} "

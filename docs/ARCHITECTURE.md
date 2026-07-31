@@ -655,12 +655,18 @@ is computed rather than approximated), else the independence lower bound, and it
 It is a **report**: never blocking, never touching an allocation. It runs after the assignment
 is final (that is why it is `[3c]` and not `[2d]` — no assignment exists at `[2d]`), and its
 result is stamped into `cost.pkl`'s `provenance["additivity"]`, so every artifact derived from
-that table carries the trust-region number. `AURA_ADDITIVITY_GATE=auto` (default) reports from a
-measured KL the run already produced (validated-surrogate's frontier JSON) and otherwise records
-the predicted sum with `measured_kl: null` and a status naming the reason; `measure` adds one
-bounded KL eval of the final assignment against the same format-menu dW cache AURA costed on;
-`0` disables. `auto` is deliberately zero-added-GPU: the default cost mode must not silently
-grow a stage.
+that table carries the trust-region number. **`AURA_ADDITIVITY_GATE=measure` is the default
+since 2026-07-30** (Robert's ruling on the R2 residue): it reports from a measured KL the run
+already produced when there is one (validated-surrogate's frontier JSON, free) and otherwise
+runs **one bounded KL eval** of the final assignment against the same format-menu dW cache AURA
+costed on — so every AURA-default run performs the measurement and **every artifact carries a
+real residual**. The wiring's one weak spot was that under `SELECTION_MODE=surrogate` an
+artifact carried a prediction and no residual, leaving AURA's structural assumption a two-model
+memory instead of a per-artifact number; the ruling closes it, at the price of one bounded GPU
+eval per run. `auto` (the pre-ruling behaviour) stays selectable and is zero-added-GPU: it
+reports only from a measurement the run already made, otherwise recording the predicted sum with
+`measured_kl: null` and a status naming the reason. `0` disables. Either way it is a report —
+non-blocking, never touching an allocation.
 
 ### 4.4 L2 and L3 — retired 2026-07-30 (`archive/l3_propagated_2026-07-30/`)
 
@@ -806,20 +812,43 @@ under `TARGET_DISK_GB`**), `best-kl`, `lowest-bpp`, `practical-knee`, `saturatio
 Diagnostics emitted with the pick: surrogate-vs-KL Spearman, `worst_rank_inversion`,
 leave-one-out kneedle stability.
 
-**Tail veto** (D1, 2026-07-30). §2.3 rule: KL is a *screening* metric and a lower mean can hide
-a heavier tail — the shipped 27B PrismaSCOUT has a worse max-prompt NLL than the artifact it
-beat on mean KL. `--tail-veto {none,kl_p99,kl_max,nll_p99}` adds a second admission condition to
-the same single pass: a row that improves mean KL enters only when
+**Tail veto** (D1, 2026-07-30) — **DEFAULT-ON, contract statistic `kl_max`** (ruled by Robert
+2026-07-30). §2.3 rule: KL is a *screening* metric and a lower mean can hide a heavier tail —
+the shipped 27B PrismaSCOUT has a worse max-prompt NLL than the artifact it beat on mean KL.
+`--tail-veto {none,kl_p99,kl_max,nll_p99}` adds a second admission condition to the same single
+pass: a row that improves mean KL enters only when
 `row[tail] <= incumbent[tail] * (1 + --tail-eta)`, the incumbent being the last *admitted*
 frontier point. Columns come from `validate_assignments_kl`'s per-sequence emission (§7.1) and
-carry the gold lane's key names, so a selection row and a served row read the same. **Default
-`none` is byte-identical to no veto** — no column is read, nothing is refused; `--tail-eta`
-defaults to `0.0` (strictly non-increasing tail). Refusals are never silent: vetoed rows are
-printed and kept in the summary under `vetoed_rows` with a `veto_reason`
-(`tail_regression`, or `tail_missing` when the row predates the emission). The veto also
-applies inside the leave-one-out rebuild, so the stability diagnostic reflects the same
-envelope the pick came from. There is **no second eval pass** — the tail was already being
-computed and discarded.
+carry the gold lane's key names, so a selection row and a served row read the same.
+
+- **The contract statistic is `kl_max`** — the worst sequence. It is the statistic that would
+  have caught the broken 27B that passed on the *mean* while 80% of its prompts were bad, which
+  is the same reason §7.2's ship gate guards p99 per-prompt NLL. `nll_p99` continues to be
+  recorded on every row (both are free), so switching the contract later is a flag, not a
+  re-measurement.
+- **Default-on is safe because the failure is one-sided.** A spurious veto only makes the pick
+  **more conservative** — it refuses a lower-bpp/lower-mean point and keeps a higher-bpp one
+  with a smaller tail — and it is never silent: every refusal is printed and retained in the
+  summary under `vetoed_rows` with its `veto_reason` (`tail_regression`, or `tail_missing` when
+  a row predates the emission). The `--tail-veto` help text says exactly this.
+- **`--tail-eta` defaults to `auto`: the slack is derived, not chosen** (house rule 2). `auto` =
+  the incumbent row's **relative stderr of the tail statistic across calibration repeats**
+  (`std/√n ÷ mean` over `<column>_repeats`, floored at 0) — i.e. how much that tail moves when
+  nothing about the assignment changes, so a candidate inside its own measurement noise is
+  admitted and one outside it is a real regression. `validate_assignments_kl` emits the
+  per-repeat tails from the same forwards the mean already paid for. With a **single** repeat
+  there is no spread: `auto` degrades to a strict `0` **and prints a warning**, because
+  single-seed tails are noisy (§2.5: a +10% reading has flipped to −5.2% across repeats) — run
+  validation with `--calib-repeats ≥ 4` to get a real slack. An explicit numeric `--tail-eta`
+  always wins. Derivation documented at `select_validated_frontier.tail_eta_auto`.
+- **A pre-R9 validation JSON carries no tail column at all.** Vetoing every row would turn a
+  stale input into an empty frontier, so the veto goes **inert** with a loud warning and the
+  run reproduces the mean-only envelope (`tail_veto_inert_reason`, recorded in the summary).
+
+`--tail-veto none` restores the pre-R9 envelope byte-for-byte (pinned by a regression test).
+The veto also applies inside the leave-one-out rebuild, so the stability diagnostic reflects
+the same envelope the pick came from. There is **no second eval pass** — the tail was already
+being computed and discarded.
 
 **Byte budget = constraint, measured KL = objective** (re-vet **R1**, closes D12). Two disjoint
 ship selectors used to exist: the allocator's `--target-disk-gb` picked by *predicted* Δloss
@@ -915,7 +944,15 @@ cache, so building the *export* cache burns hours on bytes that never ship.
 `aura-adjoint`; neither is its default and neither is recommended. AURA's −38%/−17.9% margins
 are native-lane results, and CB's error surface (VQ quantization plus the expert route-flip
 floor) is a different animal. The pipeline prints that the combination is opt-in when it is
-selected. The A/B that would justify a CB default has not been run.
+selected. The A/B that would justify a CB default has not been run — and is **deferred by
+Robert (2026-07-30)** behind the NVFP4-vs-CB-FP8@4.5 criteria work; CB stays `weight-recon`
+until it runs.
+
+**The trust-region readout that rides with the default objective.** `AURA_ADDITIVITY_GATE`
+defaults to **`measure`** (ruled 2026-07-30), so every `COST_MODE=aura` run performs one
+bounded end-KL eval and stamps a real `residual` into `cost.pkl`'s `provenance["additivity"]`
+— stage `[3c]`, §4.3. `auto` (report only from a measurement the run already made) and `0`
+remain selectable.
 
 ## 5. Formats & render
 
@@ -1180,6 +1217,7 @@ silently corrupts.
 | Numeric ship gate | `validate_quantized_model.py` | **never run, never echoed** | yes, exit 0/1 |
 | Gold lane | `tools/measure_vllm_full_kl.py`, `tools/measure_vllm_wikitext_ppl.py` | never | manual, authoritative |
 | Ship record | `exported/shipcard.json` (opened by the exporter) → `tools/shipcard.py verify` | opened by every export | **refuses** until every serve-lane slot is closed |
+| **Publication** | `tools/publish_artifact.py` | no — operator-run | **BLOCKING**: refuses to upload (or even print the upload command) unless `shipcard.verify` passes |
 
 Nothing in the pipeline blocks on a quality number — and it should not: `vllm` is not
 importable in the build venv, so embedding a serve inside `run-pipeline.sh` would make the
@@ -1193,8 +1231,20 @@ description and the shipcard is the *refusal*. Two things this made visible rath
 assumed: the CB half was pure wiring (native and CB declare the **same** ship-gate runner on
 the **same** endpoint kind, because `validate_quantized_model.py` is endpoint-agnostic), and
 GGUF's missing frontier evaluator is a thin adapter over its own harness
-(`gguf_kl_evaluator.py`, §9.3). Gates are **advisory** — recorded, never blocking; making them
-blocking changes every lane's run and is deferred.
+(`gguf_kl_evaluator.py`, §9.3). **Gates stay advisory in the pipeline; the blocking point is PUBLICATION** (Robert's ruling on
+R16, 2026-07-30). Nothing in `run-pipeline.sh` blocks on a quality number and nothing should —
+the build/serve boundary is physical. But an artifact only becomes a claim when it goes public,
+so that is where the record is enforced: `tools/publish_artifact.py <artifact_dir> --repo-id
+rdtand/<name>` calls `prismaquant.shipcard.verify` as a **library call** (never a subprocess —
+the ambient python may not have the package) and **refuses before it uploads anything or even
+prints the command it would run**, listing every unfilled or failing slot; a refusal that still
+hands over a copy-pasteable command is not a refusal. `huggingface_hub` is imported lazily, so
+in the build venv the tool verifies and then prints the exact `hf upload …` line to run
+elsewhere. The escape hatch is deliberately expensive: `--force-unverified` requires the
+operator to **re-type the artifact directory's basename** (interactively, or `--confirm-name`
+for scripts) and stamps `forced_unverified: true` plus the overridden problems into the
+shipcard, so the artifact itself carries the record that it shipped ungated. Tests:
+`tests/test_publish_artifact.py`.
 
 **The ship record (`exported/shipcard.json`).** `export_native_compressed._write_shipcard`
 (`:8111`, called after `mixed_native_manifest.json`) opens a card carrying the build-lane
@@ -1710,7 +1760,8 @@ longer the same as requiring `COST_MODE=local`: since CB Milestone C the product
 render those families weighted (`--col-weights`), so a cached-menu render is admissible on
 these lanes, opt-in and non-default. Each lane's serve command, endpoint, gate set and KL
 evaluator are declared in `prismaquant/lane_specs/*.json` (re-vet **R16**); the gates are
-advisory and the shipcard is what refuses (§7).
+advisory and the shipcard is what refuses — at **publication**, via `tools/publish_artifact.py`
+(§7.1).
 
 **DIAGRAM-2 — Serving lanes:** the three artifact containers, the runtime each requires, and
 the one box any of it has been proven on.
@@ -1858,7 +1909,8 @@ exceeds `EXPORT_STREAMING_THRESHOLD_GB` (80) — non-streaming goes resident and
 is the regression anchor. There is no in-lane serving smoke — CB artifacts serve only through
 the out-of-tree plugin — but the gate set is now *declared* (`prismaquant/lane_specs/nvfp4_cb.json`,
 re-vet **R16**): same OpenAI endpoint, same endpoint-agnostic `validate_quantized_model`, plus
-the lane-specific prefill perf gate (INV-2). Gates are advisory; the shipcard refuses.
+the lane-specific prefill perf gate (INV-2). Gates are advisory; the shipcard refuses, and
+`tools/publish_artifact.py` is where that refusal binds (§7.1).
 
 **Milestone C is closed (2026-07-30, re-vet R3).** `render_production_weight` /
 `build_production_cache` take `col_weights`, so a `ProductionWeightCache` render of a CB rung
@@ -2049,7 +2101,7 @@ unplumbed).
 
 | # | Item | Evidence | Sev | Suggested action |
 |---|---|---|---|---|
-| D1 | **FIXED 2026-07-30 (R9).** Tail-veto was unimplemented since 2026-06-05 — and it had stalled on an assumed cost (a second eval pass) that does not exist. **Mechanism:** every KL site already accumulated per-sequence values and discarded them at the return; both selection paths now return `(mean, per_seq, stats)`, so `kl_p95/kl_p99/kl_max` and the rung-2 `nll_mean/nll_p99` (one `gather` + `logsumexp` on logits already in hand) cost **zero extra forwards**. `_frontier_from_rows` gained a second admission condition — `row[tail] <= incumbent[tail] * (1 + tail_eta)` — behind `--tail-veto {none,kl_p99,kl_max,nll_p99}` / `--tail-eta`, with vetoed rows retained under `vetoed_rows` + `veto_reason` so a refusal is visible. **Default `--tail-veto none` is byte-identical to the old selector** (pinned by a frontier-identity regression test); promotion to default-on wants a 27B run showing the two picks agree. §4.6, §7.1. | `select_validated_frontier.py` `_frontier_from_rows`, `measured_rows`, `TAIL_VETO_COLUMNS`; `kl_measurement.sequence_token_nll` / `summarize_per_sequence_kl`; `tests/test_select_validated_frontier.py`, `tests/test_kl_per_sequence_tail.py` | — | Done, default-off. Follow-up: pick the contract statistic (`kl_max` is the one that would have caught the broken 27B that passed on mean while 80% of prompts were bad) and flip the default after a 27B agreement check. |
+| D1 | **FIXED 2026-07-30 (R9).** Tail-veto was unimplemented since 2026-06-05 — and it had stalled on an assumed cost (a second eval pass) that does not exist. **Mechanism:** every KL site already accumulated per-sequence values and discarded them at the return; both selection paths now return `(mean, per_seq, stats)`, so `kl_p95/kl_p99/kl_max` and the rung-2 `nll_mean/nll_p99` (one `gather` + `logsumexp` on logits already in hand) cost **zero extra forwards**. `_frontier_from_rows` gained a second admission condition — `row[tail] <= incumbent[tail] * (1 + tail_eta)` — behind `--tail-veto {none,kl_p99,kl_max,nll_p99}` / `--tail-eta`, with vetoed rows retained under `vetoed_rows` + `veto_reason` so a refusal is visible. **DEFAULT-ON since 2026-07-30** with `kl_max` (the worst sequence) as the contract statistic — Robert's ruling; `--tail-veto none` still reproduces the pre-R9 envelope byte-for-byte (pinned by a frontier-identity regression test). The slack is **derived, not chosen**: `--tail-eta auto` (default) is the incumbent's between-repeat relative stderr of the tail statistic, degrading to a strict 0 **with a printed warning** on a single repeat. A pre-R9 validation JSON (no tail column on any row) makes the veto go inert with a warning rather than empty the frontier. §4.6, §7.1. | `select_validated_frontier.py` `_frontier_from_rows`, `measured_rows`, `tail_eta_auto`, `tail_veto_inert_reason`, `TAIL_VETO_COLUMNS`/`TAIL_REPEAT_COLUMNS`; `validate_assignments_kl._kl_repeat_summary` (per-repeat tails); `kl_measurement.sequence_token_nll` / `summarize_per_sequence_kl`; `tests/test_select_validated_frontier.py`, `tests/test_kl_per_sequence_tail.py` | — | CLOSED — default-on, `kl_max`, repeat-derived eta (ruled 2026-07-30). |
 | D2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile — §8.5 L2. All three import sites now call `profile.build_mtp_module()` / `read_mtp_source_state_dict()` / `load_mtp_state_dict()`, keyed on the new `mtp_source_prefix()` accessor; `prismaquant/mtp_module.py` is deleted and DSv4 declares `has_mtp → False` + `"mtp."` passthrough. | §8.5 L2 | ~~HIGH~~ CLOSED | — |
 | D3 | **FIXED 2026-07-30 (R10)** — was: gridbook per-arch CB expert opt-in as a hand-maintained code list, a missing line failing silently as coherent garbage generation. Now a module-path tuple (`plugin.py:91-118`) plus an unbypassable serve-time fill assertion (`cb_fill_guard.py`, raised from `process_weights_after_loading`). §8.5 L3 has the mechanism. | §8.5 L3 | ~~HIGH~~ closed | — |
 | ~~D4~~ | **CLOSED 2026-07-30 (re-vet R11).** `TARGET_PROFILE` has no shell default; `--target-profile` reaches the allocator only when requested, with `--target-profile-default vllm_packed_moe` as the fallback; the allocator stamps its resolved profile into `layer_config.json`'s reserved `__prismaquant__` block and the exporter reads it (env override kept). Non-regression 0/614 and 0/500 on the shipped 27B/35B. See §8.5 L1. | §8.5 L1 | ~~HIGH~~ | closed |

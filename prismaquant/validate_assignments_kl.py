@@ -58,6 +58,11 @@ from prismaquant.perturbed_x_cache import (
     build_quantizable_map,
     calibration_data_hash,
 )
+# The tail statistics the selector may veto on; kept in ONE place so the
+# emitting side and the reading side cannot drift (R9/D1).
+from prismaquant.select_validated_frontier import (
+    TAIL_VETO_COLUMNS as _TAIL_REPEAT_COLUMNS,
+)
 from prismaquant.schemas import validate_cost_payload
 from prismaquant.sensitivity_probe import load_calibration
 from prismaquant.source_prefetch import prefetch_safetensors_checkpoint
@@ -733,6 +738,8 @@ def _kl_repeat_summary(
     ucb_z: float,
     kl_per_sample: Sequence[float] | None = None,
     nll_per_sample: Sequence[float] | None = None,
+    kl_per_sample_repeats: Sequence[Sequence[float]] | None = None,
+    nll_per_sample_repeats: Sequence[Sequence[float]] | None = None,
 ) -> dict[str, object]:
     """Summarize per-repeat KL, plus (R9) the tail over per-sequence values.
 
@@ -740,6 +747,15 @@ def _kl_repeat_summary(
     the caller; when supplied, the gold lane's tail keys
     (``kl_p95``/``kl_p99``/``kl_max``, ``nll_mean``/``nll_p99``) are emitted
     alongside the mean at zero extra forward cost.
+
+    ``kl_per_sample_repeats`` / ``nll_per_sample_repeats`` are the SAME values
+    kept per repeat instead of pooled. They cost nothing extra and are what
+    makes the D1 tail veto's slack derivable rather than a taste constant: the
+    selector's ``--tail-eta auto`` reads ``<column>_repeats`` and takes the
+    between-repeat relative stderr of the tail statistic
+    (``select_validated_frontier.tail_eta_auto``). One repeat emits a
+    one-element list — enough for the selector to say "single seed" out loud
+    rather than infer a slack from a spread it does not have.
 
     ``kl_mean`` is the canonical mean key (R28); ``last_token_kl`` is kept as an
     alias for one cycle because it names a scope that has not been the shipping
@@ -767,6 +783,10 @@ def _kl_repeat_summary(
         "kl_ucb": float(mean + float(ucb_z) * stderr),
         "kl_ucb_z": float(ucb_z),
     }
+    if kl_per_sample is None and kl_per_sample_repeats:
+        kl_per_sample = [v for chunk in kl_per_sample_repeats for v in chunk]
+    if nll_per_sample is None and nll_per_sample_repeats:
+        nll_per_sample = [v for chunk in nll_per_sample_repeats for v in chunk]
     if kl_per_sample:
         tail = summarize_per_sequence_kl(
             kl_per_sample, nll_values=nll_per_sample)
@@ -775,6 +795,25 @@ def _kl_repeat_summary(
         # every repeat drew the same number of sequences.
         tail.pop("kl_mean", None)
         summary.update(tail)
+    if kl_per_sample_repeats:
+        nll_chunks = list(nll_per_sample_repeats or [])
+        per_repeat = [
+            summarize_per_sequence_kl(
+                chunk,
+                nll_values=(nll_chunks[i] if i < len(nll_chunks) else None),
+            )
+            for i, chunk in enumerate(kl_per_sample_repeats)
+            if chunk
+        ]
+        for column in _TAIL_REPEAT_COLUMNS:
+            column_vals = [
+                float(stat[column]) for stat in per_repeat
+                if stat.get(column) is not None
+            ]
+            # All-or-nothing: a partial list would silently understate the
+            # spread the slack is derived from.
+            if per_repeat and len(column_vals) == len(per_repeat):
+                summary[f"{column}_repeats"] = column_vals
     return summary
 
 
@@ -1414,9 +1453,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             kl_values: list[float] = []
             # R9: per-sequence KL / token NLL concatenated across repeats. Both
-            # fall out of the same forwards the mean already paid for.
+            # fall out of the same forwards the mean already paid for. The
+            # per-repeat nesting is kept as well (same values, not pooled) so
+            # the tail's between-seed spread is recoverable — that spread is
+            # what `--tail-eta auto` derives the veto slack from.
             kl_per_sample: list[float] = []
             nll_per_sample: list[float] = []
+            kl_per_sample_repeats: list[list[float]] = []
+            nll_per_sample_repeats: list[list[float]] = []
             replay_runs: list[dict[str, object]] = []
             for repeat_idx, (calib_ids, ref_log_probs) in enumerate(
                 zip(calib_repeats, ref_log_prob_repeats, strict=True)
@@ -1455,11 +1499,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         return_per_sequence=True,
                     )
                 kl_values.append(float(kl_value))
-                kl_per_sample.extend(float(v) for v in kl_seq)
+                kl_this_repeat = [float(v) for v in kl_seq]
+                kl_per_sample.extend(kl_this_repeat)
+                kl_per_sample_repeats.append(kl_this_repeat)
                 replay_stats = dict(replay_stats)
-                nll_per_sample.extend(
+                nll_this_repeat = [
                     float(v) for v in (replay_stats.pop("nll_per_sample", None) or [])
-                )
+                ]
+                nll_per_sample.extend(nll_this_repeat)
+                nll_per_sample_repeats.append(nll_this_repeat)
                 replay_runs.append({
                     "repeat": int(repeat_idx),
                     **replay_stats,
@@ -1469,6 +1517,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ucb_z=float(args.kl_ucb_z),
                 kl_per_sample=kl_per_sample,
                 nll_per_sample=nll_per_sample,
+                kl_per_sample_repeats=kl_per_sample_repeats,
+                nll_per_sample_repeats=nll_per_sample_repeats,
             )
             kl = float(kl_summary["kl_mean"])
             replay_stats = {

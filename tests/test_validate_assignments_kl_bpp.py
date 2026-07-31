@@ -140,3 +140,37 @@ def test_kl_repeat_summary_without_per_sequence_data_omits_tail():
     summary = _kl_repeat_summary([0.10, 0.20], ucb_z=0.0)
     for key in ("kl_p95", "kl_p99", "kl_max", "kl_per_sample", "nll_p99"):
         assert key not in summary
+    for key in ("kl_max_repeats", "kl_p99_repeats", "nll_p99_repeats"):
+        assert key not in summary
+
+
+def test_kl_repeat_summary_emits_per_repeat_tails_for_the_derived_slack():
+    """The tail's between-seed spread is what `--tail-eta auto` derives from."""
+    summary = _kl_repeat_summary(
+        [0.20, 0.22],
+        ucb_z=0.0,
+        kl_per_sample_repeats=[[0.10, 0.12, 0.90], [0.11, 0.13, 0.95]],
+        nll_per_sample_repeats=[[2.0, 2.1, 5.0], [2.0, 2.2, 5.2]],
+    )
+
+    assert summary["kl_max_repeats"] == [0.90, 0.95]
+    assert len(summary["kl_p99_repeats"]) == 2
+    assert len(summary["nll_p99_repeats"]) == 2
+    # The pooled tail is still emitted, from the same values, flattened.
+    assert summary["kl_max"] == 0.95
+    assert summary["kl_per_sample"] == [0.10, 0.12, 0.90, 0.11, 0.13, 0.95]
+
+    from prismaquant.select_validated_frontier import tail_eta_auto
+    eta, source = tail_eta_auto(summary, "kl_max")
+    assert source == "derived"
+    assert eta > 0.0
+
+
+def test_kl_repeat_summary_single_repeat_tail_list_is_one_element():
+    """One repeat => a 1-element list, so the selector can say 'single seed'."""
+    summary = _kl_repeat_summary(
+        [0.20], ucb_z=0.0, kl_per_sample_repeats=[[0.10, 0.12, 0.90]])
+    assert summary["kl_max_repeats"] == [0.90]
+
+    from prismaquant.select_validated_frontier import tail_eta_auto
+    assert tail_eta_auto(summary, "kl_max") == (0.0, "single_repeat")

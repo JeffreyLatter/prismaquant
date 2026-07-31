@@ -108,6 +108,36 @@ def test_cost_axes_are_declared_with_back_compat_aliases():
     assert "COST_RENDER" in doc and "COST_OBJECTIVE" in doc
 
 
+def test_additivity_gate_default_is_measure():
+    """Ruled 2026-07-30 (R2 residue): every AURA-default run measures a residual.
+
+    `auto` reported only from a KL the run happened to have, so under
+    `SELECTION_MODE=surrogate` an artifact carried a prediction and no residual
+    — AURA's structural assumption stayed a two-model memory. `measure` costs
+    one bounded end-KL eval and buys a per-artifact number.
+    """
+    script, doc = _pipeline(), _doc()
+    assert _shell_default(script, "AURA_ADDITIVITY_GATE") == "measure"
+    assert "AURA_ADDITIVITY_GATE=measure" in doc
+    # auto and off must stay selectable (the report is never mandatory GPU work
+    # for someone who explicitly does not want it).
+    assert '"$AURA_ADDITIVITY_GATE" != "0"' in script
+    assert '"$AURA_ADDITIVITY_GATE" == "measure"' in script
+
+
+def test_tail_veto_default_on_with_kl_max_is_documented():
+    """R9/D1 ruled 2026-07-30: default-on, `kl_max` contract, derived eta."""
+    from prismaquant.select_validated_frontier import (
+        DEFAULT_TAIL_ETA,
+        DEFAULT_TAIL_VETO,
+    )
+    doc = _doc()
+    assert DEFAULT_TAIL_VETO == "kl_max"
+    assert DEFAULT_TAIL_ETA == "auto"
+    assert "DEFAULT-ON, contract statistic `kl_max`" in doc
+    assert "--tail-eta` defaults to `auto`" in doc
+
+
 def test_cb_defaults_match_the_shipped_drivers():
     """D15: a default no shipped driver uses documents an unvalidated path.
     Pinned against the drivers themselves so the two cannot drift again."""

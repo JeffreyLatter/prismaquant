@@ -288,6 +288,10 @@ within 1–2%. The decision-unit *framing* from CLADO is kept
 - **Pre-ship gate** (`validate_quantized_model.py`): vLLM actually serves;
   generation is coherent; PPL < threshold **and p99 per-prompt NLL** < threshold
   (p99 added after a broken 27B passed on mean while 80% of prompts were broken).
+- **No HF upload without `tools/publish_artifact.py`** — it refuses on an
+  unverified shipcard (pipeline gates stay advisory; **publication** is the
+  blocking point). `--force-unverified` needs the artifact dir's basename
+  re-typed and stamps `forced_unverified` onto the card.
 - **Promotion ladder:** Research (opt-in, documented, excluded from defaults) →
   Candidate (small-model GPU+vLLM smokes + a 27B measurement plan) → Production
   recipe (wins/preserves KL/bpp/runtime on the target stack + serving suite +

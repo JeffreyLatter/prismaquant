@@ -8,6 +8,8 @@ from pathlib import Path
 import math
 
 from prismaquant.select_validated_frontier import (
+    DEFAULT_TAIL_ETA,
+    DEFAULT_TAIL_VETO,
     _frontier_from_rows,
     _kneedle_convex_decreasing,
     _log_error_values,
@@ -18,6 +20,8 @@ from prismaquant.select_validated_frontier import (
     practical_knee,
     select_frontier_point,
     spearman_rank_correlation,
+    tail_eta_auto,
+    tail_veto_inert_reason,
     worst_rank_inversion,
 )
 
@@ -520,8 +524,8 @@ def _tail_rows():
     ]
 
 
-def test_tail_veto_off_is_frontier_identity():
-    """Default (veto off) must reproduce the historical envelope exactly."""
+def test_tail_veto_none_mode_is_frontier_identity():
+    """`--tail-veto none` must reproduce the pre-R9 envelope exactly."""
     rows = _tail_rows()
     baseline = _frontier_from_rows(rows)
     assert [r["label"] for r in baseline] == ["a", "b", "c", "d"]
@@ -600,8 +604,7 @@ def test_select_frontier_point_threads_the_veto():
     assert [r["label"] for r in frontier_off] == ["a", "b", "c", "d"]
 
 
-def test_tail_veto_cli_records_vetoed_rows(tmp_path):
-    rows = _tail_rows()
+def _write_validation(tmp_path, rows, columns=("kl_p99",)):
     results = []
     for row in rows:
         path = tmp_path / f"{row['label']}.json"
@@ -611,30 +614,136 @@ def test_tail_veto_cli_records_vetoed_rows(tmp_path):
         }))
         results.append({
             "label": row["label"], "path": str(path), "bpp": row["bpp"],
-            "last_token_kl": row["kl"], "kl_p99": row["kl_p99"],
+            "last_token_kl": row["kl"],
+            **{c: row[c] for c in columns if c in row},
         })
     validation_path = tmp_path / "validation.json"
     validation_path.write_text(json.dumps({"results": results}))
+    return validation_path
 
-    def _run(extra):
-        summary = tmp_path / f"selection{'-'.join(extra) or '-off'}.json"
-        subprocess.run(
-            [sys.executable, "-m", "prismaquant.select_validated_frontier",
-             "--validation-json", str(validation_path),
-             "--mode", "best-kl",
-             "--output-layer-config", str(tmp_path / "lc.json"),
-             "--output-assignment", str(tmp_path / "sa.json"),
-             "--output-summary", str(summary), *extra],
-            cwd=Path(__file__).resolve().parents[1], check=True,
-        )
-        return json.loads(summary.read_text())
 
-    off = _run([])
+def _run_select(tmp_path, validation_path, extra, tag="run"):
+    summary = tmp_path / f"selection-{tag}.json"
+    subprocess.run(
+        [sys.executable, "-m", "prismaquant.select_validated_frontier",
+         "--validation-json", str(validation_path),
+         "--mode", "best-kl",
+         "--output-layer-config", str(tmp_path / "lc.json"),
+         "--output-assignment", str(tmp_path / "sa.json"),
+         "--output-summary", str(summary), *extra],
+        cwd=Path(__file__).resolve().parents[1], check=True,
+    )
+    return json.loads(summary.read_text())
+
+
+def test_tail_veto_cli_default_is_on_with_kl_max(tmp_path):
+    """Ruled 2026-07-30: the veto ships DEFAULT-ON with kl_max as the contract."""
+    assert DEFAULT_TAIL_VETO == "kl_max"
+    assert DEFAULT_TAIL_ETA == "auto"
+    validation_path = _write_validation(
+        tmp_path, _tail_rows(), columns=("kl_p99", "kl_max"))
+    default = _run_select(tmp_path, validation_path, [], tag="default")
+    assert default["tail_veto"]["column"] == "kl_max"
+    assert default["tail_veto"]["eta"] == "auto"
+    assert default["tail_veto"]["eta_mode"] == "auto"
+    assert default["tail_veto"]["inert_reason"] is None
+    # c wins the mean and blows the worst-sequence tail (2.40 vs 0.70): refused.
+    assert [r["label"] for r in default["vetoed_rows"]] == ["c"]
+    assert [r["label"] for r in default["frontier"]] == ["a", "b", "d"]
+    assert default["vetoed_rows"][0]["veto_column"] == "kl_max"
+    # No per-repeat tails on these rows -> the derived slack degrades to strict 0.
+    assert {e["source"] for e in default["tail_veto"]["eta_resolved"]} == {"absent"}
+
+
+def test_tail_veto_cli_none_mode_restores_the_pre_r9_envelope(tmp_path):
+    validation_path = _write_validation(
+        tmp_path, _tail_rows(), columns=("kl_p99", "kl_max"))
+    off = _run_select(tmp_path, validation_path, ["--tail-veto", "none"],
+                      tag="off")
     assert off["tail_veto"]["column"] is None
     assert off["vetoed_rows"] == []
     assert [r["label"] for r in off["frontier"]] == ["a", "b", "c", "d"]
 
-    on = _run(["--tail-veto", "kl_p99"])
-    assert on["tail_veto"] == {"column": "kl_p99", "eta": 0.0, "n_vetoed": 1}
+
+def test_tail_veto_cli_goes_inert_on_a_pre_r9_validation_json(tmp_path):
+    """Default-on must not turn a tail-less (pre-R9) input into an empty frontier."""
+    validation_path = _write_validation(tmp_path, _tail_rows(), columns=())
+    out = _run_select(tmp_path, validation_path, [], tag="inert")
+    assert out["tail_veto"]["column"] == "kl_max"
+    assert out["tail_veto"]["inert_reason"] == "tail_column_absent_on_every_row"
+    assert out["vetoed_rows"] == []
+    assert [r["label"] for r in out["frontier"]] == ["a", "b", "c", "d"]
+
+
+def test_tail_veto_cli_records_vetoed_rows(tmp_path):
+    validation_path = _write_validation(tmp_path, _tail_rows())
+    on = _run_select(tmp_path, validation_path,
+                     ["--tail-veto", "kl_p99", "--tail-eta", "0.0"], tag="p99")
+    assert on["tail_veto"]["column"] == "kl_p99"
+    assert on["tail_veto"]["eta"] == 0.0
+    assert on["tail_veto"]["eta_mode"] == "explicit"
+    assert on["tail_veto"]["n_vetoed"] == 1
     assert [r["label"] for r in on["vetoed_rows"]] == ["c"]
     assert [r["label"] for r in on["frontier"]] == ["a", "b", "d"]
+
+
+def test_tail_veto_cli_explicit_eta_beats_auto(tmp_path):
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30, "kl_max": 1.00},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20, "kl_max": 1.05},
+    ]
+    validation_path = _write_validation(tmp_path, rows, columns=("kl_max",))
+    strict = _run_select(tmp_path, validation_path, [], tag="strict")
+    assert [r["label"] for r in strict["frontier"]] == ["a"]
+    loose = _run_select(tmp_path, validation_path, ["--tail-eta", "0.10"],
+                        tag="loose")
+    assert loose["tail_veto"]["eta"] == 0.10
+    assert [r["label"] for r in loose["frontier"]] == ["a", "b"]
+
+
+# ---- the derived slack (--tail-eta auto) --------------------------------
+
+
+def test_tail_eta_auto_is_the_between_repeat_relative_stderr():
+    repeats = [1.0, 1.1, 0.9, 1.0]
+    eta, source = tail_eta_auto({"kl_max_repeats": repeats}, "kl_max")
+    assert source == "derived"
+    mean = sum(repeats) / len(repeats)
+    var = sum((v - mean) ** 2 for v in repeats) / (len(repeats) - 1)
+    assert eta == math.sqrt(var) / math.sqrt(len(repeats)) / mean
+    assert eta > 0.0
+
+
+def test_tail_eta_auto_degrades_to_strict_zero_without_a_spread():
+    assert tail_eta_auto({"kl_max_repeats": [1.0]}, "kl_max") == (0.0, "single_repeat")
+    assert tail_eta_auto({}, "kl_max") == (0.0, "absent")
+    assert tail_eta_auto({"kl_max_repeats": [0.0, 0.0]}, "kl_max") == (0.0, "degenerate")
+
+
+def test_tail_eta_auto_admits_inside_the_measured_noise_and_refuses_outside():
+    """The slack is the tail's own noise: 4% moves are noise, 100% is a regression."""
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30, "kl_max": 1.00,
+         "kl_max_repeats": [1.0, 1.1, 0.9, 1.0]},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20, "kl_max": 1.02},
+        {"label": "c", "path": "c", "bpp": 5.5, "kl": 0.10, "kl_max": 2.00},
+    ]
+    vetoed = []
+    frontier = _frontier_from_rows(
+        rows, tail_veto="kl_max", tail_eta="auto", vetoed=vetoed)
+    assert [r["label"] for r in frontier] == ["a", "b"]
+    assert [r["label"] for r in vetoed] == ["c"]
+    assert vetoed[0]["veto_eta_source"] == "absent"  # b carries no repeats
+    # With eta hard-zero, b's 2% is refused too: the derived slack is doing work.
+    strict = _frontier_from_rows(rows, tail_veto="kl_max", tail_eta=0.0)
+    assert [r["label"] for r in strict] == ["a"]
+
+
+def test_tail_veto_inert_reason_only_fires_when_no_row_carries_the_column():
+    rows = _tail_rows()
+    assert tail_veto_inert_reason(rows, "kl_max") is None
+    assert tail_veto_inert_reason(rows, None) is None
+    bare = [{"label": "a", "bpp": 4.5, "kl": 0.3}]
+    assert tail_veto_inert_reason(bare, "kl_max") == "tail_column_absent_on_every_row"
+    # Inert -> the envelope is the mean-only one, not an empty frontier.
+    assert len(_frontier_from_rows(bare, tail_veto="kl_max")) == 1

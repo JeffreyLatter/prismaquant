@@ -1613,20 +1613,26 @@ fi
 # first point where layer_config.json is final under both selection modes.
 #
 # AURA_ADDITIVITY_GATE:
-#   auto (default) — report from a measured KL this run ALREADY produced
-#                    (validated-surrogate's frontier JSON). Costs nothing. With
-#                    no such measurement the predicted sum + its stderr are
-#                    still recorded, with measured_kl null and a status saying
-#                    why: an AURA artifact always carries its prediction, and
-#                    carries the residual whenever the run measured one.
-#   measure        — additionally run one bounded KL measurement of the final
-#                    assignment against the SAME format-menu dW cache AURA
-#                    costed on (AURA_COST_NSAMPLES x AURA_COST_SEQLEN). Opt-in:
-#                    it is GPU work added to a run that did not ask for it, and
-#                    the default cost mode must not silently grow a stage.
+#   measure (DEFAULT, ruled 2026-07-30) — report from a measured KL this run
+#                    already produced when there is one (validated-surrogate's
+#                    frontier JSON, free), and otherwise run ONE bounded KL
+#                    measurement of the final assignment against the SAME
+#                    format-menu dW cache AURA costed on (AURA_COST_NSAMPLES x
+#                    AURA_COST_SEQLEN). Robert's ruling on the R2 residue: the
+#                    wiring's weak spot was that under SELECTION_MODE=surrogate
+#                    an artifact carried a *prediction* and no residual, so
+#                    AURA's one structural assumption stayed a two-model memory
+#                    instead of a per-artifact number. Every AURA-default run
+#                    now performs the eval and every artifact carries a real
+#                    residual. It is still a REPORT — non-blocking, and it never
+#                    changes an allocation.
+#   auto           — the pre-ruling behaviour: report only from a measurement
+#                    the run already made; otherwise record the predicted sum
+#                    with measured_kl null and a status saying why. Zero added
+#                    GPU.
 #   0              — off.
 # -----------------------------------------------------------------------
-: "${AURA_ADDITIVITY_GATE:=auto}"
+: "${AURA_ADDITIVITY_GATE:=measure}"
 if [[ "$COST_MODE" == "aura" && "$AURA_ADDITIVITY_GATE" != "0" \
    && "$AURA_ADDITIVITY_GATE" != "false" && "$AURA_ADDITIVITY_GATE" != "off" ]]; then
   AURA_ADDITIVITY_JSON="${WORK_DIR}/artifacts/aura_additivity.json"
