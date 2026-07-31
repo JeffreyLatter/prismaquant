@@ -424,21 +424,25 @@ _CB_COST_RUNGS = ["NVFP4_CB_K16", "NVFP4_CB_S16", "FP8_CB_K44"]
 
 @pytest.mark.parametrize("rung", _CB_COST_RUNGS)
 def test_cb_batched_cost_matches_direct_qdq(rung):
-    # The batched cost path must equal the per-slice registry qdq the exporter
-    # uses — unweighted AND under a per-item imatrix — or the allocator's cost
-    # diverges from the shipped bytes. (in_features=512 % 256 == 0.)
+    # The batched cost path must equal the per-slice producer-context QDQ —
+    # unweighted AND under a per-item imatrix — or the allocator's cost
+    # diverges from the shipped bytes. The registry closure remains legacy-v1;
+    # production cost binds v1/v2 explicitly. (in_features=512 % 256 == 0.)
     spec = fr.get_format(rung)
     torch.manual_seed(0)
     stacked = torch.randn(3, 256, 512) * torch.rand(3, 1, 1).exp()
     batched = mqc._batched_quantize(spec, stacked)
     per_slice = torch.stack(
-        [spec.quantize_dequantize(stacked[i]) for i in range(3)])
+        [mqc._cb_cost_quantize_dequantize(spec, stacked[i])
+         for i in range(3)])
     torch.testing.assert_close(batched, per_slice, rtol=0, atol=0)
     # Per-item imatrix (N,1,in) — the batched cost path's shape.
     qw = torch.rand(3, 1, 512) + 0.05
     batched_w = mqc._batched_quantize(spec, stacked, col_weights=qw)
     per_slice_w = torch.stack([
-        spec.quantize_dequantize(stacked[i], col_weights=qw[i, 0])
+        mqc._cb_cost_quantize_dequantize(
+            spec, stacked[i], col_weights=qw[i, 0]
+        )
         for i in range(3)])
     torch.testing.assert_close(batched_w, per_slice_w, rtol=0, atol=0)
 
@@ -453,8 +457,10 @@ def test_cb_imatrix_changes_cost_and_lowers_weighted_error(rung):
     torch.manual_seed(1)
     w = torch.randn(128, 512)
     qw = torch.rand(512) + 0.05
-    unweighted = spec.quantize_dequantize(w.clone())
-    weighted = spec.quantize_dequantize(w.clone(), col_weights=qw)
+    unweighted = mqc._cb_cost_quantize_dequantize(spec, w.clone())
+    weighted = mqc._cb_cost_quantize_dequantize(
+        spec, w.clone(), col_weights=qw
+    )
     assert not torch.equal(unweighted, weighted), "imatrix did not change render"
     wmse = lambda r: float(((w - r).pow(2) * qw).mean())
     assert wmse(weighted) <= wmse(unweighted) * 1.0001 + 1e-9
