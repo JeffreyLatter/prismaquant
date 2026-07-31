@@ -26,13 +26,18 @@
 //          per-CU vector L0.
 // 2. THE CODEBOOK LUT IS LDS-RESIDENT (the analogue of the CUDA lane's R6 smem
 //    LUT, `sm120_cb_fused_mma.hpp:167-193`).  A VQ decode is a random gather
-//    into a table that is 1-32 KiB depending on rung; on gfx1151 the vector L0
-//    is small and a k48 table thrashes it.  Staging it once per workgroup makes
-//    every gather a `ds_read_u16`.  See the LDS budget table in README.md — no
-//    FP8_CB rung needs LUT splitting (K48 is 32 KiB against a 64 KiB budget).
-//    That is only affordable because a workgroup covers MANY output rows
-//    (`rows_per_wg`), amortising the staging; the CUDA kernel's one-row-per-
-//    block shape would pay it per row.
+//    into a table that is 2-64 KiB depending on rung once materialised as bf16
+//    (the LUT dtype contract, cb_decode_hip.h); on gfx1151 the vector L0 is
+//    small and a top-rung table thrashes it.  Staging it once per workgroup
+//    makes every gather a `ds_read_b32`, with the e4m3 -> bf16 conversion (if
+//    the sidecar even holds e4m3) done ONCE at fill rather than per gather.
+//    Every rung FITS -- A and B are register-resident, so the LUT is the only
+//    LDS consumer and the whole 64 KiB is available -- but fitting is not the
+//    question: past ~16 KiB the occupancy loss outweighs the gather win and the
+//    global arm is measurably faster (see the policy table below).  Staging is
+//    only affordable at all because a workgroup covers MANY output rows
+//    (`rows_per_wg`), amortising the fill; the CUDA kernel's one-row-per-block
+//    shape would pay it per row.
 // 3. ONE WAVE OWNS ONE OUTPUT ROW, so the cross-wave reduction of the CUDA
 //    kernel disappears: the row's partial sums are reduced with a single
 //    wave32 butterfly and written by lane 0.
@@ -357,7 +362,9 @@ __global__ __launch_bounds__(THREADS) void fp8_act_qdq_kernel(
 
 // ===========================================================================
 // FP8-direct transient expander: decode the packed weight into a dense [N, K]
-// e4m3-byte tile.  Kept for two reasons: it is the fallback prefill path when
+// e4m3-byte tile.  This is the one consumer that stays byte-typed, because its
+// OUTPUT is e4m3 bytes by definition.  Kept for two reasons: it is the
+// fallback prefill path when
 // the WMMA GEMM is unavailable (expand -> hipblaslt), and it is an INDEPENDENT
 // second implementation of the decode that the self-test cross-checks the GEMV
 // against.  INV-1: the tile is a bounded per-layer transient, never resident.
@@ -405,22 +412,30 @@ int cb_gemv_lut_bytes_fp8(int k_bits) {
 
 // MEASURED LDS-LUT POLICY (gfx1151, cb_hip_selftest --bench, 2026-07-30).
 //
-// Staging the codebook in LDS is not a free win: it is an occupancy trade, and
-// the crossover was measured across the whole rung ladder at N=K=4096, M=1:
+// Re-measured after two corrections that both moved the answer: the LUT is now
+// materialised as bf16 (2x the on-disk e4m3 bytes, per the LUT dtype contract
+// in cb_decode_hip.h), and every timing is taken after 45 s of sustained load
+// because this device idles at ~1.2 GHz and boosts to ~2.6 GHz only under
+// continuous work -- the first measurement of this table was taken at idle
+// clock and is void.
 //
-//   rung   LUT     LDS-LUT    global     verdict
-//   K36     4 KiB  0.147 ms   0.172 ms   LDS +17%
-//   K44    16 KiB  0.171 ms   0.184 ms   LDS  +8%
-//   K45    20 KiB  0.269 ms   0.173 ms   global +36%
-//   K46    24 KiB  0.281 ms   0.185 ms   global +34%
-//   K47    28 KiB  0.280 ms   0.185 ms   global +34%
-//   K48    32 KiB  0.270 ms   0.178 ms   global +34%
+// Staging is an OCCUPANCY trade, not a free win.  At N = K = 4096, M = 1:
 //
-// The cliff sits exactly between 16 and 20 KiB, i.e. where the per-workgroup
-// LDS allocation stops allowing enough concurrent workgroups per WGP to cover
-// the gather latency.  So the default is "stage if it costs at most 16 KiB",
-// which is a measurement, not a guess — and the caller can still force either
-// arm for an A/B (PRISMAQUANT_CB_HIP_LUT=lds|global).
+//   rung   LUT bf16   LDS-LUT    global     verdict
+//   K36     8 KiB     0.103 ms   0.179 ms   LDS  +74%
+//   K40    16 KiB     0.114 ms   0.178 ms   LDS  +56%
+//   K42    24 KiB     0.214 ms   0.180 ms   global +19%
+//   K44    32 KiB     0.230 ms   0.192 ms   global +20%
+//
+// The cliff is between 16 and 24 KiB, so: stage if it costs at most 16 KiB.
+// Feasibility is NOT the constraint -- a 64 KiB LUT launches and passes parity,
+// because A and B are register-resident and the LUT is the only LDS consumer --
+// occupancy is.  `PRISMAQUANT_CB_HIP_LUT=lds|global` forces either arm.
+//
+// Honest limits on this default: it is calibrated at N = K = 4096 and inverts
+// at large N (at N=16384/K=8192 the global arm wins even at K44), so a
+// shape-aware policy is open work; and the threshold is stated in LDS BYTES so
+// that it stays meaningful if the LUT dtype ever changes again.
 constexpr int kLdsLutMaxBytes = 16 * 1024;
 
 bool cb_gemv_prefer_lds(int lut_bytes, int lds_limit) {

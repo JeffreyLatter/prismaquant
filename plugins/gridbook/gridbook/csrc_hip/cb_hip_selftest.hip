@@ -610,8 +610,19 @@ static void bench(int k, int64_t N, int64_t K) {
   HIP_OK(hipMemcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice));
 
   const double packed_gb = (double)(N * c.n_sb * c.type_size) / 1e9;
-  std::printf("\n  --- k=%d  N=%lld K=%lld  packed weight %.3f GB ---\n", k,
-              (long long)N, (long long)K, packed_gb);
+  // The honest baseline for a DECODE GEMV on a bandwidth-saturated machine is
+  // not "hipBLAS" but "a perfectly bandwidth-bound bf16 GEMV of the same
+  // logical matrix".  Stock bf16 GEMV on this box measures 201-233 GB/s against
+  // a ~210 GB/s copy ceiling, i.e. it already saturates -- so that floor is
+  // reachable and the ratio below is what the FORMAT buys after the decode
+  // gives some of it back.
+  const double kCopyCeilGBs = 210.0;
+  const double bf16_gb = (double)(N * K * 2) / 1e9;
+  const double bf16_floor_ms = bf16_gb / kCopyCeilGBs * 1e3;
+  std::printf("\n  --- k=%d  N=%lld K=%lld  packed %.3f GB (%.2f bpw) vs bf16 "
+              "%.3f GB; bandwidth-bound bf16 GEMV floor %.3f ms ---\n",
+              k, (long long)N, (long long)K, packed_gb, k / 8.0, bf16_gb,
+              bf16_floor_ms);
   BenchCtx ctx{dx, dqw, dcb, dcboff, dscale, dy, 1, N, K, c.qw_stride,
                k, c.type_size, 32, 0, true};
   // Drive the clock up BEFORE measuring anything (see sustain_clock).
@@ -619,18 +630,18 @@ static void bench(int k, int64_t N, int64_t K) {
   sustain_clock(run_gemv, &ctx, g_warm_s);
   std::printf("    [clock after %.0f s sustained load: %d MHz]\n", g_warm_s,
               current_sclk_mhz());
-  for (int M : {1, 4, 8, 16}) {
+  for (int M : {1, 8}) {
     ctx.M = M;
     for (bool lds : {true, false}) {
       ctx.lds = lds;
       const double ms = time_ms(run_gemv, &ctx, 50);
       std::printf("    GEMV M=%-3d %s  %8.3f ms   %6.1f GB/s (packed)   "
-                  "%6.2f GFLOP/s\n",
+                  "%6.2f GFLOP/s   %5.2fx bf16-BW-bound\n",
                   M, lds ? "LDS-LUT " : "global  ", ms, packed_gb / (ms / 1e3),
-                  2.0 * M * N * K / (ms / 1e3) / 1e9);
+                  2.0 * M * N * K / (ms / 1e3) / 1e9, bf16_floor_ms / ms);
     }
   }
-  for (int M : {32, 64, 128, 256, 512}) {
+  for (int M : {128, 512}) {
     ctx.M = M;
     ctx.lds = true;
     const double ms = time_ms(run_gemm, &ctx, 20);
@@ -698,6 +709,8 @@ int main(int argc, char** argv) {
     bench(36, 4096, 4096);
     // LDS-LUT crossover sweep: the staged table grows 16->32 KiB across these
     // four rungs, and LDS occupancy is what decides whether staging pays.
+    bench(40, 4096, 4096);   // 16 KiB LUT -- the crossover candidates
+    bench(42, 4096, 4096);   // 24 KiB
     bench(45, 4096, 4096);
     bench(46, 4096, 4096);
     bench(47, 4096, 4096);

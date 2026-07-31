@@ -18,8 +18,8 @@ Authored **and validated on real hardware**: an AMD Ryzen AI MAX+ 395 (Radeon
 |---|---|---|
 | compiles | **YES** | `hipcc --offload-arch=gfx1151 -O3`, zero warnings-as-errors, first-attempt clean for the kernels |
 | runs | **YES** | standalone `cb_hip_selftest` and the torch extension both execute |
-| numerically correct | **YES** | 34/34 pytest cases + 44/44 standalone cases, gated at **1 bf16 output ULP** against an fp64 torch/CPU reference |
-| benchmarked | **YES** | numbers below, `hipEvent`-timed, 50 (GEMV) / 20 (GEMM) iterations after 5 warmups |
+| numerically correct | **YES** | 42/42 standalone + 38/38 pytest cases, gated at **1 bf16 output ULP** against an fp64 torch/CPU reference |
+| benchmarked | **YES** | numbers below, `hipEvent`-timed **at sustained clock** (see the methodology note — the first attempt measured the idle clock and was thrown away) |
 | served end-to-end under vLLM | **NO** | not attempted — no vLLM-ROCm on the box, and the plugin's dispatch integration is authored but never exercised inside a live serve |
 | accuracy-validated (KL / PPL) | **NO** | no served artifact, so no serving-metric claim of any kind is made here |
 
@@ -203,67 +203,89 @@ it is measurably faster there, not because the LUT would not fit.  Neither
 LUT splitting nor a packed LUT with per-gather conversion is implemented, and
 neither is needed for the rungs that matter on a 58 GB box.
 
-### The LDS-vs-global policy is measured, and it is shape-dependent
+### The LDS-vs-global policy: measured, and it is an occupancy trade
 
-Staging is an occupancy trade, not a free win.  At N = K = 4096, M = 1:
+At N = K = 4096, M = 1, all timings at sustained clock, with the bf16 LUT:
 
-| rung | LUT | LDS-LUT | global | verdict |
+| rung | LUT (bf16) | LDS-LUT | global | verdict |
 |---|---|---|---|---|
-| K36 | 4 KiB | 0.147 ms | 0.172 ms | LDS **+17%** |
-| K44 | 16 KiB | 0.171 ms | 0.184 ms | LDS **+8%** |
-| K45 | 20 KiB | 0.269 ms | 0.173 ms | global **+36%** |
-| K46 | 24 KiB | 0.281 ms | 0.185 ms | global **+34%** |
-| K47 | 28 KiB | 0.280 ms | 0.185 ms | global **+34%** |
-| K48 | 32 KiB | 0.270 ms | 0.178 ms | global **+34%** |
+| K36 | 8 KiB | **0.103 ms** | 0.179 ms | LDS **+74%** |
+| K40 | 16 KiB | **0.114 ms** | 0.178 ms | LDS **+56%** |
+| K42 | 24 KiB | 0.214 ms | **0.180 ms** | global **+19%** |
+| K44 | 32 KiB | 0.230 ms | **0.192 ms** | global **+20%** |
 
-The cliff is exactly between 16 and 20 KiB, so the shipped default is *stage if
-it costs ≤ 16 KiB* (`kLdsLutMaxBytes`, `cb_gemv_hip.hip`), overridable with
-`PRISMAQUANT_CB_HIP_LUT=lds|global` for an A/B.
+The cliff sits between **16 and 24 KiB**, so the shipped default is *stage if it
+costs ≤ 16 KiB* (`kLdsLutMaxBytes`), overridable with
+`PRISMAQUANT_CB_HIP_LUT=lds|global`.  Note this threshold is stated in **LDS
+bytes**, not in rungs, so it survives a change of LUT dtype — the earlier
+byte-LUT measurement put the same cliff at the same *byte* figure but at a
+different *rung* (K44), which is exactly the confusion the byte framing avoids.
 
-**Honest limit on that default:** it was calibrated at N = K = 4096.  At
-N = 16384, K = 8192 (a 92 MB packed tensor, larger than the 32 MB MALL) the
-global variant wins even at K44 — 1.285 ms vs 1.594 ms, **global +24%**.  So the
-16 KiB threshold is a *shape-local* measurement, and a shape-aware retune is
+**Honest limit:** calibrated at N = K = 4096.  At N = 16384, K = 8192 the global
+arm wins even at K44, so a shape-aware policy (LUT bytes × workgroup count) is
 open work, flagged rather than papered over.
 
 ---
 
 ## Measured performance
 
-`cb_hip_selftest --bench`, gfx1151, `hipEvent` timing.  "GB/s (packed)" is the
-packed weight stream divided by kernel time — the quantity the decode regime is
-supposed to be bound by.
+All numbers at sustained clock (2280–2666 MHz, printed per shape), `hipEvent`
+timing, 20 warmup + 50 (GEMV) / 20 (GEMM) timed iterations.
 
-**K44, N = 5120, K = 4096 (14.4 MB packed — MALL-resident, so this is a
-cache-rate, not a DRAM rate):**
+### The GEMV, against the baseline that actually matters
 
-| M | GEMV LDS | GEMV global | GEMM |
-|---|---|---|---|
-| 1 | **0.171 ms** (84.6 GB/s) | 0.184 ms | — |
-| 4 | 0.242 ms | 0.255 ms | — |
-| 8 | 0.343 ms | 0.364 ms | — |
-| 16 | 0.560 ms | 0.569 ms | — |
-| 32 | — | — | 0.514 ms (2.61 TFLOP/s) |
-| 64 | — | — | 0.576 ms (4.66 TFLOP/s) |
-| 128 | — | — | 0.668 ms (8.03 TFLOP/s) |
-| 256 | — | — | 1.131 ms (9.49 TFLOP/s) |
-| 512 | — | — | **2.31 ms (9.30 TFLOP/s)** |
+Since stock bf16 GEMV already saturates this machine, the meaningful baseline is
+**a perfectly bandwidth-bound bf16 GEMV of the same logical matrix**: `N*K*2`
+bytes at the ~210 GB/s copy ceiling.  The ratio below is what the *format* buys
+after the decode gives some of it back — that is the number this lane lives or
+dies on, and it is reported for the best arm at each rung.
 
-**K44, N = 16384, K = 8192 (92 MB packed — exceeds the 32 MB MALL, so this is a
-DRAM-resident rate):** GEMV M=1 global **1.285 ms = 71.8 GB/s**.
+| rung | bpw | LUT | best arm | time | vs bf16-BW-bound floor |
+|---|---|---|---|---|---|
+| K36 | 4.50 | 8 KiB | LDS | 0.103 ms | **1.55×** |
+| K40 | 5.00 | 16 KiB | LDS | 0.114 ms | **1.40×** |
+| K42 | 5.25 | 24 KiB | global | 0.180 ms | 0.89× |
+| K45 | 5.62 | 40 KiB | global | 0.182 ms | 0.88× |
+| K46 | 5.75 | 48 KiB | global | 0.197 ms | 0.81× |
+| K47 | 5.88 | 56 KiB | global | 0.199 ms | 0.80× |
+| K48 | 6.00 | 64 KiB | global | 0.184 ms | 0.87× |
 
-Two readings worth stating plainly:
+(N = K = 4096 throughout, so the rungs are directly comparable.  Two other
+shapes, for scale: K44 at 5120×4096 → 0.192 ms = 1.04×; K44 at 16384×8192,
+a 92 MB tensor well past the 32 MB MALL → 1.396 ms = 0.92×.)
 
-* **The WMMA prefill GEMM is the win it was built to be.** At M = 512 it runs
-  2.31 ms where looping the GEMV would take ~32 × 0.56 = 17.9 ms — **~7.8×**.
-  That is the whole reason the kernel exists.
-* **Both kernels are well short of the machine.** 71.8 GB/s against ~256 GB/s of
-  LPDDR5X is ~28% of nominal; 9.3–10.1 TFLOP/s (the range across two runs)
-  against a spec-sheet ~59 TFLOP/s bf16 peak (40 CU × 512 FLOP/clk × 2.9 GHz —
-  a derivation, not a measurement here) is ~16–17%.  These are first-cut
-  kernels, and the gap is not mysterious; see "deferred" below.
+**Read this plainly: the format's byte advantage survives only while the LUT is
+LDS-resident.** At K36–K40 the decode GEMV genuinely beats what a bf16 GEMV
+could do on this machine *at its bandwidth ceiling* — 1.40–1.55×. From K42 up it
+does not: the ratio collapses to a flat **0.80–0.89×** and, tellingly, stays
+flat while the byte count keeps rising.  Flat-in-bytes means the top rungs are
+**decode-bound, not bandwidth-bound** — the bytes saved are being spent on the
+gather, and the cliff coincides exactly with the LUT leaving LDS.
 
----
+The practical consequence for Strix is concrete and worth acting on:
+**prefer the K≤40 rungs**, which is also where a 58 GB box wants to be. It also
+sharpens the open work — the top-rung fix is a decode-cost problem (a partial
+LDS LUT, say), not a bandwidth problem, so anything aimed at load efficiency
+there will miss.
+
+### The WMMA prefill GEMM
+
+| rung | shape | M | time | throughput |
+|---|---|---|---|---|
+| K44 | 5120×4096 | 128 | 0.452 ms | **11.9 TFLOP/s** |
+| K44 | 5120×4096 | 512 | 1.908 ms | 11.3 TFLOP/s |
+| K36 | 4096×4096 | 128 | 0.354 ms | 12.1 TFLOP/s |
+
+Against a spec-derived peak of ~54 TFLOP/s (40 CU × 512 FLOP/clk × 2.65 GHz —
+a *derivation*, not measured here) that is ~22%. The GEMM is still the right
+call at prefill — at M=512 it beats looping the GEMV by ~7× — but it is
+untuned, and the reason is known and stated below rather than guessed at.
+
+**Large shapes are worse, and that is the diagnostic:** at N = 16384, K = 8192
+the GEMM falls to 5–6 TFLOP/s while the GEMV holds its rate. The GEMM decodes B
+**4×** redundantly (lanes 16–31 duplicate lanes 0–15 by ISA requirement, and the
+two waves sharing a `wave_n` decode the same fragment), which is invisible when
+the codebook is L0-resident and dominant when it is not.
 
 ## What is validated, and what is only authored
 
@@ -276,6 +298,9 @@ and 44 standalone cases (`cb_hip_selftest`), all at a 1-bf16-ULP gate:
 * M ∈ {1, 2, 3, 4, 8, 16} — every register-tile boundary, including M values
   that fall between tiles and must be predicated off rather than read OOB;
 * both LUT variants (LDS-staged and global), byte-for-byte the same answer;
+* **both codebook grid sources** — an e4m3-byte sidecar and a bf16 sidecar
+  holding the same values give **bit-identical** output at K28/36/44/48, on
+  both LUT arms (the LUT dtype contract);
 * the fused-module case (3 roles, distinct codebooks, `cb_row_offset` spanning
   blocks) — the case where a workgroup's staged LUT is valid for only some of
   its rows;
@@ -378,20 +403,27 @@ every environment-specific problem below showed up.
 Listed with the measurement that motivates each; none is implemented, and none
 should be until it can be A/B'd on this box.
 
-1. **B-decode redundancy in the GEMM (biggest lever).**  Lanes 16–31 duplicate
-   lanes 0–15 by ISA requirement, and the two waves sharing a `wave_n` decode
-   the same B fragment — so B is decoded **4×**.  The evidence: at
-   N = 16384, K = 8192, M = 32 the GEMM moves the packed stream at 10.8 GB/s
-   where the GEMV does the same work at 71.8 GB/s.  Fix: decode B once into LDS
-   per workgroup and broadcast, trading the current zero-LDS-traffic design for
-   one staged tile — which is only worth it because the decode, not the load, is
-   the cost.
-2. **Shape-aware LUT policy.**  The 16 KiB threshold inverts at large N (above).
-   The honest fix is a two-variable policy (LUT bytes × workgroup count),
-   seeded from a sweep, not a second constant.
-3. **K-loop double buffering in the GEMV.**  There is none; the CUDA lane
+1. **Get the top rungs back above the bf16 baseline (biggest lever).**  K42+
+   currently sits at 0.89–1.04× a bandwidth-bound bf16 GEMV, i.e. the format's
+   byte advantage is being spent on decode.  The cause is identified — the LUT
+   stops being LDS-resident at the occupancy cliff — so the candidates are a
+   *partial* LDS LUT (stage the two hottest sub-tables, gather the rest from
+   global), or a nibble-packed fp4 LUT for the NVFP4 ladder, or simply accepting
+   that Strix prefers K≤40.  All three are measurable; none is implemented,
+   because the third may well be the right answer and costs nothing.
+2. **B-decode redundancy in the GEMM.**  B is decoded **4×** (ISA lane
+   duplication plus the two waves sharing a `wave_n`).  Evidence: at
+   N = 16384, K = 8192 the GEMM drops to 5–6 TFLOP/s while the GEMV holds rate.
+   Fix: decode B once into LDS per workgroup and broadcast — trading the
+   zero-LDS-traffic design for one staged tile, which is only worth it because
+   decode, not load, is the cost.  Note this competes with lever 1 for the same
+   64 KiB.
+3. **Shape-aware LUT policy.**  The 16 KiB threshold inverts at large N.  The
+   honest fix is a two-variable policy (LUT bytes × workgroup count) seeded from
+   a sweep, not a second hand-picked constant.
+4. **K-loop double buffering in the GEMV.**  There is none; the CUDA lane
    measured this as a win in its own (different) shape and it is untested here.
-4. **`int8` / `int4` WMMA — measured, and explicitly NOT started.**
+5. **`int8` / `int4` WMMA — measured, and explicitly NOT started.**
    `iu8` and `iu4` WMMA are present on this device, and the throughput has been
    measured elsewhere on this box: **iu8 is 1.56x bf16 when LDS-fed but only
    1.06x register-resident**, and **iu4 is 2.86x**.  The iu8 shape of that
@@ -404,7 +436,7 @@ should be until it can be A/B'd on this box.
    throughput" for iu8 from vendor generalities; that was wrong in magnitude
    and wrong about the mechanism, and is retracted here rather than quietly
    edited.)
-5. **MoE grouped kernels.**  Absent entirely; an MoE artifact on ROCm falls back
+6. **MoE grouped kernels.**  Absent entirely; an MoE artifact on ROCm falls back
    to Triton today.
 
 ## Files

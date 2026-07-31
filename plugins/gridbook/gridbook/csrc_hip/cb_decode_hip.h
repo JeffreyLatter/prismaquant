@@ -23,7 +23,8 @@
 //   * wave32.  Every wave-level primitive below assumes 32 lanes and the host
 //     launchers assert `props.warpSize == 32` before launching.
 //   * 64 KiB LDS per workgroup.  The LUT-residency budget is computed by
-//     `pq_lut_bytes_fp8()` on the host and checked against the device limit.
+//     `pq_lut_elems_*` / `pq_lut_lds_bytes` and checked against the device
+//     limit; the LUT is materialised as bf16, so it is 2 B per entry.
 //   * No fp8 matrix instruction (RDNA3.5 WMMA covers f16/bf16/iu8/iu4 only) —
 //     so fp8-CB here means fp8 STORAGE decoded to bf16 for WMMA compute.
 //
@@ -299,11 +300,10 @@ PQ_DEVINL uint64_t code_mask_of(int k_bits) {
 // Codebook gathers.
 //
 // FP8_CB, product mode, n_sub = 4, sub_dim = 2: sub-entry i is TWO adjacent
-// e4m3 bytes, so one 16-bit read fetches both.  `cb` is the e4m3-BYTE codebook
-// (`layer._cb_flat_fp8`), `base` the row's element == byte offset into it
-// (`cb_row_offset[n]`), or 0 when `cb` is the LDS-resident copy of that row's
-// block.  Element offsets are always even (elt[i] accumulates 2 << w and
-// idx*2 is even), so the uint16 read is 2-byte aligned.
+// two adjacent grid entries, so one paired read fetches both.  `base` is the
+// row's ELEMENT offset (`cb_row_offset[n]`), or 0 when reading the LDS-resident
+// copy of that row's block.  Element offsets are always even (elt[i] accumulates
+// 2 << w and idx*2 is even), which is what makes the paired read aligned.
 // ---------------------------------------------------------------------------
 // Gather one 8-wide codeword as BF16 BIT PATTERNS.
 //

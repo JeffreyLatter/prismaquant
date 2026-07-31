@@ -2032,11 +2032,23 @@ accordingly), 919 GB free.
 `plugins/gridbook/gridbook/csrc_hip/` holds the result: a wave32 decode GEMV (fp8-CB **and**
 NVFP4_CB two-tier v2), a bf16 **WMMA** decode-in-prologue prefill GEMM, the transient expander,
 and the fused fp8 activation QDQ, sharing one format header with the CUDA lane. It **compiles,
-runs, and passes 34 pytest + 44 standalone parity cases at a 1-bf16-ULP gate against an fp64
-torch reference**, across the odd rungs, every register-tile M boundary, ragged edge tiles and
-the fused multi-role codebook case. Benchmarked: GEMV 0.171 ms at M=1 / K44 / N=5120 K=4096, and
-the WMMA GEMM ~7.8× faster than looping the GEMV at M=512 — while sitting at ~28% of nominal
-bandwidth and ~17% of nominal bf16 peak, so these are first-cut kernels, not tuned ones.
+runs, and passes parity at a 1-bf16-ULP gate against an fp64 torch reference** across the odd
+rungs, every register-tile M boundary, ragged edge tiles and the fused multi-role codebook case.
+
+**Benchmark discipline on this box is itself a finding:** gfx1151 idles at ~1.2 GHz and needs
+~45 s of sustained load to reach ~2.6 GHz, so a conventional 5-iteration warmup measures the
+idle clock. Every number taken that way was discarded and re-taken behind a `sustain_clock()`
+that prints the achieved clock. The related correction matters more: there is **no large
+bandwidth headroom to reclaim** — stock bf16 GEMV already measures 201–233 GB/s against a
+~210 GB/s copy ceiling. **The decode GEMV's justification is the index stream, not out-coding
+hipBLAS**: a CB rung reads `k/8` bits per weight (4.5 bpw at K36) where bf16 reads 16, and the
+right question is how much of that byte advantage survives the decode. Measured against a
+perfectly bandwidth-bound bf16 GEMV of the same logical matrix, at N=K=4096: **K36 = 1.55×,
+K40 = 1.40×, then a cliff to a flat 0.80–0.89× from K42 through K48**. Flat-while-bytes-rise
+means the top rungs are **decode-bound, not bandwidth-bound**, and the cliff coincides exactly
+with the codebook LUT ceasing to be LDS-resident. Actionable consequence: **on Strix prefer the
+K≤40 rungs** — which is also where a 58 GB box wants to be. The WMMA prefill GEMM reaches
+**11.9 TFLOP/s** (K44, M=128), ~22% of a spec-derived peak.
 
 **The load-bearing measured fact: RDNA 3.5 has no fp8 matrix instruction.** A device-pass
 `__has_builtin` probe (`csrc_hip/wmma_probe.hip`) shows bf16/f16/**iu8** WMMA present and every
@@ -2046,8 +2058,22 @@ arithmetic is *better* than an fp8-MMA path, not worse. The same probe establish
 fragment layout on device (`D[2*i + lane/16][lane%16]`), which is what lets the GEMM decode B
 straight into registers with no LDS tile, and measured that the WMMA unit is **not** exactly
 rounded (~0.5 f32 ULP), which is why every parity gate here is relative rather than bit-exact.
-`iu8` being present is recorded as the next measured-available lever (~2× matrix throughput on
-several AMD parts) with its accuracy cost stated, not as a plan.
+
+**The codebook grid is a free choice on this platform, and the kernels are built for that.**
+Since an FP8_CB codeword must be materialised as bf16 for WMMA regardless, a bf16-grid codebook
+is same-bytes, same-speed and a strict grid superset of the e4m3 one — so the likely artifact
+design is one index stream plus a per-grid codebook (~0.02% of artifact bytes), Blackwell
+reading e4m3 and Strix bf16. The HIP kernels are therefore **dtype-agnostic at materialisation**:
+the LDS LUT is always filled as bf16 and any e4m3→bf16 conversion happens **once at fill time,
+never per gather** (the ALU term R6 removed on Blackwell stays removed), pinned by a test that
+asserts a bf16 sidecar is **bit-identical** to the e4m3 one. The cost is LDS footprint —
+a materialised LUT is 2 B/element, so K48 and NVFP4_CB K24 need the full 64 KiB. Those still
+*fit* here, because A and B are register-resident and the LUT is the only LDS consumer; the top
+rungs use the global-gather arm because it is measurably faster, not because the LUT overflows.
+`iu8`/`iu4` WMMA are present, and measured on this box at **1.56× bf16 LDS-fed but only 1.06×
+register-resident** (iu8) and 2.86× (iu4) — iu8's gain is halved LDS traffic, not faster math,
+which buys little in a GEMM whose operands are already in registers. Both need integer
+activations and an accuracy gate is running; **neither is started**.
 
 **Not yet true, and the docs must keep saying so:** no vLLM-ROCm serve has been attempted, so
 there is **no serving-metric claim** — no KL, no PPL, no tok/s under a real engine; the

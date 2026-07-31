@@ -96,9 +96,25 @@ def maybe_apply(method, layer, x, bias=None):
 
     if method.n_sub != 4 or method.type_size != 4 * method.k:
         return None
-    cb8 = getattr(layer, "_cb_flat_fp8", None)
-    if cb8 is None:
+
+    # Grid choice (the LUT dtype contract, csrc_hip/README.md). gfx1151 has no
+    # fp8 hardware, so an FP8_CB codeword is materialised as bf16 for WMMA
+    # whichever table we read — which makes the bf16 table strictly preferable
+    # here: same kernel cost, and it carries whatever grid the sidecar was fit
+    # on rather than forcing the value back through e4m3. On today's artifacts
+    # `_cb_flat` holds the same e4m3-valued entries as `_cb_flat_fp8`, so this
+    # is bit-identical; on a future bf16-grid sidecar it is the whole point.
+    # `PRISMAQUANT_CB_HIP_GRID=e4m3` forces the byte table for an A/B.
+    cb = None
+    if os.environ.get("PRISMAQUANT_CB_HIP_GRID") != "e4m3":
+        cb = getattr(layer, "_cb_flat", None)
+        if cb is not None and cb.dtype != torch.bfloat16:
+            cb = None
+    if cb is None:
+        cb = getattr(layer, "_cb_flat_fp8", None)
+    if cb is None:
         return None
+    cb8 = cb
 
     if M <= HIP_GEMV_M_MAX:
         # The GEMV fuses the fp8 dynamic per-token activation QDQ (qdq_input),
