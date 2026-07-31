@@ -157,15 +157,126 @@ PY
 fi
 echo "[pipeline] preflight: EXPORT_CONTAINER=${EXPORT_CONTAINER} lane OK; target profile resolves to ${TARGET_PROFILE_RESOLVED}${TARGET_PROFILE:+ (explicit TARGET_PROFILE=$TARGET_PROFILE)}"
 
-# GGUF lane consistency gates (see docs/lanes/gguf.md). The imatrix lockstep
-# contract (measured cost == shipped bytes) only holds under COST_MODE=local
-# today: production-render-score renders gguf formats via the unweighted
-# registry qdq, and the production cache is never read by export_gguf.
-if [[ "$EXPORT_CONTAINER" == "gguf" ]]; then
-  if [[ "${COST_MODE:-production-render-score}" != "local" ]]; then
-    echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires COST_MODE=local — production-render-score scores UNWEIGHTED registry renders while the GGUF exporter ships imatrix-weighted bytes (rendering confound). Set COST_MODE=local." >&2
+# -----------------------------------------------------------------------
+# Cost axes (re-vet R3). COST_MODE silently decided TWO independent things:
+# which RENDER produces the per-(Linear, format) error, and which OBJECTIVE
+# maps that error to predicted_dloss. They are now named:
+#
+#   COST_RENDER    ∈ {inline, cached-menu}
+#       inline      — the cost stage renders each (Linear, format) itself,
+#                     through the family's own qdq (weighted where the family
+#                     is weighted).
+#       cached-menu — the error is read off a ProductionWeightCache render of
+#                     the whole format menu.
+#   COST_OBJECTIVE ∈ {weight-recon, render-score, aura-adjoint}
+#
+# COST_MODE remains the documented spelling and keeps its exact meaning; the
+# axes are the mechanism underneath, and setting them directly is equivalent:
+#   local                  = inline      x weight-recon
+#   production-render-score= cached-menu x render-score
+#   aura                   = cached-menu x aura-adjoint
+# Only those three pairs are implemented; anything else stops with the reason.
+# -----------------------------------------------------------------------
+if [[ -n "${COST_RENDER:-}" || -n "${COST_OBJECTIVE:-}" ]]; then
+  if [[ -n "${COST_MODE:-}" ]]; then
+    echo "[pipeline] ERROR: set COST_MODE or the (COST_RENDER, COST_OBJECTIVE) axes, not both — they are two spellings of one setting and a disagreement has no defensible resolution." >&2
     exit 2
   fi
+  : "${COST_RENDER:=cached-menu}"
+  : "${COST_OBJECTIVE:=render-score}"
+  case "${COST_RENDER}|${COST_OBJECTIVE}" in
+    "inline|weight-recon")           COST_MODE="local" ;;
+    "cached-menu|render-score")      COST_MODE="production-render-score" ;;
+    "cached-menu|aura-adjoint")      COST_MODE="aura" ;;
+    "inline|aura-adjoint")
+      echo "[pipeline] ERROR: COST_RENDER=inline x COST_OBJECTIVE=aura-adjoint is not implemented — the AURA adjoint consumes production-rendered dW from a format-menu cache (aura_cost --require-production-cache), which is the cached-menu render by definition." >&2
+      exit 2
+      ;;
+    "cached-menu|weight-recon")
+      echo "[pipeline] ERROR: COST_RENDER=cached-menu x COST_OBJECTIVE=weight-recon is not implemented — production_render_cost derives cost from the scores the render recorded (render-score), and the weight-recon objective is the inline stage's own measurement. Use COST_MODE=local or COST_MODE=production-render-score." >&2
+      exit 2
+      ;;
+    *)
+      echo "[pipeline] ERROR: COST_RENDER must be inline|cached-menu and COST_OBJECTIVE must be weight-recon|render-score|aura-adjoint (got '${COST_RENDER}' x '${COST_OBJECTIVE}')" >&2
+      exit 2
+      ;;
+  esac
+  echo "[pipeline] cost axes: COST_RENDER=${COST_RENDER} x COST_OBJECTIVE=${COST_OBJECTIVE} -> COST_MODE=${COST_MODE}"
+fi
+# COST_MODE default lives here (not in the defaults block below) because the
+# lane render-faithfulness assertion runs before it.
+: "${COST_MODE:=aura}"
+case "$COST_MODE" in
+  local)                              COST_RENDER=inline;      COST_OBJECTIVE=weight-recon ;;
+  production-render-score|production-render)
+                                      COST_RENDER=cached-menu; COST_OBJECTIVE=render-score ;;
+  aura)                               COST_RENDER=cached-menu; COST_OBJECTIVE=aura-adjoint ;;
+  *)                                  COST_RENDER=unknown;     COST_OBJECTIVE=unknown ;;
+esac
+
+# -----------------------------------------------------------------------
+# Lane render-faithfulness assertion (re-vet R3), replacing the two
+# `COST_MODE=local` gates.
+#
+# What those gates were protecting is a property of the RENDER, not of the
+# objective: the render that produces the allocator's cost must be the render
+# the exporter ships. The right key already existed —
+# `measure_quant_cost._cost_render_uses_imatrix` decides it per FORMAT FAMILY
+# (the CB families always weighted, gguf tracking PRISMAQUANT_GGUF_IMATRIX) —
+# the gates just did not use it, which is why `COST_MODE=local` had to stand
+# in for "weighted render" and blocked two objectives for no reason of their
+# own.
+#
+#   COST_RENDER=inline      -> the cost stage calls the family's own qdq:
+#                              faithful by construction.
+#   COST_RENDER=cached-menu -> faithful iff the ProductionWeightCache render
+#                              applies the same imatrix. Since CB Milestone C
+#                              (R3: `col_weights` on render_production_weight)
+#                              it can, given the harvested vector — so the
+#                              pipeline harvests it and passes --col-weights,
+#                              and this block records that requirement.
+#
+# NOT a promotion: AURA-on-CB is now REACHABLE, not recommended. Its −38% /
+# −17.9% wins are native-lane results and CB's error surface (VQ + the expert
+# route-flip floor) is a different animal; it stays opt-in pending its own
+# served A/B.
+# -----------------------------------------------------------------------
+COST_CACHE_COL_WEIGHTS_REQUIRED=0
+if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
+  if ! LANE_RENDER_WEIGHTED="$(
+    PQ_EXPORT_CONTAINER="$EXPORT_CONTAINER" python3 - <<'PY'
+import os
+import sys
+
+from prismaquant import format_registry as fr
+from prismaquant.measure_quant_cost import _cost_render_uses_imatrix
+
+FAMILIES = {"gguf": ("gguf",), "nvfp4_cb": ("nvfp4_cb", "fp8_cb")}
+families = FAMILIES[os.environ["PQ_EXPORT_CONTAINER"]]
+specs = [s for s in fr.list_formats() if s.family in families]
+if not specs:
+    print("no registered formats for families "
+          f"{families}", file=sys.stderr)
+    raise SystemExit(2)
+weighted = {_cost_render_uses_imatrix(s) for s in specs}
+if len(weighted) != 1:
+    print(f"families {families} disagree on imatrix weighting: {weighted}",
+          file=sys.stderr)
+    raise SystemExit(2)
+print("1" if weighted.pop() else "0")
+PY
+  )"; then
+    echo "[pipeline] ERROR: could not resolve the render-faithfulness of the ${EXPORT_CONTAINER} lane's format families." >&2
+    exit 2
+  fi
+  if [[ "$COST_RENDER" == "cached-menu" && "$LANE_RENDER_WEIGHTED" == "1" ]]; then
+    COST_CACHE_COL_WEIGHTS_REQUIRED=1
+    echo "[pipeline] lane ${EXPORT_CONTAINER}: COST_RENDER=cached-menu on an imatrix-weighted family -> the cost cache will be built with --col-weights (CB Milestone C). COST_OBJECTIVE=${COST_OBJECTIVE} on this lane is OPT-IN and NOT the default: its accuracy case is a native-lane result and has no served CB A/B yet."
+  fi
+fi
+
+# GGUF lane consistency gates (see docs/lanes/gguf.md).
+if [[ "$EXPORT_CONTAINER" == "gguf" ]]; then
   if [[ "${PRODUCTION_CACHE:-1}" != "0" ]]; then
     echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires PRODUCTION_CACHE=0 — export_gguf requantizes the bf16 skeleton and never reads the production cache; building one burns hours rendering bytes that never ship. Set PRODUCTION_CACHE=0 PRODUCTION_RECACHE=0." >&2
     exit 2
@@ -177,17 +288,10 @@ if [[ "$EXPORT_CONTAINER" == "gguf" ]]; then
 fi
 
 # NVFP4-CB / FP8-CB codebook lane consistency gates (docs/lanes/nvfp4-cb/
-# format-pipeline.md §6, LAYOUT.md). Same rendering-confound contract as the
-# GGUF lane: the CB exporter (export_nvfp4_cb) ships imatrix-weighted VQ bytes
-# and requantizes the bf16 skeleton, so the allocator cost MUST be the
-# skeleton-requantize weighted render (COST_MODE=local), never
-# production-render-score (which scores UNWEIGHTED registry renders and never
-# reads the production cache the CB exporter also ignores).
+# format-pipeline.md §6, LAYOUT.md). The rendering-confound half is now the
+# shared render-faithfulness assertion above (R3); what remains here is the
+# serving-profile and production-cache consistency the CB container needs.
 if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
-  if [[ "${COST_MODE:-production-render-score}" != "local" ]]; then
-    echo "[pipeline] ERROR: EXPORT_CONTAINER=nvfp4_cb requires COST_MODE=local — production-render-score scores UNWEIGHTED registry renders while the CB exporter ships imatrix-weighted VQ bytes (the identical rendering confound the GGUF gate exists for). Set COST_MODE=local." >&2
-    exit 2
-  fi
   if [[ "$TARGET_PROFILE_RESOLVED" != "nvfp4_cb" ]]; then
     echo "[pipeline] ERROR: EXPORT_CONTAINER=nvfp4_cb requires the nvfp4_cb serving profile — the allocator must gate every candidate through the nvfp4_cb serving profile (allow_formats = CB rungs + NVFP4/FP8_DYNAMIC/BF16, in_features%256 shape rule) and the exporter hard-fails on non-CB formats in the assignment. The serving profile resolved to '${TARGET_PROFILE_RESOLVED}'; declare default_serving_profile=nvfp4_cb in the architecture spec, or set TARGET_PROFILE=nvfp4_cb." >&2
     exit 2
@@ -248,7 +352,8 @@ PY
 : "${PRODUCTION_CACHE_RENDER_SCOPE:=assignment}"
 : "${PRODUCTION_CACHE_LEVERS:=gptq,static_act_order,joint_scale_opt}"
 : "${PRODUCTION_CACHE_DISABLE_LEVERS:=}"
-: "${COST_MODE:=production-render-score}"
+# COST_MODE / COST_RENDER / COST_OBJECTIVE are resolved in the cost-axes block
+# above (re-vet R3), which runs before the lane render-faithfulness assertion.
 : "${PRODUCTION_RENDER_COST_NSAMPLES:=8}"
 : "${PRODUCTION_RENDER_COST_SEQLEN:=1024}"
 : "${PRODUCTION_RENDER_COST_SEED:=42}"
@@ -382,7 +487,14 @@ fi
 # CB-lane empirical packed-expert stage + ladder interpolation. Defaults live
 # here (not inside the [2d-CB] block) so the settings-hash emission can see
 # every value an artifact's identity is keyed on.
-: "${CB_EXPERT_EMPIRICAL:=1}"
+# D15 (re-vet R28): the default is the SHIPPED value. Every shipped MoE CB
+# driver — run_hy3_prod_nvfp4cb.sh, run_hy3_prod_joint.sh, run_35b_prod_nvfp4cb.sh,
+# run_laguna_s21_prod.sh — sets 0 (local weighted-MSE expert costs with the
+# per-expert ladder), and a default nobody ships is a default that documents a
+# path nobody validated. 1 re-enables the empirical unit-KL replacement (the
+# [2d-CB] hybrid), which is the right choice for menus of coarse rungs whose
+# unit KLs sit far apart; see run_35b_prod_nvfp4cb.sh's own note.
+: "${CB_EXPERT_EMPIRICAL:=0}"
 : "${CB_EXPERT_NSAMPLES:=16}"
 : "${CB_EXPERT_SEQLEN:=512}"
 : "${CB_EXPERT_SAMPLE:=0}"
@@ -697,6 +809,49 @@ require_stage_settings() {
 }
 
 # -----------------------------------------------------------------------
+# CB / GGUF col-weights (imatrix) harvest — ONE definition, four call sites
+# (pre-cost local expert costs, the cached-menu cost cache, [2d-CB], and the
+# exporter). The vector is the exporter's own importance weighting, including
+# the synthesized per-expert gate_up/down_proj entries a raw activation
+# harvest cannot contain — which is why every weighted render takes it as an
+# argument rather than deriving E[x^2] locally. Skip-if-exists; override
+# CB_COL_WEIGHTS to supply a pre-built {qname: (in_features,)} pickle.
+# -----------------------------------------------------------------------
+harvest_cb_col_weights() {
+  local stage="$1"
+  require_stage_settings "$CB_COL_WEIGHTS" cb-col-weights
+  if [[ -f "$CB_COL_WEIGHTS" ]]; then
+    echo "[pipeline] ${stage} CB col-weights exist, skipping"
+    return 0
+  fi
+  echo "[pipeline] ${stage} harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
+  CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" \
+  MODEL_PATH="$MODEL_PATH" CB_STAGE="$stage" python3 - <<'PY'
+import os, pickle
+from prismaquant.export_gguf import build_imatrix_from_act_cache
+from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
+act_dir = os.environ["CB_ACT_DIR"]
+out = os.environ["CB_COL_WEIGHTS"]
+stage = os.environ["CB_STAGE"]
+cw = build_imatrix_from_act_cache(act_dir)
+if not cw:
+    raise SystemExit(
+        f"[pipeline] ERROR: no activation cache under {act_dir!r}; the "
+        f"weighted render needs a col-weights (imatrix) vector per target. "
+        f"Run the probe+cost stages first (they populate {act_dir}).")
+added = synthesize_packed_expert_col_weights(
+    os.environ["MODEL_PATH"], act_dir, cw)
+if added:
+    print(f"[pipeline] {stage} synthesized {len(added)} packed-expert "
+          f"imatrix entries (gate_up pool / down_proj routed replay)")
+os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+with open(out, "wb") as fh:
+    pickle.dump(cw, fh)
+print(f"[pipeline] {stage} wrote {out}: {len(cw)} entries")
+PY
+}
+
+# -----------------------------------------------------------------------
 # 1. Sensitivity probe (per-Linear empirical Fisher diagonal trace,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
@@ -786,29 +941,7 @@ if [[ "$BASE_COST_REUSABLE" == "0" ]]; then
   # rendering-confound class).
   if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" \
      && "$CB_EXPERT_EMPIRICAL" != "1" ]]; then
-    require_stage_settings "$CB_COL_WEIGHTS" cb-col-weights
-    if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
-      echo "[pipeline] [2/4] pre-cost CB col-weights harvest (local expert costs) ..."
-      CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
-import os, pickle
-from prismaquant.export_gguf import build_imatrix_from_act_cache
-from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
-act_dir = os.environ["CB_ACT_DIR"]
-out = os.environ["CB_COL_WEIGHTS"]
-cw = build_imatrix_from_act_cache(act_dir)
-if not cw:
-    raise SystemExit(f"[pipeline] ERROR: no activation cache under {act_dir!r}")
-added = synthesize_packed_expert_col_weights(
-    os.environ["MODEL_PATH"], act_dir, cw)
-if added:
-    print(f"[pipeline] [2/4] synthesized {len(added)} packed-expert "
-          f"imatrix entries (gate_up pool / down_proj routed replay)")
-os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-with open(out, "wb") as fh:
-    pickle.dump(cw, fh)
-print(f"[pipeline] [2/4] wrote {out}: {len(cw)} entries")
-PY
-    fi
+    harvest_cb_col_weights "[2/4] pre-cost (local expert costs)"
     export PRISMAQUANT_CB_COL_WEIGHTS="$CB_COL_WEIGHTS"
   fi
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
@@ -833,6 +966,15 @@ fi
 # Fisher output-MSE allocator cost-status check removed; the archive guard
 # at the top of this file errors out before reaching here if the var is set.
 
+# R3 / CB Milestone C: on a weighted-render lane the cached-menu cost cache
+# must render with the exporter's imatrix or it is not the bytes that ship.
+# Harvested once and shared with [2d-CB] and the exporter.
+COST_CACHE_COL_WEIGHT_ARGS=()
+if [[ "$COST_CACHE_COL_WEIGHTS_REQUIRED" == "1" ]]; then
+  harvest_cb_col_weights "[2b/4] cost-cache"
+  COST_CACHE_COL_WEIGHT_ARGS=(--col-weights "$CB_COL_WEIGHTS")
+fi
+
 if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" ]]; then
   require_stage_settings "$PRODUCTION_RENDER_COST_CACHE_PATH" render-cost-cache
   if [[ ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
@@ -842,6 +984,7 @@ if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-r
       --output "$PRODUCTION_RENDER_COST_CACHE_PATH" \
       --formats "$FORMATS" \
       --render-scope format-menu \
+      "${COST_CACHE_COL_WEIGHT_ARGS[@]+"${COST_CACHE_COL_WEIGHT_ARGS[@]}"}" \
       --n-calib-samples "$PRODUCTION_RENDER_COST_NSAMPLES" \
       --calib-seqlen "$PRODUCTION_RENDER_COST_SEQLEN" \
       --calib-seed "$PRODUCTION_RENDER_COST_SEED" \
@@ -927,6 +1070,7 @@ PY
       --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
       --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
       --render-scope format-menu \
+      "${COST_CACHE_COL_WEIGHT_ARGS[@]+"${COST_CACHE_COL_WEIGHT_ARGS[@]}"}" \
       $(if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then echo "--render-packed-experts"; fi) \
       2>&1 | tee "${WORK_DIR}/logs/aura_dw_cache.log"
   else
@@ -1045,33 +1189,9 @@ PY
   require_stage_settings "$COST_PATH" cb-hybrid-cost
   if [[ "$CB_MERGED" != "1" ]]; then
     # The empirical pass renders CB candidates imatrix-WEIGHTED — harvest
-    # the col-weights now (same skip-if-exists block as the [4/4] exporter;
-    # measured cost and shipped bytes stay the one weighted render).
-    require_stage_settings "$CB_COL_WEIGHTS" cb-col-weights
-    if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
-      echo "[pipeline] [2d-CB] harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
-      CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
-import os, pickle
-from prismaquant.export_gguf import build_imatrix_from_act_cache
-from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
-act_dir = os.environ["CB_ACT_DIR"]
-out = os.environ["CB_COL_WEIGHTS"]
-cw = build_imatrix_from_act_cache(act_dir)
-if not cw:
-    raise SystemExit(
-        f"[pipeline] ERROR: no activation cache under {act_dir!r}; the "
-        f"empirical expert pass needs a col-weights vector per CB target.")
-added = synthesize_packed_expert_col_weights(
-    os.environ["MODEL_PATH"], act_dir, cw)
-if added:
-    print(f"[pipeline] [2d-CB] synthesized {len(added)} packed-expert "
-          f"imatrix entries (gate_up pool / down_proj routed replay)")
-os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-with open(out, "wb") as fh:
-    pickle.dump(cw, fh)
-print(f"[pipeline] [2d-CB] wrote {out}: {len(cw)} Linears")
-PY
-    fi
+    # the col-weights now (same shared helper as the exporter; measured cost
+    # and shipped bytes stay the one weighted render).
+    harvest_cb_col_weights "[2d-CB]"
     if [[ ! -f "$CB_LOCAL_RAW" ]]; then
       mv "$COST_PATH" "$CB_LOCAL_RAW"
     fi
@@ -1475,6 +1595,189 @@ PY
   fi
 fi
 
+# -----------------------------------------------------------------------
+# [3c] AURA additivity report (re-vet R2 precondition (ii) / R3; the R2-vs-R19
+# disagreement resolved as WIRED).
+#
+# AURA's one structural assumption is that per-Linear KL contributions ADD.
+# This stage turns that assumption into a per-artifact NUMBER —
+#   residual = measured_end_KL(assignment) - sum_i predicted_dloss_i
+# with an honest stderr (exact per-probe when the cost rows carry
+# x2_per_probe, else the independence lower bound) — instead of a two-model
+# memory. It is a REPORT: it never fails the run, and it never changes an
+# allocation.
+#
+# WHY IT IS HERE AND NOT AT [2d]. The residual needs a concrete assignment,
+# and none exists until the allocator has run (and, under
+# validated-surrogate, until the frontier has been selected). This is the
+# first point where layer_config.json is final under both selection modes.
+#
+# AURA_ADDITIVITY_GATE:
+#   auto (default) — report from a measured KL this run ALREADY produced
+#                    (validated-surrogate's frontier JSON). Costs nothing. With
+#                    no such measurement the predicted sum + its stderr are
+#                    still recorded, with measured_kl null and a status saying
+#                    why: an AURA artifact always carries its prediction, and
+#                    carries the residual whenever the run measured one.
+#   measure        — additionally run one bounded KL measurement of the final
+#                    assignment against the SAME format-menu dW cache AURA
+#                    costed on (AURA_COST_NSAMPLES x AURA_COST_SEQLEN). Opt-in:
+#                    it is GPU work added to a run that did not ask for it, and
+#                    the default cost mode must not silently grow a stage.
+#   0              — off.
+# -----------------------------------------------------------------------
+: "${AURA_ADDITIVITY_GATE:=auto}"
+if [[ "$COST_MODE" == "aura" && "$AURA_ADDITIVITY_GATE" != "0" \
+   && "$AURA_ADDITIVITY_GATE" != "false" && "$AURA_ADDITIVITY_GATE" != "off" ]]; then
+  AURA_ADDITIVITY_JSON="${WORK_DIR}/artifacts/aura_additivity.json"
+  AURA_MEASURED_KL=""
+  AURA_MEASURED_KL_STDERR="0"
+  AURA_MEASURED_SOURCE="none"
+  AURA_FRONTIER_JSON="${WORK_DIR}/artifacts/validated_frontier_kl.json"
+  if [[ -f "$AURA_FRONTIER_JSON" ]]; then
+    read -r AURA_MEASURED_KL AURA_MEASURED_KL_STDERR <<<"$(
+      python3 - "$AURA_FRONTIER_JSON" "${WORK_DIR}/artifacts/validated_frontier_selection.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results = json.loads(Path(sys.argv[1]).read_text()).get("results", [])
+label = None
+sel = Path(sys.argv[2])
+if sel.is_file():
+    payload = json.loads(sel.read_text())
+    label = (payload.get("selected") or {}).get("label") or payload.get("label")
+row = None
+for item in results:
+    if label is not None and item.get("label") == label:
+        row = item
+        break
+if row is None and results:
+    row = min(results, key=lambda r: float(r.get("kl_mean", r.get("kl", 1e9))))
+if row is None:
+    print("")
+else:
+    kl = row.get("kl_mean", row.get("kl"))
+    print(f"{float(kl)} {float(row.get('kl_stderr', 0.0) or 0.0)}")
+PY
+    )"
+    [[ -n "$AURA_MEASURED_KL" ]] && AURA_MEASURED_SOURCE="validated_frontier_kl.json"
+  fi
+  if [[ -z "$AURA_MEASURED_KL" && "$AURA_ADDITIVITY_GATE" == "measure" ]]; then
+    AURA_ADDITIVITY_KL_JSON="${WORK_DIR}/artifacts/aura_additivity_kl.json"
+    if [[ ! -f "$AURA_ADDITIVITY_KL_JSON" ]]; then
+      echo "[pipeline] [3c] measuring end-KL for the additivity report (AURA_ADDITIVITY_GATE=measure) ..."
+      python3 -m prismaquant.validate_assignments_kl \
+        --model "$MODEL_PATH" \
+        --probe "$PROBE_PATH" \
+        --costs "$COST_PATH" \
+        --base-assignment "${WORK_DIR}/artifacts/layer_config.json" \
+        --assignment "selected=${WORK_DIR}/artifacts/layer_config.json" \
+        --formats "$FORMATS" \
+        --dataset "$DATASET" \
+        --n-calib-samples "$AURA_COST_NSAMPLES" \
+        --calib-seqlen "$AURA_COST_SEQLEN" \
+        --calib-seed "$AURA_COST_CALIB_SEED" \
+        --kl-scope full_sequence \
+        --assignment-materialization inplace \
+        --production-weight-cache "$PRODUCTION_RENDER_COST_CACHE_PATH" \
+        --production-cache-dir-override "$PRODUCTION_RENDER_COST_CACHE_DIR" \
+        --work-dir "${WORK_DIR}/work/aura_additivity" \
+        --dtype bf16 --device "$DEVICE" \
+        --output "$AURA_ADDITIVITY_KL_JSON" \
+        2>&1 | tee "${WORK_DIR}/logs/aura_additivity_kl.log" || true
+    fi
+    if [[ -f "$AURA_ADDITIVITY_KL_JSON" ]]; then
+      read -r AURA_MEASURED_KL AURA_MEASURED_KL_STDERR <<<"$(
+        python3 - "$AURA_ADDITIVITY_KL_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results = json.loads(Path(sys.argv[1]).read_text()).get("results", [])
+if not results:
+    print("")
+else:
+    row = results[0]
+    print(f"{float(row.get('kl_mean', row.get('kl', 0.0)))} "
+          f"{float(row.get('kl_stderr', 0.0) or 0.0)}")
+PY
+      )"
+      [[ -n "$AURA_MEASURED_KL" ]] && AURA_MEASURED_SOURCE="aura_additivity_kl.json"
+    fi
+  fi
+  if [[ -n "$AURA_MEASURED_KL" ]]; then
+    echo "[pipeline] [3c] AURA additivity report (measured KL from ${AURA_MEASURED_SOURCE}) ..."
+    python3 -m prismaquant.aura_additivity_gate \
+      --costs "$COST_PATH" \
+      --assignment "${WORK_DIR}/artifacts/layer_config.json" \
+      --measured-kl "$AURA_MEASURED_KL" \
+      --measured-kl-stderr "$AURA_MEASURED_KL_STDERR" \
+      --output "$AURA_ADDITIVITY_JSON" \
+      2>&1 | tee "${WORK_DIR}/logs/aura_additivity.log" || \
+      echo "[pipeline] [3c] WARNING: additivity report failed (non-blocking)"
+  else
+    echo "[pipeline] [3c] AURA additivity report: no measured end-KL in this run (SELECTION_MODE=${SELECTION_MODE}); recording the predicted sum only. Set AURA_ADDITIVITY_GATE=measure for the residual."
+    python3 - "$COST_PATH" "${WORK_DIR}/artifacts/layer_config.json" "$AURA_ADDITIVITY_JSON" <<'PY' || \
+      echo "[pipeline] [3c] WARNING: additivity report failed (non-blocking)"
+import json
+import pickle
+import sys
+
+from prismaquant.aura_additivity_gate import additivity_gate
+from prismaquant.layer_config import load_assignment
+
+with open(sys.argv[1], "rb") as fh:
+    payload = pickle.load(fh)
+result = additivity_gate(payload, load_assignment(sys.argv[2]), 0.0)
+# measured_kl=0.0 is a placeholder, not a measurement: null it out and say so,
+# rather than publish a residual equal to -sum(predicted).
+result["measured_kl"] = None
+result["residual"] = None
+result["residual_over_measured"] = None
+result["residual_z"] = None
+result["status"] = "no_measured_end_kl_in_this_run"
+with open(sys.argv[3], "w") as fh:
+    json.dump(result, fh, indent=1)
+print(json.dumps(result, indent=1))
+PY
+  fi
+  # Stamp the trust-region number into the cost table's provenance so every
+  # artifact derived from it carries it (the R2 provenance contract).
+  if [[ -f "$AURA_ADDITIVITY_JSON" ]]; then
+    python3 - "$COST_PATH" "$AURA_ADDITIVITY_JSON" "$AURA_MEASURED_SOURCE" <<'PY' || \
+      echo "[pipeline] [3c] WARNING: could not stamp additivity provenance (non-blocking)"
+import json
+import pickle
+import sys
+
+cost_path, report_path, source = sys.argv[1:4]
+with open(cost_path, "rb") as fh:
+    payload = pickle.load(fh)
+report = json.loads(open(report_path).read())
+prov = dict(payload.get("provenance", {}) or {})
+prov["additivity"] = {
+    key: report.get(key)
+    for key in (
+        "measured_kl", "measured_kl_stderr", "predicted_sum",
+        "predicted_stderr", "stderr_method", "residual",
+        "residual_over_measured", "residual_z", "n_covered", "n_zero_cost",
+        "status",
+    )
+}
+prov["additivity"]["measured_kl_source"] = source
+payload["provenance"] = prov
+with open(cost_path, "wb") as fh:
+    pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+add = prov["additivity"]
+print(f"[pipeline] [3c] additivity stamped into {cost_path}: "
+      f"predicted_sum={add['predicted_sum']:.6g} "
+      f"+-{add['predicted_stderr']:.3g} ({add['stderr_method']}) "
+      f"residual={add['residual']} z={add['residual_z']}")
+PY
+  fi
+fi
+
 if [[ "$EXPORT_CONTAINER" == "gguf" ]]; then
   # GGUF lane: one artifact serves llama.cpp natively and vLLM via the
   # GGUF path. Requires TARGET_PROFILE=gguf at allocation time (the
@@ -1559,7 +1862,8 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # artifact served by the out-of-tree gridbook_plugin (LAYOUT.md is
   # the byte contract). Like the GGUF lane, the exporter requantizes the bf16
   # skeleton with an imatrix-weighted VQ search — it does NOT read a production
-  # cache. Requires TARGET_PROFILE=nvfp4_cb + COST_MODE=local (gated above).
+  # cache. Requires the nvfp4_cb serving profile (gated above); the cost render
+  # only has to be imatrix-weighted, which the R3 assertion enforces.
   : "${CB_OUT:=${WORK_DIR}/exported_nvfp4_cb}"
   # Codebook source: `lattice` (deterministic fixed FP4/FP8 lattice, no
   # sidecar) or `learned` (shared per-(role) codebooks trained at export
@@ -1572,9 +1876,14 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # exp-1 CB-vs-IQ confound was a scale-rendering artifact). CB_SCALE_SWEEP=0
   # is the one-shot amax/grid-max A/B ablation only.
   : "${CB_SCALE_SWEEP:=1}"
-  # fp4 scale coding: `v1` (bare E4M3 plane, default/served) or `two_tier`
-  # (layout-v2 E8M0-super + 4-bit-sub; serve gates pending — do NOT ship).
-  : "${CB_SCALE_CODING:=v1}"
+  # fp4 scale coding: `two_tier` (layout-v2 E8M0-super + 4-bit-sub) or `v1`
+  # (bare E4M3 plane). D15 (re-vet R28): the default is the SHIPPED value.
+  # v2 shipped in the Hy3 295B and Laguna-S-2.1 artifacts and STANDARDS.md
+  # calls it the production fp4 scale coding with v1 legacy read-compat only —
+  # the old "serve gates pending, do NOT ship" comment predated its own ship.
+  # (fp8-CB has no group-16 scale plane, so this knob is inert on fp8-only
+  # menus, which is why two 27B/35B drivers set v1 without contradicting this.)
+  : "${CB_SCALE_CODING:=two_tier}"
 
   # Col-weights (per-input-column imatrix) — the CB exporter's weighted-VQ
   # importance, REQUIRED for every CB target (no silent RTN). Harvested from
@@ -1583,34 +1892,7 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # one weighted render (the one-cache / lockstep contract, format-pipeline
   # §6). Skip-if-exists; override CB_COL_WEIGHTS to supply a pre-built flat
   # {qname: (in_features,) tensor} pickle (e.g. Fisher col-weights, exp-4).
-  require_stage_settings "$CB_COL_WEIGHTS" cb-col-weights
-  if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
-    echo "[pipeline] [4/4] harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
-    CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
-import os, pickle
-from prismaquant.export_gguf import build_imatrix_from_act_cache
-from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
-act_dir = os.environ["CB_ACT_DIR"]
-out = os.environ["CB_COL_WEIGHTS"]
-cw = build_imatrix_from_act_cache(act_dir)
-if not cw:
-    raise SystemExit(
-        f"[pipeline] ERROR: no activation cache under {act_dir!r}; the CB "
-        f"exporter needs a col-weights (imatrix) vector per CB target. Run "
-        f"the probe+cost stages first (they populate {act_dir}).")
-added = synthesize_packed_expert_col_weights(
-    os.environ["MODEL_PATH"], act_dir, cw)
-if added:
-    print(f"[pipeline] [4/4] synthesized {len(added)} packed-expert "
-          f"imatrix entries (gate_up pool / down_proj routed replay)")
-os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-with open(out, "wb") as fh:
-    pickle.dump(cw, fh)
-print(f"[pipeline] [4/4] wrote {out}: {len(cw)} Linears")
-PY
-  else
-    echo "[pipeline] [4/4] CB col-weights exist, skipping"
-  fi
+  harvest_cb_col_weights "[4/4]"
 
   # Streaming exporter for 200-300B-class sources (Hy3 ~557GB, DSv4 ~295GB):
   # export_nvfp4_cb loads EVERY shard resident + accumulates EVERY output tensor
@@ -1671,12 +1953,16 @@ PY
   fi
   "${CB_EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
 
-  # TODO(Milestone C / production-cache): the fuller one-cache integration —
-  # teach production-render-score to pass col_weights to the CB render so the
-  # standard ProductionWeightCache identity holds (cost==KL==bytes through the
-  # cache, like NVFP4/FP8) and the COST_MODE=local restriction can lift — is
-  # DEFERRED per format-pipeline.md §6 ("Alternative (larger, better) path —
-  # flag not adopt"). Phase 0 mirrors the GGUF skeleton-requantize model.
+  # Milestone C LANDED 2026-07-30 (re-vet R3): `render_production_weight` /
+  # `build_production_cache` take `--col-weights`, so a cached-menu render of
+  # a CB rung is the SAME imatrix-weighted render the exporter ships and the
+  # standard ProductionWeightCache identity (cost == KL == bytes) holds on
+  # this lane too. The `COST_MODE=local` restriction is therefore GONE,
+  # replaced by the render-faithfulness assertion at the top of this file.
+  # What is deliberately NOT promoted: render-score/AURA objectives on CB are
+  # reachable but opt-in — their accuracy case is native-lane evidence and CB
+  # has had no served objective A/B (that A/B, not the plumbing, is what would
+  # justify a default).
   # There is also NO in-lane serving smoke: CB artifacts serve ONLY via the
   # out-of-tree gridbook_plugin (plugins/gridbook/), so the
   # load+generate / served-KL gate runs in the plugin's serving env, not here

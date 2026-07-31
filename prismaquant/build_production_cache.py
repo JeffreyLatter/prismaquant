@@ -57,6 +57,53 @@ from prismaquant.production_weight_cache import (
 from prismaquant.sensitivity_probe import load_calibration
 
 
+def _load_col_weights(path, formats) -> dict | None:
+    """Load the imatrix pickle for a weighted-family render (re-vet R3).
+
+    Refuses the two ways this can silently produce a confounded cache: a menu
+    that contains a weighted-render family with no vector (the render would be
+    unweighted while the exporter ships weighted bytes), and a vector supplied
+    for a menu that has no weighted family at all (nothing would consume it, so
+    the operator's intent is not what happened).
+    """
+    import pickle
+
+    import torch
+
+    from prismaquant.production_weight_cache import _weighted_render_family
+
+    weighted = sorted({
+        fmt for fmt in formats if _weighted_render_family(fmt) is not None
+    })
+    if not path:
+        if weighted:
+            raise SystemExit(
+                "[build-prod-cache] ERROR: the format menu contains "
+                f"weighted-render formats {weighted} but no --col-weights was "
+                "supplied. Their exporters ALWAYS render imatrix-weighted, so "
+                "an unweighted cache render is not the bytes that ship (the "
+                "rendering confound). Pass --col-weights "
+                "<work>/artifacts/cb_col_weights.pkl."
+            )
+        return None
+    if not weighted:
+        raise SystemExit(
+            "[build-prod-cache] ERROR: --col-weights was supplied but the "
+            f"format menu {sorted(set(formats))} has no weighted-render "
+            "family (CB / GGUF); nothing would consume the vector and every "
+            "render would be byte-identical without it. Drop the flag."
+        )
+    with open(path, "rb") as fh:
+        raw = pickle.load(fh)
+    loaded = {str(k): torch.as_tensor(v) for k, v in raw.items()}
+    print(
+        f"[build-prod-cache] col-weights: {len(loaded)} entries from {path} "
+        f"(weighted-render formats in menu: {weighted})",
+        flush=True,
+    )
+    return loaded
+
+
 def _model_has_packed_experts(model: nn.Module, profile) -> bool:
     from prismaquant.sensitivity_probe import _is_packed_experts_module
     return any(
@@ -494,6 +541,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "per-Linear and per-experts-module input rows that the render passes "
         "consume in place of a fresh calibration forward.",
     )
+    p.add_argument(
+        "--col-weights",
+        default=None,
+        help="Per-input-column imatrix pickle ({qname: tensor}, e.g. "
+        "artifacts/cb_col_weights.pkl) applied to the weighted-render "
+        "families ONLY (CB codebook rungs, GGUF k-quants) — re-vet R3 / CB "
+        "Milestone C. Their exporters always render weighted, so without this "
+        "a cached-menu render of those formats is unfaithful to the shipped "
+        "bytes (the rendering confound the lane gates were written to avoid). "
+        "NVFP4/FP8/MX/BF16 renders are bit-identical with or without it.",
+    )
     args = p.parse_args(argv)
 
     # Opt-in deterministic CUDA path. The default lever ablations on small
@@ -648,6 +706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{non_bf16} non-BF16 entries from {layer_config}",
                 flush=True,
             )
+        col_weights = _load_col_weights(args.col_weights, formats)
         t0 = time.monotonic()
         cache = fill_production_weight_cache(
             model, calib_ids, qnames,
@@ -662,6 +721,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             recache_include_activation_quant=not args.no_recache_activation_quant,
             recache_microbatch_size=args.recache_microbatch_size,
             h_detail_dir=args.h_detail_dir,
+            col_weights=col_weights,
         )
         # R14: stamp the calibration identity onto the cache so every artifact
         # derived from it (production_render_cost's cost table) can be checked
@@ -700,6 +760,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 render_mode=args.expert_render_mode,
                 gate_calib_ids=gate_calib_ids,
                 gate_token_budget=args.expert_gate_token_budget,
+                col_weights=col_weights,
             )
             if expert_coverage:
                 if cache.metadata is None:

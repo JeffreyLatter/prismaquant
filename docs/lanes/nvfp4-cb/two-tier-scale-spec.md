@@ -11,9 +11,10 @@
 > 295B and Laguna-S-2.1 artifacts (`CB_SCALE_CODING=two_tier`,
 > `scripts/run_hy3_prod_nvfp4cb.sh:53`, `scripts/run_hy3_prod_joint.sh:56`,
 > `scripts/run_laguna_s21_prod.sh:49`). Per `STANDARDS.md:13,22-23` v2 is the
-> production fp4 scale coding and **v1 is legacy read-compat only** — note
-> `run-pipeline.sh:1547` still defaults `CB_SCALE_CODING=v1` per-run, so
-> production drivers set it explicitly. §6's implementation gates are
+> production fp4 scale coding and **v1 is legacy read-compat only** — and since
+> 2026-07-30 (re-vet R28 / §12 D15) `run-pipeline.sh` **defaults
+> `CB_SCALE_CODING=two_tier`**, so the shell default finally matches the shipped
+> value. Production drivers still set it explicitly, so no shipped run changes. §6's implementation gates are
 > historical; §1–§5 remain the contract.
 >
 > **Original motivation (as drafted).** Mitigation for the structural

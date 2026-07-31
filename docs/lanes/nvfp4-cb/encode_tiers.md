@@ -28,7 +28,7 @@ Result (balanced, 89M fp8 K44 MLP, wRecon 2.5739e+01 unchanged, peak 5.2 GB):
 | fast | (n/a) | 14.3 s | — |
 | max | 276 s | 276 s | ×1.0 (bit-identical, the regression anchor) |
 
-fp4 v1 (K16, small K) is already 5.4 s; two-tier v2 (opt-in, not the pipeline default — `CB_SCALE_CODING=v1` ships) keeps its original bit-preserving W×16 windowed-entry path (25 s; its search does not batch cleanly and it is off the critical 27B/35B path). Cost-stage extrapolation: the ~19 h uniform-FP8 cost stage → **~5.4 h** at ×3.5 on the MLP-dominated wall.
+fp4 v1 (K16, small K) is already 5.4 s; two-tier v2 (**the pipeline default since 2026-07-30**, D15; v1 is legacy read-compat) keeps its original bit-preserving W×16 windowed-entry path (25 s; its search does not batch cleanly and it is off the critical 27B/35B path). Cost-stage extrapolation: the ~19 h uniform-FP8 cost stage → **~5.4 h** at ×3.5 on the MLP-dominated wall.
 
 ## Per-Linear timings (0.6B layer-6 + stacked), min-of-2
 

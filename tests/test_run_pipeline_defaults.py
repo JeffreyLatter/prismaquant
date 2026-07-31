@@ -22,7 +22,9 @@ def test_production_recache_default_enabled_after_smoke_ladder():
     assert "PRODUCTION_RECACHE:=1" in script
     assert "PRODUCTION_RECACHE=0" in script
     assert "PIPELINE_SPEC_PATH:=${WORK_DIR}/artifacts/pipeline_spec.json" in script
-    assert "COST_MODE:=production-render-score" in script
+    # COST_MODE flipped to `aura` 2026-07-30 (re-vet R2); the flip itself is
+    # pinned in tests/test_architecture_doc.py alongside the doc it must match.
+    assert "COST_MODE:=aura" in script
     assert "PRODUCTION_CACHE_LEVERS:=gptq,static_act_order,joint_scale_opt" in script
     assert "includes static_act_order" not in script
     assert "production-render-staged|production-render-tail" in script  # exit-2 gate arm
@@ -91,8 +93,10 @@ def test_grouped_kl_is_archived_and_blocked():
     assert "prismaquant.grouped_kl_cost" not in script
     assert "GROUPED_KL_NSAMPLES" not in script
     assert "GROUPED_KL_MAX_LANES" not in script
-    # production-render-score remains the default cost mode.
-    assert "COST_MODE:=production-render-score" in script
+    # production-render-score remains an ACCEPTED mode (it is the explicit /
+    # legacy spelling since the R2 default flip), which is what makes the
+    # grouped-kl arm's "use production-render-score" advice honest.
+    assert "production-render-score|production-render)" in script
 
 
 def test_mse_promotion_is_archived_and_blocked():

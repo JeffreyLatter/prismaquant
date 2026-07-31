@@ -50,7 +50,12 @@ from .expand import (
     expand_cb_to_value,
     expand_fp4_v2_to_weight,
 )
-from .moe_autotune import STOCK as _AUTO_STOCK, cb_prefill_auto
+from .moe_autotune import (
+    STOCK as _AUTO_STOCK,
+    cb_prefill_auto,
+    record_autotune_timings,
+    shape_regime as autotune_shape_regime,
+)
 from .moe_l2 import (
     L2_PIPELINE,
     cb_l2_cap_bytes,
@@ -1414,15 +1419,37 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             forced=os.environ.get("PRISMAQUANT_CB_PREFILL_AUTO_FORCE") or None,
             log=self._log_prefill_choice)
 
-    def _log_prefill_choice(self, best, timings, forced=False):
+    def _log_prefill_choice(self, best, timings, forced=False, layer=None,
+                            num_tokens=None):
         """One line per layer, to stderr like every other gate on this path.
         This is the evidence trail: a serving run must be able to show WHY it
-        picked what it picked, with the measurements that decided it."""
+        picked what it picked, with the measurements that decided it.
+
+        R21: the same measurements also go to a DURABLE sink — a per-(format,
+        shape regime, box) JSONL table — so "two boxes' cost tables disagree in
+        ranking", the forcing function for a time term in the allocator
+        objective, becomes observable instead of anecdotal. The stderr line is
+        unchanged."""
         detail = " ".join(f"{n}={timings[n]:.3f}ms" for n in sorted(timings))
         print(f"[prismaquant-cb] prefill auto {self.prefix}: "
               f"{'forced' if forced else 'chose'} {best}"
               + (f" | {detail}" if detail else ""),
               file=sys.stderr, flush=True)
+        try:
+            record_autotune_timings(
+                best, timings,
+                layer_prefix=self.prefix,
+                fmt=("NVFP4_CB_K%d" if self.is_fp4 else "FP8_CB_K%d") % self.k,
+                regime=autotune_shape_regime(
+                    num_tokens if num_tokens is not None else 0,
+                    n_experts=getattr(layer, "_cb_E", None),
+                    intermediate=getattr(layer, "_cb_inter", None),
+                ),
+                forced=forced,
+                sink_dir=os.environ.get("PRISMAQUANT_CB_ARTIFACT_DIR"),
+            )
+        except Exception:                      # noqa: BLE001 — never fail a serve
+            pass
 
     # -- prefill: per-expert loop (bisection reference) ---------------------
     def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):

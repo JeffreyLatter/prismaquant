@@ -352,9 +352,11 @@ compressed-tensors config and hard-fails on non-scheme formats).
 
 **`run-pipeline.sh` gates** (mirror the GGUF lane fail-fasts at `:72-105`). Under
 `EXPORT_CONTAINER=nvfp4_cb`:
-- require `COST_MODE=local` (production-render-score scores UNWEIGHTED CB renders
-  while the exporter ships weighted bytes → rendering confound; identical to the
-  GGUF reason at `:92-96`);
+- ~~require `COST_MODE=local`~~ — **superseded 2026-07-30 (re-vet R3).** The
+  invariant is that the cost render must be the *weighted* render the exporter
+  ships; that is a property of the render, keyed off the format family, not of
+  the objective. A cached-menu render now supplies `--col-weights` (Milestone C),
+  so the gate is a render-faithfulness assertion instead;
 - require `TARGET_PROFILE=nvfp4_cb` (exporter hard-fails on non-CB formats);
 - require `PRODUCTION_CACHE=0 PRODUCTION_RECACHE=0` (exporter requantizes the bf16
   skeleton; no production cache is read — same as GGUF `:97-100`);
@@ -362,13 +364,21 @@ compressed-tensors config and hard-fails on non-scheme formats).
   higher-rank imatrix than 256 rows, same rationale as the GGUF lane `:67-76` —
   **confirm by measurement**, don't assume).
 
-> **Alternative (larger, better) path — flag not adopt:** teach
-> `production-render-score` to pass `col_weights` to the CB render so the standard
-> ProductionWeightCache one-cache identity holds (cost==KL==bytes through the
-> cache, like NVFP4/FP8), removing the `COST_MODE=local` restriction. More work;
-> defer past Phase 0. Phase 0 mirrors GGUF's skeleton-requantize model, which
-> satisfies the one-cache rule trivially (one weighted render, used by both local
-> cost and the exporter).
+> **Milestone C — ADOPTED and LANDED 2026-07-30 (re-vet R3).** This was filed as
+> the "alternative (larger, better) path — flag not adopt", deferred past Phase 0.
+> It is now implemented: `render_production_weight` and `build_production_cache`
+> take `col_weights`, applied to the weighted-render families only
+> (`production_weight_cache.WEIGHTED_RENDER_FAMILIES`) through the single shared
+> definition `emu_forward_kl.weighted_quantize_dequantize`, so the standard
+> ProductionWeightCache identity (cost == KL == bytes) holds on this lane and the
+> `COST_MODE=local` restriction is **gone** — replaced by a render-faithfulness
+> assertion (ARCHITECTURE.md §4.7). Native/NVFP4/FP8 renders are pinned
+> **bit-identical** with and without the argument
+> (`tests/test_col_weights_render_identity.py`). Phase 0's skeleton-requantize
+> model still satisfies the one-cache rule the trivial way and remains what the
+> exporter does; what changed is that the *cost* side is no longer forced to it.
+> **Not promoted:** render-score / AURA objectives on CB are reachable, opt-in and
+> non-default until a served CB objective A/B exists.
 
 ---
 
@@ -465,9 +475,12 @@ profile → **A4 run allocator+cost+KL end-to-end in emulation on Qwen3-0.6B the
    Phase-0 promise.
 6. **`ACTIVATION_ROWS_LIMIT` for VQ** (§6): assume 1024 by analogy to GGUF but
    confirm the VQ codeword search's imatrix rank needs by measurement.
-7. **One-cache via production-render-score** (§6): Phase 0 mirrors GGUF
-   (COST_MODE=local, skeleton requantize); the fuller cache-integrated path is
-   deferred and should be scoped only if CB becomes a default lane.
+7. ~~**One-cache via production-render-score**~~ (§6): **CLOSED 2026-07-30
+   (re-vet R3, Milestone C).** The cache-integrated path is implemented —
+   `col_weights` on `render_production_weight` / `build_production_cache` — so the
+   one-cache identity holds on this lane without CB becoming the default. The
+   exporter still requantizes the skeleton; what lifted is the restriction on
+   which cost render is admissible.
 8. **Does the 8-dim VQ + CUTLASS actually round-trip bit-compatible NVFP4?**
    Assumed (decoded codewords are on the E2M1 grid + NVFP4 scale layout). The
    serving workstream must confirm the plugin can materialize standard NVFP4

@@ -43,8 +43,8 @@ format-NAME-driven and registry-backed, so CB rungs slot in with two small
 changes rather than a new tool:
 
 1. **Invoke under the CB lane.** `run-pipeline.sh` `EXPORT_CONTAINER=nvfp4_cb`
-   (COST_MODE=local) gains an opt-in step (`EXPERT_EMPIRICAL=1`, default ON
-   for MoE profiles): run `expert_empirical_cost --formats "<expert menu>"
+   gains an opt-in step (`CB_EXPERT_EMPIRICAL=1`; **the shell default is `0`
+   since 2026-07-30 — D15, the value every shipped MoE CB driver sets**): run `expert_empirical_cost --formats "<expert menu>"
    --merge-base <local cost pkl> --output <merged pkl>`. Per MoE layer it
    measures end-to-end mean-token KL(BF16 ‖ unit-quantized) with everything
    else at source precision, splits the unit cost across member tensors by

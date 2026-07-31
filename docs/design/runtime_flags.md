@@ -108,7 +108,9 @@ levers or cost modes are requested.
 | `TARGET_DISK_GB` | unset | Byte budget in decimal GB (re-vet R1, closes D12). When set: **overrides `TARGET_BITS`**, narrows the Pareto sweep to the ~3 byte-feasible rungs, and flips `SELECTION_MODE` to `validated-surrogate` + `VALIDATED_FRONTIER_PICK` to `budget` (explicit values still win). The card is the constraint; measured KL is the objective. |
 | `FISHER_WEIGHTED_GPTQ` | archived | Any truthy value is rejected; archive context lives under `archive/fisher_2026-05-15/`. |
 | `FISHER_OUTPUT_MSE_ALLOCATOR` | archived | Any truthy value is rejected; V1 allocation uses the non-Fisher objective plus measured frontier validation. |
-| `COST_MODE` | `production-render-score` (`run-pipeline.sh:187`) | `production-render-score` (default) renders the full `FORMATS` menu for every Linear through `ProductionWeightCache` and writes an allocator-compatible cost.pkl from the recorded production render scores. `local` keeps the legacy `h_trace × output_mse` objective (and is **required** for the GGUF and nvfp4_cb containers — see the gates at `:99` and `:121`). `aura` runs the AURA downstream-KL-adjoint cost (`aura_cost.py`, served −38% KL @4B / −17.9% @27B vs the h_trace×output_mse baseline) against a production-rendered dW cache; on packed-MoE models the route-flip-blind smooth cost is replaced for experts by measured empirical unit-KL (`expert_empirical_cost.py`, FP8 kept in the menu) merged into one hybrid payload, with MTP/visual sidecar rows backfilled from the baseline cost. AURA is fully wired but **opt-in** (sub-stages at `:314-336`, `:825-956`). Every producer stamps `provenance["cost_mode"]` (`--cost-mode`, re-vet R2 precondition (i)) and reuse of `cost.pkl` is conditional on it matching: `cost.pkl` is the same path under every mode, so a mode change used to silently allocate on the previous estimator. A mismatch rebuilds loudly; an unstamped (pre-R2) table warns and is reused. `grouped-kl`, `production-render-staged`, `fisher`, `hdq` and `multi-shot` are **archived** and `exit 2`. `production-render-staged` was walled 2026-07-30 (`archive/production_render_staged_2026-07-30/`, re-vet R17): it rendered NVFP4 first and offered promotion formats only to the top-30% error tail, so on 27B its last-token-KL screen improved (0.0232 vs 0.0280) while direct WikiText PPL regressed (10.83 vs 8.33) — "Do not ship". |
+| `COST_MODE` | **`aura`** (flipped 2026-07-30, re-vet R2) | The documented **spelling** over the two axes `COST_RENDER` × `COST_OBJECTIVE` (re-vet R3, §4.7 of ARCHITECTURE.md); the three values keep their exact meanings. `aura` (default) runs the AURA downstream-KL-adjoint cost (`aura_cost.py`, served −38%/−39.5% confident-KL @4B across two calibrations, −17.9% @27B, both flagships) against a production-rendered dW cache; on packed-MoE models the route-flip-blind smooth cost is replaced for experts by measured empirical unit-KL (`expert_empirical_cost.py`, FP8 kept in the menu) merged into one hybrid payload, with MTP/visual sidecar rows backfilled from the baseline cost. `production-render-score` renders the full `FORMATS` menu through `ProductionWeightCache` and writes an allocator cost from the recorded render scores — the **explicit/legacy** spelling that reproduces every pre-flip artifact. `local` keeps the inline weight-recon measurement. The CB/GGUF lanes are **no longer restricted to `local`**: the old gate named a render property to block an objective, and is replaced by the render-faithfulness assertion (a cached-menu render on those lanes is built `--col-weights`, CB Milestone C). Non-`local` objectives there are reachable but OPT-IN and not recommended pending a served CB A/B. Every producer stamps `provenance["cost_mode"]` (`--cost-mode`, R2 precondition (i)) and reuse of `cost.pkl` is conditional on it matching: `cost.pkl` is the same path under every mode, so a mode change used to silently allocate on the previous estimator. A mismatch rebuilds loudly; an unstamped (pre-R2) table warns and is reused. `grouped-kl`, `production-render-staged`, `fisher`, `hdq` and `multi-shot` are **archived** and `exit 2`. `production-render-staged` was walled 2026-07-30 (`archive/production_render_staged_2026-07-30/`, re-vet R17): it rendered NVFP4 first and offered promotion formats only to the top-30% error tail, so on 27B its last-token-KL screen improved (0.0232 vs 0.0280) while direct WikiText PPL regressed (10.83 vs 8.33) — "Do not ship". |
+| `COST_RENDER` / `COST_OBJECTIVE` | derived from `COST_MODE` | The mechanism under the spelling (re-vet R3): `COST_RENDER ∈ {inline, cached-menu}` is WHICH render produces the per-`(Linear, format)` error; `COST_OBJECTIVE ∈ {weight-recon, render-score, aura-adjoint}` is how that error becomes `predicted_dloss`. Setting the pair directly is equivalent to the alias; setting both spellings at once is `exit 2`; the two unimplemented pairs (`inline × aura-adjoint`, `cached-menu × weight-recon`) stop with the reason. |
+| `AURA_ADDITIVITY_GATE` | `auto` | Stage `[3c]`, the AURA trust-region report (R2 precondition (ii)): `residual = measured_end_KL − Σ predicted_dloss`, stamped into `cost.pkl` `provenance["additivity"]`. `auto` reports from a measured KL the run ALREADY produced (validated-surrogate's frontier JSON) and otherwise records the predicted sum with `measured_kl: null` and a status — zero added GPU, because the default cost mode must not silently grow a stage. `measure` adds one bounded KL eval of the final assignment against the same dW cache AURA costed on. `0` disables. Non-blocking either way. |
 | `AURA_COST_NPROBES` / `AURA_COST_NSAMPLES` / `AURA_COST_SEQLEN` / `AURA_COST_CALIB_SEED` | `32` / `8` / `128` / `42` | `COST_MODE=aura` probe/calibration volume (defaults = the regen-27b recipe). Also `AURA_COST_LINEAR_CHUNKS` (8), `AURA_COST_PROBE_MICROBATCH` (8), `AURA_COST_MIN_FREE_GIB` (18). |
 | `AURA_COST_DTYPE` | `auto` | Resident model dtype for the aura_cost stage. `auto` sizes the checkpoint (fp8 sidecars counted at 1 byte/param) and picks `float32` (additivity-preferred, the 27B regen regime) only when params×4 bytes + `AURA_COST_MIN_FREE_GIB` fits in MemAvailable, else `bfloat16` (35B-class — fp32 is ~140 GiB against the 121 GiB pool and OOM-kills the box). |
 | `AURA_EXPERT_NSAMPLES` / `AURA_EXPERT_SEQLEN` | `16` / `512` | `COST_MODE=aura` empirical packed-expert unit-KL stage calibration volume (the 35B arm-E recipe). |
@@ -169,8 +171,13 @@ levers or cost modes are requested.
 ## 5. NVFP4-CB / FP8-CB build lane
 
 Enabled by `EXPORT_CONTAINER=nvfp4_cb`, which the pipeline gates to
-`COST_MODE=local`, `TARGET_PROFILE=nvfp4_cb`, `PRODUCTION_CACHE=0` and
-`PRODUCTION_RECACHE=0` (`run-pipeline.sh:121-129`). Lane record:
+`TARGET_PROFILE=nvfp4_cb`, `PRODUCTION_CACHE=0` and `PRODUCTION_RECACHE=0`
+(the CB exporter requantizes the bf16 skeleton and never reads the export
+cache). The old `COST_MODE=local` requirement is **gone** as of 2026-07-30
+(re-vet R3): it named a property of the *render* in order to block an
+*objective*. What is enforced instead is render faithfulness — a `cached-menu`
+cost render on this lane is built with `--col-weights`, so it is the same
+imatrix-weighted render the exporter ships (CB Milestone C). Lane record:
 `docs/lanes/nvfp4-cb/PLAN.md`.
 
 | env var | default | read at | what it does |
@@ -185,13 +192,19 @@ Enabled by `EXPORT_CONTAINER=nvfp4_cb`, which the pipeline gates to
 | `PRISMAQUANT_EXPORT_REUSE_VERIFY` | `3` | `export_nvfp4_cb_streaming.py:1363` | Number of reused tensors re-encoded fresh and byte-checked; any mismatch aborts. |
 
 Shell-side CB knobs (`run-pipeline.sh`): `CB_LADDER_INTERP` (`0`),
-`CB_EXPERT_EMPIRICAL` (`1`, `:332`), `CB_EXPERT_NSAMPLES` / `CB_EXPERT_SEQLEN`
-(`16` / `512`, `:969-970`), `CB_EXPERT_SAMPLE` (`0`, `:1021`), `CB_COL_WEIGHTS`
-(`$WORK_DIR/artifacts/cb_col_weights.pkl`), `CB_OUT`
+**`CB_EXPERT_EMPIRICAL` (`0` since 2026-07-30 — D15: the default is now the
+value every shipped MoE CB driver sets; `1` re-enables the `[2d-CB]` empirical
+unit-KL replacement)**, `CB_EXPERT_NSAMPLES` / `CB_EXPERT_SEQLEN` (`16` /
+`512`), `CB_EXPERT_SAMPLE` (`0`), `CB_COL_WEIGHTS`
+(`$WORK_DIR/artifacts/cb_col_weights.pkl`; harvested by the shared
+`harvest_cb_col_weights` helper, one definition and four call sites), `CB_OUT`
 (`$WORK_DIR/exported_nvfp4_cb`), `CB_CODEBOOK_SOURCE` (`lattice`),
 `CB_CODEBOOK_ITERS` (`4`), `CB_CODEBOOK_SEED` (`0`), `CB_SCALE_SWEEP` (`1`;
-`0` is the one-shot amax/grid-max ablation only), `CB_SCALE_CODING` (`v1`;
-`two_tier` layout-v2 serve gates are pending — do NOT ship),
+`0` is the one-shot amax/grid-max ablation only), **`CB_SCALE_CODING`
+(`two_tier` since 2026-07-30 — D15: layout-v2 shipped in the Hy3 295B and
+Laguna-S-2.1 artifacts and `STANDARDS.md` calls it the production fp4 scale
+coding, with v1 legacy read-compat only; the flag is inert on fp8-CB-only
+menus, which have no group-16 scale plane)**,
 `EXPORT_REUSE_PRIOR` / `EXPORT_REUSE_VERIFY`.
 
 ## 6. Non-`PRISMAQUANT_` shell vars read directly by Python
@@ -245,6 +258,8 @@ legacy alias `prismaquant` (`plugin.py:133-139`).
 |---|---|---|---|
 | `PRISMAQUANT_CB_PREFILL` | `auto` (fp8) / `loop` (fp4) | `moe.py:404` | MoE prefill strategy override. `auto` is the measured per-layer selection promoted in `3062fbf`. `l2_pipeline` selects the diagnostic path directly. |
 | `PRISMAQUANT_CB_AUTOTUNE_MIN_M` | `1024` | `moe.py:1395` | Minimum M before prefill autotuning engages. |
+| `PRISMAQUANT_CB_AUTOTUNE_LOG` | unset | `moe_autotune.py:autotune_sink_path` | Durable JSONL sink for the prefill auto-tuner's per-candidate timings (re-vet R21): one row per tuned layer carrying `(format, shape regime, box)` + `{candidate: ms}`. Unset falls back to `<PRISMAQUANT_CB_ARTIFACT_DIR>/cb_autotune_timings.jsonl` when that is set, else the timings stay on stderr only. `off`/`0` disables. Append-only; an unwritable path degrades to a stderr warning and never fails a serve. **This is measurement, not policy** — nothing reads it back into an allocator; the λ time term stays specified-not-implemented until two boxes' tables disagree in ranking. |
+| `PRISMAQUANT_CB_ARTIFACT_DIR` | unset | `moe.py:_log_prefill_choice` | Directory the auto-tuner's default sink is written beside (normally the served artifact's directory). |
 | `PRISMAQUANT_CB_PREFILL_AUTO_FORCE` | unset | `moe.py:1397` | Pins the autotuner to one named candidate. |
 | `PRISMAQUANT_CB_L2_AUTOTUNE` | unset | `moe.py:1375` | `1` adds the L2-pipeline variant to the autotune candidates. **DIAGNOSTIC-ONLY** (`afc64ec`): gated off by default after three live-serve wedges; its parity / ragged / buffer-rotation race tests have never executed on hardware. |
 | `PRISMAQUANT_CB_L2_WINDOW_MB` / `_GROUP` / `_MIN_M` / `_OVERLAP` | unset / unset / `128` (`moe_l2.py:138`) / unset | `moe.py:920` / `:923` / `:1115` / `:1171` | L2-pipeline per-half window cap (can only lower the device-derived cap), forced expert group size, tiny-M floor, and cross-stream overlap. `_OVERLAP=1` refuses to run inside a graph capture rather than risk the driver hang. |
@@ -273,7 +288,7 @@ device reads, no new syncs).
 
 | env var | default | what it does |
 |---|---|---|
-| `EXPORT_CONTAINER` | `compressed-tensors` | `gguf` switches stage 4 to skeleton-build + `export_gguf`; the pipeline requires `TARGET_PROFILE=gguf`, `COST_MODE=local`, `PRODUCTION_CACHE=0` (`run-pipeline.sh:97-107`) |
+| `EXPORT_CONTAINER` | `compressed-tensors` | `gguf` switches stage 4 to skeleton-build + `export_gguf`; the pipeline requires `TARGET_PROFILE=gguf` and `PRODUCTION_CACHE=0`. The `COST_MODE=local` requirement was replaced by the render-faithfulness assertion (re-vet R3): what matters is that the cost render applies the imatrix exactly when the export does, which `PRISMAQUANT_GGUF_IMATRIX` already keys. |
 | `PRISMAQUANT_GGUF_IMATRIX` | `1` (`measure_quant_cost.py:1211`) | Activation-weighted (imatrix) k-quant scale selection in BOTH the batched cost path and the pipeline's export call — keep the two in lockstep or the A/B has a rendering confound |
 | `LLAMA_CPP_DIR` | `/home/rob/dq-runs/llama.cpp` | Source of `convert_hf_to_gguf.py` for the skeleton |
 | `GGUF_SKELETON` | `WORK_DIR/artifacts/skeleton.gguf` | bf16 skeleton path (built if missing) |

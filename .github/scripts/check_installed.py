@@ -38,6 +38,18 @@ if not specs:
     sys.exit(f"no model-structure specs under {spec_dir} — package-data broke")
 print(f"  model-structure specs OK: {len(specs)} ({', '.join(specs)})")
 
+# Lane specs (re-vet R16): the per-lane ship-gate declaration is package data
+# too — an install that cannot resolve it silently loses the only place the
+# bar is defined.
+from prismaquant.lane_spec import all_lane_specs  # noqa: E402
+
+lanes = all_lane_specs()
+if len(lanes) < 3:
+    sys.exit(f"lane specs missing from the install (found {len(lanes)}) — "
+             "package-data broke")
+print(f"  lane specs OK: {len(lanes)} "
+      f"({', '.join(spec.id for spec in lanes)})")
+
 # run-pipeline.sh is the orchestrator, shipped as package data.
 pipeline = os.path.join(where, "run-pipeline.sh")
 if not os.path.isfile(pipeline):

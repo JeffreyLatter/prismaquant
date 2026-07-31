@@ -109,10 +109,15 @@ house promotion rules (repeats, held-out corpora, downstream tasks) apply.
 ## Consistency guards (added after the 2026-07-06 review pass)
 
 - `run-pipeline.sh` **fails fast** when `EXPORT_CONTAINER=gguf` is combined
-  with `COST_MODE!=local`, `PRODUCTION_CACHE!=0`, or `TARGET_PROFILE!=gguf` —
-  each combination silently breaks the measured-cost==shipped-bytes contract
-  (render-score scores unweighted registry renders; the production cache is
-  never read by this exporter).
+  with `PRODUCTION_CACHE!=0` or `TARGET_PROFILE!=gguf`. The third condition
+  used to be `COST_MODE!=local`; **since 2026-07-30 (re-vet R3) it is a
+  render-faithfulness assertion instead.** The contract that matters is
+  measured-cost-render == shipped-bytes-render, which is a property of the
+  *render*, not of the objective — and it is keyed off the format family, as
+  `measure_quant_cost._cost_render_uses_imatrix` always did. A `cached-menu`
+  cost render on this lane is now built with `--col-weights`, so it applies the
+  same imatrix the exporter does; `PRODUCTION_CACHE=0` still holds because
+  `export_gguf` requantizes the skeleton and never reads the export cache.
 - `export_native_compressed` **hard-fails** on GGUF formats in an assignment
   (previously they became newly reachable by the silent BF16-coercion branch).
 - The exporter **hard-fails** when an imatrix is requested but empty, weights
@@ -182,12 +187,14 @@ answer. No public quality claim until both land and repeat.
   promoted fixed damp 1.0. Covers the six uniform k-quants
   (`gguf_gptq.py:30-43`, `GPTQ_SUPPORTED`); wired at
   `export_gguf.py:322-334` via `--gptq-act-dir`. Still true: the IQ family has
-  no GPTQ rounder (grid/codebook indices, not a uniform level), and
-  `_format_supports_render_mechanism` (`production_weight_cache.py:1349-1380`)
-  still returns false for gguf formats — the GGUF GPTQ path lives in the
-  exporter, not in `ProductionWeightCache`, so cost measurement still scores
-  the registry-RTN render. That is a rendering-confound risk if allocation
-  ever proves sensitive to it.
+  no GPTQ rounder (grid/codebook indices, not a uniform level), and the GGUF
+  **GPTQ** path lives in the exporter, not in `ProductionWeightCache`, so cost
+  measurement scores the imatrix-RTN render rather than the GPTQ one. That is a
+  rendering-confound risk if allocation ever proves sensitive to it. What
+  *changed* on 2026-07-30 (re-vet R3): `_format_supports_render_mechanism` now
+  returns True for the gguf family on the `weighted_vq` mechanism, so a
+  production-cache render of a GGUF format applies `col_weights` — the imatrix
+  half of the confound is closed, the GPTQ half is not.
 - **IQ formats** (IQ2_XXS 2.06 / IQ2_XS 2.31 / IQ2_S 2.56 / IQ3_XXS 3.06 /
   IQ3_S 3.44 / IQ4_XS 4.25 / IQ4_NL 4.5 bpw): **implemented** end-to-end
   (`gguf_iq_formats.py`) — registry FormatSpecs, layer_config/serving allow-list
@@ -201,15 +208,32 @@ answer. No public quality claim until both land and repeat.
   (~1.000). Still **research/candidate**: the vLLM/llama.cpp serving path uses
   MMVQ/Triton (no CUDA MMQ) and has not cleared a perf gate; GPTQ-into-IQ is not
   implemented (IQ renders via imatrix-RTN, `GPTQ_SUPPORTED` excludes them).
-- **Selection**: `SELECTION_MODE=surrogate` only; the validated-frontier
-  real-KL selection has not been wired to a llama.cpp evaluator yet — and the
-  ~3 bpw cliff is exactly where measured selection should pay.
+- **Selection**: the lane now HAS a KL evaluator behind the
+  `validate_assignments_kl` interface —
+  `prismaquant/gguf_kl_evaluator.py:measure_assignment_kl` wraps
+  `llama-perplexity --kl-divergence-base` and returns
+  `(mean, per_sequence, stats)` under the gold lane's key names
+  (`kl_mean`/`kl_p99`/`kl_max`/`nll_mean`), so a GGUF row and a native row are
+  comparable (re-vet R16, declared in `prismaquant/lane_specs/gguf.json`).
+  Honest limits: `per_sequence` is EMPTY and `kl_tail_domain="aggregate"`,
+  because llama-perplexity reports token-domain quantiles rather than
+  per-sequence values — a tail-veto reading `kl_p99` here is reading a
+  different domain than the resident evaluator's. Parsing is unit-tested
+  against canned output from both spellings llama.cpp has shipped; the live
+  path (invoking the binary) is integration and has not been run.
+  `run-pipeline.sh` still runs `SELECTION_MODE=surrogate` on this lane — the
+  evaluator exists, the frontier loop is not wired to it — and the ~3 bpw
+  cliff is exactly where measured selection should pay.
 - **Gold metric**: the tables above are the llama.cpp KL harness (the serving
   metric *for this lane's runtime*); vLLM-GGUF serving of the same artifacts
   was smoke-verified on the 0.19.2 venv but not KL-measured there.
-- **Ship gate**: the pipeline's llama.cpp smoke proves load+generate only; a
-  `validate_quantized_model` analog (PPL threshold + p99 per-prompt NLL on
-  the llama.cpp runtime) does not exist yet and must before any public ship.
+- **Ship gate**: the pipeline's llama.cpp smoke proves load+generate only. The
+  *declaration* now exists (`prismaquant/lane_specs/gguf.json`, re-vet R16):
+  llama-server exposes an OpenAI-compatible endpoint and
+  `validate_quantized_model.py` is endpoint-agnostic, so the same PPL + p99
+  per-prompt NLL gate applies unchanged — it has simply not been RUN on this
+  lane. Gates are **advisory** (recorded in `shipcard.json`); whether they
+  become blocking is deferred to Robert.
 - **imatrix vector mismatch (minor)**: the cost path derives per-column weights
   from the chunk-truncated activation rows it bmm's with, the exporter from
   the full cached rows — same estimator, slightly different sample counts.
@@ -223,3 +247,20 @@ answer. No public quality claim until both land and repeat.
 - **Embedding/head formats are an operator policy**, not a measured
   allocator decision — a principle-2 debt; the flags are recorded in
   provenance KVs so size-matched claims stay auditable.
+
+## Hardware targets — Strix Halo tracking (re-vet R7, ACCEPTED 2026-07-30)
+
+Strix Halo enters as a **serving-only** target, **GGUF first**. Quantization
+stays on the Spark in every option, so the probe/cost/render/export stack (all
+CUDA, `gpu_guard.require_cuda_hot_path`) needs **zero ROCm work** — that
+decoupling is the load-bearing part of the ruling, and no ROCm build stack is in
+scope.
+
+| date | option | status | note |
+|---|---|---|---|
+| 2026-07-30 | **A — GGUF-first (approved)** | **BLOCKED: no box** | Milestone: serve the shipped Hy3 2.8 bpp GGUF (`rdtand/Hy3-295B-A21B-…-gguf-vllm`) on Strix and record prefill / decode / ToolEvalBench. Zero new code — llama.cpp already serves ROCm/gfx1151. Also answers the question nothing else does: does the box hold a 100 GB-class artifact at all? |
+| 2026-07-30 | **B — HIP/CK port of the CB kernels** | **NOT FUNDED** | `gb/csrc/cutlass_fork/*` is CUTLASS + sm_120-specific (R6 smem LUT, TileM feasibility, TMA): a rewrite, not a port, doubling the kernel surface maintained forever. Revisit only if A's measured Strix prefill tax is both large and load-bearing for a real workload; the entry test is one kernel (dense decode GEMV) bit-exactness-checked against CUDA on the same artifact. |
+| 2026-07-30 | **C — wait for upstream vLLM-ROCm** | **TRACKING (passive)** | Watch for the first vLLM version that routes NVFP4 / FP8 to a *performant* gfx1151 kernel (registry support is not enough — core principle 9). Costs nothing; buys the zero-maintained-code promise if it lands. Nothing observed as of this row. Append a dated row here when it changes. |
+
+`ARCHITECTURE.md` §10's "Strix Halo — planned, nothing designed or built" stays
+accurate until option A produces a measurement.

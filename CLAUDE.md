@@ -101,13 +101,18 @@ ships.
 **There is one cost level, not three.** The surrogate is a *single faithful
 unary cost* over `(Linear, format)`, solved by a multi-choice knapsack DP:
 
-- **The cost.** `production-render-score` by default — per-Linear error measured
+- **The cost.** **`COST_MODE=aura` by default since 2026-07-30** (re-vet R2):
+  `predicted_dloss` from a **KL-adjoint** probe × the production-rendered `dW`
+  (`aura_cost.py`), worth **−38%/−39.5% KL @4B** across two calibrations and
+  **−17.9% @27B** against the `h_trace × output_mse` baseline, and the recipe
+  behind both flagships. `production-render-score` is the explicit/legacy
+  spelling that reproduces every pre-flip artifact — per-Linear error measured
   on the **production-rendered** weights the export will actually ship (score
   field `weight_mse` since audit M6), so the surrogate, the KL validation and
-  the exported bytes are the same rendering (principle 8). `COST_MODE=aura` is
-  the better cost where opted in: `predicted_dloss` from a **KL-adjoint** probe
-  × the production-rendered `dW` (`aura_cost.py`), worth **−38% KL @4B** and
-  **−17.9% @27B** against the `h_trace × output_mse` baseline. On MoE the smooth
+  the exported bytes are the same rendering (principle 8). Either way the
+  rendering identity is the point; what the flip changed is the *objective*
+  applied to it. `COST_MODE` is a spelling over `COST_RENDER × COST_OBJECTIVE`
+  (re-vet R3). On MoE the smooth
   cost is route-flip-blind for routed experts, so packed experts get **measured**
   empirical unit-KL instead (`expert_empirical_cost.py`), merged into one hybrid
   payload. Fisher normalization detail: every `h_trace` row — dense or MoE
@@ -327,12 +332,27 @@ validate_quantized_model (PPL / p99-NLL / MMLU / MTP-acceptance ship gate)
 `FORMATS=NVFP4,FP8_DYNAMIC,BF16` (note: **MXFP8 is de-menued for inference** —
 exact-scale FP8 Pareto-dominates it), `NSAMPLES=32 SEQLEN=1024`,
 `PRODUCTION_CACHE_LEVERS=gptq,static_act_order,joint_scale_opt`,
-`COST_MODE=production-render-score`, **`SELECTION_MODE=surrogate`** (set
+**`COST_MODE=aura`** (flipped from `production-render-score` on 2026-07-30,
+re-vet R2 — both flagships were produced with it; `production-render-score` is
+the explicit/legacy spelling that reproduces every pre-flip artifact, and a
+stale `WORK_DIR` now **rebuilds loudly** on the mode change instead of silently
+allocating on the other estimator), **`SELECTION_MODE=surrogate`** (set
 `validated-surrogate` to opt into the real-KL frontier selection that produced
 the shipped 27B), `TARGET_PROFILE=vllm_packed_moe`, `PRODUCTION_CACHE=1`,
-`PRODUCTION_RECACHE=1`, `VALIDATED_SOURCE_PREFETCH=require`. The archived cost
-modes / levers (`grouped-kl`, fisher, hdq, multi-shot) **fail fast with `exit 2`**
-pointing at their archive.
+`PRODUCTION_RECACHE=1`, `VALIDATED_SOURCE_PREFETCH=require`,
+`AURA_ADDITIVITY_GATE=auto`, `CB_EXPERT_EMPIRICAL=0`, `CB_SCALE_CODING=two_tier`
+(the last two are D15: the default is now the value every shipped driver sets).
+The archived cost modes / levers (`grouped-kl`, fisher, hdq, multi-shot,
+production-render-staged) **fail fast with `exit 2`** pointing at their archive.
+
+`COST_MODE` is a **spelling** over two axes since 2026-07-30 (re-vet R3):
+`COST_RENDER ∈ {inline, cached-menu}` × `COST_OBJECTIVE ∈ {weight-recon,
+render-score, aura-adjoint}`. The CB/GGUF lanes are no longer pinned to
+`COST_MODE=local` — that gate named a *render* property to block an *objective*;
+it is now a render-faithfulness assertion, and `col_weights` on the production
+render path (CB Milestone C) lets a cached-menu render be the exporter's
+imatrix-weighted render. Non-`local` objectives on CB are reachable but
+**opt-in and not recommended** until a served CB A/B exists.
 
 **Subsystem owners (the files that matter):**
 
@@ -345,7 +365,7 @@ pointing at their archive.
 | The one cache + render | `production_weight_cache.py` (`ProductionWeightCache` + `render_production_weight`) · `build_production_cache.py` · `production_recache.py` · `render_score.py` (output-MSE render scorer + gate + mechanism registry/topo-order) · `layer_state_cache.py` |
 | Streaming (huge models) | `layer_streaming.py` (LRU + pressure shrink + FP8 block dequant + per-expert→packed bridge) · `streaming_model.py` · `weight_session.py` (stage/revert/commit live-model format flips) · `source_prefetch.py` (fail-fast residency gate) · `autoscale.py` |
 | Export | `export_native_compressed.py` (~7300 lines: NVFP4/MX/FP8 packing, unified codecs, `build_quantization_config` config_groups+ignore, packed-MoE split, FP8_SOURCE verbatim copy, BF16-upgrade audit) · `export_batched_gptq.py`. (`block_output_match.py` walled 2026-07-30 — `archive/block_output_match_2026-07-30/`; it was unreachable on the shipping recipe.) |
-| Validate / select | `validate_assignments_kl.py` · `select_validated_frontier.py` (kneedle + surrogate-vs-KL Spearman + worst-rank-inversion) · `validation_harness.py` · `validate_native_export.py` · `validate_quantized_model.py` |
+| Validate / select | `validate_assignments_kl.py` · `select_validated_frontier.py` (kneedle + surrogate-vs-KL Spearman + worst-rank-inversion) · `validation_harness.py` · `validate_native_export.py` · `validate_quantized_model.py` · `shipcard.py` (the refusal contract) · `lane_spec.py` + `lane_specs/*.json` (per-lane serve command / endpoint / gate set / KL evaluator — gates ADVISORY) · `gguf_kl_evaluator.py` (llama-perplexity behind the `validate_assignments_kl` interface) |
 | Profiles (plug-in) | `model_profiles/`: `base.py` (auto-derives fused/packed/naming from the vLLM class), `structure.py` (declarative `ModelStructureSpec` JSON + `build_model_graph`), `registry.py` (`detect_profile`/`register_profile`), `vllm_registry.py`, + per-arch (`qwen3*`, `gemma4`, `lfm2_moe`, `minimax_m2`, `deepseek_v4`). Serving constraints live in the top-level `serving_profiles.py` + `serving_profile_specs/*.json` |
 | Misc | MTP synthesis (transformers v5 drops it) now lives on the profile: `model_profiles/base.py` `mtp_source_prefix`/`read_mtp_source_state_dict`/`load_mtp_state_dict` + `model_profiles/qwen3_5.py::MtpModule` (top-level `mtp_module.py` deleted 2026-07-30) · `layer_config.py` (single canonical recipe parser) · `schemas.py` |
 
@@ -439,9 +459,12 @@ local `main` checkout had drifted 54 commits behind it; check
 - **Gemma4-31B-IT 6bit** (2026-06-01; beats the shipped 5.5 by −24% *confident-position*
   KL-vs-BF16, +5.9pp top-1 agreement; the 5.5 repo is left untouched).
 
-**Live recipe:** `gptq`(+damp_sweep) + `static_act_order` + **JSO** + the
-PrismaQuant solver; `production-render-score` cost; surrogate selection by default,
-validated-surrogate for real-KL frontier selection.
+**Live recipe:** `gptq` (fixed damp 1.0, sweep OFF) + `static_act_order` +
+**JSO** + the PrismaQuant solver; **AURA cost** (`COST_MODE=aura`, the default
+since 2026-07-30) with the empirical packed-expert unit-KL hybrid on MoE and the
+`[3c]` additivity report stamped into `cost.pkl` provenance; surrogate selection
+by default, validated-surrogate for real-KL frontier selection (automatic under
+a `TARGET_DISK_GB` card).
 
 **In flight / open (and the stale claims to ignore):**
 - **DSv4-Flash-Base** (284B FP8 source): vendored transformers (`PR #45643`) + 3

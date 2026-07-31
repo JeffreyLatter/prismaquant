@@ -78,6 +78,55 @@ def test_selection_mode_default_documented():
     assert "TARGET_DISK_GB" in doc
 
 
+def test_cost_mode_default_is_aura_with_the_legacy_mode_still_reachable():
+    """re-vet R2: the default flipped to `aura` on 2026-07-30. Both halves are
+    pinned — the flip itself (so it cannot silently revert) and the continued
+    reachability of `production-render-score`, which is how every pre-flip
+    artifact reproduces."""
+    script, doc = _pipeline(), _doc()
+    assert _shell_default(script, "COST_MODE") == "aura"
+    assert "production-render-score|production-render)" in script, (
+        "production-render-score must stay an accepted COST_MODE: it is the "
+        "explicit spelling that reproduces every pre-2026-07-30 artifact."
+    )
+    assert "COST_MODE=aura" in doc and "explicit/legacy" in doc
+
+
+def test_cost_axes_are_declared_with_back_compat_aliases():
+    """re-vet R3: COST_MODE is a spelling over (COST_RENDER x COST_OBJECTIVE),
+    and the three documented values keep their exact meanings."""
+    script, doc = _pipeline(), _doc()
+    for pair, mode in (
+        ('"inline|weight-recon")', "local"),
+        ('"cached-menu|render-score")', "production-render-score"),
+        ('"cached-menu|aura-adjoint")', "aura"),
+    ):
+        assert pair in script and mode in script
+    # The two unimplemented pairs must stop with a reason, not fall through.
+    assert '"inline|aura-adjoint")' in script
+    assert '"cached-menu|weight-recon")' in script
+    assert "COST_RENDER" in doc and "COST_OBJECTIVE" in doc
+
+
+def test_cb_defaults_match_the_shipped_drivers():
+    """D15: a default no shipped driver uses documents an unvalidated path.
+    Pinned against the drivers themselves so the two cannot drift again."""
+    script = _pipeline()
+    assert _shell_default(script, "CB_EXPERT_EMPIRICAL") == "0"
+    assert _shell_default(script, "CB_SCALE_CODING") == "two_tier"
+    drivers = [
+        ROOT / "scripts" / name for name in (
+            "run_hy3_prod_nvfp4cb.sh",
+            "run_hy3_prod_joint.sh",
+            "run_35b_prod_nvfp4cb.sh",
+            "run_laguna_s21_prod.sh",
+        )
+    ]
+    for driver in drivers:
+        text = driver.read_text(encoding="utf-8")
+        assert "export CB_EXPERT_EMPIRICAL=0" in text, driver.name
+
+
 def test_three_diagrams_present():
     assert _doc().count("```mermaid") == 3
 

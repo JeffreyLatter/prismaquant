@@ -1373,12 +1373,53 @@ def _format_supports_render_mechanism(fmt: str, mechanism: str) -> bool:
         return mech in {"gptq", "static_act_order"} or (
             mech == "scale_sweep" and fmt_u == "MXFP8_E4M3"
         )
-    if fmt_u.startswith(("NVFP4_CB_K", "NVFP4_CB_S", "FP8_CB_K")):
-        # VQ codebooks quantize 8-column vectors jointly; the scalar-column
-        # mechanisms (gptq/jso/scale_sweep/act_order) do not apply. The
-        # imatrix-weighted VQ search IS the deliberate render (col_weights).
+    if _weighted_render_family(fmt_u) is not None:
+        # VQ codebooks quantize 8-column vectors jointly and k-quant
+        # superblocks pick scales per block; the scalar-column mechanisms
+        # (gptq/jso/scale_sweep/act_order) do not apply to either. The
+        # imatrix-weighted search IS the deliberate render (col_weights) —
+        # re-vet R3 / CB Milestone C made it reachable from this path.
         return mech == "weighted_vq"
     return False
+
+
+# Format families whose EXPORTER renders imatrix-weighted, so a production
+# render of the same (qname, fmt) is only exporter-faithful when it applies the
+# same per-input-column vector. Keyed off the family exactly as
+# `measure_quant_cost._cost_render_uses_imatrix` keys the inline cost render —
+# one invariant, two call sites, no third opinion.
+WEIGHTED_RENDER_FAMILIES = ("nvfp4_cb", "fp8_cb", "gguf")
+
+
+def _expert_col_weights(
+    stack_cw: torch.Tensor | None, index: int, n_experts: int,
+) -> torch.Tensor | None:
+    """Slice a packed-expert imatrix entry for expert ``index``.
+
+    **Delegates** to ``measure_quant_cost._item_col_weights`` rather than
+    re-deriving the rule: a ``(E, in)`` stack is indexed per expert, anything
+    else is a single pooled vector shared by every expert. One definition, two
+    readers — if the cost stage and the cache ever sliced the same pickle
+    differently they would weight the same tensor differently, which is the
+    rendering confound wearing a new hat.
+    """
+    if stack_cw is None:
+        return None
+    from prismaquant.measure_quant_cost import _item_col_weights
+
+    return _item_col_weights(stack_cw, index, n_experts)
+
+
+def _weighted_render_family(fmt: str) -> str | None:
+    """The weighted-render family of ``fmt``, or ``None`` for every format
+    whose render ignores ``col_weights`` (NVFP4/FP8/MX/BF16/INT)."""
+    from prismaquant import format_registry as fr
+
+    try:
+        family = fr.get_format(str(fmt).strip().upper()).family
+    except Exception:
+        return None
+    return family if family in WEIGHTED_RENDER_FAMILIES else None
 
 
 def _render_nvfp4_progressive_candidate(
@@ -1794,6 +1835,7 @@ def render_production_weight(
     act_clip_threshold: float | None = None,
     act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
+    col_weights: torch.Tensor | None = None,
     gate_trace: list[dict[str, object]] | None = None,
 ) -> torch.Tensor:
     """Compute the production-faithful dequantized weight for ``(qname, fmt)``.
@@ -1814,10 +1856,32 @@ def render_production_weight(
     render passes. ``fisher_row_weights`` optionally weights local objectives
     by per-token gradient² from h-detail.
 
+    ``col_weights`` is the per-input-column imatrix vector (``(in_features,)``)
+    for this ``qname`` — CB **Milestone C** / re-vet **R3**. It is applied for
+    the weighted-render families ONLY (``WEIGHTED_RENDER_FAMILIES``: the CB
+    codebook families and GGUF), whose exporters ship imatrix-weighted bytes;
+    for every other format the argument is inert and the render is
+    **bit-identical** whether it is passed or not (pinned by
+    ``tests/test_col_weights_render_identity.py``). The vector is supplied by
+    the caller rather than derived here from ``activations`` on purpose: the
+    exporter's vector is the harvested ``artifacts/cb_col_weights.pkl``, which
+    includes the synthesized packed-expert entries
+    (``moe_imatrix.synthesize_packed_expert_col_weights``) that no raw
+    activation matrix on this path can reproduce. With it, the CB lane's cost,
+    KL and shipped bytes can come from ONE render through
+    ``ProductionWeightCache``.
+
     """
     from prismaquant import format_registry as fr
 
     fmt = fr.canonical_format_name(str(fmt).strip().upper())
+    if col_weights is not None and not (
+        _format_supports_render_mechanism(fmt, "weighted_vq")
+        and bool(levers.get("weighted_vq", True))
+    ):
+        # Inert for every non-weighted family: fall through to the exact
+        # pre-R3 code path, no branch, no dtype churn.
+        col_weights = None
     clip_rescale = "none"
     if str(act_clip_rescale or "none").strip().lower() not in {
         "",
@@ -1844,9 +1908,19 @@ def render_production_weight(
 
     if fmt != "NVFP4":
         spec = fr.get_format(fmt)
-        baseline = spec.quantize_dequantize(weight.detach().clone()).to(
-            device=weight.device, dtype=weight.dtype,
-        )
+        if col_weights is None:
+            baseline = spec.quantize_dequantize(weight.detach().clone()).to(
+                device=weight.device, dtype=weight.dtype,
+            )
+        else:
+            # R3 / Milestone C: the weighted families' one render definition,
+            # shared with the inline cost render and the emulation path.
+            from prismaquant.emu_forward_kl import weighted_quantize_dequantize
+
+            baseline = weighted_quantize_dequantize(
+                spec, weight.detach(),
+                col_weights.reshape(-1).to(weight.device),
+            ).to(device=weight.device, dtype=weight.dtype)
         reference = weight.detach().to(torch.float32)
         acts = activations.get(qname)
         acts_for_render = (
@@ -1871,7 +1945,8 @@ def render_production_weight(
             acts_for_gate,
         )
         current = _RenderedCandidate(
-            label=f"{fmt.lower()}+rtn",
+            label=f"{fmt.lower()}+" + (
+                "weighted_vq" if col_weights is not None else "rtn"),
             weight=baseline.contiguous(),
             score=float(baseline_score),
             metric=baseline_metric,
@@ -2223,6 +2298,7 @@ def fill_production_weight_cache(
     recache_include_activation_quant: bool = True,
     recache_microbatch_size: int = 1,
     h_detail_dir: str | Path | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
 ) -> ProductionWeightCache:
     """End-to-end fill: collect activations, render production δw per
     (qname, fmt), return a `ProductionWeightCache`.
@@ -2248,6 +2324,13 @@ def fill_production_weight_cache(
         needs the actual export assignment.
       h_detail_dir: optional probe h-detail directory retained for archived
         Fisher ablations. V1 production defaults do not require it.
+      col_weights: optional ``{qname: (in_features,)}`` imatrix map (re-vet R3
+        / CB Milestone C). Applied only to the weighted-render families
+        (``WEIGHTED_RENDER_FAMILIES``); every other format's rendered bytes are
+        bit-identical whether it is supplied or not. This is what lets the CB
+        lane's allocator cost, frontier KL and shipped bytes all come from ONE
+        ``ProductionWeightCache`` render instead of a separate
+        skeleton-requantize path.
     """
     if recache_pass and not recache_assignment:
         raise ValueError(
@@ -2733,6 +2816,10 @@ def fill_production_weight_cache(
                     joint_global_real=joint,
                     input_global_scale=export_scale,
                     fisher_row_weights=row_weights,
+                    col_weights=(
+                        None if col_weights is None
+                        else col_weights.get(qname)
+                    ),
                     gate_trace=gate_trace,
                 )
                 render_score_records[_render_score_record_key(qname, fmt_key)] = (
@@ -3029,6 +3116,7 @@ def fill_packed_expert_cache_entries(
     gate_calib_ids: torch.Tensor | None = None,
     gate_token_budget: int | None = None,
     module_acts_override: Mapping[str, torch.Tensor] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
 ) -> dict:
     """Render packed-MoE experts into ``ProductionWeightCache`` entries.
 
@@ -3076,6 +3164,13 @@ def fill_packed_expert_cache_entries(
       module_token_budget: reservoir size for each experts module's input X.
       max_rows_per_expert: cap on routed rows fed to each expert's GPTQ.
       max_layers: debug/timing cap — render only the first N experts modules.
+      col_weights: optional ``{qname: vector}`` imatrix map (re-vet R3 / CB
+        Milestone C), keyed by the packed tensor name (``…experts.w1`` etc.)
+        with either one shared ``(in_features,)`` vector or a per-expert
+        ``(E, in_features)`` stack — the layout
+        ``moe_imatrix.synthesize_packed_expert_col_weights`` emits. Applied
+        only on the per-expert render path and only for the weighted-render
+        families; NVFP4/FP8 expert bytes are unchanged.
       module_acts_override: streaming build. ``{experts_qname: X}`` module-level
         input snapshots sourced from the probe's activation cache instead of a
         fresh forward pass. When supplied, no calibration forward runs, in-scope
@@ -3583,6 +3678,7 @@ def fill_packed_expert_cache_entries(
         else:
             # Per-expert full-stack render (fmt != NVFP4, or the A/B mode).
             rendered = torch.empty_like(packed_param)
+            stack_cw = None if col_weights is None else col_weights.get(full)
             for e in range(E):
                 w_e = packed_param[e]  # [out, in]
                 acts_e = (
@@ -3597,6 +3693,7 @@ def fill_packed_expert_cache_entries(
                     ),
                     levers=levers,
                     joint_global_real=per_expert_global[e],
+                    col_weights=_expert_col_weights(stack_cw, e, int(E)),
                 )
                 rendered[e] = w_dq.to(rendered.dtype)
                 del w_dq

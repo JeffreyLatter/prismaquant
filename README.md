@@ -49,7 +49,8 @@ export MODEL_PATH=/path/to/model
 export WORK_DIR=./dq-runs/mymodel
 export FORMATS=NVFP4,FP8_DYNAMIC,BF16   # the production menu — FP8 belongs in every recipe
 export TARGET_BITS=4.75
-export COST_MODE=aura                    # AURA cost (default: production-render-score)
+# COST_MODE=aura is the DEFAULT since 2026-07-30 (KL-Fisher x production-rendered dW);
+# set COST_MODE=production-render-score to reproduce pre-flip artifacts.
 export SELECTION_MODE=validated-surrogate  # real-KL frontier selection (default: surrogate)
 
 ./prismaquant/run-pipeline.sh

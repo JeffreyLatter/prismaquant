@@ -366,6 +366,19 @@ def _register_builtins() -> None:
         description="Fisher/output-weighted GPTQ objective.",
     ))
     register_render_mechanism(RenderMechanismSpec(
+        name="weighted_vq",
+        operation="imatrix_weighted_search",
+        scope="linear",
+        phase=50,
+        gate_metric="weight_mse",
+        description=(
+            "Imatrix (per-input-column) weighted search for the CB codebook "
+            "and GGUF k-quant families — their exporters always render "
+            "weighted, so this IS their deliberate render rather than a "
+            "candidate layered on RTN (re-vet R3 / CB Milestone C)."
+        ),
+    ))
+    register_render_mechanism(RenderMechanismSpec(
         name="scale_sweep",
         operation="codebook_scale_refine",
         scope="linear",

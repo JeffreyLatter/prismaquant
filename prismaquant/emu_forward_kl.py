@@ -76,10 +76,21 @@ def _qdq_accepts_col_weights(spec: fr.FormatSpec) -> bool:
     return "col_weights" in sig.parameters
 
 
-def _render_weight(
+def weighted_quantize_dequantize(
     spec: fr.FormatSpec, w: torch.Tensor, col_weights: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Emulation reconstruction of a weight in ``spec``'s format."""
+    """THE single weighted-render definition: reconstruct ``w`` in ``spec``'s
+    format, applying the per-input-column imatrix when the family's exporter
+    does.
+
+    One function, three callers by design (principle #8, one render): this
+    emulation path, the inline cost render
+    (``measure_quant_cost._cost_render_uses_imatrix``), and — since re-vet R3
+    / CB Milestone C — ``production_weight_cache.render_production_weight``.
+    ``col_weights=None`` reproduces the unweighted registry render exactly, so
+    every non-weighted family is bit-identical whether or not a caller has a
+    vector in hand.
+    """
     if spec.family == "gguf":
         from .gguf_formats import gguf_quantize_dequantize
         cw = None if col_weights is None else col_weights.to(w.device)
@@ -87,6 +98,10 @@ def _render_weight(
     if col_weights is not None and _qdq_accepts_col_weights(spec):
         return spec.quantize_dequantize(w.clone(), col_weights=col_weights.to(w.device))
     return spec.quantize_dequantize(w.clone())
+
+
+# Historical name, kept for this module's own call sites.
+_render_weight = weighted_quantize_dequantize
 
 
 def _wants_act_emulation(spec: fr.FormatSpec) -> bool:
