@@ -26,6 +26,32 @@ Authored **and validated on real hardware**: an AMD Ryzen AI MAX+ 395 (Radeon
 **No performance claim is made against the CUDA lane.** Different silicon,
 different memory system; the numbers below stand on their own.
 
+### Measurement methodology, and a retraction
+
+**gfx1151 idles at ~1.2 GHz and needs tens of seconds of continuous load to
+reach its ~2.9 GHz boost.**  A conventional "5 warmup iterations" is single-digit
+milliseconds of load here, so it measures the *idle* clock.  The first revision
+of this file reported numbers taken that way, plus a "~28% of nominal bandwidth"
+framing derived from them.  **Those numbers are retracted**; everything in the
+performance section below was re-taken after `sustain_clock()` drives the device
+for 45 s and the achieved clock is printed next to each result.  Nothing on this
+box should be benchmarked without it.
+
+A second correction, and a more important one: an earlier framing implied this
+lane had large bandwidth headroom to reclaim from stock kernels.  It does not.
+Measured properly, **stock bf16 GEMV reaches 201–233 GB/s against a ~210 GB/s
+copy ceiling** — the machine is already saturated by ordinary kernels, and there
+is no multiple to be won by out-coding hipBLAS.
+
+**So what is the decode GEMV actually for?**  The index stream, not the
+arithmetic.  A CB rung reads **k/8 bits per weight** — 4.5 bpw at K36, 5.5 at
+K44 — where a bf16 weight reads 16.  On a bandwidth-saturated machine serving a
+memory-bound decode step, that ratio *is* the win, and it is a property of the
+format rather than of the kernel.  The kernel's job is to spend that saved
+bandwidth without giving it back to decode overhead; the honest way to read the
+GEMV numbers below is "how much of the format's bandwidth advantage survives
+the decode", not "how much faster than hipBLAS".
+
 ---
 
 ## The load-bearing fact: WMMA on RDNA 3.5
@@ -105,47 +131,77 @@ rather than miscompute.
 
 ---
 
-## LDS budget per rung
+## The LUT dtype contract, and the LDS budget it implies
 
-The codebook LUT is staged into LDS once per workgroup and shared by every
-output row the workgroup covers.  Sizes are exact
-(`pq_codebook_elems` in `cb_decode_hip.h` is the device-side twin of the
-encoder's `_bit_split`), against the measured 64 KiB per-workgroup budget.
+gfx1151 has **no fp8 anything**, so an FP8_CB codeword has to be materialised as
+bf16 for WMMA no matter what the sidecar stored.  That makes the codebook's grid
+a free choice on this platform: a **bf16-grid** codebook is the same bytes, the
+same kernel cost, and a strict superset of the e4m3 grid — so it can only be
+better quality.  The likely artifact design is one index stream plus a per-grid
+codebook (a codebook is ~0.02% of artifact bytes, so carrying both is nearly
+free), with Blackwell reading the e4m3 table and Strix the bf16 one.
 
-**FP8_CB (n_sub = 4, sub_dim = 2, e4m3 bytes — 1 B per entry):**
+These kernels are therefore **agnostic to the sidecar dtype**, with one rule:
+
+> The LDS LUT is **always materialised as bf16**, and any e4m3 → bf16
+> conversion happens **exactly once, at LUT-fill time**.  The hot loop gathers
+> bf16 out of LDS and never learns what the sidecar held.
+
+Mechanically: `stage_lut_bf16` (`cb_decode_hip.h`) is the single conversion
+point; `gather_fp8_bits<SRC>` is instantiated `CB_SRC_BF16` on the LDS path and
+`CB_SRC_E4M3` only on the global-gather fallback.  The WMMA prologue consumes
+those bits directly — they *are* the operand format — so on the staged path the
+B-fragment decode carries **zero** conversion ALU.  This is the ALU term the
+CUDA lane's R6 work removed on Blackwell, and it stays removed here.
+
+Correctness of the contract is pinned two ways, both green: the standalone
+harness runs every rung with a bf16 sidecar built from the e4m3 one, and
+`test_bf16_grid_sidecar_is_identical` asserts the two agree **bit-exactly**
+(`torch.equal` on the raw bf16 bits) rather than merely closely — which is
+available precisely because e4m3 → bf16 is exact.
+
+The cost of the contract is LDS footprint: **a materialised LUT is 2 bytes per
+codebook element**, twice the on-disk e4m3 size.  That is the budget the rung
+ladder has to be designed against, against 64 KiB per workgroup.
+
+**FP8_CB (n_sub = 4, sub_dim = 2) — bf16 LUT bytes:**
 
 | rung | LUT | rung | LUT | rung | LUT |
 |---|---|---|---|---|---|
-| K28 | 1.0 KiB | K35 | 3.5 KiB | K42 | 12 KiB |
-| K29 | 1.25 KiB | K36 | 4 KiB | K43 | 14 KiB |
-| K30 | 1.5 KiB | K37 | 5 KiB | **K44** | **16 KiB** |
-| K31 | 1.75 KiB | K38 | 6 KiB | K45 | 20 KiB |
-| K32 | 2 KiB | K39 | 7 KiB | K46 | 24 KiB |
-| K33 | 2.5 KiB | K40 | 8 KiB | K47 | 28 KiB |
-| K34 | 3 KiB | K41 | 10 KiB | K48 | 32 KiB |
+| K28 | 2 KiB | K35 | 7 KiB | K42 | 24 KiB |
+| K29 | 2.5 KiB | K36 | **8 KiB** | K43 | 28 KiB |
+| K30 | 3 KiB | K37 | 10 KiB | K44 | **32 KiB** |
+| K31 | 3.5 KiB | K38 | 12 KiB | K45 | 40 KiB |
+| K32 | 4 KiB | K39 | 14 KiB | K46 | 48 KiB |
+| K33 | 5 KiB | K40 | **16 KiB** | K47 | 56 KiB |
+| K34 | 6 KiB | K41 | 20 KiB | K48 | **64 KiB** |
 
-**No FP8_CB rung needs LUT splitting** — K48's 32 KiB is half the budget.  That
-is only true because the LUT is kept as **e4m3 bytes** and converted to bf16
-arithmetically in the WMMA prologue (`e4m3_to_bf16_bits`); a bf16 LUT would be
-64 KiB at K48 and would not fit at all.  That is why the conversion is done with
-6 ALU ops instead of a wider table.
-
-**NVFP4_CB (n_sub = 2, sub_dim = 4, bf16 — 2 B per entry):**
+**NVFP4_CB (n_sub = 2, sub_dim = 4) — bf16 LUT bytes:**
 
 | rung | LUT | rung | LUT | rung | LUT |
 |---|---|---|---|---|---|
 | K12 | 1 KiB | K17 | 6 KiB | K22 | 32 KiB |
 | K13 | 1.5 KiB | K18 | 8 KiB | K23 | 48 KiB |
-| K14 | 2 KiB | K19 | 12 KiB | **K24** | **64 KiB — does NOT fit** |
-| K15 | 3 KiB | K20 | 16 KiB | S13–S16 | 0.5–4 KiB |
+| K14 | 2 KiB | K19 | 12 KiB | K24 | **64 KiB** |
+| K15 | 3 KiB | K20 | **16 KiB** | S13–S16 | 0.5–4 KiB |
 | K16 | 4 KiB | K21 | 24 KiB | | |
 
-**K24 is the one rung that cannot stage its LUT** (64 KiB is the entire
-workgroup budget, leaving nothing).  It is handled, not banned: the kernel is
-templated on `LDS_LUT` and the host launcher selects the global-gather variant,
-which is correct at every rung.  A future K24 LDS path would split the two
-sub-tables across two kernel passes, or store fp4 values as nibbles (16 KiB) —
-neither is written, because neither is measured to be needed.
+### The top rungs fit here, for a structural reason worth stating
+
+The usual objection to a bf16 LUT is that K48 and K24 need the *entire* 64 KiB
+and therefore cannot coexist with the GEMM's operand tiles.  **That objection
+does not apply to this GEMM**, and it is not luck: because the wave32 fragment
+layout lets each lane fill its whole B fragment from two codewords, A and B are
+**register-resident and never touch LDS at all** (see above).  The LUT is the
+only LDS consumer in either kernel, so the full 64 KiB is available to it.
+
+Verified rather than argued: K48 (64 KiB) and the whole fp4 ladder launch and
+pass parity on the staged path.  So *feasibility* is not the constraint at the
+top rungs — **occupancy** is, and that is a measurement, not a budget question.
+See the policy below: the top rungs are served by the global-gather arm because
+it is measurably faster there, not because the LUT would not fit.  Neither
+LUT splitting nor a packed LUT with per-gather conversion is implemented, and
+neither is needed for the rungs that matter on a 58 GB box.
 
 ### The LDS-vs-global policy is measured, and it is shape-dependent
 
@@ -335,14 +391,19 @@ should be until it can be A/B'd on this box.
    seeded from a sweep, not a second constant.
 3. **K-loop double buffering in the GEMV.**  There is none; the CUDA lane
    measured this as a win in its own (different) shape and it is untested here.
-4. **`int8` WMMA.**  `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32` is **PRESENT**
-   on this device, and on several AMD parts int8 matrix throughput is ~2× bf16.
-   A CB decode is a table lookup, so emitting int8 + a per-tile scale instead of
-   bf16 is architecturally available here and could roughly double the
-   WMMA-bound prefill rate.  It is **not** a free win: it requires an
-   int8-quantised activation path and re-opens the accuracy question that the
-   whole lane exists to answer, so it is recorded as a measured-available lever
-   with its cost stated, and benchmarked only after bf16 is tuned.
+4. **`int8` / `int4` WMMA — measured, and explicitly NOT started.**
+   `iu8` and `iu4` WMMA are present on this device, and the throughput has been
+   measured elsewhere on this box: **iu8 is 1.56x bf16 when LDS-fed but only
+   1.06x register-resident**, and **iu4 is 2.86x**.  The iu8 shape of that
+   result is the informative part — its gain is halved LDS *traffic*, not
+   faster math, so it would buy little in a GEMM whose operands are already
+   register-resident, which is exactly what this one is.  Both also require
+   integer activations of matching width, and an accuracy gate on that is
+   running.  **No int8 or int4 variant is to be started until that gate
+   reports.**  (An earlier draft of this file speculated "~2x matrix
+   throughput" for iu8 from vendor generalities; that was wrong in magnitude
+   and wrong about the mechanism, and is retracted here rather than quietly
+   edited.)
 5. **MoE grouped kernels.**  Absent entirely; an MoE artifact on ROCm falls back
    to Triton today.
 

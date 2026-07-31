@@ -243,14 +243,46 @@ def test_gemm_fp8_matches_torch_reference(M):
     _assert_close(y.cpu(), ref, f"GEMM M={M} N={N}")
 
 
-def test_lut_policy_is_measured_not_guessed():
-    """The LDS-vs-global codebook default is a measured crossover (16 KiB); a
-    change to it should break this test and force a re-measurement."""
-    assert ext.lut_bytes_fp8(28) == 1024
-    assert ext.lut_bytes_fp8(44) == 16384
-    assert ext.lut_bytes_fp8(48) == 32768
-    assert ext.lut_is_lds(44) is True
+def test_lut_lds_budget_is_bf16_materialised():
+    """The LDS LUT is materialised as bf16 whatever the sidecar stored, so its
+    footprint is 2 bytes per codebook element — NOT the on-disk e4m3 size.
+
+    These are the numbers the rung ladder has to be designed against; if the
+    LUT dtype contract is ever weakened back to a byte table with per-gather
+    conversion, this test is what should fail first.
+    """
+    assert ext.lut_bytes_fp8(28) == 2048        # 2 KiB
+    assert ext.lut_bytes_fp8(36) == 8192        # 8 KiB
+    assert ext.lut_bytes_fp8(44) == 32768       # 32 KiB
+    assert ext.lut_bytes_fp8(48) == 65536       # 64 KiB — the whole budget
+    # The staging decision is a measured crossover, not a guess; a change to it
+    # must be accompanied by a re-measurement (csrc_hip/README.md).
+    assert ext.lut_is_lds(36) is True
     assert ext.lut_is_lds(48) is False
+
+
+@pytest.mark.parametrize("k", [28, 36, 44, 48])
+def test_bf16_grid_sidecar_is_identical(k):
+    """Grid-source independence (the LUT dtype contract).
+
+    gfx1151 has no fp8 hardware, so an FP8_CB codeword must be materialised as
+    bf16 for WMMA regardless — which makes a bf16-grid codebook same-bytes,
+    same-speed and a strict grid superset on this platform.  The kernels must
+    therefore accept EITHER sidecar dtype.  For a table whose values are
+    e4m3-representable the two must agree BIT-EXACTLY (e4m3 -> bf16 is exact),
+    which is a much stronger statement than "close" and is what is asserted.
+    """
+    case = _rand_case_fp8(k, N=96, K=768, seed=500 + k)
+    torch.manual_seed(k)
+    x = torch.randn(4, case["K"], dtype=torch.bfloat16, device=DEV)
+    args = (case["qwp"], case["cb_row_offset"], case["scale"], case["N"],
+            case["K"], k, 4, case["type_size"], False)
+    y_e4m3 = ext.cb_gemv_fp8(x, args[0], case["cb8"], *args[1:])
+    cb_bf16 = case["cb8"].view(torch.float8_e4m3fn).to(torch.bfloat16)
+    y_bf16 = ext.cb_gemv_fp8(x, args[0], cb_bf16, *args[1:])
+    assert torch.equal(y_e4m3.view(torch.uint16), y_bf16.view(torch.uint16)), (
+        f"k={k}: bf16-grid sidecar differs from e4m3-grid on an "
+        f"e4m3-representable table")
 
 
 # --------------------------------------------------------------------------- #

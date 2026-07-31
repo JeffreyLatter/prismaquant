@@ -10,7 +10,18 @@ scale plane, which in the fp4 CB family *is* a storage dial.
 Driver scripts (scratch, not shipping): `scratch/mxfp4_cb/`. Raw results:
 `/home/rob/dq-runs/mxfp4-cb-study/`. No shipping module was modified.
 
----
+> **STOPPED EARLY, 2026-07-30 — verdict stands, refinement deliberately not run.**
+> Robert halted this study on the grounds that *"if MXFP4 isn't supported on this
+> hardware, we don't need to invest any time doing a codebook study for it"* —
+> confirmed by the format inventory: gfx1151 has **no fp4 matrix path of any kind**
+> (fp4 WMMA and block-scaled `f8f6f4` both absent), so an MXFP4 grid buys nothing
+> on the only non-Blackwell box we have; everything decodes to bf16 there
+> regardless of grid. The NO-GO below was already established and measured when
+> the call came, and it agrees with him. What was *not* run is the follow-up
+> measurement of the strongest MX configuration (§8's refinement) — treat any
+> "strongest-case MX" claim as unmeasured. **Do not restart this without a target
+> that runs MXFP4 natively** (RDNA4, CDNA4, Intel) — that is the condition, and
+> we own none of them today.
 
 ## Verdict: NO-GO for the quality claim; the cross-platform claim is FALSE as stated
 
