@@ -177,7 +177,9 @@ picks NVFP4 there on accuracy alone (`:12-14`). The criteria's job is to say
   guidance plus the joint menu (`format-speed-policy.md:36-47`).
 - K2 is an **operator declaration about the deployment**, expressed as *which menu
   is offered* — the same class of input as `TARGET_DISK_GB`, not a heuristic inside
-  the objective, and it must never become one.
+  the objective, and it must never become one. **Interim rule:** §4(d)'s
+  prefill-tax budget supersedes K2 once implemented — the declaration collapses
+  into choosing `T` on a measured frontier.
 
 **K3 — The R21 sink graduates K2 from judgment to a table.** The λ term
 (`quality + λ·serving_ms`, λ=0 default) is **specified, not implemented** — no λ in
@@ -206,6 +208,60 @@ containing FP8:
 A "pure NVFP4 at 4.5" artifact is not a candidate in either branch; a CB artifact
 that allocates zero NVFP4 units is an *outcome of measurement*, not a container
 property.
+
+### (d) The systematic balance — a prefill-tax budget, not a λ blend, not a menu
+
+*Added 2026-07-30 after Robert's framing: "systematically, I'm looking for how we
+balance performance of NVFP4 vs accuracy of codebook fp8 at the same bit rate —
+and even lower bit rates use fp8 when NVFP4 could be used."*
+
+**The revealed preference in §2.1 is circular, and Robert's second sentence is the
+proof.** The allocator's objective is accuracy-only, so at matched bytes fp8-CB
+wins every unit *by construction* wherever it is more accurate — at 4.5 and at 2.9
+alike. Zero-vanilla-NVFP4 solves are not evidence that NVFP4 has no value; they are
+the objective being structurally blind to the one thing NVFP4 is good at (prefill:
+no expand, W4A4 tensor-core rate). K2's operator-declared menu is an honest patch,
+not a balance.
+
+**The systematic form.** Speed does not enter the objective (a `λ·serving_ms` blend
+has no natural units — the class of tuned constant core principle 2 forbids). It
+enters as a **second explicit budget**, exactly parallel to fit-the-card (R1:
+budget = constraint, measured KL = objective):
+
+```
+minimize   quality cost (per-unit, measured)
+subject to bytes(assignment)        ≤ TARGET_DISK_GB          (landed)
+           prefill_ms(assignment)   ≤ (1 + T) · prefill_floor  (proposed)
+
+prefill_ms(assignment) = Σ_units ms(format_u, shape_regime_u)
+prefill_floor          = Σ_units min over the unit's menu of ms(·)
+T                      = TARGET_PREFILL_TAX — the operator's ONE deployment input
+```
+
+Prefill time is additive across sequential layers the way bytes are additive
+across tensors — an assumption to *check*, not assume: sum the per-layer table for
+an existing artifact pair and compare against its measured end-to-end prefill
+(§2.1's 27B/35B numbers are the check pairs).
+
+**Sweep T; do not pick it.** Solve the same byte budget at
+`T ∈ {∞, 0.20, 0.10, 0}` and measure real KL at each point: the deliverable is a
+**measured KL-vs-prefill-tax frontier**, and the operator picks a point on a
+curve the platform measured. `T=∞` reproduces today's behaviour exactly
+(bit-identical, provably non-regressive); `T=0` is the all-fastest solve. The
+low-bit observation becomes a row in the same table: re-solve a Hy3-class 2.9
+budget under `T` and read what accuracy the prefill discipline costs there.
+
+**Data and machinery required, honestly.** (i) The per-(format, shape-regime) ms
+table: the R21 sink accrues it on every serve, and one microbench pass needs both
+kernels in one process — vLLM's `cutlass_scaled_mm` and the gridbook ext — i.e.
+the serving container, i.e. a box window (same window as Stage 1's served arms).
+(ii) The solver: an ε-constraint second axis on the memoized DP
+(`solve_with_promotion`'s feasible-only contract extends; cost **M**). (iii)
+Status: **PROPOSED, not implemented.** K1 remains hard and binding; K2/K3 remain
+the *interim* operating rule until the table exists, the DP lands, and the
+frontier is measured — at which point K2's deployment declaration collapses into
+choosing `T`, and K3's "graduates to a table" clause is discharged by
+construction. The R21 ruling (no λ) is unchanged — this is not λ.
 
 ## 5. MEASUREMENT PLAN — validating 4.5 (acceptance fixed before each stage runs)
 
@@ -264,12 +320,13 @@ unmatched arms yield a **range against the ±20% band**, not a delta.
 Any arm lacking provenance (git commit, calibration hash, assignment hash, cache
 hit/miss counts, `serve_fingerprint`) is quarantined, not compared (§7.4).
 
-### Stage 3 — only if Stage 2 is ambiguous
+### Stage 3 — the timing table (runs with Stage 2's window, not only on ambiguity)
 
 Dump the `auto` tuner's per-layer measured ms from both arms into the per-(format,
-shape-regime) table the λ term *would* consume — **not to implement λ**, but to size
-whether such a table reorders anything, making R21's own trigger ("two boxes' tables
-disagree in ranking") testable rather than aspirational.
+shape-regime) table — this is the table §4(d)'s prefill-tax budget consumes, so it
+is harvested in the same serve window regardless of Stage 2's verdict, plus the
+additivity check (Σ per-layer ms vs measured end-to-end prefill on both arms).
+**Not λ** — R21's ruling stands; §4(d) is a constraint, not an objective term.
 
 ### Box constraints, stated honestly
 
