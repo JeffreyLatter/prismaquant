@@ -28,7 +28,11 @@ def test_production_recache_default_enabled_after_smoke_ladder():
     assert "production-render-staged|production-render-tail" in script  # exit-2 gate arm
     assert "python3 -m prismaquant.pipeline" in script
     assert "--write-default-production" in script
-    assert "--target-profile \"$TARGET_PROFILE\"" in script
+    # re-vet R11: the spec invocation records the RESOLVED profile, and the
+    # allocator only receives --target-profile when one was requested.
+    assert "--target-profile \"$TARGET_PROFILE_RESOLVED\"" in script
+    assert "--target-profile-default \"$TARGET_PROFILE_DEFAULT\"" in script
+    assert "require_lane_supported" in script
     assert ': "${HADAMARD_DUQUANT' not in script
     assert "HADAMARD_DUQUANT:-" in script
     assert "archive/hdq_2026-05-14" in script
@@ -122,4 +126,9 @@ def test_core_recipe_defaults_are_pinned():
 
     assert _shell_default(script, "FORMATS") == "NVFP4,FP8_DYNAMIC,BF16"
     assert _shell_default(script, "TARGET_BITS") == "4.75"
-    assert _shell_default(script, "SELECTION_MODE") == "surrogate"
+    # re-vet R1: SELECTION_MODE is conditional — surrogate by default,
+    # validated-surrogate under a byte budget (an explicit value wins).
+    assert ': "${SELECTION_MODE:=surrogate}"' in script
+    assert ': "${SELECTION_MODE:=validated-surrogate}"' in script
+    assert ': "${TARGET_DISK_GB:=}"' in script
+    assert ': "${VALIDATED_FRONTIER_PICK:=budget}"' in script

@@ -40,11 +40,23 @@
 
 set -euo pipefail
 
+# Repo root, for the out-of-package tools/ (shipcard show at the end).
+PIPELINE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 : "${MODEL_PATH:?Set MODEL_PATH to the source HF model directory}"
 : "${WORK_DIR:?Set WORK_DIR to a writable directory for artifacts}"
 : "${FORMATS:=NVFP4,FP8_DYNAMIC,BF16}"
 : "${TARGET_BITS:=4.75}"
 : "${PARETO_TARGETS:=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25}"
+# TARGET_DISK_GB (re-vet R1, closes debt D12): the byte budget is the
+# CONSTRAINT and measured KL is the OBJECTIVE. When set it OVERRIDES
+# TARGET_BITS — the allocator solves the exact-footprint feasibility test and
+# re-emits at the chosen bpp — and it flips SELECTION_MODE to
+# validated-surrogate for this run (an explicit SELECTION_MODE still wins), so
+# the ship pick is made on measured KL among the allocations that fit rather
+# than on the surrogate knee. It also narrows the Pareto set to the ~3 rungs
+# that can fit, which is what keeps the extra KL evals cheap.
+: "${TARGET_DISK_GB:=}"
 # Calibration defaults. 4x256 was the historical minimum for correctness
 # validation; 32x1024 (N=32, T=1024 = 32768 tokens/sample, 32 samples)
 # produces ~7% lower PPL on the resulting quantized artifact at a
@@ -73,8 +85,8 @@ set -euo pipefail
 # search wants a higher-rank imatrix than 256 rows (format-pipeline.md §6);
 # 1024 is the analogy-to-GGUF starting point pending a CB-specific
 # measurement (docs/lanes/nvfp4-cb/format-pipeline.md open-Q 6).
-if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" \
-   || "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
+: "${EXPORT_CONTAINER:=compressed-tensors}"
+if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   : "${ACTIVATION_ROWS_LIMIT:=1024}"
 else
   : "${ACTIVATION_ROWS_LIMIT:=256}"
@@ -88,13 +100,68 @@ fi
 : "${EXPERT_GATE_DATASET:=/home/rob/dq-runs/calibration/xdom-gate-v1.jsonl}"
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
-: "${TARGET_PROFILE:=vllm_packed_moe}"
+# TARGET_PROFILE is deliberately UNSET by default (re-vet R11 / debt D4). A
+# hardcoded `:=vllm_packed_moe` here won `resolve_target_profile`'s explicit-
+# request precedence over the architecture's own `spec.default_serving_profile`
+# for every run — measured cost, 2026-07-11: 226 dense FP8 Linears silently
+# coerced to BF16 on the Hy3 compressed-tensors export, because the allocator
+# solved under the shell's vllm_packed_moe while export re-resolved hy_v3's
+# declared `gguf`. Unset, the spec default wins; TARGET_PROFILE_DEFAULT is the
+# fallback when an architecture declares nothing — never `research`, whose
+# format menu is unbounded. Explicit TARGET_PROFILE still wins, so every
+# in-tree launch script is bit-identical.
+: "${TARGET_PROFILE:=}"
+: "${TARGET_PROFILE_DEFAULT:=vllm_packed_moe}"
+
+# -----------------------------------------------------------------------
+# Preflight: lane eligibility + serving-profile resolution (re-vet R6/R11).
+#
+# Lane eligibility is a model-profile property, not an operator preference:
+# an undeclared lane does NOT fail loudly at serve time — the missing
+# per-architecture loader means the runtime serves uninitialised weights and
+# generates coherent-looking garbage (precedent 9a79963: Laguna, 93% of
+# params). require_lane_supported refuses up front against the declared set.
+# The same block resolves the serving profile ONCE so the lane gates below,
+# the pipeline spec and the allocator all see the same answer.
+# -----------------------------------------------------------------------
+if ! TARGET_PROFILE_RESOLVED="$(
+  PQ_MODEL_PATH="$MODEL_PATH" \
+  PQ_EXPORT_CONTAINER="$EXPORT_CONTAINER" \
+  PQ_TARGET_PROFILE="$TARGET_PROFILE" \
+  PQ_TARGET_PROFILE_DEFAULT="$TARGET_PROFILE_DEFAULT" \
+  python3 - <<'PY'
+import os
+import sys
+
+from prismaquant.model_profiles import detect_profile
+from prismaquant.serving_profiles import (
+    require_lane_supported,
+    resolve_target_profile,
+)
+
+profile = detect_profile(os.environ["PQ_MODEL_PATH"])
+try:
+    require_lane_supported(profile, os.environ["PQ_EXPORT_CONTAINER"])
+except SystemExit as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(2) from None
+print(resolve_target_profile(
+    profile,
+    os.environ.get("PQ_TARGET_PROFILE") or None,
+    default=os.environ["PQ_TARGET_PROFILE_DEFAULT"],
+))
+PY
+)"; then
+  echo "[pipeline] ERROR: preflight refused this run (export lane not declared for the architecture, or serving-profile resolution failed)." >&2
+  exit 2
+fi
+echo "[pipeline] preflight: EXPORT_CONTAINER=${EXPORT_CONTAINER} lane OK; target profile resolves to ${TARGET_PROFILE_RESOLVED}${TARGET_PROFILE:+ (explicit TARGET_PROFILE=$TARGET_PROFILE)}"
 
 # GGUF lane consistency gates (see docs/lanes/gguf.md). The imatrix lockstep
 # contract (measured cost == shipped bytes) only holds under COST_MODE=local
 # today: production-render-score renders gguf formats via the unweighted
 # registry qdq, and the production cache is never read by export_gguf.
-if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
+if [[ "$EXPORT_CONTAINER" == "gguf" ]]; then
   if [[ "${COST_MODE:-production-render-score}" != "local" ]]; then
     echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires COST_MODE=local — production-render-score scores UNWEIGHTED registry renders while the GGUF exporter ships imatrix-weighted bytes (rendering confound). Set COST_MODE=local." >&2
     exit 2
@@ -103,8 +170,8 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
     echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires PRODUCTION_CACHE=0 — export_gguf requantizes the bf16 skeleton and never reads the production cache; building one burns hours rendering bytes that never ship. Set PRODUCTION_CACHE=0 PRODUCTION_RECACHE=0." >&2
     exit 2
   fi
-  if [[ "${TARGET_PROFILE:-vllm_packed_moe}" != "gguf" ]]; then
-    echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf requires TARGET_PROFILE=gguf (the exporter hard-fails on non-GGUF formats in the assignment)." >&2
+  if [[ "$TARGET_PROFILE_RESOLVED" != "gguf" ]]; then
+    echo "[pipeline] ERROR: EXPORT_CONTAINER=gguf resolves the serving profile to '${TARGET_PROFILE_RESOLVED}', not gguf (the exporter hard-fails on non-GGUF formats in the assignment). Declare default_serving_profile=gguf in the architecture spec, or set TARGET_PROFILE=gguf." >&2
     exit 2
   fi
 fi
@@ -116,13 +183,13 @@ fi
 # skeleton-requantize weighted render (COST_MODE=local), never
 # production-render-score (which scores UNWEIGHTED registry renders and never
 # reads the production cache the CB exporter also ignores).
-if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
+if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   if [[ "${COST_MODE:-production-render-score}" != "local" ]]; then
     echo "[pipeline] ERROR: EXPORT_CONTAINER=nvfp4_cb requires COST_MODE=local — production-render-score scores UNWEIGHTED registry renders while the CB exporter ships imatrix-weighted VQ bytes (the identical rendering confound the GGUF gate exists for). Set COST_MODE=local." >&2
     exit 2
   fi
-  if [[ "${TARGET_PROFILE:-vllm_packed_moe}" != "nvfp4_cb" ]]; then
-    echo "[pipeline] ERROR: EXPORT_CONTAINER=nvfp4_cb requires TARGET_PROFILE=nvfp4_cb — the allocator must gate every candidate through the nvfp4_cb serving profile (allow_formats = CB rungs + NVFP4/FP8_DYNAMIC/BF16, in_features%256 shape rule) and the exporter hard-fails on non-CB formats in the assignment. Set TARGET_PROFILE=nvfp4_cb." >&2
+  if [[ "$TARGET_PROFILE_RESOLVED" != "nvfp4_cb" ]]; then
+    echo "[pipeline] ERROR: EXPORT_CONTAINER=nvfp4_cb requires the nvfp4_cb serving profile — the allocator must gate every candidate through the nvfp4_cb serving profile (allow_formats = CB rungs + NVFP4/FP8_DYNAMIC/BF16, in_features%256 shape rule) and the exporter hard-fails on non-CB formats in the assignment. The serving profile resolved to '${TARGET_PROFILE_RESOLVED}'; declare default_serving_profile=nvfp4_cb in the architecture spec, or set TARGET_PROFILE=nvfp4_cb." >&2
     exit 2
   fi
   if [[ "${PRODUCTION_CACHE:-1}" != "0" || "${PRODUCTION_RECACHE:-1}" != "0" ]]; then
@@ -168,6 +235,10 @@ PY
 : "${PRODUCTION_CACHE_MAX_ACT_ROWS:=512}"
 : "${PRODUCTION_CACHE_LRU_GB:=64.0}"
 : "${PRODUCTION_CACHE_PREFETCH:=require}"
+# Export-side assignment prefetch (re-vet R24/D8): require on the native
+# lane, so a cache that cannot serve the assignment fails loudly instead of
+# silently degrading the export to an NVMe-bound crawl.
+: "${EXPORT_PRODUCTION_CACHE_PREFETCH:=require}"
 : "${PRODUCTION_CACHE_PREFETCH_WORKERS:=4}"
 : "${PRODUCTION_RECACHE_MICROBATCH:=1}"
 : "${PRODUCTION_CACHE_FORMATS:=auto}"
@@ -220,7 +291,18 @@ case ",$PRODUCTION_CACHE_LEVERS," in
     ;;
 esac
 export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
-: "${SELECTION_MODE:=surrogate}"
+# Selection mode. Under a byte budget the ship bpp is FIXED by the card, so
+# the only open question is which of the ~3 fitting allocations measures best
+# — that is validated-surrogate's job and it costs ~3 KL evals there (re-vet
+# R1). Without a budget it stays opt-in: on an open-ended TARGET_BITS run it
+# turns the assignment-scope render into a format-menu render (~2x) plus 11 KL
+# evals to decide a bpp the card would have fixed for free. An explicit
+# SELECTION_MODE always wins.
+if [[ -n "$TARGET_DISK_GB" ]]; then
+  : "${SELECTION_MODE:=validated-surrogate}"
+else
+  : "${SELECTION_MODE:=surrogate}"
+fi
 : "${VALIDATED_FRONTIER_NSAMPLES:=$NSAMPLES}"
 : "${VALIDATED_FRONTIER_SEQLEN:=$SEQLEN}"
 # Held-out selection (review criticals C3/C5): the frontier-selecting KL
@@ -234,13 +316,28 @@ export PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR=0
 # Optional fully separate validation corpus (overrides skip-first
 # disjointness with corpus-level disjointness when provided).
 : "${VALIDATED_FRONTIER_DATASET:=$DATASET}"
+# The effective skip-first: corpus-level disjointness (a separate validation
+# dataset) supersedes prefix-skip disjointness. Computed once so the stage
+# settings hash and the CLI cannot disagree.
+if [[ "$VALIDATED_FRONTIER_DATASET" == "$DATASET" ]]; then
+  VALIDATED_FRONTIER_CALIB_SKIP_FIRST="$VALIDATED_FRONTIER_SKIP_CALIB"
+else
+  VALIDATED_FRONTIER_CALIB_SKIP_FIRST=0
+fi
 # M26: final selection scores full-sequence KL (the gold-metric scope, §5),
 # not the last_token triage screen. Selection is still re-validated on the
 # served metric before ship, but aligning the selection scope with the gold
 # metric removes a screen/gold mismatch. VALIDATED_FRONTIER_KL_SCOPE=last_token
 # reproduces historical selections (the flagship 27B was picked under it).
 : "${VALIDATED_FRONTIER_KL_SCOPE:=full_sequence}"
-: "${VALIDATED_FRONTIER_PICK:=kneedle}"
+# Frontier pick. `budget` = min measured KL among the rows whose exact
+# exported footprint fits TARGET_DISK_GB (re-vet R1); kneedle stays the
+# default without a budget and is a diagnostic on a log-linear RD curve.
+if [[ -n "$TARGET_DISK_GB" ]]; then
+  : "${VALIDATED_FRONTIER_PICK:=budget}"
+else
+  : "${VALIDATED_FRONTIER_PICK:=kneedle}"
+fi
 : "${VALIDATED_FRONTIER_SAT_Z:=2.0}"
 # Saturation (B*) needs a real per-bpp noise floor: validate_assignments_kl's
 # kl_stderr is computed across calib-repeats, so a single repeat -> stderr=0 ->
@@ -282,6 +379,15 @@ fi
 # measured end-to-end, FP8 kept in the menu (real-KL rejects it, no bans).
 : "${AURA_EXPERT_NSAMPLES:=16}"
 : "${AURA_EXPERT_SEQLEN:=512}"
+# CB-lane empirical packed-expert stage + ladder interpolation. Defaults live
+# here (not inside the [2d-CB] block) so the settings-hash emission can see
+# every value an artifact's identity is keyed on.
+: "${CB_EXPERT_EMPIRICAL:=1}"
+: "${CB_EXPERT_NSAMPLES:=16}"
+: "${CB_EXPERT_SEQLEN:=512}"
+: "${CB_EXPERT_SAMPLE:=0}"
+: "${CB_LADDER_INTERP:=0}"
+: "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 case "$COST_MODE" in
@@ -292,7 +398,7 @@ case "$COST_MODE" in
     PRODUCTION_RENDER_COST_CACHE_DIR=""
     # One user knob drives BOTH ladder wirings (dense local cost + the
     # empirical expert stage): CB_LADDER_INTERP=1.
-    if [[ "${CB_LADDER_INTERP:-0}" == "1" ]]; then
+    if [[ "$CB_LADDER_INTERP" == "1" ]]; then
       export PRISMAQUANT_CB_LADDER_INTERP=1
     fi
     # CB M4-hybrid: stage [2d-CB] REPLACES every packed-expert row with the
@@ -300,8 +406,8 @@ case "$COST_MODE" in
     # local stage's expert measurements — full-stack imatrix-weighted CB
     # encodes per rung, the dominant cost-stage wall on MoE (35B: ~1h45/shard)
     # — are discarded work. Skip them whenever the replacement is guaranteed.
-    if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" \
-       && "${CB_EXPERT_EMPIRICAL:-1}" == "1" ]]; then
+    if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" \
+       && "$CB_EXPERT_EMPIRICAL" == "1" ]]; then
       export PRISMAQUANT_SKIP_PACKED_EXPERT_COST=1
       echo "[pipeline] [2/4] packed-expert local cost SKIPPED (CB hybrid replaces those rows)"
     fi
@@ -407,6 +513,8 @@ echo "[pipeline] config:"
 echo "  MODEL_PATH=$MODEL_PATH"
 echo "  WORK_DIR=$WORK_DIR"
 echo "  FORMATS=$FORMATS  TARGET_BITS=$TARGET_BITS"
+echo "  TARGET_DISK_GB=${TARGET_DISK_GB:-<unset>}  EXPORT_CONTAINER=$EXPORT_CONTAINER"
+echo "  TARGET_PROFILE=${TARGET_PROFILE:-<unset, spec-resolved>} -> $TARGET_PROFILE_RESOLVED (default $TARGET_PROFILE_DEFAULT)"
 echo "  NSAMPLES=$NSAMPLES SEQLEN=$SEQLEN LAYERS_PER_SHARD=$LAYERS_PER_SHARD"
 echo "  PREFETCH_LOOKAHEAD=$PREFETCH_LOOKAHEAD PREFETCH_WORKERS=$PREFETCH_WORKERS"
 echo "  ACTIVATION_ROWS_LIMIT=$ACTIVATION_ROWS_LIMIT"
@@ -443,7 +551,7 @@ PIPELINE_SPEC_ARGS=(
   --work-dir "$WORK_DIR"
   --formats "$FORMATS"
   --target-bits "$TARGET_BITS"
-  --target-profile "$TARGET_PROFILE"
+  --target-profile "$TARGET_PROFILE_RESOLVED"
   --calibration-modality "$CALIBRATION_MODALITY"
   --selection-mode "$SELECTION_MODE"
   --production-cache "$PRODUCTION_CACHE"
@@ -457,45 +565,23 @@ esac
 
 
 # -----------------------------------------------------------------------
-# Settings-hash guard (review critical C4): skip-if-exists stages must
-# refuse to reuse artifacts built under different quality-affecting
-# settings — silent reuse is the rendering-confound class that has
-# invalidated A/Bs before. Each stage writes <artifact>.settings.json on
-# build; on reuse a mismatch is a hard exit-2 naming the stale file.
-# Legacy artifacts (no manifest) warn loudly but are not invalidated.
+# Settings-hash guard (review critical C4; re-vet R5 closes debt D6).
+#
+# Skip-if-exists stages must refuse to reuse artifacts built under different
+# quality-affecting settings — silent reuse is the rendering-confound class
+# that has invalidated A/Bs before. WHICH settings key each artifact is
+# `pipeline.py`'s single real job (STAGE_SETTINGS_KEYS): the shell supplies
+# every value below, pipeline.py projects them onto each artifact's declared
+# key set and emits STAGE_SETTINGS_PATH; `require_stage_settings <artifact>
+# <stage> [LATE=value ...]` then reads the projection instead of re-deciding
+# the key set at each call site. That is what stops the eleventh stage from
+# arriving with no guard, and what stops ten stages from each holding a
+# different opinion of what their artifact depends on.
+#
+# Contract: mismatch = exit 2 naming the stale file. A MISSING manifest (or a
+# stage that never recorded one) only WARNs, so pre-guard artifacts are never
+# invalidated.
 # -----------------------------------------------------------------------
-require_stage_settings() {
-  local artifact="$1" stage="$2"; shift 2
-  python3 - "$artifact" "${artifact}.settings.json" "$stage" "$@" <<'GUARD'
-import json, os, sys
-artifact, manifest, stage, *pairs = sys.argv[1:]
-cur = dict(p.split("=", 1) for p in pairs)
-if os.path.exists(artifact):
-    if not os.path.exists(manifest):
-        print(f"[pipeline] WARNING: {stage}: reusing {artifact} which has no "
-              "settings manifest (predates the settings-hash guard); cannot "
-              "verify it matches the current settings", flush=True)
-        sys.exit(0)
-    prev = json.load(open(manifest))
-    diffs = {k: (prev.get(k), cur.get(k))
-             for k in sorted(set(prev) | set(cur))
-             if prev.get(k) != cur.get(k)}
-    if diffs:
-        print(f"[pipeline] ERROR: {stage}: {artifact} was built under "
-              "DIFFERENT settings; refusing silent reuse:", flush=True)
-        for k, (a, b) in diffs.items():
-            print(f"    {k}: artifact={a!r}  current={b!r}", flush=True)
-        print(f"    -> delete {artifact} (and its .settings.json) to "
-              "rebuild, or restore the original settings", flush=True)
-        sys.exit(2)
-    sys.exit(0)
-os.makedirs(os.path.dirname(manifest) or ".", exist_ok=True)
-json.dump(cur, open(manifest, "w"), indent=1, sort_keys=True)
-GUARD
-  local rc=$?
-  if [[ $rc -ne 0 ]]; then exit "$rc"; fi
-}
-
 RENDER_ENV_SETTINGS=(
   "PRISMAQUANT_NVFP4_SCALE_RULE=${PRISMAQUANT_NVFP4_SCALE_RULE:-}"
   # Manifest default must match the code default (gptq_damp_sweep_enabled:
@@ -507,13 +593,114 @@ RENDER_ENV_SETTINGS=(
   "PRODUCTION_CACHE_DISABLE_LEVERS=${PRODUCTION_CACHE_DISABLE_LEVERS:-}"
 )
 
+STAGE_SETTINGS_PATH="${WORK_DIR}/artifacts/stage_settings.json"
+STAGE_SETTINGS_ENV=(
+  "MODEL_PATH=$MODEL_PATH"
+  "DATASET=$DATASET"
+  "NSAMPLES=$NSAMPLES"
+  "SEQLEN=$SEQLEN"
+  "FORMATS=$FORMATS"
+  "TARGET_BITS=$TARGET_BITS"
+  "CALIBRATION_MODALITY=$CALIBRATION_MODALITY"
+  "ACTIVATION_ROWS_LIMIT=$ACTIVATION_ROWS_LIMIT"
+  "COST_MODE=$COST_MODE"
+  "SELECTION_MODE=$SELECTION_MODE"
+  "PRODUCTION_CACHE_RENDER_SCOPE=$PRODUCTION_CACHE_RENDER_SCOPE"
+  "PRODUCTION_RENDER_COST_NSAMPLES=$PRODUCTION_RENDER_COST_NSAMPLES"
+  "PRODUCTION_RENDER_COST_SEQLEN=$PRODUCTION_RENDER_COST_SEQLEN"
+  "PRODUCTION_RENDER_COST_SEED=$PRODUCTION_RENDER_COST_SEED"
+  "PRODUCTION_RENDER_COST_SCORE_FIELD=$PRODUCTION_RENDER_COST_SCORE_FIELD"
+  "PRODUCTION_RENDER_COST_REQUIRE_SCORES=$PRODUCTION_RENDER_COST_REQUIRE_SCORES"
+  "PRODUCTION_RENDER_COST_REQUIRE_OUTPUT=$PRODUCTION_RENDER_COST_REQUIRE_OUTPUT"
+  "AURA_COST_NPROBES=$AURA_COST_NPROBES"
+  "AURA_COST_NSAMPLES=$AURA_COST_NSAMPLES"
+  "AURA_COST_SEQLEN=$AURA_COST_SEQLEN"
+  "AURA_COST_CALIB_SEED=$AURA_COST_CALIB_SEED"
+  "AURA_COST_DTYPE=$AURA_COST_DTYPE"
+  "AURA_EXPERT_NSAMPLES=$AURA_EXPERT_NSAMPLES"
+  "AURA_EXPERT_SEQLEN=$AURA_EXPERT_SEQLEN"
+  "CB_EXPERT_NSAMPLES=$CB_EXPERT_NSAMPLES"
+  "CB_EXPERT_SEQLEN=$CB_EXPERT_SEQLEN"
+  "CB_EXPERT_SAMPLE=$CB_EXPERT_SAMPLE"
+  "CB_LADDER_INTERP=$CB_LADDER_INTERP"
+  "VALIDATED_FRONTIER_DATASET=$VALIDATED_FRONTIER_DATASET"
+  "VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES"
+  "VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN"
+  "VALIDATED_FRONTIER_CALIB_REPEATS=$VALIDATED_FRONTIER_CALIB_REPEATS"
+  "VALIDATED_FRONTIER_CALIB_SKIP_FIRST=$VALIDATED_FRONTIER_CALIB_SKIP_FIRST"
+  "VALIDATED_FRONTIER_KL_SCOPE=$VALIDATED_FRONTIER_KL_SCOPE"
+  "${RENDER_ENV_SETTINGS[@]}"
+)
+STAGE_SETTINGS_ARGS=()
+for _kv in "${STAGE_SETTINGS_ENV[@]}"; do
+  STAGE_SETTINGS_ARGS+=(--setting "$_kv")
+done
+unset _kv
+python3 -m prismaquant.pipeline \
+  --write-stage-settings "$STAGE_SETTINGS_PATH" \
+  "${STAGE_SETTINGS_ARGS[@]}"
+
+# -----------------------------------------------------------------------
+# Cost-table provenance (re-vet R2 precondition (i)).
+#
+# `cost.pkl` is the SAME path under every COST_MODE (local /
+# production-render-score / aura), so a bare `[[ -f ]]` reuse test silently
+# allocates on the previous mode's estimator while the log says otherwise —
+# D6's silent-reuse class landing exactly on a mode change. Every producer now
+# stamps provenance["cost_mode"]; reuse is conditional on it matching. This is
+# the in-tree pattern the CB hybrid already used for its own merge probe.
+# Unstamped tables (pre-R2) warn and are reused, never invalidated.
+# -----------------------------------------------------------------------
+cost_table_cost_mode() {
+  python3 - "$1" <<'COSTPROV'
+import pickle
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as fh:
+        payload = pickle.load(fh)
+    prov = payload.get("provenance", {}) if isinstance(payload, dict) else {}
+    print(str((prov or {}).get("cost_mode", "") or ""))
+except Exception:
+    print("")
+COSTPROV
+}
+
+cost_table_reusable() {
+  local path="$1" stamped
+  [[ -f "$path" ]] || return 1
+  stamped="$(cost_table_cost_mode "$path")"
+  if [[ -z "$stamped" ]]; then
+    echo "[pipeline] WARNING: $path carries no provenance['cost_mode'] (predates the R2 stamp); reusing it under COST_MODE=${COST_MODE} unverified"
+    return 0
+  fi
+  if [[ "$stamped" != "$COST_MODE" ]]; then
+    echo "[pipeline] cost table $path was produced under COST_MODE=${stamped} but this run is COST_MODE=${COST_MODE} -> REBUILDING (reusing it would allocate on the other estimator; re-vet R2)"
+    return 1
+  fi
+  return 0
+}
+
+require_stage_settings() {
+  local artifact="$1" stage="$2"; shift 2
+  local overrides=()
+  local kv
+  for kv in "$@"; do
+    overrides+=(--setting "$kv")
+  done
+  python3 -m prismaquant.pipeline --check-stage-settings \
+    --stage-settings "$STAGE_SETTINGS_PATH" \
+    --artifact "$artifact" --stage "$stage" \
+    "${overrides[@]+"${overrides[@]}"}"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then exit "$rc"; fi
+}
+
 # -----------------------------------------------------------------------
 # 1. Sensitivity probe (per-Linear empirical Fisher diagonal trace,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
-require_stage_settings "${PROBE_PATH}" probe \
-  "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
-  "SEQLEN=$SEQLEN" "CALIBRATION_MODALITY=$CALIBRATION_MODALITY"
+require_stage_settings "${PROBE_PATH}" probe
 if [[ ! -f "${PROBE_PATH}" ]]; then
   echo "[pipeline] [1/4] running sensitivity probe ..."
   python3 -m prismaquant.incremental_probe \
@@ -578,10 +765,18 @@ fi
 # 2. Cost measurement (per-(Linear, format) measured RTN error,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
-require_stage_settings "${BASE_COST_PATH}" base-cost \
-  "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
-  "SEQLEN=$SEQLEN" "FORMATS=$FORMATS"
+require_stage_settings "${BASE_COST_PATH}" base-cost
+# Under COST_MODE=local the baseline IS the allocator's cost table, so it is
+# also gated on the stamped cost_mode. Under the other modes cost_baseline.pkl
+# is mode-agnostic (the same measured RTN error feeds every estimator) and is
+# reused across mode changes on purpose.
+BASE_COST_REUSABLE=1
 if [[ ! -f "${BASE_COST_PATH}" ]]; then
+  BASE_COST_REUSABLE=0
+elif [[ "$BASE_COST_PATH" == "$COST_PATH" ]] && ! cost_table_reusable "$BASE_COST_PATH"; then
+  BASE_COST_REUSABLE=0
+fi
+if [[ "$BASE_COST_REUSABLE" == "0" ]]; then
   # CB lane + LOCAL expert costs (CB_EXPERT_EMPIRICAL=0): the packed-expert
   # measurement must use the SAME imatrix the exporter ships — incl. the
   # synthesized per-expert down_proj replay entries the raw harvest can never
@@ -589,9 +784,9 @@ if [[ ! -f "${BASE_COST_PATH}" ]]; then
   # point the cost stage at the pickle. Without this, down_proj stacks would
   # be COSTED unweighted while the export ships weighted bytes (the
   # rendering-confound class).
-  if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" \
-     && "${CB_EXPERT_EMPIRICAL:-1}" != "1" ]]; then
-    : "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
+  if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" \
+     && "$CB_EXPERT_EMPIRICAL" != "1" ]]; then
+    require_stage_settings "$CB_COL_WEIGHTS" cb-col-weights
     if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
       echo "[pipeline] [2/4] pre-cost CB col-weights harvest (local expert costs) ..."
       CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
@@ -619,6 +814,7 @@ PY
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
   python3 -m prismaquant.incremental_measure_quant_cost \
     --model "$MODEL_PATH" \
+    --cost-mode "$COST_MODE" \
     --probe "${PROBE_PATH}" \
     --activation-cache-dir "${WORK_DIR}/act" \
     --formats "$FORMATS" \
@@ -638,10 +834,7 @@ fi
 # at the top of this file errors out before reaching here if the var is set.
 
 if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-render" ]]; then
-  require_stage_settings "$PRODUCTION_RENDER_COST_CACHE_PATH" render-cost-cache \
-    "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "FORMATS=$FORMATS" \
-    "NS=$PRODUCTION_RENDER_COST_NSAMPLES" "SL=$PRODUCTION_RENDER_COST_SEQLEN" \
-    "SEED=$PRODUCTION_RENDER_COST_SEED" "${RENDER_ENV_SETTINGS[@]}"
+  require_stage_settings "$PRODUCTION_RENDER_COST_CACHE_PATH" render-cost-cache
   if [[ ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
     echo "[pipeline] [2b/4] rendering production weights for allocator cost ..."
     python3 -m prismaquant.build_production_cache \
@@ -662,7 +855,8 @@ if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-r
   else
     echo "[pipeline] [2b/4] production-render cost cache exists, skipping"
   fi
-  if [[ ! -f "$COST_PATH" ]]; then
+  require_stage_settings "$COST_PATH" render-cost
+  if ! cost_table_reusable "$COST_PATH"; then
     echo "[pipeline] [2c/4] synthesizing production-render allocator cost ..."
     PROD_RENDER_COST_ARGS=()
     case "$PRODUCTION_RENDER_COST_REQUIRE_SCORES" in
@@ -677,6 +871,7 @@ if [[ "$COST_MODE" == "production-render-score" || "$COST_MODE" == "production-r
         ;;
     esac
     python3 -m prismaquant.production_render_cost \
+      --cost-mode "$COST_MODE" \
       --production-cache "$PRODUCTION_RENDER_COST_CACHE_PATH" \
       --baseline-cost "$BASE_COST_PATH" \
       --output "$COST_PATH" \
@@ -716,9 +911,7 @@ PY
     exit 2
   fi
   require_stage_settings "$PRODUCTION_RENDER_COST_CACHE_PATH" aura-dw-cache \
-    "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "FORMATS=$AURA_CACHE_FORMATS" \
-    "NS=$NSAMPLES" "SL=$SEQLEN" "SELECTION_MODE=$SELECTION_MODE" \
-    "${RENDER_ENV_SETTINGS[@]}"
+    "AURA_CACHE_FORMATS=$AURA_CACHE_FORMATS"
   if [[ ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
     echo "[pipeline] [2b/4] building format-menu production cache for AURA dW ..."
     python3 -m prismaquant.build_production_cache \
@@ -743,10 +936,12 @@ PY
   # [2c] The AURA cost itself: KL-Fisher probes x production-rendered dW.
   # Packed-MoE experts are deliberately omitted here (the smooth adjoint is
   # route-flip-blind on them) and costed empirically in [2d].
+  require_stage_settings "$AURA_COST_RAW" aura-cost
   if [[ ! -f "$AURA_COST_RAW" ]]; then
     echo "[pipeline] [2c/4] measuring AURA downstream-KL-adjoint cost ..."
     python3 -m prismaquant.aura_cost \
       --model "$MODEL_PATH" \
+      --cost-mode "$COST_MODE" \
       --output "$AURA_COST_RAW" \
       --formats "$FORMATS" \
       --production-cache "$PRODUCTION_RENDER_COST_CACHE_PATH" \
@@ -773,7 +968,8 @@ PY
   # packed experts (FP8 kept in the menu — real-KL rejects it, no bans),
   # plus sidecar (MTP/visual) row backfill from the baseline cost. Backfilled
   # rows carry the baseline estimator and are recorded in provenance.
-  if [[ ! -f "$COST_PATH" ]]; then
+  require_stage_settings "$COST_PATH" aura-hybrid-cost
+  if ! cost_table_reusable "$COST_PATH"; then
     OMITTED_EXPERTS="$(python3 - "$AURA_COST_RAW" <<'PY'
 import pickle
 import sys
@@ -786,6 +982,7 @@ PY
       echo "[pipeline] [2d/4] measuring empirical packed-expert unit-KL costs (${OMITTED_EXPERTS} omitted tensors; hybrid merge) ..."
       python3 -m prismaquant.expert_empirical_cost \
         --model "$MODEL_PATH" \
+        --cost-mode "$COST_MODE" \
         --output "$COST_PATH" \
         --formats "$FORMATS" \
         --dataset "$DATASET" \
@@ -796,7 +993,8 @@ PY
         2>&1 | tee "${WORK_DIR}/logs/expert_empirical_cost.log"
     else
       echo "[pipeline] [2d/4] no packed experts omitted; finalizing AURA cost (sidecar backfill) ..."
-      python3 - "$AURA_COST_RAW" "$BASE_COST_PATH" "$COST_PATH" <<'PY'
+      COST_MODE="$COST_MODE" python3 - "$AURA_COST_RAW" "$BASE_COST_PATH" "$COST_PATH" <<'PY'
+import os
 import pickle
 import sys
 
@@ -811,6 +1009,8 @@ prov = dict(payload.get("provenance", {}) or {})
 if added:
     prov["backfilled_from_base"] = added
     prov["backfill_base"] = sys.argv[2]
+# re-vet R2 precondition (i): stamp the mode that produced this table.
+prov["cost_mode"] = os.environ.get("COST_MODE", "")
 payload["provenance"] = prov
 with open(sys.argv[3], "wb") as fh:
     pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
@@ -829,12 +1029,9 @@ fi
 # empirical unit-KL, non-experts keep the local CB costs. No-op (beyond a
 # model load) on dense models: zero packed-expert units -> the merged
 # payload is the base unchanged. CB_EXPERT_EMPIRICAL=0 opts out.
-if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" \
-   && "${CB_EXPERT_EMPIRICAL:-1}" == "1" ]]; then
+if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" \
+   && "$CB_EXPERT_EMPIRICAL" == "1" ]]; then
   CB_LOCAL_RAW="${WORK_DIR}/artifacts/cost_local_raw.pkl"
-  : "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
-  : "${CB_EXPERT_NSAMPLES:=16}"
-  : "${CB_EXPERT_SEQLEN:=512}"
   CB_MERGED="$(python3 - "$COST_PATH" <<'PY'
 import pickle, sys
 try:
@@ -845,10 +1042,12 @@ except Exception:
     print(0)
 PY
 )"
+  require_stage_settings "$COST_PATH" cb-hybrid-cost
   if [[ "$CB_MERGED" != "1" ]]; then
     # The empirical pass renders CB candidates imatrix-WEIGHTED — harvest
     # the col-weights now (same skip-if-exists block as the [4/4] exporter;
     # measured cost and shipped bytes stay the one weighted render).
+    require_stage_settings "$CB_COL_WEIGHTS" cb-col-weights
     if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
       echo "[pipeline] [2d-CB] harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
       CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
@@ -878,18 +1077,19 @@ PY
     fi
     echo "[pipeline] [2d-CB] measuring empirical packed-expert unit-KL (CB hybrid; replace semantics) ..."
     CB_LADDER_ARGS=()
-    if [[ "${CB_LADDER_INTERP:-0}" == "1" ]]; then
+    if [[ "$CB_LADDER_INTERP" == "1" ]]; then
       CB_LADDER_ARGS+=(--cb-ladder-interp)
     fi
     # CB_EXPERT_SAMPLE=N: stratified expert subsample per unit (shared across
     # formats), unit KL extrapolated by expert count. 0 (default) = full
     # stacks. Cuts the empirical stage's encode volume ~E/N; export always
     # encodes every expert exactly.
-    if [[ "${CB_EXPERT_SAMPLE:-0}" != "0" ]]; then
+    if [[ "$CB_EXPERT_SAMPLE" != "0" ]]; then
       CB_LADDER_ARGS+=(--expert-sample "$CB_EXPERT_SAMPLE")
     fi
     python3 -m prismaquant.expert_empirical_cost \
       --model "$MODEL_PATH" \
+      --cost-mode "$COST_MODE" \
       --output "$COST_PATH" \
       --formats "$FORMATS" \
       --dataset "$DATASET" \
@@ -908,7 +1108,11 @@ fi
 # -----------------------------------------------------------------------
 # 3. Allocator (multi-choice knapsack over per-layer formats)
 # -----------------------------------------------------------------------
-echo "[pipeline] [3/4] running allocator at target=${TARGET_BITS} bpp ..."
+if [[ -n "$TARGET_DISK_GB" ]]; then
+  echo "[pipeline] [3/4] running allocator under a ${TARGET_DISK_GB}GB byte budget (overrides TARGET_BITS=${TARGET_BITS}) ..."
+else
+  echo "[pipeline] [3/4] running allocator at target=${TARGET_BITS} bpp ..."
+fi
 # Choose visual-sensitivity mode from calibration modality:
 #   text-only → uniform (Phase 1 --visual-format path, as before)
 #   multimodal → fisher (Phase 2: DP places visual Linears from real
@@ -926,12 +1130,27 @@ if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
 else
   ALLOCATOR_PARETO_DIR=""
 fi
+# --target-profile is passed ONLY when the operator asked for one, so the
+# architecture's own spec.default_serving_profile can win (re-vet R11);
+# --target-profile-default keeps the historical fallback for architectures
+# that declare nothing, instead of resolve_target_profile's `research`.
+ALLOCATOR_PROFILE_ARGS=(--target-profile-default "$TARGET_PROFILE_DEFAULT")
+if [[ -n "$TARGET_PROFILE" ]]; then
+  ALLOCATOR_PROFILE_ARGS+=(--target-profile "$TARGET_PROFILE")
+fi
+# Byte budget: the constraint is the card, the objective is measured KL
+# (re-vet R1). The allocator re-emits at the bpp whose EXACT footprint fits.
+ALLOCATOR_BUDGET_ARGS=()
+if [[ -n "$TARGET_DISK_GB" ]]; then
+  ALLOCATOR_BUDGET_ARGS=(--target-disk-gb "$TARGET_DISK_GB")
+fi
 python3 -m prismaquant.allocator \
   --probe "${PROBE_PATH}" \
   --costs "${COST_PATH}" \
   --target-bits "$TARGET_BITS" \
   --formats "$FORMATS" \
-  --target-profile "$TARGET_PROFILE" \
+  "${ALLOCATOR_PROFILE_ARGS[@]}" \
+  "${ALLOCATOR_BUDGET_ARGS[@]+"${ALLOCATOR_BUDGET_ARGS[@]}"}" \
   --pareto-targets "$PARETO_TARGETS" \
   --visual-format "$VISUAL_FORMAT" \
   --visual-sensitivity "$VISUAL_SENSITIVITY" \
@@ -983,6 +1202,8 @@ PY
     fi
     PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
     PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_frontier_raw.pkl"
+    require_stage_settings "$PROD_CACHE_RAW" frontier-cache \
+      "CACHE_FORMATS=$CACHE_FORMATS"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
       python3 -m prismaquant.build_production_cache \
@@ -1031,7 +1252,7 @@ PY
       --base-assignment "${WORK_DIR}/artifacts/layer_config.json"
       --formats "$FORMATS"
       --dataset "$VALIDATED_FRONTIER_DATASET"
-      --calib-skip-first "$(if [[ "$VALIDATED_FRONTIER_DATASET" == "$DATASET" ]]; then echo "$VALIDATED_FRONTIER_SKIP_CALIB"; else echo 0; fi)"
+      --calib-skip-first "$VALIDATED_FRONTIER_CALIB_SKIP_FIRST"
       --n-calib-samples "$VALIDATED_FRONTIER_NSAMPLES"
       --calib-seqlen "$VALIDATED_FRONTIER_SEQLEN"
       --calib-repeats "$VALIDATED_FRONTIER_CALIB_REPEATS"
@@ -1069,6 +1290,7 @@ PY
         VAK_LABEL_SAFE="${VAK_LABEL//[^A-Za-z0-9._-]/_}"
         VAK_PART="${VAK_PART_DIR}/vak_${VAK_LABEL_SAFE}.json"
         VAK_PART_FILES+=("$VAK_PART")
+        require_stage_settings "$VAK_PART" frontier-kl-point
         if [[ -f "$VAK_PART" ]]; then
           echo "[pipeline] [4/4] ${VAK_LABEL}: per-point KL exists, skipping"
           continue
@@ -1111,10 +1333,15 @@ PY
     fi
 
     echo "[pipeline] [4/4] selecting measured frontier point ..."
+    FRONTIER_SELECT_ARGS=()
+    if [[ -n "$TARGET_DISK_GB" ]]; then
+      FRONTIER_SELECT_ARGS+=(--target-disk-gb "$TARGET_DISK_GB")
+    fi
     python3 -m prismaquant.select_validated_frontier \
       --validation-json "$VALIDATION_JSON" \
       --mode "$VALIDATED_FRONTIER_PICK" \
       --sat-z "$VALIDATED_FRONTIER_SAT_Z" \
+      "${FRONTIER_SELECT_ARGS[@]+"${FRONTIER_SELECT_ARGS[@]}"}" \
       --output-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
       --output-assignment "${WORK_DIR}/artifacts/layer_config_validated_assignment.json" \
       --output-summary "${WORK_DIR}/artifacts/validated_frontier_selection.json" \
@@ -1129,6 +1356,7 @@ print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()[:12])
 PY
 )"
       PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache_frontier_${SELECTED_DIGEST}_recached.pkl"
+      require_stage_settings "$PROD_CACHE_RECACHED" frontier-recache
       if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
         echo "[pipeline] [4/4] re-fitting activation scales for selected measured-${VALIDATED_FRONTIER_PICK} assignment ..."
         python3 -m prismaquant.production_recache \
@@ -1173,9 +1401,7 @@ PY
   elif [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
     LC_DIGEST=$(sha256sum "${WORK_DIR}/artifacts/layer_config.json" | cut -c1-16)
     require_stage_settings "$PROD_CACHE_RECACHED" production-cache-recached \
-      "MODEL_PATH=$MODEL_PATH" "DATASET=$DATASET" "NSAMPLES=$NSAMPLES" \
-      "SEQLEN=$SEQLEN" "FORMATS=$FORMATS" "TARGET_BITS=$TARGET_BITS" \
-      "ASSIGNMENT_DIGEST=$LC_DIGEST" "${RENDER_ENV_SETTINGS[@]}"
+      "ASSIGNMENT_DIGEST=$LC_DIGEST"
     if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
       if [[ ! -f "$PROD_CACHE_RAW" ]]; then
         echo "[pipeline] [4/4] building production cache + re-fitting activation scales ..."
@@ -1221,6 +1447,9 @@ PY
     fi
     PRODUCTION_CACHE_PATH="$PROD_CACHE_RECACHED"
   else
+    RAW_LC_DIGEST=$(sha256sum "${WORK_DIR}/artifacts/layer_config.json" | cut -c1-16)
+    require_stage_settings "$PROD_CACHE_RAW" production-cache-raw \
+      "CACHE_FORMATS=$CACHE_FORMATS" "ASSIGNMENT_DIGEST=$RAW_LC_DIGEST"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       echo "[pipeline] [4/4] building production cache ..."
       python3 -m prismaquant.build_production_cache \
@@ -1246,7 +1475,7 @@ PY
   fi
 fi
 
-if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
+if [[ "$EXPORT_CONTAINER" == "gguf" ]]; then
   # GGUF lane: one artifact serves llama.cpp natively and vLLM via the
   # GGUF path. Requires TARGET_PROFILE=gguf at allocation time (the
   # exporter hard-fails on non-GGUF formats). The skeleton (metadata +
@@ -1255,8 +1484,7 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   : "${GGUF_SKELETON:=${WORK_DIR}/artifacts/skeleton.gguf}"
   : "${GGUF_TOKEN_EMBEDDING_FORMAT:=}"
   : "${GGUF_OUTPUT_FORMAT:=}"
-  require_stage_settings "$GGUF_SKELETON" gguf-skeleton \
-    "MODEL_PATH=$MODEL_PATH"
+  require_stage_settings "$GGUF_SKELETON" gguf-skeleton
   if [[ ! -f "$GGUF_SKELETON" ]]; then
     echo "[pipeline] [4/4] building GGUF skeleton (convert_hf_to_gguf, bf16) ..."
     # Write-then-rename: convert_hf_to_gguf writes in place, so a crashed
@@ -1326,14 +1554,13 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "gguf" ]]; then
   exit 0
 fi
 
-if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
+if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # NVFP4-CB / FP8-CB codebook lane: one custom compressed-tensors-STYLE
   # artifact served by the out-of-tree gridbook_plugin (LAYOUT.md is
   # the byte contract). Like the GGUF lane, the exporter requantizes the bf16
   # skeleton with an imatrix-weighted VQ search — it does NOT read a production
   # cache. Requires TARGET_PROFILE=nvfp4_cb + COST_MODE=local (gated above).
   : "${CB_OUT:=${WORK_DIR}/exported_nvfp4_cb}"
-  : "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
   # Codebook source: `lattice` (deterministic fixed FP4/FP8 lattice, no
   # sidecar) or `learned` (shared per-(role) codebooks trained at export
   # time, sidecar amortized ~0 bpw — the byte-competitive champion in
@@ -1356,6 +1583,7 @@ if [[ "${EXPORT_CONTAINER:-compressed-tensors}" == "nvfp4_cb" ]]; then
   # one weighted render (the one-cache / lockstep contract, format-pipeline
   # §6). Skip-if-exists; override CB_COL_WEIGHTS to supply a pre-built flat
   # {qname: (in_features,) tensor} pickle (e.g. Fisher col-weights, exp-4).
+  require_stage_settings "$CB_COL_WEIGHTS" cb-col-weights
   if [[ ! -f "$CB_COL_WEIGHTS" ]]; then
     echo "[pipeline] [4/4] harvesting CB col-weights (imatrix) from ${WORK_DIR}/act ..."
     CB_ACT_DIR="${WORK_DIR}/act" CB_COL_WEIGHTS="$CB_COL_WEIGHTS" MODEL_PATH="$MODEL_PATH" python3 - <<'PY'
@@ -1492,19 +1720,33 @@ case "$EXPORT_SCALE_SWEEP" in
     ;;
 esac
 if [[ -n "$PRODUCTION_CACHE_PATH" ]]; then
-	  EXPORT_ARGS+=(
-	    --production-weight-cache "$PRODUCTION_CACHE_PATH"
-	    --production-cache-dir-override "$PROD_CACHE_DIR"
-	    --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB"
-	    --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
-	  )
+  # --production-cache-prefetch=require (re-vet R24/D8): a total prefetch miss
+  # used to be invisible — the helper returned 0 on every failure path and the
+  # caller only logged when it prefetched something — so the export silently
+  # went NVMe-bound tensor by tensor. `require` on the native lane mirrors
+  # VALIDATED_SOURCE_PREFETCH=require and production_weight_cache's own
+  # require mode; the CB/GGUF lanes never read a production cache at all.
+  EXPORT_ARGS+=(
+    --production-weight-cache "$PRODUCTION_CACHE_PATH"
+    --production-cache-dir-override "$PROD_CACHE_DIR"
+    --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB"
+    --production-cache-prefetch "$EXPORT_PRODUCTION_CACHE_PREFETCH"
+    --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
+  )
 fi
 "${EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
 
 echo
 echo "[pipeline] done."
 echo "  Artifact: ${WORK_DIR}/exported"
-echo "  Validate: python3 -m prismaquant.validate_native_export \\"
-echo "              --model ${WORK_DIR}/exported"
-echo "  Serve:    vllm serve ${WORK_DIR}/exported \\"
-echo "              --quantization compressed-tensors --trust-remote-code"
+# The build lane OPENS the ship record; the serve lane must CLOSE it (R13).
+# Printing the open slots here is the whole point of a refusal contract: the
+# run ends by naming what has NOT been measured yet, instead of echoing a
+# command and implying the artifact is done.
+SHIPCARD_JSON="${WORK_DIR}/exported/shipcard.json"
+SHIPCARD_TOOL="${PIPELINE_REPO_ROOT}/tools/shipcard.py"
+if [[ -f "$SHIPCARD_JSON" && -f "$SHIPCARD_TOOL" ]]; then
+  python3 "$SHIPCARD_TOOL" show "$SHIPCARD_JSON" || true
+else
+  echo "  WARNING: no shipcard at ${SHIPCARD_JSON} — the export did not open a ship record."
+fi

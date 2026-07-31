@@ -126,6 +126,7 @@ from .serving_profiles import (
     serving_profile_names,
 )
 from .decision_units import block_id_from_qname
+from .layer_config import LAYER_CONFIG_META_KEY
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
@@ -1433,6 +1434,13 @@ def main():
                          "prismaquant/serving_profile_specs. Defaults to "
                          "the detected model profile's configured serving "
                          "profile, or research when none is declared.")
+    ap.add_argument("--target-profile-default",
+                    default="research",
+                    help="Fallback serving profile when neither "
+                         "--target-profile nor the architecture's "
+                         "spec.default_serving_profile names one. The "
+                         "production orchestrator passes vllm_packed_moe; "
+                         "the bare-CLI default stays `research` (re-vet R11).")
     ap.add_argument("--calibration", default=None,
                     help="Optional path to a JSON containing "
                          "'calibrated_gains[fmt] = α_fmt'. When present, "
@@ -1525,7 +1533,10 @@ def main():
             "specific fused-sibling groups will NOT be enforced. Pass "
             "--model-override <model> (or rebuild the probe with meta['model'] "
             "set) so detect_profile resolves the real profile.", flush=True)
-    target_profile = resolve_target_profile(model_profile, args.target_profile)
+    target_profile = resolve_target_profile(
+        model_profile, args.target_profile,
+        default=str(args.target_profile_default or "research"),
+    )
     if target_profile not in serving_profile_names():
         raise SystemExit(f"[alloc] ERROR: unknown target profile {target_profile!r}")
     print(f"[alloc] target profile: {target_profile}", flush=True)
@@ -2241,6 +2252,101 @@ def main():
               f"(target={_r['target_bits']:.3f}, {_r['evals']} DP evals, "
               f"±{_r['tol_bits']}b)")
 
+    # --- exact exported footprint per Pareto candidate (re-vet R1) --------
+    # The byte budget is the CONSTRAINT and measured KL is the OBJECTIVE, but
+    # `select_validated_frontier` cannot see the card: it reads only the
+    # per-point KL rows. Pricing each candidate here — through the SAME
+    # footprint.assignment_artifact_bytes the allocator's own byte-budget
+    # selector uses, so the two can never disagree — puts the bytes in the
+    # assignment payload the KL selector already loads.
+    _footprint_ctx: dict[str, object] = {}
+
+    def _footprint_scalars():
+        if _footprint_ctx or not probe_model_path:
+            return _footprint_ctx or None
+        from . import footprint as _fp
+        try:
+            src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
+            _footprint_ctx.update({
+                "fp": _fp,
+                "source_total_bytes": src_total,
+                "regime": _fp.source_regime(src_by_dtype),
+                "source_manifest": _fp.source_tensor_bytes_manifest(
+                    probe_model_path,
+                    name_map=getattr(model_profile, "checkpoint_to_live_name", None),
+                    expert_parent_for_projection=getattr(
+                        model_profile, "packed_expert_parent_for_projection", None),
+                ),
+                "stats": {**accounting_stats, **fixed_stats, **stats},
+            })
+        except Exception as exc:  # pricing is additive; never break allocation
+            print(f"[alloc] WARNING: Pareto footprint pricing unavailable: {exc}",
+                  flush=True)
+            return None
+        return _footprint_ctx
+
+    def _artifact_bytes_for(expanded_assignment):
+        ctx = _footprint_scalars()
+        if not ctx:
+            return None
+        try:
+            return int(ctx["fp"].assignment_artifact_bytes(
+                expanded_assignment, ctx["stats"],
+                source_total_bytes=ctx["source_total_bytes"],
+                source_manifest=ctx["source_manifest"],
+                regime=ctx["regime"],
+                context="pareto candidate footprint",
+            )["artifact_bytes"])
+        except Exception as exc:
+            print(f"[alloc] WARNING: could not price a Pareto candidate: {exc}",
+                  flush=True)
+            return None
+
+    if args.pareto_output_dir:
+        for record in pareto_seed_records:
+            record["artifact_bytes"] = _artifact_bytes_for(record["assignment"])
+
+        # Collapse the Pareto set to the rungs that can actually ship. On an
+        # 11-rung sweep under a card, 8 of those rungs are decided before a
+        # single KL is measured — the narrowing is what makes byte-budget
+        # selection ~3 KL evals instead of 11. Computed from the priced grid,
+        # never hardcoded, and skipped (loudly) when pricing is unavailable.
+        if args.target_disk_gb is not None and pareto_seed_records:
+            from . import footprint as _fp_gb
+            budget_bytes_pareto = float(args.target_disk_gb) * _fp_gb.GB
+            priced = [r for r in pareto_seed_records
+                      if r.get("artifact_bytes") is not None]
+            if len(priced) != len(pareto_seed_records):
+                print("[alloc] WARNING: byte-budget Pareto narrowing skipped — "
+                      f"{len(pareto_seed_records) - len(priced)} of "
+                      f"{len(pareto_seed_records)} candidates could not be "
+                      "priced; measuring the full sweep", flush=True)
+            else:
+                ordered = sorted(pareto_seed_records,
+                                 key=lambda r: r["artifact_bytes"])
+                fits = [i for i, r in enumerate(ordered)
+                        if r["artifact_bytes"] <= budget_bytes_pareto]
+                if fits:
+                    top = fits[-1]
+                    keep_positions = {max(0, top - 1), top,
+                                      min(len(ordered) - 1, top + 1)}
+                    reason = (
+                        f"largest fitting rung achieved="
+                        f"{ordered[top]['achieved_bits']:.3f} bpp at "
+                        f"{ordered[top]['artifact_bytes'] / _fp_gb.GB:.3f}GB")
+                else:
+                    keep_positions = set(range(min(2, len(ordered))))
+                    reason = ("NOTHING fits the card; keeping the cheapest "
+                              "rungs so the measurement shows the shortfall")
+                keep = {id(ordered[i]) for i in sorted(keep_positions)}
+                before = len(pareto_seed_records)
+                pareto_seed_records = [r for r in pareto_seed_records
+                                       if id(r) in keep]
+                print(f"[alloc] byte-budget Pareto narrowing: {before} -> "
+                      f"{len(pareto_seed_records)} rungs "
+                      f"(card={args.target_disk_gb:.2f}GB; {reason})",
+                      flush=True)
+
     if args.pareto_output_dir:
         out_dir = Path(args.pareto_output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2271,6 +2377,8 @@ def main():
                     record["total_predicted_dloss_with_aux"]
                 ),
                 "format_counts": record["format_counts"],
+                "artifact_bytes": record.get("artifact_bytes"),
+                "target_profile": target_profile,
                 "assignment": dict(sorted(assignment.items())),
             }
             path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -2291,11 +2399,15 @@ def main():
                 ),
                 "fixed_predicted_dloss": float(record["fixed_predicted_dloss"]),
                 "format_counts": record["format_counts"],
+                "artifact_bytes": record.get("artifact_bytes"),
             })
         (out_dir / "manifest.json").write_text(json.dumps({
             "schema": "prismaquant.allocator.pareto_manifest.v1",
             "probe": str(args.probe),
             "costs": str(args.costs),
+            "target_profile": target_profile,
+            "target_disk_gb": (float(args.target_disk_gb)
+                               if args.target_disk_gb is not None else None),
                 "formats": [s.name for s in specs_sorted],
             "target_bits": [float(x) for x in targets],
             "knees": knee_summary,
@@ -2860,6 +2972,23 @@ def main():
             # passed --formats NVFP4,BF16 plus --visual-format MXFP8_E4M3).
             # Resolve from the global registry.
             layer_cfg[name] = fr.get_format(fmt).autoround_config()
+
+    # The resolved serving profile travels WITH the assignment (re-vet R11 /
+    # debt D4). Before this, it landed only in the side report
+    # format_applicability.json, which export never reads, so the exporter
+    # re-resolved the profile from the architecture spec and could legality-
+    # audit under a different one than the allocator solved with — measured
+    # 2026-07-11: 226 dense FP8 Linears silently coerced to BF16 on the Hy3
+    # compressed-tensors export. PRISMAQUANT_TARGET_PROFILE remains the
+    # override for direct exporter invocations.
+    layer_cfg[LAYER_CONFIG_META_KEY] = {
+        "schema": "prismaquant.layer_config_meta.v1",
+        "target_profile": target_profile,
+        "target_profile_requested": args.target_profile,
+        "target_profile_default": str(args.target_profile_default or "research"),
+        "target_bits": float(args.target_bits),
+        "achieved_bits": float(achieved),
+    }
 
     out = Path(args.layer_config)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -839,6 +839,8 @@ def main(argv: list[str] | None = None) -> None:
                     "layout_version 2; serve gates pending — do not ship)")
     ap.add_argument("--device", default=None)
     args = ap.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("export_nvfp4_cb")
 
     with open(args.col_weights, "rb") as fh:
         col_weights = pickle.load(fh)

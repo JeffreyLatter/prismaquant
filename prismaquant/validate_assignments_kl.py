@@ -41,7 +41,10 @@ from prismaquant.calibration_data import (
     load_wikitext_calibration_windowed,
 )
 from prismaquant.gpu_guard import require_cuda_hot_path
-from prismaquant.layer_config import canonicalize_format
+from prismaquant.layer_config import (
+    canonicalize_format,
+    is_layer_config_meta_key,
+)
 from prismaquant.model_profiles import detect_profile_with_warning
 from prismaquant.kl_measurement import (
     assignment_bit_total,
@@ -88,9 +91,12 @@ def _load_costs(path: str | Path, *, calib_hashes_out: set | None = None) -> dic
 def load_assignment_json(path: str | Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
     payload = _load_json(path)
     if isinstance(payload, Mapping) and isinstance(payload.get("assignment"), Mapping):
-        assignment = {str(k): canonicalize_format(v) for k, v in payload["assignment"].items()}
+        assignment = {str(k): canonicalize_format(v)
+                      for k, v in payload["assignment"].items()
+                      if not is_layer_config_meta_key(k)}
     elif isinstance(payload, Mapping):
-        assignment = {str(k): canonicalize_format(v) for k, v in payload.items()}
+        assignment = {str(k): canonicalize_format(v) for k, v in payload.items()
+                      if not is_layer_config_meta_key(k)}
     else:
         raise ValueError(f"unsupported assignment JSON shape: {path}")
     if base is not None:

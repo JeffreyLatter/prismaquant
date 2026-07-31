@@ -345,6 +345,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--production-cache", required=True)
     parser.add_argument("--baseline-cost", default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--cost-mode", default="",
+                        help="Pipeline COST_MODE stamped into "
+                             "provenance['cost_mode'] (re-vet R2).")
     parser.add_argument(
         "--formats",
         default=None,
@@ -376,6 +379,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "instead of output_mse/fisher_output_mse.",
     )
     args = parser.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("production_render_cost")
 
     # The staged (two-pass NVFP4-then-promote) surface — --select-tail-*,
     # --promotion-qnames-file, --bf16-policy, --missing-render-score-policy —
@@ -400,6 +405,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_render_scores=bool(args.require_render_scores),
         require_output_metric=bool(args.require_output_metric),
     )
+    # Stamp the pipeline COST_MODE (re-vet R2 precondition (i)): cost.pkl is
+    # the same path under every mode, so reuse must be conditional on it.
+    prov = dict(payload.get("provenance") or {})
+    prov["cost_mode"] = str(args.cost_mode or "")
+    payload["provenance"] = prov
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as fh:

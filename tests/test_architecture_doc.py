@@ -39,8 +39,6 @@ def test_defaults_table_matches_run_pipeline():
         "FORMATS",
         "TARGET_BITS",
         "COST_MODE",
-        "SELECTION_MODE",
-        "TARGET_PROFILE",
         "NSAMPLES",
         "SEQLEN",
         "PRODUCTION_CACHE_LEVERS",
@@ -50,6 +48,34 @@ def test_defaults_table_matches_run_pipeline():
             f"ARCHITECTURE.md §3.3 is stale: run-pipeline.sh has {var}={val}. "
             "Update the defaults table in the same commit as the default change."
         )
+
+
+def test_target_profile_has_no_shell_default():
+    """re-vet R11: TARGET_PROFILE must stay UNSET so the architecture's own
+    `spec.default_serving_profile` can win. A `:=` default here silently beat
+    every spec (measured: 226 Hy3 FP8 Linears -> BF16, 2026-07-11), so this
+    pins the absence of one and requires the doc to say how it resolves."""
+    script, doc = _pipeline(), _doc()
+    assert re.search(r'\$\{TARGET_PROFILE:=\}', script), (
+        "TARGET_PROFILE must have an EMPTY ':=' default in run-pipeline.sh; "
+        "an architecture's spec.default_serving_profile can never win against "
+        "an explicit request (serving_profiles.resolve_target_profile)."
+    )
+    assert f"TARGET_PROFILE_DEFAULT={_shell_default(script, 'TARGET_PROFILE_DEFAULT')}" in doc
+    assert "spec-resolved" in doc, (
+        "ARCHITECTURE.md §3.3 must document that TARGET_PROFILE is "
+        "spec-resolved rather than shell-defaulted."
+    )
+
+
+def test_selection_mode_default_documented():
+    """SELECTION_MODE is no longer a single ':=' default — it is surrogate,
+    or validated-surrogate under a byte budget (re-vet R1)."""
+    script, doc = _pipeline(), _doc()
+    assert 'SELECTION_MODE:=validated-surrogate' in script
+    assert 'SELECTION_MODE:=surrogate' in script
+    assert "SELECTION_MODE=surrogate" in doc
+    assert "TARGET_DISK_GB" in doc
 
 
 def test_three_diagrams_present():

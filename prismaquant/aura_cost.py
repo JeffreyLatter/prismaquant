@@ -866,7 +866,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "exp 4). Additive: the rest of the payload is unchanged. "
                         "Env: PRISMAQUANT_FISHER_COL_WEIGHTS=1.")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--cost-mode", default="",
+                   help="Pipeline COST_MODE stamped into "
+                        "provenance['cost_mode'] (re-vet R2).")
     args = p.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("aura_cost", args.device)
 
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -967,6 +972,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "calib_seqlen": int(args.calib_seqlen),
         "calib_seed": int(args.calib_seed),
         "production_cache": str(args.production_cache or ""),
+        # re-vet R2 precondition (i): which pipeline COST_MODE produced this.
+        "cost_mode": str(args.cost_mode or ""),
     })
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:

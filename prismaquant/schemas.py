@@ -214,6 +214,12 @@ def validate_layer_config_payload(payload, path: str | None = None):
     for name, entry in payload.items():
         if not isinstance(name, str):
             _fail(path, "", "layer_config keys must be strings")
+        if name == "__prismaquant__":
+            # Reserved allocator-metadata block (layer_config.LAYER_CONFIG_META_KEY):
+            # travels with the assignment, is not a tensor entry.
+            if not _is_mapping(entry):
+                _fail(path, f"[{name!r}]", "reserved metadata must be an object")
+            continue
         where = f"[{name!r}]"
         if isinstance(entry, dict):
             dt = entry.get("data_type")

@@ -14,17 +14,17 @@ Ranked by leverage-per-risk, fundamentals first. "Lens" credits the arguing revi
 
 | id | proposal | class | cost | risk | lens |
 |---|---|---|---|---|---|
-| **R1** | Byte budget becomes the *constraint*, measured KL the *objective*; kneedle → diagnostic (D12) | FUNDAMENTAL | M | none while opt-in | L1 |
-| **R2** | Flip `COST_MODE=aura` to default, gated on a cost-provenance stamp + wiring the additivity gate | FUNDAMENTAL | S+S+S | loud fail on stale WORK_DIR | L1 |
+| **R1** | Byte budget becomes the *constraint*, measured KL the *objective*; kneedle → diagnostic — **IMPLEMENTED 2026-07-30** (both verdicts YES; D12 closed) | FUNDAMENTAL | M | none while opt-in | L1 |
+| **R2** | Flip `COST_MODE=aura` to default, gated on a cost-provenance stamp + wiring the additivity gate — **precondition (i) IMPLEMENTED 2026-07-30**; the flip itself waits on R3 | FUNDAMENTAL | S+S+S | mismatch rebuilds, loudly | L1 |
 | **R3** | Split `COST_MODE` into (render source)×(cost objective); `col_weights` on the CB render closes Milestone C and lifts the CB gates | FUNDAMENTAL | M–L | med — shared render path | L2 + L4 |
 | **R4** | Retire L2/L3 from the spine; archive-wall the L3 probe — **IMPLEMENTED 2026-07-30** (measured: 97 symbols / ~4.3k lines out of `kl_measurement.py`, not the ~15 functions estimated) | FUNDAMENTAL | M | near-zero | L6 |
-| **R5** | **DISAGREEMENT** — `pipeline.py`: promote to settings-hash authority (L2) *vs* demote to linter / delete (L6) | FUNDAMENTAL | M / S | low either way | L2 vs L6 |
-| **R6** | Lane eligibility becomes model configuration (`supported_lanes`/`preferred_lane`), not an operator env var | FUNDAMENTAL | M | low, additive | L4 |
+| **R5** | `pipeline.py`: settings-hash authority — **RESOLVED for Lens 2, IMPLEMENTED 2026-07-30** (D6 + D10 closed; 16 guard sites / 15 artifacts) | FUNDAMENTAL | M | low | L2 vs L6 |
+| **R6** | Lane eligibility becomes model configuration — **IMPLEMENTED 2026-07-30** (spec side wave 2, `run-pipeline.sh` preflight wave 3) | FUNDAMENTAL | M | low, additive | L4 |
 | **R7** | Strix Halo enters **serving-only**, GGUF-first; no ROCm build stack in scope | FUNDAMENTAL | S | none | L4 |
 | **R8** | `spec.match`: implement the reader (`SpecMatchProfile`, zero-Python Tier A) **or** delete the dead field | FUNDAMENTAL | M / S | med — detection order | L3 |
 | **R9** | D1 tail-veto: emit `kl_p99`/`kl_max`/`nll_p99` from tensors already in hand; veto in `_frontier_from_rows` | STRUCTURAL | M | zero default-off | L1 + L5 |
 | **R10** | Gridbook per-arch CB loader list → data + serve-time "every CB expert tensor consumed" assertion (D3) | STRUCTURAL | M | low | L3 + L4 |
-| **R11** | `spec.default_serving_profile` authoritative; allocator stamps resolved profile into `layer_config.json` (D4) | STRUCTURAL | S | low | L3 |
+| **R11** | `spec.default_serving_profile` authoritative; allocator stamps resolved profile into `layer_config.json` — **IMPLEMENTED 2026-07-30**, D4 closed, non-regression 0/614 + 0/500 | STRUCTURAL | S | low | L3 |
 | **R12** | Route MTP through the profile; add `mtp_source_prefix()`; delete `mtp_module.py` (D2) | STRUCTURAL | M | med — probe + export | L3 |
 | **R13** | `exported/shipcard.json` — a refusal contract the build lane opens and the serve lane must close — **IMPLEMENTED 2026-07-30** (run-pipeline echo deferred) | STRUCTURAL | M | none | L5 |
 | **R14** | Mechanize held-out disjointness by `calib_hash` intersection, hard-error; fix the wikitext `--calib-skip-first` no-op | STRUCTURAL | S | none | L5 |
@@ -37,7 +37,7 @@ Ranked by leverage-per-risk, fundamentals first. "Lens" credits the arguing revi
 | **R21** | Persist the MoE auto-tuner's timings; **defer λ** until two boxes' cost tables disagree in ranking | STRUCTURAL | S | none | L4 |
 | **R22** | Author the `minimax_m2` structure spec + `deepseek_v4` `default_serving_profile` (D13) | STRUCTURAL | M+S | low | L3 |
 | **R23** | **Decision only:** do *not* port `run-pipeline.sh` to a `pipeline.py` executor | STRUCTURAL | free | none | L2 |
-| **R24** | Hardening pass: D8 export prefetch `require` + D9 `require_cuda_hot_path` on 7 stages | HYGIENE | S | D8 can newly fail | L2 |
+| **R24** | Hardening pass: D8 export prefetch `require` + D9 `require_cuda_hot_path` on 7 stages — **IMPLEMENTED 2026-07-30** as one branch; D8/D9 closed | HYGIENE | S | D8 can newly fail | L2 |
 | **R25** | Archive-wall block-output-match; close D16 as *unreachable*, not *unmeasured* — do not A/B it — **IMPLEMENTED 2026-07-30**, D16 closed as *unreachable* | HYGIENE | S | none on shipping recipe | L5 |
 | **R26** | Conformance test: every declared spec field has a reader (the pattern behind 4 of 5 plugin leaks) | HYGIENE | S | none | L3 |
 | **R27** | Two accessor moves: `streaming_model.py:98-104` arch predicate → spec bool; probe's `MiniMaxM2Experts` → accessor | HYGIENE | S | ~zero | L3 |
@@ -59,6 +59,21 @@ Ranked by leverage-per-risk, fundamentals first. "Lens" credits the arguing revi
 
 **Verdict-request.** (a) Should `TARGET_DISK_GB`, when set, override `TARGET_BITS` in the pipeline as it does in the CLI? (b) Should `validated-surrogate` default **on only under a byte budget** (~3 KL evals), staying opt-in for open-ended `TARGET_BITS` runs? Lens recommends yes to both. *Corollary:* do **not** promote `validated-surrogate` unconditionally — alone it turns the assignment-scope render (`run-pipeline.sh:177`) into a format-menu render (`:1153-1170`), ~2× render on a 3-format menu, plus 11 KL evals, to decide a bpp a byte budget fixes for free.
 
+
+**Outcome: ACCEPTED, implemented 2026-07-30 — both verdict-requests answered YES by Robert.**
+(a) `TARGET_DISK_GB`, when set, **overrides `TARGET_BITS`** in the pipeline exactly as it does
+in the CLI. (b) `validated-surrogate` defaults **on only under a byte budget**, staying opt-in
+for open-ended `TARGET_BITS` runs — an explicit `SELECTION_MODE` still wins. Mechanism: the
+allocator prices every Pareto candidate with `footprint.assignment_artifact_bytes` (the same
+accounting its own byte-budget selector uses) and stamps `artifact_bytes` into each assignment
+payload + the manifest; under a card it narrows the Pareto set to the largest fitting rung ±1
+(~3 of 11) with a log line — a computed narrowing, skipped loudly if any candidate is unpriced;
+`select_validated_frontier --mode budget --target-disk-gb` picks **min measured KL among the
+rows that fit**, reading the bytes column from the allocator payload. Unpriced rows and an
+infeasible card are hard errors, never a silent fall-back to another pick. Kneedle stays the
+default without a card and stays the diagnostic `_rd_curve_diagnostic` already calls it.
+Byte-identical when `TARGET_DISK_GB` is unset (pinned by a test). Closes **D12**.
+
 ### R2 (L1 P2) — Flip `COST_MODE=aura`, gated on two S-sized preconditions · FUNDAMENTAL
 
 **What.** AURA's evidence clears the §2.4 default-on bar: −38%/−39.5% served confident-KL at the 4B knee across two independent calibrations with PPL agreeing (−18% vs `output_mse`), −17.9% at 27B, both flagships (regen-27B, 35B arm-E) produced with it, MoE hole closed by the M4 hybrid, automated at `[2d]` (`run-pipeline.sh:905-956`). What is *not* ready is the WORK_DIR contract.
@@ -72,6 +87,20 @@ Ranked by leverage-per-risk, fundamentals first. "Lens" credits the arguing revi
 **Verdict-request.** Accept "stale cost tables hard-fail on a mode change" as the back-compat story (lens recommendation — silence is worse than a stop), or add `--allow-cost-mode-mismatch` mirroring `--allow-legacy-fisher-norm`? And: flip on 4B + 27B + 35B, or require one more architecture first?
 
 > **DISAGREEMENT (R2 vs R19).** Precondition (ii) wires `aura_additivity_gate.py`; Lens 6 lists the same file among orphans to wall ("AURA additivity cleared"). Robert must pick: wire it as a standing per-artifact trust-region readout, or wall it as a closed thread.
+
+
+**Outcome: precondition (i) IMPLEMENTED 2026-07-30; the default flip is NOT done.**
+Every producer — `incremental_measure_quant_cost`, `production_render_cost`, `aura_cost`,
+`expert_empirical_cost`, and the inline sidecar-backfill finalize — now takes `--cost-mode` and
+stamps `provenance["cost_mode"]`. `run-pipeline.sh`'s `cost_table_reusable()` makes reuse of the
+**allocator's** table conditional on that stamp matching `$COST_MODE`, and `cost.pkl` /
+`cost_aura.pkl` are under the new R5 guard. Behaviour on a mismatch is **rebuild with a loud
+line naming both modes** (the in-tree CB-hybrid provenance-probe pattern the proposal points
+at), not a hard stop; an unstamped pre-R2 table warns and is reused, never invalidated. Under
+`COST_MODE=local` the baseline *is* the allocator table and carries the same gate; under the
+other modes `cost_baseline.pkl` is mode-agnostic and is deliberately shared across mode
+changes. Precondition (ii) (`aura_additivity_gate` wiring) and the `COST_MODE=aura` default
+flip remain open — the flip waits on the R3 axis split.
 
 ### R9 (L1 P3 + L5 P3) — D1 tail-veto: one reduction away, not a second eval pass · STRUCTURAL
 
@@ -131,6 +160,25 @@ Ranked by leverage-per-risk, fundamentals first. "Lens" credits the arguing revi
 
 **Verdict-request.** Make `pipeline.py` load-bearing this narrowly, or delete its validation and keep the shell guard hand-written? Under the first option: accept forced rebuilds on any live `WORK_DIR` when key sets land?
 
+
+**Outcome: RESOLVED in favour of Lens 2's narrow promotion — implemented 2026-07-30.**
+`pipeline.py` is now the settings-hash authority and nothing more: `STAGE_SETTINGS_KEYS`
+declares, per artifact, which settings its identity is keyed on; `run-pipeline.sh` supplies
+every value once (`STAGE_SETTINGS_ENV`) and `--write-stage-settings` projects them into
+`artifacts/stage_settings.json`; `require_stage_settings <artifact> <stage> [LATE=v …]` calls
+`--check-stage-settings` instead of hand-passing `k=v`. Execution stays in bash (R23 confirmed).
+Coverage is now **every** skip-if-exists artifact — 16 call sites over 15 declared artifacts,
+including all ten the audit enumerated. The manifest is keyed by stage, so the two stages that
+legitimately share one path (AURA dW cache == frontier cache under `validated-surrogate`)
+coexist; pre-R5 flat manifests are read as a `legacy` block and still guard the stage whose key
+set they match, so **no live `WORK_DIR` is invalidated** — the named over-keying risk was
+handled by preserving historical manifest key names and by keying the probe on
+model/corpus/windows/modality but **not** on `FORMATS` (it is format-blind). Missing manifest,
+and a stage that never recorded one, stay WARN. D10 bookkeeping done: the two phantom owner
+names are deleted, `streaming_model_weights` names `layer_streaming.LayerCache`, a test asserts
+every approved owner has a class behind it, and `QuantWeightCache` needed no entry — it went to
+the archive wall with L3 in wave 2. Closes **D6** and **D10**.
+
 ### R23 (L2 P3) — Adjudication: do **not** move stage execution into `pipeline.py`-as-executor · STRUCTURAL
 
 An explicit "no", recorded so it is not re-litigated. The complexity the rewrite case rests on could not be evidenced. Against: (i) ~60 lines of env plumbing per subprocess does not shrink in python — it becomes `subprocess` arg lists of the same arity; (ii) the graveyard's lesson is that rewrites need measured need, and our actual failure class (D6 silent reuse) is language-orthogonal and fixed by R5 in 2 days; (iii) the three lanes are near-disjoint straight lines, not a matrix — GGUF `exit 0`s at `:1523`, CB at `:1661`, so lane × mode interaction is bounded by two preflight gates; (iv) `run-pipeline.sh` is the operational muscle memory of every launcher and handover, and a port invalidates it as the Strix Halo work starts. Honest cost if you want it anyway: **L, 1.5–2 weeks**, plus end-to-end re-validation of one 27B-class artifact proving byte-identical output — that validation, not the port, is the real bill. **What would flip this:** if lanes stop `exit 0`-ing and start composing (one run exporting both compressed-tensors and CB from one cache), the straight line breaks and bash stops being the right host. **Verdict-request.** Confirm "no port", and confirm which side of R5 is the accepted D6 fix.
@@ -144,6 +192,21 @@ An explicit "no", recorded so it is not re-litigated. The complexity the rewrite
 ## Lens 3 — plugin architecture & per-model configuration
 
 **No structural flaw. The residue is wiring debt — but of one repeating shape, and that shape is the real finding.** The three-registry design is load-bearing: allocator, solver, caches, exporter and `pipeline.py` carry zero arch conditionals, the three-tier precedence has absorbed 9 of 11 architectures, and the `DefaultProfile` fused-coherence gate (`allocator.py:1550-1554`) fails proactively rather than guessing. What §8.5 does not yet name is that **all four leaks, plus one more, are the same failure: a declarative extension point is defined, parsed, documented — and has no production caller.** `spec.default_serving_profile` (L1), `profile.build_mtp_module` (L2), `spec.unpacked_expert_projection_names` (§8.4), and — new here — **`spec.match`, which all 9 spec files declare, `structure.py:185` parses into `ModelStructureSpec.match`, and nothing in the tree reads** (grep: zero consumers outside the parser). Dead config decays: `qwen3_5_dense.json`'s `match` is **not equivalent** to `qwen3_5_dense.py:23`, which additionally requires `not any("Moe" in arch)`.
+
+
+**Outcome: ACCEPTED, implemented 2026-07-30 as ONE branch (D8 + D9 + the guard rollout).**
+**D8:** `_production_cache_prefetch_assignment` gained a `require` mode mirroring
+`production_weight_cache.prefetch_assignment(require=…)`, exposed as
+`--production-cache-prefetch {require,warn}`; `run-pipeline.sh` passes `require` on the native
+lane (matching `VALIDATED_SOURCE_PREFETCH=require`) and the CB/GGUF lanes read no production
+cache at all, so `warn` elsewhere is vacuous. Every silent-zero path — no cache, no `prefetch`
+attribute, quantized entries resolving to zero keys, keys loading nothing — is now a named
+failure under `require`; an all-BF16 prefix still legitimately prefetches nothing.
+**D9:** the guard is at `main()` entry (not import time) in all seven stages, after confirming
+no CPU-only test imports those `main()`s (`tests/test_prismaquant_visual_phase2.py` only reads
+`incremental_probe.main`'s source; `alloc.main()` is the allocator, which is not in scope). A
+parametrized test pins all twelve `require_cuda_hot_path` callers.
+**Guard rollout:** landed on R5's mechanism.
 
 ### R8 (L3 P6) — Spec-expressible `matches()`: under-engineering today, not over- · FUNDAMENTAL
 
@@ -178,6 +241,24 @@ profile, so the live detection order contains zero `SpecMatchProfile`s).
 **Why now.** Measured cost: 226 dense FP8 Linears silently coerced to BF16 on the Hy3 CT export, 2026-07-11 (§8.5 L1 / D4), because the allocator resolved `vllm_packed_moe` from the shell while export re-resolved `gguf` from `hy_v3.json`. **Non-regression.** All 8 in-tree launch scripts already `export TARGET_PROFILE=nvfp4_cb` (`scripts/run_{laguna_s21,27b_prod_nvfp4cb,hy3_prod_joint,hy3_prod_nvfp4cb,27b_cb_20gb,35b_prod_nvfp4cb,0p8b_s_rung_headtohead}.sh`, `smoke_nvfp4_cb_pipeline.sh`) — explicit request still wins, so **every existing script is bit-identical**. Spec defaults: 7 archs declare `vllm_packed_moe` (no change); `hy_v3`→`gguf` and `laguna`→`nvfp4_cb` are always script-driven; `minimax_m2`/`deepseek_v4` declare nothing and the new default holds them at `vllm_packed_moe`. Gate: re-run the allocator on the shipped 27B/35B probes and diff `layer_config.json` — expect 0/614 and 0/500, the same check the #13–#21 stack used.
 
 **Cost** S. **Risk** low — the only changed behaviour is an unset-`TARGET_PROFILE` run on hy_v3/laguna, which today hard-errors at `run-pipeline.sh:106/:124` anyway. **Verdict-request.** Approve the order; decide whether export's channel is `layer_config.json` metadata (lens recommendation — it travels with the artifact) or a CLI flag.
+
+
+**Outcome: ACCEPTED, implemented 2026-07-30. Export's channel is `layer_config.json` metadata**
+(the lens recommendation — it travels with the artifact), with `PRISMAQUANT_TARGET_PROFILE` kept
+as the override for direct exporter invocations. `run-pipeline.sh` leaves `TARGET_PROFILE`
+unset, passes `--target-profile` only when non-empty, and always passes
+`--target-profile-default vllm_packed_moe`. The allocator stamps its resolved profile into a
+reserved `__prismaquant__` block (`layer_config.LAYER_CONFIG_META_KEY`) that the schema and
+every assignment parser skip; `select_validated_frontier` carries the block forward when it
+overwrites the layer config. **Non-regression measured, not assumed:** re-solving the shipped
+27B (`prod-27b-nvfp4cb-5p5`, 5.5 bpp) and 35B (`prod-35b-nvfp4cb-4p75`, 4.75 bpp) from their
+stored `probe.pkl`/`cost.pkl` changed **0/614** and **0/500** against the same allocator without
+this change. Against the *shipped* configs the 27B is also 0/614; the 35B differs by 32/500 for
+an unrelated pre-existing reason — the Fisher renormalization fix that landed after that
+artifact shipped, reproduced identically at HEAD. `tests/test_architecture_doc.py` was updated
+in the same change: `TARGET_PROFILE` leaves the `:=`-defaults list and is replaced by a test
+asserting the *absence* of a shell default plus the doc's spec-resolution statement.
+Closes **D4** / §8.5 L1.
 
 ### R12 (L3 P2) — Route MTP through the profile; it needs a fourth accessor · STRUCTURAL
 
@@ -251,7 +332,7 @@ Core-stack architecture literals in control flow: **3 → 0**.
 
 **What.** Add `supported_lanes` / `preferred_lane` to the model-profile spec (mirrored in `serving_profile_specs/*.json`), plus a preflight refusing an `EXPORT_CONTAINER` the arch has not declared; `run-pipeline.sh` defaults to the arch's preferred lane, not hardcoded `compressed-tensors`. **Why now.** Lane choice is already a per-arch fact, currently tribal knowledge in `scripts/run_*_prod_nvfp4cb.sh`. Nothing stops `EXPORT_CONTAINER=nvfp4_cb` on DSv4, whose CB expert loader is an explicit TODO (`gb/plugin.py:117-118`) — the run completes and serves garbage (precedent `9a79963`: Laguna, 93% of params). The honest CB-eligible set is four archs and nothing in the tree says so. Same declarative move §8 already made for structure and serving constraints; lanes are the one axis still imperative. **Cost** M. **Risk** low — undeclared archs keep `compressed-tensors`, strictly additive. **Verdict-request.** Is lane eligibility a profile property, or do lanes stay operator-chosen with a warning only? (R10 is a prerequisite either way.)
 
-**Outcome: ACCEPTED — spec side implemented 2026-07-30; pipeline preflight pending wave 3.**
+**Outcome: ACCEPTED — spec side implemented 2026-07-30 (wave 2); pipeline preflight wired 2026-07-30 (wave 3).**
 `supported_lanes` / `preferred_lane` are `ModelStructureSpec` fields read by
 `ModelProfile.supported_export_lanes()` / `preferred_export_lane()`, defaulting to
 `["compressed-tensors"]` / `"compressed-tensors"` when absent — strictly additive, so no run
@@ -261,8 +342,14 @@ archs — `qwen3_5`, `qwen3_5_dense`, `hy_v3`, `laguna` — with `hy_v3` also GG
 it, and `laguna` preferring `nvfp4_cb`; a conformance test pins that declaration against the
 gridbook loader list so over-declaring fails. `require_lane_supported(profile,
 export_container)` (`serving_profiles.py`) is the preflight and refuses with the declared set
-and the failure mode named. **`run-pipeline.sh` is NOT wired** — that is wave 3, per the
-no-edit constraint on this batch; until then the declaration binds only callers that opt in.
+and the failure mode named. **`run-pipeline.sh` is NOT wired** — that was wave 3.
+
+**Pipeline preflight landed 2026-07-30 (wave 3).** `run-pipeline.sh` runs one preflight block
+before the lane gates: `detect_profile(MODEL_PATH)` -> `require_lane_supported(profile,
+EXPORT_CONTAINER)` -> `resolve_target_profile(...)`, refusing an undeclared lane with `exit 2`
+naming the declared set and the failure mode. The same block resolves the serving profile once
+(`TARGET_PROFILE_RESOLVED`), which the GGUF/CB consistency gates, the pipeline spec and the
+allocator now all read — so lane eligibility and profile resolution can no longer disagree.
 
 ### R7 (L4 P3) — Strix Halo: enter as a *serving-only* target, GGUF first · FUNDAMENTAL
 
@@ -444,7 +531,7 @@ Null findings and buried ideas the panel declined to revive. Load-bearing for tr
 
 ## Open disagreements for Robert
 
-1. **R5** — `pipeline.py`: settings-hash authority (L2) vs linter-or-gone (L6). Both agree it is not enforcement today and must not be the executor.
+1. ~~**R5**~~ — **RESOLVED 2026-07-30 for Lens 2's narrow promotion** (implemented; see the R5 outcome). `pipeline.py` is the settings-hash authority and nothing else; it is still not the executor.
 2. **R2 vs R19** — `aura_additivity_gate.py`: wire it as AURA's standing trust-region readout (L1) vs wall it as a closed thread (L6).
 3. **R3** — CB lane: fund Milestone C (`col_weights` render identity) as the prerequisite to per-arch CB defaults — L2's axis split makes it cheap, L4 recommends funding it *while leaving the default at native* — vs freeze CB as a premium manual lane and stop carrying the gate as debt (L4's alternative).
 4. **R8** — `spec.match`: implement the reader for zero-Python Tier A, or delete the dead field and declare Tier B the contract. Leaving 9 decayed unread `match` blocks is not an option.

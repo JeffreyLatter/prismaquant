@@ -486,6 +486,8 @@ def main(argv: list[str] | None = None) -> None:
         "with llama.cpp imatrix semantics",
     )
     args = ap.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("export_gguf")
     imatrix = None
     if args.imatrix_from_act_cache:
         imatrix = build_imatrix_from_act_cache(args.imatrix_from_act_cache)

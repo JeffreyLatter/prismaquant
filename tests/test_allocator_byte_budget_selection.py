@@ -280,7 +280,8 @@ def test_denser_fitting_rung_with_worse_dloss_is_rejected(
     assert selection["max_bytes_pick_target_bits"] == 8.0
     assert not selection["max_bytes_grid_pick_agrees"]
     # The shipped artifact is the sparser, better one.
-    assert {cfg["data_type"] for cfg in layer_cfg.values()} == {"nv_fp"}
+    assert {cfg["data_type"] for name, cfg in layer_cfg.items()
+            if name != "__prismaquant__"} == {"nv_fp"}
     # Headroom is deliberately left on the card: filling it costs quality.
     assert selection["headroom_gb"] > 0
     # The near-lossless cap was probed and REJECTED, not ignored.
@@ -304,7 +305,8 @@ def test_monotone_case_still_fills_the_card(monkeypatch, tmp_path):
     assert selection["max_bytes_grid_pick_agrees"], (
         "in the monotone regime the objective change must be a no-op")
     assert selection["predicted_dloss"] == selection["max_bytes_pick_dloss"]
-    assert {cfg["data_type"] for cfg in layer_cfg.values()} == {"fp8_e4m3"}
+    assert {cfg["data_type"] for name, cfg in layer_cfg.items()
+            if name != "__prismaquant__"} == {"fp8_e4m3"}
     assert selection["has_slack"]
 
 
@@ -320,7 +322,8 @@ def test_over_budget_rung_is_never_selected(monkeypatch, tmp_path):
         fmt_for_target=lambda t: "FP8_E4M3" if t >= 6.0 else "NVFP4")
 
     assert selection["chosen_target_bits"] == 4.5
-    assert {cfg["data_type"] for cfg in layer_cfg.values()} == {"nv_fp"}
+    assert {cfg["data_type"] for name, cfg in layer_cfg.items()
+            if name != "__prismaquant__"} == {"nv_fp"}
     assert selection["predicted_artifact_gb"] * fp.GB <= selection["budget_bytes"]
     assert not any(r["accepted"] for r in selection["ratchet_trace"]
                    if not r["fits"])

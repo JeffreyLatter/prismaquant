@@ -3219,6 +3219,8 @@ def main():
     ap.add_argument("--mm-max-text-len", type=int, default=128,
                     help="Max text tokens per multimodal calibration sample.")
     args = ap.parse_args()
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("incremental_probe", args.device)
 
     # MINOR-M33 (closed): KV-sharing models are probed normally now — the
     # reverse sweep seeds each producing layer's backward with the cotangent its

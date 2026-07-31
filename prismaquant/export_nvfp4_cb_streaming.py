@@ -1355,6 +1355,8 @@ def main(argv=None) -> None:
                          "CB targets and byte-check them (default 3, env "
                          "PRISMAQUANT_EXPORT_REUSE_VERIFY); a mismatch aborts.")
     args = ap.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("export_nvfp4_cb_streaming")
     import os
     reuse_prior = args.reuse_prior or os.environ.get(
         "PRISMAQUANT_EXPORT_REUSE_PRIOR") or None

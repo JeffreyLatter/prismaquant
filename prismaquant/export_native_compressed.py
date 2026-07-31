@@ -92,6 +92,10 @@ from .layer_config import (
     canonicalize_format,
 )
 from .model_profiles.qwen3_5 import Qwen3_5Profile
+from .layer_config import (
+    is_layer_config_meta_key as _is_layer_config_meta_key,
+    layer_config_metadata as _layer_config_metadata,
+)
 from .schemas import validate_layer_config_payload
 
 # ---------------------------------------------------------------------------
@@ -1950,13 +1954,27 @@ def _runtime_coercion_manifest_rows(
     return rows
 
 
+# The serving profile the allocator actually solved with, read out of
+# layer_config.json's reserved metadata block at load time (re-vet R11).
+_ALLOCATOR_TARGET_PROFILE: str | None = None
+
+
 def _allocator_target_profile_for_audit(profile) -> str | None:
-    # PRISMAQUANT_TARGET_PROFILE lets the pipeline audit export legality
-    # under the SAME serving profile the allocator solved with. Without it
-    # a profile whose spec default differs (hy_v3 defaults to gguf) would
-    # coerce every format the default profile doesn't serve — 2026-07-11:
-    # 226 dense FP8 Linears silently -> BF16 on the Hy3 CT export.
-    requested = os.environ.get("PRISMAQUANT_TARGET_PROFILE") or None
+    # Export must audit legality under the SAME serving profile the allocator
+    # solved with. When they differ, export coerces every format the profile
+    # it resolved does not serve — 2026-07-11: 226 dense FP8 Linears silently
+    # -> BF16 on the Hy3 CT export, because the allocator ran vllm_packed_moe
+    # while export re-resolved hy_v3's declared `gguf`.
+    #
+    # Precedence: PRISMAQUANT_TARGET_PROFILE (explicit operator override for
+    # direct exporter invocations) > the allocator's stamp in
+    # layer_config.json > the architecture spec default. The stamp travels
+    # with the artifact, so the pipeline needs no env plumbing at all.
+    requested = (
+        os.environ.get("PRISMAQUANT_TARGET_PROFILE")
+        or _ALLOCATOR_TARGET_PROFILE
+        or None
+    )
     if profile is None and requested is None:
         return None
     return resolve_target_profile(profile, requested)
@@ -2091,23 +2109,58 @@ def _production_cache_prefetch_assignment(
     assignment: dict[str, str],
     *,
     prefix: str | None = None,
+    mode: str | None = None,
 ) -> int:
+    """Prefetch this layer's rendered weights out of the production cache.
+
+    ``mode`` mirrors ``ProductionWeightCache.prefetch_assignment(require=…)``:
+    under ``require`` a cache that cannot supply the assignment is a hard
+    failure. Every failure path here used to return ``0`` and the caller only
+    logged when it prefetched something, so a TOTAL miss was invisible and the
+    export silently went NVMe-bound, tensor by tensor (re-vet R24 / debt D8).
+    """
+    mode = str(mode or _PRODUCTION_CACHE_PREFETCH_MODE or "warn").lower()
+    require = mode == "require"
+
+    def _refuse(reason: str) -> None:
+        if require:
+            raise RuntimeError(
+                f"production-cache prefetch (require): {reason}. The export "
+                "would fall back to per-tensor NVMe reads; pass "
+                "--production-cache-prefetch warn to accept that explicitly."
+            )
+
     cache = _PRODUCTION_WEIGHT_CACHE
     if cache is None or not hasattr(cache, "prefetch"):
+        _refuse("no production weight cache is installed")
         return 0
     keys: list[tuple[str, str]] = []
+    quantized = 0
     for qname, fmt in assignment.items():
         if prefix is not None and not (qname == prefix or qname.startswith(prefix + ".")):
             continue
         cache_fmt = str(fmt).upper()
         if _canonical_export_format(cache_fmt) == "BF16":
             continue
+        quantized += 1
         key = _production_cache_lookup_key(qname, cache_fmt)
         if key is not None:
             keys.append(key)
     if not keys:
+        # No quantized entries under this prefix is legitimate (an all-BF16
+        # layer); quantized entries with no cache keys is a total miss.
+        if quantized:
+            _refuse(
+                f"{quantized} quantized entries under prefix {prefix!r} "
+                "resolved to zero production-cache keys"
+            )
         return 0
-    return int(cache.prefetch(keys, max_workers=_PRODUCTION_CACHE_PREFETCH_WORKERS))
+    loaded = int(cache.prefetch(keys, max_workers=_PRODUCTION_CACHE_PREFETCH_WORKERS))
+    if loaded == 0:
+        _refuse(
+            f"{len(keys)} cache keys under prefix {prefix!r} loaded nothing"
+        )
+    return loaded
 
 
 @contextmanager
@@ -2373,6 +2426,9 @@ _INLINE_EXPERT_GPTQ = (
 )
 _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
+# "require" | "warn" (D8). run-pipeline.sh passes require on the native
+# lane, matching VALIDATED_SOURCE_PREFETCH=require.
+_PRODUCTION_CACHE_PREFETCH_MODE = "warn"
 
 
 def _packed_expert_render_hist_label(
@@ -7959,6 +8015,7 @@ def main():
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
     global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
     global _PRODUCTION_CACHE_PREFETCH_WORKERS, _NVFP4_SCALE_RULE
+    global _PRODUCTION_CACHE_PREFETCH_MODE, _ALLOCATOR_TARGET_PROFILE
     _refuse_archived_block_output_match()
     _INPUT_GLOBAL_SCALES = None
     _CACHED_ACTIVATIONS = None
@@ -8017,6 +8074,13 @@ def main():
                          "current layer into this LRU.")
     ap.add_argument("--production-cache-prefetch-workers", type=int, default=4,
                     help="Thread count for production-cache prefetch.")
+    ap.add_argument("--production-cache-prefetch",
+                    choices=("require", "warn"), default="warn",
+                    help="`require` fails the export when the production "
+                         "cache cannot supply a layer's assignment instead of "
+                         "silently falling back to per-tensor NVMe reads "
+                         "(re-vet R24/D8). run-pipeline.sh passes require on "
+                         "the native lane; the bare-CLI default stays warn.")
     ap.add_argument("--perturbed-x-dir", default=None,
                     help="Directory containing final_layer_config.json and "
                          "activation cache files from a prior production "
@@ -8128,6 +8192,8 @@ def main():
         _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
             1, int(args.production_cache_prefetch_workers)
         )
+        _PRODUCTION_CACHE_PREFETCH_MODE = str(
+            args.production_cache_prefetch or "warn").lower()
         expected_keys, missing_keys = _production_cache_expected_keys(
             _assignment_for_cache
         )
@@ -8259,7 +8325,8 @@ def main():
             with open(args.layer_config) as _lc:
                 _recipe_payload = json.load(_lc)
             validate_layer_config_payload(_recipe_payload, args.layer_config)
-            _recipe_names = list(_recipe_payload.keys())
+            _recipe_names = [n for n in _recipe_payload.keys()
+                             if not _is_layer_config_meta_key(n)]
             idx = ActivationIndex(cache_dir, _recipe_names)
             _ACTIVATION_CACHE_FINGERPRINT = _activation_index_fingerprint(
                 idx, cache_dir)
@@ -8303,6 +8370,11 @@ def main():
     with open(args.layer_config) as f:
         raw_recipe = json.load(f)
     validate_layer_config_payload(raw_recipe, args.layer_config)
+    _allocator_meta = _layer_config_metadata(raw_recipe)
+    if _allocator_meta.get("target_profile"):
+        _ALLOCATOR_TARGET_PROFILE = str(_allocator_meta["target_profile"])
+        print(f"[export] allocator target profile (from layer_config): "
+              f"{_ALLOCATOR_TARGET_PROFILE}", flush=True)
     assignment = _canonicalize_assignment(raw_recipe)
     assignment, runtime_coerced = _coerce_runtime_legal_assignment(
         args.model,

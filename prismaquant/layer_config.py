@@ -19,6 +19,32 @@ def strip_weight(name: str) -> str:
     return name[:-len(".weight")] if name.endswith(".weight") else name
 
 
+# Reserved non-tensor key in layer_config.json. No module qname can collide
+# with it (dunder-wrapped, no dots), so allocator metadata can travel WITH the
+# assignment instead of in a side report the exporter never reads (re-vet R11 /
+# debt D4: the allocator resolved `vllm_packed_moe` while export re-resolved
+# `gguf` from the spec, silently coercing 226 Hy3 FP8 Linears to BF16).
+LAYER_CONFIG_META_KEY = "__prismaquant__"
+
+
+def is_layer_config_meta_key(name: str) -> bool:
+    return str(name) == LAYER_CONFIG_META_KEY
+
+
+def layer_config_metadata(payload: Mapping) -> dict:
+    """Return the reserved metadata block of a layer_config payload."""
+    meta = payload.get(LAYER_CONFIG_META_KEY) if isinstance(payload, Mapping) else None
+    return dict(meta) if isinstance(meta, Mapping) else {}
+
+
+def read_layer_config_metadata(path: str | Path) -> dict:
+    try:
+        payload = json.loads(Path(path).read_text())
+    except Exception:
+        return {}
+    return layer_config_metadata(payload) if isinstance(payload, Mapping) else {}
+
+
 # GGUF k-quant + IQ lane (llama.cpp / vLLM-GGUF serving). Kept as an explicit
 # literal so this module stays torch-free; pinned to gguf_formats.GGUF_BLOCK_BYTES
 # by test_gguf_formats.test_layer_config_gguf_names_stay_in_sync.
@@ -131,6 +157,7 @@ def canonicalize_assignment(raw: Mapping) -> dict[str, str]:
     return {
         strip_weight(str(name)): canonicalize_format(entry)
         for name, entry in raw.items()
+        if not is_layer_config_meta_key(name)
     }
 
 

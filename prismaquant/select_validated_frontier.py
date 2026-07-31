@@ -9,7 +9,12 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from prismaquant import format_registry as fr
-from prismaquant.layer_config import canonicalize_format
+from prismaquant.layer_config import (
+    LAYER_CONFIG_META_KEY,
+    canonicalize_format,
+    is_layer_config_meta_key,
+    read_layer_config_metadata,
+)
 from prismaquant.saturation_select import find_saturation_bpp
 
 
@@ -70,7 +75,7 @@ def _load_assignment(path: str | Path) -> dict[str, str]:
             else canonicalize_format(fmt)
         )
         for name, fmt in raw.items()
-        if str(name).strip()
+        if str(name).strip() and not is_layer_config_meta_key(name)
     }
 
 
@@ -177,6 +182,36 @@ def _row_metric(row: Mapping, metric: str) -> float | None:
     return None
 
 
+def _artifact_bytes_for_row(row: Mapping) -> int | None:
+    """Exact artifact bytes for a measured row, or None when unpriced.
+
+    Prefers a value already on the row; otherwise reads `artifact_bytes` out
+    of the allocator's Pareto assignment payload at `row["path"]` (stamped by
+    `allocator.py` from `footprint.assignment_artifact_bytes`, the same
+    accounting the allocator's own byte-budget selector uses).
+    """
+    direct = row.get("artifact_bytes")
+    if direct is not None:
+        try:
+            return int(direct)
+        except (TypeError, ValueError):
+            return None
+    path = row.get("path")
+    if not path:
+        return None
+    try:
+        payload = _load_json(path)
+    except Exception:
+        return None
+    value = payload.get("artifact_bytes") if isinstance(payload, Mapping) else None
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def measured_rows(
     results: Sequence[Mapping],
     *,
@@ -212,6 +247,11 @@ def measured_rows(
                 if row.get("surrogate_loss") is not None
                 else (row.get("mse") or {}).get("predicted_dloss_sum")
             ),
+            # Exact exported footprint (re-vet R1). validate_assignments_kl
+            # does not emit it; the allocator stamps it into the Pareto
+            # assignment payload the row points at, so the byte budget is
+            # readable by the selector that owns the ship decision.
+            "artifact_bytes": _artifact_bytes_for_row(row),
             "kl_repeats": list(row.get("kl_repeats", []) or []),
             "kl_std": row.get("kl_std"),
             "kl_stderr": row.get("kl_stderr"),
@@ -569,6 +609,7 @@ def select_frontier_point(
     tail_veto: str | None = None,
     tail_eta: float = 0.0,
     vetoed: list | None = None,
+    budget_bytes: float | None = None,
 ) -> tuple[dict, list[dict]]:
     rows = measured_rows(results, metric=metric)
     frontier = _frontier_from_rows(
@@ -580,7 +621,32 @@ def select_frontier_point(
     )
     if not frontier:
         raise ValueError("no finite measured KL/bpp points found")
-    if mode == "best-kl":
+    if mode == "budget":
+        # Byte budget = constraint, measured KL = objective (re-vet R1). The
+        # frontier is the KL lower envelope and bytes are monotone in bpp, so
+        # the min-KL fitting FRONTIER row is the min-KL fitting row overall.
+        if budget_bytes is None:
+            raise ValueError("--mode budget requires a byte budget "
+                             "(--target-disk-gb)")
+        unpriced = [row["label"] for row in frontier
+                    if row.get("artifact_bytes") is None]
+        if unpriced:
+            raise ValueError(
+                "--mode budget needs exact artifact bytes on every frontier "
+                f"row; {len(unpriced)} are unpriced (e.g. {unpriced[:3]}). "
+                "Re-run the allocator so it stamps artifact_bytes into the "
+                "Pareto assignment payloads.")
+        fitting = [i for i, row in enumerate(frontier)
+                   if float(row["artifact_bytes"]) <= float(budget_bytes)]
+        if not fitting:
+            cheapest = min(float(row["artifact_bytes"]) for row in frontier)
+            raise ValueError(
+                f"no measured allocation fits the {budget_bytes / 1e9:.3f}GB "
+                f"budget; the cheapest measured artifact is "
+                f"{cheapest / 1e9:.3f}GB. Raise the budget or widen the "
+                "format menu.")
+        idx = min(fitting, key=lambda i: (frontier[i]["kl"], -frontier[i]["bpp"]))
+    elif mode == "best-kl":
         idx = min(range(len(frontier)), key=lambda i: (frontier[i]["kl"], frontier[i]["bpp"]))
     elif mode == "saturation":
         idx, _sat = _saturation_pick(frontier, sat_z)
@@ -634,9 +700,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--validation-json", required=True)
     parser.add_argument(
         "--mode",
-        choices=("kneedle", "best-kl", "lowest-bpp", "practical-knee", "saturation"),
+        choices=("kneedle", "best-kl", "lowest-bpp", "practical-knee",
+                 "saturation", "budget"),
         default="kneedle",
-        help="Frontier pick. 'saturation' = unconstrained bit-rate selector: "
+        help="Frontier pick. 'budget' = min measured KL among the rows whose "
+             "EXACT exported footprint fits --target-disk-gb (re-vet R1: the "
+             "card is the constraint, measured KL is the objective). "
+             "'saturation' = unconstrained bit-rate selector: "
              "lowest bpp whose KL is within --sat-z stderr of the high-bpp "
              "asymptote (needs a real per-bpp stderr, i.e. validate with "
              "--calib-repeats>=4). 'kneedle' is axis-dependent and a diagnostic "
@@ -677,10 +747,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("keep-kneedle", "best-kl", "practical-knee"),
         default="keep-kneedle",
     )
+    parser.add_argument(
+        "--target-disk-gb", type=float, default=None,
+        help="Byte budget in decimal GB. Required by --mode budget; ignored "
+             "by the other picks (recorded in the summary either way).")
     parser.add_argument("--output-layer-config", required=True)
     parser.add_argument("--output-assignment", required=True)
     parser.add_argument("--output-summary", required=True)
     args = parser.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("select_validated_frontier")
 
     payload = _load_json(args.validation_json)
     results = payload.get("results") if isinstance(payload, Mapping) else None
@@ -702,6 +778,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         tail_veto=tail_veto,
         tail_eta=args.tail_eta,
         vetoed=vetoed_rows,
+        budget_bytes=(None if args.target_disk_gb is None
+                      else float(args.target_disk_gb) * 1e9),
     )
     saturation = None
     if args.mode == "saturation":
@@ -741,6 +819,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     layer_config = _layer_config_from_assignment(assignment)
 
     layer_config_path = Path(args.output_layer_config)
+    # This stage OVERWRITES the allocator's layer_config.json, so it must carry
+    # the allocator's reserved metadata forward — the exporter reads the
+    # resolved serving profile from there (re-vet R11), and dropping it would
+    # re-open the allocator/export profile split this run just closed.
+    carried = read_layer_config_metadata(layer_config_path)
+    if carried:
+        carried = dict(carried)
+        carried["selected_by"] = f"validated_frontier:{args.mode}"
+        carried["selected_label"] = selected.get("label")
+        carried["selected_achieved_bits"] = selected.get("bpp")
+        layer_config[LAYER_CONFIG_META_KEY] = carried
     layer_config_path.parent.mkdir(parents=True, exist_ok=True)
     layer_config_path.write_text(json.dumps(layer_config, indent=2, sort_keys=True) + "\n")
 
@@ -758,6 +847,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema": "prismaquant.validated_frontier_selection.v1",
         "validation_json": str(Path(args.validation_json)),
         "selection_mode": args.mode,
+        "target_disk_gb": args.target_disk_gb,
+        "selected_artifact_bytes": selected.get("artifact_bytes"),
         "metric": args.metric,
         "selected": selected,
         "frontier": frontier,

@@ -337,7 +337,10 @@ def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
     names = emitted.get("assignment", emitted)
     assert names
     # Layer-config entries are rich dicts (AutoRound schema); canonicalize each.
-    chosen = {lcfg.canonicalize_format(v) for v in names.values()}
+    # `__prismaquant__` is the reserved allocator-metadata block (R11), not a
+    # tensor entry.
+    chosen = {lcfg.canonicalize_format(v) for k, v in names.items()
+              if not lcfg.is_layer_config_meta_key(k)}
     assert chosen <= _canon() | {"BF16"}, f"off-menu format chosen: {chosen}"
     assert any(c.startswith(("NVFP4_CB", "FP8_CB")) for c in chosen), (
         f"mixed menu produced no CB rung: {chosen}")

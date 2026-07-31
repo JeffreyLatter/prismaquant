@@ -81,6 +81,16 @@ from .streaming_model import (
 # ---------------------------------------------------------------------------
 # Per-shard pickle merge helpers (unchanged public API vs. prior version)
 # ---------------------------------------------------------------------------
+# The pipeline COST_MODE this table was produced under (re-vet R2 precondition
+# (i)). `cost.pkl` is the same path under every mode, so without this stamp a
+# re-run silently allocates on the previous mode's estimator.
+_PIPELINE_COST_MODE = ""
+
+
+def _cost_mode_provenance() -> dict:
+    return {"cost_mode": _PIPELINE_COST_MODE} if _PIPELINE_COST_MODE else {}
+
+
 def merge_cost_pickles(paths: list[Path], output_path: Path):
     merged_costs = {}
     merged_formats = None
@@ -113,6 +123,7 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
         pickle.dump({
             "costs": merged_costs,
             "formats": merged_formats or [],
+            "provenance": _cost_mode_provenance(),
             "meta": {
                 "incremental": True,
                 "n_shards": len(paths),
@@ -564,6 +575,7 @@ def _run_body_cost_shard(
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": _cost_mode_provenance(),
             "meta": {
                 "model": model_name,
                 "probe": probe_path,
@@ -932,6 +944,11 @@ def _run_visual_cost_shard(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
+    ap.add_argument("--cost-mode", default="",
+                    help="Pipeline COST_MODE this table is produced under; "
+                         "stamped into provenance['cost_mode'] so a re-run "
+                         "cannot silently reuse another mode's table "
+                         "(re-vet R2).")
     ap.add_argument("--probe", required=True)
     ap.add_argument("--activation-cache-dir", required=True)
     ap.add_argument("--output", required=True)
@@ -979,6 +996,10 @@ def main():
                          "Fisher row-weighted fisher_output_mse alongside "
                          "weight_mse in cost.pkl.")
     args = ap.parse_args()
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("incremental_measure_quant_cost", args.device)
+    global _PIPELINE_COST_MODE
+    _PIPELINE_COST_MODE = str(getattr(args, "cost_mode", "") or "")
 
     n_layers = load_num_hidden_layers(args.model)
     start = max(0, args.start_layer)

@@ -950,6 +950,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Empirical packed-MoE expert cost (+ hybrid merge)")
     p.add_argument("--model", required=True)
+    p.add_argument("--cost-mode", default="",
+                   help="Pipeline COST_MODE stamped into "
+                        "provenance['cost_mode'] (re-vet R2).")
     p.add_argument("--output", required=True)
     p.add_argument(
         "--formats", default="NVFP4,FP8_DYNAMIC,BF16",

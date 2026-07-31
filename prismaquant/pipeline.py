@@ -1,9 +1,11 @@
 """Typed pipeline, artifact, resource, and gate contracts.
 
-This module is intentionally descriptive first.  It lets existing PrismaQuant
-stages advertise their inputs, outputs, gates, and cache ownership without
-replacing the production implementations.  Execution stays in the current
-GPU-bound probe/cache/export paths until call sites opt into these contracts.
+This module is descriptive about stage *shape* and authoritative about one
+thing: **which settings each build artifact's identity is keyed on** (re-vet
+R5).  ``run-pipeline.sh`` executes; this module decides what a reuse of
+``cost.pkl`` (or a 90 GB production cache) is allowed to mean.  Everything
+else here — the artifact/stage/gate declarations — remains a documented view
+of the production flow, not an executor (re-vet R23: no python port).
 """
 from __future__ import annotations
 
@@ -18,12 +20,332 @@ from typing import Any
 
 APPROVED_RESOURCE_OWNERS: dict[str, frozenset[str]] = {
     "rendered_weights": frozenset({"ProductionWeightCache"}),
-    "perturbed_activations": frozenset({
-        "PerturbedActivationCache",
-        "StreamingActivationCache",
-    }),
-    "streaming_model_weights": frozenset({"StreamingModelPrefetch"}),
+    "perturbed_activations": frozenset({"PerturbedActivationCache"}),
+    # layer_streaming.LayerCache is the real streaming-weight owner
+    # (layer_streaming.py:1253). The former placeholder names
+    # (StreamingActivationCache / StreamingModelPrefetch) were never
+    # implemented anywhere in the tree and were deleted with re-vet R5/D10.
+    "streaming_model_weights": frozenset({"LayerCache"}),
 }
+
+
+# ---------------------------------------------------------------------------
+# Settings-hash authority (re-vet R5 / debt D6).
+#
+# `run-pipeline.sh`'s `require_stage_settings` used to hand-pass `k=v` pairs at
+# each call site, which meant every new stage arrived with its own opinion of
+# what keys its artifact depends on — and ten stages arrived with none at all.
+# The key SET now lives here, in one reviewable table, and the shell only
+# supplies values.
+#
+# Declaring a key means "a change to this setting makes the stored artifact a
+# DIFFERENT artifact". Over-keying is the named risk: hashing a setting an
+# artifact does not depend on forces a spurious rebuild, and some of these
+# artifacts are 90 GB. The rule used below: key an artifact on the inputs that
+# change its BYTES, and key expensive artifacts conservatively.
+#
+# Each entry is (manifest_key, settings_source). They differ where a stage
+# historically recorded a short manifest key (`NS`) for a specific setting
+# (`PRODUCTION_RENDER_COST_NSAMPLES`); keeping the historical manifest key
+# means artifacts built before R5 stay valid instead of forcing a rebuild.
+# ---------------------------------------------------------------------------
+
+STAGE_SETTINGS_SCHEMA = "prismaquant.stage_settings/1"
+STAGE_MANIFEST_SCHEMA = "prismaquant.stage_settings_manifest/2"
+
+# Render-affecting environment, shared by every artifact that stores rendered
+# weights. Mirrors RENDER_ENV_SETTINGS in run-pipeline.sh.
+_RENDER_SETTINGS: tuple[str, ...] = (
+    "PRISMAQUANT_NVFP4_SCALE_RULE",
+    "PRISMAQUANT_GPTQ_DAMP_SWEEP",
+    "PRISMAQUANT_GPTQ_DAMP",
+    "PRISMAQUANT_ACT_CLIP_QUANTILE",
+    "PRODUCTION_CACHE_LEVERS",
+    "PRODUCTION_CACHE_DISABLE_LEVERS",
+)
+
+
+def _key_pairs(*specs: str) -> tuple[tuple[str, str], ...]:
+    """``"NS<-PRODUCTION_RENDER_COST_NSAMPLES"`` -> ``("NS", "PRODUCTION_…")``."""
+    out: list[tuple[str, str]] = []
+    for spec in specs:
+        if "<-" in spec:
+            manifest_key, source = spec.split("<-", 1)
+            out.append((manifest_key.strip(), source.strip()))
+        else:
+            out.append((spec.strip(), spec.strip()))
+    return tuple(out)
+
+
+STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
+    # --- probe / cost ------------------------------------------------------
+    # The Fisher trace is a function of (model, calibration corpus, window
+    # count/length, modality). NOT of FORMATS: the probe is format-blind.
+    "probe": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "CALIBRATION_MODALITY",
+    ),
+    # Per-(Linear, format) baseline error. Adds FORMATS; drops modality
+    # (the cost stage reads the probe's activation cache, whose modality the
+    # probe guard already pins).
+    "base-cost": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "FORMATS",
+    ),
+    # production-render-score: the rendered format-menu cache the score reads.
+    "render-cost-cache": _key_pairs(
+        "MODEL_PATH", "DATASET", "FORMATS",
+        "NS<-PRODUCTION_RENDER_COST_NSAMPLES",
+        "SL<-PRODUCTION_RENDER_COST_SEQLEN",
+        "SEED<-PRODUCTION_RENDER_COST_SEED",
+        *_RENDER_SETTINGS,
+    ),
+    # …and the allocator cost table synthesized from it. Cheap to rebuild, so
+    # it carries the score field and the require-flags too.
+    "render-cost": _key_pairs(
+        "MODEL_PATH", "FORMATS", "COST_MODE",
+        "SCORE_FIELD<-PRODUCTION_RENDER_COST_SCORE_FIELD",
+        "REQUIRE_SCORES<-PRODUCTION_RENDER_COST_REQUIRE_SCORES",
+        "REQUIRE_OUTPUT<-PRODUCTION_RENDER_COST_REQUIRE_OUTPUT",
+    ),
+    # AURA dW cache. FORMATS is the derived non-BF16 menu (AURA_CACHE_FORMATS);
+    # SELECTION_MODE is keyed because validated-surrogate redirects this cache
+    # to the frontier path and renders packed experts into it.
+    "aura-dw-cache": _key_pairs(
+        "MODEL_PATH", "DATASET",
+        "FORMATS<-AURA_CACHE_FORMATS",
+        "NS<-NSAMPLES", "SL<-SEQLEN", "SELECTION_MODE",
+        *_RENDER_SETTINGS,
+    ),
+    "aura-cost": _key_pairs(
+        "MODEL_PATH", "DATASET", "FORMATS", "COST_MODE",
+        "NPROBES<-AURA_COST_NPROBES",
+        "NS<-AURA_COST_NSAMPLES",
+        "SL<-AURA_COST_SEQLEN",
+        "SEED<-AURA_COST_CALIB_SEED",
+        "DTYPE<-AURA_COST_DTYPE",
+    ),
+    "aura-hybrid-cost": _key_pairs(
+        "MODEL_PATH", "DATASET", "FORMATS", "COST_MODE",
+        "EXPERT_NS<-AURA_EXPERT_NSAMPLES",
+        "EXPERT_SL<-AURA_EXPERT_SEQLEN",
+    ),
+    # --- CB lane -----------------------------------------------------------
+    # The imatrix harvest reads the probe's activation cache; key it on what
+    # produced that cache. Minutes to rebuild, so keying is generous.
+    "cb-col-weights": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "ACTIVATION_ROWS_LIMIT",
+    ),
+    "cb-hybrid-cost": _key_pairs(
+        "MODEL_PATH", "FORMATS", "COST_MODE",
+        "EXPERT_NS<-CB_EXPERT_NSAMPLES",
+        "EXPERT_SL<-CB_EXPERT_SEQLEN",
+        "EXPERT_SAMPLE<-CB_EXPERT_SAMPLE",
+        "LADDER_INTERP<-CB_LADDER_INTERP",
+    ),
+    # --- production caches -------------------------------------------------
+    "frontier-cache": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
+        "FORMATS<-CACHE_FORMATS",
+        *_RENDER_SETTINGS,
+    ),
+    "frontier-recache": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
+        *_RENDER_SETTINGS,
+    ),
+    "production-cache-recached": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "FORMATS", "TARGET_BITS",
+        "ASSIGNMENT_DIGEST",
+        *_RENDER_SETTINGS,
+    ),
+    "production-cache-raw": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
+        "FORMATS<-CACHE_FORMATS", "ASSIGNMENT_DIGEST",
+        "RENDER_SCOPE<-PRODUCTION_CACHE_RENDER_SCOPE",
+        *_RENDER_SETTINGS,
+    ),
+    # --- validated frontier ------------------------------------------------
+    # One JSON per Pareto point; the point's identity is in the filename, so
+    # the manifest keys the measurement conditions and the render env behind
+    # the weights being measured.
+    "frontier-kl-point": _key_pairs(
+        "MODEL_PATH", "FORMATS",
+        "DATASET<-VALIDATED_FRONTIER_DATASET",
+        "NS<-VALIDATED_FRONTIER_NSAMPLES",
+        "SL<-VALIDATED_FRONTIER_SEQLEN",
+        "REPEATS<-VALIDATED_FRONTIER_CALIB_REPEATS",
+        "SKIP_CALIB<-VALIDATED_FRONTIER_CALIB_SKIP_FIRST",
+        "KL_SCOPE<-VALIDATED_FRONTIER_KL_SCOPE",
+        *_RENDER_SETTINGS,
+    ),
+    # --- GGUF lane ---------------------------------------------------------
+    # llama.cpp's converter reads only the checkpoint.
+    "gguf-skeleton": _key_pairs("MODEL_PATH"),
+}
+
+
+def parse_settings(pairs: Iterable[str]) -> dict[str, str]:
+    """Parse ``K=V`` strings into a settings mapping (later wins)."""
+    out: dict[str, str] = {}
+    for raw in pairs:
+        if not raw:
+            continue
+        if "=" not in raw:
+            raise ValueError(f"setting {raw!r} is not K=V")
+        key, value = raw.split("=", 1)
+        out[key.strip()] = value
+    return out
+
+
+def stage_settings_projection(
+    stage: str,
+    settings: Mapping[str, str],
+) -> tuple[dict[str, str], list[str]]:
+    """Project ``settings`` onto ``stage``'s declared key set.
+
+    Returns ``(manifest_key -> value, unresolved_source_names)``.
+    """
+    try:
+        keys = STAGE_SETTINGS_KEYS[stage]
+    except KeyError:
+        raise KeyError(
+            f"unknown settings-hash stage {stage!r}; declare it in "
+            "pipeline.STAGE_SETTINGS_KEYS (known: "
+            f"{sorted(STAGE_SETTINGS_KEYS)})"
+        ) from None
+    projection: dict[str, str] = {}
+    unresolved: list[str] = []
+    for manifest_key, source in keys:
+        if source in settings:
+            projection[manifest_key] = str(settings[source])
+        else:
+            unresolved.append(source)
+    return projection, unresolved
+
+
+def stage_settings_document(settings: Mapping[str, str]) -> dict[str, Any]:
+    """Emit the per-artifact key sets, already projected onto ``settings``."""
+    artifacts: dict[str, dict[str, str]] = {}
+    unresolved: dict[str, list[str]] = {}
+    for stage in STAGE_SETTINGS_KEYS:
+        projection, missing = stage_settings_projection(stage, settings)
+        artifacts[stage] = projection
+        if missing:
+            unresolved[stage] = missing
+    return {
+        "schema": STAGE_SETTINGS_SCHEMA,
+        "artifacts": artifacts,
+        "unresolved": unresolved,
+    }
+
+
+def _load_stage_manifest(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: settings manifest is not a JSON object")
+    if payload.get("schema") == STAGE_MANIFEST_SCHEMA:
+        return payload
+    # Pre-R5 manifests are a flat {manifest_key: value} dict written by one
+    # anonymous stage. Keep them under "legacy" so upgrading the file never
+    # drops the guard that was already there.
+    return {
+        "schema": STAGE_MANIFEST_SCHEMA,
+        "stages": {},
+        "legacy": {str(k): str(v) for k, v in payload.items()},
+    }
+
+
+def check_stage_settings(
+    artifact: str | Path,
+    stage: str,
+    document: Mapping[str, Any],
+    *,
+    overrides: Mapping[str, str] | None = None,
+) -> tuple[int, list[str]]:
+    """Guard one skip-if-exists artifact. Returns ``(exit_code, messages)``.
+
+    * artifact absent -> record this stage's projection, exit 0.
+    * artifact present with a matching recorded projection -> exit 0.
+    * artifact present, projection differs -> exit 2, naming every diff.
+    * artifact present, this stage never recorded -> WARN and record
+      (trust-on-first-use: artifacts predating a stage's guard are not
+      invalidated, which is the pre-R5 contract for missing manifests).
+    """
+    declared = dict((document.get("artifacts") or {}).get(stage) or {})
+    unresolved = list((document.get("unresolved") or {}).get(stage) or [])
+    if overrides:
+        extra, still_missing = stage_settings_projection(stage, overrides)
+        declared.update(extra)
+        unresolved = [name for name in unresolved if name not in overrides]
+    if unresolved:
+        return 2, [
+            f"[pipeline] ERROR: {stage}: settings-hash key(s) "
+            f"{sorted(set(unresolved))} were declared in "
+            "pipeline.STAGE_SETTINGS_KEYS but no value was supplied by "
+            "run-pipeline.sh; the guard refuses to hash a partial key set.",
+        ]
+
+    artifact_path = Path(artifact)
+    manifest_path = Path(f"{artifact_path}.settings.json")
+    messages: list[str] = []
+
+    if artifact_path.exists():
+        if not manifest_path.exists():
+            return 0, [
+                f"[pipeline] WARNING: {stage}: reusing {artifact_path} which "
+                "has no settings manifest (predates the settings-hash guard); "
+                "cannot verify it matches the current settings",
+            ]
+        stored = _load_stage_manifest(manifest_path)
+        prev = (stored.get("stages") or {}).get(stage)
+        if prev is None:
+            legacy = stored.get("legacy")
+            if isinstance(legacy, Mapping) and set(legacy) == set(declared):
+                prev = dict(legacy)
+        if prev is None:
+            messages.append(
+                f"[pipeline] WARNING: {stage}: {artifact_path} predates this "
+                "stage's settings guard; recording the current settings "
+                "instead of invalidating it"
+            )
+            _record_stage_settings(manifest_path, stage, declared)
+            return 0, messages
+        diffs = {
+            key: (prev.get(key), declared.get(key))
+            for key in sorted(set(prev) | set(declared))
+            if prev.get(key) != declared.get(key)
+        }
+        if diffs:
+            messages.append(
+                f"[pipeline] ERROR: {stage}: {artifact_path} was built under "
+                "DIFFERENT settings; refusing silent reuse:"
+            )
+            for key, (was, now) in diffs.items():
+                messages.append(f"    {key}: artifact={was!r}  current={now!r}")
+            messages.append(
+                f"    -> delete {artifact_path} (and its .settings.json) to "
+                "rebuild, or restore the original settings"
+            )
+            return 2, messages
+        return 0, messages
+
+    _record_stage_settings(manifest_path, stage, declared)
+    return 0, messages
+
+
+def _record_stage_settings(
+    manifest_path: Path,
+    stage: str,
+    projection: Mapping[str, str],
+) -> None:
+    if manifest_path.exists():
+        payload = _load_stage_manifest(manifest_path)
+    else:
+        payload = {"schema": STAGE_MANIFEST_SCHEMA, "stages": {}}
+    stages = dict(payload.get("stages") or {})
+    stages[stage] = dict(projection)
+    payload["stages"] = stages
+    payload["schema"] = STAGE_MANIFEST_SCHEMA
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, indent=1, sort_keys=True) + "\n")
 
 
 @dataclass(frozen=True)
@@ -889,7 +1211,7 @@ def default_production_pipeline_spec(
             outputs=("probe_stats",),
             resources=(ResourceContract(
                 resource="streaming_model_weights",
-                owner="StreamingModelPrefetch",
+                owner="LayerCache",
                 residency="required",
             ),),
             tags=("probe", "gpu_bound"),
@@ -901,7 +1223,7 @@ def default_production_pipeline_spec(
             outputs=("quant_costs",),
             resources=(ResourceContract(
                 resource="streaming_model_weights",
-                owner="StreamingModelPrefetch",
+                owner="LayerCache",
                 residency="required",
             ),),
             tags=("cost", "gpu_bound"),
@@ -1128,7 +1450,56 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="List registered opt-in pipeline components and exit.",
     )
+    ap.add_argument(
+        "--setting",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="A pipeline setting value. Consumed by --write-stage-settings "
+             "(projected onto each artifact's declared key set) and by "
+             "--check-stage-settings (late-computed overrides).",
+    )
+    ap.add_argument(
+        "--write-stage-settings",
+        metavar="PATH",
+        help="Write the per-artifact settings-hash key sets, already "
+             "projected onto --setting values, to PATH (re-vet R5).",
+    )
+    ap.add_argument(
+        "--check-stage-settings",
+        action="store_true",
+        help="Guard one skip-if-exists artifact against its recorded "
+             "settings. Requires --stage-settings/--artifact/--stage.",
+    )
+    ap.add_argument("--stage-settings", metavar="PATH", default=None,
+                    help="Path written by --write-stage-settings.")
+    ap.add_argument("--artifact", metavar="PATH", default=None)
+    ap.add_argument("--stage", metavar="ID", default=None)
     args = ap.parse_args(argv)
+
+    if args.check_stage_settings:
+        if not (args.stage_settings and args.artifact and args.stage):
+            print("[pipeline] ERROR: --check-stage-settings needs "
+                  "--stage-settings, --artifact and --stage")
+            return 2
+        document = json.loads(Path(args.stage_settings).read_text())
+        code, messages = check_stage_settings(
+            args.artifact,
+            args.stage,
+            document,
+            overrides=parse_settings(args.setting),
+        )
+        for message in messages:
+            print(message, flush=True)
+        return code
+
+    if args.write_stage_settings:
+        document = stage_settings_document(parse_settings(args.setting))
+        out = Path(args.write_stage_settings)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(document, indent=1, sort_keys=True) + "\n")
+        print(f"[pipeline-spec] wrote {out}")
+        return 0
 
     if args.list_components:
         for component in registered_pipeline_components().values():

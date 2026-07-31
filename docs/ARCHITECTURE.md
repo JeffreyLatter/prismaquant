@@ -2,7 +2,8 @@
 
 As of: 2026-07-30 · branch `claude/docs-consolidation` · verified against merge `8f14400`
 (= NVFP4-CB lane + `origin/main`'s 54-commit allocator/release stack) plus the same-day
-cleanup/fix batch committed with this document
+cleanup/fix batch and the three architecture re-vet waves committed with this document
+(wave 3: R1/R2(i)/R5/R6/R11/R24 — §3.4, §3.6, §4.6, §8.5 L1, and D4/D6/D8/D9/D10/D12 closed)
 
 **Prime directive:** the code is the authority. Where this document and the tree disagree, the
 document is wrong — fix it, or record the divergence in §12; never propagate it.
@@ -298,76 +299,142 @@ Line refs are `run-pipeline.sh` unless stated. Artifact paths are relative to `$
 
 | # | Stage | Script | Artifact(s) | Reuse guard | Mode/lane gate |
 |---|---|---|---|---|---|
-| **1/4** | Sensitivity probe — per-Linear empirical Fisher `h_trace`, body + MTP in one pass; tied heads materialized and excluded, KV-sharing cotangents grafted (§7.5) | `prismaquant.incremental_probe` (`544-560`) | `artifacts/probe.pkl`; activations → `act/`; shards → `work/`; `logs/probe.log` | settings-hash (`539`); reuse also re-checks stored `calibration_modality` (`568-598`) | — |
-| **2/4** | Baseline per-(Linear,format) RTN cost | `prismaquant.incremental_measure_quant_cost` (`645-658`) | `artifacts/cost.pkl` (`COST_MODE=local`) or `artifacts/cost_baseline.pkl` (`314-380`); `logs/cost.log` | settings-hash (`606`) | — |
-| **2a-CB** | imatrix column-weight harvest | inline → `export_gguf.build_imatrix_from_act_cache` + `moe_imatrix.synthesize_packed_expert_col_weights` (`617-643`) | `artifacts/cb_col_weights.pkl` | bare skip (`620`) | CB lane, `CB_EXPERT_EMPIRICAL≠1` |
-| **2b/4** | Format-menu production render for allocator cost | `build_production_cache --render-scope format-menu` (`672-686`) | `artifacts/production_render_score_cache.pkl` + `…_weight_cache/` | settings-hash (`666`) | `production-render-score` |
-| **2c/4** | Synthesize allocator cost from render scores | `prismaquant.production_render_cost` (`704-711`) | `artifacts/cost.pkl` | **bare skip** (`690`) | `production-render-score` |
-| **2b/4** | Format-menu cache for AURA dW | `build_production_cache … --render-scope format-menu` (`857-871`) | frontier cache under validated-surrogate, else `production_render_score_cache.pkl` (`366-378`) | settings-hash (`851`) | `aura`; `exit 2` if the menu is BF16-only (`847-850`) |
-| **2c/4** | AURA downstream-KL-adjoint cost | `prismaquant.aura_cost` (`881-900`) | `artifacts/cost_aura.pkl` | **bare skip** (`879`) | `aura` |
-| **2d/4** | Hybrid finalize: empirical packed-expert unit-KL + sidecar backfill | `prismaquant.expert_empirical_cost --merge-base --backfill-base` (`920-929`) or inline backfill (`932-952`) | `artifacts/cost.pkl` | **bare skip** (`909`) | `aura` |
-| **2d-CB** | CB hybrid: replace packed-expert rows with empirical unit-KL | col-weight harvest (`985-1008`) → `expert_empirical_cost --replace-experts --col-weights` (`1024-1035`) | `artifacts/cost_local_raw.pkl`, `artifacts/cost.pkl`, `cb_col_weights.pkl` | provenance probe on `cost.pkl` (`971-981`); col-weights bare skip (`985`) | CB lane, `CB_EXPERT_EMPIRICAL=1` (default) |
+| **1/4** | Sensitivity probe — per-Linear empirical Fisher `h_trace`, body + MTP in one pass; tied heads materialized and excluded, KV-sharing cotangents grafted (§7.5) | `prismaquant.incremental_probe` (`544-560`) | `artifacts/probe.pkl`; activations → `act/`; shards → `work/`; `logs/probe.log` | settings-hash `probe` (`703`); reuse also re-checks stored `calibration_modality` | — |
+| **2/4** | Baseline per-(Linear,format) RTN cost | `prismaquant.incremental_measure_quant_cost` (`645-658`) | `artifacts/cost.pkl` (`COST_MODE=local`) or `artifacts/cost_baseline.pkl` (`314-380`); `logs/cost.log` | settings-hash `base-cost` (`768`) + cost-mode provenance when it IS the allocator table (`769-777`) | — |
+| **2a-CB** | imatrix column-weight harvest | inline → `export_gguf.build_imatrix_from_act_cache` + `moe_imatrix.synthesize_packed_expert_col_weights` (`617-643`) | `artifacts/cb_col_weights.pkl` | settings-hash `cb-col-weights` (`789`) | CB lane, `CB_EXPERT_EMPIRICAL≠1` |
+| **2b/4** | Format-menu production render for allocator cost | `build_production_cache --render-scope format-menu` (`672-686`) | `artifacts/production_render_score_cache.pkl` + `…_weight_cache/` | settings-hash `render-cost-cache` (`837`) | `production-render-score` |
+| **2c/4** | Synthesize allocator cost from render scores | `prismaquant.production_render_cost` (`704-711`) | `artifacts/cost.pkl` | settings-hash `render-cost` (`858`) + cost-mode provenance (`859`) | `production-render-score` |
+| **2b/4** | Format-menu cache for AURA dW | `build_production_cache … --render-scope format-menu` (`857-871`) | frontier cache under validated-surrogate, else `production_render_score_cache.pkl` (`366-378`) | settings-hash `aura-dw-cache` (`913`) | `aura`; `exit 2` if the menu is BF16-only |
+| **2c/4** | AURA downstream-KL-adjoint cost | `prismaquant.aura_cost` (`881-900`) | `artifacts/cost_aura.pkl` | settings-hash `aura-cost` (`939`) | `aura` |
+| **2d/4** | Hybrid finalize: empirical packed-expert unit-KL + sidecar backfill | `prismaquant.expert_empirical_cost --merge-base --backfill-base` (`920-929`) or inline backfill (`932-952`) | `artifacts/cost.pkl` | settings-hash `aura-hybrid-cost` (`971`) + cost-mode provenance (`972`) | `aura` |
+| **2d-CB** | CB hybrid: replace packed-expert rows with empirical unit-KL | col-weight harvest (`985-1008`) → `expert_empirical_cost --replace-experts --col-weights` (`1024-1035`) | `artifacts/cost_local_raw.pkl`, `artifacts/cost.pkl`, `cb_col_weights.pkl` | settings-hash `cb-hybrid-cost` (`1046`) + the in-payload merge probe; col-weights `cb-col-weights` (`1051`) | CB lane, `CB_EXPERT_EMPIRICAL=1` (default) |
 | **3/4** | Allocator — multi-choice knapsack over per-Linear formats (§4) | `prismaquant.allocator` (`1076-1090`) | `artifacts/layer_config.json`, `artifacts/pareto.csv`, `artifacts/pareto_assignments/` (validated-surrogate only, `1056-1061`); `logs/allocator.log` | **none — always runs** | — |
-| **4/4 A** | Frontier format-menu cache | `build_production_cache … --render-scope format-menu --render-packed-experts` | `artifacts/production_weight_cache_frontier_raw.pkl` + `…_frontier/` | **bare skip** | validated-surrogate; `exit 2` if `PRODUCTION_CACHE=0` |
-| **4/4 B** | Measured held-out KL per Pareto point | `prismaquant.validate_assignments_kl` (`1243-1248` per-point, `1272-1277` batched) | `artifacts/validated_frontier_kl.json` + `…_parts/*.json` (merged `1250-1269`) | **bare skip** per point (`1239`) | validated-surrogate |
+| **4/4 A** | Frontier format-menu cache | `build_production_cache … --render-scope format-menu --render-packed-experts` | `artifacts/production_weight_cache_frontier_raw.pkl` + `…_frontier/` | settings-hash `frontier-cache` (`1206`) | validated-surrogate; `exit 2` if `PRODUCTION_CACHE=0` |
+| **4/4 B** | Measured held-out KL per Pareto point | `prismaquant.validate_assignments_kl` (`1243-1248` per-point, `1272-1277` batched) | `artifacts/validated_frontier_kl.json` + `…_parts/*.json` (merged `1250-1269`) | settings-hash `frontier-kl-point` per point (`1294`) | validated-surrogate |
 | **4/4 C** | Frontier point selection | `prismaquant.select_validated_frontier` (`1281-1288`) | overwrites `artifacts/layer_config.json`; `layer_config_validated_assignment.json`; `validated_frontier_selection.json` | none | validated-surrogate |
-| **4/4 D** | Production cache build / recache for the selected assignment | `production_recache` (`1331-1346`, `1399-1414`) or `build_production_cache --recache-layer-config` (`1379-1396`, `1423-1438`) | `production_weight_cache_frontier_<digest>_recached.pkl` (`1328`), `production_weight_cache_recached.pkl` / `…_raw.pkl` (`1102-1103`) | settings-hash on the recached path (`1372`); **bare skip** on the frontier recache (`1329`) and the non-recache raw (`1421`) | `PRODUCTION_CACHE=1` |
-| **4/4 E-gguf** | GGUF skeleton + export + llama.cpp smoke | `convert_hf_to_gguf.py` (`1461-1464`), `prismaquant.export_gguf` (`1469-1493`), `llama-completion` (`1500-1516`) | `artifacts/skeleton.gguf`, `exported.gguf` | settings-hash on the skeleton (`1455`); export always runs | GGUF lane; **exits 0 at `1523`** |
-| **4/4 E-cb** | CB col-weights + codebook export | col-weights (`1556-1582`), `export_nvfp4_cb[_streaming]` (`1592-1641`) | `exported_nvfp4_cb/` | **bare skip** on col-weights (`1556`); export always runs | CB lane; no in-lane serving smoke (`1649-1654`); **exits 0 at `1661`** |
+| **4/4 D** | Production cache build / recache for the selected assignment | `production_recache` (`1331-1346`, `1399-1414`) or `build_production_cache --recache-layer-config` (`1379-1396`, `1423-1438`) | `production_weight_cache_frontier_<digest>_recached.pkl` (`1328`), `production_weight_cache_recached.pkl` / `…_raw.pkl` (`1102-1103`) | settings-hash `production-cache-recached` (`1404`), `frontier-recache` (`1360`), `production-cache-raw` (`1452`) | `PRODUCTION_CACHE=1` |
+| **4/4 E-gguf** | GGUF skeleton + export + llama.cpp smoke | `convert_hf_to_gguf.py` (`1461-1464`), `prismaquant.export_gguf` (`1469-1493`), `llama-completion` (`1500-1516`) | `artifacts/skeleton.gguf`, `exported.gguf` | settings-hash `gguf-skeleton` (`1488`); export always runs | GGUF lane; **exits 0** |
+| **4/4 E-cb** | CB col-weights + codebook export | col-weights (`1556-1582`), `export_nvfp4_cb[_streaming]` (`1592-1641`) | `exported_nvfp4_cb/` | settings-hash `cb-col-weights` (`1587`); export always runs | CB lane; no in-lane serving smoke; **exits 0** |
 | **4/4 E** | compressed-tensors export (§6) | `prismaquant.export_native_compressed` (`1665-1699`) | `exported/`; `logs/export.log` | **none — always runs** | default lane |
 
-**Nothing in the pipeline validates the artifact.** The script's closing block (`1701-1707`)
-echoes a suggested `validate_native_export` command (`1704-1705`) and a `vllm serve` line
-(`1706-1707`), then stops. `validate_quantized_model` is neither run nor echoed — its only
-mention in the file is a GGUF-lane comment at `1497`. Both the numeric ship gate and the
-gold-lane KL/PPL contracts are manual; §7 owns that.
+**Nothing in the pipeline validates the artifact** — that is a physical lane boundary (`vllm`
+is not importable in the build venv), not laziness. What the script now does instead of
+echoing a suggested command is **print the open ship record**: the closing block runs
+`tools/shipcard.py show <exported>/shipcard.json` and names every slot still UNFILLED
+(re-vet R13 + the deferred wave-1 item). The build lane opens the record; the serve lane must
+close it. Both the numeric ship gate and the gold-lane KL/PPL contracts remain manual; §7
+owns that.
 
-### 3.3 Defaults at HEAD (`8f14400`)
+### 3.3 Defaults at HEAD (`8f14400` + the 2026-07-30 re-vet waves)
 
 This table is the single source of truth for pipeline defaults; other sections reference it
-rather than restate it.
+rather than restate it. `tests/test_architecture_doc.py` pins the enumerable half against
+`run-pipeline.sh`, so a default change that skips this table fails the suite. (Line numbers
+were dropped from this block: the re-vet waves shifted them, and a stale `file:line` is worse
+than none — `grep ': "${NAME:='` is exact and never decays.)
 
 ```
-FORMATS=NVFP4,FP8_DYNAMIC,BF16   [45]   TARGET_BITS=4.75                    [46]
-PARETO_TARGETS=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25              [47]
-NSAMPLES=32 [52]  SEQLEN=1024 [53]  DATASET=…/calibration/diverse-v1.jsonl  [82]
-EXPERT_GATE_DATASET=…/calibration/xdom-gate-v1.jsonl (cross-domain)         [88]
-ACTIVATION_ROWS_LIMIT=1024 on the GGUF/CB lanes else 256                  [76-81]
-COST_MODE=production-render-score [187]  SELECTION_MODE=surrogate         [250]
-PRODUCTION_RENDER_COST_SCORE_FIELD=weight_mse (M6, §4.2)                  [200]
-TARGET_PROFILE=vllm_packed_moe    [91]   EXPORT_CONTAINER=compressed-tensors[76]
-MTP_FORMAT=BF16 [161]  PRODUCTION_CACHE=1 [166]  PRODUCTION_RECACHE=1     [167]
-PRODUCTION_CACHE_LEVERS=gptq,static_act_order,joint_scale_opt             [178]
-PRODUCTION_CACHE_RENDER_SCOPE=assignment [177]  …_CACHE_PREFETCH=require  [170]
-VALIDATED_SOURCE_PREFETCH=require [282]  VALIDATED_FRONTIER_PICK=kneedle  [270]
-VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)       [260]
-CB_EXPERT_EMPIRICAL=1 [332,966]  CB_SCALE_CODING=v1 [1547]
-PRISMAQUANT_GGUF_IMATRIX=1 [1482]  DEVICE=cuda [89]  EXPORT_DEVICE=cuda    [90]
+FORMATS=NVFP4,FP8_DYNAMIC,BF16   TARGET_BITS=4.75
+PARETO_TARGETS=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25
+NSAMPLES=32  SEQLEN=1024  DATASET=…/calibration/diverse-v1.jsonl
+EXPERT_GATE_DATASET=…/calibration/xdom-gate-v1.jsonl (cross-domain)
+ACTIVATION_ROWS_LIMIT=1024 on the GGUF/CB lanes else 256
+COST_MODE=production-render-score        PRODUCTION_CACHE_PREFETCH=require
+PRODUCTION_RENDER_COST_SCORE_FIELD=weight_mse (M6, §4.2)
+TARGET_DISK_GB=<unset>  EXPORT_CONTAINER=compressed-tensors
+TARGET_PROFILE=<unset, spec-resolved>  TARGET_PROFILE_DEFAULT=vllm_packed_moe
+SELECTION_MODE=surrogate, or validated-surrogate under a TARGET_DISK_GB card
+EXPORT_PRODUCTION_CACHE_PREFETCH=require (native lane, D8)
+MTP_FORMAT=BF16  PRODUCTION_CACHE=1  PRODUCTION_RECACHE=1
+PRODUCTION_CACHE_LEVERS=gptq,static_act_order,joint_scale_opt
+PRODUCTION_CACHE_RENDER_SCOPE=assignment  …_CACHE_PREFETCH=require
+VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
+                                    or `budget` under a TARGET_DISK_GB card
+VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
+CB_EXPERT_EMPIRICAL=1  CB_SCALE_CODING=v1
+PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
 ```
 
-`EXPORT_CONTAINER` ∈ {`compressed-tensors`, `gguf`, `nvfp4_cb`} selects the lane. `aura` and
-`validated-surrogate` are fully wired but **opt-in** (`355-380`, `825-956`, and `1092-1313`
-respectively) — the flagship artifacts were produced with them, which is not the same as their
-being the default. §4 owns the cost-mode semantics; §5 owns the lever semantics.
+`EXPORT_CONTAINER` ∈ {`compressed-tensors`, `gguf`, `nvfp4_cb`} selects the lane, and the
+preflight now **refuses a lane the architecture has not declared** (`supported_lanes`,
+re-vet R6) — an undeclared lane does not fail at serve time, it serves uninitialised expert
+memory and generates coherent-looking garbage. `aura` is fully wired but **opt-in** — the
+flagship artifacts were produced with it, which is not the same as its being the default
+(the flip is R2's, gated on the provenance stamp §3.4 now carries).
+
+**`TARGET_PROFILE` is deliberately unset** (re-vet R11 / D4). `resolve_target_profile` gives an
+explicit request precedence, so a shell default silently beat every architecture's
+`spec.default_serving_profile` — measured cost 2026-07-11: 226 dense FP8 Linears coerced to
+BF16 on the Hy3 export. Unset, the spec wins; `TARGET_PROFILE_DEFAULT=vllm_packed_moe` is the
+fallback for architectures that declare nothing (never `research`, whose menu is unbounded);
+an explicit `TARGET_PROFILE` still wins, so every in-tree launch script is bit-identical. The
+resolved profile is stamped into `layer_config.json`'s reserved `__prismaquant__` block and
+read back by the exporter, so allocator and export cannot disagree.
+
+**`TARGET_DISK_GB` makes the card the constraint** (re-vet R1 / D12). When set it overrides
+`TARGET_BITS` (the allocator re-emits at the bpp whose exact footprint fits), narrows the
+Pareto sweep to the ~3 rungs that can ship, flips `SELECTION_MODE` to `validated-surrogate`
+and `VALIDATED_FRONTIER_PICK` to `budget` — min measured KL among the allocations that fit.
+An explicit `SELECTION_MODE`/`VALIDATED_FRONTIER_PICK` still wins. §4.6 owns the selection
+semantics; §4 owns the cost-mode semantics; §5 owns the lever semantics.
 
 ### 3.4 Reuse guards and the silent-reuse class
 
-`require_stage_settings()` (`492-522`) writes a `<artifact>.settings.json` on first build and,
-on reuse, diffs it against current settings — any difference is `exit 2`. A *missing* manifest
-only WARNs, so pre-guard artifacts are not invalidated. Render-affecting env is captured in
-`RENDER_ENV_SETTINGS` (`524-533`: `PRISMAQUANT_NVFP4_SCALE_RULE`,
-`PRISMAQUANT_GPTQ_DAMP_SWEEP` default `0`, `PRISMAQUANT_GPTQ_DAMP`,
-`PRISMAQUANT_ACT_CLIP_QUANTILE` default `0.999`, `PRODUCTION_CACHE_LEVERS`,
-`PRODUCTION_CACHE_DISABLE_LEVERS`).
+**The key set is `pipeline.py`'s job; the values are the shell's.** `STAGE_SETTINGS_KEYS`
+(`pipeline.py`) declares, per artifact, which settings that artifact's identity depends on.
+`run-pipeline.sh` passes every value once (`STAGE_SETTINGS_ENV`, `596`+), `pipeline.py
+--write-stage-settings` projects them onto each declared key set and emits
+`artifacts/stage_settings.json`, and `require_stage_settings <artifact> <stage> [LATE=v …]`
+(`684`) reads that projection instead of re-deciding the key set at the call site. Late-computed
+values (`AURA_CACHE_FORMATS`, `CACHE_FORMATS`, `ASSIGNMENT_DIGEST`) are passed as overrides;
+a declared key nobody supplies is a hard stop, not a silent gap. This is re-vet **R5**, and it
+closes **D6** by mechanism rather than by enumeration — the twelfth stage cannot arrive without
+a guard, because adding one is a table entry, not a bespoke argument list.
 
-**Only six stages are guarded** — `539` probe, `606` base-cost, `666` render-cost-cache, `851`
-aura-dW-cache, `1372` production-cache-recached, `1455` gguf-skeleton. Everything else is a
-bare `[[ -f … ]]`, marked in §3.2: `cost.pkl` under every mode, `cost_aura.pkl`, the CB hybrid
-cost, the frontier cache and recache, the per-point KL JSONs, the CB col-weights pickle and the
-non-recache raw cache are all **silently reused across setting changes**. Re-running a
-`$WORK_DIR` with a different `FORMATS`, `PRODUCTION_CACHE_LEVERS` or calibration will reuse a
-cost table built under the old settings without a word — the exact failure the guard exists to
-close, currently covering under half the artifacts. §12 D6.
+Contract:
+
+| state | outcome |
+|---|---|
+| artifact absent | record this stage's projection, build |
+| recorded projection matches | reuse |
+| recorded projection differs | **`exit 2`**, naming every differing key and the stale file |
+| no record for this stage (pre-guard artifact) | **WARN**, record, guard from then on |
+
+The manifest is `<artifact>.settings.json`, keyed by stage, so two stages can legitimately own
+one path — under `COST_MODE=aura` + `validated-surrogate` the AURA dW cache and the frontier
+cache **are the same file** (principle 8's one-render identity), and both key sets coexist.
+Pre-R5 flat manifests are read as a `legacy` block and still guard the stage whose key set they
+match, so no live `WORK_DIR` is invalidated by the upgrade.
+
+**Coverage is now every skip-if-exists artifact** — 16 call sites over 15 declared artifacts:
+`probe`, `base-cost`, `render-cost-cache`, `render-cost`, `aura-dw-cache`, `aura-cost`,
+`aura-hybrid-cost`, `cb-col-weights` (×3 harvest sites), `cb-hybrid-cost`, `frontier-cache`,
+`frontier-kl-point`, `frontier-recache`, `production-cache-recached`, `production-cache-raw`,
+`gguf-skeleton`. Render-affecting env is captured in `RENDER_ENV_SETTINGS` (`585`:
+`PRISMAQUANT_NVFP4_SCALE_RULE`, `PRISMAQUANT_GPTQ_DAMP_SWEEP` default `0`,
+`PRISMAQUANT_GPTQ_DAMP`, `PRISMAQUANT_ACT_CLIP_QUANTILE` default `0.999`,
+`PRODUCTION_CACHE_LEVERS`, `PRODUCTION_CACHE_DISABLE_LEVERS`) and spliced into every artifact
+that stores rendered weights.
+
+**Over-keying is the risk the table is written against.** Declaring a key an artifact does not
+depend on forces a spurious rebuild, and some of these are 90 GB. The rule applied: key an
+artifact on the inputs that change its *bytes*, and key expensive artifacts conservatively (the
+probe is keyed on model/corpus/windows/modality and **not** on `FORMATS` — it is format-blind;
+`cb_col_weights.pkl` is keyed generously because it rebuilds in minutes). Historical manifest
+key names (`NS`, `SL`, `SEED`) are preserved where they existed, so artifacts built before R5
+compare equal instead of rebuilding.
+
+**Cost tables get a second, orthogonal gate.** `cost.pkl` is the same path under *every*
+`COST_MODE`, so a settings match is not sufficient — the file could be the previous mode's
+estimator. Every producer (`incremental_measure_quant_cost`, `production_render_cost`,
+`aura_cost`, `expert_empirical_cost`, and the inline sidecar-backfill finalize) now stamps
+`provenance["cost_mode"]` from `--cost-mode`, and `cost_table_reusable()` (`669`) makes reuse of
+the *allocator's* table conditional on it matching. A mismatch **rebuilds** with a loud line
+naming both modes; an unstamped (pre-R2) table warns and is reused, never invalidated. Under
+`COST_MODE=local` the baseline *is* the allocator table so it carries the same gate; under the
+other modes `cost_baseline.pkl` is mode-agnostic on purpose and is shared across mode changes.
+This is re-vet **R2 precondition (i)** — the prerequisite to flipping the `COST_MODE` default,
+which is *not* done here.
 
 ### 3.5 Archived modes — the eleven `exit 2` gates
 
@@ -398,33 +465,33 @@ env var no pipeline stage ever set.
 
 ### 3.6 `pipeline.py` — what the contract layer actually is
 
-`pipeline.py` is descriptive, not executive, and says so at `pipeline.py:1-7`.
-`run-pipeline.sh:462-481` invokes it once to write and `--validate` a spec JSON; **nothing
-downstream reads that JSON back**. It declares 14 artifacts, 3 gates and 9 base stages
-(`pipeline.py:821-1001`), plus render-mechanism stages generated from
-`render_score.resolve_render_mechanism_order` (`776-818`).
+**It has exactly one load-bearing job, and §3.4 is it.** `pipeline.py` owns
+`STAGE_SETTINGS_KEYS` — the per-artifact declaration of which settings each build artifact's
+identity is keyed on — and the `--check-stage-settings` guard the orchestrator calls at every
+skip-if-exists site. That is the one thing the shell provably got wrong (ten artifacts with no
+guard at all, six more each holding their own opinion of their key set), and it is the one
+thing `pipeline.py` was already positioned to fix: it receives the settings and it is the only
+place where "what does this artifact depend on?" can be reviewed as a table rather than
+rediscovered per call site. Re-vet **R5**, adjudicated in favour of Lens 2's narrow promotion.
 
-Its `validate()` (`501-563`) checks name uniqueness, gate existence, input provenance,
-single-producer outputs, `APPROVED_RESOURCE_OWNERS` membership, required-resource fail-fast,
-and GPU-boundness (warn). Three load-bearing caveats:
+Everything else in the file remains **descriptive**: it also writes and `--validate`s a spec
+JSON declaring 14 artifacts, 3 gates and 9 base stages plus render-mechanism stages generated
+from `render_score.resolve_render_mechanism_order`. Nothing downstream reads that JSON back,
+and its `validate()` is tautological in the production path — the spec it validates is the one
+`default_production_pipeline_spec()` just generated from its own hardcoded `ResourceContract`s,
+and `run-pipeline.sh` never passes `--input`. Treat the *spec* half as documentation with a
+linter. Coverage stays partial in both directions by choice (re-vet: modelling the ten
+executed-but-unmodelled stages would be fiction-surface without teeth): `validate.vllm_smoke` is
+always stripped and `validate.kl` is stripped whenever `SELECTION_MODE=surrogate`.
 
-1. **The validation is tautological in the production path.** The spec validated is the one
-   `default_production_pipeline_spec()` just generated from its own hardcoded
-   `ResourceContract`s (`pipeline.py:890, 902, 926, 939, 958-967, 980`), all naming approved
-   owners; `run-pipeline.sh` never passes `--input`.
-2. **Two of the three approved owner names have no implementation.** `StreamingActivationCache`
-   and `StreamingModelPrefetch` (`pipeline.py:23, 25, 892, 904`) exist nowhere else in the
-   tree; the real streaming owner is `layer_streaming.LayerCache` (`layer_streaming.py:1253`).
-3. **Coverage is partial in both directions.** Executed-but-unmodelled:
-   `production_render_cost`, `aura_cost`, `expert_empirical_cost`, `select_validated_frontier`,
-   `production_recache`, both alternate lanes, both validators.
-   Modelled-but-never-executed: `validate.vllm_smoke` is always stripped
-   (`pipeline.py:662-663`) and `validate.kl` is stripped whenever `SELECTION_MODE=surrogate`
-   (`659-660`), i.e. by default.
+`APPROVED_RESOURCE_OWNERS` is now honest (D10): `rendered_weights → ProductionWeightCache`,
+`perturbed_activations → PerturbedActivationCache`, `streaming_model_weights → LayerCache`
+(`layer_streaming.py`). The two placeholder names that existed nowhere in the tree
+(`StreamingActivationCache`, `StreamingModelPrefetch`) are deleted, and a test asserts every
+approved owner has a class behind it. `kl_measurement.QuantWeightCache`, the other candidate
+owner, went to the archive wall with L3 (§4.4) and is no longer a live holder.
 
-The one-cache rule (§5.4) is therefore enforced by code convention plus the runtime
-strict-cache gates, **not** by `pipeline.py`. Treat the spec as documentation with a linter,
-not as a contract with teeth. §12 D10.
+The one-cache rule (§5.4) is still enforced by the runtime strict-cache gates, not by this file.
 
 ### 3.7 `WORK_DIR` layout
 
@@ -434,7 +501,7 @@ Created at `408`:
 artifacts/  probe.pkl, cost*.pkl, layer_config*.json, pareto.csv,
             pareto_assignments/, production_*_cache.pkl + shard dirs,
             validated_frontier_kl*.json, cb_col_weights.pkl, skeleton.gguf,
-            pipeline_spec.json, *.settings.json
+            pipeline_spec.json, stage_settings.json, *.settings.json
 act/        probe activation cache        work/  streaming layer shards
 logs/       probe|cost|allocator|export   exported/  compressed-tensors ckpt
 ```
@@ -688,9 +755,10 @@ assignment.
 
 `select_validated_frontier.py` builds an **η-dominance** envelope: rows sorted by (bpp, kl), a
 point enters only if it beats the running best by more than `--kl-noise-floor`
-(`_frontier_from_rows`). Picks: `kneedle` (default), `best-kl`, `lowest-bpp`,
-`practical-knee`, `saturation`. Diagnostics emitted with the pick: surrogate-vs-KL Spearman,
-`worst_rank_inversion`, leave-one-out kneedle stability.
+(`_frontier_from_rows`). Picks: `kneedle` (default without a card), `budget` (**the default
+under `TARGET_DISK_GB`**), `best-kl`, `lowest-bpp`, `practical-knee`, `saturation`.
+Diagnostics emitted with the pick: surrogate-vs-KL Spearman, `worst_rank_inversion`,
+leave-one-out kneedle stability.
 
 **Tail veto** (D1, 2026-07-30). §2.3 rule: KL is a *screening* metric and a lower mean can hide
 a heavier tail — the shipped 27B PrismaSCOUT has a worse max-prompt NLL than the artifact it
@@ -707,12 +775,36 @@ applies inside the leave-one-out rebuild, so the stability diagnostic reflects t
 envelope the pick came from. There is **no second eval pass** — the tail was already being
 computed and discarded.
 
-**Byte-budget "fit the card"** is a third path, CLI-only and **not wired into
-`run-pipeline.sh`**: `allocator.py --target-disk-gb` (`:1202`, impl `:2276-2605`) takes the
-exact exported footprint from `footprint.py` — which reproduces real `metadata.total_size` to
-0.00% on three 27B artifacts (`:1-20`; `GB = 1e9`) — grids over Pareto rungs via
-`saturation_select.select_under_byte_budget`, then ratchet-bisects the memoized DP for an exact
-fit. This is the answer when the RD diagnostic says the kneedle is axis-dependent. §12 D12.
+**Byte budget = constraint, measured KL = objective** (re-vet **R1**, closes D12). Two disjoint
+ship selectors used to exist: the allocator's `--target-disk-gb` picked by *predicted* Δloss
+among the allocations that fit, and `select_validated_frontier` picked by *measured* KL but was
+byte-blind (`grep -c bytes` → 0). The selector that owned the ship decision ran on the
+surrogate; the one that measured could not see the card — §2.2 inverted exactly where it is
+load-bearing, and the surrogate-knee failure is on record (27B: surrogate 5.857/0.056 vs
+validated 5.31/0.015). They are now one stage:
+
+* `TARGET_DISK_GB` is plumbed through `run-pipeline.sh` into the allocator. When set it
+  **overrides `TARGET_BITS`** (the allocator re-emits at the chosen bpp) — the CLI semantics,
+  now the pipeline's.
+* The allocator prices **every Pareto candidate** with `footprint.assignment_artifact_bytes`
+  — the same accounting its own byte-budget selector uses, so the two can never disagree — and
+  stamps `artifact_bytes` into each Pareto assignment payload and the manifest.
+* Under a card it then **narrows the Pareto set to the bracket around the byte-feasible bpp**
+  (the largest fitting rung ±1, ~3 of 11), with a log line naming the largest fitting rung. A
+  computed narrowing, not a hardcoded rung count; skipped loudly if any candidate is unpriced.
+  This is what makes byte-budget selection ~3 KL evals rather than 11, and it is why
+  `validated-surrogate` defaults **on** under a card and stays opt-in without one.
+* `select_validated_frontier --mode budget --target-disk-gb` picks **min measured KL among the
+  rows whose exact footprint fits**. `measured_rows` gains the `artifact_bytes` column, read
+  from the row or from the allocator payload at `row["path"]`. Bytes are monotone in bpp and
+  the frontier is the KL lower envelope, so the min-KL fitting frontier row is the min-KL
+  fitting row overall. Unpriced rows or an infeasible card are hard errors, never a silent
+  fallback to another pick.
+
+`footprint.py` reproduces real `metadata.total_size` to 0.00% on three 27B artifacts (`GB = 1e9`);
+`saturation_select.select_under_byte_budget` grids the rungs and the ratchet bisects the
+memoized DP for an exact fit. Kneedle stays available and stays what `_rd_curve_diagnostic`
+already calls it: a diagnostic on a log-linear RD curve.
 
 **The floor is a per-tensor manifest, and it cannot go negative** (#15, `bb974a0`; `0a9dc00`).
 The identity is `artifact_bytes = floor + Σ_reencoded memory_bytes_for_shape`, with
@@ -1468,11 +1560,11 @@ default, which is correct for them.
 
 ### 8.5 Known contract leaks
 
-These four are the canonical statement; §12 references them rather than restating them. L2 (R12) and L4 (R27) closed on 2026-07-30 and are kept in the table with their fix, so the leak and its resolution stay in one place.
+These four are the canonical statement; §12 references them rather than restating them. **All four are now FIXED** (L1/R11, L2/R12, L3/R10, L4/R27, all 2026-07-30) and are kept in the table with their fix, so each leak and its resolution stay in one place.
 
 | # | Leak | Severity |
 |---|---|---|
-| L1 | `run-pipeline.sh:91` hardcodes `TARGET_PROFILE:=vllm_packed_moe` and passes it unconditionally (`:471`, `:1081`); `resolve_target_profile` gives the explicit request precedence (`serving_profiles.py:611-633`), so `spec.default_serving_profile` is **never consulted through the production orchestrator**. `hy_v3.json` (`gguf`) and `laguna.json` (`nvfp4_cb`) are silently overridden. Mitigated only by the export-container gates (`run-pipeline.sh:106`, `:124`), which turn the mismatch into a hard error the operator must already know to avoid. **This leak has a measured cost, not a hypothetical one.** The exporter resolves the profile it judges legality under the same way, so when the spec default differs from the profile the allocation was solved with, export coerces every format the *spec-default* profile does not serve: on 2026-07-11, **226 dense FP8 Linears were silently demoted to BF16** on the Hy3 compressed-tensors export, because `hy_v3.json` declares `gguf`. `PRISMAQUANT_TARGET_PROFILE` now exists precisely so the audit and coercion run under the *allocator's* profile (`_allocator_target_profile_for_audit`, `export_native_compressed.py:1953-1962`, consumed by `_coerce_runtime_legal_assignment :1527` and `_bf16_upgrade_audit :2001`) — but **`run-pipeline.sh` never exports it**, so the production path still relies on the operator setting it by hand. Fix: unset the shell default *and* have the export stage pass the allocator's resolved profile through. | **high** |
+| L1 | **FIXED 2026-07-30 (R11).** Was: `run-pipeline.sh` hardcoded `TARGET_PROFILE:=vllm_packed_moe` and passed it unconditionally, and `resolve_target_profile` gives an explicit request precedence (`serving_profiles.py`), so `spec.default_serving_profile` was **never consulted through the production orchestrator** — `hy_v3.json` (`gguf`) and `laguna.json` (`nvfp4_cb`) silently overridden. **The leak had a measured cost:** because export re-resolved the profile it judges legality under, on 2026-07-11 **226 dense FP8 Linears were silently demoted to BF16** on the Hy3 compressed-tensors export. **Mechanism of the fix:** (i) the shell default is now empty and `--target-profile` is passed to the allocator **only when non-empty**, with a new `--target-profile-default vllm_packed_moe` supplying the fallback for architectures that declare nothing — never `research`, whose menu is unbounded. (ii) The allocator stamps its **resolved** profile into `layer_config.json`'s reserved `__prismaquant__` metadata block (`layer_config.LAYER_CONFIG_META_KEY`, skipped by every assignment parser and by the schema), and `export_native_compressed._allocator_target_profile_for_audit` reads it, with `PRISMAQUANT_TARGET_PROFILE` kept as the operator override for direct exporter invocations. `select_validated_frontier` carries the block forward when it overwrites the layer config, so the validated path keeps it too. Allocator and export can no longer disagree, and the channel travels **with** the artifact. **Non-regression:** re-solving the shipped 27B and 35B from their stored probe/cost artifacts changed **0 of 614** and **0 of 500** assignments vs the same code without the change (the 35B differs from its *shipped* config by 32/500 for an unrelated, pre-existing reason — the Fisher renormalization fix that landed after that artifact shipped). Every in-tree launch script sets `TARGET_PROFILE` explicitly, so all eight are bit-identical. | ~~high~~ FIXED |
 | L2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile: `prismaquant/mtp_module.py` was Qwen3.5-specific yet imported **directly** by `incremental_probe.py`, `incremental_measure_quant_cost.py` and `export_native_compressed.py`, gated only on the arch-agnostic `profile.has_mtp()`, so `deepseek_v4` (`has_mtp → True`, `build_mtp_module → None`) would have been handed a Qwen3.5 decoder layer. **Mechanism of the fix:** a fourth accessor `ModelProfile.mtp_source_prefix()` (`base.py:255-272`, spec-expressible as `shard_regexes.mtp_source_prefix`, default `"mtp."`) plus a generic `read_mtp_source_state_dict()` (`:290-326`) and a packed-expert-aware `load_mtp_state_dict()` (`:329-396`, absorbed from the deleted `_load_into_mtp`); `build_mtp_module`'s docstring now states the naming contract (names under an `mtp` parent must equal the recipe names). The Qwen body moved verbatim into `model_profiles/qwen3_5.py:124` (`MtpModule`) and the dead near-copies in `qwen3_5.py` and `qwen3_5_dense.py` were reconciled into it; all three call sites now go through the profile and hard-fail with a named error if `has_mtp()` and `build_mtp_module()` disagree. `prismaquant/mtp_module.py` is **deleted**. DSv4 takes the hy_v3 route (`has_mtp → False` + `"mtp."` in `passthrough_prefixes`) until its nextn block is actually quantized. Gates: `tests/test_mtp_module_arch.py` pins parameter-name-set equality against the pre-move layout for both the dense and MoE profile; `tests/test_model_profile_conformance.py::test_has_mtp_implies_a_buildable_mtp_module` is the standing ratchet. | ~~high~~ FIXED |
 | L3 | **FIXED 2026-07-30 (R10).** Was: a hand-maintained `try/except ImportError` opt-in chain (three hardcoded class imports plus one module scan), whose missing-line failure mode is **coherent-looking garbage generation** at serve time, with no test. Now: (i) the opt-in is data — a module-path tuple `_CB_TOPLEVEL_MODULE_PATHS` (`plugins/gridbook/gridbook/plugin.py:91-118`) fed to the version- and name-robust `_install_on_module_classes` (`:38-63`); a new arch is one line, and DSv4 is a commented candidate naming the vLLM module path to check (`:114-117`) rather than a bare TODO. A JSON sidecar remains the upgrade if third parties need to extend it. (ii) The silence is gone: `create_weights` stamps `_pq_cb_filled = False` on `w13/w2_cb_qweight`, both fill paths stamp `True` (the instance hook `moe.py:199`, `moe_toplevel_loader.py:583`), and `process_weights_after_loading` (`moe.py:213-217`) raises via `cb_fill_guard.assert_cb_experts_filled` (`:114`), naming the model class and the module path to add. **No env bypass**; scoped to the params the local rank registered, so EP/PP-absent and zero-expert shards are skipped (`cb_fill_guard.py:57-77`). Tests: `plugins/gridbook/tests/test_cb_fill_guard.py` (7). | ~~high~~ closed |
 | L4 | **FIXED 2026-07-30 (R27).** Both MiniMax hardcodes now go through profile accessors. `streaming_model.py`'s FP8-rewrite bypass was already half config-derived (`quant_method == "fp8"` and `weight_block_size`); the architecture half is a static property, so it became `staging.bypass_hf_fp8_module_rewrite` in the spec behind `profile.bypass_hf_fp8_module_rewrite()` (`base.py`), leaving the per-checkpoint half a config read where it belongs. `incremental_probe.py`'s `type(module).__name__ == "MiniMaxM2Experts"` became `profile.packed_expert_module_class_names()` (`base.py:182-192`) — the accessor that already existed for exactly this lookup — plus the structural shape test; the declared class stays **required**, because the replacement forward implements one specific expert-loop signature and applying it to a lookalike container would silently change a forward pass. `specs/minimax_m2.json` declares both, and `unpacked_expert_projection_names` with them. | closed |
@@ -1827,15 +1919,15 @@ returning with a stale copy sees the resolution rather than silence.
 | D1 | **FIXED 2026-07-30 (R9).** Tail-veto was unimplemented since 2026-06-05 — and it had stalled on an assumed cost (a second eval pass) that does not exist. **Mechanism:** every KL site already accumulated per-sequence values and discarded them at the return; both selection paths now return `(mean, per_seq, stats)`, so `kl_p95/kl_p99/kl_max` and the rung-2 `nll_mean/nll_p99` (one `gather` + `logsumexp` on logits already in hand) cost **zero extra forwards**. `_frontier_from_rows` gained a second admission condition — `row[tail] <= incumbent[tail] * (1 + tail_eta)` — behind `--tail-veto {none,kl_p99,kl_max,nll_p99}` / `--tail-eta`, with vetoed rows retained under `vetoed_rows` + `veto_reason` so a refusal is visible. **Default `--tail-veto none` is byte-identical to the old selector** (pinned by a frontier-identity regression test); promotion to default-on wants a 27B run showing the two picks agree. §4.6, §7.1. | `select_validated_frontier.py` `_frontier_from_rows`, `measured_rows`, `TAIL_VETO_COLUMNS`; `kl_measurement.sequence_token_nll` / `summarize_per_sequence_kl`; `tests/test_select_validated_frontier.py`, `tests/test_kl_per_sequence_tail.py` | — | Done, default-off. Follow-up: pick the contract statistic (`kl_max` is the one that would have caught the broken 27B that passed on mean while 80% of prompts were bad) and flip the default after a 27B agreement check. |
 | D2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile — §8.5 L2. All three import sites now call `profile.build_mtp_module()` / `read_mtp_source_state_dict()` / `load_mtp_state_dict()`, keyed on the new `mtp_source_prefix()` accessor; `prismaquant/mtp_module.py` is deleted and DSv4 declares `has_mtp → False` + `"mtp."` passthrough. | §8.5 L2 | ~~HIGH~~ CLOSED | — |
 | D3 | **FIXED 2026-07-30 (R10)** — was: gridbook per-arch CB expert opt-in as a hand-maintained code list, a missing line failing silently as coherent garbage generation. Now a module-path tuple (`plugin.py:91-118`) plus an unbypassable serve-time fill assertion (`cb_fill_guard.py`, raised from `process_weights_after_loading`). §8.5 L3 has the mechanism. | §8.5 L3 | ~~HIGH~~ closed | — |
-| D4 | **`spec.default_serving_profile` is dead** — §8.5 L1, and it has a measured cost (226 Hy3 FP8 Linears silently → BF16, 2026-07-11). The `PRISMAQUANT_TARGET_PROFILE` escape hatch exists but `run-pipeline.sh` never exports it, so the production export still audits and coerces under whatever profile the *spec* declares. | §8.5 L1; `export_native_compressed.py:1953-1962`; `grep PRISMAQUANT_TARGET_PROFILE prismaquant/run-pipeline.sh` → 0 | HIGH | Unset the shell default; keep the env var as an override; have the export stage pass the allocator's resolved profile through so the two can never disagree silently. |
+| ~~D4~~ | **CLOSED 2026-07-30 (re-vet R11).** `TARGET_PROFILE` has no shell default; `--target-profile` reaches the allocator only when requested, with `--target-profile-default vllm_packed_moe` as the fallback; the allocator stamps its resolved profile into `layer_config.json`'s reserved `__prismaquant__` block and the exporter reads it (env override kept). Non-regression 0/614 and 0/500 on the shipped 27B/35B. See §8.5 L1. | §8.5 L1 | ~~HIGH~~ | closed |
 | D5 | **RESOLVED 2026-07-30.** `PRISMAQUANT_GPTQ_DAMP_SWEEP` had two readers with opposite defaults — `"0"` in the exporter, `"1"` in a forked lever-defaulting copy inside the KL sensitivity probe (stale from `9c91d62`, missed by the sweep-OFF policy in `f2363e2`), so any A/B touching both compared different renders. `_normalized_production_cache_levers` now delegates to `production_weight_cache._resolve_production_render_levers` — one contract, and the probe's stamped provenance can no longer disagree with the render that produced it. | `archive/l3_propagated_2026-07-30/prismaquant/kl_sensitivity_probe.py:272-285`; `tests/test_production_weight_cache.py` | — | Done, and fully closed later the same day: R4 walled the probe itself, so the forked reader no longer exists in the live tree. The follow-up landed too — the delegation contract is pinned by `tests/test_production_weight_cache.py`, which carries it as a local shim and keeps every assertion (sweep OFF by default; sweep-off renders must record their fixed damp). |
-| D6 | **Only 6 of ~16 executed stages are settings-hash guarded** (§3.4). Silent stale-reuse across recipe changes. | guard `run-pipeline.sh:492-522`, applied at `:539,606,666,851,1372,1455`; unguarded at `:620,690,800,879,909,981,1009,1134,1239,1329,1421,1556` | HIGH | Extend `require_stage_settings` to the cost and frontier-cache artifacts. |
+| ~~D6~~ | **CLOSED 2026-07-30 (re-vet R5).** Closed by *mechanism*, not enumeration: `pipeline.STAGE_SETTINGS_KEYS` declares each artifact's key set, `run-pipeline.sh` supplies values once, and the guard now covers every skip-if-exists artifact (16 call sites / 15 artifacts). `cost.pkl` additionally carries a `provenance["cost_mode"]` stamp so a mode change cannot silently reuse the other estimator's table (R2 precondition (i)). See §3.4. | §3.4; `pipeline.py` `STAGE_SETTINGS_KEYS` | ~~HIGH~~ | closed |
 | D7 | **RESOLVED 2026-07-30 — and the original diagnosis was wrong.** The register previously read "`pyproject.toml` on `main` is `0.1.0` while PyPI serves `0.4.1` from a tag that is not an ancestor of `main`", implying the release had been cut off-trunk. It had not: `origin/main` *was* the release source all along (`v0.2.0` `4745887` → `v0.2.1` → `v0.3.x` → `v0.4.1` `d058267`, each an ancestor of `origin/main`), and the **local** `main` ref was simply 54 commits behind. Merging `origin/main` into this branch (`8f14400`) brings the whole release stack: `pyproject.toml:7` is `0.4.1`, `requires-python = ">=3.11"` (`:14`), plus the tag-driven PyPI pipeline, packaging gates and `docs/RELEASING.md`. `git merge-base --is-ancestor v0.4.1 HEAD` → true. Lesson: verify a divergence claim against the **remote** ref before filing it as debt. | `pyproject.toml:6-14`; `.github/workflows/release.yml`; `git merge-base --is-ancestor v0.4.1 HEAD` | — | Done. Follow-up: fast-forward the local `main` ref so the next reader's `git log main` is not 54 commits stale. |
-| D8 | **Export never enforces production-cache residency.** The exporter has no `--production-cache-prefetch` argument and its prefetch helper has no `require` mode; a cache miss silently yields 0 prefetched keys (NVMe-bound export). | `run-pipeline.sh:1691-1698`; `export_native_compressed.py` `_production_cache_prefetch_assignment` `:2090-2110`, sole caller `:6237` | MED | Add a `require` mode mirroring `production_weight_cache.py:461-478`. |
-| D9 | **`require_cuda_hot_path` is not called by 7 stages** — `incremental_probe`, `incremental_measure_quant_cost`, `aura_cost`, `production_render_cost`, `export_nvfp4_cb[_streaming]`, `export_gguf`, `select_validated_frontier`. They are protected only by the shell preflight, which the CB/GGUF ladder work routinely bypasses by invoking modules directly. | `gpu_guard.py:7-15`; shell gate `run-pipeline.sh:134-145` | MED | Add the one-line guard to each stage's `main()`. |
-| D10 | **`pipeline.py`'s contract layer is partly fictional** (§3.6): tautological validation, 2 of 3 `APPROVED_RESOURCE_OWNERS` unimplemented, 10+ executed stages unmodelled, `_register_builtin_components` a deliberate no-op. | `pipeline.py:23,25,501-563,890-980,1059-1063`; `run-pipeline.sh:462-481` | MED | Either model the real owners (`layer_streaming.LayerCache`, `QuantWeightCache`) and the missing stages, or demote the file to a documented linter and stop citing it as enforcement. |
+| ~~D8~~ | **CLOSED 2026-07-30 (re-vet R24).** `_production_cache_prefetch_assignment` gained a `require` mode mirroring `production_weight_cache.prefetch_assignment(require=…)`, exposed as `--production-cache-prefetch {require,warn}`; `run-pipeline.sh` passes `require` on the native lane (matching `VALIDATED_SOURCE_PREFETCH=require`), and the CB/GGUF lanes read no production cache at all. A total miss is now a named failure instead of a silent NVMe-bound export. | `export_native_compressed._production_cache_prefetch_assignment` | ~~MED~~ | closed |
+| ~~D9~~ | **CLOSED 2026-07-30 (re-vet R24).** The guard is at `main()` entry (not import time) in all seven — `incremental_probe`, `incremental_measure_quant_cost`, `aura_cost`, `production_render_cost`, `export_nvfp4_cb[_streaming]`, `export_gguf`, `select_validated_frontier` — verified against every CPU-only test import first, and a parametrized test pins all twelve callers so a refactor cannot drop one. | `gpu_guard.py` | ~~MED~~ | closed |
+| ~~D10~~ | **CLOSED 2026-07-30 (re-vet R5).** `pipeline.py` now has one real job — settings-hash authority (§3.4) — and the bookkeeping is honest: the two owner names that existed nowhere in the tree are deleted, `streaming_model_weights` names `layer_streaming.LayerCache`, and a test asserts every approved owner has a class behind it. `QuantWeightCache` went to the archive wall with L3, so it is no longer an unmodelled holder. The *spec* half stays explicitly descriptive (§3.6); modelling the ten executed-but-unmodelled stages was refused as fiction-surface. | §3.6; `pipeline.py` | ~~MED~~ | closed |
 | D11 | **MOSTLY FIXED 2026-07-30.** `model_profiles/validate.py`'s 8 conformance checks had zero callers and there were no workflow files in the tree. Both halves closed: `.github/workflows/ci.yml` (#18, `1cc7b90`) runs the suite on every push and PR (py3.11/3.12, CPU torch), and `tests/test_model_profile_conformance.py` drives the CPU-safe checks (1, 6, 8 + four structural invariants) over every registered profile, with 2/3/4 behind `integration` and 6/7 behind `slow`, and known gaps encoded as ratchets rather than bare xfails. **Residual (2026-07-30, R12): the check-5 half is now covered** — `test_has_mtp_implies_a_buildable_mtp_module` asserts `build_mtp_module` is a real override (and `mtp_source_prefix()` non-empty) whenever `has_mtp()`, which is the declarative part of the check that would catch L2/D2; check 5 proper still materialises a decoder layer and stays out of CI. Remaining: nothing invokes the validator as a `run-pipeline.sh` preflight for the actual `MODEL_PATH`. | `.github/workflows/ci.yml`; `tests/test_model_profile_conformance.py:9-31,223-249` | LOW (was MED) | Add a preflight invocation for `MODEL_PATH`. |
-| D12 | **`TARGET_DISK_GB` byte-budget selection is CLI-only.** §4.6 names the byte budget as the ship rule that replaced kneedle, but `run-pipeline.sh` has no hits — every byte-budget ship is a manual `allocator.py` invocation. | `allocator.py:1202` `--target-disk-gb`; `grep TARGET_DISK_GB prismaquant/run-pipeline.sh` → 0 | MED | Plumb `TARGET_DISK_GB` through the allocator stage. |
+| ~~D12~~ | **CLOSED 2026-07-30 (re-vet R1).** `TARGET_DISK_GB` is plumbed through `run-pipeline.sh`: it overrides `TARGET_BITS`, narrows the Pareto sweep to the byte-feasible bracket, flips `SELECTION_MODE` to `validated-surrogate` and the frontier pick to `budget` = min measured KL among the rows that fit. Kneedle stays the default without a card and stays a diagnostic. See §4.6. | §4.6; `select_validated_frontier --mode budget` | ~~MED~~ | closed |
 | D13 | **FIXED 2026-07-30 (R22 + R27).** The two hardcoded MiniMax arch tests now route through `profile.bypass_hf_fp8_module_rewrite()` and `profile.packed_expert_module_class_names()`; `specs/minimax_m2.json` exists and declares all eight of that profile's overrides; `deepseek_v4.json` declares `default_serving_profile: vllm_packed_moe`. Core-stack arch literals in control flow: **0**. Residual (not debt, sequencing): the MiniMax Python overrides stay until the equivalence gate `tests/test_minimax_m2_spec.py` has held for a release. | §8.4, §8.5 L4 | closed | — |
 | D14 | **`plugins/gridbook/README.md` — the lane's most-read file — is materially wrong**: claims uniform-CB-only (delegation is implemented), claims mixed containers raise `NotImplementedError`, omits MoE entirely, calls even-split product mode the only supported shape, and calls `--enforce-eager` a requirement. | `gb/config.py:346-374`, `gb/tests/test_delegation.py`, `gb/moe.py`, `gb/linear.py:439` | MED | Rewrite Scope + add an MoE section; link `docs/lanes/nvfp4-cb/STANDARDS.md` rather than restate status. |
 | D15 | **CB defaults do not match shipping practice.** `CB_SCALE_CODING` defaults to `v1` (warned "serve gates pending — do NOT ship") though every shipped fp4 artifact overrides to `two_tier`; `CB_EXPERT_EMPIRICAL` defaults to `1` though every shipped MoE driver sets `0`. | `run-pipeline.sh:1547`, `:332` | MED | Flip the defaults to the shipped values, or record why the default is deliberately the conservative one. |
