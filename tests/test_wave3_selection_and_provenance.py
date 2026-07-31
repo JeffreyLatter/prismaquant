@@ -194,7 +194,6 @@ def test_export_prefetch_require_is_wired_on_the_native_lane():
     "export_nvfp4_cb",
     "export_nvfp4_cb_streaming",
     "export_gguf",
-    "select_validated_frontier",
     # the pre-existing callers, pinned so a refactor cannot drop them
     "build_production_cache",
     "expert_empirical_cost",
@@ -206,6 +205,14 @@ def test_gpu_or_bust_guard_on_every_production_entrypoint(module):
     assert "require_cuda_hot_path" in src, (
         f"{module}.main() can run on CPU; the CB/GGUF ladder invokes these "
         "directly, bypassing run-pipeline.sh's preflight")
+
+
+def test_validated_frontier_selector_remains_cpu_safe():
+    """Selection reads measured JSON and writes JSON; it launches no tensor
+    work and must remain usable on orchestration/CI hosts without a GPU."""
+    src = (ROOT / "prismaquant" / "select_validated_frontier.py").read_text()
+    assert "require_cuda_hot_path" not in src
+    assert "torch." not in src
 
 
 # ---------------------------------------------------------------------- R6

@@ -3,8 +3,6 @@ Milestone B byte packers / exporter)."""
 from __future__ import annotations
 
 import json
-import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -533,18 +531,10 @@ def test_nvfp4_cb_pack_stacked_experts():
 # bit-exactness (learned Lloyd / VQ argmin ties are device-dependent).
 # ===========================================================================
 
-# Mandated scratch root — never /tmp (CLAUDE.md landmine).
-_EXPORT_ROOT = Path("/home/rob/dq-runs/nvfp4-cb-phase0/export-test/pytest")
-
-
 @pytest.fixture
-def export_dir():
-    _EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
-    d = Path(tempfile.mkdtemp(dir=_EXPORT_ROOT))
-    try:
-        yield d
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+def export_dir(tmp_path: Path):
+    """Use pytest's per-run root; CI must not depend on a developer home."""
+    return tmp_path
 
 
 def _tiny_model(mdl: Path, in_f: int = 256):
