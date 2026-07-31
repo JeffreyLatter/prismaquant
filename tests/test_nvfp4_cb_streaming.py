@@ -68,18 +68,10 @@ def _stock_by_scheme(quant_config: dict) -> dict:
             {k: v for k, v in g.items() if k != "targets"}
             for g in quant_config["config_groups"].values() if "scheme" not in g}
 
-_ROOT = Path("/home/rob/dq-runs/nvfp4-cb-phase0/stream-test/pytest")
-
-
 @pytest.fixture
-def workdir():
-    _ROOT.mkdir(parents=True, exist_ok=True)
-    import tempfile
-    d = Path(tempfile.mkdtemp(dir=_ROOT))
-    try:
-        yield d
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+def workdir(tmp_path: Path):
+    """Keep synthetic exports isolated and portable across CI runners."""
+    return tmp_path
 
 
 def _write_model(mdl: Path, tensors: dict, hid: int = 256):
@@ -660,6 +652,16 @@ def test_reuse_sharded_prior(workdir):
 # run-pipeline.sh drives tonight.
 def test_reuse_main_env_fallback(workdir, monkeypatch):
     import pickle
+    import prismaquant.gpu_guard as gpu_guard
+
+    # The production CLI is intentionally GPU-only. This test exercises only
+    # argument/environment plumbing on tiny CPU tensors, so isolate that policy
+    # guard instead of weakening it in production code.
+    monkeypatch.setattr(
+        gpu_guard,
+        "require_cuda_hot_path",
+        lambda *_args, **_kwargs: torch.device("cpu"),
+    )
     mdl = workdir / "model"
     _reuse_model(mdl)
     cwp = workdir / "cw.pkl"
