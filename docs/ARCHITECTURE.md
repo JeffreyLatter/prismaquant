@@ -1818,7 +1818,7 @@ it; §7 owns its gates. Validation runs in-process (`validate_native_export.py:1
 
 **Package and registration.** `plugins/gridbook/` is an independently installable package
 (`gridbook`, `pyproject.toml:8`), registered through vLLM's general-plugin entry point
-(`pyproject.toml:69-70`). In-tree version is **`0.2.0.dev0`** (`gb/__init__.py:16`, which
+(`pyproject.toml:69-70`). In-tree version is **`0.2.0.dev0`** (`gb/__init__.py:19`, which
 `pyproject.toml:73` declares as the single source of truth) — a *development head*, not a
 release: releases are cut from the standalone `/home/rob/gridbook` repo, which published PyPI
 0.1.1. The dev suffix is the honest label for a tree that is ahead of the release in kernel work
@@ -1832,6 +1832,22 @@ artifacts (`:141-147`), and the per-arch loader installs below. **No vLLM-core m
 (`gb/moe.py:177-207`). It is a *mixed* container: CB targets get CB methods, ignored prefixes
 BF16, and plain NVFP4/FP8_DYNAMIC groups are re-keyed into a real `CompressedTensorsConfig` and
 delegated (`gb/config.py:326-375`). Single-GPU only — no TP handling in `gb/*.py`.
+
+**Two trees, one package, one direction (2026-07-30).** The same package lives in two places:
+`plugins/gridbook/` here is the **development tree** — where the kernel campaign lands, next to
+the encoder that produces the artifacts those kernels serve — and `RobTand/gridbook` (locally
+`/home/rob/gridbook`) is the **release project**, which owns the distribution scaffolding this
+tree deliberately does not have (`LICENSE`, `MANIFEST.in`, `Dockerfile`, `docs/`, `.github/`,
+`CITATION.cff`) and is the only place a tag or a PyPI upload happens. They drifted 37 files
+apart with nothing watching, so the path is now mechanical: `scripts/sync_gridbook.py` mirrors
+`plugins/gridbook/gridbook/` → `<release>/gridbook/` and `plugins/gridbook/tests/` →
+`<release>/tests/`, one way, deletions included, reading **committed** content only (a
+`--rev`, default `HEAD`) so in-flight kernel authoring is excluded by construction rather than
+by a denylist — Robert's rule is "when they're ready", and a commit is the only mechanical
+definition of ready this repo has. It never writes outside those two subtrees.
+`tests/test_gridbook_sync.py` runs `--check` as a drift gate and skips (never passes) when the
+clone is absent; its location is `GRIDBOOK_REPO`. Nothing in the path commits, tags or
+publishes — releasing stays a human action.
 
 **Storage format.** Product vector quantization onto a codebook whose every entry lies exactly
 on a hardware grid, so a decoded tile *is* a bit-standard NVFP4/FP8 tensor and dequantization

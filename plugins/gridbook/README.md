@@ -14,9 +14,24 @@ tree mirrors this one; the rest of the drift is doc-path strings.
 **Versions.** PyPI serves **0.1.1**, and the standalone `/home/rob/gridbook`
 repo is the **release source** — releases are cut there, never from this tree.
 This in-tree copy is the **development head**: `__version__ = "0.2.0.dev0"`
-(`gridbook/__init__.py:16`), a dev suffix that says truthfully "unreleased,
+(`gridbook/__init__.py:19`), a dev suffix that says truthfully "unreleased,
 post-0.1.1" — it is ahead of the released package in kernel work (R6 smem LUT,
 single-storage dense weights) and must never be read as a published version.
+
+**Syncing the two trees.** `scripts/sync_gridbook.py` is the one-way path:
+`plugins/gridbook/gridbook/` → `<release>/gridbook/` and `plugins/gridbook/tests/`
+→ `<release>/tests/`, mirrored (deletions included), from **committed** content
+only — in-flight kernel authoring in the working tree is excluded by
+construction, since Robert's rule is that kernels join the release project
+*when they're ready*. It never touches the release repo's distribution
+scaffolding (`LICENSE`, `pyproject.toml`, `MANIFEST.in`, `Dockerfile`, `docs/`,
+`.github/`), and it never commits, tags or publishes. Run
+`python3 scripts/sync_gridbook.py --check` for a drift report (exit 1 on drift)
+or without `--check` to apply; `tests/test_gridbook_sync.py` is the gate that
+keeps the two trees from silently diverging again, and it skips — never passes —
+when `GRIDBOOK_REPO` (default `/home/rob/gridbook`) is not present. After a sync,
+commit in the release repo by hand; `__version__` moves with the sync, so both
+trees always report the same version.
 
 Format and kernel contracts: `docs/lanes/nvfp4-cb/STANDARDS.md` (authoritative),
 byte layout `docs/lanes/nvfp4-cb/LAYOUT.md`.
