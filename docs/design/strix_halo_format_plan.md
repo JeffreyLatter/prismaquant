@@ -71,11 +71,26 @@ bf16 decode. The grid was only ever there to make the decoded tile bit-standard
 for fp8/fp4 tensor cores; where those do not exist, the constraint costs nothing
 and buys nothing, and the artifact is unchanged.
 
-**A bf16-grid ("unconstrained") CB for Strix is DO-NOT-BUILD.** It would buy the
-grid-constraint cost back — measured at **+0.2–0.7% weighted MSE** in
-`rd_ceiling_study.md` — at the price of forking the artifact per platform,
-doubling encode, and breaking the one-artifact property that makes (b) valuable.
-The trade is not close.
+**A bf16-grid CB — REVISED 2026-07-30, this section was wrong.** I first called
+it DO-NOT-BUILD on the grounds that it forks the artifact for +0.2–0.7% MSE
+(`rd_ceiling_study.md`). The format inventory then made the opposite case
+correctly: on gfx1151 an `FP8_CB` weight *must* decode to bf16 anyway, so a
+bf16-grid codebook there is **same bytes, same speed, superset grid — strictly
+dominating `FP8_CB` on that platform.** That is the MXFP6 argument run in
+reverse and it is right.
+
+Both are true, and they resolve to a design neither states alone:
+**one index stream, multiple codebooks.** The index stream is the entire bulk of
+the artifact and is grid-agnostic; a codebook is kilobytes (8 KB per Linear at
+K36 — ~3 MB on a 27B, **~0.02%** of a 17 GB artifact). So ship one index stream
+plus a small per-grid codebook, each re-fitted to its grid with the *assignment
+held fixed*. Blackwell reads the fp8-grid codebook and gets bit-standard fp8
+tiles; Strix reads the bf16-grid codebook and gets the superset grid's quality.
+No artifact fork, no re-encode of the expensive part, no Blackwell regression.
+Fitting cost is one constrained pass per extra grid, not a re-solve.
+
+**Settle this before the HIP lane hardens around e4m3** — the decode kernel's
+LUT-materialisation path differs, and retrofitting is worse than choosing now.
 
 **An int8-grid CB is DO-NOT-BUILD.** Measured on the GB10: int8 38.7 TOP/s vs
 fp8 48.0 TFLOP/s — int8 is *slower* than fp8 on Blackwell, so an int8-grid
@@ -88,9 +103,10 @@ never the right lever — a platform-specific *kernel* is.
 
 | # | Kernel | Why | Effort |
 |---|---|---|---|
-| **K1** | CB decode **GEMV** → bf16, LDS-resident codebook LUT | The decode-phase workhorse and the whole product on this box: bandwidth-bound, so this is where 4.5 bpw becomes tokens/s. Stock ROCm bf16 GEMV measured **23 GB/s against 208 GB/s available** — if that gap survives sustained-clock re-measurement, a purpose-written kernel has ~9× of headroom. | M |
+| **K1** | CB decode **GEMV** → bf16, LDS-resident codebook LUT | The decode-phase workhorse and the whole product on this box: bandwidth-bound, so this is where 4.5 bpw becomes tokens/s. **Corrected 2026-07-30:** my earlier "23 GB/s vs 208, ~9× headroom" was a **clock artifact** — the GPU idles at 1214 MHz and needs ~45 s of load to reach 2.6 GHz; sustained, stock bf16 GEMV reaches **201–233 GB/s against a 210 GB/s ceiling**. There is no headroom to reclaim. K1's justification is therefore *the index stream itself* — reading 4.5 bpw instead of 16 — not out-coding hipBLAS. | M |
 | **K2** | CB **decode-in-prologue GEMM** → bf16 WMMA | Prefill. Carries the lane's original thesis onto this box: tensor-core prefill instead of GGUF-IQ's dequant-bound path. | L |
-| **K3** | *(conditional)* int8 decode target for K2 | Only if `iu8` benchmarks materially above bf16 WMMA **and** the activation-outlier accuracy question is settled on a served A/B. Strix-local optimisation, never an artifact change. | M |
+| **K3** | *(conditional)* int8 decode target for K2 | **Measured 2026-07-30: `iu8` is 1.56× bf16 LDS-fed (42.9 vs 27.5 TFLOP/s) but only 1.06× register-resident** — so int8's gain is halved LDS traffic, *not* math. A modest prize for adopting int8 activations. Gated on `int8_w8a8_accuracy_gate.md`. | M |
+| **K4** | *(conditional)* int4 WMMA GEMM | `iu4` measures **2.86× bf16 LDS-fed (78.7)** — the only lever that closes Strix's prefill deficit. But `iu4` needs *both* operands int4, i.e. **W4A4 integer** activations: no exponent, strictly more outlier-hostile than fp4. Do not start before the activation gate reports. | L |
 
 K1 and K2 are already being authored against the real toolchain. K3 stays a
 measured option, not a commitment.
