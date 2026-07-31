@@ -20,7 +20,7 @@ Ranked by leverage-per-risk, fundamentals first. "Lens" credits the arguing revi
 | **R4** | Retire L2/L3 from the spine; archive-wall the L3 probe — **IMPLEMENTED 2026-07-30** (measured: 97 symbols / ~4.3k lines out of `kl_measurement.py`, not the ~15 functions estimated) | FUNDAMENTAL | M | near-zero | L6 |
 | **R5** | `pipeline.py`: settings-hash authority — **RESOLVED for Lens 2, IMPLEMENTED 2026-07-30** (D6 + D10 closed; 16 guard sites / 15 artifacts) | FUNDAMENTAL | M | low | L2 vs L6 |
 | **R6** | Lane eligibility becomes model configuration — **IMPLEMENTED 2026-07-30** (spec side wave 2, `run-pipeline.sh` preflight wave 3) | FUNDAMENTAL | M | low, additive | L4 |
-| **R7** | Strix Halo enters **serving-only**, GGUF-first; no ROCm build stack in scope — **ACCEPTED 2026-07-30**; option A approved, blocked only on the box; C tracked in `docs/lanes/gguf.md` | FUNDAMENTAL | S | none | L4 |
+| **R7** | Strix Halo enters **serving-only**, GGUF-first; no ROCm build stack in scope — **ACCEPTED 2026-07-30**, then **PARTLY SUPERSEDED the same day**: Robert funded the CB kernel port, a gfx1151 box arrived, and option B's entry test is passed (HIP kernels authored + parity-verified + benchmarked in `plugins/gridbook/gridbook/csrc_hip/`, still unserved). Quantization-stays-on-the-Spark is unchanged; A still unrun | FUNDAMENTAL | S | none | L4 |
 | **R8** | `spec.match`: implement the reader (`SpecMatchProfile`, zero-Python Tier A) **or** delete the dead field | FUNDAMENTAL | M / S | med — detection order | L3 |
 | **R9** | D1 tail-veto: emit `kl_p99`/`kl_max`/`nll_p99` from tensors already in hand; veto in `_frontier_from_rows` | STRUCTURAL | M | zero default-off | L1 + L5 |
 | **R10** | Gridbook per-arch CB loader list → data + serve-time "every CB expert tensor consumed" assertion (D3) | STRUCTURAL | M | low | L3 + L4 |
@@ -397,6 +397,28 @@ Quantization stays on the Spark in all three options; Strix is a serving box. Th
 > **OUTCOME — ACCEPTED 2026-07-30 (wave 4). Serving-only framing confirmed; option A approved; no ROCm build stack in scope.**
 > Quantization stays on the Spark in every option, so the probe/cost/render/export stack needs **zero** ROCm work — that decoupling is the ruling's load-bearing half. **Milestone (A):** serve the shipped Hy3 2.8 bpp GGUF on Strix and record prefill / decode / ToolEvalBench, *when the box exists* — nothing here is blocked on code, so the item's state is "blocked: no box", not "in progress". **C is tracked passively** as a dated row (which vLLM version first routes NVFP4/FP8 to a *performant* gfx1151 kernel — registry support is not enough, per core principle 9); nothing observed yet. **B is not funded** and its entry test is unchanged: one kernel (dense decode GEMV) bit-exactness-checked against CUDA, and if that one is uneconomic B is uneconomic.
 > Recorded as a dated table in `docs/lanes/gguf.md` ("Hardware targets — Strix Halo tracking"), which is where the readout will land. §10's "Strix Halo — planned, nothing designed or built" stays accurate until A produces a measurement. **Still blocked on hardware per Robert 2026-07-30** — no box, so nothing to measure; the item stays "blocked: no box", not "in progress".
+
+> **⚠ SUPERSEDED IN PART — 2026-07-30, later the same day.** Robert directly commissioned the
+> thing this ruling declined: *"build fp8 vllm kernels that target strix halo and support codebook
+> formats"*, and a gfx1151 box arrived. **Option B is now funded and its entry test is PASSED.**
+> The test as written above was "port one kernel — dense decode GEMV — and bit-exactness-check it";
+> what landed is broader (decode GEMV for fp8-CB *and* NVFP4_CB two-tier, plus a bf16 WMMA
+> prefill GEMM, the expander and the fused activation QDQ, in
+> `plugins/gridbook/gridbook/csrc_hip/`), and it is checked **not** against CUDA but against an
+> fp64 torch reference at a 1-bf16-ULP gate — 34 pytest + 44 standalone cases green on the device.
+> Bit-exactness against CUDA is not an available gate and the entry test should be read as amended:
+> this device's WMMA unit is measurably not exactly-rounded (~0.5 f32 ULP), so a relative gate is
+> the tightest defensible one. B's stated cost — "it doubles the kernel surface we maintain
+> forever" — **stands and is now real**; nothing here retires it.
+>
+> **What did NOT change.** (a) Quantization stays on the Spark: probe/cost/render/export are CUDA
+> and need zero ROCm work — the ruling's load-bearing half survives intact. (b) The concern that
+> `gb/csrc/cutlass_fork/*` is "a rewrite, not a port" was **correct**: none of the CUTLASS/sm_120
+> code was ported; the HIP kernels are independently derived against the format spec, sharing only
+> `LAYOUT.md`. (c) A is still unrun — no GGUF serve on Strix, no vLLM-ROCm serve of anything, so
+> there is **no serving metric on this hardware yet** and §10's readout must not be read as one.
+> (d) C stays passive tracking. **New state:** B = "kernels authored, parity-verified and
+> benchmarked standalone; unserved". `docs/lanes/gguf.md`'s tracking table still owns A.
 
 ### R21 (L4 P4) — Persist the auto-tuner's timings; defer λ · STRUCTURAL
 

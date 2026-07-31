@@ -2020,14 +2020,44 @@ launching, build → measure → delete before the next arm. **Never write to `/
 cleared it in 2026-04 and took the MiniMax artifacts with it. Set `TMPDIR` explicitly for any
 tool reaching for `mkdtemp()`.
 
-**Strix Halo — planned, nothing designed or built.** It is the next hardware target and that is
-the entire current state: no ROCm code, no gfx1151 build path, no design document anywhere in
-the tree (a repo-wide grep for `strix|gfx1151|rocm` returns nothing outside session handovers).
-Orientation, not commitment: the native lane rides vLLM's CUTLASS W4A4/W8A8 kernels and would
-need whatever ROCm equivalents upstream provides; the gridbook CB lane is **CUDA-only today**
-(three JIT `cpp_extension` builds, a CUTLASS fork, sm_120/121-specific smem budgeting, §9.2) so
-it does not port without a deliberate HIP/Composable-Kernel effort; GGUF is the only lane whose
-serving path already runs there via llama.cpp, making it the likely first target. Uncosted.
+**Strix Halo — a second box, and a CB kernel lane that now exists in HIP.** Robert funded kernel
+authoring on 2026-07-30 ("build fp8 vllm kernels that target strix halo and support codebook
+formats"), which **supersedes re-vet R7's serving-only framing** (R7 accepted GGUF-first with
+"no ROCm build stack in scope" and left option B — a HIP port of the CB kernels — unfunded; the
+outcome note in `docs/audits/architecture_re-vet_2026-07-30.md` §R7 records the change). A box
+arrived the same day: AMD Ryzen AI MAX+ 395 / Radeon 8060S, **gfx1151**, RDNA 3.5, Fedora 44,
+ROCm 7.1.1, torch 2.9.1 with HIP, **58 GB** unified memory (not 128 — size test shapes
+accordingly), 919 GB free.
+
+`plugins/gridbook/gridbook/csrc_hip/` holds the result: a wave32 decode GEMV (fp8-CB **and**
+NVFP4_CB two-tier v2), a bf16 **WMMA** decode-in-prologue prefill GEMM, the transient expander,
+and the fused fp8 activation QDQ, sharing one format header with the CUDA lane. It **compiles,
+runs, and passes 34 pytest + 44 standalone parity cases at a 1-bf16-ULP gate against an fp64
+torch reference**, across the odd rungs, every register-tile M boundary, ragged edge tiles and
+the fused multi-role codebook case. Benchmarked: GEMV 0.171 ms at M=1 / K44 / N=5120 K=4096, and
+the WMMA GEMM ~7.8× faster than looping the GEMV at M=512 — while sitting at ~28% of nominal
+bandwidth and ~17% of nominal bf16 peak, so these are first-cut kernels, not tuned ones.
+
+**The load-bearing measured fact: RDNA 3.5 has no fp8 matrix instruction.** A device-pass
+`__has_builtin` probe (`csrc_hip/wmma_probe.hip`) shows bf16/f16/**iu8** WMMA present and every
+fp8 variant absent — those are gfx12/RDNA4. So fp8-CB here is a **storage** format decoded to
+bf16 fragments; since e4m3's 3 mantissa bits fit bf16's 7 the decode is lossless and the
+arithmetic is *better* than an fp8-MMA path, not worse. The same probe established the wave32
+fragment layout on device (`D[2*i + lane/16][lane%16]`), which is what lets the GEMM decode B
+straight into registers with no LDS tile, and measured that the WMMA unit is **not** exactly
+rounded (~0.5 f32 ULP), which is why every parity gate here is relative rather than bit-exact.
+`iu8` being present is recorded as the next measured-available lever (~2× matrix throughput on
+several AMD parts) with its accuracy cost stated, not as a plan.
+
+**Not yet true, and the docs must keep saying so:** no vLLM-ROCm serve has been attempted, so
+there is **no serving-metric claim** — no KL, no PPL, no tok/s under a real engine; the
+`linear_hip.py` dispatch is authored but never exercised inside a live serve; MoE/grouped-expert
+HIP kernels do not exist, so an MoE artifact falls back to Triton on ROCm; and the signed S-rung
+path is compiled but untested. Quantization stays on the Spark either way — R7's load-bearing
+half is unchanged, since probe/cost/render/export are CUDA and need zero ROCm work. GGUF remains
+the zero-code serving lane (§9.3). Full status, the LDS budget table per rung, the measured
+LDS-vs-global LUT policy and its shape-dependence, seven Fedora/ROCm bring-up landmines and the
+deferred-work list: `plugins/gridbook/gridbook/csrc_hip/README.md`.
 
 ## 11. History — what was tried and rejected
 
