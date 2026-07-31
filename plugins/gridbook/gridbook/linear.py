@@ -63,7 +63,7 @@ def _fp4_fused_mode() -> str:
     # arguably the *more* faithful rendering of what NVFP4 hardware serving
     # does; but it is a change in served numerics that has NOT been validated
     # on the serving metric (no KL/PPL A/B). See
-    # docs/lanes/nvfp4-cb/fp4-fused-prefill.md.
+    # docs/KERNELS.md ("Fused decode-in-prologue").
     if not _FP4_FUSED_MODE:
         _FP4_FUSED_MODE.append(
             os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip())
@@ -257,21 +257,29 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 f"{self.prefix}: checkpoint role rows {shard_widths} "
                 f"(sum {sum(shard_widths)}) != logical width sum {sum(widths)}")
         blocks, row_offsets = [], []
+        # Fused projections commonly reuse the exact same shared codebook for
+        # every role.  Keep one physical block per exact reference tuple and
+        # point all matching roles at it.  Comparing references (rather than
+        # tensor values) is deliberate: differently named codebooks remain
+        # distinct even when their current contents happen to match.
+        block_offsets: dict[tuple[str, ...], int] = {}
         cb_cumoffset = 0
         for i, sp in enumerate(shard_prefixes):
             ref = self.quant_config.target_scheme[sp]["codebook_ref"]
-            names = ref if isinstance(ref, list) else [ref]
-            subs = [codebooks[n].to(dev) for n in names]
-            flat = codec.build_flat_codebook(
-                subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
-            blocks.append(flat)
+            names = tuple(ref) if isinstance(ref, (list, tuple)) else (ref,)
+            if names not in block_offsets:
+                subs = [codebooks[n].to(dev) for n in names]
+                flat = codec.build_flat_codebook(
+                    subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
+                block_offsets[names] = cb_cumoffset
+                blocks.append(flat)
+                cb_cumoffset += flat.numel()
             w = shard_widths[i]
-            # cumulative base (not i*cb_total): correct even if per-shard
-            # codebooks differ in size. All rows of shard i point at that
-            # shard's block within the concatenated cb_flat.
-            row_offsets.append(torch.full((w,), cb_cumoffset,
+            # Exact-reference duplicates reuse their first block; distinct
+            # references retain a cumulative base (rather than i*cb_total),
+            # which remains correct when blocks differ in size.
+            row_offsets.append(torch.full((w,), block_offsets[names],
                                           dtype=torch.int32, device=dev))
-            cb_cumoffset += flat.numel()
         cb_flat = torch.cat(blocks).contiguous()
         cb_row_offset = torch.cat(row_offsets).contiguous()
 
@@ -283,6 +291,12 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             "every output row (kernels index it by row).")
         layer._cb_flat = cb_flat
         layer._cb_row_offset = cb_row_offset
+        # The fp8 mid-M fused kernel has no row-offset input: every row uses
+        # LUT base zero.  Derive and cache its safety fact without a CUDA->host
+        # sync.  One interned block means every role necessarily points at the
+        # first (zero-based) block; two or more blocks must use the offset-aware
+        # fallback paths.
+        layer._cb_fp8_fused_lut_ok = len(blocks) == 1
         dummy = torch.zeros(1, dtype=torch.float32, device=dev)
         if self.is_fp4 and self.is_v2:
             # v2: NO resident fp32 plane (spec §4/G4). The kernel composes the
@@ -384,6 +398,30 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                   f"(K={K} k={self.k} ts={self.type_size} n_sub={self.n_sub})")
         layer._cb_ptc_ok = ok
         return ok
+
+    def _fused_fp8_lut_ok(self, layer) -> bool:
+        """Whether the offset-free fp8 fused kernel can decode every row.
+
+        ``cb_fused_prefill_mm_scaled`` receives the flat LUT but no per-row
+        offsets, so it always addresses LUT base zero.  A uniform non-zero
+        base is therefore not sufficient unless the caller also slices the
+        LUT (which this path intentionally does not do).  Production layers
+        cache this fact while interning blocks at load time; the tensor check
+        is a defensive/testing fallback for manually constructed layers.  The
+        format checks pin the four-subtable fp8 layout hard-coded by the CUDA
+        prologue rather than relying on the shipped scheme menu implicitly.
+        """
+        ok = getattr(layer, "_cb_fp8_fused_lut_ok", None)
+        if ok is None:
+            ro = getattr(layer, "_cb_row_offset", None)
+            ok = (ro is not None and ro.numel() == layer._cb_N
+                  and ro.numel() > 0
+                  and bool((ro == 0).all().item()))
+            layer._cb_fp8_fused_lut_ok = ok
+        return (not self.is_fp4
+                and self.n_sub == 4
+                and self.type_size == 4 * self.k
+                and bool(ok))
 
     # -- fp4-MMA fused prefill (opt-in; see the dispatch site below) ---------
     def _fused_fp4_ok(self, layer, K: int) -> bool:
@@ -488,7 +526,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # global x per-group-16 ue4m3 SF) instead of the Triton/transient
         # paths' fp32-group-scale QDQ — the hardware SF operand is ue4m3, an
         # fp32 group scale is unrepresentable. Promotion therefore requires a
-        # served KL A/B (docs/lanes/nvfp4-cb/fp4-fused-prefill.md), which is
+        # served KL A/B (docs/KERNELS.md), which is
         # why this lands opt-in. "1" = all prefill M; "midm" = only the fp8
         # kernel's proven 16<M<=128 niche.
         if (self.is_fp4 and bias is None and M > PREFILL_M_THRESHOLD
@@ -583,7 +621,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # Step-4 rungs only (the kernel's KBits template dispatch).
         if (bias is None and 16 < x2.shape[0] <= 128
                 and self.k in (28, 32, 36, 40, 44, 48)
-                and os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0"):
+                and os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0"
+                and self._fused_fp8_lut_ok(layer)):
             from .cuda_ext import get_fused_ext
             fext = get_fused_ext()
             if fext is not None and hasattr(fext, "cb_fused_prefill_mm_scaled"):
