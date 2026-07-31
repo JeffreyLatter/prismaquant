@@ -27,8 +27,9 @@ declarative contract layer, not the executor.
 - `saturation_select` — saturation-point bit-rate selection.
 - `gguf_formats`, `gguf_iq_formats`, `gguf_gptq` — GGUF k-quant / IQ quantizers
   and the GPTQ-under-frozen-scales lever.
-- `nvfp4_cb_formats`, `nvfp4_cb_footprint` — product-codebook format specs and
-  their bpw accounting.
+- `nvfp4_cb_formats`, `nvfp4_cb_footprint` — product-codebook codecs plus the
+  versioned serialized-payload contract (production FP4 layout-v2, FP8 row
+  scales, and shared FP16 codebook sidecars).
 
 ## Archive
 

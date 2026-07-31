@@ -25,9 +25,9 @@ import pickle
 import sys
 
 import pytest
-
 import torch
 
+import prismaquant.allocator as alloc
 from prismaquant import format_registry as fr
 from prismaquant import layer_config as lcfg
 from prismaquant import measure_quant_cost as mqc
@@ -43,8 +43,7 @@ from prismaquant.allocator_candidates import (
     check_format_applicability,
 )
 from prismaquant.allocator_solver import promote_serving_units
-import prismaquant.allocator as alloc
-
+from prismaquant.nvfp4_cb_footprint import CBSerializationContext
 
 # The task's canonical mixed menu: two CB families + their native carriers.
 _MIXED_MENU = [
@@ -56,6 +55,7 @@ _ALL_CB_RUNGS = (
     + [f"NVFP4_CB_S{k}" for k in (13, 14, 15, 16)]
     + [f"FP8_CB_K{k}" for k in (36, 40, 44, 48)]
 )
+_CB_CONTEXT = CBSerializationContext.production()
 
 
 class _FakeProfile:
@@ -162,11 +162,49 @@ def test_nvfp4_cb_profile_shape_rule_256(rung):
 def test_mixed_menu_build_candidates_keeps_cb_rungs():
     specs = _menu_specs()
     stats, costs = _dense_model(specs)
-    cands = build_candidates(stats, costs, specs, target_profile="nvfp4_cb")
+    cands = build_candidates(
+        stats,
+        costs,
+        specs,
+        target_profile="nvfp4_cb",
+        cb_serialization_context=_CB_CONTEXT,
+    )
     for name in stats:
         fmts = {c.fmt for c in cands[name]}
         # Every menu rung is legal on these 256-aligned shapes (canonical names).
         assert _canon() <= fmts, f"{name} lost menu rungs: {sorted(fmts)}"
+
+
+def test_cb_candidate_bytes_use_v2_payload_and_require_context():
+    name = "model.layers.0.mlp.gate_proj"
+    specs = [fr.get_format("NVFP4_CB_K16"), fr.get_format("FP8_CB_K44")]
+    stats = {
+        name: {
+            "h_trace": 1.0,
+            "n_params": 64 * 256,
+            "in_features": 256,
+            "out_features": 64,
+        }
+    }
+    costs = {name: {spec.name: _cost_entry(0.1) for spec in specs}}
+    with pytest.raises(ValueError, match="CBSerializationContext"):
+        build_candidates(stats, costs, specs, target_profile="nvfp4_cb")
+    candidates = build_candidates(
+        stats,
+        costs,
+        specs,
+        target_profile="nvfp4_cb",
+        cb_serialization_context=_CB_CONTEXT,
+    )[name]
+    by_fmt = {candidate.fmt: candidate for candidate in candidates}
+    # FP4 v2: one 256-weight superblock per row, 4k+9 = 73 bytes.
+    assert by_fmt["NVFP4_CB_K16"].memory_bytes == 64 * 73
+    # FP8: 4k index bytes per row plus one fp32 row scale.
+    assert by_fmt["FP8_CB_K44"].memory_bytes == 64 * (4 * 44 + 4)
+    assert "two_tier" in by_fmt["NVFP4_CB_K16"].serialized_identity
+    assert "cb_codebook.lattice.NVFP4_CB_K16.sub0" in (
+        by_fmt["NVFP4_CB_K16"].serialized_identity
+    )
 
 
 def test_cb_masked_when_in_features_not_256_falls_back():
@@ -180,7 +218,8 @@ def test_cb_masked_when_in_features_not_256_falls_back():
     costs = {name: _costs_for(specs, 0.5)}
     mask_records: list[dict] = []
     cands = build_candidates(stats, costs, specs, target_profile="nvfp4_cb",
-                             mask_records=mask_records)
+                             mask_records=mask_records,
+                             cb_serialization_context=_CB_CONTEXT)
     fmts = {c.fmt for c in cands[name]}
     assert "NVFP4" in fmts and "BF16" in fmts, f"fallback rungs lost: {fmts}"
     for cb_rung in ("NVFP4_CB_K14", "NVFP4_CB_K16", "FP8_CB_K44"):
@@ -220,7 +259,13 @@ def test_mixed_menu_solve_and_fused_promotion_uniform():
     specs = _menu_specs()
     stats, costs = _dense_model(specs)
     profile = _FakeProfile()
-    cands = build_candidates(stats, costs, specs, target_profile="nvfp4_cb")
+    cands = build_candidates(
+        stats,
+        costs,
+        specs,
+        target_profile="nvfp4_cb",
+        cb_serialization_context=_CB_CONTEXT,
+    )
 
     stats_x, costs_x, cands_x = aggregate_fused_siblings(
         stats, costs, specs, cands, profile)
@@ -299,6 +344,8 @@ def _run_main(tmp_path, monkeypatch, menu, *, enforce, target="3.0"):
         "--pareto-csv", str(csv),
         "--target-profile", "nvfp4_cb",
         "--allow-default-profile",
+        "--cb-scale-coding", "two_tier",
+        "--cb-codebook-source", "lattice",
     ]
     if enforce:
         argv.append("--enforce-family-coherence")
@@ -336,6 +383,12 @@ def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
     emitted = json.loads(lc.read_text())
     names = emitted.get("assignment", emitted)
     assert names
+    assert emitted["__prismaquant__"]["cb_serialized_payload"] == {
+        "schema": "prismaquant.cb_serialized_payload.v1",
+        "scale_coding": "two_tier",
+        "layout_version": 2,
+        "codebook_source": "lattice",
+    }
     # Layer-config entries are rich dicts (AutoRound schema); canonicalize each.
     # `__prismaquant__` is the reserved allocator-metadata block (R11), not a
     # tensor entry.
@@ -525,6 +578,32 @@ def test_mixed_container_config_groups_schema(tmp_path):
     assert f"{qbf}.weight" in st and f"{qcb}.cb_qweight" in st
     assert qc["provenance"]["stock_ct_targets"] == 2
     assert qc["provenance"]["cb_targets"] == 1
+    payload = qc["provenance"]["serialized_payload"]
+    assert payload["schema"] == "prismaquant.cb_serialized_payload.v1"
+    assert payload["context"]["layout_version"] == 2
+    assert payload["tensor_payload_bytes"] == 128 * (4 * 16 + 9)
+    assert payload["codebook_sidecar_bytes"] == 2 * 256 * 4 * 2
+    assert payload["global_scale_bytes"] == 0
+    inventory = qc["provenance"]["artifact_inventory"]
+    actual_files = {
+        path.name: path.stat().st_size for path in out.iterdir() if path.is_file()
+    }
+    assert inventory["scope"] == "all_regular_files_recursive"
+    assert inventory["file_bytes"] == actual_files
+    assert inventory["export_directory_bytes"] == sum(actual_files.values())
+    assert inventory["file_bytes"]["quant_config.json"] == (
+        out / "quant_config.json"
+    ).stat().st_size
+    assert inventory["cb_serialized_payload_bytes"] == payload["total_bytes"]
+    assert inventory["cb_tensor_payload_bytes"] == payload["tensor_payload_bytes"]
+    assert inventory["cb_codebook_sidecar_bytes"] == (
+        payload["codebook_sidecar_bytes"]
+    )
+    assert inventory["safetensors_container_overhead_bytes"] > 0
+    assert inventory["non_safetensors_file_bytes"] >= (
+        inventory["file_bytes"]["config.json"]
+        + inventory["file_bytes"]["quant_config.json"]
+    )
 
 
 def test_stock_rungs_no_longer_rejected_but_junk_still_is(tmp_path):

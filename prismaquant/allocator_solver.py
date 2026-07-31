@@ -43,6 +43,11 @@ class Candidate:
     bits_per_param: float
     memory_bytes: int
     predicted_dloss: float
+    # Versioned producer-layout identity.  None for formats whose FormatSpec is
+    # already a complete serialized description.  Kept out of solver logic for
+    # backwards compatibility; reports/assertions use it to distinguish e.g.
+    # FP4-CB v1 from v2 and lattice from learned sidecars.
+    serialized_identity: str | None = None
 
 
 def _shape_from_stats(entry: dict) -> tuple[int, ...]:

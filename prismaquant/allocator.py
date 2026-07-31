@@ -117,7 +117,13 @@ from .allocator_candidates import (
     expand_fused_sibling_assignment,
     expand_packed_group_assignment,
     packed_role_split_profile,
+    serialized_candidate_payload,
     summarize_applicability_masks,
+)
+from .nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_serialization_context_stamp,
+    is_cb_format,
 )
 from .serving_profiles import (
     check_serving_format,
@@ -1334,6 +1340,26 @@ def main():
                          "meta.model / --model-override) to size the "
                          "non-quantizable floor (lm_head/embed/norms). Unpin "
                          "lm_head (--allow-pinned lm_head) to lower the floor.")
+    ap.add_argument(
+        "--cb-scale-coding",
+        choices=("v1", "two_tier"),
+        default=None,
+        help=(
+            "Exact CB producer scale layout used for candidate and artifact "
+            "bytes. Required when the body/auxiliary formats contain a CB "
+            "rung; production "
+            "passes two_tier. v1 is explicit legacy-write reproduction only."
+        ),
+    )
+    ap.add_argument(
+        "--cb-codebook-source",
+        choices=("lattice", "learned"),
+        default=None,
+        help=(
+            "Exact CB sidecar sharing policy. Required when any body/auxiliary "
+            "format is CB so codebook identity/bytes cannot be guessed."
+        ),
+    )
     ap.add_argument("--formats", default="",
                     help="Comma-separated format names to consider; empty=all")
     ap.add_argument("--allow-pinned", default="",
@@ -1618,6 +1644,32 @@ def main():
         fmt_names = cost_data["formats"]
     specs = [fr.get_format(n) for n in fmt_names]
     specs_sorted = sorted(specs, key=lambda s: s.effective_bits)
+    cb_serialization_context = None
+    cb_requested_names = [spec.name for spec in specs_sorted]
+    cb_requested_names.extend((
+        fr.get_format(args.mtp_format).name,
+        fr.get_format(args.visual_format).name,
+    ))
+    if any(is_cb_format(name) for name in cb_requested_names):
+        if args.cb_scale_coding is None or args.cb_codebook_source is None:
+            raise SystemExit(
+                "[alloc] ERROR: a CB format is present in the body or fixed "
+                "auxiliary assignment but exact serialized "
+                "context is missing. Pass --cb-scale-coding {two_tier,v1} and "
+                "--cb-codebook-source {lattice,learned}; refusing to silently "
+                "price the registry's legacy-v1 approximation."
+            )
+        cb_serialization_context = CBSerializationContext(
+            scale_coding=args.cb_scale_coding,
+            codebook_source=args.cb_codebook_source,
+        )
+        print(
+            "[alloc] CB serialized payload: "
+            f"scale_coding={cb_serialization_context.scale_coding} "
+            f"layout_version={cb_serialization_context.layout_version} "
+            f"codebook_source={cb_serialization_context.codebook_source}",
+            flush=True,
+        )
 
     # Fused-coherence guard: a multi-format menu under DefaultProfile cannot
     # enforce architecture-specific fused-sibling coherence (e.g. Qwen3.x
@@ -1747,6 +1799,7 @@ def main():
         source_manifest=source_manifest,
         target_profile=target_profile,
         mask_records=candidate_mask_records,
+        cb_serialization_context=cb_serialization_context,
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
@@ -1784,6 +1837,7 @@ def main():
             source_manifest=source_manifest,
             target_profile=target_profile,
             mask_records=candidate_mask_records,
+            cb_serialization_context=cb_serialization_context,
         )
         missing_mtp_candidates = [
             name for name in mtp_names
@@ -1854,6 +1908,7 @@ def main():
                 source_manifest=source_manifest,
                 target_profile=target_profile,
                 mask_records=candidate_mask_records,
+                cb_serialization_context=cb_serialization_context,
             )
             visual_aux_candidates = {
                 name: cand for name in visual_cost_names
@@ -1906,12 +1961,18 @@ def main():
         int(entry.get("n_params", 0) or 0) for entry in fixed_stats.values()
     )
 
-    def _bits_for_stats_entry(entry: dict, fmt: str) -> float:
+    def _bits_for_stats_entry(entry: dict, fmt: str, qname: str) -> float:
         shape = _shape_from_stats(entry)
-        return 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
+        payload_bytes, _identity = serialized_candidate_payload(
+            fr.get_format(fmt),
+            shape,
+            qname=qname,
+            cb_serialization_context=cb_serialization_context,
+        )
+        return 8.0 * payload_bytes
 
     fixed_total_bits = sum(
-        _bits_for_stats_entry(fixed_stats[name], fmt)
+        _bits_for_stats_entry(fixed_stats[name], fmt, name)
         for name, fmt in fixed_format_assignment.items()
         if name in fixed_stats
     )
@@ -2130,7 +2191,13 @@ def main():
                 total += 8.0 * memory_map[fmt]
                 continue
             shape = _shape_from_stats(entry)
-            total += 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
+            payload_bytes, _identity = serialized_candidate_payload(
+                fr.get_format(fmt),
+                shape,
+                qname=name,
+                cb_serialization_context=cb_serialization_context,
+            )
+            total += 8.0 * payload_bytes
         return float(total)
 
     pareto_seed_records: list[dict] = []
@@ -2296,6 +2363,7 @@ def main():
                 source_manifest=ctx["source_manifest"],
                 regime=ctx["regime"],
                 context="pareto candidate footprint",
+                cb_serialization_context=cb_serialization_context,
             )["artifact_bytes"])
         except Exception as exc:
             print(f"[alloc] WARNING: could not price a Pareto candidate: {exc}",
@@ -2530,6 +2598,7 @@ def main():
                     source_manifest=src_manifest,
                     regime=regime,
                     context=ctx,
+                    cb_serialization_context=cb_serialization_context,
                 )
             except ValueError as exc:
                 # House idiom for an operator-facing fatal in main(): a
@@ -2988,6 +3057,11 @@ def main():
         "target_profile_default": str(args.target_profile_default or "research"),
         "target_bits": float(args.target_bits),
         "achieved_bits": float(achieved),
+        **({
+            "cb_serialized_payload": cb_serialization_context_stamp(
+                cb_serialization_context
+            ),
+        } if cb_serialization_context is not None else {}),
     }
 
     out = Path(args.layer_config)

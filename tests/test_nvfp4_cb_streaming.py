@@ -121,6 +121,17 @@ def test_streaming_byte_identical_dense_and_stacked(workdir):
     assert qm["config_groups"] == qs["config_groups"]
     assert qm["ignore"] == qs["ignore"]
     assert qs["provenance"]["streaming"] is True
+    for root, config in ((workdir / "m", qm), (workdir / "s", qs)):
+        inventory = config["provenance"]["artifact_inventory"]
+        files = {
+            path.relative_to(root).as_posix(): path.stat().st_size
+            for path in root.rglob("*") if path.is_file()
+        }
+        assert inventory["file_bytes"] == files
+        assert inventory["export_directory_bytes"] == sum(files.values())
+        assert inventory["cb_serialized_payload_bytes"] == (
+            config["provenance"]["serialized_payload"]["total_bytes"]
+        )
     # codebook sidecars identical
     cbm = load_file(str(workdir / "m" / "cm.pqcb")) if (
         workdir / "m" / "cm.pqcb").exists() else None

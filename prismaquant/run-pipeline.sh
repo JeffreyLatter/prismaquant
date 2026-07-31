@@ -86,6 +86,12 @@ PIPELINE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 1024 is the analogy-to-GGUF starting point pending a CB-specific
 # measurement (docs/lanes/nvfp4-cb/format-pipeline.md open-Q 6).
 : "${EXPORT_CONTAINER:=compressed-tensors}"
+if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
+  # Producer identity must be fixed before allocation: candidate bytes and the
+  # final export must describe the same layout and shared sidecars.
+  : "${CB_CODEBOOK_SOURCE:=lattice}"
+  : "${CB_SCALE_CODING:=two_tier}"
+fi
 if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   : "${ACTIVATION_ROWS_LIMIT:=1024}"
 else
@@ -1264,6 +1270,13 @@ ALLOCATOR_BUDGET_ARGS=()
 if [[ -n "$TARGET_DISK_GB" ]]; then
   ALLOCATOR_BUDGET_ARGS=(--target-disk-gb "$TARGET_DISK_GB")
 fi
+ALLOCATOR_CB_ARGS=()
+if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
+  ALLOCATOR_CB_ARGS=(
+    --cb-scale-coding "$CB_SCALE_CODING"
+    --cb-codebook-source "$CB_CODEBOOK_SOURCE"
+  )
+fi
 python3 -m prismaquant.allocator \
   --probe "${PROBE_PATH}" \
   --costs "${COST_PATH}" \
@@ -1271,6 +1284,7 @@ python3 -m prismaquant.allocator \
   --formats "$FORMATS" \
   "${ALLOCATOR_PROFILE_ARGS[@]}" \
   "${ALLOCATOR_BUDGET_ARGS[@]+"${ALLOCATOR_BUDGET_ARGS[@]}"}" \
+  "${ALLOCATOR_CB_ARGS[@]+"${ALLOCATOR_CB_ARGS[@]}"}" \
   --pareto-targets "$PARETO_TARGETS" \
   --visual-format "$VISUAL_FORMAT" \
   --visual-sensitivity "$VISUAL_SENSITIVITY" \
@@ -1871,10 +1885,11 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # cache. Requires the nvfp4_cb serving profile (gated above); the cost render
   # only has to be imatrix-weighted, which the R3 assertion enforces.
   : "${CB_OUT:=${WORK_DIR}/exported_nvfp4_cb}"
-  # Codebook source: `lattice` (deterministic fixed FP4/FP8 lattice, no
-  # sidecar) or `learned` (shared per-(role) codebooks trained at export
-  # time, sidecar amortized ~0 bpw — the byte-competitive champion in
-  # Phase 0; per-tensor learned is footprint-prohibitive, never used).
+  # Codebook source: `lattice` (deterministic fixed FP4/FP8 tables, one FP16
+  # sidecar set per format) or `learned` (shared per-(role) FP16 codebooks
+  # trained at export time). Both are real serialized sidecars and allocator
+  # whole-artifact pricing charges each physical identity once; per-tensor
+  # learned is footprint-prohibitive and never used.
   : "${CB_CODEBOOK_SOURCE:=lattice}"
   : "${CB_CODEBOOK_ITERS:=4}"
   : "${CB_CODEBOOK_SEED:=0}"

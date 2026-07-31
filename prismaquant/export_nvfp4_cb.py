@@ -14,7 +14,8 @@ target Linear with the **same** weighted closure the cost measured
 tensor verbatim (bf16 passthrough), and emit:
 
   * ``<name>.cb_qweight``  uint8 (rows, bytes_per_row) — the §1 superblock byte
-    stream (index bits + fp4 group-16 E4M3 scale plane; fp8 index bits only);
+    stream (index bits + fp4 versioned scale plane: production-v2 two-tier,
+    explicit legacy-v1 E4M3-direct; fp8 index bits only);
   * ``<name>.weight_scale`` fp32 (out_features,) — fp8 families only (fp8 has no
     on-disk scale plane; the plane is per-output-channel);
   * ``cb_codebook.<ref>.<fmt>[.sub{i}]`` fp16 — the resolved codebook, shipped
@@ -42,6 +43,16 @@ from prismaquant import nvfp4_cb_formats as cb
 from prismaquant.layer_config import (
     _NVFP4_CB_FORMAT_NAMES,
     load_assignment,
+    read_layer_config_metadata,
+)
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    cb_payload_summary,
+    cb_tensor_payload_breakdown,
+    finalize_cb_export_artifact_inventory,
+    validate_cb_sidecar_tensors,
+    validate_cb_serialization_context_stamp,
 )
 
 # This exporter's own declaration of what the mixed CB container can carry —
@@ -55,11 +66,6 @@ from prismaquant.layer_config import (
 EXPORTABLE_FORMATS = frozenset(_NVFP4_CB_FORMAT_NAMES) | frozenset(
     {"NVFP4", "FP8_E4M3", "FP8_SOURCE", "BF16"}
 )
-
-# Codebook entry bytes for the sidecar-honest footprint (footprint.py owns the
-# real accounting; recorded here in provenance for cross-checking).
-_CB_FAMILY_ENTRY_BYTES = {"fp4": 4, "fp8": 8}
-
 
 def _git_commit() -> str:
     from prismaquant.aura_cost import _git_commit as _aura_git_commit
@@ -296,15 +302,29 @@ def _train_shared_codebook(weights, cws, *, grid, mode, k, seed, iters,
                              seed=seed).cpu()
 
 
+def _codebook_tensor_names(ref: str, fmt: str, codebook) -> tuple[str, ...]:
+    """Physical sidecar tensor names for a resolved codebook object."""
+    base = f"cb_codebook.{ref}.{fmt}"
+    if isinstance(codebook, (tuple, list)):
+        return tuple(f"{base}.sub{i}" for i in range(len(codebook)))
+    return (base,)
+
+
 def _codebook_tensors(ref: str, fmt: str, codebook) -> dict[str, torch.Tensor]:
     """Serialize a codebook (single table or product sub-table tuple) to fp16
     safetensors tensors under ``cb_codebook.<ref>.<fmt>[.sub{i}]`` (grid values
     are exact in fp16 for both the E2M1 and E4M3 grids)."""
-    base = f"cb_codebook.{ref}.{fmt}"
     if isinstance(codebook, (tuple, list)):
-        return {f"{base}.sub{i}": t.to(torch.float16).cpu().contiguous()
-                for i, t in enumerate(codebook)}
-    return {base: codebook.to(torch.float16).cpu().contiguous()}
+        return {
+            name: tensor.to(torch.float16).cpu().contiguous()
+            for name, tensor in zip(
+                _codebook_tensor_names(ref, fmt, codebook), codebook
+            )
+        }
+    return {
+        _codebook_tensor_names(ref, fmt, codebook)[0]:
+        codebook.to(torch.float16).cpu().contiguous()
+    }
 
 
 def export_nvfp4_cb(
@@ -316,7 +336,7 @@ def export_nvfp4_cb(
     shared_codebook_spec: dict | None = None,
     device: str | None = None,
     scale_sweep: bool = True,
-    scale_coding: str = cb.SCALE_CODING_V1,
+    scale_coding: str = cb.SCALE_CODING_TWO_TIER,
 ) -> dict[str, int]:
     """Export a CB checkpoint. See module docstring / LAYOUT.md for the layout.
 
@@ -324,18 +344,16 @@ def export_nvfp4_cb(
     (imatrix / Fisher). ``shared_codebook_spec`` (or None) selects the codebook
     source:
 
-      * ``None`` / ``{"source": "lattice"}`` — the deterministic fixed lattice
-        (no per-tensor sidecar), shipped once per format;
+      * ``None`` / ``{"source": "lattice"}`` — the deterministic fixed lattice,
+        shipped as one shared FP16 sidecar table set per format;
       * ``{"source": "learned", "train": True, "iters", "seed", "train_cap"}`` —
         a shared per-(role) learned codebook trained here on pooled vectors;
       * ``{"source": "learned", "codebooks": {role: cb_obj}}`` — use provided
         per-role codebooks (a missing role for a target hard-fails).
 
-    ``scale_coding``: ``"v1"`` (default; e4m3-direct scale plane) or
-    ``"two_tier"`` (layout v2, fp4 targets only — writes ``layout_version: 2``
-    + a ``scale_coding`` scheme section; two-tier-scale-spec.md). v2 artifacts
-    may only SHIP once the plugin serves them M1-native (spec §4/G4); default
-    stays v1 until those gates clear.
+    ``scale_coding``: ``"two_tier"`` (production layout v2; fp4 targets write
+    4k+9 bytes per superblock) or explicit legacy ``"v1"`` (4k+16). Readers
+    remain backward compatible with v1; new artifacts default to v2.
     """
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
@@ -533,9 +551,30 @@ def export_nvfp4_cb(
         for q in qnames:
             target_cb[q] = (ref, fmt, codebooks[(ref, fmt)], kind)
 
+    # Bind byte pricing to the exact physical sidecar refs this artifact will
+    # write.  This identity is shared by allocation/reporting/export checks;
+    # no producer path silently assumes the legacy-v1 scale plane.
+    serialization_context = CBSerializationContext(
+        scale_coding=scale_coding,
+        codebook_source=source,
+        codebook_refs={
+            qname: _codebook_tensor_names(ref, fmt, codebook)
+            for qname, (ref, fmt, codebook, _kind) in target_cb.items()
+        },
+    )
+    recipe_meta = read_layer_config_metadata(layer_config_path)
+    validate_cb_serialization_context_stamp(
+        recipe_meta.get("cb_serialized_payload"),
+        serialization_context,
+        where="export_nvfp4_cb",
+    )
+
     # --- Pack targets; copy everything else verbatim. ---
     out_tensors: dict[str, torch.Tensor] = {}
     cb_tensor_blobs: dict[str, torch.Tensor] = {}
+    cb_serialized_shapes: dict[str, tuple[int, ...]] = {}
+    cb_output_tensor_names: set[str] = set()
+    actual_cb_tensor_bytes = 0
     counts: Counter[str] = Counter()
     ignore: list[str] = []
     packed_qnames = set(cb_targets)
@@ -596,12 +635,48 @@ def export_nvfp4_cb(
                 # uint8 (E, out, bytes_per_row); fp8 per-channel scales
                 # (E, out). LAYOUT.md §3 (stacked experts).
                 packed = packed.reshape(w.shape[0], w.shape[1], -1)
-            out_tensors[ckpt_qname + ".cb_qweight"] = packed.to(
-                torch.uint8).cpu().contiguous()
+            packed_out = packed.to(torch.uint8).cpu().contiguous()
+            payload = cb_tensor_payload_breakdown(
+                fmt,
+                tuple(int(dim) for dim in w.shape),
+                qname=canon,
+                context=serialization_context,
+            )
+            packed_bytes = packed_out.numel() * packed_out.element_size()
+            if packed_bytes != payload["packed_weight_bytes"]:
+                raise AssertionError(
+                    f"{canon}: serialized cb_qweight is {packed_bytes}B, "
+                    f"accounting expected {payload['packed_weight_bytes']}B"
+                )
+            packed_name = ckpt_qname + ".cb_qweight"
+            out_tensors[packed_name] = packed_out
+            cb_output_tensor_names.add(packed_name)
+            scale_bytes = 0
             if grid == "fp8":
                 ws = fields["scales"].reshape(
-                    *w.shape[:-1]).to(torch.float32)
-                out_tensors[ckpt_qname + ".weight_scale"] = ws.cpu().contiguous()
+                    *w.shape[:-1]).to(torch.float32).cpu().contiguous()
+                scale_bytes = ws.numel() * ws.element_size()
+                if scale_bytes != payload["fp8_row_scale_bytes"]:
+                    raise AssertionError(
+                        f"{canon}: serialized weight_scale is {scale_bytes}B, "
+                        "accounting expected "
+                        f"{payload['fp8_row_scale_bytes']}B"
+                    )
+                scale_name = ckpt_qname + ".weight_scale"
+                out_tensors[scale_name] = ws
+                cb_output_tensor_names.add(scale_name)
+            elif payload["fp8_row_scale_bytes"]:
+                raise AssertionError(
+                    f"{canon}: FP4-CB unexpectedly priced an FP8 row scale"
+                )
+            actual = packed_bytes + scale_bytes
+            if actual != payload["tensor_payload_bytes"]:
+                raise AssertionError(
+                    f"{canon}: emitted {actual}B of CB tensor payload, "
+                    f"accounting expected {payload['tensor_payload_bytes']}B"
+                )
+            cb_serialized_shapes[canon] = tuple(int(dim) for dim in w.shape)
+            actual_cb_tensor_bytes += actual
             counts[fmt] += 1
         elif canon in stock_targets:
             # Stock rung: CT-pack via the shared compressed-tensors codec
@@ -637,6 +712,31 @@ def export_nvfp4_cb(
         for tname, blob in _codebook_tensors(ref, fmt, codebook).items():
             cb_tensor_blobs[tname] = blob
     codebook_file = "cb_codebooks.pqcb" if cb_tensor_blobs else None
+
+    if set(cb_serialized_shapes) != set(cb_targets):
+        missing = sorted(set(cb_targets) - set(cb_serialized_shapes))
+        extra = sorted(set(cb_serialized_shapes) - set(cb_targets))
+        raise AssertionError(
+            "CB serialized-payload coverage does not match assignment: "
+            f"missing={missing[:5]}, extra={extra[:5]}"
+        )
+    serialized_payload = cb_assignment_payload_breakdown(
+        {qname: assignment[qname] for qname in cb_targets},
+        cb_serialized_shapes,
+        context=serialization_context,
+    )
+    if actual_cb_tensor_bytes != serialized_payload["tensor_payload_bytes"]:
+        raise AssertionError(
+            f"emitted CB tensor payload is {actual_cb_tensor_bytes}B, "
+            "assignment accounting expected "
+            f"{serialized_payload['tensor_payload_bytes']}B"
+        )
+    validate_cb_sidecar_tensors(
+        serialized_payload,
+        cb_tensor_blobs,
+        where="export_nvfp4_cb",
+    )
+    serialized_payload_summary = cb_payload_summary(serialized_payload)
 
     # --- Provenance hashes. ---
     assignment_sha = hashlib.sha256(json.dumps(
@@ -758,6 +858,7 @@ def export_nvfp4_cb(
             "cb_targets": len(cb_targets),
             "stock_ct_targets": len(stock_targets),
             "fp8_source_targets": len(source_targets),
+            "serialized_payload": serialized_payload_summary,
             "tensor_formats": {
                 q: assignment[q]
                 for q in sorted(set(cb_targets) | set(stock_targets)
@@ -779,8 +880,6 @@ def export_nvfp4_cb(
         save_file({k: v.contiguous() for k, v in cb_tensor_blobs.items()},
                   str(out_dir / codebook_file),
                   metadata={"format": "pt", "quant_method": "gridbook"})
-    (out_dir / "quant_config.json").write_text(
-        json.dumps(quant_config, indent=2, sort_keys=True))
     src_config = model_dir / "config.json"
     config = json.loads(src_config.read_text()) if src_config.exists() else {}
     config["quantization_config"] = {
@@ -805,6 +904,17 @@ def export_nvfp4_cb(
         p = model_dir / aux
         if p.exists():
             (out_dir / aux).write_bytes(p.read_bytes())
+    # Final measured bytes are a separate scope from CB tensor-data pricing:
+    # include safetensors headers, JSON, tokenizer files, and every other
+    # regular file.  The helper embeds a self-consistent inventory in
+    # quant_config.json and re-checks the exact CB spans in the final files.
+    finalize_cb_export_artifact_inventory(
+        out_dir,
+        quant_config,
+        serialized_payload=serialized_payload_summary,
+        cb_tensor_names=sorted(cb_output_tensor_names),
+        codebook_file=codebook_file,
+    )
     return dict(counts)
 
 
@@ -825,18 +935,18 @@ def main(argv: list[str] | None = None) -> None:
                     help="pickle: {qname: per-column importance tensor}")
     ap.add_argument("--codebook-source", default="lattice",
                     choices=["lattice", "learned"],
-                    help="fixed lattice (no sidecar) or shared per-role "
+                    help="fixed lattice sidecar or shared per-role "
                     "learned codebooks trained at export time")
     ap.add_argument("--codebook-iters", type=int, default=4)
     ap.add_argument("--codebook-seed", type=int, default=0)
     ap.add_argument("--no-scale-sweep", action="store_true",
                     help="one-shot amax/grid-max scale (A/B only; default is "
                     "the joint scale sweep, IQ-rendering parity)")
-    ap.add_argument("--scale-coding", default=cb.SCALE_CODING_V1,
+    ap.add_argument("--scale-coding", default=cb.SCALE_CODING_TWO_TIER,
                     choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER],
-                    help="fp4 scale coding: v1 e4m3 plane (default) or the "
-                    "layout-v2 two-tier super+sub coding (writes "
-                    "layout_version 2; serve gates pending — do not ship)")
+                    help="fp4 scale coding: production layout-v2 two-tier "
+                    "super+sub coding (default), or explicit legacy v1 e4m3 "
+                    "plane for backward-compatible artifacts")
     ap.add_argument("--device", default=None)
     args = ap.parse_args(argv)
     from prismaquant.gpu_guard import require_cuda_hot_path

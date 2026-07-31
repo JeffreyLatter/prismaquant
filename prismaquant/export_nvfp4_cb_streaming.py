@@ -60,10 +60,9 @@ import torch
 from safetensors import safe_open
 
 from prismaquant import nvfp4_cb_formats as cb
-from prismaquant.layer_config import load_assignment
-from prismaquant.model_profiles import detect_profile
 from prismaquant.export_nvfp4_cb import (
     _canonical_qname,
+    _codebook_tensor_names,
     _codebook_tensors,
     _export_base_name,
     _git_commit,
@@ -71,6 +70,17 @@ from prismaquant.export_nvfp4_cb import (
     _role_of,
     _to_device,
     _try_resolve_skeleton,
+)
+from prismaquant.layer_config import load_assignment, read_layer_config_metadata
+from prismaquant.model_profiles import detect_profile
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    cb_payload_summary,
+    cb_tensor_payload_breakdown,
+    finalize_cb_export_artifact_inventory,
+    validate_cb_sidecar_tensors,
+    validate_cb_serialization_context_stamp,
 )
 
 # safetensors dtype string codes for the tensors we emit.
@@ -630,7 +640,7 @@ def export_nvfp4_cb_streaming(
     shared_codebook_spec: dict | None = None,
     device: str | None = None,
     scale_sweep: bool = True,
-    scale_coding: str = cb.SCALE_CODING_V1,
+    scale_coding: str = cb.SCALE_CODING_TWO_TIER,
     subset_prefixes: list[str] | None = None,
     reuse_prior: str | Path | None = None,
     reuse_verify: int = 3,
@@ -893,6 +903,21 @@ def export_nvfp4_cb_streaming(
         for q in qnames:
             target_cb[q] = (ref, fmt, codebooks[(ref, fmt)], kind)
 
+    serialization_context = CBSerializationContext(
+        scale_coding=scale_coding,
+        codebook_source=source,
+        codebook_refs={
+            qname: _codebook_tensor_names(ref, fmt, codebook)
+            for qname, (ref, fmt, codebook, _kind) in target_cb.items()
+        },
+    )
+    recipe_meta = read_layer_config_metadata(layer_config_path)
+    validate_cb_serialization_context_stamp(
+        recipe_meta.get("cb_serialized_payload"),
+        serialization_context,
+        where="export_nvfp4_cb_streaming",
+    )
+
     # DELTA-EXPORT: a CB group's codebook is a byte-copy input, so compare this
     # run's serialized codebook against the prior sidecar ONCE per (ref, fmt).
     # A group whose codebook differs makes every target on it re-encode.
@@ -917,6 +942,9 @@ def export_nvfp4_cb_streaming(
     source_set = set(source_targets)
     stock_set = set(stock_targets)
     emitted_bases: set[str] = set()   # checkpoint tensor keys we consume
+    cb_serialized_shapes: dict[str, tuple[int, ...]] = {}
+    cb_output_tensor_names: set[str] = set()
+    planned_cb_tensor_bytes = 0
 
     # CB + FP8_SOURCE targets (keyed by canonical/recipe qname).
     for qname in list(cb_targets) + list(source_targets):
@@ -955,6 +983,19 @@ def export_nvfp4_cb_streaming(
             emitted_bases.add(h)
         packed_shape = ((shape[0], shape[1], n_sb * ts) if len(shape) == 3
                         else (rows, n_sb * ts))
+        payload = cb_tensor_payload_breakdown(
+            fmt,
+            shape,
+            qname=qname,
+            context=serialization_context,
+        )
+        planned_packed_bytes = _nbytes(torch.uint8, packed_shape)
+        if planned_packed_bytes != payload["packed_weight_bytes"]:
+            raise AssertionError(
+                f"{qname}: streaming cb_qweight plan is "
+                f"{planned_packed_bytes}B, accounting expected "
+                f"{payload['packed_weight_bytes']}B"
+            )
         state: dict = {}
 
         def _pack(qname=qname, h=(kind, h), grid=grid, mode=mode, k=k,
@@ -969,10 +1010,30 @@ def export_nvfp4_cb_streaming(
         qw_name = export_base + ".cb_qweight"
         scale_shape = tuple(int(d) for d in shape[:-1])
         scale_name = export_base + ".weight_scale"
+        planned_scale_bytes = (
+            _nbytes(torch.float32, scale_shape) if grid == "fp8" else 0
+        )
+        if planned_scale_bytes != payload["fp8_row_scale_bytes"]:
+            raise AssertionError(
+                f"{qname}: streaming row-scale plan is "
+                f"{planned_scale_bytes}B, accounting expected "
+                f"{payload['fp8_row_scale_bytes']}B"
+            )
+        planned_tensor_bytes = planned_packed_bytes + planned_scale_bytes
+        if planned_tensor_bytes != payload["tensor_payload_bytes"]:
+            raise AssertionError(
+                f"{qname}: streaming CB tensor plan is "
+                f"{planned_tensor_bytes}B, accounting expected "
+                f"{payload['tensor_payload_bytes']}B"
+            )
+        cb_serialized_shapes[qname] = tuple(int(dim) for dim in shape)
+        planned_cb_tensor_bytes += planned_tensor_bytes
         # Planned output tensors (name, dtype, shape) — the eligibility gate.
         expected = [(qw_name, torch.uint8, packed_shape)]
+        cb_output_tensor_names.add(qw_name)
         if grid == "fp8":
             expected.append((scale_name, torch.float32, scale_shape))
+            cb_output_tensor_names.add(scale_name)
 
         # DELTA-EXPORT eligibility: same format + scheme signature + byte-equal
         # codebook + every planned output already present in the prior at the
@@ -1128,10 +1189,33 @@ def export_nvfp4_cb_streaming(
         for tname, blob in _codebook_tensors(ref, fmt, codebook).items():
             cb_tensor_blobs[tname] = blob
     codebook_file = "cb_codebooks.pqcb" if cb_tensor_blobs else None
+    if set(cb_serialized_shapes) != set(cb_targets):
+        missing = sorted(set(cb_targets) - set(cb_serialized_shapes))
+        extra = sorted(set(cb_serialized_shapes) - set(cb_targets))
+        raise AssertionError(
+            "streaming CB payload coverage does not match assignment: "
+            f"missing={missing[:5]}, extra={extra[:5]}"
+        )
+    serialized_payload = cb_assignment_payload_breakdown(
+        {qname: assignment[qname] for qname in cb_targets},
+        cb_serialized_shapes,
+        context=serialization_context,
+    )
+    if planned_cb_tensor_bytes != serialized_payload["tensor_payload_bytes"]:
+        raise AssertionError(
+            f"streaming CB plan is {planned_cb_tensor_bytes}B, accounting "
+            f"expected {serialized_payload['tensor_payload_bytes']}B"
+        )
+    validate_cb_sidecar_tensors(
+        serialized_payload,
+        cb_tensor_blobs,
+        where="export_nvfp4_cb_streaming",
+    )
+    serialized_payload_summary = cb_payload_summary(serialized_payload)
     quant_config = _build_config(
         assignment, cb_targets, source_targets, stock_targets, by_group,
         codebooks, col_weights, cb_tensor_blobs, ignore, codebook_file,
-        scale_coding, source, profile)
+        scale_coding, source, profile, serialized_payload_summary)
 
     # DELTA-EXPORT: verify sampled copies + log the summary BEFORE writing (an
     # abort here leaves no partial artifact). No-op when reuse is disabled.
@@ -1147,8 +1231,6 @@ def export_nvfp4_cb_streaming(
     if cb_tensor_blobs:
         save_file(cb_tensor_blobs, str(out_dir / codebook_file),
                   metadata={"format": "pt"})
-    (out_dir / "quant_config.json").write_text(
-        json.dumps(quant_config, indent=2, sort_keys=True))
     src_config = model_dir / "config.json"
     config = json.loads(src_config.read_text()) if src_config.exists() else {}
     config["quantization_config"] = {
@@ -1163,6 +1245,16 @@ def export_nvfp4_cb_streaming(
         p = model_dir / aux
         if p.exists():
             (out_dir / aux).write_bytes(p.read_bytes())
+    # Persist and assert a final filesystem inventory distinct from the CB
+    # tensor-data payload contract.  This includes both safetensors headers,
+    # JSON configs, tokenizer assets, and all other regular output files.
+    finalize_cb_export_artifact_inventory(
+        out_dir,
+        quant_config,
+        serialized_payload=serialized_payload_summary,
+        cb_tensor_names=sorted(cb_output_tensor_names),
+        codebook_file=codebook_file,
+    )
     return dict(counts)
 
 
@@ -1227,7 +1319,8 @@ def _train_shared_codebook_streaming(skeleton, profile, expert_groups,
 
 def _build_config(assignment, cb_targets, source_targets, stock_targets,
                   by_group, codebooks, col_weights, cb_tensor_blobs, ignore,
-                  codebook_file, scale_coding, source, profile):
+                  codebook_file, scale_coding, source, profile,
+                  serialized_payload_summary):
     """quant_config.json — mirrors export_nvfp4_cb's config emitter exactly
     (CB config_groups keyed by scheme signature + stock-CT / FP8_SOURCE groups
     in the exact compressed-tensors vocabulary + provenance)."""
@@ -1316,6 +1409,7 @@ def _build_config(assignment, cb_targets, source_targets, stock_targets,
             "streaming": True, "cb_targets": len(cb_targets),
             "stock_ct_targets": len(stock_targets),
             "fp8_source_targets": len(source_targets),
+            "serialized_payload": serialized_payload_summary,
         },
     }
     if scale_coding == cb.SCALE_CODING_TWO_TIER:
@@ -1335,8 +1429,13 @@ def main(argv=None) -> None:
     ap.add_argument("--codebook-iters", type=int, default=4)
     ap.add_argument("--codebook-seed", type=int, default=0)
     ap.add_argument("--no-scale-sweep", action="store_true")
-    ap.add_argument("--scale-coding", default=cb.SCALE_CODING_V1,
-                    choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER])
+    ap.add_argument(
+        "--scale-coding",
+        default=cb.SCALE_CODING_TWO_TIER,
+        choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER],
+        help="production layout-v2 two-tier coding (default), or explicit "
+        "legacy v1 for backward-compatible artifacts",
+    )
     ap.add_argument("--device", default=None)
     ap.add_argument("--subset-prefix", action="append", default=None,
                     metavar="PREFIX",
