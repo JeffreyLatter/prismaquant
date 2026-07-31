@@ -299,6 +299,16 @@ it is Hy3-only), reporting the `h_trace`-weighted column the CSV already carries
 loses the act-weighted majority on either model, re-plan before spending a serve
 window; if it wins, it is a screen and nothing more.
 
+**RUN 2026-07-30 — no STOP; results in `format_choice_4p5_stage0_results.md`.**
+27B (496 units) and 4B (252 units) both hold the act-weighted majority: 99.4% and
+100.0% under the production-faithful imatrix codebook fit (Σ h·mse ratios 0.405 /
+0.472), 62.9% and 89.3% under the unweighted fit the Hy3 screen used. The stop
+condition is not met; **nothing is promoted** and Stages 1–2 are unchanged. Two
+caveats recorded there: the `h_trace` column of the shipped Hy3 CSV is all `1.0`
+(tool bug, now fixed), and the Σ h·mse aggregate inverts in the fit/scoring
+mismatched cells on both models — so a CB cost run must render with the imatrix
+to be comparable at all.
+
 ### Stage 1 — small-scale-first screens (0.6B + 4B)
 
 Two matched-byte 4.5 allocations per model, native menu vs CB menu,

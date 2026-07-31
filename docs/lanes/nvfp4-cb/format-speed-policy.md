@@ -13,6 +13,33 @@ the joint menu already lets the allocator pick NVFP4 there on accuracy
 alone. Part of CB's edge is structural: fp8 rungs run A8 activations where
 native NVFP4 runs A4.
 
+> **CORRECTION 2026-07-30 — two of the three figures above are artefacts of
+> the screen, not properties of the formats. The conclusion survives and in
+> fact strengthens; the numbers do not.** Evidence:
+> `docs/design/format_choice_4p5_stage0_results.md`.
+> 1. **`h_trace` in the shipped Hy3 CSV is degenerate — literally `1.0` on all
+>    503 rows** (verified). `probe.get("h_trace", probe)` never resolved, so no
+>    h_trace weighting was ever applied. Fixed in the script.
+> 2. **The codebook was fitted *unweighted* and then scored act-weighted** — an
+>    objective mismatch, since production always fits with `col_weights`
+>    (`harvest_cb_col_weights` → cache/export). Re-run under the
+>    production-faithful fit, K36 wins the act-weighted majority **99.4%
+>    (493/496) on the 27B and 100% on the 4B**, versus 62.9% / 89.3% under the
+>    mismatched fit — which also inverted Σ h·mse (1.395 and 4.466), each
+>    inversion carried by a single high-`h_trace` `down_proj`.
+> 3. **"42 outlier-row units favor NVFP4" is fit-convention-dependent, not
+>    structural.** The 27B's equivalent cell gives 184 under the mismatched fit
+>    and collapses to **3 of 496** when fitted as production renders — all
+>    `linear_attn.in_proj_a` (48 rows, `h_trace` 0.68 vs model median 834,
+>    **0.0% aggregate share**); the 4B has **zero**. The Hy3 figure itself is
+>    now unverifiable (its source dir is deleted).
+> 4. "87% act-weighted" was the `dense/attn` role alone (86.6%); overall Hy3 is
+>    91.7%.
+>
+> **What is unchanged:** the no-format-bans policy below, and the direction of
+> the result — at matched 4.5 bpw fp8-CB beats vanilla NVFP4 on the cost model.
+> It remains a cost-model screen, not a served result.
+
 **Speed at matched bpw** (served, 2026-07-23..27):
 - **Decode: neutral.** CB decode is at per-byte parity (measured twice:
   27B vs AURA; Laguna vs poolside NVFP4 — tok/s ratio == byte ratio). At
