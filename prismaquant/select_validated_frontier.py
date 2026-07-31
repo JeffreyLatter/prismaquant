@@ -863,9 +863,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-assignment", required=True)
     parser.add_argument("--output-summary", required=True)
     args = parser.parse_args(argv)
-    from prismaquant.gpu_guard import require_cuda_hot_path
-    require_cuda_hot_path("select_validated_frontier")
-
+    # This stage is pure JSON/frontier post-processing. GPU-or-bust applies to
+    # tensor hot paths (probe, render, export, validation), not this selector.
     payload = _load_json(args.validation_json)
     results = payload.get("results") if isinstance(payload, Mapping) else None
     if not isinstance(results, list):
