@@ -128,9 +128,13 @@ from .nvfp4_cb_footprint import (
     cb_assignment_payload_breakdown,
     cb_assignment_serialization_stamps,
     cb_serialization_context_stamp,
+    cb_tensor_payload_breakdown,
     is_cb_format,
+    load_cb_codebook_digest_manifest,
     validate_cb_cost_provenance,
+    whole_artifact_budget_stamp,
 )
+from .footprint import nvfp4_global_sidecar_bytes
 from .serving_profiles import (
     check_serving_format,
     require_per_role_expert_scheme_support,
@@ -751,6 +755,7 @@ def _build_bit_attribution(
     candidates: dict[str, list[Candidate]],
     stats_entry_for,
     format_specs: dict[str, "fr.FormatSpec"],
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """Build (buckets, per_linear_rows, body_totals) for the bit-attribution
     report over the FINAL resolved body assignment.
@@ -765,8 +770,10 @@ def _build_bit_attribution(
     """
     buckets: dict[tuple[str, str], dict] = {}
     per_linear: list[dict] = []
-    body_bits = 0.0
+    body_tensor_bits = 0.0
     body_params = 0
+    cb_assignment: dict[str, str] = {}
+    cb_shapes: dict[str, tuple[int, ...]] = {}
 
     for name, fmt in assignment_expanded.items():
         if _is_visual_linear(name) or _is_mtp_linear(name):
@@ -783,7 +790,29 @@ def _build_bit_attribution(
         cand = _find_candidate_for_format(candidates, name, fmt)
         bits = None
         pred_dloss = None
-        if cand is not None:
+        if is_cb_format(fmt):
+            if cb_serialization_context is None:
+                raise ValueError(
+                    f"bit attribution cannot price {name}={fmt} without "
+                    "CBSerializationContext"
+                )
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"bit attribution cannot price {name}={fmt} without shape stats"
+                )
+            shape = _shape_from_stats(entry)
+            item = cb_tensor_payload_breakdown(
+                fmt,
+                shape,
+                qname=name,
+                context=cb_serialization_context,
+            )
+            bits = 8.0 * int(item["tensor_payload_bytes"])
+            cb_assignment[name] = fmt
+            cb_shapes[name] = shape
+            if cand is not None:
+                pred_dloss = float(getattr(cand, "predicted_dloss", 0.0))
+        elif cand is not None:
             bits = 8.0 * cand.memory_bytes
             pred_dloss = float(getattr(cand, "predicted_dloss", 0.0))
         elif isinstance(entry, dict):
@@ -793,6 +822,11 @@ def _build_bit_attribution(
             elif fmt in format_specs and n_params:
                 shape = _shape_from_stats(entry)
                 bits = format_specs[fmt].effective_bits_for_shape(shape) * n_params
+
+        if bits is not None and fmt == "NVFP4" and isinstance(entry, dict):
+            bits += 8.0 * nvfp4_global_sidecar_bytes(
+                name, _shape_from_stats(entry)
+            )
 
         bpp = (bits / n_params) if (bits is not None and n_params) else None
         block_id = block_id_from_qname(name)
@@ -825,7 +859,7 @@ def _build_bit_attribution(
         bucket["format_counts"][fmt] += 1
         if bits is not None:
             bucket["bits_total"] += bits
-            body_bits += bits
+            body_tensor_bits += bits
         if n_params:
             bucket["n_params_total"] += n_params
             body_params += n_params
@@ -855,8 +889,22 @@ def _build_bit_attribution(
 
     bucket_list.sort(key=lambda r: (_bit_attr_block_sort_key(r["block_id"]), r["role"]))
     per_linear.sort(key=lambda r: (_bit_attr_block_sort_key(r["block_id"]), r["role"], r["qname"]))
+    cb_shared_sidecar_bits = 0.0
+    if cb_assignment:
+        cb_payload = cb_assignment_payload_breakdown(
+            cb_assignment,
+            cb_shapes,
+            context=cb_serialization_context,
+        )
+        cb_shared_sidecar_bits = 8.0 * int(
+            cb_payload["codebook_sidecar_bytes"]
+        )
+    body_bits = body_tensor_bits + cb_shared_sidecar_bits
     totals = {
         "body_bits": body_bits,
+        "body_tensor_payload_bits": body_tensor_bits,
+        "body_shared_cb_sidecar_bits": cb_shared_sidecar_bits,
+        "body_assignment_payload_bits": body_bits,
         "body_quantizable_params": body_params,
         "body_bits_per_param": (body_bits / body_params) if body_params else None,
         "n_body_linears": len(per_linear),
@@ -874,6 +922,7 @@ def _write_bit_attribution_reports(
     candidates: dict[str, list[Candidate]],
     stats_entry_for,
     format_specs: dict[str, "fr.FormatSpec"],
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> None:
     """Write the bit-attribution JSON / CSV and print a compact per-role rollup.
 
@@ -881,14 +930,43 @@ def _write_bit_attribution_reports(
     if not json_path and not csv_path:
         return
     buckets, per_linear, totals = _build_bit_attribution(
-        assignment_expanded, candidates, stats_entry_for, format_specs)
+        assignment_expanded,
+        candidates,
+        stats_entry_for,
+        format_specs,
+        cb_serialization_context,
+    )
+
+    if totals["body_quantizable_params"]:
+        reconciled = float(totals["body_bits_per_param"])
+        if not math.isclose(
+            reconciled,
+            float(achieved_bits),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise AssertionError(
+                "bit attribution does not reconcile with final exact body "
+                f"assignment bpp: report={reconciled}, final={achieved_bits}"
+            )
 
     if json_path:
         payload = {
-            "schema": "prismaquant.allocator.bit_attribution.v1",
+            "schema": "prismaquant.allocator.bit_attribution.v2",
             "target_bits": float(target_bits),
             "achieved_bits": float(achieved_bits),
             "body_bits_per_param": totals["body_bits_per_param"],
+            "body_assignment_payload_bits": totals[
+                "body_assignment_payload_bits"
+            ],
+            "body_tensor_payload_bits": totals["body_tensor_payload_bits"],
+            "body_shared_cb_sidecar_bits": totals[
+                "body_shared_cb_sidecar_bits"
+            ],
+            "reconciliation": (
+                "body_assignment_payload_bits = body_tensor_payload_bits + "
+                "body_shared_cb_sidecar_bits"
+            ),
             "body_quantizable_params": totals["body_quantizable_params"],
             "n_body_linears": totals["n_body_linears"],
             "buckets": buckets,
@@ -1404,21 +1482,36 @@ def main():
     ap.add_argument("--target-disk-gb", type=float, default=None,
                     help="Fit-the-card ship selection: instead of --target-bits, "
                          "the card sets the CONSTRAINT and predicted Δloss the "
-                         "OBJECTIVE — among the allocations whose EXACT exported "
-                         "on-disk footprint (prismaquant.footprint, validated "
-                         "0.00%% vs real index.json total_size) fits this many "
-                         "decimal GB, ship the one with the LOWEST predicted "
+                         "OBJECTIVE — among allocations whose exact tensor-data "
+                         "payload plus --artifact-overhead-reserve-bytes fits "
+                         "this many decimal GB, ship the one with the LOWEST "
+                         "predicted "
                          "Δloss (ties -> larger footprint; more bits is not "
                          "monotonically better, so filling the card is a proxy, "
                          "not the objective). Bisects the sub-second DP between "
                          "Pareto grid rungs to search denser fitting "
-                         "allocations, overrides --target-bits for the emitted "
+                         "allocations. The exporter then measures all regular "
+                         "files recursively and fails closed against this same "
+                         "budget. Overrides --target-bits for the emitted "
                          "layer_config, and writes selection.json (objective, "
                          "search ceiling, full ratchet trace) beside "
                          "--pareto-csv. Needs the source model path (probe "
                          "meta.model / --model-override) to size the "
                          "non-quantizable floor (lm_head/embed/norms). Unpin "
                          "lm_head (--allow-pinned lm_head) to lower the floor.")
+    ap.add_argument(
+        "--artifact-overhead-reserve-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Required with --target-disk-gb. Conservative upper bound for "
+            "all bytes outside safetensors tensor-data spans (container "
+            "headers, JSON/config, tokenizer/processor assets and other "
+            "regular files). Selection gates tensor payload + this reserve; "
+            "the exporter then stats every regular file recursively and "
+            "fails closed against the original whole-artifact budget."
+        ),
+    )
     ap.add_argument(
         "--cb-scale-coding",
         choices=("v1", "two_tier"),
@@ -1437,6 +1530,16 @@ def main():
         help=(
             "Exact CB sidecar sharing policy. Required when any body/auxiliary "
             "format is CB so codebook identity/bytes cannot be guessed."
+        ),
+    )
+    ap.add_argument(
+        "--cb-codebook-digests",
+        default=None,
+        help=(
+            "JSON file (or inline JSON object) mapping each physical learned-"
+            "codebook tensor ref to its lowercase SHA-256 digest. Required when "
+            "--cb-codebook-source=learned so allocation/KL/export bind the "
+            "same materialized sidecar bytes."
         ),
     )
     ap.add_argument("--formats", default="",
@@ -1595,6 +1698,31 @@ def main():
                          "bits, bpp, n_params, h_trace, predicted_dloss).")
     args = ap.parse_args()
 
+    if args.target_disk_gb is not None:
+        if not math.isfinite(args.target_disk_gb) or args.target_disk_gb <= 0:
+            raise SystemExit(
+                "[alloc] ERROR: --target-disk-gb must be a positive finite "
+                "decimal-GB budget"
+            )
+        if (
+            args.artifact_overhead_reserve_bytes is None
+            or args.artifact_overhead_reserve_bytes <= 0
+        ):
+            raise SystemExit(
+                "[alloc] ERROR: --target-disk-gb is a whole-artifact hard "
+                "budget and requires a positive "
+                "--artifact-overhead-reserve-bytes. The selector can price "
+                "tensor data deterministically, but safetensors headers, "
+                "JSON and copied tokenizer/processor files require an "
+                "operator-supplied conservative reserve; final export is "
+                "measured recursively and fails closed."
+            )
+    elif args.artifact_overhead_reserve_bytes is not None:
+        raise SystemExit(
+            "[alloc] ERROR: --artifact-overhead-reserve-bytes is meaningful "
+            "only with --target-disk-gb"
+        )
+
     if args.threads > 0:
         import os
         os.environ["OMP_NUM_THREADS"] = str(args.threads)
@@ -1737,10 +1865,42 @@ def main():
                 "--cb-codebook-source {lattice,learned}; refusing to silently "
                 "price the registry's legacy-v1 approximation."
             )
-        cb_serialization_context = CBSerializationContext(
-            scale_coding=args.cb_scale_coding,
-            codebook_source=args.cb_codebook_source,
-        )
+        codebook_digests = None
+        if args.cb_codebook_source == "learned":
+            if args.cb_codebook_digests is None:
+                raise SystemExit(
+                    "[alloc] ERROR: learned CB allocation requires "
+                    "--cb-codebook-digests for the already-materialized "
+                    "sidecar. A role name identifies sharing/bytes but not "
+                    "the codebook values whose render is being scored."
+                )
+            try:
+                raw_digests = load_cb_codebook_digest_manifest(
+                    args.cb_codebook_digests,
+                    where="allocator learned CB context",
+                )
+            except (OSError, ValueError, AssertionError) as exc:
+                raise SystemExit(
+                    f"[alloc] ERROR: cannot read learned CB digest manifest "
+                    f"{args.cb_codebook_digests}: {exc}"
+                ) from None
+            codebook_digests = {
+                str(name): str(value)
+                for name, value in raw_digests.items()
+            }
+        elif args.cb_codebook_digests is not None:
+            raise SystemExit(
+                "[alloc] ERROR: --cb-codebook-digests is only valid with "
+                "--cb-codebook-source=learned"
+            )
+        try:
+            cb_serialization_context = CBSerializationContext(
+                scale_coding=args.cb_scale_coding,
+                codebook_source=args.cb_codebook_source,
+                codebook_content_digests=codebook_digests,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"[alloc] ERROR: {exc}") from None
         print(
             "[alloc] CB serialized payload: "
             f"scale_coding={cb_serialization_context.scale_coding} "
@@ -2065,13 +2225,40 @@ def main():
             qname=qname,
             cb_serialization_context=cb_serialization_context,
         )
-        return 8.0 * payload_bytes
+        global_bytes = (
+            nvfp4_global_sidecar_bytes(qname, shape)
+            if fmt == "NVFP4"
+            else 0
+        )
+        return 8.0 * (payload_bytes + global_bytes)
 
     fixed_total_bits = sum(
         _bits_for_stats_entry(fixed_stats[name], fmt, name)
         for name, fmt in fixed_format_assignment.items()
         if name in fixed_stats
     )
+    fixed_cb_assignment = {
+        name: fmt
+        for name, fmt in fixed_format_assignment.items()
+        if name in fixed_stats and is_cb_format(fmt)
+    }
+    if fixed_cb_assignment:
+        if cb_serialization_context is None:
+            raise AssertionError(
+                "fixed CB assignment reached payload reporting without a "
+                "CBSerializationContext"
+            )
+        fixed_cb_payload = cb_assignment_payload_breakdown(
+            fixed_cb_assignment,
+            {
+                name: _shape_from_stats(fixed_stats[name])
+                for name in fixed_cb_assignment
+            },
+            context=cb_serialization_context,
+        )
+        fixed_total_bits += 8.0 * int(
+            fixed_cb_payload["codebook_sidecar_bytes"]
+        )
     fixed_total_dloss = sum(
         float(cand.predicted_dloss)
         for cand in fixed_chosen_candidates.values()
@@ -2173,7 +2360,11 @@ def main():
                 for name in fixed_format_assignment
             )),
             "params": fixed_total_params,
-            "bits_total": fixed_total_bits,
+            "assignment_payload_bits_total": fixed_total_bits,
+            "assignment_payload_bits_scope": (
+                "fixed_assignment_tensor_payload_including_deduplicated_"
+                "cb_sidecars"
+            ),
             "predicted_dloss": fixed_total_dloss,
             "budget_scope": "auxiliary_excluded_from_body_budget",
         },
@@ -2195,56 +2386,6 @@ def main():
         if isinstance(original_entry, dict):
             return original_entry
         return None
-
-    _solve_cache: dict[float, tuple] = {}
-    # Solver diagnostics per target, kept beside the memo so a cache hit never
-    # loses them: an INFEASIBLE rung's only explanation lives here (the solver
-    # sees the format floor and every over-target iterate, then discards both).
-    _solve_diagnostics: dict[float, dict] = {}
-
-    def _solve_for_target(target_bits: float):
-        """Solve the body-budget DP at one target bit budget.
-
-        Memoized: the solve is a pure function of the target given fixed
-        stats/candidates, and the byte-budget grid + ratchet bisection
-        re-visit targets the Pareto sweep already solved.
-        """
-        cache_key = round(float(target_bits), 9)
-        cached = _solve_cache.get(cache_key)
-        if cached is None:
-            cached = _solve_for_target_uncached(target_bits)
-            _solve_cache[cache_key] = cached
-        # Hand out a copy of the assignment dict: callers may mutate it
-        # (fused-sibling expansion, fixed-format update) and must never
-        # poison the cached solve.
-        assign, achieved_r, total, mutable_total = cached
-        if assign is not None:
-            assign = dict(assign)
-        return assign, achieved_r, total, mutable_total
-
-    def _solve_for_target_uncached(target_bits: float):
-        mutable_target_bits = float(target_bits)
-        if mutable_total_params <= 0:
-            if fixed_total_params > 0 and mutable_target_bits >= 0.0:
-                return {}, 0.0, 0.0, 0.0
-            return None, float("nan"), float("inf"), float("inf")
-        if mutable_target_bits < 0.0:
-            return None, float("nan"), float("inf"), float("inf")
-        diag: dict = {}
-        _solve_diagnostics[round(float(target_bits), 9)] = diag
-        assign, achieved_r = solve_with_promotion(
-            stats, candidates, mutable_target_bits, format_specs, format_rank,
-            args.bit_precision,
-            no_fused_promote=args.no_fused_promote,
-            overshoot_tolerance=args.overshoot_tolerance,
-            profile=model_profile,
-            diagnostics=diag,
-        )
-        if assign is None:
-            return None, float("nan"), float("inf"), float("inf")
-        mutable_total = compute_assignment_predicted_dloss(assign, candidates)
-        total = mutable_total
-        return assign, achieved_r, total, mutable_total
 
     def _expand_assignment_for_seed_json(
         assignment: dict[str, str],
@@ -2273,14 +2414,28 @@ def main():
             legal_formats=per_linear_legal_formats,
         )
 
-    def _assignment_bits_total(assignment: dict[str, str]) -> float:
+    def _assignment_payload_totals(
+        assignment: Mapping[str, str],
+        *,
+        require_all_stats: bool,
+    ) -> dict[str, float | int | list[str]]:
+        """Exact assignment-scope tensor payload, including shared CB tables.
+
+        Candidate memory remains the additive DP proposal cost.  This function
+        is the non-additive exact filter/reporting path: CB tables are charged
+        once per physical identity and NVFP4 global scale tensors are included.
+        """
         total = 0.0
+        params = 0
         cb_assignment: dict[str, str] = {}
         cb_shapes: dict[str, tuple[int, ...]] = {}
+        missing: list[str] = []
         for name, fmt in assignment.items():
             entry = _stats_entry_for_assignment_name(name)
             if not isinstance(entry, dict):
+                missing.append(name)
                 continue
+            params += int(entry.get("n_params", 0) or 0)
             if is_cb_format(fmt):
                 cb_assignment[name] = fmt
                 cb_shapes[name] = _shape_from_stats(entry)
@@ -2291,6 +2446,10 @@ def main():
             memory_map = entry.get("_memory_bytes_by_format")
             if isinstance(memory_map, dict) and fmt in memory_map:
                 total += 8.0 * memory_map[fmt]
+                if fmt == "NVFP4":
+                    total += 8.0 * nvfp4_global_sidecar_bytes(
+                        name, _shape_from_stats(entry)
+                    )
                 continue
             shape = _shape_from_stats(entry)
             payload_bytes, _identity, _sidecar_identity = serialized_candidate_payload(
@@ -2300,6 +2459,15 @@ def main():
                 cb_serialization_context=cb_serialization_context,
             )
             total += 8.0 * payload_bytes
+            if fmt == "NVFP4":
+                total += 8.0 * nvfp4_global_sidecar_bytes(name, shape)
+        if missing and require_all_stats:
+            raise AssertionError(
+                "exact assignment payload has no shape/stats for "
+                f"{len(missing)} tensor(s): {sorted(missing)[:12]}"
+            )
+        cb_tensor_bits = 0.0
+        cb_sidecar_bits = 0.0
         if cb_assignment:
             if cb_serialization_context is None:
                 raise AssertionError(
@@ -2311,8 +2479,130 @@ def main():
                 cb_shapes,
                 context=cb_serialization_context,
             )
-            total += 8.0 * int(payload["total_bytes"])
-        return float(total)
+            cb_tensor_bits = 8.0 * int(payload["tensor_payload_bytes"])
+            cb_sidecar_bits = 8.0 * int(payload["codebook_sidecar_bytes"])
+            total += cb_tensor_bits + cb_sidecar_bits
+        return {
+            "bits_total": float(total),
+            "quantizable_params": int(params),
+            "bits_per_param": float(total) / max(params, 1),
+            "cb_tensor_bits": float(cb_tensor_bits),
+            "cb_shared_sidecar_bits": float(cb_sidecar_bits),
+            "missing_stats_names": sorted(missing),
+        }
+
+    def _assignment_bits_total(assignment: dict[str, str]) -> float:
+        return float(_assignment_payload_totals(
+            assignment,
+            require_all_stats=True,
+        )["bits_total"])
+
+    _solve_cache: dict[float, tuple] = {}
+    # Solver diagnostics per target, kept beside the memo so a cache hit never
+    # loses them: an INFEASIBLE rung's only explanation lives here.
+    _solve_diagnostics: dict[float, dict] = {}
+
+    def _solve_for_target(target_bits: float):
+        """Solve additively, then exact-filter non-additive shared payloads.
+
+        Shared CB sidecars are assignment activation costs rather than legal
+        per-candidate additive costs.  The DP therefore proposes assignments;
+        every proposal is expanded and exact-priced, and an over-target result
+        tightens/re-solves.  This enforces feasibility but is deliberately not
+        advertised as a globally optimal mixed-sidecar solve.
+        """
+        cache_key = round(float(target_bits), 9)
+        cached = _solve_cache.get(cache_key)
+        if cached is None:
+            cached = _solve_for_target_uncached(target_bits)
+            _solve_cache[cache_key] = cached
+        assign, achieved_r, total, mutable_total = cached
+        if assign is not None:
+            assign = dict(assign)
+        return assign, achieved_r, total, mutable_total
+
+    def _solve_for_target_uncached(target_bits: float):
+        requested_target = float(target_bits)
+        mutable_target_bits = requested_target
+        if mutable_total_params <= 0:
+            if fixed_total_params > 0 and mutable_target_bits >= 0.0:
+                return {}, 0.0, 0.0, 0.0
+            return None, float("nan"), float("inf"), float("inf")
+        if mutable_target_bits < 0.0:
+            return None, float("nan"), float("inf"), float("inf")
+        outer_diag: dict = {
+            "solver_contract": (
+                "additive_candidate_proposal_then_exact_assignment_filter"
+            ),
+            "global_optimality_claimed": False,
+            "exact_filter_trace": [],
+        }
+        _solve_diagnostics[round(requested_target, 9)] = outer_diag
+        for attempt in range(16):
+            proposal_diag: dict = {}
+            assign, solver_achieved = solve_with_promotion(
+                stats,
+                candidates,
+                mutable_target_bits,
+                format_specs,
+                format_rank,
+                args.bit_precision,
+                no_fused_promote=args.no_fused_promote,
+                overshoot_tolerance=args.overshoot_tolerance,
+                profile=model_profile,
+                diagnostics=proposal_diag,
+            )
+            outer_diag.update({
+                key: value
+                for key, value in proposal_diag.items()
+                if key not in {"achieved_bits"}
+            })
+            if assign is None:
+                return None, float("nan"), float("inf"), float("inf")
+            expanded = _expand_assignment_for_seed_json(
+                assign,
+                include_auxiliary=False,
+            )
+            exact = _assignment_payload_totals(
+                expanded,
+                require_all_stats=True,
+            )
+            exact_achieved = float(exact["bits_per_param"])
+            outer_diag["exact_filter_trace"].append({
+                "attempt": attempt,
+                "proposal_target_bits": float(mutable_target_bits),
+                "solver_additive_candidate_bpp": float(solver_achieved),
+                "exact_assignment_payload_bpp": exact_achieved,
+                "cb_shared_sidecar_bits": float(
+                    exact["cb_shared_sidecar_bits"]
+                ),
+                "feasible": bool(
+                    exact_achieved
+                    <= requested_target + args.overshoot_tolerance
+                ),
+            })
+            if exact_achieved <= requested_target + args.overshoot_tolerance:
+                outer_diag["achieved_bits"] = exact_achieved
+                outer_diag["solver_additive_candidate_bpp"] = float(
+                    solver_achieved
+                )
+                outer_diag["exact_assignment_payload_bpp"] = exact_achieved
+                mutable_total = compute_assignment_predicted_dloss(
+                    assign, candidates
+                )
+                return assign, exact_achieved, mutable_total, mutable_total
+            overage = exact_achieved - requested_target
+            next_target = (
+                mutable_target_bits
+                - overage
+                - max(float(args.bit_precision), 1e-9)
+            )
+            if next_target >= mutable_target_bits or next_target < 0.0:
+                break
+            mutable_target_bits = next_target
+        outer_diag["feasible"] = False
+        outer_diag["reason"] = "exact_assignment_payload_filter_exhausted"
+        return None, float("nan"), float("inf"), float("inf")
 
     def _cb_stamps_for_assignment(
         assignment: Mapping[str, str],
@@ -2387,7 +2677,7 @@ def main():
             "aux_fixed_predicted_dloss": fixed_total_dloss,
             "fixed_predicted_dloss": fixed_total_dloss,
             "total_predicted_dloss_with_aux": total_with_aux,
-            "aux_fixed_bits_total": fixed_total_bits,
+            "aux_fixed_assignment_payload_bits_total": fixed_total_bits,
             "aux_fixed_params": fixed_total_params,
             **{f"layers_{k}": v for k, v in format_counts.items()},
             **{f"params_{k}": v for k, v in format_params.items()},
@@ -2485,13 +2775,14 @@ def main():
               f"(target={_r['target_bits']:.3f}, {_r['evals']} DP evals, "
               f"±{_r['tol_bits']}b)")
 
-    # --- exact exported footprint per Pareto candidate (re-vet R1) --------
+    # --- deterministic tensor payload + conservative artifact bound --------
     # The byte budget is the CONSTRAINT and measured KL is the OBJECTIVE, but
     # `select_validated_frontier` cannot see the card: it reads only the
     # per-point KL rows. Pricing each candidate here — through the SAME
     # footprint.assignment_artifact_bytes the allocator's own byte-budget
-    # selector uses, so the two can never disagree — puts the bytes in the
-    # assignment payload the KL selector already loads.
+    # selector uses.  That function prices safetensors tensor-data spans, not
+    # a directory.  Under a whole-artifact budget we add the explicit operator
+    # reserve; the exporter later measures every regular file and hard-fails.
     _footprint_ctx: dict[str, object] = {}
 
     def _footprint_scalars():
@@ -2518,19 +2809,35 @@ def main():
             return None
         return _footprint_ctx
 
-    def _artifact_bytes_for(expanded_assignment):
+    def _artifact_size_for(expanded_assignment):
         ctx = _footprint_scalars()
         if not ctx:
             return None
         try:
-            return int(ctx["fp"].assignment_artifact_bytes(
+            info = ctx["fp"].assignment_artifact_bytes(
                 expanded_assignment, ctx["stats"],
                 source_total_bytes=ctx["source_total_bytes"],
                 source_manifest=ctx["source_manifest"],
                 regime=ctx["regime"],
                 context="pareto candidate footprint",
                 cb_serialization_context=cb_serialization_context,
-            )["artifact_bytes"])
+            )
+            tensor_payload_bytes = int(info["artifact_payload_bytes"])
+            reserve_bytes = int(args.artifact_overhead_reserve_bytes or 0)
+            return {
+                "artifact_tensor_payload_bytes": tensor_payload_bytes,
+                "artifact_tensor_payload_scope": info["artifact_byte_scope"],
+                **({
+                    "whole_artifact_upper_bound_bytes": (
+                        tensor_payload_bytes + reserve_bytes
+                    ),
+                    "artifact_bytes": tensor_payload_bytes + reserve_bytes,
+                    "artifact_byte_scope": (
+                        "selection_upper_bound_tensor_payload_plus_"
+                        "operator_non_tensor_reserve"
+                    ),
+                } if args.target_disk_gb is not None else {}),
+            }
         except Exception as exc:
             print(f"[alloc] WARNING: could not price a Pareto candidate: {exc}",
                   flush=True)
@@ -2538,7 +2845,9 @@ def main():
 
     if args.pareto_output_dir:
         for record in pareto_seed_records:
-            record["artifact_bytes"] = _artifact_bytes_for(record["assignment"])
+            sized = _artifact_size_for(record["assignment"])
+            if sized is not None:
+                record.update(sized)
 
         # Collapse the Pareto set to the rungs that can actually ship. On an
         # 11-rung sweep under a card, 8 of those rungs are decided before a
@@ -2547,9 +2856,11 @@ def main():
         # never hardcoded, and skipped (loudly) when pricing is unavailable.
         if args.target_disk_gb is not None and pareto_seed_records:
             from . import footprint as _fp_gb
-            budget_bytes_pareto = float(args.target_disk_gb) * _fp_gb.GB
+            budget_bytes_pareto = int(
+                math.floor(float(args.target_disk_gb) * _fp_gb.GB)
+            )
             priced = [r for r in pareto_seed_records
-                      if r.get("artifact_bytes") is not None]
+                      if r.get("whole_artifact_upper_bound_bytes") is not None]
             if len(priced) != len(pareto_seed_records):
                 print("[alloc] WARNING: byte-budget Pareto narrowing skipped — "
                       f"{len(pareto_seed_records) - len(priced)} of "
@@ -2557,9 +2868,9 @@ def main():
                       "priced; measuring the full sweep", flush=True)
             else:
                 ordered = sorted(pareto_seed_records,
-                                 key=lambda r: r["artifact_bytes"])
+                                 key=lambda r: r["whole_artifact_upper_bound_bytes"])
                 fits = [i for i, r in enumerate(ordered)
-                        if r["artifact_bytes"] <= budget_bytes_pareto]
+                        if r["whole_artifact_upper_bound_bytes"] <= budget_bytes_pareto]
                 if fits:
                     top = fits[-1]
                     keep_positions = {max(0, top - 1), top,
@@ -2567,7 +2878,8 @@ def main():
                     reason = (
                         f"largest fitting rung achieved="
                         f"{ordered[top]['achieved_bits']:.3f} bpp at "
-                        f"{ordered[top]['artifact_bytes'] / _fp_gb.GB:.3f}GB")
+                        f"{ordered[top]['whole_artifact_upper_bound_bytes'] / _fp_gb.GB:.3f}GB "
+                        "selection upper bound")
                 else:
                     keep_positions = set(range(min(2, len(ordered))))
                     reason = ("NOTHING fits the card; keeping the cheapest "
@@ -2598,8 +2910,27 @@ def main():
                 f"_achieved_{record['achieved_bits']:.4f}_{digest}"
             ).replace(".", "p")
             path = out_dir / f"{label}.json"
+            record_budget_stamp = None
+            if args.target_disk_gb is not None:
+                record_budget_bytes = int(math.floor(
+                    float(args.target_disk_gb) * 1_000_000_000.0
+                ))
+                upper = record.get("whole_artifact_upper_bound_bytes")
+                payload_bytes = record.get("artifact_tensor_payload_bytes")
+                if (
+                    isinstance(upper, int)
+                    and isinstance(payload_bytes, int)
+                    and upper <= record_budget_bytes
+                ):
+                    record_budget_stamp = whole_artifact_budget_stamp(
+                        budget_bytes=record_budget_bytes,
+                        selection_tensor_payload_bytes=payload_bytes,
+                        selection_non_tensor_reserve_bytes=int(
+                            args.artifact_overhead_reserve_bytes
+                        ),
+                    )
             payload = {
-                "schema": "prismaquant.allocator.pareto_assignment.v1",
+                "schema": "prismaquant.allocator.pareto_assignment.v2",
                 "label": label,
                 "source": "allocator_pareto",
                 "target_bits": float(record["target_bits"]),
@@ -2612,6 +2943,16 @@ def main():
                 ),
                 "format_counts": record["format_counts"],
                 "artifact_bytes": record.get("artifact_bytes"),
+                "artifact_byte_scope": record.get("artifact_byte_scope"),
+                "artifact_tensor_payload_bytes": record.get(
+                    "artifact_tensor_payload_bytes"
+                ),
+                "artifact_tensor_payload_scope": record.get(
+                    "artifact_tensor_payload_scope"
+                ),
+                "whole_artifact_upper_bound_bytes": record.get(
+                    "whole_artifact_upper_bound_bytes"
+                ),
                 "target_profile": target_profile,
                 "assignment": dict(sorted(assignment.items())),
                 **({
@@ -2622,6 +2963,9 @@ def main():
                         record.get(CB_ASSIGNMENT_IDENTITIES_FIELD, {}).items()
                     )),
                 } if record.get(CB_ASSIGNMENT_IDENTITIES_FIELD) else {}),
+                **({
+                    "whole_artifact_budget": record_budget_stamp,
+                } if record_budget_stamp is not None else {}),
             }
             path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
             manifest_rows.append({
@@ -2642,6 +2986,13 @@ def main():
                 "fixed_predicted_dloss": float(record["fixed_predicted_dloss"]),
                 "format_counts": record["format_counts"],
                 "artifact_bytes": record.get("artifact_bytes"),
+                "artifact_byte_scope": record.get("artifact_byte_scope"),
+                "artifact_tensor_payload_bytes": record.get(
+                    "artifact_tensor_payload_bytes"
+                ),
+                "whole_artifact_upper_bound_bytes": record.get(
+                    "whole_artifact_upper_bound_bytes"
+                ),
             })
         (out_dir / "manifest.json").write_text(json.dumps({
             "schema": "prismaquant.allocator.pareto_manifest.v1",
@@ -2650,7 +3001,12 @@ def main():
             "target_profile": target_profile,
             "target_disk_gb": (float(args.target_disk_gb)
                                if args.target_disk_gb is not None else None),
-                "formats": [s.name for s in specs_sorted],
+            "artifact_overhead_reserve_bytes": (
+                int(args.artifact_overhead_reserve_bytes)
+                if args.artifact_overhead_reserve_bytes is not None
+                else None
+            ),
+            "formats": [s.name for s in specs_sorted],
             "target_bits": [float(x) for x in targets],
             "knees": knee_summary,
             "candidates": manifest_rows,
@@ -2697,15 +3053,18 @@ def main():
         print(f"  {row['target_bits']:>6.3f}  {row['achieved_bits']:>7.3f}  "
               f"{dloss_str:>20}   {fmt_str}")
 
-    # ----- Byte-budget ("fit the card") ship-bpp selection -----
+    # ----- Whole-artifact budget ("fit the card") ship-bpp selection -----
     # When --target-disk-gb is given, the ship bpp is set by the card, not by
-    # --target-bits: the card supplies the CONSTRAINT (exact exported footprint
-    # <= budget; the RD curve is log-linear, so there is no intrinsic knee to
+    # --target-bits: the card supplies the CONSTRAINT.  Selection uses a
+    # conservative upper bound (exact tensor spans + required non-tensor
+    # reserve); final export stats the whole directory and fails closed. The RD
+    # curve is log-linear, so there is no intrinsic knee to
     # find — see rd_curve diagnostic) and predicted Δloss supplies the
     # OBJECTIVE (minimize it among the allocations that fit). This is a
     # selector over Pareto candidates whose feasibility test needs no
     # measurement, then a bisection of the same sub-second DP between grid
     # rungs to search denser fitting allocations.
+    selected_whole_artifact_budget_stamp = None
     if args.target_disk_gb is not None:
         from . import footprint as _fp
         from .saturation_select import select_under_byte_budget
@@ -2718,7 +3077,8 @@ def main():
         # objective must be recoverable from the artifact, not inferred from
         # the code version that produced it.
         _RATCHET_OBJECTIVE = "min_predicted_dloss__ties_to_larger_footprint"
-        budget_bytes = float(args.target_disk_gb) * _fp.GB
+        budget_bytes = int(math.floor(float(args.target_disk_gb) * _fp.GB))
+        overhead_reserve_bytes = int(args.artifact_overhead_reserve_bytes)
         src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
         regime = _fp.source_regime(src_by_dtype)  # recorded for reporting only
         # Per-tensor source-byte manifest: each re-encoded Linear is charged
@@ -2800,7 +3160,10 @@ def main():
             return {
                 "target_bits": float(t), "achieved_bits": float(ach_t),
                 "bpp": float(ach_t), "dloss": float(tot_t),
-                "disk_bytes": float(info["artifact_bytes"]),
+                "tensor_payload_bytes": int(info["artifact_payload_bytes"]),
+                "whole_artifact_upper_bound_bytes": int(
+                    info["artifact_payload_bytes"]
+                ) + overhead_reserve_bytes,
                 "floor_bytes": float(info["floor_bytes"]),
             }
 
@@ -2817,24 +3180,36 @@ def main():
         # ship pick — see the objective note below; it is recorded as
         # `max_bytes_pick_*` so the two objectives stay comparable in the
         # artifact.
-        sel = select_under_byte_budget(grid, budget_bytes)
+        sel = select_under_byte_budget(
+            grid,
+            budget_bytes,
+            bytes_key="whole_artifact_upper_bound_bytes",
+        )
 
         rd = knee_summary.get("rd_curve") if isinstance(knee_summary, dict) else None
         selection = {
-            # v2: the ratchet objective changed from MAX disk bytes to MIN
-            # predicted Δloss among the fitting rungs, so `chosen_*` means
-            # something different than it did in v1. Every v1 key is kept.
-            "schema": "prismaquant.allocator.byte_budget_selection.v2",
+            "schema": "prismaquant.allocator.byte_budget_selection.v3",
             "mode": "byte-budget",
             "target_disk_gb": float(args.target_disk_gb),
             "budget_bytes": budget_bytes,
+            "artifact_overhead_reserve_bytes": overhead_reserve_bytes,
             "source_total_bytes": float(src_total),
             "source_regime": regime,
             "source_accounting": "per_tensor_manifest_v2",
             "footprint_path": "footprint.assignment_artifact_bytes",
             "source_bytes_per_param": int(
                 _fp.dominant_source_bytes_per_param(src_by_dtype)),
-            "feasibility_test": "exact_artifact_bytes <= budget_bytes",
+            "selection_feasibility_test": (
+                "exact_tensor_payload_bytes + operator_non_tensor_reserve_bytes "
+                "<= whole_artifact_budget_bytes"
+            ),
+            "final_feasibility_test": (
+                "stat_all_regular_files_recursive <= whole_artifact_budget_bytes"
+            ),
+            "feasibility_test": (
+                "selection_whole_artifact_upper_bound_bytes <= budget_bytes; "
+                "final_recursive_inventory_fail_closed"
+            ),
             "ratchet_objective": _RATCHET_OBJECTIVE,
             "feasible": bool(sel["feasible"]),
             "below_floor": bool(sel["below_floor"]),
@@ -2843,16 +3218,23 @@ def main():
             "grid": [
                 {"target_bits": c["target_bits"],
                  "achieved_bits": c["achieved_bits"],
-                 "disk_gb": c["disk_bytes"] / _fp.GB, "dloss": c["dloss"],
-                 "fits": c["disk_bytes"] <= budget_bytes}
+                 "tensor_payload_gb": c["tensor_payload_bytes"] / _fp.GB,
+                 "whole_artifact_upper_bound_gb": (
+                     c["whole_artifact_upper_bound_bytes"] / _fp.GB
+                 ),
+                 "dloss": c["dloss"],
+                 "fits": c["whole_artifact_upper_bound_bytes"] <= budget_bytes}
                 for c in grid
             ],
         }
         sel_path = Path(args.pareto_csv).with_name("selection.json")
         if not sel["feasible"]:
             cheapest = sel.get("rejected_next") or (grid[0] if grid else None)
-            cheapest_gb = (cheapest["disk_bytes"] / _fp.GB) if cheapest else float("nan")
-            selection["cheapest_artifact_gb"] = cheapest_gb
+            cheapest_gb = (
+                cheapest["whole_artifact_upper_bound_bytes"] / _fp.GB
+                if cheapest else float("nan")
+            )
+            selection["cheapest_whole_artifact_upper_bound_gb"] = cheapest_gb
             sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
             raise SystemExit(
                 f"[alloc] --target-disk-gb={args.target_disk_gb:.3f} is below the "
@@ -2860,7 +3242,8 @@ def main():
                 f"budget, unpin lm_head (--allow-pinned lm_head), or widen the "
                 f"format menu. Selection written to {sel_path}.")
 
-        # Among the allocations whose EXACT footprint fits the card, ship the
+        # Among allocations whose conservative selection upper bound fits the
+        # card, ship the
         # one with the LOWEST predicted Δloss — ties broken toward the larger
         # footprint (spend the budget only when it costs nothing in predicted
         # quality). "Fill the card" was a proxy for that, valid only while
@@ -2878,12 +3261,15 @@ def main():
         # auxiliary (MTP/visual) Δloss excluded from all of them is a
         # rung-invariant constant, so it cannot reorder them.
         #
-        # Feasibility is unchanged: exact footprint <= budget, and the ratchet
-        # is seeded at the grid pick the shared selector already proved
-        # feasible, so the shipped artifact is never worse in predicted Δloss
-        # than that proven point.
+        # Selection feasibility is tensor spans + reserve <= budget. Final
+        # feasibility is intentionally deferred to the exporter, which stats
+        # the recursive regular-file set and fails closed. The ratchet is
+        # seeded at the grid pick already proven selection-feasible.
         def _fits(cand) -> bool:
-            return cand is not None and cand["disk_bytes"] <= budget_bytes
+            return (
+                cand is not None
+                and cand["whole_artifact_upper_bound_bytes"] <= budget_bytes
+            )
 
         def _beats(cand, best) -> bool:
             """The ratchet objective: min Δloss, ties -> larger footprint."""
@@ -2891,7 +3277,10 @@ def main():
                 return True
             if cand["dloss"] != best["dloss"]:
                 return cand["dloss"] < best["dloss"]
-            return cand["disk_bytes"] > best["disk_bytes"]
+            return (
+                cand["whole_artifact_upper_bound_bytes"]
+                > best["whole_artifact_upper_bound_bytes"]
+            )
 
         best = None
         emit_target = None
@@ -2907,8 +3296,14 @@ def main():
                 "target_bits": float(target),
                 "achieved_bits": (
                     float(cand["achieved_bits"]) if cand is not None else None),
-                "disk_gb": (
-                    cand["disk_bytes"] / _fp.GB if cand is not None else None),
+                "tensor_payload_gb": (
+                    cand["tensor_payload_bytes"] / _fp.GB
+                    if cand is not None else None
+                ),
+                "whole_artifact_upper_bound_gb": (
+                    cand["whole_artifact_upper_bound_bytes"] / _fp.GB
+                    if cand is not None else None
+                ),
                 "dloss": float(cand["dloss"]) if cand is not None else None,
                 "fits": fits,
                 "accepted": accepted,
@@ -2937,7 +3332,10 @@ def main():
         # the downside is bounded at shipping the grid pick, never worse —
         # but it IS a forgone option, so both the cap and the tightening are
         # recorded in selection.json rather than left invisible.
-        over_budget = [c for c in grid if c["disk_bytes"] > budget_bytes]
+        over_budget = [
+            c for c in grid
+            if c["whole_artifact_upper_bound_bytes"] > budget_bytes
+        ]
         tightening_rung = (
             min(float(c["target_bits"]) for c in over_budget)
             if over_budget else None)
@@ -2974,17 +3372,35 @@ def main():
 
         max_bytes_pick = sel["chosen"]  # what "fill the card" would have shipped
         args.target_bits = float(emit_target)  # override emit target below
+        selected_whole_artifact_budget_stamp = whole_artifact_budget_stamp(
+            budget_bytes=budget_bytes,
+            selection_tensor_payload_bytes=int(
+                chosen_info["tensor_payload_bytes"]
+            ),
+            selection_non_tensor_reserve_bytes=overhead_reserve_bytes,
+        )
         selection.update({
             "has_slack": bool(has_slack),
             "chosen_target_bits": float(emit_target),
             "chosen_achieved_bits": float(chosen_info["achieved_bits"]),
-            "predicted_artifact_gb": chosen_info["disk_bytes"] / _fp.GB,
+            "predicted_tensor_payload_gb": (
+                chosen_info["tensor_payload_bytes"] / _fp.GB
+            ),
+            "predicted_whole_artifact_upper_bound_gb": (
+                chosen_info["whole_artifact_upper_bound_bytes"] / _fp.GB
+            ),
             "predicted_floor_gb": chosen_info["floor_bytes"] / _fp.GB,
-            "predicted_body_gb": (chosen_info["disk_bytes"] - chosen_info["floor_bytes"]) / _fp.GB,
+            "predicted_body_tensor_payload_gb": (
+                chosen_info["tensor_payload_bytes"]
+                - chosen_info["floor_bytes"]
+            ) / _fp.GB,
             "predicted_dloss": float(chosen_info["dloss"]),
             "predicted_dloss_scope": (
                 "dp_body_items_only__excludes_fixed_auxiliary_mtp_visual"),
-            "headroom_gb": (budget_bytes - chosen_info["disk_bytes"]) / _fp.GB,
+            "selection_headroom_gb": (
+                budget_bytes
+                - chosen_info["whole_artifact_upper_bound_bytes"]
+            ) / _fp.GB,
             "grid_pick_target_bits": float(grid_pick["target_bits"]),
             "grid_pick_dloss": float(grid_pick["dloss"]),
             # The tightened ceiling the ratchet actually searched under, the
@@ -3009,15 +3425,19 @@ def main():
             "max_bytes_grid_pick_agrees": bool(
                 max_bytes_pick is not None
                 and max_bytes_pick["target_bits"] == grid_pick["target_bits"]),
+            "whole_artifact_budget": selected_whole_artifact_budget_stamp,
         })
         sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
         print(
             f"[alloc] byte-budget: card={args.target_disk_gb:.2f}GB ({regime} src) "
             f"-> ship {chosen_info['achieved_bits']:.3f} bpp "
-            f"({chosen_info['disk_bytes'] / _fp.GB:.3f}GB: floor "
+            f"(selection upper bound "
+            f"{chosen_info['whole_artifact_upper_bound_bytes'] / _fp.GB:.3f}GB: "
+            f"tensor floor "
             f"{chosen_info['floor_bytes'] / _fp.GB:.3f} + body "
-            f"{(chosen_info['disk_bytes'] - chosen_info['floor_bytes']) / _fp.GB:.3f}, "
-            f"headroom {(budget_bytes - chosen_info['disk_bytes']) / _fp.GB:.3f}GB, "
+            f"{(chosen_info['tensor_payload_bytes'] - chosen_info['floor_bytes']) / _fp.GB:.3f} "
+            f"+ reserve {overhead_reserve_bytes / _fp.GB:.3f}, "
+            f"headroom {(budget_bytes - chosen_info['whole_artifact_upper_bound_bytes']) / _fp.GB:.3f}GB, "
             f"Δloss={chosen_info['dloss']:.4e} = min over "
             f"{sum(1 for r in ratchet_trace if r['fits'])} fitting probes)"
             + ("  [card has slack beyond near-lossless]" if has_slack else "")
@@ -3206,6 +3626,32 @@ def main():
                 "PASSTHROUGH_SOURCE_REQUIREMENTS deliberately."
             )
 
+    final_body_assignment = {
+        name: fmt
+        for name, fmt in assignment_expanded.items()
+        if not _is_visual_linear(name) and not _is_mtp_linear(name)
+    }
+    final_body_payload = _assignment_payload_totals(
+        final_body_assignment,
+        require_all_stats=True,
+    )
+    final_body_achieved = float(final_body_payload["bits_per_param"])
+    if not math.isclose(
+        final_body_achieved,
+        float(achieved),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise AssertionError(
+            "final expanded assignment payload does not reconcile with the "
+            f"exact-filtered solve: final={final_body_achieved}, "
+            f"solve={achieved}"
+        )
+    final_assignment_payload = _assignment_payload_totals(
+        assignment_expanded,
+        require_all_stats=False,
+    )
+
     final_cb_serialization_stamps = _cb_stamps_for_assignment(
         assignment_expanded
     )
@@ -3237,12 +3683,42 @@ def main():
         "target_profile_requested": args.target_profile,
         "target_profile_default": str(args.target_profile_default or "research"),
         "target_bits": float(args.target_bits),
-        "achieved_bits": float(achieved),
+        "achieved_bits": final_body_achieved,
+        "achieved_bits_scope": (
+            "body_assignment_tensor_payload_including_deduplicated_cb_sidecars"
+        ),
+        "body_assignment_payload_bits_total": float(
+            final_body_payload["bits_total"]
+        ),
+        "body_assignment_quantizable_params": int(
+            final_body_payload["quantizable_params"]
+        ),
+        "body_shared_cb_sidecar_bits": float(
+            final_body_payload["cb_shared_sidecar_bits"]
+        ),
+        "solver_contract": (
+            "additive_candidate_proposal_then_exact_assignment_filter"
+        ),
+        "global_optimality_claimed": False,
+        "assignment_payload_bits_total": (
+            float(final_assignment_payload["bits_total"])
+            if not final_assignment_payload["missing_stats_names"]
+            else None
+        ),
+        "assignment_payload_bits_scope": (
+            "all_assignment_tensor_payload_including_deduplicated_cb_sidecars"
+        ),
+        "assignment_payload_missing_stats_names": final_assignment_payload[
+            "missing_stats_names"
+        ],
         **({
             "cb_serialized_payload": cb_serialization_context_stamp(
                 cb_serialization_context
             ),
         } if cb_serialization_context is not None else {}),
+        **({
+            "whole_artifact_budget": selected_whole_artifact_budget_stamp,
+        } if selected_whole_artifact_budget_stamp is not None else {}),
     }
 
     out = Path(args.layer_config)
@@ -3253,7 +3729,10 @@ def main():
     counts = defaultdict(int)
     for fmt in assignment_expanded.values():
         counts[fmt] += 1
-    print(f"\n[alloc] target={args.target_bits} achieved={achieved:.3f}")
+    print(
+        f"\n[alloc] target={args.target_bits} "
+        f"exact_assignment_payload_bpp={final_body_achieved:.3f}"
+    )
     for fmt, n in sorted(counts.items(), key=lambda kv: -kv[1]):
         print(f"  {fmt:>14}: {n:>5} layers")
     print(f"\nLayer config → {out}")
@@ -3265,11 +3744,12 @@ def main():
         args.bit_attribution_json,
         args.bit_attribution_csv,
         target_bits=args.target_bits,
-        achieved_bits=achieved,
+        achieved_bits=final_body_achieved,
         assignment_expanded=assignment_expanded,
         candidates=candidates,
         stats_entry_for=_stats_entry_for_assignment_name,
         format_specs=format_specs,
+        cb_serialization_context=cb_serialization_context,
     )
 
 

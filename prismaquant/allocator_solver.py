@@ -41,6 +41,9 @@ _SOLVER_TRACE = os.environ.get("PRISMAQUANT_SOLVER_TRACE", "") not in ("", "0")
 class Candidate:
     fmt: str
     bits_per_param: float
+    # Per-candidate tensor payload only. Assignment-level shared sidecars are
+    # non-additive activation costs and must be deduplicated by the caller's
+    # exact-filter/reporting pass before claiming a final achieved rate.
     memory_bytes: int
     predicted_dloss: float
     # Versioned producer-layout identity. None for formats whose FormatSpec is
@@ -546,7 +549,13 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
                      format_specs: dict[str, fr.FormatSpec],
                      candidates: dict[str, list[Candidate]] | None = None,
                      ) -> tuple[float, float]:
-    """Return ``(avg_bits, total_predicted_dloss)`` for an assignment.
+    """Return additive proposal ``(avg_bits, total_predicted_dloss)``.
+
+    ``Candidate.memory_bytes`` is deliberately tensor-local, so this helper
+    does not charge assignment-shared CB codebooks or other non-additive
+    artifact costs. Producer callers must exact-price the expanded assignment
+    before reporting a final achieved rate; :mod:`prismaquant.allocator` does
+    that in its proposal-then-exact-filter loop.
 
     A priced row (a name present in ``candidates``) whose assigned format has
     no candidate is a HARD ERROR, not a zero-cost row. It means promotion put

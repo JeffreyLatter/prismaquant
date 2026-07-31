@@ -51,6 +51,7 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_serialization_metadata_from_assignment_payload,
     cb_tensor_payload_breakdown,
     finalize_cb_export_artifact_inventory,
+    whole_artifact_budget_from_assignment_payload,
     validate_cb_sidecar_tensors,
     validate_cb_assignment_serialization_stamps,
     validate_cb_serialization_context_stamp,
@@ -374,6 +375,10 @@ def export_nvfp4_cb(
     _recipe_cb_context_stamp, _recipe_cb_tensor_stamps = (
         cb_serialization_metadata_from_assignment_payload(_recipe_payload)
     )
+    _whole_artifact_budget = whole_artifact_budget_from_assignment_payload(
+        _recipe_payload,
+        where="export_nvfp4_cb layer config",
+    )
     skeleton = _load_skeleton(model_dir)
 
     # Reuse the compressed-tensors codecs + scheme templates for stock rungs —
@@ -559,6 +564,17 @@ def export_nvfp4_cb(
     # Bind byte pricing to the exact physical sidecar refs this artifact will
     # write.  This identity is shared by allocation/reporting/export checks;
     # no producer path silently assumes the legacy-v1 scale plane.
+    materialized_codebook_tensors = {
+        name: tensor
+        for (ref, fmt), codebook in codebooks.items()
+        for name, tensor in _codebook_tensors(ref, fmt, codebook).items()
+    }
+    materialized_codebook_digests = {
+        name: hashlib.sha256(
+            tensor.to(torch.float16).cpu().contiguous().numpy().tobytes()
+        ).hexdigest()
+        for name, tensor in materialized_codebook_tensors.items()
+    }
     serialization_context = CBSerializationContext(
         scale_coding=scale_coding,
         codebook_source=source,
@@ -566,6 +582,7 @@ def export_nvfp4_cb(
             qname: _codebook_tensor_names(ref, fmt, codebook)
             for qname, (ref, fmt, codebook, _kind) in target_cb.items()
         },
+        codebook_content_digests=materialized_codebook_digests,
     )
     validate_cb_serialization_context_stamp(
         _recipe_cb_context_stamp,
@@ -712,9 +729,7 @@ def export_nvfp4_cb(
     # config's codebook_file pointer (plugins/gridbook config.py
     # get_codebooks -> load_file(model_dir/cb_codebooks.pqcb)), keyed by each
     # scheme's codebook_ref. Sidecar-only: NOT written into model.safetensors. ---
-    for (ref, fmt), codebook in codebooks.items():
-        for tname, blob in _codebook_tensors(ref, fmt, codebook).items():
-            cb_tensor_blobs[tname] = blob
+    cb_tensor_blobs.update(materialized_codebook_tensors)
     codebook_file = "cb_codebooks.pqcb" if cb_tensor_blobs else None
 
     if set(cb_serialized_shapes) != set(cb_targets):
@@ -729,7 +744,7 @@ def export_nvfp4_cb(
         cb_serialized_shapes,
         context=serialization_context,
     )
-    if _recipe_cb_tensor_stamps:
+    if _recipe_cb_context_stamp is not None or _recipe_cb_tensor_stamps:
         validate_cb_assignment_serialization_stamps(
             {qname: assignment[qname] for qname in cb_targets},
             cb_serialized_shapes,
@@ -926,6 +941,12 @@ def export_nvfp4_cb(
         serialized_payload=serialized_payload_summary,
         cb_tensor_names=sorted(cb_output_tensor_names),
         codebook_file=codebook_file,
+        expected_model_files=["model.safetensors"],
+        whole_artifact_budget_bytes=(
+            int(_whole_artifact_budget["budget_bytes"])
+            if _whole_artifact_budget is not None
+            else None
+        ),
     )
     return dict(counts)
 

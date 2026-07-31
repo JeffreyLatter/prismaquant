@@ -141,6 +141,37 @@ def test_streaming_byte_identical_dense_and_stacked(workdir):
         assert _tensors_equal(cb_m, cb_s)
 
 
+def test_streaming_global_cb_stamp_does_not_bypass_missing_layer_identities(
+    workdir,
+):
+    qname = "model.layers.0.self_attn.o_proj"
+    mdl = workdir / "model"
+    _write_model(
+        mdl,
+        {f"{qname}.weight": torch.randn(2, 256).to(torch.bfloat16)},
+    )
+    ap = workdir / "a.json"
+    _assign(ap, {
+        qname: {"data_type": "nvfp4_cb", "cb_k": 16},
+        "__prismaquant__": {
+            "cb_serialized_payload": {
+                "schema": "prismaquant.cb_serialized_payload.v1",
+                "scale_coding": "two_tier",
+                "layout_version": 2,
+                "codebook_source": "lattice",
+            },
+        },
+    })
+    with pytest.raises(ValueError, match="per-layer serialization identity"):
+        export_nvfp4_cb_streaming(
+            mdl,
+            ap,
+            workdir / "s",
+            {qname: torch.ones(256)},
+            device="cpu",
+        )
+
+
 # --- per-expert -> stacked bridging (Hy3 layout) ---------------------------
 
 def _per_expert_model(mdl: Path, E=3, inter=256, hid=256, seed=1):

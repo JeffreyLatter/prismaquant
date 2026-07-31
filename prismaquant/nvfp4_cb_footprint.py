@@ -22,6 +22,7 @@ separate post-export scope.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -36,6 +37,8 @@ CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v1"
 CB_EXPORT_ARTIFACT_INVENTORY_SCHEMA = (
     "prismaquant.cb_export_artifact_inventory.v1"
 )
+WHOLE_ARTIFACT_BUDGET_SCHEMA = "prismaquant.whole_artifact_budget.v1"
+WHOLE_ARTIFACT_BUDGET_FIELD = "whole_artifact_budget"
 CB_TENSOR_IDENTITY_FIELD = "cb_serialized_identity"
 CB_ASSIGNMENT_IDENTITIES_FIELD = "cb_serialized_identities"
 PRODUCTION_FP4_SCALE_CODING = "two_tier"
@@ -50,25 +53,30 @@ _FP32_BYTES = 4
 _SUPERBLOCK = 256
 _VEC_DIM = 8
 
-_SAFETENSORS_DTYPE_BYTES = {
-    "BOOL": 1,
-    "U8": 1,
-    "I8": 1,
-    "F8_E4M3": 1,
-    "F8_E4M3FN": 1,
-    "F8_E4M3FNUZ": 1,
-    "F8_E5M2": 1,
-    "F8_E5M2FNUZ": 1,
-    "U16": 2,
-    "I16": 2,
-    "F16": 2,
-    "BF16": 2,
-    "U32": 4,
-    "I32": 4,
-    "F32": 4,
-    "U64": 8,
-    "I64": 8,
-    "F64": 8,
+_SAFETENSORS_DTYPE_BITS = {
+    "BOOL": 8,
+    "U8": 8,
+    "I8": 8,
+    "F8_E4M3": 8,
+    "F8_E4M3FN": 8,
+    "F8_E4M3FNUZ": 8,
+    "F8_E5M2": 8,
+    "F8_E5M2FNUZ": 8,
+    "F8_E8M0": 8,
+    "F4": 4,
+    "F4_E2M1": 4,
+    "F6_E2M3": 6,
+    "F6_E3M2": 6,
+    "U16": 16,
+    "I16": 16,
+    "F16": 16,
+    "BF16": 16,
+    "U32": 32,
+    "I32": 32,
+    "F32": 32,
+    "U64": 64,
+    "I64": 64,
+    "F64": 64,
 }
 
 _CB_NAME_RE = re.compile(r"^(NVFP4|FP8)_CB_([KS])(\d+)$")
@@ -90,6 +98,7 @@ class CBSerializationContext:
     codebook_source: str
     layout_version: int | None = None
     codebook_refs: Mapping[str, str | Sequence[str]] | None = None
+    codebook_content_digests: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         coding = str(self.scale_coding).strip().lower()
@@ -125,6 +134,20 @@ class CBSerializationContext:
                     else tuple(str(item) for item in raw_refs)
                 )
             object.__setattr__(self, "codebook_refs", normalized_refs)
+        if self.codebook_content_digests is not None:
+            normalized_digests: dict[str, str] = {}
+            for raw_name, raw_digest in self.codebook_content_digests.items():
+                name = str(raw_name)
+                digest = str(raw_digest).strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise ValueError(
+                        f"CB codebook digest for {name!r} is not a lowercase "
+                        f"SHA-256 value: {raw_digest!r}"
+                    )
+                normalized_digests[name] = digest
+            object.__setattr__(
+                self, "codebook_content_digests", normalized_digests
+            )
 
     @classmethod
     def production(
@@ -132,12 +155,14 @@ class CBSerializationContext:
         *,
         codebook_source: str = "lattice",
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
+        codebook_content_digests: Mapping[str, str] | None = None,
     ) -> CBSerializationContext:
         return cls(
             scale_coding=PRODUCTION_FP4_SCALE_CODING,
             layout_version=2,
             codebook_source=codebook_source,
             codebook_refs=codebook_refs,
+            codebook_content_digests=codebook_content_digests,
         )
 
     @classmethod
@@ -146,6 +171,7 @@ class CBSerializationContext:
         *,
         codebook_source: str = "lattice",
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
+        codebook_content_digests: Mapping[str, str] | None = None,
     ) -> CBSerializationContext:
         """Explicit legacy writer context; old artifacts remain readable."""
         return cls(
@@ -153,6 +179,7 @@ class CBSerializationContext:
             layout_version=1,
             codebook_source=codebook_source,
             codebook_refs=codebook_refs,
+            codebook_content_digests=codebook_content_digests,
         )
 
 
@@ -160,11 +187,25 @@ def cb_serialization_context_stamp(context: CBSerializationContext) -> dict:
     """Small identity stamp suitable for an allocator recipe's metadata."""
     if context is None:
         raise ValueError("CB serialization context stamp requires a context")
+    if (
+        context.codebook_source == "learned"
+        and not context.codebook_content_digests
+    ):
+        raise ValueError(
+            "learned CB serialization identity requires materialized "
+            "codebook_content_digests; a logical role/ref does not identify "
+            "the bytes that cost, KL, and export must share"
+        )
     return {
         "schema": CB_SERIALIZED_PAYLOAD_SCHEMA,
         "scale_coding": context.scale_coding,
         "layout_version": context.layout_version,
         "codebook_source": context.codebook_source,
+        **({
+            "codebook_content_sha256": dict(sorted(
+                context.codebook_content_digests.items()
+            )),
+        } if context.codebook_source == "learned" else {}),
     }
 
 
@@ -198,10 +239,23 @@ def cb_serialization_context_from_stamp(
         raise ValueError(
             f"{where}: CB serialized-payload context is missing {missing}"
         )
+    raw_digests = stamp.get("codebook_content_sha256")
+    if str(stamp["codebook_source"]).strip().lower() == "learned" and not isinstance(
+        raw_digests, Mapping
+    ):
+        raise ValueError(
+            f"{where}: learned CB serialized-payload context is missing "
+            "codebook_content_sha256"
+        )
     return CBSerializationContext(
         scale_coding=str(stamp["scale_coding"]),
         layout_version=int(stamp["layout_version"]),
         codebook_source=str(stamp["codebook_source"]),
+        codebook_content_digests=(
+            {str(name): str(value) for name, value in raw_digests.items()}
+            if isinstance(raw_digests, Mapping)
+            else None
+        ),
     )
 
 
@@ -235,10 +289,39 @@ def cb_serialization_context_from_env(
         raise ValueError(
             f"{where}: missing explicit CB producer setting(s) {missing}"
         )
+    digest_source = environ.get("CB_CODEBOOK_DIGESTS")
+    digests = (
+        load_cb_codebook_digest_manifest(digest_source, where=where)
+        if digest_source
+        else None
+    )
     return CBSerializationContext(
         scale_coding=scale or PRODUCTION_FP4_SCALE_CODING,
         codebook_source=source or "lattice",
+        codebook_content_digests=digests,
     )
+
+
+def load_cb_codebook_digest_manifest(
+    source: str | Path,
+    *,
+    where: str,
+) -> dict[str, str]:
+    """Load a strict JSON digest object from a path or inline object text."""
+    text = str(source)
+    if text.lstrip().startswith("{"):
+        raw_text = text
+        source_label = "inline CB_CODEBOOK_DIGESTS"
+    else:
+        path = Path(text)
+        raw_text = path.read_text()
+        source_label = str(path)
+    raw = _strict_json_loads(raw_text, where=source_label)
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            f"{where}: CB codebook digest manifest must be a JSON object"
+        )
+    return {str(name): str(value) for name, value in raw.items()}
 
 
 def validate_cb_serialization_context_stamp(
@@ -258,12 +341,34 @@ def validate_cb_serialization_context_stamp(
     if not isinstance(stamp, Mapping):
         raise TypeError(f"{where}: CB serialized-payload stamp is not an object")
     expected = cb_serialization_context_stamp(context)
-    observed = {key: stamp.get(key) for key in expected}
-    if observed != expected:
+    base_keys = ("schema", "scale_coding", "layout_version", "codebook_source")
+    observed = {key: stamp.get(key) for key in base_keys}
+    expected_base = {key: expected.get(key) for key in base_keys}
+    if observed != expected_base:
         raise ValueError(
             f"{where}: CB serialization context differs from allocator "
-            f"recipe: recipe={observed}, exporter={expected}"
+            f"recipe: recipe={observed}, exporter={expected_base}"
         )
+    if context.codebook_source == "learned":
+        observed_digests = stamp.get("codebook_content_sha256")
+        if not isinstance(observed_digests, Mapping):
+            raise ValueError(
+                f"{where}: learned CB recipe has no materialized codebook "
+                "content digests"
+            )
+        expected_digests = context.codebook_content_digests or {}
+        missing = sorted(set(expected_digests) - set(observed_digests))
+        mismatched = sorted(
+            name
+            for name, digest in expected_digests.items()
+            if str(observed_digests.get(name, "")).lower() != digest
+        )
+        if missing or mismatched:
+            raise ValueError(
+                f"{where}: learned CB serialization context differs from "
+                "allocator recipe: relevant materialized digest "
+                f"missing={missing[:8]}, mismatched={mismatched[:8]}"
+            )
 
 
 def cb_cost_provenance(
@@ -485,6 +590,144 @@ def cb_serialization_metadata_from_assignment_payload(
     )
 
 
+def whole_artifact_budget_stamp(
+    *,
+    budget_bytes: int,
+    selection_tensor_payload_bytes: int,
+    selection_non_tensor_reserve_bytes: int,
+) -> dict:
+    """Persist the conservative selection contract consumed by exporters."""
+    values = {
+        "budget_bytes": budget_bytes,
+        "selection_tensor_payload_bytes": selection_tensor_payload_bytes,
+        "selection_non_tensor_reserve_bytes": selection_non_tensor_reserve_bytes,
+    }
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    upper_bound = (
+        selection_tensor_payload_bytes + selection_non_tensor_reserve_bytes
+    )
+    if upper_bound > budget_bytes:
+        raise ValueError(
+            "selection whole-artifact upper bound exceeds its hard budget: "
+            f"{upper_bound}B > {budget_bytes}B"
+        )
+    return {
+        "schema": WHOLE_ARTIFACT_BUDGET_SCHEMA,
+        "scope": "all_regular_files_recursive",
+        "budget_bytes": budget_bytes,
+        "selection_tensor_payload_bytes": selection_tensor_payload_bytes,
+        "selection_non_tensor_reserve_bytes": selection_non_tensor_reserve_bytes,
+        "selection_whole_artifact_upper_bound_bytes": upper_bound,
+        "selection_contract": (
+            "tensor_payload_plus_operator_supplied_non_tensor_reserve"
+        ),
+        "final_contract": "stat_all_regular_files_recursive_fail_closed",
+    }
+
+
+def whole_artifact_budget_from_assignment_payload(
+    payload: Mapping[str, object],
+    *,
+    where: str,
+) -> Mapping[str, object] | None:
+    """Read and validate an optional hard export-directory budget stamp."""
+    meta = payload.get("__prismaquant__")
+    raw = (
+        meta.get(WHOLE_ARTIFACT_BUDGET_FIELD)
+        if isinstance(meta, Mapping)
+        else None
+    )
+    if raw is None:
+        raw = payload.get(WHOLE_ARTIFACT_BUDGET_FIELD)
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{where}: whole-artifact budget stamp is not an object")
+    if raw.get("schema") != WHOLE_ARTIFACT_BUDGET_SCHEMA:
+        raise ValueError(
+            f"{where}: unsupported whole-artifact budget schema "
+            f"{raw.get('schema')!r}"
+        )
+    required = (
+        "budget_bytes",
+        "selection_tensor_payload_bytes",
+        "selection_non_tensor_reserve_bytes",
+        "selection_whole_artifact_upper_bound_bytes",
+    )
+    parsed: dict[str, int] = {}
+    for name in required:
+        value = raw.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"{where}: whole-artifact budget field {name!r} must be a "
+                "nonnegative integer"
+            )
+        parsed[name] = value
+    expected_upper = (
+        parsed["selection_tensor_payload_bytes"]
+        + parsed["selection_non_tensor_reserve_bytes"]
+    )
+    if parsed["selection_whole_artifact_upper_bound_bytes"] != expected_upper:
+        raise ValueError(
+            f"{where}: whole-artifact upper bound does not reconcile: "
+            f"stamp={parsed['selection_whole_artifact_upper_bound_bytes']}B, "
+            f"payload+reserve={expected_upper}B"
+        )
+    if expected_upper > parsed["budget_bytes"]:
+        raise ValueError(
+            f"{where}: selected whole-artifact upper bound {expected_upper}B "
+            f"exceeds budget {parsed['budget_bytes']}B"
+        )
+    return dict(raw)
+
+
+def recursive_regular_file_bytes(path: str | Path) -> int:
+    """Measure a completed artifact using the budget stamp's final scope."""
+    root = Path(path)
+    if root.is_file():
+        return int(root.stat().st_size)
+    if not root.is_dir():
+        raise FileNotFoundError(f"export artifact does not exist: {root}")
+    return sum(
+        int(item.stat().st_size)
+        for item in root.rglob("*")
+        if item.is_file()
+    )
+
+
+def enforce_whole_artifact_budget(
+    artifact_path: str | Path,
+    assignment_payload: Mapping[str, object],
+    *,
+    where: str,
+) -> dict | None:
+    """Hard-fail a completed file/directory against its persisted budget."""
+    stamp = whole_artifact_budget_from_assignment_payload(
+        assignment_payload,
+        where=where,
+    )
+    if stamp is None:
+        return None
+    actual = recursive_regular_file_bytes(artifact_path)
+    budget = int(stamp["budget_bytes"])
+    attestation = {
+        "scope": "all_regular_files_recursive",
+        "artifact_path": str(artifact_path),
+        "actual_bytes": actual,
+        "budget_bytes": budget,
+        "headroom_bytes": budget - actual,
+        "within_budget": actual <= budget,
+    }
+    if actual > budget:
+        raise RuntimeError(
+            f"{where}: exact completed artifact size is {actual}B, exceeding "
+            f"the hard whole-artifact budget of {budget}B by {actual - budget}B"
+        )
+    return attestation
+
+
 def _bit_split(k: int, n_sub: int) -> tuple[int, ...]:
     base, extra = divmod(int(k), int(n_sub))
     return tuple(base + (1 if index < extra else 0) for index in range(n_sub))
@@ -551,6 +794,17 @@ def _sidecar_identity(
     canonical = str(format_name).strip().upper()
     refs = _physical_codebook_refs(qname, canonical, context)
     shapes = codebook_subtable_shapes(canonical)
+    content_sha256 = None
+    if context.codebook_source == "learned":
+        digests = context.codebook_content_digests or {}
+        missing = [ref for ref in refs if ref not in digests]
+        if missing:
+            raise ValueError(
+                f"{qname}: learned {canonical} sidecar identity is missing "
+                f"materialized SHA-256 digest(s) for {missing}; logical refs "
+                "alone cannot prove render/export byte identity"
+            )
+        content_sha256 = [digests[ref] for ref in refs]
     return {
         "format": canonical,
         "codebook_source": context.codebook_source,
@@ -558,6 +812,8 @@ def _sidecar_identity(
         "dtype": "float16",
         "subtable_shapes": [list(shape) for shape in shapes],
         "payload_bytes": codebook_sidecar_payload_bytes(canonical),
+        **({"content_sha256": content_sha256}
+           if content_sha256 is not None else {}),
     }
 
 
@@ -624,6 +880,17 @@ def cb_tensor_payload_breakdown(
         "type_size": (4 * k + (9 if context.scale_coding ==
                                PRODUCTION_FP4_SCALE_CODING else 16))
         if grid == "fp4" else 4 * k,
+        "shape": list(dims),
+        "params": int(math.prod(dims)),
+        "output_rows": output_rows,
+        "in_features": in_features,
+        "superblocks_per_row": n_superblocks,
+        "index_bytes": int(index_bytes),
+        "fp4_scale_bytes": int(fp4_scale_bytes),
+        "fp8_row_scale_bytes": int(fp8_row_scale_bytes),
+        "global_scale_bytes": 0,
+        "packed_weight_bytes": int(packed_weight_bytes),
+        "tensor_payload_bytes": int(tensor_payload_bytes),
         "sidecar": sidecar,
     }
     return {
@@ -738,6 +1005,30 @@ def cb_payload_summary(breakdown: Mapping[str, object]) -> dict:
     }
 
 
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(raw: str, *, where: str):
+    try:
+        return json.loads(
+            raw,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"{where}: invalid strict JSON: {exc}") from exc
+
+
 def _safetensors_data_spans(path: Path) -> dict[str, int]:
     """Read exact tensor data-span bytes from a safetensors container.
 
@@ -759,8 +1050,10 @@ def _safetensors_data_spans(path: Path) -> dict[str, int]:
             )
         raw_header = handle.read(header_length)
     try:
-        header = json.loads(raw_header.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        header = _strict_json_loads(
+            raw_header.decode("utf-8"), where=str(path)
+        )
+    except UnicodeDecodeError as exc:
         raise AssertionError(f"{path}: invalid safetensors JSON header") from exc
     if not isinstance(header, Mapping):
         raise TypeError(f"{path}: safetensors header is not an object")
@@ -787,7 +1080,7 @@ def _safetensors_data_spans(path: Path) -> dict[str, int]:
             )
         dtype = entry.get("dtype")
         shape = entry.get("shape")
-        if dtype not in _SAFETENSORS_DTYPE_BYTES:
+        if dtype not in _SAFETENSORS_DTYPE_BITS:
             raise AssertionError(
                 f"{path}: tensor {name!r} has unsupported dtype {dtype!r}"
             )
@@ -798,7 +1091,8 @@ def _safetensors_data_spans(path: Path) -> dict[str, int]:
             raise AssertionError(
                 f"{path}: tensor {name!r} has invalid shape {shape!r}"
             )
-        expected_span = int(math.prod(shape)) * _SAFETENSORS_DTYPE_BYTES[dtype]
+        expected_bits = int(math.prod(shape)) * _SAFETENSORS_DTYPE_BITS[dtype]
+        expected_span = (expected_bits + 7) // 8
         if end - start != expected_span:
             raise AssertionError(
                 f"{path}: tensor {name!r} span is {end - start}B but "
@@ -825,12 +1119,46 @@ def _safetensors_data_spans(path: Path) -> dict[str, int]:
     return spans
 
 
+def _safetensors_tensor_payload_sha256(
+    path: Path,
+    tensor_names: Sequence[str],
+) -> dict[str, str]:
+    """Hash exact serialized data spans after structural validation."""
+    spans = _safetensors_data_spans(path)
+    requested = {str(name) for name in tensor_names}
+    missing = sorted(requested - set(spans))
+    if missing:
+        raise AssertionError(
+            f"{path}: cannot hash missing safetensors tensors {missing[:12]}"
+        )
+    with path.open("rb") as handle:
+        raw_length = handle.read(8)
+        (header_length,) = struct.unpack("<Q", raw_length)
+        header = _strict_json_loads(
+            handle.read(header_length).decode("utf-8"), where=str(path)
+        )
+        data_start = 8 + int(header_length)
+        out: dict[str, str] = {}
+        for name in sorted(requested):
+            start, end = header[name]["data_offsets"]
+            handle.seek(data_start + int(start))
+            raw = handle.read(int(end) - int(start))
+            if len(raw) != int(end) - int(start):
+                raise AssertionError(
+                    f"{path}: truncated payload while hashing {name!r}"
+                )
+            out[name] = hashlib.sha256(raw).hexdigest()
+    return out
+
+
 def cb_export_artifact_inventory(
     out_dir: str | Path,
     *,
     serialized_payload: Mapping[str, object],
     cb_tensor_names: Sequence[str],
     codebook_file: str | None,
+    expected_model_files: Sequence[str] | None = None,
+    whole_artifact_budget_bytes: int | None = None,
 ) -> dict:
     """Inventory an already-written CB export and assert both byte scopes.
 
@@ -852,6 +1180,29 @@ def cb_export_artifact_inventory(
     if not files:
         raise AssertionError(f"{root}: CB export produced no files")
 
+    stale_codebook_files = sorted(
+        name
+        for name in files
+        if Path(name).suffix == ".pqcb" and name != codebook_file
+    )
+    if stale_codebook_files:
+        raise AssertionError(
+            f"{root}: unexpected/stale CB codebook sidecar files are present "
+            f"outside the fresh export plan: {stale_codebook_files[:12]}"
+        )
+
+    if expected_model_files is not None:
+        expected_containers = {str(name) for name in expected_model_files}
+        actual_containers = {
+            name for name in files if Path(name).suffix == ".safetensors"
+        }
+        if actual_containers != expected_containers:
+            raise AssertionError(
+                f"{root}: model safetensors files differ from the fresh export "
+                f"plan: expected={sorted(expected_containers)}, "
+                f"actual={sorted(actual_containers)}"
+            )
+
     container_spans: dict[str, dict[str, int]] = {}
     for relative in files:
         path = root / relative
@@ -861,6 +1212,38 @@ def cb_export_artifact_inventory(
             container_spans[relative] = _safetensors_data_spans(path)
 
     expected_names = {str(name) for name in cb_tensor_names}
+    cb_bases = {
+        name[: -len(".cb_qweight")]
+        for name in expected_names
+        if name.endswith(".cb_qweight")
+    }
+    unexpected_cb_tensors: list[str] = []
+    reserved_suffixes = (
+        ".cb_qweight",
+        ".weight",
+        ".weight_scale",
+        ".weight_scale_inv",
+        ".weight_global_scale",
+        ".input_global_scale",
+    )
+    for relative, spans in container_spans.items():
+        if codebook_file is not None and relative == codebook_file:
+            continue
+        for name in spans:
+            belongs_to_expected_cb = any(
+                name.startswith(f"{base}.") for base in cb_bases
+            )
+            if (
+                (name.endswith(".cb_qweight") or belongs_to_expected_cb)
+                and name.endswith(reserved_suffixes)
+                and name not in expected_names
+            ):
+                unexpected_cb_tensors.append(f"{relative}:{name}")
+    if unexpected_cb_tensors:
+        raise AssertionError(
+            f"{root}: unexpected/stale CB tensors are present outside the "
+            f"export plan: {sorted(unexpected_cb_tensors)[:12]}"
+        )
     found_names: dict[str, tuple[str, int]] = {}
     for relative, spans in container_spans.items():
         if codebook_file is not None and relative == codebook_file:
@@ -885,6 +1268,63 @@ def cb_export_artifact_inventory(
     codebook_spans = (
         container_spans.get(codebook_file, {}) if codebook_file is not None else {}
     )
+    expected_codebook_names = {
+        str(ref)
+        for sidecar in serialized_payload.get("sidecars", [])
+        if isinstance(sidecar, Mapping)
+        for ref in sidecar.get("codebook_ref", [])
+    }
+    if set(codebook_spans) != expected_codebook_names:
+        raise AssertionError(
+            f"{root}: final codebook tensors differ from the serialized "
+            f"identity: expected={sorted(expected_codebook_names)}, "
+            f"actual={sorted(codebook_spans)}"
+        )
+    expected_codebook_digests: dict[str, str] = {}
+    for sidecar in serialized_payload.get("sidecars", []):
+        if not isinstance(sidecar, Mapping):
+            continue
+        refs = sidecar.get("codebook_ref", [])
+        digests = sidecar.get("content_sha256")
+        if digests is None:
+            continue
+        if not isinstance(refs, list) or not isinstance(digests, list) or (
+            len(refs) != len(digests)
+        ):
+            raise AssertionError(
+                f"{root}: invalid learned-codebook digest identity"
+            )
+        for ref, digest in zip(refs, digests):
+            ref_name = str(ref)
+            digest_value = str(digest).lower()
+            previous = expected_codebook_digests.setdefault(
+                ref_name, digest_value
+            )
+            if previous != digest_value:
+                raise AssertionError(
+                    f"{root}: conflicting learned-codebook digests for "
+                    f"{ref_name!r}"
+                )
+    actual_codebook_digests: dict[str, str] = {}
+    if expected_codebook_digests:
+        if codebook_file is None:
+            raise AssertionError(
+                f"{root}: learned-codebook identity has no sidecar file"
+            )
+        actual_codebook_digests = _safetensors_tensor_payload_sha256(
+            root / codebook_file,
+            sorted(expected_codebook_digests),
+        )
+        mismatched = sorted(
+            name
+            for name, digest in expected_codebook_digests.items()
+            if actual_codebook_digests.get(name) != digest
+        )
+        if mismatched:
+            raise AssertionError(
+                f"{root}: final learned-codebook bytes differ from their "
+                f"content identity: {mismatched[:12]}"
+            )
     cb_codebook_bytes = sum(codebook_spans.values())
     expected_tensor_bytes = int(serialized_payload.get("tensor_payload_bytes", 0))
     expected_codebook_bytes = int(
@@ -913,6 +1353,12 @@ def cb_export_artifact_inventory(
             f"{root}: final CB payload is {cb_payload_bytes}B, accounting "
             f"expected {expected_total}B"
         )
+    if whole_artifact_budget_bytes is not None:
+        if isinstance(whole_artifact_budget_bytes, bool) or int(
+            whole_artifact_budget_bytes
+        ) < 0:
+            raise ValueError("whole_artifact_budget_bytes must be a nonnegative int")
+        whole_artifact_budget_bytes = int(whole_artifact_budget_bytes)
     return {
         "schema": CB_EXPORT_ARTIFACT_INVENTORY_SCHEMA,
         "scope": "all_regular_files_recursive",
@@ -927,6 +1373,20 @@ def cb_export_artifact_inventory(
         "cb_serialized_payload_bytes": int(cb_payload_bytes),
         "cb_tensor_payload_bytes": int(cb_tensor_bytes),
         "cb_codebook_sidecar_bytes": int(cb_codebook_bytes),
+        **({
+            "cb_codebook_content_sha256": dict(sorted(
+                actual_codebook_digests.items()
+            )),
+        } if actual_codebook_digests else {}),
+        **({
+            "whole_artifact_budget_bytes": whole_artifact_budget_bytes,
+            "within_whole_artifact_budget": bool(
+                directory_bytes <= whole_artifact_budget_bytes
+            ),
+            "whole_artifact_budget_headroom_bytes": int(
+                whole_artifact_budget_bytes - directory_bytes
+            ),
+        } if whole_artifact_budget_bytes is not None else {}),
     }
 
 
@@ -937,6 +1397,8 @@ def finalize_cb_export_artifact_inventory(
     serialized_payload: Mapping[str, object],
     cb_tensor_names: Sequence[str],
     codebook_file: str | None,
+    expected_model_files: Sequence[str] | None = None,
+    whole_artifact_budget_bytes: int | None = None,
 ) -> dict:
     """Write ``quant_config.json`` with a self-consistent final inventory.
 
@@ -965,8 +1427,21 @@ def finalize_cb_export_artifact_inventory(
             serialized_payload=serialized_payload,
             cb_tensor_names=cb_tensor_names,
             codebook_file=codebook_file,
+            expected_model_files=expected_model_files,
+            whole_artifact_budget_bytes=whole_artifact_budget_bytes,
         )
         if provenance.get("artifact_inventory") == inventory:
+            if (
+                whole_artifact_budget_bytes is not None
+                and not inventory["within_whole_artifact_budget"]
+            ):
+                raise RuntimeError(
+                    f"{root}: exact recursive export size is "
+                    f"{inventory['export_directory_bytes']}B, exceeding the "
+                    f"hard whole-artifact budget of "
+                    f"{whole_artifact_budget_bytes}B by "
+                    f"{-inventory['whole_artifact_budget_headroom_bytes']}B"
+                )
             return inventory
         provenance["artifact_inventory"] = inventory
     raise AssertionError(

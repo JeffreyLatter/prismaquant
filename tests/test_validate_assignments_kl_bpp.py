@@ -48,7 +48,10 @@ def test_assignment_bpp_excludes_pinned_and_auxiliary_entries():
 
     expected = (
         8.0
-        * fr.get_format("NVFP4").memory_bytes_for_shape((16, 16))
+        * (
+            fr.get_format("NVFP4").memory_bytes_for_shape((16, 16))
+            + 8  # fp32 weight_global_scale + input_global_scale
+        )
         / 256.0
     )
     assert details["bpp"] == expected
@@ -76,7 +79,10 @@ def test_assignment_bpp_excludes_auxiliary_entries_even_when_quantized():
 
     expected = (
         8.0
-        * fr.get_format("NVFP4").memory_bytes_for_shape((16, 16))
+        * (
+            fr.get_format("NVFP4").memory_bytes_for_shape((16, 16))
+            + 8  # fp32 weight_global_scale + input_global_scale
+        )
         / 256.0
     )
     assert details["bpp"] == expected

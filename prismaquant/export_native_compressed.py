@@ -97,6 +97,7 @@ from .layer_config import (
     layer_config_metadata as _layer_config_metadata,
 )
 from .schemas import validate_layer_config_payload
+from .nvfp4_cb_footprint import enforce_whole_artifact_budget
 
 # ---------------------------------------------------------------------------
 # NVFP4 packing. The byte layout (two 4-bit indices/byte, element-0 low nibble,
@@ -8593,6 +8594,19 @@ def main():
         except Exception as e:
             print(f"[export-stream] WARN cache cleanup failed: {e!r}",
                   flush=True)
+
+    budget_attestation = enforce_whole_artifact_budget(
+        out_dir,
+        raw_recipe,
+        where="export_native_compressed",
+    )
+    if budget_attestation is not None:
+        print(
+            "[export-stream] whole-artifact budget passed: "
+            f"{budget_attestation['actual_bytes']}B <= "
+            f"{budget_attestation['budget_bytes']}B",
+            flush=True,
+        )
 
     print(f"[export-stream] done. Serve with:\n"
           f"  vllm serve {out_dir.resolve()} --quantization compressed-tensors",

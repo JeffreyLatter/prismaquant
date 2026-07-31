@@ -50,13 +50,15 @@ PIPELINE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${PARETO_TARGETS:=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25}"
 # TARGET_DISK_GB (re-vet R1, closes debt D12): the byte budget is the
 # CONSTRAINT and measured KL is the OBJECTIVE. When set it OVERRIDES
-# TARGET_BITS — the allocator solves the exact-footprint feasibility test and
+# TARGET_BITS — the allocator solves exact tensor spans plus an operator-set
+# non-tensor reserve, then the exporter enforces exact recursive file bytes —
 # re-emits at the chosen bpp — and it flips SELECTION_MODE to
 # validated-surrogate for this run (an explicit SELECTION_MODE still wins), so
 # the ship pick is made on measured KL among the allocations that fit rather
 # than on the surrogate knee. It also narrows the Pareto set to the ~3 rungs
 # that can fit, which is what keeps the extra KL evals cheap.
 : "${TARGET_DISK_GB:=}"
+: "${ARTIFACT_OVERHEAD_RESERVE_BYTES:=}"
 # Calibration defaults. 4x256 was the historical minimum for correctness
 # validation; 32x1024 (N=32, T=1024 = 32768 tokens/sample, 32 samples)
 # produces ~7% lower PPL on the resulting quantized artifact at a
@@ -91,10 +93,11 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # final export must describe the same layout and shared sidecars.
   : "${CB_CODEBOOK_SOURCE:=lattice}"
   : "${CB_SCALE_CODING:=two_tier}"
+  : "${CB_CODEBOOK_DIGESTS:=}"
   # Cost renderers resolve CBSerializationContext from the environment. These
   # must be exported (not merely shell locals) or a legacy-v1/default split can
   # recur between the Python cost process and the exporter CLI.
-  export CB_CODEBOOK_SOURCE CB_SCALE_CODING
+  export CB_CODEBOOK_SOURCE CB_SCALE_CODING CB_CODEBOOK_DIGESTS
 fi
 if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   : "${ACTIVATION_ROWS_LIMIT:=1024}"
@@ -1271,10 +1274,18 @@ if [[ -n "$TARGET_PROFILE" ]]; then
   ALLOCATOR_PROFILE_ARGS+=(--target-profile "$TARGET_PROFILE")
 fi
 # Byte budget: the constraint is the card, the objective is measured KL
-# (re-vet R1). The allocator re-emits at the bpp whose EXACT footprint fits.
+# (re-vet R1). Selection reserves non-tensor bytes; export enforces the exact
+# recursive regular-file ceiling.
 ALLOCATOR_BUDGET_ARGS=()
 if [[ -n "$TARGET_DISK_GB" ]]; then
-  ALLOCATOR_BUDGET_ARGS=(--target-disk-gb "$TARGET_DISK_GB")
+  if [[ -z "$ARTIFACT_OVERHEAD_RESERVE_BYTES" ]]; then
+    echo "[pipeline] ERROR: TARGET_DISK_GB requires ARTIFACT_OVERHEAD_RESERVE_BYTES (safetensors headers + JSON/tokenizer/processor/other output files)" >&2
+    exit 2
+  fi
+  ALLOCATOR_BUDGET_ARGS=(
+    --target-disk-gb "$TARGET_DISK_GB"
+    --artifact-overhead-reserve-bytes "$ARTIFACT_OVERHEAD_RESERVE_BYTES"
+  )
 fi
 ALLOCATOR_CB_ARGS=()
 if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
@@ -1282,6 +1293,13 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     --cb-scale-coding "$CB_SCALE_CODING"
     --cb-codebook-source "$CB_CODEBOOK_SOURCE"
   )
+  if [[ "$CB_CODEBOOK_SOURCE" == "learned" ]]; then
+    if [[ -z "$CB_CODEBOOK_DIGESTS" ]]; then
+      echo "[pipeline] ERROR: learned CB production requires CB_CODEBOOK_DIGESTS for an already-materialized sidecar; logical role refs do not identify render/export bytes" >&2
+      exit 2
+    fi
+    ALLOCATOR_CB_ARGS+=(--cb-codebook-digests "$CB_CODEBOOK_DIGESTS")
+  fi
 fi
 python3 -m prismaquant.allocator \
   --probe "${PROBE_PATH}" \
@@ -1893,9 +1911,11 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   : "${CB_OUT:=${WORK_DIR}/exported_nvfp4_cb}"
   # Codebook source: `lattice` (deterministic fixed FP4/FP8 tables, one FP16
   # sidecar set per format) or `learned` (shared per-(role) FP16 codebooks
-  # trained at export time). Both are real serialized sidecars and allocator
-  # whole-artifact pricing charges each physical identity once; per-tensor
-  # learned is footprint-prohibitive and never used.
+  # trained deterministically at export time). Learned production is accepted
+  # only when CB_CODEBOOK_DIGESTS binds the pre-materialized expected tensors;
+  # export recomputes and checks those hashes through the layer-config stamp.
+  # Both are real serialized sidecars and allocator pricing charges each
+  # physical identity once; per-tensor learned is never used.
   : "${CB_CODEBOOK_SOURCE:=lattice}"
   : "${CB_CODEBOOK_ITERS:=4}"
   : "${CB_CODEBOOK_SEED:=0}"

@@ -48,6 +48,7 @@ from prismaquant.nvfp4_cb_footprint import (
     is_cb_format,
     validate_cb_assignment_serialization_stamps,
 )
+from prismaquant.footprint import nvfp4_global_sidecar_bytes
 
 KLScope = Literal["last_token", "full_sequence"]
 
@@ -192,7 +193,8 @@ def assignment_bit_total(
 ) -> float:
     """Return exact assignment payload bits, including shared CB sidecars.
 
-    Non-CB formats preserve the historical FormatSpec/stat-memory-map path.
+    Non-CB formats preserve the historical FormatSpec/stat-memory-map path,
+    with NVFP4's emitted global scale tensors added explicitly.
     CB formats are priced as one assignment so FP8 row scales and each
     physical codebook sidecar are charged exactly once. Persisted per-layer
     identities are mandatory: a format label alone cannot establish whether
@@ -210,6 +212,10 @@ def assignment_bit_total(
             cb_shapes[str(name)] = _shape_from_stats(dict(stats[name]))
         else:
             total += 8.0 * _memory_bytes_for_format(stats[name], spec)
+            if spec.name == "NVFP4":
+                total += 8.0 * nvfp4_global_sidecar_bytes(
+                    str(name), _shape_from_stats(dict(stats[name]))
+                )
     if cb_assignment:
         if cb_serialization_context is None:
             raise ValueError(

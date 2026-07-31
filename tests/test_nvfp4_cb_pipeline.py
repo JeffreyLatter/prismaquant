@@ -409,6 +409,37 @@ def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
     assert chosen <= _canon() | {"BF16"}, f"off-menu format chosen: {chosen}"
     assert any(c.startswith(("NVFP4_CB", "FP8_CB")) for c in chosen), (
         f"mixed menu produced no CB rung: {chosen}")
+    assignment = {
+        name: lcfg.canonicalize_format(entry)
+        for name, entry in names.items()
+        if not lcfg.is_layer_config_meta_key(name)
+    }
+    stamps = {
+        name: entry["cb_serialized_identity"]
+        for name, entry in names.items()
+        if (
+            not lcfg.is_layer_config_meta_key(name)
+            and isinstance(entry, dict)
+            and entry.get("cb_serialized_identity") is not None
+        )
+    }
+    from prismaquant.kl_measurement import assignment_bit_total
+
+    stats, _costs = _dense_model(_menu_specs())
+    specs = {spec.name: spec for spec in _menu_specs()}
+    exact_bits = assignment_bit_total(
+        stats,
+        assignment,
+        specs,
+        cb_serialization_context=_CB_CONTEXT,
+        cb_serialization_stamps=stamps,
+        where="allocator integration exact-rate check",
+    )
+    expected_bpp = exact_bits / sum(entry["n_params"] for entry in stats.values())
+    assert emitted["__prismaquant__"]["achieved_bits"] == pytest.approx(
+        expected_bpp, abs=1e-12
+    )
+    assert emitted["__prismaquant__"]["global_optimality_claimed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +586,32 @@ def test_stock_fp8_export_bitexact_vs_ct_codec(tmp_path):
     assert set(ref) == {"weight", "weight_scale"}
     for suffix, t in ref.items():
         assert torch.equal(st[f"{q}.{suffix}"], t.cpu()), f"{suffix} not bit-exact"
+
+
+def test_export_global_cb_stamp_does_not_bypass_missing_layer_identities(tmp_path):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    qname = "model.layers.0.self_attn.o_proj"
+    _make_synth_model(tmp_path, {qname: (2, 256)})
+    layer_config = _write_layer_config(tmp_path, {
+        qname: "NVFP4_CB_K16",
+        "__prismaquant__": {
+            "cb_serialized_payload": {
+                "schema": "prismaquant.cb_serialized_payload.v1",
+                "scale_coding": "two_tier",
+                "layout_version": 2,
+                "codebook_source": "lattice",
+            },
+        },
+    })
+    with pytest.raises(ValueError, match="per-layer serialization identity"):
+        export_nvfp4_cb(
+            str(tmp_path),
+            layer_config,
+            str(_Path(tmp_path) / "exp"),
+            col_weights={qname: torch.ones(256)},
+            device="cpu",
+        )
 
 
 def test_mixed_container_config_groups_schema(tmp_path):

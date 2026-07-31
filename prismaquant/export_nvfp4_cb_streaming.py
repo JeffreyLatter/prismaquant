@@ -80,6 +80,7 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_serialization_metadata_from_assignment_payload,
     cb_tensor_payload_breakdown,
     finalize_cb_export_artifact_inventory,
+    whole_artifact_budget_from_assignment_payload,
     validate_cb_sidecar_tensors,
     validate_cb_assignment_serialization_stamps,
     validate_cb_serialization_context_stamp,
@@ -693,6 +694,10 @@ def export_nvfp4_cb_streaming(
     _recipe_cb_context_stamp, _recipe_cb_tensor_stamps = (
         cb_serialization_metadata_from_assignment_payload(_recipe_payload)
     )
+    _whole_artifact_budget = whole_artifact_budget_from_assignment_payload(
+        _recipe_payload,
+        where="export_nvfp4_cb_streaming layer config",
+    )
     skeleton = _LazySkeleton(model_dir)
     try:
         profile = detect_profile(str(model_dir))
@@ -909,6 +914,17 @@ def export_nvfp4_cb_streaming(
         for q in qnames:
             target_cb[q] = (ref, fmt, codebooks[(ref, fmt)], kind)
 
+    materialized_codebook_tensors = {
+        name: tensor
+        for (ref, fmt), codebook in codebooks.items()
+        for name, tensor in _codebook_tensors(ref, fmt, codebook).items()
+    }
+    materialized_codebook_digests = {
+        name: hashlib.sha256(
+            tensor.to(torch.float16).cpu().contiguous().numpy().tobytes()
+        ).hexdigest()
+        for name, tensor in materialized_codebook_tensors.items()
+    }
     serialization_context = CBSerializationContext(
         scale_coding=scale_coding,
         codebook_source=source,
@@ -916,6 +932,7 @@ def export_nvfp4_cb_streaming(
             qname: _codebook_tensor_names(ref, fmt, codebook)
             for qname, (ref, fmt, codebook, _kind) in target_cb.items()
         },
+        codebook_content_digests=materialized_codebook_digests,
     )
     validate_cb_serialization_context_stamp(
         _recipe_cb_context_stamp,
@@ -1189,10 +1206,9 @@ def export_nvfp4_cb_streaming(
         counts["copied"] += 1
 
     # --- Codebook sidecar (small; in-memory) + config + write. ---
-    cb_tensor_blobs: dict[str, torch.Tensor] = {}
-    for (ref, fmt), codebook in codebooks.items():
-        for tname, blob in _codebook_tensors(ref, fmt, codebook).items():
-            cb_tensor_blobs[tname] = blob
+    cb_tensor_blobs: dict[str, torch.Tensor] = dict(
+        materialized_codebook_tensors
+    )
     codebook_file = "cb_codebooks.pqcb" if cb_tensor_blobs else None
     if set(cb_serialized_shapes) != set(cb_targets):
         missing = sorted(set(cb_targets) - set(cb_serialized_shapes))
@@ -1206,7 +1222,7 @@ def export_nvfp4_cb_streaming(
         cb_serialized_shapes,
         context=serialization_context,
     )
-    if _recipe_cb_tensor_stamps:
+    if _recipe_cb_context_stamp is not None or _recipe_cb_tensor_stamps:
         validate_cb_assignment_serialization_stamps(
             {qname: assignment[qname] for qname in cb_targets},
             cb_serialized_shapes,
@@ -1267,6 +1283,12 @@ def export_nvfp4_cb_streaming(
         serialized_payload=serialized_payload_summary,
         cb_tensor_names=sorted(cb_output_tensor_names),
         codebook_file=codebook_file,
+        expected_model_files=["model.safetensors"],
+        whole_artifact_budget_bytes=(
+            int(_whole_artifact_budget["budget_bytes"])
+            if _whole_artifact_budget is not None
+            else None
+        ),
     )
     return dict(counts)
 

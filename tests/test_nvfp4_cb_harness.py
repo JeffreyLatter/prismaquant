@@ -36,6 +36,20 @@ from prismaquant.nvfp4_cb_footprint import (
 # Footprint — exact producer payload (v2 default; explicit v1 compatibility)
 # ---------------------------------------------------------------------------
 
+
+def _learned_context(fmt: str, role: str = "w") -> CBSerializationContext:
+    count = len(codebook_subtable_shapes(fmt))
+    base = f"cb_codebook.{role}.{fmt}"
+    refs = [base] if count == 1 else [
+        f"{base}.sub{index}" for index in range(count)
+    ]
+    return CBSerializationContext.production(
+        codebook_source="learned",
+        codebook_content_digests={
+            ref: f"{index + 1:064x}" for index, ref in enumerate(refs)
+        },
+    )
+
 @pytest.mark.parametrize("k", range(12, 25))
 def test_footprint_production_fp4_v2_is_4k_plus_9(k):
     shape = (128, 256)
@@ -78,7 +92,7 @@ def test_lattice_and_learned_product_codebooks_have_real_fp16_sidecars():
     fmt = f"NVFP4_CB_K{k}"
     base = cb_footprint({"w": fmt}, {"w": shape})
     learned = cb_footprint(
-        {"w": fmt}, {"w": shape}, codebook_sources={"w": "learned"})
+        {"w": fmt}, {"w": shape}, context=_learned_context(fmt))
     # k16 product codebook = two (2^8, 4) FP16 subtables = 4096 B.
     expected_sidecar = 2 * (1 << 8) * 4 * 2
     assert codebook_subtable_shapes(fmt) == ((256, 4), (256, 4))
@@ -96,10 +110,17 @@ def test_footprint_shared_codebook_charged_once():
     k = 12
     shape = (256, 256)
     fmt = f"NVFP4_CB_K{k}"
-    src = {"a": {"learned": "cb", "group": "role0"},
-           "b": {"learned": "cb", "group": "role0"}}
+    count = len(codebook_subtable_shapes(fmt))
+    refs = [f"cb_codebook.role0.{fmt}.sub{index}" for index in range(count)]
+    context = CBSerializationContext.production(
+        codebook_source="learned",
+        codebook_refs={name: refs for name in ("a", "b")},
+        codebook_content_digests={
+            ref: f"{index + 1:064x}" for index, ref in enumerate(refs)
+        },
+    )
     fp = cb_footprint(
-        {"a": fmt, "b": fmt}, {"a": shape, "b": shape}, codebook_sources=src)
+        {"a": fmt, "b": fmt}, {"a": shape, "b": shape}, context=context)
     # One shared codebook for both tensors → charged once.
     assert fp["sidecar_bytes"] == codebook_sidecar_payload_bytes(fmt) == 1024
 
@@ -133,7 +154,7 @@ def test_fp8_cb_codebook_is_four_fp16_subtables_for_both_sources():
     fmt = f"FP8_CB_K{k}"
     base = cb_footprint({"w": fmt}, {"w": (out_f, in_f)})
     learned = cb_footprint(
-        {"w": fmt}, {"w": (out_f, in_f)}, codebook_sources={"w": "learned"})
+        {"w": fmt}, {"w": (out_f, in_f)}, context=_learned_context(fmt))
     expected_sidecar = 4 * (1 << 9) * 2 * 2
     assert codebook_subtable_shapes(fmt) == ((512, 2),) * 4
     assert base["sidecar_bytes"] == expected_sidecar
@@ -143,7 +164,7 @@ def test_fp8_cb_codebook_is_four_fp16_subtables_for_both_sources():
 
 def test_signed_codebook_shape_and_assignment_deduplication():
     fmt = "NVFP4_CB_S16"
-    ctx = CBSerializationContext.production(codebook_source="learned")
+    ctx = _learned_context(fmt, "q_proj")
     assignment = {"layer.0.q_proj": fmt, "layer.1.q_proj": fmt}
     shapes = {name: (64, 256) for name in assignment}
     result = cb_assignment_payload_breakdown(
@@ -222,7 +243,10 @@ def test_tensor_breakdown_requires_exact_context_and_shape():
 
 
 def test_recipe_context_stamp_rejects_export_layout_drift():
-    production = CBSerializationContext.production(codebook_source="learned")
+    digests = _learned_context("NVFP4_CB_K16").codebook_content_digests
+    production = CBSerializationContext.production(
+        codebook_source="learned", codebook_content_digests=digests
+    )
     stamp = cb_serialization_context_stamp(production)
     validate_cb_serialization_context_stamp(
         stamp, production, where="unit"
@@ -230,7 +254,9 @@ def test_recipe_context_stamp_rejects_export_layout_drift():
     with pytest.raises(ValueError, match="differs from allocator recipe"):
         validate_cb_serialization_context_stamp(
             stamp,
-            CBSerializationContext.legacy_v1(codebook_source="learned"),
+            CBSerializationContext.legacy_v1(
+                codebook_source="learned", codebook_content_digests=digests
+            ),
             where="unit",
         )
 

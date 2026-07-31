@@ -263,6 +263,16 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
         }],
     }))
     layer_config = tmp_path / "layer_config.json"
+    layer_config.write_text(json.dumps({
+        "__prismaquant__": {
+            "cb_serialized_payload": {
+                "schema": "prismaquant.cb_serialized_payload.v1",
+                "scale_coding": "v1",
+                "layout_version": 1,
+                "codebook_source": "lattice",
+            },
+        },
+    }))
     assignment_out = tmp_path / "selected_assignment.json"
     summary = tmp_path / "selection.json"
 
@@ -365,6 +375,163 @@ def test_selector_preserves_cb_global_and_per_layer_serialization_identity(
     assert emitted_assignment["cb_serialized_identities"] == {
         "model.layers.0.self_attn.q_proj": identity,
     }
+
+
+def test_selector_carries_non_cb_whole_artifact_budget_to_layer_config(tmp_path):
+    budget = {
+        "schema": "prismaquant.whole_artifact_budget.v1",
+        "scope": "all_regular_files_recursive",
+        "budget_bytes": 10_000,
+        "selection_tensor_payload_bytes": 8_000,
+        "selection_non_tensor_reserve_bytes": 1_000,
+        "selection_whole_artifact_upper_bound_bytes": 9_000,
+        "selection_contract": (
+            "tensor_payload_plus_operator_supplied_non_tensor_reserve"
+        ),
+        "final_contract": "stat_all_regular_files_recursive_fail_closed",
+    }
+    assignment_path = tmp_path / "candidate.json"
+    assignment_path.write_text(json.dumps({
+        "whole_artifact_budget": budget,
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate",
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+        }],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    emitted_layer = json.loads(layer_config.read_text())
+    assert emitted_layer["__prismaquant__"]["whole_artifact_budget"] == budget
+    assert "cb_serialized_payload" not in emitted_layer["__prismaquant__"]
+    emitted_assignment = json.loads(assignment_out.read_text())
+    assert emitted_assignment["whole_artifact_budget"] == budget
+
+
+def test_selector_rejects_global_cb_stamp_without_per_layer_identities(tmp_path):
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "cb_serialized_payload": {
+            "schema": "prismaquant.cb_serialized_payload.v1",
+            "scale_coding": "two_tier",
+            "layout_version": 2,
+            "codebook_source": "lattice",
+        },
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4_CB_K16",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "global serialized-payload context but no per-layer identities" in (
+        result.stderr + result.stdout
+    )
+
+
+def test_selector_rejects_stale_cb_stamp_on_non_cb_assignment(tmp_path):
+    assignment_path = tmp_path / "candidate.json"
+    assignment_path.write_text(json.dumps({
+        "cb_serialized_payload": {
+            "schema": "prismaquant.cb_serialized_payload.v1",
+            "scale_coding": "two_tier",
+            "layout_version": 2,
+            "codebook_source": "lattice",
+        },
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate",
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "global serialized-payload context but no per-layer identities" in (
+        result.stderr + result.stdout
+    )
 
 
 def test_select_validated_frontier_diagnostics_include_dominated_rows(tmp_path):

@@ -135,4 +135,7 @@ def test_core_recipe_defaults_are_pinned():
     assert ': "${SELECTION_MODE:=surrogate}"' in script
     assert ': "${SELECTION_MODE:=validated-surrogate}"' in script
     assert ': "${TARGET_DISK_GB:=}"' in script
+    assert ': "${ARTIFACT_OVERHEAD_RESERVE_BYTES:=}"' in script
+    assert '--artifact-overhead-reserve-bytes "$ARTIFACT_OVERHEAD_RESERVE_BYTES"' in script
+    assert "TARGET_DISK_GB requires ARTIFACT_OVERHEAD_RESERVE_BYTES" in script
     assert ': "${VALIDATED_FRONTIER_PICK:=budget}"' in script
