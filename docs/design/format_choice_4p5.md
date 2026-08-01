@@ -74,11 +74,12 @@ Measured at *other* budgets:
   format-dependent (`format-speed-policy.md:16-29`). The "12% decode / 30% prefill" framing in
   `serving-tax-elimination.md:1-5` is **superseded** (pre-dates the CUDA expander
   and mid-M fused promotion) — cite the 07-27 policy / ARCHITECTURE §9.2.
-- **CB's deployment cost:** out-of-tree plugin, per-arch top-level expert-loader
-  wiring (`_CB_TOPLEVEL_MODULE_PATHS`), **single-GPU only, no TP handling in
-  `gb/*.py`** (ARCHITECTURE §9.2); an unwired arch used to serve uninitialised
-  memory as coherent-looking garbage, now a hard serve-time failure
-  `[MEMORY: gridbook new-MoE-arch checklist]`.
+- **CB's deployment cost:** an external Gridbook runtime with architecture and
+  parallelism capabilities declared by its packaged consumer contract at the
+  exact PrismaQuant pin (ARCHITECTURE §9.2). An unwired architecture used to
+  serve uninitialised memory as coherent-looking garbage; the runtime now
+  fails closed and cross-repository CI compares producer eligibility with that
+  contract.
 
 ### 2.2 EXTRAPOLATION to 4.5
 
@@ -152,8 +153,9 @@ NVFP4 unit, and the bundle's net quality and phase-specific latency decide it.
 
 **K1 — Serving-environment constraint (hard, binary, decides alone).**
 - Stock vLLM only / TP or multi-GPU required / architecture not CB-declared
-  (`supported_lanes`, `_CB_TOPLEVEL_MODULE_PATHS`) ⇒ **native container, NVFP4
-  menu.** Not a quality judgment: CB cannot serve there.
+  (producer `supported_lanes` versus the pinned Gridbook consumer contract) ⇒
+  **native container, NVFP4 menu.** Not a quality judgment: CB cannot serve
+  there.
 - **Pre-Blackwell target** (sm < 100) ⇒ **CB container, fp8-CB ladder with no
   vanilla-NVFP4 rungs offered** — NVFP4 has no kernel there, gridbook's floor is
   8.0. A constraint, never a quality claim.
@@ -236,7 +238,7 @@ before it influences anything.
 **4B served arms** then decide whether Stage 2 is worth the box. Residency matching
 is mandatory (§7.4: ±17% conf-KL keyed purely on extension residency) and has a
 mechanism — the native arm sets `PRISMAQUANT_PRELOAD_FUSED=1`
-(`plugins/gridbook/gridbook/plugin.py:134`), which exists for exactly this.
+(external Gridbook `gridbook/plugin.py`), which exists for exactly this.
 `tools/kl_ab.py` refuses a delta across mismatched `serve_fingerprint`s (§7.4 R15);
 unmatched arms yield a **range against the ±20% band**, not a delta.
 

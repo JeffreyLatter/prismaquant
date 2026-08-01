@@ -40,10 +40,18 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from prismaquant import nvfp4_cb_formats as cb
-from prismaquant.layer_config import (
-    _NVFP4_CB_FORMAT_NAMES,
-    load_assignment,
+from prismaquant.cb_layout import (
+    CB_FORMAT_NAMES,
+    family_for,
+    parse_format_name,
+    subtable_bit_widths,
 )
+from prismaquant.cb_export_config import (
+    build_quant_config,
+    codebook_tensor_names as _codebook_tensor_names,
+    codebook_tensors as _codebook_tensors,
+)
+from prismaquant.layer_config import load_assignment
 from prismaquant.export_output_safety import (
     prepare_fresh_export_directory,
     transactional_directory_output,
@@ -70,7 +78,7 @@ from prismaquant.nvfp4_cb_footprint import (
 # derives its format menu from this constant
 # (serving_profile_specs/nvfp4_cb.json), so the allocator can never spend budget
 # on a rung this exporter would hard-fail on.
-EXPORTABLE_FORMATS = frozenset(_NVFP4_CB_FORMAT_NAMES) | frozenset(
+EXPORTABLE_FORMATS = CB_FORMAT_NAMES | frozenset(
     {"NVFP4", "FP8_E4M3", "FP8_SOURCE", "BF16"}
 )
 
@@ -83,16 +91,11 @@ def _git_commit() -> str:
 def _parse_cb_format(fmt: str) -> tuple[str, str, int] | None:
     """``NVFP4_CB_K{k}`` -> (fp4, product, k); ``NVFP4_CB_S{k}`` -> (fp4,
     signed, k); ``FP8_CB_K{k}`` -> (fp8, product, k). None for non-CB."""
-    up = str(fmt).strip().upper()
-    if up not in _NVFP4_CB_FORMAT_NAMES:
+    parsed = parse_format_name(str(fmt).strip().upper())
+    if parsed is None:
         return None
-    if up.startswith("NVFP4_CB_S"):
-        return "fp4", "signed", int(up[len("NVFP4_CB_S"):])
-    if up.startswith("NVFP4_CB_K"):
-        return "fp4", "product", int(up[len("NVFP4_CB_K"):])
-    if up.startswith("FP8_CB_K"):
-        return "fp8", "product", int(up[len("FP8_CB_K"):])
-    return None
+    family, k = parsed
+    return family.grid, family.mode, k
 
 
 def _role_of(qname: str) -> str:
@@ -420,13 +423,18 @@ def _train_shared_codebook(weights, cws, *, grid, mode, k, seed, iters,
             vec.device)
         vec, wq = vec[idx], wq[idx]
     if mode == "signed":
-        return cb.learn_codebook(vec.abs(), k - cb.VEC_DIM, grid=grid,
+        signed_bits = subtable_bit_widths(
+            k,
+            "signed",
+            family_for(grid, "signed").n_sub,
+        )[0]
+        return cb.learn_codebook(vec.abs(), signed_bits, grid=grid,
                                  col_weights=wq, positive=True, iters=iters,
                                  seed=seed).cpu()
     if mode == "product":
-        n_sub = cb._product_n_sub(grid)
+        n_sub = family_for(grid, mode).n_sub
         sub_dim = cb.VEC_DIM // n_sub
-        bits = cb._bit_split(k, n_sub)
+        bits = subtable_bit_widths(k, mode, n_sub)
         subs = []
         for i, b in enumerate(bits):
             xs = vec[:, i * sub_dim:(i + 1) * sub_dim]
@@ -438,31 +446,6 @@ def _train_shared_codebook(weights, cws, *, grid, mode, k, seed, iters,
         return tuple(subs)
     return cb.learn_codebook(vec, k, grid=grid, col_weights=wq, iters=iters,
                              seed=seed).cpu()
-
-
-def _codebook_tensor_names(ref: str, fmt: str, codebook) -> tuple[str, ...]:
-    """Physical sidecar tensor names for a resolved codebook object."""
-    base = f"cb_codebook.{ref}.{fmt}"
-    if isinstance(codebook, (tuple, list)):
-        return tuple(f"{base}.sub{i}" for i in range(len(codebook)))
-    return (base,)
-
-
-def _codebook_tensors(ref: str, fmt: str, codebook) -> dict[str, torch.Tensor]:
-    """Serialize a codebook (single table or product sub-table tuple) to fp16
-    safetensors tensors under ``cb_codebook.<ref>.<fmt>[.sub{i}]`` (grid values
-    are exact in fp16 for both the E2M1 and E4M3 grids)."""
-    if isinstance(codebook, (tuple, list)):
-        return {
-            name: tensor.to(torch.float16).cpu().contiguous()
-            for name, tensor in zip(
-                _codebook_tensor_names(ref, fmt, codebook), codebook
-            )
-        }
-    return {
-        _codebook_tensor_names(ref, fmt, codebook)[0]:
-        codebook.to(torch.float16).cpu().contiguous()
-    }
 
 
 @transactional_directory_output(
@@ -535,15 +518,12 @@ def export_nvfp4_cb(
     # Reuse the compressed-tensors codecs + scheme templates for stock rungs —
     # NEVER reimplement packing. M19 scale-fidelity: `_quantize_2d` renders and
     # packs from ONE scale selection, so the shipped scales ARE the render's.
-    from copy import deepcopy as _deepcopy
     from prismaquant import format_registry as _fr
     from prismaquant.export_native_compressed import (
         _quantize_2d as _ct_quantize_2d,
         compute_nvfp4_global_real as _ct_nvfp4_global_real,
-        _explicit_regex as _ct_explicit_regex,
         NVFP4_SCHEME as _NVFP4_SCHEME,
         FP8_E4M3_SCHEME as _FP8_E4M3_SCHEME,
-        FP8_SOURCE_SCHEME as _FP8_SOURCE_SCHEME,
     )
     from prismaquant.model_profiles import detect_profile as _detect_profile
     # Stock rungs the mixed container carries CT-style (plugin delegates them to
@@ -1000,8 +980,8 @@ def export_nvfp4_cb(
     # --- Codebook tensors: shipped once per (ref, fmt) in a NON-safetensors-
     # globbed sidecar (cb_codebooks.pqcb) so vLLM's weight loader never sees
     # these non-parameter tensors. The plugin loads them explicitly via the
-    # config's codebook_file pointer (plugins/gridbook config.py
-    # get_codebooks -> load_file(model_dir/cb_codebooks.pqcb)), keyed by each
+    # config's codebook_file pointer (external Gridbook runtime:
+    # config.get_codebooks -> load_file(model_dir/cb_codebooks.pqcb)), keyed by each
     # scheme's codebook_ref. Sidecar-only: NOT written into model.safetensors. ---
     cb_tensor_blobs.update(materialized_codebook_tensors)
     codebook_file = "cb_codebooks.pqcb" if cb_tensor_blobs else None
@@ -1039,109 +1019,6 @@ def export_nvfp4_cb(
     )
     serialized_payload_summary = cb_payload_summary(serialized_payload)
 
-    # --- Provenance hashes. ---
-    assignment_sha = hashlib.sha256(json.dumps(
-        dict(sorted(assignment.items())), separators=(",", ":")).encode(),
-    ).hexdigest()
-    ih = hashlib.sha256()
-    for q in sorted(col_weights):
-        ih.update(q.encode())
-        ih.update(col_weights[q].to(torch.float32).cpu().numpy().tobytes())
-    imatrix_sha = ih.hexdigest()
-    codebook_sha = {
-        tname: hashlib.sha256(
-            blob.to(torch.float16).cpu().numpy().tobytes()).hexdigest()
-        for tname, blob in cb_tensor_blobs.items()
-    }
-
-    # --- Custom quant config (config_groups keyed by scheme signature). ---
-    config_groups: dict[str, dict] = {}
-    for gi, ((ref, fmt), qnames) in enumerate(sorted(by_group.items())):
-        grid, mode, k = cb_targets[qnames[0]]
-        codebook = codebooks[(ref, fmt)]
-        n_sub = len(codebook) if isinstance(codebook, (tuple, list)) else 1
-        base = f"cb_codebook.{ref}.{fmt}"
-        codebook_ref = ([f"{base}.sub{i}" for i in range(n_sub)]
-                        if n_sub > 1 else base)
-        group_coding = (scale_coding if grid == "fp4"
-                        else cb.SCALE_CODING_V1)
-        scheme = {
-            "grid": grid,
-            "mode": mode,
-            "k": k,
-            "superblock": cb.SUPERBLOCK,
-            "group_size": cb.FP4_GROUP if grid == "fp4" else 0,
-            "vec_dim": cb.VEC_DIM,
-            "n_sub": n_sub,
-            "type_size": cb.nvfp4_cb_type_size(k, grid, group_coding),
-            "act_bits": 4 if grid == "fp4" else 8,
-            "codebook_source": (
-                "lattice" if ref == "lattice" else "learned"),
-            "codebook_ref": codebook_ref,
-            "codebook_group": None if ref == "lattice" else ref,
-        }
-        if group_coding == cb.SCALE_CODING_TWO_TIER:
-            # Table entries asserted e4m3-exact by _two_tier_tables; ship the
-            # 16 floats so the scheme is self-describing (spec §1.3/§5.1).
-            table, _, _ = cb._two_tier_tables("cpu")
-            scheme["scale_coding"] = {
-                "kind": "two_tier",
-                "sub_bits": 4,
-                "super_bias": cb.TWO_TIER_SUPER_BIAS,
-                "table": [float(t) for t in table.tolist()],
-            }
-        config_groups[f"group_{gi}"] = {
-            # Targets are the CANONICAL qnames: vLLM's class mapper serves the
-            # LM at model.layers.* regardless of the checkpoint's infix
-            # convention (the 0.8B ships model.language_model.* on disk yet
-            # serves at model.layers.* — checkpoint-namespace targets matched
-            # nothing and every layer loaded unquantized, 2026-07-22).
-            # Checkpoint names remain the TENSOR convention only.
-            "targets": sorted(qnames),
-            "format": fmt,
-            "scheme": scheme,
-        }
-    # Stock CT config_groups: EXACT compressed-tensors vocabulary (weights/
-    # input_activations/format at the group top, NO "scheme" key) so the plugin
-    # hands them straight to CompressedTensorsConfig.from_config under
-    # delegation. The presence of a "scheme" key is the CB-vs-stock dispatch
-    # marker (LAYOUT.md §4): CB groups have "scheme"; stock CT groups do not.
-    _stock_by_fmt: dict[str, list[str]] = {}
-    for _q, _f in stock_targets.items():
-        _key = f"{_f}//sidecar" if _q in sidecar_stock else _f
-        _stock_by_fmt.setdefault(_key, []).append(_q)
-    def _sidecar_serving_name(q: str) -> str:
-        # Config-group targets must match vLLM's SERVING prefixes. The LM
-        # keeps the checkpoint's `model.` prefix at serve time, but sidecar
-        # towers do not: the Qwen VL mapper serves checkpoint
-        # `model.visual.*` as module `visual.*` (demonstrated by the loader
-        # itself — 'blocks.0.attn.proj ... in Qwen3_VisionTransformer').
-        # Tensor NAMES stay checkpoint-form; only group targets strip the
-        # leading `model.`.
-        return q[len("model."):] if q.startswith("model.") else q
-
-    for _key, _qnames in sorted(_stock_by_fmt.items()):
-        _f = _key.split("//")[0]
-        _group = _deepcopy(_STOCK_CT_SCHEMES[_f])
-        _names = (_qnames if not _key.endswith("//sidecar")
-                  else [_sidecar_serving_name(q) for q in _qnames])
-        if _key.endswith("//sidecar"):
-            # weight-only (W4A16/W8A16): no activation contract for sidecar
-            # towers; CT vocabulary = input_activations null.
-            _group["input_activations"] = None
-        # Serving-namespace targets: canonical qnames (sidecars strip the
-        # model. prefix per the class mapper) — see the CB-group note above.
-        _group["targets"] = sorted(_ct_explicit_regex(q) for q in _names)
-        config_groups[f"group_{len(config_groups)}"] = _group
-    # FP8_SOURCE passthrough group: the stock CT `float-quantized` block-fp8
-    # scheme (no "scheme" key -> the plugin delegates it to CompressedTensors,
-    # exactly like the other stock rungs; the emitted `.weight`/`.weight_scale`
-    # names match FP8_SOURCE_SCHEME).
-    if source_targets:
-        _src_group = _deepcopy(_FP8_SOURCE_SCHEME)
-        _src_group["targets"] = sorted(
-            _ct_explicit_regex(q) for q in source_targets)
-        config_groups[f"group_{len(config_groups)}"] = _src_group
     if (
         _recipe_cb_render_identity is not None
         and verified_cb_source_qnames != set(cb_targets)
@@ -1154,42 +1031,35 @@ def export_nvfp4_cb(
             f"{sorted(verified_cb_source_qnames - set(cb_targets))[:8]}"
         )
 
-    quant_config = {
-        "quant_method": "gridbook",
-        "format": "nvfp4_cb",
-        "config_groups": config_groups,
-        "ignore": sorted(set(ignore)),
-        **({"codebook_file": codebook_file} if codebook_file else {}),
-        "provenance": {
-            "git_commit": _git_commit(),
-            "assignment_sha256": assignment_sha,
-            "imatrix_sha256": imatrix_sha,
-            "codebook_sha256": codebook_sha,
-            "codebook_source": source,
-            "scale_sweep": bool(scale_sweep),
-            "encode_tier": serialization_context.encode_tier,
-            "renderer_abi": serialization_context.renderer_abi,
-            "scale_coding": scale_coding,
-            "cb_targets": len(cb_targets),
-            "stock_ct_targets": len(stock_targets),
-            "fp8_source_targets": len(source_targets),
-            "serialized_payload": serialized_payload_summary,
-            "render_identity_verified": bool(
-                _recipe_cb_render_identity is not None
-            ),
-            **({
-                "cb_render_identity": _recipe_cb_render_identity,
-            } if _recipe_cb_render_identity is not None else {}),
-            "tensor_formats": {
-                q: assignment[q]
-                for q in sorted(set(cb_targets) | set(stock_targets)
-                                | set(source_targets))},
-        },
-    }
-    if scale_coding == cb.SCALE_CODING_TWO_TIER:
-        # Absence of layout_version (and of any scheme scale_coding key)
-        # means v1 — old artifacts parse unchanged, forever (spec §5.1).
-        quant_config["layout_version"] = 2
+    def _delegated_target_name(qname: str) -> str:
+        # Sidecar towers lose the leading model. prefix in vLLM's module tree;
+        # the LM and all physical tensor names retain their canonical names.
+        if qname in sidecar_stock and qname.startswith("model."):
+            return qname[len("model."):]
+        return qname
+
+    quant_config = build_quant_config(
+        assignment=assignment,
+        cb_targets=cb_targets,
+        source_targets=source_targets,
+        stock_targets=stock_targets,
+        by_group=by_group,
+        codebooks=codebooks,
+        col_weights=col_weights,
+        codebook_tensors_by_name=cb_tensor_blobs,
+        ignore=ignore,
+        codebook_file=codebook_file,
+        scale_coding=scale_coding,
+        codebook_source=source,
+        serialized_payload_summary=serialized_payload_summary,
+        serialization_context=serialization_context,
+        cb_render_identity=_recipe_cb_render_identity,
+        git_commit=_git_commit(),
+        delegated_target_name=_delegated_target_name,
+        weight_only_stock_targets=sidecar_stock,
+        streaming_provenance=None,
+        include_tensor_formats=True,
+    )
 
     # --- Write safetensors (params only) + the codebook sidecar + configs. ---
     save_file(out_tensors, str(out_dir / "model.safetensors"),

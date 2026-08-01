@@ -3,7 +3,7 @@
   "id": "nvfp4_cb",
   "export_container": "nvfp4_cb",
   "runtime": "vllm+gridbook_plugin",
-  "description": "NVFP4-CB / FP8-CB codebook container, served by the out-of-tree gridbook plugin (plugins/gridbook/). Same OpenAI endpoint as the native lane — which is exactly why the CB half of R16 is wiring, not capability: validate_quantized_model is already endpoint-agnostic and knows nothing about the container.",
+  "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in scripts/lib/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Same OpenAI endpoint as the native lane — which is exactly why the CB half of R16 is wiring, not capability: validate_quantized_model is already endpoint-agnostic and knows nothing about the container.",
   "serving_profiles": ["nvfp4_cb"],
   "endpoint": {
     "kind": "openai",
@@ -61,7 +61,7 @@
   },
   "advisory_gates": true,
   "notes": [
-    "Four archs are declared CB-eligible (qwen3_5, qwen3_5_dense, hy_v3, laguna); the preflight refuses anything else (R6).",
-    "Single-GPU only: no TP path in the plugin."
+    "Required CI compares the producer profiles declared CB-eligible with the pinned Gridbook consumer contract; the preflight refuses any mismatch (R6).",
+    "Single-GPU only: the pinned Gridbook contract has no qualified TP path."
   ]
 }

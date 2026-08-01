@@ -1,5 +1,12 @@
 # NVFP4-CB — Serving & Kernel Plan (PLAN ONLY)
 
+> **HISTORICAL DESIGN RECORD — DO NOT USE AS CURRENT SERVING INSTRUCTIONS.**
+> The runtime now lives in the external Gridbook repository and must be used at
+> the exact commit recorded in `scripts/lib/gridbook_runtime_pin.json`. The
+> canonical quantization key is `gridbook`; any `prismaquant` compatibility
+> alias, package name, import path, or CLI instruction below is retained only as
+> historical evidence and must not be followed for a current deployment.
+
 Scope: how we serve an NVFP4-CB (vector-quantized codebook over FP4/E2M1 codes,
 NVFP4-identical group-16 E4M3 scales) checkpoint in vLLM on GB10/sm_121, mixed
 per-Linear with plain NVFP4, FP8, BF16 in one artifact. Not an implementation.

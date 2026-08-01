@@ -21,8 +21,8 @@ over. This exporter streams instead:
 The PACKED BYTES are identical to the in-memory exporter (both call
 ``cb.nvfp4_cb_pack``; CB scales are per-expert/per-row/per-group, so packing
 one expert alone equals packing it inside the stack) — pinned byte-for-byte
-in tests/test_nvfp4_cb_streaming.py. Container/config/sidecar mirror
-export_nvfp4_cb + LAYOUT.md exactly.
+in tests/test_nvfp4_cb_streaming.py. Both exporters call the single
+``cb_export_config`` builder for container/config/sidecar metadata.
 
 Scope: bf16 source + fp8-source READ + CB families + BF16 passthrough +
 FP8_SOURCE passthrough + stock-CT **DENSE** rungs (vanilla NVFP4 / FP8_DYNAMIC
@@ -63,10 +63,15 @@ import torch
 from safetensors import safe_open
 
 from prismaquant import nvfp4_cb_formats as cb
+from prismaquant.cb_export_config import (
+    build_cb_scheme,
+    build_quant_config,
+    cb_scheme_reuse_signature,
+    codebook_tensor_names as _codebook_tensor_names,
+    codebook_tensors as _codebook_tensors,
+)
 from prismaquant.export_nvfp4_cb import (
     _canonical_qname,
-    _codebook_tensor_names,
-    _codebook_tensors,
     _export_base_name,
     _git_commit,
     _parse_cb_format,
@@ -602,13 +607,6 @@ class _PriorArtifact:
                 and self.shape(name) == tuple(int(d) for d in shape))
 
 
-def _prior_scale_coding_norm(scheme: dict) -> str:
-    sc = scheme.get("scale_coding")
-    if isinstance(sc, dict) and sc.get("kind") == "two_tier":
-        return "two_tier"
-    return "v1"
-
-
 def _cb_reuse_reason(prior: _PriorArtifact, export_base: str, fmt: str,
                      cur_subset: dict, expected_outputs, group_cb_ok: bool):
     """Return None if this CB target is byte-copy eligible from ``prior``, else
@@ -621,13 +619,7 @@ def _cb_reuse_reason(prior: _PriorArtifact, export_base: str, fmt: str,
     pfmt, pscheme = entry
     if pfmt != fmt:
         return "format_changed"
-    pscheme_norm = {
-        "grid": pscheme.get("grid"), "mode": pscheme.get("mode"),
-        "k": pscheme.get("k"), "n_sub": pscheme.get("n_sub"),
-        "type_size": pscheme.get("type_size"),
-        "codebook_ref": pscheme.get("codebook_ref"),
-        "scale_coding": _prior_scale_coding_norm(pscheme),
-    }
+    pscheme_norm = cb_scheme_reuse_signature(pscheme)
     if pscheme_norm != cur_subset:
         return "scheme_changed"
     if not group_cb_ok:
@@ -641,8 +633,8 @@ def _cb_reuse_reason(prior: _PriorArtifact, export_base: str, fmt: str,
 
 
 def _current_imatrix_sha(col_weights: dict[str, torch.Tensor]) -> str:
-    """The imatrix hash exactly as ``_build_config`` computes it — used to
-    diagnose whether the reuse prior shares this run's calibration."""
+    """The imatrix hash exactly as the shared config builder computes it —
+    used to diagnose whether the reuse prior shares this calibration."""
     ih = hashlib.sha256()
     for q in sorted(col_weights):
         ih.update(q.encode())
@@ -1223,18 +1215,15 @@ def export_nvfp4_cb_streaming(
         # planned dtype+shape => byte-copy instead of re-encode.
         reason = "disabled"
         if prior is not None:
-            n_sub = (len(codebook) if isinstance(codebook, (tuple, list))
-                     else 1)
-            base_ref = f"cb_codebook.{ref}.{fmt}"
-            cb_ref = ([f"{base_ref}.sub{i}" for i in range(n_sub)]
-                      if n_sub > 1 else base_ref)
-            cur_subset = {
-                "grid": grid, "mode": mode, "k": k, "n_sub": n_sub,
-                "type_size": ts, "codebook_ref": cb_ref,
-                "scale_coding": ("two_tier"
-                                 if coding == cb.SCALE_CODING_TWO_TIER
-                                 else "v1"),
-            }
+            cur_subset = cb_scheme_reuse_signature(build_cb_scheme(
+                ref=ref,
+                fmt=fmt,
+                grid=grid,
+                mode=mode,
+                k=k,
+                codebook=codebook,
+                scale_coding=coding,
+            ))
             reason = _cb_reuse_reason(
                 prior, export_base, fmt, cur_subset, expected,
                 group_cb_ok.get((ref, fmt), False))
@@ -1420,11 +1409,41 @@ def export_nvfp4_cb_streaming(
         where="export_nvfp4_cb_streaming",
     )
     serialized_payload_summary = cb_payload_summary(serialized_payload)
-    quant_config = _build_config(
-        assignment, cb_targets, source_targets, stock_targets, by_group,
-        codebooks, col_weights, cb_tensor_blobs, ignore, codebook_file,
-        scale_coding, source, profile, serialized_payload_summary,
-        serialization_context, _recipe_cb_render_identity)
+
+    def _cb_target_name(qname: str) -> str:
+        return _export_base_name(qname, profile)
+
+    def _delegated_target_name(qname: str) -> str:
+        return (
+            profile.to_vllm_internal_name(qname)
+            if profile is not None
+            else qname
+        )
+
+    quant_config = build_quant_config(
+        assignment=assignment,
+        cb_targets=cb_targets,
+        source_targets=source_targets,
+        stock_targets=stock_targets,
+        by_group=by_group,
+        codebooks=codebooks,
+        col_weights=col_weights,
+        codebook_tensors_by_name=cb_tensor_blobs,
+        ignore=ignore,
+        codebook_file=codebook_file,
+        scale_coding=scale_coding,
+        codebook_source=source,
+        serialized_payload_summary=serialized_payload_summary,
+        serialization_context=serialization_context,
+        cb_render_identity=_recipe_cb_render_identity,
+        git_commit=_git_commit(),
+        cb_target_name=_cb_target_name,
+        delegated_target_name=_delegated_target_name,
+        source_target_name=_delegated_target_name,
+        weight_only_stock_targets=(),
+        streaming_provenance=True,
+        include_tensor_formats=False,
+    )
 
     # DELTA-EXPORT: verify sampled copies + log the summary BEFORE writing (an
     # abort here leaves no partial artifact). No-op when reuse is disabled.
@@ -1575,116 +1594,6 @@ def _train_shared_codebook_streaming(skeleton, profile, expert_groups,
     return _train_shared_codebook(
         weights, cws, grid=grid, mode=mode, k=k, seed=seed, iters=iters,
         train_cap=train_cap)
-
-
-def _build_config(assignment, cb_targets, source_targets, stock_targets,
-                  by_group, codebooks, col_weights, cb_tensor_blobs, ignore,
-                  codebook_file, scale_coding, source, profile,
-                  serialized_payload_summary, serialization_context,
-                  cb_render_identity):
-    """quant_config.json — mirrors export_nvfp4_cb's config emitter exactly
-    (CB config_groups keyed by scheme signature + stock-CT / FP8_SOURCE groups
-    in the exact compressed-tensors vocabulary + provenance)."""
-    assignment_sha = hashlib.sha256(json.dumps(
-        dict(sorted(assignment.items())), separators=(",", ":")).encode()
-    ).hexdigest()
-    ih = hashlib.sha256()
-    for q in sorted(col_weights):
-        ih.update(q.encode())
-        ih.update(col_weights[q].to(torch.float32).cpu().numpy().tobytes())
-    imatrix_sha = ih.hexdigest()
-    codebook_sha = {
-        t: hashlib.sha256(b.to(torch.float16).cpu().numpy().tobytes())
-        .hexdigest() for t, b in cb_tensor_blobs.items()}
-    config_groups: dict[str, dict] = {}
-    for gi, ((ref, fmt), qnames) in enumerate(sorted(by_group.items())):
-        grid, mode, k = cb_targets[qnames[0]]
-        codebook = codebooks[(ref, fmt)]
-        n_sub = len(codebook) if isinstance(codebook, (tuple, list)) else 1
-        base = f"cb_codebook.{ref}.{fmt}"
-        codebook_ref = ([f"{base}.sub{i}" for i in range(n_sub)]
-                        if n_sub > 1 else base)
-        coding = scale_coding if grid == "fp4" else cb.SCALE_CODING_V1
-        targets = sorted(_export_base_name(q, profile) for q in qnames)
-        scheme = {
-            "grid": grid, "mode": mode, "k": k, "superblock": cb.SUPERBLOCK,
-            "group_size": cb.FP4_GROUP if grid == "fp4" else 0,
-            "vec_dim": cb.VEC_DIM, "n_sub": n_sub,
-            "type_size": cb.nvfp4_cb_type_size(k, grid, coding),
-            "act_bits": 4 if grid == "fp4" else 8,
-            "codebook_source": "lattice" if ref == "lattice" else "learned",
-            "codebook_ref": codebook_ref,
-            "codebook_group": None if ref == "lattice" else ref,
-        }
-        if coding == cb.SCALE_CODING_TWO_TIER:
-            table, _, _ = cb._two_tier_tables("cpu")
-            scheme["scale_coding"] = {
-                "kind": "two_tier", "sub_bits": 4,
-                "super_bias": cb.TWO_TIER_SUPER_BIAS,
-                "table": [float(t) for t in table.tolist()]}
-        config_groups[f"group_{gi}"] = {
-            "targets": targets, "format": fmt, "scheme": scheme}
-    # Stock-CT + FP8_SOURCE config_groups: EXACT compressed-tensors vocabulary
-    # (weights/input_activations/format at the group top, NO "scheme" key) so
-    # the plugin hands them to CompressedTensorsConfig under delegation (the
-    # "scheme" key is the CB-vs-stock dispatch marker, LAYOUT.md §4). Targets
-    # carry the vLLM-INTERNAL name (to_vllm_internal_name): the delegated CT
-    # path matches vLLM's module tree, NOT the checkpoint tensor names, so a
-    # hy_v3 shared_mlp Linear (params under .shared_mlp.*, dispatch prefix
-    # collapsed to .mlp.*) is matched only via the vLLM name (28b6862 /
-    # export_native_compressed.build_quantization_config). CB groups instead
-    # keep the checkpoint name and are runtime-aliased inside the plugin.
-    from copy import deepcopy as _deepcopy
-    from prismaquant.export_native_compressed import (
-        _explicit_regex as _ct_explicit_regex,
-        NVFP4_SCHEME as _NVFP4_SCHEME,
-        FP8_E4M3_SCHEME as _FP8_E4M3_SCHEME,
-        FP8_SOURCE_SCHEME as _FP8_SOURCE_SCHEME,
-    )
-    _STOCK_CT_SCHEMES = {"NVFP4": _NVFP4_SCHEME, "FP8_E4M3": _FP8_E4M3_SCHEME}
-
-    def _vllm_target(q):
-        return profile.to_vllm_internal_name(q) if profile is not None else q
-
-    _stock_by_fmt: dict[str, list[str]] = {}
-    for _q, _f in stock_targets.items():
-        _stock_by_fmt.setdefault(_f, []).append(_q)
-    for _f, _qnames in sorted(_stock_by_fmt.items()):
-        _group = _deepcopy(_STOCK_CT_SCHEMES[_f])
-        _group["targets"] = sorted(
-            _ct_explicit_regex(_vllm_target(q)) for q in _qnames)
-        config_groups[f"group_{len(config_groups)}"] = _group
-    if source_targets:
-        _src_group = _deepcopy(_FP8_SOURCE_SCHEME)
-        _src_group["targets"] = sorted(
-            _ct_explicit_regex(_vllm_target(q)) for q in source_targets)
-        config_groups[f"group_{len(config_groups)}"] = _src_group
-    quant_config = {
-        "quant_method": "gridbook", "format": "nvfp4_cb",
-        "config_groups": config_groups, "ignore": sorted(set(ignore)),
-        **({"codebook_file": codebook_file} if codebook_file else {}),
-        "provenance": {
-            "git_commit": _git_commit(), "assignment_sha256": assignment_sha,
-            "imatrix_sha256": imatrix_sha, "codebook_sha256": codebook_sha,
-            "codebook_source": source, "scale_coding": scale_coding,
-            "scale_sweep": serialization_context.scale_sweep,
-            "encode_tier": serialization_context.encode_tier,
-            "renderer_abi": serialization_context.renderer_abi,
-            "streaming": True, "cb_targets": len(cb_targets),
-            "stock_ct_targets": len(stock_targets),
-            "fp8_source_targets": len(source_targets),
-            "serialized_payload": serialized_payload_summary,
-            "render_identity_verified": bool(
-                cb_render_identity is not None
-            ),
-            **({
-                "cb_render_identity": cb_render_identity,
-            } if cb_render_identity is not None else {}),
-        },
-    }
-    if scale_coding == cb.SCALE_CODING_TWO_TIER:
-        quant_config["layout_version"] = 2
-    return quant_config
 
 
 def main(argv=None) -> None:

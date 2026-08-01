@@ -20,6 +20,7 @@ from safetensors.torch import load_file
 
 from prismaquant import format_registry as fr
 from prismaquant import nvfp4_cb_formats as cb
+from prismaquant.cb_layout import NVFP4_PRODUCT_RUNGS
 
 MODEL = Path("/home/rob/models/Qwen3-0.6B")
 WIKI = Path("/home/rob/dq-runs/gguf-smoke/wiki.test.raw")
@@ -121,7 +122,7 @@ def measure_tiers(dev):
 def rd_law(dev):
     """Fit D(k)=C*2^(-k/4) on anchors {12,18,24}, validate on every other
     rung (two-tier v2, balanced tier)."""
-    ks = tuple(range(12, 25))
+    ks = NVFP4_PRODUCT_RUNGS
     anchors = (12, 18, 24)
     out = []
     for name, w, cwv in _load_reps()[:4]:

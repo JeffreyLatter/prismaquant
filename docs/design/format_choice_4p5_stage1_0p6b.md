@@ -7,6 +7,12 @@ larger. That misses the protocol's <=0.1% exact-byte tolerance. The pair is
 useful for performance iteration, but any native-parity decision must be rerun
 under an exact whole-artifact byte constraint.
 
+**Historical execution note (2026-08-01):** this run predated removal of the
+vendored Gridbook tree. Its old copy/editable-install commands are intentionally
+not reusable. Current reproduction must resolve the exact external runtime via
+`scripts/lib/gridbook_runtime_pin.json` and `gridbook_runtime.sh`; a result that
+cannot attest that commit is invalid.
+
 Executes the endpoint half of `docs/design/format_choice_4p5.md` §5 Stage 1 /
 §5 Stage 2 ("Endpoints first"): two *pure* single-format builds of the same
 model at the same nominal 4.5 rung, so there is no assignment-choice confound;
@@ -245,7 +251,7 @@ the native endpoint and any native-container variant are always full re-exports.
 
 ### (b) Mixed-container delegation — do substituted stock-NVFP4 groups reach vLLM's native path?
 
-**Yes, and it is verified in-container.** `plugins/gridbook/gridbook/config.py`
+**Yes, and it is verified in-container.** External Gridbook `gridbook/config.py`
 splits `config_groups` on the presence of a `"scheme"` key — CB groups have it,
 stock compressed-tensors groups do not (`:161-172`) — and builds a **real
 `CompressedTensorsConfig`** over the stock groups, re-keyed to
@@ -260,7 +266,7 @@ are written with the exact CT scheme vocabulary and **no** `"scheme"` key —
 "the presence of a `scheme` key is the CB-vs-stock dispatch marker"
 (`export_nvfp4_cb.py:706-735`).
 
-Verified by running `plugins/gridbook/tests/test_delegation.py` inside
+Verified by running Gridbook's `tests/test_delegation.py` inside
 `vllm-node:latest` (vLLM `0.23.1rc1.dev764`) — 5/5 pass, including
 `test_ct_owns_stock_and_ignores_cb`, which resolves a stock prefix through
 vLLM's own `find_matched_target`. Pushing one step further, asking the delegated
@@ -291,29 +297,13 @@ holds most of the 128 GB unified pool. ... Stop the serve first
 
 That check belongs to the same box window as the ladder's timing readouts.
 
-## 8. Every command used
+## 8. Command provenance
 
-See §3 for the builds and §5 for the measurements. Additional one-offs:
-
-```bash
-# held-out raw text (wiki.test.raw was missing from /home/rob/dq-runs/gguf-smoke/)
-HF_DATASETS_OFFLINE=1 /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -c \
- "from datasets import load_dataset; ds=load_dataset('wikitext','wikitext-2-raw-v1',split='test',
-  cache_dir='/home/rob/.cache/huggingface/datasets');
-  open('/home/rob/dq-runs/heldout/wiki.test.raw','w').write(''.join(ds['text']))"
-
-# in-container delegation check (CPU-only container; no --gpus, see §7b)
-docker run --rm -v /home/rob/prismaquant:/repo:ro --entrypoint bash vllm-node:latest -c \
- 'cp -r /repo/plugins/gridbook /gb_snap && pip install -e /gb_snap --no-deps -q; python3 - <<PY
-  ... exec test_delegation.py without pytest, then resolve the stock scheme ...
-  PY'
-
-# gridbook into the KL venv — from a SNAPSHOT, never the repo tree
-cp -r /home/rob/prismaquant/plugins/gridbook/. /home/rob/dq-runs/gb_snap/
-rm -rf /home/rob/dq-runs/gb_snap/*.egg-info
-/home/rob/dq-runs/venvs/prismaquant-vllm-kl-20260521/bin/python -m pip install \
-  -e /home/rob/dq-runs/gb_snap --no-deps
-```
+See §3 for the builds and §5 for the measurements. The original one-offs copied
+the then-vendored runtime into mutable snapshots; those commands were removed
+when the two-tree design was retired. Git history preserves them for forensic
+reconstruction. A current rerun must use the immutable external pin helper and
+record Gridbook's resolved commit in the serve fingerprint.
 
 ## 9. Blocked / not done
 

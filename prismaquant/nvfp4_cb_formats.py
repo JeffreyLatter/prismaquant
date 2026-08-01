@@ -62,9 +62,22 @@ from pathlib import Path
 
 import torch
 
-VEC_DIM = 8
-SUPERBLOCK = 256
-FP4_GROUP = 16
+from .cb_layout import (
+    CODEWORDS_PER_SUPERBLOCK,
+    FP4_GROUP,
+    FP4_SCALE_GROUPS_PER_SUPERBLOCK,
+    INDEX_BYTES_PER_K,
+    SCALE_CODING_TWO_TIER,
+    SCALE_CODING_V1,
+    SCALE_PLANE_BYTES,
+    SUPERBLOCK,
+    VEC_DIM,
+    codebook_subtable_shapes,
+    family_for,
+    subtable_bit_widths,
+    type_size as _serialized_type_size,
+)
+
 FP8_ELEMENT_MAX = 448.0
 NVFP4_GRID_MAX = 6.0            # max(|E2M1|); amax/6 == no-clip one-shot scale
 # Flat-table feasibility ceiling (encode-side exhaustive argmin + serve-side
@@ -93,8 +106,6 @@ _E4M3_MIN_POS = 2.0 ** -9
 # x per-16 4-bit sub code into a fixed table of e4m3-exact multipliers;
 # the composition lands exactly on E4M3 by construction (legality mask, no
 # rounding anywhere). Scale plane 16 B -> 9 B per superblock (0.28125 bpw).
-SCALE_CODING_V1 = "v1"                # bare e4m3 plane, 16 B/superblock
-SCALE_CODING_TWO_TIER = "two_tier"    # E8M0 super + 4-bit sub, 9 B/superblock
 TWO_TIER_SUPER_BIAS = 127
 # T4_2oct8m (spec §1.3): all 8 e4m3 mantissa steps x 2 octaves.
 TWO_TIER_SUB_TABLE = (1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875,
@@ -156,20 +167,6 @@ _LATTICE_ITERS = 12
 
 # E2M1: {0, +-0.5, +-1, +-1.5, +-2, +-3, +-4, +-6}
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-def _product_n_sub(grid: str) -> int:
-    """Sub-vectors per 8-dim vector in product mode. fp4 splits into two
-    4-dim halves; fp8 into four 2-dim sub-vectors so every FP8_CB rung's
-    sub-table stays flat-searchable (k=36..48 -> 9..12-bit sub-tables)."""
-    return 2 if grid == "fp4" else 4
-
-
-def _bit_split(k: int, n_sub: int) -> tuple[int, ...]:
-    """Split k index bits across n_sub sub-tables as evenly as possible
-    (ceil-first, so n_sub=2 keeps the historical (ceil, floor) split)."""
-    base, extra = divmod(k, n_sub)
-    return tuple(base + (1 if i < extra else 0) for i in range(n_sub))
 
 
 @lru_cache(maxsize=None)
@@ -392,27 +389,40 @@ def _resolve_codebook(k: int, grid: str, mode: str,
             cb = codebook
         return cb.to(device, torch.float32)
     if mode == "product":
+        n_sub = family_for(grid, mode).n_sub
+        expected_shapes = codebook_subtable_shapes(k, mode, n_sub)
         if codebook is None:
-            n_sub = _product_n_sub(grid)
-            sub_dim = VEC_DIM // n_sub
-            tables = tuple(fixed_lattice(bits, grid, sub_dim)
-                           for bits in _bit_split(k, n_sub))
+            tables = tuple(
+                fixed_lattice(bits, grid, sub_dim)
+                for bits, (_, sub_dim) in zip(
+                    subtable_bit_widths(k, mode, n_sub), expected_shapes
+                )
+            )
         else:
             tables = tuple(codebook)
-            if VEC_DIM % len(tables) != 0:
-                raise ValueError(
-                    f"product codebook count {len(tables)} must divide "
-                    f"{VEC_DIM}")
+        actual_shapes = tuple(tuple(int(dim) for dim in table.shape)
+                              for table in tables)
+        if actual_shapes != expected_shapes:
+            raise ValueError(
+                f"{grid} {mode} k={k} codebook shapes {actual_shapes} do "
+                f"not match canonical serialized shapes {expected_shapes}"
+            )
         return tuple(t.to(device, torch.float32) for t in tables)
     if mode == "signed":
-        m = k - VEC_DIM                       # 8 explicit sign bits inside k
-        if m < 1:
-            raise ValueError(f"signed mode needs k > {VEC_DIM} (got k={k})")
+        n_sub = family_for(grid, mode).n_sub
+        (m,) = subtable_bit_widths(k, mode, n_sub)
+        (expected_shape,) = codebook_subtable_shapes(k, mode, n_sub)
         if codebook is None:
             cb = fixed_lattice(m, grid, VEC_DIM, positive=True)
         else:
             cb = codebook
         cb = cb.to(device, torch.float32)
+        actual_shape = tuple(int(dim) for dim in cb.shape)
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"{grid} {mode} k={k} codebook shape {actual_shape} does "
+                f"not match canonical serialized shape {expected_shape}"
+            )
         if bool((cb < 0).any()):
             raise ValueError(
                 "signed-mode magnitude codebook must be non-negative "
@@ -1520,34 +1530,18 @@ def predict_cb_ladder_costs(w: torch.Tensor, ks: tuple[int, ...], *,
 # Milestone B — byte packers (export path). Bit-exact on-disk layout:
 # docs/lanes/nvfp4-cb/format-pipeline.md §1 / docs/lanes/nvfp4-cb/LAYOUT.md.
 #
-# Per 256-weight superblock along the input dim:
-#   * 4k index bytes — 32 k-bit codewords (one per 8-dim vector), LSB-first;
-#   * fp4 v1: 16 E4M3 group-scale bytes;
-#   * production fp4 v2: 9 two-tier bytes (one E8M0 super + eight packed
-#     subscale-nibble bytes).
-# type_size = 4k + 16 (fp4 v1), 4k + 9 (fp4 v2), or 4k (fp8). The packed tensor
-# is 2-D uint8 (rows, bytes_per_row) — NEVER a flat 1-D buffer (the GGUF
+# The index body, scale-plane sizes, and total type size come only from
+# ``cb_layout``. The packed tensor is 2-D uint8 (rows, bytes_per_row) — NEVER
+# a flat 1-D buffer (the GGUF
 # lesson: a flat store loses the logical row/superblock structure the reader
 # and serving kernel index into). fp8 ships NO scale plane in the weight bytes;
 # its per-output-channel fp32 scales are a separate ``<name>.weight_scale``.
 # ---------------------------------------------------------------------------
 
-def _type_size(k: int, grid: str,
-               scale_coding: str = SCALE_CODING_V1) -> int:
-    """Bytes per 256-weight superblock: 4k index bytes + the scale section —
-    16 E4M3 bytes (fp4 v1), 9 bytes (fp4 v2 two-tier: 1 E8M0 super + 8 sub
-    nibble-bytes), none (fp8)."""
-    if grid != "fp4":
-        return 4 * int(k)
-    if scale_coding == SCALE_CODING_TWO_TIER:
-        return 4 * int(k) + 9
-    return 4 * int(k) + 16
-
-
 def nvfp4_cb_type_size(k: int, grid: str = "fp4",
                        scale_coding: str = SCALE_CODING_V1) -> int:
     """Public: on-disk bytes per 256-weight superblock for a CB rung."""
-    return _type_size(k, grid, scale_coding)
+    return _serialized_type_size(k, grid, scale_coding)
 
 
 def nvfp4_cb_effective_bits(k: int, grid: str = "fp4",
@@ -1557,7 +1551,7 @@ def nvfp4_cb_effective_bits(k: int, grid: str = "fp4",
     Registered FormatSpec rates are nominal compatibility metadata; exact
     producer pricing is versioned by ``CBSerializationContext`` and asserted
     against the serialized payload."""
-    return _type_size(k, grid, scale_coding) * 8.0 / SUPERBLOCK
+    return _serialized_type_size(k, grid, scale_coding) * 8.0 / SUPERBLOCK
 
 
 def _vector_codes(fields: dict, k: int, grid: str, mode: str) -> torch.Tensor:
@@ -1567,7 +1561,8 @@ def _vector_codes(fields: dict, k: int, grid: str, mode: str) -> torch.Tensor:
     product decomposition:
       * full   — the codebook index itself (k bits);
       * product— the n_sub sub-indices contiguous, sub0 in the low bits
-                 (bit widths ``_bit_split(k, n_sub)``, ceil-first);
+                 (bit widths ``subtable_bit_widths(k, "product", n_sub)``,
+                 ceil-first);
       * signed — 8 sign bits (bit j == coord j is negative) in the low byte,
                  then the (k-8)-bit magnitude index above them.
     """
@@ -1582,9 +1577,14 @@ def _vector_codes(fields: dict, k: int, grid: str, mode: str) -> torch.Tensor:
         shifts = torch.arange(VEC_DIM, device=neg.device)
         sign_byte = (neg << shifts).sum(dim=-1)                   # (rows, nvec)
         return sign_byte | (mag << VEC_DIM)
-    # product: idx is (rows, nvec, n_sub)
-    n_sub = idx.shape[-1]
-    bits = _bit_split(k, n_sub)
+    # product: idx is (rows, nvec, canonical family n_sub)
+    n_sub = family_for(grid, mode).n_sub
+    if idx.shape[-1] != n_sub:
+        raise ValueError(
+            f"{grid} {mode} index stream has {idx.shape[-1]} subtables; "
+            f"serialized family requires {n_sub}"
+        )
+    bits = subtable_bit_widths(k, mode, n_sub)
     code = torch.zeros(idx.shape[:-1], dtype=torch.int64, device=idx.device)
     off = 0
     for i in range(n_sub):
@@ -1594,14 +1594,19 @@ def _vector_codes(fields: dict, k: int, grid: str, mode: str) -> torch.Tensor:
 
 
 def _pack_codes_to_bytes(codes: torch.Tensor, k: int) -> torch.Tensor:
-    """(rows, nvec) k-bit codewords -> (rows, n_superblocks, 4k) uint8.
+    """Pack k-bit codewords into the canonical superblock index body.
 
-    Each 256-weight superblock is 32 codewords = 32k bits = 4k bytes and is
-    byte-aligned, so the codewords pack contiguously LSB-first (codeword c
+    Each superblock is byte-aligned, so the codewords pack contiguously
+    LSB-first (codeword c
     occupies stream bits [c*k, c*k+k), its own LSB first; bytes fill LSB-first).
     """
     rows, nvec = codes.shape
-    n_sb = nvec // 32
+    if nvec % CODEWORDS_PER_SUPERBLOCK:
+        raise ValueError(
+            f"codeword count {nvec} is not divisible by "
+            f"{CODEWORDS_PER_SUPERBLOCK}"
+        )
+    n_sb = nvec // CODEWORDS_PER_SUPERBLOCK
     shifts = torch.arange(k, device=codes.device)
     wt = 1 << torch.arange(8, device=codes.device)
     # Chunk over rows: the (chunk, nvec, k) int64 bitstream transient is
@@ -1609,56 +1614,70 @@ def _pack_codes_to_bytes(codes: torch.Tensor, k: int) -> torch.Tensor:
     # stack (three box-wide OOMs, 2026-07-19). Rows are independent, so
     # chunking is bit-identical.
     step = max(1, _SLICE_MAX_ELEMS // max(nvec * k, 1))
-    out = torch.empty(rows, n_sb, 4 * k, dtype=torch.uint8,
+    index_bytes = INDEX_BYTES_PER_K * k
+    out = torch.empty(rows, n_sb, index_bytes, dtype=torch.uint8,
                       device=codes.device)
     for a in range(0, rows, step):
         b = min(rows, a + step)
         bits = (codes[a:b].unsqueeze(-1) >> shifts) & 1      # (chunk, nvec, k)
-        bits = bits.reshape(b - a, n_sb, 4 * k, 8)
+        bits = bits.reshape(b - a, n_sb, index_bytes, 8)
         out[a:b] = (bits * wt).sum(dim=-1).to(torch.uint8)
     return out                                               # (rows,n_sb,4k)
 
 
 def _unpack_bytes_to_codes(idx_bytes: torch.Tensor, k: int) -> torch.Tensor:
-    """(rows, n_sb, 4k) uint8 -> (rows, n_sb*32) int64 codewords (inverse of
-    ``_pack_codes_to_bytes``)."""
+    """Inverse of :func:`_pack_codes_to_bytes` under ``cb_layout``."""
     rows, n_sb, _ = idx_bytes.shape
     bshift = torch.arange(8, device=idx_bytes.device)
     bits = (idx_bytes.to(torch.int64).unsqueeze(-1) >> bshift) & 1
-    bits = bits.reshape(rows, n_sb, 32, k)                      # k bits/codeword
+    bits = bits.reshape(
+        rows, n_sb, CODEWORDS_PER_SUPERBLOCK, k
+    )                                                          # k bits/codeword
     kshift = torch.arange(k, device=idx_bytes.device)
     codes = (bits << kshift).sum(dim=-1)                        # (rows,n_sb,32)
-    return codes.reshape(rows, n_sb * 32)
+    return codes.reshape(rows, n_sb * CODEWORDS_PER_SUPERBLOCK)
 
 
 def _scale_plane_bytes(scales: torch.Tensor, n_sb: int) -> torch.Tensor:
-    """fp4 v1 scale plane -> (rows, n_sb, 16) uint8. ``scales`` (rows, in//16)
+    """Encode the canonical fp4-v1 scale plane. ``scales`` (rows, in//16)
     are already E4M3-exact (snapped by the encoder), so the E4M3 byte view is
     lossless."""
     rows = scales.shape[0]
-    s = scales.reshape(rows, n_sb, FP4_GROUP).to(_E4M3)
+    s = scales.reshape(
+        rows, n_sb, FP4_SCALE_GROUPS_PER_SUPERBLOCK
+    ).to(_E4M3)
     return s.contiguous().view(torch.uint8)
 
 
 def _two_tier_scale_bytes(super_e: torch.Tensor, sub_c: torch.Tensor,
                           n_sb: int) -> torch.Tensor:
-    """fp4 v2 scale section -> (rows, n_sb, 9) uint8: 1 E8M0 super byte, then
-    8 sub bytes (16 x 4-bit codes; group g in byte g//2, even g = LOW nibble
-    — LSB-first, consistent with the index stream). Spec §5.1."""
+    """Encode the canonical fp4-v2 two-tier scale plane.
+
+    The first byte is E8M0; remaining bytes pack two 4-bit subscale codes,
+    with the even group in the low nibble. Spec §5.1.
+    """
     rows = super_e.shape[0]
     sup = super_e.reshape(rows, n_sb, 1).to(torch.uint8)
-    c = sub_c.reshape(rows, n_sb, SUPERBLOCK // FP4_GROUP).to(torch.int64)
+    c = sub_c.reshape(
+        rows, n_sb, FP4_SCALE_GROUPS_PER_SUPERBLOCK
+    ).to(torch.int64)
     if bool((c < 0).any()) or bool((c > 15).any()):
         raise ValueError("two-tier sub codes must be 4-bit (0..15)")
-    pairs = c.reshape(rows, n_sb, 8, 2)
+    pairs = c.reshape(
+        rows, n_sb, FP4_SCALE_GROUPS_PER_SUPERBLOCK // 2, 2
+    )
     sub = (pairs[..., 0] | (pairs[..., 1] << 4)).to(torch.uint8)
     return torch.cat([sup, sub], dim=-1)
 
 
 def _two_tier_scale_unpack(sc_bytes: torch.Tensor):
-    """(rows, n_sb, 9) uint8 -> (super_e (rows, n_sb) int64, sub codes
-    (rows, n_sb*16) int64, composed scales (rows, n_sb*16) fp32 — exact E4M3
-    by construction (table compose, no rounding)."""
+    """Decode the canonical fp4-v2 scale plane to exact E4M3 scales."""
+    expected = SCALE_PLANE_BYTES[("fp4", SCALE_CODING_TWO_TIER)]
+    if sc_bytes.shape[-1] != expected:
+        raise ValueError(
+            f"two-tier scale plane has {sc_bytes.shape[-1]} bytes; "
+            f"expected {expected}"
+        )
     rows, n_sb, _ = sc_bytes.shape
     super_e = sc_bytes[..., 0].to(torch.int64)
     sub = sc_bytes[..., 1:].to(torch.int64)                     # (rows,n_sb,8)
@@ -1670,8 +1689,9 @@ def _two_tier_scale_unpack(sc_bytes: torch.Tensor):
     if not bool(legal[e_exp, codes].all()):
         raise ValueError(
             "two-tier scale bytes contain an illegal (super, sub) pair")
-    scales = compose[e_exp, codes].reshape(rows, n_sb * (SUPERBLOCK
-                                                         // FP4_GROUP))
+    scales = compose[e_exp, codes].reshape(
+        rows, n_sb * FP4_SCALE_GROUPS_PER_SUPERBLOCK
+    )
     return super_e, codes.reshape(rows, -1), scales
 
 
@@ -1681,30 +1701,30 @@ def nvfp4_cb_assemble_bytes(fields: dict, k: int, grid: str = "fp4",
 
     Returns a 2-D uint8 tensor ``(rows, n_superblocks * type_size)`` on the
     fields' device. The scale coding is taken from the fields (a two-tier
-    encode carries ``scale_super``/``scale_sub``): ``type_size == 4k + 16``
-    (fp4 v1) / ``4k + 9`` (fp4 v2) / ``4k`` (fp8), asserted.
+    encode carries ``scale_super``/``scale_sub``); the size is resolved from
+    :mod:`prismaquant.cb_layout` and asserted.
     """
     k = int(k)
     scale_coding = fields.get("scale_coding", SCALE_CODING_V1)
     codes = _vector_codes(fields, k, grid, mode)                # (rows, nvec)
     rows, nvec = codes.shape
-    if nvec % 32 != 0:
+    if nvec % CODEWORDS_PER_SUPERBLOCK != 0:
         raise ValueError(
             f"in_features={nvec * VEC_DIM} is not a multiple of {SUPERBLOCK}")
-    n_sb = nvec // 32
-    idx_bytes = _pack_codes_to_bytes(codes, k)                  # (rows,n_sb,4k)
+    n_sb = nvec // CODEWORDS_PER_SUPERBLOCK
+    idx_bytes = _pack_codes_to_bytes(codes, k)
     if grid == "fp4" and scale_coding == SCALE_CODING_TWO_TIER:
         sc_bytes = _two_tier_scale_bytes(
-            fields["scale_super"], fields["scale_sub"], n_sb)   # (rows,n_sb,9)
+            fields["scale_super"], fields["scale_sub"], n_sb)
         block = torch.cat([idx_bytes, sc_bytes], dim=-1)
     elif grid == "fp4":
-        sc_bytes = _scale_plane_bytes(fields["scales"], n_sb)   # (rows,n_sb,16)
+        sc_bytes = _scale_plane_bytes(fields["scales"], n_sb)
         block = torch.cat([idx_bytes, sc_bytes], dim=-1)
     elif grid == "fp8":
         block = idx_bytes
     else:
         raise ValueError(f"unknown grid {grid!r}")
-    ts = _type_size(k, grid, scale_coding)
+    ts = _serialized_type_size(k, grid, scale_coding)
     assert block.shape[-1] == ts, (
         f"type_size mismatch: packed {block.shape[-1]} bytes/superblock, "
         f"expected {ts} for k={k} grid={grid} scale_coding={scale_coding}")
@@ -1735,14 +1755,15 @@ def nvfp4_cb_unpack(packed: torch.Tensor, k: int, grid: str, mode: str,
             f"in_features={in_f} must be a multiple of {SUPERBLOCK}")
     rows = int(packed.shape[0])
     n_sb = in_f // SUPERBLOCK
-    ts = _type_size(k, grid, scale_coding)
+    ts = _serialized_type_size(k, grid, scale_coding)
     if tuple(packed.shape) != (rows, n_sb * ts):
         raise ValueError(
             f"packed shape {tuple(packed.shape)} != expected "
             f"{(rows, n_sb * ts)} for k={k} grid={grid} in_features={in_f} "
             f"scale_coding={scale_coding}")
     block = packed.reshape(rows, n_sb, ts)
-    codes = _unpack_bytes_to_codes(block[..., :4 * k], k)
+    index_bytes = INDEX_BYTES_PER_K * k
+    codes = _unpack_bytes_to_codes(block[..., :index_bytes], k)
     nvec = in_f // VEC_DIM
 
     if mode == "full":
@@ -1755,8 +1776,8 @@ def nvfp4_cb_unpack(packed: torch.Tensor, k: int, grid: str, mode: str,
         signs = torch.where(neg, -1.0, 1.0).reshape(rows, in_f)
         fields = {"indices": mag.reshape(rows, nvec), "signs": signs}
     elif mode == "product":
-        n_sub = _product_n_sub(grid)
-        bits = _bit_split(k, n_sub)
+        n_sub = family_for(grid, "product").n_sub
+        bits = subtable_bit_widths(k, "product", n_sub)
         subs, off = [], 0
         for i in range(n_sub):
             subs.append((codes >> off) & ((1 << bits[i]) - 1))
@@ -1768,13 +1789,19 @@ def nvfp4_cb_unpack(packed: torch.Tensor, k: int, grid: str, mode: str,
 
     if grid == "fp4" and scale_coding == SCALE_CODING_TWO_TIER:
         super_e, sub_c, composed = _two_tier_scale_unpack(
-            block[..., 4 * k:4 * k + 9])
+            block[..., index_bytes:
+                  index_bytes + SCALE_PLANE_BYTES[
+                      ("fp4", SCALE_CODING_TWO_TIER)
+                  ]])
         fields["scales"] = composed
         fields["scale_super"] = super_e.to(torch.uint8)
         fields["scale_sub"] = sub_c
         fields["scale_coding"] = SCALE_CODING_TWO_TIER
     elif grid == "fp4":
-        sc = block[..., 4 * k:4 * k + FP4_GROUP].reshape(rows, n_sb * FP4_GROUP)
+        scale_plane_bytes = SCALE_PLANE_BYTES[("fp4", SCALE_CODING_V1)]
+        sc = block[..., index_bytes:index_bytes + scale_plane_bytes].reshape(
+            rows, n_sb * FP4_SCALE_GROUPS_PER_SUPERBLOCK
+        )
         fields["scales"] = sc.contiguous().view(_E4M3).to(torch.float32)
     else:
         if scales is None:

@@ -248,19 +248,11 @@ answer. No public quality claim until both land and repeat.
   allocator decision — a principle-2 debt; the flags are recorded in
   provenance KVs so size-matched claims stay auditable.
 
-## Hardware targets — Strix Halo tracking (re-vet R7, ACCEPTED 2026-07-30)
+## Hardware targets — Strix Halo canceled 2026-07-31
 
-Strix Halo enters as a **serving-only** target, **GGUF first**. Quantization
-stays on the Spark in every option, so the probe/cost/render/export stack (all
-CUDA, `gpu_guard.require_cuda_hot_path`) needs **zero ROCm work** — that
-decoupling is the load-bearing part of the ruling, and no ROCm build stack is in
-scope.
-
-| date | option | status | note |
-|---|---|---|---|
-| 2026-07-30 | **A — GGUF-first (approved)** | **BLOCKED: no box** | Milestone: serve the shipped Hy3 2.8 bpp GGUF (`rdtand/Hy3-295B-A21B-…-gguf-vllm`) on Strix and record prefill / decode / ToolEvalBench. Zero new code — llama.cpp already serves ROCm/gfx1151. Also answers the question nothing else does: does the box hold a 100 GB-class artifact at all? |
-| 2026-07-30 | **B — HIP/CK port of the CB kernels** | **NOT FUNDED** | `gb/csrc/cutlass_fork/*` is CUTLASS + sm_120-specific (R6 smem LUT, TileM feasibility, TMA): a rewrite, not a port, doubling the kernel surface maintained forever. Revisit only if A's measured Strix prefill tax is both large and load-bearing for a real workload; the entry test is one kernel (dense decode GEMV) bit-exactness-checked against CUDA on the same artifact. |
-| 2026-07-30 | **C — wait for upstream vLLM-ROCm** | **TRACKING (passive)** | Watch for the first vLLM version that routes NVFP4 / FP8 to a *performant* gfx1151 kernel (registry support is not enough — core principle 9). Costs nothing; buys the zero-maintained-code promise if it lands. Nothing observed as of this row. Append a dated row here when it changes. |
-
-`ARCHITECTURE.md` §10's "Strix Halo — planned, nothing designed or built" stays
-accurate until option A produces a measurement.
+Access to the only gfx1151 system was lost, so all Strix validation and ROCm
+kernel work is canceled. The unqualified Gridbook HIP prototype was removed;
+there is no supported or passively tracked Gridbook-on-Strix lane. Earlier
+measurements remain in dated audit/history documents only. Reopening this target
+requires new hardware and a fresh qualification plan; it is not part of the
+current GGUF or CB release backlog.

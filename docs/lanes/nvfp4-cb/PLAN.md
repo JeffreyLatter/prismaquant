@@ -1,5 +1,10 @@
 # NVFP4-CB — Master Implementation Plan (synthesis) + running log
 
+> Package names, import paths, CLI flags, and repository-local plugin paths in
+> the retained historical log describe the execution context at that time; they
+> are not current instructions. Use the external Gridbook runtime at PrismaQuant's
+> exact tracked pin and follow the normative pages linked below.
+
 ## Status 2026-07-30 — LANE SHIPPED
 
 The plan below was drafted 2026-07-15 and executed; the format, the encoder,
@@ -10,7 +15,7 @@ are all in production. **Current normative pages, in this order:**
 |---|---|
 | `STANDARDS.md` | the format + kernel + cost contract production builds against (supersedes any roadmap text below) |
 | `LAYOUT.md` | on-disk byte layout / container contract |
-| `plugins/gridbook/README.md` | what the serving plugin does today, defaults, per-arch wiring |
+| [Gridbook README](https://github.com/RobTand/gridbook) | what the separately released serving plugin does today, defaults, per-arch wiring |
 | `two-tier-scale-spec.md` | fp4 layout-v2 scale coding (implemented) |
 | `prod_27b_results.md`, `prod_35b_results.md`, `prod_hy3_results.md` | the served verdicts + bug ledgers |
 
@@ -24,7 +29,7 @@ Proven artifacts (four, three of them MoE):
 | Laguna-S-2.1 117B (256-expert MoE) | 6.0 bpp, 84 GB | serves 256k ctx at util 0.87; decode 15.2 tok/s; MoE prefill 293 → 2,186 tok/s over the kernel campaign; no quality claims |
 
 Kernel campaign state, open items and the honest negatives live in
-`STANDARDS.md` (kernel table) and the R6 entry in `plugins/gridbook/README.md`.
+`STANDARDS.md` (kernel table) and the Gridbook repository's kernel documentation.
 
 ---
 
@@ -395,13 +400,14 @@ cheapest. Two-tier-scale mitigation + 4B check deferred behind the speed number.
   on; suite 1099. Agent's judgment call accepted: fp4 E4M3 scales INLINE in
   cb_qweight (type_size=4k+16 exact), only fp8 per-channel scales as a
   separate weight_scale tensor — LAYOUT.md §3 is the plugin contract.
-- **K2 (running):** in-repo plugins/vllm_prismaquant/ — registration + CB
+- **K2 (historical; subsequently externalized to Gridbook):** registration + CB
   linear method + correctness-first Triton expand-in-tile kernels (INV-1
   enforced, INV-2 explicitly waived for the prototype); exports uniform 0.6B
   FP8_CB_K44 + NVFP4_CB_K16 artifacts; measures (a) served-KL vs the emulation
   gate's predictions (0.019 / ~2.21) and (b) the speed table vs vllm-gguf-plugin
   IQ4_XS and BF16 on the same box. Deliverable:
-  docs/nvfp4-cb-plan/serve_prototype_0p6b.md.
+  `serve_prototype_0p6b.md`. Current execution uses the immutable external
+  Gridbook pin; PrismaQuant contains no runtime implementation.
 - **K2 LANDED (a4bf317), ACCEPTED (+ hygiene fix: kernel tests importorskip
   outside serving env; 25/25 re-verified independently):**
   * **EMULATION GATE VALIDATED ON SERVED METAL: served/emu = 1.09× (FP8_CB_K44:

@@ -4,7 +4,7 @@ Target at drafting: Qwen3.6-35B-A3B (packed 3-D expert stacks,
 `experts.gate_up_proj` / `experts.down_proj` per layer). Status: encode /
 export / allocator MoE-ready and tested; the expert COST design in §3 is the
 part that was specced here. **§4's plugin gap is CLOSED** — `PrismaQuantCBMoEMethod`
-(`plugins/gridbook/gridbook/moe.py`) serves CB expert stacks, and three of the
+([external Gridbook `moe.py`](https://github.com/RobTand/gridbook/blob/master/gridbook/moe.py)) serves CB expert stacks, and three of the
 four proven CB artifacts are MoE (35B Ornith, Hy3 295B, Laguna-S-2.1). Read §4
 for what shipped; the rest is the original design record.
 
@@ -78,7 +78,7 @@ changes rather than a new tool:
 ## 4. Serving — SHIPPED (was "plugin gap"; closed 2026-07-19)
 
 The contract drafted here is implemented in
-`plugins/gridbook/gridbook/moe.py` (`PrismaQuantCBMoEMethod`), against each
+[Gridbook's `gridbook/moe.py`](https://github.com/RobTand/gridbook/blob/master/gridbook/moe.py) (`PrismaQuantCBMoEMethod`), against each
 clause:
 
 - **dispatch** on a `RoutedExperts` prefix whose expert targets carry a CB
@@ -99,7 +99,7 @@ clause:
   (`moe.py:277-281`).
 
 Kernel/prefill-path defaults are not restated here — see
-`plugins/gridbook/README.md` and `STANDARDS.md`. Live constraint worth
+[Gridbook's README](https://github.com/RobTand/gridbook) and `STANDARDS.md`. Live constraint worth
 carrying: fp4 experts require two-tier v2 scale coding; fp4-v1 stacks raise
 (`moe.py:112-117`).
 

@@ -47,12 +47,8 @@ export EXPORT_STREAMING=auto
 # keep the cost pass O(anchors), so menu width is ~free. Signed S-rungs
 # remain OUT: no CUDA decode path yet (promotion rule: performant kernel or
 # no menu entry).
-export FORMATS="$(python3 - <<'PYF'
-fp4 = ",".join(f"NVFP4_CB_K{k}" for k in range(12, 25))
-fp8 = ",".join(f"FP8_CB_K{k}" for k in range(28, 49))
-print(f"{fp4},{fp8},NVFP4,FP8_DYNAMIC,BF16")
-PYF
-)"
+export FORMATS="$(PYTHONPATH="$REPO" python3 \
+  "$REPO/scripts/print_cb_format_menu.py" NVFP4 FP8_DYNAMIC BF16)"
 export CB_SCALE_CODING=two_tier
 export TARGET_BITS=2.9
 export PARETO_TARGETS="2.7,2.9,3.1"

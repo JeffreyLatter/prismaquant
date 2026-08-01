@@ -62,12 +62,8 @@ export CB_LADDER_INTERP=1
 export EXPORT_STREAMING=auto
 
 # --- FULL ladder, no vanilla NVFP4 (see header) ---
-export FORMATS="$(python3 - <<'PYF'
-fp4 = ",".join(f"NVFP4_CB_K{k}" for k in range(12, 25))
-fp8 = ",".join(f"FP8_CB_K{k}" for k in range(28, 49))
-print(f"{fp4},{fp8},NVFP4,FP8_DYNAMIC,BF16")
-PYF
-)"
+export FORMATS="$(PYTHONPATH="$REPO" python3 \
+  "$REPO/scripts/print_cb_format_menu.py" NVFP4 FP8_DYNAMIC BF16)"
 export CB_SCALE_CODING=two_tier
 # Overridable for additional SKUs from the SAME probe/cost (allocation +
 # export only). 16 GB SKU (5080/5070-Ti): TARGET_BITS=2.4 MTP_FORMAT=CB.

@@ -1,5 +1,10 @@
 # INT8 vs FP8 at W8A8 — the accuracy gate for the Strix int8 kernel direction
 
+> **Target canceled; evidence retained.** The gfx1151 machine is no longer
+> available and Strix kernel work was canceled on 2026-07-31. This accuracy
+> screen still establishes why naive IU8/W8A8 must not be built or promoted;
+> it is not an active Strix implementation plan.
+
 2026-07-30. **Screen, not a result.** Every number is a *whole-model emulated*
 forward KL-vs-BF16 on Qwen3-0.6B / 4B — metric rung 3–5, nothing served, no
 promotion language. Emulated activation quant is known to *under-count* the

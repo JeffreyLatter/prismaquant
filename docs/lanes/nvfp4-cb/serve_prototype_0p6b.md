@@ -1,5 +1,10 @@
 # NVFP4-CB / FP8-CB — served prototype (i), Qwen3-0.6B
 
+> **Historical evidence.** The prototype runtime described below was later
+> moved to the external [Gridbook repository](https://github.com/RobTand/gridbook).
+> PrismaQuant no longer contains or synchronizes a runtime source tree; current
+> runs use the immutable pin in `scripts/lib/gridbook_runtime_pin.json`.
+
 > **Prototype (i) of `docs/lanes/nvfp4-cb/serving-kernel.md`: a CORRECT-but-slow
 > Triton vLLM plugin.** First served KL-vs-BF16 and first speed reading for the
 > CB codebook formats. **INV-1 honored** (no dense `[N,K]` in HBM — per-tile
@@ -8,7 +13,8 @@
 > *quality* on the real served stack, and (b) get a first, honest speed reading.
 > 0.6B only.
 
-- Plugin: `plugins/vllm_prismaquant/` (in-repo). Artifacts:
+- Runtime: the historical Gridbook prototype (then in-repo; now external and
+  immutable-pinned). Artifacts:
   `/home/rob/dq-runs/nvfp4-cb-phase0/serve/{fp8cb_k44,nvfp4cb_k16}`.
 - Both artifacts are **uniform** (every target Linear one CB format), product
   mode, shared-per-role learned codebooks, scale_sweep, imatrix col_weights from
@@ -109,7 +115,7 @@ prototype (bandwidth-bound); even un-tuned FP8_CB is 0.58× BF16, and prototype
 
 ## 4. Correctness gate (passed)
 
-`plugins/vllm_prismaquant/tests/test_cb_kernels.py` — 25/25 on the **real
+The corresponding Gridbook kernel suite — 25/25 on the **real
 exported** tensors: (a) the kernel's byte-window codeword extraction is
 bit-identical to `nvfp4_cb_unpack`; (b) the decode-GEMM matches
 `nvfp4_cb_reconstruct @ x` to ≤1e-2 rel (bf16 accumulation), M∈{1,17}, both

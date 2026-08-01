@@ -1,5 +1,9 @@
 # NVFP4-CB / FP8-CB — served prototype (ii+): transient-expansion prefill + 4B scale
 
+> **Historical evidence.** Gridbook now solely owns the runtime and kernel
+> implementation. PrismaQuant consumes its immutable external pin from
+> `scripts/lib/gridbook_runtime_pin.json`; there is no in-repo runtime copy.
+
 > **Prototype (ii+) of `docs/lanes/nvfp4-cb/serving-kernel.md`.** Builds on the
 > prototype-(i) correctness serve (`serve_prototype_0p6b.md`): adds a **tuned
 > decode kernel** and a **transient-expansion prefill path** that reaches vLLM's
@@ -8,7 +12,8 @@
 > resident dense weight); INV-2 still waived for decode (bf16 `tl.dot`), but the
 > **prefill path now hits fp8 tensor cores** via the transient trick.
 
-- Plugin: `plugins/vllm_prismaquant/`. Serve stack: `vllm-node:latest`
+- Runtime: the historical Gridbook prototype (now external). Serve stack:
+  `vllm-node:latest`
   (vLLM 0.23.1rc1), GB10 / sm_121, `--enforce-eager --max-model-len 4096`, tp=1,
   `gpu_memory_utilization 0.5`. KL: served top-20 `prompt_logprobs` (kl_tool),
   held-out `wiki.test.raw`, 8192 tok × seqlen 512, CB and BF16 same session.

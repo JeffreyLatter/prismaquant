@@ -12,6 +12,9 @@ set -u
 # R15 serve fingerprint (docs/ARCHITECTURE.md §7.4): write_serve_manifest.
 PQ_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$PQ_SCRIPT_DIR/lib/serve_manifest.sh" ] && . "$PQ_SCRIPT_DIR/lib/serve_manifest.sh"
+PQ_REPO_ROOT="$(cd "$PQ_SCRIPT_DIR/.." && pwd)"
+. "$PQ_SCRIPT_DIR/lib/gridbook_runtime.sh"
+gridbook_runtime_prepare || exit $?
 NAME=pq_laguna
 MODEL="${MODEL:-/dqruns/laguna-s21/prod/exported_nvfp4_cb}"
 MAXLEN="${MAXLEN:-262144}"
@@ -34,8 +37,9 @@ for f in glob.glob(os.path.join(sys.argv[1], "*.safetensors")):
 PYFLUSH
 echo "[serve] launching $NAME (len $MAXLEN, util $UTIL, extra: $EXTRA_ARGS) $(date '+%H:%M:%S')"
 docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
-  -v /home/rob/prismaquant:/repo \
+  -v "$PQ_REPO_ROOT":/repo:ro \
   -v /home/rob/dq-runs:/dqruns \
+  "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" \
   -e VLLM_LOGGING_LEVEL=INFO \
   -e VLLM_TORCH_PROFILER_DIR=/dqruns/laguna-s21/profiles \
   -e VLLM_SERVER_DEV_MODE=1 \
@@ -54,8 +58,8 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e PRISMAQUANT_CB_PREFILL_DENSE="${PRISMAQUANT_CB_PREFILL_DENSE:-}" \
   -e PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK="${PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK:-}" \
   --entrypoint bash vllm-node:latest -c '
-    cp -r /repo/plugins/gridbook /gb_snap
-    pip install -e /gb_snap --no-deps -q 2>/dev/null
+    set -euo pipefail
+    bash /repo/scripts/lib/gridbook_runtime.sh install-container
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
       --served-model-name laguna \
       --max-model-len "$PQ_MAXLEN" --max-num-seqs 2 \

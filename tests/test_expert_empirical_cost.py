@@ -319,6 +319,16 @@ def test_ladder_split_pays_at_four_fp8_rungs():
     assert pred_bad is None and rel_bad > 0.10
 
 
+def test_signed_ladder_rate_uses_only_magnitude_table_bits():
+    from prismaquant.expert_empirical_cost import _cb_ladder_rate_factor
+
+    # S13 spends eight of its thirteen codeword bits on signs. Its one
+    # magnitude subtable therefore has 2**5 entries of dimension eight.
+    assert _cb_ladder_rate_factor("NVFP4_CB_S13", 13) == pytest.approx(
+        2.0 ** (-2.0 * 5.0 / 8.0)
+    )
+
+
 def test_ladder_split_too_short():
     from prismaquant.expert_empirical_cost import _cb_ladder_split
     assert _cb_ladder_split(["FP8_CB_K36", "FP8_CB_K44", "NVFP4"]) is None

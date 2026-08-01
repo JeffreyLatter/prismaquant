@@ -216,10 +216,10 @@ laid out exactly as the 2-D case; expert `e` = `cb_qweight[e]`), and the fp8
 `(E, 1, in)` when provided (a single `(in,)` vector is broadcast to all
 experts); all experts of a stack share one format + one codebook (the
 allocator's serving-unit promotion guarantees it). **Served** by
-`PrismaQuantCBMoEMethod` (`plugins/gridbook/gridbook/moe.py`), which registers
+`PrismaQuantCBMoEMethod` ([external Gridbook `moe.py`](https://github.com/RobTand/gridbook/blob/master/gridbook/moe.py)), which registers
 w13/w2 buffers at these exact shapes so loading is a plain `copy_`; archs that
 map experts at the top level additionally need a loader line in
-`plugins/gridbook/gridbook/plugin.py` (see `moe_cb_design.md` §4).
+Gridbook's packaged runtime contract and loader table (see `moe_cb_design.md` §4).
 
 **Codebooks — shipped once per `(ref, format)`, never per tensor:**
 

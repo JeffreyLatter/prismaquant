@@ -15,7 +15,7 @@
 > M∈(16,128]: 1.04×/1.26×/1.45× at M=32/64/128.** *(Correction 2026-07-30: the
 > "dispatch intentionally not wired" note is stale — mid-M dispatch is WIRED
 > and ON BY DEFAULT since the 2026-07-26 promotion:
-> `plugins/gridbook/gridbook/linear.py:437-448`, gated only by
+> [Gridbook `linear.py`](https://github.com/RobTand/gridbook/blob/master/gridbook/linear.py), gated only by
 > `PRISMAQUANT_CB_FUSED_MIDM` defaulting to `"1"` at `:439`, over rungs
 > k ∈ {28,32,36,40,44,48}. Promotion evidence in `STANDARDS.md:54` — 1.40×
 > in-niche, conf-KL-vs-teacher gate preserved.)* Large-M parity (the remaining 0.33 s

@@ -14,6 +14,9 @@ set -u
 # R15 serve fingerprint (docs/ARCHITECTURE.md §7.4): write_serve_manifest.
 PQ_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$PQ_SCRIPT_DIR/lib/serve_manifest.sh" ] && . "$PQ_SCRIPT_DIR/lib/serve_manifest.sh"
+PQ_REPO_ROOT="$(cd "$PQ_SCRIPT_DIR/.." && pwd)"
+. "$PQ_SCRIPT_DIR/lib/gridbook_runtime.sh"
+gridbook_runtime_prepare || exit $?
 NAME=pq_hy3_cb
 MODEL="${MODEL:-/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb}"
 MAXLEN="${MAXLEN:-12288}"
@@ -44,8 +47,9 @@ echo "[serve] launching $NAME (TEB protocol: len $MAXLEN, util $UTIL, extra: $EX
 # embedded JSON (--compilation-config '{"…"}') survives intact. Host-side
 # interpolation into a double-quoted -c string strips the JSON's quotes.
 docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
-  -v /home/rob/prismaquant:/repo \
+  -v "$PQ_REPO_ROOT":/repo:ro \
   -v /home/rob/dq-runs:/dqruns \
+  "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" \
   -e VLLM_LOGGING_LEVEL=INFO \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_TORCH_PROFILER_DIR=/dqruns/prod-hy3-nvfp4cb-2p9/profiles \
@@ -57,12 +61,10 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e PRISMAQUANT_CB_PREFILL="${PRISMAQUANT_CB_PREFILL:-}" \
   -e PRISMAQUANT_CB_DISPATCH="${PRISMAQUANT_CB_DISPATCH:-}" \
   --entrypoint bash vllm-node:latest -c '
-    # Snapshot the plugin INSIDE the container before installing: the serve
-    # JIT-builds kernels from the package dir, and building from the live
-    # /repo mount races host-side edits (a mid-edit .cu broke a launch on
-    # 2026-07-21). The copy dies with the container.
-    cp -r /repo/plugins/gridbook /gb_snap
-    pip install -e /gb_snap --no-deps -q 2>/dev/null
+    set -euo pipefail
+    # The helper re-attests and snapshots the externally pinned source before
+    # installation, so host edits cannot race a JIT build.
+    bash /repo/scripts/lib/gridbook_runtime.sh install-container
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
       --served-model-name hy3 \
       --max-model-len "$PQ_MAXLEN" --max-num-seqs 2 \

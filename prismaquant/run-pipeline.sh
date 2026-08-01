@@ -2067,16 +2067,16 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # has had no served objective A/B (that A/B, not the plumbing, is what would
   # justify a default).
   # There is also NO in-lane serving smoke: CB artifacts serve ONLY via the
-  # out-of-tree gridbook_plugin (plugins/gridbook/), so the
-  # load+generate / served-KL gate runs in the plugin's serving env, not here
+  # separately released, immutable-pinned Gridbook runtime, so the
+  # load+generate / served-KL gate runs in Gridbook's serving env, not here
   # (docs/lanes/nvfp4-cb/serve_prototype_0p6b.md). No rung is production-eligible
   # until it clears the served gold-metric KL/PPL gate AND the prefill perf
   # gate (INV-2, no Triton masquerade).
   echo
   echo "[pipeline] done."
-  echo "  Artifact: ${CB_OUT}  (custom quant_method=prismaquant; LAYOUT.md contract)"
-  echo "  Serve:    vLLM with the gridbook_plugin installed"
-  echo "            (plugins/gridbook/); NOT stock compressed-tensors."
+  echo "  Artifact: ${CB_OUT}  (custom quant_method=gridbook; LAYOUT.md contract)"
+  echo "  Serve:    vLLM with the pinned external gridbook package installed"
+  echo "            (scripts/lib/gridbook_runtime_pin.json); NOT stock compressed-tensors."
   echo "  Gate:     served KL-vs-BF16 + WikiText PPL in the plugin serving env."
   exit 0
 fi
