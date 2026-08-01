@@ -10,8 +10,9 @@ import subprocess
 
 
 REPO = Path(__file__).resolve().parents[1]
-HELPER = REPO / "scripts" / "lib" / "gridbook_runtime.sh"
-PIN = REPO / "scripts" / "lib" / "gridbook_runtime_pin.json"
+ASSET_DIR = REPO / "prismaquant" / "gridbook_runtime"
+HELPER = ASSET_DIR / "gridbook_runtime.sh"
+PIN = ASSET_DIR / "gridbook_runtime_pin.json"
 LIVE_SCRIPTS = (
     "canary_ladder.sh",
     "serve_hy3_smoke.sh",
@@ -33,7 +34,11 @@ def _bash(script: str, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_gridbook_pin_is_one_full_immutable_commit():
-    pins = list((REPO / "scripts").rglob("*gridbook*pin*.json"))
+    pins = [
+        path
+        for root in (REPO / "prismaquant", REPO / "scripts")
+        for path in root.rglob("*gridbook*pin*.json")
+    ]
     assert pins == [PIN]
     payload = json.loads(PIN.read_text(encoding="utf-8"))
     assert set(payload) == {"schema", "repository", "commit", "version"}
@@ -73,14 +78,17 @@ def test_every_live_script_uses_the_one_external_runtime_helper():
     for name in LIVE_SCRIPTS:
         text = (REPO / "scripts" / name).read_text(encoding="utf-8")
         assert "gridbook_runtime.sh" in text, name
+        assert "prismaquant/gridbook_runtime/gridbook_runtime.sh" in text, name
         assert "gridbook_runtime_prepare" in text, name
         assert "GRIDBOOK_RUNTIME_DOCKER_ARGS" in text, name
+        assert "PQ_GRIDBOOK_RUNTIME_HELPER" in text, name
         assert (
             "install-container" in text
             or "gridbook_runtime_install_container" in text
         ), name
         assert "set -euo pipefail" in text, name
         assert "plugins/gridbook" not in text, name
+        assert "/repo/scripts/lib/gridbook_runtime.sh" not in text, name
         assert "--quantization prismaquant" not in text, name
     delegation = (REPO / "scripts" /
                   "smoke_nvfp4_cb_delegation.sh").read_text(encoding="utf-8")
@@ -168,6 +176,42 @@ def test_checkout_override_requires_exact_clean_commit(tmp_path):
     wrong = _bash(command, str(checkout), "0" * 40)
     assert wrong.returncode == 2
     assert "does not equal pinned" in wrong.stderr
+
+
+def test_prepare_mounts_runtime_source_and_contract_read_only(tmp_path):
+    checkout = tmp_path / "gridbook"
+    checkout.mkdir()
+    commit = _make_gridbook_checkout(checkout)
+
+    assets = tmp_path / "contract"
+    assets.mkdir()
+    copied_helper = assets / HELPER.name
+    shutil.copy2(HELPER, copied_helper)
+    (assets / PIN.name).write_text(json.dumps({
+        "schema": "prismaquant.gridbook_runtime_pin.v1",
+        "repository": "https://github.com/example/gridbook.git",
+        "commit": commit,
+        "version": "9.9.9",
+    }), encoding="utf-8")
+
+    prepared = _bash(
+        'GRIDBOOK_RUNTIME_CHECKOUT="$1"; '
+        '. "$2"; '
+        'gridbook_runtime_prepare; '
+        'printf "%s\\n" "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}"',
+        str(checkout), str(copied_helper),
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    args = prepared.stdout.splitlines()
+    assert f"{checkout}:/opt/prismaquant-gridbook-source:ro" in args
+    assert (
+        f"{assets}:/opt/prismaquant-gridbook-runtime-contract:ro" in args
+    )
+    assert (
+        "PQ_GRIDBOOK_RUNTIME_HELPER="
+        "/opt/prismaquant-gridbook-runtime-contract/gridbook_runtime.sh"
+    ) in args
+    assert all("/repo/" not in arg for arg in args)
 
 
 def test_container_install_reloads_and_enforces_the_tracked_pin():

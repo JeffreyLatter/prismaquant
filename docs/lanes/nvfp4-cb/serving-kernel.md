@@ -2,7 +2,7 @@
 
 > **HISTORICAL DESIGN RECORD — DO NOT USE AS CURRENT SERVING INSTRUCTIONS.**
 > The runtime now lives in the external Gridbook repository and must be used at
-> the exact commit recorded in `scripts/lib/gridbook_runtime_pin.json`. The
+> the exact commit recorded in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`. The
 > canonical quantization key is `gridbook`; any `prismaquant` compatibility
 > alias, package name, import path, or CLI instruction below is retained only as
 > historical evidence and must not be followed for a current deployment.

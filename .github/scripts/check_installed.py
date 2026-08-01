@@ -9,6 +9,7 @@ package-data regression actually shows up.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -55,6 +56,57 @@ pipeline = os.path.join(where, "run-pipeline.sh")
 if not os.path.isfile(pipeline):
     sys.exit(f"run-pipeline.sh missing from the install ({pipeline})")
 print("  run-pipeline.sh OK")
+
+# Canonical IQ and CB tables must ship. Without IQ tables the first real GGUF
+# encode raises FileNotFoundError; without CB lattices the package silently
+# regenerates them, which is expensive and can be nondeterministic on CUDA.
+from prismaquant.gguf_iq_formats import _tables as iq_tables  # noqa: E402
+from prismaquant.nvfp4_cb_formats import _lattice_file  # noqa: E402
+
+iq = iq_tables("cpu")
+required_iq = {
+    "grid_iq2_xxs", "grid_iq2_xs", "grid_iq2_s",
+    "grid_iq3_xxs", "grid_iq3_s", "ksigns", "kvalues_iq4nl",
+}
+if set(iq) != required_iq:
+    sys.exit(f"installed IQ tables differ from canonical keys: {sorted(iq)}")
+print(f"  IQ tables OK: {len(iq)}")
+
+lattices = _lattice_file()
+if len(lattices) != 20:
+    sys.exit(f"installed CB lattice table count is {len(lattices)}, expected 20")
+print(f"  CB lattices OK: {len(lattices)}")
+
+# The exact external-runtime contract must work from site-packages and from an
+# arbitrary CWD. It is moved into the package, never copied from scripts/.
+runtime_dir = os.path.join(where, "gridbook_runtime")
+helper = os.path.join(runtime_dir, "gridbook_runtime.sh")
+pin_path = os.path.join(runtime_dir, "gridbook_runtime_pin.json")
+if not os.path.isfile(helper) or not os.path.isfile(pin_path):
+    sys.exit(f"Gridbook runtime assets missing under {runtime_dir}")
+syntax = subprocess.run(["bash", "-n", helper], capture_output=True, text=True)
+if syntax.returncode != 0:
+    sys.exit(f"packaged Gridbook helper is invalid bash:\n{syntax.stderr}")
+pin = json.loads(open(pin_path, encoding="utf-8").read())
+printed = subprocess.run(
+    ["bash", helper, "print-pin"], capture_output=True, text=True,
+)
+if printed.returncode != 0:
+    sys.exit(f"packaged Gridbook helper cannot read its pin:\n{printed.stderr}")
+want = f"{pin['repository']} {pin['commit']} {pin['version']}"
+if printed.stdout.strip() != want:
+    sys.exit(f"packaged Gridbook pin mismatch: {printed.stdout.strip()!r}")
+print("  Gridbook runtime pin/helper OK")
+
+# The pipeline's final refusal display is packaged rather than pointing at the
+# repository-only tools/ tree.
+shipcard = subprocess.run(
+    [sys.executable, "-m", "prismaquant.shipcard_cli", "--help"],
+    capture_output=True, text=True,
+)
+if shipcard.returncode != 0:
+    sys.exit(f"installed shipcard CLI failed:\n{shipcard.stderr}")
+print("  shipcard CLI OK")
 
 # The CLI entry point every downstream user touches first.
 r = subprocess.run([sys.executable, "-m", "prismaquant.allocator", "--help"],

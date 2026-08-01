@@ -3,7 +3,7 @@
 > **Historical evidence.** The prototype runtime described below was later
 > moved to the external [Gridbook repository](https://github.com/RobTand/gridbook).
 > PrismaQuant no longer contains or synchronizes a runtime source tree; current
-> runs use the immutable pin in `scripts/lib/gridbook_runtime_pin.json`.
+> runs use the immutable pin in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`.
 
 > **Prototype (i) of `docs/lanes/nvfp4-cb/serving-kernel.md`: a CORRECT-but-slow
 > Triton vLLM plugin.** First served KL-vs-BF16 and first speed reading for the

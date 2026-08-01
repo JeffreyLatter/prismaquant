@@ -10,7 +10,7 @@
 # validated on 0.6B first.
 #
 # Part 2 installs the immutable external Gridbook revision pinned by
-# scripts/lib/gridbook_runtime_pin.json. Stock compressed-tensors delegation is
+# prismaquant/gridbook_runtime/gridbook_runtime_pin.json. Stock compressed-tensors delegation is
 # implemented; the serve must exercise both routes and fail loudly if either
 # the external package contract or the artifact is incompatible.
 #
@@ -19,7 +19,7 @@
 # ============================================================================
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-. "$REPO/scripts/lib/gridbook_runtime.sh"
+. "$REPO/prismaquant/gridbook_runtime/gridbook_runtime.sh"
 
 : "${MODEL_PATH:=/home/rob/models/Qwen3-0.6B}"
 : "${WORK_DIR:=/home/rob/dq-runs/smoke-nvfp4-cb-mixed-3p5}"
@@ -68,7 +68,7 @@ CID=$(docker run -d --gpus all -p "${PORT}:${PORT}" \
   "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" \
   --entrypoint bash "${SERVE_IMAGE}" -c \
   "set -euo pipefail; \
-   bash /repo/scripts/lib/gridbook_runtime.sh install-container && \
+   bash \"\${PQ_GRIDBOOK_RUNTIME_HELPER:?}\" install-container && \
    vllm serve /model --host 0.0.0.0 --port ${PORT} --trust-remote-code \
      --quantization gridbook --enforce-eager")
 echo "[deleg-smoke] container CID=${CID} — stop by this EXACT id, never pattern-kill"

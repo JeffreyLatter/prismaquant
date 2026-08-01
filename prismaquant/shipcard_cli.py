@@ -5,10 +5,10 @@ R13. `export_native_compressed` opens the card with the build-lane facts and
 five empty, required serve-lane slots; this tool closes them and refuses.
 
     # after the serve lane has run
-    python3 tools/shipcard.py show   exported/shipcard.json
-    python3 tools/shipcard.py fill   exported/shipcard.json \
+    python3 -m prismaquant.shipcard_cli show   exported/shipcard.json
+    python3 -m prismaquant.shipcard_cli fill   exported/shipcard.json \
         --slot gold.kl --record /home/rob/dq-runs/<run>/kl_student.json
-    python3 tools/shipcard.py verify exported/shipcard.json --model-dir exported
+    python3 -m prismaquant.shipcard_cli verify exported/shipcard.json --model-dir exported
 
 `verify` exits 0 only when every slot holds a passing record whose `model_sha`
 matches the artifact on disk, and the two `gold.*` records report
@@ -25,9 +25,7 @@ import math
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from prismaquant.shipcard import (  # noqa: E402
+from prismaquant.shipcard import (
     GOLD_SLOTS,
     REQUIRED_SLOTS,
     compute_model_sha,

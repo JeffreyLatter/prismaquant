@@ -234,7 +234,7 @@ def main():
     ap.add_argument("--shipcard", default=None,
                     help="Path to the artifact's shipcard.json; the arm's "
                          "verdict is appended to native_export.<arm> "
-                         "(see tools/shipcard.py).")
+                         "(see python -m prismaquant.shipcard_cli).")
     args = ap.parse_args()
 
     model_dir = Path(args.model)

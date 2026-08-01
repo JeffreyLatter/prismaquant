@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.5.0 — 2026-08-01
+
+This release establishes the production boundary between PrismaQuant and
+Gridbook. PrismaQuant owns quantization, allocation, serialized-byte accounting,
+and artifact export; Gridbook alone owns serving code, kernels, runtime flags,
+tests, packaging, and releases.
+
+### One runtime, one producer contract
+
+- Deleted the complete vendored Gridbook runtime, CUDA/HIP sources, runtime
+  tests, and source-sync machinery (38,216 lines removed).
+- Added one immutable Gridbook commit pin, PEP 610 provenance checks, a packaged
+  consumer contract, and tiny real-artifact compatibility tests.
+- Consolidated producer-owned CB layout and export metadata in
+  `cb_layout.py` and `cb_export_config.py`, shared by resident and streaming
+  exporters.
+- Moved the sole Gridbook pin and resolver into packaged assets under
+  `prismaquant/gridbook_runtime/`. This is an intentional 0.x interface change:
+  external scripts that sourced `scripts/lib/gridbook_runtime.sh` must source
+  `prismaquant/gridbook_runtime/gridbook_runtime.sh` instead.
+
+### Exact accounting and constrained selection
+
+- Unified serialized-payload accounting across candidate construction,
+  allocation, reporting, and exporter assertions, including FP4-CB layout-v2
+  scale planes, FP8 per-row scales, and shared codebook sidecars.
+- Replaced blended latency scoring with quality minimization under exact whole-
+  artifact bytes, phase-specific serving SLOs, memory, backend, shape, TP, and
+  serving-unit constraints.
+- Excluded signed S13-S16 rungs from production menus while retaining research
+  export and decoder compatibility.
+- Fixed partial LFM packed-expert CB export layouts.
+
+### Packaging correctness
+
+- Wheels and sdists now include the canonical IQ grids and NVFP4/FP8-CB lattice
+  tables. Earlier distributions omitted them: IQ failed at first use and CB
+  could silently regenerate expensive lattices.
+- The shipcard CLI is now installed as
+  `python -m prismaquant.shipcard_cli`; the packaged pipeline no longer points
+  at a checkout-only `tools/shipcard.py`.
+- Distribution and clean installed-wheel gates now exercise every model,
+  serving and lane spec, both tensor-table assets, the exact Gridbook pin and
+  resolver, the pipeline, and the shipcard CLI.
+
+### Fused NVFP4 safety decision
+
+Gridbook's installed-wheel CUDA operator gate passed, but the teacher-backed
+LFM2.5 A/B rejected promotion (exact full-vocabulary KL 0.247178, delta NLL
++0.054964, perplexity +5.65%). Dense and grouped fused-NVFP4 paths therefore
+remain explicit opt-ins and default off in Gridbook 0.4.1.
+
 ## 0.4.1 — 2026-07-30
 
 Tied-embedding models could not be quantized at all. Found by running the

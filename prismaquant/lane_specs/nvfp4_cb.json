@@ -3,7 +3,7 @@
   "id": "nvfp4_cb",
   "export_container": "nvfp4_cb",
   "runtime": "vllm+gridbook_plugin",
-  "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in scripts/lib/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Same OpenAI endpoint as the native lane — which is exactly why the CB half of R16 is wiring, not capability: validate_quantized_model is already endpoint-agnostic and knows nothing about the container.",
+  "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in prismaquant/gridbook_runtime/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Same OpenAI endpoint as the native lane — which is exactly why the CB half of R16 is wiring, not capability: validate_quantized_model is already endpoint-agnostic and knows nothing about the container.",
   "serving_profiles": ["nvfp4_cb"],
   "endpoint": {
     "kind": "openai",

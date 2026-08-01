@@ -13,7 +13,7 @@ set -u
 PQ_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$PQ_SCRIPT_DIR/lib/serve_manifest.sh" ] && . "$PQ_SCRIPT_DIR/lib/serve_manifest.sh"
 PQ_REPO_ROOT="$(cd "$PQ_SCRIPT_DIR/.." && pwd)"
-. "$PQ_SCRIPT_DIR/lib/gridbook_runtime.sh"
+. "$PQ_REPO_ROOT/prismaquant/gridbook_runtime/gridbook_runtime.sh"
 gridbook_runtime_prepare || exit $?
 NAME=pq_qwen27b
 MODEL="${MODEL:-/dqruns/qwen27b-gb/artifact}"
@@ -60,7 +60,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
   -e PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK="${PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK:-}" \
   --entrypoint bash vllm-node:latest -c '
     set -euo pipefail
-    bash /repo/scripts/lib/gridbook_runtime.sh install-container
+    bash "${PQ_GRIDBOOK_RUNTIME_HELPER:?}" install-container
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
       --served-model-name qwen \
       --max-model-len "$PQ_MAXLEN" --max-num-seqs 2 \

@@ -15,7 +15,7 @@ set -u
 PQ_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$PQ_SCRIPT_DIR/lib/serve_manifest.sh" ] && . "$PQ_SCRIPT_DIR/lib/serve_manifest.sh"
 PQ_REPO_ROOT="$(cd "$PQ_SCRIPT_DIR/.." && pwd)"
-. "$PQ_SCRIPT_DIR/lib/gridbook_runtime.sh"
+. "$PQ_REPO_ROOT/prismaquant/gridbook_runtime/gridbook_runtime.sh"
 gridbook_runtime_prepare || exit $?
 NAME=pq_hy3_cb
 MODEL="${MODEL:-/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb}"
@@ -64,7 +64,7 @@ docker run -d --gpus all --ipc=host -p 8000:8000 --name "$NAME" \
     set -euo pipefail
     # The helper re-attests and snapshots the externally pinned source before
     # installation, so host edits cannot race a JIT build.
-    bash /repo/scripts/lib/gridbook_runtime.sh install-container
+    bash "${PQ_GRIDBOOK_RUNTIME_HELPER:?}" install-container
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 \
       --served-model-name hy3 \
       --max-model-len "$PQ_MAXLEN" --max-num-seqs 2 \

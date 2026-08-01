@@ -122,7 +122,7 @@ jobs:
       - name: Install the immutable external Gridbook runtime
         run: |
           read -r repository commit version <<< \
-            "$(bash scripts/lib/gridbook_runtime.sh print-pin)"
+            "$(bash prismaquant/gridbook_runtime/gridbook_runtime.sh print-pin)"
           python -m pip install --no-deps \
             "gridbook @ git+${repository}@${commit}"
           test "$(python -c 'import importlib.metadata as m; print(m.version("gridbook"))')" = "$version"
